@@ -35,6 +35,23 @@ pub struct ServeArgs {
     #[arg(long, alias = "served-model-name", value_name = "NAME")]
     pub model_name: Option<String>,
 
+    /// Force selection of a specific kernel target by directory name
+    /// (e.g. `qwen3.6-35b-a3b-abl`). Bypasses the
+    /// `(model_type, hidden_size)` first-match-wins dispatch in
+    /// `atlas_kernels::ptx_for_config`. Use this to apply tuned MODEL.toml
+    /// defaults (sampling, behavior) for abliterated / heretic checkpoints
+    /// that share their architecture with a canonical target — without
+    /// this flag, the canonical target's MODEL.toml wins because both
+    /// match the same `(model_type, hidden_size)` tuple.
+    ///
+    /// The named target must exist as a compiled `(hw, model, quant)`
+    /// kernel set; the build only produces it when
+    /// `ATLAS_TARGET_MODEL=*` (wildcard) or the exact name is set at
+    /// build time. Errors with the list of available targets if the
+    /// requested name does not match.
+    #[arg(long, value_name = "MODEL_DIR")]
+    pub kernel_target: Option<String>,
+
     /// Override HuggingFace cache directory
     /// (default: $HF_HUB_CACHE, $HF_HOME/hub, or ~/.cache/huggingface/hub).
     #[arg(long, value_name = "DIR")]

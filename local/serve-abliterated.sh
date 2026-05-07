@@ -29,12 +29,21 @@ MODELS="${MODELS_DIR:-/home/flocka/models}"
 
 case "${1:-}" in
   huihui-q36)
+    # Validated config (2026-05-07): patched OSS Atlas + MTP + ngram
+    # speculative + NVFP4 KV. Mean 87 tok/s, peak 92, 104.7 on
+    # predictable workloads. +6.9% over closed-source Atlas 2.99
+    # docker on the same checkpoint.
+    #
+    # Knobs that did NOT help: --self-speculative (no measurable
+    # change), --num-drafts 2 (43% slower per Atlas docs on 35B-A3B
+    # — verified), --scheduling-policy slai (FIFO equal at batch=1).
     exec "$SPARK" serve \
       --model-from-path "$MODELS/Huihui-NVFP4-Sehyo-MTP" \
       --model-name qwen36-abl \
       --port "$PORT" \
+      --kernel-target qwen3.6-35b-a3b-abl \
       --gpu-memory-utilization 0.85 \
-      --kv-cache-dtype fp8 \
+      --kv-cache-dtype nvfp4 \
       --kv-high-precision-layers auto \
       --max-seq-len 16384 \
       --enable-prefix-caching \
@@ -43,7 +52,7 @@ case "${1:-}" in
       --num-drafts 1 \
       --mtp-quantization nvfp4 \
       --max-thinking-budget 768 \
-      --fp8-kv-calibration-tokens 256
+      --warmup-prompt "$(dirname "$0")/warmup.txt"
     ;;
 
   heretic-122b)
@@ -55,6 +64,7 @@ case "${1:-}" in
       --model-from-path "$MODELS/Qwen3.5-122B-heretic-MTP-NVFP4" \
       --model-name qwen35-122b-heretic \
       --port "$PORT" \
+      --kernel-target qwen3.5-122b-a10b-heretic \
       --gpu-memory-utilization 0.97 \
       --oom-guard-mb 512 \
       --max-batch-size 1 \

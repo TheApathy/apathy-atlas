@@ -68,21 +68,50 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
 
     // 2. Select kernel target and initialize GPU backend
     //
-    // Each kernel target declares which (model_type, hidden_size) pairs it supports
-    // via [[model_types]] in MODEL.toml. Exact hidden_size matches win over wildcards.
-    let ptx_set = atlas_kernels::ptx_for_config(&config.model_type, config.hidden_size)
-        .with_context(|| {
-            format!(
-                "No compiled kernel target matches model_type '{}' / hidden_size={}. \
-             Available targets: {:?}",
-                config.model_type,
-                config.hidden_size,
-                atlas_kernels::available_targets()
-                    .iter()
-                    .map(|t| &t.target.model)
-                    .collect::<Vec<_>>(),
-            )
-        })?;
+    // Default dispatch: each kernel target declares which (model_type,
+    // hidden_size) pairs it supports via [[model_types]] in MODEL.toml.
+    // Exact hidden_size matches win over wildcards.
+    //
+    // CLI override: `--kernel-target <NAME>` forces a specific target
+    // dir, useful for abliterated/heretic checkpoints whose tuned
+    // MODEL.toml defaults would otherwise be shadowed by the canonical
+    // target with the same `(model_type, hidden_size)` tuple.
+    let ptx_set = if let Some(ref forced) = args.kernel_target {
+        // Exact name match first, then substring fallback. Exact-first
+        // is important for abliterated targets whose names are
+        // supersets of the canonical (e.g. `qwen3.6-35b-a3b-abl`
+        // contains `qwen3.6-35b-a3b`).
+        atlas_kernels::available_targets()
+            .into_iter()
+            .find(|t| t.target.model == *forced)
+            .or_else(|| atlas_kernels::ptx_for_model(forced))
+            .with_context(|| {
+                format!(
+                    "--kernel-target '{}' did not match any compiled kernel target. \
+                     Available targets: {:?}",
+                    forced,
+                    atlas_kernels::available_targets()
+                        .iter()
+                        .map(|t| &t.target.model)
+                        .collect::<Vec<_>>(),
+                )
+            })?
+    } else {
+        atlas_kernels::ptx_for_config(&config.model_type, config.hidden_size).with_context(
+            || {
+                format!(
+                    "No compiled kernel target matches model_type '{}' / hidden_size={}. \
+                     Available targets: {:?}",
+                    config.model_type,
+                    config.hidden_size,
+                    atlas_kernels::available_targets()
+                        .iter()
+                        .map(|t| &t.target.model)
+                        .collect::<Vec<_>>(),
+                )
+            },
+        )?
+    };
     let sampling_presets = ptx_set.sampling;
     tracing::info!(
         "Selected kernel target: {} ({} modules)",
