@@ -1,0 +1,109 @@
+# Heretic-abliterated Qwen3.5-122B-A10B kernel target.
+#
+# Tuned defaults for refusal-removed (heretic-style abliterated) variants
+# of the 122B-A10B family at hidden_size=3072 — Huihui-NVFP4-Sehyo-MTP,
+# Qwen3.5-122B-heretic-MTP-NVFP4. Architecture is identical to the
+# canonical `qwen3.5-122b-a10b` target (kernels are symlinked); only
+# sampling and behavior defaults differ.
+#
+# Dispatch note: until a per-checkpoint kernel-target override is wired
+# upstream, this target only activates with
+# `ATLAS_TARGET_MODEL=qwen3.5-122b-a10b-heretic` at build time. See
+# atlas-kernels/src/lib.rs:248 for the first-match-wins reasoning.
+
+[model]
+name = "qwen3.5-122b-a10b-heretic"
+hf_id = "local/Qwen3.5-122B-heretic-MTP-NVFP4"
+params = "122B"
+active_params = "10B"
+architecture = "Gated DeltaNet + Full Attention + MoE (heretic-abliterated)"
+
+layers_total = 48
+layers_linear_attention = 36
+layers_full_attention = 12
+layer_pattern = "3:1 (linear, linear, linear, full)"
+
+moe_experts = 256
+moe_topk = 8
+moe_intermediate = 1024
+shared_expert_intermediate = 1024
+
+hidden_dim = 3072
+head_dim = 256
+q_heads = 32
+kv_heads = 2
+
+linear_attn_key_heads = 16
+linear_attn_key_dim = 128
+linear_attn_value_heads = 64
+linear_attn_value_dim = 128
+linear_conv_kernel = 4
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+partial_rotary_factor = 0.25
+attn_output_gate = true
+
+mtp_layers = 1
+mtp_type = "full_attention"
+vision = true
+
+# ── Sampling tuned for heretic-abliterated 122B ──
+#
+# Heretic abliteration is more aggressive than basic refusal removal —
+# it ablates multiple refusal-correlated directions per layer. At low
+# temperature this produces a slight preference collapse on
+# multi-paragraph generations. The canonical 122B already runs hot
+# (temp=1.0, presence=1.5/2.0); we pull presence/frequency penalties
+# up further on long-form non-thinking outputs.
+
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+presence_penalty = 1.5
+frequency_penalty = 0.1
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.2
+frequency_penalty = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.97          # -0.03 — tighten very long tail to reduce drift
+top_k = 20
+presence_penalty = 2.2  # +0.2 — heretic ablation can favor recent tokens
+frequency_penalty = 0.3
+
+[sampling.tools]
+temperature = 0.5
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.3
+frequency_penalty = 0.0
+
+[behavior]
+# 2026-05-07 — heretic 122B observed serving cleanly via Atlas docker
+# at >50 tok/s on long-code prompts with no observed loops. Watchdog
+# stays disabled, matching canonical target.
+enable_loop_watchdog = false
+thinking_in_tools = false
+max_thinking_budget = 1024            # +512 — heretic 122B benefits from longer reasoning
+default_num_drafts = 2                # K=3 — 122B benefits from deeper draft tree
+fp8_kv_calibration_tokens = 512        # 2x — wider K/V distribution under heretic
+default_kv_dtype = "fp8"
+
+[[model_types]]
+model_type = "qwen3_5_moe"
+hidden_size = 3072
+
+[[model_types]]
+model_type = "qwen3_6_moe"
+hidden_size = 3072
+
+[kernel]
+moe_gate_shmem_bytes = 6144

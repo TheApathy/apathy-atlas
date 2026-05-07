@@ -12,8 +12,8 @@ use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLa
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
-    dequant_nvfp4_to_bf16, detect_nvfp4_variant, gpu_concat_rows, interleave_ba, load_dense_ffn,
-    load_kv_scales, load_ssm_qwen35, quantize_to_nvfp4, quantized_auto,
+    detect_nvfp4_variant, gpu_concat_rows, interleave_ba, load_dense_ffn, load_kv_scales,
+    load_ssm_qwen35, quantize_to_nvfp4, quantized_auto,
 };
 
 pub struct Qwen35DenseWeightLoader;
@@ -75,7 +75,16 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     let tp_rank = config.tp_rank;
                     let tp_size = config.tp_world_size.max(1);
                     let (attn, q_nvfp4, k_nvfp4, v_nvfp4) = match variant {
-                        Nvfp4Variant::CompressedTensors => {
+                        // NVFP4 already packed in the checkpoint
+                        // (compressed-tensors `.weight_packed` or
+                        // modelopt uint8 `.weight` + `weight_scale_2`).
+                        // `quantized_auto` reads either schema; we shard
+                        // packed bytes directly. Treating modelopt as
+                        // BF16-then-quantize previously crashed at the
+                        // first full_attention layer because dense_auto
+                        // returned a uint8 ptr aliased as BF16, and the
+                        // absmax kernel read 2× the allocation.
+                        Nvfp4Variant::CompressedTensors | Nvfp4Variant::Standard => {
                             // NVFP4-from-disk path: column-parallel Q/K/V, row-parallel O.
                             let group_size = 16usize;
                             let load_nvfp4 = |name: &str,
@@ -113,9 +122,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                             };
                             (attn, Some(q), Some(k), Some(v))
                         }
-                        Nvfp4Variant::Standard
-                        | Nvfp4Variant::Fp8Dequanted
-                        | Nvfp4Variant::Bf16Raw => {
+                        Nvfp4Variant::Fp8Dequanted | Nvfp4Variant::Bf16Raw => {
                             // BF16 → NVFP4 path: shard BF16 then quantize per-rank.
                             let load_bf16_then_nvfp4 = |name: &str,
                                                         full_n: usize,
@@ -187,47 +194,24 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     let qkv_rows = config.ssm_qkv_size();
                     let z_rows = config.ssm_z_size();
                     let value_dim = nv * config.linear_value_head_dim;
-                    let la = format!("{lp}.linear_attn");
 
-                    // SSM projections may be BF16 or NVFP4 depending on quantizer.
-                    // If NVFP4 (weight_packed exists), dequant to BF16 for concat pipeline.
-                    let ssm_quantized = store.contains(&format!("{la}.in_proj_qkv.weight_packed"));
-
-                    let (qkv_dense, z_dense, out_proj_dense) = if ssm_quantized {
-                        let qkv = dequant_nvfp4_to_bf16(
-                            store,
-                            &format!("{la}.in_proj_qkv"),
-                            qkv_rows,
-                            h,
-                            gpu,
-                        )?;
-                        let z = dequant_nvfp4_to_bf16(
-                            store,
-                            &format!("{la}.in_proj_z"),
-                            z_rows,
-                            h,
-                            gpu,
-                        )?;
-                        let out = dequant_nvfp4_to_bf16(
-                            store,
-                            &format!("{la}.out_proj"),
-                            h,
-                            value_dim,
-                            gpu,
-                        )?;
-                        (qkv, z, out)
-                    } else {
-                        let ssm35 = load_ssm_qwen35(store, &lp, gpu, variant)?;
-                        (ssm35.in_proj_qkv, ssm35.in_proj_z, ssm35.out_proj)
-                    };
-
-                    // A, B are always BF16
-                    let in_proj_a = dense(store, &format!("{la}.in_proj_a.weight"))?;
-                    let in_proj_b = dense(store, &format!("{la}.in_proj_b.weight"))?;
-                    let conv1d = dense(store, &format!("{la}.conv1d.weight"))?;
-                    let a_log = dense(store, &format!("{la}.A_log"))?;
-                    let dt_bias = dense(store, &format!("{la}.dt_bias"))?;
-                    let norm = dense(store, &format!("{la}.norm.weight"))?;
+                    // load_ssm_qwen35 returns BF16 dense regardless of source
+                    // quantization (modelopt uint8 .weight, compressed-tensors
+                    // .weight_packed, or raw BF16). Including in_proj_a / b /
+                    // out_proj which previous versions of this loader assumed
+                    // were always BF16 — that assumption breaks on Sehyo /
+                    // Huihui-style NVFP4 checkpoints which pack all five SSM
+                    // projections.
+                    let ssm35 = load_ssm_qwen35(store, &lp, gpu, variant, config)?;
+                    let qkv_dense = ssm35.in_proj_qkv;
+                    let z_dense = ssm35.in_proj_z;
+                    let out_proj_dense = ssm35.out_proj;
+                    let in_proj_a = ssm35.in_proj_a;
+                    let in_proj_b = ssm35.in_proj_b;
+                    let conv1d = ssm35.conv1d;
+                    let a_log = ssm35.a_log;
+                    let dt_bias = ssm35.dt_bias;
+                    let norm = ssm35.norm;
 
                     let qkvz_dense =
                         gpu_concat_rows(&qkv_dense, qkv_rows, &z_dense, z_rows, h, gpu)?;

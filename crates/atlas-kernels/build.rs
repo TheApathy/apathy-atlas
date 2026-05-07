@@ -168,18 +168,87 @@ fn main() {
         // Compile all kernel source files via the ComputeTarget abstraction.
         // The NvidiaTarget uses nvcc; future targets (AMD, Apple, Intel) would
         // use their respective compilers.
+        //
+        // PTX-cache freshness check: skip nvcc when an existing PTX is newer
+        // than every potentially-relevant source (.cu + every .cuh in the
+        // model and common dirs) AND the target-identity signature for this
+        // `t{idx}__` slot matches the prior build. The signature guards
+        // against the case where ATLAS_TARGET_MODEL changes and re-numbers
+        // the targets — without it we'd happily reuse a stale PTX from a
+        // different model that happened to land at the same `idx`.
+        let signature = format!(
+            "{}|{}|{}|{}",
+            target.hw,
+            target.model,
+            target.quant,
+            target.arch,
+        );
+        let signature_file = out_dir.join(format!("t{idx}__signature"));
+        let signature_matches = std::fs::read_to_string(&signature_file)
+            .map(|s| s == signature)
+            .unwrap_or(false);
+        if !signature_matches {
+            let _ = std::fs::write(&signature_file, &signature);
+        }
+        let header_floor = target_header_floor(
+            &target.model_kernel_dir,
+            target.common_kernel_dir.as_deref(),
+            &signature_file,
+        );
+
         let mut errors = Vec::new();
+        let mut compiled = 0usize;
+        let mut cached = 0usize;
         for cu_file in &cu_files {
             let stem = cu_file.file_stem().unwrap().to_str().unwrap().to_string();
             let out_file = out_dir.join(format!("t{idx}__{stem}.{output_ext}"));
+
+            // Per-file freshness: skip nvcc when output exists and is
+            // newer than max(this .cu's mtime, target header floor).
+            // The header floor folds in every `.cuh` in the model+common
+            // dirs plus the signature file mtime, so touching a header
+            // invalidates every `.cu` in the target while touching a
+            // single `.cu` only invalidates itself. Conservative —
+            // false negatives (recompile when unchanged) are a minor
+            // perf miss; false positives (skip when changed) would
+            // silently ship stale PTX.
+            if signature_matches {
+                let cu_mt = std::fs::metadata(cu_file)
+                    .and_then(|m| m.modified())
+                    .ok();
+                let out_mt = std::fs::metadata(&out_file)
+                    .and_then(|m| m.modified())
+                    .ok();
+                let src_floor = match (cu_mt, header_floor) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                if let (Some(out_mt), Some(src_mt)) = (out_mt, src_floor) {
+                    if out_mt > src_mt {
+                        cached += 1;
+                        continue;
+                    }
+                }
+            }
+
             if let Err(e) =
                 compute_target.compile(cu_file, &out_file, &target.arch, &target.extra_flags)
             {
                 errors.push(e);
+            } else {
+                compiled += 1;
             }
         }
         if !errors.is_empty() {
             panic!("Kernel compilation failed:\n{}", errors.join("\n"));
+        }
+        if cached > 0 {
+            println!(
+                "cargo:warning=atlas-kernels: target {idx} ({}, {}, {}): {} cached, {} compiled",
+                target.hw, target.model, target.quant, cached, compiled
+            );
         }
 
         for cu_file in &cu_files {
@@ -439,6 +508,53 @@ fn find_cu_files(kernel_dir: &std::path::Path) -> Vec<PathBuf> {
             }
         })
         .collect()
+}
+
+/// Latest mtime over all `.cuh` files (headers only) in a directory.
+/// Used by the PTX-cache freshness check as the conservative shared
+/// dependency: any header touch invalidates every `.cu` that could
+/// have included it. We don't parse `#include`s, so this is
+/// per-target-coarse but per-`.cu`-fine — touching a single `.cu`
+/// only re-compiles that one file.
+fn latest_header_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut latest: Option<std::time::SystemTime> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("cuh") {
+            continue;
+        }
+        if let Ok(mt) = entry.metadata().and_then(|m| m.modified()) {
+            latest = Some(latest.map_or(mt, |prev| prev.max(mt)));
+        }
+    }
+    latest
+}
+
+/// Combined header-mtime for a target — model dir + common dir + the
+/// target-identity signature file. Per-`.cu` cache decisions then take
+/// `max(this_cu_mtime, this_target_header_floor)`.
+///
+/// The signature file lets us invalidate cached PTX when the
+/// `(hw, model, quant)` tuple at this `idx` slot changes from a prior
+/// build (e.g. user toggled `ATLAS_TARGET_MODEL` between a wildcard
+/// and a single model — same `t{idx}__` prefix would otherwise
+/// collide with stale PTX).
+fn target_header_floor(
+    model_dir: &std::path::Path,
+    common_dir: Option<&std::path::Path>,
+    signature_file: &std::path::Path,
+) -> Option<std::time::SystemTime> {
+    let mut latest = latest_header_mtime(model_dir);
+    if let Some(c) = common_dir {
+        if let Some(t) = latest_header_mtime(c) {
+            latest = Some(latest.map_or(t, |p| p.max(t)));
+        }
+    }
+    if let Ok(mt) = std::fs::metadata(signature_file).and_then(|m| m.modified()) {
+        latest = Some(latest.map_or(mt, |p| p.max(mt)));
+    }
+    latest
 }
 
 #[path = "build_codegen.rs"]

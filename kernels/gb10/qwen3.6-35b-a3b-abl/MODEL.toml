@@ -1,0 +1,123 @@
+# Abliterated Qwen3.6-35B-A3B kernel target.
+#
+# Tuned defaults for refusal-removed (abliterated) variants of the
+# qwen3_6_moe / qwen3_5_moe family at hidden_size=2048 — Huihui-Q36-abl,
+# AEON-7-Qwen3.6-heretic, etc. Architecture is identical to the
+# canonical `qwen3.6-35b-a3b` target (kernels are symlinked); only
+# sampling and behavior defaults differ.
+#
+# Dispatch note: until a per-checkpoint kernel-target override is wired
+# upstream, this target only activates with
+# `ATLAS_TARGET_MODEL=qwen3.6-35b-a3b-abl` at build time. The auto
+# `ptx_for_config` first-match-wins logic will otherwise pick the
+# canonical `qwen3.6-35b-a3b` because both targets match
+# `(qwen3_6_moe, 2048)`. See atlas-kernels/src/lib.rs:248.
+
+[model]
+name = "qwen3.6-35b-a3b-abl"
+hf_id = "Huihui-AI/Qwen3.6-35B-A3B-abliterated-NVFP4"
+params = "35B"
+active_params = "3B"
+architecture = "Gated DeltaNet + Full Attention + MoE + MRoPE (abliterated)"
+
+layers_total = 40
+layers_linear_attention = 30
+layers_full_attention = 10
+layer_pattern = "3:1 (linear, linear, linear, full)"
+
+moe_experts = 256
+moe_topk = 8
+moe_intermediate = 512
+shared_expert_intermediate = 512
+
+hidden_dim = 2048
+head_dim = 256
+q_heads = 16
+kv_heads = 2
+
+linear_attn_key_heads = 16
+linear_attn_key_dim = 128
+linear_attn_value_heads = 32
+linear_attn_value_dim = 128
+linear_conv_kernel = 4
+
+vocab_size = 248320
+max_position_embeddings = 262144
+rope_theta = 10000000
+partial_rotary_factor = 0.25
+attn_output_gate = true
+
+mrope_interleaved = true
+mrope_section = [11, 11, 10]
+
+mtp_layers = 1
+mtp_type = "full_attention"
+vision = true
+
+effective_context = 24576
+
+# ── Sampling tuned for abliterated checkpoints ──
+#
+# Abliteration removes the refusal-aligned weight directions, which
+# also slightly damps the model's natural diversity at low temperature
+# — leading to repetition loops on long-form text. Bumping presence
+# penalty and dropping top_p slightly counteracts the collapse without
+# hurting tool-call structure.
+
+[sampling.thinking_text]
+temperature = 0.7        # +0.1 vs canonical
+top_p = 0.92             # -0.03 — narrower truncation
+top_k = 20
+presence_penalty = 0.6   # +0.6 — counteract abliteration's repetition bias
+frequency_penalty = 0.1
+
+[sampling.thinking_coding]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.3
+frequency_penalty = 0.0
+
+[sampling.non_thinking]
+temperature = 0.8        # +0.1 — abliterated model can be conservative
+top_p = 0.85
+top_k = 20
+presence_penalty = 0.8   # +0.8 — long-form repetition risk
+frequency_penalty = 0.2
+
+[sampling.tools]
+temperature = 0.5        # -0.1 — tighter for tool selection
+top_p = 0.95
+top_k = 20
+presence_penalty = 0.3
+frequency_penalty = 0.0
+
+[behavior]
+# Abliterated MoE variants benefit from the loop watchdog because the
+# refusal-direction ablation can occasionally produce token-level
+# attractors that the model can't escape on its own. Cheap insurance.
+enable_loop_watchdog = true
+thinking_in_tools = false
+max_thinking_budget = 768           # +256 — abliterated tools sometimes need more
+default_num_drafts = 1              # K=2 same benchmark as canonical 35B-A3B
+fp8_kv_calibration_tokens = 256
+default_kv_dtype = "fp8"
+disable_tool_steering = false
+
+[[model_types]]
+model_type = "qwen3_6_moe"
+hidden_size = 2048
+
+[[model_types]]
+model_type = "qwen3_5_moe"
+hidden_size = 2048
+
+[kernel]
+moe_gate_shmem_bytes = 4096
+
+[dflash]
+draft_model = "z-lab/Qwen3.6-35B-A3B-DFlash"
+gamma = 16
+window_size = 4096
+mask_token_id = 248070
+target_layer_ids = [1, 10, 19, 28, 37]
