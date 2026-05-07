@@ -33,28 +33,70 @@ pub struct SsmWeightsQwen35 {
 }
 
 /// Load SSM weights for Qwen3.5 (separate projections, BF16 out_proj).
+///
+/// Handles three quant layouts for the linear-attention projections:
+///   * Raw BF16 (Bf16Raw) — pointer alias.
+///   * FP8 block-scaled (Fp8Dequanted) — dequant via `dense_auto`.
+///   * NVFP4 packed (Standard / CompressedTensors) — dequant to BF16 via
+///     `dequant_nvfp4_to_bf16`, which auto-detects modelopt naming
+///     (`.weight` uint8 + `weight_scale_2`) vs compressed-tensors naming
+///     (`.weight_packed` + `weight_global_scale`).
+///
+/// Returns BF16 dense weights regardless of source format so the
+/// downstream concat / re-quantize pipeline in
+/// `qwen35::load_layers::linear_attn_arms` works uniformly.
 pub(crate) fn load_ssm_qwen35(
     store: &WeightStore,
     layer_prefix: &str,
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
+    config: &atlas_core::config::ModelConfig,
 ) -> Result<SsmWeightsQwen35> {
     let p = format!("{layer_prefix}.linear_attn");
+    let h = config.hidden_size;
 
-    // For FP8 models: in_proj_qkv, in_proj_z, out_proj are FP8 block-scaled.
-    // conv1d, in_proj_a, in_proj_b are BF16 (in modules_to_not_convert).
-    let load_proj = |name: &str| -> Result<DenseWeight> {
+    // Detect NVFP4 packed format under either naming convention.
+    // Modelopt: packed bytes live in `.weight` (uint8) + `weight_scale_2` (FP32 scalar).
+    // Compressed-tensors: packed bytes live in `.weight_packed` + `weight_global_scale`.
+    let is_packed = |proj: &str| -> bool {
+        let prefix = format!("{p}.{proj}");
+        if store.contains(&format!("{prefix}.weight_packed")) {
+            return true;
+        }
+        if let Ok(w) = store.get(&format!("{prefix}.weight")) {
+            if w.dtype == WeightDtype::UInt8
+                && store.contains(&format!("{prefix}.weight_scale_2"))
+            {
+                return true;
+            }
+        }
+        false
+    };
+
+    // Load a projection as BF16 dense, dequantizing if the checkpoint
+    // ships NVFP4 packed bytes. `n`, `k` are the logical dims of the
+    // unpacked weight (n rows × k cols of BF16).
+    let load_proj_bf16 = |proj: &str, n: usize, k: usize| -> Result<DenseWeight> {
+        let prefix = format!("{p}.{proj}");
+        if is_packed(proj) {
+            return dequant_nvfp4_to_bf16(store, &prefix, n, k, gpu);
+        }
         match variant {
-            Nvfp4Variant::Fp8Dequanted => dense_auto(store, name, gpu),
-            _ => dense(store, name),
+            Nvfp4Variant::Fp8Dequanted => dense_auto(store, &format!("{prefix}.weight"), gpu),
+            _ => dense(store, &format!("{prefix}.weight")),
         }
     };
 
+    let qkv_size = config.ssm_qkv_size();
+    let z_size = config.ssm_z_size();
+    let nv = config.linear_num_value_heads;
+    let value_dim = nv * config.linear_value_head_dim;
+
     Ok(SsmWeightsQwen35 {
-        in_proj_qkv: load_proj(&format!("{p}.in_proj_qkv.weight"))?,
-        in_proj_z: load_proj(&format!("{p}.in_proj_z.weight"))?,
-        in_proj_a: dense(store, &format!("{p}.in_proj_a.weight"))?,
-        in_proj_b: dense(store, &format!("{p}.in_proj_b.weight"))?,
+        in_proj_qkv: load_proj_bf16("in_proj_qkv", qkv_size, h)?,
+        in_proj_z: load_proj_bf16("in_proj_z", z_size, h)?,
+        in_proj_a: load_proj_bf16("in_proj_a", nv, h)?,
+        in_proj_b: load_proj_bf16("in_proj_b", nv, h)?,
         conv1d: dense(store, &format!("{p}.conv1d.weight"))?,
         // A_log and dt_bias MUST be FP32 — BF16 precision causes exponential
         // error amplification in the GDR decay gate at 8k+ tokens.
@@ -62,7 +104,7 @@ pub(crate) fn load_ssm_qwen35(
         dt_bias: dense_keep_f32(store, &format!("{p}.dt_bias"), gpu)?,
         // norm.weight is safe as BF16 (no recurrent amplification)
         norm: dense_f32_safe(store, &format!("{p}.norm.weight"), gpu)?,
-        out_proj: load_proj(&format!("{p}.out_proj.weight"))?,
+        out_proj: load_proj_bf16("out_proj", h, value_dim)?,
     })
 }
 

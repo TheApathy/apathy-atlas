@@ -12,16 +12,31 @@ use crate::cli;
 
 pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     if config.model_type == "minimax_m2" {
-        Some(1.02)
-    } else if config
-        .quantization_config
-        .as_ref()
-        .is_some_and(|qc| qc.quant_method == "fp8")
-    {
-        Some(1.05)
-    } else {
-        None
+        return Some(1.02);
     }
+    let Some(qc) = config.quantization_config.as_ref() else {
+        return None;
+    };
+    if qc.quant_method == "fp8" {
+        return Some(1.05);
+    }
+    // NVFP4: weights mmap'd zero-copy. Runtime BF16 staging for SSM
+    // QKV/Z concat is the only sizable intermediate (~150 MB per
+    // linear-attention layer, freed after the layer's
+    // quantize_to_nvfp4 completes). Empirically 1.05× holds for both
+    // compressed-tensors and modelopt; the upstream fallback of 1.3×
+    // false-OOM'd 76 GB heretic 122B on a 119 GB GPU.
+    let is_nvfp4 = (qc.quant_method == "modelopt"
+        && qc.quant_algo.eq_ignore_ascii_case("NVFP4"))
+        || qc.quant_method == "compressed-tensors";
+    if is_nvfp4 {
+        // 1.02 fits 76 GB heretic 122B in a 119.7 GB GPU once the
+        // 13 GB inference reserve and 2 GB OOM guard are deducted.
+        // Compressed-tensors and modelopt NVFP4 are mmap'd zero-copy;
+        // SSM concat intermediates are freed per-layer.
+        return Some(1.02);
+    }
+    None
 }
 
 pub(crate) fn load_weight_store(

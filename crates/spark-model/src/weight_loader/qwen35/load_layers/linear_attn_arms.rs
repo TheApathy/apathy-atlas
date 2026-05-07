@@ -72,7 +72,7 @@ pub(super) fn build_linear_attention_fp8(
         out_fp8.k
     );
 
-    let ssm35 = load_ssm_qwen35(store, lp, gpu, variant)?;
+    let ssm35 = load_ssm_qwen35(store, lp, gpu, variant, config)?;
 
     let qkv_size = config.ssm_qkv_size();
     let z_size = config.ssm_z_size();
@@ -144,7 +144,7 @@ pub(super) fn build_linear_attention_nvfp4(
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
 ) -> Result<Box<dyn TransformerLayer>> {
-    let ssm35 = load_ssm_qwen35(store, lp, gpu, variant)?;
+    let ssm35 = load_ssm_qwen35(store, lp, gpu, variant, config)?;
 
     let qkv_rows = config.ssm_qkv_size();
     let z_rows = config.ssm_z_size();

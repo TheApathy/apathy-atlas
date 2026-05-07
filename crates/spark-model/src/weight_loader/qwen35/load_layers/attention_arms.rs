@@ -43,7 +43,16 @@ pub(super) fn build_full_attention_nvfp4(
     let i = layer_idx;
 
     let (attn, q_nvfp4, k_nvfp4, v_nvfp4) = match variant {
-        Nvfp4Variant::CompressedTensors => {
+        // NVFP4 already packed in the checkpoint (compressed-tensors:
+        // `.weight_packed` + `weight_global_scale`; modelopt: uint8
+        // `.weight` + `weight_scale_2`). `quantized_auto` reads either
+        // schema and returns the packed pointer without going through
+        // BF16, so we shard the packed bytes directly. Treating
+        // modelopt as Bf16Raw blew up here previously: `dense_auto`
+        // returned a uint8 ptr aliased as BF16, then quantize_to_nvfp4
+        // launched an absmax kernel that read 2× the allocation and
+        // hit ILLEGAL_ADDRESS at the first full_attention layer.
+        Nvfp4Variant::CompressedTensors | Nvfp4Variant::Standard => {
             let group_size = 16usize;
             let load_nvfp4 = |name: &str,
                               full_n: usize,
@@ -80,7 +89,7 @@ pub(super) fn build_full_attention_nvfp4(
             };
             (attn, Some(q), Some(k), Some(v))
         }
-        Nvfp4Variant::Standard | Nvfp4Variant::Fp8Dequanted | Nvfp4Variant::Bf16Raw => {
+        Nvfp4Variant::Fp8Dequanted | Nvfp4Variant::Bf16Raw => {
             tracing::info!("Layer {i}: loading attention projections ({variant:?})");
             let load_bf16_then_nvfp4 =
                 |name: &str,
