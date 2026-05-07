@@ -86,10 +86,33 @@ case "${1:-}" in
     ;;
 
   aeon7-27b)
-    echo "BLOCKED: AEON-7-DFlash-Qwen3.5-27B crashes at layer-2 transpose post loader patch." >&2
-    echo "Tracking in task #11 (Diagnose AEON-7 layer-2 transpose crash)." >&2
-    echo "Try after the downstream kernel/transpose fix lands." >&2
-    exit 2
+    # Loads + serves with our patches but output quality is degraded —
+    # Chinese/Japanese tokens from training distribution rather than
+    # coherent English. Tested both auto-selected qwen3.6-27b kernel
+    # target and forced qwen3.5-27b (this model has no MRoPE so 3.5
+    # is correct); both produce garbled output at ~12 tok/s.
+    #
+    # This is NOT the loader-crash bug we fixed — the model loads
+    # fully. It's a deeper kernel/weight-layout issue specific to
+    # AEON-7's modelopt-format SSM hybrid 27B. Likely candidates:
+    #   1. AEON-7's abliteration process produced corrupted SSM weights
+    #   2. modelopt input_scale not threaded through quantized_auto
+    #   3. shard_quantized_nvfp4 layout incompatibility for modelopt
+    #
+    # If you want to repro: spark serve with --kernel-target qwen3.5-27b
+    exec "$SPARK" serve \
+      --model-from-path "$MODELS/AEON-7-DFlash-Qwen3.5-27B-Uncensored-NVFP4" \
+      --model-name aeon7-27b \
+      --port "$PORT" \
+      --kernel-target qwen3.5-27b \
+      --gpu-memory-utilization 0.7 \
+      --kv-cache-dtype nvfp4 \
+      --kv-high-precision-layers auto \
+      --max-seq-len 4096 \
+      --enable-prefix-caching \
+      --speculative \
+      --num-drafts 1 \
+      --mtp-quantization nvfp4
     ;;
 
   '' | -h | --help)
