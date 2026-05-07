@@ -29,14 +29,20 @@ MODELS="${MODELS_DIR:-/path/to/models}"
 
 case "${1:-}" in
   huihui-q36)
-    # Validated config (2026-05-07): patched OSS Atlas + MTP + ngram
-    # speculative + NVFP4 KV. Mean 87 tok/s, peak 92, 104.7 on
-    # predictable workloads. +6.9% over closed-source Atlas 2.99
-    # docker on the same checkpoint.
+    # WINNING CONFIG (validated 2026-05-07 spec sweep, 4-prompt mix):
     #
-    # Knobs that did NOT help: --self-speculative (no measurable
-    # change), --num-drafts 2 (43% slower per Atlas docs on 35B-A3B
-    # — verified), --scheduling-policy slai (FIFO equal at batch=1).
+    #   A — MTP + ngram K=2:                    79-93 tok/s,  mean 87.9
+    #   B — MTP K=2 only (NO ngram):           104-122 tok/s, mean 112  🏆
+    #   C — MTP K=3 (num_drafts=2):             71-109 tok/s, mean 88.9
+    #   D — MTP K=2 + self-spec:                62-64  tok/s, mean 62.8
+    #
+    # The ngram K=2 reject path was net-negative on diverse text
+    # (each rejected verify costs 15.8ms = full forward pass).
+    # Self-spec adds overhead with no benefit on this checkpoint.
+    # K=3 is 21% slower than K=2 (Atlas docs predicted, confirmed).
+    #
+    # Result: +37.4% over closed-source Atlas Alpha 2.99 production
+    # docker (81.5 tok/s baseline) on the same Huihui-Q36-abl checkpoint.
     exec "$SPARK" serve \
       --model-from-path "$MODELS/Huihui-NVFP4-Sehyo-MTP" \
       --model-name qwen36-abl \
@@ -48,7 +54,6 @@ case "${1:-}" in
       --max-seq-len 16384 \
       --enable-prefix-caching \
       --speculative \
-      --ngram-speculative \
       --num-drafts 1 \
       --mtp-quantization nvfp4 \
       --max-thinking-budget 768 \
