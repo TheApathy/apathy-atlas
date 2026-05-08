@@ -154,45 +154,6 @@ impl TransformerModel {
                         img_idx += 1;
                     }
                 }
-                // ── Vision feature magnitude correction ──
-                // Empirical (2026-05-08, ATLAS_DUMP_VIT trace): the merger
-                // fc2 output has abs_mean=0.04 — too low magnitude for the
-                // LLM to attend to vs text token embeddings (~1.0). Without
-                // amplification the model perceives image_pad positions as
-                // ~zero noise and reports "blank canvas" for any image.
-                // ATLAS_VISION_SCALE provides a runtime override so we can
-                // sweep magnitudes without rebuilding (default 1.0 = no
-                // change). Set to e.g. 25.0 to test the magnitude
-                // hypothesis.
-                let vis_scale: f32 = std::env::var("ATLAS_VISION_SCALE")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1.0);
-                if (vis_scale - 1.0).abs() > 1e-6 && img_idx > 0 {
-                    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
-                    if let Ok(k_scale) = self
-                        .gpu
-                        .kernel("vision_scale", "bf16_scale_inplace")
-                    {
-                        // Scale only the bytes we just wrote. Each pad
-                        // token wrote `out_hidden_size` BF16 elements; the
-                        // pads aren't necessarily contiguous in the hidden
-                        // buffer, so scale per-image-pad in place.
-                        for (i, &tok) in tokens.iter().enumerate() {
-                            if tok == pad_id {
-                                let dst = hidden.offset(i * h * fp32);
-                                let n = ve.out_hidden_size as u32;
-                                KernelLaunch::new(self.gpu.as_ref(), k_scale)
-                                    .grid([div_ceil(n, 256), 1, 1])
-                                    .block([256, 1, 1])
-                                    .arg_ptr(dst)
-                                    .arg_u32(n)
-                                    .arg_f32(vis_scale)
-                                    .launch(stream)?;
-                            }
-                        }
-                    }
-                }
             }
         }
 
