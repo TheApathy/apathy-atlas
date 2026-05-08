@@ -84,20 +84,6 @@ pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>
 
     // Build patches. The temporal dimension is handled by duplicating the image `tp` times.
     // Layout: [P, C, T, Hp, Wp] → stored as [P, C*T*Hp*Wp] in row-major order.
-    //
-    // ATLAS_VISION_CHANNEL_ROTATE: 2026-05-08 channel-rotation diagnostic.
-    // Empirical test on canonical RedHatAI-Qwen3.6-NVFP4-vllm showed solid
-    // R/G/B inputs produce model outputs of green/red/blue respectively
-    // (a +1 channel rotation in the model's perception). Hypothesis: the
-    // patch_embed weight load or the GEMM K-axis order in Atlas applies
-    // an unintended rotation. To test:
-    //   ATLAS_VISION_CHANNEL_ROTATE=1   write to physical c+1 mod 3
-    //   ATLAS_VISION_CHANNEL_ROTATE=2   write to physical c+2 mod 3
-    //   ATLAS_VISION_CHANNEL_ROTATE=-1  write to physical c-1 mod 3
-    let rot: i32 = std::env::var("ATLAS_VISION_CHANNEL_ROTATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
     for ph in 0..grid_h {
         for pw in 0..grid_w {
             let patch_idx = ph * grid_w + pw;
@@ -111,12 +97,7 @@ pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>
                                 img.get_pixel(pixel_x as u32, pixel_y as u32)[c] as f32 / 255.0;
                             let norm = (raw - MEAN[c]) / STD[c];
                             // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
-                            // With rotation: place logical channel `c` at
-                            // physical channel `(c + rot) mod 3` so we can
-                            // probe whether downstream load/GEMM applies an
-                            // implicit channel permutation.
-                            let phys_c = (((c as i32) + rot).rem_euclid(3)) as usize;
-                            let off = phys_c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
+                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
                             pixels[patch_idx * patch_dim + off] = norm;
                         }
                     }
