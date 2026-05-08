@@ -18,6 +18,25 @@ const STD: [f32; 3] = [0.5, 0.5, 0.5];
 /// Maximum allowed image dimension in pixels (longer side).
 const MAX_DIM: u32 = 1280;
 
+/// Minimum useful image dimension in pixels (longer side). Below this,
+/// Qwen3-VL produces too few visual tokens after `spatial_merge_size=2`
+/// reduction for confident recognition on natural images.
+///
+/// Empirical curve (2026-05-08, RedHatAI canonical Qwen3.6-VL):
+///   224×224 (49 tok)  — collapses to "blank" for natural images
+///   448×448 (196 tok) — partial recognition
+///   512×512 (256 tok) — solid colors + simple scenes recognized
+///   768×768 (576 tok) — confident recognition on complex scenes
+///   1024×1024 (1024 tok) — full quality
+///
+/// 512 is the speed/quality sweet spot. Vision-encoder TTFT scales
+/// with patch count P (attention is P², MLP is P×D), so dropping from
+/// 768 to 512 reduces vision encoder work ~2.3×.
+///
+/// Override with ATLAS_VISION_MIN_DIM=<pixels> for workload-specific
+/// trade-offs. Set to 0 to disable upscaling entirely.
+const DEFAULT_MIN_DIM: u32 = 512;
+
 /// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
 fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     // Strip optional "data:image/<fmt>;base64," prefix.
@@ -42,12 +61,33 @@ fn decode_image(data_uri: &str) -> Result<DynamicImage> {
 }
 
 /// Compute the target (H, W) so that:
-/// - Neither side exceeds `MAX_DIM`.
+/// - Longer side is in `[MIN_DIM, MAX_DIM]` (auto-upscale tiny images).
 /// - Both sides are multiples of `grid_unit = patch_size × spatial_merge_size`.
 /// - Aspect ratio is preserved (rounded to nearest grid_unit).
+///
+/// `MIN_DIM` is read from `ATLAS_VISION_MIN_DIM` (default 768). Set to
+/// 0 to disable upscaling entirely (legacy behaviour).
 fn target_size(orig_h: u32, orig_w: u32, grid_unit: u32) -> (u32, u32) {
-    let scale = (MAX_DIM as f32) / (orig_h.max(orig_w) as f32);
-    let scale = scale.min(1.0); // never upscale
+    let min_dim: u32 = std::env::var("ATLAS_VISION_MIN_DIM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MIN_DIM);
+    let longer = orig_h.max(orig_w) as f32;
+    // Scale the longer side into [min_dim, MAX_DIM]. Compute both bounds
+    // and pick whichever is needed (downscale, no-op, or upscale).
+    let scale_down = (MAX_DIM as f32) / longer;
+    let scale_up = if min_dim > 0 && longer > 0.0 {
+        (min_dim as f32) / longer
+    } else {
+        0.0
+    };
+    let scale = if scale_down < 1.0 {
+        scale_down
+    } else if scale_up > 1.0 {
+        scale_up
+    } else {
+        1.0
+    };
     let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
     let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
     (target_h, target_w)
@@ -123,17 +163,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_target_size_no_upscale() {
-        // Small image: grid_unit=32, no upscale needed.
+    fn test_target_size_upscale_small() {
+        // Small image (longer side 150 < 512): should be upscaled
+        // toward ~512 on the longer side, preserving aspect ratio.
+        // Reads ATLAS_VISION_MIN_DIM at call time, defaults to 512.
         let (h, w) = target_size(100, 150, 32);
         assert!(h <= 1280 && w <= 1280);
+        assert!(h.max(w) >= 480, "expected longer side >= 480, got h={h} w={w}");
         assert_eq!(h % 32, 0);
         assert_eq!(w % 32, 0);
     }
 
     #[test]
     fn test_target_size_downscale() {
-        // Large image: should be downscaled.
+        // Large image: should be downscaled to <=1280.
         let (h, w) = target_size(2000, 3000, 32);
         assert!(h.max(w) <= 1280);
         assert_eq!(h % 32, 0);

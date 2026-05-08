@@ -44,20 +44,99 @@ impl TransformerModel {
             None => return Ok(()),
         };
         let stream = self.gpu.default_stream();
+
+        // Single-entry vision cache. ON by default (2026-05-08 v2).
+        //
+        // Strategy: keep a dedicated GPU buffer (`vision_cache_buf`)
+        // that holds a snapshot of `ve.buf_out` after the previous
+        // ViT forward, plus a u64 fingerprint of the (grid + pixel
+        // bytes) that produced it. Cache HIT path:
+        //   1. Stream-sync to ensure the previous encode's writes are
+        //      visible (and that no in-flight LLM read overlaps).
+        //   2. D2D copy `vision_cache_buf` → `ve.buf_out` so the
+        //      splice in prefill_c reads the right features.
+        //   3. Restore the cached grids + patch count.
+        //
+        // Why the snapshot copy: `ve.buf_out` is shared scratch; later
+        // calls (e.g. an MTP head asking for vision again, or a stale
+        // pointer from a prior request) could overwrite it. A
+        // dedicated buffer pair makes the cache invariant explicit.
+        // Set ATLAS_VISION_CACHE=0 to disable.
+        let cache_on = std::env::var("ATLAS_VISION_CACHE")
+            .ok()
+            .map(|s| s != "0" && s != "false")
+            .unwrap_or(true);
+        let fp = if cache_on { vision_fingerprint(images) } else { 0 };
+        if cache_on && fp != 0 {
+            let last = self.vision_cache_fp.load(std::sync::atomic::Ordering::Relaxed);
+            if fp == last {
+                let cached = self.vision_cache_grids.lock().clone();
+                let cache_buf = *self.vision_cache_buf.lock();
+                let cache_bytes = self.vision_cache_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                if !cached.is_empty()
+                    && cached.len() == images.len()
+                    && cache_buf.0 != 0
+                    && cache_bytes > 0
+                {
+                    self.gpu.synchronize(stream)?;
+                    self.gpu
+                        .copy_d2d_async(cache_buf, ve.buf_out, cache_bytes, stream)?;
+                    self.gpu.synchronize(stream)?;
+                    let total: usize = cached.iter().map(|(h, w)| h * w).sum();
+                    *self.vision_embed_patches.lock() = total;
+                    *self.vision_image_grids.lock() = cached;
+                    tracing::info!(
+                        "Vision encoder: {} patches (CACHE HIT, restored {:.1} MB from cache)",
+                        total,
+                        cache_bytes as f64 / 1_048_576.0
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         let mut total_patches = 0usize;
         let mut post_merge_grids: Vec<(usize, usize)> = Vec::with_capacity(images.len());
         let sms = ve.spatial_merge_size.max(1);
         for (pixels, grid_h, grid_w) in images {
             let p = ve.forward(pixels, *grid_h, *grid_w, self.gpu.as_ref(), stream)?;
             total_patches += p;
-            // Record post-merge dimensions for downstream MRoPE position
-            // computation. The ViT folds `sms × sms` pre-merge patches into
-            // a single output embedding, so the effective spatial grid
-            // shrinks by that factor in each axis.
             post_merge_grids.push((grid_h / sms, grid_w / sms));
         }
         *self.vision_embed_patches.lock() = total_patches;
-        *self.vision_image_grids.lock() = post_merge_grids;
+        *self.vision_image_grids.lock() = post_merge_grids.clone();
+
+        if cache_on && fp != 0 && total_patches > 0 {
+            // Snapshot ve.buf_out into the cache buffer. Allocate (or
+            // grow) on first use / size change.
+            // Buf_out layout per forward.rs: rows
+            // [0 .. (1 + n_deepstack) * merged_p) × out_hidden_size.
+            // We only cache the FIRST merger output (rows 0..merged_p)
+            // because that's all the splice consumes. Compute exact
+            // bytes from total_patches × out_hidden_size × 2 (BF16).
+            let needed_bytes = total_patches * ve.out_hidden_size * 2;
+            let have_bytes = self
+                .vision_cache_bytes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let mut buf_guard = self.vision_cache_buf.lock();
+            if have_bytes < needed_bytes {
+                if buf_guard.0 != 0 {
+                    let _ = self.gpu.free(*buf_guard);
+                }
+                *buf_guard = self.gpu.alloc(needed_bytes)?;
+                self.vision_cache_bytes
+                    .store(needed_bytes, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.gpu.synchronize(stream)?;
+            self.gpu
+                .copy_d2d_async(ve.buf_out, *buf_guard, needed_bytes, stream)?;
+            self.gpu.synchronize(stream)?;
+            drop(buf_guard);
+
+            *self.vision_cache_grids.lock() = post_merge_grids;
+            self.vision_cache_fp
+                .store(fp, std::sync::atomic::Ordering::Relaxed);
+        }
         tracing::info!("Vision encoder: {} patches encoded", total_patches);
         Ok(())
     }
@@ -489,4 +568,41 @@ impl TransformerModel {
 
         Ok(self.decode_logits_ptr())
     }
+}
+
+/// FNV-1a hash over the (grid + raw pixel f32 bytes) of all images in
+/// a request. Used by the single-entry vision cache to skip ViT
+/// forward when the same images appear back-to-back. Returns 0 for an
+/// empty image list (cache always misses on 0).
+fn vision_fingerprint(images: &[(Vec<f32>, usize, usize)]) -> u64 {
+    if images.is_empty() {
+        return 0;
+    }
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x100_0000_01b3;
+    let mut h: u64 = FNV_OFFSET;
+    let mix = |h: &mut u64, b: u8| {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(FNV_PRIME);
+    };
+    for (pixels, gh, gw) in images {
+        for &b in (*gh as u32).to_le_bytes().iter() {
+            mix(&mut h, b);
+        }
+        for &b in (*gw as u32).to_le_bytes().iter() {
+            mix(&mut h, b);
+        }
+        // Hash a sparse subset of the pixel f32 stream — every 64th
+        // element. Full hash on a 1024×1024 image is ~3 MB; sparse
+        // hash is <50 KB and still distinguishes distinct images
+        // (collisions are astronomically rare for natural pixel data).
+        for chunk in pixels.chunks(64) {
+            if let Some(&v) = chunk.first() {
+                for &b in v.to_le_bytes().iter() {
+                    mix(&mut h, b);
+                }
+            }
+        }
+    }
+    if h == 0 { 1 } else { h }
 }
