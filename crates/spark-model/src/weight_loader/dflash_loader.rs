@@ -54,6 +54,44 @@ pub struct DflashConfig {
     /// DFlash-specific nested config object.
     #[serde(default)]
     pub dflash_config: Option<DflashSubConfig>,
+    /// Per-layer attention type. Qwen3.6-27B-DFlash ships
+    /// `["sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"]`
+    /// — first 4 layers are SWA, last is full. Older drafters omit the field
+    /// (treated as all `full_attention`).
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+    /// SWA span (only meaningful when `layer_types` contains `sliding_attention`).
+    /// Qwen3.6-27B-DFlash sets this to 2048.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    /// RoPE rotation base. Qwen3.6-27B-DFlash and 35B-DFlash both ship 10_000_000.
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    /// `rope_scaling` block from HF config. `None` for the 27B drafter
+    /// (vanilla RoPE), `Some(...)` for the 35B drafter (YaRN). Atlas
+    /// branches on this to pick `rope_forward` vs `rope_forward_yarn`.
+    #[serde(default)]
+    pub rope_scaling: Option<DflashRopeScaling>,
+}
+
+fn default_rope_theta() -> f32 {
+    10_000_000.0
+}
+
+/// HF `rope_scaling` block. Qwen3.5/3.6 DFlash drafters that DO use scaling
+/// set `rope_type = "yarn"`. The 27B drafter omits the entire block.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DflashRopeScaling {
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f32>,
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
 }
 
 fn default_block_size() -> usize {

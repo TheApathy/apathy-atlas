@@ -240,7 +240,24 @@ impl BlockDiffusionDraftHead {
             dump_bf16("layer0.k_buf[ctx0].post_rope", self.scratch.k_buf, 10)?;
         }
 
-        // 3e. attention — non-causal, q_len = kv_len = n_attn.
+        // 3e. attention — q_len = kv_len = n_attn.
+        // Per-layer SWA + causal (vLLM PR #40898 dflash.py:410-447):
+        //  - `sliding_attention` layers (Qwen3.6-27B-DFlash idx 0..3):
+        //    causal=True, sliding_window=2048
+        //  - `full_attention` layer (idx 4): causal=False, window=0
+        // When `layer_window_sizes`/`layer_causal` are empty (older drafter
+        // without `layer_types`), fall back to non-causal full attention —
+        // matches the 3.5-era propose() codepath.
+        let layer_window = self
+            .layer_window_sizes
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(0);
+        let layer_causal = self
+            .layer_causal
+            .get(layer_idx)
+            .copied()
+            .unwrap_or(false);
         ops::prefill_attention(
             gpu,
             self.kernels.prefill_attn,
@@ -254,8 +271,8 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            false,
-            0,
+            layer_causal,
+            layer_window,
             stream,
         )?;
         if layer_idx == 0 {

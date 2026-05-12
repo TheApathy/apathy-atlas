@@ -178,40 +178,67 @@ impl BlockDiffusionDraftHead {
             position_ids: gpu.alloc(n_attn * 4)?,
         };
 
-        // Pre-compute yarn inv_freq table for drafter RoPE. Mirrors the
-        // formula in `mistral_loader.rs:518-577`. Drafter config:
-        //   factor = 64.0, beta_fast = 32.0, beta_slow = 1.0,
-        //   original_max_position_embeddings = 4096
-        let rope_theta = 10_000_000.0f32; // drafter rope_theta
+        // Pre-compute RoPE inv_freq table. Two paths based on the drafter's
+        // `rope_scaling` config:
+        //   - `Some(yarn)` → YaRN ramp interpolation (35B drafter)
+        //   - `None`       → vanilla RoPE inv_freq (27B drafter — verified
+        //                    via `z-lab/Qwen3.6-27B-DFlash/config.json` —
+        //                    `rope_scaling: None`, `rope_theta: 10_000_000`)
+        // Without this branch, the 27B drafter sees YaRN-rotated K/V and
+        // attention scores diverge → ~3% accept rate (verified empirically).
+        let rope_theta = weights.config.rope_theta;
         let rotary_dim = head_dim; // Qwen3.6-DFlash applies rope to full head_dim
-        let factor = 64.0f32;
-        let beta_fast = 32.0f32;
-        let beta_slow = 1.0f32;
-        let orig_max_pos = 4096.0f32;
         let dim_f = rotary_dim as f32;
         let n_pairs = rotary_dim / 2;
-        let find_correction_dim = |num_rot: f32| -> f32 {
-            (dim_f * (orig_max_pos / (num_rot * 2.0 * std::f32::consts::PI)).ln())
-                / (2.0 * rope_theta.ln())
-        };
-        let low = find_correction_dim(beta_fast).floor().max(0.0);
-        let high = find_correction_dim(beta_slow)
-            .ceil()
-            .min((rotary_dim - 1) as f32);
-        let ramp_denom = if (high - low).abs() < 1e-6 {
-            high - low + 0.001
-        } else {
-            high - low
-        };
         let mut inv_freq_table = vec![0.0f32; n_pairs];
-        for j in 0..n_pairs {
-            let pos_freq = rope_theta.powf((2 * j) as f32 / dim_f);
-            let inv_freq_extrap = 1.0 / pos_freq;
-            let inv_freq_interp = 1.0 / (factor * pos_freq);
-            let ramp = ((j as f32 - low) / ramp_denom).clamp(0.0, 1.0);
-            let extrap_factor = 1.0 - ramp;
-            inv_freq_table[j] =
-                inv_freq_interp * (1.0 - extrap_factor) + inv_freq_extrap * extrap_factor;
+        if let Some(scaling) = weights.config.rope_scaling.as_ref()
+            && scaling.rope_type.as_deref() == Some("yarn")
+        {
+            // YaRN path (35B drafter and any future YaRN-scaled drafter).
+            let factor = scaling.factor.unwrap_or(64.0);
+            let beta_fast = scaling.beta_fast.unwrap_or(32.0);
+            let beta_slow = scaling.beta_slow.unwrap_or(1.0);
+            let orig_max_pos =
+                scaling.original_max_position_embeddings.unwrap_or(4096) as f32;
+            let find_correction_dim = |num_rot: f32| -> f32 {
+                (dim_f * (orig_max_pos / (num_rot * 2.0 * std::f32::consts::PI)).ln())
+                    / (2.0 * rope_theta.ln())
+            };
+            let low = find_correction_dim(beta_fast).floor().max(0.0);
+            let high = find_correction_dim(beta_slow)
+                .ceil()
+                .min((rotary_dim - 1) as f32);
+            let ramp_denom = if (high - low).abs() < 1e-6 {
+                high - low + 0.001
+            } else {
+                high - low
+            };
+            for j in 0..n_pairs {
+                let pos_freq = rope_theta.powf((2 * j) as f32 / dim_f);
+                let inv_freq_extrap = 1.0 / pos_freq;
+                let inv_freq_interp = 1.0 / (factor * pos_freq);
+                let ramp = ((j as f32 - low) / ramp_denom).clamp(0.0, 1.0);
+                let extrap_factor = 1.0 - ramp;
+                inv_freq_table[j] = inv_freq_interp * (1.0 - extrap_factor)
+                    + inv_freq_extrap * extrap_factor;
+            }
+            tracing::info!(
+                "DFlash YaRN inv_freq: {n_pairs} pairs, factor={factor}, \
+                 beta_fast={beta_fast}, beta_slow={beta_slow}, \
+                 max_pos={orig_max_pos}, low_dim={low:.1}, high_dim={high:.1}"
+            );
+        } else {
+            // Vanilla RoPE: inv_freq[j] = 1 / theta^(2j/dim). 27B drafter ships
+            // `rope_scaling: None` so this path produces the correct K/V
+            // rotation expected by the drafter weights.
+            for j in 0..n_pairs {
+                let pos_freq = rope_theta.powf((2 * j) as f32 / dim_f);
+                inv_freq_table[j] = 1.0 / pos_freq;
+            }
+            tracing::info!(
+                "DFlash vanilla RoPE inv_freq: {n_pairs} pairs, theta={rope_theta} \
+                 (drafter has no rope_scaling)"
+            );
         }
         let inv_freq_bytes: Vec<u8> = inv_freq_table
             .iter()
@@ -219,11 +246,52 @@ impl BlockDiffusionDraftHead {
             .collect();
         let yarn_inv_freq = gpu.alloc(inv_freq_bytes.len())?;
         gpu.copy_h2d(&inv_freq_bytes, yarn_inv_freq)?;
-        tracing::info!(
-            "DFlash yarn inv_freq: {} pairs, factor={factor}, beta_fast={beta_fast}, \
-             beta_slow={beta_slow}, max_pos={orig_max_pos}, low_dim={low:.1}, high_dim={high:.1}",
-            n_pairs,
-        );
+
+        // Per-layer SWA window (vLLM PR #40898). When the drafter ships
+        // `layer_types` + `sliding_window`, build the per-layer u32 vector
+        // — `0` for full_attention layers, `sliding_window` for
+        // sliding_attention. Compute path will pass this to
+        // `prefill_attention(sliding_window=...)`. KV cache stays full
+        // (per PR40898 rationale: drafter writes every context KV before
+        // drafting and cannot evict from any layer).
+        let (layer_window_sizes, layer_causal): (Vec<u32>, Vec<bool>) = match (
+            weights.config.layer_types.as_ref(),
+            weights.config.sliding_window,
+        ) {
+            (Some(types), Some(sw)) if types.len() == num_layers => {
+                let mut sliding_count = 0usize;
+                let mut windows = Vec::with_capacity(num_layers);
+                let mut causals = Vec::with_capacity(num_layers);
+                for t in types {
+                    if t == "sliding_attention" {
+                        sliding_count += 1;
+                        windows.push(sw as u32);
+                    } else {
+                        windows.push(0);
+                    }
+                    // DFlash reference (dflash.py) sets `is_causal = False` for ALL
+                    // attention layers. The drafter is a block-diffusion model: all
+                    // γ noise tokens must attend to each other (non-causal). Causal
+                    // attention would make the drafter autoregressive within the
+                    // block, producing garbage drafts.
+                    causals.push(false);
+                }
+                tracing::info!(
+                    "DFlash per-layer SWA: {sliding_count}/{num_layers} layers use \
+                     sliding_window={sw} causal=false (matches dflash.py reference); \
+                     full_attention layers use causal=false"
+                );
+                (windows, causals)
+            }
+            (Some(types), None) if types.iter().any(|t| t == "sliding_attention") => {
+                anyhow::bail!(
+                    "DFlash drafter has sliding_attention layers but no `sliding_window` \
+                     in config — refusing to silently treat as full-attention (would \
+                     break drafts)"
+                );
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
 
         let head = Self {
             num_layers,
@@ -237,6 +305,8 @@ impl BlockDiffusionDraftHead {
             gamma: gamma_val,
             mask_token_id,
             window_size,
+            layer_window_sizes,
+            layer_causal,
             target_layer_ids,
             target_hidden_size,
 
