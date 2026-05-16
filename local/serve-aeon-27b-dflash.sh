@@ -1,0 +1,50 @@
+#!/bin/bash
+# Atlas Spark — AEON-7 Qwen3.6-27B target + Qwen3.6-27B-DFlash drafter
+# Tight mem because γ=16 inflates SSM-MTP-pool + KV by ~24 GB.
+#
+# ATLAS_DFLASH_DRAFT_CAP=16 — full γ=16 drafts + 1 prefix = K=17 verify.
+# K=17 triggers gdn_decode_wy17 which saves all 17 intermediates.
+# caps 4..15 fall through to the sequential path (no intermediates)
+# and corrupt SSM rollback — DO NOT USE.
+#
+# ATLAS_DFLASH_CTX_WINDOW=512 — drafter trained on full prefix; capping
+# at γ cripples accept rate. 512 ≈ 280 MB scratch, affordable.
+#
+# ATLAS_DFLASH_QUANT={bf16|nvfp4} — drafter weight precision. Defaults to
+# bf16 to preserve the pre-existing production path. `nvfp4` runtime-
+# quantizes every dense projection in the drafter (7/layer + `fc`) at
+# model-load time so the per-step forward runs through the same fast
+# `w4a16_gemm` kernels the target model uses, cutting propose latency
+# from ~134 ms → ~25-40 ms on GB10 at γ=16, ctx_window=512. RMSNorm and
+# bias tensors stay BF16. Frees ~3.3 GB of BF16 source weights post-
+# quantize; verify-side parity is preserved because the target's logits
+# are always the source of truth.
+export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-16}
+export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-512}
+export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
+
+exec /home/flocka/atlas-src/target/release/spark serve \
+  --model-from-path /home/flocka/models/AEON-Q36-27B-Full \
+  --model-name aeon-27b-dflash \
+  --port 8890 \
+  --kernel-target qwen3.6-27b \
+  --gpu-memory-utilization 0.65 \
+  --kv-cache-dtype turbo4 \
+  --kv-high-precision-layers auto \
+  --max-seq-len 8192 \
+  --max-batch-size 1 \
+  --max-num-seqs 1 \
+  --enable-prefix-caching \
+  --dflash \
+  --draft-model /home/flocka/models/z-lab-Qwen3.6-27B-DFlash \
+  --dflash-gamma 16 \
+  --dflash-quantization "$ATLAS_DFLASH_QUANT"
+# IMPORTANT: ATLAS_DFLASH_DRAFT_CAP MUST equal γ (=16) so total verify tokens
+# K = γ + 1 = 17 hits the fused `gdn_wy17_k` SSM kernel. Any DRAFT_CAP < γ
+# (e.g. 15 → K=16) routes through the sequential per-token SSM path which
+# has a NaN bug at positions K-3..K-1 for K>4. Symptom: target output
+# becomes `correct_first_token + !!!!!`. Confirmed via 64-layer HF reference
+# (modelforge inspect-batched) — atlas_kgamma_layer0_pos13..15 = NaN at
+# DRAFT_CAP=15 but pos0..16 all valid at DRAFT_CAP=16. \
+  --max-thinking-budget 768 \
+  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
