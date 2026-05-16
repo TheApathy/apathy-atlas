@@ -148,6 +148,23 @@ impl TransformerModel {
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
         let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        // Mirror verify_b.rs (K=2) auto-unsuppress logic. Without this the
+        // K=γ verify path stays EAGER forever once FP8/turbo KV calibration
+        // sets suppress_graphs=true at startup, and never gets recaptured
+        // into a CUDA graph. Eager K=γ verify is ~5x slower than graphed
+        // (observed: K=9 eager 600ms/step vs K=4 graphed 80ms/step). Once
+        // seq_len passes the calibration window, FP8 scales are frozen and
+        // graph capture is safe.
+        if self
+            .suppress_graphs
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            && std::env::var("ATLAS_DUMP_HIDDEN").is_err()
+        {
+            self.suppress_graphs
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs (K=γ verify)");
+        }
         let use_graphs = self.comm.is_none()
             && !self
                 .suppress_graphs
