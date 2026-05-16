@@ -253,6 +253,11 @@ impl TransformerModel {
         token_idx: usize,
         stream: u64,
     ) -> Result<()> {
+        // DEBUG: bypass capture to test if dflash_hidden_save writes corrupt
+        // target output. Set ATLAS_DFLASH_NO_CAPTURE=1 to skip the d2d.
+        if std::env::var("ATLAS_DFLASH_NO_CAPTURE").ok().as_deref() == Some("1") {
+            return Ok(());
+        }
         let dst = match self.dflash_hidden_save {
             Some(p) => p,
             None => return Ok(()),
