@@ -19,6 +19,13 @@
 # bias tensors stay BF16. Frees ~3.3 GB of BF16 source weights post-
 # quantize; verify-side parity is preserved because the target's logits
 # are always the source of truth.
+# IMPORTANT: ATLAS_DFLASH_DRAFT_CAP MUST equal γ (=16) so total verify tokens
+# K = γ + 1 = 17 hits the fused `gdn_wy17_k` SSM kernel. Any DRAFT_CAP < γ
+# (e.g. 15 → K=16) routes through the sequential per-token SSM path which
+# has a NaN bug at positions K-3..K-1 for K>4. Symptom: target output
+# becomes `correct_first_token + !!!!!`. Confirmed via 64-layer HF reference
+# (modelforge inspect-batched) — atlas_kgamma_layer0_pos13..15 = NaN at
+# DRAFT_CAP=15 but pos0..16 all valid at DRAFT_CAP=16.
 export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-16}
 export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-512}
 export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
@@ -38,13 +45,6 @@ exec /path/to/atlas-src/target/release/spark serve \
   --dflash \
   --draft-model /path/to/models/z-lab-Qwen3.6-27B-DFlash \
   --dflash-gamma 16 \
-  --dflash-quantization "$ATLAS_DFLASH_QUANT"
-# IMPORTANT: ATLAS_DFLASH_DRAFT_CAP MUST equal γ (=16) so total verify tokens
-# K = γ + 1 = 17 hits the fused `gdn_wy17_k` SSM kernel. Any DRAFT_CAP < γ
-# (e.g. 15 → K=16) routes through the sequential per-token SSM path which
-# has a NaN bug at positions K-3..K-1 for K>4. Symptom: target output
-# becomes `correct_first_token + !!!!!`. Confirmed via 64-layer HF reference
-# (modelforge inspect-batched) — atlas_kgamma_layer0_pos13..15 = NaN at
-# DRAFT_CAP=15 but pos0..16 all valid at DRAFT_CAP=16. \
+  --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
   --warmup-prompt /path/to/atlas-src/local/warmup.txt
