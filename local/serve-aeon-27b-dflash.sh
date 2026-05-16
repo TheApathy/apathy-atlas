@@ -2,6 +2,29 @@
 # Atlas Spark — AEON-7 Qwen3.6-27B target + Qwen3.6-27B-DFlash drafter
 # Tight mem because γ=16 inflates SSM-MTP-pool + KV by ~24 GB.
 #
+# CRASH-SAFE WRAPPER (2026-05-16): preflight kill + port + memory checks
+# (host crashed during repeated launches without these). 0.65 utilization
+# is already conservative; this script just refuses to start in unsafe state.
+set -euo pipefail
+
+PORT=${PORT:-8890}
+if pgrep -x spark >/dev/null 2>&1; then
+  echo "[serve-aeon-27b-dflash] killing prior spark serve..."
+  pkill -9 -x spark || true
+  sleep 4
+fi
+if ss -tnlp 2>/dev/null | grep -q ":${PORT} "; then
+  echo "[serve-aeon-27b-dflash] ERROR: port ${PORT} still bound" >&2
+  exit 1
+fi
+FREE_GB=$(free -g | awk '/^Mem:/ {print $7}')
+if [ "${FREE_GB:-0}" -lt 50 ]; then
+  echo "[serve-aeon-27b-dflash] ERROR: only ${FREE_GB} GB free, need ≥50 GB (DFlash adds 24 GB pool)" >&2
+  free -h >&2
+  exit 1
+fi
+echo "[serve-aeon-27b-dflash] preflight ok: ${FREE_GB} GB free"
+#
 # ATLAS_DFLASH_DRAFT_CAP=16 — full γ=16 drafts + 1 prefix = K=17 verify.
 # K=17 triggers gdn_decode_wy17 which saves all 17 intermediates.
 # caps 4..15 fall through to the sequential path (no intermediates)
