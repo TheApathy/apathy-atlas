@@ -234,19 +234,33 @@ impl TransformerModel {
                 let conv_bytes = conv_dim * d_conv * 4;
 
                 if num_accepted == k {
-                    // Full accept: scratch → live (commit verify result).
+                    // Full accept: h_state already holds state-after-K, which
+                    // is the canonical post-step state. Mirror into the
+                    // checkpoint so a future rollback (if any) has a valid
+                    // restore point.
                     self.gpu
                         .copy_d2d_async(ssm.h_state, h_ckpt, h_bytes, stream)?;
                     self.gpu
                         .copy_d2d_async(ssm.conv_state, conv_ckpt, conv_bytes, stream)?;
                 } else {
-                    // Partial accept: intermediate[num_accepted-1] → live.
+                    // Partial accept: h_state holds state-after-K (includes
+                    // rejected drafts) — WRONG for the next forward.
+                    // intermediate[N-1] holds state-after-(N accepted tokens).
+                    // The SSM kernels read from h_state on every forward call,
+                    // so we MUST overwrite h_state with the canonical state.
+                    // Also mirror into checkpoint for rollback consistency.
                     let slot = seq.slot_idx;
                     let inter_idx = num_accepted - 1;
                     let h_inter = self.ssm_pool.h_intermediate(ssm_layer_idx, slot, inter_idx);
                     let conv_inter =
                         self.ssm_pool
                             .conv_intermediate(ssm_layer_idx, slot, inter_idx);
+                    // canonical → live (h_state read by next forward)
+                    self.gpu
+                        .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;
+                    self.gpu
+                        .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
+                    // canonical → checkpoint (for any future rollback)
                     self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
                     self.gpu
                         .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
