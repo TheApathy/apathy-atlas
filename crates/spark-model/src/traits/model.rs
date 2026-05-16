@@ -278,9 +278,15 @@ pub trait Model: Send + Sync {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<Vec<u32>> {
-        // Phase 2.5e: route to the K=γ graphed path. Models that don't
-        // override `decode_verify_graphed_kgamma` get the eager fallback
-        // for free (the trait default does that).
+        // DEBUG: route to the K=2 graphed path (used by MTP, known-working).
+        // ATLAS_DFLASH_VERIFY_VIA_K2=1 forces this; otherwise use kgamma.
+        if std::env::var("ATLAS_DFLASH_VERIFY_VIA_K2").ok().as_deref() == Some("1")
+            && tokens.len() == 2
+        {
+            let pair: &[u32; 2] = tokens.try_into().expect("len==2 guarantees array");
+            let result = self.decode_verify_graphed(pair, seq, stream)?;
+            return Ok(result.to_vec());
+        }
         self.decode_verify_graphed_kgamma(tokens, seq, stream)
     }
 
@@ -288,6 +294,18 @@ pub trait Model: Send + Sync {
     /// dedicated MTP input buffer. Must precede `run_mtp_propose` — MTP
     /// overwrites shared buffers including `norm_output`.
     fn save_hidden_for_mtp(&self, token_idx: usize, stream: u64) -> Result<()>;
+
+    /// Run the bonus token through the target model and capture its hidden
+    /// states into the DFlash `dflash_hidden_save` buffer at index 0.
+    ///
+    /// This is needed because the verify forward pass does not include the
+    /// bonus token, so DFlash's next propose() step would otherwise draft
+    /// from an outdated prefix.
+    ///
+    /// Default: no-op (DFlash not active).
+    fn save_hidden_for_dflash(&self, _token: u32, _seq: &mut SequenceState, _stream: u64) -> Result<()> {
+        Ok(())
+    }
 
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
