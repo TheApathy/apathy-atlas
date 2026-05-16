@@ -7,9 +7,8 @@
 //! many locals with no clean extraction boundary.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
 
-use super::BlockDiffusionDraftHead;
+use super::{BlockDiffusionDraftHead, DflashProposerState};
 use crate::layer::ForwardContext;
 
 impl BlockDiffusionDraftHead {
@@ -19,7 +18,7 @@ impl BlockDiffusionDraftHead {
         position: usize,
         ctx: &ForwardContext,
         stream: u64,
-        ctx_buffer: Option<(DevicePtr, usize)>,
+        dstate: &mut DflashProposerState,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -42,18 +41,35 @@ impl BlockDiffusionDraftHead {
         let force_ctx_used: Option<usize> = std::env::var("ATLAS_DFLASH_DEBUG_CTX_USED")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
-        let (ctx_base_ptr, ctx_total, eff_ctx) = match ctx_buffer {
-            Some(_) if force_no_ctx => (None, 0, 0),
-            Some((p, n)) => {
-                let eff = match force_ctx_used {
-                    Some(forced) => forced.min(n).min(self.ctx_window),
-                    None => n.min(self.ctx_window),
-                };
-                (Some(p), n, eff)
-            }
-            None => (None, 0, 0),
+        let (ctx_base_ptr, ctx_total, eff_ctx) = if dstate.ctx_len > 0 && !force_no_ctx {
+            let n = dstate.ctx_len;
+            let eff = match force_ctx_used {
+                Some(forced) => forced.min(n).min(self.ctx_window),
+                None => n.min(self.ctx_window),
+            };
+            (Some(dstate.ctx_hidden_acc), n, eff)
+        } else {
+            (None, 0, 0)
         };
         let n_attn = (eff_ctx + self.gamma) as u32;
+
+        // Zero all scratch buffers to eliminate non-determinism from
+        // uninitialized memory (different GPU allocations may contain
+        // stale data from previous operations).
+        let n_attn_usize = n_attn as usize;
+        gpu.memset(self.scratch.stream_buf, 0, n_attn_usize * self.hidden_size * bf16)?;
+        gpu.memset(self.scratch.norm_buf, 0, n_attn_usize * self.hidden_size * bf16)?;
+        gpu.memset(self.scratch.q_buf, 0, n_attn_usize * q_dim as usize * bf16)?;
+        gpu.memset(self.scratch.k_buf, 0, n_attn_usize * kv_dim as usize * bf16)?;
+        gpu.memset(self.scratch.v_buf, 0, n_attn_usize * kv_dim as usize * bf16)?;
+        gpu.memset(self.scratch.attn_out, 0, n_attn_usize * q_dim as usize * bf16)?;
+        gpu.memset(self.scratch.mlp_intermediate, 0, n_attn_usize * self.intermediate_size * bf16)?;
+        gpu.memset(self.scratch.mlp_up, 0, n_attn_usize * self.intermediate_size * bf16)?;
+        gpu.memset(self.scratch.stream_acc, 0, n_attn_usize * self.hidden_size * bf16)?;
+        gpu.memset(self.scratch.fc_proj, 0, self.ctx_window * self.hidden_size * bf16)?;
+        gpu.memset(self.scratch.logits, 0, self.gamma * self.vocab_size * bf16)?;
+        gpu.memset(self.scratch.draft_tokens_dev, 0, n_attn_usize * 4)?;
+
         let target_hidden_dim = self.target_layer_ids.len() * self.target_hidden_size;
         let ctx_slot_bytes = target_hidden_dim * bf16;
 
@@ -157,33 +173,103 @@ impl BlockDiffusionDraftHead {
                 }
                 FULL_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            for i in 0..eff_ctx {
-                let src_slot = base.offset((start_slot + i) * ctx_slot_bytes);
-                let dst_slot = self.scratch.fc_proj.offset(i * self.hidden_size * bf16);
-                ops::dense_gemv(
+            // Persistent fc_proj cache: copy old positions, compute new ones.
+            let needed_start = ctx_total.saturating_sub(eff_ctx);
+            let old_fc_end = needed_start
+                .saturating_add(eff_ctx)
+                .min(dstate.cache_fc_end)
+                .max(needed_start);
+            let old_fc_count = old_fc_end.saturating_sub(needed_start);
+            let new_fc_count = eff_ctx.saturating_sub(old_fc_count);
+            tracing::info!(
+                "DFlash fc_proj cache: needed=[{}..{}), cached=[{}..{}), old={}, new={}",
+                needed_start,
+                needed_start + eff_ctx,
+                dstate.cache_fc_start,
+                dstate.cache_fc_end,
+                old_fc_count,
+                new_fc_count,
+            );
+
+            if old_fc_count > 0 {
+                self.cache_copy_range(
                     gpu,
-                    self.kernels.dense_gemv,
-                    src_slot,
-                    &self.fc,
-                    dst_slot,
-                    h,
-                    target_hidden_dim as u32,
+                    dstate.ctx_fc_cache,
+                    dstate.cache_fc_start,
+                    dstate.cache_fc_end,
+                    self.ctx_window,
+                    needed_start,
+                    old_fc_end,
+                    self.scratch.fc_proj,
+                    self.hidden_size * bf16,
                     stream,
                 )?;
             }
-            if eff_ctx > 0 {
-                dump_bf16("step0.fc_proj.pre_norm[0]", self.scratch.fc_proj, 10)?;
+            if new_fc_count > 0 {
+                // Compute fc projection for new context positions.
+                for i in 0..new_fc_count {
+                    let abs_pos = old_fc_end + i;
+                    let src_slot = base.offset(abs_pos * ctx_slot_bytes);
+                    let dst_slot = self
+                        .scratch
+                        .fc_proj
+                        .offset((old_fc_count + i) * self.hidden_size * bf16);
+                    match (self.quant, self.fc_nvfp4.as_ref()) {
+                        (super::DflashQuantization::Nvfp4, Some(fc_q)) => ops::w4a16_gemv(
+                            gpu,
+                            self.kernels.w4a16_gemv,
+                            src_slot,
+                            fc_q,
+                            dst_slot,
+                            h,
+                            target_hidden_dim as u32,
+                            stream,
+                        )?,
+                        _ => ops::dense_gemv(
+                            gpu,
+                            self.kernels.dense_gemv,
+                            src_slot,
+                            &self.fc,
+                            dst_slot,
+                            h,
+                            target_hidden_dim as u32,
+                            stream,
+                        )?,
+                    }
+                }
+                // RMSNorm on the newly-computed slice.
                 ops::rms_norm(
                     gpu,
                     self.kernels.rms_norm,
-                    self.scratch.fc_proj,
+                    self.scratch.fc_proj.offset(old_fc_count * self.hidden_size * bf16),
                     &self.hidden_norm,
-                    self.scratch.fc_proj,
-                    eff_ctx as u32,
+                    self.scratch.fc_proj.offset(old_fc_count * self.hidden_size * bf16),
+                    new_fc_count as u32,
                     h,
                     self.rms_norm_eps,
                     stream,
                 )?;
+                // Write new fc_proj into persistent cache.
+                let (new_fc_start, new_fc_end) = self.cache_write_range(
+                    gpu,
+                    self.scratch.fc_proj.offset(old_fc_count * self.hidden_size * bf16),
+                    old_fc_end,
+                    new_fc_count,
+                    dstate.ctx_fc_cache,
+                    dstate.cache_fc_start,
+                    dstate.cache_fc_end,
+                    self.ctx_window,
+                    self.hidden_size * bf16,
+                    stream,
+                )?;
+                dstate.cache_fc_start = new_fc_start;
+                dstate.cache_fc_end = new_fc_end;
+            }
+            // RMSNorm on the cached slice (if not already normalized).
+            // The cache stores post-norm fc_proj, so cached positions are
+            // already normalized. Only the new slice needs norm above.
+            if eff_ctx > 0 {
+                dump_bf16("step0.fc_proj.pre_norm[0]", self.scratch.fc_proj, 10)?;
                 dump_bf16(
                     "step0.fc_proj.post_hidden_norm[0]",
                     self.scratch.fc_proj,
@@ -215,8 +301,13 @@ impl BlockDiffusionDraftHead {
 
         // ── Step 2: stream_buf layout ──
         // First eff_ctx rows: zero (Q-side ctx is zero; K/V-side gets
-        // overwritten in step 3b' below). Next γ rows: embed of
-        // [last_token, mask, mask, ..., mask].
+        // overwritten in step 3b' below).
+        // Next γ rows: embed of [last_token (bonus), mask, mask, ..., mask].
+        // The drafter is trained with query = [next_token_id, mask × (γ-1)]
+        // per vLLM (qwen3_dflash.py + dflash.py:set_inputs_first_pass: "Q from
+        // query embeddings (bonus + mask tokens)"). Without the bonus token at
+        // position 0, the drafter has no anchor and produces a constant
+        // high-frequency token (`,`, `<|im_end|>`) for every position.
         // Total stream_buf width = n_attn rows.
         if eff_ctx > 0 {
             gpu.memset(
@@ -225,17 +316,22 @@ impl BlockDiffusionDraftHead {
                 eff_ctx * self.hidden_size * bf16,
             )?;
         }
+        // ATLAS_DFLASH_MASK_OVERRIDE: env var override for the mask token ID.
+        let mask_id = std::env::var("ATLAS_DFLASH_MASK_OVERRIDE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(self.mask_token_id);
+        // [eff_ctx zeros, last_token (bonus), mask_id × (γ-1)]
         let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
             .chain(std::iter::once(last_token as i32))
             .chain(std::iter::repeat_n(
-                self.mask_token_id as i32,
-                self.gamma - 1,
+                mask_id as i32,
+                self.gamma.saturating_sub(1),
             ))
             .collect();
         if debug_dump {
             tracing::info!(
-                "DFLASH DUMP token_ids_host: last_token={} mask={} eff_ctx={} ids[0..8]={:?}",
-                last_token,
+                "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
                 self.mask_token_id,
                 eff_ctx,
                 &token_ids_host[..token_ids_host.len().min(8)],
@@ -297,6 +393,7 @@ impl BlockDiffusionDraftHead {
         // [eff_ctx..n_attn] are NOISE (full Q/K/V from embeddings).
         // Per-layer flow follows `dflash.py:Qwen3DFlashDecoderLayer.forward`.
         // Body extracted to `forward_block_layer.rs` for the 500-LoC budget.
+        let needed_start = ctx_total.saturating_sub(eff_ctx);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let args = super::forward_block_layer::LayerArgs {
                 layer_idx,
@@ -309,8 +406,10 @@ impl BlockDiffusionDraftHead {
                 bf16,
                 inv_sqrt_d,
                 stream,
+                needed_start,
+                window: self.ctx_window,
             };
-            self.forward_block_layer(layer, &args, ctx, debug_dump)?;
+            self.forward_block_layer(layer, &args, ctx, debug_dump, dstate)?;
         }
         // Drop the original inline loop body — extracted to helper.
 
@@ -331,6 +430,9 @@ impl BlockDiffusionDraftHead {
             self.rms_norm_eps,
             stream,
         )?;
+        // Capped vocab: the shared lm_head may have fewer rows than the
+        // drafter's vocab_size (e.g. target capped 248320→248077).
+        let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
         ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
@@ -340,7 +442,7 @@ impl BlockDiffusionDraftHead {
             },
             self.scratch.logits,
             self.gamma as u32,
-            self.vocab_size as u32,
+            lm_vocab,
             h,
             stream,
         )?;
@@ -354,21 +456,51 @@ impl BlockDiffusionDraftHead {
             dump_bf16("final.lm_head_shared[0..10]", self.lm_head_shared, 10)?;
         }
 
+        // ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS=1: final norm/logits/drafts dumps.
+        let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if dump_all_layers {
+            let norm_bytes = self.gamma * self.hidden_size * bf16;
+            let mut buf = vec![0u8; norm_bytes];
+            gpu.synchronize(stream)?;
+            gpu.copy_d2h(norm_noise, &mut buf)?;
+            let path = "/tmp/atlas_final_norm_buf.bin";
+            if !std::path::Path::new(path).exists() {
+                let _ = std::fs::write(path, &buf);
+                tracing::info!("DFLASH DUMP_ALL: wrote {norm_bytes}B to {path}");
+            }
+        }
+
         // ── Step 5: argmax per row → γ token ids ──
+        let argmax_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
+        let lm_stride = self.target_vocab_size.min(self.vocab_size);
         for i in 0..self.gamma {
-            let logits_row = self.scratch.logits.offset(i * self.vocab_size * bf16);
+            let logits_row = self.scratch.logits.offset(i * lm_stride * bf16);
             let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
             ops::argmax_bf16(
                 gpu,
                 self.kernels.argmax,
                 logits_row,
                 token_slot,
-                self.vocab_size as u32,
+                argmax_vocab,
                 stream,
             )?;
         }
         if debug_dump {
             dump_bf16("final.logits[noise0]", self.scratch.logits, 10)?;
+        }
+        if dump_all_layers {
+            let logits_bytes = self.gamma * self.vocab_size * bf16;
+            let mut buf = vec![0u8; logits_bytes];
+            gpu.synchronize(stream)?;
+            gpu.copy_d2h(self.scratch.logits, &mut buf)?;
+            let path = "/tmp/atlas_final_logits.bin";
+            if !std::path::Path::new(path).exists() {
+                let _ = std::fs::write(path, &buf);
+                tracing::info!("DFLASH DUMP_ALL: wrote {logits_bytes}B to {path}");
+            }
         }
 
         // ── Step 6: D2H γ × 4 bytes ──
@@ -399,6 +531,13 @@ impl BlockDiffusionDraftHead {
                 drafts,
             );
             DRAFTS_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if dump_all_layers {
+            let path = "/tmp/atlas_final_drafts.bin";
+            if !std::path::Path::new(path).exists() {
+                let _ = std::fs::write(path, &host_buf);
+                tracing::info!("DFLASH DUMP_ALL: drafts {drafts:?} → {path}");
+            }
         }
         let _ = g; // suppress unused
         Ok(drafts)
