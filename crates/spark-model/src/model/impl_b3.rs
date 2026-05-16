@@ -225,6 +225,15 @@ impl TransformerModel {
         Ok(())
     }
 
+    pub(super) fn save_hidden_for_dflash_dispatch(
+        &self,
+        _token: u32,
+        _seq: &mut crate::traits::SequenceState,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// DFlash 5-layer hidden capture. Called inside each per-layer loop after
     /// `layer.decode(...)` returns. No-op when DFlash is disabled (the buffer
     /// is `None`) or when `layer_idx` is not in `dflash_capture_layers`.

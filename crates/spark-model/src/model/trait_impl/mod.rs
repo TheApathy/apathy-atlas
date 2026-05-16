@@ -201,6 +201,9 @@ impl Model for TransformerModel {
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }
+    fn save_hidden_for_dflash(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<()> {
+        self.save_hidden_for_dflash_dispatch(token, seq, _stream)
+    }
     fn run_mtp_propose(
         &self,
         token: u32,
