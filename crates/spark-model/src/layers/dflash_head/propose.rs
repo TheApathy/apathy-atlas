@@ -220,10 +220,32 @@ impl BlockDiffusionDraftHead {
             .ok()
             .as_deref()
             == Some("1");
+        // Drop the `first_propose_done` gate. The previous logic skipped
+        // the append on the very first propose call, assuming
+        // dflash_hidden_save was uninitialized. But after a regular
+        // bootstrap decode (mtp_step's Phase A), `decode_a.rs` has
+        // already populated dflash_hidden_save[0] with the
+        // bootstrap-decoded token's hidden at sequence position M (=
+        // seq_len after prefill, BEFORE bootstrap increment). Skipping
+        // the append left ctx_len = M (prefill captures) while
+        // seq.seq_len = M+1, so the drafter's RoPE positions for ctx
+        // were assigned [1..M] instead of [0..M-1] — an off-by-one
+        // that shifted every ctx position by 1 RoPE rotation. Every
+        // subsequent step inherited the off-by-one (ctx_len fell one
+        // behind seq.seq_len). Result: drafter accept rate collapsed
+        // to ~1% because attention K/V were rotated to the wrong
+        // positions. Verified by reading position=5, eff_ctx=4 from
+        // the very first propose dump.
+        //
+        // Fix: always append on every propose. On first propose,
+        // last_num_accepted=0 → num_append=1 → appends the bootstrap
+        // hidden, ctx_len becomes M+1 = seq.seq_len, RoPE positions
+        // align. On subsequent proposes, the existing logic
+        // (last_num_accepted+1 slots) keeps ctx_len in lockstep with
+        // seq.seq_len.
         if !skip_decode_append
             && let Some(base) = target_hidden_stack
             && dstate.ctx_len < dstate.max_ctx_len
-            && dstate.first_propose_done
         {
             // Append the new tokens' hidden states from the previous
             // verify step.
