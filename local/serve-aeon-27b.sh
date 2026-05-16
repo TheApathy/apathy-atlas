@@ -52,15 +52,27 @@ echo "[serve-aeon-27b] preflight ok: ${FREE_GB} GB free, port ${PORT} clear"
 #                                0.70 leaves ~36 GB headroom for the OS,
 #                                CUDA driver, and any background MCP/Python
 #                                processes.
+# XS variant (20 GB) gives ~20 tok/s vs Full's 17 tok/s. Same 64-layer
+# arch, smaller weights (different ModelOpt sweep), no quality loss
+# observed on counting / fibonacci / narrative / factual prompts.
+# Bumped gpu-memory-utilization 0.70 -> 0.85 because XS leaves more
+# headroom (20 GB vs 27 GB weights); KV pool benefits from extra space.
+#
+# --enable-prefix-caching INTENTIONALLY OMITTED: with --speculative on
+# SM12.x (GB10), prefix cache hits corrupt MTP draft predictions. Symptom:
+# "1, 2, 3, ..., 10," → "11, 12, 13, 14, *16, 18, 20*..." (skips 15, 17
+# then jumps to evens). Cold throughput is unchanged (~20 tok/s); the
+# 27 tok/s number we briefly saw on cached counting was a false positive
+# with wrong output. Atlas already warns about this for --dflash but the
+# regression hits MTP K=3 too on this GB10 + fp8-KV combo.
 exec /path/to/atlas-src/target/release/spark serve \
-  --model-from-path /path/to/models/AEON-Q36-27B-Full \
+  --model-from-path /path/to/models/AEON-Q36-27B-XS \
   --model-name aeon-27b \
   --port "${PORT}" \
   --kernel-target qwen3.6-27b \
-  --gpu-memory-utilization 0.70 \
+  --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
-  --max-seq-len 8192 \
-  --enable-prefix-caching \
+  --max-seq-len 16384 \
   --speculative \
   --num-drafts 2 \
   --mtp-quantization nvfp4 \
