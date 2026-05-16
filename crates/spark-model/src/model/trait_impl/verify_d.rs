@@ -226,6 +226,35 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                // DFlash hidden capture for ctx conditioning. Save ALL k
+                // tokens so the scheduler can pick the correct one
+                // (num_accepted) after verify. Layout:
+                // [token_idx, capture_layer, hidden] in dflash_hidden_save.
+                for t in 0..k {
+                    self.try_dflash_capture(layer_idx, t, stream)?;
+                }
+                // ATLAS_KGAMMA_DEBUG_DUMP=1: dump per-position hidden state
+                // for K=γ verify so we can diff against HF reference
+                // (modelforge inspect-batched). Writes
+                // /tmp/atlas_kgamma_layer{L}_pos{t}.bin one-shot per pair.
+                // Dump only when NOT capturing a CUDA graph (sync ops illegal
+                // during capture). Set ATLAS_DFLASH_DEBUG_NO_GRAPH=1 too.
+                if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
+                    let h_bytes = h * 2;
+                    for t in 0..k {
+                        let path = format!(
+                            "/tmp/atlas_kgamma_layer{}_pos{}.bin",
+                            layer_idx, t
+                        );
+                        if !std::path::Path::new(&path).exists() {
+                            let mut buf = vec![0u8; h_bytes];
+                            self.gpu.synchronize(stream)?;
+                            self.gpu
+                                .copy_d2h(hidden.offset(t * h_bytes), &mut buf)?;
+                            let _ = std::fs::write(&path, &buf);
+                        }
+                    }
+                }
             }
 
             // Final norm [K, H]
@@ -242,8 +271,41 @@ impl TransformerModel {
                 stream,
             )?;
 
+            // DEBUG: dump post-final-norm hidden states (K positions)
+            if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
+                let h_bytes = h * 2;
+                for t in 0..k {
+                    let path = format!("/tmp/atlas_kgamma_final_norm_pos{}.bin", t);
+                    if !std::path::Path::new(&path).exists() {
+                        let mut buf = vec![0u8; h_bytes];
+                        self.gpu.synchronize(stream)?;
+                        self.gpu.copy_d2h(normed.offset(t * h_bytes), &mut buf)?;
+                        let _ = std::fs::write(&path, &buf);
+                    }
+                }
+            }
+
             // LM head for K tokens
             self.lm_head_batched(normed, k as u32, stream)?;
+
+            // DEBUG: dump logits for first 100 vocab entries per position
+            if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
+                let vocab = self.config.vocab_size;
+                let bf16 = 2usize;
+                let dump_n = 100.min(vocab);
+                for t in 0..k {
+                    let path = format!("/tmp/atlas_kgamma_logits_pos{}.bin", t);
+                    if !std::path::Path::new(&path).exists() {
+                        let mut buf = vec![0u8; dump_n * bf16];
+                        self.gpu.synchronize(stream)?;
+                        self.gpu.copy_d2h(
+                            self.buffers.logits().offset(t * vocab * bf16),
+                            &mut buf,
+                        )?;
+                        let _ = std::fs::write(&path, &buf);
+                    }
+                }
+            }
 
             // Argmax inside graph (fixed scratch addresses — graph-safe)
             let vocab = self.config.vocab_size;
