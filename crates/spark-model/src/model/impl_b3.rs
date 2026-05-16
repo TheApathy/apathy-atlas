@@ -225,6 +225,14 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// No-op. The original "bonus-decode" approach was based on the
+    /// misunderstanding that the drafter needs the bonus's hidden in
+    /// ctx — actually the bonus is at position seq_len (not yet in
+    /// KV), and ctx should contain hiddens for positions [0..seq_len-1]
+    /// which is exactly what dflash_hidden_save[0..N+1] provides
+    /// after a verify (last_token at position P, drafts at P+1..P+N).
+    /// The bonus appears as the FIRST noise embedding (Q-side input)
+    /// at position P+N+1.
     pub(super) fn save_hidden_for_dflash_dispatch(
         &self,
         _token: u32,
