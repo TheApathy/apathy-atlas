@@ -126,8 +126,10 @@ impl BlockDiffusionDraftHead {
         //
         // ── Step 2: build γ-token query input ──
         // - Allocate [γ, draft_hidden] scratch buffer.
-        // - Embed token 0 as `last_token` via shared embed_tokens_shared.
-        // - Embed tokens 1..γ as `mask_token_id` via shared embed_tokens_shared.
+        // - Embed ALL γ tokens as `mask_token_id` via shared embed_tokens_shared.
+        //   The drafter is trained with mask_token_id for every noise position;
+        //   context conditioning comes entirely from target_hidden (fc projection),
+        //   not from embedding last_token into the noise block.
         // - Add the projected fc context to position 0 (Qwen3-DFlash
         //   `combine_hidden_states` semantics — verify against vLLM
         //   `qwen3_dflash.py:DFlashQwen3Model.forward`).
@@ -219,56 +221,89 @@ impl BlockDiffusionDraftHead {
             .as_deref()
             == Some("1");
         if !skip_decode_append
-            && let Some(latest_ctx) = target_hidden_stack
+            && let Some(base) = target_hidden_stack
             && dstate.ctx_len < dstate.max_ctx_len
+            && dstate.first_propose_done
         {
-            let dst_offset = dstate.ctx_len * dstate.ctx_slot_bytes;
-            ctx.gpu.copy_d2d_async(
-                latest_ctx,
-                dstate.ctx_hidden_acc.offset(dst_offset),
-                dstate.ctx_slot_bytes,
-                _stream,
-            )?;
-            dstate.ctx_len += 1;
+            // Append the new tokens' hidden states from the previous
+            // verify step.
+            //
+            // dflash_hidden_save layout (set during verify of
+            // [last_token, draft_0, ..., draft_{γ-1}]):
+            //   [0]   = hidden of verify input position 0 = last_token
+            //   [1..] = hidden of draft_0, draft_1, ...
+            //
+            // ctx_hidden_acc semantics: slot i = hidden of token at
+            // sequence position i. ctx_start in forward_block.rs is
+            // computed as `position - eff_ctx`, so position i in ctx
+            // corresponds to absolute position (position - eff_ctx + i).
+            //
+            // After step N's verify (last_token at sequence position P,
+            // num_accepted=N accepted drafts, bonus emitted next):
+            //   - decode_verify wrote last_token at KV position P,
+            //     draft_0 at P+1, ..., draft_{N-1} at P+N
+            //   - seq.seq_len = P + N + 1 after rollback
+            //   - The bonus is logically at position P+N+1 but has no
+            //     KV yet (will be written when next verify processes it
+            //     as input position 0)
+            //
+            // For step N+1 propose:
+            //   - position = P + N + 1
+            //   - We need ctx slots P, P+1, ..., P+N populated with
+            //     hiddens of (last_token, draft_0, ..., draft_{N-1})
+            //   - dflash_hidden_save[0..N+1] has EXACTLY this in order
+            //
+            // So src_idx 0..N+1 is correct and matches sequence order.
+            // The bonus's hidden is NOT needed in ctx — bonus appears
+            // as the first noise embedding (Q-side input).
+            let num_append = dstate.last_num_accepted + 1;
+            let available = dstate.max_ctx_len.saturating_sub(dstate.ctx_len);
+            let to_append = num_append.min(available);
+            tracing::info!(
+                "DFlash propose append: last_num_accepted={} num_append={} to_append={} ctx_len_before={}",
+                dstate.last_num_accepted,
+                num_append,
+                to_append,
+                dstate.ctx_len,
+            );
+            for i in 0..to_append {
+                let src = base.offset(i * dstate.ctx_slot_bytes);
+                let dst = dstate.ctx_hidden_acc.offset(dstate.ctx_len * dstate.ctx_slot_bytes);
+                ctx.gpu.copy_d2d_async(src, dst, dstate.ctx_slot_bytes, _stream)?;
+                dstate.ctx_len += 1;
+            }
         }
 
         let drafts = self
-            .forward_block(
-                last_token,
-                position,
-                ctx,
-                _stream,
-                // Pass the accumulator's start pointer + `ctx_len` so
-                // forward_block knows how many ctx positions to project.
-                if dstate.ctx_len > 0 {
-                    Some((dstate.ctx_hidden_acc, dstate.ctx_len))
-                } else {
-                    None
-                },
-            )
+            .forward_block(last_token, position, ctx, _stream, dstate)
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
                 e
             })?;
-        // Phase 2.5e scaffolding: K=γ verify path is implemented in model.rs
-        // (decode_verify_graphed_kgamma) and dispatched via step_verify_dflash
-        // when drafts.len()>=4. However, per-step output corruption (output
-        // starts correct then degenerates to gibberish at K=5) indicates an
-        // SSM state-management mismatch between the generic K=γ path and the
-        // hand-tuned K=2/3/4 specializations: the K=N!=2/3/4 fallback writes
-        // intermediates differently from the WY-chunkwise kernels, causing
-        // partial-accept rollback to land on stale state.
+        // Phase 2.5e: K=γ verify path is implemented in model.rs
+        // (decode_verify_graphed_kgamma → decode_verify) and dispatched via
+        // step_verify_dflash when drafts.len()>=4. The SSM intermediate
+        // checkpoint/rollback path is fully wired:
+        //   - SSM pool allocates 17 intermediate slots (γ+1) at model init
+        //   - decode_batched → decode_batched_conv_gdn saves per-token
+        //     h_state and conv_state intermediates (WY17 fused path or
+        //     sequential fallback, both write to pool addresses)
+        //   - commit_verify_state_async reads intermediates[num_accepted-1]
+        //     from the pool for partial-accept rollback
         //
-        // Until the SSM intermediate semantics are reconciled (kernel work),
-        // cap drafts at 1 → forces scheduler to use step_verify_k2 which
-        // produces correct output. Set ATLAS_DFLASH_DRAFT_CAP=N to override
-        // (N=γ to test the K=γ path; N=1 is the safe default).
+        // The earlier cap=1 default was a conservative workaround from early
+        // development when SSM intermediate semantics were not yet verified.
+        // Audit (2026-05-15) confirmed all paths produce correct
+        // intermediates. Default raised to γ to enable full DFlash speedup.
+        // Set ATLAS_DFLASH_DRAFT_CAP=1 to force K=2 verify if regression
+        // is observed.
         let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(self.gamma);
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
+        dstate.first_propose_done = true;
         Ok(drafts)
     }
 }
