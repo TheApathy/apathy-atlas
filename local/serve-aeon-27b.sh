@@ -81,7 +81,7 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --speculative \
   --num-drafts 2 \
   --mtp-quantization nvfp4 \
-  --mtp-vocab 100000 \
+  --mtp-vocab 32000 \
   --ssm-cache-slots 16 \
   --max-thinking-budget 768 \
   --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
