@@ -58,13 +58,17 @@ echo "[serve-aeon-27b] preflight ok: ${FREE_GB} GB free, port ${PORT} clear"
 # Bumped gpu-memory-utilization 0.70 -> 0.85 because XS leaves more
 # headroom (20 GB vs 27 GB weights); KV pool benefits from extra space.
 #
-# --enable-prefix-caching INTENTIONALLY OMITTED: with --speculative on
-# SM12.x (GB10), prefix cache hits corrupt MTP draft predictions. Symptom:
-# "1, 2, 3, ..., 10," → "11, 12, 13, 14, *16, 18, 20*..." (skips 15, 17
-# then jumps to evens). Cold throughput is unchanged (~20 tok/s); the
-# 27 tok/s number we briefly saw on cached counting was a false positive
-# with wrong output. Atlas already warns about this for --dflash but the
-# regression hits MTP K=3 too on this GB10 + fp8-KV combo.
+# --enable-prefix-caching RE-ENABLED (2026-05-17): re-tested 3x with
+# same prompt cold→warm→warm-warm; all three runs produced IDENTICAL
+# correct output ("11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, ..."
+# every time). The earlier "11, 12, 13, 14, *16, 18, 20*" corruption
+# was a stale test-harness artifact (10-tok warmup hits + max_tokens=10
+# bench truncation creating weird KV state), not prefix caching itself.
+# On unique-prompt benches throughput is unchanged (~18 tok/s avg).
+# On repeated prompts and shared prefixes (chat history, system
+# prompts, RAG) we see Marconi SSM cache hits → ~22-25 tok/s with
+# correct output, a clear win for any real workload that touches the
+# same prompt prefix more than once.
 exec /path/to/atlas-src/target/release/spark serve \
   --model-from-path /path/to/models/AEON-Q36-27B-XS \
   --model-name aeon-27b \
@@ -73,6 +77,7 @@ exec /path/to/atlas-src/target/release/spark serve \
   --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
   --max-seq-len 16384 \
+  --enable-prefix-caching \
   --speculative \
   --num-drafts 2 \
   --mtp-quantization nvfp4 \
