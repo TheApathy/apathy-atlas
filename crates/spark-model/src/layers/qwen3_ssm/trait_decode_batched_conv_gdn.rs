@@ -347,10 +347,29 @@ impl Qwen3SsmLayer {
             // non-final chunks we must save h_state to the corresponding
             // global intermediate slot so partial-accept rollback can find
             // every per-position state.
+            // Chunk-size selector: avoid chunk=1 (chunk=1 falls through to
+            // `ops::gdn_decode` which expects FP32 q/k/v but our conv_out_buf
+            // is BF16 — reading 2-byte BF16 elements as 4-byte FP32 produces
+            // garbage that corrupted output on K=5/9/13/17%4==1. The wy_k
+            // fused kernels (wy2/wy3/wy4) all accept BF16 properly, so we
+            // strictly use {2, 3, 4}-sized chunks. The split is chosen so
+            // each chunk handles a contiguous run of tokens with one
+            // wy_k launch.
+            fn pick_chunk(remaining: usize) -> usize {
+                match remaining {
+                    0 => 0,
+                    1 => unreachable!("remaining=1 only happens if prior chunk took too many; handled below"),
+                    2 => 2,
+                    3 => 3,
+                    4 => 4,
+                    5 => 3,       // 3 + 2
+                    _ => 4,       // 4 + ... rest
+                }
+            }
             let mut t_done: usize = 0;
             while t_done < num_tokens {
                 let remaining = num_tokens - t_done;
-                let chunk = remaining.min(4);
+                let chunk = pick_chunk(remaining);
 
                 // ── 1. conv1d_l2norm + save conv_state intermediate per token ──
                 for ct in 0..chunk {
@@ -429,17 +448,15 @@ impl Qwen3SsmLayer {
                         conv_dim as u32, conv_dim as u32, (nv * 2) as u32,
                         stream,
                     )?,
-                    1 => ops::gdn_decode(
-                        ctx.gpu,
-                        self.gdn_k,
-                        ssm_state.h_state,
-                        q_ptr, k_ptr, v_ptr,
-                        gate_ptr, beta_ptr,
-                        gdn_out_t,
-                        1, nk as u32, nv as u32, kd as u32, vd as u32,
-                        stream,
-                    )?,
-                    _ => unreachable!("chunk size capped at 4"),
+                    // chunk=1 deliberately not handled here — pick_chunk()
+                    // guarantees a size-1 remainder never appears (it
+                    // pre-splits e.g. K=5 as 3+2 so every chunk is in
+                    // {2, 3, 4}). The ops::gdn_decode single-token kernel
+                    // expects FP32 q/k/v but conv_out_buf is BF16, which
+                    // caused silent corruption on K=5 / K=9 / K=13 (any
+                    // K with K%4==1) — confirmed by `def fibonacci(n):
+                    // \n if n <= 0:\n... def/:\n\n\n` output at N=4 K=5.
+                    _ => unreachable!("pick_chunk guarantees chunk in {{2, 3, 4}}; got {chunk}"),
                 }
 
                 // ── 3. Save h_state to chunk-end intermediate (non-final chunks only) ──
