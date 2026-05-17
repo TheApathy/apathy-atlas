@@ -103,6 +103,71 @@ impl BlockDiffusionDraftHead {
         if let Some(base) = ctx_base_ptr {
             // Walk the LAST `eff_ctx` slots of the accumulator.
             let start_slot = ctx_total.saturating_sub(eff_ctx);
+            // ATLAS_DFLASH_ZERO_LATE_LAYERS=N zeros out the LAST N capture
+            // layer slots per ctx position before the fc projection. This
+            // is a workaround for SSM kernel numerical drift that
+            // compounds layer-by-layer in Atlas vs HF transformers
+            // reference: by L61 (the 5th capture layer of [1,16,31,46,61]),
+            // cosine similarity drops to 0.86 — drafter sees OOD input.
+            // Zeroing zeros out the corresponding fc input rows so the
+            // drafter only conditions on the cleaner early-layer captures.
+            // Effective drafter input dim drops from 5*hidden to (5-N)*hidden.
+            let zero_late = std::env::var("ATLAS_DFLASH_ZERO_LATE_LAYERS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            // ATLAS_DFLASH_HF_OVERRIDE=/tmp/hf_target_hidden.bin overrides
+            // Atlas's captured ctx with HF transformers' reference hiddens
+            // for the same tokens. Used to validate whether the SSM kernel
+            // drift is the root cause of low drafter accept rate: if accept
+            // rate jumps with HF hiddens but stays low with Atlas's, then
+            // the kernel-fidelity hypothesis is confirmed.
+            if let Ok(hf_path) = std::env::var("ATLAS_DFLASH_HF_OVERRIDE") {
+                if eff_ctx > 0 {
+                    match std::fs::read(&hf_path) {
+                        Ok(hf_bytes) => {
+                            let needed = eff_ctx * ctx_slot_bytes;
+                            if hf_bytes.len() >= needed {
+                                gpu.copy_h2d(
+                                    &hf_bytes[..needed],
+                                    base.offset(start_slot * ctx_slot_bytes),
+                                )?;
+                                if debug_dump {
+                                    tracing::info!(
+                                        "DFLASH HF_OVERRIDE: loaded {} bytes from {}",
+                                        needed, hf_path,
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "DFLASH HF_OVERRIDE: file too small ({} < needed {})",
+                                    hf_bytes.len(), needed,
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!("DFLASH HF_OVERRIDE: read failed: {e}"),
+                    }
+                }
+            }
+            if zero_late > 0 && eff_ctx > 0 {
+                let n_capture = self.target_layer_ids.len();
+                let n_zero = zero_late.min(n_capture);
+                let h_bytes = self.target_hidden_size * bf16;
+                for slot_i in 0..eff_ctx {
+                    let slot_base = base.offset((start_slot + slot_i) * ctx_slot_bytes);
+                    // Zero the LAST n_zero layer slices (indices n_capture-n_zero .. n_capture)
+                    for layer_i in (n_capture - n_zero)..n_capture {
+                        let layer_ptr = slot_base.offset(layer_i * h_bytes);
+                        gpu.memset(layer_ptr, 0, h_bytes)?;
+                    }
+                }
+                if debug_dump {
+                    tracing::info!(
+                        "DFLASH ZERO_LATE: zeroed last {} of {} capture layers across {} ctx slots",
+                        n_zero, n_capture, eff_ctx
+                    );
+                }
+            }
             // ATLAS_DFLASH_DEBUG_FORCE_PATTERN=1 overwrites the captured
             // target_hidden_stack with a deterministic test pattern so a
             // PyTorch reference run on the same input produces directly
