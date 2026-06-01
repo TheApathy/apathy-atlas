@@ -129,6 +129,102 @@ pub struct GdnPrefillBuffers {
     pub total_len: usize,
 }
 
+/// Tree-aware attention KV indirection plumbing.
+///
+/// `ATLAS_TREE_AWARE_ATTN=1` + tree-mode K=γ verify: each query at compact
+/// slot `t` in the tree must attend ONLY to its true ancestor chain (not
+/// to sibling/cousin slots that happen to come before it in compact order).
+/// The host-side builder fills `kv_indir[t * stride + j]` with the compact
+/// index of the j-th ancestor of `t` (j in `[0..depth[t]+1)`). The kernel
+/// remaps positions `>= kv_indir_base` via this table; positions
+/// `[0..kv_indir_base)` (prior linear context) read normally.
+#[derive(Clone, Copy)]
+pub struct TreeAwareAttn {
+    /// Device pointer to `int32_t[num_seqs * kv_indir_stride]`. Row `t`
+    /// holds the compact indices of slot t's ancestors (depth[t]+1 entries,
+    /// padded out — the kernel only reads up to `seq_lens[t]-kv_indir_base`).
+    pub kv_indir: spark_runtime::gpu::DevicePtr,
+    /// CUDA graph fix: position threshold lives in a 1×i32 device buffer.
+    /// Positions `[0..*kv_indir_base_ptr)` are prior linear context (read
+    /// normally); positions `[*kv_indir_base_ptr..seq_lens[t])` are the
+    /// tree-window remapped via indirection. Host writes `seq.seq_len`
+    /// here before each K=γ verify step so captured CUDA graphs see the
+    /// fresh value on each replay instead of the stale scalar that was
+    /// baked into the kernel-launch node at capture time.
+    pub kv_indir_base_ptr: spark_runtime::gpu::DevicePtr,
+    /// Row stride of `kv_indir`, in i32 slots (= dflash_kgamma typically).
+    pub kv_indir_stride: u32,
+    /// ATLAS_TREE_KV_PACK: when present, the multi-seq attention dispatch
+    /// runs a tiny scatter kernel to pack the ancestor KV into a contiguous
+    /// per-layer scratch pool, then calls `paged_decode_attn_*` against the
+    /// scratch with NULL indirection (fast BC=4 batched path) instead of
+    /// the slower indirected per-position fallback. `None` keeps the
+    /// existing tree-aware single-position fallback path active.
+    pub pack: Option<TreeKvPack>,
+}
+
+/// ATLAS_TREE_KV_PACK plumbing — references the per-attention-layer scratch
+/// pools owned by `TransformerModel`. All pointers are stable (allocated at
+/// model init); per-step `verify_d.rs` only re-uploads `seq_lens` (chain
+/// length per row).
+#[derive(Clone, Copy)]
+pub struct TreeKvPack {
+    /// Number of attention layers (= length of `scratch_k_ptrs` /
+    /// `scratch_v_ptrs` arrays). Used to bounds-check `attn_layer_idx`.
+    pub num_attn_layers: u32,
+    /// Raw pointer to a `[num_attn_layers]` slice of K-pool `DevicePtr`
+    /// values. Lifetime: pinned for the duration of the forward pass
+    /// (lives on the model). The dispatcher dereferences this with
+    /// `attn_layer_idx` to find the K scratch pool for the current layer.
+    pub scratch_k_ptrs: *const spark_runtime::gpu::DevicePtr,
+    /// Same as `scratch_k_ptrs` for V.
+    pub scratch_v_ptrs: *const spark_runtime::gpu::DevicePtr,
+    /// Identity block table (`[num_seqs] i32`, value seq_idx) shared by all
+    /// layers. The packed scratch has `num_blocks = num_seqs` with one
+    /// `stride`-wide block per seq, and the consumer kernel multiplies
+    /// `seq_idx * max_blocks_per_seq=1` to land at `bt[seq] = seq`.
+    pub identity_block_table: spark_runtime::gpu::DevicePtr,
+    /// Per-step `seq_lens` (`[num_seqs] i32`) holding `depth[t] + 1` for
+    /// the packed-KV attention call. Uploaded fresh per K=γ verify step.
+    pub seq_lens: spark_runtime::gpu::DevicePtr,
+    /// Per-block bytes in the scratch pool. Passed as the consumer
+    /// kernel's `block_stride_bytes` (NVFP4) / `cache_stride` (FP8).
+    pub block_stride_bytes: u64,
+    /// NVFP4 data-section bytes per block (0 for FP8). Passed as
+    /// `data_section_bytes` to the NVFP4 consumer kernel.
+    pub data_section_bytes: u64,
+    /// Synthetic block_size (= max_chain_len = kv_indir_stride). Passed
+    /// as the consumer kernel's `block_size` argument.
+    pub block_size: u32,
+    /// FP8 scatter kernel handle (`KernelHandle(0)` if not loaded).
+    pub scatter_fp8_kernel: spark_runtime::gpu::KernelHandle,
+    /// NVFP4 scatter kernel handle (`KernelHandle(0)` if not loaded).
+    pub scatter_nvfp4_kernel: spark_runtime::gpu::KernelHandle,
+    /// Active KV cache geometry forwarded to the scatter kernel —
+    /// the source paged cache uses `cache_block_size` not `block_size`.
+    pub cache_block_size: u32,
+    /// Real `max_blocks_per_seq` for the source paged cache (used by the
+    /// scatter to index the caller's block_table).
+    pub cache_max_blocks_per_seq: u32,
+    /// CUDA graph fix: absolute position where the tree window begins
+    /// (`= seq.seq_len`, same value as `TreeAwareAttn::kv_indir_base_ptr`).
+    /// Stored in a 1×i32 device buffer (in practice the same buffer as
+    /// `kv_indir_base_ptr` since both hold `seq.seq_len`). Forwarded to
+    /// the scatter kernel so a captured graph sees the fresh value on
+    /// each replay instead of the stale scalar baked in at capture time.
+    pub abs_base_ptr: spark_runtime::gpu::DevicePtr,
+}
+
+// SAFETY: `TreeKvPack` holds raw pointers (`*const DevicePtr`) into a
+// `Vec<DevicePtr>` owned by `TransformerModel`. The vector is allocated
+// once at model init and never resized, so the pointers stay valid for
+// the model's lifetime. The struct is shared across threads in the same
+// way `TreeAwareAttn` is — via per-step `ForwardContext` copies. The
+// `DevicePtr` values themselves are POD (`Copy`), so reading them is
+// race-free.
+unsafe impl Send for TreeKvPack {}
+unsafe impl Sync for TreeKvPack {}
+
 /// Shared context for a single forward pass step.
 ///
 /// Provides access to GPU, buffers, and config without coupling
@@ -150,6 +246,26 @@ pub struct ForwardContext<'a> {
     /// True when inside CUDA graph capture (between begin_capture/end_capture).
     /// MoE layers use sync all_reduce (capturable) instead of async (event-based).
     pub graph_capture: bool,
+    /// M8A: DDTree parent_ids device tensor for tree-aware GDN dispatch.
+    /// `Some(ptr)` when the K=γ verify path is processing a non-flat tree
+    /// payload (verify_d.rs uploads it from `a.pending_tree_payload`).
+    /// `None` for flat verify — GDN falls through to the fused wy_k path.
+    pub ddtree_parent_ids_dev: Option<spark_runtime::gpu::DevicePtr>,
+    /// ATLAS_TREE_AWARE_ATTN: optional per-row KV indirection for paged
+    /// decode attention during K=γ verify. `None` for the legacy chain-mode
+    /// path (every prior consumer just leaves this default).
+    pub tree_aware_attn: Option<TreeAwareAttn>,
+    /// Graph-safe override base address for the multi-seq SSM pointer
+    /// table. When `Some(ptr)`, the SSM multi-seq decode path uses `ptr`
+    /// as the `[h_state_ptrs[n] || conv_state_ptrs[n]]` array address
+    /// AND SKIPS the in-layer H2D upload — the caller (e.g.
+    /// `decode_batch_dispatch` under `ATLAS_SSM_MULTI_SEQ_GRAPH=1`) has
+    /// already populated the table BEFORE `begin_capture`. Iteration over
+    /// `decode_multi_seq` advances `ssm_layer_idx` in the caller; each
+    /// layer call receives its own per-layer slice address. `None` keeps
+    /// the legacy in-layer per-step H2D upload (eager / non-graphed
+    /// concurrent decode path).
+    pub ssm_multi_seq_ptr_table_override: Option<spark_runtime::gpu::DevicePtr>,
 }
 
 /// A single transformer layer performing the full per-layer computation.

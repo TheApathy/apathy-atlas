@@ -143,6 +143,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.
     pub(super) rope_mrope_interleaved_k: KernelHandle,
+    /// Batched per-token-strided RoPE for multi-seq K=3 path
+    /// (`ATLAS_ATTN_QKV_MEGA=1`). Optional — `try_kernel` so older builds
+    /// without the kernel still load.
+    pub(super) rope_strided_b3_k: KernelHandle,
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
@@ -177,10 +181,52 @@ pub struct Qwen3AttentionLayer {
     /// Split-K GEMM for skinny prefill matrices (M < 64).
     pub(super) gemm_splitk_partial_k: KernelHandle,
     pub(super) gemm_splitk_reduce_k: KernelHandle,
+    /// NVFP4×NVFP4 native tensor-core GEMM (HuggingFace `[N, K/2]` layout).
+    /// Loaded via `try_kernel` — handle 0 disables `ATLAS_QKV_SPLITK`
+    /// silently. Required by the K/V projection split-K path together
+    /// with the absmax + quantize kernels below.
+    pub(super) nvfp4_gemm_k: KernelHandle,
+    /// Split-K variant of `nvfp4_gemm_k`. Partitions K-axis across
+    /// `K_SPLITS=2` CTAs (Z-grid) and writes FP32 partials. Paired
+    /// with `nvfp4_splitk_reduce_k`. Wins on small K*N (<25M) where
+    /// the non-split kernel underutilizes SMs.
+    pub(super) nvfp4_gemm_splitk_k: KernelHandle,
+    /// Reduce kernel: sums `K_SPLITS` FP32 partials, applies `scale2_ab`,
+    /// casts to BF16.
+    pub(super) nvfp4_splitk_reduce_k: KernelHandle,
+    /// Per-tensor BF16 absmax → FP32. Used to derive `a_scale2` for the
+    /// activation NVFP4 quantization step.
+    pub(super) nvfp4_absmax_k: KernelHandle,
+    /// BF16 → NVFP4 (E2M1 nibbles + FP8 E4M3 per-group scales) per-row
+    /// activation quantizer.
+    pub(super) nvfp4_quantize_k: KernelHandle,
     /// Tensor-core BF16 GEMM (m16n8k16 MMA).
     pub(super) dense_gemm_tc_k: KernelHandle,
     pub(super) paged_decode_splitk_k: Option<KernelHandle>,
     pub(super) paged_decode_reduce_k: Option<KernelHandle>,
+    /// FlashAttention-v2 inspired Q-tile fused paged-decode kernel for the
+    /// K=γ verify path (gated by `ATLAS_FLASH_ATTN_KGAMMA=1`). NVFP4 KV
+    /// cache + HDIM=256 only; `None` for other KV dtypes / head_dims and
+    /// when the PTX failed to resolve (older caches).
+    pub(super) paged_decode_kgamma_k: Option<KernelHandle>,
+    /// VEC variant of `paged_decode_kgamma_k`: 16 warps/CTA + 2-position
+    /// dequant batching. Gated by `ATLAS_KGAMMA_VECDEQUANT=1`; falls back to
+    /// the baseline kgamma kernel when unavailable or gate is off.
+    pub(super) paged_decode_kgamma_vec_k: Option<KernelHandle>,
+    /// Split-K variant of `paged_decode_kgamma_k` for long sequences.
+    /// Partitions KV history across `num_splits` CTAs per q_head. Gated
+    /// by `ATLAS_FLASH_ATTN_KGAMMA_SPLITK=1`; falls back to the single-
+    /// CTA kgamma kernel when unavailable or for short sequences.
+    pub(super) paged_decode_kgamma_splitk_k: Option<KernelHandle>,
+    /// Reduce kernel paired with `paged_decode_kgamma_splitk_k`: merges
+    /// `num_splits` partial (m, l, o) tuples into the final BF16 output.
+    pub(super) paged_decode_kgamma_reduce_k: Option<KernelHandle>,
+    /// FlashAttention-v2 grafted variant of `paged_decode_kgamma_k`: stages
+    /// FA2_TILE_N=32 KV positions into shared memory via cp.async, with a
+    /// 2-stage double-buffered pipeline overlapping load with compute.
+    /// Gated by `ATLAS_FA2_KGAMMA=1`; falls back to the VEC / baseline kgamma
+    /// kernels when unavailable or gate is off.
+    pub(super) paged_decode_kgamma_fa2_k: Option<KernelHandle>,
     pub(super) residual_add_k: KernelHandle,
     pub(super) sigmoid_gate_mul_k: KernelHandle,
     pub(super) deinterleave_qg_k: KernelHandle,
@@ -194,6 +240,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemv_qg_batch3_k: KernelHandle,
     pub(super) w4a16_gemv_dual_batch3_k: KernelHandle,
     pub(super) w4a16_gemv_batch3_k: KernelHandle,
+    // Kernels — batch3 strided (ATLAS_ATTN_QKV_FUSED=1)
+    pub(super) w4a16_gemv_qg_batch3_strided_k: KernelHandle,
+    pub(super) w4a16_gemv_dual_batch3_strided_k: KernelHandle,
+    pub(super) rms_norm_qk_batch3_k: KernelHandle,
     // Kernels — prefill (GEMM M=N + Flash Attention)
     pub(super) w4a16_gemm_k: KernelHandle,
     pub(super) w4a16_gemm_t_k: KernelHandle,
@@ -203,6 +253,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemm_t_m128_v2_k: KernelHandle,
     /// v3 variant: K_STEP=64.
     pub(super) w4a16_gemm_t_m128_v3_k: KernelHandle,
+    /// M16 variant: K=γ verify path (M ≤ 32). Gated by ATLAS_TC_NVFP4_M16=1.
+    pub(super) w4a16_gemm_t_m16_k: KernelHandle,
     pub(super) dense_gemm_k: KernelHandle,
     pub(super) prefill_attn_k: KernelHandle,
     /// HDIM=512 contiguous prefill for Gemma-4 full-attention layers

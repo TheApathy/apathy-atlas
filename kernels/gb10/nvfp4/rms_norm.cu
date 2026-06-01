@@ -1081,3 +1081,105 @@ extern "C" __global__ void l2_norm_bf16(
         x[head_dim - 1] = __float2bfloat16(val * inv_norm);
     }
 }
+
+
+// ============================================================
+// rms_norm_qk_batch3 — batched RMS norm for K=3 verify path
+// ============================================================
+// In the K=3 multi-sequence decode path, each step needs 3 q_norms and
+// 3 k_norms, where every Q/K vector lives at a strided offset inside
+// qkv_buf (stride = per_seq_qkv in BF16 elements). Six separate
+// `rms_norm` launches accounted for the bulk of the residual gap to
+// theoretical attn_qkv_proj time.
+//
+// This kernel processes all 6 norms in a single launch:
+//   grid: (6, 1, 1)
+//   block: (min(max(q_dim, k_dim), 1024), 1, 1)
+//   blockIdx.x layout:
+//     0..3 → q_norm for token 0/1/2
+//     3..6 → k_norm for token 0/1/2
+// Each block reads from qkv_base + token*qkv_stride [+ q_offset for K]
+// and writes back in place.
+//
+// Uses (1 + weight) formula (Qwen3-Next style — same as `rms_norm`).
+extern "C" __global__ void rms_norm_qk_batch3(
+    __nv_bfloat16* __restrict__ qkv_base,         // points at token 0's Q
+    const __nv_bfloat16* __restrict__ q_weight,   // [head_dim]
+    const __nv_bfloat16* __restrict__ k_weight,   // [head_dim]
+    unsigned int qkv_stride,                       // BF16 elements between tokens
+    unsigned int q_dim,                            // == num_q_heads * head_dim
+    unsigned int k_dim,                            // == num_kv_heads * head_dim
+    unsigned int k_offset,                         // BF16 elements from token start to K (= q_proj_dim)
+    unsigned int head_dim,                         // per-head RMS norm width
+    float eps
+) {
+    // Grid layout: (max(nq,nkv), 3, 2)
+    //   blockIdx.x = head index (may exceed n_heads for K — early-return)
+    //   blockIdx.y = token (0..2)
+    //   blockIdx.z = kind  (0 = q_norm, 1 = k_norm)
+    // Block layout: (head_dim, 1, 1) — one block per head per token.
+    const unsigned int head = blockIdx.x;
+    const unsigned int token = blockIdx.y;
+    const unsigned int kind = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned int n_heads = (kind == 0u) ? (q_dim / head_dim)
+                                              : (k_dim / head_dim);
+    if (head >= n_heads) return;
+
+    __nv_bfloat16* base;
+    const __nv_bfloat16* weight;
+    if (kind == 0u) {
+        base = qkv_base + token * qkv_stride;             // Q region for this token
+        weight = q_weight;
+    } else {
+        base = qkv_base + token * qkv_stride + k_offset;  // K region for this token
+        weight = k_weight;
+    }
+
+    __nv_bfloat16* x = base + head * head_dim;
+    unsigned int* x32 = (unsigned int*)x;
+    const unsigned int half_hd = head_dim / 2;
+
+    // Sum of squares
+    float sum_sq = 0.0f;
+    for (unsigned int i = tid; i < half_hd; i += blockDim.x) {
+        float v0, v1;
+        unpack_bf16x2(x32[i], v0, v1);
+        sum_sq += v0 * v0 + v1 * v1;
+    }
+    if ((head_dim & 1) && tid == 0) {
+        float val = __bfloat162float(x[head_dim - 1]);
+        sum_sq += val * val;
+    }
+
+    sum_sq = warp_reduce_sum(sum_sq);
+
+    __shared__ float warp_sums[32];
+    unsigned int warp_id = tid / 32;
+    unsigned int lane_id = tid % 32;
+    if (lane_id == 0) warp_sums[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane_id == 0) warp_sums[0] = val;
+    }
+    __syncthreads();
+
+    float rms = rsqrtf(warp_sums[0] / (float)head_dim + eps);
+
+    const unsigned int* w32 = (const unsigned int*)weight;
+    unsigned int* out32 = (unsigned int*)x;
+    for (unsigned int i = tid; i < half_hd; i += blockDim.x) {
+        float xv0, xv1, wv0, wv1;
+        unpack_bf16x2(x32[i], xv0, xv1);
+        unpack_bf16x2(w32[i], wv0, wv1);
+        out32[i] = pack_bf16x2(xv0 * rms * (1.0f + wv0), xv1 * rms * (1.0f + wv1));
+    }
+    if ((head_dim & 1) && tid == 0) {
+        float val = __bfloat162float(x[head_dim - 1]);
+        float w = __bfloat162float(weight[head_dim - 1]);
+        x[head_dim - 1] = __float2bfloat16(val * rms * (1.0f + w));
+    }
+}

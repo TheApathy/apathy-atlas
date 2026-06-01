@@ -127,10 +127,47 @@ impl BufferSizes {
         let mamba2_d_inner = config.mamba2_d_inner();
         let max_dim = h.max(mamba2_d_inner);
 
-        // Split-K decode workspace: NUM_SMS * (head_dim + 2) * sizeof(f32).
-        // Partials from split CTAs are stored as [o[head_dim], m, l] per split.
-        // Total slots = num_seqs * num_splits ≤ NUM_SMS, so this is constant ~48 KB.
-        let splitk_workspace = 48 * (hd + 2) * 4;
+        // Split-K decode workspace: stores partials [o[head_dim], m, l] per
+        // (seq, q_head, split). Indexed as
+        //   workspace[seq_idx, q_head, split] (head_dim + 2) F32 values.
+        //
+        // Default (ATLAS_PAGED_DECODE_SPLITK unset/0): legacy 48-slot workspace
+        // (num_seqs * num_q_heads * num_splits ≤ NUM_SMS=48). Sufficient when
+        // num_splits is derived solely from SM occupancy.
+        //
+        // Extended (ATLAS_PAGED_DECODE_SPLITK=1, EXPERIMENTAL): bump workspace
+        // so num_splits can scale with seq_len. NOTE: empirically REGRESSES
+        // FP8 K=3 verify at 4K context (see `run_paged_decode::compute_num_splits`
+        // — the splitk kernel doesn't do BC=4 batching). Allocation is gated
+        // so the larger arena only exists when the env var opts in.
+        //   max_decode_seqs ≈ 32 (covers K=γ DFlash verify with γ=16 → 17 + headroom)
+        //   MAX_SPLITS      = max_seq_len / 512, capped at 64
+        // Worst-case for aeon-27b (q_heads=24, hd=256, max_seq=16384):
+        //   32 * 24 * 32 * 258 * 4 ≈ 25 MB. Acceptable on a 119 GB unified pool.
+        let splitk_enabled = std::env::var("ATLAS_PAGED_DECODE_SPLITK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // Task #96: kgamma split-K reuses the same workspace layout
+        // ([num_qtile, num_q_heads, num_splits, (hd+2)] F32) so the
+        // existing extended-arena formula already covers our worst case
+        // (num_qtile=γ+1≤17, num_q_heads=4, num_splits=12 → ~850 KB).
+        // Bumping the arena under ATLAS_FLASH_ATTN_KGAMMA_SPLITK=1
+        // ensures the buffer is large enough even when the legacy
+        // ATLAS_PAGED_DECODE_SPLITK is off (default).
+        let kgamma_splitk_enabled = std::env::var("ATLAS_FLASH_ATTN_KGAMMA_SPLITK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let splitk_workspace = if splitk_enabled || kgamma_splitk_enabled {
+            const SPLIT_TILE: usize = 512;
+            const MAX_SPLITS_CAP: usize = 64;
+            const MAX_DECODE_SEQS: usize = 32;
+            let max_splits = ((max_seq_len + SPLIT_TILE - 1) / SPLIT_TILE)
+                .max(2)
+                .min(MAX_SPLITS_CAP);
+            MAX_DECODE_SEQS * q_heads * max_splits * (hd + 2) * 4
+        } else {
+            48 * (hd + 2) * 4
+        };
 
         // Residual dtype controlled by config.use_fp32_residual().
         // FP32 prevents BF16 truncation across 48 layers but costs 2x bandwidth.

@@ -142,6 +142,52 @@ pub fn rope_mrope_interleaved(
         .launch(stream)
 }
 
+/// Batched per-token-strided RoPE for the multi-sequence K=3 verify path.
+///
+/// Replaces N back-to-back `rope_forward` launches (each with `seq_len=1`)
+/// with a single launch that handles all `num_tokens` slots inside a
+/// per-token-strided `qkv_buf`. Output is bit-identical to the sequential
+/// version when called with the same inputs.
+///
+/// Kernel: `rope_forward_strided_b3(qkv_base, positions, num_tokens,
+///          qkv_stride_bf16, k_offset_bf16, num_q_heads, num_kv_heads,
+///          head_dim, rotary_dim, theta)`
+/// Grid: (num_q_heads + num_kv_heads, num_tokens, 1)
+/// Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn rope_strided_b3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qkv_base: DevicePtr,
+    positions: DevicePtr,
+    num_tokens: u32,
+    qkv_stride_bf16: u32,
+    k_offset_bf16: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    theta: f32,
+    stream: u64,
+) -> Result<()> {
+    assert!(rotary_dim > 0, "rope_strided_b3: rotary_dim=0");
+    assert!(num_tokens > 0, "rope_strided_b3: num_tokens=0");
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads + num_kv_heads, num_tokens, 1])
+        .block([128, 1, 1])
+        .arg_ptr(qkv_base)
+        .arg_ptr(positions)
+        .arg_u32(num_tokens)
+        .arg_u32(qkv_stride_bf16)
+        .arg_u32(k_offset_bf16)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(rotary_dim)
+        .arg_f32(theta)
+        .launch(stream)
+}
+
 /// RoPE with precomputed YaRN inv_freq table (Mistral Small 4).
 /// The kernel reads frequencies from the table instead of computing from theta.
 #[allow(clippy::too_many_arguments)]

@@ -177,6 +177,9 @@ impl TransformerModel {
             cached_prefix_tokens: 0,
             prompt_len: 0,
             disk_block_ids: Vec::new(),
+            mtp_lastk_host_buf: Vec::new(),
+            mtp_lastk_host_filled: 0,
+            mtp_lastk_end_abs: 0,
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
         })
     }
@@ -232,6 +235,25 @@ impl TransformerModel {
         self.gpu.copy_d2h(out_ptr, &mut buf)?;
         let gpu_token = u32::from_le_bytes(buf);
 
+        // ── ATLAS_DUMP_HIDDEN: append emitted-token record ──
+        // Pairs with the 5 hidden-state records dumped during the layer loop.
+        // Record format: u32 magic | u32 token_id | u32 0 | u32 0 (16 bytes).
+        if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+            const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
+            use std::io::Write;
+            tracing::trace!("ATLAS_DUMP_HIDDEN: argmax_dispatch → token {}", gpu_token);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
+                let _ = f.write_all(&gpu_token.to_le_bytes());
+                let _ = f.write_all(&0u32.to_le_bytes());
+                let _ = f.write_all(&0u32.to_le_bytes());
+            }
+        }
+
         Ok(gpu_token)
     }
 
@@ -273,6 +295,26 @@ impl TransformerModel {
                 buf[i * 4 + 3],
             ]));
         }
+
+        // ── ATLAS_DUMP_HIDDEN: append emitted-token records (batch path) ──
+        // Pairs with the per-decode-step hidden-state records.
+        if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+            const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                for &tok in &results {
+                    let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
+                    let _ = f.write_all(&tok.to_le_bytes());
+                    let _ = f.write_all(&0u32.to_le_bytes());
+                    let _ = f.write_all(&0u32.to_le_bytes());
+                }
+            }
+        }
+
         Ok(results)
     }
 

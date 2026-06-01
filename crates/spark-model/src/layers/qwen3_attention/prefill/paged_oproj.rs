@@ -92,6 +92,21 @@ impl Qwen3AttentionLayer {
                     nq * hd,
                     stream,
                 )?;
+            } else if n <= 32
+                && self.w4a16_gemm_t_m16_k.0 != 0
+                && crate::layers::tc_nvfp4_m16_enabled()
+            {
+                ops::w4a16_gemm_n128_m16(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_k,
+                    attn_out,
+                    nvfp4_t,
+                    o_out,
+                    n,
+                    h,
+                    nq * hd,
+                    stream,
+                )?;
             } else {
                 ops::w4a16_gemm_n128(
                     ctx.gpu,

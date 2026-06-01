@@ -156,12 +156,28 @@ impl TransformerModel {
                 seq.slot_idx
             );
         }
-        // batch_decode_graphs is keyed by padded_n, not slot — but the captured
-        // graphs DO contain per-slot SSM pointers from the active set at capture
-        // time. Drop them all (they'll be re-captured on next batched decode).
-        for (_, graph) in self.batch_decode_graphs.lock().drain() {
-            if let Err(e) = self.gpu.destroy_graph(graph) {
-                tracing::error!("free_sequence: destroy_graph(batch_decode_graphs entry): {e:#}");
+        // batch_decode_graphs is keyed by (sorted_slot_ids, padded_n) when
+        // ATLAS_SSM_MULTI_SEQ_GRAPH is on, else by ((empty), padded_n). In
+        // graph mode, drop only entries that include this freed slot — other
+        // slot-set graphs remain valid and avoid unnecessary recapture. In the
+        // legacy off mode the cache is empty (never inserted), so the drain
+        // is a no-op.
+        {
+            let mut cache = self.batch_decode_graphs.lock();
+            let stale_keys: Vec<(Vec<usize>, usize)> = cache
+                .keys()
+                .filter(|(slots, _)| slots.is_empty() || slots.contains(&seq.slot_idx))
+                .cloned()
+                .collect();
+            for key in stale_keys {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(batch_decode_graphs[{:?}]): {e:#}",
+                        key
+                    );
+                }
             }
         }
         // Verify graphs are now slot-keyed (sibling of decode_graph fix).
@@ -264,6 +280,29 @@ impl TransformerModel {
         // reads are still in flight — cross-seq race that produces partial data.
         self.gpu.synchronize(stream)?;
         self.ssm_pool.release_slot(old_slot);
+
+        // Invalidate any cached batch-decode graphs referencing the old slot.
+        // The graph baked the old_slot's SSM pool pointers in; after compaction
+        // this seq uses new_slot and old_slot may be reassigned. Mirrors the
+        // free_sequence invalidation logic.
+        {
+            let mut cache = self.batch_decode_graphs.lock();
+            let stale_keys: Vec<(Vec<usize>, usize)> = cache
+                .keys()
+                .filter(|(slots, _)| slots.contains(&old_slot))
+                .cloned()
+                .collect();
+            for key in stale_keys {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "compact_sequence: destroy_graph(batch_decode_graphs[{:?}]): {e:#}",
+                        key
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

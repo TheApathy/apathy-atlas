@@ -157,6 +157,9 @@ impl TransformerModel {
             .suppress_graphs
             .load(std::sync::atomic::Ordering::Relaxed)
             && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            // ATLAS_DUMP_HIDDEN: keep eager mode for the entire run so the
+            // CPU sync dump in try_dflash_capture stays graph-safe.
+            && std::env::var("ATLAS_DUMP_HIDDEN").is_err()
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -179,6 +182,9 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // ── Phase 2: CUDA graph capture / replay ──
@@ -248,12 +254,13 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
-                // DFlash hidden capture for ctx conditioning. Capture from
-                // the LAST verified position (K-1) — the bonus token in
-                // K=2. This populates `dflash_hidden_save` so the next
-                // `propose()` has fresh target hiddens. No-op when DFlash
-                // is disabled.
-                self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                // DFlash hidden capture for ctx conditioning. Save ALL k
+                // tokens so the scheduler can pick the correct one
+                // (num_accepted) after verify. Layout:
+                // [token_idx, capture_layer, hidden] in dflash_hidden_save.
+                for t in 0..k {
+                    self.try_dflash_capture(layer_idx, t, stream)?;
+                }
             }
 
             // Final norm [2, H]
@@ -302,6 +309,12 @@ impl TransformerModel {
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──
+
+        // ATLAS_DUMP_HIDDEN: flush captured layer hiddens to file.
+        // Cheap no-op when env var unset. Graph-safe because
+        // ATLAS_DUMP_HIDDEN forces eager mode upstream (suppress_graphs
+        // never lifts; see line 162 above).
+        self.flush_hidden_dump(k)?;
 
         let out_ptr = self.buffers.scratch();
         let mut buf = [0u8; 8];

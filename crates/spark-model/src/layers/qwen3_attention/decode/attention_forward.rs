@@ -452,6 +452,9 @@ impl Qwen3AttentionLayer {
             })
             .expect("local installed checked in high_speed_swap_engaged")?;
         } else {
+            // Single-sequence decode path: tree-aware indirection is only
+            // active in K=γ verify (decode_multi_seq path), so always pass
+            // null here.
             self.run_paged_decode(
                 ctx.gpu,
                 q_out,
@@ -468,6 +471,13 @@ impl Qwen3AttentionLayer {
                 inv_sqrt_d,
                 nq * hd,
                 ctx.buffers.splitk_workspace(),
+                spark_runtime::gpu::DevicePtr::NULL,
+                spark_runtime::gpu::DevicePtr::NULL,
+                0,
+                // Host-side seq_len for KV split heuristic. +1 accounts for the
+                // about-to-be-attended token (matches the value uploaded as
+                // device-side `seq_lens`).
+                (seq_len + 1) as u32,
                 stream,
             )?;
         }

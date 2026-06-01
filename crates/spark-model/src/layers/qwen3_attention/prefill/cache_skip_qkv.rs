@@ -179,6 +179,21 @@ impl Qwen3AttentionLayer {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu, normed, nvfp4_t, out, n, out_dim, h, stream,
                 )?;
+            } else if n <= 32
+                && self.w4a16_gemm_t_m16_k.0 != 0
+                && crate::layers::tc_nvfp4_m16_enabled()
+            {
+                ops::w4a16_gemm_n128_m16(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_k,
+                    normed,
+                    nvfp4_t,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
             } else {
                 ops::w4a16_gemm_n128(
                     ctx.gpu,

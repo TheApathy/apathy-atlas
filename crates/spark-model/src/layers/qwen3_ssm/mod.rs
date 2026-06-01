@@ -56,9 +56,22 @@ pub struct Qwen3SsmLayer {
     gated_rms_norm_k: KernelHandle,
     gated_rms_norm_f32_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    /// K=3 batched counterpart of `dense_gemv_k` for the SSM BA projection.
+    /// Single launch handles all 3 tokens, eliminating ~48 μs of launch
+    /// overhead per SSM layer per K=3 verify step. Gated by
+    /// `ATLAS_SSM_BA_BATCHED=1`; NULL handle when the kernel isn't in the
+    /// active target's PTX bundle, in which case the per-token loop runs.
+    dense_gemv_batch3_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w8a16_gemv_k: KernelHandle,
     w4a16_gemv_qkvz_k: KernelHandle,
+    /// Fused rms_norm_residual + w4a16_gemv for SSM QKVZ (sequential layout).
+    /// Gated by ATLAS_FUSE_SSM_QKVZ=1 at decode dispatch time. NULL handle if
+    /// the kernel module didn't load (older PTX bundles).
+    fused_rms_qkvz_k: KernelHandle,
+    /// K=3 batched counterpart of `fused_rms_qkvz_k` (3-token verify path).
+    /// Same env gate; NULL handle when not built for the active target.
+    fused_rms_qkvz_batch3_k: KernelHandle,
     deinterleave_k: KernelHandle,
     conv1d_k: KernelHandle,
     conv1d_l2norm_k: KernelHandle,
@@ -75,6 +88,10 @@ pub struct Qwen3SsmLayer {
     w4a16_gemm_t_k: KernelHandle, // Transposed B layout [K/2, N] — K_STEP_T=32
     w4a16_gemm_t_k64_k: KernelHandle, // K64 variant: K_STEP_T=64, halves outer loop
     w4a16_gemm_t_m128_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
+    /// M16 variant: 1 CTA row × 4 warps × 32-N each (K=γ verify, M≤32).
+    /// Gated by `ATLAS_TC_NVFP4_M16=1` env var. KernelHandle(0) if not compiled
+    /// for this target (qwen3.6-27b NVFP4 shadow only as of 2026-05-19).
+    w4a16_gemm_t_m16_k: KernelHandle,
     w4a16_gemv_batch2_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     gdn_prefill_k: KernelHandle,
@@ -86,6 +103,25 @@ pub struct Qwen3SsmLayer {
     /// shared memory. ~30x faster than per-token for 14k+ sequences.
     gdn_prefill_wy32_k: KernelHandle,
     compute_gdn_gates_k: KernelHandle,
+    /// Multi-seq variants: advance `c` SSM states in ONE launch. Gated
+    /// by `ATLAS_SSM_MULTI_SEQ_KERNEL=1` (additive on top of
+    /// `ATLAS_SSM_MULTI_SEQ_BATCHED=1`). KernelHandle(0) if the multi-seq
+    /// PTX modules aren't in the active target's bundle, in which case
+    /// the trait_decode_multi_seq path falls back to the per-seq loop.
+    conv1d_multi_seq_k: KernelHandle,
+    conv1d_l2norm_multi_seq_k: KernelHandle,
+    gdn_decode_multi_seq_k: KernelHandle,
+    compute_gdn_gates_multi_seq_k: KernelHandle,
+    /// Scratch device buffer for per-seq state pointer arrays uploaded
+    /// before each multi-seq kernel launch. Sized at init for the
+    /// configured `max_batch_size`. Layout: `[h_state_ptrs[c],
+    /// conv_state_ptrs[c]]` u64 each (each c × 8 bytes), so total
+    /// `2 * max_c * 8` bytes. Pre-allocated to avoid per-call alloc.
+    ssm_multi_seq_ptr_scratch: DevicePtr,
+    /// Capacity of the pointer scratch in number of sequences. Acts as
+    /// a hard cap on `num_seqs` for the multi-seq kernels (callers fall
+    /// back to per-seq loop if `n > ssm_multi_seq_ptr_max`).
+    ssm_multi_seq_ptr_max: usize,
     ba_gates_prefill_k: KernelHandle,
     // Kernels — prefill (multi-token sequential)
     conv1d_prefill_k: KernelHandle,
@@ -104,6 +140,14 @@ pub struct Qwen3SsmLayer {
     /// in which case decode_batched(K=17) falls through to the sequential
     /// per-token path.
     gdn_wy17_k: KernelHandle,
+    /// M8A: tree-aware GDN kernel for DDTree verify with non-flat branches.
+    /// Sequential per-token loop with parent_ids state load. NULL handle
+    /// when not compiled for the active target.
+    pub(crate) gdn_tree_k: KernelHandle,
+    /// M8A v2: tree-aware WY-fused GDN kernel. Bit-equivalent to wy17 on
+    /// flat chains, supports arbitrary tree topology via ancestor walk in
+    /// WY correction. Preferred over `gdn_tree_k` when present.
+    pub(crate) gdn_tree_wy_k: KernelHandle,
     // State allocation sizes (pre-computed from config)
     h_state_bytes: usize,
     conv_state_bytes: usize,
@@ -127,6 +171,29 @@ mod trait_prefill_gdn;
 mod trait_prefill_helper;
 mod trait_prefill_phase1;
 mod trait_prefill_phase3;
+
+// ── Phase 2 profiling helpers (ATLAS_SSM_KERNEL_PROFILE=1) ────────────────
+// Accumulate per-call wall-clock ns spent in wy17 across all SSM layers.
+// Reporter logs total + call count every N=5000 calls (every ~100 verify
+// steps at 48 SSM layers per step). Zero overhead when disabled.
+static SSM_PROFILE_NS_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SSM_PROFILE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ssm_profile_record(ns: u64) {
+    SSM_PROFILE_NS_TOTAL.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    let n = SSM_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // Report every 480 calls (= 10 verify steps × 48 SSM layers).
+    if n.is_multiple_of(480) {
+        let total_ns = SSM_PROFILE_NS_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+        let mean_us = (total_ns as f64) / (n as f64) / 1_000.0;
+        tracing::info!(
+            "ATLAS_SSM_KERNEL_PROFILE: wy17 calls={n}, total={:.3}ms, mean={:.2}us/call",
+            (total_ns as f64) / 1_000_000.0,
+            mean_us
+        );
+    }
+}
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──
 impl TransformerLayer for Qwen3SsmLayer {

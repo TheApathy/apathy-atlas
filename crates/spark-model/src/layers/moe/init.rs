@@ -180,6 +180,9 @@ impl MoeLayer {
             nvfp4_gate_up_m128: std::env::var("ATLAS_NVFP4_GATE_UP_M128")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            k3_fused_gate_up: std::env::var("ATLAS_MOE_K3_FUSED_GATE_UP")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             shared_gate_t: None,
             shared_up_t: None,
             shared_down_t: None,

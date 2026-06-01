@@ -43,13 +43,17 @@ case "${1:-}" in
     #
     # Result: +37.4% over closed-source Atlas Alpha 2.99 production
     # docker (81.5 tok/s baseline) on the same Huihui-Q36-abl checkpoint.
+    #
+    # 2026-05-09 perf bump: turbo4 KV (was nvfp4) + nvcc --use_fast_math:
+    #   105.70 → 112.40 mean / 117.29 peak (+6.3% mean, +9.5% peak)
+    #   See atlas_patches/PERF_LOG.md for full per-change record.
     exec "$SPARK" serve \
       --model-from-path "$MODELS/Huihui-NVFP4-Sehyo-MTP" \
       --model-name qwen36-abl \
       --port "$PORT" \
       --kernel-target qwen3.6-35b-a3b-abl \
       --gpu-memory-utilization 0.85 \
-      --kv-cache-dtype nvfp4 \
+      --kv-cache-dtype turbo4 \
       --kv-high-precision-layers auto \
       --max-seq-len 16384 \
       --enable-prefix-caching \
@@ -104,14 +108,14 @@ case "${1:-}" in
       --model-from-path "$MODELS/AEON-7-DFlash-Qwen3.5-27B-Uncensored-NVFP4" \
       --model-name aeon7-27b \
       --port "$PORT" \
-      --kernel-target qwen3.5-27b \
+      --kernel-target qwen3.6-27b \
       --gpu-memory-utilization 0.7 \
       --kv-cache-dtype nvfp4 \
       --kv-high-precision-layers auto \
       --max-seq-len 4096 \
       --enable-prefix-caching \
-      --speculative \
-      --num-drafts 1 \
+      --dflash \
+      --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash" \
       --mtp-quantization nvfp4
     ;;
 

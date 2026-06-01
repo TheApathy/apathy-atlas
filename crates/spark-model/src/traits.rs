@@ -90,6 +90,40 @@ pub struct SequenceState {
     /// back to the pool) but keeps `disk_block_ids[0]` — the evicted
     /// block's data lives on at that disk_id for streaming reads.
     pub disk_block_ids: Vec<u32>,
+    /// Host-side ring buffer for cross-chunk MTP last-K target hidden capture.
+    ///
+    /// Populated when `ATLAS_MTP_LASTK_PREFILL=K` (K>0) and an MTP proposer is
+    /// wired. Each prefill chunk's tail rows are D2H copied here from the
+    /// shared `hidden_states()` device buffer (which gets clobbered by the
+    /// next sequence's chunk or this sequence's next chunk). At the last
+    /// chunk's `finalize_last`, the accumulated host rows are H2D'd back to
+    /// the shared `mtp_lastk_buf` device buffer so the MTP head can replay
+    /// `forward_one` against the full last-K window — not just the last
+    /// chunk's contribution.
+    ///
+    /// Layout: `[K, hidden_size]` BF16 (or FP32 when `use_fp32_residual()`),
+    /// where row 0 is the oldest captured position and row K-1 is the newest.
+    /// `mtp_lastk_host_filled` tracks how many rows are currently populated
+    /// (0..=K).
+    ///
+    /// Lazy allocation: empty Vec until the first prefill chunk for an
+    /// MTP-enabled sequence. Sized once to `K * hidden_size * fp_size`.
+    /// Freed naturally when `SequenceState` drops.
+    ///
+    /// The historical "single-chunk capture" path (mtp-lastk-v2) read directly
+    /// from `hidden_states()` at finalize_last and silently truncated to the
+    /// last chunk's `proc_count`, which collapsed to K_eff=83 at K=512 when
+    /// `--max-prefill-tokens 1024` made the trailing chunk small. This
+    /// cross-chunk ring fixes that truncation.
+    pub mtp_lastk_host_buf: Vec<u8>,
+    /// Number of rows currently populated in `mtp_lastk_host_buf` (0..=K).
+    /// Reset to 0 on `free_sequence`. Reaches K once enough prefill chunks
+    /// have been seen; subsequent chunks shift older rows out.
+    pub mtp_lastk_host_filled: usize,
+    /// Absolute prompt position of the LAST captured row in
+    /// `mtp_lastk_host_buf` (`base_position` arg to `prefill_last_k`).
+    /// 0 when no rows captured.
+    pub mtp_lastk_end_abs: usize,
     /// Per-attention-layer offload progress tracker for `--high-speed-swap`
     /// (Phase 6.1.d critical fix). `disk_last_offloaded_per_layer[L]` is
     /// the number of `disk_block_ids` entries this attention layer has

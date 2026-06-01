@@ -56,21 +56,22 @@ pub fn build_model(
     // capture-layer indices from the drafter's `dflash_config.target_layer_ids`
     // so `TransformerModel::new` allocates the 5×hidden_size capture buffer.
     //
-    // HF `output_hidden_states[i]` semantics: index 0 = post-embedding,
-    // index k>=1 = post-layer-(k-1). The drafter's `target_layer_ids`
-    // are interpreted as HF `output_hidden_states` indices (so layer_id=1
-    // means post-layer-0). Atlas captures AFTER `layer.decode()` for the
-    // listed `dflash_capture_layers` index — to match HF semantics we
-    // subtract 1 from each id (clamped at 0). Set
-    // ATLAS_DFLASH_CAPTURE_LAYER_OFFSET=0 to disable this adjustment for
-    // a back-to-back A/B test.
+    // vLLM PR #40898 (DFlash author @jianc99) applies a **+1 shift** to
+    // `target_layer_ids`: the drafter's raw ids [1,16,31,46,61] become
+    // capture layers [2,17,32,47,62]. The author calls this a correctness
+    // bug — without it "the drafter reads the wrong target hidden states
+    // and acceptance plummets". Atlas captures AFTER `layer.decode()` for
+    // the listed `dflash_capture_layers` index, so we add 1 (clamped).
+    //
+    // Set ATLAS_DFLASH_CAPTURE_LAYER_OFFSET=0 to disable the shift for
+    // an A/B test; set to -1 to restore the old (broken) behaviour.
     if let Some(ref args) = dflash_args
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         let offset: i64 = std::env::var("ATLAS_DFLASH_CAPTURE_LAYER_OFFSET")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(-1);
+            .unwrap_or(0);
         config.dflash_capture_layers = sub
             .target_layer_ids
             .iter()
@@ -100,6 +101,11 @@ pub fn build_model(
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
     let lm_head = loader.load_lm_head(store, &config)?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
+    // Probe dense MTP path for non-MoE models (Qwen3.5/3.6 27B family,
+    // AEON-7 re-quants). Loader returns None for MoE models so this is a
+    // no-op there. The full DenseMtpHead layer is not yet wired — for now
+    // we just log presence so the user sees the loader works.
+    let mtp_dense_weights = loader.load_mtp_dense_weights(store, &config, gpu.as_ref())?;
     let vision_encoder = loader.load_vision_encoder(store, &config, gpu.as_ref())?;
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
@@ -328,6 +334,7 @@ pub fn build_model(
     let target_embed_for_dflash = embed.weight;
     let target_lm_head_for_dflash = lm_head.weight;
     let target_hidden_for_dflash = config.hidden_size;
+    let target_vocab_for_dflash = config.vocab_size;
 
     let mut model = TransformerModel::new(
         config,
@@ -339,6 +346,7 @@ pub fn build_model(
         buffers,
         kv_cache,
         mtp_weights,
+        mtp_dense_weights,
         gpu,
         max_seq_len,
         max_batch_size,
@@ -372,10 +380,12 @@ pub fn build_model(
                 target_embed_for_dflash,
                 target_lm_head_for_dflash,
                 target_hidden_for_dflash,
+                target_vocab_for_dflash,
                 args.gamma,
                 args.window_size,
                 model.gpu_backend(),
                 max_seq_len,
+                args.quantization,
             )?;
             model.set_dflash_proposer(std::sync::Arc::new(head));
             tracing::info!("DFlash drafter installed as the active proposer");

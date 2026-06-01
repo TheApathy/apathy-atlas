@@ -30,6 +30,7 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 pub(super) fn build_mtp_proposer(
     use_speculative: bool,
     mtp_weights: Vec<MtpWeights>,
+    mtp_dense_weights: Option<crate::weight_map::MtpDenseWeights>,
     embed_tokens: DenseWeight,
     lm_head_nvfp4: Option<QuantizedWeight>,
     config: &ModelConfig,
@@ -39,13 +40,42 @@ pub(super) fn build_mtp_proposer(
     max_seq_len: usize,
 ) -> Option<Arc<dyn DraftProposer>> {
     if !use_speculative {
-        if !mtp_weights.is_empty() {
+        if !mtp_weights.is_empty() || mtp_dense_weights.is_some() {
             tracing::info!(
-                "MTP weights available ({} module(s)) but --speculative not set, skipping MTP head construction",
-                mtp_weights.len()
+                "MTP weights available but --speculative not set, skipping MTP head construction"
             );
         }
         return None;
+    }
+    // Dense MTP path (Qwen3.5/3.6 27B-class) takes precedence when present.
+    if let Some(dense) = mtp_dense_weights {
+        let lm_nvfp4 = match lm_head_nvfp4 {
+            Some(w) => w,
+            None => {
+                tracing::warn!(
+                    "Dense MTP weights found but no NVFP4 LM head — speculative decoding disabled."
+                );
+                return None;
+            }
+        };
+        match crate::layers::MtpHead::new_dense(
+            dense,
+            embed_tokens,
+            lm_nvfp4,
+            config,
+            gpu,
+            mtp_vocab_size,
+            max_seq_len,
+        ) {
+            Ok(head) => {
+                tracing::info!("Dense MTP speculative decoding: ENABLED (single-module, dense MLP)");
+                return Some(Arc::new(head) as Arc<dyn DraftProposer>);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to build dense MTP head: {e}. Speculative disabled.");
+                return None;
+            }
+        }
     }
     if mtp_weights.is_empty() {
         return None;

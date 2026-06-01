@@ -209,6 +209,29 @@ pub(crate) fn load_dense_ffn(
                 down_proj: down,
             })
         }
+        Nvfp4Variant::Bf16Raw => {
+            // Raw BF16 disk format (base Qwen3.6-27B). Load BF16, then
+            // runtime-quantize to NVFP4 in-place for fast decode.
+            let inter = if config.intermediate_size > 0 {
+                config.intermediate_size
+            } else {
+                config.moe_intermediate_size
+            };
+            let h = config.hidden_size;
+            use crate::weight_map::model_a::dense;
+            use crate::weight_map::loaders_fp8::quantize_to_nvfp4;
+            let gate_bf16 = dense(store, &format!("{prefix}.mlp.gate_proj.weight"))?;
+            let up_bf16 = dense(store, &format!("{prefix}.mlp.up_proj.weight"))?;
+            let down_bf16 = dense(store, &format!("{prefix}.mlp.down_proj.weight"))?;
+            let gate = quantize_to_nvfp4(&gate_bf16, inter, h, gpu, absmax_k, quantize_k, stream)?;
+            let up = quantize_to_nvfp4(&up_bf16, inter, h, gpu, absmax_k, quantize_k, stream)?;
+            let down = quantize_to_nvfp4(&down_bf16, h, inter, gpu, absmax_k, quantize_k, stream)?;
+            Ok(DenseFfnWeights {
+                gate_proj: gate,
+                up_proj: up,
+                down_proj: down,
+            })
+        }
         _ => {
             let gate = quantized_auto(store, &format!("{prefix}.mlp.gate_proj"), gpu, variant)?;
             let up = quantized_auto(store, &format!("{prefix}.mlp.up_proj"), gpu, variant)?;

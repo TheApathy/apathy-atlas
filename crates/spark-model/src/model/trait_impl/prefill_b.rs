@@ -178,6 +178,14 @@ impl TransformerModel {
             stream,
         )?;
 
+        // ── Phase 4b: MTP last-K cross-chunk capture ──
+        // D2H the tail rows of this chunk's `hidden_states` into the per-seq
+        // host ring buffer. Must run BEFORE finalize_last (which reads logits
+        // off hidden_states[proc_count-1] and may clobber adjacent buffers),
+        // and BEFORE the next chunk overwrites hidden_states. No-op when MTP
+        // last-K prefill is disabled or no proposer is wired.
+        self.mtp_lastk_capture_chunk(seq, chunk_start, chunk_len, proc_count, stream)?;
+
         // ── Phase 5: update sequence state incrementally ──
         // Always add chunk tokens exactly once. The early-return path for
         // fully cached non-last chunks doesn't add tokens, so this is the

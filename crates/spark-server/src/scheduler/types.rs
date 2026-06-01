@@ -160,6 +160,13 @@ pub(super) struct ActiveSeq {
     pub grammar_state: Option<GrammarState>,
     /// MTP draft tokens awaiting verification.
     pub pending_drafts: Vec<u32>,
+    /// DDTree M3: optional tree payload paired with `pending_drafts`.
+    /// `None` for flat DFlash / MTP / ngram paths. When set by a
+    /// DDTree-capable proposer (M4B+), the verifier reads ancestor
+    /// metadata + parent ids from this payload instead of treating
+    /// `pending_drafts` as a flat chain. Cleared in the same
+    /// scheduler step the drafts are consumed.
+    pub pending_tree_payload: Option<spark_model::layers::DDTreePayload>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
     pub last_token_time: Instant,
     /// Timestamp when the request entered prefill (for TTFT).

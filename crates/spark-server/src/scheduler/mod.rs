@@ -31,6 +31,8 @@ mod repetition;
 mod sample_step;
 mod spec_step;
 mod types;
+mod verify_csk_step;
+mod verify_csk_step_k2;
 mod verify_dflash_step;
 mod verify_k2_step;
 mod verify_k3_step;
@@ -56,6 +58,8 @@ use repetition::*;
 use sample_step::*;
 use spec_step::*;
 use types::*;
+use verify_csk_step::*;
+use verify_csk_step_k2::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;
 use verify_k3_step::*;
@@ -289,12 +293,33 @@ pub fn run(
                 // Self-speculative: draft via layer-skipping, verify with full model.
                 step_self_spec(&*model, &mut active, num_drafts);
             } else if use_mtp
-                && active.len() == 1
-                && !active[0].inside_thinking
-                && !active[0].suppress_tool_call
-                && !active[0].disable_mtp
+                && active.iter().all(|a| {
+                    !a.inside_thinking && !a.suppress_tool_call && !a.disable_mtp
+                })
             {
-                // MTP speculative decode: beneficial at all context lengths.
+                // MTP speculative decode for ALL active sequences.
+                //
+                // Concurrent-decode fix (2026-05-22): previously gated on
+                // `active.len() == 1`, which forced n>=2 into
+                // `step_decode_only`. That path runs the SSM
+                // `decode_multi_seq_inner` which sequentially calls
+                // per-seq `decode()` (see qwen3_ssm/trait_decode_multi_seq.rs
+                // — comment: "delegate to per-sequence single decode") with
+                // no CUDA graphs and no MTP, collapsing throughput to ~14
+                // tok/s aggregate at c=2 (down from 28 at c=1).
+                //
+                // `step_mtp` already loops bootstrap+verify across all
+                // active sequences (see mtp_step.rs lines 21,96). Each
+                // sequence reuses its own per-slot CUDA graph for K=3
+                // verify (graph cache is keyed on `seq.slot_idx` in
+                // verify_c.rs), so n>=2 captures one graph per slot on
+                // first iteration and replays on every subsequent step.
+                //
+                // Per-seq guards (inside_thinking / suppress_tool_call /
+                // disable_mtp) are checked across ALL active sequences
+                // because step_mtp doesn't conditionally bootstrap per
+                // active flag; if any seq disables MTP we fall back to
+                // batched decode_only for the whole batch this tick.
                 step_mtp(&*model, &mut active, num_drafts);
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.

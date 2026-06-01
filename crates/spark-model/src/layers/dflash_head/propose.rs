@@ -319,13 +319,236 @@ impl BlockDiffusionDraftHead {
         // intermediates. Default raised to γ to enable full DFlash speedup.
         // Set ATLAS_DFLASH_DRAFT_CAP=1 to force K=2 verify if regression
         // is observed.
-        let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.gamma);
-        let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
+        // ATLAS_DFLASH_DRAFT_CAP is now consumed inside forward_block.rs
+        // and shrinks the noise block to gamma_eff+1 rows — so `drafts`
+        // already has length = gamma_eff. The legacy post-filter is removed
+        // (was wasting drafter compute on tokens we'd then discard).
         dstate.last_num_drafted = drafts.len();
         dstate.first_propose_done = true;
+
+        // M4B (MVP): when DDTree mode is active, build a degenerate
+        // single-chain DDTreePayload from the existing top-1 drafts and
+        // stash it in dstate for the scheduler to drain. This exercises
+        // the M3 payload bridge end-to-end. Real top-k extraction needs
+        // a CUDA top-k kernel over 248K vocab — M4B v2.
+        //
+        // Activated by setting ATLAS_DFLASH_METHOD=ddtree at startup
+        // (mirrors the --dflash-method=ddtree CLI flag wired in M1).
+        let ddtree_active = std::env::var("ATLAS_DFLASH_METHOD")
+            .ok()
+            .as_deref()
+            == Some("ddtree");
+        // ATLAS_DDTREE_NONFLAT=1 enables the experimental non-flat root-sibling
+        // topology that exercises the M8A tree kernel. Default OFF because the
+        // first-pass tree kernel isn't bit-equivalent to wy17 — flat-chain
+        // tokens drift numerically and drafter accept collapses. Re-enable
+        // after task #45 (Python-ref bit-diff + reduction-order fix).
+        let nonflat_enabled = std::env::var("ATLAS_DDTREE_NONFLAT").ok().as_deref()
+            == Some("1");
+        static PAYLOAD_DBG_DONE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !PAYLOAD_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "M8A propose dbg: ddtree_active={} nonflat_enabled={} drafts.len={}",
+                ddtree_active, nonflat_enabled, drafts.len()
+            );
+        }
+        // ATLAS_DDTREE_CHAIN_ONLY=1: produce a strict flat chain even in DDTree
+        // mode so requires_tree_kernel returns false → wy17 path fires → no
+        // numerical drift vs baseline. Validates that the drift cascade isolation
+        // diagnosis from m8a_diff.py is correct.
+        let chain_only =
+            std::env::var("ATLAS_DDTREE_CHAIN_ONLY").ok().as_deref() == Some("1");
+        if chain_only && ddtree_active && !drafts.is_empty() {
+            let n = drafts.len();
+            let mut parent_indices = Vec::with_capacity(n);
+            parent_indices.push(-1i32);
+            for i in 0..n.saturating_sub(1) {
+                parent_indices.push(i as i32);
+            }
+            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                tree_token_ids: drafts.clone(),
+                parent_indices,
+            });
+            dstate.last_num_drafted = drafts.len();
+            dstate.first_propose_done = true;
+            return Ok(drafts);
+        }
+        if ddtree_active && nonflat_enabled && drafts.len() >= 2 {
+            // M4B v2 lite: build a NON-FLAT tree from existing γ_eff drafts so
+            // the M8A kernel actually fires (flat payloads short-circuit to
+            // wy_k). Topology: drafts[0..n-1] form the main chain; drafts[n-1]
+            // becomes a SIBLING of drafts[0] under root.
+            //
+            //                       root
+            //                      /    \
+            //               drafts[0]   drafts[n-1]     ← sibling branch
+            //                  |
+            //               drafts[1]
+            //                  |
+            //                 ...
+            //                  |
+            //               drafts[n-2]
+            //
+            // tree_token_ids order is drafts[0..n], parent_indices keys to
+            // those compact indices. drafts[n-1] sits at compact index n-1
+            // with parent -1 (root) — breaks the flat-chain assumption.
+            let n = drafts.len();
+            let mut parent_indices = Vec::with_capacity(n);
+            parent_indices.push(-1i32); // drafts[0] → root
+            for i in 1..n.saturating_sub(1) {
+                parent_indices.push((i - 1) as i32); // drafts[i] → drafts[i-1]
+            }
+            // drafts[n-1] also attaches to root — this is the sibling.
+            if n >= 2 {
+                parent_indices.push(-1i32);
+            }
+            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                tree_token_ids: drafts.clone(),
+                parent_indices,
+            });
+        } else if ddtree_active && !drafts.is_empty() {
+            // M4B v2: real top-K DDTree. Extract per-MASK-position top-K
+            // tokens from `self.scratch.logits` (already populated by the
+            // forward_block call above; survives until next propose), seed
+            // the [`super::ddtree::build_ddtree`] best-first builder, then
+            // serialize the result into [`TreePayload`].
+            //
+            // Set ATLAS_DDTREE_CHAIN_ONLY=1 (handled above as an early
+            // return) to bypass this path and emit the legacy flat-chain
+            // payload — needed when validating bit-equivalence of the wy17
+            // GDN kernel before turning on the tree-aware verifier.
+            // Match AEON-7 env var naming (DDTREE_*) with an Atlas-prefixed
+            // alias (ATLAS_DDTREE_*) for consistency with the rest of the
+            // codebase. AEON-7's serve scripts set the unprefixed names.
+            let top_k: usize = std::env::var("ATLAS_DDTREE_TOP_K")
+                .ok()
+                .or_else(|| std::env::var("DDTREE_TOP_K").ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8)
+                .min(super::DDTREE_TOP_K_MAX)
+                .max(1);
+            let budget: usize = std::env::var("ATLAS_DDTREE_BUDGET")
+                .ok()
+                .or_else(|| std::env::var("DDTREE_BUDGET").ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15)
+                .max(1);
+            let min_root_branches: usize = std::env::var("ATLAS_DDTREE_MIN_ROOT_BRANCHES")
+                .ok()
+                .or_else(|| std::env::var("DDTREE_MIN_ROOT_BRANCHES").ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            let chain_seed = std::env::var("ATLAS_DDTREE_CHAIN_SEED")
+                .ok()
+                .as_deref()
+                != Some("0");
+
+            // Extract top-K logits from the just-computed γ_eff logit rows.
+            let gamma_eff = drafts.len();
+            match self.extract_topk_from_logits(ctx.gpu, _stream, gamma_eff, top_k) {
+                Ok((topk_tokens, topk_logits)) => {
+                    // Reshape into [γ_eff][top_k] DraftCandidate vectors.
+                    // logprob_proxy = logit - row_max so the top-1 row gets 0
+                    // and the rest are negative — preserves ranking and acts
+                    // as a sensible additive path-score for the best-first
+                    // tree builder. Real log-softmax would require a vocab-
+                    // wide reduction we want to avoid in this hot path.
+                    let mut candidates_by_depth: Vec<Vec<super::ddtree::DraftCandidate>> =
+                        Vec::with_capacity(gamma_eff);
+                    for row in 0..gamma_eff {
+                        let base = row * top_k;
+                        let row_max = topk_logits[base];
+                        let row_cands: Vec<super::ddtree::DraftCandidate> = (0..top_k)
+                            .map(|i| super::ddtree::DraftCandidate {
+                                token_id: topk_tokens[base + i],
+                                logprob: topk_logits[base + i] - row_max,
+                            })
+                            .collect();
+                        candidates_by_depth.push(row_cands);
+                    }
+
+                    // Root token is irrelevant for the payload (tree_token_ids
+                    // skips index 0); pass u32::MAX as a sentinel.
+                    match super::ddtree::build_ddtree(
+                        &candidates_by_depth,
+                        budget,
+                        top_k,
+                        chain_seed,
+                        min_root_branches,
+                        u32::MAX,
+                    ) {
+                        Ok(tree) => {
+                            let tree_token_ids = tree.token_ids_for_verifier();
+                            let parent_indices = tree.parent_indices_for_verifier();
+                            static TOPK_TREE_DBG_DONE: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !TOPK_TREE_DBG_DONE.swap(
+                                true,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) {
+                                tracing::info!(
+                                    "M4B v2 real top-K tree: γ_eff={} k={} budget={} \
+                                     min_root_branches={} chain_seed={} \
+                                     → nodes={} parent_indices={:?} \
+                                     tokens[..min(8)]={:?}",
+                                    gamma_eff,
+                                    top_k,
+                                    budget,
+                                    min_root_branches,
+                                    chain_seed,
+                                    tree_token_ids.len(),
+                                    parent_indices,
+                                    &tree_token_ids
+                                        [..tree_token_ids.len().min(8)],
+                                );
+                            }
+                            dstate.pending_tree_payload =
+                                Some(super::ddtree::TreePayload {
+                                    tree_token_ids,
+                                    parent_indices,
+                                });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "DDTree build_ddtree failed ({e}); falling back \
+                                 to flat-chain payload"
+                            );
+                            // Flat-chain fallback so the dispatch chain still
+                            // sees a valid (degenerate) payload.
+                            let n = drafts.len();
+                            let mut parent_indices = Vec::with_capacity(n);
+                            parent_indices.push(-1i32);
+                            for i in 0..n.saturating_sub(1) {
+                                parent_indices.push(i as i32);
+                            }
+                            dstate.pending_tree_payload =
+                                Some(super::ddtree::TreePayload {
+                                    tree_token_ids: drafts.clone(),
+                                    parent_indices,
+                                });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DDTree top-K extraction failed ({e}); emitting flat-chain payload"
+                    );
+                    let n = drafts.len();
+                    let mut parent_indices = Vec::with_capacity(n);
+                    parent_indices.push(-1i32);
+                    for i in 0..n.saturating_sub(1) {
+                        parent_indices.push(i as i32);
+                    }
+                    dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                        tree_token_ids: drafts.clone(),
+                        parent_indices,
+                    });
+                }
+            }
+        } else {
+            dstate.pending_tree_payload = None;
+        }
         Ok(drafts)
     }
 }

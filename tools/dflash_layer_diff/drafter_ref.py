@@ -165,33 +165,46 @@ def main():
     print(f"fc_proj shape={list(fc_proj.shape)} mean={fc_proj.float().mean():.4f} std={fc_proj.float().std():.4f}")
 
     # === Step 1: build noise inputs ===
-    # vLLM: query = [next_token_id (bonus), mask × (γ-1)]
-    # Atlas: now matches (post-fix). Reads bonus from Atlas log line:
-    #   "DFLASH DUMP_FULL: ... (last_token=N, position=P, eff_ctx=E)"
-    # For our count-to-30 prompt, last_token=16 (token id for " 11"? or whatever)
-    LAST_TOKEN = 248068  # AEON-7 <think> token, from dump_run.log
-    print(f"\n=== Step 1: noise embeddings [bonus={LAST_TOKEN}, mask × {GAMMA-1}] ===")
-    ids = torch.tensor([LAST_TOKEN] + [MASK_TOKEN_ID] * (GAMMA - 1), dtype=torch.long)
-    noise_embeds = embed[ids].to(torch.bfloat16)  # [γ, 5120]
+    # vLLM-aligned: query = [bonus=last_token, mask × γ] → noise_count = γ+1.
+    # Read inputs from /tmp/atlas_dump_meta.json (written by forward_block.rs
+    # alongside the target_hidden binary) so reference + Atlas use identical
+    # last_token / position / eff_ctx.
+    import json as _json
+    meta_path = "/tmp/atlas_dump_meta.json"
+    if os.path.exists(meta_path):
+        meta = _json.load(open(meta_path))
+        LAST_TOKEN = int(meta["last_token"])
+        POSITION = int(meta["position"])
+        meta_eff_ctx = int(meta["eff_ctx"])
+        if meta_eff_ctx != n_ctx:
+            print(f"WARN: meta eff_ctx={meta_eff_ctx} != binary n_ctx={n_ctx} — using binary")
+        print(f"[meta] last_token={LAST_TOKEN} position={POSITION} eff_ctx={n_ctx}")
+    else:
+        LAST_TOKEN = 248068
+        POSITION = n_ctx
+        print(f"WARN: no {meta_path}; falling back to LAST_TOKEN={LAST_TOKEN} POSITION={POSITION}")
+
+    NOISE_COUNT = GAMMA + 1  # 1 bonus + γ MASK
+    print(f"\n=== Step 1: noise embeddings [bonus={LAST_TOKEN}, mask × {GAMMA}] noise_count={NOISE_COUNT} ===")
+    ids = torch.tensor([LAST_TOKEN] + [MASK_TOKEN_ID] * GAMMA, dtype=torch.long)
+    noise_embeds = embed[ids].to(torch.bfloat16)  # [γ+1, 5120]
     print(f"noise_embeds shape={list(noise_embeds.shape)} mean={noise_embeds.float().mean():.5f} std={noise_embeds.float().std():.5f}")
 
     # ctx slots zeroed, noise rows = noise_embeds
     eff_ctx = n_ctx
-    n_attn = eff_ctx + GAMMA
+    n_attn = eff_ctx + NOISE_COUNT
     stream = torch.zeros(n_attn, HIDDEN, dtype=torch.bfloat16)
     stream[eff_ctx:] = noise_embeds
 
-    # Position IDs — assume position is the seq_len position right after prompt
-    # From Atlas's dump info: position is logged with target_hidden dump
-    # We'll use 0 for ctx_start, but in real use this comes from Atlas's seq state
-    # For first decode of a long prompt at position P, ctx_positions = [P-n_ctx..P), noise = [P..P+γ)
-    # If we don't know P, just use sequential.
-    # Atlas log: position=35, eff_ctx=16 → ctx positions=[35-16..35)=[19..35), noise=[35..51)
-    POS_OFFSET = 5 - eff_ctx
+    # Position IDs (Atlas layout):
+    #   ctx_pos_i  = POSITION - eff_ctx + i   for i in [0, eff_ctx)
+    #   noise_pos_i = POSITION + i            for i in [0, NOISE_COUNT)
+    ctx_start = max(0, POSITION - eff_ctx)
     pos = torch.cat([
-        torch.arange(POS_OFFSET, POS_OFFSET + eff_ctx, dtype=torch.long),
-        torch.arange(POS_OFFSET + eff_ctx, POS_OFFSET + eff_ctx + GAMMA, dtype=torch.long),
+        torch.arange(ctx_start, ctx_start + eff_ctx, dtype=torch.long),
+        torch.arange(POSITION, POSITION + NOISE_COUNT, dtype=torch.long),
     ])
+    print(f"[pos] ctx=[{ctx_start}..{ctx_start+eff_ctx}) noise=[{POSITION}..{POSITION+NOISE_COUNT}) n_attn={n_attn}")
 
     inv_freq = vanilla_inv_freq(ROTARY_DIM, ROPE_THETA)
 

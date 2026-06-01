@@ -193,6 +193,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
         k: usize,
+        last_inter_slot: usize,
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
@@ -203,6 +204,30 @@ impl TransformerModel {
             self.gpu
                 .record_event(self.secondary_event, self.secondary_stream)?;
             return Ok(());
+        }
+
+        // M8A: if the just-finished verify ran the tree-aware GDN kernel, the
+        // kernel only wrote h_state_intermediates[t] per token and LEFT h_state
+        // untouched. The full-accept fast path below (line 236) assumes wy_k
+        // semantics where h_state was updated in-place to post-K state — wrong
+        // for tree mode. Force the partial-accept copy path (copy intermediate
+        // [last_inter_slot] → h_state) regardless of num_accepted when tree
+        // mode was active.
+        let was_tree_mode = self.ddtree_parent_ids_dev.lock().is_some();
+
+        // Defensive bounds check: `last_inter_slot` must be a valid pool slot.
+        // The intermediate pool was sized to `num_intermediates = γ+1 = k` so
+        // valid slots are `0..k`. Out-of-bounds indicates a caller bug — fail
+        // loudly rather than corrupting an unrelated sequence's state pool.
+        if last_inter_slot >= self.ssm_pool.num_intermediates {
+            bail!(
+                "commit_verify_state_async: last_inter_slot={} OOB (num_intermediates={}, k={}, num_accepted={}, tree_mode={})",
+                last_inter_slot,
+                self.ssm_pool.num_intermediates,
+                k,
+                num_accepted,
+                was_tree_mode,
+            );
         }
 
         let stream = self.secondary_stream;
@@ -233,28 +258,37 @@ impl TransformerModel {
                 let d_conv = self.config.linear_conv_kernel_dim;
                 let conv_bytes = conv_dim * d_conv * 4;
 
-                if num_accepted == k {
-                    // Full accept: h_state already holds state-after-K, which
-                    // is the canonical post-step state. Mirror into the
-                    // checkpoint so a future rollback (if any) has a valid
-                    // restore point.
+                if num_accepted == k && !was_tree_mode {
+                    // Full accept (wy_k path): h_state already holds state-
+                    // after-K, which is the canonical post-step state. Mirror
+                    // into the checkpoint so a future rollback (if any) has a
+                    // valid restore point.
                     self.gpu
                         .copy_d2d_async(ssm.h_state, h_ckpt, h_bytes, stream)?;
                     self.gpu
                         .copy_d2d_async(ssm.conv_state, conv_ckpt, conv_bytes, stream)?;
                 } else {
-                    // Partial accept: h_state holds state-after-K (includes
-                    // rejected drafts) — WRONG for the next forward.
-                    // intermediate[N-1] holds state-after-(N accepted tokens).
-                    // The SSM kernels read from h_state on every forward call,
-                    // so we MUST overwrite h_state with the canonical state.
-                    // Also mirror into checkpoint for rollback consistency.
+                    // Partial accept (or any tree-mode accept): h_state holds
+                    // state-after-K (includes rejected drafts) — WRONG for the
+                    // next forward. The kernel-slot semantics are:
+                    //   slot 0     = post-root (= previously-committed bonus)
+                    //   slot k     = post-compact-index-k for k ∈ [1, T-1]
+                    // Chain mode: `last_inter_slot = num_accepted - 1`.
+                    // Tree mode: `last_inter_slot = accepted_compact_indices
+                    //             .last()` — may be > num_accepted-1 when the
+                    // accepted path crosses tree forks (non-contiguous compact
+                    // indices, e.g. [1, 4, 7]). Reading
+                    // `inter[num_accepted - 1]` instead would silently grab
+                    // an unrelated branch's state and produce gibberish.
                     let slot = seq.slot_idx;
-                    let inter_idx = num_accepted - 1;
-                    let h_inter = self.ssm_pool.h_intermediate(ssm_layer_idx, slot, inter_idx);
-                    let conv_inter =
+                    let h_inter =
                         self.ssm_pool
-                            .conv_intermediate(ssm_layer_idx, slot, inter_idx);
+                            .h_intermediate(ssm_layer_idx, slot, last_inter_slot);
+                    let conv_inter = self.ssm_pool.conv_intermediate(
+                        ssm_layer_idx,
+                        slot,
+                        last_inter_slot,
+                    );
                     // canonical → live (h_state read by next forward)
                     self.gpu
                         .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;

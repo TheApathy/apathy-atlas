@@ -74,6 +74,13 @@ fn bench_paged_decode(c: &mut Criterion) {
         group.bench_function(&label, |b| {
             b.iter_custom(|iters| {
                 let ms = gpu::bench_kernel_ms(stream, 50, iters as usize, || {
+                    // Null indirection (default, chain-mode behavior).
+                    // CUDA graph fix: kv_indir_base is now a device-buffer
+                    // pointer; NULL deactivates the tree path in the kernel.
+                    let null_indir: u64 = 0;
+                    let null_base_ptr: u64 = 0;
+                    let null_pack: u64 = 0;
+                    let zero_u32: u32 = 0;
                     let mut params: Vec<*mut c_void> = vec![
                         &q_ptr as *const u64 as *mut c_void,
                         &k_cache_ptr as *const u64 as *mut c_void,
@@ -91,6 +98,12 @@ fn bench_paged_decode(c: &mut Criterion) {
                         &v_scale as *const f32 as *mut c_void,
                         &q_stride as *const u32 as *mut c_void,
                         &cache_stride as *const u64 as *mut c_void,
+                        &null_indir as *const u64 as *mut c_void,
+                        &null_base_ptr as *const u64 as *mut c_void,
+                        &zero_u32 as *const u32 as *mut c_void,
+                        &null_pack as *const u64 as *mut c_void,
+                        &null_pack as *const u64 as *mut c_void,
+                        &zero_u32 as *const u32 as *mut c_void,
                     ];
                     unsafe {
                         gpu::launch(

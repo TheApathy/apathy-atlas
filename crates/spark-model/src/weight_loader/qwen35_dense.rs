@@ -67,7 +67,65 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             let ffn_weights = load_dense_ffn(
                 store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
             )?;
-            let ffn = FfnComponent::Dense(DenseFfnLayer::new(ffn_weights, gpu)?);
+            let mut ffn_layer = DenseFfnLayer::new(ffn_weights, gpu)?;
+            // ATLAS_FFN_M16_TRANSPOSED=1: build transposed (nvfp4_t) copies
+            // of the three FFN projections so `forward_kgamma` can route
+            // through the M_TILE=16 `w4a16_gemm_n128_m16` kernel (near-zero
+            // MMA accumulator waste at M ≤ 32) instead of the M_TILE=64
+            // `w4a16_gemm` fallback (which discards ~73% of writes at M=17).
+            // Matches the SSM `qkvz_nvfp4_t` / `out_proj_nvfp4_t` pattern at
+            // lines 232/244 below, and the DFlash drafter pattern in
+            // dflash_head/from_weights.rs:472-483. Skipped on non-NVFP4
+            // FFN paths (BF16/FP8-LUT) — the transposed kernel only
+            // accepts QuantizedWeight.
+            //
+            // Memory cost: ~equivalent to original FFN weights (~150 MB on
+            // qwen3.6-27b — 64 layers × 3 projections × ~780 KB packed).
+            // Load-time cost: 3 H↔D round-trips per layer (~89 MB each),
+            // ~few hundred ms total across 64 layers via host transpose.
+            if crate::layers::ffn_m16_transposed_enabled() {
+                let inter = config.intermediate_size;
+                // gate: [intermediate, hidden]; up: [intermediate, hidden];
+                // down: [hidden, intermediate]. transpose_for_gemm(_, n, k):
+                let gate_t = ffn_layer
+                    .weights
+                    .gate_proj
+                    .transpose_for_gemm(gpu, inter, h)?;
+                let up_t = ffn_layer
+                    .weights
+                    .up_proj
+                    .transpose_for_gemm(gpu, inter, h)?;
+                let down_t = ffn_layer
+                    .weights
+                    .down_proj
+                    .transpose_for_gemm(gpu, h, inter)?;
+                ffn_layer.set_transposed_weights(gate_t, up_t, down_t);
+                if i == 0 {
+                    tracing::info!(
+                        "Dense FFN M_TILE=16 transposed-weight path enabled \
+                         (ATLAS_FFN_M16_TRANSPOSED=1): \
+                         transposed gate/up/down per layer for w4a16_gemm_n128_m16"
+                    );
+                }
+            }
+            // ATLAS_FFN_PREDEQUANT_FP8=1: pre-dequant the (non-transposed)
+            // NVFP4 FFN weights to FP8 [N, K] for the `fp8_gemm_t_m128`
+            // prefill fast path. Allocates ~270 MB per layer (gate+up+down)
+            // → ~17 GB total at Qwen3.6-27B's 64 layers. Worth it when the
+            // 5-20% per-GEMM speedup × 64 layers × 3 GEMMs beats the memory
+            // budget impact. Mirrors `predequant_for_prefill` for attention.
+            if crate::layers::prefill_ffn_fp8_enabled() {
+                let inter = config.intermediate_size;
+                ffn_layer.predequant_for_prefill(gpu, h, inter, stream)?;
+                if i == 0 {
+                    tracing::info!(
+                        "Dense FFN FP8 predequant prefill path enabled \
+                         (ATLAS_FFN_PREDEQUANT_FP8=1): \
+                         pre-dequanted gate/up/down per layer for fp8_gemm_t_m128"
+                    );
+                }
+            }
+            let ffn = FfnComponent::Dense(ffn_layer);
 
             match lt {
                 LayerType::FullAttention => {
@@ -172,7 +230,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         }
                     };
 
-                    layers.push(Box::new(Qwen3AttentionLayer::new(
+                    let mut layer = Qwen3AttentionLayer::new(
                         input_norm,
                         attn,
                         post_attn_norm,
@@ -185,7 +243,44 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         layer_kv_dtypes[attn_idx],
                         config.fp8_kv_calibration_tokens,
                         config,
-                    )?));
+                    )?;
+
+                    // Transpose NVFP4 weights for the small-M prefill /
+                    // K=γ verify GEMM path (`w4a16_gemm_t_m16`). Without
+                    // these, the multi_seq decode path falls back to
+                    // per-token GEMV at γ=16 (3 × 17 launches/layer).
+                    let num_heads = config.num_attention_heads;
+                    let num_kv_heads = config.num_key_value_heads;
+                    let head_dim = config.head_dim;
+                    let gated = config.attn_gated;
+                    let q_proj_n = if gated {
+                        num_heads * head_dim * 2
+                    } else {
+                        num_heads * head_dim
+                    };
+                    if let Some(ref qw) = q_nvfp4 {
+                        let qt = qw.transpose_for_gemm(gpu, q_proj_n, h)?;
+                        let kt = k_nvfp4
+                            .as_ref()
+                            .unwrap()
+                            .transpose_for_gemm(gpu, num_kv_heads * head_dim, h)?;
+                        let vt = v_nvfp4
+                            .as_ref()
+                            .unwrap()
+                            .transpose_for_gemm(gpu, num_kv_heads * head_dim, h)?;
+                        let ot = layer
+                            .attn
+                            .o_proj
+                            .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
+                        layer.set_prefill_weights(
+                            Some(qt),
+                            Some(kt),
+                            Some(vt),
+                            Some(ot),
+                        );
+                    }
+
+                    layers.push(Box::new(layer));
                     attn_idx += 1;
                 }
                 LayerType::LinearAttention => {
@@ -319,6 +414,26 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>> {
+        // Dense models don't have MoE-shaped MTP — see `load_mtp_dense_weights`.
         Ok(None)
+    }
+
+    fn load_mtp_dense_weights(
+        &self,
+        store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::weight_map::MtpDenseWeights>> {
+        if !store.contains("mtp.fc.weight") {
+            return Ok(None);
+        }
+        tracing::info!("Loading dense MTP weights (Qwen3.5/3.6 27B-class)...");
+        let mtp = crate::weight_map::load_mtp_dense(store)?;
+        if mtp.is_some() {
+            tracing::info!(
+                "Dense MTP weights loaded: 1 attention layer + dense MLP (no expert routing)"
+            );
+        }
+        Ok(mtp)
     }
 }

@@ -97,7 +97,7 @@ extern "C" __global__ void gated_delta_rule_decode(
     // which naturally constrains to (0, 1), but FP32 rounding or extreme
     // activations could push outside this range.
     float g_raw = gate[b * num_v_heads + vh];
-    const float g = fminf(fmaxf(g_raw, 1e-6f), 1.0f - 1e-6f);
+    const float g = fminf(fmaxf(g_raw, 0.0f), 1.0f);
     const float bt = beta[b * num_v_heads + vh];    // beta gating
 
     // Shared memory for key and query vectors (k_dim elements each)
@@ -242,7 +242,7 @@ extern "C" __global__ void gated_delta_rule_decode_f32(
     const __nv_bfloat16* v_ptr = value + (b * num_v_heads + vh) * v_dim;
 
     float g_raw = gate[b * num_v_heads + vh];
-    const float g = fminf(fmaxf(g_raw, 1e-6f), 1.0f - 1e-6f);
+    const float g = fminf(fmaxf(g_raw, 0.0f), 1.0f);
     const float bt = beta[b * num_v_heads + vh];
 
     __shared__ float smem_k[128];

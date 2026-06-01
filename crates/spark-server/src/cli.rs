@@ -155,6 +155,45 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 4096)]
     pub dflash_window_size: usize,
 
+    /// DFlash drafter weight precision: `bf16` or `nvfp4`. `bf16` loads
+    /// weights verbatim from the drafter checkpoint and uses BF16 dense
+    /// GEMMs (~134 ms/step). `nvfp4` runtime-quantizes every dense
+    /// projection (7/layer + `fc`) to NVFP4 at model-load time so the
+    /// per-step forward runs through `w4a16_gemm` kernels (~3-5x faster
+    /// on GB10). Default `bf16` to preserve existing behavior.
+    #[arg(long, default_value = "bf16")]
+    pub dflash_quantization: String,
+
+    /// DFlash verifier strategy: `flat` (default — γ-block of linear drafts)
+    /// or `ddtree` (experimental — tree-shaped drafts with sibling branches).
+    /// Port of AEON-7 vLLM PR M1 (`method="dflash_ddtree"`). M1-M11E milestone
+    /// roadmap: starts as flat-DFlash pass-through and incrementally enables
+    /// tree builder, ancestor-mask verifier, GDN parent-state replay, and
+    /// accepted-branch KV/state compaction. See
+    /// research/ddtree_port/ddtree_src/README.md for milestone descriptions.
+    #[arg(long, default_value = "flat")]
+    pub dflash_method: String,
+
+    /// DDTree: maximum non-root verifier nodes per request. Caps total tree
+    /// size when `--dflash-method=ddtree`. None = use γ as default.
+    #[arg(long)]
+    pub ddtree_budget: Option<usize>,
+
+    /// DDTree: number of candidate siblings to keep per DFlash draft position.
+    /// AEON-7 deployable-safe default is 8. Higher values widen the tree.
+    #[arg(long, default_value_t = 8)]
+    pub ddtree_top_k: usize,
+
+    /// DDTree: temperature applied to DFlash draft logits when scoring sibling
+    /// candidates for tree expansion. 1.0 = use raw probabilities.
+    #[arg(long, default_value_t = 1.0)]
+    pub ddtree_temperature: f32,
+
+    /// DDTree: seed the tree with the top-1 chain before adding sibling
+    /// branches (mirrors vLLM `ddtree_chain_seed=True` default).
+    #[arg(long, default_value_t = true)]
+    pub ddtree_chain_seed: bool,
+
     /// Number of draft tokens per speculative step (1=K=2, 2=K=3, 3=K=4 verify).
     /// Higher K verifies more drafts per step. Uses WY-chunkwise GDN kernels.
     #[arg(long, default_value_t = 1)]

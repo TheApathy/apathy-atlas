@@ -13,6 +13,26 @@ impl Qwen3SsmLayer {
         stream: u64,
         trace: bool,
     ) -> Result<DevicePtr> {
+        self.ssm_forward_with_fuse(normed, None, normed, stream, state, ctx, trace)
+    }
+
+    /// Same as `ssm_forward` but with an optional fused rms_norm_residual entry point.
+    ///
+    /// When `fuse_input` is `Some((hidden, residual))`, the kernel computes
+    /// `rms_norm_residual(hidden, input_norm) -> {normed, residual}` AND the
+    /// QKVZ projection in a single launch. `normed` must point at the buffer
+    /// that downstream consumers (ba_gates, etc.) will read from.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ssm_forward_with_fuse(
+        &self,
+        normed: DevicePtr,
+        fuse_input: Option<(DevicePtr, DevicePtr)>,
+        _normed_alias: DevicePtr,
+        stream: u64,
+        state: &mut SsmLayerState,
+        ctx: &ForwardContext,
+        trace: bool,
+    ) -> Result<DevicePtr> {
         let h = ctx.config.hidden_size as u32;
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
@@ -83,7 +103,27 @@ impl Qwen3SsmLayer {
             } else if self.sequential_qkvz {
                 // Qwen3.5: QKVZ weight is pre-concatenated [Q|K|V|Z] sequential.
                 // Plain GEMV writes directly to deinterleaved buffer.
-                if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+                if let (Some((fuse_hidden, fuse_residual)), Some(ref nvfp4)) =
+                    (fuse_input, self.qkvz_nvfp4.as_ref())
+                {
+                    // Fused path: rms_norm_residual + w4a16_gemv in one launch.
+                    // Writes `normed` (consumed by ba_gates below), `residual` (consumed
+                    // by the post-attn residual_add_rms_norm), and the QKVZ output.
+                    ops::rms_norm_residual_w4a16_gemv(
+                        ctx.gpu,
+                        self.fused_rms_qkvz_k,
+                        fuse_hidden,
+                        &self.input_norm,
+                        normed,
+                        fuse_residual,
+                        nvfp4,
+                        deinterleaved,
+                        qkvz_size,
+                        h,
+                        ctx.config.rms_norm_eps as f32,
+                        stream,
+                    )
+                } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
                     ops::w4a16_gemv(
                         ctx.gpu,
                         self.w4a16_gemv_k,

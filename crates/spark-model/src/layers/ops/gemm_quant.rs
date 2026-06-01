@@ -130,6 +130,45 @@ pub fn dense_gemv(
         .launch(stream)
 }
 
+/// K=3 batched dense BF16 GEMV: C[3, N] = A[3, K] @ B[N, K]^T.
+///
+/// Collapses 3 per-token `dense_gemv` launches into a single launch. B
+/// (weights) is read once per N-tile and dotted against all 3 activation
+/// rows — same B bandwidth as the unbatched call, 3× the A bandwidth (A
+/// fits in L1/L2 for the SSM BA case where K=hidden=5120 → 30 KiB).
+///
+/// Used by the SSM BA projection on the K=3 verify path (48 SSM layers ×
+/// 3 launches/layer = 144 launches/verify collapses to 48). The actual
+/// math (N=64 outputs × K=5120) is tiny — the loop is launch-overhead
+/// bound, ~24μs/launch on GB10.
+///
+/// A: `[3, K]` BF16 contiguous (rows are token-0, token-1, token-2).
+/// B: `[N, K]` BF16 weights.
+/// C: `[3, N]` BF16 contiguous (same row order as A).
+///
+/// Kernel: `dense_gemv_bf16_batch3(A, B, C, N, K)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+pub fn dense_gemv_batch3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Dense FP8-weight GEMV (M=1): C = A @ (dequant(B_fp8) * row_scale).
 ///
 /// A: `[1, K]` BF16, B: `[N, K]` FP8 E4M3, row_scale: `[N]` f32, C: `[1, N]` BF16.

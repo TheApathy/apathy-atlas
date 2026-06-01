@@ -180,6 +180,21 @@ impl TransformerModel {
         // DFlash: advance ctx_len after the LAST chunk of chunked prefill.
         self.update_dflash_ctx_len_after_prefill(seq, chunk_start, chunk_len)?;
 
+        // MTP last-K prefill: replay the last K prompt-tail target hidden
+        // states through the MTP head so its self-attention sees recent
+        // prompt context before the first decode. Gated by
+        // `ATLAS_MTP_LASTK_PREFILL=N` (capacity captured at model init).
+        // No-op when capacity==0, no proposer is wired, or the proposer is
+        // not MTP (DFlash has its own prefill path via dflash_capture_layers).
+        self.mtp_lastk_prefill_after_finalize(
+            tokens,
+            seq,
+            chunk_start,
+            chunk_len,
+            proc_count,
+            stream,
+        )?;
+
         Ok(self.decode_logits_ptr())
     }
 }

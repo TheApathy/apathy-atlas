@@ -32,6 +32,7 @@ pub struct DflashBuildArgs<'a> {
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,
+    pub quantization: crate::layers::DflashQuantization,
 }
 
 // ── Loader registry ─────────────────────────────────────────────────────────

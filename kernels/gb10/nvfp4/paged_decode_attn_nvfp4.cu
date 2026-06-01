@@ -99,7 +99,22 @@ extern "C" __global__ void paged_decode_attn_nvfp4(
     const float inv_sqrt_d,
     const unsigned int q_stride,
     const unsigned long long block_stride_bytes,
-    const unsigned long long data_section_bytes
+    const unsigned long long data_section_bytes,
+    // Optional tree-aware KV indirection (ATLAS_TREE_AWARE_ATTN). When
+    // `kv_indirection == nullptr`, kernel behavior is identical to the
+    // pre-tree path. When non-null, positions `[kv_indir_base..seq_lens[t])`
+    // are remapped via:
+    //     actual_pos = kv_indir_base + kv_indirection[seq_idx * kv_indir_stride + (i - kv_indir_base)]
+    // Positions below `kv_indir_base` (prior linear context) read normally.
+    // Indirection covers the K=γ tree window (≤17 positions per row).
+    //
+    // CUDA graph fix: `kv_indir_base` lives in a 1×i32 device buffer
+    // (`kv_indir_base_ptr`) so captured graphs see the fresh value on
+    // each replay. Host writes the current `seq.seq_len` before launch.
+    // `nullptr` for legacy / non-tree paths.
+    const int* __restrict__ kv_indirection,
+    const int* __restrict__ kv_indir_base_ptr,
+    const unsigned int kv_indir_stride
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
@@ -111,6 +126,10 @@ extern "C" __global__ void paged_decode_attn_nvfp4(
 
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
+
+    // Load tree-window base position from device buffer (graph-safe, volatile).
+    const unsigned int kv_indir_base = (kv_indir_base_ptr != nullptr)
+        ? (unsigned int)(*((const volatile int*)kv_indir_base_ptr)) : 0u;
 
     // E2M1 dequant LUT in shared memory (16 floats = 64 bytes)
     __shared__ float e2m1_lut[16];
@@ -158,13 +177,73 @@ extern "C" __global__ void paged_decode_attn_nvfp4(
     #pragma unroll
     for (int i = 0; i < VEC_BF16; i++) o_reg[i] = 0.0f;
 
+    // Tree-aware indirection: when active and we're past `kv_indir_base`,
+    // remap raw position → actual position. Pre-`kv_indir_base` reads use
+    // the original batched path (large prior linear context). Tree window
+    // is small (≤17 positions) so single-position fallback is acceptable.
+    const bool tree_active = (kv_indirection != nullptr);
+    const int* my_indir = tree_active
+        ? kv_indirection + (unsigned long long)seq_idx * kv_indir_stride
+        : nullptr;
+
     unsigned int pos = my_start;
     while (pos < my_end) {
+        // In tree-aware mode, when we're at/past kv_indir_base, take the
+        // single-position indirected path (one slot at a time, possibly
+        // crossing blocks arbitrarily).
+        if (tree_active && pos >= kv_indir_base) {
+            unsigned int local_off = pos - kv_indir_base;
+            int compact_idx = my_indir[local_off];
+            unsigned int actual_pos = kv_indir_base + (unsigned int)compact_idx;
+            unsigned int logical_block_t = actual_pos / block_size;
+            unsigned int block_offset_t = actual_pos % block_size;
+            unsigned int physical_block_t = (unsigned int)my_block_table[logical_block_t];
+            const unsigned char* k_block_t = K_cache + (unsigned long long)physical_block_t * block_stride_bytes;
+            const unsigned char* v_block_t = V_cache + (unsigned long long)physical_block_t * block_stride_bytes;
+            const unsigned char* kd = k_block_t + block_offset_t * token_data_stride + kv_data_offset;
+            const unsigned char* ks = k_block_t + data_section_bytes + block_offset_t * token_scale_stride + kv_scale_offset;
+            float k_tmp[VEC_BF16];
+            nvfp4_dequant(kd, ks, e2m1_lut, k_tmp);
+
+            float dot = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < VEC_BF16; i++)
+                dot += q_reg[i] * k_tmp[i];
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                dot += __shfl_xor_sync(0xffffffff, dot, offset);
+
+            float score = dot * inv_sqrt_d;
+            float m_new = fmaxf(m, score);
+            float exp_old = __expf(m - m_new);
+            float exp_new = __expf(score - m_new);
+            l = l * exp_old + exp_new;
+
+            const unsigned char* vd = v_block_t + block_offset_t * token_data_stride + kv_data_offset;
+            const unsigned char* vs = v_block_t + data_section_bytes + block_offset_t * token_scale_stride + kv_scale_offset;
+            float v_tmp[VEC_BF16];
+            nvfp4_dequant(vd, vs, e2m1_lut, v_tmp);
+
+            #pragma unroll
+            for (int i = 0; i < VEC_BF16; i++)
+                o_reg[i] = o_reg[i] * exp_old + exp_new * v_tmp[i];
+            m = m_new;
+            pos += 1;
+            continue;
+        }
+
         unsigned int logical_block = pos / block_size;
         unsigned int block_offset = pos % block_size;
         unsigned int remaining_in_block = block_size - block_offset;
         unsigned int remaining_total = my_end - pos;
         unsigned int batch_count = remaining_in_block < remaining_total ? remaining_in_block : remaining_total;
+
+        // Don't let the batched (linear) path bleed into the indirected
+        // (tree-window) region — stop short of kv_indir_base when active.
+        if (tree_active && pos < kv_indir_base) {
+            unsigned int remaining_to_base = kv_indir_base - pos;
+            if (batch_count > remaining_to_base) batch_count = remaining_to_base;
+        }
 
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
         const unsigned char* k_block = K_cache + (unsigned long long)physical_block * block_stride_bytes;
@@ -352,7 +431,13 @@ extern "C" __global__ void paged_decode_attn_splitk_nvfp4(
     const unsigned int num_splits,
     const unsigned int q_stride,
     const unsigned long long block_stride_bytes,
-    const unsigned long long data_section_bytes
+    const unsigned long long data_section_bytes,
+    // See `paged_decode_attn_nvfp4` for the indirection contract.
+    // `kv_indir_base_ptr` is a 1×i32 device buffer (graph-safe replacement
+    // for the prior scalar). Pass `nullptr` for legacy / non-tree paths.
+    const int* __restrict__ kv_indirection,
+    const int* __restrict__ kv_indir_base_ptr,
+    const unsigned int kv_indir_stride
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int split_id = blockIdx.y;
@@ -365,6 +450,10 @@ extern "C" __global__ void paged_decode_attn_splitk_nvfp4(
 
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
+
+    // Load tree-window base position from device buffer (graph-safe, volatile).
+    const unsigned int kv_indir_base = (kv_indir_base_ptr != nullptr)
+        ? (unsigned int)(*((const volatile int*)kv_indir_base_ptr)) : 0u;
 
     // E2M1 dequant LUT
     __shared__ float e2m1_lut[16];
@@ -418,9 +507,21 @@ extern "C" __global__ void paged_decode_attn_splitk_nvfp4(
     #pragma unroll
     for (int i = 0; i < VEC_BF16; i++) o_reg[i] = 0.0f;
 
+    // Tree-aware indirection (see paged_decode_attn_nvfp4 contract).
+    const bool tree_active = (kv_indirection != nullptr);
+    const int* my_indir = tree_active
+        ? kv_indirection + (unsigned long long)seq_idx * kv_indir_stride
+        : nullptr;
+
     for (unsigned int pos = my_start; pos < my_end; pos++) {
-        unsigned int logical_block = pos / block_size;
-        unsigned int block_offset = pos % block_size;
+        unsigned int actual_pos = pos;
+        if (tree_active && pos >= kv_indir_base) {
+            unsigned int local_off = pos - kv_indir_base;
+            int compact_idx = my_indir[local_off];
+            actual_pos = kv_indir_base + (unsigned int)compact_idx;
+        }
+        unsigned int logical_block = actual_pos / block_size;
+        unsigned int block_offset = actual_pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
         const unsigned char* k_block = K_cache + (unsigned long long)physical_block * block_stride_bytes;

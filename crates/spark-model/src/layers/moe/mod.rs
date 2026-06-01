@@ -157,6 +157,18 @@ pub struct MoeLayer {
     /// `moe_fused_gate_up_t_k64_m128 == KernelHandle(0)` and dispatch
     /// falls through to the M=64 path even when the env var is set.
     nvfp4_gate_up_m128: bool,
+    /// `ATLAS_MOE_K3_FUSED_GATE_UP=1` opts in to the prefill-style fused
+    /// gate+up kernel (`moe_w4a16_fused_gate_up_t_k64`) on the K=3 MTP
+    /// verify path. Bridges OSS K=3 decode (separate gate / up GEMVs
+    /// → 100-104 tok/s on Qwen3.6-35B-A3B-NVFP4) to the closed Atlas
+    /// Alpha leaderboard number (~202 tok/s). Resolved once at
+    /// construction; dispatch additionally requires `gate_ptrs_t`,
+    /// `up_ptrs_t`, `down_ptrs_t` to be resident (full persistent
+    /// transpose, NOT the lazy scratch path) AND
+    /// `moe_fused_gate_up_t_k64 != KernelHandle(0)`. Falls through to
+    /// the existing batch3 path when any precondition fails (incl. FP8
+    /// experts, EP > 1, sigmoid+correction-bias routing).
+    k3_fused_gate_up: bool,
     /// `ATLAS_HYBRID_MOE_LAYOUT=1` opts in to the hybrid-layout path:
     /// keep BOTH original `[N, K/2]` weights (for decode + MTP verify) AND
     /// transposed `[K/2, N]` weights (for prefill). Doubles MoE-weight
@@ -247,11 +259,13 @@ pub struct MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod collision_trace;
 mod forward;
 mod forward_batched;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;
+mod forward_k3_fused;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_fp8;

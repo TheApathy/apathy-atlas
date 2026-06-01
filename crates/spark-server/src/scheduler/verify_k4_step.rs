@@ -109,6 +109,10 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
             tracing::error!("save_hidden_for_mtp(3): {e:#}");
             return;
         }
+        if let Err(e) = model.save_hidden_for_dflash(v3, &mut a.seq, 0) {
+            tracing::error!("save_hidden_for_dflash(v3): {e:#}");
+            return;
+        }
         if let Err(e) = model.trim_proposer_state(&mut a.seq, 3, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
@@ -162,6 +166,10 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
             tracing::error!("save_hidden_for_mtp(2): {e:#}");
             return;
         }
+        if let Err(e) = model.save_hidden_for_dflash(v2, &mut a.seq, 0) {
+            tracing::error!("save_hidden_for_dflash(v2): {e:#}");
+            return;
+        }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         match model.run_mtp_propose_multi(
@@ -208,6 +216,10 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
             return;
         }
+        if let Err(e) = model.save_hidden_for_dflash(v1, &mut a.seq, 0) {
+            tracing::error!("save_hidden_for_dflash(v1): {e:#}");
+            return;
+        }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         match model.run_mtp_propose_multi(
@@ -250,6 +262,10 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
         a.last_token = v0;
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
+            return;
+        }
+        if let Err(e) = model.save_hidden_for_dflash(v0, &mut a.seq, 0) {
+            tracing::error!("save_hidden_for_dflash(v0): {e:#}");
             return;
         }
         let t_propose = Instant::now();

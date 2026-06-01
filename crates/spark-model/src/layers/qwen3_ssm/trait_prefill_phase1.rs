@@ -116,6 +116,24 @@ impl Qwen3SsmLayer {
                 .map_err(|e| {
                     anyhow::anyhow!("ssm phase1: QKVZ m128 GEMM failed (M={k}, N={qkvz_size}): {e}")
                 })?;
+            } else if k <= 32
+                && self.w4a16_gemm_t_m16_k.0 != 0
+                && super::super::tc_nvfp4_m16_enabled()
+            {
+                ops::w4a16_gemm_n128_m16(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_k,
+                    normed,
+                    nvfp4_t,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("ssm phase1: QKVZ m16 GEMM failed (M={k}, N={qkvz_size}): {e}")
+                })?;
             } else {
                 ops::w4a16_gemm_n128(
                     ctx.gpu,

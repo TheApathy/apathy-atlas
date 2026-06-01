@@ -344,6 +344,28 @@ pub fn paged_decode_attn_fp8(
     v_scale: f32,
     q_stride: u32,
     cache_stride: u64,
+    // ATLAS_TREE_AWARE_ATTN: optional KV indirection. Pass DevicePtr::NULL
+    // for `kv_indirection` and `kv_indir_base_ptr` plus `0` for the stride
+    // to take the legacy chain-mode path (kernel behavior unchanged).
+    //
+    // `kv_indir_base_ptr` is a 1×i32 device buffer (graph-safe replacement
+    // for the prior `kv_indir_base: u32` scalar). The host writes the
+    // current `seq.seq_len` into the buffer before each step so a captured
+    // CUDA graph reads the fresh value on each replay instead of the
+    // stale immediate that was baked in at capture time.
+    kv_indirection: DevicePtr,
+    kv_indir_base_ptr: DevicePtr,
+    kv_indir_stride: u32,
+    // ATLAS_TREE_KV_PACK: optional pre-scattered ancestor pool. Pass
+    // `(DevicePtr::NULL, DevicePtr::NULL, 0)` for paths without the
+    // packed-KV fast tree window — kernel checks `K_pack_pool == nullptr`
+    // and falls back to the original code path. When provided, positions
+    // `[kv_indir_base..seq_lens[t])` read from the pack pool with the
+    // fast BC=4 batched code, instead of the slow indirected per-position
+    // fallback.
+    k_pack_pool: DevicePtr,
+    v_pack_pool: DevicePtr,
+    pack_block_size: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -365,5 +387,11 @@ pub fn paged_decode_attn_fp8(
         .arg_f32(v_scale)
         .arg_u32(q_stride)
         .arg_u64(cache_stride)
+        .arg_ptr(kv_indirection)
+        .arg_ptr(kv_indir_base_ptr)
+        .arg_u32(kv_indir_stride)
+        .arg_ptr(k_pack_pool)
+        .arg_ptr(v_pack_pool)
+        .arg_u32(pack_block_size)
         .launch(stream)
 }

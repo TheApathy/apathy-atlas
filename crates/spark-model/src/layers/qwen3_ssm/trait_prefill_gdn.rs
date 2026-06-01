@@ -2,7 +2,53 @@
 
 //! prefill_gdn_full.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::*;
+
+/// Per-call gdn_prefill profile (gated by ATLAS_GDN_PROFILE=1).
+/// Aggregates total invocations + total nanoseconds + bucketed total per
+/// "size class" (total token count) so we can separate small chunks from
+/// the dominating large prefill chunk.
+static GDN_CALLS: AtomicU64 = AtomicU64::new(0);
+static GDN_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static GDN_LARGE_CALLS: AtomicU64 = AtomicU64::new(0);
+static GDN_LARGE_NS: AtomicU64 = AtomicU64::new(0);
+static GDN_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static GDN_MAX_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn gdn_profile_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_GDN_PROFILE").ok().as_deref() == Some("1"))
+}
+
+/// Public dumper used from the server shutdown / bench script if needed.
+#[allow(dead_code)]
+pub fn dump_gdn_profile() {
+    let n = GDN_CALLS.load(Ordering::Relaxed);
+    let ns = GDN_TOTAL_NS.load(Ordering::Relaxed);
+    let nl = GDN_LARGE_CALLS.load(Ordering::Relaxed);
+    let nls = GDN_LARGE_NS.load(Ordering::Relaxed);
+    let mx = GDN_MAX_NS.load(Ordering::Relaxed);
+    let mxt = GDN_MAX_TOTAL.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    let per = ns / n.max(1);
+    let per_l = if nl > 0 { nls / nl } else { 0 };
+    tracing::info!(
+        "GDN_PROF total_calls={n} total_us={} avg_per_call_us={} large_calls={nl} \
+         large_total_us={} large_avg_us={} max_us={} max_total={}",
+        ns / 1000,
+        per / 1000,
+        nls / 1000,
+        per_l / 1000,
+        mx / 1000,
+        mxt
+    );
+}
 
 impl Qwen3SsmLayer {
     pub(super) fn prefill_gdn_full_inner(
@@ -12,6 +58,13 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        let __gdn_prof = gdn_profile_enabled();
+        let __gdn_t0 = if __gdn_prof {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let ssm_state = state
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()
@@ -43,15 +96,14 @@ impl Qwen3SsmLayer {
         // WY32 persistent: processes 32 tokens per WY iteration with H in
         // shared memory (~84KB). ~30× faster than per-token for 14k+ sequences.
         // Falls through to WY4 or sub-chunked persistent for shorter sequences.
-        tracing::info!(
-            "GDN prefill: total={total} wy32_k={} wy4_k={} persistent_k={} split4_k={}",
-            self.gdn_prefill_wy32_k.0 != 0,
-            self.gdn_prefill_persistent_wy4_k.0 != 0,
-            self.gdn_prefill_persistent_k.0 != 0,
-            self.gdn_prefill_split4_k.0 != 0
-        );
+        // Silenced per-call info log; instrumentation lives in trait_prefill.rs.
         if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {
-            let smem = (kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2 + 32 * 32 * 4 + 256) as u32;
+            // SMEM layout: H[kd*vd]FP32 + smem_k[32*kd]BF16 + smem_q[32*kd]BF16
+            //   + smem_warp[4]FP32 + smem_kd[32*32]FP32
+            //   + smem_g[32]FP32 + smem_bt[32]FP32 (rounded to 256 B alignment)
+            let smem_bytes = kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2
+                + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
+            let smem = (((smem_bytes + 255) / 256) * 256) as u32;
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,
                 self.gdn_prefill_wy32_k,
@@ -202,6 +254,39 @@ impl Qwen3SsmLayer {
                 gb_stride,
                 stream,
             )?;
+        }
+
+        if let Some(t0) = __gdn_t0 {
+            ctx.gpu.synchronize(stream)?;
+            let ns = t0.elapsed().as_nanos() as u64;
+            GDN_CALLS.fetch_add(1, Ordering::Relaxed);
+            GDN_TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+            // "large" bucket = total >= 256 (typical chunked-prefill chunk).
+            if total >= 256 {
+                GDN_LARGE_CALLS.fetch_add(1, Ordering::Relaxed);
+                GDN_LARGE_NS.fetch_add(ns, Ordering::Relaxed);
+            }
+            // Track per-call max so a single very-large call shows up.
+            let mut prev = GDN_MAX_NS.load(Ordering::Relaxed);
+            while ns > prev {
+                match GDN_MAX_NS.compare_exchange_weak(
+                    prev,
+                    ns,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        GDN_MAX_TOTAL.store(total as u64, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(p) => prev = p,
+                }
+            }
+            tracing::info!(
+                "GDN_PROF call total={total} us={} max_us={}",
+                ns / 1000,
+                GDN_MAX_NS.load(Ordering::Relaxed) / 1000
+            );
         }
 
         Ok(())

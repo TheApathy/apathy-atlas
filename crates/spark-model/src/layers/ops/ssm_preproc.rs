@@ -204,6 +204,47 @@ pub fn compute_gdn_gates(
         .launch(stream)
 }
 
+/// Multi-sequence GDN gates — `compute_gdn_gates` for `num_seqs`
+/// sequences in a single launch.
+///
+/// Kernel: `compute_gdn_gates_multi_seq(ba_interleaved, A_log, dt_bias,
+///          gate_out, beta_out, num_seqs, num_v_heads, num_groups,
+///          vheads_per_group, ba_stride, gate_beta_stride)`
+/// Grid: (num_seqs, 1, 1)  Block: (num_v_heads, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn compute_gdn_gates_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    ba_interleaved: DevicePtr,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    gate_out: DevicePtr,
+    beta_out: DevicePtr,
+    num_seqs: u32,
+    num_v_heads: u32,
+    num_groups: u32,
+    vheads_per_group: u32,
+    ba_stride: u32,
+    gate_beta_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_seqs, 1, 1])
+        .block([num_v_heads, 1, 1])
+        .arg_ptr(ba_interleaved)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(gate_out)
+        .arg_ptr(beta_out)
+        .arg_u32(num_seqs)
+        .arg_u32(num_v_heads)
+        .arg_u32(num_groups)
+        .arg_u32(vheads_per_group)
+        .arg_u32(ba_stride)
+        .arg_u32(gate_beta_stride)
+        .launch(stream)
+}
+
 /// Fused BA projection + GDN gates: dense GEMV + gate/beta transforms.
 ///
 /// Combines `dense_gemv(input, ba_weight, ba_out, N, K)` and
