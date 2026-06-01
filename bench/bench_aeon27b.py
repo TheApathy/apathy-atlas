@@ -51,7 +51,7 @@ for name, prompt in PROMPTS:
         }
         t0 = time.time()
         try:
-            r = requests.post(URL, json=payload, timeout=120)
+            r = requests.post(URL, json=payload, timeout=240)
             r.raise_for_status()
             d = r.json()
         except Exception as e:
