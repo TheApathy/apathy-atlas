@@ -34,46 +34,77 @@ impl Qwen3AttentionLayer {
         num_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
+        seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
-        let c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
+        // Max host-side seq_len drives the split-K KV partition. Safe upper
+        // bound across all sequences in the batch (verify dispatch uploads
+        // monotonically increasing seq_len per K slot, so `max()` matches the
+        // longest KV scan any CTA will perform).
+        let max_seq_len_host =
+            seq_lens.iter().copied().max().unwrap_or(0).saturating_add(1) as u32;
+        let c = ctx::MultiSeqCtx::new(
+            self,
+            ctx,
+            hidden,
+            residual,
+            num_seqs,
+            bs,
+            stream,
+            max_seq_len_host,
+        );
 
         // ── Phase 1: RMS norm + residual for N tokens ──
-        ops::rms_norm_residual(
-            ctx.gpu,
-            self.rms_norm_residual_k,
-            c.hidden,
-            &self.input_norm,
-            c.normed,
-            c.residual,
-            c.n as u32,
-            c.h as u32,
-            c.eps,
-            c.stream,
-        )?;
+        crate::kprof!(ctx.gpu, stream, "attn_rms_norm_residual", {
+            ops::rms_norm_residual(
+                ctx.gpu,
+                self.rms_norm_residual_k,
+                c.hidden,
+                &self.input_norm,
+                c.normed,
+                c.residual,
+                c.n as u32,
+                c.h as u32,
+                c.eps,
+                c.stream,
+            )?;
+            anyhow::Result::<()>::Ok(())
+        })?;
 
         // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
-        self.ms_phase_qkv(&c)?;
+        crate::kprof!(ctx.gpu, stream, "attn_qkv_proj", {
+            self.ms_phase_qkv(&c)?;
+            anyhow::Result::<()>::Ok(())
+        })?;
 
         // ── Phase 3: RoPE per-sequence ──
         let meta = ctx
             .attn_metadata
             .expect("attention layer requires metadata");
-        self.ms_phase_rope(&c, meta)?;
+        crate::kprof!(ctx.gpu, stream, "attn_rope", {
+            self.ms_phase_rope(&c, meta)?;
+            anyhow::Result::<()>::Ok(())
+        })?;
 
         // ── Phase 4: KV cache write ──
-        self.ms_phase_cache_write(&c, kv_cache, meta)?;
+        crate::kprof!(ctx.gpu, stream, "attn_cache_write", {
+            self.ms_phase_cache_write(&c, kv_cache, meta)?;
+            anyhow::Result::<()>::Ok(())
+        })?;
 
         // ── Phase 5: paged decode attention (batched) ──
-        let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta)?;
+        let attn_out = crate::kprof!(ctx.gpu, stream, "attn_paged_decode", {
+            self.ms_phase_paged_decode(&c, kv_cache, meta)?
+        });
 
         // ── Phase 6: gate multiply + O projection ──
-        let o_out = self.ms_phase_o_proj(&c, attn_out)?;
+        let o_out = crate::kprof!(ctx.gpu, stream, "attn_o_proj", {
+            self.ms_phase_o_proj(&c, attn_out)?
+        });
 
         // TP all-reduce on o_out after o_proj (Megatron row-parallel
         // pattern). Mirrors decode_inner.rs and prefill_inner.rs. Without
@@ -90,7 +121,10 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Phase 7: residual + post-norm + MoE ──
-        self.ms_phase_ffn(&c, o_out)?;
+        crate::kprof!(ctx.gpu, stream, "attn_ffn", {
+            self.ms_phase_ffn(&c, o_out)?;
+            anyhow::Result::<()>::Ok(())
+        })?;
 
         Ok(())
     }

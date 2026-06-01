@@ -30,6 +30,111 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 #[allow(dead_code)]
 pub struct TransformerModel {
     pub(super) config: ModelConfig,
+    /// M8A: per-step DDTree parent-ids channel. verify_d.rs uploads a
+    /// payload's parent_indices tensor and stashes the device pointer
+    /// here BEFORE the K=γ layer loop; the SSM dispatch reads it to
+    /// decide flat (gdn_wy17_k) vs tree-aware (gdn_tree_k) kernel.
+    /// `None` outside DDTree verify or when payload is flat-chain.
+    pub ddtree_parent_ids_dev: Mutex<Option<spark_runtime::gpu::DevicePtr>>,
+    /// Length of the parent_ids tensor above (= num_tree_tokens = K verify).
+    pub ddtree_num_tree_tokens: Mutex<usize>,
+    /// CUDA-graph-safe persistent parent_ids buffer for the K=γ verify
+    /// path. Allocated ONCE at init, sized for `dflash_kgamma * 4` bytes
+    /// (= 17 i32 slots on the 27b target). Holds two state-overlays:
+    ///   * Default (linear-chain): `[-1, 0, 1, ..., K-2]` — bit-equivalent
+    ///     to the wy17 flat path when consumed by `gated_delta_rule_tree_wy`.
+    ///     Re-stamped after every tree-mode verify by `clear_ddtree_parent_ids`.
+    ///   * Tree-mode override: `set_ddtree_parent_ids` overwrites in place
+    ///     with the kernel-frame mapping of the current payload.
+    /// The DEVICE POINTER never changes — that's the invariant captured
+    /// CUDA graphs rely on. `DevicePtr::NULL` when DFlash is disabled.
+    pub ddtree_parent_ids_persistent: spark_runtime::gpu::DevicePtr,
+    /// Capacity of `ddtree_parent_ids_persistent` in i32 slots (= dflash_kgamma).
+    /// Zero when DFlash is disabled. Used to stamp linear-chain defaults.
+    pub ddtree_parent_ids_capacity: usize,
+    /// Host-side mirror of the kernel-frame parent_ids tensor. Populated by
+    /// `set_ddtree_parent_ids` so the K=γ verify path can derive per-token
+    /// tree depths (for depth-based RoPE positions and seq_lens) without
+    /// a D2H copy. Empty when no tree payload is active (chain mode).
+    ///
+    /// Layout matches `ddtree_parent_ids_persistent`: index 0 is the bonus
+    /// (parent=-1), index i+1 corresponds to draft i, with each entry the
+    /// kernel-frame parent (`-1` = pre-tree state / bonus's parent, `k≥0`
+    /// = parent kernel slot).
+    pub ddtree_parent_ids_host: Mutex<Vec<i32>>,
+    /// Inverse DFS permutation from the last K=γ verify (option C reorder).
+    /// `dfs_inv_perm[orig_compact_idx] = dfs_slot_idx`. Empty when DFS
+    /// reorder is inactive (env var off, or payload was trivially flat).
+    ///
+    /// Populated by `verify_d.rs` BEFORE the SSM kernel runs (because the
+    /// kernel writes h_state_inter in DFS slot order). Read by
+    /// `commit_verify_state_async_with_slot` to translate the original-
+    /// compact `last_inter_slot` from greedy_sample_ddtree into the DFS
+    /// slot where the SSM canonical state actually lives.
+    pub ddtree_dfs_inv_perm: Mutex<Vec<usize>>,
+    /// ATLAS_TREE_AWARE_ATTN: persistent per-row KV indirection buffer.
+    /// Layout: `[dflash_kgamma rows × dflash_kgamma cols]` i32, row-major.
+    /// `verify_d.rs` writes the ancestor-chain mapping for the current
+    /// K=γ tree (single-shot upload) so the paged-decode attention kernel
+    /// can remap tree-window positions to true ancestors.
+    /// `DevicePtr::NULL` when DFlash is disabled.
+    pub tree_kv_indir_persistent: spark_runtime::gpu::DevicePtr,
+    /// Row stride of `tree_kv_indir_persistent`, in i32 slots
+    /// (= dflash_kgamma). Zero when DFlash is disabled.
+    pub tree_kv_indir_stride: usize,
+    /// ATLAS_TREE_AWARE_ATTN CUDA graph fix: persistent 1×i32 device buffer
+    /// holding the current tree-window base position (= `seq.seq_len`).
+    /// The paged-decode-attn + tree-kv-scatter kernels read this via
+    /// pointer arg so a captured graph sees the fresh value on each replay
+    /// — the prior scalar arg was baked into the kernel-launch node at
+    /// capture time and went stale as `seq.seq_len` advanced.
+    /// `verify_d.rs` writes the current `seq.seq_len` here before each K=γ
+    /// verify step. `DevicePtr::NULL` when DFlash is disabled.
+    pub tree_kv_indir_base_persistent: spark_runtime::gpu::DevicePtr,
+    /// Pinned-host shadow of `tree_kv_indir_base_persistent` (1×i32).
+    /// `verify_d.rs` writes `seq.seq_len` into this pinned buffer then
+    /// fires `cuMemcpyHtoDAsync` from it on the verify stream. Pinned
+    /// host memory establishes a proper stream-ordered dependency for
+    /// the H2D copy (pageable Vec sources do not, leading to a race
+    /// where captured graph kernels dereference the device buffer
+    /// before the upload completes → stale `kv_indir_base` → `1, 2, 2, 3`
+    /// style token-duplication artifacts).
+    /// `null` when DFlash is disabled.
+    pub tree_kv_indir_base_host_pinned: *mut u8,
+    /// ATLAS_TREE_KV_PACK: per-attention-layer packed-KV scratch pool.
+    /// One entry per FullAttention layer; each is the K-pool base pointer
+    /// for `[num_seqs blocks × stride tokens]` of the layer's KV dtype.
+    /// `verify_d.rs` triggers a small scatter kernel that materializes the
+    /// ancestor chain for each row into this scratch, and the existing
+    /// `paged_decode_attn_*` kernels run over it with NULL indirection
+    /// (fast BC=4 batched path). Empty when DFlash is disabled or
+    /// `ATLAS_TREE_KV_PACK` is unset.
+    pub tree_kv_pack_scratch_k: Vec<spark_runtime::gpu::DevicePtr>,
+    /// Same layout as `tree_kv_pack_scratch_k` for V pool.
+    pub tree_kv_pack_scratch_v: Vec<spark_runtime::gpu::DevicePtr>,
+    /// Identity block table for the packed-KV path: `[num_seqs × 1]` i32
+    /// with `bt[seq] = seq`. Allocated once.
+    pub tree_kv_pack_block_table: spark_runtime::gpu::DevicePtr,
+    /// `seq_lens` buffer for the packed-KV path: `[num_seqs]` i32 holding
+    /// `depth[t] + 1` (= chain length for row t). Uploaded per-step by
+    /// `verify_d.rs` when the packed-KV path is active.
+    pub tree_kv_pack_seq_lens: spark_runtime::gpu::DevicePtr,
+    /// Bytes per scratch block (one block per seq). Equals
+    /// `stride * num_kv_heads * head_dim * elem_bytes` for FP8 (and
+    /// `nvfp4_data_bytes + nvfp4_scale_bytes` for NVFP4). Stored in u64
+    /// because the consumer kernel takes `block_stride_bytes` as u64.
+    pub tree_kv_pack_block_stride_bytes: u64,
+    /// NVFP4-only: data-section size in bytes per block (scales follow
+    /// immediately after). Zero for FP8.
+    pub tree_kv_pack_data_section_bytes: u64,
+    /// FP8 scatter kernel handle (`tree_kv_scatter_fp8`). `KernelHandle(0)`
+    /// when not loaded.
+    pub tree_kv_pack_scatter_fp8_kernel: spark_runtime::gpu::KernelHandle,
+    /// NVFP4 scatter kernel handle (`tree_kv_scatter_nvfp4`).
+    pub tree_kv_pack_scatter_nvfp4_kernel: spark_runtime::gpu::KernelHandle,
+    /// True when `ATLAS_TREE_KV_PACK=1` AND scratch is allocated AND
+    /// at least one scatter kernel is loaded.
+    pub tree_kv_pack_active: bool,
     pub(super) embed_tokens: DenseWeight,
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
@@ -52,6 +157,11 @@ pub struct TransformerModel {
     pub(super) w4a16_gemv_logits_kernel: KernelHandle, // FP32 output for LM head
     pub(super) w4a16_gemm_kernel: KernelHandle,
     pub(super) w4a16_gemv_batch2_kernel: KernelHandle,
+    /// W4A16 M=3 GEMV specialized for LM head (large N=vocab).
+    /// Replaces the M=3 fallback through `w4a16_gemm` (95% wasted M-tile)
+    /// when `ATLAS_LM_HEAD_BATCH3=1`. See `w4a16_gemv_batch3_logits` in
+    /// `kernels/gb10/nvfp4/w4a16_gemv.cu`.
+    pub(super) w4a16_gemv_batch3_logits_kernel: KernelHandle,
     pub(super) dense_gemm_kernel: KernelHandle,
     pub(super) argmax_kernel: KernelHandle,
     pub(super) argmax_logits_kernel: KernelHandle, // FP32 argmax for logits
@@ -66,8 +176,18 @@ pub struct TransformerModel {
     /// alternate between slots in n=1 decode (e.g. via the per-seq fresh-decode
     /// fix in scheduler::step_decode_only), so we keep one graph per slot.
     pub(super) decode_graph: Mutex<std::collections::HashMap<usize, GraphHandle>>,
-    /// Cached CUDA graphs for batched decode, keyed by padded batch size.
-    pub(super) batch_decode_graphs: Mutex<HashMap<usize, GraphHandle>>,
+    /// Cached CUDA graphs for batched decode.
+    ///
+    /// Two cache schemes coexist:
+    /// 1. **padded_n key** (default): keyed by `(vec![], padded_n)`. Used when
+    ///    `ATLAS_SSM_MULTI_SEQ_GRAPH` is OFF — graphs are NOT replayed across
+    ///    batches because SSM h_state/conv_state pointers are slot-specific.
+    /// 2. **slot-set key** (graph mode): keyed by `(sorted_slot_ids, padded_n)`.
+    ///    Used when `ATLAS_SSM_MULTI_SEQ_GRAPH=1`. The graph bakes the per-slot
+    ///    SSM pool pointers in; replay is safe as long as the same slot set is
+    ///    active. When a slot is freed, all entries containing it are dropped
+    ///    (`free_sequence`).
+    pub(super) batch_decode_graphs: Mutex<HashMap<(Vec<usize>, usize), GraphHandle>>,
     /// Pre-allocated SSM state pool for stable GPU addresses across graph replays.
     pub(super) ssm_pool: SsmStatePool,
     /// SSM state snapshot pool for Marconi prefix caching.
@@ -93,6 +213,20 @@ pub struct TransformerModel {
     /// Size: hidden_size * 4 bytes (one FP32 vector). MTP overwrites shared
     /// buffers (norm_output etc.), so the target hidden must be saved here first.
     pub(super) mtp_hidden_save: DevicePtr,
+    /// Last-K prompt-tail target hidden capture buffer for MTP prefill.
+    ///
+    /// Allocated when `ATLAS_MTP_LASTK_PREFILL=N` (N>0). Layout:
+    /// `[K × hidden_size × fp_size]` (BF16 or FP32 depending on residual mode)
+    /// — the last K target-side hidden states from the final prefill chunk are
+    /// copied here so the MTP head can replay them through `forward_one` to
+    /// populate its own KV cache before the first decode. Without this, MTP's
+    /// self-attention sees zero prompt context at long ctx, dropping draft
+    /// accept from 1.83 → 0.92 (target_seq=5085 vs mtp_seq=423 at 4K-prompt
+    /// + 1K decode).
+    pub(super) mtp_lastk_buf: Option<DevicePtr>,
+    /// Capacity (K) of `mtp_lastk_buf`. Read once from
+    /// `ATLAS_MTP_LASTK_PREFILL` at model init; 0 disables the feature.
+    pub(super) mtp_lastk_capacity: usize,
     /// DFlash 5-layer hidden-state stack. Allocated only when a
     /// `BlockDiffusionDraftHead` proposer is built. Layout:
     /// `[5 × hidden_size × bf16]` shallow-to-deep at the layer indices
@@ -117,7 +251,10 @@ pub struct TransformerModel {
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
     /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
     /// per (slot, K) — different γ values coexist via the K dimension.
-    pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
+    // Key: (slot_idx, k, pack_active_flag). The pack_active flag forces a
+    // separate captured graph for the ATLAS_TREE_KV_PACK fast path so the
+    // first (pre-tree, flat-chain) verify can't bake in stale arg pointers.
+    pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize, u32), GraphHandle>>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.

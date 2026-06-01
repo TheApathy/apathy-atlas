@@ -88,6 +88,94 @@ pub fn conv1d_update_l2norm(
         .launch(stream)
 }
 
+/// Multi-sequence conv1d update — runs the decode-step state advance
+/// for `num_seqs` independent sequences in a SINGLE launch.
+///
+/// Kernel: `causal_conv1d_update_multi_seq(conv_state_ptrs, new_input,
+///          weight, bias, output, num_seqs, dim, d_conv, input_stride,
+///          output_stride)`
+/// Grid: (ceil(dim/256), num_seqs, 1)  Block: (256, 1, 1)
+///
+/// `conv_state_ptrs` is a device-resident `[num_seqs]` array of
+/// `float*` per-seq state pointers (the caller uploads it before the
+/// launch). `input_stride` / `output_stride` are in BF16 ELEMENTS
+/// between successive sequences (allows passing strided slabs of
+/// wider per-seq tensors).
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_update_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state_ptrs: DevicePtr, // device array of num_seqs × u64 ptrs
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    d_inner: u32,
+    d_conv: u32,
+    num_seqs: u32,
+    input_stride: u32,
+    output_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    let bias_ptr = DevicePtr::NULL;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(d_inner, 256), num_seqs, 1])
+        .block([256, 1, 1])
+        .arg_ptr(conv_state_ptrs)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(bias_ptr)
+        .arg_ptr(output)
+        .arg_u32(num_seqs)
+        .arg_u32(d_inner)
+        .arg_u32(d_conv)
+        .arg_u32(input_stride)
+        .arg_u32(output_stride)
+        .launch(stream)
+}
+
+/// Multi-sequence fused conv1d + SiLU + L2-norm for Q/K channels.
+///
+/// Same semantics as `conv1d_update_l2norm` but for c sequences in one
+/// launch. State pointers are passed as a device array. Strides are
+/// in BF16 ELEMENTS between successive sequences.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_update_l2norm_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state_ptrs: DevicePtr,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    d_inner: u32,
+    d_conv: u32,
+    num_seqs: u32,
+    qk_channels: u32,
+    head_dim: u32,
+    l2_eps: f32,
+    input_stride: u32,
+    output_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    let bias_ptr = DevicePtr::NULL;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(d_inner, 256), num_seqs, 1])
+        .block([256, 1, 1])
+        .arg_ptr(conv_state_ptrs)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(bias_ptr)
+        .arg_ptr(output)
+        .arg_u32(num_seqs)
+        .arg_u32(d_inner)
+        .arg_u32(d_conv)
+        .arg_u32(qk_channels)
+        .arg_u32(head_dim)
+        .arg_f32(l2_eps)
+        .arg_u32(input_stride)
+        .arg_u32(output_stride)
+        .launch(stream)
+}
+
 /// Multi-token conv1d sliding window update + SiLU for prefill.
 ///
 /// Processes `seq_len` tokens sequentially per channel in registers.

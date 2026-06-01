@@ -34,6 +34,7 @@ mod verify_a;
 mod verify_b;
 mod verify_c;
 mod verify_c2;
+mod verify_csk;
 mod verify_d;
 
 impl Model for TransformerModel {
@@ -182,6 +183,22 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 3]> {
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
+    fn decode_verify_k3_batched_csk(
+        &self,
+        tokens_per_seq: &[[u32; 3]],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<[u32; 3]>> {
+        self.decode_verify_k3_batched_csk_dispatch(tokens_per_seq, seqs)
+    }
+    fn decode_verify_k2_batched_csk(
+        &self,
+        tokens_per_seq: &[[u32; 2]],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<[u32; 2]>> {
+        self.decode_verify_k2_batched_csk_dispatch(tokens_per_seq, seqs)
+    }
     fn decode_verify_graphed_k4(
         &self,
         tokens: &[u32; 4],
@@ -234,6 +251,136 @@ impl Model for TransformerModel {
     fn read_deferred_draft_token(&self) -> Result<u32> {
         self.read_deferred_draft_token_dispatch()
     }
+    fn take_pending_tree_payload(
+        &self,
+        seq: &mut SequenceState,
+    ) -> Option<crate::layers::DDTreePayload> {
+        let proposer = self.proposer.as_ref()?;
+        let state = seq.proposer_state.as_mut()?;
+        proposer.take_pending_tree_payload(state.as_mut())
+    }
+
+    /// M8A: upload payload.parent_indices to the per-model scratch slot.
+    ///
+    /// Writes into the persistent `ddtree_parent_ids_persistent` device
+    /// buffer (allocated once at init) so the device address stays stable
+    /// across CUDA graph capture and replay. Older revisions of this
+    /// function allocated a fresh scratch buffer per call, which left the
+    /// captured graph reading a freed/stale pointer on replay.
+    fn set_ddtree_parent_ids(&self, payload: &crate::layers::DDTreePayload) -> Result<bool> {
+        use crate::layers::dflash_head::ddtree_gdn_dispatch::requires_tree_kernel;
+        static SETDBG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SETDBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let needs_tree = requires_tree_kernel(Some(payload));
+        // ATLAS_FORCE_TREEWY=1: stash even for flat chain payloads so the
+        // M8A v2 kernel fires on them. Used for A/B precision diff vs wy17
+        // (without the bypass, flat chains skip M8A and dispatch wy17).
+        let force_treewy =
+            std::env::var("ATLAS_FORCE_TREEWY").ok().as_deref() == Some("1");
+        if n < 3 {
+            tracing::info!(
+                "M8A set_ddtree_parent_ids #{n}: payload.len={} needs_tree={} force_treewy={} parents={:?}",
+                payload.tree_token_ids.len(), needs_tree, force_treewy,
+                payload.parent_indices.iter().take(8).collect::<Vec<_>>()
+            );
+        }
+        if !needs_tree && !force_treewy {
+            // Flat chain → kernel falls through to wy_k. Nothing to stash.
+            return Ok(false);
+        }
+        // Convert payload (compact-tree frame) to kernel frame.
+        //
+        // The K=γ verify kernel processes T = γ+1 tokens in order:
+        //   token 0    = bonus (= last verified token from previous step)
+        //   token i+1  = drafts[i] for i in 0..γ
+        //
+        // Each kernel token needs parent_ids[i]:
+        //   -1  → load state from h_state (the pre-tree commit point)
+        //   k≥0 → load state from h_state_inter[k]   (must satisfy k < i)
+        //
+        // payload.parent_indices[j] is in COMPACT-TREE frame for draft j:
+        //   -1  → draft j attaches to the synthetic root (a.k.a. the bonus)
+        //   k≥0 → draft j's parent is draft k
+        //
+        // Mapping compact-tree → kernel frame:
+        //   kernel_parents[0]     = -1                                 (bonus loads from h_state)
+        //   kernel_parents[j+1]   = if payload.parent_indices[j] < 0:
+        //                              0                               (root-children load post-bonus state)
+        //                          else:
+        //                              payload.parent_indices[j] + 1   (+1 skips bonus slot)
+        let stream = self.gpu.default_stream();
+        let mut kernel_parents: Vec<i32> = Vec::with_capacity(1 + payload.parent_indices.len());
+        kernel_parents.push(-1i32);
+        for &p in &payload.parent_indices {
+            kernel_parents.push(if p < 0 { 0 } else { p + 1 });
+        }
+        // Refuse to overrun the persistent buffer (defensive — payload
+        // should never exceed dflash_kgamma).
+        if self.ddtree_parent_ids_capacity == 0 {
+            anyhow::bail!(
+                "set_ddtree_parent_ids: persistent buffer not allocated (dflash_kgamma=0)"
+            );
+        }
+        if kernel_parents.len() > self.ddtree_parent_ids_capacity {
+            anyhow::bail!(
+                "set_ddtree_parent_ids: payload has {} tokens > capacity {}",
+                kernel_parents.len(),
+                self.ddtree_parent_ids_capacity
+            );
+        }
+        let bytes: Vec<u8> = kernel_parents
+            .iter()
+            .flat_map(|p| p.to_le_bytes())
+            .collect();
+        // Write into the persistent buffer (NOT a fresh alloc). The device
+        // pointer never changes — CUDA graph replays see the new payload.
+        self.gpu.copy_h2d_async(
+            &bytes,
+            self.ddtree_parent_ids_persistent,
+            stream,
+        )?;
+        *self.ddtree_parent_ids_dev.lock() = Some(self.ddtree_parent_ids_persistent);
+        *self.ddtree_num_tree_tokens.lock() = kernel_parents.len();
+        // Stash the host-side mirror so verify_d.rs can derive per-token
+        // depths for tree-aware RoPE/seq_lens without a D2H copy.
+        *self.ddtree_parent_ids_host.lock() = kernel_parents;
+        Ok(true)
+    }
+
+    fn clear_ddtree_parent_ids(&self) {
+        // Restore the persistent buffer to the linear-chain default so the
+        // graph-safe verify path (which keeps `Some(persistent)` to always
+        // hit tree_wy) reads bit-equivalent-to-wy17 parents on the next
+        // non-tree call. We don't release the buffer — its address must
+        // remain stable for captured graphs.
+        if self.ddtree_parent_ids_capacity > 0 {
+            let cap = self.ddtree_parent_ids_capacity;
+            let mut chain = Vec::<i32>::with_capacity(cap);
+            chain.push(-1);
+            for i in 1..cap {
+                chain.push((i - 1) as i32);
+            }
+            let bytes: Vec<u8> = chain
+                .iter()
+                .flat_map(|p| p.to_le_bytes())
+                .collect();
+            let stream = self.gpu.default_stream();
+            // Best-effort restamp. A failed copy here is non-fatal: the next
+            // set_ddtree_parent_ids call will overwrite, and the graph-safe
+            // path always re-stamps before replay-only invocations.
+            if let Err(e) = self
+                .gpu
+                .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)
+            {
+                tracing::warn!("clear_ddtree_parent_ids: failed to restamp linear chain: {e:#}");
+            }
+        }
+        *self.ddtree_parent_ids_dev.lock() = None;
+        *self.ddtree_num_tree_tokens.lock() = 0;
+        self.ddtree_parent_ids_host.lock().clear();
+        // DFS reorder state lives only for the duration of one verify+commit.
+        self.ddtree_dfs_inv_perm.lock().clear();
+    }
     fn trim_proposer_state(
         &self,
         seq: &mut SequenceState,
@@ -285,7 +432,35 @@ impl Model for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
-        self.commit_verify_state_async_dispatch(seq, num_accepted, k)
+        // Legacy callers (K=2/K=3/K=4 chain verifies) → derive the kernel
+        // slot as `num_accepted - 1` (chain-contiguous). DDTree callers
+        // must use `commit_verify_state_async_with_slot` to pass the
+        // explicit non-contiguous slot.
+        let last_inter_slot = num_accepted.saturating_sub(1);
+        self.commit_verify_state_async_dispatch(seq, num_accepted, k, last_inter_slot)
+    }
+    fn commit_verify_state_async_with_slot(
+        &self,
+        seq: &mut SequenceState,
+        num_accepted: usize,
+        k: usize,
+        last_inter_slot: usize,
+    ) -> Result<()> {
+        // DFS reorder (option C): when the K=γ verify ran with
+        // ATLAS_DDTREE_DFS_REORDER=1, the SSM kernel wrote h_state_inter in
+        // DFS slot order — not original-compact order. greedy_sample_ddtree
+        // returns indices in the ORIGINAL compact frame, so we must map
+        // them via dfs_inv_perm[orig] = dfs_slot before reading the inter
+        // pool. Mapping is a no-op when the buffer is empty (chain mode or
+        // DFS-disabled).
+        let inv_perm = self.ddtree_dfs_inv_perm.lock();
+        let mapped_slot = if !inv_perm.is_empty() && last_inter_slot < inv_perm.len() {
+            inv_perm[last_inter_slot]
+        } else {
+            last_inter_slot
+        };
+        drop(inv_perm);
+        self.commit_verify_state_async_dispatch(seq, num_accepted, k, mapped_slot)
     }
     fn ep_worker_step(&self, seq: &mut SequenceState) -> Result<bool> {
         self.ep_worker_step_dispatch(seq)

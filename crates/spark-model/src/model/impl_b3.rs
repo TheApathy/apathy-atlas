@@ -86,6 +86,9 @@ impl TransformerModel {
             profile: false,
             comm: None,
             graph_capture: false,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
         let prop_state = seq
             .proposer_state
@@ -197,6 +200,271 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Per-chunk MTP last-K capture (called from `prefill_chunk_dispatch` after
+    /// `forward_layers`). Copies the just-computed chunk's hidden states into
+    /// the per-sequence host ring buffer `seq.mtp_lastk_host_buf`, shifting
+    /// older rows out when the ring is full. The actual H2D into the shared
+    /// `mtp_lastk_buf` device buffer + proposer `prefill_last_k` happens at
+    /// `mtp_lastk_prefill_after_finalize` on the last chunk only.
+    ///
+    /// No-op when MTP last-K prefill is disabled (capacity==0), no proposer
+    /// is wired, or rank > 0 under EP/TP.
+    ///
+    /// `proc_count` is the number of rows in `hidden_states` for this chunk.
+    /// `chunk_start + chunk_len - 1` is the absolute position of the last
+    /// captured row.
+    pub(super) fn mtp_lastk_capture_chunk(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        proc_count: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let capacity = self.mtp_lastk_capacity;
+        if capacity == 0 || self.proposer.is_none() {
+            return Ok(());
+        }
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(());
+        }
+        if proc_count == 0 {
+            return Ok(());
+        }
+        let h = self.config.hidden_size;
+        let fp32 = if self.config.use_fp32_residual() {
+            4usize
+        } else {
+            2usize
+        };
+        let row_bytes = h * fp32;
+        let ring_capacity_bytes = capacity * row_bytes;
+
+        // Lazy-size the host ring buffer.
+        if seq.mtp_lastk_host_buf.len() != ring_capacity_bytes {
+            seq.mtp_lastk_host_buf = vec![0u8; ring_capacity_bytes];
+            seq.mtp_lastk_host_filled = 0;
+            seq.mtp_lastk_end_abs = 0;
+        }
+
+        // Number of rows to ingest from this chunk: at most `capacity` (the
+        // last `capacity` rows of the chunk fully replace the ring), at most
+        // `proc_count` rows present in `hidden_states`.
+        let ingest = capacity.min(proc_count);
+        if ingest == 0 {
+            return Ok(());
+        }
+
+        // Source row range in `hidden_states`: the trailing `ingest` rows of
+        // the chunk's proc_count outputs.
+        let src_first_row = proc_count - ingest;
+        let src_bytes = ingest * row_bytes;
+        let src_ptr = self
+            .buffers
+            .hidden_states()
+            .offset(src_first_row * row_bytes);
+
+        if ingest >= capacity {
+            // Chunk produced ≥ K rows — wipe ring and copy the last K rows.
+            // D2H directly into the host ring buf.
+            // SAFETY: copy_d2h requires &mut [u8] of exact size; the ring is
+            // sized to `ring_capacity_bytes` and `src_bytes == ring_capacity_bytes`.
+            self.gpu
+                .synchronize(stream)?;
+            self.gpu
+                .copy_d2h(src_ptr, &mut seq.mtp_lastk_host_buf[..src_bytes])?;
+            seq.mtp_lastk_host_filled = capacity;
+        } else {
+            // Shift the existing ring left by `ingest` rows (drop oldest),
+            // then append the new rows at the tail.
+            let shift_bytes = ingest * row_bytes;
+            if seq.mtp_lastk_host_filled == capacity {
+                // Ring is full: drop oldest `ingest` rows.
+                seq.mtp_lastk_host_buf
+                    .copy_within(shift_bytes..ring_capacity_bytes, 0);
+                let tail_start = ring_capacity_bytes - shift_bytes;
+                self.gpu.synchronize(stream)?;
+                self.gpu.copy_d2h(
+                    src_ptr,
+                    &mut seq.mtp_lastk_host_buf[tail_start..tail_start + shift_bytes],
+                )?;
+            } else if seq.mtp_lastk_host_filled + ingest <= capacity {
+                // Ring has room: append at `filled`.
+                let tail_start = seq.mtp_lastk_host_filled * row_bytes;
+                self.gpu.synchronize(stream)?;
+                self.gpu.copy_d2h(
+                    src_ptr,
+                    &mut seq.mtp_lastk_host_buf[tail_start..tail_start + shift_bytes],
+                )?;
+                seq.mtp_lastk_host_filled += ingest;
+            } else {
+                // Partial overlap: existing rows shift out the front, new
+                // rows fill the tail. New filled count is `capacity`.
+                let drop = seq.mtp_lastk_host_filled + ingest - capacity;
+                let drop_bytes = drop * row_bytes;
+                let keep_bytes =
+                    seq.mtp_lastk_host_filled * row_bytes - drop_bytes;
+                seq.mtp_lastk_host_buf.copy_within(
+                    drop_bytes..drop_bytes + keep_bytes,
+                    0,
+                );
+                let tail_start = keep_bytes;
+                self.gpu.synchronize(stream)?;
+                self.gpu.copy_d2h(
+                    src_ptr,
+                    &mut seq.mtp_lastk_host_buf[tail_start..tail_start + shift_bytes],
+                )?;
+                seq.mtp_lastk_host_filled = capacity;
+            }
+        }
+        seq.mtp_lastk_end_abs = chunk_start + chunk_len - 1;
+
+        if std::env::var("ATLAS_MTP_DEBUG").ok().as_deref() == Some("1") {
+            tracing::info!(
+                "ATLAS_MTP_DEBUG mtp_lastk_capture_chunk: \
+                 chunk=[{chunk_start},{}] proc_count={proc_count} \
+                 ingest={ingest} filled={}/{capacity} end_abs={}",
+                chunk_start + chunk_len,
+                seq.mtp_lastk_host_filled,
+                seq.mtp_lastk_end_abs,
+            );
+        }
+        Ok(())
+    }
+
+    /// MTP last-K prefill (called from `prefill_b_finalize_last` on the last
+    /// chunk). H2Ds the per-sequence cross-chunk host ring buffer
+    /// (`seq.mtp_lastk_host_buf`, populated by `mtp_lastk_capture_chunk` on
+    /// every chunk) into the shared `self.mtp_lastk_buf`, then asks the
+    /// proposer to replay the rows so its self-attention KV cache covers the
+    /// prompt tail before the first decode.
+    ///
+    /// No-op when:
+    ///   - `mtp_lastk_capacity == 0` (env-gate disabled)
+    ///   - No proposer wired (e.g. non-speculative serve)
+    ///   - No `mtp_lastk_buf` allocated (defensive)
+    ///   - Rank > 0 under EP/TP (MTP runs on rank 0 only)
+    ///   - `seq.mtp_lastk_host_filled == 0` (capture never fired)
+    ///
+    /// `proc_count` and `chunk_len` are retained as args for backward
+    /// compatibility with the call site but are no longer used to size the
+    /// captured window — the host ring already holds the cross-chunk tail.
+    pub(super) fn mtp_lastk_prefill_after_finalize(
+        &self,
+        tokens: &[u32],
+        seq: &mut crate::traits::SequenceState,
+        _chunk_start: usize,
+        _chunk_len: usize,
+        _proc_count: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let capacity = self.mtp_lastk_capacity;
+        if capacity == 0 {
+            return Ok(());
+        }
+        let proposer = match &self.proposer {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+        let lastk_buf = match self.mtp_lastk_buf {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(());
+        }
+
+        // Read the per-seq cross-chunk capture state populated by
+        // `mtp_lastk_capture_chunk` at every prefill chunk.
+        let filled = seq.mtp_lastk_host_filled;
+        if filled == 0 || seq.mtp_lastk_host_buf.is_empty() {
+            // Capture never fired (e.g. all chunks early-returned via cache).
+            // Nothing to prefill into MTP.
+            tracing::warn!(
+                "MTP last-K prefill: skipped — host ring empty (filled={filled}, \
+                 buf_bytes={}). Likely all chunks were prefix-cache early-returns.",
+                seq.mtp_lastk_host_buf.len(),
+            );
+            return Ok(());
+        }
+        let end_abs = seq.mtp_lastk_end_abs;
+        let h = self.config.hidden_size;
+        let fp32 = if self.config.use_fp32_residual() {
+            4usize
+        } else {
+            2usize
+        };
+        let row_bytes = h * fp32;
+        let used_bytes = filled * row_bytes;
+
+        // The `filled` rows in the host ring occupy
+        // `mtp_lastk_host_buf[(capacity-filled)*row_bytes ..]` when partially
+        // filled OR `[0..]` when full — actually our shift logic always keeps
+        // the populated rows contiguous starting at offset 0 when the ring
+        // has been padded with copy_within back to slot 0 OR ending at the
+        // tail. Re-read the capture invariant:
+        //   - When `filled == capacity`: rows are at `[0 .. capacity*row_bytes]`
+        //     (oldest at row 0, newest at row capacity-1).
+        //   - When `filled < capacity`: rows are at `[0 .. filled*row_bytes]`
+        //     (the append-to-tail branch fills from offset
+        //     `mtp_lastk_host_filled` upward each chunk).
+        // Both cases: the first `filled` rows of the buffer are the live data.
+        let src_slice = &seq.mtp_lastk_host_buf[..used_bytes];
+        self.gpu.copy_h2d_async(src_slice, lastk_buf, stream)?;
+
+        // The captured tokens span `[end_abs - filled + 1 ..= end_abs]`.
+        let start_abs = end_abs + 1 - filled;
+        if start_abs > end_abs || end_abs >= tokens.len() {
+            tracing::warn!(
+                "MTP last-K prefill: invalid span [{start_abs}, {end_abs}] for tokens.len()={}",
+                tokens.len(),
+            );
+            return Ok(());
+        }
+        let captured_tokens: Vec<u32> = tokens[start_abs..=end_abs].to_vec();
+
+        // Build a ForwardContext mirroring `run_mtp_propose_inner`. MTP
+        // loads ALL experts on every rank, so MoE output is already complete
+        // → no all_reduce needed (comm: None).
+        let ctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            attn_metadata: None,
+            profile: false,
+            comm: None,
+            graph_capture: false,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
+        };
+
+        let prop_state = match seq.proposer_state.as_mut() {
+            Some(ps) => ps,
+            None => return Ok(()),
+        };
+
+        let t0 = std::time::Instant::now();
+        proposer.prefill_last_k(
+            &captured_tokens,
+            lastk_buf,
+            end_abs,
+            prop_state.as_mut(),
+            &ctx,
+            stream,
+        )?;
+        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            "MTP last-K prefill: filled={filled}/{capacity} rows from cross-chunk ring, \
+             end_abs={end_abs} (span=[{start_abs},{end_abs}]), took {dt_ms:.1}ms",
+        );
+        Ok(())
+    }
+
     /// After prefill completes, advance the seq's DFlash `ctx_len` to
     /// `chunk_start + proc_count` so the drafter sees all captured prompt
     /// positions on the first propose() call.
@@ -246,10 +514,18 @@ impl TransformerModel {
     /// `layer.decode(...)` returns. No-op when DFlash is disabled (the buffer
     /// is `None`) or when `layer_idx` is not in `dflash_capture_layers`.
     ///
-    /// Captures only the latest-decoded-token's hidden, matching the
-    /// `save_hidden_for_mtp` semantics. The `token_idx` argument selects
-    /// which row of `self.buffers.hidden_states()` to read — pass 0 for the
-    /// single-token decode path.
+    /// Writes hidden state for input row `token_idx` into the
+    /// `dflash_hidden_save` buffer at `[token_idx, slot, ..]` where `slot`
+    /// is this layer's index in `dflash_capture_layers`. The buffer is laid
+    /// out as `[k_max, n_capture, hidden]` BF16 so the downstream propose
+    /// can read whole-token rows of stride `n_capture * hidden * bf16`.
+    ///
+    /// Pre-2026-05-18 bug: the per-token offset was missing — every token
+    /// position wrote to slot 0 of the buffer, leaving only the last
+    /// captured token's hiddens visible to the drafter and corrupting the
+    /// ctx_hidden_acc on K>=2 verify paths. K=2/3/4 partly hid the bug
+    /// (small γ, low ctx mismatch), but K=γ=16 collapsed accept rate to
+    /// ~2% because every ctx slot got seeded with the last-position hidden.
     ///
     /// Under EP/TP world > 1: only rank 0 owns the drafter (replicated, not
     /// sharded — same pattern as MTP under EP — see model.rs:7232 comment),
@@ -290,9 +566,118 @@ impl TransformerModel {
             !self.config.use_fp32_residual(),
             "DFlash hidden capture currently assumes BF16 residual; FP32-residual models need a separate downcast path"
         );
+        let n_capture = self.dflash_capture_layers.len();
         let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
-        let dst_slot = dst.offset(slot * h * bf16);
+        // [token_idx, slot, hidden] BF16 layout. Per-token stride =
+        // n_capture * h * bf16; per-slot stride = h * bf16.
+        let dst_off = token_idx * n_capture * h * bf16 + slot * h * bf16;
+        let dst_slot = dst.offset(dst_off);
         self.gpu.copy_d2d_async(src, dst_slot, h * bf16, stream)?;
+        if std::env::var("ATLAS_PROPOSE_PROBE").ok().as_deref() == Some("1") {
+            tracing::info!(
+                "try_dflash_capture: layer_idx={} token_idx={} slot={} dst_off={} h={}",
+                layer_idx,
+                token_idx,
+                slot,
+                dst_off,
+                h,
+            );
+        }
+        Ok(())
+    }
+
+    /// Flush captured hidden states from `dflash_hidden_save` (GPU) to the
+    /// path in `$ATLAS_DUMP_HIDDEN` (host file). No-op when:
+    ///   - env var is unset (production hot path — zero cost)
+    ///   - `dflash_hidden_save` was never allocated
+    ///   - `dflash_capture_layers` is empty
+    ///   - this is a non-rank-0 worker under EP/TP (drafter is replicated)
+    ///
+    /// Must be called from a verify path that runs in EAGER mode (no CUDA
+    /// graph capture) — `copy_d2h` is a synchronous device→host transfer
+    /// and would fail with `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED (900)`
+    /// inside a captured region. `verify_b.rs` already forces eager mode
+    /// when `ATLAS_DUMP_HIDDEN` is set (see the env-var check at the
+    /// `suppress_graphs` re-enable site), so unconditional calls from the
+    /// post-layer-loop site are safe.
+    ///
+    /// Record format (little-endian, 16-byte header + bf16 payload):
+    /// ```text
+    /// u32 magic         = 0xA71A5DEE   // distinct from TOKEN_DUMP_MAGIC (0xA71B5DEE)
+    /// u32 layer_idx                    // ABSOLUTE layer index (one of dflash_capture_layers)
+    /// u32 token_idx                    // position within the K-step verify
+    /// u32 hidden_dim                   // model hidden_size (5120 on AEON-27B, 2048 on 35B-A3B-abl)
+    /// bf16 hidden[hidden_dim]
+    /// ```
+    /// Bytes per record = 16 + hidden_dim * 2. The dump is APPEND-ONLY
+    /// across the run; downstream training code splits records on the
+    /// magic header.
+    ///
+    /// Pairs with the emitted-token records written by `meta.rs::argmax*`
+    /// (magic 0xA71B5DEE). Together they let an offline trainer pair
+    /// each emitted token with the 5 hidden states that preceded it.
+    ///
+    /// `k` is the verify width (number of `token_idx` slots populated by
+    /// the just-completed layer loop — K=2 for K=2 verify, K=3 for K=3
+    /// MTP verify, K=γ+1 for DFlash γ verify).
+    pub(super) fn flush_hidden_dump(&self, k: usize) -> Result<()> {
+        // Hot-path early exit: env var check is the cheapest possible.
+        let path = match std::env::var("ATLAS_DUMP_HIDDEN") {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        if self.dflash_capture_layers.is_empty() {
+            return Ok(());
+        }
+        let dst = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        // Rank-0 gate (mirrors try_dflash_capture's behavior). Replicated
+        // drafter under EP/TP — only rank 0 owns it.
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(());
+        }
+
+        let h = self.config.hidden_size;
+        let bf16 = 2usize;
+        let n_capture = self.dflash_capture_layers.len();
+        let bytes_per_slot = h * bf16;
+        let bytes_per_token = n_capture * bytes_per_slot;
+        let total_bytes = k * bytes_per_token;
+
+        // copy_d2h is synchronous on the default stream — graph-capture
+        // unsafe but the caller guarantees eager mode (see method doc).
+        let mut host_buf = vec![0u8; total_bytes];
+        self.gpu.copy_d2h(dst, &mut host_buf)?;
+
+        // Open file in append mode. If open or any write fails we surface
+        // the error rather than silently swallowing (caller is in eager
+        // mode by design — we want loud failures so missing dumps are
+        // visible in logs).
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("ATLAS_DUMP_HIDDEN open {path}: {e}"))?;
+
+        const HIDDEN_DUMP_MAGIC: u32 = 0xA71A_5DEE;
+        for t in 0..k {
+            for (slot, &layer_idx) in self.dflash_capture_layers.iter().enumerate() {
+                let off = t * bytes_per_token + slot * bytes_per_slot;
+                let hidden_bytes = &host_buf[off..off + bytes_per_slot];
+                f.write_all(&HIDDEN_DUMP_MAGIC.to_le_bytes())?;
+                f.write_all(&(layer_idx as u32).to_le_bytes())?;
+                f.write_all(&(t as u32).to_le_bytes())?;
+                f.write_all(&(h as u32).to_le_bytes())?;
+                f.write_all(hidden_bytes)?;
+            }
+        }
+        // No fsync — append-only writes to a single file are fine across
+        // open/close cycles, and per-step fsync would tank throughput.
         Ok(())
     }
 }

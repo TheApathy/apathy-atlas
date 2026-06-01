@@ -450,6 +450,9 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: false,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // ── 4. Forward through all layers ──

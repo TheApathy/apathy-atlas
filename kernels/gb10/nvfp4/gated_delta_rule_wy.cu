@@ -65,13 +65,13 @@ extern "C" __global__ void gated_delta_rule_wy2(
     // (0,1) to prevent state explosion / sign inversion). Without this,
     // WY2 drifts from per-token over repeated MTP verify steps and flips
     // single-token argmax decisions (80B-MTP fib: "return a" vs "return b").
-    const float g0 = fminf(fmaxf(gate[(b * 2) * gb_stride + vh], 1e-6f), 1.0f - 1e-6f);
+    const float g0 = fminf(fmaxf(gate[(b * 2) * gb_stride + vh], 0.0f), 1.0f);
     const float bt0 = beta[(b * 2) * gb_stride + vh];
 
     const __nv_bfloat16* q1 = query + (b * 2 + 1) * qk_stride + kh * k_dim;
     const __nv_bfloat16* k1 = key   + (b * 2 + 1) * qk_stride + kh * k_dim;
     const __nv_bfloat16* v1 = value + (b * 2 + 1) * v_stride  + vh * v_dim;
-    const float g1 = fminf(fmaxf(gate[(b * 2 + 1) * gb_stride + vh], 1e-6f), 1.0f - 1e-6f);
+    const float g1 = fminf(fmaxf(gate[(b * 2 + 1) * gb_stride + vh], 0.0f), 1.0f);
     const float bt1 = beta[(b * 2 + 1) * gb_stride + vh];
 
     __shared__ float smem_k0[128], smem_q0[128];

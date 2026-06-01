@@ -71,6 +71,10 @@ harness = false
 name = "ssm"
 harness = false
 
+[[bench]]
+name = "nvfp4_gemm"
+harness = false
+
 
 [lints]
 workspace = true

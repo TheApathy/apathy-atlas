@@ -106,6 +106,54 @@ pub fn residual_add_rms_norm(
         .launch(stream)
 }
 
+/// Batched per-head RMS norm for the K=3 verify path: 3 q_norms + 3 k_norms
+/// in a single launch (6 blocks total), with each block iterating over the
+/// head_dim slices for its (token, q|k) pair.
+///
+/// `qkv_base` must point at token 0's Q region; subsequent tokens are at
+/// stride `qkv_stride_bf16` BF16 elements. `k_offset_bf16` is the offset
+/// (in BF16 elements) from each token's start to its K slab — equal to
+/// `q_proj_dim` (which is `2*q_dim` for gated layers because of the Gate
+/// chunk preceding K).
+///
+/// Kernel: `rms_norm_qk_batch3(qkv_base, q_weight, k_weight,
+///     qkv_stride, q_dim, k_dim, k_offset, head_dim, eps)`
+/// Grid: (6, 1, 1)  Block: (min(head_dim, 1024), 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_qk_batch3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qkv_base: DevicePtr,
+    q_weight: &DenseWeight,
+    k_weight: &DenseWeight,
+    qkv_stride_bf16: u32,
+    q_dim: u32,
+    k_dim: u32,
+    k_offset_bf16: u32,
+    head_dim: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(head_dim > 0, "head_dim must be > 0");
+    debug_assert!(q_dim % head_dim == 0 && k_dim % head_dim == 0);
+    let nq_heads = q_dim / head_dim;
+    let nkv_heads = k_dim / head_dim;
+    let max_heads = nq_heads.max(nkv_heads);
+    KernelLaunch::new(gpu, kernel)
+        .grid([max_heads, 3, 2])
+        .block([head_dim.min(1024), 1, 1])
+        .arg_ptr(qkv_base)
+        .arg_ptr(q_weight.weight)
+        .arg_ptr(k_weight.weight)
+        .arg_u32(qkv_stride_bf16)
+        .arg_u32(q_dim)
+        .arg_u32(k_dim)
+        .arg_u32(k_offset_bf16)
+        .arg_u32(head_dim)
+        .arg_f32(eps)
+        .launch(stream)
+}
+
 /// Gated RMS norm (norm_before_gate=False, per-group):
 ///   output = rms_norm_per_group(input * silu(gate), weight, group_size)
 ///

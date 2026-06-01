@@ -246,6 +246,84 @@ pub trait Model: Send + Sync {
         stream: u64,
     ) -> Result<[u32; 3]>;
 
+    /// K=3 verify, c-batched per-step (Path B). Runs K=3 SEQUENTIAL c-batched
+    /// single-step decodes (using `decode_batch` + `decode_multi_seq`) instead
+    /// of c independent K=3 verify forwards — folds c × 3 = 12 forwards per
+    /// layer per step (c=4 case) into 3 batched forwards per layer per step
+    /// for a 4× reduction in FFN/SSM/attn kernel launches.
+    ///
+    /// `tokens_per_seq[i]` = `[last_token, draft0, draft1]` for sequence `i`.
+    /// `seqs[i]` mirrors `tokens_per_seq[i]` and must NOT be cross-aliased.
+    ///
+    /// Returns `Vec<[u32; 3]>` where element `i` is the argmax outputs for
+    /// sequence `i`'s three verify positions, identical layout to
+    /// `decode_verify_graphed_k3`'s `[u32; 3]` return value.
+    ///
+    /// **Side effects per seq:** each seq's `seq_len` is incremented by K=3
+    /// and the 3 tokens are pushed to `seq.tokens`. Callers must roll back
+    /// to `original_seq_len + accept_count[i] + 1` based on the per-seq
+    /// argmax / draft comparison AND call
+    /// `commit_verify_state_async(seq, accept_count[i] + 1, 3)` to restore
+    /// SSM state from the per-step intermediate snapshots saved internally.
+    ///
+    /// Default impl falls back to looping single-seq `decode_verify_graphed_k3`
+    /// (functionally equivalent but no batching win); TransformerModel
+    /// overrides with the real batched K-loop.
+    fn decode_verify_k3_batched_csk(
+        &self,
+        tokens_per_seq: &[[u32; 3]],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<[u32; 3]>> {
+        // Default: per-seq fallback (no batching win). Real implementation
+        // lives on TransformerModel.
+        let mut out = Vec::with_capacity(seqs.len());
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let r = self.decode_verify_graphed_k3(&tokens_per_seq[i], seq, 0)?;
+            out.push(r);
+        }
+        Ok(out)
+    }
+
+    /// K=2 verify, c-batched per-step. K=2 sibling of
+    /// `decode_verify_k3_batched_csk`. Runs K=2 SEQUENTIAL c-batched
+    /// single-step decodes (using `decode_batch` + `decode_multi_seq`)
+    /// instead of c independent K=2 verify forwards — folds c × 2 = 2c
+    /// forwards per layer per step into 2 batched forwards per layer per
+    /// step.
+    ///
+    /// `tokens_per_seq[i]` = `[last_token, draft0]` for sequence `i`.
+    /// `seqs[i]` mirrors `tokens_per_seq[i]` and must NOT be cross-aliased.
+    ///
+    /// Returns `Vec<[u32; 2]>` where element `i` is the argmax outputs
+    /// for sequence `i`'s two verify positions, identical layout to
+    /// `decode_verify_graphed`'s `[u32; 2]` return value.
+    ///
+    /// **Side effects per seq:** each seq's `seq_len` is incremented by
+    /// K=2 and the 2 tokens are pushed to `seq.tokens`. Callers must
+    /// roll back to `original_seq_len + accept_count[i] + 1` based on
+    /// per-seq argmax / draft comparison AND call
+    /// `commit_verify_state_async(seq, accept_count[i] + 1, 2)` to
+    /// restore SSM state from the per-step intermediate snapshots saved
+    /// internally.
+    ///
+    /// Default impl falls back to looping single-seq
+    /// `decode_verify_graphed` (functionally equivalent but no batching
+    /// win); TransformerModel overrides with the real batched K-loop.
+    fn decode_verify_k2_batched_csk(
+        &self,
+        tokens_per_seq: &[[u32; 2]],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<[u32; 2]>> {
+        let mut out = Vec::with_capacity(seqs.len());
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let r = self.decode_verify_graphed(&tokens_per_seq[i], seq, 0)?;
+            out.push(r);
+        }
+        Ok(out)
+    }
+
     /// CUDA-graphed K=4 verify (1 verified + 3 drafts). Returns 4 argmax IDs.
     /// SSM intermediates [0..3] saved for partial rollback.
     fn decode_verify_graphed_k4(
@@ -341,6 +419,31 @@ pub trait Model: Send + Sync {
     /// token ID directly on GPU). Returns 0 if no proposer is available.
     fn read_deferred_draft_token(&self) -> Result<u32> {
         Ok(0)
+    }
+
+    /// M8A: upload a DDTree payload's parent_indices to device and stash
+    /// the pointer so the next K=γ verify call routes through the tree-aware
+    /// GDN kernel. Caller is responsible for clearing via
+    /// `clear_ddtree_parent_ids` after verify. No-op for models without an
+    /// SSM path. Returns Ok(true) when stashed, Ok(false) when payload is
+    /// flat (kernel falls through to wy_k).
+    fn set_ddtree_parent_ids(&self, _payload: &crate::layers::DDTreePayload) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// M8A: clear the parent_ids stash after verify. Default no-op.
+    fn clear_ddtree_parent_ids(&self) {}
+
+    /// DDTree M6: drain the per-seq tree payload stashed by the last propose
+    /// call. Default returns `None` (flat / MTP / ngram drafters). DDTree-
+    /// capable drafters override to surface their last-step tree topology so
+    /// the scheduler can assign to `ActiveSeq.pending_tree_payload` for the
+    /// next-step verifier.
+    fn take_pending_tree_payload(
+        &self,
+        _seq: &mut SequenceState,
+    ) -> Option<crate::layers::DDTreePayload> {
+        None
     }
 
     /// Encode images through the vision encoder and store embeddings for the next prefill.
@@ -488,6 +591,32 @@ pub trait Model: Send + Sync {
         } else {
             Ok(())
         }
+    }
+
+    /// DDTree-aware variant of `commit_verify_state_async`.
+    ///
+    /// `last_inter_slot` is the kernel slot index of the *last accepted*
+    /// SSM state in `h_state_intermediates`. For chain-mode verify this
+    /// equals `num_accepted - 1` and the behavior is identical to
+    /// `commit_verify_state_async`. For DDTree (tree-aware) verify the
+    /// accepted compact indices may be non-contiguous — e.g.
+    /// `[1, 4, 7]` — and the kernel writes the post-acceptance state at
+    /// slot `7`, NOT slot `2 = len - 1`. Callers must pass the explicit
+    /// slot derived from the tree walk (`accepted_compact_indices.last()`
+    /// or `0` when no drafts were accepted).
+    ///
+    /// Default impl forwards to the legacy `commit_verify_state_async`,
+    /// which only sees `num_accepted` and `k` — equivalent to assuming
+    /// `last_inter_slot == num_accepted - 1`. Backends that distinguish
+    /// chain vs tree (TransformerModel) should override.
+    fn commit_verify_state_async_with_slot(
+        &self,
+        seq: &mut SequenceState,
+        num_accepted: usize,
+        k: usize,
+        _last_inter_slot: usize,
+    ) -> Result<()> {
+        self.commit_verify_state_async(seq, num_accepted, k)
     }
 
     /// Save KV blocks + SSM state to writer. Does NOT free resources.

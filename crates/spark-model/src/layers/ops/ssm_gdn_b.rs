@@ -282,6 +282,114 @@ pub fn gdn_decode_wy17(
         .launch(stream)
 }
 
+/// M8A: tree-aware GDN verify with parent_ids state load.
+/// Kernel: `gated_delta_rule_tree` (gated_delta_rule_tree.cu).
+/// Sequential per-token loop; each token reads H from `h_state` (parent=-1)
+/// or `h_state_inter[parent_ids[i]]` (earlier token's output state).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_tree(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    parent_ids_dev: DevicePtr,
+    output: DevicePtr,
+    h_state_inter_base: DevicePtr,
+    inter_stride_floats: u32,
+    num_tokens: u32,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(parent_ids_dev)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter_base)
+        .arg_u32(inter_stride_floats)
+        .arg_u32(num_tokens)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// M8A v2: tree-aware WY-fused GDN. Same I/O as gdn_decode_tree but
+/// internally uses wy17-style algebra (single H_root read, scalar WY
+/// correction) so flat-chain payloads are bit-equivalent to wy17.
+/// For tree branches, walks ancestor chain per token in shared mem.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_tree_wy(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    parent_ids_dev: DevicePtr,
+    output: DevicePtr,
+    h_state_inter_base: DevicePtr,
+    inter_stride_floats: u32,
+    num_tokens: u32,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(parent_ids_dev)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter_base)
+        .arg_u32(inter_stride_floats)
+        .arg_u32(num_tokens)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
 /// Fused 2-token conv1d sliding window update + SiLU.
 ///
 /// Each thread handles one channel independently. The 2-token dependency

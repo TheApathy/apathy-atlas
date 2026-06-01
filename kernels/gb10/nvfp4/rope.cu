@@ -206,6 +206,97 @@ extern "C" __global__ void rope_forward_proportional(
 // Grid: (num_q_heads + num_kv_heads, seq_blocks, batch)
 // Block: (128, 1, 1) — same as rope_forward
 // ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// rope_forward_strided_b3 — batched (per-token-strided) RoPE for the
+// multi-sequence K=3 verify path.
+//
+// In `ms_phase_rope` the QKV tensor is laid out as N tokens at
+// stride `per_seq_qkv` BF16 elements, with Q at offset 0 and K at
+// offset `k_offset_bf16` within each token's slot. The original code
+// launched N separate `rope_forward` kernels (one per token) — pure
+// launch overhead, since each call only touches (nq+nkv) heads worth
+// of rotation. This kernel collapses those N launches into 1 by
+// adding a token axis (blockIdx.y) and a per-token byte stride
+// (qkv_stride_bf16).
+//
+// Layout:
+//   QKV: [num_tokens] tokens, each [per_seq_qkv] BF16 (= qkv_stride_bf16).
+//        Within a token: [Q_all (nq*hd) | <gate (nq*hd) for gated> | K (nkv*hd) | V (nkv*hd)]
+//        Q starts at `base + token*stride`, K starts at `base + token*stride + k_offset_bf16`.
+//   positions: [num_tokens]  uint32
+//
+// Grid: (num_q_heads + num_kv_heads, num_tokens, 1)
+// Block: (128, 1, 1)
+//
+// Output is bit-identical to N back-to-back `rope_forward` launches with
+// `seq_len=1` and Q/K pointers offset to each token.
+extern "C" __global__ void rope_forward_strided_b3(
+    __nv_bfloat16* __restrict__ qkv_base,            // points at token 0's Q
+    const unsigned int* __restrict__ positions,      // [num_tokens] absolute positions
+    const unsigned int num_tokens,
+    const unsigned int qkv_stride_bf16,              // BF16 elements between tokens
+    const unsigned int k_offset_bf16,                // BF16 offset within token slot to K
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int rotary_dim,
+    const float theta
+) {
+    const unsigned int head_idx = blockIdx.x;
+    const unsigned int token = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+
+    if (token >= num_tokens) return;
+
+    const bool is_q = (head_idx < num_q_heads);
+    const unsigned int head = is_q ? head_idx : (head_idx - num_q_heads);
+    const unsigned int num_heads = is_q ? num_q_heads : num_kv_heads;
+
+    if (!is_q && head >= num_kv_heads) return;
+    if (is_q && head >= num_q_heads) return;
+
+    // Pair / position layout (matches rope_forward).
+    const unsigned int pairs_per_pos = rotary_dim / 2;
+    // For multi_seq decode, each block handles ONE token (one position).
+    // We still pack threads as (pairs_per_pos * 1) but pad to 128 for occupancy.
+    if (tid >= pairs_per_pos) return;
+    const unsigned int pair_idx = tid;
+
+    const unsigned int abs_pos = positions[token];
+
+    // freq_i = 1 / theta^(2*pair_idx / rotary_dim)
+    const double freq_exp_d = (double)(2 * pair_idx) / (double)rotary_dim;
+    const float freq = (float)(1.0 / pow((double)theta, freq_exp_d));
+    const float angle = (float)abs_pos * freq;
+    const float cos_val = cosf(angle);
+    const float sin_val = sinf(angle);
+
+    // Per-token slot base
+    __nv_bfloat16* token_base = qkv_base + (unsigned long long)token * qkv_stride_bf16;
+
+    __nv_bfloat16* ptr;
+    if (is_q) {
+        // Q region: [num_q_heads, head_dim], head h at offset h*head_dim
+        ptr = token_base + (unsigned long long)head * head_dim;
+    } else {
+        // K region: at k_offset_bf16 inside the token slot
+        ptr = token_base + k_offset_bf16 + (unsigned long long)head * head_dim;
+    }
+
+    const unsigned int half_rot = rotary_dim / 2;
+    const unsigned int d0 = pair_idx;
+    const unsigned int d1 = pair_idx + half_rot;
+    const float x0 = (float)ptr[d0];
+    const float x1 = (float)ptr[d1];
+
+    const float y0 = x0 * cos_val - x1 * sin_val;
+    const float y1 = x1 * cos_val + x0 * sin_val;
+
+    ptr[d0] = __float2bfloat16(y0);
+    ptr[d1] = __float2bfloat16(y1);
+}
+
+
 extern "C" __global__ void rope_forward_yarn(
     __nv_bfloat16* __restrict__ Q,
     __nv_bfloat16* __restrict__ K,

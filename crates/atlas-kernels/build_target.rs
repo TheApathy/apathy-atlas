@@ -48,7 +48,20 @@ impl ComputeTarget for NvidiaTarget {
         arch: &str,
         extra_flags: &[String],
     ) -> Result<(), String> {
-        let mut args = vec!["--ptx".into(), format!("-arch={arch}"), "-O3".into()];
+        // --use_fast_math enables: ftz=true, fmad=true, prec-div=false,
+        // prec-sqrt=false. KERNEL.md documents this as the canonical build
+        // command. Safe for NVFP4-quantized weights where numerical noise
+        // floor is far above fast-math drift. -Xptxas -O3 forces PTX-level
+        // optimization too. Adds ~5-15% throughput on math-heavy kernels
+        // (gated_delta_rule, l2_norm, rms_norm, gdn_decode).
+        let mut args = vec![
+            "--ptx".into(),
+            format!("-arch={arch}"),
+            "-O3".into(),
+            "--use_fast_math".into(),
+            "-Xptxas".into(),
+            "-O3".into(),
+        ];
         args.extend(extra_flags.iter().cloned());
         args.push(source.to_str().unwrap().into());
         args.push("-o".into());

@@ -63,6 +63,10 @@ impl TransformerModel {
         // F62 (2026-04-27): SpecMamba dual-buffer pre-verify copy.
         self.pre_verify_copy_async(seq)?;
 
+        // ATLAS_FULL_PROFILE=1: bump per-step counter (warmup logic lives in
+        // full_profile.rs). Cheap atomic load when env var is unset.
+        crate::full_profile::begin_step();
+
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
 
@@ -71,9 +75,12 @@ impl TransformerModel {
         // ── Phase 1: Pre-graph (varies per step, NOT captured) ──
 
         // 1a. Embed 3 tokens
-        for t in 0..k {
-            self.embed(tokens[t], hidden.offset(t * h * fp32), stream)?;
-        }
+        crate::kprof!(self.gpu.as_ref(), stream, "embed", {
+            for t in 0..k {
+                self.embed(tokens[t], hidden.offset(t * h * fp32), stream)?;
+            }
+            anyhow::Result::<()>::Ok(())
+        })?;
 
         // 1b. Allocate KV blocks for all 3 positions
         let bs = kv_cache.block_size();
@@ -157,16 +164,22 @@ impl TransformerModel {
 
         // Phase 6.2.c — HSS host I/O is illegal under CUDA graph capture.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        let use_graphs = self.comm.is_none() && !hss_engaged;
+        // ATLAS_FULL_PROFILE=1 disables graph capture so per-kernel sync is
+        // legal (CUDA graph capture forbids host syncs / D2H copies inside).
+        let full_profile = crate::full_profile::is_enabled();
+        let use_graphs = self.comm.is_none() && !hss_engaged && !full_profile;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: full_profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // ── Phase 2: CUDA graph capture / replay ──
@@ -230,40 +243,56 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                // DFlash hidden capture for ctx conditioning / training
+                // data collection (ATLAS_DUMP_HIDDEN). No-op when both
+                // `dflash_hidden_save` is None AND `dflash_capture_layers`
+                // is empty (production hot path: zero overhead).
+                for t in 0..k {
+                    self.try_dflash_capture(layer_idx, t, stream)?;
+                }
             }
 
             // Final norm [3, H]
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                hidden,
-                &self.final_norm,
-                normed,
-                k as u32,
-                h as u32,
-                self.config.rms_norm_eps as f32,
-                stream,
-            )?;
+            crate::kprof!(self.gpu.as_ref(), stream, "final_norm", {
+                ops::rms_norm(
+                    self.gpu.as_ref(),
+                    self.rms_norm_kernel,
+                    hidden,
+                    &self.final_norm,
+                    normed,
+                    k as u32,
+                    h as u32,
+                    self.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
 
             // LM head for 3 tokens
-            self.lm_head_batched(normed, k as u32, stream)?;
+            crate::kprof!(self.gpu.as_ref(), stream, "lm_head", {
+                self.lm_head_batched(normed, k as u32, stream)?;
+                anyhow::Result::<()>::Ok(())
+            })?;
 
             // Argmax inside graph
             let vocab = self.config.vocab_size;
             let argmax_out = self.buffers.scratch();
-            for t in 0..k {
-                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-                let out_t = argmax_out.offset(t * 4);
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits_t,
-                    out_t,
-                    vocab as u32,
-                    stream,
-                )?;
-            }
+            crate::kprof!(self.gpu.as_ref(), stream, "argmax", {
+                for t in 0..k {
+                    let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                    let out_t = argmax_out.offset(t * 4);
+                    ops::argmax_bf16(
+                        self.gpu.as_ref(),
+                        self.argmax_kernel,
+                        logits_t,
+                        out_t,
+                        vocab as u32,
+                        stream,
+                    )?;
+                }
+                anyhow::Result::<()>::Ok(())
+            })?;
 
             if use_graphs {
                 let graph = self.gpu.end_capture(stream)?;
@@ -278,6 +307,10 @@ impl TransformerModel {
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──
+
+        // ATLAS_DUMP_HIDDEN: flush captured layer hiddens to file. See
+        // verify_b.rs for the eager-mode safety contract.
+        self.flush_hidden_dump(k)?;
 
         let out_ptr = self.buffers.scratch();
         let mut buf = [0u8; 12];

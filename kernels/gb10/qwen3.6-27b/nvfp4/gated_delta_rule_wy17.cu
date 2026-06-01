@@ -93,7 +93,7 @@ extern "C" __global__ void gated_delta_rule_wy17(
     if (tid < K_TOKENS) {
         // Gate clamp matches per-token gated_delta_rule_decode (see wy4 comment).
         float g_raw = gate[(b * K_TOKENS + tid) * gb_stride + vh];
-        sg[tid] = fminf(fmaxf(g_raw, 1e-6f), 1.0f - 1e-6f);
+        sg[tid] = fminf(fmaxf(g_raw, 0.0f), 1.0f);
         sbt[tid] = beta[(b * K_TOKENS + tid) * gb_stride + vh];
     }
     __syncthreads();

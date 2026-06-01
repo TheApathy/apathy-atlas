@@ -57,7 +57,7 @@ extern "C" __global__ void gated_delta_rule_wy4(
         const __nv_bfloat16* q##T = query + (b*4+T)*qk_stride + kh*k_dim; \
         const __nv_bfloat16* k##T = key   + (b*4+T)*qk_stride + kh*k_dim; \
         const __nv_bfloat16* v##T = value + (b*4+T)*v_stride  + vh*v_dim; \
-        const float g##T = fminf(fmaxf(gate[(b*4+T)*gb_stride + vh], 1e-6f), 1.0f - 1e-6f); \
+        const float g##T = fminf(fmaxf(gate[(b*4+T)*gb_stride + vh], 0.0f), 1.0f); \
         const float bt##T = beta[(b*4+T)*gb_stride + vh];
     TP(0) TP(1) TP(2) TP(3)
     #undef TP

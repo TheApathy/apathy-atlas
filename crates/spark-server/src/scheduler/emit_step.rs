@@ -13,6 +13,24 @@ use super::*;
 /// When `logprobs` is Some, the logprobs data is accumulated for blocking
 /// responses and sent via `StreamEvent::TokenWithLogprobs` for streaming.
 pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::TokenLogprobs>) {
+    // ── ATLAS_DUMP_HIDDEN: append token-emit record (catch-all spec path) ──
+    // verify_k2/k3/k4/dflash all funnel through emit_token, so this hook
+    // covers the speculative codepaths that bypass process_decode_logits.
+    if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+        const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
+            let _ = f.write_all(&tok.to_le_bytes());
+            let _ = f.write_all(&0u32.to_le_bytes());
+            let _ = f.write_all(&0u32.to_le_bytes());
+        }
+    }
+
     // ChatML role-boundary HARD stop (`<|im_start|>`).
     //
     // Handled BEFORE grammar advance / EOS suppression: if the model

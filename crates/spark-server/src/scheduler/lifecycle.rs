@@ -66,6 +66,11 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
     };
     let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
     tracing::info!("Done: {n} tokens ({reason}) {tps:.1} tok/s, TTFT={ttft_ms:.1}ms");
+    // ATLAS_FULL_PROFILE=1: dump per-kernel timing report after every
+    // generation. Zero overhead when env var is unset.
+    if spark_model::full_profile::is_enabled() {
+        spark_model::full_profile::dump();
+    }
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
@@ -298,6 +303,7 @@ pub fn resume_swapped_seq(
         // Grammar state is not serializable; resumed sequences use legacy fallback.
         grammar_state: None,
         pending_drafts: Vec::new(),
+            pending_tree_payload: None,
         last_token_time: Instant::now(),
         request_start: s.request_start,
         decode_start: s.decode_start,

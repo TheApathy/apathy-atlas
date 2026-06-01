@@ -265,16 +265,17 @@ extern "C" __global__ void inferspark_prefill(
                     if (kv_start + col1 > qr0) acc_s[nt][1] = -1e30f;
                     if (kv_start + col0 > qr1) acc_s[nt][2] = -1e30f;
                     if (kv_start + col1 > qr1) acc_s[nt][3] = -1e30f;
-                    // Sliding-window mask: key position k out-of-window for
-                    // query q when (q - k) >= sliding_window. sliding_window=0
-                    // (full attn) leaves scores untouched.
-                    if (sliding_window > 0) {
-                        unsigned int k0 = kv_start + col0, k1 = kv_start + col1;
-                        if (k0 <= qr0 && qr0 - k0 >= sliding_window) acc_s[nt][0] = -1e30f;
-                        if (k1 <= qr0 && qr0 - k1 >= sliding_window) acc_s[nt][1] = -1e30f;
-                        if (k0 <= qr1 && qr1 - k0 >= sliding_window) acc_s[nt][2] = -1e30f;
-                        if (k1 <= qr1 && qr1 - k1 >= sliding_window) acc_s[nt][3] = -1e30f;
-                    }
+                }
+                // Sliding-window mask: applied independently of causal mode
+                // so DFlash bidirectional (causal=0) still respects per-layer
+                // sliding_window limits.
+                if (sliding_window > 0) {
+                    unsigned int qr0 = q_start + row0, qr1 = q_start + row1;
+                    unsigned int k0 = kv_start + col0, k1 = kv_start + col1;
+                    if (qr0 >= k0 && qr0 - k0 >= sliding_window) acc_s[nt][0] = -1e30f;
+                    if (qr0 >= k1 && qr0 - k1 >= sliding_window) acc_s[nt][1] = -1e30f;
+                    if (qr1 >= k0 && qr1 - k0 >= sliding_window) acc_s[nt][2] = -1e30f;
+                    if (qr1 >= k1 && qr1 - k1 >= sliding_window) acc_s[nt][3] = -1e30f;
                 }
                 if (col0 >= kv_len) { acc_s[nt][0] = -1e30f; acc_s[nt][2] = -1e30f; }
                 if (col1 >= kv_len) { acc_s[nt][1] = -1e30f; acc_s[nt][3] = -1e30f; }
@@ -719,16 +720,15 @@ extern "C" __global__ void inferspark_prefill_64(
                     if (kv_start + col1 > qr0) acc_s[nt][1] = -1e30f;
                     if (kv_start + col0 > qr1) acc_s[nt][2] = -1e30f;
                     if (kv_start + col1 > qr1) acc_s[nt][3] = -1e30f;
-                    // Sliding-window mask: key position k out-of-window for
-                    // query q when (q - k) >= sliding_window. sliding_window=0
-                    // (full attn) leaves scores untouched.
-                    if (sliding_window > 0) {
-                        unsigned int k0 = kv_start + col0, k1 = kv_start + col1;
-                        if (k0 <= qr0 && qr0 - k0 >= sliding_window) acc_s[nt][0] = -1e30f;
-                        if (k1 <= qr0 && qr0 - k1 >= sliding_window) acc_s[nt][1] = -1e30f;
-                        if (k0 <= qr1 && qr1 - k0 >= sliding_window) acc_s[nt][2] = -1e30f;
-                        if (k1 <= qr1 && qr1 - k1 >= sliding_window) acc_s[nt][3] = -1e30f;
-                    }
+                }
+                // Sliding-window mask: applied independently of causal mode.
+                if (sliding_window > 0) {
+                    unsigned int qr0 = q_start + row0, qr1 = q_start + row1;
+                    unsigned int k0 = kv_start + col0, k1 = kv_start + col1;
+                    if (qr0 >= k0 && qr0 - k0 >= sliding_window) acc_s[nt][0] = -1e30f;
+                    if (qr0 >= k1 && qr0 - k1 >= sliding_window) acc_s[nt][1] = -1e30f;
+                    if (qr1 >= k0 && qr1 - k0 >= sliding_window) acc_s[nt][2] = -1e30f;
+                    if (qr1 >= k1 && qr1 - k1 >= sliding_window) acc_s[nt][3] = -1e30f;
                 }
                 if (col0 >= kv_len) { acc_s[nt][0] = -1e30f; acc_s[nt][2] = -1e30f; }
                 if (col1 >= kv_len) { acc_s[nt][1] = -1e30f; acc_s[nt][3] = -1e30f; }

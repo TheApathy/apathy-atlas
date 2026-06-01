@@ -10,6 +10,59 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 
 impl MtpHead {
+    /// Sequentially populate the MTP head's per-sequence KV cache from the
+    /// last `k` prompt-tail positions. See [`crate::speculative::DraftProposer::prefill_last_k`]
+    /// for full contract.
+    ///
+    /// Loops `forward_one` with `draft_embed_target=None`, `grammar_bitmask=None`,
+    /// discarding draft tokens (we want the KV cache populated, not predictions).
+    /// Updates `state.seq_len` to `k` (assuming starting from 0).
+    pub(crate) fn prefill_last_k_impl(
+        &self,
+        tokens: &[u32],
+        target_hiddens: DevicePtr,
+        base_position: usize,
+        state: &mut MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let k = tokens.len();
+        if k == 0 {
+            return Ok(());
+        }
+        let h = ctx.config.hidden_size;
+        let fp32 = if ctx.config.use_fp32_residual() { 4 } else { 2 };
+        let stride = h * fp32;
+        let start_pos = (base_position + 1).saturating_sub(k);
+        for i in 0..k {
+            let token = tokens[i];
+            let target_hidden_i = target_hiddens.offset(i * stride);
+            // Position passed to forward_one is the position MTP is "predicting
+            // into" — i.e. one past the input-token position. Step i has input
+            // at absolute position `start_pos + i`, so we predict `start_pos + i + 1`.
+            // After K iterations the latest cache entry is RoPE'd at
+            // `start_pos + k = base_position + 1`, matching what the first
+            // post-prefill decode call will pass (`seq.seq_len` after bootstrap).
+            let position = start_pos + i + 1;
+            let _draft = self.forward_one(
+                token,
+                target_hidden_i,
+                position,
+                state,
+                ctx,
+                stream,
+                None, // draft_embed_target: discard
+                None, // grammar_bitmask: not constrained during prefill
+            )?;
+        }
+        // We populated K KV entries but did NOT consume a draft step on the
+        // caller's behalf. Reset `last_num_drafted` so the next `after_verify`
+        // (which trims `last_num_drafted - num_accepted`) does not over-trim
+        // the prefill entries.
+        state.last_num_drafted = 0;
+        Ok(())
+    }
+
     /// MTP forward pass for a single token.
     ///
     /// When `draft_embed_target` is `Some(ptr)`, the draft token's embedding
@@ -247,7 +300,23 @@ impl MtpHead {
             stream,
         )?;
 
-        // Reshape + cache (FP8)
+        // Reshape + cache (FP8).
+        //
+        // Per-MTP-layer FP8 KV scale calibration (when `ATLAS_MTP_FP8_CALIB=1`,
+        // default ON): observe post-RoPE K/V magnitudes for the first
+        // `MTP_FP8_WARMUP_TOKENS` decode positions, then freeze a calibrated
+        // (k_scale, v_scale) pair. Without this, hardcoded scale=1.0 caused
+        // FP8 dequantization error to compound across positions, dropping
+        // draft accept rate by ~50% at 4K+ ctx (1.83 → 0.92 tokens/verify).
+        // The same `Fp8KvCalibration` machinery powers the target attention
+        // layers — see `qwen3_attention::decode::write_kv_cache` for the
+        // mirror call site.
+        if let Some(ref cal) = self.fp8_calibration {
+            // 1 token per MTP forward (decode-only). nkv KV heads × hd dim.
+            cal.observe(ctx.gpu, k_out, v_out, 1, nkv, hd, stream)?;
+        }
+        let (k_scale, v_scale) = self.effective_mtp_fp8_scales();
+
         let kv_stride = nkv * hd;
         ops::reshape_and_cache_fp8(
             ctx.gpu,
@@ -261,8 +330,8 @@ impl MtpHead {
             nkv,
             hd,
             bs as u32,
-            1.0,
-            1.0, // k_scale, v_scale (no pre-computed scales for MTP)
+            k_scale,
+            v_scale,
             kv_stride,
             kv_stride,
             kv_cache.cache_stride() as u64,
@@ -288,10 +357,21 @@ impl MtpHead {
             hd,
             bs as u32,
             inv_sqrt_d,
-            1.0,
-            1.0, // k_scale, v_scale
+            k_scale,
+            v_scale, // calibrated FP8 scales (matches reshape_and_cache_fp8 above)
             nq * hd,
             kv_cache.cache_stride() as u64,
+            // No tree-aware indirection on MTP path.
+            // CUDA graph fix: kv_indir_base is now a device-buffer ptr;
+            // NULL deactivates the tree path entirely (kernel reads
+            // `kv_indir_base` only when `kv_indirection != nullptr`).
+            spark_runtime::gpu::DevicePtr::NULL,
+            spark_runtime::gpu::DevicePtr::NULL,
+            0,
+            // No tree-pack on MTP path.
+            spark_runtime::gpu::DevicePtr::NULL,
+            spark_runtime::gpu::DevicePtr::NULL,
+            0,
             stream,
         )?;
 
@@ -326,15 +406,19 @@ impl MtpHead {
             stream,
         )?;
 
-        // 10. MoE FFN
-        let moe_out = match self.quant {
-            MtpQuantization::Nvfp4 => self
-                .moe_nvfp4
-                .as_ref()
-                .unwrap()
-                .forward(normed2, ctx, stream)?,
-            MtpQuantization::Fp8 | MtpQuantization::Bf16 => {
-                self.moe_forward_generic(normed2, ctx, stream)?
+        // 10. MoE FFN — or dense MLP for Qwen3.5/3.6 27B-class.
+        let moe_out = if self.is_dense_mlp {
+            self.dense_mlp_forward(normed2, ctx, stream)?
+        } else {
+            match self.quant {
+                MtpQuantization::Nvfp4 => self
+                    .moe_nvfp4
+                    .as_ref()
+                    .unwrap()
+                    .forward(normed2, ctx, stream)?,
+                MtpQuantization::Fp8 | MtpQuantization::Bf16 => {
+                    self.moe_forward_generic(normed2, ctx, stream)?
+                }
             }
         };
         ops::residual_add(ctx.gpu, self.residual_add_k, hidden, moe_out, h, stream)?;
@@ -458,6 +542,57 @@ impl MtpHead {
             }
         } else {
             ops::argmax_bf16(ctx.gpu, self.argmax_k, logits, out_ptr, v, stream)?;
+
+            // ATLAS_MTP_DEBUG=1: per-step diagnostic — emit drafter top-1 token,
+            // top-1/top-2 confidence margin, and target_hidden bf16 abs-max so
+            // long-context accept-rate drift can be correlated with logit
+            // confidence + hidden-state magnitude growth.
+            //
+            // This is on the propose hot path so it forces a D2H sync — only
+            // engage under env-gate when investigating accept-rate regressions.
+            if std::env::var("ATLAS_MTP_DEBUG").ok().as_deref() == Some("1") {
+                let vocab = v as usize;
+                let mut bf16_buf = vec![0u8; vocab * 2];
+                ctx.gpu.copy_d2h(logits, &mut bf16_buf)?;
+                let mut top1_val = f32::NEG_INFINITY;
+                let mut top2_val = f32::NEG_INFINITY;
+                let mut top1_tok: u32 = 0;
+                for i in 0..vocab {
+                    let hi = u16::from_le_bytes([bf16_buf[2 * i], bf16_buf[2 * i + 1]]);
+                    let val = f32::from_bits((hi as u32) << 16);
+                    if val > top1_val {
+                        top2_val = top1_val;
+                        top1_val = val;
+                        top1_tok = i as u32;
+                    } else if val > top2_val {
+                        top2_val = val;
+                    }
+                }
+                let margin = top1_val - top2_val;
+                // Sample target_hidden magnitude (bf16, h elements).
+                let h_bytes = h as usize * 2;
+                let mut th_buf = vec![0u8; h_bytes];
+                ctx.gpu.copy_d2h(target_hidden, &mut th_buf)?;
+                let mut th_absmax = 0.0f32;
+                let mut th_sumsq = 0.0f64;
+                for i in 0..(h as usize) {
+                    let hi = u16::from_le_bytes([th_buf[2 * i], th_buf[2 * i + 1]]);
+                    let val = f32::from_bits((hi as u32) << 16);
+                    let abs = val.abs();
+                    if abs > th_absmax {
+                        th_absmax = abs;
+                    }
+                    th_sumsq += (val as f64) * (val as f64);
+                }
+                let th_rms = (th_sumsq / (h as f64)).sqrt();
+                tracing::info!(
+                    "ATLAS_MTP_DEBUG pos={position} mtp_seq={} top1={top1_tok} \
+                     top1_val={top1_val:.3} margin={margin:.3} \
+                     th_absmax={th_absmax:.3} th_rms={th_rms:.3}",
+                    state.seq_len,
+                );
+            }
+
             if let Some(embed_target) = draft_embed_target {
                 // GPU-side embedding: write draft embedding to verify input buffer
                 // and token ID to deferred readback buffer. No D2H sync needed.

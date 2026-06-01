@@ -29,24 +29,47 @@ impl Qwen3SsmLayer {
             .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
 
         let normed = ctx.buffers.norm_output();
-        ops::rms_norm_residual(
-            ctx.gpu,
-            self.rms_norm_residual_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            residual,
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        // Fused path requires: env opt-in, kernel handle present, sequential QKVZ +
+        // NVFP4 weights (the only QKVZ branch that calls plain w4a16_gemv right after
+        // rms_norm_residual). Falls back to the unfused sequence otherwise.
+        let fuse_qkvz = self.fused_rms_qkvz_k.0 != 0
+            && self.sequential_qkvz
+            && self.qkvz_nvfp4.is_some()
+            && !ctx.config.use_fp32_residual()
+            && std::env::var("ATLAS_FUSE_SSM_QKVZ").ok().as_deref() == Some("1");
+
+        if !fuse_qkvz {
+            ops::rms_norm_residual(
+                ctx.gpu,
+                self.rms_norm_residual_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                residual,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "pre-norm", normed, 4);
         }
 
-        let ssm_out = self.ssm_forward(normed, ssm_state, ctx, stream, trace)?;
+        let ssm_out = if fuse_qkvz {
+            self.ssm_forward_with_fuse(
+                normed,
+                Some((hidden, residual)),
+                normed,
+                stream,
+                ssm_state,
+                ctx,
+                trace,
+            )?
+        } else {
+            self.ssm_forward(normed, ssm_state, ctx, stream, trace)?
+        };
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "ssm-out", ssm_out, 4);

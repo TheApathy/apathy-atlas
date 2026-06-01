@@ -69,6 +69,11 @@ echo "[serve-aeon-27b] preflight ok: ${FREE_GB} GB free, port ${PORT} clear"
 # prompts, RAG) we see Marconi SSM cache hits → ~22-25 tok/s with
 # correct output, a clear win for any real workload that touches the
 # same prompt prefix more than once.
+export ATLAS_GDN_PREFILL_TUNED=1
+export ATLAS_LM_HEAD_BATCH3=1
+export ATLAS_SSM_OUT_BATCH3=1
+export ATLAS_PREFILL_FFN_FAST=1
+export ATLAS_FFN_M16_TRANSPOSED=1
 exec /home/flocka/atlas-src/target/release/spark serve \
   --model-from-path /home/flocka/models/AEON-Q36-27B-XS \
   --model-name aeon-27b \
@@ -77,11 +82,15 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --gpu-memory-utilization 0.85 \
   --kv-cache-dtype fp8 \
   --max-seq-len 16384 \
+  --max-batch-size 8 \
+  --max-num-seqs 8 \
   --enable-prefix-caching \
   --speculative \
   --num-drafts 2 \
   --mtp-quantization nvfp4 \
   --mtp-vocab 32000 \
   --ssm-cache-slots 16 \
+  --ssm-checkpoint-interval 16 \
+  --max-prefill-tokens 1024 \
   --max-thinking-budget 768 \
   --warmup-prompt /home/flocka/atlas-src/local/warmup.txt

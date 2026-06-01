@@ -273,6 +273,263 @@ impl Qwen3SsmLayer {
                 (nv * 2) as u32, // gb_stride
                 stream,
             )?;
+        } else if let (Some(parent_ids_dev), true) = (
+            ctx.ddtree_parent_ids_dev,
+            self.gdn_tree_k.0 != 0
+                && std::env::var("ATLAS_FORCE_WY17").ok().as_deref() != Some("1"),
+        ) {
+            static DISPATCH_DBG: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = DISPATCH_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 {
+                tracing::info!(
+                    "M8A dispatch FIRES #{n}: num_tokens={} parent_ids_dev={:?} gdn_tree_k=non-null",
+                    num_tokens, parent_ids_dev
+                );
+            }
+            // ── M8A: DDTree tree-aware GDN verify ──
+            // parent_ids_dev is a [num_tokens × i32] device tensor uploaded by
+            // verify_d.rs from a.pending_tree_payload before the layer loop.
+            // Each token's state load follows parent_ids[i] instead of i-1,
+            // letting the verifier walk non-flat tree branches.
+            for t in 0..(num_tokens as u32) {
+                let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
+                let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
+                ops::conv1d_update_l2norm(
+                    ctx.gpu,
+                    self.conv1d_l2norm_k,
+                    ssm_state.conv_state,
+                    qkv_t,
+                    &self.ssm.conv1d,
+                    conv_out_t,
+                    conv_dim as u32,
+                    d_conv as u32,
+                    1,
+                    qk_ch,
+                    kd as u32,
+                    1e-6,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    ssm_state.conv_state,
+                    ssm_state.conv_state_intermediates[t as usize],
+                    conv_bytes,
+                    stream,
+                )?;
+            }
+            let q_ptr = conv_out_buf;
+            let k_ptr = conv_out_buf.offset(key_dim * bf16);
+            let v_ptr = conv_out_buf.offset(key_dim * 2 * bf16);
+            let gate_ptr = gates_buf;
+            let beta_ptr = gates_buf.offset(nv * fp32);
+            // Use the FIRST per-token intermediate slot as the base for the
+            // tree kernel's contiguous `h_state_inter[T, ...]` output layout.
+            // Atlas allocates intermediates[0..num_tokens] contiguously per
+            // (b, vh) — the kernel writes inter[t] = base + t * hv directly.
+            // ── M8A precision dump (one-shot, env-gated) ──
+            // ATLAS_M8A_DUMP=1 + ATLAS_M8A_DUMP_LAYER=N writes:
+            //   /tmp/m8a_dump_q.bin           [T*qk_stride] BF16
+            //   /tmp/m8a_dump_k.bin           [T*qk_stride] BF16
+            //   /tmp/m8a_dump_v.bin           [T*v_stride]  BF16
+            //   /tmp/m8a_dump_gate.bin        [T*gb_stride] FP32
+            //   /tmp/m8a_dump_beta.bin        [T*gb_stride] FP32
+            //   /tmp/m8a_dump_parent_ids.bin  [T]           i32
+            //   /tmp/m8a_dump_h_in.bin        [nv*kd*vd]    FP32 (h_state BEFORE kernel)
+            //   /tmp/m8a_dump_h_out.bin       [T*nv*kd*vd]  FP32 (h_state_intermediates AFTER)
+            //   /tmp/m8a_dump_output.bin      [T*nv*v_dim]  BF16
+            //   /tmp/m8a_dump_meta.json       dims + strides for python ref
+            // After kernel runs, set ATLAS_M8A_DUMP_DONE marker so subsequent
+            // calls skip. Python ref consumes the dump.
+            static DUMP_DONE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let dump_enabled = std::env::var("ATLAS_M8A_DUMP").ok().as_deref() == Some("1")
+                && !DUMP_DONE.load(std::sync::atomic::Ordering::Relaxed);
+            let dump_layer_match = std::env::var("ATLAS_M8A_DUMP_LAYER")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map_or(true, |target| target == 0usize);
+            let dump_now = dump_enabled && dump_layer_match;
+
+            if dump_now {
+                // Dump inputs BEFORE the kernel runs.
+                let qk_bytes_per = qkvz_size * bf16;
+                let v_bytes_per = qkvz_size * bf16; // q,k,v all same size in deinterleaved layout
+                let _ = v_bytes_per;
+                let q_total = (num_tokens as usize) * (conv_dim as usize) * bf16;
+                let v_total = (num_tokens as usize) * (conv_dim as usize) * bf16;
+                let gb_total = (num_tokens as usize) * nv * fp32;
+                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let h_inter_total = (num_tokens as usize) * h_total;
+
+                let dump = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
+                    let mut buf = vec![0u8; n];
+                    ctx.gpu.synchronize(stream)?;
+                    ctx.gpu.copy_d2h(ptr, &mut buf)?;
+                    let path = format!("/tmp/m8a_dump_{name}.bin");
+                    std::fs::write(&path, &buf)
+                        .map_err(|e| anyhow::anyhow!("m8a dump write {path}: {e}"))?;
+                    Ok(())
+                };
+                dump("q", q_ptr, q_total)?;
+                dump("k", k_ptr, q_total)?;
+                dump("v", v_ptr, v_total)?;
+                dump("gate", gate_ptr, gb_total)?;
+                dump("beta", beta_ptr, gb_total)?;
+                // parent_ids has length num_tokens (verify K = γ+1). Now correctly
+                // sized post-fix in set_ddtree_parent_ids (kernel-frame with leading -1).
+                let parent_ids_bytes = (num_tokens as usize) * 4;
+                dump("parent_ids", parent_ids_dev, parent_ids_bytes)?;
+                dump("h_in", ssm_state.h_state, h_total)?;
+
+                let meta = serde_json::json!({
+                    "0usize": 0usize,
+                    "num_tokens": num_tokens,
+                    "batch_size": 1,
+                    "num_k_heads": nk,
+                    "num_v_heads": nv,
+                    "k_dim": kd,
+                    "v_dim": vd,
+                    "qk_stride": conv_dim,
+                    "v_stride": conv_dim,
+                    "gb_stride": nv * 2,
+                    "h_per_token_bytes": h_total,
+                    "h_inter_total_bytes": h_inter_total,
+                    "qk_bytes_per_token": qk_bytes_per,
+                });
+                std::fs::write("/tmp/m8a_dump_meta.json", serde_json::to_string_pretty(&meta)?)
+                    .map_err(|e| anyhow::anyhow!("meta write: {e}"))?;
+            }
+
+            // wy17 uses inter_stride_floats = h_bytes/4 = nv*kd*vd. Match it
+            // so post-verify commit reads from the right per-token slot.
+            let inter_stride_floats = (h_bytes / 4) as u32;
+
+            // ── Inline A/B: when M8A_VS_WY17=1, run wy17 first on same inputs
+            // (only when num_tokens==17 and wy17 available), dump its output,
+            // then restore h_state and run tree_wy normally. Lets us bit-diff
+            // both kernels' outputs from IDENTICAL inputs.
+            let ab_diff = dump_now
+                && num_tokens == 17
+                && self.gdn_wy17_k.0 != 0
+                && std::env::var("ATLAS_M8A_VS_WY17").ok().as_deref() == Some("1");
+            if ab_diff {
+                // Backup h_state to host before wy17 mutates it.
+                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let mut h_backup = vec![0u8; h_total];
+                ctx.gpu.synchronize(stream)?;
+                ctx.gpu.copy_d2h(ssm_state.h_state, &mut h_backup)?;
+                // Run wy17 — it will write to h_state_intermediates AND h_state.
+                ops::gdn_decode_wy17(
+                    ctx.gpu,
+                    self.gdn_wy17_k,
+                    ssm_state.h_state,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    gate_ptr,
+                    beta_ptr,
+                    gdn_out_buf,
+                    ssm_state.h_state_intermediates[0],
+                    inter_stride_floats,
+                    1, nk as u32, nv as u32, kd as u32, vd as u32,
+                    conv_dim as u32, conv_dim as u32, (nv * 2) as u32,
+                    stream,
+                )?;
+                // Dump wy17's intermediates + output.
+                let h_inter_total = (num_tokens as usize) * h_total;
+                let out_total = (num_tokens as usize) * nv * (vd as usize) * bf16;
+                let dump_wy17 = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
+                    let mut buf = vec![0u8; n];
+                    ctx.gpu.synchronize(stream)?;
+                    ctx.gpu.copy_d2h(ptr, &mut buf)?;
+                    std::fs::write(format!("/tmp/wy17_dump_{name}.bin"), &buf)
+                        .map_err(|e| anyhow::anyhow!("wy17 ab dump {name}: {e}"))?;
+                    Ok(())
+                };
+                dump_wy17("h_out_inter", ssm_state.h_state_intermediates[0], h_inter_total)?;
+                dump_wy17("output", gdn_out_buf, out_total)?;
+                // Restore h_state from backup so tree_wy gets identical input.
+                ctx.gpu.copy_h2d_async(&h_backup, ssm_state.h_state, stream)?;
+                ctx.gpu.synchronize(stream)?;
+                tracing::info!("M8A A/B: wy17 dumped to /tmp/wy17_dump_*.bin, h_state restored");
+            }
+
+            // Prefer M8A v2 (tree-aware WY-fused) when available — bit-
+            // equivalent to wy17 on flat-chain payloads. Falls back to the
+            // sequential per-token kernel (M8A v1) when WY kernel not loaded.
+            if self.gdn_tree_wy_k.0 != 0 {
+                ops::gdn_decode_tree_wy(
+                    ctx.gpu,
+                    self.gdn_tree_wy_k,
+                    ssm_state.h_state,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    gate_ptr,
+                    beta_ptr,
+                    parent_ids_dev,
+                    gdn_out_buf,
+                    ssm_state.h_state_intermediates[0],
+                    inter_stride_floats,
+                    num_tokens as u32,
+                    1, // batch_size
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim as u32, // qk_stride
+                    conv_dim as u32, // v_stride
+                    (nv * 2) as u32, // gb_stride
+                    stream,
+                )?;
+            } else {
+                ops::gdn_decode_tree(
+                    ctx.gpu,
+                    self.gdn_tree_k,
+                    ssm_state.h_state,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    gate_ptr,
+                    beta_ptr,
+                    parent_ids_dev,
+                    gdn_out_buf,
+                    ssm_state.h_state_intermediates[0],
+                    inter_stride_floats,
+                    num_tokens as u32,
+                    1, // batch_size
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim as u32, // qk_stride
+                    conv_dim as u32, // v_stride
+                    (nv * 2) as u32, // gb_stride
+                    stream,
+                )?;
+            }
+
+            if dump_now {
+                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let h_inter_total = (num_tokens as usize) * h_total;
+                let out_total = (num_tokens as usize) * nv * (vd as usize) * bf16;
+                let dump_after = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
+                    let mut buf = vec![0u8; n];
+                    ctx.gpu.synchronize(stream)?;
+                    ctx.gpu.copy_d2h(ptr, &mut buf)?;
+                    let path = format!("/tmp/m8a_dump_{name}.bin");
+                    std::fs::write(&path, &buf)
+                        .map_err(|e| anyhow::anyhow!("m8a dump write {path}: {e}"))?;
+                    Ok(())
+                };
+                dump_after("h_out_inter", ssm_state.h_state_intermediates[0], h_inter_total)?;
+                dump_after("output", gdn_out_buf, out_total)?;
+                tracing::info!(
+                    "M8A precision dump complete (layer={}, T={}, nv={}, kd={}, vd={}); see /tmp/m8a_dump_*.bin",
+                    0usize, num_tokens, nv, kd, vd
+                );
+                DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         } else if num_tokens == 17 && self.gdn_wy17_k.0 != 0 {
             // ── K=17 (DFlash γ+1): fused WY-Chunkwise path ──
             for t in 0..(num_tokens as u32) {
@@ -307,28 +564,125 @@ impl Qwen3SsmLayer {
             let gate_ptr = gates_buf;
             let beta_ptr = gates_buf.offset(nv * fp32);
             let inter_stride_floats = (h_bytes / 4) as u32;
-            ops::gdn_decode_wy17(
-                ctx.gpu,
-                self.gdn_wy17_k,
-                ssm_state.h_state,
-                q_ptr,
-                k_ptr,
-                v_ptr,
-                gate_ptr,
-                beta_ptr,
-                gdn_out_buf,
-                ssm_state.h_state_intermediates[0],
-                inter_stride_floats,
-                1, // batch_size
-                nk as u32,
-                nv as u32,
-                kd as u32,
-                vd as u32,
-                conv_dim as u32, // qk_stride
-                conv_dim as u32, // v_stride
-                (nv * 2) as u32, // gb_stride
-                stream,
-            )?;
+
+            // ── wy17 precision dump (one-shot, env-gated) ──
+            // ATLAS_WY17_DUMP=1 dumps inputs+output for the FIRST K=17 verify
+            // call so we can bit-diff against M8A v2 tree_wy on the same chain.
+            static WY17_DUMP_DONE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let wy17_dump = std::env::var("ATLAS_WY17_DUMP").ok().as_deref() == Some("1")
+                && !WY17_DUMP_DONE.load(std::sync::atomic::Ordering::Relaxed);
+            if wy17_dump {
+                let q_total = (num_tokens as usize) * (conv_dim as usize) * bf16;
+                let gb_total = (num_tokens as usize) * nv * fp32;
+                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let dump = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
+                    let mut buf = vec![0u8; n];
+                    ctx.gpu.synchronize(stream)?;
+                    ctx.gpu.copy_d2h(ptr, &mut buf)?;
+                    let path = format!("/tmp/wy17_dump_{name}.bin");
+                    std::fs::write(&path, &buf)
+                        .map_err(|e| anyhow::anyhow!("wy17 dump write {path}: {e}"))?;
+                    Ok(())
+                };
+                dump("q", q_ptr, q_total)?;
+                dump("k", k_ptr, q_total)?;
+                dump("v", v_ptr, q_total)?;
+                dump("gate", gate_ptr, gb_total)?;
+                dump("beta", beta_ptr, gb_total)?;
+                dump("h_in", ssm_state.h_state, h_total)?;
+            }
+
+            // ── Phase 2 profiling: wall-clock per wy17 call ──
+            // Gated by ATLAS_SSM_KERNEL_PROFILE=1. Accumulates total ns spent in
+            // wy17 across every SSM layer + every verify step. Sync-before to
+            // start clock with empty stream; sync-after to capture GPU finish.
+            // Adds ~2 host syncs per layer when active. Disabled by default.
+            static SSM_PROFILE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+            let profile = {
+                let v = SSM_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
+                if v >= 0 {
+                    v == 1
+                } else {
+                    let enabled =
+                        std::env::var("ATLAS_SSM_KERNEL_PROFILE").ok().as_deref() == Some("1");
+                    SSM_PROFILE.store(if enabled { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+                    enabled
+                }
+            };
+            if profile {
+                ctx.gpu.synchronize(stream)?;
+                let t0 = std::time::Instant::now();
+                ops::gdn_decode_wy17(
+                    ctx.gpu,
+                    self.gdn_wy17_k,
+                    ssm_state.h_state,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    gate_ptr,
+                    beta_ptr,
+                    gdn_out_buf,
+                    ssm_state.h_state_intermediates[0],
+                    inter_stride_floats,
+                    1, // batch_size
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim as u32, // qk_stride
+                    conv_dim as u32, // v_stride
+                    (nv * 2) as u32, // gb_stride
+                    stream,
+                )?;
+                ctx.gpu.synchronize(stream)?;
+                let ns = t0.elapsed().as_nanos() as u64;
+                crate::layers::qwen3_ssm::ssm_profile_record(ns);
+            } else {
+                ops::gdn_decode_wy17(
+                    ctx.gpu,
+                    self.gdn_wy17_k,
+                    ssm_state.h_state,
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    gate_ptr,
+                    beta_ptr,
+                    gdn_out_buf,
+                    ssm_state.h_state_intermediates[0],
+                    inter_stride_floats,
+                    1, // batch_size
+                    nk as u32,
+                    nv as u32,
+                    kd as u32,
+                    vd as u32,
+                    conv_dim as u32, // qk_stride
+                    conv_dim as u32, // v_stride
+                    (nv * 2) as u32, // gb_stride
+                    stream,
+                )?;
+            }
+
+            if wy17_dump {
+                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let h_inter_total = (num_tokens as usize) * h_total;
+                let out_total = (num_tokens as usize) * nv * (vd as usize) * bf16;
+                let dump_after = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
+                    let mut buf = vec![0u8; n];
+                    ctx.gpu.synchronize(stream)?;
+                    ctx.gpu.copy_d2h(ptr, &mut buf)?;
+                    let path = format!("/tmp/wy17_dump_{name}.bin");
+                    std::fs::write(&path, &buf)
+                        .map_err(|e| anyhow::anyhow!("wy17 dump write {path}: {e}"))?;
+                    Ok(())
+                };
+                dump_after("h_out_inter", ssm_state.h_state_intermediates[0], h_inter_total)?;
+                dump_after("output", gdn_out_buf, out_total)?;
+                tracing::info!(
+                    "wy17 precision dump complete (T={num_tokens}, nv={nv}, kd={kd}, vd={vd}); see /tmp/wy17_dump_*.bin"
+                );
+                WY17_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         } else {
             // ── K∈{5..16}: chunked path using fused wy4/wy3/wy2 kernels ──
             //

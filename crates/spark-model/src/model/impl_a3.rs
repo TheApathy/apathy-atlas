@@ -27,6 +27,17 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+/// Returns true if the LM-head triple-GEMV fast path is enabled via
+/// `ATLAS_LM_HEAD_BATCH3=1`. Default off for A/B safety until verified.
+fn lm_head_batch3_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ATLAS_LM_HEAD_BATCH3")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 impl TransformerModel {
     pub(super) fn embed(&self, token: u32, output: DevicePtr, stream: u64) -> Result<()> {
         let h = self.config.hidden_size;
@@ -166,6 +177,28 @@ impl TransformerModel {
                     stream,
                 )?;
             }
+        } else if num_tokens == 3
+            && self.lm_head_nvfp4.is_some()
+            && self.w4a16_gemv_batch3_logits_kernel.0 != 0
+            && lm_head_batch3_enabled()
+        {
+            // K=3 verify path: replace the M=3 fallback through `w4a16_gemm`
+            // (M-tile=64 wastes ~95% of M-dim at M=3 → 18.7 ms measured for
+            // 715 MB weight read, 7× off the 2.6 ms bandwidth-bound floor).
+            // The dedicated triple-GEMV reads each weight row once and FMAs
+            // against all 3 input rows simultaneously, matching the M=2
+            // batch GEMV pattern already in use just above.
+            let nvfp4 = self.lm_head_nvfp4.as_ref().expect("checked above");
+            ops::w4a16_gemv_batch3_logits(
+                self.gpu.as_ref(),
+                self.w4a16_gemv_batch3_logits_kernel,
+                hidden,
+                nvfp4,
+                logits,
+                v,
+                h,
+                stream,
+            )?;
         } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
             ops::w4a16_gemm(
                 self.gpu.as_ref(),

@@ -9,9 +9,41 @@
 //! `forward_block`'s Step 3 loop.
 
 use anyhow::Result;
+use std::sync::OnceLock;
 
-use super::{BlockDiffusionDraftHead, DflashLayer};
+use super::{BlockDiffusionDraftHead, DflashLayerNvfp4, DflashLayerQuantWeights};
 use crate::layer::ForwardContext;
+
+/// Per-layer SWA gate (vLLM PR #40898). When enabled, the drafter applies
+/// the per-layer sliding-window from `layer_window_sizes` so that
+/// `sliding_attention` layers respect their trained window (typically 2048)
+/// and `full_attention` layers see the full prefix. When disabled, every
+/// layer falls back to full attention (the pre-PR-40898 behavior, which
+/// silently widens the SWA layers — this hurts acceptance on long-context
+/// prompts because the drafter was trained with a finite window).
+///
+/// Default: ON. Set `ATLAS_DFLASH_SWA=0` to disable (A/B benchmark only).
+fn dflash_swa_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let raw = std::env::var("ATLAS_DFLASH_SWA").ok();
+        match raw.as_deref() {
+            Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => {
+                tracing::info!(
+                    "DFlash per-layer SWA DISABLED (ATLAS_DFLASH_SWA=0); \
+                     all drafter layers run full attention (pre-PR-40898 behavior)"
+                );
+                false
+            }
+            _ => {
+                tracing::info!(
+                    "DFlash per-layer SWA enabled (vLLM PR #40898 alignment)"
+                );
+                true
+            }
+        }
+    })
+}
 
 /// Inputs passed to the per-layer kernel chain. Holds local computations
 /// from the surrounding `forward_block` body so the helper can be called
@@ -28,17 +60,50 @@ pub(super) struct LayerArgs {
     pub bf16: usize,
     pub inv_sqrt_d: f32,
     pub stream: u64,
+    pub needed_start: usize,
+    pub window: usize,
 }
 
 impl BlockDiffusionDraftHead {
     /// Run one drafter transformer layer. Mutates `self.scratch.*` buffers
     /// in place, leaving `stream_buf` updated with the layer's output.
+    ///
+    /// Dispatch on the per-layer weight quantization variant: BF16 layers
+    /// route every projection through `ops::dense_gemm`; NVFP4 layers
+    /// route them through `ops::w4a16_gemm` (same kernel the target model
+    /// uses, ~7× faster than BF16 dense GEMM on GB10). All non-GEMM steps
+    /// (RMSNorm, RoPE, attention, SiLU, residual add) are identical
+    /// because the scratch buffers stay BF16.
     pub(super) fn forward_block_layer(
         &self,
-        layer: &DflashLayer,
+        layer: &DflashLayerQuantWeights,
         args: &LayerArgs,
         ctx: &ForwardContext,
         debug_dump: bool,
+        dstate: &mut super::DflashProposerState,
+        kprofile: bool,
+    ) -> Result<()> {
+        match layer {
+            DflashLayerQuantWeights::Bf16(l) => {
+                self.forward_block_layer_bf16(l, args, ctx, debug_dump, dstate, kprofile)
+            }
+            DflashLayerQuantWeights::Nvfp4(l) => {
+                self.forward_block_layer_nvfp4(l, args, ctx, debug_dump, dstate, kprofile)
+            }
+        }
+    }
+
+    /// BF16 per-layer body — verbatim from the pre-NVFP4 implementation.
+    /// Reads `layer.{q,k,v,o,gate,up,down}_proj` as [`DenseWeight`] and
+    /// dispatches each through `ops::dense_gemm`.
+    fn forward_block_layer_bf16(
+        &self,
+        layer: &super::DflashLayer,
+        args: &LayerArgs,
+        ctx: &ForwardContext,
+        debug_dump: bool,
+        dstate: &mut super::DflashProposerState,
+        kprofile: bool,
     ) -> Result<()> {
         use crate::layers::ops;
 
@@ -53,7 +118,31 @@ impl BlockDiffusionDraftHead {
             bf16,
             inv_sqrt_d,
             stream,
+            needed_start,
+            window,
         } = *args;
+        // Kernel profiler helper: synchronize+time when kprofile=true, then
+        // accumulate into the thread-local KPROF_ACC field. Free when off.
+        macro_rules! kp {
+            ($field:ident, $body:expr) => {{
+                if kprofile {
+                    let t = std::time::Instant::now();
+                    let r = $body;
+                    ctx.gpu.synchronize(stream)?;
+                    let dt = t.elapsed().as_micros();
+                    super::kprof_add(|a| a.$field += dt);
+                    r
+                } else {
+                    $body
+                }
+            }};
+        }
+        let cache_k = dstate.ctx_k_cache[layer_idx];
+        let cache_v = dstate.ctx_v_cache[layer_idx];
+        let mut cache_k_start = dstate.cache_k_start[layer_idx];
+        let mut cache_k_end = dstate.cache_k_end[layer_idx];
+        let mut cache_v_start = dstate.cache_v_start[layer_idx];
+        let mut cache_v_end = dstate.cache_v_end[layer_idx];
         let gpu = ctx.gpu;
 
         let dump_bf16 = |label: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
@@ -74,8 +163,39 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
+        // ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS=1: per-layer binary dumps to
+        // /tmp/atlas_layer{i}_{tag}.bin so the Python diff harness can
+        // compare element-wise against vLLM at every layer.
+        let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let dump_layer_bin = |tag: &str,
+                              ptr: spark_runtime::gpu::DevicePtr,
+                              n_elems: usize|
+         -> Result<()> {
+            if !dump_all_layers {
+                return Ok(());
+            }
+            let n_bytes = n_elems * 2;
+            let mut buf = vec![0u8; n_bytes];
+            gpu.synchronize(stream)?;
+            gpu.copy_d2h(ptr, &mut buf)?;
+            let path = format!("/tmp/atlas_layer{}_{}.bin", layer_idx, tag);
+            if !std::path::Path::new(&path).exists() {
+                if let Err(e) = std::fs::write(&path, &buf) {
+                    tracing::warn!("DFLASH DUMP_ALL_LAYERS: write {path} failed: {e}");
+                } else {
+                    tracing::info!(
+                        "DFLASH DUMP_ALL_LAYERS: wrote {n_bytes}B ({n_elems} BF16) to {path}"
+                    );
+                }
+            }
+            Ok(())
+        };
+
         // 3a. input_layernorm.
-        ops::rms_norm(
+        kp!(input_norm_us, ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
             self.scratch.stream_buf,
@@ -85,10 +205,10 @@ impl BlockDiffusionDraftHead {
             h,
             self.rms_norm_eps,
             stream,
-        )?;
+        ))?;
 
-        // 3b. q/k/v projections from norm_buf (n_attn rows).
-        ops::dense_gemm(
+        // 3b. Q projection for all n_attn tokens (ctx + noise).
+        kp!(q_proj_us, ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
             self.scratch.norm_buf,
@@ -98,59 +218,149 @@ impl BlockDiffusionDraftHead {
             q_dim,
             h,
             stream,
-        )?;
-        ops::dense_gemm(
-            gpu,
-            self.kernels.dense_gemm,
-            self.scratch.norm_buf,
-            &layer.k_proj,
-            self.scratch.k_buf,
-            n_attn,
-            kv_dim,
-            h,
-            stream,
-        )?;
-        ops::dense_gemm(
-            gpu,
-            self.kernels.dense_gemm,
-            self.scratch.norm_buf,
-            &layer.v_proj,
-            self.scratch.v_buf,
-            n_attn,
-            kv_dim,
-            h,
-            stream,
-        )?;
-
-        // 3b'. Ctx K/V override (skip input_layernorm; project fc_proj
-        // directly through layer.k_proj/v_proj for ctx slots).
+        ))?;
         if eff_ctx > 0 {
-            ops::dense_gemm(
-                gpu,
-                self.kernels.dense_gemm,
-                self.scratch.fc_proj,
-                &layer.k_proj,
-                self.scratch.k_buf,
-                eff_ctx as u32,
-                kv_dim,
-                h,
-                stream,
-            )?;
-            ops::dense_gemm(
-                gpu,
-                self.kernels.dense_gemm,
-                self.scratch.fc_proj,
-                &layer.v_proj,
-                self.scratch.v_buf,
-                eff_ctx as u32,
-                kv_dim,
-                h,
-                stream,
-            )?;
-            // Force ctx-slot Q to zeros — Q-side ctx contributes nothing
-            // meaningful (gets discarded at lm_head extraction).
             gpu.memset(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16)?;
         }
+
+        // 3b'. K/V projections with persistent context cache.
+        // Instead of recomputing K/V for ALL eff_ctx context tokens every
+        // step, we copy cached K/V for old positions and only compute
+        // new ones. This turns O(seq_len) k_proj/v_proj per layer into
+        // O(new_tokens) ≈ O(1) amortized.
+        //
+        // PERF FIX (2026-05-19): demoted this per-layer log from
+        // tracing::info! to tracing::debug! — it fired 5×/propose at INFO
+        // level (one per drafter layer) and was on the critical path.
+        // Re-enable via `RUST_LOG=spark_model::layers::dflash_head=debug`.
+        let needed_end = needed_start + eff_ctx;
+        tracing::debug!(
+            "DFlash layer={} K/V cache: needed=[{}..{}), k_cached=[{}..{}), v_cached=[{}..{})",
+            layer_idx,
+            needed_start,
+            needed_end,
+            cache_k_start,
+            cache_k_end,
+            cache_v_start,
+            cache_v_end,
+        );
+        let old_ctx_end = needed_end.min(cache_k_end).max(needed_start);
+        let old_ctx_count = old_ctx_end.saturating_sub(needed_start);
+        let new_ctx_count = eff_ctx.saturating_sub(old_ctx_count);
+
+        if eff_ctx > 0 {
+            // 1. Copy cached K/V for old context positions.
+            if old_ctx_count > 0 {
+                kp!(kv_ctx_copy_us, self.cache_copy_range(
+                    gpu,
+                    cache_k,
+                    cache_k_start,
+                    cache_k_end,
+                    window,
+                    needed_start,
+                    old_ctx_end,
+                    self.scratch.k_buf,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+                kp!(kv_ctx_copy_us, self.cache_copy_range(
+                    gpu,
+                    cache_v,
+                    cache_v_start,
+                    cache_v_end,
+                    window,
+                    needed_start,
+                    old_ctx_end,
+                    self.scratch.v_buf,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+            }
+            // 2. Compute K/V for new context positions from fc_proj.
+            if new_ctx_count > 0 {
+                let fc_offset = old_ctx_count * self.hidden_size * bf16;
+                let kv_offset = old_ctx_count * kv_dim as usize * bf16;
+                kp!(kv_ctx_new_us, ops::dense_gemm(
+                    gpu,
+                    self.kernels.dense_gemm,
+                    self.scratch.fc_proj.offset(fc_offset),
+                    &layer.k_proj,
+                    self.scratch.k_buf.offset(kv_offset),
+                    new_ctx_count as u32,
+                    kv_dim,
+                    h,
+                    stream,
+                ))?;
+                kp!(kv_ctx_new_us, ops::dense_gemm(
+                    gpu,
+                    self.kernels.dense_gemm,
+                    self.scratch.fc_proj.offset(fc_offset),
+                    &layer.v_proj,
+                    self.scratch.v_buf.offset(kv_offset),
+                    new_ctx_count as u32,
+                    kv_dim,
+                    h,
+                    stream,
+                ))?;
+                // 3. Write new K/V into persistent cache.
+                let (new_k_start, new_k_end) = kp!(cache_write_us, self.cache_write_range(
+                    gpu,
+                    self.scratch.k_buf.offset(kv_offset),
+                    needed_start + old_ctx_count,
+                    new_ctx_count,
+                    cache_k,
+                    cache_k_start,
+                    cache_k_end,
+                    window,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+                cache_k_start = new_k_start;
+                cache_k_end = new_k_end;
+                let (new_v_start, new_v_end) = kp!(cache_write_us, self.cache_write_range(
+                    gpu,
+                    self.scratch.v_buf.offset(kv_offset),
+                    needed_start + old_ctx_count,
+                    new_ctx_count,
+                    cache_v,
+                    cache_v_start,
+                    cache_v_end,
+                    window,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+                cache_v_start = new_v_start;
+                cache_v_end = new_v_end;
+            }
+        }
+
+        // 4. K/V projections for noise tokens (γ+1 rows at offset eff_ctx:
+        // 1 bonus + γ MASKs; vLLM PR #40898 alignment).
+        let noise_count = n_attn - eff_ctx as u32;
+        let noise_offset = eff_ctx * self.hidden_size * bf16;
+        let noise_kv_offset = eff_ctx * kv_dim as usize * bf16;
+        kp!(kv_noise_us, ops::dense_gemm(
+            gpu,
+            self.kernels.dense_gemm,
+            self.scratch.norm_buf.offset(noise_offset),
+            &layer.k_proj,
+            self.scratch.k_buf.offset(noise_kv_offset),
+            noise_count,
+            kv_dim,
+            h,
+            stream,
+        ))?;
+        kp!(kv_noise_us, ops::dense_gemm(
+            gpu,
+            self.kernels.dense_gemm,
+            self.scratch.norm_buf.offset(noise_offset),
+            &layer.v_proj,
+            self.scratch.v_buf.offset(noise_kv_offset),
+            noise_count,
+            kv_dim,
+            h,
+            stream,
+        ))?;
 
         if layer_idx == 0 {
             dump_bf16("layer0.k_buf[ctx0].pre_k_norm", self.scratch.k_buf, 10)?;
@@ -169,8 +379,14 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
+        // Store updated cache ranges back into proposer state.
+        dstate.cache_k_start[layer_idx] = cache_k_start;
+        dstate.cache_k_end[layer_idx] = cache_k_end;
+        dstate.cache_v_start[layer_idx] = cache_v_start;
+        dstate.cache_v_end[layer_idx] = cache_v_end;
+
         // 3c. q_norm / k_norm — per-head RMSNorm over head_dim slices.
-        ops::rms_norm(
+        kp!(qk_norm_us, ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
             self.scratch.q_buf,
@@ -180,8 +396,8 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             self.rms_norm_eps,
             stream,
-        )?;
-        ops::rms_norm(
+        ))?;
+        kp!(qk_norm_us, ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
             self.scratch.k_buf,
@@ -191,7 +407,7 @@ impl BlockDiffusionDraftHead {
             self.head_dim as u32,
             self.rms_norm_eps,
             stream,
-        )?;
+        ))?;
         if layer_idx == 0 {
             dump_bf16("layer0.k_buf[ctx0].post_k_norm", self.scratch.k_buf, 10)?;
             let noise_q_offset = eff_ctx * q_dim as usize * bf16;
@@ -207,9 +423,12 @@ impl BlockDiffusionDraftHead {
                 10,
             )?;
         }
+        dump_layer_bin("q_post_norm", self.scratch.q_buf, n_attn as usize * q_dim as usize)?;
+        dump_layer_bin("k_post_norm", self.scratch.k_buf, n_attn as usize * kv_dim as usize)?;
+        dump_layer_bin("v_buf", self.scratch.v_buf, n_attn as usize * kv_dim as usize)?;
 
         // 3d. yarn RoPE — n_attn positions.
-        ops::rope_yarn(
+        kp!(rope_us, ops::rope_yarn(
             gpu,
             self.kernels.rope_qwen3,
             self.scratch.q_buf,
@@ -223,7 +442,7 @@ impl BlockDiffusionDraftHead {
             self.yarn_inv_freq,
             self.rope_theta,
             stream,
-        )?;
+        ))?;
         if layer_idx == 0 {
             let noise_q_offset = eff_ctx * q_dim as usize * bf16;
             let noise_k_offset = eff_ctx * kv_dim as usize * bf16;
@@ -239,26 +458,35 @@ impl BlockDiffusionDraftHead {
             )?;
             dump_bf16("layer0.k_buf[ctx0].post_rope", self.scratch.k_buf, 10)?;
         }
+        dump_layer_bin("q_post_rope", self.scratch.q_buf, n_attn as usize * q_dim as usize)?;
+        dump_layer_bin("k_post_rope", self.scratch.k_buf, n_attn as usize * kv_dim as usize)?;
 
-        // 3e. attention — q_len = kv_len = n_attn.
-        // Per-layer SWA + causal (vLLM PR #40898 dflash.py:410-447):
-        //  - `sliding_attention` layers (Qwen3.6-27B-DFlash idx 0..3):
-        //    causal=True, sliding_window=2048
-        //  - `full_attention` layer (idx 4): causal=False, window=0
-        // When `layer_window_sizes`/`layer_causal` are empty (older drafter
-        // without `layer_types`), fall back to non-causal full attention —
-        // matches the 3.5-era propose() codepath.
-        let layer_window = self
-            .layer_window_sizes
-            .get(layer_idx)
-            .copied()
-            .unwrap_or(0);
-        let layer_causal = self
-            .layer_causal
-            .get(layer_idx)
-            .copied()
-            .unwrap_or(false);
-        ops::prefill_attention(
+        // 3e. attention — per-layer SWA window + causal (vLLM PR #40898).
+        // sliding_attention layers: window=sliding_window (2048), causal=TRUE.
+        // full_attention layers:    window=0 (full attn),       causal=FALSE.
+        // Drafter is block-diffusion across γ noise tokens, but vLLM's
+        // dflash.py:424-433 specifically applies a causal sliding-window
+        // mask to sliding layers (the drafter was trained with this).
+        // The flag is wired from `from_weights.rs:280` (causals.push(is_sliding)).
+        // ATLAS_DFLASH_SWA=0 force-disables the per-layer window for A/B benchmarks.
+        let swa_on = dflash_swa_enabled();
+        let layer_window = if swa_on {
+            self.layer_window_sizes
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let layer_causal_b = if swa_on {
+            self.layer_causal
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        kp!(prefill_attn_us, ops::prefill_attention(
             gpu,
             self.kernels.prefill_attn,
             self.scratch.q_buf,
@@ -271,10 +499,15 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            layer_causal,
+            layer_causal_b,
             layer_window,
             stream,
-        )?;
+        ))?;
+        // Zero context rows in attn_out so garbage uniform scores from zeroed Q
+        // don't corrupt the residual stream through o_proj.
+        if eff_ctx > 0 {
+            gpu.memset(self.scratch.attn_out, 0, eff_ctx * q_dim as usize * bf16)?;
+        }
         if layer_idx == 0 {
             let noise_q_offset = eff_ctx * q_dim as usize * bf16;
             dump_bf16(
@@ -312,9 +545,10 @@ impl BlockDiffusionDraftHead {
                 );
             }
         }
+        dump_layer_bin("attn_out", self.scratch.attn_out, n_attn as usize * q_dim as usize)?;
 
         // 3f. o_proj.
-        ops::dense_gemm(
+        kp!(o_proj_us, ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
             self.scratch.attn_out,
@@ -324,7 +558,7 @@ impl BlockDiffusionDraftHead {
             h,
             q_dim,
             stream,
-        )?;
+        ))?;
         if layer_idx == 0 {
             let noise_offset = eff_ctx * self.hidden_size * bf16;
             dump_bf16(
@@ -350,16 +584,21 @@ impl BlockDiffusionDraftHead {
                     .map_err(|e| anyhow::anyhow!("write o_proj_out: {e}"))?;
             }
         }
+        dump_layer_bin(
+            "stream_acc_post_o_proj",
+            self.scratch.stream_acc,
+            n_attn as usize * h as usize,
+        )?;
 
         // 3g. residual: stream_buf += stream_acc (n_attn rows).
-        ops::residual_add(
+        kp!(resid1_us, ops::residual_add(
             gpu,
             self.kernels.residual_add,
             self.scratch.stream_buf,
             self.scratch.stream_acc,
             n_attn * h,
             stream,
-        )?;
+        ))?;
         if layer_idx == 0 {
             let noise_offset = eff_ctx * self.hidden_size * bf16;
             dump_bf16(
@@ -370,7 +609,7 @@ impl BlockDiffusionDraftHead {
         }
 
         // 3h. post_attention_layernorm.
-        ops::rms_norm(
+        kp!(post_norm_us, ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
             self.scratch.stream_buf,
@@ -380,10 +619,10 @@ impl BlockDiffusionDraftHead {
             h,
             self.rms_norm_eps,
             stream,
-        )?;
+        ))?;
 
         // 3i. MLP: gate + up.
-        ops::dense_gemm(
+        kp!(gate_up_us, ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
             self.scratch.norm_buf,
@@ -393,8 +632,8 @@ impl BlockDiffusionDraftHead {
             inter,
             h,
             stream,
-        )?;
-        ops::dense_gemm(
+        ))?;
+        kp!(gate_up_us, ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
             self.scratch.norm_buf,
@@ -404,10 +643,10 @@ impl BlockDiffusionDraftHead {
             inter,
             h,
             stream,
-        )?;
+        ))?;
 
         // 3j. silu_mul.
-        ops::silu_mul(
+        kp!(silu_mul_us, ops::silu_mul(
             gpu,
             self.kernels.silu_mul,
             self.scratch.mlp_intermediate,
@@ -415,10 +654,10 @@ impl BlockDiffusionDraftHead {
             self.scratch.mlp_intermediate,
             n_attn * inter,
             stream,
-        )?;
+        ))?;
 
         // 3k. down_proj.
-        ops::dense_gemm(
+        kp!(down_proj_us, ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
             self.scratch.mlp_intermediate,
@@ -428,17 +667,17 @@ impl BlockDiffusionDraftHead {
             h,
             inter,
             stream,
-        )?;
+        ))?;
 
         // 3l. residual.
-        ops::residual_add(
+        kp!(resid2_us, ops::residual_add(
             gpu,
             self.kernels.residual_add,
             self.scratch.stream_buf,
             self.scratch.stream_acc,
             n_attn * h,
             stream,
-        )?;
+        ))?;
         if layer_idx == 0 {
             let noise_offset = eff_ctx * self.hidden_size * bf16;
             dump_bf16(
@@ -447,6 +686,611 @@ impl BlockDiffusionDraftHead {
                 10,
             )?;
         }
+        dump_layer_bin(
+            "stream_buf_post_mlp",
+            self.scratch.stream_buf,
+            n_attn as usize * h as usize,
+        )?;
+
+        Ok(())
+    }
+
+    /// NVFP4 per-layer body — structurally identical to the BF16 path, but
+    /// every dense projection (q/k/v/o + gate/up/down) is dispatched through
+    /// `ops::w4a16_gemm` against a [`QuantizedWeight`]. Activations remain
+    /// BF16 in scratch buffers; the kernel reads BF16 input, dequantizes
+    /// the NVFP4 weight on-chip, and writes BF16 output. This is the same
+    /// kernel the target model uses for its prefill GEMMs, so we inherit
+    /// its ~7× throughput advantage over BF16 dense_gemm on GB10.
+    fn forward_block_layer_nvfp4(
+        &self,
+        layer: &DflashLayerNvfp4,
+        args: &LayerArgs,
+        ctx: &ForwardContext,
+        debug_dump: bool,
+        dstate: &mut super::DflashProposerState,
+        kprofile: bool,
+    ) -> Result<()> {
+        use crate::layers::ops;
+
+        let LayerArgs {
+            layer_idx,
+            n_attn,
+            eff_ctx,
+            h,
+            q_dim,
+            kv_dim,
+            inter,
+            bf16,
+            inv_sqrt_d,
+            stream,
+            needed_start,
+            window,
+        } = *args;
+        // Kernel profiler helper (NVFP4 path). Identical to BF16 helper.
+        macro_rules! kp {
+            ($field:ident, $body:expr) => {{
+                if kprofile {
+                    let t = std::time::Instant::now();
+                    let r = $body;
+                    ctx.gpu.synchronize(stream)?;
+                    let dt = t.elapsed().as_micros();
+                    super::kprof_add(|a| a.$field += dt);
+                    r
+                } else {
+                    $body
+                }
+            }};
+        }
+        let cache_k = dstate.ctx_k_cache[layer_idx];
+        let cache_v = dstate.ctx_v_cache[layer_idx];
+        let mut cache_k_start = dstate.cache_k_start[layer_idx];
+        let mut cache_k_end = dstate.cache_k_end[layer_idx];
+        let mut cache_v_start = dstate.cache_v_start[layer_idx];
+        let mut cache_v_end = dstate.cache_v_end[layer_idx];
+        let gpu = ctx.gpu;
+
+        let dump_bf16 = |label: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
+            if !debug_dump {
+                return Ok(());
+            }
+            let mut buf = vec![0u8; n * 2];
+            gpu.synchronize(stream)?;
+            gpu.copy_d2h(ptr, &mut buf)?;
+            let vals: Vec<f32> = buf
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect();
+            tracing::info!("DFLASH DUMP {label} [{n}]: {:?}", &vals);
+            Ok(())
+        };
+
+        // ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS=1: per-layer binary dumps to
+        // /tmp/atlas_layer{i}_{tag}.bin so the Python diff harness can
+        // compare element-wise against vLLM at every layer.
+        let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let _dump_layer_bin = |_tag: &str,
+                              _ptr: spark_runtime::gpu::DevicePtr,
+                              _n_elems: usize|
+         -> Result<()> {
+            // NVFP4 path: dumps not wired up yet (BF16 path is enough for
+            // first-divergence detection vs vLLM, which is BF16 too).
+            if !dump_all_layers {
+                return Ok(());
+            }
+            Ok(())
+        };
+
+        // 3a. input_layernorm. Identical to BF16 path.
+        kp!(input_norm_us, ops::rms_norm(
+            gpu,
+            self.kernels.rms_norm,
+            self.scratch.stream_buf,
+            &layer.input_layernorm,
+            self.scratch.norm_buf,
+            n_attn,
+            h,
+            self.rms_norm_eps,
+            stream,
+        ))?;
+
+        // 3b. Q projection for all n_attn tokens. When the drafter was built
+        // with ATLAS_DFLASH_ATTN_KGAMMA=1 and the transposed attention
+        // weights are present (q_proj_t / k_proj_t / v_proj_t / o_proj_t all
+        // Some), route through the M_TILE=16 specialization
+        // (w4a16_gemm_n128_m16) instead of the M_TILE=64 default. Mirrors
+        // the FFN-kgamma dispatch (see Step 3i below). Each branch is a
+        // straight 1:1 substitution — same scratch buffers, same (m, n, k)
+        // shape; only the kernel + weight layout swap.
+        let attn_kgamma_t = layer.q_proj_t.is_some()
+            && layer.k_proj_t.is_some()
+            && layer.v_proj_t.is_some()
+            && layer.o_proj_t.is_some()
+            && self.kernels.w4a16_gemm_t_m16.0 != 0;
+        if attn_kgamma_t {
+            let q_t = layer.q_proj_t.as_ref().unwrap();
+            kp!(q_proj_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.norm_buf,
+                q_t,
+                self.scratch.q_buf,
+                n_attn,
+                q_dim,
+                h,
+                stream,
+            ))?;
+        } else {
+            kp!(q_proj_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.norm_buf,
+                &layer.q_proj,
+                self.scratch.q_buf,
+                n_attn,
+                q_dim,
+                h,
+                stream,
+            ))?;
+        }
+        if eff_ctx > 0 {
+            gpu.memset(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16)?;
+        }
+
+        // 3b'. K/V projections with persistent context cache (NVFP4 path).
+        let needed_end = needed_start + eff_ctx;
+        let old_ctx_end = needed_end.min(cache_k_end).max(needed_start);
+        let old_ctx_count = old_ctx_end.saturating_sub(needed_start);
+        let new_ctx_count = eff_ctx.saturating_sub(old_ctx_count);
+
+        if eff_ctx > 0 {
+            if old_ctx_count > 0 {
+                kp!(kv_ctx_copy_us, self.cache_copy_range(
+                    gpu,
+                    cache_k,
+                    cache_k_start,
+                    cache_k_end,
+                    window,
+                    needed_start,
+                    old_ctx_end,
+                    self.scratch.k_buf,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+                kp!(kv_ctx_copy_us, self.cache_copy_range(
+                    gpu,
+                    cache_v,
+                    cache_v_start,
+                    cache_v_end,
+                    window,
+                    needed_start,
+                    old_ctx_end,
+                    self.scratch.v_buf,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+            }
+            if new_ctx_count > 0 {
+                let fc_offset = old_ctx_count * self.hidden_size * bf16;
+                let kv_offset = old_ctx_count * kv_dim as usize * bf16;
+                if attn_kgamma_t {
+                    let k_t = layer.k_proj_t.as_ref().unwrap();
+                    let v_t = layer.v_proj_t.as_ref().unwrap();
+                    kp!(kv_ctx_new_us, ops::w4a16_gemm_n128_m16(
+                        gpu,
+                        self.kernels.w4a16_gemm_t_m16,
+                        self.scratch.fc_proj.offset(fc_offset),
+                        k_t,
+                        self.scratch.k_buf.offset(kv_offset),
+                        new_ctx_count as u32,
+                        kv_dim,
+                        h,
+                        stream,
+                    ))?;
+                    kp!(kv_ctx_new_us, ops::w4a16_gemm_n128_m16(
+                        gpu,
+                        self.kernels.w4a16_gemm_t_m16,
+                        self.scratch.fc_proj.offset(fc_offset),
+                        v_t,
+                        self.scratch.v_buf.offset(kv_offset),
+                        new_ctx_count as u32,
+                        kv_dim,
+                        h,
+                        stream,
+                    ))?;
+                } else {
+                    kp!(kv_ctx_new_us, ops::w4a16_gemm(
+                        gpu,
+                        self.kernels.w4a16_gemm,
+                        self.scratch.fc_proj.offset(fc_offset),
+                        &layer.k_proj,
+                        self.scratch.k_buf.offset(kv_offset),
+                        new_ctx_count as u32,
+                        kv_dim,
+                        h,
+                        stream,
+                    ))?;
+                    kp!(kv_ctx_new_us, ops::w4a16_gemm(
+                        gpu,
+                        self.kernels.w4a16_gemm,
+                        self.scratch.fc_proj.offset(fc_offset),
+                        &layer.v_proj,
+                        self.scratch.v_buf.offset(kv_offset),
+                        new_ctx_count as u32,
+                        kv_dim,
+                        h,
+                        stream,
+                    ))?;
+                }
+                let (new_k_start, new_k_end) = kp!(cache_write_us, self.cache_write_range(
+                    gpu,
+                    self.scratch.k_buf.offset(kv_offset),
+                    needed_start + old_ctx_count,
+                    new_ctx_count,
+                    cache_k,
+                    cache_k_start,
+                    cache_k_end,
+                    window,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+                cache_k_start = new_k_start;
+                cache_k_end = new_k_end;
+                let (new_v_start, new_v_end) = kp!(cache_write_us, self.cache_write_range(
+                    gpu,
+                    self.scratch.v_buf.offset(kv_offset),
+                    needed_start + old_ctx_count,
+                    new_ctx_count,
+                    cache_v,
+                    cache_v_start,
+                    cache_v_end,
+                    window,
+                    kv_dim as usize * bf16,
+                    stream,
+                ))?;
+                cache_v_start = new_v_start;
+                cache_v_end = new_v_end;
+            }
+        }
+
+        // 4. K/V for noise tokens (γ+1 rows: 1 bonus + γ MASKs, vLLM PR #40898).
+        let noise_count = n_attn - eff_ctx as u32;
+        let noise_offset = eff_ctx * self.hidden_size * bf16;
+        let noise_kv_offset = eff_ctx * kv_dim as usize * bf16;
+        if attn_kgamma_t {
+            let k_t = layer.k_proj_t.as_ref().unwrap();
+            let v_t = layer.v_proj_t.as_ref().unwrap();
+            kp!(kv_noise_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.norm_buf.offset(noise_offset),
+                k_t,
+                self.scratch.k_buf.offset(noise_kv_offset),
+                noise_count,
+                kv_dim,
+                h,
+                stream,
+            ))?;
+            kp!(kv_noise_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.norm_buf.offset(noise_offset),
+                v_t,
+                self.scratch.v_buf.offset(noise_kv_offset),
+                noise_count,
+                kv_dim,
+                h,
+                stream,
+            ))?;
+        } else {
+            kp!(kv_noise_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.norm_buf.offset(noise_offset),
+                &layer.k_proj,
+                self.scratch.k_buf.offset(noise_kv_offset),
+                noise_count,
+                kv_dim,
+                h,
+                stream,
+            ))?;
+            kp!(kv_noise_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.norm_buf.offset(noise_offset),
+                &layer.v_proj,
+                self.scratch.v_buf.offset(noise_kv_offset),
+                noise_count,
+                kv_dim,
+                h,
+                stream,
+            ))?;
+        }
+
+        // Store updated cache ranges back into proposer state (NVFP4 path).
+        dstate.cache_k_start[layer_idx] = cache_k_start;
+        dstate.cache_k_end[layer_idx] = cache_k_end;
+        dstate.cache_v_start[layer_idx] = cache_v_start;
+        dstate.cache_v_end[layer_idx] = cache_v_end;
+
+        // 3c. q_norm / k_norm — RMSNorm reads BF16 weight, ignores quant.
+        kp!(qk_norm_us, ops::rms_norm(
+            gpu,
+            self.kernels.rms_norm,
+            self.scratch.q_buf,
+            &layer.q_norm,
+            self.scratch.q_buf,
+            n_attn * self.num_q_heads as u32,
+            self.head_dim as u32,
+            self.rms_norm_eps,
+            stream,
+        ))?;
+        kp!(qk_norm_us, ops::rms_norm(
+            gpu,
+            self.kernels.rms_norm,
+            self.scratch.k_buf,
+            &layer.k_norm,
+            self.scratch.k_buf,
+            n_attn * self.num_kv_heads as u32,
+            self.head_dim as u32,
+            self.rms_norm_eps,
+            stream,
+        ))?;
+
+        // 3d. yarn RoPE.
+        kp!(rope_us, ops::rope_yarn(
+            gpu,
+            self.kernels.rope_qwen3,
+            self.scratch.q_buf,
+            self.scratch.k_buf,
+            self.scratch.position_ids,
+            n_attn,
+            self.num_q_heads as u32,
+            self.num_kv_heads as u32,
+            self.head_dim as u32,
+            self.rotary_dim as u32,
+            self.yarn_inv_freq,
+            self.rope_theta,
+            stream,
+        ))?;
+
+        // 3e. attention — per-layer SWA window + causal (vLLM PR #40898).
+        // ATLAS_DFLASH_SWA=0 force-disables the per-layer window for A/B benchmarks.
+        let swa_on = dflash_swa_enabled();
+        let layer_window = if swa_on {
+            self.layer_window_sizes
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let layer_causal_b = if swa_on {
+            self.layer_causal
+                .get(layer_idx)
+                .copied()
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        kp!(prefill_attn_us, ops::prefill_attention(
+            gpu,
+            self.kernels.prefill_attn,
+            self.scratch.q_buf,
+            self.scratch.k_buf,
+            self.scratch.v_buf,
+            self.scratch.attn_out,
+            n_attn,
+            1,
+            self.num_q_heads as u32,
+            self.num_kv_heads as u32,
+            self.head_dim as u32,
+            inv_sqrt_d,
+            layer_causal_b,
+            layer_window,
+            stream,
+        ))?;
+        // Zero context rows in attn_out so garbage uniform scores from zeroed Q
+        // don't corrupt the residual stream through o_proj.
+        if eff_ctx > 0 {
+            gpu.memset(self.scratch.attn_out, 0, eff_ctx * q_dim as usize * bf16)?;
+        }
+
+        // 3f. o_proj via NVFP4 W4A16 GEMM. N=h, K=q_dim.
+        //
+        // When ATLAS_DFLASH_ATTN_KGAMMA=1 (transposed o weights present),
+        // route through the M_TILE=16 specialization (w4a16_gemm_n128_m16),
+        // mirroring q/k/v_proj. Empirical paired KP (seed=42, "Count from
+        // 1 to 100", matched n_attn≈257-259):
+        //   * M_TILE=64 (w4a16_gemm):           o_proj=10.83ms total=105.9ms
+        //   * M_TILE=16 (w4a16_gemm_n128_m16):  o_proj= 3.89ms total=100.6ms
+        //   * Kernel-time savings 6.9ms in o_proj per propose
+        //   * End-to-end propose savings 5.3ms (~5% of propose)
+        // The earlier note that M_TILE=16 collapsed accept to <25% does
+        // not reproduce on the current build — likely fixed by the ctx
+        // zeroing at line 1102 (the same FFN gate/up at M=528 already
+        // run on M_TILE=16 with identical pre-zeroing semantics). Output
+        // is coherent and accept rates are comparable to or higher than
+        // the M_TILE=64 path across 18+ seed runs. Opt out with
+        // ATLAS_DFLASH_ATTN_KGAMMA_DISABLE_O=1 for bisection.
+        let disable_o = std::env::var("ATLAS_DFLASH_ATTN_KGAMMA_DISABLE_O")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if attn_kgamma_t && !disable_o {
+            let o_t = layer.o_proj_t.as_ref().unwrap();
+            kp!(o_proj_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.attn_out,
+                o_t,
+                self.scratch.stream_acc,
+                n_attn,
+                h,
+                q_dim,
+                stream,
+            ))?;
+        } else {
+            kp!(o_proj_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.attn_out,
+                &layer.o_proj,
+                self.scratch.stream_acc,
+                n_attn,
+                h,
+                q_dim,
+                stream,
+            ))?;
+        }
+
+        // 3g. residual.
+        kp!(resid1_us, ops::residual_add(
+            gpu,
+            self.kernels.residual_add,
+            self.scratch.stream_buf,
+            self.scratch.stream_acc,
+            n_attn * h,
+            stream,
+        ))?;
+
+        // 3h. post_attention_layernorm.
+        kp!(post_norm_us, ops::rms_norm(
+            gpu,
+            self.kernels.rms_norm,
+            self.scratch.stream_buf,
+            &layer.post_attention_layernorm,
+            self.scratch.norm_buf,
+            n_attn,
+            h,
+            self.rms_norm_eps,
+            stream,
+        ))?;
+
+        // 3i. MLP: gate + up via NVFP4. When the drafter was built with
+        // ATLAS_DFLASH_FFN_KGAMMA=1 and the transposed FFN weights are
+        // present (gate_proj_t / up_proj_t / down_proj_t all Some), route
+        // through the M_TILE=16 specialization (w4a16_gemm_n128_m16)
+        // instead of the M_TILE=64 default. At γ=16 the drafter forwards
+        // n_attn = ctx_window + γ+1 tokens through a single batched FFN
+        // per layer; only the γ+1 noise-block rows actually carry useful
+        // signal, but the GEMM operates on the full M=n_attn for layout
+        // reasons. M_TILE=64 discards 47/64 = 73% of accumulator writes;
+        // the M_TILE=16 variant redesigns warp partitioning so all 4
+        // warps share the same 16 rows across N sub-tiles (no waste).
+        let ffn_kgamma_t = layer.gate_proj_t.is_some()
+            && layer.up_proj_t.is_some()
+            && layer.down_proj_t.is_some()
+            && self.kernels.w4a16_gemm_t_m16.0 != 0;
+        if ffn_kgamma_t {
+            let gate_t = layer.gate_proj_t.as_ref().unwrap();
+            let up_t = layer.up_proj_t.as_ref().unwrap();
+            kp!(gate_up_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.norm_buf,
+                gate_t,
+                self.scratch.mlp_intermediate,
+                n_attn,
+                inter,
+                h,
+                stream,
+            ))?;
+            kp!(gate_up_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.norm_buf,
+                up_t,
+                self.scratch.mlp_up,
+                n_attn,
+                inter,
+                h,
+                stream,
+            ))?;
+        } else {
+            kp!(gate_up_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.norm_buf,
+                &layer.gate_proj,
+                self.scratch.mlp_intermediate,
+                n_attn,
+                inter,
+                h,
+                stream,
+            ))?;
+            kp!(gate_up_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.norm_buf,
+                &layer.up_proj,
+                self.scratch.mlp_up,
+                n_attn,
+                inter,
+                h,
+                stream,
+            ))?;
+        }
+
+        // 3j. silu_mul.
+        kp!(silu_mul_us, ops::silu_mul(
+            gpu,
+            self.kernels.silu_mul,
+            self.scratch.mlp_intermediate,
+            self.scratch.mlp_up,
+            self.scratch.mlp_intermediate,
+            n_attn * inter,
+            stream,
+        ))?;
+
+        // 3k. down_proj via NVFP4 — route through M_TILE=16 when
+        // ATLAS_DFLASH_FFN_KGAMMA=1 (see gate/up branch above for the
+        // rationale on M_TILE=16 vs M_TILE=64).
+        if ffn_kgamma_t {
+            let down_t = layer.down_proj_t.as_ref().unwrap();
+            kp!(down_proj_us, ops::w4a16_gemm_n128_m16(
+                gpu,
+                self.kernels.w4a16_gemm_t_m16,
+                self.scratch.mlp_intermediate,
+                down_t,
+                self.scratch.stream_acc,
+                n_attn,
+                h,
+                inter,
+                stream,
+            ))?;
+        } else {
+            kp!(down_proj_us, ops::w4a16_gemm(
+                gpu,
+                self.kernels.w4a16_gemm,
+                self.scratch.mlp_intermediate,
+                &layer.down_proj,
+                self.scratch.stream_acc,
+                n_attn,
+                h,
+                inter,
+                stream,
+            ))?;
+        }
+
+        // 3l. residual.
+        kp!(resid2_us, ops::residual_add(
+            gpu,
+            self.kernels.residual_add,
+            self.scratch.stream_buf,
+            self.scratch.stream_acc,
+            n_attn * h,
+            stream,
+        ))?;
+
+        // Debug breadcrumb (cheap when debug_dump=false).
+        let _ = (layer_idx, dump_bf16, bf16);
 
         Ok(())
     }

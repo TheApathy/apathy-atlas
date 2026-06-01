@@ -49,7 +49,24 @@ echo "[serve-aeon-27b-dflash] preflight ok: ${FREE_GB} GB free"
 # becomes `correct_first_token + !!!!!`. Confirmed via 64-layer HF reference
 # (modelforge inspect-batched) — atlas_kgamma_layer0_pos13..15 = NaN at
 # DRAFT_CAP=15 but pos0..16 all valid at DRAFT_CAP=16.
-export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-16}
+# EMPIRICAL 2026-05-17 (post shrink-noise fix): γ=2 (K=3 verify) is the
+# robust sweet spot for mixed workloads — 5.4 tok/s mean across
+# counting/fibonacci/capital/haiku vs γ=4's 4.5 mean. K=3 hits the proven
+# 88ms graphed verify path. After moving DRAFT_CAP enforcement INSIDE
+# forward_block.rs (shrink the noise block to γ_eff+1 instead of full γ
+# noise + post-filter), drafter latency scales with γ_eff so smaller γ
+# now actually translates to lower per-step wall.
+#
+# Tradeoff: γ=4 still wins on counting alone (7.76 vs 5.64) due to longer
+# accepted runs on structured prompts. Switch to DRAFT_CAP=4 for
+# counting-heavy / code-gen workloads. γ=2 wins on creative/QA/fibonacci.
+# Container's 97 tok/s counting remains out of reach without K=γ kernel
+# rewrite (DUET-style state-stationary SSM dataflow).
+#
+# γ=16 (original published default) is preserved by setting
+# DRAFT_CAP=16 explicitly — only useful when running the gdn_wy17_k
+# fused safe path matters more than throughput.
+export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-32}
 export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-512}
 export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
 
@@ -59,12 +76,10 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --port 8890 \
   --kernel-target qwen3.6-27b \
   --gpu-memory-utilization 0.65 \
-  --kv-cache-dtype turbo4 \
-  --kv-high-precision-layers auto \
+  --kv-cache-dtype fp8 \
   --max-seq-len 8192 \
   --max-batch-size 1 \
   --max-num-seqs 1 \
-  --enable-prefix-caching \
   --dflash \
   --draft-model /home/flocka/models/z-lab-Qwen3.6-27B-DFlash \
   --dflash-gamma 16 \

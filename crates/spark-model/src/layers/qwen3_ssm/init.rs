@@ -44,9 +44,24 @@ impl Qwen3SsmLayer {
             gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
             gated_rms_norm_f32_k: super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input"),
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            // Optional K=3 batched BA-proj GEMV. Built into the common
+            // nvfp4/dense_gemv_bf16.cu so every target picks it up, but
+            // use `try_kernel` for safety — older PTX bundles or future
+            // model dirs that shadow `gemv` may not include it.
+            dense_gemv_batch3_k: super::super::try_kernel(gpu, "gemv", "dense_gemv_bf16_batch3"),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
             w4a16_gemv_qkvz_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qkvz")?,
+            fused_rms_qkvz_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_fused",
+                "rms_norm_residual_w4a16_gemv",
+            ),
+            fused_rms_qkvz_batch3_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_fused",
+                "rms_norm_residual_w4a16_gemv_batch3",
+            ),
             deinterleave_k: gpu.kernel("ssm_preprocess", "deinterleave_qkvz")?,
             conv1d_k: gpu.kernel("causal_conv1d", "causal_conv1d_update")?,
             conv1d_l2norm_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_l2norm")?,
@@ -88,6 +103,9 @@ impl Qwen3SsmLayer {
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            // Optional small-M variant (qwen3.6-27b only). Use try_kernel so
+            // generic builds without the kernel still link cleanly.
+            w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gdn_prefill_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_prefill")?,
@@ -111,6 +129,43 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_prefill_wy64",
             ),
             compute_gdn_gates_k: gpu.kernel("ssm_preprocess", "compute_gdn_gates")?,
+            // ── Multi-seq state-advance kernels (ATLAS_SSM_MULTI_SEQ_KERNEL=1) ──
+            // Three new kernels collapse the per-seq SSM state loop into ONE
+            // launch each, advancing c independent sequences in parallel and
+            // saturating the 48-SM GB10 at c >= 2 (vs single-seq launches
+            // that touch 32 SMs and serialize across c). All three are
+            // `try_kernel` so older PTX bundles cleanly fall back to the
+            // per-seq path.
+            conv1d_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d_multi_seq",
+                "causal_conv1d_update_multi_seq",
+            ),
+            conv1d_l2norm_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d_multi_seq",
+                "causal_conv1d_update_l2norm_multi_seq",
+            ),
+            gdn_decode_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_multi_seq",
+                "gated_delta_rule_decode_multi_seq",
+            ),
+            compute_gdn_gates_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "ssm_preprocess_multi_seq",
+                "compute_gdn_gates_multi_seq",
+            ),
+            // Per-layer scratch for the 2 × c × 8-byte per-seq state ptr
+            // arrays uploaded before each multi-seq launch. Cap at 32 seqs
+            // (well above the practical concurrent-decode batch size on
+            // GB10 — 36 SSM layers × 512 bytes = 18 KB total budget).
+            ssm_multi_seq_ptr_scratch: {
+                const MAX_C: usize = 32;
+                let bytes = 2 * MAX_C * 8;
+                gpu.alloc(bytes)?
+            },
+            ssm_multi_seq_ptr_max: 32,
             ba_gates_prefill_k: gpu.kernel("ssm_preprocess", "dense_gemm_ba_gates_prefill")?,
             conv1d_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
             gdn_chunk2_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk2")?,
@@ -127,6 +182,32 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy17",
                 "gated_delta_rule_wy17",
             ),
+            // M8A: tree-aware GDN kernel (gated_delta_rule_tree.cu). Sequential
+            // per-token loop with parent_ids state load — enables non-flat
+            // DDTree branches. NULL on targets that haven't compiled the
+            // kernel (gated_delta_rule_tree.cu must exist in their nvfp4/).
+            gdn_tree_k: {
+                let k = super::super::try_kernel(
+                    gpu,
+                    "gated_delta_rule_tree",
+                    "gated_delta_rule_tree",
+                );
+                tracing::info!("M8A: gdn_tree_k handle = {} (0 = NOT LOADED)", k.0);
+                k
+            },
+            // M8A v2: tree-aware WY-fused kernel. Bit-equivalent to wy17 on
+            // flat-chain payloads (same H_root reads, kd_flat reductions, WY
+            // correction algebra). For tree branches, walks ancestor chain
+            // per token. Preferred path when present.
+            gdn_tree_wy_k: {
+                let k = super::super::try_kernel(
+                    gpu,
+                    "gated_delta_rule_tree_wy",
+                    "gated_delta_rule_tree_wy",
+                );
+                tracing::info!("M8A v2: gdn_tree_wy_k handle = {} (0 = NOT LOADED)", k.0);
+                k
+            },
             h_state_bytes: nv * vd * kd * 4, // FP32 [nv, kd, vd] transposed for coalescing
             conv_state_bytes: conv_dim * d_conv * 4, // FP32 [conv_dim, d_conv]
             qkvz_fp8: None,

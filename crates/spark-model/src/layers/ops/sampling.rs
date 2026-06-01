@@ -63,6 +63,44 @@ pub fn embed_from_argmax(
         .launch(stream)
 }
 
+/// GPU-side top-K over BF16 logits, batched across rows.
+///
+/// For each of `num_rows` rows, finds the top-`k` BF16 logits and writes
+/// the resulting `(token_id, logit_value)` pairs sorted by logit descending.
+///
+/// Used by the DDTree (M4B v2) propose path to seed branch candidates per
+/// MASK-position drafter output. K=8 is the common case; the kernel caps at
+/// MAX_TOP_K=16 compile-time (silently truncates beyond).
+///
+/// Output layout (caller-allocated, both buffers row-major):
+///   - `top_indices`: `[num_rows, k]` u32  — token IDs
+///   - `top_logits` : `[num_rows, k]` f32  — raw BF16-→f32 logit values
+///
+/// Kernel: `topk_bf16(logits, top_indices, top_logits, num_rows, vocab, k)`
+/// Grid: (num_rows, 1, 1)  Block: (1024, 1, 1)
+pub fn topk_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    top_indices: DevicePtr,
+    top_logits: DevicePtr,
+    num_rows: u32,
+    vocab: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_rows.max(1), 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(top_indices)
+        .arg_ptr(top_logits)
+        .arg_u32(num_rows)
+        .arg_u32(vocab)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Batched embedding: gather N rows from embedding table in one launch.
 ///
 /// Replaces N individual D2D copies with a single kernel.

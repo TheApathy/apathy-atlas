@@ -96,6 +96,10 @@ pub fn step_verify_k2(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
             return;
         }
+        if let Err(e) = model.save_hidden_for_dflash(v1, &mut a.seq, 0) {
+            tracing::error!("save_hidden_for_dflash(v1): {e:#}");
+            return;
+        }
         if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
@@ -147,6 +151,10 @@ pub fn step_verify_k2(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
 
         if let Err(e) = model.save_hidden_for_mtp(0, 0) {
             tracing::error!("save_hidden_for_mtp(0): {e:#}");
+            return;
+        }
+        if let Err(e) = model.save_hidden_for_dflash(v0, &mut a.seq, 0) {
+            tracing::error!("save_hidden_for_dflash(v0): {e:#}");
             return;
         }
         let t_propose = Instant::now();

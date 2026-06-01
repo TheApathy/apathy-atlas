@@ -96,33 +96,110 @@ impl Qwen3AttentionLayer {
             } else {
                 2usize
             };
-            for i in 0..n {
-                let hidden_i = hidden.offset(i * h * residual_elem);
-                let o_out_i = o_out.offset(i * h * bf16); // BF16 attn output
-                let residual_i = residual.offset(i * h * residual_elem);
-                let normed2 = fwd.buffers.norm_output().offset(i * h * bf16);
-                ops::residual_add_rms_norm(
+
+            // Batched K=γ FFN path: replaces the n GEMV calls (each
+            // re-reading ~134 MB of NVFP4 FFN weights) with 3 GEMMs at
+            // M=n that load each weight once. Gated by
+            // `ATLAS_FFN_KGAMMA_M16=1`; only available for dense FFN
+            // (MoE has its own batched path via forward_k3 / shared
+            // expert fused kernels). When the flag is off or the FFN
+            // is MoE, falls through to the original per-token loop.
+            //
+            // Threshold n > 3 (re-verified 2026-05-21): the n == 2 / n
+            // == 3 branches above own those cases via their fused
+            // batch kernels. For n >= 4 the w4a16_gemm_t_m16 (M_TILE=16)
+            // path is the fast option and was re-validated to produce
+            // coherent output across the full adaptive-truncate range
+            // {4..16}. A prior defensive gate `>= 16` was a workaround
+            // for a transient drafter/adaptive interaction that has
+            // since been resolved upstream; keeping it suppressed the
+            // fast kernel on truncated-γ verifies, costing the prose
+            // path 15-20 tok/s.
+            let try_kgamma =
+                n > 3 && crate::layers::ffn_kgamma_m16_enabled();
+            let used_kgamma = if try_kgamma {
+                // 1) Batched residual + norm for all n tokens. The
+                // single-token slice in the fallback loop reads
+                // residual_i / o_out_i / hidden_i per token; the
+                // batched variant processes a contiguous [n, h] slab
+                // identical to the n=2 / n=3 branches above.
+                let normed2_base = fwd.buffers.norm_output();
+                crate::kprof!(fwd.gpu, stream, "attn_ffn_kgamma_norm", {
+                    ops::residual_add_rms_norm(
+                        fwd.gpu,
+                        self.residual_add_rms_norm_k,
+                        hidden,
+                        o_out,
+                        &self.post_attn_norm,
+                        normed2_base,
+                        residual,
+                        n as u32,
+                        h as u32,
+                        eps,
+                        stream,
+                    )?;
+                    anyhow::Result::<()>::Ok(())
+                })?;
+                // 2) Batched FFN at M=n. Output lands in
+                // `ctx.buffers.moe_output()`.
+                let serviced = crate::kprof!(
                     fwd.gpu,
-                    self.residual_add_rms_norm_k,
-                    hidden_i,
-                    o_out_i,
-                    &self.post_attn_norm,
-                    normed2,
-                    residual_i,
-                    1,
-                    h as u32,
-                    eps,
                     stream,
+                    "attn_ffn_kgamma_dense",
+                    self.ffn.forward_kgamma(normed2_base, n as u32, fwd, stream)
                 )?;
-                let moe_out = self.ffn.forward(normed2, fwd, stream)?;
-                ops::residual_add(
-                    fwd.gpu,
-                    self.residual_add_k,
-                    hidden_i,
-                    moe_out,
-                    h as u32,
-                    stream,
-                )?;
+                if serviced {
+                    // 3) Batched residual add for all n*h elements.
+                    let moe_out = fwd.buffers.moe_output();
+                    crate::kprof!(fwd.gpu, stream, "attn_ffn_kgamma_resid", {
+                        ops::residual_add(
+                            fwd.gpu,
+                            self.residual_add_k,
+                            hidden,
+                            moe_out,
+                            (n * h) as u32,
+                            stream,
+                        )?;
+                        anyhow::Result::<()>::Ok(())
+                    })?;
+                }
+                serviced
+            } else {
+                false
+            };
+
+            if !used_kgamma {
+                crate::kprof!(fwd.gpu, stream, "attn_ffn_per_token_loop_n17", {
+                    for i in 0..n {
+                        let hidden_i = hidden.offset(i * h * residual_elem);
+                        let o_out_i = o_out.offset(i * h * bf16); // BF16 attn output
+                        let residual_i = residual.offset(i * h * residual_elem);
+                        let normed2 = fwd.buffers.norm_output().offset(i * h * bf16);
+                        ops::residual_add_rms_norm(
+                            fwd.gpu,
+                            self.residual_add_rms_norm_k,
+                            hidden_i,
+                            o_out_i,
+                            &self.post_attn_norm,
+                            normed2,
+                            residual_i,
+                            1,
+                            h as u32,
+                            eps,
+                            stream,
+                        )?;
+                        let moe_out = self.ffn.forward(normed2, fwd, stream)?;
+                        ops::residual_add(
+                            fwd.gpu,
+                            self.residual_add_k,
+                            hidden_i,
+                            moe_out,
+                            h as u32,
+                            stream,
+                        )?;
+                    }
+                    anyhow::Result::<()>::Ok(())
+                })?;
             }
         }
         Ok(())

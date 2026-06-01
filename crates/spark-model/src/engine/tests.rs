@@ -154,6 +154,9 @@ impl Model for MockModel {
             cached_prefix_tokens: 0,
             prompt_len: 0,
             disk_block_ids: Vec::new(),
+            mtp_lastk_host_buf: Vec::new(),
+            mtp_lastk_host_filled: 0,
+            mtp_lastk_end_abs: 0,
             disk_last_offloaded_per_layer: Vec::new(),
         })
     }

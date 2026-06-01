@@ -28,7 +28,7 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
-    pub(super) fn decode_dispatch(
+    pub(crate) fn decode_dispatch(
         &self,
         token: u32,
         seq: &mut SequenceState,
@@ -108,6 +108,8 @@ impl TransformerModel {
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            // ATLAS_DUMP_HIDDEN: keep eager mode so CPU sync dump stays safe.
+            && std::env::var("ATLAS_DUMP_HIDDEN").is_err()
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -134,6 +136,9 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.

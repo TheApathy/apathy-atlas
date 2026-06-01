@@ -395,6 +395,9 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         let prefill_ctx = ForwardContext {
@@ -405,6 +408,9 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: false,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

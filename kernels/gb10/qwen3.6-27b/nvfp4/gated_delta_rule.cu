@@ -92,7 +92,7 @@ gated_delta_rule_prefill(
         }
 
         float v_i = (float)value[(unsigned long long)t * v_stride + vh * v_dim + tid];
-        float g_t = fminf(fmaxf(gate[(unsigned long long)t * gb_stride + vh], 1e-6f), 1.0f - 1e-6f);
+        float g_t = fminf(fmaxf(gate[(unsigned long long)t * gb_stride + vh], 0.0f), 1.0f);
         float bt_t = beta[(unsigned long long)t * gb_stride + vh];
 
         // Pass 1: hk_dot = H_reg^T · k
@@ -270,7 +270,7 @@ gated_delta_rule_prefill_split(
         }
 
         float v_i  = (float)value[(unsigned long long)t * v_stride + vh * v_dim + tid];
-        float g_t  = fminf(fmaxf(gate[(unsigned long long)t * gb_stride + vh], 1e-6f), 1.0f - 1e-6f);
+        float g_t  = fminf(fmaxf(gate[(unsigned long long)t * gb_stride + vh], 0.0f), 1.0f);
         float bt_t = beta[(unsigned long long)t * gb_stride + vh];
 
         float hk0 = 0.0f, hk1 = 0.0f, hk2 = 0.0f, hk3 = 0.0f;
@@ -409,7 +409,7 @@ gated_delta_rule_prefill_split4(
         }
 
         float v_i  = (float)value[(unsigned long long)t * v_stride + vh * v_dim + tid];
-        float g_t  = fminf(fmaxf(gate[(unsigned long long)t * gb_stride + vh], 1e-6f), 1.0f - 1e-6f);
+        float g_t  = fminf(fmaxf(gate[(unsigned long long)t * gb_stride + vh], 0.0f), 1.0f);
         float bt_t = beta[(unsigned long long)t * gb_stride + vh];
 
         float hk0 = 0.0f, hk1 = 0.0f, hk2 = 0.0f, hk3 = 0.0f;
@@ -485,7 +485,7 @@ extern "C" __global__ void gated_delta_rule_decode(
     const float* q_ptr = query + (b * num_k_heads + kh) * k_dim;
     const float* k_ptr = key + (b * num_k_heads + kh) * k_dim;
     const float* v_ptr = value + (b * num_v_heads + vh) * v_dim;
-    const float g = fminf(fmaxf(gate[b * num_v_heads + vh], 1e-6f), 1.0f - 1e-6f);
+    const float g = fminf(fmaxf(gate[b * num_v_heads + vh], 0.0f), 1.0f);
     const float bt = beta[b * num_v_heads + vh];
     __shared__ float smem_k[128];
     __shared__ float smem_q[128];
@@ -545,7 +545,7 @@ extern "C" __global__ void gated_delta_rule_decode_f32(
     const float* q_ptr = query + (b * num_k_heads + kh) * k_dim;
     const float* k_ptr = key + (b * num_k_heads + kh) * k_dim;
     const float* v_ptr = value + (b * num_v_heads + vh) * v_dim;
-    const float g = fminf(fmaxf(gate[b * num_v_heads + vh], 1e-6f), 1.0f - 1e-6f);
+    const float g = fminf(fmaxf(gate[b * num_v_heads + vh], 0.0f), 1.0f);
     const float bt = beta[b * num_v_heads + vh];
     __shared__ float smem_k[128];
     __shared__ float smem_q[128];
@@ -610,11 +610,11 @@ extern "C" __global__ void gated_delta_rule_chunk2(
     const __nv_bfloat16* q0=query+(b*2)*qk_stride+kh*k_dim;
     const __nv_bfloat16* k0=key+(b*2)*qk_stride+kh*k_dim;
     const __nv_bfloat16* v0=value+(b*2)*v_stride+vh*v_dim;
-    const float g0=fminf(fmaxf(gate[(b*2)*gb_stride+vh], 1e-6f), 1.0f - 1e-6f), bt0=beta[(b*2)*gb_stride+vh];
+    const float g0=fminf(fmaxf(gate[(b*2)*gb_stride+vh], 0.0f), 1.0f), bt0=beta[(b*2)*gb_stride+vh];
     const __nv_bfloat16* q1=query+(b*2+1)*qk_stride+kh*k_dim;
     const __nv_bfloat16* k1=key+(b*2+1)*qk_stride+kh*k_dim;
     const __nv_bfloat16* v1=value+(b*2+1)*v_stride+vh*v_dim;
-    const float g1=fminf(fmaxf(gate[(b*2+1)*gb_stride+vh], 1e-6f), 1.0f - 1e-6f), bt1=beta[(b*2+1)*gb_stride+vh];
+    const float g1=fminf(fmaxf(gate[(b*2+1)*gb_stride+vh], 0.0f), 1.0f), bt1=beta[(b*2+1)*gb_stride+vh];
     __shared__ float sk0[128],sq0[128],sk1[128],sq1[128];
     if (tid<k_dim) {
         sk0[tid]=(float)k0[tid]; sq0[tid]=(float)q0[tid];
@@ -690,15 +690,15 @@ extern "C" __global__ void gated_delta_rule_chunk3(
     const __nv_bfloat16* q0=query+(b*3)*qk_stride+kh*k_dim;
     const __nv_bfloat16* k0=key+(b*3)*qk_stride+kh*k_dim;
     const __nv_bfloat16* v0=value+(b*3)*v_stride+vh*v_dim;
-    const float g0=fminf(fmaxf(gate[(b*3)*gb_stride+vh], 1e-6f), 1.0f - 1e-6f), bt0=beta[(b*3)*gb_stride+vh];
+    const float g0=fminf(fmaxf(gate[(b*3)*gb_stride+vh], 0.0f), 1.0f), bt0=beta[(b*3)*gb_stride+vh];
     const __nv_bfloat16* q1=query+(b*3+1)*qk_stride+kh*k_dim;
     const __nv_bfloat16* k1=key+(b*3+1)*qk_stride+kh*k_dim;
     const __nv_bfloat16* v1=value+(b*3+1)*v_stride+vh*v_dim;
-    const float g1=fminf(fmaxf(gate[(b*3+1)*gb_stride+vh], 1e-6f), 1.0f - 1e-6f), bt1=beta[(b*3+1)*gb_stride+vh];
+    const float g1=fminf(fmaxf(gate[(b*3+1)*gb_stride+vh], 0.0f), 1.0f), bt1=beta[(b*3+1)*gb_stride+vh];
     const __nv_bfloat16* q2=query+(b*3+2)*qk_stride+kh*k_dim;
     const __nv_bfloat16* k2=key+(b*3+2)*qk_stride+kh*k_dim;
     const __nv_bfloat16* v2=value+(b*3+2)*v_stride+vh*v_dim;
-    const float g2=fminf(fmaxf(gate[(b*3+2)*gb_stride+vh], 1e-6f), 1.0f - 1e-6f), bt2=beta[(b*3+2)*gb_stride+vh];
+    const float g2=fminf(fmaxf(gate[(b*3+2)*gb_stride+vh], 0.0f), 1.0f), bt2=beta[(b*3+2)*gb_stride+vh];
     __shared__ float sk0[128],sq0[128],sk1[128],sq1[128],sk2[128],sq2[128];
     if (tid<k_dim) {
         sk0[tid]=(float)k0[tid]; sq0[tid]=(float)q0[tid];

@@ -22,6 +22,11 @@ pub(super) struct MultiSeqCtx<'a> {
     pub n: usize,
     /// CUDA stream.
     pub stream: u64,
+    /// Largest `seq_len + 1` across the batch (count of KV positions the
+    /// longest sequence will attend over after the current token is written).
+    /// Used to scale split-K kernel partitioning under
+    /// `ATLAS_PAGED_DECODE_SPLITK`.
+    pub max_seq_len_host: u32,
 
     // Cached config / per-layer scalars.
     pub h: usize,
@@ -44,6 +49,7 @@ pub(super) struct MultiSeqCtx<'a> {
 }
 
 impl<'a> MultiSeqCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         layer: &Qwen3AttentionLayer,
         fwd: &'a ForwardContext<'a>,
@@ -52,6 +58,7 @@ impl<'a> MultiSeqCtx<'a> {
         n: usize,
         bs: u32,
         stream: u64,
+        max_seq_len_host: u32,
     ) -> Self {
         let h = fwd.config.hidden_size;
         let nq = layer
@@ -75,6 +82,7 @@ impl<'a> MultiSeqCtx<'a> {
             residual,
             n,
             stream,
+            max_seq_len_host,
             h,
             nq,
             nkv,

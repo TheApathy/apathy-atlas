@@ -18,11 +18,39 @@ use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::layer::ForwardContext;
 use crate::layers::MoeLayer;
+use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::layers::ops;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{
     DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight, quantize_to_fp8, quantize_to_nvfp4,
 };
+
+/// Returns true when `ATLAS_MTP_FP8_CALIB=1` is set in the process env.
+///
+/// Gates the MTP head's per-attention-layer FP8 KV-cache scale calibration.
+/// Default OFF after empirical A/B (2026-05-22): enabling calibration on
+/// Qwen3.6-27B/aeon-27b moved long-ctx accept 0.92→0.89 and short-ctx
+/// 1.83→1.81 (i.e., slightly worse), and tok/s 10.05→9.60 at 4K ctx and
+/// 29.77→29.44 at short ctx — the per-token `gpu.synchronize` inside
+/// `Fp8KvCalibration::observe` adds latency, and Qwen3.6-27B's MTP K/V
+/// magnitudes are well within the FP8 E4M3 [-448, 448] range at scale=1.0,
+/// so calibration changes precision without removing clipping. Kept as an
+/// opt-in (set `ATLAS_MTP_FP8_CALIB=1`) for models whose MTP K/V outputs
+/// genuinely exceed ±448 (e.g., Gemma-4 26B, Mistral families). Cached via
+/// `OnceLock`.
+pub(crate) fn mtp_fp8_calib_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_MTP_FP8_CALIB")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Number of warmup tokens before MTP FP8 KV scales are frozen.
+/// Mirrors the target attention layer's `MODEL.toml fp8_kv_calibration_tokens`
+/// default (256) since the MTP head sees the same hidden-state distribution.
+pub(crate) const MTP_FP8_WARMUP_TOKENS: usize = 256;
 
 /// MTP head weight precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +134,16 @@ pub struct MtpHead {
     moe_gate: DenseWeight,
     shared_expert_gate: DenseWeight,
 
+    // Dense MLP path (Qwen3.5/3.6 27B-class). When `is_dense_mlp == true`,
+    // the forward pass swaps the MoE block for a plain gate/up/down MLP
+    // built from `MtpDenseWeights`. Quantized to NVFP4 at construction so
+    // it shares the same w4a16_gemv kernel as the projections above.
+    is_dense_mlp: bool,
+    dense_mlp_gate: Option<QuantizedWeight>,
+    dense_mlp_up: Option<QuantizedWeight>,
+    dense_mlp_down: Option<QuantizedWeight>,
+    dense_mlp_intermediate: usize,
+
     // Precision mode
     quant: MtpQuantization,
 
@@ -119,6 +157,15 @@ pub struct MtpHead {
     // KV cache for MTP attention (1 layer, separate from target)
     kv_cache: Mutex<PagedKvCache>,
     attn_layer_idx: usize,
+
+    /// Per-MTP-layer FP8 KV cache scale calibration.
+    ///
+    /// `Some` when `ATLAS_MTP_FP8_CALIB=1` (default ON) and the cache is FP8.
+    /// Without calibration, MTP decode hardcodes `k_scale=v_scale=1.0`, which
+    /// causes FP8 dequantization error to compound across positions at long
+    /// context (4K+), dropping draft accept rate by ~50% (1.83 → 0.92
+    /// tokens/verify). Mirrors `Qwen3AttentionLayer::fp8_calibration`.
+    pub(super) fp8_calibration: Option<Fp8KvCalibration>,
 
     // Kernel handles (always needed)
     rms_norm_k: KernelHandle,
@@ -153,6 +200,19 @@ impl MtpHead {
     /// `parking_lot::Mutex` does not poison, so this can never fail.
     pub(crate) fn kv_cache_lock(&self) -> parking_lot::MutexGuard<'_, PagedKvCache> {
         self.kv_cache.lock()
+    }
+
+    /// Returns the effective FP8 K/V scales for the MTP attention layer.
+    ///
+    /// During warmup or when calibration is disabled, returns the bootstrap
+    /// scales from `Fp8KvCalibration::scales()` (currently 2.0/2.0 during
+    /// warmup). After warmup, returns the calibrated per-layer scales.
+    /// Without a calibration tracker, falls back to 1.0/1.0 (legacy behavior).
+    pub(super) fn effective_mtp_fp8_scales(&self) -> (f32, f32) {
+        match &self.fp8_calibration {
+            Some(cal) => cal.scales(),
+            None => (1.0, 1.0),
+        }
     }
 
     /// Dispatch GEMV to the appropriate kernel based on weight precision.
@@ -352,6 +412,22 @@ impl DraftProposer for MtpHead {
         }
         mtp_state.seq_len = 0;
         Ok(())
+    }
+
+    fn prefill_last_k(
+        &self,
+        tokens: &[u32],
+        target_hiddens: DevicePtr,
+        base_position: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let mtp_state = state
+            .as_any_mut()
+            .downcast_mut::<MtpProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("Invalid MTP proposer state"))?;
+        self.prefill_last_k_impl(tokens, target_hiddens, base_position, mtp_state, ctx, stream)
     }
 }
 

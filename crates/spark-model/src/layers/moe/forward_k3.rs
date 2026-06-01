@@ -84,6 +84,13 @@ impl MoeLayer {
             )?;
         }
 
+        // Phase 1 instrumentation: cross-token expert collision rate.
+        // Gated on `ATLAS_MOE_COLLISION_TRACE=1`; no-op otherwise.
+        // Skip during graph capture (stream sync is illegal then).
+        if !ctx.graph_capture {
+            super::collision_trace::sample(ctx.gpu, indices_dev, top_k, stream)?;
+        }
+
         // 3-5. Fused expert dispatch for 3 tokens
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
@@ -218,6 +225,42 @@ impl MoeLayer {
                 h,
                 inter,
                 top_k,
+                stream,
+            )?;
+        } else if !is_ep && self.k3_fused_gate_up_eligible() {
+            // ── NVFP4 fused gate+up path for K=3 (Alpha parity) ──
+            //
+            // Routes the K=3 verify step through the same
+            // `moe_w4a16_fused_gate_up_t_k64` kernel used by prefill:
+            // one launch covers BOTH gate and up via N-tile splitting
+            // (lower half → gate, upper half → up), reading each
+            // expert's quantised weights ONCE instead of twice.
+            //
+            // Pipeline mirrors `forward_prefill` (N=3):
+            //   sort-by-expert → fused gate+up GEMM → silu_mul →
+            //   grouped down GEMM → unpermute_reduce → shared expert
+            //   GEMV → moe_batched_blend.
+            //
+            // Gated behind `ATLAS_MOE_K3_FUSED_GATE_UP=1` AND the
+            // transposed weight tables being resident (full persistent
+            // transpose, NOT the lazy scratch path). Falls through to
+            // the existing batch3 path when any precondition fails.
+            self.forward_k3_fused_gate_up(
+                input,
+                router_in,
+                gate_logits,
+                indices_dev,
+                weights_dev,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                shared_down_out,
+                output,
+                h,
+                inter,
+                num_experts,
+                top_k,
+                ctx,
                 stream,
             )?;
         } else {

@@ -216,6 +216,11 @@ impl Qwen3AttentionLayer {
                 "rope_mrope_interleaved",
                 "rope_forward_mrope_interleaved",
             ),
+            rope_strided_b3_k: super::super::try_kernel(
+                gpu,
+                "rope",
+                "rope_forward_strided_b3",
+            ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
@@ -317,6 +322,35 @@ impl Qwen3AttentionLayer {
                 "gemm_splitk",
                 "dense_gemm_splitk_reduce",
             ),
+            // NVFP4×NVFP4 GEMM + split-K kernels for K/V projection
+            // small-shape acceleration (gated by `ATLAS_QKV_SPLITK=1`).
+            // All four handles must be non-zero for the gate to engage;
+            // `try_kernel` returns 0 on older PTX caches without these.
+            nvfp4_gemm_k: super::super::try_kernel(
+                gpu,
+                "nvfp4_cutlass",
+                "nvfp4_nvfp4_gemm_t_m64",
+            ),
+            nvfp4_gemm_splitk_k: super::super::try_kernel(
+                gpu,
+                "nvfp4_cutlass",
+                "nvfp4_nvfp4_gemm_t_m64_splitk",
+            ),
+            nvfp4_splitk_reduce_k: super::super::try_kernel(
+                gpu,
+                "nvfp4_cutlass",
+                "nvfp4_splitk_reduce",
+            ),
+            nvfp4_absmax_k: super::super::try_kernel(
+                gpu,
+                "quantize_nvfp4",
+                "nvfp4_global_absmax",
+            ),
+            nvfp4_quantize_k: super::super::try_kernel(
+                gpu,
+                "quantize_nvfp4",
+                "quantize_bf16_to_nvfp4",
+            ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
@@ -331,6 +365,77 @@ impl Qwen3AttentionLayer {
                 }
                 KvCacheDtype::Turbo3 | KvCacheDtype::Turbo4 | KvCacheDtype::Turbo8 => None,
                 _ => Some(gpu.kernel("paged_decode_fp8", "paged_decode_attn_reduce_fp8")?),
+            },
+            // K=γ FlashAttention-v2 fused kernel (NVFP4 + HDIM=256 only).
+            // Falls back to None for unsupported configs / missing PTX;
+            // gated by `ATLAS_FLASH_ATTN_KGAMMA=1` at the dispatch site.
+            paged_decode_kgamma_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            // VEC variant of the kgamma kernel: 16 warps/CTA + 2-position
+            // dequant batching. Gated by `ATLAS_KGAMMA_VECDEQUANT=1` at the
+            // dispatch site. `try_kernel` falls back to None for older PTX
+            // caches; the dispatch site then uses the baseline kgamma kernel.
+            paged_decode_kgamma_vec_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4_vec",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            // Split-K variant + reduce kernel for the kgamma path.
+            // Gated by `ATLAS_FLASH_ATTN_KGAMMA_SPLITK=1` at the dispatch
+            // site. `try_kernel` lets older PTX caches load with None and
+            // simply fall back to the single-CTA kgamma kernel.
+            paged_decode_kgamma_splitk_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4_splitk",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            paged_decode_kgamma_reduce_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_reduce_nvfp4",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            // FA2-grafted variant of the kgamma kernel: cp.async double-
+            // buffered KV tile staging in shared memory. Gated by
+            // `ATLAS_FA2_KGAMMA=1` at the dispatch site. `try_kernel`
+            // falls back to None for older PTX caches; the dispatch site
+            // then uses the VEC or baseline kgamma kernel.
+            paged_decode_kgamma_fa2_k: match kv_dtype {
+                KvCacheDtype::Nvfp4 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_nvfp4",
+                        "paged_decode_attn_kgamma_nvfp4_fa2",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
             },
             residual_add_k: if config.use_fp32_residual() {
                 gpu.kernel("norm", "f32_residual_add")
@@ -364,6 +469,23 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_qg_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch3")?,
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            // Strided variants (ATLAS_ATTN_QKV_FUSED=1). try_kernel so older
+            // builds without the kernel still load.
+            w4a16_gemv_qg_batch3_strided_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_qg_batch3_strided",
+            ),
+            w4a16_gemv_dual_batch3_strided_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_dual_batch3_strided",
+            ),
+            rms_norm_qk_batch3_k: super::super::try_kernel(
+                gpu,
+                "norm",
+                "rms_norm_qk_batch3",
+            ),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
@@ -378,6 +500,8 @@ impl Qwen3AttentionLayer {
                 "w4a16_v3",
                 "w4a16_gemm_t_m128_v3",
             ),
+            // Optional small-M (M≤32) variant; qwen3.6-27b shadow only.
+            w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             prefill_attn_k: gpu.kernel("inferspark_prefill", "inferspark_prefill")?,
             prefill_attn_512_k: super::super::try_kernel(

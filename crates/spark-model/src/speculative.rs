@@ -89,6 +89,58 @@ pub trait DraftProposer: Send + Sync {
         let _ = state;
         Ok(())
     }
+
+    /// DDTree M6: drain any pending tree payload built by the most recent
+    /// `propose()` call. Default returns `None` (flat MTP / ngram / flat
+    /// DFlash). DDTree-capable drafters override to return + clear the
+    /// payload stashed on per-seq state. Caller assigns to
+    /// `ActiveSeq.pending_tree_payload` for the next-step verifier.
+    fn take_pending_tree_payload(
+        &self,
+        state: &mut dyn ProposerState,
+    ) -> Option<crate::layers::DDTreePayload> {
+        let _ = state;
+        None
+    }
+
+    /// Sequentially populate the proposer's per-sequence KV cache for the last
+    /// `k` prompt-tail positions before the first decode step.
+    ///
+    /// Without this, MTP's self-attention starts with an empty KV cache and
+    /// predicts long-context drafts off zero historical context — empirically
+    /// drops draft accept rate 1.83 → 0.92 (target_seq=5085 vs mtp_seq=423 at
+    /// 4K prompt + 1K decode). Calling this after target prefill lets the
+    /// drafter see the recent prompt tail (where attention mass concentrates),
+    /// restoring most of the lost accept.
+    ///
+    /// # Arguments
+    /// * `tokens` — slice of `k` prompt token IDs at absolute positions
+    ///   `[base_position - k + 1 .. base_position]`. `tokens[i]` is the token
+    ///   at absolute position `base_position - k + 1 + i`.
+    /// * `target_hiddens` — device pointer to a contiguous BF16/FP32 buffer
+    ///   of shape `[k, hidden_size]`. Row `i` is the target's last-layer
+    ///   hidden state for the input token at the same absolute position as
+    ///   `tokens[i]`. The proposer reads `i`-th row as input to step `i`.
+    /// * `base_position` — absolute position of the LAST captured token
+    ///   (`prompt_len - 1`). Step `i` uses position `base_position - k + 2 + i`
+    ///   for RoPE (the position the proposer is predicting INTO).
+    /// * `state` — per-sequence proposer state; KV cache is grown in-place.
+    /// * `ctx` — shared forward context (buffers, gpu, config).
+    /// * `stream` — CUDA stream handle.
+    ///
+    /// Default: no-op (proposers without prefill support skip silently).
+    fn prefill_last_k(
+        &self,
+        tokens: &[u32],
+        target_hiddens: DevicePtr,
+        base_position: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (tokens, target_hiddens, base_position, state, ctx, stream);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

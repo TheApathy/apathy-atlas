@@ -107,6 +107,9 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // ── Phase 2: CUDA graph lookup / capture ──
@@ -116,8 +119,18 @@ impl TransformerModel {
             None
         };
 
+        // batch_decode_graphs is keyed by (sorted_slot_ids, padded_n) — see
+        // sequence.rs:159 and types.rs:190. This decoder forces use_graphs=false
+        // (multi-seq SSM state-pointer hazard), so this lookup never fires; the
+        // key still has to type-check.
+        let graph_key: (Vec<usize>, usize) = {
+            let mut slots: Vec<usize> = seqs.iter().map(|s| s.slot_idx).collect();
+            slots.sort_unstable();
+            (slots, padded_n)
+        };
+
         if let Some(ref graphs) = graphs
-            && let Some(&graph) = graphs.get(&padded_n)
+            && let Some(&graph) = graphs.get(&graph_key)
         {
             // Graph exists — replay (kernels use updated metadata + SSM pool addresses)
             if graph.0 != 0 {
@@ -285,7 +298,7 @@ impl TransformerModel {
                 if graph.0 != 0 {
                     tracing::info!("Captured CUDA graph for batch size {padded_n}");
                     if let Some(ref mut g) = graphs {
-                        g.insert(padded_n, graph);
+                        g.insert(graph_key.clone(), graph);
                     }
                     self.gpu.launch_graph(graph, stream)?;
                 }

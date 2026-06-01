@@ -300,7 +300,58 @@ impl Qwen3SsmLayer {
         let v_ptr = conv_out_buf.offset(key_dim * 2 * bf16);
         let gb_stride = (nv * 2) as u32;
 
-        if self.gdn_prefill_persistent_wy4_k.0 != 0 {
+        // GDN profile gate (env: ATLAS_GDN_PROFILE=1). Sync + Instant before kernel
+        // launch, paired with sync + record after.
+        let __gdn_prof = {
+            use std::sync::OnceLock;
+            static C: OnceLock<bool> = OnceLock::new();
+            *C.get_or_init(|| std::env::var("ATLAS_GDN_PROFILE").ok().as_deref() == Some("1"))
+        };
+        let __gdn_t = if __gdn_prof {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let __gdn_path: &'static str;
+
+        if std::env::var("ATLAS_GDN_PREFILL_TUNED").ok().as_deref() == Some("1")
+            && self.gdn_prefill_wy32_k.0 != 0
+            && k > 32
+        {
+            __gdn_path = "wy32_tuned";
+            // SMEM layout per kernel:
+            //   H[kd*vd]FP32 + smem_k[32*kd]BF16 + smem_q[32*kd]BF16
+            //   + smem_warp[4]FP32 + smem_kd[32*32]FP32
+            //   + smem_g[32]FP32 + smem_bt[32]FP32
+            // Round up to 256 B for alignment.
+            let smem_bytes = kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2
+                + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
+            let smem = (((smem_bytes + 255) / 256) * 256) as u32;
+            ops::gdn_prefill_persistent_smem(
+                ctx.gpu,
+                self.gdn_prefill_wy32_k,
+                ssm_state.h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gates_buf,
+                gates_buf.offset(nv * fp32),
+                gdn_out_buf,
+                1,
+                k,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                conv_dim as u32,
+                gb_stride,
+                smem,
+                stream,
+            )?;
+        } else if self.gdn_prefill_persistent_wy4_k.0 != 0 {
+            __gdn_path = "wy4";
             // WY4-persistent: H in shared memory, 4 tokens per iteration
             // smem = H[K_DIM*V_DIM] + 8*k/q buffers + warp sums + WY scalars
             let smem = (kd * vd * 4 + 8 * kd * 4 + 56) as u32;
@@ -327,6 +378,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if (256..=4096).contains(&k) && self.gdn_prefill_persistent_k.0 != 0 {
+            __gdn_path = "persistent";
             ops::gdn_prefill_persistent(
                 ctx.gpu,
                 self.gdn_prefill_persistent_k,
@@ -349,6 +401,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else {
+            __gdn_path = "split4";
             ops::gdn_prefill_split4(
                 ctx.gpu,
                 self.gdn_prefill_split4_k,
@@ -370,6 +423,12 @@ impl Qwen3SsmLayer {
                 gb_stride,
                 stream,
             )?;
+        }
+
+        if let Some(__t) = __gdn_t {
+            ctx.gpu.synchronize(stream)?;
+            let __ns = __t.elapsed().as_nanos() as u64;
+            tracing::info!("GDN_PROF call total={k} us={} path={}", __ns / 1000, __gdn_path);
         }
 
         prof!("gdn_prefill", t0);

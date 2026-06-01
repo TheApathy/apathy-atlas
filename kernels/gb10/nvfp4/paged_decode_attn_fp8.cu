@@ -75,7 +75,32 @@ extern "C" __global__ void paged_decode_attn_fp8(
     const float k_scale,
     const float v_scale,
     const unsigned int q_stride,              // query.stride(0) in elements
-    const unsigned long long cache_stride     // k_cache.stride(0) in elements (block-level stride)
+    const unsigned long long cache_stride,    // k_cache.stride(0) in elements (block-level stride)
+    // Optional tree-aware KV indirection (ATLAS_TREE_AWARE_ATTN). When
+    // `kv_indirection == nullptr`, behavior is identical to the pre-tree
+    // path. Otherwise positions in `[kv_indir_base..seq_lens[t])` are
+    // remapped via `actual_pos = kv_indir_base + kv_indirection[seq_idx*kv_indir_stride + (pos - kv_indir_base)]`.
+    //
+    // CUDA graph fix: `kv_indir_base` is read from a 1×i32 device buffer
+    // (`kv_indir_base_ptr`) instead of a kernel-launch immediate so the
+    // captured graph reads the fresh value on each replay. Host writes the
+    // current `seq.seq_len` to the buffer before launching. `nullptr` for
+    // legacy / non-tree paths (kernel ignores `kv_indir_base` when
+    // `kv_indirection == nullptr`).
+    const int* __restrict__ kv_indirection,
+    const int* __restrict__ kv_indir_base_ptr,
+    const unsigned int kv_indir_stride,
+    // ATLAS_TREE_KV_PACK fast path: pre-scattered ancestor KV pool. When
+    // `K_pack_pool != nullptr`, positions in `[kv_indir_base..seq_lens[t])`
+    // read from this contiguous scratch (one block per seq, BC=4 batched)
+    // instead of walking the indirection table. Layout matches the regular
+    // FP8 paged cache but with `block_size = pack_block_size`,
+    // `num_blocks = num_seqs`, identity block table. Linear context
+    // (`[0..kv_indir_base)`) still reads from `K_cache` via `block_tables`
+    // — both contributions feed the same online-softmax accumulator.
+    const __nv_fp8_storage_t* __restrict__ K_pack_pool,
+    const __nv_fp8_storage_t* __restrict__ V_pack_pool,
+    const unsigned int pack_block_size
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
@@ -88,6 +113,14 @@ extern "C" __global__ void paged_decode_attn_fp8(
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
 
+    // Load tree-window base position from device buffer (graph-safe).
+    // `kv_indir_base_ptr` is nullptr for legacy non-tree callers; in that
+    // case `kv_indir_base` is unused (gated by `kv_indirection == nullptr`).
+    // `volatile` to defeat any aggressive caching of the load — the value
+    // is updated each step via cuMemcpyHtoDAsync before launch.
+    const unsigned int kv_indir_base = (kv_indir_base_ptr != nullptr)
+        ? (unsigned int)(*((const volatile int*)kv_indir_base_ptr)) : 0u;
+
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa_ratio;
     // FP8: each lane covers 8 elements, but byte offset = lane_id * 8
@@ -96,6 +129,7 @@ extern "C" __global__ void paged_decode_attn_fp8(
     const unsigned int vec_offset_fp8 = lane_id * VEC_BF16;   // FP8 element offset for K/V cache
 
     const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
+    const bool pack_active = (K_pack_pool != nullptr) && (V_pack_pool != nullptr);
 
     // Load Q (BF16, strided: Q may be a non-contiguous QKV split view)
     const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)seq_idx * q_stride
@@ -123,13 +157,204 @@ extern "C" __global__ void paged_decode_attn_fp8(
     // head_stride_kv (within-block) is always contiguous.
     unsigned long long head_stride_kv = (unsigned long long)num_kv_heads * head_dim;
 
+    // Tree-aware indirection (see kernel docstring).
+    const bool tree_active = (kv_indirection != nullptr);
+    const int* my_indir = tree_active
+        ? kv_indirection + (unsigned long long)seq_idx * kv_indir_stride
+        : nullptr;
+
     unsigned int pos = my_start;
     while (pos < my_end) {
+        // ── ATLAS_TREE_KV_PACK fast path ──
+        // When `pack_active`, the tree-window slots have been pre-scattered
+        // into a contiguous per-seq block in `K_pack_pool` / `V_pack_pool`
+        // with `block_size = pack_block_size`, `num_blocks = num_seqs`, and
+        // implicit identity block table. Read BC=4 from the pack pool —
+        // no indirection lookups, no block_table walk per position.
+        if (pack_active && pos >= kv_indir_base) {
+            unsigned int local_off = pos - kv_indir_base;
+            unsigned int remaining_total = my_end - pos;
+            unsigned int batch_count = remaining_total;
+            // Reads stay within the one pack block per seq (pack_block_size
+            // slots). Already guaranteed by seq_lens[t] ≤ kv_indir_base + pack_block_size.
+            const unsigned long long pack_block_stride =
+                (unsigned long long)pack_block_size * head_stride_kv;
+            const __nv_fp8_storage_t* k_pack_base = K_pack_pool
+                + (unsigned long long)seq_idx * pack_block_stride
+                + (unsigned long long)local_off * head_stride_kv
+                + (unsigned long long)kv_head * head_dim;
+            const __nv_fp8_storage_t* v_pack_base = V_pack_pool
+                + (unsigned long long)seq_idx * pack_block_stride
+                + (unsigned long long)local_off * head_stride_kv
+                + (unsigned long long)kv_head * head_dim;
+
+            unsigned int processed = 0;
+            unsigned int aligned_count = (batch_count / BC) * BC;
+            for (; processed < aligned_count; processed += BC) {
+                unsigned int k_packed[BC][VEC_U32_FP8];
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    const unsigned int* k32 = (const unsigned int*)(k_pack_base
+                        + (unsigned long long)(processed + b) * head_stride_kv + vec_offset_fp8);
+                    #pragma unroll
+                    for (int i = 0; i < VEC_U32_FP8; i++)
+                        k_packed[b][i] = k32[i];
+                }
+                float scores[BC];
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < VEC_U32_FP8; i++) {
+                        float k0, k1, k2, k3;
+                        unpack4_fp8(k_packed[b][i], k_scale, k0, k1, k2, k3);
+                        dot += q_reg[4*i]   * k0 + q_reg[4*i+1] * k1
+                             + q_reg[4*i+2] * k2 + q_reg[4*i+3] * k3;
+                    }
+                    #pragma unroll
+                    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                        dot += __shfl_xor_sync(0xffffffff, dot, offset);
+                    scores[b] = dot * inv_sqrt_d;
+                }
+                unsigned int v_packed[BC][VEC_U32_FP8];
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    const unsigned int* v32 = (const unsigned int*)(v_pack_base
+                        + (unsigned long long)(processed + b) * head_stride_kv + vec_offset_fp8);
+                    #pragma unroll
+                    for (int i = 0; i < VEC_U32_FP8; i++)
+                        v_packed[b][i] = v32[i];
+                }
+                float m_new = m;
+                #pragma unroll
+                for (int b = 0; b < BC; b++) m_new = fmaxf(m_new, scores[b]);
+                float exp_old = __expf(m - m_new);
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++) o_reg[i] *= exp_old;
+                l *= exp_old;
+                float exp_factors[BC];
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    exp_factors[b] = __expf(scores[b] - m_new);
+                    l += exp_factors[b];
+                }
+                m = m_new;
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    float ef = exp_factors[b];
+                    #pragma unroll
+                    for (int i = 0; i < VEC_U32_FP8; i++) {
+                        float v0, v1, v2, v3;
+                        unpack4_fp8(v_packed[b][i], v_scale, v0, v1, v2, v3);
+                        o_reg[4*i]   += ef * v0;
+                        o_reg[4*i+1] += ef * v1;
+                        o_reg[4*i+2] += ef * v2;
+                        o_reg[4*i+3] += ef * v3;
+                    }
+                }
+            }
+            // Remainder: single-position from pack pool (still no indirection).
+            for (; processed < batch_count; processed++) {
+                const unsigned int* k32 = (const unsigned int*)(k_pack_base
+                    + (unsigned long long)processed * head_stride_kv + vec_offset_fp8);
+                float dot = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < VEC_U32_FP8; i++) {
+                    float k0, k1, k2, k3;
+                    unpack4_fp8(k32[i], k_scale, k0, k1, k2, k3);
+                    dot += q_reg[4*i] * k0 + q_reg[4*i+1] * k1
+                         + q_reg[4*i+2] * k2 + q_reg[4*i+3] * k3;
+                }
+                #pragma unroll
+                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                    dot += __shfl_xor_sync(0xffffffff, dot, offset);
+                float score = dot * inv_sqrt_d;
+                float m_new = fmaxf(m, score);
+                float exp_old = __expf(m - m_new);
+                float exp_new = __expf(score - m_new);
+                l = l * exp_old + exp_new;
+                const unsigned int* v32 = (const unsigned int*)(v_pack_base
+                    + (unsigned long long)processed * head_stride_kv + vec_offset_fp8);
+                #pragma unroll
+                for (int i = 0; i < VEC_U32_FP8; i++) {
+                    float v0, v1, v2, v3;
+                    unpack4_fp8(v32[i], v_scale, v0, v1, v2, v3);
+                    o_reg[4*i]   = o_reg[4*i]   * exp_old + exp_new * v0;
+                    o_reg[4*i+1] = o_reg[4*i+1] * exp_old + exp_new * v1;
+                    o_reg[4*i+2] = o_reg[4*i+2] * exp_old + exp_new * v2;
+                    o_reg[4*i+3] = o_reg[4*i+3] * exp_old + exp_new * v3;
+                }
+                m = m_new;
+            }
+            pos += batch_count;
+            continue;
+        }
+
+        // Tree-window single-position fallback when active and past the base
+        // (only reached when pack_pool is NULL — i.e. ATLAS_TREE_AWARE_ATTN
+        // without ATLAS_TREE_KV_PACK).
+        if (tree_active && pos >= kv_indir_base) {
+            unsigned int local_off = pos - kv_indir_base;
+            int compact_idx = my_indir[local_off];
+            unsigned int actual_pos = kv_indir_base + (unsigned int)compact_idx;
+            unsigned int logical_block_t = actual_pos / block_size;
+            unsigned int block_offset_t = actual_pos % block_size;
+            unsigned int physical_block_t = (unsigned int)my_block_table[logical_block_t];
+            const __nv_fp8_storage_t* k_base_t = K_cache
+                + (unsigned long long)physical_block_t * cache_stride
+                + (unsigned long long)block_offset_t * head_stride_kv
+                + (unsigned long long)kv_head * head_dim;
+            const __nv_fp8_storage_t* v_base_t = V_cache
+                + (unsigned long long)physical_block_t * cache_stride
+                + (unsigned long long)block_offset_t * head_stride_kv
+                + (unsigned long long)kv_head * head_dim;
+
+            const unsigned int* k32 = (const unsigned int*)(k_base_t + vec_offset_fp8);
+            float dot = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < VEC_U32_FP8; i++) {
+                float k0, k1, k2, k3;
+                unpack4_fp8(k32[i], k_scale, k0, k1, k2, k3);
+                dot += q_reg[4*i] * k0 + q_reg[4*i+1] * k1
+                     + q_reg[4*i+2] * k2 + q_reg[4*i+3] * k3;
+            }
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                dot += __shfl_xor_sync(0xffffffff, dot, offset);
+
+            float score = dot * inv_sqrt_d;
+            float m_new = fmaxf(m, score);
+            float exp_old = __expf(m - m_new);
+            float exp_new = __expf(score - m_new);
+            l = l * exp_old + exp_new;
+
+            const unsigned int* v32 = (const unsigned int*)(v_base_t + vec_offset_fp8);
+            #pragma unroll
+            for (int i = 0; i < VEC_U32_FP8; i++) {
+                float v0, v1, v2, v3;
+                unpack4_fp8(v32[i], v_scale, v0, v1, v2, v3);
+                o_reg[4*i]   = o_reg[4*i]   * exp_old + exp_new * v0;
+                o_reg[4*i+1] = o_reg[4*i+1] * exp_old + exp_new * v1;
+                o_reg[4*i+2] = o_reg[4*i+2] * exp_old + exp_new * v2;
+                o_reg[4*i+3] = o_reg[4*i+3] * exp_old + exp_new * v3;
+            }
+            m = m_new;
+            pos += 1;
+            continue;
+        }
+
         unsigned int logical_block = pos / block_size;
         unsigned int block_offset = pos % block_size;
         unsigned int remaining_in_block = block_size - block_offset;
         unsigned int remaining_total = my_end - pos;
         unsigned int batch_count = remaining_in_block < remaining_total ? remaining_in_block : remaining_total;
+
+        // Don't bleed past kv_indir_base into the indirected window
+        // (slow fallback) or the packed window (pack_pool fast path).
+        if ((tree_active || pack_active) && pos < kv_indir_base) {
+            unsigned int remaining_to_base = kv_indir_base - pos;
+            if (batch_count > remaining_to_base) batch_count = remaining_to_base;
+        }
 
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
         const __nv_fp8_storage_t* k_block_base = K_cache + (unsigned long long)physical_block * cache_stride
@@ -337,7 +562,13 @@ extern "C" __global__ void paged_decode_attn_splitk_fp8(
     const float k_scale,
     const float v_scale,
     const unsigned int q_stride,              // query.stride(0) in elements
-    const unsigned long long cache_stride     // k_cache.stride(0) in elements (block-level stride)
+    const unsigned long long cache_stride,    // k_cache.stride(0) in elements (block-level stride)
+    // See `paged_decode_attn_fp8` for the indirection contract.
+    // `kv_indir_base_ptr` is a 1×i32 device buffer (graph-safe replacement
+    // for the prior scalar). Pass `nullptr` for legacy / non-tree paths.
+    const int* __restrict__ kv_indirection,
+    const int* __restrict__ kv_indir_base_ptr,
+    const unsigned int kv_indir_stride
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int split_id = blockIdx.y;
@@ -350,6 +581,10 @@ extern "C" __global__ void paged_decode_attn_splitk_fp8(
 
     const unsigned int seq_len = (unsigned int)seq_lens[seq_idx];
     if (seq_len == 0) return;
+
+    // Load tree-window base position from device buffer (graph-safe, volatile).
+    const unsigned int kv_indir_base = (kv_indir_base_ptr != nullptr)
+        ? (unsigned int)(*((const volatile int*)kv_indir_base_ptr)) : 0u;
 
     unsigned int split_size = (seq_len + num_splits - 1) / num_splits;
     unsigned int kv_start = split_id * split_size;
@@ -389,9 +624,21 @@ extern "C" __global__ void paged_decode_attn_splitk_fp8(
     // cache_stride (block-level) passed from host; head_stride_kv (within-block) always contiguous.
     unsigned long long head_stride_kv = (unsigned long long)num_kv_heads * head_dim;
 
+    // Tree-aware indirection (see paged_decode_attn_fp8 contract).
+    const bool tree_active = (kv_indirection != nullptr);
+    const int* my_indir = tree_active
+        ? kv_indirection + (unsigned long long)seq_idx * kv_indir_stride
+        : nullptr;
+
     for (unsigned int pos = my_start; pos < my_end; pos++) {
-        unsigned int logical_block = pos / block_size;
-        unsigned int block_offset = pos % block_size;
+        unsigned int actual_pos = pos;
+        if (tree_active && pos >= kv_indir_base) {
+            unsigned int local_off = pos - kv_indir_base;
+            int compact_idx = my_indir[local_off];
+            actual_pos = kv_indir_base + (unsigned int)compact_idx;
+        }
+        unsigned int logical_block = actual_pos / block_size;
+        unsigned int block_offset = actual_pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
         const unsigned int* k32 = (const unsigned int*)(K_cache

@@ -17,6 +17,8 @@ mod loaders_fp8;
 mod loaders_moe;
 #[path = "weight_map/loaders_mtp.rs"]
 mod loaders_mtp;
+#[path = "weight_map/loaders_mtp_dense.rs"]
+mod loaders_mtp_dense;
 #[path = "weight_map/model_a.rs"]
 mod model_a;
 #[path = "weight_map/model_b.rs"]
@@ -45,6 +47,7 @@ mod tests;
 pub use expert::*;
 pub use loaders_fp8::*;
 pub use loaders_mtp::*;
+pub use loaders_mtp_dense::*;
 pub use model_a::*;
 pub use moe::*;
 pub use nemotron::*;

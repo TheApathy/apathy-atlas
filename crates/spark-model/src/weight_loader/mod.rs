@@ -43,7 +43,7 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
 use crate::layers::VisionEncoder;
-use crate::weight_map::{DenseWeight, MtpWeights, Nvfp4Variant, detect_nvfp4_variant};
+use crate::weight_map::{DenseWeight, MtpDenseWeights, MtpWeights, Nvfp4Variant, detect_nvfp4_variant};
 
 /// Runtime quantization format for weight dispatch.
 ///
@@ -189,6 +189,23 @@ pub trait ModelWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>>;
+
+    /// Load *dense* MTP head weights for non-MoE models that ship an MTP
+    /// block (Qwen3.5/3.6 27B family, AEON-7 re-quants). Default returns
+    /// `None` so existing MoE loaders are untouched. Loaders that opt in
+    /// override this and forward to
+    /// [`crate::weight_map::load_mtp_dense`].
+    ///
+    /// `build_mtp_proposer` checks this method only when `load_mtp_weights`
+    /// returns `None`, so the two paths are mutually exclusive per model.
+    fn load_mtp_dense_weights(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<MtpDenseWeights>> {
+        Ok(None)
+    }
 
     /// Load MTP weights for multi-module MTP (DeepSeek-V3 / MiniMax-M2
     /// style: N independent transformer modules, each with its own

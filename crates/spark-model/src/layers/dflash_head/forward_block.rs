@@ -31,6 +31,23 @@ impl BlockDiffusionDraftHead {
         let inv_sqrt_d = 1.0f32 / (self.head_dim as f32).sqrt();
         let gpu = ctx.gpu;
 
+        // ── Kernel profiler (ATLAS_DFLASH_KERNEL_PROFILE=1) ──
+        // Lightweight per-phase timing using synchronize-and-Instant. Matches
+        // `qwen3_ssm/ssm_forward.rs:prof!` pattern. Aggregates per-kernel μs
+        // sums across all drafter layers via a thread-local accumulator,
+        // logged at the end of forward_block. Adds ~20μs/sync × ~14 syncs/layer
+        // when enabled — only use for measurement, not production.
+        let kprofile = std::env::var("ATLAS_DFLASH_KERNEL_PROFILE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let t_total = std::time::Instant::now();
+        if kprofile {
+            gpu.synchronize(stream)?;
+        }
+        let t_pre_layers = std::time::Instant::now();
+        super::kprof_reset_layers();
+
         // Determine effective ctx_len: capped by the configured ctx_window
         // and the accumulator's actual fill. Use the LAST `eff_ctx` ctx
         // positions (most recent) — drafter trained on locally recent
@@ -51,7 +68,23 @@ impl BlockDiffusionDraftHead {
         } else {
             (None, 0, 0)
         };
-        let n_attn = (eff_ctx + self.gamma) as u32;
+        // Noise block layout (vLLM PR #40898 alignment): (γ_eff+1) query
+        // tokens = 1 bonus (last_token) + γ_eff MASK rows. Drafts read from
+        // rows [1..γ_eff+1] → γ_eff drafts.
+        //
+        // γ_eff defaults to self.gamma (drafter config) but is capped by
+        // ATLAS_DFLASH_DRAFT_CAP when set. The cap previously only filtered
+        // the returned drafts AFTER the full γ forward — wasting drafter
+        // compute. Now the noise block itself shrinks to γ_eff+1 rows,
+        // cutting drafter forward latency proportionally (DUET/SpecKV-
+        // inspired: don't compute drafts that will be discarded).
+        let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(self.gamma);
+        let gamma_eff = cap.min(self.gamma).max(1);
+        let noise_count = gamma_eff + 1;
+        let n_attn = (eff_ctx + noise_count) as u32;
 
         // Zero all scratch buffers to eliminate non-determinism from
         // uninitialized memory (different GPU allocations may contain
@@ -254,6 +287,24 @@ impl BlockDiffusionDraftHead {
                         eff_ctx,
                     );
                 }
+                // Sibling metadata JSON so the Python reference can
+                // reconstruct the exact propose() inputs without parsing
+                // tracing output. Same one-shot guard as the binary.
+                let meta = format!(
+                    "{{\"last_token\":{},\"position\":{},\"eff_ctx\":{},\"ctx_total\":{},\"gamma\":{},\"mask_token_id\":{},\"hidden\":{},\"target_hidden_size\":{},\"n_target_layers\":{}}}",
+                    last_token,
+                    position,
+                    eff_ctx,
+                    ctx_total,
+                    self.gamma,
+                    self.mask_token_id,
+                    self.hidden_size,
+                    self.target_hidden_size,
+                    self.target_layer_ids.len(),
+                );
+                if let Err(e) = std::fs::write("/tmp/atlas_dump_meta.json", &meta) {
+                    tracing::warn!("DFLASH DUMP_FULL: meta write failed: {e}");
+                }
                 FULL_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Persistent fc_proj cache: copy old positions, compute new ones.
@@ -264,7 +315,10 @@ impl BlockDiffusionDraftHead {
                 .max(needed_start);
             let old_fc_count = old_fc_end.saturating_sub(needed_start);
             let new_fc_count = eff_ctx.saturating_sub(old_fc_count);
-            tracing::info!(
+            // PERF (2026-05-19): demoted from tracing::info! — fired on every
+            // propose() call (~80×/s during decode), drowning real diagnostics.
+            // Re-enable via RUST_LOG=spark_model::layers::dflash_head=debug.
+            tracing::debug!(
                 "DFlash fc_proj cache: needed=[{}..{}), cached=[{}..{}), old={}, new={}",
                 needed_start,
                 needed_start + eff_ctx,
@@ -368,7 +422,7 @@ impl BlockDiffusionDraftHead {
         let ctx_start = position.saturating_sub(eff_ctx);
         let pos_host: Vec<i32> = (0..eff_ctx)
             .map(|i| (ctx_start + i) as i32)
-            .chain((0..self.gamma).map(|i| (position + i) as i32))
+            .chain((0..noise_count).map(|i| (position + i) as i32))
             .collect();
         let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
         gpu.copy_h2d(&pos_bytes, self.scratch.position_ids)?;
@@ -404,13 +458,10 @@ impl BlockDiffusionDraftHead {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(self.mask_token_id);
-        // [eff_ctx zeros, last_token (bonus), mask_id × (γ-1)]
+        // [eff_ctx zeros, last_token (bonus), mask_id × γ_eff] = eff_ctx + 1 + γ_eff.
         let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
             .chain(std::iter::once(last_token as i32))
-            .chain(std::iter::repeat_n(
-                mask_id as i32,
-                self.gamma.saturating_sub(1),
-            ))
+            .chain(std::iter::repeat_n(mask_id as i32, gamma_eff))
             .collect();
         if debug_dump {
             tracing::info!(
@@ -477,6 +528,7 @@ impl BlockDiffusionDraftHead {
         // Per-layer flow follows `dflash.py:Qwen3DFlashDecoderLayer.forward`.
         // Body extracted to `forward_block_layer.rs` for the 500-LoC budget.
         let needed_start = ctx_total.saturating_sub(eff_ctx);
+        let t_layers = std::time::Instant::now();
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let args = super::forward_block_layer::LayerArgs {
                 layer_idx,
@@ -492,14 +544,22 @@ impl BlockDiffusionDraftHead {
                 needed_start,
                 window: self.ctx_window,
             };
-            self.forward_block_layer(layer, &args, ctx, debug_dump, dstate)?;
+            self.forward_block_layer(layer, &args, ctx, debug_dump, dstate, kprofile)?;
         }
         // Drop the original inline loop body — extracted to helper.
+        let layers_us = if kprofile {
+            gpu.synchronize(stream)?;
+            t_layers.elapsed().as_micros()
+        } else {
+            0
+        };
+        let t_tail = std::time::Instant::now();
 
-        // ── Step 4: final RMSNorm + LM head on noise rows only ──
-        // Skip ctx slots [0..eff_ctx] (their stream_buf is garbage from
-        // layer accumulation). Read from offset `eff_ctx * h * bf16`.
-        let noise_byte_offset = eff_ctx * self.hidden_size * bf16;
+        // ── Step 4: final RMSNorm + LM head on MASK rows only ──
+        // Skip ctx slots [0..eff_ctx] (garbage) AND the bonus row at
+        // slot eff_ctx (untrained for prediction output). Read γ MASK
+        // rows starting at offset `(eff_ctx + 1) * h * bf16`.
+        let noise_byte_offset = (eff_ctx + 1) * self.hidden_size * bf16;
         let stream_noise = self.scratch.stream_buf.offset(noise_byte_offset);
         let norm_noise = self.scratch.norm_buf.offset(noise_byte_offset);
         ops::rms_norm(
@@ -508,7 +568,7 @@ impl BlockDiffusionDraftHead {
             stream_noise,
             &self.norm,
             norm_noise,
-            self.gamma as u32,
+            gamma_eff as u32,
             h,
             self.rms_norm_eps,
             stream,
@@ -516,6 +576,13 @@ impl BlockDiffusionDraftHead {
         // Capped vocab: the shared lm_head may have fewer rows than the
         // drafter's vocab_size (e.g. target capped 248320→248077).
         let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
+        // PERF NOTE (2026-05-19): tried switching to `dense_gemm_tc` here —
+        // the shape (M=γ_eff≤16, N=vocab=248k, K=2048) looks ideal for the
+        // tensor-core kernel (M_TILE=16, m16n8k16 MMA). But A/B benchmark
+        // showed zero throughput change (8.70 vs 8.72 mean tok/s). The
+        // lm_head GEMM is bandwidth-bound on weight read (~1GB at 273GB/s
+        // ≈ 4ms) — TC compute doesn't shrink the floor. Left as scalar
+        // dense_gemm to keep the dispatch simple.
         ops::dense_gemm(
             gpu,
             self.kernels.dense_gemm,
@@ -524,7 +591,7 @@ impl BlockDiffusionDraftHead {
                 weight: self.lm_head_shared,
             },
             self.scratch.logits,
-            self.gamma as u32,
+            gamma_eff as u32,
             lm_vocab,
             h,
             stream,
@@ -556,10 +623,10 @@ impl BlockDiffusionDraftHead {
             }
         }
 
-        // ── Step 5: argmax per row → γ token ids ──
+        // ── Step 5: argmax per row → γ_eff token ids ──
         let argmax_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
         let lm_stride = self.target_vocab_size.min(self.vocab_size);
-        for i in 0..self.gamma {
+        for i in 0..gamma_eff {
             let logits_row = self.scratch.logits.offset(i * lm_stride * bf16);
             let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
             ops::argmax_bf16(
@@ -586,14 +653,228 @@ impl BlockDiffusionDraftHead {
             }
         }
 
-        // ── Step 6: D2H γ × 4 bytes ──
-        let mut host_buf = vec![0u8; self.gamma * 4];
+        // ── Step 5b: optional logit-margin gate (top-1 vs top-2) ──
+        //
+        // ATLAS_DFLASH_MARGIN_GATE=<float>  (default 0.0 = disabled)
+        //   When > 0, runs top-K=2 on the same logits and replaces the draft
+        //   token at any row whose (logit_top1 - logit_top2) margin is below
+        //   the threshold with `mask_token_id`. Mask is guaranteed to mismatch
+        //   the target's argmax → forces the chain to terminate at the first
+        //   low-confidence draft. The drafter is essentially saying "I'm
+        //   guessing here" — passing the guess to target just to be rejected
+        //   wastes verify cycles. Truncating early lets the verifier emit a
+        //   bonus token (its own argmax) at the truncation point.
+        //
+        //   Recommended values: 0.3 (mild), 0.6 (aggressive), 1.0 (very strict).
+        //   BF16 logits are O(10-30) for top tokens so margins of 0.3-1.0 are
+        //   the meaningful range.
+        //
+        // ATLAS_DFLASH_ADAPTIVE_GAMMA=1  (default 0 = disabled)
+        //   Tracks a moving window of accept counts (last 8 verifies on the
+        //   sequence's DflashProposerState) and shrinks the effective draft
+        //   count to `clamp(mean + ADAPTIVE_SLACK, ADAPTIVE_MIN, gamma_eff)`.
+        //   Excess drafter positions get replaced with `mask_token_id` so the
+        //   verifier rejects them and stops the chain — same mechanism as the
+        //   margin gate. Saves verifier compute when the drafter is wasted.
+        //
+        // ATLAS_DFLASH_ADAPTIVE_MIN=<usize>  (default 4)
+        //   Lower bound for adaptive gamma. Below 4 the K=γ verify graph
+        //   doesn't cache well (too many distinct shapes).
+        //
+        // ATLAS_DFLASH_ADAPTIVE_SLACK=<usize>  (default 2)
+        //   Added to the rolling mean accept count to give the drafter a
+        //   little headroom past its recent average — accept rate is bursty.
+        let margin_gate: f32 = std::env::var("ATLAS_DFLASH_MARGIN_GATE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let adaptive_gamma = std::env::var("ATLAS_DFLASH_ADAPTIVE_GAMMA")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let adaptive_min: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let adaptive_slack: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_SLACK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        // ATLAS_DFLASH_ADAPTIVE_MAX=<usize> caps the adaptive cutoff so the
+        // K=γ verify graph never fires when its wall-time exceeds the
+        // throughput benefit. K=γ=16 verify on GB10 is ~2.8s/call vs
+        // K=γ=4's 421ms — at 38% accept (γ=16 prose), K=16 emits only
+        // ~7 tokens in 2.8s = 2.5 tok/s, dragging mean throughput far
+        // below the K=4 path. ADAPTIVE_MAX=4 hard-caps cutoff so the
+        // scheduler always lands on a faster verify graph. Default 0 =
+        // unbounded (legacy behavior, allows up to gamma_eff).
+        let adaptive_max: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // ATLAS_DFLASH_ADAPTIVE_PROBE_INTERVAL=<usize> (default 0 = off)
+        //   Every N adaptive-engaged steps, force cutoff = gamma_eff
+        //   (= no truncation, no masking from adaptive shrink) so the
+        //   verifier observes the TRUE accept ceiling for the current
+        //   context. Without this, adaptive truncate is self-limiting:
+        //   a low-accept burst on prose shrinks γ_eff, which fills
+        //   `accept_history` with small accept counts from the truncated
+        //   steps, which keeps the cutoff small forever — even after
+        //   the content turns predictable (counting, lists, repeating
+        //   structure). Periodic γ_max reprobes break the trap: if the
+        //   content is still hard, the reprobe step contributes one
+        //   small accept count and we truncate again next step; if the
+        //   content has become easy, the reprobe lands a long accept
+        //   chain and the moving mean climbs back. The probe step
+        //   itself bypasses both the adaptive shrink AND the
+        //   `ATLAS_DFLASH_ADAPTIVE_MAX` ceiling — its whole purpose is
+        //   to measure ceiling, not to be capped by one. Margin-gate
+        //   cuts still apply (those are per-step confidence signals
+        //   independent of history).
+        let adaptive_probe_interval: usize =
+            std::env::var("ATLAS_DFLASH_ADAPTIVE_PROBE_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+        // Run top-2 if the margin gate is active, so we have the second-best
+        // logit value per row. Cost: one extra kernel launch over the same
+        // logits buffer plus a γ_eff×2×4 byte D2H. Tiny vs the layer chain.
+        let margin_top2: Option<Vec<f32>> = if margin_gate > 0.0 {
+            let k_used = 2usize;
+            let used_bytes = gamma_eff * k_used * 4;
+            gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
+            gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
+            ops::topk_bf16(
+                gpu,
+                self.kernels.topk,
+                self.scratch.logits,
+                self.scratch.topk_tokens_dev,
+                self.scratch.topk_logits_dev,
+                gamma_eff as u32,
+                argmax_vocab,
+                k_used as u32,
+                stream,
+            )?;
+            gpu.synchronize(stream)?;
+            let mut logits_bytes = vec![0u8; used_bytes];
+            gpu.copy_d2h(self.scratch.topk_logits_dev, &mut logits_bytes)?;
+            let logits: Vec<f32> = logits_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Some(logits)
+        } else {
+            None
+        };
+
+        // ── Step 6: D2H γ_eff × 4 bytes ──
+        let mut host_buf = vec![0u8; gamma_eff * 4];
         gpu.synchronize(stream)?;
         gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf)?;
-        let drafts: Vec<u32> = host_buf
+        let mut drafts: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+
+        // Apply adaptive gamma + margin gate. Two behaviors are available
+        // via ATLAS_DFLASH_ADAPTIVE_MODE:
+        //   "mask"     (default): replace excess drafts with mask_token_id
+        //              and KEEP drafts.len() == gamma_eff. The verify kernel
+        //              still runs K=γ+1, the CUDA graph stays hot, and the
+        //              accept-prefix logic terminates at the first mask
+        //              position. Use this when the K=γ verify cost is fixed
+        //              and you only want to stop wasted ctx pollution.
+        //   "truncate": physically shorten the drafts vector to `cutoff`
+        //              entries. The dispatcher in mtp_step.rs then routes
+        //              to a smaller K verify path (K=2/3/4 graphed) when
+        //              drafts.len() < 4, or to eager K=cutoff+1 path. May
+        //              save substantial verify cycles when accept is low,
+        //              at the cost of dropping the K=γ CUDA graph cache.
+        //
+        // Replaced positions get `mask_token_id` which is guaranteed to
+        // mismatch the target's argmax → accept-prefix terminates at the
+        // first replacement (mask mode), or the truncation point (truncate
+        // mode — no replacement needed, the position just disappears).
+        let adaptive_mode = std::env::var("ATLAS_DFLASH_ADAPTIVE_MODE")
+            .unwrap_or_else(|_| "mask".to_string());
+        let truncate_mode = adaptive_mode == "truncate";
+        if adaptive_gamma || margin_gate > 0.0 {
+            let mask = self.mask_token_id;
+            // Bump the monotonic step counter once per adaptive-engaged call.
+            // Used below to decide whether this step is a γ_max reprobe.
+            dstate.propose_steps = dstate.propose_steps.wrapping_add(1);
+            // A "probe step" forces cutoff = gamma_eff so the verifier sees
+            // the true accept ceiling, bypassing both the history-mean shrink
+            // and the ATLAS_DFLASH_ADAPTIVE_MAX ceiling. Margin-gate cuts
+            // still apply later (per-step confidence, not history). We trigger
+            // a probe every `adaptive_probe_interval` adaptive-engaged steps;
+            // a value of 0 disables reprobing (legacy behavior). We also
+            // require `accept_history_count >= 4` so the warmup phase (where
+            // we're already running γ_max naturally) doesn't waste probes.
+            let is_probe_step = adaptive_probe_interval > 0
+                && dstate.accept_history_count >= 4
+                && dstate.propose_steps % adaptive_probe_interval == 0;
+            // Compute the adaptive cutoff (= number of drafts to keep as-is).
+            // gamma_eff is the post-cap drafter output size. cutoff <= gamma_eff.
+            let mut cutoff = gamma_eff;
+            if !is_probe_step && adaptive_gamma && dstate.accept_history_count >= 4 {
+                let n = dstate.accept_history_count.min(dstate.accept_history.len());
+                let sum: usize = dstate
+                    .accept_history
+                    .iter()
+                    .take(n)
+                    .map(|&v| v as usize)
+                    .sum();
+                let mean = sum / n; // integer mean is fine — we want conservative shrink
+                let target = (mean + adaptive_slack).max(adaptive_min);
+                cutoff = cutoff.min(target);
+            }
+            // Hard ceiling: K=γ=16 verify wall-time (2.8s/call on GB10) is
+            // a worse deal than K=γ=4 even at high accept rates. When
+            // ATLAS_DFLASH_ADAPTIVE_MAX > 0, never allow cutoff above it.
+            // Independent of accept_history — applies even on the first
+            // few calls (where history is still warming up). Skipped on
+            // probe steps so we can actually measure γ_max behavior.
+            if !is_probe_step && adaptive_max > 0 {
+                cutoff = cutoff.min(adaptive_max);
+            }
+            // Margin gate: walk drafts in order, replace with mask at the first
+            // low-confidence position (and all subsequent positions, since the
+            // chain terminates at the first reject anyway — no point computing
+            // attention for tokens we know will be discarded).
+            if let Some(ref logits) = margin_top2 {
+                for i in 0..gamma_eff {
+                    let base = i * 2;
+                    let top1 = logits[base];
+                    let top2 = logits[base + 1];
+                    let margin = top1 - top2;
+                    if margin < margin_gate {
+                        cutoff = cutoff.min(i);
+                        break;
+                    }
+                }
+            }
+            if truncate_mode {
+                // Shrink the vector so the scheduler downgrades the verify K.
+                drafts.truncate(cutoff.max(1));
+            } else {
+                // Mask mode (default): replace positions [cutoff..gamma_eff].
+                for i in cutoff..gamma_eff {
+                    drafts[i] = mask;
+                }
+            }
+            tracing::debug!(
+                "DFlash adaptive: gamma_eff={} cutoff={} accept_count={} margin_gate={} mode={} probe={} step={}",
+                gamma_eff,
+                cutoff,
+                dstate.accept_history_count,
+                margin_gate,
+                adaptive_mode,
+                is_probe_step,
+                dstate.propose_steps,
+            );
+        }
         // ATLAS_DFLASH_DEBUG_DUMP_FULL=1 (one-shot): log all γ drafts so
         // we can compare against the PyTorch reference run on the same
         // captured target_hidden. Static guard mirrors the input dump.
@@ -623,6 +904,107 @@ impl BlockDiffusionDraftHead {
             }
         }
         let _ = g; // suppress unused
+        if kprofile {
+            gpu.synchronize(stream)?;
+            let tail_us = t_tail.elapsed().as_micros();
+            let pre_us = t_pre_layers.duration_since(t_total).as_micros()
+                + t_layers.duration_since(t_pre_layers).as_micros();
+            let total_us = t_total.elapsed().as_micros();
+            let agg = super::kprof_snapshot_layers();
+            tracing::info!(
+                "DFLASH_KP propose: total={:.2}ms pre+steps0-2={:.0}μs layers={:.2}ms tail={:.0}μs \
+                 n_attn={} eff_ctx={} γ_eff={} | per-kernel-sum-over-{}-layers (μs): \
+                 input_norm={} q_proj={} kv_ctx_copy={} kv_ctx_new={} kv_noise={} \
+                 qk_norm={} rope={} cache_write={} prefill_attn={} \
+                 o_proj={} resid1={} post_norm={} gate_up={} silu_mul={} down_proj={} resid2={}",
+                total_us as f32 / 1000.0,
+                pre_us,
+                layers_us as f32 / 1000.0,
+                tail_us,
+                n_attn,
+                eff_ctx,
+                gamma_eff,
+                self.layers.len(),
+                agg.input_norm_us,
+                agg.q_proj_us,
+                agg.kv_ctx_copy_us,
+                agg.kv_ctx_new_us,
+                agg.kv_noise_us,
+                agg.qk_norm_us,
+                agg.rope_us,
+                agg.cache_write_us,
+                agg.prefill_attn_us,
+                agg.o_proj_us,
+                agg.resid1_us,
+                agg.post_norm_us,
+                agg.gate_up_us,
+                agg.silu_mul_us,
+                agg.down_proj_us,
+                agg.resid2_us,
+            );
+        }
         Ok(drafts)
+    }
+
+    /// DDTree M4B v2: extract top-K tokens + logit values per drafter
+    /// MASK row from the just-computed `self.scratch.logits` buffer.
+    ///
+    /// Must be called immediately after [`forward_block`] (before any
+    /// subsequent call overwrites the logits scratch). Returns
+    /// `(tokens, logits)` host vectors where each row of length `k`
+    /// is sorted by logit descending.
+    ///
+    /// `gamma_eff` = the number of MASK rows that produced drafts (matches
+    /// `drafts.len()` from forward_block). `k` is clamped to
+    /// `super::DDTREE_TOP_K_MAX`.
+    #[allow(dead_code)]
+    pub(super) fn extract_topk_from_logits(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        stream: u64,
+        gamma_eff: usize,
+        k: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        use crate::layers::ops;
+
+        let k_used = k.min(super::DDTREE_TOP_K_MAX).max(1);
+        let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
+        // Scratch is sized [γ, DDTREE_TOP_K_MAX] but we only fill γ_eff × k
+        // rows. Zero just the rows we'll read so a partial write leaves no
+        // stale data from a prior step.
+        let used_bytes = gamma_eff * k_used * 4;
+        gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
+        gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
+
+        // Logits already populated by forward_block at self.scratch.logits
+        // (shape [γ_eff, lm_vocab] BF16, row-major, contiguous).
+        ops::topk_bf16(
+            gpu,
+            self.kernels.topk,
+            self.scratch.logits,
+            self.scratch.topk_tokens_dev,
+            self.scratch.topk_logits_dev,
+            gamma_eff as u32,
+            lm_vocab,
+            k_used as u32,
+            stream,
+        )?;
+
+        gpu.synchronize(stream)?;
+
+        let mut tokens_bytes = vec![0u8; used_bytes];
+        let mut logits_bytes = vec![0u8; used_bytes];
+        gpu.copy_d2h(self.scratch.topk_tokens_dev, &mut tokens_bytes)?;
+        gpu.copy_d2h(self.scratch.topk_logits_dev, &mut logits_bytes)?;
+
+        let tokens: Vec<u32> = tokens_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let logits: Vec<f32> = logits_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        Ok((tokens, logits))
     }
 }

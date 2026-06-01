@@ -241,6 +241,17 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         hss_cache_blocks_per_seq,
     } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
     let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let dflash_quantization = match args.dflash_quantization.as_str() {
+        "bf16" => spark_model::layers::DflashQuantization::Bf16,
+        "nvfp4" => spark_model::layers::DflashQuantization::Nvfp4,
+        other => {
+            tracing::warn!(
+                "Unknown --dflash-quantization value `{other}` — defaulting to bf16. \
+                 Accepted: `bf16`, `nvfp4`."
+            );
+            spark_model::layers::DflashQuantization::Bf16
+        }
+    };
     let dflash_args =
         dflash_drafter_state
             .as_ref()
@@ -253,6 +264,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
                 } else {
                     None
                 },
+                quantization: dflash_quantization,
             });
     let model = serve_phases::build_model(
         &args,

@@ -157,6 +157,9 @@ impl TransformerModel {
             profile: false,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // ── Phase 2: CUDA graph capture / replay ──
@@ -220,6 +223,13 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                // DFlash hidden capture for ctx conditioning. Save ALL k
+                // tokens so the scheduler can pick the correct one
+                // (num_accepted) after verify. Layout:
+                // [token_idx, capture_layer, hidden] in dflash_hidden_save.
+                for t in 0..k {
+                    self.try_dflash_capture(layer_idx, t, stream)?;
+                }
             }
 
             // Final norm [4, H]
@@ -268,6 +278,10 @@ impl TransformerModel {
         }
 
         // ── Phase 3: Post-graph (D2H copy only) ──
+
+        // ATLAS_DUMP_HIDDEN: flush captured layer hiddens to file. See
+        // verify_b.rs for the eager-mode safety contract.
+        self.flush_hidden_dump(k)?;
 
         let out_ptr = self.buffers.scratch();
         let mut buf = [0u8; 16];
