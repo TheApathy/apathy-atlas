@@ -43,7 +43,7 @@ fn attn_qkv_fused_enabled() -> bool {
 /// Keeping the dispatch behind its own flag so production sets
 /// `ATLAS_TC_NVFP4_M16=1` (for SSM/prefill gains) without enabling the
 /// broken attention path. Set `ATLAS_TC_NVFP4_M16_MS_ATTN=1` to opt in.
-fn tc_nvfp4_m16_ms_attn_enabled() -> bool {
+pub(super) fn tc_nvfp4_m16_ms_attn_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE
         .get_or_init(|| std::env::var("ATLAS_TC_NVFP4_M16_MS_ATTN").ok().as_deref() == Some("1"))
