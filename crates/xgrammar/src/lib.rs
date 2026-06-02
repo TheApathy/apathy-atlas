@@ -10,6 +10,8 @@
 // The algorithmic core lives in the modules below; `api` is the
 // vendored-signature façade Atlas's `spark-server` links against.
 
+#![deny(warnings)]
+#![deny(clippy::all)]
 // Index-based loops and same-named submodules (`fsm::fsm`,
 // `compiler::compiler`) are kept where they mirror the C++ source's
 // structure 1:1 — that traceability is deliberate for a line-by-line
