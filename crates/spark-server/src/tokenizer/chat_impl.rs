@@ -9,11 +9,11 @@ use tokenizers::Tokenizer;
 use super::{ChatTokenizer, StreamingDecoder, normalize_tool_call_arguments};
 
 impl ChatTokenizer {
-    /// Override directory for Jinja templates. Drop a `.jinja` file here
-    /// named by model_type (e.g. `qwen3_5_moe.jinja`) to override the
-    /// template from `tokenizer_config.json`. Useful for applying community
-    /// fixes without re-downloading model weights.
-    const TEMPLATE_OVERRIDE_DIR: &'static str = "jinja-templates";
+    // The Jinja-template override directory constant is defined and used
+    // in `tokenizer/jinja_helpers.rs` as `TEMPLATE_OVERRIDE_DIR`
+    // (`pub(super) const ...`). The duplicate associated constant here was
+    // dead code — kept the helper-module version as the single source of
+    // truth.
 
     pub fn from_model_dir(
         model_dir: &Path,

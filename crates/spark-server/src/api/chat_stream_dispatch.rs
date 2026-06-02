@@ -67,7 +67,7 @@ pub(super) async fn dispatch_streaming(
     // otherwise truncate at the shorter, wrong boundary).
     let mut stop_strings = req.stop.clone();
     stop_strings.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    let stream_include_usage = req.stream_options.map(|o| o.include_usage).unwrap_or(false);
+    let stream_include_usage = req.stream_options.is_some_and(|o| o.include_usage);
     let req_return_token_ids = req.return_token_ids;
     let req_service_tier = req.service_tier.clone();
     let req_metadata = req.metadata.clone();
