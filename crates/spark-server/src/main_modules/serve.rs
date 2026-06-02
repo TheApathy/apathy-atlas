@@ -17,14 +17,9 @@ use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
 use crate::main_modules::serve_phases;
 use crate::tokenizer::ChatTokenizer;
-#[allow(unused_imports)]
 use crate::{
-    adaptive_sampler, anthropic, api, citation, cli, conversation_store, grammar, halluc_probe,
-    hint_injector, llmlingua, lookback_lens, loop_detector, loop_simhash, lqer, metrics,
-    model_resolver, moe_quality, ngram, observation_mask, openai, rate_limiter, reasoning_parser,
-    refusal, request_dumper, response_store, retrieval_heads, scheduler, scheduling_policy,
-    session_manager, symbol_trie, task_pin, tokenizer, tool_arg_dedup, tool_parser, tool_rag,
-    tool_salvage,
+    cli, conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
+    session_manager,
 };
 
 pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
@@ -137,10 +132,16 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // 2a-2. OOM watchdog: background async task that polls GPU memory every 2s.
     // On GB10 unified memory, GPU OOM = system freeze, so we exit(1) early.
     // Threshold: 2 GB (enough to detect runaway allocation before system locks up).
+    //
+    // CUDA-only: Apple Silicon UMA already exposes `currentAllocatedSize`
+    // and the OS handles memory pressure via Metal's working-set policy,
+    // so the dedicated watchdog isn't needed.
+    #[cfg(feature = "cuda")]
     let _oom_watchdog = spark_runtime::cuda_backend::spawn_oom_watchdog(
         2048, // 2 GB threshold
         std::time::Duration::from_secs(2),
     );
+    #[cfg(feature = "cuda")]
     tracing::info!("OOM watchdog started (threshold: 2 GB, interval: 2s)");
 
     // 2b. Resolve TP / EP topology and set on model config.
@@ -324,6 +325,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         reasoning_parser_box,
         think_end_token,
         think_start_token,
+        code_fence_token,
         reflection_suppress_ids,
         tool_call_start_token,
         tool_call_end_token,
@@ -451,6 +453,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             block_size,
             think_end_token,
             think_start_token,
+            code_fence_token,
             tool_call_start_token,
             tool_call_end_token,
             reflection_suppress_ids,
@@ -503,6 +506,10 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             b
         },
         disable_thinking: args.disable_thinking,
+        default_chat_template_kwargs: args
+            .default_chat_template_kwargs
+            .as_ref()
+            .and_then(|s| crate::openai::ChatTemplateKwargs::from_json(s)),
         response_store,
         rate_limiter,
         conversation_store,

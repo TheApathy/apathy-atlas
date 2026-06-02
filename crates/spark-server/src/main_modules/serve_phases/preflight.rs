@@ -52,6 +52,23 @@ pub(crate) fn preflight_reserve(
     } else {
         args.max_seq_len
     };
+    // Mirror of the auto-clamp in resolve_prefill_budget (kv_cache.rs).
+    // See issue #15: when prefix caching + SSM snapshots are both on,
+    // single-chunk prefill produces no reachable intermediate snapshots.
+    let prefill_budget_pre = if !user_set_prefill_pre
+        && args.enable_prefix_caching
+        && args.ssm_checkpoint_interval > 0
+        && args.ssm_cache_slots > 0
+    {
+        let target = args.ssm_checkpoint_interval * args.block_size;
+        if prefill_budget_pre > target && target > 0 {
+            target
+        } else {
+            prefill_budget_pre
+        }
+    } else {
+        prefill_budget_pre
+    };
     let max_batch_tokens_pre = prefill_budget_pre
         .max(spec_tokens_pre)
         .max(args.max_batch_size);
@@ -62,8 +79,18 @@ pub(crate) fn preflight_reserve(
         args.block_size,
     )
     .total_bytes();
-    let ssm_snapshot_bytes =
-        args.ssm_cache_slots * config.num_ssm_layers() * (h_state_bytes + conv_state_bytes);
+    // SSM snapshot pool = Marconi prefix-cache region + Phase-C
+    // decode-rollback ring. The decode ring is sized per active
+    // sequence (`ROLLBACK_RESTEER_CAP + 1` slots × `max_batch_size`),
+    // and only allocated for SSM models. Mirrors `SsmSnapshotPool::new`.
+    let decode_ring_slots = if config.num_ssm_layers() > 0 {
+        (atlas_kernels::ROLLBACK_RESTEER_CAP as usize) + 1
+    } else {
+        0
+    };
+    let ssm_snapshot_bytes = (args.ssm_cache_slots + decode_ring_slots * args.max_batch_size)
+        * config.num_ssm_layers()
+        * (h_state_bytes + conv_state_bytes);
     let cuda_headroom: usize =
         if args.speculative || args.self_speculative || args.ngram_speculative {
             4 * 1024 * 1024 * 1024
@@ -101,11 +128,10 @@ pub(crate) fn preflight_reserve(
                 0
             }
         };
-        let suggested = if per_tok_bytes > 0 {
-            (budget_for_seq_term / per_tok_bytes).max(2048)
-        } else {
-            0
-        };
+        let suggested = budget_for_seq_term
+            .checked_div(per_tok_bytes)
+            .map(|q| q.max(2048))
+            .unwrap_or(0);
         let hint = if suggested > 0 && suggested < args.max_seq_len {
             format!(
                 " Try --max-seq-len {} (or lower --max-batch-size / --num-drafts).",
@@ -132,6 +158,30 @@ pub(crate) fn preflight_reserve(
         buffer_arena_bytes / (1024 * 1024),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
     );
+    // Q09: per-component breakdown so future MTP/spec-decode reserve
+    // jumps are diagnosable from the log alone. Each line is dropped at
+    // debug to avoid noise on hot startup paths; flip to info if you
+    // need to trace a specific deployment's reserve.
+    let spec_on = args.speculative || args.self_speculative || args.ngram_speculative;
+    tracing::debug!(
+        "Preflight reserve breakdown: \
+         ssm_pool={} MB ({}× max_batch × {} ssm_layers × (h+conv)), \
+         ssm_snapshot={} MB ({} slots), \
+         gdn_two_phase={} MB ({} tokens), \
+         cuda_headroom={} MB ({}), \
+         spec_on={}, num_drafts={}",
+        ssm_pool_bytes / (1024 * 1024),
+        ssm_multiplier,
+        config.num_ssm_layers(),
+        ssm_snapshot_bytes / (1024 * 1024),
+        args.ssm_cache_slots,
+        gdn_two_phase_bytes / (1024 * 1024),
+        max_batch_tokens_pre,
+        cuda_headroom / (1024 * 1024),
+        if spec_on { "spec/MTP on" } else { "no spec" },
+        spec_on,
+        if spec_on { args.num_drafts as i64 } else { -1 },
+    );
     Ok(ReservePreflight {
         inference_reserve,
         buffer_arena_bytes,
@@ -141,6 +191,15 @@ pub(crate) fn preflight_reserve(
     })
 }
 
+/// Initialize the GPU backend for the active feature.
+///
+/// Compile-time dispatch:
+/// - `cuda` feature → `AtlasCudaBackend` loading PTX modules from `ptx_set`.
+/// - `metal` feature → `MetalGpuBackend` loading metallib modules from
+///   `atlas_kernels::metallib_modules()`. The `ptx_set` argument is
+///   accepted (for ABI symmetry with the cuda variant) but ignored;
+///   metal kernels live in a parallel registry.
+#[cfg(feature = "cuda")]
 pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
@@ -153,6 +212,27 @@ pub(crate) fn init_gpu_backend(
     let free_mem = gpu.free_memory()?;
     tracing::info!(
         "GPU {}: {:.1} GB total, {:.1} GB free",
+        args.gpu_ordinal,
+        total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+        free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    Ok((gpu, free_mem))
+}
+
+#[cfg(all(feature = "metal", not(feature = "cuda")))]
+pub(crate) fn init_gpu_backend(
+    args: &cli::ServeArgs,
+    _ptx_set: &atlas_kernels::TargetPtxSet,
+) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+    let modules = atlas_kernels::metallib_modules();
+    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+        spark_runtime::metal_backend::MetalGpuBackend::new(args.gpu_ordinal, &modules)
+            .context("Failed to initialize Metal backend")?,
+    );
+    let total_mem = gpu.total_memory()?;
+    let free_mem = gpu.free_memory()?;
+    tracing::info!(
+        "Metal device {}: {:.1} GB total, {:.1} GB free",
         args.gpu_ordinal,
         total_mem as f64 / (1024.0 * 1024.0 * 1024.0),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),

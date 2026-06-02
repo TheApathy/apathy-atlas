@@ -180,6 +180,8 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
         let (reasoning_content_i, output_text_i) =
             decode_response_text(&state, &response, enable_thinking);
         let output_text_i = strip_stop_sequences(output_text_i, &req.stop);
+        let output_text_i =
+            super::chat::repair_json::repair_json_object_prefix(&req, output_text_i);
 
         let (message, finish_reason_i) = build_choice_message(
             &state,
@@ -216,19 +218,27 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> Response {
 }
 
 /// Decode `(reasoning_content, output_text)` from the scheduler's
-/// response — split at the last `</think>` token if the tokenizer
-/// resolves it, fall back to text-level extraction otherwise.
+/// response. When `enable_thinking=true`, split at the last `</think>`
+/// token. When `enable_thinking=false`, decode all output_tokens as
+/// content — mirrors streaming's `thinking_done = !enable_thinking`
+/// init in chat_stream/state.rs and recovers the answer Qwen3.x emits
+/// inside `<think>...</think>` when it ignores a closed-thinking
+/// prefill (issue #40).
 fn decode_response_text(
     state: &AppState,
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
 ) -> (Option<String>, String) {
     if let Some(think_tok) = state.think_end_token_id {
-        let last_think_pos = response.output_tokens.iter().rposition(|&t| t == think_tok);
+        let last_think_pos = if enable_thinking {
+            response.output_tokens.iter().rposition(|&t| t == think_tok)
+        } else {
+            None
+        };
         if let Some(pos) = last_think_pos {
             let thinking_tokens = &response.output_tokens[..pos];
             let content_tokens = &response.output_tokens[pos + 1..];
-            let reasoning = if enable_thinking && !thinking_tokens.is_empty() {
+            let reasoning = if !thinking_tokens.is_empty() {
                 state
                     .tokenizer
                     .decode(thinking_tokens)
@@ -326,14 +336,16 @@ fn build_choice_message(
                     let close_end = after_open + rel_close + 3;
                     c = format!("{}{}", &c[..start], &c[close_end..]);
                 }
-                let trimmed = c.trim().to_string();
-                if trimmed.is_empty() {
-                    return trimmed;
-                }
-                trimmed
+                c.trim().to_string()
             });
             message.content = content;
             if !validated.valid.is_empty() {
+                for tc in &validated.valid {
+                    let p: String = tc.function.arguments.chars().take(120).collect();
+                    let s = ["", "…"][usize::from(tc.function.arguments.len() > p.len())];
+                    tracing::info!("Tool call: {}({p}{s})", tc.function.name);
+                    crate::metrics::TOOL_CALLS_TOTAL.inc();
+                }
                 message.tool_calls = Some(validated.valid);
                 finish_reason_i = "tool_calls".to_string();
             }
