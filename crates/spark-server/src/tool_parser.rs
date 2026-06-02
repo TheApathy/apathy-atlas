@@ -207,6 +207,14 @@ pub trait ToolCallParser: Send + Sync {
         LeakMarkers::EMPTY
     }
 
+    /// PR #69: when true, the Anthropic `count_tokens` endpoint skips
+    /// rendering tools through the chat template (avoids inflating the
+    /// reported count for parsers that re-emit tools via their own
+    /// prompt). Default: false. `BareJsonParser` overrides to true.
+    fn suppresses_jinja_tools(&self) -> bool {
+        false
+    }
+
     /// F69 (2026-04-29): symmetric grammar dispatch. Compile the
     /// XGrammar structural-tag grammar that constrains decoding for
     /// this parser's tool-call envelope.
