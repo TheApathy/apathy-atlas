@@ -90,6 +90,14 @@ pub(super) fn load_sharded(
 
         let file = std::fs::File::open(&shard_path)
             .with_context(|| format!("Failed to open {}", shard_path.display()))?;
+        // SAFETY: model shards are read-only artifacts owned by the
+        // serving process; we open them O_RDONLY and never write back.
+        // `memmap2::map` is unsafe because the kernel cannot prevent
+        // another process from truncating or modifying the file
+        // mid-mapping, which would corrupt or SIGBUS reads. Atlas's
+        // deployment model treats the model directory as immutable
+        // ground truth — any concurrent mutation by an external actor
+        // is a deployment-layer bug, not a runtime concern.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
         let tensors = safetensors::SafeTensors::deserialize(&mmap)?;
 
@@ -172,6 +180,9 @@ pub(super) fn load_single(
     skip_fn: &dyn Fn(&str) -> bool,
 ) -> Result<HashMap<String, WeightTensor>> {
     let file = std::fs::File::open(path)?;
+    // SAFETY: same model-shard immutability invariant as the multi-shard
+    // path above — see the SAFETY comment in `load_shard`. Single-shard
+    // loader uses the same O_RDONLY + read-only `map` pattern.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
     let tensors = safetensors::SafeTensors::deserialize(&mmap)?;
 
