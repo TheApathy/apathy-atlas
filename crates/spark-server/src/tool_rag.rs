@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//
+// Research scaffolding: the Tokeniser / Embedder traits + cosine /
+// retrieve_top_k / filter_tools_by_name helpers are wired together but
+// not yet hooked into the request preprocessing pipeline. Allow at
+// module level so the API surface stays compilable.
+#![allow(dead_code)]
 
 //! Tool-RAG: retrieve top-K relevant tools before grammar exposure
 //! (A.3, 2026-04-25).

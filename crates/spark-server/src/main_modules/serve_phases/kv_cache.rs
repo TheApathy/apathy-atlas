@@ -163,6 +163,10 @@ pub(crate) fn resolve_prefill_budget(
 }
 
 pub(crate) struct KvCacheConfig {
+    // Sole consumer (serve.rs) destructures this as `effective_kv_dtype_str: _`
+    // today — kept for serialization symmetry and a future startup-banner
+    // log line that reports the resolved KV dtype.
+    #[allow(dead_code)]
     pub(crate) effective_kv_dtype_str: String,
     pub(crate) kv_dtype: spark_runtime::kv_cache::KvCacheDtype,
     pub(crate) layer_dtypes: Vec<spark_runtime::kv_cache::KvCacheDtype>,

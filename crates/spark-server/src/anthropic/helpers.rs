@@ -36,6 +36,12 @@ pub(super) fn convert_tools(tools: &[AnthropicTool]) -> Vec<tool_parser::ToolDef
 }
 
 /// Convert Anthropic tool_choice to OpenAI-compatible tool_choice.
+//
+// Kept as part of the conversion-helper surface — the live Anthropic
+// translator inlines an equivalent match; this helper covers the case
+// where a future code path needs the conversion in isolation. Allowed
+// rather than removed so the surface stays exported.
+#[allow(dead_code)]
 pub(super) fn convert_tool_choice(tc: &AnthropicToolChoice) -> tool_parser::ToolChoice {
     match tc.choice_type.as_str() {
         "any" => tool_parser::ToolChoice::Mode("required".to_string()),

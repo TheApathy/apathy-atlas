@@ -18,6 +18,12 @@ pub struct PendingRequestInfo {
     /// Number of prompt tokens (determines prefill cost).
     pub prompt_len: usize,
     /// Index into the full pending requests vec.
+    //
+    // Populated by the scheduler so that policy implementations can return
+    // an index back to the caller. The bundled FIFO + SLAI policies pick
+    // by linear scan and don't consult it; kept as part of the public
+    // policy ABI for custom policies.
+    #[allow(dead_code)]
     pub index: usize,
 }
 

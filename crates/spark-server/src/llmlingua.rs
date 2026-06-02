@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//
+// Research scaffolding: compress / compress_with_anchors / rerank /
+// KeepClassifier are implemented but not yet hooked into the prompt
+// pipeline. Allow at module level so the API surface stays compilable.
+#![allow(dead_code)]
 
 //! LongLLMLingua-2 prompt compression primitive (B.3, 2026-04-25).
 //!

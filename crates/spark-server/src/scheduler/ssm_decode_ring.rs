@@ -132,6 +132,11 @@ impl SsmDecodeRing {
     /// The set of token positions that currently have a live snapshot,
     /// most-recent last. Used by boundary selection to restrict the
     /// rollback target to a boundary that can actually be restored.
+    //
+    // Live boundary-selection inlines `self.entries.iter()` directly; this
+    // accessor is part of the public ring API and kept for callers outside
+    // the scheduler that may want to inspect snapshot positions.
+    #[allow(dead_code)]
     pub fn snapshot_positions(&self) -> impl Iterator<Item = usize> + '_ {
         self.entries.iter().map(|e| e.token_position)
     }
