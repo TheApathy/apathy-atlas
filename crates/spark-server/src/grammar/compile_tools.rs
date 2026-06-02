@@ -172,8 +172,6 @@ impl GrammarEngine {
         }
 
         let mut tag_entries = Vec::with_capacity(tools.len());
-        let mut triggers = Vec::new();
-        let mut seen_triggers = HashMap::<String, bool>::new();
 
         // Pre-sanitize all schemas so the fallback path can reuse them.
         struct SanitizedTool {
@@ -218,16 +216,43 @@ impl GrammarEngine {
                 "content": {"type": "qwen_xml_parameter", "json_schema": st.schema},
                 "end": end,
             }));
-            let trigger = format!("<tool_call>\n<function={}", st.name);
-            if !seen_triggers.contains_key(&trigger) {
-                seen_triggers.insert(trigger.clone(), true);
-                triggers.push(trigger);
-            }
         }
 
         if tag_entries.is_empty() {
             return Err(GrammarError::NoTools);
         }
+
+        // Trigger selection depends on `use_triggers` (i.e. tool_choice mode):
+        //
+        // * tool_choice="auto" (use_triggers=true): per-tool LATE triggers
+        //   `<tool_call>\n<function=NAME`. The model is free to emit a
+        //   `<tool_call>` token and then *not* commit (e.g. by emitting
+        //   plain prose afterwards), which is the ergonomic behaviour
+        //   most pass-not-fail scenarios depend on (TC-11 mental math,
+        //   TC-39 restraint, TC-43 ask-for-missing-arg, TC-48 multi-turn
+        //   email composition). Late triggers preserve that freedom.
+        //
+        // * tool_choice="required"/specific (use_triggers=false): SHORT
+        //   shared trigger `<tool_call>`. Without it, the model can — and
+        //   does — emit `<tool_call><tool_call>…` indefinitely under
+        //   required mode (`at_least_one=true` only suppresses EOS, it
+        //   does not constrain content); LATE triggers stay in
+        //   free-preamble forever because the `<tool_call>` special
+        //   token never extends to the required `\n<function=` prefix.
+        //   The SHORT trigger engages the moment the open token is
+        //   sampled, locking xgrammar's `triggered_tags` alternation onto
+        //   one of `\n<function=NAME>` for each registered tool — the
+        //   `<tool_call><tool_call>…` lockup is unreachable by
+        //   construction. Mirrors compile_minimax_xml_tool_grammar's F67
+        //   fix for the same xgrammar behaviour pattern.
+        let triggers: Vec<String> = if use_triggers {
+            sanitized_tools
+                .iter()
+                .map(|st| format!("<tool_call>\n<function={}", st.name))
+                .collect()
+        } else {
+            vec!["<tool_call>".to_string()]
+        };
 
         let at_least_one = !use_triggers;
         let stop_after_first = !use_triggers;
@@ -240,9 +265,24 @@ impl GrammarEngine {
         ) {
             Ok(compiled) => Ok(compiled),
             Err(e) => {
-                // Fall back to json_schema content type if qwen_xml_parameter not supported.
-                tracing::warn!(
-                    "qwen_xml_parameter grammar failed ({e:?}), retrying with json_schema"
+                // Fall back to json_schema content type if qwen_xml_parameter
+                // EBNF generation hits an edge case for one of these tool
+                // schemas. The fallback path is fully functional — accuracy
+                // is comparable, just the grammar is JSON-shaped instead of
+                // XML-parameter-shaped under the hood. Emit at INFO with the
+                // tool list so a follow-up bug report has the context to
+                // narrow down which schema triggered xgrammar's EBNF parser
+                // (Discord 2026-05-07 a1vadfs report on
+                // mmangkad/Qwen3.6-27B-NVFP4: "EBNF parser error at line N").
+                let tool_names: Vec<&str> =
+                    sanitized_tools.iter().map(|st| st.name.as_str()).collect();
+                tracing::info!(
+                    "qwen_xml_parameter grammar fell back to json_schema ({e:?}). \
+                     Functional but slightly looser tool-call grammar. Tools in \
+                     this batch: [{}]. If you want to help narrow this down, \
+                     set RUST_LOG=trace and re-run — the rejected schema is \
+                     emitted at trace level by xgrammar.",
+                    tool_names.join(", "),
                 );
                 let tag_entries_fallback: Vec<serde_json::Value> = sanitized_tools
                     .iter()

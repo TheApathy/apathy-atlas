@@ -71,6 +71,29 @@ pub(super) struct StreamState {
     pub(super) streaming_tool_args: HashMap<usize, (String, String)>,
     /// F12: per-response total tool-call count.
     pub(super) tool_calls_emitted_count: usize,
+    /// Bug-2 (OpenClaw 2026-05-08): per-tool-name consecutive-call
+    /// guard. F11 keys on `(name, canonical_args)` and is defeated by
+    /// runaway loops where the model varies args slightly each
+    /// iteration (e.g. timestamps, sequence numbers, IDs). This
+    /// counter trips whenever the same tool name fires in N
+    /// successive `ToolCallEnd` events regardless of args drift,
+    /// catching the `cron`+`exec` alternation pattern observed when
+    /// the streaming detector did successfully classify the calls.
+    /// `(last_name, run_length)`. `last_name = None` means the run
+    /// was just broken by a different tool name.
+    pub(super) name_run: Option<(String, u32)>,
+    /// Set true when ANY tool-call loop guard forcibly ends the
+    /// response: the Bug-2 name-run cap, F11 within-response dedup,
+    /// F5 cross-flush dedup, or F44 permanent-failure circuit-breaker.
+    /// `handle_done` reads this and overrides `finish_reason` to
+    /// `"length"` — without the override the response otherwise looks
+    /// like a normal `"tool_calls"` completion (because tool calls
+    /// were emitted), and agent clients (opencode, etc.) cheerfully
+    /// run the tools and send the next request, perpetuating the loop
+    /// from the outside. `"length"` is the OpenAI-spec slot for
+    /// "response was forcibly truncated" and gives every agent a
+    /// clean hook to break its outer retry loop.
+    pub(super) tool_loop_capped: bool,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
@@ -102,6 +125,8 @@ impl StreamState {
             tool_arg_dedup_within: crate::tool_arg_dedup::ToolArgDedup::with_params(4, 2, 3),
             streaming_tool_args: HashMap::new(),
             tool_calls_emitted_count: 0,
+            name_run: None,
+            tool_loop_capped: false,
             detector: if tools_active {
                 Some(tool_parser::StreamingToolDetector::new())
             } else {

@@ -5,6 +5,26 @@ edition = "2024"
 license.workspace = true
 description = "Atlas Spark — pure Rust LLM inference server"
 
+[features]
+default = ["cuda"]
+# Forwards through to atlas-core/spark-runtime/spark-model so the default
+# Linux build still activates the cuda backend after atlas-core became
+# default-features = false at the workspace level.
+cuda = [
+    "atlas-core/cuda",
+    "spark-runtime/cuda",
+    "spark-model/cuda",
+    "spark-storage/cuda",
+    "spark-comm/cuda",
+]
+metal = [
+    "atlas-core/metal",
+    "spark-runtime/metal",
+    "spark-model/metal",
+    "spark-storage/metal",
+    "spark-comm/metal",
+]
+
 [[bin]]
 name = "spark"
 path = "src/main.rs"
@@ -12,10 +32,12 @@ path = "src/main.rs"
 [dependencies]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
-spark-runtime = { path = "../spark-runtime" }
-spark-model = { path = "../spark-model" }
-spark-comm = { path = "../spark-comm" }
-spark-storage = { path = "../spark-storage" }
+# `default-features = false` on path-deps so the metal feature actually
+# disables the cuda default that each downstream crate inherits.
+spark-runtime = { path = "../spark-runtime", default-features = false }
+spark-model = { path = "../spark-model", default-features = false }
+spark-comm = { path = "../spark-comm", default-features = false }
+spark-storage = { path = "../spark-storage", default-features = false }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,14 +47,18 @@ axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["full", "parking_lot"] }
 tokio-stream = "0.1"
 futures = "0.3"
-rayon = "1.10"
+rayon = "1.12"
 parking_lot = { workspace = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 toml = "0.8"
 minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json"] }
-xgrammar-rs = "0.1"
+# Pure-Rust grammar-constrained decoding (W7: was the C++-backed
+# `xgrammar-rs = "0.1"` patched to `vendor/xgrammar-rs`; now the
+# from-scratch Rust port at `crates/xgrammar`). The crate's lib is
+# named `xgrammar`, so `use xgrammar::` resolves unchanged.
+xgrammar = { path = "../xgrammar" }
 prometheus = { version = "0.13", default-features = false }
 lazy_static = "1"
 tower-http = { version = "0.6", features = ["catch-panic", "cors"] }

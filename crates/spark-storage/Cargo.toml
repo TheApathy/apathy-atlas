@@ -5,6 +5,15 @@ edition = "2024"
 license.workspace = true
 description = "Atlas: high-speed NVMe-backed KV cache offload (cuFile/GDS + io_uring)"
 
+[features]
+default = ["cuda"]
+# `cuda` gates the cuda_min/module/graph + high-speed-swap stack. The
+# `metal` arm is empty: spark-storage's job (NVMe → HBM via cuFile/GDS)
+# isn't reachable on Apple Silicon UMA, so under metal the crate
+# compiles down to the pure-config / type modules only.
+cuda = []
+metal = []
+
 [dependencies]
 cufile-sys = { path = "../cufile-sys" }
 anyhow = { workspace = true }
@@ -18,6 +27,12 @@ rand_distr = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# io-uring is Linux-only — macOS is `cfg(unix)` but lacks the syscall layer
+# (uses kqueue instead). Gating on `target_os = "linux"` lets the rest of
+# spark-storage compile-check on Apple Silicon, even though the NVMe-swap
+# code paths that actually need io-uring won't be reachable there.
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
 [dev-dependencies]

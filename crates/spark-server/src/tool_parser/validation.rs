@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #![allow(unused_imports, dead_code)]
 
+use super::fuzzy_match::fuzzy_match_tool_name;
 use super::*;
 
 /// Fix tool call arguments: schema-aware type coercion + backfill missing params.
@@ -314,49 +315,6 @@ pub fn validate_tool_calls(
     }
 
     ValidatedToolCalls { valid, errors }
-}
-
-/// Fuzzy match a hallucinated tool name to the closest available tool.
-///
-/// Strategies (in priority order):
-/// 1. Substring containment: "weather" matches "get_weather"
-/// 2. Available tool name contains the model's name: "get_weather" contains "weather"
-/// 3. Model's name contains available tool: "weather_report" contains "weather"
-///
-/// Only returns a match if exactly one tool matches (ambiguous = reject).
-fn fuzzy_match_tool_name(model_name: &str, tools: &[ToolDefinition]) -> Option<String> {
-    if tools.is_empty() || model_name.is_empty() {
-        return None;
-    }
-
-    let lower = model_name.to_lowercase();
-
-    // Strategy 1: exact substring — model name is substring of a tool name
-    let matches: Vec<&str> = tools
-        .iter()
-        .filter(|t| t.function.name.to_lowercase().contains(&lower))
-        .map(|t| t.function.name.as_str())
-        .collect();
-    if matches.len() == 1 {
-        return Some(matches[0].to_string());
-    }
-
-    // Strategy 2: tool name is substring of model's name
-    let matches: Vec<&str> = tools
-        .iter()
-        .filter(|t| lower.contains(&t.function.name.to_lowercase()))
-        .map(|t| t.function.name.as_str())
-        .collect();
-    if matches.len() == 1 {
-        return Some(matches[0].to_string());
-    }
-
-    // Strategy 3: if only one tool available, use it (model clearly intended to call a tool)
-    if tools.len() == 1 {
-        return Some(tools[0].function.name.clone());
-    }
-
-    None
 }
 
 /// Validate a single tool call. Returns `Ok(())` if valid,

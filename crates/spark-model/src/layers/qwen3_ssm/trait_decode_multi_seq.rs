@@ -6,75 +6,77 @@ use super::*;
 
 impl Qwen3SsmLayer {
     #[allow(clippy::too_many_arguments)]
-    /// Multi-sequence decode: falls back to per-sequence single decode.
+    /// Multi-sequence decode (one token per sequence, independent SSM state).
     ///
-    /// The batched SSM path had buffer aliasing bugs (#6) where shared scratch
-    /// buffers (conv_out, gdn_out, moe_output) corrupted across sequences,
-    /// producing gibberish (Chinese/multilingual tokens). Instead of debugging
-    /// every buffer interaction, we delegate to the proven single-sequence
-    /// decode path which has no aliasing issues.
+    /// SSM decode has two kinds of work per layer:
+    /// - **State-free outer ops** (input/output RMS norm + residual) —
+    ///   token-independent; safe to batch across N sequences in a single
+    ///   kernel launch.
+    /// - **State-bearing inner ops** (`conv1d_update`, `gdn_decode`) — each
+    ///   carries its own per-sequence recurrent state, so the kernels can't
+    ///   trivially fan over multiple states in one grid.
     ///
-    /// Performance impact: negligible — SSM decode is memory-bandwidth-bound
-    /// and per-sequence GEMV weights stay in L2 cache across iterations.
-    #[allow(unreachable_code, unused_variables)]
+    /// We batch the outer ops (`rms_norm_residual` + the
+    /// `residual_add_rms_norm` after SSM) and run the inner ops in a
+    /// per-sequence loop using disjoint slices of the per-pass scratch arena
+    /// (sized for `max_batch_tokens` in `BufferSizes::from_config`).
+    ///
+    /// An earlier batched attempt (#6) wrote conv1d output to
+    /// `ctx.buffers.attn_output()`, which is only sized for
+    /// `m * mamba2_d_inner * bf16` — half of what `n * conv_dim * bf16`
+    /// requires on Qwen3.5-A3B. The out-of-bounds writes were what produced
+    /// the multilingual gibberish. The corrected layout writes conv and GDN
+    /// output into the much larger `ssm_conv_out_f32`
+    /// (`m * ssm_qkvz_size * 4`), mirroring the single-seq `ssm_forward`
+    /// layout per slice.
+    ///
+    /// MoE forward writes to `moe_output[0..h]` and is therefore interleaved
+    /// with the per-seq `residual_add` (same pattern as
+    /// [`decode_batched_inner`] for non-fused K).
+    ///
+    /// If the FP32 conv1d / GDN / gated-RMS kernels aren't loaded on the
+    /// active backend (e.g. Metal), fall back to per-sequence
+    /// [`decode_inner`] — the BF16 path stores GDN output in `attn_output`,
+    /// which the safe layout above can't accommodate.
     pub(super) fn decode_multi_seq_inner<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
         residual: DevicePtr,
         num_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
-        _kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
-        _block_tables: &[Vec<u32>],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let h = ctx.config.hidden_size;
-        let bf16 = 2usize;
+        let use_batched = self.conv1d_l2norm_f32_k.0 != 0
+            && self.gdn_f32_k.0 != 0
+            && self.gated_rms_norm_f32_k.0 != 0;
+        if !use_batched {
+            return self.decode_multi_seq_per_seq_fallback(
+                hidden,
+                residual,
+                num_seqs,
+                states,
+                kv_cache,
+                seq_lens,
+                block_tables,
+                ctx,
+                stream,
+            );
+        }
 
-        // CONCURRENT-DECODE BUG FIX: per-seq stride must match the ACTUAL
-        // hidden/residual element size, not always FP32 (4 bytes). When
-        // `use_fp32_residual()` is false (BF16 hidden — the default for
-        // GB10 LPDDR5X bandwidth-limited systems via HARDWARE.toml), the
-        // hardcoded `i * h * 4` skipped to position 2 of the BF16 buffer
-        // for `i=1`, leaving seq-1's actual position-1 slice UNTOUCHED by
-        // every SSM layer. Result: seq 1 only got modifications from the
-        // attention layers (which use the correct n>=2 batched indexing
-        // internally), producing the position-specific gibberish that
-        // reproduced even with identical prompts. Use the same `fp32`
-        // bytes-per-element computation the dispatcher uses at
-        // model.rs:4250.
+        let h = ctx.config.hidden_size;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let bf16 = 2usize;
+        let fp32 = 4usize;
         let residual_elem = if ctx.config.use_fp32_residual() {
             4usize
         } else {
             2usize
         };
-
-        // Delegate to per-sequence single decode (proven correct, no buffer aliasing).
-        let mut _stub_disk = Vec::<u32>::new();
-        let mut _stub_last_offloaded = Vec::<u32>::new();
-        for i in 0..num_seqs {
-            let hidden_i = hidden.offset(i * h * residual_elem);
-            let residual_i = residual.offset(i * h * residual_elem);
-            self.decode(
-                hidden_i,
-                residual_i,
-                states[i],
-                _kv_cache,
-                _seq_lens[i],
-                &mut _block_tables[i].clone(),
-                &mut _stub_disk,
-                &mut _stub_last_offloaded,
-                ctx,
-                stream,
-            )?;
-        }
-        return Ok(());
-
-        // ── Original batched path (disabled — buffer aliasing bug #6) ──
-        let eps = ctx.config.rms_norm_eps as f32;
-        let fp32 = 4usize;
-        let n = num_seqs;
+        let n = num_seqs as u32;
 
         let nk = ctx.config.linear_num_key_heads;
         let kd = ctx.config.linear_key_head_dim;
@@ -83,12 +85,13 @@ impl Qwen3SsmLayer {
         let vpg = nv / nk;
         let key_dim = nk * kd;
         let value_dim = nv * vd;
-        let conv_dim = key_dim * 2 + value_dim;
-        let d_conv = ctx.config.linear_conv_kernel_dim;
+        let conv_dim = (key_dim * 2 + value_dim) as u32;
+        let qk_channels = (key_dim * 2) as u32;
+        let d_conv = ctx.config.linear_conv_kernel_dim as u32;
         let qkvz_size = ctx.config.ssm_qkvz_size();
         let ba_size = ctx.config.ssm_ba_size();
 
-        // ── 1. RMS norm + residual for N tokens ──
+        // ── 1. Batched RMS norm + residual across all N sequences ──
         let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
             ctx.gpu,
@@ -97,30 +100,48 @@ impl Qwen3SsmLayer {
             &self.input_norm,
             normed,
             residual,
-            n as u32,
+            n,
             h as u32,
             eps,
             stream,
         )?;
 
-        // ── 2-9. Per-sequence SSM forward + projections ──
-        // GEMV projections are sequential (weights cached in L2 after first call).
-        // Conv1d, GDN are per-sequence (independent recurrent state).
-        let qkvz_out = ctx.buffers.ssm_qkvz();
+        // ── 2-7. Per-seq SSM forward (state-bearing) ──
+        //
+        // Buffer layout per seq i:
+        //   ssm_deinterleaved[i * qkvz_size * bf16 ..]            — [Q|K|V|Z]
+        //   ssm_gates[i * nv * 2 * fp32 ..]                       — [gate(nv) | beta(nv)]
+        //   ssm_conv_out_f32[i * qkvz_size * fp32 ..]             — conv1d FP32 out
+        //     + (key_dim*2 + value_dim)*fp32                      — GDN FP32 out (in-slice)
+        //   ssm_qkvz[i * qkvz_size * bf16 ..]                     — normed_out (gated_rms)
+        //   moe_output[i * h * bf16 ..]                           — SSM output projection
+        //
+        // All strides match the per-token natural stride of the respective
+        // arena buffer (see `BufferSizes::from_config`), so per-seq writes
+        // stay in-bounds for any `num_seqs ≤ max_batch_tokens`.
         let deinterleaved = ctx.buffers.ssm_deinterleaved();
         let gates_buf = ctx.buffers.ssm_gates();
-        let conv_out_buf = ctx.buffers.attn_output(); // reuse
-        let gdn_out_buf = ctx.buffers.qkv_output(); // reuse for GDN output
+        let conv_out_f32 = ctx.buffers.ssm_conv_out_f32();
+        let normed_out_buf = ctx.buffers.ssm_qkvz();
+        let ssm_out_buf = ctx.buffers.moe_output();
+        let gdn_local_offset = (key_dim * 2 + value_dim) * fp32;
 
-        for i in 0..n {
+        for i in 0..num_seqs {
             let normed_i = normed.offset(i * h * bf16);
+            let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+            let gate_i = gates_buf.offset(i * nv * 2 * fp32);
+            let beta_i = gate_i.offset(nv * fp32);
+            let conv_out_i = conv_out_f32.offset(i * qkvz_size * fp32);
+            let gdn_out_i = conv_out_i.offset(gdn_local_offset);
+            let normed_out_i = normed_out_buf.offset(i * qkvz_size * bf16);
+            let ssm_out_i = ssm_out_buf.offset(i * h * bf16);
+
             let ssm_state = states[i]
                 .as_any_mut()
                 .downcast_mut::<SsmLayerState>()
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
 
-            // QKVZ projection: GEMV (sequential writes directly to deinterleaved)
-            let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+            // ── 2. QKVZ projection (+ deinterleave if needed) ──
             if self.sequential_qkvz {
                 if let Some(ref nvfp4) = self.qkvz_nvfp4 {
                     ops::w4a16_gemv(
@@ -145,35 +166,37 @@ impl Qwen3SsmLayer {
                         stream,
                     )?;
                 }
+            } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+                ops::w4a16_gemv_qkvz(
+                    ctx.gpu,
+                    self.w4a16_gemv_qkvz_k,
+                    normed_i,
+                    nvfp4,
+                    deint_i,
+                    qkvz_size as u32,
+                    h as u32,
+                    nk as u32,
+                    kd as u32,
+                    vpg as u32,
+                    vd as u32,
+                    stream,
+                )?;
             } else {
-                let qkvz_i = qkvz_out.offset(i * qkvz_size * bf16);
-                if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-                    ops::w4a16_gemv(
-                        ctx.gpu,
-                        self.w4a16_gemv_k,
-                        normed_i,
-                        nvfp4,
-                        qkvz_i,
-                        qkvz_size as u32,
-                        h as u32,
-                        stream,
-                    )?;
-                } else {
-                    ops::dense_gemv(
-                        ctx.gpu,
-                        self.dense_gemv_k,
-                        normed_i,
-                        &self.ssm.in_proj_qkvz,
-                        qkvz_i,
-                        qkvz_size as u32,
-                        h as u32,
-                        stream,
-                    )?;
-                }
+                // Dense fallback: interleaved GEMV then in-place deinterleave.
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed_i,
+                    &self.ssm.in_proj_qkvz,
+                    deint_i,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?;
                 ops::deinterleave_qkvz(
                     ctx.gpu,
                     self.deinterleave_k,
-                    qkvz_i,
+                    deint_i,
                     deint_i,
                     1,
                     nk as u32,
@@ -184,78 +207,50 @@ impl Qwen3SsmLayer {
                 )?;
             }
 
-            // BA projection + GDN gates
-            let ba_out = ctx.buffers.ssm_ba().offset(i * ba_size * bf16);
-            ops::dense_gemv(
+            // ── 3. Fused BA projection + GDN gates ──
+            ops::dense_gemv_ba_gates(
                 ctx.gpu,
-                self.dense_gemv_k,
+                self.ba_gates_k,
                 normed_i,
                 &self.ssm.in_proj_ba,
-                ba_out,
-                ba_size as u32,
-                h as u32,
-                stream,
-            )?;
-            let gate_beta_stride = nv * 2 * fp32;
-            let gate_i = gates_buf.offset(i * gate_beta_stride);
-            let beta_i = gates_buf.offset(i * gate_beta_stride + nv * fp32);
-            ops::compute_gdn_gates(
-                ctx.gpu,
-                self.compute_gdn_gates_k,
-                ba_out,
                 self.ssm.a_log.weight,
                 self.ssm.dt_bias.weight,
                 gate_i,
                 beta_i,
-                1,
-                nv as u32,
-                nk as u32,
-                vpg as u32,
                 ba_size as u32,
+                h as u32,
+                vpg as u32,
                 stream,
             )?;
 
-            // Conv1d update
-            let qkv_i = deint_i;
-            let conv_out_i = conv_out_buf.offset(i * conv_dim * bf16);
-            ops::conv1d_update(
+            // ── 4. Conv1d update + SiLU + L2 norm (FP32 output) ──
+            ops::conv1d_update_l2norm(
                 ctx.gpu,
-                self.conv1d_k,
+                self.conv1d_l2norm_f32_k,
                 ssm_state.conv_state,
-                qkv_i,
+                deint_i,
                 &self.ssm.conv1d,
                 conv_out_i,
-                conv_dim as u32,
-                d_conv as u32,
+                conv_dim,
+                d_conv,
                 1,
-                stream,
-            )?;
-
-            // L2 norm on Q,K
-            ops::l2_norm(
-                ctx.gpu,
-                self.l2_norm_k,
-                conv_out_i,
-                (nk * 2) as u32,
+                qk_channels,
                 kd as u32,
                 1e-6,
-                1,
-                (nk * 2 * kd) as u32,
                 stream,
             )?;
 
-            // GDN decode
-            let q_i = conv_out_i;
-            let k_i = conv_out_i.offset(key_dim * bf16);
-            let v_i = conv_out_i.offset(key_dim * 2 * bf16);
-            let gdn_out_i = gdn_out_buf.offset(i * value_dim * bf16);
+            // ── 5. GDN decode (FP32 state + output) ──
+            let q_conv = conv_out_i;
+            let k_conv = conv_out_i.offset(key_dim * fp32);
+            let v_conv = conv_out_i.offset(key_dim * 2 * fp32);
             ops::gdn_decode(
                 ctx.gpu,
-                self.gdn_k,
+                self.gdn_f32_k,
                 ssm_state.h_state,
-                q_i,
-                k_i,
-                v_i,
+                q_conv,
+                k_conv,
+                v_conv,
                 gate_i,
                 beta_i,
                 gdn_out_i,
@@ -267,16 +262,15 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
 
-            // Gated RMS norm
-            let z_i = deint_i.offset((key_dim * 2 + value_dim) * bf16);
-            let normed_ssm_i = conv_out_i; // reuse
+            // ── 6. Gated RMS norm (FP32 GDN input → BF16 normed output) ──
+            let z_ptr = deint_i.offset((key_dim * 2 + value_dim) * bf16);
             ops::gated_rms_norm(
                 ctx.gpu,
-                self.gated_rms_norm_k,
+                self.gated_rms_norm_f32_k,
                 gdn_out_i,
-                z_i,
+                z_ptr,
                 &self.ssm.norm,
-                normed_ssm_i,
+                normed_out_i,
                 nv as u32,
                 vd as u32,
                 vd as u32,
@@ -285,13 +279,12 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
 
-            // Output projection: GEMV
-            let ssm_out_i = ctx.buffers.moe_output().offset(i * h * bf16);
+            // ── 7. Output projection [value_dim → hidden_size] ──
             if let Some(ref dense_out) = self.out_proj_dense {
                 ops::dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
-                    normed_ssm_i,
+                    normed_out_i,
                     dense_out,
                     ssm_out_i,
                     h as u32,
@@ -302,7 +295,7 @@ impl Qwen3SsmLayer {
                 ops::w4a16_gemv(
                     ctx.gpu,
                     self.w4a16_gemv_k,
-                    normed_ssm_i,
+                    normed_out_i,
                     &self.ssm.out_proj,
                     ssm_out_i,
                     h as u32,
@@ -312,37 +305,34 @@ impl Qwen3SsmLayer {
             }
         }
 
-        // ── 10. Residual + post-norm + MoE per-sequence ──
-        // Bug #6 fix: copy SSM outputs to a safe buffer before running MoE.
-        // `self.ffn.forward()` writes its result to `moe_output[0]`, which would
-        // overwrite seq 1's SSM output at `moe_output[h]` if the MoE internally
-        // uses the full moe_output region as scratch. By copying SSM outputs to
-        // `ssm_deinterleaved` (no longer needed after step 9), we decouple them.
-        let ssm_out_safe = ctx.buffers.ssm_deinterleaved(); // reuse, large enough for n*h
-        for i in 0..n {
-            let src = ctx.buffers.moe_output().offset(i * h * bf16);
-            let dst = ssm_out_safe.offset(i * h * bf16);
-            ctx.gpu.copy_d2d_async(src, dst, h * bf16, stream)?;
-        }
-        for i in 0..n {
-            let hidden_i = hidden.offset(i * h * 4); // FP32
-            let ssm_out_i = ssm_out_safe.offset(i * h * bf16);
-            let residual_i = residual.offset(i * h * 4); // FP32
-            let normed2 = ctx.buffers.norm_output().offset(i * h * bf16);
-            ops::residual_add_rms_norm(
-                ctx.gpu,
-                self.residual_add_rms_norm_k,
-                hidden_i,
-                ssm_out_i,
-                &self.post_attn_norm,
-                normed2,
-                residual_i,
-                1,
-                h as u32,
-                eps,
-                stream,
-            )?;
-            let moe_out = self.ffn.forward(normed2, ctx, stream)?;
+        // ── 8. Batched residual + post-attn RMS norm across all N seqs ──
+        // Reads SSM output from `ssm_out_buf[0..n*h*bf16]` (contiguous,
+        // written in step 7) and produces post-norm input for the MoE.
+        let normed2 = ctx.buffers.norm_output();
+        ops::residual_add_rms_norm(
+            ctx.gpu,
+            self.residual_add_rms_norm_k,
+            hidden,
+            ssm_out_buf,
+            &self.post_attn_norm,
+            normed2,
+            residual,
+            n,
+            h as u32,
+            eps,
+            stream,
+        )?;
+
+        // ── 9. Per-seq MoE forward + residual_add (interleaved) ──
+        //
+        // MoE.forward writes its output into `moe_output[0..h*bf16]`
+        // regardless of which sequence it's processing, so we add it back
+        // into the hidden slot for seq i before invoking MoE for seq i+1.
+        // Same pattern as `decode_batched_inner` for non-fused K.
+        for i in 0..num_seqs {
+            let normed2_i = normed2.offset(i * h * bf16);
+            let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
+            let hidden_i = hidden.offset(i * h * residual_elem);
             ops::residual_add(
                 ctx.gpu,
                 self.residual_add_k,
@@ -353,6 +343,51 @@ impl Qwen3SsmLayer {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Per-sequence single-decode fallback. Used when FP32 conv1d / GDN
+    /// kernels aren't loaded (e.g. Metal backend) — the BF16 path uses
+    /// `attn_output` for GDN output, which the batched layout above can't
+    /// safely accommodate for N>1 without overflow.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_per_seq_fallback<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let residual_elem = if ctx.config.use_fp32_residual() {
+            4usize
+        } else {
+            2usize
+        };
+
+        let mut stub_disk = Vec::<u32>::new();
+        let mut stub_last_offloaded = Vec::<u32>::new();
+        for i in 0..num_seqs {
+            let hidden_i = hidden.offset(i * h * residual_elem);
+            let residual_i = residual.offset(i * h * residual_elem);
+            self.decode(
+                hidden_i,
+                residual_i,
+                states[i],
+                kv_cache,
+                seq_lens[i],
+                &mut block_tables[i].clone(),
+                &mut stub_disk,
+                &mut stub_last_offloaded,
+                ctx,
+                stream,
+            )?;
+        }
         Ok(())
     }
 }
