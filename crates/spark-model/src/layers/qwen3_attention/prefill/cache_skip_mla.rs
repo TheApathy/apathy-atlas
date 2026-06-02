@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! MLA branch of `prefill_attention_with_cache_skip`. Mistral4-style
-//! 2-step prefill with the unabsorbed/MHA fused fallback path that
-//! expands K/V via `wkv_b` and runs HDIM=128 FlashAttention. Extracted
-//! from `cache_skip.rs` to keep that file under 500 LoC.
+//! absorbed MLA prefill: Q_absorption + causal attention + V_extraction
+//! via `mla_fused_prefill` (HDIM=320 absorbed space). Extracted from
+//! `cache_skip.rs` to keep that file under 500 LoC.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -13,19 +13,18 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) struct CacheSkipMlaArgs {
     pub normed: DevicePtr,
-    pub num_tokens: usize,
     pub n: u32,
     pub h: u32,
     pub nq: u32,
-    pub nkv: u32,
     pub hd: u32,
-    pub kv_dim: usize,
     pub eps: f32,
-    pub bf16: usize,
     pub stream: u64,
+    /// Number of token positions whose KV entries are already in the cache
+    /// (prefix-cache hit). Only tokens `kv_write_start..n` need to be written.
+    /// 0 = no cached prefix (all tokens are new).
+    pub kv_write_start: usize,
 }
 
 impl Qwen3AttentionLayer {
@@ -37,19 +36,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         args: &CacheSkipMlaArgs,
     ) -> Result<DevicePtr> {
-        let CacheSkipMlaArgs {
-            normed,
-            num_tokens,
-            n,
-            h,
-            nq,
-            nkv,
-            hd,
-            kv_dim,
-            eps,
-            bf16,
-            stream,
-        } = *args;
+        let CacheSkipMlaArgs { normed, n, h, nq, hd, eps, stream, kv_write_start } = *args;
         let mla = self
             .mla
             .as_ref()
@@ -243,86 +230,70 @@ impl Qwen3AttentionLayer {
             mla_cache_dim,
             stream,
         )?;
-        self.write_kv_cache(
-            ctx.gpu,
-            k_cache_assembled,
-            v_cache_assembled,
-            kv_cache,
-            meta.slot,
-            n,
-            1,
-            mla_cache_dim,
-            bs as u32,
-            mla_cache_dim,
-            mla_cache_dim,
-            stream,
-            ctx.graph_capture,
-        )?;
+        // Only write the tokens that are NOT already in the cache.
+        // kv_write_start tokens (prefix-cache hit) already have correct KV
+        // entries at their physical slots; skip them to avoid redundant writes.
+        // Mirror of the non-MLA `write_start` logic in cache_skip.rs.
+        let write_count = (n as usize).saturating_sub(kv_write_start);
+        if write_count > 0 {
+            let bf16 = 2usize; // bytes per BF16 element
+            let cache_elem_offset = kv_write_start * mla_cache_dim as usize;
+            let slot_byte_offset = kv_write_start * 8; // 8 bytes per u64 slot entry
+            self.write_kv_cache(
+                ctx.gpu,
+                k_cache_assembled.offset(cache_elem_offset * bf16),
+                v_cache_assembled.offset(cache_elem_offset * bf16),
+                kv_cache,
+                meta.slot.offset(slot_byte_offset),
+                write_count as u32,
+                1,
+                mla_cache_dim,
+                bs as u32,
+                mla_cache_dim,
+                mla_cache_dim,
+                stream,
+                ctx.graph_capture,
+            )?;
+        }
 
-        // Unabsorbed (MHA) prefill: expand K/V via wkv_b, use HDIM=128 FlashAttention
-        let kv_expanded_dim = nkv * (mla_nope + mla_v_dim);
-        let kv_expanded = ctx.buffers.ssm_deinterleaved();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
-            kv_latent,
-            &mla.wkv_b,
-            kv_expanded,
-            n,
-            kv_expanded_dim,
-            kv_lora,
-            stream,
-        )?;
-        let k_contiguous = ctx.buffers.ssm_qkvz();
-        let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
-        ops::mla_kv_assemble_batched(
-            ctx.gpu,
-            self.mla_kv_assemble_batched_k,
-            kv_expanded,
-            k_rope_buf,
-            k_contiguous,
-            v_contiguous,
-            n,
-            nkv,
-            mla_nope,
-            mla_v_dim,
-            mla_rope,
-            hd,
-            nkv * (mla_nope + mla_v_dim),
-            stream,
-        )?;
-        ops::mla_q_rope_writeback_batched(
-            ctx.gpu,
-            self.mla_q_rope_writeback_batched_k,
-            q_rope_tmp,
-            qg_out,
-            n,
-            nq,
-            hd,
-            mla_nope,
-            mla_rope,
-            nq * hd,
-            stream,
-        )?;
+        // MLA absorbed attention: fused Q_absorb + attention (320-dim) + V_extract.
+        // inferspark_prefill_64 has compile-time HDIM=256; MLA kv_stride=nkv*hd=128 so
+        // col>=128 aliases K[k+1][0..127] — corrupts attention scores over long contexts.
+        // inv_sqrt_d: 1/sqrt(kv_lora + rope) = 1/sqrt(320) — absorbed dimension, NOT hd.
+        // Using 1/sqrt(hd=128) would over-sharpen softmax by sqrt(128/320) ≈ 0.63.
         let attn_out_fb = ctx.buffers.attn_output();
-        ops::prefill_attention_64(
+        // inv_sqrt_d in the absorbed space: 1/sqrt(kv_lora + rope) = 1/sqrt(320).
+        // Using 1/sqrt(hd=128) would over-sharpen softmax by sqrt(128/320) ≈ 0.63.
+        let inv_sqrt_d_absorbed = 1.0f32 / ((kv_lora + mla_rope) as f32).sqrt();
+        anyhow::ensure!(
+            self.mla_fused_prefill_k.0 != 0,
+            "MLA cache-skip prefill requires mla_fused_prefill kernel \
+             (inferspark_prefill HDIM=256 is broken for MLA hd=128; \
+              rebuild with kernels/gb10/mistral-small-4/nvfp4/mla_fused_prefill.cu)"
+        );
+        ops::mla_fused_prefill(
             ctx.gpu,
-            self.prefill_attn_64_k,
+            self.mla_fused_prefill_k,
             qg_out,
-            k_contiguous,
-            v_contiguous,
+            q_rope_tmp,
+            kv_latent,
+            k_rope_buf,
+            mla.w_uk_t.weight,
+            mla.w_uv.weight,
             attn_out_fb,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
             n,
-            1,
             nq,
-            nkv,
+            mla_nope,
+            mla_rope,
+            kv_lora,
+            mla_v_dim,
             hd,
-            1.0f32 / (hd as f32).sqrt(),
-            true,
-            0,
+            inv_sqrt_d_absorbed,
             stream,
         )
-        .map_err(|e| anyhow::anyhow!("MLA flash_attn_64 fallback: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("MLA fused prefill: {e}"))?;
         // wo projection — output to qkv_output (norm_output aliases downstream)
         let o_out = ctx.buffers.qkv_output();
         if let Some(ref wo_nvfp4) = mla.wo_nvfp4 {
@@ -334,7 +305,7 @@ impl Qwen3AttentionLayer {
                 o_out,
                 n,
                 h,
-                nq * hd,
+                nq * mla_v_dim,
                 stream,
             )?;
         } else {
@@ -346,7 +317,7 @@ impl Qwen3AttentionLayer {
                 o_out,
                 n,
                 h,
-                nq * hd,
+                nq * mla_v_dim,
                 stream,
             )?;
         }

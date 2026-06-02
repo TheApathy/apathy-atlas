@@ -89,16 +89,13 @@ impl Qwen3AttentionLayer {
         if self.mla.is_some() {
             let args = super::cache_skip_mla::CacheSkipMlaArgs {
                 normed,
-                num_tokens,
                 n,
                 h,
                 nq,
-                nkv,
                 hd,
-                kv_dim,
                 eps,
-                bf16,
                 stream,
+                kv_write_start,
             };
             return self.prefill_attention_cache_skip_mla(kv_cache, ctx, &args);
         }
@@ -143,22 +140,6 @@ impl Qwen3AttentionLayer {
                 q_proj_dim as u32,
                 stream,
             )?;
-        } else if self.mla.is_some() {
-            // DIAGNOSTIC: check V BEFORE Q copy
-            if self.attn_layer_idx == 0 && ctx.config.model_type == "mistral" {
-                ctx.gpu.synchronize(stream)?;
-                let v_chk = k_contiguous.offset(num_tokens * kv_dim * bf16);
-                crate::layers::qwen3_attention::trait_impl::diag_norm(
-                    ctx.gpu,
-                    v_chk,
-                    (nkv * hd) as usize,
-                    stream,
-                    "L0 V BEFORE Q_copy",
-                );
-            }
-            ctx.gpu
-                .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
-                .map_err(|e| anyhow::anyhow!("MLA Q copy failed: {e}"))?;
         } else {
             ctx.gpu
                 .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
