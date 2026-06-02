@@ -1159,7 +1159,7 @@ mod tests {
     fn greedy_walk_accepts_chain_when_target_matches() {
         let tree = build_ddtree(&demo_candidates(), 8, 3, true, 0, u32::MAX).unwrap();
         // Oracle: always pick chain tokens 101, 201, 301, 401.
-        let chain = vec![101u32, 201, 301, 401];
+        let chain = [101u32, 201, 301, 401];
         let oracle = |path: &[u32]| -> u32 {
             let next_depth = path.len();
             if next_depth < chain.len() {
