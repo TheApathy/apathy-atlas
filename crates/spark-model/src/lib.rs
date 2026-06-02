@@ -2,13 +2,17 @@
 
 #![deny(warnings)]
 #![deny(clippy::all)]
-// PR #74 merge added several "never-used" items (diagnostic dumps, prefill
-// helpers our DFlash path doesn't call). They're upstream's diagnostic
-// scaffolding — allowed at crate level so deny(warnings) still catches
-// new dead code in our own additions.
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
+// The PR #74 merge added a few diagnostic / upstream-only helpers our
+// DFlash path doesn't call. Earlier this was a crate-level
+// `#![allow(dead_code)]` shotgun, which masked any NEW dead code we
+// introduced anywhere in spark-model. The shotgun is now scoped to
+// the 4 individual files that legitimately need it (env-gated debug
+// dumpers + upstream-only prefill helpers); deny(warnings) again
+// catches new dead code in our own additions.
+//
+// Empirically validated: removing `unused_imports` + `unused_variables`
+// shotguns produces ZERO new warnings; only `dead_code` had real items
+// to silence, which are now narrowed to file-level allows.
 // Kernel-launch helpers and trait-impl wide signatures legitimately exceed
 // clippy's 7-argument default. The same goes for the indexing-loop patterns
 // that mirror the kernel grids we dispatch.

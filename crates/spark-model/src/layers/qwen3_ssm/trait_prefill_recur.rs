@@ -20,7 +20,12 @@ impl Qwen3SsmLayer {
     /// Env overrides:
     /// - `ATLAS_DISABLE_WY4=1` — skip WY4-persistent.
     /// - `ATLAS_FORCE_PERSISTENT=1` — force single-token persistent at any `k`.
+    ///
+    /// Upstream-only helper: PR #74 prefill path. Our DFlash prefill takes a
+    /// different code path, so this method stays compiled as a reference but
+    /// isn't called in the default build.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(super) fn prefill_gdn_recurrence(
         &self,
         h_state: DevicePtr,

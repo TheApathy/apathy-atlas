@@ -15,7 +15,12 @@ impl Qwen3SsmLayer {
     /// Writes the sequential `[Q|K|V|Z]` projection into the
     /// `ssm_deinterleaved` buffer. `force_bf16` (= `ATLAS_GDN_BF16_WEIGHTS`)
     /// bypasses both the FP8 and NVFP4 weight-quant paths.
+    ///
+    /// Upstream-only helper: PR #74 prefill path. Our DFlash prefill takes
+    /// a different code path (see `decode_a2` + `verify_*`), so this method
+    /// stays compiled as a reference but isn't called in the default build.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(super) fn prefill_qkvz_proj(
         &self,
         normed: DevicePtr,

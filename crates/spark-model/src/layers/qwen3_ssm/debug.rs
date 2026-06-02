@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//
+// Env-gated debug dumpers. Wired through ATLAS_DUMP_* environment variables
+// and only activated for offline diagnostic runs, so the items here are
+// legitimately "never used" in a default build.
+#![allow(dead_code)]
 
 //! Debug print helpers + env-gated GDN intermediate dumper for
 //! per-layer numerical comparison vs an HF CPU oracle. See
