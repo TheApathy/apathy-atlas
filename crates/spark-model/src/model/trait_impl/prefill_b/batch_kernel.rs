@@ -397,6 +397,10 @@ impl TransformerModel {
             profile: self.profile,
             comm: self.comm_ref(),
             graph_capture: false,
+            // PR #74 added 3 ddtree/tree-aware fields on ForwardContext.
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
         };
 
         // h_state_ptrs scratch slot offset (used JIT per SSM layer).

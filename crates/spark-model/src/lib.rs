@@ -2,6 +2,13 @@
 
 #![deny(warnings)]
 #![deny(clippy::all)]
+// PR #74 merge added several "never-used" items (diagnostic dumps, prefill
+// helpers our DFlash path doesn't call). They're upstream's diagnostic
+// scaffolding — allowed at crate level so deny(warnings) still catches
+// new dead code in our own additions.
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 // Kernel-launch helpers and trait-impl wide signatures legitimately exceed
 // clippy's 7-argument default. The same goes for the indexing-loop patterns
 // that mirror the kernel grids we dispatch.

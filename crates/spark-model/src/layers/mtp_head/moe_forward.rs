@@ -44,16 +44,30 @@ impl MtpHead {
         } else {
             ctx.config.moe_intermediate_size as u32
         };
-        let (gate_w, up_w, down_w) = self
-            .dense_ffn_generic
+        // Our local DFlash work uses individual Option fields rather than
+        // upstream's tuple `dense_ffn_generic: Option<(W, W, W)>`. Same data,
+        // just decomposed.
+        let gate_w = self
+            .dense_mlp_gate
             .as_ref()
-            .expect("dense_ffn_forward_generic called without dense_ffn_generic populated");
+            .expect("dense_ffn_forward_generic called without dense_mlp_gate populated");
+        let up_w = self
+            .dense_mlp_up
+            .as_ref()
+            .expect("dense_ffn_forward_generic called without dense_mlp_up populated");
+        let down_w = self
+            .dense_mlp_down
+            .as_ref()
+            .expect("dense_ffn_forward_generic called without dense_mlp_down populated");
 
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
-        self.gemv(ctx.gpu, input, gate_w, gate_out, inter, h, stream)?;
-        self.gemv(ctx.gpu, input, up_w, up_out, inter, h, stream)?;
+        // Our dense_mlp_gate/up/down are QuantizedWeight (NVFP4). Upstream's
+        // gemv() dispatcher expects ProjectionWeight enum — bypass by calling
+        // the NVFP4 path directly.
+        ops::w4a16_gemv(ctx.gpu, self.w4a16_gemv_k, input, gate_w, gate_out, inter, h, stream)?;
+        ops::w4a16_gemv(ctx.gpu, self.w4a16_gemv_k, input, up_w, up_out, inter, h, stream)?;
 
         ops::moe_silu_mul(
             ctx.gpu,
@@ -66,7 +80,7 @@ impl MtpHead {
         )?;
 
         let output = ctx.buffers.moe_output();
-        self.gemv(ctx.gpu, gate_out, down_w, output, h, inter, stream)?;
+        ops::w4a16_gemv(ctx.gpu, self.w4a16_gemv_k, gate_out, down_w, output, h, inter, stream)?;
         Ok(output)
     }
 
