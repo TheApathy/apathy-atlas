@@ -37,11 +37,7 @@ static PAIR_OVERLAP_SUM: AtomicU64 = AtomicU64::new(0);
 static TRIPLE_OVERLAP_SUM: AtomicU64 = AtomicU64::new(0);
 static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 // Histogram of unique-count distribution (clamped 0..=64).
-static UNIQUE_HIST: [AtomicUsize; 65] = {
-    // workaround: const array of AtomicUsize requires explicit init list.
-    const A: AtomicUsize = AtomicUsize::new(0);
-    [A; 65]
-};
+static UNIQUE_HIST: [AtomicUsize; 65] = [const { AtomicUsize::new(0) }; 65];
 
 #[inline]
 pub fn is_enabled() -> bool {

@@ -14,9 +14,7 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     if config.model_type == "minimax_m2" {
         return Some(1.02);
     }
-    let Some(qc) = config.quantization_config.as_ref() else {
-        return None;
-    };
+    let qc = config.quantization_config.as_ref()?;
     if qc.quant_method == "fp8" {
         return Some(1.05);
     }

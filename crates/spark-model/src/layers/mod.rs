@@ -482,6 +482,7 @@ pub fn dflash_attn_kgamma_enabled() -> bool {
 ///   - NVFP4 KV cache
 ///   - No tree-aware indirection active (legacy kernel handles tree mode)
 ///   - `head_dim == 256` (kernel compiled with HDIM=256)
+///
 /// Default off until proven; falls back to the legacy per-query path.
 /// Cached via `OnceLock`.
 pub fn flash_attn_kgamma_enabled() -> bool {
@@ -512,6 +513,7 @@ pub fn flash_attn_kgamma_enabled() -> bool {
 ///   - `ATLAS_FLASH_ATTN_KGAMMA_SPLITK` is NOT effective (splitk path keeps
 ///     using its own kernel for now — vec optimization can be ported later)
 ///   - vec kernel resolved at init
+///
 /// Default off until proven. Cached via `OnceLock`.
 pub fn flash_attn_kgamma_vecdequant_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -555,6 +557,7 @@ pub fn flash_attn_kgamma_splitk_enabled() -> bool {
 ///   - `ATLAS_FA2_KGAMMA=1`
 ///   - `ATLAS_FLASH_ATTN_KGAMMA=1` (the gate that activates the kgamma path)
 ///   - fa2 kernel resolved at init (`paged_decode_kgamma_fa2_k`)
+///
 /// Takes precedence over the VEC variant when both are enabled.
 /// Default off until proven. Cached via `OnceLock`.
 pub fn flash_attn_kgamma_fa2_enabled() -> bool {

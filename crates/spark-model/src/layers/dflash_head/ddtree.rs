@@ -326,7 +326,7 @@ pub fn build_ddtree(
     } else if min_root_branches > 0 {
         let take = min_root_branches.min(candidates[0].len());
         for i in 0..take {
-            if nodes.len() - 1 >= budget {
+            if nodes.len() > budget {
                 break;
             }
             let cand = candidates[0][i];

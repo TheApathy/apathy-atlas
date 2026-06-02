@@ -70,9 +70,9 @@ fn compute_num_splits(num_q_heads: u32, num_seqs: u32, max_seq_len_host: u32) ->
         return legacy;
     }
 
-    let seq_target = ((max_seq_len_host + SPLIT_TILE - 1) / SPLIT_TILE)
-        .max(1)
-        .min(MAX_SPLITS_CAP);
+    let seq_target = max_seq_len_host
+        .div_ceil(SPLIT_TILE)
+        .clamp(1, MAX_SPLITS_CAP);
     // Keep at least `legacy` splits — never regress on the fill-SMs heuristic.
     // The kernel handles num_splits=1 directly via the non-splitk fallback, so
     // only invoke split-K when we have something to gain (>= 2 splits).

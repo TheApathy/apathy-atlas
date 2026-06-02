@@ -426,8 +426,7 @@ impl BlockDiffusionDraftHead {
                 .or_else(|| std::env::var("DDTREE_TOP_K").ok())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8)
-                .min(super::DDTREE_TOP_K_MAX)
-                .max(1);
+                .clamp(1, super::DDTREE_TOP_K_MAX);
             let budget: usize = std::env::var("ATLAS_DDTREE_BUDGET")
                 .ok()
                 .or_else(|| std::env::var("DDTREE_BUDGET").ok())

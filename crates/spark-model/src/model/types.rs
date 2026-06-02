@@ -46,6 +46,7 @@ pub struct TransformerModel {
     ///     Re-stamped after every tree-mode verify by `clear_ddtree_parent_ids`.
     ///   * Tree-mode override: `set_ddtree_parent_ids` overwrites in place
     ///     with the kernel-frame mapping of the current payload.
+    ///
     /// The DEVICE POINTER never changes — that's the invariant captured
     /// CUDA graphs rely on. `DevicePtr::NULL` when DFlash is disabled.
     pub ddtree_parent_ids_persistent: spark_runtime::gpu::DevicePtr,

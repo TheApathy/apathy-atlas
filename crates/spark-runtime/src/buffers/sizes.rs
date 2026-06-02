@@ -160,9 +160,9 @@ impl BufferSizes {
             const SPLIT_TILE: usize = 512;
             const MAX_SPLITS_CAP: usize = 64;
             const MAX_DECODE_SEQS: usize = 32;
-            let max_splits = ((max_seq_len + SPLIT_TILE - 1) / SPLIT_TILE)
-                .max(2)
-                .min(MAX_SPLITS_CAP);
+            let max_splits = max_seq_len
+                .div_ceil(SPLIT_TILE)
+                .clamp(2, MAX_SPLITS_CAP);
             MAX_DECODE_SEQS * q_heads * max_splits * (hd + 2) * 4
         } else {
             48 * (hd + 2) * 4

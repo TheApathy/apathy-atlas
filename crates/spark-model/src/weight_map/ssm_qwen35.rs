@@ -63,12 +63,11 @@ pub(crate) fn load_ssm_qwen35(
         if store.contains(&format!("{prefix}.weight_packed")) {
             return true;
         }
-        if let Ok(w) = store.get(&format!("{prefix}.weight")) {
-            if w.dtype == WeightDtype::UInt8
-                && store.contains(&format!("{prefix}.weight_scale_2"))
-            {
-                return true;
-            }
+        if let Ok(w) = store.get(&format!("{prefix}.weight"))
+            && w.dtype == WeightDtype::UInt8
+            && store.contains(&format!("{prefix}.weight_scale_2"))
+        {
+            return true;
         }
         false
     };
