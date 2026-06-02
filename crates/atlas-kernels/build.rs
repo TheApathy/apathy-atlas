@@ -517,9 +517,14 @@ fn collect_cu_files(
     common_dir: Option<&std::path::Path>,
     model_dir: &std::path::Path,
 ) -> Vec<PathBuf> {
-    // Derive the shared dir from common_dir's parent (so we get
-    // `kernels/$hw/common/` when common is `kernels/$hw/$quant/`).
-    let shared_dir = common_dir.and_then(|c| c.parent().map(|p| p.join("common")));
+    // Derive shared dir from the model dir's hw ancestor — works whether
+    // common_dir is present or None. Layout assumption:
+    //   model_dir = kernels/$hw/$model/$quant/
+    //   shared    = kernels/$hw/common/
+    let shared_dir = model_dir
+        .parent()                          // kernels/$hw/$model/
+        .and_then(|p| p.parent())          // kernels/$hw/
+        .map(|p| p.join("common"));
 
     let mut files: HashMap<String, PathBuf> = HashMap::new();
 
