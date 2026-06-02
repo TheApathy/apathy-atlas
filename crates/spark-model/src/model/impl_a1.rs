@@ -404,12 +404,17 @@ impl TransformerModel {
             )
         };
 
-        // Marconi SSM snapshot pool for prefix caching
+        // Marconi SSM snapshot pool for prefix caching.
+        // PR #74 added decode_ring_slots + decode_max_seqs args for the
+        // Phase-C decode-rollback region. We set both to 0 (decode rollback
+        // disabled) — Marconi caching still works the same.
         let ssm_snapshots = SsmSnapshotPool::new(
             ssm_cache_slots,
             ssm_pool.h_bytes,
             ssm_pool.conv_bytes,
             ssm_pool.num_ssm_layers,
+            0,  // decode_ring_slots
+            0,  // decode_max_seqs
             gpu.as_ref(),
         )?;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {

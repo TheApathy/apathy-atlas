@@ -6,6 +6,12 @@
 //! (gate+up, silu+down) instead of 10 × 5 individual launches. Expert indices
 //! and weights stay on device — zero D2H synchronization.
 
+// PR #74 brought in `dump.rs` and `forward_prefill_routed.rs` as new
+// submodules. We took ours on this file but need to declare the new files
+// so their pub items are reachable.
+mod dump;
+mod forward_prefill_routed;
+
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
