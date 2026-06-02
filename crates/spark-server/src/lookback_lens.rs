@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//
+// Research scaffolding: the rerank() + GroundedClassifier pieces are
+// shipped but the inference-time per-head attention-mass hook that
+// would invoke them isn't wired yet. Allow at module level so the
+// API surface stays compilable.
+#![allow(dead_code)]
 
 //! Lookback-Lens guided decoding (C.4, 2026-04-25).
 //!

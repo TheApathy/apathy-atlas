@@ -64,6 +64,11 @@ pub struct AppState {
     /// Effective context length for agentic tasks (from MODEL.toml).
     /// Compaction triggers when prompt exceeds 50% of this value.
     /// 0 = use max_seq_len instead.
+    ///
+    /// Wired in at the serve.rs construction site (`effective_context: 0`,
+    /// TODO: embed in TargetPtxSet) but no read sites consume it yet —
+    /// kept for the future compaction trigger plumbing.
+    #[allow(dead_code)]
     pub effective_context: usize,
     /// Model-specific behavior overrides from MODEL.toml `[behavior]`.
     /// Embedded at build time via atlas-kernels.
@@ -94,5 +99,8 @@ pub struct AppState {
     pub auth: Option<Arc<auth::AuthConfig>>,
 }
 
-/// Re-export for convenience in api.rs / anthropic.rs.
+/// Re-export for convenience in api.rs / anthropic.rs. Reserved for the
+/// behavior-driven request paths that the live handlers currently access
+/// directly via `state.behavior.*` instead of through the alias.
+#[allow(dead_code)]
 pub type ModelBehavior = atlas_kernels::ModelBehavior;

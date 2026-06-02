@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//
+// Research scaffolding: LASER router_entropy / laser_top_k + MoE-Spec
+// budget_experts are characterized but not yet wired into the verify
+// path. Allow at module level so the API surface stays compilable.
+#![allow(dead_code)]
 
 //! MoE quality interventions: LASER routing rebalance + MoE-Spec
 //! verification-time expert budgeting (B.5, 2026-04-25).

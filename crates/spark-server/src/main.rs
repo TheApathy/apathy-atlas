@@ -2,6 +2,18 @@
 
 #![deny(warnings)]
 #![deny(clippy::all)]
+// `#![allow(dead_code)]` is retained at the binary-crate level because
+// spark-server ships ~20 module files that are operational scaffolding
+// (LASER routing, lookback-lens reranking, retrieval-head probes,
+// SymbolTrie token-constraint, etc.) — instantiated by an upcoming
+// scheduler hook but not yet wired in. Auditing and per-item narrowing
+// is desirable but mechanical; the lib-side audit was the high-value
+// pass (it masked exactly ONE leaking duplicate, ChatTokenizer::
+// TEMPLATE_OVERRIDE_DIR). File-level allows added to the 5 highest-
+// density research-scaffolding modules below tighten the loop:
+//   - lqer.rs, tool_rag.rs, moe_quality.rs, llmlingua.rs, lookback_lens.rs
+// This crate-level allow shrinks but doesn't disappear pending a
+// dedicated dead-code sweep.
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]

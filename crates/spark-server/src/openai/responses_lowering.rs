@@ -12,6 +12,10 @@ pub enum LowerResponsesError {
 }
 
 impl LowerResponsesError {
+    // Live callers destructure the variants directly via `match`; kept as
+    // a stable string-getter for any future consumer that needs the
+    // message without inspecting the variant.
+    #[allow(dead_code)]
     pub fn message(&self) -> &str {
         match self {
             Self::BadRequest(m) | Self::PriorNotFound(m) => m.as_str(),
@@ -228,39 +232,7 @@ pub fn lower_responses_to_chat(
     })
 }
 
-/// UUID v4 generation using OS randomness (no external crate needed).
-pub(crate) fn uuid_v4() -> String {
-    let mut bytes = [0u8; 16];
-    // Use getrandom via std (available since Rust 1.36)
-    if let Ok(()) = getrandom(&mut bytes) {
-        // Set version 4 (bits 48-51) and variant 1 (bits 64-65)
-        bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
-        bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant 1
-    } else {
-        // Fallback: nanosecond timestamp (unique but not random)
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        bytes = t.to_le_bytes();
-    }
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    )
-}
+// Canonical `uuid_v4` lives in `openai/mod.rs::uuid_v4`. A verbatim
+// duplicate that lived here was dead code (no `responses_lowering`-local
+// caller; all live callers reach the openai/mod one via
+// `crate::openai::uuid_v4`).

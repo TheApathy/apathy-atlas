@@ -46,6 +46,9 @@ pub struct SystemBlock {
 }
 
 impl SystemContent {
+    // Live translator already inlines the to-string logic; kept exported as
+    // a stable conversion helper for the types module surface.
+    #[allow(dead_code)]
     pub(super) fn to_text(&self) -> String {
         match self {
             SystemContent::Text(s) => s.clone(),
@@ -111,7 +114,10 @@ pub enum ContentBlock {
     },
     #[serde(rename = "thinking")]
     Thinking {
+        // Deserialized off the wire for spec completeness; the translator
+        // currently drops thinking-block content rather than echoing it.
         #[serde(default)]
+        #[allow(dead_code)]
         thinking: Option<String>,
     },
     #[serde(other)]

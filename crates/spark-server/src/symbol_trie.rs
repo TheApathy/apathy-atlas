@@ -58,6 +58,12 @@ struct TrieNode {
 }
 
 /// Public construction interface — the caller supplies the tokeniser.
+//
+// Production builds the trie via `SymbolTrie::build` with an inline
+// concrete tokeniser type rather than dispatching through this trait. The
+// trait remains as the public construction surface for external callers
+// that need to swap in a non-stock tokeniser.
+#[allow(dead_code)]
 pub trait Tokeniser {
     /// Encode `s` to a sequence of token IDs. Implementations must
     /// match the model's tokeniser (incl. BPE merges + BOS/EOS rules)

@@ -42,6 +42,10 @@ pub enum StoredKind {
 }
 
 impl StoredKind {
+    // Live callers concatenate prefix literals inline (e.g.,
+    // `format!("resp_{}", uuid_v4())`); this getter is kept for any future
+    // path that decides the prefix from a `StoredKind` value.
+    #[allow(dead_code)]
     pub fn id_prefix(self) -> &'static str {
         match self {
             StoredKind::Response => "resp_",

@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//
+// Research scaffolding: full descriptor + (de)serializer for the LQER
+// loader is implemented here, but the runtime dispatcher integration that
+// would consume it hasn't shipped yet. Allow at the module level rather
+// than per-item so the API surface stays compilable without bleeding into
+// the rest of the crate.
+#![allow(dead_code)]
 
 //! LQER — Low-Rank Quantization Error Reconstruction (C.2, 2026-04-25).
 //!
