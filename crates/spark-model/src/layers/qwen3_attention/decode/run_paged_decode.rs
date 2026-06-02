@@ -188,7 +188,7 @@ impl Qwen3AttentionLayer {
                 }
             }
             // Turbo4/3: same 4-bit interface as NVFP4 (block_stride + data_section layout).
-            KvCacheDtype::Turbo4 | KvCacheDtype::Turbo3 => {
+            KvCacheDtype::Turbo4 | KvCacheDtype::Turbo3 | KvCacheDtype::Turbo2 => {
                 let kernel = if head_dim > 256 && self.paged_decode_512_k.0 != 0 {
                     self.paged_decode_512_k
                 } else {
@@ -196,6 +196,7 @@ impl Qwen3AttentionLayer {
                 };
                 let data_bytes = match self.kv_dtype {
                     KvCacheDtype::Turbo3 => kv_cache.turbo3_data_bytes() as u64,
+                    KvCacheDtype::Turbo2 => kv_cache.turbo2_data_bytes() as u64,
                     _ => kv_cache.turbo4_data_bytes() as u64,
                 };
                 ops::paged_decode_attn_nvfp4(
@@ -254,6 +255,262 @@ impl Qwen3AttentionLayer {
                     kv_indir_stride,
                     stream,
                 )
+            }
+            KvCacheDtype::Bf16KTurbo3V => {
+                // TurboQuant+ safer-asym Bf16K + Turbo3V combined paged decode.
+                // K read as BF16 NHD (vector loads), V read as turbo3 (3-bit
+                // packed + FP8 group scale, sparse-V threshold on batched +
+                // remainder paths). Single combined kernel per HDIM variant.
+                let sliding = self.sliding_window.unwrap_or(0);
+                ops::paged_decode_attn_bf16k_turbo3v(
+                    gpu,
+                    self.paged_decode_k,
+                    q,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    output,
+                    block_table,
+                    seq_lens,
+                    max_blocks_per_seq,
+                    num_seqs,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    inv_sqrt_d,
+                    q_stride,
+                    kv_cache.v_block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    kv_cache.turbo3_data_bytes() as u64,
+                    sliding,
+                    stream,
+                )
+            }
+            KvCacheDtype::Bf16KTurbo4V => {
+                // TurboQuant+ safer-asym Bf16K + Turbo4V combined paged decode.
+                // K read as BF16 NHD, V read as turbo4 (4-bit packed + FP8
+                // group scale, sparse-V threshold on batched + remainder paths).
+                let sliding = self.sliding_window.unwrap_or(0);
+                ops::paged_decode_attn_bf16k_turbo4v(
+                    gpu,
+                    self.paged_decode_k,
+                    q,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    output,
+                    block_table,
+                    seq_lens,
+                    max_blocks_per_seq,
+                    num_seqs,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    inv_sqrt_d,
+                    q_stride,
+                    kv_cache.v_block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    kv_cache.nvfp4_data_bytes() as u64,
+                    sliding,
+                    stream,
+                )
+            }
+            KvCacheDtype::Bf16KTurbo2V => {
+                // TurboQuant+ safer-asym Bf16K + Turbo2V (6.4x V compression)
+                // combined paged decode. K read as BF16 NHD, V read as turbo2
+                // (2-bit packed + FP8 group scale, sparse-V threshold).
+                let sliding = self.sliding_window.unwrap_or(0);
+                ops::paged_decode_attn_bf16k_turbo2v(
+                    gpu,
+                    self.paged_decode_k,
+                    q,
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    output,
+                    block_table,
+                    seq_lens,
+                    max_blocks_per_seq,
+                    num_seqs,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    block_size,
+                    inv_sqrt_d,
+                    q_stride,
+                    kv_cache.v_block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                    kv_cache.turbo2_data_bytes() as u64,
+                    sliding,
+                    stream,
+                )
+            }
+            KvCacheDtype::Turbo4KTurbo3V
+            | KvCacheDtype::Turbo4KTurbo8V
+            | KvCacheDtype::Turbo3KTurbo8V => {
+                // TurboQuant+ both-sides asym: K and V both turbo. Pass per-side
+                // (block_stride, data_section) pairs since K and V pools have
+                // independent byte layouts.
+                let sliding = self.sliding_window.unwrap_or(0);
+                let k_block_stride =
+                    kv_cache.k_block_stride_bytes_for_layer(self.attn_layer_idx) as u64;
+                let v_block_stride =
+                    kv_cache.v_block_stride_bytes_for_layer(self.attn_layer_idx) as u64;
+                let k_pool = kv_cache.k_pool_ptr(self.attn_layer_idx);
+                let v_pool = kv_cache.v_pool_ptr(self.attn_layer_idx);
+                match self.kv_dtype {
+                    KvCacheDtype::Turbo4KTurbo3V => ops::paged_decode_attn_turbo4k_turbo3v(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        k_block_stride,
+                        kv_cache.nvfp4_data_bytes() as u64,
+                        v_block_stride,
+                        kv_cache.turbo3_data_bytes() as u64,
+                        sliding,
+                        stream,
+                    ),
+                    KvCacheDtype::Turbo4KTurbo8V => ops::paged_decode_attn_turbo4k_turbo8v(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        k_block_stride,
+                        kv_cache.nvfp4_data_bytes() as u64,
+                        v_block_stride,
+                        kv_cache.turbo8_data_bytes() as u64,
+                        sliding,
+                        stream,
+                    ),
+                    KvCacheDtype::Turbo3KTurbo8V => ops::paged_decode_attn_turbo3k_turbo8v(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        k_block_stride,
+                        kv_cache.turbo3_data_bytes() as u64,
+                        v_block_stride,
+                        kv_cache.turbo8_data_bytes() as u64,
+                        sliding,
+                        stream,
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            KvCacheDtype::Fp8KTurbo3V | KvCacheDtype::Fp8KTurbo4V | KvCacheDtype::Fp8KTurbo2V => {
+                // TurboQuant+ asym for FP8 models: K=fp8 (per-tensor scale),
+                // V=turbo{3,4,2} with sparse-V threshold on batched + remainder.
+                let sliding = self.sliding_window.unwrap_or(0);
+                let (k_scale, _) = self.effective_fp8_scales();
+                let v_block_stride =
+                    kv_cache.v_block_stride_bytes_for_layer(self.attn_layer_idx) as u64;
+                let k_pool = kv_cache.k_pool_ptr(self.attn_layer_idx);
+                let v_pool = kv_cache.v_pool_ptr(self.attn_layer_idx);
+                match self.kv_dtype {
+                    KvCacheDtype::Fp8KTurbo3V => ops::paged_decode_attn_fp8k_turbo3v(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        k_scale,
+                        q_stride,
+                        v_block_stride,
+                        kv_cache.turbo3_data_bytes() as u64,
+                        sliding,
+                        stream,
+                    ),
+                    KvCacheDtype::Fp8KTurbo4V => ops::paged_decode_attn_fp8k_turbo4v(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        k_scale,
+                        q_stride,
+                        v_block_stride,
+                        kv_cache.nvfp4_data_bytes() as u64,
+                        sliding,
+                        stream,
+                    ),
+                    KvCacheDtype::Fp8KTurbo2V => ops::paged_decode_attn_fp8k_turbo2v(
+                        gpu,
+                        self.paged_decode_k,
+                        q,
+                        k_pool,
+                        v_pool,
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        k_scale,
+                        q_stride,
+                        v_block_stride,
+                        kv_cache.turbo2_data_bytes() as u64,
+                        sliding,
+                        stream,
+                    ),
+                    _ => unreachable!(),
+                }
             }
             KvCacheDtype::Bf16 => {
                 // BF16 paged decode — no Split-K (not implemented for BF16 yet)
