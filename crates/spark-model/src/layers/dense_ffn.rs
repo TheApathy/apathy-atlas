@@ -1170,11 +1170,14 @@ impl DenseFfnLayer {
                 std::env::var("ATLAS_FFN_M128_V2").ok().as_deref() == Some("1");
             let e2m1_gate_on =
                 std::env::var("ATLAS_E2M1_GEMM").ok().as_deref() == Some("1");
+            let e2m1_down_only_gate_on =
+                std::env::var("ATLAS_E2M1_GEMM_DOWN_ONLY").ok().as_deref() == Some("1");
             tracing::info!(
                 m,
                 inter,
                 h,
                 e2m1_fast_path,
+                e2m1_down_only_path,
                 fp8_fast_path,
                 v2_fast_path,
                 fast_path,
@@ -1189,17 +1192,20 @@ impl DenseFfnLayer {
                 fp8_gate = fp8_gate_on,
                 v2_gate = v2_gate_on,
                 e2m1_gate = e2m1_gate_on,
+                e2m1_down_only_gate = e2m1_down_only_gate_on,
                 "dense_ffn forward_prefill dispatch (one-shot)"
             );
             eprintln!(
                 "[atlas-prefill-ffn] dispatch: M={m} inter={inter} h={h} \
                  e2m1_fast_path={e2m1_fast_path} \
+                 e2m1_down_only_path={e2m1_down_only_path} \
                  fp8_fast_path={fp8_fast_path} v2_fast_path={v2_fast_path} \
                  fast_path={fast_path} has_e2m1={has_e2m1} has_fp8={has_fp8} \
                  has_transposed={has_t} e2m1_kernel={e2m1_ok} \
                  fp8_m128_kernel={fp8_m128_ok} \
                  m128_v2_kernel={m128_v2_ok} m128_kernel={m128_ok} \
                  e2m1_gate=ATLAS_E2M1_GEMM={e2m1_gate_on} \
+                 e2m1_down_only_gate=ATLAS_E2M1_GEMM_DOWN_ONLY={e2m1_down_only_gate_on} \
                  gate=ATLAS_PREFILL_FFN_FAST={gate_on} \
                  fp8_gate=ATLAS_FFN_PREDEQUANT_FP8={fp8_gate_on} \
                  v2_gate=ATLAS_FFN_M128_V2={v2_gate_on}"
