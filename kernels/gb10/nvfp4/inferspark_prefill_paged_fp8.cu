@@ -48,25 +48,13 @@ __device__ __forceinline__ __nv_bfloat16 fp8_to_bf16(__nv_fp8_storage_t b, float
     , const float k_scale \
     , const float v_scale \
     , const unsigned long long fp8_cache_stride
-#define KERNEL_PREAMBLE \
-    const float dq_scale = (K_cache == V_cache) ? k_scale : \
-        ((const void*)smem_Q == (const void*)smem_V ? v_scale : k_scale); \
-    /* This hack won't work; we need separate K/V dequant scales. */ \
-    /* Actually: dq_scale is set per LOAD_KV_TILE call via the cache ptr. */ \
-    /* For now, use a shared approach: k_scale for K loads, v_scale for V loads. */ \
-    /* The LOAD_KV_TILE macro captures `dq_scale` from scope. */ \
-    /* We'll set it before each load in the compute header... */ \
-    /* FIXME: For FP8, we need K and V to use different scales. */ \
-    /* Simple approach: the compute header loads K with dq_scale=k_scale, V with dq_scale=v_scale. */ \
-    (void)0;
+#define KERNEL_PREAMBLE /* per-K/V scales now selected inside LOAD_KV_TILE below */
 
-/* Problem: the shared compute header uses LOAD_KV_TILE for both K and V,
-   but FP8 needs different scales. Override with a scale-aware approach. */
-
-/* Actually, let me take a different approach. For FP8, the scale depends on
-   whether we're loading K or V. The compute header calls LOAD_KV_TILE with
-   K_cache for K tiles and V_cache for V tiles. We can use the cache pointer
-   to determine which scale to use. */
+// K and V need DIFFERENT dequant scales under FP8 KV cache. The shared
+// `prefill_paged_compute.cuh` header calls LOAD_KV_TILE for K tiles with
+// the K_cache pointer and for V tiles with V_cache. We override the macro
+// so it inspects the pointer at the call site and selects k_scale for
+// K-side loads, v_scale for V-side. This was the FIXME above (now fixed).
 
 #undef LOAD_KV_TILE
 #define LOAD_KV_TILE(cache, bt, smem, kv_s, kv_l, kvh, t, stride) \
