@@ -48,6 +48,10 @@ for name, prompt in PROMPTS:
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": MAX_TOKENS,
             "temperature": 0.0,
+            # PR #74 enabled thinking-by-default on Qwen3.6 — explicitly
+            # disable so we measure useful-token throughput (otherwise
+            # thinking-mode reasoning tokens inflate ct + lower tok/s).
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         t0 = time.time()
         try:
