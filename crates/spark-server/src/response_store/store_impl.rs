@@ -166,7 +166,7 @@ impl ResponseStore {
     /// persistent backend when one is attached.
     pub fn delete(&self, id: &str, kind: StoredKind) -> bool {
         let mut inner = self.inner.lock();
-        let matches = inner.map.get(id).map(|e| e.kind == kind).unwrap_or(false);
+        let matches = inner.map.get(id).is_some_and(|e| e.kind == kind);
         if !matches {
             return false;
         }

@@ -196,7 +196,7 @@ pub async fn list_response_input_items(
     // full transcript so previous_response_id can resume; we exclude
     // the last assistant message on this endpoint.
     let mut msgs: Vec<crate::openai::IncomingMessage> = entry.messages;
-    if msgs.last().map(|m| m.role == "assistant").unwrap_or(false) {
+    if msgs.last().is_some_and(|m| m.role == "assistant") {
         msgs.pop();
     }
 

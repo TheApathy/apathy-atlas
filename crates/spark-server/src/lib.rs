@@ -2,7 +2,10 @@
 
 #![deny(warnings)]
 #![deny(clippy::all)]
-#![allow(dead_code)]
+// Crate-wide `#![allow(dead_code)]` was removed after auditing the single
+// item it was masking — `ChatTokenizer::TEMPLATE_OVERRIDE_DIR`, a duplicate
+// of `tokenizer::jinja_helpers::TEMPLATE_OVERRIDE_DIR`. The duplicate is
+// now gone, so deny(warnings) again catches new dead code we add here.
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::large_enum_variant)]
