@@ -368,16 +368,24 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
         for quant in &quants {
             let model_kernel_dir = model_dir.join(quant);
             let common_kernel_dir = hw_dir.join(quant);
+            // SHARED `common/` dir (upstream PR #74 layout): kernels that
+            // apply to any (model, quant) combination. Examples: multi-seq
+            // SSM kernels, tree-aware kv scatter, paged_decode kgamma
+            // variants. Lives at `kernels/$hw/common/` and is merged into
+            // the kernel set alongside the quant-specific common dir below.
+            let shared_kernel_dir = hw_dir.join("common");
+            let has_shared_dir = shared_kernel_dir.is_dir();
 
             // At least one of common or model-specific dir must exist
             let has_model_dir = model_kernel_dir.is_dir();
             let has_common_dir = common_kernel_dir.is_dir();
             assert!(
-                has_model_dir || has_common_dir,
+                has_model_dir || has_common_dir || has_shared_dir,
                 "No kernel directory found for ({model}, {quant}). \
-                 Expected {} or {}.",
+                 Expected {}, {} or {}.",
                 model_kernel_dir.display(),
                 common_kernel_dir.display(),
+                shared_kernel_dir.display(),
             );
 
             // KERNEL.toml: prefer model-specific, fall back to common
@@ -466,15 +474,36 @@ use build_parse::{
     parse_behavior, parse_dflash, parse_kernel_toml, parse_model_types, parse_sampling_presets,
 };
 
-/// Collect .cu files with shadowing: common dir provides the base set,
-/// model-specific dir can override individual files by matching filename.
+/// Collect .cu files with shadowing across three priority layers:
+///   1. shared   — `kernels/$hw/common/` — quant-independent (lowest priority)
+///   2. common   — `kernels/$hw/$quant/` — quant-specific shared (medium)
+///   3. model    — `kernels/$hw/$model/$quant/` — model-specific (highest, overrides)
+///
+/// Upstream PR #74 introduces the `kernels/$hw/common/` shared layer for
+/// kernels that work across any (model, quant) combination (multi-seq SSM,
+/// tree-aware kv scatter, paged-decode kgamma). We adopt the same layout so
+/// future merges don't conflict on file locations.
 fn collect_cu_files(
     common_dir: Option<&std::path::Path>,
     model_dir: &std::path::Path,
 ) -> Vec<PathBuf> {
+    // Derive the shared dir from common_dir's parent (so we get
+    // `kernels/$hw/common/` when common is `kernels/$hw/$quant/`).
+    let shared_dir = common_dir.and_then(|c| c.parent().map(|p| p.join("common")));
+
     let mut files: HashMap<String, PathBuf> = HashMap::new();
 
-    // Base layer: common kernels
+    // Layer 1: shared (quant-independent) kernels
+    if let Some(ref shared) = shared_dir {
+        if shared.is_dir() {
+            for f in find_cu_files(shared) {
+                let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+                files.insert(stem, f);
+            }
+        }
+    }
+
+    // Layer 2: quant-specific common kernels
     if let Some(common) = common_dir {
         for f in find_cu_files(common) {
             let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
@@ -482,7 +511,7 @@ fn collect_cu_files(
         }
     }
 
-    // Override layer: model-specific .cu files shadow common ones
+    // Layer 3: model-specific overrides
     for f in find_cu_files(model_dir) {
         let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
         files.insert(stem, f);
