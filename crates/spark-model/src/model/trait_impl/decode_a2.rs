@@ -153,7 +153,26 @@ impl TransformerModel {
         // replays with stale pointers and corrupts SSM state across seqs.
         // Attention metadata uses fixed device addresses and is safe.
         // n==1 still uses self.decode()'s correct graph cache.
-        let use_graphs = false;
+        //
+        // Wire ATLAS_SSM_MULTI_SEQ_GRAPH=1 as an OPT-IN UNSAFE override:
+        // until the indirection-table fix lands (see crate::layers::mod.rs
+        // docstring), enabling this WILL produce corrupted output the
+        // first time batch composition changes. Allow advanced users to
+        // experiment without modifying source.
+        let use_graphs = crate::layers::ssm_multi_seq_graph_enabled();
+        if use_graphs {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "ATLAS_SSM_MULTI_SEQ_GRAPH=1 is set — multi-seq decode \
+                     will use CUDA graph capture. EXPERIMENTAL: output will \
+                     corrupt when batch composition changes (sequences \
+                     finish, swap_remove reorders). Indirection-table fix \
+                     is the proper unblocker; this is opt-in until then."
+                );
+            }
+        }
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

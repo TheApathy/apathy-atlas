@@ -405,6 +405,27 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     } else if use_speculative {
         tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)");
+        // Loud warnings for known-degenerate gate combinations so users
+        // don't enable them by accident expecting concurrency wins.
+        if spark_model::layers::mtp_k3_batch_cseq_enabled() {
+            tracing::warn!(
+                "ATLAS_MTP_K3_BATCH_CSEQ=1 is set. The c-batched K=3 verify \
+                 path is documented as ~600-1300 ms per K-step at c=2-3 \
+                 (vs ~85 ms single-seq graphed). Without the multi-seq \
+                 CUDA-graph unblocker (also see ATLAS_SSM_MULTI_SEQ_GRAPH), \
+                 enabling this dramatically REDUCES throughput at \
+                 concurrency. Recommend leaving unset until the indirection \
+                 table fix lands upstream."
+            );
+        }
+        if spark_model::layers::mtp_k2_batch_cseq_enabled() {
+            tracing::warn!(
+                "ATLAS_MTP_K2_BATCH_CSEQ=1 is set (K=2 sibling of the \
+                 c-batched K=3 verify path). Same caveat applies — \
+                 reduces throughput at concurrency until graph capture \
+                 lands. Leave unset for production."
+            );
+        }
     } else if scheduler_model.has_proposer() {
         tracing::info!(
             "MTP proposer available but speculative decoding disabled (use --speculative to enable)"
