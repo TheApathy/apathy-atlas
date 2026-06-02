@@ -316,7 +316,7 @@ impl Qwen3AttentionLayer {
                 // Target one CTA per SM. Also bound by ceil(seq_len/SPLIT_TILE)
                 // so each split gets at least ~SPLIT_TILE positions.
                 let occupancy_target = (NUM_SMS / nq).max(2);
-                let seq_target = (max_seq_len_host + SPLIT_TILE - 1) / SPLIT_TILE;
+                let seq_target = max_seq_len_host.div_ceil(SPLIT_TILE);
                 let num_splits = occupancy_target
                     .min(seq_target.max(1))
                     .min(MAX_SPLITS_CAP);
@@ -676,6 +676,8 @@ impl Qwen3AttentionLayer {
             // dispatch currently produces numerically different output
             // vs the per-token GEMV fallback (see qkv.rs comment for the
             // root-cause investigation status).
+            // unwrap safe: gated by `self.o_nvfp4_t.is_some()` above.
+            #[allow(clippy::unnecessary_unwrap)]
             let nvfp4_t = self.o_nvfp4_t.as_ref().unwrap();
             ops::w4a16_gemm_n128_m16(
                 fwd.gpu,

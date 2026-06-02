@@ -71,22 +71,22 @@
 //! commit/emit/propose pipeline). What's missing is CUDA graph
 //! capture for multi-seq decode. Two paths:
 //!
-//! 1. **Indirection table** (recommended): marshal per-seq SSM state
-//!    pointers into a small device-resident `[u64; max_batch_size]`
-//!    array (`ssm_pool.ptr_scratch` analog) that `gdn_decode_multi_seq`
-//!    + `conv1d_update_multi_seq` read at launch time instead of having
-//!    pointers baked into kernel args. Then the captured graph contains
-//!    only the table pointer (fixed), and per-step the host code H2Ds
-//!    the actual per-seq pointers. This works because the multi-seq
-//!    kernels already accept `h_state_ptrs` / `conv_state_ptrs` as
-//!    kernel args (see qwen3_ssm/trait_decode_multi_seq.rs:421-451) —
-//!    they just don't survive graph replay today.
+//! **Path A — Indirection table (recommended).** Marshal per-seq SSM state
+//! pointers into a small device-resident `[u64; max_batch_size]` array
+//! (`ssm_pool.ptr_scratch` analog) that `gdn_decode_multi_seq` +
+//! `conv1d_update_multi_seq` read at launch time instead of having pointers
+//! baked into kernel args. Then the captured graph contains only the table
+//! pointer (fixed), and per-step the host code H2Ds the actual per-seq
+//! pointers. This works because the multi-seq kernels already accept
+//! `h_state_ptrs` / `conv_state_ptrs` as kernel args (see
+//! qwen3_ssm/trait_decode_multi_seq.rs:421-451) — they just don't survive
+//! graph replay today.
 //!
-//! 2. **Per-slot-tuple graph cache**: key the multi-seq decode graph
-//!    cache on `(slot_tuple, padded_n)` and re-capture when the active
-//!    seq's slot set changes. Simpler but causes a graph-capture stall
-//!    every time the batch composition changes (sequence finishes /
-//!    new arrival), which may obviate the gain in a busy server.
+//! **Path B — Per-slot-tuple graph cache.** Key the multi-seq decode graph
+//! cache on `(slot_tuple, padded_n)` and re-capture when the active seq's
+//! slot set changes. Simpler but causes a graph-capture stall every time
+//! the batch composition changes (sequence finishes / new arrival), which
+//! may obviate the gain in a busy server.
 //!
 //! Once graphs land for c-batched decode, CSK's 12 → 3 FFN/SSM
 //! forward-call reduction should hit the ~4× target.

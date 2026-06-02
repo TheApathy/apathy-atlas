@@ -61,7 +61,7 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     let tree_tokens_verify =
         std::env::var("ATLAS_DDTREE_TREE_TOKENS_VERIFY").ok().as_deref() == Some("1");
     let use_tree_tokens = tree_tokens_verify
-        && a.pending_tree_payload.as_ref().map_or(false, |p| !p.is_empty());
+        && a.pending_tree_payload.as_ref().is_some_and(|p| !p.is_empty());
 
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
@@ -109,10 +109,10 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // M8A: if a tree payload is present from the previous propose, upload its
     // parent_indices to the model's per-step scratch so the GDN dispatch can
     // fire gdn_tree_k. Cleared after verify completes (Ok or Err).
-    if let Some(payload) = a.pending_tree_payload.as_ref() {
-        if let Err(e) = model.set_ddtree_parent_ids(payload) {
-            tracing::warn!("set_ddtree_parent_ids failed (falling back to flat): {e:#}");
-        }
+    if let Some(payload) = a.pending_tree_payload.as_ref()
+        && let Err(e) = model.set_ddtree_parent_ids(payload)
+    {
+        tracing::warn!("set_ddtree_parent_ids failed (falling back to flat): {e:#}");
     }
 
     let verified = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {

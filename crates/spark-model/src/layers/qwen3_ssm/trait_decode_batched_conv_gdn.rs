@@ -347,7 +347,7 @@ impl Qwen3SsmLayer {
             let dump_layer_match = std::env::var("ATLAS_M8A_DUMP_LAYER")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .map_or(true, |target| target == 0usize);
+                .is_none_or(|target| target == 0usize);
             let dump_now = dump_enabled && dump_layer_match;
 
             if dump_now {
@@ -355,11 +355,11 @@ impl Qwen3SsmLayer {
                 let qk_bytes_per = qkvz_size * bf16;
                 let v_bytes_per = qkvz_size * bf16; // q,k,v all same size in deinterleaved layout
                 let _ = v_bytes_per;
-                let q_total = (num_tokens as usize) * (conv_dim as usize) * bf16;
-                let v_total = (num_tokens as usize) * (conv_dim as usize) * bf16;
-                let gb_total = (num_tokens as usize) * nv * fp32;
-                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
-                let h_inter_total = (num_tokens as usize) * h_total;
+                let q_total = num_tokens * conv_dim * bf16;
+                let v_total = num_tokens * conv_dim * bf16;
+                let gb_total = num_tokens * nv * fp32;
+                let h_total = nv * kd * vd * fp32;
+                let h_inter_total = num_tokens * h_total;
 
                 let dump = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
                     let mut buf = vec![0u8; n];
@@ -377,7 +377,7 @@ impl Qwen3SsmLayer {
                 dump("beta", beta_ptr, gb_total)?;
                 // parent_ids has length num_tokens (verify K = γ+1). Now correctly
                 // sized post-fix in set_ddtree_parent_ids (kernel-frame with leading -1).
-                let parent_ids_bytes = (num_tokens as usize) * 4;
+                let parent_ids_bytes = num_tokens * 4;
                 dump("parent_ids", parent_ids_dev, parent_ids_bytes)?;
                 dump("h_in", ssm_state.h_state, h_total)?;
 
@@ -414,7 +414,7 @@ impl Qwen3SsmLayer {
                 && std::env::var("ATLAS_M8A_VS_WY17").ok().as_deref() == Some("1");
             if ab_diff {
                 // Backup h_state to host before wy17 mutates it.
-                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let h_total = nv * kd * vd * fp32;
                 let mut h_backup = vec![0u8; h_total];
                 ctx.gpu.synchronize(stream)?;
                 ctx.gpu.copy_d2h(ssm_state.h_state, &mut h_backup)?;
@@ -436,8 +436,8 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
                 // Dump wy17's intermediates + output.
-                let h_inter_total = (num_tokens as usize) * h_total;
-                let out_total = (num_tokens as usize) * nv * (vd as usize) * bf16;
+                let h_inter_total = num_tokens * h_total;
+                let out_total = num_tokens * nv * vd * bf16;
                 let dump_wy17 = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
                     let mut buf = vec![0u8; n];
                     ctx.gpu.synchronize(stream)?;
@@ -510,9 +510,9 @@ impl Qwen3SsmLayer {
             }
 
             if dump_now {
-                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
-                let h_inter_total = (num_tokens as usize) * h_total;
-                let out_total = (num_tokens as usize) * nv * (vd as usize) * bf16;
+                let h_total = nv * kd * vd * fp32;
+                let h_inter_total = num_tokens * h_total;
+                let out_total = num_tokens * nv * vd * bf16;
                 let dump_after = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
                     let mut buf = vec![0u8; n];
                     ctx.gpu.synchronize(stream)?;
@@ -573,9 +573,9 @@ impl Qwen3SsmLayer {
             let wy17_dump = std::env::var("ATLAS_WY17_DUMP").ok().as_deref() == Some("1")
                 && !WY17_DUMP_DONE.load(std::sync::atomic::Ordering::Relaxed);
             if wy17_dump {
-                let q_total = (num_tokens as usize) * (conv_dim as usize) * bf16;
-                let gb_total = (num_tokens as usize) * nv * fp32;
-                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
+                let q_total = num_tokens * conv_dim * bf16;
+                let gb_total = num_tokens * nv * fp32;
+                let h_total = nv * kd * vd * fp32;
                 let dump = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
                     let mut buf = vec![0u8; n];
                     ctx.gpu.synchronize(stream)?;
@@ -664,9 +664,9 @@ impl Qwen3SsmLayer {
             }
 
             if wy17_dump {
-                let h_total = nv * (kd as usize) * (vd as usize) * fp32;
-                let h_inter_total = (num_tokens as usize) * h_total;
-                let out_total = (num_tokens as usize) * nv * (vd as usize) * bf16;
+                let h_total = nv * kd * vd * fp32;
+                let h_inter_total = num_tokens * h_total;
+                let out_total = num_tokens * nv * vd * bf16;
                 let dump_after = |name: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
                     let mut buf = vec![0u8; n];
                     ctx.gpu.synchronize(stream)?;

@@ -103,7 +103,7 @@ impl Qwen3SsmLayer {
             } else if self.sequential_qkvz {
                 // Qwen3.5: QKVZ weight is pre-concatenated [Q|K|V|Z] sequential.
                 // Plain GEMV writes directly to deinterleaved buffer.
-                if let (Some((fuse_hidden, fuse_residual)), Some(ref nvfp4)) =
+                if let (Some((fuse_hidden, fuse_residual)), Some(nvfp4)) =
                     (fuse_input, self.qkvz_nvfp4.as_ref())
                 {
                     // Fused path: rms_norm_residual + w4a16_gemv in one launch.

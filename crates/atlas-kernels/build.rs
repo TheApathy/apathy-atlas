@@ -237,11 +237,11 @@ fn main() {
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
-                if let (Some(out_mt), Some(src_mt)) = (out_mt, src_floor) {
-                    if out_mt > src_mt {
-                        cached += 1;
-                        continue;
-                    }
+                if let (Some(out_mt), Some(src_mt)) = (out_mt, src_floor)
+                    && out_mt > src_mt
+                {
+                    cached += 1;
+                    continue;
                 }
             }
 
@@ -529,12 +529,12 @@ fn collect_cu_files(
     let mut files: HashMap<String, PathBuf> = HashMap::new();
 
     // Layer 1: shared (quant-independent) kernels
-    if let Some(ref shared) = shared_dir {
-        if shared.is_dir() {
-            for f in find_cu_files(shared) {
-                let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
-                files.insert(stem, f);
-            }
+    if let Some(ref shared) = shared_dir
+        && shared.is_dir()
+    {
+        for f in find_cu_files(shared) {
+            let stem = f.file_stem().unwrap().to_str().unwrap().to_string();
+            files.insert(stem, f);
         }
     }
 
@@ -610,10 +610,10 @@ fn target_header_floor(
     signature_file: &std::path::Path,
 ) -> Option<std::time::SystemTime> {
     let mut latest = latest_header_mtime(model_dir);
-    if let Some(c) = common_dir {
-        if let Some(t) = latest_header_mtime(c) {
-            latest = Some(latest.map_or(t, |p| p.max(t)));
-        }
+    if let Some(c) = common_dir
+        && let Some(t) = latest_header_mtime(c)
+    {
+        latest = Some(latest.map_or(t, |p| p.max(t)));
     }
     if let Ok(mt) = std::fs::metadata(signature_file).and_then(|m| m.modified()) {
         latest = Some(latest.map_or(mt, |p| p.max(mt)));

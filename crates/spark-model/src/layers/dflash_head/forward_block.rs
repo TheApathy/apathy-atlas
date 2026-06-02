@@ -814,7 +814,7 @@ impl BlockDiffusionDraftHead {
             // we're already running γ_max naturally) doesn't waste probes.
             let is_probe_step = adaptive_probe_interval > 0
                 && dstate.accept_history_count >= 4
-                && dstate.propose_steps % adaptive_probe_interval == 0;
+                && dstate.propose_steps.is_multiple_of(adaptive_probe_interval);
             // Compute the adaptive cutoff (= number of drafts to keep as-is).
             // gamma_eff is the post-cap drafter output size. cutoff <= gamma_eff.
             let mut cutoff = gamma_eff;
@@ -967,7 +967,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<(Vec<u32>, Vec<f32>)> {
         use crate::layers::ops;
 
-        let k_used = k.min(super::DDTREE_TOP_K_MAX).max(1);
+        let k_used = k.clamp(1, super::DDTREE_TOP_K_MAX);
         let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
         // Scratch is sized [γ, DDTREE_TOP_K_MAX] but we only fill γ_eff × k
         // rows. Zero just the rows we'll read so a partial write leaves no

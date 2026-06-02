@@ -135,7 +135,7 @@ pub fn rms_norm_qk_batch3(
     stream: u64,
 ) -> Result<()> {
     debug_assert!(head_dim > 0, "head_dim must be > 0");
-    debug_assert!(q_dim % head_dim == 0 && k_dim % head_dim == 0);
+    debug_assert!(q_dim.is_multiple_of(head_dim) && k_dim.is_multiple_of(head_dim));
     let nq_heads = q_dim / head_dim;
     let nkv_heads = k_dim / head_dim;
     let max_heads = nq_heads.max(nkv_heads);
