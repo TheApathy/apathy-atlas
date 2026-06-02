@@ -13,6 +13,20 @@ use super::*;
 /// When `logprobs` is Some, the logprobs data is accumulated for blocking
 /// responses and sent via `StreamEvent::TokenWithLogprobs` for streaming.
 pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::TokenLogprobs>) {
+    // Cooperative cancellation from the streaming pipeline (PR #89). The
+    // stream-side loop guards (Bug-2 name-run cap, F11 within-dedup, F44
+    // perm-fail, loop-watchdog) flip this flag when they decide the
+    // response should end. Treat it like an EOS: finalise now so
+    // `handle_done` runs with the proper `tool_loop_capped` /
+    // `finish_reason="length"` machinery, instead of letting the model
+    // keep emitting tokens that just get suppressed.
+    if let Some(ref f) = a.cancel_flag
+        && f.load(std::sync::atomic::Ordering::Acquire)
+    {
+        a.finished = true;
+        return;
+    }
+
     // ── ATLAS_DUMP_HIDDEN: append token-emit record (catch-all spec path) ──
     // verify_k2/k3/k4/dflash all funnel through emit_token, so this hook
     // covers the speculative codepaths that bypass process_decode_logits.
