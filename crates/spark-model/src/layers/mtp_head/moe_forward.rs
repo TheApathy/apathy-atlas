@@ -29,6 +29,13 @@ impl MtpHead {
     /// One MLP, no router, no expert dispatch. Reuses the same FP8/BF16
     /// kernels (`dense_gemv_*`, `moe_silu_mul`) the per-expert path uses,
     /// so no new kernel wiring is required.
+    ///
+    /// Upstream-only helper: the post-#74 adapter routes our dense MTP head
+    /// through `dense_mlp_gate/up/down` + `ops::w4a16_gemv` directly (see the
+    /// adapter shim added in commit a634442). This generic FP8/BF16 path is
+    /// kept compiled as a reference for future dense MTP heads that don't
+    /// ship NVFP4 weights.
+    #[allow(dead_code)]
     pub(super) fn dense_ffn_forward_generic(
         &self,
         input: DevicePtr,
