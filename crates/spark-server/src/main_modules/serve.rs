@@ -432,6 +432,32 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
 
+    // ── Inert-gate warnings (helpers defined but not yet dispatched) ──
+    // Both env vars exist as `OnceLock` helpers in spark_model::layers but
+    // gate code paths that aren't implemented yet. Setting them is a no-op
+    // today, so flag it loudly so users don't think they did anything.
+    if spark_model::layers::ssm_multi_seq_batched_enabled() {
+        tracing::warn!(
+            "ATLAS_SSM_MULTI_SEQ_BATCHED=1 is set, but the batched-projections \
+             multi-seq SSM decode path is NOT YET IMPLEMENTED in \
+             decode_multi_seq_inner — the per-seq projection loop runs \
+             regardless. Setting this env var is currently a no-op. \
+             Tracking: layers/qwen3_ssm/trait_decode_multi_seq.rs:129 \
+             (the 7-step loop that would be replaced by M=n batched GEMVs)."
+        );
+    }
+    if spark_model::layers::ssm_multi_seq_kernel_enabled() {
+        tracing::warn!(
+            "ATLAS_SSM_MULTI_SEQ_KERNEL=1 is set, but the multi-seq SSM \
+             state-advance kernels (conv1d_update_multi_seq, \
+             gdn_decode_multi_seq, compute_gdn_gates_multi_seq) are NOT \
+             dispatched from any code path today. Setting this env var is \
+             currently a no-op. Multi-seq kernel handles exist \
+             (init.rs:162) but are only used by the unimplemented BATCHED \
+             path above."
+        );
+    }
+
     let policy: Box<dyn scheduling_policy::SchedulingPolicy> = match args.scheduling_policy.as_str()
     {
         "fifo" => {

@@ -1066,6 +1066,21 @@ impl DenseFfnLayer {
             && crate::layers::prefill_ffn_e2m1_enabled()
             && self.has_e2m1_ffn();
 
+        // Per-shape E2M1 dispatch: gate/up stay on `w4a16_gemm_t_m128`,
+        // down_proj routes through native E2M1 hardware MMA. Per the
+        // shape table at the `prefill_ffn_e2m1_down_only_enabled` doc
+        // site: gate (K=5120,N=17408) + up (same) are faster on the
+        // BF16×NVFP4 w4a16 m128 path, while down (K=17408,N=5120) is
+        // 1.31× faster via E2M1 MMA — net ~30% down savings with no
+        // gate/up regression. Mutually exclusive with the all-three
+        // `e2m1_fast_path`.
+        let e2m1_down_only_path = !e2m1_fast_path
+            && m >= 128
+            && crate::layers::prefill_ffn_e2m1_down_only_enabled()
+            && self.has_e2m1_ffn()
+            && self.has_transposed_ffn()
+            && self.w4a16_gemm_t_m128.0 != 0;
+
         // Large-M FP8 predequant fast path: route through the
         // `fp8_gemm_t_m128` kernel (BF16 A × pre-dequanted FP8 B) when:
         //   - ATLAS_FFN_PREDEQUANT_FP8=1 was set at startup
@@ -1082,6 +1097,7 @@ impl DenseFfnLayer {
         // m128 path when not active. Mirrors the attention
         // `predequant_for_prefill` + `fp8_gemm_n128_m128` pattern.
         let fp8_fast_path = !e2m1_fast_path
+            && !e2m1_down_only_path
             && m >= 128
             && crate::layers::prefill_ffn_fp8_enabled()
             && self.has_fp8_ffn();
@@ -1101,6 +1117,7 @@ impl DenseFfnLayer {
         // kernels/gb10/minimax-m2-229b/nvfp4/w4a16_gemm_v2.cu —
         // copied verbatim into qwen3.6-27b/.
         let v2_fast_path = !e2m1_fast_path
+            && !e2m1_down_only_path
             && !fp8_fast_path
             && m >= 128
             && crate::layers::prefill_ffn_m128_v2_enabled()
@@ -1120,6 +1137,7 @@ impl DenseFfnLayer {
         // `qwen3_attention/prefill_weights.rs:14`. Falls back to the
         // standard M_TILE=64 `w4a16_gemm` when any condition fails.
         let fast_path = !e2m1_fast_path
+            && !e2m1_down_only_path
             && !fp8_fast_path
             && !v2_fast_path
             && m >= 128
@@ -1228,6 +1246,59 @@ impl DenseFfnLayer {
                 stream,
             )?;
             // down_proj: [M, inter] BF16 → [M, H] BF16
+            let output = ctx.buffers.moe_output();
+            self.forward_e2m1_proj(
+                ctx,
+                gate_out,
+                &self.weights.down_proj,
+                output,
+                m,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(());
+        }
+
+        if e2m1_down_only_path {
+            // gate/up stay on the w4a16 m128 fast path; only down_proj
+            // routes through E2M1 hardware MMA. Matches the shape table
+            // documented at `prefill_ffn_e2m1_down_only_enabled` — net
+            // ~30% down_proj savings, no gate/up regression vs the
+            // standard `fast_path`.
+            let gt = self.gate_proj_t.as_ref().unwrap();
+            let ut = self.up_proj_t.as_ref().unwrap();
+            ops::w4a16_gemm_n128_m128(
+                ctx.gpu,
+                self.w4a16_gemm_t_m128,
+                input,
+                gt,
+                gate_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::w4a16_gemm_n128_m128(
+                ctx.gpu,
+                self.w4a16_gemm_t_m128,
+                input,
+                ut,
+                up_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
             let output = ctx.buffers.moe_output();
             self.forward_e2m1_proj(
                 ctx,
