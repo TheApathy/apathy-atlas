@@ -216,7 +216,7 @@ impl StorageBackend for IoUringBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h_async};
+    use crate::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h_async, stream_sync};
     use crate::group::{GroupKey, GroupLayout, KvKind};
     use std::path::PathBuf;
 

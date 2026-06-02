@@ -119,10 +119,11 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_qd() {
+        // QD cap raised 64 → 256 on 2026-05-09; assertion bound was stale.
         let mut c = cfg();
         c.qd = 0;
         assert!(c.validate().is_err());
-        c.qd = 65;
+        c.qd = 257;
         assert!(c.validate().is_err());
     }
 }
