@@ -664,7 +664,7 @@ impl Qwen3AttentionLayer {
             && self.w4a16_gemm_t_m16_k.0 != 0
             && crate::layers::tc_nvfp4_m16_enabled()
             && self.o_nvfp4_t.is_some()
-            && std::env::var("ATLAS_TC_NVFP4_M16_MS_ATTN").ok().as_deref() == Some("1")
+            && super::qkv::tc_nvfp4_m16_ms_attn_enabled()
         {
             // K=γ verify path (DFlash γ>3): batch O-projection as a single
             // M=n GEMM using the small-M specialization, replacing n per-token
