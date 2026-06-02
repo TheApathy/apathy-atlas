@@ -331,8 +331,14 @@ pub async fn count_tokens(
         .tool_call_parser
         .as_ref()
         .is_some_and(|p| p.suppresses_jinja_tools());
+    // PR #69 added behavior.skip_template_tools. Our atlas-kernels Target
+    // struct doesn't have this field (defaulted at MODEL.toml parse time),
+    // so we treat it as `false` and rely on parser_suppresses as the only
+    // gate. Models that need template-tool skipping should opt in via a
+    // bare_json-class parser.
+    let skip_template_tools = false;
     let jinja_tools: Option<Vec<serde_json::Value>> =
-        if tools_active && !state.behavior.skip_template_tools && !parser_suppresses {
+        if tools_active && !skip_template_tools && !parser_suppresses {
             req.tools.as_ref().map(|ts| {
                 let oai = convert_tools(ts);
                 oai.iter().map(|t| serde_json::json!({
