@@ -126,7 +126,280 @@ impl Qwen3SsmLayer {
         let ssm_out_buf = ctx.buffers.moe_output();
         let gdn_local_offset = (key_dim * 2 + value_dim) * fp32;
 
+        // ── ATLAS_SSM_MULTI_SEQ_KERNEL multi-seq state-advance dispatch ──
+        //
+        // Gated by `ssm_multi_seq_kernel_enabled()` AND the FP32 multi-seq
+        // kernel handles AND num_seqs ≤ ssm_multi_seq_ptr_max. When ON:
+        //   - QKVZ projection + BA + gates run per-seq (no shape change)
+        //   - conv1d_update_l2norm + gdn_decode each collapse to a SINGLE
+        //     launch via the FP32 multi-seq variants, fed a device-resident
+        //     per-seq state pointer table uploaded once per layer.
+        //   - gated_rms_norm + out_proj stay per-seq (their compute is
+        //     state-free; the per-seq launch overhead is left untouched
+        //     since they're not the bottleneck — conv1d+gdn alone is
+        //     ~50 % of the per-seq loop cost on AEON-Q36-27B).
+        //
+        // Saves 2 launches per SSM layer per token at num_seqs ≥ 2. At
+        // num_seqs=4 × 48 SSM layers × ~20 μs/launch = ~3.8 ms/token of
+        // pure launch-overhead removed.
+        let multi_seq_kernel_path = num_seqs >= 2
+            && num_seqs <= self.ssm_multi_seq_ptr_max
+            && self.conv1d_l2norm_f32_multi_seq_k.0 != 0
+            && self.gdn_decode_f32_multi_seq_k.0 != 0
+            && crate::layers::ssm_multi_seq_kernel_enabled();
+        if multi_seq_kernel_path {
+            // Collect per-seq h_state + conv_state device pointers and
+            // upload to the layer's pre-allocated scratch
+            // (`ssm_multi_seq_ptr_scratch`). Layout:
+            //   [h_state_ptrs[N] u64, conv_state_ptrs[N] u64]
+            // h_state_ptrs at offset 0, conv_state_ptrs at offset N*8.
+            let mut ptr_buf: [u64; 64] = [0u64; 64];
+            assert!(
+                num_seqs * 2 <= ptr_buf.len(),
+                "ssm_multi_seq_ptr_scratch capacity exceeded: {}*2 > {}",
+                num_seqs,
+                ptr_buf.len()
+            );
+            for (i, state) in states.iter_mut().enumerate().take(num_seqs) {
+                let ssm_state = state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+                ptr_buf[i] = ssm_state.h_state.0;
+                ptr_buf[num_seqs + i] = ssm_state.conv_state.0;
+            }
+            let ptr_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    ptr_buf.as_ptr() as *const u8,
+                    num_seqs * 2 * std::mem::size_of::<u64>(),
+                )
+            };
+            ctx.gpu.copy_h2d_async(
+                ptr_bytes,
+                self.ssm_multi_seq_ptr_scratch,
+                stream,
+            )?;
+            let h_state_ptrs_dev = self.ssm_multi_seq_ptr_scratch;
+            let conv_state_ptrs_dev = self
+                .ssm_multi_seq_ptr_scratch
+                .offset(num_seqs * std::mem::size_of::<u64>());
+
+            // Step 2 (QKVZ) + Step 3 (BA + gates) still run per-seq
+            // because the BA + gates fusion (`dense_gemv_ba_gates`) has
+            // no multi-seq variant. They're cheap per-seq (BA is
+            // N=64-output GEMV) so the per-seq launch cost is in the
+            // noise compared to conv1d/gdn.
+            for i in 0..num_seqs {
+                let normed_i = normed.offset(i * h * bf16);
+                let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+                let gate_i = gates_buf.offset(i * nv * 2 * fp32);
+                let beta_i = gate_i.offset(nv * fp32);
+
+                // QKVZ projection (only sequential_qkvz + nvfp4 production path).
+                if self.sequential_qkvz {
+                    if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+                        ops::w4a16_gemv(
+                            ctx.gpu,
+                            self.w4a16_gemv_k,
+                            normed_i,
+                            nvfp4,
+                            deint_i,
+                            qkvz_size as u32,
+                            h as u32,
+                            stream,
+                        )?;
+                    } else {
+                        ops::dense_gemv(
+                            ctx.gpu,
+                            self.dense_gemv_k,
+                            normed_i,
+                            &self.ssm.in_proj_qkvz,
+                            deint_i,
+                            qkvz_size as u32,
+                            h as u32,
+                            stream,
+                        )?;
+                    }
+                } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
+                    ops::w4a16_gemv_qkvz(
+                        ctx.gpu,
+                        self.w4a16_gemv_qkvz_k,
+                        normed_i,
+                        nvfp4,
+                        deint_i,
+                        qkvz_size as u32,
+                        h as u32,
+                        nk as u32,
+                        kd as u32,
+                        vpg as u32,
+                        vd as u32,
+                        stream,
+                    )?;
+                } else {
+                    ops::dense_gemv(
+                        ctx.gpu,
+                        self.dense_gemv_k,
+                        normed_i,
+                        &self.ssm.in_proj_qkvz,
+                        deint_i,
+                        qkvz_size as u32,
+                        h as u32,
+                        stream,
+                    )?;
+                    ops::deinterleave_qkvz(
+                        ctx.gpu,
+                        self.deinterleave_k,
+                        deint_i,
+                        deint_i,
+                        1,
+                        nk as u32,
+                        kd as u32,
+                        vpg as u32,
+                        vd as u32,
+                        stream,
+                    )?;
+                }
+
+                // BA + GDN gates fused (no multi-seq variant for this fused op).
+                ops::dense_gemv_ba_gates(
+                    ctx.gpu,
+                    self.ba_gates_k,
+                    normed_i,
+                    &self.ssm.in_proj_ba,
+                    self.ssm.a_log.weight,
+                    self.ssm.dt_bias.weight,
+                    gate_i,
+                    beta_i,
+                    ba_size as u32,
+                    h as u32,
+                    vpg as u32,
+                    stream,
+                )?;
+            }
+
+            // Step 4: ONE conv1d_update_l2norm_f32_multi_seq launch.
+            // Input layout: deinterleaved [num_seqs, qkvz_size] BF16
+            //   → input_stride = qkvz_size BF16 elements between seqs
+            // Output layout: conv_out_f32 [num_seqs, qkvz_size] FP32
+            //   → output_stride = qkvz_size FP32 elements between seqs
+            ops::conv1d_update_l2norm_f32_multi_seq(
+                ctx.gpu,
+                self.conv1d_l2norm_f32_multi_seq_k,
+                conv_state_ptrs_dev,
+                deinterleaved,
+                &self.ssm.conv1d,
+                conv_out_f32,
+                conv_dim,
+                d_conv,
+                num_seqs as u32,
+                qk_channels,
+                kd as u32,
+                1e-6,
+                qkvz_size as u32,
+                qkvz_size as u32,
+                stream,
+            )?;
+
+            // Step 5: ONE gdn_decode_f32_multi_seq launch.
+            //   Q/K split: query at conv_out_f32 + offset 0
+            //              key   at conv_out_f32 + key_dim FP32 elements
+            //   V        : conv_out_f32 + 2*key_dim FP32 elements
+            //   gate/beta: gates_buf, gate_beta_stride = 2*nv FP32 elements
+            //   output   : conv_out_f32 + gdn_local_offset (Z region tail
+            //              per ssm_forward.rs single-seq layout —
+            //              re-uses the qkv region's tail in the FP32 slot)
+            //   v_out_stride = qkvz_size FP32 elements between seqs
+            // Strides expressed in BF16 elements for q/k/v (per kernel
+            // contract). Since the buffer is FP32, BF16 stride is 2× the
+            // FP32 stride.
+            let qk_stride_bf16 = (qkvz_size * 2) as u32; // qkvz_size FP32 elts = 2*qkvz_size BF16 elts
+            let v_in_stride_bf16 = (qkvz_size * 2) as u32;
+            let gdn_out = conv_out_f32.offset(gdn_local_offset);
+            ops::gdn_decode_f32_multi_seq(
+                ctx.gpu,
+                self.gdn_decode_f32_multi_seq_k,
+                h_state_ptrs_dev,
+                conv_out_f32,
+                conv_out_f32.offset(key_dim * fp32),
+                conv_out_f32.offset(key_dim * 2 * fp32),
+                gates_buf,
+                gates_buf.offset(nv * fp32),
+                gdn_out,
+                num_seqs as u32,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                (nv * 2) as u32,
+                qk_stride_bf16,
+                v_in_stride_bf16,
+                qkvz_size as u32,
+                stream,
+            )?;
+
+            // Steps 6 + 7: per-seq gated_rms_norm + out_proj.
+            // These are cheap (per-seq compute is small) so leaving them
+            // per-seq doesn't significantly impact the overall layer time.
+            for i in 0..num_seqs {
+                let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
+                let conv_out_i = conv_out_f32.offset(i * qkvz_size * fp32);
+                let gdn_out_i = conv_out_i.offset(gdn_local_offset);
+                let normed_out_i = normed_out_buf.offset(i * qkvz_size * bf16);
+                let ssm_out_i = ssm_out_buf.offset(i * h * bf16);
+
+                let z_ptr = deint_i.offset((key_dim * 2 + value_dim) * bf16);
+                ops::gated_rms_norm(
+                    ctx.gpu,
+                    self.gated_rms_norm_f32_k,
+                    gdn_out_i,
+                    z_ptr,
+                    &self.ssm.norm,
+                    normed_out_i,
+                    nv as u32,
+                    vd as u32,
+                    vd as u32,
+                    eps,
+                    vd as u32,
+                    stream,
+                )?;
+
+                if let Some(ref dense_out) = self.out_proj_dense {
+                    ops::dense_gemv(
+                        ctx.gpu,
+                        self.dense_gemv_k,
+                        normed_out_i,
+                        dense_out,
+                        ssm_out_i,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv_k,
+                        normed_out_i,
+                        &self.ssm.out_proj,
+                        ssm_out_i,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                }
+            }
+
+            // Skip the legacy per-seq loop below and continue with the
+            // existing batched step 8 (residual_add_rms_norm) + step 9
+            // (per-seq MoE) at the bottom of this function.
+            // We did the equivalent of steps 2-7 above. Use a labeled
+            // loop break by overwriting the entire per-seq block with a
+            // sentinel.
+        }
+
         for i in 0..num_seqs {
+            if multi_seq_kernel_path {
+                break; // already done above
+            }
             let normed_i = normed.offset(i * h * bf16);
             let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
             let gate_i = gates_buf.offset(i * nv * 2 * fp32);

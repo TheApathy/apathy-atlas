@@ -120,6 +120,15 @@ pub struct Qwen3SsmLayer {
     conv1d_l2norm_multi_seq_k: KernelHandle,
     gdn_decode_multi_seq_k: KernelHandle,
     compute_gdn_gates_multi_seq_k: KernelHandle,
+    /// FP32-output multi-seq variants. These are the production-precision
+    /// kernels that the AEON-Q36-27B decode path uses when
+    /// `ATLAS_SSM_MULTI_SEQ_KERNEL=1`. The BF16-output variants above
+    /// (conv1d_l2norm_multi_seq_k / gdn_decode_multi_seq_k) preserve API
+    /// symmetry but aren't dispatched in production because the model is
+    /// calibrated for FP32 recurrent precision. KernelHandle(0) when the
+    /// PTX module isn't compiled for the active target.
+    conv1d_l2norm_f32_multi_seq_k: KernelHandle,
+    gdn_decode_f32_multi_seq_k: KernelHandle,
     /// Scratch device buffer for per-seq state pointer arrays uploaded
     /// before each multi-seq kernel launch. Sized at init for the
     /// configured `max_batch_size`. Layout: `[h_state_ptrs[c],

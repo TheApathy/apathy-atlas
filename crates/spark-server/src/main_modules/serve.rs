@@ -432,10 +432,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
 
-    // ── Inert-gate warnings (helpers defined but not yet dispatched) ──
-    // Both env vars exist as `OnceLock` helpers in spark_model::layers but
-    // gate code paths that aren't implemented yet. Setting them is a no-op
-    // today, so flag it loudly so users don't think they did anything.
+    // ── Multi-seq SSM gate status notes ──
+    // ATLAS_SSM_MULTI_SEQ_BATCHED is still un-wired (batched-projections
+    // path scoped but not landed — would replace the per-seq QKVZ/BA/
+    // out_proj launches with M=n batched GEMVs). Setting it is a no-op.
+    // ATLAS_SSM_MULTI_SEQ_KERNEL is now LIVE: routes conv1d_update_l2norm
+    // + gdn_decode through the FP32 multi-seq variants, collapsing those
+    // two per-seq launches into one each at num_seqs ≥ 2. Wired in
+    // layers/qwen3_ssm/trait_decode_multi_seq.rs.
     if spark_model::layers::ssm_multi_seq_batched_enabled() {
         tracing::warn!(
             "ATLAS_SSM_MULTI_SEQ_BATCHED=1 is set, but the batched-projections \
@@ -447,14 +451,13 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
     if spark_model::layers::ssm_multi_seq_kernel_enabled() {
-        tracing::warn!(
-            "ATLAS_SSM_MULTI_SEQ_KERNEL=1 is set, but the multi-seq SSM \
-             state-advance kernels (conv1d_update_multi_seq, \
-             gdn_decode_multi_seq, compute_gdn_gates_multi_seq) are NOT \
-             dispatched from any code path today. Setting this env var is \
-             currently a no-op. Multi-seq kernel handles exist \
-             (init.rs:162) but are only used by the unimplemented BATCHED \
-             path above."
+        tracing::info!(
+            "ATLAS_SSM_MULTI_SEQ_KERNEL=1 is set. The multi-seq SSM \
+             state-advance kernels (conv1d_update_l2norm_f32_multi_seq, \
+             gdn_decode_f32_multi_seq) will be dispatched at num_seqs ≥ 2 \
+             during multi-seq decode, collapsing 2 per-seq launches per \
+             SSM layer per token to 1 each. Saves ~96 launches per token \
+             at num_seqs=4 × 48 SSM layers."
         );
     }
 
