@@ -98,15 +98,21 @@ fn build_active_seq_from_prefill(
     ssm_ring_capacity: usize,
 ) -> ActiveSeq {
     let temperature = p.temperature;
+    // Pre-allocate output_tokens to the final response length so we
+    // avoid the ~10 Vec growth-realloc cycles (1 → 2 → 4 → ... → 1024)
+    // that grow() would do over a long response. Saves ~10 mallocs +
+    // copies per request. Capacity guess uses max_tokens directly; under
+    // mimalloc the slop from over-allocation is reclaimed quickly.
+    let output_capacity = p.max_tokens.max(1);
+    let mut output_tokens = Vec::with_capacity(output_capacity);
+    if !(!immediate_finish && spontaneous_think) {
+        output_tokens.push(first);
+    }
     ActiveSeq {
         seq: p.seq,
         session_hash: p.session_hash,
         last_token: first,
-        output_tokens: if !immediate_finish && spontaneous_think {
-            vec![]
-        } else {
-            vec![first]
-        },
+        output_tokens,
         remaining: if immediate_finish {
             0
         } else {
