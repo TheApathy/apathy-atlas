@@ -129,6 +129,12 @@ pub struct Qwen3SsmLayer {
     /// PTX module isn't compiled for the active target.
     conv1d_l2norm_f32_multi_seq_k: KernelHandle,
     gdn_decode_f32_multi_seq_k: KernelHandle,
+    /// Multi-seq gated_rms_norm with FP32 input + per-seq strides. Lets
+    /// the multi_seq decode collapse the per-seq gated_rms_norm loop into
+    /// one launch, while writing into a value_dim-contig output buffer so
+    /// the subsequent out_proj can fire as a batched w4a16_gemm at M=n.
+    /// KernelHandle(0) when not compiled for the active target.
+    gated_rms_norm_f32_multi_seq_k: KernelHandle,
     /// Scratch device buffer for per-seq state pointer arrays uploaded
     /// before each multi-seq kernel launch. Sized at init for the
     /// configured `max_batch_size`. Layout: `[h_state_ptrs[c],

@@ -197,6 +197,11 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_f32_multi_seq",
                 "gated_delta_rule_decode_f32_multi_seq",
             ),
+            gated_rms_norm_f32_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "gated_rms_norm_f32_multi_seq",
+                "gated_rms_norm_f32_multi_seq",
+            ),
             // Per-layer scratch for the 2 × c × 8-byte per-seq state ptr
             // arrays uploaded before each multi-seq launch. Cap at 32 seqs
             // (well above the practical concurrent-decode batch size on
