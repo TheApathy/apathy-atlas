@@ -126,6 +126,65 @@ impl Qwen3SsmLayer {
         let ssm_out_buf = ctx.buffers.moe_output();
         let gdn_local_offset = (key_dim * 2 + value_dim) * fp32;
 
+        // ── Optional batched QKVZ projection across num_seqs ──
+        //
+        // Gated by ATLAS_SSM_MULTI_SEQ_BATCHED=1 (see layers::mod.rs's
+        // `ssm_multi_seq_batched_enabled` doc). When ON and num_seqs is
+        // 2 or 3, replaces the per-seq w4a16_gemv loop below with ONE
+        // w4a16_gemv_batch2/3 launch covering the contiguous [num_seqs, h]
+        // → [num_seqs, qkvz_size] shape. Saves (num_seqs-1) launches per
+        // SSM layer per token — at num_seqs=3 × 48 SSM layers × 20 μs that's
+        // ~2 ms/token of pure launch-overhead removed.
+        //
+        // State-bearing ops (conv1d_update, gdn_decode, gated_rms_norm,
+        // out_proj) still run in the per-seq loop below since they need
+        // per-seq state pointers. The QKVZ batching is safe because
+        // `normed` is already produced in [num_seqs, h] contiguous layout
+        // by the batched rms_norm_residual at step 1 above, and
+        // `deinterleaved` is sized to hold [num_seqs, qkvz_size] BF16.
+        //
+        // Only applies when sequential_qkvz=True + qkvz_nvfp4=Some (the
+        // AEON-Q36-27B + Qwen3.5 family path). Other paths (FP8, BF16,
+        // interleaved) fall through to the per-seq loop unchanged.
+        let qkvz_batched = num_seqs >= 2
+            && num_seqs <= 3
+            && self.sequential_qkvz
+            && self.qkvz_nvfp4.is_some()
+            && crate::layers::ssm_multi_seq_batched_enabled()
+            && match num_seqs {
+                2 => self.w4a16_gemv_batch2_k.0 != 0,
+                3 => self.w4a16_gemv_batch3_k.0 != 0,
+                _ => false,
+            };
+        if qkvz_batched
+            && let Some(ref nvfp4) = self.qkvz_nvfp4
+        {
+            // Single batched launch covering all num_seqs rows.
+            match num_seqs {
+                2 => ops::w4a16_gemv_batch2(
+                    ctx.gpu,
+                    self.w4a16_gemv_batch2_k,
+                    normed,
+                    nvfp4,
+                    deinterleaved,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?,
+                3 => ops::w4a16_gemv_batch3(
+                    ctx.gpu,
+                    self.w4a16_gemv_batch3_k,
+                    normed,
+                    nvfp4,
+                    deinterleaved,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )?,
+                _ => unreachable!("qkvz_batched true only for num_seqs in 2..=3"),
+            }
+        }
+
         for i in 0..num_seqs {
             let normed_i = normed.offset(i * h * bf16);
             let deint_i = deinterleaved.offset(i * qkvz_size * bf16);
@@ -142,7 +201,13 @@ impl Qwen3SsmLayer {
                 .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
 
             // ── 2. QKVZ projection (+ deinterleave if needed) ──
-            if self.sequential_qkvz {
+            //
+            // Skipped when `qkvz_batched` above already produced the
+            // entire [num_seqs, qkvz_size] output in a single launch.
+            if qkvz_batched {
+                // No-op: deint_i contents already populated by the
+                // batched launch above. Fall through to step 3.
+            } else if self.sequential_qkvz {
                 if let Some(ref nvfp4) = self.qkvz_nvfp4 {
                     ops::w4a16_gemv(
                         ctx.gpu,
