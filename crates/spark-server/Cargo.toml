@@ -32,6 +32,12 @@ path = "src/main.rs"
 [dependencies]
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
+# Global allocator. mimalloc tends to be 5-10% faster than glibc's
+# ptmalloc on Vec-heavy / String-heavy Rust workloads on aarch64. We
+# allocate a LOT in the per-token scheduler hot path (Vec<u32> drafts,
+# Vec<u8> D2H buffers, String content sanitiser, accumulated_content,
+# etc.), so the allocator choice is on the critical path.
+mimalloc = { version = "0.1", default-features = false }
 # `default-features = false` on path-deps so the metal feature actually
 # disables the cuda default that each downstream crate inherits.
 spark-runtime = { path = "../spark-runtime", default-features = false }

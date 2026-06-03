@@ -33,6 +33,14 @@
 //! 7. Spawn scheduler thread
 //! 8. Start axum HTTP server
 
+// Global allocator: mimalloc. Faster than glibc's ptmalloc on the
+// Vec-heavy / String-heavy allocations in the per-token scheduler
+// hot path (draft Vecs, D2H buffers, content sanitiser, accumulator
+// strings). Picked over jemalloc for: smaller binary, better aarch64
+// performance, and active maintenance.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod adaptive_sampler;
 mod anthropic;
 mod api;
