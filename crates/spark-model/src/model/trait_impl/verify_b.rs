@@ -84,15 +84,32 @@ impl TransformerModel {
             )?;
         }
 
-        // 1c. Upload 2-entry attention metadata (same layout as batch decode)
+        // 1c. Upload 2-entry attention metadata as a SINGLE packed H2D.
+        // See verify_c.rs (K=3 sibling) for the rationale on the 4→1 H2D
+        // pack: each copy_h2d_async carries ~5 μs CUDA-driver overhead;
+        // packing saves 3 syscalls per K=2 verify step.
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = self.max_blocks_per_seq;
+        let mb = max_blocks as usize;
+        let needed = k * mb;
+        let pack_bytes = 768 + needed * 4;
 
-        // Zero-alloc metadata upload: cast stack arrays to byte slices directly.
+        let mut pack_stack = [0u8; 1024];
+        let mut pack_heap: Vec<u8>;
+        let pack: &mut [u8] = if pack_bytes <= pack_stack.len() {
+            &mut pack_stack[..pack_bytes]
+        } else {
+            pack_heap = vec![0u8; pack_bytes];
+            &mut pack_heap
+        };
+
+        // positions at offset 0 (2 × u32)
         let positions = [seq.seq_len as u32, (seq.seq_len + 1) as u32];
-        let pos_bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, 8) };
-        self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
+        pack[0..8].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(positions.as_ptr() as *const u8, 8)
+        });
 
+        // slots at offset 256 (2 × i64)
         let mut slots = [0i64; 2];
         for t in 0..k {
             let pos = seq.seq_len + t;
@@ -101,35 +118,28 @@ impl TransformerModel {
             let physical_block = seq.physical_block_for(block_idx).unwrap_or(0);
             slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
         }
-        let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, 16) };
-        self.gpu
-            .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
+        pack[256..272].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(slots.as_ptr() as *const u8, 16)
+        });
 
+        // seq_lens at offset 512 (2 × i32)
         let seq_lens = [(seq.seq_len + 1) as i32, (seq.seq_len + 2) as i32];
-        let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, 8) };
-        self.gpu
-            .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
+        pack[512..520].copy_from_slice(unsafe {
+            std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, 8)
+        });
 
-        // Block table: K rows with same content (same physical sequence).
-        let mb = max_blocks as usize;
-        let needed = k * mb;
-        let mut bt_buf_vec;
-        let mut bt_buf_stack = [0i32; 1024];
-        let bt_buf: &mut [i32] = if needed <= 1024 {
-            &mut bt_buf_stack[..needed]
-        } else {
-            bt_buf_vec = vec![0i32; needed];
-            &mut bt_buf_vec
-        };
+        // block_table at offset 768 (k × max_blocks × i32). All K rows
+        // carry the same physical sequence.
+        let bt_bytes_dst = &mut pack[768..768 + needed * 4];
         for row in 0..k {
             for (j, &block) in seq.block_table.iter().enumerate().take(mb) {
-                bt_buf[row * mb + j] = block as i32;
+                let off = (row * mb + j) * 4;
+                bt_bytes_dst[off..off + 4].copy_from_slice(&(block as i32).to_le_bytes());
             }
         }
-        let bt_bytes =
-            unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
+
+        // Single fused H2D
+        self.gpu.copy_h2d_async(pack, meta_base, stream)?;
 
         let metadata = AttnMetadataDev {
             positions: meta_base,
