@@ -1,0 +1,13 @@
+# Atlas Rust build config.
+#
+# `target-cpu=native` enables CPU-specific code generation for the host
+# (GB10 = NVIDIA Grace = Neoverse V2 = ARMv9.0-A + SVE2 + FP16 + dot-product
+# + crypto). Default rustc targets the baseline ARMv8.0 ISA, missing
+# ~10 years of ARM extensions. SVE2 specifically helps the per-token
+# CPU-side BF16↔f32 and argmax loops in sample_step.rs / grammar bitmask
+# scan / xgrammar matcher inner code.
+#
+# Safe because Atlas is not distributed as a binary — every build runs on
+# its target machine. Wheel-style binary distribution would need this off.
+[build]
+rustflags = ["-C", "target-cpu=native"]
