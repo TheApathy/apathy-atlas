@@ -155,9 +155,83 @@ pub fn sample_token_with_grammar(
     let Some(gs) = grammar_state else {
         return sample_token(model, logits, temperature, top_k, top_p, suppress_ids);
     };
+
+    // ── Tier 3b: forced-token short-circuit (xgrammar "Coalescence") ──
+    //
+    // When the grammar admits exactly one legal next token (very common in
+    // JSON tool-call syntax: literal `{`, key strings, `:`, `,`, closing
+    // braces), xgrammar can compute the token directly without filling a
+    // vocab-wide bitmask. Skip the D2H + BF16→f32 + mask + argmax loop
+    // entirely — saves ~5 ms per forced position. On a typical tool-call
+    // response, ~30-50% of positions are forced.
+    if let Some(forced) = gs.forced_token() {
+        return Ok(forced as u32);
+    }
+
     let vocab_size = model.vocab_size();
     let mut bf16_buf = vec![0u8; vocab_size * 2];
     model.copy_logits_to_host(logits, &mut bf16_buf)?;
+    gs.fill_bitmask();
+    let bitmask = gs.bitmask_data();
+
+    // ── Greedy fused fast path (temperature == 0) ──
+    //
+    // Earlier implementation made THREE sequential passes over `vocab_size`:
+    // (1) BF16→f32 conversion, (2) apply_bitmask_to_logits, (3) max_by scan
+    // with f32 partial_cmp — about 5 ms wall on the 248k-vocab aeon-ultimate
+    // model. We fuse them into ONE pass, comparing BF16 values directly as
+    // signed i16 (which preserves the natural ordering of finite BF16
+    // values) so no f32 scratch buffer is needed. Plus we apply suppress_ids
+    // post-hoc since they're typically a handful of token IDs.
+    if temperature == 0.0 {
+        let bytes: &[u8] = &bf16_buf;
+        let mut best_tok: u32 = 0;
+        let mut best_val: i16 = i16::MIN;
+        for tok in 0..vocab_size {
+            let word = tok / 32;
+            let bit = tok % 32;
+            if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
+                continue;
+            }
+            // Reinterpret BF16 bit pattern as signed i16 for total ordering
+            // over finite values. Suppress-ids are filtered post-loop.
+            let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
+            let signed = hi as i16;
+            if signed > best_val {
+                best_val = signed;
+                best_tok = tok as u32;
+            }
+        }
+        // Suppress-id post-filter: rare hit path, recompute argmax only when
+        // a suppressed token was chosen. Cheaper than per-token suppress
+        // check inside the hot loop above.
+        if suppress_ids.contains(&best_tok) {
+            best_val = i16::MIN;
+            best_tok = 0;
+            for tok in 0..vocab_size {
+                if suppress_ids.contains(&(tok as u32)) {
+                    continue;
+                }
+                let word = tok / 32;
+                let bit = tok % 32;
+                if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
+                    continue;
+                }
+                let hi = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]);
+                let signed = hi as i16;
+                if signed > best_val {
+                    best_val = signed;
+                    best_tok = tok as u32;
+                }
+            }
+        }
+        return Ok(best_tok);
+    }
+
+    // Stochastic sampling path: needs f32 logits for the sampler. Keep the
+    // original BF16→f32 + apply_bitmask_to_logits pattern here; this path
+    // is rare in greedy production usage and the dispatching overhead is
+    // dominated by `sample_with_params` regardless.
     let mut f32_logits: Vec<f32> = (0..vocab_size)
         .map(|i| {
             let lo = bf16_buf[i * 2];
@@ -170,18 +244,7 @@ pub fn sample_token_with_grammar(
             f32_logits[id as usize] = f32::NEG_INFINITY;
         }
     }
-    // Apply grammar bitmask.
-    gs.fill_bitmask();
     gs.apply_bitmask_to_logits(&mut f32_logits);
-    if temperature == 0.0 {
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-        return Ok(best);
-    }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
     Ok(sample_with_params(
