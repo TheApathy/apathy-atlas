@@ -25,6 +25,15 @@ pub(super) struct StreamState {
     pub(super) content_decoder: Option<crate::tokenizer::StreamingDecoder<'static>>,
     /// Buffer used for stop-string matching across delta boundaries.
     pub(super) accumulated_content: String,
+    /// Byte position in `accumulated_content` up to which stop-string
+    /// scans have already searched (and not matched). On each new
+    /// token only `accumulated_content[scan_floor..]` needs scanning,
+    /// keeping the total scan work O(n) over a response instead of the
+    /// previous O(n²) (re-scan all of accumulated_content per token).
+    /// scan_floor moves forward only — never resets — because once a
+    /// suffix has been scanned without a stop-string match, prepending
+    /// more text can't introduce a match in the already-scanned prefix.
+    pub(super) stop_scan_floor: usize,
     /// Mirror of the post-sanitizer content stream; used by the
     /// post-stream refusal classifier and the `--dump` synthesiser.
     pub(super) refusal_scan_buf: String,
@@ -127,6 +136,7 @@ impl StreamState {
             emitted: 0,
             content_decoder: None,
             accumulated_content: String::new(),
+            stop_scan_floor: 0,
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             suppressing_param_leak: false,

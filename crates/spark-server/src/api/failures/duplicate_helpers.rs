@@ -71,11 +71,50 @@ pub fn check_loop_watchdog(
         }
         out
     }
+
+    /// Alloc-free normalised iterator: yields lowercased non-whitespace
+    /// chars with whitespace runs collapsed to a single space, matching
+    /// `norm()`'s output shape but without allocating a String.
+    ///
+    /// Used by the inner-loop `norm_eq` to count duplicate lines in the
+    /// loop watchdog without paying a `norm()` String alloc per
+    /// candidate line per emitted token.
+    fn norm_chars(s: &str) -> impl Iterator<Item = char> + '_ {
+        let trimmed = s.trim();
+        let mut prev_space = false;
+        let mut started = false;
+        trimmed.chars().filter_map(move |raw| {
+            let ch = raw.to_ascii_lowercase();
+            if ch.is_ascii_whitespace() {
+                if !prev_space && started {
+                    prev_space = true;
+                    Some(' ')
+                } else {
+                    None
+                }
+            } else {
+                prev_space = false;
+                started = true;
+                Some(ch)
+            }
+        })
+    }
+
+    fn norm_eq(a: &str, b: &str) -> bool {
+        norm_chars(a).eq(norm_chars(b))
+    }
+
     let needle = norm(&line);
     if needle.is_empty() {
         return false;
     }
-    let exact_occurrences = loop_scan_buf.lines().filter(|l| norm(l) == needle).count();
+    // `needle` is already normalised; pass `&line` here so `norm_eq`
+    // doesn't trim+lowercase it twice — both arms produce the same
+    // normalised sequence (line is the source we computed `needle` from).
+    let exact_occurrences = loop_scan_buf
+        .lines()
+        .filter(|l| norm_eq(l, &line))
+        .count();
     if exact_occurrences >= 4 {
         tracing::warn!(
             occurrences = exact_occurrences,
@@ -88,15 +127,31 @@ pub fn check_loop_watchdog(
     // when one occurrence is glued onto another line (mid-stream
     // narration ramping). Only count for ≥30-char phrases so we
     // don't false-positive on short common fragments.
+    //
+    // Earlier this allocated a per-call lowered copy of loop_scan_buf
+    // (up to 10 KB) just to do `.find(&needle)`. Replaced with an
+    // alloc-free case-insensitive byte search: walks `loop_scan_buf`
+    // once, lowercasing each byte inline while checking equality with
+    // `needle`. Short-circuits at 4 occurrences.
     if needle.len() >= 30 {
-        let lowered_buf = loop_scan_buf.to_ascii_lowercase();
+        let needle_bytes = needle.as_bytes();
+        let buf_bytes = loop_scan_buf.as_bytes();
+        let nlen = needle_bytes.len();
         let mut count = 0usize;
-        let mut start = 0usize;
-        while let Some(rel) = lowered_buf[start..].find(&needle) {
-            count += 1;
-            start += rel + needle.len();
-            if count >= 4 {
-                break;
+        let mut i = 0usize;
+        while i + nlen <= buf_bytes.len() {
+            let matches = buf_bytes[i..i + nlen]
+                .iter()
+                .zip(needle_bytes.iter())
+                .all(|(b1, b2)| b1.eq_ignore_ascii_case(b2));
+            if matches {
+                count += 1;
+                if count >= 4 {
+                    break;
+                }
+                i += nlen;
+            } else {
+                i += 1;
             }
         }
         if count >= 4 {

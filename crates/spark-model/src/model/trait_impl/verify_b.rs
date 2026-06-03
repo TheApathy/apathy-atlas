@@ -153,23 +153,29 @@ impl TransformerModel {
         // called), so we also drive the same auto-unsuppress trigger that
         // `decode` uses: once `seq_len > calibration_tokens + 10` the scales
         // are frozen and graphs become safe.
-        if self
+        //
+        // Single atomic load below, reused for both the "freeze graphs"
+        // store decision and the final `use_graphs` flag. The earlier
+        // shape did one load before the if-block + a second load after
+        // (to derive use_graphs); they always returned the same value
+        // because we only mutate via the store on the path that took
+        // the if. ATLAS_DUMP_HIDDEN check uses the cached helper now
+        // instead of re-reading the env var per verify call.
+        let mut suppress_graphs = self
             .suppress_graphs
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if suppress_graphs
             && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
-            // ATLAS_DUMP_HIDDEN: keep eager mode for the entire run so the
-            // CPU sync dump in try_dflash_capture stays graph-safe.
-            && std::env::var("ATLAS_DUMP_HIDDEN").is_err()
+            && !crate::model::env_diag::dump_hidden_enabled()
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            suppress_graphs = false;
             tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs (MTP verify)");
         }
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         let use_graphs = self.comm.is_none()
-            && !self
-                .suppress_graphs
-                .load(std::sync::atomic::Ordering::Relaxed)
+            && !suppress_graphs
             // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is
             // illegal under CUDA graph capture.
             && !hss_engaged;

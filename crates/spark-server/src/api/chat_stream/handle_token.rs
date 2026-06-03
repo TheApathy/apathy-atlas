@@ -210,12 +210,31 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     }
 
     // Multi-token stop sequences via string matching.
+    //
+    // Incremental-scan optimisation: previously the search was
+    //   `accumulated_content.find(stop_str)` over the FULL accumulator
+    // on every token, which is O(n²) over a response. We now only
+    // scan from `stop_scan_floor` (advanced after each scan) backed
+    // off by `max_stop_len - 1` so a stop string straddling the
+    // floor boundary still matches. Net work is O(n) over the whole
+    // response with the same correctness as the original full scan.
     if !ctx.stop_strings.is_empty() && !state.stop_string_triggered {
+        let already_emitted = state.accumulated_content.len();
         state.accumulated_content.push_str(&delta);
+        let max_stop_len = ctx
+            .stop_strings
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        let scan_start = state.stop_scan_floor.saturating_sub(max_stop_len);
+        // Scan the trailing window once; the prefix before scan_start
+        // has been searched in a prior call without a match.
+        let scan_window = &state.accumulated_content[scan_start..];
         for stop_str in &ctx.stop_strings {
-            if let Some(pos) = state.accumulated_content.find(stop_str.as_str()) {
+            if let Some(rel_pos) = scan_window.find(stop_str.as_str()) {
+                let pos = scan_start + rel_pos;
                 let content_before_stop = &state.accumulated_content[..pos];
-                let already_emitted = state.accumulated_content.len() - delta.len();
                 if pos > already_emitted {
                     delta = content_before_stop[already_emitted..].to_string();
                 } else {
@@ -224,6 +243,13 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
                 state.stop_string_triggered = true;
                 break;
             }
+        }
+        if !state.stop_string_triggered {
+            // No match in the trailing window — advance the cursor so the
+            // next token only scans content added after this point. We
+            // leave a `max_stop_len - 1` overlap (via scan_start above)
+            // so partial matches at the boundary are recovered next call.
+            state.stop_scan_floor = state.accumulated_content.len();
         }
         if state.stop_string_triggered && delta.is_empty() {
             return sse_events;

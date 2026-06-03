@@ -103,16 +103,24 @@ impl TransformerModel {
         // CUDA graphs cannot capture NCCL all-reduce (it runs on a separate
         // stream) or cuStreamSynchronize calls. Suppress for EP and profile.
         // Re-enable graphs once FP8 calibration is frozen.
+        //
+        // Single atomic load below, reused for both the freeze decision and
+        // the final use_graphs flag — earlier code did two Relaxed loads
+        // for the same value (the second one read whatever the conditional
+        // store wrote, but a local mirror gives the same outcome at half
+        // the load cost).
+        let mut suppress_graphs = self
+            .suppress_graphs
+            .load(std::sync::atomic::Ordering::Relaxed);
         if self.config.fp8_kv_calibration_tokens > 0
-            && self
-                .suppress_graphs
-                .load(std::sync::atomic::Ordering::Relaxed)
+            && suppress_graphs
             && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
             // ATLAS_DUMP_HIDDEN: keep eager mode so CPU sync dump stays safe.
             && !crate::model::env_diag::dump_hidden_enabled()
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            suppress_graphs = false;
             tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs");
         }
         // Phase 6.2.c — `--high-speed-swap` paths do host-side D2H + dequant
@@ -123,9 +131,7 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         let use_graphs = self.comm.is_none()
             && !self.profile
-            && !self
-                .suppress_graphs
-                .load(std::sync::atomic::Ordering::Relaxed)
+            && !suppress_graphs
             && !hss_engaged;
 
         let ctx = ForwardContext {
