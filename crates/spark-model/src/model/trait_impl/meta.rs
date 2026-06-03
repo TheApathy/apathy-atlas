@@ -238,14 +238,15 @@ impl TransformerModel {
         // ── ATLAS_DUMP_HIDDEN: append emitted-token record ──
         // Pairs with the 5 hidden-state records dumped during the layer loop.
         // Record format: u32 magic | u32 token_id | u32 0 | u32 0 (16 bytes).
-        if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+        // env::var lookup cached via OnceLock helper (was a per-token syscall).
+        if let Some(path) = crate::model::env_diag::dump_hidden_path() {
             const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
             use std::io::Write;
             tracing::trace!("ATLAS_DUMP_HIDDEN: argmax_dispatch → token {}", gpu_token);
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&path)
+                .open(path)
             {
                 let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
                 let _ = f.write_all(&gpu_token.to_le_bytes());
@@ -298,13 +299,14 @@ impl TransformerModel {
 
         // ── ATLAS_DUMP_HIDDEN: append emitted-token records (batch path) ──
         // Pairs with the per-decode-step hidden-state records.
-        if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+        // env::var lookup cached via OnceLock helper.
+        if let Some(path) = crate::model::env_diag::dump_hidden_path() {
             const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&path)
+                .open(path)
             {
                 for &tok in &results {
                     let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
