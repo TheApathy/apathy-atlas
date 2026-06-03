@@ -104,13 +104,15 @@ pub fn process_decode_logits(
     // was sampled at this step. Fires for both fast path (argmax_batch) and
     // host-side path (process_seq_logits). Matches the model-side hook that
     // dumps records only when ATLAS_DUMP_HIDDEN env var is set.
-    if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+    // Cached via `dump_hidden_path` OnceLock so the var-unset case is a
+    // single relaxed load per scheduler step.
+    if let Some(path) = super::helpers::dump_hidden_path() {
         const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
         {
             for (tok, _lp) in &new_tokens {
                 let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
