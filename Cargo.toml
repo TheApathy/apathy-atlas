@@ -70,6 +70,27 @@ atlas-kernels = { path = "crates/atlas-kernels" }
 # `#![deny(clippy::all)]` to its `lib.rs`/`main.rs`; this section extends
 # the same policy to integration tests, benches, and examples (which are
 # compiled as separate targets and would otherwise inherit nothing).
+# ── Release profile ────────────────────────────────────────────────────────
+# Atlas was building with Cargo's default release profile (LTO=false,
+# codegen-units=16) which leaves significant cross-crate inlining on the
+# table — particularly painful for the per-token scheduler → spark-model
+# → spark-runtime → atlas-kernels call chain that hits every emit.
+#
+# `lto = "thin"` is the safest first step: enables ThinLTO across all
+# crates, ~20-30% slower link but allows cross-crate inlining of hot
+# helpers (sample_token, emit_token, dispatch fns, kernel-launch
+# wrappers). `codegen-units = 1` per crate enables full intra-crate
+# optimisation. `panic = "abort"` removes unwind tables from the hot
+# path; we never catch_unwind across the GPU dispatch boundary and the
+# scheduler treats panics as fatal anyway.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = false
+incremental = false
+strip = "none"
+
 [workspace.lints.rust]
 warnings = "deny"
 
