@@ -8,6 +8,25 @@ pub fn bf16_to_f32(lo: u8, hi: u8) -> f32 {
     f32::from_bits(((lo as u32) | ((hi as u32) << 8)) << 16)
 }
 
+/// Cached `ATLAS_DUMP_HIDDEN` env var read.
+///
+/// Returns `Some(path)` if the env var is set (non-empty), `None` otherwise.
+/// The lookup happens exactly once at first call and is cached for the
+/// process lifetime. `emit_token` and `process_decode_logits` previously
+/// re-read the env var on every emitted token; on a 256-token response that
+/// was 256 syscalls + cstring conversions adding ~1.3 ms of pure overhead
+/// when the var was unset (the production default).
+#[inline]
+pub fn dump_hidden_path() -> Option<&'static str> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("ATLAS_DUMP_HIDDEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+
 /// Global hard-stop token for ChatML role boundaries (`<|im_start|>`).
 ///
 /// Set once at startup from `main.rs::set_im_start_hard_stop` when the

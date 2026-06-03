@@ -83,7 +83,7 @@ impl TransformerModel {
 
         // Diagnostic: post-norm hidden state
         if (chunk_start + chunk_len) > 16384
-            || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true")
+            || crate::model::env_diag::diag_gemma4_enabled()
         {
             self.gpu.synchronize(stream)?;
             let (vals, norm) = self.readback_bf16(normed, h.min(16))?;
@@ -137,7 +137,7 @@ impl TransformerModel {
 
         // Diagnostic: logits stats
         if (chunk_start + chunk_len) > 16384
-            || std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true")
+            || crate::model::env_diag::diag_gemma4_enabled()
         {
             self.gpu.synchronize(stream)?;
             let logits_ptr = self.buffers.logits();

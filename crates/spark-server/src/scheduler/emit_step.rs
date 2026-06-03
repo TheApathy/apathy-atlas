@@ -30,13 +30,15 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // ── ATLAS_DUMP_HIDDEN: append token-emit record (catch-all spec path) ──
     // verify_k2/k3/k4/dflash all funnel through emit_token, so this hook
     // covers the speculative codepaths that bypass process_decode_logits.
-    if let Ok(path) = std::env::var("ATLAS_DUMP_HIDDEN") {
+    // Path lookup is cached via OnceLock in `dump_hidden_path` so the
+    // common production case (var unset) is a single relaxed pointer load.
+    if let Some(path) = super::helpers::dump_hidden_path() {
         const TOKEN_DUMP_MAGIC: u32 = 0xA71B5DEE;
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
         {
             let _ = f.write_all(&TOKEN_DUMP_MAGIC.to_le_bytes());
             let _ = f.write_all(&tok.to_le_bytes());

@@ -109,7 +109,7 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
             // ATLAS_DUMP_HIDDEN: keep eager mode so CPU sync dump stays safe.
-            && std::env::var("ATLAS_DUMP_HIDDEN").is_err()
+            && !crate::model::env_diag::dump_hidden_enabled()
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -243,7 +243,7 @@ impl TransformerModel {
         // so the d2h sync below is safe). Reads top-5 tokens by logit so we
         // can see whether the LM head produced a near-tie or a confident bad
         // pick. (B4 — Creative haiku degeneration loop diagnostic.)
-        if std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true") {
+        if crate::model::env_diag::diag_gemma4_enabled() {
             self.gpu.synchronize(stream)?;
             let n_logits = self.config.vocab_size;
             // Read the buffer the LM head actually wrote to. With Gemma-4
