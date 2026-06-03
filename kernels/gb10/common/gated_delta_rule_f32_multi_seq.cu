@@ -24,11 +24,14 @@
 // ============================================================
 // DECODE multi-seq: gated delta rule recurrent update (FP32 output).
 // ============================================================
+// Inputs are FP32 (NOT BF16): conv1d_update_l2norm_f32_multi_seq writes
+// FP32, and AEON-Q36-27B's calibration relies on FP32 conv→GDN precision.
+// Strides for q/k/v are in FP32 elements (qkvz_size FP32 per seq).
 extern "C" __global__ void gated_delta_rule_decode_f32_multi_seq(
     float* const* __restrict__ h_states,
-    const __nv_bfloat16* __restrict__ query,
-    const __nv_bfloat16* __restrict__ key,
-    const __nv_bfloat16* __restrict__ value,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
     const float* __restrict__ gate,
     const float* __restrict__ beta,
     float* __restrict__ output,
@@ -38,8 +41,8 @@ extern "C" __global__ void gated_delta_rule_decode_f32_multi_seq(
     unsigned int k_dim,
     unsigned int v_dim,
     unsigned int gate_beta_stride, // FP32 elements between seqs in gate/beta
-    unsigned int qk_stride,        // BF16 elements between seqs in query/key
-    unsigned int v_in_stride,      // BF16 elements between seqs in value
+    unsigned int qk_stride,        // FP32 elements between seqs in query/key
+    unsigned int v_in_stride,      // FP32 elements between seqs in value
     unsigned int v_out_stride      // FP32 elements between seqs in output
 ) {
     const unsigned int vh  = blockIdx.x;
@@ -53,9 +56,9 @@ extern "C" __global__ void gated_delta_rule_decode_f32_multi_seq(
 
     float* H = h_states[seq] + (vh * k_dim * v_dim);
 
-    const __nv_bfloat16* q_ptr = query + (unsigned long long)seq * qk_stride + kh * k_dim;
-    const __nv_bfloat16* k_ptr = key   + (unsigned long long)seq * qk_stride + kh * k_dim;
-    const __nv_bfloat16* v_ptr = value + (unsigned long long)seq * v_in_stride + vh * v_dim;
+    const float* q_ptr = query + (unsigned long long)seq * qk_stride + kh * k_dim;
+    const float* k_ptr = key   + (unsigned long long)seq * qk_stride + kh * k_dim;
+    const float* v_ptr = value + (unsigned long long)seq * v_in_stride + vh * v_dim;
 
     float g_raw = gate[seq * gate_beta_stride + vh];
     const float g = fminf(fmaxf(g_raw, 0.0f), 1.0f);
@@ -65,13 +68,13 @@ extern "C" __global__ void gated_delta_rule_decode_f32_multi_seq(
     __shared__ float smem_q[128];
 
     if (tid < k_dim) {
-        smem_k[tid] = (float)k_ptr[tid];
-        smem_q[tid] = (float)q_ptr[tid];
+        smem_k[tid] = k_ptr[tid];
+        smem_q[tid] = q_ptr[tid];
     }
     __syncthreads();
 
     if (tid < v_dim) {
-        float v_i = (float)v_ptr[tid];
+        float v_i = v_ptr[tid];
 
         float hk_dot = 0.0f;
         #pragma unroll 4

@@ -187,6 +187,52 @@ pub fn gated_rms_norm(
         .launch(stream)
 }
 
+/// Multi-sequence gated RMS norm with FP32 input, PER-HEAD norm, and
+/// per-seq strides.
+///
+/// Mirrors the single-seq `gated_rms_norm_f32_input` semantics (one CTA
+/// per (seq, head) pair, norm computed over `head_dim` per head), but
+/// the per-seq row strides for input/gate/output are parameterised so
+/// the multi-seq decode buffer layout stays in bounds. `input_stride`
+/// is FP32 elements, `gate_stride` and `output_stride` are BF16
+/// elements.
+///
+/// Kernel: `gated_rms_norm_f32_multi_seq(input, gate, weight, output,
+///   head_dim, eps, input_stride_fp32, gate_stride_bf16,
+///   output_stride_bf16)`
+/// Grid: (num_v_heads, num_seqs, 1)  Block: (head_dim, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gated_rms_norm_f32_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    num_v_heads: u32,
+    num_seqs: u32,
+    head_dim: u32,
+    eps: f32,
+    input_stride: u32,
+    gate_stride: u32,
+    output_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, num_seqs, 1])
+        .block([head_dim.min(1024), 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(head_dim)
+        .arg_f32(eps)
+        .arg_u32(input_stride)
+        .arg_u32(gate_stride)
+        .arg_u32(output_stride)
+        .launch(stream)
+}
+
 /// Batched gated RMS norm for prefill: all (head, actual_token) pairs in one launch.
 ///
 /// Grid: (heads_per_token, num_actual_tokens, 1)
