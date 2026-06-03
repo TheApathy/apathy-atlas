@@ -186,6 +186,17 @@ impl Qwen3SsmLayer {
                 "ssm_preprocess_multi_seq",
                 "compute_gdn_gates_multi_seq",
             ),
+            // FP32-output variants — production-precision multi-seq path.
+            conv1d_l2norm_f32_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d_f32_multi_seq",
+                "causal_conv1d_update_l2norm_f32_multi_seq",
+            ),
+            gdn_decode_f32_multi_seq_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_f32_multi_seq",
+                "gated_delta_rule_decode_f32_multi_seq",
+            ),
             // Per-layer scratch for the 2 × c × 8-byte per-seq state ptr
             // arrays uploaded before each multi-seq launch. Cap at 32 seqs
             // (well above the practical concurrent-decode batch size on

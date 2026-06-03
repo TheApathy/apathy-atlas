@@ -113,6 +113,64 @@ pub fn gdn_decode_multi_seq(
         .launch(stream)
 }
 
+/// FP32-output multi-seq gated delta rule decode.
+///
+/// Same signature as `gdn_decode_multi_seq` but writes FP32 output
+/// instead of BF16. Used in the production AEON-Q36-27B decode path
+/// where the downstream gated_rms_norm consumes FP32 to maintain
+/// recurrent-path precision (Stuffed-Mamba mitigation).
+///
+/// `v_out_stride` is in FP32 ELEMENTS between successive sequences.
+///
+/// Kernel: `gated_delta_rule_decode_f32_multi_seq(h_state_ptrs, query,
+///          key, value, gate, beta, output, num_seqs, num_k_heads,
+///          num_v_heads, k_dim, v_dim, gate_beta_stride, qk_stride,
+///          v_in_stride, v_out_stride)`
+/// Grid: (num_v_heads, num_seqs, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_multi_seq(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state_ptrs: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    num_seqs: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    gate_beta_stride: u32,
+    qk_stride: u32,
+    v_in_stride: u32,
+    v_out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, num_seqs, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state_ptrs)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_u32(num_seqs)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(qk_stride)
+        .arg_u32(v_in_stride)
+        .arg_u32(v_out_stride)
+        .launch(stream)
+}
+
 /// Gated delta rule prefill (multi-token, sequential SSM update within kernel).
 ///
 /// Processes `seq_len` tokens sequentially per (batch, head) pair.
