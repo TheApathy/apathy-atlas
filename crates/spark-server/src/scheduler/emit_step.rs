@@ -178,11 +178,16 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
     let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
 
-    if a.eos_tokens.contains(&tok) && !suppress_eos {
+    // Single-pass over eos_tokens: previously this Vec was linearly
+    // scanned twice per emit (once for each branch of the suppress_eos
+    // dispatch). On a 256-token response that's 256 extra scans of the
+    // ~3-5 entry vec — small per call but mechanical to remove.
+    let is_eos = a.eos_tokens.contains(&tok);
+    if is_eos && !suppress_eos {
         a.finished = true;
         return;
     }
-    if a.eos_tokens.contains(&tok) && suppress_eos {
+    if is_eos {
         // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
         // or min_tokens not reached. Don't stop — let the model continue generating.
         return;

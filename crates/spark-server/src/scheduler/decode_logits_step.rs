@@ -387,14 +387,16 @@ pub fn process_decode_logits(
             || thinking_suppresses_eos
             || post_think_suppresses_eos;
 
-        if a.eos_tokens.contains(&tok) && !suppress_eos {
+        // Single-pass over eos_tokens (was 2× linear scan).
+        let is_eos = a.eos_tokens.contains(&tok);
+        if is_eos && !suppress_eos {
             // Stop/EOS token: do NOT stream to client (OpenAI spec: returned text
             // must not contain the stop sequence). The token is still added to
             // output_tokens for correct token count; the API layer strips the
             // decoded text for blocking responses.
             a.output_tokens.push(tok);
             a.finished = true;
-        } else if a.eos_tokens.contains(&tok) && suppress_eos {
+        } else if is_eos {
             // EOS suppressed: grammar not terminated or legacy tool call not yet seen.
             // Don't stop, don't stream the EOS — the model must keep generating.
             // Don't add to output_tokens (EOS is discarded).
