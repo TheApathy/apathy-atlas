@@ -226,6 +226,65 @@ pub fn conv1d_update_l2norm_f32_multi_seq(
         .launch(stream)
 }
 
+/// K=3 fused conv1d-update + SiLU + L2 norm + intermediate-state save.
+///
+/// Replaces the K=3 verify per-token loop (3 × `conv1d_update_l2norm` +
+/// 3 × d2d copy of conv_state) with a single launch. State stays in
+/// registers across the 3 sequential updates; intermediates after
+/// tokens 0 and 1 are written to `state_inter_0` / `state_inter_1`,
+/// and the final state after token 2 lands in `conv_state` (matching
+/// the post-state contract of the per-token kernel). `input_stride` and
+/// `output_stride` are BF16 elements between successive tokens so the
+/// caller can keep the existing `deinterleaved` layout (qkvz_size
+/// stride) and the existing `conv_out_buf` layout (conv_dim stride).
+///
+/// Kernel: `causal_conv1d_update_l2norm_chunk3(conv_state, new_input,
+///          weight, bias, output, state_inter_0, state_inter_1, batch,
+///          dim, d_conv, qk_channels, head_dim, l2_eps, input_stride,
+///          output_stride)`
+/// Grid: (ceil(dim/256), batch, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_update_l2norm_chunk3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state: DevicePtr,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    state_inter_0: DevicePtr,
+    state_inter_1: DevicePtr,
+    batch: u32,
+    dim: u32,
+    d_conv: u32,
+    qk_channels: u32,
+    head_dim: u32,
+    l2_eps: f32,
+    input_stride: u32,
+    output_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    let bias_ptr = DevicePtr::NULL;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(dim, 256), batch, 1])
+        .block([256, 1, 1])
+        .arg_ptr(conv_state)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(bias_ptr)
+        .arg_ptr(output)
+        .arg_ptr(state_inter_0)
+        .arg_ptr(state_inter_1)
+        .arg_u32(batch)
+        .arg_u32(dim)
+        .arg_u32(d_conv)
+        .arg_u32(qk_channels)
+        .arg_u32(head_dim)
+        .arg_f32(l2_eps)
+        .arg_u32(input_stride)
+        .arg_u32(output_stride)
+        .launch(stream)
+}
+
 /// Multi-token conv1d sliding window update + SiLU for prefill.
 ///
 /// Processes `seq_len` tokens sequentially per channel in registers.

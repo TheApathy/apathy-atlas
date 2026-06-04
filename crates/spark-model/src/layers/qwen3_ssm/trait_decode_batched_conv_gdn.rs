@@ -130,31 +130,58 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else if num_tokens == 3 {
-            // ── K=3 fused path: conv1d+L2norm per token, GDN WY3 ──
-            for t in 0..3u32 {
-                let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
-                let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
-                ops::conv1d_update_l2norm(
+            // ── K=3 fused path: conv1d+L2norm + intermediates, GDN WY3 ──
+            // Single chunk3 kernel covers 3 sequential conv1d updates +
+            // L2 norm on Q/K + intermediate-state save (replaces 3 per-
+            // token conv1d_l2norm launches + 3 d2d copies = 6 launches
+            // → 1). Falls back to the per-token loop if the kernel isn't
+            // loaded for the active target.
+            if self.conv1d_l2norm_chunk3_k.0 != 0 {
+                ops::conv1d_update_l2norm_chunk3(
                     ctx.gpu,
-                    self.conv1d_l2norm_k,
+                    self.conv1d_l2norm_chunk3_k,
                     ssm_state.conv_state,
-                    qkv_t,
+                    deinterleaved,
                     &self.ssm.conv1d,
-                    conv_out_t,
+                    conv_out_buf,
+                    ssm_state.conv_state_intermediates[0],
+                    ssm_state.conv_state_intermediates[1],
+                    1,
                     conv_dim as u32,
                     d_conv as u32,
-                    1,
                     qk_ch,
                     kd as u32,
                     1e-6,
+                    qkvz_size as u32, // input stride (BF16): qkvz_size between tokens
+                    conv_dim as u32,  // output stride (BF16): conv_dim between tokens
                     stream,
                 )?;
-                ctx.gpu.copy_d2d_async(
-                    ssm_state.conv_state,
-                    ssm_state.conv_state_intermediates[t as usize],
-                    conv_bytes,
-                    stream,
-                )?;
+            } else {
+                for t in 0..3u32 {
+                    let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
+                    let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
+                    ops::conv1d_update_l2norm(
+                        ctx.gpu,
+                        self.conv1d_l2norm_k,
+                        ssm_state.conv_state,
+                        qkv_t,
+                        &self.ssm.conv1d,
+                        conv_out_t,
+                        conv_dim as u32,
+                        d_conv as u32,
+                        1,
+                        qk_ch,
+                        kd as u32,
+                        1e-6,
+                        stream,
+                    )?;
+                    ctx.gpu.copy_d2d_async(
+                        ssm_state.conv_state,
+                        ssm_state.conv_state_intermediates[t as usize],
+                        conv_bytes,
+                        stream,
+                    )?;
+                }
             }
 
             let q_ptr = conv_out_buf;
