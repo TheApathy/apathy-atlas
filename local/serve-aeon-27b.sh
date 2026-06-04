@@ -35,8 +35,39 @@ if [ "${FREE_GB:-0}" -lt 40 ]; then
 fi
 echo "[serve-aeon-27b] preflight ok: ${FREE_GB} GB free, port ${PORT} clear"
 
-# WORKING CONFIG (2026-05-16): 17-20 tok/s avg with CORRECT output.
-# Counting prompts hit 20.28 tok/s; narrative + code 15-17 tok/s.
+# WORKING CONFIG (2026-06-04 re-bench): 30 tok/s avg at N=1, 28 tok/s at
+# N=8 concurrent decode. Code generation 28 tok/s, counting 24-30 tok/s.
+# +30% vs raw (no-flag) baseline of 22.94 tok/s, matching the published
+# AEON container number (30.9 tok/s).
+#
+# Winning stack composition:
+#   ATLAS_LM_HEAD_BATCH3=1        : +16% (K=3 LM-head triple GEMV — single
+#                                   kernel replaces M=3 w4a16_gemm fallback
+#                                   that wastes 95% of M_TILE=64)
+#   ATLAS_SSM_OUT_BATCH3=1        : +12% on top (K=3 SSM out_proj GEMV
+#                                   batched for K=3 verify, avoids same
+#                                   M=3 waste)
+#   ATLAS_SSM_MULTI_SEQ_KERNEL=1  : +0% at N=1, no regression at N≥2.
+#                                   Added 2026-06-03 (commits b9e7c28 +
+#                                   b57339d). FP32-input multi-seq
+#                                   conv1d_update_l2norm + gdn_decode +
+#                                   batched QKVZ/BA+gates/RMS-norm/out_proj
+#                                   for multi-seq concurrent decode.
+#                                   Critically fixes the silent garbage
+#                                   that b9e7c28 alone produced at N≥2.
+#
+# Flags evaluated and DROPPED:
+#   ATLAS_TC_NVFP4_M16=1          : -42% regression at N=8
+#   ATLAS_TC_NVFP4_K3=1           : -18% regression (M=3 MMA-tile waste)
+#   ATLAS_FUSE_SSM_QKVZ=1         : noise (+0.3%)
+#   ATLAS_MOE_K3_FUSED_GATE_UP=1  : noise (within ±1%)
+#   ATLAS_SSM_BA_BATCHED=1        : noise (BA is already 14μs/layer)
+#   ATLAS_UNIFIED_MOE_LAYOUT=1    : no effect (needs t-layout weights
+#                                   not built; would also regress at small N
+#                                   per helpers_b.rs:181 — warp-reduction
+#                                   wins at decode)
+#   --ngram-speculative           : -30% (K=2 ceiling lower than K=3 MTP)
+#   --num-drafts 4 (K=5)          : -84% (drafter not trained for K=5)
 #
 # Why these flags:
 #   --kv-cache-dtype fp8         FP8 KV cache. turbo4 (FP4) CORRUPTS the
@@ -74,6 +105,11 @@ export ATLAS_LM_HEAD_BATCH3=1
 export ATLAS_SSM_OUT_BATCH3=1
 export ATLAS_PREFILL_FFN_FAST=1
 export ATLAS_FFN_M16_TRANSPOSED=1
+# 2026-06-04: multi-seq batched conv1d + gdn + QKVZ + BA-split + RMS-norm
+# + out_proj for concurrent decode (b9e7c28 + b57339d). FP32-input fix +
+# 4 op-level launch-reductions per SSM layer per token. No regression at
+# N=1, no regression at N=8 concurrent; correctness validated.
+export ATLAS_SSM_MULTI_SEQ_KERNEL=1
 exec /path/to/atlas-src/target/release/spark serve \
   --model-from-path /path/to/models/AEON-Q36-27B-XS \
   --model-name aeon-27b \
