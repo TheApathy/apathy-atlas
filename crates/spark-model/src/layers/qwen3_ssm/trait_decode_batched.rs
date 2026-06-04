@@ -293,26 +293,54 @@ impl Qwen3SsmLayer {
             }
             anyhow::Result::<()>::Ok(())
         })?;
-        crate::kprof!(ctx.gpu, stream, "ssm_compute_gdn_gates_loop", {
-            for t in 0..(num_tokens as u32) {
-                let ba_out = ctx.buffers.ssm_ba().offset(t as usize * ba_size * bf16);
-                let gate_t = gates_buf.offset(t as usize * gate_beta_stride);
-                let beta_t = gates_buf.offset(t as usize * gate_beta_stride + nv * fp32);
-                ops::compute_gdn_gates(
+        // Batched compute_gdn_gates across K=γ tokens via the multi-seq
+        // kernel (one CTA per (token, head)). Stride between successive
+        // tokens in ba_out is `ba_size` BF16 elements; in gates/beta it's
+        // `2*nv` FP32 elements (gate at offset 0, beta at offset nv).
+        // Saves K-1 launches per SSM layer per K=γ verify step. Falls
+        // back to per-token loop when the multi-seq kernel handle is null
+        // (e.g. older PTX bundles).
+        crate::kprof!(ctx.gpu, stream, "ssm_compute_gdn_gates_batched", {
+            if self.compute_gdn_gates_multi_seq_k.0 != 0 && num_tokens >= 2 {
+                ops::compute_gdn_gates_multi_seq(
                     ctx.gpu,
-                    self.compute_gdn_gates_k,
-                    ba_out,
+                    self.compute_gdn_gates_multi_seq_k,
+                    ctx.buffers.ssm_ba(),
                     self.ssm.a_log.weight,
                     self.ssm.dt_bias.weight,
-                    gate_t,
-                    beta_t,
-                    1,
+                    gates_buf,
+                    gates_buf.offset(nv * fp32),
+                    num_tokens as u32,
                     nv as u32,
                     nk as u32,
                     vpg as u32,
                     ba_size as u32,
+                    (nv * 2) as u32,
                     stream,
                 )?;
+            } else {
+                for t in 0..(num_tokens as u32) {
+                    let ba_out =
+                        ctx.buffers.ssm_ba().offset(t as usize * ba_size * bf16);
+                    let gate_t = gates_buf.offset(t as usize * gate_beta_stride);
+                    let beta_t =
+                        gates_buf.offset(t as usize * gate_beta_stride + nv * fp32);
+                    ops::compute_gdn_gates(
+                        ctx.gpu,
+                        self.compute_gdn_gates_k,
+                        ba_out,
+                        self.ssm.a_log.weight,
+                        self.ssm.dt_bias.weight,
+                        gate_t,
+                        beta_t,
+                        1,
+                        nv as u32,
+                        nk as u32,
+                        vpg as u32,
+                        ba_size as u32,
+                        stream,
+                    )?;
+                }
             }
             anyhow::Result::<()>::Ok(())
         })?;
@@ -372,31 +400,36 @@ impl Qwen3SsmLayer {
             anyhow::Result::<()>::Ok(())
         })?;
 
-        // ── 8. Gated RMS norm per token ──
-        // Z gate is in deinterleaved at offset [Q_2048 + K_2048 + V_4096]
-        // Normed out: reuse conv_out_buf (freed after GDN)
+        // ── 8. Gated RMS norm — batched across K tokens ──
+        // Z gate lives in `deinterleaved` at offset [Q + K + V] within
+        // each token's qkvz slice; gdn output is BF16 [K, value_dim]
+        // contig. Use the prefill kernel (grid = (heads_per_token,
+        // num_actual_tokens, 1)) to collapse the per-token loop into a
+        // single launch. The kernel reads stride parameters for
+        // input/output and gate independently, so the value_dim/qkvz_size
+        // stride mismatch is handled at the kernel.
+        //
+        // Saves num_tokens-1 launches per SSM layer per K=γ verify:
+        //   K=3 × 48 SSM layers × ~20 μs/launch ≈ 2 ms/token.
+        // The prefill kernel handle is non-null (init.rs:110 mandatory).
         let normed_out_buf = conv_out_buf;
-        crate::kprof!(ctx.gpu, stream, "ssm_gated_rms_norm_loop", {
-            for t in 0..(num_tokens as u32) {
-                let gdn_t = gdn_out_buf.offset(t as usize * value_dim * bf16);
-                let z_t = deinterleaved
-                    .offset(t as usize * qkvz_size * bf16 + (key_dim * 2 + value_dim) * bf16);
-                let normed_t = normed_out_buf.offset(t as usize * value_dim * bf16);
-                ops::gated_rms_norm(
-                    ctx.gpu,
-                    self.gated_rms_norm_k,
-                    gdn_t,
-                    z_t,
-                    &self.ssm.norm,
-                    normed_t,
-                    nv as u32,
-                    vd as u32,
-                    vd as u32,
-                    eps,
-                    vd as u32,
-                    stream,
-                )?;
-            }
+        crate::kprof!(ctx.gpu, stream, "ssm_gated_rms_norm_batched", {
+            let z_base = deinterleaved.offset((key_dim * 2 + value_dim) * bf16);
+            ops::gated_rms_norm_prefill(
+                ctx.gpu,
+                self.gated_rms_norm_prefill_k,
+                gdn_out_buf,
+                z_base,
+                &self.ssm.norm,
+                normed_out_buf,
+                nv as u32,
+                vd as u32,
+                eps,
+                num_tokens as u32,
+                value_dim as u32,
+                qkvz_size as u32,
+                stream,
+            )?;
             anyhow::Result::<()>::Ok(())
         })?;
 

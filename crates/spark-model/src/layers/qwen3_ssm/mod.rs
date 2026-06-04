@@ -135,6 +135,12 @@ pub struct Qwen3SsmLayer {
     /// the subsequent out_proj can fire as a batched w4a16_gemm at M=n.
     /// KernelHandle(0) when not compiled for the active target.
     gated_rms_norm_f32_multi_seq_k: KernelHandle,
+    /// K=3 fused conv1d-update + L2 norm + intermediate-state save for the
+    /// K=3 verify SSM forward. Replaces the per-token loop (3
+    /// `conv1d_l2norm` + 3 d2d copies) with one launch. KernelHandle(0)
+    /// when the PTX module isn't in the active target's bundle, in which
+    /// case the per-token fallback runs.
+    conv1d_l2norm_chunk3_k: KernelHandle,
     /// Scratch device buffer for per-seq state pointer arrays uploaded
     /// before each multi-seq kernel launch. Sized at init for the
     /// configured `max_batch_size`. Layout: `[h_state_ptrs[c],
