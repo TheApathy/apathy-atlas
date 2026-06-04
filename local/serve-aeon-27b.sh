@@ -35,10 +35,11 @@ if [ "${FREE_GB:-0}" -lt 40 ]; then
 fi
 echo "[serve-aeon-27b] preflight ok: ${FREE_GB} GB free, port ${PORT} clear"
 
-# WORKING CONFIG (2026-06-04 re-bench): 30 tok/s avg at N=1, 28 tok/s at
-# N=8 concurrent decode. Code generation 28 tok/s, counting 24-30 tok/s.
-# +30% vs raw (no-flag) baseline of 22.94 tok/s, matching the published
-# AEON container number (30.9 tok/s).
+# WORKING CONFIG (2026-06-04 re-bench): 30.6 tok/s avg at N=1, 31.1 at
+# N=2, 28.7 at N=8 concurrent decode. Code generation 28.5 tok/s,
+# counting 29-32 tok/s, fizzbuzz 29.2 tok/s. +33% vs raw (no-flag)
+# baseline of 22.94 tok/s — slightly beats the AEON container number
+# (30.9 tok/s).
 #
 # Winning stack composition:
 #   ATLAS_LM_HEAD_BATCH3=1        : +16% (K=3 LM-head triple GEMV — single
@@ -55,6 +56,14 @@ echo "[serve-aeon-27b] preflight ok: ${FREE_GB} GB free, port ${PORT} clear"
 #                                   for multi-seq concurrent decode.
 #                                   Critically fixes the silent garbage
 #                                   that b9e7c28 alone produced at N≥2.
+#   (no env flag — always on)     : K=3 verify SSM forward fully batched
+#                                   (commit a494ac9 2026-06-04). New
+#                                   conv1d_chunk3 kernel collapses 6
+#                                   per-token launches to 1; gates loop
+#                                   uses compute_gdn_gates_multi_seq;
+#                                   gated_rms_norm loop uses the prefill
+#                                   kernel with independent input/gate
+#                                   strides. ~+1-2% at all N.
 #
 # Flags evaluated and DROPPED:
 #   ATLAS_TC_NVFP4_M16=1          : -42% regression at N=8
