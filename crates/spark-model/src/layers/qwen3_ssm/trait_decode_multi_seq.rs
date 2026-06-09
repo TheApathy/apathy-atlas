@@ -153,24 +153,49 @@ impl Qwen3SsmLayer {
             // (`ssm_multi_seq_ptr_scratch`). Layout:
             //   [h_state_ptrs[N] u64, conv_state_ptrs[N] u64]
             // h_state_ptrs at offset 0, conv_state_ptrs at offset N*8.
-            let mut ptr_buf: [u64; 64] = [0u64; 64];
+            //
+            // Fix B: use the layer's stable heap-allocated host buffer
+            // instead of a stack array. CUDA graph capture records the
+            // source pointer at capture time; on replay the GPU reads
+            // from that same address. A stack array would be invalid on
+            // replay (stack frame gone), so the per-layer
+            // `multi_seq_ptr_host` Box<UnsafeCell<[u64;64]>> gives a
+            // stable heap address that persists for the model lifetime.
+            //
+            // SAFETY: `decode_a2.rs` serialises layer dispatch within a
+            // verify step — only one stream touches this layer at a
+            // time. Even though the harness can't prove this statically,
+            // the architectural invariant holds (no parallel forward
+            // through the same layer instance).
+            let ptr_buf: *mut [u64; 64] = self.multi_seq_ptr_host.get();
             assert!(
-                num_seqs * 2 <= ptr_buf.len(),
-                "ssm_multi_seq_ptr_scratch capacity exceeded: {}*2 > {}",
+                num_seqs * 2 <= 64,
+                "multi_seq_ptr_host capacity exceeded: {}*2 > 64",
                 num_seqs,
-                ptr_buf.len()
             );
-            for (i, state) in states.iter_mut().enumerate().take(num_seqs) {
-                let ssm_state = state
-                    .as_any_mut()
-                    .downcast_mut::<SsmLayerState>()
-                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
-                ptr_buf[i] = ssm_state.h_state.0;
-                ptr_buf[num_seqs + i] = ssm_state.conv_state.0;
+            // SAFETY: see note above — single-thread mutation here is
+            // upheld by the model forward serialisation. We hold the
+            // raw pointer only across this short fill+H2D submission.
+            unsafe {
+                let slots = &mut *ptr_buf;
+                for (i, state) in states.iter_mut().enumerate().take(num_seqs) {
+                    let ssm_state = state
+                        .as_any_mut()
+                        .downcast_mut::<SsmLayerState>()
+                        .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+                    slots[i] = ssm_state.h_state.0;
+                    slots[num_seqs + i] = ssm_state.conv_state.0;
+                }
             }
+            // SAFETY: the byte slice borrows the same stable heap region
+            // as ptr_buf; copy_h2d_async only needs the address +
+            // length, and the H2D submission is queued onto `stream`
+            // before this scope ends. Async completion happens later on
+            // the GPU but the heap memory remains valid for the model
+            // lifetime, so even captured graph replays read live data.
             let ptr_bytes = unsafe {
                 std::slice::from_raw_parts(
-                    ptr_buf.as_ptr() as *const u8,
+                    ptr_buf as *const u8,
                     num_seqs * 2 * std::mem::size_of::<u64>(),
                 )
             };

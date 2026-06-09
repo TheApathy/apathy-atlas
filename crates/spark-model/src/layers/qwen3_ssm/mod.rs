@@ -147,6 +147,21 @@ pub struct Qwen3SsmLayer {
     /// conv_state_ptrs[c]]` u64 each (each c × 8 bytes), so total
     /// `2 * max_c * 8` bytes. Pre-allocated to avoid per-call alloc.
     ssm_multi_seq_ptr_scratch: DevicePtr,
+    /// Stable heap-allocated HOST staging buffer for the multi-seq ptr
+    /// table H2D upload. The pre-Fix-B code used a stack array `[u64;
+    /// 64]` as the H2D source — CUDA graph capture recorded that stack
+    /// address, and on graph replay the GPU read invalid memory after
+    /// the stack frame was gone. Pinning it on the heap gives a stable
+    /// source address: graph capture records the heap pointer, replay
+    /// reads the CURRENT contents (which the CPU updates fresh every
+    /// step). 64 u64s = 512 bytes, well below MAX_C=32 × 2 = 64 slots.
+    ///
+    /// Wrapped in `Box<UnsafeCell<...>>` for interior mutability behind
+    /// the `&self` decode forward. SAFETY contract: the layer is only
+    /// touched on one stream at a time (decode_a2.rs serialises layer
+    /// dispatch within a verify step), so concurrent mutation is
+    /// impossible — even though Rust can't prove it.
+    multi_seq_ptr_host: Box<std::cell::UnsafeCell<[u64; 64]>>,
     /// Capacity of the pointer scratch in number of sequences. Acts as
     /// a hard cap on `num_seqs` for the multi-seq kernels (callers fall
     /// back to per-seq loop if `n > ssm_multi_seq_ptr_max`).
@@ -186,6 +201,16 @@ pub struct Qwen3SsmLayer {
     fp8_gemm_k: KernelHandle,
     fp8_gemm_t_m128_k: KernelHandle, // M128: halves B re-reads for out_proj at ISL > 128
 }
+
+// SAFETY: `multi_seq_ptr_host` contains an `UnsafeCell<[u64; 64]>` which
+// makes the struct `!Sync` by default. The `TransformerLayer` trait
+// requires `Send + Sync`. The architectural invariant that makes this
+// safe is upheld in `decode_a2.rs`: layer dispatch is serialised within
+// a verify step (the layer iteration is a single for-loop on one stream,
+// not parallel), so concurrent mutation of the host ptr buffer is
+// impossible. The Rust type system can't see this — manual impl with
+// SAFETY note is correct.
+unsafe impl Sync for Qwen3SsmLayer {}
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
