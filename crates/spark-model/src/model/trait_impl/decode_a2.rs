@@ -198,6 +198,13 @@ impl TransformerModel {
         // sequence.rs:159 and types.rs:190. This decoder forces use_graphs=false
         // (multi-seq SSM state-pointer hazard), so this lookup never fires; the
         // key still has to type-check.
+        //
+        // NOTE: even with Fix B's stable SSM ptr-table indirection,
+        // slot-specific addresses still leak into captured graphs via
+        // paths NOT (yet) routed through indirection (empirically: one
+        // token corrupted per N=4 stream when graph_key drops slot_ids
+        // — needs full audit of attn metadata / KV block table /
+        // embedding offset paths before key simplification is safe).
         let graph_key: (Vec<usize>, usize) = {
             let mut slots: Vec<usize> = seqs.iter().map(|s| s.slot_idx).collect();
             slots.sort_unstable();
