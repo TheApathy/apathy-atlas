@@ -563,7 +563,21 @@ impl TransformerModel {
         // path (verified cos=1.0 across all 17 tokens in a prior session),
         // so output text is identical to the pre-fix eager path.
         let mut ddtree_parent_ids_dev = *self.ddtree_parent_ids_dev.lock();
-        if use_graphs
+        // ATLAS_DISABLE_TREE_WY=1 forces flat-chain wy_k path (wy17 etc.)
+        // instead of `gated_delta_rule_tree_wy`. The tree-WY kernel is
+        // NOT bit-equivalent to wy17 on linear chains (see propose.rs
+        // comment around line 343 — "first-pass tree kernel isn't bit-
+        // equivalent to wy17 — flat-chain tokens drift numerically and
+        // drafter accept collapses"). When γ matches
+        // `ddtree_parent_ids_capacity`, the auto-injection at this site
+        // would otherwise force the broken kernel. Setting the env var
+        // skips the injection and lets the proven wy_k path run.
+        let disable_tree_wy = std::env::var("ATLAS_DISABLE_TREE_WY")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !disable_tree_wy
+            && use_graphs
             && ddtree_parent_ids_dev.is_none()
             && self.ddtree_parent_ids_capacity > 0
             && k == self.ddtree_parent_ids_capacity
