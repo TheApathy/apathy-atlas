@@ -217,6 +217,11 @@ impl Qwen3SsmLayer {
                 gpu.alloc(bytes)?
             },
             ssm_multi_seq_ptr_max: 32,
+            // Fix B: stable heap-allocated host staging buffer for the
+            // ptr-table H2D upload. Address stays put for the model
+            // lifetime — required for CUDA graph capture (the previous
+            // `[u64; 64]` stack array was invalid on graph replay).
+            multi_seq_ptr_host: Box::new(std::cell::UnsafeCell::new([0u64; 64])),
             ba_gates_prefill_k: gpu.kernel("ssm_preprocess", "dense_gemm_ba_gates_prefill")?,
             conv1d_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
             gdn_chunk2_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk2")?,
