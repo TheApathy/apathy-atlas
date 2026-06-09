@@ -153,6 +153,15 @@ impl TransformerModel {
         let mut results: Vec<[u32; 3]> = vec![[0u32; 3]; c];
 
         // ── Per-step c-batched K-loop ──
+        //
+        // Fix C (perf): write each step's argmax to a DISTINCT region of
+        // scratch (`argmax_base + (k*c + i) * 4`) and skip the per-step
+        // sync + d2h. The argmax `results[i][k]` are only consumed AFTER
+        // the K-loop completes, so the per-step host sync was a pure
+        // GPU pipeline stall (~80 ms per K=3 step ≈ 240 ms wasted per
+        // c-batched verify). All argmax bytes are read back in ONE d2h
+        // after the loop with a single sync.
+        let argmax_base = self.buffers.scratch();
         for k in 0..k_steps {
             // Gather the k-th token from each seq.
             let step_tokens: Vec<u32> = (0..c).map(|i| tokens_per_seq[i][k]).collect();
@@ -167,13 +176,11 @@ impl TransformerModel {
             // self.buffers.logits()[0..c, vocab]. We need argmax per row.
             let logits_ptr = self.decode_batch_dispatch(&step_tokens, seqs, stream)?;
 
-            // Argmax per seq: write c argmax outputs to scratch, then
-            // single D2H copy. Each argmax is u32 (4 bytes), c × 4 bytes
-            // total D2H per step.
-            let argmax_out = self.buffers.scratch();
+            // Per-step argmax writes go to `argmax_base + (k*c + i) * 4`
+            // — non-overlapping region per step. NO sync, NO d2h here.
             for i in 0..c {
                 let logits_i = logits_ptr.offset(i * vocab * bf16);
-                let out_i = argmax_out.offset(i * 4);
+                let out_i = argmax_base.offset((k * c + i) * 4);
                 ops::argmax_bf16(
                     self.gpu.as_ref(),
                     self.argmax_kernel,
@@ -182,20 +189,6 @@ impl TransformerModel {
                     vocab as u32,
                     stream,
                 )?;
-            }
-            // Sync before D2H so argmax kernels have completed.
-            self.gpu.synchronize(stream)?;
-            let mut argmax_buf = vec![0u8; c * 4];
-            self.gpu.copy_d2h(argmax_out, &mut argmax_buf)?;
-            for i in 0..c {
-                let off = i * 4;
-                let v = u32::from_le_bytes([
-                    argmax_buf[off],
-                    argmax_buf[off + 1],
-                    argmax_buf[off + 2],
-                    argmax_buf[off + 3],
-                ]);
-                results[i][k] = v;
             }
 
             // ── Snapshot per-seq SSM state into intermediate pool slot k ──
@@ -222,6 +215,28 @@ impl TransformerModel {
             // snapshot for the last step k=K-1 as a small optimization.
             if k + 1 < k_steps {
                 self.snapshot_ssm_intermediates_per_seq(seqs, k, stream)?;
+            }
+        }
+
+        // Fix C: ONE sync + ONE d2h after the K-loop completes.
+        // GPU pipelined all K argmax kernels with the decode forwards
+        // and SSM snapshots — host wakes only when everything queued
+        // since the last sync is done. argmax_buf layout: [step 0:
+        // c*4 bytes, step 1: c*4, step 2: c*4] = K*c*4 = 3*c*4 bytes.
+        self.gpu.synchronize(stream)?;
+        let total_argmax_bytes = k_steps * c * 4;
+        let mut argmax_buf = vec![0u8; total_argmax_bytes];
+        self.gpu.copy_d2h(argmax_base, &mut argmax_buf)?;
+        for k in 0..k_steps {
+            for i in 0..c {
+                let off = (k * c + i) * 4;
+                let v = u32::from_le_bytes([
+                    argmax_buf[off],
+                    argmax_buf[off + 1],
+                    argmax_buf[off + 2],
+                    argmax_buf[off + 3],
+                ]);
+                results[i][k] = v;
             }
         }
 
