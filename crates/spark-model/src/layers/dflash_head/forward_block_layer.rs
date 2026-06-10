@@ -45,6 +45,35 @@ fn dflash_swa_enabled() -> bool {
     })
 }
 
+/// Noise-rows-only layer math (upstream dflash.py alignment). The reference
+/// drafter runs its decoder layers on the γ+1 noise rows ONLY — ctx enters
+/// attention purely as K/V projected from the stationary `fc_proj` output
+/// (`k_ctx = k_proj(target_hidden)` per layer, dflash.py:71-76). Atlas
+/// historically ran input_norm / q_proj / o_proj / residuals / FFN over the
+/// full `n_attn = eff_ctx + γ+1` rows, with ctx-row results either zeroed
+/// (q, attn_out) or computed-and-never-read (FFN, residual stream). At
+/// ctx_window=512 that is ~30× wasted FFN rows per layer and the dominant
+/// propose cost (gate_up 33ms + down 18ms per propose at eff_ctx≈100).
+///
+/// With this gate ON, the per-row ops shrink to the noise slice
+/// [eff_ctx .. n_attn). Ops that genuinely cover ctx rows are unchanged:
+/// k_norm + RoPE (ctx K is cached pre-rope; positions shift per step) and
+/// the attention kernel itself (ctx rows participate as keys/values).
+///
+/// Default: OFF until validated. Set `ATLAS_DFLASH_NOISE_ONLY=1` to enable.
+fn dflash_noise_only_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = std::env::var("ATLAS_DFLASH_NOISE_ONLY").ok().as_deref() == Some("1");
+        if on {
+            tracing::info!(
+                "DFlash noise-rows-only layer math ENABLED (ATLAS_DFLASH_NOISE_ONLY=1)"
+            );
+        }
+        on
+    })
+}
+
 /// Inputs passed to the per-layer kernel chain. Holds local computations
 /// from the surrounding `forward_block` body so the helper can be called
 /// without re-deriving them in every layer iteration.
@@ -750,6 +779,22 @@ impl BlockDiffusionDraftHead {
         let mut cache_v_end = dstate.cache_v_end[layer_idx];
         let gpu = ctx.gpu;
 
+        // Noise-rows-only row range (see dflash_noise_only_enabled). Per-row
+        // ops run on rows [row0, row0 + m_rows); ctx-row regions of the
+        // touched scratch buffers become stale, which is safe because ctx
+        // K/V comes from the persistent cache + fc_proj (never from the
+        // evolving stream/norm buffers) and the final norm/lm_head in
+        // forward_block reads the noise slice only.
+        let noise_only = dflash_noise_only_enabled();
+        let (m_rows, row0) = if noise_only {
+            (n_attn - eff_ctx as u32, eff_ctx)
+        } else {
+            (n_attn, 0usize)
+        };
+        let row0_h = row0 * h as usize * bf16;
+        let row0_q = row0 * q_dim as usize * bf16;
+        let row0_inter = row0 * inter as usize * bf16;
+
         let dump_bf16 = |label: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
             if !debug_dump {
                 return Ok(());
@@ -787,14 +832,16 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
-        // 3a. input_layernorm. Identical to BF16 path.
+        // 3a. input_layernorm. Identical to BF16 path. Noise-only: ctx rows
+        // of norm_buf go stale — consumed only by the full-M q/FFN GEMMs
+        // that shrink with this gate (noise K/V reads the noise slice).
         kp!(input_norm_us, ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.stream_buf,
+            self.scratch.stream_buf.offset(row0_h),
             &layer.input_layernorm,
-            self.scratch.norm_buf,
-            n_attn,
+            self.scratch.norm_buf.offset(row0_h),
+            m_rows,
             h,
             self.rms_norm_eps,
             stream,
@@ -818,10 +865,10 @@ impl BlockDiffusionDraftHead {
             kp!(q_proj_us, ops::w4a16_gemm_n128_m16(
                 gpu,
                 self.kernels.w4a16_gemm_t_m16,
-                self.scratch.norm_buf,
+                self.scratch.norm_buf.offset(row0_h),
                 q_t,
-                self.scratch.q_buf,
-                n_attn,
+                self.scratch.q_buf.offset(row0_q),
+                m_rows,
                 q_dim,
                 h,
                 stream,
@@ -830,15 +877,19 @@ impl BlockDiffusionDraftHead {
             kp!(q_proj_us, ops::w4a16_gemm(
                 gpu,
                 self.kernels.w4a16_gemm,
-                self.scratch.norm_buf,
+                self.scratch.norm_buf.offset(row0_h),
                 &layer.q_proj,
-                self.scratch.q_buf,
-                n_attn,
+                self.scratch.q_buf.offset(row0_q),
+                m_rows,
                 q_dim,
                 h,
                 stream,
             ))?;
         }
+        // ctx rows of q_buf must be ZERO either way: the attention kernel
+        // still computes all n_attn query rows, and zero Q keeps ctx rows'
+        // (discarded) outputs finite. In noise-only mode the GEMM never
+        // touches the ctx region, so the memset fully owns it.
         if eff_ctx > 0 {
             gpu.memset(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16)?;
         }
@@ -1128,10 +1179,10 @@ impl BlockDiffusionDraftHead {
             kp!(o_proj_us, ops::w4a16_gemm_n128_m16(
                 gpu,
                 self.kernels.w4a16_gemm_t_m16,
-                self.scratch.attn_out,
+                self.scratch.attn_out.offset(row0_q),
                 o_t,
-                self.scratch.stream_acc,
-                n_attn,
+                self.scratch.stream_acc.offset(row0_h),
+                m_rows,
                 h,
                 q_dim,
                 stream,
@@ -1140,10 +1191,10 @@ impl BlockDiffusionDraftHead {
             kp!(o_proj_us, ops::w4a16_gemm(
                 gpu,
                 self.kernels.w4a16_gemm,
-                self.scratch.attn_out,
+                self.scratch.attn_out.offset(row0_q),
                 &layer.o_proj,
-                self.scratch.stream_acc,
-                n_attn,
+                self.scratch.stream_acc.offset(row0_h),
+                m_rows,
                 h,
                 q_dim,
                 stream,
@@ -1154,9 +1205,9 @@ impl BlockDiffusionDraftHead {
         kp!(resid1_us, ops::residual_add(
             gpu,
             self.kernels.residual_add,
-            self.scratch.stream_buf,
-            self.scratch.stream_acc,
-            n_attn * h,
+            self.scratch.stream_buf.offset(row0_h),
+            self.scratch.stream_acc.offset(row0_h),
+            m_rows * h,
             stream,
         ))?;
 
@@ -1164,10 +1215,10 @@ impl BlockDiffusionDraftHead {
         kp!(post_norm_us, ops::rms_norm(
             gpu,
             self.kernels.rms_norm,
-            self.scratch.stream_buf,
+            self.scratch.stream_buf.offset(row0_h),
             &layer.post_attention_layernorm,
-            self.scratch.norm_buf,
-            n_attn,
+            self.scratch.norm_buf.offset(row0_h),
+            m_rows,
             h,
             self.rms_norm_eps,
             stream,
@@ -1194,10 +1245,10 @@ impl BlockDiffusionDraftHead {
             kp!(gate_up_us, ops::w4a16_gemm_n128_m16(
                 gpu,
                 self.kernels.w4a16_gemm_t_m16,
-                self.scratch.norm_buf,
+                self.scratch.norm_buf.offset(row0_h),
                 gate_t,
-                self.scratch.mlp_intermediate,
-                n_attn,
+                self.scratch.mlp_intermediate.offset(row0_inter),
+                m_rows,
                 inter,
                 h,
                 stream,
@@ -1205,10 +1256,10 @@ impl BlockDiffusionDraftHead {
             kp!(gate_up_us, ops::w4a16_gemm_n128_m16(
                 gpu,
                 self.kernels.w4a16_gemm_t_m16,
-                self.scratch.norm_buf,
+                self.scratch.norm_buf.offset(row0_h),
                 up_t,
-                self.scratch.mlp_up,
-                n_attn,
+                self.scratch.mlp_up.offset(row0_inter),
+                m_rows,
                 inter,
                 h,
                 stream,
@@ -1217,10 +1268,10 @@ impl BlockDiffusionDraftHead {
             kp!(gate_up_us, ops::w4a16_gemm(
                 gpu,
                 self.kernels.w4a16_gemm,
-                self.scratch.norm_buf,
+                self.scratch.norm_buf.offset(row0_h),
                 &layer.gate_proj,
-                self.scratch.mlp_intermediate,
-                n_attn,
+                self.scratch.mlp_intermediate.offset(row0_inter),
+                m_rows,
                 inter,
                 h,
                 stream,
@@ -1228,10 +1279,10 @@ impl BlockDiffusionDraftHead {
             kp!(gate_up_us, ops::w4a16_gemm(
                 gpu,
                 self.kernels.w4a16_gemm,
-                self.scratch.norm_buf,
+                self.scratch.norm_buf.offset(row0_h),
                 &layer.up_proj,
-                self.scratch.mlp_up,
-                n_attn,
+                self.scratch.mlp_up.offset(row0_inter),
+                m_rows,
                 inter,
                 h,
                 stream,
@@ -1242,10 +1293,10 @@ impl BlockDiffusionDraftHead {
         kp!(silu_mul_us, ops::silu_mul(
             gpu,
             self.kernels.silu_mul,
-            self.scratch.mlp_intermediate,
-            self.scratch.mlp_up,
-            self.scratch.mlp_intermediate,
-            n_attn * inter,
+            self.scratch.mlp_intermediate.offset(row0_inter),
+            self.scratch.mlp_up.offset(row0_inter),
+            self.scratch.mlp_intermediate.offset(row0_inter),
+            m_rows * inter,
             stream,
         ))?;
 
@@ -1257,10 +1308,10 @@ impl BlockDiffusionDraftHead {
             kp!(down_proj_us, ops::w4a16_gemm_n128_m16(
                 gpu,
                 self.kernels.w4a16_gemm_t_m16,
-                self.scratch.mlp_intermediate,
+                self.scratch.mlp_intermediate.offset(row0_inter),
                 down_t,
-                self.scratch.stream_acc,
-                n_attn,
+                self.scratch.stream_acc.offset(row0_h),
+                m_rows,
                 h,
                 inter,
                 stream,
@@ -1269,10 +1320,10 @@ impl BlockDiffusionDraftHead {
             kp!(down_proj_us, ops::w4a16_gemm(
                 gpu,
                 self.kernels.w4a16_gemm,
-                self.scratch.mlp_intermediate,
+                self.scratch.mlp_intermediate.offset(row0_inter),
                 &layer.down_proj,
-                self.scratch.stream_acc,
-                n_attn,
+                self.scratch.stream_acc.offset(row0_h),
+                m_rows,
                 h,
                 inter,
                 stream,
@@ -1283,9 +1334,9 @@ impl BlockDiffusionDraftHead {
         kp!(resid2_us, ops::residual_add(
             gpu,
             self.kernels.residual_add,
-            self.scratch.stream_buf,
-            self.scratch.stream_acc,
-            n_attn * h,
+            self.scratch.stream_buf.offset(row0_h),
+            self.scratch.stream_acc.offset(row0_h),
+            m_rows * h,
             stream,
         ))?;
 
