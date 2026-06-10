@@ -74,27 +74,26 @@ export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
 # 760ms/step (of 900ms total) in ssm_ffn_per_token_loop_n17 +
 # attn_ffn_per_token_loop_n17 — 64 layers × 17 M=1 GEMVs re-reading FFN
 # weights 17× per step. ATLAS_FFN_KGAMMA_M16=1 routes verify through
-# forward_kgamma; WITHOUT the transposed flag it uses plain w4a16_gemm
-# (M_TILE=64, single tile at M=17) which is CORRECT: counting verified
-# token-exact, acceptance 15.9/16 mean, verify 900→536ms, counting
-# 23.8 tok/s. ATLAS_DISABLE_TREE_WY=1 is the γ=16 correctness fix
-# from c588b34.
+# forward_kgamma; ATLAS_FFN_M16_TRANSPOSED=1 upgrades the FFN GEMMs to
+# w4a16_gemm_t_m16, which was flag-isolated CLEAN at M=17 (token-exact
+# greedy counting, 15.6/16 mean acceptance). Measured on counting:
+# verify 900→244ms, 42.6 tok/s at accepted 15.62/16.
+# ATLAS_DISABLE_TREE_WY=1 is the γ=16 correctness fix from c588b34.
 export ATLAS_FFN_KGAMMA_M16=${ATLAS_FFN_KGAMMA_M16:-1}
+export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-1}
 export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 
-# ── DO NOT ENABLE: M_TILE=16 kernels corrupt at M=17 ──────────────────
-# ATLAS_FFN_M16_TRANSPOSED=1 and ATLAS_TC_NVFP4_M16=1(+MS_ATTN) route
-# FFN / qkv through w4a16_gemm_t_m16, which dense_ffn.rs documents as
-# validated only for M ∈ {4..16}. At K=γ+1=17 (second, 1-row tile) it
-# produces subtly wrong logits: verify deep-slot argmax repeats earlier
-# digits ("39, 40, 40, 4443..."), greedy determinism breaks across
-# requests, and acceptance collapses from 15.9/16 to ~1.5/16 (which
-# masquerades as a drafter-quality problem). Verified by controlled
-# greedy A/B 2026-06-10: flags off → token-exact counting, 9/11 steps
-# 16/16 accepted; flags on → corruption within 10 tokens. The 246ms
-# verify they bought is fast-but-wrong; re-enable only after the kernel
-# gets an M=17-correct partial-tile path (or pad M to 32).
-export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-0}
+# ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
+# ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
+# M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy
+# controlled A/B 2026-06-10: with it, verify deep-slot argmax repeats
+# earlier digits ("39, 40, 40, 4443..."), greedy determinism breaks
+# across requests, and acceptance collapses 15.6/16 → ~1.5/16 (which
+# masquerades as a drafter-quality problem). All other combinations
+# (flags off / KGAMMA only / KGAMMA+TRANSPOSED) are token-exact. It
+# bought only ~20ms of verify — not worth debugging until propose-side
+# work is done. Suspect: qkv N-dims (q=8192? kv=1024) vs the kernel's
+# (gns + 15 < N) predicates, or q/k/v transposed-weight build.
 export ATLAS_TC_NVFP4_M16=${ATLAS_TC_NVFP4_M16:-0}
 export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 
