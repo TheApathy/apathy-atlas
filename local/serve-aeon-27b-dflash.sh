@@ -70,6 +70,36 @@ export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-32}
 export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-512}
 export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
 
+# 2026-06-10: batched K=γ FFN. KPROF showed the K=17 verify spending
+# 760ms/step (of 900ms total) in ssm_ffn_per_token_loop_n17 +
+# attn_ffn_per_token_loop_n17 — 64 layers × 17 M=1 GEMVs re-reading FFN
+# weights 17× per step. ATLAS_FFN_KGAMMA_M16=1 routes verify through
+# forward_kgamma (one M=17 GEMM per projection, weights read once);
+# ATLAS_FFN_M16_TRANSPOSED=1 upgrades it to the w4a16_gemm_t_m16 kernel.
+# Measured: verify 900ms → 246ms, cat-story prose 2.6 → 8.0 tok/s.
+# ATLAS_DISABLE_TREE_WY=1 is the γ=16 correctness fix from c588b34.
+export ATLAS_FFN_KGAMMA_M16=${ATLAS_FFN_KGAMMA_M16:-1}
+export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-1}
+export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
+
+# 2026-06-10 (round 2): M16 batched attention projections at K=17.
+# attn_qkv_proj was 53ms/step (per-token GEMVs); ms_phase_qkv has an
+# n∈(3,32] M_TILE=16 path gated by BOTH flags below + transposed weights.
+# Also speeds the drafter (shares the tc_nvfp4_m16 gate): propose
+# 175→~110ms at short ctx. Measured: verify 246→223ms, prose 8.0→9.2
+# tok/s, counting + prose output coherent.
+# NOTE: do NOT copy ATLAS_TC_NVFP4_M16 to the MTP production script —
+# it benched -42% at N=8 concurrent there. This server is single-seq
+# K=17 only, where the M=3 tile-waste regression case never occurs.
+export ATLAS_TC_NVFP4_M16=${ATLAS_TC_NVFP4_M16:-1}
+export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-1}
+
+# Drafter checkpoint. Default = generic z-lab drafter (trained for base
+# Qwen3.6-27B). The AEON-tuned variants (-aeon-tuned/-aeon-v2/
+# -aeon-v3-balanced) match the abliterated target's distribution and
+# should accept more drafts per step on prose.
+DRAFT_MODEL=${DRAFT_MODEL:-/path/to/models/z-lab-Qwen3.6-27B-DFlash}
+
 exec /path/to/atlas-src/target/release/spark serve \
   --model-from-path /path/to/models/AEON-Q36-27B-Full \
   --model-name aeon-27b-dflash \
@@ -81,7 +111,7 @@ exec /path/to/atlas-src/target/release/spark serve \
   --max-batch-size 1 \
   --max-num-seqs 1 \
   --dflash \
-  --draft-model /path/to/models/z-lab-Qwen3.6-27B-DFlash \
+  --draft-model "${DRAFT_MODEL}" \
   --dflash-gamma 16 \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \

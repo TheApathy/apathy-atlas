@@ -27,11 +27,18 @@ use super::*;
 ///   * Sliding-window state rollback for sliding-attention layers
 ///     (Gemma-4-style; not used by Qwen3.6 targets).
 pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_drafts: usize) {
+    // ATLAS_DFLASH_STEP_TIMING=1: per-phase wall-clock breakdown of the
+    // verify step, logged once per step. Companion to ATLAS_DFLASH_PROPOSE_LOG
+    // (which only covers the re-propose at the tail of this function).
+    let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
+    let t_step = Instant::now();
+
     if let Err(e) = model.sync_secondary() {
         tracing::error!("sync_secondary: {e:#}");
         a.finished = true;
         return;
     }
+    let t_sync_secondary_us = t_step.elapsed().as_micros();
 
     // tokens = [last_verified, draft_0, draft_1, ..., draft_{γ-1}]
     //
@@ -115,6 +122,7 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         tracing::warn!("set_ddtree_parent_ids failed (falling back to flat): {e:#}");
     }
 
+    let t_verify = Instant::now();
     let verified = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
         Err(e) => {
@@ -124,6 +132,7 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
             return;
         }
     };
+    let t_verify_us = t_verify.elapsed().as_micros();
     // Note: clear_ddtree_parent_ids is deferred until AFTER
     // commit_verify_state_async so the commit knows tree mode was active
     // and routes through the partial-accept (intermediate→h_state) path.
@@ -343,6 +352,7 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         Some(slot) => slot,
         None => total_accepted.saturating_sub(1),
     };
+    let t_commit = Instant::now();
     let commit_res = if tree_last_inter_slot.is_some() {
         model.commit_verify_state_async_with_slot(
             &mut a.seq,
@@ -353,6 +363,7 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     } else {
         model.commit_verify_state_async(&mut a.seq, total_accepted, k_verify)
     };
+    let t_commit_us = t_commit.elapsed().as_micros();
     if let Err(e) = commit_res {
         tracing::error!("commit_verify_state_async (dflash): {e:#}");
         model.clear_ddtree_parent_ids();
@@ -365,14 +376,18 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // Save the bonus token's hidden state for the NEXT propose() call.
     // DFlash needs the target's hidden states for the full prefix including
     // the bonus token; the verify forward pass only processed the drafts.
+    let t_save = Instant::now();
     let bonus = verified.get(bonus_idx).copied().unwrap_or(a.last_token);
     if let Err(e) = model.save_hidden_for_dflash(bonus, &mut a.seq, 0) {
         tracing::error!("save_hidden_for_dflash (dflash): {e:#}");
     }
+    let t_save_us = t_save.elapsed().as_micros();
 
+    let t_trim = Instant::now();
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state: {e:#}");
     }
+    let t_trim_us = t_trim.elapsed().as_micros();
 
     // Re-propose for next step.
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
@@ -398,6 +413,18 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         Ok(d) if !d.is_empty() => a.pending_drafts = d,
         Ok(_) => {}
         Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+    }
+
+    if step_timing {
+        let total_us = t_step.elapsed().as_micros();
+        let other_us = total_us.saturating_sub(
+            t_sync_secondary_us + t_verify_us + t_commit_us + t_save_us + t_trim_us + propose_us,
+        );
+        tracing::info!(
+            "DFLASH step timing: total={total_us}μs sync_secondary={t_sync_secondary_us}μs \
+             verify={t_verify_us}μs commit={t_commit_us}μs save_hidden={t_save_us}μs \
+             trim={t_trim_us}μs propose={propose_us}μs other={other_us}μs accepted={num_accepted}",
+        );
     }
 
     // DDTree M6: drain any tree payload the drafter built during the propose
