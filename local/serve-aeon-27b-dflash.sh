@@ -83,6 +83,14 @@ export ATLAS_FFN_KGAMMA_M16=${ATLAS_FFN_KGAMMA_M16:-1}
 export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-1}
 export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 
+# 2026-06-10: noise-rows-only drafter layers (upstream dflash.py
+# alignment — ctx enters attention as cached K/V only; input_norm / q /
+# o / FFN / residuals run on the γ+1 noise rows instead of all
+# ctx+noise rows). propose 145→88ms. Validated token-exact +
+# deterministic + acceptance 15.90/16. Counting: 51.0 tok/s
+# (step 331ms = verify 243 + propose 88).
+export ATLAS_DFLASH_NOISE_ONLY=${ATLAS_DFLASH_NOISE_ONLY:-1}
+
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
 # M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy
