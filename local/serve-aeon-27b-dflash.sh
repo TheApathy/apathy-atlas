@@ -91,6 +91,13 @@ export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 # (step 331ms = verify 243 + propose 88).
 export ATLAS_DFLASH_NOISE_ONLY=${ATLAS_DFLASH_NOISE_ONLY:-1}
 
+# 2026-06-10: batched K=17 attention QKV via plain w4a16_gemm (M=17, one
+# weight read instead of 17 per layer). Validated token-exact +
+# deterministic + acceptance 15.90/16. verify 243→231ms → 52.8 tok/s
+# counting. Also proves the gated-layer corruption lives in the
+# w4a16_gemm_t_m16/NVFP4-T path, NOT in deinterleave_qg.
+export ATLAS_ATTN_QKV_BATCHED=${ATLAS_ATTN_QKV_BATCHED:-1}
+
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
 # M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy

@@ -15,6 +15,24 @@ use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
+/// Cached `ATLAS_ATTN_QKV_BATCHED` env-var lookup. When `1` the n∈(3,32]
+/// multi_seq QKV projection runs THREE plain `w4a16_gemm` calls at M=n
+/// (non-transposed NVFP4 weights, M_TILE=64 single tile — the same kernel
+/// family validated token-exact for the K=γ FFN at M=17) instead of the
+/// per-token GEMV loop that re-reads q/k/v weights n times per layer
+/// (~53ms/step of the K=17 DFlash verify at n=17 across 16 attn layers).
+/// Output goes to scratch then scatters into the interleaved qkv_buf with
+/// the same per-token `deinterleave_qg` fixup as the batched-M16 path.
+/// Default off for A/B safety.
+fn attn_qkv_batched_plain_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ATLAS_ATTN_QKV_BATCHED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Cached `ATLAS_ATTN_QKV_FUSED` env-var lookup. When `1`/`true` the
 /// batch3 QKV projection writes directly into the interleaved
 /// `qkv_buf` layout and uses a single batched RMS norm launch instead
@@ -92,6 +110,14 @@ impl Qwen3AttentionLayer {
             && self.v_nvfp4_t.is_some()
         {
             self.ms_qkv_batched_m16(c)?;
+        } else if n > 3
+            && n <= 32
+            && attn_qkv_batched_plain_enabled()
+            && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+            && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+            && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+        {
+            self.ms_qkv_batched_plain(c)?;
         } else {
             for i in 0..n {
                 let normed_i = normed.offset(i * h * bf16);
@@ -480,6 +506,139 @@ impl Qwen3AttentionLayer {
     /// scatter into the strided `qkv_buf` layout. Per-token rms_norm calls
     /// follow (same as the n=3/n=2 batched paths — rms_norm is cheap, the
     /// QKV GEMVs are the bottleneck at n=17).
+    /// n∈(3,32] batched QKV via plain `w4a16_gemm` (M_TILE=64, single tile
+    /// at these M) with the regular non-transposed NVFP4 weights. Same
+    /// scratch/scatter/deinterleave/norm structure as `ms_qkv_batched_m16`,
+    /// but avoids both the per-token weight re-reads of the sequential loop
+    /// and the `w4a16_gemm_t_m16` + NVFP4-T path that corrupts on gated
+    /// Qwen3.6-27B layers (see the ATLAS_TC_NVFP4_M16_MS_ATTN warning above).
+    fn ms_qkv_batched_plain(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            eps,
+            bf16,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+
+        let q_nvfp4 = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let k_nvfp4 = self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let v_nvfp4 = self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+
+        let n_u32 = n as u32;
+        let kv_dim = nkv * hd;
+        let kv_bytes = kv_dim as usize * bf16;
+
+        // Q scratch: [n, q_proj_dim] BF16 contiguous in ssm_qkvz.
+        let q_scratch = fwd.buffers.ssm_qkvz();
+        ops::w4a16_gemm(
+            fwd.gpu,
+            self.w4a16_gemm_k,
+            normed,
+            q_nvfp4,
+            q_scratch,
+            n_u32,
+            q_proj_dim,
+            h as u32,
+            stream,
+        )?;
+
+        // K scratch: [n, kv_dim] BF16 contiguous in attn_output.
+        // V scratch: [n, kv_dim] BF16 contiguous at attn_output + n*kv_bytes.
+        let k_scratch = fwd.buffers.attn_output();
+        let v_scratch = k_scratch.offset(n * kv_bytes);
+        ops::w4a16_gemm(
+            fwd.gpu,
+            self.w4a16_gemm_k,
+            normed,
+            k_nvfp4,
+            k_scratch,
+            n_u32,
+            kv_dim,
+            h as u32,
+            stream,
+        )?;
+        ops::w4a16_gemm(
+            fwd.gpu,
+            self.w4a16_gemm_k,
+            normed,
+            v_nvfp4,
+            v_scratch,
+            n_u32,
+            kv_dim,
+            h as u32,
+            stream,
+        )?;
+
+        // Scatter + gated deinterleave + per-token q/k norms: identical
+        // semantics to ms_qkv_batched_m16 (and to one iteration of the
+        // sequential loop after its fused w4a16_gemv_qg).
+        for i in 0..n {
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let v_out_i = k_out_i.offset(kv_bytes);
+            fwd.gpu.copy_d2d_async(
+                q_scratch.offset(i * q_proj_bytes),
+                q_out_i,
+                q_proj_bytes,
+                stream,
+            )?;
+            fwd.gpu
+                .copy_d2d_async(k_scratch.offset(i * kv_bytes), k_out_i, kv_bytes, stream)?;
+            fwd.gpu
+                .copy_d2d_async(v_scratch.offset(i * kv_bytes), v_out_i, kv_bytes, stream)?;
+            if self.gated {
+                ops::deinterleave_qg(
+                    fwd.gpu,
+                    self.deinterleave_qg_k,
+                    q_out_i,
+                    1,
+                    nq,
+                    hd,
+                    q_proj_dim,
+                    stream,
+                )?;
+            }
+            if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    fwd.gpu,
+                    self.rms_norm_k,
+                    q_out_i,
+                    &self.attn.q_norm,
+                    q_out_i,
+                    nq,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    fwd.gpu,
+                    self.rms_norm_k,
+                    k_out_i,
+                    &self.attn.k_norm,
+                    k_out_i,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn ms_qkv_batched_m16(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
         let MultiSeqCtx {
             fwd,
