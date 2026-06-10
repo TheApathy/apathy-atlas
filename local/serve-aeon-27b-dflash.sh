@@ -74,25 +74,29 @@ export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
 # 760ms/step (of 900ms total) in ssm_ffn_per_token_loop_n17 +
 # attn_ffn_per_token_loop_n17 — 64 layers × 17 M=1 GEMVs re-reading FFN
 # weights 17× per step. ATLAS_FFN_KGAMMA_M16=1 routes verify through
-# forward_kgamma (one M=17 GEMM per projection, weights read once);
-# ATLAS_FFN_M16_TRANSPOSED=1 upgrades it to the w4a16_gemm_t_m16 kernel.
-# Measured: verify 900ms → 246ms, cat-story prose 2.6 → 8.0 tok/s.
-# ATLAS_DISABLE_TREE_WY=1 is the γ=16 correctness fix from c588b34.
+# forward_kgamma; WITHOUT the transposed flag it uses plain w4a16_gemm
+# (M_TILE=64, single tile at M=17) which is CORRECT: counting verified
+# token-exact, acceptance 15.9/16 mean, verify 900→536ms, counting
+# 23.8 tok/s. ATLAS_DISABLE_TREE_WY=1 is the γ=16 correctness fix
+# from c588b34.
 export ATLAS_FFN_KGAMMA_M16=${ATLAS_FFN_KGAMMA_M16:-1}
-export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-1}
 export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 
-# 2026-06-10 (round 2): M16 batched attention projections at K=17.
-# attn_qkv_proj was 53ms/step (per-token GEMVs); ms_phase_qkv has an
-# n∈(3,32] M_TILE=16 path gated by BOTH flags below + transposed weights.
-# Also speeds the drafter (shares the tc_nvfp4_m16 gate): propose
-# 175→~110ms at short ctx. Measured: verify 246→223ms, prose 8.0→9.2
-# tok/s, counting + prose output coherent.
-# NOTE: do NOT copy ATLAS_TC_NVFP4_M16 to the MTP production script —
-# it benched -42% at N=8 concurrent there. This server is single-seq
-# K=17 only, where the M=3 tile-waste regression case never occurs.
-export ATLAS_TC_NVFP4_M16=${ATLAS_TC_NVFP4_M16:-1}
-export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-1}
+# ── DO NOT ENABLE: M_TILE=16 kernels corrupt at M=17 ──────────────────
+# ATLAS_FFN_M16_TRANSPOSED=1 and ATLAS_TC_NVFP4_M16=1(+MS_ATTN) route
+# FFN / qkv through w4a16_gemm_t_m16, which dense_ffn.rs documents as
+# validated only for M ∈ {4..16}. At K=γ+1=17 (second, 1-row tile) it
+# produces subtly wrong logits: verify deep-slot argmax repeats earlier
+# digits ("39, 40, 40, 4443..."), greedy determinism breaks across
+# requests, and acceptance collapses from 15.9/16 to ~1.5/16 (which
+# masquerades as a drafter-quality problem). Verified by controlled
+# greedy A/B 2026-06-10: flags off → token-exact counting, 9/11 steps
+# 16/16 accepted; flags on → corruption within 10 tokens. The 246ms
+# verify they bought is fast-but-wrong; re-enable only after the kernel
+# gets an M=17-correct partial-tile path (or pad M to 32).
+export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-0}
+export ATLAS_TC_NVFP4_M16=${ATLAS_TC_NVFP4_M16:-0}
+export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 
 # Drafter checkpoint. Default = generic z-lab drafter (trained for base
 # Qwen3.6-27B). The AEON-tuned variants (-aeon-tuned/-aeon-v2/
@@ -106,7 +110,7 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --port 8890 \
   --kernel-target qwen3.6-27b \
   --gpu-memory-utilization 0.65 \
-  --kv-cache-dtype fp8 \
+  --kv-cache-dtype "${KV_DTYPE:-fp8}" \
   --max-seq-len 8192 \
   --max-batch-size 1 \
   --max-num-seqs 1 \
