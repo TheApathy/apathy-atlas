@@ -539,46 +539,96 @@ impl Qwen3AttentionLayer {
         let kv_dim = nkv * hd;
         let kv_bytes = kv_dim as usize * bf16;
 
+        // Prefer the transposed M_TILE=128 kernel when the prefill weights
+        // are installed: nsys ground truth (2026-06-11) shows the plain
+        // non-transposed `w4a16_gemm` runs ~5× off the bandwidth floor at
+        // M=17 (median 695μs for the Q projection vs ~140μs floor) due to
+        // strided B access; the transposed m128 kernel covers M≤128 in one
+        // tile with coalesced loads. Same scratch/scatter layout either way.
+        let m128_t = self.w4a16_gemm_t_m128_k.0 != 0
+            && self.q_nvfp4_t.is_some()
+            && self.k_nvfp4_t.is_some()
+            && self.v_nvfp4_t.is_some();
+
         // Q scratch: [n, q_proj_dim] BF16 contiguous in ssm_qkvz.
         let q_scratch = fwd.buffers.ssm_qkvz();
-        ops::w4a16_gemm(
-            fwd.gpu,
-            self.w4a16_gemm_k,
-            normed,
-            q_nvfp4,
-            q_scratch,
-            n_u32,
-            q_proj_dim,
-            h as u32,
-            stream,
-        )?;
-
         // K scratch: [n, kv_dim] BF16 contiguous in attn_output.
         // V scratch: [n, kv_dim] BF16 contiguous at attn_output + n*kv_bytes.
         let k_scratch = fwd.buffers.attn_output();
         let v_scratch = k_scratch.offset(n * kv_bytes);
-        ops::w4a16_gemm(
-            fwd.gpu,
-            self.w4a16_gemm_k,
-            normed,
-            k_nvfp4,
-            k_scratch,
-            n_u32,
-            kv_dim,
-            h as u32,
-            stream,
-        )?;
-        ops::w4a16_gemm(
-            fwd.gpu,
-            self.w4a16_gemm_k,
-            normed,
-            v_nvfp4,
-            v_scratch,
-            n_u32,
-            kv_dim,
-            h as u32,
-            stream,
-        )?;
+
+        if m128_t {
+            let q_t = self.q_nvfp4_t.as_ref().unwrap();
+            let k_t = self.k_nvfp4_t.as_ref().unwrap();
+            let v_t = self.v_nvfp4_t.as_ref().unwrap();
+            ops::w4a16_gemm_n128_m128(
+                fwd.gpu,
+                self.w4a16_gemm_t_m128_k,
+                normed,
+                q_t,
+                q_scratch,
+                n_u32,
+                q_proj_dim,
+                h as u32,
+                stream,
+            )?;
+            ops::w4a16_gemm_n128_m128(
+                fwd.gpu,
+                self.w4a16_gemm_t_m128_k,
+                normed,
+                k_t,
+                k_scratch,
+                n_u32,
+                kv_dim,
+                h as u32,
+                stream,
+            )?;
+            ops::w4a16_gemm_n128_m128(
+                fwd.gpu,
+                self.w4a16_gemm_t_m128_k,
+                normed,
+                v_t,
+                v_scratch,
+                n_u32,
+                kv_dim,
+                h as u32,
+                stream,
+            )?;
+        } else {
+            ops::w4a16_gemm(
+                fwd.gpu,
+                self.w4a16_gemm_k,
+                normed,
+                q_nvfp4,
+                q_scratch,
+                n_u32,
+                q_proj_dim,
+                h as u32,
+                stream,
+            )?;
+            ops::w4a16_gemm(
+                fwd.gpu,
+                self.w4a16_gemm_k,
+                normed,
+                k_nvfp4,
+                k_scratch,
+                n_u32,
+                kv_dim,
+                h as u32,
+                stream,
+            )?;
+            ops::w4a16_gemm(
+                fwd.gpu,
+                self.w4a16_gemm_k,
+                normed,
+                v_nvfp4,
+                v_scratch,
+                n_u32,
+                kv_dim,
+                h as u32,
+                stream,
+            )?;
+        }
 
         // Scatter + gated deinterleave + per-token q/k norms: identical
         // semantics to ms_qkv_batched_m16 (and to one iteration of the
