@@ -144,6 +144,7 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --dflash \
   --draft-model "${DRAFT_MODEL}" \
   --dflash-gamma 16 \
+  --mtp-vocab 32000 \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
   --warmup-prompt /home/flocka/atlas-src/local/warmup.txt

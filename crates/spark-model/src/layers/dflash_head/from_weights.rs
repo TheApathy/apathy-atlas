@@ -152,6 +152,7 @@ impl BlockDiffusionDraftHead {
             // link; the dispatch in forward_block_layer_nvfp4 checks for
             // `KernelHandle(0)` and falls back to the M_TILE=64 path.
             w4a16_gemm_t_m16: crate::layers::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
+            w4a16_gemm_t_m32_n64: crate::layers::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
