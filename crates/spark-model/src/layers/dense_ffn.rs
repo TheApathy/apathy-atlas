@@ -125,6 +125,10 @@ pub struct DenseFfnLayer {
     /// (272, 56)=15232 CTAs — 4x fewer CTAs but 4x more work per CTA,
     /// and ~2x less weight DRAM traffic.
     w4a16_gemm_t_m128: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64` — DFlash K=17 verify specialization:
+    /// single B read (one 32-row M-tile) × 272 CTAs (N_TILE=64).
+    /// Loaded via `try_kernel`; 0 falls back to m128/m16.
+    w4a16_gemm_t_m32_n64: KernelHandle,
     /// `w4a16_gemm_t_m128_v2` — 8-warp (blockDim 256) shadow of
     /// `w4a16_gemm_t_m128`. Same 2-stage cp.async pipeline + same SMEM
     /// footprint (~29.8KB → 3 CTAs/SM), but parallelizes chunk 0 and
@@ -231,6 +235,7 @@ impl DenseFfnLayer {
             // GEMM for prefill. Handle 0 disables the
             // `ATLAS_PREFILL_FFN_FAST` fast path silently.
             w4a16_gemm_t_m128: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
+            w4a16_gemm_t_m32_n64: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
             // Optional 8-warp shadow of the M=128 kernel. Handle 0
             // disables `ATLAS_FFN_M128_V2` silently.
             w4a16_gemm_t_m128_v2: super::try_kernel(gpu, "w4a16_v2", "w4a16_gemm_t_m128_v2"),
@@ -876,10 +881,29 @@ impl DenseFfnLayer {
         let m128_path = m16_path
             && crate::layers::ffn_kgamma_m128_enabled()
             && self.w4a16_gemm_t_m128.0 != 0;
+        // m32_n64: single B read AND full SM occupancy — strictly better
+        // than m128 at n ≤ 32 when the kernel symbol is present.
+        // ATLAS_FFN_KGAMMA_M32=0 opts out for bisection.
+        let m32_path = m128_path
+            && self.w4a16_gemm_t_m32_n64.0 != 0
+            && std::env::var("ATLAS_FFN_KGAMMA_M32").ok().as_deref() != Some("0");
 
         // gate_proj GEMM: [n, H] → [n, inter]
         crate::kprof!(ctx.gpu, stream, "ffn_gate_kgamma", {
-            if m128_path {
+            if m32_path {
+                let gt = self.gate_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64,
+                    input,
+                    gt,
+                    gate_out,
+                    n,
+                    inter,
+                    h,
+                    stream,
+                )?;
+            } else if m128_path {
                 let gt = self.gate_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n128_m128(
                     ctx.gpu,
@@ -923,7 +947,20 @@ impl DenseFfnLayer {
 
         // up_proj GEMM: [n, H] → [n, inter]
         crate::kprof!(ctx.gpu, stream, "ffn_up_kgamma", {
-            if m128_path {
+            if m32_path {
+                let ut = self.up_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64,
+                    input,
+                    ut,
+                    up_out,
+                    n,
+                    inter,
+                    h,
+                    stream,
+                )?;
+            } else if m128_path {
                 let ut = self.up_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n128_m128(
                     ctx.gpu,
@@ -982,7 +1019,20 @@ impl DenseFfnLayer {
         // down_proj GEMM: [n, inter] → [n, H]
         let output = ctx.buffers.moe_output();
         crate::kprof!(ctx.gpu, stream, "ffn_down_kgamma", {
-            if m128_path {
+            if m32_path {
+                let dt = self.down_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64,
+                    gate_out,
+                    dt,
+                    output,
+                    n,
+                    h,
+                    inter,
+                    stream,
+                )?;
+            } else if m128_path {
                 let dt = self.down_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n128_m128(
                     ctx.gpu,
