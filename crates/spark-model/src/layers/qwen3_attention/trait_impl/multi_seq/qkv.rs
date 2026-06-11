@@ -10,9 +10,11 @@
 //! token but supports every weight encoding.
 
 use anyhow::Result;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
+use crate::weight_map::QuantizedWeight;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
 /// Cached `ATLAS_ATTN_QKV_BATCHED` env-var lookup. When `1` the n∈(3,32]
@@ -549,6 +551,16 @@ impl Qwen3AttentionLayer {
             && self.q_nvfp4_t.is_some()
             && self.k_nvfp4_t.is_some()
             && self.v_nvfp4_t.is_some();
+        // Prefer the m32_n64 kernel when present: same single-B-read
+        // property as m128 at n ≤ 32 but 2× the CTA count (no SM
+        // starvation). Falls back to m128 on older PTX caches.
+        let use_m32 = m128_t && n <= 32 && self.w4a16_gemm_t_m32_n64_k.0 != 0;
+        let (t_kernel, t_launch): (KernelHandle, fn(&dyn GpuBackend, KernelHandle, DevicePtr, &QuantizedWeight, DevicePtr, u32, u32, u32, u64) -> Result<()>) =
+            if use_m32 {
+                (self.w4a16_gemm_t_m32_n64_k, ops::w4a16_gemm_n64_m32)
+            } else {
+                (self.w4a16_gemm_t_m128_k, ops::w4a16_gemm_n128_m128)
+            };
 
         // Q scratch: [n, q_proj_dim] BF16 contiguous in ssm_qkvz.
         let q_scratch = fwd.buffers.ssm_qkvz();
@@ -561,9 +573,9 @@ impl Qwen3AttentionLayer {
             let q_t = self.q_nvfp4_t.as_ref().unwrap();
             let k_t = self.k_nvfp4_t.as_ref().unwrap();
             let v_t = self.v_nvfp4_t.as_ref().unwrap();
-            ops::w4a16_gemm_n128_m128(
+            t_launch(
                 fwd.gpu,
-                self.w4a16_gemm_t_m128_k,
+                t_kernel,
                 normed,
                 q_t,
                 q_scratch,
@@ -572,9 +584,9 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
-            ops::w4a16_gemm_n128_m128(
+            t_launch(
                 fwd.gpu,
-                self.w4a16_gemm_t_m128_k,
+                t_kernel,
                 normed,
                 k_t,
                 k_scratch,
@@ -583,9 +595,9 @@ impl Qwen3AttentionLayer {
                 h as u32,
                 stream,
             )?;
-            ops::w4a16_gemm_n128_m128(
+            t_launch(
                 fwd.gpu,
-                self.w4a16_gemm_t_m128_k,
+                t_kernel,
                 normed,
                 v_t,
                 v_scratch,

@@ -262,6 +262,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemm_t_k: KernelHandle,
     pub(super) w4a16_gemm_t_k64_k: KernelHandle,
     pub(super) w4a16_gemm_t_m128_k: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64` — K=γ verify small-M GEMM (single B read ×
+    /// 272 CTAs). Used by the batched qkv/o paths at 3 < n ≤ 32.
+    pub(super) w4a16_gemm_t_m32_n64_k: KernelHandle,
     /// MiniMax-only shadow kernel.
     pub(super) w4a16_gemm_t_m128_v2_k: KernelHandle,
     /// v3 variant: K_STEP=64.
