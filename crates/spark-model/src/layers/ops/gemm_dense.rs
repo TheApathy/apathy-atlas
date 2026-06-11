@@ -178,6 +178,41 @@ pub fn w4a16_gemm_n128_m16(
         .launch(stream)
 }
 
+/// W4A16 GEMM with M_TILE=32 + N_TILE=64: DFlash K=γ+1=17 verify variant.
+///
+/// One 32-row M-tile = single B read for any M ≤ 32 (the m16 kernel
+/// re-reads B per 16-row tile: 2× traffic at M=17), and N_TILE=64
+/// fields 272 CTAs at intermediate=17408 (the m128 kernel's N=128 grid
+/// is SM-starved at ~136 CTAs / 110 SMs). 4 warps × (2 M-frags × 2
+/// N-subtiles) keeps the m16 kernel's MMA pipeline density.
+///
+/// Grid: (ceil(N/64), ceil(M/32), 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 32), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W4A16 GEMM with M_TILE=16 + N_TILE=64: K=3 MTP verify variant.
 ///
 /// Same FP8 MMA pipeline as `w4a16_gemm_n128_m16` but with the N tile
