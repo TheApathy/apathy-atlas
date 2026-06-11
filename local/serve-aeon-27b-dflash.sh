@@ -98,6 +98,19 @@ export ATLAS_DFLASH_NOISE_ONLY=${ATLAS_DFLASH_NOISE_ONLY:-1}
 # w4a16_gemm_t_m16/NVFP4-T path, NOT in deinterleave_qg.
 export ATLAS_ATTN_QKV_BATCHED=${ATLAS_ATTN_QKV_BATCHED:-1}
 
+# 2026-06-11: nsys-guided kernel routing. Ground-truth trace showed the
+# K=17 verify dominated by small-M GEMM inefficiency (GPU ~80% busy, no
+# graph gaps): plain w4a16_gemm ran ~5x off the bandwidth floor at M=17
+# (strided B reads), and w4a16_gemm_t_m16 re-reads weights per 16-row
+# tile. Routing FFN + batched qkv through the transposed M_TILE=128
+# kernel (single weight read, coalesced): verify 238->199ms.
+# ATLAS_DFLASH_FFN_KGAMMA=1 quantizes the drafter FFN to m16-transposed
+# at load: propose 88->61ms. Combined: counting 38->43.4, coding
+# 23.9->26.2, prose ~14->16.2 tok/s (usage-method, vs container
+# 74.3/51.6/21.0).
+export ATLAS_FFN_KGAMMA_M128=${ATLAS_FFN_KGAMMA_M128:-1}
+export ATLAS_DFLASH_FFN_KGAMMA=${ATLAS_DFLASH_FFN_KGAMMA:-1}
+
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
 # M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy

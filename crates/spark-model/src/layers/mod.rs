@@ -132,6 +132,21 @@ pub fn ffn_kgamma_m16_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_M16").ok().as_deref() == Some("1"))
 }
 
+/// Returns true when `ATLAS_FFN_KGAMMA_M128=1` is set in the process env.
+///
+/// Routes the batched K=γ verify FFN through `w4a16_gemm_t_m128`
+/// (M_TILE=128) instead of `w4a16_gemm_t_m16`. At M=17 the m16 kernel
+/// runs ceil(17/16)=2 M-tile rows and each tile row re-reads the FULL
+/// weight matrix — 2× B DRAM traffic on a memory-bound GEMM. The m128
+/// kernel covers M=17 in ONE tile (single weight read); its compute
+/// waste on 111 phantom rows is irrelevant because the kernel is
+/// bandwidth-bound (see forward_prefill's fp8_fast_path note). Expected
+/// ~40ms verify reduction at K=17 on Qwen3.6-27B Full.
+pub fn ffn_kgamma_m128_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_M128").ok().as_deref() == Some("1"))
+}
+
 /// Returns true when `ATLAS_SSM_MULTI_SEQ_BATCHED=1` is set in the process env.
 ///
 /// Gates the batched-projections multi-seq SSM decode path. With this off

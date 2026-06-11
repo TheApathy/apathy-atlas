@@ -870,10 +870,29 @@ impl DenseFfnLayer {
             && (crate::layers::ffn_m16_transposed_enabled()
                 || crate::layers::tc_nvfp4_m16_enabled())
             && self.has_transposed_ffn();
+        // m128 upgrade of the m16 path: ONE M-tile at n ≤ 128 → single
+        // weight read (m16 re-reads B per 16-row tile: 2× traffic at
+        // n=17 on a memory-bound GEMM). See ffn_kgamma_m128_enabled.
+        let m128_path = m16_path
+            && crate::layers::ffn_kgamma_m128_enabled()
+            && self.w4a16_gemm_t_m128.0 != 0;
 
         // gate_proj GEMM: [n, H] → [n, inter]
         crate::kprof!(ctx.gpu, stream, "ffn_gate_kgamma", {
-            if m16_path {
+            if m128_path {
+                let gt = self.gate_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m128,
+                    input,
+                    gt,
+                    gate_out,
+                    n,
+                    inter,
+                    h,
+                    stream,
+                )?;
+            } else if m16_path {
                 let gt = self.gate_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n128_m16(
                     ctx.gpu,
@@ -904,7 +923,20 @@ impl DenseFfnLayer {
 
         // up_proj GEMM: [n, H] → [n, inter]
         crate::kprof!(ctx.gpu, stream, "ffn_up_kgamma", {
-            if m16_path {
+            if m128_path {
+                let ut = self.up_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m128,
+                    input,
+                    ut,
+                    up_out,
+                    n,
+                    inter,
+                    h,
+                    stream,
+                )?;
+            } else if m16_path {
                 let ut = self.up_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n128_m16(
                     ctx.gpu,
@@ -950,7 +982,20 @@ impl DenseFfnLayer {
         // down_proj GEMM: [n, inter] → [n, H]
         let output = ctx.buffers.moe_output();
         crate::kprof!(ctx.gpu, stream, "ffn_down_kgamma", {
-            if m16_path {
+            if m128_path {
+                let dt = self.down_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m128,
+                    gate_out,
+                    dt,
+                    output,
+                    n,
+                    h,
+                    inter,
+                    stream,
+                )?;
+            } else if m16_path {
                 let dt = self.down_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n128_m16(
                     ctx.gpu,
