@@ -862,9 +862,17 @@ impl BlockDiffusionDraftHead {
             && self.kernels.w4a16_gemm_t_m16.0 != 0;
         if attn_kgamma_t {
             let q_t = layer.q_proj_t.as_ref().unwrap();
-            kp!(q_proj_us, ops::w4a16_gemm_n128_m16(
+            kp!(q_proj_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.norm_buf.offset(row0_h),
                 q_t,
                 self.scratch.q_buf.offset(row0_q),
@@ -1017,9 +1025,17 @@ impl BlockDiffusionDraftHead {
         if attn_kgamma_t {
             let k_t = layer.k_proj_t.as_ref().unwrap();
             let v_t = layer.v_proj_t.as_ref().unwrap();
-            kp!(kv_noise_us, ops::w4a16_gemm_n128_m16(
+            kp!(kv_noise_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.norm_buf.offset(noise_offset),
                 k_t,
                 self.scratch.k_buf.offset(noise_kv_offset),
@@ -1028,9 +1044,17 @@ impl BlockDiffusionDraftHead {
                 h,
                 stream,
             ))?;
-            kp!(kv_noise_us, ops::w4a16_gemm_n128_m16(
+            kp!(kv_noise_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.norm_buf.offset(noise_offset),
                 v_t,
                 self.scratch.v_buf.offset(noise_kv_offset),
@@ -1176,9 +1200,17 @@ impl BlockDiffusionDraftHead {
             == Some("1");
         if attn_kgamma_t && !disable_o {
             let o_t = layer.o_proj_t.as_ref().unwrap();
-            kp!(o_proj_us, ops::w4a16_gemm_n128_m16(
+            kp!(o_proj_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.attn_out.offset(row0_q),
                 o_t,
                 self.scratch.stream_acc.offset(row0_h),
@@ -1242,9 +1274,17 @@ impl BlockDiffusionDraftHead {
         if ffn_kgamma_t {
             let gate_t = layer.gate_proj_t.as_ref().unwrap();
             let up_t = layer.up_proj_t.as_ref().unwrap();
-            kp!(gate_up_us, ops::w4a16_gemm_n128_m16(
+            kp!(gate_up_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.norm_buf.offset(row0_h),
                 gate_t,
                 self.scratch.mlp_intermediate.offset(row0_inter),
@@ -1253,9 +1293,17 @@ impl BlockDiffusionDraftHead {
                 h,
                 stream,
             ))?;
-            kp!(gate_up_us, ops::w4a16_gemm_n128_m16(
+            kp!(gate_up_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.norm_buf.offset(row0_h),
                 up_t,
                 self.scratch.mlp_up.offset(row0_inter),
@@ -1305,9 +1353,17 @@ impl BlockDiffusionDraftHead {
         // rationale on M_TILE=16 vs M_TILE=64).
         if ffn_kgamma_t {
             let down_t = layer.down_proj_t.as_ref().unwrap();
-            kp!(down_proj_us, ops::w4a16_gemm_n128_m16(
+            kp!(down_proj_us, (if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                ops::w4a16_gemm_n64_m32
+            } else {
+                ops::w4a16_gemm_n128_m16
+            })(
                 gpu,
-                self.kernels.w4a16_gemm_t_m16,
+                if self.kernels.w4a16_gemm_t_m32_n64.0 != 0 {
+                    self.kernels.w4a16_gemm_t_m32_n64
+                } else {
+                    self.kernels.w4a16_gemm_t_m16
+                },
                 self.scratch.mlp_intermediate.offset(row0_inter),
                 down_t,
                 self.scratch.stream_acc.offset(row0_h),
