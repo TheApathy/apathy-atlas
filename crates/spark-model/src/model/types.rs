@@ -140,6 +140,9 @@ pub struct TransformerModel {
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
+    /// Transposed copy of the NVFP4 lm_head for the m32_n64 K=γ path.
+    /// Built at load when ATLAS_LM_HEAD_T=1 (~0.63 GB on qwen3.6-27b).
+    pub(super) lm_head_nvfp4_t: Option<QuantizedWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
     pub(super) kv_cache: Mutex<PagedKvCache>,
@@ -157,6 +160,9 @@ pub struct TransformerModel {
     pub(super) w4a16_gemv_kernel: KernelHandle,
     pub(super) w4a16_gemv_logits_kernel: KernelHandle, // FP32 output for LM head
     pub(super) w4a16_gemm_kernel: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64` for the K=γ lm_head (single B read × full
+    /// occupancy at 3 < M ≤ 32). 0 when the symbol is absent.
+    pub(super) w4a16_gemm_t_m32_n64_kernel: KernelHandle,
     pub(super) w4a16_gemv_batch2_kernel: KernelHandle,
     /// W4A16 M=3 GEMV specialized for LM head (large N=vocab).
     /// Replaces the M=3 fallback through `w4a16_gemm` (95% wasted M-tile)
