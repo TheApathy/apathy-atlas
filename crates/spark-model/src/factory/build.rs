@@ -342,7 +342,16 @@ pub fn build_model(
     let target_embed_for_dflash = embed.weight;
     let target_lm_head_for_dflash = lm_head.weight;
     let target_hidden_for_dflash = config.hidden_size;
-    let target_vocab_for_dflash = config.vocab_size;
+    // Honor --mtp-vocab for the DFlash drafter lm_head, mirroring the MTP
+    // head: drafts only need argmax over the high-frequency vocab prefix,
+    // and the full 248k-row lm_head GEMM at M=γ+1 dominates the propose
+    // tail (~32ms of 67ms propose at ctx≈390, DFLASH_KP 2026-06-11).
+    // mtp_vocab_size=0 means uncapped.
+    let target_vocab_for_dflash = if mtp_vocab_size > 0 {
+        (mtp_vocab_size as usize).min(config.vocab_size)
+    } else {
+        config.vocab_size
+    };
 
     let mut model = TransformerModel::new(
         config,
