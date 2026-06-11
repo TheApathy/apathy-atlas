@@ -661,6 +661,29 @@ impl Qwen3AttentionLayer {
             )?;
         } else if n > 3
             && n <= 32
+            && self.w4a16_gemm_t_m32_n64_k.0 != 0
+            && self.o_nvfp4_t.is_some()
+        {
+            // K=γ verify: single M=n GEMM via the m32_n64 kernel (single
+            // B read, full SM occupancy) — replaces the n per-token GEMV
+            // launches (17 weight re-reads at DFlash K=17). The T-weights +
+            // transposed-kernel combination is production-validated (FFN
+            // m32 + qkv m128_t, token-exact 2026-06-11); only the legacy
+            // m16 KERNEL below remains quarantined.
+            let nvfp4_t = self.o_nvfp4_t.as_ref().unwrap();
+            ops::w4a16_gemm_n64_m32(
+                fwd.gpu,
+                self.w4a16_gemm_t_m32_n64_k,
+                attn_out,
+                nvfp4_t,
+                o_out,
+                n as u32,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
+        } else if n > 3
+            && n <= 32
             && self.w4a16_gemm_t_m16_k.0 != 0
             && crate::layers::tc_nvfp4_m16_enabled()
             && self.o_nvfp4_t.is_some()
