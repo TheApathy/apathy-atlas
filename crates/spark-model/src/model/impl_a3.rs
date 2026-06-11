@@ -206,6 +206,26 @@ impl TransformerModel {
                 h,
                 stream,
             )?;
+        } else if num_tokens > 3
+            && num_tokens <= 32
+            && self.lm_head_nvfp4_t.is_some()
+            && self.w4a16_gemm_t_m32_n64_kernel.0 != 0
+        {
+            // K=γ verify: transposed m32_n64 lm_head — single coalesced
+            // weight read vs the plain kernel's strided ~5×-floor access
+            // at M=17 (ATLAS_LM_HEAD_T=1 builds the T-copy at load).
+            let nvfp4_t = self.lm_head_nvfp4_t.as_ref().unwrap();
+            ops::w4a16_gemm_n64_m32(
+                self.gpu.as_ref(),
+                self.w4a16_gemm_t_m32_n64_kernel,
+                hidden,
+                nvfp4_t,
+                logits,
+                num_tokens,
+                v,
+                h,
+                stream,
+            )?;
         } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
             ops::w4a16_gemm(
                 self.gpu.as_ref(),

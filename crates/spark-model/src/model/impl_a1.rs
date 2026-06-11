@@ -80,6 +80,8 @@ impl TransformerModel {
         let w4a16_gemv_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv")?;
         let w4a16_gemv_logits_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv_logits")?;
         let w4a16_gemm_kernel = gpu.kernel("w4a16", "w4a16_gemm")?;
+        let w4a16_gemm_t_m32_n64_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "w4a16_gemm_t_m32_n64");
         let w4a16_gemv_batch2_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?;
         let w4a16_gemv_batch3_logits_kernel =
             gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3_logits")?;
@@ -439,6 +441,31 @@ impl TransformerModel {
         kv_cache.zero_block(dummy_kv_block, gpu.as_ref(), gpu.default_stream())?;
         gpu.synchronize(gpu.default_stream())?;
 
+        // ATLAS_LM_HEAD_T=1: transposed NVFP4 lm_head copy so the K=γ
+        // verify lm_head routes through w4a16_gemm_t_m32_n64 (single
+        // coalesced B read at M ≤ 32) instead of the strided plain
+        // w4a16_gemm (~5× off the bandwidth floor at M=17, ~15 ms/step
+        // on qwen3.6-27b's 248k vocab). ~0.63 GB extra device memory.
+        let lm_head_nvfp4_t = if std::env::var("ATLAS_LM_HEAD_T").ok().as_deref() == Some("1")
+            && w4a16_gemm_t_m32_n64_kernel.0 != 0
+        {
+            match lm_head_nvfp4.as_ref() {
+                Some(w) => match w.transpose_for_gemm(gpu.as_ref(), config.vocab_size, config.hidden_size) {
+                    Ok(t) => {
+                        tracing::info!("lm_head NVFP4-T built for K=γ m32 path (vocab={})", config.vocab_size);
+                        Some(t)
+                    }
+                    Err(e) => {
+                        tracing::warn!("lm_head transpose failed ({e:#}); K=γ lm_head stays on plain w4a16_gemm");
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // Build MTP proposer (extracted to keep `new` under the file cap).
         let proposer: Option<Arc<dyn DraftProposer>> = super::impl_a1_init::build_mtp_proposer(
             use_speculative,
@@ -783,6 +810,7 @@ impl TransformerModel {
             final_norm,
             lm_head_weight,
             lm_head_nvfp4,
+            lm_head_nvfp4_t,
             layers,
             buffers,
             kv_cache: Mutex::new(kv_cache),
@@ -794,6 +822,7 @@ impl TransformerModel {
             w4a16_gemv_kernel,
             w4a16_gemv_logits_kernel,
             w4a16_gemm_kernel,
+            w4a16_gemm_t_m32_n64_kernel,
             w4a16_gemv_batch2_kernel,
             w4a16_gemv_batch3_logits_kernel,
             dense_gemm_kernel,
