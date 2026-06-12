@@ -68,7 +68,7 @@ echo "[serve-aeon-27b-dflash] preflight ok: ${FREE_GB} GB free"
 # fused safe path matters more than throughput.
 export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-32}
 export ATLAS_LM_HEAD_T="${ATLAS_LM_HEAD_T:-1}"
-export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-512}
+export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-2048}
 export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
 
 # 2026-06-10: batched K=γ FFN. KPROF showed the K=17 verify spending
@@ -131,12 +131,6 @@ export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 # -aeon-v3-balanced) match the abliterated target's distribution and
 # should accept more drafts per step on prose.
 DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/models/z-lab-Qwen3.6-27B-DFlash}
-
-# Drafter ctx window: 512 default strangles acceptance past position ~600
-# (drafter trained on full captured prefix). 2048 measured +11 tok/s on
-# coding-800 (36.5 -> 47.8).
-export ATLAS_LM_HEAD_T="${ATLAS_LM_HEAD_T:-1}"
-export ATLAS_DFLASH_CTX_WINDOW="${ATLAS_DFLASH_CTX_WINDOW:-2048}"
 
 exec /home/flocka/atlas-src/target/release/spark serve \
   --model-from-path /home/flocka/models/AEON-Q36-27B-Full \
