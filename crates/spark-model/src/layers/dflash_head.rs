@@ -72,6 +72,9 @@ pub struct DflashKernels {
     /// `try_kernel`; handle is `KernelHandle(0)` (sentinel) on miss so
     /// the dispatch can degrade gracefully to the M_TILE=64 path.
     pub w4a16_gemm_t_m16: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64` — single B read × full occupancy at M ≤ 32.
+    /// Preferred over m16 (2× B reads at M=17) for drafter kgamma GEMMs.
+    pub w4a16_gemm_t_m32_n64: KernelHandle,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
