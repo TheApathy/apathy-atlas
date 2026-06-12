@@ -661,6 +661,10 @@ pub(super) fn kprof_add(f: impl FnOnce(&mut KprofAcc)) {
 }
 
 impl DraftProposer for BlockDiffusionDraftHead {
+    fn is_dflash(&self) -> bool {
+        true
+    }
+
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
         // Sized once, re-used across the seq's lifetime; reset on

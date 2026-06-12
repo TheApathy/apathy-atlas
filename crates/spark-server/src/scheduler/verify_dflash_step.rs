@@ -178,7 +178,27 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     //     accepted state (== max compact index, or 0 when no drafts
     //     accepted). `None` for flat-chain → commit derives slot from
     //     `num_accepted - 1` (chain-contiguous).
-    let (num_accepted, tree_last_inter_slot) = if let Some(payload) = a.pending_tree_payload.as_ref() {
+    // Stage-2 grammar enforcement (ATLAS_DFLASH_GRAMMAR_MODE=verify): the
+    // `verified` vec came from an UNMASKED GPU argmax, so for a
+    // grammar-constrained sequence each position's target token must be
+    // recomputed as masked argmax over the verify logits (still resident in
+    // the model's `[K, vocab]` BF16 logits buffer at this point — nothing
+    // touches the model between the verify above and here). `Some((n, b))`
+    // overrides the accept count and bonus token below; `None` falls
+    // through to the unmasked paths (grammar inactive / tree mode / fp32
+    // logits / D2H failure).
+    let grammar_accept: Option<(usize, u32)> = if dflash_grammar_mode()
+        == DflashGrammarMode::Verify
+        && a.pending_tree_payload.is_none()
+    {
+        dflash_masked_accept(model, a, &verify_input_tokens, &verified)
+    } else {
+        None
+    };
+
+    let (num_accepted, tree_last_inter_slot) = if let Some((n, _)) = grammar_accept {
+        (n, None)
+    } else if let Some(payload) = a.pending_tree_payload.as_ref() {
         use spark_model::layers::dflash_head::ddtree::{
             greedy_sample_ddtree, last_accepted_inter_slot, DDTreeRequestRuntime,
         };
@@ -232,17 +252,27 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
             }
         }
     } else {
-        let mut n = 0usize;
-        for i in 0..drafts.len() {
-            if i + 1 >= verified.len() {
-                break;
+        // Typical acceptance (ATLAS_DFLASH_TYPICAL_ACCEPT, temp > 0, no
+        // active grammar): probabilistic accept test over the target's
+        // verify logits at would-be-mismatch positions. `None` ⇒ inactive
+        // for this request ⇒ legacy exact-match prefix below.
+        let n = match dflash_typical_accept(model, a, drafts, &verified) {
+            Some(n) => n,
+            None => {
+                let mut n = 0usize;
+                for i in 0..drafts.len() {
+                    if i + 1 >= verified.len() {
+                        break;
+                    }
+                    if drafts[i] == verified[i] {
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                n
             }
-            if drafts[i] == verified[i] {
-                n += 1;
-            } else {
-                break;
-            }
-        }
+        };
         (n, None)
     };
 
@@ -293,9 +323,15 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
 
     // Bonus token = verified[num_accepted] (the one that "corrected" the draft
     // at the first mismatch, or the next-prediction past the full-accept case).
+    // Grammar verify mode substitutes the MASKED argmax at that position —
+    // safe because the bonus has no KV/seq.tokens entry yet (it is fed as
+    // verify input position 0 next step), exactly like the MTP masked path.
     let bonus_idx = num_accepted;
-    if bonus_idx < verified.len() {
-        let bonus = verified[bonus_idx];
+    let bonus_tok = match grammar_accept {
+        Some((_, b)) => Some(b),
+        None => verified.get(bonus_idx).copied(),
+    };
+    if let Some(bonus) = bonus_tok {
         emit_token(a, bonus, None);
         if a.finished {
             return;
@@ -377,7 +413,10 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // DFlash needs the target's hidden states for the full prefix including
     // the bonus token; the verify forward pass only processed the drafts.
     let t_save = Instant::now();
-    let bonus = verified.get(bonus_idx).copied().unwrap_or(a.last_token);
+    // `a.last_token` already holds the emitted bonus (masked argmax under
+    // grammar verify mode, else `verified[bonus_idx]`; unchanged when no
+    // bonus row existed).
+    let bonus = a.last_token;
     if let Err(e) = model.save_hidden_for_dflash(bonus, &mut a.seq, 0) {
         tracing::error!("save_hidden_for_dflash (dflash): {e:#}");
     }
@@ -389,17 +428,29 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     }
     let t_trim_us = t_trim.elapsed().as_micros();
 
-    // Re-propose for next step.
-    let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+    // Re-propose for next step — unless the stage-1 grammar gate fires
+    // (grammar now constrains output, e.g. this verify emitted the token
+    // that opened a tool-call body): leave `pending_drafts` empty so the
+    // next step runs the grammar-enforced bootstrap decode.
+    let skip_propose = dflash_grammar_skip_propose(model, a);
+    let _mtp_grammar_mask = if skip_propose {
+        None
+    } else {
+        mtp_grammar_mask_for(a)
+    };
     let t_propose = std::time::Instant::now();
-    let propose_result = model.run_mtp_propose_multi(
-        a.last_token,
-        a.seq.seq_len,
-        num_drafts,
-        &mut a.seq,
-        0,
-        _mtp_grammar_mask.as_deref(),
-    );
+    let propose_result = if skip_propose {
+        Ok(Vec::new())
+    } else {
+        model.run_mtp_propose_multi(
+            a.last_token,
+            a.seq.seq_len,
+            num_drafts,
+            &mut a.seq,
+            0,
+            _mtp_grammar_mask.as_deref(),
+        )
+    };
     let propose_us = t_propose.elapsed().as_micros();
     if std::env::var("ATLAS_DFLASH_PROPOSE_LOG").ok().as_deref() == Some("1") {
         tracing::info!(
@@ -431,4 +482,276 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // above and stash it on ActiveSeq for the next-step verifier. Default
     // proposers return None (flat path preserved).
     a.pending_tree_payload = model.take_pending_tree_payload(&mut a.seq);
+}
+
+/// Grammar-masked re-derivation of the DFlash accept prefix + bonus
+/// (stage 2, `ATLAS_DFLASH_GRAMMAR_MODE=verify`).
+///
+/// Row `i` of the model's verify logits buffer (`[K, vocab]` BF16, row
+/// stride `vocab_size`) is the target's prediction for the slot
+/// `drafts[i]` occupies; row `drafts.len()` is the bonus slot. Walk the
+/// positions in order: fill the matcher's bitmask for the CURRENT grammar
+/// state, take the MASKED argmax as the target token, and stop acceptance
+/// at the first draft that diverges from it or that the matcher rejects.
+/// The matcher is advanced per accepted draft (so each position's mask
+/// reflects its prefix) and rolled back before returning — `emit_token`
+/// re-advances it for real on emission, mirroring
+/// `truncate_drafts_at_grammar_boundary`'s transient-advance pattern.
+///
+/// Mask-application convention mirrors the MTP masked-draft path in
+/// `spark-model/src/layers/mtp_head/forward.rs`: bit `tok` set in the i32
+/// bitmask ⇒ token allowed; BF16 logits are ordered by their raw bit
+/// pattern reinterpreted as i16 (a total order over finite values).
+///
+/// Returns `(num_accepted, bonus_token)`, or `None` when masking does not
+/// apply (thinking span, no/terminated grammar, fp32 logits) or the
+/// logits D2H fails — the caller falls back to the unmasked accept path.
+fn dflash_masked_accept(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    drafts: &[u32],
+    verified: &[u32],
+) -> Option<(usize, u32)> {
+    if a.inside_thinking || verified.is_empty() {
+        return None;
+    }
+    if a
+        .grammar_state
+        .as_ref()
+        .is_none_or(|gs| gs.is_terminated())
+    {
+        return None;
+    }
+    let logits_base = model.logits_buffer_ptr();
+    if model.logits_ptr_is_fp32(logits_base) {
+        return None; // masked argmax below assumes BF16 rows
+    }
+    let vocab = model.vocab_size();
+    let mut row_buf = vec![0u8; vocab * 2];
+
+    let gs = a.grammar_state.as_mut().expect("checked above");
+    let mut accepted = 0usize;
+    let mut bonus: Option<u32> = None;
+    for i in 0..verified.len() {
+        let target_tok = if gs.fill_bitmask() {
+            if let Err(e) =
+                model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf)
+            {
+                tracing::warn!(
+                    "DFlash grammar verify: logits D2H failed ({e:#}); unmasked fallback"
+                );
+                if accepted > 0 {
+                    gs.rollback(accepted);
+                }
+                return None;
+            }
+            match masked_argmax_bf16(&row_buf, gs.bitmask_data(), vocab) {
+                Some(t) => t,
+                None => {
+                    // Degenerate empty allowed set (dead grammar state):
+                    // keep the unmasked argmax — emit_token tolerates the
+                    // failed accept exactly as the pre-fix path did.
+                    tracing::warn!(
+                        "DFlash grammar verify: mask allowed zero tokens at verify pos {i}"
+                    );
+                    verified[i]
+                }
+            }
+        } else {
+            // No constraint at this position (e.g. grammar just terminated
+            // mid-walk after a stop token was accepted).
+            verified[i]
+        };
+        // Accept drafts[i] only while a bonus row remains past it (mirrors
+        // the unmasked loop's `i + 1 >= verified.len()` guard); otherwise
+        // this row's target token becomes the bonus.
+        if i < drafts.len()
+            && i + 1 < verified.len()
+            && drafts[i] == target_tok
+            && gs.accept_token(drafts[i])
+        {
+            accepted += 1;
+            continue;
+        }
+        bonus = Some(target_tok);
+        break;
+    }
+    if accepted > 0 {
+        gs.rollback(accepted);
+    }
+    Some((accepted, bonus?))
+}
+
+/// Typical acceptance for the flat-chain DFlash accept prefix
+/// (`ATLAS_DFLASH_TYPICAL_ACCEPT=<epsilon>`, opt-in).
+///
+/// At temperature > 0 the exact-match rule (`drafts[i] == verified[i]`,
+/// where `verified` is the target's UNMASKED GPU argmax) is needlessly
+/// strict: a draft the target itself would plausibly sample gets rejected
+/// just for not being the argmax, collapsing acceptance on creative/story
+/// prompts. Instead, accept `drafts[i]` when
+///
+///   p_target(drafts[i]) >= max(epsilon, alpha * p_max)
+///
+/// where `p_target` is the temperature-scaled softmax of the target's
+/// verify logits at position `i` (row `i` of the `[K, vocab]` BF16 logits
+/// buffer, still resident on device — same lazy per-row D2H pattern as
+/// `dflash_masked_accept`), `p_max` its max, `alpha` from
+/// `ATLAS_DFLASH_TYPICAL_ALPHA` (default 0.3). Exact argmax matches are
+/// accepted without the test (and without the D2H) — the typical rule
+/// only ever WIDENS acceptance, so greedy-equivalent behavior is the
+/// floor. The first position failing the test ends the prefix; the bonus
+/// stays `verified[num_accepted]` (the existing path — note this verify
+/// path emits the target's argmax as the bonus even at temp > 0).
+///
+/// Returns `Some(num_accepted)` when the rule is active for this request,
+/// `None` to fall back to exact-match: env absent, temperature == 0
+/// (greedy completely unaffected), an active (non-terminated) grammar —
+/// loosened acceptance must not bypass constraint enforcement — or fp32
+/// logits (row layout below assumes BF16). A failed row D2H ends the
+/// prefix at that position, which equals the exact-match outcome there.
+fn dflash_typical_accept(
+    model: &dyn Model,
+    a: &ActiveSeq,
+    drafts: &[u32],
+    verified: &[u32],
+) -> Option<usize> {
+    let epsilon = dflash_typical_epsilon()?;
+    if a.temperature <= 0.0 {
+        return None;
+    }
+    if a.grammar_state.as_ref().is_some_and(|gs| !gs.is_terminated()) {
+        return None;
+    }
+    let logits_base = model.logits_buffer_ptr();
+    if model.logits_ptr_is_fp32(logits_base) {
+        return None; // softmax below assumes BF16 rows
+    }
+    let vocab = model.vocab_size();
+    let alpha = dflash_typical_alpha();
+    // Lazily allocated on the first non-argmax position; pure argmax
+    // prefixes never touch the device.
+    let mut row_buf: Vec<u8> = Vec::new();
+    let mut accepted = 0usize;
+    let mut typical_hits = 0usize;
+    for i in 0..drafts.len() {
+        if i + 1 >= verified.len() {
+            break;
+        }
+        if drafts[i] == verified[i] {
+            accepted += 1;
+            continue;
+        }
+        if drafts[i] as usize >= vocab {
+            break;
+        }
+        if row_buf.is_empty() {
+            row_buf = vec![0u8; vocab * 2];
+        }
+        if let Err(e) =
+            model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf)
+        {
+            tracing::warn!("DFlash typical accept: logits D2H failed ({e:#}); stopping prefix");
+            break;
+        }
+        let (p_draft, p_max) =
+            typical_row_probs_bf16(&row_buf, vocab, a.temperature, drafts[i]);
+        if p_draft >= epsilon.max(alpha * p_max) {
+            accepted += 1;
+            typical_hits += 1;
+        } else {
+            break;
+        }
+    }
+    if typical_hits > 0 {
+        tracing::debug!(
+            "DFlash typical accept: +{typical_hits} non-argmax draft(s) accepted \
+             (total {accepted}/{}, ε={epsilon}, α={alpha}, T={})",
+            drafts.len(),
+            a.temperature,
+        );
+    }
+    Some(accepted)
+}
+
+/// Temperature-scaled softmax probabilities over one host-copied BF16
+/// logits row: `(p(tok), p_max)`. Two passes, f32 accumulation; numerically
+/// stable via max-logit subtraction (so `p_max == 1/Z` exactly).
+fn typical_row_probs_bf16(bytes: &[u8], vocab: usize, temperature: f32, tok: u32) -> (f32, f32) {
+    let inv_t = 1.0 / temperature.max(1e-6);
+    let mut max_logit = f32::NEG_INFINITY;
+    for i in 0..vocab {
+        let l = bf16_to_f32(bytes[2 * i], bytes[2 * i + 1]);
+        if l > max_logit {
+            max_logit = l;
+        }
+    }
+    let mut z = 0f32;
+    let mut e_tok = 0f32;
+    for i in 0..vocab {
+        let l = bf16_to_f32(bytes[2 * i], bytes[2 * i + 1]);
+        let e = ((l - max_logit) * inv_t).exp();
+        z += e;
+        if i == tok as usize {
+            e_tok = e;
+        }
+    }
+    if z <= 0.0 || !z.is_finite() {
+        return (0.0, 0.0);
+    }
+    (e_tok / z, 1.0 / z)
+}
+
+/// `ATLAS_DFLASH_TYPICAL_ACCEPT` epsilon, read once at first use. `None`
+/// when the env is absent (feature off); a set-but-unparseable value
+/// falls back to 0.05 with a warning.
+fn dflash_typical_epsilon() -> Option<f32> {
+    static EPS: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *EPS.get_or_init(|| {
+        let raw = std::env::var("ATLAS_DFLASH_TYPICAL_ACCEPT").ok()?;
+        match raw.trim().parse::<f32>() {
+            Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Some(v),
+            _ => {
+                tracing::warn!(
+                    "ATLAS_DFLASH_TYPICAL_ACCEPT={raw:?} unparseable (want float in [0,1]); \
+                     defaulting to 0.05"
+                );
+                Some(0.05)
+            }
+        }
+    })
+}
+
+/// `ATLAS_DFLASH_TYPICAL_ALPHA` (fraction of `p_max` a draft must reach),
+/// read once at first use. Default 0.3.
+fn dflash_typical_alpha() -> f32 {
+    static ALPHA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *ALPHA.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_TYPICAL_ALPHA")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.3)
+    })
+}
+
+/// Masked argmax over one host-copied BF16 logits row. `None` when the
+/// bitmask allows zero tokens. Same BF16-as-i16 ordering trick as the MTP
+/// masked path (`mtp_head/forward.rs`) — valid for all finite values.
+fn masked_argmax_bf16(bytes: &[u8], bitmask: &[i32], vocab: usize) -> Option<u32> {
+    let mut best_tok: Option<u32> = None;
+    let mut best_val = i16::MIN;
+    for tok in 0..vocab {
+        let word = tok / 32;
+        let bit = tok % 32;
+        if word >= bitmask.len() || (bitmask[word] & (1i32 << bit)) == 0 {
+            continue;
+        }
+        let signed = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]) as i16;
+        if best_tok.is_none() || signed > best_val {
+            best_val = signed;
+            best_tok = Some(tok as u32);
+        }
+    }
+    best_tok
 }

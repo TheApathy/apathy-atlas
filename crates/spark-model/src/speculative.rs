@@ -30,6 +30,17 @@ pub trait DraftProposer: Send + Sync {
     /// Allocate per-sequence proposer state.
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>>;
 
+    /// True when this proposer is the DFlash γ-block drafter.
+    ///
+    /// DFlash's block argmax is GPU-side and ignores the `grammar_bitmask`
+    /// argument to [`Self::propose`], so the scheduler must gate (or
+    /// verify-side mask) speculative drafting for grammar-constrained
+    /// sequences — see `ATLAS_DFLASH_GRAMMAR_MODE` in spark-server. MTP and
+    /// ngram proposers honor the mask and keep the default `false`.
+    fn is_dflash(&self) -> bool {
+        false
+    }
+
     /// Propose up to `num_drafts` tokens autoregressively.
     ///
     /// # Arguments

@@ -379,6 +379,74 @@ pub fn mtp_grammar_mask_for(a: &mut ActiveSeq) -> Option<Vec<i32>> {
 /// Mutates `gs` transiently but restores it via `rollback`. K=2
 /// (num_drafts=1) callers can skip this — a single draft uses its
 /// own up-to-date mask.
+/// Grammar-constraint handling for the DFlash proposer
+/// (`ATLAS_DFLASH_GRAMMAR_MODE`, read once at first use).
+///
+/// Unlike MTP — which threads the XGrammar bitmask through
+/// `run_mtp_propose_multi` into a masked CPU argmax — DFlash's γ-block
+/// draft argmax AND the K=γ verify argmax are GPU-side and grammar-blind,
+/// so an unhandled grammar (`tools` / `response_format`) was silently
+/// ignored on the DFlash path. Modes:
+///   - `off`:    legacy behavior (grammar ignored by DFlash — unsafe).
+///   - `gate`:   (default) skip DFlash drafting while the grammar
+///               constrains the next token; the sequence falls back to the
+///               bootstrap single-token decode, which samples through
+///               `sample_token_with_grammar`.
+///   - `verify`: keep drafting; enforce the bitmask target-side in
+///               `step_verify_dflash` via per-position masked argmax over
+///               the verify logits (DDTree topologies still gate — the
+///               tree-frame accept walk has no masked equivalent).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DflashGrammarMode {
+    Off,
+    Gate,
+    Verify,
+}
+
+pub fn dflash_grammar_mode() -> DflashGrammarMode {
+    static MODE: std::sync::OnceLock<DflashGrammarMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("ATLAS_DFLASH_GRAMMAR_MODE").ok().as_deref() {
+            Some("off") => DflashGrammarMode::Off,
+            Some("verify") => DflashGrammarMode::Verify,
+            Some("gate") | None => DflashGrammarMode::Gate,
+            Some(other) => {
+                tracing::warn!(
+                    "ATLAS_DFLASH_GRAMMAR_MODE={other:?} unrecognized (off|gate|verify); \
+                     defaulting to \"gate\""
+                );
+                DflashGrammarMode::Gate
+            }
+        },
+    )
+}
+
+/// Stage-1 grammar gate: true when the DFlash proposer must NOT draft for
+/// `a` this step, i.e. the grammar actively constrains the next token and
+/// the configured mode keeps DFlash out of grammar territory. The caller
+/// skips `run_mtp_propose_multi`, leaving `pending_drafts` empty so the
+/// sequence runs the grammar-enforced bootstrap decode instead.
+pub fn dflash_grammar_skip_propose(model: &dyn Model, a: &mut ActiveSeq) -> bool {
+    if !model.proposer_is_dflash() || a.grammar_state.is_none() {
+        return false;
+    }
+    let gate = match dflash_grammar_mode() {
+        DflashGrammarMode::Off => false,
+        DflashGrammarMode::Gate => true,
+        // verify mode keeps drafting (mask enforced in step_verify_dflash)
+        // except under DDTree, whose tree-frame accept walk is unmasked.
+        DflashGrammarMode::Verify => {
+            std::env::var("ATLAS_DFLASH_METHOD").ok().as_deref() == Some("ddtree")
+        }
+    };
+    if !gate || a.inside_thinking {
+        return false;
+    }
+    // Same activation test as `mtp_grammar_mask_for`, minus the owned copy.
+    let gs = a.grammar_state.as_mut().expect("checked above");
+    !gs.is_terminated() && gs.fill_bitmask()
+}
+
 pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]) -> usize {
     if drafts.len() < 2 || gs.is_terminated() {
         return drafts.len();

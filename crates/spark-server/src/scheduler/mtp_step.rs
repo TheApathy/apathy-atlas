@@ -7,6 +7,18 @@ use super::*;
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) {
+    // Stage-1 DFlash grammar gate: drop drafts proposed before the grammar
+    // became constraining (e.g. the block whose emission opened a
+    // `<tool_call>`). DFlash drafts and the K=γ verify argmax bypass the
+    // XGrammar bitmask, so a grammar-active sequence must run the bootstrap
+    // path below, where `sample_token_with_grammar` enforces it.
+    for a in active.iter_mut() {
+        if !a.pending_drafts.is_empty() && dflash_grammar_skip_propose(model, a) {
+            a.pending_drafts.clear();
+            a.pending_tree_payload = None;
+        }
+    }
+
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {
@@ -68,22 +80,27 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
             tracing::error!("save_hidden_for_mtp: {e:#}");
             continue;
         }
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            tok,
-            a.seq.seq_len,
-            num_drafts,
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(drafts) if !drafts.is_empty() => {
-                tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
-                a.pending_drafts = drafts;
-            }
-            Ok(_) => tracing::warn!("MTP propose returned empty"),
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
+        // Stage-1 DFlash grammar gate: while the grammar constrains output,
+        // stay non-speculative (the bootstrap decode above already sampled
+        // through the grammar; drafting would bypass it at verify).
+        if !dflash_grammar_skip_propose(model, a) {
+            let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+            match model.run_mtp_propose_multi(
+                tok,
+                a.seq.seq_len,
+                num_drafts,
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(drafts) if !drafts.is_empty() => {
+                    tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
+                    a.pending_drafts = drafts;
+                }
+                Ok(_) => tracing::warn!("MTP propose returned empty"),
+                Err(e) => {
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                }
             }
         }
 
