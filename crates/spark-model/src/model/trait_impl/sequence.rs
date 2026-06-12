@@ -76,6 +76,31 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // Free the DFlash proposer state's per-sequence device buffers.
+        // free_state can't (no GpuBackend in scope there); without this,
+        // every request leaked the ctx accumulator + fc/K/V caches
+        // (hundreds of MB per sequence — unbounded UMA growth while
+        // serving).
+        if let Some(ps) = seq.proposer_state.as_mut()
+            && let Some(ds) = ps
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+        {
+            let mut ptrs: Vec<spark_runtime::gpu::DevicePtr> =
+                vec![ds.ctx_hidden_acc, ds.ctx_fc_cache];
+            ptrs.extend(ds.ctx_k_cache.drain(..));
+            ptrs.extend(ds.ctx_v_cache.drain(..));
+            for p in ptrs {
+                if p.0 != 0
+                    && let Err(e) = self.gpu.free(p)
+                {
+                    tracing::warn!("free_sequence: dflash buffer free failed: {e:#}");
+                }
+            }
+            ds.ctx_hidden_acc = spark_runtime::gpu::DevicePtr(0);
+            ds.ctx_fc_cache = spark_runtime::gpu::DevicePtr(0);
+        }
+
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later
