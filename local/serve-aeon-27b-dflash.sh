@@ -131,6 +131,11 @@ export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 # should accept more drafts per step on prose.
 DRAFT_MODEL=${DRAFT_MODEL:-/path/to/models/z-lab-Qwen3.6-27B-DFlash}
 
+# Drafter ctx window: 512 default strangles acceptance past position ~600
+# (drafter trained on full captured prefix). 2048 measured +11 tok/s on
+# coding-800 (36.5 -> 47.8).
+export ATLAS_DFLASH_CTX_WINDOW="${ATLAS_DFLASH_CTX_WINDOW:-2048}"
+
 exec /path/to/atlas-src/target/release/spark serve \
   --model-from-path /path/to/models/AEON-Q36-27B-Full \
   --model-name aeon-27b-dflash \
@@ -144,7 +149,7 @@ exec /path/to/atlas-src/target/release/spark serve \
   --dflash \
   --draft-model "${DRAFT_MODEL}" \
   --dflash-gamma 16 \
-  --mtp-vocab 32000 \
+  --mtp-vocab "${MTP_VOCAB:-131072}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
   --warmup-prompt /path/to/atlas-src/local/warmup.txt

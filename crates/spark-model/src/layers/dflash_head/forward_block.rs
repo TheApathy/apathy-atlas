@@ -266,6 +266,12 @@ impl BlockDiffusionDraftHead {
                     .ok()
                     .as_deref()
                     == Some("1")
+                // Mirror the tokens-dump gate: defer until position >= N.
+                && position
+                    >= std::env::var("ATLAS_DFLASH_DUMP_MIN_POS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0)
             {
                 // Dump ALL eff_ctx slots — needed to reproduce the
                 // multi-token ctx in PyTorch reference. Layout:
