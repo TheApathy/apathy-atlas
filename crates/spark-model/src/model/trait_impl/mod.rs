@@ -212,6 +212,9 @@ impl Model for TransformerModel {
     fn has_proposer(&self) -> bool {
         self.has_proposer_dispatch()
     }
+    fn proposer_is_dflash(&self) -> bool {
+        self.proposer.as_ref().is_some_and(|p| p.is_dflash())
+    }
     fn has_self_speculative(&self) -> bool {
         self.has_self_speculative_dispatch()
     }

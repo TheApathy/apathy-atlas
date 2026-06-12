@@ -310,6 +310,14 @@ pub trait Model: Send + Sync {
     /// Check if speculative decoding is available (MTP or self-speculative).
     fn has_proposer(&self) -> bool;
 
+    /// True when the installed draft proposer is the DFlash γ-block drafter
+    /// (see [`crate::speculative::DraftProposer::is_dflash`]). DFlash drafts
+    /// bypass the grammar bitmask, so grammar-constrained sequences need the
+    /// scheduler-side gate / verify-side masking keyed off this flag.
+    fn proposer_is_dflash(&self) -> bool {
+        false
+    }
+
     /// Check if self-speculative decoding is enabled.
     fn has_self_speculative(&self) -> bool;
 
