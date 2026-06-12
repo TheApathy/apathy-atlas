@@ -264,6 +264,9 @@ pub struct DflashProposerState {
     /// append to `ctx_hidden_acc` (positions 1..=last_num_accepted for
     /// accepted drafts; position 0 when zero drafts were accepted).
     pub last_num_accepted: usize,
+    /// Host copy of the sequence's committed tokens, refreshed by the
+    /// caller each propose when ATLAS_DFLASH_PLD=1 (prompt-lookup drafts).
+    pub pld_tokens: Vec<u32>,
     /// Whether `propose_drafts` has been called at least once. Used to
     /// skip the post-prefill append on the first call because
     /// `dflash_hidden_save` hasn't been populated yet.
@@ -694,6 +697,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_slot_bytes,
             last_capture_idx: 0,
             last_num_accepted: 0,
+            pld_tokens: Vec::new(),
             first_propose_done: false,
             ctx_fc_cache,
             ctx_k_cache,

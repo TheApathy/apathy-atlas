@@ -319,6 +319,59 @@ impl BlockDiffusionDraftHead {
                 .max((first_pos + num_append).min(dstate.max_ctx_len));
         }
 
+        // ATLAS_DFLASH_PLD=1: prompt-lookup drafting. If the trailing n-gram
+        // (ATLAS_PLD_NGRAM, default 3) recurs earlier in the committed
+        // sequence, draft the gamma tokens that followed that occurrence and
+        // skip the drafter forward entirely. Highly repetitive text (story
+        // names/phrases, code idioms) accepts these at high rates; misses are
+        // rejected by the verifier as usual. Draft count stays gamma so the
+        // K=17 verify path is unchanged. Ctx bookkeeping above already ran.
+        // Precision gates (naive 3-gram PLD regressed coding 53.7->37: short
+        // matches preempt a strong drafter with wrong continuations): only
+        // fire in the weak-drafter regime (previous step accepted <=1, never
+        // true on coding/counting at 8-16 accepts) and require a long suffix
+        // match (8 down to ATLAS_PLD_NGRAM, default 5; longest wins).
+        if std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
+            && dstate.first_propose_done
+            && dstate.last_num_accepted <= 1
+        {
+            let ng_min: usize = std::env::var("ATLAS_PLD_NGRAM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            let need = 16usize;
+            let toks = &dstate.pld_tokens;
+            let l = toks.len();
+            let mut hit: Option<usize> = None;
+            for ng in (ng_min..=8).rev() {
+                if l <= ng + need {
+                    continue;
+                }
+                let mut suffix: Vec<u32> = toks[l - (ng - 1)..].to_vec();
+                suffix.push(last_token);
+                let mut p = l.saturating_sub(ng + 1);
+                loop {
+                    if toks[p..p + ng] == suffix[..] && p + ng + need <= l {
+                        hit = Some(p + ng);
+                        break;
+                    }
+                    if p == 0 {
+                        break;
+                    }
+                    p -= 1;
+                }
+                if hit.is_some() {
+                    break;
+                }
+            }
+            if let Some(cs) = hit {
+                let drafts: Vec<u32> = toks[cs..cs + need].to_vec();
+                dstate.last_num_drafted = drafts.len();
+                dstate.first_propose_done = true;
+                return Ok(drafts);
+            }
+        }
+
         let drafts = self
             .forward_block(last_token, position, ctx, _stream, dstate)
             .map_err(|e| {
