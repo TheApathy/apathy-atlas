@@ -101,6 +101,14 @@ impl TransformerModel {
             .proposer_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
+        if std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
+            && let Some(ds) = prop_state
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+        {
+            ds.pld_tokens.clear();
+            ds.pld_tokens.extend_from_slice(&seq.tokens);
+        }
         proposer.propose(
             token,
             self.mtp_hidden_save,
