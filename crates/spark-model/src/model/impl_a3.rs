@@ -215,7 +215,9 @@ impl TransformerModel {
             // weight read vs the plain kernel's strided ~5×-floor access
             // at M=17 (ATLAS_LM_HEAD_T=1 builds the T-copy at load).
             let nvfp4_t = self.lm_head_nvfp4_t.as_ref().unwrap();
-            ops::w4a16_gemm_n64_m32(
+            // ldb = 64-padded vocab: transpose_for_gemm pads the B-row
+            // stride so cp.async stays 16B-aligned at the odd 248077 vocab.
+            ops::w4a16_gemm_n64_m32_ldb(
                 self.gpu.as_ref(),
                 self.w4a16_gemm_t_m32_n64_kernel,
                 hidden,
@@ -224,6 +226,7 @@ impl TransformerModel {
                 num_tokens,
                 v,
                 h,
+                v.div_ceil(64) * 64,
                 stream,
             )?;
         } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {

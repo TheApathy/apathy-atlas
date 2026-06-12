@@ -1855,7 +1855,12 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64(
     const unsigned char* __restrict__ B_scale,
     const float scale2,
     __nv_bfloat16* __restrict__ C,
-    unsigned int M, unsigned int N, unsigned int K
+    unsigned int M, unsigned int N, unsigned int K,
+    // B-row stride in elements. Equals N for tightly-packed weights; a
+    // 64-padded value for odd-N weights (e.g. the 248077-vocab lm_head)
+    // where a tight stride would break cp.async 16B alignment. C stores
+    // remain guarded by the logical N.
+    unsigned int ldb
 ) {
     constexpr unsigned int M_TILE_S = 32;
     const unsigned int cta_n = blockIdx.x * N_TILE_S3;
@@ -1901,15 +1906,15 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64(
             unsigned int gke = (kb) + (kp << 1); \
             unsigned int gns = cta_n + ns; \
             cp_async_pred_16(&smem_Bp[(buf)][kp][ns], \
-                &B_packed[(unsigned long long)(gke >> 1) * N + gns], \
-                (gke + 1 <= K) && (gns + 15 < N)); \
+                &B_packed[(unsigned long long)(gke >> 1) * ldb + gns], \
+                (gke + 1 <= K) && (gns + 15 < ldb)); \
             if (kp < (K_STEP_T / GROUP_SIZE) * (N_TILE_S3 / 16)) { \
                 unsigned int sg_row = kp >> 2; \
                 unsigned int sg_ns  = (kp & 3) << 4; \
                 unsigned int sg = (kb) / GROUP_SIZE + sg_row; \
                 cp_async_pred_16(&smem_Bs[(buf)][sg_row][sg_ns], \
-                    &B_scale[(unsigned long long)sg * N + cta_n + sg_ns], \
-                    (cta_n + sg_ns + 15 < N)); \
+                    &B_scale[(unsigned long long)sg * ldb + cta_n + sg_ns], \
+                    (cta_n + sg_ns + 15 < ldb)); \
             } \
         } \
     } while(0)

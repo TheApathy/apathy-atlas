@@ -199,6 +199,26 @@ pub fn w4a16_gemm_n64_m32(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    w4a16_gemm_n64_m32_ldb(gpu, kernel, input, weight, output, m, n, k, n, stream)
+}
+
+/// `w4a16_gemm_t_m32_n64` with an explicit B-row stride. `ldb == n` for
+/// tightly-packed T-weights; a 64-padded stride for odd-N weights (the
+/// 248077-vocab lm_head) where a tight row stride breaks cp.async 16B
+/// alignment (CUDA 716).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32_ldb(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldb: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 32), 1])
         .block([128, 1, 1])
@@ -210,6 +230,7 @@ pub fn w4a16_gemm_n64_m32(
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
+        .arg_u32(ldb)
         .launch(stream)
 }
 

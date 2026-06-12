@@ -67,6 +67,7 @@ echo "[serve-aeon-27b-dflash] preflight ok: ${FREE_GB} GB free"
 # DRAFT_CAP=16 explicitly — only useful when running the gdn_wy17_k
 # fused safe path matters more than throughput.
 export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-32}
+export ATLAS_LM_HEAD_T="${ATLAS_LM_HEAD_T:-1}"
 export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-512}
 export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
 
@@ -134,6 +135,7 @@ DRAFT_MODEL=${DRAFT_MODEL:-/path/to/models/z-lab-Qwen3.6-27B-DFlash}
 # Drafter ctx window: 512 default strangles acceptance past position ~600
 # (drafter trained on full captured prefix). 2048 measured +11 tok/s on
 # coding-800 (36.5 -> 47.8).
+export ATLAS_LM_HEAD_T="${ATLAS_LM_HEAD_T:-1}"
 export ATLAS_DFLASH_CTX_WINDOW="${ATLAS_DFLASH_CTX_WINDOW:-2048}"
 
 exec /path/to/atlas-src/target/release/spark serve \
