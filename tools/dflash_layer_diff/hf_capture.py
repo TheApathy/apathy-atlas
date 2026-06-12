@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-MODEL = "/home/flocka/models/Qwen3.6-27B-base"
+MODEL = os.environ.get("HF_CAPTURE_MODEL", "/home/flocka/models/AEON-Q36-27B-BF16-dequant")
 CAPTURE_LAYERS = [1, 16, 31, 46, 61]
 HIDDEN = 5120
 
@@ -130,6 +130,30 @@ def main():
             print(f"  slot{s:2d}: cos={cos:.4f} L2={l2:.2f} L2/HF={ratio:.4f}  "
                   f"atlas[mean={a.mean():.4f} std={a.std():.4f} norm={np.linalg.norm(a):.2f}]  "
                   f"hf[mean={h.mean():.4f} std={h.std():.4f} norm={np.linalg.norm(h):.2f}]")
+
+    def mean_cos(off_a, off_h, slot_a, slot_h):
+        cs = []
+        for s in range(n_compare):
+            sa, sh = s + off_a, s + off_h
+            if not (0 <= sa < n_atlas and 0 <= sh < n):
+                continue
+            a, h = atlas_f[sa, slot_a], hf_f[sh, slot_h]
+            cs.append(float(np.dot(a, h) / (np.linalg.norm(a) * np.linalg.norm(h) + 1e-9)))
+        return sum(cs) / max(len(cs), 1)
+
+    print(f"\n=== Position-offset test (mean cos, atlas[s] vs hf[s+d]) ===")
+    for slot, layer_idx in enumerate(CAPTURE_LAYERS):
+        row = "  ".join(
+            f"d={d:+d}: {mean_cos(0, d, slot, slot):.4f}" for d in (-2, -1, 0, 1, 2)
+        )
+        print(f"  layer {layer_idx:2d}: {row}")
+
+    print(f"\n=== Layer-permutation test (mean cos, atlas slot i vs hf slot j, d=0) ===")
+    hdr = "          " + "  ".join(f"hf:L{l:<2d}" for l in CAPTURE_LAYERS)
+    print(hdr)
+    for i, li in enumerate(CAPTURE_LAYERS):
+        row = "  ".join(f"{mean_cos(0, 0, i, j):.4f}" for j in range(5))
+        print(f"  atlas:L{li:<2d} {row}")
 
 
 if __name__ == "__main__":

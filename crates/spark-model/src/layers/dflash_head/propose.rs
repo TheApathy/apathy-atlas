@@ -279,21 +279,44 @@ impl BlockDiffusionDraftHead {
             // The bonus's hidden is NOT needed in ctx — bonus appears
             // as the first noise embedding (Q-side input).
             let num_append = dstate.last_num_accepted + 1;
-            let available = dstate.max_ctx_len.saturating_sub(dstate.ctx_len);
-            let to_append = num_append.min(available);
+            // dflash_hidden_save rows 0..num_append hold the hiddens of the
+            // tokens at absolute positions (position - num_append)..position.
+            // Write each row at its ABSOLUTE slot rather than appending at
+            // ctx_len: steps that commit tokens without an append (no-spec
+            // fallback when propose yields <4 drafts) otherwise desync the
+            // lockstep counter and shift every later slot — measured as a
+            // constant d=+2 ctx misalignment on prose that collapsed accept
+            // from 1.38 to 0.31 per block (probe_states_ab.py, 2026-06-12).
+            // A skipped step now costs one stale slot, not a permanent shift.
+            let first_pos = position.saturating_sub(num_append);
+            if dstate.ctx_len != first_pos {
+                tracing::warn!(
+                    "DFlash ctx drift: ctx_len={} expected {} (position={}, num_append={}) — realigning by absolute slot",
+                    dstate.ctx_len,
+                    first_pos,
+                    position,
+                    num_append,
+                );
+            }
             tracing::info!(
-                "DFlash propose append: last_num_accepted={} num_append={} to_append={} ctx_len_before={}",
+                "DFlash propose append: last_num_accepted={} num_append={} first_pos={} ctx_len_before={}",
                 dstate.last_num_accepted,
                 num_append,
-                to_append,
+                first_pos,
                 dstate.ctx_len,
             );
-            for i in 0..to_append {
+            for i in 0..num_append {
+                let slot = first_pos + i;
+                if slot >= dstate.max_ctx_len {
+                    break; // accumulator full; drop later positions
+                }
                 let src = base.offset(i * dstate.ctx_slot_bytes);
-                let dst = dstate.ctx_hidden_acc.offset(dstate.ctx_len * dstate.ctx_slot_bytes);
+                let dst = dstate.ctx_hidden_acc.offset(slot * dstate.ctx_slot_bytes);
                 ctx.gpu.copy_d2d_async(src, dst, dstate.ctx_slot_bytes, _stream)?;
-                dstate.ctx_len += 1;
             }
+            dstate.ctx_len = dstate
+                .ctx_len
+                .max((first_pos + num_append).min(dstate.max_ctx_len));
         }
 
         let drafts = self

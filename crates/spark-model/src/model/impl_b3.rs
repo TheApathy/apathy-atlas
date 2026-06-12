@@ -50,6 +50,13 @@ impl TransformerModel {
                 .ok()
                 .as_deref()
                 == Some("1")
+            // ATLAS_DFLASH_DUMP_MIN_POS=N defers the one-shot dump until the
+            // first propose at position >= N (mid-generation ctx capture).
+            && position
+                >= std::env::var("ATLAS_DFLASH_DUMP_MIN_POS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0)
         {
             let tokens_json = serde_json::json!({
                 "prompt_len": position - seq.tokens.len() + seq.tokens.len(),
