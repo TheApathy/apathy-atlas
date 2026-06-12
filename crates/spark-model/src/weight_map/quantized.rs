@@ -52,32 +52,38 @@ impl QuantizedWeight {
     ) -> Result<QuantizedWeight> {
         const GROUP_SIZE: usize = 16;
         let half_k = k / 2;
+        // Row stride padded to 64 so odd-N weights (248077-vocab lm_head)
+        // keep cp.async 16B alignment in w4a16_gemm_t_m32_n64. Tail columns
+        // are zero; the kernel's C stores are guarded by the logical N.
+        // For N already divisible by 64 (all FFN/attention weights) this is
+        // identical to the previous tight layout.
+        let n_pad = n.div_ceil(64) * 64;
 
-        // Transpose B_packed: [N, K/2] → [K/2, N] into a NEW GPU allocation.
+        // Transpose B_packed: [N, K/2] → [K/2, N_pad] into a NEW GPU allocation.
         let packed_size = n * half_k;
         let mut buf = vec![0u8; packed_size];
         gpu.copy_d2h(self.weight, &mut buf)?;
-        let mut t_buf = vec![0u8; packed_size];
+        let mut t_buf = vec![0u8; half_k * n_pad];
         for i in 0..n {
             for j in 0..half_k {
-                t_buf[j * n + i] = buf[i * half_k + j];
+                t_buf[j * n_pad + i] = buf[i * half_k + j];
             }
         }
-        let new_weight = gpu.alloc(packed_size)?;
+        let new_weight = gpu.alloc(t_buf.len())?;
         gpu.copy_h2d(&t_buf, new_weight)?;
 
-        // Transpose B_scale: [N, K/GROUP_SIZE] → [K/GROUP_SIZE, N] into a NEW allocation.
+        // Transpose B_scale: [N, K/GROUP_SIZE] → [K/GROUP_SIZE, N_pad].
         let num_groups = k / GROUP_SIZE;
         let scale_size = n * num_groups;
         let mut sbuf = vec![0u8; scale_size];
         gpu.copy_d2h(self.weight_scale, &mut sbuf)?;
-        let mut st_buf = vec![0u8; scale_size];
+        let mut st_buf = vec![0u8; num_groups * n_pad];
         for i in 0..n {
             for j in 0..num_groups {
-                st_buf[j * n + i] = sbuf[i * num_groups + j];
+                st_buf[j * n_pad + i] = sbuf[i * num_groups + j];
             }
         }
-        let new_scale = gpu.alloc(scale_size)?;
+        let new_scale = gpu.alloc(st_buf.len())?;
         gpu.copy_h2d(&st_buf, new_scale)?;
 
         Ok(QuantizedWeight {
