@@ -315,7 +315,13 @@ impl Qwen3SsmLayer {
         };
         let __gdn_path: &'static str;
 
-        if std::env::var("ATLAS_GDN_PREFILL_TUNED").ok().as_deref() == Some("1")
+        // wy32 (32 tokens/WY iteration) is the default GDN prefill kernel when
+        // available — matches the two-phase `prefill_gdn_full` path (see
+        // trait_prefill_gdn.rs:100, which already prefers wy32 unconditionally
+        // for total>32). A/B-validated on AEON-Q36-27B: ~3.0 ms/layer vs ~6.3
+        // ms/layer on wy4 (2.1×), 510-tok prefill 840→674 ms, output coherent.
+        // Opt out with ATLAS_GDN_PREFILL_TUNED=0 to fall back to wy4.
+        if std::env::var("ATLAS_GDN_PREFILL_TUNED").ok().as_deref() != Some("0")
             && self.gdn_prefill_wy32_k.0 != 0
             && k > 32
         {
