@@ -336,7 +336,13 @@ pub fn mtp_k2_batch_cseq_enabled() -> bool {
 /// until A/B-validated. Cached via `OnceLock`.
 pub fn prefill_ffn_fast_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() == Some("1"))
+    // Default ON (opt-out via ATLAS_PREFILL_FFN_FAST=0). A/B-validated on
+    // AEON-Q36-27B (qwen3.6-27b target): the M_TILE=128 transposed-weight
+    // path runs the dense FFN prefill GEMM at ~5.4 ms/layer vs ~41.8 ms/layer
+    // on the M_TILE=64 baseline (7.7×), cutting 510-tok prefill 3166→840 ms
+    // (161→607 tok/s) with no output-coherence change. Memory cost of the
+    // transposed weights is ~150 MB total. Honors an explicit "0" to disable.
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() != Some("0"))
 }
 
 /// Returns true when `ATLAS_FFN_PREDEQUANT_FP8=1` is set in the process env.
@@ -430,7 +436,13 @@ pub fn prefill_ffn_m128_v2_enabled() -> bool {
 /// path stays the baseline. Cached via `OnceLock`.
 pub fn ffn_m16_transposed_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_M16_TRANSPOSED").ok().as_deref() == Some("1"))
+    // Default ON (opt-out via ATLAS_FFN_M16_TRANSPOSED=0). The transposed
+    // NVFP4 FFN weights (~150 MB total) are the prerequisite for the
+    // default-on `prefill_ffn_fast_enabled` M_TILE=128 prefill path AND the
+    // M_TILE=16 verify path. Building them unconditionally removes the
+    // foot-gun where the fast prefill gate is on but silently falls back to
+    // the M_TILE=64 baseline because the transposed copies were never built.
+    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_M16_TRANSPOSED").ok().as_deref() != Some("0"))
 }
 
 /// Returns true when `ATLAS_DFLASH_FFN_KGAMMA=1` is set in the process env.
