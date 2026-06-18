@@ -118,6 +118,11 @@ export ATLAS_ATTN_QKV_BATCHED=${ATLAS_ATTN_QKV_BATCHED:-1}
 # 74.3/51.6/21.0).
 export ATLAS_FFN_KGAMMA_M128=${ATLAS_FFN_KGAMMA_M128:-1}
 export ATLAS_DFLASH_FFN_KGAMMA=${ATLAS_DFLASH_FFN_KGAMMA:-1}
+# 2026-06-11 records-grade: also route the drafter's attention projections
+# (q/k/v/o, 7 GEMM sites) through the transposed m32_n64 kernel by building
+# drafter T-weights at load. Cuts propose; with the nvfp4 drafter fix this
+# restores counting to records parity (65->74.4). Token-exact (drafter-only).
+export ATLAS_DFLASH_ATTN_KGAMMA=${ATLAS_DFLASH_ATTN_KGAMMA:-1}
 
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
@@ -152,7 +157,7 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --dflash \
   --draft-model "${DRAFT_MODEL}" \
   --dflash-gamma 16 \
-  --mtp-vocab "${MTP_VOCAB:-131072}" \
+  --mtp-vocab "${MTP_VOCAB:-32000}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
   --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
