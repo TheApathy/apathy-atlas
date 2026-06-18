@@ -66,10 +66,17 @@ echo "[serve-aeon-27b-dflash] preflight ok: ${FREE_GB} GB free"
 # γ=16 (original published default) is preserved by setting
 # DRAFT_CAP=16 explicitly — only useful when running the gdn_wy17_k
 # fused safe path matters more than throughput.
-export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-32}
+export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-16}
 export ATLAS_LM_HEAD_T="${ATLAS_LM_HEAD_T:-1}"
 export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-2048}
-export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-bf16}
+# 2026-06-17: default MUST be nvfp4. With bf16 every drafter projection runs
+# ops::dense_gemm over all n_attn = eff_ctx(≤CTX_WINDOW) + γ rows — propose
+# scaled to ~1.75s/step at seq 800 (counting 13 tok/s, coding TIMEOUT).
+# nvfp4 routes the same projections through w4a16_gemm (the target's kernel):
+# propose 1751→48ms, step 1910→206ms, counting 13.1→64.9, coding TIMEOUT→16.8,
+# prose ~2→10.9. Token-exact (verify is the source of truth; drafter quant only
+# affects acceptance, never committed greedy tokens).
+export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-nvfp4}
 
 # 2026-06-10: batched K=γ FFN. KPROF showed the K=17 verify spending
 # 760ms/step (of 900ms total) in ssm_ffn_per_token_loop_n17 +
@@ -139,7 +146,7 @@ exec /path/to/atlas-src/target/release/spark serve \
   --kernel-target qwen3.6-27b \
   --gpu-memory-utilization 0.65 \
   --kv-cache-dtype "${KV_DTYPE:-fp8}" \
-  --max-seq-len 8192 \
+  --max-seq-len ${MAX_SEQ_LEN:-8192} \
   --max-batch-size 1 \
   --max-num-seqs 1 \
   --dflash \
