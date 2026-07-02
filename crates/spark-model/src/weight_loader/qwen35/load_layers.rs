@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 mod attention_arms;
+mod attn_sliding_window;
 mod linear_attn_arms;
 mod tq_plus_weight_rotation;
 
@@ -306,6 +307,12 @@ pub(super) fn load_layers(
                     );
                 } else {
                     tracing::info!("Layer {i}: FP8 weights transposed for fast prefill");
+                }
+
+                // Lever 5: opt-in sliding-window cap on full-attention layers
+                // (ATLAS_ATTN_SLIDING_WINDOW). Default None = global attention.
+                if let Some(w) = attn_sliding_window::sliding_window_override() {
+                    layer.set_sliding_window(Some(w));
                 }
 
                 layers.push(Box::new(layer));

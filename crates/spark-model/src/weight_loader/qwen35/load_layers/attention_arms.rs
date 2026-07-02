@@ -210,5 +210,12 @@ pub(super) fn build_full_attention_nvfp4(
     }
     layer.predequant_for_prefill(gpu, config, stream)?;
 
+    // Lever 5: opt-in sliding-window cap on full-attention layers
+    // (ATLAS_ATTN_SLIDING_WINDOW). Default None = global attention →
+    // byte-identical to the un-gated build.
+    if let Some(w) = super::attn_sliding_window::sliding_window_override() {
+        layer.set_sliding_window(Some(w));
+    }
+
     Ok(Box::new(layer))
 }
