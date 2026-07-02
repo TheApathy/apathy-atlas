@@ -129,6 +129,21 @@ pub struct DenseFfnLayer {
     /// single B read (one 32-row M-tile) × 272 CTAs (N_TILE=64).
     /// Loaded via `try_kernel`; 0 falls back to m128/m16.
     w4a16_gemm_t_m32_n64: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64_splitk` — split-K variant of the above for
+    /// the DFlash K=17 verify `down_proj` ([M=17,N=5120,K=16384]). The
+    /// single-slice kernel fields only 80 CTAs (N=5120/64) and is
+    /// occupancy-starved on the long K=16384 loop (~91 GB/s vs gate/up's
+    /// ~163). Split-K multiplies CTAs by k_splits into an FP32 workspace,
+    /// then `reduce_splitk_f32_to_bf16` sums + downcasts. Gated by
+    /// `ATLAS_FFN_DOWN_SPLITK` (default 4; 0/1 disables). Loaded via
+    /// `try_kernel` — handle 0 keeps the single-slice m32_n64 path.
+    w4a16_gemm_t_m32_n64_splitk: KernelHandle,
+    /// `reduce_splitk_f32_to_bf16` — companion reduce kernel for the
+    /// split-K down_proj. Sums the k_splits FP32 partial bands → BF16.
+    reduce_splitk_k: KernelHandle,
+    /// Lazily-allocated FP32 split-K workspace [k_splits, M, N].
+    /// `Mutex` because `forward_kgamma` takes `&self`.
+    splitk_workspace: Mutex<Option<DevicePtr>>,
     /// `w4a16_gemm_t_m128_v2` — 8-warp (blockDim 256) shadow of
     /// `w4a16_gemm_t_m128`. Same 2-stage cp.async pipeline + same SMEM
     /// footprint (~29.8KB → 3 CTAs/SM), but parallelizes chunk 0 and
@@ -236,6 +251,15 @@ impl DenseFfnLayer {
             // `ATLAS_PREFILL_FFN_FAST` fast path silently.
             w4a16_gemm_t_m128: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             w4a16_gemm_t_m32_n64: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
+            // Optional split-K down_proj variant + reduce. Handle 0 keeps
+            // the single-slice m32_n64 path (ATLAS_FFN_DOWN_SPLITK).
+            w4a16_gemm_t_m32_n64_splitk: super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_splitk",
+            ),
+            reduce_splitk_k: super::try_kernel(gpu, "w4a16", "reduce_splitk_f32_to_bf16"),
+            splitk_workspace: Mutex::new(None),
             // Optional 8-warp shadow of the M=128 kernel. Handle 0
             // disables `ATLAS_FFN_M128_V2` silently.
             w4a16_gemm_t_m128_v2: super::try_kernel(gpu, "w4a16_v2", "w4a16_gemm_t_m128_v2"),
@@ -410,6 +434,36 @@ impl DenseFfnLayer {
         self.gate_proj_t = Some(gate_proj_t);
         self.up_proj_t = Some(up_proj_t);
         self.down_proj_t = Some(down_proj_t);
+    }
+
+    /// Eagerly allocate the FP32 split-K workspace for the down_proj
+    /// (`[k_splits, 32, n]` where n = hidden, M padded to the M_TILE=32
+    /// of the split-K kernel). Called at load time (pre-graph-capture)
+    /// because `gpu.alloc` is illegal during CUDA graph capture. No-op
+    /// when split-K is disabled or the kernel symbols are missing.
+    pub fn alloc_splitk_workspace(&self, gpu: &dyn GpuBackend, n: u32) -> Result<()> {
+        // `n` is the largest split-K output dim this layer might use. The
+        // down_proj path needs N=hidden; the gate/up path (when
+        // `ATLAS_FFN_GATEUP_SPLITK` is on) needs N=intermediate. Callers pass
+        // `max(hidden, intermediate)` so ONE FP32 workspace serves both.
+        // gate and up run back-to-back on the same stream and each fully
+        // reduces into its own output before the next partial phase, so they
+        // can safely share this scratch.
+        let down_splits = crate::layers::ffn_down_splitk();
+        let gateup_splits = crate::layers::ffn_gateup_splitk();
+        if (down_splits == 0 && gateup_splits == 0)
+            || self.w4a16_gemm_t_m32_n64_splitk.0 == 0
+            || self.reduce_splitk_k.0 == 0
+        {
+            return Ok(());
+        }
+        let mut slot = self.splitk_workspace.lock().unwrap();
+        if slot.is_none() {
+            // 8 = max split clamp; 32 = M_TILE of the split-K kernel.
+            let bytes = 8usize * 32 * n as usize * 4;
+            *slot = Some(gpu.alloc(bytes)?);
+        }
+        Ok(())
     }
 
     /// Whether the M_TILE=16 transposed-weight path is wired up.
@@ -889,8 +943,39 @@ impl DenseFfnLayer {
             && std::env::var("ATLAS_FFN_KGAMMA_M32").ok().as_deref() != Some("0");
 
         // gate_proj GEMM: [n, H] → [n, inter]
+        // Split-K [M=n, N=inter, K=h] when ATLAS_FFN_GATEUP_SPLITK is set —
+        // slices K across gridDim.z into the shared FP32 workspace (lossless,
+        // token-exact). Falls through to the single-slice m32_n64 path below.
+        let gateup_splitk = crate::layers::ffn_gateup_splitk();
+        let gateup_ws = if gateup_splitk > 0 {
+            *self.splitk_workspace.lock().unwrap()
+        } else {
+            None
+        };
+        let gateup_splitk_ok = m32_path
+            && gateup_splitk > 0
+            && self.w4a16_gemm_t_m32_n64_splitk.0 != 0
+            && self.reduce_splitk_k.0 != 0
+            && gateup_ws.is_some();
         crate::kprof!(ctx.gpu, stream, "ffn_gate_kgamma", {
-            if m32_path {
+            if gateup_splitk_ok {
+                let gt = self.gate_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n64_m32_splitk(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk,
+                    self.reduce_splitk_k,
+                    input,
+                    gt,
+                    gate_out,
+                    gateup_ws.unwrap(),
+                    n,
+                    inter,
+                    h,
+                    inter, // ldb == N for tightly-packed T-weight
+                    gateup_splitk,
+                    stream,
+                )?;
+            } else if m32_path {
                 let gt = self.gate_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n64_m32(
                     ctx.gpu,
@@ -945,9 +1030,27 @@ impl DenseFfnLayer {
             anyhow::Result::<()>::Ok(())
         })?;
 
-        // up_proj GEMM: [n, H] → [n, inter]
+        // up_proj GEMM: [n, H] → [n, inter]. Same split-K treatment as gate;
+        // reuses the shared workspace (gate's reduce already consumed it).
         crate::kprof!(ctx.gpu, stream, "ffn_up_kgamma", {
-            if m32_path {
+            if gateup_splitk_ok {
+                let ut = self.up_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n64_m32_splitk(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk,
+                    self.reduce_splitk_k,
+                    input,
+                    ut,
+                    up_out,
+                    gateup_ws.unwrap(),
+                    n,
+                    inter,
+                    h,
+                    inter, // ldb == N for tightly-packed T-weight
+                    gateup_splitk,
+                    stream,
+                )?;
+            } else if m32_path {
                 let ut = self.up_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n64_m32(
                     ctx.gpu,
@@ -1019,7 +1122,39 @@ impl DenseFfnLayer {
         // down_proj GEMM: [n, inter] → [n, H]
         let output = ctx.buffers.moe_output();
         crate::kprof!(ctx.gpu, stream, "ffn_down_kgamma", {
-            if m32_path {
+            // Split-K down_proj: [M=n, N=h, K=inter]. The single-slice
+            // m32_n64 kernel is occupancy-starved here (N=h=5120 → 80 CTAs
+            // vs gate/up's 256 at N=inter=16384) and grinds a long K-loop.
+            // Split-K multiplies CTAs by `splits` into an FP32 workspace,
+            // then reduces → BF16. Gated by ATLAS_FFN_DOWN_SPLITK; falls
+            // through to the single-slice path when disabled or unallocated.
+            let splitk = crate::layers::ffn_down_splitk();
+            let ws = if splitk > 0 {
+                *self.splitk_workspace.lock().unwrap()
+            } else {
+                None
+            };
+            if let (true, Some(ws)) = (m32_path && splitk > 0
+                && self.w4a16_gemm_t_m32_n64_splitk.0 != 0
+                && self.reduce_splitk_k.0 != 0, ws)
+            {
+                let dt = self.down_proj_t.as_ref().unwrap();
+                ops::w4a16_gemm_n64_m32_splitk(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk,
+                    self.reduce_splitk_k,
+                    gate_out,
+                    dt,
+                    output,
+                    ws,
+                    n,
+                    h,
+                    inter,
+                    h, // ldb == N for tightly-packed T-weight
+                    splitk,
+                    stream,
+                )?;
+            } else if m32_path {
                 let dt = self.down_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n64_m32(
                     ctx.gpu,

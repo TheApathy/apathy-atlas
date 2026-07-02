@@ -234,6 +234,64 @@ pub fn w4a16_gemm_n64_m32_ldb(
         .launch(stream)
 }
 
+/// Split-K W4A16 GEMM for the `w4a16_gemm_t_m32_n64` kernel family.
+///
+/// The DFlash K=17 verify FFN `down_proj` is [M=17, N=5120, K=16384].
+/// The single-slice m32_n64 kernel fields only ceil(5120/64)=80 CTAs
+/// (vs gate/up's 256 at N=16384) and grinds a 512-iteration K-loop, so
+/// it is occupancy-starved — measured ~91 GB/s vs gate/up ~163 GB/s on
+/// the same-size weight. Splitting K by `k_splits` multiplies the CTA
+/// count (80→320 at k_splits=4) and restores occupancy. Partial
+/// products accumulate into an FP32 `workspace` of
+/// `k_splits * M * N * 4` bytes, then `reduce_splitk_f32_to_bf16` sums
+/// the slices and writes BF16 — lossless (FP32 partials).
+///
+/// `ldb` is the B-row stride (== n for tightly-packed T-weights).
+/// Partial grid: (ceil(N/64), ceil(M/32), k_splits)  Block (128,1,1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32_splitk(
+    gpu: &dyn GpuBackend,
+    partial_kernel: KernelHandle,
+    reduce_kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    workspace: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldb: u32,
+    k_splits: u32,
+    stream: u64,
+) -> Result<()> {
+    // Phase 1: per-slice partial products → FP32 workspace [k_splits, M, N].
+    KernelLaunch::new(gpu, partial_kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 32), k_splits])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(workspace)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(ldb)
+        .arg_u32(k_splits)
+        .launch(stream)?;
+    // Phase 2: reduce the k_splits FP32 bands → BF16 [M, N].
+    let total = m * n;
+    KernelLaunch::new(gpu, reduce_kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(workspace)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k_splits)
+        .launch(stream)
+}
+
 /// W4A16 GEMM with M_TILE=16 + N_TILE=64: K=3 MTP verify variant.
 ///
 /// Same FP8 MMA pipeline as `w4a16_gemm_n128_m16` but with the N tile
