@@ -69,6 +69,26 @@ pub fn step_decode_only(
         }
     };
 
+    // THINKING-PHASE DFlash ctx capture (default-OFF, gated inside the model
+    // by ATLAS_DFLASH_CAPTURE_THINKING). The plain-decode path above ran the
+    // model's per-layer `try_dflash_capture` hook (landing the just-decoded
+    // token's 5 target-layer hiddens in `dflash_hidden_save[0]`), but the
+    // DFlash propose/verify append that normally moves that row into
+    // `ctx_hidden_acc` only runs in the answer phase. Without this call the
+    // ctx slots spanning the `<think>` span stay ZERO, so the answer-phase
+    // drafter attends over hundreds of zero-norm keys.
+    //
+    // Restricted to single-sequence in-thinking decode: `dflash_hidden_save`
+    // only holds one row, and the n>=2 batched decode path does not run the
+    // per-seq capture hook anyway. Drafter-conditioning only — the model's
+    // method is a no-op unless the flag is set and a DFlash proposer state is
+    // present, so this is free on the production default-off path.
+    if active.len() == 1 && active[0].inside_thinking {
+        if let Err(e) = model.dflash_capture_thinking(&mut active[0].seq, 0) {
+            tracing::warn!("dflash_capture_thinking: {e:#}");
+        }
+    }
+
     process_decode_logits(
         model,
         active,

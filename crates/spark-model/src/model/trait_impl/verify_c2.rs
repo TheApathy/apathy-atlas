@@ -270,8 +270,10 @@ impl TransformerModel {
             // LM head for 4 tokens
             self.lm_head_batched(normed, k as u32, stream)?;
 
-            // Argmax inside graph
-            let vocab = self.config.vocab_size;
+            // Argmax inside graph. Use the verify-side (possibly truncated)
+            // vocab so the per-row logits stride AND the argmax range match
+            // what `lm_head_batched` wrote — full vocab when truncation off.
+            let vocab = self.verify_lmhead_vocab() as usize;
             let argmax_out = self.buffers.scratch();
             for t in 0..k {
                 let logits_t = self.buffers.logits().offset(t * vocab * bf16);

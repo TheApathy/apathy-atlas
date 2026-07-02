@@ -184,11 +184,16 @@ impl TransformerModel {
             tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs (MTP verify)");
         }
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
+        // ATLAS_MOE_OVERLAP=1: force eager so the per-step D2H overlap probe in
+        // forward_k2 is legal (illegal under graph capture). Measurement-only.
+        let moe_overlap_probe =
+            std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
         let use_graphs = self.comm.is_none()
             && !suppress_graphs
             // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is
             // illegal under CUDA graph capture.
-            && !hss_engaged;
+            && !hss_engaged
+            && !moe_overlap_probe;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -232,8 +237,21 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // ATLAS_MOE_OVERLAP probe: coarse per-layer-type wall accumulators
+            // (eager-only — `moe_overlap_probe` forced use_graphs=false). Lets
+            // us split the K=2 verify cost into attn vs SSM(+MoE) vs head.
+            let mut attn_ns: u64 = 0;
+            let mut ssm_ns: u64 = 0;
+            let probe = moe_overlap_probe;
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
+                let __lt0 = if probe {
+                    self.gpu.synchronize(stream)?;
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -301,6 +319,15 @@ impl TransformerModel {
                         stream,
                     )?;
                 }
+                if let Some(t0) = __lt0 {
+                    self.gpu.synchronize(stream)?;
+                    let dt = t0.elapsed().as_nanos() as u64;
+                    if layer_type == LayerType::FullAttention {
+                        attn_ns += dt;
+                    } else {
+                        ssm_ns += dt;
+                    }
+                }
                 // DFlash hidden capture for ctx conditioning. Save ALL k
                 // tokens so the scheduler can pick the correct one
                 // (num_accepted) after verify. Layout:
@@ -308,6 +335,15 @@ impl TransformerModel {
                 for t in 0..k {
                     self.try_dflash_capture(layer_idx, t, stream)?;
                 }
+            }
+
+            if probe && seq.seq_len.is_multiple_of(50) {
+                tracing::info!(
+                    "VERIFY_PHASE attn_layers_us={} ssm+moe_layers_us={} seq_len={}",
+                    attn_ns / 1000,
+                    ssm_ns / 1000,
+                    seq.seq_len
+                );
             }
 
             // Final norm [2, H]
@@ -327,8 +363,12 @@ impl TransformerModel {
             // LM head for 2 tokens (GEMM: weights loaded once)
             self.lm_head_batched(normed, k as u32, stream)?;
 
-            // Argmax inside graph (fixed scratch addresses — graph-safe)
-            let vocab = self.config.vocab_size;
+            // Argmax inside graph (fixed scratch addresses — graph-safe).
+            // Use the verify-side (possibly truncated) vocab so the per-row
+            // logits stride AND the argmax range match exactly what
+            // `lm_head_batched` wrote — `verify_lmhead_vocab()` returns the
+            // full vocab when `ATLAS_TARGET_LMHEAD_VOCAB` truncation is off.
+            let vocab = self.verify_lmhead_vocab() as usize;
             let argmax_out = self.buffers.scratch();
             for t in 0..k {
                 let logits_t = self.buffers.logits().offset(t * vocab * bf16);

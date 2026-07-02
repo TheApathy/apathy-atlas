@@ -164,4 +164,26 @@ impl TransformerModel {
         }
         Ok(())
     }
+
+    /// FIX 1 (ATLAS_DFLASH_TREE_COMMIT): stamp the accepted-path compact
+    /// indices onto the DFlash proposer state so the next propose's ctx-hidden
+    /// append reads the scattered (fork) capture rows instead of the
+    /// contiguous prefix. Must be called AFTER `trim_proposer_state`
+    /// (`after_verify` clears the path). No-op for non-DFlash proposers.
+    pub(super) fn set_dflash_accepted_compact_dispatch(
+        &self,
+        seq: &mut SequenceState,
+        accepted_compact: &[usize],
+    ) {
+        let Some(ref mut state) = seq.proposer_state else {
+            return;
+        };
+        if let Some(ds) = state
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        {
+            ds.last_accepted_compact.clear();
+            ds.last_accepted_compact.extend_from_slice(accepted_compact);
+        }
+    }
 }

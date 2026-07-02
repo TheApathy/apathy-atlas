@@ -67,3 +67,26 @@ pub fn conc_hsd_enabled() -> bool {
             .is_some_and(|v| v == "1" || v == "true")
     })
 }
+
+/// `ATLAS_DFLASH_CAPTURE_THINKING=1` or `=true`, cached. Default-OFF.
+///
+/// When set, the thinking-phase plain-decode path (which bypasses the
+/// DFlash propose/verify cycle, so its per-token target-hidden capture in
+/// `dflash_hidden_save[0]` is normally never appended to `ctx_hidden_acc`)
+/// ALSO appends each thinking token's captured 5-layer target hidden into
+/// the per-seq `ctx_hidden_acc` accumulator at its absolute slot. This
+/// fills the otherwise-ZERO ctx region spanning the thinking span so that,
+/// when the answer phase begins, the DFlash drafter conditions on REAL
+/// reasoning-context hidden states instead of zero-norm keys.
+///
+/// Drafter-conditioning only — target verify is unchanged, so committed
+/// tokens stay byte-identical (raises acceptance, not output).
+#[inline]
+pub fn dflash_capture_thinking_enabled() -> bool {
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_CAPTURE_THINKING")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "true")
+    })
+}

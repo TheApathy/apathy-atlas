@@ -86,7 +86,18 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         // token at every kernel slot.
         let payload = a.pending_tree_payload.as_ref().expect("checked above");
         let tree_len = payload.tree_token_ids.len();
-        for i in 0..drafts.len() {
+        // Verify width = the FULL tree. When the DDTree budget exceeds γ the
+        // tree has MORE nodes than `drafts` (wide branching: top-k siblings
+        // expanded per depth), so the verifier must process all `tree_len`
+        // nodes — not just `drafts.len()`. Truncating to γ would feed nodes
+        // whose `parent_indices` reference siblings beyond the verified set,
+        // corrupting the tree topology (observed: counting non-lossless +
+        // accept collapse). When the tree is NARROWER than γ (budget < γ),
+        // chain-pad the tail with the linear top-1 `drafts` so verify still
+        // covers γ depths (verify_d.rs pads parent_ids with linear-chain
+        // links for indices >= tree_len, matching this padding).
+        let verify_len = tree_len.max(drafts.len());
+        for i in 0..verify_len {
             let tok = if i < tree_len {
                 payload.tree_token_ids[i]
             } else {
@@ -196,11 +207,22 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         None
     };
 
+    // FIX 1 — Tree-path commit (ATLAS_DFLASH_TREE_COMMIT=1, default off).
+    // When active for a tree payload, the greedy walk commits the WHOLE
+    // accepted path (incl. a sibling-fork tail), not just the contiguous flat
+    // prefix. `tree_accepted_path` carries the (possibly non-contiguous)
+    // compact-index path + the bonus row so the emit + KV-compaction below
+    // can lay tokens/KV correctly. `None` on every flat-chain / non-tree path
+    // → legacy contiguous behavior unchanged.
+    let tree_commit_enabled =
+        std::env::var("ATLAS_DFLASH_TREE_COMMIT").ok().as_deref() == Some("1");
+    let mut tree_accepted_path: Option<(Vec<usize>, usize)> = None;
     let (num_accepted, tree_last_inter_slot) = if let Some((n, _)) = grammar_accept {
         (n, None)
     } else if let Some(payload) = a.pending_tree_payload.as_ref() {
         use spark_model::layers::dflash_head::ddtree::{
-            greedy_sample_ddtree, last_accepted_inter_slot, DDTreeRequestRuntime,
+            greedy_sample_ddtree, greedy_sample_ddtree_full, last_accepted_inter_slot,
+            DDTreeRequestRuntime,
         };
         let req = DDTreeRequestRuntime {
             req_id: String::new(),
@@ -220,14 +242,69 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
             a.resize(expected_rows, *verified.last().unwrap_or(&0));
             a
         };
-        match greedy_sample_ddtree(&req, &argmax) {
+        // ── ATLAS_DDTREE_CEILING_LOG=1: branch-headroom measurement ──
+        // Counterfactual: on ANY run (incl. the lossless flat-safe path),
+        // compute what the FULL tree walk would accept vs the flat (top-1
+        // chain) prefix. tree_depth > flat_depth means a sibling branch
+        // matched the target argmax where the top-1 chain diverged — i.e.
+        // real branch headroom. This is pure observation (nothing committed),
+        // so downstream state stays clean and the numbers are uncontaminated
+        // by the fork-commit bug. The gap is the ceiling on branching gain.
+        if std::env::var("ATLAS_DDTREE_CEILING_LOG").ok().as_deref() == Some("1") {
+            let full = greedy_sample_ddtree_full(&req, &argmax)
+                .map(|s| s.accepted_compact_indices.len())
+                .unwrap_or(0);
+            // Flat (top-1 chain) depth: contiguous prefix of the full walk.
+            let flat = greedy_sample_ddtree(&req, &argmax)
+                .map(|s| s.accepted_compact_indices.len())
+                .unwrap_or(0);
+            // RETRIEVAL ceiling: the target's argmax at the FIRST divergence
+            // (row `flat`, i.e. where the top-1 chain stopped). Is that token
+            // present in recent generated context? If so, a retrieval / n-gram
+            // sibling (Graft, arXiv 2605.20104) could supply it where the
+            // diffusion drafter's marginals can't. Measures the repetitive-
+            // span headroom that diffusion branching alone (branch_gain) misses.
+            let div_tok = argmax.get(flat).copied();
+            let retr_hit = match div_tok {
+                Some(t) => {
+                    let toks = &a.seq.tokens;
+                    let lo = toks.len().saturating_sub(1024);
+                    toks[lo..].contains(&t)
+                }
+                None => false,
+            };
+            tracing::info!(
+                "DDTREE_CEILING: flat_depth={flat} tree_depth={full} branch_gain={} \
+                 retr_hit={} tree_nodes={}",
+                full as i64 - flat as i64,
+                retr_hit as u8,
+                req.tree_token_ids.len(),
+            );
+        }
+        // FIX 1: full-path sampler when tree-commit is enabled, else the
+        // legacy flat-safe sampler.
+        let sample_res = if tree_commit_enabled {
+            greedy_sample_ddtree_full(&req, &argmax)
+        } else {
+            greedy_sample_ddtree(&req, &argmax)
+        };
+        match sample_res {
             Ok(sample) => {
                 let n = sample.accepted_compact_indices.len();
-                // M4B-prep: derive the kernel-frame slot from the actual
-                // compact indices, NOT from `n - 1`. In chain-only mode
-                // these are equal; once branch-mode adapter lands they
-                // may diverge (e.g. [1, 4, 7] → slot 7, not 2).
+                // Derive the kernel-frame slot from the actual compact
+                // indices, NOT from `n - 1`. In chain-only mode these are
+                // equal; for a fork-crossing path they diverge
+                // (e.g. [1, 2, 7] → slot 7, not 2).
                 let slot = last_accepted_inter_slot(&sample.accepted_compact_indices);
+                // Record the sparse path for the emit + KV-compaction below.
+                // The bonus row is the compact tip the walk ended at
+                // (== last accepted compact index, or 0 if nothing accepted).
+                if tree_commit_enabled {
+                    let bonus_row =
+                        sample.accepted_compact_indices.last().copied().unwrap_or(0);
+                    tree_accepted_path =
+                        Some((sample.accepted_compact_indices.clone(), bonus_row));
+                }
                 (n, Some(slot))
             }
             Err(e) => {
@@ -252,26 +329,38 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
             }
         }
     } else {
-        // Typical acceptance (ATLAS_DFLASH_TYPICAL_ACCEPT, temp > 0, no
-        // active grammar): probabilistic accept test over the target's
-        // verify logits at would-be-mismatch positions. `None` ⇒ inactive
-        // for this request ⇒ legacy exact-match prefix below.
-        let n = match dflash_typical_accept(model, a, drafts, &verified) {
+        // Relaxed acceptance (ATLAS_DFLASH_RELAX_ACCEPT=1, default off,
+        // works at temp0 AND temp>0): accept a near-miss DRAFT token (and
+        // COMMIT IT, not the argmax) when it is a high-probability token
+        // under the TARGET — within the target's top-k OR with
+        // p(draft)/p(argmax) >= ratio at the would-be-mismatch position.
+        // Quality is preserved because we only ever commit a token the
+        // target itself ranks highly; the PPL guardrail bounds the drift.
+        // `None` ⇒ inactive ⇒ fall through to typical-accept, then to the
+        // legacy exact-match prefix.
+        //
+        // Tried BEFORE typical-accept: relaxed is the more general gate
+        // (subsumes typical's α·p_max test as a special case) and is the
+        // one that also fires at temp0.
+        let n = match dflash_relax_accept(model, a, drafts, &verified) {
             Some(n) => n,
-            None => {
-                let mut n = 0usize;
-                for i in 0..drafts.len() {
-                    if i + 1 >= verified.len() {
-                        break;
+            None => match dflash_typical_accept(model, a, drafts, &verified) {
+                Some(n) => n,
+                None => {
+                    let mut n = 0usize;
+                    for i in 0..drafts.len() {
+                        if i + 1 >= verified.len() {
+                            break;
+                        }
+                        if drafts[i] == verified[i] {
+                            n += 1;
+                        } else {
+                            break;
+                        }
                     }
-                    if drafts[i] == verified[i] {
-                        n += 1;
-                    } else {
-                        break;
-                    }
+                    n
                 }
-                n
-            }
+            },
         };
         (n, None)
     };
@@ -295,6 +384,18 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         }
     }
 
+    // ── ATLAS_DFLASH_EARLY_EXIT_PROFILE=1: per-step accept counter ──
+    // Logs the accept count for THIS K=γ verify step so the early-exit
+    // sweep can read mean accept/γ straight from the server log. Cheap
+    // (one log line per verify); gated so it is a no-op in production.
+    if std::env::var("ATLAS_DFLASH_EARLY_EXIT_PROFILE").ok().as_deref() == Some("1") {
+        tracing::info!(
+            "DFLASH_EE_VERIFY: accepted={num_accepted}/{} drafts[..min(6)]={:?}",
+            drafts.len(),
+            &drafts[..drafts.len().min(6)],
+        );
+    }
+
     // Emit accepted drafts.
     //
     // ATLAS_DDTREE_TREE_TOKENS_VERIFY=1: when the verify input was built
@@ -312,8 +413,19 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // else drafts[i] for the chain-padded tail). With the env off,
     // verify_input_tokens == drafts so this is identical to the legacy
     // emission. Defensive bound: take from drafts if i exceeds vector.
-    let emit_take = num_accepted.min(verify_input_tokens.len());
-    let emit_tokens: Vec<u32> = verify_input_tokens[..emit_take].to_vec();
+    // FIX 1: when the tree-commit path is active, the accepted compact
+    // indices may be NON-contiguous (a sibling fork tail). Look up each
+    // accepted token by its compact index (compact slot `c` carries
+    // `verify_input_tokens[c-1]`) rather than slicing the contiguous prefix.
+    // Falls back to the legacy contiguous slice on every flat/non-tree path.
+    let emit_tokens: Vec<u32> = if let Some((ref path, _)) = tree_accepted_path {
+        path.iter()
+            .filter_map(|&c| verify_input_tokens.get(c.saturating_sub(1)).copied())
+            .collect()
+    } else {
+        let emit_take = num_accepted.min(verify_input_tokens.len());
+        verify_input_tokens[..emit_take].to_vec()
+    };
     for &tok in &emit_tokens {
         emit_token(a, tok, None);
         if a.finished {
@@ -326,7 +438,15 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // Grammar verify mode substitutes the MASKED argmax at that position —
     // safe because the bonus has no KV/seq.tokens entry yet (it is fed as
     // verify input position 0 next step), exactly like the MTP masked path.
-    let bonus_idx = num_accepted;
+    //
+    // FIX 1: for a tree-fork accept the bonus is the target's greedy at the
+    // path TIP (the last accepted compact row), NOT verified[num_accepted]
+    // (which is a contiguous-index assumption that is false once the path
+    // forked). `tree_accepted_path.1` carries that compact row.
+    let bonus_idx = match tree_accepted_path {
+        Some((_, bonus_row)) => bonus_row,
+        None => num_accepted,
+    };
     let bonus_tok = match grammar_accept {
         Some((_, b)) => Some(b),
         None => verified.get(bonus_idx).copied(),
@@ -375,8 +495,11 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     //  - 0 < num_accepted < k_verify (partial): canonical = intermediate[num_accepted-1]
     //  - num_accepted == 0: canonical untouched (rollback to checkpoint)
     //
-    // k_verify = drafts.len() + 1 (the prefix bonus position is also verified).
-    let k_verify = drafts.len() + 1;
+    // k_verify = total verified positions = tokens.len() (bonus slot 0 + all
+    // tree/draft nodes). For a WIDE DDTree (budget > γ) this is tree_len+1,
+    // NOT drafts.len()+1 — the SSM rollback range must span every verified
+    // node or the canonical state lands at the wrong intermediate slot.
+    let k_verify = tokens.len();
     let total_accepted = num_accepted + 1; // bonus is always "accepted"
     // Kernel slot of the LAST accepted state in `h_state_intermediates`:
     //   - Chain mode (no tree payload): `total_accepted - 1`. Slot N is the
@@ -409,6 +532,33 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // M8A: now safe to clear — commit has finished reading the tree-mode flag.
     model.clear_ddtree_parent_ids();
 
+    // FIX 2 — KV compaction for a sparse (tree-fork) accept. When the accepted
+    // path crossed a sibling fork, its attention KV sits at the scattered
+    // compact slots `pre_verify_len + compact_idx`; gather it down to the
+    // contiguous run `pre_verify_len + 1 .. pre_verify_len + num_accepted` so
+    // the next decode/propose reads correct contiguous KV (mirrors the flat
+    // chain layout). No-op when the path is already contiguous (every
+    // flat-chain accept) or tree-commit is off. LOSSLESS: relocates committed
+    // K/V bytes only. Must run AFTER the SSM commit (which reads its own
+    // intermediate pool, untouched by KV) and BEFORE the re-propose decode.
+    // Guard on NON-contiguity explicitly (mirrors set_dflash_accepted_compact
+    // below): a contiguous accepted path `[1,2,..,n]` needs no compaction —
+    // its KV already sits at the contiguous run, exactly like the flat path,
+    // which never calls compact_verify_kv at all. Only a fork-crossing
+    // (sparse) path requires the gather. Calling the gather on a contiguous
+    // path must be a true identity; making the skip explicit here removes any
+    // dependence on the kernel's internal contiguity detection being exact.
+    if let Some((ref path, _)) = tree_accepted_path
+        && !path.is_empty()
+        && !path.iter().enumerate().all(|(i, &c)| c == i + 1)
+    {
+        if let Err(e) = model.compact_verify_kv(&a.seq, path, pre_verify_len) {
+            tracing::error!("compact_verify_kv (dflash tree-fork): {e:#}");
+            a.finished = true;
+            return;
+        }
+    }
+
     // Save the bonus token's hidden state for the NEXT propose() call.
     // DFlash needs the target's hidden states for the full prefix including
     // the bonus token; the verify forward pass only processed the drafts.
@@ -426,7 +576,36 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state: {e:#}");
     }
+    // FIX 1: stamp the sparse accepted path onto the proposer (AFTER
+    // trim/after_verify, which clears it) so the next propose's ctx-hidden
+    // append reads the scattered fork-capture rows, not the contiguous
+    // prefix. Only when the path actually forked (non-contiguous): a
+    // contiguous `[1..N]` path needs no override and stays on the fast path.
+    if let Some((ref path, _)) = tree_accepted_path {
+        let is_contiguous = path.iter().enumerate().all(|(i, &c)| c == i + 1);
+        if !is_contiguous {
+            model.set_dflash_accepted_compact(&mut a.seq, path);
+        }
+    }
     let t_trim_us = t_trim.elapsed().as_micros();
+
+    // ATLAS_DFLASH_RECYCLE=1: stash the discarded draft tail BEFORE the
+    // re-propose below, keyed by the corrected token the target just committed
+    // (= a.last_token, which is also the `token` fed to the next propose). The
+    // next propose re-offers `drafts[num_accepted+1..]` when its last_token
+    // matches this key. No-op for the default (non-recycle) path. Skipped under
+    // tree mode (drafts/verified are compact-tree indices, not a flat chain, so
+    // the tail-after-mismatch arithmetic does not hold). Lossless: only changes
+    // what is PROPOSED next step, never what is committed.
+    if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() == Some("1")
+        && a.pending_tree_payload.is_none()
+    {
+        if let Err(e) =
+            model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token)
+        {
+            tracing::warn!("dflash_stash_recycle: {e:#}");
+        }
+    }
 
     // Re-propose for next step — unless the stage-1 grammar gate fires
     // (grammar now constrains output, e.g. this verify emitted the token
@@ -733,6 +912,194 @@ fn dflash_typical_alpha() -> f32 {
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
             .unwrap_or(0.3)
     })
+}
+
+/// Parsed `ATLAS_DFLASH_RELAX_*` configuration (read once).
+#[derive(Clone, Copy)]
+struct RelaxConfig {
+    /// Accept a draft if it is within the target's top-`k` logits. 0 = off.
+    topk: usize,
+    /// Accept a draft if `p_target(draft)/p_target(argmax) >= ratio`.
+    /// `<= 0.0` = off. The ratio is logit-based so it is temperature-free:
+    /// `p(d)/p(amax) = exp(l_d - l_amax)` (the partition function cancels),
+    /// which is exactly the relaxation we want at temp0 (no softmax temp).
+    ratio: f32,
+}
+
+/// `ATLAS_DFLASH_RELAX_ACCEPT` gate config. Returns `None` (feature off)
+/// unless `ATLAS_DFLASH_RELAX_ACCEPT=1` AND at least one of
+/// `ATLAS_DFLASH_RELAX_TOPK` (int >= 1) / `ATLAS_DFLASH_RELAX_RATIO`
+/// (float in (0,1]) is set. Read once at first use.
+fn dflash_relax_config() -> Option<RelaxConfig> {
+    static CFG: std::sync::OnceLock<Option<RelaxConfig>> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let on = std::env::var("ATLAS_DFLASH_RELAX_ACCEPT").ok().as_deref() == Some("1");
+        if !on {
+            return None;
+        }
+        let topk = std::env::var("ATLAS_DFLASH_RELAX_TOPK")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&k| k >= 1)
+            .unwrap_or(0);
+        let ratio = std::env::var("ATLAS_DFLASH_RELAX_RATIO")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+            .unwrap_or(0.0);
+        if topk == 0 && ratio <= 0.0 {
+            tracing::warn!(
+                "ATLAS_DFLASH_RELAX_ACCEPT=1 but neither RELAX_TOPK (>=1) nor \
+                 RELAX_RATIO (0<r<=1) is set — relaxed accept inactive (falling \
+                 back to exact / typical accept)"
+            );
+            return None;
+        }
+        tracing::info!(
+            "ATLAS_DFLASH_RELAX_ACCEPT active: topk={topk} ratio={ratio} \
+             (commits high-prob target near-miss drafts; PPL-bounded, default-off)"
+        );
+        Some(RelaxConfig { topk, ratio })
+    })
+}
+
+/// PPL-bounded relaxed acceptance for the flat-chain DFlash accept prefix
+/// (`ATLAS_DFLASH_RELAX_ACCEPT=1`, default off; works at temp0 and temp>0).
+///
+/// At each would-be-mismatch position the strict greedy rule rejects the
+/// draft purely because it is not the target's argmax — even when the draft
+/// is the target's 2nd/3rd choice with near-argmax probability. On novel
+/// code the drafter's near-misses are usually exactly such high-probability
+/// alternates, so strict greedy collapses acceptance to ~3/16.
+///
+/// Relaxed accept commits the DRAFT token (NOT the argmax) at a mismatch
+/// when the draft is a high-probability token under the TARGET:
+///
+///   - draft is within the target's top-`topk` logits at this row, OR
+///   - `p_target(draft) / p_target(argmax) >= ratio`, i.e.
+///     `l_draft - l_argmax >= ln(ratio)` (logit-space, temperature-free).
+///
+/// Quality is preserved because every committed token is one the target
+/// itself ranks at/near the top — the PPL guardrail bounds the drift. The
+/// committed draft's KV + SSM intermediate already sit at compact slot `i`
+/// (the drafter token was embedded there in `decode_verify`), so the
+/// downstream chain commit (`h_state_intermediates[num_accepted-1]`) stays
+/// consistent — identical plumbing to `dflash_typical_accept`.
+///
+/// The bonus stays `verified[num_accepted]` (the target argmax at the first
+/// genuinely-rejected position). Exact argmax matches accept without any
+/// D2H (the rule only ever WIDENS acceptance vs strict greedy).
+///
+/// Returns `Some(num_accepted)` when active, `None` to defer: env off, an
+/// active grammar (relaxed accept must not bypass constraint enforcement),
+/// or fp32 logits (row layout assumes BF16). A failed row D2H ends the
+/// prefix at that position (== strict outcome there).
+fn dflash_relax_accept(
+    model: &dyn Model,
+    a: &ActiveSeq,
+    drafts: &[u32],
+    verified: &[u32],
+) -> Option<usize> {
+    let cfg = dflash_relax_config()?;
+    if a.grammar_state.as_ref().is_some_and(|gs| !gs.is_terminated()) {
+        return None;
+    }
+    let logits_base = model.logits_buffer_ptr();
+    if model.logits_ptr_is_fp32(logits_base) {
+        return None; // row scan below assumes BF16
+    }
+    let vocab = model.vocab_size();
+    let ln_ratio = if cfg.ratio > 0.0 {
+        cfg.ratio.ln()
+    } else {
+        f32::NEG_INFINITY
+    };
+    // Lazily allocated on the first non-argmax position; pure argmax
+    // prefixes never touch the device.
+    let mut row_buf: Vec<u8> = Vec::new();
+    let mut accepted = 0usize;
+    let mut relax_hits = 0usize;
+    for i in 0..drafts.len() {
+        if i + 1 >= verified.len() {
+            break;
+        }
+        if drafts[i] == verified[i] {
+            accepted += 1;
+            continue;
+        }
+        if drafts[i] as usize >= vocab {
+            break;
+        }
+        if row_buf.is_empty() {
+            row_buf = vec![0u8; vocab * 2];
+        }
+        if let Err(e) =
+            model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf)
+        {
+            tracing::warn!("DFlash relax accept: logits D2H failed ({e:#}); stopping prefix");
+            break;
+        }
+        if relax_row_accepts(&row_buf, vocab, drafts[i], cfg.topk, ln_ratio) {
+            accepted += 1;
+            relax_hits += 1;
+        } else {
+            break;
+        }
+    }
+    if relax_hits > 0 {
+        tracing::debug!(
+            "DFlash relax accept: +{relax_hits} non-argmax draft(s) committed \
+             (total {accepted}/{}, topk={}, ratio={}, T={})",
+            drafts.len(),
+            cfg.topk,
+            cfg.ratio,
+            a.temperature,
+        );
+    }
+    Some(accepted)
+}
+
+/// Relaxed-accept test for one host-copied BF16 logits row. Accepts `tok`
+/// when it is within the top-`topk` logits OR its logit gap to the argmax
+/// satisfies `l_tok - l_max >= ln_ratio` (== `p(tok)/p(max) >= ratio`,
+/// temperature-free). BF16 values compare correctly as i16 for finite
+/// magnitudes (same ordering trick as `masked_argmax_bf16`); the exact
+/// logit gap is computed in f32 for the ratio test.
+fn relax_row_accepts(
+    bytes: &[u8],
+    vocab: usize,
+    tok: u32,
+    topk: usize,
+    ln_ratio: f32,
+) -> bool {
+    let ti = tok as usize;
+    if ti >= vocab {
+        return false;
+    }
+    let l_tok = bf16_to_f32(bytes[2 * ti], bytes[2 * ti + 1]);
+    // Single pass: find max logit and count how many logits strictly exceed
+    // l_tok (the draft's rank-1 position is `n_greater`). top-k holds when
+    // n_greater < topk (i.e. at most topk-1 tokens beat the draft).
+    let mut max_logit = f32::NEG_INFINITY;
+    let mut n_greater = 0usize;
+    for i in 0..vocab {
+        let l = bf16_to_f32(bytes[2 * i], bytes[2 * i + 1]);
+        if l > max_logit {
+            max_logit = l;
+        }
+        if l > l_tok {
+            n_greater += 1;
+            // Early exit only safe if top-k is the only criterion; with the
+            // ratio test we still need the true max, so don't break here.
+        }
+    }
+    if topk >= 1 && n_greater < topk {
+        return true;
+    }
+    if ln_ratio.is_finite() && (l_tok - max_logit) >= ln_ratio {
+        return true;
+    }
+    false
 }
 
 /// Masked argmax over one host-copied BF16 logits row. `None` when the

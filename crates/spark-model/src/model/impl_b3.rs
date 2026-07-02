@@ -97,11 +97,38 @@ impl TransformerModel {
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
         };
+        // ── ATLAS_DFLASH_EARLY_EXIT=1: target early-exit drafter ──
+        //
+        // Replace the tiny z-lab drafter's propose with the TARGET'S OWN first
+        // N layers + lm_head as the draft source (see `early_exit.rs`). The
+        // drafts flow into the unchanged verify path; the full 64-layer target
+        // still commits only its greedy token, so output stays byte-identical
+        // (LOSSLESS — verify is the oracle). This is the in-distribution
+        // predictor that beats the tiny drafter on NOVEL coding tokens.
+        //
+        // The DFlash proposer state's ctx accumulator append (done inside
+        // `propose_drafts`) is intentionally skipped here: when early-exit is
+        // the draft source the neural drafter never runs, so its ctx is never
+        // consumed. The verify path's SSM checkpoint/rollback is independent of
+        // this and unchanged.
+        if Self::early_exit_enabled() {
+            return self.early_exit_propose(token, num_drafts, seq);
+        }
         let prop_state = seq
             .proposer_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
-        if std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
+        // Refresh the host token mirror used by both prompt-lookup drafting
+        // (ATLAS_DFLASH_PLD) and the generalized retrieval-augmented drafter
+        // (ATLAS_DFLASH_RETRIEVAL). `seq.tokens` is the FULL committed
+        // sequence = prompt tokens + everything generated so far, so the
+        // retrieval haystack includes any reference code in the prompt for
+        // free. Only populated when one of the flags is on (default off ⇒
+        // no extra copy, legacy behavior byte-for-byte).
+        let want_token_mirror = std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
+            || std::env::var("ATLAS_DFLASH_RETRIEVAL").ok().as_deref() == Some("1")
+            || std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1");
+        if want_token_mirror
             && let Some(ds) = prop_state
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
@@ -504,6 +531,97 @@ impl TransformerModel {
         {
             let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
             dstate.ctx_len = new_len;
+        }
+        Ok(())
+    }
+
+    /// THINKING-PHASE ctx capture (default-OFF, `ATLAS_DFLASH_CAPTURE_THINKING=1`).
+    ///
+    /// During the model's `<think>`…`</think>` span the scheduler runs the
+    /// plain-decode path (`step_decode_only` → `decode_batch` → `decode`),
+    /// NOT the DFlash propose/verify cycle. That plain decode still fires the
+    /// per-layer `try_dflash_capture` hook, which lands the just-decoded
+    /// thinking token's 5 target-layer hiddens in `dflash_hidden_save[0]` —
+    /// but nothing ever appends that row into `ctx_hidden_acc` (the append
+    /// lives in `propose_drafts`, which only runs in the answer phase). As a
+    /// result the ctx slots spanning the thinking span are left ZERO, and
+    /// when the answer phase starts the drafter attends over hundreds of
+    /// zero-norm context keys.
+    ///
+    /// This method copies the freshly captured `dflash_hidden_save[0]` row
+    /// (all `n_capture` layers, one contiguous `ctx_slot_bytes` block) into
+    /// the absolute slot of the token that was just decoded, then advances
+    /// `ctx_len` to keep it in lockstep with `seq.seq_len`. Must be called
+    /// AFTER `decode` has incremented `seq.seq_len`, so the just-decoded
+    /// token sits at absolute position `seq.seq_len - 1`.
+    ///
+    /// Cost: one `ctx_slot_bytes` d2d copy per thinking token. No-op when:
+    ///   - the flag is unset,
+    ///   - DFlash is inactive (`dflash_hidden_save` is `None` / capture layers empty),
+    ///   - the seq has no `DflashProposerState`,
+    ///   - rank > 0 under EP/TP (drafter is rank-0 only),
+    ///   - the accumulator is already full.
+    ///
+    /// Drafter-conditioning ONLY: the target's verify path is untouched, so
+    /// committed tokens remain byte-identical — this raises ACCEPTANCE, not
+    /// output.
+    pub(super) fn dflash_capture_thinking_dispatch(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        if !crate::model::env_diag::dflash_capture_thinking_enabled() {
+            return Ok(());
+        }
+        if self.dflash_capture_layers.is_empty() {
+            return Ok(());
+        }
+        let src_base = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(());
+        }
+        let dstate = match seq.proposer_state.as_mut() {
+            Some(ps) => match ps
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+            {
+                Some(s) => s,
+                None => return Ok(()),
+            },
+            None => return Ok(()),
+        };
+        // `decode` already incremented seq.seq_len; the token whose hiddens
+        // are sitting in dflash_hidden_save[0] occupies absolute position
+        // seq.seq_len - 1. ctx slot i == hidden of token at sequence position
+        // i (matches propose_drafts' absolute-slot semantics), so target slot
+        // is exactly seq.seq_len - 1.
+        let abs_pos = match seq.seq_len.checked_sub(1) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if abs_pos >= dstate.max_ctx_len {
+            return Ok(()); // accumulator full; drop later positions
+        }
+        // dflash_hidden_save layout is [k_max, n_capture, hidden] BF16; row 0
+        // is one whole ctx slot (n_capture * hidden * bf16 == ctx_slot_bytes).
+        let slot_bytes = dstate.ctx_slot_bytes;
+        let dst = dstate.ctx_hidden_acc.offset(abs_pos * slot_bytes);
+        self.gpu.copy_d2d_async(src_base, dst, slot_bytes, stream)?;
+        // Keep ctx_len in lockstep with seq_len. Using max() guards against
+        // any transient where ctx_len was already advanced past this slot.
+        dstate.ctx_len = dstate.ctx_len.max((abs_pos + 1).min(dstate.max_ctx_len));
+        if std::env::var("ATLAS_PROPOSE_PROBE").ok().as_deref() == Some("1") {
+            tracing::info!(
+                "dflash_capture_thinking: abs_pos={} ctx_len={} slot_bytes={}",
+                abs_pos,
+                dstate.ctx_len,
+                slot_bytes,
+            );
         }
         Ok(())
     }

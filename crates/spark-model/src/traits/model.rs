@@ -501,6 +501,22 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// THINKING-PHASE ctx capture (default-OFF, `ATLAS_DFLASH_CAPTURE_THINKING=1`).
+    ///
+    /// Append the just-decoded thinking token's captured 5-layer target
+    /// hidden (in `dflash_hidden_save[0]`) into the per-seq `ctx_hidden_acc`
+    /// accumulator at its absolute slot, keeping `ctx_len` in lockstep with
+    /// `seq.seq_len`. Must be called from the plain-decode (thinking) path
+    /// AFTER `seq.seq_len` has been incremented. Fills the ctx region that
+    /// the thinking span would otherwise leave ZERO, so the answer-phase
+    /// drafter conditions on real reasoning context.
+    ///
+    /// Drafter-conditioning only — target verify untouched, committed tokens
+    /// byte-identical. Default: no-op (DFlash not active / flag off).
+    fn dflash_capture_thinking(&self, _seq: &mut SequenceState, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(
@@ -650,6 +666,28 @@ pub trait Model: Send + Sync {
         stream: u64,
     ) -> Result<()>;
 
+    /// ATLAS_DFLASH_RECYCLE=1: stash the discarded draft tail on the DFlash
+    /// proposer state so the next propose can re-offer it (lossless).
+    ///
+    /// `drafts` is the FULL set of drafts that was just verified, and
+    /// `num_accepted` is the matching-prefix length. The discarded tail is
+    /// `drafts[num_accepted+1 .. ]` — the draft at index `num_accepted` was the
+    /// mismatch (replaced by the target's correction), and everything after it
+    /// was thrown away purely because it sat downstream of that miss.
+    /// `corrected_token` is the bonus the target committed at the mismatch
+    /// (= the next step's `last_token`); it becomes the recycle key.
+    ///
+    /// Default no-op for non-DFlash / non-recycle backends.
+    fn dflash_stash_recycle(
+        &self,
+        _seq: &mut SequenceState,
+        _drafts: &[u32],
+        _num_accepted: usize,
+        _corrected_token: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Launch SSM state checkpoint D2D copies on a secondary CUDA stream.
     ///
     /// Non-blocking: returns immediately. The copies can overlap with MTP
@@ -734,6 +772,33 @@ pub trait Model: Send + Sync {
     ) -> Result<()> {
         self.commit_verify_state_async(seq, num_accepted, k)
     }
+
+    /// FIX 2 — compact a tree-fork accept's scattered attention KV down to a
+    /// contiguous run (mirrors the flat-chain KV layout) so the next decode
+    /// reads correct contiguous KV.
+    ///
+    /// `accepted_compact` is the full accepted path (compact indices, walk
+    /// order, possibly non-contiguous). `pre_verify_len` is the sequence
+    /// length before this verify advanced it. No-op when the path is already
+    /// contiguous (every flat-chain accept). LOSSLESS: relocates committed
+    /// K/V bytes, never alters a value.
+    ///
+    /// Default impl is a no-op (non-hybrid / no-tree backends never produce
+    /// a non-contiguous accept). `TransformerModel` overrides.
+    fn compact_verify_kv(
+        &self,
+        _seq: &SequenceState,
+        _accepted_compact: &[usize],
+        _pre_verify_len: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// FIX 1 (ATLAS_DFLASH_TREE_COMMIT): stamp the accepted-path compact
+    /// indices onto the proposer so its next ctx-hidden append reads the
+    /// scattered fork-capture rows. Call AFTER `trim_proposer_state`.
+    /// Default no-op (non-DFlash / non-tree backends).
+    fn set_dflash_accepted_compact(&self, _seq: &mut SequenceState, _accepted_compact: &[usize]) {}
 
     /// Save KV blocks + SSM state to writer. Does NOT free resources.
     ///

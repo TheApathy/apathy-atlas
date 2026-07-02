@@ -904,8 +904,12 @@ impl TransformerModel {
                 }
             }
 
-            // Argmax inside graph (fixed scratch addresses — graph-safe)
-            let vocab = self.config.vocab_size;
+            // Argmax inside graph (fixed scratch addresses — graph-safe).
+            // Use the verify-side (possibly truncated) vocab so the per-row
+            // logits stride AND the argmax range match exactly what
+            // `lm_head_batched` wrote for the K=γ transposed GEMM — full vocab
+            // when `ATLAS_TARGET_LMHEAD_VOCAB` truncation is off.
+            let vocab = self.verify_lmhead_vocab() as usize;
             let argmax_out = self.buffers.scratch();
             crate::kprof!(self.gpu.as_ref(), stream, "argmax", {
                 for t in 0..k {
@@ -988,5 +992,108 @@ impl TransformerModel {
         seq.seq_len += k;
 
         Ok(out)
+    }
+
+    /// FIX 2 — KV compaction for sparse (tree-fork) accepts.
+    ///
+    /// During K=γ verify, compact slot `t` writes its attention K/V to the
+    /// linear KV position `pre_verify_len + t` (see the `slots` build above).
+    /// When the target's greedy walk crosses a sibling fork, the accepted
+    /// path's compact indices are NON-contiguous (e.g. `[1, 2, 3, 7]`), so the
+    /// accepted tokens' KV is scattered across positions `pre+1, pre+2, pre+3,
+    /// pre+7`. The next decode reads a CONTIGUOUS sequence `pre+1 .. pre+N`, so
+    /// the scattered entries must be GATHERED down to the contiguous run that
+    /// mirrors how the flat chain lays KV.
+    ///
+    /// `accepted_compact` is `greedy_sample_ddtree_full`'s path (compact
+    /// indices, in walk order). `pre_verify_len` is the sequence length BEFORE
+    /// this verify advanced it. For each accepted step `j` (1-based), the
+    /// token lives at compact index `accepted_compact[j-1]` (KV pos
+    /// `pre + that`); its contiguous home is `pre + j`. A copy fires only when
+    /// source != destination (a flat prefix is already in place → no-op).
+    ///
+    /// LOSSLESS: this only relocates already-committed K/V bytes; it never
+    /// changes a value. Bonus row needs no KV (it is fed as verify input next
+    /// step). Supported KV dtypes: bf16 / fp8 (contiguous per-position element
+    /// layout). Quantized cache dtypes (NVFP4/Turbo*) have split data+scale
+    /// sections and are refused so the feature never silently corrupts.
+    pub(super) fn compact_verify_kv_dispatch(
+        &self,
+        seq: &SequenceState,
+        accepted_compact: &[usize],
+        pre_verify_len: usize,
+    ) -> Result<()> {
+        // Determine the relocation plan: (src_pos, dst_pos) pairs where the
+        // source differs from the contiguous destination. Process in
+        // ASCENDING destination order so an earlier copy never clobbers a
+        // source a later copy still needs (dst_j = pre+j <= src = pre+compact
+        // because compact >= j along any monotone path; the walk is strictly
+        // increasing in compact index, so this holds).
+        let mut moves: Vec<(usize, usize)> = Vec::new();
+        for (j, &compact) in accepted_compact.iter().enumerate() {
+            let dst_pos = pre_verify_len + j + 1; // j is 0-based; step j+1
+            let src_pos = pre_verify_len + compact;
+            if src_pos != dst_pos {
+                moves.push((src_pos, dst_pos));
+            }
+        }
+        if moves.is_empty() {
+            return Ok(());
+        }
+
+        let stream = self.gpu.default_stream();
+        let kv_cache = self.kv_cache.lock();
+        let bs = kv_cache.block_size();
+        let num_layers = kv_cache.num_layers();
+
+        for layer_idx in 0..num_layers {
+            let dtype = kv_cache.dtype_for_layer(layer_idx);
+            let (nkv, hd) = kv_cache.config().dims_for_layer(layer_idx);
+            let elem_per_pos = nkv * hd;
+            // Per-position byte stride for the contiguous element dtypes.
+            let pos_bytes = match dtype {
+                spark_runtime::kv_cache::KvCacheDtype::Bf16 => elem_per_pos * 2,
+                spark_runtime::kv_cache::KvCacheDtype::Fp8 => elem_per_pos,
+                other => {
+                    bail!(
+                        "compact_verify_kv: unsupported KV dtype {other:?} for layer {layer_idx} \
+                         (tree-fork KV compaction only supports contiguous bf16/fp8); \
+                         disable ATLAS_DFLASH_TREE_COMMIT or use --kv-cache-dtype fp8"
+                    );
+                }
+            };
+
+            for &(src_pos, dst_pos) in &moves {
+                let src_block = seq
+                    .physical_block_for(src_pos / bs)
+                    .ok_or_else(|| anyhow::anyhow!("compact_verify_kv: src block evicted"))?;
+                let dst_block = seq
+                    .physical_block_for(dst_pos / bs)
+                    .ok_or_else(|| anyhow::anyhow!("compact_verify_kv: dst block evicted"))?;
+                let src_off = (src_pos % bs) * pos_bytes;
+                let dst_off = (dst_pos % bs) * pos_bytes;
+
+                let k_src = kv_cache.k_cache_ptr(layer_idx, src_block).offset(src_off);
+                let k_dst = kv_cache.k_cache_ptr(layer_idx, dst_block).offset(dst_off);
+                let v_src = kv_cache.v_cache_ptr(layer_idx, src_block).offset(src_off);
+                let v_dst = kv_cache.v_cache_ptr(layer_idx, dst_block).offset(dst_off);
+
+                self.gpu.copy_d2d_async(k_src, k_dst, pos_bytes, stream)?;
+                self.gpu.copy_d2d_async(v_src, v_dst, pos_bytes, stream)?;
+            }
+        }
+        drop(kv_cache);
+
+        static COMPACT_DBG: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = COMPACT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 {
+            tracing::info!(
+                "compact_verify_kv #{n}: pre_len={pre_verify_len} accepted_compact={:?} moves={:?}",
+                accepted_compact,
+                moves,
+            );
+        }
+        Ok(())
     }
 }

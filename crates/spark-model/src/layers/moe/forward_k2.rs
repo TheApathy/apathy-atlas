@@ -85,6 +85,35 @@ impl MoeLayer {
             )?;
         }
 
+        // ATLAS_MOE_OVERLAP=1: measure expert-set overlap between the 2 verify
+        // tokens. Only safe when NOT capturing a graph (D2H sync). Logs the
+        // count of distinct experts across both tokens (8 = full overlap,
+        // 16 = disjoint) so we can size a dedup win for the K=2 verify MoE.
+        let moe_probe = !ctx.graph_capture
+            && std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
+        let __moe_t0 = if moe_probe {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        if moe_probe {
+            ctx.gpu.synchronize(stream)?;
+            let mut idx_buf = vec![0u8; 2 * top_k as usize * 4];
+            ctx.gpu.copy_d2h(indices_dev, &mut idx_buf)?;
+            let mut set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for i in 0..(2 * top_k as usize) {
+                let e = u32::from_le_bytes([
+                    idx_buf[i * 4],
+                    idx_buf[i * 4 + 1],
+                    idx_buf[i * 4 + 2],
+                    idx_buf[i * 4 + 3],
+                ]);
+                set.insert(e);
+            }
+            tracing::info!("MOE_OVERLAP distinct={} of {}", set.len(), 2 * top_k);
+        }
+
         // 3-5. Fused expert dispatch for 2 tokens
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
@@ -329,6 +358,25 @@ impl MoeLayer {
                         stream,
                     )?;
                 }
+            }
+        }
+
+        if let Some(t0) = __moe_t0 {
+            ctx.gpu.synchronize(stream)?;
+            let dt = t0.elapsed().as_nanos() as u64;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static MOE_ACC_NS: AtomicU64 = AtomicU64::new(0);
+            static MOE_CALLS: AtomicU64 = AtomicU64::new(0);
+            let acc = MOE_ACC_NS.fetch_add(dt, Ordering::Relaxed) + dt;
+            let calls = MOE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+            // 48 MoE forwards per verify step. Log a rolling per-step MoE total
+            // every 48 calls (one verify step worth).
+            if calls.is_multiple_of(48 * 50) {
+                tracing::info!(
+                    "MOE_K2_TIME total_per_step_us={} (avg over {} steps)",
+                    acc / 1000 / (calls / 48),
+                    calls / 48
+                );
             }
         }
 

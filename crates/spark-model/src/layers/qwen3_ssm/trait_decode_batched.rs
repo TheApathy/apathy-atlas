@@ -520,6 +520,31 @@ impl Qwen3SsmLayer {
                     value_dim as u32,
                     stream,
                 )?;
+            } else if k > 3
+                && k <= 32
+                && self.w4a16_gemm_t_m32_n64_k.0 != 0
+                && super::super::ssm_out_proj_m32n64()
+            {
+                // K=γ verify (DFlash γ=16 → M=17): route the SSM out_proj
+                // [M=17, N=H=5120, K=value_dim=6144] through the m32_n64
+                // transposed kernel instead of w4a16_gemm_n128 (N_TILE=128).
+                // At N=5120 the m128 kernel fields only ceil(5120/128)=40 CTAs
+                // — SM-starved at ~37 GB/s on a 15.7 MB weight, mirroring the
+                // ffn_down occupancy starve. N_TILE=64 doubles CTAs to
+                // ceil(5120/64)=80 and M_TILE=32 keeps a single B read for M≤32.
+                // Same proven T-weight + m32_n64 path as qkv/o/FFN (token-exact,
+                // single K-chain — bit-exact, no split-K rounding).
+                ops::w4a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64_k,
+                    normed_out_buf,
+                    nvfp4_t,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
             } else {
                 ops::w4a16_gemm_n128(
                     ctx.gpu,

@@ -322,8 +322,10 @@ impl TransformerModel {
                 anyhow::Result::<()>::Ok(())
             })?;
 
-            // Argmax inside graph
-            let vocab = self.config.vocab_size;
+            // Argmax inside graph. Use the verify-side (possibly truncated)
+            // vocab so the per-row logits stride AND the argmax range match
+            // what `lm_head_batched` wrote — full vocab when truncation off.
+            let vocab = self.verify_lmhead_vocab() as usize;
             let argmax_out = self.buffers.scratch();
             crate::kprof!(self.gpu.as_ref(), stream, "argmax", {
                 for t in 0..k {

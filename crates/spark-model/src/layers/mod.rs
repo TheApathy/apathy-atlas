@@ -88,6 +88,22 @@ pub fn ssm_out_batch3_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_BATCH3").ok().as_deref() == Some("1"))
 }
 
+/// Gates routing the SSM `out_proj` [M=17, N=5120, K=6144] through the
+/// `w4a16_gemm_t_m32_n64` kernel (N_TILE=64 → 80 CTAs) at the K=γ verify
+/// (3 < M ≤ 32) instead of the legacy `w4a16_gemm_t` (N_TILE=128 → only 40
+/// CTAs at N=5120, SM-starved like the pre-split-K ffn_down). Same proven
+/// T-weight + m32_n64 path as qkv/o/FFN — single K-chain, bit-exact.
+/// Default OFF: A/B (2026-06-18) measured NO throughput win — out_proj's
+/// K=6144 loop is 3× shorter and its weight 3× smaller than ffn_down's, so
+/// it is NOT occupancy-starved; doubling CTAs 40→80 left counting flat
+/// (82.5→81.5, within noise). Kept as an opt-in (`ATLAS_SSM_OUT_M32N64=1`,
+/// bit-exact: counting md5 unchanged) but off by default to preserve the
+/// baseline. Cached via `OnceLock`.
+pub fn ssm_out_proj_m32n64() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_M32N64").ok().as_deref() == Some("1"))
+}
+
 /// Returns true when `ATLAS_SSM_BA_BATCHED=1` is set in the process env.
 ///
 /// Gates the K=3 batched-GEMV path for the SSM BA projection. The
@@ -145,6 +161,52 @@ pub fn ffn_kgamma_m16_enabled() -> bool {
 pub fn ffn_kgamma_m128_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_M128").ok().as_deref() == Some("1"))
+}
+
+/// Split count for the DFlash K=γ verify FFN `down_proj` GEMM.
+///
+/// The down projection ([M=17, N=5120, K=16384]) is occupancy-starved on
+/// the single-slice `w4a16_gemm_t_m32_n64` kernel: N=5120 → only 80 CTAs
+/// vs gate/up's 256 at N=16384, and it grinds a 512-iteration K-loop. Per
+/// full_profile (2026-06-18) it runs at ~91 GB/s vs gate/up ~163 GB/s on
+/// the same-size weight. Split-K multiplies the CTA count by this factor
+/// (80 → 320 at 4) to restore occupancy. Returns 0 (disabled, single
+/// slice) when the env var is unset/0/1; otherwise the parsed split count
+/// clamped to [2, 8]. `ATLAS_FFN_DOWN_SPLITK=4` is the records-grade
+/// default applied by the serve script.
+pub fn ffn_down_splitk() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_FFN_DOWN_SPLITK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 0 } else { v.min(8) })
+            .unwrap_or(0)
+    })
+}
+
+/// Split-K factor for the FFN **gate/up** projections ([M=17, N=inter=16384,
+/// K=hidden=5120]) on the K=γ verify path. Default OFF (0).
+///
+/// Unlike `ffn_down`, gate/up are NOT occupancy-starved on the single-slice
+/// `w4a16_gemm_t_m32_n64` kernel — at N=16384 they field ceil(16384/64)=256
+/// CTAs (~2.4/SM on GB10's ~108 SMs) vs down's 80 at N=5120. But the K=5120
+/// loop (160 K-steps) may still leave latency-hiding headroom: `ATLAS_FFN_
+/// GATEUP_SPLITK=2` slices K across gridDim.z, doubling CTAs to 512 (~4.7/SM)
+/// into an FP32 workspace, then `reduce_splitk_f32_to_bf16` sums+downcasts.
+/// Lossless (FP32 partials) and token-exact — mirrors the proven ffn_down
+/// path exactly. Returns 0 when unset/0/1; else the parsed count clamped to
+/// [2, 8]. A/B this against the single-slice baseline before shipping — the
+/// win is only real if the extra CTAs actually raise effective bandwidth.
+pub fn ffn_gateup_splitk() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_FFN_GATEUP_SPLITK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 0 } else { v.min(8) })
+            .unwrap_or(0)
+    })
 }
 
 /// Returns true when `ATLAS_SSM_MULTI_SEQ_BATCHED=1` is set in the process env.
