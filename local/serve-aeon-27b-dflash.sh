@@ -68,7 +68,8 @@ echo "[serve-aeon-27b-dflash] preflight ok: ${FREE_GB} GB free"
 # fused safe path matters more than throughput.
 export ATLAS_DFLASH_DRAFT_CAP=${ATLAS_DFLASH_DRAFT_CAP:-16}
 export ATLAS_LM_HEAD_T="${ATLAS_LM_HEAD_T:-1}"
-export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-2048}
+# 4096 matches the jun26 drafter's trained SWA window (was 2048 for the 3.6 drafter).
+export ATLAS_DFLASH_CTX_WINDOW=${ATLAS_DFLASH_CTX_WINDOW:-4096}
 # 2026-06-17: default MUST be nvfp4. With bf16 every drafter projection runs
 # ops::dense_gemm over all n_attn = eff_ctx(≤CTX_WINDOW) + γ rows — propose
 # scaled to ~1.75s/step at seq 800 (counting 13 tok/s, coding TIMEOUT).
@@ -99,6 +100,21 @@ export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 # (step 331ms = verify 243 + propose 88).
 export ATLAS_DFLASH_NOISE_ONLY=${ATLAS_DFLASH_NOISE_ONLY:-1}
 
+# 2026-06-19: SAM longest-suffix RETRIEVAL augmentation (retrieval.rs),
+# "retrieval-when-confident, diffusion-otherwise". LOSSLESS by construction —
+# retrieval drafts pass the SAME greedy DFlash verify, so output is always the
+# target's argmax (changes SPEED not output; counting MD5 bit-exact either way).
+#
+# DEFAULT ON, made safe by the ADAPTIVE GATE (2026-06-21). SAM alone is a big
+# win on reuse-heavy code EDITING (add_method, ~100-line context: 45→71 tok/s)
+# but REGRESSED counting 77→65 (digit runs produce strong-but-wrong suffix
+# matches → wasted drafts). The adaptive gate (propose.rs, default ON via
+# ATLAS_DFLASH_SAM_ADAPTIVE) tracks retrieval accept per-seq and auto-disables
+# it after 3 consecutive misfires for a 24-step cooldown — so it stays active
+# on editing and backs off on counting/novel content. LOSSLESS either way
+# (verify commits the target's greedy token). Disable retrieval: ATLAS_DFLASH_SAM=0.
+export ATLAS_DFLASH_SAM=${ATLAS_DFLASH_SAM:-1}
+
 # 2026-06-10: batched K=17 attention QKV via plain w4a16_gemm (M=17, one
 # weight read instead of 17 per layer). Validated token-exact +
 # deterministic + acceptance 15.90/16. verify 243→231ms → 52.8 tok/s
@@ -124,6 +140,19 @@ export ATLAS_DFLASH_FFN_KGAMMA=${ATLAS_DFLASH_FFN_KGAMMA:-1}
 # restores counting to records parity (65->74.4). Token-exact (drafter-only).
 export ATLAS_DFLASH_ATTN_KGAMMA=${ATLAS_DFLASH_ATTN_KGAMMA:-1}
 
+# 2026-06-18: split-K down_proj. full_profile exposed the K=17 verify's #1
+# kernel sink as ffn_down_kgamma — the down projection ([M=17,N=5120,K=16384])
+# fields only 80 CTAs on the single-slice w4a16_gemm_t_m32_n64 kernel (vs
+# gate/up's 256 at N=16384) and runs at ~91 GB/s vs gate/up's ~163 on the same
+# 47MB weight, i.e. SM-starved on the long K-loop. ATLAS_FFN_DOWN_SPLITK=4
+# slices K across gridDim.z (80->320 CTAs) into an FP32 workspace, then
+# reduce_splitk_f32_to_bf16 sums+downcasts. Lossless (FP32 partials) and
+# token-exact (counting md5 unchanged). Clean A/B: counting 75.2->82.0 (+9%),
+# coding 16.5->17.9, prose 12.3->12.9 — lifts every workload since verify runs
+# every step. Requires the w4a16_gemm_t_m32_n64_splitk + reduce kernels (built
+# into the qwen3.6-27b cache); handle-0 fallback keeps the single-slice path.
+export ATLAS_FFN_DOWN_SPLITK=${ATLAS_FFN_DOWN_SPLITK:-4}
+
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
 # M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy
@@ -142,21 +171,26 @@ export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 # Qwen3.6-27B). The AEON-tuned variants (-aeon-tuned/-aeon-v2/
 # -aeon-v3-balanced) match the abliterated target's distribution and
 # should accept more drafts per step on prose.
-DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/models/z-lab-Qwen3.6-27B-DFlash}
+# 2026-07-02: default drafter switched to the mid-June z-lab Qwen3.5-27B-DFlash
+# refresh (6 layers, SWA window 4096) — A/B vs the stale Apr-27 3.6 drafter:
+# counting 71.7 vs 68.3, code_novel 15.9 vs 15.2, prose par, counting-md5
+# LOSSLESS. Cross-target (3.5-trained) but wins anyway; larger SWA window may
+# help more at long context. Old drafter: z-lab-Qwen3.6-27B-DFlash.
+DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/models/z-lab-Qwen3.5-27B-DFlash-jun26}
 
 exec /home/flocka/atlas-src/target/release/spark serve \
-  --model-from-path /home/flocka/models/AEON-Q36-27B-Full \
+  --model-from-path "${TARGET_MODEL:-/home/flocka/models/AEON-Q36-27B-Full}" \
   --model-name aeon-27b-dflash \
   --port 8890 \
   --kernel-target qwen3.6-27b \
   --gpu-memory-utilization 0.65 \
   --kv-cache-dtype "${KV_DTYPE:-fp8}" \
   --max-seq-len ${MAX_SEQ_LEN:-8192} \
-  --max-batch-size 1 \
-  --max-num-seqs 1 \
+  --max-batch-size ${BATCH:-1} \
+  --max-num-seqs ${BATCH:-1} \
   --dflash \
   --draft-model "${DRAFT_MODEL}" \
-  --dflash-gamma 16 \
+  --dflash-gamma ${DFLASH_GAMMA:-16} \
   --mtp-vocab "${MTP_VOCAB:-32000}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \

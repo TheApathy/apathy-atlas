@@ -100,6 +100,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     .down_proj
                     .transpose_for_gemm(gpu, h, inter)?;
                 ffn_layer.set_transposed_weights(gate_t, up_t, down_t);
+                // Eagerly allocate the split-K FP32 workspace at load time
+                // (illegal during CUDA graph capture). Sized for the largest
+                // output dim used by any split-K projection: down_proj is
+                // N=hidden, gate/up (ATLAS_FFN_GATEUP_SPLITK) is N=intermediate.
+                // Pass max so one workspace serves both. No-op when neither
+                // split-K env is set or the split-K kernels are missing.
+                ffn_layer.alloc_splitk_workspace(gpu, h.max(inter) as u32)?;
                 if i == 0 {
                     tracing::info!(
                         "Dense FFN M_TILE=16 transposed-weight path enabled \
@@ -435,5 +442,28 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             );
         }
         Ok(mtp)
+    }
+
+    /// Load the ViT tower for dense Qwen3.5/3.6 checkpoints that ship one.
+    ///
+    /// The dense weight loader handles the text-only Qwen3.6-27B-FP8 sibling
+    /// (no vision) AND vision-capable dense checkpoints like AEON-Q36-27B,
+    /// which carry the full 333-tensor `model.visual.*` tower in the same
+    /// `qwen3_5` + `num_experts==0` config that routes here (see
+    /// `factory::loader_for_config`). The default trait impl returns `None`,
+    /// which silently dropped the vision tower for the latter — the image
+    /// `<|image_pad|>` token was then embedded as plain text, producing
+    /// fluent-but-wrong "vision" output. The ViT load logic is identical to
+    /// the MoE-VL sibling (same `model.visual.*` / nested layout, same FP8→
+    /// BF16 auto-dequant), so delegate to it. It returns `Ok(None)` when
+    /// `config.vision` is `None` (the text-only dense path), keeping that
+    /// path byte-for-byte unchanged.
+    fn load_vision_encoder(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        super::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
     }
 }
