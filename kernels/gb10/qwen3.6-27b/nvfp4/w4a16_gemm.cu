@@ -2021,4 +2021,247 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m32_n64_splitk — split-K variant of w4a16_gemm_t_m32_n64
+//
+// Purpose (nsys/full_profile 2026-06-18): the DFlash K=17 verify FFN
+// `down_proj` GEMM has shape [M=17, N=5120, K=16384]. The base
+// m32_n64 kernel fields grid (ceil(5120/64), 1) = 80 CTAs — well
+// under GB10's SM count — yet each CTA grinds a 512-iteration K-loop
+// (K=16384/K_STEP_T=32). Measured: down runs at ~91 GB/s vs the
+// gate/up projections' ~163 GB/s on an identically-sized weight, i.e.
+// it is OCCUPANCY-starved, not bandwidth-bound. gate/up have N=16384
+// → 256 CTAs and saturate; down does not.
+//
+// Fix: add a gridDim.z = SPLITK dimension. Slice z owns K-range
+// [z*Kc, (z+1)*Kc) (Kc = ceil(K / SPLITK), rounded to K_STEP_T). Each
+// slice accumulates its partial [M,N] into a FP32 scratch row-band
+// `Cpartial + z*M*N`. A companion `reduce_splitk_f32_to_bf16` sums the
+// SPLITK partials and writes the BF16 output. This multiplies CTA
+// count by SPLITK (80→320 at SPLITK=4) without atomics, restoring full
+// occupancy. Lossless: FP32 partials, exact sum.
+//
+// Geometry identical to w4a16_gemm_t_m32_n64 except:
+//   - Grid (ceil(N/64), ceil(M/32), SPLITK)  Block (128,1,1)
+//   - K-loop bounded to [k_lo, k_hi) for this z-slice
+//   - Stores FP32 to Cpartial[z*M*N + r*N + c] (no bounds-add; plain
+//     write, the reduce kernel reads all SPLITK bands).
+// ═══════════════════════════════════════════════════════════════════
+extern "C" __global__ void w4a16_gemm_t_m32_n64_splitk(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    float* __restrict__ Cpartial,           // [SPLITK, M, N] FP32
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ldb,
+    unsigned int splitk                     // number of K-slices (gridDim.z)
+) {
+    constexpr unsigned int M_TILE_S = 32;
+    const unsigned int cta_n = blockIdx.x * N_TILE_S3;
+    const unsigned int cta_m = blockIdx.y * M_TILE_S;
+    const unsigned int zslice = blockIdx.z;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    // K-range for this slice, snapped to K_STEP_T so group/scale indexing
+    // stays aligned (GROUP_SIZE=16 divides K_STEP_T=32).
+    unsigned int kc = (K + splitk - 1) / splitk;
+    kc = ((kc + K_STEP_T - 1) / K_STEP_T) * K_STEP_T;   // round up to K_STEP_T
+    unsigned int k_lo = zslice * kc;
+    unsigned int k_hi = k_lo + kc;
+    if (k_hi > K) k_hi = K;
+    // Empty slice (can happen when splitk*kc overshoots): write zeros so the
+    // reduce kernel reads a defined value, then bail.
+    if (k_lo >= K) {
+        #pragma unroll
+        for (int sub = 0; sub < 2; sub++) {
+            unsigned int nt = warp_id * 2 + sub;
+            unsigned int c0 = cta_n + nt * 8 + tid * 2;
+            unsigned int c1 = c0 + 1;
+            unsigned int r0 = cta_m + group_id;
+            unsigned int rows[4] = {r0, r0 + 8, r0 + 16, r0 + 24};
+            float* base = Cpartial + (unsigned long long)zslice * M * N;
+            #pragma unroll
+            for (int rr = 0; rr < 4; rr++) {
+                if (rows[rr] < M && c0 < N) base[rows[rr]*N + c0] = 0.0f;
+                if (rows[rr] < M && c1 < N) base[rows[rr]*N + c1] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE_S][K_STEP_T + PAD_T];
+    __shared__ unsigned char smem_Bp[2][K_STEP_T / 2][N_TILE_S3 + BP_PAD];
+    __shared__ unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][N_TILE_S3 + BP_PAD];
+    __shared__ unsigned char smem_B_fp8[N_TILE_S3][K_STEP_T];
+    __shared__ float smem_LUT[16];
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    float acc[2][2][4];
+    #pragma unroll
+    for (int mf = 0; mf < 2; mf++)
+        #pragma unroll
+        for (int sub = 0; sub < 2; sub++) {
+            acc[mf][sub][0] = 0.0f; acc[mf][sub][1] = 0.0f;
+            acc[mf][sub][2] = 0.0f; acc[mf][sub][3] = 0.0f;
+        }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // Identical load/dequant/MMA macros to w4a16_gemm_t_m32_n64, but the
+    // global K-coordinate `gc/gke/sg` is offset by the absolute k position
+    // (the macro arg `kb` is already absolute below) and predicates use the
+    // full K (so the weight-row stride math is unchanged); the loop bounds
+    // restrict to [k_lo, k_hi).
+    #define ISSUE_LOADS_SK(buf, kb) do { \
+        { \
+            unsigned int a_row = threadIdx.x >> 2; \
+            unsigned int a_col = (threadIdx.x & 3) << 3; \
+            unsigned int gc = (kb) + a_col; \
+            unsigned int gr = cta_m + a_row; \
+            cp_async_pred_16(&smem_A[(buf)][a_row][a_col], \
+                &A[(unsigned long long)gr * K + gc], \
+                (gr < M) && (gc + 7 < K)); \
+        } \
+        if (threadIdx.x < 64) { \
+            unsigned int kp = threadIdx.x >> 2; \
+            unsigned int ns = (threadIdx.x & 3) << 4; \
+            unsigned int gke = (kb) + (kp << 1); \
+            unsigned int gns = cta_n + ns; \
+            cp_async_pred_16(&smem_Bp[(buf)][kp][ns], \
+                &B_packed[(unsigned long long)(gke >> 1) * ldb + gns], \
+                (gke + 1 <= K) && (gns + 15 < ldb)); \
+            if (kp < (K_STEP_T / GROUP_SIZE) * (N_TILE_S3 / 16)) { \
+                unsigned int sg_row = kp >> 2; \
+                unsigned int sg_ns  = (kp & 3) << 4; \
+                unsigned int sg = (kb) / GROUP_SIZE + sg_row; \
+                cp_async_pred_16(&smem_Bs[(buf)][sg_row][sg_ns], \
+                    &B_scale[(unsigned long long)sg * ldb + cta_n + sg_ns], \
+                    (cta_n + sg_ns + 15 < ldb)); \
+            } \
+        } \
+    } while(0)
+
+    #define DEQUANT_SK(buf) do { \
+        unsigned int my_n = threadIdx.x >> 1; \
+        unsigned int half = threadIdx.x & 1; \
+        unsigned char sb = smem_Bs[(buf)][half][my_n]; \
+        __nv_fp8_e4m3 f; \
+        *(unsigned char*)&f = sb; \
+        float sv = (float)f * scale2; \
+        unsigned int kp0 = half << 3; \
+        _Pragma("unroll") \
+        for (unsigned int kp = kp0; kp < kp0 + 8; kp++) { \
+            unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
+            float lo = smem_LUT[packed & 0xF] * sv; \
+            float hi = smem_LUT[packed >> 4] * sv; \
+            unsigned short fp8_pair; \
+            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+        } \
+    } while(0)
+
+    #define COMPUTE_MMA_SK(a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        unsigned int fr0 = group_id; \
+        unsigned int fr1 = fr0 + 8; \
+        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        unsigned int b0 = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + tid * 4]); \
+        unsigned int b1 = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + tid * 4]); \
+        unsigned int b2 = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + 16 + tid * 4]); \
+        unsigned int b3 = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int sub = 0; sub < 2; sub++) { \
+            unsigned int nt = warp_id * 2 + sub; \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int v0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid]; \
+            unsigned int v1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid]; \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[0][sub][0]),"=f"(acc[0][sub][1]),"=f"(acc[0][sub][2]),"=f"(acc[0][sub][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(v0),"r"(v1), \
+                 "f"(acc[0][sub][0]),"f"(acc[0][sub][1]),"f"(acc[0][sub][2]),"f"(acc[0][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[1][sub][0]),"=f"(acc[1][sub][1]),"=f"(acc[1][sub][2]),"=f"(acc[1][sub][3]) \
+                :"r"(b0),"r"(b1),"r"(b2),"r"(b3),"r"(v0),"r"(v1), \
+                 "f"(acc[1][sub][0]),"f"(acc[1][sub][1]),"f"(acc[1][sub][2]),"f"(acc[1][sub][3])); \
+        } \
+    } while(0)
+
+    ISSUE_LOADS_SK(0, k_lo);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+    DEQUANT_SK(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = k_lo + K_STEP_T; k_base < k_hi; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        ISSUE_LOADS_SK(nxt, k_base);
+        cp_async_commit();
+        COMPUTE_MMA_SK(cur);
+        cp_async_wait_all();
+        __syncthreads();
+        DEQUANT_SK(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    COMPUTE_MMA_SK(cur);
+
+    #undef ISSUE_LOADS_SK
+    #undef DEQUANT_SK
+    #undef COMPUTE_MMA_SK
+
+    float* base = Cpartial + (unsigned long long)zslice * M * N;
+    #pragma unroll
+    for (int sub = 0; sub < 2; sub++) {
+        unsigned int nt = warp_id * 2 + sub;
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + group_id;
+        unsigned int r1 = r0 + 8;
+        unsigned int r2 = r0 + 16;
+        unsigned int r3 = r0 + 24;
+        if (r0 < M && c0 < N) base[r0*N+c0] = acc[0][sub][0];
+        if (r0 < M && c1 < N) base[r0*N+c1] = acc[0][sub][1];
+        if (r1 < M && c0 < N) base[r1*N+c0] = acc[0][sub][2];
+        if (r1 < M && c1 < N) base[r1*N+c1] = acc[0][sub][3];
+        if (r2 < M && c0 < N) base[r2*N+c0] = acc[1][sub][0];
+        if (r2 < M && c1 < N) base[r2*N+c1] = acc[1][sub][1];
+        if (r3 < M && c0 < N) base[r3*N+c0] = acc[1][sub][2];
+        if (r3 < M && c1 < N) base[r3*N+c1] = acc[1][sub][3];
+    }
+}
+
+// Reduce the [SPLITK, M, N] FP32 partials produced by
+// w4a16_gemm_t_m32_n64_splitk into a [M, N] BF16 output. One thread per
+// (row, col) output element; sums the SPLITK bands. Grid covers M*N.
+extern "C" __global__ void reduce_splitk_f32_to_bf16(
+    const float* __restrict__ Cpartial,     // [SPLITK, M, N]
+    __nv_bfloat16* __restrict__ C,           // [M, N]
+    unsigned int M, unsigned int N, unsigned int splitk
+) {
+    unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long mn = (unsigned long long)M * N;
+    if (idx >= mn) return;
+    float sum = 0.0f;
+    const float* p = Cpartial + idx;
+    for (unsigned int z = 0; z < splitk; z++) {
+        sum += *p;
+        p += mn;
+    }
+    C[idx] = __float2bfloat16(sum);
+}
+
 #undef N_TILE_S3

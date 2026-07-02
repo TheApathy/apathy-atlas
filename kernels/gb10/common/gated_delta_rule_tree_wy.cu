@@ -12,7 +12,7 @@
 // Key invariants:
 //   - parent_ids[t] < t  (DAG; enforced host-side)
 //   - parent_ids[0] = -1 (the bonus / root)
-//   - 1 <= T <= K_MAX (T passed at runtime; K_MAX=17 for SMEM sizing)
+//   - 1 <= T <= K_MAX (T passed at runtime; K_MAX=32 for SMEM sizing)
 //
 // PASS 1: read H_root once, compute hk_root[t] = H_root @ k[t] for all t.
 // WY:     for each t, walk ancestors via parent_ids, accumulate corrected[t]
@@ -26,12 +26,25 @@
 //         registers from previous iter. For branch, re-read from H_inter[parent].
 //
 // Grid: (num_v_heads, batch, 1)   Block: (128, 1, 1)
-// SMEM: ~18 KB at K=17.
+// SMEM (static): sk/sq dominate = 2*K_MAX*128*4 B. At K_MAX=32 ≈ 32 KB +
+// kd_flat (K*(K-1)/2 floats ≈ 2 KB) + scalars ≈ 34 KB — under the 48 KB
+// static-SMEM cap, so no dynamic-SMEM opt-in needed.
+//
+// K_MAX governs the max DDTree verify width (tree nodes incl. root). It was
+// 17 (= drafter γ+1, flat-chain only). Raised to 32 to admit wide DDTree
+// branch trees: the CaDDTree throughput-optimal budget on a bandwidth-bound
+// device (where the O(T^2) WY correction below is the cost driver) is ~32,
+// not the 256 used on HBM datacenter parts. The per-token arrays vi/hk_root/
+// vn/qd are indexed by a RUNTIME t, so nvcc already spills them to (L1/L2-
+// cached) local memory at K=17 — raising K_MAX only grows that footprint, it
+// does not change the spill class, and this kernel is not the verify
+// bottleneck (the bandwidth-bound FFN/attn GEMMs are). The compute ORDER is
+// unchanged, so the linear-chain fast path stays bit-equivalent to wy17.
 
 #include <cuda_bf16.h>
 #include "gdn_reduce.cuh"
 #define BLOCK_SIZE 128
-#define K_MAX 17
+#define K_MAX 32
 
 extern "C" __global__ void gated_delta_rule_tree_wy(
     float* __restrict__ h_state,                // [batch, vh, k_dim, v_dim] FP32 — RO here
@@ -89,7 +102,14 @@ extern "C" __global__ void gated_delta_rule_tree_wy(
     if (tid < T) {
         // Per-token scalars at offset (b*T + t)*gb_stride + vh for gate/beta.
         float g_raw = gate[(b * T + tid) * gb_stride + vh];
-        sg[tid]  = fminf(fmaxf(g_raw, 1e-6f), 1.0f - 1e-6f);
+        // BIT-EQUIVALENCE FIX: clamp must MATCH gated_delta_rule_wy17.cu's
+        // [0, 1] clamp exactly. The previous [1e-6, 1-1e-6] clamp made the
+        // tree kernel diverge from wy17 on LINEAR chains for any gate at the
+        // [0,1] boundary, propagating through the entire WY recurrence and
+        // collapsing drafter accept. The wider clamp does not improve
+        // stability (gate is already a sigmoid output in (0,1)); it only
+        // breaks the chain-equivalence invariant.
+        sg[tid]  = fminf(fmaxf(g_raw, 0.0f), 1.0f);
         sbt[tid] = beta[(b * T + tid) * gb_stride + vh];
         sparent[tid] = parent_ids[tid];
     }
@@ -142,7 +162,27 @@ extern "C" __global__ void gated_delta_rule_tree_wy(
             if (p < 0) {
                 // Root → no chain.
                 corrected = hk_root[t];
+            } else if (p == (int)t - 1) {
+                // ── LINEAR-CHAIN FAST PATH (bit-equivalent to wy17) ──
+                // When parent[t] == t-1 the ancestor chain is the contiguous
+                // run [0, 1, ..., t-1]. Reproduce gated_delta_rule_wy17.cu's
+                // EXACT accumulation order so the result is bit-identical:
+                //   - leading product accumulated ascending u = 0..t-1
+                //   - cross terms summed ascending s = 0..t-1, each with a
+                //     FRESH nested product gprod = ∏_{u=s+1..t-1} sg[u]
+                // (The general ancestor-walk below visits s descending with a
+                // running gprod — same math, different FP rounding. Matching
+                // wy17 order is what makes the chain path bit-exact.)
+                float lead_prod = 1.0f;
+                for (int u = 0; u < (int)t; u++) lead_prod *= sg[u];
+                corrected = lead_prod * hk_root[t];
+                for (int s = 0; s < (int)t; s++) {
+                    float gprod = 1.0f;
+                    for (int u = s + 1; u < (int)t; u++) gprod *= sg[u];
+                    corrected += gprod * kd_flat[t * (t - 1) / 2 + s] * vn[s];
+                }
             } else {
+                // ── GENERAL BRANCH PATH (ancestor walk) ──
                 // Walk ancestors from parent back to root, oldest-first list.
                 int chain[K_MAX]; int L = 0;
                 int cur = p;
@@ -153,22 +193,26 @@ extern "C" __global__ void gated_delta_rule_tree_wy(
                 // chain[0] = parent (closest), chain[L-1] = root-child (oldest in chain).
                 // Reverse semantics: ancestor a_i for i=0..L-1 with a_0=oldest=chain[L-1], a_{L-1}=closest=chain[0].
                 // Leading term: ∏_{i=0..L-1} g[a_i] = ∏ g[chain[k]] for all k.
+                // Accumulate oldest→closest (ascending real index) so the
+                // leading product matches the wy17 ordering convention.
                 float lead = 1.0f;
-                for (int k = 0; k < L; k++) lead *= sg[chain[k]];
+                for (int k = L - 1; k >= 0; k--) lead *= sg[chain[k]];
                 corrected = lead * hk_root[t];
                 // Cross terms: Σ_{i=0..L-1} (∏_{j=i+1..L-1} g[a_j]) * kd[t][a_i] * vn[a_i]
-                // a_i = chain[L-1-i]. ∏ g over a_{i+1..L-1} = ∏ g[chain[L-1-j]] for j=i+1..L-1
-                //                                          = ∏ g[chain[0..L-2-i]]
-                // Equivalent: for ancestor at chain[ci] (ci in 0..L-1):
-                //   gprod = ∏ g[chain[k]] for k in 0..ci-1   (zero terms when ci=0 → 1)
+                // a_i = chain[L-1-i]. For ancestor at chain[ci] (ci in 0..L-1):
+                //   gprod = ∏ g[chain[k]] for k in 0..ci-1   (empty product = 1)
                 //   cross += gprod * kd[t][chain[ci]] * vn[chain[ci]]
-                float gprod = 1.0f;
-                for (int ci = 0; ci < L; ci++) {
-                    // kd[t][s] where s = chain[ci]; only defined for s < t (DAG).
+                // Sum ancestors oldest→closest (ci = L-1 down to 0) so that,
+                // on a contiguous chain, the per-term gprod is the same fresh
+                // ∏_{u=s+1..t-1} sg[u] wy17 uses. gprod is rebuilt from
+                // scratch per ancestor to avoid running-product FP drift.
+                for (int ci = L - 1; ci >= 0; ci--) {
                     int s = chain[ci];
                     float kd_ts = kd_flat[t * (t - 1) / 2 + s];
+                    // gprod = ∏ g[chain[k]] for k = 0 .. ci-1 (closer-than-s ancestors)
+                    float gprod = 1.0f;
+                    for (int k = 0; k < ci; k++) gprod *= sg[chain[k]];
                     corrected += gprod * kd_ts * vn[s];
-                    gprod *= sg[s];
                 }
             }
             vn[t] = (vi[t] - sg[t] * corrected) * sbt[t];
