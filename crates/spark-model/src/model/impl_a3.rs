@@ -38,6 +38,30 @@ fn lm_head_batch3_enabled() -> bool {
     })
 }
 
+/// Verify-side LM-head vocab truncation cap (`ATLAS_TARGET_LMHEAD_VOCAB`).
+///
+/// The TARGET model's verify `lm_head` GEMV computes logits over the FULL
+/// 248320-row vocab for every spec-decode verify step (k≈2 rows/step). The
+/// argmax that picks the verified token only needs the top scoring token,
+/// and BPE places frequent tokens at low IDs — so reading only the first N
+/// weight rows makes the GEMV proportionally cheaper (it's memory-bound on
+/// the NVFP4 weight read at 273 GB/s) with negligible quality risk for N
+/// large enough to cover normal text.
+///
+/// 0 (default) = full vocab (no truncation). Any value ≥ vocab_size is also
+/// treated as full. Only the batched-verify and single-token DECODE argmax
+/// paths honor this — PREFILL keeps the full vocab so the first token stays
+/// exact.
+pub(super) fn target_lmhead_vocab() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ATLAS_TARGET_LMHEAD_VOCAB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
 impl TransformerModel {
     pub(super) fn embed(&self, token: u32, output: DevicePtr, stream: u64) -> Result<()> {
         let h = self.config.hidden_size;
@@ -134,6 +158,18 @@ impl TransformerModel {
     }
 
     /// LM head for K tokens: hidden[K, H] → logits[K, V].
+    /// Effective verify-side vocab for the batched-decode/verify `lm_head`
+    /// argmax: the full vocab, or the `ATLAS_TARGET_LMHEAD_VOCAB` cap when it
+    /// is set and smaller. The scheduler's verify argmax MUST read this (not
+    /// `config.vocab_size`) so the per-row logits stride and the argmax range
+    /// match what `lm_head_batched` actually wrote. Returns the full vocab in
+    /// every non-truncated case (cap==0 or cap≥vocab).
+    pub(super) fn verify_lmhead_vocab(&self) -> u32 {
+        let v = self.config.vocab_size as u32;
+        let cap = target_lmhead_vocab();
+        if cap == 0 || cap >= v { v } else { cap }
+    }
+
     pub(super) fn lm_head_batched(
         &self,
         hidden: DevicePtr,
@@ -141,7 +177,35 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size as u32;
-        let v = self.config.vocab_size as u32;
+        let v_full = self.config.vocab_size as u32;
+        // Verify-side vocab truncation: shrink the logical GEMM/GEMV output
+        // dimension (and the matching argmax range in the scheduler) to the
+        // first `v` rows. BPE places frequent tokens at low IDs, so reading
+        // fewer vocab rows is a clean bandwidth reduction with negligible
+        // quality risk for `v` large enough to cover normal text.
+        // `verify_lmhead_vocab()` returns the full vocab when truncation is
+        // disabled (`ATLAS_TARGET_LMHEAD_VOCAB` unset / 0 / ≥ vocab).
+        //
+        // SCOPE: applies to BOTH verify families —
+        //   * small-batch GEMV (num_tokens ≤ 3 — MTP K=2/K=3): the NVFP4
+        //     weight is row-major over vocab, so the first `v` rows are
+        //     contiguous; the kernel simply outputs fewer rows.
+        //   * K=γ DFlash transposed GEMM (num_tokens > 3): the kernel
+        //     `w4a16_gemm_t_m32_n64` separates the physical B-row stride
+        //     (`ldb`) from the logical output width (`N`). The transposed
+        //     weight `lm_head_nvfp4_t` is padded/transposed at FULL vocab, so
+        //     `ldb` MUST stay `v_full`-derived (`v_full_pad` below) to read
+        //     the weight correctly — but passing a truncated logical `N`
+        //     makes the kernel compute/store only the first `N` vocab columns
+        //     (C-store guard `c < N`) and launch `ceil(N/64)` CTAs instead of
+        //     `ceil(v_full/64)`. First-N columns of the transpose are exactly
+        //     the low BPE IDs, so this is a correct truncation, not a
+        //     mis-stride. See `w4a16_gemm.cu::w4a16_gemm_t_m32_n64`.
+        let v = self.verify_lmhead_vocab();
+        // Physical B-row stride for the transposed lm_head: ALWAYS the full
+        // 64-padded vocab (the weight was built at full vocab). Never derive
+        // this from the truncated `v`.
+        let v_full_pad = v_full.div_ceil(64) * 64;
         let logits = self.buffers.logits();
         if num_tokens == 2 {
             // Double-GEMV: reads weights once, computes 2 outputs.
@@ -215,8 +279,13 @@ impl TransformerModel {
             // weight read vs the plain kernel's strided ~5×-floor access
             // at M=17 (ATLAS_LM_HEAD_T=1 builds the T-copy at load).
             let nvfp4_t = self.lm_head_nvfp4_t.as_ref().unwrap();
-            // ldb = 64-padded vocab: transpose_for_gemm pads the B-row
-            // stride so cp.async stays 16B-aligned at the odd 248077 vocab.
+            // ldb = 64-padded FULL vocab: transpose_for_gemm built the B-row
+            // stride at full vocab (`v_full_pad`) so cp.async stays 16B-aligned
+            // at the odd 248320 vocab. `v` is the logical output width — it may
+            // be the truncated `ATLAS_TARGET_LMHEAD_VOCAB` cap, which makes the
+            // kernel compute/store only the first `v` columns and launch
+            // ceil(v/64) CTAs, while still reading the weight at the full
+            // physical `v_full_pad` stride.
             ops::w4a16_gemm_n64_m32_ldb(
                 self.gpu.as_ref(),
                 self.w4a16_gemm_t_m32_n64_kernel,
@@ -226,7 +295,7 @@ impl TransformerModel {
                 num_tokens,
                 v,
                 h,
-                v.div_ceil(64) * 64,
+                v_full_pad,
                 stream,
             )?;
         } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {

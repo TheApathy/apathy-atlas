@@ -202,7 +202,9 @@ impl TransformerModel {
         self.lm_head_batched(normed, k as u32, stream)?;
 
         // ── Argmax per token ──
-        let vocab = self.config.vocab_size;
+        // Verify-side (possibly truncated) vocab must match the stride/range
+        // `lm_head_batched` wrote — full vocab when truncation is off.
+        let vocab = self.verify_lmhead_vocab() as usize;
         let mut results = Vec::with_capacity(k);
         for t in 0..k {
             let logits_t = self.buffers.logits().offset(t * vocab * bf16);

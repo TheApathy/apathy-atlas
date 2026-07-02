@@ -115,6 +115,11 @@ impl Qwen3SsmLayer {
             // Optional small-M variant (qwen3.6-27b only). Use try_kernel so
             // generic builds without the kernel still link cleanly.
             w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
+            w4a16_gemm_t_m32_n64_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64",
+            ),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gdn_prefill_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_prefill")?,

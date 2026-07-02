@@ -117,6 +117,22 @@ pub struct DflashScratch {
     /// row-wise softmax over the K selected logits (or simpler heuristic
     /// — see `propose.rs` for the score-translation policy).
     pub topk_logits_dev: DevicePtr,
+    /// EAGLE-3.1 per-layer FC-normalization scratch (ATLAS_DFLASH_FC_LAYERNORM=1).
+    /// Holds one fc-input slot's `[n_target_layers * target_hidden]` BF16 after
+    /// each captured target-layer slice has been unit-variance RMS-normalized
+    /// independently (so no single high-magnitude late-layer capture dominates
+    /// the fused fc input). The fc GEMV reads from here instead of the raw
+    /// `ctx_hidden_acc` slot when the flag is on. Sized
+    /// `n_target_layers * target_hidden` BF16. Unused (and may be a null/stub
+    /// pointer) when the flag is off — Step 0 only touches it on the ON path.
+    pub fc_norm_in: DevicePtr,
+    /// All-zeros BF16 weight of length `target_hidden`, used as the per-slice
+    /// RMS-norm scale for the unit-variance FC-layernorm variant. The
+    /// `rms_norm` kernel computes `x * rms * (1 + w)`, so a zero weight yields
+    /// the plain `x * rms` unit-variance normalization (variant (a): no learned
+    /// gamma, the safest / least-OOD choice given `self.fc` was trained on
+    /// un-normalized concat). Allocated + zeroed once at construction.
+    pub fc_norm_zero_w: DevicePtr,
 }
 
 /// Drafter-side weight precision.
@@ -264,6 +280,16 @@ pub struct DflashProposerState {
     /// append to `ctx_hidden_acc` (positions 1..=last_num_accepted for
     /// accepted drafts; position 0 when zero drafts were accepted).
     pub last_num_accepted: usize,
+    /// FIX 1 (ATLAS_DFLASH_TREE_COMMIT): the accepted-path COMPACT indices
+    /// from the last tree-fork verify (e.g. `[1, 2, 3, 7]`). Empty on every
+    /// flat-chain / non-tree step. When non-empty, `propose_drafts` reads the
+    /// captured ctx hiddens from these sparse `dflash_hidden_save` rows
+    /// (verify slot 0 = last_token, slot `c` = compact index `c`) instead of
+    /// the contiguous `0..last_num_accepted+1` — because a fork accept's
+    /// hiddens are scattered, and reading `0..N+1` would pick up rejected
+    /// sibling rows. Stays a strict superset-safe override: when the path is
+    /// the contiguous `[1..N]` it produces identical reads.
+    pub last_accepted_compact: Vec<usize>,
     /// Host copy of the sequence's committed tokens, refreshed by the
     /// caller each propose when ATLAS_DFLASH_PLD=1 (prompt-lookup drafts).
     pub pld_tokens: Vec<u32>,
@@ -271,6 +297,21 @@ pub struct DflashProposerState {
     /// skip the post-prefill append on the first call because
     /// `dflash_hidden_save` hasn't been populated yet.
     pub first_propose_done: bool,
+
+    // ── Adaptive retrieval gate (ATLAS_DFLASH_SAM auto-disable) ──
+    /// Whether the PREVIOUS propose pre-empted the neural drafter with a
+    /// retrieval (SAM) draft. Set when the retrieval path fires; read on the
+    /// next propose to attribute `last_num_accepted` to retrieval vs drafter.
+    pub retr_used_last: bool,
+    /// Consecutive retrieval steps whose accept came back poor. When it
+    /// crosses the limit, retrieval enters a cooldown — this auto-disables SAM
+    /// on content where its strong suffix matches mis-predict (e.g. counting:
+    /// digit runs match but the next number is always new), while leaving it
+    /// fully active on reuse-heavy code editing (where it keeps accepting).
+    pub retr_misfire_streak: u32,
+    /// Remaining propose steps to SKIP retrieval (cooldown). Decremented each
+    /// step; retrieval is suppressed while > 0, then retried.
+    pub retr_cooldown: u32,
 
     // ── Persistent context cache (eliminates O(seq_len) recompute) ──
     /// Cached fc_proj outputs for context tokens. Circular buffer of
@@ -324,6 +365,50 @@ pub struct DflashProposerState {
     /// more predictable (counting, lists, structured output). Reprobing
     /// re-measures the true accept ceiling.
     pub propose_steps: usize,
+    /// ATLAS_DFLASH_ACCEPT_FALLBACK: number of remaining steps this sequence
+    /// must spend in plain single-token decode (speculation suppressed)
+    /// before the next re-probe. When > 0, `propose_drafts` returns an empty
+    /// draft vector so the scheduler routes the sequence through the bootstrap
+    /// plain-decode path. Decremented once per suppressed propose call. When
+    /// it reaches 0, the next propose runs a full γ probe to re-measure
+    /// acceptance. 0 = not suppressed (normal full-γ speculation).
+    pub fallback_suppressed_remaining: usize,
+
+    // ── ATLAS_DFLASH_RECYCLE=1: discarded-draft-tail recycling (default off) ──
+    /// The tail of the PREVIOUS step's drafts that verify discarded after the
+    /// first content miss — `drafts[num_accepted+1 .. γ_eff]`. The drafter
+    /// often gets the STRUCTURAL continuation right even when the corrected
+    /// token (committed by the target at the mismatch) differs, so re-offering
+    /// this tail re-accepts the free structural part. Populated by
+    /// `dflash_stash_recycle` from `verify_dflash_step` after `num_accepted`
+    /// is known; consumed by `propose_drafts` on the next call. Empty ⇒ no
+    /// tail available. LOSSLESS: these tokens are only PROPOSED — verify still
+    /// commits target-greedy, so a wrong recycle costs one rejected
+    /// speculation, never output.
+    pub recycle_tail: Vec<u32>,
+    /// The corrected token committed by the target at the mismatch position
+    /// (= `verified[num_accepted]` = the bonus = next step's `last_token`).
+    /// `propose_drafts` offers `recycle_tail` only when the new `last_token`
+    /// equals this key — the tail was the drafter's continuation conditioned
+    /// on this exact corrected token, so re-offering it is principled.
+    pub recycle_key: u32,
+    /// Whether `recycle_tail`/`recycle_key` hold a valid stash (distinguishes
+    /// "empty tail because full-accept" from "no stash yet"; the offer path
+    /// needs both a matching key AND a non-empty tail anyway, so this is
+    /// belt-and-suspenders for the key==0 corner case).
+    pub recycle_valid: bool,
+    /// Whether the PREVIOUS propose returned a recycled tail. Prevents the
+    /// self-sustaining low-accept trap: a recycled tail that re-accepts poorly
+    /// keeps `last_num_accepted` low, which would re-open the recycle gate
+    /// forever and STARVE the neural drafter (measured: counting collapsed
+    /// 82→~9 tok/s because one early recycle offer trapped the sequence). With
+    /// this flag, recycle never fires two steps in a row — after any offer the
+    /// next step runs the real drafter, which re-establishes the true accept
+    /// signal and produces a fresh tail. Recycle thus fires at most every other
+    /// step, capping its worst-case throughput cost at one wasted speculation
+    /// per two steps while still recovering the discarded tail on genuinely
+    /// weak content.
+    pub recycle_last_offered: bool,
 }
 
 impl ProposerState for DflashProposerState {
@@ -600,7 +685,9 @@ pub mod ddtree_gdn_dispatch;
 mod forward_block;
 mod forward_block_layer;
 mod from_weights;
+mod noise_pass;
 mod propose;
+pub mod retrieval;
 
 // Re-export DDTree payload so the scheduler can carry it as Option<DDTreePayload>
 // in ActiveSeq (M3 milestone — pure plumbing, no behavior change).
@@ -701,8 +788,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_slot_bytes,
             last_capture_idx: 0,
             last_num_accepted: 0,
+            last_accepted_compact: Vec::new(),
             pld_tokens: Vec::new(),
             first_propose_done: false,
+            retr_used_last: false,
+            retr_misfire_streak: 0,
+            retr_cooldown: 0,
             ctx_fc_cache,
             ctx_k_cache,
             ctx_v_cache,
@@ -717,6 +808,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
             accept_history_pos: 0,
             accept_history_count: 0,
             propose_steps: 0,
+            fallback_suppressed_remaining: 0,
+            recycle_tail: Vec::new(),
+            recycle_key: 0,
+            recycle_valid: false,
+            recycle_last_offered: false,
         }))
     }
 
@@ -763,6 +859,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // every verify position; `last_capture_idx` selects the correct one.
         dstate.last_capture_idx = num_accepted;
         dstate.last_num_accepted = num_accepted;
+        // Clear any stale tree-fork path; the scheduler re-stamps it via
+        // `set_dflash_accepted_compact` AFTER this when the step forked.
+        dstate.last_accepted_compact.clear();
         dstate.last_num_drafted = 0;
         // Push accept count into the ring buffer for ATLAS_DFLASH_ADAPTIVE_GAMMA.
         // Saturating cast: num_accepted >= 256 cannot happen because dflash_kgamma

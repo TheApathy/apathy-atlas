@@ -92,6 +92,12 @@ pub struct Qwen3SsmLayer {
     /// Gated by `ATLAS_TC_NVFP4_M16=1` env var. KernelHandle(0) if not compiled
     /// for this target (qwen3.6-27b NVFP4 shadow only as of 2026-05-19).
     w4a16_gemm_t_m16_k: KernelHandle,
+    /// M32×N64 variant: K=γ verify small-M GEMM (single B read for M≤32 ×
+    /// N_TILE=64 → full SM occupancy). Used by the SSM `out_proj`
+    /// [M=17, N=5120, K=6144] at 3 < M ≤ 32 to replace the N_TILE=128
+    /// `w4a16_gemm_t` (only 40 CTAs at N=5120, SM-starved). KernelHandle(0)
+    /// if the kernel is not compiled for this target.
+    w4a16_gemm_t_m32_n64_k: KernelHandle,
     w4a16_gemv_batch2_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     gdn_prefill_k: KernelHandle,

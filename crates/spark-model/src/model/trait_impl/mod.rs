@@ -281,6 +281,9 @@ impl Model for TransformerModel {
     fn save_hidden_for_dflash(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<()> {
         self.save_hidden_for_dflash_dispatch(token, seq, _stream)
     }
+    fn dflash_capture_thinking(&self, seq: &mut SequenceState, stream: u64) -> Result<()> {
+        self.dflash_capture_thinking_dispatch(seq, stream)
+    }
     fn run_mtp_propose(
         &self,
         token: u32,
@@ -449,6 +452,45 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
+    fn dflash_stash_recycle(
+        &self,
+        seq: &mut SequenceState,
+        drafts: &[u32],
+        num_accepted: usize,
+        corrected_token: u32,
+    ) -> Result<()> {
+        // Stash `drafts[num_accepted+1 ..]` (the tail discarded purely because
+        // it sat downstream of the first content miss) keyed by the corrected
+        // token the target committed at that miss. The next propose re-offers
+        // this tail when its last_token == corrected_token. LOSSLESS: only
+        // affects what is PROPOSED, never what is committed.
+        let Some(ps) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        let Some(ds) = ps
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        else {
+            return Ok(());
+        };
+        // The tail starts AFTER the mismatched draft at index `num_accepted`
+        // (that draft was wrong → replaced by the bonus). `num_accepted+1` is
+        // the first downstream-discarded draft. Full-accept (num_accepted ==
+        // drafts.len()) leaves an empty tail → nothing to recycle.
+        let tail_start = num_accepted.saturating_add(1);
+        if tail_start < drafts.len() {
+            ds.recycle_tail.clear();
+            ds.recycle_tail.extend_from_slice(&drafts[tail_start..]);
+            ds.recycle_key = corrected_token;
+            ds.recycle_valid = true;
+        } else {
+            // No usable tail this step — invalidate any prior stash so it is
+            // never re-offered staler than one step.
+            ds.recycle_tail.clear();
+            ds.recycle_valid = false;
+        }
+        Ok(())
+    }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<()> {
         self.compact_sequence_dispatch(seq, new_slot)
     }
@@ -521,6 +563,17 @@ impl Model for TransformerModel {
         };
         drop(inv_perm);
         self.commit_verify_state_async_dispatch(seq, num_accepted, k, mapped_slot)
+    }
+    fn compact_verify_kv(
+        &self,
+        seq: &SequenceState,
+        accepted_compact: &[usize],
+        pre_verify_len: usize,
+    ) -> Result<()> {
+        self.compact_verify_kv_dispatch(seq, accepted_compact, pre_verify_len)
+    }
+    fn set_dflash_accepted_compact(&self, seq: &mut SequenceState, accepted_compact: &[usize]) {
+        self.set_dflash_accepted_compact_dispatch(seq, accepted_compact);
     }
     fn ep_worker_step(&self, seq: &mut SequenceState) -> Result<bool> {
         self.ep_worker_step_dispatch(seq)

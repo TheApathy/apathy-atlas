@@ -787,6 +787,256 @@ pub fn greedy_sample_ddtree(
     })
 }
 
+/// Tree-path (full-branch) greedy DDTree walk — commits the WHOLE accepted
+/// path the target's greedy oracle takes through the tree, including a tail
+/// reached through a sibling fork, NOT just the contiguous flat prefix.
+///
+/// Difference from [`greedy_sample_ddtree`]: that function runs
+/// `adapt_to_flat_safe_contract`, which truncates the accept at the first
+/// fork (compact index != position+1) and turns the fork token into a
+/// single bonus — so a fork's tail is never committed (zero branching gain).
+/// This function returns the raw `walk_one_tree` result:
+///   - `output_token_ids` = every accepted path token + the bonus
+///   - `accepted_compact_indices` = the full (possibly NON-contiguous, e.g.
+///     `[1, 2, 3, 7]`) compact index path the greedy walk traversed
+///   - `bonus_parent_compact_index` = the compact row the bonus is read from
+///
+/// LOSSLESS: still commits ONLY tokens where `draft == target_argmax` along
+/// the path, and the bonus is always the target's greedy at the path tip —
+/// identical token contract to the flat path, only the recognized accept
+/// SET changes. The caller is responsible for two pieces of plumbing that
+/// the flat path gets for free:
+///   1. SSM state handoff — `last_accepted_inter_slot(accepted_compact)`
+///      already returns the correct kernel intermediate slot (the max
+///      compact index, the genuine last-accepted state) for sparse paths.
+///   2. KV compaction — the accepted path's attention KV sits at the sparse
+///      compact slots and must be gathered down to contiguous positions
+///      before the next decode (see `compact_verify_kv`).
+pub fn greedy_sample_ddtree_full(
+    req: &DDTreeRequestRuntime,
+    target_argmax: &[u32],
+) -> Result<DDTreeGreedySample, DDTreeBuildError> {
+    let expected = 1 + req.num_nodes();
+    if target_argmax.len() != expected {
+        return Err(DDTreeBuildError::EmptyCandidates);
+    }
+    let (acc_tok, acc_compact, bonus_tok, bonus_parent) = walk_one_tree(req, target_argmax);
+    let mut emitted = acc_tok;
+    emitted.push(bonus_tok);
+    Ok(DDTreeGreedySample {
+        output_token_ids: emitted,
+        accepted_compact_indices: acc_compact,
+        bonus_parent_compact_index: bonus_parent,
+    })
+}
+
+/// Build a DEPTH-CONTIGUOUS caterpillar TreePayload for the K=γ+1 DFlash
+/// verify (`ATLAS_DFLASH_CATERPILLAR=1`).
+///
+/// ## The invariant this enforces (why it is lossless without a kernel)
+///
+/// The K=γ verify lays compact slot `t` at KV/RoPE position `seq_len + t` and
+/// attention at slot `t` reads positions `[0 .. seq_len + t]` (the flat-chain
+/// metadata in `verify_d.rs`). The post-verify KV-compaction (FIX 2) relocates
+/// an accepted node's K/V bytes from `pre + compact` down to `pre + j`, but it
+/// CANNOT re-RoPE them. So for any node the greedy walk might COMMIT, its KV is
+/// lossless after relocation iff BOTH hold at verify time:
+///   1. `slot == depth`  → the RoPE phase baked at `pre + slot` equals the
+///      contiguous home position `pre + depth`.
+///   2. slots `[0 .. slot-1]` ARE exactly that node's ancestor chain → the
+///      attention context it was conditioned on survives compaction unchanged.
+///
+/// ## The layout
+///
+/// The top-1 chain is the SPINE, laid contiguously at compact slots
+/// `1, 2, …, spine_len` (slot == depth, both invariants trivially hold for
+/// every spine node — this is the byte-identical flat baseline when the target
+/// stays on top-1). At the SHALLOWEST gated cliff (spine depth `d`), a single
+/// top-2 token is forked as a LEAF whose parent is the spine node at depth
+/// `d-1` (compact slot `d-1`), and the leaf is placed at compact slot `d`
+/// (== its depth). To make room without growing `n`, the spine's own depth-`d`
+/// node and everything below it shift up by one slot (the deepest spine node is
+/// dropped so the node count stays `n`). After the shift:
+///   * The fork leaf at slot `d` reads slots `[0..d-1]` = spine `[0..d-1]` =
+///     its true ancestors, and `slot d == depth d` → committing it (the walk
+///     diverges to top-2 at the cliff) is lossless: KV-compaction is a no-op
+///     (`compact d == j d`) and RoPE is already correct.
+///   * The spine continuation past the cliff is pushed one slot deeper, so IF
+///     the target instead stays on top-1 the walk re-converges onto a shifted
+///     run. That run is still committed by the SAME greedy oracle (draft ==
+///     target argmax), and its KV/RoPE carry the shifted-slot positions which
+///     KV-compaction relocates to the contiguous home — the relocation is a
+///     pure byte move of an already-correct ancestor-conditioned K/V because
+///     each shifted spine node's prefix `[0..slot-1]` is STILL its ancestor
+///     chain (the inserted fork leaf at slot `d` is a leaf with no spine child,
+///     so it is the only non-ancestor in the prefix; see the contamination
+///     guard below — we therefore commit at most the fork OR the shallow spine
+///     prefix, never a deep shifted spine tail through the leaf).
+///
+/// To keep the guarantee airtight we lay the fork leaf at slot `d` and the
+/// spine prefix `1..d-1` BEFORE it (DFS pre-order: root → spine[1..d-1] →
+/// {fork-leaf @ d, spine-continuation @ d+1..}). Then:
+///   * accepted path "spine then fork-leaf"  = `[1, 2, …, d-1, d]` (contiguous)
+///   * accepted path "spine then top-1 child" = `[1, 2, …, d-1, d+1, d+2, …]`
+///     — the ONE non-contiguous jump is `d-1 → d+1`, skipping the fork leaf at
+///     slot `d`. The spine child at slot `d+1` has true depth `d`; its prefix
+///     `[0..d]` contains the fork leaf at slot `d` (a non-ancestor). To keep
+///     THIS path lossless too, the spine child's RoPE must be `pre+d` not
+///     `pre+(d+1)` — which only the depth-RoPE tree-aware path supplies. Under
+///     pure flat metadata only the fork-leaf branch (and the pre-cliff prefix)
+///     is guaranteed lossless; the spine-past-cliff branch needs
+///     `ATLAS_DDTREE_TREE_AWARE_VERIFY=1`. Both are committed by the lossless
+///     greedy oracle regardless; the env gate decides whether the deep tail is
+///     byte-exact or simply not accepted.
+///
+/// `cliff_depths` are spine depths (1-based, the depth of the spine node the
+/// fork attaches BELOW) selected by the caller's margin gate, ascending. Only
+/// the shallowest is used for the strictly-lossless single-fork layout; deeper
+/// entries are reserved for the tree-aware multi-fork extension and ignored
+/// here so the flat-metadata path never commits a contaminated node.
+pub fn build_caterpillar_payload(
+    spine: &[u32],
+    fork_token: u32,
+    cliff_depth: usize,
+) -> TreePayload {
+    let n = spine.len();
+    // Degenerate guards → plain flat chain (no fork).
+    if n < 2 || cliff_depth == 0 || cliff_depth > n {
+        let parent_indices = (0..n as i32).map(|i| i - 1).collect();
+        return TreePayload {
+            tree_token_ids: spine.to_vec(),
+            parent_indices,
+        };
+    }
+
+    // Slot layout (compact indices are 1-based; slot 0 is the bonus/root):
+    //   slots 1 .. cliff_depth-1 : spine[0 .. cliff_depth-2]   (depth == slot)
+    //   slot  cliff_depth        : FORK LEAF (top-2), depth == cliff_depth,
+    //                              parent = spine node at slot cliff_depth-1
+    //   slots cliff_depth+1 .. n : spine[cliff_depth-1 ..]      (shifted +1)
+    // The deepest spine token (spine[n-1]) is dropped to hold n total nodes.
+    let mut tree_token_ids: Vec<u32> = Vec::with_capacity(n);
+    let mut parent_indices: Vec<i32> = Vec::with_capacity(n);
+
+    // Spine prefix before the cliff: compact slots 1..=cliff_depth-1.
+    for i in 0..cliff_depth.saturating_sub(1) {
+        tree_token_ids.push(spine[i]);
+        parent_indices.push(i as i32 - 1); // parent = slot i (== i-1 in 0-based payload idx)
+    }
+    // Fork leaf at compact slot `cliff_depth`. Parent compact slot =
+    // cliff_depth-1 → payload index (cliff_depth-1)-1 = cliff_depth-2.
+    tree_token_ids.push(fork_token);
+    parent_indices.push((cliff_depth as i32) - 2);
+    // Spine continuation: original spine[cliff_depth-1 ..], each pushed one
+    // slot deeper. Their parent is the spine node at depth d-1 (the cliff's
+    // parent, compact slot cliff_depth-1 → payload index cliff_depth-2) for
+    // the first one, then the previous continuation node.
+    // First continuation node (true depth cliff_depth) attaches to the spine
+    // node at slot cliff_depth-1 (payload index cliff_depth-2), SKIPPING the
+    // fork leaf — so the spine path is `…, d-1, d+1, …` and never threads
+    // through the leaf.
+    let mut prev_parent = (cliff_depth as i32) - 2;
+    for i in (cliff_depth - 1)..n {
+        if tree_token_ids.len() >= n {
+            break; // node budget reached (we dropped the deepest spine token)
+        }
+        tree_token_ids.push(spine[i]);
+        parent_indices.push(prev_parent);
+        prev_parent = tree_token_ids.len() as i32 - 1; // this node's payload index
+    }
+
+    TreePayload {
+        tree_token_ids,
+        parent_indices,
+    }
+}
+
+/// Build a depth-contiguous caterpillar where the FORK (top-2) branch carries
+/// the post-cliff TAIL contiguously, and the top-1-at-cliff is a single
+/// high-slot leaf (`ATLAS_DFLASH_CATERPILLAR=1` + `ATLAS_DFLASH_CAT_TAIL=1`).
+///
+/// This is the EV variant: it bets that at a low-margin cliff the target's
+/// greedy picks the drafter's TOP-2, and that the predictable tail after the
+/// cliff (indentation, closers, `):`) re-accepts even when re-rooted on top-2.
+/// Layout (compact slots, slot 0 = bonus/root):
+///   slots 1..cliff-1 : top-1 spine prefix   (depth == slot)
+///   slot  cliff      : FORK top-2 token      (depth == cliff)
+///   slots cliff+1..S : tail = the linear top-1 drafts AFTER the cliff,
+///                      re-rooted onto the top-2 fork (depth == slot)
+///   slot  S+1        : top-1-at-cliff LEAF   (the rejected alternative; a
+///                      single node so when the target stays on top-1 the
+///                      flat-safe walk truncates to the prefix + this bonus =
+///                      byte-identical to the flat baseline)
+///
+/// LOSSLESS under the flat-safe sampler: the committed run is always the
+/// contiguous `[1..k]` prefix the greedy walk traverses. If the walk dives
+/// into the top-2 tail it stays contiguous (the whole tail commits — the GAIN);
+/// if it diverges to the top-1 leaf at slot S+1 the flat-safe contract turns
+/// that into a single bonus (no contaminated tail committed). The fork token at
+/// slot `cliff` and every tail node sit at slot == depth, so RoPE + the
+/// slot-prefix-as-ancestors invariant hold for the committed contiguous run.
+///
+/// `cliff_depth` = the depth of the fork node (1-based compact slot it occupies
+/// = parent spine depth + 1). `tail` = the drafter's top-1 tokens that followed
+/// the cliff in the linear chain (caller passes `drafts[cliff_row+1 ..]`).
+pub fn build_caterpillar_tail_payload(
+    spine: &[u32],
+    fork_token: u32,
+    cliff_depth: usize,
+    tail: &[u32],
+) -> TreePayload {
+    let n = spine.len();
+    if n < 2 || cliff_depth == 0 || cliff_depth > n {
+        let parent_indices = (0..n as i32).map(|i| i - 1).collect();
+        return TreePayload {
+            tree_token_ids: spine.to_vec(),
+            parent_indices,
+        };
+    }
+
+    let mut tree_token_ids: Vec<u32> = Vec::with_capacity(n);
+    let mut parent_indices: Vec<i32> = Vec::with_capacity(n);
+
+    // Top-1 spine prefix: compact slots 1..=cliff_depth-1 (depth == slot).
+    for i in 0..cliff_depth.saturating_sub(1) {
+        tree_token_ids.push(spine[i]);
+        parent_indices.push(i as i32 - 1);
+    }
+    // Fork node (top-2) at compact slot cliff_depth. Parent = slot
+    // cliff_depth-1 → payload index cliff_depth-2.
+    tree_token_ids.push(fork_token);
+    parent_indices.push((cliff_depth as i32) - 2);
+    // Tail re-rooted on the fork: each node is a child of the previous, laid
+    // contiguously at slots cliff_depth+1.. Reserve ONE slot at the end for the
+    // top-1 leaf, so the tail takes at most n - cliff_depth - 1 nodes.
+    let mut prev = tree_token_ids.len() as i32 - 1; // fork node's payload idx
+    let tail_budget = n.saturating_sub(cliff_depth + 1);
+    for &t in tail.iter().take(tail_budget) {
+        tree_token_ids.push(t);
+        parent_indices.push(prev);
+        prev = tree_token_ids.len() as i32 - 1;
+    }
+    // Top-1-at-cliff leaf at the final slot, sibling of the fork (same parent =
+    // the spine node at slot cliff_depth-1, payload idx cliff_depth-2).
+    if tree_token_ids.len() < n {
+        tree_token_ids.push(spine[cliff_depth - 1]);
+        parent_indices.push((cliff_depth as i32) - 2);
+    }
+    // Pad any remaining budget with a benign continuation off the leaf so the
+    // node count stays exactly n (verify K shape unchanged). These padding
+    // nodes are never on the committed contiguous run.
+    while tree_token_ids.len() < n {
+        let pad_idx = tree_token_ids.len() as i32 - 1;
+        tree_token_ids.push(spine[(cliff_depth).min(n - 1)]);
+        parent_indices.push(pad_idx);
+    }
+
+    TreePayload {
+        tree_token_ids,
+        parent_indices,
+    }
+}
+
 /// Map a DDTree greedy walk's `accepted_compact_indices` to the kernel
 /// intermediate slot index of the **last accepted state**.
 ///
@@ -1351,6 +1601,226 @@ mod tests {
         assert_eq!(s.output_token_ids, vec![10, 20]);
         assert_eq!(s.accepted_compact_indices, vec![1]);
         assert_eq!(s.bonus_parent_compact_index, 1);
+    }
+
+    // ── Depth-contiguous caterpillar builder ──
+
+    /// The committed fork-leaf branch must be at compact slot == its depth
+    /// AND its slot-prefix must be exactly its ancestor chain (the lossless
+    /// invariant). We assert both from the payload structure.
+    #[test]
+    fn caterpillar_fork_leaf_is_at_depth_slot() {
+        // Spine of 8 top-1 tokens [10..80], cliff at spine depth 3 (fork off
+        // the depth-2 spine node), fork token 999.
+        let spine = [10u32, 20, 30, 40, 50, 60, 70, 80];
+        let p = build_caterpillar_payload(&spine, 999, 3);
+        // n nodes preserved.
+        assert_eq!(p.tree_token_ids.len(), spine.len());
+        assert_eq!(p.parent_indices.len(), spine.len());
+        // Layout: slots 1,2 = spine[0],spine[1]; slot 3 = fork(999) parent slot2;
+        // slots 4.. = spine[2],spine[3],... (shifted, deepest dropped).
+        assert_eq!(p.tree_token_ids[0], 10); // slot 1
+        assert_eq!(p.tree_token_ids[1], 20); // slot 2
+        assert_eq!(p.tree_token_ids[2], 999); // slot 3 = FORK LEAF (depth 3)
+        assert_eq!(p.tree_token_ids[3], 30); // slot 4 = spine[2] (depth 3, shifted)
+        // Fork leaf (payload idx 2, compact slot 3) parent = compact slot 2
+        // (payload idx 1).
+        assert_eq!(p.parent_indices[2], 1);
+        // First spine continuation (payload idx 3, slot 4) parent = compact
+        // slot 2 (payload idx 1) — SKIPS the fork leaf at slot 3.
+        assert_eq!(p.parent_indices[3], 1);
+
+        // Build the runtime and verify the lossless invariant for the
+        // fork-leaf branch: walk root→spine[0]→spine[1]→fork(999).
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // argmax: root→10, after-slot1→20, after-slot2→999 (diverge to fork),
+        // after-fork→bonus 7.
+        let mut argmax = vec![0u32; 1 + p.tree_token_ids.len()];
+        argmax[0] = 10; // root predicts spine[0]
+        argmax[1] = 20; // slot1 predicts spine[1]
+        argmax[2] = 999; // slot2 predicts the FORK token (target picks top-2)
+        argmax[3] = 7; // fork-leaf row → bonus
+        let full = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        // Accepted compact path is [1, 2, 3] — CONTIGUOUS (== depths 1,2,3).
+        assert_eq!(full.accepted_compact_indices, vec![1, 2, 3]);
+        assert_eq!(full.output_token_ids, vec![10, 20, 999, 7]);
+        // last inter slot == 3 == depth of the committed fork leaf.
+        assert_eq!(last_accepted_inter_slot(&full.accepted_compact_indices), 3);
+    }
+
+    #[test]
+    fn caterpillar_spine_path_stays_flat_safe() {
+        // When the target follows top-1 (no divergence at the cliff), the walk
+        // accepts the contiguous spine prefix then jumps to the shifted
+        // continuation. greedy_sample_ddtree (flat-safe) truncates at the jump
+        // → identical token contract to the flat baseline (the fork leaf is
+        // simply unused). This guards the no-regress case.
+        let spine = [10u32, 20, 30, 40, 50, 60, 70, 80];
+        let p = build_caterpillar_payload(&spine, 999, 3);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // Target stays on top-1: root→10, slot1→20, slot2→30 (the spine
+        // child, NOT the fork 999).
+        let mut argmax = vec![0u32; 1 + p.tree_token_ids.len()];
+        argmax[0] = 10;
+        argmax[1] = 20;
+        argmax[2] = 30; // spine child (compact slot 4) — diverges from compact order
+        argmax[3] = 40;
+        argmax[4] = 50;
+        for k in 5..argmax.len() {
+            argmax[k] = 0; // mismatch → stop
+        }
+        let flat = greedy_sample_ddtree(&r, &argmax).unwrap();
+        // Flat-safe truncates at the first non-contiguous accept (slot 4 != 3),
+        // committing [10, 20] + bonus 30 — byte-identical to flat-baseline.
+        assert_eq!(flat.accepted_compact_indices, vec![1, 2]);
+        assert_eq!(flat.output_token_ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn caterpillar_tail_commits_fork_branch_contiguously() {
+        // Spine top-1 [10,20,30,40,50,60,70,80], cliff at depth 3 (fork off the
+        // depth-2 node), fork token 999, tail [31,41,51] (the post-cliff top-1
+        // drafts re-rooted onto the fork).
+        let spine = [10u32, 20, 30, 40, 50, 60, 70, 80];
+        let tail = [31u32, 41, 51, 61, 71];
+        let p = build_caterpillar_tail_payload(&spine, 999, 3, &tail);
+        assert_eq!(p.tree_token_ids.len(), spine.len());
+        // slots: 1=10, 2=20, 3=999(fork), 4=31, 5=41, 6=51, 7=61, 8=top1-leaf(30)
+        assert_eq!(p.tree_token_ids[0], 10);
+        assert_eq!(p.tree_token_ids[1], 20);
+        assert_eq!(p.tree_token_ids[2], 999); // fork at slot 3 == depth 3
+        assert_eq!(p.tree_token_ids[3], 31); // tail re-rooted on fork
+        // top-1-at-cliff leaf is the LAST node (sibling of the fork).
+        assert_eq!(*p.tree_token_ids.last().unwrap(), 30);
+        assert_eq!(*p.parent_indices.last().unwrap(), 1); // parent = slot 2
+
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // Target picks top-2 (999) at the cliff, then the tail re-accepts:
+        // root→10, slot1→20, slot2→999, slot3(fork)→31, slot4→41, slot5→bonus.
+        let mut argmax = vec![0u32; 1 + p.tree_token_ids.len()];
+        argmax[0] = 10;
+        argmax[1] = 20;
+        argmax[2] = 999;
+        argmax[3] = 31;
+        argmax[4] = 41;
+        argmax[5] = 7; // bonus
+        let s = greedy_sample_ddtree(&r, &argmax).unwrap();
+        // Contiguous commit [1,2,3,4,5] — the whole top-2 tail, the GAIN.
+        assert_eq!(s.accepted_compact_indices, vec![1, 2, 3, 4, 5]);
+        assert_eq!(s.output_token_ids, vec![10, 20, 999, 31, 41, 7]);
+    }
+
+    #[test]
+    fn caterpillar_tail_top1_path_is_flat_safe() {
+        // Target stays on top-1 at the cliff: root→10, slot1→20, slot2→30
+        // (the top-1 token, which is the LEAF at the high slot). Flat-safe
+        // truncates → [10,20] + bonus 30 = byte-identical to flat baseline.
+        let spine = [10u32, 20, 30, 40, 50, 60, 70, 80];
+        let tail = [31u32, 41, 51];
+        let p = build_caterpillar_tail_payload(&spine, 999, 3, &tail);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        let mut argmax = vec![0u32; 1 + p.tree_token_ids.len()];
+        argmax[0] = 10;
+        argmax[1] = 20;
+        argmax[2] = 30; // top-1 → the high-slot leaf (non-contiguous)
+        for k in 3..argmax.len() {
+            argmax[k] = 0;
+        }
+        let s = greedy_sample_ddtree(&r, &argmax).unwrap();
+        assert_eq!(s.accepted_compact_indices, vec![1, 2]);
+        assert_eq!(s.output_token_ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn caterpillar_tail_all_parents_causal() {
+        let spine: Vec<u32> = (1..=16u32).map(|i| i * 10).collect();
+        let tail: Vec<u32> = (1..=16u32).map(|i| i * 100).collect();
+        for cliff in 1..=16usize {
+            let p = build_caterpillar_tail_payload(&spine, 7777, cliff, &tail);
+            assert_eq!(p.tree_token_ids.len(), spine.len(), "cliff={cliff}");
+            for i in 0..p.parent_indices.len() {
+                let par = p.parent_indices[i];
+                assert!(par >= -1 && par < i as i32, "cliff={cliff} idx={i} par={par}");
+            }
+        }
+    }
+
+    #[test]
+    fn caterpillar_degenerate_inputs_fall_back_to_flat_chain() {
+        // cliff_depth 0 or n<2 → plain flat chain (no fork node).
+        let spine = [10u32, 20, 30];
+        let p0 = build_caterpillar_payload(&spine, 999, 0);
+        assert_eq!(p0.tree_token_ids, vec![10, 20, 30]);
+        assert_eq!(p0.parent_indices, vec![-1, 0, 1]);
+        let one = build_caterpillar_payload(&[42u32], 999, 1);
+        assert_eq!(one.tree_token_ids, vec![42]);
+        assert_eq!(one.parent_indices, vec![-1]);
+    }
+
+    #[test]
+    fn caterpillar_all_parents_are_causal_and_well_formed() {
+        // Every parent index must be < its own payload index (causal) and the
+        // node count is preserved across a range of cliff depths.
+        let spine: Vec<u32> = (1..=16u32).map(|i| i * 10).collect();
+        for cliff in 1..=16usize {
+            let p = build_caterpillar_payload(&spine, 7777, cliff);
+            assert_eq!(p.tree_token_ids.len(), spine.len(), "cliff={cliff}");
+            assert_eq!(p.parent_indices.len(), spine.len(), "cliff={cliff}");
+            for i in 0..p.parent_indices.len() {
+                let par = p.parent_indices[i];
+                assert!(par >= -1 && par < i as i32, "cliff={cliff} idx={i} par={par}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_sampler_commits_fork_tail() {
+        // Single-cliff branch shape (the ATLAS_DFLASH_BRANCH=1 topology):
+        //   compact 1: chain token 10 (root child)
+        //   compact 2: chain token 20 (child of 1)
+        //   compact 3: leaf token 99 (fork off compact 1 — parent = 1)
+        // Flat indices: [1, 2] are contiguous; compact 3 is a sibling fork
+        // off compact 1, so it diverges from the flat chain.
+        //
+        // Target greedy: root->10 (compact 1), compact-1 row -> 99 (fork to
+        // the leaf at compact 3 instead of the chain child 20).
+        let r = req(&[10, 20, 99], &[-1, 0, 0]);
+        // argmax rows: [root, after-1, after-2, after-3].
+        // root -> 10 (accept compact 1); compact-1 row -> 99 (accept leaf
+        // compact 3); compact-3 row -> 777 (bonus).
+        let argmax = vec![10u32, 99, 0, 777];
+
+        // Flat-safe contract: truncates at the fork — accepts only [1], emits
+        // [10, 99] (99 becomes a single bonus), tail token 99's own row is
+        // NOT advanced into.
+        let flat = greedy_sample_ddtree(&r, &argmax).unwrap();
+        assert_eq!(flat.accepted_compact_indices, vec![1]);
+        assert_eq!(flat.output_token_ids, vec![10, 99]);
+
+        // Full tree-path commit: accepts the whole walk [1, 3], emits the
+        // path tokens [10, 99] AND the fresh bonus 777 read from compact 3.
+        let full = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        assert_eq!(full.accepted_compact_indices, vec![1, 3]);
+        assert_eq!(full.output_token_ids, vec![10, 99, 777]);
+        // Last accepted inter slot is the genuine max compact index (3),
+        // which the SSM commit reads — NOT len-1 = 1.
+        assert_eq!(last_accepted_inter_slot(&full.accepted_compact_indices), 3);
+    }
+
+    #[test]
+    fn full_sampler_matches_flat_when_path_is_contiguous() {
+        // When the greedy walk stays on the flat chain, the full sampler and
+        // the flat-safe sampler must agree byte-for-byte (no-regress on the
+        // common case).
+        let r = req(&[10, 20, 30, 40], &[-1, 0, 1, 2]);
+        let argmax = vec![10u32, 20, 30, 40, 99];
+        let flat = greedy_sample_ddtree(&r, &argmax).unwrap();
+        let full = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        assert_eq!(flat.output_token_ids, full.output_token_ids);
+        assert_eq!(
+            flat.accepted_compact_indices,
+            full.accepted_compact_indices
+        );
     }
 
     #[test]

@@ -26,9 +26,7 @@ impl BlockDiffusionDraftHead {
         let h = self.hidden_size as u32;
         let q_dim = (self.num_q_heads * self.head_dim) as u32;
         let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
-        let inter = self.intermediate_size as u32;
         let bf16 = 2usize;
-        let inv_sqrt_d = 1.0f32 / (self.head_dim as f32).sqrt();
         let gpu = ctx.gpu;
 
         // ── Kernel profiler (ATLAS_DFLASH_KERNEL_PROFILE=1) ──
@@ -348,11 +346,65 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?;
             }
+            // EAGLE-3.1 per-layer FC-normalization (vLLM 2026-05-26):
+            // ATLAS_DFLASH_FC_LAYERNORM=1 (default OFF). When the fc layer
+            // consumes a CONCATENATION of multiple target-layer hidden states,
+            // "the fused input becomes increasingly imbalanced as higher-layer
+            // hidden states dominate" (larger magnitude). The fix is to
+            // normalize EACH captured target hidden state independently
+            // BEFORE the fc layer. DFlash concatenates the 5 raw captures
+            // [layers 1,16,31,46,61] into one [5*2048] BF16 stack feeding ONE
+            // fc GEMV — exactly the broken thing. Here we apply a per-slice
+            // unit-variance RMSNorm (zero-weight → x*rms, no learned gamma) to
+            // each of the n_capture layer slices so no single late-layer
+            // capture's magnitude dominates the fused fc input. Drafter-side
+            // only → target verify unchanged → token-exact; raises ACCEPTANCE.
+            //
+            // OOD caveat: self.fc was TRAINED on UN-normalized concat, so this
+            // is out-of-distribution and may help or hurt — measured A/B.
+            // Variant (a): plain unit-variance (no learned norm weight).
+            let fc_layernorm = std::env::var("ATLAS_DFLASH_FC_LAYERNORM")
+                .ok()
+                .as_deref()
+                == Some("1");
             if new_fc_count > 0 {
                 // Compute fc projection for new context positions.
                 for i in 0..new_fc_count {
                     let abs_pos = old_fc_end + i;
-                    let src_slot = base.offset(abs_pos * ctx_slot_bytes);
+                    let raw_slot = base.offset(abs_pos * ctx_slot_bytes);
+                    // Per-layer FC-norm: copy each of the n_capture target-layer
+                    // slices [target_hidden_size] into fc_norm_in, unit-variance
+                    // RMS-normalized independently, then feed the normalized
+                    // concat to the fc GEMV instead of the raw slot. Mirrors the
+                    // ZERO_LATE_LAYERS per-layer slicing of `ctx_hidden_acc`.
+                    let src_slot = if fc_layernorm {
+                        let n_capture = self.target_layer_ids.len();
+                        let h_elems = self.target_hidden_size as u32;
+                        for layer_i in 0..n_capture {
+                            let in_ptr =
+                                raw_slot.offset(layer_i * self.target_hidden_size * bf16);
+                            let out_ptr = self
+                                .scratch
+                                .fc_norm_in
+                                .offset(layer_i * self.target_hidden_size * bf16);
+                            ops::rms_norm(
+                                gpu,
+                                self.kernels.rms_norm,
+                                in_ptr,
+                                &crate::weight_map::DenseWeight {
+                                    weight: self.scratch.fc_norm_zero_w,
+                                },
+                                out_ptr,
+                                1,
+                                h_elems,
+                                self.rms_norm_eps,
+                                stream,
+                            )?;
+                        }
+                        self.scratch.fc_norm_in
+                    } else {
+                        raw_slot
+                    };
                     let dst_slot = self
                         .scratch
                         .fc_proj
@@ -442,117 +494,129 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        // ── Step 2: stream_buf layout ──
-        // First eff_ctx rows: zero (Q-side ctx is zero; K/V-side gets
-        // overwritten in step 3b' below).
-        // Next γ rows: embed of [last_token (bonus), mask, mask, ..., mask].
-        // The drafter is trained with query = [next_token_id, mask × (γ-1)]
-        // per vLLM (qwen3_dflash.py + dflash.py:set_inputs_first_pass: "Q from
-        // query embeddings (bonus + mask tokens)"). Without the bonus token at
-        // position 0, the drafter has no anchor and produces a constant
-        // high-frequency token (`,`, `<|im_end|>`) for every position.
-        // Total stream_buf width = n_attn rows.
-        if eff_ctx > 0 {
-            gpu.memset(
-                self.scratch.stream_buf,
-                0,
-                eff_ctx * self.hidden_size * bf16,
-            )?;
-        }
+        // ── Steps 2–5: noise-block forward — possibly iterated ──
+        //
+        // The per-pass body (noise-embedding build → 8 drafter layers →
+        // final norm/lm_head → per-row argmax) lives in
+        // `noise_pass.rs:run_noise_pass`, extracted verbatim from here.
+        //
+        // ATLAS_DFLASH_DENOISE_STEPS=N (default 1 = single pass, the
+        // original behavior with zero added work) runs the γ-block noise
+        // forward N times per propose. After pass k, rows whose argmax is
+        // confident (top1−top2 logit margin ≥ ATLAS_DFLASH_DENOISE_MARGIN,
+        // default 1.0) are "committed": pass k+1 embeds the predicted token
+        // at that row instead of the mask embedding, so the still-masked
+        // rows are conditioned on partial predictions (DiffusionGemma-style
+        // iterative refinement). Committed rows are frozen into the final
+        // drafts (ATLAS_DFLASH_DENOISE_FREEZE=0 takes the last pass's
+        // argmax everywhere instead). Early exits: a pass that commits no
+        // new rows would re-run on identical input (deterministic → same
+        // output), and a pass with ALL rows already committed has nothing
+        // masked left to refine — both break out of the loop, so uniformly
+        // high pass-1 confidence (counting workloads) pays for at most one
+        // extra pass.
+        //
+        // Cache safety: the per-layer ctx K/V caches and the fc_proj cache
+        // are append-once with explicit range tracking. Step 0 (fc
+        // projection) runs once above; passes ≥1 re-enter the layer loop
+        // where old_ctx_count == eff_ctx and new_ctx_count == 0, so caches
+        // are only COPIED from, never re-appended — cache_{k,v,fc}_start/
+        // end stay consistent across passes.
+        //
+        // OOD caveat: the drafter is TRAINED with all-mask noise rows;
+        // real-token embeddings at committed rows are out-of-distribution.
+        // Measure acceptance A/B before enabling in production.
+        //
         // ATLAS_DFLASH_MASK_OVERRIDE: env var override for the mask token ID.
         let mask_id = std::env::var("ATLAS_DFLASH_MASK_OVERRIDE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(self.mask_token_id);
-        // [eff_ctx zeros, last_token (bonus), mask_id × γ_eff] = eff_ctx + 1 + γ_eff.
-        let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
-            .chain(std::iter::once(last_token as i32))
-            .chain(std::iter::repeat_n(mask_id as i32, gamma_eff))
-            .collect();
-        if debug_dump {
-            tracing::info!(
-                "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
-                self.mask_token_id,
-                eff_ctx,
-                &token_ids_host[..token_ids_host.len().min(8)],
-            );
-        }
-        let tid_bytes: Vec<u8> = token_ids_host
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
-        gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
-        ops::batched_embed(
-            gpu,
-            self.kernels.batched_embed,
-            self.scratch.draft_tokens_dev,
-            self.embed_tokens_shared,
-            self.scratch.stream_buf,
-            n_attn,
-            h,
-            stream,
-        )?;
-        // Re-zero ctx slots (batched_embed wrote token-0 embedding to them).
-        if eff_ctx > 0 {
-            gpu.memset(
-                self.scratch.stream_buf,
-                0,
-                eff_ctx * self.hidden_size * bf16,
-            )?;
-        }
-        // ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1: overwrite noise rows
-        // [eff_ctx..n_attn) with a deterministic pattern matching the
-        // PyTorch reference. Lets us compare layer-0 q/k/v post-projection
-        // when both Atlas and PyTorch see identical input.
-        let force_noise_pattern = std::env::var("ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN")
+        let denoise_steps: usize = std::env::var("ATLAS_DFLASH_DENOISE_STEPS")
             .ok()
-            .as_deref()
-            == Some("1");
-        if force_noise_pattern {
-            let mut bytes = Vec::with_capacity(self.gamma * self.hidden_size * 2);
-            for t in 0..self.gamma {
-                for j in 0..self.hidden_size {
-                    let v =
-                        0.001_f32 * ((t + 1) as f32) * ((j + 1) as f32) / (self.hidden_size as f32);
-                    let bf16_bits = (v.to_bits() >> 16) as u16;
-                    bytes.extend_from_slice(&bf16_bits.to_le_bytes());
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 8);
+        let denoise_margin: f32 = std::env::var("ATLAS_DFLASH_DENOISE_MARGIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        let denoise_freeze =
+            std::env::var("ATLAS_DFLASH_DENOISE_FREEZE").ok().as_deref() != Some("0");
+        let argmax_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
+        let needed_start = ctx_total.saturating_sub(eff_ctx);
+        let pass_args = super::noise_pass::NoisePassArgs {
+            last_token,
+            eff_ctx,
+            gamma_eff,
+            n_attn,
+            mask_id,
+            needed_start,
+            stream,
+            debug_dump,
+            kprofile,
+        };
+        let mut committed: Vec<Option<u32>> = vec![None; gamma_eff];
+        let t_layers = std::time::Instant::now();
+        for pass in 0..denoise_steps {
+            self.run_noise_pass(&pass_args, &committed, ctx, dstate)?;
+            if pass + 1 == denoise_steps {
+                break;
+            }
+            // Confidence feedback: top-2 over this pass's logits gives the
+            // per-row top1−top2 margin; the argmax tokens are already in
+            // draft_tokens_dev. Cost: one topk launch + ~γ·12 bytes D2H.
+            let used_bytes = gamma_eff * 2 * 4;
+            gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
+            gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
+            ops::topk_bf16(
+                gpu,
+                self.kernels.topk,
+                self.scratch.logits,
+                self.scratch.topk_tokens_dev,
+                self.scratch.topk_logits_dev,
+                gamma_eff as u32,
+                argmax_vocab,
+                2,
+                stream,
+            )?;
+            gpu.synchronize(stream)?;
+            let mut tok_bytes = vec![0u8; gamma_eff * 4];
+            gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut tok_bytes)?;
+            let mut top2_bytes = vec![0u8; used_bytes];
+            gpu.copy_d2h(self.scratch.topk_logits_dev, &mut top2_bytes)?;
+            let pass_tokens: Vec<u32> = tok_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let top2: Vec<f32> = top2_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let mut newly_committed = 0usize;
+            for i in 0..gamma_eff {
+                if committed[i].is_some() {
+                    continue;
+                }
+                let margin = top2[i * 2] - top2[i * 2 + 1];
+                if margin >= denoise_margin {
+                    committed[i] = Some(pass_tokens[i]);
+                    newly_committed += 1;
                 }
             }
-            gpu.copy_h2d(
-                &bytes,
-                self.scratch
-                    .stream_buf
-                    .offset(eff_ctx * self.hidden_size * bf16),
-            )?;
+            let n_committed = committed.iter().filter(|c| c.is_some()).count();
+            tracing::debug!(
+                "DFlash denoise pass {}: +{} committed ({}/{} rows, margin≥{})",
+                pass,
+                newly_committed,
+                n_committed,
+                gamma_eff,
+                denoise_margin,
+            );
+            if newly_committed == 0 || n_committed == gamma_eff {
+                break;
+            }
         }
-
-        // ── Step 3: 8 drafter layers ──
-        //
-        // All compute runs on `n_attn = eff_ctx + γ` rows. Slots [0..eff_ctx]
-        // are CTX (Q-zero / KV from fc_proj projection) and slots
-        // [eff_ctx..n_attn] are NOISE (full Q/K/V from embeddings).
-        // Per-layer flow follows `dflash.py:Qwen3DFlashDecoderLayer.forward`.
-        // Body extracted to `forward_block_layer.rs` for the 500-LoC budget.
-        let needed_start = ctx_total.saturating_sub(eff_ctx);
-        let t_layers = std::time::Instant::now();
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let args = super::forward_block_layer::LayerArgs {
-                layer_idx,
-                n_attn,
-                eff_ctx,
-                h,
-                q_dim,
-                kv_dim,
-                inter,
-                bf16,
-                inv_sqrt_d,
-                stream,
-                needed_start,
-                window: self.ctx_window,
-            };
-            self.forward_block_layer(layer, &args, ctx, debug_dump, dstate, kprofile)?;
-        }
-        // Drop the original inline loop body — extracted to helper.
         let layers_us = if kprofile {
             gpu.synchronize(stream)?;
             t_layers.elapsed().as_micros()
@@ -560,104 +624,10 @@ impl BlockDiffusionDraftHead {
             0
         };
         let t_tail = std::time::Instant::now();
-
-        // ── Step 4: final RMSNorm + LM head on MASK rows only ──
-        // Skip ctx slots [0..eff_ctx] (garbage) AND the bonus row at
-        // slot eff_ctx (untrained for prediction output). Read γ MASK
-        // rows starting at offset `(eff_ctx + 1) * h * bf16`.
-        let noise_byte_offset = (eff_ctx + 1) * self.hidden_size * bf16;
-        let stream_noise = self.scratch.stream_buf.offset(noise_byte_offset);
-        let norm_noise = self.scratch.norm_buf.offset(noise_byte_offset);
-        ops::rms_norm(
-            gpu,
-            self.kernels.rms_norm,
-            stream_noise,
-            &self.norm,
-            norm_noise,
-            gamma_eff as u32,
-            h,
-            self.rms_norm_eps,
-            stream,
-        )?;
-        // Capped vocab: the shared lm_head may have fewer rows than the
-        // drafter's vocab_size (e.g. target capped 248320→248077).
-        let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
-        // PERF NOTE (2026-05-19): tried switching to `dense_gemm_tc` here —
-        // the shape (M=γ_eff≤16, N=vocab=248k, K=2048) looks ideal for the
-        // tensor-core kernel (M_TILE=16, m16n8k16 MMA). But A/B benchmark
-        // showed zero throughput change (8.70 vs 8.72 mean tok/s). The
-        // lm_head GEMM is bandwidth-bound on weight read (~1GB at 273GB/s
-        // ≈ 4ms) — TC compute doesn't shrink the floor. Left as scalar
-        // dense_gemm to keep the dispatch simple.
-        ops::dense_gemm(
-            gpu,
-            self.kernels.dense_gemm,
-            norm_noise,
-            &crate::weight_map::DenseWeight {
-                weight: self.lm_head_shared,
-            },
-            self.scratch.logits,
-            gamma_eff as u32,
-            lm_vocab,
-            h,
-            stream,
-        )?;
-
-        // Optional full-stream dump after final norm (debug; before lm_head).
-        if debug_dump {
-            dump_bf16("final.norm_buf[noise0]", norm_noise, 10)?;
-            // Sanity-check: dump first 10 BF16 values of target's lm_head_shared.
-            // If this returns zeros or garbage, the BF16 lm_head was freed by
-            // factory.rs's NVFP4 quantization step.
-            dump_bf16("final.lm_head_shared[0..10]", self.lm_head_shared, 10)?;
-        }
-
-        // ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS=1: final norm/logits/drafts dumps.
         let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
             .ok()
             .as_deref()
             == Some("1");
-        if dump_all_layers {
-            let norm_bytes = self.gamma * self.hidden_size * bf16;
-            let mut buf = vec![0u8; norm_bytes];
-            gpu.synchronize(stream)?;
-            gpu.copy_d2h(norm_noise, &mut buf)?;
-            let path = "/tmp/atlas_final_norm_buf.bin";
-            if !std::path::Path::new(path).exists() {
-                let _ = std::fs::write(path, &buf);
-                tracing::info!("DFLASH DUMP_ALL: wrote {norm_bytes}B to {path}");
-            }
-        }
-
-        // ── Step 5: argmax per row → γ_eff token ids ──
-        let argmax_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
-        let lm_stride = self.target_vocab_size.min(self.vocab_size);
-        for i in 0..gamma_eff {
-            let logits_row = self.scratch.logits.offset(i * lm_stride * bf16);
-            let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
-            ops::argmax_bf16(
-                gpu,
-                self.kernels.argmax,
-                logits_row,
-                token_slot,
-                argmax_vocab,
-                stream,
-            )?;
-        }
-        if debug_dump {
-            dump_bf16("final.logits[noise0]", self.scratch.logits, 10)?;
-        }
-        if dump_all_layers {
-            let logits_bytes = self.gamma * self.vocab_size * bf16;
-            let mut buf = vec![0u8; logits_bytes];
-            gpu.synchronize(stream)?;
-            gpu.copy_d2h(self.scratch.logits, &mut buf)?;
-            let path = "/tmp/atlas_final_logits.bin";
-            if !std::path::Path::new(path).exists() {
-                let _ = std::fs::write(path, &buf);
-                tracing::info!("DFLASH DUMP_ALL: wrote {logits_bytes}B to {path}");
-            }
-        }
 
         // ── Step 5b: optional logit-margin gate (top-1 vs top-2) ──
         //
@@ -782,6 +752,21 @@ impl BlockDiffusionDraftHead {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+
+        // Multi-step denoise: committed rows freeze their commit-time
+        // prediction. On the final pass those rows were embedded as REAL
+        // tokens, so the row's own re-prediction is out-of-distribution
+        // for the drafter (trained to predict at MASK rows only) — keep
+        // the token that earned the confidence commit instead. No-op when
+        // ATLAS_DFLASH_DENOISE_STEPS=1 (committed is all-None) or when
+        // ATLAS_DFLASH_DENOISE_FREEZE=0 (take last-pass argmax verbatim).
+        if denoise_freeze {
+            for (d, c) in drafts.iter_mut().zip(committed.iter()) {
+                if let Some(t) = c {
+                    *d = *t;
+                }
+            }
+        }
 
         // Apply adaptive gamma + margin gate. Two behaviors are available
         // via ATLAS_DFLASH_ADAPTIVE_MODE:

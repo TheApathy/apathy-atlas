@@ -117,13 +117,52 @@ impl TransformerModel {
         // For DFlash K=γ verify: K = γ + 1 (drafter's γ drafts + 1 verified bonus slot).
         // Pool size = max of both so DFlash and MTP can coexist on the same model.
         let dflash_kgamma = if !config.dflash_capture_layers.is_empty() {
-            // Drafter's γ is fixed in dflash config; use the largest known γ
-            // (16 for `Qwen3.6-DFlash`). The +1 is the prefix bonus position
-            // in the verify input `[last_token, draft_0, ..., draft_{γ-1}]`.
-            17
+            // `dflash_kgamma` is the verify token count T = γ+1 (the bonus
+            // last-token slot + γ draft slots) — it sizes every verify-side
+            // persistent buffer: parent_ids capacity (= kernel_parents.len()
+            // = T, see trait_impl/mod.rs), tree_kv_indir stride, and the
+            // tree_kv_pack num_seqs. The verify entry uses `k == capacity`
+            // (verify_d.rs) where k = tokens.len() = T, so the capacity MUST
+            // equal T, not γ.
+            //
+            // Drafter's γ is plumbed through `num_drafts`: for DFlash the
+            // scheduler is configured with `num_drafts = γ - 1` (serve.rs /
+            // build.rs), so T = γ+1 = num_drafts + 2. This MUST track the
+            // ACTUAL γ, not a literal 17, or γ>16 OOBs these buffers. For the
+            // canonical γ=16 run this evaluates to 15+2 = 17 (unchanged).
+            num_drafts + 2
         } else {
             0
         };
+        // ── DDTree wide-tree verify capacity (ATLAS_DDTREE_MAX_NODES) ──
+        // The drafter emits γ draft positions, so the FLAT verify width is
+        // `dflash_kgamma` (= γ+1). But a DDTree branch tree can hold MORE
+        // nodes than γ (top-k siblings expanded per depth, up to a budget).
+        // `ddtree_cap` sizes every verify-side PERSISTENT buffer (SSM
+        // intermediates, parent_ids, tree-KV indirection, hidden-save) to
+        // admit a wider tree. It is clamped to the tree-WY kernel's
+        // compile-time K_MAX=32. Default = dflash_kgamma ⇒ NO behavior change
+        // unless the operator opts in; the flat/counting path keeps verifying
+        // exactly `dflash_kgamma` tokens. When widened, flat verify (k <
+        // ddtree_cap) routes through the proven wy_k path (the persistent
+        // parent injection at `k == capacity` no longer matches at the flat
+        // width — validated bit-identical to the tree_wy-linear-chain path).
+        const DDTREE_KERNEL_KMAX: usize = 32; // must match gated_delta_rule_tree_wy.cu K_MAX
+        let ddtree_cap = if dflash_kgamma > 0 {
+            std::env::var("ATLAS_DDTREE_MAX_NODES")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(dflash_kgamma)
+                .clamp(dflash_kgamma, DDTREE_KERNEL_KMAX)
+        } else {
+            0
+        };
+        if ddtree_cap > dflash_kgamma {
+            tracing::info!(
+                "ATLAS_DDTREE_MAX_NODES: wide-tree verify capacity = {ddtree_cap} \
+                 (flat width dflash_kgamma = {dflash_kgamma}, kernel K_MAX = {DDTREE_KERNEL_KMAX})"
+            );
+        }
         // DFlash needs the SSM verify pools regardless of MTP weight presence
         // or lm_head quantization — its K=γ verify path checkpoints SSM state
         // for partial-accept rollback. Force `has_mtp` on whenever DFlash is
@@ -134,10 +173,16 @@ impl TransformerModel {
             || dflash_kgamma > 0;
         let num_intermediates = if has_mtp {
             // wy17 writes K-1 inter slots (final state in h_state) so dflash_kgamma
-            // suffices for that path. M8A tree_wy writes ALL T = γ+1 slots into
-            // intermediates because tree topology needs every state addressable
-            // by token. Bump by +1 so tree mode never OOBs.
-            (num_drafts + 1).max(dflash_kgamma + 1)
+            // suffices for that path. M8A tree_wy / general-K verify writes ALL
+            // T = γ+1 slots into intermediates because tree topology needs every
+            // state addressable by token. With dflash_kgamma = T (= num_drafts+2),
+            // `dflash_kgamma + 1` = T+1 keeps one slot of headroom so tree mode
+            // never OOBs. For γ=16 this is 17+1 = 18 (unchanged from the prior
+            // hardcoded `.max(17 + 1)`). The MTP branch (`num_drafts + 2`) covers
+            // the K = num_drafts+1 verify when DFlash is inactive.
+            // `ddtree_cap + 1` keeps one slot of headroom so wide-tree mode
+            // (which writes all T tree slots into intermediates) never OOBs.
+            (num_drafts + 2).max(ddtree_cap + 1)
         } else {
             0
         };
@@ -164,7 +209,7 @@ impl TransformerModel {
         // `[-1, 0, 1, ..., K-2]` so flat-payload verify reuses tree_wy
         // without an upload (zero-copy bit-equivalence path).
         let (parent_ids_persistent, parent_ids_capacity) = if dflash_kgamma > 0 {
-            let cap = dflash_kgamma;
+            let cap = ddtree_cap;
             let bytes = cap * std::mem::size_of::<i32>();
             let buf = gpu.alloc(bytes)?;
             // Stamp the linear-chain default: parents[0] = -1, parents[i] = i-1.
@@ -200,7 +245,7 @@ impl TransformerModel {
         // captured pointer always behaves like chain-mode if someone forgets
         // to update it before launch.
         let (tree_kv_indir_persistent, tree_kv_indir_stride) = if dflash_kgamma > 0 {
-            let stride = dflash_kgamma;
+            let stride = ddtree_cap;
             let cells = stride * stride;
             let bytes = cells * std::mem::size_of::<i32>();
             let buf = gpu.alloc(bytes)?;
@@ -286,8 +331,8 @@ impl TransformerModel {
             // num_seqs sized by k_max (= γ+1). Conservative; matches the K=γ
             // verify batch dimension. The scatter kernel only writes the rows
             // actually used per step.
-            let num_seqs = dflash_kgamma;
-            let stride = dflash_kgamma; // = max_chain_len
+            let num_seqs = ddtree_cap;
+            let stride = ddtree_cap; // = max_chain_len (wide-tree capacity)
             let kv_dtype = kv_cache.dtype();
             // Compute per-block bytes following the same layout the
             // paged_decode_attn kernels expect for the given dtype.
@@ -596,7 +641,12 @@ impl TransformerModel {
             None
         } else {
             let n = dflash_capture_layers.len();
-            let k_max = 17; // max verify size: DFlash γ=16 + 1 prefix token
+            // Max verify width T = γ+1 (= dflash_kgamma): the K=γ verify
+            // captures hidden state for ALL T input rows via
+            // `try_dflash_capture(token_idx=0..T)`. Hardcoding 17 (γ=16)
+            // OOB-writes this buffer for γ>16 → GPU illegal-memory crash.
+            // Track the real γ so γ=20/24/32 size correctly.
+            let k_max = dflash_kgamma.max(ddtree_cap).max(17);
             Some(gpu.alloc(k_max * n * config.hidden_size * 2)?)
         };
 

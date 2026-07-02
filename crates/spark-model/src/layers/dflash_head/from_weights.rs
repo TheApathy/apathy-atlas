@@ -214,7 +214,21 @@ impl BlockDiffusionDraftHead {
                 .alloc(g * super::DDTREE_TOP_K_MAX * 4)?,
             topk_logits_dev: gpu
                 .alloc(g * super::DDTREE_TOP_K_MAX * 4)?,
+            // EAGLE-3.1 per-layer FC-normalization scratch
+            // (ATLAS_DFLASH_FC_LAYERNORM=1). `fc_norm_in` holds one fc-input
+            // slot [n_target_layers * target_hidden] BF16; `fc_norm_zero_w` is
+            // an all-zeros BF16 weight of length target_hidden so the
+            // `rms_norm` kernel's `x * rms * (1 + w)` reduces to unit-variance
+            // `x * rms` per slice. Both are allocated unconditionally (a few
+            // KB) so the scratch shape is independent of the runtime flag; the
+            // zero weight is memset to 0 below.
+            fc_norm_in: gpu
+                .alloc(target_layer_ids.len() * target_hidden_size * bf16)?,
+            fc_norm_zero_w: gpu.alloc(target_hidden_size * bf16)?,
         };
+        // Zero the FC-layernorm weight buffer so the per-slice rms_norm uses a
+        // unit (1 + 0) scale → plain unit-variance normalization (variant a).
+        gpu.memset(scratch.fc_norm_zero_w, 0, target_hidden_size * bf16)?;
 
         // Pre-compute RoPE inv_freq table. Two paths based on the drafter's
         // `rope_scaling` config:
