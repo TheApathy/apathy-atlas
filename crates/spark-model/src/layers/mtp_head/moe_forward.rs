@@ -73,8 +73,26 @@ impl MtpHead {
         // Our dense_mlp_gate/up/down are QuantizedWeight (NVFP4). Upstream's
         // gemv() dispatcher expects ProjectionWeight enum — bypass by calling
         // the NVFP4 path directly.
-        ops::w4a16_gemv(ctx.gpu, self.w4a16_gemv_k, input, gate_w, gate_out, inter, h, stream)?;
-        ops::w4a16_gemv(ctx.gpu, self.w4a16_gemv_k, input, up_w, up_out, inter, h, stream)?;
+        ops::w4a16_gemv(
+            ctx.gpu,
+            self.w4a16_gemv_k,
+            input,
+            gate_w,
+            gate_out,
+            inter,
+            h,
+            stream,
+        )?;
+        ops::w4a16_gemv(
+            ctx.gpu,
+            self.w4a16_gemv_k,
+            input,
+            up_w,
+            up_out,
+            inter,
+            h,
+            stream,
+        )?;
 
         ops::moe_silu_mul(
             ctx.gpu,
@@ -87,7 +105,16 @@ impl MtpHead {
         )?;
 
         let output = ctx.buffers.moe_output();
-        ops::w4a16_gemv(ctx.gpu, self.w4a16_gemv_k, gate_out, down_w, output, h, inter, stream)?;
+        ops::w4a16_gemv(
+            ctx.gpu,
+            self.w4a16_gemv_k,
+            gate_out,
+            down_w,
+            output,
+            h,
+            inter,
+            stream,
+        )?;
         Ok(output)
     }
 

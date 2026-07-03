@@ -45,8 +45,12 @@ impl Qwen3AttentionLayer {
         // bound across all sequences in the batch (verify dispatch uploads
         // monotonically increasing seq_len per K slot, so `max()` matches the
         // longest KV scan any CTA will perform).
-        let max_seq_len_host =
-            seq_lens.iter().copied().max().unwrap_or(0).saturating_add(1) as u32;
+        let max_seq_len_host = seq_lens
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1) as u32;
         let c = ctx::MultiSeqCtx::new(
             self,
             ctx,

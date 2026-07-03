@@ -35,10 +35,7 @@ impl BlockDiffusionDraftHead {
         // sums across all drafter layers via a thread-local accumulator,
         // logged at the end of forward_block. Adds ~20μs/sync × ~14 syncs/layer
         // when enabled — only use for measurement, not production.
-        let kprofile = std::env::var("ATLAS_DFLASH_KERNEL_PROFILE")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let kprofile = std::env::var("ATLAS_DFLASH_KERNEL_PROFILE").ok().as_deref() == Some("1");
         let t_total = std::time::Instant::now();
         if kprofile {
             gpu.synchronize(stream)?;
@@ -88,16 +85,44 @@ impl BlockDiffusionDraftHead {
         // uninitialized memory (different GPU allocations may contain
         // stale data from previous operations).
         let n_attn_usize = n_attn as usize;
-        gpu.memset(self.scratch.stream_buf, 0, n_attn_usize * self.hidden_size * bf16)?;
-        gpu.memset(self.scratch.norm_buf, 0, n_attn_usize * self.hidden_size * bf16)?;
+        gpu.memset(
+            self.scratch.stream_buf,
+            0,
+            n_attn_usize * self.hidden_size * bf16,
+        )?;
+        gpu.memset(
+            self.scratch.norm_buf,
+            0,
+            n_attn_usize * self.hidden_size * bf16,
+        )?;
         gpu.memset(self.scratch.q_buf, 0, n_attn_usize * q_dim as usize * bf16)?;
         gpu.memset(self.scratch.k_buf, 0, n_attn_usize * kv_dim as usize * bf16)?;
         gpu.memset(self.scratch.v_buf, 0, n_attn_usize * kv_dim as usize * bf16)?;
-        gpu.memset(self.scratch.attn_out, 0, n_attn_usize * q_dim as usize * bf16)?;
-        gpu.memset(self.scratch.mlp_intermediate, 0, n_attn_usize * self.intermediate_size * bf16)?;
-        gpu.memset(self.scratch.mlp_up, 0, n_attn_usize * self.intermediate_size * bf16)?;
-        gpu.memset(self.scratch.stream_acc, 0, n_attn_usize * self.hidden_size * bf16)?;
-        gpu.memset(self.scratch.fc_proj, 0, self.ctx_window * self.hidden_size * bf16)?;
+        gpu.memset(
+            self.scratch.attn_out,
+            0,
+            n_attn_usize * q_dim as usize * bf16,
+        )?;
+        gpu.memset(
+            self.scratch.mlp_intermediate,
+            0,
+            n_attn_usize * self.intermediate_size * bf16,
+        )?;
+        gpu.memset(
+            self.scratch.mlp_up,
+            0,
+            n_attn_usize * self.intermediate_size * bf16,
+        )?;
+        gpu.memset(
+            self.scratch.stream_acc,
+            0,
+            n_attn_usize * self.hidden_size * bf16,
+        )?;
+        gpu.memset(
+            self.scratch.fc_proj,
+            0,
+            self.ctx_window * self.hidden_size * bf16,
+        )?;
         gpu.memset(self.scratch.logits, 0, self.gamma * self.vocab_size * bf16)?;
         gpu.memset(self.scratch.draft_tokens_dev, 0, n_attn_usize * 4)?;
 
@@ -187,13 +212,15 @@ impl BlockDiffusionDraftHead {
                         if debug_dump {
                             tracing::info!(
                                 "DFLASH HF_OVERRIDE: loaded {} bytes from {}",
-                                needed, p,
+                                needed,
+                                p,
                             );
                         }
                     }
                     Ok(hf_bytes) => tracing::warn!(
                         "DFLASH HF_OVERRIDE file too small ({} < needed {})",
-                        hf_bytes.len(), needed,
+                        hf_bytes.len(),
+                        needed,
                     ),
                     Err(e) => tracing::warn!("DFLASH HF_OVERRIDE read failed: {e}"),
                 }
@@ -213,7 +240,9 @@ impl BlockDiffusionDraftHead {
                 if debug_dump {
                     tracing::info!(
                         "DFLASH ZERO_LATE: zeroed last {} of {} capture layers across {} ctx slots",
-                        n_zero, n_capture, eff_ctx
+                        n_zero,
+                        n_capture,
+                        eff_ctx
                     );
                 }
             }
@@ -363,10 +392,8 @@ impl BlockDiffusionDraftHead {
             // OOD caveat: self.fc was TRAINED on UN-normalized concat, so this
             // is out-of-distribution and may help or hurt — measured A/B.
             // Variant (a): plain unit-variance (no learned norm weight).
-            let fc_layernorm = std::env::var("ATLAS_DFLASH_FC_LAYERNORM")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let fc_layernorm =
+                std::env::var("ATLAS_DFLASH_FC_LAYERNORM").ok().as_deref() == Some("1");
             if new_fc_count > 0 {
                 // Compute fc projection for new context positions.
                 for i in 0..new_fc_count {
@@ -381,8 +408,7 @@ impl BlockDiffusionDraftHead {
                         let n_capture = self.target_layer_ids.len();
                         let h_elems = self.target_hidden_size as u32;
                         for layer_i in 0..n_capture {
-                            let in_ptr =
-                                raw_slot.offset(layer_i * self.target_hidden_size * bf16);
+                            let in_ptr = raw_slot.offset(layer_i * self.target_hidden_size * bf16);
                             let out_ptr = self
                                 .scratch
                                 .fc_norm_in
@@ -436,9 +462,13 @@ impl BlockDiffusionDraftHead {
                 ops::rms_norm(
                     gpu,
                     self.kernels.rms_norm,
-                    self.scratch.fc_proj.offset(old_fc_count * self.hidden_size * bf16),
+                    self.scratch
+                        .fc_proj
+                        .offset(old_fc_count * self.hidden_size * bf16),
                     &self.hidden_norm,
-                    self.scratch.fc_proj.offset(old_fc_count * self.hidden_size * bf16),
+                    self.scratch
+                        .fc_proj
+                        .offset(old_fc_count * self.hidden_size * bf16),
                     new_fc_count as u32,
                     h,
                     self.rms_norm_eps,
@@ -447,7 +477,9 @@ impl BlockDiffusionDraftHead {
                 // Write new fc_proj into persistent cache.
                 let (new_fc_start, new_fc_end) = self.cache_write_range(
                     gpu,
-                    self.scratch.fc_proj.offset(old_fc_count * self.hidden_size * bf16),
+                    self.scratch
+                        .fc_proj
+                        .offset(old_fc_count * self.hidden_size * bf16),
                     old_fc_end,
                     new_fc_count,
                     dstate.ctx_fc_cache,
@@ -664,10 +696,8 @@ impl BlockDiffusionDraftHead {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        let adaptive_gamma = std::env::var("ATLAS_DFLASH_ADAPTIVE_GAMMA")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let adaptive_gamma =
+            std::env::var("ATLAS_DFLASH_ADAPTIVE_GAMMA").ok().as_deref() == Some("1");
         let adaptive_min: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_MIN")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -707,11 +737,10 @@ impl BlockDiffusionDraftHead {
         //   to measure ceiling, not to be capped by one. Margin-gate
         //   cuts still apply (those are per-step confidence signals
         //   independent of history).
-        let adaptive_probe_interval: usize =
-            std::env::var("ATLAS_DFLASH_ADAPTIVE_PROBE_INTERVAL")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+        let adaptive_probe_interval: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_PROBE_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
 
         // Run top-2 if the margin gate is active, so we have the second-best
         // logit value per row. Cost: one extra kernel launch over the same
@@ -753,6 +782,37 @@ impl BlockDiffusionDraftHead {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
+        // ── DSpark VanillaMarkov head (auto-on when the checkpoint ships it) ──
+        // Re-sample the γ-block LEFT-TO-RIGHT with the low-rank bigram bias
+        // B(prev) = markov_w2 @ markov_w1[prev], where position k's chosen
+        // token feeds position k+1's bias (position 0's predecessor is the
+        // verified `last_token` bonus that seeds the block). This
+        // semi-autoregressively repairs the drafter's suffix decay. The base
+        // logit rows are still in `self.scratch.logits` (untouched since the
+        // final lm_head above), so the correction reads them directly. LOSSLESS
+        // w.r.t. committed output — only the proposed tokens change; the target
+        // verify still commits its own greedy token. Disable via
+        // ATLAS_DFLASH_MARKOV=0 (handled at load time → `self.markov` is None).
+        if self.markov.is_some() {
+            match self.apply_markov_sequential(gpu, stream, last_token, &drafts) {
+                Ok(corrected) if corrected.len() == drafts.len() => {
+                    drafts = corrected;
+                    // Keep host_buf consistent for the DUMP_ALL diagnostic below.
+                    for (i, t) in drafts.iter().enumerate() {
+                        host_buf[i * 4..i * 4 + 4].copy_from_slice(&t.to_le_bytes());
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "DFlash Markov: corrected draft count mismatch — keeping base argmax"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("DFlash Markov correction failed ({e:#}); base argmax kept");
+                }
+            }
+        }
+
         // Multi-step denoise: committed rows freeze their commit-time
         // prediction. On the final pass those rows were embedded as REAL
         // tokens, so the row's own re-prediction is out-of-distribution
@@ -787,8 +847,8 @@ impl BlockDiffusionDraftHead {
         // mismatch the target's argmax → accept-prefix terminates at the
         // first replacement (mask mode), or the truncation point (truncate
         // mode — no replacement needed, the position just disappears).
-        let adaptive_mode = std::env::var("ATLAS_DFLASH_ADAPTIVE_MODE")
-            .unwrap_or_else(|_| "mask".to_string());
+        let adaptive_mode =
+            std::env::var("ATLAS_DFLASH_ADAPTIVE_MODE").unwrap_or_else(|_| "mask".to_string());
         let truncate_mode = adaptive_mode == "truncate";
         if adaptive_gamma || margin_gate > 0.0 {
             let mask = self.mask_token_id;

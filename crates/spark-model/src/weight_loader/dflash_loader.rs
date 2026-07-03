@@ -72,6 +72,25 @@ pub struct DflashConfig {
     /// branches on this to pick `rope_forward` vs `rope_forward_yarn`.
     #[serde(default)]
     pub rope_scaling: Option<DflashRopeScaling>,
+    /// DSpark low-rank Markov head rank `r` (config key `markov_rank`).
+    /// `0` (or absent) ⇒ no Markov head. The DSpark-AEON-draft checkpoint
+    /// ships `markov_rank: 256` with a rank-256 `VanillaMarkov` head that
+    /// adds a per-position bigram logit bias `B(prev) = W2(W1[prev])` and
+    /// samples the block LEFT-TO-RIGHT (each position's chosen token biases
+    /// the next). See `models/DSpark-AEON-draft/markov_head.py`.
+    #[serde(default)]
+    pub markov_rank: usize,
+    /// DSpark Markov head variant (config key `markov_head_type`). Only
+    /// `"vanilla"` is supported in Atlas (the +16-18% accepted-length default
+    /// that ships in DSpark); `"gated"` requires the backbone hidden per
+    /// position which Atlas's argmax-only propose path does not surface, so
+    /// it falls back to vanilla with a warning.
+    #[serde(default = "default_markov_head_type")]
+    pub markov_head_type: String,
+}
+
+fn default_markov_head_type() -> String {
+    "vanilla".to_string()
 }
 
 fn default_rope_theta() -> f32 {
@@ -139,6 +158,29 @@ pub struct DflashWeights {
     /// `draft_vocab_size != target_vocab_size`). Absent for
     /// Qwen3.6-35B-A3B-DFlash (both vocabs = 248320).
     pub draft_id_to_target_id: Option<Vec<i64>>,
+
+    /// DSpark VanillaMarkov head weights, present iff the checkpoint ships
+    /// `markov_head.markov_w1.weight` + `markov_head.markov_w2.weight` AND
+    /// `config.markov_rank > 0`. `None` for the vanilla DFlash drafters.
+    pub markov: Option<MarkovWeights>,
+}
+
+/// DSpark VanillaMarkov head weights (both BF16, loaded verbatim on device).
+///
+/// `markov_w1` is an `nn.Embedding(V, r)` — the checkpoint stores it as
+/// `[V, r]` so a row `markov_w1[prev]` is a contiguous `[r]` slice (a plain
+/// embedding gather). `markov_w2` is an `nn.Linear(r, V, bias=False)` — the
+/// checkpoint stores its weight as `[V, r]` (out=V, in=r), i.e. the per-token
+/// bias is `B(prev) = markov_w2 @ markov_w1[prev]` = `[V, r] @ [r] = [V]`,
+/// which is exactly a `dense_gemv(input=w1row[r], weight=w2[V, r], n=V, k=r)`.
+#[derive(Debug, Clone, Copy)]
+pub struct MarkovWeights {
+    /// `nn.Embedding(vocab, rank)` weight — `[vocab, rank]` BF16.
+    pub w1: DenseWeight,
+    /// `nn.Linear(rank, vocab, bias=False)` weight — `[vocab, rank]` BF16.
+    pub w2: DenseWeight,
+    /// Low-rank dimension `r` (256 for DSpark-AEON-draft).
+    pub rank: usize,
 }
 
 /// Per-drafter-layer raw weights (BF16). Same shape across all 8 layers.
@@ -165,6 +207,14 @@ pub struct DflashLayerWeights {
 /// bare layout (verified against commit 42d3b34, May 2026).
 pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
     store.contains("fc.weight") || store.contains("model.fc.weight")
+}
+
+/// Probe a [`WeightStore`] for the DSpark VanillaMarkov head tensors. Both
+/// bare and `model.`-prefixed layouts are accepted (the DSpark-AEON-draft
+/// checkpoint ships bare: `markov_head.markov_w1.weight`).
+pub fn store_has_markov_head(store: &WeightStore) -> bool {
+    store.contains("markov_head.markov_w1.weight")
+        || store.contains("model.markov_head.markov_w1.weight")
 }
 
 /// Parse a DFlash drafter's `config.json` into a [`DflashConfig`]. Used by
@@ -278,8 +328,55 @@ pub fn load_dflash_weights(
         None
     };
 
+    // DSpark VanillaMarkov head (config-driven, like the rest of the drafter):
+    // load W1/W2 iff `config.markov_rank > 0` AND the checkpoint actually ships
+    // the tensors. ATLAS_DFLASH_MARKOV=0 disables the head at load time even
+    // when present (A/B toggle); default auto-on when the checkpoint has it.
+    let markov_disabled = std::env::var("ATLAS_DFLASH_MARKOV").ok().as_deref() == Some("0");
+    let markov = if drafter_config.markov_rank > 0
+        && store_has_markov_head(drafter_store)
+        && !markov_disabled
+    {
+        let head_type = drafter_config.markov_head_type.to_lowercase();
+        if head_type != "vanilla" {
+            tracing::warn!(
+                "DFlash Markov head type={head_type:?} is not fully supported in Atlas \
+                 (only 'vanilla'); the gated variant needs the per-position backbone \
+                 hidden which the argmax-only propose path does not surface — falling \
+                 back to the VanillaMarkov bias (ignores the gate)."
+            );
+        }
+        let w1 = dense(drafter_store, &format!("{prefix}markov_head.markov_w1.weight"))
+            .context("DFlash Markov head: load markov_w1.weight")?;
+        let w2 = dense(drafter_store, &format!("{prefix}markov_head.markov_w2.weight"))
+            .context("DFlash Markov head: load markov_w2.weight")?;
+        tracing::info!(
+            "DFlash DSpark Markov head loaded: rank={}, type={} (bigram logit bias applied \
+             LEFT-TO-RIGHT before per-position argmax; set ATLAS_DFLASH_MARKOV=0 to disable)",
+            drafter_config.markov_rank,
+            head_type,
+        );
+        Some(MarkovWeights {
+            w1,
+            w2,
+            rank: drafter_config.markov_rank,
+        })
+    } else {
+        if drafter_config.markov_rank > 0 && !store_has_markov_head(drafter_store) {
+            tracing::warn!(
+                "DFlash config has markov_rank={} but the checkpoint ships no \
+                 `markov_head.markov_w1.weight` — Markov head disabled",
+                drafter_config.markov_rank,
+            );
+        }
+        if markov_disabled && store_has_markov_head(drafter_store) {
+            tracing::info!("DFlash Markov head present but ATLAS_DFLASH_MARKOV=0 — disabled");
+        }
+        None
+    };
+
     tracing::info!(
-        "DFlash drafter loaded: {} layers, hidden={}, vocab={}, γ={}, target_layers={:?}",
+        "DFlash drafter loaded: {} layers, hidden={}, vocab={}, γ={}, target_layers={:?}, markov={}",
         layers.len(),
         drafter_config.hidden_size,
         drafter_config.vocab_size,
@@ -289,6 +386,7 @@ pub fn load_dflash_weights(
             .as_ref()
             .map(|c| c.target_layer_ids.as_slice())
             .unwrap_or(&[]),
+        markov.is_some(),
     );
 
     Ok(Some(DflashWeights {
@@ -298,6 +396,7 @@ pub fn load_dflash_weights(
         norm,
         layers,
         draft_id_to_target_id,
+        markov,
     }))
 }
 

@@ -199,11 +199,8 @@ impl Qwen3SsmLayer {
                     num_seqs * 2 * std::mem::size_of::<u64>(),
                 )
             };
-            ctx.gpu.copy_h2d_async(
-                ptr_bytes,
-                self.ssm_multi_seq_ptr_scratch,
-                stream,
-            )?;
+            ctx.gpu
+                .copy_h2d_async(ptr_bytes, self.ssm_multi_seq_ptr_scratch, stream)?;
             let h_state_ptrs_dev = self.ssm_multi_seq_ptr_scratch;
             let conv_state_ptrs_dev = self
                 .ssm_multi_seq_ptr_scratch
@@ -215,9 +212,8 @@ impl Qwen3SsmLayer {
             //   K), output `deinterleaved` is contiguous (stride qkvz_size
             //   BF16 = N). Matches the per-seq layout 1:1.
             // Fallback: per-seq loop (interleaved 80B / dense / non-nvfp4).
-            let qkvz_batched_gemm = self.sequential_qkvz
-                && self.qkvz_nvfp4.is_some()
-                && self.w4a16_gemm_k.0 != 0;
+            let qkvz_batched_gemm =
+                self.sequential_qkvz && self.qkvz_nvfp4.is_some() && self.w4a16_gemm_k.0 != 0;
             if qkvz_batched_gemm {
                 let nvfp4 = self.qkvz_nvfp4.as_ref().unwrap();
                 ops::w4a16_gemm(
@@ -340,8 +336,8 @@ impl Qwen3SsmLayer {
                     nv as u32,
                     nk as u32,
                     vpg as u32,
-                    ba_size as u32,           // BF16 elements between seqs in ba_scratch
-                    (nv * 2) as u32,          // FP32 elements between seqs in gates_buf
+                    ba_size as u32,  // BF16 elements between seqs in ba_scratch
+                    (nv * 2) as u32, // FP32 elements between seqs in gates_buf
                     stream,
                 )?;
             } else {
@@ -450,13 +446,13 @@ impl Qwen3SsmLayer {
                     z_base,
                     &self.ssm.norm,
                     normed_out_compact,
-                    nv as u32,           // num_v_heads (32)
+                    nv as u32, // num_v_heads (32)
                     num_seqs as u32,
-                    vd as u32,           // head_dim (128) — norm is per-head
+                    vd as u32, // head_dim (128) — norm is per-head
                     eps,
-                    qkvz_size as u32,    // FP32 elements between seqs (input)
-                    qkvz_size as u32,    // BF16 elements between seqs (gate)
-                    value_dim as u32,    // BF16 elements between seqs (output)
+                    qkvz_size as u32, // FP32 elements between seqs (input)
+                    qkvz_size as u32, // BF16 elements between seqs (gate)
+                    value_dim as u32, // BF16 elements between seqs (output)
                     stream,
                 )?;
             } else {
@@ -506,8 +502,7 @@ impl Qwen3SsmLayer {
                         )?;
                     } else {
                         for i in 0..num_seqs {
-                            let normed_out_i =
-                                normed_out_compact.offset(i * value_dim * bf16);
+                            let normed_out_i = normed_out_compact.offset(i * value_dim * bf16);
                             let ssm_out_i = ssm_out_buf.offset(i * h * bf16);
                             ops::dense_gemv(
                                 ctx.gpu,

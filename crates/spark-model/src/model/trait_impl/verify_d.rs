@@ -86,8 +86,7 @@ impl TransformerModel {
         // `dfs_perm[i] = j` means "DFS slot i contains kernel slot j".
         // `dfs_inv_perm[j] = i` means "kernel slot j is at DFS slot i".
         // Empty when DFS reorder is disabled or no tree payload is active.
-        let dfs_enabled =
-            std::env::var("ATLAS_DDTREE_DFS_REORDER").ok().as_deref() == Some("1");
+        let dfs_enabled = std::env::var("ATLAS_DDTREE_DFS_REORDER").ok().as_deref() == Some("1");
         let (dfs_perm, dfs_inv_perm, dfs_depths): (Vec<usize>, Vec<usize>, Vec<usize>) = {
             let host_parents_lock = self.ddtree_parent_ids_host.lock();
             // Allow payload shorter than k (we pad with linear-chain tail to
@@ -115,7 +114,8 @@ impl TransformerModel {
                     if !DFS_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         tracing::info!(
                             "ATLAS_DDTREE_DFS_REORDER: k={k} perm={:?} depths={:?}",
-                            perm, depths
+                            perm,
+                            depths
                         );
                     }
                     (perm, inv, depths)
@@ -138,9 +138,10 @@ impl TransformerModel {
         // attention (preserves the existing chain accept behavior) while
         // letting depth-based RoPE positions still fire. This is a
         // research-only mode used to A/B the metadata permutation alone.
-        let dfs_permute_tokens =
-            std::env::var("ATLAS_DDTREE_DFS_REORDER_METADATA_ONLY").ok().as_deref()
-                != Some("1");
+        let dfs_permute_tokens = std::env::var("ATLAS_DDTREE_DFS_REORDER_METADATA_ONLY")
+            .ok()
+            .as_deref()
+            != Some("1");
 
         // 1a. Embed K tokens — in DFS order if reorder active AND
         // METADATA_ONLY=0 (default).
@@ -220,8 +221,10 @@ impl TransformerModel {
         // set_ddtree_parent_ids — index 0 is the bonus (depth 0), index i+1
         // is draft i. parent[i] = -1 means "child of pre-tree state" (= bonus,
         // depth 1); parent[i] = k means depth[t] = 1 + depth[k].
-        let tree_aware_enabled =
-            std::env::var("ATLAS_DDTREE_TREE_AWARE_VERIFY").ok().as_deref() == Some("1");
+        let tree_aware_enabled = std::env::var("ATLAS_DDTREE_TREE_AWARE_VERIFY")
+            .ok()
+            .as_deref()
+            == Some("1");
         let tree_depths: Option<Vec<usize>> = if tree_aware_enabled {
             // host_parents may be shorter than k when the tree payload has
             // fewer nodes than γ_eff (e.g. budget < γ_eff caps the tree at
@@ -268,10 +271,7 @@ impl TransformerModel {
                     static TREE_AWARE_DBG_DONE: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !TREE_AWARE_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::info!(
-                            "ATLAS_DDTREE_TREE_AWARE_VERIFY: k={k} depths={:?}",
-                            depths
-                        );
+                        tracing::info!("ATLAS_DDTREE_TREE_AWARE_VERIFY: k={k} depths={:?}", depths);
                     }
                     Some(depths)
                 }
@@ -321,9 +321,7 @@ impl TransformerModel {
             // Kernel slot 0 (bonus) is depth 0 → position seq.seq_len (the
             // last_token's slot). For drafts at depth d, position is
             // seq.seq_len + d.
-            (0..k)
-                .map(|t| (seq.seq_len + depths[t]) as u32)
-                .collect()
+            (0..k).map(|t| (seq.seq_len + depths[t]) as u32).collect()
         } else {
             (0..k).map(|t| (seq.seq_len + t) as u32).collect()
         };
@@ -427,11 +425,8 @@ impl TransformerModel {
                     std::mem::size_of::<i32>(),
                 )
             };
-            self.gpu.copy_h2d_async(
-                base_bytes,
-                self.tree_kv_indir_base_persistent,
-                stream,
-            )?;
+            self.gpu
+                .copy_h2d_async(base_bytes, self.tree_kv_indir_base_persistent, stream)?;
         }
 
         // ATLAS_TREE_AWARE_ATTN: build + upload per-row KV indirection table.
@@ -479,11 +474,8 @@ impl TransformerModel {
                     indir.len() * std::mem::size_of::<i32>(),
                 )
             };
-            self.gpu.copy_h2d_async(
-                indir_bytes_view,
-                self.tree_kv_indir_persistent,
-                stream,
-            )?;
+            self.gpu
+                .copy_h2d_async(indir_bytes_view, self.tree_kv_indir_persistent, stream)?;
             static TREE_KV_DBG_DONE: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !TREE_KV_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -572,10 +564,7 @@ impl TransformerModel {
         // `ddtree_parent_ids_capacity`, the auto-injection at this site
         // would otherwise force the broken kernel. Setting the env var
         // skips the injection and lets the proven wy_k path run.
-        let disable_tree_wy = std::env::var("ATLAS_DISABLE_TREE_WY")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let disable_tree_wy = std::env::var("ATLAS_DISABLE_TREE_WY").ok().as_deref() == Some("1");
         if !disable_tree_wy
             && use_graphs
             && ddtree_parent_ids_dev.is_none()
@@ -603,11 +592,8 @@ impl TransformerModel {
             if host_parents.len() == k {
                 let permuted = permute_parent_ids(&host_parents, &dfs_perm, &dfs_inv_perm);
                 let bytes: Vec<u8> = permuted.iter().flat_map(|p| p.to_le_bytes()).collect();
-                self.gpu.copy_h2d_async(
-                    &bytes,
-                    self.ddtree_parent_ids_persistent,
-                    stream,
-                )?;
+                self.gpu
+                    .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)?;
                 // Make sure dispatch uses persistent buffer (which now holds
                 // DFS-frame parents).
                 ddtree_parent_ids_dev = Some(self.ddtree_parent_ids_persistent);
@@ -658,11 +644,8 @@ impl TransformerModel {
                         packed_seq_lens.len() * std::mem::size_of::<i32>(),
                     )
                 };
-                self.gpu.copy_h2d_async(
-                    sl_bytes_view,
-                    self.tree_kv_pack_seq_lens,
-                    stream,
-                )?;
+                self.gpu
+                    .copy_h2d_async(sl_bytes_view, self.tree_kv_pack_seq_lens, stream)?;
                 // NOTE: kv_cache mutex is already held earlier in this fn
                 // (`let mut kv_cache = self.kv_cache.lock();`), so we must
                 // NOT re-lock it. Read block_size via the already-held
@@ -739,10 +722,7 @@ impl TransformerModel {
         // that graph — its kernel sequence has stale arg pointers. Treating
         // pack as a separate cache key forces a fresh capture for the
         // pack-active path.
-        let pack_key = ctx
-            .tree_aware_attn
-            .and_then(|t| t.pack)
-            .is_some() as u32;
+        let pack_key = ctx.tree_aware_attn.and_then(|t| t.pack).is_some() as u32;
         let cache_key = (seq.slot_idx, k, pack_key);
         let cached_for_slot = graph_cache
             .as_ref()
@@ -833,15 +813,11 @@ impl TransformerModel {
                 if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
                     let h_bytes = h * 2;
                     for t in 0..k {
-                        let path = format!(
-                            "/tmp/atlas_kgamma_layer{}_pos{}.bin",
-                            layer_idx, t
-                        );
+                        let path = format!("/tmp/atlas_kgamma_layer{}_pos{}.bin", layer_idx, t);
                         if !std::path::Path::new(&path).exists() {
                             let mut buf = vec![0u8; h_bytes];
                             self.gpu.synchronize(stream)?;
-                            self.gpu
-                                .copy_d2h(hidden.offset(t * h_bytes), &mut buf)?;
+                            self.gpu.copy_d2h(hidden.offset(t * h_bytes), &mut buf)?;
                             let _ = std::fs::write(&path, &buf);
                         }
                     }
@@ -895,10 +871,8 @@ impl TransformerModel {
                     if !std::path::Path::new(&path).exists() {
                         let mut buf = vec![0u8; dump_n * bf16];
                         self.gpu.synchronize(stream)?;
-                        self.gpu.copy_d2h(
-                            self.buffers.logits().offset(t * vocab * bf16),
-                            &mut buf,
-                        )?;
+                        self.gpu
+                            .copy_d2h(self.buffers.logits().offset(t * vocab * bf16), &mut buf)?;
                         let _ = std::fs::write(&path, &buf);
                     }
                 }
@@ -1023,20 +997,39 @@ impl TransformerModel {
         accepted_compact: &[usize],
         pre_verify_len: usize,
     ) -> Result<()> {
-        // Determine the relocation plan: (src_pos, dst_pos) pairs where the
-        // source differs from the contiguous destination. Process in
-        // ASCENDING destination order so an earlier copy never clobbers a
-        // source a later copy still needs (dst_j = pre+j <= src = pre+compact
-        // because compact >= j along any monotone path; the walk is strictly
-        // increasing in compact index, so this holds).
-        let mut moves: Vec<(usize, usize)> = Vec::new();
-        for (j, &compact) in accepted_compact.iter().enumerate() {
-            let dst_pos = pre_verify_len + j + 1; // j is 0-based; step j+1
-            let src_pos = pre_verify_len + compact;
-            if src_pos != dst_pos {
-                moves.push((src_pos, dst_pos));
-            }
-        }
+        // TASK #29 root-cause fix. Two things this must get right:
+        //
+        //   1. FRAME. The accepted path is in the COMPACT frame, but the KV was
+        //      written by the kernel in the KERNEL (DFS-reordered) frame. When
+        //      ATLAS_DDTREE_DFS_REORDER=1 (the portfolio / deep-DDTree commit
+        //      config), compact index `c`'s KV lives at KV position
+        //      `pre + dfs_inv_perm[c]`, NOT `pre + c`. The pre-fix code gathered
+        //      from `pre + compact` → wrong bytes → counting md5 corruption on a
+        //      forked accept. We map through the SAME `ddtree_dfs_inv_perm` the
+        //      SSM commit uses (`commit_verify_state_async_with_slot`).
+        //   2. OVERLAP. Once sources are permuted kernel slots, a source may be
+        //      another move's destination; a naive in-place copy clobbers data a
+        //      later move still needs. `plan_kv_compaction_moves` evacuates such
+        //      conflicts through free tail verify slots first, so the whole
+        //      relocation is a lossless permutation.
+        //
+        // Empty `inv_perm` (chain mode / DFS off) ⇒ identity map ⇒ this reduces
+        // to the legacy ascending-dst plan (and is a no-op for a contiguous
+        // path), so the flat path is byte-for-byte unchanged.
+        use crate::layers::dflash_head::ddtree::plan_kv_compaction_moves;
+        let inv_perm = self.ddtree_dfs_inv_perm.lock().clone();
+        // Verify width (kernel-slot count). Under DFS reorder inv_perm has
+        // exactly k entries; otherwise the general (scratch) path is never
+        // taken, so any bound >= accepted_compact.len()+1 is safe. Use the
+        // accepted-path max compact index as a floor so tail scratch exists.
+        let k = if !inv_perm.is_empty() {
+            inv_perm.len()
+        } else {
+            accepted_compact.iter().copied().max().unwrap_or(0) + 1
+        };
+        let planned = plan_kv_compaction_moves(accepted_compact, &inv_perm, pre_verify_len, k);
+        let moves: Vec<(usize, usize)> =
+            planned.iter().map(|m| (m.src_pos, m.dst_pos)).collect();
         if moves.is_empty() {
             return Ok(());
         }
@@ -1084,8 +1077,7 @@ impl TransformerModel {
         }
         drop(kv_cache);
 
-        static COMPACT_DBG: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
+        static COMPACT_DBG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COMPACT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 8 {
             tracing::info!(

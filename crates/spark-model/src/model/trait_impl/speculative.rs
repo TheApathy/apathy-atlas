@@ -165,11 +165,20 @@ impl TransformerModel {
         Ok(())
     }
 
-    /// FIX 1 (ATLAS_DFLASH_TREE_COMMIT): stamp the accepted-path compact
-    /// indices onto the DFlash proposer state so the next propose's ctx-hidden
-    /// append reads the scattered (fork) capture rows instead of the
-    /// contiguous prefix. Must be called AFTER `trim_proposer_state`
-    /// (`after_verify` clears the path). No-op for non-DFlash proposers.
+    /// FIX 1 (ATLAS_DFLASH_TREE_COMMIT): stamp the accepted-path capture rows
+    /// onto the DFlash proposer state so the next propose's ctx-hidden append
+    /// reads the scattered (fork) capture rows instead of the contiguous
+    /// prefix. Must be called AFTER `trim_proposer_state` (`after_verify`
+    /// clears the path). No-op for non-DFlash proposers.
+    ///
+    /// TASK #29 frame fix: `accepted_compact` is in the COMPACT frame, but
+    /// `dflash_hidden_save` (which these rows index) was written by
+    /// `try_dflash_capture(layer, t)` in the KERNEL (DFS-reordered) frame —
+    /// capture row `t` holds kernel slot `t`. So compact index `c`'s captured
+    /// hidden lives at row `dfs_inv_perm[c]`. We map here through the SAME
+    /// `ddtree_dfs_inv_perm` the KV gather and SSM commit use, then store the
+    /// KERNEL-frame rows the append will read directly. Empty inv_perm (chain
+    /// mode / DFS off) ⇒ identity ⇒ flat path unchanged.
     pub(super) fn set_dflash_accepted_compact_dispatch(
         &self,
         seq: &mut SequenceState,
@@ -182,8 +191,12 @@ impl TransformerModel {
             .as_any_mut()
             .downcast_mut::<crate::layers::DflashProposerState>()
         {
+            use crate::layers::dflash_head::ddtree::map_compact_path_to_kernel;
+            let inv_perm = self.ddtree_dfs_inv_perm.lock();
+            let kernel_rows = map_compact_path_to_kernel(accepted_compact, &inv_perm);
+            drop(inv_perm);
             ds.last_accepted_compact.clear();
-            ds.last_accepted_compact.extend_from_slice(accepted_compact);
+            ds.last_accepted_compact.extend_from_slice(&kernel_rows);
         }
     }
 }

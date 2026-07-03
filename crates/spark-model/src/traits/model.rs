@@ -497,7 +497,12 @@ pub trait Model: Send + Sync {
     /// from an outdated prefix.
     ///
     /// Default: no-op (DFlash not active).
-    fn save_hidden_for_dflash(&self, _token: u32, _seq: &mut SequenceState, _stream: u64) -> Result<()> {
+    fn save_hidden_for_dflash(
+        &self,
+        _token: u32,
+        _seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<()> {
         Ok(())
     }
 

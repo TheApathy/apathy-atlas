@@ -205,9 +205,9 @@ impl TransformerModel {
                 // MTP runs on rank 0 only — no EP all_reduce (BUG #26).
                 comm: None,
                 graph_capture: false,
-            ddtree_parent_ids_dev: None,
-            tree_aware_attn: None,
-            ssm_multi_seq_ptr_table_override: None,
+                ddtree_parent_ids_dev: None,
+                tree_aware_attn: None,
+                ssm_multi_seq_ptr_table_override: None,
             };
             let drafts = proposer.propose(
                 token_0,

@@ -89,8 +89,8 @@ impl MoeLayer {
         // tokens. Only safe when NOT capturing a graph (D2H sync). Logs the
         // count of distinct experts across both tokens (8 = full overlap,
         // 16 = disjoint) so we can size a dedup win for the K=2 verify MoE.
-        let moe_probe = !ctx.graph_capture
-            && std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
+        let moe_probe =
+            !ctx.graph_capture && std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
         let __moe_t0 = if moe_probe {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())

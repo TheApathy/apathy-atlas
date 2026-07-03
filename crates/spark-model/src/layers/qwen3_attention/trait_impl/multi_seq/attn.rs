@@ -51,7 +51,10 @@ impl Qwen3AttentionLayer {
         // Mega path: batched RoPE in one launch.
         if attn_qkv_mega_enabled() && self.rope_strided_b3_k.0 != 0 {
             debug_assert!(per_seq_qkv % bf16 == 0, "qkv stride must be BF16-aligned");
-            debug_assert!(q_proj_bytes % bf16 == 0, "q_proj_bytes must be BF16-aligned");
+            debug_assert!(
+                q_proj_bytes % bf16 == 0,
+                "q_proj_bytes must be BF16-aligned"
+            );
             let qkv_stride_bf16 = (per_seq_qkv / bf16) as u32;
             let k_offset_bf16 = (q_proj_bytes / bf16) as u32;
             return ops::rope_strided_b3(
@@ -317,9 +320,7 @@ impl Qwen3AttentionLayer {
                 // so each split gets at least ~SPLIT_TILE positions.
                 let occupancy_target = (NUM_SMS / nq).max(2);
                 let seq_target = max_seq_len_host.div_ceil(SPLIT_TILE);
-                let num_splits = occupancy_target
-                    .min(seq_target.max(1))
-                    .min(MAX_SPLITS_CAP);
+                let num_splits = occupancy_target.min(seq_target.max(1)).min(MAX_SPLITS_CAP);
                 if num_splits >= 2 {
                     let workspace = fwd.buffers.splitk_workspace();
                     ops::paged_decode_attn_kgamma_nvfp4_splitk(
@@ -345,14 +346,7 @@ impl Qwen3AttentionLayer {
                         stream,
                     )?;
                     ops::paged_decode_attn_kgamma_reduce_nvfp4(
-                        fwd.gpu,
-                        reduce_k,
-                        workspace,
-                        attn_out,
-                        nq,
-                        num_splits,
-                        n as u32,
-                        stream,
+                        fwd.gpu, reduce_k, workspace, attn_out, nq, num_splits, n as u32, stream,
                     )?;
                     return Ok(attn_out);
                 }
@@ -659,10 +653,7 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
-        } else if n > 3
-            && n <= 32
-            && self.w4a16_gemm_t_m32_n64_k.0 != 0
-            && self.o_nvfp4_t.is_some()
+        } else if n > 3 && n <= 32 && self.w4a16_gemm_t_m32_n64_k.0 != 0 && self.o_nvfp4_t.is_some()
         {
             // K=γ verify: single M=n GEMM via the m32_n64 kernel (single
             // B read, full SM occupancy) — replaces the n per-token GEMV

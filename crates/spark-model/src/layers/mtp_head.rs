@@ -427,7 +427,14 @@ impl DraftProposer for MtpHead {
             .as_any_mut()
             .downcast_mut::<MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid MTP proposer state"))?;
-        self.prefill_last_k_impl(tokens, target_hiddens, base_position, mtp_state, ctx, stream)
+        self.prefill_last_k_impl(
+            tokens,
+            target_hiddens,
+            base_position,
+            mtp_state,
+            ctx,
+            stream,
+        )
     }
 }
 

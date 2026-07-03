@@ -218,8 +218,8 @@ pub(crate) fn load_dense_ffn(
                 config.moe_intermediate_size
             };
             let h = config.hidden_size;
-            use crate::weight_map::model_a::dense;
             use crate::weight_map::loaders_fp8::quantize_to_nvfp4;
+            use crate::weight_map::model_a::dense;
             let gate_bf16 = dense(store, &format!("{prefix}.mlp.gate_proj.weight"))?;
             let up_bf16 = dense(store, &format!("{prefix}.mlp.up_proj.weight"))?;
             let down_bf16 = dense(store, &format!("{prefix}.mlp.down_proj.weight"))?;

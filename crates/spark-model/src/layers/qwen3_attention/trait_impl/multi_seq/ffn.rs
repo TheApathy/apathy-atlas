@@ -128,8 +128,7 @@ impl Qwen3AttentionLayer {
             // since been resolved upstream; keeping it suppressed the
             // fast kernel on truncated-γ verifies, costing the prose
             // path 15-20 tok/s.
-            let try_kgamma =
-                n > 3 && crate::layers::ffn_kgamma_m16_enabled();
+            let try_kgamma = n > 3 && crate::layers::ffn_kgamma_m16_enabled();
             let used_kgamma = if try_kgamma {
                 // 1) Batched residual + norm for all n tokens. The
                 // single-token slice in the fallback loop reads

@@ -64,10 +64,7 @@ pub enum GdnDispatch {
 /// AND providing a non-flat payload would return `TreeAware` — but the
 /// caller MUST currently fall back because the kernel isn't written.
 pub fn pick_dispatch(payload: Option<&TreePayload>) -> GdnDispatch {
-    let triton_tree_enabled = std::env::var("DDTREE_TRITON_TREE_GDN")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let triton_tree_enabled = std::env::var("DDTREE_TRITON_TREE_GDN").ok().as_deref() == Some("1");
     if !triton_tree_enabled {
         return GdnDispatch::Flat;
     }
@@ -96,8 +93,8 @@ impl std::error::Error for TreeKernelUnavailable {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::ddtree::TreePayload;
+    use super::*;
 
     fn payload(tokens: &[u32], parents: &[i32]) -> TreePayload {
         TreePayload {

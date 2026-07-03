@@ -159,11 +159,7 @@ impl Qwen3AttentionLayer {
                 "rope_mrope_interleaved",
                 "rope_forward_mrope_interleaved",
             ),
-            rope_strided_b3_k: super::super::try_kernel(
-                gpu,
-                "rope",
-                "rope_forward_strided_b3",
-            ),
+            rope_strided_b3_k: super::super::try_kernel(gpu, "rope", "rope_forward_strided_b3"),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
@@ -293,11 +289,7 @@ impl Qwen3AttentionLayer {
             // small-shape acceleration (gated by `ATLAS_QKV_SPLITK=1`).
             // All four handles must be non-zero for the gate to engage;
             // `try_kernel` returns 0 on older PTX caches without these.
-            nvfp4_gemm_k: super::super::try_kernel(
-                gpu,
-                "nvfp4_cutlass",
-                "nvfp4_nvfp4_gemm_t_m64",
-            ),
+            nvfp4_gemm_k: super::super::try_kernel(gpu, "nvfp4_cutlass", "nvfp4_nvfp4_gemm_t_m64"),
             nvfp4_gemm_splitk_k: super::super::try_kernel(
                 gpu,
                 "nvfp4_cutlass",
@@ -308,11 +300,7 @@ impl Qwen3AttentionLayer {
                 "nvfp4_cutlass",
                 "nvfp4_splitk_reduce",
             ),
-            nvfp4_absmax_k: super::super::try_kernel(
-                gpu,
-                "quantize_nvfp4",
-                "nvfp4_global_absmax",
-            ),
+            nvfp4_absmax_k: super::super::try_kernel(gpu, "quantize_nvfp4", "nvfp4_global_absmax"),
             nvfp4_quantize_k: super::super::try_kernel(
                 gpu,
                 "quantize_nvfp4",
@@ -470,16 +458,19 @@ impl Qwen3AttentionLayer {
                 "w4a16_gemv",
                 "w4a16_gemv_dual_batch3_strided",
             ),
-            rms_norm_qk_batch3_k: super::super::try_kernel(
-                gpu,
-                "norm",
-                "rms_norm_qk_batch3",
-            ),
+            rms_norm_qk_batch3_k: super::super::try_kernel(gpu, "norm", "rms_norm_qk_batch3"),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             w4a16_gemm_t_m32_n64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
+            w4a16_gemm_t_m32_n64_splitk_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_splitk",
+            ),
+            reduce_splitk_k: super::super::try_kernel(gpu, "w4a16", "reduce_splitk_f32_to_bf16"),
+            qkv_splitk_workspace: std::sync::Mutex::new(None),
             w4a16_gemm_t_m128_v2_k: super::super::try_kernel(
                 gpu,
                 "w4a16_v2",

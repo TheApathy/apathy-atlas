@@ -169,7 +169,10 @@ mod tests {
         // Reads ATLAS_VISION_MIN_DIM at call time, defaults to 512.
         let (h, w) = target_size(100, 150, 32);
         assert!(h <= 1280 && w <= 1280);
-        assert!(h.max(w) >= 480, "expected longer side >= 480, got h={h} w={w}");
+        assert!(
+            h.max(w) >= 480,
+            "expected longer side >= 480, got h={h} w={w}"
+        );
         assert_eq!(h % 32, 0);
         assert_eq!(w % 32, 0);
     }

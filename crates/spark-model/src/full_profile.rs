@@ -115,17 +115,10 @@ pub fn begin_step() {
 /// total_us descending.
 pub fn dump() {
     let t = table().lock();
-    let mut rows: Vec<_> = t
-        .iter()
-        .map(|(k, v)| (*k, v.calls, v.total_ns))
-        .collect();
+    let mut rows: Vec<_> = t.iter().map(|(k, v)| (*k, v.calls, v.total_ns)).collect();
     rows.sort_by(|a, b| b.2.cmp(&a.2));
     let total_steps = STEP.load(Ordering::Relaxed).saturating_sub(warmup_steps());
-    tracing::info!(
-        "KPROF SUMMARY steps={} kernels={}",
-        total_steps,
-        rows.len()
-    );
+    tracing::info!("KPROF SUMMARY steps={} kernels={}", total_steps, rows.len());
     for (label, calls, ns) in &rows {
         let total_us = ns / 1000;
         let per_call_us = if *calls > 0 { ns / calls / 1000 } else { 0 };

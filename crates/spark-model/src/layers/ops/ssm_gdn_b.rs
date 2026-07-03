@@ -282,6 +282,61 @@ pub fn gdn_decode_wy17(
         .launch(stream)
 }
 
+/// V-DIM SPLIT variant of `gdn_decode_wy17`: splits the v_dim columns of
+/// the per-head state across `v_split` CTAs (gridDim.z) to raise occupancy
+/// on the 48-CTA-limited wy17 launch. Kernel: `gated_delta_rule_wy17_vsplit`.
+/// Bit-identical output to `gdn_decode_wy17` (per-column FP32 math is
+/// unchanged; only the CTA-to-column mapping differs). `v_split` is clamped
+/// by the kernel via v_chunk = ceil(v_dim/v_split); passing v_split=1 is
+/// equivalent to the baseline (still recomputes kd_flat once).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_wy17_vsplit(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter_base: DevicePtr,
+    inter_stride_floats: u32,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    v_split: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, v_split])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter_base)
+        .arg_u32(inter_stride_floats)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .arg_u32(v_split)
+        .launch(stream)
+}
+
 /// M8A: tree-aware GDN verify with parent_ids state load.
 /// Kernel: `gated_delta_rule_tree` (gated_delta_rule_tree.cu).
 /// Sequential per-token loop; each token reads H from `h_state` (parent=-1)

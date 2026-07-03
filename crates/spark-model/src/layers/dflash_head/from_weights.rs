@@ -12,10 +12,10 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::{
-    BlockDiffusionDraftHead, DflashKernels, DflashLayer, DflashLayerNvfp4,
-    DflashLayerQuantWeights, DflashQuantization, DflashScratch,
+    BlockDiffusionDraftHead, DflashKernels, DflashLayer, DflashLayerNvfp4, DflashLayerQuantWeights,
+    DflashQuantization, DflashScratch,
 };
-use crate::weight_loader::DflashWeights;
+use crate::weight_loader::{DflashWeights, MarkovWeights};
 use crate::weight_map::{DenseWeight, quantize_to_nvfp4};
 
 impl BlockDiffusionDraftHead {
@@ -210,10 +210,8 @@ impl BlockDiffusionDraftHead {
             // K (16) × γ rows. u32 indices + f32 logits = 4 bytes each.
             // Allocated unconditionally so the scratch shape is independent
             // of the runtime ATLAS_DFLASH_METHOD value.
-            topk_tokens_dev: gpu
-                .alloc(g * super::DDTREE_TOP_K_MAX * 4)?,
-            topk_logits_dev: gpu
-                .alloc(g * super::DDTREE_TOP_K_MAX * 4)?,
+            topk_tokens_dev: gpu.alloc(g * super::DDTREE_TOP_K_MAX * 4)?,
+            topk_logits_dev: gpu.alloc(g * super::DDTREE_TOP_K_MAX * 4)?,
             // EAGLE-3.1 per-layer FC-normalization scratch
             // (ATLAS_DFLASH_FC_LAYERNORM=1). `fc_norm_in` holds one fc-input
             // slot [n_target_layers * target_hidden] BF16; `fc_norm_zero_w` is
@@ -222,13 +220,34 @@ impl BlockDiffusionDraftHead {
             // `x * rms` per slice. Both are allocated unconditionally (a few
             // KB) so the scratch shape is independent of the runtime flag; the
             // zero weight is memset to 0 below.
-            fc_norm_in: gpu
-                .alloc(target_layer_ids.len() * target_hidden_size * bf16)?,
+            fc_norm_in: gpu.alloc(target_layer_ids.len() * target_hidden_size * bf16)?,
             fc_norm_zero_w: gpu.alloc(target_hidden_size * bf16)?,
+            // DSpark Markov head scratch. Allocated only when the checkpoint
+            // ships the head (`weights.markov.is_some()`), else NULL — the
+            // propose path only touches these on the Some branch.
+            markov_w1_row: match weights.markov.as_ref() {
+                Some(m) => gpu.alloc(m.rank * bf16)?,
+                None => DevicePtr::NULL,
+            },
+            markov_bias: match weights.markov.as_ref() {
+                Some(_) => gpu.alloc(vocab_size * bf16)?,
+                None => DevicePtr::NULL,
+            },
+            markov_prev_dev: match weights.markov.as_ref() {
+                Some(_) => gpu.alloc(4)?,
+                None => DevicePtr::NULL,
+            },
         };
         // Zero the FC-layernorm weight buffer so the per-slice rms_norm uses a
         // unit (1 + 0) scale → plain unit-variance normalization (variant a).
         gpu.memset(scratch.fc_norm_zero_w, 0, target_hidden_size * bf16)?;
+
+        // Capture the DSpark Markov head weights before `weights.layers` is
+        // consumed below. Weights stay BF16 on device even under NVFP4 drafter
+        // quantization — the head operates directly on the shared-vocab logit
+        // space and the per-position GEMV (K=rank=256) is tiny, so quantizing
+        // it would add complexity for no measurable win.
+        let markov_weights: Option<MarkovWeights> = weights.markov;
 
         // Pre-compute RoPE inv_freq table. Two paths based on the drafter's
         // `rope_scaling` config:
@@ -249,8 +268,7 @@ impl BlockDiffusionDraftHead {
             let factor = scaling.factor.unwrap_or(64.0);
             let beta_fast = scaling.beta_fast.unwrap_or(32.0);
             let beta_slow = scaling.beta_slow.unwrap_or(1.0);
-            let orig_max_pos =
-                scaling.original_max_position_embeddings.unwrap_or(4096) as f32;
+            let orig_max_pos = scaling.original_max_position_embeddings.unwrap_or(4096) as f32;
             let find_correction_dim = |num_rot: f32| -> f32 {
                 (dim_f * (orig_max_pos / (num_rot * 2.0 * std::f32::consts::PI)).ln())
                     / (2.0 * rope_theta.ln())
@@ -270,8 +288,8 @@ impl BlockDiffusionDraftHead {
                 let inv_freq_interp = 1.0 / (factor * pos_freq);
                 let ramp = ((j as f32 - low) / ramp_denom).clamp(0.0, 1.0);
                 let extrap_factor = 1.0 - ramp;
-                inv_freq_table[j] = inv_freq_interp * (1.0 - extrap_factor)
-                    + inv_freq_extrap * extrap_factor;
+                inv_freq_table[j] =
+                    inv_freq_interp * (1.0 - extrap_factor) + inv_freq_extrap * extrap_factor;
             }
             tracing::info!(
                 "DFlash YaRN inv_freq: {n_pairs} pairs, factor={factor}, \
@@ -396,11 +414,9 @@ impl BlockDiffusionDraftHead {
                 // H2D+D2H round trip; drafter is 5 layers × 3 FFN projs ~=
                 // 1.3 GB total). Disabled when ffn_kgamma kernel handle
                 // failed to resolve (older cached PTX).
-                let want_ffn_kgamma_t = crate::layers::dflash_ffn_kgamma_enabled()
-                    && kernels.w4a16_gemm_t_m16.0 != 0;
-                if crate::layers::dflash_ffn_kgamma_enabled()
-                    && kernels.w4a16_gemm_t_m16.0 == 0
-                {
+                let want_ffn_kgamma_t =
+                    crate::layers::dflash_ffn_kgamma_enabled() && kernels.w4a16_gemm_t_m16.0 != 0;
+                if crate::layers::dflash_ffn_kgamma_enabled() && kernels.w4a16_gemm_t_m16.0 == 0 {
                     tracing::warn!(
                         "ATLAS_DFLASH_FFN_KGAMMA=1 set but w4a16_gemm_t_m16 \
                          kernel symbol missing — drafter FFN will use the \
@@ -419,11 +435,9 @@ impl BlockDiffusionDraftHead {
                 // at model build (~1.5 GB × 5 layers ≈ 7.5 GB transient host
                 // memory, freed after each transpose). Disabled when the
                 // kgamma kernel handle failed to resolve.
-                let want_attn_kgamma_t = crate::layers::dflash_attn_kgamma_enabled()
-                    && kernels.w4a16_gemm_t_m16.0 != 0;
-                if crate::layers::dflash_attn_kgamma_enabled()
-                    && kernels.w4a16_gemm_t_m16.0 == 0
-                {
+                let want_attn_kgamma_t =
+                    crate::layers::dflash_attn_kgamma_enabled() && kernels.w4a16_gemm_t_m16.0 != 0;
+                if crate::layers::dflash_attn_kgamma_enabled() && kernels.w4a16_gemm_t_m16.0 == 0 {
                     tracing::warn!(
                         "ATLAS_DFLASH_ATTN_KGAMMA=1 set but w4a16_gemm_t_m16 \
                          kernel symbol missing — drafter attention will use \
@@ -456,16 +470,40 @@ impl BlockDiffusionDraftHead {
                     Vec::with_capacity(weights.layers.len());
                 for l in weights.layers.into_iter() {
                     let q = quantize_to_nvfp4(
-                        &l.q_proj, q_out, hidden_size, gpu, absmax_k, quantize_k, qstream,
+                        &l.q_proj,
+                        q_out,
+                        hidden_size,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        qstream,
                     )?;
                     let k = quantize_to_nvfp4(
-                        &l.k_proj, kv_out, hidden_size, gpu, absmax_k, quantize_k, qstream,
+                        &l.k_proj,
+                        kv_out,
+                        hidden_size,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        qstream,
                     )?;
                     let v = quantize_to_nvfp4(
-                        &l.v_proj, kv_out, hidden_size, gpu, absmax_k, quantize_k, qstream,
+                        &l.v_proj,
+                        kv_out,
+                        hidden_size,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        qstream,
                     )?;
                     let o = quantize_to_nvfp4(
-                        &l.o_proj, hidden_size, q_out, gpu, absmax_k, quantize_k, qstream,
+                        &l.o_proj,
+                        hidden_size,
+                        q_out,
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        qstream,
                     )?;
                     let gate = quantize_to_nvfp4(
                         &l.gate_proj,
@@ -502,8 +540,12 @@ impl BlockDiffusionDraftHead {
                     // of headroom for the BF16 leftovers is acceptable in
                     // exchange for stability.
                     let _ = (
-                        l.q_proj.weight, l.k_proj.weight, l.v_proj.weight,
-                        l.o_proj.weight, l.gate_proj.weight, l.up_proj.weight,
+                        l.q_proj.weight,
+                        l.k_proj.weight,
+                        l.v_proj.weight,
+                        l.o_proj.weight,
+                        l.gate_proj.weight,
+                        l.up_proj.weight,
                         l.down_proj.weight,
                     );
 
@@ -513,12 +555,9 @@ impl BlockDiffusionDraftHead {
                     // see qwen35_dense.rs:232/244 for the established pattern).
                     let (gate_t, up_t, down_t) = if want_ffn_kgamma_t {
                         // gate: [intermediate, hidden]; up: [intermediate, hidden]; down: [hidden, intermediate].
-                        let gt = gate
-                            .transpose_for_gemm(gpu, intermediate_size, hidden_size)?;
-                        let ut = up
-                            .transpose_for_gemm(gpu, intermediate_size, hidden_size)?;
-                        let dt = down
-                            .transpose_for_gemm(gpu, hidden_size, intermediate_size)?;
+                        let gt = gate.transpose_for_gemm(gpu, intermediate_size, hidden_size)?;
+                        let ut = up.transpose_for_gemm(gpu, intermediate_size, hidden_size)?;
+                        let dt = down.transpose_for_gemm(gpu, hidden_size, intermediate_size)?;
                         (Some(gt), Some(ut), Some(dt))
                     } else {
                         (None, None, None)
@@ -573,6 +612,15 @@ impl BlockDiffusionDraftHead {
             }
         };
 
+        // DSpark VanillaMarkov head (runtime form). Weights are BF16 on device
+        // (loaded by the drafter weight loader); we just carry the pointers +
+        // rank. The scratch buffers above are already sized for `rank`/`vocab`.
+        let markov = markov_weights.map(|m: MarkovWeights| super::MarkovHead {
+            w1: m.w1,
+            w2: m.w2,
+            rank: m.rank,
+        });
+
         let head = Self {
             num_layers,
             hidden_size,
@@ -598,6 +646,7 @@ impl BlockDiffusionDraftHead {
             fc: fc_after,
             fc_nvfp4,
             draft_id_to_target_id: None,
+            markov,
             layers,
             kv_cache: Mutex::new(kv_cache),
             scratch,

@@ -292,6 +292,47 @@ pub fn w4a16_gemm_n64_m32_splitk(
         .launch(stream)
 }
 
+/// Fused gate_proj + up_proj + SiLU·mul via `w4a16_gemm_t_m32_n64_gateup_silu`.
+///
+/// Takes two transposed NVFP4 weights (gate then up) sharing the input
+/// `A` [M, K] and output shape [M, N=inter]. Computes both projections in
+/// one launch (A loaded once, both B streamed) and writes silu(gate)*up
+/// as the single [M, N] `output`. Replaces the baseline's two m32_n64
+/// GEMMs + standalone `moe_silu_mul` launch.
+///
+/// `ldb` is the B-row stride (== n for tightly-packed T-weights).
+/// Grid: (ceil(N/64), ceil(M/32), 1)  Block (128,1,1).
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_n64_m32_gateup_silu(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 32), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate.weight)
+        .arg_ptr(gate.weight_scale)
+        .arg_f32(gate.weight_scale_2)
+        .arg_ptr(up.weight)
+        .arg_ptr(up.weight_scale)
+        .arg_f32(up.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(n) // ldb == N for tightly-packed T-weights
+        .launch(stream)
+}
+
 /// W4A16 GEMM with M_TILE=16 + N_TILE=64: K=3 MTP verify variant.
 ///
 /// Same FP8 MMA pipeline as `w4a16_gemm_n128_m16` but with the N tile

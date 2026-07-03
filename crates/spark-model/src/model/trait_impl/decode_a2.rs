@@ -65,8 +65,8 @@ impl TransformerModel {
         // fully isolate concurrent sequences (each `decode()`'s
         // `Buffers::zero_all` wipes the shared `logits` buffer), so it is
         // not the default.
-        let mla_perseq_fallback = self.is_mla_dispatch()
-            && crate::model::env_diag::mla_perseq_fallback_enabled();
+        let mla_perseq_fallback =
+            self.is_mla_dispatch() && crate::model::env_diag::mla_perseq_fallback_enabled();
         if mla_perseq_fallback {
             use std::sync::atomic::Ordering;
             let logits = self.decode_logits_ptr();
@@ -282,9 +282,8 @@ impl TransformerModel {
             // CONC_HSD: per-seq hidden-state dump diagnostic. Logs first 4 FP32
             // hidden values for each seq after each layer to localize where
             // pos>=1 diverges from pos 0 in concurrent batched decode.
-            let conc_hsd = crate::model::env_diag::conc_hsd_enabled()
-                && padded_n >= 2
-                && self.comm.is_none();
+            let conc_hsd =
+                crate::model::env_diag::conc_hsd_enabled() && padded_n >= 2 && self.comm.is_none();
             let dump_hidden = |label: &str, stream: u64| -> Result<()> {
                 if !conc_hsd {
                     return Ok(());

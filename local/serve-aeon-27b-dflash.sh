@@ -89,6 +89,10 @@ export ATLAS_DFLASH_QUANT=${ATLAS_DFLASH_QUANT:-nvfp4}
 # verify 900→244ms, 42.6 tok/s at accepted 15.62/16.
 # ATLAS_DISABLE_TREE_WY=1 is the γ=16 correctness fix from c588b34.
 export ATLAS_FFN_KGAMMA_M16=${ATLAS_FFN_KGAMMA_M16:-1}
+# 2026-07-02: fused gate+up+SiLU kernel (one launch, shared A-tile, dual cp.async
+# weight streams, BF16-round-trip reproduced in-kernel → counting md5 byte-identical).
+# Measured: gate+up+silu 42.8→34.8ms/step, counting AND coding +5.5%.
+export ATLAS_FFN_FUSED_GATEUP=${ATLAS_FFN_FUSED_GATEUP:-1}
 export ATLAS_FFN_M16_TRANSPOSED=${ATLAS_FFN_M16_TRANSPOSED:-1}
 export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 
@@ -114,6 +118,32 @@ export ATLAS_DFLASH_NOISE_ONLY=${ATLAS_DFLASH_NOISE_ONLY:-1}
 # on editing and backs off on counting/novel content. LOSSLESS either way
 # (verify commits the target's greedy token). Disable retrieval: ATLAS_DFLASH_SAM=0.
 export ATLAS_DFLASH_SAM=${ATLAS_DFLASH_SAM:-1}
+
+# 2026-07-02: PORTFOLIO verify (ATLAS_DFLASH_PORTFOLIO=1, default OFF).
+# Verifies TWO independent flat chains in ONE K=32 pass — the DFlash drafter's
+# 16-token chain AND the SAM retrieval chain — as a 2-root forest (both attach
+# to the shared root). At each step the target rides whichever chain it actually
+# continues onto, so a divergence the drafter mispredicts can still be covered by
+# the retrieval sibling in the SAME bandwidth-bound verify (K=32 costs ≈ K=17).
+# LOSSLESS by the greedy-oracle argument (verify commits only the target's argmax
+# — proven byte-identical counting md5). Retrieval no longer PRE-EMPTS the
+# drafter here, so its hybrid gate is loosened (fires on any real match, not only
+# the strongest). Requires the wide verify buffers + depth-aware verify path:
+#   ATLAS_DDTREE_MAX_NODES=32          → allocate 32-node parent_ids buffers
+#   ATLAS_DDTREE_TREE_TOKENS_VERIFY=1  → embed each slot's tree-topology token
+#   ATLAS_DDTREE_DFS_REORDER=1         → DFS pre-order = contiguous ancestor
+#                                        reads per chain (validated lossless)
+# Chain A (drafter) is never truncated (byte-exact drafter baseline when no
+# retrieval sibling fires); chain B (retrieval) takes the remaining budget.
+# Enable all four together:
+#   ATLAS_DFLASH_PORTFOLIO=1 ATLAS_DDTREE_MAX_NODES=32 \
+#   ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 ATLAS_DDTREE_DFS_REORDER=1
+if [ "${ATLAS_DFLASH_PORTFOLIO:-0}" = "1" ]; then
+  export ATLAS_DDTREE_MAX_NODES=${ATLAS_DDTREE_MAX_NODES:-32}
+  export ATLAS_DDTREE_TREE_TOKENS_VERIFY=${ATLAS_DDTREE_TREE_TOKENS_VERIFY:-1}
+  export ATLAS_DDTREE_DFS_REORDER=${ATLAS_DDTREE_DFS_REORDER:-1}
+  echo "[serve-aeon-27b-dflash] PORTFOLIO verify ON (2-root forest, K=32, lossless)"
+fi
 
 # 2026-06-10: batched K=17 attention QKV via plain w4a16_gemm (M=17, one
 # weight read instead of 17 per layer). Validated token-exact +
