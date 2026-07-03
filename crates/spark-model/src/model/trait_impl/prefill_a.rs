@@ -66,13 +66,21 @@ impl TransformerModel {
             .ok()
             .map(|s| s != "0" && s != "false")
             .unwrap_or(true);
-        let fp = if cache_on { vision_fingerprint(images) } else { 0 };
+        let fp = if cache_on {
+            vision_fingerprint(images)
+        } else {
+            0
+        };
         if cache_on && fp != 0 {
-            let last = self.vision_cache_fp.load(std::sync::atomic::Ordering::Relaxed);
+            let last = self
+                .vision_cache_fp
+                .load(std::sync::atomic::Ordering::Relaxed);
             if fp == last {
                 let cached = self.vision_cache_grids.lock().clone();
                 let cache_buf = *self.vision_cache_buf.lock();
-                let cache_bytes = self.vision_cache_bytes.load(std::sync::atomic::Ordering::Relaxed);
+                let cache_bytes = self
+                    .vision_cache_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 if !cached.is_empty()
                     && cached.len() == images.len()
                     && cache_buf.0 != 0
@@ -568,6 +576,11 @@ impl TransformerModel {
         // DFlash: advance the seq's `ctx_len` to span all just-prefilled
         // positions so the next propose() can read them.
         self.update_dflash_ctx_len_after_prefill(seq, layer_kv_write_start, proc_count)?;
+
+        // DFlash drafter-retrain teacher-forced hidden capture (default-OFF).
+        // No-op unless ATLAS_DUMP_CTX_HIDDEN is set. Dumps the full-sequence
+        // 5-layer NVFP4 hiddens now resident in ctx_hidden_acc.
+        self.dump_ctx_hidden_after_prefill(seq, tokens)?;
 
         Ok(self.decode_logits_ptr())
     }

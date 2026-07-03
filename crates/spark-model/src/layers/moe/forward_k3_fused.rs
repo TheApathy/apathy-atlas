@@ -73,16 +73,16 @@ impl MoeLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_k3_fused_gate_up(
         &self,
-        input: DevicePtr,           // [3, H] BF16 — raw MoE input (post-norm by caller)
-        router_in: DevicePtr,       // [3, H] BF16 — router input (Gemma-4 pre-norm, else == input)
-        gate_logits: DevicePtr,     // [3, num_experts] BF16 — gate GEMM output (reused as sort scratch)
-        indices_dev: DevicePtr,     // [3*top_k] u32
-        weights_dev: DevicePtr,     // [3*top_k] f32
+        input: DevicePtr,       // [3, H] BF16 — raw MoE input (post-norm by caller)
+        router_in: DevicePtr,   // [3, H] BF16 — router input (Gemma-4 pre-norm, else == input)
+        gate_logits: DevicePtr, // [3, num_experts] BF16 — gate GEMM output (reused as sort scratch)
+        indices_dev: DevicePtr, // [3*top_k] u32
+        weights_dev: DevicePtr, // [3*top_k] f32
         expert_gate_out: DevicePtr, // [3*top_k, inter] BF16 (sorted-order writes)
-        expert_up_out: DevicePtr,   // [3*top_k, inter] BF16 (sorted-order writes)
+        expert_up_out: DevicePtr, // [3*top_k, inter] BF16 (sorted-order writes)
         expert_down_out: DevicePtr, // [3*top_k, H] BF16 (sorted-order writes)
         shared_down_out: DevicePtr, // [3, H] BF16
-        output: DevicePtr,          // [3, H] BF16 — final MoE output
+        output: DevicePtr,      // [3, H] BF16 — final MoE output
         h: u32,
         inter: u32,
         num_experts: u32,
@@ -227,16 +227,7 @@ impl MoeLayer {
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let has_shared = shared_inter > 0;
         if has_shared {
-            self.run_shared_expert_prefill(
-                input,
-                n,
-                h,
-                shared_inter,
-                stream,
-                stream,
-                false,
-                ctx,
-            )?;
+            self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
             // ── 7. Blend shared expert into output ───────────────────
             //
             // moe_batched_blend computes

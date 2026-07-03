@@ -186,8 +186,7 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         // ATLAS_MOE_OVERLAP=1: force eager so the per-step D2H overlap probe in
         // forward_k2 is legal (illegal under graph capture). Measurement-only.
-        let moe_overlap_probe =
-            std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
+        let moe_overlap_probe = std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
         let use_graphs = self.comm.is_none()
             && !suppress_graphs
             // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is

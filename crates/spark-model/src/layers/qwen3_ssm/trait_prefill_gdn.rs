@@ -101,8 +101,8 @@ impl Qwen3SsmLayer {
             // SMEM layout: H[kd*vd]FP32 + smem_k[32*kd]BF16 + smem_q[32*kd]BF16
             //   + smem_warp[4]FP32 + smem_kd[32*32]FP32
             //   + smem_g[32]FP32 + smem_bt[32]FP32 (rounded to 256 B alignment)
-            let smem_bytes = kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2
-                + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
+            let smem_bytes =
+                kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2 + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
             let smem = (smem_bytes.div_ceil(256) * 256) as u32;
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,

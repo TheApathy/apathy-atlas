@@ -272,9 +272,9 @@ impl TransformerModel {
                 profile: false,
                 comm: ctx.comm,
                 graph_capture: ctx.graph_capture,
-            ddtree_parent_ids_dev: None,
-            tree_aware_attn: None,
-            ssm_multi_seq_ptr_table_override: None,
+                ddtree_parent_ids_dev: None,
+                tree_aware_attn: None,
+                ssm_multi_seq_ptr_table_override: None,
             }
         };
 

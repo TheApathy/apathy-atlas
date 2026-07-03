@@ -313,8 +313,7 @@ impl TransformerModel {
             // D2H directly into the host ring buf.
             // SAFETY: copy_d2h requires &mut [u8] of exact size; the ring is
             // sized to `ring_capacity_bytes` and `src_bytes == ring_capacity_bytes`.
-            self.gpu
-                .synchronize(stream)?;
+            self.gpu.synchronize(stream)?;
             self.gpu
                 .copy_d2h(src_ptr, &mut seq.mtp_lastk_host_buf[..src_bytes])?;
             seq.mtp_lastk_host_filled = capacity;
@@ -346,12 +345,9 @@ impl TransformerModel {
                 // rows fill the tail. New filled count is `capacity`.
                 let drop = seq.mtp_lastk_host_filled + ingest - capacity;
                 let drop_bytes = drop * row_bytes;
-                let keep_bytes =
-                    seq.mtp_lastk_host_filled * row_bytes - drop_bytes;
-                seq.mtp_lastk_host_buf.copy_within(
-                    drop_bytes..drop_bytes + keep_bytes,
-                    0,
-                );
+                let keep_bytes = seq.mtp_lastk_host_filled * row_bytes - drop_bytes;
+                seq.mtp_lastk_host_buf
+                    .copy_within(drop_bytes..drop_bytes + keep_bytes, 0);
                 let tail_start = keep_bytes;
                 self.gpu.synchronize(stream)?;
                 self.gpu.copy_d2h(
@@ -532,6 +528,106 @@ impl TransformerModel {
             let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
             dstate.ctx_len = new_len;
         }
+        Ok(())
+    }
+
+    /// DFlash drafter-retrain teacher-forced capture. When
+    /// `ATLAS_DUMP_CTX_HIDDEN=<path>` is set, dump the per-sequence
+    /// `ctx_hidden_acc` (all-position × 5-capture-layer hiddens from the
+    /// just-completed prefill, computed on the NVFP4 serving path) to the
+    /// append-only file. One record per request. No-op when the env var is
+    /// unset, DFlash capture is inactive, or rank > 0 under EP/TP.
+    ///
+    /// The `ctx_hidden_acc` device layout is `[pos, slot, hidden]` BF16
+    /// (per-position stride `n_capture * hidden * 2`), which is exactly the
+    /// SpecForge offline `[T, L*H]` tensor with L = capture layers in
+    /// `dflash_capture_layers` order (e.g. [1,16,31,46,61]). The Python
+    /// harness pads to SPECFORGE_PAD_TO and saves `{md5(padded ids)}.pt`.
+    ///
+    /// Record format (little-endian):
+    /// ```text
+    /// u32 magic        = 0xC7D5_1DEE
+    /// u32 seq_len      = number of positions dumped (= dstate.ctx_len)
+    /// u32 n_capture    = number of capture layers (5)
+    /// u32 hidden_dim   = model hidden_size (5120)
+    /// u64 tok_fnv      = FNV-1a of the request's prompt-token bytes (pairing)
+    /// bf16 payload[seq_len * n_capture * hidden_dim]  (layout [pos, slot, h])
+    /// ```
+    /// Must run in eager mode (synchronous `copy_d2h`); prefill is already
+    /// eager (no CUDA-graph capture on the prefill path).
+    pub(super) fn dump_ctx_hidden_after_prefill(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        tokens: &[u32],
+    ) -> Result<()> {
+        let path = match crate::model::env_diag::dump_ctx_hidden_path() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        if self.dflash_capture_layers.is_empty() {
+            return Ok(());
+        }
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(());
+        }
+        let h = self.config.hidden_size;
+        let bf16 = 2usize;
+        let n_capture = self.dflash_capture_layers.len();
+
+        let (acc_base, n) = match seq.proposer_state.as_mut() {
+            Some(ps) => match ps
+                .as_any_mut()
+                .downcast_mut::<crate::layers::DflashProposerState>()
+            {
+                Some(dstate) => (dstate.ctx_hidden_acc, dstate.ctx_len),
+                None => return Ok(()),
+            },
+            None => return Ok(()),
+        };
+        if acc_base.0 == 0 || n == 0 {
+            tracing::warn!(
+                "ATLAS_DUMP_CTX_HIDDEN: no ctx_hidden_acc/ctx_len (acc={:#x}, n={}) — skipping dump",
+                acc_base.0,
+                n
+            );
+            return Ok(());
+        }
+
+        let total_bytes = n * n_capture * h * bf16;
+        let mut host_buf = vec![0u8; total_bytes];
+        self.gpu.copy_d2h(acc_base, &mut host_buf)?;
+
+        // FNV-1a over the prompt token bytes — lets the Python harness assert
+        // it paired the right record with the right sample.
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x100_0000_01b3;
+        let mut fnv: u64 = FNV_OFFSET;
+        for &t in tokens {
+            for &b in t.to_le_bytes().iter() {
+                fnv ^= b as u64;
+                fnv = fnv.wrapping_mul(FNV_PRIME);
+            }
+        }
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("ATLAS_DUMP_CTX_HIDDEN open {path}: {e}"))?;
+        const CTX_HIDDEN_MAGIC: u32 = 0xC7D5_1DEE;
+        f.write_all(&CTX_HIDDEN_MAGIC.to_le_bytes())?;
+        f.write_all(&(n as u32).to_le_bytes())?;
+        f.write_all(&(n_capture as u32).to_le_bytes())?;
+        f.write_all(&(h as u32).to_le_bytes())?;
+        f.write_all(&fnv.to_le_bytes())?;
+        f.write_all(&host_buf)?;
+        tracing::info!(
+            "ATLAS_DUMP_CTX_HIDDEN: wrote record seq_len={n} n_capture={n_capture} h={h} \
+             ({total_bytes} bytes payload) fnv={fnv:#018x} → {path}"
+        );
         Ok(())
     }
 

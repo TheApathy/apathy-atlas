@@ -15,8 +15,8 @@
 //! Cost: 1 D2H copy of 96 bytes + 1 stream sync per K=3 call when
 //! enabled. Compiles to a single `is_enabled()` atomic load when not.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -55,12 +55,7 @@ pub fn is_enabled() -> bool {
 /// `indices_dev` points at the [3 * top_k] u32 expert-id table that the
 /// fused MoE kernel will consume. We sync the stream, D2H-copy the small
 /// table, and update accumulators.
-pub fn sample(
-    gpu: &dyn GpuBackend,
-    indices_dev: DevicePtr,
-    top_k: u32,
-    stream: u64,
-) -> Result<()> {
+pub fn sample(gpu: &dyn GpuBackend, indices_dev: DevicePtr, top_k: u32, stream: u64) -> Result<()> {
     if !is_enabled() {
         return Ok(());
     }

@@ -11,8 +11,15 @@ use super::*;
 #[allow(dead_code)]
 pub struct CompletionRequest {
     pub model: String,
-    #[serde(deserialize_with = "deserialize_prompt")]
+    #[serde(default, deserialize_with = "deserialize_prompt")]
     pub prompt: String,
+    /// Optional raw prompt token IDs. When present, bypasses tokenization
+    /// AND the think-prefix injection — the model prefills exactly these
+    /// tokens. Used by the DFlash drafter-retrain hidden-capture harness so
+    /// the captured hidden states align 1:1 with the trainer's own
+    /// (chat-templated) input_ids. `prompt` is ignored when this is set.
+    #[serde(default)]
+    pub prompt_token_ids: Option<Vec<u32>>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     pub temperature: Option<f32>,

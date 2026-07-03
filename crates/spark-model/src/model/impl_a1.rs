@@ -218,9 +218,8 @@ impl TransformerModel {
             for i in 1..cap {
                 chain.push((i - 1) as i32);
             }
-            let byte_view = unsafe {
-                std::slice::from_raw_parts(chain.as_ptr() as *const u8, bytes)
-            };
+            let byte_view =
+                unsafe { std::slice::from_raw_parts(chain.as_ptr() as *const u8, bytes) };
             gpu.copy_h2d_async(byte_view, buf, gpu.default_stream())?;
             gpu.synchronize(gpu.default_stream())?;
             tracing::info!(
@@ -255,14 +254,15 @@ impl TransformerModel {
                     identity.push(j as i32);
                 }
             }
-            let byte_view = unsafe {
-                std::slice::from_raw_parts(identity.as_ptr() as *const u8, bytes)
-            };
+            let byte_view =
+                unsafe { std::slice::from_raw_parts(identity.as_ptr() as *const u8, bytes) };
             gpu.copy_h2d_async(byte_view, buf, gpu.default_stream())?;
             gpu.synchronize(gpu.default_stream())?;
             tracing::info!(
                 "ATLAS_TREE_AWARE_ATTN: allocated indirection buffer ({}x{} i32, ptr={:?})",
-                stride, stride, buf
+                stride,
+                stride,
+                buf
             );
             (buf, stride)
         } else {
@@ -279,25 +279,25 @@ impl TransformerModel {
         // upload establishes a proper stream-ordered dependency for the
         // captured graph kernels. A pageable-source (Vec-backed) async copy
         // can race ahead of the kernel launch on graph replay paths.
-        let (tree_kv_indir_base_persistent, tree_kv_indir_base_host_pinned) =
-            if dflash_kgamma > 0 {
-                let buf = gpu.alloc(std::mem::size_of::<i32>())?;
-                gpu.memset_async(buf, 0, std::mem::size_of::<i32>(), gpu.default_stream())?;
-                gpu.synchronize(gpu.default_stream())?;
-                let host_ptr = gpu.alloc_host_pinned(std::mem::size_of::<i32>())?;
-                // Pre-zero the pinned shadow so any pre-tree verify (rare) is
-                // consistent with the device buffer's zero-init.
-                unsafe {
-                    std::ptr::write_bytes(host_ptr, 0u8, std::mem::size_of::<i32>());
-                }
-                tracing::info!(
-                    "ATLAS_TREE_AWARE_ATTN: allocated kv_indir_base buffer (1xi32, dev={:?}, host_pinned={:?})",
-                    buf, host_ptr
-                );
-                (buf, host_ptr)
-            } else {
-                (DevicePtr::NULL, std::ptr::null_mut::<u8>())
-            };
+        let (tree_kv_indir_base_persistent, tree_kv_indir_base_host_pinned) = if dflash_kgamma > 0 {
+            let buf = gpu.alloc(std::mem::size_of::<i32>())?;
+            gpu.memset_async(buf, 0, std::mem::size_of::<i32>(), gpu.default_stream())?;
+            gpu.synchronize(gpu.default_stream())?;
+            let host_ptr = gpu.alloc_host_pinned(std::mem::size_of::<i32>())?;
+            // Pre-zero the pinned shadow so any pre-tree verify (rare) is
+            // consistent with the device buffer's zero-init.
+            unsafe {
+                std::ptr::write_bytes(host_ptr, 0u8, std::mem::size_of::<i32>());
+            }
+            tracing::info!(
+                "ATLAS_TREE_AWARE_ATTN: allocated kv_indir_base buffer (1xi32, dev={:?}, host_pinned={:?})",
+                buf,
+                host_ptr
+            );
+            (buf, host_ptr)
+        } else {
+            (DevicePtr::NULL, std::ptr::null_mut::<u8>())
+        };
 
         // ATLAS_TREE_KV_PACK: per-attention-layer packed-KV scratch pool.
         //
@@ -315,7 +315,8 @@ impl TransformerModel {
         //   16 attn layers    = ~4.6 MB total (negligible).
         //
         // NVFP4: per-block = data + scale section, similar order of magnitude.
-        let tree_kv_pack_active_env = std::env::var("ATLAS_TREE_KV_PACK").ok().as_deref() == Some("1");
+        let tree_kv_pack_active_env =
+            std::env::var("ATLAS_TREE_KV_PACK").ok().as_deref() == Some("1");
         let (
             tree_kv_pack_scratch_k,
             tree_kv_pack_scratch_v,
@@ -393,9 +394,8 @@ impl TransformerModel {
                 let bt_bytes = bt_entries * std::mem::size_of::<i32>();
                 let bt_buf = gpu.alloc(bt_bytes)?;
                 let identity: Vec<i32> = (0..num_seqs as i32).collect();
-                let bt_view = unsafe {
-                    std::slice::from_raw_parts(identity.as_ptr() as *const u8, bt_bytes)
-                };
+                let bt_view =
+                    unsafe { std::slice::from_raw_parts(identity.as_ptr() as *const u8, bt_bytes) };
                 gpu.copy_h2d_async(bt_view, bt_buf, gpu.default_stream())?;
 
                 let seq_lens_bytes = num_seqs * std::mem::size_of::<i32>();
@@ -423,7 +423,12 @@ impl TransformerModel {
                 tracing::info!(
                     "ATLAS_TREE_KV_PACK: allocated {} attn-layer scratch pools ({} bytes each K/V), \
                      stride={}, num_seqs={}, dtype={:?}, active={}",
-                    num_attn, pool_bytes_per_layer, stride, num_seqs, kv_dtype, active
+                    num_attn,
+                    pool_bytes_per_layer,
+                    stride,
+                    num_seqs,
+                    kv_dtype,
+                    active
                 );
                 (
                     scratch_k,
@@ -460,8 +465,8 @@ impl TransformerModel {
             ssm_pool.h_bytes,
             ssm_pool.conv_bytes,
             ssm_pool.num_ssm_layers,
-            0,  // decode_ring_slots
-            0,  // decode_max_seqs
+            0, // decode_ring_slots
+            0, // decode_max_seqs
             gpu.as_ref(),
         )?;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
@@ -495,16 +500,24 @@ impl TransformerModel {
             && w4a16_gemm_t_m32_n64_kernel.0 != 0
         {
             match lm_head_nvfp4.as_ref() {
-                Some(w) => match w.transpose_for_gemm(gpu.as_ref(), config.vocab_size, config.hidden_size) {
-                    Ok(t) => {
-                        tracing::info!("lm_head NVFP4-T built for K=γ m32 path (vocab={})", config.vocab_size);
-                        Some(t)
+                Some(w) => {
+                    match w.transpose_for_gemm(gpu.as_ref(), config.vocab_size, config.hidden_size)
+                    {
+                        Ok(t) => {
+                            tracing::info!(
+                                "lm_head NVFP4-T built for K=γ m32 path (vocab={})",
+                                config.vocab_size
+                            );
+                            Some(t)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "lm_head transpose failed ({e:#}); K=γ lm_head stays on plain w4a16_gemm"
+                            );
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("lm_head transpose failed ({e:#}); K=γ lm_head stays on plain w4a16_gemm");
-                        None
-                    }
-                },
+                }
                 None => None,
             }
         } else {
@@ -614,7 +627,8 @@ impl TransformerModel {
                     return Err(anyhow::anyhow!(
                         "ATLAS_DUMP_HIDDEN: derived spacing s={} from N={} is \
                          degenerate. Set ATLAS_DUMP_LAYERS explicitly.",
-                        s, n
+                        s,
+                        n
                     ));
                 }
                 let derived = vec![1, 1 + s, 1 + 2 * s, 1 + 3 * s, 1 + 4 * s];
@@ -626,14 +640,17 @@ impl TransformerModel {
                     return Err(anyhow::anyhow!(
                         "ATLAS_DUMP_HIDDEN: capture layer {} out of range \
                          (num_hidden_layers={})",
-                        li, config.num_hidden_layers
+                        li,
+                        config.num_hidden_layers
                     ));
                 }
             }
             tracing::info!(
                 "ATLAS_DUMP_HIDDEN set: dflash_capture_layers = {:?} \
                  (source: {}, num_hidden_layers={})",
-                layers, source, config.num_hidden_layers
+                layers,
+                source,
+                config.num_hidden_layers
             );
             dflash_capture_layers = layers;
         }

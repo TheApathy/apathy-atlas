@@ -169,6 +169,41 @@ pub fn dense_gemv_batch3(
         .launch(stream)
 }
 
+/// General batched dense BF16 GEMV: C[num_tokens, N] = A[num_tokens, K] @ B[N, K]^T.
+///
+/// grid.y = token index — each y-block runs EXACTLY the `dense_gemv_bf16`
+/// body on `A + t*K` / `C + t*N` (same lane→kv mapping, same accumulation
+/// order, same warp-shuffle + smem reduce), so the output is BIT-IDENTICAL
+/// to `num_tokens` separate `dense_gemv` launches. Collapses the DFlash
+/// K=γ verify's per-token `ssm_ba_proj_loop` (17 launches × 48 SSM layers)
+/// into 1 launch per layer. The BA weight is L2-resident across y-blocks
+/// so DRAM weight traffic stays ~1×.
+///
+/// Kernel: `dense_gemv_bf16_batchn(A, B, C, N, K)`
+/// Grid: (ceil(N/4), num_tokens, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    num_tokens: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), num_tokens, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Dense FP8-weight GEMV (M=1): C = A @ (dequant(B_fp8) * row_scale).
 ///
 /// A: `[1, K]` BF16, B: `[N, K]` FP8 E4M3, row_scale: `[N]` f32, C: `[1, N]` BF16.

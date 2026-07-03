@@ -331,8 +331,8 @@ impl Qwen3SsmLayer {
             //   + smem_warp[4]FP32 + smem_kd[32*32]FP32
             //   + smem_g[32]FP32 + smem_bt[32]FP32
             // Round up to 256 B for alignment.
-            let smem_bytes = kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2
-                + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
+            let smem_bytes =
+                kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2 + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
             let smem = (smem_bytes.div_ceil(256) * 256) as u32;
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,
@@ -434,7 +434,11 @@ impl Qwen3SsmLayer {
         if let Some(__t) = __gdn_t {
             ctx.gpu.synchronize(stream)?;
             let __ns = __t.elapsed().as_nanos() as u64;
-            tracing::info!("GDN_PROF call total={k} us={} path={}", __ns / 1000, __gdn_path);
+            tracing::info!(
+                "GDN_PROF call total={k} us={} path={}",
+                __ns / 1000,
+                __gdn_path
+            );
         }
 
         prof!("gdn_prefill", t0);

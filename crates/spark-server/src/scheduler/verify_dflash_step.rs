@@ -640,7 +640,22 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
         );
     }
     match propose_result {
-        Ok(d) if !d.is_empty() => a.pending_drafts = d,
+        Ok(d) if !d.is_empty() => {
+            let mut drafts = d;
+            // ── ATLAS_DFLASH_CFG_JF=1: CFG jump-forward splice (default off) ──
+            //
+            // Splice structurally-forced tokens (closing brackets/quotes) into
+            // the freshly-proposed draft chain at positions where the neural
+            // drafter disagreed with the single legal next token. LOSSLESS: the
+            // verify above is a greedy oracle, so a wrong splice is rejected
+            // exactly like a wrong drafter token. Skipped when a
+            // NON-terminated grammar is active (xgrammar already forces those
+            // positions; we must not fight it) and when the tree payload is set
+            // (drafts are compact tree indices, not a flat chain). No-op unless
+            // the classification table was built at startup.
+            cfg_jf_splice_drafts(a, &mut drafts);
+            a.pending_drafts = drafts;
+        }
         Ok(_) => {}
         Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
     }
@@ -661,6 +676,60 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // above and stash it on ActiveSeq for the next-step verifier. Default
     // proposers return None (flat path preserved).
     a.pending_tree_payload = model.take_pending_tree_payload(&mut a.seq);
+}
+
+/// Whether any DFlash TREE draft method is active (BRANCH / CATERPILLAR /
+/// DDTree). CFG jump-forward operates on a FLAT draft chain only; when a tree
+/// method is on, the proposer emits compact tree-index tokens whose positions
+/// don't correspond to a left-to-right token stream, so splicing would be
+/// meaningless. Read once. CFG_JF is a distinct opt-in flag, so the operator is
+/// not expected to combine them — this is a defensive guard.
+fn dflash_tree_method_active() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_BRANCH").ok().as_deref() == Some("1")
+            || std::env::var("ATLAS_DFLASH_CATERPILLAR").ok().as_deref() == Some("1")
+            || std::env::var("ATLAS_DFLASH_METHOD").ok().as_deref() == Some("ddtree")
+    })
+}
+
+/// Apply the CFG jump-forward splice to a freshly-proposed flat draft chain
+/// in place. No-op unless `ATLAS_DFLASH_CFG_JF=1`, the startup classification
+/// table is present, no tree method is active, and the sequence has no active
+/// (non-terminated) grammar. Emits a one-shot stats log on the first splice.
+///
+/// LOSSLESS: only mutates the PROPOSED tokens; the verify path commits solely
+/// the target's greedy token, so a wrong splice is rejected for free and output
+/// is byte-identical to the flag-off path when no splice ever helps.
+fn cfg_jf_splice_drafts(a: &ActiveSeq, drafts: &mut [u32]) {
+    use super::cfg_jump_forward as jf;
+
+    if !jf::cfg_jf_enabled() || drafts.is_empty() || dflash_tree_method_active() {
+        return;
+    }
+    // Do not fight an active grammar (xgrammar already forces those slots).
+    if a.grammar_state.as_ref().is_some_and(|gs| !gs.is_terminated()) {
+        return;
+    }
+    let (Some(table), Some(forced)) = (jf::delim_table(), jf::forced_ids()) else {
+        return; // table not built (flag was off at startup) → inert
+    };
+
+    let stats = jf::splice_forced(drafts, &a.seq.tokens, &table, &forced);
+
+    if stats.splices > 0 {
+        static JF_DBG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = JF_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 16 {
+            tracing::info!(
+                "DFlash CFG_JF #{n}: spliced {} forced token(s) into draft chain \
+                 (first_pos={}, seq_len={})",
+                stats.splices,
+                stats.first_pos,
+                a.seq.seq_len,
+            );
+        }
+    }
 }
 
 /// Grammar-masked re-derivation of the DFlash accept prefix + bonus

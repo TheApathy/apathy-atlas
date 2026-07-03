@@ -14,8 +14,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::ctx::MultiSeqCtx;
 use crate::layers::ops;
-use crate::weight_map::QuantizedWeight;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+use crate::weight_map::QuantizedWeight;
 
 /// Cached `ATLAS_ATTN_QKV_BATCHED` env-var lookup. When `1` the n∈(3,32]
 /// multi_seq QKV projection runs THREE plain `w4a16_gemm` calls at M=n
@@ -25,13 +25,24 @@ use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 /// (~53ms/step of the K=17 DFlash verify at n=17 across 16 attn layers).
 /// Output goes to scratch then scatters into the interleaved qkv_buf with
 /// the same per-token `deinterleave_qg` fixup as the batched-M16 path.
-/// Default off for A/B safety.
+///
+/// Enabled by `ATLAS_ATTN_QKV_BATCHED=1` (the serve-script default) OR the
+/// alias `ATLAS_ATTN_QKV_M16=1`. Both select the same batched path, which
+/// internally prefers the M-efficient transposed `w4a16_gemm_t_m32_n64`
+/// kernel (single B read, 272 CTAs) over the plain M_TILE=64 `w4a16_gemm`
+/// when the transposed QKV weights are installed — see `use_m32` in
+/// `ms_qkv_batched_plain`. This is the SAFE M-efficient QKV route at M=17
+/// (the `w4a16_gemm_t_m16` + NVFP4-T path is the corruptor; see the
+/// ATLAS_TC_NVFP4_M16_MS_ATTN warning below). Default off for A/B safety.
 fn attn_qkv_batched_plain_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("ATLAS_ATTN_QKV_BATCHED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        let on = |k: &str| {
+            std::env::var(k)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        on("ATLAS_ATTN_QKV_BATCHED") || on("ATLAS_ATTN_QKV_M16")
     })
 }
 
@@ -65,8 +76,7 @@ fn attn_qkv_fused_enabled() -> bool {
 /// broken attention path. Set `ATLAS_TC_NVFP4_M16_MS_ATTN=1` to opt in.
 pub(super) fn tc_nvfp4_m16_ms_attn_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE
-        .get_or_init(|| std::env::var("ATLAS_TC_NVFP4_M16_MS_ATTN").ok().as_deref() == Some("1"))
+    *GATE.get_or_init(|| std::env::var("ATLAS_TC_NVFP4_M16_MS_ATTN").ok().as_deref() == Some("1"))
 }
 
 impl Qwen3AttentionLayer {
@@ -555,12 +565,24 @@ impl Qwen3AttentionLayer {
         // property as m128 at n ≤ 32 but 2× the CTA count (no SM
         // starvation). Falls back to m128 on older PTX caches.
         let use_m32 = m128_t && n <= 32 && self.w4a16_gemm_t_m32_n64_k.0 != 0;
-        let (t_kernel, t_launch): (KernelHandle, fn(&dyn GpuBackend, KernelHandle, DevicePtr, &QuantizedWeight, DevicePtr, u32, u32, u32, u64) -> Result<()>) =
-            if use_m32 {
-                (self.w4a16_gemm_t_m32_n64_k, ops::w4a16_gemm_n64_m32)
-            } else {
-                (self.w4a16_gemm_t_m128_k, ops::w4a16_gemm_n128_m128)
-            };
+        let (t_kernel, t_launch): (
+            KernelHandle,
+            fn(
+                &dyn GpuBackend,
+                KernelHandle,
+                DevicePtr,
+                &QuantizedWeight,
+                DevicePtr,
+                u32,
+                u32,
+                u32,
+                u64,
+            ) -> Result<()>,
+        ) = if use_m32 {
+            (self.w4a16_gemm_t_m32_n64_k, ops::w4a16_gemm_n64_m32)
+        } else {
+            (self.w4a16_gemm_t_m128_k, ops::w4a16_gemm_n128_m128)
+        };
 
         // Q scratch: [n, q_proj_dim] BF16 contiguous in ssm_qkvz.
         let q_scratch = fwd.buffers.ssm_qkvz();
@@ -573,39 +595,70 @@ impl Qwen3AttentionLayer {
             let q_t = self.q_nvfp4_t.as_ref().unwrap();
             let k_t = self.k_nvfp4_t.as_ref().unwrap();
             let v_t = self.v_nvfp4_t.as_ref().unwrap();
+            // Q projection: N=q_proj_dim (12288 gated) → ~192 CTAs on the
+            // single-slice m32_n64, already well-provisioned; split-K is a
+            // no-op here (like FFN gate/up) so Q always uses `t_launch`.
             t_launch(
-                fwd.gpu,
-                t_kernel,
-                normed,
-                q_t,
-                q_scratch,
-                n_u32,
-                q_proj_dim,
-                h as u32,
-                stream,
+                fwd.gpu, t_kernel, normed, q_t, q_scratch, n_u32, q_proj_dim, h as u32, stream,
             )?;
-            t_launch(
-                fwd.gpu,
-                t_kernel,
-                normed,
-                k_t,
-                k_scratch,
-                n_u32,
-                kv_dim,
-                h as u32,
-                stream,
-            )?;
-            t_launch(
-                fwd.gpu,
-                t_kernel,
-                normed,
-                v_t,
-                v_scratch,
-                n_u32,
-                kv_dim,
-                h as u32,
-                stream,
-            )?;
+
+            // ── Target 1: K/V split-K (ATLAS_ATTN_QKV_SPLITK=n) ──
+            // K and V are N=kv_dim (1024) → only ~16 CTAs on the single
+            // slice: occupancy-starved on GB10's 48 SMs. Route through the
+            // proven ffn_down split-K path (partial → FP32 workspace →
+            // reduce → BF16) when the gate + kernels + use_m32 + workspace
+            // are all present. Token-exact (FP32 partials). Falls through
+            // to the single-slice `t_launch` otherwise.
+            let qkv_splits = crate::layers::attn_qkv_splitk();
+            let ws = if qkv_splits > 0 {
+                *self.qkv_splitk_workspace.lock().unwrap()
+            } else {
+                None
+            };
+            let kv_splitk_ok = use_m32
+                && qkv_splits > 0
+                && self.w4a16_gemm_t_m32_n64_splitk_k.0 != 0
+                && self.reduce_splitk_k.0 != 0
+                && ws.is_some();
+            if let (true, Some(ws)) = (kv_splitk_ok, ws) {
+                ops::w4a16_gemm_n64_m32_splitk(
+                    fwd.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk_k,
+                    self.reduce_splitk_k,
+                    normed,
+                    k_t,
+                    k_scratch,
+                    ws,
+                    n_u32,
+                    kv_dim,
+                    h as u32,
+                    kv_dim, // ldb == N for tightly-packed T-weight
+                    qkv_splits,
+                    stream,
+                )?;
+                ops::w4a16_gemm_n64_m32_splitk(
+                    fwd.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk_k,
+                    self.reduce_splitk_k,
+                    normed,
+                    v_t,
+                    v_scratch,
+                    ws,
+                    n_u32,
+                    kv_dim,
+                    h as u32,
+                    kv_dim,
+                    qkv_splits,
+                    stream,
+                )?;
+            } else {
+                t_launch(
+                    fwd.gpu, t_kernel, normed, k_t, k_scratch, n_u32, kv_dim, h as u32, stream,
+                )?;
+                t_launch(
+                    fwd.gpu, t_kernel, normed, v_t, v_scratch, n_u32, kv_dim, h as u32, stream,
+                )?;
+            }
         } else {
             ops::w4a16_gemm(
                 fwd.gpu,

@@ -55,9 +55,9 @@ fn test_forward_context_lifetime() {
         profile: false,
         comm: None,
         graph_capture: false,
-            ddtree_parent_ids_dev: None,
-            tree_aware_attn: None,
-            ssm_multi_seq_ptr_table_override: None,
+        ddtree_parent_ids_dev: None,
+        tree_aware_attn: None,
+        ssm_multi_seq_ptr_table_override: None,
     };
 
     assert_eq!(ctx.config.hidden_size, 2048);

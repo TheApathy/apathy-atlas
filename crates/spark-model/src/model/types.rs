@@ -261,7 +261,8 @@ pub struct TransformerModel {
     // Key: (slot_idx, k, pack_active_flag). The pack_active flag forces a
     // separate captured graph for the ATLAS_TREE_KV_PACK fast path so the
     // first (pre-tree, flat-chain) verify can't bake in stale arg pointers.
-    pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize, u32), GraphHandle>>,
+    pub(super) verify_kgamma_graph:
+        Mutex<std::collections::HashMap<(usize, usize, u32), GraphHandle>>,
     /// Prefix cache for KV block reuse across requests.
     pub(super) prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     /// Secondary CUDA stream for pipelining checkpoint D2D with MTP propose.

@@ -114,10 +114,7 @@ impl BlockDiffusionDraftHead {
         // [eff_ctx zeros, last_token (bonus), per-row mask-or-committed × γ_eff].
         let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
             .chain(std::iter::once(last_token as i32))
-            .chain(
-                (0..gamma_eff)
-                    .map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)),
-            )
+            .chain((0..gamma_eff).map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)))
             .collect();
         if debug_dump {
             tracing::info!(

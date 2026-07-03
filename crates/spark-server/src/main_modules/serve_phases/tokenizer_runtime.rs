@@ -157,6 +157,29 @@ pub(crate) fn resolve_tokenizer_runtime(
         );
     }
 
+    // CFG jump-forward classification table (ATLAS_DFLASH_CFG_JF=1, default
+    // off). Classifies every vocab id into a structural delimiter class
+    // (open/close bracket, quote, triple-quote, colon, newline) so the DFlash
+    // draft-splice path ([`scheduler::cfg_jump_forward`]) can force closing
+    // delimiters into the draft chain by pure table lookup on the hot path.
+    // Built ONLY when the flag is set (skips ~250K decodes otherwise). Fully
+    // lossless: only changes what is proposed, never what is committed.
+    if crate::scheduler::cfg_jf_enabled() {
+        let vocab_size = tokenizer.inner().get_vocab_size(true);
+        let decode = |id: u32| tokenizer.decode_with_special(&[id]).ok();
+        let (table, structural) = crate::scheduler::build_delim_table(vocab_size, decode);
+        crate::scheduler::set_delim_table(std::sync::Arc::from(table));
+        let forced =
+            crate::scheduler::build_forced_ids(vocab_size, |id| {
+                tokenizer.decode_with_special(&[id]).ok()
+            });
+        crate::scheduler::set_forced_ids(std::sync::Arc::new(forced));
+        tracing::info!(
+            "CFG jump-forward: ENABLED — {structural}/{vocab_size} ids classified \
+             as structural delimiters (ATLAS_DFLASH_CFG_JF=1, lossless draft splice)"
+        );
+    }
+
     if let Some(tid) = think_end_token {
         tracing::info!(
             "Thinking end token: {} ({})",

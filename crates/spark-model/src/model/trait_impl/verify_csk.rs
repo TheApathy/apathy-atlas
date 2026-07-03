@@ -363,18 +363,14 @@ impl TransformerModel {
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Expected SsmLayerState at layer {layer_i}")
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState at layer {layer_i}"))?;
 
                 let h_inter = self
                     .ssm_pool
                     .h_intermediate(ssm_layer_idx, slot, inter_slot);
-                let conv_inter = self.ssm_pool.conv_intermediate(
-                    ssm_layer_idx,
-                    slot,
-                    inter_slot,
-                );
+                let conv_inter = self
+                    .ssm_pool
+                    .conv_intermediate(ssm_layer_idx, slot, inter_slot);
                 self.gpu
                     .copy_d2d_async(ssm.h_state, h_inter, h_bytes, stream)?;
                 self.gpu

@@ -54,9 +54,7 @@ impl TransformerModel {
     /// True when target early-exit drafting is enabled.
     pub(super) fn early_exit_enabled() -> bool {
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *CACHE.get_or_init(|| {
-            std::env::var("ATLAS_DFLASH_EARLY_EXIT").ok().as_deref() == Some("1")
-        })
+        *CACHE.get_or_init(|| std::env::var("ATLAS_DFLASH_EARLY_EXIT").ok().as_deref() == Some("1"))
     }
 
     /// Number of target layers to run before the early exit (`lm_head` is

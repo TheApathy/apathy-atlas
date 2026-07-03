@@ -72,8 +72,7 @@ impl RetrievalConfig {
     /// byte-for-byte preserved). `ATLAS_DFLASH_SAM=1` additionally selects the
     /// longest-suffix (SAM) matcher; it implies retrieval is on.
     pub fn from_env(draft_count: usize) -> Option<Self> {
-        let retrieval_on =
-            std::env::var("ATLAS_DFLASH_RETRIEVAL").ok().as_deref() == Some("1");
+        let retrieval_on = std::env::var("ATLAS_DFLASH_RETRIEVAL").ok().as_deref() == Some("1");
         let sam = std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1");
         if !retrieval_on && !sam {
             return None;
@@ -86,8 +85,7 @@ impl RetrievalConfig {
         // the minimum match length that pre-empts the drafter — default it
         // to `l_min` (the sweepable `ATLAS_RETRIEVAL_HYBRID_MIN` overrides).
         let hybrid_default = if sam { l_min } else { l_max };
-        let hybrid_min: usize =
-            env_usize("ATLAS_RETRIEVAL_HYBRID_MIN", hybrid_default).max(1);
+        let hybrid_min: usize = env_usize("ATLAS_RETRIEVAL_HYBRID_MIN", hybrid_default).max(1);
         Some(Self {
             l_max,
             l_min,
@@ -458,5 +456,37 @@ mod tests {
     fn sam_no_match_returns_none() {
         let haystack = vec![1, 2, 3, 4, 5];
         assert!(retrieve_longest(&haystack, 99, &sam_cfg(3, 16, 2)).is_none());
+    }
+
+    // ── WIDE RETRIEVAL (ATLAS_DFLASH_RETR_WIDE) tests ─────────────────────
+
+    #[test]
+    fn sam_wide_returns_exact_draft_count() {
+        // A strong match with MANY follow-on tokens: a wide draft_count of 20
+        // must return exactly 20 drafts (K=21 verify), not truncate to γ=16.
+        // Build a 25-token run repeated after a [1,2,3,4] anchor.
+        let mut haystack: Vec<u32> = vec![1, 2, 3, 4];
+        let follow: Vec<u32> = (100..125).collect(); // 25 follow-on tokens
+        haystack.extend_from_slice(&follow); // first occurrence: [1,2,3,4] + follow
+        haystack.extend_from_slice(&[9, 9, 9]);
+        haystack.extend_from_slice(&[1, 2, 3]); // live tail ...1,2,3 + last=4
+        // draft_count=20 (> γ=16): retrieve_longest must return 20 follow-on
+        // tokens from the earlier [1,2,3,4] occurrence.
+        let hit = retrieve_longest(&haystack, 4, &sam_cfg(20, 32, 2)).expect("wide sam hit");
+        assert_eq!(hit.drafts.len(), 20);
+        assert_eq!(hit.drafts, follow[..20].to_vec());
+        assert!(hit.match_len >= 4);
+    }
+
+    #[test]
+    fn sam_wide_none_when_insufficient_followon() {
+        // Strong match but only 10 follow-on tokens available; a wide request
+        // of 20 must return None (so the caller falls back to the neural
+        // drafter at γ) rather than a short draft that would break the fixed
+        // K = draft_count + 1 verify-graph width.
+        let mut haystack: Vec<u32> = vec![1, 2, 3, 4];
+        haystack.extend_from_slice(&(100..110).collect::<Vec<u32>>()); // only 10
+        haystack.extend_from_slice(&[1, 2, 3]); // live tail + last=4
+        assert!(retrieve_longest(&haystack, 4, &sam_cfg(20, 32, 2)).is_none());
     }
 }

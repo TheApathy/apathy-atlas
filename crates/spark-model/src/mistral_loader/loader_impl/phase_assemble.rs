@@ -121,7 +121,10 @@ pub(super) fn assemble_layer(
     // get(i) = Some(BF16) for all valid i. The unwrap_or(BF16) is a safety
     // fallback for the kv_dtype!=BF16 + high_precision_layers=0 case where
     // the vec is empty — ensures MLA layers never silently get FP8.
-    let kv_dtype = layer_kv_dtypes.get(i).copied().unwrap_or(KvCacheDtype::Bf16);
+    let kv_dtype = layer_kv_dtypes
+        .get(i)
+        .copied()
+        .unwrap_or(KvCacheDtype::Bf16);
 
     // ── MoE experts (w1=gate, w2=down, w3=up) ──
     let ffn = build_moe_ffn(ctx.store, i, gpu, config);

@@ -284,11 +284,9 @@ impl TransformerModel {
                     let h_inter =
                         self.ssm_pool
                             .h_intermediate(ssm_layer_idx, slot, last_inter_slot);
-                    let conv_inter = self.ssm_pool.conv_intermediate(
-                        ssm_layer_idx,
-                        slot,
-                        last_inter_slot,
-                    );
+                    let conv_inter =
+                        self.ssm_pool
+                            .conv_intermediate(ssm_layer_idx, slot, last_inter_slot);
                     // canonical → live (h_state read by next forward)
                     self.gpu
                         .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;

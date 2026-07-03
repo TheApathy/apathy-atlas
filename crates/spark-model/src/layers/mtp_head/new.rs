@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
-use super::{MtpHead, MtpQuantization, ProjectionWeight, mtp_fp8_calib_enabled, MTP_FP8_WARMUP_TOKENS};
+use super::{
+    MTP_FP8_WARMUP_TOKENS, MtpHead, MtpQuantization, ProjectionWeight, mtp_fp8_calib_enabled,
+};
 use crate::layers::MoeLayer;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::weight_map::{DenseWeight, MoeWeights, MtpWeights, QuantizedWeight, quantize_to_nvfp4};
@@ -334,9 +336,11 @@ impl MtpHead {
         let o_proj = q(&weights.o_proj, h, nq * hd)?;
 
         // Quantize dense MLP weights to NVFP4 so they share the w4a16_gemv path.
-        let mlp_gate = quantize_to_nvfp4(&weights.mlp_gate, inter, h, gpu, absmax_k, nvfp4_k, stream)?;
+        let mlp_gate =
+            quantize_to_nvfp4(&weights.mlp_gate, inter, h, gpu, absmax_k, nvfp4_k, stream)?;
         let mlp_up = quantize_to_nvfp4(&weights.mlp_up, inter, h, gpu, absmax_k, nvfp4_k, stream)?;
-        let mlp_down = quantize_to_nvfp4(&weights.mlp_down, h, inter, gpu, absmax_k, nvfp4_k, stream)?;
+        let mlp_down =
+            quantize_to_nvfp4(&weights.mlp_down, h, inter, gpu, absmax_k, nvfp4_k, stream)?;
 
         // KV cache for the single MTP attention layer (FP8, same as MoE path).
         let kv_config = spark_runtime::kv_cache::KvCacheConfig {

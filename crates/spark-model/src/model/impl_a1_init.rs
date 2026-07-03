@@ -68,7 +68,9 @@ pub(super) fn build_mtp_proposer(
             max_seq_len,
         ) {
             Ok(head) => {
-                tracing::info!("Dense MTP speculative decoding: ENABLED (single-module, dense MLP)");
+                tracing::info!(
+                    "Dense MTP speculative decoding: ENABLED (single-module, dense MLP)"
+                );
                 return Some(Arc::new(head) as Arc<dyn DraftProposer>);
             }
             Err(e) => {

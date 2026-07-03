@@ -168,14 +168,7 @@ impl Qwen3AttentionLayer {
 
         // absmax → scale2_a
         ctx.gpu.memset_async(a_max, 0, 4, stream)?;
-        ops::nvfp4_global_absmax(
-            ctx.gpu,
-            self.nvfp4_absmax_k,
-            normed,
-            a_max,
-            m * h,
-            stream,
-        )?;
+        ops::nvfp4_global_absmax(ctx.gpu, self.nvfp4_absmax_k, normed, a_max, m * h, stream)?;
         ctx.gpu.synchronize(stream)?;
         let mut bytes = [0u8; 4];
         ctx.gpu.copy_d2h(a_max, &mut bytes)?;

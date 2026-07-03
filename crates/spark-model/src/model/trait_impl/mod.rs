@@ -278,7 +278,12 @@ impl Model for TransformerModel {
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }
-    fn save_hidden_for_dflash(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<()> {
+    fn save_hidden_for_dflash(
+        &self,
+        token: u32,
+        seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<()> {
         self.save_hidden_for_dflash_dispatch(token, seq, _stream)
     }
     fn dflash_capture_thinking(&self, seq: &mut SequenceState, stream: u64) -> Result<()> {
@@ -338,12 +343,13 @@ impl Model for TransformerModel {
         // ATLAS_FORCE_TREEWY=1: stash even for flat chain payloads so the
         // M8A v2 kernel fires on them. Used for A/B precision diff vs wy17
         // (without the bypass, flat chains skip M8A and dispatch wy17).
-        let force_treewy =
-            std::env::var("ATLAS_FORCE_TREEWY").ok().as_deref() == Some("1");
+        let force_treewy = std::env::var("ATLAS_FORCE_TREEWY").ok().as_deref() == Some("1");
         if n < 3 {
             tracing::info!(
                 "M8A set_ddtree_parent_ids #{n}: payload.len={} needs_tree={} force_treewy={} parents={:?}",
-                payload.tree_token_ids.len(), needs_tree, force_treewy,
+                payload.tree_token_ids.len(),
+                needs_tree,
+                force_treewy,
                 payload.parent_indices.iter().take(8).collect::<Vec<_>>()
             );
         }
@@ -397,11 +403,8 @@ impl Model for TransformerModel {
             .collect();
         // Write into the persistent buffer (NOT a fresh alloc). The device
         // pointer never changes — CUDA graph replays see the new payload.
-        self.gpu.copy_h2d_async(
-            &bytes,
-            self.ddtree_parent_ids_persistent,
-            stream,
-        )?;
+        self.gpu
+            .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)?;
         *self.ddtree_parent_ids_dev.lock() = Some(self.ddtree_parent_ids_persistent);
         *self.ddtree_num_tree_tokens.lock() = kernel_parents.len();
         // Stash the host-side mirror so verify_d.rs can derive per-token
@@ -423,17 +426,14 @@ impl Model for TransformerModel {
             for i in 1..cap {
                 chain.push((i - 1) as i32);
             }
-            let bytes: Vec<u8> = chain
-                .iter()
-                .flat_map(|p| p.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = chain.iter().flat_map(|p| p.to_le_bytes()).collect();
             let stream = self.gpu.default_stream();
             // Best-effort restamp. A failed copy here is non-fatal: the next
             // set_ddtree_parent_ids call will overwrite, and the graph-safe
             // path always re-stamps before replay-only invocations.
-            if let Err(e) = self
-                .gpu
-                .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)
+            if let Err(e) =
+                self.gpu
+                    .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)
             {
                 tracing::warn!("clear_ddtree_parent_ids: failed to restamp linear chain: {e:#}");
             }
@@ -441,8 +441,18 @@ impl Model for TransformerModel {
         *self.ddtree_parent_ids_dev.lock() = None;
         *self.ddtree_num_tree_tokens.lock() = 0;
         self.ddtree_parent_ids_host.lock().clear();
-        // DFS reorder state lives only for the duration of one verify+commit.
-        self.ddtree_dfs_inv_perm.lock().clear();
+        // TASK #29: do NOT clear `ddtree_dfs_inv_perm` here. The scheduler
+        // calls `clear_ddtree_parent_ids` (verify_dflash_step.rs) BEFORE the
+        // KV gather (`compact_verify_kv`) and the ctx-hidden row stamp
+        // (`set_dflash_accepted_compact`), both of which must translate the
+        // committed COMPACT indices into the KERNEL (DFS-reordered) frame via
+        // this permutation. Clearing it here left those two consumers with an
+        // empty (identity) map on a genuine fork → they gathered the wrong KV
+        // bytes / wrong capture rows → counting md5 corruption. The permutation
+        // is authoritatively (re)set or cleared at the START of every
+        // `decode_verify_graphed_kgamma_dispatch` (verify_d.rs) based on that
+        // step's DFS-active state, so it never leaks stale across a verify —
+        // making the clear here both unnecessary and actively harmful.
     }
     fn trim_proposer_state(
         &self,

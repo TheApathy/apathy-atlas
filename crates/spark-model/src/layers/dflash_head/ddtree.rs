@@ -78,8 +78,7 @@ impl DDTree {
             path.push(node.token_id);
             cursor = node.parent_index;
         }
-        path.reverse()
-        ;
+        path.reverse();
         path
     }
 
@@ -190,7 +189,9 @@ impl std::fmt::Display for DDTreeBuildError {
             Self::InvalidTopK => write!(f, "top_k must be >= 1"),
             Self::InvalidBudget => write!(f, "budget must be >= 1"),
             Self::EmptyDepth(d) => write!(f, "depth {d} has no draft candidates"),
-            Self::EmptyCandidates => write!(f, "candidates_by_depth must contain at least one depth"),
+            Self::EmptyCandidates => {
+                write!(f, "candidates_by_depth must contain at least one depth")
+            }
         }
     }
 }
@@ -381,8 +382,7 @@ pub fn build_ddtree(
         if child_edges.contains(&edge) {
             continue;
         }
-        let Some(node) =
-            add_child(&mut nodes, &mut child_edges, entry.parent_index, candidate)
+        let Some(node) = add_child(&mut nodes, &mut child_edges, entry.parent_index, candidate)
         else {
             continue;
         };
@@ -561,8 +561,7 @@ impl TreeVerifierMetadata {
         }
         let tree_token_ids = tree.token_ids_for_verifier();
         let parent_indices = tree.parent_indices_for_verifier();
-        let node_depths: Vec<usize> =
-            tree.non_root_nodes().iter().map(|n| n.depth).collect();
+        let node_depths: Vec<usize> = tree.non_root_nodes().iter().map(|n| n.depth).collect();
         let tree_position_ids: Vec<u32> = node_depths
             .iter()
             .map(|d| (prompt_len + d - 1) as u32)
@@ -678,8 +677,9 @@ impl DDTreeRequestRuntime {
     /// For each compact node (0 = root, 1..N = tree nodes), a map of
     /// `token_id → child compact index`.
     pub fn child_maps(&self) -> Vec<std::collections::HashMap<u32, usize>> {
-        let mut children: Vec<std::collections::HashMap<u32, usize>> =
-            (0..=self.num_nodes()).map(|_| std::collections::HashMap::new()).collect();
+        let mut children: Vec<std::collections::HashMap<u32, usize>> = (0..=self.num_nodes())
+            .map(|_| std::collections::HashMap::new())
+            .collect();
         for (node_index, (&tok, &parent)) in self
             .tree_token_ids
             .iter()
@@ -707,7 +707,14 @@ fn walk_one_tree(
     loop {
         let next_token = target_argmax[cursor_compact];
         match children[cursor_compact].get(&next_token).copied() {
-            None => return (accepted_tokens, accepted_compact, next_token, cursor_compact),
+            None => {
+                return (
+                    accepted_tokens,
+                    accepted_compact,
+                    next_token,
+                    cursor_compact,
+                );
+            }
             Some(child_compact) => {
                 let node_index = child_compact - 1;
                 accepted_tokens.push(req.tree_token_ids[node_index]);
@@ -1037,6 +1044,96 @@ pub fn build_caterpillar_tail_payload(
     }
 }
 
+/// Build a 2-ROOT PORTFOLIO forest payload (`ATLAS_DFLASH_PORTFOLIO=1`).
+///
+/// Verifies TWO independent flat chains in ONE verify pass by laying them as
+/// two sibling branches under the shared root (compact slot 0 = the bonus /
+/// `last_token`):
+///
+/// ```text
+///                     root (slot 0 = last_token)
+///                    /                          \
+///          chain_a[0] (depth 1)          chain_b[0] (depth 1)
+///              |                              |
+///          chain_a[1]                     chain_b[1]
+///              |                              |
+///             ...                            ...
+/// ```
+///
+/// `chain_a` is the DFlash neural drafter's γ-token chain; `chain_b` is the
+/// SAM/retrieval chain. Both are internally FLAT (each node's parent is the
+/// previous node in its own chain), so within either branch the greedy walk
+/// commits a strictly-contiguous run — the ONLY non-flat structure is the
+/// single fork at the root.
+///
+/// ## Why this is lossless
+///
+/// The greedy DDTree walker ([`greedy_sample_ddtree`]) at the root commits the
+/// target's argmax `verified[0]` and descends into whichever branch's depth-1
+/// token equals it. It then follows that branch as a plain contiguous chain,
+/// accepting `chain[i]` only while `chain[i] == target_argmax` at each depth.
+/// The other branch is NEVER committed. So the committed token stream is
+/// exactly the target's greedy continuation regardless of which source fired —
+/// byte-identical to running the SELECTED chain alone. The win is that BOTH
+/// candidate continuations were verified in the same bandwidth-bound pass, so
+/// whichever the target picks at the fork is already verified to full depth.
+///
+/// ## Layout (compact indices are 1-based; slot 0 is the root/bonus)
+///
+/// Chain A occupies compact slots `1 ..= a` (contiguous, depth == slot).
+/// Chain B occupies compact slots `a+1 ..= a+b`; `chain_b[0]` attaches to the
+/// ROOT (parent = -1), and `chain_b[i>0]` attaches to the previous B node.
+/// So B's slots are NOT equal to its depths (B[0] is at slot a+1 but depth 1).
+///
+/// For attention/RoPE correctness on the B branch, the caller MUST enable a
+/// depth-aware verify path (`ATLAS_DDTREE_DFS_REORDER=1` — DFS pre-order lays
+/// each ancestor chain contiguously and is the validated-lossless mechanism —
+/// or `ATLAS_DDTREE_TREE_AWARE_VERIFY=1`) AND `ATLAS_DDTREE_TREE_TOKENS_VERIFY=1`
+/// so the verifier embeds the tree topology's tokens at each slot. Under pure
+/// flat metadata only chain A (slot == depth) is guaranteed lossless; chain B's
+/// deep tail would read sibling-A KV. The greedy oracle keeps output correct
+/// regardless (a contaminated B row simply fails to match target argmax and is
+/// rejected), so the flag combination trades acceptance depth, never
+/// correctness.
+///
+/// ## Node budget
+///
+/// Total nodes `a + b` must be `<= max_nodes` (the K-1 verify capacity, from
+/// `ATLAS_DDTREE_MAX_NODES`; tree-WY K_MAX is 32 so `max_nodes <= 31`). Chain A
+/// is never truncated (it is the trained-drafter baseline — the flat-safe
+/// fallback must stay byte-exact when B doesn't fire); chain B is truncated to
+/// the remaining budget. Returns a plain flat-A payload when B has no room.
+pub fn build_portfolio_payload(
+    chain_a: &[u32],
+    chain_b: &[u32],
+    max_nodes: usize,
+) -> TreePayload {
+    let a = chain_a.len().min(max_nodes);
+    // Chain A always laid first (contiguous, slot == depth).
+    let mut tree_token_ids: Vec<u32> = Vec::with_capacity(max_nodes);
+    let mut parent_indices: Vec<i32> = Vec::with_capacity(max_nodes);
+    for i in 0..a {
+        tree_token_ids.push(chain_a[i]);
+        parent_indices.push(i as i32 - 1); // A[0] → root (-1); A[i] → A[i-1]
+    }
+    // Chain B fills the remaining budget as a sibling branch off the root.
+    let b_budget = max_nodes.saturating_sub(a);
+    let b = chain_b.len().min(b_budget);
+    let a_end_payload_idx = tree_token_ids.len() as i32; // first B payload index
+    for j in 0..b {
+        tree_token_ids.push(chain_b[j]);
+        if j == 0 {
+            parent_indices.push(-1); // B[0] → root (sibling of A[0])
+        } else {
+            parent_indices.push(a_end_payload_idx + j as i32 - 1); // B[j] → B[j-1]
+        }
+    }
+    TreePayload {
+        tree_token_ids,
+        parent_indices,
+    }
+}
+
 /// Map a DDTree greedy walk's `accepted_compact_indices` to the kernel
 /// intermediate slot index of the **last accepted state**.
 ///
@@ -1057,6 +1154,188 @@ pub fn build_caterpillar_tail_payload(
 #[inline]
 pub fn last_accepted_inter_slot(accepted_compact_indices: &[usize]) -> usize {
     accepted_compact_indices.last().copied().unwrap_or(0)
+}
+
+/// Translate a compact-frame index into the KERNEL (DFS-reordered) frame.
+///
+/// ## Why this exists (root cause of the sparse fork-commit corruption)
+///
+/// `greedy_sample_ddtree{,_full}` returns `accepted_compact_indices` in the
+/// ORIGINAL COMPACT frame: compact index `c` is the payload node whose token
+/// is `tree_token_ids[c-1]` and whose verify argmax is row `c`. That is the
+/// frame the caller reasons about (emit tokens, bonus row, SSM slot lookup —
+/// all consume the UN-permuted `verified` vec, so compact indices are right
+/// for those).
+///
+/// But two pieces of GPU-resident state are laid out in the KERNEL frame, not
+/// the compact frame, when `ATLAS_DDTREE_DFS_REORDER=1` is active:
+///
+///   1. **Attention KV.** `verify_d.rs` writes KV for KERNEL slot `t` at KV
+///      position `pre_verify_len + t`, and kernel slot `t` embeds the token
+///      `tokens[dfs_perm[t]]` (compact index `dfs_perm[t]`). So compact index
+///      `c`'s KV lives at position `pre + dfs_inv_perm[c]`, NOT `pre + c`.
+///   2. **`dflash_hidden_save` capture rows.** `try_dflash_capture(layer, t)`
+///      saves the hidden for KERNEL slot `t` at row `t`. Compact index `c`'s
+///      captured hidden is therefore at row `dfs_inv_perm[c]`.
+///
+/// Before this helper, `compact_verify_kv_dispatch` and the ctx-hidden append
+/// in `propose.rs` used the compact indices DIRECTLY as kernel-frame
+/// positions/rows. On a genuine fork with DFS reorder on (the portfolio /
+/// deep-sibling DDTree commit path — `permutation != identity`), that gathered
+/// the WRONG KV bytes and appended the WRONG ctx hiddens → the committed KV /
+/// drafter conditioning diverged from the emitted tokens → counting md5
+/// corrupts and accept collapses. `commit_verify_state_async_with_slot`
+/// ALREADY applied `dfs_inv_perm` to its single `last_inter_slot`, so it was
+/// the odd one out that worked; these two paths were missing the same map.
+///
+/// `inv_perm[old_kernel_slot] = new_dfs_slot` is the SAME buffer stashed by
+/// `verify_d.rs` (`ddtree_dfs_inv_perm`) and consumed by
+/// `commit_verify_state_async_with_slot`. Empty `inv_perm` (chain mode, DFS
+/// disabled, or an identity permutation that `verify_d.rs` collapses to empty)
+/// ⇒ the map is the identity, so the flat/chain path is byte-for-byte
+/// unchanged. An out-of-range compact index (defensive) also passes through
+/// unmapped rather than panicking.
+#[inline]
+pub fn compact_to_kernel_slot(compact: usize, inv_perm: &[usize]) -> usize {
+    if !inv_perm.is_empty() && compact < inv_perm.len() {
+        inv_perm[compact]
+    } else {
+        compact
+    }
+}
+
+/// Map a whole compact-frame accepted path into the kernel (DFS) frame.
+///
+/// Applies [`compact_to_kernel_slot`] element-wise. Used by
+/// `compact_verify_kv` (to gather KV from the true kernel positions) and the
+/// ctx-hidden append (to read the true capture rows). Identity when
+/// `inv_perm` is empty (chain / DFS-off), preserving the flat path exactly.
+pub fn map_compact_path_to_kernel(compact_path: &[usize], inv_perm: &[usize]) -> Vec<usize> {
+    compact_path
+        .iter()
+        .map(|&c| compact_to_kernel_slot(c, inv_perm))
+        .collect()
+}
+
+/// One relocation for post-verify KV compaction, in ABSOLUTE KV positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvMove {
+    pub src_pos: usize,
+    pub dst_pos: usize,
+}
+
+/// Plan the overlap-safe sequence of KV relocations that gathers a sparse
+/// (fork) accepted path down to the contiguous run `pre+1 .. pre+N`.
+///
+/// ## Inputs
+///   - `accepted_compact`: the greedy walk's path in COMPACT frame (walk
+///     order, strictly increasing in compact index).
+///   - `inv_perm`: `ddtree_dfs_inv_perm` — maps compact index → kernel slot.
+///     Empty ⇒ kernel frame == compact frame (chain / DFS-off).
+///   - `pre_verify_len`: sequence length before this verify advanced it.
+///   - `k`: total verify width (= `tokens.len()`, the number of kernel slots).
+///     Positions `pre+N+1 .. pre+k-1` are the UNCOMMITTED tail verify slots;
+///     they are free scratch (the next verify overwrites them) and are used to
+///     break clobber cycles.
+///
+/// ## Why ordering matters (root cause of the DFS-on fork corruption)
+///
+/// Step `j` (0-based) commits compact index `accepted_compact[j]`, whose KV
+/// physically lives at KERNEL position `pre + inv_perm[compact]` (NOT
+/// `pre + compact` — the pre-fix bug), and whose contiguous home is
+/// `pre + j + 1`. On the flat/chain path `inv_perm` is empty and sources are
+/// already `>= ` destinations, so plain ascending-dst order is safe (and no
+/// move fires at all for a truly contiguous path). But once DFS reorder
+/// permutes kernel slots, a source may equal a not-yet-consumed destination
+/// (`dst_a == src_b`), so a naive in-place copy clobbers data a later move
+/// still needs. We resolve this generally by first evacuating any source that
+/// is also a destination into a free tail scratch position, then performing
+/// the placements. The result is a byte-lossless permutation of committed KV.
+///
+/// Returns moves already filtered to `src != dst` (identity moves dropped) and
+/// ordered so that executing them front-to-back never destroys unconsumed
+/// data. Empty when the path is already contiguous in the kernel frame.
+pub fn plan_kv_compaction_moves(
+    accepted_compact: &[usize],
+    inv_perm: &[usize],
+    pre_verify_len: usize,
+    k: usize,
+) -> Vec<KvMove> {
+    let n = accepted_compact.len();
+    // Desired (src_pos, dst_pos) in absolute KV positions.
+    let mut want: Vec<(usize, usize)> = Vec::with_capacity(n);
+    for (j, &compact) in accepted_compact.iter().enumerate() {
+        let kernel_slot = compact_to_kernel_slot(compact, inv_perm);
+        let src = pre_verify_len + kernel_slot;
+        let dst = pre_verify_len + j + 1;
+        if src != dst {
+            want.push((src, dst));
+        }
+    }
+    if want.is_empty() {
+        return Vec::new();
+    }
+
+    // Fast path: if no destination is also a source, ascending-dst is safe
+    // (every write lands on a position no remaining move reads from).
+    let dst_set: std::collections::HashSet<usize> = want.iter().map(|&(_, d)| d).collect();
+    let src_set: std::collections::HashSet<usize> = want.iter().map(|&(s, _)| s).collect();
+    let has_conflict = want.iter().any(|&(_, d)| src_set.contains(&d));
+    if !has_conflict {
+        let mut moves: Vec<KvMove> = want
+            .into_iter()
+            .map(|(src_pos, dst_pos)| KvMove { src_pos, dst_pos })
+            .collect();
+        moves.sort_by_key(|m| m.dst_pos);
+        return moves;
+    }
+
+    // General path: evacuate every conflicting source (a source that is also
+    // some move's destination) into a free tail scratch position first, then
+    // run all placements. Free scratch = uncommitted verify slots
+    // `pre + n + 1 .. pre + k - 1` (past the accepted run; overwritten next
+    // verify). We only need as many scratch slots as there are conflicts.
+    let mut moves: Vec<KvMove> = Vec::with_capacity(want.len() + n);
+    // Free scratch = tail verify slots that are NOT themselves a source or a
+    // destination of any wanted move (so evacuating into them can never
+    // clobber live data). Sources may be kernel slots > n under DFS reorder,
+    // so filter against both sets explicitly.
+    let mut scratch_slots: Vec<usize> = ((pre_verify_len + n + 1)..(pre_verify_len + k))
+        .filter(|p| !src_set.contains(p) && !dst_set.contains(p))
+        .collect();
+    let mut scratch_iter = scratch_slots.drain(..);
+    // Map: original src_pos -> the scratch pos we evacuated it to.
+    let mut relocated: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for &(src, _) in &want {
+        // Evacuate each conflicting source (a source that is also some move's
+        // destination) exactly once, into a free tail scratch slot. If scratch
+        // is exhausted (cannot happen when callers pass k = full verify width,
+        // since conflicts <= n-1 <= tail slots) the placement below still runs
+        // from the original source — bounded, but callers guarantee enough
+        // scratch so the relocation stays strictly lossless.
+        if dst_set.contains(&src)
+            && !relocated.contains_key(&src)
+            && let Some(scratch) = scratch_iter.next()
+        {
+            moves.push(KvMove {
+                src_pos: src,
+                dst_pos: scratch,
+            });
+            relocated.insert(src, scratch);
+        }
+    }
+    // Placements, ascending by destination. Read from the evacuated scratch
+    // when the source was relocated, else from the original source.
+    let mut placements: Vec<(usize, usize)> = want
+        .iter()
+        .map(|&(src, dst)| (*relocated.get(&src).unwrap_or(&src), dst))
+        .collect();
+    placements.sort_by_key(|&(_, dst)| dst);
+    for (src_pos, dst_pos) in placements {
+        moves.push(KvMove { src_pos, dst_pos });
+    }
+    moves
 }
 
 // ============================================================================
@@ -1228,7 +1507,11 @@ mod dfs_reorder_tests {
         assert_eq!(perm[1], 1);
         // The chain off slot 1 is visited next: kernel slots 6, 7, 8, ..., 15.
         for (i, expected) in (2..=11).zip(6..=15) {
-            assert_eq!(perm[i], expected, "DFS slot {} should be kernel slot {}", i, expected);
+            assert_eq!(
+                perm[i], expected,
+                "DFS slot {} should be kernel slot {}",
+                i, expected
+            );
         }
         // Then the remaining root children at slots 2, 3, 4, 5.
         assert_eq!(&perm[12..16], &[2, 3, 4, 5]);
@@ -1247,25 +1530,37 @@ mod dfs_reorder_tests {
         // Use the example above and verify the permuted parents form
         // valid "previous-only" references (each parent < self) AND that the
         // chain rooted at DFS slot 1 has consecutive parents.
-        let kp = vec![
-            -1i32, 0, 0, 0, 0, 0,
-            1, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-        ];
+        let kp = vec![-1i32, 0, 0, 0, 0, 0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14];
         let (perm, inv, _depths) = dfs_reorder(&kp);
         let np = permute_parent_ids(&kp, &perm, &inv);
         // All non-root parents must be < their index (causal).
         for i in 1..np.len() {
-            assert!(np[i] >= 0 && (np[i] as usize) < i, "parent {} at DFS slot {} must be < self", np[i], i);
+            assert!(
+                np[i] >= 0 && (np[i] as usize) < i,
+                "parent {} at DFS slot {} must be < self",
+                np[i],
+                i
+            );
         }
         // First chain off the chosen root: DFS slots 1..=11.
         // np[1] = 0 (parent is bonus), np[2] = 1, np[3] = 2, ..., np[11] = 10.
         assert_eq!(np[1], 0);
         for i in 2..=11 {
-            assert_eq!(np[i], (i - 1) as i32, "chain slot {} parent should be {}", i, i - 1);
+            assert_eq!(
+                np[i],
+                (i - 1) as i32,
+                "chain slot {} parent should be {}",
+                i,
+                i - 1
+            );
         }
         // Sibling root children at DFS slots 12, 13, 14, 15 all have parent 0.
         for i in 12..=15 {
-            assert_eq!(np[i], 0, "sibling root child at DFS slot {} parent should be 0 (bonus)", i);
+            assert_eq!(
+                np[i], 0,
+                "sibling root child at DFS slot {} parent should be 0 (bonus)",
+                i
+            );
         }
     }
 
@@ -1354,7 +1649,9 @@ mod tests {
         let tree = build_ddtree(&demo_candidates(), 8, 3, true, 0, u32::MAX).unwrap();
         let a = tree.ancestor_indices(4, true);
         // Chain 0->1->2->3->4.
-        assert!(a.contains(&0) && a.contains(&1) && a.contains(&2) && a.contains(&3) && a.contains(&4));
+        assert!(
+            a.contains(&0) && a.contains(&1) && a.contains(&2) && a.contains(&3) && a.contains(&4)
+        );
         assert_eq!(a.len(), 5);
         let b = tree.ancestor_indices(4, false);
         assert!(!b.contains(&4));
@@ -1513,7 +1810,10 @@ mod tests {
         // No prompt row attends to any tree column.
         for r in 0..prompt_len {
             for c in prompt_len..total {
-                assert!(!mask[r * total + c], "prompt row {r} should not see tree col {c}");
+                assert!(
+                    !mask[r * total + c],
+                    "prompt row {r} should not see tree col {c}"
+                );
             }
         }
         // Every tree row sees the full prompt.
@@ -1576,6 +1876,117 @@ mod tests {
         assert_eq!(s.output_token_ids, vec![99]); // just the bonus
         assert_eq!(s.accepted_compact_indices, Vec::<usize>::new());
         assert_eq!(s.bonus_parent_compact_index, 0);
+    }
+
+    // ── PORTFOLIO 2-root forest (ATLAS_DFLASH_PORTFOLIO) ──────────────────
+
+    #[test]
+    fn portfolio_layout_two_sibling_chains() {
+        // chain_a = [10,20,30], chain_b = [11,21]. max_nodes = 8.
+        // A → slots 1,2,3 (parents -1,0,1); B → slots 4,5 (parents -1,3).
+        let p = build_portfolio_payload(&[10, 20, 30], &[11, 21], 8);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 11, 21]);
+        // payload parent indices: A[0]→root(-1), A[1]→A[0](0), A[2]→A[1](1),
+        // B[0]→root(-1), B[1]→B[0](payload idx 3).
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, -1, 3]);
+    }
+
+    #[test]
+    fn portfolio_commits_chain_a_when_target_picks_a() {
+        // Root argmax selects chain_a's first token (10). The whole A chain
+        // then matches → commit A in full; chain B never touched. Lossless:
+        // identical to verifying chain A alone.
+        let p = build_portfolio_payload(&[10, 20, 30], &[11, 21], 8);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // rows: [root, A0, A1, A2, B0, B1]
+        // root→10, A0(10)→20, A1(20)→30, A2(30)→99(bonus), B rows irrelevant.
+        let argmax = vec![10u32, 20, 30, 99, 0, 0];
+        let s = greedy_sample_ddtree(&r, &argmax).unwrap();
+        assert_eq!(s.output_token_ids, vec![10, 20, 30, 99]);
+        assert_eq!(s.accepted_compact_indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn portfolio_commits_chain_b_when_target_picks_b() {
+        // Root argmax selects chain_b's first token (11) — the drafter chain A
+        // would have diverged at the root, but the retrieval chain B matches to
+        // full depth in the SAME verify pass. This is the portfolio WIN.
+        let p = build_portfolio_payload(&[10, 20, 30], &[11, 21], 8);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // B occupies compact slots 4 (tok 11) and 5 (tok 21).
+        // root→11 (picks B0), B0(11)→21 (picks B1), B1(21)→77 (bonus).
+        let argmax = vec![11u32, 0, 0, 0, 21, 77];
+        let s = greedy_sample_ddtree(&r, &argmax).unwrap();
+        // Flat-safe contract: the accepted compact path is [4, 5] which is
+        // NON-contiguous from position 1, so adapt_to_flat_safe truncates to
+        // the flat prefix (empty, since compact 4 != index 1) + the bonus =
+        // the first B token as a single free bonus. This is the LOSSLESS
+        // guarantee under flat metadata: output is still the target's greedy
+        // token (11). Deeper B commit requires the depth-aware verify path.
+        assert_eq!(s.output_token_ids, vec![11]);
+    }
+
+    #[test]
+    fn portfolio_full_b_commit_under_tree_commit_semantics() {
+        // greedy_sample_ddtree_full commits the WHOLE accepted path (the
+        // depth-aware / tree-commit path the portfolio uses in production),
+        // so when the target rides chain B the entire B run + bonus commits.
+        let p = build_portfolio_payload(&[10, 20, 30], &[11, 21], 8);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        let argmax = vec![11u32, 0, 0, 0, 21, 77];
+        let s = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        assert_eq!(s.output_token_ids, vec![11, 21, 77]);
+        assert_eq!(s.accepted_compact_indices, vec![4, 5]);
+        // last accepted inter slot = max compact index (kernel state slot).
+        assert_eq!(last_accepted_inter_slot(&s.accepted_compact_indices), 5);
+    }
+
+    #[test]
+    fn portfolio_a_never_truncated_b_gets_remaining_budget() {
+        // max_nodes = 4: chain A (3 nodes) laid in full; chain B (3 tokens)
+        // truncated to the remaining 1 slot.
+        let p = build_portfolio_payload(&[1, 2, 3], &[7, 8, 9], 4);
+        assert_eq!(p.tree_token_ids, vec![1, 2, 3, 7]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, -1]);
+    }
+
+    #[test]
+    fn portfolio_no_room_for_b_is_plain_flat_a() {
+        // A fills the entire budget → B gets zero slots → payload is a plain
+        // flat A chain, byte-identical to the non-portfolio drafter path.
+        let p = build_portfolio_payload(&[1, 2, 3, 4], &[7, 8], 4);
+        assert_eq!(p.tree_token_ids, vec![1, 2, 3, 4]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn portfolio_empty_b_is_flat_a() {
+        let p = build_portfolio_payload(&[5, 6], &[], 8);
+        assert_eq!(p.tree_token_ids, vec![5, 6]);
+        assert_eq!(p.parent_indices, vec![-1, 0]);
+    }
+
+    #[test]
+    fn portfolio_first_token_collision_stays_lossless() {
+        // chain_a and chain_b share the same first token (10). The root has two
+        // children carrying token 10 (compact 1 = A[0], compact 4 = B[0]);
+        // child_maps keys by token so the LATER insert (B[0], compact 4) wins
+        // the root's 10-entry. The greedy walk therefore descends B[0], then
+        // rides whichever branch the target continues. Correctness is
+        // unaffected — the committed tokens are still the target's argmax; the
+        // only cost is that A's chain isn't taken when the first tokens collide
+        // (no gain, no corruption).
+        let p = build_portfolio_payload(&[10, 20], &[10, 99], 8);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 10, 99]);
+        assert_eq!(p.parent_indices, vec![-1, 0, -1, 2]);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // 4 nodes → argmax length must be 1 + 4 = 5 (root row + one per node).
+        // root→10 (picks B0 at compact 3, the winning insert), B0(10)→77 bonus.
+        let argmax = vec![10u32, 0, 0, 77, 0];
+        let full = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        // Whichever child is followed, the committed token stream begins with
+        // the target's argmax 10 and the bonus — always lossless.
+        assert_eq!(full.output_token_ids.first().copied(), Some(10));
     }
 
     #[test]
@@ -1740,7 +2151,10 @@ mod tests {
             assert_eq!(p.tree_token_ids.len(), spine.len(), "cliff={cliff}");
             for i in 0..p.parent_indices.len() {
                 let par = p.parent_indices[i];
-                assert!(par >= -1 && par < i as i32, "cliff={cliff} idx={i} par={par}");
+                assert!(
+                    par >= -1 && par < i as i32,
+                    "cliff={cliff} idx={i} par={par}"
+                );
             }
         }
     }
@@ -1768,7 +2182,10 @@ mod tests {
             assert_eq!(p.parent_indices.len(), spine.len(), "cliff={cliff}");
             for i in 0..p.parent_indices.len() {
                 let par = p.parent_indices[i];
-                assert!(par >= -1 && par < i as i32, "cliff={cliff} idx={i} par={par}");
+                assert!(
+                    par >= -1 && par < i as i32,
+                    "cliff={cliff} idx={i} par={par}"
+                );
             }
         }
     }
@@ -1817,10 +2234,7 @@ mod tests {
         let flat = greedy_sample_ddtree(&r, &argmax).unwrap();
         let full = greedy_sample_ddtree_full(&r, &argmax).unwrap();
         assert_eq!(flat.output_token_ids, full.output_token_ids);
-        assert_eq!(
-            flat.accepted_compact_indices,
-            full.accepted_compact_indices
-        );
+        assert_eq!(flat.accepted_compact_indices, full.accepted_compact_indices);
     }
 
     #[test]
@@ -1852,10 +2266,7 @@ mod tests {
             .expect("metadata");
         assert_eq!(meta.stride, 7);
         // Row 0: [-1, -1, 0, 0, 0, 0, 0]
-        assert_eq!(
-            meta.row(0),
-            &[ROOT_PARENT, ROOT_PARENT, 0, 0, 0, 0, 0]
-        );
+        assert_eq!(meta.row(0), &[ROOT_PARENT, ROOT_PARENT, 0, 0, 0, 0, 0]);
     }
 
     // ── last_accepted_inter_slot: kernel slot mapping for commit ──
@@ -1945,5 +2356,185 @@ mod tests {
         let walk = greedy_tree_walk(&tree, oracle);
         assert_eq!(walk.accepted_token_ids, vec![101]);
         assert_eq!(walk.bonus_token_id, 999);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // TASK #29 — sparse (non-contiguous) fork-commit frame-mapping regression
+    //
+    // These tests exercise the compact→kernel(DFS) frame translation that the
+    // KV-compaction and ctx-hidden-append paths were MISSING, which caused the
+    // counting-md5 corruption with ATLAS_DFLASH_TREE_COMMIT=1 on a forked
+    // accept when ATLAS_DDTREE_DFS_REORDER=1 (the portfolio / deep-DDTree
+    // production config). Everything here is pure CPU (no GPU / no serve).
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Empty inv_perm (chain mode / DFS disabled) ⇒ the map is the identity so
+    /// the flat path is byte-for-byte unchanged.
+    #[test]
+    fn compact_to_kernel_identity_when_no_dfs() {
+        assert_eq!(compact_to_kernel_slot(0, &[]), 0);
+        assert_eq!(compact_to_kernel_slot(3, &[]), 3);
+        assert_eq!(map_compact_path_to_kernel(&[1, 2, 3, 4], &[]), vec![1, 2, 3, 4]);
+    }
+
+    /// Out-of-range compact index passes through unmapped (defensive; never
+    /// panics on a malformed payload).
+    #[test]
+    fn compact_to_kernel_out_of_range_passthrough() {
+        let inv = vec![0usize, 1, 2];
+        assert_eq!(compact_to_kernel_slot(9, &inv), 9);
+    }
+
+    /// DFS reorder for two root branches (from `dfs_reorder_handles_two_root_branches`):
+    /// kernel_parents = [-1,0,0,1,2] → perm=[0,1,3,2,4], inv=[0,1,3,2,4].
+    /// A compact index `c` (== old kernel slot) maps to DFS slot inv[c].
+    #[test]
+    fn compact_to_kernel_uses_dfs_inv_perm() {
+        let kp = vec![-1i32, 0, 0, 1, 2];
+        let (_perm, inv, _d) = dfs_reorder(&kp);
+        assert_eq!(inv, vec![0, 1, 3, 2, 4]);
+        // Portfolio-style B branch sits at compact slots {2,4}; under DFS
+        // reorder those live at kernel slots inv[2]=3, inv[4]=4.
+        assert_eq!(compact_to_kernel_slot(2, &inv), 3);
+        assert_eq!(compact_to_kernel_slot(4, &inv), 4);
+        assert_eq!(map_compact_path_to_kernel(&[2, 4], &inv), vec![3, 4]);
+    }
+
+    // ── KV compaction move planner ──
+
+    /// A truly contiguous accepted path in the kernel frame needs no moves.
+    #[test]
+    fn kv_plan_contiguous_is_noop() {
+        // chain accept [1,2,3,4], DFS off → sources == destinations.
+        let moves = plan_kv_compaction_moves(&[1, 2, 3, 4], &[], 100, 17);
+        assert!(moves.is_empty());
+    }
+
+    /// Fork-at-root, DFS OFF: accepted compact path [4,5] (portfolio B branch).
+    /// Kernel frame == compact frame here. KV lives at pre+4, pre+5; must be
+    /// gathered to the contiguous home pre+1, pre+2. No src is a dst here
+    /// (srcs {4,5}, dsts {1,2}) → simple ascending-dst order, lossless.
+    #[test]
+    fn kv_plan_fork_at_root_no_dfs() {
+        let moves = plan_kv_compaction_moves(&[4, 5], &[], 100, 17);
+        assert_eq!(
+            moves,
+            vec![
+                KvMove { src_pos: 104, dst_pos: 101 },
+                KvMove { src_pos: 105, dst_pos: 102 },
+            ]
+        );
+    }
+
+    /// The concrete corruption case: fork-at-root WITH DFS reorder on. The
+    /// portfolio B branch is at compact {4,5}, but under DFS reorder its KV is
+    /// physically at kernel slots inv[4], inv[5]. The planner MUST read from the
+    /// mapped kernel positions, not pre+4/pre+5 (the pre-fix bug read the wrong
+    /// bytes → md5 corruption).
+    #[test]
+    fn kv_plan_fork_with_dfs_maps_source() {
+        // Construct a payload where compact 4,5 permute to different kernel
+        // slots. kernel_parents for portfolio [A0,A1,A2,B0,B1] (3+2), bonus
+        // first: [-1, 0,1,2, 0,4]  (A chain off bonus; B0 off bonus; B1 off B0)
+        let kp = vec![-1i32, 0, 1, 2, 0, 4];
+        let (_perm, inv, _d) = dfs_reorder(&kp);
+        // DFS visits: 0 → 1 → 2 → 3 (A chain) → 4 → 5 (B chain).
+        // Here that is already identity-ish; force a non-identity by swapping
+        // the child visitation via a shape the reorder actually permutes.
+        // Use the two-root-branch shape instead for a genuine permutation:
+        let kp2 = vec![-1i32, 0, 0, 1, 2]; // inv = [0,1,3,2,4]
+        let (_p2, inv2, _d2) = dfs_reorder(&kp2);
+        assert_eq!(inv2, vec![0, 1, 3, 2, 4]);
+        let _ = inv; // (first shape kept for documentation)
+        // Accept the branch at compact {2,4}. Kernel positions: inv2[2]=3,
+        // inv2[4]=4 → sources pre+3, pre+4. Homes pre+1, pre+2.
+        let moves = plan_kv_compaction_moves(&[2, 4], &inv2, 100, 5);
+        // Sources {103,104}, dsts {101,102} — no overlap → ascending dst.
+        assert_eq!(
+            moves,
+            vec![
+                KvMove { src_pos: 103, dst_pos: 101 },
+                KvMove { src_pos: 104, dst_pos: 102 },
+            ]
+        );
+    }
+
+    /// Overlap hazard: a source position is ALSO a destination of another move.
+    /// The planner must evacuate the conflicting source to a free tail scratch
+    /// slot BEFORE placing, so nothing is clobbered. Verify (a) every wanted
+    /// destination ends up sourced from the correct original byte, and (b) no
+    /// placement reads a position an earlier placement already overwrote.
+    #[test]
+    fn kv_plan_overlap_is_evacuated_safely() {
+        // accepted compact [2, 1] (walk visited kernel slots that map so that
+        // src of move-0 == dst of move-1). Use inv_perm to force it: compact 2
+        // → kernel 1, compact 1 → kernel 2. pre=100, k=8.
+        //   step0: compact 2 → kernel 1 → src 101, dst 101+? (j=0 → dst 101)
+        // To actually create dst==src conflict, craft:
+        //   accepted [c0=3, c1=1], inv maps 3→1, 1→2.
+        //   step0 (j0): src=pre+1(=101), dst=pre+1(=101) → identity, dropped.
+        // Simplest deterministic conflict: identity inv, accepted [2,1]:
+        //   step0 j0: src pre+2 (102) dst pre+1 (101)
+        //   step1 j1: src pre+1 (101) dst pre+2 (102)
+        // 101 is both src(step1) and dst(step0) → conflict → must evacuate.
+        let moves = plan_kv_compaction_moves(&[2, 1], &[], 100, 8);
+        // Simulate the moves on a position→value map to prove losslessness.
+        // Initial: pos p holds the byte tagged p.
+        use std::collections::HashMap;
+        let mut mem: HashMap<usize, usize> = (100..108).map(|p| (p, p)).collect();
+        for m in &moves {
+            let val = *mem.get(&m.src_pos).expect("src populated");
+            mem.insert(m.dst_pos, val);
+        }
+        // Desired final: dst pre+1(101) holds compact-2's byte (originally at
+        // kernel pos pre+2=102), dst pre+2(102) holds compact-1's byte (pos 101).
+        assert_eq!(mem[&101], 102, "home[1] must carry the byte from pos 102");
+        assert_eq!(mem[&102], 101, "home[2] must carry the byte from pos 101");
+    }
+
+    /// Larger scramble: a 3-cycle of positions under an inv_perm permutation,
+    /// proven lossless by simulation.
+    #[test]
+    fn kv_plan_three_cycle_lossless() {
+        // accepted compact [1,2,3]; inv_perm maps 1→3, 2→1, 3→2 (a 3-cycle over
+        // kernel slots {1,2,3}). Homes are pre+1,pre+2,pre+3.
+        let inv = vec![0usize, 3, 1, 2]; // index by compact idx
+        let pre = 100;
+        let k = 8;
+        let moves = plan_kv_compaction_moves(&[1, 2, 3], &inv, pre, k);
+        use std::collections::HashMap;
+        let mut mem: HashMap<usize, usize> = (pre..pre + k).map(|p| (p, p)).collect();
+        for m in &moves {
+            let val = *mem.get(&m.src_pos).expect("src populated");
+            mem.insert(m.dst_pos, val);
+        }
+        // home[j+1] must hold the byte from kernel slot inv[accepted[j]].
+        assert_eq!(mem[&(pre + 1)], pre + 3, "home1 <- kernel3 (inv[1])");
+        assert_eq!(mem[&(pre + 2)], pre + 1, "home2 <- kernel1 (inv[2])");
+        assert_eq!(mem[&(pre + 3)], pre + 2, "home3 <- kernel2 (inv[3])");
+    }
+
+    /// End-to-end frame-consistency: given a portfolio payload where the target
+    /// rides chain B, the FULL sampler's accepted compact indices, when mapped
+    /// through inv_perm, address DISTINCT kernel positions (no aliasing) — the
+    /// invariant the KV gather and ctx-hidden append rely on.
+    #[test]
+    fn portfolio_b_commit_maps_to_distinct_kernel_slots() {
+        let p = build_portfolio_payload(&[10, 20, 30], &[11, 21], 8);
+        // kernel_parents = full_parent_ids_from_payload (bonus-prefixed).
+        let kernel_parents = full_parent_ids_from_payload(&p).unwrap();
+        let (_perm, inv, _d) = dfs_reorder(&kernel_parents);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        let argmax = vec![11u32, 0, 0, 0, 21, 77]; // target rides B
+        let s = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        assert_eq!(s.accepted_compact_indices, vec![4, 5]);
+        let kernel = map_compact_path_to_kernel(&s.accepted_compact_indices, &inv);
+        // Distinct kernel slots (no aliasing → a valid permutation to gather).
+        let uniq: std::collections::HashSet<_> = kernel.iter().copied().collect();
+        assert_eq!(uniq.len(), kernel.len(), "kernel slots must be distinct");
+        // And the SSM commit slot (max compact) maps through inv identically to
+        // commit_verify_state_async_with_slot's mapping.
+        let last = last_accepted_inter_slot(&s.accepted_compact_indices);
+        assert_eq!(compact_to_kernel_slot(last, &inv), *kernel.last().unwrap());
     }
 }

@@ -129,6 +129,14 @@ pub struct DenseFfnLayer {
     /// single B read (one 32-row M-tile) × 272 CTAs (N_TILE=64).
     /// Loaded via `try_kernel`; 0 falls back to m128/m16.
     w4a16_gemm_t_m32_n64: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64_gateup_silu` — FUSED gate_proj + up_proj +
+    /// SiLU·mul for the K=γ verify path. Loads the shared [M,K] input
+    /// tile once, streams BOTH transposed weights (gate + up), and writes
+    /// only the fused silu(gate)*up [M,N] activation in one launch (vs the
+    /// baseline's two m32_n64 GEMMs + standalone `moe_silu_mul`). Gated by
+    /// `ATLAS_FFN_FUSED_GATEUP`. Loaded via `try_kernel`; handle 0 keeps
+    /// the split gate/up path.
+    w4a16_gemm_t_m32_n64_gateup_silu: KernelHandle,
     /// `w4a16_gemm_t_m32_n64_splitk` — split-K variant of the above for
     /// the DFlash K=17 verify `down_proj` ([M=17,N=5120,K=16384]). The
     /// single-slice kernel fields only 80 CTAs (N=5120/64) and is
@@ -251,6 +259,13 @@ impl DenseFfnLayer {
             // `ATLAS_PREFILL_FFN_FAST` fast path silently.
             w4a16_gemm_t_m128: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128"),
             w4a16_gemm_t_m32_n64: super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
+            // Optional fused gate+up+silu kernel. Handle 0 keeps the split
+            // gate/up path (ATLAS_FFN_FUSED_GATEUP).
+            w4a16_gemm_t_m32_n64_gateup_silu: super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_gateup_silu",
+            ),
             // Optional split-K down_proj variant + reduce. Handle 0 keeps
             // the single-slice m32_n64 path (ATLAS_FFN_DOWN_SPLITK).
             w4a16_gemm_t_m32_n64_splitk: super::try_kernel(
@@ -288,9 +303,7 @@ impl DenseFfnLayer {
     /// choose between the W4A4 fast path and the existing fp8/v2/m128
     /// fallbacks.
     pub fn has_e2m1_ffn(&self) -> bool {
-        self.nvfp4_gemm_k.0 != 0
-            && self.nvfp4_absmax_k.0 != 0
-            && self.nvfp4_quantize_k.0 != 0
+        self.nvfp4_gemm_k.0 != 0 && self.nvfp4_absmax_k.0 != 0 && self.nvfp4_quantize_k.0 != 0
     }
 
     /// Ensure the W4A4 activation scratch arena has capacity for `m` rows
@@ -359,14 +372,7 @@ impl DenseFfnLayer {
         // Caller-side memset to zero matches `quantize_to_nvfp4` (see
         // weight_map/loaders_fp8.rs:87).
         ctx.gpu.memset_async(a_max, 0, 4, stream)?;
-        ops::nvfp4_global_absmax(
-            ctx.gpu,
-            self.nvfp4_absmax_k,
-            input,
-            a_max,
-            m * k,
-            stream,
-        )?;
+        ops::nvfp4_global_absmax(ctx.gpu, self.nvfp4_absmax_k, input, a_max, m * k, stream)?;
 
         // Phase 2: read absmax back, derive scale2.
         // We have to synchronize: scale2 is a kernel ARGUMENT (FP32 by-
@@ -764,28 +770,53 @@ impl DenseFfnLayer {
 
             crate::kprof!(ctx.gpu, stream, "ffn_gate_up_dual_batch3", {
                 ops::w4a16_gemm_n64_m16(
-                    ctx.gpu, self.w4a16_gemm_t_m16_n64,
-                    input, gt, gate_out_buf, 3, inter, h, stream,
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_n64,
+                    input,
+                    gt,
+                    gate_out_buf,
+                    3,
+                    inter,
+                    h,
+                    stream,
                 )?;
                 ops::w4a16_gemm_n64_m16(
-                    ctx.gpu, self.w4a16_gemm_t_m16_n64,
-                    input, ut, up_out_buf, 3, inter, h, stream,
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_n64,
+                    input,
+                    ut,
+                    up_out_buf,
+                    3,
+                    inter,
+                    h,
+                    stream,
                 )?;
                 anyhow::Result::<()>::Ok(())
             })?;
             crate::kprof!(ctx.gpu, stream, "ffn_silu_mul", {
                 ops::silu_mul(
-                    ctx.gpu, self.act_mul,
-                    gate_out_buf, up_out_buf, gate_out_buf,
-                    3 * inter, stream,
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out_buf,
+                    up_out_buf,
+                    gate_out_buf,
+                    3 * inter,
+                    stream,
                 )?;
                 anyhow::Result::<()>::Ok(())
             })?;
             let output = ctx.buffers.moe_output();
             crate::kprof!(ctx.gpu, stream, "ffn_down_batch3", {
                 ops::w4a16_gemm_n64_m16(
-                    ctx.gpu, self.w4a16_gemm_t_m16_n64,
-                    gate_out_buf, dt, output, 3, h, inter, stream,
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m16_n64,
+                    gate_out_buf,
+                    dt,
+                    output,
+                    3,
+                    h,
+                    inter,
+                    stream,
                 )?;
                 anyhow::Result::<()>::Ok(())
             })?;
@@ -803,8 +834,7 @@ impl DenseFfnLayer {
         // so the 3-token activation vector is loaded once per CTA instead of
         // twice. Falls back to the baseline kernel when the env var is unset
         // OR the tuned kernel symbol was not present in the loaded cache.
-        let use_tuned =
-            ffn_dual_tuned_enabled() && self.w4a16_gemv_dual_batch3_tuned.0 != 0;
+        let use_tuned = ffn_dual_tuned_enabled() && self.w4a16_gemv_dual_batch3_tuned.0 != 0;
         let dual_kernel = if use_tuned {
             self.w4a16_gemv_dual_batch3_tuned
         } else {
@@ -912,7 +942,10 @@ impl DenseFfnLayer {
         n: u32,
         stream: u64,
     ) -> Result<()> {
-        debug_assert!(n > 1, "forward_kgamma is for batched verify; use forward() at n=1");
+        debug_assert!(
+            n > 1,
+            "forward_kgamma is for batched verify; use forward() at n=1"
+        );
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.intermediate_size as u32;
 
@@ -932,9 +965,8 @@ impl DenseFfnLayer {
         // m128 upgrade of the m16 path: ONE M-tile at n ≤ 128 → single
         // weight read (m16 re-reads B per 16-row tile: 2× traffic at
         // n=17 on a memory-bound GEMM). See ffn_kgamma_m128_enabled.
-        let m128_path = m16_path
-            && crate::layers::ffn_kgamma_m128_enabled()
-            && self.w4a16_gemm_t_m128.0 != 0;
+        let m128_path =
+            m16_path && crate::layers::ffn_kgamma_m128_enabled() && self.w4a16_gemm_t_m128.0 != 0;
         // m32_n64: single B read AND full SM occupancy — strictly better
         // than m128 at n ≤ 32 when the kernel symbol is present.
         // ATLAS_FFN_KGAMMA_M32=0 opts out for bisection.
@@ -957,167 +989,199 @@ impl DenseFfnLayer {
             && self.w4a16_gemm_t_m32_n64_splitk.0 != 0
             && self.reduce_splitk_k.0 != 0
             && gateup_ws.is_some();
-        crate::kprof!(ctx.gpu, stream, "ffn_gate_kgamma", {
-            if gateup_splitk_ok {
-                let gt = self.gate_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n64_m32_splitk(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m32_n64_splitk,
-                    self.reduce_splitk_k,
-                    input,
-                    gt,
-                    gate_out,
-                    gateup_ws.unwrap(),
-                    n,
-                    inter,
-                    h,
-                    inter, // ldb == N for tightly-packed T-weight
-                    gateup_splitk,
-                    stream,
-                )?;
-            } else if m32_path {
-                let gt = self.gate_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n64_m32(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m32_n64,
-                    input,
-                    gt,
-                    gate_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            } else if m128_path {
-                let gt = self.gate_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n128_m128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m128,
-                    input,
-                    gt,
-                    gate_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            } else if m16_path {
-                let gt = self.gate_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n128_m16(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m16,
-                    input,
-                    gt,
-                    gate_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            } else {
-                ops::w4a16_gemm(
-                    ctx.gpu,
-                    self.w4a16_gemm,
-                    input,
-                    &self.weights.gate_proj,
-                    gate_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            }
-            anyhow::Result::<()>::Ok(())
-        })?;
 
-        // up_proj GEMM: [n, H] → [n, inter]. Same split-K treatment as gate;
-        // reuses the shared workspace (gate's reduce already consumed it).
-        crate::kprof!(ctx.gpu, stream, "ffn_up_kgamma", {
-            if gateup_splitk_ok {
-                let ut = self.up_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n64_m32_splitk(
+        // FUSED gate+up+silu (ATLAS_FFN_FUSED_GATEUP=1): one launch reads
+        // the shared [n,H] input once, streams both transposed weights, and
+        // writes silu(gate)*up into `gate_out` (the same buffer moe_silu_mul
+        // targets) — replacing the gate GEMM + up GEMM + silu_mul below.
+        // Supersedes gateup split-K. Requires the m32 transposed path + the
+        // fused kernel symbol; byte-exact (BF16 activation round-trip matched
+        // in-kernel). Falls through to the split path otherwise.
+        let fused_gateup = m32_path
+            && !gateup_splitk_ok
+            && crate::layers::ffn_fused_gateup_enabled()
+            && self.w4a16_gemm_t_m32_n64_gateup_silu.0 != 0;
+        if fused_gateup {
+            let gt = self.gate_proj_t.as_ref().unwrap();
+            let ut = self.up_proj_t.as_ref().unwrap();
+            crate::kprof!(ctx.gpu, stream, "ffn_gateup_fused_kgamma", {
+                ops::w4a16_gemm_n64_m32_gateup_silu(
                     ctx.gpu,
-                    self.w4a16_gemm_t_m32_n64_splitk,
-                    self.reduce_splitk_k,
+                    self.w4a16_gemm_t_m32_n64_gateup_silu,
                     input,
+                    gt,
                     ut,
-                    up_out,
-                    gateup_ws.unwrap(),
-                    n,
-                    inter,
-                    h,
-                    inter, // ldb == N for tightly-packed T-weight
-                    gateup_splitk,
-                    stream,
-                )?;
-            } else if m32_path {
-                let ut = self.up_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n64_m32(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m32_n64,
-                    input,
-                    ut,
-                    up_out,
+                    gate_out,
                     n,
                     inter,
                     h,
                     stream,
                 )?;
-            } else if m128_path {
-                let ut = self.up_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n128_m128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m128,
-                    input,
-                    ut,
-                    up_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            } else if m16_path {
-                let ut = self.up_proj_t.as_ref().unwrap();
-                ops::w4a16_gemm_n128_m16(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m16,
-                    input,
-                    ut,
-                    up_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            } else {
-                ops::w4a16_gemm(
-                    ctx.gpu,
-                    self.w4a16_gemm,
-                    input,
-                    &self.weights.up_proj,
-                    up_out,
-                    n,
-                    inter,
-                    h,
-                    stream,
-                )?;
-            }
-            anyhow::Result::<()>::Ok(())
-        })?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+        } else {
+            crate::kprof!(ctx.gpu, stream, "ffn_gate_kgamma", {
+                if gateup_splitk_ok {
+                    let gt = self.gate_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n64_m32_splitk(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m32_n64_splitk,
+                        self.reduce_splitk_k,
+                        input,
+                        gt,
+                        gate_out,
+                        gateup_ws.unwrap(),
+                        n,
+                        inter,
+                        h,
+                        inter, // ldb == N for tightly-packed T-weight
+                        gateup_splitk,
+                        stream,
+                    )?;
+                } else if m32_path {
+                    let gt = self.gate_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n64_m32(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m32_n64,
+                        input,
+                        gt,
+                        gate_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else if m128_path {
+                    let gt = self.gate_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n128_m128(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m128,
+                        input,
+                        gt,
+                        gate_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else if m16_path {
+                    let gt = self.gate_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n128_m16(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m16,
+                        input,
+                        gt,
+                        gate_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemm(
+                        ctx.gpu,
+                        self.w4a16_gemm,
+                        input,
+                        &self.weights.gate_proj,
+                        gate_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                }
+                anyhow::Result::<()>::Ok(())
+            })?;
 
-        // activation(gate) * up for n tokens
-        crate::kprof!(ctx.gpu, stream, "ffn_silu_mul_kgamma", {
-            ops::silu_mul(
-                ctx.gpu,
-                self.act_mul,
-                gate_out,
-                up_out,
-                gate_out,
-                n * inter,
-                stream,
-            )?;
-            anyhow::Result::<()>::Ok(())
-        })?;
+            // up_proj GEMM: [n, H] → [n, inter]. Same split-K treatment as gate;
+            // reuses the shared workspace (gate's reduce already consumed it).
+            crate::kprof!(ctx.gpu, stream, "ffn_up_kgamma", {
+                if gateup_splitk_ok {
+                    let ut = self.up_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n64_m32_splitk(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m32_n64_splitk,
+                        self.reduce_splitk_k,
+                        input,
+                        ut,
+                        up_out,
+                        gateup_ws.unwrap(),
+                        n,
+                        inter,
+                        h,
+                        inter, // ldb == N for tightly-packed T-weight
+                        gateup_splitk,
+                        stream,
+                    )?;
+                } else if m32_path {
+                    let ut = self.up_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n64_m32(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m32_n64,
+                        input,
+                        ut,
+                        up_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else if m128_path {
+                    let ut = self.up_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n128_m128(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m128,
+                        input,
+                        ut,
+                        up_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else if m16_path {
+                    let ut = self.up_proj_t.as_ref().unwrap();
+                    ops::w4a16_gemm_n128_m16(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m16,
+                        input,
+                        ut,
+                        up_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemm(
+                        ctx.gpu,
+                        self.w4a16_gemm,
+                        input,
+                        &self.weights.up_proj,
+                        up_out,
+                        n,
+                        inter,
+                        h,
+                        stream,
+                    )?;
+                }
+                anyhow::Result::<()>::Ok(())
+            })?;
+
+            // activation(gate) * up for n tokens
+            crate::kprof!(ctx.gpu, stream, "ffn_silu_mul_kgamma", {
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    n * inter,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+        } // end !fused_gateup
 
         // down_proj GEMM: [n, inter] → [n, H]
         let output = ctx.buffers.moe_output();
@@ -1134,10 +1198,13 @@ impl DenseFfnLayer {
             } else {
                 None
             };
-            if let (true, Some(ws)) = (m32_path && splitk > 0
-                && self.w4a16_gemm_t_m32_n64_splitk.0 != 0
-                && self.reduce_splitk_k.0 != 0, ws)
-            {
+            if let (true, Some(ws)) = (
+                m32_path
+                    && splitk > 0
+                    && self.w4a16_gemm_t_m32_n64_splitk.0 != 0
+                    && self.reduce_splitk_k.0 != 0,
+                ws,
+            ) {
                 let dt = self.down_proj_t.as_ref().unwrap();
                 ops::w4a16_gemm_n64_m32_splitk(
                     ctx.gpu,
@@ -1292,9 +1359,8 @@ impl DenseFfnLayer {
         // DRAM traffic (0.5 B/elt vs 2 B/elt BF16). Takes precedence
         // over the fp8/v2/m128 paths when active. Falls back silently
         // when the gate is off or kernels are missing.
-        let e2m1_fast_path = m >= 128
-            && crate::layers::prefill_ffn_e2m1_enabled()
-            && self.has_e2m1_ffn();
+        let e2m1_fast_path =
+            m >= 128 && crate::layers::prefill_ffn_e2m1_enabled() && self.has_e2m1_ffn();
 
         // Per-shape E2M1 dispatch: gate/up stay on `w4a16_gemm_t_m128`,
         // down_proj routes through native E2M1 hardware MMA. Per the
@@ -1382,8 +1448,7 @@ impl DenseFfnLayer {
         // server is launched under `nohup ... > file 2>&1` (stderr is
         // line-buffered to a regular file, so a single `\n`-terminated
         // write hits disk immediately, even before process teardown).
-        static LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             let has_t = self.has_transposed_ffn();
             let has_fp8 = self.has_fp8_ffn();
@@ -1392,14 +1457,11 @@ impl DenseFfnLayer {
             let m128_v2_ok = self.w4a16_gemm_t_m128_v2.0 != 0;
             let fp8_m128_ok = self.fp8_gemm_t_m128_k.0 != 0;
             let e2m1_ok = self.nvfp4_gemm_k.0 != 0;
-            let gate_on =
-                std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() == Some("1");
+            let gate_on = std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() == Some("1");
             let fp8_gate_on =
                 std::env::var("ATLAS_FFN_PREDEQUANT_FP8").ok().as_deref() == Some("1");
-            let v2_gate_on =
-                std::env::var("ATLAS_FFN_M128_V2").ok().as_deref() == Some("1");
-            let e2m1_gate_on =
-                std::env::var("ATLAS_E2M1_GEMM").ok().as_deref() == Some("1");
+            let v2_gate_on = std::env::var("ATLAS_FFN_M128_V2").ok().as_deref() == Some("1");
+            let e2m1_gate_on = std::env::var("ATLAS_E2M1_GEMM").ok().as_deref() == Some("1");
             let e2m1_down_only_gate_on =
                 std::env::var("ATLAS_E2M1_GEMM_DOWN_ONLY").ok().as_deref() == Some("1");
             tracing::info!(

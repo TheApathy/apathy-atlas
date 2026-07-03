@@ -13,6 +13,7 @@
 //! When busy: drains pending queue (mutex lock) after each decode step.
 
 // ── Submodules (split for ≤500 LoC files) ──────────────────────────────────
+mod cfg_jump_forward;
 mod confidence;
 mod decode_logits_content;
 mod decode_logits_seq;
@@ -42,6 +43,9 @@ mod verify_k2_step;
 mod verify_k3_step;
 mod verify_k4_step;
 
+pub use cfg_jump_forward::{
+    build_delim_table, build_forced_ids, cfg_jf_enabled, set_delim_table, set_forced_ids,
+};
 use confidence::*;
 use decode_logits_content::*;
 use decode_logits_seq::*;

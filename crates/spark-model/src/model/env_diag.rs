@@ -32,6 +32,23 @@ pub fn dump_hidden_enabled() -> bool {
     dump_hidden_path().is_some()
 }
 
+/// `ATLAS_DUMP_CTX_HIDDEN` env var, cached. Returns the append-file path when
+/// set (non-empty), `None` otherwise. This is the DFlash drafter-retrain
+/// teacher-forced capture: after a prefill completes, the per-sequence
+/// `ctx_hidden_acc` (all-position × 5-capture-layer hidden states, computed
+/// on the NVFP4 serving path) is dumped to this file, one record per request.
+/// Distinct from `ATLAS_DUMP_HIDDEN` (verify-path, generation-time).
+#[inline]
+pub fn dump_ctx_hidden_path() -> Option<&'static str> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var("ATLAS_DUMP_CTX_HIDDEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+
 /// `ATLAS_DIAG_GEMMA4=1` or `=true`, cached. Per-decode-step Gemma-4
 /// degeneration diagnostic — off by default in production.
 #[inline]

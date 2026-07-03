@@ -129,10 +129,7 @@ impl TransformerModel {
         // Capture isn't a useful win for HSS anyway: per-layer launch overhead
         // is small relative to the per-step disk I/O on the critical path.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        let use_graphs = self.comm.is_none()
-            && !self.profile
-            && !suppress_graphs
-            && !hss_engaged;
+        let use_graphs = self.comm.is_none() && !self.profile && !suppress_graphs && !hss_engaged;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,

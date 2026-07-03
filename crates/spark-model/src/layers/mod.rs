@@ -120,6 +120,74 @@ pub fn ssm_ba_batched_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_BA_BATCHED").ok().as_deref() == Some("1"))
 }
 
+/// Split-K factor for the K/V projections on the DFlash K=γ verify
+/// attention QKV path ([M=n, N=nkv*hd, K=hidden]).
+///
+/// On AEON-27B the K/V projections are N=nkv*hd=4*256=1024 → the
+/// single-slice `w4a16_gemm_t_m32_n64` fields only ceil(1024/64)=16 CTAs on
+/// GB10's 48 SMs (severely occupancy-starved), while the Q projection at
+/// N=q_proj_dim=12288 already fields 192 CTAs (well-provisioned; split-K is
+/// a no-op there, like FFN gate/up). This factor slices the K axis of the
+/// K and V GEMMs across gridDim.z into an FP32 workspace, then
+/// `reduce_splitk_f32_to_bf16` sums+downcasts — lossless (FP32 partials),
+/// token-exact, mirroring the proven `ffn_down` split-K path. Q stays on
+/// the single-slice kernel. Returns 0 (disabled) when unset/0/1; else the
+/// parsed factor clamped to [2, 8]. A/B against the single-slice baseline —
+/// the win is only real if the extra CTAs raise effective bandwidth on the
+/// tiny K/V weights.
+pub fn attn_qkv_splitk() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_ATTN_QKV_SPLITK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 0 } else { v.min(8) })
+            .unwrap_or(0)
+    })
+}
+
+/// V-dim split factor for the DFlash K=17 `gated_delta_rule_wy17` GDN verify.
+///
+/// The single-slice wy17 launches grid=(num_v_heads=48, batch=1) = 48 CTAs
+/// on the 48-SM GB10 — 1 CTA/SM, 4 warps, no second resident block to hide
+/// the two k_dim=128 H-state streaming passes. This factor fans each head's
+/// v_dim=128 columns across `ATLAS_WY17_SPLIT` CTAs (gridDim.z), so an SM
+/// hosts that many blocks and can overlap memory stalls. Each split
+/// recomputes the shared kd_flat k-dots (136 block-reductions) — the
+/// occupancy/recompute trade. Bit-identical to the single-slice kernel
+/// (per-column FP32 math + reduction order unchanged). Returns 0 (disabled)
+/// when unset/0/1; else the parsed factor clamped to [2, 4] (v_dim=128 → 64
+/// or 32 columns/CTA; beyond 4 the kd_flat recompute dominates).
+pub fn wy17_split() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_WY17_SPLIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 0 } else { v.min(4) })
+            .unwrap_or(0)
+    })
+}
+
+/// Returns true when `ATLAS_SSM_BA_BATCH=1` is set in the process env.
+///
+/// Gates the GENERAL (any num_tokens) batched BA projection for the SSM
+/// in_proj_ba. The baseline runs `dense_gemv` once per token — at DFlash
+/// γ=16 that is 17 launches/layer × 48 SSM layers = 816 tiny GEMV launches
+/// per K=γ verify, each computing only N=64 outputs × K=5120 reductions.
+/// The weight (`in_proj_ba`) is IDENTICAL across tokens, so the 17 GEMVs
+/// collapse into ONE `dense_gemm` at M=num_tokens (weight read once, all
+/// tokens' rows computed together). This cuts BOTH launch overhead AND the
+/// 17× redundant weight streaming — reducing graph *execution* time, not
+/// just launch count. Distinct from `ATLAS_SSM_BA_BATCHED` which only
+/// covers the K=3 MTP path via `dense_gemv_batch3`. Bit-exact: `dense_gemm`
+/// and `dense_gemv` share the same BF16 accumulation math. md5-gated.
+/// Default OFF for A/B safety. Cached via `OnceLock`.
+pub fn ssm_ba_batch_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_BA_BATCH").ok().as_deref() == Some("1"))
+}
+
 /// Returns true when `ATLAS_FFN_DUAL_TUNED=1` is set in the process env.
 ///
 /// Gates the tuned `w4a16_gemv_dual_batch3_tuned` kernel that fuses the
@@ -185,6 +253,26 @@ pub fn ffn_down_splitk() -> u32 {
     })
 }
 
+/// Returns true when `ATLAS_FFN_FUSED_GATEUP=1` is set in the process env.
+///
+/// Routes the K=γ verify FFN gate_proj + up_proj + SiLU·mul through the
+/// single fused kernel `w4a16_gemm_t_m32_n64_gateup_silu` instead of two
+/// separate m32_n64 GEMMs + a standalone `moe_silu_mul`. Loads the shared
+/// [M,K] input tile once and writes only the fused silu(gate)*up [M,N]
+/// activation (eliminates the two [M,N] activation writes + reads of the
+/// standalone silu_mul and one kernel launch). Requires transposed FFN
+/// weights + the fused kernel symbol; falls back to the m32/m16 path
+/// otherwise. Mutually exclusive with ATLAS_FFN_GATEUP_SPLITK (the
+/// fused path supersedes gate/up split-K). Byte-exact vs the unfused
+/// path: the fused kernel rounds each gate/up accumulator to BF16 and
+/// back to FP32 before the silu·mul, exactly reproducing the baseline's
+/// BF16 activation round-trip (m32_n64 writes gate_out/up_out as BF16 →
+/// moe_silu_mul reloads FP32). md5-gated. Default OFF for A/B safety.
+pub fn ffn_fused_gateup_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_FUSED_GATEUP").ok().as_deref() == Some("1"))
+}
+
 /// Split-K factor for the FFN **gate/up** projections ([M=17, N=inter=16384,
 /// K=hidden=5120]) on the K=γ verify path. Default OFF (0).
 ///
@@ -228,9 +316,7 @@ pub fn ffn_gateup_splitk() -> u32 {
 /// `OnceLock`.
 pub fn ssm_multi_seq_batched_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_SSM_MULTI_SEQ_BATCHED").ok().as_deref() == Some("1")
-    })
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_MULTI_SEQ_BATCHED").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_SSM_MULTI_SEQ_KERNEL=1` is set in the process env.
@@ -245,9 +331,7 @@ pub fn ssm_multi_seq_batched_enabled() -> bool {
 /// run when this gate is off. Cached via `OnceLock`.
 pub fn ssm_multi_seq_kernel_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_SSM_MULTI_SEQ_KERNEL").ok().as_deref() == Some("1")
-    })
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_MULTI_SEQ_KERNEL").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_SSM_MULTI_SEQ_GRAPH=1` is set in the process env.
@@ -271,9 +355,7 @@ pub fn ssm_multi_seq_kernel_enabled() -> bool {
 /// NCCL all-reduce). Cached via `OnceLock`.
 pub fn ssm_multi_seq_graph_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_SSM_MULTI_SEQ_GRAPH").ok().as_deref() == Some("1")
-    })
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_MULTI_SEQ_GRAPH").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_MTP_K3_BATCH_CSEQ=1` is set in the process env.
@@ -340,9 +422,7 @@ pub fn ssm_multi_seq_graph_enabled() -> bool {
 /// `OnceLock`.
 pub fn mtp_k3_batch_cseq_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_MTP_K3_BATCH_CSEQ").ok().as_deref() == Some("1")
-    })
+    *GATE.get_or_init(|| std::env::var("ATLAS_MTP_K3_BATCH_CSEQ").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_MTP_K2_BATCH_CSEQ=1` is set in the process env.
@@ -373,9 +453,7 @@ pub fn mtp_k3_batch_cseq_enabled() -> bool {
 /// kernel path. Cached via `OnceLock`.
 pub fn mtp_k2_batch_cseq_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_MTP_K2_BATCH_CSEQ").ok().as_deref() == Some("1")
-    })
+    *GATE.get_or_init(|| std::env::var("ATLAS_MTP_K2_BATCH_CSEQ").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_PREFILL_FFN_FAST=1` is set in the process env.
@@ -425,8 +503,7 @@ pub fn prefill_ffn_fast_enabled() -> bool {
 /// `OnceLock`.
 pub fn prefill_ffn_fp8_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE
-        .get_or_init(|| std::env::var("ATLAS_FFN_PREDEQUANT_FP8").ok().as_deref() == Some("1"))
+    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_PREDEQUANT_FP8").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_E2M1_GEMM=1` is set in the process env.
@@ -617,8 +694,12 @@ pub fn flash_attn_kgamma_vecdequant_enabled() -> bool {
 /// is also true; default off until proven. Cached via `OnceLock`.
 pub fn flash_attn_kgamma_splitk_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE
-        .get_or_init(|| std::env::var("ATLAS_FLASH_ATTN_KGAMMA_SPLITK").ok().as_deref() == Some("1"))
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_FLASH_ATTN_KGAMMA_SPLITK")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// Returns true when `ATLAS_FA2_KGAMMA=1` is set in the process env.

@@ -260,7 +260,33 @@ impl Qwen3SsmLayer {
             // buffer; `ssm_ba()` is already a contiguous [K, ba_size] BF16
             // buffer — both layouts match the kernel's [3, K]→[3, N]
             // contract exactly.
-            if num_tokens == 3
+            if num_tokens >= 2
+                && super::super::ssm_ba_batch_enabled()
+                && self.dense_gemv_batchn_k.0 != 0
+            {
+                // General batched BA projection: ONE dense_gemv_bf16_batchn
+                // launch (grid.y = token) replaces the per-token dense_gemv
+                // loop. Each y-block runs the exact dense_gemv_bf16 body on
+                // its token's row, so output is BIT-IDENTICAL to the loop
+                // (md5-gated; a dense_gemm variant was NOT bit-exact — its
+                // 16×16-tile accumulation order differs → counting md5
+                // mismatch, measured 2026-07-02). `normed` is contiguous
+                // [num_tokens, h] BF16; `ssm_ba()` is contiguous
+                // [num_tokens, ba_size] BF16 — matching the kernel's A/C
+                // layout. Cuts 17 launches → 1 per SSM layer on the DFlash
+                // γ=16 verify. Covers K=17 which the batch3 path can't.
+                ops::dense_gemv_batchn(
+                    ctx.gpu,
+                    self.dense_gemv_batchn_k,
+                    normed,
+                    &self.ssm.in_proj_ba,
+                    ctx.buffers.ssm_ba(),
+                    num_tokens as u32,
+                    ba_size as u32,
+                    h as u32,
+                    stream,
+                )?;
+            } else if num_tokens == 3
                 && super::super::ssm_ba_batched_enabled()
                 && self.dense_gemv_batch3_k.0 != 0
             {
@@ -320,11 +346,9 @@ impl Qwen3SsmLayer {
                 )?;
             } else {
                 for t in 0..(num_tokens as u32) {
-                    let ba_out =
-                        ctx.buffers.ssm_ba().offset(t as usize * ba_size * bf16);
+                    let ba_out = ctx.buffers.ssm_ba().offset(t as usize * ba_size * bf16);
                     let gate_t = gates_buf.offset(t as usize * gate_beta_stride);
-                    let beta_t =
-                        gates_buf.offset(t as usize * gate_beta_stride + nv * fp32);
+                    let beta_t = gates_buf.offset(t as usize * gate_beta_stride + nv * fp32);
                     ops::compute_gdn_gates(
                         ctx.gpu,
                         self.compute_gdn_gates_k,
@@ -436,67 +460,132 @@ impl Qwen3SsmLayer {
         // ── 9. Output projection → [K, H] ──
         let out_proj_buf = ctx.buffers.moe_output(); // [K, H] BF16
         crate::kprof!(ctx.gpu, stream, "ssm_out_proj", {
-        if let Some(ref dense_out) = self.out_proj_dense {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
-                normed_out_buf,
-                dense_out,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
-        } else if num_tokens == 3
-            && super::super::ssm_out_batch3_enabled()
-            && !self.ssm.out_proj.is_null()
-        {
-            // ATLAS_SSM_OUT_BATCH3=1 fast path: triple-GEMV at M=3 avoids the
-            // ~96% wasted MMA work of `w4a16_gemm` M_TILE=64. Requires a valid
-            // NVFP4 non-transposed `ssm.out_proj` (Qwen3.5 NVFP4 + AEON-27B
-            // path). Falls through to FP8 / NVFP4_T below when off or when the
-            // model variant has `ssm.out_proj == null` (FP8-only loaders).
-            ops::w4a16_gemv_batch3(
-                ctx.gpu,
-                self.w4a16_gemv_batch3_k,
-                normed_out_buf,
-                &self.ssm.out_proj,
-                out_proj_buf,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
-        } else if num_tokens == 2 {
-            ops::w4a16_gemv_batch2(
-                ctx.gpu,
-                self.w4a16_gemv_batch2_k,
-                normed_out_buf,
-                &self.ssm.out_proj,
-                out_proj_buf,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
-        } else if let Some(fp8) = self.out_proj_fp8 {
-            if k > 128 {
-                ops::fp8_gemm_n128_m128(
+            if let Some(ref dense_out) = self.out_proj_dense {
+                ops::dense_gemm(
                     ctx.gpu,
-                    self.fp8_gemm_t_m128_k,
+                    self.dense_gemm_k,
                     normed_out_buf,
-                    fp8,
+                    dense_out,
                     out_proj_buf,
                     k,
                     h as u32,
                     value_dim as u32,
                     stream,
                 )?;
-            } else {
-                ops::fp8_gemm_n128(
+            } else if num_tokens == 3
+                && super::super::ssm_out_batch3_enabled()
+                && !self.ssm.out_proj.is_null()
+            {
+                // ATLAS_SSM_OUT_BATCH3=1 fast path: triple-GEMV at M=3 avoids the
+                // ~96% wasted MMA work of `w4a16_gemm` M_TILE=64. Requires a valid
+                // NVFP4 non-transposed `ssm.out_proj` (Qwen3.5 NVFP4 + AEON-27B
+                // path). Falls through to FP8 / NVFP4_T below when off or when the
+                // model variant has `ssm.out_proj == null` (FP8-only loaders).
+                ops::w4a16_gemv_batch3(
                     ctx.gpu,
-                    self.fp8_gemm_k,
+                    self.w4a16_gemv_batch3_k,
                     normed_out_buf,
-                    fp8,
+                    &self.ssm.out_proj,
+                    out_proj_buf,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else if num_tokens == 2 {
+                ops::w4a16_gemv_batch2(
+                    ctx.gpu,
+                    self.w4a16_gemv_batch2_k,
+                    normed_out_buf,
+                    &self.ssm.out_proj,
+                    out_proj_buf,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?;
+            } else if let Some(fp8) = self.out_proj_fp8 {
+                if k > 128 {
+                    ops::fp8_gemm_n128_m128(
+                        ctx.gpu,
+                        self.fp8_gemm_t_m128_k,
+                        normed_out_buf,
+                        fp8,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                } else {
+                    ops::fp8_gemm_n128(
+                        ctx.gpu,
+                        self.fp8_gemm_k,
+                        normed_out_buf,
+                        fp8,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                }
+            } else if let Some(ref nvfp4_t) = self.out_proj_nvfp4_t {
+                if k <= 32 && self.w4a16_gemm_t_m16_k.0 != 0 && super::super::tc_nvfp4_m16_enabled()
+                {
+                    ops::w4a16_gemm_n128_m16(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m16_k,
+                        normed_out_buf,
+                        nvfp4_t,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                } else if k > 3
+                    && k <= 32
+                    && self.w4a16_gemm_t_m32_n64_k.0 != 0
+                    && super::super::ssm_out_proj_m32n64()
+                {
+                    // K=γ verify (DFlash γ=16 → M=17): route the SSM out_proj
+                    // [M=17, N=H=5120, K=value_dim=6144] through the m32_n64
+                    // transposed kernel instead of w4a16_gemm_n128 (N_TILE=128).
+                    // At N=5120 the m128 kernel fields only ceil(5120/128)=40 CTAs
+                    // — SM-starved at ~37 GB/s on a 15.7 MB weight, mirroring the
+                    // ffn_down occupancy starve. N_TILE=64 doubles CTAs to
+                    // ceil(5120/64)=80 and M_TILE=32 keeps a single B read for M≤32.
+                    // Same proven T-weight + m32_n64 path as qkv/o/FFN (token-exact,
+                    // single K-chain — bit-exact, no split-K rounding).
+                    ops::w4a16_gemm_n64_m32(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_m32_n64_k,
+                        normed_out_buf,
+                        nvfp4_t,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                } else {
+                    ops::w4a16_gemm_n128(
+                        ctx.gpu,
+                        self.w4a16_gemm_t_k,
+                        normed_out_buf,
+                        nvfp4_t,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )?;
+                }
+            } else {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm_k,
+                    normed_out_buf,
+                    &self.ssm.out_proj,
                     out_proj_buf,
                     k,
                     h as u32,
@@ -504,73 +593,6 @@ impl Qwen3SsmLayer {
                     stream,
                 )?;
             }
-        } else if let Some(ref nvfp4_t) = self.out_proj_nvfp4_t {
-            if k <= 32
-                && self.w4a16_gemm_t_m16_k.0 != 0
-                && super::super::tc_nvfp4_m16_enabled()
-            {
-                ops::w4a16_gemm_n128_m16(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m16_k,
-                    normed_out_buf,
-                    nvfp4_t,
-                    out_proj_buf,
-                    k,
-                    h as u32,
-                    value_dim as u32,
-                    stream,
-                )?;
-            } else if k > 3
-                && k <= 32
-                && self.w4a16_gemm_t_m32_n64_k.0 != 0
-                && super::super::ssm_out_proj_m32n64()
-            {
-                // K=γ verify (DFlash γ=16 → M=17): route the SSM out_proj
-                // [M=17, N=H=5120, K=value_dim=6144] through the m32_n64
-                // transposed kernel instead of w4a16_gemm_n128 (N_TILE=128).
-                // At N=5120 the m128 kernel fields only ceil(5120/128)=40 CTAs
-                // — SM-starved at ~37 GB/s on a 15.7 MB weight, mirroring the
-                // ffn_down occupancy starve. N_TILE=64 doubles CTAs to
-                // ceil(5120/64)=80 and M_TILE=32 keeps a single B read for M≤32.
-                // Same proven T-weight + m32_n64 path as qkv/o/FFN (token-exact,
-                // single K-chain — bit-exact, no split-K rounding).
-                ops::w4a16_gemm_n64_m32(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m32_n64_k,
-                    normed_out_buf,
-                    nvfp4_t,
-                    out_proj_buf,
-                    k,
-                    h as u32,
-                    value_dim as u32,
-                    stream,
-                )?;
-            } else {
-                ops::w4a16_gemm_n128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_k,
-                    normed_out_buf,
-                    nvfp4_t,
-                    out_proj_buf,
-                    k,
-                    h as u32,
-                    value_dim as u32,
-                    stream,
-                )?;
-            }
-        } else {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed_out_buf,
-                &self.ssm.out_proj,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )?;
-        }
             anyhow::Result::<()>::Ok(())
         })?;
 
@@ -653,8 +675,7 @@ impl Qwen3SsmLayer {
             // interaction that has since been resolved upstream; keeping
             // it suppressed the fast kernel on truncated-γ verifies,
             // costing the prose path 15-20 tok/s.
-            let try_kgamma = (num_tokens as u32) > 3
-                && super::super::ffn_kgamma_m16_enabled();
+            let try_kgamma = (num_tokens as u32) > 3 && super::super::ffn_kgamma_m16_enabled();
             let used_kgamma = if try_kgamma {
                 let serviced = crate::kprof!(
                     ctx.gpu,

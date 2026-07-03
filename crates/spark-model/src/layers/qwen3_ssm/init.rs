@@ -49,6 +49,9 @@ impl Qwen3SsmLayer {
             // use `try_kernel` for safety — older PTX bundles or future
             // model dirs that shadow `gemv` may not include it.
             dense_gemv_batch3_k: super::super::try_kernel(gpu, "gemv", "dense_gemv_bf16_batch3"),
+            // General batched BA-proj GEMV (grid.y = token). Bit-identical
+            // to per-token dense_gemv_bf16. NULL on older PTX bundles.
+            dense_gemv_batchn_k: super::super::try_kernel(gpu, "gemv", "dense_gemv_bf16_batchn"),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
             w4a16_gemv_qkvz_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qkvz")?,
@@ -115,11 +118,7 @@ impl Qwen3SsmLayer {
             // Optional small-M variant (qwen3.6-27b only). Use try_kernel so
             // generic builds without the kernel still link cleanly.
             w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
-            w4a16_gemm_t_m32_n64_k: super::super::try_kernel(
-                gpu,
-                "w4a16",
-                "w4a16_gemm_t_m32_n64",
-            ),
+            w4a16_gemm_t_m32_n64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gdn_prefill_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_prefill")?,
@@ -243,16 +242,21 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy17",
                 "gated_delta_rule_wy17",
             ),
+            // V-dim-split occupancy variant of wy17. NULL on targets that
+            // haven't compiled gated_delta_rule_wy17_vsplit.cu → dispatch
+            // falls back to gdn_wy17_k (single CTA/head).
+            gdn_wy17_vsplit_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy17_vsplit",
+                "gated_delta_rule_wy17_vsplit",
+            ),
             // M8A: tree-aware GDN kernel (gated_delta_rule_tree.cu). Sequential
             // per-token loop with parent_ids state load — enables non-flat
             // DDTree branches. NULL on targets that haven't compiled the
             // kernel (gated_delta_rule_tree.cu must exist in their nvfp4/).
             gdn_tree_k: {
-                let k = super::super::try_kernel(
-                    gpu,
-                    "gated_delta_rule_tree",
-                    "gated_delta_rule_tree",
-                );
+                let k =
+                    super::super::try_kernel(gpu, "gated_delta_rule_tree", "gated_delta_rule_tree");
                 tracing::info!("M8A: gdn_tree_k handle = {} (0 = NOT LOADED)", k.0);
                 k
             },

@@ -82,9 +82,7 @@ impl TransformerModel {
         )?;
 
         // Diagnostic: post-norm hidden state
-        if (chunk_start + chunk_len) > 16384
-            || crate::model::env_diag::diag_gemma4_enabled()
-        {
+        if (chunk_start + chunk_len) > 16384 || crate::model::env_diag::diag_gemma4_enabled() {
             self.gpu.synchronize(stream)?;
             let (vals, norm) = self.readback_bf16(normed, h.min(16))?;
             tracing::warn!(
@@ -136,9 +134,7 @@ impl TransformerModel {
         }
 
         // Diagnostic: logits stats
-        if (chunk_start + chunk_len) > 16384
-            || crate::model::env_diag::diag_gemma4_enabled()
-        {
+        if (chunk_start + chunk_len) > 16384 || crate::model::env_diag::diag_gemma4_enabled() {
             self.gpu.synchronize(stream)?;
             let logits_ptr = self.buffers.logits();
             let n_logits = self.config.vocab_size;
@@ -250,6 +246,13 @@ impl TransformerModel {
 
         // DFlash: advance ctx_len after the LAST chunk of chunked prefill.
         self.update_dflash_ctx_len_after_prefill(seq, chunk_start, chunk_len)?;
+
+        // DFlash drafter-retrain teacher-forced hidden capture (default-OFF).
+        // No-op unless ATLAS_DUMP_CTX_HIDDEN is set. This is the LAST-chunk
+        // finalizer of the CHUNKED prefill path (the scheduler's default path
+        // when max_prefill_tokens>0), so ctx_hidden_acc is fully populated for
+        // all prompt positions here. `tokens` is the full prompt.
+        self.dump_ctx_hidden_after_prefill(seq, tokens)?;
 
         // MTP last-K prefill: replay the last K prompt-tail target hidden
         // states through the MTP head so its self-attention sees recent

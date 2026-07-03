@@ -94,6 +94,30 @@ impl Qwen3AttentionLayer {
         self.o_nvfp4_t = o_nvfp4_t;
     }
 
+    /// Eagerly allocate the FP32 split-K workspace for the K/V projections
+    /// on the K=γ verify QKV path (`ATLAS_ATTN_QKV_SPLITK`). `n` is the
+    /// largest split-K output dim (kv_dim = num_kv_heads*head_dim). Called
+    /// at load time (pre-graph-capture) because `gpu.alloc` is illegal
+    /// during CUDA graph capture. No-op when split-K is disabled or the
+    /// split-K kernel symbols are missing. Sized `[max_splits, M_TILE=32, n]`
+    /// FP32 so K and V (run back-to-back, each fully reduced before the
+    /// next partial phase) can share the one scratch.
+    pub fn alloc_qkv_splitk_workspace(&self, gpu: &dyn GpuBackend, n: u32) -> anyhow::Result<()> {
+        if crate::layers::attn_qkv_splitk() == 0
+            || self.w4a16_gemm_t_m32_n64_splitk_k.0 == 0
+            || self.reduce_splitk_k.0 == 0
+        {
+            return Ok(());
+        }
+        let mut slot = self.qkv_splitk_workspace.lock().unwrap();
+        if slot.is_none() {
+            // 8 = max split clamp; 32 = M_TILE of the split-K kernel.
+            let bytes = 8usize * 32 * n as usize * 4;
+            *slot = Some(gpu.alloc(bytes)?);
+        }
+        Ok(())
+    }
+
     /// Set native FP8 checkpoint weights for `w8a16_gemv` decode path.
     ///
     /// NOTE: Does NOT set `q_fp8`/`k_fp8`/`v_fp8`/`o_fp8` (raw FP8

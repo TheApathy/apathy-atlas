@@ -36,7 +36,16 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         args: &CacheSkipMlaArgs,
     ) -> Result<DevicePtr> {
-        let CacheSkipMlaArgs { normed, n, h, nq, hd, eps, stream, kv_write_start } = *args;
+        let CacheSkipMlaArgs {
+            normed,
+            n,
+            h,
+            nq,
+            hd,
+            eps,
+            stream,
+            kv_write_start,
+        } = *args;
         let mla = self
             .mla
             .as_ref()

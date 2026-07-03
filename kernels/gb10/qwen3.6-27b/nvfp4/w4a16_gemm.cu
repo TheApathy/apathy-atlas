@@ -2264,4 +2264,241 @@ extern "C" __global__ void reduce_splitk_f32_to_bf16(
     C[idx] = __float2bfloat16(sum);
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m32_n64_gateup_silu — FUSED gate_proj + up_proj + SiLU·mul
+//
+// Fork of `w4a16_gemm_t_m32_n64`. The DFlash K=γ+1 verify FFN runs
+// gate = gate_proj(x); up = up_proj(x); act = silu(gate)*up. The two
+// projections share the SAME input `A` [M, K=hidden] and the SAME
+// output shape [M, N=inter]. The baseline dispatches them as two
+// separate m32_n64 GEMMs (each re-loading the A tile + writing a full
+// [M,N] activation) followed by a third `moe_silu_mul` kernel that
+// reads both [M,N] activations and writes one.
+//
+// This kernel loads A ONCE into SMEM (shared across both projections),
+// streams BOTH B weights (gate + up) through their own double-buffered
+// cp.async pipelines, keeps two independent accumulator sets, and at
+// output computes silu(gate)*up in registers — writing only the single
+// [M,N] activation. Eliminates:
+//   * one full re-read of the [M, K] A tile (small: ~174 KB at M=17)
+//   * the two [M,N] activation WRITES + two READS of the standalone
+//     silu_mul (gate_out + up_out ≈ 2×[17,16384]×2B = 1.1 MB write +
+//     1.1 MB read) → replaced by ONE [M,N] write
+//   * two kernel launches (2 GEMM + 1 silu → 1 fused)
+//
+// NOTE (honesty): the dominant DRAM traffic is the two 47 MB weights
+// (gate + up), which this kernel still reads in full — fusion cannot
+// reduce weight bandwidth. The saved traffic (~2.2 MB activation +
+// A re-read) is ~2% of the ~96 MB total, so the win is bounded by
+// launch-overhead + activation-roundtrip elimination, NOT a bandwidth
+// speedup. A/B measured, gated behind ATLAS_FFN_FUSED_GATEUP.
+//
+// SMEM (2× B pipeline vs the single-B m32_n64):
+//   - A:        2 × 32 × 40 × 2          = 5120 B  (shared)
+//   - Bp ×2:    2 × 2 × 16 × 80          = 5120 B
+//   - Bs ×2:    2 × 2 × 2  × 80          =  640 B
+//   - B_fp8 ×2: 2 × 64 × 32              = 4096 B
+//   - LUT:                                    64 B  ≈ 15.0 KB
+//
+// Caller contract: identical geometry to w4a16_gemm_t_m32_n64 but with
+// TWO weight triples (gate then up) and a shared ldb. Output C is the
+// fused silu(gate)*up activation [M, N]. Accepts any M ≤ 32.
+// ═══════════════════════════════════════════════════════════════════
+extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bg_packed,
+    const unsigned char* __restrict__ Bg_scale,
+    const float scale2_g,
+    const unsigned char* __restrict__ Bu_packed,
+    const unsigned char* __restrict__ Bu_scale,
+    const float scale2_u,
+    __nv_bfloat16* __restrict__ C,          // fused silu(gate)*up [M,N]
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ldb
+) {
+    constexpr unsigned int M_TILE_S = 32;
+    const unsigned int cta_n = blockIdx.x * N_TILE_S3;
+    const unsigned int cta_m = blockIdx.y * M_TILE_S;
+    const unsigned int warp_id = threadIdx.x / 32;  // 0..3
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;     // 0..7
+    const unsigned int tid = lane_id & 3;           // 0..3
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE_S][K_STEP_T + PAD_T];        // 5120B
+    // Two B pipelines: [0]=gate, [1]=up.
+    __shared__ unsigned char smem_Bp[2][2][K_STEP_T / 2][N_TILE_S3 + BP_PAD]; // 5120B
+    __shared__ unsigned char smem_Bs[2][2][K_STEP_T / GROUP_SIZE][N_TILE_S3 + BP_PAD]; // 640B
+    __shared__ unsigned char smem_B_fp8[2][N_TILE_S3][K_STEP_T];           // 4096B
+    __shared__ float smem_LUT[16];
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    // Per-warp accumulators for BOTH projections:
+    // acc[w][m_frag 0..1][n_subtile 0..1][4 fp32]. w: 0=gate, 1=up.
+    float acc[2][2][2][4];
+    #pragma unroll
+    for (int w = 0; w < 2; w++)
+        #pragma unroll
+        for (int mf = 0; mf < 2; mf++)
+            #pragma unroll
+            for (int sub = 0; sub < 2; sub++) {
+                acc[w][mf][sub][0] = 0.0f; acc[w][mf][sub][1] = 0.0f;
+                acc[w][mf][sub][2] = 0.0f; acc[w][mf][sub][3] = 0.0f;
+            }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // A loads (shared) + BOTH B loads for the given weight index w.
+    #define ISSUE_A_M32(buf, kb) do { \
+        unsigned int a_row = threadIdx.x >> 2;        /* 0..31 */ \
+        unsigned int a_col = (threadIdx.x & 3) << 3;  /* 0/8/16/24 */ \
+        unsigned int gc = (kb) + a_col; \
+        unsigned int gr = cta_m + a_row; \
+        cp_async_pred_16(&smem_A[(buf)][a_row][a_col], \
+            &A[(unsigned long long)gr * K + gc], \
+            (gr < M) && (gc + 7 < K)); \
+    } while(0)
+
+    #define ISSUE_B_M32(w, buf, kb, Bp, Bs) do { \
+        if (threadIdx.x < 64) { \
+            unsigned int kp = threadIdx.x >> 2;          /* 0..15 */ \
+            unsigned int ns = (threadIdx.x & 3) << 4;    /* 0/16/32/48 */ \
+            unsigned int gke = (kb) + (kp << 1); \
+            unsigned int gns = cta_n + ns; \
+            cp_async_pred_16(&smem_Bp[(w)][(buf)][kp][ns], \
+                &Bp[(unsigned long long)(gke >> 1) * ldb + gns], \
+                (gke + 1 <= K) && (gns + 15 < ldb)); \
+            if (kp < (K_STEP_T / GROUP_SIZE) * (N_TILE_S3 / 16)) { \
+                unsigned int sg_row = kp >> 2; \
+                unsigned int sg_ns  = (kp & 3) << 4; \
+                unsigned int sg = (kb) / GROUP_SIZE + sg_row; \
+                cp_async_pred_16(&smem_Bs[(w)][(buf)][sg_row][sg_ns], \
+                    &Bs[(unsigned long long)sg * ldb + cta_n + sg_ns], \
+                    (cta_n + sg_ns + 15 < ldb)); \
+            } \
+        } \
+    } while(0)
+
+    // Dequant weight w's B tile → smem_B_fp8[w].
+    #define DEQUANT_M32(w, buf, sc2) do { \
+        unsigned int my_n = threadIdx.x >> 1;            /* 0..63 */ \
+        unsigned int half = threadIdx.x & 1;             /* 0..1  */ \
+        unsigned char sb = smem_Bs[(w)][(buf)][half][my_n]; \
+        __nv_fp8_e4m3 f; \
+        *(unsigned char*)&f = sb; \
+        float sv = (float)f * (sc2); \
+        unsigned int kp0 = half << 3; \
+        _Pragma("unroll") \
+        for (unsigned int kp = kp0; kp < kp0 + 8; kp++) { \
+            unsigned char packed = smem_Bp[(w)][(buf)][kp][my_n]; \
+            float lo = smem_LUT[packed & 0xF] * sv; \
+            float hi = smem_LUT[packed >> 4] * sv; \
+            unsigned short fp8_pair; \
+            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            *(unsigned short*)&smem_B_fp8[(w)][my_n][kp * 2] = fp8_pair; \
+        } \
+    } while(0)
+
+    // MMA for weight w, using the shared A tile (a_buf) and B_fp8[w].
+    #define COMPUTE_MMA_M32(w, a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        unsigned int fr0 = group_id; \
+        unsigned int fr1 = fr0 + 8; \
+        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        unsigned int b0 = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + tid * 4]); \
+        unsigned int b1 = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + tid * 4]); \
+        unsigned int b2 = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + 16 + tid * 4]); \
+        unsigned int b3 = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int sub = 0; sub < 2; sub++) { \
+            unsigned int nt = warp_id * 2 + sub; \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int v0 = *(const unsigned int*)&smem_B_fp8[(w)][nc][4 * tid]; \
+            unsigned int v1 = *(const unsigned int*)&smem_B_fp8[(w)][nc][16 + 4 * tid]; \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][0][sub][0]),"=f"(acc[(w)][0][sub][1]),"=f"(acc[(w)][0][sub][2]),"=f"(acc[(w)][0][sub][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(v0),"r"(v1), \
+                 "f"(acc[(w)][0][sub][0]),"f"(acc[(w)][0][sub][1]),"f"(acc[(w)][0][sub][2]),"f"(acc[(w)][0][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][1][sub][0]),"=f"(acc[(w)][1][sub][1]),"=f"(acc[(w)][1][sub][2]),"=f"(acc[(w)][1][sub][3]) \
+                :"r"(b0),"r"(b1),"r"(b2),"r"(b3),"r"(v0),"r"(v1), \
+                 "f"(acc[(w)][1][sub][0]),"f"(acc[(w)][1][sub][1]),"f"(acc[(w)][1][sub][2]),"f"(acc[(w)][1][sub][3])); \
+        } \
+    } while(0)
+
+    // Prologue: load A + both B tiles for k_base=0.
+    ISSUE_A_M32(0, 0);
+    ISSUE_B_M32(0, 0, 0, Bg_packed, Bg_scale);
+    ISSUE_B_M32(1, 0, 0, Bu_packed, Bu_scale);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+    DEQUANT_M32(0, 0, scale2_g);
+    DEQUANT_M32(1, 0, scale2_u);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        ISSUE_A_M32(nxt, k_base);
+        ISSUE_B_M32(0, nxt, k_base, Bg_packed, Bg_scale);
+        ISSUE_B_M32(1, nxt, k_base, Bu_packed, Bu_scale);
+        cp_async_commit();
+        COMPUTE_MMA_M32(0, cur);
+        COMPUTE_MMA_M32(1, cur);
+        cp_async_wait_all();
+        __syncthreads();
+        DEQUANT_M32(0, nxt, scale2_g);
+        DEQUANT_M32(1, nxt, scale2_u);
+        __syncthreads();
+        cur = nxt;
+    }
+    COMPUTE_MMA_M32(0, cur);
+    COMPUTE_MMA_M32(1, cur);
+
+    #undef ISSUE_A_M32
+    #undef ISSUE_B_M32
+    #undef DEQUANT_M32
+    #undef COMPUTE_MMA_M32
+
+    // Output: silu(gate)*up per element, single [M,N] write.
+    #pragma unroll
+    for (int sub = 0; sub < 2; sub++) {
+        unsigned int nt = warp_id * 2 + sub;
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + group_id;
+        unsigned int r1 = r0 + 8;
+        unsigned int r2 = r0 + 16;
+        unsigned int r3 = r0 + 24;
+        // SiLU(g)*u. Round the gate/up accumulators to BF16 and back to
+        // FP32 FIRST — this reproduces the baseline flow byte-for-byte:
+        // the standalone m32_n64 GEMMs write gate_out/up_out as BF16
+        // (__float2bfloat16(acc)), then `moe_silu_mul` reloads them as
+        // FP32 (__bfloat162float) and computes g*sigmoid(g)*u. Keeping the
+        // raw FP32 accumulators would be *more* precise but would diverge
+        // in the low bits → breaks the md5 gate. Match the baseline exactly.
+        #define FUSE(gi, ui) ({ \
+            float g_ = __bfloat162float(__float2bfloat16(gi)); \
+            float u_ = __bfloat162float(__float2bfloat16(ui)); \
+            float sig_ = 1.0f / (1.0f + __expf(-g_)); \
+            __float2bfloat16(g_ * sig_ * u_); })
+        if (r0 < M && c0 < N) C[r0*N+c0] = FUSE(acc[0][0][sub][0], acc[1][0][sub][0]);
+        if (r0 < M && c1 < N) C[r0*N+c1] = FUSE(acc[0][0][sub][1], acc[1][0][sub][1]);
+        if (r1 < M && c0 < N) C[r1*N+c0] = FUSE(acc[0][0][sub][2], acc[1][0][sub][2]);
+        if (r1 < M && c1 < N) C[r1*N+c1] = FUSE(acc[0][0][sub][3], acc[1][0][sub][3]);
+        if (r2 < M && c0 < N) C[r2*N+c0] = FUSE(acc[0][1][sub][0], acc[1][1][sub][0]);
+        if (r2 < M && c1 < N) C[r2*N+c1] = FUSE(acc[0][1][sub][1], acc[1][1][sub][1]);
+        if (r3 < M && c0 < N) C[r3*N+c0] = FUSE(acc[0][1][sub][2], acc[1][1][sub][2]);
+        if (r3 < M && c1 < N) C[r3*N+c1] = FUSE(acc[0][1][sub][3], acc[1][1][sub][3]);
+        #undef FUSE
+    }
+}
+
 #undef N_TILE_S3

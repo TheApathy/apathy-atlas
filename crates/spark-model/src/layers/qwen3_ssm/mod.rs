@@ -62,6 +62,11 @@ pub struct Qwen3SsmLayer {
     /// `ATLAS_SSM_BA_BATCHED=1`; NULL handle when the kernel isn't in the
     /// active target's PTX bundle, in which case the per-token loop runs.
     dense_gemv_batch3_k: KernelHandle,
+    /// General batched (grid.y = token) counterpart of `dense_gemv_k` for
+    /// the SSM BA projection at any num_tokens (DFlash K=γ=17 included).
+    /// Bit-identical to the per-token loop (same kernel body per y-block).
+    /// Gated by `ATLAS_SSM_BA_BATCH=1`; NULL handle → per-token loop.
+    dense_gemv_batchn_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
     w8a16_gemv_k: KernelHandle,
     w4a16_gemv_qkvz_k: KernelHandle,
@@ -190,6 +195,12 @@ pub struct Qwen3SsmLayer {
     /// in which case decode_batched(K=17) falls through to the sequential
     /// per-token path.
     gdn_wy17_k: KernelHandle,
+    /// V-dim-split wy17 (`gated_delta_rule_wy17_vsplit`): occupancy variant
+    /// that fans the 48-head wy17 launch across `ATLAS_WY17_SPLIT` v-column
+    /// bands (gridDim.z). Bit-identical output to `gdn_wy17_k`. NULL handle
+    /// when the kernel isn't in the active target's PTX bundle → the K=17
+    /// path uses `gdn_wy17_k` unchanged.
+    gdn_wy17_vsplit_k: KernelHandle,
     /// M8A: tree-aware GDN kernel for DDTree verify with non-flat branches.
     /// Sequential per-token loop with parent_ids state load. NULL handle
     /// when not compiled for the active target.
@@ -238,8 +249,7 @@ mod trait_prefill_recur;
 // Accumulate per-call wall-clock ns spent in wy17 across all SSM layers.
 // Reporter logs total + call count every N=5000 calls (every ~100 verify
 // steps at 48 SSM layers per step). Zero overhead when disabled.
-static SSM_PROFILE_NS_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SSM_PROFILE_NS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SSM_PROFILE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn ssm_profile_record(ns: u64) {

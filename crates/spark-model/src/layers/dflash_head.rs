@@ -133,6 +133,19 @@ pub struct DflashScratch {
     /// gamma, the safest / least-OOD choice given `self.fc` was trained on
     /// un-normalized concat). Allocated + zeroed once at construction.
     pub fc_norm_zero_w: DevicePtr,
+    /// DSpark Markov head scratch — the gathered `markov_w1[prev]` row
+    /// (`[rank]` BF16). Only allocated (non-null) when the head is present;
+    /// `DevicePtr::NULL` otherwise. Input to the `w2` bias GEMV.
+    pub markov_w1_row: DevicePtr,
+    /// DSpark Markov head scratch — the per-position bias `B(prev)`
+    /// (`[vocab]` BF16), the output of `dense_gemv(w1_row, w2)`. Added to the
+    /// base logit row before argmax. `DevicePtr::NULL` when no Markov head.
+    pub markov_bias: DevicePtr,
+    /// DSpark Markov head scratch — the previous token id (`[1]` u32) fed to
+    /// the `batched_embed` gather that selects `markov_w1[prev]`. Rewritten
+    /// each block position with the token sampled at the prior position.
+    /// `DevicePtr::NULL` when no Markov head.
+    pub markov_prev_dev: DevicePtr,
 }
 
 /// Drafter-side weight precision.
@@ -155,6 +168,19 @@ pub struct DflashScratch {
 pub enum DflashQuantization {
     Bf16,
     Nvfp4,
+}
+
+/// DSpark VanillaMarkov head (runtime form) — the low-rank bigram bias
+/// `B(prev) = markov_w2 @ markov_w1[prev]` applied per block position.
+///
+/// Both weights are BF16 on device. `w1` is `[vocab, rank]` (an embedding
+/// gather picks row `prev`); `w2` is `[vocab, rank]` (`nn.Linear(rank, vocab)`
+/// weight), so `B = dense_gemv(input=w1[prev], weight=w2, n=vocab, k=rank)`.
+/// The per-block bias scratch (`[vocab]` BF16) lives in [`DflashScratch`].
+pub struct MarkovHead {
+    pub w1: DenseWeight,
+    pub w2: DenseWeight,
+    pub rank: usize,
 }
 
 /// Per-drafter-layer Qwen3-style BF16 weights (default path).
@@ -501,6 +527,16 @@ pub struct BlockDiffusionDraftHead {
     /// drafter shares vocab with the target (Qwen3.6-35B-A3B-DFlash case:
     /// vocab_size == draft_vocab_size == 248320).
     pub draft_id_to_target_id: Option<DevicePtr>,
+
+    /// DSpark VanillaMarkov head. `Some` when the checkpoint ships the
+    /// `markov_head.markov_w{1,2}.weight` tensors and `markov_rank > 0` and
+    /// `ATLAS_DFLASH_MARKOV != 0`. When present, `propose_drafts` applies a
+    /// per-position bigram logit bias `B(prev) = W2(W1[prev])` and samples the
+    /// γ-block LEFT-TO-RIGHT (each position's chosen token biases the next),
+    /// semi-autoregressively repairing suffix decay. LOSSLESS w.r.t. committed
+    /// output — only changes which tokens are *proposed*; the target verify
+    /// still commits its own greedy token.
+    pub markov: Option<MarkovHead>,
     /// Drafter transformer layers (8 for Qwen3.6-35B-A3B-DFlash). Each
     /// layer carries either BF16 or NVFP4 weights — the `forward_block_layer`
     /// helper match-dispatches on the variant.
@@ -685,6 +721,7 @@ pub mod ddtree_gdn_dispatch;
 mod forward_block;
 mod forward_block_layer;
 mod from_weights;
+mod markov;
 mod noise_pass;
 mod propose;
 pub mod retrieval;
@@ -869,8 +906,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let slot = dstate.accept_history_pos % dstate.accept_history.len();
         dstate.accept_history[slot] = num_accepted.min(u8::MAX as usize) as u8;
         dstate.accept_history_pos = (dstate.accept_history_pos + 1) % dstate.accept_history.len();
-        dstate.accept_history_count = (dstate.accept_history_count + 1)
-            .min(dstate.accept_history.len());
+        dstate.accept_history_count =
+            (dstate.accept_history_count + 1).min(dstate.accept_history.len());
         Ok(())
     }
 

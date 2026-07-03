@@ -267,24 +267,28 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     };
                     if let Some(ref qw) = q_nvfp4 {
                         let qt = qw.transpose_for_gemm(gpu, q_proj_n, h)?;
-                        let kt = k_nvfp4
-                            .as_ref()
-                            .unwrap()
-                            .transpose_for_gemm(gpu, num_kv_heads * head_dim, h)?;
-                        let vt = v_nvfp4
-                            .as_ref()
-                            .unwrap()
-                            .transpose_for_gemm(gpu, num_kv_heads * head_dim, h)?;
-                        let ot = layer
-                            .attn
-                            .o_proj
-                            .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
-                        layer.set_prefill_weights(
-                            Some(qt),
-                            Some(kt),
-                            Some(vt),
-                            Some(ot),
-                        );
+                        let kt = k_nvfp4.as_ref().unwrap().transpose_for_gemm(
+                            gpu,
+                            num_kv_heads * head_dim,
+                            h,
+                        )?;
+                        let vt = v_nvfp4.as_ref().unwrap().transpose_for_gemm(
+                            gpu,
+                            num_kv_heads * head_dim,
+                            h,
+                        )?;
+                        let ot =
+                            layer
+                                .attn
+                                .o_proj
+                                .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
+                        layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
+                        // Eagerly allocate the QKV split-K FP32 workspace
+                        // (illegal during CUDA graph capture). Sized for the
+                        // K/V output dim (kv_dim = num_kv_heads*head_dim);
+                        // Q uses the single-slice kernel. No-op when
+                        // ATLAS_ATTN_QKV_SPLITK is unset or kernels missing.
+                        layer.alloc_qkv_splitk_workspace(gpu, (num_kv_heads * head_dim) as u32)?;
                     }
 
                     layers.push(Box::new(layer));

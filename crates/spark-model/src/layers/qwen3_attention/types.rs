@@ -265,6 +265,19 @@ pub struct Qwen3AttentionLayer {
     /// `w4a16_gemm_t_m32_n64` — K=γ verify small-M GEMM (single B read ×
     /// 272 CTAs). Used by the batched qkv/o paths at 3 < n ≤ 32.
     pub(super) w4a16_gemm_t_m32_n64_k: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64_splitk` — split-K variant for the K/V
+    /// projections on the K=γ verify path. At nkv*hd=1024 the single-slice
+    /// m32_n64 fields only ceil(1024/64)=16 CTAs (vs Q's 192 at 12288) and
+    /// is occupancy-starved on GB10's 48 SMs. Split-K multiplies CTAs by
+    /// `ATLAS_ATTN_QKV_SPLITK` into an FP32 workspace, then
+    /// `reduce_splitk_f32_to_bf16` sums+downcasts. NULL handle → the QKV
+    /// split-K path stays disabled and the single-slice m32_n64 runs.
+    pub(super) w4a16_gemm_t_m32_n64_splitk_k: KernelHandle,
+    /// Companion reduce for `w4a16_gemm_t_m32_n64_splitk_k`.
+    pub(super) reduce_splitk_k: KernelHandle,
+    /// Lazily-allocated FP32 split-K workspace [k_splits, M, N] for the QKV
+    /// split-K path. `Mutex` because `ms_phase_qkv` takes `&self`.
+    pub(super) qkv_splitk_workspace: std::sync::Mutex<Option<DevicePtr>>,
     /// MiniMax-only shadow kernel.
     pub(super) w4a16_gemm_t_m128_v2_k: KernelHandle,
     /// v3 variant: K_STEP=64.

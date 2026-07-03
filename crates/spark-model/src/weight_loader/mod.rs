@@ -24,8 +24,8 @@ mod qwen35_dense;
 mod qwen3_vl;
 
 pub use dflash_loader::{
-    DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
-    store_has_dflash_weights,
+    DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, MarkovWeights,
+    load_dflash_weights, store_has_dflash_weights, store_has_markov_head,
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
@@ -43,7 +43,9 @@ use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
 use crate::layers::VisionEncoder;
-use crate::weight_map::{DenseWeight, MtpDenseWeights, MtpWeights, Nvfp4Variant, detect_nvfp4_variant};
+use crate::weight_map::{
+    DenseWeight, MtpDenseWeights, MtpWeights, Nvfp4Variant, detect_nvfp4_variant,
+};
 
 /// Runtime quantization format for weight dispatch.
 ///
