@@ -184,6 +184,36 @@ impl Qwen3SsmLayer {
                     h as u32,
                     stream,
                 )?;
+            } else if k > 3
+                && k <= 32
+                && super::super::ssm_qkvz_splitk() > 0
+                && self.w4a16_gemm_t_m32_n64_splitk_k.0 != 0
+                && self.reduce_splitk_k.0 != 0
+                && self.ssm_splitk_workspace.lock().unwrap().is_some()
+            {
+                // ATLAS_SSM_QKVZ_SPLITK: K=γ verify qkvz projection
+                // [M=17, N=12288, K=5120] through the split-K m32_n64
+                // kernel. Floor-map microbench (2026-07-05): the
+                // w4a16_gemm_t default runs 220.5µs = 59% of the 132µs
+                // DRAM floor; split-K×2 measures 167.3µs (85%, 232 GB/s)
+                // + ~10µs reduce — ~2.2ms/step across 48 layers. Lossless
+                // FP32 partials, mirrors the shipped ffn_down split-K.
+                let ws = self.ssm_splitk_workspace.lock().unwrap().unwrap();
+                ops::w4a16_gemm_n64_m32_splitk(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk_k,
+                    self.reduce_splitk_k,
+                    normed,
+                    nvfp4_t,
+                    proj_dst,
+                    ws,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    qkvz_size as u32, // ldb == N for tightly-packed T-weight
+                    super::super::ssm_qkvz_splitk(),
+                    stream,
+                )?;
             } else {
                 ops::w4a16_gemm_n128(
                     ctx.gpu,
@@ -500,6 +530,42 @@ impl Qwen3SsmLayer {
                     out_proj_buf,
                     h as u32,
                     value_dim as u32,
+                    stream,
+                )?;
+            } else if k > 3
+                && k <= 32
+                && super::super::ssm_out_splitk() > 0
+                && self.w4a16_gemm_t_m32_n64_splitk_k.0 != 0
+                && self.reduce_splitk_k.0 != 0
+                && let Some(proj_t) = self.out_proj_nvfp4_t.as_ref()
+                && let Some(ws) = *self.ssm_splitk_workspace.lock().unwrap()
+            {
+                // ATLAS_SSM_OUT_SPLITK: K=γ verify out_proj
+                // [M=17, N=H=5120, K=value_dim=6144] through the split-K
+                // m32_n64 kernel. Placed BEFORE the fp8 branch: the
+                // production route is `fp8_gemm_t` (out_proj_fp8 installed
+                // by predequant_for_prefill), floor-map measured at
+                // 191.6µs = 61% of its 117µs FP8 floor (2× weight bytes).
+                // Split-K×4 on the NVFP4 T-weight slices K across
+                // gridDim.z (320 CTAs) into FP32 partials and measures
+                // 89.4µs (85% of the 76µs NVFP4 floor, 232 GB/s) + ~5µs
+                // reduce — a 2.1× kernel win, ~4.6ms/step across 48
+                // layers. Lossless FP32 partials +
+                // reduce_splitk_f32_to_bf16, mirroring the shipped
+                // ffn_down split-K route.
+                ops::w4a16_gemm_n64_m32_splitk(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m32_n64_splitk_k,
+                    self.reduce_splitk_k,
+                    normed_out_buf,
+                    proj_t,
+                    out_proj_buf,
+                    ws,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    h as u32, // ldb == N for tightly-packed T-weight
+                    super::super::ssm_out_splitk(),
                     stream,
                 )?;
             } else if let Some(fp8) = self.out_proj_fp8 {

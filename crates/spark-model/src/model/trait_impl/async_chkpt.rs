@@ -197,6 +197,13 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
 
+        // Task #34: consume the flat-chain injection flag FIRST (even on the
+        // full-reject early return below) so a stale `true` can never leak
+        // into an unrelated later commit (e.g. an MTP K=2/3/4 verify).
+        let flat_tree_injected = self
+            .dflash_flat_tree_route
+            .swap(false, std::sync::atomic::Ordering::Acquire);
+
         if num_accepted == 0 {
             // Full reject: canonical state untouched — no commit needed.
             // Still record the event so sync_secondary has something to wait
@@ -213,7 +220,19 @@ impl TransformerModel {
         // for tree mode. Force the partial-accept copy path (copy intermediate
         // [last_inter_slot] → h_state) regardless of num_accepted when tree
         // mode was active.
-        let was_tree_mode = self.ddtree_parent_ids_dev.lock().is_some();
+        //
+        // Task #34: "tree mode" has TWO producers, and both must be visible:
+        //   * the scheduler-set payload stash (`ddtree_parent_ids_dev`), and
+        //   * the verify's own graph-safe FLAT-CHAIN injection
+        //     (`dflash_flat_tree_route`, set by verify_d.rs when
+        //     `k == ddtree_parent_ids_capacity` with graphs on and
+        //     ATLAS_DISABLE_TREE_WY unset).
+        // Missing the second one made every FULL accept on an injected verify
+        // (e.g. K=12 / γ=11 DSpark) commit the STALE pre-verify h_state.
+        let was_tree_mode = super::commit_plan::commit_sees_tree_mode(
+            self.ddtree_parent_ids_dev.lock().is_some(),
+            flat_tree_injected,
+        );
 
         // Defensive bounds check: `last_inter_slot` must be a valid pool slot.
         // The intermediate pool was sized to `num_intermediates = γ+1 = k` so
@@ -230,11 +249,37 @@ impl TransformerModel {
             );
         }
 
+        // WY17 LAZY commit: reconstruct a skipped intermediate slot via the
+        // replay kernel instead of the intermediate → h_state D2D copy. Active
+        // only when the gate is on, lazy J>1, and the tree path was NOT used
+        // (tree writes all slots; the flat wy17 path is the only lazy producer).
+        //
+        // Task #34 sibling hazard: the env gates alone are NOT sufficient — a
+        // K≠17 verify runs the CHUNKED wy4/wy3/wy2 path, which persists ALL
+        // intermediate slots and never populates the k/v/gate/beta retention
+        // buffers the replay kernel reads. The per-layer
+        // `wy17_lazy_engaged(k)` check below (shared with the dispatch)
+        // guarantees replay fires only when the lazy wy17 kernel actually
+        // produced this verify's intermediates.
+        let lazy_j = crate::layers::wy17_lazy();
+        let lazy_commit_env = crate::layers::wy17_lazy_commit();
+
         let stream = self.secondary_stream;
         let mut ssm_layer_idx = 0usize;
 
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) == LayerType::LinearAttention {
+                // Snapshot the replay kernel handle + retention pointers BEFORE
+                // taking the &mut borrow of the layer state (avoids borrowing
+                // `self.layers` while `seq.layer_states` is mutably borrowed).
+                let replay_kernel = self.layers[i].wy17_replay_kernel();
+                // Did THIS layer's dispatch run the lazy wy17 kernel for a
+                // k-token verify? Pure function of k + env + kernel handles
+                // (graph-replay safe); shared with the dispatch. False for
+                // every K≠17 (chunked/fused) verify — replay must not fire
+                // there (task #34 sibling hazard).
+                let lazy_engaged = self.layers[i].wy17_lazy_engaged(k);
+
                 let ssm = layer_state
                     .as_any_mut()
                     .downcast_mut::<SsmLayerState>()
@@ -281,21 +326,91 @@ impl TransformerModel {
                     // `inter[num_accepted - 1]` instead would silently grab
                     // an unrelated branch's state and produce gibberish.
                     let slot = seq.slot_idx;
-                    let h_inter =
-                        self.ssm_pool
-                            .h_intermediate(ssm_layer_idx, slot, last_inter_slot);
                     let conv_inter =
                         self.ssm_pool
                             .conv_intermediate(ssm_layer_idx, slot, last_inter_slot);
-                    // canonical → live (h_state read by next forward)
-                    self.gpu
-                        .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;
-                    self.gpu
-                        .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
-                    // canonical → checkpoint (for any future rollback)
-                    self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
-                    self.gpu
-                        .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
+
+                    // ── WY17 LAZY commit: replay a skipped H slot ──
+                    // Under lazy J>1 the wy17 kernel persisted only checkpoint
+                    // H intermediates. If this partial accept targets a
+                    // NON-checkpoint slot, `h_intermediate[last_inter_slot]`
+                    // holds a STALE H — reconstruct the true H-after-slot via
+                    // `gated_delta_rule_wy17_replay`, re-seeding from the
+                    // pre-verify ROOT (== h_ckpt) and replaying the SAME FP32
+                    // WY recurrence over tokens [0..=last_inter_slot] with the
+                    // retained k/v/gate/beta inputs. Bit-exact vs the state the
+                    // kernel would have written. Conv intermediates are ALWAYS
+                    // persisted (lazy only skips H), so conv still uses D2D.
+                    let use_replay = super::commit_plan::wy17_replay_allowed(
+                        lazy_commit_env,
+                        lazy_j,
+                        was_tree_mode,
+                        num_accepted,
+                        k,
+                        last_inter_slot,
+                        lazy_engaged,
+                    ) && replay_kernel.0 != 0
+                        && ssm.wy17_kv_retain.is_some()
+                        && ssm.wy17_gate_retain.is_some();
+
+                    if use_replay {
+                        // Retained forward inputs (this layer's snapshot).
+                        let kv_ret = ssm.wy17_kv_retain.unwrap();
+                        let gate_ret = ssm.wy17_gate_retain.unwrap();
+                        let bf16 = 2usize;
+                        let fp32 = 4usize;
+                        let key_dim = nk * kd;
+                        let q_ptr = kv_ret;
+                        let k_ptr = kv_ret.offset(key_dim * bf16);
+                        let v_ptr = kv_ret.offset(key_dim * 2 * bf16);
+                        let gate_ptr = gate_ret;
+                        let beta_ptr = gate_ret.offset(nv * fp32);
+                        // out_h = live h_state (read by next forward).
+                        crate::layers::ops::gdn_wy17_replay(
+                            self.gpu.as_ref(),
+                            replay_kernel,
+                            h_ckpt, // h_root == pre-verify ROOT state
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            gate_ptr,
+                            beta_ptr,
+                            ssm.h_state, // out_h
+                            0,           // ckpt_first_token (root replay)
+                            last_inter_slot as u32,
+                            1, // batch_size
+                            nk as u32,
+                            nv as u32,
+                            kd as u32,
+                            vd as u32,
+                            conv_dim as u32, // qk_stride
+                            conv_dim as u32, // v_stride
+                            (nv * 2) as u32, // gb_stride
+                            stream,
+                        )?;
+                        // Mirror reconstructed H into the checkpoint for any
+                        // future rollback (parity with the D2D path below).
+                        self.gpu
+                            .copy_d2d_async(ssm.h_state, h_ckpt, h_bytes, stream)?;
+                        // Conv is always persisted → plain D2D.
+                        self.gpu
+                            .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
+                        self.gpu
+                            .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
+                    } else {
+                        let h_inter =
+                            self.ssm_pool
+                                .h_intermediate(ssm_layer_idx, slot, last_inter_slot);
+                        // canonical → live (h_state read by next forward)
+                        self.gpu
+                            .copy_d2d_async(h_inter, ssm.h_state, h_bytes, stream)?;
+                        self.gpu
+                            .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
+                        // canonical → checkpoint (for any future rollback)
+                        self.gpu.copy_d2d_async(h_inter, h_ckpt, h_bytes, stream)?;
+                        self.gpu
+                            .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
+                    }
                 }
 
                 ssm_layer_idx += 1;

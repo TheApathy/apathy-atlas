@@ -142,6 +142,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.

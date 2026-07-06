@@ -119,6 +119,15 @@ impl Qwen3SsmLayer {
             // generic builds without the kernel still link cleanly.
             w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
             w4a16_gemm_t_m32_n64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
+            // Split-K route for K=γ verify out_proj/qkvz (ATLAS_SSM_OUT_SPLITK /
+            // ATLAS_SSM_QKVZ_SPLITK). try_kernel: absent on non-27b targets.
+            w4a16_gemm_t_m32_n64_splitk_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_splitk",
+            ),
+            reduce_splitk_k: super::super::try_kernel(gpu, "w4a16", "reduce_splitk_f32_to_bf16"),
+            ssm_splitk_workspace: std::sync::Mutex::new(None),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gdn_prefill_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_prefill")?,
@@ -250,6 +259,19 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy17_vsplit",
                 "gated_delta_rule_wy17_vsplit",
             ),
+            // LAZY Hi-writes wy17 + its companion replay kernel. Both live in
+            // the SAME PTX module as gdn_wy17_k. NULL on targets whose wy17
+            // module predates the lazy build → dispatch uses gdn_wy17_k.
+            gdn_wy17_lazy_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy17",
+                "gated_delta_rule_wy17_lazy",
+            ),
+            gdn_wy17_replay_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy17",
+                "gated_delta_rule_wy17_replay",
+            ),
             // M8A: tree-aware GDN kernel (gated_delta_rule_tree.cu). Sequential
             // per-token loop with parent_ids state load — enables non-flat
             // DDTree branches. NULL on targets that haven't compiled the
@@ -310,7 +332,40 @@ impl Qwen3SsmLayer {
         layer.sequential_qkvz = true;
         layer.qkvz_nvfp4_t = qkvz_nvfp4_t;
         layer.out_proj_nvfp4_t = out_proj_nvfp4_t;
+        layer.alloc_ssm_splitk_ws(config, gpu)?;
         Ok(layer)
+    }
+
+    /// Eagerly allocate the FP32 split-K workspace for the K=γ verify
+    /// out_proj / qkvz split-K routes (`ATLAS_SSM_OUT_SPLITK` /
+    /// `ATLAS_SSM_QKVZ_SPLITK`). Sized for the larger of the two enabled
+    /// routes: `[k_splits, 32, N]` FP32 where N = hidden (out_proj) or
+    /// qkvz_size (qkvz). Allocated at load time because `gpu.alloc` is
+    /// illegal during CUDA graph capture. No-op when both gates are off
+    /// or the split-K kernel symbols are missing from the PTX bundle.
+    fn alloc_ssm_splitk_ws(
+        &self,
+        config: &atlas_core::config::ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<()> {
+        let out_splits = super::super::ssm_out_splitk() as usize;
+        let qkvz_splits = super::super::ssm_qkvz_splitk() as usize;
+        if (out_splits == 0 && qkvz_splits == 0)
+            || self.w4a16_gemm_t_m32_n64_splitk_k.0 == 0
+            || self.reduce_splitk_k.0 == 0
+        {
+            return Ok(());
+        }
+        let bytes = std::cmp::max(
+            out_splits * config.hidden_size,
+            qkvz_splits * config.ssm_qkvz_size(),
+        ) * 32
+            * 4;
+        let mut slot = self.ssm_splitk_workspace.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(gpu.alloc(bytes)?);
+        }
+        Ok(())
     }
 
     /// Set native FP8 checkpoint weights for w8a16_gemv decode path.

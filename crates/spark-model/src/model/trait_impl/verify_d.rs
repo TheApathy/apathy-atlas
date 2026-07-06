@@ -565,14 +565,47 @@ impl TransformerModel {
         // would otherwise force the broken kernel. Setting the env var
         // skips the injection and lets the proven wy_k path run.
         let disable_tree_wy = std::env::var("ATLAS_DISABLE_TREE_WY").ok().as_deref() == Some("1");
-        if !disable_tree_wy
-            && use_graphs
-            && ddtree_parent_ids_dev.is_none()
-            && self.ddtree_parent_ids_capacity > 0
-            && k == self.ddtree_parent_ids_capacity
-        {
+        let flat_injected = super::commit_plan::flat_tree_wy_injection_applies(
+            disable_tree_wy,
+            use_graphs,
+            ddtree_parent_ids_dev.is_some(),
+            self.ddtree_parent_ids_capacity,
+            k,
+        );
+        if flat_injected {
             ddtree_parent_ids_dev = Some(self.ddtree_parent_ids_persistent);
         }
+        // Task #34 fix: the injected flat-chain verify runs
+        // `gated_delta_rule_tree_wy`, which leaves the live `h_state`
+        // UNTOUCHED (it writes per-token states into the intermediate pool
+        // only). The commit's full-accept fast path (`async_chkpt.rs`)
+        // previously read only the scheduler-set `ddtree_parent_ids_dev`
+        // stash to detect this — the injection was invisible, so a FULL
+        // accept committed the STALE pre-verify `h_state` (SSM state froze →
+        // non-lossless at high acceptance; observed at K=12 / γ=11 in the
+        // DSpark A/B). Record the injection on the model so the commit
+        // routes full accepts through `h_intermediate[K-1]`.
+        //
+        // The flag is only honored when the SSM dispatch would actually take
+        // the tree branch (`gdn_tree_k` loaded and `ATLAS_FORCE_WY17` unset —
+        // mirrors `trait_decode_batched_conv_gdn.rs`); otherwise the flat
+        // wy17/chunked kernels run, which DO write `h_state`.
+        // `any` assumes GDN kernel homogeneity: every SSM layer is built from
+        // the same PTX bundle, so either all have the tree kernel or none do
+        // (non-SSM layers return false). A mixed target would need a
+        // filtered `all` here — the per-layer dispatch checks its OWN handle,
+        // and a layer falling back to wy17/chunked writes h_state live,
+        // making the InterSlot commit source wrong for that layer.
+        let injection_routes_tree = flat_injected
+            && std::env::var("ATLAS_FORCE_WY17").ok().as_deref() != Some("1")
+            && self.layers.iter().any(|l| l.gdn_tree_kernel_loaded());
+        // Release/Acquire pairing with the commit-side swap: the scheduler
+        // calls verify and commit sequentially on one thread today, but the
+        // flag guards h_state commit-source selection (silent corruption if
+        // desynced), so pay the fence and stay correct under any future
+        // cross-thread step orchestration.
+        self.dflash_flat_tree_route
+            .store(injection_routes_tree, std::sync::atomic::Ordering::Release);
 
         // DFS reorder: re-stamp parent_ids in DFS frame so the SSM (GDN
         // tree-WY) kernel processes tokens in DFS order, matching the
@@ -705,6 +738,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev,
             tree_aware_attn,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         // ── Phase 2: CUDA graph capture / replay ──
@@ -1028,8 +1062,7 @@ impl TransformerModel {
             accepted_compact.iter().copied().max().unwrap_or(0) + 1
         };
         let planned = plan_kv_compaction_moves(accepted_compact, &inv_perm, pre_verify_len, k);
-        let moves: Vec<(usize, usize)> =
-            planned.iter().map(|m| (m.src_pos, m.dst_pos)).collect();
+        let moves: Vec<(usize, usize)> = planned.iter().map(|m| (m.src_pos, m.dst_pos)).collect();
         if moves.is_empty() {
             return Ok(());
         }

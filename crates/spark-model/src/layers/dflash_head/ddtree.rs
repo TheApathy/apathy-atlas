@@ -1103,11 +1103,7 @@ pub fn build_caterpillar_tail_payload(
 /// is never truncated (it is the trained-drafter baseline — the flat-safe
 /// fallback must stay byte-exact when B doesn't fire); chain B is truncated to
 /// the remaining budget. Returns a plain flat-A payload when B has no room.
-pub fn build_portfolio_payload(
-    chain_a: &[u32],
-    chain_b: &[u32],
-    max_nodes: usize,
-) -> TreePayload {
+pub fn build_portfolio_payload(chain_a: &[u32], chain_b: &[u32], max_nodes: usize) -> TreePayload {
     let a = chain_a.len().min(max_nodes);
     // Chain A always laid first (contiguous, slot == depth).
     let mut tree_token_ids: Vec<u32> = Vec::with_capacity(max_nodes);
@@ -1132,6 +1128,148 @@ pub fn build_portfolio_payload(
         tree_token_ids,
         parent_indices,
     }
+}
+
+/// One sibling branch request for [`build_free_slots_payload`]: a fork token
+/// that attaches BELOW spine depth `cliff_depth` (i.e. shares the parent of the
+/// spine node at that depth), optionally carrying a short re-rooted tail.
+#[derive(Debug, Clone)]
+pub struct FreeSlotBranch {
+    /// 1-based spine depth the fork attaches BELOW. The fork node itself has
+    /// tree depth `cliff_depth` (a sibling of `spine[cliff_depth-1]`).
+    pub cliff_depth: usize,
+    /// The alternative (e.g. drafter top-2) token at the cliff.
+    pub fork_token: u32,
+    /// Tokens continuing after the fork, re-rooted onto it (contiguous within
+    /// the branch). May be empty (a bare 1-node fork leaf).
+    pub tail: Vec<u32>,
+}
+
+/// Build a FREE-SLOTS branch-verify payload (`ATLAS_DFLASH_FREE_SLOTS=<N>`).
+///
+/// The insight (this branch's whole thesis): the K-token DFlash verify is
+/// weight-bandwidth-bound, so verifying K=32 costs the same wall-clock as
+/// K=17 — the free 15 slots are *free candidate tokens*. Rather than spend
+/// them uniformly, this builder spends them on SIBLING BRANCHES placed at the
+/// low-confidence draft positions where the linear chain statistically dies
+/// (the "cliffs"), following the DDTree / SAM-retrieval finding that a single
+/// well-placed fork clears the cliff far more often than deepening the chain.
+///
+/// ## Layout (compact indices, 1-based; slot 0 = bonus/root)
+///
+/// The full γ spine is laid FIRST at contiguous compact slots `1..=spine_len`
+/// (slot == depth, byte-identical to the flat baseline for every spine node —
+/// this is the losslessness anchor: when the target rides the top-1 chain the
+/// committed run is exactly the flat path). Then each requested branch is
+/// appended as its own contiguous run starting at the next free slot:
+///   * the fork node attaches to the spine node at compact slot
+///     `cliff_depth - 1` (its cliff parent), so it is a genuine SIBLING of
+///     `spine[cliff_depth-1]`;
+///   * the branch's tail nodes chain off the fork contiguously.
+///
+/// Branches are added in ASCENDING cliff depth (shallowest first — EAGLE-2:
+/// shallow accept dominates) until `max_nodes` is exhausted. A branch is added
+/// whole or with a tail shortened to the remaining slots; the fork node is
+/// always laid, and the tail is truncated (never the fork) when the budget runs
+/// out — so no partial branch ever references a slot beyond the budget.
+///
+/// ## Why this is lossless (same argument as portfolio / caterpillar)
+///
+/// The greedy DDTree walker ([`greedy_sample_ddtree`] / `_full`) commits a node
+/// ONLY when its token equals the target's argmax at its parent's row, and the
+/// bonus is always the target's greedy at the path tip. A sibling branch merely
+/// gives the walk a SECOND (third, …) candidate to match at each cliff — it can
+/// never change which token the target commits. So the committed stream is
+/// byte-identical to the flat γ chain whenever the flag is off OR no branch ever
+/// matches; when a branch DOES match, it accepts strictly MORE of the target's
+/// own greedy continuation. Depth-correct RoPE/attention for the deep branch
+/// tails requires the DFS-reorder verify path
+/// (`ATLAS_DDTREE_DFS_REORDER=1` + `ATLAS_DDTREE_TREE_TOKENS_VERIFY=1`); under
+/// pure flat metadata only the spine (slot==depth) and each branch's depth-1
+/// fork are guaranteed byte-exact, and the greedy oracle keeps output correct
+/// regardless (a mis-conditioned deep row simply fails to match and is
+/// rejected).
+///
+/// Returns a plain flat spine payload (parents `[-1,0,1,…]`) when no branch
+/// fits or `branches` is empty — byte-identical to the drafter baseline.
+pub fn build_free_slots_payload(
+    spine: &[u32],
+    branches: &[FreeSlotBranch],
+    max_nodes: usize,
+) -> TreePayload {
+    let spine_len = spine.len().min(max_nodes);
+    let mut tree_token_ids: Vec<u32> = Vec::with_capacity(max_nodes);
+    let mut parent_indices: Vec<i32> = Vec::with_capacity(max_nodes);
+    // Spine: contiguous, slot == depth. spine[0] → root(-1); spine[i]→spine[i-1].
+    for i in 0..spine_len {
+        tree_token_ids.push(spine[i]);
+        parent_indices.push(i as i32 - 1);
+    }
+    // Branches in ascending cliff depth (shallowest first).
+    let mut ordered: Vec<&FreeSlotBranch> = branches
+        .iter()
+        .filter(|b| b.cliff_depth >= 1 && b.cliff_depth <= spine_len)
+        .collect();
+    ordered.sort_by_key(|b| b.cliff_depth);
+
+    for b in ordered {
+        let remaining = max_nodes.saturating_sub(tree_token_ids.len());
+        if remaining == 0 {
+            break;
+        }
+        // The fork's cliff parent is the spine node at compact slot
+        // `cliff_depth - 1`. Compact slot s → payload index s-1. For a fork at
+        // depth 1 (cliff_depth == 1) the parent is the root (payload parent -1).
+        let cliff_parent_payload_idx: i32 = b.cliff_depth as i32 - 2;
+        // Fork node.
+        tree_token_ids.push(b.fork_token);
+        parent_indices.push(cliff_parent_payload_idx);
+        let mut prev = tree_token_ids.len() as i32 - 1; // fork's payload idx
+        // Tail (bounded by remaining budget after the fork node).
+        let tail_budget = remaining.saturating_sub(1);
+        for &t in b.tail.iter().take(tail_budget) {
+            tree_token_ids.push(t);
+            parent_indices.push(prev);
+            prev = tree_token_ids.len() as i32 - 1;
+        }
+    }
+
+    TreePayload {
+        tree_token_ids,
+        parent_indices,
+    }
+}
+
+/// Pick the branch cliffs for [`build_free_slots_payload`] from per-row top-2
+/// logit margins. Returns the compact spine depths (1-based) whose top1−top2
+/// margin is below `margin_thresh`, ASCENDING (shallowest first — the chain
+/// dies at the FIRST cliff it reaches, so branching a deeper one the walk never
+/// reaches is wasted), capped at `max_branches`.
+///
+/// `margins[r]` is the top1−top2 margin at spine row `r` (0-based); a fork at
+/// depth `r+1` attaches below the spine node at depth `r` (compact slot `r`),
+/// mirroring the caterpillar/branch cliff convention in `propose.rs`. Rows 0 and
+/// the last row are excluded (row 0 gates the whole chain via the bonus; the
+/// last spine node has no room for a meaningful sibling continuation).
+pub fn pick_free_slot_cliffs(
+    margins: &[f32],
+    margin_thresh: f32,
+    max_branches: usize,
+) -> Vec<usize> {
+    let n = margins.len();
+    if n < 2 || max_branches == 0 {
+        return Vec::new();
+    }
+    let mut cliffs = Vec::new();
+    for r in 1..n - 1 {
+        if margins[r] < margin_thresh {
+            cliffs.push(r + 1); // cliff_depth is 1-based (r is 0-based row)
+            if cliffs.len() >= max_branches {
+                break;
+            }
+        }
+    }
+    cliffs
 }
 
 /// Map a DDTree greedy walk's `accepted_compact_indices` to the kernel
@@ -1305,8 +1443,7 @@ pub fn plan_kv_compaction_moves(
         .collect();
     let mut scratch_iter = scratch_slots.drain(..);
     // Map: original src_pos -> the scratch pos we evacuated it to.
-    let mut relocated: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
+    let mut relocated: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for &(src, _) in &want {
         // Evacuate each conflicting source (a source that is also some move's
         // destination) exactly once, into a free tail scratch slot. If scratch
@@ -1989,6 +2126,158 @@ mod tests {
         assert_eq!(full.output_token_ids.first().copied(), Some(10));
     }
 
+    // ── FREE SLOTS branch placement (ATLAS_DFLASH_FREE_SLOTS) ─────────────
+
+    #[test]
+    fn free_slots_no_branches_is_flat_spine() {
+        // No branches → plain flat chain, byte-identical to the drafter path.
+        let p = build_free_slots_payload(&[10, 20, 30, 40], &[], 8);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn free_slots_single_shallow_fork_layout() {
+        // Spine [10,20,30,40]; one fork at cliff_depth 2 (below spine[1]=20),
+        // token 99, tail [31,41]. Spine → slots 1..4 (parents -1,0,1,2). Fork at
+        // slot 5 attaches to spine slot 1 (cliff_depth-1=1 → payload idx 0).
+        // Tail 31→slot6 (parent=fork idx4), 41→slot7 (parent idx5).
+        let b = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 99,
+            tail: vec![31, 41],
+        };
+        let p = build_free_slots_payload(&[10, 20, 30, 40], &[b], 16);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40, 99, 31, 41]);
+        //                                spine ------------  fork tail--
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, /*fork→spine[0]*/ 0, 4, 5]);
+    }
+
+    #[test]
+    fn free_slots_depth1_fork_attaches_to_root() {
+        // cliff_depth 1 → the fork is a sibling of spine[0], attaching to the
+        // root (payload parent -1). This is the portfolio-style root fork.
+        let b = FreeSlotBranch {
+            cliff_depth: 1,
+            fork_token: 77,
+            tail: vec![88],
+        };
+        let p = build_free_slots_payload(&[10, 20], &[b], 16);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 77, 88]);
+        assert_eq!(p.parent_indices, vec![-1, 0, /*fork→root*/ -1, 2]);
+    }
+
+    #[test]
+    fn free_slots_branches_ordered_shallowest_first() {
+        // Two branches given deepest-first; builder must lay the shallower one
+        // (cliff_depth 2) before the deeper (cliff_depth 3).
+        let deep = FreeSlotBranch { cliff_depth: 3, fork_token: 300, tail: vec![] };
+        let shallow = FreeSlotBranch { cliff_depth: 2, fork_token: 200, tail: vec![] };
+        let p = build_free_slots_payload(&[1, 2, 3, 4], &[deep, shallow], 16);
+        // Spine slots 1..4, then fork@2 (tok 200, parent spine slot1→idx0),
+        // then fork@3 (tok 300, parent spine slot2→idx1).
+        assert_eq!(p.tree_token_ids, vec![1, 2, 3, 4, 200, 300]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, 0, 1]);
+    }
+
+    #[test]
+    fn free_slots_respects_max_nodes_budget() {
+        // max_nodes = 5: spine (4 nodes) + fork node (1) = 5, tail dropped.
+        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![31, 41, 51] };
+        let p = build_free_slots_payload(&[10, 20, 30, 40], &[b], 5);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40, 99]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, 0]);
+        assert!(p.tree_token_ids.len() <= 5);
+    }
+
+    #[test]
+    fn free_slots_no_room_for_any_branch_is_flat_spine() {
+        // Spine already fills the budget → no branch slots → plain flat chain.
+        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![31] };
+        let p = build_free_slots_payload(&[10, 20, 30, 40], &[b], 4);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn free_slots_out_of_range_cliff_ignored() {
+        // cliff_depth 9 > spine_len 4 → filtered out; cliff_depth 0 invalid.
+        let bad_deep = FreeSlotBranch { cliff_depth: 9, fork_token: 1, tail: vec![] };
+        let bad_zero = FreeSlotBranch { cliff_depth: 0, fork_token: 2, tail: vec![] };
+        let good = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![] };
+        let p = build_free_slots_payload(&[10, 20, 30, 40], &[bad_deep, bad_zero, good], 16);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40, 99]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn free_slots_shallow_fork_commits_under_tree_semantics() {
+        // Spine [10,20,30], fork at cliff_depth 2 (below spine[1]=20) carrying
+        // token 99 and tail [98]. When the target diverges to the fork at the
+        // cliff (row 1 argmax = 99), the fork + tail commit — the free-slot WIN.
+        //   compact 1: 10 (parent root)
+        //   compact 2: 20 (parent 1)
+        //   compact 3: 30 (parent 2)
+        //   compact 4: 99 fork (parent spine slot1 → payload idx 0 → compact 1)
+        //   compact 5: 98 tail (parent 4)
+        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![98] };
+        let p = build_free_slots_payload(&[10, 20, 30], &[b], 16);
+        assert_eq!(p.tree_token_ids, vec![10, 20, 30, 99, 98]);
+        assert_eq!(p.parent_indices, vec![-1, 0, 1, 0, 3]);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // rows: [root, c1, c2, c3, c4, c5]
+        // root→10 (accept c1); c1(10)→99 (target picks the FORK, not spine 20);
+        // c4(99)→98 (accept the tail); c5(98)→55 bonus.
+        let argmax = vec![10u32, 99, 0, 0, 98, 55];
+        let s = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        assert_eq!(s.output_token_ids, vec![10, 99, 98, 55]);
+        assert_eq!(s.accepted_compact_indices, vec![1, 4, 5]);
+        // Last accepted kernel state slot = max compact index.
+        assert_eq!(last_accepted_inter_slot(&s.accepted_compact_indices), 5);
+    }
+
+    #[test]
+    fn free_slots_spine_ride_is_byte_identical_to_flat() {
+        // When the target rides the top-1 spine, the committed run is exactly
+        // the flat chain — the losslessness anchor. Fork present but never hit.
+        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![98] };
+        let p = build_free_slots_payload(&[10, 20, 30], &[b], 16);
+        let r = req(&p.tree_token_ids, &p.parent_indices);
+        // root→10, c1→20 (spine, not fork), c2→30, c3→77 bonus.
+        let argmax = vec![10u32, 20, 30, 77, 0, 0];
+        let flat = build_free_slots_payload(&[10, 20, 30], &[], 16);
+        let rf = req(&flat.tree_token_ids, &flat.parent_indices);
+        let argmax_flat = vec![10u32, 20, 30, 77];
+        let s = greedy_sample_ddtree_full(&r, &argmax).unwrap();
+        let sf = greedy_sample_ddtree_full(&rf, &argmax_flat).unwrap();
+        assert_eq!(s.output_token_ids, sf.output_token_ids);
+        assert_eq!(s.output_token_ids, vec![10, 20, 30, 77]);
+        assert_eq!(s.accepted_compact_indices, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn pick_free_slot_cliffs_first_low_margin_ascending() {
+        // margins: row0 huge (excluded), row1 low, row2 high, row3 low, last excluded.
+        let margins = vec![10.0f32, 0.5, 5.0, 0.4, 6.0, 0.2 /*last, excluded*/];
+        let cliffs = pick_free_slot_cliffs(&margins, 1.0, 8);
+        // rows 1 and 3 below threshold → cliff depths 2 and 4 (r+1), ascending.
+        assert_eq!(cliffs, vec![2, 4]);
+    }
+
+    #[test]
+    fn pick_free_slot_cliffs_caps_at_max_branches() {
+        let margins = vec![10.0f32, 0.1, 0.1, 0.1, 0.1, 9.0];
+        let cliffs = pick_free_slot_cliffs(&margins, 1.0, 2);
+        assert_eq!(cliffs.len(), 2);
+        assert_eq!(cliffs, vec![2, 3]); // first two low-margin rows, ascending
+    }
+
+    #[test]
+    fn pick_free_slot_cliffs_none_when_all_confident() {
+        let margins = vec![10.0f32, 9.0, 8.0, 7.0];
+        assert!(pick_free_slot_cliffs(&margins, 1.0, 8).is_empty());
+    }
+
     #[test]
     fn sampler_flat_safe_truncates_at_branch_divergence() {
         // Tree: root → 10 → 20a, 20b; (siblings at depth 2).
@@ -2374,7 +2663,10 @@ mod tests {
     fn compact_to_kernel_identity_when_no_dfs() {
         assert_eq!(compact_to_kernel_slot(0, &[]), 0);
         assert_eq!(compact_to_kernel_slot(3, &[]), 3);
-        assert_eq!(map_compact_path_to_kernel(&[1, 2, 3, 4], &[]), vec![1, 2, 3, 4]);
+        assert_eq!(
+            map_compact_path_to_kernel(&[1, 2, 3, 4], &[]),
+            vec![1, 2, 3, 4]
+        );
     }
 
     /// Out-of-range compact index passes through unmapped (defensive; never
@@ -2420,8 +2712,14 @@ mod tests {
         assert_eq!(
             moves,
             vec![
-                KvMove { src_pos: 104, dst_pos: 101 },
-                KvMove { src_pos: 105, dst_pos: 102 },
+                KvMove {
+                    src_pos: 104,
+                    dst_pos: 101
+                },
+                KvMove {
+                    src_pos: 105,
+                    dst_pos: 102
+                },
             ]
         );
     }
@@ -2453,8 +2751,14 @@ mod tests {
         assert_eq!(
             moves,
             vec![
-                KvMove { src_pos: 103, dst_pos: 101 },
-                KvMove { src_pos: 104, dst_pos: 102 },
+                KvMove {
+                    src_pos: 103,
+                    dst_pos: 101
+                },
+                KvMove {
+                    src_pos: 104,
+                    dst_pos: 102
+                },
             ]
         );
     }

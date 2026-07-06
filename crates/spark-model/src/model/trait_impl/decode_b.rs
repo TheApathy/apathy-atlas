@@ -392,6 +392,8 @@ impl TransformerModel {
                         conv_state_checkpoint: None,
                         h_state_intermediates: Vec::new(),
                         conv_state_intermediates: Vec::new(),
+                        wy17_kv_retain: None,
+                        wy17_gate_retain: None,
                     }));
                     ssm_idx += 1;
                 } else {
@@ -418,6 +420,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         let prefill_ctx = ForwardContext {
@@ -431,6 +434,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {

@@ -135,6 +135,7 @@ impl TransformerModel {
                         ddtree_parent_ids_dev: None,
                         tree_aware_attn: None,
                         ssm_multi_seq_ptr_table_override: None,
+                        self_spec_sparse_draft: None,
                     };
 
                     let h_t = hidden.offset(t * h * fp32);
@@ -165,6 +166,7 @@ impl TransformerModel {
                     ddtree_parent_ids_dev: None,
                     tree_aware_attn: None,
                     ssm_multi_seq_ptr_table_override: None,
+                    self_spec_sparse_draft: None,
                 };
 
                 layer.decode_batched(

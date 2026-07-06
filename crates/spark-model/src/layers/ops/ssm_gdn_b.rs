@@ -282,6 +282,113 @@ pub fn gdn_decode_wy17(
         .launch(stream)
 }
 
+/// LAZY Hi-writes variant of `gdn_decode_wy17` (`ATLAS_WY17_LAZY=J`).
+/// Identical I/O plus a trailing `lazy_j`. lazy_j==1 is bit-identical to
+/// `gdn_decode_wy17` (all 16 slots written); lazy_j>1 persists only
+/// checkpoint slots (0, K-2, every J-th). Outputs and final h_state are
+/// byte-identical for every lazy_j — only the intermediate DRAM write
+/// footprint shrinks. Skipped slots are reconstructed via `gdn_wy17_replay`
+/// by the commit path when a partial accept targets one.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_wy17_lazy(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter_base: DevicePtr,
+    inter_stride_floats: u32,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    lazy_j: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter_base)
+        .arg_u32(inter_stride_floats)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .arg_u32(lazy_j)
+        .launch(stream)
+}
+
+/// Reconstruct ONE skipped intermediate H slot for the lazy-wy17 commit path.
+/// Re-seeds from the pre-verify ROOT state (`h_root`) and replays the FP32
+/// WY recurrence for tokens [0..=target_slot], writing the reconstructed
+/// H-after-target into `out_h` (the caller points this at the live h_state).
+/// Bit-exact vs the state the main kernel would have persisted at `target_slot`.
+/// Only invoked on a partial accept whose slot is not a checkpoint.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_wy17_replay(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_root: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    out_h: DevicePtr,
+    ckpt_first_token: u32,
+    target_slot: u32,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_root)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(out_h)
+        .arg_u32(ckpt_first_token)
+        .arg_u32(target_slot)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .launch(stream)
+}
+
 /// V-DIM SPLIT variant of `gdn_decode_wy17`: splits the v_dim columns of
 /// the per-head state across `v_split` CTAs (gridDim.z) to raise occupancy
 /// on the 48-CTA-limited wy17 launch. Kernel: `gated_delta_rule_wy17_vsplit`.

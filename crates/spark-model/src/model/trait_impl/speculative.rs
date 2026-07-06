@@ -91,6 +91,16 @@ impl TransformerModel {
         TransformerModel::decode_draft(self, token, seq, stream)
     }
 
+    pub(super) fn decode_draft_sparse_dispatch(
+        &self,
+        token: u32,
+        thresh_frac: f32,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        TransformerModel::decode_draft_sparse(self, token, thresh_frac, seq, stream)
+    }
+
     pub(super) fn save_hidden_for_mtp_dispatch(
         &self,
         token_idx: usize,

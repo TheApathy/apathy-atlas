@@ -293,6 +293,15 @@ impl TransformerModel {
                                     ));
                             }
                         }
+                        // WY17 LAZY-commit retention pointers follow the slot.
+                        if ssm.wy17_kv_retain.is_some() {
+                            ssm.wy17_kv_retain =
+                                self.ssm_pool.wy17_kv_retain(ssm_layer_idx, new_slot);
+                        }
+                        if ssm.wy17_gate_retain.is_some() {
+                            ssm.wy17_gate_retain =
+                                self.ssm_pool.wy17_gate_retain(ssm_layer_idx, new_slot);
+                        }
                     }
                 }
                 ssm_layer_idx += 1;
@@ -329,6 +338,15 @@ impl TransformerModel {
                 }
             }
         }
+        // NOTE (ATLAS_MULTISEQ_GRAPHS): `piecewise_decode_graphs` is
+        // intentionally NOT invalidated on compaction. Those segment graphs
+        // are keyed by `(padded_n, seg_id)` and bake NO per-slot address —
+        // the SSM h_state/conv_state pointers are read from the layer-stable
+        // ptr scratch, which the piecewise dispatcher refreshes from each
+        // sequence's (post-compaction) `layer_states` before every replay.
+        // So a compaction that changes a seq's slot is transparent: the next
+        // pre-replay `multiseq_refresh_ptr_table` uploads the new slot's
+        // pointers and the same cached graph replays correctly.
         Ok(())
     }
 

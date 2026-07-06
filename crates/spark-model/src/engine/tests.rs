@@ -365,3 +365,37 @@ fn test_argmax_bf16_basic() {
     ];
     assert_eq!(argmax_bf16(&data), 1);
 }
+
+/// Dispatch-gating: the default `decode_draft_sparse` trait impl (which the
+/// MockModel does NOT override) must delegate to `decode_draft` — proving that
+/// when the sparse feature is unavailable the ORIGINAL draft path runs
+/// byte-for-byte. We verify both drafters produce the identical argmax token
+/// and identical seq_len advancement from the same starting state.
+#[test]
+fn test_decode_draft_sparse_defaults_to_decode_draft() {
+    let model = MockModel::new(vec![10, 20, 30, 40]);
+
+    // Run the DENSE draft once.
+    let mut seq_dense = model.alloc_sequence().unwrap();
+    let dense_logits = model.decode_draft(7, &mut seq_dense, 0).unwrap();
+    let dense_tok = model.argmax_on_device(dense_logits, 0).unwrap();
+    let dense_len = seq_dense.seq_len;
+
+    // Run the SPARSE draft (default trait impl → decode_draft) from the same
+    // starting state. The threshold argument is ignored by the default impl.
+    let mut seq_sparse = model.alloc_sequence().unwrap();
+    let sparse_logits = model
+        .decode_draft_sparse(7, 0.01, &mut seq_sparse, 0)
+        .unwrap();
+    let sparse_tok = model.argmax_on_device(sparse_logits, 0).unwrap();
+    let sparse_len = seq_sparse.seq_len;
+
+    assert_eq!(
+        dense_tok, sparse_tok,
+        "OFF-path: sparse draft default must yield the SAME token as dense draft"
+    );
+    assert_eq!(
+        dense_len, sparse_len,
+        "OFF-path: sparse draft default must advance seq_len identically"
+    );
+}

@@ -275,6 +275,7 @@ impl TransformerModel {
                 ddtree_parent_ids_dev: None,
                 tree_aware_attn: None,
                 ssm_multi_seq_ptr_table_override: None,
+                self_spec_sparse_draft: None,
             }
         };
 
@@ -459,6 +460,139 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
+        };
+
+        // Eager layer loop: skip SSM layers, run attention layers only
+        for (i, layer) in self.layers.iter().enumerate() {
+            if self.config.layer_type(i) == LayerType::LinearAttention {
+                continue; // Skip SSM layers
+            }
+            layer.decode(
+                hidden,
+                residual,
+                seq.layer_states[i].as_mut(),
+                &mut kv_cache,
+                seq.seq_len,
+                &mut seq.block_table,
+                &mut seq.disk_block_ids,
+                &mut seq.disk_last_offloaded_per_layer,
+                &ctx,
+                stream,
+            )?;
+        }
+
+        // Final norm + LM head
+        let normed = self.buffers.norm_output();
+        let h = self.config.hidden_size as u32;
+        let eps = self.config.rms_norm_eps as f32;
+        ops::rms_norm(
+            self.gpu.as_ref(),
+            self.rms_norm_kernel,
+            hidden,
+            &self.final_norm,
+            normed,
+            1,
+            h,
+            eps,
+            stream,
+        )?;
+        self.lm_head(normed, stream)?;
+
+        seq.tokens.push(token);
+        seq.seq_len += 1;
+
+        Ok(self.decode_logits_ptr())
+    }
+
+    /// SPARSE self-speculative draft: identical layer-skip shape to
+    /// `decode_draft` (SSM layers skipped, so rewind stays a trivial truncate —
+    /// NO new SSM checkpoint/rollback), but the attention layers' dense FFN
+    /// runs the column-sparse DRAFT path (`forward_draft_sparse`) instead of
+    /// the exact dense GEMV. Selected by `step_self_spec` when
+    /// `ATLAS_SELF_SPEC_SPARSE=1`.
+    ///
+    /// The only difference from `decode_draft` is `self_spec_sparse_draft:
+    /// Some(thresh)` on the `ForwardContext` — that flag makes
+    /// `FfnComponent::forward` route dense FFN layers through the sparse GEMV.
+    /// The draft need NOT be bit-exact: the dense verify (`decode_verify`,
+    /// untouched) is the lossless oracle.
+    pub(super) fn decode_draft_sparse(
+        &self,
+        token: u32,
+        thresh_frac: f32,
+        seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<DevicePtr> {
+        let stream = self.gpu.default_stream();
+        let hidden = self.buffers.hidden_states();
+        let residual = self.buffers.residual();
+
+        let mut kv_cache = self.kv_cache.lock();
+
+        // 1. Embedding lookup
+        self.embed(token, hidden, stream)?;
+
+        // 2. Pre-allocate KV cache blocks + upload attention metadata
+        let bs = kv_cache.block_size();
+        let blocks_needed = (seq.seq_len / bs) + 1;
+        ensure_blocks_through_decode(
+            seq,
+            blocks_needed - 1,
+            &mut kv_cache,
+            self.prefix_cache.as_ref(),
+            self.gpu.as_ref(),
+            stream,
+        )?;
+
+        let meta_base = self.buffers.scratch().offset(32768);
+        let max_blocks = seq.block_table.len() as u32;
+
+        let pos_val = seq.seq_len as u32;
+        self.gpu
+            .copy_h2d_async(&pos_val.to_le_bytes(), meta_base, stream)?;
+
+        let block_idx = seq
+            .physical_block_for(seq.seq_len / bs)
+            .unwrap_or(self.dummy_kv_block);
+        let global_slot = (block_idx as i64) * (bs as i64) + ((seq.seq_len % bs) as i64);
+        self.gpu
+            .copy_h2d_async(&global_slot.to_le_bytes(), meta_base.offset(8), stream)?;
+
+        let actual_seq_len = (seq.seq_len + 1) as i32;
+        self.gpu
+            .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
+
+        let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
+        let bt_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
+        self.gpu
+            .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
+
+        let attn_metadata = AttnMetadataDev {
+            positions: meta_base,
+            positions_h: meta_base,
+            positions_w: meta_base,
+            slot: meta_base.offset(8),
+            seq_len: meta_base.offset(16),
+            block_table: meta_base.offset(256),
+            max_blocks_per_seq: max_blocks,
+            num_seqs: 1,
+        };
+
+        let ctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            attn_metadata: Some(attn_metadata),
+            profile: false,
+            comm: self.comm_ref(),
+            graph_capture: false, // Eager mode — no CUDA graph (sparse GEMV reads back keep_len)
+            ddtree_parent_ids_dev: None,
+            tree_aware_attn: None,
+            ssm_multi_seq_ptr_table_override: None,
+            // The ONLY difference vs decode_draft: request the sparse FFN path.
+            self_spec_sparse_draft: Some(thresh_frac),
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

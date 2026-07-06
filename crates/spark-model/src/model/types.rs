@@ -36,6 +36,17 @@ pub struct TransformerModel {
     /// decide flat (gdn_wy17_k) vs tree-aware (gdn_tree_k) kernel.
     /// `None` outside DDTree verify or when payload is flat-chain.
     pub ddtree_parent_ids_dev: Mutex<Option<spark_runtime::gpu::DevicePtr>>,
+    /// Task #34: TRUE when the K=γ verify that just ran took the graph-safe
+    /// FLAT-CHAIN tree_wy injection (verify_d.rs substitutes the persistent
+    /// linear-chain parent_ids at `k == ddtree_parent_ids_capacity` when
+    /// `ATLAS_DISABLE_TREE_WY` is unset and CUDA graphs are on). The injected
+    /// route runs `gated_delta_rule_tree_wy`, which leaves the live `h_state`
+    /// UNTOUCHED — the commit must read this flag (in addition to the
+    /// scheduler-set `ddtree_parent_ids_dev` stash) to route a FULL accept
+    /// through the `h_intermediate[K-1]` copy path instead of the stale
+    /// `h_state` fast path. Written by every `decode_verify_graphed_kgamma`
+    /// call; consumed (swap-to-false) by `commit_verify_state_async`.
+    pub dflash_flat_tree_route: std::sync::atomic::AtomicBool,
     /// Length of the parent_ids tensor above (= num_tree_tokens = K verify).
     pub ddtree_num_tree_tokens: Mutex<usize>,
     /// CUDA-graph-safe persistent parent_ids buffer for the K=γ verify
@@ -195,6 +206,18 @@ pub struct TransformerModel {
     ///    active. When a slot is freed, all entries containing it are dropped
     ///    (`free_sequence`).
     pub(super) batch_decode_graphs: Mutex<HashMap<(Vec<usize>, usize), GraphHandle>>,
+    /// Cached CUDA graphs for the **piecewise** multi-seq decode path
+    /// (`ATLAS_MULTISEQ_GRAPHS=1`, see `decode_batch_dispatch_piecewise`).
+    ///
+    /// Keyed by `(padded_n, segment_id)` ONLY — no slot tuple. Each entry
+    /// is a captured run of consecutive address-stable layers (SSM/FFN) or
+    /// the final-norm+LM-head tail. Attention layers are NOT represented
+    /// here; they run eagerly between segment replays. Because every
+    /// captured segment reads only fixed device addresses (SSM ptr table,
+    /// attn metadata base, model buffers — all re-uploaded before replay),
+    /// a segment graph replays for any active slot set of the same padded
+    /// size, so entries are NEVER invalidated on `free_sequence`.
+    pub(super) piecewise_decode_graphs: Mutex<HashMap<(usize, usize), GraphHandle>>,
     /// Pre-allocated SSM state pool for stable GPU addresses across graph replays.
     pub(super) ssm_pool: SsmStatePool,
     /// SSM state snapshot pool for Marconi prefix caching.

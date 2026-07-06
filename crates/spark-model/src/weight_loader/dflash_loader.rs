@@ -346,10 +346,16 @@ pub fn load_dflash_weights(
                  back to the VanillaMarkov bias (ignores the gate)."
             );
         }
-        let w1 = dense(drafter_store, &format!("{prefix}markov_head.markov_w1.weight"))
-            .context("DFlash Markov head: load markov_w1.weight")?;
-        let w2 = dense(drafter_store, &format!("{prefix}markov_head.markov_w2.weight"))
-            .context("DFlash Markov head: load markov_w2.weight")?;
+        let w1 = dense(
+            drafter_store,
+            &format!("{prefix}markov_head.markov_w1.weight"),
+        )
+        .context("DFlash Markov head: load markov_w1.weight")?;
+        let w2 = dense(
+            drafter_store,
+            &format!("{prefix}markov_head.markov_w2.weight"),
+        )
+        .context("DFlash Markov head: load markov_w2.weight")?;
         tracing::info!(
             "DFlash DSpark Markov head loaded: rank={}, type={} (bigram logit bias applied \
              LEFT-TO-RIGHT before per-position argmax; set ATLAS_DFLASH_MARKOV=0 to disable)",

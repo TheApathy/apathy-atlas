@@ -69,6 +69,8 @@ mod ssm_gdn_a;
 mod ssm_gdn_b;
 #[path = "ops/ssm_gdn_batched.rs"]
 mod ssm_gdn_batched;
+#[path = "ops/sparsity.rs"]
+mod sparsity;
 #[path = "ops/ssm_mamba.rs"]
 mod ssm_mamba;
 #[path = "ops/ssm_preproc.rs"]
@@ -101,6 +103,7 @@ pub use prefill_attn_main_b::*;
 pub use prefill_attn_turbok::*;
 pub use quant_dispatch::*;
 pub use sampling::*;
+pub use sparsity::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_b::*;
 pub use ssm_gdn_batched::*;

@@ -103,6 +103,19 @@ pub struct Qwen3SsmLayer {
     /// `w4a16_gemm_t` (only 40 CTAs at N=5120, SM-starved). KernelHandle(0)
     /// if the kernel is not compiled for this target.
     w4a16_gemm_t_m32_n64_k: KernelHandle,
+    /// Split-K variant of the m32_n64 kernel + its FP32→BF16 reduce.
+    /// Used by the K=γ verify `out_proj` (ATLAS_SSM_OUT_SPLITK) and
+    /// `qkvz` (ATLAS_SSM_QKVZ_SPLITK) routes: the single-slice out_proj
+    /// fields only 80 CTAs on 48 SMs (floor-map measured 28% of the DRAM
+    /// floor — 235µs vs 66µs); slicing K across gridDim.z into an FP32
+    /// workspace reaches 84% (91µs). Mirrors the proven `ffn_down`
+    /// split-K path (lossless FP32 partials, token-exact). Handle 0 when
+    /// the PTX bundle lacks the kernels — routes silently stay off.
+    w4a16_gemm_t_m32_n64_splitk_k: KernelHandle,
+    reduce_splitk_k: KernelHandle,
+    /// Lazily-allocated FP32 split-K workspace [k_splits≤8, 32, max_n].
+    /// Allocated at load time (pre-graph-capture) by `alloc_ssm_splitk_ws`.
+    ssm_splitk_workspace: std::sync::Mutex<Option<DevicePtr>>,
     w4a16_gemv_batch2_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     gdn_prefill_k: KernelHandle,
@@ -201,6 +214,16 @@ pub struct Qwen3SsmLayer {
     /// when the kernel isn't in the active target's PTX bundle → the K=17
     /// path uses `gdn_wy17_k` unchanged.
     gdn_wy17_vsplit_k: KernelHandle,
+    /// LAZY Hi-writes wy17 (`gated_delta_rule_wy17_lazy`): takes runtime
+    /// `lazy_j`; lazy_j==1 is bit-identical to `gdn_wy17_k`, lazy_j>1
+    /// persists only checkpoint intermediate slots (86%-of-traffic cut).
+    /// NULL handle when not in the active target's PTX bundle → dispatch
+    /// uses `gdn_wy17_k` (all slots) unchanged. Gated by `ATLAS_WY17_LAZY`.
+    gdn_wy17_lazy_k: KernelHandle,
+    /// Replay kernel (`gated_delta_rule_wy17_replay`) that reconstructs one
+    /// skipped intermediate slot bit-exactly for the commit path under
+    /// lazy_j>1. NULL when not compiled. Exposed for async_chkpt wiring.
+    pub(crate) gdn_wy17_replay_k: KernelHandle,
     /// M8A: tree-aware GDN kernel for DDTree verify with non-flat branches.
     /// Sequential per-token loop with parent_ids state load. NULL handle
     /// when not compiled for the active target.
@@ -472,6 +495,51 @@ impl TransformerLayer for Qwen3SsmLayer {
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         self.alloc_state_inner(gpu)
+    }
+
+    fn multiseq_graph_safe(&self, num_seqs: usize) -> bool {
+        self.multi_seq_kernel_path_active(num_seqs)
+    }
+
+    fn multiseq_refresh_ptr_table<'a, 'b: 'a>(
+        &self,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        num_seqs: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        self.refresh_multi_seq_ptr_table(states, num_seqs, gpu, stream)
+    }
+
+    fn wy17_replay_kernel(&self) -> KernelHandle {
+        self.gdn_wy17_replay_k
+    }
+
+    fn gdn_tree_kernel_loaded(&self) -> bool {
+        self.gdn_tree_k.0 != 0
+    }
+
+    fn wy17_lazy_engaged(&self, num_tokens: usize) -> bool {
+        // MUST mirror the `use_lazy` computation in
+        // `trait_decode_batched_conv_gdn.rs` (wy17 branch) exactly: the lazy
+        // wy17 kernel skips non-checkpoint intermediate H writes, and the
+        // commit may replay a skipped slot ONLY when that kernel actually
+        // produced this verify's intermediates. Everything here is a pure
+        // function of `num_tokens` + process-constant env gates + kernel
+        // handles, so it is safe under CUDA-graph replay (unlike per-step
+        // mutable state, which would go stale on replayed steps).
+        if num_tokens != 17 || self.gdn_wy17_k.0 == 0 {
+            // The lazy kernel is only dispatched from the `num_tokens == 17`
+            // branch; every other K runs chunked/fused kernels that persist
+            // ALL intermediate slots.
+            return false;
+        }
+        let use_vsplit = crate::layers::wy17_split() > 0 && self.gdn_wy17_vsplit_k.0 != 0;
+        crate::layers::wy17_lazy() > 1
+            && self.gdn_wy17_lazy_k.0 != 0
+            && self.gdn_wy17_replay_k.0 != 0
+            && crate::layers::wy17_lazy_commit()
+            && !use_vsplit
     }
 }
 

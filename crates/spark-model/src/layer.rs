@@ -57,6 +57,16 @@ pub struct SsmLayerState {
     pub h_state_intermediates: Vec<DevicePtr>,
     /// Intermediate conv_state snapshots during batched verification.
     pub conv_state_intermediates: Vec<DevicePtr>,
+    /// WY17 LAZY commit retention: full per-verify k/q/v buffer
+    /// (`conv_out_buf` = `[K, conv_dim]` BF16) copied out of the shared
+    /// forward-context scratch during the lazy wy17 verify, so the commit
+    /// path can feed the SAME inputs to `gated_delta_rule_wy17_replay` when a
+    /// partial accept lands on a skipped (non-checkpoint) intermediate slot.
+    /// `None` unless `ATLAS_WY17_LAZY_COMMIT=1`. Allocated lazily.
+    pub wy17_kv_retain: Option<DevicePtr>,
+    /// WY17 LAZY commit retention: full per-verify gate/beta buffer
+    /// (`gates_buf` = `[K, 2*num_v_heads]` FP32). Paired with `wy17_kv_retain`.
+    pub wy17_gate_retain: Option<DevicePtr>,
 }
 
 impl LayerState for SsmLayerState {
@@ -315,6 +325,16 @@ pub struct ForwardContext<'a> {
     /// the legacy in-layer per-step H2D upload (eager / non-graphed
     /// concurrent decode path).
     pub ssm_multi_seq_ptr_table_override: Option<spark_runtime::gpu::DevicePtr>,
+    /// SPARSITY-DRAFTED SELF-SPECULATION: when `Some(thresh_frac)`, dense FFN
+    /// layers route their single-token `forward` through the column-sparse
+    /// DRAFT path (`DenseFfnLayer::forward_draft_sparse`) at the given keep
+    /// threshold (fraction of per-row max-abs). Set ONLY by
+    /// `decode_draft_sparse` (the sparse self-spec drafter, gated by
+    /// `ATLAS_SELF_SPEC_SPARSE`). `None` for every other caller — the dense
+    /// exact `forward` runs, so the verify path and all non-draft decodes are
+    /// byte-identical to before this field existed. The draft need not be
+    /// bit-exact (the dense verify is the oracle).
+    pub self_spec_sparse_draft: Option<f32>,
 }
 
 /// A single transformer layer performing the full per-layer computation.

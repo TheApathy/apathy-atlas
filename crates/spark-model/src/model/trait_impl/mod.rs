@@ -18,8 +18,10 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, PrefillSlice, SequenceSta
 use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod async_chkpt;
+pub(crate) mod commit_plan;
 mod decode_a;
 mod decode_a2;
+mod decode_a2_piecewise;
 mod decode_b;
 mod decode_b2;
 mod ep_misc;
@@ -221,6 +223,15 @@ impl Model for TransformerModel {
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
         self.decode_draft_dispatch(token, seq, stream)
     }
+    fn decode_draft_sparse(
+        &self,
+        token: u32,
+        thresh_frac: f32,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.decode_draft_sparse_dispatch(token, thresh_frac, seq, stream)
+    }
     fn cache_sequence(&self, seq: &SequenceState) {
         self.cache_sequence_dispatch(seq)
     }
@@ -414,6 +425,13 @@ impl Model for TransformerModel {
     }
 
     fn clear_ddtree_parent_ids(&self) {
+        // Task #34: also disarm the flat-chain injection flag. Every caller
+        // of this method is either an error path that skips the commit (the
+        // commit's swap-to-false is what normally consumes the flag — an
+        // armed flag would otherwise leak into an unrelated later commit)
+        // or runs after the commit already consumed it (reset is a no-op).
+        self.dflash_flat_tree_route
+            .store(false, std::sync::atomic::Ordering::Release);
         // Restore the persistent buffer to the linear-chain default so the
         // graph-safe verify path (which keeps `Some(persistent)` to always
         // hit tree_wy) reads bit-equivalent-to-wy17 parents on the next
