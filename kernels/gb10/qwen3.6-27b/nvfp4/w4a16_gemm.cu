@@ -164,6 +164,13 @@ __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_group 0;");
 }
 
+// Windowed wait: block until at most N cp.async groups remain in flight.
+// N is an immediate (PTX requires it), so we template on it.
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+}
+
 __device__ __forceinline__ unsigned int pack_bf16_pair(float lo, float hi) {
     unsigned int result;
     asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(result)
@@ -2484,6 +2491,515 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu(
         // FP32 (__bfloat162float) and computes g*sigmoid(g)*u. Keeping the
         // raw FP32 accumulators would be *more* precise but would diverge
         // in the low bits → breaks the md5 gate. Match the baseline exactly.
+        #define FUSE(gi, ui) ({ \
+            float g_ = __bfloat162float(__float2bfloat16(gi)); \
+            float u_ = __bfloat162float(__float2bfloat16(ui)); \
+            float sig_ = 1.0f / (1.0f + __expf(-g_)); \
+            __float2bfloat16(g_ * sig_ * u_); })
+        if (r0 < M && c0 < N) C[r0*N+c0] = FUSE(acc[0][0][sub][0], acc[1][0][sub][0]);
+        if (r0 < M && c1 < N) C[r0*N+c1] = FUSE(acc[0][0][sub][1], acc[1][0][sub][1]);
+        if (r1 < M && c0 < N) C[r1*N+c0] = FUSE(acc[0][0][sub][2], acc[1][0][sub][2]);
+        if (r1 < M && c1 < N) C[r1*N+c1] = FUSE(acc[0][0][sub][3], acc[1][0][sub][3]);
+        if (r2 < M && c0 < N) C[r2*N+c0] = FUSE(acc[0][1][sub][0], acc[1][1][sub][0]);
+        if (r2 < M && c1 < N) C[r2*N+c1] = FUSE(acc[0][1][sub][1], acc[1][1][sub][1]);
+        if (r3 < M && c0 < N) C[r3*N+c0] = FUSE(acc[0][1][sub][2], acc[1][1][sub][2]);
+        if (r3 < M && c1 < N) C[r3*N+c1] = FUSE(acc[0][1][sub][3], acc[1][1][sub][3]);
+        #undef FUSE
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m32_n64_gateup_silu_pipe3 — 3-STAGE double-buffered fork
+// (MISSION target #2, ATLAS_GATEUP_PIPE3=1).
+//
+// SAME math as w4a16_gemm_t_m32_n64_gateup_silu — identical load, DEQUANT
+// (BF16 round-trip via cvt.rn.satfinite.e4m3x2), MMA, and FUSE (BF16
+// round-trip SiLU·mul). SCHEDULING CHANGE ONLY, zero arithmetic change:
+//
+//   2-stage baseline: ISSUE(nxt); commit; MMA(cur); WAIT_ALL; DEQUANT(nxt).
+//     WAIT_ALL (wait_group 0) drains EVERY outstanding group before dequant,
+//     and DEQUANT sits on the critical path between the wait and the next
+//     MMA — the ~36µs dequant is fully exposed and the next tile's loads
+//     cannot overlap it.
+//
+//   3-stage pipe: keep TWO cp.async groups in flight. Producer issues stage
+//     k+2's A+B loads, then `cp.async.wait_group<2>` blocks only until stage
+//     k's loads land (≤2 groups remain). We then DEQUANT stage k and MMA
+//     stage k while stage k+1 is already resident and stage k+2 streams in
+//     the background. Dequant of k overlaps the in-flight load of k+2, and
+//     MMA of k overlaps nothing extra but is no longer gated by a full drain.
+//
+// Ring depth 3 for A / Bp / Bs / B_fp8 (buf = k % 3). SMEM grows ~1.5× vs
+// the 2-stage kernel (still well under the 100 KB SM_120 cap):
+//   - A:        3 × 32 × 40 × 2      = 7680 B
+//   - Bp ×2:    3 × 2 × 16 × 80      = 7680 B
+//   - Bs ×2:    3 × 2 × 2  × 80      =  960 B
+//   - B_fp8 ×2: 3 × 64 × 32          = 6144 B  ≈ 22.5 KB + LUT
+// Caller contract identical to w4a16_gemm_t_m32_n64_gateup_silu.
+// ═══════════════════════════════════════════════════════════════════
+#define N_TILE_S3 64
+extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu_pipe3(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bg_packed,
+    const unsigned char* __restrict__ Bg_scale,
+    const float scale2_g,
+    const unsigned char* __restrict__ Bu_packed,
+    const unsigned char* __restrict__ Bu_scale,
+    const float scale2_u,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ldb
+) {
+    constexpr unsigned int M_TILE_S = 32;
+    constexpr int STAGES = 3;
+    const unsigned int cta_n = blockIdx.x * N_TILE_S3;
+    const unsigned int cta_m = blockIdx.y * M_TILE_S;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[STAGES][M_TILE_S][K_STEP_T + PAD_T];
+    __shared__ unsigned char smem_Bp[2][STAGES][K_STEP_T / 2][N_TILE_S3 + BP_PAD];
+    __shared__ unsigned char smem_Bs[2][STAGES][K_STEP_T / GROUP_SIZE][N_TILE_S3 + BP_PAD];
+    __shared__ unsigned char smem_B_fp8[2][STAGES][N_TILE_S3][K_STEP_T];
+    __shared__ float smem_LUT[16];
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    float acc[2][2][2][4];
+    #pragma unroll
+    for (int w = 0; w < 2; w++)
+        #pragma unroll
+        for (int mf = 0; mf < 2; mf++)
+            #pragma unroll
+            for (int sub = 0; sub < 2; sub++) {
+                acc[w][mf][sub][0] = 0.0f; acc[w][mf][sub][1] = 0.0f;
+                acc[w][mf][sub][2] = 0.0f; acc[w][mf][sub][3] = 0.0f;
+            }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // A loads into ring slot `buf` for global k-offset `kb`.
+    #define P3_ISSUE_A(buf, kb) do { \
+        unsigned int a_row = threadIdx.x >> 2; \
+        unsigned int a_col = (threadIdx.x & 3) << 3; \
+        unsigned int gc = (kb) + a_col; \
+        unsigned int gr = cta_m + a_row; \
+        cp_async_pred_16(&smem_A[(buf)][a_row][a_col], \
+            &A[(unsigned long long)gr * K + gc], \
+            (gr < M) && (gc + 7 < K)); \
+    } while(0)
+
+    // B loads for weight w into ring slot `buf`.
+    #define P3_ISSUE_B(w, buf, kb, Bp, Bs) do { \
+        if (threadIdx.x < 64) { \
+            unsigned int kp = threadIdx.x >> 2; \
+            unsigned int ns = (threadIdx.x & 3) << 4; \
+            unsigned int gke = (kb) + (kp << 1); \
+            unsigned int gns = cta_n + ns; \
+            cp_async_pred_16(&smem_Bp[(w)][(buf)][kp][ns], \
+                &Bp[(unsigned long long)(gke >> 1) * ldb + gns], \
+                (gke + 1 <= K) && (gns + 15 < ldb)); \
+            if (kp < (K_STEP_T / GROUP_SIZE) * (N_TILE_S3 / 16)) { \
+                unsigned int sg_row = kp >> 2; \
+                unsigned int sg_ns  = (kp & 3) << 4; \
+                unsigned int sg = (kb) / GROUP_SIZE + sg_row; \
+                cp_async_pred_16(&smem_Bs[(w)][(buf)][sg_row][sg_ns], \
+                    &Bs[(unsigned long long)sg * ldb + cta_n + sg_ns], \
+                    (cta_n + sg_ns + 15 < ldb)); \
+            } \
+        } \
+    } while(0)
+
+    // Issue A + both B tiles for one stage (one cp.async group).
+    #define P3_ISSUE_STAGE(buf, kb) do { \
+        P3_ISSUE_A((buf), (kb)); \
+        P3_ISSUE_B(0, (buf), (kb), Bg_packed, Bg_scale); \
+        P3_ISSUE_B(1, (buf), (kb), Bu_packed, Bu_scale); \
+        cp_async_commit(); \
+    } while(0)
+
+    #define P3_DEQUANT(w, buf, sc2) do { \
+        unsigned int my_n = threadIdx.x >> 1; \
+        unsigned int half = threadIdx.x & 1; \
+        unsigned char sb = smem_Bs[(w)][(buf)][half][my_n]; \
+        __nv_fp8_e4m3 f; \
+        *(unsigned char*)&f = sb; \
+        float sv = (float)f * (sc2); \
+        unsigned int kp0 = half << 3; \
+        _Pragma("unroll") \
+        for (unsigned int kp = kp0; kp < kp0 + 8; kp++) { \
+            unsigned char packed = smem_Bp[(w)][(buf)][kp][my_n]; \
+            float lo = smem_LUT[packed & 0xF] * sv; \
+            float hi = smem_LUT[packed >> 4] * sv; \
+            unsigned short fp8_pair; \
+            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                         : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            *(unsigned short*)&smem_B_fp8[(w)][(buf)][my_n][kp * 2] = fp8_pair; \
+        } \
+    } while(0)
+
+    #define P3_MMA(w, buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(buf)]; \
+        unsigned int fr0 = group_id; \
+        unsigned int fr1 = fr0 + 8; \
+        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        unsigned int b0 = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + tid * 4]); \
+        unsigned int b1 = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + tid * 4]); \
+        unsigned int b2 = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + 16 + tid * 4]); \
+        unsigned int b3 = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int sub = 0; sub < 2; sub++) { \
+            unsigned int nt = warp_id * 2 + sub; \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int v0 = *(const unsigned int*)&smem_B_fp8[(w)][(buf)][nc][4 * tid]; \
+            unsigned int v1 = *(const unsigned int*)&smem_B_fp8[(w)][(buf)][nc][16 + 4 * tid]; \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][0][sub][0]),"=f"(acc[(w)][0][sub][1]),"=f"(acc[(w)][0][sub][2]),"=f"(acc[(w)][0][sub][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(v0),"r"(v1), \
+                 "f"(acc[(w)][0][sub][0]),"f"(acc[(w)][0][sub][1]),"f"(acc[(w)][0][sub][2]),"f"(acc[(w)][0][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][1][sub][0]),"=f"(acc[(w)][1][sub][1]),"=f"(acc[(w)][1][sub][2]),"=f"(acc[(w)][1][sub][3]) \
+                :"r"(b0),"r"(b1),"r"(b2),"r"(b3),"r"(v0),"r"(v1), \
+                 "f"(acc[(w)][1][sub][0]),"f"(acc[(w)][1][sub][1]),"f"(acc[(w)][1][sub][2]),"f"(acc[(w)][1][sub][3])); \
+        } \
+    } while(0)
+
+    const unsigned int num_k = K / K_STEP_T;   // K is a multiple of K_STEP_T
+
+    // Prologue: prime up to (STAGES-1)=2 cp.async groups in flight.
+    #pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if ((unsigned)s < num_k) P3_ISSUE_STAGE(s, (unsigned)s * K_STEP_T);
+    }
+
+    // Steady state.
+    for (unsigned int k = 0; k < num_k; k++) {
+        unsigned int buf = k % STAGES;
+        // Prefetch stage k+2 (keeps 2 groups ahead) before consuming k.
+        unsigned int pf = k + (STAGES - 1);
+        bool prefetched = pf < num_k;
+        if (prefetched) {
+            P3_ISSUE_STAGE(pf % STAGES, pf * K_STEP_T);
+        }
+        // Block until stage k's loads have landed. In steady state exactly
+        // STAGES-1 groups are ahead of stage k, so leaving ≤(STAGES-1) in
+        // flight guarantees stage k is done. In the TAIL (no prefetch issued),
+        // fewer than STAGES-1 groups remain — waiting for ≤STAGES-1 could
+        // return WITHOUT completing stage k. Drain fully there: the remaining
+        // resident stages stay valid (wait_group<0> only blocks, never evicts).
+        if (prefetched) {
+            cp_async_wait_group<STAGES - 1>();
+        } else {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+        P3_DEQUANT(0, buf, scale2_g);
+        P3_DEQUANT(1, buf, scale2_u);
+        __syncthreads();
+        P3_MMA(0, buf);
+        P3_MMA(1, buf);
+    }
+
+    #undef P3_ISSUE_A
+    #undef P3_ISSUE_B
+    #undef P3_ISSUE_STAGE
+    #undef P3_DEQUANT
+    #undef P3_MMA
+
+    // Output: silu(gate)*up — identical FUSE to the 2-stage kernel.
+    #pragma unroll
+    for (int sub = 0; sub < 2; sub++) {
+        unsigned int nt = warp_id * 2 + sub;
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + group_id;
+        unsigned int r1 = r0 + 8;
+        unsigned int r2 = r0 + 16;
+        unsigned int r3 = r0 + 24;
+        #define FUSE(gi, ui) ({ \
+            float g_ = __bfloat162float(__float2bfloat16(gi)); \
+            float u_ = __bfloat162float(__float2bfloat16(ui)); \
+            float sig_ = 1.0f / (1.0f + __expf(-g_)); \
+            __float2bfloat16(g_ * sig_ * u_); })
+        if (r0 < M && c0 < N) C[r0*N+c0] = FUSE(acc[0][0][sub][0], acc[1][0][sub][0]);
+        if (r0 < M && c1 < N) C[r0*N+c1] = FUSE(acc[0][0][sub][1], acc[1][0][sub][1]);
+        if (r1 < M && c0 < N) C[r1*N+c0] = FUSE(acc[0][0][sub][2], acc[1][0][sub][2]);
+        if (r1 < M && c1 < N) C[r1*N+c1] = FUSE(acc[0][0][sub][3], acc[1][0][sub][3]);
+        if (r2 < M && c0 < N) C[r2*N+c0] = FUSE(acc[0][1][sub][0], acc[1][1][sub][0]);
+        if (r2 < M && c1 < N) C[r2*N+c1] = FUSE(acc[0][1][sub][1], acc[1][1][sub][1]);
+        if (r3 < M && c0 < N) C[r3*N+c0] = FUSE(acc[0][1][sub][2], acc[1][1][sub][2]);
+        if (r3 < M && c1 < N) C[r3*N+c1] = FUSE(acc[0][1][sub][3], acc[1][1][sub][3]);
+        #undef FUSE
+    }
+}
+
+#undef N_TILE_S3
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m32_n64_gateup_silu_pipe — DEQUANT-IN-REGISTERS fork of
+// w4a16_gemm_t_m32_n64_gateup_silu (MISSION target, ATLAS_DEQUANT_PIPE=1).
+//
+// Same shape / caller contract / OUTPUT MATH as the 2-stage baseline
+// (byte-exact — see the bit-exactness argument at the bottom). The ONLY
+// change is WHERE the NVFP4→FP8 dequant lands and HOW the K-loop is
+// scheduled:
+//
+//   Baseline 2-stage steady-state (per K-step):
+//     ISSUE(nxt); commit; MMA_from_smem_fp8(cur);
+//     cp.async.wait_group 0;  __syncthreads();
+//     DEQUANT(cur→smem_B_fp8);  __syncthreads();
+//   The wait_group 0 fully DRAINS every outstanding cp.async group, then
+//   DEQUANT sits on the critical path between the drain and the next MMA,
+//   fully exposed, gated by TWO __syncthreads per step. B is materialized
+//   into a separate 4 KB smem_B_fp8[2][64][32] staging array.
+//
+//   This kernel: NO smem_B_fp8 staging. SMEM holds only the PACKED W4
+//   bytes (smem_Bp) + FP8 scales (smem_Bs). The FP4→FP8 unpack+scale runs
+//   in REGISTERS inside the MMA macro, immediately before each
+//   mma.sync.e4m3, from the resident packed bytes of the CURRENT tile.
+//   Meanwhile the NEXT tile's cp.async is already in flight and we only
+//   `cp.async.wait_group 1` (leave 1 group ahead) instead of draining —
+//   so the unpack ALU of tile k overlaps the memory latency of tile k+1.
+//   One __syncthreads per step (the dequant→smem barrier is gone).
+//
+// Dequant-in-regs is the load-latency-hiding lever the SMEM-staged
+// baseline cannot get: the baseline's DEQUANT must FINISH (2nd sync)
+// before ANY MMA can read smem_B_fp8, so it is serialized after the
+// drain. Here the per-column unpack is private to the consuming thread
+// and interleaves with the MMA issue + the background load.
+//
+// SMEM (2-stage, NO fp8 staging → 4 KB smaller than the baseline fused
+// kernel's ~15 KB → higher occupancy, the opposite of the pipe3 attempt
+// which GREW smem and lost a block/SM):
+//   - A:      2 × 32 × 40 × 2   = 5120 B  (shared)
+//   - Bp ×2:  2 × 2 × 16 × 80   = 5120 B
+//   - Bs ×2:  2 × 2 × 2  × 80   =  640 B
+//   - LUT:                          64 B  ≈ 10.9 KB  (vs 15.0 KB baseline)
+//
+// Because the packed bytes stay in SMEM and only the transient FP8 lives
+// in registers, the 4× SMEM saving vs the staged path preserves (indeed
+// improves) blocks/SM — directly answering the pipe3 no-op: that fork
+// LOST by growing SMEM 1.5×; this one SHRINKS it.
+// ═══════════════════════════════════════════════════════════════════
+#define N_TILE_S3 64
+extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu_pipe(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bg_packed,
+    const unsigned char* __restrict__ Bg_scale,
+    const float scale2_g,
+    const unsigned char* __restrict__ Bu_packed,
+    const unsigned char* __restrict__ Bu_scale,
+    const float scale2_u,
+    __nv_bfloat16* __restrict__ C,          // fused silu(gate)*up [M,N]
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ldb
+) {
+    constexpr unsigned int M_TILE_S = 32;
+    const unsigned int cta_n = blockIdx.x * N_TILE_S3;
+    const unsigned int cta_m = blockIdx.y * M_TILE_S;
+    const unsigned int warp_id = threadIdx.x / 32;  // 0..3
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;     // 0..7
+    const unsigned int tid = lane_id & 3;           // 0..3
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE_S][K_STEP_T + PAD_T];        // 5120B
+    // Two B pipelines: [0]=gate, [1]=up. Packed W4 + FP8 scales ONLY —
+    // no dequanted smem_B_fp8 staging array (the register-dequant win).
+    __shared__ unsigned char smem_Bp[2][2][K_STEP_T / 2][N_TILE_S3 + BP_PAD]; // 5120B
+    __shared__ unsigned char smem_Bs[2][2][K_STEP_T / GROUP_SIZE][N_TILE_S3 + BP_PAD]; // 640B
+    __shared__ float smem_LUT[16];
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    // Per-warp accumulators for BOTH projections:
+    // acc[w][m_frag 0..1][n_subtile 0..1][4 fp32]. w: 0=gate, 1=up.
+    float acc[2][2][2][4];
+    #pragma unroll
+    for (int w = 0; w < 2; w++)
+        #pragma unroll
+        for (int mf = 0; mf < 2; mf++)
+            #pragma unroll
+            for (int sub = 0; sub < 2; sub++) {
+                acc[w][mf][sub][0] = 0.0f; acc[w][mf][sub][1] = 0.0f;
+                acc[w][mf][sub][2] = 0.0f; acc[w][mf][sub][3] = 0.0f;
+            }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // A loads (shared) — identical to the baseline ISSUE_A_M32.
+    #define PR_ISSUE_A(buf, kb) do { \
+        unsigned int a_row = threadIdx.x >> 2;        /* 0..31 */ \
+        unsigned int a_col = (threadIdx.x & 3) << 3;  /* 0/8/16/24 */ \
+        unsigned int gc = (kb) + a_col; \
+        unsigned int gr = cta_m + a_row; \
+        cp_async_pred_16(&smem_A[(buf)][a_row][a_col], \
+            &A[(unsigned long long)gr * K + gc], \
+            (gr < M) && (gc + 7 < K)); \
+    } while(0)
+
+    // B loads for weight w — identical to the baseline ISSUE_B_M32.
+    #define PR_ISSUE_B(w, buf, kb, Bp, Bs) do { \
+        if (threadIdx.x < 64) { \
+            unsigned int kp = threadIdx.x >> 2;          /* 0..15 */ \
+            unsigned int ns = (threadIdx.x & 3) << 4;    /* 0/16/32/48 */ \
+            unsigned int gke = (kb) + (kp << 1); \
+            unsigned int gns = cta_n + ns; \
+            cp_async_pred_16(&smem_Bp[(w)][(buf)][kp][ns], \
+                &Bp[(unsigned long long)(gke >> 1) * ldb + gns], \
+                (gke + 1 <= K) && (gns + 15 < ldb)); \
+            if (kp < (K_STEP_T / GROUP_SIZE) * (N_TILE_S3 / 16)) { \
+                unsigned int sg_row = kp >> 2; \
+                unsigned int sg_ns  = (kp & 3) << 4; \
+                unsigned int sg = (kb) / GROUP_SIZE + sg_row; \
+                cp_async_pred_16(&smem_Bs[(w)][(buf)][sg_row][sg_ns], \
+                    &Bs[(unsigned long long)sg * ldb + cta_n + sg_ns], \
+                    (cta_n + sg_ns + 15 < ldb)); \
+            } \
+        } \
+    } while(0)
+
+    #define PR_ISSUE_STAGE(buf, kb) do { \
+        PR_ISSUE_A((buf), (kb)); \
+        PR_ISSUE_B(0, (buf), (kb), Bg_packed, Bg_scale); \
+        PR_ISSUE_B(1, (buf), (kb), Bu_packed, Bu_scale); \
+        cp_async_commit(); \
+    } while(0)
+
+    // Register dequant of ONE column `nc` of weight w, tile `buf`, into the
+    // two uint32 FP8 fragments the mma.sync consumes: v0 = fp8[k=4tid..4tid+3],
+    // v1 = fp8[k=16+4tid..16+4tid+3]. Bit-exact with the baseline DEQUANT +
+    // smem_B_fp8 read:
+    //   baseline: smem_B_fp8[nc][kp*2 (+1)] = cvt.e4m3x2.f32(hi,lo) with
+    //             lo=LUT[packed&0xF]*sv, hi=LUT[packed>>4]*sv, sv=(f8_scale)*sc2;
+    //             MMA then reads 4 consecutive fp8 bytes as one uint32.
+    //   here:     reconstruct those same 4 bytes directly in a register.
+    // v0 spans k=4tid..4tid+3 → packed bytes kp=2tid (k lo/hi) and kp=2tid+1;
+    // both in the FIRST scale half (kp<8 for tid≤3) → scale group 0.
+    // v1 spans k=16+4tid..16+4tid+3 → packed bytes kp=8+2tid and 8+2tid+1;
+    // SECOND scale half → scale group 1.
+    //
+    // Byte order within the uint32 MUST match the smem layout: byte b of
+    // smem_B_fp8[nc][base+b] = fp8 for k=base+b. cvt.e4m3x2.f32 %0,%hi,%lo
+    // packs lo into the LOW byte and hi into the HIGH byte of the 16-bit
+    // result — i.e. the pair (k even, k odd) lands (low, high), matching
+    // *(unsigned short*)&smem_B_fp8[nc][kp*2]. Assembling two such pairs
+    // little-endian into a uint32 reproduces the 4-byte smem read exactly.
+    #define PR_DEQ_COL(w, buf, nc, sc2, v0, v1) do { \
+        __nv_fp8_e4m3 f0_, f1_; \
+        *(unsigned char*)&f0_ = smem_Bs[(w)][(buf)][0][(nc)]; \
+        *(unsigned char*)&f1_ = smem_Bs[(w)][(buf)][1][(nc)]; \
+        float sv0_ = (float)f0_ * (sc2); \
+        float sv1_ = (float)f1_ * (sc2); \
+        unsigned int p0_ = smem_Bp[(w)][(buf)][2*tid    ][(nc)]; \
+        unsigned int p1_ = smem_Bp[(w)][(buf)][2*tid + 1][(nc)]; \
+        unsigned int p2_ = smem_Bp[(w)][(buf)][8 + 2*tid    ][(nc)]; \
+        unsigned int p3_ = smem_Bp[(w)][(buf)][8 + 2*tid + 1][(nc)]; \
+        unsigned short h0_, h1_, h2_, h3_; \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h0_) \
+            : "f"(smem_LUT[p0_ >> 4] * sv0_), "f"(smem_LUT[p0_ & 0xF] * sv0_)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h1_) \
+            : "f"(smem_LUT[p1_ >> 4] * sv0_), "f"(smem_LUT[p1_ & 0xF] * sv0_)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h2_) \
+            : "f"(smem_LUT[p2_ >> 4] * sv1_), "f"(smem_LUT[p2_ & 0xF] * sv1_)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(h3_) \
+            : "f"(smem_LUT[p3_ >> 4] * sv1_), "f"(smem_LUT[p3_ & 0xF] * sv1_)); \
+        (v0) = ((unsigned int)h1_ << 16) | (unsigned int)h0_; \
+        (v1) = ((unsigned int)h3_ << 16) | (unsigned int)h2_; \
+    } while(0)
+
+    // MMA for weight w with register-resident B dequant. Identical MMA
+    // instruction + accumulator targets + A fragment path as the baseline
+    // COMPUTE_MMA_M32; only the B operand source differs (regs, not smem).
+    #define PR_MMA(w, buf, sc2) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(buf)]; \
+        unsigned int fr0 = group_id; \
+        unsigned int fr1 = fr0 + 8; \
+        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        unsigned int c0_ = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + tid * 4]); \
+        unsigned int c1_ = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + tid * 4]); \
+        unsigned int c2_ = bf16x4_to_e4m3x4(&sA[(fr0 + 16) * a_stride + 16 + tid * 4]); \
+        unsigned int c3_ = bf16x4_to_e4m3x4(&sA[(fr1 + 16) * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int sub = 0; sub < 2; sub++) { \
+            unsigned int nt = warp_id * 2 + sub; \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int v0, v1; \
+            PR_DEQ_COL((w), (buf), nc, (sc2), v0, v1); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][0][sub][0]),"=f"(acc[(w)][0][sub][1]),"=f"(acc[(w)][0][sub][2]),"=f"(acc[(w)][0][sub][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(v0),"r"(v1), \
+                 "f"(acc[(w)][0][sub][0]),"f"(acc[(w)][0][sub][1]),"f"(acc[(w)][0][sub][2]),"f"(acc[(w)][0][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][1][sub][0]),"=f"(acc[(w)][1][sub][1]),"=f"(acc[(w)][1][sub][2]),"=f"(acc[(w)][1][sub][3]) \
+                :"r"(c0_),"r"(c1_),"r"(c2_),"r"(c3_),"r"(v0),"r"(v1), \
+                 "f"(acc[(w)][1][sub][0]),"f"(acc[(w)][1][sub][1]),"f"(acc[(w)][1][sub][2]),"f"(acc[(w)][1][sub][3])); \
+        } \
+    } while(0)
+
+    const unsigned int num_k = K / K_STEP_T;   // K is a multiple of K_STEP_T
+
+    // Prologue: prime the first tile (2-stage → 1 group ahead).
+    PR_ISSUE_STAGE(0, 0);
+
+    int cur = 0;
+    for (unsigned int k = 0; k < num_k; k++) {
+        unsigned int kb = k * K_STEP_T;
+        int nxt = 1 - cur;
+        // Prefetch next tile BEFORE consuming current — keeps 1 cp.async
+        // group in flight so its memory latency overlaps this step's
+        // register-dequant + MMA.
+        bool has_next = (k + 1) < num_k;
+        if (has_next) {
+            PR_ISSUE_STAGE(nxt, kb + K_STEP_T);
+        }
+        // Leave ≤1 group in flight (the just-issued next tile) → block only
+        // until the CURRENT tile's loads have landed. On the last step no
+        // next tile was issued, so drain fully.
+        if (has_next) {
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+        // Dequant happens IN-LINE inside PR_MMA (register-resident); no
+        // smem_B_fp8 write and no second __syncthreads.
+        PR_MMA(0, cur, scale2_g);
+        PR_MMA(1, cur, scale2_u);
+        // Barrier before the next step overwrites smem[cur]: every thread
+        // has finished reading smem_Bp/Bs[cur] in PR_MMA above.
+        __syncthreads();
+        cur = nxt;
+    }
+
+    #undef PR_ISSUE_A
+    #undef PR_ISSUE_B
+    #undef PR_ISSUE_STAGE
+    #undef PR_DEQ_COL
+    #undef PR_MMA
+
+    // Output: silu(gate)*up — IDENTICAL FUSE to the 2-stage kernel (BF16
+    // round-trip on each accumulator, __expf sigmoid). Byte-for-byte.
+    #pragma unroll
+    for (int sub = 0; sub < 2; sub++) {
+        unsigned int nt = warp_id * 2 + sub;
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + group_id;
+        unsigned int r1 = r0 + 8;
+        unsigned int r2 = r0 + 16;
+        unsigned int r3 = r0 + 24;
         #define FUSE(gi, ui) ({ \
             float g_ = __bfloat162float(__float2bfloat16(gi)); \
             float u_ = __bfloat162float(__float2bfloat16(ui)); \
