@@ -32,14 +32,27 @@ pub fn step_self_spec(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: u
         }
     };
 
-    // 2. Draft phase: layer-skipping for cheap predictions
+    // 2. Draft phase: layer-skipping for cheap predictions.
+    //
+    // SPARSITY-DRAFTED SELF-SPECULATION (ATLAS_SELF_SPEC_SPARSE=1): route the
+    // draft through the column-sparse FFN path (`decode_draft_sparse`) at the
+    // configured keep threshold. When OFF, call the ORIGINAL `decode_draft`
+    // byte-for-byte (the `use_sparse=false` branch below). The sparse draft is
+    // only a proposer — the dense verify (step 5) is the lossless oracle.
+    let use_sparse = spark_model::layers::self_spec_sparse_enabled();
+    let sparse_thresh = spark_model::layers::self_spec_sparse_thresh();
     let seq_len_before_draft = a.seq.seq_len;
     let tokens_before_draft = a.seq.tokens.len();
 
     let mut draft_tokens = Vec::with_capacity(num_drafts);
     let mut draft_token = token_0;
     for _ in 0..num_drafts {
-        let logits = match model.decode_draft(draft_token, &mut a.seq, 0) {
+        let draft_res = if use_sparse {
+            model.decode_draft_sparse(draft_token, sparse_thresh, &mut a.seq, 0)
+        } else {
+            model.decode_draft(draft_token, &mut a.seq, 0)
+        };
+        let logits = match draft_res {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!("self-spec draft error: {e:#}");

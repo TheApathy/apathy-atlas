@@ -60,9 +60,7 @@ pub fn step_verify_k3_batched_csk(
     // filter does not check EP — gate here as a safety net. (Production
     // single-GPU deploy doesn't hit EP, so this is a defensive bail.)
     if model.is_ep() {
-        tracing::warn!(
-            "CSK verify path doesn't support EP; falling back to per-seq K=3 for c={c}"
-        );
+        tracing::warn!("CSK verify path doesn't support EP; falling back to per-seq K=3 for c={c}");
         // Restore drafts and fall through to per-seq path.
         for (i, &idx) in batched_idxs.iter().enumerate() {
             active[idx].pending_drafts = per_seq_drafts[i].to_vec();
@@ -95,7 +93,11 @@ pub fn step_verify_k3_batched_csk(
         // with split_at_mut to peel off each &mut ActiveSeq, push its
         // &mut seq into refs in the SORTED order, then permute back to
         // batched_idxs order after the call.
-        let mut sorted: Vec<(usize, usize)> = batched_idxs.iter().enumerate().map(|(p, &i)| (i, p)).collect();
+        let mut sorted: Vec<(usize, usize)> = batched_idxs
+            .iter()
+            .enumerate()
+            .map(|(p, &i)| (i, p))
+            .collect();
         sorted.sort_by_key(|t| t.0);
         let mut tail: &mut [ActiveSeq] = active;
         let mut cursor: usize = 0;
@@ -156,7 +158,10 @@ pub fn step_verify_k3_batched_csk(
         // decode_batch advanced seq.seq_len by K=3 and pushed 3 tokens.
         // We want `seq_len = orig_len + num_accepted_drafts + 1`.
         let target_len = orig_len + num_accepted_drafts + 1;
-        debug_assert!(target_len <= a.seq.seq_len, "K-loop should have advanced past target_len");
+        debug_assert!(
+            target_len <= a.seq.seq_len,
+            "K-loop should have advanced past target_len"
+        );
         let pop_count = a.seq.seq_len - target_len;
         for _ in 0..pop_count {
             a.seq.tokens.pop();

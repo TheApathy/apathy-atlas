@@ -57,8 +57,7 @@ pub fn prefill_request(
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
     let grammar_state = compile_grammar_state(grammar_engine, &grammar_spec);
-    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req
-    {
+    let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
             max_tokens,
@@ -206,6 +205,7 @@ pub fn prefill_request(
             spontaneous_think_budget,
             thinking_tokens: 0,
             cached_prompt_tokens: cached_prompt_tok,
+            difficulty_probe: Default::default(),
             force_end_thinking: false,
             consecutive_confident: 0,
             in_code_fence: false,
@@ -268,7 +268,7 @@ pub fn prefill_request(
         dry_sequence_breakers: Vec::new(),
         logit_bias,
         pending_drafts: Vec::new(),
-            pending_tree_payload: None,
+        pending_tree_payload: None,
         inside_thinking: spontaneous_think || (req_enable_thinking && think_end_token.is_some()),
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
@@ -279,6 +279,7 @@ pub fn prefill_request(
         spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,
+        difficulty_probe: Default::default(),
         force_end_thinking: false,
         consecutive_confident: 0,
         in_code_fence: false,

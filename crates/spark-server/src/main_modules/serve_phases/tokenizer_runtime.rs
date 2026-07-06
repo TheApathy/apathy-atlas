@@ -169,10 +169,9 @@ pub(crate) fn resolve_tokenizer_runtime(
         let decode = |id: u32| tokenizer.decode_with_special(&[id]).ok();
         let (table, structural) = crate::scheduler::build_delim_table(vocab_size, decode);
         crate::scheduler::set_delim_table(std::sync::Arc::from(table));
-        let forced =
-            crate::scheduler::build_forced_ids(vocab_size, |id| {
-                tokenizer.decode_with_special(&[id]).ok()
-            });
+        let forced = crate::scheduler::build_forced_ids(vocab_size, |id| {
+            tokenizer.decode_with_special(&[id]).ok()
+        });
         crate::scheduler::set_forced_ids(std::sync::Arc::new(forced));
         tracing::info!(
             "CFG jump-forward: ENABLED — {structural}/{vocab_size} ids classified \
@@ -217,6 +216,50 @@ pub(crate) fn resolve_tokenizer_runtime(
             "Reflection suppression tokens: {} IDs resolved",
             reflection_suppress_ids.len()
         );
+    }
+
+    // Decoding-efficiency wave (all default-OFF, env-gated): hesitation
+    // penalty (ATLAS_HESITATION_PENALTY), soft </think> exit bias
+    // (ATLAS_THINK_EXIT_BIAS + ATLAS_THINK_SOFT_START), and adaptive thinking
+    // budget (ATLAS_ADAPTIVE_THINK). With all vars unset this installs an
+    // inert config and resolves NO hesitation ids — every apply site is a
+    // no-op, so the committed token stream (and counting-eval md5) is
+    // byte-identical. Only when a var is set does behaviour change, and then
+    // it is OUTPUT-SHAPING (fewer thinking tokens), validated by eval quality.
+    {
+        let mut cfg = crate::scheduler::parse_think_efficiency_config(
+            std::env::var("ATLAS_HESITATION_PENALTY").ok().as_deref(),
+            std::env::var("ATLAS_THINK_EXIT_BIAS").ok().as_deref(),
+            std::env::var("ATLAS_THINK_SOFT_START").ok().as_deref(),
+            std::env::var("ATLAS_ADAPTIVE_THINK").ok().as_deref(),
+        );
+        // Build the hesitation id set only when the penalty is on (skips the
+        // ~50 tokenizer encodes otherwise). Single-token variants only —
+        // multi-token phrases can't be penalised at one logit position.
+        if cfg.hesitation_penalty.is_some() {
+            cfg.hesitation_ids =
+                crate::scheduler::build_hesitation_ids(|s| tokenizer.encode(s).ok());
+            tracing::info!(
+                "Hesitation penalty ENABLED (ATLAS_HESITATION_PENALTY={}): {} token IDs resolved",
+                cfg.hesitation_penalty.unwrap(),
+                cfg.hesitation_ids.len(),
+            );
+        }
+        if let Some(bias) = cfg.think_exit_bias {
+            tracing::info!(
+                "Soft </think> exit bias ENABLED (ATLAS_THINK_EXIT_BIAS={bias}, \
+                 soft_start={} tokens): linear ramp to budget",
+                cfg.think_soft_start,
+            );
+        }
+        if cfg.adaptive_think {
+            tracing::info!(
+                "Adaptive thinking budget ENABLED (ATLAS_ADAPTIVE_THINK=1): \
+                 difficulty-scaled over first {} thinking tokens",
+                crate::scheduler::ADAPTIVE_PROBE_TOKENS_LOG,
+            );
+        }
+        crate::scheduler::set_think_efficiency_config(cfg);
     }
 
     let tool_call_format_name: Option<String> = args.tool_call_parser.clone().or_else(|| {

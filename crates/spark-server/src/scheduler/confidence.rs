@@ -27,6 +27,14 @@ pub fn toggle_code_fence(in_fence: bool, tok: u32, fence_tok: Option<u32>) -> bo
 /// is `watchdog_params().confidence_run_length` (MODEL.toml-tunable).
 pub const CONFIDENCE_RUN_LIMIT: u32 = 30;
 
+/// F2 only arms after this many thinking tokens — the model needs room to
+/// plan (numbered lists / step-by-step reasoning have high per-token
+/// confidence but are NOT signs the model is done thinking). Shared by the
+/// plain decode path (`process_seq_logits`) and the think-spec accept
+/// filter's fast-path window check (`think_spec_accept`), so the two can
+/// never disagree about when the F2 window opens.
+pub const CONFIDENCE_EARLY_STOP_MIN_THINKING: u32 = 400;
+
 /// F2 confidence-run accumulator. Given whether the current token is
 /// high-confidence (top-1 softmax ≥ 0.95) and the prior consecutive
 /// run length, return `(new_run, should_arm_force_end)`.

@@ -6,7 +6,12 @@ use super::*;
 
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
-pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) {
+pub fn step_mtp(
+    model: &dyn Model,
+    active: &mut [ActiveSeq],
+    num_drafts: usize,
+    think: &ThinkSpecCtx<'_>,
+) {
     // Stage-1 DFlash grammar gate: drop drafts proposed before the grammar
     // became constraining (e.g. the block whose emission opened a
     // `<tool_call>`). DFlash drafts and the K=γ verify argmax bypass the
@@ -14,6 +19,21 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
     // path below, where `sample_token_with_grammar` enforces it.
     for a in active.iter_mut() {
         if !a.pending_drafts.is_empty() && dflash_grammar_skip_propose(model, a) {
+            a.pending_drafts.clear();
+            a.pending_tree_payload = None;
+        }
+        // ATLAS_THINK_SPEC=1: the thinking accept filter exists only on
+        // the DFlash K=γ verify path (drafts >= 4, flat chain). Short MTP
+        // chains (K=2/3/4 graphed verifies) and DDTree payloads have no
+        // filter equivalent, so a thinking sequence holding one is
+        // downgraded to the bootstrap decode below — which runs the FULL
+        // plain-path sampler (`bootstrap_thinking_token`). Dropping
+        // drafts is always lossless (they are speculative only).
+        if think.enabled
+            && a.inside_thinking
+            && !a.pending_drafts.is_empty()
+            && (a.pending_drafts.len() < 4 || a.pending_tree_payload.is_some())
+        {
             a.pending_drafts.clear();
             a.pending_tree_payload = None;
         }
@@ -46,31 +66,49 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
                 continue;
             }
         };
-        let tok = match sample_token_with_grammar(
-            model,
-            logits,
-            a.temperature,
-            a.top_k,
-            a.top_p,
-            &[],
-            a.grammar_state.as_mut(),
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("bootstrap sample error: {e:#}");
-                a.finished = true;
-                continue;
+        let tok = if think.enabled && a.inside_thinking {
+            // ATLAS_THINK_SPEC=1: a thinking sequence's bootstrap token
+            // must carry the plain path's logit interventions + per-token
+            // side effects (F1/F2/wave, EOS suppression, fence parity),
+            // which `sample_token_with_grammar` + `emit_token` do not
+            // replicate. `bootstrap_thinking_token` routes this single
+            // row through `process_seq_logits` — byte-identical to one
+            // `step_decode_only` token — and commits it. The plain
+            // decode's per-layer DFlash capture hook already ran inside
+            // `model.decode` above, so drafter ctx conditioning matches
+            // the propose/verify steps that follow.
+            match bootstrap_thinking_token(model, a, logits, think) {
+                Some(t) => t,
+                None => continue, // D2H failure: sequence finished
             }
-        };
-
-        // Extract logprobs from bootstrap decode logits (single position).
-        let lp = if let Some(k) = a.top_logprobs {
-            extract_single_logprobs(model, logits, tok, k)
         } else {
-            None
-        };
+            let tok = match sample_token_with_grammar(
+                model,
+                logits,
+                a.temperature,
+                a.top_k,
+                a.top_p,
+                &[],
+                a.grammar_state.as_mut(),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("bootstrap sample error: {e:#}");
+                    a.finished = true;
+                    continue;
+                }
+            };
 
-        emit_token(a, tok, lp);
+            // Extract logprobs from bootstrap decode logits (single position).
+            let lp = if let Some(k) = a.top_logprobs {
+                extract_single_logprobs(model, logits, tok, k)
+            } else {
+                None
+            };
+
+            emit_token(a, tok, lp);
+            tok
+        };
         if a.finished {
             continue;
         }
@@ -147,7 +185,14 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
             if drafts.is_empty() {
                 continue;
             }
-            if let Some(ref mut gs) = a.grammar_state {
+            // Thinking spans never advance the grammar (mirrors the
+            // `!inside_thinking` gate in emit_token / the bitmask-skip in
+            // process_seq_logits), so draft validation against the
+            // matcher would spuriously truncate to zero mid-`<think>`.
+            // Only reachable while thinking under ATLAS_THINK_SPEC=1.
+            if !a.inside_thinking
+                && let Some(ref mut gs) = a.grammar_state
+            {
                 let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
                 if kept < drafts.len() {
                     drafts.truncate(kept);
@@ -157,7 +202,7 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
                 }
             }
             if drafts.len() >= 4 {
-                step_verify_dflash(model, a, &drafts, num_drafts);
+                step_verify_dflash(model, a, &drafts, num_drafts, think);
             } else if drafts.len() >= 3 {
                 step_verify_k4(model, a, &drafts, num_drafts);
             } else if drafts.len() >= 2 {
@@ -201,7 +246,14 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
             if drafts.is_empty() {
                 continue;
             }
-            if let Some(ref mut gs) = a.grammar_state {
+            // Thinking spans never advance the grammar (mirrors the
+            // `!inside_thinking` gate in emit_token / the bitmask-skip in
+            // process_seq_logits), so draft validation against the
+            // matcher would spuriously truncate to zero mid-`<think>`.
+            // Only reachable while thinking under ATLAS_THINK_SPEC=1.
+            if !a.inside_thinking
+                && let Some(ref mut gs) = a.grammar_state
+            {
                 let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
                 if kept < drafts.len() {
                     drafts.truncate(kept);
@@ -211,7 +263,7 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
                 }
             }
             if drafts.len() >= 4 {
-                step_verify_dflash(model, a, &drafts, num_drafts);
+                step_verify_dflash(model, a, &drafts, num_drafts, think);
             } else if drafts.len() >= 3 {
                 step_verify_k4(model, a, &drafts, num_drafts);
             } else if drafts.len() >= 2 {
@@ -240,7 +292,13 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
         // `accept_token` silently fails — desync'ing the grammar
         // from the output stream. Truncating here downgrades K=4 →
         // K=3 → K=2 cleanly.
-        if let Some(ref mut gs) = a.grammar_state {
+        //
+        // Skipped inside `<think>` (reachable only under
+        // ATLAS_THINK_SPEC=1): thinking tokens never advance the grammar,
+        // so matcher validation would spuriously truncate to zero.
+        if !a.inside_thinking
+            && let Some(ref mut gs) = a.grammar_state
+        {
             let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
             if kept < drafts.len() {
                 drafts.truncate(kept);
@@ -261,7 +319,7 @@ pub fn step_mtp(model: &dyn Model, active: &mut [ActiveSeq], num_drafts: usize) 
         // ATLAS_DFLASH_DRAFT_CAP should not force K=2 verify and discard
         // valid drafts.
         if drafts.len() >= 4 {
-            step_verify_dflash(model, a, &drafts, num_drafts);
+            step_verify_dflash(model, a, &drafts, num_drafts, think);
         } else if drafts.len() >= 3 {
             step_verify_k4(model, a, &drafts, num_drafts);
         } else if drafts.len() >= 2 {

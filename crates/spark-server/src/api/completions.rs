@@ -84,12 +84,12 @@ pub async fn completions(
         }
         ids.clone()
     } else {
-        let raw_prompt =
-            if state.tokenizer.supports_thinking() && !req.prompt.contains("</think>") {
-                format!("<think></think>\n\n{}", req.prompt)
-            } else {
-                req.prompt.clone()
-            };
+        let raw_prompt = if state.tokenizer.supports_thinking() && !req.prompt.contains("</think>")
+        {
+            format!("<think></think>\n\n{}", req.prompt)
+        } else {
+            req.prompt.clone()
+        };
         match state.tokenizer.encode(&raw_prompt) {
             Ok(t) => t,
             Err(e) => {

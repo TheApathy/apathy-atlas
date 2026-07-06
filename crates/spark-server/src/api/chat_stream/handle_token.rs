@@ -221,12 +221,7 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
     if !ctx.stop_strings.is_empty() && !state.stop_string_triggered {
         let already_emitted = state.accumulated_content.len();
         state.accumulated_content.push_str(&delta);
-        let max_stop_len = ctx
-            .stop_strings
-            .iter()
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0);
+        let max_stop_len = ctx.stop_strings.iter().map(|s| s.len()).max().unwrap_or(0);
         let scan_start = state.stop_scan_floor.saturating_sub(max_stop_len);
         // Scan the trailing window once; the prefix before scan_start
         // has been searched in a prior call without a match.
