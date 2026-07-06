@@ -19,10 +19,21 @@
 # intermediates for partial-accept rollback. This is the modern, NaN-SAFE
 # replacement for the old per-token sequential loop (whose NaN-at-K-3..K-1 bug
 # the serve-aeon-27b-dflash.sh comments warn about — that warning applies only
-# to the OLD path, which this chunked path supersedes). No tree payload and no
-# wy12 kernel are required. Do NOT set ATLAS_DISABLE_TREE_WY=1 here (it only
-# matters at k == γ+1 capacity = 12; the chunked else-path fires regardless,
-# so it is a no-op — left unset for clarity).
+# to the OLD path, which this chunked path supersedes).
+#
+# ATLAS_DISABLE_TREE_WY=1 is REQUIRED here (task #34). A prior revision of
+# this script left it unset, reasoning the injection was "also safe" — it is
+# NOT: with graphs on and no tree payload, verify_d.rs substitutes the
+# persistent linear-chain parent_ids whenever k == ddtree_parent_ids_capacity
+# (= dflash_kgamma = 12 at γ=11), rerouting the SSM verify through
+# gated_delta_rule_tree_wy. That kernel (a) leaves the live h_state UNTOUCHED
+# — pre-fix, every FULL accept then committed the STALE pre-verify state (SSM
+# state froze → non-lossless exactly at high acceptance) — and (b) is not
+# bit-equivalent to the wy17-class kernels on linear chains (numeric drift,
+# see c588b34). The commit-side staleness is fixed in-engine
+# (dflash_flat_tree_route, trait_impl/commit_plan.rs), but the chunked path
+# remains the proven-lossless route for K≠17 (md5-exact at K=21/25 in the
+# 2026-06 γ sweep), so keep the injection disabled.
 #
 # All γ/K plumbing is fully dynamic: --dflash-gamma 11 → num_drafts=10 →
 # dflash_kgamma = num_drafts+2 = 12 → num_intermediates sized from γ (=13).
@@ -75,12 +86,12 @@ export ATLAS_DFLASH_FFN_KGAMMA=${ATLAS_DFLASH_FFN_KGAMMA:-1}
 export ATLAS_DFLASH_ATTN_KGAMMA=${ATLAS_DFLASH_ATTN_KGAMMA:-1}
 export ATLAS_DFLASH_NOISE_ONLY=${ATLAS_DFLASH_NOISE_ONLY:-1}
 
-# NOTE: leave ATLAS_DISABLE_TREE_WY UNSET (default off). At K=12 the chunked
-# else-path handles verify; the persistent-parent injection only triggers at
-# k == capacity (=12) with graphs on, and injecting a flat-chain tree payload
-# there would route through gated_delta_rule_tree_wy (arbitrary-K, correct,
-# saves intermediates) — also safe. Either way is NaN-free; the chunked path is
-# the proven default.
+# Task #34 fix: force the chunked WY path at K=12 (see header comment). The
+# flat-chain tree_wy injection fires at k == capacity (=12) with graphs on and
+# froze the SSM state on every full accept pre-fix; tree_wy also drifts
+# numerically on linear chains. Chunked wy4/wy3/wy2 is the proven-lossless
+# K≠17 route.
+export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 
 # SAM retrieval augmentation (lossless, adaptive-gated) — orthogonal to Markov.
 export ATLAS_DFLASH_SAM=${ATLAS_DFLASH_SAM:-1}
