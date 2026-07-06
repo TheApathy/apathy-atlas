@@ -145,6 +145,32 @@ if [ "${ATLAS_DFLASH_PORTFOLIO:-0}" = "1" ]; then
   echo "[serve-aeon-27b-dflash] PORTFOLIO verify ON (2-root forest, K=32, lossless)"
 fi
 
+# 2026-07-05: FREE-SLOTS branch verify (ATLAS_DFLASH_FREE_SLOTS=<N>, default OFF).
+# Keeps the FULL γ=16 spine AND spends the free K=32 verify slots on N sibling
+# branches placed at the LOW-CONFIDENCE draft positions where the linear chain
+# statistically dies (the "cliffs"), each carrying the drafter's top-2 at the
+# cliff + a short re-rooted tail. Same bandwidth-bound verify (K=32 ≈ K=17) →
+# more of the target's greedy continuation accepted (DDTree: up to +46% accept on
+# coding). LOSSLESS by the greedy-oracle argument (verify commits only the
+# target's argmax). Requires the same wide-verify + depth-aware commit path as
+# PORTFOLIO, plus ATLAS_DFLASH_TREE_COMMIT=1 so the deep branch tail commits
+# (not just the flat prefix). Companion knobs:
+#   ATLAS_DFLASH_FREE_SLOTS=<N>        → number of sibling branches (each ≈1+tail)
+#   ATLAS_DFLASH_FREE_SLOTS_TAIL=<L>   → per-branch tail length (default 4)
+#   ATLAS_DFLASH_BRANCH_MARGIN=<m>     → cliff = top1-top2 margin < m (default 2.0)
+# Enable:
+#   ATLAS_DFLASH_FREE_SLOTS=3 ATLAS_DDTREE_MAX_NODES=32 \
+#   ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 ATLAS_DDTREE_DFS_REORDER=1 \
+#   ATLAS_DFLASH_TREE_COMMIT=1
+if [ "$(printf '%s' "${ATLAS_DFLASH_FREE_SLOTS:-0}" | tr -cd '0-9')" != "0" ] \
+   && [ "${ATLAS_DFLASH_FREE_SLOTS:-0}" != "0" ]; then
+  export ATLAS_DDTREE_MAX_NODES=${ATLAS_DDTREE_MAX_NODES:-32}
+  export ATLAS_DDTREE_TREE_TOKENS_VERIFY=${ATLAS_DDTREE_TREE_TOKENS_VERIFY:-1}
+  export ATLAS_DDTREE_DFS_REORDER=${ATLAS_DDTREE_DFS_REORDER:-1}
+  export ATLAS_DFLASH_TREE_COMMIT=${ATLAS_DFLASH_TREE_COMMIT:-1}
+  echo "[serve-aeon-27b-dflash] FREE-SLOTS branch verify ON (N=${ATLAS_DFLASH_FREE_SLOTS}, K=32, lossless)"
+fi
+
 # 2026-06-10: batched K=17 attention QKV via plain w4a16_gemm (M=17, one
 # weight read instead of 17 per layer). Validated token-exact +
 # deterministic + acceptance 15.90/16. verify 243→231ms → 52.8 tok/s
@@ -182,6 +208,24 @@ export ATLAS_DFLASH_ATTN_KGAMMA=${ATLAS_DFLASH_ATTN_KGAMMA:-1}
 # every step. Requires the w4a16_gemm_t_m32_n64_splitk + reduce kernels (built
 # into the qwen3.6-27b cache); handle-0 fallback keeps the single-slice path.
 export ATLAS_FFN_DOWN_SPLITK=${ATLAS_FFN_DOWN_SPLITK:-4}
+
+# 2026-07-04 (kernel wave 2): split-K for the attention K/V projections on the
+# K=γ verify QKV path. K/V are N=nkv*hd=1024 → only 16 CTAs on the single-slice
+# w4a16_gemm_t_m32_n64 (severely SM-starved on the 48-SM GB10); Q at
+# N=q_proj_dim=12288 fields 192 CTAs and stays single-slice. ATLAS_ATTN_QKV_
+# SPLITK=4 slices K across gridDim.z (16→64 CTAs each) into an FP32 workspace +
+# reduce — exactly the proven ffn_down pattern. Clean A/B (idle box, n=5):
+# counting 84.9→86.7 (+2.1%), coding 41.2→42.5 (+3.2%), step 157.9→155.0ms;
+# counting md5 byte-identical. Wave-2 siblings measured same-day, left OFF:
+#   ATLAS_WY17_SPLIT=2 (v-dim split of gated_delta_rule_wy17): honest NO-OP
+#     (84.8/41.5, step 158.2ms) — 48 CTAs at 1/SM isn't starved enough to pay
+#     for the per-split kd_flat recompute. md5 clean; kernel kept in tree.
+#   ATLAS_SSM_BA_BATCH=1 (17 BA GEMVs → 1 dense_gemv_bf16_batchn launch):
+#     marginal (85.7/41.6, step 155.9ms, ~+1%). md5 clean via the bit-exact
+#     batchn kernel (a dense_gemm variant was NOT bit-exact — md5 mismatch;
+#     do not swap back).
+#   All three combined: 85.7 counting / 42.7 coding, step 152.3ms.
+export ATLAS_ATTN_QKV_SPLITK=${ATLAS_ATTN_QKV_SPLITK:-4}
 
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
