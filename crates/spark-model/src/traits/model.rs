@@ -325,6 +325,25 @@ pub trait Model: Send + Sync {
     /// Returns logits pointer for argmax. Advances seq_len by 1.
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr>;
 
+    /// SPARSE self-speculative draft (sparsity-drafted self-speculation).
+    /// Same layer-skip shape as `decode_draft` but routes the dense FFN
+    /// through the column-sparse draft GEMV at the given keep threshold
+    /// (`thresh_frac`, fraction of per-row max-abs). Selected by
+    /// `step_self_spec` when `ATLAS_SELF_SPEC_SPARSE=1`. The draft need not be
+    /// bit-exact — the dense verify is the lossless oracle. Default impl falls
+    /// back to `decode_draft` (ignoring `thresh_frac`) so non-TransformerModel
+    /// impls keep working.
+    fn decode_draft_sparse(
+        &self,
+        token: u32,
+        thresh_frac: f32,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        let _ = thresh_frac;
+        self.decode_draft(token, seq, stream)
+    }
+
     /// Insert the full token sequence (prompt + generated) into the prefix
     /// cache. Call BEFORE `free_sequence()` (block indices must still be
     /// valid). Benefits multi-turn agentic sessions that resend full history.

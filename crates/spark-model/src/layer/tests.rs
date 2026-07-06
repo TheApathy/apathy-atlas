@@ -18,6 +18,8 @@ fn test_ssm_layer_state_downcast() {
         conv_state_checkpoint: None,
         h_state_intermediates: Vec::new(),
         conv_state_intermediates: Vec::new(),
+        wy17_kv_retain: None,
+        wy17_gate_retain: None,
     });
     let ssm = state.as_any().downcast_ref::<SsmLayerState>().unwrap();
     assert_eq!(ssm.h_state.0, 0x1000);
@@ -33,6 +35,8 @@ fn test_ssm_layer_state_mut() {
         conv_state_checkpoint: None,
         h_state_intermediates: Vec::new(),
         conv_state_intermediates: Vec::new(),
+        wy17_kv_retain: None,
+        wy17_gate_retain: None,
     });
     let ssm = state.as_any_mut().downcast_mut::<SsmLayerState>().unwrap();
     ssm.h_state = DevicePtr(0x3000);
@@ -58,6 +62,7 @@ fn test_forward_context_lifetime() {
         ddtree_parent_ids_dev: None,
         tree_aware_attn: None,
         ssm_multi_seq_ptr_table_override: None,
+        self_spec_sparse_draft: None,
     };
 
     assert_eq!(ctx.config.hidden_size, 2048);

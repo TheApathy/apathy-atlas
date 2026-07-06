@@ -855,6 +855,7 @@ impl TransformerModel {
         Ok(Self {
             config,
             ddtree_parent_ids_dev: Mutex::new(None),
+            dflash_flat_tree_route: std::sync::atomic::AtomicBool::new(false),
             ddtree_num_tree_tokens: Mutex::new(0),
             ddtree_parent_ids_persistent: parent_ids_persistent,
             ddtree_parent_ids_capacity: parent_ids_capacity,
@@ -899,6 +900,7 @@ impl TransformerModel {
             fill_slots_kernel,
             decode_graph: Mutex::new(std::collections::HashMap::new()),
             batch_decode_graphs: Mutex::new(HashMap::new()),
+            piecewise_decode_graphs: Mutex::new(HashMap::new()),
             // Suppress graphs during FP8 calibration only. MLA used to be
             // suppressed because an internal sync was placed inside the graph
             // capture region — that sync is now conditional on eager mode

@@ -102,6 +102,23 @@ impl TransformerModel {
             return Ok(logits);
         }
 
+        // ── Piecewise CUDA-graph multi-seq decode (ATLAS_MULTISEQ_GRAPHS=1) ──
+        //
+        // Captures address-stable SSM/FFN layer runs + the norm/LM-head tail
+        // into per-`padded_n` segment graphs and runs FullAttention layers
+        // eagerly between replays. Requires the multi-seq SSM kernel path
+        // (so per-seq state pointers are indirected via the layer-stable
+        // ptr scratch rather than baked) and the non-EP / no-comm path
+        // (graph capture is illegal under NCCL all-reduce). See
+        // `crate::layers::multiseq_graphs_enabled` for the full audit of
+        // which addresses are captured vs run eager.
+        if crate::layers::multiseq_graphs_enabled()
+            && crate::layers::ssm_multi_seq_kernel_enabled()
+            && self.comm.is_none()
+        {
+            return self.decode_batch_dispatch_piecewise(tokens, seqs);
+        }
+
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -185,6 +202,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         // ── Phase 2: CUDA graph lookup / capture ──
@@ -266,6 +284,8 @@ impl TransformerModel {
                             conv_state_checkpoint: None,
                             h_state_intermediates: Vec::new(),
                             conv_state_intermediates: Vec::new(),
+                            wy17_kv_retain: None,
+                            wy17_gate_retain: None,
                         }));
                         ssm_idx += 1;
                     } else {

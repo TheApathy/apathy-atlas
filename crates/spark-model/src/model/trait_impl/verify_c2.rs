@@ -160,6 +160,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         // ── Phase 2: CUDA graph capture / replay ──

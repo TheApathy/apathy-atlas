@@ -807,6 +807,79 @@ impl Qwen3SsmLayer {
         Ok(())
     }
 
+    /// True when this SSM layer will take the multi-seq kernel path for
+    /// `num_seqs` sequences (the path that indirects per-seq h_state /
+    /// conv_state through `ssm_multi_seq_ptr_scratch` rather than baking raw
+    /// `SsmLayerState` pointers into kernel args). This is the precondition
+    /// for a segment containing this layer to be CUDA-graph-safe under the
+    /// piecewise dispatcher.
+    pub(crate) fn multi_seq_kernel_path_active(&self, num_seqs: usize) -> bool {
+        num_seqs >= 2
+            && num_seqs <= self.ssm_multi_seq_ptr_max
+            && self.conv1d_l2norm_f32_multi_seq_k.0 != 0
+            && self.gdn_decode_f32_multi_seq_k.0 != 0
+            && self.conv1d_l2norm_f32_k.0 != 0
+            && self.gdn_f32_k.0 != 0
+            && self.gated_rms_norm_f32_k.0 != 0
+            && crate::layers::ssm_multi_seq_kernel_enabled()
+    }
+
+    /// Gather-before-replay: refresh the layer-stable host pointer buffer
+    /// (`multi_seq_ptr_host`) with the current active sequences' h_state /
+    /// conv_state device addresses AND re-upload it to the fixed device
+    /// scratch (`ssm_multi_seq_ptr_scratch`) on `stream`.
+    ///
+    /// This is the vLLM `state_indices_tensor` update applied to a captured
+    /// graph: the segment graph bakes ONLY the fixed scratch address; the
+    /// per-step pointer values live in the stable heap buffer and are
+    /// uploaded here, OUTSIDE the captured region, before each replay. When
+    /// batch composition drifts (a sequence finishes, a new one claims a
+    /// different pool slot), calling this before replay makes the captured
+    /// kernels read the right per-seq state without re-capture.
+    ///
+    /// Layout mirrors `decode_multi_seq_inner` exactly:
+    ///   `[h_state_ptrs[N] u64, conv_state_ptrs[N] u64]`
+    /// h_state_ptrs at offset 0, conv_state_ptrs at offset N*8.
+    pub(crate) fn refresh_multi_seq_ptr_table<'a, 'b: 'a>(
+        &self,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        num_seqs: usize,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        assert!(
+            num_seqs * 2 <= 64,
+            "multi_seq_ptr_host capacity exceeded: {num_seqs}*2 > 64",
+        );
+        let ptr_buf: *mut [u64; 64] = self.multi_seq_ptr_host.get();
+        // SAFETY: single-thread mutation upheld by the model forward
+        // serialisation (see the `unsafe impl Sync` note in mod.rs). We
+        // hold the raw pointer only across this short fill + H2D submission.
+        unsafe {
+            let slots = &mut *ptr_buf;
+            for (i, state) in states.iter_mut().enumerate().take(num_seqs) {
+                let ssm_state = state
+                    .as_any_mut()
+                    .downcast_mut::<SsmLayerState>()
+                    .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState for seq {i}"))?;
+                slots[i] = ssm_state.h_state.0;
+                slots[num_seqs + i] = ssm_state.conv_state.0;
+            }
+        }
+        // SAFETY: byte view over the same stable heap region; copy_h2d_async
+        // needs only address + length. The H2D is queued on `stream` before
+        // this scope ends and the heap memory stays valid for the model
+        // lifetime.
+        let ptr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                ptr_buf as *const u8,
+                num_seqs * 2 * std::mem::size_of::<u64>(),
+            )
+        };
+        gpu.copy_h2d_async(ptr_bytes, self.ssm_multi_seq_ptr_scratch, stream)?;
+        Ok(())
+    }
+
     /// Per-sequence single-decode fallback. Used when FP32 conv1d / GDN
     /// kernels aren't loaded (e.g. Metal backend) — the BF16 path uses
     /// `attn_output` for GDN output, which the batched layout above can't

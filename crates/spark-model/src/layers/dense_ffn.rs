@@ -137,6 +137,17 @@ pub struct DenseFfnLayer {
     /// `ATLAS_FFN_FUSED_GATEUP`. Loaded via `try_kernel`; handle 0 keeps
     /// the split gate/up path.
     w4a16_gemm_t_m32_n64_gateup_silu: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64_gateup_silu_pipe` — DEQUANT-IN-REGISTERS fork of
+    /// the fused gate+up+SiLU kernel (`ATLAS_DEQUANT_PIPE=1`). Byte-exact
+    /// with `w4a16_gemm_t_m32_n64_gateup_silu` (same shape, accumulation
+    /// order, and BF16 round-trips) but the NVFP4→FP8 dequant runs in
+    /// registers immediately before each MMA instead of via a `smem_B_fp8`
+    /// staging array — dropping the 2nd per-K-step `__syncthreads`, shrinking
+    /// SMEM ~27% (10.9 KB vs 15.0 KB → higher occupancy), and using
+    /// `cp.async.wait_group<1>` so the next tile's load overlaps the current
+    /// dequant+MMA. Loaded via `try_kernel`; handle 0 keeps the staged fused
+    /// kernel as silent fallback.
+    w4a16_gemm_t_m32_n64_gateup_silu_pipe: KernelHandle,
     /// `w4a16_gemm_t_m32_n64_splitk` — split-K variant of the above for
     /// the DFlash K=17 verify `down_proj` ([M=17,N=5120,K=16384]). The
     /// single-slice kernel fields only 80 CTAs (N=5120/64) and is
@@ -198,6 +209,65 @@ pub struct DenseFfnLayer {
     /// Resized in-place if M or K grows. `Mutex` because `forward_prefill`
     /// takes `&self`.
     e2m1_scratch: Mutex<Option<E2m1Scratch>>,
+    /// `ffn_sparsity_measure` — TEAL-style activation-sparsity observer for
+    /// the sparsity-drafted self-speculation feasibility gate
+    /// (`ATLAS_MEASURE_FFN_SPARSITY=1`). Loaded via `try_kernel`; handle 0
+    /// disables the measurement silently (older kernel caches).
+    ffn_sparsity_measure_k: KernelHandle,
+    /// Lazily-allocated device counter buffers for the sparsity measurement.
+    /// `Mutex` because `forward` takes `&self`. Allocated on first measured
+    /// `forward` call (gpu.alloc is illegal during graph capture, but the
+    /// self-spec draft + measurement run EAGER — see the gate docs). None
+    /// until the first measured forward.
+    sparsity_meas: Mutex<Option<SparsityMeas>>,
+    /// `ffn_build_keep_chunks` — on-device keep-chunk selector for the SPARSE
+    /// self-spec DRAFT path (`ATLAS_SELF_SPEC_SPARSE=1`). Handle 0 disables.
+    ffn_build_keep_chunks_k: KernelHandle,
+    /// `w4a16_gemv_sparse_cols` — column-sparse GEMV for the SPARSE draft
+    /// path. Handle 0 disables the sparse draft (falls back to dense GEMV).
+    w4a16_gemv_sparse_cols_k: KernelHandle,
+    /// Lazily-allocated per-layer keep_idx / keep_len device scratch for the
+    /// sparse draft path. `Mutex` because `forward_draft_sparse` takes `&self`.
+    sparse_draft_scratch: Mutex<Option<SparseDraftScratch>>,
+}
+
+/// Per-layer device counter buffers for the FFN activation-sparsity
+/// measurement. Two sites (gate/up input + down input), each with a
+/// `NUM_THRESH`-entry u32 histogram (below-threshold counts, atomically
+/// accumulated) and a 2-entry u32 `count` ([0]=rows seen, [1]=elements seen).
+struct SparsityMeas {
+    /// Histogram for site 0 (gate/up input, K=hidden). `NUM_THRESH` u32s.
+    hist_gateup: DevicePtr,
+    /// [rows, elements] u32 counter for site 0.
+    count_gateup: DevicePtr,
+    /// Histogram for site 1 (down input, K=intermediate). `NUM_THRESH` u32s.
+    hist_down: DevicePtr,
+    /// [rows, elements] u32 counter for site 1.
+    count_down: DevicePtr,
+    /// Dedicated BF16 scratch [1, intermediate] into which the observer
+    /// recomputes `silu(gate)*up` for the DOWN-input site. This is a SEPARATE
+    /// buffer from the token-stream's `gate_out`/`up_out` — the fused down
+    /// GEMV (`w4a16_gemv_silu_input`) applies SiLU internally and never
+    /// materialises a standalone silu'd vector, so the observer computes its
+    /// own copy here WITHOUT touching the buffers the fused kernel reads.
+    /// Keeps the measurement a pure reader (token stream byte-identical).
+    meas_silu: DevicePtr,
+    /// Number of measured `forward` calls since process start on this layer.
+    /// Drives the periodic D2H dump cadence.
+    steps: u64,
+}
+
+/// Per-layer device scratch for the SPARSE self-spec draft: `keep_idx`
+/// (surviving k8-chunk indices, capacity `K_max/8`) + `keep_len` (1 u32).
+struct SparseDraftScratch {
+    /// Surviving k8-chunk index list, sized for the largest K this layer
+    /// might sparsify (down input K=intermediate). `keep_idx.len == K/8`.
+    keep_idx: DevicePtr,
+    /// Single u32: number of surviving chunks written by
+    /// `ffn_build_keep_chunks`.
+    keep_len: DevicePtr,
+    /// Capacity in k8 chunks (= K_max/8) the `keep_idx` buffer can hold.
+    cap_chunks: usize,
 }
 
 impl DenseFfnLayer {
@@ -266,6 +336,13 @@ impl DenseFfnLayer {
                 "w4a16",
                 "w4a16_gemm_t_m32_n64_gateup_silu",
             ),
+            // Optional dequant-in-registers fork of the fused kernel. Handle
+            // 0 keeps the staged fused kernel (ATLAS_DEQUANT_PIPE).
+            w4a16_gemm_t_m32_n64_gateup_silu_pipe: super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_gateup_silu_pipe",
+            ),
             // Optional split-K down_proj variant + reduce. Handle 0 keeps
             // the single-slice m32_n64 path (ATLAS_FFN_DOWN_SPLITK).
             w4a16_gemm_t_m32_n64_splitk: super::try_kernel(
@@ -294,6 +371,27 @@ impl DenseFfnLayer {
             nvfp4_absmax_k: super::try_kernel(gpu, "quantize_nvfp4", "nvfp4_global_absmax"),
             nvfp4_quantize_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
             e2m1_scratch: Mutex::new(None),
+            // Sparsity-drafted self-speculation kernels (default-off features).
+            // The .cu files live in kernels/gb10/common/ and register under
+            // their file-stem module names. try_kernel → handle 0 disables the
+            // feature silently on caches built before these kernels existed.
+            ffn_sparsity_measure_k: super::try_kernel(
+                gpu,
+                "ffn_sparsity_measure",
+                "ffn_sparsity_measure",
+            ),
+            sparsity_meas: Mutex::new(None),
+            ffn_build_keep_chunks_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_sparse_cols",
+                "ffn_build_keep_chunks",
+            ),
+            w4a16_gemv_sparse_cols_k: super::try_kernel(
+                gpu,
+                "w4a16_gemv_sparse_cols",
+                "w4a16_gemv_sparse_cols",
+            ),
+            sparse_draft_scratch: Mutex::new(None),
         })
     }
 
@@ -558,6 +656,295 @@ impl DenseFfnLayer {
         });
     }
 
+    /// Whether the FFN activation-sparsity MEASUREMENT harness is wired up:
+    /// the env gate is on AND the measure kernel symbol is present.
+    fn sparsity_measure_active(&self) -> bool {
+        crate::layers::measure_ffn_sparsity_enabled() && self.ffn_sparsity_measure_k.0 != 0
+    }
+
+    /// Ensure the per-layer sparsity-measurement counter buffers exist and are
+    /// zeroed on first allocation. Returns the four device pointers. Allocated
+    /// lazily on the first measured `forward` (never during graph capture —
+    /// the measured path runs eager).
+    fn ensure_sparsity_meas(
+        &self,
+        gpu: &dyn GpuBackend,
+        inter: usize,
+    ) -> Result<(DevicePtr, DevicePtr, DevicePtr, DevicePtr, DevicePtr)> {
+        let n_thresh = ops::SPARSITY_NUM_THRESH;
+        let mut slot = self.sparsity_meas.lock().unwrap();
+        if slot.is_none() {
+            let hist_gateup = gpu.alloc(n_thresh * 4)?;
+            let count_gateup = gpu.alloc(2 * 4)?;
+            let hist_down = gpu.alloc(n_thresh * 4)?;
+            let count_down = gpu.alloc(2 * 4)?;
+            let meas_silu = gpu.alloc(inter * 2)?; // BF16 [1, intermediate]
+            // Zero the accumulators up front (kernel uses atomicAdd).
+            gpu.memset(hist_gateup, 0, n_thresh * 4)?;
+            gpu.memset(count_gateup, 0, 2 * 4)?;
+            gpu.memset(hist_down, 0, n_thresh * 4)?;
+            gpu.memset(count_down, 0, 2 * 4)?;
+            *slot = Some(SparsityMeas {
+                hist_gateup,
+                count_gateup,
+                hist_down,
+                count_down,
+                meas_silu,
+                steps: 0,
+            });
+        }
+        let s = slot.as_ref().unwrap();
+        Ok((
+            s.hist_gateup,
+            s.count_gateup,
+            s.hist_down,
+            s.count_down,
+            s.meas_silu,
+        ))
+    }
+
+    /// Observer: launch `ffn_sparsity_measure` on `input` at the given site.
+    /// PURE READER — never mutates `input` or any token-stream buffer; writes
+    /// only into the dedicated `hist`/`count` accumulators. Called from
+    /// `forward` at the two FFN sites when the measurement gate is on.
+    fn measure_sparsity_site(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        hist: DevicePtr,
+        count: DevicePtr,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        ops::ffn_sparsity_measure(
+            ctx.gpu,
+            self.ffn_sparsity_measure_k,
+            input,
+            hist,
+            count,
+            k,
+            stream,
+        )
+    }
+
+    /// Periodic D2H dump of the accumulated per-site sparsity histograms,
+    /// averaged over all rows measured since process start. Emits a
+    /// `tracing::info` line every `measure_ffn_sparsity_dump_every` measured
+    /// forwards. Bumps the per-layer step counter each call. No-op when the
+    /// dump cadence has not been reached.
+    ///
+    /// The reported fraction for threshold t at a site is
+    /// `hist[t] / elements_seen` — the mean below-threshold activation
+    /// fraction, i.e. the UPPER BOUND on the column-skip weight-byte savings
+    /// for that projection at that threshold. The go/no-go number is the
+    /// down-input (K=intermediate) fraction at the 1% threshold.
+    fn maybe_dump_sparsity(&self, ctx: &ForwardContext, layer_tag: &str) -> Result<()> {
+        let every = crate::layers::measure_ffn_sparsity_dump_every();
+        let (hist_gateup, count_gateup, hist_down, count_down, steps) = {
+            let mut slot = self.sparsity_meas.lock().unwrap();
+            let Some(s) = slot.as_mut() else {
+                return Ok(());
+            };
+            s.steps += 1;
+            if !s.steps.is_multiple_of(every) {
+                return Ok(());
+            }
+            (
+                s.hist_gateup,
+                s.count_gateup,
+                s.hist_down,
+                s.count_down,
+                s.steps,
+            )
+        };
+
+        // Sync so the accumulators reflect all launched measurements, then
+        // read the histograms + counts back to the host.
+        ctx.gpu.synchronize(ctx.gpu.default_stream())?;
+        let n_thresh = ops::SPARSITY_NUM_THRESH;
+        let read_hist = |hist: DevicePtr| -> Result<Vec<u32>> {
+            let mut bytes = vec![0u8; n_thresh * 4];
+            ctx.gpu.copy_d2h(hist, &mut bytes)?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        };
+        let read_count = |count: DevicePtr| -> Result<(u64, u64)> {
+            let mut bytes = vec![0u8; 2 * 4];
+            ctx.gpu.copy_d2h(count, &mut bytes)?;
+            let rows = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
+            let elems = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u64;
+            Ok((rows, elems))
+        };
+
+        let fmt_site = |hist: &[u32], elems: u64| -> String {
+            if elems == 0 {
+                return "n/a".to_string();
+            }
+            ops::SPARSITY_TAU
+                .iter()
+                .zip(hist.iter())
+                .map(|(tau, &cnt)| {
+                    let frac = cnt as f64 / elems as f64;
+                    format!("{:.1}%tau={:.1}%", tau * 100.0, frac * 100.0)
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        let hg = read_hist(hist_gateup)?;
+        let hd = read_hist(hist_down)?;
+        let (rows_g, elems_g) = read_count(count_gateup)?;
+        let (rows_d, elems_d) = read_count(count_down)?;
+
+        tracing::info!(
+            "FFN_SPARSITY[{layer_tag}] steps={steps} \
+             gateup_in(K=hidden rows={rows_g}): {} | \
+             down_in(K=inter rows={rows_d}): {}",
+            fmt_site(&hg, elems_g),
+            fmt_site(&hd, elems_d),
+        );
+        Ok(())
+    }
+
+    /// Whether the column-sparse self-spec DRAFT FFN path is wired up: both
+    /// kernel symbols present. The env gate (`ATLAS_SELF_SPEC_SPARSE`) is
+    /// checked by the caller (`step_self_spec`) so this only reports capability.
+    pub fn has_sparse_draft(&self) -> bool {
+        self.ffn_build_keep_chunks_k.0 != 0 && self.w4a16_gemv_sparse_cols_k.0 != 0
+    }
+
+    /// Ensure the per-layer sparse-draft scratch (`keep_idx` + `keep_len`)
+    /// exists with capacity for `k` (the largest K this layer will sparsify —
+    /// the down input K=intermediate). Allocated lazily on the first sparse
+    /// draft forward (eager path, no graph capture).
+    fn ensure_sparse_draft_scratch(
+        &self,
+        gpu: &dyn GpuBackend,
+        k: usize,
+    ) -> Result<(DevicePtr, DevicePtr)> {
+        let need_chunks = k / 8;
+        let mut slot = self.sparse_draft_scratch.lock().unwrap();
+        let realloc = match slot.as_ref() {
+            Some(s) => s.cap_chunks < need_chunks,
+            None => true,
+        };
+        if realloc {
+            if let Some(prev) = slot.take() {
+                let _ = gpu.free(prev.keep_idx);
+                let _ = gpu.free(prev.keep_len);
+            }
+            let keep_idx = gpu.alloc(need_chunks * 4)?; // u32 per chunk
+            let keep_len = gpu.alloc(4)?; // single u32
+            *slot = Some(SparseDraftScratch {
+                keep_idx,
+                keep_len,
+                cap_chunks: need_chunks,
+            });
+        }
+        let s = slot.as_ref().unwrap();
+        Ok((s.keep_idx, s.keep_len))
+    }
+
+    /// SPARSE self-spec DRAFT single-token FFN forward.
+    ///
+    /// Same gate/up GEMV shape as `forward` (gate/up input is the dense
+    /// residual stream — low activation sparsity, per the TEAL analysis, so
+    /// it stays a dense dual GEMV), then swaps the down_proj GEMV for the
+    /// column-sparse path: `ffn_build_keep_chunks` thresholds the silu(gate)*up
+    /// activation into a surviving-chunk list, then `w4a16_gemv_sparse_cols`
+    /// reads only those weight columns. APPROXIMATE by design — the dense
+    /// verify is the lossless oracle, so this only proposes.
+    ///
+    /// `thresh_frac` is the keep threshold as a fraction of per-row max-abs
+    /// (e.g. 0.01 for 1%). Falls back to the exact `forward` dense path when
+    /// the sparse kernels are missing (`has_sparse_draft` false), so callers
+    /// can always invoke it safely.
+    ///
+    /// EAGER only (the self-spec draft never captures a CUDA graph): the
+    /// `keep_len` scalar is read back D2H before the sparse GEMV launch.
+    pub fn forward_draft_sparse(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        thresh_frac: f32,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        // Capability + BF16-weight guard: the sparse kernels operate on the
+        // NVFP4 `QuantizedWeight` layout only. Fall back to the exact dense
+        // forward when sparse kernels are missing or BF16 weights are active.
+        if !self.has_sparse_draft() || self.bf16_weights.is_some() {
+            return self.forward(input, ctx, stream);
+        }
+
+        let h = ctx.config.hidden_size as u32;
+        let inter = ctx.config.intermediate_size as u32;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+
+        // gate/up stay DENSE (residual-stream input, low sparsity).
+        ops::w4a16_gemv_dual(
+            ctx.gpu,
+            self.w4a16_gemv_dual,
+            input,
+            &self.weights.gate_proj,
+            gate_out,
+            &self.weights.up_proj,
+            up_out,
+            inter,
+            h,
+            stream,
+        )?;
+
+        // silu(gate)*up → gate_out (the down-proj input we sparsify).
+        ops::silu_mul(
+            ctx.gpu,
+            self.act_mul,
+            gate_out,
+            up_out,
+            gate_out,
+            inter,
+            stream,
+        )?;
+
+        // Threshold the down-input into a surviving k8-chunk list.
+        let (keep_idx, keep_len) = self.ensure_sparse_draft_scratch(ctx.gpu, inter as usize)?;
+        ops::ffn_build_keep_chunks(
+            ctx.gpu,
+            self.ffn_build_keep_chunks_k,
+            gate_out,
+            thresh_frac,
+            keep_idx,
+            keep_len,
+            inter,
+            stream,
+        )?;
+
+        // Read back keep_len (scalar-by-value kernel arg). Sync is acceptable
+        // on the eager draft path; it also bounds the sparse GEMV's loop.
+        ctx.gpu.synchronize(stream)?;
+        let mut kl_bytes = [0u8; 4];
+        ctx.gpu.copy_d2h(keep_len, &mut kl_bytes)?;
+        let keep_len_val = u32::from_le_bytes(kl_bytes);
+
+        // Column-sparse down_proj GEMV over the surviving chunks only.
+        let output = ctx.buffers.moe_output();
+        ops::w4a16_gemv_sparse_cols(
+            ctx.gpu,
+            self.w4a16_gemv_sparse_cols_k,
+            gate_out,
+            &self.weights.down_proj,
+            keep_idx,
+            keep_len_val,
+            output,
+            h,
+            inter,
+            stream,
+        )?;
+        Ok(output)
+    }
+
     /// Single-token decode: 2-3 kernel launches depending on activation.
     /// SiLU: dual GEMV + SiLU-fused down GEMV (2 launches).
     /// GELU: dual GEMV + gelu_mul + down GEMV (3 launches, no fused GELU down kernel).
@@ -638,6 +1025,40 @@ impl DenseFfnLayer {
             )?;
             anyhow::Result::<()>::Ok(())
         })?;
+
+        // ── FFN activation-sparsity MEASUREMENT (observer, default-off) ──
+        // Runs ONLY when ATLAS_MEASURE_FFN_SPARSITY=1 and the kernel symbol is
+        // present. Pure reader: measures `input` (gate/up in, K=hidden) and a
+        // freshly-recomputed `silu(gate)*up` copy (down in, K=inter) into
+        // dedicated counter buffers. It never touches `input`, `gate_out`,
+        // `up_out`, or `output`, so the token stream stays byte-identical
+        // whether the gate is on or off (counting-md5 constitution preserved).
+        //
+        // Skipped under CUDA graph capture: the observer lazily `gpu.alloc`s its
+        // counter buffers on first use, which is illegal mid-capture. The
+        // measurement run is intended for eager decode (the operator sets the
+        // gate for a measurement window); skipping graphed steps only omits a
+        // subset of rows from the average and never perturbs the token stream.
+        if self.sparsity_measure_active() && !ctx.graph_capture {
+            let (hist_g, count_g, hist_d, count_d, meas_silu) =
+                self.ensure_sparsity_meas(ctx.gpu, inter as usize)?;
+            // Site 0: gate/up input (residual stream, K=hidden).
+            self.measure_sparsity_site(ctx, input, hist_g, count_g, h, stream)?;
+            // Site 1: down input = silu(gate)*up (K=intermediate). Recompute
+            // into the observer's OWN scratch so gate_out/up_out (read by the
+            // fused down GEMV below) are untouched.
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                meas_silu,
+                inter,
+                stream,
+            )?;
+            self.measure_sparsity_site(ctx, meas_silu, hist_d, count_d, inter, stream)?;
+            self.maybe_dump_sparsity(ctx, "dense_ffn")?;
+        }
 
         let output = ctx.buffers.moe_output();
         match self.activation {
@@ -1004,10 +1425,20 @@ impl DenseFfnLayer {
         if fused_gateup {
             let gt = self.gate_proj_t.as_ref().unwrap();
             let ut = self.up_proj_t.as_ref().unwrap();
+            // Select the DEQUANT-IN-REGISTERS fork when ATLAS_DEQUANT_PIPE=1
+            // and its symbol is present; byte-exact with the staged fused
+            // kernel (identical call signature) — falls back otherwise.
+            let fused_kernel = if crate::layers::dequant_pipe_enabled()
+                && self.w4a16_gemm_t_m32_n64_gateup_silu_pipe.0 != 0
+            {
+                self.w4a16_gemm_t_m32_n64_gateup_silu_pipe
+            } else {
+                self.w4a16_gemm_t_m32_n64_gateup_silu
+            };
             crate::kprof!(ctx.gpu, stream, "ffn_gateup_fused_kgamma", {
                 ops::w4a16_gemm_n64_m32_gateup_silu(
                     ctx.gpu,
-                    self.w4a16_gemm_t_m32_n64_gateup_silu,
+                    fused_kernel,
                     input,
                     gt,
                     ut,

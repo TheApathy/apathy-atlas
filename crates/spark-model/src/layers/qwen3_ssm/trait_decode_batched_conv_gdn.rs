@@ -676,7 +676,52 @@ impl Qwen3SsmLayer {
             // closure so both the profiled and unprofiled branches share it.
             let wy17_split = crate::layers::wy17_split();
             let use_vsplit = wy17_split > 0 && self.gdn_wy17_vsplit_k.0 != 0;
+            // LAZY Hi-writes (MISSION #1). Route to gdn_wy17_lazy when the gate
+            // is >1 AND both the lazy kernel and its replay companion are
+            // loaded. SAFETY GATE: lazy_j>1 skips non-checkpoint intermediate
+            // slots, which is only lossless once the commit path
+            // (async_chkpt.rs) replays a skipped slot via gdn_wy17_replay_k on
+            // a non-checkpoint partial accept. Until that one-liner lands we
+            // must NOT skip slots in production, so we hard-clamp the effective
+            // J to 1 here (bit-identical) unless the replay wiring flips this
+            // env on. This keeps the kernel + ops shipped and A/B-safe while
+            // the commit-side change (owned by another agent) is staged.
+            let wy17_lazy_j = crate::layers::wy17_lazy();
+            // Task #34: this decision is shared with the commit path via the
+            // `TransformerLayer::wy17_lazy_engaged` trait hook (implemented in
+            // qwen3_ssm/mod.rs) so the dispatch and the commit can never
+            // disagree about whether the lazy kernel produced this verify's
+            // intermediates. It encapsulates ALL conjuncts, including the
+            // vsplit exclusion (same expression as `use_vsplit` above) —
+            // do not re-guard here or the hook and dispatch could drift.
+            let use_lazy = crate::layer::TransformerLayer::wy17_lazy_engaged(self, num_tokens);
+            let eff_lazy_j = if use_lazy { wy17_lazy_j } else { 1 };
             let run_wy17 = |gpu: &dyn spark_runtime::gpu::GpuBackend| -> Result<()> {
+                if use_lazy {
+                    return ops::gdn_decode_wy17_lazy(
+                        gpu,
+                        self.gdn_wy17_lazy_k,
+                        ssm_state.h_state,
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        gate_ptr,
+                        beta_ptr,
+                        gdn_out_buf,
+                        ssm_state.h_state_intermediates[0],
+                        inter_stride_floats,
+                        1, // batch_size
+                        nk as u32,
+                        nv as u32,
+                        kd as u32,
+                        vd as u32,
+                        conv_dim as u32, // qk_stride
+                        conv_dim as u32, // v_stride
+                        (nv * 2) as u32, // gb_stride
+                        eff_lazy_j,
+                        stream,
+                    );
+                }
                 if use_vsplit {
                     ops::gdn_decode_wy17_vsplit(
                         gpu,
@@ -735,6 +780,31 @@ impl Qwen3SsmLayer {
                 crate::layers::qwen3_ssm::ssm_profile_record(ns);
             } else {
                 run_wy17(ctx.gpu)?;
+            }
+
+            // ── WY17 LAZY-commit retention ──
+            // When lazy is active the kernel persisted only checkpoint
+            // intermediate slots. A later partial accept that lands on a
+            // SKIPPED slot is reconstructed by `gdn_wy17_replay` in the commit
+            // path, which needs the SAME per-token k/v/gate/beta inputs this
+            // verify used. Those live in the shared forward-context scratch
+            // (`conv_out_buf` / `gates_buf`), which the NEXT SSM layer
+            // overwrites — so snapshot them into this layer's fixed retention
+            // buffers now. Only fires when both the gate is on AND the
+            // per-layer retention pool was allocated (buffers non-None). This
+            // copy runs on the SAME stream as the verify kernel (ordering
+            // guaranteed) and is a plain D2D (CUDA-graph safe, no alloc).
+            if let (true, Some(kv_ret), Some(gate_ret)) = (
+                use_lazy,
+                ssm_state.wy17_kv_retain,
+                ssm_state.wy17_gate_retain,
+            ) {
+                let kv_bytes = num_tokens * conv_dim * bf16;
+                let gate_bytes = num_tokens * (nv * 2) * fp32;
+                ctx.gpu
+                    .copy_d2d_async(conv_out_buf, kv_ret, kv_bytes, stream)?;
+                ctx.gpu
+                    .copy_d2d_async(gates_buf, gate_ret, gate_bytes, stream)?;
             }
 
             if wy17_dump {

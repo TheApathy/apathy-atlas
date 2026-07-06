@@ -41,6 +41,18 @@ pub(crate) struct SsmStatePool {
     /// Per-slot SSM state checkpoint pools (only allocated when has_mtp).
     pub(super) h_checkpoint_pools: Vec<DevicePtr>,
     pub(super) conv_checkpoint_pools: Vec<DevicePtr>,
+    /// WY17 LAZY-commit retention pools (only allocated when has_mtp AND the
+    /// lazy-commit gate is on). Each holds one full per-verify k/q/v buffer
+    /// (`[K, conv_dim]` BF16 = `kv_retain_bytes`) and gate/beta buffer
+    /// (`[K, 2*nv]` FP32 = `gate_retain_bytes`) per slot per layer, so the
+    /// commit path can feed the SAME inputs to `gated_delta_rule_wy17_replay`.
+    /// Fixed addresses (like the intermediate pools) for CUDA-graph stability.
+    pub(super) wy17_kv_retain_pools: Vec<DevicePtr>,
+    pub(super) wy17_gate_retain_pools: Vec<DevicePtr>,
+    /// Byte size of one retained k/q/v buffer (`K * conv_dim * 2`), 0 if unused.
+    pub(super) kv_retain_bytes: usize,
+    /// Byte size of one retained gate/beta buffer (`K * 2*nv * 4`), 0 if unused.
+    pub(super) gate_retain_bytes: usize,
     pub(super) h_bytes: usize,
     pub(super) conv_bytes: usize,
     /// Number of CLAIMABLE slots (excludes the reserved dummy slot at
@@ -83,6 +95,33 @@ impl SsmStatePool {
         let mut conv_intermediate_pools = Vec::new();
         let mut h_checkpoint_pools = Vec::new();
         let mut conv_checkpoint_pools = Vec::new();
+        let mut wy17_kv_retain_pools = Vec::new();
+        let mut wy17_gate_retain_pools = Vec::new();
+
+        // WY17 LAZY-commit retention sizing. Retained buffers replicate the
+        // per-verify forward scratch (`conv_out_buf` / `gates_buf`) so the
+        // replay kernel can re-derive a skipped intermediate slot. Layout must
+        // match the wy17 kernel's `K_TOKENS`-strided reads: k/q/v = `[K,
+        // conv_dim]` BF16, gate/beta = `[K, 2*nv]` FP32, where K = the verify
+        // window (= num_intermediates). Only allocated when the lazy-commit
+        // gate is on to avoid the (small) memory cost on the default path.
+        let lazy_commit = crate::layers::wy17_lazy_commit();
+        let nk = config.linear_num_key_heads;
+        let kd = config.linear_key_head_dim;
+        let nv = config.linear_num_value_heads;
+        let vd = config.linear_value_head_dim;
+        let conv_dim = nk * kd * 2 + nv * vd;
+        let k_tokens = num_intermediates; // verify window K = γ+1
+        let kv_retain_bytes = if has_mtp && lazy_commit {
+            k_tokens * conv_dim * 2 // BF16
+        } else {
+            0
+        };
+        let gate_retain_bytes = if has_mtp && lazy_commit {
+            k_tokens * (2 * nv) * 4 // FP32
+        } else {
+            0
+        };
 
         for _ in 0..num_ssm_layers {
             let h_pool = gpu.alloc(total_slots * h_bytes)?;
@@ -113,6 +152,25 @@ impl SsmStatePool {
                 let conv_ckpt = gpu.alloc(total_slots * conv_bytes)?;
                 gpu.memset(conv_ckpt, 0, total_slots * conv_bytes)?;
                 conv_checkpoint_pools.push(conv_ckpt);
+
+                if kv_retain_bytes > 0 {
+                    let kv_ret = gpu.alloc(total_slots * kv_retain_bytes)?;
+                    gpu.memset(kv_ret, 0, total_slots * kv_retain_bytes)?;
+                    wy17_kv_retain_pools.push(kv_ret);
+
+                    let gate_ret = gpu.alloc(total_slots * gate_retain_bytes)?;
+                    gpu.memset(gate_ret, 0, total_slots * gate_retain_bytes)?;
+                    wy17_gate_retain_pools.push(gate_ret);
+                }
+            }
+
+            if kv_retain_bytes > 0 {
+                let retain_mb =
+                    num_ssm_layers * total_slots * (kv_retain_bytes + gate_retain_bytes)
+                        / (1024 * 1024);
+                tracing::info!(
+                    "SSM WY17 LAZY-commit retention pools (K={k_tokens}): {retain_mb} MB"
+                );
             }
 
             let mtp_mb = num_ssm_layers
@@ -138,6 +196,10 @@ impl SsmStatePool {
             conv_intermediate_pools,
             h_checkpoint_pools,
             conv_checkpoint_pools,
+            wy17_kv_retain_pools,
+            wy17_gate_retain_pools,
+            kv_retain_bytes,
+            gate_retain_bytes,
             h_bytes,
             conv_bytes,
             max_slots,
@@ -215,6 +277,23 @@ impl SsmStatePool {
 
     pub(super) fn conv_checkpoint(&self, ssm_layer_idx: usize, slot: usize) -> DevicePtr {
         self.conv_checkpoint_pools[ssm_layer_idx].offset(slot * self.conv_bytes)
+    }
+
+    /// WY17 LAZY-commit k/q/v retention buffer for `(layer, slot)`. `None` when
+    /// retention pools weren't allocated (lazy-commit gate off or `!has_mtp`).
+    pub(super) fn wy17_kv_retain(&self, ssm_layer_idx: usize, slot: usize) -> Option<DevicePtr> {
+        if self.wy17_kv_retain_pools.is_empty() {
+            return None;
+        }
+        Some(self.wy17_kv_retain_pools[ssm_layer_idx].offset(slot * self.kv_retain_bytes))
+    }
+
+    /// WY17 LAZY-commit gate/beta retention buffer for `(layer, slot)`.
+    pub(super) fn wy17_gate_retain(&self, ssm_layer_idx: usize, slot: usize) -> Option<DevicePtr> {
+        if self.wy17_gate_retain_pools.is_empty() {
+            return None;
+        }
+        Some(self.wy17_gate_retain_pools[ssm_layer_idx].offset(slot * self.gate_retain_bytes))
     }
 
     pub(super) fn reset_slot(&self, slot: usize, gpu: &dyn GpuBackend) -> Result<()> {

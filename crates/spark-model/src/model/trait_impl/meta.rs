@@ -115,6 +115,8 @@ impl TransformerModel {
                     conv_state_checkpoint: None,
                     h_state_intermediates: Vec::new(),
                     conv_state_intermediates: Vec::new(),
+                    wy17_kv_retain: None,
+                    wy17_gate_retain: None,
                 };
 
                 if has_mtp {
@@ -133,6 +135,12 @@ impl TransformerModel {
                             .conv_state_intermediates
                             .push(self.ssm_pool.conv_intermediate(ssm_layer_idx, slot, t));
                     }
+
+                    // WY17 LAZY-commit retention (None unless the pools were
+                    // allocated, i.e. ATLAS_WY17_LAZY_COMMIT=1).
+                    ssm_state.wy17_kv_retain = self.ssm_pool.wy17_kv_retain(ssm_layer_idx, slot);
+                    ssm_state.wy17_gate_retain =
+                        self.ssm_pool.wy17_gate_retain(ssm_layer_idx, slot);
                 }
 
                 layer_states.push(Box::new(ssm_state));

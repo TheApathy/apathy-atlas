@@ -96,6 +96,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
         // ── ATLAS_DFLASH_EARLY_EXIT=1: target early-exit drafter ──
         //
@@ -479,6 +480,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         let prop_state = match seq.proposer_state.as_mut() {

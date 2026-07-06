@@ -104,6 +104,45 @@ pub fn ssm_out_proj_m32n64() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_M32N64").ok().as_deref() == Some("1"))
 }
 
+/// Split-K factor for the SSM `out_proj` [M=17, N=5120, K=6144] on the
+/// K=γ verify (`ATLAS_SSM_OUT_SPLITK`). Floor-map microbench (2026-07-05,
+/// clean per-launch event timing, min-of-150): the production
+/// `w4a16_gemm_t` route runs 234.7µs = 28% of the 66µs DRAM floor (40
+/// CTAs on 48 SMs, 77 GB/s), and the earlier `ATLAS_SSM_OUT_M32N64`
+/// verdict of "not occupancy-starved" was wrong — the m32_n64 single
+/// slice measures 167µs (40%) and split-K×4 measures 90.8µs (84%, 228
+/// GB/s), a 2.6× kernel-level win worth ~6.7ms/step across 48 layers.
+/// Same lossless FP32-partials + `reduce_splitk_f32_to_bf16` pattern as
+/// the shipped `ffn_down` split-K. Returns 0 when unset/0/1; else the
+/// factor clamped to [2, 8]. Default OFF pending the counting-md5 gate.
+pub fn ssm_out_splitk() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_SSM_OUT_SPLITK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 0 } else { v.min(8) })
+            .unwrap_or(0)
+    })
+}
+
+/// Split-K factor for the SSM `qkvz` projection [M=17, N=12288, K=5120]
+/// on the K=γ verify (`ATLAS_SSM_QKVZ_SPLITK`). Floor-map microbench
+/// (2026-07-05): production `w4a16_gemm_t` route = 220.5µs (59% of the
+/// 132µs floor); split-K×2 = 167.3µs (85%, 232 GB/s) — ~2.2ms/step
+/// across 48 layers. Lossless FP32 partials, mirrors `ffn_down` split-K.
+/// Returns 0 when unset/0/1; else clamped to [2, 8]. Default OFF.
+pub fn ssm_qkvz_splitk() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_SSM_QKVZ_SPLITK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 0 } else { v.min(8) })
+            .unwrap_or(0)
+    })
+}
+
 /// Returns true when `ATLAS_SSM_BA_BATCHED=1` is set in the process env.
 ///
 /// Gates the K=3 batched-GEMV path for the SSM BA projection. The
@@ -167,6 +206,167 @@ pub fn wy17_split() -> u32 {
             .map(|v| if v < 2 { 0 } else { v.min(4) })
             .unwrap_or(0)
     })
+}
+
+/// Returns the WY17 LAZY Hi-write stride J (`ATLAS_WY17_LAZY=J`).
+///
+/// The wy17 PASS-2 writes 16 per-token intermediate H states (Hi_0..Hi_15),
+/// which are 86% of the kernel's DRAM traffic. They exist ONLY for partial-
+/// accept rollback, and the commit consumer reads at most ONE of them
+/// (inter[num_accepted-1] on partial accept; full accept reads none). J>1
+/// makes the kernel persist only CHECKPOINT slots (0, K-2, every J-th); a
+/// partial accept whose slot was skipped is reconstructed bit-exactly by
+/// `gated_delta_rule_wy17_replay` (root re-seed, same FP32 recurrence).
+/// Returns 1 (disabled — write all, bit-identical to the historical kernel)
+/// when unset/0/1; else the parsed J clamped to [2, 16]. Outputs and final
+/// h_state are byte-identical for every J. md5-gated. Cached via `OnceLock`.
+pub fn wy17_lazy() -> u32 {
+    static GATE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_WY17_LAZY")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|v| if v < 2 { 1 } else { v.min(16) })
+            .unwrap_or(1)
+    })
+}
+
+/// Returns true when `ATLAS_WY17_LAZY_COMMIT=1` is set in the process env.
+///
+/// Gates the commit-side half of the WY17 lazy Hi-writes optimisation. When
+/// on (and `ATLAS_WY17_LAZY>1`), the wy17 verify kernel persists only
+/// checkpoint intermediate slots, and the async-checkpoint commit path
+/// reconstructs a skipped non-checkpoint partial-accept slot via the
+/// `gated_delta_rule_wy17_replay` kernel instead of a plain intermediate
+/// → h_state D2D copy. Requires the per-layer k/v/gate/beta retention buffers
+/// (see `SsmLayerState::wy17_kv_retain` / `wy17_gate_retain`). Default OFF.
+/// Cached via `OnceLock`.
+pub fn wy17_lazy_commit() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_WY17_LAZY_COMMIT").ok().as_deref() == Some("1"))
+}
+
+/// Is intermediate slot `s` (0..K-1, i.e. Hi_0..Hi_{K-2}) persisted by the
+/// lazy wy17 kernel under stride `j`?
+///
+/// This MUST match `wy17_is_checkpoint` in `gated_delta_rule_wy17.cu` exactly,
+/// because the commit path uses it to decide whether `h_intermediate[s]` holds
+/// a real state (checkpoint → plain D2D copy) or a skipped slot that must be
+/// reconstructed via `gated_delta_rule_wy17_replay` (non-checkpoint → replay).
+///
+/// Kernel predicate:  `s == 0 || s == K-2 || ((s+1) % j == 0)`.
+/// `j <= 1` disables lazy (every slot written) so all slots are checkpoints.
+///
+/// `s` is the pool `token_idx` (== the kernel's Hi index) and is expected in
+/// `0..k` where `k = K = num verify tokens = γ+1` (so valid Hi slots are
+/// `0..=K-2`). A caller passing `s >= K-1` (e.g. the final live-h_state slot)
+/// is treated as a checkpoint (no replay) — replay only reconstructs the
+/// `Hi_0..Hi_{K-2}` intermediates the kernel could have skipped.
+#[inline]
+pub fn wy17_is_checkpoint(s: usize, j: u32, k: usize) -> bool {
+    if j <= 1 {
+        return true;
+    }
+    // Slots outside the intermediate range (0..=K-2) are never lazily skipped.
+    if k < 2 || s >= k - 1 {
+        return true;
+    }
+    let last_inter = k - 2; // K-2
+    s == 0 || s == last_inter || ((s as u32) + 1).is_multiple_of(j)
+}
+
+#[cfg(test)]
+mod wy17_checkpoint_tests {
+    use super::wy17_is_checkpoint;
+
+    const K: usize = 17; // DFlash γ+1
+
+    #[test]
+    fn lazy_disabled_j_le_1_all_checkpoints() {
+        for s in 0..K {
+            assert!(wy17_is_checkpoint(s, 0, K), "j=0 s={s}");
+            assert!(wy17_is_checkpoint(s, 1, K), "j=1 s={s}");
+        }
+    }
+
+    #[test]
+    fn slot_0_and_k_minus_2_always_checkpoints() {
+        for j in 2..=16u32 {
+            assert!(wy17_is_checkpoint(0, j, K), "slot 0 j={j}");
+            assert!(wy17_is_checkpoint(K - 2, j, K), "slot K-2 j={j}");
+        }
+    }
+
+    #[test]
+    fn final_slot_and_beyond_treated_as_checkpoint() {
+        // K-1 (the live-h_state slot) and any OOB slot are never skipped.
+        for j in 2..=16u32 {
+            assert!(wy17_is_checkpoint(K - 1, j, K), "slot K-1 j={j}");
+            assert!(wy17_is_checkpoint(K, j, K), "slot K j={j}");
+        }
+    }
+
+    #[test]
+    fn j8_matches_kernel_predicate() {
+        // j=8, K=17: checkpoints are s==0, s==15, or (s+1)%8==0 → s∈{7,15}.
+        // Memory note (J=8): 3 written slots {0, 7, 15}.
+        let expected_ckpt: Vec<usize> = vec![0, 7, 15];
+        for s in 0..(K - 1) {
+            let is_ckpt = wy17_is_checkpoint(s, 8, K);
+            assert_eq!(
+                is_ckpt,
+                expected_ckpt.contains(&s),
+                "j=8 s={s} got {is_ckpt}"
+            );
+        }
+        // Exactly 3 checkpoint intermediates (matches microbench "3 writes").
+        let n_ckpt = (0..(K - 1))
+            .filter(|&s| wy17_is_checkpoint(s, 8, K))
+            .count();
+        assert_eq!(n_ckpt, 3, "J=8 must persist 3 intermediate slots");
+    }
+
+    #[test]
+    fn j4_matches_kernel_predicate() {
+        // j=4, K=17: s==0, s==15, or (s+1)%4==0 → s∈{3,7,11,15}. Plus 0.
+        // → {0, 3, 7, 11, 15} = 5 written slots (matches microbench "5 writes").
+        let expected_ckpt: Vec<usize> = vec![0, 3, 7, 11, 15];
+        for s in 0..(K - 1) {
+            assert_eq!(
+                wy17_is_checkpoint(s, 4, K),
+                expected_ckpt.contains(&s),
+                "j=4 s={s}"
+            );
+        }
+        let n_ckpt = (0..(K - 1))
+            .filter(|&s| wy17_is_checkpoint(s, 4, K))
+            .count();
+        assert_eq!(n_ckpt, 5, "J=4 must persist 5 intermediate slots");
+    }
+
+    #[test]
+    fn j2_writes_alternating_plus_endpoints() {
+        // j=2, K=17: s==0, s==15, or (s+1)%2==0 → all odd s, plus 0.
+        // odd s in 0..=15 = {1,3,5,7,9,11,13,15} (8) plus s=0 = 9 slots.
+        let n_ckpt = (0..(K - 1))
+            .filter(|&s| wy17_is_checkpoint(s, 2, K))
+            .count();
+        assert_eq!(n_ckpt, 9, "J=2 checkpoint count");
+        assert!(wy17_is_checkpoint(1, 2, K));
+        assert!(!wy17_is_checkpoint(2, 2, K));
+    }
+
+    #[test]
+    fn small_k_never_panics() {
+        // Guard the k<2 branch and tiny verify windows (K=2/3).
+        for k in 0..=3usize {
+            for s in 0..=4usize {
+                for j in 0..=4u32 {
+                    let _ = wy17_is_checkpoint(s, j, k);
+                }
+            }
+        }
+    }
 }
 
 /// Returns true when `ATLAS_SSM_BA_BATCH=1` is set in the process env.
@@ -268,6 +468,28 @@ pub fn ffn_down_splitk() -> u32 {
 /// back to FP32 before the silu·mul, exactly reproducing the baseline's
 /// BF16 activation round-trip (m32_n64 writes gate_out/up_out as BF16 →
 /// moe_silu_mul reloads FP32). md5-gated. Default OFF for A/B safety.
+/// Returns true when `ATLAS_DEQUANT_PIPE=1` is set in the process env.
+///
+/// When the fused gate+up+SiLU path is active (`ffn_fused_gateup_enabled`),
+/// this routes it through the DEQUANT-IN-REGISTERS variant
+/// `w4a16_gemm_t_m32_n64_gateup_silu_pipe` instead of the SMEM-staged
+/// baseline `w4a16_gemm_t_m32_n64_gateup_silu`. Same shape, same caller
+/// signature, byte-exact output — the NVFP4→FP8 dequant runs in registers
+/// immediately before each `mma.sync.e4m3` (from resident packed W4 bytes)
+/// rather than being materialized into a `smem_B_fp8` staging array behind
+/// two `__syncthreads`. This (a) drops the second per-K-step barrier, (b)
+/// shrinks SMEM ~27% (10.9 KB vs 15.0 KB → higher occupancy — the opposite
+/// of the `pipe3` fork which grew SMEM and lost a block/SM), and (c) uses
+/// `cp.async.wait_group<1>` so the next tile's memory load overlaps the
+/// current tile's register dequant + MMA instead of a full drain. Requires
+/// the `_pipe` kernel symbol; falls back to the staged fused kernel when
+/// missing. Default OFF for A/B safety — md5-gated (greedy-counting
+/// constitution 91a6ff90d50736f779c09db67a96db2d).
+pub fn dequant_pipe_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_DEQUANT_PIPE").ok().as_deref() == Some("1"))
+}
+
 pub fn ffn_fused_gateup_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_FFN_FUSED_GATEUP").ok().as_deref() == Some("1"))
@@ -356,6 +578,55 @@ pub fn ssm_multi_seq_kernel_enabled() -> bool {
 pub fn ssm_multi_seq_graph_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_SSM_MULTI_SEQ_GRAPH").ok().as_deref() == Some("1"))
+}
+
+/// Returns true when `ATLAS_MULTISEQ_GRAPHS=1` is set in the process env.
+///
+/// Gates the **piecewise CUDA-graph** multi-seq decode dispatch
+/// (`decode_batch_dispatch_piecewise`). This is the pragmatic sibling of
+/// the monolithic `ATLAS_SSM_MULTI_SEQ_GRAPH` path: instead of trying to
+/// capture the *entire* per-step forward into one graph (which requires
+/// indirecting every per-slot device address a captured kernel reads — the
+/// SSM state pointers, KV block tables, slot mappings, attention split-K
+/// launch geometry, and embedding offsets), it captures only the segments
+/// that are provably address-stable and runs the rest eagerly:
+///
+///   * **SSM + FFN layer runs** — captured. The only per-slot addresses
+///     they read (the recurrent `h_state` / `conv_state` pointers) are
+///     already indirected through the layer-stable
+///     `ssm_multi_seq_ptr_scratch` device buffer (see
+///     `qwen3_ssm::decode_multi_seq_inner`, "Fix B"): the graph bakes only
+///     the *fixed* scratch address, and the freshly-uploaded per-step
+///     pointer table is consumed on replay. Requires the multi-seq SSM
+///     kernel path (`ssm_multi_seq_kernel_enabled`) so that indirection is
+///     actually taken; otherwise the per-seq fallback bakes raw
+///     `SsmLayerState` pointers and the segment is *not* captured.
+///   * **FullAttention layers** — run EAGER, never captured. Their paged
+///     decode picks a split-K partition (`num_splits`, hence the kernel
+///     grid dims) from a *host* scalar `max_seq_len_host = max(seq_lens)+1`
+///     (see `qwen3_attention::multi_seq::mod`). Baking that grid geometry
+///     into a graph makes replay stale the moment any sequence grows across
+///     a split-K threshold — the documented "one token corrupted per N=4
+///     stream". Running attention eagerly sidesteps the whole class.
+///   * **final norm + LM head** — captured as a tail segment (all fixed
+///     model-buffer addresses).
+///
+/// Because every captured segment now reads ONLY fixed device addresses,
+/// the segment-graph cache is keyed on **`(padded_n, segment_id)` alone**
+/// — NOT on the active slot tuple. A graph captured for a given padded
+/// batch size replays for *any* slot set of that size. Pad slots point at
+/// the dedicated `ssm_pool.dummy_slot()` / `dummy_kv_block` sentinels
+/// (vLLM PAD_SLOT_ID pattern), so one max-batch-size capture serves any
+/// `n <= padded_n`.
+///
+/// Metadata (positions / slot mapping / seq_len / block table / SSM ptr
+/// table) is uploaded to those fixed addresses *before* each segment's
+/// replay, OUTSIDE the captured region, mirroring vLLM's persistent-batch
+/// gather-before-replay. Default off; opt-in via env var. Cached via
+/// `OnceLock`.
+pub fn multiseq_graphs_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_MULTISEQ_GRAPHS").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_MTP_K3_BATCH_CSEQ=1` is set in the process env.
@@ -628,6 +899,94 @@ pub fn dflash_attn_kgamma_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_ATTN_KGAMMA").ok().as_deref() == Some("1"))
 }
 
+/// Returns true when `ATLAS_MEASURE_FFN_SPARSITY=1` is set in the process env.
+///
+/// Gates the TEAL-style FFN activation-sparsity MEASUREMENT harness — the
+/// go/no-go feasibility gate for sparsity-drafted self-speculation. When on,
+/// `DenseFfnLayer::forward` runs `ffn_sparsity_measure` at two sites per
+/// layer:
+///   1. on `input` (gate/up in, K=hidden=5120) before the dual GEMV
+///   2. on `gate_out` (down in, K=intermediate=17408) after silu_mul
+/// accumulating per-site below-threshold histograms at {0.5,1,2,5}%×rowmax.
+/// A periodic D2H dump (see `DenseFfnLayer::maybe_dump_sparsity`) prints the
+/// averaged fractions so the operator can read the down_proj-input sparsity —
+/// the single number that decides whether the whole flagship is worth building
+/// (>=40% at <=1% threshold → BUILD; <25% → KILL).
+///
+/// This is a PURE OBSERVER: the measure kernel only READS `input`/`gate_out`
+/// and writes into dedicated per-layer counter buffers — it never mutates the
+/// token-producing path. Enabling the gate therefore keeps the greedy-counting
+/// md5 at the 91a6ff90 constitution (the token stream is byte-identical whether
+/// the gate is on or off; only extra observer kernels are launched).
+/// Default off. Cached via `OnceLock`.
+pub fn measure_ffn_sparsity_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_MEASURE_FFN_SPARSITY").ok().as_deref() == Some("1"))
+}
+
+/// Number of decode-token FFN forwards between periodic sparsity-histogram
+/// dumps (`ATLAS_MEASURE_FFN_SPARSITY_EVERY`, default 512). The dump is
+/// per-site, averaged over all rows seen since process start, and printed at
+/// `tracing::info`. Returns the parsed value clamped to `>= 1`.
+pub fn measure_ffn_sparsity_dump_every() -> u64 {
+    static GATE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_MEASURE_FFN_SPARSITY_EVERY")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(512)
+    })
+}
+
+/// Returns true when `ATLAS_SELF_SPEC_SPARSE=1` is set in the process env.
+///
+/// Selects the SPARSE self-speculative DRAFT path (`decode_draft_sparse`) in
+/// `step_self_spec` instead of the default dense layer-skip `decode_draft`.
+/// The sparse draft reuses the existing self-spec layer-skip shape (SSM layers
+/// skipped, so rewind stays a trivial truncate — NO new SSM checkpoint/rollback)
+/// but swaps the FFN's down_proj (and gate/up) GEMV for the column-sparse path
+/// (`ffn_build_keep_chunks` → `w4a16_gemv_sparse_cols`), reading fewer weight
+/// bytes. The draft need NOT be bit-exact — the dense verify (`decode_verify`,
+/// untouched) is the lossless oracle. When OFF, `step_self_spec` calls the
+/// ORIGINAL `decode_draft` byte-for-byte. Default off. Cached via `OnceLock`.
+pub fn self_spec_sparse_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SELF_SPEC_SPARSE").ok().as_deref() == Some("1"))
+}
+
+/// Threshold (fraction of per-row max-abs) for the sparse self-spec draft's
+/// keep-chunk selection (`ATLAS_SELF_SPEC_SPARSE_THRESH`, as a PERCENT — e.g.
+/// `1.0` means 1% of rowmax). A k8 chunk survives iff any of its 8 activations
+/// is `>= (percent/100) * rowmax`. Higher percent → more columns skipped →
+/// cheaper draft but lower acceptance. Returns the parsed percent as a raw
+/// fraction (percent/100), defaulting to 0.01 (1%). Clamped to (0, 1].
+pub fn self_spec_sparse_thresh() -> f32 {
+    static GATE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        let pct = std::env::var("ATLAS_SELF_SPEC_SPARSE_THRESH")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        parse_sparse_thresh_pct(pct)
+    })
+}
+
+/// Pure conversion + clamp for `ATLAS_SELF_SPEC_SPARSE_THRESH` (a PERCENT) into
+/// a keep-threshold FRACTION of per-row max-abs. Extracted from
+/// `self_spec_sparse_thresh` so it is unit-testable without touching process
+/// env (the OnceLock caches on first call). Keeps the result in `(0, 1]`:
+/// `>= 1` would skip everything but the rowmax chunk (degenerate); `<= 0`
+/// would keep all chunks (== dense). Clamped to a sane draft window.
+#[inline]
+pub fn parse_sparse_thresh_pct(pct: f32) -> f32 {
+    let frac = pct / 100.0;
+    if !frac.is_finite() {
+        return 0.01; // default 1% for NaN/inf input
+    }
+    frac.clamp(1e-4, 1.0)
+}
+
 /// Returns true when `ATLAS_FLASH_ATTN_KGAMMA=1` is set in the process env.
 ///
 /// Gates the FlashAttention-v2 inspired Q-tile fused paged-decode kernel
@@ -757,7 +1116,16 @@ impl FfnComponent {
     ) -> Result<DevicePtr> {
         match self {
             Self::Moe(m) => m.forward(input, ctx, stream),
-            Self::Dense(d) => d.forward(input, ctx, stream),
+            // Sparsity-drafted self-spec DRAFT path: when the context requests
+            // it (`decode_draft_sparse` sets `self_spec_sparse_draft=Some(t)`),
+            // route the dense FFN through the column-sparse draft GEMV. Every
+            // other caller leaves the field `None` → the exact dense `forward`
+            // runs, byte-for-byte as before. `forward_draft_sparse` itself
+            // falls back to `forward` when the sparse kernels are missing.
+            Self::Dense(d) => match ctx.self_spec_sparse_draft {
+                Some(thresh) => d.forward_draft_sparse(input, ctx, thresh, stream),
+                None => d.forward(input, ctx, stream),
+            },
             Self::None => Ok(input),
         }
     }
@@ -833,5 +1201,46 @@ impl FfnComponent {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sparse_thresh_tests {
+    use super::parse_sparse_thresh_pct;
+
+    #[test]
+    fn default_one_percent() {
+        // 1.0 percent → 0.01 fraction.
+        assert!((parse_sparse_thresh_pct(1.0) - 0.01).abs() < 1e-9);
+    }
+
+    #[test]
+    fn half_percent() {
+        assert!((parse_sparse_thresh_pct(0.5) - 0.005).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_percent() {
+        assert!((parse_sparse_thresh_pct(2.0) - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clamps_below_floor() {
+        // A tiny percent floors at 1e-4 (keeps the draft from becoming dense).
+        assert!((parse_sparse_thresh_pct(0.0) - 1e-4).abs() < 1e-9);
+        assert!((parse_sparse_thresh_pct(-5.0) - 1e-4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clamps_above_ceiling() {
+        // >= 100% clamps to 1.0 (degenerate but bounded).
+        assert!((parse_sparse_thresh_pct(150.0) - 1.0).abs() < 1e-9);
+        assert!((parse_sparse_thresh_pct(100.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_finite_falls_back_to_default() {
+        assert!((parse_sparse_thresh_pct(f32::NAN) - 0.01).abs() < 1e-9);
+        assert!((parse_sparse_thresh_pct(f32::INFINITY) - 0.01).abs() < 1e-9);
     }
 }

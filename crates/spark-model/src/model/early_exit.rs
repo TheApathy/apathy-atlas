@@ -211,6 +211,7 @@ impl TransformerModel {
             ddtree_parent_ids_dev: None,
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
+            self_spec_sparse_draft: None,
         };
 
         // 3. Run the FIRST `n_layers` target layers — ALL layer types. The

@@ -443,4 +443,68 @@ pub trait TransformerLayer: Send + Sync {
     /// - `EmptyLayerState` for pure attention layers
     /// - `SsmLayerState` for SSM/recurrent layers
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>>;
+
+    /// Piecewise-CUDA-graph hook: report whether, for a batch of `num_seqs`
+    /// sequences, this layer's multi-seq decode takes the address-stable
+    /// path (all per-slot device addresses indirected through fixed
+    /// scratch), making it safe to include in a captured segment graph.
+    ///
+    /// Default `false` — a layer that returns `false` forces a segment
+    /// boundary (the piecewise dispatcher runs it eagerly). Overridden by
+    /// SSM layers that take the multi-seq kernel path.
+    fn multiseq_graph_safe(&self, _num_seqs: usize) -> bool {
+        false
+    }
+
+    /// Piecewise-CUDA-graph hook: gather-before-replay. Refresh any
+    /// layer-local host→device pointer table (e.g. SSM h_state/conv_state
+    /// indirection) with the current active sequences' addresses so a
+    /// previously-captured segment graph replays against live state.
+    ///
+    /// Default no-op — layers with no per-slot indirection need nothing.
+    /// Called by the piecewise dispatcher BEFORE replaying a segment that
+    /// contains this layer, OUTSIDE the captured region. See
+    /// `Qwen3SsmLayer::refresh_multi_seq_ptr_table`.
+    #[allow(clippy::too_many_arguments)]
+    fn multiseq_refresh_ptr_table<'a, 'b: 'a>(
+        &self,
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _num_seqs: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// WY17 LAZY-commit hook: the `gated_delta_rule_wy17_replay` kernel handle
+    /// for this layer, or a null handle (`KernelHandle(0)`) if this layer type
+    /// / target doesn't provide it. The async-checkpoint commit path uses it to
+    /// reconstruct a skipped (non-checkpoint) intermediate H slot on a partial
+    /// accept. Default null — only SSM layers with the lazy kernel loaded
+    /// return a live handle. See `Qwen3SsmLayer`.
+    fn wy17_replay_kernel(&self) -> spark_runtime::gpu::KernelHandle {
+        spark_runtime::gpu::KernelHandle(0)
+    }
+
+    /// TRUE when this layer's K=γ GDN dispatch would take the tree-aware
+    /// kernel branch for a ForwardContext with `ddtree_parent_ids_dev` set
+    /// (i.e. `gdn_tree_k` is loaded). Used by `verify_d.rs` to decide whether
+    /// the graph-safe flat-chain parent injection actually reroutes the SSM
+    /// to `gated_delta_rule_tree_wy` (which leaves `h_state` stale — the
+    /// commit must know; task #34). Default false — non-SSM layers.
+    fn gdn_tree_kernel_loaded(&self) -> bool {
+        false
+    }
+
+    /// TRUE when a `num_tokens`-wide verify on this layer runs the LAZY wy17
+    /// kernel (`gated_delta_rule_wy17_lazy`, sparse intermediate H writes).
+    /// The async-checkpoint commit consults this before choosing the
+    /// `gated_delta_rule_wy17_replay` path: replay is only bit-exact when the
+    /// lazy kernel populated the retention buffers THIS verify — a K≠17
+    /// (chunked) verify under global `ATLAS_WY17_LAZY` env gates must use the
+    /// plain intermediate D2D copy instead (task #34 sibling hazard).
+    /// Default false — non-SSM layers. See `Qwen3SsmLayer`.
+    fn wy17_lazy_engaged(&self, _num_tokens: usize) -> bool {
+        false
+    }
 }

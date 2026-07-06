@@ -980,6 +980,125 @@ impl BlockDiffusionDraftHead {
             }
         }
 
+        // ── ATLAS_DFLASH_FREE_SLOTS=<N>: free-slot branch verify (default off) ──
+        //
+        // The whole thesis of the K=32 verify: it is weight-bandwidth-bound, so
+        // verifying 32 nodes costs the same wall-clock as 17. The free 15 slots
+        // are free candidate tokens. Instead of a single cliff fork (BRANCH /
+        // CATERPILLAR, both held at K=17 by dropping spine nodes), keep the full
+        // γ spine AND spend the extra slots on SIBLING BRANCHES placed at the
+        // low-confidence draft positions where the chain statistically dies
+        // (the cliffs) — the DDTree / SAM-retrieval finding (+46% accept on
+        // coding). Each branch carries the drafter's top-2 at the cliff plus a
+        // short re-rooted tail; multiple branches fill the budget shallowest
+        // first (EAGLE-2: shallow accept dominates).
+        //
+        // The OPERATOR MUST ALSO set ATLAS_DDTREE_MAX_NODES=<K> (K = the free
+        // width, ≤ 32) so the verify-side persistent buffers (parent_ids, SSM
+        // intermediates, hidden_save) are sized for the wider tree; and, to
+        // commit the deep branch tails byte-exactly, ATLAS_DDTREE_DFS_REORDER=1
+        // + ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 + ATLAS_DFLASH_TREE_COMMIT=1.
+        // LOSSLESS regardless: the greedy verify commits only the target's
+        // argmax, so a mis-conditioned deep row is simply rejected (see
+        // `build_free_slots_payload` doc). Default off ⇒ byte-identical to the
+        // flat γ=16 path.
+        //
+        // N = the number of sibling branches to place (each ≈ 1 + tail_len
+        // extra nodes). The builder self-limits to the ddtree capacity.
+        let free_slots: usize = std::env::var("ATLAS_DFLASH_FREE_SLOTS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if free_slots >= 1 && drafts.len() >= 3 {
+            let margin_thresh: f32 = std::env::var("ATLAS_DFLASH_BRANCH_MARGIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2.0);
+            // Per-branch tail length (post-cliff continuation carried on the
+            // sibling). 0 = bare 1-node fork leaves. Default 4 — enough of the
+            // predictable post-cliff structure (indentation/closers) to re-accept.
+            let tail_len: usize = std::env::var("ATLAS_DFLASH_FREE_SLOTS_TAIL")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(4);
+            let n = drafts.len();
+            match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
+                Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
+                    // Per-row top1−top2 margins over the spine rows.
+                    let margins: Vec<f32> =
+                        (0..n).map(|r| topk_logits[2 * r] - topk_logits[2 * r + 1]).collect();
+                    let cliffs = super::ddtree::pick_free_slot_cliffs(
+                        &margins,
+                        margin_thresh,
+                        free_slots,
+                    );
+                    // Build one FreeSlotBranch per cliff: fork = the drafter's
+                    // top-2 at that row; tail = the spine's own post-cliff
+                    // tokens (re-rooted onto the fork — the predictable
+                    // continuation the chain would have produced past the cliff).
+                    let branches: Vec<super::ddtree::FreeSlotBranch> = cliffs
+                        .iter()
+                        .filter_map(|&cliff_depth| {
+                            let row = cliff_depth - 1; // 0-based spine row
+                            let fork_token = topk_tokens[2 * row + 1]; // top-2
+                            // Skip a degenerate fork that equals the spine token.
+                            if fork_token == drafts[row] {
+                                return None;
+                            }
+                            let tail: Vec<u32> =
+                                drafts[(row + 1).min(n)..].iter().take(tail_len).copied().collect();
+                            Some(super::ddtree::FreeSlotBranch {
+                                cliff_depth,
+                                fork_token,
+                                tail,
+                            })
+                        })
+                        .collect();
+                    if branches.is_empty() {
+                        // No usable cliff → flat chain, identical to baseline.
+                        dstate.pending_tree_payload = None;
+                        return Ok(drafts);
+                    }
+                    // Widen the payload to the ddtree verify capacity (K-1 nodes).
+                    let max_nodes = ddtree_verify_cap.saturating_sub(1).max(drafts.len());
+                    let payload = super::ddtree::build_free_slots_payload(
+                        &drafts,
+                        &branches,
+                        max_nodes,
+                    );
+                    static FREE_DBG: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let dbg = FREE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if dbg < 8 {
+                        tracing::info!(
+                            "DFlash FREE_SLOTS #{dbg}: γ={n} branches={} cliffs={:?} max_nodes={} \
+                             nodes={} tokens[..min(10)]={:?} parents[..min(10)]={:?}",
+                            branches.len(),
+                            cliffs,
+                            max_nodes,
+                            payload.tree_token_ids.len(),
+                            &payload.tree_token_ids[..payload.tree_token_ids.len().min(10)],
+                            &payload.parent_indices[..payload.parent_indices.len().min(10)],
+                        );
+                    }
+                    dstate.pending_tree_payload = Some(payload);
+                    dstate.last_num_drafted = drafts.len();
+                    return Ok(drafts);
+                }
+                Ok(_) => {
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "DFlash FREE_SLOTS top-2 extraction failed ({e}); flat chain fallback"
+                    );
+                    dstate.pending_tree_payload = None;
+                    return Ok(drafts);
+                }
+            }
+        }
+
         let branch_enabled = std::env::var("ATLAS_DFLASH_BRANCH").ok().as_deref() == Some("1");
         if branch_enabled && drafts.len() >= 3 {
             // Margin threshold in raw-BF16-logit units (top tokens are O(10-30),
@@ -1140,11 +1259,8 @@ impl BlockDiffusionDraftHead {
         if portfolio_active && !drafts.is_empty() {
             if let Some(retr_chain) = portfolio_retrieval_chain.take() {
                 let max_nodes = ddtree_verify_cap.saturating_sub(1).max(drafts.len());
-                let payload = super::ddtree::build_portfolio_payload(
-                    &drafts,
-                    &retr_chain,
-                    max_nodes,
-                );
+                let payload =
+                    super::ddtree::build_portfolio_payload(&drafts, &retr_chain, max_nodes);
                 static PORTF_FUSE_DBG: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !PORTF_FUSE_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {
