@@ -5,9 +5,16 @@
 use super::*;
 
 /// Process logits for a single active sequence: dequant, adjust, sample, return token + optional logprobs.
+///
+/// This is the single source of truth for the per-token thinking-span logit
+/// interventions (F1 reflection suppression, efficiency wave, F2 confidence
+/// early stop, tool-call mask, forced `</think>` injection). Besides the
+/// plain decode path (`process_decode_logits`), the `ATLAS_THINK_SPEC=1`
+/// accept filter (`think_spec_accept`) feeds individual verify-logits rows
+/// through this same function so the speculative and plain paths cannot
+/// drift — do NOT fork the intervention logic out of here.
 #[allow(clippy::too_many_arguments)]
 pub fn process_seq_logits(
-    _model: &dyn Model,
     a: &mut ActiveSeq,
     buf: &[u8],
     i: usize,
@@ -51,6 +58,64 @@ pub fn process_seq_logits(
         }
     }
 
+    // ── Decoding-efficiency wave (env-gated, default-OFF, OUTPUT-SHAPING) ──
+    // Lever 1 (hesitation penalty) + Lever 2 (soft </think> exit bias) shape
+    // the thinking-span logits; Lever 3 (adaptive budget) probes difficulty
+    // over the first ~48 thinking tokens and rescales `thinking_budget`.
+    //
+    // Fully inert when no ATLAS_* var is set: `is_active()` is false, the
+    // shaping apply is a guarded no-op, and the probe never observes — so the
+    // committed token stream (and counting-eval md5) is byte-identical.
+    if a.inside_thinking {
+        let cfg = crate::scheduler::think_efficiency_config();
+        if cfg.is_active() {
+            // Lever 3: adaptive thinking budget. Observe this token's top-1
+            // confidence into the difficulty probe; once the probe window is
+            // full, commit a difficulty-scaled budget (once). Confidence is the
+            // only difficulty signal available *during* thinking — speculative
+            // decode (and thus the drafter accept-rate) is bypassed while
+            // inside_thinking by the MTP gate in scheduler::run, unless
+            // ATLAS_THINK_SPEC=1, in which case the think-spec accept filter
+            // slow-paths every position through this function while the wave
+            // is active, so the probe observes identically. High mean
+            // confidence ⇒ easy reasoning ⇒ shorter budget.
+            if cfg.adaptive_think {
+                let top1 = crate::scheduler::top1_confidence(&f32_logits);
+                a.difficulty_probe.observe(top1);
+                if let Some(base) = a.thinking_budget
+                    && let Some(scaled) = a.difficulty_probe.commit(base)
+                {
+                    if scaled != base {
+                        tracing::info!(
+                            seq_thinking_tokens = a.thinking_tokens,
+                            mean_confidence = a.difficulty_probe.mean_confidence().unwrap_or(0.0),
+                            base_budget = base,
+                            adaptive_budget = scaled,
+                            "ADAPTIVE_THINK: rescaled thinking budget from difficulty probe"
+                        );
+                    }
+                    a.thinking_budget = Some(scaled);
+                }
+            }
+
+            // Levers 1+2: hesitation penalty + progressive </think> exit bias.
+            let touched = crate::scheduler::apply_think_logit_shaping(
+                &mut f32_logits,
+                cfg,
+                think_end_token,
+                a.thinking_tokens,
+                a.thinking_budget,
+            );
+            if touched > 0 && tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
+                    thinking_tokens = a.thinking_tokens,
+                    touched,
+                    "THINK_EFFICIENCY: shaped {touched} logit slots"
+                );
+            }
+        }
+    }
+
     // F2: Confidence-based early stop during thinking.
     // When top-1 prob >= 0.95 for 30 consecutive tokens, force </think>.
     // Only kicks in after 400 thinking tokens — the model needs room to
@@ -72,7 +137,7 @@ pub fn process_seq_logits(
     // (decode_logits_step) also stays active in fences.
     if a.inside_thinking
         && !a.force_end_thinking
-        && a.thinking_tokens >= 400
+        && a.thinking_tokens >= CONFIDENCE_EARLY_STOP_MIN_THINKING
         && crate::scheduler::helpers::watchdog_params().confidence_early_stop
     {
         let max_logit = f32_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

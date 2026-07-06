@@ -111,10 +111,7 @@ pub fn check_loop_watchdog(
     // `needle` is already normalised; pass `&line` here so `norm_eq`
     // doesn't trim+lowercase it twice — both arms produce the same
     // normalised sequence (line is the source we computed `needle` from).
-    let exact_occurrences = loop_scan_buf
-        .lines()
-        .filter(|l| norm_eq(l, &line))
-        .count();
+    let exact_occurrences = loop_scan_buf.lines().filter(|l| norm_eq(l, &line)).count();
     if exact_occurrences >= 4 {
         tracing::warn!(
             occurrences = exact_occurrences,

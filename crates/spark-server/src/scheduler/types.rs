@@ -212,6 +212,12 @@ pub(super) struct ActiveSeq {
     pub adaptive: crate::adaptive_sampler::AdaptiveSamplingState,
     /// Number of prompt tokens served by the prefix cache (no prefill cost).
     pub cached_prompt_tokens: u32,
+    /// Lever 3 (ATLAS_ADAPTIVE_THINK): per-sequence difficulty probe over the
+    /// first ~48 thinking tokens. Accumulates top-1 confidence; once full it
+    /// commits an adaptively-scaled `thinking_budget`. Inert (never observed,
+    /// never committed) unless `ATLAS_ADAPTIVE_THINK=1`. See
+    /// [`super::thinking_efficiency::DifficultyProbe`].
+    pub difficulty_probe: super::thinking_efficiency::DifficultyProbe,
 }
 
 /// A sequence that has been swapped out to disk (KV + SSM state saved to file).

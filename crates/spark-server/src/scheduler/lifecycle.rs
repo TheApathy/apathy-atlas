@@ -309,7 +309,7 @@ pub fn resume_swapped_seq(
         // Grammar state is not serializable; resumed sequences use legacy fallback.
         grammar_state: None,
         pending_drafts: Vec::new(),
-            pending_tree_payload: None,
+        pending_tree_payload: None,
         last_token_time: Instant::now(),
         request_start: s.request_start,
         decode_start: s.decode_start,
@@ -319,5 +319,9 @@ pub fn resume_swapped_seq(
         timeout_at: s.timeout_at,
         adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(s.temperature),
         cached_prompt_tokens: s.cached_prompt_tokens,
+        // Swap-in resets the difficulty probe: a resumed sequence is past its
+        // thinking-probe window (or the budget already committed), so a fresh
+        // (inert) probe is correct — it never re-observes post-`</think>`.
+        difficulty_probe: Default::default(),
     })
 }

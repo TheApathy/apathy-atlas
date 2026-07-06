@@ -26,7 +26,13 @@ use super::*;
 ///     accepted bonus token (the next propose() needs the latest hidden).
 ///   * Sliding-window state rollback for sliding-attention layers
 ///     (Gemma-4-style; not used by Qwen3.6 targets).
-pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_drafts: usize) {
+pub fn step_verify_dflash(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    drafts: &[u32],
+    num_drafts: usize,
+    think: &ThinkSpecCtx<'_>,
+) {
     // ATLAS_DFLASH_STEP_TIMING=1: per-phase wall-clock breakdown of the
     // verify step, logged once per step. Companion to ATLAS_DFLASH_PROPOSE_LOG
     // (which only covers the re-propose at the tail of this function).
@@ -65,10 +71,14 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // identical bytes. When the tree is non-flat (M4B v2 with branches),
     // this fix puts the RIGHT tokens at the RIGHT slots so the verifier's
     // per-position argmax aligns with the tree topology.
-    let tree_tokens_verify =
-        std::env::var("ATLAS_DDTREE_TREE_TOKENS_VERIFY").ok().as_deref() == Some("1");
+    let tree_tokens_verify = std::env::var("ATLAS_DDTREE_TREE_TOKENS_VERIFY")
+        .ok()
+        .as_deref()
+        == Some("1");
     let use_tree_tokens = tree_tokens_verify
-        && a.pending_tree_payload.as_ref().is_some_and(|p| !p.is_empty());
+        && a.pending_tree_payload
+            .as_ref()
+            .is_some_and(|p| !p.is_empty());
 
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
@@ -198,8 +208,28 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // overrides the accept count and bonus token below; `None` falls
     // through to the unmasked paths (grammar inactive / tree mode / fp32
     // logits / D2H failure).
-    let grammar_accept: Option<(usize, u32)> = if dflash_grammar_mode()
-        == DflashGrammarMode::Verify
+    // ATLAS_THINK_SPEC=1 thinking-span accept filter (sibling of the
+    // grammar path below, same walk-and-truncate shape): re-derives the
+    // PLAIN-path token per verify position — F1 reflection suppression,
+    // F2 confidence early stop, efficiency wave, tool-call mask, forced
+    // `</think>` injection, in-thinking EOS suppression — and truncates
+    // acceptance at the first divergence or phase boundary. The walk
+    // COMMITS (streams) its accepted tokens + bonus itself, because the
+    // in-thinking side effects (suppressed EOS, `</think>` transition,
+    // fence parity, THINK_LOOP watchdog) don't fit the plain emit loop
+    // below. Mutually exclusive with the grammar path: grammar masking is
+    // suspended inside `<think>` (dflash_masked_accept bails on
+    // `inside_thinking`), and tree payloads are cleared for thinking
+    // sequences in step_mtp before verify.
+    let thinking_accept: Option<ThinkAcceptOutcome> =
+        if think.enabled && a.inside_thinking && a.pending_tree_payload.is_none() {
+            run_dflash_thinking_accept(model, a, &verify_input_tokens, &verified, think)
+        } else {
+            None
+        };
+
+    let grammar_accept: Option<(usize, u32)> = if thinking_accept.is_none()
+        && dflash_grammar_mode() == DflashGrammarMode::Verify
         && a.pending_tree_payload.is_none()
     {
         dflash_masked_accept(model, a, &verify_input_tokens, &verified)
@@ -217,12 +247,14 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     let tree_commit_enabled =
         std::env::var("ATLAS_DFLASH_TREE_COMMIT").ok().as_deref() == Some("1");
     let mut tree_accepted_path: Option<(Vec<usize>, usize)> = None;
-    let (num_accepted, tree_last_inter_slot) = if let Some((n, _)) = grammar_accept {
+    let (num_accepted, tree_last_inter_slot) = if let Some(ref t) = thinking_accept {
+        (t.num_accepted, None)
+    } else if let Some((n, _)) = grammar_accept {
         (n, None)
     } else if let Some(payload) = a.pending_tree_payload.as_ref() {
         use spark_model::layers::dflash_head::ddtree::{
-            greedy_sample_ddtree, greedy_sample_ddtree_full, last_accepted_inter_slot,
-            DDTreeRequestRuntime,
+            DDTreeRequestRuntime, greedy_sample_ddtree, greedy_sample_ddtree_full,
+            last_accepted_inter_slot,
         };
         let req = DDTreeRequestRuntime {
             req_id: String::new(),
@@ -300,10 +332,8 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
                 // The bonus row is the compact tip the walk ended at
                 // (== last accepted compact index, or 0 if nothing accepted).
                 if tree_commit_enabled {
-                    let bonus_row =
-                        sample.accepted_compact_indices.last().copied().unwrap_or(0);
-                    tree_accepted_path =
-                        Some((sample.accepted_compact_indices.clone(), bonus_row));
+                    let bonus_row = sample.accepted_compact_indices.last().copied().unwrap_or(0);
+                    tree_accepted_path = Some((sample.accepted_compact_indices.clone(), bonus_row));
                 }
                 (n, Some(slot))
             }
@@ -317,8 +347,14 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
                 // == drafts so this matches legacy chain-arithmetic.
                 let mut n = 0usize;
                 for i in 0..verify_input_tokens.len() {
-                    if i + 1 >= verified.len() { break; }
-                    if verify_input_tokens[i] == verified[i] { n += 1; } else { break; }
+                    if i + 1 >= verified.len() {
+                        break;
+                    }
+                    if verify_input_tokens[i] == verified[i] {
+                        n += 1;
+                    } else {
+                        break;
+                    }
                 }
                 // Fallback path is chain-arithmetic but the GDN kernel
                 // that just ran was still tree-aware — slot 0 if nothing
@@ -388,7 +424,11 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // Logs the accept count for THIS K=γ verify step so the early-exit
     // sweep can read mean accept/γ straight from the server log. Cheap
     // (one log line per verify); gated so it is a no-op in production.
-    if std::env::var("ATLAS_DFLASH_EARLY_EXIT_PROFILE").ok().as_deref() == Some("1") {
+    if std::env::var("ATLAS_DFLASH_EARLY_EXIT_PROFILE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         tracing::info!(
             "DFLASH_EE_VERIFY: accepted={num_accepted}/{} drafts[..min(6)]={:?}",
             drafts.len(),
@@ -418,45 +458,58 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     // accepted token by its compact index (compact slot `c` carries
     // `verify_input_tokens[c-1]`) rather than slicing the contiguous prefix.
     // Falls back to the legacy contiguous slice on every flat/non-tree path.
-    let emit_tokens: Vec<u32> = if let Some((ref path, _)) = tree_accepted_path {
-        path.iter()
-            .filter_map(|&c| verify_input_tokens.get(c.saturating_sub(1)).copied())
-            .collect()
+    if let Some(ref t) = thinking_accept {
+        // ATLAS_THINK_SPEC: the thinking walk already committed/streamed
+        // its accepted prefix AND bonus with plain-path in-thinking
+        // semantics (suppressed EOS never reaches output_tokens,
+        // `</think>` runs the phase transition, `a.last_token` already
+        // points at the bonus). A missing bonus means the walk finished
+        // the sequence mid-emission (stream drop / cancel / D2H failure)
+        // — bail out exactly like the legacy emit loop's early return.
+        if a.finished || t.bonus.is_none() {
+            return;
+        }
     } else {
-        let emit_take = num_accepted.min(verify_input_tokens.len());
-        verify_input_tokens[..emit_take].to_vec()
-    };
-    for &tok in &emit_tokens {
-        emit_token(a, tok, None);
-        if a.finished {
-            return;
+        let emit_tokens: Vec<u32> = if let Some((ref path, _)) = tree_accepted_path {
+            path.iter()
+                .filter_map(|&c| verify_input_tokens.get(c.saturating_sub(1)).copied())
+                .collect()
+        } else {
+            let emit_take = num_accepted.min(verify_input_tokens.len());
+            verify_input_tokens[..emit_take].to_vec()
+        };
+        for &tok in &emit_tokens {
+            emit_token(a, tok, None);
+            if a.finished {
+                return;
+            }
         }
-    }
 
-    // Bonus token = verified[num_accepted] (the one that "corrected" the draft
-    // at the first mismatch, or the next-prediction past the full-accept case).
-    // Grammar verify mode substitutes the MASKED argmax at that position —
-    // safe because the bonus has no KV/seq.tokens entry yet (it is fed as
-    // verify input position 0 next step), exactly like the MTP masked path.
-    //
-    // FIX 1: for a tree-fork accept the bonus is the target's greedy at the
-    // path TIP (the last accepted compact row), NOT verified[num_accepted]
-    // (which is a contiguous-index assumption that is false once the path
-    // forked). `tree_accepted_path.1` carries that compact row.
-    let bonus_idx = match tree_accepted_path {
-        Some((_, bonus_row)) => bonus_row,
-        None => num_accepted,
-    };
-    let bonus_tok = match grammar_accept {
-        Some((_, b)) => Some(b),
-        None => verified.get(bonus_idx).copied(),
-    };
-    if let Some(bonus) = bonus_tok {
-        emit_token(a, bonus, None);
-        if a.finished {
-            return;
+        // Bonus token = verified[num_accepted] (the one that "corrected" the draft
+        // at the first mismatch, or the next-prediction past the full-accept case).
+        // Grammar verify mode substitutes the MASKED argmax at that position —
+        // safe because the bonus has no KV/seq.tokens entry yet (it is fed as
+        // verify input position 0 next step), exactly like the MTP masked path.
+        //
+        // FIX 1: for a tree-fork accept the bonus is the target's greedy at the
+        // path TIP (the last accepted compact row), NOT verified[num_accepted]
+        // (which is a contiguous-index assumption that is false once the path
+        // forked). `tree_accepted_path.1` carries that compact row.
+        let bonus_idx = match tree_accepted_path {
+            Some((_, bonus_row)) => bonus_row,
+            None => num_accepted,
+        };
+        let bonus_tok = match grammar_accept {
+            Some((_, b)) => Some(b),
+            None => verified.get(bonus_idx).copied(),
+        };
+        if let Some(bonus) = bonus_tok {
+            emit_token(a, bonus, None);
+            if a.finished {
+                return;
+            }
+            a.last_token = bonus;
         }
-        a.last_token = bonus;
     }
 
     crate::metrics::SPEC_DECODE_VERIFY
@@ -600,9 +653,7 @@ pub fn step_verify_dflash(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], 
     if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() == Some("1")
         && a.pending_tree_payload.is_none()
     {
-        if let Err(e) =
-            model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token)
-        {
+        if let Err(e) = model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token) {
             tracing::warn!("dflash_stash_recycle: {e:#}");
         }
     }
@@ -690,6 +741,10 @@ fn dflash_tree_method_active() -> bool {
         std::env::var("ATLAS_DFLASH_BRANCH").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_CATERPILLAR").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_METHOD").ok().as_deref() == Some("ddtree")
+            || std::env::var("ATLAS_DFLASH_FREE_SLOTS")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .is_some_and(|n| n >= 1)
     })
 }
 
@@ -708,7 +763,10 @@ fn cfg_jf_splice_drafts(a: &ActiveSeq, drafts: &mut [u32]) {
         return;
     }
     // Do not fight an active grammar (xgrammar already forces those slots).
-    if a.grammar_state.as_ref().is_some_and(|gs| !gs.is_terminated()) {
+    if a.grammar_state
+        .as_ref()
+        .is_some_and(|gs| !gs.is_terminated())
+    {
         return;
     }
     let (Some(table), Some(forced)) = (jf::delim_table(), jf::forced_ids()) else {
@@ -763,11 +821,7 @@ fn dflash_masked_accept(
     if a.inside_thinking || verified.is_empty() {
         return None;
     }
-    if a
-        .grammar_state
-        .as_ref()
-        .is_none_or(|gs| gs.is_terminated())
-    {
+    if a.grammar_state.as_ref().is_none_or(|gs| gs.is_terminated()) {
         return None;
     }
     let logits_base = model.logits_buffer_ptr();
@@ -868,7 +922,10 @@ fn dflash_typical_accept(
     if a.temperature <= 0.0 {
         return None;
     }
-    if a.grammar_state.as_ref().is_some_and(|gs| !gs.is_terminated()) {
+    if a.grammar_state
+        .as_ref()
+        .is_some_and(|gs| !gs.is_terminated())
+    {
         return None;
     }
     let logits_base = model.logits_buffer_ptr();
@@ -896,14 +953,11 @@ fn dflash_typical_accept(
         if row_buf.is_empty() {
             row_buf = vec![0u8; vocab * 2];
         }
-        if let Err(e) =
-            model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf)
-        {
+        if let Err(e) = model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf) {
             tracing::warn!("DFlash typical accept: logits D2H failed ({e:#}); stopping prefix");
             break;
         }
-        let (p_draft, p_max) =
-            typical_row_probs_bf16(&row_buf, vocab, a.temperature, drafts[i]);
+        let (p_draft, p_max) = typical_row_probs_bf16(&row_buf, vocab, a.temperature, drafts[i]);
         if p_draft >= epsilon.max(alpha * p_max) {
             accepted += 1;
             typical_hits += 1;
@@ -1070,7 +1124,10 @@ fn dflash_relax_accept(
     verified: &[u32],
 ) -> Option<usize> {
     let cfg = dflash_relax_config()?;
-    if a.grammar_state.as_ref().is_some_and(|gs| !gs.is_terminated()) {
+    if a.grammar_state
+        .as_ref()
+        .is_some_and(|gs| !gs.is_terminated())
+    {
         return None;
     }
     let logits_base = model.logits_buffer_ptr();
@@ -1102,9 +1159,7 @@ fn dflash_relax_accept(
         if row_buf.is_empty() {
             row_buf = vec![0u8; vocab * 2];
         }
-        if let Err(e) =
-            model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf)
-        {
+        if let Err(e) = model.copy_logits_to_host(logits_base.offset(i * vocab * 2), &mut row_buf) {
             tracing::warn!("DFlash relax accept: logits D2H failed ({e:#}); stopping prefix");
             break;
         }
@@ -1134,13 +1189,7 @@ fn dflash_relax_accept(
 /// temperature-free). BF16 values compare correctly as i16 for finite
 /// magnitudes (same ordering trick as `masked_argmax_bf16`); the exact
 /// logit gap is computed in f32 for the ratio test.
-fn relax_row_accepts(
-    bytes: &[u8],
-    vocab: usize,
-    tok: u32,
-    topk: usize,
-    ln_ratio: f32,
-) -> bool {
+fn relax_row_accepts(bytes: &[u8], vocab: usize, tok: u32, topk: usize, ln_ratio: f32) -> bool {
     let ti = tok as usize;
     if ti >= vocab {
         return false;

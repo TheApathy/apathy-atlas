@@ -139,7 +139,7 @@ fn build_active_seq_from_prefill(
         dry_sequence_breakers: Vec::new(),
         logit_bias: p.logit_bias,
         pending_drafts: Vec::new(),
-            pending_tree_payload: None,
+        pending_tree_payload: None,
         inside_thinking: if immediate_finish {
             p.enable_thinking && think_end_token.is_some()
         } else {
@@ -154,6 +154,7 @@ fn build_active_seq_from_prefill(
         spontaneous_think_budget: p.spontaneous_think_budget,
         thinking_tokens: 0,
         cached_prompt_tokens: cached_prompt_tok,
+        difficulty_probe: Default::default(),
         force_end_thinking: false,
         consecutive_confident: 0,
         in_code_fence: false,

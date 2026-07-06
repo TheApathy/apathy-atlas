@@ -155,10 +155,12 @@ pub fn classify_str(s: &str) -> TokenDelim {
             // Multi-char token. If it contains ANY delimiter/quote char it is
             // ambiguous (we can't know the ordering / string-escaping) → opaque.
             // Otherwise it is ordinary content.
-            if core
-                .bytes()
-                .any(|b| matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'\'' | b'"' | b'`' | b':'))
-            {
+            if core.bytes().any(|b| {
+                matches!(
+                    b,
+                    b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'\'' | b'"' | b'`' | b':'
+                )
+            }) {
                 TokenDelim::Opaque
             } else {
                 TokenDelim::Other
@@ -266,7 +268,8 @@ impl BracketTracker {
                         self.stack.pop(); // closes the triple string
                     }
                     Some(Frame::Str(_)) => { /* triple-quote text inside a
-                                              single-quoted string: ignore */ }
+                        single-quoted string: ignore */
+                    }
                     _ => self.stack.push(Frame::TripleStr(q)),
                 }
                 self.after_colon = false;
@@ -277,7 +280,8 @@ impl BracketTracker {
                         self.stack.pop(); // closes the single-line string
                     }
                     Some(Frame::Str(_)) | Some(Frame::TripleStr(_)) => { /* other
-                                              quote char inside a string: text */ }
+                        quote char inside a string: text */
+                    }
                     _ => self.stack.push(Frame::Str(q)),
                 }
                 self.after_colon = false;
@@ -505,7 +509,10 @@ pub fn splice_forced(
     // realistic single function / class body.
     let start = committed.len().saturating_sub(4096);
     for &tok in &committed[start..] {
-        let d = table.get(tok as usize).copied().unwrap_or(TokenDelim::Other);
+        let d = table
+            .get(tok as usize)
+            .copied()
+            .unwrap_or(TokenDelim::Other);
         base.advance(d);
         // A poisoned base can't force anything useful; bail early (no splices).
         if base.poisoned {
@@ -569,22 +576,22 @@ mod tests {
     //  0..: single chars we care about.
     fn fake_vocab() -> Vec<&'static str> {
         vec![
-            "(",   // 0
-            ")",   // 1
-            "[",   // 2
-            "]",   // 3
-            "{",   // 4
-            "}",   // 5
-            "\"",  // 6
-            "'",   // 7
-            ":",   // 8
-            "\n",  // 9
-            "foo", // 10
-            "bar", // 11
+            "(",      // 0
+            ")",      // 1
+            "[",      // 2
+            "]",      // 3
+            "{",      // 4
+            "}",      // 5
+            "\"",     // 6
+            "'",      // 7
+            ":",      // 8
+            "\n",     // 9
+            "foo",    // 10
+            "bar",    // 11
             "\"\"\"", // 12
-            "(x", // 13 opaque
-            "  ", // 14 whitespace-only -> Other
-            " (", // 15 leading-space open (still Open)
+            "(x",     // 13 opaque
+            "  ",     // 14 whitespace-only -> Other
+            " (",     // 15 leading-space open (still Open)
         ]
     }
 
@@ -593,7 +600,9 @@ mod tests {
     }
 
     fn forced_from(vocab: &[&str]) -> ForcedIds {
-        build_forced_ids(vocab.len(), |id| vocab.get(id as usize).map(|s| s.to_string()))
+        build_forced_ids(vocab.len(), |id| {
+            vocab.get(id as usize).map(|s| s.to_string())
+        })
     }
 
     #[test]

@@ -35,6 +35,8 @@ mod rollback;
 mod sample_step;
 mod spec_step;
 mod ssm_decode_ring;
+mod think_spec_accept;
+mod thinking_efficiency;
 mod types;
 mod verify_csk_step;
 mod verify_csk_step_k2;
@@ -72,6 +74,12 @@ use rollback::{RollbackOutcome, rollback_to_boundary};
 use sample_step::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
+use think_spec_accept::*;
+pub use thinking_efficiency::{
+    ADAPTIVE_PROBE_TOKENS as ADAPTIVE_PROBE_TOKENS_LOG, apply_think_logit_shaping,
+    build_hesitation_ids, parse_config as parse_think_efficiency_config,
+    set_think_efficiency_config, think_efficiency_config, top1_confidence,
+};
 use types::*;
 use verify_csk_step::*;
 use verify_csk_step_k2::*;
@@ -200,6 +208,21 @@ pub fn run(
 
     install_high_speed_swap(&*model, high_speed_swap_cfg);
 
+    // ATLAS_THINK_SPEC=1: allow MTP/DFlash speculative decode DURING
+    // `<think>` spans. The post-verify accept filter
+    // (`think_spec_accept::dflash_thinking_accept`) re-derives the
+    // plain-path token per position, so output stays byte-identical to
+    // `step_decode_only`. Disqualified when the model emits fp32 decode
+    // logits (the filter's row D2H assumes BF16) or `--adaptive-sampling`
+    // is on (its per-token entropy observation is plain-path-only state).
+    // Default OFF: `enabled=false` reproduces the historical
+    // `!inside_thinking` gate bit-for-bit.
+    let think_ctx = ThinkSpecCtx {
+        enabled: think_spec_enabled() && !adaptive_sampling && !model.decode_logits_fp32(),
+        code_fence_token,
+        reflection_suppress_ids: &reflection_suppress_ids,
+    };
+
     loop {
         // ── Drain pending → start prefill (chunked or full) ──
         let new_reqs =
@@ -311,7 +334,14 @@ pub fn run(
                 step_self_spec(&*model, &mut active, num_drafts);
             } else if use_mtp
                 && active.iter().all(|a| {
-                    !a.inside_thinking && !a.suppress_tool_call && !a.disable_mtp
+                    // ATLAS_THINK_SPEC=1: `inside_thinking` no longer
+                    // disqualifies — the DFlash verify path re-derives the
+                    // plain-path thinking interventions post-verify (see
+                    // think_spec_accept.rs). suppress_tool_call /
+                    // disable_mtp gates unchanged.
+                    (!a.inside_thinking || think_ctx.enabled)
+                        && !a.suppress_tool_call
+                        && !a.disable_mtp
                 })
             {
                 // MTP speculative decode for ALL active sequences.
@@ -337,7 +367,7 @@ pub fn run(
                 // because step_mtp doesn't conditionally bootstrap per
                 // active flag; if any seq disables MTP we fall back to
                 // batched decode_only for the whole batch this tick.
-                step_mtp(&*model, &mut active, num_drafts);
+                step_mtp(&*model, &mut active, num_drafts, &think_ctx);
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.
                 if use_mtp {

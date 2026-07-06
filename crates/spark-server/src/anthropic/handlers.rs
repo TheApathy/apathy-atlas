@@ -337,18 +337,20 @@ pub async fn count_tokens(
     // gate. Models that need template-tool skipping should opt in via a
     // bare_json-class parser.
     let skip_template_tools = false;
-    let jinja_tools: Option<Vec<serde_json::Value>> =
-        if tools_active && !skip_template_tools && !parser_suppresses {
-            req.tools.as_ref().map(|ts| {
+    let jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
+        && !skip_template_tools
+        && !parser_suppresses
+    {
+        req.tools.as_ref().map(|ts| {
                 let oai = convert_tools(ts);
                 oai.iter().map(|t| serde_json::json!({
                     "type": "function",
                     "function": { "name": t.function.name, "description": t.function.description, "parameters": t.function.parameters }
                 })).collect()
             })
-        } else {
-            None
-        };
+    } else {
+        None
+    };
 
     let input_tokens = match state.tokenizer.apply_chat_template_jinja(
         &json_messages,

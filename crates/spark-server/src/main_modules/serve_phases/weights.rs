@@ -24,8 +24,7 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     // quantize_to_nvfp4 completes). Empirically 1.05× holds for both
     // compressed-tensors and modelopt; the upstream fallback of 1.3×
     // false-OOM'd 76 GB heretic 122B on a 119 GB GPU.
-    let is_nvfp4 = (qc.quant_method == "modelopt"
-        && qc.quant_algo.eq_ignore_ascii_case("NVFP4"))
+    let is_nvfp4 = (qc.quant_method == "modelopt" && qc.quant_algo.eq_ignore_ascii_case("NVFP4"))
         || qc.quant_method == "compressed-tensors";
     if is_nvfp4 {
         // 1.02 fits 76 GB heretic 122B in a 119.7 GB GPU once the
