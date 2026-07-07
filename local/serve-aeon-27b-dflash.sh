@@ -227,6 +227,18 @@ export ATLAS_FFN_DOWN_SPLITK=${ATLAS_FFN_DOWN_SPLITK:-4}
 #   All three combined: 85.7 counting / 42.7 coding, step 152.3ms.
 export ATLAS_ATTN_QKV_SPLITK=${ATLAS_ATTN_QKV_SPLITK:-4}
 
+# 2026-07-05 (WY17 lazy Hi-writes): the gated_delta_rule_wy17 verify kernel
+# writes 16 per-token intermediate states as a partial-accept safety net —
+# 86% of its DRAM traffic. Lazy mode writes only checkpoint slots {0, K-2,
+# every J-th} and reconstructs the rare skipped-slot partial-accept via a
+# bit-exact root-replay kernel (gdn_wy17_replay). Microbench 306→111µs/call
+# (-64%). Validated e2e A/B (idle box): counting 86.6→88.1 (+1.7%), coding
+# 39.2→41.8 (+6.6%), prose 13.5→14.0 (+3.7%); counting md5 == 91a6ff90
+# constitution (replay path exercised, LOSSLESS). Prose (low-accept → more
+# replays) did NOT regress — each replay is one cheap partial kernel. SHIP.
+export ATLAS_WY17_LAZY=${ATLAS_WY17_LAZY:-8}
+export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-1}
+
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
 # M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy
