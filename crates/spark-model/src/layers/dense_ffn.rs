@@ -1614,6 +1614,24 @@ impl DenseFfnLayer {
             })?;
         } // end !fused_gateup
 
+        // FFN activation-sparsity MEASUREMENT (ATLAS_MEASURE_FFN_SPARSITY).
+        // This is the K=γ verify FFN — the path DFlash decode ACTUALLY uses
+        // (forward() M=1 is not hit per decode step). Row 0 of the [n, *]
+        // buffers is a representative decode activation. `input` is the
+        // gate/up input (K=hidden); `gate_out` now holds silu(gate)*up, the
+        // down_proj input (K=intermediate) — no recompute needed here (unlike
+        // forward(), which consumes gate_out in its fused path). PURE READER:
+        // measures row 0 into dedicated accumulators, never mutates the token
+        // stream. Skipped under graph capture (lazy alloc illegal mid-capture)
+        // → run with ATLAS_DFLASH_DEBUG_NO_GRAPH=1 to observe eager decode.
+        if self.sparsity_measure_active() && !ctx.graph_capture {
+            let (hist_g, count_g, hist_d, count_d, _meas) =
+                self.ensure_sparsity_meas(ctx.gpu, inter as usize)?;
+            self.measure_sparsity_site(ctx, input, hist_g, count_g, h, stream)?;
+            self.measure_sparsity_site(ctx, gate_out, hist_d, count_d, inter, stream)?;
+            self.maybe_dump_sparsity(ctx, "dense_ffn_kgamma")?;
+        }
+
         // down_proj GEMM: [n, inter] → [n, H]
         let output = ctx.buffers.moe_output();
         crate::kprof!(ctx.gpu, stream, "ffn_down_kgamma", {
