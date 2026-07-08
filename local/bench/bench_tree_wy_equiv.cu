@@ -377,6 +377,44 @@ int main(int argc, char** argv){
         free_window(s1);
     }
 
+    // ── Timing (informational): wy17 K=17 vs tree_wy T=17 / T=32 ──
+    // Quantifies the SSM-kernel share of the free-slots K=32 step cost.
+    {
+        auto time_min=[&](CUfunction f, Window& w, bool tree)->double{
+            unsigned T=(unsigned)w.T(), batch=1, nk=NK, nv=NV, kd=KD, vd=VD,
+                     conv=CONV, gb=GB, isf=(unsigned)HFLOATS;
+            void* at[]={&w.H,&w.Q,&w.K,&w.V,&w.G,&w.B,&w.P,&w.O,&w.HI,&isf,&T,&batch,&nk,&nv,&kd,&vd,&conv,&conv,&gb};
+            void* aw[]={&w.H,&w.Q,&w.K,&w.V,&w.G,&w.B,&w.O,&w.HI,&isf,&batch,&nk,&nv,&kd,&vd,&conv,&conv,&gb};
+            void** a = tree ? at : aw;
+            for (int i=0;i<8;i++) CK(cuLaunchKernel(f, nv,1,1, 128,1,1, 0,0,a,0));
+            CK(cuCtxSynchronize());
+            CUevent e0,e1; cuEventCreate(&e0,0); cuEventCreate(&e1,0);
+            double best=1e30;
+            for (int i=0;i<100;i++){
+                cuEventRecord(e0,0);
+                CK(cuLaunchKernel(f, nv,1,1, 128,1,1, 0,0,a,0));
+                cuEventRecord(e1,0);
+                CK(cuEventSynchronize(e1));
+                float ms=0; cuEventElapsedTime(&ms,e0,e1);
+                if (ms*1000.0<best) best=ms*1000.0;
+            }
+            cuEventDestroy(e0); cuEventDestroy(e1);
+            return best;
+        };
+        Window w17 = chain_window(spine17);
+        upload_window(w17, p);
+        CK(cuMemcpyHtoD(w17.H, p.h0.data(), HBYTES));
+        std::vector<int> sel32; for (int i=0;i<32;i++) sel32.push_back(i%NTOK);
+        Window w32 = chain_window(sel32);
+        upload_window(w32, p);
+        CK(cuMemcpyHtoD(w32.H, p.h0.data(), HBYTES));
+        printf("\n--- µs/launch (min-of-100, informational) ---\n");
+        printf("wy17     K=17: %7.1f us\n", time_min(fW, w17, false));
+        printf("tree_wy  T=17: %7.1f us\n", time_min(fT, w17, true));
+        printf("tree_wy  T=32: %7.1f us\n", time_min(fT, w32, true));
+        free_window(w17); free_window(w32);
+    }
+
     free_window(ref);
     printf(g_failures==0 ? "ALL EQUIVALENCE GATES PASS\n"
                          : "*** %d EQUIVALENCE GATE(S) FAILED ***\n", g_failures);
