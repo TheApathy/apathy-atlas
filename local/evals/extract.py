@@ -50,6 +50,9 @@ def extract_code(text: str) -> str:
 def _trim_bare(text: str) -> str:
     """Strip a leading language echo and obvious trailing prose from bare code."""
     s = text
+    # Unclosed fence (completion truncated before the closing ```): the fence
+    # regex found no block, but a leading ```python line would poison the code.
+    s = re.sub(r"^\s*```[a-zA-Z0-9_+-]*\r?\n", "", s, count=1)
     # Some models prefix a stray "python" line.
     s = re.sub(r"^\s*python\s*\n", "", s, count=1)
     return s.rstrip()

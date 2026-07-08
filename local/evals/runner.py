@@ -42,20 +42,41 @@ def _candidate_for(problem: Problem, dataset: str, completion_text: str) -> str:
     return extract_code(completion_text)
 
 
+_CHAT_INSTR = (
+    "Complete the following Python function. Reply with ONLY the complete, "
+    "runnable function definition (including any needed imports) inside a "
+    "single ```python code fence. No tests, no explanation.\n\n```python\n{prompt}\n```"
+)
+
+
 def _eval_one(client, problem, dataset, *, n, max_tokens, temperature, seed,
-              sb_timeout):
+              sb_timeout, mode="completion", thinking=False):
     """Draw n samples for one problem, sandbox each, return the record dict."""
     samples = []
     n_correct = 0
     for i in range(n):
         s = None if seed is None else seed + i
-        comp = client.complete(
-            problem.prompt, max_tokens=max_tokens,
-            temperature=temperature, seed=s,
-            # HumanEval completion mode benefits from stopping at test markers.
-            stop=["\nclass ", "\nprint(", "\nif __name__"] if dataset == "humaneval" else None,
-        )
-        code = _candidate_for(problem, dataset, comp.text)
+        if mode == "chat":
+            # Instruct models don't reliably continue raw prefixes (they
+            # re-emit docstrings / full solutions in varying shapes, breaking
+            # the stitcher — measured 27/29 harness-artifact failures on arm
+            # A 2026-07-08). Chat mode asks for ONE fenced standalone
+            # function; extraction is then trivial and robust.
+            comp = client.chat(
+                [{"role": "user",
+                  "content": _CHAT_INSTR.format(prompt=problem.prompt.rstrip())}],
+                max_tokens=max_tokens, temperature=temperature, seed=s,
+                enable_thinking=thinking,
+            )
+            code = extract_code(comp.text)
+        else:
+            comp = client.complete(
+                problem.prompt, max_tokens=max_tokens,
+                temperature=temperature, seed=s,
+                # HumanEval completion mode benefits from stopping at test markers.
+                stop=["\nclass ", "\nprint(", "\nif __name__"] if dataset == "humaneval" else None,
+            )
+            code = _candidate_for(problem, dataset, comp.text)
         program = problem.build_test_program(code)
         res = run_code(program, timeout=sb_timeout)
         if res.passed:
@@ -64,6 +85,7 @@ def _eval_one(client, problem, dataset, *, n, max_tokens, temperature, seed,
             "passed": res.passed,
             "status": res.status,
             "code": code,
+            "completion": comp.text[-2000:],
             "stderr_tail": res.stderr[-400:] if res.stderr else "",
         })
     passed_at_1 = pass_at_k(n, n_correct, 1)  # == n_correct/n
@@ -79,7 +101,7 @@ def _eval_one(client, problem, dataset, *, n, max_tokens, temperature, seed,
 
 def run(dataset: str, *, label: str, base_url: str, model: str, limit=None,
         n=1, max_tokens=1024, temperature=0.0, seed=0, sb_timeout=10.0,
-        out_path: str | None = None) -> dict:
+        out_path: str | None = None, mode="completion", thinking=False) -> dict:
     problems = (load_humaneval(limit) if dataset == "humaneval"
                 else load_mbpp(limit))
     client = AtlasClient(base_url=base_url, model=model)
@@ -87,7 +109,8 @@ def run(dataset: str, *, label: str, base_url: str, model: str, limit=None,
     records = []
     for p in problems:
         rec = _eval_one(client, p, dataset, n=n, max_tokens=max_tokens,
-                        temperature=temperature, seed=seed, sb_timeout=sb_timeout)
+                        temperature=temperature, seed=seed, sb_timeout=sb_timeout,
+                        mode=mode, thinking=thinking)
         records.append(rec)
         mark = "PASS" if rec["passed"] else "FAIL"
         print(f"[{dataset}] {p.task_id:16s} {mark} "
@@ -98,7 +121,8 @@ def run(dataset: str, *, label: str, base_url: str, model: str, limit=None,
         "config": label,
         "dataset": dataset,
         "params": {"model": model, "n": n, "max_tokens": max_tokens,
-                   "temperature": temperature, "seed": seed},
+                   "temperature": temperature, "seed": seed,
+                   "mode": mode, "thinking": thinking},
         "pass_at_1": pass1,
         "n_problems": len(records),
         "records": records,
@@ -125,6 +149,9 @@ def main(argv=None):
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sb-timeout", type=float, default=10.0)
+    ap.add_argument("--mode", choices=["completion", "chat"], default="completion")
+    ap.add_argument("--thinking", action="store_true",
+                    help="chat mode: enable_thinking=true (reasoning before answer)")
     args = ap.parse_args(argv)
 
     datasets = ["humaneval", "mbpp"] if args.dataset == "both" else [args.dataset]
@@ -135,7 +162,8 @@ def main(argv=None):
         r = run(ds, label=args.label, base_url=args.base_url, model=args.model,
                 limit=args.limit, n=args.n, max_tokens=args.max_tokens,
                 temperature=args.temperature, seed=args.seed,
-                sb_timeout=args.sb_timeout, out_path=out)
+                sb_timeout=args.sb_timeout, out_path=out,
+                mode=args.mode, thinking=args.thinking)
         # Namespace task_ids by dataset so a merged file has unique keys.
         for rec in r["records"]:
             merged_records.append({**rec, "task_id": f"{ds}:{rec['task_id']}"})
