@@ -765,6 +765,35 @@ pub fn step_verify_dflash(
         }
     }
 
+    // ── ATLAS_DFLASH_ECHO=1: stash the target's own rejected-tail argmaxes ──
+    // `verified[num_accepted+1 ..]` (the tokens AFTER the bonus) are the
+    // target's OWN next-token choices conditioned on a near-miss prefix —
+    // usually still right after the one-token bonus substitution. Stash them
+    // (keyed by the bonus = a.last_token) so the NEXT propose offers them as
+    // a target-authored draft chain and skips the drafter forward (the
+    // 25-50ms propose slice). Gated to the plain FLAT chain path only:
+    //   - no tree payload this step and no tree/portfolio draft method active
+    //     (`verified` rows are compact-tree indices there, and the accept
+    //     walk is topology-aware — chain arithmetic does not hold);
+    //   - not the think-spec accept walk (it commits its own tokens with
+    //     forced-injection semantics; its bonus may not be verified[n]);
+    //   - not the grammar-masked accept (its bonus is a MASKED argmax, and
+    //     grammar-active sequences drop pending drafts in step_mtp anyway).
+    // The min-accept floor / min-tail gates live in dflash_stash_echo.
+    // LOSSLESS: only changes what is PROPOSED next step, never what is
+    // committed — same oracle contract as recycle above.
+    if spark_model::layers::dflash_head::echo::EchoConfig::enabled()
+        && a.pending_tree_payload.is_none()
+        && !dflash_tree_method_active()
+        && !dflash_portfolio_active()
+        && thinking_accept.is_none()
+        && grammar_accept.is_none()
+    {
+        if let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token) {
+            tracing::warn!("dflash_stash_echo: {e:#}");
+        }
+    }
+
     // Re-propose for next step — unless the stage-1 grammar gate fires
     // (grammar now constrains output, e.g. this verify emitted the token
     // that opened a tool-call body): leave `pending_drafts` empty so the
@@ -853,6 +882,16 @@ fn dflash_tree_method_active() -> bool {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .is_some_and(|n| n >= 1)
     })
+}
+
+/// Whether the 2-root PORTFOLIO forest verify is enabled
+/// (ATLAS_DFLASH_PORTFOLIO=1). Not covered by `dflash_tree_method_active`
+/// (portfolio emits a flat chain on steps where the retrieval sibling
+/// doesn't fire), but echo-drafting is excluded whenever the mode is on:
+/// its verify rows may belong to a forest topology. Read once.
+fn dflash_portfolio_active() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_PORTFOLIO").ok().as_deref() == Some("1"))
 }
 
 /// Apply the CFG jump-forward splice to a freshly-proposed flat draft chain

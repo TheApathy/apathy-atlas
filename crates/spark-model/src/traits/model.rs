@@ -731,6 +731,30 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// ATLAS_DFLASH_ECHO=1 (echo-drafting / Jacobi salvage): stash the
+    /// TARGET'S OWN verify argmaxes downstream of the bonus on the DFlash
+    /// proposer state so the next propose can offer them as a
+    /// target-authored draft chain at zero propose cost (lossless).
+    ///
+    /// `verified` is the FULL flat-chain verify output
+    /// (`[argmax_after_last_token, argmax_after_draft_0, ...]`, length γ+1)
+    /// and `num_accepted` the matching-prefix length; the salvage is
+    /// `verified[num_accepted+1 ..]` — the tokens AFTER the bonus.
+    /// `bonus_token` (= the next step's `last_token`) becomes the echo key.
+    /// The min-accept / min-tail gates (`echo::should_stash`) are applied
+    /// here; a gated-out step invalidates any prior stash.
+    ///
+    /// Default no-op for non-DFlash / non-echo backends.
+    fn dflash_stash_echo(
+        &self,
+        _seq: &mut SequenceState,
+        _verified: &[u32],
+        _num_accepted: usize,
+        _bonus_token: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Launch SSM state checkpoint D2D copies on a secondary CUDA stream.
     ///
     /// Non-blocking: returns immediately. The copies can overlap with MTP

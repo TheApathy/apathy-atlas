@@ -435,6 +435,35 @@ pub struct DflashProposerState {
     /// per two steps while still recovering the discarded tail on genuinely
     /// weak content.
     pub recycle_last_offered: bool,
+
+    // ── ATLAS_DFLASH_ECHO=1: echo-drafting / Jacobi salvage (default off) ──
+    /// The TARGET'S OWN verify argmaxes downstream of the bonus —
+    /// `verified[num_accepted+1 ..]` from the previous flat-chain verify.
+    /// Unlike `recycle_tail` (drafter-authored), these are target-authored:
+    /// conditioned on a near-miss prefix, they are usually still right after
+    /// the one-token bonus substitution. Populated by `dflash_stash_echo`
+    /// (verify_dflash_step.rs, flat path only, gated on
+    /// `num_accepted >= min_accept` + `tail >= min_tail`); consumed by
+    /// `propose_drafts` on the next call, skipping the drafter forward
+    /// entirely (the 25-50ms propose slice). LOSSLESS: proposal-only.
+    pub echo_tail: Vec<u32>,
+    /// The bonus token committed at the rejection (= next step's
+    /// `last_token`). The echo tail is the target's continuation after this
+    /// exact token's context, so it is offered only when the key matches.
+    pub echo_key: u32,
+    /// Whether `echo_tail`/`echo_key` hold a valid stash (belt-and-suspenders
+    /// for the key==0 corner, mirroring `recycle_valid`).
+    pub echo_valid: bool,
+    /// Consecutive echo offers. Capped at `ATLAS_DFLASH_ECHO_MAX_STREAK`
+    /// (default 2) so an echo-drafted step that itself rejects can not keep
+    /// salvaging its own wreckage forever — after the cap the real drafter
+    /// runs and re-establishes the true accept signal. Reset to 0 on any
+    /// propose where echo does not fire.
+    pub echo_streak: u32,
+    /// Whether the PREVIOUS propose returned an echo tail. Read (and
+    /// cleared) by the next propose to attribute `last_num_accepted` to the
+    /// echo draft — the salvage-accept telemetry line.
+    pub echo_offered_last: bool,
 }
 
 impl ProposerState for DflashProposerState {
@@ -718,6 +747,7 @@ impl BlockDiffusionDraftHead {
 pub mod ddtree;
 pub mod ddtree_gdn_contract;
 pub mod ddtree_gdn_dispatch;
+pub mod echo;
 mod forward_block;
 mod forward_block_layer;
 mod from_weights;
@@ -850,6 +880,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
             recycle_key: 0,
             recycle_valid: false,
             recycle_last_offered: false,
+            echo_tail: Vec::new(),
+            echo_key: 0,
+            echo_valid: false,
+            echo_streak: 0,
+            echo_offered_last: false,
         }))
     }
 
