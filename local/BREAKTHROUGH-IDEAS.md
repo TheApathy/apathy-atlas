@@ -85,10 +85,11 @@ Five compounding levers, all in flight, each attacking a different term. No mira
     LOSSLESS streams (concurrency proven byte-exact) at 208 aggregate tok/s → wall-clock app builds
     ~2.7x faster with zero single-stream change. Effective coding throughput for app-building ~150+
     TODAY. Requires only agent-side planning to emit independent file tasks.
-19. **SSM prefix-state caching (hybrid dark matter).** KV prefix caching is standard; the 48 SSM layers
-    still RE-SCAN the whole prefix every agent-loop turn because nobody caches recurrent state across
-    requests. Snapshot SSM state at prefix boundary per session → agent TTFT collapses. Check
-    marconi_skip_to coverage; most hybrid stacks lack exactly this.
+19. **SSM prefix-state caching — INVESTIGATED 2026-07-08: mechanism EXISTS** (prefix_lookup.rs checks
+    ssm_snapshot_tokens; "no SSM snapshot -> recomputing all KV" fallback warning in tree). The open
+    question is COVERAGE: how often agent-loop prefix hits find a snapshot vs recompute. Next: telemetry
+    run on agent-like traffic (repeat-prefix chat turns), count snapshot-hit vs no-snapshot warnings;
+    if poor, widen snapshot save points (per-request-end saves). Downgraded from build to measurement.
 20. **Thought memoization.** Cache reasoning traces by problem-shape hash; replay as the DRAFT for the
     thinking span on similar problems → near-full accept when the model has "thought this before."
 21. **Persistent-L2 pinning.** cudaMemAdvise persistence window for small-hot tensors (conv1d, norms,
