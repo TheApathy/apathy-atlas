@@ -47,6 +47,20 @@ pub struct TransformerModel {
     /// `h_state` fast path. Written by every `decode_verify_graphed_kgamma`
     /// call; consumed (swap-to-false) by `commit_verify_state_async`.
     pub dflash_flat_tree_route: std::sync::atomic::AtomicBool,
+    /// Was the LAST K=γ verify's attention ancestor-exact for EVERY tree
+    /// node? `true` for flat/chain payloads (prefix reads ARE the exact
+    /// conditioning) and for the per-row KV indirection path
+    /// (`ATLAS_TREE_AWARE_ATTN` + `ATLAS_DDTREE_TREE_AWARE_VERIFY`). `false`
+    /// when a NON-flat tree payload ran with prefix metadata only (chain
+    /// mode or `ATLAS_DDTREE_DFS_REORDER=1` depth-prefix reads): DFS prefix
+    /// reads are ancestor-exact only for the leftmost spine, so branch rows
+    /// read a spine sibling and miss their own key (the 2026-07-08
+    /// deep-branch-tail commit corruption root cause). The scheduler reads
+    /// this via `Model::dflash_tree_ancestor_attn_exact` to gate the FULL
+    /// tree-commit walker; when false it must degrade to the flat-safe
+    /// walker, which only consumes correctly-conditioned spine rows.
+    /// Written by every `decode_verify_graphed_kgamma` call.
+    pub dflash_tree_ancestor_attn: std::sync::atomic::AtomicBool,
     /// Length of the parent_ids tensor above (= num_tree_tokens = K verify).
     pub ddtree_num_tree_tokens: Mutex<usize>,
     /// CUDA-graph-safe persistent parent_ids buffer for the K=γ verify
@@ -281,9 +295,11 @@ pub struct TransformerModel {
     /// Cached CUDA graphs for DFlash K=γ verification, keyed by
     /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
     /// per (slot, K) — different γ values coexist via the K dimension.
-    // Key: (slot_idx, k, pack_active_flag). The pack_active flag forces a
-    // separate captured graph for the ATLAS_TREE_KV_PACK fast path so the
-    // first (pre-tree, flat-chain) verify can't bake in stale arg pointers.
+    // Key: (slot_idx, k, flags) where flags bit0 = ATLAS_TREE_KV_PACK active
+    // and bit1 = tree-aware KV indirection active. Both force a separate
+    // captured graph so a flat-chain verify can't bake in stale/NULL kernel
+    // arg pointers that a later tree-indirected verify of the same K (or
+    // vice versa) would replay incorrectly.
     pub(super) verify_kgamma_graph:
         Mutex<std::collections::HashMap<(usize, usize, u32), GraphHandle>>,
     /// Prefix cache for KV block reuse across requests.

@@ -1173,22 +1173,35 @@ pub struct FreeSlotBranch {
 /// always laid, and the tail is truncated (never the fork) when the budget runs
 /// out — so no partial branch ever references a slot beyond the budget.
 ///
-/// ## Why this is lossless (same argument as portfolio / caterpillar)
+/// ## Losslessness — REQUIRES per-row ancestor attention (2026-07-08 root cause)
 ///
 /// The greedy DDTree walker ([`greedy_sample_ddtree`] / `_full`) commits a node
-/// ONLY when its token equals the target's argmax at its parent's row, and the
-/// bonus is always the target's greedy at the path tip. A sibling branch merely
-/// gives the walk a SECOND (third, …) candidate to match at each cliff — it can
-/// never change which token the target commits. So the committed stream is
-/// byte-identical to the flat γ chain whenever the flag is off OR no branch ever
-/// matches; when a branch DOES match, it accepts strictly MORE of the target's
-/// own greedy continuation. Depth-correct RoPE/attention for the deep branch
-/// tails requires the DFS-reorder verify path
-/// (`ATLAS_DDTREE_DFS_REORDER=1` + `ATLAS_DDTREE_TREE_TOKENS_VERIFY=1`); under
-/// pure flat metadata only the spine (slot==depth) and each branch's depth-1
-/// fork are guaranteed byte-exact, and the greedy oracle keeps output correct
-/// regardless (a mis-conditioned deep row simply fails to match and is
-/// rejected).
+/// ONLY when its token equals the target's argmax at its PARENT's row, and the
+/// bonus is always the target's argmax at the path-tip row. So the committed
+/// stream equals the greedy oracle iff every row the walk READS FROM is
+/// correctly conditioned (attends to exactly its ancestors + itself).
+///
+/// The earlier claim here — "a mis-conditioned deep row simply fails to match
+/// and is rejected" — was WRONG: a branch node's own row is not a *candidate*
+/// that gets rejected, it is the argmax SOURCE for (a) accepting the branch's
+/// child and (b) emitting the bonus when the branch is the path tip. A
+/// mis-conditioned fork row therefore COMMITS non-oracle tokens whenever the
+/// fork itself is (correctly) accepted. This was the deep-branch-tail md5
+/// corruption in the FREE_SLOTS K=32 validation (VALIDATION-36 TEST 1).
+///
+/// Under `ATLAS_DDTREE_DFS_REORDER=1` the depth-based prefix reads
+/// (`seq_lens[t] = pre + depth + 1`) are ancestor-exact ONLY for the leftmost
+/// (spine) path: a branch node at DFS slot `s > depth` reads DFS slots
+/// `[0..depth]`, which INCLUDE its spine sibling at slot `depth` and EXCLUDE
+/// its own key at slot `s` (see [`dfs_prefix_reads_are_ancestor_exact`]). No
+/// contiguous-prefix metadata can serve two divergent paths at overlapping
+/// depths, so deep-branch commits REQUIRE the per-row KV indirection verify
+/// path: `ATLAS_DDTREE_TREE_AWARE_VERIFY=1` + `ATLAS_TREE_AWARE_ATTN=1` (and
+/// `ATLAS_DDTREE_TREE_TOKENS_VERIFY=1`). The scheduler enforces this: the
+/// full-path walker only engages when the verify reports ancestor-exact
+/// attention (`Model::dflash_tree_ancestor_attn_exact`), otherwise it
+/// degrades to the flat-safe walker (spine prefix + fork bonus — lossless
+/// because those decisions read only correctly-conditioned spine rows).
 ///
 /// Returns a plain flat spine payload (parents `[-1,0,1,…]`) when no branch
 /// fits or `branches` is empty — byte-identical to the drafter baseline.
@@ -1606,6 +1619,82 @@ pub fn permute_parent_ids(kernel_parents: &[i32], perm: &[usize], inv_perm: &[us
         out.push(new_parent_dfs);
     }
     out
+}
+
+/// Is the DFS-reorder + depth-based-seq_len attention metadata ancestor-exact
+/// for EVERY node of this tree?
+///
+/// Under `ATLAS_DDTREE_DFS_REORDER=1` the K=γ verify reads, for the query at
+/// DFS slot `s` (tree depth `d`), the KV positions `[0 .. pre + d + 1)` — i.e.
+/// the prefix context plus DFS slots `[0..d]`. That read set equals the node's
+/// true conditioning (ancestors + itself) iff the node's own DFS slot `s == d`
+/// AND its ancestors occupy DFS slots `[0..d-1]`. In DFS pre-order this holds
+/// exactly for the LEFTMOST root-to-leaf path (the spine) and fails for every
+/// other node: a branch node visited after an earlier subtree has `s > d`, so
+/// the prefix window `[0..d]` contains its spine SIBLING at slot `d` and
+/// misses its own key at slot `s`.
+///
+/// Equivalent characterization used here: exact ⇔ `dfs_inv_perm[j] ==
+/// depth[j]` for every kernel slot `j` ⇔ the tree is a single chain. This is
+/// the root cause of the FREE_SLOTS deep-branch-tail commit corruption
+/// (VALIDATION-36 TEST 1): the deep tree-commit walker consumed branch rows
+/// whose logits were computed under that wrong read set. Deep-branch commits
+/// therefore require the per-row KV indirection path (`ATLAS_TREE_AWARE_ATTN`)
+/// instead of DFS prefix metadata.
+pub fn dfs_prefix_reads_are_ancestor_exact(kernel_parents: &[i32]) -> bool {
+    if kernel_parents.is_empty() {
+        return true;
+    }
+    let (_perm, inv, depths) = dfs_reorder(kernel_parents);
+    (0..kernel_parents.len()).all(|j| inv[j] == depths[j])
+}
+
+/// The set of KERNEL slots a query at kernel slot `t` actually READS under the
+/// DFS-reorder depth-based prefix metadata (tree window only; the pre-context
+/// prefix is common to all rows). Returns kernel slots at DFS positions
+/// `[0 .. depth[t]]`. Pure helper for tests/diagnostics of the invariant
+/// documented on [`dfs_prefix_reads_are_ancestor_exact`].
+pub fn dfs_prefix_read_set(kernel_parents: &[i32], t: usize) -> Vec<usize> {
+    let (perm, _inv, depths) = dfs_reorder(kernel_parents);
+    if t >= depths.len() {
+        return Vec::new();
+    }
+    let d = depths[t];
+    perm.iter().take(d + 1).copied().collect()
+}
+
+/// True ancestor chain of kernel slot `t`, top-down `[root(0), …, t]` — the
+/// conditioning set a correctly-conditioned verify row must attend to (plus
+/// the pre-tree context). This is exactly the per-row indirection row the
+/// `ATLAS_TREE_AWARE_ATTN` kernel consumes; extracted from the inline builder
+/// in `verify_d.rs` so it is unit-testable against the free-slots shapes.
+///
+/// `kernel_parents[cur]` may be shorter than the verify width `k`; slots
+/// beyond it are treated as linear-chain padding (`parent = cur - 1`),
+/// mirroring `verify_d.rs`'s padding. Defensive: a self-parent or malformed
+/// entry terminates the walk rather than looping.
+pub fn ancestor_chain_topdown(kernel_parents: &[i32], t: usize, k: usize) -> Vec<usize> {
+    let mut chain: Vec<usize> = vec![t];
+    let mut cur = t;
+    while cur != 0 {
+        let p = if cur < kernel_parents.len() {
+            kernel_parents[cur]
+        } else {
+            cur as i32 - 1 // padded linear-chain tail
+        };
+        let parent_slot: usize = if p < 0 {
+            0
+        } else {
+            (p as usize).min(k.saturating_sub(1))
+        };
+        if parent_slot == cur {
+            break;
+        }
+        chain.push(parent_slot);
+        cur = parent_slot;
+    }
+    chain.reverse();
+    chain
 }
 
 #[cfg(test)]
@@ -2150,7 +2239,10 @@ mod tests {
         let p = build_free_slots_payload(&[10, 20, 30, 40], &[b], 16);
         assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40, 99, 31, 41]);
         //                                spine ------------  fork tail--
-        assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, /*fork→spine[0]*/ 0, 4, 5]);
+        assert_eq!(
+            p.parent_indices,
+            vec![-1, 0, 1, 2, /*fork→spine[0]*/ 0, 4, 5]
+        );
     }
 
     #[test]
@@ -2171,8 +2263,16 @@ mod tests {
     fn free_slots_branches_ordered_shallowest_first() {
         // Two branches given deepest-first; builder must lay the shallower one
         // (cliff_depth 2) before the deeper (cliff_depth 3).
-        let deep = FreeSlotBranch { cliff_depth: 3, fork_token: 300, tail: vec![] };
-        let shallow = FreeSlotBranch { cliff_depth: 2, fork_token: 200, tail: vec![] };
+        let deep = FreeSlotBranch {
+            cliff_depth: 3,
+            fork_token: 300,
+            tail: vec![],
+        };
+        let shallow = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 200,
+            tail: vec![],
+        };
         let p = build_free_slots_payload(&[1, 2, 3, 4], &[deep, shallow], 16);
         // Spine slots 1..4, then fork@2 (tok 200, parent spine slot1→idx0),
         // then fork@3 (tok 300, parent spine slot2→idx1).
@@ -2183,7 +2283,11 @@ mod tests {
     #[test]
     fn free_slots_respects_max_nodes_budget() {
         // max_nodes = 5: spine (4 nodes) + fork node (1) = 5, tail dropped.
-        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![31, 41, 51] };
+        let b = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 99,
+            tail: vec![31, 41, 51],
+        };
         let p = build_free_slots_payload(&[10, 20, 30, 40], &[b], 5);
         assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40, 99]);
         assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, 0]);
@@ -2193,7 +2297,11 @@ mod tests {
     #[test]
     fn free_slots_no_room_for_any_branch_is_flat_spine() {
         // Spine already fills the budget → no branch slots → plain flat chain.
-        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![31] };
+        let b = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 99,
+            tail: vec![31],
+        };
         let p = build_free_slots_payload(&[10, 20, 30, 40], &[b], 4);
         assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40]);
         assert_eq!(p.parent_indices, vec![-1, 0, 1, 2]);
@@ -2202,9 +2310,21 @@ mod tests {
     #[test]
     fn free_slots_out_of_range_cliff_ignored() {
         // cliff_depth 9 > spine_len 4 → filtered out; cliff_depth 0 invalid.
-        let bad_deep = FreeSlotBranch { cliff_depth: 9, fork_token: 1, tail: vec![] };
-        let bad_zero = FreeSlotBranch { cliff_depth: 0, fork_token: 2, tail: vec![] };
-        let good = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![] };
+        let bad_deep = FreeSlotBranch {
+            cliff_depth: 9,
+            fork_token: 1,
+            tail: vec![],
+        };
+        let bad_zero = FreeSlotBranch {
+            cliff_depth: 0,
+            fork_token: 2,
+            tail: vec![],
+        };
+        let good = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 99,
+            tail: vec![],
+        };
         let p = build_free_slots_payload(&[10, 20, 30, 40], &[bad_deep, bad_zero, good], 16);
         assert_eq!(p.tree_token_ids, vec![10, 20, 30, 40, 99]);
         assert_eq!(p.parent_indices, vec![-1, 0, 1, 2, 0]);
@@ -2220,7 +2340,11 @@ mod tests {
         //   compact 3: 30 (parent 2)
         //   compact 4: 99 fork (parent spine slot1 → payload idx 0 → compact 1)
         //   compact 5: 98 tail (parent 4)
-        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![98] };
+        let b = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 99,
+            tail: vec![98],
+        };
         let p = build_free_slots_payload(&[10, 20, 30], &[b], 16);
         assert_eq!(p.tree_token_ids, vec![10, 20, 30, 99, 98]);
         assert_eq!(p.parent_indices, vec![-1, 0, 1, 0, 3]);
@@ -2240,7 +2364,11 @@ mod tests {
     fn free_slots_spine_ride_is_byte_identical_to_flat() {
         // When the target rides the top-1 spine, the committed run is exactly
         // the flat chain — the losslessness anchor. Fork present but never hit.
-        let b = FreeSlotBranch { cliff_depth: 2, fork_token: 99, tail: vec![98] };
+        let b = FreeSlotBranch {
+            cliff_depth: 2,
+            fork_token: 99,
+            tail: vec![98],
+        };
         let p = build_free_slots_payload(&[10, 20, 30], &[b], 16);
         let r = req(&p.tree_token_ids, &p.parent_indices);
         // root→10, c1→20 (spine, not fork), c2→30, c3→77 bonus.
@@ -2840,5 +2968,112 @@ mod tests {
         // commit_verify_state_async_with_slot's mapping.
         let last = last_accepted_inter_slot(&s.accepted_compact_indices);
         assert_eq!(compact_to_kernel_slot(last, &inv), *kernel.last().unwrap());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 2026-07-08 — FREE-SLOTS deep-branch-tail commit corruption root cause
+    // (VALIDATION-36 TEST 1). The DFS-reorder depth-prefix attention metadata
+    // is ancestor-exact ONLY for the leftmost (spine) path; branch rows read
+    // their spine SIBLING and miss their OWN key, so the deep tree-commit
+    // walker consumed mis-conditioned rows for child-acceptance + bonus.
+    // These tests pin the invariant and the per-row indirection replacement.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// The kernel-frame parents of the exact TEST-1 failing shape: full γ=16
+    /// spine + one FreeSlotBranch at cliff depth 5 with a 4-token tail
+    /// (fork at kernel slot 17, tail at 18..=21).
+    fn free_slots_failing_shape() -> Vec<i32> {
+        let spine: Vec<u32> = (100..116).collect();
+        let b = FreeSlotBranch {
+            cliff_depth: 5,
+            fork_token: 900,
+            tail: vec![901, 902, 903, 904],
+        };
+        let p = build_free_slots_payload(&spine, &[b], 31);
+        full_parent_ids_from_payload(&p).unwrap()
+    }
+
+    /// Flat chains (the counting / no-cliff path) are ancestor-exact under
+    /// DFS prefix reads — this is why the constitution md5 held while the
+    /// coding tail corrupted.
+    #[test]
+    fn flat_chain_dfs_prefix_is_ancestor_exact() {
+        let kp: Vec<i32> = std::iter::once(-1)
+            .chain((0..16).map(|i| i as i32))
+            .collect();
+        assert!(dfs_prefix_reads_are_ancestor_exact(&kp));
+    }
+
+    /// FAILING SHAPE (root cause): for the free-slots payload, the DFS
+    /// depth-prefix read set of the fork row contains the fork's spine
+    /// SIBLING and misses the fork's own key — so the fork row's logits
+    /// (used to accept the tail child and to emit the bonus at the tip)
+    /// are computed under wrong conditioning. The predicate the scheduler
+    /// gate consumes must report NOT exact.
+    #[test]
+    fn free_slots_branch_rows_violate_dfs_prefix_reads() {
+        let kp = free_slots_failing_shape();
+        assert!(
+            !dfs_prefix_reads_are_ancestor_exact(&kp),
+            "free-slots branch shape must NOT be ancestor-exact under DFS prefix reads"
+        );
+        // Fork = kernel slot 17 (payload idx 16), depth 5. Its true ancestors
+        // are kernel slots [0,1,2,3,4]; its prefix read set is DFS slots
+        // [0..=5] = kernel slots [0..=5] — includes sibling slot 5 (the spine
+        // node at depth 5), excludes itself (slot 17).
+        let fork_reads = dfs_prefix_read_set(&kp, 17);
+        assert!(
+            fork_reads.contains(&5),
+            "fork prefix read set {fork_reads:?} must show the sibling contamination"
+        );
+        assert!(
+            !fork_reads.contains(&17),
+            "fork prefix read set {fork_reads:?} must show the missing self key"
+        );
+        // First tail node = kernel slot 18, depth 6: reads spine slots 5 and 6
+        // instead of the fork (17) it actually descends from.
+        let tail_reads = dfs_prefix_read_set(&kp, 18);
+        assert!(
+            !tail_reads.contains(&17),
+            "tail row must be missing its fork ancestor"
+        );
+        assert!(
+            tail_reads.contains(&6),
+            "tail row reads the depth-6 spine cousin instead"
+        );
+        // Spine rows stay exact (read exactly their ancestors + self) — the
+        // reason counting/flat md5 held.
+        for t in 0..=16usize {
+            let reads = dfs_prefix_read_set(&kp, t);
+            let want: Vec<usize> = (0..=t).collect();
+            assert_eq!(
+                reads, want,
+                "spine slot {t} must read exactly its ancestors+self"
+            );
+        }
+    }
+
+    /// PASSING REPLACEMENT: the per-row indirection rows (what the
+    /// `ATLAS_TREE_AWARE_ATTN` kernel consumes) are exactly each node's true
+    /// ancestors + itself for the same failing shape.
+    #[test]
+    fn ancestor_chain_matches_true_ancestors_for_free_slots_branch() {
+        let kp = free_slots_failing_shape();
+        let k = kp.len();
+        // Fork (kernel 17, parent kernel 4).
+        assert_eq!(ancestor_chain_topdown(&kp, 17, k), vec![0, 1, 2, 3, 4, 17]);
+        // Tail nodes chain through the fork, not the spine.
+        assert_eq!(
+            ancestor_chain_topdown(&kp, 19, k),
+            vec![0, 1, 2, 3, 4, 17, 18, 19]
+        );
+        // Spine node unchanged.
+        assert_eq!(ancestor_chain_topdown(&kp, 3, k), vec![0, 1, 2, 3]);
+        // Padded tail slot beyond the payload behaves as linear chain.
+        let short = &kp[..5];
+        assert_eq!(
+            ancestor_chain_topdown(short, 6, 8),
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
     }
 }

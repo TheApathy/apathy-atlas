@@ -309,6 +309,58 @@ impl TransformerModel {
             && self.tree_kv_indir_persistent.0 != 0
             && k <= self.tree_kv_indir_stride;
 
+        // ── Ancestor-exact attention flag (2026-07-08 deep-branch root cause) ──
+        //
+        // Record whether THIS verify gives EVERY tree node ancestor-exact
+        // attention (each row attends to exactly the pre-context + its true
+        // ancestors + itself):
+        //   * flat/chain payload (or none)  → exact: prefix reads ARE the
+        //     conditioning (byte-identical baseline path);
+        //   * per-row KV indirection active → exact: the kernel remaps the
+        //     tree window through each row's true ancestor chain;
+        //   * NON-flat payload under prefix metadata (chain-mode or DFS
+        //     depth-prefix reads) → NOT exact. DFS pre-order lays only the
+        //     LEFTMOST path at slot == depth; any branch node at DFS slot
+        //     s > depth reads DFS slots [0..depth] — its spine SIBLING at
+        //     slot `depth` instead of its own key at slot `s`
+        //     (`ddtree::dfs_prefix_reads_are_ancestor_exact`). Branch rows'
+        //     logits are then wrong, and the deep tree-commit walker would
+        //     consume them for child-acceptance and the bonus → committed
+        //     tokens diverge from the greedy oracle (VALIDATION-36 TEST 1).
+        //
+        // The scheduler reads this via `dflash_tree_ancestor_attn_exact()`
+        // and degrades the FULL tree-commit walker to the flat-safe walker
+        // when not exact — turning that silent-corruption class into a safe
+        // (spine-only) accept.
+        let payload_non_flat = {
+            let hp = self.ddtree_parent_ids_host.lock();
+            hp.iter()
+                .enumerate()
+                .skip(1)
+                .any(|(i, &p)| p != i as i32 - 1)
+        };
+        let ancestor_attn_exact = !payload_non_flat || tree_kv_active;
+        self.dflash_tree_ancestor_attn
+            .store(ancestor_attn_exact, std::sync::atomic::Ordering::Release);
+        if payload_non_flat && !ancestor_attn_exact {
+            static NONEXACT_DBG: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = NONEXACT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 16 {
+                tracing::info!(
+                    "K=γ verify: non-flat tree payload WITHOUT per-row ancestor attention \
+                     (k={k}, dfs_active={dfs_active}, tree_aware_attn={tree_aware_attn_enabled}, \
+                     tree_depths_some={}, indir_stride={}, indir_ptr_ok={}) — \
+                     branch rows are prefix-conditioned; deep tree-commit will degrade to \
+                     flat-safe. Enable ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 \
+                     for lossless deep-branch commits.",
+                    tree_depths.is_some(),
+                    self.tree_kv_indir_stride,
+                    self.tree_kv_indir_persistent.0 != 0,
+                );
+            }
+        }
+
         let positions: Vec<u32> = if dfs_active {
             // DFS slot i contains kernel slot dfs_perm[i]; its tree depth
             // (kernel frame) is dfs_depths[dfs_perm[i]]. RoPE position is
@@ -439,23 +491,11 @@ impl TransformerModel {
             let host_parents = self.ddtree_parent_ids_host.lock().clone();
             let mut indir = vec![0i32; stride * stride];
             for t in 0..k {
-                let mut chain: Vec<usize> = Vec::with_capacity(depths_ref[t] + 1);
-                chain.push(t);
-                let mut cur = t;
-                while cur != 0 {
-                    let p = if cur < host_parents.len() {
-                        host_parents[cur]
-                    } else {
-                        cur as i32 - 1 // padded linear chain tail
-                    };
-                    let parent_slot: usize = if p < 0 { 0 } else { (p as usize).min(k - 1) };
-                    if parent_slot == cur {
-                        break;
-                    }
-                    chain.push(parent_slot);
-                    cur = parent_slot;
-                }
-                chain.reverse();
+                // True ancestor chain [root(0), …, t] — unit-tested against
+                // the free-slots branch shapes in ddtree.rs
+                // (`ancestor_chain_matches_true_ancestors_for_free_slots_branch`).
+                let mut chain: Vec<usize> =
+                    crate::layers::dflash_head::ddtree::ancestor_chain_topdown(&host_parents, t, k);
                 let want = depths_ref[t] + 1;
                 while chain.len() < want {
                     chain.push(*chain.last().unwrap_or(&t));
@@ -756,7 +796,12 @@ impl TransformerModel {
         // that graph — its kernel sequence has stale arg pointers. Treating
         // pack as a separate cache key forces a fresh capture for the
         // pack-active path.
-        let pack_key = ctx.tree_aware_attn.and_then(|t| t.pack).is_some() as u32;
+        // Bit 1: tree-aware indirection active. A graph captured WITHOUT the
+        // indirection kernel arguments (flat step, kv_indirection=NULL) must
+        // never be replayed for a tree-indirected step of the same K (and
+        // vice versa) — the kernel argument sets differ.
+        let pack_key = ctx.tree_aware_attn.and_then(|t| t.pack).is_some() as u32
+            | ((ctx.tree_aware_attn.is_some() as u32) << 1);
         let cache_key = (seq.slot_idx, k, pack_key);
         let cached_for_slot = graph_cache
             .as_ref()

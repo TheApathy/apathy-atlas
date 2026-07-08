@@ -996,12 +996,16 @@ impl BlockDiffusionDraftHead {
         // The OPERATOR MUST ALSO set ATLAS_DDTREE_MAX_NODES=<K> (K = the free
         // width, ≤ 32) so the verify-side persistent buffers (parent_ids, SSM
         // intermediates, hidden_save) are sized for the wider tree; and, to
-        // commit the deep branch tails byte-exactly, ATLAS_DDTREE_DFS_REORDER=1
-        // + ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 + ATLAS_DFLASH_TREE_COMMIT=1.
-        // LOSSLESS regardless: the greedy verify commits only the target's
-        // argmax, so a mis-conditioned deep row is simply rejected (see
-        // `build_free_slots_payload` doc). Default off ⇒ byte-identical to the
-        // flat γ=16 path.
+        // commit the deep branch tails byte-exactly,
+        // ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 (per-row
+        // ancestor KV indirection) + ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 +
+        // ATLAS_DFLASH_TREE_COMMIT=1. NOTE (2026-07-08 root cause):
+        // ATLAS_DDTREE_DFS_REORDER's depth-prefix reads are ancestor-exact
+        // only for the spine; a branch row's own argmax (consumed for tail
+        // acceptance + the tip bonus) is mis-conditioned, so deep commits
+        // under DFS corrupt — the scheduler now degrades them to flat-safe
+        // (see `build_free_slots_payload` doc). Default off ⇒ byte-identical
+        // to the flat γ=16 path.
         //
         // N = the number of sibling branches to place (each ≈ 1 + tail_len
         // extra nodes). The builder self-limits to the ddtree capacity.
@@ -1025,13 +1029,11 @@ impl BlockDiffusionDraftHead {
             match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
                 Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
                     // Per-row top1−top2 margins over the spine rows.
-                    let margins: Vec<f32> =
-                        (0..n).map(|r| topk_logits[2 * r] - topk_logits[2 * r + 1]).collect();
-                    let cliffs = super::ddtree::pick_free_slot_cliffs(
-                        &margins,
-                        margin_thresh,
-                        free_slots,
-                    );
+                    let margins: Vec<f32> = (0..n)
+                        .map(|r| topk_logits[2 * r] - topk_logits[2 * r + 1])
+                        .collect();
+                    let cliffs =
+                        super::ddtree::pick_free_slot_cliffs(&margins, margin_thresh, free_slots);
                     // Build one FreeSlotBranch per cliff: fork = the drafter's
                     // top-2 at that row; tail = the spine's own post-cliff
                     // tokens (re-rooted onto the fork — the predictable
@@ -1045,8 +1047,11 @@ impl BlockDiffusionDraftHead {
                             if fork_token == drafts[row] {
                                 return None;
                             }
-                            let tail: Vec<u32> =
-                                drafts[(row + 1).min(n)..].iter().take(tail_len).copied().collect();
+                            let tail: Vec<u32> = drafts[(row + 1).min(n)..]
+                                .iter()
+                                .take(tail_len)
+                                .copied()
+                                .collect();
                             Some(super::ddtree::FreeSlotBranch {
                                 cliff_depth,
                                 fork_token,
@@ -1061,11 +1066,8 @@ impl BlockDiffusionDraftHead {
                     }
                     // Widen the payload to the ddtree verify capacity (K-1 nodes).
                     let max_nodes = ddtree_verify_cap.saturating_sub(1).max(drafts.len());
-                    let payload = super::ddtree::build_free_slots_payload(
-                        &drafts,
-                        &branches,
-                        max_nodes,
-                    );
+                    let payload =
+                        super::ddtree::build_free_slots_payload(&drafts, &branches, max_nodes);
                     static FREE_DBG: std::sync::atomic::AtomicUsize =
                         std::sync::atomic::AtomicUsize::new(0);
                     let dbg = FREE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -4,6 +4,23 @@
 
 use super::*;
 
+/// ATLAS_DFLASH_BRANCH_AUDIT=1 cross-step stash: session_hash →
+/// `(expected_argmax_after_fork, fork_token)` recorded on a step whose
+/// flat-safe commit ended with the fork token as bonus. The NEXT verify for
+/// the same session compares its root row (`verified[0]`, the TRUE greedy
+/// after the fork) against the fork ROW's argmax from the previous step —
+/// a direct, per-step-deterministic measurement of branch-row conditioning
+/// correctness (the 2026-07-08 deep-branch root cause). Debug-only.
+fn branch_audit_stash() -> &'static std::sync::Mutex<std::collections::HashMap<u64, (u32, u32)>> {
+    static STASH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, (u32, u32)>>,
+    > = std::sync::OnceLock::new();
+    STASH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Running audit tally: (matches, mismatches). Logged on every comparison.
+static BRANCH_AUDIT_TALLY: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
 /// DFlash γ-token verify with accept-prefix.
 ///
 /// Phase 3 minimal-viable implementation: routes `[last_token, drafts...]`
@@ -159,6 +176,38 @@ pub fn step_verify_dflash(
     // and routes through the partial-accept (intermediate→h_state) path.
     a.last_token_time = Instant::now();
 
+    // ── ATLAS_DFLASH_BRANCH_AUDIT=1: settle the previous step's stash ──
+    // `verified[0]` is the target's TRUE argmax after `tokens[0]`
+    // (= the committed bonus of the previous step). If the previous step
+    // stashed a fork-row prediction for that exact context, compare it now.
+    // Only judged when the committed token actually IS the stashed fork
+    // token (grammar/think interventions could have replaced it).
+    if let Some((expected, fork_tok)) = {
+        let mut stash = branch_audit_stash().lock().unwrap();
+        stash.remove(&a.session_hash)
+    } {
+        if tokens[0] == fork_tok
+            && let Some(&actual) = verified.first()
+        {
+            let is_match = actual == expected;
+            let (m, mm) = {
+                let mut t = BRANCH_AUDIT_TALLY.lock().unwrap();
+                if is_match {
+                    t.0 += 1;
+                } else {
+                    t.1 += 1;
+                }
+                *t
+            };
+            tracing::info!(
+                "BRANCH_AUDIT: fork_tok={fork_tok} expected_after_fork={expected} \
+                 true_after_fork={actual} match={} tally={m}/{}",
+                is_match as u8,
+                m + mm,
+            );
+        }
+    }
+
     // `decode_verify` already advanced `seq.seq_len` by `tokens.len()` and
     // pushed all γ+1 tokens into `seq.tokens`. The accept-prefix logic below
     // determines how many to keep — the rest must be rolled back so the
@@ -246,6 +295,32 @@ pub fn step_verify_dflash(
     // → legacy contiguous behavior unchanged.
     let tree_commit_enabled =
         std::env::var("ATLAS_DFLASH_TREE_COMMIT").ok().as_deref() == Some("1");
+    // 2026-07-08 deep-branch-tail root-cause guard: the FULL walker consumes
+    // branch rows' argmaxes (child-acceptance + bonus at the path tip), so it
+    // is only sound when the verify that just ran gave EVERY tree node
+    // ancestor-exact attention (per-row KV indirection —
+    // ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1). Under
+    // prefix-read metadata (incl. ATLAS_DDTREE_DFS_REORDER=1) only the spine
+    // rows are exact: a branch row reads its spine SIBLING and misses its own
+    // key, so committing through it diverges from the greedy oracle
+    // (VALIDATION-36 TEST 1 md5 corruption). Degrade to the flat-safe walker,
+    // which never reads a branch row.
+    let ancestor_attn_exact = model.dflash_tree_ancestor_attn_exact();
+    let tree_commit_active = tree_commit_enabled && ancestor_attn_exact;
+    if tree_commit_enabled && !ancestor_attn_exact && a.pending_tree_payload.is_some() {
+        static DOWNGRADE_DBG: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = DOWNGRADE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            tracing::warn!(
+                "ATLAS_DFLASH_TREE_COMMIT=1 but the verify was NOT ancestor-exact \
+                 (prefix/DFS metadata on a non-flat tree) — deep-branch commit would \
+                 corrupt; degrading to the flat-safe walker. Set \
+                 ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 (and unset \
+                 ATLAS_DDTREE_DFS_REORDER) for lossless deep-branch commits."
+            );
+        }
+    }
     let mut tree_accepted_path: Option<(Vec<usize>, usize)> = None;
     let (num_accepted, tree_last_inter_slot) = if let Some(ref t) = thinking_accept {
         (t.num_accepted, None)
@@ -313,9 +388,41 @@ pub fn step_verify_dflash(
                 req.tree_token_ids.len(),
             );
         }
-        // FIX 1: full-path sampler when tree-commit is enabled, else the
-        // legacy flat-safe sampler.
-        let sample_res = if tree_commit_enabled {
+        // ── ATLAS_DFLASH_BRANCH_AUDIT=1: cross-step conditioning audit ──
+        // Pure observation (commits nothing). When the flat-safe walk stops
+        // at a divergence whose fork token the FULL walk would take, this
+        // step commits [spine prefix] + bonus == the fork token, so the NEXT
+        // verify's root row (verified[0]) is the target's TRUE argmax after
+        // the fork under exact flat conditioning. The fork ROW of THIS step
+        // claims that same conditioning ([ctx, spine prefix, fork]) — its
+        // argmax must therefore equal next step's verified[0]. Mismatches
+        // measure exactly the branch-row mis-conditioning that corrupts the
+        // deep tree-commit; ~100% match certifies ancestor-exact attention.
+        // Stash keyed by session hash (debug-only; batch=1 serve config).
+        let audit_enabled = std::env::var("ATLAS_DFLASH_BRANCH_AUDIT").ok().as_deref() == Some("1");
+        if audit_enabled
+            && !tree_commit_active
+            && let Ok(full) = greedy_sample_ddtree_full(&req, &argmax)
+            && let Ok(flat) = greedy_sample_ddtree(&req, &argmax)
+        {
+            let flat_n = flat.accepted_compact_indices.len();
+            let fullp = &full.accepted_compact_indices;
+            if fullp.len() > flat_n {
+                let fork_c = fullp[flat_n];
+                let fork_tok = req.tree_token_ids.get(fork_c.saturating_sub(1)).copied();
+                let expected = argmax.get(fork_c).copied();
+                if let (Some(ft), Some(exp)) = (fork_tok, expected) {
+                    branch_audit_stash()
+                        .lock()
+                        .unwrap()
+                        .insert(a.session_hash, (exp, ft));
+                }
+            }
+        }
+        // FIX 1: full-path sampler when tree-commit is enabled AND the verify
+        // was ancestor-exact (see the guard above), else the flat-safe
+        // sampler (spine rows only — always correctly conditioned).
+        let sample_res = if tree_commit_active {
             greedy_sample_ddtree_full(&req, &argmax)
         } else {
             greedy_sample_ddtree(&req, &argmax)
@@ -331,7 +438,7 @@ pub fn step_verify_dflash(
                 // Record the sparse path for the emit + KV-compaction below.
                 // The bonus row is the compact tip the walk ended at
                 // (== last accepted compact index, or 0 if nothing accepted).
-                if tree_commit_enabled {
+                if tree_commit_active {
                     let bonus_row = sample.accepted_compact_indices.last().copied().unwrap_or(0);
                     tree_accepted_path = Some((sample.accepted_compact_indices.clone(), bonus_row));
                 }

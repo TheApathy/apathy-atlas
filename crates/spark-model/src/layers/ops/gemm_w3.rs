@@ -251,7 +251,11 @@ pub fn w3_pack_codes(codes: &[u8]) -> Vec<u8> {
             debug_assert!(c < 8);
             u24 |= (c as u32) << (3 * i);
         }
-        out.extend_from_slice(&[(u24 & 0xFF) as u8, ((u24 >> 8) & 0xFF) as u8, (u24 >> 16) as u8]);
+        out.extend_from_slice(&[
+            (u24 & 0xFF) as u8,
+            ((u24 >> 8) & 0xFF) as u8,
+            (u24 >> 16) as u8,
+        ]);
     }
     out
 }
@@ -416,7 +420,9 @@ mod tests {
         // Deterministic LCG so the test is reproducible without rand.
         let mut state = 0x12345678u64;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 33) & 7) as u8
         };
         let codes: Vec<u8> = (0..1024).map(|_| next()).collect();

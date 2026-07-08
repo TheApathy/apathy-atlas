@@ -856,6 +856,9 @@ impl TransformerModel {
             config,
             ddtree_parent_ids_dev: Mutex::new(None),
             dflash_flat_tree_route: std::sync::atomic::AtomicBool::new(false),
+            // Ancestor-exact until a non-flat tree verify without per-row
+            // indirection proves otherwise (flat/chain verifies are exact).
+            dflash_tree_ancestor_attn: std::sync::atomic::AtomicBool::new(true),
             ddtree_num_tree_tokens: Mutex::new(0),
             ddtree_parent_ids_persistent: parent_ids_persistent,
             ddtree_parent_ids_capacity: parent_ids_capacity,
