@@ -116,7 +116,12 @@ def _mbpp_program(test_list: list[str], setup: str):
 
 def _mbpp_from_record(rec: dict) -> Problem:
     tests = rec["test_list"]
-    setup = rec.get("test_setup_code", "") or ""
+    # Sanitized MBPP carries test_imports (e.g. "import math" for isclose
+    # assertions); full MBPP uses test_setup_code. Honor both.
+    setup_parts = list(rec.get("test_imports") or [])
+    if rec.get("test_setup_code"):
+        setup_parts.append(rec["test_setup_code"])
+    setup = "\n".join(setup_parts)
     # Full MBPP uses "text"; the sanitized split uses "prompt".
     desc = rec.get("text") or rec.get("prompt") or ""
     prompt = MBPP_PROMPT_TMPL.format(text=desc, tests="\n".join(tests))
