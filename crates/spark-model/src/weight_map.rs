@@ -39,6 +39,8 @@ mod quantized;
 mod ssm_qwen35;
 #[path = "weight_map/ssm_qwen35_more.rs"]
 mod ssm_qwen35_more;
+#[path = "weight_map/w3_sidecar.rs"]
+pub mod w3_sidecar;
 
 #[cfg(test)]
 #[path = "weight_map/tests.rs"]

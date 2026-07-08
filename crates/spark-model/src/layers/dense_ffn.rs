@@ -220,6 +220,32 @@ pub struct DenseFfnLayer {
     /// self-spec draft + measurement run EAGER — see the gate docs). None
     /// until the first measured forward.
     sparsity_meas: Mutex<Option<SparsityMeas>>,
+    /// W3 (3-bit weight) FFN projections — mixed-precision byte-reduction
+    /// lane. `Some` only when `ATLAS_FFN_W3_LAYERS` names this layer AND
+    /// the repacked sidecar (`ATLAS_FFN_W3_SIDECAR`, built by
+    /// `local/tools/repack_w3.py`) contained its tensors; installed by the
+    /// loader via `set_w3_weights`. GEMV layout `[N, 3K/8]` — used by the
+    /// single-token `forward` SiLU path (dual gate/up + fused SiLU down).
+    /// Cuts packed FFN weight bytes 25% vs NVFP4 on a weight-bandwidth-
+    /// bound decode. NOT md5-gated (weights differ from W4 by
+    /// construction) — quality is protected by the ABBA eval gate; the
+    /// default path (gate off / no sidecar) stays byte-identical.
+    w3_weights: Option<DenseFfnWeights>,
+    /// Transposed W3 copies (`[3K/8, N_pad64]`) for the K=γ verify GEMM
+    /// path (`w3a16_gemm_t_m32_n64`). Built host-side by the sidecar
+    /// loader. `forward_kgamma` routes gate/up/down through the W3 GEMM
+    /// when set (superseding the W4 m32/fused/split-K variants on this
+    /// layer). Other paths (prefill, K=2/3 batched GEMV) intentionally
+    /// stay on the retained W4 weights — they are not weight-bandwidth-
+    /// bound the same way and keep their higher-precision copies.
+    w3_weights_t: Option<DenseFfnWeights>,
+    /// `w3a16_gemv_dual` — W3 gate+up dual GEMV. `try_kernel`; handle 0
+    /// (older PTX caches) disables the W3 GEMV path silently.
+    w3a16_gemv_dual_k: KernelHandle,
+    /// `w3a16_gemv_silu_input` — W3 fused SiLU-input down GEMV.
+    w3a16_gemv_silu_input_k: KernelHandle,
+    /// `w3a16_gemm_t_m32_n64` — W3 clone of the m32_n64 verify GEMM.
+    w3a16_gemm_t_m32_n64_k: KernelHandle,
     /// `ffn_build_keep_chunks` — on-device keep-chunk selector for the SPARSE
     /// self-spec DRAFT path (`ATLAS_SELF_SPEC_SPARSE=1`). Handle 0 disables.
     ffn_build_keep_chunks_k: KernelHandle,
@@ -375,6 +401,16 @@ impl DenseFfnLayer {
             // The .cu files live in kernels/gb10/common/ and register under
             // their file-stem module names. try_kernel → handle 0 disables the
             // feature silently on caches built before these kernels existed.
+            // W3 (3-bit) FFN lane — weights installed later by the loader
+            // (set_w3_weights) iff ATLAS_FFN_W3_LAYERS + sidecar match.
+            // Kernels live in kernels/gb10/common/w3a16_gemv.cu /
+            // w3a16_gemm.cu; try_kernel → handle 0 on caches built before
+            // they existed (W3 then stays fully disabled).
+            w3_weights: None,
+            w3_weights_t: None,
+            w3a16_gemv_dual_k: super::try_kernel(gpu, "w3a16_gemv", "w3a16_gemv_dual"),
+            w3a16_gemv_silu_input_k: super::try_kernel(gpu, "w3a16_gemv", "w3a16_gemv_silu_input"),
+            w3a16_gemm_t_m32_n64_k: super::try_kernel(gpu, "w3a16_gemm", "w3a16_gemm_t_m32_n64"),
             ffn_sparsity_measure_k: super::try_kernel(
                 gpu,
                 "ffn_sparsity_measure",
@@ -538,6 +574,38 @@ impl DenseFfnLayer {
         self.gate_proj_t = Some(gate_proj_t);
         self.up_proj_t = Some(up_proj_t);
         self.down_proj_t = Some(down_proj_t);
+    }
+
+    /// Install W3 (3-bit) FFN weights for this layer — GEMV-layout copies
+    /// (used by the single-token `forward` SiLU path) and transposed
+    /// GEMM-layout copies (used by `forward_kgamma`). Called by the loader
+    /// when `ATLAS_FFN_W3_LAYERS` names this layer and the sidecar tensors
+    /// loaded cleanly (see `weight_map::w3_sidecar`). The original W4
+    /// weights are RETAINED for the paths W3 does not cover (prefill,
+    /// K=2/3 batched GEMV, GELU models, sparse draft).
+    pub fn set_w3_weights(&mut self, gemv: DenseFfnWeights, gemm_t: DenseFfnWeights) {
+        self.w3_weights = Some(gemv);
+        self.w3_weights_t = Some(gemm_t);
+    }
+
+    /// Whether the W3 single-token GEMV path is fully wired: weights
+    /// installed + both kernel symbols present + SiLU activation (the W3
+    /// GEMV set has no GELU-fused down kernel; GELU models stay on W4).
+    fn has_w3_gemv(&self) -> bool {
+        self.w3_weights.is_some()
+            && self.w3a16_gemv_dual_k.0 != 0
+            && self.w3a16_gemv_silu_input_k.0 != 0
+            && self.activation == FfnActivation::SiLU
+    }
+
+    /// Whether the W3 K=γ verify GEMM path is fully wired.
+    fn has_w3_gemm(&self) -> bool {
+        self.w3_weights_t.is_some() && self.w3a16_gemm_t_m32_n64_k.0 != 0
+    }
+
+    /// Whether ANY W3 routing is active on this layer (loader log helper).
+    pub fn has_w3(&self) -> bool {
+        self.has_w3_gemv() || self.has_w3_gemm()
     }
 
     /// Eagerly allocate the FP32 split-K workspace for the down_proj
