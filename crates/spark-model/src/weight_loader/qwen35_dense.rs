@@ -132,6 +132,31 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                     );
                 }
             }
+            // W3 mixed-precision FFN (ATLAS_FFN_W3_LAYERS + ATLAS_FFN_W3_SIDECAR):
+            // for the named layers, install 3-bit sidecar FFN weights (25% fewer
+            // bytes on the bandwidth wall). Fail-open — maybe_load_w3_ffn returns
+            // None (stays W4) on any miss. ABBA-gated, NOT md5 (W3 changes the
+            // weights by construction, so output is not byte-identical).
+            if let Some(w3) = crate::weight_map::w3_sidecar::maybe_load_w3_ffn(
+                i,
+                &lp,
+                gpu,
+                h,
+                config.intermediate_size,
+            )? {
+                let gemv = crate::layers::dense_ffn::DenseFfnWeights {
+                    gate_proj: w3.gate,
+                    up_proj: w3.up,
+                    down_proj: w3.down,
+                };
+                let gemm_t = crate::layers::dense_ffn::DenseFfnWeights {
+                    gate_proj: w3.gate_t,
+                    up_proj: w3.up_t,
+                    down_proj: w3.down_t,
+                };
+                ffn_layer.set_w3_weights(gemv, gemm_t);
+                tracing::info!("W3 FFN active on layer {i} (3-bit gate/up/down from sidecar)");
+            }
             let ffn = FfnComponent::Dense(ffn_layer);
 
             match lt {
