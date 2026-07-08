@@ -317,6 +317,23 @@ int main(int argc, char** argv){
         free_window(A);
     }
 
+    // ── T6: portfolio 2-root forest (ATLAS_DFLASH_PORTFOLIO topology) ──
+    // Root-B chain laid contiguously at slots 8..15 behind a re-root
+    // (parent=-1) at slot 8. Pre-fix, slots 9..15 hit the linear fast path
+    // and summed cross terms over chain A — the "portfolio deep-B" blocker.
+    // Every chain-B row must equal the pure chain window [tok20..tok27].
+    {
+        std::vector<int> sel; for (int i=0;i<8;i++) sel.push_back(i);      // chain A
+        for (int i=0;i<8;i++) sel.push_back(20+i);                          // chain B
+        Window A = chain_window(sel);
+        A.parents[8] = -1;                                                  // root B
+        upload_window(A, p);
+        run_tree(fT, A, p);
+        std::vector<int> csel; for (int i=0;i<8;i++) csel.push_back(20+i);
+        cmp_branch("T6  portfolio 2-root chain-B rows vs chain", A, {8,9,10,11,12,13,14,15}, csel, 0);
+        free_window(A);
+    }
+
     // ── T5: WY-form vs direct-form floor (characterization only) ──
     // Sequential T=1 windows == the direct per-token form (corrected = H·k).
     // wy17's row t uses the WY-corrected form. Mathematically equal,
