@@ -117,12 +117,14 @@ def _mbpp_program(test_list: list[str], setup: str):
 def _mbpp_from_record(rec: dict) -> Problem:
     tests = rec["test_list"]
     setup = rec.get("test_setup_code", "") or ""
-    prompt = MBPP_PROMPT_TMPL.format(text=rec["text"], tests="\n".join(tests))
+    # Full MBPP uses "text"; the sanitized split uses "prompt".
+    desc = rec.get("text") or rec.get("prompt") or ""
+    prompt = MBPP_PROMPT_TMPL.format(text=desc, tests="\n".join(tests))
     return Problem(
         task_id=str(rec["task_id"]),
         prompt=prompt,
         build_test_program=_mbpp_program(tests, setup),
-        meta={"text": rec["text"], "code": rec.get("code", ""),
+        meta={"text": rec.get("text") or rec.get("prompt") or "", "code": rec.get("code", ""),
               "test_list": tests},
     )
 
