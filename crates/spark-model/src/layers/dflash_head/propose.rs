@@ -343,6 +343,95 @@ impl BlockDiffusionDraftHead {
                 .max((first_pos + num_append).min(dstate.max_ctx_len));
         }
 
+        // ── ATLAS_DFLASH_ECHO=1: echo-drafting / Jacobi salvage (default off) ──
+        //
+        // On the previous step's rejection, `dflash_stash_echo` (called from
+        // verify_dflash_step.rs on the FLAT chain path only) stashed the
+        // TARGET'S OWN verify argmaxes downstream of the bonus —
+        // `verified[num_accepted+1 ..]`, the target's next-token choices
+        // conditioned on a near-miss prefix. After the one-token bonus
+        // substitution they are usually still right, so offer them directly
+        // as this step's draft chain and SKIP the drafter forward entirely
+        // (the 25-50ms propose slice → ~0). Highest precedence among the
+        // draft sources (PLD / retrieval / recycle below): a target-authored
+        // draft beats any drafter- or lookup-authored one.
+        //
+        // LOSSLESS by the same oracle argument as retrieval/recycle: echo
+        // tokens are only PROPOSED; the verify commits solely the target's
+        // greedy token, so a wrong echo costs one rejected speculation and
+        // can never change committed output (proven by greedy byte-match).
+        //
+        // ctx-hidden maintenance: the append block ABOVE already ran, so the
+        // drafter's context accumulator stays in lockstep even though its
+        // forward is skipped — the next real propose is not ctx-starved.
+        //
+        // Anti-degenerate-loop: `echo_streak` counts CONSECUTIVE echo offers
+        // and is capped (ATLAS_DFLASH_ECHO_MAX_STREAK, default 2) so an echo
+        // step that itself rejects cannot keep salvaging its own wreckage;
+        // after the cap the real drafter runs and resets the streak. The
+        // stash-side min-accept floor (>=2) already blocks re-echo from an
+        // early-rejecting echo step; the cap is the backstop.
+        if let Some(echo_cfg) = super::echo::EchoConfig::from_env() {
+            // Salvage-accept telemetry: attribute the previous step's accept
+            // to the echo draft that produced it (`last_num_accepted` was
+            // just set by after_verify). This line + the offer line below
+            // are the fire-rate / salvage-distribution measurement.
+            if dstate.echo_offered_last {
+                dstate.echo_offered_last = false;
+                tracing::info!(
+                    "DFLASH_ECHO result: accepted={} streak={}",
+                    dstate.last_num_accepted,
+                    dstate.echo_streak,
+                );
+            }
+            // Take the stash unconditionally (single-use): an echo tail is
+            // only valid for the immediately-following step whose last_token
+            // == the stashed bonus key.
+            let valid = dstate.echo_valid;
+            let key = dstate.echo_key;
+            let tail = std::mem::take(&mut dstate.echo_tail);
+            dstate.echo_valid = false;
+            if dstate.first_propose_done
+                && super::echo::should_offer(
+                    &echo_cfg,
+                    valid,
+                    key == last_token,
+                    tail.len(),
+                    dstate.echo_streak,
+                )
+            {
+                // Shape to γ_eff (pad with a trailing repeat / truncate) so
+                // the K=γ_eff+1 verify dispatch — and its CUDA graph — is
+                // identical to the drafter path (same contract as recycle).
+                let echo_gamma_eff = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(self.gamma)
+                    .min(self.gamma)
+                    .max(1);
+                let drafts = super::echo::pad_tail_to_gamma(&tail, echo_gamma_eff);
+                dstate.last_num_drafted = drafts.len();
+                dstate.echo_streak += 1;
+                dstate.echo_offered_last = true;
+                // Flat chain → wy17 verify path, identical dispatch to
+                // drafter output. No tree payload.
+                dstate.pending_tree_payload = None;
+                static ECHO_OFFERS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = ECHO_OFFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(
+                    "DFLASH_ECHO offer #{n}: tail_len={} padded_to={} streak={} key={key}",
+                    tail.len(),
+                    drafts.len(),
+                    dstate.echo_streak,
+                );
+                return Ok(drafts);
+            }
+            // Echo did not fire this propose — every draft source below is
+            // non-echo, so the consecutive-offer streak resets here.
+            dstate.echo_streak = 0;
+        }
+
         // ATLAS_DFLASH_PLD=1: prompt-lookup drafting. If the trailing n-gram
         // (ATLAS_PLD_NGRAM, default 3) recurs earlier in the committed
         // sequence, draft the gamma tokens that followed that occurrence and
