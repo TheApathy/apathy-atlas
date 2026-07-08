@@ -1447,19 +1447,39 @@ impl DenseFfnLayer {
         //   - the `w4a16_gemm_t_m16` kernel symbol is present (try_kernel)
         //   - n ≤ 32 (the kernel's intended small-M window)
         // The combined gate matches the SSM `qkvz` / drafter pattern.
-        let m16_path = n <= 32
+        // WIDE window (SASS audit 2026-07-08): at c>=2 batched verify,
+        // M = 17c exceeds 32 and this whole transposed family used to
+        // disengage — silent fallback to legacy `w4a16_gemm` (no cp.async,
+        // scalar LDG.U8, ~4x sector overfetch, issue-capped ~47% of DRAM
+        // BW): the measured cause of the concurrency ceiling. Route
+        // 32 < n <= 256 through `w4a16_gemm_t_m128` (y-tiled; at M=136 two
+        // weight reads still beat legacy's 3 sweeps x overfetch). Requires
+        // the m128 kernel — the m16 kernel's small-M window is NOT widened.
+        let wide_m128 = n > 32
+            && n <= 256
+            && crate::layers::ffn_kgamma_wide_enabled()
+            && crate::layers::ffn_kgamma_m128_enabled()
+            && self.w4a16_gemm_t_m128.0 != 0
             && (crate::layers::ffn_m16_transposed_enabled()
                 || crate::layers::tc_nvfp4_m16_enabled())
             && self.has_transposed_ffn();
+        let m16_path = (n <= 32
+            && (crate::layers::ffn_m16_transposed_enabled()
+                || crate::layers::tc_nvfp4_m16_enabled())
+            && self.has_transposed_ffn())
+            || wide_m128;
         // m128 upgrade of the m16 path: ONE M-tile at n ≤ 128 → single
         // weight read (m16 re-reads B per 16-row tile: 2× traffic at
         // n=17 on a memory-bound GEMM). See ffn_kgamma_m128_enabled.
         let m128_path =
             m16_path && crate::layers::ffn_kgamma_m128_enabled() && self.w4a16_gemm_t_m128.0 != 0;
         // m32_n64: single B read AND full SM occupancy — strictly better
-        // than m128 at n ≤ 32 when the kernel symbol is present.
+        // than m128 at n ≤ 32 when the kernel symbol is present. The n<=32
+        // bound keeps the WIDE window off m32/fused/split-K variants (their
+        // M_TILE=32 shapes don't cover wide M).
         // ATLAS_FFN_KGAMMA_M32=0 opts out for bisection.
         let m32_path = m128_path
+            && n <= 32
             && self.w4a16_gemm_t_m32_n64.0 != 0
             && std::env::var("ATLAS_FFN_KGAMMA_M32").ok().as_deref() != Some("0");
 
