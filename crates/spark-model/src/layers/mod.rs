@@ -431,6 +431,18 @@ pub fn ffn_kgamma_m128_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_M128").ok().as_deref() == Some("1"))
 }
 
+/// ATLAS_FFN_KGAMMA_WIDE=1: extend the transposed K=γ FFN family to
+/// 32 < n <= 256 via `w4a16_gemm_t_m128` (SASS audit 2026-07-08: at c>=2
+/// batched verify M=17c>32 previously fell back SILENTLY to the legacy
+/// `w4a16_gemm` — no cp.async, scalar LDG.U8, ~4x sector overfetch,
+/// issue-capped at ~47% of DRAM BW — the measured cause of the concurrency
+/// ceiling). Default OFF until the c=2/4 token-exactness A/B passes
+/// (m128-vs-legacy accumulation order differs, so md5 must be re-proven).
+pub fn ffn_kgamma_wide_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_KGAMMA_WIDE").ok().as_deref() == Some("1"))
+}
+
 /// Split count for the DFlash K=γ verify FFN `down_proj` GEMM.
 ///
 /// The down projection ([M=17, N=5120, K=16384]) is occupancy-starved on
