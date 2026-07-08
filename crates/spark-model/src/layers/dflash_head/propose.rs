@@ -31,6 +31,15 @@ impl BlockDiffusionDraftHead {
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
 
+        // ATLAS_DFLASH_ASYNC: the placeholder flag describes the drafts the
+        // PREVIOUS launch returned. Whatever this propose returns (echo /
+        // retrieval / recycle / sync forward / a fresh async launch that
+        // re-sets it), the old flag is stale — clear it up front so a
+        // pending-drafts clear that bypassed collect (e.g. the scheduler's
+        // MTP-mode transition) can never cause a later collect to wipe REAL
+        // drafts and degrade the sequence to bootstrap-only.
+        dstate.async_placeholder = false;
+
         // ── Phase 2.5b kernel-chain scaffold (commented for next-session
         // fill-in; current path falls through to empty-Vec stub below) ──
         //
