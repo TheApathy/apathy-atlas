@@ -264,6 +264,16 @@ impl TransformerModel {
         let lazy_j = crate::layers::wy17_lazy();
         let lazy_commit_env = crate::layers::wy17_lazy_commit();
 
+        // ATLAS_DFLASH_ASYNC_PROBE=1: measure the TRUE GPU duration of this
+        // commit tail (enqueue + secondary-stream drain), not just the CPU
+        // enqueue time STEP_TIMING reports. Measurement-only.
+        let probe = crate::layers::dflash_async_probe();
+        let t_probe = if probe {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let stream = self.secondary_stream;
         let mut ssm_layer_idx = 0usize;
 
@@ -418,6 +428,15 @@ impl TransformerModel {
         }
 
         self.gpu.record_event(self.secondary_event, stream)?;
+        if let Some(t0) = t_probe {
+            let enqueue_us = t0.elapsed().as_micros();
+            self.gpu.synchronize(stream)?;
+            let total_us = t0.elapsed().as_micros();
+            tracing::info!(
+                "ASYNC_PROBE commit_tail: enqueue={enqueue_us}μs gpu_total={total_us}μs \
+                 (num_accepted={num_accepted} k={k})",
+            );
+        }
         Ok(())
     }
 }
