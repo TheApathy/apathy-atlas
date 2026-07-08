@@ -153,6 +153,29 @@ pub(crate) async fn build_and_serve(
     }
     tracing::info!("Listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // Disable Nagle's algorithm (set TCP_NODELAY) on every accepted
+    // connection. Task #41 (2026-07-07): SSE token streaming ships one
+    // tiny `data:` frame per committed token, and DFlash spec-decode
+    // commits a *burst* of K tokens per verify step. With Nagle ON (the
+    // kernel default), the socket coalesces the burst into one segment
+    // and then withholds the *next* burst until the client's delayed-ACK
+    // timer fires (~40 ms) or the prior segment is acknowledged. Measured
+    // against the live server this stretched the client-observed
+    // first→last inter-token window ~2.7x (true 85.7 tok/s read as
+    // ~32-35 tok/s by localmaxxing / any streaming client), because
+    // decode throughput is computed as output_tokens / (lastChunk -
+    // firstChunk) wall clock. TCP_NODELAY flushes each SSE frame to the
+    // wire immediately, so client-observed tok/s tracks true generation
+    // tok/s. Delivery-only change: the SSE byte stream (and thus the
+    // reassembled content) is identical — Nagle only affects *when*
+    // bytes hit the wire, never *which* bytes. `axum::serve::ListenerExt`
+    // runs the tap on each accepted `TcpStream` before hyper serves it.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp_stream| {
+        if let Err(err) = tcp_stream.set_nodelay(true) {
+            tracing::warn!("failed to set TCP_NODELAY on incoming connection: {err:#}");
+        }
+    });
     // `into_make_service_with_connect_info` exposes the socket peer addr
     // to extractors — needed by `rate_limit_middleware` when the caller
     // didn't send X-Forwarded-For.
