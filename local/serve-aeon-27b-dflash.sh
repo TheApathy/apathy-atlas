@@ -262,7 +262,12 @@ export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 # counting 71.7 vs 68.3, code_novel 15.9 vs 15.2, prose par, counting-md5
 # LOSSLESS. Cross-target (3.5-trained) but wins anyway; larger SWA window may
 # help more at long context. Old drafter: z-lab-Qwen3.6-27B-DFlash.
-DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/models/z-lab-Qwen3.5-27B-DFlash-jun26}
+# 2026-07-08: default → v5-goheavy (2-epoch warm-start from v4-scale on the
+# combined 8712-sample NVFP4-captured corpus, go share 1.6%→11.5%). Same-
+# harness A/B vs v4-scale: go +4.6%, counting +1.2%, py neutral; counting md5
+# byte-identical (lossless swap) and ABBA HumanEval x60 chat pass@1 gate:
+# 95.0% vs 95.0%, delta CI [0,0] — identical outputs on every problem. SHIP.
+DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/dflash-retrain/v5-ckpt-goheavy/epoch_2_step_16732}
 
 exec /home/flocka/atlas-src/target/release/spark serve \
   --model-from-path "${TARGET_MODEL:-/home/flocka/models/AEON-Q36-27B-Full}" \
