@@ -246,6 +246,25 @@ pub fn wy17_lazy_commit() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_WY17_LAZY_COMMIT").ok().as_deref() == Some("1"))
 }
 
+/// Returns true when `ATLAS_DFLASH_ASYNC_PROBE=1` is set in the process env.
+///
+/// Measurement-only gate for the task-#20 async propose‖verify design probe.
+/// When on:
+///   * `commit_verify_state_async_dispatch` fences the secondary stream after
+///     enqueue and logs the TRUE GPU duration of the SSM commit tail
+///     (`ASYNC_PROBE commit_tail`), which the CPU-side `STEP_TIMING`
+///     `commit=` figure (enqueue-only) understates;
+///   * `forward_block` logs the enqueue-vs-GPU split of the drafter propose
+///     (`ASYNC_PROBE propose`), i.e. how much of the propose wall is CPU
+///     launch overhead vs actual drafter kernels.
+///
+/// Adds one stream sync per step per site — measurement only, never enable
+/// in production. Default OFF (zero cost). Cached via `OnceLock`.
+pub fn dflash_async_probe() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_ASYNC_PROBE").ok().as_deref() == Some("1"))
+}
+
 /// Is intermediate slot `s` (0..K-1, i.e. Hi_0..Hi_{K-2}) persisted by the
 /// lazy wy17 kernel under stride `j`?
 ///
