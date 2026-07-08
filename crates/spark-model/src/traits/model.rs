@@ -590,6 +590,25 @@ pub trait Model: Send + Sync {
     /// M8A: clear the parent_ids stash after verify. Default no-op.
     fn clear_ddtree_parent_ids(&self) {}
 
+    /// Did the LAST K=γ verify give every tree node ancestor-exact attention
+    /// (pre-context + true ancestors + itself)?
+    ///
+    /// `true` for flat/chain payloads and for the per-row KV indirection
+    /// verify path (`ATLAS_TREE_AWARE_ATTN` +
+    /// `ATLAS_DDTREE_TREE_AWARE_VERIFY`). `false` when a NON-flat tree
+    /// payload was verified with prefix-read metadata only (incl.
+    /// `ATLAS_DDTREE_DFS_REORDER=1`, whose depth-prefix reads are exact only
+    /// for the leftmost spine — branch rows read a spine sibling and miss
+    /// their own key). The scheduler MUST NOT run the full tree-commit
+    /// walker (`greedy_sample_ddtree_full`) when this is `false`: branch
+    /// rows' argmaxes are mis-conditioned and committing through them
+    /// diverges from the greedy oracle (the 2026-07-08 deep-branch-tail
+    /// corruption). Default `true` (models without a DFlash tree verify
+    /// never produce mis-conditioned rows).
+    fn dflash_tree_ancestor_attn_exact(&self) -> bool {
+        true
+    }
+
     /// DDTree M6: drain the per-seq tree payload stashed by the last propose
     /// call. Default returns `None` (flat / MTP / ngram drafters). DDTree-
     /// capable drafters override to surface their last-step tree topology so

@@ -472,6 +472,17 @@ impl Model for TransformerModel {
         // step's DFS-active state, so it never leaks stale across a verify —
         // making the clear here both unnecessary and actively harmful.
     }
+
+    /// See the trait doc: ancestor-exactness of the LAST K=γ verify's
+    /// attention. Written by `decode_verify_graphed_kgamma_dispatch`
+    /// (verify_d.rs) on every call; the scheduler consults it right after
+    /// verify to gate the full tree-commit walker. Release/Acquire pairs
+    /// with the store for the same reason as `dflash_flat_tree_route`.
+    fn dflash_tree_ancestor_attn_exact(&self) -> bool {
+        self.dflash_tree_ancestor_attn
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn trim_proposer_state(
         &self,
         seq: &mut SequenceState,

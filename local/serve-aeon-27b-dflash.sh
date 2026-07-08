@@ -151,24 +151,36 @@ fi
 # statistically dies (the "cliffs"), each carrying the drafter's top-2 at the
 # cliff + a short re-rooted tail. Same bandwidth-bound verify (K=32 ≈ K=17) →
 # more of the target's greedy continuation accepted (DDTree: up to +46% accept on
-# coding). LOSSLESS by the greedy-oracle argument (verify commits only the
-# target's argmax). Requires the same wide-verify + depth-aware commit path as
-# PORTFOLIO, plus ATLAS_DFLASH_TREE_COMMIT=1 so the deep branch tail commits
-# (not just the flat prefix). Companion knobs:
+# coding). Companion knobs:
 #   ATLAS_DFLASH_FREE_SLOTS=<N>        → number of sibling branches (each ≈1+tail)
 #   ATLAS_DFLASH_FREE_SLOTS_TAIL=<L>   → per-branch tail length (default 4)
 #   ATLAS_DFLASH_BRANCH_MARGIN=<m>     → cliff = top1-top2 margin < m (default 2.0)
+#
+# 2026-07-08 ROOT-CAUSE FIX (VALIDATION-36 TEST 1 deep-tail md5 corruption):
+# deep-branch commits are lossless ONLY with per-row ancestor attention —
+# ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 (per-row KV
+# indirection: every tree row attends to exactly its true ancestors + itself).
+# The previous companion, ATLAS_DDTREE_DFS_REORDER=1, is ancestor-exact only
+# for the leftmost spine: a branch row read its spine SIBLING and missed its
+# own key, so its argmax (used for tail-acceptance + the bonus at the path
+# tip) was mis-conditioned → committed tokens diverged from the greedy oracle
+# exactly when a branch was accepted (deep coding tail; counting unaffected).
+# The engine now degrades ATLAS_DFLASH_TREE_COMMIT to the flat-safe walker if
+# the verify was not ancestor-exact (silent corruption is no longer possible),
+# but the branch GAIN requires the indirection path below. Debug:
+# ATLAS_DFLASH_BRANCH_AUDIT=1 logs fork-row-vs-oracle conditioning matches.
 # Enable:
 #   ATLAS_DFLASH_FREE_SLOTS=3 ATLAS_DDTREE_MAX_NODES=32 \
-#   ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 ATLAS_DDTREE_DFS_REORDER=1 \
-#   ATLAS_DFLASH_TREE_COMMIT=1
+#   ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 ATLAS_DDTREE_TREE_AWARE_VERIFY=1 \
+#   ATLAS_TREE_AWARE_ATTN=1 ATLAS_DFLASH_TREE_COMMIT=1
 if [ "$(printf '%s' "${ATLAS_DFLASH_FREE_SLOTS:-0}" | tr -cd '0-9')" != "0" ] \
    && [ "${ATLAS_DFLASH_FREE_SLOTS:-0}" != "0" ]; then
   export ATLAS_DDTREE_MAX_NODES=${ATLAS_DDTREE_MAX_NODES:-32}
   export ATLAS_DDTREE_TREE_TOKENS_VERIFY=${ATLAS_DDTREE_TREE_TOKENS_VERIFY:-1}
-  export ATLAS_DDTREE_DFS_REORDER=${ATLAS_DDTREE_DFS_REORDER:-1}
+  export ATLAS_DDTREE_TREE_AWARE_VERIFY=${ATLAS_DDTREE_TREE_AWARE_VERIFY:-1}
+  export ATLAS_TREE_AWARE_ATTN=${ATLAS_TREE_AWARE_ATTN:-1}
   export ATLAS_DFLASH_TREE_COMMIT=${ATLAS_DFLASH_TREE_COMMIT:-1}
-  echo "[serve-aeon-27b-dflash] FREE-SLOTS branch verify ON (N=${ATLAS_DFLASH_FREE_SLOTS}, K=32, lossless)"
+  echo "[serve-aeon-27b-dflash] FREE-SLOTS branch verify ON (N=${ATLAS_DFLASH_FREE_SLOTS}, K=32, ancestor-exact tree attention)"
 fi
 
 # 2026-06-10: batched K=17 attention QKV via plain w4a16_gemm (M=17, one

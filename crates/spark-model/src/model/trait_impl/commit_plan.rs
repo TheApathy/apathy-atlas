@@ -489,7 +489,8 @@ mod tests {
         assert!(commit_source_is_valid(plan, route, k, k, None));
         // Every partial accept reads inter[total-1] (chain-contiguous).
         for total in 1..k {
-            let (route, plan) = flat_chain_verify_commit(k, cap, false, true, total, false, 1, false);
+            let (route, plan) =
+                flat_chain_verify_commit(k, cap, false, true, total, false, 1, false);
             assert_eq!(route, GdnVerifyRoute::Wy17);
             assert_eq!(plan, HCommitSource::InterSlot(total - 1));
             assert!(commit_source_is_valid(plan, route, total, k, None));
