@@ -239,6 +239,17 @@ export ATLAS_ATTN_QKV_SPLITK=${ATLAS_ATTN_QKV_SPLITK:-4}
 export ATLAS_WY17_LAZY=${ATLAS_WY17_LAZY:-8}
 export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-1}
 
+# 2026-07-08 (think-spec): speculative decode DURING <think> spans (was hard-
+# bypassed -> plain ~13-25 tok/s on the majority of reasoning tokens). Post-
+# verify plain-path accept filter replicates every thinking intervention;
+# ~1.7x thinking-inclusive throughput (11-27 -> 40-43 tok/s on reasoning
+# prompts). NOT byte-lossless (batched verify fwd != sequential decode on SSM
+# layers; benign greedy-trajectory divergence) -> gated on QUALITY instead:
+# ABBA HumanEval x40 thinking-mode pass@1 = 97.5% (flag) vs 95.0% (no flag),
+# CI [0,+0.075] "not worse" = SHIP. /v1/completions (no thinking) unaffected;
+# counting md5 constitution holds.
+export ATLAS_THINK_SPEC=${ATLAS_THINK_SPEC:-1}
+
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
 # M_TILE=16 q/k/v path) was flag-isolated as the corruptor by greedy
