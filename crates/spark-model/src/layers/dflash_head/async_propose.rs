@@ -282,7 +282,14 @@ impl BlockDiffusionDraftHead {
         gpu.stream_wait_event(pstream, ev)?;
 
         // Enqueue the drafter forward with the final sync + D2H deferred.
-        self.forward_block(last_token, position, ctx, pstream, dstate, true)?;
+        // On a mid-enqueue failure, drain the propose stream BEFORE
+        // returning: no inflight handle exists yet, and the caller's sync
+        // fallback would otherwise rewrite the shared scratch while the
+        // partially-enqueued kernels are still running.
+        if let Err(e) = self.forward_block(last_token, position, ctx, pstream, dstate, true) {
+            let _ = gpu.synchronize(pstream);
+            return Err(e);
+        }
 
         *self.async_inflight.lock() = Some(AsyncInflight {
             owner: dstate_id(dstate),
