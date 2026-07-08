@@ -105,10 +105,16 @@ impl BlockDiffusionDraftHead {
         // embed the predicted token instead of the mask.
         // Total stream_buf width = n_attn rows.
         if eff_ctx > 0 {
-            gpu.memset(
+            // Stream-ordered (was gpu.memset = default-stream + host sync):
+            // under ATLAS_DFLASH_ASYNC the pass runs on the propose stream and
+            // this zero must be ordered with the surrounding kernels on THAT
+            // stream (the post-embed re-zero below would otherwise race
+            // batched_embed). Same-stream ordering ⇒ byte-identical when off.
+            gpu.memset_async(
                 self.scratch.stream_buf,
                 0,
                 eff_ctx * self.hidden_size * bf16,
+                stream,
             )?;
         }
         // [eff_ctx zeros, last_token (bonus), per-row mask-or-committed × γ_eff].
@@ -141,10 +147,16 @@ impl BlockDiffusionDraftHead {
         )?;
         // Re-zero ctx slots (batched_embed wrote token-0 embedding to them).
         if eff_ctx > 0 {
-            gpu.memset(
+            // Stream-ordered (was gpu.memset = default-stream + host sync):
+            // under ATLAS_DFLASH_ASYNC the pass runs on the propose stream and
+            // this zero must be ordered with the surrounding kernels on THAT
+            // stream (the post-embed re-zero below would otherwise race
+            // batched_embed). Same-stream ordering ⇒ byte-identical when off.
+            gpu.memset_async(
                 self.scratch.stream_buf,
                 0,
                 eff_ctx * self.hidden_size * bf16,
+                stream,
             )?;
         }
         // ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1: overwrite noise rows

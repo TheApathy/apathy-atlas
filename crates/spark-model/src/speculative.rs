@@ -101,6 +101,35 @@ pub trait DraftProposer: Send + Sync {
         Ok(())
     }
 
+    /// ATLAS_DFLASH_ASYNC (task #20): collect the real drafts of an async
+    /// (second-stream) propose previously launched for this sequence.
+    ///
+    /// Returns `Ok(None)` when nothing is pending (the universal default);
+    /// `Ok(Some(drafts))` with the real chain to replace the placeholder;
+    /// `Ok(Some(vec![]))` when the placeholder was orphaned — the caller
+    /// clears its pending drafts and falls back to the bootstrap decode
+    /// (lossless: drafts only ever propose).
+    fn collect_async_drafts(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+    ) -> Result<Option<Vec<u32>>> {
+        let _ = (gpu, state);
+        Ok(None)
+    }
+
+    /// ATLAS_DFLASH_ASYNC: resolve (sync + discard) any in-flight async
+    /// propose. Must be called before per-sequence device buffers the
+    /// in-flight kernels may read are freed (`free_sequence`). Default no-op.
+    fn resolve_async_inflight(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: Option<&mut dyn ProposerState>,
+    ) -> Result<()> {
+        let _ = (gpu, state);
+        Ok(())
+    }
+
     /// DDTree M6: drain any pending tree payload built by the most recent
     /// `propose()` call. Default returns `None` (flat MTP / ngram / flat
     /// DFlash). DDTree-capable drafters override to return + clear the

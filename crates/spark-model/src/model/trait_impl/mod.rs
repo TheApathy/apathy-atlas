@@ -491,6 +491,9 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
+    fn dflash_collect_async_drafts(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
+        self.dflash_collect_async_drafts_dispatch(seq)
+    }
     fn dflash_stash_recycle(
         &self,
         seq: &mut SequenceState,

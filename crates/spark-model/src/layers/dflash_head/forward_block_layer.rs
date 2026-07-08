@@ -249,7 +249,7 @@ impl BlockDiffusionDraftHead {
             )
         )?;
         if eff_ctx > 0 {
-            gpu.memset(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16)?;
+            gpu.memset_async(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16, stream)?;
         }
 
         // 3b'. K/V projections with persistent context cache.
@@ -585,7 +585,7 @@ impl BlockDiffusionDraftHead {
         // Zero context rows in attn_out so garbage uniform scores from zeroed Q
         // don't corrupt the residual stream through o_proj.
         if eff_ctx > 0 {
-            gpu.memset(self.scratch.attn_out, 0, eff_ctx * q_dim as usize * bf16)?;
+            gpu.memset_async(self.scratch.attn_out, 0, eff_ctx * q_dim as usize * bf16, stream)?;
         }
         if layer_idx == 0 {
             let noise_q_offset = eff_ctx * q_dim as usize * bf16;
@@ -984,7 +984,7 @@ impl BlockDiffusionDraftHead {
         // (discarded) outputs finite. In noise-only mode the GEMM never
         // touches the ctx region, so the memset fully owns it.
         if eff_ctx > 0 {
-            gpu.memset(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16)?;
+            gpu.memset_async(self.scratch.q_buf, 0, eff_ctx * q_dim as usize * bf16, stream)?;
         }
 
         // 3b'. K/V projections with persistent context cache (NVFP4 path).
@@ -1301,7 +1301,7 @@ impl BlockDiffusionDraftHead {
         // Zero context rows in attn_out so garbage uniform scores from zeroed Q
         // don't corrupt the residual stream through o_proj.
         if eff_ctx > 0 {
-            gpu.memset(self.scratch.attn_out, 0, eff_ctx * q_dim as usize * bf16)?;
+            gpu.memset_async(self.scratch.attn_out, 0, eff_ctx * q_dim as usize * bf16, stream)?;
         }
 
         // 3f. o_proj via NVFP4 W4A16 GEMM. N=h, K=q_dim.
