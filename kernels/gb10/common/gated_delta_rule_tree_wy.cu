@@ -156,23 +156,41 @@ extern "C" __global__ void gated_delta_rule_tree_wy(
         // where the empty product is 1.
         // For parent_ids[t] = -1 (root): corrected[t] = hk_root[t].
         float vn[K_MAX];
+        // TASK #40 FIX (predicate): `parent[t] == t-1` alone does NOT imply the
+        // ancestor chain is [0..t-1]. A branch TAIL node is laid at contiguous
+        // slots behind its fork (build_free_slots_payload), so its parent IS
+        // t-1 while its true ancestors are [spine..cliff, fork, tail...] —
+        // the old predicate routed such rows through the linear fast path and
+        // summed cross terms over NON-ANCESTOR slots (spine below the cliff +
+        // earlier branches): an ALGEBRAIC corruption of every branch-tail row,
+        // not mere rounding. The fast path is valid iff ancestors(t) ==
+        // [0..t-1], i.e. parent[t] == t-1 AND ancestors(t-1) == [0..t-2] —
+        // tracked incrementally by `prev_contig` (token 0 must be the root).
+        bool prev_contig = false; // does token t-1 have ancestors exactly [0..t-2]?
         for (unsigned int t = 0; t < T; t++) {
             int p = sparent[t];
             float corrected;
+            bool cur_contig;
             if (p < 0) {
-                // Root → no chain.
+                // Root → no chain. (A re-root at t > 0 — e.g. portfolio root B —
+                // is algebraically fine here but breaks slot-contiguity for its
+                // descendants, hence cur_contig only at t == 0.)
                 corrected = hk_root[t];
-            } else if (p == (int)t - 1) {
+                cur_contig = (t == 0);
+            } else if (p == (int)t - 1 && prev_contig) {
                 // ── LINEAR-CHAIN FAST PATH (bit-equivalent to wy17) ──
-                // When parent[t] == t-1 the ancestor chain is the contiguous
-                // run [0, 1, ..., t-1]. Reproduce gated_delta_rule_wy17.cu's
-                // EXACT accumulation order so the result is bit-identical:
+                // Taken only when the FULL ancestor chain is the contiguous
+                // run [0, 1, ..., t-1] (parent == t-1 AND prev_contig — see
+                // TASK #40 predicate fix above). Reproduce
+                // gated_delta_rule_wy17.cu's EXACT accumulation order so the
+                // result is bit-identical:
                 //   - leading product accumulated ascending u = 0..t-1
                 //   - cross terms summed ascending s = 0..t-1, each with a
                 //     FRESH nested product gprod = ∏_{u=s+1..t-1} sg[u]
-                // (The general ancestor-walk below visits s descending with a
-                // running gprod — same math, different FP rounding. Matching
-                // wy17 order is what makes the chain path bit-exact.)
+                // (The general ancestor-walk below now uses the identical
+                // oldest→newest order per term, so it is bit-equal to this
+                // path on contiguous ancestor content; this branch remains
+                // as the walk-free shortcut for the dominant spine rows.)
                 float lead_prod = 1.0f;
                 for (int u = 0; u < (int)t; u++) lead_prod *= sg[u];
                 corrected = lead_prod * hk_root[t];
@@ -181,6 +199,7 @@ extern "C" __global__ void gated_delta_rule_tree_wy(
                     for (int u = s + 1; u < (int)t; u++) gprod *= sg[u];
                     corrected += gprod * kd_flat[t * (t - 1) / 2 + s] * vn[s];
                 }
+                cur_contig = true;
             } else {
                 // ── GENERAL BRANCH PATH (ancestor walk) ──
                 // Walk ancestors from parent back to root, oldest-first list.
@@ -209,13 +228,24 @@ extern "C" __global__ void gated_delta_rule_tree_wy(
                 for (int ci = L - 1; ci >= 0; ci--) {
                     int s = chain[ci];
                     float kd_ts = kd_flat[t * (t - 1) / 2 + s];
-                    // gprod = ∏ g[chain[k]] for k = 0 .. ci-1 (closer-than-s ancestors)
+                    // gprod = ∏ g[chain[k]] for k = 0 .. ci-1 (closer-than-s
+                    // ancestors). TASK #40 FIX (rounding order): multiply
+                    // OLDEST→NEWEST (k = ci-1 down to 0, ascending real time)
+                    // — the same left-to-right order as wy17's fresh
+                    // ∏_{u=s+1..t-1} sg[u]. The previous k = 0..ci-1 walk
+                    // multiplied newest-first: same product mathematically,
+                    // DIFFERENT FP rounding — the last bit-drift separating
+                    // branch rows from the wy17 chain result on identical
+                    // ancestor content (--fmad=false makes source order the
+                    // only rounding degree of freedom, so this closes it).
                     float gprod = 1.0f;
-                    for (int k = 0; k < ci; k++) gprod *= sg[chain[k]];
+                    for (int k = ci - 1; k >= 0; k--) gprod *= sg[chain[k]];
                     corrected += gprod * kd_ts * vn[s];
                 }
+                cur_contig = false;
             }
             vn[t] = (vi[t] - sg[t] * corrected) * sbt[t];
+            prev_contig = cur_contig;
         }
 
         // ── PASS 2: per-token sequential, write H_inter[t], compute qd[t] ──
