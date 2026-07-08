@@ -14,6 +14,9 @@ mod stream_chunk;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod stream_framing_tests;
+
 pub use annotations::*;
 pub use chat_message::*;
 pub use chat_request::*;
