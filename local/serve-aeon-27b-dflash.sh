@@ -305,7 +305,7 @@ exec /path/to/atlas-src/target/release/spark serve \
   --dflash \
   --draft-model "${DRAFT_MODEL}" \
   --dflash-gamma ${DFLASH_GAMMA:-16} \
-  --mtp-vocab "${MTP_VOCAB:-32000}" \
+  --mtp-vocab "${MTP_VOCAB:-96000}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
   --warmup-prompt /path/to/atlas-src/local/warmup.txt
