@@ -67,3 +67,26 @@ K×248,320 logits per step and uses K argmaxes — 99.999% of paid-for intellige
 - Tier 1 build queued behind the deep-tail agent (scheduler file ownership).
 - Sparse-col GEMV microbench + mtp-vocab 96000 A/B + full-164 evals = next GPU batch.
 - In flight: deep-tail fix (GPU), IMMA decomposition research, W3 mixed-precision build.
+
+## THE 100-TOK/S CODING RECIPE (dense, honest arithmetic, 2026-07-08)
+Today: ~8 accepted / ~190ms step (40ms propose + 150ms verify) = 42 tok/s.
+1. Echo-drafting/async overlap (propose→0): step 150ms → 53 tok/s
+2. Vocab-cap 96k (kill 6% forced-miss): accept ~9.5 → 63
+3. Free-slots + target-guided branching (+30% accept): ~12 → 80
+4. W3 mixed precision (~16 tolerant layers, verify 150→130ms): → 92
+5. Block-chaining γ→32 / hierarchical sparse execution: accept 14+ → 100+
+Five compounding levers, all in flight, each attacking a different term. No miracle required.
+
+## Tier 5 — crazier still (2026-07-08)
+18. **Self-batching app generation.** An app = multiple files; generate all N files as N concurrent
+    LOSSLESS streams (concurrency proven byte-exact) at 208 aggregate tok/s → wall-clock app builds
+    ~2.7x faster with zero single-stream change. Effective coding throughput for app-building ~150+
+    TODAY. Requires only agent-side planning to emit independent file tasks.
+19. **SSM prefix-state caching (hybrid dark matter).** KV prefix caching is standard; the 48 SSM layers
+    still RE-SCAN the whole prefix every agent-loop turn because nobody caches recurrent state across
+    requests. Snapshot SSM state at prefix boundary per session → agent TTFT collapses. Check
+    marconi_skip_to coverage; most hybrid stacks lack exactly this.
+20. **Thought memoization.** Cache reasoning traces by problem-shape hash; replay as the DRAFT for the
+    thinking span on similar problems → near-full accept when the model has "thought this before."
+21. **Persistent-L2 pinning.** cudaMemAdvise persistence window for small-hot tensors (conv1d, norms,
+    hot embedding rows). Bounded, grubby, free.
