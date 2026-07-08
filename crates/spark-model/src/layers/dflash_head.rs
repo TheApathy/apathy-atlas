@@ -464,6 +464,11 @@ pub struct DflashProposerState {
     /// cleared) by the next propose to attribute `last_num_accepted` to the
     /// echo draft — the salvage-accept telemetry line.
     pub echo_offered_last: bool,
+    /// ATLAS_DFLASH_ASYNC: this sequence's `pending_drafts` currently holds
+    /// a PLACEHOLDER chain from an async (second-stream) propose launch; the
+    /// real drafts are collected via `collect_async_drafts` at the top of
+    /// the next scheduler step. Cleared on collect / resolve.
+    pub async_placeholder: bool,
 }
 
 impl ProposerState for DflashProposerState {
@@ -613,6 +618,20 @@ pub struct BlockDiffusionDraftHead {
 
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
+
+    // ── ATLAS_DFLASH_ASYNC (task #20) ──
+    /// At most one in-flight async (second-stream) propose — the head owns a
+    /// single scratch buffer set. `None` when idle / flag off. See
+    /// `async_propose.rs` for the shared-scratch discipline.
+    pub async_inflight: Mutex<Option<async_propose::AsyncInflight>>,
+    /// Dedicated non-blocking CUDA stream for async propose launches.
+    /// Lazily created on first eligible launch; `0` = creation failed →
+    /// async permanently disabled.
+    pub async_propose_stream: std::sync::OnceLock<u64>,
+    /// Event used to order the propose stream after the default stream's
+    /// prior writes (ctx-append D2Ds, verify captures). Set together with
+    /// `async_propose_stream`.
+    pub async_order_event: std::sync::atomic::AtomicU64,
 }
 
 impl BlockDiffusionDraftHead {
@@ -744,6 +763,7 @@ impl BlockDiffusionDraftHead {
     }
 }
 
+pub mod async_propose;
 pub mod ddtree;
 pub mod ddtree_gdn_contract;
 pub mod ddtree_gdn_dispatch;
@@ -885,6 +905,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             echo_valid: false,
             echo_streak: 0,
             echo_offered_last: false,
+            async_placeholder: false,
         }))
     }
 
@@ -965,5 +986,26 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // acceptable for typical session lifetimes. The allocator reclaims
         // on process exit.
         Ok(())
+    }
+
+    fn collect_async_drafts(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+    ) -> Result<Option<Vec<u32>>> {
+        let dstate = state
+            .as_any_mut()
+            .downcast_mut::<DflashProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        self.collect_async_drafts_impl(gpu, dstate)
+    }
+
+    fn resolve_async_inflight(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: Option<&mut dyn ProposerState>,
+    ) -> Result<()> {
+        let dstate = state.and_then(|s| s.as_any_mut().downcast_mut::<DflashProposerState>());
+        self.resolve_async_inflight_impl(gpu, dstate)
     }
 }

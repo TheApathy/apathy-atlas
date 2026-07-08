@@ -18,6 +18,24 @@ pub fn step_mtp(
     // XGrammar bitmask, so a grammar-active sequence must run the bootstrap
     // path below, where `sample_token_with_grammar` enforces it.
     for a in active.iter_mut() {
+        // ATLAS_DFLASH_ASYNC (task #20): the previous step's propose was
+        // ENQUEUED on a second CUDA stream and returned a placeholder chain;
+        // its drafter kernels overlapped the SSM commit tail + step-tail CPU
+        // work. Collect the real drafts NOW (stream sync + γ×4B D2H) before
+        // any gate below inspects `pending_drafts`. `Some(vec![])` = the
+        // launch was orphaned → clear and bootstrap (lossless: drafts only
+        // ever propose). No-op `None` on the sync path / flag off.
+        if !a.pending_drafts.is_empty() {
+            match model.dflash_collect_async_drafts(&mut a.seq) {
+                Ok(Some(drafts)) => a.pending_drafts = drafts,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("dflash_collect_async_drafts: {e:#}");
+                    a.pending_drafts.clear();
+                    a.pending_tree_payload = None;
+                }
+            }
+        }
         if !a.pending_drafts.is_empty() && dflash_grammar_skip_propose(model, a) {
             a.pending_drafts.clear();
             a.pending_tree_payload = None;

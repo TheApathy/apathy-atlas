@@ -12,6 +12,15 @@ use super::{BlockDiffusionDraftHead, DflashProposerState};
 use crate::layer::ForwardContext;
 
 impl BlockDiffusionDraftHead {
+    /// `async_launch` (ATLAS_DFLASH_ASYNC, task #20): when true, every op is
+    /// enqueued on `stream` (the dedicated propose stream, already ordered
+    /// after the default stream via an event) and the function returns
+    /// IMMEDIATELY after the noise-pass loop — the final synchronize + drafts
+    /// D2H (and any host-side post-processing) is deferred to
+    /// `collect_async_drafts_impl` at the top of the next scheduler step.
+    /// The launch-eligibility gate guarantees none of the host-interactive
+    /// features (markov / denoise>1 / margin gate / topk builders / debug
+    /// dumps) are active on this path. Returns an empty Vec sentinel.
     pub(super) fn forward_block(
         &self,
         last_token: u32,
@@ -19,6 +28,7 @@ impl BlockDiffusionDraftHead {
         ctx: &ForwardContext,
         stream: u64,
         dstate: &mut DflashProposerState,
+        async_launch: bool,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -655,6 +665,17 @@ impl BlockDiffusionDraftHead {
         } else {
             0
         };
+
+        // ── ATLAS_DFLASH_ASYNC deferred tail ──
+        // All drafter kernels (incl. the per-row argmax into
+        // `scratch.draft_tokens_dev`) are enqueued on the propose stream.
+        // Return now; the synchronize + D2H below runs at collect time.
+        // Eligibility guarantees the skipped host-side post-processing
+        // (margin gate / markov / denoise freeze / dumps) is inactive.
+        if async_launch {
+            return Ok(Vec::new());
+        }
+
         let t_tail = std::time::Instant::now();
         let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
             .ok()
@@ -774,8 +795,25 @@ impl BlockDiffusionDraftHead {
         };
 
         // ── Step 6: D2H γ_eff × 4 bytes ──
+        // ATLAS_DFLASH_ASYNC_PROBE=1: split the propose wall into CPU enqueue
+        // time (fn entry → here, all kernels launched) vs GPU drain time (the
+        // synchronize below). The drain is the part an async second-stream
+        // launch could overlap with the step's CPU tail. Measurement-only.
+        let async_probe = crate::layers::dflash_async_probe();
+        let probe_enqueue_us = if async_probe {
+            t_total.elapsed().as_micros()
+        } else {
+            0
+        };
         let mut host_buf = vec![0u8; gamma_eff * 4];
         gpu.synchronize(stream)?;
+        if async_probe {
+            tracing::info!(
+                "ASYNC_PROBE propose: enqueue={probe_enqueue_us}μs gpu_total={}μs \
+                 (eff_ctx={eff_ctx} n_attn={n_attn})",
+                t_total.elapsed().as_micros(),
+            );
+        }
         gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf)?;
         let mut drafts: Vec<u32> = host_buf
             .chunks_exact(4)

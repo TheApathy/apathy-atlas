@@ -76,6 +76,20 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // ATLAS_DFLASH_ASYNC: an in-flight second-stream propose reads this
+        // sequence's ctx accumulator + fc/K/V caches — resolve (sync +
+        // discard) BEFORE those buffers are freed below (use-after-free
+        // guard). No-op when nothing is in flight.
+        if let Some(ref proposer) = self.proposer {
+            let res = match seq.proposer_state.as_deref_mut() {
+                Some(ps) => proposer.resolve_async_inflight(self.gpu.as_ref(), Some(ps)),
+                None => proposer.resolve_async_inflight(self.gpu.as_ref(), None),
+            };
+            if let Err(e) = res {
+                tracing::warn!("free_sequence: resolve_async_inflight failed: {e:#}");
+            }
+        }
+
         // Free the DFlash proposer state's per-sequence device buffers.
         // free_state can't (no GpuBackend in scope there); without this,
         // every request leaked the ctx accumulator + fc/K/V caches

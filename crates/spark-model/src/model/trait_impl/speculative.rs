@@ -158,6 +158,22 @@ impl TransformerModel {
         proposer.read_deferred_draft_token(self.gpu.as_ref())
     }
 
+    /// ATLAS_DFLASH_ASYNC: collect a deferred async propose's drafts for
+    /// this sequence (no-op `None` when nothing is pending). See
+    /// `dflash_head/async_propose.rs`.
+    pub(super) fn dflash_collect_async_drafts_dispatch(
+        &self,
+        seq: &mut SequenceState,
+    ) -> Result<Option<Vec<u32>>> {
+        let Some(proposer) = self.proposer.as_ref() else {
+            return Ok(None);
+        };
+        let Some(ref mut state) = seq.proposer_state else {
+            return Ok(None);
+        };
+        proposer.collect_async_drafts(self.gpu.as_ref(), state.as_mut())
+    }
+
     pub(super) fn trim_proposer_state_dispatch(
         &self,
         seq: &mut SequenceState,

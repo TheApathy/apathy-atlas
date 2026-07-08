@@ -898,8 +898,37 @@ impl BlockDiffusionDraftHead {
             // mean >= thresh (or warming up) ⇒ fall through to full-γ propose.
         }
 
+        // ── ATLAS_DFLASH_ASYNC=1 (task #20): async propose‖commit-tail ──
+        // Enqueue the drafter forward on the dedicated propose stream and
+        // return a placeholder chain immediately; the real drafts are
+        // collected (stream sync + γ×4B D2H) by the scheduler at the top of
+        // the NEXT step, so the SSM commit tail + step-tail CPU work overlap
+        // the drafter GPU time. Falls through to the sync path (None) when
+        // the flag is off or any host-interactive feature is active. When
+        // the flag is on but this call is ineligible, still resolve any
+        // stale in-flight launch before the sync forward touches the shared
+        // scratch buffers.
+        if super::async_propose::dflash_async_enabled() {
+            match self.try_launch_async_propose(
+                last_token,
+                position,
+                base_gamma_eff,
+                ctx,
+                _stream,
+                _grammar_bitmask.is_some(),
+                dstate,
+            ) {
+                Ok(Some(placeholder)) => return Ok(placeholder),
+                Ok(None) => self.resolve_async_inflight_impl(ctx.gpu, None)?,
+                Err(e) => {
+                    tracing::warn!("DFLASH_ASYNC launch failed ({e:#}); sync propose fallback");
+                    self.resolve_async_inflight_impl(ctx.gpu, None)?;
+                }
+            }
+        }
+
         let drafts = self
-            .forward_block(last_token, position, ctx, _stream, dstate)
+            .forward_block(last_token, position, ctx, _stream, dstate, false)
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
                 e

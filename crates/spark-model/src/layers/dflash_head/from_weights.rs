@@ -658,6 +658,9 @@ impl BlockDiffusionDraftHead {
             rms_norm_eps: 1e-6,
             ctx_window,
             quant: quantization,
+            async_inflight: Mutex::new(None),
+            async_propose_stream: std::sync::OnceLock::new(),
+            async_order_event: std::sync::atomic::AtomicU64::new(0),
         };
 
         tracing::info!(

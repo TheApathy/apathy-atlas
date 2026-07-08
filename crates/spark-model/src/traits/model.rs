@@ -709,6 +709,19 @@ pub trait Model: Send + Sync {
         stream: u64,
     ) -> Result<()>;
 
+    /// ATLAS_DFLASH_ASYNC (task #20): collect the real drafts of an async
+    /// (second-stream) DFlash propose previously launched for this sequence.
+    ///
+    /// The scheduler calls this at the top of each step for sequences with
+    /// pending drafts; `Some(drafts)` replaces the placeholder chain the
+    /// launch returned. `Some(vec![])` signals an orphaned placeholder —
+    /// the caller clears its pending drafts and bootstraps (lossless).
+    /// Default `None`: nothing pending / feature unsupported.
+    fn dflash_collect_async_drafts(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
+        let _ = seq;
+        Ok(None)
+    }
+
     /// ATLAS_DFLASH_RECYCLE=1: stash the discarded draft tail on the DFlash
     /// proposer state so the next propose can re-offer it (lossless).
     ///
