@@ -10,9 +10,12 @@ proven at PTX level). Wins = fewer bytes, more tokens per read, or less serial t
 K×248,320 logits per step and uses K argmaxes — 99.999% of paid-for intelligence is discarded.
 
 ## Tier 1 — mine the discarded verify logits (PURSUING FIRST)
-1. **Echo-drafting (Jacobi salvage).** Next step's draft = [bonus, target's own argmaxes at the rejected
-   tail]. Target-authored draft, zero propose cost. Attacks the 25-50ms propose slice. Build: keep verify
-   argmaxes (already returned), use as pending_drafts behind a near-miss heuristic; A/B accept.
+1. **Echo-drafting (Jacobi salvage).** ~~REFUTED as standalone (2026-07-08, measured)~~: salvage accept
+   0.85/16 mean, 83% of echo chains die at position 0 — a one-token substitution derails the target's
+   continuation nearly always (joins recycle/denoise in the dead post-miss-salvage family, now with
+   per-position data). LOSSLESS both ways; machinery committed default-OFF. LIVE VARIANT: as the FREE
+   draft inside async propose-verify overlap (#20) — a poor echo costs nothing there, and the measured
+   7.7% of >=5-accept salvages are pure profit.
 2. **Target-guided branching.** Top-2/3 of verify logits at each position → the K=32 free slots. Branches
    sourced from the target's own second choices; no drafter, no training. Needs deep-tail fix landed.
 
