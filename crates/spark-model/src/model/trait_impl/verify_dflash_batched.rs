@@ -34,8 +34,12 @@
 //! deterministic GEMM). The scheduler's per-seq accept/commit/propose loops
 //! run UNCHANGED, so per-sequence output is identical to c=1.
 //!
+//! ## v2 additions
+//!   * lm_head batched: `ceil(c*K/32)` chunked passes over the contiguous
+//!     `[c*K, H]` normed buffer (the logits buffer caps at 32 rows) instead of
+//!     the v1 `c` per-seq passes — fewer lm_head weight-read sweeps.
+//!
 //! ## Not batched in v1 (see the FFN win note above)
-//!   * lm_head runs per-seq (the logits buffer is capped at 32 rows).
 //!   * No CUDA graph capture (eager; the weight amortization dwarfs launch
 //!     overhead at these M).
 //!   * No tree/DDTree payloads (flat chain only); the scheduler routes
@@ -236,16 +240,30 @@ impl TransformerModel {
             stream,
         )?;
 
-        // ── lm_head + argmax PER SEQ (logits buffer capped at 32 rows) ──
-        // Each seq's K rows fit; argmax D2H after each seq.
+        // ── BATCHED lm_head + argmax over ALL c*K rows (v2) ──
+        // The shared logits buffer is capped at 32 rows (`logits_tokens =
+        // m.min(32)` in buffers/sizes.rs), so we cannot land all `c*K` rows'
+        // logits at once. Instead of the v1 per-seq loop (`c` weight-read
+        // passes, one per sequence), chunk the CONTIGUOUS `[c*K, H]` normed
+        // buffer into `ceil(c*K/32)` runs of ≤32 rows — each run is ONE
+        // lm_head weight-read pass (the transposed m32_n64 kernel covers M≤32
+        // in a single coalesced sweep). At c=8/K=17 this is
+        // ceil(136/32)=5 passes vs 8. Rows may straddle sequence boundaries
+        // (row `r` = seq `r/K`, position `r%K`), which is fine: the lm_head
+        // projection + per-row argmax are independent per row, so a chunk that
+        // mixes two sequences' rows is bit-identical to running each row alone.
+        // Byte-identical to the single-seq `decode_verify` argmax: same kernel,
+        // same weights, same per-row math — only the M-dimension batches.
         let vocab = self.verify_lmhead_vocab() as usize;
-        let mut results: Vec<Vec<u32>> = Vec::with_capacity(c);
-        for s in 0..c {
-            let row_base = s * k;
-            let normed_s = normed.offset(row_base * h * bf16);
-            self.lm_head_batched(normed_s, k as u32, stream)?;
+        const LM_CHUNK: usize = 32;
+        let mut all_argmax: Vec<u32> = vec![0u32; total_rows];
+        let mut chunk_start = 0usize;
+        while chunk_start < total_rows {
+            let rows = (total_rows - chunk_start).min(LM_CHUNK);
+            let normed_chunk = normed.offset(chunk_start * h * bf16);
+            self.lm_head_batched(normed_chunk, rows as u32, stream)?;
             let argmax_out = self.buffers.scratch();
-            for t in 0..k {
+            for t in 0..rows {
                 let logits_t = self.buffers.logits().offset(t * vocab * bf16);
                 let out_t = argmax_out.offset(t * 4);
                 ops::argmax_bf16(
@@ -258,18 +276,22 @@ impl TransformerModel {
                 )?;
             }
             self.gpu.synchronize(stream)?;
-            let mut buf = vec![0u8; k * 4];
+            let mut buf = vec![0u8; rows * 4];
             self.gpu.copy_d2h(argmax_out, &mut buf)?;
-            let mut out = Vec::with_capacity(k);
-            for t in 0..k {
-                out.push(u32::from_le_bytes([
+            for t in 0..rows {
+                all_argmax[chunk_start + t] = u32::from_le_bytes([
                     buf[t * 4],
                     buf[t * 4 + 1],
                     buf[t * 4 + 2],
                     buf[t * 4 + 3],
-                ]));
+                ]);
             }
-            results.push(out);
+            chunk_start += rows;
+        }
+        // Slice the flat per-row argmax back into per-seq K-length windows.
+        let mut results: Vec<Vec<u32>> = Vec::with_capacity(c);
+        for s in 0..c {
+            results.push(all_argmax[s * k..(s + 1) * k].to_vec());
         }
 
         // ── Advance per-seq state exactly like decode_verify (push K, +=K) ──
