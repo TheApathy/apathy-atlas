@@ -47,10 +47,12 @@ K×248,320 logits per step and uses K argmaxes — 99.999% of paid-for intellige
     Probably 0%; costs 10 minutes to check.
 
 ## Tier 4 — the even-crazier wave (2026-07-08, second brainstorm)
-12. **Concurrent best-of-N with sandbox arbitration (self-healing codegen).** Use the idle-bandwidth
-    concurrency slots to decode 2-4 independent solutions in parallel, execute all in the sandbox, return
-    the one that passes tests. pass@2-4 quality at ~pass@1 wall-clock. Immediately useful for app-building;
-    all machinery exists (concurrency validated lossless, sandbox built for evals).
+12. **Concurrent best-of-N with sandbox arbitration — BUILT + MEASURED (2026-07-08, local/bestofn.py).**
+    HumanEval x40, n=4, temp0.7: pass@1 92.5% -> pass-any@4 97.5% = **+5pt CORRECTNESS LIFT**. Cost NOT
+    free: n=4 concurrency overlap = 2.5x (not 4x — thinking-mode chat outputs vary in length so the batch
+    doesn't pack perfectly) → ~1.6x generation wall + N sandbox runs. VERDICT: a genuine QUALITY axis
+    nothing else touches — +5pt coding correctness for ~1.6x latency, tunable (n=2 ≈ most of lift at ~1.3x).
+    Strong for app-building (correct-that-runs > fast-but-wrong). SHIP as an opt-in coding mode.
 13. **Span-copy speculation ("edit-script drafting").** For editing/refactoring: the drafter emits ONE
     action — "copy context span [a,b]" — instead of 500 tokens. Chunked K=32 verify windows ride through
     the span at full accept; compose with hierarchical execution (sparse ghost verifies the copy, dense
