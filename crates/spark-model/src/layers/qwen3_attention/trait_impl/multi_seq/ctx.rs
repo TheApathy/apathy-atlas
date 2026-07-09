@@ -60,6 +60,36 @@ impl<'a> MultiSeqCtx<'a> {
         stream: u64,
         max_seq_len_host: u32,
     ) -> Self {
+        Self::new_with_qkv_base(
+            layer,
+            fwd,
+            hidden,
+            residual,
+            n,
+            bs,
+            stream,
+            max_seq_len_host,
+            None,
+        )
+    }
+
+    /// Like [`Self::new`] but with an optional override for the QKV buffer
+    /// base. Used by the #39 v2 cross-seq batched-QKV path: the projection is
+    /// hoisted across all `c*K` rows into `qkv_output`, and each sequence's
+    /// attention phases 3-7 read their own `[s*K, (s+1)*K)` slice by pointing
+    /// `qkv_buf` at `qkv_output + s*K*per_seq_qkv`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn new_with_qkv_base(
+        layer: &Qwen3AttentionLayer,
+        fwd: &'a ForwardContext<'a>,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        n: usize,
+        bs: u32,
+        stream: u64,
+        max_seq_len_host: u32,
+        qkv_buf_override: Option<DevicePtr>,
+    ) -> Self {
         let h = fwd.config.hidden_size;
         let nq = layer
             .num_q_heads_override
@@ -75,7 +105,7 @@ impl<'a> MultiSeqCtx<'a> {
         let q_proj_bytes = q_proj_dim as usize * bf16;
         let per_seq_qkv = q_proj_bytes + (nkv * hd) as usize * bf16 * 2;
         let normed = fwd.buffers.norm_output();
-        let qkv_buf = fwd.buffers.qkv_output();
+        let qkv_buf = qkv_buf_override.unwrap_or_else(|| fwd.buffers.qkv_output());
         Self {
             fwd,
             hidden,
