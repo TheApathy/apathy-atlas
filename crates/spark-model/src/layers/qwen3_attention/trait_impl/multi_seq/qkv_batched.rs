@@ -82,6 +82,15 @@ impl Qwen3AttentionLayer {
         if !ok {
             bail!("decode_multi_seq_qkv_batched: transposed QKV weights / m128 kernel unavailable");
         }
+        // FP32-residual builds route phase-1 RMS-norm through the FP32-input
+        // `rms_norm_residual_fp32` kernel (the hidden buffer is FP32-strided).
+        // Our batched `rms_norm_k` is the BF16-input kernel, so it would
+        // mis-stride an FP32 hidden buffer. Refuse and let the caller keep the
+        // per-seq v1 path (which binds the correct FP32 kernel). Production
+        // GB10 aeon-27b uses BF16 residual, so the fast path stays active.
+        if fwd.config.use_fp32_residual() {
+            bail!("decode_multi_seq_qkv_batched: FP32 residual — per-seq path owns the FP32 norm");
+        }
 
         // ── RMS-norm over all `num_rows` rows into `norm_output` ──
         // `residual` is NOT updated here: phase 1 (`rms_norm_residual`) in the
