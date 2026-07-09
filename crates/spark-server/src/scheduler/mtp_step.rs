@@ -293,6 +293,74 @@ pub fn step_mtp(
         return;
     }
 
+    // ── Phase B (opt-in): CROSS-SEQ BATCHED DFLASH VERIFY (#39) ──
+    // ATLAS_DFLASH_BATCHED_VERIFY=1: route ELIGIBLE γ-block verifies through
+    // ONE batched forward (FFN weights read once across c seqs). Eligible =
+    // drafts.len()>=4, equal K, no grammar, not thinking, no tree payload /
+    // tree-or-portfolio method, not finished. Others fall through per-seq.
+    if dflash_batched_verify_enabled() && verify_idxs.len() >= 2 {
+        let mut batched_idxs: Vec<usize> = Vec::new();
+        let mut leftover_idxs: Vec<usize> = Vec::new();
+        // Reference K = first eligible seq's draft count; the batch must share it.
+        let mut batch_k: Option<usize> = None;
+        for &idx in &verify_idxs {
+            let a = &active[idx];
+            let dl = a.pending_drafts.len();
+            let grammar_ok = a
+                .grammar_state
+                .as_ref()
+                .is_none_or(|gs| gs.is_terminated());
+            let eligible = dl >= 4
+                && grammar_ok
+                && !a.finished
+                && !(think.enabled && a.inside_thinking)
+                && a.pending_tree_payload.is_none()
+                && !dflash_tree_method_active()
+                && !dflash_portfolio_active()
+                && batch_k.is_none_or(|k| k == dl);
+            if eligible {
+                batch_k.get_or_insert(dl);
+                batched_idxs.push(idx);
+            } else {
+                leftover_idxs.push(idx);
+            }
+        }
+        if batched_idxs.len() >= 2 {
+            step_verify_dflash_batched(model, active, &batched_idxs, num_drafts);
+        } else {
+            leftover_idxs.extend(batched_idxs);
+        }
+        // Per-seq path for anything that didn't batch.
+        for &idx in &leftover_idxs {
+            let a = &mut active[idx];
+            let mut drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
+            if drafts.is_empty() {
+                continue;
+            }
+            if !a.inside_thinking
+                && let Some(ref mut gs) = a.grammar_state
+            {
+                let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
+                if kept < drafts.len() {
+                    drafts.truncate(kept);
+                }
+                if drafts.is_empty() {
+                    continue;
+                }
+            }
+            if drafts.len() >= 4 {
+                step_verify_dflash(model, a, &drafts, num_drafts, think);
+            } else if drafts.len() >= 3 {
+                step_verify_k4(model, a, &drafts, num_drafts);
+            } else if drafts.len() >= 2 {
+                step_verify_k3(model, a, &drafts, num_drafts);
+            } else {
+                step_verify_k2(model, a, &drafts, num_drafts);
+            }
+        }
+        return;
+    }
+
     // ── Phase B (default per-seq path): Verify with pipelined checkpoint ──
     for &idx in &verify_idxs {
         let a = &mut active[idx];

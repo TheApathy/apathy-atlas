@@ -407,6 +407,7 @@ impl TransformerModel {
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
             self_spec_sparse_draft: None,
+            ffn_defer: None,
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──

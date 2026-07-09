@@ -335,6 +335,29 @@ pub struct ForwardContext<'a> {
     /// byte-identical to before this field existed. The draft need not be
     /// bit-exact (the dense verify is the oracle).
     pub self_spec_sparse_draft: Option<f32>,
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): when `Some`, the layer runs its
+    /// MIXER (SSM/GDN or attention) + post-mixer residual RMS-norm but SKIPS
+    /// its own FFN. Instead of running `self.ffn.forward*` and adding the FFN
+    /// output back into `hidden`, the layer writes its post-mixer normed FFN
+    /// input into `dst_base` at row `row_offset` (contiguous `[num_rows, H]`)
+    /// so the model orchestrator can run ONE batched FFN over all c×K rows of
+    /// all sequences — reading the 14 GB of FFN weights ONCE per layer instead
+    /// of once per sequence. `None` for every legacy caller — the layer runs
+    /// its own FFN exactly as before (byte-identical). See
+    /// `decode_verify_dflash_batched`.
+    pub ffn_defer: Option<FfnDefer>,
+}
+
+/// Directive for the cross-seq batched verify (#39): defer this layer's FFN,
+/// writing the post-mixer FFN input to an external contiguous buffer so the
+/// caller can batch the FFN GEMM across sequences.
+#[derive(Clone, Copy)]
+pub struct FfnDefer {
+    /// Base of the external `[total_rows, H]` BF16 buffer that collects every
+    /// sequence's post-mixer FFN input for this layer.
+    pub dst_base: spark_runtime::gpu::DevicePtr,
+    /// Row where THIS sequence's rows start in `dst_base` (× H × bf16 stride).
+    pub row_offset: usize,
 }
 
 /// A single transformer layer performing the full per-layer computation.

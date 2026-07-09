@@ -209,6 +209,64 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    fn run_deferred_ffn(
+        &self,
+        ffn_input: DevicePtr,
+        hidden: DevicePtr,
+        total_rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::layers::ops;
+        // Attention layers may have no FFN (Nemotron-H) — nothing to add.
+        if self.ffn.is_none() {
+            return Ok(());
+        }
+        let h = ctx.config.hidden_size;
+        let bf16 = 2usize;
+        let residual_elem = if ctx.config.use_fp32_residual() {
+            4usize
+        } else {
+            2usize
+        };
+        let try_kgamma = (total_rows as u32) > 3 && crate::layers::ffn_kgamma_m16_enabled();
+        let used_kgamma = if try_kgamma {
+            let serviced = self
+                .ffn
+                .forward_kgamma(ffn_input, total_rows as u32, ctx, stream)?;
+            if serviced {
+                let moe_out = ctx.buffers.moe_output();
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    moe_out,
+                    (total_rows as u32) * h as u32,
+                    stream,
+                )?;
+            }
+            serviced
+        } else {
+            false
+        };
+        if !used_kgamma {
+            for t in 0..total_rows {
+                let in_t = ffn_input.offset(t * h * bf16);
+                let moe_out = self.ffn.forward(in_t, ctx, stream)?;
+                let hidden_t = hidden.offset(t * h * residual_elem);
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden_t,
+                    moe_out,
+                    h as u32,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         Ok(Box::new(EmptyLayerState))
     }

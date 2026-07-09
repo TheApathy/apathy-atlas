@@ -46,6 +46,33 @@ impl Qwen3AttentionLayer {
         // attention path (issue #84) gets correct, isolated FFN output
         // without depending on the buggy batched-MoE kernels. Fixing the
         // batched-MoE kernel is tracked separately (out of #84 scope).
+        // CROSS-SEQ BATCHED DFLASH VERIFY (#39): defer the FFN. Run the
+        // post-attn residual RMS-norm over all `n` rows into `normed2_base`
+        // (leaving the post-mixer residual in `hidden`), copy those rows into
+        // the caller's external collection buffer at this seq's row offset, and
+        // return WITHOUT the FFN — the model orchestrator batches the FFN GEMM
+        // across every sequence's rows and adds the output back into `hidden`.
+        if let Some(defer) = fwd.ffn_defer {
+            let normed2_base = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2_base,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            let dst = defer.dst_base.offset(defer.row_offset * h * bf16);
+            fwd.gpu
+                .copy_d2d_async(normed2_base, dst, n * h * bf16, stream)?;
+            return Ok(());
+        }
+
         let force_seq_ffn = self.mla.is_some();
         if n == 3 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();

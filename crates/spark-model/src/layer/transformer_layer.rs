@@ -437,6 +437,30 @@ pub trait TransformerLayer: Send + Sync {
         Ok(())
     }
 
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): run this layer's FFN ONCE over
+    /// `total_rows` rows that were collected from every sequence's mixer output
+    /// (via `ctx.ffn_defer`), then add the FFN output back into `hidden`.
+    ///
+    /// `ffn_input` is a contiguous `[total_rows, H]` BF16 buffer holding the
+    /// post-mixer FFN input for every sequence's K rows (written by the mixer's
+    /// deferred path). `hidden` is the same `[total_rows, H]` residual stream.
+    /// This is the weight-amortizing step: the FFN weights are read ONCE for
+    /// all `c×K` rows instead of once per sequence.
+    ///
+    /// Default: unimplemented (only the concrete SSM/attention layers with an
+    /// FFN override it). Layers with no FFN return `Ok(())`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_deferred_ffn(
+        &self,
+        _ffn_input: DevicePtr,
+        _hidden: DevicePtr,
+        _total_rows: usize,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("run_deferred_ffn not implemented for this layer type (#39 batched verify)")
+    }
+
     /// Allocate per-sequence state for this layer.
     ///
     /// Called once when a new sequence is created. Returns:

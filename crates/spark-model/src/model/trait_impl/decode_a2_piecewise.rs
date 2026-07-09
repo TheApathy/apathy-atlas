@@ -131,6 +131,7 @@ impl TransformerModel {
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
             self_spec_sparse_draft: None,
+            ffn_defer: None,
         };
 
         // Fixed-stride seq_lens / block_tables for the padded batch (only the
@@ -471,6 +472,7 @@ fn clone_ctx<'a>(ctx: &ForwardContext<'a>) -> ForwardContext<'a> {
         tree_aware_attn: None,
         ssm_multi_seq_ptr_table_override: None,
         self_spec_sparse_draft: None,
+            ffn_defer: None,
     }
 }
 
