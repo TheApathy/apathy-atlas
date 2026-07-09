@@ -493,9 +493,16 @@ impl TransformerModel {
 fn dflash_batched_qkv_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
+        // Default OFF: MEASURED 2026-07-09 neutral-to-slightly-slower vs the
+        // FFN-only v1 (c=8: 223.0 vs 227.7, both md5-exact e3a39829). qkv is
+        // only 16 layers + lm_head 1 → small shareable bytes, and the
+        // deferred-gather restructuring overhead cancels them. The c=8 per-seq
+        // collapse is SSM COMPUTE, not weight reads, so batching more
+        // projections can't move it. Kept opt-in (=1) — lossless, may repay at
+        // higher concurrency where the byte share grows.
         std::env::var("ATLAS_DFLASH_BATCHED_QKV")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     })
 }
 
