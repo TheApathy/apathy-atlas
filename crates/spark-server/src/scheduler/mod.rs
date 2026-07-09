@@ -40,6 +40,7 @@ mod thinking_efficiency;
 mod types;
 mod verify_csk_step;
 mod verify_csk_step_k2;
+mod verify_dflash_batched_step;
 mod verify_dflash_step;
 mod verify_k2_step;
 mod verify_k3_step;
@@ -83,6 +84,7 @@ pub use thinking_efficiency::{
 use types::*;
 use verify_csk_step::*;
 use verify_csk_step_k2::*;
+use verify_dflash_batched_step::*;
 use verify_dflash_step::*;
 use verify_k2_step::*;
 use verify_k3_step::*;

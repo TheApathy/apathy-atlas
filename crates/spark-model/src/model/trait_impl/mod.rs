@@ -38,6 +38,7 @@ mod verify_c;
 mod verify_c2;
 mod verify_csk;
 mod verify_d;
+mod verify_dflash_batched;
 
 impl Model for TransformerModel {
     fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
@@ -277,6 +278,14 @@ impl Model for TransformerModel {
         _stream: u64,
     ) -> Result<[u32; 4]> {
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
+    }
+    fn decode_verify_dflash_batched(
+        &self,
+        tokens_per_seq: &[Vec<u32>],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<Vec<u32>>> {
+        self.decode_verify_dflash_batched_dispatch(tokens_per_seq, seqs)
     }
     fn decode_verify_graphed_kgamma(
         &self,

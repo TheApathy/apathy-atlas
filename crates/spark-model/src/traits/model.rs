@@ -459,6 +459,39 @@ pub trait Model: Send + Sync {
         Ok(out)
     }
 
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): verify `c` sequences' K=γ+1
+    /// draft windows in ONE forward whose FFN GEMMs read the ~14 GB of NVFP4
+    /// FFN weights ONCE for all `c×K` rows (instead of `c` separate per-seq
+    /// verify forwards). `tokens_per_seq[s]` = seq `s`'s `[last_token,
+    /// draft0, .., draft_{γ-1}]`; all seqs MUST share the same `K` (scheduler
+    /// aligns the batch).
+    ///
+    /// Returns `Vec<Vec<u32>>` where element `s` is seq `s`'s per-position
+    /// argmax (length `K`), identical layout to `decode_verify` per seq.
+    ///
+    /// **Side effects per seq (identical to `decode_verify`):** `seq_len += K`
+    /// and all `K` tokens pushed to `seq.tokens`. The caller rolls back per-seq
+    /// and calls `commit_verify_state_async(seq, num_accepted+1, K)` per-seq
+    /// exactly as the single-seq DFlash verify path does — the per-sequence
+    /// accept/commit/propose loops are UNCHANGED, so output stays lossless.
+    ///
+    /// Default impl loops the single-seq `decode_verify` (functionally
+    /// identical, no batching win); TransformerModel overrides with the real
+    /// batched forward.
+    fn decode_verify_dflash_batched(
+        &self,
+        tokens_per_seq: &[Vec<u32>],
+        seqs: &mut [&mut SequenceState],
+        _stream: u64,
+    ) -> Result<Vec<Vec<u32>>> {
+        let mut out = Vec::with_capacity(seqs.len());
+        for (i, seq) in seqs.iter_mut().enumerate() {
+            let r = self.decode_verify(&tokens_per_seq[i], seq, 0)?;
+            out.push(r);
+        }
+        Ok(out)
+    }
+
     /// CUDA-graphed K=4 verify (1 verified + 3 drafts). Returns 4 argmax IDs.
     /// SSM intermediates [0..3] saved for partial rollback.
     fn decode_verify_graphed_k4(

@@ -681,6 +681,22 @@ impl Qwen3SsmLayer {
             )?;
             anyhow::Result::<()>::Ok(())
         })?;
+
+        // CROSS-SEQ BATCHED DFLASH VERIFY (#39): defer the FFN. The mixer +
+        // post-attn residual RMS-norm above have written this seq's
+        // `num_tokens` FFN-input rows into `normed2_base` and left the
+        // post-mixer residual in `hidden` (= residual). Copy those rows into
+        // the caller's external collection buffer at this seq's row offset and
+        // return WITHOUT running the FFN — the model orchestrator batches the
+        // FFN GEMM across all sequences' rows, reading FFN weights once, then
+        // adds the batched FFN output back into each seq's `hidden`.
+        if let Some(defer) = ctx.ffn_defer {
+            let dst = defer.dst_base.offset(defer.row_offset * h * bf16);
+            ctx.gpu
+                .copy_d2d_async(normed2_base, dst, num_tokens * h * bf16, stream)?;
+            return Ok(());
+        }
+
         if num_tokens == 3 {
             // Fused K=3 MoE: 5 kernel launches instead of 15
             crate::kprof!(ctx.gpu, stream, "ssm_ffn_forward_k3", {
@@ -789,6 +805,71 @@ impl Qwen3SsmLayer {
             }
         }
 
+        Ok(())
+    }
+
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): run the dense FFN ONCE over
+    /// `total_rows` (= c×K) rows collected from every sequence's deferred
+    /// mixer output, then residual-add into the shared `[total_rows, H]`
+    /// hidden. This is the weight-amortizing step — the FFN NVFP4 weights are
+    /// streamed once for all sequences instead of once per sequence. Mirrors
+    /// the `num_tokens > 3` batched-FFN branch of `decode_batched_inner`
+    /// (forward_kgamma at M=total_rows → WIDE m128 window when 32 < M ≤ 256),
+    /// falling back to the per-row `forward()` loop when the batched kernel
+    /// isn't serviced (e.g. MoE FFN, kgamma disabled).
+    pub(super) fn run_deferred_ffn_inner(
+        &self,
+        ffn_input: DevicePtr,
+        hidden: DevicePtr,
+        total_rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let h = ctx.config.hidden_size;
+        let bf16 = 2usize;
+        let residual_elem = if ctx.config.use_fp32_residual() {
+            4usize
+        } else {
+            2usize
+        };
+
+        let try_kgamma =
+            (total_rows as u32) > 3 && super::super::ffn_kgamma_m16_enabled();
+        let used_kgamma = if try_kgamma {
+            let serviced = self
+                .ffn
+                .forward_kgamma(ffn_input, total_rows as u32, ctx, stream)?;
+            if serviced {
+                let moe_out = ctx.buffers.moe_output();
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    moe_out,
+                    (total_rows as u32) * h as u32,
+                    stream,
+                )?;
+            }
+            serviced
+        } else {
+            false
+        };
+
+        if !used_kgamma {
+            for t in 0..total_rows {
+                let in_t = ffn_input.offset(t * h * bf16);
+                let moe_out = self.ffn.forward(in_t, ctx, stream)?;
+                let hidden_t = hidden.offset(t * h * residual_elem);
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden_t,
+                    moe_out,
+                    h as u32,
+                    stream,
+                )?;
+            }
+        }
         Ok(())
     }
 }
