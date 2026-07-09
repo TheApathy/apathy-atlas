@@ -122,25 +122,16 @@ fn finalize_flat_dflash_verify(
 ) {
     a.last_token_time = Instant::now();
 
-    // Accept-prefix: drafts[i] accepted iff drafts[i] == verified[i].
-    let mut num_accepted = 0usize;
-    for i in 0..drafts.len() {
-        if i + 1 >= verified.len() {
-            break;
-        }
-        if drafts[i] == verified[i] {
-            num_accepted += 1;
-        } else {
-            break;
-        }
-    }
+    // Accept-prefix: drafts[i] accepted iff drafts[i] == verified[i]. Pure
+    // helper (unit-tested) so the exact-match contract matches the flat path of
+    // step_verify_dflash bit-for-bit.
+    let num_accepted = flat_accept_prefix(drafts, verified);
 
     // Roll back the over-extended seq_len / seq.tokens to
     // pre_verify_len + num_accepted + 1 (accepted drafts + bonus slot).
     let k_tokens = drafts.len() + 1;
-    let pre_verify_len = a.seq.seq_len.saturating_sub(k_tokens);
-    let target_seq_len = pre_verify_len + num_accepted + 1;
-    let to_drop = a.seq.seq_len.saturating_sub(target_seq_len);
+    let (target_seq_len, to_drop) =
+        flat_rollback_plan(a.seq.seq_len, drafts.len(), num_accepted);
     if to_drop > 0 {
         a.seq.seq_len = target_seq_len;
         let pop_n = to_drop.min(a.seq.tokens.len());
@@ -202,5 +193,127 @@ fn finalize_flat_dflash_verify(
         }
         Ok(_) => {}
         Err(e) => tracing::error!("run_mtp_propose_multi (batched dflash): {e:#}"),
+    }
+}
+
+/// Pure flat-chain accept-prefix count: the length of the longest prefix where
+/// `drafts[i] == verified[i]`. `verified` is `[target@last_token, target@draft0,
+/// …]` (length `drafts.len()+1` in the well-formed case); a draft `i` can only
+/// be accepted if its correcting/bonus slot `verified[i+1]` exists (matching the
+/// `i + 1 >= verified.len()` guard in `step_verify_dflash`'s flat path).
+///
+/// This is the ONLY acceptance rule the batched flat path applies — grammar /
+/// thinking / relax / typical / tree acceptance are all excluded by the batched
+/// eligibility gate (see `mtp_step.rs`), so per-seq output stays byte-identical
+/// to the single-stream flat verify.
+fn flat_accept_prefix(drafts: &[u32], verified: &[u32]) -> usize {
+    let mut n = 0usize;
+    for i in 0..drafts.len() {
+        if i + 1 >= verified.len() {
+            break;
+        }
+        if drafts[i] == verified[i] {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Post-verify rollback target: the batched forward advanced `seq_len` by
+/// `k_tokens = drafts.len()+1`; the accepted prefix keeps
+/// `pre_verify_len + num_accepted + 1` (accepted drafts + the always-accepted
+/// bonus slot). Returns `(target_seq_len, num_tokens_to_pop)`.
+fn flat_rollback_plan(
+    current_seq_len: usize,
+    drafts_len: usize,
+    num_accepted: usize,
+) -> (usize, usize) {
+    let k_tokens = drafts_len + 1;
+    let pre_verify_len = current_seq_len.saturating_sub(k_tokens);
+    let target_seq_len = pre_verify_len + num_accepted + 1;
+    let to_drop = current_seq_len.saturating_sub(target_seq_len);
+    (target_seq_len, to_drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flat_accept_prefix, flat_rollback_plan};
+
+    // ── flat_accept_prefix: exact-match prefix, matches step_verify_dflash ──
+
+    #[test]
+    fn accept_prefix_full_accept() {
+        // All drafts match; verified has the bonus slot at the tail.
+        let drafts = [10, 11, 12, 13];
+        let verified = [10, 11, 12, 13, 14];
+        assert_eq!(flat_accept_prefix(&drafts, &verified), 4);
+    }
+
+    #[test]
+    fn accept_prefix_first_mismatch_terminates() {
+        let drafts = [10, 11, 99, 13];
+        let verified = [10, 11, 12, 13, 14];
+        // drafts[2] (99) != verified[2] (12) → prefix stops at 2.
+        assert_eq!(flat_accept_prefix(&drafts, &verified), 2);
+    }
+
+    #[test]
+    fn accept_prefix_zero_when_first_diverges() {
+        let drafts = [7, 11, 12, 13];
+        let verified = [8, 11, 12, 13, 14];
+        assert_eq!(flat_accept_prefix(&drafts, &verified), 0);
+    }
+
+    #[test]
+    fn accept_prefix_capped_by_verified_bonus_slot() {
+        // verified is SHORT (no bonus slot for the last draft): the guard
+        // `i + 1 >= verified.len()` caps acceptance so the bonus always exists.
+        let drafts = [10, 11, 12, 13];
+        let verified = [10, 11, 12]; // len 3 → i can accept only 0,1 (i+1<3)
+        assert_eq!(flat_accept_prefix(&drafts, &verified), 2);
+    }
+
+    #[test]
+    fn accept_prefix_empty_drafts() {
+        assert_eq!(flat_accept_prefix(&[], &[42]), 0);
+    }
+
+    // ── flat_rollback_plan: seq_len over-extension unwind ──
+
+    #[test]
+    fn rollback_full_accept_keeps_all_plus_bonus() {
+        // pre_verify_len=100, K=5 → seq_len advanced to 105. Full accept (4):
+        // target = 100 + 4 + 1 = 105 → nothing to drop.
+        let (target, drop) = flat_rollback_plan(105, 4, 4);
+        assert_eq!(target, 105);
+        assert_eq!(drop, 0);
+    }
+
+    #[test]
+    fn rollback_partial_accept_drops_rejected_tail() {
+        // pre_verify_len=100, K=5, seq_len=105, accepted 2:
+        // target = 100 + 2 + 1 = 103 → drop 2 (the rejected drafts 2,3).
+        let (target, drop) = flat_rollback_plan(105, 4, 2);
+        assert_eq!(target, 103);
+        assert_eq!(drop, 2);
+    }
+
+    #[test]
+    fn rollback_zero_accept_keeps_only_bonus() {
+        // seq_len=105, accepted 0: target = 100 + 0 + 1 = 101 → drop 4.
+        let (target, drop) = flat_rollback_plan(105, 4, 0);
+        assert_eq!(target, 101);
+        assert_eq!(drop, 4);
+    }
+
+    #[test]
+    fn rollback_mixed_max_tokens_shapes() {
+        // Distinct K per seq is fine — the plan is per-seq (mid-batch
+        // compaction case): a K=3 seq at seq_len=53 with 1 accepted.
+        let (target, drop) = flat_rollback_plan(53, 2, 1);
+        assert_eq!(target, 53 - 3 + 1 + 1); // pre=50, +1 accepted +1 bonus =52
+        assert_eq!(drop, 1);
     }
 }
