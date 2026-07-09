@@ -276,6 +276,7 @@ impl TransformerModel {
                 tree_aware_attn: None,
                 ssm_multi_seq_ptr_table_override: None,
                 self_spec_sparse_draft: None,
+            ffn_defer: None,
             }
         };
 
@@ -461,6 +462,7 @@ impl TransformerModel {
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
             self_spec_sparse_draft: None,
+            ffn_defer: None,
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only
@@ -593,6 +595,7 @@ impl TransformerModel {
             ssm_multi_seq_ptr_table_override: None,
             // The ONLY difference vs decode_draft: request the sparse FFN path.
             self_spec_sparse_draft: Some(thresh_frac),
+            ffn_defer: None,
         };
 
         // Eager layer loop: skip SSM layers, run attention layers only

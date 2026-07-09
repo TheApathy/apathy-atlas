@@ -871,7 +871,7 @@ pub fn step_verify_dflash(
 /// don't correspond to a left-to-right token stream, so splicing would be
 /// meaningless. Read once. CFG_JF is a distinct opt-in flag, so the operator is
 /// not expected to combine them — this is a defensive guard.
-fn dflash_tree_method_active() -> bool {
+pub(super) fn dflash_tree_method_active() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("ATLAS_DFLASH_BRANCH").ok().as_deref() == Some("1")
@@ -889,7 +889,7 @@ fn dflash_tree_method_active() -> bool {
 /// (portfolio emits a flat chain on steps where the retrieval sibling
 /// doesn't fire), but echo-drafting is excluded whenever the mode is on:
 /// its verify rows may belong to a forest topology. Read once.
-fn dflash_portfolio_active() -> bool {
+pub(super) fn dflash_portfolio_active() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_PORTFOLIO").ok().as_deref() == Some("1"))
 }

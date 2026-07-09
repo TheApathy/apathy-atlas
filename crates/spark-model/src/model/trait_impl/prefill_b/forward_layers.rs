@@ -86,6 +86,7 @@ impl TransformerModel {
             tree_aware_attn: None,
             ssm_multi_seq_ptr_table_override: None,
             self_spec_sparse_draft: None,
+            ffn_defer: None,
         };
 
         // When proc_count == 1 (warm prefix cache hit), use the decode layer path

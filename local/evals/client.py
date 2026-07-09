@@ -74,7 +74,9 @@ class AtlasClient:
     def chat(self, messages: list[dict], *, max_tokens: int = 1024,
              temperature: float = 0.0, seed: int | None = None,
              enable_thinking: bool = False,
-             thinking_budget: int | None = None) -> Completion:
+             thinking_budget: int | None = None,
+             tools: list[dict] | None = None,
+             tool_choice: str | dict | None = None) -> Completion:
         body = {
             "model": self.model,
             "messages": messages,
@@ -86,6 +88,13 @@ class AtlasClient:
             body["enable_thinking"] = True
         if thinking_budget:
             body["thinking"] = {"budget_tokens": thinking_budget}
+        if tools:
+            # OpenAI shape: [{"type":"function","function":{name,description,
+            # parameters}}]. Server parses grammar-enforced qwen3_coder-dialect
+            # output back into message.tool_calls.
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
         if seed is not None:
             body["seed"] = seed
         d = self._post("/v1/chat/completions", body)

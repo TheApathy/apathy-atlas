@@ -278,6 +278,12 @@ pub struct TransformerModel {
     /// token's intermediate hiddens; the drafter consumes them via its `fc`
     /// projection on the next propose() call. None for non-DFlash runs.
     pub(super) dflash_hidden_save: Option<DevicePtr>,
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): lazily-allocated `[c*K, H]` BF16
+    /// scratch that collects every sequence's post-mixer FFN input per layer so
+    /// the batched verify can run ONE FFN GEMM across all sequences' rows.
+    /// Allocated on first use (sized `max_batch_tokens × H × bf16`), `None`
+    /// until the batched verify path fires.
+    pub(super) dflash_batched_ffn_input: parking_lot::Mutex<Option<DevicePtr>>,
     /// Layer indices to capture for DFlash. Empty when DFlash is disabled.
     /// Sourced from drafter's `dflash_config.target_layer_ids` at model build.
     pub(super) dflash_capture_layers: Vec<usize>,

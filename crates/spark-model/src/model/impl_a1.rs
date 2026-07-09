@@ -926,6 +926,7 @@ impl TransformerModel {
             mtp_lastk_buf,
             mtp_lastk_capacity,
             dflash_hidden_save,
+            dflash_batched_ffn_input: parking_lot::Mutex::new(None),
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),

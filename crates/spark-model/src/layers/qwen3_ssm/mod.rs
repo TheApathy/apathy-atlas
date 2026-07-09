@@ -348,6 +348,17 @@ impl TransformerLayer for Qwen3SsmLayer {
         )
     }
 
+    fn run_deferred_ffn(
+        &self,
+        ffn_input: DevicePtr,
+        hidden: DevicePtr,
+        total_rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.run_deferred_ffn_inner(ffn_input, hidden, total_rows, ctx, stream)
+    }
+
     fn decode_multi_seq<'a, 'b: 'a>(
         &self,
         hidden: DevicePtr,
