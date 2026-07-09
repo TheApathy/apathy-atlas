@@ -209,6 +209,46 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_qkv_batched(
+        &self,
+        hidden: DevicePtr,
+        num_rows: usize,
+        qkv_out_base: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_multi_seq_qkv_batched_inner(hidden, num_rows, qkv_out_base, ctx, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_attn_from_qkv<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+        qkv_base: DevicePtr,
+    ) -> Result<()> {
+        self.decode_multi_seq_attn_from_qkv(
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+            qkv_base,
+        )
+    }
+
     fn run_deferred_ffn(
         &self,
         ffn_input: DevicePtr,

@@ -24,6 +24,7 @@ mod attn;
 mod ctx;
 mod ffn;
 mod qkv;
+mod qkv_batched;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
@@ -35,9 +36,64 @@ impl Qwen3AttentionLayer {
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
         seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        // Full path (phases 1-7): QKV computed inline, default qkv_output base.
+        self.decode_multi_seq_inner_impl(
+            hidden, residual, num_seqs, states, kv_cache, seq_lens, block_tables, ctx, stream, None,
+        )
+    }
+
+    /// #39 v2 cross-seq batched-QKV entry point: run ONLY attention phases 3-7
+    /// for one sequence's `num_seqs` (= K) rows, reading its Q/K/V from
+    /// `qkv_base` (a slice of the shared `qkv_output` that the caller populated
+    /// for ALL `c*K` rows via [`Self::decode_multi_seq_qkv_batched`]). Phases 1
+    /// (RMS-norm) and 2 (QKV projection) are SKIPPED — they already ran, once,
+    /// across every sequence. Bit-identical to the full path: the projection
+    /// output in `qkv_base` is the same per-row math, only batched.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::qwen3_attention) fn decode_multi_seq_attn_from_qkv<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
+        block_tables: &[Vec<u32>],
+        ctx: &ForwardContext,
+        stream: u64,
+        qkv_base: DevicePtr,
+    ) -> Result<()> {
+        self.decode_multi_seq_inner_impl(
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+            Some(qkv_base),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_inner_impl<'a, 'b: 'a>(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        kv_cache: &mut PagedKvCache,
+        seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
+        qkv_base_override: Option<DevicePtr>,
     ) -> Result<()> {
         let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
@@ -51,7 +107,7 @@ impl Qwen3AttentionLayer {
             .max()
             .unwrap_or(0)
             .saturating_add(1) as u32;
-        let c = ctx::MultiSeqCtx::new(
+        let c = ctx::MultiSeqCtx::new_with_qkv_base(
             self,
             ctx,
             hidden,
@@ -60,30 +116,35 @@ impl Qwen3AttentionLayer {
             bs,
             stream,
             max_seq_len_host,
+            qkv_base_override,
         );
 
-        // ── Phase 1: RMS norm + residual for N tokens ──
-        crate::kprof!(ctx.gpu, stream, "attn_rms_norm_residual", {
-            ops::rms_norm_residual(
-                ctx.gpu,
-                self.rms_norm_residual_k,
-                c.hidden,
-                &self.input_norm,
-                c.normed,
-                c.residual,
-                c.n as u32,
-                c.h as u32,
-                c.eps,
-                c.stream,
-            )?;
-            anyhow::Result::<()>::Ok(())
-        })?;
+        // Phases 1-2 (RMS-norm + QKV) are skipped when QKV is precomputed
+        // across sequences (the #39 v2 batched-QKV path).
+        if qkv_base_override.is_none() {
+            // ── Phase 1: RMS norm + residual for N tokens ──
+            crate::kprof!(ctx.gpu, stream, "attn_rms_norm_residual", {
+                ops::rms_norm_residual(
+                    ctx.gpu,
+                    self.rms_norm_residual_k,
+                    c.hidden,
+                    &self.input_norm,
+                    c.normed,
+                    c.residual,
+                    c.n as u32,
+                    c.h as u32,
+                    c.eps,
+                    c.stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
 
-        // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
-        crate::kprof!(ctx.gpu, stream, "attn_qkv_proj", {
-            self.ms_phase_qkv(&c)?;
-            anyhow::Result::<()>::Ok(())
-        })?;
+            // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
+            crate::kprof!(ctx.gpu, stream, "attn_qkv_proj", {
+                self.ms_phase_qkv(&c)?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+        }
 
         // ── Phase 3: RoPE per-sequence ──
         let meta = ctx

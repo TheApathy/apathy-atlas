@@ -437,6 +437,50 @@ pub trait TransformerLayer: Send + Sync {
         Ok(())
     }
 
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39 v2): project Q/K/V for `num_rows`
+    /// contiguous rows of `hidden` (all `c*K` rows across every sequence) in
+    /// ONE weight read per Q/K/V, writing the result into `qkv_out_base` in the
+    /// per-seq-strided layout that [`Self::decode_multi_seq_attn_from_qkv`]
+    /// consumes. RMS-norm (`input_norm`) is applied inline. `hidden` is only
+    /// read (the residual stream is untouched).
+    ///
+    /// Default: unimplemented (only the attention layer overrides). Returns an
+    /// error so the caller falls back to the per-seq v1 path.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_qkv_batched(
+        &self,
+        _hidden: DevicePtr,
+        _num_rows: usize,
+        _qkv_out_base: DevicePtr,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("decode_multi_seq_qkv_batched not implemented for this layer type")
+    }
+
+    /// CROSS-SEQ BATCHED DFLASH VERIFY (#39 v2): run attention phases 3-7 for
+    /// ONE sequence's `num_seqs` (= K) rows, reading Q/K/V from `qkv_base` (a
+    /// slice of the shared `qkv_output` populated by
+    /// [`Self::decode_multi_seq_qkv_batched`]). Phases 1-2 are skipped.
+    ///
+    /// Default: unimplemented (only the attention layer overrides).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_attn_from_qkv<'a, 'b: 'a>(
+        &self,
+        _hidden: DevicePtr,
+        _residual: DevicePtr,
+        _num_seqs: usize,
+        _states: &'a mut [&'b mut (dyn LayerState + 'static)],
+        _kv_cache: &mut PagedKvCache,
+        _seq_lens: &[usize],
+        _block_tables: &[Vec<u32>],
+        _ctx: &ForwardContext,
+        _stream: u64,
+        _qkv_base: DevicePtr,
+    ) -> Result<()> {
+        anyhow::bail!("decode_multi_seq_attn_from_qkv not implemented for this layer type")
+    }
+
     /// CROSS-SEQ BATCHED DFLASH VERIFY (#39): run this layer's FFN ONCE over
     /// `total_rows` rows that were collected from every sequence's mixer output
     /// (via `ctx.ffn_defer`), then add the FFN output back into `hidden`.
