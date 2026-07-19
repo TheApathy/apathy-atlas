@@ -70,11 +70,13 @@ pub fn dflash_fused_enabled() -> bool {
 /// Env-derived disqualifiers, computed once. Every feature here either
 /// post-processes drafts on the host inside/after `forward_block` (markov,
 /// denoise>1, margin gate, adaptive gamma, cfg-jf splice, debug dumps,
-/// kernel profile) or builds a tree payload from host drafts (branch /
-/// caterpillar / free-slots / ddtree / portfolio) — all need the drafts on
-/// the host at propose() return, which defeats the deferred collect. The
-/// async path only engages on the plain flat-chain neural propose (the
-/// production default config).
+/// kernel profile), builds a tree payload from host drafts (branch /
+/// caterpillar / free-slots / ddtree / portfolio), or pre-empts the neural
+/// drafter with host-side drafts that early-return from `propose_drafts`
+/// before the async bookkeeping (retrieval/SAM, PLD, recycle) — all need the
+/// drafts on the host at propose() return, which defeats the deferred
+/// collect. The async path only engages on the plain flat-chain neural
+/// propose (the production default config).
 #[derive(Debug, Clone, Copy)]
 pub struct AsyncEnvEligibility {
     pub denoise_steps: usize,
@@ -85,6 +87,17 @@ pub struct AsyncEnvEligibility {
     pub cfg_jf: bool,
     pub kprofile: bool,
     pub debug_dump: bool,
+    /// Retrieval drafting (`ATLAS_DFLASH_RETRIEVAL=1` / `ATLAS_DFLASH_SAM=1`):
+    /// pre-empts the neural drafter with host-side drafts and early-returns
+    /// from `propose_drafts` BEFORE the async launch/collect bookkeeping, so a
+    /// prior in-flight async propose is never resolved — violating the
+    /// single-in-flight scratch invariant (measured: silent serve death at
+    /// drafter init, variants.md 2026-07-18).
+    pub retrieval: bool,
+    /// `ATLAS_DFLASH_PLD=1`: same host-draft early-return class as retrieval.
+    pub pld: bool,
+    /// `ATLAS_DFLASH_RECYCLE=1`: same host-draft early-return class.
+    pub recycle: bool,
 }
 
 impl AsyncEnvEligibility {
@@ -114,6 +127,9 @@ impl AsyncEnvEligibility {
             debug_dump: flag("ATLAS_DFLASH_DEBUG_DUMP")
                 || flag("ATLAS_DFLASH_DEBUG_DUMP_FULL")
                 || flag("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS"),
+            retrieval: flag("ATLAS_DFLASH_RETRIEVAL") || flag("ATLAS_DFLASH_SAM"),
+            pld: flag("ATLAS_DFLASH_PLD"),
+            recycle: flag("ATLAS_DFLASH_RECYCLE"),
         }
     }
 
@@ -145,6 +161,9 @@ pub fn async_launch_eligible(
         && !env.cfg_jf
         && !env.kprofile
         && !env.debug_dump
+        && !env.retrieval
+        && !env.pld
+        && !env.recycle
 }
 
 /// Placeholder chain returned by an async launch. Length == γ_eff so the
@@ -424,6 +443,9 @@ mod tests {
             cfg_jf: false,
             kprofile: false,
             debug_dump: false,
+            retrieval: false,
+            pld: false,
+            recycle: false,
         }
     }
 
@@ -458,6 +480,29 @@ mod tests {
             ..all_clear()
         };
         assert!(!async_launch_eligible(&env, false, false));
+    }
+
+    #[test]
+    fn host_draft_preempt_paths_disqualify() {
+        // retrieval/SAM, PLD, and recycle all pre-empt the neural drafter
+        // with host drafts and early-return before async collect — each must
+        // force the sync path (SAM+ASYNC init death, variants.md 2026-07-18).
+        for f in [
+            AsyncEnvEligibility {
+                retrieval: true,
+                ..all_clear()
+            },
+            AsyncEnvEligibility {
+                pld: true,
+                ..all_clear()
+            },
+            AsyncEnvEligibility {
+                recycle: true,
+                ..all_clear()
+            },
+        ] {
+            assert!(!async_launch_eligible(&f, false, false));
+        }
     }
 
     #[test]
