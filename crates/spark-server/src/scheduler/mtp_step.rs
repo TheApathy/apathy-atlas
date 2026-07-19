@@ -136,6 +136,19 @@ pub fn step_mtp(
             tracing::error!("save_hidden_for_mtp: {e:#}");
             continue;
         }
+        // DFlash ctx-drift fix: reset last_num_accepted to 0 before the
+        // bootstrap propose. After a tree verify (TREE_TOKENS_VERIFY=1, k=32)
+        // that accepted n>0 tokens, trim_proposer_state stores n in
+        // last_num_accepted. A THINK_SPEC downgrade (or any other cause of
+        // missing drafts) then routes here: the bootstrap decode advances
+        // seq_len by 1 without calling trim, so the propose computes
+        // num_append = n+1 → first_pos = seq_len-(n+1) ≠ ctx_len = seq_len-1,
+        // causing drift = n and corrupting the drafter's RoPE conditioning.
+        // Calling trim(0) resets last_num_accepted=0 and clears the stale
+        // accepted-compact path, so num_append = 1 → first_pos = ctx_len (no drift).
+        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+            tracing::warn!("trim_proposer_state (bootstrap dflash reset): {e:#}");
+        }
         // Stage-1 DFlash grammar gate: while the grammar constrains output,
         // stay non-speculative (the bootstrap decode above already sampled
         // through the grammar; drafting would bypass it at verify).
