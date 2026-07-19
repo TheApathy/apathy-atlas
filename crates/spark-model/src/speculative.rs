@@ -130,6 +130,14 @@ pub trait DraftProposer: Send + Sync {
         Ok(())
     }
 
+    /// ATLAS_DFLASH_FUSED=1: record the propose-ordering CUDA event immediately
+    /// after the target verify returns (before commit kernels are enqueued).
+    /// Default no-op; only `BlockDiffusionDraftHead` overrides.
+    fn arm_propose_overlap(&self, gpu: &dyn GpuBackend, default_stream: u64) -> Result<()> {
+        let _ = (gpu, default_stream);
+        Ok(())
+    }
+
     /// DDTree M6: drain any pending tree payload built by the most recent
     /// `propose()` call. Default returns `None` (flat MTP / ngram / flat
     /// DFlash). DDTree-capable drafters override to return + clear the

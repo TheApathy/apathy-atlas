@@ -64,6 +64,7 @@ pub(super) fn build_mtp_proposer(
             lm_nvfp4,
             config,
             gpu,
+            mtp_quant,
             mtp_vocab_size,
             max_seq_len,
         ) {

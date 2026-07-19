@@ -87,6 +87,16 @@ pub struct ServeArgs {
     #[arg(long, default_value = "0")]
     pub kv_high_precision_layers: String,
 
+    /// EXPLICIT set of attention-layer indices to keep at BF16 KV precision, from a
+    /// MEASURED per-layer sensitivity sweep (see local/kv_sensitivity_rank.py). Overrides
+    /// the positional --kv-high-precision-layers heuristic when set. Indices are
+    /// attention-layer-LOCAL (0..num_attention_layers, in attention-order — NOT global
+    /// model layer ids). Comma-separated, e.g. "0,4,9,15". Empty = use the positional
+    /// heuristic. Spends the same BF16 budget on the layers a sweep found most sensitive
+    /// to KV quantization, for better long-context coherence at identical memory.
+    #[arg(long, default_value = "")]
+    pub kv_high_precision_layer_set: String,
+
     /// GPU memory utilization (0.0-1.0).
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f64,

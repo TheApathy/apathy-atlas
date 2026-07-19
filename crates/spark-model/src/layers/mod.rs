@@ -526,6 +526,17 @@ pub fn ffn_fused_gateup_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_FFN_FUSED_GATEUP").ok().as_deref() == Some("1"))
 }
 
+/// Returns true when `ATLAS_GATEUP_K64=1` is set — routes the fused
+/// gate+up+SiLU kernel to the K_STEP=64 register-dequant variant
+/// (`w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64`). Halves K-loop
+/// iterations (80 vs 160) and sync count while doubling per-step load
+/// volume for better memory-latency overlap. Takes priority over
+/// ATLAS_DEQUANT_PIPE when both are set. Requires K divisible by 64.
+pub fn gateup_k64_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_GATEUP_K64").ok().as_deref() == Some("1"))
+}
+
 /// Split-K factor for the FFN **gate/up** projections ([M=17, N=inter=16384,
 /// K=hidden=5120]) on the K=γ verify path. Default OFF (0).
 ///

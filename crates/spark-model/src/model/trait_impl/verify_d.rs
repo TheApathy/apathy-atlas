@@ -36,6 +36,93 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+// ── ATLAS_LAYER_RESOLUTION_PROBE ────────────────────────────────────────────
+// Measures at which layer the K=γ verify argmax stabilises.  Run with
+// ATLAS_LAYER_RESOLUTION_PROBE=1 (forces eager mode).  Every
+// ATLAS_LRP_DUMP_EVERY steps (default 100) logs per-checkpoint match rates.
+
+fn layer_resolution_probe_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_LAYER_RESOLUTION_PROBE").ok().as_deref() == Some("1")
+    })
+}
+
+fn lrp_dump_every() -> u64 {
+    static VAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("ATLAS_LRP_DUMP_EVERY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100)
+    })
+}
+
+/// 0-indexed layer indices at which hidden state is snapshotted.
+/// Covers the full 64-layer depth at ~8-layer resolution.
+const LRP_PROBE_LAYERS: &[usize] = &[7, 15, 23, 31, 39, 47, 55];
+
+struct LrpAccum {
+    step: u64,
+    /// matches[probe_idx][token_pos] = steps where probe argmax == final argmax.
+    matches: Vec<Vec<u64>>,
+    k: usize,
+}
+
+impl LrpAccum {
+    fn new(k: usize) -> Self {
+        Self { step: 0, matches: vec![vec![0u64; k]; LRP_PROBE_LAYERS.len()], k }
+    }
+
+    fn accumulate(&mut self, final_am: &[u32], probe_ams: &[Vec<u32>]) {
+        let k = self.k.min(final_am.len());
+        self.step += 1;
+        for (pi, pam) in probe_ams.iter().enumerate() {
+            for t in 0..k {
+                if pam.get(t).copied() == Some(final_am[t]) {
+                    self.matches[pi][t] += 1;
+                }
+            }
+        }
+    }
+
+    fn dump(&self) {
+        let steps = self.step.max(1);
+        let mut msg = format!("LRP step={} K={}:", self.step, self.k);
+        for (pi, &layer_idx) in LRP_PROBE_LAYERS.iter().enumerate() {
+            let matched: u64 = self.matches[pi].iter().sum();
+            let total = steps * self.k as u64;
+            let rate = matched as f64 / total as f64;
+            msg.push_str(&format!(" L{}={:.3}", layer_idx + 1, rate));
+        }
+        msg.push_str(" L64=1.000");
+        tracing::info!("{msg}");
+    }
+}
+
+static LRP_ACCUM: std::sync::OnceLock<Mutex<LrpAccum>> = std::sync::OnceLock::new();
+// ── end LRP ─────────────────────────────────────────────────────────────────
+
+/// Static verify-layer-skip set parsed once from `ATLAS_VERIFY_SKIP_LAYERS`
+/// (comma-separated layer indices). Empty when unset. See the layer loop in
+/// `decode_verify_graphed_kgamma_dispatch` for semantics (identity pass-through,
+/// graph-safe, pass@1-gated). The "past-the-dense-read" bandwidth lever.
+fn verify_skip_layer(idx: usize) -> bool {
+    use std::sync::OnceLock;
+    static SET: OnceLock<Vec<usize>> = OnceLock::new();
+    SET.get_or_init(|| {
+        std::env::var("ATLAS_VERIFY_SKIP_LAYERS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|x| x.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .contains(&idx)
+}
+
 impl TransformerModel {
     pub(super) fn decode_verify_graphed_kgamma_dispatch(
         &self,
@@ -232,6 +319,13 @@ impl TransformerModel {
             // clear_ddtree_parent_ids' linear-chain default — replicate the
             // same padding here so depth lookups don't OOB.
             let mut host_parents = self.ddtree_parent_ids_host.lock().clone();
+            // DDTree budgets MAX_NODES (e.g. 32) but SSM verify window is k
+            // (e.g. 17). When len > k the == k guard below was falling through
+            // to None, keeping tree_depths always None and preventing the
+            // causal_conv1d_tree_reroot kernel from ever firing. Truncate first.
+            if host_parents.len() > k {
+                host_parents.truncate(k);
+            }
             if !host_parents.is_empty() && host_parents.len() < k {
                 let last_payload_idx = host_parents.len() as i32 - 1;
                 while host_parents.len() < k {
@@ -339,7 +433,27 @@ impl TransformerModel {
                 .skip(1)
                 .any(|(i, &p)| p != i as i32 - 1)
         };
-        let ancestor_attn_exact = !payload_non_flat || tree_kv_active;
+        // Conv-exact assertion (ATLAS_DDTREE_TREE_CONV_EXACT=1 + kernel loaded).
+        // The causal_conv1d_tree_reroot kernel re-roots each branch token's conv
+        // shift-register from its true ancestor's intermediate, making the conv
+        // output oracle-correct for ALL tree topologies. Branch commits without
+        // this kernel are WRONG (BUG 1 from freeslots-rootcause.md): the conv
+        // window propagates compact-predecessor tokens instead of true ancestors,
+        // corrupting all 48 GDN layer outputs for branch rows.
+        // Gating branch commits on conv_exact prevents silent non-oracle commits.
+        // ATLAS_DDTREE_ASSUME_CONV_EXACT=1 is the research escape hatch (repro only).
+        let tree_conv_exact_on = std::env::var("ATLAS_DDTREE_TREE_CONV_EXACT")
+            .ok()
+            .as_deref()
+            == Some("1")
+            || std::env::var("ATLAS_DDTREE_ASSUME_CONV_EXACT")
+                .ok()
+                .as_deref()
+                == Some("1");
+        // For a non-flat tree payload, BOTH attention indirection AND conv reroot
+        // must be active to guarantee oracle-correct branch logits. A flat payload
+        // (or no payload) is always exact by construction.
+        let ancestor_attn_exact = !payload_non_flat || (tree_kv_active && tree_conv_exact_on);
         self.dflash_tree_ancestor_attn
             .store(ancestor_attn_exact, std::sync::atomic::Ordering::Release);
         if payload_non_flat && !ancestor_attn_exact {
@@ -348,12 +462,12 @@ impl TransformerModel {
             let n = NONEXACT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 16 {
                 tracing::info!(
-                    "K=γ verify: non-flat tree payload WITHOUT per-row ancestor attention \
+                    "K=γ verify: non-flat tree payload — branch commits degraded to flat-safe \
                      (k={k}, dfs_active={dfs_active}, tree_aware_attn={tree_aware_attn_enabled}, \
-                     tree_depths_some={}, indir_stride={}, indir_ptr_ok={}) — \
-                     branch rows are prefix-conditioned; deep tree-commit will degrade to \
-                     flat-safe. Enable ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 \
-                     for lossless deep-branch commits.",
+                     tree_depths_some={}, indir_stride={}, indir_ptr_ok={}, \
+                     tree_conv_exact_on={tree_conv_exact_on}) — \
+                     Enable ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 + \
+                     ATLAS_DDTREE_TREE_CONV_EXACT=1 for lossless deep-branch commits.",
                     tree_depths.is_some(),
                     self.tree_kv_indir_stride,
                     self.tree_kv_indir_persistent.0 != 0,
@@ -575,7 +689,8 @@ impl TransformerModel {
                 .load(std::sync::atomic::Ordering::Relaxed)
             && !hss_engaged
             && !force_eager
-            && !full_profile;
+            && !full_profile
+            && !layer_resolution_probe_enabled();
 
         // M8A: upload DDTree parent_ids (when stashed) so the GDN dispatch
         // can fire the tree-aware kernel. Stash lives on the model so we
@@ -812,6 +927,7 @@ impl TransformerModel {
         {
             self.gpu.launch_graph(graph, stream)?;
         }
+        let mut lrp_snapshots: Vec<Vec<u8>> = Vec::new();
         let need_run = cached_for_slot.is_none();
         if need_run {
             let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
@@ -823,6 +939,17 @@ impl TransformerModel {
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
+
+                // ATLAS_VERIFY_SKIP_LAYERS="2,3,7,...": static layer-skip in the
+                // single-stream γ verify. A skipped layer is identity (residual
+                // passes through unchanged) at EVERY step, so its SSM/KV state is
+                // never written and never read — consistent, graph-capture-safe.
+                // Lossy vs md5 but pass@1-gated (measured: skip-16 = 25% verify
+                // bandwidth cut at ~pass@1-preserving on HumanEval-style coding).
+                // Capture layers [1,10,18,27,35,44,52,61] must NOT be in the set.
+                if verify_skip_layer(layer_idx) {
+                    continue;
+                }
 
                 if layer_type == LayerType::FullAttention {
                     if hss_engaged {
@@ -883,6 +1010,17 @@ impl TransformerModel {
                 // [token_idx, capture_layer, hidden] in dflash_hidden_save.
                 for t in 0..k {
                     self.try_dflash_capture(layer_idx, t, stream)?;
+                }
+                // ATLAS_LAYER_RESOLUTION_PROBE: snapshot [K, H] BF16 hidden
+                // at checkpoint layers. GPU sync required (probe is eager-only).
+                if layer_resolution_probe_enabled() {
+                    if LRP_PROBE_LAYERS.contains(&layer_idx) {
+                        let h_bytes = k * h * 2;
+                        let mut snap = vec![0u8; h_bytes];
+                        self.gpu.synchronize(stream)?;
+                        self.gpu.copy_d2h(hidden, &mut snap)?;
+                        lrp_snapshots.push(snap);
+                    }
                 }
                 // ATLAS_KGAMMA_DEBUG_DUMP=1: dump per-position hidden state
                 // for K=γ verify so we can diff against HF reference
@@ -1018,6 +1156,61 @@ impl TransformerModel {
                 buf[off + 2],
                 buf[off + 3],
             ]));
+        }
+
+        // ATLAS_LAYER_RESOLUTION_PROBE: for each captured snapshot, run
+        // norm+lm_head+argmax on GPU and compare to final argmax.  Accumulate
+        // match rates into LRP_ACCUM, dump every lrp_dump_every() steps.
+        if layer_resolution_probe_enabled() && !lrp_snapshots.is_empty() {
+            let normed = self.buffers.norm_output();
+            let vocab = self.verify_lmhead_vocab() as usize;
+            let argmax_out = self.buffers.scratch();
+            let mut probe_ams: Vec<Vec<u32>> = Vec::with_capacity(lrp_snapshots.len());
+            for snap in &lrp_snapshots {
+                // Upload snapshot → hidden buffer, then norm+lm_head+argmax.
+                // `hidden` is not used after the probe block so reuse is safe.
+                self.gpu.copy_h2d(snap, hidden)?;
+                ops::rms_norm(
+                    self.gpu.as_ref(),
+                    self.rms_norm_kernel,
+                    hidden,
+                    &self.final_norm,
+                    normed,
+                    k as u32,
+                    h as u32,
+                    self.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+                self.lm_head_batched(normed, k as u32, stream)?;
+                for t in 0..k {
+                    let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                    let out_t = argmax_out.offset(t * 4);
+                    ops::argmax_bf16(
+                        self.gpu.as_ref(),
+                        self.argmax_kernel,
+                        logits_t,
+                        out_t,
+                        vocab as u32,
+                        stream,
+                    )?;
+                }
+                self.gpu.synchronize(stream)?;
+                let mut pbuf = vec![0u8; k * 4];
+                self.gpu.copy_d2h(argmax_out, &mut pbuf)?;
+                let pam: Vec<u32> = (0..k)
+                    .map(|t| {
+                        let o = t * 4;
+                        u32::from_le_bytes([pbuf[o], pbuf[o + 1], pbuf[o + 2], pbuf[o + 3]])
+                    })
+                    .collect();
+                probe_ams.push(pam);
+            }
+            let accum = LRP_ACCUM.get_or_init(|| Mutex::new(LrpAccum::new(k)));
+            let mut g = accum.lock();
+            g.accumulate(&out, &probe_ams);
+            if g.step % lrp_dump_every() == 0 {
+                g.dump();
+            }
         }
 
         // DFS reorder: un-permute verified outputs back to original-compact

@@ -148,6 +148,16 @@ pub struct DenseFfnLayer {
     /// dequant+MMA. Loaded via `try_kernel`; handle 0 keeps the staged fused
     /// kernel as silent fallback.
     w4a16_gemm_t_m32_n64_gateup_silu_pipe: KernelHandle,
+    /// `w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64` — K_STEP=64 fork of the
+    /// `_pipe` register-dequant kernel (`ATLAS_GATEUP_K64=1`). Doubles the
+    /// K-tile from 32 to 64 elements: 80 K-loop iterations vs 160, halving
+    /// sync count and loop overhead. Each step issues two m16n8k32 MMAs per
+    /// accumulator (K[0..31] then K[32..63]) and 2× the cp.async volume
+    /// (6 KB vs 3 KB per stage), so the background load overlaps more of the
+    /// inline dequant+compute work. Takes priority over ATLAS_DEQUANT_PIPE.
+    /// Requires K divisible by 64 (hidden_size 5120 qualifies). Handle 0
+    /// silently falls back through _pipe → staged fused kernel.
+    w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64: KernelHandle,
     /// `w4a16_gemm_t_m32_n64_splitk` — split-K variant of the above for
     /// the DFlash K=17 verify `down_proj` ([M=17,N=5120,K=16384]). The
     /// single-slice kernel fields only 80 CTAs (N=5120/64) and is
@@ -368,6 +378,13 @@ impl DenseFfnLayer {
                 gpu,
                 "w4a16",
                 "w4a16_gemm_t_m32_n64_gateup_silu_pipe",
+            ),
+            // Optional K_STEP=64 register-dequant fork (ATLAS_GATEUP_K64).
+            // Handle 0 falls back through _pipe → staged fused kernel.
+            w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64: super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64",
             ),
             // Optional split-K down_proj variant + reduce. Handle 0 keeps
             // the single-slice m32_n64 path (ATLAS_FFN_DOWN_SPLITK).
@@ -1513,10 +1530,16 @@ impl DenseFfnLayer {
         if fused_gateup {
             let gt = self.gate_proj_t.as_ref().unwrap();
             let ut = self.up_proj_t.as_ref().unwrap();
-            // Select the DEQUANT-IN-REGISTERS fork when ATLAS_DEQUANT_PIPE=1
-            // and its symbol is present; byte-exact with the staged fused
-            // kernel (identical call signature) — falls back otherwise.
-            let fused_kernel = if crate::layers::dequant_pipe_enabled()
+            // Kernel selection priority (highest first):
+            //   ATLAS_GATEUP_K64=1  → _pipe_k64 (K_STEP=64, reg-dequant)
+            //   ATLAS_DEQUANT_PIPE=1 → _pipe    (K_STEP=32, reg-dequant)
+            //   default              → staged fused (smem_B_fp8 staging)
+            let fused_kernel = if crate::layers::gateup_k64_enabled()
+                && self.w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64.0 != 0
+                && h % 64 == 0  // K must be divisible by 64
+            {
+                self.w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64
+            } else if crate::layers::dequant_pipe_enabled()
                 && self.w4a16_gemm_t_m32_n64_gateup_silu_pipe.0 != 0
             {
                 self.w4a16_gemm_t_m32_n64_gateup_silu_pipe

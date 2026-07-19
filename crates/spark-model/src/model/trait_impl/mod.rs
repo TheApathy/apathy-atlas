@@ -503,6 +503,14 @@ impl Model for TransformerModel {
     fn dflash_collect_async_drafts(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
         self.dflash_collect_async_drafts_dispatch(seq)
     }
+
+    fn dflash_arm_propose_overlap(&self) -> Result<()> {
+        let Some(ref proposer) = self.proposer else {
+            return Ok(());
+        };
+        proposer.arm_propose_overlap(self.gpu.as_ref(), self.gpu.default_stream())
+    }
+
     fn dflash_stash_recycle(
         &self,
         seq: &mut SequenceState,

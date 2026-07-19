@@ -3018,3 +3018,259 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu_pipe(
 }
 
 #undef N_TILE_S3
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64 — K_STEP=64 fork of
+// w4a16_gemm_t_m32_n64_gateup_silu_pipe (ATLAS_GATEUP_K64=1).
+//
+// Doubles the K-step tile from 32 to 64 elements: 80 K-loop iterations
+// vs 160, halving sync count and loop overhead. Each step issues 2×
+// the cp.async traffic (6 KB A+gate+up vs 3 KB), so the background
+// load overlaps more of the per-step dequant+double-MMA work.
+//
+// Mathematics: two consecutive m16n8k32 FP8 MMAs per accumulator per
+// K-step (K[0..31] then K[32..63]), sharing the same FP32 accumulator.
+// Byte-exact with the _pipe kernel: BF16 round-trip SiLU*mul at output.
+//
+// Loading (2-stage pipeline, wait_group<1>):
+//   A: each thread issues 2 × cp.async 16B — cols [a_col] and [a_col+32]
+//      for its row → 256 loads of 16B per stage = 4096 B.
+//   B gate/up: all 128 threads (kp=0..31), 1 × 16B load per weight →
+//      128 loads = 2048 B per weight; threads kp<16 also load 16B scale.
+//
+// SMEM (no smem_B_fp8 staging, a_stride=72 for 16B-aligned rows):
+//   A: 2×32×72×2 = 9216 B  |  Bp×2: 2×2×32×80 = 10240 B
+//   Bs×2: 2×2×4×80 = 1280 B  |  LUT: 64 B   ≈ 20.8 KB total
+// ═══════════════════════════════════════════════════════════════════
+#define N_TILE_K64  64
+#define K_STEP_K64  64
+#define A_PAD_K64    8   // (64+8)*2=144, 144%16=0 → 16B-aligned rows
+#define BP_PAD_K64  16
+extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ Bg_packed,
+    const unsigned char* __restrict__ Bg_scale,
+    const float scale2_g,
+    const unsigned char* __restrict__ Bu_packed,
+    const unsigned char* __restrict__ Bu_scale,
+    const float scale2_u,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K,
+    unsigned int ldb
+) {
+    constexpr unsigned int M_TILE_K  = 32;
+    constexpr unsigned int K_GROUPS  = K_STEP_K64 / GROUP_SIZE;  // 4
+    const unsigned int cta_n    = blockIdx.x * N_TILE_K64;
+    const unsigned int cta_m    = blockIdx.y * M_TILE_K;
+    const unsigned int warp_id  = threadIdx.x / 32;
+    const unsigned int lane_id  = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;   // 0..7
+    const unsigned int tid      = lane_id & 3;    // 0..3
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE_K][K_STEP_K64 + A_PAD_K64];
+    __shared__ unsigned char smem_Bp[2][2][K_STEP_K64 / 2][N_TILE_K64 + BP_PAD_K64];
+    __shared__ unsigned char smem_Bs[2][2][K_GROUPS][N_TILE_K64 + BP_PAD_K64];
+    __shared__ float smem_LUT[16];
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+
+    float acc[2][2][2][4];
+    #pragma unroll
+    for (int w = 0; w < 2; w++)
+        #pragma unroll
+        for (int mf = 0; mf < 2; mf++)
+            #pragma unroll
+            for (int sub = 0; sub < 2; sub++) {
+                acc[w][mf][sub][0] = 0.0f; acc[w][mf][sub][1] = 0.0f;
+                acc[w][mf][sub][2] = 0.0f; acc[w][mf][sub][3] = 0.0f;
+            }
+
+    const unsigned int a_stride = K_STEP_K64 + A_PAD_K64;  // 72 uint16
+
+    // A: each thread issues 2 cp.async — K[0..31] and K[32..63] of its row.
+    #define K64_ISSUE_A(buf, kb) do { \
+        unsigned int _ar = threadIdx.x >> 2; \
+        unsigned int _ac = (threadIdx.x & 3) << 3; \
+        unsigned int _gr = cta_m + _ar; \
+        cp_async_pred_16(&smem_A[(buf)][_ar][_ac], \
+            &A[(unsigned long long)_gr * K + (kb) + _ac], \
+            (_gr < M) && ((kb) + _ac + 7 < K)); \
+        unsigned int _ac2 = _ac + 32; \
+        cp_async_pred_16(&smem_A[(buf)][_ar][_ac2], \
+            &A[(unsigned long long)_gr * K + (kb) + _ac2], \
+            (_gr < M) && ((kb) + _ac2 + 7 < K)); \
+    } while(0)
+
+    // B: all 128 threads, kp=0..31.  Threads kp<16 also load scale.
+    #define K64_ISSUE_B(w, buf, kb, Bp, Bs) do { \
+        unsigned int _kp  = threadIdx.x >> 2; \
+        unsigned int _ns  = (threadIdx.x & 3) << 4; \
+        unsigned int _gke = (kb) + (_kp << 1); \
+        unsigned int _gns = cta_n + _ns; \
+        cp_async_pred_16(&smem_Bp[(w)][(buf)][_kp][_ns], \
+            &Bp[(unsigned long long)(_gke >> 1) * ldb + _gns], \
+            (_gke + 1 <= K) && (_gns + 15 < ldb)); \
+        if (_kp < K_GROUPS * (N_TILE_K64 / 16)) { \
+            unsigned int _sgr = _kp >> 2; \
+            unsigned int _sgn = (_kp & 3) << 4; \
+            unsigned int _sg  = (kb) / GROUP_SIZE + _sgr; \
+            cp_async_pred_16(&smem_Bs[(w)][(buf)][_sgr][_sgn], \
+                &Bs[(unsigned long long)_sg * ldb + cta_n + _sgn], \
+                (cta_n + _sgn + 15 < ldb)); \
+        } \
+    } while(0)
+
+    #define K64_ISSUE_STAGE(buf, kb) do { \
+        K64_ISSUE_A((buf), (kb)); \
+        K64_ISSUE_B(0, (buf), (kb), Bg_packed, Bg_scale); \
+        K64_ISSUE_B(1, (buf), (kb), Bu_packed, Bu_scale); \
+        cp_async_commit(); \
+    } while(0)
+
+    // Register dequant of 64 K-elements of column nc for weight w tile buf.
+    // Output fragments: v0_0,v1_0 = K[0..31]; v0_1,v1_1 = K[32..63].
+    // Each uint32 packs 4 FP8 bytes in the layout consumed by m16n8k32:
+    //   v0 = {bytes for k=4tid,4tid+1,4tid+2,4tid+3} (lower K-half of step)
+    //   v1 = {bytes for k=16+4tid..16+4tid+3}         (upper K-half)
+    // Bit-exact with PR_DEQ_COL in _pipe kernel per K-half.
+    #define K64_DEQ_COL(w, buf, nc, sc2, v0_0, v1_0, v0_1, v1_1) do { \
+        __nv_fp8_e4m3 _sf0, _sf1, _sf2, _sf3; \
+        *(unsigned char*)&_sf0 = smem_Bs[(w)][(buf)][0][(nc)]; \
+        *(unsigned char*)&_sf1 = smem_Bs[(w)][(buf)][1][(nc)]; \
+        *(unsigned char*)&_sf2 = smem_Bs[(w)][(buf)][2][(nc)]; \
+        *(unsigned char*)&_sf3 = smem_Bs[(w)][(buf)][3][(nc)]; \
+        float _sv0 = (float)_sf0 * (sc2); \
+        float _sv1 = (float)_sf1 * (sc2); \
+        float _sv2 = (float)_sf2 * (sc2); \
+        float _sv3 = (float)_sf3 * (sc2); \
+        unsigned int _p00 = smem_Bp[(w)][(buf)][   2*tid  ][(nc)]; \
+        unsigned int _p01 = smem_Bp[(w)][(buf)][   2*tid+1][(nc)]; \
+        unsigned int _p10 = smem_Bp[(w)][(buf)][8+ 2*tid  ][(nc)]; \
+        unsigned int _p11 = smem_Bp[(w)][(buf)][8+ 2*tid+1][(nc)]; \
+        unsigned short _h00,_h01,_h10,_h11; \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_h00):"f"(smem_LUT[_p00>>4]*_sv0),"f"(smem_LUT[_p00&0xF]*_sv0)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_h01):"f"(smem_LUT[_p01>>4]*_sv0),"f"(smem_LUT[_p01&0xF]*_sv0)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_h10):"f"(smem_LUT[_p10>>4]*_sv1),"f"(smem_LUT[_p10&0xF]*_sv1)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_h11):"f"(smem_LUT[_p11>>4]*_sv1),"f"(smem_LUT[_p11&0xF]*_sv1)); \
+        (v0_0) = ((unsigned int)_h01 << 16) | (unsigned int)_h00; \
+        (v1_0) = ((unsigned int)_h11 << 16) | (unsigned int)_h10; \
+        unsigned int _q00 = smem_Bp[(w)][(buf)][16+ 2*tid  ][(nc)]; \
+        unsigned int _q01 = smem_Bp[(w)][(buf)][16+ 2*tid+1][(nc)]; \
+        unsigned int _q10 = smem_Bp[(w)][(buf)][24+ 2*tid  ][(nc)]; \
+        unsigned int _q11 = smem_Bp[(w)][(buf)][24+ 2*tid+1][(nc)]; \
+        unsigned short _g00,_g01,_g10,_g11; \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_g00):"f"(smem_LUT[_q00>>4]*_sv2),"f"(smem_LUT[_q00&0xF]*_sv2)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_g01):"f"(smem_LUT[_q01>>4]*_sv2),"f"(smem_LUT[_q01&0xF]*_sv2)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_g10):"f"(smem_LUT[_q10>>4]*_sv3),"f"(smem_LUT[_q10&0xF]*_sv3)); \
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0,%1,%2;":"=h"(_g11):"f"(smem_LUT[_q11>>4]*_sv3),"f"(smem_LUT[_q11&0xF]*_sv3)); \
+        (v0_1) = ((unsigned int)_g01 << 16) | (unsigned int)_g00; \
+        (v1_1) = ((unsigned int)_g11 << 16) | (unsigned int)_g10; \
+    } while(0)
+
+    // Two consecutive m16n8k32 MMAs per N-subtile per M-frag (K[0..31] + K[32..63]).
+    #define K64_MMA(w, buf, sc2) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(buf)]; \
+        unsigned int _fr0 = group_id; \
+        unsigned int _fr1 = _fr0 + 8; \
+        unsigned int _a0 = bf16x4_to_e4m3x4(&sA[_fr0      * a_stride +        tid * 4]); \
+        unsigned int _a1 = bf16x4_to_e4m3x4(&sA[_fr1      * a_stride +        tid * 4]); \
+        unsigned int _a2 = bf16x4_to_e4m3x4(&sA[_fr0      * a_stride + 16 +   tid * 4]); \
+        unsigned int _a3 = bf16x4_to_e4m3x4(&sA[_fr1      * a_stride + 16 +   tid * 4]); \
+        unsigned int _b0 = bf16x4_to_e4m3x4(&sA[(_fr0+16) * a_stride +        tid * 4]); \
+        unsigned int _b1 = bf16x4_to_e4m3x4(&sA[(_fr1+16) * a_stride +        tid * 4]); \
+        unsigned int _b2 = bf16x4_to_e4m3x4(&sA[(_fr0+16) * a_stride + 16 +   tid * 4]); \
+        unsigned int _b3 = bf16x4_to_e4m3x4(&sA[(_fr1+16) * a_stride + 16 +   tid * 4]); \
+        unsigned int _e0 = bf16x4_to_e4m3x4(&sA[_fr0      * a_stride + 32 +   tid * 4]); \
+        unsigned int _e1 = bf16x4_to_e4m3x4(&sA[_fr1      * a_stride + 32 +   tid * 4]); \
+        unsigned int _e2 = bf16x4_to_e4m3x4(&sA[_fr0      * a_stride + 48 +   tid * 4]); \
+        unsigned int _e3 = bf16x4_to_e4m3x4(&sA[_fr1      * a_stride + 48 +   tid * 4]); \
+        unsigned int _f0 = bf16x4_to_e4m3x4(&sA[(_fr0+16) * a_stride + 32 +   tid * 4]); \
+        unsigned int _f1 = bf16x4_to_e4m3x4(&sA[(_fr1+16) * a_stride + 32 +   tid * 4]); \
+        unsigned int _f2 = bf16x4_to_e4m3x4(&sA[(_fr0+16) * a_stride + 48 +   tid * 4]); \
+        unsigned int _f3 = bf16x4_to_e4m3x4(&sA[(_fr1+16) * a_stride + 48 +   tid * 4]); \
+        _Pragma("unroll") \
+        for (int sub = 0; sub < 2; sub++) { \
+            unsigned int nt = warp_id * 2 + sub; \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int _v00,_v10,_v01,_v11; \
+            K64_DEQ_COL((w),(buf),nc,(sc2),_v00,_v10,_v01,_v11); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][0][sub][0]),"=f"(acc[(w)][0][sub][1]),"=f"(acc[(w)][0][sub][2]),"=f"(acc[(w)][0][sub][3]) \
+                :"r"(_a0),"r"(_a1),"r"(_a2),"r"(_a3),"r"(_v00),"r"(_v10), \
+                 "f"(acc[(w)][0][sub][0]),"f"(acc[(w)][0][sub][1]),"f"(acc[(w)][0][sub][2]),"f"(acc[(w)][0][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][1][sub][0]),"=f"(acc[(w)][1][sub][1]),"=f"(acc[(w)][1][sub][2]),"=f"(acc[(w)][1][sub][3]) \
+                :"r"(_b0),"r"(_b1),"r"(_b2),"r"(_b3),"r"(_v00),"r"(_v10), \
+                 "f"(acc[(w)][1][sub][0]),"f"(acc[(w)][1][sub][1]),"f"(acc[(w)][1][sub][2]),"f"(acc[(w)][1][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][0][sub][0]),"=f"(acc[(w)][0][sub][1]),"=f"(acc[(w)][0][sub][2]),"=f"(acc[(w)][0][sub][3]) \
+                :"r"(_e0),"r"(_e1),"r"(_e2),"r"(_e3),"r"(_v01),"r"(_v11), \
+                 "f"(acc[(w)][0][sub][0]),"f"(acc[(w)][0][sub][1]),"f"(acc[(w)][0][sub][2]),"f"(acc[(w)][0][sub][3])); \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[(w)][1][sub][0]),"=f"(acc[(w)][1][sub][1]),"=f"(acc[(w)][1][sub][2]),"=f"(acc[(w)][1][sub][3]) \
+                :"r"(_f0),"r"(_f1),"r"(_f2),"r"(_f3),"r"(_v01),"r"(_v11), \
+                 "f"(acc[(w)][1][sub][0]),"f"(acc[(w)][1][sub][1]),"f"(acc[(w)][1][sub][2]),"f"(acc[(w)][1][sub][3])); \
+        } \
+    } while(0)
+
+    const unsigned int num_k = K / K_STEP_K64;  // K must be a multiple of 64
+
+    K64_ISSUE_STAGE(0, 0);
+    int cur = 0;
+    for (unsigned int k = 0; k < num_k; k++) {
+        int nxt = 1 - cur;
+        bool has_next = (k + 1) < num_k;
+        if (has_next) K64_ISSUE_STAGE(nxt, (k + 1) * K_STEP_K64);
+        if (has_next) {
+            cp_async_wait_group<1>();
+        } else {
+            cp_async_wait_all();
+        }
+        __syncthreads();
+        K64_MMA(0, cur, scale2_g);
+        K64_MMA(1, cur, scale2_u);
+        __syncthreads();
+        cur = nxt;
+    }
+
+    #undef K64_ISSUE_A
+    #undef K64_ISSUE_B
+    #undef K64_ISSUE_STAGE
+    #undef K64_DEQ_COL
+    #undef K64_MMA
+
+    // Output: identical FUSE to _pipe (BF16 round-trip SiLU*mul).
+    #pragma unroll
+    for (int sub = 0; sub < 2; sub++) {
+        unsigned int nt = warp_id * 2 + sub;
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + group_id;
+        unsigned int r1 = r0 + 8;
+        unsigned int r2 = r0 + 16;
+        unsigned int r3 = r0 + 24;
+        #define FUSE_K64(gi, ui) ({ \
+            float _g = __bfloat162float(__float2bfloat16(gi)); \
+            float _u = __bfloat162float(__float2bfloat16(ui)); \
+            float _s = 1.0f / (1.0f + __expf(-_g)); \
+            __float2bfloat16(_g * _s * _u); })
+        if (r0 < M && c0 < N) C[r0*N+c0] = FUSE_K64(acc[0][0][sub][0], acc[1][0][sub][0]);
+        if (r0 < M && c1 < N) C[r0*N+c1] = FUSE_K64(acc[0][0][sub][1], acc[1][0][sub][1]);
+        if (r1 < M && c0 < N) C[r1*N+c0] = FUSE_K64(acc[0][0][sub][2], acc[1][0][sub][2]);
+        if (r1 < M && c1 < N) C[r1*N+c1] = FUSE_K64(acc[0][0][sub][3], acc[1][0][sub][3]);
+        if (r2 < M && c0 < N) C[r2*N+c0] = FUSE_K64(acc[0][1][sub][0], acc[1][1][sub][0]);
+        if (r2 < M && c1 < N) C[r2*N+c1] = FUSE_K64(acc[0][1][sub][1], acc[1][1][sub][1]);
+        if (r3 < M && c0 < N) C[r3*N+c0] = FUSE_K64(acc[0][1][sub][2], acc[1][1][sub][2]);
+        if (r3 < M && c1 < N) C[r3*N+c1] = FUSE_K64(acc[0][1][sub][3], acc[1][1][sub][3]);
+        #undef FUSE_K64
+    }
+}
+
+#undef N_TILE_K64
+#undef K_STEP_K64
+#undef A_PAD_K64
+#undef BP_PAD_K64

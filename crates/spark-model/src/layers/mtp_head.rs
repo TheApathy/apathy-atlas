@@ -136,12 +136,14 @@ pub struct MtpHead {
 
     // Dense MLP path (Qwen3.5/3.6 27B-class). When `is_dense_mlp == true`,
     // the forward pass swaps the MoE block for a plain gate/up/down MLP
-    // built from `MtpDenseWeights`. Quantized to NVFP4 at construction so
-    // it shares the same w4a16_gemv kernel as the projections above.
+    // built from `MtpDenseWeights`. Precision follows `MtpQuantization`
+    // (--mtp-quantization): BF16 preserves the checkpoint head verbatim —
+    // grafted EAGLE-style heads lose most of their acceptance when
+    // re-quantized to NVFP4.
     is_dense_mlp: bool,
-    dense_mlp_gate: Option<QuantizedWeight>,
-    dense_mlp_up: Option<QuantizedWeight>,
-    dense_mlp_down: Option<QuantizedWeight>,
+    dense_mlp_gate: Option<ProjectionWeight>,
+    dense_mlp_up: Option<ProjectionWeight>,
+    dense_mlp_down: Option<ProjectionWeight>,
     dense_mlp_intermediate: usize,
 
     // Precision mode

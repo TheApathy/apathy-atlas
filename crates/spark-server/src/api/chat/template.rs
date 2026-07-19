@@ -14,9 +14,23 @@ use crate::AppState;
 use crate::openai::ChatCompletionRequest;
 use crate::tool_parser;
 
-use super::super::compact::{compact_messages, openai_error_response};
+use super::super::compact::{compact_messages, openai_error_response, truncate_to_fit};
 use super::super::failures::strip_xml_leaks_from_assistant_content;
 use super::msg_entry::MsgEntry;
+
+/// Whether the hard context-overflow truncation safety net is active
+/// (Atlas task #76). Default ON; `ATLAS_CTX_OVERFLOW_TRUNCATE=0` restores the
+/// strict 400-on-overflow behavior. Cached so the hot path is a relaxed load.
+fn ctx_overflow_truncate_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("ATLAS_CTX_OVERFLOW_TRUNCATE").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
 
 /// Outputs of [`render_template`]. Threaded into the streaming /
 /// blocking dispatch.
@@ -117,12 +131,15 @@ pub(super) fn render_template(
         json_messages
     };
 
-    let prompt_tokens = match state.tokenizer.apply_chat_template_openai(
-        &json_messages,
-        jinja_tools.as_deref(),
-        template_thinking,
-        state.behavior.disable_tool_steering,
-    ) {
+    let tokenize = |jm: &[serde_json::Value]| {
+        state.tokenizer.apply_chat_template_openai(
+            jm,
+            jinja_tools.as_deref(),
+            template_thinking,
+            state.behavior.disable_tool_steering,
+        )
+    };
+    let mut prompt_tokens = match tokenize(&json_messages) {
         Ok(t) => t,
         Err(e) => {
             return Err(openai_error_response(
@@ -131,6 +148,52 @@ pub(super) fn render_template(
             ));
         }
     };
+
+    // ── Hard context-overflow safety net (Atlas task #76) ──
+    // Deep agentic multi-turn conversations (long ops briefing + accumulated
+    // tool outputs) can overflow max_seq_len. Previously this either 400'd or
+    // wedged the scheduler to the 900 s harness ceiling (Spark-Bench AG-11/12).
+    // Reserve room for output (max_thinking_budget on think-on runs is the
+    // dominant term — the champion serves 768) and, if the prompt won't fit,
+    // drop the OLDEST turns and re-render — bounded, never an infinite loop.
+    // Opt out with ATLAS_CTX_OVERFLOW_TRUNCATE=0 to restore strict 400-on-overflow.
+    if ctx_overflow_truncate_enabled() {
+        let output_reserve =
+            (state.behavior.max_thinking_budget as usize).saturating_add(256);
+        let fit_budget = state.max_seq_len.saturating_sub(output_reserve).max(1);
+        if prompt_tokens.len() >= fit_budget {
+            let mut jm = json_messages.clone();
+            // keep_tail shrinks each pass (6 → 4 → 2) so we always make progress.
+            for keep_tail in [6usize, 4, 2] {
+                match truncate_to_fit(&jm, keep_tail) {
+                    Some(truncated) => {
+                        let dropped = jm.len().saturating_sub(truncated.len());
+                        jm = truncated;
+                        match tokenize(&jm) {
+                            Ok(t) => {
+                                let fits = t.len() < fit_budget;
+                                tracing::warn!(
+                                    "ctx-overflow truncate (keep_tail={keep_tail}): dropped {dropped} \
+                                     msg(s), prompt {} → {} tokens (fit_budget={fit_budget}, fits={fits})",
+                                    prompt_tokens.len(),
+                                    t.len(),
+                                );
+                                prompt_tokens = t;
+                                if fits {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("re-tokenization after truncate failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    None => break, // nothing left to drop → caller fast-fails with 400
+                }
+            }
+        }
+    }
 
     // Expand image pads when needed.
     let prompt_tokens = if image_pad_counts.iter().any(|&c| c > 1) {

@@ -1,0 +1,9 @@
+[hardware]
+name = "rtx6000"
+vendor = "nvidia"
+arch = "sm_120"
+compute_capability = "12.0"
+memory_bandwidth_gbps = 1792
+memory_type = "GDDR7"
+memory_gb = 96
+use_fp32_residual = false
