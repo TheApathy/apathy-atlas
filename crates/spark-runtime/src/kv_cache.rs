@@ -4,6 +4,45 @@
 //!
 //! Manages a pool of fixed-size blocks for attention KV storage.
 //! Each block holds `block_size` token positions for all KV heads.
+//!
+//! ## Roadmap: TCQ (trellis-coded quantization) KV — long-context Phase 2
+//!
+//! The scalar per-element quantizers here (FP8, NVFP4, Turbo{2,3,4,8}) are
+//! bandwidth-optimal at 8k context but leave quality on the table at long
+//! context. Trellis-coded quantization (buun-llama-cpp / VBR) exploits the
+//! correlation between adjacent cache entries via a Viterbi search over a coding
+//! trellis, reaching ~lossless quality at 3.25 bpv (their Qwen3.6-27B numbers:
+//! PPL 5.668 vs f16 5.683, median KLD 0.00163) and still-coherent output at
+//! 1.25 bpv (KLD 0.026). That is ~2.5x smaller than FP8 at equal quality.
+//!
+//! WHY IT MATTERS ONLY AT LONG CONTEXT: this hybrid has just 16 full-attention
+//! layers (the SSM layers hold no paged KV), so at 8k the KV read is a small
+//! fraction of the 273 GB/s bandwidth wall — a TCQ win is negligible. At 32k+
+//! the FP8 KV read grows to ~15 ms/token (doubling the step), and TCQ's 2.5x
+//! reduction becomes the dominant lever; at 64k–262k it dominates.
+//!
+//! IMPLEMENTATION SHAPE (a multi-week kernel port, NOT yet built):
+//!   1. Add `Tcq3` (3.25 bpv) / `Tcq2` (2.25) / `Tcq1` (1.25) variants + their
+//!      asymmetric K/V pairings (`Fp8KTcq3V`, `Bf16KTcq2V`, …) — mirror the
+//!      existing Turbo* wiring in `kv_pair`/`is_asymmetric`/Display and every
+//!      dispatch match site.
+//!   2. WRITE kernel: fork `reshape_and_cache_flash_turboN` to run the Viterbi
+//!      encode over each block's V (and optionally K). NOTE from their repo: TCQ
+//!      costs prefill (~25% slower — the re-encode is not free); DECODE is
+//!      unaffected because the trellis is decoded by table lookup.
+//!   3. DECODE kernel: a new `paged_decode_attn_tcqN` variant that dequantizes the
+//!      trellis codes inline (the Turbo2 note below shows the missing-decoder
+//!      pattern to avoid).
+//!   4. VBR schedule: start hi-precision and degrade layer-by-layer as context
+//!      grows. In Atlas terms this is a DYNAMIC version of the per-layer dtype
+//!      vector — shrink the high-precision layer set (see the server's
+//!      `--kv-high-precision-layer-set`, ranked by `local/kv_sensitivity_rank.py`)
+//!      as sequence length crosses thresholds. Their degradation ladder:
+//!      FP16 → 8.125 → 4.125 → 3.25tcq → 2.25tcq → 1.25tcq bpv.
+//!
+//! Until built, the measured per-layer sensitivity ordering (Phase 1) already
+//! lets an operator spend the BF16 budget on the most KV-sensitive layers via
+//! `--kv-high-precision-layer-set` — a scalar-quant win available today.
 
 use crate::gpu::DevicePtr;
 use anyhow::{Result, bail};

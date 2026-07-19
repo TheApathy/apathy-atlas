@@ -661,6 +661,7 @@ impl BlockDiffusionDraftHead {
             async_inflight: Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),
             async_order_event: std::sync::atomic::AtomicU64::new(0),
+            fused_event_armed: std::sync::atomic::AtomicBool::new(false),
         };
 
         tracing::info!(

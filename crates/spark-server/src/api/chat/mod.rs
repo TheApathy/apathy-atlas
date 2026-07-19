@@ -213,12 +213,21 @@ pub(crate) async fn chat_completions_inner(
     );
     let prompt_len = prompt_tokens.len();
     if prompt_len >= state.max_seq_len {
-        return openai_error_response(
+        // The overflow-truncation safety net (task #76, see template.rs) already
+        // dropped oldest turns; reaching here means even the minimal tail can't
+        // fit (e.g. a single oversized system prompt or user turn). Emit the
+        // OpenAI-standard `context_length_exceeded` code so coding-agent clients
+        // (OpenCode/Cline) compact and retry instead of blindly re-sending the
+        // same over-long prompt — the retry loop that dragged agentic scenarios
+        // to the 900 s harness ceiling.
+        return super::compact::openai_error_response_with_param(
             StatusCode::BAD_REQUEST,
             format!(
                 "Prompt too long: {prompt_len} tokens exceeds max_seq_len {} (leave room for output tokens)",
                 state.max_seq_len
             ),
+            Some("messages"),
+            Some("context_length_exceeded"),
         );
     }
 

@@ -59,6 +59,14 @@ pub fn dflash_async_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_ASYNC").ok().as_deref() == Some("1"))
 }
 
+/// ATLAS_DFLASH_FUSED=1: record the propose-ordering event pre-commit so the
+/// drafter runs in parallel with SSM commit + KV reshape (~10ms overlap).
+/// Requires ATLAS_DFLASH_ASYNC=1. Cached.
+pub fn dflash_fused_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_FUSED").ok().as_deref() == Some("1"))
+}
+
 /// Env-derived disqualifiers, computed once. Every feature here either
 /// post-processes drafts on the host inside/after `forward_block` (markov,
 /// denoise>1, margin gate, adaptive gamma, cfg-jf splice, debug dumps,
@@ -207,6 +215,42 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Resolve (sync + discard) any in-flight async propose. Called before
+    /// ATLAS_DFLASH_FUSED=1: record the propose-ordering CUDA event immediately
+    /// after verify returns, BEFORE commit kernels are enqueued on the default
+    /// stream. The drafter reads only `dflash_hidden_save` (populated by verify)
+    /// and `ctx_hidden_acc` (per-sequence, not written by commit). Commit writes
+    /// h_state and KV cache — disjoint from everything the drafter touches.
+    /// Recording the event here lets the propose stream start while commit
+    /// (~10ms SSM h_state copy + KV reshape) is still running on the default
+    /// stream, instead of waiting for it.
+    ///
+    /// `try_launch_async_propose` detects the armed flag and skips re-recording.
+    /// No-op on ASYNC/FUSED flag off, or stream not yet created (falls back to
+    /// record-at-launch on first step, fused on all subsequent ones).
+    pub(crate) fn arm_propose_overlap(
+        &self,
+        gpu: &dyn GpuBackend,
+        default_stream: u64,
+    ) -> Result<()> {
+        if !dflash_async_enabled() || !dflash_fused_enabled() {
+            return Ok(());
+        }
+        let pstream = self.propose_stream_lazy(gpu);
+        if pstream == 0 {
+            return Ok(());
+        }
+        let ev = self
+            .async_order_event
+            .load(std::sync::atomic::Ordering::Acquire);
+        if ev == 0 {
+            return Ok(());
+        }
+        gpu.record_event(ev, default_stream)?;
+        self.fused_event_armed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// any new launch touches the shared scratch, and from `free_sequence`
     /// before the per-seq ctx buffers are freed. Also clears an orphaned
     /// placeholder flag on `dstate` when provided.
@@ -275,10 +319,22 @@ impl BlockDiffusionDraftHead {
         // Shared-scratch discipline: at most one in-flight propose.
         self.resolve_async_inflight_impl(gpu, None)?;
 
-        // GPU-side ordering: propose stream waits for everything enqueued on
-        // the default stream so far (ctx-append D2Ds, verify capture writes).
-        let ev = self.async_order_event.load(std::sync::atomic::Ordering::Acquire);
-        gpu.record_event(ev, default_stream)?;
+        // GPU-side ordering: propose stream waits for the ordering event.
+        //
+        // ATLAS_DFLASH_FUSED: `arm_propose_overlap` already recorded the event
+        // immediately after verify returned (before commit was enqueued), so the
+        // propose stream only waits for verify — commit and drafter run in
+        // parallel. Consume the armed flag; if not set, record now (current
+        // behavior: propose waits for commit too).
+        let ev = self
+            .async_order_event
+            .load(std::sync::atomic::Ordering::Acquire);
+        let already_armed = self
+            .fused_event_armed
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if !already_armed {
+            gpu.record_event(ev, default_stream)?;
+        }
         gpu.stream_wait_event(pstream, ev)?;
 
         // Enqueue the drafter forward with the final sync + D2H deferred.

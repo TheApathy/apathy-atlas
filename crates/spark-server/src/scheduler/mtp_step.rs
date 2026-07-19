@@ -47,16 +47,13 @@ pub fn step_mtp(
         // depth-0 child) before the walk diverges. That is no better than
         // bootstrap but costs a k=32 verify.
         //
-        // Fix: always clear pending_tree_payload when inside thinking so the
-        // flat MTP drafts (pending_drafts, the top-1 linear chain) proceed to
-        // the k=γ flat verify + thinking accept walk. That restores the baseline
-        // ~5–7 tok/step during <think> spans instead of the 1 tok/step bootstrap.
-        // Short draft chains (< 4) still fall back to bootstrap as before.
-        if think.enabled && a.inside_thinking {
+        // While inside thinking, clear both drafts and the tree payload so the
+        // sequence falls through to bootstrap (single-token decode). The
+        // bootstrap_thinking_token path correctly handles budget accounting and
+        // per-token side effects (EOS suppression, </think> fence).
+        if think.enabled && a.inside_thinking && a.pending_tree_payload.is_some() {
+            a.pending_drafts.clear();
             a.pending_tree_payload = None;
-            if a.pending_drafts.len() < 4 {
-                a.pending_drafts.clear();
-            }
         }
     }
 

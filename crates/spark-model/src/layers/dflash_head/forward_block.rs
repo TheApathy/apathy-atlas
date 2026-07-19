@@ -405,8 +405,49 @@ impl BlockDiffusionDraftHead {
             let fc_layernorm =
                 std::env::var("ATLAS_DFLASH_FC_LAYERNORM").ok().as_deref() == Some("1");
             if new_fc_count > 0 {
-                // Compute fc projection for new context positions.
+                // Batched fast path (task #64): when NOT applying per-slice
+                // FC-norm, every new context position reads a contiguous
+                // [target_hidden_dim] source row from `base` (stride
+                // ctx_slot_bytes = target_hidden_dim*bf16 = the GEMM K) and
+                // writes a contiguous [hidden_size] dst row into `fc_proj`
+                // (stride h*bf16 = the GEMM N). So the whole per-position GEMV
+                // loop — one ~105MB fc-weight read PER position — collapses to a
+                // SINGLE w4a16_gemm over M=new_fc_count rows: one weight read.
+                // Bit-exact vs the loop (same weight, same (n=h, k=K) mapping,
+                // M_TILE=64 handles arbitrary M with `if (r < M)` guards); the
+                // gemv's n/k args map to the gemm's n/k unchanged. The
+                // fc_layernorm path (default OFF) still needs per-position
+                // RMSNorm into a 1-position scratch buffer, so it keeps the
+                // loop below.
+                let batched_nvfp4 = !fc_layernorm
+                    && matches!(self.quant, super::DflashQuantization::Nvfp4)
+                    && self.fc_nvfp4.is_some();
+                if batched_nvfp4 {
+                    let fc_q = self.fc_nvfp4.as_ref().unwrap();
+                    let src = base.offset(old_fc_end * ctx_slot_bytes);
+                    let dst = self
+                        .scratch
+                        .fc_proj
+                        .offset(old_fc_count * self.hidden_size * bf16);
+                    ops::w4a16_gemm(
+                        gpu,
+                        self.kernels.w4a16_gemm,
+                        src,
+                        fc_q,
+                        dst,
+                        new_fc_count as u32,
+                        h,
+                        target_hidden_dim as u32,
+                        stream,
+                    )?;
+                }
+                // Per-position fallback: fc_layernorm path (per-slice RMSNorm)
+                // and the dense (non-NVFP4) path. Skipped entirely when the
+                // batched NVFP4 fast path above already computed fc_proj.
                 for i in 0..new_fc_count {
+                    if batched_nvfp4 {
+                        break;
+                    }
                     let abs_pos = old_fc_end + i;
                     let raw_slot = base.offset(abs_pos * ctx_slot_bytes);
                     // Per-layer FC-norm: copy each of the n_capture target-layer

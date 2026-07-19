@@ -277,12 +277,37 @@ pub(crate) fn resolve_kv_cache_config(
             effective_kv_dtype_str,
         );
     }
-    let layer_dtypes = crate::main_modules::build_layer_kv_dtypes(
-        kv_dtype,
-        num_attn_layers,
-        kv_hp_layers,
-        spark_runtime::kv_cache::KvCacheDtype::Bf16,
-    );
+    // A MEASURED sensitivity set (--kv-high-precision-layer-set) overrides the positional
+    // first-N/last-N heuristic: spend the same BF16 budget on the attention layers a
+    // per-layer sweep found most sensitive to KV quantization (see local/kv_sensitivity_rank.py).
+    let hp_layer_set: Vec<usize> = args
+        .kv_high_precision_layer_set
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<usize>().ok())
+        .collect();
+    let layer_dtypes = if !hp_layer_set.is_empty() {
+        tracing::info!(
+            "Using MEASURED --kv-high-precision-layer-set {:?} (overrides positional \
+             --kv-high-precision-layers {})",
+            hp_layer_set,
+            kv_hp_layers,
+        );
+        crate::main_modules::build_layer_kv_dtypes_from_set(
+            kv_dtype,
+            num_attn_layers,
+            &hp_layer_set,
+            spark_runtime::kv_cache::KvCacheDtype::Bf16,
+        )
+    } else {
+        crate::main_modules::build_layer_kv_dtypes(
+            kv_dtype,
+            num_attn_layers,
+            kv_hp_layers,
+            spark_runtime::kv_cache::KvCacheDtype::Bf16,
+        )
+    };
     let hss_cache_blocks_per_seq = if args.high_speed_swap {
         Some(args.high_speed_swap_cache_blocks_per_seq)
     } else {

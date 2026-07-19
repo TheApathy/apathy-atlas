@@ -632,6 +632,15 @@ pub struct BlockDiffusionDraftHead {
     /// prior writes (ctx-append D2Ds, verify captures). Set together with
     /// `async_propose_stream`.
     pub async_order_event: std::sync::atomic::AtomicU64,
+
+    // ── ATLAS_DFLASH_FUSED ──
+    /// Set by `arm_propose_overlap` immediately after verify returns (before
+    /// commit is enqueued on the default stream). When true,
+    /// `try_launch_async_propose` skips re-recording `async_order_event`
+    /// (the pre-commit snapshot is already in place) so the propose stream
+    /// only waits for verify, not for the ~10ms SSM commit + KV reshape.
+    /// Cleared on each consume in `try_launch_async_propose`.
+    pub fused_event_armed: std::sync::atomic::AtomicBool,
 }
 
 impl BlockDiffusionDraftHead {
@@ -1007,5 +1016,13 @@ impl DraftProposer for BlockDiffusionDraftHead {
     ) -> Result<()> {
         let dstate = state.and_then(|s| s.as_any_mut().downcast_mut::<DflashProposerState>());
         self.resolve_async_inflight_impl(gpu, dstate)
+    }
+
+    fn arm_propose_overlap(
+        &self,
+        gpu: &dyn GpuBackend,
+        default_stream: u64,
+    ) -> Result<()> {
+        BlockDiffusionDraftHead::arm_propose_overlap(self, gpu, default_stream)
     }
 }

@@ -295,9 +295,11 @@ impl MtpHead {
 
     /// Construct an MtpHead for *dense-MLP* MTP (Qwen3.5/3.6 27B-class).
     ///
-    /// Mirrors `new()` minus the MoE quantization. Quantizes the dense
-    /// MLP weights (`gate/up/down`) to NVFP4 so they share the same
-    /// w4a16_gemv kernel as the projections. Forward pass branches on
+    /// Mirrors `new()` minus the MoE quantization. Weight precision follows
+    /// `quant` (--mtp-quantization) for the attention projections AND the
+    /// dense MLP: grafted checkpoint heads (e.g. AEON-Ultimate-MTP) ship
+    /// BF16 `mtp.*` tensors whose acceptance rate collapses if re-quantized
+    /// to NVFP4 — BF16 preserves them verbatim. Forward pass branches on
     /// `is_dense_mlp` and runs a 4-op MLP (gate → up → silu+mul → down)
     /// in place of the MoE block.
     #[allow(clippy::too_many_arguments)]
@@ -307,6 +309,7 @@ impl MtpHead {
         lm_head_nvfp4: QuantizedWeight,
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
+        quant: MtpQuantization,
         mtp_vocab_size: u32,
         max_seq_len: usize,
     ) -> Result<Self> {
@@ -323,7 +326,6 @@ impl MtpHead {
         // Read from the actual weight shape (gate_proj is [intermediate, hidden]).
         let inter = config.intermediate_size;
 
-        let quant = MtpQuantization::Nvfp4;
         let q = |bf16: &DenseWeight, n: usize, k: usize| -> Result<ProjectionWeight> {
             Self::quantize_proj(bf16, n, k, quant, gpu, absmax_k, nvfp4_k, fp8_k, stream)
         };
@@ -335,12 +337,10 @@ impl MtpHead {
         let v_proj = q(&weights.v_proj, nkv * hd, h)?;
         let o_proj = q(&weights.o_proj, h, nq * hd)?;
 
-        // Quantize dense MLP weights to NVFP4 so they share the w4a16_gemv path.
-        let mlp_gate =
-            quantize_to_nvfp4(&weights.mlp_gate, inter, h, gpu, absmax_k, nvfp4_k, stream)?;
-        let mlp_up = quantize_to_nvfp4(&weights.mlp_up, inter, h, gpu, absmax_k, nvfp4_k, stream)?;
-        let mlp_down =
-            quantize_to_nvfp4(&weights.mlp_down, h, inter, gpu, absmax_k, nvfp4_k, stream)?;
+        // Dense MLP weights follow the same precision as the projections.
+        let mlp_gate = q(&weights.mlp_gate, inter, h)?;
+        let mlp_up = q(&weights.mlp_up, inter, h)?;
+        let mlp_down = q(&weights.mlp_down, h, inter)?;
 
         // KV cache for the single MTP attention layer (FP8, same as MoE path).
         let kv_config = spark_runtime::kv_cache::KvCacheConfig {
@@ -368,7 +368,7 @@ impl MtpHead {
             config.vocab_size
         };
         tracing::info!(
-            "Dense MTP head: NVFP4, fc=[{h},{h2}], attn Q=[{qd},{h}], MLP I={inter}, \
+            "Dense MTP head: {quant:?}, fc=[{h},{h2}], attn Q=[{qd},{h}], MLP I={inter}, \
              vocab={ev}/{fv} (LM head {lm:.1} MB)",
             h2 = h * 2,
             qd = nq * hd * 2,
@@ -402,7 +402,7 @@ impl MtpHead {
             dense_mlp_up: Some(mlp_up),
             dense_mlp_down: Some(mlp_down),
             dense_mlp_intermediate: inter,
-            quant: MtpQuantization::Nvfp4,
+            quant,
             mtp_vocab_size,
             embed_tokens,
             lm_head_nvfp4,
@@ -452,11 +452,11 @@ impl MtpHead {
             // moe_silu_mul is the same kernel for dense fused silu*up — it
             // does not require expert routing.
             moe_silu_mul_k: Some(gpu.kernel("moe_silu_mul", "moe_silu_mul")?),
-            // BF16/FP8 kernels not needed; dense MLP uses w4a16_gemv only.
-            dense_gemv_k: None,
-            dense_gemv_fp8w_k: None,
+            // BF16/FP8 GEMV kernels back the non-NVFP4 arms of gemv().
+            dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16").ok(),
+            dense_gemv_fp8w_k: gpu.kernel("gemv_fp8w", "dense_gemv_fp8w").ok(),
+            deinterleave_qg_k: gpu.kernel("ssm_preprocess", "deinterleave_qg").ok(),
             w8a16_gemv_k: None,
-            deinterleave_qg_k: None,
             moe_topk_k: None,
             moe_weighted_sum_blend_k: None,
         })
@@ -488,28 +488,10 @@ impl MtpHead {
         let up_w = self.dense_mlp_up.as_ref().unwrap();
         let down_w = self.dense_mlp_down.as_ref().unwrap();
 
-        // 1. gate = w4a16_gemv(normed, gate_w)
-        crate::layers::ops::w4a16_gemv(
-            ctx.gpu,
-            self.w4a16_gemv_k,
-            normed,
-            gate_w,
-            gate_buf,
-            inter,
-            h,
-            stream,
-        )?;
-        // 2. up = w4a16_gemv(normed, up_w)
-        crate::layers::ops::w4a16_gemv(
-            ctx.gpu,
-            self.w4a16_gemv_k,
-            normed,
-            up_w,
-            up_buf,
-            inter,
-            h,
-            stream,
-        )?;
+        // 1. gate = gemv(normed, gate_w) — dispatches on MtpQuantization.
+        self.gemv(ctx.gpu, normed, gate_w, gate_buf, inter, h, stream)?;
+        // 2. up = gemv(normed, up_w)
+        self.gemv(ctx.gpu, normed, up_w, up_buf, inter, h, stream)?;
         // 3. silu_act = silu(gate) * up — moe_silu_mul does it elementwise.
         crate::layers::ops::moe_silu_mul(
             ctx.gpu,
@@ -520,17 +502,8 @@ impl MtpHead {
             inter,
             stream,
         )?;
-        // 4. mlp_out = w4a16_gemv(silu_act, down_w)
-        crate::layers::ops::w4a16_gemv(
-            ctx.gpu,
-            self.w4a16_gemv_k,
-            gate_buf,
-            down_w,
-            mlp_out,
-            h,
-            inter,
-            stream,
-        )?;
+        // 4. mlp_out = gemv(silu_act, down_w)
+        self.gemv(ctx.gpu, gate_buf, down_w, mlp_out, h, inter, stream)?;
         Ok(mlp_out)
     }
 }

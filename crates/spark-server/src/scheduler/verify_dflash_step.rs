@@ -176,6 +176,15 @@ pub fn step_verify_dflash(
     // and routes through the partial-accept (intermediate→h_state) path.
     a.last_token_time = Instant::now();
 
+    // ATLAS_DFLASH_FUSED=1: record the propose-ordering event NOW, before
+    // commit kernels are enqueued. The drafter reads dflash_hidden_save
+    // (populated by verify) and ctx_hidden_acc (per-sequence). Commit writes
+    // h_state and KV cache — disjoint. This lets the propose stream run in
+    // parallel with the ~10ms SSM commit + KV reshape.
+    if let Err(e) = model.dflash_arm_propose_overlap() {
+        tracing::warn!("dflash_arm_propose_overlap: {e:#}");
+    }
+
     // ── ATLAS_DFLASH_BRANCH_AUDIT=1: settle the previous step's stash ──
     // `verified[0]` is the target's TRUE argmax after `tokens[0]`
     // (= the committed bonus of the previous step). If the previous step
@@ -857,6 +866,15 @@ pub fn step_verify_dflash(
              verify={t_verify_us}μs commit={t_commit_us}μs save_hidden={t_save_us}μs \
              trim={t_trim_us}μs propose={propose_us}μs other={other_us}μs accepted={num_accepted}",
         );
+    }
+
+    // ATLAS_FULL_PROFILE: emit per-kernel KPROF every 150 verify steps — the
+    // DFlash scheduler bypasses the lifecycle.rs dump so wire it here.
+    if spark_model::full_profile::is_enabled() {
+        static DFKP_CTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if DFKP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 150 == 149 {
+            spark_model::full_profile::dump();
+        }
     }
 
     // DDTree M6: drain any tree payload the drafter built during the propose

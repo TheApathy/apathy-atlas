@@ -3,7 +3,7 @@
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
-use crate::main_modules::build_layer_kv_dtypes;
+use crate::main_modules::{build_layer_kv_dtypes, build_layer_kv_dtypes_from_set};
 
 #[test]
 fn test_cli_parse_positional_model() {
@@ -130,6 +130,92 @@ fn test_build_layer_kv_dtypes_single_layer() {
     let dtypes = build_layer_kv_dtypes(KvCacheDtype::Nvfp4, 1, 1, KvCacheDtype::Bf16);
     assert_eq!(dtypes.len(), 1);
     assert_eq!(dtypes[0], KvCacheDtype::Bf16);
+}
+
+#[test]
+fn test_build_layer_kv_dtypes_from_set_basic() {
+    use spark_runtime::kv_cache::KvCacheDtype;
+    // Explicit measured set: layers 0, 5, 11 kept at BF16; the rest NVFP4.
+    let dtypes =
+        build_layer_kv_dtypes_from_set(KvCacheDtype::Nvfp4, 12, &[0, 5, 11], KvCacheDtype::Bf16);
+    assert_eq!(dtypes.len(), 12);
+    for i in 0..12 {
+        let expected = if [0usize, 5, 11].contains(&i) {
+            KvCacheDtype::Bf16
+        } else {
+            KvCacheDtype::Nvfp4
+        };
+        assert_eq!(dtypes[i], expected, "layer {i}");
+    }
+}
+
+#[test]
+fn test_build_layer_kv_dtypes_from_set_empty_is_uniform() {
+    use spark_runtime::kv_cache::KvCacheDtype;
+    // Empty set → empty vec (uniform dtype), same no-benefit semantics as the positional builder.
+    let dtypes = build_layer_kv_dtypes_from_set(KvCacheDtype::Fp8, 16, &[], KvCacheDtype::Bf16);
+    assert!(dtypes.is_empty());
+}
+
+#[test]
+fn test_build_layer_kv_dtypes_from_set_same_dtype_is_empty() {
+    use spark_runtime::kv_cache::KvCacheDtype;
+    // boundary == base → no benefit → empty vec (matches build_layer_kv_dtypes).
+    let dtypes =
+        build_layer_kv_dtypes_from_set(KvCacheDtype::Bf16, 16, &[1, 2], KvCacheDtype::Bf16);
+    assert!(dtypes.is_empty());
+}
+
+#[test]
+fn test_build_layer_kv_dtypes_from_set_out_of_range_ignored() {
+    use spark_runtime::kv_cache::KvCacheDtype;
+    // Index 99 is out of range for a 16-layer model — ignored, not a panic.
+    // Valid index 3 still applies.
+    let dtypes =
+        build_layer_kv_dtypes_from_set(KvCacheDtype::Turbo4, 16, &[3, 99], KvCacheDtype::Bf16);
+    assert_eq!(dtypes.len(), 16);
+    assert_eq!(dtypes[3], KvCacheDtype::Bf16);
+    let hp = dtypes.iter().filter(|d| **d == KvCacheDtype::Bf16).count();
+    assert_eq!(hp, 1, "only the in-range index should apply");
+}
+
+#[test]
+fn test_build_layer_kv_dtypes_from_set_duplicate_indices() {
+    use spark_runtime::kv_cache::KvCacheDtype;
+    // Duplicates are idempotent — layer 2 set twice is still just layer 2.
+    let dtypes =
+        build_layer_kv_dtypes_from_set(KvCacheDtype::Nvfp4, 8, &[2, 2, 2], KvCacheDtype::Bf16);
+    let hp = dtypes.iter().filter(|d| **d == KvCacheDtype::Bf16).count();
+    assert_eq!(hp, 1);
+    assert_eq!(dtypes[2], KvCacheDtype::Bf16);
+}
+
+#[test]
+fn test_cli_parse_kv_high_precision_layer_set() {
+    let cli = Cli::try_parse_from([
+        "spark",
+        "serve",
+        "nvidia/model",
+        "--kv-high-precision-layer-set",
+        "0,5,11",
+    ]);
+    assert!(cli.is_ok());
+    match cli.unwrap().command {
+        Command::Serve(args) => {
+            assert_eq!(args.kv_high_precision_layer_set, "0,5,11");
+        }
+    }
+}
+
+#[test]
+fn test_cli_default_kv_high_precision_layer_set() {
+    let cli = Cli::try_parse_from(["spark", "serve", "nvidia/model"]);
+    assert!(cli.is_ok());
+    match cli.unwrap().command {
+        Command::Serve(args) => {
+            assert_eq!(args.kv_high_precision_layer_set, "");
+        }
+    }
 }
 
 #[test]

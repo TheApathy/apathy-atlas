@@ -385,6 +385,43 @@ pub fn mamba2_ssm_prefill(
         .launch(stream)
 }
 
+/// Tree-aware conv state re-root for DDTree / FREE_SLOTS verify.
+///
+/// Before processing token `t` in a non-flat tree, copies
+/// `conv_inter_base[parent_ids[t] * conv_floats..]` → `conv_state`
+/// when `parent_ids[t] != t - 1`. No-op on the root token (t==0) or
+/// on any linear-chain step (parent == t-1).
+///
+/// This is CUDA-graph-safe: `parent_ids` is a persistent device buffer
+/// whose content is updated before each graph replay; the pointer is
+/// fixed at capture time. `t` is a launch parameter (graph-baked) and
+/// does not change within a replay — each per-token kernel invocation
+/// in the sequential loop has a distinct graph-baked `t`.
+///
+/// Kernel: `causal_conv1d_tree_reroot`
+/// Grid:   (ceil(conv_floats / 256), 1, 1)
+/// Block:  (256, 1, 1)
+pub fn conv1d_tree_reroot(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state: DevicePtr,
+    inter_base: DevicePtr,
+    parent_ids_dev: DevicePtr,
+    t: u32,
+    conv_floats: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(conv_floats, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(conv_state)
+        .arg_ptr(inter_base)
+        .arg_ptr(parent_ids_dev)
+        .arg_u32(t)
+        .arg_u32(conv_floats)
+        .launch(stream)
+}
+
 /// Persistent Mamba-2 SSM prefill: H in shared memory, reduces global traffic.
 /// Same parameters and launch config as mamba2_ssm_prefill.
 #[allow(clippy::too_many_arguments)]

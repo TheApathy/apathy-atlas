@@ -755,6 +755,17 @@ pub trait Model: Send + Sync {
         Ok(None)
     }
 
+    /// ATLAS_DFLASH_FUSED=1: record the propose-ordering event immediately
+    /// after verify returns, before commit kernels are enqueued. This lets the
+    /// drafter's secondary CUDA stream run in parallel with SSM commit + KV
+    /// reshape (~10ms), instead of waiting for them.
+    ///
+    /// Must be called right after `decode_verify_dflash` returns, before any
+    /// commit call. No-op when ATLAS_DFLASH_ASYNC or ATLAS_DFLASH_FUSED unset.
+    fn dflash_arm_propose_overlap(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// ATLAS_DFLASH_RECYCLE=1: stash the discarded draft tail on the DFlash
     /// proposer state so the next propose can re-offer it (lossless).
     ///

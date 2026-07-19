@@ -470,3 +470,40 @@ extern "C" __global__ void causal_conv1d_update_l2norm_f32(
         output[b * dim + ch] = silu;  // FP32 — no truncation!
     }
 }
+
+// ============================================================
+// TREE-AWARE CONV STATE RE-ROOT (M8A / FREE_SLOTS)
+// ============================================================
+// Before processing token t in a non-flat DDTree verify, re-root
+// conv_state from conv_state_intermediates[parent] when parent != t-1.
+//
+// Reads parent_ids[t] at runtime so the kernel is CUDA-graph-safe:
+// the pointer to parent_ids is fixed at graph capture; the content
+// (which parent each token inherits from) is updated by the host
+// before each graph replay, letting the same graph handle any tree
+// topology with the same K and pack_flag.
+//
+// Semantics:
+//   - t==0 or parent_ids[t]==t-1: no-op (root token or linear chain)
+//   - otherwise: memcpy conv_inter_base[parent*n_floats..] → conv_state
+//
+// conv_inter_base = conv_state_intermediates[0] for this sequence slot:
+// the contiguous array of K saved conv windows, stride n_floats floats.
+//
+// Grid:  (ceil(n_floats/256), 1, 1)
+// Block: (256, 1, 1)
+extern "C" __global__ void causal_conv1d_tree_reroot(
+    float* __restrict__ conv_state,           // live conv state (overwritten if needed)
+    const float* __restrict__ inter_base,     // conv_state_intermediates[0] for this slot
+    const int* __restrict__ parent_ids,       // device buffer [K], updated per step
+    unsigned int t,                           // current token (baked into graph)
+    unsigned int n_floats                     // conv_bytes / sizeof(float)
+) {
+    const int parent = parent_ids[t];
+    // Linear chain (parent == t-1) or root (t==0, parent==-1): conv_state already correct.
+    if (t == 0 || parent == (int)t - 1) return;
+    const float* src = inter_base + (long long)parent * n_floats;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_floats; i += gridDim.x * blockDim.x) {
+        conv_state[i] = src[i];
+    }
+}

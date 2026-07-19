@@ -297,8 +297,10 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --model-name aeon-27b-dflash \
   --port 8890 \
   --kernel-target qwen3.6-27b \
-  --gpu-memory-utilization 0.65 \
+  --gpu-memory-utilization ${GPU_MEM_UTIL:-0.65} \
   --kv-cache-dtype "${KV_DTYPE:-fp8}" \
+  --kv-high-precision-layers "${KV_HP_LAYERS:-5}" \
+  --kv-high-precision-layer-set "${KV_HP_SET:-}" \
   --max-seq-len ${MAX_SEQ_LEN:-8192} \
   --max-batch-size ${BATCH:-1} \
   --max-num-seqs ${BATCH:-1} \

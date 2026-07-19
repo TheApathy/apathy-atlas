@@ -171,6 +171,67 @@ pub fn compact_messages(
     result
 }
 
+/// Hard context-overflow safety net (Atlas task #76).
+///
+/// Distinct from [`compact_messages`], which implements the *progressive*
+/// auto-compact that is DISABLED by default (see `template.rs`). This is an
+/// always-on last-resort truncation that fires only when the rendered prompt
+/// would not leave `output_reserve` tokens under `max_seq_len` — the exact
+/// condition that previously either returned HTTP 400 or wedged the scheduler
+/// to the 900 s harness ceiling on deep agentic multi-turn conversations
+/// (Spark-Bench AG-11/AG-12: a long ops briefing + accumulated tool outputs
+/// across turns overflow the context window).
+///
+/// It drops the OLDEST middle messages, always keeping the system message
+/// (index 0) plus the most recent `keep_tail` messages, and guarantees the
+/// retained tail begins on a real user query (not an orphaned `tool` /
+/// `<tool_response>` message) so the Jinja template can't raise
+/// "No user query found". Returns `None` when nothing more can be dropped
+/// (already at system + minimal tail) — the caller then surfaces a fast 4xx.
+///
+/// Gated by `ATLAS_CTX_OVERFLOW_TRUNCATE` (default ON; set to `0` to restore
+/// the strict 400-on-overflow behavior).
+pub fn truncate_to_fit(msgs: &[serde_json::Value], keep_tail: usize) -> Option<Vec<serde_json::Value>> {
+    // Need at least a system message + one droppable middle message + tail.
+    if msgs.len() <= keep_tail.saturating_add(1) {
+        return None;
+    }
+    let mut tail_start = msgs.len().saturating_sub(keep_tail);
+
+    // Walk backward until the tail begins on a genuine user query, so we never
+    // strand a `tool`/assistant reply without its preceding user turn.
+    let has_user_query = |from: usize| {
+        (from..msgs.len()).any(|i| {
+            let role = msgs[i]["role"].as_str().unwrap_or("");
+            let content = msgs[i]["content"].as_str().unwrap_or("");
+            role == "user" && !content.starts_with("<tool_response>")
+        })
+    };
+    if !has_user_query(tail_start) {
+        while tail_start > 1 {
+            tail_start -= 1;
+            let role = msgs[tail_start]["role"].as_str().unwrap_or("");
+            let content = msgs[tail_start]["content"].as_str().unwrap_or("");
+            if role == "user" && !content.starts_with("<tool_response>") {
+                break;
+            }
+        }
+    }
+    // Never start the tail on a bare `tool` message (needs a preceding assistant).
+    while tail_start < msgs.len() && msgs[tail_start]["role"].as_str() == Some("tool") {
+        tail_start += 1;
+    }
+    // If the safety walks pushed us back to "keep everything but system", there's
+    // nothing left to drop — signal the caller to fast-fail instead of looping.
+    if tail_start <= 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(msgs.len() - tail_start + 1);
+    out.push(msgs[0].clone()); // system
+    out.extend_from_slice(&msgs[tail_start..]);
+    Some(out)
+}
+
 pub(super) fn openai_error_response(status: StatusCode, message: String) -> Response {
     openai_error_response_with_param(status, message, None, None)
 }
@@ -200,4 +261,79 @@ pub(super) fn openai_error_response_with_param(
         }
     });
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_to_fit;
+    use serde_json::json;
+
+    fn m(role: &str, content: &str) -> serde_json::Value {
+        json!({"role": role, "content": content})
+    }
+
+    fn roles(v: &[serde_json::Value]) -> Vec<String> {
+        v.iter()
+            .map(|x| x["role"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn keeps_system_plus_tail_and_drops_oldest() {
+        // system + 10 alternating user/assistant turns.
+        let mut msgs = vec![m("system", "you are helpful")];
+        for i in 0..5 {
+            msgs.push(m("user", &format!("q{i}")));
+            msgs.push(m("assistant", &format!("a{i}")));
+        }
+        // 11 msgs, keep_tail=6 → drop 4 middle, keep system + last 6.
+        let out = truncate_to_fit(&msgs, 6).expect("should truncate");
+        assert_eq!(out.len(), 7, "system + 6 tail");
+        assert_eq!(out[0]["role"], "system");
+        // newest content is preserved.
+        assert_eq!(out.last().unwrap()["content"], "a4");
+    }
+
+    #[test]
+    fn none_when_nothing_to_drop() {
+        // Only system + tail already at/below keep_tail+1 → cannot shrink.
+        let msgs = vec![m("system", "s"), m("user", "hi"), m("assistant", "yo")];
+        assert!(truncate_to_fit(&msgs, 6).is_none());
+    }
+
+    #[test]
+    fn tail_never_starts_on_bare_tool_message() {
+        // Deep conversation whose keep_tail window would begin on a `tool` reply.
+        let mut msgs = vec![m("system", "s")];
+        for i in 0..6 {
+            msgs.push(m("user", &format!("q{i}")));
+            msgs.push(m("assistant", &format!("call{i}")));
+            msgs.push(m("tool", &format!("result{i}")));
+        }
+        let out = truncate_to_fit(&msgs, 2).expect("should truncate");
+        assert_eq!(out[0]["role"], "system");
+        // The first non-system retained message must not be an orphaned tool reply.
+        assert_ne!(out[1]["role"], "tool", "tail must not strand a bare tool msg");
+    }
+
+    #[test]
+    fn tail_begins_on_real_user_query() {
+        // Force the safety walk: last messages are assistant/tool only.
+        let msgs = vec![
+            m("system", "s"),
+            m("user", "old question"),
+            m("assistant", "old answer"),
+            m("user", "real question"),
+            m("assistant", "thinking"),
+            m("tool", "<tool_response>data"),
+        ];
+        let out = truncate_to_fit(&msgs, 2).expect("should truncate");
+        // A genuine user query must be present in the retained tail (not just a
+        // <tool_response> placeholder) so Jinja won't raise "No user query found".
+        let has_user = out.iter().skip(1).any(|x| {
+            x["role"] == "user"
+                && !x["content"].as_str().unwrap_or("").starts_with("<tool_response>")
+        });
+        assert!(has_user, "retained tail must contain a real user query; roles={:?}", roles(&out));
+    }
 }
