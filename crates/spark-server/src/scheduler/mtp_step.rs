@@ -40,20 +40,23 @@ pub fn step_mtp(
             a.pending_drafts.clear();
             a.pending_tree_payload = None;
         }
-        // ATLAS_THINK_SPEC=1: the thinking accept filter exists only on
-        // the DFlash K=γ verify path (drafts >= 4, flat chain). Short MTP
-        // chains (K=2/3/4 graphed verifies) and DDTree payloads have no
-        // filter equivalent, so a thinking sequence holding one is
-        // downgraded to the bootstrap decode below — which runs the FULL
-        // plain-path sampler (`bootstrap_thinking_token`). Dropping
-        // drafts is always lossless (they are speculative only).
-        if think.enabled
-            && a.inside_thinking
-            && !a.pending_drafts.is_empty()
-            && (a.pending_drafts.len() < 4 || a.pending_tree_payload.is_some())
-        {
-            a.pending_drafts.clear();
+        // ATLAS_THINK_SPEC=1: the thinking accept filter (dflash_thinking_accept)
+        // works on flat token chains only — it compares drafts[i] vs target[i]
+        // linearly, but DDTree compact slots are BFS siblings, not descendants,
+        // so passing a tree payload through yields at most 1 accepted token (the
+        // depth-0 child) before the walk diverges. That is no better than
+        // bootstrap but costs a k=32 verify.
+        //
+        // Fix: always clear pending_tree_payload when inside thinking so the
+        // flat MTP drafts (pending_drafts, the top-1 linear chain) proceed to
+        // the k=γ flat verify + thinking accept walk. That restores the baseline
+        // ~5–7 tok/step during <think> spans instead of the 1 tok/step bootstrap.
+        // Short draft chains (< 4) still fall back to bootstrap as before.
+        if think.enabled && a.inside_thinking {
             a.pending_tree_payload = None;
+            if a.pending_drafts.len() < 4 {
+                a.pending_drafts.clear();
+            }
         }
     }
 
