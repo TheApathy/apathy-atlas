@@ -220,6 +220,11 @@ pub struct Qwen3SsmLayer {
     /// NULL handle when not in the active target's PTX bundle → dispatch
     /// uses `gdn_wy17_k` (all slots) unchanged. Gated by `ATLAS_WY17_LAZY`.
     gdn_wy17_lazy_k: KernelHandle,
+    /// Combined LAZY + V-DIM SPLIT wy17 (`gated_delta_rule_wy17_lazy_vsplit`):
+    /// fuses both benefits — checkpoint-gated Hi-writes (lazy_j) AND vsplit
+    /// occupancy (96 CTAs on 48 SMs). Preferred over `gdn_wy17_lazy_k` when
+    /// ATLAS_WY17_SPLIT is also set. NULL on targets that predate the kernel.
+    gdn_wy17_lazy_vsplit_k: KernelHandle,
     /// Replay kernel (`gated_delta_rule_wy17_replay`) that reconstructs one
     /// skipped intermediate slot bit-exactly for the commit path under
     /// lazy_j>1. NULL when not compiled. Exposed for async_chkpt wiring.
@@ -232,6 +237,12 @@ pub struct Qwen3SsmLayer {
     /// flat chains, supports arbitrary tree topology via ancestor walk in
     /// WY correction. Preferred over `gdn_tree_k` when present.
     pub(crate) gdn_tree_wy_k: KernelHandle,
+    /// Tree-aware conv state re-root (ATLAS_DDTREE_TREE_CONV_EXACT=1).
+    /// Before processing token t, copies conv_inter[parent[t]] → conv_state
+    /// when parent[t] != t-1 (branch token). Makes the conv1d shift register
+    /// ancestor-exact so FREE_SLOTS branch commits are byte-oracle.
+    /// NULL on targets without causal_conv1d_tree_reroot compiled in.
+    pub(crate) conv1d_tree_reroot_k: KernelHandle,
     // State allocation sizes (pre-computed from config)
     h_state_bytes: usize,
     conv_state_bytes: usize,
@@ -546,11 +557,14 @@ impl TransformerLayer for Qwen3SsmLayer {
             return false;
         }
         let use_vsplit = crate::layers::wy17_split() > 0 && self.gdn_wy17_vsplit_k.0 != 0;
-        crate::layers::wy17_lazy() > 1
-            && self.gdn_wy17_lazy_k.0 != 0
+        let lazy_base = crate::layers::wy17_lazy() > 1
             && self.gdn_wy17_replay_k.0 != 0
-            && crate::layers::wy17_lazy_commit()
-            && !use_vsplit
+            && crate::layers::wy17_lazy_commit();
+        // lazy is engaged when the plain lazy kernel runs (no vsplit) OR when
+        // the combined lazy_vsplit kernel covers both benefits (vsplit active).
+        lazy_base
+            && ((self.gdn_wy17_lazy_k.0 != 0 && !use_vsplit)
+                || (use_vsplit && self.gdn_wy17_lazy_vsplit_k.0 != 0))
     }
 }
 

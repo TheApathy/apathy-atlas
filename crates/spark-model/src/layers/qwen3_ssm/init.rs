@@ -272,6 +272,13 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy17",
                 "gated_delta_rule_wy17_replay",
             ),
+            // Combined LAZY + V-DIM SPLIT wy17: lives in the vsplit PTX module.
+            // NULL when the vsplit module predates this kernel symbol.
+            gdn_wy17_lazy_vsplit_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy17_vsplit",
+                "gated_delta_rule_wy17_lazy_vsplit",
+            ),
             // M8A: tree-aware GDN kernel (gated_delta_rule_tree.cu). Sequential
             // per-token loop with parent_ids state load — enables non-flat
             // DDTree branches. NULL on targets that haven't compiled the
@@ -295,6 +302,11 @@ impl Qwen3SsmLayer {
                 tracing::info!("M8A v2: gdn_tree_wy_k handle = {} (0 = NOT LOADED)", k.0);
                 k
             },
+            conv1d_tree_reroot_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d",
+                "causal_conv1d_tree_reroot",
+            ),
             h_state_bytes: nv * vd * kd * 4, // FP32 [nv, kd, vd] transposed for coalescing
             conv_state_bytes: conv_dim * d_conv * 4, // FP32 [conv_dim, d_conv]
             qkvz_fp8: None,

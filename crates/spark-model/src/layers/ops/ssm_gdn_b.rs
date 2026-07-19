@@ -444,6 +444,60 @@ pub fn gdn_decode_wy17_vsplit(
         .launch(stream)
 }
 
+/// Combined LAZY Hi-writes + V-DIM SPLIT variant of `gdn_decode_wy17`.
+/// Gives both the checkpoint-gated Hi-write bandwidth reduction (lazy_j) AND
+/// the vsplit occupancy benefit (96 CTAs on 48 SMs vs 48). Grid: (num_v_heads,
+/// batch, v_split). Bit-identical outputs to `gdn_decode_wy17`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_wy17_lazy_vsplit(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter_base: DevicePtr,
+    inter_stride_floats: u32,
+    batch_size: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    v_split: u32,
+    lazy_j: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, batch_size, v_split])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter_base)
+        .arg_u32(inter_stride_floats)
+        .arg_u32(batch_size)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gb_stride)
+        .arg_u32(v_split)
+        .arg_u32(lazy_j)
+        .launch(stream)
+}
+
 /// M8A: tree-aware GDN verify with parent_ids state load.
 /// Kernel: `gated_delta_rule_tree` (gated_delta_rule_tree.cu).
 /// Sequential per-token loop; each token reads H from `h_state` (parent=-1)

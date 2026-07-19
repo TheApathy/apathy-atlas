@@ -322,9 +322,35 @@ impl Qwen3SsmLayer {
             // verify_d.rs from a.pending_tree_payload before the layer loop.
             // Each token's state load follows parent_ids[i] instead of i-1,
             // letting the verifier walk non-flat tree branches.
+            //
+            // ATLAS_DDTREE_TREE_CONV_EXACT=1: before each token, re-root
+            // conv_state from conv_state_intermediates[parent[t]] when the
+            // token is a branch (parent != t-1). This makes the conv1d shift
+            // register ancestor-exact so FREE_SLOTS branch commits produce
+            // oracle-correct logits. Requires causal_conv1d_tree_reroot compiled.
+            let tree_conv_exact = self.conv1d_tree_reroot_k.0 != 0
+                && std::env::var("ATLAS_DDTREE_TREE_CONV_EXACT")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+            // Base of this slot's conv intermediates (contiguous: base + t*conv_bytes).
+            let conv_inter_base = ssm_state.conv_state_intermediates[0];
+            let conv_floats = (conv_bytes / 4) as u32;
             for t in 0..(num_tokens as u32) {
                 let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
                 let conv_out_t = conv_out_buf.offset(t as usize * conv_dim * bf16);
+                if tree_conv_exact {
+                    ops::conv1d_tree_reroot(
+                        ctx.gpu,
+                        self.conv1d_tree_reroot_k,
+                        ssm_state.conv_state,
+                        conv_inter_base,
+                        parent_ids_dev,
+                        t,
+                        conv_floats,
+                        stream,
+                    )?;
+                }
                 ops::conv1d_update_l2norm(
                     ctx.gpu,
                     self.conv1d_l2norm_k,
@@ -697,6 +723,32 @@ impl Qwen3SsmLayer {
             let use_lazy = crate::layer::TransformerLayer::wy17_lazy_engaged(self, num_tokens);
             let eff_lazy_j = if use_lazy { wy17_lazy_j } else { 1 };
             let run_wy17 = |gpu: &dyn spark_runtime::gpu::GpuBackend| -> Result<()> {
+                if use_lazy && use_vsplit && self.gdn_wy17_lazy_vsplit_k.0 != 0 {
+                    return ops::gdn_decode_wy17_lazy_vsplit(
+                        gpu,
+                        self.gdn_wy17_lazy_vsplit_k,
+                        ssm_state.h_state,
+                        q_ptr,
+                        k_ptr,
+                        v_ptr,
+                        gate_ptr,
+                        beta_ptr,
+                        gdn_out_buf,
+                        ssm_state.h_state_intermediates[0],
+                        inter_stride_floats,
+                        1, // batch_size
+                        nk as u32,
+                        nv as u32,
+                        kd as u32,
+                        vd as u32,
+                        conv_dim as u32, // qk_stride
+                        conv_dim as u32, // v_stride
+                        (nv * 2) as u32, // gb_stride
+                        wy17_split,
+                        eff_lazy_j,
+                        stream,
+                    );
+                }
                 if use_lazy {
                     return ops::gdn_decode_wy17_lazy(
                         gpu,
