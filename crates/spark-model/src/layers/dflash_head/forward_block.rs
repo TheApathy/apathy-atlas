@@ -1095,19 +1095,27 @@ impl BlockDiffusionDraftHead {
         gamma_eff: usize,
         k: usize,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
-        use crate::layers::ops;
+        self.enqueue_topk_on_stream(gpu, stream, gamma_eff, k)?;
+        gpu.synchronize(stream)?;
+        self.collect_topk_d2h(gpu, gamma_eff, k)
+    }
 
+    /// Enqueue the top-K extraction kernel on `stream` without syncing or D2H.
+    /// Used by the async propose path to defer collection until `collect_topk_d2h`.
+    /// Logits must already be populated at `self.scratch.logits` by `forward_block`.
+    pub(super) fn enqueue_topk_on_stream(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        stream: u64,
+        gamma_eff: usize,
+        k: usize,
+    ) -> Result<()> {
+        use crate::layers::ops;
         let k_used = k.clamp(1, super::DDTREE_TOP_K_MAX);
         let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
-        // Scratch is sized [γ, DDTREE_TOP_K_MAX] but we only fill γ_eff × k
-        // rows. Zero just the rows we'll read so a partial write leaves no
-        // stale data from a prior step.
         let used_bytes = gamma_eff * k_used * 4;
         gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
         gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
-
-        // Logits already populated by forward_block at self.scratch.logits
-        // (shape [γ_eff, lm_vocab] BF16, row-major, contiguous).
         ops::topk_bf16(
             gpu,
             self.kernels.topk,
@@ -1118,15 +1126,24 @@ impl BlockDiffusionDraftHead {
             lm_vocab,
             k_used as u32,
             stream,
-        )?;
+        )
+    }
 
-        gpu.synchronize(stream)?;
-
+    /// D2H the top-K results from `scratch.topk_tokens_dev`/`topk_logits_dev`.
+    /// The stream holding the kernel must already be synced by the caller
+    /// (e.g. via `collect_async_drafts_impl`'s stream sync).
+    pub(super) fn collect_topk_d2h(
+        &self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        gamma_eff: usize,
+        k: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let k_used = k.clamp(1, super::DDTREE_TOP_K_MAX);
+        let used_bytes = gamma_eff * k_used * 4;
         let mut tokens_bytes = vec![0u8; used_bytes];
         let mut logits_bytes = vec![0u8; used_bytes];
         gpu.copy_d2h(self.scratch.topk_tokens_dev, &mut tokens_bytes)?;
         gpu.copy_d2h(self.scratch.topk_logits_dev, &mut logits_bytes)?;
-
         let tokens: Vec<u32> = tokens_bytes
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))

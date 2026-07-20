@@ -1384,6 +1384,27 @@ fn relax_row_accepts(bytes: &[u8], vocab: usize, tok: u32, topk: usize, ln_ratio
     false
 }
 
+/// Argmax over a host-copied BF16 logits row, skipping a set of token indices.
+/// Returns `None` only if `vocab == 0` or all tokens are in the skip set.
+/// Used by the DDTree bonus source fix to exclude `<think>`, `</think>`, and
+/// EOS tokens when think_ended=true so the re-derived bonus is always a valid
+/// content token.
+fn argmax_bf16_skip_tokens(bytes: &[u8], skip_toks: &[u32], vocab: usize) -> Option<u32> {
+    let mut best_tok: Option<u32> = None;
+    let mut best_val = i16::MIN;
+    for tok in 0..vocab {
+        if skip_toks.contains(&(tok as u32)) {
+            continue;
+        }
+        let signed = u16::from_le_bytes([bytes[2 * tok], bytes[2 * tok + 1]]) as i16;
+        if best_tok.is_none() || signed > best_val {
+            best_val = signed;
+            best_tok = Some(tok as u32);
+        }
+    }
+    best_tok
+}
+
 /// Masked argmax over one host-copied BF16 logits row. `None` when the
 /// bitmask allows zero tokens. Same BF16-as-i16 ordering trick as the MTP
 /// masked path (`mtp_head/forward.rs`) — valid for all finite values.

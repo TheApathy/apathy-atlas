@@ -114,13 +114,12 @@ impl AsyncEnvEligibility {
                 .unwrap_or(0.0)
                 > 0.0,
             adaptive_gamma: flag("ATLAS_DFLASH_ADAPTIVE_GAMMA"),
-            tree_method: flag("ATLAS_DFLASH_BRANCH")
-                || flag("ATLAS_DFLASH_CATERPILLAR")
-                || std::env::var("ATLAS_DFLASH_METHOD").ok().as_deref() == Some("ddtree")
-                || std::env::var("ATLAS_DFLASH_FREE_SLOTS")
-                    .ok()
-                    .and_then(|s| s.trim().parse::<usize>().ok())
-                    .is_some_and(|n| n >= 1),
+            // ATLAS_DFLASH_BRANCH and CATERPILLAR post-process drafts on the
+            // host after forward_block (cliff extraction + sibling splice)
+            // without async support. FREE_SLOTS and the legacy "ddtree" method
+            // use the deferred top-K path (enqueue_topk_on_stream + collect)
+            // and are eligible for async — they are NOT listed here.
+            tree_method: flag("ATLAS_DFLASH_BRANCH") || flag("ATLAS_DFLASH_CATERPILLAR"),
             portfolio: flag("ATLAS_DFLASH_PORTFOLIO"),
             cfg_jf: flag("ATLAS_DFLASH_CFG_JF"),
             kprofile: flag("ATLAS_DFLASH_KERNEL_PROFILE"),
@@ -175,9 +174,27 @@ pub fn placeholder_drafts(gamma_eff: usize, mask_id: u32) -> Vec<u32> {
     vec![mask_id; gamma_eff]
 }
 
+/// Metadata for ATLAS_DFLASH_FREE_SLOTS async tree building.
+/// Stored in `AsyncInflight.ddtree` when FREE_SLOTS >= 1 was active at
+/// launch. At collect time, the scheduler D2Hs the top-K results (already
+/// computed on the propose stream) and builds the tree payload on the CPU.
+#[derive(Debug, Clone)]
+pub struct AsyncDDTreeMeta {
+    /// k used in `enqueue_topk_on_stream` (always 2 for FREE_SLOTS).
+    pub top_k: usize,
+    /// Number of sibling branches to place (= ATLAS_DFLASH_FREE_SLOTS).
+    pub free_slots: usize,
+    /// Top1−Top2 margin threshold for cliff detection (ATLAS_DFLASH_BRANCH_MARGIN).
+    pub margin_thresh: f32,
+    /// Post-cliff continuation tail length (ATLAS_DFLASH_FREE_SLOTS_TAIL).
+    pub tail_len: usize,
+    /// max_nodes cap for `build_free_slots_payload` (from ATLAS_DDTREE_MAX_NODES).
+    pub max_nodes: usize,
+}
+
 /// One in-flight async propose (at most one — the head has a single scratch
 /// buffer set).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AsyncInflight {
     /// Identity of the owning `DflashProposerState` (stable Box address for
     /// the sequence's lifetime). Matched at collect so a different sequence
@@ -187,6 +204,9 @@ pub struct AsyncInflight {
     pub gamma_eff: usize,
     /// Stream the drafter kernels were enqueued on.
     pub stream: u64,
+    /// When Some, a top-K GPU kernel was also enqueued on `stream` and the
+    /// collect phase should D2H the results and build a tree payload.
+    pub ddtree: Option<AsyncDDTreeMeta>,
 }
 
 /// Stable identity for a proposer state (Box contents don't move).
@@ -366,15 +386,37 @@ impl BlockDiffusionDraftHead {
             return Err(e);
         }
 
+        // ATLAS_DFLASH_FREE_SLOTS async DDTree path: enqueue top-K kernel on
+        // pstream so collect_async_drafts_impl can D2H and build the tree
+        // payload without a synchronous stream-sync+D2H during propose.
+        // The forward_block logits (scratch.logits) are already enqueued on
+        // pstream before this point, so ordering is guaranteed.
+        let ddtree_meta = build_async_ddtree_meta(gamma_eff).and_then(|meta| {
+            match self.enqueue_topk_on_stream(gpu, pstream, gamma_eff, meta.top_k) {
+                Ok(()) => Some(meta),
+                Err(e) => {
+                    tracing::warn!("DFLASH_ASYNC: top-K enqueue failed ({e:#}); no tree payload");
+                    None
+                }
+            }
+        });
+
         *self.async_inflight.lock() = Some(AsyncInflight {
             owner: dstate_id(dstate),
             gamma_eff,
             stream: pstream,
+            ddtree: ddtree_meta,
         });
         dstate.async_placeholder = true;
         dstate.last_num_drafted = gamma_eff;
         dstate.first_propose_done = true;
         dstate.pending_tree_payload = None;
+        // cleared above; see mtp_step.rs drain after collect The collect
+        // phase (collect_async_drafts_impl) may have set it from the previous
+        // step's top-K results; take_pending_tree_payload will drain it into
+        // a.pending_tree_payload after the propose returns. Clearing it here
+        // destroys the payload before it can be consumed (the bug that caused
+        // ASYNC+DDTree to never fire tree verify steps).
         ASYNC_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log_telemetry();
         Ok(Some(placeholder_drafts(gamma_eff, self.mask_token_id)))
@@ -416,6 +458,7 @@ impl BlockDiffusionDraftHead {
         let inflight = guard.take().expect("checked above");
         drop(guard);
 
+        // Single stream sync covers both forward_block and (if present) top-K.
         gpu.synchronize(inflight.stream)?;
         let mut host_buf = vec![0u8; inflight.gamma_eff * 4];
         gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf)?;
@@ -423,10 +466,101 @@ impl BlockDiffusionDraftHead {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+
+        // ATLAS_DFLASH_FREE_SLOTS: D2H the top-K and build the tree payload.
+        // The stream is already synced above, so `collect_topk_d2h` reads
+        // the completed GPU output without an additional sync.
+        if let Some(ref meta) = inflight.ddtree {
+            if drafts.len() >= 3 {
+                match self.collect_topk_d2h(gpu, inflight.gamma_eff, meta.top_k) {
+                    Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * drafts.len() => {
+                        let n = drafts.len();
+                        let margins: Vec<f32> = (0..n)
+                            .map(|r| topk_logits[2 * r] - topk_logits[2 * r + 1])
+                            .collect();
+                        let cliffs = super::ddtree::pick_free_slot_cliffs(
+                            &margins,
+                            meta.margin_thresh,
+                            meta.free_slots,
+                        );
+                        if !cliffs.is_empty() {
+                            let cliff_margins: Vec<f32> =
+                                cliffs.iter().map(|&d| margins[d - 1]).collect();
+                            tracing::debug!(
+                                "DFLASH_ASYNC collect: cliffs={:?} margins={:?} thresh={:.2}",
+                                cliffs,
+                                cliff_margins,
+                                meta.margin_thresh,
+                            );
+                        }
+                        let branches: Vec<super::ddtree::FreeSlotBranch> = cliffs
+                            .iter()
+                            .filter_map(|&cliff_depth| {
+                                let row = cliff_depth - 1;
+                                let fork_token = topk_tokens[2 * row + 1];
+                                if fork_token == drafts[row] {
+                                    return None;
+                                }
+                                let tail: Vec<u32> = drafts[(row + 1).min(n)..]
+                                    .iter()
+                                    .take(meta.tail_len)
+                                    .copied()
+                                    .collect();
+                                Some(super::ddtree::FreeSlotBranch { cliff_depth, fork_token, tail })
+                            })
+                            .collect();
+                        if !branches.is_empty() {
+                            dstate.pending_tree_payload = Some(
+                                super::ddtree::build_free_slots_payload(
+                                    &drafts,
+                                    &branches,
+                                    meta.max_nodes,
+                                ),
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("DFLASH_ASYNC: top-K D2H failed ({e:#}); no tree payload");
+                    }
+                }
+            }
+        }
+
         dstate.async_placeholder = false;
         ASYNC_COLLECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(drafts))
     }
+}
+
+/// Build `AsyncDDTreeMeta` from env vars when ATLAS_DFLASH_FREE_SLOTS >= 1.
+/// Returns `None` when FREE_SLOTS is 0 or unset (no tree payload needed).
+fn build_async_ddtree_meta(gamma_eff: usize) -> Option<AsyncDDTreeMeta> {
+    let free_slots: usize = std::env::var("ATLAS_DFLASH_FREE_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if free_slots == 0 {
+        return None;
+    }
+    let ddtree_verify_cap: usize = std::env::var("ATLAS_DDTREE_MAX_NODES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let max_nodes = ddtree_verify_cap.saturating_sub(1).max(gamma_eff);
+    Some(AsyncDDTreeMeta {
+        top_k: 2,
+        free_slots,
+        margin_thresh: std::env::var("ATLAS_DFLASH_BRANCH_MARGIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2.0),
+        tail_len: std::env::var("ATLAS_DFLASH_FREE_SLOTS_TAIL")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(4),
+        max_nodes,
+    })
 }
 
 #[cfg(test)]
