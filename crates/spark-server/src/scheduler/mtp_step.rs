@@ -27,7 +27,22 @@ pub fn step_mtp(
         // ever propose). No-op `None` on the sync path / flag off.
         if !a.pending_drafts.is_empty() {
             match model.dflash_collect_async_drafts(&mut a.seq) {
-                Ok(Some(drafts)) => a.pending_drafts = drafts,
+                Ok(Some(drafts)) => {
+                    a.pending_drafts = drafts;
+                    // ASYNC+DDTree: collect_async_drafts_impl may have built a
+                    // tree payload from the previous step's top-K kernel. Drain
+                    // it NOW so this step's verify (which checks a.pending_tree_payload
+                    // inside step_verify_dflash) can use the tree. The normal
+                    // sync-path drain at the end of step_verify_dflash
+                    // (take_pending_tree_payload, line 883) runs AFTER
+                    // run_mtp_propose_multi, which on the async path clears
+                    // dstate.pending_tree_payload — so line 883 returns None and
+                    // does not overwrite the tree we set here.
+                    let tree = model.take_pending_tree_payload(&mut a.seq);
+                    if tree.is_some() {
+                        a.pending_tree_payload = tree;
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => {
                     tracing::error!("dflash_collect_async_drafts: {e:#}");
@@ -47,12 +62,13 @@ pub fn step_mtp(
         // depth-0 child) before the walk diverges. That is no better than
         // bootstrap but costs a k=32 verify.
         //
-        // While inside thinking, clear both drafts and the tree payload so the
-        // sequence falls through to bootstrap (single-token decode). The
-        // bootstrap_thinking_token path correctly handles budget accounting and
-        // per-token side effects (EOS suppression, </think> fence).
+        // When inside thinking with a tree payload, drop the tree metadata but
+        // KEEP the flat-chain pending_drafts (the top-1 drafter spine). The
+        // sequence then falls through to the flat k=17 verify → dflash_thinking_accept,
+        // which correctly handles budget accounting, EOS suppression, and the
+        // </think> fence. Previously both were cleared → bootstrap (1 tok/step),
+        // which caused the Arm C code_long slow-run regression.
         if think.enabled && a.inside_thinking && a.pending_tree_payload.is_some() {
-            a.pending_drafts.clear();
             a.pending_tree_payload = None;
         }
     }

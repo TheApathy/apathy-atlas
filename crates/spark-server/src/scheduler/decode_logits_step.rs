@@ -152,21 +152,37 @@ pub fn process_decode_logits(
         // each successive re-entry has a tighter window. After 4+
         // fires, the budget is 1/16 of normal — the watchdog kills
         // re-entry within a handful of tokens.
+        // DDTree guard: bonus tokens bypass the sample-time logit mask that
+        // blocks <think> when think_ended=true. If think_ended=true and <think>
+        // arrives, the token is already in the KV cache (committed by verify),
+        // so we must enter thinking mode but force an immediate exit: next token
+        // is forced to </think> (0 thinking content tokens, 1 </think> overhead).
         if !a.inside_thinking && think_start_token == Some(tok) {
-            let decay_shift = a.think_watchdog_fires.min(4);
-            let decayed = a.spontaneous_think_budget >> decay_shift;
-            a.inside_thinking = true;
-            a.think_ended = false; // reset so </think> detection path works
-            a.think_skip_count = 0;
-            a.thinking_budget = Some(decayed.max(8)); // floor to keep watchdog functional
-            if a.think_watchdog_fires > 0 {
-                tracing::debug!(
-                    fires = a.think_watchdog_fires,
-                    decayed_budget = decayed,
-                    "Spontaneous <think> re-entry after watchdog; decayed budget"
-                );
+            if !a.think_ended {
+                let decay_shift = a.think_watchdog_fires.min(4);
+                let decayed = a.spontaneous_think_budget >> decay_shift;
+                a.inside_thinking = true;
+                a.think_ended = false; // reset so </think> detection path works
+                a.think_skip_count = 0;
+                a.thinking_budget = Some(decayed.max(8)); // floor to keep watchdog functional
+                if a.think_watchdog_fires > 0 {
+                    tracing::debug!(
+                        fires = a.think_watchdog_fires,
+                        decayed_budget = decayed,
+                        "Spontaneous <think> re-entry after watchdog; decayed budget"
+                    );
+                } else {
+                    tracing::debug!("Spontaneous <think> detected, entering thinking mode");
+                }
             } else {
-                tracing::debug!("Spontaneous <think> detected, entering thinking mode");
+                // DDTree cliff-path <think> (think_ended=true): force-exit.
+                a.inside_thinking = true;
+                a.think_skip_count = 0;
+                a.thinking_budget = Some(0);
+                a.force_end_thinking = true;
+                tracing::debug!(
+                    "DDTree <think> (think_ended=true): force-exit thinking (0 content tokens)"
+                );
             }
             continue; // don't emit <think> as content
         }
