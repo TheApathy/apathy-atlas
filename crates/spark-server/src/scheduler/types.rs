@@ -145,6 +145,10 @@ pub(super) struct ActiveSeq {
     pub think_just_ended: bool,
     /// Consecutive `</think>` tokens skipped outside thinking. Safety limit: 50.
     pub think_skip_count: u32,
+    /// Post-think DDTree gate: after a force-exit (think_ended+think bonus), suppress
+    /// DDTree for this many steps. Prevents the thinking-attractor cascade where the
+    /// target immediately re-selects <think> as verified[0] on the step after </think>.
+    pub post_think_gate_steps: u8,
     /// Token ID for `</tool_call>` — acts as a stop token for one-call-per-response.
     pub tool_call_end_token: Option<u32>,
     /// When true AND grammar_state is None, EOS tokens are suppressed until
@@ -260,6 +264,7 @@ pub(super) struct SwappedSeq {
     pub think_ended: bool,
     pub think_just_ended: bool,
     pub think_skip_count: u32,
+    pub post_think_gate_steps: u8,
     pub require_tool_call: bool,
     pub suppress_tool_call: bool,
     /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
