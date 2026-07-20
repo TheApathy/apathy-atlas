@@ -79,12 +79,16 @@ impl RetrievalConfig {
         }
         let l_max: usize = env_usize("ATLAS_RETRIEVAL_LMAX", 16).clamp(2, 64);
         let l_min: usize = env_usize("ATLAS_RETRIEVAL_LMIN", 4).clamp(1, l_max);
-        // Default hybrid threshold. In legacy mode it defaults to `l_max`
-        // (only the strongest tried length pre-empts). In SAM mode the
-        // longest matcher can return ANY length, so the meaningful knob is
-        // the minimum match length that pre-empts the drafter — default it
-        // to `l_min` (the sweepable `ATLAS_RETRIEVAL_HYBRID_MIN` overrides).
-        let hybrid_default = if sam { l_min } else { l_max };
+        // Default hybrid threshold: always l_max (strongest match ⇒ pre-empt).
+        // SAM can find matches at ANY length ≥ l_min, so an aggressive low
+        // threshold causes false fires on short (4-token) matches that then
+        // propose RETR_WIDE=31 tokens with near-zero accuracy, pre-empting the
+        // neural DDTree drafter at a severe cost. Defaulting to l_max=16 keeps
+        // SAM safe: it only pre-empts when it found a 16-token exact suffix,
+        // which is strong enough evidence to justify proposing 16-31 tokens.
+        // For tasks where aggressive SAM helps, set ATLAS_RETRIEVAL_HYBRID_MIN
+        // explicitly to a lower value.
+        let hybrid_default = l_max;
         let hybrid_min: usize = env_usize("ATLAS_RETRIEVAL_HYBRID_MIN", hybrid_default).max(1);
         Some(Self {
             l_max,
