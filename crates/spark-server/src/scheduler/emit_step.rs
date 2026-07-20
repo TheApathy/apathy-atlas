@@ -83,12 +83,35 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // Spontaneous <think>: model generates <think> even when thinking was not
     // requested. Enter thinking mode so EOS is suppressed and thinking content
     // is stripped. This handles MTP bootstrap/verify paths.
+    //
+    // Spontaneous <think>: model generates <think> even when thinking was not
+    // requested. Enter thinking mode so EOS is suppressed and thinking content
+    // is stripped. This handles MTP bootstrap/verify paths.
+    //
+    // DDTree guard: bonus tokens bypass the sample-time logit mask that normally
+    // blocks <think> when think_ended=true. When think_ended=true and <think>
+    // arrives here, we must still enter thinking mode (the token is already
+    // committed to the KV cache by the verify pass) but force an immediate exit
+    // via force_end_thinking. The very next token becomes </think> (0 thinking
+    // content tokens, 1 </think> overhead), and coding output continues cleanly.
     if !a.inside_thinking && a.think_start_token == Some(tok) {
-        a.inside_thinking = true;
-        a.think_ended = false;
-        a.think_skip_count = 0;
-        a.thinking_budget = Some(a.spontaneous_think_budget);
-        tracing::debug!("Spontaneous <think> detected in emit_token, entering thinking mode");
+        if !a.think_ended {
+            a.inside_thinking = true;
+            a.think_ended = false;
+            a.think_skip_count = 0;
+            a.thinking_budget = Some(a.spontaneous_think_budget);
+            tracing::debug!("Spontaneous <think> detected in emit_token, entering thinking mode");
+        } else {
+            // DDTree cliff-path <think> bonus with think_ended=true: force-exit.
+            a.inside_thinking = true;
+            a.think_skip_count = 0;
+            a.thinking_budget = Some(0);
+            a.force_end_thinking = true;
+            a.post_think_gate_steps = 0;
+            tracing::debug!(
+                "DDTree <think> bonus (think_ended=true): force-exit thinking (0 content tokens), gate=2"
+            );
+        }
         return; // don't emit <think> as content
     }
 

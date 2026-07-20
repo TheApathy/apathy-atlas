@@ -170,6 +170,7 @@ fn build_active_seq_from_prefill(
         },
         think_just_ended: false,
         think_skip_count: 0,
+        post_think_gate_steps: 0,
         require_tool_call: use_legacy_tool_call,
         tool_call_start_token,
         tool_call_opened: false,

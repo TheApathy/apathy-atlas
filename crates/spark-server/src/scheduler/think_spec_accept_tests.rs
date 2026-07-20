@@ -88,6 +88,7 @@ fn think_seq() -> ActiveSeq {
         think_ended: false,
         think_just_ended: false,
         think_skip_count: 0,
+        post_think_gate_steps: 0,
         tool_call_end_token: Some(TC_END),
         require_tool_call: false,
         tool_call_start_token: Some(TC_START),
