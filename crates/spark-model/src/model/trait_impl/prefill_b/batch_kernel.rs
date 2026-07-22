@@ -41,13 +41,19 @@ mod eligible;
 // Re-exports so `batch_kernel::check_kernel_batched_eligible` (used by
 // `batch_kernel_tests.rs`) and the env-flag predicates resolve unchanged
 // after the eligibility cluster moved into the `eligible` submodule.
-use eligible::first_chunk_batched_enabled;
-pub(in crate::model) use eligible::{check_kernel_batched_eligible, varlen_prefill_enabled};
+pub(in crate::model) use eligible::{
+    cache_batch_matches_compatible, check_kernel_batched_eligible, varlen_prefill_enabled,
+};
 
 use crate::layer::{
     BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, TransformerLayer,
 };
 use crate::traits::{Model, PrefillSlice, SequenceState};
+
+pub(in crate::model) enum KernelBatchResult {
+    Completed(Vec<DevicePtr>),
+    NotAdmitted,
+}
 
 impl TransformerModel {
     /// Q12 Path B: full kernel-batched prefill orchestration.
@@ -60,7 +66,7 @@ impl TransformerModel {
         &self,
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
-    ) -> Result<Vec<DevicePtr>> {
+    ) -> Result<KernelBatchResult> {
         let n = streams.len();
         let chunk_len = streams[0].chunk_len;
         let is_last_chunk = streams[0].is_last_chunk;
@@ -97,6 +103,16 @@ impl TransformerModel {
         // Lock KV cache once.
         let mut kv_cache = self.kv_cache.lock();
 
+        // Cache admission happens while every sequence is pristine. A rejected
+        // plan has released its exact radix references and may safely take the
+        // established per-stream path. Once admitted, Phase A consumes these
+        // reservations instead of walking the cache again.
+        let reserved_prefix_matches =
+            match self.prefill_b_reserve_batched_prefix_matches(streams, kv_cache.block_size()) {
+                Some(matches) => matches,
+                None => return Ok(KernelBatchResult::NotAdmitted),
+            };
+
         // Zero shared buffers once (instead of N times in per-stream).
         if self.comm.is_some() {
             self.buffers.zero_all(self.gpu.as_ref(), stream)?;
@@ -129,7 +145,8 @@ impl TransformerModel {
             proc_off: usize,
         }
         let mut per_stream: Vec<PerStreamMeta> = Vec::with_capacity(n);
-        let force_paged_first_chunk = streams[0].chunk_start == 0 && first_chunk_batched_enabled();
+        let force_paged_first_chunk = streams[0].chunk_start == 0
+            && crate::layers::ops::prefill_batched_first_chunk_enabled();
 
         // Tracks MRoPE / paged-flag agreement across streams.
         let mut use_mrope: Option<bool> = None;
@@ -143,7 +160,16 @@ impl TransformerModel {
         // Cumulative scratch offset cursor — starts after MoE topk
         // staging area (per single-stream upload_meta convention). Sized by the
         // largest per-stream chunk so a long VARLEN stream's topk staging fits.
-        let moe_scratch_bytes = max_chunk_len * self.config.num_experts_per_tok * 4 * 2 * n;
+        // VARLEN packs routed-MoE metadata by `cu_seqlens`, just like hidden
+        // states and BatchedAttnMetadata. Charging every stream at the longest
+        // request length both disagrees with the admission SSOT and can push
+        // the first per-stream metadata upload past scratch capacity.
+        let moe_scratch_tokens = if varlen {
+            streams.iter().map(|slice| slice.chunk_len).sum()
+        } else {
+            max_chunk_len * n
+        };
+        let moe_scratch_bytes = moe_scratch_tokens * self.config.num_experts_per_tok * 4 * 2;
         let mut scratch_cursor = (moe_scratch_bytes + 63) & !63;
 
         for (b, slice) in streams.iter_mut().enumerate() {
@@ -166,7 +192,13 @@ impl TransformerModel {
             let hidden_b = hidden_base.offset(proc_off_b * h * dtype_bytes);
             self.prefill_b_embed_chunk_at(tokens, chunk_start, cl, hidden_b, stream)?;
 
-            // Prefix-cache lookup, EP-sync, Marconi restore.
+            // Prefix-cache lookup, EP-sync, Marconi restore. Cache-admitted
+            // batches consume their preflight reservation exactly once.
+            let reserved_match = if self.prefix_cache.is_active() && chunk_start == 0 {
+                Some(reserved_prefix_matches[b].clone())
+            } else {
+                None
+            };
             let (kv_write_start, marconi_skip) = self.prefill_b_prefix_lookup(
                 tokens,
                 seq,
@@ -174,6 +206,7 @@ impl TransformerModel {
                 total,
                 &mut kv_cache,
                 stream,
+                reserved_match,
             )?;
 
             // Block allocation through end of chunk.
@@ -489,7 +522,7 @@ impl TransformerModel {
             logits_out.push(logits);
         }
 
-        Ok(logits_out)
+        Ok(KernelBatchResult::Completed(logits_out))
     }
 }
 

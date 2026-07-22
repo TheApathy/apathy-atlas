@@ -3,7 +3,7 @@ name = "laguna-s-2.1"
 hf_id = "poolside/Laguna-S-2.1-NVFP4"
 model_type = "laguna"
 architecture = "Hybrid Full/Sliding Attention + Dense/MoE"
-parameters = "100B"
+parameters = "117.6B-A8.5B"
 
 layers_total = 48
 layers_sliding_attention = 36
@@ -32,32 +32,32 @@ vision = false
 mtp_layers = 0
 
 [sampling.thinking_text]
-temperature = 1.0
-top_p = 1.0
+temperature = 0.7
+top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
 
 [sampling.thinking_coding]
-temperature = 1.0
-top_p = 1.0
+temperature = 0.7
+top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
 
 [sampling.non_thinking]
-temperature = 1.0
-top_p = 1.0
+temperature = 0.7
+top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 repetition_penalty = 1.0
 dry_multiplier = 0.0
 
 [sampling.tools]
-temperature = 1.0
-top_p = 1.0
+temperature = 0.7
+top_p = 0.95
 top_k = 20
 presence_penalty = 0.0
 frequency_penalty = 0.0
@@ -67,9 +67,17 @@ dry_multiplier = 0.0
 [behavior]
 thinking_in_tools = true
 max_thinking_budget = 8192
+# Poolside recommends thinking for agentic coding and preserving it between
+# tool calls. Clients can still opt out per request with enable_thinking=false.
 thinking_default = true
 default_kv_dtype = "fp8"
 tool_call_parser = "poolside_v1"
+# The model card recommends 0.7 / 0.95 for quality and reliability, while the
+# generic generation_config.json retains 1.0 / 1.0 evaluation defaults.
+use_sampling_presets_for_core = true
+# OpenCode already supplies its cwd in the native system prompt. Reinjecting a
+# second Atlas-specific environment block made Laguna fixate on path discovery.
+disable_cwd_hint_injection = true
 
 [[model_types]]
 model_type = "laguna"

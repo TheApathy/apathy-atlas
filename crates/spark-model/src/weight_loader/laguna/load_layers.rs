@@ -34,6 +34,19 @@ pub(super) fn load_layers(
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
     let stream = gpu.default_stream();
     let yarn_inv_freq = compute_yarn_inv_freq(config, gpu)?;
+    // Sliding layers: theta=10000 over the full head_dim, no YaRN ramp.
+    let sliding_inv_freq = if sliding_rope_table_enabled() {
+        compute_plain_inv_freq(10_000.0, config.head_dim, gpu)?
+    } else {
+        DevicePtr::NULL
+    };
+    let unified_moe_layout =
+        unified_moe_layout_enabled(std::env::var("ATLAS_UNIFIED_MOE_LAYOUT").ok().as_deref());
+    if unified_moe_layout {
+        tracing::info!(
+            "Laguna: using unified transposed MoE layout; prefill uses fused K64 kernels and decode uses transposed experts"
+        );
+    }
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
 
     for i in 0..config.num_hidden_layers {
@@ -43,7 +56,16 @@ pub(super) fn load_layers(
         let ffn = if config.mlp_only_layers.contains(&i) {
             load_dense_ffn(store, gpu, &lp)?
         } else {
-            load_moe_ffn(store, config, gpu, &lp, absmax_k, quantize_k, stream)?
+            load_moe_ffn(
+                store,
+                config,
+                gpu,
+                &lp,
+                absmax_k,
+                quantize_k,
+                stream,
+                unified_moe_layout,
+            )?
         };
         let layer = load_attention(
             store,
@@ -55,6 +77,7 @@ pub(super) fn load_layers(
             ffn,
             layer_kv_dtypes[i],
             yarn_inv_freq,
+            sliding_inv_freq,
             i,
         )?;
         layers.push(Box::new(layer));
@@ -92,6 +115,7 @@ fn load_moe_ffn(
     absmax_k: spark_runtime::gpu::KernelHandle,
     quantize_k: spark_runtime::gpu::KernelHandle,
     stream: u64,
+    unified_moe_layout: bool,
 ) -> Result<FfnComponent> {
     let mlp = format!("{lp}.mlp");
     let gate = dense(store, &format!("{mlp}.gate.weight"))?;
@@ -132,8 +156,28 @@ fn load_moe_ffn(
         correction_bias: Some(correction_bias),
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
-    layer.predequant_for_prefill(gpu, config, stream)?;
+    // The checkpoint explicitly excludes the shared expert from NVFP4
+    // compression. Keep its BF16 weights authoritative for both prefill and
+    // decode; the quantized copies above are placeholders for fused routed
+    // kernels and their shared contribution is overwritten before blending.
+    layer.set_bf16_shared_expert(shared_gate, shared_up, shared_down)?;
+    if unified_moe_layout {
+        layer.transpose_for_prefill_unified(gpu, config)?;
+    }
+    // Native NVFP4 CUTLASS grouped MoE (ATLAS_HOLO_MOE_GROUPED_CUTLASS=1).
+    // The routed grouped GEMMs are ~47% of Laguna's C=1 prefill GPU time and
+    // otherwise run on the w4a16 kernels, which LUT-dequant NVFP4 to FP8 per
+    // tile. The SFB swizzle is built from whichever scale tables exist —
+    // transposed [K/16,N] under the unified layout, else the checkpoint's own
+    // [N,K/16] via the src_n_major packer path.
+    if cutlass_grouped_moe_enabled() {
+        layer.build_cutlass_grouped_sfb(gpu, config, gpu.default_stream())?;
+    }
     Ok(FfnComponent::Moe(layer))
+}
+
+fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -147,6 +191,7 @@ fn load_attention(
     ffn: FfnComponent,
     kv_dtype: KvCacheDtype,
     yarn_inv_freq: DevicePtr,
+    sliding_inv_freq: DevicePtr,
     i: usize,
 ) -> Result<Qwen3AttentionLayer> {
     let p = format!("{lp}.self_attn");
@@ -212,6 +257,10 @@ fn load_attention(
         LayerType::SlidingAttention => {
             layer.set_sliding_window(Some(config.sliding_window));
             layer.set_rope_overrides(10_000.0, config.head_dim as u32);
+            if !sliding_inv_freq.is_null() {
+                // attention_factor = 1.0 => cos/sin unscaled, i.e. plain RoPE.
+                layer.set_yarn_rope(sliding_inv_freq, 1.0);
+            }
         }
         LayerType::FullAttention => {
             layer.set_sliding_window(None);
@@ -294,4 +343,61 @@ fn compute_yarn_inv_freq(config: &ModelConfig, gpu: &dyn GpuBackend) -> Result<D
         .context("allocate laguna YaRN table")?;
     gpu.copy_h2d(&bytes, ptr)?;
     Ok(ptr)
+}
+
+/// Precomputed plain RoPE inv_freq table for the sliding-attention layers.
+///
+/// Those layers use theta=10000 over the full head_dim with no YaRN ramp, and
+/// the default rope kernel recomputes `1/theta^(2j/dim)` on the GPU with an
+/// FP64 `pow` per pair index per block (kernels/gb10/common/rope.cu). For
+/// Laguna's sliding layers rotary_dim == head_dim == 128, so a block covers
+/// only 2 positions and pays 64 doubles to produce them — measured at 6.3% of
+/// C=1 prefill GPU time. The table-based `rope_yarn_scaled` kernel is already
+/// wired for this model (it serves the full-attention YaRN layers); feeding it
+/// a plain table with attention_factor = 1.0 is the same math without the
+/// per-block transcendentals.
+///
+/// Computed in f64 and narrowed once, so the stored values are at least as
+/// accurate as the kernel's own FP64 `pow` followed by an f32 store.
+/// Build the CUTLASS grouped-NVFP4 SFB tables at load
+/// (`ATLAS_HOLO_MOE_GROUPED_CUTLASS=1`). Costs ~7.1 GB of device memory for
+/// Laguna (256 experts x 47 layers x 3 projections), so it is opt-in.
+fn cutlass_grouped_moe_enabled() -> bool {
+    matches!(
+        std::env::var("ATLAS_HOLO_MOE_GROUPED_CUTLASS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn compute_plain_inv_freq(theta: f64, dim: usize, gpu: &dyn GpuBackend) -> Result<DevicePtr> {
+    let bytes = (0..dim / 2)
+        .map(|j| (1.0f64 / theta.powf((2 * j) as f64 / dim as f64)) as f32)
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<_>>();
+    let ptr = gpu
+        .alloc(bytes.len())
+        .context("allocate laguna sliding-layer RoPE table")?;
+    gpu.copy_h2d(&bytes, ptr)?;
+    Ok(ptr)
+}
+
+/// Opt out of the precomputed sliding-layer RoPE table with
+/// `ATLAS_LAGUNA_ROPE_TABLE=0` (falls back to the on-the-fly rope kernel).
+fn sliding_rope_table_enabled() -> bool {
+    std::env::var("ATLAS_LAGUNA_ROPE_TABLE").as_deref() != Ok("0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unified_moe_layout_enabled;
+
+    #[test]
+    fn unified_moe_layout_is_explicitly_opt_in() {
+        assert!(unified_moe_layout_enabled(Some("1")));
+        assert!(unified_moe_layout_enabled(Some("true")));
+        assert!(unified_moe_layout_enabled(Some("TRUE")));
+        assert!(!unified_moe_layout_enabled(None));
+        assert!(!unified_moe_layout_enabled(Some("0")));
+        assert!(!unified_moe_layout_enabled(Some("full")));
+    }
 }

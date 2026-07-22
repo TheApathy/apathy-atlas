@@ -61,7 +61,7 @@ pub(super) fn install_high_speed_swap(
 }
 
 /// Co-dispatch admission window: `Some(duration)` when `ATLAS_PREFILL_CODISPATCH=1`,
-/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS` (default 5).
+/// else `None`. The window length is `ATLAS_PREFILL_CODISPATCH_WINDOW_MS` (default 100).
 fn codispatch_window() -> Option<std::time::Duration> {
     let on = std::env::var("ATLAS_PREFILL_CODISPATCH")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -72,8 +72,20 @@ fn codispatch_window() -> Option<std::time::Duration> {
     let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_WINDOW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(100);
     Some(std::time::Duration::from_millis(ms))
+}
+
+/// Quiet period that ends the co-dispatch window early for a lone request
+/// (`ATLAS_PREFILL_CODISPATCH_SETTLE_MS`, default 10). The window is only
+/// abandoned after this long with NO new arrival, so a burst whose members
+/// are separated by less than this is still collected whole.
+fn codispatch_settle() -> std::time::Duration {
+    let ms = std::env::var("ATLAS_PREFILL_CODISPATCH_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Drain pending request queue and policy-select prefills to start.
@@ -112,24 +124,44 @@ pub(super) fn drain_pending_requests(
         // gather a whole concurrent BURST into one forward (batched via
         // run_batched_prefill_step) rather than stopping at the 2nd request — a
         // 4-request burst used to split into 2+2 because the loop exited at len==2.
-        // Keep collecting up to `max_batch_size`, bounded by `window`, and dispatch
-        // EARLY once the burst settles (>=2 gathered and no new arrival within
-        // SETTLE) so latency stays low. A lone request pays at most `window` TTFT.
+        // Keep collecting up to `max_batch_size` for the full admission window.
+        // Agentic/RAG clients commonly submit a burst through independently
+        // parsed HTTP tasks; the former 2 ms "settle" shortcut split a C=4
+        // burst into C=3+1 before its last request reached this queue. A lone
+        // request pays at most `window` TTFT, which is the intentional tradeoff
+        // when co-dispatch is explicitly enabled.
         if g.requests.len() < max_batch_size
             && let Some(window) = codispatch_window()
         {
-            const SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
+            // A LONE request used to pay the whole window as TTFT (~100 ms on
+            // every single-stream request, measured: ISL-1K TTFT 1074 -> 971 ms
+            // with the window forced to 0). Burning it is only worthwhile while
+            // a burst is actually still arriving.
+            //
+            // So: wait in `settle`-sized slices and keep the full window alive
+            // as long as the queue KEEPS GROWING; give up once it has been
+            // quiet for one settle. This is deliberately growth-aware rather
+            // than a flat short timeout — an earlier flat 2 ms settle split a
+            // C=4 burst into C=3+1 when its last member had not yet reached
+            // this queue. Here a burst that trickles in with gaps under
+            // `settle` still gets collected in full, up to the same deadline.
             let deadline = std::time::Instant::now() + window;
+            let settle = window.min(codispatch_settle());
+            let mut seen = g.requests.len();
             while g.requests.len() < max_batch_size && !g.closed {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
                 }
-                let wait = (deadline - now).min(SETTLE);
-                let res = cv.wait_for(&mut g, wait);
-                // Timed out with no new arrival in SETTLE → burst drained; dispatch
-                // what we have (if it's batchable). Otherwise keep gathering.
-                if res.timed_out() && g.requests.len() >= 2 {
+                let slice = (deadline - now).min(settle);
+                let res = cv.wait_for(&mut g, slice);
+                if g.requests.len() > seen {
+                    // Burst still landing — reset the quiet timer.
+                    seen = g.requests.len();
+                    continue;
+                }
+                if res.timed_out() {
+                    // Quiet for a full settle and nothing new: stop waiting.
                     break;
                 }
             }

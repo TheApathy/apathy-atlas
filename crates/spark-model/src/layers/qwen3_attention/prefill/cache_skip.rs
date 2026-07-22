@@ -157,18 +157,35 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Standard Q/K/V projection (non-MLA models) ──
+        let ht = std::env::var("ATLAS_PREFILL_HOST_TIMING").as_deref() == Ok("1");
+        let tp0 = ht.then(std::time::Instant::now);
         if self.mla.is_none() {
             self.prefill_attention_cache_skip_qkv(
                 normed, normed_fp8, n, h, nkv, hd, q_proj_dim, kv_dim, num_tokens, bf16, ctx,
                 stream,
             )?;
         } // end if self.mla.is_none() (standard projection path)
+        if let Some(t) = tp0 {
+            crate::layers::qwen3_attention::add_attn_phase_us(0, t.elapsed().as_micros() as u64);
+        }
+        let tp1 = ht.then(std::time::Instant::now);
 
         // ── 4+5. Deinterleave Q/Gate + per-head Q/K RMS norms ──
         let qg_out = ctx.buffers.qkv_output();
         let k_contiguous = ctx.buffers.ssm_qkvz();
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
-        let q_contiguous = ctx.buffers.ssm_deinterleaved();
+        // UNGATED models: the q_proj output IS the contiguous Q in exactly the
+        // layout downstream wants ([n, nq*hd]) — `q_proj_dim == q_dim` above,
+        // and the only other reader of `qg_out`, the sigmoid gate at step 9, is
+        // `if self.gated`. Aliasing avoids a full duplicate of Q: at 8K that
+        // copy_d2d moves 135 MB out + 135 MB in PER LAYER (~6.5 GB per prefill)
+        // to produce a byte-identical buffer. Gated models still need the
+        // separate destination because their qg_out carries [Q | G].
+        let q_contiguous = if self.gated {
+            ctx.buffers.ssm_deinterleaved()
+        } else {
+            qg_out
+        };
         let q_rope_fused = self.gated
             && !self.attn.q_norm.weight.is_null()
             && self.mrope_interleaved
@@ -244,9 +261,10 @@ impl Qwen3AttentionLayer {
                 .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
                 .map_err(|e| anyhow::anyhow!("MLA Q copy failed: {e}"))?;
         } else {
-            ctx.gpu
-                .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
-                .map_err(|e| anyhow::anyhow!("Q copy d2d failed: {e}"))?;
+            // No copy: `q_contiguous` aliases `qg_out` for ungated models (see
+            // its binding above). Kept as a no-op branch so the gated/MLA
+            // structure below is unchanged.
+            debug_assert_eq!(q_contiguous.0, qg_out.0);
             if let Some(ref q_norm_full) = self.attn.q_norm_full {
                 ops::rms_norm(
                     ctx.gpu,
@@ -260,17 +278,35 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else if !self.attn.q_norm.weight.is_null() {
-                ops::rms_norm(
-                    ctx.gpu,
-                    self.rms_norm_w_k,
-                    q_contiguous,
-                    &self.attn.q_norm,
-                    q_contiguous,
-                    nq * n,
-                    hd,
-                    eps,
-                    stream,
-                )?;
+                // Per-head rows are head_dim long and there are nq*n of them;
+                // the block-per-row kernel runs ~43x above its bandwidth floor
+                // on that shape.
+                if self.rms_norm_w_warp_row_k.0 != 0 && ops::rms_norm_short_row_eligible(nq * n, hd)
+                {
+                    ops::rms_norm_warp_row(
+                        ctx.gpu,
+                        self.rms_norm_w_warp_row_k,
+                        q_contiguous,
+                        &self.attn.q_norm,
+                        q_contiguous,
+                        nq * n,
+                        hd,
+                        eps,
+                        stream,
+                    )?;
+                } else {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_w_k,
+                        q_contiguous,
+                        &self.attn.q_norm,
+                        q_contiguous,
+                        nq * n,
+                        hd,
+                        eps,
+                        stream,
+                    )?;
+                }
             }
         }
         if let Some(ref k_norm_full) = self.attn.k_norm_full {
@@ -286,18 +322,34 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                k_contiguous,
-                &self.attn.k_norm,
-                k_contiguous,
-                nkv * n,
-                hd,
-                eps,
-                stream,
-            )
-            .map_err(|e| anyhow::anyhow!("k_norm rms_norm failed: nkv={nkv} n={n} hd={hd}: {e}"))?;
+            if self.rms_norm_w_warp_row_k.0 != 0 && ops::rms_norm_short_row_eligible(nkv * n, hd) {
+                ops::rms_norm_warp_row(
+                    ctx.gpu,
+                    self.rms_norm_w_warp_row_k,
+                    k_contiguous,
+                    &self.attn.k_norm,
+                    k_contiguous,
+                    nkv * n,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            } else {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    k_contiguous,
+                    &self.attn.k_norm,
+                    k_contiguous,
+                    nkv * n,
+                    hd,
+                    eps,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("k_norm rms_norm failed: nkv={nkv} n={n} hd={hd}: {e}")
+                })?;
+            }
         }
 
         // ATLAS_OP_DUMP: k AFTER k_norm, BEFORE RoPE. Matches vLLM's "k_proj"
@@ -597,6 +649,13 @@ impl Qwen3AttentionLayer {
                 anyhow::anyhow!("prefill_512 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
             })?;
         } else {
+            if let Some(t) = tp1 {
+                crate::layers::qwen3_attention::add_attn_phase_us(
+                    1,
+                    t.elapsed().as_micros() as u64,
+                );
+            }
+            let tp2 = std::time::Instant::now();
             ops::prefill_attention_64(
                 ctx.gpu,
                 self.prefill_attn_64_k,
@@ -617,6 +676,7 @@ impl Qwen3AttentionLayer {
             .map_err(|e| {
                 anyhow::anyhow!("flash_attn_64 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
             })?;
+            crate::layers::qwen3_attention::add_attn_phase_us(2, tp2.elapsed().as_micros() as u64);
         }
 
         // TurboQuant WHT bookend (output side): attention output is
