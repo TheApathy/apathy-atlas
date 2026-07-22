@@ -306,6 +306,7 @@ pub fn process_decode_logits(
                 // cycling) within ~24-60 tokens of the loop starting,
                 // instead of waiting for the 256-token thinking budget.
                 if !crate::scheduler::helpers::disable_watchdogs()
+                    && crate::scheduler::helpers::enable_think_loop_watchdog()
                     && !a.force_end_thinking
                     && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
                     && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
