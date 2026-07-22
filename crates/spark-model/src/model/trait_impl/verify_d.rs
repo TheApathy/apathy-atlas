@@ -211,7 +211,15 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            // ATLAS_VERIFY_PROFILE=1 (eager only): per-layer sync timing of the
+            // K=γ verify loop — itemizes the step against the bandwidth floor.
+            let vprof = !use_graphs
+                && std::env::var("ATLAS_VERIFY_PROFILE").ok().as_deref() == Some("1");
+            let mut vprof_attn_us = 0u64;
+            let mut vprof_slide_us = 0u64;
+            let vprof_t0 = std::time::Instant::now();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let vprof_l0 = std::time::Instant::now();
                 let layer_type = self.config.layer_type(layer_idx);
 
                 // forward_k16 speed probe: route SLIDING-window layers through the
@@ -325,6 +333,24 @@ impl TransformerModel {
                 } else {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
                 }
+                if vprof {
+                    self.gpu.synchronize(stream)?;
+                    let us = vprof_l0.elapsed().as_micros() as u64;
+                    if layer_type == LayerType::FullAttention {
+                        vprof_attn_us += us;
+                    } else {
+                        vprof_slide_us += us;
+                    }
+                }
+            }
+            if vprof {
+                tracing::info!(
+                    "VERIFY_PROFILE K={}: layers total={:.1}ms (12 full-attn={:.1}ms, 36 sliding={:.1}ms)",
+                    k,
+                    vprof_t0.elapsed().as_secs_f64() * 1000.0,
+                    vprof_attn_us as f64 / 1000.0,
+                    vprof_slide_us as f64 / 1000.0,
+                );
             }
 
             // Final norm [K, H]
