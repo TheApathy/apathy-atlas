@@ -72,6 +72,17 @@ impl Qwen3AttentionLayer {
             .attn_metadata
             .expect("attention layer requires metadata");
 
+        // ATLAS_VERIFY_PROFILE=1 (eager): accumulate attention-vs-FFN split
+        // across all layer calls; report every 48 calls (= one verify pass).
+        static VP2_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let vp2 = *VP2_ENV.get_or_init(|| {
+            std::env::var("ATLAS_VERIFY_PROFILE").ok().as_deref() == Some("1")
+        }) && !ctx.graph_capture;
+        static ATTN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static FFN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let vp2_t0 = std::time::Instant::now();
+
         // ── Phases 2-6: attention ──
         // MLA models (Mistral-Small-4) take the dedicated absorbed-MLA
         // batched path (issue #84). The standard `ms_phase_qkv` reads
@@ -109,8 +120,35 @@ impl Qwen3AttentionLayer {
             comm.all_reduce_async(o_out.0, bytes, c.stream)?;
         }
 
+        if vp2 {
+            c.fwd.gpu.synchronize(c.stream)?;
+            ATTN_US.fetch_add(
+                vp2_t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        let vp2_t1 = std::time::Instant::now();
+
         // ── Phase 7: residual + post-norm + MoE ──
         self.ms_phase_ffn(&c, o_out)?;
+
+        if vp2 {
+            c.fwd.gpu.synchronize(c.stream)?;
+            FFN_US.fetch_add(
+                vp2_t1.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let calls = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if calls % 48 == 0 {
+                let a = ATTN_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                let f = FFN_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "VERIFY_SPLIT (48 layer-calls): attn={:.1}ms ffn={:.1}ms",
+                    a as f64 / 1000.0,
+                    f as f64 / 1000.0,
+                );
+            }
+        }
 
         Ok(())
     }
