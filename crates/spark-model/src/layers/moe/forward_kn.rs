@@ -150,6 +150,23 @@ impl MoeLayer {
         }
 
         kn_ck!("topk");
+        // ATLAS_KN_TRACE_EXPERTS=1 (eager only; pair with
+        // ATLAS_DFLASH_DEBUG_NO_GRAPH=1): dump each verify row's routed
+        // expert ids. The K rows are consecutive drafted tokens, so a line's
+        // first w rows are exactly a CSS w-cohort — union(w)/top_k over these
+        // lines is the expert-union inflation measurement (M1, doc 13 gate 4).
+        if !ctx.graph_capture
+            && std::env::var("ATLAS_KN_TRACE_EXPERTS").ok().as_deref() == Some("1")
+        {
+            ctx.gpu.synchronize(stream)?;
+            let mut buf = vec![0u8; num_tokens * top_k as usize * 4];
+            ctx.gpu.copy_d2h(indices_dev, &mut buf)?;
+            let ids: Vec<u32> = buf
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            tracing::info!("KN_EXPERTS: {ids:?}");
+        }
         // 3-5. Fused expert dispatch — one grid each, all num_tokens tokens.
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
