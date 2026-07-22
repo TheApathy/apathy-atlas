@@ -30,6 +30,9 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        // Block-fork (doc 16): never carry a stale fork across proposes —
+        // source paths (SAM/echo/recycle) have no fresh drafter logits.
+        dstate.pending_block_fork = None;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
         // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
@@ -838,6 +841,57 @@ impl BlockDiffusionDraftHead {
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
         dstate.first_propose_done = true;
+
+        // ── Block-fork cliff (doc 16, ATLAS_DFLASH_BLOCKFORK=1) ──
+        // Per-row top-2 over the fresh drafter logits; the lowest-margin
+        // draft position is the coin flip to hedge. Payload rides dstate to
+        // the scheduler (dflash_take_block_fork) next to the drafts.
+        static BLOCKFORK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *BLOCKFORK.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_BLOCKFORK").ok().as_deref() == Some("1")
+        }) && self.kernels.top2.0 != 0
+            && drafts.len() >= 3
+        {
+            // logits row j+1 produced (row-0-dropped) draft j.
+            let rows = (drafts.len() + 1) as u32;
+            crate::layers::ops::top2_bf16_rows(
+                ctx.gpu,
+                self.kernels.top2,
+                self.scratch.logits,
+                self.top2_out,
+                rows,
+                self.vocab_size as u32,
+                _stream,
+            )?;
+            ctx.gpu.synchronize(_stream)?;
+            let mut buf = vec![0u8; rows as usize * 16];
+            ctx.gpu.copy_d2h(self.top2_out, &mut buf)?;
+            let w: Vec<u32> = buf
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let mut best: Option<(usize, u32, f32)> = None;
+            for r in 1..rows as usize {
+                let margin = f32::from_bits(w[r * 4 + 1]) - f32::from_bits(w[r * 4 + 3]);
+                let draft_idx = r - 1;
+                if best.is_none_or(|(_, _, bm)| margin < bm) {
+                    best = Some((draft_idx, w[r * 4 + 2], margin));
+                }
+            }
+            if let Some((di, fork_tok, margin)) = best {
+                dstate.pending_block_fork = Some((di, fork_tok));
+                static FORK_DBG: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = FORK_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 4 || n % 256 == 0 {
+                    tracing::info!(
+                        "DFLASH_BLOCKFORK payload #{n}: cliff_draft={di} fork_tok={fork_tok} \
+                         margin={margin:.3} (drafts[cliff]={})",
+                        drafts[di],
+                    );
+                }
+            }
+        }
 
         // ── Task 1 DIAG (c): final value returned to run_mtp_propose_inner
         // (→ scheduler). This is the drafts.len() the >=4 dispatch sees

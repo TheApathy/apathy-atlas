@@ -512,6 +512,15 @@ impl Model for TransformerModel {
         proposer.collect_async_drafts(self.gpu.as_ref(), state)
     }
 
+    fn dflash_take_block_fork(&self, seq: &mut SequenceState) -> Option<(usize, u32)> {
+        seq.proposer_state
+            .as_mut()?
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()?
+            .pending_block_fork
+            .take()
+    }
+
     fn dflash_stash_recycle(
         &self,
         seq: &mut SequenceState,

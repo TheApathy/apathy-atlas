@@ -36,6 +36,30 @@ pub fn argmax_bf16(
         .launch(stream)
 }
 
+/// Per-row top-2 over `[rows, vocab]` BF16 logits (block-fork cliff
+/// detection, doc 16). Writes `rows × (idx1, bits(val1), idx2, bits(val2))`
+/// u32 quads to `out`.
+///
+/// Kernel: `top2_bf16_rows(logits, out, n)`
+/// Grid: (rows, 1, 1)  Block: (1024, 1, 1)
+pub fn top2_bf16_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    logits: DevicePtr,
+    out: DevicePtr,
+    rows: u32,
+    vocab_size: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, 1, 1])
+        .block([1024, 1, 1])
+        .arg_ptr(logits)
+        .arg_ptr(out)
+        .arg_u32(vocab_size)
+        .launch(stream)
+}
+
 /// GPU-side argmax + embedding lookup — eliminates D2H sync in MTP propose.
 ///
 /// Reads the argmax result from `argmax_out`, looks up the embedding row

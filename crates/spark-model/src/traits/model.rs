@@ -628,6 +628,12 @@ pub trait Model: Send + Sync {
         Ok(None)
     }
 
+    /// Block-fork tree (doc 16): drain the propose-side fork payload
+    /// `(cliff_draft_index, fork_token)` for this sequence, if any.
+    fn dflash_take_block_fork(&self, _seq: &mut SequenceState) -> Option<(usize, u32)> {
+        None
+    }
+
     /// ATLAS_DFLASH_RECYCLE: stash the discarded draft tail
     /// `drafts[num_accepted+1..]` keyed by the corrected (bonus) token, so
     /// the next propose can re-offer it (lossless — proposal only).

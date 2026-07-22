@@ -157,6 +157,7 @@ fn build_active_seq_from_prefill(
         dry_sequence_breakers: Vec::new(),
         logit_bias: p.logit_bias,
         pending_drafts: Vec::new(),
+        pending_block_fork: None,
         inside_thinking: if immediate_finish {
             p.enable_thinking && think_end_token.is_some()
         } else {

@@ -326,6 +326,10 @@ pub(super) struct ActiveSeq {
     pub grammar_state: Option<GrammarState>,
     /// MTP draft tokens awaiting verification.
     pub pending_drafts: Vec<u32>,
+    /// Block-fork tree payload for `pending_drafts` (doc 16):
+    /// `(cliff_draft_index, fork_token)`. Consumed by the tree-mode verify;
+    /// always cleared together with `pending_drafts`.
+    pub pending_block_fork: Option<(usize, u32)>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
     pub last_token_time: Instant,
     /// Timestamp when the request entered prefill (for TTFT).

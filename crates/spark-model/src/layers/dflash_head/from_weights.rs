@@ -156,6 +156,9 @@ impl BlockDiffusionDraftHead {
             silu_mul: gpu.kernel("moe_silu_mul", "silu_mul_noclamp")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
+            top2: gpu
+                .kernel("argmax", "top2_bf16_rows")
+                .unwrap_or(spark_runtime::gpu::KernelHandle(0)),
             batched_embed: gpu.kernel("embed_from_argmax", "batched_embed")?,
             // Phase 2 Option B: slot_mapping builder. Same kernel the
             // target model uses for its KV cache writeback (see
@@ -605,6 +608,7 @@ impl BlockDiffusionDraftHead {
             propose_graphs: parking_lot::Mutex::new(None),
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
+            top2_out: gpu.alloc(gamma_val * 16)?,
             async_inflight: parking_lot::Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),
             async_order_event: std::sync::atomic::AtomicU64::new(0),

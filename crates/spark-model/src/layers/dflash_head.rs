@@ -64,6 +64,9 @@ pub struct DflashKernels {
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
     pub argmax: KernelHandle,
+    /// Per-row top-2 over the drafter logits (block-fork tree cliff
+    /// detection, doc 16). `0` when the target's kernel set lacks it.
+    pub top2: KernelHandle,
     pub batched_embed: KernelHandle,
     /// Phase 2 Option B: builds `[count]` i32 slot indices on-device
     /// from a host-provided block_table. Used by propose.rs to populate
@@ -353,6 +356,13 @@ pub struct DflashProposerState {
     pub echo_valid: bool,
     pub echo_streak: u32,
     pub echo_offered_last: bool,
+    /// Block-fork tree payload (doc 16): `(cliff_draft_index, fork_token)`.
+    /// Set by the drafter path when ATLAS_DFLASH_BLOCKFORK=1 (the lowest-
+    /// margin draft position + the drafter's top-2 token there); drained by
+    /// the scheduler via `dflash_take_block_fork` alongside the drafts.
+    /// Cleared at the top of every propose so source paths never carry a
+    /// stale fork.
+    pub pending_block_fork: Option<(usize, u32)>,
 }
 
 impl ProposerState for DflashProposerState {
@@ -533,6 +543,10 @@ pub struct BlockDiffusionDraftHead {
     /// is hit.
     pub propose_warmup_count: std::sync::atomic::AtomicUsize,
 
+    /// Block-fork tree (doc 16): `[γ, 4]` u32 top-2 results
+    /// (idx1, bits(val1), idx2, bits(val2)) per drafter-logits row.
+    pub top2_out: DevicePtr,
+
     // ── ATLAS_DFLASH_ASYNC (ported from atlas-src task #20) ──
     /// At most one in-flight async (second-stream) propose — the head owns a
     /// single scratch buffer set. See `async_propose.rs`.
@@ -605,6 +619,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             echo_valid: false,
             echo_streak: 0,
             echo_offered_last: false,
+            pending_block_fork: None,
         }))
     }
 

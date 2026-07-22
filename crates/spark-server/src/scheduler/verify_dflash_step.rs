@@ -245,9 +245,16 @@ pub fn step_verify_dflash(
             0,
             _mtp_grammar_mask.as_deref(),
         ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+            Ok(d) if !d.is_empty() => {
+                a.pending_drafts = d;
+                // Block-fork (doc 16): the fork payload rides with the drafts.
+                a.pending_block_fork = model.dflash_take_block_fork(&mut a.seq);
+            }
+            Ok(_) => a.pending_block_fork = None,
+            Err(e) => {
+                a.pending_block_fork = None;
+                tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
+            }
         }
     }
     if step_timing {

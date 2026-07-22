@@ -303,6 +303,7 @@ pub fn step_mtp(
                 Ok(drafts) if !drafts.is_empty() => {
                     tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
                     a.pending_drafts = drafts;
+                    a.pending_block_fork = model.dflash_take_block_fork(&mut a.seq);
                 }
                 Ok(_) => tracing::warn!("MTP propose returned empty"),
                 Err(e) => {
