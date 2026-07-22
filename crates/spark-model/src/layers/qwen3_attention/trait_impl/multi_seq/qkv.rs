@@ -57,6 +57,13 @@ impl Qwen3AttentionLayer {
             // weight loop in the wide verify — one GEMM per Q/K/V reads each
             // weight ONCE for all n rows instead of n× (mirrors batch3 with M=n).
             self.ms_qkv_batchn(c)?;
+        } else if n > 3 && self.q_weight.is_none() && !self.attn.q_proj.weight.is_null() {
+            // BF16 dense wide-verify (Laguna: attention projections are BF16 by
+            // design — quantization ignore list). One dense GEMM per Q/K/V reads
+            // each weight ONCE for all n rows; the per-token GEMV loop re-read
+            // ~88 MB of projection weights per row (measured ~2.6 ms/layer of
+            // the 5.2 ms/layer K=8 verify — VERIFY_PROFILE, docs/12).
+            self.ms_qkv_batchn_bf16(c)?;
         } else {
             for i in 0..n {
                 let normed_i = normed.offset(i * h * bf16);
@@ -537,6 +544,97 @@ impl Qwen3AttentionLayer {
             k,
             stream,
         )
+    }
+
+    /// Wide-verify (n>3) BF16-dense batched QKV — same structure as
+    /// [`Self::ms_qkv_batchn`] but for models whose attention projections are
+    /// unquantized BF16 (Laguna). One dense GEMM per Q/K/V + per-row scatter.
+    fn ms_qkv_batchn_bf16(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            bf16,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        let dense_proj = |w: &crate::weight_map::DenseWeight,
+                          out: spark_runtime::gpu::DevicePtr,
+                          n_out: u32|
+         -> Result<()> {
+            if self.dense_gemm_pipelined_k.0 != 0 {
+                ops::dense_gemm_bf16_pipelined(
+                    fwd.gpu,
+                    self.dense_gemm_pipelined_k,
+                    normed,
+                    w,
+                    out,
+                    n as u32,
+                    n_out,
+                    h as u32,
+                    stream,
+                )
+            } else {
+                ops::dense_gemm(
+                    fwd.gpu,
+                    self.dense_gemm_k,
+                    normed,
+                    w,
+                    out,
+                    n as u32,
+                    n_out,
+                    h as u32,
+                    stream,
+                )
+            }
+        };
+
+        let q_scratch = fwd.buffers.ssm_qkvz();
+        dense_proj(&self.attn.q_proj, q_scratch, q_proj_dim)?;
+        if self.gated && !self.q_lora_active() {
+            ops::deinterleave_qg(
+                fwd.gpu,
+                self.deinterleave_qg_k,
+                q_scratch,
+                n as u32,
+                nq,
+                hd,
+                q_proj_dim,
+                stream,
+            )?;
+        }
+
+        let kv_dim = nkv * hd;
+        let kv_bytes = kv_dim as usize * bf16;
+        let k_scratch = fwd.buffers.attn_output();
+        let v_scratch = k_scratch.offset(n * kv_bytes);
+        dense_proj(&self.attn.k_proj, k_scratch, kv_dim)?;
+        dense_proj(&self.attn.v_proj, v_scratch, kv_dim)?;
+
+        for i in 0..n {
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let v_out_i = k_out_i.offset(kv_bytes);
+            fwd.gpu.copy_d2d_async(
+                q_scratch.offset(i * q_proj_bytes),
+                q_out_i,
+                q_proj_bytes,
+                stream,
+            )?;
+            fwd.gpu
+                .copy_d2d_async(k_scratch.offset(i * kv_bytes), k_out_i, kv_bytes, stream)?;
+            fwd.gpu
+                .copy_d2d_async(v_scratch.offset(i * kv_bytes), v_out_i, kv_bytes, stream)?;
+        }
+        Ok(())
     }
 
     /// Wide-verify (n>3) NVFP4 batched QKV. Reads each of Q/K/V ONCE for all
