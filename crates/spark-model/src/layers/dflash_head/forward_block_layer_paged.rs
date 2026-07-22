@@ -1064,6 +1064,9 @@ impl BlockDiffusionDraftHead {
             stream,
         )?;
 
+        if args.block_dump {
+            self.block_dump_buf(ctx, self.scratch.norm_buf, args.layer_idx, "post_attn_norm", g, h, stream)?;
+        }
         // 3j. MLP: gate_proj + up_proj + silu_mul + down_proj — γ rows.
         // dflash.py:141  hidden_states = self.mlp(hidden_states)
         //   Qwen3MLP: down_proj(silu(gate_proj(x)) * up_proj(x)).
@@ -1086,6 +1089,10 @@ impl BlockDiffusionDraftHead {
             inter,
             h,
         )?;
+        if args.block_dump {
+            self.block_dump_buf(ctx, self.scratch.mlp_intermediate, args.layer_idx, "mlp_gate_raw", g, inter, stream)?;
+            self.block_dump_buf(ctx, self.scratch.mlp_up, args.layer_idx, "mlp_up_raw", g, inter, stream)?;
+        }
         ops::silu_mul(
             gpu,
             self.kernels.silu_mul,
@@ -1104,6 +1111,10 @@ impl BlockDiffusionDraftHead {
             inter,
         )?;
 
+        if args.block_dump {
+            self.block_dump_buf(ctx, self.scratch.mlp_intermediate, args.layer_idx, "mlp_act", g, inter, stream)?;
+            self.block_dump_buf(ctx, self.scratch.stream_acc, args.layer_idx, "mlp_out", g, h, stream)?;
+        }
         // 3k. Second residual add: hidden = (residual + attn) + mlp_output.
         // dflash.py:142  hidden_states = residual + hidden_states
         //   stream_buf (= residual + attn_output, the line-139 residual)

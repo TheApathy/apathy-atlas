@@ -148,7 +148,12 @@ impl BlockDiffusionDraftHead {
                 "prefill_paged_indirect",
                 "inferspark_prefill_paged_indirect",
             )?,
-            silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
+            // UNCLAMPED SwiGLU: `moe_silu_mul` carries a DeepSeek-V4-specific
+            // swiglu_limit=10.0 clamp that silently clips the drafter's dense
+            // MLP activations (anchor rows ~14% clipped → acceptance collapse;
+            // root-caused via stage parity, docs/12). The drafter has NO
+            // swiglu_limit — use the unclamped variant.
+            silu_mul: gpu.kernel("moe_silu_mul", "silu_mul_noclamp")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             batched_embed: gpu.kernel("embed_from_argmax", "batched_embed")?,

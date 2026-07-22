@@ -365,6 +365,18 @@ impl BlockDiffusionDraftHead {
                 eff_ctx * self.hidden_size * bf16,
             )?;
         }
+        if debug_dump {
+            // Stage-3 parity dump: γ block-input rows exactly as layer 0 sees
+            // them (embed(anchor) + embed(mask)×(γ-1)).
+            let nb = self.gamma * self.hidden_size * bf16;
+            gpu.synchronize(stream)?;
+            let mut b = vec![0u8; nb];
+            gpu.copy_d2h(
+                self.scratch.stream_buf.offset(eff_ctx * self.hidden_size * bf16),
+                &mut b,
+            )?;
+            let _ = std::fs::write("/tmp/atlas_blk_input.bin", &b);
+        }
         // ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN=1: overwrite noise rows
         // [eff_ctx..n_attn) with a deterministic pattern matching the
         // PyTorch reference. Lets us compare layer-0 q/k/v post-projection
@@ -1016,6 +1028,23 @@ impl BlockDiffusionDraftHead {
                 eff_ctx,
                 drafts,
             );
+            // Stage 3-5 parity dumps: block input rows (post-embed residual
+            // stream) + final normed hidden (pre-lm_head), γ rows × hidden
+            // each, BF16 — compared row-by-row against the CPU reference
+            // (bench/dflash_block_forward.py) to localize the divergent row.
+            let nb = self.gamma * self.hidden_size * 2;
+            gpu.synchronize(stream)?;
+            let mut b = vec![0u8; nb];
+            gpu.copy_d2h(
+                self.scratch.stream_buf.offset(eff_ctx * self.hidden_size * 2),
+                &mut b,
+            )?;
+            let _ = std::fs::write("/tmp/atlas_blk_final_hidden.bin", &b);
+            gpu.copy_d2h(
+                self.scratch.norm_buf.offset(eff_ctx * self.hidden_size * 2),
+                &mut b,
+            )?;
+            let _ = std::fs::write("/tmp/atlas_blk_final_normed.bin", &b);
             DRAFTS_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         let _ = g; // suppress unused
