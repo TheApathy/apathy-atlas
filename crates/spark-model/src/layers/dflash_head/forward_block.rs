@@ -32,6 +32,15 @@ impl BlockDiffusionDraftHead {
         // empty vec; collect_async_drafts_impl event-syncs and parses the
         // pinned buffer at the top of the next scheduler step.
         async_launch: bool,
+        // ATLAS_DFLASH_REDENOISE: verifier-corrected warm start. Instead of
+        // seeding the block's noise rows with MASK, seed them with the
+        // previous step's rejected draft tail (shifted past the correction)
+        // so the drafter REVISES it with the corrected anchor visible via
+        // in-block bidirectional attention — posterior re-denoising, the
+        // block-diffusion model's native task (deeploop's progressive
+        // unmasking is the in-distribution precedent). Proposal-only ⇒
+        // lossless. None ⇒ classic all-MASK seeding, byte-identical.
+        warm_tail: Option<&[u32]>,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -333,10 +342,14 @@ impl BlockDiffusionDraftHead {
         }
         let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
             .chain(std::iter::once(last_token as i32))
-            .chain(std::iter::repeat_n(
-                self.mask_token_id as i32,
-                self.gamma - 1,
-            ))
+            .chain((0..self.gamma - 1).map(|i| {
+                match warm_tail {
+                    // Warm-start row: previous rejected draft i+1 positions
+                    // past the correction (rows beyond the tail stay MASK).
+                    Some(tail) if i < tail.len() => tail[i] as i32,
+                    _ => self.mask_token_id as i32,
+                }
+            }))
             .collect();
         if debug_dump {
             tracing::info!(

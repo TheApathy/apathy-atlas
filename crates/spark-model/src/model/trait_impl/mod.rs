@@ -522,7 +522,13 @@ impl Model for TransformerModel {
         // Stash `drafts[num_accepted+1 ..]` (the tail discarded purely because
         // it sat downstream of the first content miss) keyed by the corrected
         // token the target committed at that miss. LOSSLESS: proposal only.
-        if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() != Some("1") {
+        // Consumers: RECYCLE (verbatim re-offer) and REDENOISE (warm-start
+        // revision by the drafter) — stash when either is armed.
+        static STASH_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*STASH_ON.get_or_init(|| {
+            let f = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+            f("ATLAS_DFLASH_RECYCLE") || f("ATLAS_DFLASH_REDENOISE")
+        }) {
             return Ok(());
         }
         let Some(ps) = seq.proposer_state.as_mut() else {

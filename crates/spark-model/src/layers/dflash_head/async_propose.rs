@@ -189,6 +189,7 @@ impl BlockDiffusionDraftHead {
         ctx_buffer: Option<(spark_runtime::gpu::DevicePtr, usize)>,
         option_b: Option<(spark_runtime::gpu::DevicePtr, u32)>,
         grammar_masked: bool,
+        warm_tail: Option<&[u32]>,
         dstate: &mut DflashProposerState,
     ) -> Result<Option<Vec<u32>>> {
         if !dflash_async_enabled() || !async_env_eligible() || grammar_masked {
@@ -221,9 +222,9 @@ impl BlockDiffusionDraftHead {
         // fallback would otherwise rewrite the shared scratch while the
         // partially-enqueued kernels are still running.
         let t_enqueue = std::time::Instant::now();
-        if let Err(e) =
-            self.forward_block(last_token, position, ctx, pstream, ctx_buffer, option_b, true)
-        {
+        if let Err(e) = self.forward_block(
+            last_token, position, ctx, pstream, ctx_buffer, option_b, true, warm_tail,
+        ) {
             let _ = gpu.synchronize(pstream);
             return Err(e);
         }

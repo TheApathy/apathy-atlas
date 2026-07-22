@@ -683,6 +683,43 @@ impl BlockDiffusionDraftHead {
             }
         }
 
+        // ── ATLAS_DFLASH_REDENOISE=1: verifier-corrected warm-start ──
+        // On re-entry after a rejection, seed the drafter's noise rows with
+        // the shifted rejected tail (stashed by dflash_stash_recycle, keyed
+        // by the corrected bonus = this step's last_token) so the block-
+        // diffusion drafter REVISES it against the correction instead of
+        // re-drafting from pure MASK. Same single forward — zero extra cost;
+        // proposal-only ⇒ lossless. Attacks the post-rejection accept<=1
+        // failure mode (26% of steps measured 2026-07-23) that verbatim
+        // re-offers (echo/recycle) could not: here the drafter gets to REVISE.
+        static REDENOISE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let redenoise_on = *REDENOISE.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_REDENOISE").ok().as_deref() == Some("1")
+        });
+        let warm_tail_owned: Option<Vec<u32>> = if redenoise_on
+            && dstate.first_propose_done
+            && dstate.recycle_valid
+            && dstate.recycle_key == last_token
+            && !dstate.recycle_tail.is_empty()
+        {
+            // Single-use: consume the stash whether or not the revise helps.
+            dstate.recycle_valid = false;
+            let tail = std::mem::take(&mut dstate.recycle_tail);
+            static REDENOISE_FIRES: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = REDENOISE_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 4 || n % 128 == 0 {
+                tracing::info!(
+                    "DFLASH_REDENOISE fire #{n}: warm_tail_len={} key={last_token}",
+                    tail.len(),
+                );
+            }
+            Some(tail)
+        } else {
+            None
+        };
+        let warm_tail = warm_tail_owned.as_deref();
+
         // ── ATLAS_DFLASH_ASYNC: enqueue the drafter forward on the dedicated
         // propose stream and return a placeholder chain; the scheduler
         // collects the real drafts at the top of the next step (overlapping
@@ -698,6 +735,7 @@ impl BlockDiffusionDraftHead {
                 ctx_buffer_arg,
                 option_b_arg,
                 _grammar_bitmask.is_some(),
+                warm_tail,
                 dstate,
             ) {
                 Ok(Some(placeholder)) => return Ok(placeholder),
@@ -717,6 +755,7 @@ impl BlockDiffusionDraftHead {
                 ctx_buffer_arg,
                 option_b_arg,
                 false,
+                warm_tail,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
