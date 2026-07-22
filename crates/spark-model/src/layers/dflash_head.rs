@@ -322,6 +322,37 @@ pub struct DflashProposerState {
     /// real drafts are collected via `collect_async_drafts` at the top of
     /// the next scheduler step. Cleared on collect / resolve.
     pub async_placeholder: bool,
+
+    // ── Accept-lift draft sources (atlas-src port, Phase A) ──
+    /// Whether `propose_drafts` has returned at least once for this sequence.
+    /// The source precision gates require a real drafter/accept history
+    /// before pre-empting.
+    pub first_propose_done: bool,
+    /// Host copy of the sequence's committed tokens (prompt + generated),
+    /// refreshed by the caller each propose when retrieval/SAM is on — the
+    /// retrieval haystack.
+    pub pld_tokens: Vec<u32>,
+    // Adaptive retrieval gate (ATLAS_DFLASH_SAM auto-disable): attribute the
+    // last step's accept to retrieval, count consecutive misfires, cool down.
+    pub retr_used_last: bool,
+    pub retr_misfire_streak: u32,
+    pub retr_cooldown: u32,
+    // ATLAS_DFLASH_RECYCLE: the previous step's discarded draft tail
+    // `drafts[num_accepted+1..]`, keyed by the corrected (bonus) token; the
+    // drafter's structural continuation often survives a one-token
+    // substitution. Offer at most every other step (recycle_last_offered).
+    pub recycle_tail: Vec<u32>,
+    pub recycle_key: u32,
+    pub recycle_valid: bool,
+    pub recycle_last_offered: bool,
+    // ATLAS_DFLASH_ECHO: the TARGET'S own verify argmaxes downstream of the
+    // bonus (`verified[num_accepted+1..]`) — target-authored salvage drafts
+    // at zero propose cost, keyed by the bonus token, streak-capped.
+    pub echo_tail: Vec<u32>,
+    pub echo_key: u32,
+    pub echo_valid: bool,
+    pub echo_streak: u32,
+    pub echo_offered_last: bool,
 }
 
 impl ProposerState for DflashProposerState {
@@ -518,12 +549,14 @@ pub struct BlockDiffusionDraftHead {
 }
 
 mod async_propose;
+pub(crate) mod echo;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
 mod from_weights;
 mod precompute_ctx_kv;
 mod propose;
+mod retrieval;
 
 impl DraftProposer for BlockDiffusionDraftHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -558,6 +591,20 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_committed: 0,
             ctx_positions: Vec::new(),
             async_placeholder: false,
+            first_propose_done: false,
+            pld_tokens: Vec::new(),
+            retr_used_last: false,
+            retr_misfire_streak: 0,
+            retr_cooldown: 0,
+            recycle_tail: Vec::new(),
+            recycle_key: 0,
+            recycle_valid: false,
+            recycle_last_offered: false,
+            echo_tail: Vec::new(),
+            echo_key: 0,
+            echo_valid: false,
+            echo_streak: 0,
+            echo_offered_last: false,
         }))
     }
 
@@ -610,7 +657,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // `dstate.ctx_committed = dstate.ctx_len` so the next propose
         // recomputes the rolled-back tail instead of reading stale K/V.
         // The `.min(ctx_len)` clamp in propose() is the defensive backstop.
-        let _ = num_accepted;
+        //
+        // Accept-lift port: record the REAL accept count — the echo/recycle
+        // precision gates and the SAM adaptive cooldown key off it. (Before
+        // this port nothing ever set it; it was only zeroed on free_state.)
+        dstate.last_num_accepted = num_accepted;
         dstate.last_num_drafted = 0;
         Ok(())
     }

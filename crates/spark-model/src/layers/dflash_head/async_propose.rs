@@ -163,8 +163,10 @@ impl BlockDiffusionDraftHead {
     }
 
     /// Length the sync path would return for this propose: γ minus the row-0
-    /// drop (diffusion drafters), clamped by ATLAS_DFLASH_DRAFT_CAP.
-    fn sync_path_draft_len(&self) -> usize {
+    /// drop (diffusion drafters), clamped by ATLAS_DFLASH_DRAFT_CAP. Also the
+    /// chain length every non-drafter draft source must produce so the
+    /// K=len+1 verify dispatch (and its CUDA graph) is identical.
+    pub(super) fn sync_path_draft_len(&self) -> usize {
         let raw = self.gamma;
         let dropped = if self.mask_token_id != 0 && raw > 1 { raw - 1 } else { raw };
         let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")

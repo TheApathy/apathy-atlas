@@ -91,6 +91,28 @@ impl TransformerModel {
             routed_lora_layers: None, // #30: MTP/draft decode never routes prefill.
             midchunk_capture: None,
         };
+        // Accept-lift (Phase A): refresh the retrieval/PLD haystack — the
+        // host mirror of the committed token sequence — when any lookup
+        // source is enabled. Snapshot first to avoid a double seq borrow.
+        {
+            static SRC_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let on = *SRC_ON.get_or_init(|| {
+                let f = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+                f("ATLAS_DFLASH_PLD") || f("ATLAS_DFLASH_RETRIEVAL") || f("ATLAS_DFLASH_SAM")
+            });
+            if on {
+                let toks_snapshot = seq.tokens.clone();
+                if let Some(ps) = seq.proposer_state.as_mut()
+                    && let Some(ds) = ps
+                        .as_any_mut()
+                        .downcast_mut::<crate::layers::DflashProposerState>()
+                {
+                    ds.pld_tokens.clear();
+                    ds.pld_tokens.extend_from_slice(&toks_snapshot);
+                }
+            }
+        }
+
         let prop_state = seq
             .proposer_state
             .as_mut()

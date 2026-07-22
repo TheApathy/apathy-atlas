@@ -460,6 +460,229 @@ impl BlockDiffusionDraftHead {
             None
         };
 
+        // ═══ Accept-lift draft sources (atlas-src port, Phase A) ═══
+        // Priority: echo (target-authored) → PLD → retrieval/SAM → recycle →
+        // neural drafter. Every source is LOSSLESS by the oracle argument:
+        // sources only change what is PROPOSED; the K=γ verify commits solely
+        // the target's greedy token, so a wrong source guess costs one
+        // rejected speculation and can never change committed output. All
+        // sources emit exactly `sync_path_draft_len()` tokens so the verify
+        // dispatch + CUDA graph are identical to the drafter path. Ctx-hidden
+        // maintenance above already ran on every early-return path, so the
+        // drafter is never ctx-starved; any stale async in-flight propose is
+        // resolved before returning source drafts (the 2026-07-18 SAM+ASYNC
+        // silent-death lesson from atlas-src).
+        let source_gamma_eff = self.sync_path_draft_len();
+        macro_rules! resolve_async_before_source {
+            () => {
+                if super::async_propose::dflash_async_enabled() {
+                    self.resolve_async_inflight_impl(ctx.gpu, None)?;
+                }
+            };
+        }
+
+        // ── ATLAS_DFLASH_ECHO=1: target-authored salvage (highest priority) ──
+        if let Some(echo_cfg) = super::echo::EchoConfig::from_env() {
+            if dstate.echo_offered_last {
+                dstate.echo_offered_last = false;
+                tracing::info!(
+                    "DFLASH_ECHO result: accepted={} streak={}",
+                    dstate.last_num_accepted,
+                    dstate.echo_streak,
+                );
+            }
+            // Single-use stash: only valid for the immediately-following step
+            // whose last_token == the stashed bonus key.
+            let valid = dstate.echo_valid;
+            let key = dstate.echo_key;
+            let tail = std::mem::take(&mut dstate.echo_tail);
+            dstate.echo_valid = false;
+            if dstate.first_propose_done
+                && super::echo::should_offer(
+                    &echo_cfg,
+                    valid,
+                    key == last_token,
+                    tail.len(),
+                    dstate.echo_streak,
+                )
+            {
+                let drafts = super::echo::pad_tail_to_gamma(&tail, source_gamma_eff);
+                dstate.last_num_drafted = drafts.len();
+                dstate.echo_streak += 1;
+                dstate.echo_offered_last = true;
+                static ECHO_OFFERS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = ECHO_OFFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 4 || n % 64 == 0 {
+                    tracing::info!(
+                        "DFLASH_ECHO offer #{n}: tail_len={} padded_to={} streak={} key={key}",
+                        tail.len(),
+                        drafts.len(),
+                        dstate.echo_streak,
+                    );
+                }
+                resolve_async_before_source!();
+                return Ok(drafts);
+            }
+            dstate.echo_streak = 0;
+        }
+
+        // ── ATLAS_DFLASH_PLD=1: weak-drafter prompt-lookup (long match only) ──
+        if std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
+            && dstate.first_propose_done
+            && dstate.last_num_accepted <= 1
+        {
+            let ng_min: usize = std::env::var("ATLAS_PLD_NGRAM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            let need = source_gamma_eff;
+            let toks = &dstate.pld_tokens;
+            let l = toks.len();
+            let mut hit: Option<usize> = None;
+            for ng in (ng_min..=8).rev() {
+                if l <= ng + need {
+                    continue;
+                }
+                let mut suffix: Vec<u32> = toks[l - (ng - 1)..].to_vec();
+                suffix.push(last_token);
+                let mut p = l.saturating_sub(ng + 1);
+                loop {
+                    if toks[p..p + ng] == suffix[..] && p + ng + need <= l {
+                        hit = Some(p + ng);
+                        break;
+                    }
+                    if p == 0 {
+                        break;
+                    }
+                    p -= 1;
+                }
+                if hit.is_some() {
+                    break;
+                }
+            }
+            if let Some(cs) = hit {
+                let drafts: Vec<u32> = toks[cs..cs + need].to_vec();
+                dstate.last_num_drafted = drafts.len();
+                resolve_async_before_source!();
+                return Ok(drafts);
+            }
+        }
+
+        // ── ATLAS_DFLASH_RETRIEVAL / ATLAS_DFLASH_SAM: longest-suffix reuse ──
+        if let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(source_gamma_eff) {
+            // Adaptive misfire gate (ATLAS_DFLASH_SAM_ADAPTIVE, default on):
+            // attribute the previous step's accept to retrieval; cool down on
+            // consecutive misfires (measured on atlas-src: counting content
+            // regressed 77→65 without this — runs match, next number is new).
+            let adaptive =
+                std::env::var("ATLAS_DFLASH_SAM_ADAPTIVE").ok().as_deref() != Some("0");
+            if adaptive {
+                let min_accept: usize = std::env::var("ATLAS_DFLASH_SAM_MIN_ACCEPT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                let misfire_limit: u32 = std::env::var("ATLAS_DFLASH_SAM_MISFIRE_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
+                let cooldown: u32 = std::env::var("ATLAS_DFLASH_SAM_COOLDOWN")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(24);
+                if dstate.retr_used_last {
+                    if dstate.last_num_accepted < min_accept {
+                        dstate.retr_misfire_streak += 1;
+                    } else {
+                        dstate.retr_misfire_streak = 0;
+                    }
+                }
+                dstate.retr_used_last = false;
+                if dstate.retr_cooldown == 0 && dstate.retr_misfire_streak >= misfire_limit {
+                    dstate.retr_cooldown = cooldown;
+                    dstate.retr_misfire_streak = 0;
+                }
+            }
+            let retr_suppressed = adaptive && dstate.retr_cooldown > 0;
+            if dstate.retr_cooldown > 0 {
+                dstate.retr_cooldown -= 1;
+            }
+            let lookup = if retr_suppressed {
+                None
+            } else if rcfg.sam {
+                super::retrieval::retrieve_longest(&dstate.pld_tokens, last_token, &rcfg)
+            } else {
+                super::retrieval::retrieve(&dstate.pld_tokens, last_token, &rcfg)
+            };
+            if let Some(hit) = lookup
+                && hit.match_len >= rcfg.hybrid_min
+                && hit.drafts.len() == source_gamma_eff
+            {
+                static RETR_DBG_DONE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !RETR_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "DFlash retrieval: first hit match_len={} draft_count={} haystack_len={} \
+                         (lmax={} lmin={} hybrid_min={} sam={})",
+                        hit.match_len,
+                        hit.drafts.len(),
+                        dstate.pld_tokens.len(),
+                        rcfg.l_max,
+                        rcfg.l_min,
+                        rcfg.hybrid_min,
+                        rcfg.sam,
+                    );
+                }
+                dstate.last_num_drafted = hit.drafts.len();
+                dstate.retr_used_last = true;
+                resolve_async_before_source!();
+                return Ok(hit.drafts);
+            }
+        }
+
+        // ── ATLAS_DFLASH_RECYCLE=1: re-offer the discarded draft tail ──
+        // Weak-drafter regime only (accept <= RECYCLE_MAX_ACCEPT, default 1)
+        // and never two steps in a row (the counting 82→9 tok/s trap).
+        if dstate.recycle_last_offered {
+            dstate.recycle_last_offered = false;
+        } else if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() == Some("1")
+            && dstate.first_propose_done
+            && dstate.last_num_accepted
+                <= std::env::var("ATLAS_DFLASH_RECYCLE_MAX_ACCEPT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1)
+        {
+            let valid = dstate.recycle_valid;
+            let key = dstate.recycle_key;
+            let tail = std::mem::take(&mut dstate.recycle_tail);
+            dstate.recycle_valid = false;
+            if valid && key == last_token && !tail.is_empty() {
+                let mut drafts: Vec<u32> = Vec::with_capacity(source_gamma_eff);
+                for i in 0..source_gamma_eff {
+                    drafts.push(if i < tail.len() {
+                        tail[i]
+                    } else {
+                        *tail.last().unwrap()
+                    });
+                }
+                static RECYCLE_DBG_DONE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !RECYCLE_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        "DFlash recycle: first offer key={} tail_len={} γ_eff={}",
+                        key,
+                        tail.len(),
+                        source_gamma_eff,
+                    );
+                }
+                dstate.last_num_drafted = drafts.len();
+                dstate.recycle_last_offered = true;
+                resolve_async_before_source!();
+                return Ok(drafts);
+            }
+        }
+
         // ── ATLAS_DFLASH_ASYNC: enqueue the drafter forward on the dedicated
         // propose stream and return a placeholder chain; the scheduler
         // collects the real drafts at the top of the next step (overlapping
@@ -575,6 +798,7 @@ impl BlockDiffusionDraftHead {
 
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
+        dstate.first_propose_done = true;
 
         // ── Task 1 DIAG (c): final value returned to run_mtp_propose_inner
         // (→ scheduler). This is the drafts.len() the >=4 dispatch sees

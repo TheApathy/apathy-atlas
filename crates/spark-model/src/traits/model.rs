@@ -628,6 +628,33 @@ pub trait Model: Send + Sync {
         Ok(None)
     }
 
+    /// ATLAS_DFLASH_RECYCLE: stash the discarded draft tail
+    /// `drafts[num_accepted+1..]` keyed by the corrected (bonus) token, so
+    /// the next propose can re-offer it (lossless — proposal only).
+    fn dflash_stash_recycle(
+        &self,
+        _seq: &mut SequenceState,
+        _drafts: &[u32],
+        _num_accepted: usize,
+        _corrected_token: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// ATLAS_DFLASH_ECHO: stash the TARGET'S own verify argmaxes downstream
+    /// of the bonus (`verified[num_accepted+1..]`) keyed by the bonus token —
+    /// a target-authored draft chain for the next propose at zero propose
+    /// cost (lossless — proposal only).
+    fn dflash_stash_echo(
+        &self,
+        _seq: &mut SequenceState,
+        _verified: &[u32],
+        _num_accepted: usize,
+        _bonus_token: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Unified DFlash ctx commit (ATLAS_DFLASH_UNIFIED_CTX=1). Copies
     /// `num_committed` scratch rows (`dflash_hidden_save` rows
     /// `0..num_committed`) into `ctx_hidden_acc` at the CURRENT TAIL

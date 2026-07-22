@@ -171,6 +171,19 @@ pub fn step_verify_dflash(
         a.last_token = bonus;
     }
 
+    // Accept-lift draft sources (Phase A): stash this step's salvage for the
+    // next propose, keyed by the bonus (= next step's last_token). Both fns
+    // early-return when their env gate is off. Flat-chain path only (this IS
+    // the flat path; tree verify lands in Phase C).
+    // Recycle: the drafter's discarded tail drafts[num_accepted+1..].
+    if let Err(e) = model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token) {
+        tracing::warn!("dflash_stash_recycle: {e:#}");
+    }
+    // Echo: the target's own argmaxes verified[num_accepted+1..].
+    if let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token) {
+        tracing::warn!("dflash_stash_echo: {e:#}");
+    }
+
     crate::metrics::SPEC_DECODE_VERIFY
         .with_label_values(&[
             "dflash",

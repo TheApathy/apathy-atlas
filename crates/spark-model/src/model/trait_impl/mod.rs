@@ -512,6 +512,82 @@ impl Model for TransformerModel {
         proposer.collect_async_drafts(self.gpu.as_ref(), state)
     }
 
+    fn dflash_stash_recycle(
+        &self,
+        seq: &mut SequenceState,
+        drafts: &[u32],
+        num_accepted: usize,
+        corrected_token: u32,
+    ) -> Result<()> {
+        // Stash `drafts[num_accepted+1 ..]` (the tail discarded purely because
+        // it sat downstream of the first content miss) keyed by the corrected
+        // token the target committed at that miss. LOSSLESS: proposal only.
+        if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() != Some("1") {
+            return Ok(());
+        }
+        let Some(ps) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        let Some(ds) = ps
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        else {
+            return Ok(());
+        };
+        // `num_accepted+1` is the first downstream-discarded draft (the draft
+        // at `num_accepted` was wrong → replaced by the bonus). Full-accept
+        // leaves an empty tail → nothing to recycle.
+        let tail_start = num_accepted.saturating_add(1);
+        if tail_start < drafts.len() {
+            ds.recycle_tail.clear();
+            ds.recycle_tail.extend_from_slice(&drafts[tail_start..]);
+            ds.recycle_key = corrected_token;
+            ds.recycle_valid = true;
+        } else {
+            ds.recycle_tail.clear();
+            ds.recycle_valid = false;
+        }
+        Ok(())
+    }
+
+    fn dflash_stash_echo(
+        &self,
+        seq: &mut SequenceState,
+        verified: &[u32],
+        num_accepted: usize,
+        bonus_token: u32,
+    ) -> Result<()> {
+        // Stash `verified[num_accepted+1 ..]` — the target's own argmaxes at
+        // the positions AFTER the bonus — keyed by the bonus. LOSSLESS:
+        // proposal only.
+        use crate::layers::dflash_head::echo;
+        let Some(cfg) = echo::EchoConfig::from_env() else {
+            return Ok(());
+        };
+        let Some(ps) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        let Some(ds) = ps
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        else {
+            return Ok(());
+        };
+        let tail = echo::echo_tail(verified, num_accepted);
+        if echo::should_stash(&cfg, num_accepted, tail.len()) {
+            ds.echo_tail.clear();
+            ds.echo_tail.extend_from_slice(tail);
+            ds.echo_key = bonus_token;
+            ds.echo_valid = true;
+        } else {
+            // Gated out (full accept, weak prefix, or short tail) — never
+            // re-offer a stash staler than one step.
+            ds.echo_tail.clear();
+            ds.echo_valid = false;
+        }
+        Ok(())
+    }
+
     fn dflash_serial_ctx_append(&self, seq: &mut SequenceState) -> Result<()> {
         // Ctx-holes fix: append the serial-decoded token's captured hidden.
         // The decode layer loop (decode_a.rs try_dflash_capture) already
