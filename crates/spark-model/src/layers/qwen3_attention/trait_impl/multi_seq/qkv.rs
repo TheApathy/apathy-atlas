@@ -570,7 +570,17 @@ impl Qwen3AttentionLayer {
                           out: spark_runtime::gpu::DevicePtr,
                           n_out: u32|
          -> Result<()> {
-            if self.dense_gemm_pipelined_k.0 != 0 {
+            if ops::cublas_gemm_enabled() && n > 1 {
+                ops::cublas_bf16_proj_dense(
+                    normed,
+                    w.weight,
+                    out,
+                    n as u32,
+                    n_out,
+                    h as u32,
+                    stream,
+                )
+            } else if self.dense_gemm_pipelined_k.0 != 0 {
                 ops::dense_gemm_bf16_pipelined(
                     fwd.gpu,
                     self.dense_gemm_pipelined_k,

@@ -87,23 +87,44 @@ impl Qwen3AttentionLayer {
         // MLA models (Mistral-Small-4) take the dedicated absorbed-MLA
         // batched path (issue #84). The standard `ms_phase_qkv` reads
         // `attn.q_proj`, a NULL stub for MLA loaders — see `mla.rs`.
+        static P_QKV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static P_ROPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static P_CACHE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static P_PAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static P_OPROJ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        macro_rules! ph {
+            ($acc:ident, $body:expr) => {{
+                if vp2 {
+                    let t = std::time::Instant::now();
+                    let r = $body;
+                    ctx.gpu.synchronize(stream)?;
+                    $acc.fetch_add(
+                        t.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    r
+                } else {
+                    $body
+                }
+            }};
+        }
         let o_out = if let Some(ref _mla) = self.mla {
             self.ms_mla_decode(&c, kv_cache, meta)?
         } else {
             // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
-            self.ms_phase_qkv(&c)?;
+            ph!(P_QKV, self.ms_phase_qkv(&c)?);
 
             // ── Phase 3: RoPE per-sequence ──
-            self.ms_phase_rope(&c, meta)?;
+            ph!(P_ROPE, self.ms_phase_rope(&c, meta)?);
 
             // ── Phase 4: KV cache write ──
-            self.ms_phase_cache_write(&c, kv_cache, meta)?;
+            ph!(P_CACHE, self.ms_phase_cache_write(&c, kv_cache, meta)?);
 
             // ── Phase 5: paged decode attention (batched) ──
-            let attn_out = self.ms_phase_paged_decode(&c, kv_cache, meta)?;
+            let attn_out = ph!(P_PAGED, self.ms_phase_paged_decode(&c, kv_cache, meta)?);
 
             // ── Phase 6: gate multiply + O projection ──
-            self.ms_phase_o_proj(&c, attn_out)?
+            ph!(P_OPROJ, self.ms_phase_o_proj(&c, attn_out)?)
         };
 
         // TP all-reduce on o_out after o_proj (Megatron row-parallel
@@ -142,10 +163,16 @@ impl Qwen3AttentionLayer {
             if calls % 48 == 0 {
                 let a = ATTN_US.swap(0, std::sync::atomic::Ordering::Relaxed);
                 let f = FFN_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+                use std::sync::atomic::Ordering::Relaxed;
                 tracing::info!(
-                    "VERIFY_SPLIT (48 layer-calls): attn={:.1}ms ffn={:.1}ms",
+                    "VERIFY_SPLIT (48 layer-calls): attn={:.1}ms ffn={:.1}ms | qkv={:.1} rope={:.1} cache={:.1} paged={:.1} oproj={:.1}",
                     a as f64 / 1000.0,
                     f as f64 / 1000.0,
+                    P_QKV.swap(0, Relaxed) as f64 / 1000.0,
+                    P_ROPE.swap(0, Relaxed) as f64 / 1000.0,
+                    P_CACHE.swap(0, Relaxed) as f64 / 1000.0,
+                    P_PAGED.swap(0, Relaxed) as f64 / 1000.0,
+                    P_OPROJ.swap(0, Relaxed) as f64 / 1000.0,
                 );
             }
         }

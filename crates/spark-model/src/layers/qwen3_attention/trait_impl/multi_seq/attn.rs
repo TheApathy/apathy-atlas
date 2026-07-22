@@ -294,17 +294,44 @@ impl Qwen3AttentionLayer {
             // attn_out is contiguous [n, q_dim] and o_out is [n, h], so a single
             // batched GEMM reads the BF16 o_proj weight ONCE for all n sequences
             // instead of once per sequence (per-seq dense_gemv re-read it N×).
-            ops::dense_gemm(
-                fwd.gpu,
-                self.dense_gemm_k,
-                attn_out,
-                o_bf16,
-                o_out,
-                n as u32,
-                h as u32,
-                nq * hd,
-                stream,
-            )?;
+            // Same-precision fast ladder (VERIFY_SPLIT measured the naive
+            // dense_gemm at 44ms/step for the K=8 verify — 6.5× off the
+            // bandwidth floor): cuBLASLt BF16 → pipelined → naive.
+            if ops::cublas_gemm_enabled() && n > 1 {
+                ops::cublas_bf16_proj_dense(
+                    attn_out,
+                    o_bf16.weight,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
+            } else if self.dense_gemm_pipelined_k.0 != 0 {
+                ops::dense_gemm_bf16_pipelined(
+                    fwd.gpu,
+                    self.dense_gemm_pipelined_k,
+                    attn_out,
+                    o_bf16,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm(
+                    fwd.gpu,
+                    self.dense_gemm_k,
+                    attn_out,
+                    o_bf16,
+                    o_out,
+                    n as u32,
+                    h as u32,
+                    nq * hd,
+                    stream,
+                )?;
+            }
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             // FP8 native: per-token w8a16_gemv for O projection.
             for i in 0..n {
