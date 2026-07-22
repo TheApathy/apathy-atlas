@@ -867,6 +867,176 @@ extern "C" __global__ void moe_expert_gate_up_shared_batchN_v2(
     }
 }
 
+// gate_up v3 = v2 + staged activations: the M cohort rows' A-chunks live in
+// dynamic smem (one K-tile at a time, cooperative uint4 fill), so the inner
+// FMA loop reads smem instead of re-touching L1/L2 per (chunk, m). K-tile =
+// 1024 elems → 32 k32-groups = exactly one iteration per lane per tile; smem
+// = num_tokens*1024*2B = 16KB at M<=8. Same math order per accumulator as v2.
+// Launcher: identical grid/args to batchN, block 128, dynamic smem 16KB*.
+#define V3_TK 1024
+extern "C" __global__ void moe_expert_gate_up_shared_batchN_v3(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_packed,
+    const unsigned char* __restrict__ sh_gate_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_packed,
+    const unsigned char* __restrict__ sh_up_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int num_tokens
+) {
+    const unsigned int total_routed = num_tokens * top_k;
+    const unsigned int y = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const bool is_shared = (y >= total_routed);
+
+    __shared__ unsigned int s_slot[V2_MAX_M];
+    __shared__ unsigned int s_m;
+    if (!v2_gather_slots(expert_indices, y, total_routed, num_tokens, top_k,
+                         is_shared, s_slot, &s_m)) return;
+    const unsigned int M = s_m;
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    __nv_bfloat16* C_base;
+
+    if (is_shared) {
+        if (proj == 0) { B_packed = sh_gate_packed; B_scale = sh_gate_scale;
+                         s2 = sh_gate_s2; C_base = sh_gate_out; }
+        else           { B_packed = sh_up_packed; B_scale = sh_up_scale;
+                         s2 = sh_up_s2; C_base = sh_up_out; }
+    } else {
+        const unsigned int expert_id = expert_indices[y];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_ptrs[expert_id];
+            B_scale = (const unsigned char*)gate_scale_ptrs[expert_id];
+            s2 = gate_scale2_vals[expert_id];
+            C_base = gate_out;
+        } else {
+            B_packed = (const unsigned char*)up_packed_ptrs[expert_id];
+            B_scale = (const unsigned char*)up_scale_ptrs[expert_id];
+            s2 = up_scale2_vals[expert_id];
+            C_base = up_out;
+        }
+    }
+
+    if (B_packed == 0) {
+        const unsigned int n_base = blockIdx.x * (N_PER_BLOCK * 2);
+        for (unsigned int m = 0; m < M; m++) {
+            __nv_bfloat16* z = C_base + (unsigned long long)s_slot[m] * N;
+            for (unsigned int i = threadIdx.x; i < N_PER_BLOCK * 2 && n_base + i < N;
+                 i += V2_BLOCK) {
+                z[n_base + i] = __float2bfloat16(0.0f);
+            }
+        }
+        return;
+    }
+
+    const unsigned int local_out = threadIdx.x / V2_TPO;
+    const unsigned int lane = threadIdx.x % V2_TPO;
+    const unsigned int n1 = blockIdx.x * (N_PER_BLOCK * 2) + local_out * 2;
+    const unsigned int n2 = n1 + 1;
+    const bool have_n1 = (n1 < N);
+    const bool have_n2 = (n2 < N);
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+
+    __shared__ float s_lut[16];
+    extern __shared__ __nv_bfloat16 s_a[];  // [M, V3_TK]
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_BATCH2[threadIdx.x];
+
+    float acc1[V2_MAX_M], acc2[V2_MAX_M];
+    #pragma unroll
+    for (int m = 0; m < V2_MAX_M; m++) { acc1[m] = 0.0f; acc2[m] = 0.0f; }
+
+    const unsigned int num_tiles = K / V3_TK;
+    for (unsigned int tile = 0; tile < num_tiles; tile++) {
+        __syncthreads();
+        // cooperative A stage: M*V3_TK/8 uint4 loads across the block
+        for (unsigned int i8 = threadIdx.x; i8 < M * (V3_TK / 8); i8 += V2_BLOCK) {
+            const unsigned int m = i8 / (V3_TK / 8);
+            const unsigned int off = i8 % (V3_TK / 8);
+            const unsigned int token = is_shared ? s_slot[m] : s_slot[m] / top_k;
+            ((uint4*)(s_a + m * V3_TK))[off] =
+                *(const uint4*)(A + (unsigned long long)token * K + tile * V3_TK + off * 8);
+        }
+        __syncthreads();
+        if (!have_n1) continue;
+
+        // V3_TK/32 == V2_TPO: exactly one k32 group per lane per tile
+        const unsigned int k32 = tile * (V3_TK / 32) + lane;
+        const uint4 w1 = *(const uint4*)(B_packed + (unsigned long long)n1 * half_K + k32 * 16);
+        const uint4 w2 = have_n2 ?
+            *(const uint4*)(B_packed + (unsigned long long)n2 * half_K + k32 * 16)
+            : make_uint4(0u, 0u, 0u, 0u);
+        const unsigned int words1[4] = {w1.x, w1.y, w1.z, w1.w};
+        const unsigned int words2[4] = {w2.x, w2.y, w2.z, w2.w};
+        const unsigned int sg = k32 * 2;
+        const float sc1a = atlas_dec_e4m3(B_scale[(unsigned long long)n1 * num_groups + sg]) * s2;
+        const float sc1b = atlas_dec_e4m3(B_scale[(unsigned long long)n1 * num_groups + sg + 1]) * s2;
+        const float sc2a = have_n2 ?
+            atlas_dec_e4m3(B_scale[(unsigned long long)n2 * num_groups + sg]) * s2 : 0.0f;
+        const float sc2b = have_n2 ?
+            atlas_dec_e4m3(B_scale[(unsigned long long)n2 * num_groups + sg + 1]) * s2 : 0.0f;
+
+        const unsigned int local_elem = lane * 32;
+        #pragma unroll
+        for (int g = 0; g < 4; g++) {
+            const float scA = (g < 2) ? sc1a : sc1b;
+            const float scB = (g < 2) ? sc2a : sc2b;
+            float f1[8], f2[8];
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                const unsigned char bv1 = (words1[g] >> (b * 8)) & 0xFF;
+                f1[b * 2] = s_lut[bv1 & 0xF] * scA;
+                f1[b * 2 + 1] = s_lut[bv1 >> 4] * scA;
+                const unsigned char bv2 = (words2[g] >> (b * 8)) & 0xFF;
+                f2[b * 2] = s_lut[bv2 & 0xF] * scB;
+                f2[b * 2 + 1] = s_lut[bv2 >> 4] * scB;
+            }
+            #pragma unroll
+            for (int m = 0; m < V2_MAX_M; m++) {
+                if (m >= (int)M) break;
+                const __nv_bfloat16* am = s_a + m * V3_TK + local_elem + g * 8;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    acc1[m] += __bfloat162float(am[j]) * f1[j];
+                    acc2[m] += __bfloat162float(am[j]) * f2[j];
+                }
+            }
+        }
+    }
+    if (!have_n1) return;
+
+    #pragma unroll
+    for (int m = 0; m < V2_MAX_M; m++) {
+        if (m >= (int)M) break;
+        float a1 = acc1[m], a2 = acc2[m];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            a1 += __shfl_down_sync(0xFFFFFFFF, a1, offset);
+            a2 += __shfl_down_sync(0xFFFFFFFF, a2, offset);
+        }
+        if (lane == 0) {
+            __nv_bfloat16* out = C_base + (unsigned long long)s_slot[m] * N;
+            out[n1] = __float2bfloat16(a1);
+            if (have_n2) out[n2] = __float2bfloat16(a2);
+        }
+    }
+}
+
 // silu_down v2: each block covers V2D_ROWS output rows (vs v1's 8) so the
 // [M, K] activation staging amortizes: 24 blocks/expert at Laguna N=3072
 // instead of 384, cutting act re-read traffic ~16x. Each warp walks

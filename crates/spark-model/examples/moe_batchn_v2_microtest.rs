@@ -246,9 +246,12 @@ fn main() -> Result<()> {
 
     let launch_gate_up = |name: &str, block: u32, stream: u64| -> Result<()> {
         let h = gpu.kernel("moe_fused_batch2", name)?;
+        // v3 stages A per K-tile: num_tokens * 1024 * 2B dynamic smem
+        let smem = if name.ends_with("_v3") { (num_tokens * 1024 * 2) as u32 } else { 0 };
         KernelLaunch::new(gpu, h)
             .grid([(INTER as u32).div_ceil(8), rows_y, 2])
             .block([block, 1, 1])
+            .shared_mem(smem)
             .arg_ptr(a_ptr)
             .arg_ptr(gate_tbl.0)
             .arg_ptr(gate_tbl.1)
@@ -304,13 +307,20 @@ fn main() -> Result<()> {
     let v1_smem = (INTER * 4) as u32;
     let v2_smem = (num_tokens * INTER * 4) as u32;
     // production block choice for hidden>=3072 is 256 (v1); v2 fixes 128
-    let run_pair = |v2: bool, stream: u64| -> Result<()> {
-        if v2 {
-            launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, stream)?;
-            launch_silu_down("moe_expert_silu_down_shared_batchN_v2", 128, v2_smem, stream)
-        } else {
-            launch_gate_up("moe_expert_gate_up_shared_batchN", 256, stream)?;
-            launch_silu_down("moe_expert_silu_down_shared_batchN", 256, v1_smem, stream)
+    let run_pair = |mode: u8, stream: u64| -> Result<()> {
+        match mode {
+            1 => {
+                launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, stream)?;
+                launch_silu_down("moe_expert_silu_down_shared_batchN_v2", 128, v2_smem, stream)
+            }
+            2 => {
+                launch_gate_up("moe_expert_gate_up_shared_batchN_v3", 128, stream)?;
+                launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, stream)
+            }
+            _ => {
+                launch_gate_up("moe_expert_gate_up_shared_batchN", 256, stream)?;
+                launch_silu_down("moe_expert_silu_down_shared_batchN", 256, v1_smem, stream)
+            }
         }
     };
 
@@ -371,8 +381,8 @@ fn main() -> Result<()> {
     // ── correctness: v1 then v2, each vs the CPU reference ──
     let mut fail = false;
     let mut v1_down_all: Vec<f32> = Vec::new();
-    for (label, v2) in [("v1", false), ("v2", true)] {
-        run_pair(v2, stream)?;
+    for (label, mode) in [("v1", 0u8), ("v2", 1u8), ("v3", 2u8)] {
+        run_pair(mode, stream)?;
         gpu.synchronize(stream)?;
         let g = read_bf16(gate_out, total_routed * INTER)?;
         let d = read_bf16(down_out, total_routed * HIDDEN)?;
@@ -388,11 +398,11 @@ fn main() -> Result<()> {
         if [cg, cd, csg, csd].iter().any(|c| !(*c >= COSINE_GATE)) {
             fail = true;
         }
-        if v2 {
-            let dvd = cosine(&d, &v1_down_all);
-            println!("v2-vs-v1 down cosine: {dvd:.6}");
-        } else {
+        if mode == 0 {
             v1_down_all = d;
+        } else {
+            let dvd = cosine(&d, &v1_down_all);
+            println!("{label}-vs-v1 down cosine: {dvd:.6}");
         }
     }
 
@@ -449,6 +459,11 @@ fn main() -> Result<()> {
             "v2@128",
             Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, s)),
             Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN_v2", 128, v2_smem, s)),
+        ),
+        (
+            "v3@128",
+            Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN_v3", 128, s)),
+            Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, s)),
         ),
     ];
     for (label, gu, sd) in &configs {
