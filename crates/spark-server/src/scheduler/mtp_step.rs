@@ -20,6 +20,25 @@ pub fn step_mtp(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
+    // ATLAS_DFLASH_ASYNC: the previous step's propose was ENQUEUED on a
+    // second CUDA stream and returned a placeholder chain; its drafter
+    // kernels overlapped the step-tail CPU work. Collect the real drafts NOW
+    // (event sync + pinned-buffer read) before anything below inspects
+    // `pending_drafts`. `Some(vec![])` = the launch was orphaned → clear and
+    // bootstrap (lossless: drafts only ever propose). `None` = sync path.
+    for a in active.iter_mut() {
+        if !a.pending_drafts.is_empty() {
+            match model.dflash_collect_async_drafts(&mut a.seq) {
+                Ok(Some(drafts)) => a.pending_drafts = drafts,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("dflash_collect_async_drafts: {e:#}");
+                    a.pending_drafts.clear();
+                }
+            }
+        }
+    }
+
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {

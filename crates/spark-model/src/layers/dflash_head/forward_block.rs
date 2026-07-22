@@ -27,6 +27,11 @@ impl BlockDiffusionDraftHead {
         stream: u64,
         ctx_buffer: Option<(DevicePtr, usize)>,
         option_b: Option<(DevicePtr, u32)>,
+        // ATLAS_DFLASH_ASYNC: enqueue-only mode — leave the drafts D2H in
+        // flight on `stream` (the dedicated propose stream) and return an
+        // empty vec; collect_async_drafts_impl event-syncs and parses the
+        // pinned buffer at the top of the next scheduler step.
+        async_launch: bool,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -1003,6 +1008,9 @@ impl BlockDiffusionDraftHead {
             unsafe { std::slice::from_raw_parts_mut(pinned_ptr, self.gamma * 4) };
         gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, host_buf, stream)?;
         gpu.record_event(self.scratch.draft_tokens_event, stream)?;
+        if async_launch {
+            return Ok(Vec::new());
+        }
         gpu.event_synchronize(self.scratch.draft_tokens_event)?;
         let drafts: Vec<u32> = host_buf
             .chunks_exact(4)

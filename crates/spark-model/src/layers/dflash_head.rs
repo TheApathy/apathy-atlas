@@ -317,6 +317,11 @@ pub struct DflashProposerState {
     /// + i` formula in `precompute_ctx_kv`. Prefill positions are seeded
     /// `0..prompt_len` in `update_dflash_ctx_len_after_prefill`.
     pub ctx_positions: Vec<i32>,
+    /// ATLAS_DFLASH_ASYNC: this sequence's `pending_drafts` currently holds a
+    /// PLACEHOLDER chain from an async (second-stream) propose launch; the
+    /// real drafts are collected via `collect_async_drafts` at the top of
+    /// the next scheduler step. Cleared on collect / resolve.
+    pub async_placeholder: bool,
 }
 
 impl ProposerState for DflashProposerState {
@@ -497,10 +502,22 @@ pub struct BlockDiffusionDraftHead {
     /// is hit.
     pub propose_warmup_count: std::sync::atomic::AtomicUsize,
 
+    // ── ATLAS_DFLASH_ASYNC (ported from atlas-src task #20) ──
+    /// At most one in-flight async (second-stream) propose — the head owns a
+    /// single scratch buffer set. See `async_propose.rs`.
+    pub async_inflight: Mutex<Option<async_propose::AsyncInflight>>,
+    /// Dedicated non-blocking CUDA stream for async propose launches. Lazily
+    /// created on first eligible launch; `0` = creation failed → disabled.
+    pub async_propose_stream: std::sync::OnceLock<u64>,
+    /// Event ordering the propose stream after the default stream's prior
+    /// writes (ctx-append D2Ds, verify captures).
+    pub async_order_event: std::sync::atomic::AtomicU64,
+
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
 }
 
+mod async_propose;
 mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
@@ -540,6 +557,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             max_ctx_count_drafter: 0,
             ctx_committed: 0,
             ctx_positions: Vec::new(),
+            async_placeholder: false,
         }))
     }
 
@@ -597,6 +615,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
         Ok(())
     }
 
+    fn collect_async_drafts(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+    ) -> Result<Option<Vec<u32>>> {
+        let dstate = match state.as_any_mut().downcast_mut::<DflashProposerState>() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        self.collect_async_drafts_impl(gpu, dstate)
+    }
+
     fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
         // Phase 2 (Option B) reclaim: return the drafter's lazily-allocated
         // paged KV blocks to the pool on request completion. Without this the
@@ -609,6 +639,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
+        // ATLAS_DFLASH_ASYNC: an in-flight async propose reads this
+        // sequence's ctx buffers — sync + discard it before freeing them.
+        if async_propose::dflash_async_enabled() {
+            self.resolve_async_inflight_impl(gpu, Some(dstate))?;
+        }
         if !dstate.block_table.is_empty() {
             self.kv_cache.lock().free_blocks(&dstate.block_table);
             dstate.block_table.clear();

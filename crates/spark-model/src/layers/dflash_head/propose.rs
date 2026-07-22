@@ -452,20 +452,48 @@ impl BlockDiffusionDraftHead {
             None
         };
 
+        // Pass the accumulator's start pointer + `ctx_len` so forward_block
+        // knows how many ctx positions to project.
+        let ctx_buffer_arg = if dstate.ctx_len > 0 {
+            Some((dstate.ctx_hidden_acc, dstate.ctx_len))
+        } else {
+            None
+        };
+
+        // ── ATLAS_DFLASH_ASYNC: enqueue the drafter forward on the dedicated
+        // propose stream and return a placeholder chain; the scheduler
+        // collects the real drafts at the top of the next step (overlapping
+        // the drafter GPU time with the step-tail CPU work). On the
+        // ineligible path, resolve any stale in-flight launch before the sync
+        // forward below touches the shared drafter scratch.
+        if super::async_propose::dflash_async_enabled() {
+            match self.try_launch_async_propose(
+                last_token,
+                position,
+                ctx,
+                _stream,
+                ctx_buffer_arg,
+                option_b_arg,
+                _grammar_bitmask.is_some(),
+                dstate,
+            ) {
+                Ok(Some(placeholder)) => return Ok(placeholder),
+                Ok(None) => self.resolve_async_inflight_impl(ctx.gpu, None)?,
+                Err(e) => {
+                    tracing::warn!("DFLASH_ASYNC launch failed ({e:#}); sync propose fallback");
+                }
+            }
+        }
+
         let drafts = self
             .forward_block(
                 last_token,
                 position,
                 ctx,
                 _stream,
-                // Pass the accumulator's start pointer + `ctx_len` so
-                // forward_block knows how many ctx positions to project.
-                if dstate.ctx_len > 0 {
-                    Some((dstate.ctx_hidden_acc, dstate.ctx_len))
-                } else {
-                    None
-                },
+                ctx_buffer_arg,
                 option_b_arg,
+                false,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");

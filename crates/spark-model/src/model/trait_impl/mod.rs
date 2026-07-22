@@ -497,6 +497,21 @@ impl Model for TransformerModel {
         Ok(())
     }
 
+    fn dflash_collect_async_drafts(
+        &self,
+        seq: &mut SequenceState,
+    ) -> Result<Option<Vec<u32>>> {
+        let proposer = match &self.proposer {
+            Some(p) => p.as_ref(),
+            None => return Ok(None),
+        };
+        let state = match seq.proposer_state.as_mut() {
+            Some(s) => s.as_mut(),
+            None => return Ok(None),
+        };
+        proposer.collect_async_drafts(self.gpu.as_ref(), state)
+    }
+
     fn dflash_serial_ctx_append(&self, seq: &mut SequenceState) -> Result<()> {
         // Ctx-holes fix: append the serial-decoded token's captured hidden.
         // The decode layer loop (decode_a.rs try_dflash_capture) already

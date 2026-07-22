@@ -156,6 +156,20 @@ pub trait DraftProposer: Send + Sync {
         Ok(0)
     }
 
+    /// ATLAS_DFLASH_ASYNC: collect the real drafts of a previously-launched
+    /// async (second-stream) propose for this sequence. `Ok(None)` = nothing
+    /// pending (sync path / unsupported proposer); `Ok(Some(drafts))` = real
+    /// drafts replacing the placeholder chain; `Ok(Some(vec![]))` = orphaned
+    /// placeholder → caller bootstraps (lossless). Default: unsupported.
+    fn collect_async_drafts(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+    ) -> Result<Option<Vec<u32>>> {
+        let _ = (gpu, state);
+        Ok(None)
+    }
+
     /// Called after target verification to trim proposer state.
     ///
     /// `num_accepted` indicates how many draft tokens were accepted.

@@ -617,6 +617,17 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// ATLAS_DFLASH_ASYNC: collect the real drafts of the previous step's
+    /// async (second-stream) propose for this sequence, replacing its
+    /// placeholder chain. `Ok(None)` = nothing pending (sync path);
+    /// `Ok(Some(vec![]))` = orphaned launch → caller bootstraps (lossless).
+    fn dflash_collect_async_drafts(
+        &self,
+        _seq: &mut SequenceState,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Unified DFlash ctx commit (ATLAS_DFLASH_UNIFIED_CTX=1). Copies
     /// `num_committed` scratch rows (`dflash_hidden_save` rows
     /// `0..num_committed`) into `ctx_hidden_acc` at the CURRENT TAIL

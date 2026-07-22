@@ -605,6 +605,9 @@ impl BlockDiffusionDraftHead {
             propose_graphs: parking_lot::Mutex::new(None),
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
+            async_inflight: parking_lot::Mutex::new(None),
+            async_propose_stream: std::sync::OnceLock::new(),
+            async_order_event: std::sync::atomic::AtomicU64::new(0),
             quant: DflashQuantization::Bf16,
         };
 
