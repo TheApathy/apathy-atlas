@@ -89,6 +89,9 @@ impl MoeLayer {
                 .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batchN")?,
             moe_expert_silu_down_shared_batchn_k: gpu
                 .kernel("moe_fused_batch2", "moe_expert_silu_down_shared_batchN")?,
+            moe_expert_gate_up_shared_batchn_v2_k: gpu
+                .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batchN_v2")
+                .unwrap_or(KernelHandle(0)),
             moe_weighted_sum_blend_batch2: gpu
                 .kernel("moe_fused_batch2", "moe_weighted_sum_blend_batch2")?,
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,

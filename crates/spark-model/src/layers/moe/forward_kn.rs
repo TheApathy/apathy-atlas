@@ -165,10 +165,32 @@ impl MoeLayer {
         let shared_up_scratch = expert_up_out.offset(routed_inter_bytes);
         let shared_down_out = expert_down_out.offset(routed_hidden_bytes);
 
-        let batch_block = if ctx.config.hidden_size >= 3072 { 256u32 } else { 128u32 };
+        // ATLAS_KN_V2=1: expert-dedup gate_up kernel (one leader block per
+        // unique expert computes every token routed to it; shared expert read
+        // once) + block 128 for both kernels (at blockDim 256 the v1 kernels'
+        // BLOCK_SIZE=128 indexing makes threads 128-255 recompute the next
+        // block's rows). Microbench (moe_batchn_v2_microtest, Laguna shapes):
+        // 2.23 -> 1.66 ms/layer. v2 caps the per-leader token fan-out at 8.
+        static KN_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v2 = *KN_V2.get_or_init(|| {
+            std::env::var("ATLAS_KN_V2").ok().as_deref() == Some("1")
+        }) && num_tokens <= 8
+            && self.moe_expert_gate_up_shared_batchn_v2_k.0 != 0;
+        let batch_block = if v2 {
+            128u32
+        } else if ctx.config.hidden_size >= 3072 {
+            256u32
+        } else {
+            128u32
+        };
+        let gate_up_k = if v2 {
+            self.moe_expert_gate_up_shared_batchn_v2_k
+        } else {
+            self.moe_expert_gate_up_shared_batchn_k
+        };
         ops::moe_expert_gate_up_shared_batchn(
             ctx.gpu,
-            self.moe_expert_gate_up_shared_batchn_k,
+            gate_up_k,
             input,
             self.gate_ptrs.packed_ptrs,
             self.gate_ptrs.scale_ptrs,
