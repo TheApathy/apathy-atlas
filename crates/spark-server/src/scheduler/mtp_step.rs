@@ -72,6 +72,30 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
+                    // ── Task 1 DIAG (ATLAS_DFLASH_DIAG=1): the FIRST propose of
+                    // a fresh seq routes here (Phase A bootstrap), NOT through
+                    // the >=4 dflash dispatch — it always goes to k2/k3/k4 and
+                    // `continue`s. step_verify_dflash only fires on LATER
+                    // iterations (Phase B) once k4's re-propose set pending_drafts.
+                    // If init.len()<4 here the k4 re-propose likely also yields
+                    // <4 → dflash never reached. Log the count + branch.
+                    if std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1") {
+                        let branch = if eff >= 3 && init.len() >= 3 {
+                            "k4"
+                        } else if eff >= 2 && init.len() >= 2 {
+                            "k3"
+                        } else {
+                            "k2"
+                        };
+                        tracing::info!(
+                            "DFLASH DIAG scheduler Phase-A bootstrap: init.len()={} eff={} \
+                             → branch={} (bootstrap NEVER routes to dflash; k4 re-propose \
+                             must yield >=4 for Phase-B dflash to fire next iter)",
+                            init.len(),
+                            eff,
+                            branch,
+                        );
+                    }
                     if eff >= 3 && init.len() >= 3 {
                         step_verify_k4(
                             model,
@@ -298,6 +322,29 @@ pub fn step_mtp(
             if drafts.is_empty() {
                 continue;
             }
+        }
+
+        // ── Task 1 DIAG (ATLAS_DFLASH_DIAG=1): the drafts.len() the Phase-B
+        // verify dispatch sees, and which branch it takes. This is THE gate
+        // for step_verify_dflash firing (needs len>=4). If this logs a branch
+        // other than "dflash", propose is returning <4 for Laguna.
+        if std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1") {
+            let branch = if drafts.len() >= 4 {
+                "dflash (K=γ)"
+            } else if num_drafts >= 3 && drafts.len() >= 3 {
+                "k4"
+            } else if num_drafts >= 2 && drafts.len() >= 2 {
+                "k3"
+            } else {
+                "k2"
+            };
+            tracing::info!(
+                "DFLASH DIAG scheduler Phase-B verify dispatch: drafts.len()={} num_drafts={} \
+                 → branch={} (step_verify_dflash fires iff len>=4)",
+                drafts.len(),
+                num_drafts,
+                branch,
+            );
         }
 
         // DFlash γ-block drafters return ≥4 drafts per step (γ=16 typical).

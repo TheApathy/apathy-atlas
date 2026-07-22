@@ -240,7 +240,12 @@ impl BlockDiffusionDraftHead {
             dump_bf16("layer0.k_buf[ctx0].post_rope", self.scratch.k_buf, 10)?;
         }
 
-        // 3e. attention — non-causal, q_len = kv_len = n_attn.
+        // 3e. attention — q_len = kv_len = n_attn (contiguous [eff_ctx+γ],
+        // q_offset=0). Delta A: causal γ-block for the Laguna drafter
+        // (causal=true). Standard causal mask (kv_pos > q_pos ⇒ masked) makes
+        // noise query row `eff_ctx+i` attend to [0..=eff_ctx+i] — full ctx
+        // prefix visible, γ block causal within itself. Qwen3.6-DFlash keeps
+        // `causal=false` (bidirectional).
         ops::prefill_attention(
             gpu,
             self.kernels.prefill_attn,
@@ -254,7 +259,7 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            false,
+            self.causal,
             0,
             stream,
         )?;
@@ -294,6 +299,65 @@ impl BlockDiffusionDraftHead {
                     n_bytes
                 );
             }
+        }
+
+        // 3f'. Laguna per-head attention-output gate (applied BEFORE o_proj).
+        // FIX 3 (2026-07-22, docs/08 §2 + docs/07 GAP-3): the paged path already
+        // gates (forward_block_layer_paged.rs:944); this NON-paged legacy path
+        // was missing it entirely, so whenever Laguna routed here the attn output
+        // was left un-scaled → wrong. Port the same gate so Laguna is gated on
+        // WHICHEVER path runs. Gated on `layer.g_proj.is_some()` (Laguna only);
+        // Qwen3.6-DFlash leaves g_proj None → this block is skipped
+        // (bit-identical to before for the Qwen3.6-DFlash path).
+        //
+        // Reference (laguna.py::LagunaAttention.forward):
+        //   gate, _ = self.g_proj(hidden_states)        # x = input_layernorm'd hidden
+        //   gate    = F.softplus(gate.float())          # softplus in fp32 — a SCALE
+        //   attn_output = (attn_output.view(t, nq, hd) * gate.unsqueeze(-1)).view(...)
+        //
+        // The gate INPUT is the layer's NORMED input hidden (post input_layernorm),
+        // i.e. `norm_buf` (written in 3a, untouched since — q/k/v GEMMs only read
+        // it, o_proj hasn't run). `g_proj.weight` is `[num_q_heads, h]` (bias-free).
+        //
+        // vLLM computes ONLY the query rows (the γ block); this non-paged path
+        // carries n_attn = eff_ctx + γ rows, where the γ block is the LAST γ rows
+        // (offset `eff_ctx`). The ctx rows are keys-only in the reference and
+        // never feed the sampled draft logits, so we gate ONLY the γ rows — which
+        // also matches `gate_buf`'s `[γ, num_q_heads]` sizing. norm_buf and
+        // attn_out are both offset to the γ block by `eff_ctx` rows.
+        if let Some(g_proj) = layer.g_proj.as_ref() {
+            debug_assert!(
+                self.scratch.gate_buf != spark_runtime::gpu::DevicePtr::NULL,
+                "Laguna g_proj present but gate_buf scratch is NULL (non-paged path)"
+            );
+            let gamma = self.gamma as u32;
+            let norm_gamma = self.scratch.norm_buf.offset(eff_ctx * h as usize * bf16);
+            let attn_gamma = self.scratch.attn_out.offset(eff_ctx * q_dim as usize * bf16);
+            // gate logits: [γ, num_q_heads] = norm_buf[γ, h] @ g_projᵀ.
+            ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                norm_gamma,
+                g_proj,
+                self.scratch.gate_buf,
+                gamma,
+                self.num_q_heads as u32,
+                h,
+                stream,
+            )?;
+            // attn_out[γ][head,d] *= softplus(gate[γ][head]); softplus in fp32
+            // inside the kernel; broadcast over head_dim.
+            ops::softplus_gate_mul_head_broadcast(
+                gpu,
+                self.kernels.softplus_gate,
+                attn_gamma,
+                self.scratch.gate_buf,
+                attn_gamma,
+                self.num_q_heads as u32,
+                self.head_dim as u32,
+                gamma,
+                stream,
+            )?;
         }
 
         // 3f. o_proj.

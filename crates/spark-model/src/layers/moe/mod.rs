@@ -109,6 +109,9 @@ pub struct MoeLayer {
     // K=2 fused MoE kernel handles
     moe_expert_gate_up_shared_batch2: KernelHandle,
     moe_expert_silu_down_shared_batch2: KernelHandle,
+    // forward_k16 wide-verify batched MoE (num_tokens generalization, non-t).
+    moe_expert_gate_up_shared_batchn_k: KernelHandle,
+    moe_expert_silu_down_shared_batchn_k: KernelHandle,
     moe_weighted_sum_blend_batch2: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
     // K=3 fused MoE kernel handles
@@ -193,6 +196,9 @@ pub struct MoeLayer {
     tid2eid_dev: Option<DevicePtr>,
     moe_expert_gate_up_shared_batch2_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch2_t_k: KernelHandle,
+    // forward_k16 wide-verify batched MoE (num_tokens generalization of batch2_t).
+    moe_expert_gate_up_shared_batchn_t_k: KernelHandle,
+    moe_expert_silu_down_shared_batchn_t_k: KernelHandle,
     moe_expert_gate_up_shared_batch3_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch3_t_k: KernelHandle,
     moe_expert_gate_up_shared_fp8_t_k: KernelHandle,
@@ -408,6 +414,7 @@ mod forward_batched;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;
+mod forward_kn;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;

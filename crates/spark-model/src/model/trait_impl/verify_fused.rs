@@ -57,6 +57,13 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<Vec<u32>> {
+        // ATLAS_DFLASH_NO_FUSED=1: bypass the fused M=(1+k) graph and route the
+        // k2/k3/k4 bootstrap through the K=γ verify path instead — isolates
+        // fused-graph wrongness (Laguna debug: verify argmax diverges from
+        // plain decode within the first bootstrap steps).
+        if std::env::var("ATLAS_DFLASH_NO_FUSED").ok().as_deref() == Some("1") {
+            return self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream);
+        }
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize; // bytes per BF16 element
@@ -266,8 +273,60 @@ impl TransformerModel {
                             stream,
                         )?;
                     }
+                } else if layer_type == LayerType::SlidingAttention {
+                    // Sliding-window ATTENTION (Laguna): the single-token decode
+                    // attention consumes ctx.attn_metadata (NOT its seq_len arg),
+                    // so the shared M-row metadata must be offset per row — else
+                    // every row reads entry 0 (same RoPE position + KV slot) and
+                    // the last draft's K/V clobbers the committed token's slot
+                    // (docs/10 root cause). Mirror of the verify_d.rs fix.
+                    for t in 0..m {
+                        let mb = metadata.max_blocks_per_seq as usize;
+                        let meta_t = AttnMetadataDev {
+                            positions: metadata.positions.offset(t * 4),
+                            positions_h: metadata.positions_h.offset(t * 4),
+                            positions_w: metadata.positions_w.offset(t * 4),
+                            slot: metadata.slot.offset(t * 8),
+                            seq_len: metadata.seq_len.offset(t * 4),
+                            block_table: metadata.block_table.offset(t * mb * 4),
+                            max_blocks_per_seq: metadata.max_blocks_per_seq,
+                            num_seqs: 1,
+                            seq_slot: if metadata.seq_slot.0 != 0 {
+                                metadata.seq_slot.offset(t * 4)
+                            } else {
+                                metadata.seq_slot
+                            },
+                        };
+                        let ctx_t = ForwardContext {
+                            buffers: ctx.buffers,
+                            gpu: ctx.gpu,
+                            config: ctx.config,
+                            attn_metadata: Some(meta_t),
+                            profile: ctx.profile,
+                            comm: ctx.comm,
+                            graph_capture: ctx.graph_capture,
+                            gdn_exact_replay: ctx.gdn_exact_replay,
+                            token_ids: ctx.token_ids,
+                            routed_lora_layers: ctx.routed_lora_layers,
+                            midchunk_capture: None,
+                        };
+                        layer.decode(
+                            hidden.offset(t * h * bf16),
+                            residual.offset(t * h * bf16),
+                            seq.layer_states[layer_idx].as_mut(),
+                            &mut kv_cache,
+                            seq.seq_len + t,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
+                            &ctx_t,
+                            stream,
+                        )?;
+                    }
                 } else {
                     // SSM: batch all M tokens together (M=2/3 fast paths exist).
+                    // SSM decode is state-based and never reads attn_metadata,
+                    // so the shared-metadata batching is safe here.
                     layer.decode_batched(
                         hidden,
                         residual,

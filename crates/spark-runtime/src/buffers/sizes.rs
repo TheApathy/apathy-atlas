@@ -183,7 +183,21 @@ impl BufferSizes {
 
         // Batched expert output buffers for MoE (or dense FFN).
         // Sized for max(K=3 verify, prefill chunk) × top_k experts.
-        let k_max = m.max(3); // prefill chunk or K=3 verify, whichever larger
+        // forward_k16: the DFlash K=γ verify runs up to γ+1 tokens through the
+        // batched MoE at once. Size the expert scratch for that (routed
+        // num_tokens*top_k PLUS a shared-expert slice of num_tokens rows carved
+        // from the tail → need k_max*top_k >= num_tokens*(top_k+1)), so floor
+        // k_max at 20 when DFlash is active (covers K=17 with headroom).
+        // Only inflate when the batched verify (forward_kn) is actually enabled:
+        // the k_max floor grows the expert scratch ~7× and shifts the whole
+        // arena layout, so keep the proven layout unless ATLAS_DFLASH_BATCH_MOE=1.
+        let batch_moe = std::env::var("ATLAS_DFLASH_BATCH_MOE").ok().as_deref() == Some("1");
+        let dflash_k = if batch_moe && !config.dflash_capture_layers.is_empty() {
+            20
+        } else {
+            0
+        };
+        let k_max = m.max(3).max(dflash_k); // prefill chunk / K=3 verify / DFlash K=γ
         let expert_inter = if config.num_experts > 0 {
             k_max
                 * (config.num_experts_per_tok * config.moe_intermediate_size)
@@ -321,12 +335,12 @@ impl BufferSizes {
                     0
                 }),
             gate_logits: if config.num_experts > 0 {
-                m * config.num_experts * bf16
+                m.max(dflash_k) * config.num_experts * bf16
             } else {
                 256
             },
             gate_logits_f32: if config.num_experts > 0 {
-                m * config.num_experts * 4
+                m.max(dflash_k) * config.num_experts * 4
             } else {
                 256
             },

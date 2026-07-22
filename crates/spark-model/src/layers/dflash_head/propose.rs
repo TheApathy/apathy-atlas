@@ -471,6 +471,23 @@ impl BlockDiffusionDraftHead {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
                 e
             })?;
+
+        // ── Task 1 DIAG (ATLAS_DFLASH_DIAG=1): draft-count drop tracing ──
+        // (a) raw drafts straight out of the drafter forward, BEFORE any
+        // row-0 drop or DRAFT_CAP truncation. γ=16 → expect 16 here.
+        let diag = std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1");
+        if diag {
+            tracing::info!(
+                "DFLASH DIAG (a) raw forward_block drafts: len={} γ={} mask_token_id={} \
+                 position={} last_token={} ctx_len={}",
+                drafts.len(),
+                self.gamma,
+                self.mask_token_id,
+                position,
+                last_token,
+                dstate.ctx_len,
+            );
+        }
         // Default cap = γ. The nologik spec_ssm merge provides the WY-chunkwise
         // GDN kernels (gdn_decode_wy17 for K=17, wy2/wy3/wy4 for smaller K)
         // that snapshot per-position h/conv intermediates into the SSM pool.
@@ -509,14 +526,41 @@ impl BlockDiffusionDraftHead {
         // Gated on `mask_token_id` presence in the drafter config —
         // that's the diffusion-drafter signal. Autoregressive drafters
         // (e.g. EAGLE) have no mask token and should keep row 0.
-        let drafts = if self.mask_token_id != 0 && drafts.len() > 1 {
+        let row0_dropped = self.mask_token_id != 0 && drafts.len() > 1;
+        let drafts = if row0_dropped {
             drafts[1..].to_vec()
         } else {
             drafts
         };
 
+        // ── Task 1 DIAG (b): after the row-0 drop, before DRAFT_CAP. ──
+        if diag {
+            tracing::info!(
+                "DFLASH DIAG (b) after row-0-drop: len={} (row0_dropped={} because \
+                 mask_token_id={}≠0 && raw_len>1); DRAFT_CAP={}",
+                drafts.len(),
+                row0_dropped,
+                self.mask_token_id,
+                cap,
+            );
+        }
+
         let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
+
+        // ── Task 1 DIAG (c): final value returned to run_mtp_propose_inner
+        // (→ scheduler). This is the drafts.len() the >=4 dispatch sees
+        // (modulo the confidence-tau trim in impl_b3.rs, which the DIAG at
+        // the multi-dispatch site catches). <4 here => plain decode.
+        if diag {
+            tracing::info!(
+                "DFLASH DIAG (c) FINAL drafts returned: len={} (γ={}, expect γ-1={} \
+                 after row-0 drop); scheduler routes to step_verify_dflash iff len>=4",
+                drafts.len(),
+                self.gamma,
+                self.gamma.saturating_sub(1),
+            );
+        }
         Ok(drafts)
     }
 }

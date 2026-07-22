@@ -210,7 +210,32 @@ impl TransformerModel {
     ) -> Result<Vec<u32>> {
         // MTP loads ALL experts on every rank — no EP all_reduce needed.
         // Rank 1 does not participate in MTP propose.
-        self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask)
+        let out = self.run_mtp_propose_inner(token, position, num_drafts, seq, grammar_bitmask);
+        // ── Task 1 DIAG (ATLAS_DFLASH_DIAG=1): the drafts.len() that actually
+        // leaves the model layer for the scheduler. Differs from propose.rs
+        // DIAG (c) ONLY when the confidence-tau trim in run_mtp_propose_inner
+        // (impl_b3.rs) fired and returned an empty Vec — the one place <4 (in
+        // fact 0) can appear that propose.rs's own DIAG doesn't show.
+        if std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1") {
+            match &out {
+                Ok(d) => tracing::info!(
+                    "DFLASH DIAG multi_dispatch: requested num_drafts={} → returned len={} \
+                     (token={} position={}); scheduler >=4 dispatch sees THIS",
+                    num_drafts,
+                    d.len(),
+                    token,
+                    position,
+                ),
+                Err(e) => tracing::info!(
+                    "DFLASH DIAG multi_dispatch: propose ERRORED (num_drafts={} token={} \
+                     position={}): {e:#} → scheduler gets empty → plain decode",
+                    num_drafts,
+                    token,
+                    position,
+                ),
+            }
+        }
+        out
     }
 
     pub(super) fn read_deferred_draft_token_dispatch(&self) -> Result<u32> {

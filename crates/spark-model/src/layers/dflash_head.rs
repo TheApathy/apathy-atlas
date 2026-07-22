@@ -93,6 +93,13 @@ pub struct DflashKernels {
     /// for `fp8_gemm_n128_row_scaled` when M=γ=16. Single warp per CTA,
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
+    /// Laguna per-head attention-output gate: applies
+    /// `out[t,h,d] = in[t,h,d] * softplus(gate[t,h])`, broadcasting one
+    /// softplus scalar per head across `head_dim`. Consumes the `[γ, num_q_heads]`
+    /// gate produced by GEMV'ing the layer input hidden through `g_proj`.
+    /// Resolves to `softplus_gate_mul_head_broadcast` (kernels/gb10/common/
+    /// residual_add.cu). Only used when the drafter ships a per-head `g_proj`.
+    pub softplus_gate: KernelHandle,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -152,6 +159,26 @@ pub struct DflashScratch {
     /// historical target positions (decoded indices); last γ are
     /// the to-be-predicted noise positions.
     pub position_ids: DevicePtr,
+
+    /// Laguna per-capture aux-norm pre-pass scratch. `[ctx_window, L_t*h_t]`
+    /// BF16 — holds a per-capture RMS-normalised copy of the captured target
+    /// hiddens (each `h_t`-wide capture slice normalised by its own
+    /// `aux_hidden_norms[k]`) that `fc` then reads instead of the raw
+    /// accumulator. `DevicePtr::NULL` when the drafter has no aux norms
+    /// (Qwen3.6-DFlash), in which case the fc path reads the accumulator
+    /// directly (unchanged).
+    pub aux_normed: DevicePtr,
+    /// Laguna aux-norm gather temp. `[ctx_window, h_t]` BF16 — one capture
+    /// index's slices for all rows, gathered contiguously so the contiguous
+    /// `rms_norm` kernel can normalise them, then scattered back into
+    /// `aux_normed`. `DevicePtr::NULL` when the drafter has no aux norms.
+    pub aux_slice: DevicePtr,
+    /// Laguna per-head gate scratch: `[γ, num_q_heads]` BF16 — the raw
+    /// `hidden_in @ g_proj.T` logits (pre-softplus) for the γ noise rows.
+    /// `softplus_gate_mul_head_broadcast` reads this and applies the softplus
+    /// in fp32 internally. `DevicePtr::NULL` when the drafter has no `g_proj`
+    /// (Qwen3.6-DFlash) — the gate is then skipped entirely.
+    pub gate_buf: DevicePtr,
 }
 
 /// Drafter-side weight precision. Defaults to BF16. **Phase G (2026-05-28)**
@@ -186,6 +213,13 @@ pub struct DflashLayer {
     pub o_proj: DenseWeight,
     pub q_norm: DenseWeight,
     pub k_norm: DenseWeight,
+    /// Per-head attention output gate (`self_attn.g_proj.weight`, `[num_q_heads, hidden]`).
+    /// Present ONLY on the Laguna drafter (`gating: per-head`); `None` for the
+    /// Qwen3.6-DFlash drafters. When set, the forward path computes
+    /// `g = softplus(hidden_in @ g_proj.T)` [tokens, num_q_heads] and multiplies
+    /// it head-wise into the attention output (broadcast over head_dim) BEFORE
+    /// o_proj — see `forward_block_layer_post_attn`.
+    pub g_proj: Option<DenseWeight>,
     // MLP
     pub gate_proj: DenseWeight,
     pub up_proj: DenseWeight,
@@ -362,6 +396,22 @@ pub struct BlockDiffusionDraftHead {
     /// drafter shares vocab with the target (Qwen3.6-35B-A3B-DFlash case:
     /// vocab_size == draft_vocab_size == 248320).
     pub draft_id_to_target_id: Option<DevicePtr>,
+
+    /// Per-captured-target-hidden RMSNorms (`aux_hidden_norms.{k}.weight`,
+    /// each `[target_hidden_size]`). Present ONLY on the poolside **Laguna**
+    /// drafter: each captured target hidden is RMS-normalised with its own
+    /// norm BEFORE the `fc` projection (per-capture conditioning). Empty for
+    /// the Qwen3.6-DFlash drafters, which apply only the single post-`fc`
+    /// `hidden_norm`. When non-empty, the fc-projection sites (`forward_block`
+    /// step 0 and `precompute_ctx_kv`) pre-normalise the captured hiddens
+    /// slice-by-slice through these before running `fc`.
+    pub aux_hidden_norms: Vec<DenseWeight>,
+
+    /// `true` for the poolside Laguna drafter (`dflash_config.causal`). Gates
+    /// the causal γ-block attention mask in the CONTIG attention path
+    /// (`forward_block_layer*`). Default `false` so the Qwen3.6-DFlash drafters
+    /// keep the bidirectional block-diffusion γ-block attention unchanged.
+    pub causal: bool,
     /// Drafter transformer layers (8 for Qwen3.6-35B-A3B-DFlash).
     pub layers: Vec<DflashLayer>,
 

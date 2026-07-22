@@ -83,7 +83,6 @@ impl BlockDiffusionDraftHead {
         let n = new_ctx_count as u32;
         let l_total = self.num_layers;
         let target_hidden_dim = self.target_layer_ids.len() * self.target_hidden_size;
-        let ctx_slot_bytes = target_hidden_dim * bf16;
         let kv_slab_bytes = (kv_dim as usize) * bf16;
         // Stride (bytes) between adjacent rows in the fused KV GEMM output.
         let row_stride = l_total * 2 * kv_slab_bytes;
@@ -112,10 +111,17 @@ impl BlockDiffusionDraftHead {
             Ok(())
         };
 
+        // ── Step 0 (Laguna): per-capture aux_hidden_norms ────────────
+        // The Laguna drafter RMS-normalises each captured target hidden with
+        // its own `aux_hidden_norms[k]` BEFORE the fc projection (per-capture
+        // conditioning). `apply_aux_hidden_norms` writes the normalised
+        // [n, L_t*h_t] copy into `scratch.aux_normed` and returns that
+        // pointer; when the drafter has no aux norms (Qwen3.6-DFlash) it
+        // returns the raw accumulator slice unchanged.
         // ── Step 1: batched fc projection ────────────────────────────
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
-        let src = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
+        let src = self.apply_aux_hidden_norms(ctx_base_ptr, start_slot, new_ctx_count, ctx, stream)?;
         ops::dense_gemm_bf16_pipelined(
             gpu,
             self.kernels.dense_gemm_pipelined,
@@ -319,5 +325,103 @@ impl BlockDiffusionDraftHead {
         }
 
         Ok(())
+    }
+
+    /// Delta B — apply the Laguna drafter's per-capture `aux_hidden_norms` to
+    /// the captured target hiddens BEFORE the `fc` projection.
+    ///
+    /// The captured-hidden accumulator row is `[cap_0 | cap_1 | … | cap_{L_t-1}]`,
+    /// each capture slice `h_t = target_hidden_size` wide (row stride
+    /// `ctx_slot = L_t * h_t`). Each capture slice `k` must be RMS-normalised
+    /// with its own `aux_hidden_norms[k]` (`[h_t]`). The contiguous
+    /// `rms_norm` kernel only normalises contiguous `hidden_size`-wide rows, so
+    /// for each capture `k` we:
+    ///   1. gather the k-th slice of all `n` rows into a contiguous
+    ///      `[n, h_t]` temp (`scratch.aux_slice`) via a single pitched
+    ///      `copy_d2d_2d_async` (src pitch = ctx_slot, dst pitch = h_t),
+    ///   2. `rms_norm` that temp in place with `aux_hidden_norms[k]`, and
+    ///   3. scatter it back into the k-th slice of `scratch.aux_normed`
+    ///      (dst pitch = ctx_slot, src pitch = h_t).
+    /// `fc` then reads `aux_normed` (`[n, L_t*h_t]`) instead of the raw
+    /// accumulator.
+    ///
+    /// Returns the device pointer `fc` should read `n` rows from:
+    ///   * `scratch.aux_normed` when the drafter ships aux norms (Laguna), or
+    ///   * the raw accumulator slice `ctx_base_ptr + start_slot*ctx_slot`
+    ///     unchanged when it does not (Qwen3.6-DFlash — bit-identical to before).
+    ///
+    /// Assumption / faithfulness note: applies to the first
+    /// `min(aux_hidden_norms.len(), L_t)` capture slices; any remaining slices
+    /// are copied through un-normalised. The Laguna S-2.1 drafter ships exactly
+    /// `L_t` aux norms so all captures are covered.
+    pub(super) fn apply_aux_hidden_norms(
+        &self,
+        ctx_base_ptr: DevicePtr,
+        start_slot: usize,
+        n: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        use crate::layers::ops;
+
+        let bf16 = 2usize;
+        let h_t = self.target_hidden_size;
+        let l_t = self.target_layer_ids.len();
+        let ctx_slot_bytes = l_t * h_t * bf16;
+        let slice_bytes = h_t * bf16;
+        let src_base = ctx_base_ptr.offset(start_slot * ctx_slot_bytes);
+
+        // Qwen3.6-DFlash (no aux norms) or degenerate n=0 — read accumulator
+        // directly, unchanged.
+        if self.aux_hidden_norms.is_empty() || n == 0 {
+            return Ok(src_base);
+        }
+        debug_assert!(
+            !self.scratch.aux_normed.is_null() && !self.scratch.aux_slice.is_null(),
+            "aux_normed/aux_slice scratch must be allocated when aux_hidden_norms present"
+        );
+
+        let gpu = ctx.gpu;
+        let k_norms = self.aux_hidden_norms.len().min(l_t);
+        for k in 0..l_t {
+            // Gather the k-th slice of all n rows → contiguous [n, h_t].
+            gpu.copy_d2d_2d_async(
+                src_base.offset(k * slice_bytes), // src: k-th slice of row 0
+                ctx_slot_bytes,                   // src pitch: full row
+                self.scratch.aux_slice,           // dst: contiguous [n, h_t]
+                slice_bytes,                       // dst pitch: one slice
+                slice_bytes,                       // width bytes
+                n,                                 // rows
+                stream,
+            )?;
+
+            if k < k_norms {
+                // Normalise the gathered slice in place with aux_hidden_norms[k].
+                ops::rms_norm(
+                    gpu,
+                    self.kernels.rms_norm,
+                    self.scratch.aux_slice,
+                    &self.aux_hidden_norms[k],
+                    self.scratch.aux_slice,
+                    n as u32,
+                    h_t as u32,
+                    self.rms_norm_eps,
+                    stream,
+                )?;
+            }
+
+            // Scatter back into the k-th slice of aux_normed [n, L_t*h_t].
+            gpu.copy_d2d_2d_async(
+                self.scratch.aux_slice,                     // src: contiguous [n, h_t]
+                slice_bytes,                                 // src pitch: one slice
+                self.scratch.aux_normed.offset(k * slice_bytes), // dst: k-th slice of row 0
+                ctx_slot_bytes,                              // dst pitch: full row
+                slice_bytes,                                 // width bytes
+                n,                                           // rows
+                stream,
+            )?;
+        }
+
+        Ok(self.scratch.aux_normed)
     }
 }

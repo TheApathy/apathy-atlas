@@ -109,6 +109,26 @@ impl FfnComponent {
         }
     }
 
+    /// Wide DFlash verify (K=γ, e.g. 16 tokens) batched MoE — the forward_k16
+    /// fix. MoE: faithful batchN_t path (falls back to per-token internally if
+    /// unavailable). Dense: reuse the already-batched forward_prefill.
+    pub fn forward_kn(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => m.forward_kn(input, num_tokens, ctx, stream),
+            Self::Dense(d) => d.forward_prefill(input, num_tokens, ctx, stream),
+            Self::None => {
+                let _ = (input, num_tokens);
+                Ok(())
+            }
+        }
+    }
+
     /// K=4 verify FFN via batched GEMV (dense only). Returns `false` when the
     /// path is unavailable (MoE / missing batch4 kernel / non-NVFP4 weights)
     /// so the caller can fall back to `forward_prefill`.

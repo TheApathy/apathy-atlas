@@ -447,6 +447,7 @@ pub fn prefill_attention_paged_dflash_bf16_indirect(
     head_dim: u32,
     cache_block_size: u32,
     sliding_window: u32,
+    causal_mask_enabled: u32,
     inv_sqrt_d: f32,
     stream: u64,
 ) -> Result<()> {
@@ -456,6 +457,13 @@ pub fn prefill_attention_paged_dflash_bf16_indirect(
     // scalar `kv_len`/`q_offset` slots from the indirect buffer at entry, so
     // we feed placeholder zeros for those two args here — the values are
     // *ignored* once `KERNEL_PREAMBLE` runs in the .cu file.
+    //
+    // FIX 2 (2026-07-22, docs/08 §1): `causal_mask_enabled` is now a caller
+    // parameter (was hardcoded 0 = bidirectional). The Laguna drafter passes 1
+    // (causal) + sliding_window=512; the mask coordinate frame is set by the
+    // indirect `q_rope_pos` slot (see forward_block.rs — set to q_offset for
+    // Laguna so the mask compares cache-logical query slot vs cache-logical K
+    // slot). Qwen3.6-DFlash keeps 0 (bidirectional, unwindowed) → bit-identical.
     KernelLaunch::new(gpu, kernel)
         .grid([num_q_heads, div_ceil(q_len, br), 1])
         .block([128, 1, 1])
@@ -472,7 +480,7 @@ pub fn prefill_attention_paged_dflash_bf16_indirect(
         .arg_u32(head_dim)
         .arg_u32(cache_block_size)
         .arg_u32(sliding_window)
-        .arg_u32(0u32) // causal_mask_enabled = 0 (DFlash bidirectional)
+        .arg_u32(causal_mask_enabled)
         .arg_f32(inv_sqrt_d)
         .arg_ptr(kv_len_q_offset_dev) // KERNEL_EXTRA_PARAMS: kv_len_ptr
         .arg_ptr(kv_len_q_offset_dev.offset(4)) // KERNEL_EXTRA_PARAMS: q_offset_ptr

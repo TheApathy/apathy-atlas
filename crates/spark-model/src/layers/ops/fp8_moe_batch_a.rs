@@ -109,6 +109,108 @@ pub fn moe_expert_silu_down_shared_batch2_t(
         .launch(stream)
 }
 
+/// NVFP4 fused gate+up GEMV (transposed). batchN (forward_k16 wide verify).
+/// Identical math to `_batch2_t`; grid Y spans `num_tokens*(top_k+1)` so all
+/// tokens' expert GEMVs launch at once. `num_tokens` passed as the last arg.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_batchn_t(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate_packed_t_ptrs: DevicePtr,
+    gate_scale_t_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_t_ptrs: DevicePtr,
+    up_scale_t_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_t: &QuantizedWeight,
+    sh_gate_out: DevicePtr,
+    sh_up_t: &QuantizedWeight,
+    sh_up_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, T_BLOCK), num_tokens * (top_k + 1), 2])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate_packed_t_ptrs)
+        .arg_ptr(gate_scale_t_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_packed_t_ptrs)
+        .arg_ptr(up_scale_t_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_t.weight)
+        .arg_ptr(sh_gate_t.weight_scale)
+        .arg_f32(sh_gate_t.weight_scale_2)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(sh_up_t.weight)
+        .arg_ptr(sh_up_t.weight_scale)
+        .arg_f32(sh_up_t.weight_scale_2)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// NVFP4 fused SiLU+down GEMV (transposed). batchN (forward_k16 wide verify).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_batchn_t(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_t_ptrs: DevicePtr,
+    scale_t_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down_t: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, T_BLOCK), num_tokens * (top_k + 1), 1])
+        .block([T_BLOCK, 1, 1])
+        .shared_mem(smem_bytes)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_t_ptrs)
+        .arg_ptr(scale_t_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down_t.weight)
+        .arg_ptr(sh_down_t.weight_scale)
+        .arg_f32(sh_down_t.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
 /// NVFP4 fused gate+up GEMV (transposed). K=3 batch.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_gate_up_shared_batch3_t(

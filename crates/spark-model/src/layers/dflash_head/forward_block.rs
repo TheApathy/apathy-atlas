@@ -247,8 +247,15 @@ impl BlockDiffusionDraftHead {
                     );
                 }
             }
+            // Delta B (Laguna): per-capture aux_hidden_norms BEFORE fc. When
+            // the drafter ships aux norms, `apply_aux_hidden_norms` returns a
+            // pointer to the per-capture-normalised [eff_ctx, L_t*h_t] copy;
+            // otherwise it returns `base.offset(start_slot*ctx_slot)` unchanged
+            // (Qwen3.6-DFlash — bit-identical to before). fc reads from there.
+            let fc_src_base =
+                self.apply_aux_hidden_norms(base, start_slot, eff_ctx, ctx, stream)?;
             for i in 0..eff_ctx {
-                let src_slot = base.offset((start_slot + i) * ctx_slot_bytes);
+                let src_slot = fc_src_base.offset(i * ctx_slot_bytes);
                 let dst_slot = self.scratch.fc_proj.offset(i * self.hidden_size * bf16);
                 ops::dense_gemv(
                     gpu,
@@ -414,10 +421,26 @@ impl BlockDiffusionDraftHead {
             // indirect-args buffer (12 bytes). The graph-captured paged-
             // attention launch reads from this pointer at kernel entry.
             // q_offset = ctx_count (cache-block addressing).
-            // q_rope_pos = position (true decode position for query RoPE).
+            //
+            // FIX 2 (2026-07-22, docs/08 §1): the indirect `q_rope_pos` slot is
+            // consumed by the attention kernel SOLELY as the mask coordinate
+            // (`qr = q_rope_pos + q_start + row`) — that kernel does NOT rotate
+            // Q/K (Q was RoPE'd in step 3d, K at write-time). So the slot's real
+            // job is "query mask-position frame", not RoPE.
+            //   * Laguna (causal + 512-SWA): the ctx K sit at contiguous CACHE
+            //     SLOTS [0..ctx_count) and the γ block at [ctx_count..ctx_count+γ);
+            //     to make causal/SWA compare like-for-like against the K SLOT
+            //     index, the γ query row i must present as slot ctx_count+i.
+            //     Set q_rope_pos = q_offset (= ctx_count) so qr = ctx_count+row.
+            //   * Non-Laguna (bidirectional, mask disabled): keep the true decode
+            //     `position` (unused by the disabled mask; bit-identical).
             let kv_len = option_b_ctx_count + self.gamma as u32;
             let q_offset = option_b_ctx_count;
-            let q_rope_pos = position as u32;
+            let q_rope_pos = if self.causal {
+                q_offset
+            } else {
+                position as u32
+            };
             let indirect_bytes: [u8; 12] = {
                 let mut b = [0u8; 12];
                 b[0..4].copy_from_slice(&kv_len.to_ne_bytes());

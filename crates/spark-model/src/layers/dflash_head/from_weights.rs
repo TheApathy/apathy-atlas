@@ -52,8 +52,6 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        let _ = target_hidden_size;
-
         let num_layers = weights.config.num_hidden_layers;
         let hidden_size = weights.config.hidden_size;
         let intermediate_size = weights.config.intermediate_size;
@@ -62,6 +60,14 @@ impl BlockDiffusionDraftHead {
         let head_dim = weights.config.head_dim;
         let vocab_size = weights.config.vocab_size;
         let gamma_val = gamma.unwrap_or(weights.config.block_size);
+
+        // Delta #4: the Laguna drafter ships `sliding_window: 512` on all
+        // layers. When the caller didn't pass an explicit `--dflash-window`
+        // override, fall back to the drafter config's own sliding window so
+        // the head records the drafter's intended attention span. (The
+        // forward path honouring the window is a follow-up — see the Laguna
+        // loader notes in `weight_loader/dflash_loader.rs`.)
+        let window_size = window_size.or(weights.config.sliding_window);
 
         // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
         // sized for `max_seq_len + γ + 1` positions (prompt + γ drafts +
@@ -198,6 +204,13 @@ impl BlockDiffusionDraftHead {
                 "w4a16",
                 "fp8_gemm_t_row_scaled_m16",
             ),
+            // Laguna per-head softplus attention-output gate. Module/function
+            // both `softplus_gate_mul_head_broadcast` (kernels/gb10/common/
+            // residual_add.cu). Only invoked when a layer has `g_proj`; still
+            // resolved unconditionally so the handle is available for the
+            // Laguna path (Qwen3.6-DFlash never calls it).
+            softplus_gate: gpu
+                .kernel("residual_add", "softplus_gate_mul_head_broadcast")?,
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -282,6 +295,31 @@ impl BlockDiffusionDraftHead {
             logits: gpu.alloc(g * vocab_size * bf16)?,
             draft_tokens_dev: gpu.alloc(n_attn * 4)?,
             position_ids: gpu.alloc(n_attn * 4)?,
+            // Laguna per-capture aux-norm pre-pass scratch. Only allocated
+            // when the drafter ships `aux_hidden_norms` (Laguna); NULL for the
+            // Qwen3.6-DFlash drafters (they read the accumulator directly).
+            // `aux_normed`: [ctx_window, L_t*h_t] BF16 holds the normalised
+            // captured hiddens fc reads. `aux_slice`: [ctx_window, h_t] BF16
+            // gather temp for one capture index across all rows.
+            aux_normed: if weights.aux_hidden_norms.is_empty() {
+                DevicePtr::NULL
+            } else {
+                gpu.alloc(ctx_window * weights.config.dflash_config.as_ref()
+                    .map(|c| c.target_layer_ids.len()).unwrap_or(0)
+                    * target_hidden_size * bf16)?
+            },
+            aux_slice: if weights.aux_hidden_norms.is_empty() {
+                DevicePtr::NULL
+            } else {
+                gpu.alloc(ctx_window * target_hidden_size * bf16)?
+            },
+            // Laguna per-head gate scratch: [γ, num_q_heads] BF16. NULL unless
+            // the drafter ships a per-head g_proj (Laguna only).
+            gate_buf: if weights.layers.first().map(|l| l.g_proj.is_some()).unwrap_or(false) {
+                gpu.alloc(gamma_val * num_q_heads * bf16)?
+            } else {
+                DevicePtr::NULL
+            },
         };
 
         // Pre-compute inv_freq table for drafter RoPE.
@@ -297,7 +335,73 @@ impl BlockDiffusionDraftHead {
         // 64, pairs 11..26 ramped). Result: drafter Q/K rotations landed in
         // the wrong angular basis at every layer → 0% draft acceptance. Now
         // we read the drafter's own scaling block instead of guessing.
-        let rope_theta = weights.config.rope_theta;
+        // RoPE θ resolution. FIX 1 (2026-07-22, docs/08 §3 + ablation): vLLM
+        // inference (laguna.py + qwen3_dflash.set_default_rope_theta) applies the
+        // TARGET model's θ to both the ctx K (at their absolute positions) and the
+        // γ block. For the poolside Laguna checkpoint that target θ is **500000**.
+        // The drafter config's own `rope_theta` (10000) is the generic Qwen3
+        // default and lands the ctx K / γ Q in the WRONG angular basis → ≈0 code
+        // acceptance. Ablation confirmed θ=500000 lifts code acceptance 0.04→0.65
+        // (a ~16× swing).
+        //
+        // So for the Laguna drafter (gated on `sliding_window.is_some()`, the
+        // Laguna signal) we DEFAULT θ to the target's 500000, NOT the drafter
+        // config's value. Ideally we'd plumb the target model's actual
+        // `rope_theta`; that value is not threaded into this constructor yet, so
+        // we hardcode the poolside target θ (500000.0) — matched to the shipped
+        // Laguna-S-2.1 target config.rope_theta. The Qwen3.6-DFlash path is
+        // UNCHANGED (still the drafter config θ) — this is Laguna-only.
+        //
+        // `ATLAS_DFLASH_ROPE_THETA=<float>` still overrides on top (Laguna drafter
+        // only) so θ can be A/B'd (10000 vs 500000 vs …) on GPU without a rebuild.
+        // The effective θ is logged below.
+        const LAGUNA_TARGET_ROPE_THETA: f32 = 500_000.0;
+        let is_laguna = weights.config.sliding_window.is_some();
+        let rope_theta = {
+            let cfg_theta = weights.config.rope_theta;
+            // Laguna default = the TARGET θ (500000); non-Laguna = drafter cfg θ.
+            let laguna_default = if is_laguna {
+                LAGUNA_TARGET_ROPE_THETA
+            } else {
+                cfg_theta
+            };
+            match std::env::var("ATLAS_DFLASH_ROPE_THETA")
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+            {
+                Some(t) if is_laguna => {
+                    tracing::info!(
+                        "DFlash RoPE θ OVERRIDE (Laguna drafter): ATLAS_DFLASH_ROPE_THETA={t} \
+                         (drafter config rope_theta={cfg_theta}, target-default \
+                         {LAGUNA_TARGET_ROPE_THETA}); using {t}"
+                    );
+                    t
+                }
+                Some(t) => {
+                    tracing::warn!(
+                        "ATLAS_DFLASH_ROPE_THETA={t} set but this is NOT the Laguna drafter \
+                         (no sliding_window in config) — ignoring override, using drafter \
+                         config rope_theta={cfg_theta}"
+                    );
+                    cfg_theta
+                }
+                None if is_laguna => {
+                    tracing::info!(
+                        "DFlash RoPE θ = {laguna_default} (Laguna drafter: defaulting to the \
+                         TARGET model θ, NOT the drafter config rope_theta={cfg_theta}; \
+                         set ATLAS_DFLASH_ROPE_THETA to override)"
+                    );
+                    laguna_default
+                }
+                None => {
+                    tracing::info!(
+                        "DFlash RoPE θ = {cfg_theta} (drafter config rope_theta; \
+                         non-Laguna drafter — unchanged)"
+                    );
+                    cfg_theta
+                }
+            }
+        };
         let rotary_dim = head_dim; // Qwen3.6-DFlash applies rope to full head_dim
         let dim_f = rotary_dim as f32;
         let n_pairs = rotary_dim / 2;
@@ -441,6 +545,16 @@ impl BlockDiffusionDraftHead {
             norm: weights.norm,
             fc: weights.fc,
             draft_id_to_target_id: None,
+            // Delta B: per-capture aux norms (Laguna only; empty for Qwen3).
+            aux_hidden_norms: weights.aux_hidden_norms,
+            // Delta A: causal γ-block flag from the drafter's dflash_config.
+            // Default false (Qwen3.6-DFlash stays bidirectional).
+            causal: weights
+                .config
+                .dflash_config
+                .as_ref()
+                .map(|c| c.causal)
+                .unwrap_or(false),
             layers: weights
                 .layers
                 .into_iter()
@@ -453,6 +567,8 @@ impl BlockDiffusionDraftHead {
                     o_proj: l.o_proj,
                     q_norm: l.q_norm,
                     k_norm: l.k_norm,
+                    // Laguna per-head attention-output gate (None for Qwen3.6-DFlash).
+                    g_proj: l.g_proj,
                     gate_proj: l.gate_proj,
                     up_proj: l.up_proj,
                     down_proj: l.down_proj,

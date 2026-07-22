@@ -97,6 +97,43 @@ impl Qwen3AttentionLayer {
                 (2 * h) as u32,
                 stream,
             )?;
+        } else if !force_seq_ffn
+            && !self.ffn.is_dense()
+            && n > 4
+            && std::env::var("ATLAS_DFLASH_BATCH_MOE").ok().as_deref() == Some("1")
+        {
+            // EXPERIMENT (task #30, env-gated A/B): the per-token MoE loop below
+            // is the wide-γ verify bottleneck (682ms/step, ~95% MoE). The authors'
+            // comment (below) says the grouped-GEMM prefill path is a NET LOSS on a
+            // 256-expert MoE at small batch (per-expert M~1, sort/permute overhead).
+            // This branch routes the γ=16 verify MoE through `forward_prefill`
+            // (grouped GEMM) so we can MEASURE that claim on the Laguna box: run the
+            // verify with ATLAS_DFLASH_BATCH_MOE=1 vs unset and compare STEP_TIMING
+            // verify_ms. Reversible: off by default → zero effect on any other path.
+            let normed2 = fwd.buffers.norm_output();
+            ops::residual_add_rms_norm(
+                fwd.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                o_out,
+                &self.post_attn_norm,
+                normed2,
+                residual,
+                n as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            self.ffn.forward_kn(normed2, n, fwd, stream)?;
+            let moe_out = fwd.buffers.moe_output();
+            ops::residual_add(
+                fwd.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                (n * h) as u32,
+                stream,
+            )?;
         } else if !force_seq_ffn && self.ffn.is_dense() {
             // WIDE-VERIFY BATCHED DENSE FFN (DFlash γ=16, n=17). The dense FFN
             // (Qwen3.6-27B is dense) batches over all n rows via

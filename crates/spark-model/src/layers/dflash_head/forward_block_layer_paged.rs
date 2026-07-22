@@ -563,16 +563,59 @@ impl BlockDiffusionDraftHead {
         let gpu = ctx.gpu;
         let g = self.gamma as u32;
 
-        // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ, causal=false.
-        // dflash.py:84-97  `attn_output, _ = attn_fn(self, q, k, v, ...)`
-        //   with `self.is_causal = False` (line 39).  Q(γ) attends over
-        //   full K/V(ctx+γ) bidirectionally — identical semantics.
+        // 3f. paged attention — q_len=γ, kv_len=ctx_count+γ.
         //
-        // Phase 5 (CUDA graph): kv_len and q_offset are read from
-        // `option_b_indirect_args_dev` at kernel entry rather than passed
-        // as scalar args, so the captured launch survives per-call value
-        // changes. Host writes the 8-byte pair in forward_block.rs
-        // pre-graph; replays pick up whatever's there.
+        // FIX 2 (2026-07-22, docs/08 §1 + docs/07 GAP-2): the fast paged-indirect
+        // path is now CAUSAL + 512-SWA for the Laguna drafter (was always
+        // bidirectional + unwindowed). This is the vLLM-parity mask.
+        //
+        // ── Why this is now correct (the coordinate-frame resolution) ──
+        // The kernel's mask (prefill_paged_compute.cuh:361-382) compares the
+        // query mask-position `qr = q_rope_pos + q_start + row` against the K's
+        // CACHE-SLOT index `kv_start + c`. Crucially this attention kernel does
+        // NOT rotate Q or K — Q was RoPE'd in step 3d (at true positions
+        // [position..position+γ)) and ctx K was RoPE'd at write-time (at their
+        // true absolute `ctx_positions`). So `q_rope_pos` here feeds ONLY the
+        // mask, decoupled from RoPE. We can therefore put the MASK into the
+        // cache-logical (compacted-slot) frame independently of RoPE:
+        //   * ctx K occupy contiguous slots [0..ctx_count);
+        //   * the γ block occupies slots [ctx_count..ctx_count+γ);
+        //   * γ query row i lives at slot ctx_count+i.
+        // forward_block.rs stamps the indirect buffer's `q_rope_pos` slot to
+        // `q_offset` (= ctx_count) FOR THE LAGUNA DRAFTER (see there), so
+        // `qr = ctx_count + row`. Then:
+        //   * causal:  kv_slot > ctx_count+row masked → γ row i sees all ctx
+        //     (slots < ctx_count) + γ slots 0..i (causal within block). ✓
+        //   * 512-SWA: (ctx_count+row) - kv_slot ≥ 512 masked → moving-query
+        //     window in the compacted-slot frame. ✓
+        //
+        // ── Residual gap (documented) ──
+        // The SWA distance is measured in COMPACTED-SLOT units, which equals the
+        // true absolute-POSITION distance only when the ctx slots are
+        // position-contiguous (no accept-gaps / no think-token holes). Atlas's
+        // ctx accumulator appends one slot per decoded token with strictly
+        // increasing `ctx_positions` (propose.rs CTXLEN_PROBE), but a hole opens
+        // if some decoded tokens are not appended (e.g. skipped think tokens),
+        // in which case slot-distance < position-distance and the window keeps a
+        // few tokens vLLM would have dropped. This affects only the SWA CUTOFF
+        // (which tokens fall outside 512), never causality, and is benign
+        // whenever ctx_len ≤ ~512 (window never clips). Fully closing it needs
+        // the kernel to mask on a per-K stamped absolute position array (a
+        // larger kernel-signature change); deferred. The CONTIG path
+        // (ATLAS_DFLASH_CONTIG_ATTN=1) has the SAME slot-vs-position
+        // approximation, so this fast path is now at PARITY with it on mask
+        // fidelity while being far cheaper.
+        //
+        // Non-Laguna (Qwen3.6-DFlash): self.causal=false, window_size=None ⇒
+        // causal_mask_enabled=0, sliding_window=0, q_rope_pos=position — the
+        // exact prior bidirectional/unwindowed behavior, bit-identical.
+        //
+        // Phase 5 (CUDA graph): kv_len/q_offset/q_rope_pos are read from
+        // `option_b_indirect_args_dev` at kernel entry rather than passed as
+        // scalar args, so the captured launch survives per-call value changes.
+        // Host writes the 12-byte triple in forward_block.rs pre-graph.
+        let causal_mask_enabled: u32 = if self.causal { 1 } else { 0 };
+        let swa_window: u32 = self.window_size.unwrap_or(0) as u32;
         ops::prefill_attention_paged_dflash_bf16_indirect(
             gpu,
             self.kernels.prefill_attn_dflash_bf16_indirect,
@@ -586,8 +629,9 @@ impl BlockDiffusionDraftHead {
             self.num_q_heads as u32,
             self.num_kv_heads as u32,
             self.head_dim as u32,
-            16, // cache_block_size
-            0,  // sliding_window — drafter not windowed for now
+            16,         // cache_block_size
+            swa_window, // FIX 2: Laguna=512 (moving-query SWA), non-Laguna=0
+            causal_mask_enabled, // FIX 2: Laguna=1 (causal), non-Laguna=0
             inv_sqrt_d,
             stream,
         )?;
@@ -662,6 +706,22 @@ impl BlockDiffusionDraftHead {
         // Sync: ensure all pre_attn kernel writes are retired before D2H.
         gpu.synchronize(stream)?;
 
+        // Delta #4 (Laguna moving-query SWA): when the drafter ships a
+        // sliding_window (Laguna=512), bound the context attention to a moving
+        // window of `window_size` relative to each query's OWN array position.
+        // Reference §2/§7 (05-vllm-laguna_xs-reference.md): query row (anchor+i)
+        // attends base tokens p with p < anchor+i AND p >= (anchor+i) - 512.
+        // In the CONTIG layout the sequence is `[ctx (ctx_count rows) | γ]` at
+        // q_offset=0, ordered by increasing position (ctx = most-recent accepted
+        // positions, γ follows), so the kernel's `q_idx - k_idx >= window` mask
+        // on ARRAY INDICES is per-query-row (moving-query) SWA. This is faithful
+        // for the noise block (γ positions are contiguous) and an APPROXIMATION
+        // for the ctx half: the kernel windows on array-index distance, not true
+        // RoPE-position distance — exact only when the accumulated ctx slots are
+        // position-contiguous with no accept-gaps. Non-Laguna (window_size None)
+        // keeps window=0 (full ctx), bit-identical to before.
+        let swa_window: u32 = self.window_size.unwrap_or(0) as u32;
+
         // ── Fast path: ctx=0 — K/V/Q already in γ-row scratch, no gather needed ──
         // dflash.py:75  k = cat([k_ctx, k_noise]) ≡ k_noise when ctx_count=0.
         if ctx_count == 0 {
@@ -678,8 +738,15 @@ impl BlockDiffusionDraftHead {
                 self.num_kv_heads as u32,
                 self.head_dim as u32,
                 inv_sqrt_d,
-                false, // is_causal=false  (dflash.py:39)
-                0,
+                // Delta A: causal γ-block for the Laguna drafter (causal=true).
+                // With ctx=0 the sequence is just the γ noise rows; a causal
+                // mask makes noise row i attend noise [0..=i] (causal within
+                // block). Qwen3.6-DFlash keeps `causal=false` (bidirectional,
+                // dflash.py:39).
+                self.causal,
+                // Moving-query SWA (γ=16 << 512, so no-op here, but wired for
+                // faithfulness; matters once ctx>0 below).
+                swa_window,
                 stream,
             )?;
             if args.block_dump {
@@ -779,8 +846,24 @@ impl BlockDiffusionDraftHead {
             self.num_kv_heads as u32,
             self.head_dim as u32,
             inv_sqrt_d,
-            false, // is_causal=false  (dflash.py:39)
-            0,
+            // Delta A: causal γ-block for the Laguna drafter (causal=true).
+            // Q/K/V are the CONTIGUOUS [ctx+γ] sequence (q_offset=0), so a
+            // standard causal mask (kv_pos > q_pos ⇒ masked) makes query row
+            // `ctx+i` attend to [0..=ctx+i] — the full ctx prefix stays
+            // visible AND the γ noise block is causal within itself. This is
+            // exactly the causal γ-block semantics; the ctx prefix is NOT
+            // wrongly masked because every ctx position (index < ctx+i) is
+            // "older" than every noise query. Qwen3.6-DFlash keeps
+            // `causal=false` (bidirectional, dflash.py:39).
+            self.causal,
+            // Delta #4: moving-query SWA of `window_size` (Laguna=512) against
+            // each query's own array position in the contiguous [ctx+γ]
+            // sequence. Query row ctx+i attends keys with (ctx+i) - k_idx < 512,
+            // i.e. the last 512 positions ending at its own — per-query-row
+            // (moving-query), NOT anchor-fixed. Approximation note: windows on
+            // array index, exact only when ctx slots are position-contiguous.
+            // window=0 (non-Laguna) keeps full-ctx visibility.
+            swa_window,
             stream,
         )?;
 
@@ -876,6 +959,63 @@ impl BlockDiffusionDraftHead {
                 stream,
             )
         };
+
+        // 3f'. Laguna per-head attention-output gate (applied BEFORE o_proj).
+        // Reference §4 (05-vllm-laguna_xs-reference.md) / laguna.py::LagunaAttention:
+        //   gate, _ = self.g_proj(hidden_states)          # [tokens, num_q_heads]
+        //   gate    = F.softplus(gate.float())            # softplus in fp32 — a SCALE, not a sigmoid
+        //   attn_output = (attn_output.view(t, num_q_heads, head_dim)
+        //                  * gate.unsqueeze(-1)).view(...)  # broadcast per head over head_dim
+        // The gate INPUT is the layer's NORMED input hidden (post input_layernorm),
+        // the same tensor fed to q/k/v — that's exactly `norm_buf` here (pre_attn
+        // wrote it in 3a and nothing has overwritten it: q/k/v GEMMs read it,
+        // attention read q/k/v, and o_proj hasn't run yet). `g_proj.weight` is
+        // `[num_q_heads, h]` (bias-free), so a dense GEMM norm_buf[γ,h] @ Wᵀ →
+        // [γ, num_q_heads]. Only Laguna ships g_proj; Qwen3.6-DFlash leaves it
+        // None → this block is skipped (bit-identical to before). Applied
+        // head-wise into attn_out (broadcast over head_dim=128) before o_proj.
+        if let Some(g_proj) = layer.g_proj.as_ref() {
+            debug_assert!(
+                self.scratch.gate_buf != spark_runtime::gpu::DevicePtr::NULL,
+                "Laguna g_proj present but gate_buf scratch is NULL"
+            );
+            // gate logits: [γ, num_q_heads] = norm_buf[γ, h] @ g_projᵀ.
+            ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.scratch.norm_buf,
+                g_proj,
+                self.scratch.gate_buf,
+                g,
+                self.num_q_heads as u32,
+                h,
+                stream,
+            )?;
+            // attn_out[t,head,d] *= softplus(gate[t,head]) — softplus computed
+            // in fp32 inside the kernel; broadcast over head_dim.
+            ops::softplus_gate_mul_head_broadcast(
+                gpu,
+                self.kernels.softplus_gate,
+                self.scratch.attn_out,
+                self.scratch.gate_buf,
+                self.scratch.attn_out,
+                self.num_q_heads as u32,
+                self.head_dim as u32,
+                g,
+                stream,
+            )?;
+            if args.block_dump {
+                self.block_dump_buf(
+                    ctx,
+                    self.scratch.attn_out,
+                    args.layer_idx,
+                    "attn_out_gated",
+                    g,
+                    q_dim,
+                    stream,
+                )?;
+            }
+        }
 
         // 3g. o_proj — γ rows, [q_dim → h].
         // dflash.py:98-99  attn_output = attn_output.reshape(bsz, q_len, -1)

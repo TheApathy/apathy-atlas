@@ -171,7 +171,12 @@ impl TransformerModel {
             gpu: self.gpu.as_ref(),
             config: &self.config,
             attn_metadata: Some(metadata),
-            profile: false,
+            // ATLAS_PROFILE=1 lights up the per-op `prof!` timers (MoE gate/topk/
+            // exp_gate_up/exp_silu_down/wsum_blend) inside the verify forward so we
+            // can split the ~682ms/step into attention vs MoE. Gated on `!use_graphs`
+            // because `prof!` calls `synchronize()`, illegal mid graph-capture — so
+            // it only fires in eager mode (pair with ATLAS_DFLASH_DEBUG_NO_GRAPH=1).
+            profile: !use_graphs && std::env::var("ATLAS_PROFILE").is_ok(),
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -209,58 +214,93 @@ impl TransformerModel {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
 
-                if layer_type == LayerType::FullAttention {
-                    if hss_engaged {
-                        // HSS path: decode_multi_seq's paged-decode kernel
-                        // reads K/V from HBM only, missing the long-context
-                        // history on disk. Fall back to decode_batched
-                        // (sequential single-token decodes via the HSS
-                        // orchestrator). See verify_b.rs for full rationale.
-                        layer.decode_batched(
-                            hidden,
-                            residual,
-                            k,
-                            seq.layer_states[layer_idx].as_mut(),
-                            &mut kv_cache,
-                            seq.seq_len,
-                            &mut seq.block_table,
-                            &mut seq.disk_block_ids,
-                            &mut seq.disk_last_offloaded_per_layer,
-                            &ctx,
-                            stream,
-                        )?;
-                    } else {
-                        let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
-                            .map(|_| layer.alloc_state(self.gpu.as_ref()))
-                            .collect::<Result<_>>()?;
-                        let mut refs: Vec<&mut (dyn LayerState + 'static)> =
-                            dummy_states.iter_mut().map(|s| s.as_mut()).collect();
-                        layer.decode_multi_seq(
-                            hidden,
-                            residual,
-                            k,
-                            &mut refs,
-                            &mut kv_cache,
-                            &seq_lens_vec,
-                            &block_tables_vec,
-                            &ctx,
-                            stream,
-                        )?;
-                    }
-                } else {
-                    layer.decode_batched(
+                // forward_k16 speed probe: route SLIDING-window layers through the
+                // batched decode_multi_seq path too (not just FullAttention), so all
+                // 48 layers' MoE goes through forward_kn. Valid when ctx_len < window
+                // (512): SWA masks nothing, so multi_seq (full-attn paged decode) is
+                // bit-equivalent. ATLAS_DFLASH_ALL_MULTISEQ=1, short-context only.
+                let all_multiseq =
+                    std::env::var("ATLAS_DFLASH_ALL_MULTISEQ").ok().as_deref() == Some("1");
+                // ATLAS_DFLASH_ALL_BATCHED=1 (debug): route ALL layers through the
+                // sequential decode_batched loop (no decode_multi_seq at all) —
+                // isolates whether the multiseq paged-decode path is the source of
+                // the verify-argmax divergence from plain decode.
+                let all_batched =
+                    std::env::var("ATLAS_DFLASH_ALL_BATCHED").ok().as_deref() == Some("1");
+                let use_multiseq = !hss_engaged
+                    && !all_batched
+                    && (layer_type == LayerType::FullAttention || all_multiseq);
+                if use_multiseq {
+                    let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
+                        .map(|_| layer.alloc_state(self.gpu.as_ref()))
+                        .collect::<Result<_>>()?;
+                    let mut refs: Vec<&mut (dyn LayerState + 'static)> =
+                        dummy_states.iter_mut().map(|s| s.as_mut()).collect();
+                    layer.decode_multi_seq(
                         hidden,
                         residual,
                         k,
-                        seq.layer_states[layer_idx].as_mut(),
+                        &mut refs,
                         &mut kv_cache,
-                        seq.seq_len,
-                        &mut seq.block_table,
-                        &mut seq.disk_block_ids,
-                        &mut seq.disk_last_offloaded_per_layer,
+                        &seq_lens_vec,
+                        &block_tables_vec,
                         &ctx,
                         stream,
                     )?;
+                } else {
+                    // HSS or sliding (default): sequential single-token decodes.
+                    //
+                    // ROOT-CAUSE FIX (docs/10): the single-token decode attention
+                    // consumes ctx.attn_metadata (pre-uploaded device metadata),
+                    // NOT its seq_len argument. Passing the K-row verify metadata
+                    // unchanged made every row read ENTRY 0 — same RoPE position,
+                    // same KV slot — so all K rows collapsed onto position
+                    // seq_len, the last draft's K/V overwrote the committed
+                    // token's slot each step, and generation degenerated
+                    // progressively. Give each row its own metadata view.
+                    for t in 0..k {
+                        let mb = metadata.max_blocks_per_seq as usize;
+                        let meta_t = AttnMetadataDev {
+                            positions: metadata.positions.offset(t * 4),
+                            positions_h: metadata.positions_h.offset(t * 4),
+                            positions_w: metadata.positions_w.offset(t * 4),
+                            slot: metadata.slot.offset(t * 8),
+                            seq_len: metadata.seq_len.offset(t * 4),
+                            block_table: metadata.block_table.offset(t * mb * 4),
+                            max_blocks_per_seq: metadata.max_blocks_per_seq,
+                            num_seqs: 1,
+                            seq_slot: if metadata.seq_slot.0 != 0 {
+                                metadata.seq_slot.offset(t * 4)
+                            } else {
+                                metadata.seq_slot
+                            },
+                        };
+                        let ctx_t = ForwardContext {
+                            buffers: ctx.buffers,
+                            gpu: ctx.gpu,
+                            config: ctx.config,
+                            attn_metadata: Some(meta_t),
+                            profile: ctx.profile,
+                            comm: ctx.comm,
+                            graph_capture: ctx.graph_capture,
+                            gdn_exact_replay: ctx.gdn_exact_replay,
+                            token_ids: ctx.token_ids,
+                            routed_lora_layers: ctx.routed_lora_layers,
+                            midchunk_capture: None, // decode/verify never midchunk-captures
+                        };
+                        layer.decode(
+                            hidden.offset(t * h * bf16),
+                            residual.offset(t * h * bf16),
+                            seq.layer_states[layer_idx].as_mut(),
+                            &mut kv_cache,
+                            seq.seq_len + t,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
+                            &ctx_t,
+                            stream,
+                        )?;
+                    }
                 }
                 // DFlash intermediate hidden capture: snapshot each capture
                 // layer's output at position k-1 (last verify token) into
