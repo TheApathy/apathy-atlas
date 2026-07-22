@@ -512,6 +512,65 @@ impl Model for TransformerModel {
         proposer.collect_async_drafts(self.gpu.as_ref(), state)
     }
 
+    fn dflash_adopt_fork_blocks(&self, seq: &mut SequenceState, adopt: bool) -> Result<()> {
+        if seq.block_fork_scratch.is_empty() {
+            return Ok(());
+        }
+        let mut kv = self.kv_cache.lock();
+        for (bt_idx, scratch) in std::mem::take(&mut seq.block_fork_scratch) {
+            if adopt && bt_idx < seq.block_table.len() {
+                let old = seq.block_table[bt_idx];
+                seq.block_table[bt_idx] = scratch;
+                kv.free_block(old);
+            } else {
+                kv.free_block(scratch);
+            }
+        }
+        Ok(())
+    }
+
+    fn dflash_eagle_kgamma_append_at(
+        &self,
+        seq: &mut SequenceState,
+        num_accepted: usize,
+        base_pos: usize,
+        base_row: usize,
+    ) -> Result<()> {
+        if base_row == 0 {
+            return self.dflash_eagle_kgamma_append(seq, num_accepted, base_pos);
+        }
+        // B-chain variant: identical to dflash_eagle_kgamma_append but the
+        // capture rows start at `base_row` in dflash_hidden_save.
+        let base = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let prop = match seq.proposer_state.as_mut() {
+            Some(p) => p.as_mut(),
+            None => return Ok(()),
+        };
+        let d = prop
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("not DFlash proposer state"))?;
+        let n_layers = self.dflash_capture_layers.len();
+        if n_layers == 0 {
+            return Ok(());
+        }
+        let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
+        let stream = self.gpu.default_stream();
+        for t in 0..=num_accepted {
+            let row = base.offset((base_row + t) * ctx_slot_bytes);
+            let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
+            self.gpu.copy_d2d_async(row, dst, ctx_slot_bytes, stream)?;
+            let pos = (base_pos + t) as i32;
+            d.ctx_positions.push(pos);
+            d.ctx_len += 1;
+        }
+        d.skip_next_decode_append = true;
+        Ok(())
+    }
+
     fn dflash_take_block_fork(&self, seq: &mut SequenceState) -> Option<(usize, u32)> {
         seq.proposer_state
             .as_mut()?

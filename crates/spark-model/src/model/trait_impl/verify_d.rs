@@ -63,11 +63,48 @@ impl TransformerModel {
 
         let mut kv_cache = self.kv_cache.lock();
 
+        // ── Block-fork tree (doc 16, ATLAS_DFLASH_BLOCKFORK=1) ──
+        // B = the same chain with tokens[cliff+1] replaced by fork_tok,
+        // verified as rows k..2k. B's rows read/write KV through scratch
+        // copy-on-write blocks so the two chains never collide at the same
+        // positions. Flat path (fork = None) is byte-identical to before.
+        static BLOCKFORK_V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let blockfork_on = *BLOCKFORK_V.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_BLOCKFORK").ok().as_deref() == Some("1")
+        });
+        let hss_early = kv_cache.config().cache_blocks_per_seq.is_some();
+        // The sliding-layer per-row fallback only processes chain-A rows; B
+        // rows would carry garbage logits and corrupt the walk. Fork only
+        // when every layer routes through decode_multi_seq.
+        let all_multiseq_on =
+            std::env::var("ATLAS_DFLASH_ALL_MULTISEQ").ok().as_deref() == Some("1");
+        let fork = if blockfork_on && !hss_early && all_multiseq_on {
+            // arena rows cap 20 (sizes.rs dflash_k); cliff must index drafts
+            seq.block_fork.take().filter(|(c, _)| c + 2 <= k && 2 * k <= 20)
+        } else {
+            seq.block_fork = None;
+            None
+        };
+        let tokens_all: Vec<u32> = if let Some((c, ft)) = fork {
+            let mut v = Vec::with_capacity(2 * k);
+            v.extend_from_slice(tokens);
+            v.extend_from_slice(tokens);
+            // B replaces the cliff draft (tokens[c+1] = drafts[c]) with the
+            // fork token. The scheduler sets ft == drafts[c] under
+            // FORK_DEGEN, making this a no-op there (B ≡ A) so verify + walk
+            // stay consistent — the transparency gate.
+            v[k + c + 1] = ft;
+            v
+        } else {
+            tokens.to_vec()
+        };
+        let kt = tokens_all.len();
+
         // ── Phase 1: Pre-graph (varies per step, NOT captured) ──
 
-        // 1a. Embed K tokens
-        for t in 0..k {
-            self.embed(tokens[t], hidden.offset(t * h * fp32), stream)?;
+        // 1a. Embed all verify rows (A chain, then the B fork chain).
+        for t in 0..kt {
+            self.embed(tokens_all[t], hidden.offset(t * h * fp32), stream)?;
         }
 
         // 1b. Allocate KV blocks for all K positions
@@ -93,36 +130,85 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = self.max_blocks_per_seq;
 
-        let positions: Vec<u32> = (0..k).map(|t| (seq.seq_len + t) as u32).collect();
+        // Fork scratch blocks: copy-on-write for every block the verify rows
+        // touch. Seeded with the real block's current bytes so B's rows see
+        // the committed in-block prefix; B rows then write their own K/V
+        // here. Laguna: all layers are attention → kv layer index == layer
+        // index. Recorded on seq.block_fork_scratch for the scheduler's
+        // adopt/free call (free_sequence is the leak backstop).
+        let mut fork_scratch_abs: Vec<(usize, u32)> = Vec::new(); // (abs_blk, scratch)
+        if fork.is_some() {
+            let ws = seq.hss_window_start();
+            let b_lo = seq.seq_len / bs;
+            let b_hi = (seq.seq_len + k - 1) / bs;
+            for ab in b_lo..=b_hi {
+                let phys = seq.physical_block_for(ab).unwrap_or(0);
+                let scratch = kv_cache.alloc_block()?;
+                for l in 0..self.layers.len() {
+                    let kb = kv_cache.config().k_block_bytes_for_layer(l);
+                    let vb = kv_cache.config().v_block_bytes_for_layer(l);
+                    self.gpu.copy_d2d_async(
+                        kv_cache.k_cache_ptr(l, phys),
+                        kv_cache.k_cache_ptr(l, scratch),
+                        kb,
+                        stream,
+                    )?;
+                    self.gpu.copy_d2d_async(
+                        kv_cache.v_cache_ptr(l, phys),
+                        kv_cache.v_cache_ptr(l, scratch),
+                        vb,
+                        stream,
+                    )?;
+                }
+                fork_scratch_abs.push((ab, scratch));
+                seq.block_fork_scratch.push((ab.saturating_sub(ws), scratch));
+            }
+        }
+
+        let positions: Vec<u32> = (0..kt).map(|t| (seq.seq_len + (t % k)) as u32).collect();
         let pos_bytes =
-            unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, k * 4) };
+            unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, kt * 4) };
         self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
 
-        let mut slots = vec![0i64; k];
-        for t in 0..k {
-            let pos = seq.seq_len + t;
+        let mut slots = vec![0i64; kt];
+        for t in 0..kt {
+            let pos = seq.seq_len + (t % k);
             let block_idx = pos / bs;
             let block_offset = pos % bs;
-            let physical_block = seq.physical_block_for(block_idx).unwrap_or(0);
+            let mut physical_block = seq.physical_block_for(block_idx).unwrap_or(0);
+            // B rows write K/V into the forked scratch blocks.
+            if t >= k
+                && let Some(&(_, s)) = fork_scratch_abs.iter().find(|(ab, _)| *ab == block_idx)
+            {
+                physical_block = s;
+            }
             slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
         }
         // 256-byte gap mirrors K=4 layout for ABI compatibility with
         // attention kernels that index meta_base + fixed offsets.
-        let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, k * 8) };
+        let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, kt * 8) };
         self.gpu
             .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
 
-        let seq_lens: Vec<i32> = (0..k).map(|t| (seq.seq_len + t + 1) as i32).collect();
-        let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, k * 4) };
+        let seq_lens: Vec<i32> = (0..kt).map(|t| (seq.seq_len + (t % k) + 1) as i32).collect();
+        let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, kt * 4) };
         self.gpu
             .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
 
         let mb = max_blocks as usize;
-        let needed = k * mb;
+        let needed = kt * mb;
         let mut bt_buf = vec![0i32; needed];
-        for row in 0..k {
+        for row in 0..kt {
             for (j, &block) in seq.block_table.iter().enumerate().take(mb) {
                 bt_buf[row * mb + j] = block as i32;
+            }
+            // B rows read attention through the forked table.
+            if row >= k {
+                for &(bt_idx, scratch) in &seq.block_fork_scratch {
+                    if bt_idx < mb {
+                        bt_buf[row * mb + bt_idx] = scratch as i32;
+                    }
+                }
             }
         }
         let bt_bytes =
@@ -134,9 +220,9 @@ impl TransformerModel {
         // sequence → one adapter; [K]-all-equal buffer at the +128 gap, uploaded
         // pre-`begin_capture`. γ spec depth MUST stay ≤ 32 or +128+K*4 would
         // overrun slot@+256. `DevicePtr(0)` (no pool) → installed-pair path.
-        debug_assert!(k <= 32, "γ verify seq_slot +128 gap holds K ≤ 32");
+        debug_assert!(kt <= 32, "γ verify seq_slot +128 gap holds K ≤ 32");
         let seq_slot =
-            self.upload_seq_slot_uniform(seq.adapter_slot, k, meta_base.offset(128), stream)?;
+            self.upload_seq_slot_uniform(seq.adapter_slot, kt, meta_base.offset(128), stream)?;
 
         let metadata = AttnMetadataDev {
             positions: meta_base,
@@ -146,7 +232,7 @@ impl TransformerModel {
             seq_len: meta_base.offset(512),
             block_table: meta_base.offset(768),
             max_blocks_per_seq: max_blocks,
-            num_seqs: k as u32,
+            num_seqs: kt as u32,
             seq_slot,
         };
 
@@ -193,7 +279,7 @@ impl TransformerModel {
             None
         };
 
-        let cache_key = (seq.slot_idx, k);
+        let cache_key = (seq.slot_idx, kt);
         let cached_for_slot = graph_cache
             .as_ref()
             .and_then(|c| c.get(&cache_key).copied());
@@ -204,8 +290,18 @@ impl TransformerModel {
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
-            let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
-            let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
+            let seq_lens_vec: Vec<usize> = (0..kt).map(|t| seq.seq_len + (t % k)).collect();
+            let block_tables_vec: Vec<Vec<u32>> = {
+                let mut fork_table = seq.block_table.clone();
+                for &(bt_idx, scratch) in &seq.block_fork_scratch {
+                    if bt_idx < fork_table.len() {
+                        fork_table[bt_idx] = scratch;
+                    }
+                }
+                (0..kt)
+                    .map(|t| if t >= k { fork_table.clone() } else { seq.block_table.clone() })
+                    .collect()
+            };
 
             if use_graphs {
                 self.gpu.begin_capture(stream)?;
@@ -329,7 +425,7 @@ impl TransformerModel {
                     == Some("1")
                     || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1");
                 if capture_all {
-                    self.try_dflash_capture_all(layer_idx, k, stream)?;
+                    self.try_dflash_capture_all(layer_idx, kt, stream)?;
                 } else {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
                 }
@@ -353,7 +449,7 @@ impl TransformerModel {
                 );
             }
 
-            // Final norm [K, H]
+            // Final norm over ALL verify rows (A + fork chain B)
             let normed = self.buffers.norm_output();
             ops::rms_norm(
                 self.gpu.as_ref(),
@@ -361,19 +457,19 @@ impl TransformerModel {
                 hidden,
                 &self.final_norm,
                 normed,
-                k as u32,
+                kt as u32,
                 h as u32,
                 self.config.rms_norm_eps as f32,
                 stream,
             )?;
 
-            // LM head for K tokens
-            self.lm_head_batched(normed, k as u32, self.buffers.logits(), stream)?;
+            // LM head over all verify rows
+            self.lm_head_batched(normed, kt as u32, self.buffers.logits(), stream)?;
 
             // Argmax inside graph (fixed scratch addresses — graph-safe)
             let vocab = self.config.vocab_size;
             let argmax_out = self.buffers.scratch();
-            for t in 0..k {
+            for t in 0..kt {
                 let logits_t = self.buffers.logits().offset(t * vocab * bf16);
                 let out_t = argmax_out.offset(t * 4);
                 ops::argmax_bf16(
@@ -405,10 +501,10 @@ impl TransformerModel {
         // ── Phase 3: Post-graph (D2H copy only) ──
 
         let out_ptr = self.buffers.scratch();
-        let mut buf = vec![0u8; k * 4];
+        let mut buf = vec![0u8; kt * 4];
         self.gpu.copy_d2h(out_ptr, &mut buf)?;
-        let mut out = Vec::with_capacity(k);
-        for t in 0..k {
+        let mut out = Vec::with_capacity(kt);
+        for t in 0..kt {
             let off = t * 4;
             out.push(u32::from_le_bytes([
                 buf[off],

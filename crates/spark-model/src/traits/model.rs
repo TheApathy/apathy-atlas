@@ -634,6 +634,29 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Block-fork tree: resolve the scratch KV blocks of the last tree
+    /// verify. `adopt=true` swaps them into the block table (B's chain won);
+    /// `false` frees them (A won / fork missed). Default: no-op.
+    fn dflash_adopt_fork_blocks(&self, _seq: &mut SequenceState, _adopt: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// `dflash_eagle_kgamma_append` with a capture-row base offset — the
+    /// block-fork B chain's rows live at `base_row..` in the capture arena.
+    /// `base_row == 0` is exactly the classic append.
+    fn dflash_eagle_kgamma_append_at(
+        &self,
+        seq: &mut SequenceState,
+        num_accepted: usize,
+        base_pos: usize,
+        base_row: usize,
+    ) -> Result<()> {
+        if base_row == 0 {
+            return self.dflash_eagle_kgamma_append(seq, num_accepted, base_pos);
+        }
+        Ok(())
+    }
+
     /// ATLAS_DFLASH_RECYCLE: stash the discarded draft tail
     /// `drafts[num_accepted+1..]` keyed by the corrected (bonus) token, so
     /// the next propose can re-offer it (lossless — proposal only).

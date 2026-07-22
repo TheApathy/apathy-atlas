@@ -50,6 +50,24 @@ pub fn step_verify_dflash(
     // The ledger never had this split — it guessed "FFN + double sweep". This
     // measures it. Gated so the hot path pays nothing when the env is unset.
     let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
+    // Block-fork tree (doc 16): hand the fork payload to the verify (which
+    // takes it and, when eligible, verifies chain B as rows k..2k). Keep a
+    // host copy for the walk below.
+    // S3a gate (ATLAS_DFLASH_FORK_DEGEN=1): force the fork token to the
+    // draft AT the cliff so B ≡ A AND the walk's b_win condition
+    // (`verified[cliff] == fork_tok` with `num_accepted == cliff`) is
+    // UNREACHABLE — if verified[cliff] == drafts[cliff] then A accepted the
+    // cliff, so num_accepted > cliff. Verify and walk stay consistent, so
+    // the whole tree path must be byte-identical to flat. This is the true
+    // transparency test for the 2K-row verify + scratch-KV machinery.
+    let fork_info = a.pending_block_fork.take().map(|(c, ft)| {
+        if std::env::var("ATLAS_DFLASH_FORK_DEGEN").ok().as_deref() == Some("1") {
+            (c, drafts.get(c).copied().unwrap_or(ft))
+        } else {
+            (c, ft)
+        }
+    });
+    a.seq.block_fork = fork_info;
     let t_verify = std::time::Instant::now();
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
@@ -84,6 +102,17 @@ pub fn step_verify_dflash(
         )
     };
 
+    // Block-fork tree (doc 16): a tree verify returns A ++ B chains
+    // (2·(γ+1) entries). Split; the A-walk below is unchanged, the B branch
+    // extends it at the fork.
+    let ka = tokens.len();
+    let tree_mode = verified.len() == 2 * ka;
+    let (verified, verified_b): (Vec<u32>, Option<Vec<u32>>) = if tree_mode {
+        (verified[..ka].to_vec(), Some(verified[ka..].to_vec()))
+    } else {
+        (verified, None)
+    };
+
     // `decode_verify` already advanced `seq.seq_len` by `tokens.len()` and
     // pushed all γ+1 tokens into `seq.tokens`. The accept-prefix logic below
     // determines how many to keep — the rest must be rolled back so the
@@ -106,9 +135,41 @@ pub fn step_verify_dflash(
         }
     }
 
+    // Block-fork walk: A died exactly at the hedged cliff AND the target's
+    // correction IS the fork token → continue on chain B (its rows verified
+    // under the forked KV). b_tail = B drafts accepted past the fork;
+    // b_bonus = B's own correction after that.
+    let mut b_win = false;
+    let mut b_tail_len = 0usize;
+    let mut b_bonus: Option<u32> = None;
+    if let (Some(vb), Some((cliff, fork_tok))) = (verified_b.as_ref(), fork_info)
+        && num_accepted < drafts.len()
+        && num_accepted == cliff
+        && verified[cliff] == fork_tok
+    {
+        b_win = true;
+        let mut i = cliff + 1;
+        while i < drafts.len() && i < vb.len() && drafts[i] == vb[i] {
+            b_tail_len += 1;
+            i += 1;
+        }
+        if i < vb.len() {
+            b_bonus = Some(vb[i]);
+        }
+        static FORKWIN_DBG: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = FORKWIN_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n % 64 == 0 {
+            tracing::info!(
+                "DFLASH_BLOCKFORK WIN #{n}: cliff={cliff} fork_tok={fork_tok}                  b_tail={b_tail_len} b_bonus={b_bonus:?} (saved a miss)"
+            );
+        }
+    }
+    let committed_extra = if b_win { 1 + b_tail_len } else { 0 };
+
     // Adaptive speculation (ATLAS_DFLASH_ADAPTIVE=1): feed the rolling
     // accept window; may suspend this seq's speculation (see adaptive_spec).
-    crate::scheduler::adaptive_spec::record_verify(a, num_accepted);
+    crate::scheduler::adaptive_spec::record_verify(a, num_accepted + committed_extra);
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix
@@ -119,13 +180,36 @@ pub fn step_verify_dflash(
     // output buffer, not seq.tokens), so the bonus stays in seq.tokens
     // exactly where decode_verify put it.
     let pre_verify_len = a.seq.seq_len.saturating_sub(tokens.len());
-    let target_seq_len = pre_verify_len + num_accepted + 1;
+    // B-win holds extra positions: the fork token + its accepted B tail
+    // (their KV lives in the adopted scratch blocks; see adopt below).
+    let target_seq_len = pre_verify_len + num_accepted + 1 + committed_extra;
     let to_drop = a.seq.seq_len.saturating_sub(target_seq_len);
     if to_drop > 0 {
         a.seq.seq_len = target_seq_len;
         let pop_n = to_drop.min(a.seq.tokens.len());
         for _ in 0..pop_n {
             a.seq.tokens.pop();
+        }
+    }
+    if b_win {
+        // The pushed A-chain slot at the fork position holds the REJECTED
+        // draft; patch in the fork token (the B tail beyond it is identical
+        // to A's pushed drafts, so only this one entry differs).
+        let fork_slot = pre_verify_len + num_accepted + 1;
+        if fork_slot < a.seq.tokens.len()
+            && let Some((_, ft)) = fork_info
+        {
+            a.seq.tokens[fork_slot] = ft;
+        }
+        // Adopt B's scratch KV blocks (the canonical blocks hold A's stale
+        // rows at the committed fork positions).
+        if let Err(e) = model.dflash_adopt_fork_blocks(&mut a.seq, true) {
+            tracing::error!("dflash_adopt_fork_blocks(adopt): {e:#}");
+        }
+    } else if tree_mode {
+        // A won (or fork missed): drop the scratch blocks.
+        if let Err(e) = model.dflash_adopt_fork_blocks(&mut a.seq, false) {
+            tracing::error!("dflash_adopt_fork_blocks(free): {e:#}");
         }
     }
 
@@ -143,9 +227,20 @@ pub fn step_verify_dflash(
         }
     } else {
         let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
+        // B-win: the committed stream's capture rows are B's (offset ka),
+        // covering the shared prefix + fork + accepted tail + bonus generator.
+        let (append_rows, append_base) = if b_win {
+            (num_accepted + committed_extra, ka)
+        } else {
+            (num_accepted, 0)
+        };
         if eagle_fix
-            && let Err(e) =
-                model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
+            && let Err(e) = model.dflash_eagle_kgamma_append_at(
+                &mut a.seq,
+                append_rows,
+                pre_verify_len,
+                append_base,
+            )
         {
             tracing::error!("dflash_eagle_kgamma_append: {e:#}");
         }
@@ -161,6 +256,8 @@ pub fn step_verify_dflash(
 
     // Bonus token = verified[num_accepted] (the one that "corrected" the draft
     // at the first mismatch, or the next-prediction past the full-accept case).
+    // On a fork win this IS the fork token; the accepted B tail + B's own
+    // bonus follow it.
     let bonus_idx = num_accepted;
     if bonus_idx < verified.len() {
         let bonus = verified[bonus_idx];
@@ -169,6 +266,22 @@ pub fn step_verify_dflash(
             return;
         }
         a.last_token = bonus;
+    }
+    if b_win {
+        for i in 0..b_tail_len {
+            emit_token(a, drafts[num_accepted + 1 + i], None);
+            if a.finished {
+                return;
+            }
+            a.last_token = drafts[num_accepted + 1 + i];
+        }
+        if let Some(bb) = b_bonus {
+            emit_token(a, bb, None);
+            if a.finished {
+                return;
+            }
+            a.last_token = bb;
+        }
     }
 
     // Accept-lift draft sources (Phase A): stash this step's salvage for the

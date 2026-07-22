@@ -215,6 +215,14 @@ pub struct SequenceState {
     /// NLLB beam search: stop as soon as `num_beams` finished hypotheses
     /// exist (`false` = exhaust `max_new`). Unused by other models.
     pub early_stopping: bool,
+    /// Block-fork tree (doc 16): `(cliff_draft_index, fork_token)` for the
+    /// NEXT `decode_verify_dflash` call. Set by the scheduler from
+    /// `ActiveSeq.pending_block_fork`; taken inside the verify. `None` = flat.
+    pub block_fork: Option<(usize, u32)>,
+    /// Block-fork scratch KV blocks from the LAST tree verify:
+    /// `(block_table_index, scratch_block)` pairs. The scheduler resolves
+    /// them via `dflash_adopt_fork_blocks(adopt_b)` right after the walk.
+    pub block_fork_scratch: Vec<(usize, u32)>,
 }
 
 impl SequenceState {

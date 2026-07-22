@@ -98,6 +98,14 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // Block-fork leak backstop: scratch KV blocks from an errored tree
+        // verify (the scheduler's adopt call normally drains these).
+        if !seq.block_fork_scratch.is_empty() {
+            let mut kv = self.kv_cache.lock();
+            for (_, scratch) in std::mem::take(&mut seq.block_fork_scratch) {
+                kv.free_block(scratch);
+            }
+        }
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later

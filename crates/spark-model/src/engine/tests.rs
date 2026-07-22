@@ -169,6 +169,8 @@ impl Model for MockModel {
             prompt_logprobs: Vec::new(),
             disk_block_ids: Vec::new(),
             disk_last_offloaded_per_layer: Vec::new(),
+            block_fork: None,
+            block_fork_scratch: Vec::new(),
         })
     }
 
