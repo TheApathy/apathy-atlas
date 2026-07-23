@@ -65,6 +65,36 @@ repetition_penalty = 1.0
 dry_multiplier = 0.0
 
 [behavior]
+# The thinking-phase loop watchdog force-injects `</think>` on a period-4..20
+# repeat in the reasoning tail. On this model it does more harm than good:
+# measured 2026-07-22 on RC1, "Explain why the sky is blue in two sentences."
+#   watchdog ON  -> fires at thinking_tokens=264, finish=length, and the
+#                   post-close CONTENT is spam ('####...' / backtick runs)
+#   watchdog OFF -> reasoning stays coherent, no spam
+# Force-closing a reasoning block the model did not choose to end leaves it
+# with no natural continuation. Other models keep the watchdog (flag defaults
+# to true); this opts Laguna out.
+enable_think_loop_watchdog = false
+# The rest of the thinking-watchdog family misfires the same way on this model:
+# they all trip on the temperature-0 greedy repeat-plateau the model falls into
+# (it is designed for 0.7/0.95, not greedy), then force-close </think> or
+# rollback mid-reason, after which the content channel degenerates into token
+# spam. Measured 2026-07-22 on RC1: F2 "Confidence early stop armed" fired on
+# "explain the sky in two sentences" -> finish=length garbage; with the whole
+# family off + default sampling the same prompt is coherent. Disable all of them
+# for Laguna; other models keep the defaults (true).
+confidence_early_stop = false
+rollback_resteer = false
+# This model loops stochastically even at its recommended 0.7 sampling
+# ('TheTheThe' / 'I. ofA. of' repeat spam on long reasoning). Unlike the
+# qwen3.6-35b-a3b sibling (NVFP4 lm-head), we serve a BF16 lm-head, so the
+# drift is NOT the head -- it is the NVFP4 MoE / general FP-quant tail. A min_p
+# FLOOR truncates that tail; MEASURED here: min_p 0 -> most prompts degenerate,
+# 0.05 -> 1/6, 0.1 -> see below. It is a partial mitigation (the thinking
+# watchdogs above were the other, cruder catch). temperature_max caps runaway
+# client temps at the model's recommended ceiling.
+min_p_floor = 0.1
+temperature_max = 0.7
 thinking_in_tools = true
 max_thinking_budget = 8192
 # Poolside recommends thinking for agentic coding and preserving it between
