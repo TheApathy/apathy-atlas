@@ -143,6 +143,9 @@ pub struct MoeLayer {
     // batchN v2: expert-dedup gate_up (ATLAS_KN_V2=1; 0 when the target's
     // kernel set lacks it — dispatch falls back to v1).
     moe_expert_gate_up_shared_batchn_v2_k: KernelHandle,
+    // v4 decoupled-silu dedup down (ATLAS_KN_V4=1; 0 when absent).
+    moe_silu_precompute_batchn_k: KernelHandle,
+    moe_expert_down_dedup_batchn_k: KernelHandle,
     moe_weighted_sum_blend_batch2: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
     // K=3 fused MoE kernel handles

@@ -243,6 +243,9 @@ fn main() -> Result<()> {
     let sh_gate_out = gpu.alloc(num_tokens * INTER * 2)?;
     let sh_up_out = gpu.alloc(num_tokens * INTER * 2)?;
     let sh_down_out = gpu.alloc(num_tokens * HIDDEN * 2)?;
+    // v4 decoupled-silu buffers
+    let act_routed = gpu.alloc(total_routed * INTER * 2)?;
+    let sh_act = gpu.alloc(num_tokens * INTER * 2)?;
 
     let launch_gate_up = |name: &str, block: u32, stream: u64| -> Result<()> {
         let h = gpu.kernel("moe_fused_batch2", name)?;
@@ -304,6 +307,47 @@ fn main() -> Result<()> {
             .launch(stream)
     };
 
+    // v4 down: silu precompute (gate_out/up_out → act_routed, sh → sh_act),
+    // then dedup down reads act directly. rows_y = total_routed + num_tokens
+    // leader-block grid; 8 rows/block over HIDDEN (V2 pair layout).
+    let launch_down_v4 = |stream: u64| -> Result<()> {
+        let pre = gpu.kernel("moe_fused_batch2", "moe_silu_precompute_batchN")?;
+        let elems = (total_routed + num_tokens) * INTER;
+        KernelLaunch::new(gpu, pre)
+            .grid([(elems as u32).div_ceil(256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(gate_out)
+            .arg_ptr(up_out)
+            .arg_ptr(act_routed)
+            .arg_ptr(sh_gate_out)
+            .arg_ptr(sh_up_out)
+            .arg_ptr(sh_act)
+            .arg_u32(INTER as u32)
+            .arg_u32(total_routed as u32)
+            .arg_u32(num_tokens as u32)
+            .launch(stream)?;
+        let dn = gpu.kernel("moe_fused_batch2", "moe_expert_down_dedup_batchN")?;
+        KernelLaunch::new(gpu, dn)
+            .grid([(HIDDEN as u32).div_ceil(8), rows_y, 1])
+            .block([128, 1, 1])
+            .arg_ptr(act_routed)
+            .arg_ptr(sh_act)
+            .arg_ptr(down_tbl.0)
+            .arg_ptr(down_tbl.1)
+            .arg_ptr(down_tbl.2)
+            .arg_ptr(down_out)
+            .arg_ptr(idx_ptr)
+            .arg_ptr(sh_down_p)
+            .arg_ptr(sh_down_s)
+            .arg_f32(sh_down.s2)
+            .arg_ptr(sh_down_out)
+            .arg_u32(HIDDEN as u32)
+            .arg_u32(INTER as u32)
+            .arg_u32(top_k as u32)
+            .arg_u32(num_tokens as u32)
+            .launch(stream)
+    };
+
     let v1_smem = (INTER * 4) as u32;
     let v2_smem = (num_tokens * INTER * 4) as u32;
     // production block choice for hidden>=3072 is 256 (v1); v2 fixes 128
@@ -316,6 +360,11 @@ fn main() -> Result<()> {
             2 => {
                 launch_gate_up("moe_expert_gate_up_shared_batchN_v3", 128, stream)?;
                 launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, stream)
+            }
+            3 => {
+                // v4: v2 gate_up (shipped best) + decoupled dedup down
+                launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, stream)?;
+                launch_down_v4(stream)
             }
             _ => {
                 launch_gate_up("moe_expert_gate_up_shared_batchN", 256, stream)?;
@@ -381,7 +430,7 @@ fn main() -> Result<()> {
     // ── correctness: v1 then v2, each vs the CPU reference ──
     let mut fail = false;
     let mut v1_down_all: Vec<f32> = Vec::new();
-    for (label, mode) in [("v1", 0u8), ("v2", 1u8), ("v3", 2u8)] {
+    for (label, mode) in [("v1", 0u8), ("v2", 1u8), ("v3", 2u8), ("v4", 3u8)] {
         run_pair(mode, stream)?;
         gpu.synchronize(stream)?;
         let g = read_bf16(gate_out, total_routed * INTER)?;
@@ -464,6 +513,11 @@ fn main() -> Result<()> {
             "v3@128",
             Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN_v3", 128, s)),
             Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, s)),
+        ),
+        (
+            "v4@128 (dedup-down)",
+            Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, s)),
+            Box::new(&launch_down_v4),
         ),
     ];
     for (label, gu, sd) in &configs {

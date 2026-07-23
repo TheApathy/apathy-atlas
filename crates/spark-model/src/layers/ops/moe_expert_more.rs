@@ -232,6 +232,82 @@ pub fn moe_expert_gate_up_shared_batchn(
         .launch(stream)
 }
 
+/// v4 FFN: precompute act = silu(gate)*up into `act_out`/`sh_act_out`
+/// (in-place-safe over gate buffers), then the dedup down reads it directly.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_silu_precompute_batchn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    act_out: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_act_out: DevicePtr,
+    inter: u32,
+    total_routed: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    let elems = total_routed as usize * inter as usize + num_tokens as usize * inter as usize;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(elems as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(act_out)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_act_out)
+        .arg_u32(inter)
+        .arg_u32(total_routed)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// v4 FFN: expert-dedup down GEMV reading the precomputed act (no smem stage).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_down_dedup_batchn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    act: DevicePtr,
+    sh_act: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32,       // N = hidden (output dim)
+    k: u32,       // K = inter (input dim)
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    let total_routed = num_tokens * top_k;
+    let rows_y = total_routed + num_tokens;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 8), rows_y, 1])
+        .block([128, 1, 1])
+        .arg_ptr(act)
+        .arg_ptr(sh_act)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
 /// Fused SiLU+down expert GEMV (non-transposed NVFP4) for N tokens — forward_k16.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_silu_down_shared_batchn(

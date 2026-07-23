@@ -230,27 +230,72 @@ impl MoeLayer {
             stream,
         )?;
         kn_ck!("gate_up_batchn");
-        ops::moe_expert_silu_down_shared_batchn(
-            ctx.gpu,
-            self.moe_expert_silu_down_shared_batchn_k,
-            expert_gate_out,
-            expert_up_out,
-            self.down_ptrs.packed_ptrs,
-            self.down_ptrs.scale_ptrs,
-            self.down_ptrs.scale2_vals,
-            expert_down_out,
-            indices_dev,
-            shared_gate_scratch,
-            shared_up_scratch,
-            &self.weights.shared_expert.down_proj,
-            shared_down_out,
-            h,
-            inter,
-            top_k,
-            n,
-            batch_block,
-            stream,
-        )?;
+        // ATLAS_KN_V4=1: decoupled-silu dedup down (microbench: silu_down
+        // 0.72→0.59 ms/layer, 186 GB/s, cos 0.999997). Precompute silu(gate)*up
+        // in-place over the gate buffers, then the dedup down reads it directly
+        // (no smem staging — the cost that sank silu_down_v2). Caps M at 8.
+        static KN_V4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v4 = *KN_V4.get_or_init(|| {
+            std::env::var("ATLAS_KN_V4").ok().as_deref() == Some("1")
+        }) && num_tokens <= 8
+            && self.moe_silu_precompute_batchn_k.0 != 0
+            && self.moe_expert_down_dedup_batchn_k.0 != 0;
+        if v4 {
+            ops::moe_silu_precompute_batchn(
+                ctx.gpu,
+                self.moe_silu_precompute_batchn_k,
+                expert_gate_out,
+                expert_up_out,
+                expert_gate_out, // in-place: act overwrites gate_out
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_gate_scratch, // in-place shared act
+                inter,
+                n * top_k,
+                n,
+                stream,
+            )?;
+            ops::moe_expert_down_dedup_batchn(
+                ctx.gpu,
+                self.moe_expert_down_dedup_batchn_k,
+                expert_gate_out,     // act (routed)
+                shared_gate_scratch, // sh_act
+                self.down_ptrs.packed_ptrs,
+                self.down_ptrs.scale_ptrs,
+                self.down_ptrs.scale2_vals,
+                expert_down_out,
+                indices_dev,
+                &self.weights.shared_expert.down_proj,
+                shared_down_out,
+                h,
+                inter,
+                top_k,
+                n,
+                stream,
+            )?;
+        } else {
+            ops::moe_expert_silu_down_shared_batchn(
+                ctx.gpu,
+                self.moe_expert_silu_down_shared_batchn_k,
+                expert_gate_out,
+                expert_up_out,
+                self.down_ptrs.packed_ptrs,
+                self.down_ptrs.scale_ptrs,
+                self.down_ptrs.scale2_vals,
+                expert_down_out,
+                indices_dev,
+                shared_gate_scratch,
+                shared_up_scratch,
+                &self.weights.shared_expert.down_proj,
+                shared_down_out,
+                h,
+                inter,
+                top_k,
+                n,
+                batch_block,
+                stream,
+            )?;
+        }
         kn_ck!("silu_down_batchn");
         ops::moe_weighted_sum_blend_batchn(
             ctx.gpu,
