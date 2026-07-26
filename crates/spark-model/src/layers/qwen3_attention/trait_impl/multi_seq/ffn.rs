@@ -131,16 +131,25 @@ impl Qwen3AttentionLayer {
                 eps,
                 stream,
             )?;
-            self.ffn.forward_kn(normed2, n, fwd, stream)?;
-            let moe_out = fwd.buffers.moe_output();
-            ops::residual_add(
-                fwd.gpu,
-                self.residual_add_k,
-                hidden,
-                moe_out,
-                (n * h) as u32,
-                stream,
-            )?;
+            // ATLAS_FUSED_ELEMWISE=1: fold the FFN residual add into the MoE
+            // blend launch (bit-identical). `forward_kn_residual` returns
+            // false when it couldn't fuse (fallback path / missing kernel) —
+            // then the separate residual_add runs exactly as before.
+            let residual_arg = ops::fused_elemwise_enabled().then_some(hidden);
+            let residual_fused =
+                self.ffn
+                    .forward_kn_residual(normed2, n, residual_arg, fwd, stream)?;
+            if !residual_fused {
+                let moe_out = fwd.buffers.moe_output();
+                ops::residual_add(
+                    fwd.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    moe_out,
+                    (n * h) as u32,
+                    stream,
+                )?;
+            }
         } else if !force_seq_ffn && self.ffn.is_dense() {
             // WIDE-VERIFY BATCHED DENSE FFN (DFlash γ=16, n=17). The dense FFN
             // (Qwen3.6-27B is dense) batches over all n rows via

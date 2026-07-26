@@ -92,6 +92,15 @@ pub(crate) fn dflash_seam_serial_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_SEAM_SERIAL").ok().as_deref() == Some("1"))
 }
 
+/// `ATLAS_DFLASH_DIAG=1` (cached once). Hoisted from raw per-step
+/// `std::env::var` reads at the two `mtp_step` DIAG sites (2026-07-25
+/// host-overhead pass) — env-lock + linear scan twice per step, for a
+/// diagnostic that is off in production.
+pub(crate) fn dflash_diag_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1"))
+}
+
 /// P1-3 (2026-07-09): honor the request temperature on the MTP verify path.
 /// Under MTP + grammar ~97-100% of emitted tokens flow through verify, which
 /// PINNED the pick to a (penalty-aware) argmax regardless of the client's

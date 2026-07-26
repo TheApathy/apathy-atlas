@@ -391,7 +391,8 @@ fn load_laguna_dflash_weights(
         ""
     };
 
-    let fc = dense(store, &format!("{prefix}fc.weight")).context("Laguna DFlash: load fc.weight")?;
+    let fc =
+        dense(store, &format!("{prefix}fc.weight")).context("Laguna DFlash: load fc.weight")?;
     let hidden_norm = dense(store, &format!("{prefix}hidden_norm.weight"))
         .context("Laguna DFlash: load hidden_norm.weight")?;
     let norm =

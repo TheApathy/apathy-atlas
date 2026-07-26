@@ -326,6 +326,55 @@ pub fn moe_expert_silu_down_shared(
         .launch(stream)
 }
 
+/// v5 cp.async variant of `moe_expert_silu_down_shared` — 16 rows per block
+/// (2 pipelined 8-row cp.async weight tiles), so grid.x is ceil(N/16)
+/// instead of ceil(N/8). Same argument list and dynamic smem as v1;
+/// bit-identical outputs. Requires k == 1024 (caller-guarded).
+///
+/// Grid: (ceil(N/16), top_k+1, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_v5(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), top_k + 1, 1])
+        .block([128, 1, 1])
+        .shared_mem(k * 4) // s_act[K] for precomputed SiLU(gate)*up activation
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .launch(stream)
+}
+
 /// Fused gate+up expert GEMV with shared expert for FP8 weights.
 ///
 /// FP8 variant of `moe_expert_gate_up_shared`: uses 2 pointer tables per

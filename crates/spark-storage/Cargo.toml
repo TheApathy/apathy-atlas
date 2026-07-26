@@ -30,6 +30,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = "0.1"
 half = "2"
+# w3-requant offline tool (safetensors mmap read + parallel repack).
+safetensors = "0.8"
+memmap2 = "0.9"
+rayon = "1"
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"

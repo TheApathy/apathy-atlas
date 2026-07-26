@@ -43,6 +43,10 @@ pub mod kv_paging;
 pub mod model_dims;
 pub mod predictor_ref;
 pub mod projection;
+// W3 Lloyd-Max 3-bit expert-weight format (offline requant of NVFP4 experts;
+// consumed by spark-model's ATLAS_MOE_W3 loader). Pure host — see also the
+// `w3-requant` bin.
+pub mod w3;
 // The one-sided RDMA KV transport backend — a `StorageBackend` impl that
 // offloads/restores KV groups to a `cache_peer` blade over verbs. cuda (for the
 // pinned-host bounce + copy_h2d) + the verbs shim.

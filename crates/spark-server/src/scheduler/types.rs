@@ -330,6 +330,10 @@ pub(super) struct ActiveSeq {
     /// `(cliff_draft_index, fork_token)`. Consumed by the tree-mode verify;
     /// always cleared together with `pending_drafts`.
     pub pending_block_fork: Option<(usize, u32)>,
+    /// DDTree M2 (ATLAS_DFLASH_TREE=1): tree payload for `pending_drafts`,
+    /// taken from the model after each propose and handed to the verify via
+    /// `seq.tree_payload`. Always cleared together with `pending_drafts`.
+    pub pending_tree_payload: Option<spark_model::layers::DDTreePayload>,
     /// Timestamp of the last token emission (for TBT deadline tracking).
     pub last_token_time: Instant,
     /// Timestamp when the request entered prefill (for TTFT).

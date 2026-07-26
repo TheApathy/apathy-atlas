@@ -141,6 +141,29 @@ impl Qwen3AttentionLayer {
             v_weight: v_nvfp4.map(QuantWeight::Nvfp4),
             o_weight: None,
             o_dense_bf16: None,
+            // FP8 attention mirrors: filled post-construction by
+            // `build_attn_fp8_mirrors` under ATLAS_TARGET_ATTN_FP8_MIRROR=1.
+            q_fp8_mirror: None,
+            k_fp8_mirror: None,
+            v_fp8_mirror: None,
+            o_fp8_mirror: None,
+            dense_gemv_fp8w_k: super::super::try_kernel(gpu, "gemv_fp8w", "dense_gemv_fp8w"),
+            fp8_gemm_row_scaled_k: super::super::try_kernel(gpu, "w4a16", "fp8_gemm_t_row_scaled"),
+            fp8_gemm_row_scaled_m16_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "fp8_gemm_t_row_scaled_m16",
+            ),
+            fp8_gemm_row_scaled_mtile8_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "fp8_gemm_t_row_scaled_mtile8",
+            ),
+            fp8_gemm_row_scaled_mtile8_n32_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "fp8_gemm_t_row_scaled_mtile8_n32",
+            ),
             mla: None,
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
@@ -249,6 +272,11 @@ impl Qwen3AttentionLayer {
                 gpu,
                 "reshape_and_cache",
                 "reshape_and_cache_flash_v_only",
+            ),
+            fused_qkv_norm_rope_cache_k: super::super::try_kernel(
+                gpu,
+                "fused_verify_elemwise",
+                "fused_qkv_norm_rope_cache_write_bf16",
             ),
             wht_bf16_k: super::super::try_kernel(gpu, "wht_bf16", "wht_bf16_inplace"),
             wht_bf16_k_inv: super::super::try_kernel(gpu, "wht_bf16", "wht_bf16_inplace_inv"),

@@ -539,6 +539,10 @@ pub fn build_model(
     // NVFP4 lm_head (Copy) shared with the DFlash drafter so its final logits
     // GEMM uses w4a16 instead of a BF16 dense_gemm on NVFP4-packed bytes.
     let target_lm_head_nvfp4_for_dflash = lm_head_nvfp4;
+    // FP8 lm_head mirror (Copy, Option) shared with the DFlash drafter so
+    // its propose-tail logits GEMM reads the 308MB E4M3 mirror instead of
+    // the 616MB BF16 head (ATLAS_TARGET_LMHEAD_FP8=1 / --lm-head-dtype fp8).
+    let target_lm_head_fp8_for_dflash = lm_head_fp8;
     let target_hidden_for_dflash = config.hidden_size;
 
     let mut model = TransformerModel::new(
@@ -613,6 +617,7 @@ pub fn build_model(
                 target_embed_for_dflash,
                 target_lm_head_for_dflash,
                 target_lm_head_nvfp4_for_dflash,
+                target_lm_head_fp8_for_dflash,
                 target_hidden_for_dflash,
                 args.gamma,
                 args.window_size,

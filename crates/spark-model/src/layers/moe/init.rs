@@ -98,8 +98,64 @@ impl MoeLayer {
             moe_expert_down_dedup_batchn_k: gpu
                 .kernel("moe_fused_batch2", "moe_expert_down_dedup_batchN")
                 .unwrap_or(KernelHandle(0)),
+            moe_expert_gate_up_shared_batchn_v5_k: gpu
+                .kernel("moe_fused_batch2", "moe_expert_gate_up_shared_batchN_v5")
+                .unwrap_or(KernelHandle(0)),
+            moe_expert_down_dedup_batchn_v5_k: gpu
+                .kernel("moe_fused_batch2", "moe_expert_down_dedup_batchN_v5")
+                .unwrap_or(KernelHandle(0)),
+            moe_expert_gate_up_shared_v5_k: gpu
+                .kernel("moe_shared_expert_fused", "moe_expert_gate_up_shared_v5")
+                .unwrap_or(KernelHandle(0)),
+            moe_expert_silu_down_shared_v5_k: gpu
+                .kernel("moe_shared_expert_fused", "moe_expert_silu_down_shared_v5")
+                .unwrap_or(KernelHandle(0)),
+            // W3 Lloyd-Max (3-bit) routed-expert kernels — try_kernel so
+            // images without the modules still construct; ATLAS_MOE_W3 is
+            // refused by enable_w3() when any required handle is 0.
+            moe_expert_gate_up_shared_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_fused_w3",
+                "moe_expert_gate_up_shared_w3",
+            ),
+            moe_expert_silu_down_shared_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_fused_w3",
+                "moe_expert_silu_down_shared_w3",
+            ),
+            moe_expert_gate_up_shared_batchn_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_fused_w3",
+                "moe_expert_gate_up_shared_batchN_w3",
+            ),
+            moe_expert_silu_down_shared_batchn_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_fused_w3",
+                "moe_expert_silu_down_shared_batchN_w3",
+            ),
+            moe_expert_gate_up_shared_batchn_v2_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_fused_w3",
+                "moe_expert_gate_up_shared_batchN_v2_w3",
+            ),
+            moe_expert_down_dedup_batchn_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_fused_w3",
+                "moe_expert_down_dedup_batchN_w3",
+            ),
+            moe_grouped_gemm_w3_k: super::super::try_kernel(
+                gpu,
+                "moe_w3a16",
+                "moe_w3a16_grouped_gemm_ptrtable",
+            ),
+            w3_lut_dev: DevicePtr::NULL,
             moe_weighted_sum_blend_batch2: gpu
                 .kernel("moe_fused_batch2", "moe_weighted_sum_blend_batch2")?,
+            moe_blend_residual_batchn_k: super::super::try_kernel(
+                gpu,
+                "fused_verify_elemwise",
+                "moe_weighted_sum_blend_residual_batchn",
+            ),
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             moe_expert_gate_up_shared_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_expert_gate_up_shared_batch3")?,

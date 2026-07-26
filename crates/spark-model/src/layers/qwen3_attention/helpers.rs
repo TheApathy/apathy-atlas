@@ -129,6 +129,111 @@ impl Qwen3AttentionLayer {
         self.o_dense_bf16 = Some(o_dense);
     }
 
+    /// Build FP8-E4M3 row-scaled MIRROR copies of the BF16 attention
+    /// projections (ATLAS_TARGET_ATTN_FP8_MIRROR=1). The mirrors are
+    /// consumed ONLY by the decode/verify dispatch sites; prefill keeps
+    /// BF16. Returns the number of device bytes allocated, or 0 when the
+    /// mirrors were not built (kernels absent, sources not BF16-dense, or
+    /// allocation failure — all soft-fail to the BF16 path, never abort
+    /// load).
+    ///
+    /// Shapes (checkpoint convention, `[N, K]` row-major):
+    ///   q_proj `[q_n, h]`, k/v_proj `[kv_n, h]`, o_proj `[h, q_n]`.
+    /// The O source is `o_dense_bf16` (Laguna installs it via
+    /// [`Self::set_o_dense_bf16`]); Q/K/V sources are `attn.{q,k,v}_proj`
+    /// and are only mirrored when the corresponding `QuantWeight` slot is
+    /// `None` (i.e. the model really runs the BF16 dense path).
+    pub fn build_attn_fp8_mirrors(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        q_n: usize,
+        kv_n: usize,
+        h: usize,
+    ) -> anyhow::Result<usize> {
+        use std::sync::Once;
+        static WARN_KERNELS: Once = Once::new();
+        static WARN_SOURCE: Once = Once::new();
+        static WARN_ALLOC: Once = Once::new();
+
+        // Kernel presence: quantizer + GEMV + batched GEMM must all exist,
+        // otherwise the dispatch sites could never consume the mirrors.
+        let quantize_k = crate::layers::try_kernel(gpu, "gemv_fp8w", "quantize_bf16_to_fp8");
+        if quantize_k.0 == 0 || self.dense_gemv_fp8w_k.0 == 0 || self.fp8_gemm_row_scaled_k.0 == 0 {
+            WARN_KERNELS.call_once(|| {
+                tracing::warn!(
+                    "ATLAS_TARGET_ATTN_FP8_MIRROR=1 but gemv_fp8w / fp8_gemm_t_row_scaled \
+                     kernels are absent from this kernel set — attention stays BF16"
+                );
+            });
+            return Ok(0);
+        }
+
+        // Only mirror weights that are actually BF16 dense (skip NVFP4 /
+        // FP8-native models where the quant slots are populated).
+        let bf16_qkv = self.q_weight.is_none()
+            && self.k_weight.is_none()
+            && self.v_weight.is_none()
+            && !self.attn.q_proj.weight.is_null()
+            && !self.attn.k_proj.weight.is_null()
+            && !self.attn.v_proj.weight.is_null();
+        let Some(o_src) = self.o_dense_bf16 else {
+            WARN_SOURCE.call_once(|| {
+                tracing::warn!(
+                    "ATLAS_TARGET_ATTN_FP8_MIRROR=1 but o_proj is not BF16 dense — \
+                     attention stays BF16 (mirrors are for BF16-attention models only)"
+                );
+            });
+            return Ok(0);
+        };
+        if !bf16_qkv {
+            WARN_SOURCE.call_once(|| {
+                tracing::warn!(
+                    "ATLAS_TARGET_ATTN_FP8_MIRROR=1 but q/k/v projections are not BF16 \
+                     dense — attention stays BF16 (mirrors are for BF16-attention models)"
+                );
+            });
+            return Ok(0);
+        }
+
+        let stream = gpu.default_stream();
+        let mut built: Vec<crate::weight_map::Fp8DenseWeight> = Vec::with_capacity(4);
+        let specs: [(&crate::weight_map::DenseWeight, usize, usize); 4] = [
+            (&self.attn.q_proj, q_n, h),
+            (&self.attn.k_proj, kv_n, h),
+            (&self.attn.v_proj, kv_n, h),
+            (&o_src, h, q_n),
+        ];
+        for (src, n, k) in specs {
+            match crate::weight_map::quantize_to_fp8(src, n, k, gpu, quantize_k, stream) {
+                Ok(m) => built.push(m),
+                Err(e) => {
+                    // Free everything built so far and fall back to BF16 —
+                    // an OOM here must never abort model load.
+                    for m in built {
+                        let _ = gpu.free(m.weight);
+                        let _ = gpu.free(m.row_scale);
+                    }
+                    WARN_ALLOC.call_once(|| {
+                        tracing::warn!(
+                            "ATLAS_TARGET_ATTN_FP8_MIRROR=1: mirror quantization failed \
+                             ({e:#}); layer {} (and any later failures) stay BF16",
+                            self.attn_layer_idx
+                        );
+                    });
+                    return Ok(0);
+                }
+            }
+        }
+        // Order matches `specs`: q, k, v, o.
+        self.o_fp8_mirror = built.pop();
+        self.v_fp8_mirror = built.pop();
+        self.k_fp8_mirror = built.pop();
+        self.q_fp8_mirror = built.pop();
+        let scale = std::mem::size_of::<f32>();
+        let bytes = q_n * h + 2 * kv_n * h + h * q_n + scale * (q_n + 2 * kv_n + h);
+        Ok(bytes)
+    }
+
     /// Set post-sublayer norms (Gemma-4: 4-norm residual structure).
     pub fn set_post_sublayer_norms(
         &mut self,

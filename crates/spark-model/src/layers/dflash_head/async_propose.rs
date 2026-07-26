@@ -70,9 +70,7 @@ pub fn async_env_eligible() -> bool {
             && unset("ATLAS_DFLASH_DEBUG_CTX_OFF")
             && unset("ATLAS_DFLASH_DEBUG_CTX_USED");
         if !ok {
-            tracing::info!(
-                "DFLASH_ASYNC: a debug/host-interactive env is set — sync propose path"
-            );
+            tracing::info!("DFLASH_ASYNC: a debug/host-interactive env is set — sync propose path");
         }
         ok
     })
@@ -87,6 +85,11 @@ pub struct AsyncInflight {
     pub owner: usize,
     /// Stream the drafter kernels were enqueued on.
     pub stream: u64,
+    /// ATLAS_DFLASH_SPEC_PROPOSE entry (launched DURING the verify on the
+    /// full-accept bet). Spec entries carry a ctx-watermark snapshot on the
+    /// owning dstate that must be rolled back when the entry is discarded.
+    /// Mutually exclusive with ATLAS_DFLASH_ASYNC at the env level.
+    pub spec: bool,
 }
 
 /// Stable identity for a proposer state (Box contents don't move).
@@ -117,10 +120,11 @@ fn log_telemetry() {
 
 impl BlockDiffusionDraftHead {
     /// Lazily-created dedicated propose stream. `0` = creation failed →
-    /// async permanently disabled for this process.
-    fn propose_stream_lazy(&self, gpu: &dyn GpuBackend) -> u64 {
-        *self.async_propose_stream.get_or_init(|| {
-            match (gpu.create_stream(), gpu.create_event()) {
+    /// async (and spec) propose permanently disabled for this process.
+    pub(super) fn propose_stream_lazy(&self, gpu: &dyn GpuBackend) -> u64 {
+        *self
+            .async_propose_stream
+            .get_or_init(|| match (gpu.create_stream(), gpu.create_event()) {
                 (Ok(s), Ok(e)) if s != 0 && e != 0 => {
                     self.async_order_event
                         .store(e, std::sync::atomic::Ordering::Release);
@@ -134,8 +138,7 @@ impl BlockDiffusionDraftHead {
                     );
                     0
                 }
-            }
-        })
+            })
     }
 
     /// Resolve (sync + discard) any in-flight async propose. Called before
@@ -145,15 +148,37 @@ impl BlockDiffusionDraftHead {
     pub(crate) fn resolve_async_inflight_impl(
         &self,
         gpu: &dyn GpuBackend,
-        dstate: Option<&mut DflashProposerState>,
+        mut dstate: Option<&mut DflashProposerState>,
     ) -> Result<()> {
         let taken = self.async_inflight.lock().take();
         if let Some(inflight) = taken {
             gpu.synchronize(inflight.stream)?;
-            ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if inflight.spec {
+                // Spec entries advanced the owner's ctx watermark at launch —
+                // roll it back when we can prove the caller IS the owner.
+                // A foreign spec entry can only be rolled back by its owner;
+                // resolving it here leaves that seq's ctx with extra (valid-
+                // content but uncommitted) rows — an acceptance-quality risk
+                // only, flagged loudly.
+                match dstate.as_deref_mut() {
+                    Some(ds) if dstate_id(ds) == inflight.owner => {
+                        super::spec_propose::spec_rollback(ds);
+                    }
+                    _ => tracing::warn!(
+                        "DFLASH_SPEC: resolved a FOREIGN in-flight spec propose \
+                         (owner={:#x}) — its ctx watermark could not be rolled back",
+                        inflight.owner
+                    ),
+                }
+                super::spec_propose::SPEC_DISCARDS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             tracing::debug!(
-                "DFLASH_ASYNC: resolved stale in-flight propose (owner={:#x})",
-                inflight.owner
+                "DFLASH_ASYNC: resolved stale in-flight propose (owner={:#x} spec={})",
+                inflight.owner,
+                inflight.spec,
             );
         }
         if let Some(ds) = dstate {
@@ -168,7 +193,11 @@ impl BlockDiffusionDraftHead {
     /// K=len+1 verify dispatch (and its CUDA graph) is identical.
     pub(super) fn sync_path_draft_len(&self) -> usize {
         let raw = self.gamma;
-        let dropped = if self.mask_token_id != 0 && raw > 1 { raw - 1 } else { raw };
+        let dropped = if self.mask_token_id != 0 && raw > 1 {
+            raw - 1
+        } else {
+            raw
+        };
         let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -223,7 +252,7 @@ impl BlockDiffusionDraftHead {
         // partially-enqueued kernels are still running.
         let t_enqueue = std::time::Instant::now();
         if let Err(e) = self.forward_block(
-            last_token, position, ctx, pstream, ctx_buffer, option_b, true, warm_tail,
+            last_token, position, ctx, pstream, ctx_buffer, option_b, true, warm_tail, None,
         ) {
             let _ = gpu.synchronize(pstream);
             return Err(e);
@@ -231,8 +260,7 @@ impl BlockDiffusionDraftHead {
         // One-shot: prove the launch fires and that the enqueue is actually
         // non-blocking (a hidden sync inside forward_block would show up as
         // enqueue_ms ≈ the full drafter time and negate the overlap).
-        static FIRED_DBG: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static FIRED_DBG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !FIRED_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::info!(
                 "DFLASH_ASYNC: first async propose launched (enqueue={:.2}ms)",
@@ -243,6 +271,7 @@ impl BlockDiffusionDraftHead {
         *self.async_inflight.lock() = Some(AsyncInflight {
             owner: dstate_id(dstate),
             stream: pstream,
+            spec: false,
         });
         let len = self.sync_path_draft_len();
         dstate.async_placeholder = true;
@@ -274,7 +303,17 @@ impl BlockDiffusionDraftHead {
             if let Some(stale) = guard.take() {
                 drop(guard);
                 gpu.synchronize(stale.stream)?;
-                ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if stale.spec {
+                    tracing::warn!(
+                        "DFLASH_SPEC: collect drained a FOREIGN spec launch \
+                         (owner={:#x}) — its ctx watermark could not be rolled back",
+                        stale.owner
+                    );
+                    super::spec_propose::SPEC_DISCARDS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             if dstate.async_placeholder {
                 dstate.async_placeholder = false;
@@ -283,7 +322,7 @@ impl BlockDiffusionDraftHead {
             }
             return Ok(None);
         }
-        guard.take();
+        let was_spec = guard.take().is_some_and(|inf| inf.spec);
         drop(guard);
 
         // The D2H into the pinned buffer + `draft_tokens_event` record are the
@@ -300,8 +339,7 @@ impl BlockDiffusionDraftHead {
         }
         // SAFETY: pinned buffer is γ×4 bytes, allocated for the head's
         // lifetime; the event sync above orders the DMA before this read.
-        let host_buf: &[u8] =
-            unsafe { std::slice::from_raw_parts(pinned_ptr, self.gamma * 4) };
+        let host_buf: &[u8] = unsafe { std::slice::from_raw_parts(pinned_ptr, self.gamma * 4) };
         let raw: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -317,7 +355,11 @@ impl BlockDiffusionDraftHead {
         let drafts: Vec<u32> = drafts.into_iter().take(cap).collect();
         dstate.last_num_drafted = drafts.len();
         dstate.async_placeholder = false;
-        ASYNC_COLLECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if was_spec {
+            super::spec_propose::SPEC_COLLECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            ASYNC_COLLECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         static COLLECT_DBG: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !COLLECT_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {

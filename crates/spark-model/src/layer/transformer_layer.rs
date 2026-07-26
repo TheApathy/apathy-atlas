@@ -4,12 +4,30 @@
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
 
 mod default_loops;
+
+/// DDTree M2b/M5 — how a tree-verify layer forward re-seeds branch scratch
+/// KV blocks from canonical between the spine and branch cache-writes.
+pub enum TreeReseed<'a> {
+    /// Eager path (M2b): host-side `(canonical_phys, scratch)` block-id
+    /// pairs; the layer issues per-pair `copy_d2d_async` with pointers
+    /// computed on the host. NOT graph-capturable (per-step pointers).
+    HostPairs(&'a [(u32, u32)]),
+    /// Graphed path (M5): ONE `kv_block_indirect_copy` launch per layer.
+    /// The `(src, dst)` block ids AND the pair count live in the `meta`
+    /// device buffer (uploaded pre-replay); `max_pairs` sizes the baked
+    /// grid, so one captured graph replays for any count ≤ `max_pairs`.
+    Indirect {
+        kernel: KernelHandle,
+        meta: DevicePtr,
+        max_pairs: u32,
+    },
+}
 
 pub trait TransformerLayer: Send + Sync {
     /// `&mut dyn Any` downcast hook for post-construction weight overlays (e.g.
@@ -491,6 +509,48 @@ pub trait TransformerLayer: Send + Sync {
             ctx,
             stream,
         )
+    }
+
+    /// DDTree M2b: batched tree-verify decode with a SPLIT KV cache-write.
+    ///
+    /// Runs the same single-launch batched phases as
+    /// [`Self::decode_multi_seq`] over all `num_seqs` tree rows, except the
+    /// KV cache-write executes as two row-range invocations:
+    /// rows `[0, spine_rows)` (bonus + spine → canonical blocks), then the
+    /// `reseed` `(canonical_block, scratch_block)` d2d block copies for THIS
+    /// layer, then rows `[spine_rows, num_seqs)` (branch rows → scratch).
+    /// This gives branch rows intra-step visibility of the spine K/V
+    /// written earlier in the same verify step.
+    ///
+    /// `ctx.attn_metadata` must carry per-row positions/slots/seq_lens and
+    /// PER-ROW block tables (branch rows remapped onto scratch blocks).
+    ///
+    /// Returns `Ok(false)` when the layer has no batched tree path
+    /// (default; SSM, MLA, mHC). Implementations returning `Ok(false)`
+    /// MUST NOT have launched any GPU work — the caller then falls back
+    /// to per-row sequential decode for this layer.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_tree(
+        &self,
+        _hidden: DevicePtr,
+        _residual: DevicePtr,
+        _num_seqs: usize,
+        _kv_cache: &mut PagedKvCache,
+        _spine_rows: usize,
+        _reseed: &TreeReseed<'_>,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// DDTree M5: whether [`Self::decode_multi_seq_tree`] would take the
+    /// batched path for this layer (no MLA / mHC / SSM). The graphed tree
+    /// verify pre-checks EVERY layer with this before `begin_capture` — a
+    /// mid-capture per-row fallback would bake per-step host block pointers
+    /// into the graph. Default `false` (no batched tree path at all).
+    fn tree_graph_capable(&self) -> bool {
+        false
     }
 
     /// Allocate per-sequence state for this layer.

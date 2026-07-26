@@ -223,6 +223,32 @@ pub struct SequenceState {
     /// `(block_table_index, scratch_block)` pairs. The scheduler resolves
     /// them via `dflash_adopt_fork_blocks(adopt_b)` right after the walk.
     pub block_fork_scratch: Vec<(usize, u32)>,
+    /// DDTree M2 (ATLAS_DFLASH_TREE=1): the tree payload for the NEXT
+    /// `decode_verify_dflash` call. Set by the scheduler from
+    /// `ActiveSeq.pending_tree_payload`; taken inside the verify (its
+    /// presence IS the tree gate). `None` = flat, byte-identical to today.
+    pub tree_payload: Option<crate::layers::DDTreePayload>,
+    /// DDTree M2 per-branch scratch KV blocks from the LAST tree verify:
+    /// `tree_branch_scratch[b]` = `(abs_block_index, scratch_block)` pairs
+    /// for branch `b` (sibling branches hold DISTINCT scratch blocks). The
+    /// scheduler resolves them via `dflash_adopt_tree_branch` right after
+    /// the walk; `free_sequence` is the leak backstop.
+    pub tree_branch_scratch: Vec<Vec<(usize, u32)>>,
+    /// DDTree M5 (ATLAS_DFLASH_TREE_GRAPH=1): persistent scratch KV blocks
+    /// reserved once for this sequence's GRAPHED tree verifies and REUSED
+    /// every tree step (contents re-seeded per layer inside the graph).
+    /// Owned by the sequence until `free_sequence`; a branch win copies the
+    /// winning scratch contents INTO the canonical blocks instead of
+    /// donating pool blocks to the block table (see
+    /// `dflash_adopt_tree_branch`), so the pool never shrinks mid-life.
+    pub tree_scratch_pool: Vec<u32>,
+    /// DDTree M5: set by the graphed tree verify when the CURRENT
+    /// `tree_branch_scratch` entries reference `tree_scratch_pool` blocks.
+    /// Tells `dflash_adopt_tree_branch` (and the `free_sequence` backstop)
+    /// to copy-on-win and NEVER free/donate those entries — the pool owns
+    /// them. Cleared by the adopt call; `false` = eager per-step scratch
+    /// with the original swap/free semantics.
+    pub tree_scratch_persistent: bool,
 }
 
 impl SequenceState {

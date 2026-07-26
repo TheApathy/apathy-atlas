@@ -30,6 +30,49 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
+        // FP8 MIRROR (ATLAS_TARGET_ATTN_FP8_MIRROR): row-scaled FP8 copies of
+        // the BF16 k/v_proj — halves weight-read bandwidth vs the BF16
+        // dense_gemv fallback below. Decode-only; prefill keeps BF16.
+        if let (Some(k_mirror), Some(v_mirror)) =
+            (self.k_fp8_mirror.as_ref(), self.v_fp8_mirror.as_ref())
+            && self.dense_gemv_fp8w_k.0 != 0
+        {
+            if ops::serial_mirror_gemm_enabled()
+                && self.fp8_gemm_row_scaled_mtile8_k.0 != 0
+                && h.is_multiple_of(32)
+            {
+                // ATLAS_SERIAL_MIRROR_GEMM=1: M=1 through the proven M≤8
+                // verify GEMM (mtile8 at N=1024 K=3072). NOTE: the cold M=1
+                // microbench (fp8gemv_m1_serial_microtest) shows the GEMV
+                // below is FASTER at this shape (207 vs 157 GB/s) — gate
+                // kept for serve-side A/B only.
+                self.fp8_mirror_gemm(ctx.gpu, normed, k_mirror, k_out, 1, nkv * hd, h, stream)?;
+                self.fp8_mirror_gemm(ctx.gpu, normed, v_mirror, v_out, 1, nkv * hd, h, stream)?;
+                return Ok(());
+            }
+            ops::dense_gemv_fp8w(
+                ctx.gpu,
+                self.dense_gemv_fp8w_k,
+                normed,
+                k_mirror,
+                k_out,
+                nkv * hd,
+                h,
+                stream,
+            )?;
+            ops::dense_gemv_fp8w(
+                ctx.gpu,
+                self.dense_gemv_fp8w_k,
+                normed,
+                v_mirror,
+                v_out,
+                nkv * hd,
+                h,
+                stream,
+            )?;
+            return Ok(());
+        }
+
         if let (Some(k_fp8), Some(v_fp8)) = (
             self.k_weight.as_ref().and_then(|w| w.as_fp8()),
             self.v_weight.as_ref().and_then(|w| w.as_fp8()),

@@ -170,6 +170,64 @@ pub trait DraftProposer: Send + Sync {
         Ok(None)
     }
 
+    /// ATLAS_DFLASH_SPEC_PROPOSE: enqueue the full-accept-bet drafter forward
+    /// on the dedicated propose stream, ordered after the verify graph whose
+    /// tap-layer captures + argmax it reads. Called from INSIDE the verify
+    /// dispatch, after the graph launch and before the blocking D2H —
+    /// everything is enqueue-only; `last_token` is read device-side from
+    /// `device_last_token` (the verify argmax slot of row K-1).
+    ///
+    /// `hidden_save` = the model's K-row per-tap-layer capture buffer;
+    /// `ctx_rows` = K; `base_pos` = pre-verify seq_len (RoPE stamp base).
+    /// `Ok(true)` = launched; `Ok(false)` = ineligible (sync path unaffected).
+    /// Default: unsupported.
+    #[allow(clippy::too_many_arguments)]
+    fn spec_propose_launch(
+        &self,
+        gpu: &dyn GpuBackend,
+        default_stream: u64,
+        device_last_token: DevicePtr,
+        hidden_save: DevicePtr,
+        ctx_rows: usize,
+        base_pos: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+    ) -> Result<bool> {
+        let _ = (
+            gpu,
+            default_stream,
+            device_last_token,
+            hidden_save,
+            ctx_rows,
+            base_pos,
+            state,
+            ctx,
+        );
+        Ok(false)
+    }
+
+    /// Is a speculative (full-accept-bet) propose in flight for this seq?
+    fn spec_pending(&self, state: &mut dyn ProposerState) -> bool {
+        let _ = state;
+        false
+    }
+
+    /// Discard this seq's speculative propose: drain the propose stream and
+    /// roll the drafter ctx watermark back to its pre-launch snapshot.
+    fn spec_discard(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+        let _ = (gpu, state);
+        Ok(())
+    }
+
+    /// Adopt this seq's speculative propose after a realized full accept:
+    /// commit the optimistic ctx state and return a placeholder chain; the
+    /// real drafts are event-collected via `collect_async_drafts` at the top
+    /// of the next scheduler step. `Ok(None)` = nothing in flight.
+    fn spec_adopt_placeholder(&self, state: &mut dyn ProposerState) -> Result<Option<Vec<u32>>> {
+        let _ = state;
+        Ok(None)
+    }
+
     /// Called after target verification to trim proposer state.
     ///
     /// `num_accepted` indicates how many draft tokens were accepted.

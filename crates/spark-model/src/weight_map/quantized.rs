@@ -57,6 +57,16 @@ pub enum WeightQuantFormat {
     /// reads the scale as FP8-E4M3 per-16 and applies a global) = silent
     /// garbage — assert with `WeightQuantFormat::expect` at the dispatch site.
     Mxfp4E8m0,
+    /// W3 Lloyd-Max: 3-bit codebook indices (Turbo3 packing, 8 vals / 3
+    /// bytes, `[N, K*3/8]` N-major) + the UNCHANGED NVFP4 FP8-E4M3 per-16
+    /// group scales + per-tensor f32 scale2. Dequant is
+    /// `w3_lut[idx] * e4m3(scale) * scale2` with an 8-entry symmetric
+    /// codebook (device `[8]` f32) fitted offline by `w3-requant`
+    /// (spark-storage). Loaded from `/…/w3cache/layer_NNN.w3x` under
+    /// `ATLAS_MOE_W3=1`; consumed ONLY by the `_w3` MoE kernel variants
+    /// (`moe_fused_w3` / `moe_w3a16` modules). Feeding these bytes through an
+    /// NVFP4 kernel = silent garbage — assert via `expect` at dispatch sites.
+    W3LloydMax,
 }
 
 impl WeightQuantFormat {

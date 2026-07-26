@@ -26,15 +26,45 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.forward_kn_residual(input, num_tokens, None, ctx, stream)
+            .map(|_| ())
+    }
+
+    /// [`Self::forward_kn`] with an optional fused residual tail
+    /// (ATLAS_FUSED_ELEMWISE=1). When `residual` is `Some(hidden)` AND the
+    /// fused blend+residual kernel is present AND the fast batchN path is
+    /// taken, the final weighted-sum blend also folds `hidden += moe_out`
+    /// in the same launch (bit-identical to blend followed by
+    /// `bf16_residual_add`) and `Ok(true)` is returned. On `Ok(false)` the
+    /// MoE output is at `moe_output()` and the caller must add the residual
+    /// itself (identical contract to `forward_kn`).
+    pub fn forward_kn_residual(
+        &self,
+        input: DevicePtr, // [num_tokens, H] BF16 — normed MoE input
+        num_tokens: usize,
+        residual: Option<DevicePtr>, // [num_tokens, H] BF16 residual stream
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
         // Fast faithful path requires: NVFP4 non-transposed experts (not bf16 /
         // not fp8), dense router gate (Laguna: gate_nvfp4=None), non-EP, and the
         // batchN kernel present. Anything else → proven per-token path.
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        // W3 Lloyd-Max routed experts need the _w3 batchN kernel pair; when
+        // absent (enable_w3 should have prevented this) fall back to the
+        // per-token path, which dispatches the single-token _w3 kernels.
+        let w3 = self.is_w3();
+        let batchn_ok = if w3 {
+            self.moe_expert_gate_up_shared_batchn_w3_k.0 != 0
+                && self.moe_expert_silu_down_shared_batchn_w3_k.0 != 0
+        } else {
+            self.moe_expert_gate_up_shared_batchn_k.0 != 0
+        };
         let can_fast = !is_ep
             && self.gate_nvfp4.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && self.moe_expert_gate_up_shared_batchn_k.0 != 0;
+            && batchn_ok;
 
         {
             use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,7 +85,8 @@ impl MoeLayer {
             }
         }
         if !can_fast {
-            return self.forward_batched(input, num_tokens, ctx, stream);
+            self.forward_batched(input, num_tokens, ctx, stream)?;
+            return Ok(false); // residual NOT folded — caller adds it
         }
 
         let n = num_tokens as u32;
@@ -68,12 +99,14 @@ impl MoeLayer {
         // context names the faulting kernel (localizes the K=γ illegal address).
         // Synchronize is illegal during CUDA graph capture (error 900), so the
         // checkpoints only arm in eager mode (pair with ATLAS_DFLASH_DEBUG_NO_GRAPH=1).
-        let kn_diag = !ctx.graph_capture
-            && std::env::var("ATLAS_KN_DIAG").ok().as_deref() == Some("1");
+        let kn_diag =
+            !ctx.graph_capture && std::env::var("ATLAS_KN_DIAG").ok().as_deref() == Some("1");
         macro_rules! kn_ck {
             ($label:expr) => {
                 if kn_diag {
-                    ctx.gpu.synchronize(stream).context(concat!("KN: ", $label))?;
+                    ctx.gpu
+                        .synchronize(stream)
+                        .context(concat!("KN: ", $label))?;
                 }
             };
         }
@@ -189,58 +222,126 @@ impl MoeLayer {
         // block's rows). Microbench (moe_batchn_v2_microtest, Laguna shapes):
         // 2.23 -> 1.66 ms/layer. v2 caps the per-leader token fan-out at 8.
         static KN_V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v2 = *KN_V2.get_or_init(|| {
-            std::env::var("ATLAS_KN_V2").ok().as_deref() == Some("1")
-        }) && num_tokens <= 8
-            && self.moe_expert_gate_up_shared_batchn_v2_k.0 != 0;
-        let batch_block = if v2 {
+        let v2_env = *KN_V2
+            .get_or_init(|| std::env::var("ATLAS_KN_V2").ok().as_deref() == Some("1"))
+            && num_tokens <= 8;
+        let v2 = v2_env
+            && if w3 {
+                self.moe_expert_gate_up_shared_batchn_v2_w3_k.0 != 0
+            } else {
+                self.moe_expert_gate_up_shared_batchn_v2_k.0 != 0
+            };
+        // ATLAS_KN_V5=1: cp.async bulk-staged gate_up + 16-row dedup down.
+        // BIT-IDENTICAL outputs to the v2 + precompute + v4-down chain (same
+        // lane partition, decode and FMA order — only the load path changes:
+        // whole 8-row weight slices staged via cp.async commit groups instead
+        // of 2 dependent 16B loads per lane, plus a parallel leader election
+        // replacing v2's serial thread-0 scan). Microbench
+        // (moe_kn_v5_microtest, Laguna shapes, M=7 union 46): chain
+        // 1.28 -> 1.14 ms/layer (+13%). Laguna-shape guarded: hidden % 1024
+        // == 0 && hidden <= 3072, inter == 1024, num_tokens*top_k <= 128
+        // (election smem cache), non-w3. Falls back to v2/v4 otherwise.
+        static KN_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let v5 = *KN_V5.get_or_init(|| std::env::var("ATLAS_KN_V5").ok().as_deref() == Some("1"))
+            && num_tokens <= 8
+            && !w3
+            && num_tokens * top_k as usize <= 128
+            && self.moe_expert_gate_up_shared_batchn_v5_k.0 != 0
+            && self.moe_expert_down_dedup_batchn_v5_k.0 != 0
+            && self.moe_silu_precompute_batchn_k.0 != 0
+            && h % 1024 == 0
+            && h <= 3072
+            && inter == 1024;
+        let batch_block = if v2 || v5 {
             128u32
         } else if ctx.config.hidden_size >= 3072 {
             256u32
         } else {
             128u32
         };
-        let gate_up_k = if v2 {
-            self.moe_expert_gate_up_shared_batchn_v2_k
+        if w3 {
+            // W3 Lloyd-Max routed experts: same launch contract, _w3 kernels,
+            // codebook appended (shared slot stays NVFP4 inside the kernel).
+            let gate_up_k = if v2 {
+                self.moe_expert_gate_up_shared_batchn_v2_w3_k
+            } else {
+                self.moe_expert_gate_up_shared_batchn_w3_k
+            };
+            ops::moe_expert_gate_up_shared_batchn_w3(
+                ctx.gpu,
+                gate_up_k,
+                input,
+                self.gate_ptrs.packed_ptrs,
+                self.gate_ptrs.scale_ptrs,
+                self.gate_ptrs.scale2_vals,
+                expert_gate_out,
+                self.up_ptrs.packed_ptrs,
+                self.up_ptrs.scale_ptrs,
+                self.up_ptrs.scale2_vals,
+                expert_up_out,
+                indices_dev,
+                &self.weights.shared_expert.gate_proj,
+                shared_gate_scratch,
+                &self.weights.shared_expert.up_proj,
+                shared_up_scratch,
+                inter,
+                h,
+                top_k,
+                n,
+                batch_block,
+                self.w3_lut_dev,
+                stream,
+            )?;
         } else {
-            self.moe_expert_gate_up_shared_batchn_k
-        };
-        ops::moe_expert_gate_up_shared_batchn(
-            ctx.gpu,
-            gate_up_k,
-            input,
-            self.gate_ptrs.packed_ptrs,
-            self.gate_ptrs.scale_ptrs,
-            self.gate_ptrs.scale2_vals,
-            expert_gate_out,
-            self.up_ptrs.packed_ptrs,
-            self.up_ptrs.scale_ptrs,
-            self.up_ptrs.scale2_vals,
-            expert_up_out,
-            indices_dev,
-            &self.weights.shared_expert.gate_proj,
-            shared_gate_scratch,
-            &self.weights.shared_expert.up_proj,
-            shared_up_scratch,
-            inter,
-            h,
-            top_k,
-            n,
-            batch_block,
-            stream,
-        )?;
+            let gate_up_k = if v5 {
+                // v5: same launch contract as v2 (grid z=2, block 128) —
+                // cp.async-staged weights + parallel election inside.
+                self.moe_expert_gate_up_shared_batchn_v5_k
+            } else if v2 {
+                self.moe_expert_gate_up_shared_batchn_v2_k
+            } else {
+                self.moe_expert_gate_up_shared_batchn_k
+            };
+            ops::moe_expert_gate_up_shared_batchn(
+                ctx.gpu,
+                gate_up_k,
+                input,
+                self.gate_ptrs.packed_ptrs,
+                self.gate_ptrs.scale_ptrs,
+                self.gate_ptrs.scale2_vals,
+                expert_gate_out,
+                self.up_ptrs.packed_ptrs,
+                self.up_ptrs.scale_ptrs,
+                self.up_ptrs.scale2_vals,
+                expert_up_out,
+                indices_dev,
+                &self.weights.shared_expert.gate_proj,
+                shared_gate_scratch,
+                &self.weights.shared_expert.up_proj,
+                shared_up_scratch,
+                inter,
+                h,
+                top_k,
+                n,
+                batch_block,
+                stream,
+            )?;
+        }
         kn_ck!("gate_up_batchn");
         // ATLAS_KN_V4=1: decoupled-silu dedup down (microbench: silu_down
         // 0.72→0.59 ms/layer, 186 GB/s, cos 0.999997). Precompute silu(gate)*up
         // in-place over the gate buffers, then the dedup down reads it directly
         // (no smem staging — the cost that sank silu_down_v2). Caps M at 8.
         static KN_V4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let v4 = *KN_V4.get_or_init(|| {
-            std::env::var("ATLAS_KN_V4").ok().as_deref() == Some("1")
-        }) && num_tokens <= 8
+        let v4 = *KN_V4.get_or_init(|| std::env::var("ATLAS_KN_V4").ok().as_deref() == Some("1"))
+            && num_tokens <= 8
             && self.moe_silu_precompute_batchn_k.0 != 0
-            && self.moe_expert_down_dedup_batchn_k.0 != 0;
-        if v4 {
+            && if w3 {
+                self.moe_expert_down_dedup_batchn_w3_k.0 != 0
+            } else {
+                self.moe_expert_down_dedup_batchn_k.0 != 0
+            };
+        if v4 || v5 {
             ops::moe_silu_precompute_batchn(
                 ctx.gpu,
                 self.moe_silu_precompute_batchn_k,
@@ -255,22 +356,86 @@ impl MoeLayer {
                 n,
                 stream,
             )?;
-            ops::moe_expert_down_dedup_batchn(
+            if w3 {
+                ops::moe_expert_down_dedup_batchn_w3(
+                    ctx.gpu,
+                    self.moe_expert_down_dedup_batchn_w3_k,
+                    expert_gate_out,     // act (routed)
+                    shared_gate_scratch, // sh_act
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    &self.weights.shared_expert.down_proj,
+                    shared_down_out,
+                    h,
+                    inter,
+                    top_k,
+                    n,
+                    self.w3_lut_dev,
+                    stream,
+                )?;
+            } else if v5 {
+                ops::moe_expert_down_dedup_batchn_v5(
+                    ctx.gpu,
+                    self.moe_expert_down_dedup_batchn_v5_k,
+                    expert_gate_out,     // act (routed)
+                    shared_gate_scratch, // sh_act
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    &self.weights.shared_expert.down_proj,
+                    shared_down_out,
+                    h,
+                    inter,
+                    top_k,
+                    n,
+                    stream,
+                )?;
+            } else {
+                ops::moe_expert_down_dedup_batchn(
+                    ctx.gpu,
+                    self.moe_expert_down_dedup_batchn_k,
+                    expert_gate_out,     // act (routed)
+                    shared_gate_scratch, // sh_act
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    &self.weights.shared_expert.down_proj,
+                    shared_down_out,
+                    h,
+                    inter,
+                    top_k,
+                    n,
+                    stream,
+                )?;
+            }
+        } else if w3 {
+            ops::moe_expert_silu_down_shared_batchn_w3(
                 ctx.gpu,
-                self.moe_expert_down_dedup_batchn_k,
-                expert_gate_out,     // act (routed)
-                shared_gate_scratch, // sh_act
+                self.moe_expert_silu_down_shared_batchn_w3_k,
+                expert_gate_out,
+                expert_up_out,
                 self.down_ptrs.packed_ptrs,
                 self.down_ptrs.scale_ptrs,
                 self.down_ptrs.scale2_vals,
                 expert_down_out,
                 indices_dev,
+                shared_gate_scratch,
+                shared_up_scratch,
                 &self.weights.shared_expert.down_proj,
                 shared_down_out,
                 h,
                 inter,
                 top_k,
                 n,
+                batch_block,
+                self.w3_lut_dev,
                 stream,
             )?;
         } else {
@@ -297,29 +462,55 @@ impl MoeLayer {
             )?;
         }
         kn_ck!("silu_down_batchn");
-        ops::moe_weighted_sum_blend_batchn(
-            ctx.gpu,
-            self.moe_weighted_sum_blend_batch2,
-            output,
-            expert_down_out,
-            weights_dev,
-            shared_down_out,
-            input,
-            self.weights.shared_expert_gate.weight,
-            h,
-            top_k,
-            h,
-            n,
-            stream,
-        )?;
+        // ATLAS_FUSED_ELEMWISE=1: fold the FFN residual add into the blend
+        // (one launch + one [n, H] BF16 round-trip saved). Bit-identical:
+        // the fused kernel rounds the blend to BF16 exactly as before (and
+        // still writes `output`), then adds it to `hidden` exactly as
+        // `bf16_residual_add` would have.
+        let residual_fused = if let Some(hidden) = residual
+            && self.moe_blend_residual_batchn_k.0 != 0
+        {
+            ops::moe_weighted_sum_blend_residual_batchn(
+                ctx.gpu,
+                self.moe_blend_residual_batchn_k,
+                output,
+                expert_down_out,
+                weights_dev,
+                shared_down_out,
+                input,
+                self.weights.shared_expert_gate.weight,
+                hidden,
+                h,
+                top_k,
+                h,
+                n,
+                stream,
+            )?;
+            true
+        } else {
+            ops::moe_weighted_sum_blend_batchn(
+                ctx.gpu,
+                self.moe_weighted_sum_blend_batch2,
+                output,
+                expert_down_out,
+                weights_dev,
+                shared_down_out,
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                top_k,
+                h,
+                n,
+                stream,
+            )?;
+            false
+        };
         kn_ck!("blend_batchn");
 
         // ATLAS_KN_CMP=1 (eager only): one-shot numerical compare of the batched
         // path against the proven per-token forward() for token 0 — names the
         // diverging stage (router gemm / topk / expert kernels) in one serve run.
-        if !ctx.graph_capture
-            && std::env::var("ATLAS_KN_CMP").ok().as_deref() == Some("1")
-        {
+        if !ctx.graph_capture && std::env::var("ATLAS_KN_CMP").ok().as_deref() == Some("1") {
             use std::sync::atomic::{AtomicBool, Ordering};
             static CMP_DONE: AtomicBool = AtomicBool::new(false);
             if !CMP_DONE.swap(true, Ordering::Relaxed) {
@@ -341,7 +532,7 @@ impl MoeLayer {
             }
         }
 
-        Ok(())
+        Ok(residual_fused)
     }
 
     /// Diagnostic: compare batched (already computed) vs per-token reference for

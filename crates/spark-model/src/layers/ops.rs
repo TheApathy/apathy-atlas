@@ -55,6 +55,7 @@ mod moe_atomic_c4;
 mod moe_expert;
 #[path = "ops/moe_expert_more.rs"]
 mod moe_expert_more;
+mod moe_expert_w3;
 #[path = "ops/moe_gate.rs"]
 mod moe_gate;
 #[path = "ops/moe_grouped_a.rs"]
@@ -124,6 +125,7 @@ pub use kv_cache_turbok::*;
 pub use moe_atomic_c4::*;
 pub use moe_expert::*;
 pub use moe_expert_more::*;
+pub use moe_expert_w3::*;
 pub use moe_gate::*;
 pub use moe_grouped_a::*;
 pub use moe_grouped_a2::*;

@@ -59,6 +59,18 @@ pub fn cublas_gemm_enabled() -> bool {
     *EN.get_or_init(|| std::env::var("ATLAS_CUBLAS_GEMM").ok().as_deref() == Some("1"))
 }
 
+/// Fused elementwise-swarm kernels enabled? (`ATLAS_FUSED_ELEMWISE=1`), cached.
+/// Default OFF — gates the fused q/k norm+rope+cache-write epilogue of the
+/// multi-seq flat verify AND the serial (M=1) decode path, plus the fused MoE
+/// blend+residual tail (multi-seq KN verify and serial decode). All fused
+/// kernels are bit-identical to the unfused chains they replace (see
+/// kernels/gb10/common/fused_verify_elemwise.cu).
+pub fn fused_elemwise_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_FUSED_ELEMWISE").ok().as_deref() == Some("1"))
+}
+
 /// Native-FP8 cuBLASLt GEMM path enabled? (`ATLAS_CUBLAS_FP8=1`), cached.
 pub fn cublas_fp8_enabled() -> bool {
     use std::sync::OnceLock;
@@ -72,6 +84,29 @@ pub fn cutlass_gemm_enabled() -> bool {
     use std::sync::OnceLock;
     static EN: OnceLock<bool> = OnceLock::new();
     *EN.get_or_init(|| std::env::var("ATLAS_CUTLASS_GEMM").ok().as_deref() == Some("1"))
+}
+
+/// Serial (M=1) decode FP8-mirror GEMM dispatch enabled?
+/// (`ATLAS_SERIAL_MIRROR_GEMM=1`), cached. Default OFF.
+///
+/// When on, the M=1 decode attention-mirror sites (q/k/v/o) and the serial
+/// FP8 lm_head tier launch the proven M≤8 verify GEMMs
+/// (`fp8_gemm_t_row_scaled_mtile8` / `_n32`) instead of `dense_gemv_fp8w`.
+///
+/// Cold M=1 microbench verdict (fp8gemv_m1_serial_microtest, GB10,
+/// 2026-07-25): the GEMV is FASTER at every serial Laguna shape — 231-256
+/// GB/s cold (at the ~245 GB/s LPDDR5x wall) vs 152-211 GB/s for the
+/// mtile8/n32 tiles at M=1. This gate exists purely for serve-side
+/// falsification (in-graph, real mirrors, real L2 state); expectation from
+/// the microbench is that enabling it REGRESSES serial decode.
+///
+/// Numerics: mtile8 MMA accumulation differs from the GEMV's reduction
+/// order (known knife-edge EAR class) — A/B accept-impact serve-side.
+/// Graph-capture safe: pure device args, host-side constant decision.
+pub fn serial_mirror_gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_SERIAL_MIRROR_GEMM").ok().as_deref() == Some("1"))
 }
 
 /// Native CUTLASS NVFP4 GEMM path enabled? (`ATLAS_CUTLASS_NVFP4_GEMM=1`).

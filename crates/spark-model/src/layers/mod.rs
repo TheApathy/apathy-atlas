@@ -18,7 +18,7 @@ pub mod vision_encoder;
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
-    BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
+    BlockDiffusionDraftHead, DDTreePayload, DflashLayer, DflashProposerState, DflashQuantization,
 };
 pub use moe::MoeLayer;
 pub use mtp_head::{MtpHead, MtpQuantization, mtp_drafter_prefill_enabled};
@@ -93,6 +93,26 @@ impl FfnComponent {
         }
     }
 
+    /// [`Self::forward`] with an optional fused residual tail
+    /// (ATLAS_FUSED_ELEMWISE=1, serial M=1 decode). Returns `Ok((out, true))`
+    /// iff `hidden += out` was folded into the final MoE blend launch (see
+    /// `MoeLayer::forward_residual`); on `Ok((out, false))` the caller adds
+    /// the residual itself — identical contract to `forward`. Dense/None
+    /// FFNs never fuse.
+    pub fn forward_residual(
+        &self,
+        input: DevicePtr,
+        residual: Option<DevicePtr>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, bool)> {
+        match self {
+            Self::Moe(m) => m.forward_residual(input, residual, ctx, stream),
+            Self::Dense(d) => Ok((d.forward(input, ctx, stream)?, false)),
+            Self::None => Ok((input, false)),
+        }
+    }
+
     pub fn forward_k2(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k2(input, ctx, stream),
@@ -125,6 +145,32 @@ impl FfnComponent {
             Self::None => {
                 let _ = (input, num_tokens);
                 Ok(())
+            }
+        }
+    }
+
+    /// [`Self::forward_kn`] with an optional fused residual tail
+    /// (ATLAS_FUSED_ELEMWISE=1). Returns `Ok(true)` iff `hidden += moe_out`
+    /// was folded into the final blend launch (MoE fast batchN path only);
+    /// on `Ok(false)` the output is at `moe_output()` and the caller adds
+    /// the residual itself — identical contract to `forward_kn`.
+    pub fn forward_kn_residual(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        residual: Option<DevicePtr>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        match self {
+            Self::Moe(m) => m.forward_kn_residual(input, num_tokens, residual, ctx, stream),
+            Self::Dense(d) => {
+                d.forward_prefill(input, num_tokens, ctx, stream)?;
+                Ok(false)
+            }
+            Self::None => {
+                let _ = (input, num_tokens);
+                Ok(false)
             }
         }
     }

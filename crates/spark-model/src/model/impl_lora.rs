@@ -232,6 +232,14 @@ impl TransformerModel {
                 .collect(),
         );
         drain(
+            "verify_tree_graph",
+            self.verify_tree_graph
+                .lock()
+                .drain()
+                .flat_map(|(_, shapes)| shapes.into_iter().map(|(_, g)| g))
+                .collect(),
+        );
+        drain(
             "fused_graph",
             self.fused_graph.lock().drain().map(|(_, g)| g).collect(),
         );

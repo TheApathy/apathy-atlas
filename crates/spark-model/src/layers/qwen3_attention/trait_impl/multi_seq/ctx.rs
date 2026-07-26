@@ -46,6 +46,14 @@ pub(super) struct MultiSeqCtx<'a> {
     /// routing). Set by the orchestrator after fetching `meta`. Read by the
     /// K/V/O bgmv apply sites; `0` (or a base-only route) makes them no-op.
     pub seq_slot: DevicePtr,
+    /// ATLAS_FUSED_ELEMWISE=1 flat-verify epilogue: when true the wide (n>3)
+    /// QKV branches SKIP the per-row scatter into `qkv_buf`, the per-head
+    /// norms, per-row rope, per-row cache write and the Q gather — a single
+    /// fused kernel (bit-identical) consumes the contiguous GEMM outputs
+    /// instead. Set ONLY by `decode_multi_seq_inner` when
+    /// [`Qwen3AttentionLayer::ms_fused_epilogue_eligible`] holds; defaults to
+    /// false so the tree-verify and mHC paths are untouched.
+    pub fused_qk_epilogue: bool,
 }
 
 impl<'a> MultiSeqCtx<'a> {
@@ -94,6 +102,7 @@ impl<'a> MultiSeqCtx<'a> {
             normed,
             qkv_buf,
             seq_slot: DevicePtr(0),
+            fused_qk_epilogue: false,
         }
     }
 }

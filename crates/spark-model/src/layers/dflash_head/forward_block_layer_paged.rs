@@ -207,12 +207,13 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // Phase G: when self.quant == Fp8Weights, swap each dense_gemm
-        // for fp8_gemm_n128_row_scaled against the FP8 mirror weight.
-        // Per-row f32 scales (built at load time by quantize_bf16_to_fp8)
-        // are applied inside the GEMM at write-out. Fp8 mirror None →
-        // fall back to BF16 (defensive, shouldn't fire if G.2 ran).
-        let use_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
+        // Phase G: per-GEMM FP8 dispatch — when a weight's FP8 mirror
+        // exists (built at load by quantize_bf16_to_fp8), swap its
+        // dense_gemm for fp8_gemm_n128_row_scaled; per-row f32 scales are
+        // applied inside the GEMM at write-out. Mirror None → BF16. Full
+        // mode (ATLAS_DFLASH_DRAFTER_FP8=1) mirrors all seven weights;
+        // attn-only mode (ATLAS_DFLASH_DRAFTER_FP8_ATTN=1) mirrors only
+        // q/k/v/o, so gate/up/down stay BF16 here by mirror absence.
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
                          src: spark_runtime::gpu::DevicePtr,
@@ -220,7 +221,7 @@ impl BlockDiffusionDraftHead {
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            if use_fp8 && let Some(fp8) = w_fp8 {
+            if let Some(fp8) = w_fp8 {
                 return ops::fp8_gemm_n128_row_scaled(
                     gpu,
                     self.kernels.fp8_gemm_n128_row_scaled,
@@ -232,6 +233,12 @@ impl BlockDiffusionDraftHead {
                     k_in,
                     stream,
                 );
+            }
+            // ATLAS_DFLASH_DRAFTER_FASTGEMM=1: small-M weight-streaming
+            // BF16 GEMM (bit-identical accumulate chain; pure device args
+            // → graph-capture safe). Default OFF → pipelined, unchanged.
+            if self.try_fastgemm(gpu, src, w_bf16, dst, g, n_out, k_in, stream)? {
+                return Ok(());
             }
             ops::dense_gemm_bf16_pipelined(
                 gpu,
@@ -629,8 +636,8 @@ impl BlockDiffusionDraftHead {
             self.num_q_heads as u32,
             self.num_kv_heads as u32,
             self.head_dim as u32,
-            16,         // cache_block_size
-            swa_window, // FIX 2: Laguna=512 (moving-query SWA), non-Laguna=0
+            16,                  // cache_block_size
+            swa_window,          // FIX 2: Laguna=512 (moving-query SWA), non-Laguna=0
             causal_mask_enabled, // FIX 2: Laguna=1 (causal), non-Laguna=0
             inv_sqrt_d,
             stream,
@@ -923,10 +930,10 @@ impl BlockDiffusionDraftHead {
         let gpu = ctx.gpu;
         let g = self.gamma as u32;
 
-        // Phase G — same swap helper as pre_attn (q/k/v). Single call
-        // site per logical GEMM; the row-scaled FP8 GEMM kernel applies
-        // the per-row scale internally at write-out.
-        let use_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
+        // Phase G — same per-GEMM swap helper as pre_attn (q/k/v): FP8
+        // mirror present → row-scaled FP8 GEMM (scale applied internally
+        // at write-out), absent → BF16. In attn-only mode o_proj has a
+        // mirror but gate/up/down do not.
         let gemm_swap = |w_bf16: &crate::weight_map::DenseWeight,
                          w_fp8: &Option<crate::weight_map::Fp8DenseWeight>,
                          src: spark_runtime::gpu::DevicePtr,
@@ -934,7 +941,7 @@ impl BlockDiffusionDraftHead {
                          n_out: u32,
                          k_in: u32|
          -> Result<()> {
-            if use_fp8 && let Some(fp8) = w_fp8 {
+            if let Some(fp8) = w_fp8 {
                 return ops::fp8_gemm_n128_row_scaled(
                     gpu,
                     self.kernels.fp8_gemm_n128_row_scaled,
@@ -946,6 +953,12 @@ impl BlockDiffusionDraftHead {
                     k_in,
                     stream,
                 );
+            }
+            // ATLAS_DFLASH_DRAFTER_FASTGEMM=1: small-M weight-streaming
+            // BF16 GEMM (bit-identical accumulate chain; pure device args
+            // → graph-capture safe). Default OFF → pipelined, unchanged.
+            if self.try_fastgemm(gpu, src, w_bf16, dst, g, n_out, k_in, stream)? {
+                return Ok(());
             }
             ops::dense_gemm_bf16_pipelined(
                 gpu,
@@ -980,9 +993,8 @@ impl BlockDiffusionDraftHead {
                 "Laguna g_proj present but gate_buf scratch is NULL"
             );
             // gate logits: [γ, num_q_heads] = norm_buf[γ, h] @ g_projᵀ.
-            ops::dense_gemm_bf16_pipelined(
+            if self.try_fastgemm(
                 gpu,
-                self.kernels.dense_gemm_pipelined,
                 self.scratch.norm_buf,
                 g_proj,
                 self.scratch.gate_buf,
@@ -990,7 +1002,21 @@ impl BlockDiffusionDraftHead {
                 self.num_q_heads as u32,
                 h,
                 stream,
-            )?;
+            )? {
+                // dispatched via the small-M streaming kernel
+            } else {
+                ops::dense_gemm_bf16_pipelined(
+                    gpu,
+                    self.kernels.dense_gemm_pipelined,
+                    self.scratch.norm_buf,
+                    g_proj,
+                    self.scratch.gate_buf,
+                    g,
+                    self.num_q_heads as u32,
+                    h,
+                    stream,
+                )?;
+            }
             // attn_out[t,head,d] *= softplus(gate[t,head]) — softplus computed
             // in fp32 inside the kernel; broadcast over head_dim.
             ops::softplus_gate_mul_head_broadcast(
@@ -1065,7 +1091,15 @@ impl BlockDiffusionDraftHead {
         )?;
 
         if args.block_dump {
-            self.block_dump_buf(ctx, self.scratch.norm_buf, args.layer_idx, "post_attn_norm", g, h, stream)?;
+            self.block_dump_buf(
+                ctx,
+                self.scratch.norm_buf,
+                args.layer_idx,
+                "post_attn_norm",
+                g,
+                h,
+                stream,
+            )?;
         }
         // 3j. MLP: gate_proj + up_proj + silu_mul + down_proj — γ rows.
         // dflash.py:141  hidden_states = self.mlp(hidden_states)
@@ -1090,8 +1124,24 @@ impl BlockDiffusionDraftHead {
             h,
         )?;
         if args.block_dump {
-            self.block_dump_buf(ctx, self.scratch.mlp_intermediate, args.layer_idx, "mlp_gate_raw", g, inter, stream)?;
-            self.block_dump_buf(ctx, self.scratch.mlp_up, args.layer_idx, "mlp_up_raw", g, inter, stream)?;
+            self.block_dump_buf(
+                ctx,
+                self.scratch.mlp_intermediate,
+                args.layer_idx,
+                "mlp_gate_raw",
+                g,
+                inter,
+                stream,
+            )?;
+            self.block_dump_buf(
+                ctx,
+                self.scratch.mlp_up,
+                args.layer_idx,
+                "mlp_up_raw",
+                g,
+                inter,
+                stream,
+            )?;
         }
         ops::silu_mul(
             gpu,
@@ -1112,8 +1162,24 @@ impl BlockDiffusionDraftHead {
         )?;
 
         if args.block_dump {
-            self.block_dump_buf(ctx, self.scratch.mlp_intermediate, args.layer_idx, "mlp_act", g, inter, stream)?;
-            self.block_dump_buf(ctx, self.scratch.stream_acc, args.layer_idx, "mlp_out", g, h, stream)?;
+            self.block_dump_buf(
+                ctx,
+                self.scratch.mlp_intermediate,
+                args.layer_idx,
+                "mlp_act",
+                g,
+                inter,
+                stream,
+            )?;
+            self.block_dump_buf(
+                ctx,
+                self.scratch.stream_acc,
+                args.layer_idx,
+                "mlp_out",
+                g,
+                h,
+                stream,
+            )?;
         }
         // 3k. Second residual add: hidden = (residual + attn) + mlp_output.
         // dflash.py:142  hidden_states = residual + hidden_states

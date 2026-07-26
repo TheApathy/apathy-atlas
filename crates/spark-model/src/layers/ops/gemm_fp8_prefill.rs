@@ -278,6 +278,96 @@ pub fn fp8_gemm_n128_row_scaled_m16(
         .launch(stream)
 }
 
+/// Tiny-M row-scaled FP8 GEMM (M ≤ 8) — weight-read-bound verify kernel.
+///
+/// Same math as [`fp8_gemm_n128_row_scaled`] but specialized for the
+/// attention FP8-mirror verify projections where M = n_verify ≤ 8:
+/// each CTA streams a contiguous N_TILE=64 slice of the FP8 weight
+/// exactly once over the full K range through a 4-stage cp.async ring
+/// (K_STEP=64, 3×4KB of weight bytes in flight per CTA), with the tiny
+/// [M≤8, K] BF16 activation streamed alongside (L2-resident across
+/// CTAs). Grid ceil(N/64) = 48/96/144 CTAs at N=3072/6144/9216 — exact
+/// multiples of GB10's 48 SMs, vs 24-72 CTAs for the M64/_m16 tiles
+/// that left the LPDDR5x bus latency-bound at M=7.
+///
+/// Caller MUST guarantee `m <= 8` (rows ≥ 8 are never computed) and
+/// `k % 32 == 0` (same contract as the sibling kernels).
+///
+/// Kernel: `fp8_gemm_t_row_scaled_mtile8(A, B_fp8, row_scale, C, M, N, K)`.
+/// Grid: (ceil(N/64), 1, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_row_scaled_smallm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(
+        m <= 8,
+        "fp8_gemm_row_scaled_smallm requires M <= 8 (got {m})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Tiny-M row-scaled FP8 GEMM (M ≤ 8), N_TILE=32 variant — small-N/large-K
+/// occupancy fix.
+///
+/// Bit-identical math to [`fp8_gemm_row_scaled_smallm`] (same K_STEP=64
+/// stage walk, same per-stage MMA order, same f32 accumulation chain per
+/// output element) but each CTA covers 32 output columns instead of 64,
+/// doubling the grid. At the o_proj mirror shape (N=3072, K=6144/9216) the
+/// N_TILE=64 kernel launches exactly 48 CTAs = 1 CTA/SM on GB10 — one
+/// 4-stage cp.async ring per SM cannot hide LPDDR5x latency. ceil(N/32) =
+/// 96 CTAs = 2/SM restores the in-flight depth the qkv shapes get for free.
+///
+/// Caller MUST guarantee `m <= 8` and `k % 32 == 0` (same contract).
+///
+/// Kernel: `fp8_gemm_t_row_scaled_mtile8_n32(A, B_fp8, row_scale, C, M, N, K)`.
+/// Grid: (ceil(N/32), 1, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_row_scaled_smallm_n32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &Fp8DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(
+        m <= 8,
+        "fp8_gemm_row_scaled_smallm_n32 requires M <= 8 (got {m})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.row_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Row-scaled FP8 GEMM: `C[M, N] = A[M, K] @ (dequant(B_fp8[N, K]) * row_scale[N])`.
 ///
 /// Same tiling and FP8 MMA as `fp8_gemm_n128` (BF16 × FP8 → BF16), with a

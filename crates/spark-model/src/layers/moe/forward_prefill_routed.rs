@@ -279,6 +279,45 @@ impl MoeLayer {
                         )?;
                     }
                 }
+            } else if self.is_w3() {
+                // W3 Lloyd-Max routed experts: the pointer tables hold 3-bit
+                // Turbo3-packed weights, so the prefill fallback runs the W3
+                // grouped GEMM (enable_w3 guarantees the handle resolved).
+                let (gp, up) = (&self.gate_ptrs, &self.up_ptrs);
+                ops::moe_w3a16_grouped_gemm_ptrtable(
+                    ctx.gpu,
+                    self.moe_grouped_gemm_w3_k,
+                    expert_input,
+                    gp.packed_ptrs,
+                    gp.scale_ptrs,
+                    gp.scale2_vals,
+                    expert_gate_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles,
+                    self.w3_lut_dev,
+                    stream,
+                )?;
+                ops::moe_w3a16_grouped_gemm_ptrtable(
+                    ctx.gpu,
+                    self.moe_grouped_gemm_w3_k,
+                    expert_input,
+                    up.packed_ptrs,
+                    up.scale_ptrs,
+                    up.scale2_vals,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    max_m_tiles,
+                    self.w3_lut_dev,
+                    stream,
+                )?;
             } else {
                 // ARM-2 Phase-K straggler net: V4 native builds gate_ptrs_t, so
                 // E8M0 never reaches this non-transposed fallback. If it does,
@@ -463,6 +502,25 @@ impl MoeLayer {
                         )?;
                     }
                 }
+            } else if self.is_w3() {
+                // W3 Lloyd-Max down projection (see gate_up W3 branch above).
+                ops::moe_w3a16_grouped_gemm_ptrtable(
+                    ctx.gpu,
+                    self.moe_grouped_gemm_w3_k,
+                    expert_gate_out,
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    expert_offsets,
+                    DevicePtr(0),
+                    num_experts,
+                    h,
+                    inter,
+                    max_m_tiles,
+                    self.w3_lut_dev,
+                    stream,
+                )?;
             } else {
                 // ARM-2 Phase-K straggler net (see gate_up fallback above).
                 self.experts_scale_kind.expect(

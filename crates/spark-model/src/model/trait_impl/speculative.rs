@@ -216,7 +216,11 @@ impl TransformerModel {
         // DIAG (c) ONLY when the confidence-tau trim in run_mtp_propose_inner
         // (impl_b3.rs) fired and returned an empty Vec — the one place <4 (in
         // fact 0) can appear that propose.rs's own DIAG doesn't show.
-        if std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1") {
+        // (Env read cached once — this fired on EVERY propose.)
+        static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let diag =
+            *DIAG.get_or_init(|| std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1"));
+        if diag {
             match &out {
                 Ok(d) => tracing::info!(
                     "DFLASH DIAG multi_dispatch: requested num_drafts={} → returned len={} \

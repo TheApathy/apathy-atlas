@@ -77,6 +77,29 @@ impl BlockDiffusionDraftHead {
         };
 
         let gpu = ctx.gpu;
+        // ATLAS_DFLASH_SPEC_PROPOSE runs this precompute on the dedicated
+        // propose stream while the verify graph occupies the default stream.
+        // The blocking `copy_h2d`/`copy_d2d` variants enqueue on the DEFAULT
+        // stream and cuStreamSynchronize it — that would stall the scheduler
+        // thread for the whole verify AND order the copies on the wrong
+        // stream. Route through the `_async(stream)` variants whenever the
+        // caller's stream is not the default one; byte-identical for every
+        // existing caller (they all pass the default stream).
+        let enqueue_only = stream != gpu.default_stream();
+        let h2d = |bytes: &[u8], dst: DevicePtr| -> Result<()> {
+            if enqueue_only {
+                gpu.copy_h2d_async(bytes, dst, stream)
+            } else {
+                gpu.copy_h2d(bytes, dst)
+            }
+        };
+        let d2d = |src: DevicePtr, dst: DevicePtr, bytes: usize| -> Result<()> {
+            if enqueue_only {
+                gpu.copy_d2d_async(src, dst, bytes, stream)
+            } else {
+                gpu.copy_d2d(src, dst, bytes)
+            }
+        };
         let bf16 = 2usize;
         let h = self.hidden_size as u32;
         let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
@@ -121,10 +144,14 @@ impl BlockDiffusionDraftHead {
         // ── Step 1: batched fc projection ────────────────────────────
         // py:175  `target_hidden = self.hidden_norm(self.fc(target_hidden))`
         //   first half: fc maps [n, L_t*h_t] → [n, h].
-        let src = self.apply_aux_hidden_norms(ctx_base_ptr, start_slot, new_ctx_count, ctx, stream)?;
-        ops::dense_gemm_bf16_pipelined(
+        let src =
+            self.apply_aux_hidden_norms(ctx_base_ptr, start_slot, new_ctx_count, ctx, stream)?;
+        // ATLAS_DFLASH_DRAFTER_FASTGEMM=1: on the steady-state decode path
+        // the ctx tail is 1-2 rows, so this fc GEMM (Laguna: K = L_t·h_t =
+        // 18432 → 113 MB weight read) is small-M weight-bound. Chunked
+        // prefill catch-up can pass n > 16 — the gate falls back then.
+        if self.try_fastgemm(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             src,
             &self.fc,
             self.scratch.fc_proj,
@@ -132,7 +159,21 @@ impl BlockDiffusionDraftHead {
             h,
             target_hidden_dim as u32,
             stream,
-        )?;
+        )? {
+            // dispatched via the small-M streaming kernel
+        } else {
+            ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                src,
+                &self.fc,
+                self.scratch.fc_proj,
+                n,
+                h,
+                target_hidden_dim as u32,
+                stream,
+            )?;
+        }
         dump_buf(
             "fc_proj",
             self.scratch.fc_proj,
@@ -166,9 +207,8 @@ impl BlockDiffusionDraftHead {
         // Layout per row: [K_0 | V_0 | K_1 | V_1 | … | K_{L-1} | V_{L-1}].
         let fused_w = DenseWeight { weight: fused_kv };
         let fused_n_cols = (l_total as u32) * 2 * kv_dim;
-        ops::dense_gemm_bf16_pipelined(
+        if self.try_fastgemm(
             gpu,
-            self.kernels.dense_gemm_pipelined,
             self.scratch.fc_proj,
             &fused_w,
             self.scratch.fused_kv_out,
@@ -176,7 +216,21 @@ impl BlockDiffusionDraftHead {
             fused_n_cols,
             h,
             stream,
-        )?;
+        )? {
+            // dispatched via the small-M streaming kernel
+        } else {
+            ops::dense_gemm_bf16_pipelined(
+                gpu,
+                self.kernels.dense_gemm_pipelined,
+                self.scratch.fc_proj,
+                &fused_w,
+                self.scratch.fused_kv_out,
+                n,
+                fused_n_cols,
+                h,
+                stream,
+            )?;
+        }
         dump_buf(
             "fused_kv_out",
             self.scratch.fused_kv_out,
@@ -198,7 +252,7 @@ impl BlockDiffusionDraftHead {
                 .take(l_total * new_ctx_count)
                 .flat_map(|p: i32| p.to_le_bytes())
                 .collect();
-            gpu.copy_h2d(&repeated_bytes, self.scratch.norm_buf)?;
+            h2d(&repeated_bytes, self.scratch.norm_buf)?;
         }
 
         // ── Step 5: compact all L layers' K → all_k_stage ────────────
@@ -216,7 +270,7 @@ impl BlockDiffusionDraftHead {
                     .fused_kv_out
                     .offset(row * row_stride + l * 2 * kv_slab_bytes);
                 let k_dst = all_k_stage.offset((l * new_ctx_count + row) * kv_slab_bytes);
-                gpu.copy_d2d(k_src, k_dst, kv_slab_bytes)?;
+                d2d(k_src, k_dst, kv_slab_bytes)?;
             }
         }
 
@@ -288,7 +342,7 @@ impl BlockDiffusionDraftHead {
                     .fused_kv_out
                     .offset(row * row_stride + l * 2 * kv_slab_bytes + kv_slab_bytes);
                 let v_dst = v_stage.offset(row * kv_slab_bytes);
-                gpu.copy_d2d(v_src, v_dst, kv_slab_bytes)?;
+                d2d(v_src, v_dst, kv_slab_bytes)?;
             }
 
             if dump && l == 0 {
@@ -389,9 +443,9 @@ impl BlockDiffusionDraftHead {
                 src_base.offset(k * slice_bytes), // src: k-th slice of row 0
                 ctx_slot_bytes,                   // src pitch: full row
                 self.scratch.aux_slice,           // dst: contiguous [n, h_t]
-                slice_bytes,                       // dst pitch: one slice
-                slice_bytes,                       // width bytes
-                n,                                 // rows
+                slice_bytes,                      // dst pitch: one slice
+                slice_bytes,                      // width bytes
+                n,                                // rows
                 stream,
             )?;
 
@@ -412,12 +466,12 @@ impl BlockDiffusionDraftHead {
 
             // Scatter back into the k-th slice of aux_normed [n, L_t*h_t].
             gpu.copy_d2d_2d_async(
-                self.scratch.aux_slice,                     // src: contiguous [n, h_t]
-                slice_bytes,                                 // src pitch: one slice
+                self.scratch.aux_slice,                          // src: contiguous [n, h_t]
+                slice_bytes,                                     // src pitch: one slice
                 self.scratch.aux_normed.offset(k * slice_bytes), // dst: k-th slice of row 0
-                ctx_slot_bytes,                              // dst pitch: full row
-                slice_bytes,                                 // width bytes
-                n,                                           // rows
+                ctx_slot_bytes,                                  // dst pitch: full row
+                slice_bytes,                                     // width bytes
+                n,                                               // rows
                 stream,
             )?;
         }

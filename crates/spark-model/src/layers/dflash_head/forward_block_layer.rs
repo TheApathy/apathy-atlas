@@ -332,7 +332,10 @@ impl BlockDiffusionDraftHead {
             );
             let gamma = self.gamma as u32;
             let norm_gamma = self.scratch.norm_buf.offset(eff_ctx * h as usize * bf16);
-            let attn_gamma = self.scratch.attn_out.offset(eff_ctx * q_dim as usize * bf16);
+            let attn_gamma = self
+                .scratch
+                .attn_out
+                .offset(eff_ctx * q_dim as usize * bf16);
             // gate logits: [γ, num_q_heads] = norm_buf[γ, h] @ g_projᵀ.
             ops::dense_gemm_bf16_pipelined(
                 gpu,

@@ -15,6 +15,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // W3 Lloyd-Max routed experts: no _w3 batch3 kernels are ported (v1
+        // scope). Per-token batched path dispatches the single-token _w3
+        // kernels — same moe_output()[3,H].
+        if self.is_w3() {
+            return self.forward_batched(input, 3, ctx, stream);
+        }
         // BF16 (FP8-dequant-on-load) experts have no fused batch3 kernel.
         // The FP8 batch3 branch below would read expert weights that were
         // FREED at dequant-load → garbage MTP-verify logits → degenerate

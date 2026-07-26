@@ -1370,6 +1370,462 @@ extern "C" __global__ void moe_expert_silu_down_shared_batchN_v2(
     }
 }
 
+// ============================================================================
+// v5 — cp.async bulk-staged gate_up + dedup down (ATLAS_KN_V5, doc: DFlash
+// verify FFN bandwidth). Same launch contract and BIT-IDENTICAL outputs to
+// the v2 gate_up / v4 dedup-down pair: the per-row lane partition (32 lanes,
+// k32 = lane + 32*tile ascending), nibble decode order and FMA order are
+// copied verbatim from v2 — only HOW the weight bytes arrive changes:
+//
+//   1. cp.async bulk staging: each block issues its ENTIRE weight slice
+//      (8 rows x half_K packed + scales) as asynchronous 16B copies up
+//      front (one commit group per 1024-elem K-tile), so the full slice is
+//      in flight while earlier tiles are being decoded/FMA'd. The v2/v4
+//      kernels issue 2 dependent 16B loads per lane and then stall through
+//      a ~400-op decode+FMA chain, which is what pinned them at ~190-234
+//      GB/s of the 273 GB/s LPDDR5x wall.
+//   2. Parallel leader election: v2's v2_gather_slots has thread 0 scan up
+//      to total_routed expert ids SERIALLY from global per block (every
+//      block, including the ~40% duplicate blocks that immediately exit).
+//      v5 caches the ids in smem with one coalesced pass and elects with
+//      all 128 threads. Slot gather order differs (atomic) but each output
+//      row's value is independent of its s_slot position, so outputs are
+//      unchanged bit-for-bit.
+//   3. down v5 covers 16 rows per block (2 pipelined 8-row tiles) instead
+//      of 8: grid.x = ceil(N/16), halving block/election count and
+//      overlapping tile-1 arrival with tile-0 compute (K=inter=1024 gives
+//      each lane exactly ONE k32 group per row — v4 had zero load overlap).
+//
+// Shape limits (Rust dispatch falls back to v2/v4 outside these):
+//   gate_up_v5: K % 1024 == 0 && K <= 3072;  down_v5: K == 1024;
+//   both: num_tokens * top_k <= V5_MAX_SLOTS, num_tokens <= V2_MAX_M.
+// ============================================================================
+
+// cp.async helpers (SM80+) — copied byte-for-byte from
+// kernels/gb10/common/fp8_gemm_t_blockscaled.cu:41-52 (proven on this box).
+__device__ __forceinline__ void v5_cp_async_16(void* dst_smem, const void* src_gmem, bool pred) {
+    unsigned int dst = __cvta_generic_to_shared(dst_smem);
+    unsigned int src_bytes = pred ? 16 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;"
+                 :: "r"(dst), "l"(src_gmem), "r"(src_bytes));
+}
+__device__ __forceinline__ void v5_cp_async_commit() {
+    asm volatile("cp.async.commit_group;");
+}
+
+#define V5_MAX_SLOTS 128           // election smem cache (Laguna: 8*10 = 80)
+#define V5_TILE 1024               // K elems per stage tile
+#define V5_TILE_PK (V5_TILE / 2)   // 512 packed bytes per row per tile
+#define V5_TILE_SC (V5_TILE / GROUP_SIZE) // 64 scale bytes per row per tile
+#define V5_GU_TILES 3              // gate_up KMAX = 3072
+
+// Parallel leader election + slot gather. Same leader rule as
+// v2_gather_slots (block y leads iff no earlier slot routes to its expert;
+// shared leader is row total_routed) but O(total_routed/128) instead of a
+// serial thread-0 scan. s_slot order is atomic-nondeterministic — harmless,
+// each covered row's accumulation is independent of its m position.
+__device__ __forceinline__ bool v5_gather_slots(
+    const unsigned int* __restrict__ expert_indices,
+    unsigned int y, unsigned int total_routed, unsigned int num_tokens,
+    bool is_shared,
+    unsigned int* s_slot, unsigned int* s_m /* smem, len 1 */
+) {
+    if (is_shared) {
+        if (y != total_routed) return false;
+        if (threadIdx.x == 0) {
+            *s_m = num_tokens;
+            for (unsigned int t = 0; t < num_tokens; t++) s_slot[t] = t;
+        }
+        __syncthreads();
+        return true;
+    }
+    __shared__ unsigned int s_idx[V5_MAX_SLOTS];
+    __shared__ int s_dup;
+    __shared__ unsigned int s_cnt;
+    for (unsigned int s = threadIdx.x; s < total_routed; s += V2_BLOCK)
+        s_idx[s] = expert_indices[s];
+    if (threadIdx.x == 0) { s_dup = 0; s_cnt = 0; }
+    __syncthreads();
+    const unsigned int my_id = s_idx[y];
+    for (unsigned int s = threadIdx.x; s < y; s += V2_BLOCK)
+        if (s_idx[s] == my_id) s_dup = 1;   // benign race: all writers store 1
+    __syncthreads();
+    if (s_dup) return false;
+    for (unsigned int s = y + threadIdx.x; s < total_routed; s += V2_BLOCK) {
+        if (s_idx[s] == my_id) {
+            unsigned int m = atomicAdd(&s_cnt, 1u);
+            if (m < V2_MAX_M) s_slot[m] = s;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) *s_m = (s_cnt < V2_MAX_M) ? s_cnt : V2_MAX_M;
+    __syncthreads();
+    return true;
+}
+
+// gate_up v5 — identical launch contract to batchN/v2: grid (ceil(N/8),
+// num_tokens*(top_k+1), 2), block 128, no dynamic smem. One projection per
+// z block; the block's whole 8-row weight slice (packed + scales, all
+// K-tiles) is cp.async-staged up front in 3 commit groups and the compute
+// waits tile-by-tile (wait_group 2/1/0). Bit-identical outputs to v2.
+// (A merged-projection + fused-silu variant was A/B'd and lost: 128 regs +
+// 19KB smem dropped it to ~4 blocks/SM vs this kernel's 64 regs / 14.5KB.)
+extern "C" __global__ void moe_expert_gate_up_shared_batchN_v5(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_gate_packed,
+    const unsigned char* __restrict__ sh_gate_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    const unsigned char* __restrict__ sh_up_packed,
+    const unsigned char* __restrict__ sh_up_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int num_tokens
+) {
+    const unsigned int total_routed = num_tokens * top_k;
+    const unsigned int y = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const bool is_shared = (y >= total_routed);
+
+    __shared__ unsigned int s_slot[V2_MAX_M];
+    __shared__ unsigned int s_m;
+    if (!v5_gather_slots(expert_indices, y, total_routed, num_tokens,
+                         is_shared, s_slot, &s_m)) return;
+    const unsigned int M = s_m;
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    __nv_bfloat16* C_base;
+
+    if (is_shared) {
+        if (proj == 0) { B_packed = sh_gate_packed; B_scale = sh_gate_scale;
+                         s2 = sh_gate_s2; C_base = sh_gate_out; }
+        else           { B_packed = sh_up_packed; B_scale = sh_up_scale;
+                         s2 = sh_up_s2; C_base = sh_up_out; }
+    } else {
+        const unsigned int expert_id = expert_indices[y];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_ptrs[expert_id];
+            B_scale = (const unsigned char*)gate_scale_ptrs[expert_id];
+            s2 = gate_scale2_vals[expert_id];
+            C_base = gate_out;
+        } else {
+            B_packed = (const unsigned char*)up_packed_ptrs[expert_id];
+            B_scale = (const unsigned char*)up_scale_ptrs[expert_id];
+            s2 = up_scale2_vals[expert_id];
+            C_base = up_out;
+        }
+    }
+
+    if (B_packed == 0) {
+        const unsigned int n_base = blockIdx.x * (N_PER_BLOCK * 2);
+        for (unsigned int m = 0; m < M; m++) {
+            __nv_bfloat16* z = C_base + (unsigned long long)s_slot[m] * N;
+            for (unsigned int i = threadIdx.x; i < N_PER_BLOCK * 2 && n_base + i < N;
+                 i += V2_BLOCK) {
+                z[n_base + i] = __float2bfloat16(0.0f);
+            }
+        }
+        return;
+    }
+
+    const unsigned int local_out = threadIdx.x / V2_TPO;
+    const unsigned int lane = threadIdx.x % V2_TPO;
+    const unsigned int row_base = blockIdx.x * (N_PER_BLOCK * 2);
+    const unsigned int n1 = row_base + local_out * 2;
+    const unsigned int n2 = n1 + 1;
+    const bool have_n1 = (n1 < N);
+    const bool have_n2 = (n2 < N);
+    const unsigned int r1 = local_out * 2, r2 = r1 + 1;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int num_tiles = K / V5_TILE;   // 1..3 (dispatch-guarded)
+
+    __shared__ float s_lut[16];
+    __shared__ __align__(16) unsigned char s_wq[V5_GU_TILES][8][V5_TILE_PK]; // 12KB
+    __shared__ __align__(16) unsigned char s_sc[V5_GU_TILES][8][V5_TILE_SC]; // 1.5KB
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_BATCH2[threadIdx.x];
+
+    #pragma unroll
+    for (unsigned int t = 0; t < V5_GU_TILES; t++) {
+        if (t < num_tiles) {
+            for (unsigned int i = threadIdx.x; i < 8 * (V5_TILE_PK / 16); i += V2_BLOCK) {
+                const unsigned int r = i / (V5_TILE_PK / 16);
+                const unsigned int c = i % (V5_TILE_PK / 16);
+                const unsigned int n = row_base + r;
+                v5_cp_async_16(&s_wq[t][r][c * 16],
+                    B_packed + (unsigned long long)n * half_K + t * V5_TILE_PK + c * 16,
+                    n < N);
+            }
+            for (unsigned int i = threadIdx.x; i < 8 * (V5_TILE_SC / 16); i += V2_BLOCK) {
+                const unsigned int r = i / (V5_TILE_SC / 16);
+                const unsigned int c = i % (V5_TILE_SC / 16);
+                const unsigned int n = row_base + r;
+                v5_cp_async_16(&s_sc[t][r][c * 16],
+                    B_scale + (unsigned long long)n * num_groups + t * V5_TILE_SC + c * 16,
+                    n < N);
+            }
+        }
+        v5_cp_async_commit();
+    }
+
+    float acc1[V2_MAX_M], acc2[V2_MAX_M];
+    #pragma unroll
+    for (int m = 0; m < V2_MAX_M; m++) { acc1[m] = 0.0f; acc2[m] = 0.0f; }
+
+    #pragma unroll
+    for (unsigned int t = 0; t < V5_GU_TILES; t++) {
+        if (t == 0)      asm volatile("cp.async.wait_group 2;");
+        else if (t == 1) asm volatile("cp.async.wait_group 1;");
+        else             asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+        if (t >= num_tiles) break;
+        if (have_n1) {
+            const unsigned int k32 = t * (V5_TILE / 32) + lane;  // == v2's k32 walk
+            const uint4 w1 = *(const uint4*)&s_wq[t][r1][lane * 16];
+            const uint4 w2 = have_n2 ? *(const uint4*)&s_wq[t][r2][lane * 16]
+                                     : make_uint4(0u, 0u, 0u, 0u);
+            const unsigned int words1[4] = {w1.x, w1.y, w1.z, w1.w};
+            const unsigned int words2[4] = {w2.x, w2.y, w2.z, w2.w};
+            const float sc1a = atlas_dec_e4m3(s_sc[t][r1][lane * 2]) * s2;
+            const float sc1b = atlas_dec_e4m3(s_sc[t][r1][lane * 2 + 1]) * s2;
+            const float sc2a = have_n2 ? atlas_dec_e4m3(s_sc[t][r2][lane * 2]) * s2 : 0.0f;
+            const float sc2b = have_n2 ? atlas_dec_e4m3(s_sc[t][r2][lane * 2 + 1]) * s2 : 0.0f;
+
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {  // identical decode+FMA order to v2
+                const float scA = (g < 2) ? sc1a : sc1b;
+                const float scB = (g < 2) ? sc2a : sc2b;
+                float f1[8], f2[8];
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const unsigned char bv1 = (words1[g] >> (b * 8)) & 0xFF;
+                    f1[b * 2] = s_lut[bv1 & 0xF] * scA;
+                    f1[b * 2 + 1] = s_lut[bv1 >> 4] * scA;
+                    const unsigned char bv2 = (words2[g] >> (b * 8)) & 0xFF;
+                    f2[b * 2] = s_lut[bv2 & 0xF] * scB;
+                    f2[b * 2 + 1] = s_lut[bv2 >> 4] * scB;
+                }
+                const unsigned int elem = k32 * 32 + g * 8;
+                #pragma unroll
+                for (int m = 0; m < V2_MAX_M; m++) {
+                    if (m >= (int)M) break;
+                    const unsigned int token = is_shared ? s_slot[m] : s_slot[m] / top_k;
+                    const uint4 a = *(const uint4*)(A + (unsigned long long)token * K + elem);
+                    const unsigned int a_raw[4] = {a.x, a.y, a.z, a.w};
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++) {
+                        __nv_bfloat16 al, ah;
+                        *(unsigned short*)&al = (unsigned short)(a_raw[b] & 0xFFFF);
+                        *(unsigned short*)&ah = (unsigned short)(a_raw[b] >> 16);
+                        acc1[m] += __bfloat162float(al) * f1[b * 2] + __bfloat162float(ah) * f1[b * 2 + 1];
+                        acc2[m] += __bfloat162float(al) * f2[b * 2] + __bfloat162float(ah) * f2[b * 2 + 1];
+                    }
+                }
+            }
+        }
+    }
+    if (!have_n1) return;
+
+    #pragma unroll
+    for (int m = 0; m < V2_MAX_M; m++) {
+        if (m >= (int)M) break;
+        float a1 = acc1[m], a2 = acc2[m];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            a1 += __shfl_down_sync(0xFFFFFFFF, a1, offset);
+            a2 += __shfl_down_sync(0xFFFFFFFF, a2, offset);
+        }
+        if (lane == 0) {
+            __nv_bfloat16* out = C_base + (unsigned long long)s_slot[m] * N;
+            out[n1] = __float2bfloat16(a1);
+            if (have_n2) out[n2] = __float2bfloat16(a2);
+        }
+    }
+}
+
+// Dedup down v5 — 16 rows per block (2 pipelined 8-row cp.async tiles;
+// K=inter=1024 gives each lane exactly ONE k32 group per row, so v4 had
+// zero load overlap — staging + 2 row-tiles restores it; 32-row/4-tile was
+// A/B'd and measured no better). Grid.x = ceil(N/16)
+// (NOT ceil(N/8) — the Rust launcher differs from v4), grid.y =
+// num_tokens*(top_k+1), block 128. Requires K == 1024 (Laguna inter).
+// Bit-identical outputs to moe_expert_down_dedup_batchN.
+#define V5_DN_ROW_TILES 2
+extern "C" __global__ void moe_expert_down_dedup_batchN_v5(
+    const __nv_bfloat16* __restrict__ act,        // [total_routed, K]
+    const __nv_bfloat16* __restrict__ sh_act,     // [num_tokens, K]
+    const unsigned long long* __restrict__ packed_ptrs,
+    const unsigned long long* __restrict__ scale_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,                // routed down_out [total_routed, N]
+    const unsigned int* __restrict__ expert_indices,
+    const unsigned char* __restrict__ sh_down_packed,
+    const unsigned char* __restrict__ sh_down_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,      // [num_tokens, N]
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int num_tokens
+) {
+    const unsigned int total_routed = num_tokens * top_k;
+    const unsigned int y = blockIdx.y;
+    const bool is_shared = (y >= total_routed);
+
+    __shared__ unsigned int s_slot[V2_MAX_M];
+    __shared__ unsigned int s_m;
+    if (!v5_gather_slots(expert_indices, y, total_routed, num_tokens,
+                         is_shared, s_slot, &s_m)) return;
+    const unsigned int M = s_m;
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    __nv_bfloat16* C_base;
+    const __nv_bfloat16* act_base;
+
+    if (is_shared) {
+        B_packed = sh_down_packed; B_scale = sh_down_scale; s2 = sh_down_s2;
+        C_base = sh_down_out; act_base = sh_act;
+    } else {
+        const unsigned int expert_id = expert_indices[y];
+        B_packed = (const unsigned char*)packed_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_ptrs[expert_id];
+        s2 = scale2_vals[expert_id];
+        C_base = C; act_base = act;
+    }
+
+    const unsigned int row_base = blockIdx.x * (N_PER_BLOCK * 2 * V5_DN_ROW_TILES);
+    if (B_packed == 0) {
+        for (unsigned int m = 0; m < M; m++) {
+            __nv_bfloat16* z = C_base + (unsigned long long)s_slot[m] * N;
+            for (unsigned int i = threadIdx.x;
+                 i < N_PER_BLOCK * 2 * V5_DN_ROW_TILES && row_base + i < N;
+                 i += V2_BLOCK) z[row_base + i] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
+
+    const unsigned int local_out = threadIdx.x / V2_TPO;
+    const unsigned int lane = threadIdx.x % V2_TPO;
+
+    const unsigned int half_K = K / 2;        // 512 (K == 1024 guarded)
+    const unsigned int num_groups = K / GROUP_SIZE;  // 64
+    const unsigned int K32 = K / 32;          // 32 == V2_TPO
+
+    __shared__ float s_lut[16];
+    __shared__ __align__(16) unsigned char s_wq[V5_DN_ROW_TILES][8][V5_TILE_PK]; // 8KB
+    __shared__ __align__(16) unsigned char s_sc[V5_DN_ROW_TILES][8][V5_TILE_SC]; // 1KB
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_BATCH2[threadIdx.x];
+
+    #pragma unroll
+    for (unsigned int p = 0; p < V5_DN_ROW_TILES; p++) {
+        for (unsigned int i = threadIdx.x; i < 8 * (V5_TILE_PK / 16); i += V2_BLOCK) {
+            const unsigned int r = i / (V5_TILE_PK / 16);
+            const unsigned int c = i % (V5_TILE_PK / 16);
+            const unsigned int n = row_base + p * 8 + r;
+            v5_cp_async_16(&s_wq[p][r][c * 16],
+                B_packed + (unsigned long long)n * half_K + c * 16, n < N);
+        }
+        for (unsigned int i = threadIdx.x; i < 8 * (V5_TILE_SC / 16); i += V2_BLOCK) {
+            const unsigned int r = i / (V5_TILE_SC / 16);
+            const unsigned int c = i % (V5_TILE_SC / 16);
+            const unsigned int n = row_base + p * 8 + r;
+            v5_cp_async_16(&s_sc[p][r][c * 16],
+                B_scale + (unsigned long long)n * num_groups + c * 16, n < N);
+        }
+        v5_cp_async_commit();
+    }
+
+    #pragma unroll
+    for (unsigned int p = 0; p < V5_DN_ROW_TILES; p++) {
+        if (p == 0)      asm volatile("cp.async.wait_group 1;");
+        else             asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+
+        const unsigned int n1 = row_base + p * 8 + local_out * 2;
+        const unsigned int n2 = n1 + 1;
+        const bool have_n1 = (n1 < N);
+        const bool have_n2 = (n2 < N);
+        const unsigned int r1 = local_out * 2, r2 = r1 + 1;
+        if (!have_n1) continue;
+
+        float acc1[V2_MAX_M], acc2[V2_MAX_M];
+        #pragma unroll
+        for (int m = 0; m < V2_MAX_M; m++) { acc1[m] = 0.0f; acc2[m] = 0.0f; }
+
+        for (unsigned int k32 = lane; k32 < K32; k32 += V2_TPO) {
+            const uint4 w1 = *(const uint4*)&s_wq[p][r1][k32 * 16];
+            const uint4 w2 = have_n2 ? *(const uint4*)&s_wq[p][r2][k32 * 16]
+                                     : make_uint4(0u, 0u, 0u, 0u);
+            const unsigned int words1[4] = {w1.x, w1.y, w1.z, w1.w};
+            const unsigned int words2[4] = {w2.x, w2.y, w2.z, w2.w};
+            const unsigned int sg = k32 * 2;
+            const float sc1a = atlas_dec_e4m3(s_sc[p][r1][sg]) * s2;
+            const float sc1b = atlas_dec_e4m3(s_sc[p][r1][sg + 1]) * s2;
+            const float sc2a = have_n2 ? atlas_dec_e4m3(s_sc[p][r2][sg]) * s2 : 0.0f;
+            const float sc2b = have_n2 ? atlas_dec_e4m3(s_sc[p][r2][sg + 1]) * s2 : 0.0f;
+
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {  // identical order to dedup_batchN
+                const float scA = (g < 2) ? sc1a : sc1b;
+                const float scB = (g < 2) ? sc2a : sc2b;
+                float f1[8], f2[8];
+                #pragma unroll
+                for (int b = 0; b < 4; b++) {
+                    const unsigned char bv1 = (words1[g] >> (b * 8)) & 0xFF;
+                    f1[b * 2] = s_lut[bv1 & 0xF] * scA;
+                    f1[b * 2 + 1] = s_lut[bv1 >> 4] * scA;
+                    const unsigned char bv2 = (words2[g] >> (b * 8)) & 0xFF;
+                    f2[b * 2] = s_lut[bv2 & 0xF] * scB;
+                    f2[b * 2 + 1] = s_lut[bv2 >> 4] * scB;
+                }
+                const unsigned int elem = k32 * 32 + g * 8;
+                #pragma unroll
+                for (int m = 0; m < V2_MAX_M; m++) {
+                    if (m >= (int)M) break;
+                    const unsigned int arow = s_slot[m];
+                    const uint4 a = *(const uint4*)(act_base + (unsigned long long)arow * K + elem);
+                    const unsigned int a_raw[4] = {a.x, a.y, a.z, a.w};
+                    #pragma unroll
+                    for (int b = 0; b < 4; b++) {
+                        __nv_bfloat16 al, ah;
+                        *(unsigned short*)&al = (unsigned short)(a_raw[b] & 0xFFFF);
+                        *(unsigned short*)&ah = (unsigned short)(a_raw[b] >> 16);
+                        acc1[m] += __bfloat162float(al) * f1[b * 2] + __bfloat162float(ah) * f1[b * 2 + 1];
+                        acc2[m] += __bfloat162float(al) * f2[b * 2] + __bfloat162float(ah) * f2[b * 2 + 1];
+                    }
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int m = 0; m < V2_MAX_M; m++) {
+            if (m >= (int)M) break;
+            float a1 = acc1[m], a2 = acc2[m];
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                a1 += __shfl_down_sync(0xFFFFFFFF, a1, offset);
+                a2 += __shfl_down_sync(0xFFFFFFFF, a2, offset);
+            }
+            if (lane == 0) {
+                __nv_bfloat16* out = C_base + (unsigned long long)s_slot[m] * N;
+                out[n1] = __float2bfloat16(a1);
+                if (have_n2) out[n2] = __float2bfloat16(a2);
+            }
+        }
+    }
+}
+
 // ── Weighted sum + sigmoid blend — K=2 batch variant ──
 //
 // Combines routed expert outputs with shared expert via sigmoid gate.

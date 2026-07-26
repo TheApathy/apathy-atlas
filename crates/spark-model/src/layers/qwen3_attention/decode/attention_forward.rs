@@ -186,7 +186,34 @@ impl Qwen3AttentionLayer {
             }
         } else {
             // Ungated: Q projection only (no gate)
-            if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
+            if let Some(mirror) = self.q_fp8_mirror.as_ref()
+                && self.dense_gemv_fp8w_k.0 != 0
+            {
+                // FP8 MIRROR (ATLAS_TARGET_ATTN_FP8_MIRROR): halves Q
+                // weight-read bandwidth vs the BF16 dense_gemv below.
+                if ops::serial_mirror_gemm_enabled()
+                    && self.fp8_gemm_row_scaled_mtile8_k.0 != 0
+                    && h.is_multiple_of(32)
+                {
+                    // ATLAS_SERIAL_MIRROR_GEMM=1: M=1 through the proven M≤8
+                    // verify GEMM (mtile8/_n32 by shape). NOTE: the cold M=1
+                    // microbench (fp8gemv_m1_serial_microtest) shows the GEMV
+                    // below is FASTER at this shape (255 vs 204 GB/s at
+                    // N=9216 K=3072) — gate kept for serve-side A/B only.
+                    self.fp8_mirror_gemm(ctx.gpu, normed, mirror, q_out, 1, q_dim, h, stream)?;
+                } else {
+                    ops::dense_gemv_fp8w(
+                        ctx.gpu,
+                        self.dense_gemv_fp8w_k,
+                        normed,
+                        mirror,
+                        q_out,
+                        q_dim,
+                        h,
+                        stream,
+                    )?;
+                }
+            } else if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(
                     ctx.gpu,
                     self.w8a16_gemv_k,
@@ -339,6 +366,21 @@ impl Qwen3AttentionLayer {
             }
         }
 
+        // ── ATLAS_FUSED_ELEMWISE=1 serial (M=1) fused epilogue ──
+        // Collapses the 4-launch chain below (q per-head rms_norm → k
+        // per-head rms_norm → rope_yarn_scaled → reshape_and_cache_flash)
+        // into ONE launch of the same kernel the multi-seq flat verify
+        // uses, at n=1. Bit-identical (see decode/fused_epilogue.rs and
+        // kernels/gb10/common/fused_verify_elemwise.cu). Q is normed+roped
+        // in place at q_out (the paged-decode input); K/V go straight into
+        // the BF16 paged cache — k_out/v_out have no readers after this.
+        let fused_serial_epilogue = self.serial_fused_epilogue_eligible(ctx, hd);
+        if fused_serial_epilogue {
+            self.serial_fused_qk_epilogue(
+                q_out, k_out, v_out, kv_cache, meta, nq, nkv, hd, bs as u32, eps, ctx, stream,
+            )?;
+        }
+
         // Q/K RMS norms — three mutually-exclusive paths:
         //  1. MiniMax M2 style: RMSNorm over full projected hidden
         //     `[nq*hd]` per token, single learned weight of that shape.
@@ -350,7 +392,9 @@ impl Qwen3AttentionLayer {
         // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
         // This codepath never runs for Mistral/DeepSeek-style MLA
         // models — they early-return in the MLA branch above.
-        if let Some(ref q_norm_full) = self.attn.q_norm_full {
+        if fused_serial_epilogue {
+            // Norms + RoPE + cache write already done by the fused launch.
+        } else if let Some(ref q_norm_full) = self.attn.q_norm_full {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -375,7 +419,9 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
-        if let Some(ref k_norm_full) = self.attn.k_norm_full {
+        if fused_serial_epilogue {
+            // K norm folded into the fused epilogue launch above.
+        } else if let Some(ref k_norm_full) = self.attn.k_norm_full {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -424,7 +470,9 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        if self.mla.is_some() {
+        if fused_serial_epilogue {
+            // RoPE folded into the fused epilogue launch above.
+        } else if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block (to rope portions only).
             // Skip the shared RoPE to avoid double-rotation.
         } else if !self.yarn_inv_freq.is_null() {
@@ -505,22 +553,24 @@ impl Qwen3AttentionLayer {
         }
 
         // K/V are contiguous (separate dense_gemm outputs), stride = nkv * hd
-        let kv_stride = nkv * hd;
-        self.write_kv_cache(
-            ctx.gpu,
-            k_out,
-            v_out,
-            kv_cache,
-            meta.slot,
-            1,
-            nkv,
-            hd,
-            bs as u32,
-            kv_stride,
-            kv_stride,
-            stream,
-            ctx.graph_capture,
-        )?;
+        if !fused_serial_epilogue {
+            let kv_stride = nkv * hd;
+            self.write_kv_cache(
+                ctx.gpu,
+                k_out,
+                v_out,
+                kv_cache,
+                meta.slot,
+                1,
+                nkv,
+                hd,
+                bs as u32,
+                kv_stride,
+                kv_stride,
+                stream,
+                ctx.graph_capture,
+            )?;
+        }
 
         // Turbo KV cache: apply WHT to Q before paged decode.
         // KV cache stores WHT(K) and WHT(V). By Parseval's theorem,

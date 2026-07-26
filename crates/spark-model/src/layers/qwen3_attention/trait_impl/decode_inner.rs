@@ -339,7 +339,17 @@ impl Qwen3AttentionLayer {
                     &format!("L{:02} normed2", self.attn_layer_idx),
                 );
             }
-            let dense_out = self.ffn.forward(normed2, ctx, stream)?;
+            // ATLAS_FUSED_ELEMWISE=1 (serial M=1): fold the FFN residual add
+            // into the MoE blend launch (bit-identical; forward_kn_residual
+            // precedent). Not offered when a Gemma-4 post-FFN norm must run
+            // between the FFN output and the residual add. `forward_residual`
+            // returns false when it couldn't fuse (dense FFN / EP / missing
+            // kernel) — then the separate residual_add runs exactly as before.
+            let residual_arg = (ops::fused_elemwise_enabled() && self.post_ffn_out_norm.is_none())
+                .then_some(hidden);
+            let (dense_out, residual_fused) =
+                self.ffn
+                    .forward_residual(normed2, residual_arg, ctx, stream)?;
             if gemma4_diag {
                 diag_norm(
                     ctx.gpu,
@@ -371,14 +381,16 @@ impl Qwen3AttentionLayer {
                     );
                 }
             }
-            ops::residual_add(
-                ctx.gpu,
-                self.residual_add_k,
-                hidden,
-                dense_out,
-                h as u32,
-                stream,
-            )?;
+            if !residual_fused {
+                ops::residual_add(
+                    ctx.gpu,
+                    self.residual_add_k,
+                    hidden,
+                    dense_out,
+                    h as u32,
+                    stream,
+                )?;
+            }
         }
 
         if gemma4_diag {

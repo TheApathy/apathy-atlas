@@ -18,6 +18,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // W3 Lloyd-Max routed experts: no _w3 batch2 kernels are ported (v1
+        // scope = decode + wide-verify + prefill). The per-token batched path
+        // dispatches the single-token _w3 kernels — same moe_output()[2,H].
+        if self.is_w3() {
+            return self.forward_batched(input, 2, ctx, stream);
+        }
         // BF16 (FP8-dequant-on-load) experts. The FP8/NVFP4 batch2 branches
         // below read expert weights that were FREED at dequant-load, so they
         // must NOT run for a dequanted model. When the fused BF16 batch2

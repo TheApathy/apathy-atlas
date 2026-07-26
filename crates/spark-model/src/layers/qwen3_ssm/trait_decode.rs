@@ -134,19 +134,28 @@ impl Qwen3SsmLayer {
             Self::debug_bf16(ctx.gpu, "moe-input-normed", normed2, 4);
         }
 
-        let moe_out = self.ffn.forward(normed2, ctx, stream)?;
+        // ATLAS_FUSED_ELEMWISE=1 (serial M=1): fold `hidden += moe_out` into
+        // the MoE blend launch (bit-identical; forward_kn_residual precedent).
+        // `forward_residual` returns false when it couldn't fuse (EP /
+        // missing kernel) — then the separate residual_add runs as before.
+        let residual_arg = ops::fused_elemwise_enabled().then_some(hidden);
+        let (moe_out, residual_fused) =
+            self.ffn
+                .forward_residual(normed2, residual_arg, ctx, stream)?;
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "moe-output", moe_out, 8);
         }
-        ops::residual_add(
-            ctx.gpu,
-            self.residual_add_k,
-            hidden,
-            moe_out,
-            h as u32,
-            stream,
-        )?;
+        if !residual_fused {
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                moe_out,
+                h as u32,
+                stream,
+            )?;
+        }
         if debug {
             ctx.gpu.synchronize(stream)?;
             Self::debug_bf16(ctx.gpu, "final-hidden", hidden, 4);

@@ -213,6 +213,7 @@ pub fn start_chunked_prefill(
             logit_bias: logit_bias.clone(),
             pending_drafts: Vec::new(),
             pending_block_fork: None,
+            pending_tree_payload: None,
             inside_thinking: req_enable_thinking && think_end_token.is_some(),
             enable_thinking: req_enable_thinking,
             thinking_budget: req_thinking_budget,
@@ -541,6 +542,7 @@ pub fn start_chunked_prefill(
                 logit_bias: logit_bias.clone(),
                 pending_drafts: Vec::new(),
                 pending_block_fork: None,
+                pending_tree_payload: None,
                 inside_thinking: req_enable_thinking && think_end_token.is_some(),
                 enable_thinking: req_enable_thinking,
                 thinking_budget: req_thinking_budget,
@@ -627,6 +629,7 @@ pub fn start_chunked_prefill(
                 logit_bias: logit_bias.clone(),
                 pending_drafts: Vec::new(),
                 pending_block_fork: None,
+                pending_tree_payload: None,
                 inside_thinking: spontaneous_think
                     || (req_enable_thinking && think_end_token.is_some()),
                 enable_thinking: req_enable_thinking,

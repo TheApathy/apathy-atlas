@@ -363,6 +363,51 @@ impl MoeLayer {
                     top_k,
                     stream,
                 )?;
+            } else if self.is_w3() {
+                // W3 Lloyd-Max routed experts (3-bit; shared slot stays NVFP4).
+                ops::moe_expert_gate_up_shared_w3(
+                    ctx.gpu,
+                    self.moe_expert_gate_up_shared_w3_k,
+                    input_t,
+                    self.gate_ptrs.packed_ptrs,
+                    self.gate_ptrs.scale_ptrs,
+                    self.gate_ptrs.scale2_vals,
+                    expert_gate_out,
+                    self.up_ptrs.packed_ptrs,
+                    self.up_ptrs.scale_ptrs,
+                    self.up_ptrs.scale2_vals,
+                    expert_up_out,
+                    indices_dev,
+                    &self.weights.shared_expert.gate_proj,
+                    shared_gate_scratch,
+                    &self.weights.shared_expert.up_proj,
+                    shared_up_scratch,
+                    inter,
+                    h,
+                    top_k,
+                    self.w3_lut_dev,
+                    stream,
+                )?;
+                ops::moe_expert_silu_down_shared_w3(
+                    ctx.gpu,
+                    self.moe_expert_silu_down_shared_w3_k,
+                    expert_gate_out,
+                    expert_up_out,
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    &self.weights.shared_expert.down_proj,
+                    shared_out,
+                    h,
+                    inter,
+                    top_k,
+                    self.w3_lut_dev,
+                    stream,
+                )?;
             } else {
                 // NVFP4 path
                 ops::moe_expert_gate_up_shared(

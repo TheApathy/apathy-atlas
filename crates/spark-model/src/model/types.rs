@@ -32,6 +32,11 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, MtpWeights, QuantizedWeight
 /// 512 covers the gate's 256-token serial re-probe interval with 2x margin.
 pub(super) const MTP_CATCHUP_RING_ROWS: usize = 512;
 
+/// DDTree M5: max distinct tree SHAPES cached per `(slot, K_t)` graph key.
+/// Beyond this, unseen shapes run the eager tree path (graphs are never
+/// destroyed, so a hard cap beats LRU eviction here).
+pub(super) const TREE_GRAPH_SHAPES_PER_KEY: usize = 2;
+
 pub struct TransformerModel {
     pub(super) config: ModelConfig,
     pub(super) embed_tokens: DenseWeight,
@@ -85,6 +90,15 @@ pub struct TransformerModel {
     /// verify tokens. Bit-identical to two `dense_gemv_fp8w` calls; halves the
     /// FP8 weight bandwidth for the lm_head on the MTP verify path.
     pub(super) dense_gemv_fp8w_batch2_kernel: KernelHandle,
+    /// Batched row-scaled FP8 GEMM tiers for the verify lm_head when the
+    /// FP8 mirror is active (ATLAS_TARGET_LMHEAD_FP8=1 / --lm-head-dtype
+    /// fp8) and num_tokens >= 3: the M ≤ 8 weight-read-bound mtile8 kernel
+    /// (one 308MB mirror read for all K=7-8 verify rows), the single-warp
+    /// M ≤ 16 tile, and the M64 tile fallback. 0-handles on targets that
+    /// lack the w4a16 Phase-G kernels (dispatch falls back to the GEMV loop).
+    pub(super) fp8_gemm_row_scaled_mtile8_kernel: KernelHandle,
+    pub(super) fp8_gemm_row_scaled_m16_kernel: KernelHandle,
+    pub(super) fp8_gemm_row_scaled_kernel: KernelHandle,
     pub(super) dense_gemm_kernel: KernelHandle,
     pub(super) argmax_kernel: KernelHandle,
     pub(super) argmax_logits_kernel: KernelHandle, // FP32 argmax for logits
@@ -189,6 +203,28 @@ pub struct TransformerModel {
     /// `(seq.slot_idx, K)`. K is `tokens.len()` (γ+1 typically). One graph
     /// per (slot, K) — different γ values coexist via the K dimension.
     pub(super) verify_kgamma_graph: Mutex<std::collections::HashMap<(usize, usize), GraphHandle>>,
+    /// DDTree M5 (ATLAS_DFLASH_TREE_GRAPH=1): cached CUDA graphs for the
+    /// TREE-shaped K=γ verify, keyed by `(seq.slot_idx, K_t)` with an inner
+    /// shape dimension: each entry holds up to
+    /// [`TREE_GRAPH_SHAPES_PER_KEY`] `(shape_id, graph)` pairs (shape_id =
+    /// `ddtree::tree_shape_id`, encoding spine_len + branch row layout).
+    /// A step whose shape misses a FULL entry runs the eager tree path —
+    /// no eviction (graphs are never destroyed), no unbounded growth.
+    /// Separate from `verify_kgamma_graph` so the flat path stays
+    /// byte-identical.
+    pub(super) verify_tree_graph:
+        Mutex<std::collections::HashMap<(usize, usize), Vec<(u64, GraphHandle)>>>,
+    /// DDTree M5: fixed device buffer for the indirect re-seed copy args
+    /// (`[n_pairs, src0, dst0, ...]` u32 words, capacity
+    /// `1 + 2×TREE_RESEED_MAX_PAIRS`). Uploaded pre-replay each graphed
+    /// tree step; its ADDRESS is baked into every tree graph. Shared
+    /// across slots — verify steps are serialized on the model like the
+    /// flat path's `meta_base` scratch.
+    pub(super) tree_reseed_buf: DevicePtr,
+    /// DDTree M5: `kv_block_indirect_copy` kernel (graph-capturable
+    /// canonical→scratch block re-seed). `KernelHandle(0)` on kernel sets
+    /// that don't ship it — the graphed tree path then never engages.
+    pub(super) kv_block_copy_kernel: KernelHandle,
     /// Cached CUDA graphs for the DFlash decode+verify fused pass, keyed by
     /// `(seq.slot_idx, M)` where M = tokens.len() = 1 + num_drafts.
     /// Replaces the separate `decode_graph` (M=1) + `verify{k}_graph` (M=k)

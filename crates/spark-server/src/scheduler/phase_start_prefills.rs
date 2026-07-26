@@ -30,14 +30,26 @@ pub(super) fn start_new_requests(
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
 ) {
+    // Fast path: nothing to admit. Every section below is a no-op on an
+    // empty request batch, but walking the full function measured a
+    // consistent ~4ms/iteration on the decode hot loop (LOOP_TRACE snr
+    // bucket, 2026-07-25) — cause unidentified (not the env reads; cached
+    // ones changed nothing). The early return sidesteps it for the
+    // single-stream decode steady state where new_reqs is empty.
+    if new_reqs.is_empty() {
+        return;
+    }
     // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when >=2 non-vision requests are
     // co-admitted this tick with no active decode to starve, DEFER their chunk-0
     // prefill so they batch into one forward via run_batched_prefill_step (which
     // sees prefilling.len() >= 2 → can_batch_prefill_only). Vision excluded: a
     // shared prepare_vision_embed buffer would cross-contaminate stacked streams.
-    let want_codispatch = std::env::var("ATLAS_PREFILL_CODISPATCH")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    static CODISPATCH_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let want_codispatch = *CODISPATCH_ENV.get_or_init(|| {
+        std::env::var("ATLAS_PREFILL_CODISPATCH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
         && chunked
         && new_reqs.len() >= 2
         && active.is_empty()
@@ -66,9 +78,12 @@ pub(super) fn start_new_requests(
     // only ~6% of the ViT) and adds gather/fence overhead. Kept as opt-in
     // infrastructure — it correctly slices vision per-request, which is the
     // prerequisite for admitting image requests into LLM-prefill co-dispatch.
-    let vision_codispatch = std::env::var("ATLAS_VISION_CODISPATCH")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    static VISION_CODISPATCH_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let vision_codispatch = *VISION_CODISPATCH_ENV.get_or_init(|| {
+        std::env::var("ATLAS_VISION_CODISPATCH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
     const VISION_P_MAX: usize = 6400; // VisionEncoder scratch cap (Σ pre-merge patches)
     let mut vision_slices: Vec<VisionSlice> = vec![VisionSlice::default(); new_reqs.len()];
     if vision_codispatch && chunked {
@@ -157,10 +172,13 @@ pub(super) fn start_new_requests(
     // through to the identical per-request path. Blocking-only: streaming + beam
     // is rejected upstream, so every beam request here is Blocking.
     let mut beam_hyps: Vec<Option<Vec<u32>>> = (0..new_reqs.len()).map(|_| None).collect();
+    static BEAM_CODISPATCH_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let beam_codispatch = model.supports_beam()
-        && std::env::var("ATLAS_BEAM_CODISPATCH")
-            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-            .unwrap_or(true);
+        && *BEAM_CODISPATCH_ENV.get_or_init(|| {
+            std::env::var("ATLAS_BEAM_CODISPATCH")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true)
+        });
     if beam_codispatch {
         const BEAM_C_CAP: usize = 320; // Σ beams per fused batch (d≤2048 self-KV cap)
         let items: Vec<(usize, i32, usize)> = new_reqs

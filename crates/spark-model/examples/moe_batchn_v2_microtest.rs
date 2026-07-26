@@ -19,7 +19,7 @@
 //! Defaults: 8 10 64 0x9E3   (pool = distinct experts tokens draw from; the
 //! pointer tables are 256-wide like production, unused ids are NULL).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
@@ -94,7 +94,9 @@ struct W {
 }
 impl W {
     fn random(rng: &mut Rng, n: usize, k: usize) -> Self {
-        let packed: Vec<u8> = (0..n * k / 2).map(|_| (rng.next_u64() & 0xFF) as u8).collect();
+        let packed: Vec<u8> = (0..n * k / 2)
+            .map(|_| (rng.next_u64() & 0xFF) as u8)
+            .collect();
         // e4m3 exponent 3..=9 keeps decode finite and moderate (no NaN byte).
         let scales: Vec<u8> = (0..n * k / GROUP)
             .map(|_| {
@@ -104,7 +106,13 @@ impl W {
                 (s << 7) | (e << 3) | m
             })
             .collect();
-        W { packed, scales, s2: rng.uniform(0.02, 0.06), n, k }
+        W {
+            packed,
+            scales,
+            s2: rng.uniform(0.02, 0.06),
+            n,
+            k,
+        }
     }
     /// Dequantized weight element [row n, col k] — mirrors the kernel exactly.
     fn at(&self, n: usize, k: usize) -> f32 {
@@ -167,9 +175,15 @@ fn main() -> Result<()> {
         .map(|_| f32_to_bf16(rng.uniform(-1.0, 1.0)))
         .collect();
     // expert pool: gate/up [INTER, HIDDEN], down [HIDDEN, INTER]
-    let gates: Vec<W> = (0..pool).map(|_| W::random(&mut rng, INTER, HIDDEN)).collect();
-    let ups: Vec<W> = (0..pool).map(|_| W::random(&mut rng, INTER, HIDDEN)).collect();
-    let downs: Vec<W> = (0..pool).map(|_| W::random(&mut rng, HIDDEN, INTER)).collect();
+    let gates: Vec<W> = (0..pool)
+        .map(|_| W::random(&mut rng, INTER, HIDDEN))
+        .collect();
+    let ups: Vec<W> = (0..pool)
+        .map(|_| W::random(&mut rng, INTER, HIDDEN))
+        .collect();
+    let downs: Vec<W> = (0..pool)
+        .map(|_| W::random(&mut rng, HIDDEN, INTER))
+        .collect();
     let sh_gate = W::random(&mut rng, INTER, HIDDEN);
     let sh_up = W::random(&mut rng, INTER, HIDDEN);
     let sh_down = W::random(&mut rng, HIDDEN, INTER);
@@ -250,7 +264,11 @@ fn main() -> Result<()> {
     let launch_gate_up = |name: &str, block: u32, stream: u64| -> Result<()> {
         let h = gpu.kernel("moe_fused_batch2", name)?;
         // v3 stages A per K-tile: num_tokens * 1024 * 2B dynamic smem
-        let smem = if name.ends_with("_v3") { (num_tokens * 1024 * 2) as u32 } else { 0 };
+        let smem = if name.ends_with("_v3") {
+            (num_tokens * 1024 * 2) as u32
+        } else {
+            0
+        };
         KernelLaunch::new(gpu, h)
             .grid([(INTER as u32).div_ceil(8), rows_y, 2])
             .block([block, 1, 1])
@@ -355,7 +373,12 @@ fn main() -> Result<()> {
         match mode {
             1 => {
                 launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, stream)?;
-                launch_silu_down("moe_expert_silu_down_shared_batchN_v2", 128, v2_smem, stream)
+                launch_silu_down(
+                    "moe_expert_silu_down_shared_batchN_v2",
+                    128,
+                    v2_smem,
+                    stream,
+                )
             }
             2 => {
                 launch_gate_up("moe_expert_gate_up_shared_batchN_v3", 128, stream)?;
@@ -389,7 +412,8 @@ fn main() -> Result<()> {
             .map(|n| (0..w.k).map(|k| a_row[k] * w.at(n, k)).sum())
             .collect()
     };
-    let narrow = |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| bf16_to_f32(f32_to_bf16(x))).collect() };
+    let narrow =
+        |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| bf16_to_f32(f32_to_bf16(x))).collect() };
     let mut ref_gate = vec![0f32; total_routed * INTER];
     let mut ref_up = vec![0f32; total_routed * INTER];
     let mut ref_down = vec![0f32; total_routed * HIDDEN];
@@ -489,30 +513,46 @@ fn main() -> Result<()> {
         Ok(ms as f64 / iters as f64)
     };
     // weight bytes actually needed once per layer (packed+scales, dedup):
-    let per_expert =
-        (INTER * HIDDEN / 2 + INTER * HIDDEN / GROUP) * 2 + HIDDEN * INTER / 2 + HIDDEN * INTER / GROUP;
+    let per_expert = (INTER * HIDDEN / 2 + INTER * HIDDEN / GROUP) * 2
+        + HIDDEN * INTER / 2
+        + HIDDEN * INTER / GROUP;
     let ideal_bytes = (unique.len() + 1) * per_expert;
-    println!("dedup-ideal weight read {:.1} MB/layer", ideal_bytes as f64 / 1e6);
-    let configs: Vec<(&str, Box<dyn Fn(u64) -> Result<()>>, Box<dyn Fn(u64) -> Result<()>>)> = vec![
+    println!(
+        "dedup-ideal weight read {:.1} MB/layer",
+        ideal_bytes as f64 / 1e6
+    );
+    let configs: Vec<(
+        &str,
+        Box<dyn Fn(u64) -> Result<()>>,
+        Box<dyn Fn(u64) -> Result<()>>,
+    )> = vec![
         (
             "v1@256",
             Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN", 256, s)),
-            Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN", 256, v1_smem, s)),
+            Box::new(move |s| {
+                launch_silu_down("moe_expert_silu_down_shared_batchN", 256, v1_smem, s)
+            }),
         ),
         (
             "v1@128",
             Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN", 128, s)),
-            Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, s)),
+            Box::new(move |s| {
+                launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, s)
+            }),
         ),
         (
             "v2@128",
             Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN_v2", 128, s)),
-            Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN_v2", 128, v2_smem, s)),
+            Box::new(move |s| {
+                launch_silu_down("moe_expert_silu_down_shared_batchN_v2", 128, v2_smem, s)
+            }),
         ),
         (
             "v3@128",
             Box::new(|s| launch_gate_up("moe_expert_gate_up_shared_batchN_v3", 128, s)),
-            Box::new(move |s| launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, s)),
+            Box::new(move |s| {
+                launch_silu_down("moe_expert_silu_down_shared_batchN", 128, v1_smem, s)
+            }),
         ),
         (
             "v4@128 (dedup-down)",

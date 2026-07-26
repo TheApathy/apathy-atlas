@@ -141,6 +141,29 @@ impl AtlasRegistry {
         ordinal: usize,
         kernel_blobs: &[(&'static str, &'static [u8])],
     ) -> Result<AtlasRegistry> {
+        // ATLAS_CUDA_SCHED_SPIN=1: force CU_CTX_SCHED_SPIN on the primary
+        // context BEFORE it is created. The default SCHED_AUTO spin-then-
+        // yield sync escalates to timed naps whose wakeups round to kernel-
+        // tick granularity (~4ms at HZ=250) — measured 2026-07-25 as a
+        // consistent ~4.3ms/step of unaccounted wall on the decode hot loop.
+        // Pure spin trades one busy core (the scheduler thread already
+        // spins ~100% CPU) for tick-free sync returns.
+        if std::env::var("ATLAS_CUDA_SCHED_SPIN").ok().as_deref() == Some("1") {
+            unsafe extern "C" {
+                fn cuInit(flags: u32) -> i32;
+                fn cuDevicePrimaryCtxSetFlags_v2(dev: i32, flags: u32) -> i32;
+            }
+            const CU_CTX_SCHED_SPIN: u32 = 0x01;
+            unsafe {
+                let _ = cuInit(0);
+                let rc = cuDevicePrimaryCtxSetFlags_v2(ordinal as i32, CU_CTX_SCHED_SPIN);
+                if rc == 0 {
+                    eprintln!("atlas-core: primary ctx flags SCHED_SPIN (dev {ordinal})");
+                } else {
+                    eprintln!("atlas-core: cuDevicePrimaryCtxSetFlags(SPIN) rc={rc}");
+                }
+            }
+        }
         let ctx = CudaContext::new(ordinal).map_err(AtlasError::CudaDriver)?;
         let stream = ctx.new_stream().map_err(AtlasError::CudaDriver)?;
 

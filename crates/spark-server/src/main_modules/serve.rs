@@ -674,6 +674,30 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // scheduler thread spawns.
     scheduler::set_max_seq_len(args.max_seq_len);
     std::thread::spawn(move || {
+        // ATLAS_SCHED_PIN=<core>: pin the scheduler thread to a dedicated
+        // core. Measured 2026-07-25 (LOOP_TRACE): ~1.4 involuntary
+        // preemptions per decode step, each costing ~4ms of re-schedule
+        // latency right after step end (tokio emit/detokenize wakeups win
+        // the core). A dedicated core removes the preemption; the kernel
+        // load-balances the tokio workers onto the remaining cores.
+        if let Ok(core) = std::env::var("ATLAS_SCHED_PIN")
+            && let Ok(core) = core.parse::<usize>()
+        {
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(core, &mut set);
+                let rc = libc::sched_setaffinity(
+                    0,
+                    std::mem::size_of::<libc::cpu_set_t>(),
+                    &set,
+                );
+                if rc == 0 {
+                    tracing::info!("scheduler thread pinned to core {core}");
+                } else {
+                    tracing::warn!("ATLAS_SCHED_PIN: sched_setaffinity failed (rc={rc})");
+                }
+            }
+        }
         scheduler::run(
             scheduler_model,
             request_rx,

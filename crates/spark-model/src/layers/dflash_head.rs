@@ -40,6 +40,22 @@ pub struct DflashKernels {
     /// (and ~4× OOB → CUDA-700). `.0 == 0` when the target lm_head is BF16.
     pub w4a16_gemm: KernelHandle,
     pub dense_gemm_pipelined: KernelHandle,
+    /// Small-M (M ≤ 16) BF16 weight-streaming GEMM
+    /// (`dense_gemm_bf16_mtile16`, kernels/gb10/common/). Drop-in for
+    /// `dense_gemm_pipelined` on the drafter's M=γ propose GEMMs when
+    /// `ATLAS_DFLASH_DRAFTER_FASTGEMM=1` (default OFF). Output is
+    /// bit-identical (same m16n8k16 ascending-K FP32-accumulate chain);
+    /// the win is pure weight-read bandwidth: N_TILE=64 grid (2-6× the
+    /// CTA count of the 128×128 tile at drafter N's) + 4-stage cp.async
+    /// ring (~24 KB of B in flight per CTA vs ~8 KB). `.0 == 0` when the
+    /// target's kernel set lacks it (non-gb10 targets) — dispatch falls
+    /// back to `dense_gemm_pipelined`. Used for N ≤ 2048 (kv/g_proj).
+    pub dense_gemm_mtile16: KernelHandle,
+    /// N_TILE=128 wide-stream sibling of `dense_gemm_mtile16` (kernel
+    /// `dense_gemm_bf16_mtile16_n128`, same .cu). Used for N > 2048 —
+    /// fewer, longer B streams win on LPDDR5x at large N. `.0 == 0` →
+    /// pipelined fallback.
+    pub dense_gemm_mtile16_n128: KernelHandle,
     pub rope_qwen3: KernelHandle,
     pub reshape_cache_fp8: KernelHandle,
     /// BF16 KV cache writeback. Used by Phase 2 `precompute_ctx_kv` and
@@ -96,6 +112,14 @@ pub struct DflashKernels {
     /// for `fp8_gemm_n128_row_scaled` when M=γ=16. Single warp per CTA,
     /// no wasted M_TILE rows. Used by the lm_head GEMM.
     pub fp8_gemm_n128_row_scaled_m16: KernelHandle,
+    /// Weight-read-bound M ≤ 8 row-scaled FP8 GEMM
+    /// (`w4a16::fp8_gemm_t_row_scaled_mtile8`, N_TILE=64, 4-stage cp.async
+    /// ring). Preferred over `_m16` for the FP8 lm_head tail when γ ≤ 8 and
+    /// K % 32 == 0 — it streams the vocab×hidden mirror once at near-wall
+    /// GB/s (the single-warp _m16 tile measured ~40% lower cold weight-read
+    /// bandwidth at the mirror shapes). 0-handle on miss — dispatch falls
+    /// back to `_m16`.
+    pub fp8_gemm_row_scaled_mtile8: KernelHandle,
     /// Laguna per-head attention-output gate: applies
     /// `out[t,h,d] = in[t,h,d] * softplus(gate[t,h])`, broadcasting one
     /// softplus scalar per head across `head_dim`. Consumes the `[γ, num_q_heads]`
@@ -198,6 +222,13 @@ pub enum DflashQuantization {
     /// f32 scales at model load. Activations stay BF16; KV cache stays
     /// BF16. GEMMs use `fp8_gemm_n128` (BF16 × FP8 → BF16).
     Fp8Weights,
+    /// Attention-only weight FP8 (`ATLAS_DFLASH_DRAFTER_FP8_ATTN=1`):
+    /// only q/k/v/o are mirrored to FP8 per layer; gate/up/down and the
+    /// shared lm_head stay BF16. Motivation: the full-FP8 accept collapse
+    /// (3.09 → 2.59) is attributed to the MLP/lm_head — the target model's
+    /// q/k/v/o at FP8 measured accept-neutral. Dispatch is per-GEMM on FP8
+    /// mirror presence, so this variant is observability-only.
+    Fp8AttnWeights,
 }
 
 /// Per-drafter-layer Qwen3-style weights. Phase 1 is BF16-only; **Phase G**
@@ -229,9 +260,11 @@ pub struct DflashLayer {
     pub down_proj: DenseWeight,
 
     // Phase G — optional FP8 mirrors of the seven dense-GEMM weights.
-    // Populated at load time when `ATLAS_DFLASH_DRAFTER_FP8=1`, consumed
-    // by forward_block_layer_pre_attn / _post_attn when self.quant ==
-    // DflashQuantization::Fp8Weights. None when BF16 path is active.
+    // All seven populated at load time when `ATLAS_DFLASH_DRAFTER_FP8=1`;
+    // only q/k/v/o when `ATLAS_DFLASH_DRAFTER_FP8_ATTN=1` (attn-only mode,
+    // gate/up/down stay None → BF16). Consumed by
+    // forward_block_layer_pre_attn / _post_attn, dispatched per GEMM on
+    // mirror presence. All None when the BF16 path is active.
     pub q_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
     pub k_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
     pub v_proj_fp8: Option<crate::weight_map::Fp8DenseWeight>,
@@ -363,6 +396,23 @@ pub struct DflashProposerState {
     /// Cleared at the top of every propose so source paths never carry a
     /// stale fork.
     pub pending_block_fork: Option<(usize, u32)>,
+    /// DDTree M0 gate (ATLAS_DFLASH_TREE_M0=1): per-draft top-2 from the
+    /// drafter logits `(top1_tok, top1_val, top2_tok, top2_val)`, index =
+    /// draft position. Measurement only — the verify step compares the
+    /// target's correction at the death position against `top2_tok` to
+    /// estimate the tree-verify accept ceiling. Cleared at propose entry.
+    pub pending_m0_top2: Option<Vec<(u32, f32, u32, f32)>>,
+    /// DDTree M1 (ATLAS_DFLASH_TREE=1): free-slots tree payload built by the
+    /// drafter path from the fresh top-2 logits (spine + one low-margin
+    /// cliff fork + 1-token re-rooted tail). Drained by the scheduler via
+    /// `dflash_take_tree_payload`; UNUSED by verify until M2. Cleared at the
+    /// top of every propose so source paths never carry a stale tree.
+    pub pending_tree_payload: Option<ddtree::TreePayload>,
+    /// ATLAS_DFLASH_SPEC_PROPOSE: host watermark snapshot taken when a
+    /// speculative (full-accept-bet) propose was launched during the verify;
+    /// restored by `spec_propose::spec_rollback` on discard. `None` when no
+    /// speculative launch is outstanding (or it was adopted).
+    pub spec_watermark: Option<spec_propose::SpecWatermark>,
 }
 
 impl ProposerState for DflashProposerState {
@@ -530,6 +580,49 @@ pub struct BlockDiffusionDraftHead {
     /// it's the natural sync barrier between captured subgraphs
     /// (vLLM piecewise convention). See design doc §15.
     pub propose_graphs: Mutex<Option<Vec<spark_runtime::gpu::GraphHandle>>>,
+    /// ATLAS_DFLASH_PROPOSE_ONEGRAPH=1 (default off): ONE captured graph for
+    /// the whole propose compute — all layers (pre-attn GEMMs + INDIRECT
+    /// paged attention + post-attn GEMMs) + tail (norm + lm_head + argmax).
+    /// Collapses the ~19 host launch boundaries of the piecewise path
+    /// (6 × [pre graph, eager attn, post graph] + tail graph) into a single
+    /// `launch_graph`. The attention launch is capture-safe because the
+    /// default path already runs `inferspark_prefill_paged_indirect`, which
+    /// reads its per-step `[kv_len, q_offset, q_rope_pos]` from
+    /// `option_b_indirect_args_dev` at kernel entry; all other per-step
+    /// dynamics (position_ids, token ids incl. the spec-propose indirect
+    /// last_token, γ slot mapping via the pre-graph eager `fill_slots`
+    /// launch) also ride device buffers written before the replay.
+    ///
+    /// Keyed by the `block_table_dev` pointer (`u64`) — the ONLY per-sequence
+    /// device pointer baked into the captured region (the attention launches
+    /// bind it as a kernel arg). Under ONEGRAPH the block-table transport
+    /// buffer is SLOT-STABLE (borrowed from `bt_dev_pool`, head-lifetime —
+    /// see the pool docs below), so a key is captured against AT MOST ONCE
+    /// for the head's lifetime: sequences reuse the pool buffer, the pointer
+    /// stays valid, and only the buffer CONTENTS change (uploaded H2D at
+    /// each sequence's lazy block-table init, read by the kernels at replay
+    /// time). The map holds one entry per pool buffer ever created (bounded
+    /// by peak concurrent sequences; 1-2 in production) — entries are never
+    /// destroyed or re-captured, eliminating the per-request ~200-400 ms
+    /// re-capture that made the first landing of this feature net-negative.
+    /// `GraphHandle(0)` = empty-capture sentinel → replay eager forever.
+    pub propose_onegraph: Mutex<Vec<(u64, spark_runtime::gpu::GraphHandle)>>,
+    /// ONEGRAPH slot-stable block-table transport pool. When
+    /// `dflash_propose_onegraph_enabled()`, `propose.rs` borrows a buffer
+    /// from here (or allocates one sized `bt_pool_buf_bytes()` — the
+    /// head-max block count, identical for every sequence since
+    /// `max_ctx_len == max_seq_len` for all states) instead of a fresh
+    /// per-sequence `gpu.alloc`, and `free_state` RETURNS the buffer here
+    /// instead of freeing it. The device pointer therefore survives across
+    /// sequences and the captured onegraph's baked pointer stays valid; a
+    /// new sequence only overwrites the buffer contents (H2D upload at lazy
+    /// block-table init, before any replay for that sequence — safe because
+    /// every sync propose ends with an event sync on the drafts D2H and
+    /// `free_state` resolves async in-flight launches first). Buffers are
+    /// head-lifetime: never freed, bounded by peak concurrent sequences.
+    /// Empty and untouched when the ONEGRAPH env gate is off (byte-identical
+    /// default path: plain alloc/free per sequence).
+    pub bt_dev_pool: Mutex<Vec<DevicePtr>>,
     /// When set, all `forward_block` calls run eagerly. Mirrors target-model
     /// `TransformerModel::suppress_graphs` so external code can disable
     /// graphs at runtime (e.g. while calibrating FP8 KV).
@@ -563,6 +656,7 @@ pub struct BlockDiffusionDraftHead {
 }
 
 mod async_propose;
+pub mod ddtree;
 pub(crate) mod echo;
 mod forward_block;
 mod forward_block_layer;
@@ -571,6 +665,109 @@ mod from_weights;
 mod precompute_ctx_kv;
 mod propose;
 mod retrieval;
+pub mod spec_propose;
+
+// Re-export the DDTree payload so the scheduler / traits layer can carry it
+// as `Option<DDTreePayload>` without reaching into the module path.
+pub use ddtree::TreePayload as DDTreePayload;
+
+/// ATLAS_DFLASH_DRAFTER_FASTGEMM=1 (default OFF): route the drafter's
+/// M=γ BF16 propose GEMMs through the small-M weight-streaming kernel
+/// `dense_gemm_bf16_mtile16` instead of `dense_gemm_bf16_pipelined`.
+/// Read once (OnceLock) so the decision is stable across CUDA graph
+/// capture/replay.
+pub(crate) fn drafter_fastgemm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_DRAFTER_FASTGEMM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+/// ATLAS_DFLASH_PROPOSE_ONEGRAPH=1 (default OFF): single full-propose
+/// captured graph (see `propose_onegraph`). Shared gate for the three
+/// coupled sites — the `forward_block` capture/replay branch, the
+/// `propose.rs` block-table borrow (pool vs fresh alloc), and the
+/// `free_state` return (pool vs `gpu.free`) — so the slot-stable
+/// transport and the graph keying can never disagree. The CONTIG
+/// attention ablation injects D2H + sync inside the layer loop — not
+/// capture-safe — so it forces the gate off. Read once (OnceLock) so
+/// capture and replay always agree.
+pub(crate) fn dflash_propose_onegraph_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_PROPOSE_ONEGRAPH")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && std::env::var("ATLAS_DFLASH_CONTIG_ATTN").is_err()
+    })
+}
+
+impl BlockDiffusionDraftHead {
+    /// Size (bytes) of one `bt_dev_pool` block-table transport buffer: the
+    /// head-max block count × 4 (u32 block ids). Mirrors the `propose.rs`
+    /// lazy-init formula `(max_ctx_len + γ + 1).div_ceil(BLOCK_SIZE)` with
+    /// `max_ctx_len == max_seq_len` (every state's cap — set in
+    /// `alloc_state`), so every sequence's `bt_bytes` fits in every pool
+    /// buffer and pooled buffers are interchangeable across slots.
+    pub(crate) fn bt_pool_buf_bytes(&self) -> usize {
+        const BLOCK_SIZE: usize = 16; // matches propose.rs / from_weights.rs:68
+        (self.max_seq_len + self.gamma + 1).div_ceil(BLOCK_SIZE) * std::mem::size_of::<u32>()
+    }
+
+    /// Try to dispatch an `[m, n] = [m, k] · [n, k]ᵀ` BF16 GEMM through the
+    /// small-M weight-streaming kernels. Returns `Ok(true)` when the fast
+    /// path launched (caller skips the pipelined fallback), `Ok(false)`
+    /// when ineligible: env gate off, kernels missing from the target's
+    /// set, `m > 16` (one m16n8k16 row block), or `k % 8 != 0` (16-B
+    /// cp.async row alignment). All drafter propose shapes
+    /// (K ∈ {3072, 9216, 12288, 18432}) qualify.
+    ///
+    /// Tile pick (GB10 microbench, dflash_bf16gemm_smallm_microtest):
+    /// N ≤ 2048 → N_TILE=64 (kv_proj N=1024: 22 µs vs pipelined's 113 µs —
+    /// the 128-wide tile puts only ceil(N/128) ≤ 16 CTAs on 48 SMs);
+    /// N > 2048 → N_TILE=128 wide-stream (o/down/fc/lm_head 1.06-1.28×
+    /// over pipelined; fewer, longer DRAM streams win on LPDDR5x).
+    /// Pure device args — CUDA graph-capture safe; the env gate is a
+    /// OnceLock so capture and replay always agree.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_fastgemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        src: DevicePtr,
+        weight: &DenseWeight,
+        dst: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        if !drafter_fastgemm_enabled() || m > 16 || k % 8 != 0 {
+            return Ok(false);
+        }
+        let (kernel, wide) = if n <= 2048 {
+            (self.kernels.dense_gemm_mtile16, false)
+        } else {
+            (self.kernels.dense_gemm_mtile16_n128, true)
+        };
+        if kernel.0 == 0 {
+            return Ok(false);
+        }
+        if wide {
+            crate::layers::ops::dense_gemm_bf16_mtile16_n128(
+                gpu, kernel, src, weight, dst, m, n, k, stream,
+            )?;
+        } else {
+            crate::layers::ops::dense_gemm_bf16_mtile16(
+                gpu, kernel, src, weight, dst, m, n, k, stream,
+            )?;
+        }
+        Ok(true)
+    }
+}
 
 impl DraftProposer for BlockDiffusionDraftHead {
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
@@ -620,6 +817,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             echo_streak: 0,
             echo_offered_last: false,
             pending_block_fork: None,
+            pending_m0_top2: None,
+            pending_tree_payload: None,
+            spec_watermark: None,
         }))
     }
 
@@ -693,6 +893,56 @@ impl DraftProposer for BlockDiffusionDraftHead {
         self.collect_async_drafts_impl(gpu, dstate)
     }
 
+    fn spec_propose_launch(
+        &self,
+        gpu: &dyn GpuBackend,
+        default_stream: u64,
+        device_last_token: DevicePtr,
+        hidden_save: DevicePtr,
+        ctx_rows: usize,
+        base_pos: usize,
+        state: &mut dyn ProposerState,
+        ctx: &crate::layer::ForwardContext,
+    ) -> Result<bool> {
+        let dstate = match state.as_any_mut().downcast_mut::<DflashProposerState>() {
+            Some(d) => d,
+            None => return Ok(false),
+        };
+        self.spec_propose_launch_impl(
+            gpu,
+            default_stream,
+            device_last_token,
+            hidden_save,
+            ctx_rows,
+            base_pos,
+            dstate,
+            ctx,
+        )
+    }
+
+    fn spec_pending(&self, state: &mut dyn ProposerState) -> bool {
+        match state.as_any_mut().downcast_mut::<DflashProposerState>() {
+            Some(d) => self.spec_pending_impl(d),
+            None => false,
+        }
+    }
+
+    fn spec_discard(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+        let dstate = match state.as_any_mut().downcast_mut::<DflashProposerState>() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        self.spec_discard_impl(gpu, dstate)
+    }
+
+    fn spec_adopt_placeholder(&self, state: &mut dyn ProposerState) -> Result<Option<Vec<u32>>> {
+        let dstate = match state.as_any_mut().downcast_mut::<DflashProposerState>() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+        self.spec_adopt_impl(dstate)
+    }
+
     fn free_state(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
         // Phase 2 (Option B) reclaim: return the drafter's lazily-allocated
         // paged KV blocks to the pool on request completion. Without this the
@@ -705,9 +955,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             // Phase 1 / non-DFlash proposer state: nothing allocated, nothing to free.
             None => return Ok(()),
         };
-        // ATLAS_DFLASH_ASYNC: an in-flight async propose reads this
-        // sequence's ctx buffers — sync + discard it before freeing them.
-        if async_propose::dflash_async_enabled() {
+        // ATLAS_DFLASH_ASYNC / ATLAS_DFLASH_SPEC_PROPOSE: an in-flight
+        // second-stream propose reads this sequence's ctx buffers — sync +
+        // discard (and, for spec, roll the watermark back) before freeing.
+        if async_propose::dflash_async_enabled() || spec_propose::dflash_spec_enabled() {
             self.resolve_async_inflight_impl(gpu, Some(dstate))?;
         }
         if !dstate.block_table.is_empty() {
@@ -723,9 +974,18 @@ impl DraftProposer for BlockDiffusionDraftHead {
             gpu.free(dstate.ctx_hidden_acc)?;
             dstate.ctx_hidden_acc = DevicePtr(0);
         }
-        // Free the device-side block table (lazily allocated in propose.rs).
+        // Release the device-side block table (lazily allocated in
+        // propose.rs). Under ONEGRAPH the buffer is slot-stable transport
+        // borrowed from `bt_dev_pool` — RETURN it (never free) so the
+        // captured graph's baked pointer stays valid and the next sequence
+        // reuses it (contents re-uploaded at its lazy init). Default path:
+        // plain free, byte-identical to pre-ONEGRAPH behavior.
         if let Some(bt) = dstate.block_table_dev.take() {
-            gpu.free(bt)?;
+            if dflash_propose_onegraph_enabled() {
+                self.bt_dev_pool.lock().push(bt);
+            } else {
+                gpu.free(bt)?;
+            }
         }
         // Reset the lazy-alloc guard + watermarks so the NEXT request's first
         // propose re-allocates fresh blocks and re-precomputes ctx from a clean

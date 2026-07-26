@@ -279,8 +279,8 @@ pub fn moe_expert_down_dedup_batchn(
     expert_indices: DevicePtr,
     sh_down: &QuantizedWeight,
     sh_down_out: DevicePtr,
-    n: u32,       // N = hidden (output dim)
-    k: u32,       // K = inter (input dim)
+    n: u32, // N = hidden (output dim)
+    k: u32, // K = inter (input dim)
     top_k: u32,
     num_tokens: u32,
     stream: u64,
@@ -289,6 +289,52 @@ pub fn moe_expert_down_dedup_batchn(
     let rows_y = total_routed + num_tokens;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 8), rows_y, 1])
+        .block([128, 1, 1])
+        .arg_ptr(act)
+        .arg_ptr(sh_act)
+        .arg_ptr(packed_ptrs)
+        .arg_ptr(scale_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_down.weight)
+        .arg_ptr(sh_down.weight_scale)
+        .arg_f32(sh_down.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .launch(stream)
+}
+
+/// v5 FFN: cp.async-staged expert-dedup down GEMV. Same argument list as
+/// `moe_expert_down_dedup_batchn` but the kernel covers 16 output rows per
+/// block (2 pipelined 8-row cp.async tiles) → grid.x = ceil(n/16).
+/// Requires k == 1024 (caller-guarded; Laguna inter).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_down_dedup_batchn_v5(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    act: DevicePtr,
+    sh_act: DevicePtr,
+    packed_ptrs: DevicePtr,
+    scale_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_down: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    n: u32, // N = hidden (output dim)
+    k: u32, // K = inter (input dim)
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    let total_routed = num_tokens * top_k;
+    let rows_y = total_routed + num_tokens;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 16), rows_y, 1])
         .block([128, 1, 1])
         .arg_ptr(act)
         .arg_ptr(sh_act)
@@ -413,6 +459,46 @@ pub fn moe_weighted_sum_blend_batchn(
         .arg_ptr(shared_out)
         .arg_ptr(input)
         .arg_ptr(gate_weight)
+        .arg_u32(hidden)
+        .arg_u32(top_k)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Weighted-sum blend + residual add fused (ATLAS_FUSED_ELEMWISE=1).
+/// Byte-identical `output` to [`moe_weighted_sum_blend_batchn`], plus the
+/// `bf16_residual_add` fold on `hidden_resid` in the same pass — removes one
+/// launch and one [num_tokens, hidden] BF16 round-trip per MoE layer.
+///
+/// Kernel: `moe_weighted_sum_blend_residual_batchn`
+/// (kernels/gb10/common/fused_verify_elemwise.cu)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_weighted_sum_blend_residual_batchn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    output: DevicePtr,         // [num_tokens, hidden] BF16
+    expert_out: DevicePtr,     // [num_tokens*top_k, hidden] BF16
+    expert_weights: DevicePtr, // [num_tokens*top_k] f32
+    shared_out: DevicePtr,     // [num_tokens, hidden] BF16
+    input: DevicePtr,          // [num_tokens, K] BF16
+    gate_weight: DevicePtr,    // [1, K] BF16 (shared) or NULL
+    hidden_resid: DevicePtr,   // [num_tokens, hidden] BF16 residual, in/out
+    hidden: u32,
+    top_k: u32,
+    k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(hidden, 256), num_tokens, 1])
+        .block([256, 1, 1])
+        .arg_ptr(output)
+        .arg_ptr(expert_out)
+        .arg_ptr(expert_weights)
+        .arg_ptr(shared_out)
+        .arg_ptr(input)
+        .arg_ptr(gate_weight)
+        .arg_ptr(hidden_resid)
         .arg_u32(hidden)
         .arg_u32(top_k)
         .arg_u32(k)

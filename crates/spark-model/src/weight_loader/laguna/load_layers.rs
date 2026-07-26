@@ -65,6 +65,7 @@ pub(super) fn load_layers(
                 quantize_k,
                 stream,
                 unified_moe_layout,
+                i,
             )?
         };
         let layer = load_attention(
@@ -116,23 +117,57 @@ fn load_moe_ffn(
     quantize_k: spark_runtime::gpu::KernelHandle,
     stream: u64,
     unified_moe_layout: bool,
+    layer_idx: usize,
 ) -> Result<FfnComponent> {
     let mlp = format!("{lp}.mlp");
     let gate = dense(store, &format!("{mlp}.gate.weight"))?;
     let correction_bias = dense(store, &format!("{mlp}.experts.e_score_correction_bias"))?;
-    let experts = (0..config.num_experts)
-        .map(|e| {
-            if !config.is_local_expert(e) {
-                return Ok(ExpertWeight::null());
+
+    // ── ATLAS_MOE_W3=1: 3-bit Lloyd-Max routed experts from the w3cache. ──
+    // On success the NVFP4 expert tensors this layer would have used are
+    // FREED (never held alongside W3). Any failure (missing file, bad
+    // header, missing kernels, incompatible layout envs) warns once and
+    // stays NVFP4 — never aborts.
+    let w3_layer = maybe_load_w3_layer(config, gpu, layer_idx, unified_moe_layout);
+
+    let experts = if let Some(w3) = &w3_layer {
+        // Free the store's NVFP4 packed + scale buffers for every routed
+        // expert of this layer (per-tensor allocations; the WeightStore
+        // entries become dangling but the laguna loader is their only
+        // consumer and reads them exactly once, here).
+        let mut freed = 0usize;
+        for e in 0..config.num_experts {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                for suffix in ["weight_packed", "weight_scale"] {
+                    let name = format!("{mlp}.experts.{e}.{proj}.{suffix}");
+                    if let Ok(t) = store.get(&name) {
+                        freed += t.byte_size();
+                        let _ = gpu.free(t.ptr);
+                    }
+                }
             }
-            let ep = format!("{mlp}.experts.{e}");
-            Ok(ExpertWeight {
-                gate_proj: quantized_v2(store, &format!("{ep}.gate_proj"), gpu)?,
-                up_proj: quantized_v2(store, &format!("{ep}.up_proj"), gpu)?,
-                down_proj: quantized_v2(store, &format!("{ep}.down_proj"), gpu)?,
+        }
+        tracing::debug!(
+            "Laguna L{layer_idx}: W3 experts active (+{} MiB W3, -{} MiB NVFP4 freed)",
+            w3.device_bytes >> 20,
+            freed >> 20,
+        );
+        w3.experts.clone()
+    } else {
+        (0..config.num_experts)
+            .map(|e| {
+                if !config.is_local_expert(e) {
+                    return Ok(ExpertWeight::null());
+                }
+                let ep = format!("{mlp}.experts.{e}");
+                Ok(ExpertWeight {
+                    gate_proj: quantized_v2(store, &format!("{ep}.gate_proj"), gpu)?,
+                    up_proj: quantized_v2(store, &format!("{ep}.up_proj"), gpu)?,
+                    down_proj: quantized_v2(store, &format!("{ep}.down_proj"), gpu)?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+    };
 
     let shared = format!("{mlp}.shared_expert");
     let shared_gate = dense_auto(store, &format!("{shared}.gate_proj.weight"), gpu)?;
@@ -156,6 +191,20 @@ fn load_moe_ffn(
         correction_bias: Some(correction_bias),
     };
     let mut layer = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+    if let Some(w3) = &w3_layer {
+        // maybe_load_w3_layer verified the kernel set, so this cannot fail;
+        // if it somehow does, that is a real bug — surface it.
+        layer.enable_w3(w3.lut_dev)?;
+        static W3_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !W3_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "ATLAS_MOE_W3=1: 3-bit Lloyd-Max routed experts active (w3cache dir {:?}, \
+                 lut {:?}) — NVFP4 expert memory freed as layers load",
+                crate::weight_map::w3cache_dir(),
+                w3.lut,
+            );
+        }
+    }
     // The checkpoint explicitly excludes the shared expert from NVFP4
     // compression. Keep its BF16 weights authoritative for both prefill and
     // decode; the quantized copies above are placeholders for fused routed
@@ -177,6 +226,115 @@ fn load_moe_ffn(
 }
 
 fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// ATLAS_MOE_W3: try to load this layer's 3-bit Lloyd-Max experts from the
+/// w3cache. Every failure mode warns ONCE and returns `None` (stay NVFP4):
+/// missing/invalid cache file, missing `_w3` kernels, or a layout env that
+/// the W3 v1 kernel set cannot serve (transposed/unified/hybrid/CUTLASS/FP4
+/// prefill lanes and EP all consume NVFP4 bytes the W3 path frees).
+fn maybe_load_w3_layer(
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    layer_idx: usize,
+    unified_moe_layout: bool,
+) -> Option<crate::weight_map::W3LoadedLayer> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if !crate::weight_map::w3_enabled() {
+        return None;
+    }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let warn_once = |msg: &str| {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!("ATLAS_MOE_W3=1 requested but staying NVFP4: {msg}");
+        }
+    };
+
+    let env_on = |k: &str| {
+        matches!(
+            std::env::var(k).as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    };
+    // ATLAS_MOE_MIXED43: gate-ranked mixed 4.5/3-bit MoE (top-G experts read
+    // NVFP4, the rest W3) was evaluated 2026-07 and is NOT implementable on
+    // GB10: it needs BOTH formats resident for every expert (gate ranks vary
+    // per token, so there is no stable NVFP4 subset), i.e. 59.5 GiB NVFP4 +
+    // 46.3 GiB W3 routed experts in a 119 GiB unified LPDDR pool that also
+    // holds attention weights, KV, drafter and the OS. Streaming the NVFP4
+    // side from mmap is no escape either: cudaHostRegister pins pages in the
+    // SAME physical pool (unified memory), and unpinned page-cache reads
+    // leave ~40% of the ~475 MiB/token top-2 working set faulting from NVMe.
+    // The fittable substitute is per-layer W3 codebooks (w3-requant
+    // `--codebook per-layer`), which this build consumes transparently via
+    // the per-layer LUT already present in every .w3x header.
+    if env_on("ATLAS_MOE_MIXED43") {
+        static MIXED_WARNED: AtomicBool = AtomicBool::new(false);
+        if !MIXED_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "ATLAS_MOE_MIXED43=1 ignored: mixed NVFP4/W3 dual-residency does not fit \
+                 GB10 unified memory (see load_layers.rs); serving W3-only with per-layer \
+                 codebooks instead"
+            );
+        }
+    }
+    if unified_moe_layout
+        || env_on("ATLAS_HYBRID_MOE_LAYOUT")
+        || env_on("ATLAS_HOLO_MOE_GROUPED_CUTLASS")
+        || env_on("ATLAS_HOLO_MOE_GATEUP_FP4")
+        || env_on("ATLAS_HOLO_MOE_DOWN_FP4")
+    {
+        warn_once(
+            "incompatible MoE layout env (unified/hybrid/CUTLASS/FP4 prefill lanes need NVFP4 bytes)",
+        );
+        return None;
+    }
+    if config.ep_world_size > 1 {
+        warn_once("expert parallelism not supported by the W3 v1 path");
+        return None;
+    }
+    // Full W3 kernel set must be compiled into this target image.
+    let fused = |name: &str| gpu.kernel("moe_fused_w3", name).is_ok();
+    if !(fused("moe_expert_gate_up_shared_w3")
+        && fused("moe_expert_silu_down_shared_w3")
+        && fused("moe_expert_gate_up_shared_batchN_w3")
+        && fused("moe_expert_silu_down_shared_batchN_w3")
+        && gpu
+            .kernel("moe_w3a16", "moe_w3a16_grouped_gemm_ptrtable")
+            .is_ok())
+    {
+        warn_once("W3 kernels (moe_fused_w3 / moe_w3a16 modules) missing from this build");
+        return None;
+    }
+    let dir = crate::weight_map::w3cache_dir();
+    match crate::weight_map::load_w3_layer(
+        &dir,
+        layer_idx,
+        config.num_experts,
+        config.hidden_size,
+        config.moe_intermediate_size,
+        gpu,
+    ) {
+        Ok(w3) => Some(w3),
+        Err(e) => {
+            warn_once(&format!("layer {layer_idx}: {e:#}"));
+            None
+        }
+    }
+}
+
+/// FP8 attention-mirror env gate (`ATLAS_TARGET_ATTN_FP8_MIRROR=1`).
+/// Default OFF — the decode/verify dispatch stays byte-identical BF16.
+fn attn_fp8_mirror_enabled() -> bool {
+    attn_fp8_mirror_enabled_value(
+        std::env::var("ATLAS_TARGET_ATTN_FP8_MIRROR")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn attn_fp8_mirror_enabled_value(value: Option<&str>) -> bool {
     value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
@@ -249,6 +407,27 @@ fn load_attention(
     )?;
     layer.set_dimension_overrides(config.head_dim, heads, config.num_key_value_heads);
     layer.set_o_dense_bf16(o_proj);
+    // ── FP8-E4M3 row-scaled mirrors of the BF16 attention projections ──
+    // (ATLAS_TARGET_ATTN_FP8_MIRROR=1, default OFF = byte-identical BF16).
+    // Consumed only by the decode/verify GEMV/GEMM sites; prefill keeps
+    // BF16 (cuBLASLt). Soft-fails to BF16 on missing kernels or OOM.
+    if attn_fp8_mirror_enabled() {
+        let kv_width = config.num_key_value_heads * config.head_dim;
+        let bytes = layer.build_attn_fp8_mirrors(gpu, q_width, kv_width, config.hidden_size)?;
+        if bytes > 0 {
+            tracing::debug!(
+                "Laguna L{i}: FP8 attention mirrors built (+{:.1} MiB)",
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+            if i == 0 {
+                tracing::info!(
+                    "ATLAS_TARGET_ATTN_FP8_MIRROR=1: building FP8 row-scaled attention \
+                     mirrors for decode/verify (~{:.1} MiB per attention layer)",
+                    bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
+    }
     layer.set_head_gate_weight(
         dense_auto(store, &format!("{p}.g_proj.weight"), gpu)?,
         HeadGateActivation::Softplus,
@@ -389,7 +568,7 @@ fn sliding_rope_table_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::unified_moe_layout_enabled;
+    use super::{attn_fp8_mirror_enabled_value, unified_moe_layout_enabled};
 
     #[test]
     fn unified_moe_layout_is_explicitly_opt_in() {
@@ -399,5 +578,17 @@ mod tests {
         assert!(!unified_moe_layout_enabled(None));
         assert!(!unified_moe_layout_enabled(Some("0")));
         assert!(!unified_moe_layout_enabled(Some("full")));
+    }
+
+    // ATLAS_TARGET_ATTN_FP8_MIRROR is explicitly opt-in: default OFF keeps
+    // the decode/verify dispatch byte-identical to the BF16 baseline.
+    #[test]
+    fn attn_fp8_mirror_is_explicitly_opt_in() {
+        assert!(attn_fp8_mirror_enabled_value(Some("1")));
+        assert!(attn_fp8_mirror_enabled_value(Some("true")));
+        assert!(attn_fp8_mirror_enabled_value(Some("TRUE")));
+        assert!(!attn_fp8_mirror_enabled_value(None));
+        assert!(!attn_fp8_mirror_enabled_value(Some("0")));
+        assert!(!attn_fp8_mirror_enabled_value(Some("mirror")));
     }
 }

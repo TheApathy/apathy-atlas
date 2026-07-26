@@ -138,6 +138,82 @@ pub fn dense_gemm_bf16_pipelined(
         .launch(stream)
 }
 
+/// Small-M (M ≤ 16) BF16 weight-streaming GEMM — DFlash drafter fast path
+/// (kernel `dense_gemm_bf16_mtile16`, gated ATLAS_DFLASH_DRAFTER_FASTGEMM=1).
+/// Same math + I/O layout as `dense_gemm_bf16_pipelined` (C = A·Bᵀ, FP32
+/// accumulate, ascending-K m16n8k16 chain → bit-identical output), but
+/// N_TILE=64 / 4-stage cp.async ring tuned for the weight-read-bound M=γ
+/// drafter shapes. Contract: M ≤ 16, K % 8 == 0 (caller-guarded).
+/// Grid: (ceil(N/64), 1, 1)  Block: (128, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_bf16_mtile16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(
+        m <= 16,
+        "dense_gemm_bf16_mtile16 requires M <= 16 (got {m})"
+    );
+    debug_assert!(
+        k % 8 == 0,
+        "dense_gemm_bf16_mtile16 requires K % 8 == 0 (got {k})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// N_TILE=128 wide-stream sibling of `dense_gemm_bf16_mtile16` (kernel
+/// `dense_gemm_bf16_mtile16_n128`): same math / bit-identical output, 8
+/// warps, K_STEP=32, 4-stage ring. Preferred for N > 2048 — fewer, longer
+/// contiguous B streams win on LPDDR5x. Contract: M ≤ 16, K % 8 == 0.
+/// Grid: (ceil(N/128), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_bf16_mtile16_n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(
+        m <= 16,
+        "dense_gemm_bf16_mtile16_n128 requires M <= 16 (got {m})"
+    );
+    debug_assert!(
+        k % 8 == 0,
+        "dense_gemm_bf16_mtile16_n128 requires K % 8 == 0 (got {k})"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Dense BF16 prefill GEMM. Prefer the pipelined tensor-core kernel when the
 /// selected target ships it, and retain the scalar kernel as an explicit
 /// compatibility fallback for older targets.

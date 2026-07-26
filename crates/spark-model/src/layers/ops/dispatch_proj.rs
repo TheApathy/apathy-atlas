@@ -276,9 +276,7 @@ pub fn cublas_bf16_proj_dense(
     // heuristic top-16 on a side stream; verify o_proj measured 113 GB/s on
     // heuristic[0]). Same math, same precision — A/B gate only.
     static TUNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *TUNED.get_or_init(|| {
-        std::env::var("ATLAS_CUBLAS_TUNED").ok().as_deref() == Some("1")
-    }) {
+    if *TUNED.get_or_init(|| std::env::var("ATLAS_CUBLAS_TUNED").ok().as_deref() == Some("1")) {
         return spark_runtime::cublaslt::bf16_gemm_act_weight_t_tuned(
             act.0,
             weight_bf16.0,

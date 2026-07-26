@@ -37,6 +37,8 @@ mod verify_b;
 mod verify_c;
 mod verify_c2;
 mod verify_d;
+mod verify_d_tree;
+mod verify_d_tree_graph;
 mod verify_fused;
 
 impl Model for TransformerModel {
@@ -497,10 +499,7 @@ impl Model for TransformerModel {
         Ok(())
     }
 
-    fn dflash_collect_async_drafts(
-        &self,
-        seq: &mut SequenceState,
-    ) -> Result<Option<Vec<u32>>> {
+    fn dflash_collect_async_drafts(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
         let proposer = match &self.proposer {
             Some(p) => p.as_ref(),
             None => return Ok(None),
@@ -510,6 +509,36 @@ impl Model for TransformerModel {
             None => return Ok(None),
         };
         proposer.collect_async_drafts(self.gpu.as_ref(), state)
+    }
+
+    fn dflash_spec_pending(&self, seq: &mut SequenceState) -> bool {
+        let Some(proposer) = &self.proposer else {
+            return false;
+        };
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return false;
+        };
+        proposer.spec_pending(state.as_mut())
+    }
+
+    fn dflash_spec_discard(&self, seq: &mut SequenceState) -> Result<()> {
+        let Some(proposer) = &self.proposer else {
+            return Ok(());
+        };
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        proposer.spec_discard(self.gpu.as_ref(), state.as_mut())
+    }
+
+    fn dflash_spec_adopt(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
+        let Some(proposer) = &self.proposer else {
+            return Ok(None);
+        };
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return Ok(None);
+        };
+        proposer.spec_adopt_placeholder(state.as_mut())
     }
 
     fn dflash_adopt_fork_blocks(&self, seq: &mut SequenceState, adopt: bool) -> Result<()> {
@@ -524,6 +553,86 @@ impl Model for TransformerModel {
                 kv.free_block(old);
             } else {
                 kv.free_block(scratch);
+            }
+        }
+        Ok(())
+    }
+
+    fn dflash_adopt_tree_branch(
+        &self,
+        seq: &mut SequenceState,
+        winner: Option<usize>,
+    ) -> Result<()> {
+        if seq.tree_branch_scratch.is_empty() {
+            seq.tree_scratch_persistent = false;
+            return Ok(());
+        }
+        let ws = seq.hss_window_start();
+
+        // ── M5 graphed path: the scratch blocks belong to the sequence's
+        // PERSISTENT pool (`seq.tree_scratch_pool`) — captured tree graphs
+        // reference them through per-step device metadata, and the pool is
+        // reused every tree step. They must NEVER be freed or donated to
+        // the block table here. On a win, d2d-copy the winning scratch
+        // blocks' contents INTO the canonical blocks (~256 KB per block,
+        // 3-8 wins/100 steps — cheap, outside any graph): the scratch holds
+        // the committed prefix + this step's spine K/V at pre-fork depths
+        // (per-layer re-seed) plus the branch rows' K/V, so a whole-block
+        // copy leaves canonical exactly as the old swap semantics did.
+        // Losing branches need nothing — the next step re-seeds scratch.
+        if seq.tree_scratch_persistent {
+            seq.tree_scratch_persistent = false;
+            let branches = std::mem::take(&mut seq.tree_branch_scratch);
+            if let Some(w) = winner
+                && let Some(blocks) = branches.get(w)
+            {
+                let kv = self.kv_cache.lock();
+                let stream = self.gpu.default_stream();
+                for &(abs_blk, scratch) in blocks {
+                    let bt_idx = abs_blk.saturating_sub(ws);
+                    let Some(&phys) = seq.block_table.get(bt_idx) else {
+                        continue;
+                    };
+                    // Laguna: all layers are attention → kv layer index ==
+                    // layer index (same loop as the fork seeding in
+                    // verify_d.rs).
+                    for l in 0..self.layers.len() {
+                        let kb = kv.config().k_block_bytes_for_layer(l);
+                        let vb = kv.config().v_block_bytes_for_layer(l);
+                        self.gpu.copy_d2d_async(
+                            kv.k_cache_ptr(l, scratch),
+                            kv.k_cache_ptr(l, phys),
+                            kb,
+                            stream,
+                        )?;
+                        self.gpu.copy_d2d_async(
+                            kv.v_cache_ptr(l, scratch),
+                            kv.v_cache_ptr(l, phys),
+                            vb,
+                            stream,
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // ── Eager path: per-step scratch, original swap/free semantics.
+        let mut kv = self.kv_cache.lock();
+        for (bidx, blocks) in std::mem::take(&mut seq.tree_branch_scratch)
+            .into_iter()
+            .enumerate()
+        {
+            let adopt = winner == Some(bidx);
+            for (abs_blk, scratch) in blocks {
+                let bt_idx = abs_blk.saturating_sub(ws);
+                if adopt && bt_idx < seq.block_table.len() {
+                    let old = seq.block_table[bt_idx];
+                    seq.block_table[bt_idx] = scratch;
+                    kv.free_block(old);
+                } else {
+                    kv.free_block(scratch);
+                }
             }
         }
         Ok(())
@@ -571,12 +680,124 @@ impl Model for TransformerModel {
         Ok(())
     }
 
+    fn dflash_ctx_append_rows(
+        &self,
+        seq: &mut SequenceState,
+        rows: &[usize],
+        base_pos: usize,
+    ) -> Result<()> {
+        // DDTree M3 row-list ctx append. Modeled on `commit_ctx` (watermark
+        // slide first, tail append after) but copying EXPLICIT capture rows
+        // (`dflash_hidden_save[rows[j]]`) rather than the contiguous
+        // `0..num_committed` range — an accepted tree path's capture rows are
+        // its compact indices, which are non-contiguous past a fork.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let base = match self.dflash_hidden_save {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let prop = match seq.proposer_state.as_mut() {
+            Some(p) => p.as_mut(),
+            None => return Ok(()),
+        };
+        // Graceful no-op for non-DFlash proposers.
+        let d = match prop
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let n_layers = self.dflash_capture_layers.len();
+        if n_layers == 0 {
+            return Ok(());
+        }
+        // Capture-arena bound: rows at or past `dflash_hidden_save_rows`
+        // were never captured (`try_dflash_capture_all` clamps its writes) —
+        // append only the contiguous in-capacity PREFIX of the row list.
+        // A shortened ctx (a hole at the tail) degrades acceptance, never
+        // correctness; appending garbage rows would poison the drafter.
+        let kmax = self.dflash_hidden_save_rows;
+        let n_avail = rows.iter().position(|&r| r >= kmax).unwrap_or(rows.len());
+        if n_avail < rows.len() {
+            static ROWS_CLAMP_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !ROWS_CLAMP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "dflash_ctx_append_rows: row {} >= capture rows {} — appending {}/{} rows",
+                    rows[n_avail],
+                    kmax,
+                    n_avail,
+                    rows.len(),
+                );
+            }
+        }
+        if n_avail == 0 {
+            return Ok(());
+        }
+        let ctx_slot_bytes = n_layers * self.config.hidden_size * 2;
+        let stream = self.gpu.default_stream();
+
+        // Watermark slide FIRST (mirrors commit_ctx): keep the NEWEST rows,
+        // drop the oldest; keep clamped so the single D2D never overlaps.
+        if d.ctx_len + n_avail > d.max_ctx_len {
+            let keep = (d.max_ctx_len / 2).min(d.max_ctx_len.saturating_sub(n_avail));
+            let drop_n = d.ctx_len.saturating_sub(keep);
+            if drop_n > 0 {
+                let src = d.ctx_hidden_acc.offset(drop_n * ctx_slot_bytes);
+                let dst0 = d.ctx_hidden_acc.offset(0);
+                self.gpu
+                    .copy_d2d_async(src, dst0, keep * ctx_slot_bytes, stream)?;
+                d.ctx_positions.drain(..drop_n);
+                d.ctx_len = keep;
+                d.ctx_committed = 0;
+            }
+        }
+
+        // Append: row rows[j] → ctx tail, RoPE position base_pos + j (the
+        // path depths are contiguous even when the row indices are not).
+        for (j, &r) in rows.iter().take(n_avail).enumerate() {
+            let src = base.offset(r * ctx_slot_bytes);
+            let dst = d.ctx_hidden_acc.offset(d.ctx_len * ctx_slot_bytes);
+            self.gpu.copy_d2d_async(src, dst, ctx_slot_bytes, stream)?;
+            d.ctx_positions.push((base_pos + j) as i32);
+            d.ctx_len += 1;
+        }
+        // Freshest slot = the path tip (bonus generator). Block the next
+        // propose()'s internal decode-append (same as the flat appends).
+        d.skip_next_decode_append = true;
+        Ok(())
+    }
+
     fn dflash_take_block_fork(&self, seq: &mut SequenceState) -> Option<(usize, u32)> {
         seq.proposer_state
             .as_mut()?
             .as_any_mut()
             .downcast_mut::<crate::layers::DflashProposerState>()?
             .pending_block_fork
+            .take()
+    }
+
+    fn dflash_take_m0_top2(&self, seq: &mut SequenceState) -> Option<Vec<(u32, f32, u32, f32)>> {
+        seq.proposer_state
+            .as_mut()?
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()?
+            .pending_m0_top2
+            .take()
+    }
+
+    fn dflash_take_tree_payload(
+        &self,
+        seq: &mut SequenceState,
+    ) -> Option<crate::layers::DDTreePayload> {
+        seq.proposer_state
+            .as_mut()?
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()?
+            .pending_tree_payload
             .take()
     }
 

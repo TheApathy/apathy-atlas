@@ -39,6 +39,8 @@ mod quantized;
 mod ssm_qwen35;
 #[path = "weight_map/ssm_qwen35_more.rs"]
 mod ssm_qwen35_more;
+#[path = "weight_map/w3cache.rs"]
+mod w3cache;
 
 #[cfg(test)]
 #[path = "weight_map/tests.rs"]
@@ -55,6 +57,7 @@ pub use nvfp4_detect::*;
 pub use quantize_fns::*;
 pub use quantized::*;
 pub use ssm_qwen35::*;
+pub use w3cache::*;
 
 // Modules whose only exports are `pub(crate)` / `pub(super)` helpers.
 #[allow(unused_imports)]

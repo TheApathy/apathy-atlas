@@ -31,6 +31,28 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        Ok(self.forward_residual(input, None, ctx, stream)?.0)
+    }
+
+    /// [`Self::forward`] with an optional fused residual tail
+    /// (ATLAS_FUSED_ELEMWISE=1, serial M=1 — `forward_kn_residual`
+    /// precedent). When `residual` is `Some(hidden)` and the fused blend
+    /// kernel is available, the final `moe_weighted_sum_blend` +
+    /// `bf16_residual_add` pair collapses into ONE
+    /// `moe_weighted_sum_blend_residual_batchn` launch (n=1): bit-identical
+    /// `output` (same FP32 accumulation order, rounded to BF16 and still
+    /// written to `moe_output()`), then `hidden += output` exactly as the
+    /// separate residual kernel would. Returns `(output, true)` iff the
+    /// residual was folded; on `(output, false)` the caller adds the
+    /// residual itself — identical contract to `forward`. Never fuses under
+    /// EP (the routed sum must be all-reduced BEFORE the residual fold).
+    pub fn forward_residual(
+        &self,
+        input: DevicePtr,
+        residual: Option<DevicePtr>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<(DevicePtr, bool)> {
         // ── Phase 2.7 Tier C: Frankenstein decode-via-prefill dispatch ──
         // For DFlash capture layers only, when `ATLAS_FRANKENSTEIN_DECODE_VIA_PREFILL=1`
         // is set, route this layer's single-token MoE through `forward_prefill(M=1)`,
@@ -57,7 +79,7 @@ impl MoeLayer {
                 );
             }
             self.forward_prefill(input, 1, ctx, stream)?;
-            return Ok(ctx.buffers.moe_output());
+            return Ok((ctx.buffers.moe_output(), false));
         }
 
         // GeGLU models: fused kernels now have GELU activation (model-specific override).
@@ -386,12 +408,82 @@ impl MoeLayer {
                     stream,
                 )
             })?;
+        } else if self.is_w3() {
+            // W3 Lloyd-Max routed experts: same fused shape as the NVFP4
+            // path below, 3-bit routed dequant (shared slot stays NVFP4).
+            prof!("exp_gate_up_w3", {
+                ops::moe_expert_gate_up_shared_w3(
+                    ctx.gpu,
+                    self.moe_expert_gate_up_shared_w3_k,
+                    expert_input,
+                    self.gate_ptrs.packed_ptrs,
+                    self.gate_ptrs.scale_ptrs,
+                    self.gate_ptrs.scale2_vals,
+                    expert_gate_out,
+                    self.up_ptrs.packed_ptrs,
+                    self.up_ptrs.scale_ptrs,
+                    self.up_ptrs.scale2_vals,
+                    expert_up_out,
+                    indices_dev,
+                    &self.weights.shared_expert.gate_proj,
+                    shared_gate_scratch,
+                    &self.weights.shared_expert.up_proj,
+                    shared_up_scratch,
+                    inter,
+                    h,
+                    top_k,
+                    self.w3_lut_dev,
+                    stream,
+                )
+            })?;
+            prof!("exp_silu_down_w3", {
+                ops::moe_expert_silu_down_shared_w3(
+                    ctx.gpu,
+                    self.moe_expert_silu_down_shared_w3_k,
+                    expert_gate_out,
+                    expert_up_out,
+                    self.down_ptrs.packed_ptrs,
+                    self.down_ptrs.scale_ptrs,
+                    self.down_ptrs.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    &self.weights.shared_expert.down_proj,
+                    shared_out,
+                    h,
+                    inter,
+                    top_k,
+                    self.w3_lut_dev,
+                    stream,
+                )
+            })?;
         } else {
+            // ATLAS_KN_V5=1 also arms the M=1 serial-decode v5 kernels:
+            // cp.async whole-slice staged variants of the two serial NVFP4
+            // kernels below, BIT-IDENTICAL outputs (same lane partition,
+            // decode and FMA order — only the weight load path changes;
+            // microbench: moe_m1_s5_microtest at Laguna shapes M=1 top_k=10).
+            // Laguna-shape guarded: hidden % 1024 == 0 && hidden <= 3072
+            // (gate_up staging tiles), inter == 1024 (down staging tile).
+            // Falls back to the serial kernels otherwise.
+            static S5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let s5 = *S5.get_or_init(|| std::env::var("ATLAS_KN_V5").ok().as_deref() == Some("1"))
+                && self.moe_expert_gate_up_shared_v5_k.0 != 0
+                && self.moe_expert_silu_down_shared_v5_k.0 != 0
+                && h % 1024 == 0
+                && h <= 3072
+                && inter == 1024;
+            let gate_up_k = if s5 {
+                self.moe_expert_gate_up_shared_v5_k
+            } else {
+                self.moe_expert_gate_up_shared
+            };
             // NVFP4 path: fused routed+shared gate+up
             prof!("exp_gate_up", {
                 ops::moe_expert_gate_up_shared(
                     ctx.gpu,
-                    self.moe_expert_gate_up_shared,
+                    gate_up_k,
                     expert_input,
                     self.gate_ptrs.packed_ptrs,
                     self.gate_ptrs.scale_ptrs,
@@ -457,25 +549,47 @@ impl MoeLayer {
 
             // NVFP4 path: fused routed+shared silu+down
             prof!("exp_silu_down", {
-                ops::moe_expert_silu_down_shared(
-                    ctx.gpu,
-                    self.moe_expert_silu_down_shared,
-                    expert_gate_out,
-                    expert_up_out,
-                    self.down_ptrs.packed_ptrs,
-                    self.down_ptrs.scale_ptrs,
-                    self.down_ptrs.scale2_vals,
-                    expert_down_out,
-                    indices_dev,
-                    shared_gate_scratch,
-                    shared_up_scratch,
-                    &self.weights.shared_expert.down_proj,
-                    shared_out,
-                    h,
-                    inter,
-                    top_k,
-                    stream,
-                )
+                if s5 {
+                    ops::moe_expert_silu_down_shared_v5(
+                        ctx.gpu,
+                        self.moe_expert_silu_down_shared_v5_k,
+                        expert_gate_out,
+                        expert_up_out,
+                        self.down_ptrs.packed_ptrs,
+                        self.down_ptrs.scale_ptrs,
+                        self.down_ptrs.scale2_vals,
+                        expert_down_out,
+                        indices_dev,
+                        shared_gate_scratch,
+                        shared_up_scratch,
+                        &self.weights.shared_expert.down_proj,
+                        shared_out,
+                        h,
+                        inter,
+                        top_k,
+                        stream,
+                    )
+                } else {
+                    ops::moe_expert_silu_down_shared(
+                        ctx.gpu,
+                        self.moe_expert_silu_down_shared,
+                        expert_gate_out,
+                        expert_up_out,
+                        self.down_ptrs.packed_ptrs,
+                        self.down_ptrs.scale_ptrs,
+                        self.down_ptrs.scale2_vals,
+                        expert_down_out,
+                        indices_dev,
+                        shared_gate_scratch,
+                        shared_up_scratch,
+                        &self.weights.shared_expert.down_proj,
+                        shared_out,
+                        h,
+                        inter,
+                        top_k,
+                        stream,
+                    )
+                }
             })?;
         }
 
@@ -535,22 +649,55 @@ impl MoeLayer {
         } else {
             shared_out
         };
-        prof!("wsum_blend", {
-            ops::moe_weighted_sum_blend(
-                ctx.gpu,
-                self.moe_weighted_sum_blend,
-                output,
-                expert_down_out,
-                weights_dev,
-                shared_for_blend,
-                input,
-                self.weights.shared_expert_gate.weight,
-                h,
-                top_k,
-                h,
-                stream,
-            )
-        })?;
+        // ATLAS_FUSED_ELEMWISE=1 (serial M=1): fold `hidden += moe_out` into
+        // the blend launch — bit-identical to moe_weighted_sum_blend +
+        // bf16_residual_add (same FP32 accumulation order; the blend is
+        // rounded to BF16 and written to `output` exactly as before, then
+        // re-read for the residual add — see fused_verify_elemwise.cu).
+        // Skipped under EP: the routed sum is all-reduced below BEFORE any
+        // residual math may touch it.
+        let residual_fused = if let Some(hidden_resid) = residual
+            && !is_ep
+            && self.moe_blend_residual_batchn_k.0 != 0
+        {
+            prof!("wsum_blend", {
+                ops::moe_weighted_sum_blend_residual_batchn(
+                    ctx.gpu,
+                    self.moe_blend_residual_batchn_k,
+                    output,
+                    expert_down_out,
+                    weights_dev,
+                    shared_for_blend,
+                    input,
+                    self.weights.shared_expert_gate.weight,
+                    hidden_resid,
+                    h,
+                    top_k,
+                    h,
+                    1,
+                    stream,
+                )
+            })?;
+            true
+        } else {
+            prof!("wsum_blend", {
+                ops::moe_weighted_sum_blend(
+                    ctx.gpu,
+                    self.moe_weighted_sum_blend,
+                    output,
+                    expert_down_out,
+                    weights_dev,
+                    shared_for_blend,
+                    input,
+                    self.weights.shared_expert_gate.weight,
+                    h,
+                    top_k,
+                    h,
+                    stream,
+                )
+            })?;
+            false
+        };
 
         // EP all-reduce: sum partial expert outputs across ranks.
         // Each rank only computed its local experts (remote → zero), so
@@ -603,6 +750,6 @@ impl MoeLayer {
             tracing::info!("  MoE output: {:?}", vals);
         }
 
-        Ok(output)
+        Ok((output, residual_fused))
     }
 }

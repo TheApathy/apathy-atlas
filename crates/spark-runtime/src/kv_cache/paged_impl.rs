@@ -220,6 +220,18 @@ impl PagedKvCache {
             .offset(block_idx as usize * layer.v_block_stride)
     }
 
+    /// K pool per-block stride in bytes for a layer (DDTree M5: the
+    /// graphed tree verify's indirect-copy kernel indexes the pool as
+    /// `base + block_id * stride`).
+    pub fn k_block_stride(&self, layer_idx: usize) -> usize {
+        self.layers[layer_idx].k_block_stride
+    }
+
+    /// V pool per-block stride in bytes for a layer.
+    pub fn v_block_stride(&self, layer_idx: usize) -> usize {
+        self.layers[layer_idx].v_block_stride
+    }
+
     /// DEBUG: decode a BF16 KV block buffer into (sum, ssq, sabs) reductions.
     /// Each element is 2 bytes (BF16): top 16 bits of an f32. Used by
     /// `debug_kv_checksum` to fingerprint K/V without cancellation hiding a

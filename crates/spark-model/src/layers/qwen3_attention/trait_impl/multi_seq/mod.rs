@@ -26,6 +26,7 @@ mod ffn;
 mod mla;
 mod mla_gemv;
 mod qkv;
+mod tree;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
@@ -54,6 +55,12 @@ impl Qwen3AttentionLayer {
             return self.decode_multi_seq_inner_hc(c, kv_cache, ctx, stream);
         }
 
+        // ATLAS_FUSED_ELEMWISE=1: fold the post-QKV-GEMM elementwise swarm
+        // (3n scatter D2Ds + 2n per-head norms + n rope + n cache writes +
+        // n Q-gather D2Ds = 8n launches/layer) into ONE bit-identical kernel.
+        // Load/shape-stable predicate → graph-capture safe.
+        c.fused_qk_epilogue = self.ms_fused_epilogue_eligible(&c);
+
         // ── Phase 1: RMS norm + residual for N tokens ──
         ops::rms_norm_residual(
             ctx.gpu,
@@ -75,9 +82,9 @@ impl Qwen3AttentionLayer {
         // ATLAS_VERIFY_PROFILE=1 (eager): accumulate attention-vs-FFN split
         // across all layer calls; report every 48 calls (= one verify pass).
         static VP2_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let vp2 = *VP2_ENV.get_or_init(|| {
-            std::env::var("ATLAS_VERIFY_PROFILE").ok().as_deref() == Some("1")
-        }) && !ctx.graph_capture;
+        let vp2 = *VP2_ENV
+            .get_or_init(|| std::env::var("ATLAS_VERIFY_PROFILE").ok().as_deref() == Some("1"))
+            && !ctx.graph_capture;
         static ATTN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static FFN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -114,11 +121,17 @@ impl Qwen3AttentionLayer {
             // ── Phase 2: QKV projections (batch3 / batch2 / sequential) ──
             ph!(P_QKV, self.ms_phase_qkv(&c)?);
 
-            // ── Phase 3: RoPE per-sequence ──
-            ph!(P_ROPE, self.ms_phase_rope(&c, meta)?);
+            if c.fused_qk_epilogue {
+                // ── Phases 3+4 fused (+ the norms/scatter/gather the other
+                // phases skipped): one launch, bit-identical chain. ──
+                ph!(P_ROPE, self.ms_fused_qk_epilogue(&c, kv_cache, meta)?);
+            } else {
+                // ── Phase 3: RoPE per-sequence ──
+                ph!(P_ROPE, self.ms_phase_rope(&c, meta)?);
 
-            // ── Phase 4: KV cache write ──
-            ph!(P_CACHE, self.ms_phase_cache_write(&c, kv_cache, meta)?);
+                // ── Phase 4: KV cache write ──
+                ph!(P_CACHE, self.ms_phase_cache_write(&c, kv_cache, meta)?);
+            }
 
             // ── Phase 5: paged decode attention (batched) ──
             let attn_out = ph!(P_PAGED, self.ms_phase_paged_decode(&c, kv_cache, meta)?);

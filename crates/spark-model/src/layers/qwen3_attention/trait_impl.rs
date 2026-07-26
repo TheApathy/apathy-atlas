@@ -215,6 +215,30 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn decode_multi_seq_tree(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_seqs: usize,
+        kv_cache: &mut PagedKvCache,
+        spine_rows: usize,
+        reseed: &crate::layer::TreeReseed<'_>,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        self.decode_multi_seq_tree_inner(
+            hidden, residual, num_seqs, kv_cache, spine_rows, reseed, ctx, stream,
+        )
+    }
+
+    /// DDTree M5: the batched tree path exists whenever neither MLA nor
+    /// mHC routes the cache write through a fused/unsplittable phase —
+    /// mirrors the early-out in `decode_multi_seq_tree_inner`.
+    fn tree_graph_capable(&self) -> bool {
+        self.mla.is_none() && self.hc.is_none()
+    }
+
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {
         Ok(Box::new(EmptyLayerState))
     }

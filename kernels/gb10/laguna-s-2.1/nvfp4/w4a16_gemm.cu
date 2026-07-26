@@ -1397,3 +1397,572 @@ void fp8_fp8_gemm_t_m128(
         if (r1 < M && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc1[nt][3]);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Row-scaled FP8 GEMM: C[M, N] = A[M, K] @ (dequant(B_fp8[N, K]) * row_scale[N])
+//
+// Phase G (DFlash drafter): consumes weights produced by
+// `quantize_bf16_to_fp8` (per-row f32 scales — see dense_gemv_fp8w.cu:36).
+// Ported from kernels/gb10/qwen3.6-27b/nvfp4/w4a16_gemm.cu for the
+// laguna-s-2.1 target. Fully runtime-dimensioned (M, N, K) — no
+// model-specific compile-time constants; Laguna hidden_size=3072 arrives
+// via K at launch. Identical tiling and FP8 MMA to `fp8_gemm_t` above.
+// The only delta is the per-column scale multiply before the BF16
+// write-out. Each thread loads two scales (one per output column it
+// emits) and multiplies the accumulator before casting.
+//
+// Naming note: "row_scale" matches the convention from
+// `quantize_bf16_to_fp8` and `dense_gemv_fp8w` — it is a per-row scale of
+// the weight matrix B[N, K], which translates to a per-column scale of
+// the GEMM output C[M, N].
+//
+// A: [M, K] BF16, B_fp8: [N, K] FP8 E4M3, row_scale: [N] f32, C: [M, N] BF16.
+// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
+// ═══════════════════════════════════════════════════════════════════
+extern "C" __global__ void fp8_gemm_t_row_scaled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_fp8,
+    const float* __restrict__ row_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_m = blockIdx.y * M_TILE;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_T + PAD_T];
+    __shared__ unsigned char smem_B[2][N_TILE_LG][K_STEP_T];
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    #define FP8_LOADS_RS(buf, kb) do { \
+        { \
+            unsigned int a_row_base = threadIdx.x >> 2; \
+            unsigned int a_col = (threadIdx.x & 3) << 3; \
+            unsigned int gc = (kb) + a_col; \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 2; rnd++) { \
+                unsigned int row = rnd * 32 + a_row_base; \
+                unsigned int gr = cta_m + row; \
+                cp_async_pred_16(&smem_A[(buf)][row][a_col], \
+                    &A[(unsigned long long)gr * K + gc], \
+                    (gr < M) && (gc + 7 < K)); \
+            } \
+        } \
+        { \
+            unsigned int my_n = threadIdx.x; \
+            unsigned int gn = cta_n + my_n; \
+            bool valid = (gn < N) && ((kb) + 31 < K); \
+            cp_async_pred_16(&smem_B[(buf)][my_n][0], \
+                &B_fp8[(unsigned long long)gn * K + (kb)], valid); \
+            cp_async_pred_16(&smem_B[(buf)][my_n][16], \
+                &B_fp8[(unsigned long long)gn * K + (kb) + 16], valid); \
+        } \
+    } while(0)
+
+    #define FP8_COMPUTE_RS(a_buf, b_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        unsigned int fr0 = warp_m_offset + group_id, fr1 = fr0 + 8; \
+        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 16; nt++) { \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B[(b_buf)][nc][4 * tid]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B[(b_buf)][nc][16 + 4 * tid]; \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
+                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
+                 "r"(b0),"r"(b1), \
+                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
+                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+        } \
+    } while(0)
+
+    FP8_LOADS_RS(0, 0);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        FP8_LOADS_RS(nxt, k_base);
+        cp_async_commit();
+        FP8_COMPUTE_RS(cur, cur);
+        cp_async_wait_all();
+        __syncthreads();
+        cur = nxt;
+    }
+    FP8_COMPUTE_RS(cur, cur);
+
+    #undef FP8_LOADS_RS
+    #undef FP8_COMPUTE_RS
+
+    // Per-column scale multiply before BF16 write-out (Phase G delta).
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        float sc0 = (c0 < N) ? row_scale[c0] : 0.0f;
+        float sc1 = (c1 < N) ? row_scale[c1] : 0.0f;
+        if (r0 < M && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0] * sc0);
+        if (r0 < M && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1] * sc1);
+        if (r1 < M && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2] * sc0);
+        if (r1 < M && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3] * sc1);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Small-M row-scaled FP8 GEMM: same as fp8_gemm_t_row_scaled but with
+// M_TILE=16 instead of 64. Designed for the DFlash drafter lm_head
+// where M=γ=16 (one CTA per N-tile covers all M rows without waste).
+//
+// Layout: 1 warp per CTA, 32 threads. The mma.sync.aligned.m16n8k32
+// instruction produces exactly m16n8 output per warp; we do 16 nt
+// iterations along N to cover N_TILE_LG=128.
+//
+// Grid: (ceil(N/128), 1, 1)  Block: (32, 1, 1)
+//
+// vs fp8_gemm_t_row_scaled at M=16:
+//   - Same Grid X (we still cover N=128 per CTA).
+//   - 4× fewer threads per CTA (32 vs 128).
+//   - Each thread does the same work it did before, but no wasted
+//     MMA cycles on the missing M rows 16..63.
+// ═══════════════════════════════════════════════════════════════════
+extern "C" __global__ void fp8_gemm_t_row_scaled_m16(
+    const __nv_bfloat16* __restrict__ A,        // [M, K] BF16, M<=16
+    const unsigned char* __restrict__ B_fp8,    // [N, K] FP8 E4M3
+    const float* __restrict__ row_scale,         // [N] f32
+    __nv_bfloat16* __restrict__ C,              // [M, N] BF16
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    // M_TILE=16. Only one warp's worth of M rows.
+    __shared__ __nv_bfloat16 smem_A[2][16][K_STEP_T + PAD_T];
+    __shared__ unsigned char smem_B[2][N_TILE_LG][K_STEP_T];
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // Load A: 16 rows × 32 cols BF16 = 1024 bytes total.
+    // cp_async_pred_16 copies 16 BYTES = 8 BF16 values, so one copy only
+    // covers 8 of the 32 K-cols. 32 threads × 8 cols = 256 cells = HALF
+    // the 16×32 tile. Need 2 rounds so every (row, kcol) is written;
+    // omitting the 2nd round leaves cols 8..15 and 24..31 uninitialised
+    // (the Phase G EOD bug: garbage MMA inputs → 0% accept).
+    // Round r: thread t -> row=t/2, a_col=((t&1)<<4) + r*8  (0,8,16,24).
+    #define FP8_LOADS_M16(buf, kb) do { \
+        _Pragma("unroll") \
+        for (int ar = 0; ar < 2; ar++) { \
+            unsigned int row = threadIdx.x >> 1; \
+            unsigned int a_col = ((threadIdx.x & 1) << 4) + ar * 8; \
+            unsigned int gc = (kb) + a_col; \
+            unsigned int gr = row; \
+            cp_async_pred_16(&smem_A[(buf)][row][a_col], \
+                &A[(unsigned long long)gr * K + gc], \
+                (gr < M) && (gc + 7 < K)); \
+        } \
+        { \
+            /* Load 128 rows of B_fp8 × 32 K bytes = 4096 bytes. */ \
+            /* 32 threads, each grabs 4 rows × 32 = 128 bytes. */ \
+            _Pragma("unroll") \
+            for (int rnd = 0; rnd < 4; rnd++) { \
+                unsigned int my_n = rnd * 32 + threadIdx.x; \
+                unsigned int gn = cta_n + my_n; \
+                bool valid = (gn < N) && ((kb) + 31 < K); \
+                cp_async_pred_16(&smem_B[(buf)][my_n][0], \
+                    &B_fp8[(unsigned long long)gn * K + (kb)], valid); \
+                cp_async_pred_16(&smem_B[(buf)][my_n][16], \
+                    &B_fp8[(unsigned long long)gn * K + (kb) + 16], valid); \
+            } \
+        } \
+    } while(0)
+
+    // FP8 MMA — single warp does m16n8 per iteration, 16 nt iters = m16n128.
+    #define FP8_COMPUTE_M16(a_buf, b_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        unsigned int fr0 = group_id, fr1 = fr0 + 8; \
+        unsigned int a0 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid * 4]); \
+        unsigned int a1 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid * 4]); \
+        unsigned int a2 = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid * 4]); \
+        unsigned int a3 = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid * 4]); \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 16; nt++) { \
+            unsigned int nc = nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B[(b_buf)][nc][4 * tid]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B[(b_buf)][nc][16 + 4 * tid]; \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
+                 "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                :"r"(a0),"r"(a1),"r"(a2),"r"(a3), \
+                 "r"(b0),"r"(b1), \
+                 "f"(acc[nt][0]),"f"(acc[nt][1]), \
+                 "f"(acc[nt][2]),"f"(acc[nt][3])); \
+        } \
+    } while(0)
+
+    FP8_LOADS_M16(0, 0);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncwarp();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        FP8_LOADS_M16(nxt, k_base);
+        cp_async_commit();
+        FP8_COMPUTE_M16(cur, cur);
+        cp_async_wait_all();
+        __syncwarp();
+        cur = nxt;
+    }
+    FP8_COMPUTE_M16(cur, cur);
+
+    #undef FP8_LOADS_M16
+    #undef FP8_COMPUTE_M16
+
+    // Per-column scale multiply, single-warp write-out.
+    // Same emission pattern as fp8_gemm_t_row_scaled but no warp_m_offset.
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = group_id;        // 0..7
+        unsigned int r1 = r0 + 8;          // 8..15
+        float sc0 = (c0 < N) ? row_scale[c0] : 0.0f;
+        float sc1 = (c1 < N) ? row_scale[c1] : 0.0f;
+        if (r0 < M && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0] * sc0);
+        if (r0 < M && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1] * sc1);
+        if (r1 < M && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2] * sc0);
+        if (r1 < M && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3] * sc1);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Tiny-M row-scaled FP8 GEMM (M ≤ 8) — weight-read-bound design for the
+// attention FP8-mirror verify projections on GB10 (LPDDR5x ~273 GB/s).
+//
+// Shapes served (Laguna verify, M = n_verify ≤ 8):
+//   qkv:   M×[N=6144/9216 (q), nkv·hd (k/v)]×K=3072
+//   oproj: M×[N=3072]×K=6144/9216
+//
+// Why the existing kernels are ~2.3× off the bandwidth bound at M=7:
+//   - fp8_gemm_t_row_scaled (M_TILE=64): grid (N/128, 1) → only 24 CTAs
+//     at N=3072 on 48 SMs (half idle), 2-stage pipeline with 4KB/stage
+//     in flight — far too little MLP to cover LPDDR5x latency.
+//   - _m16: 1 warp/CTA, same grid → 24-72 warps on the whole GPU.
+//
+// This kernel: each CTA streams a contiguous N_TILE=64 slice of B
+// exactly once over the full K range (B bytes are ≥90% of all traffic),
+// with a 4-stage cp.async ring, K_STEP=64 → 3 stages × 4KB of B
+// permanently in flight per CTA. Grid (ceil(N/64)) = 48/96/144 CTAs at
+// N=3072/6144/9216 → exact multiples of GB10's 48 SMs. The [M≤8, K]
+// BF16 activation is streamed through smem alongside (1KB/stage; A is
+// tiny and shared by all CTAs → L2-resident, no extra DRAM traffic).
+//
+// MMA: m16n8k32.e4m3 with A-fragment rows 8..15 hard-zeroed (a1=a3=0) —
+// M≤8 means the upper half of every A fragment is dead, so we never
+// load or convert it. 4 warps × 16 cols = 64 cols/CTA; each warp does
+// 4 MMAs per 64-wide K step.
+//
+// Expected utilization: B bytes / 273 GB/s is the floor; per-CTA
+// in-flight bytes (12KB×48 CTAs ≈ 576KB) comfortably cover DRAM
+// latency, so ≥85% of peak is expected vs ~43% for the M64 tile.
+//
+// Contract (same as fp8_gemm_t_row_scaled): K % 32 == 0. M ≤ 8
+// (host-side dispatch guarantees this; rows ≥ 8 are never computed).
+//
+// A: [M, K] BF16, B_fp8: [N, K] FP8 E4M3, row_scale: [N] f32, C: [M, N] BF16.
+// Grid: (ceil(N/64), 1, 1)  Block: (128, 1, 1)
+// ═══════════════════════════════════════════════════════════════════
+
+#define M8_N_TILE 64
+#define M8_K_STEP 64
+#define M8_STAGES 4
+#define M8_A_STRIDE 72   // 64 + 8 pad elems: 144B rows, 16B-aligned, kills the
+                         // 8-way bank conflict a 128B stride would produce.
+
+__device__ __forceinline__ void cp_async_wait_prior_2() {
+    // Wait until at most 2 commit-groups are pending. With the ring below
+    // there are always exactly 3 outstanding groups before this call, so
+    // this waits precisely for the oldest (the stage about to be computed).
+    asm volatile("cp.async.wait_group 2;");
+}
+
+extern "C" __global__ void fp8_gemm_t_row_scaled_mtile8(
+    const __nv_bfloat16* __restrict__ A,        // [M, K] BF16, M <= 8
+    const unsigned char* __restrict__ B_fp8,    // [N, K] FP8 E4M3
+    const float* __restrict__ row_scale,        // [N] f32
+    __nv_bfloat16* __restrict__ C,              // [M, N] BF16
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * M8_N_TILE;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[M8_STAGES][8][M8_A_STRIDE];
+    __shared__ unsigned char smem_B[M8_STAGES][M8_N_TILE][M8_K_STEP];
+
+    // Per-lane accumulators: 2 n8 tiles per warp. acc[nt][2..3] hold mma
+    // rows 8..15 — dead for M≤8, but the mma writes them regardless.
+    float acc[2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int num_k = (K + M8_K_STEP - 1) / M8_K_STEP;
+
+    // Stage load: A = 8 rows × 64 cols BF16 (64 × 16B chunks, threads 0..63),
+    // B = 64 rows × 64 B (256 × 16B chunks, 2 per thread). False predicates
+    // zero-fill (cp.async src_bytes=0), so M/N/K edges contribute exact 0.
+    #define M8_LOAD(stage, kb) do { \
+        if (threadIdx.x < 64) { \
+            unsigned int ar = threadIdx.x >> 3; \
+            unsigned int ac = (threadIdx.x & 7) << 3; \
+            unsigned int gc = (kb) + ac; \
+            cp_async_pred_16(&smem_A[(stage)][ar][ac], \
+                &A[(unsigned long long)ar * K + gc], \
+                (ar < M) && (gc + 7 < K)); \
+        } \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 2; rnd++) { \
+            unsigned int ch = (threadIdx.x << 1) + rnd; \
+            unsigned int br = ch >> 2; \
+            unsigned int bo = (ch & 3) << 4; \
+            unsigned int gn = cta_n + br; \
+            unsigned int gk = (kb) + bo; \
+            cp_async_pred_16(&smem_B[(stage)][br][bo], \
+                &B_fp8[(unsigned long long)gn * K + gk], \
+                (gn < N) && (gk + 15 < K)); \
+        } \
+    } while (0)
+
+    // Stage compute: 2 k32 chunks × 2 n8 tiles = 4 MMAs per warp.
+    // A-fragment upper rows (a1, a3 = rows 8..15) are constant zero.
+    #define M8_COMPUTE(stage) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(stage)]; \
+        _Pragma("unroll") \
+        for (int kc = 0; kc < 2; kc++) { \
+            unsigned int kb32 = kc * 32; \
+            unsigned int a0 = bf16x4_to_e4m3x4( \
+                &sA[group_id * M8_A_STRIDE + kb32 + tid * 4]); \
+            unsigned int a2 = bf16x4_to_e4m3x4( \
+                &sA[group_id * M8_A_STRIDE + kb32 + 16 + tid * 4]); \
+            _Pragma("unroll") \
+            for (int nt = 0; nt < 2; nt++) { \
+                unsigned int nc = warp_id * 16 + nt * 8 + group_id; \
+                unsigned int b0 = *(const unsigned int*)&smem_B[(stage)][nc][kb32 + 4 * tid]; \
+                unsigned int b1 = *(const unsigned int*)&smem_B[(stage)][nc][kb32 + 16 + 4 * tid]; \
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
+                     "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                    :"r"(a0),"r"(0u),"r"(a2),"r"(0u), \
+                     "r"(b0),"r"(b1), \
+                     "f"(acc[nt][0]),"f"(acc[nt][1]), \
+                     "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            } \
+        } \
+    } while (0)
+
+    // Prologue: always commit STAGES-1 groups (empty groups are legal), so
+    // the in-loop wait_group 2 invariant holds even when num_k < STAGES-1.
+    #pragma unroll
+    for (unsigned int s = 0; s < M8_STAGES - 1; s++) {
+        if (s < num_k) M8_LOAD(s, s * M8_K_STEP);
+        cp_async_commit();
+    }
+
+    for (unsigned int s = 0; s < num_k; s++) {
+        cp_async_wait_prior_2();   // stage s landed
+        __syncthreads();           // …and is visible to all warps; also all
+                                   // warps are done computing stage s-1, so
+                                   // its buffer (= (s+3)&3) can be reloaded.
+        unsigned int pf = s + M8_STAGES - 1;
+        if (pf < num_k) M8_LOAD(pf & (M8_STAGES - 1), pf * M8_K_STEP);
+        cp_async_commit();         // always commit: keeps 3 groups in flight
+        M8_COMPUTE(s & (M8_STAGES - 1));
+    }
+
+    #undef M8_LOAD
+    #undef M8_COMPUTE
+
+    // Per-column scale multiply + BF16 write-out. Only mma rows 0..7 are
+    // real for M≤8 (acc[nt][2..3] are rows 8..15 — never emitted).
+    #pragma unroll
+    for (int nt = 0; nt < 2; nt++) {
+        unsigned int c0 = cta_n + warp_id * 16 + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = group_id;   // 0..7
+        float sc0 = (c0 < N) ? row_scale[c0] : 0.0f;
+        float sc1 = (c1 < N) ? row_scale[c1] : 0.0f;
+        if (r0 < M && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[nt][0] * sc0);
+        if (r0 < M && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[nt][1] * sc1);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// fp8_gemm_t_row_scaled_mtile8_n32 — N_TILE=32 sibling of the mtile8
+// kernel above, for the small-N / large-K mirror shapes (o_proj:
+// N=3072, K=6144/9216).
+//
+// Why: at N=3072 the N_TILE=64 kernel launches exactly 48 CTAs =
+// 1 CTA/SM on GB10. One 4-stage ring per SM (3×4KB of B in flight) is
+// not enough independent cp.async traffic to hide LPDDR5x latency —
+// the qkv shapes (N=6144/9216 → 96/144 CTAs = 2-3/SM) are where the
+// mtile8 kernel hit its measured 1.8-4.5×; the o_proj shape stalls
+// latency-bound (~19ms/48-layer eager oproj phase vs ~5 ideal).
+// Halving the N tile doubles the grid at N=3072 → 96 CTAs = 2/SM,
+// restoring 2 independent rings (6 in-flight commit groups) per SM.
+//
+// Identical MMA/accumulation chain to mtile8: same K_STEP=64 stage
+// walk, same per-stage kc=0,1 m16n8k32.e4m3 order, same f32
+// accumulators per output element → bit-identical C for any (M,N,K).
+// Only the CTA→column mapping changes (4 warps × 8 cols = 32 cols/CTA,
+// 1 n8 tile per warp instead of 2).
+//
+// Contract (same as mtile8): K % 32 == 0, M ≤ 8.
+// A: [M, K] BF16, B_fp8: [N, K] FP8 E4M3, row_scale: [N] f32, C: [M, N] BF16.
+// Grid: (ceil(N/32), 1, 1)  Block: (128, 1, 1)
+// ═══════════════════════════════════════════════════════════════════
+
+#define M8N32_N_TILE 32
+
+extern "C" __global__ void fp8_gemm_t_row_scaled_mtile8_n32(
+    const __nv_bfloat16* __restrict__ A,        // [M, K] BF16, M <= 8
+    const unsigned char* __restrict__ B_fp8,    // [N, K] FP8 E4M3
+    const float* __restrict__ row_scale,        // [N] f32
+    __nv_bfloat16* __restrict__ C,              // [M, N] BF16
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * M8N32_N_TILE;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[M8_STAGES][8][M8_A_STRIDE];
+    __shared__ unsigned char smem_B[M8_STAGES][M8N32_N_TILE][M8_K_STEP];
+
+    // Per-lane accumulators: 1 n8 tile per warp. acc[2..3] hold mma
+    // rows 8..15 — dead for M≤8, but the mma writes them regardless.
+    float acc[4];
+    acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f; acc[3] = 0.0f;
+
+    const unsigned int num_k = (K + M8_K_STEP - 1) / M8_K_STEP;
+
+    // Stage load: A = 8 rows × 64 cols BF16 (64 × 16B chunks, threads 0..63),
+    // B = 32 rows × 64 B (128 × 16B chunks, 1 per thread). False predicates
+    // zero-fill (cp.async src_bytes=0), so M/N/K edges contribute exact 0.
+    #define M8N32_LOAD(stage, kb) do { \
+        if (threadIdx.x < 64) { \
+            unsigned int ar = threadIdx.x >> 3; \
+            unsigned int ac = (threadIdx.x & 7) << 3; \
+            unsigned int gc = (kb) + ac; \
+            cp_async_pred_16(&smem_A[(stage)][ar][ac], \
+                &A[(unsigned long long)ar * K + gc], \
+                (ar < M) && (gc + 7 < K)); \
+        } \
+        { \
+            unsigned int br = threadIdx.x >> 2; \
+            unsigned int bo = (threadIdx.x & 3) << 4; \
+            unsigned int gn = cta_n + br; \
+            unsigned int gk = (kb) + bo; \
+            cp_async_pred_16(&smem_B[(stage)][br][bo], \
+                &B_fp8[(unsigned long long)gn * K + gk], \
+                (gn < N) && (gk + 15 < K)); \
+        } \
+    } while (0)
+
+    // Stage compute: 2 k32 chunks × 1 n8 tile = 2 MMAs per warp.
+    // A-fragment upper rows (a1, a3 = rows 8..15) are constant zero.
+    #define M8N32_COMPUTE(stage) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(stage)]; \
+        _Pragma("unroll") \
+        for (int kc = 0; kc < 2; kc++) { \
+            unsigned int kb32 = kc * 32; \
+            unsigned int a0 = bf16x4_to_e4m3x4( \
+                &sA[group_id * M8_A_STRIDE + kb32 + tid * 4]); \
+            unsigned int a2 = bf16x4_to_e4m3x4( \
+                &sA[group_id * M8_A_STRIDE + kb32 + 16 + tid * 4]); \
+            unsigned int nc = warp_id * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B[(stage)][nc][kb32 + 4 * tid]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B[(stage)][nc][kb32 + 16 + 4 * tid]; \
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                :"=f"(acc[0]),"=f"(acc[1]), \
+                 "=f"(acc[2]),"=f"(acc[3]) \
+                :"r"(a0),"r"(0u),"r"(a2),"r"(0u), \
+                 "r"(b0),"r"(b1), \
+                 "f"(acc[0]),"f"(acc[1]), \
+                 "f"(acc[2]),"f"(acc[3])); \
+        } \
+    } while (0)
+
+    // Prologue: always commit STAGES-1 groups (empty groups are legal), so
+    // the in-loop wait_group 2 invariant holds even when num_k < STAGES-1.
+    #pragma unroll
+    for (unsigned int s = 0; s < M8_STAGES - 1; s++) {
+        if (s < num_k) M8N32_LOAD(s, s * M8_K_STEP);
+        cp_async_commit();
+    }
+
+    for (unsigned int s = 0; s < num_k; s++) {
+        cp_async_wait_prior_2();   // stage s landed
+        __syncthreads();           // …and is visible to all warps; also all
+                                   // warps are done computing stage s-1, so
+                                   // its buffer (= (s+3)&3) can be reloaded.
+        unsigned int pf = s + M8_STAGES - 1;
+        if (pf < num_k) M8N32_LOAD(pf & (M8_STAGES - 1), pf * M8_K_STEP);
+        cp_async_commit();         // always commit: keeps 3 groups in flight
+        M8N32_COMPUTE(s & (M8_STAGES - 1));
+    }
+
+    #undef M8N32_LOAD
+    #undef M8N32_COMPUTE
+
+    // Per-column scale multiply + BF16 write-out. Only mma rows 0..7 are
+    // real for M≤8 (acc[2..3] are rows 8..15 — never emitted).
+    {
+        unsigned int c0 = cta_n + warp_id * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = group_id;   // 0..7
+        float sc0 = (c0 < N) ? row_scale[c0] : 0.0f;
+        float sc1 = (c1 < N) ? row_scale[c1] : 0.0f;
+        if (r0 < M && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[0] * sc0);
+        if (r0 < M && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[1] * sc1);
+    }
+}

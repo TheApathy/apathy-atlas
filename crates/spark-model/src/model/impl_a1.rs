@@ -94,6 +94,16 @@ impl TransformerModel {
             "dense_gemv_fp8w_batch2",
             "dense_gemv_fp8w_batch2",
         );
+        // Batched row-scaled FP8 GEMM tiers (w4a16 Phase-G kernels) for the
+        // verify lm_head when the FP8 mirror is active. try_kernel: 0-handle
+        // on targets whose w4a16 module predates them — the lm_head_batched
+        // dispatch falls back to the per-token GEMV loop.
+        let fp8_gemm_row_scaled_mtile8_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "fp8_gemm_t_row_scaled_mtile8");
+        let fp8_gemm_row_scaled_m16_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "fp8_gemm_t_row_scaled_m16");
+        let fp8_gemm_row_scaled_kernel =
+            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "fp8_gemm_t_row_scaled");
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
         let argmax_logits_kernel = gpu.kernel("argmax", "argmax_fp32")?;
@@ -299,6 +309,19 @@ impl TransformerModel {
         // EP command buffer for token broadcast (4 bytes, u32)
         let ep_cmd_buf = gpu.alloc(4)?;
 
+        // DDTree M5: indirect re-seed args buffer + kernel for the graphed
+        // tree verify. Tiny fixed allocation (132 bytes used, rounded up);
+        // its address is baked into captured tree graphs. try_kernel keeps
+        // the handle 0 on kernel sets without kv_block_indirect_copy — the
+        // graphed tree path then never engages (eager tree unaffected).
+        let tree_reseed_buf =
+            gpu.alloc(4 * (1 + 2 * crate::layers::dflash_head::ddtree::TREE_RESEED_MAX_PAIRS))?;
+        let kv_block_copy_kernel = crate::layers::try_kernel(
+            gpu.as_ref(),
+            "kv_block_indirect_copy",
+            "kv_block_indirect_copy",
+        );
+
         // Secondary stream + event for pipelining checkpoint D2D with MTP propose.
         let secondary_stream = gpu.create_stream()?;
         let secondary_event = gpu.create_event()?;
@@ -495,6 +518,9 @@ impl TransformerModel {
             w4a16_gemv_batch4_kernel,
             dense_gemv_fp8w_kernel,
             dense_gemv_fp8w_batch2_kernel,
+            fp8_gemm_row_scaled_mtile8_kernel,
+            fp8_gemm_row_scaled_m16_kernel,
+            fp8_gemm_row_scaled_kernel,
             dense_gemm_kernel,
             argmax_kernel,
             argmax_logits_kernel,
@@ -541,6 +567,9 @@ impl TransformerModel {
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
             verify4_graph: Mutex::new(std::collections::HashMap::new()),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
+            verify_tree_graph: Mutex::new(std::collections::HashMap::new()),
+            tree_reseed_buf,
+            kv_block_copy_kernel,
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             prefix_cache,
             secondary_stream,

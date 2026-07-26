@@ -28,6 +28,12 @@ pub fn step_mtp(
     // bootstrap (lossless: drafts only ever propose). `None` = sync path.
     for a in active.iter_mut() {
         if !a.pending_drafts.is_empty() {
+            // STEP_TIMING2 `collect` bucket: the event sync + pinned-buffer
+            // read blocks the scheduler thread until the async drafter
+            // launch (spec-adopt / DFLASH_ASYNC) finishes its GPU tail —
+            // per-step host time that neither STEP_TIMING bucket sees.
+            let t_collect = crate::scheduler::step_timing2::enabled()
+                .then(std::time::Instant::now);
             match model.dflash_collect_async_drafts(&mut a.seq) {
                 Ok(Some(drafts)) => a.pending_drafts = drafts,
                 Ok(None) => {}
@@ -35,6 +41,12 @@ pub fn step_mtp(
                     tracing::error!("dflash_collect_async_drafts: {e:#}");
                     a.pending_drafts.clear();
                 }
+            }
+            if let Some(t0) = t_collect {
+                crate::scheduler::step_timing2::record(
+                    crate::scheduler::step_timing2::Phase2::Collect,
+                    t0,
+                );
             }
         }
     }
@@ -98,7 +110,7 @@ pub fn step_mtp(
                     // iterations (Phase B) once k4's re-propose set pending_drafts.
                     // If init.len()<4 here the k4 re-propose likely also yields
                     // <4 → dflash never reached. Log the count + branch.
-                    if std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1") {
+                    if crate::scheduler::verify_pipeline_helper::dflash_diag_enabled() {
                         let branch = if eff >= 3 && init.len() >= 3 {
                             "k4"
                         } else if eff >= 2 && init.len() >= 2 {
@@ -159,6 +171,29 @@ pub fn step_mtp(
             // sequence emits its next token rather than stalling.
         }
 
+        // ── ATLAS_DFLASH_LOW_GEAR=1: adaptive-suspended host-draft verify ──
+        // The sequence is about to serial-decode because adaptive suspended
+        // its speculation. Before paying 1 token/step, try a FREE host-side
+        // longest-suffix n-gram draft against seq.tokens and run the graphed
+        // K=2/K=3 verify instead (≈ serial cost + one extra MoE-union row).
+        // Gate mirrors the bootstrap fast-path above (raw-argmax + no seam
+        // serial) so `spec_allowed` was ALREADY evaluated this iteration and
+        // returned false — `is_suspended` is authoritative and the re-probe
+        // cadence is untouched. Grammar sequences keep the serial path.
+        if dflash_verify_raw_argmax
+            && !crate::scheduler::verify_pipeline_helper::dflash_seam_serial_enabled()
+            && a.grammar_state.is_none()
+            && crate::scheduler::adaptive_spec::is_suspended(a)
+            && crate::scheduler::low_gear::step_low_gear(
+                model,
+                a,
+                verify_ctx,
+                dflash_verify_raw_argmax,
+            )
+        {
+            continue;
+        }
+
         // Non-DFlash path (or DFlash-propose fallback): EP broadcast + standalone decode.
         // EP: broadcast token to worker before decode (worker runs decode in lockstep).
         if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
@@ -166,6 +201,11 @@ pub fn step_mtp(
             a.finished = true;
             continue;
         }
+        let st2_serial = {
+            static LT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LT.get_or_init(|| std::env::var("ATLAS_LOOP_TRACE").ok().as_deref() == Some("1"))
+        };
+        let st2_t0 = st2_serial.then(std::time::Instant::now);
         let logits = match model.decode(a.last_token, &mut a.seq, 0) {
             Ok(l) => l,
             Err(e) => {
@@ -174,6 +214,20 @@ pub fn step_mtp(
                 continue;
             }
         };
+        let st2_dec_us = st2_t0.map(|t0| t0.elapsed().as_micros() as u64);
+        if let Some(us) = st2_dec_us {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static DEC_US: AtomicU64 = AtomicU64::new(0);
+            static N: AtomicU64 = AtomicU64::new(0);
+            DEC_US.fetch_add(us, Relaxed);
+            let n = N.fetch_add(1, Relaxed) + 1;
+            if n % 128 == 0 {
+                tracing::info!(
+                    "SERIAL_TRACE [{n}]: decode_gpu_call={:.2}ms/token",
+                    DEC_US.swap(0, Relaxed) as f64 / 128000.0,
+                );
+            }
+        }
         // Build the seq's configured penalties (rep/presence/frequency/LZ/DRY)
         // so the MTP bootstrap token sees the SAME penalties+history the
         // non-MTP path applies — the root-cause fix for repetition_penalty /
@@ -203,6 +257,10 @@ pub fn step_mtp(
         // `penalties.min_p`, which `penalty_params_for` copies from
         // `a.min_p` (request value + floor, resolved in `sampling_setup`) —
         // SSOT, no new channel. Kill-switch: ATLAS_NO_MTP_MINP=1.
+        // SERIAL_TRACE2 (b): `model.decode()` above returns in ~0.06ms (async
+        // enqueue) — the actual GPU drain lands HERE, inside the sampler's
+        // first D2H logits read. Timed separately from the post-sample tail.
+        let st2_sample_t0 = st2_serial.then(std::time::Instant::now);
         let tok = match sample_token_with_grammar(
             model,
             logits,
@@ -221,6 +279,12 @@ pub fn step_mtp(
                 continue;
             }
         };
+        let st2_sample_us = st2_sample_t0.map(|t0| t0.elapsed().as_micros() as u64);
+        // SERIAL_TRACE2 (c) starts: everything from sample return to the end
+        // of this iteration's serial block (logprobs extract, emit_token,
+        // adaptive tick, ctx-append gates, save_hidden_for_mtp, propose when
+        // un-suspended, start_checkpoint_async).
+        let st2_tail_t0 = st2_serial.then(std::time::Instant::now);
 
         // Extract logprobs from bootstrap decode logits (single position).
         let lp = if let Some(k) = a.top_logprobs {
@@ -304,6 +368,8 @@ pub fn step_mtp(
                     tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
                     a.pending_drafts = drafts;
                     a.pending_block_fork = model.dflash_take_block_fork(&mut a.seq);
+                    // DDTree M2: the tree payload rides with the drafts.
+                    a.pending_tree_payload = model.dflash_take_tree_payload(&mut a.seq);
                 }
                 Ok(_) => tracing::warn!("MTP propose returned empty"),
                 Err(e) => {
@@ -314,6 +380,15 @@ pub fn step_mtp(
 
         if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
             tracing::error!("bootstrap start_checkpoint_async: {e:#}");
+        }
+
+        // SERIAL_TRACE2: end of the serial block for this iteration. Only
+        // complete iterations record (the finished/error `continue`s above
+        // skip), so all three buckets stay per-token consistent.
+        if let (Some(dec_us), Some(sample_us), Some(tail_t0)) =
+            (st2_dec_us, st2_sample_us, st2_tail_t0)
+        {
+            serial_trace2_record(dec_us, sample_us, tail_t0.elapsed().as_micros() as u64);
         }
     }
 
@@ -348,7 +423,7 @@ pub fn step_mtp(
         // verify dispatch sees, and which branch it takes. This is THE gate
         // for step_verify_dflash firing (needs len>=4). If this logs a branch
         // other than "dflash", propose is returning <4 for Laguna.
-        if std::env::var("ATLAS_DFLASH_DIAG").ok().as_deref() == Some("1") {
+        if crate::scheduler::verify_pipeline_helper::dflash_diag_enabled() {
             let branch = if drafts.len() >= 4 {
                 "dflash (K=γ)"
             } else if num_drafts >= 3 && drafts.len() >= 3 {
@@ -409,5 +484,34 @@ pub fn step_mtp(
                 dflash_verify_raw_argmax,
             );
         }
+    }
+}
+
+/// SERIAL_TRACE2 (ATLAS_LOOP_TRACE=1, same 128-step cadence as SERIAL_TRACE):
+/// three-way split of the serial (M=1) bootstrap iteration —
+///   decode_enqueue = `model.decode()` host time (async enqueue, ~0.06ms);
+///   sample_drain   = `sample_token_with_grammar` (where the GPU drain lands);
+///   tail           = sample return → end of the serial block (logprobs,
+///                    emit_token, adaptive tick, ctx-append gates,
+///                    save_hidden_for_mtp, propose on un-suspend,
+///                    start_checkpoint_async).
+/// Sums are drained on log so each line is a clean per-128-token average.
+fn serial_trace2_record(dec_us: u64, sample_us: u64, tail_us: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static DEC_US: AtomicU64 = AtomicU64::new(0);
+    static SAMPLE_US: AtomicU64 = AtomicU64::new(0);
+    static TAIL_US: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    DEC_US.fetch_add(dec_us, Relaxed);
+    SAMPLE_US.fetch_add(sample_us, Relaxed);
+    TAIL_US.fetch_add(tail_us, Relaxed);
+    let n = N.fetch_add(1, Relaxed) + 1;
+    if n % 128 == 0 {
+        tracing::info!(
+            "SERIAL_TRACE2 [{n}]: decode_enqueue={:.2}ms sample_drain={:.2}ms tail={:.2}ms /token",
+            DEC_US.swap(0, Relaxed) as f64 / 128_000.0,
+            SAMPLE_US.swap(0, Relaxed) as f64 / 128_000.0,
+            TAIL_US.swap(0, Relaxed) as f64 / 128_000.0,
+        );
     }
 }

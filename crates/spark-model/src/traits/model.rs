@@ -621,10 +621,32 @@ pub trait Model: Send + Sync {
     /// async (second-stream) propose for this sequence, replacing its
     /// placeholder chain. `Ok(None)` = nothing pending (sync path);
     /// `Ok(Some(vec![]))` = orphaned launch → caller bootstraps (lossless).
-    fn dflash_collect_async_drafts(
-        &self,
-        _seq: &mut SequenceState,
-    ) -> Result<Option<Vec<u32>>> {
+    fn dflash_collect_async_drafts(&self, _seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// ATLAS_DFLASH_SPEC_PROPOSE: is a speculative (full-accept-bet) propose
+    /// in flight for this sequence? Fired inside the verify dispatch; the
+    /// scheduler MUST resolve it (adopt or discard) before any other propose
+    /// path touches the shared drafter scratch.
+    fn dflash_spec_pending(&self, _seq: &mut SequenceState) -> bool {
+        false
+    }
+
+    /// ATLAS_DFLASH_SPEC_PROPOSE: discard this sequence's speculative propose
+    /// (the realized accept was NOT the full-accept bet): drain the propose
+    /// stream and roll the drafter ctx watermark back to its pre-launch
+    /// snapshot. The normal ctx append + sync propose then run as usual.
+    fn dflash_spec_discard(&self, _seq: &mut SequenceState) -> Result<()> {
+        Ok(())
+    }
+
+    /// ATLAS_DFLASH_SPEC_PROPOSE: adopt this sequence's speculative propose
+    /// after a realized full accept — the optimistic ctx append becomes the
+    /// commit (callers must SKIP their own append) and the returned
+    /// placeholder chain stands in for the drafts until the next step's
+    /// `dflash_collect_async_drafts`. `Ok(None)` = nothing in flight.
+    fn dflash_spec_adopt(&self, _seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }
 
@@ -634,10 +656,39 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// DDTree M0 (ATLAS_DFLASH_TREE_M0=1): drain the per-draft top-2 stash
+    /// `(top1_tok, top1_val, top2_tok, top2_val)` for this sequence, if any.
+    fn dflash_take_m0_top2(&self, _seq: &mut SequenceState) -> Option<Vec<(u32, f32, u32, f32)>> {
+        None
+    }
+
+    /// DDTree M1 (ATLAS_DFLASH_TREE=1): drain the free-slots tree payload
+    /// stashed by the last propose call for this sequence, if any. UNUSED by
+    /// verify until the M2 milestone consumes it.
+    fn dflash_take_tree_payload(
+        &self,
+        _seq: &mut SequenceState,
+    ) -> Option<crate::layers::DDTreePayload> {
+        None
+    }
+
     /// Block-fork tree: resolve the scratch KV blocks of the last tree
     /// verify. `adopt=true` swaps them into the block table (B's chain won);
     /// `false` frees them (A won / fork missed). Default: no-op.
     fn dflash_adopt_fork_blocks(&self, _seq: &mut SequenceState, _adopt: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// DDTree M2: resolve the per-branch scratch KV blocks of the last TREE
+    /// verify (`seq.tree_branch_scratch`). `winner=None` frees every branch's
+    /// scratch — always the M2 call (the walk stays flat and branch rows are
+    /// trimmed). `Some(b)` adopts branch `b`'s scratch into the block table
+    /// and frees the rest (the M3 tree walk). Default: no-op.
+    fn dflash_adopt_tree_branch(
+        &self,
+        _seq: &mut SequenceState,
+        _winner: Option<usize>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -654,6 +705,25 @@ pub trait Model: Send + Sync {
         if base_row == 0 {
             return self.dflash_eagle_kgamma_append(seq, num_accepted, base_pos);
         }
+        Ok(())
+    }
+
+    /// DDTree M3: append drafter-ctx hidden slots for an accepted TREE path.
+    ///
+    /// `rows[j]` indexes `dflash_hidden_save` (the K_t-row capture of the
+    /// tree verify frame, filled by `try_dflash_capture_all`); the row is
+    /// stamped at RoPE position `base_pos + j`. Callers pass the rows in
+    /// root→tip order (`[0] ++ accepted compact indices`) so the freshest
+    /// ctx slot is the bonus generator (EAGLE order) — the tree analog of
+    /// `dflash_eagle_kgamma_append` / `commit_ctx`, whose contiguous
+    /// `0..=num_accepted` row range only covers spine accepts.
+    /// Default no-op for models without a DFlash drafter.
+    fn dflash_ctx_append_rows(
+        &self,
+        _seq: &mut SequenceState,
+        _rows: &[usize],
+        _base_pos: usize,
+    ) -> Result<()> {
         Ok(())
     }
 

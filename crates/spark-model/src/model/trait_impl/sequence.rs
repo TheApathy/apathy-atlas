@@ -106,6 +106,33 @@ impl TransformerModel {
                 kv.free_block(scratch);
             }
         }
+        // DDTree M2 leak backstop: per-branch scratch KV blocks from an
+        // errored tree verify (the scheduler's dflash_adopt_tree_branch call
+        // normally drains these). M5: when the entries reference the
+        // PERSISTENT pool (`tree_scratch_persistent`), just drop the
+        // references — the pool backstop below frees the blocks exactly
+        // once (freeing here too would double-free).
+        if !seq.tree_branch_scratch.is_empty() {
+            if seq.tree_scratch_persistent {
+                seq.tree_branch_scratch.clear();
+                seq.tree_scratch_persistent = false;
+            } else {
+                let mut kv = self.kv_cache.lock();
+                for branch in std::mem::take(&mut seq.tree_branch_scratch) {
+                    for (_, scratch) in branch {
+                        kv.free_block(scratch);
+                    }
+                }
+            }
+        }
+        // DDTree M5: free the sequence's persistent graphed-tree scratch
+        // pool (reserved at the first graphed tree step, reused since).
+        if !seq.tree_scratch_pool.is_empty() {
+            let mut kv = self.kv_cache.lock();
+            for block in std::mem::take(&mut seq.tree_scratch_pool) {
+                kv.free_block(block);
+            }
+        }
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later

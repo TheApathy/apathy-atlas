@@ -137,6 +137,14 @@ pub(crate) fn unified_ctx_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1"))
 }
 
+/// `ATLAS_DFLASH_EAGLE_FIX=1` (cached once). Hoisted here from raw per-step
+/// `std::env::var` reads in `verify_dflash_step` (2026-07-25 host-overhead
+/// pass) — same read-once semantics as every other gate in this module.
+pub(crate) fn eagle_fix_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1"))
+}
+
 /// Count a serially-decoded token toward the re-probe interval.
 pub(crate) fn tick_serial(a: &mut ActiveSeq) {
     if enabled() && a.spec_adapt.suspended {

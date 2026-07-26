@@ -146,7 +146,32 @@ pub struct MoeLayer {
     // v4 decoupled-silu dedup down (ATLAS_KN_V4=1; 0 when absent).
     moe_silu_precompute_batchn_k: KernelHandle,
     moe_expert_down_dedup_batchn_k: KernelHandle,
+    // v5 cp.async bulk-staged gate_up + dedup down (ATLAS_KN_V5=1; bit-
+    // identical to v2/v4 outputs, Laguna-shape guarded in forward_kn).
+    moe_expert_gate_up_shared_batchn_v5_k: KernelHandle,
+    moe_expert_down_dedup_batchn_v5_k: KernelHandle,
+    // M=1 serial-decode v5 (same ATLAS_KN_V5=1 gate; bit-identical to the
+    // serial moe_expert_gate_up_shared / moe_expert_silu_down_shared pair,
+    // cp.async whole-slice staging; Laguna-shape guarded in forward()).
+    moe_expert_gate_up_shared_v5_k: KernelHandle,
+    moe_expert_silu_down_shared_v5_k: KernelHandle,
+    // ── W3 Lloyd-Max (3-bit) routed-expert kernels (ATLAS_MOE_W3=1). ──
+    // try_kernel: KernelHandle(0) on images that don't compile the
+    // moe_fused_w3 / moe_w3a16 modules; `enable_w3` refuses to arm W3
+    // unless the FULL set resolved (the graceful stay-NVFP4 gate).
+    moe_expert_gate_up_shared_w3_k: KernelHandle,
+    moe_expert_silu_down_shared_w3_k: KernelHandle,
+    moe_expert_gate_up_shared_batchn_w3_k: KernelHandle,
+    moe_expert_silu_down_shared_batchn_w3_k: KernelHandle,
+    moe_expert_gate_up_shared_batchn_v2_w3_k: KernelHandle,
+    moe_expert_down_dedup_batchn_w3_k: KernelHandle,
+    moe_grouped_gemm_w3_k: KernelHandle,
+    /// Device `[8]` f32 Lloyd-Max codebook. NULL unless W3 is armed.
+    w3_lut_dev: DevicePtr,
     moe_weighted_sum_blend_batch2: KernelHandle,
+    /// Fused blend + residual add (ATLAS_FUSED_ELEMWISE=1, forward_kn tail).
+    /// 0 when the fused_verify_elemwise module is absent.
+    moe_blend_residual_batchn_k: KernelHandle,
     w4a16_gemv_batch2: KernelHandle,
     // K=3 fused MoE kernel handles
     moe_expert_gate_up_shared_batch3: KernelHandle,
@@ -434,6 +459,37 @@ impl MoeLayer {
         } else {
             nvfp4
         }
+    }
+
+    /// True when the routed experts are W3 Lloyd-Max (3-bit) — every
+    /// expert-weight-reading dispatch site must select a `_w3` kernel.
+    #[inline]
+    pub(crate) fn is_w3(&self) -> bool {
+        self.experts_scale_kind == crate::weight_map::WeightQuantFormat::W3LloydMax
+    }
+
+    /// Whether the full W3 kernel set resolved for this target image.
+    pub(crate) fn w3_kernels_present(&self) -> bool {
+        self.moe_expert_gate_up_shared_w3_k.0 != 0
+            && self.moe_expert_silu_down_shared_w3_k.0 != 0
+            && self.moe_expert_gate_up_shared_batchn_w3_k.0 != 0
+            && self.moe_expert_silu_down_shared_batchn_w3_k.0 != 0
+            && self.moe_grouped_gemm_w3_k.0 != 0
+    }
+
+    /// Arm the W3 (3-bit Lloyd-Max) routed-expert path: the caller has
+    /// already replaced `weights.experts` (and thus the pointer tables built
+    /// by `MoeLayer::new`) with W3 buffers from the w3cache. Fails — so the
+    /// caller can stay NVFP4 — when the `_w3` kernel set is missing.
+    pub fn enable_w3(&mut self, lut_dev: DevicePtr) -> Result<()> {
+        anyhow::ensure!(
+            self.w3_kernels_present(),
+            "W3 kernels (moe_fused_w3 / moe_w3a16 modules) not compiled into this target"
+        );
+        anyhow::ensure!(!lut_dev.is_null(), "W3 codebook device pointer is NULL");
+        self.experts_scale_kind = crate::weight_map::WeightQuantFormat::W3LloydMax;
+        self.w3_lut_dev = lut_dev;
+        Ok(())
     }
 }
 

@@ -22,6 +22,7 @@ impl BlockDiffusionDraftHead {
         embed_tokens_shared: DevicePtr,
         lm_head_shared: DevicePtr,
         lm_head_nvfp4: Option<crate::weight_map::QuantizedWeight>,
+        lm_head_fp8_shared: Option<crate::weight_map::Fp8DenseWeight>,
         target_hidden_size: usize,
         gamma: Option<usize>,
         window_size: Option<usize>,
@@ -117,6 +118,20 @@ impl BlockDiffusionDraftHead {
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             w4a16_gemm: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm"),
             dense_gemm_pipelined: gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?,
+            // Small-M (M ≤ 16) BF16 weight-streaming GEMM for the drafter's
+            // M=γ propose GEMMs (ATLAS_DFLASH_DRAFTER_FASTGEMM=1, default
+            // OFF). Lives in kernels/gb10/common/ — optional so non-gb10
+            // targets keep loading (handle 0 → pipelined fallback).
+            dense_gemm_mtile16: super::super::try_kernel(
+                gpu,
+                "dense_gemm_bf16_mtile16",
+                "dense_gemm_bf16_mtile16",
+            ),
+            dense_gemm_mtile16_n128: super::super::try_kernel(
+                gpu,
+                "dense_gemm_bf16_mtile16",
+                "dense_gemm_bf16_mtile16_n128",
+            ),
             // Qwen3.6-DFlash uses yarn RoPE — confirmed in the drafter
             // `config.json:rope_scaling.rope_type="yarn"`. Atlas's yarn
             // kernel is `rope::rope_forward_yarn`.
@@ -212,13 +227,19 @@ impl BlockDiffusionDraftHead {
                 "w4a16",
                 "fp8_gemm_t_row_scaled_m16",
             ),
+            // Weight-read-bound M≤8 tile for the FP8 lm_head tail at γ ≤ 8
+            // (one near-wall stream of the vocab×hidden mirror per propose).
+            fp8_gemm_row_scaled_mtile8: crate::layers::try_kernel(
+                gpu,
+                "w4a16",
+                "fp8_gemm_t_row_scaled_mtile8",
+            ),
             // Laguna per-head softplus attention-output gate. Module/function
             // both `softplus_gate_mul_head_broadcast` (kernels/gb10/common/
             // residual_add.cu). Only invoked when a layer has `g_proj`; still
             // resolved unconditionally so the handle is available for the
             // Laguna path (Qwen3.6-DFlash never calls it).
-            softplus_gate: gpu
-                .kernel("residual_add", "softplus_gate_mul_head_broadcast")?,
+            softplus_gate: gpu.kernel("residual_add", "softplus_gate_mul_head_broadcast")?,
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -312,9 +333,17 @@ impl BlockDiffusionDraftHead {
             aux_normed: if weights.aux_hidden_norms.is_empty() {
                 DevicePtr::NULL
             } else {
-                gpu.alloc(ctx_window * weights.config.dflash_config.as_ref()
-                    .map(|c| c.target_layer_ids.len()).unwrap_or(0)
-                    * target_hidden_size * bf16)?
+                gpu.alloc(
+                    ctx_window
+                        * weights
+                            .config
+                            .dflash_config
+                            .as_ref()
+                            .map(|c| c.target_layer_ids.len())
+                            .unwrap_or(0)
+                        * target_hidden_size
+                        * bf16,
+                )?
             },
             aux_slice: if weights.aux_hidden_norms.is_empty() {
                 DevicePtr::NULL
@@ -323,7 +352,12 @@ impl BlockDiffusionDraftHead {
             },
             // Laguna per-head gate scratch: [γ, num_q_heads] BF16. NULL unless
             // the drafter ships a per-head g_proj (Laguna only).
-            gate_buf: if weights.layers.first().map(|l| l.g_proj.is_some()).unwrap_or(false) {
+            gate_buf: if weights
+                .layers
+                .first()
+                .map(|l| l.g_proj.is_some())
+                .unwrap_or(false)
+            {
                 gpu.alloc(gamma_val * num_q_heads * bf16)?
             } else {
                 DevicePtr::NULL
@@ -580,7 +614,8 @@ impl BlockDiffusionDraftHead {
                     gate_proj: l.gate_proj,
                     up_proj: l.up_proj,
                     down_proj: l.down_proj,
-                    // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1.
+                    // Phase G — populated below if ATLAS_DFLASH_DRAFTER_FP8=1
+                    // (all seven) or ATLAS_DFLASH_DRAFTER_FP8_ATTN=1 (q/k/v/o only).
                     q_proj_fp8: None,
                     k_proj_fp8: None,
                     v_proj_fp8: None,
@@ -606,6 +641,14 @@ impl BlockDiffusionDraftHead {
             // Phase F: per-subgraph graph state — empty until the first
             // capture pass lands. Layout: [pre_0, post_0, ..., tail].
             propose_graphs: parking_lot::Mutex::new(None),
+            // ATLAS_DFLASH_PROPOSE_ONEGRAPH: single full-propose graph per
+            // slot-stable block-table pool buffer (keyed by its pointer).
+            // Empty until the first capture pass after warm-up; entries are
+            // head-lifetime — never destroyed/re-captured.
+            propose_onegraph: parking_lot::Mutex::new(Vec::new()),
+            // ONEGRAPH slot-stable block-table transport buffers; populated
+            // lazily by propose.rs, only when the ONEGRAPH gate is on.
+            bt_dev_pool: parking_lot::Mutex::new(Vec::new()),
             suppress_graphs: std::sync::atomic::AtomicBool::new(false),
             propose_warmup_count: std::sync::atomic::AtomicUsize::new(0),
             top2_out: gpu.alloc(gamma_val * 16)?,
@@ -630,29 +673,51 @@ impl BlockDiffusionDraftHead {
             head.target_layer_ids,
         );
 
-        // Phase G — opt-in drafter MLP FP8. Quantize the seven dense-GEMM
-        // weights per layer (q/k/v/o/gate/up/down) BF16 → FP8 E4M3 with
-        // per-row f32 scales. One-shot at model load; runtime hot path
-        // consumes the Fp8DenseWeight via fp8_gemm_n128 in pre/post_attn
-        // (wired in G.3). Default OFF — bit-identical to F.2 baseline.
+        // Phase G — opt-in drafter FP8. Two modes:
+        //   ATLAS_DFLASH_DRAFTER_FP8=1      — FULL: quantize all seven
+        //     dense-GEMM weights per layer (q/k/v/o/gate/up/down) plus the
+        //     shared lm_head, BF16 → FP8 E4M3 with per-row f32 scales.
+        //   ATLAS_DFLASH_DRAFTER_FP8_ATTN=1 — ATTN-ONLY: quantize only the
+        //     attention projections q/k/v/o; gate/up/down + lm_head stay
+        //     BF16. Rationale: full-FP8 accept collapse (3.09 → 2.59) is
+        //     attributed to MLP/lm_head precision loss — the target's
+        //     q/k/v/o at FP8 measured accept-neutral (3.08 vs 3.09).
+        //     Full takes precedence if both are set.
+        // One-shot at model load; runtime hot path consumes each
+        // Fp8DenseWeight via fp8_gemm_n128 in pre/post_attn, dispatched
+        // per GEMM on mirror presence. Default OFF — bit-identical to
+        // F.2 baseline.
         //
         // Acceptance gate (G.4 design doc §16.7): bench must hold
         // ≥43% accept (vs 44.9% BF16) AND ≥11.0 tok/s (vs 8.70). If hard
         // fail, layer-by-layer ablation; skip layer 0 first.
-        let fp8_requested = std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
+        let fp8_full = std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
+        let fp8_attn_only = !fp8_full
+            && std::env::var("ATLAS_DFLASH_DRAFTER_FP8_ATTN")
+                .ok()
+                .as_deref()
+                == Some("1");
+        let fp8_requested = fp8_full || fp8_attn_only;
         let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
             && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
         if fp8_requested && !fp8_kernels_present {
             tracing::warn!(
-                "ATLAS_DFLASH_DRAFTER_FP8=1 but fp8_gemm_t_row_scaled(_m16) kernels are \
+                "ATLAS_DFLASH_DRAFTER_FP8{}=1 but fp8_gemm_t_row_scaled(_m16) kernels are \
                  not in this target's w4a16 PTX module — staying on the BF16 drafter path. \
-                 Port the Phase G kernels from kernels/gb10/qwen3.6-27b/nvfp4/w4a16_gemm.cu."
+                 Port the Phase G kernels from kernels/gb10/qwen3.6-27b/nvfp4/w4a16_gemm.cu.",
+                if fp8_attn_only { "_ATTN" } else { "" }
             );
         }
         if fp8_requested && fp8_kernels_present {
             tracing::info!(
-                "DFlash Phase G: quantizing drafter weights to FP8 E4M3 ({} layers × 7 GEMMs)",
-                head.num_layers
+                "DFlash Phase G: quantizing drafter weights to FP8 E4M3 ({} layers × {} GEMMs{})",
+                head.num_layers,
+                if fp8_attn_only { 4 } else { 7 },
+                if fp8_attn_only {
+                    ", attn-only: q/k/v/o"
+                } else {
+                    ""
+                }
             );
             let stream = 0u64; // default stream — load-time, no concurrency
             let q_dim_local = q_dim;
@@ -689,51 +754,90 @@ impl BlockDiffusionDraftHead {
                             .o_proj
                             .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
                     );
-                // Gate proj: [inter, h]
-                layer.gate_proj_fp8 = Some(
-                    layer
-                        .gate_proj
-                        .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
-                );
-                // Up proj: [inter, h]
-                layer.up_proj_fp8 = Some(
-                    layer
-                        .up_proj
-                        .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
-                );
-                // Down proj: [h, inter]
-                layer.down_proj_fp8 = Some(
-                    layer
-                        .down_proj
-                        .quantize_to_fp8(gpu, quant_k, h, inter, stream)?,
-                );
+                // MLP (gate/up/down) — FULL mode only. Attn-only mode leaves
+                // the mirrors None so the per-GEMM dispatch stays on BF16.
+                if fp8_full {
+                    // Gate proj: [inter, h]
+                    layer.gate_proj_fp8 = Some(
+                        layer
+                            .gate_proj
+                            .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
+                    );
+                    // Up proj: [inter, h]
+                    layer.up_proj_fp8 = Some(
+                        layer
+                            .up_proj
+                            .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
+                    );
+                    // Down proj: [h, inter]
+                    layer.down_proj_fp8 = Some(
+                        layer
+                            .down_proj
+                            .quantize_to_fp8(gpu, quant_k, h, inter, stream)?,
+                    );
+                }
                 tracing::debug!("DFlash Phase G: layer {} quantized", layer_idx);
             }
-            // Phase G — also quantize the shared lm_head weight. It's the
-            // largest GEMM in the drafter (vocab × hidden = 248320 × 5120 ≈
-            // 1.27B weights, ~14× any per-layer GEMM). We allocate a SEPARATE
-            // FP8 buffer so we don't mutate the target model's BF16 lm_head
-            // (the BF16 ptr stays valid for the BF16 path).
-            tracing::info!(
-                "DFlash Phase G: quantizing shared lm_head [{} × {}]",
-                head.vocab_size,
-                head.hidden_size
-            );
-            let lm_head_bf16 = crate::weight_map::DenseWeight {
-                weight: head.lm_head_shared,
+            if fp8_full {
+                // Phase G — also quantize the shared lm_head weight. It's the
+                // largest GEMM in the drafter (vocab × hidden = 248320 × 5120 ≈
+                // 1.27B weights, ~14× any per-layer GEMM). We allocate a SEPARATE
+                // FP8 buffer so we don't mutate the target model's BF16 lm_head
+                // (the BF16 ptr stays valid for the BF16 path). Attn-only mode
+                // skips this: lm_head stays BF16 (mirror None → BF16 dispatch).
+                tracing::info!(
+                    "DFlash Phase G: quantizing shared lm_head [{} × {}]",
+                    head.vocab_size,
+                    head.hidden_size
+                );
+                let lm_head_bf16 = crate::weight_map::DenseWeight {
+                    weight: head.lm_head_shared,
+                };
+                head.lm_head_shared_fp8 = Some(lm_head_bf16.quantize_to_fp8(
+                    gpu,
+                    quant_k,
+                    head.vocab_size,
+                    head.hidden_size,
+                    stream,
+                )?);
+            }
+            head.quant = if fp8_full {
+                DflashQuantization::Fp8Weights
+            } else {
+                DflashQuantization::Fp8AttnWeights
             };
-            head.lm_head_shared_fp8 = Some(lm_head_bf16.quantize_to_fp8(
-                gpu,
-                quant_k,
-                head.vocab_size,
-                head.hidden_size,
-                stream,
-            )?);
-            head.quant = DflashQuantization::Fp8Weights;
             tracing::info!(
-                "DFlash Phase G: drafter weights ready as FP8 (quant = Fp8Weights). \
-                 Set ATLAS_DFLASH_DRAFTER_FP8=0 to revert to BF16."
+                "DFlash Phase G: drafter weights ready as FP8 (quant = {:?}). \
+                 Unset ATLAS_DFLASH_DRAFTER_FP8{} to revert to BF16.",
+                head.quant,
+                if fp8_attn_only { "_ATTN" } else { "" }
             );
+        }
+
+        // ATLAS_TARGET_LMHEAD_FP8 — adopt the TARGET's FP8 lm_head mirror
+        // for the propose tail. The target built it once at load
+        // (lm_head_setup.rs) from the same shared BF16 lm_head, so the
+        // drafter reuses the buffers instead of quantizing a second 308MB
+        // copy. ONLY the lm_head flips to FP8 — drafter layer GEMMs stay
+        // BF16 (head.quant unchanged), unlike the rejected full-drafter-FP8
+        // mode above (which, if active, already built its own mirror and
+        // takes precedence here). run_tail dispatches on
+        // `lm_head_shared_fp8.is_some()`, so this is the entire wiring.
+        if head.lm_head_shared_fp8.is_none()
+            && let Some(mirror) = lm_head_fp8_shared
+        {
+            if head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0 {
+                tracing::info!(
+                    "DFlash: adopting target's FP8 lm_head mirror for the propose tail \
+                     (ATLAS_TARGET_LMHEAD_FP8; drafter layer GEMMs stay BF16)"
+                );
+                head.lm_head_shared_fp8 = Some(mirror);
+            } else {
+                tracing::warn!(
+                    "DFlash: target FP8 lm_head mirror present but the w4a16 \
+                     fp8_gemm_t_row_scaled_m16 kernel is missing — propose tail stays BF16"
+                );
+            }
         }
 
         Ok(head)

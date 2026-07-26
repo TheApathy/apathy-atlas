@@ -8,7 +8,9 @@ use spark_runtime::kv_cache::KvCacheDtype;
 
 use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
-use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
+use crate::weight_map::{
+    AttentionWeights, DenseWeight, Fp8DenseWeight, QuantWeight, QuantizedWeight,
+};
 
 pub use super::types_weights::{HcWeights, MlaWeights};
 
@@ -95,6 +97,36 @@ pub struct Qwen3AttentionLayer {
     /// NVFP4 path (`attn.o_proj`). Used by Gemma-4 dense which honors
     /// Nvidia ModelOpt's official ignore list.
     pub(super) o_dense_bf16: Option<DenseWeight>,
+    // ── FP8-E4M3 row-scaled MIRROR copies of the BF16 attention projections
+    // (ATLAS_TARGET_ATTN_FP8_MIRROR=1; Laguna ships attention unquantized).
+    // Built once at load time from the BF16 source weights and consumed ONLY
+    // by the decode/verify GEMV/GEMM dispatch sites — prefill stays BF16
+    // (cuBLASLt). `None` (the default) keeps every path byte-identical to
+    // the BF16 baseline. Halves attention weight-read bandwidth on the hot
+    // decode/verify path (qkv 20.3ms + oproj 22.6ms of a 112ms verify step
+    // is pure BF16 weight bandwidth).
+    pub(super) q_fp8_mirror: Option<Fp8DenseWeight>,
+    pub(super) k_fp8_mirror: Option<Fp8DenseWeight>,
+    pub(super) v_fp8_mirror: Option<Fp8DenseWeight>,
+    pub(super) o_fp8_mirror: Option<Fp8DenseWeight>,
+    /// M=1 GEMV against an FP8 mirror (`gemv_fp8w::dense_gemv_fp8w`);
+    /// 0-handle when the kernel module is absent (mirrors never built then).
+    pub(super) dense_gemv_fp8w_k: KernelHandle,
+    /// Batched row-scaled FP8 GEMM (`w4a16::fp8_gemm_t_row_scaled`) for the
+    /// M=n verify projections; 0-handle on miss.
+    pub(super) fp8_gemm_row_scaled_k: KernelHandle,
+    /// Single-warp M_TILE=16 sibling (`w4a16::fp8_gemm_t_row_scaled_m16`)
+    /// used when M ≤ 16; 0-handle on miss (falls back to the M64 tile).
+    pub(super) fp8_gemm_row_scaled_m16_k: KernelHandle,
+    /// Weight-read-bound M ≤ 8 sibling (`w4a16::fp8_gemm_t_row_scaled_mtile8`,
+    /// N_TILE=64, 4-stage cp.async ring) for the verify projections;
+    /// 0-handle on miss (falls back to the _m16/M64 tiles).
+    pub(super) fp8_gemm_row_scaled_mtile8_k: KernelHandle,
+    /// N_TILE=32 sibling (`w4a16::fp8_gemm_t_row_scaled_mtile8_n32`) for the
+    /// small-N/large-K mirror shapes (o_proj: N=3072, K=6144/9216) where the
+    /// N_TILE=64 grid is only 48 CTAs = 1 CTA/SM; 0-handle on miss (falls
+    /// back to the N_TILE=64 mtile8 kernel). Bit-identical accumulation.
+    pub(super) fp8_gemm_row_scaled_mtile8_n32_k: KernelHandle,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
@@ -178,6 +210,11 @@ pub struct Qwen3AttentionLayer {
     /// V-only paged cache write. Used alongside the fused K-path so the
     /// K side of the cache stays single-rounded.
     pub(super) reshape_and_cache_flash_v_only_k: KernelHandle,
+    /// Fused multi-seq verify epilogue (ATLAS_FUSED_ELEMWISE=1): per-head q/k
+    /// rms_norm + yarn-scaled RoPE + paged BF16 K/V cache write in ONE launch,
+    /// bit-identical to the unfused per-row chain. 0 when the module is
+    /// absent — dispatch sites guard on `.0 != 0`.
+    pub(super) fused_qkv_norm_rope_cache_k: KernelHandle,
     /// WHT kernel for turbo KV cache.
     pub(super) wht_bf16_k: KernelHandle,
     /// Inverse WHT. With TQ_PLUS_SIGNS off this aliases the forward kernel

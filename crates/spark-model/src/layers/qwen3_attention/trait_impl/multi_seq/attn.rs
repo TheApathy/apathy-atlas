@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::ctx::MultiSeqCtx;
 use crate::layer::AttnMetadataDev;
@@ -14,6 +14,94 @@ use crate::layers::qwen3_attention::HeadGateActivation;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
 impl Qwen3AttentionLayer {
+    /// ATLAS_FUSED_ELEMWISE=1 flat-verify epilogue eligibility. Every term is
+    /// load-fixed (weights/kernels/dtypes) or capture-shape-fixed (`n`), so
+    /// the decision is stable across a CUDA-graph capture and its replays.
+    ///
+    /// Requirements mirror exactly what the fused kernel implements:
+    /// wide (n>3) contiguous-scratch QKV branch (batchn NVFP4 / FP8-mirror /
+    /// BF16-dense), ungated, no LoRA, per-head q/k norms present, table-based
+    /// yarn-scaled RoPE, BF16 paged KV cache, head_dim ≤ 256.
+    pub(super) fn ms_fused_epilogue_eligible(&self, c: &MultiSeqCtx<'_>) -> bool {
+        if !ops::fused_elemwise_enabled() || self.fused_qkv_norm_rope_cache_k.0 == 0 {
+            return false;
+        }
+        if c.n <= 3 {
+            return false; // batch2/batch3/seq branches scatter differently
+        }
+        if self.gated || self.lora.is_some() || self.mla.is_some() || self.hc.is_some() {
+            return false;
+        }
+        if self.kv_dtype != KvCacheDtype::Bf16 {
+            return false; // fused kernel writes a BF16 paged cache only
+        }
+        if self.yarn_inv_freq.is_null() {
+            return false; // plain-theta rope path not implemented in the fused kernel
+        }
+        if self.attn.q_norm.weight.is_null() || self.attn.k_norm.weight.is_null() {
+            return false;
+        }
+        if c.hd == 0 || !c.hd.is_multiple_of(2) || c.hd > 256 {
+            return false;
+        }
+        let rot = self
+            .rotary_dim_override
+            .unwrap_or(c.fwd.config.rotary_dim() as u32);
+        if rot < 2 || !rot.is_multiple_of(2) || rot > c.hd {
+            return false;
+        }
+        // Must land on a wide contiguous-scratch projection branch of
+        // `ms_phase_qkv` (they write [n, dim] GEMM outputs the fused kernel
+        // consumes). Mirrors that dispatch chain for n > 3.
+        let nvfp4 = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+            && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+            && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some();
+        let bf16_dense = self.q_weight.is_none() && !self.attn.q_proj.weight.is_null();
+        nvfp4 || self.attn_fp8_mirrors_present() || bf16_dense
+    }
+
+    /// Fused phases 3+4 (+ the deferred per-head norms, the scatter the QKV
+    /// branch skipped, and the Q gather phase 5 will skip): ONE launch over
+    /// the contiguous GEMM outputs. Bit-identical to the unfused chain — see
+    /// kernels/gb10/common/fused_verify_elemwise.cu.
+    pub(super) fn ms_fused_qk_epilogue(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        kv_cache: &PagedKvCache,
+        meta: AttnMetadataDev,
+    ) -> Result<()> {
+        // Contiguous scratch layout shared by every wide (n>3) QKV branch:
+        // Q at ssm_qkvz [n, q_dim], K at attn_output [n, kv_dim], V after K.
+        let q_scratch = c.fwd.buffers.ssm_qkvz();
+        let kv_bytes = (c.nkv * c.hd) as usize * c.bf16;
+        let k_scratch = c.fwd.buffers.attn_output();
+        let v_scratch = k_scratch.offset(c.n * kv_bytes);
+        ops::fused_qkv_norm_rope_cache_write(
+            c.fwd.gpu,
+            self.fused_qkv_norm_rope_cache_k,
+            q_scratch,
+            k_scratch,
+            v_scratch,
+            &self.attn.q_norm,
+            &self.attn.k_norm,
+            meta.positions,
+            self.yarn_inv_freq,
+            kv_cache.k_pool_ptr(self.attn_layer_idx),
+            kv_cache.v_pool_ptr(self.attn_layer_idx),
+            meta.slot,
+            c.n as u32,
+            c.nq,
+            c.nkv,
+            c.hd,
+            self.rotary_dim_override
+                .unwrap_or(c.fwd.config.rotary_dim() as u32),
+            c.bs,
+            c.eps,
+            self.yarn_attention_factor,
+            u32::from(!self.norm_vanilla),
+            c.stream,
+        )
+    }
     /// Phase 3: per-token RoPE (each sequence has its own position).
     pub(super) fn ms_phase_rope(&self, c: &MultiSeqCtx<'_>, meta: AttnMetadataDev) -> Result<()> {
         let MultiSeqCtx {
@@ -116,6 +204,61 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
+    /// Phase 4 (tree-verify variant): KV cache write restricted to rows
+    /// `[start_row, end_row)`.
+    ///
+    /// DDTree M2b: the tree verify writes bonus+spine rows into canonical
+    /// blocks FIRST, then d2d-seeds each branch's scratch blocks, then
+    /// writes the branch rows through their scratch slots. The QKV buffer
+    /// and metadata are row-indexed, so this is the same per-row loop as
+    /// [`Self::ms_phase_cache_write`] with explicit bounds. The full-range
+    /// call used by the flat multiseq path is deliberately untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ms_phase_cache_write_range(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        kv_cache: &mut PagedKvCache,
+        meta: AttnMetadataDev,
+        start_row: usize,
+        end_row: usize,
+    ) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            stream,
+            nkv,
+            hd,
+            bs,
+            bf16,
+            q_proj_bytes,
+            per_seq_qkv,
+            qkv_buf,
+            ..
+        } = *c;
+        let kv_stride = nkv * hd;
+        for i in start_row..end_row {
+            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+            let k_out_i = q_out_i.offset(q_proj_bytes);
+            let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
+            let slot_i = meta.slot.offset(i * 8); // i64 per slot
+            self.write_kv_cache(
+                fwd.gpu,
+                k_out_i,
+                v_out_i,
+                kv_cache,
+                slot_i,
+                1,
+                nkv,
+                hd,
+                bs,
+                kv_stride,
+                kv_stride,
+                stream,
+                fwd.graph_capture,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Phase 5: build contiguous Q buffer + run BATCHED paged decode.
     /// Returns the attn_out buffer pointer for downstream phases.
     pub(super) fn ms_phase_paged_decode(
@@ -139,15 +282,20 @@ impl Qwen3AttentionLayer {
             ..
         } = *c;
         // Build contiguous Q buffer [N, nq*hd] for batched attention.
+        // FUSED epilogue (ATLAS_FUSED_ELEMWISE=1): ssm_qkvz ALREADY holds the
+        // normed+roped Q contiguously (the fused kernel worked in place on the
+        // Q GEMM output there) — the per-row gather is redundant.
         let q_contiguous = fwd.buffers.ssm_qkvz();
-        for i in 0..n {
-            let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-            fwd.gpu.copy_d2d_async(
-                q_out_i,
-                q_contiguous.offset(i * q_dim as usize * bf16),
-                q_dim as usize * bf16,
-                stream,
-            )?;
+        if !c.fused_qk_epilogue {
+            for i in 0..n {
+                let q_out_i = qkv_buf.offset(i * per_seq_qkv);
+                fwd.gpu.copy_d2d_async(
+                    q_out_i,
+                    q_contiguous.offset(i * q_dim as usize * bf16),
+                    q_dim as usize * bf16,
+                    stream,
+                )?;
+            }
         }
         let attn_out = fwd.buffers.attn_output();
         let inv_sqrt_d = self.effective_attn_scale(hd);
@@ -289,7 +437,27 @@ impl Qwen3AttentionLayer {
         }
 
         let o_out = fwd.buffers.moe_output();
-        if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
+        if let Some(o_mirror) = self.o_fp8_mirror.as_ref()
+            && self.fp8_gemm_row_scaled_k.0 != 0
+        {
+            // FP8 MIRROR batched O projection (ATLAS_TARGET_ATTN_FP8_MIRROR):
+            // one row-scaled FP8 GEMM reads the o_proj mirror ONCE for all n
+            // rows at half the BF16 weight bytes. Checked BEFORE the
+            // o_dense_bf16 branch below. attn_out is contiguous [n, q_dim],
+            // o_out contiguous [n, h] — same layout the BF16 GEMM uses. Both
+            // the flat multiseq verify and the batched tree verify land here
+            // (tree.rs reuses this phase fn).
+            self.fp8_mirror_gemm(
+                fwd.gpu,
+                attn_out,
+                o_mirror,
+                o_out,
+                n as u32,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
+        } else if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
             // ATLAS_FP8_DEQUANT_ATTN_TO_BF16: O-proj dequanted to BF16 at load.
             // attn_out is contiguous [n, q_dim] and o_out is [n, h], so a single
             // batched GEMM reads the BF16 o_proj weight ONCE for all n sequences

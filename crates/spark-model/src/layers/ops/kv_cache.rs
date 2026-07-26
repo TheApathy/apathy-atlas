@@ -41,7 +41,115 @@ pub fn fill_slots_from_block_table(
         .launch(stream)
 }
 
+/// DDTree M5 — graph-capturable canonical→scratch KV block re-seed.
+///
+/// Copies `meta[0]` (device-read) block pairs `src → dst` within one
+/// layer's K and V pools. Block IDs ride in the `meta` device buffer
+/// (uploaded pre-replay), so the launch has NO per-step host pointers and
+/// can be captured in a CUDA graph. `max_pairs` sizes the baked grid; a
+/// replay with fewer pairs exits the surplus blocks via the device count.
+///
+/// Kernel: `kv_block_indirect_copy(k_pool, v_pool, k_stride, v_stride,
+///          k_bytes, v_bytes, meta)`
+/// Grid: (chunks, max_pairs, 2)  Block: (256, 1, 1) — z: 0 = K, 1 = V.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_block_indirect_copy(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    k_pool: DevicePtr,
+    v_pool: DevicePtr,
+    k_stride: usize,
+    v_stride: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+    meta: DevicePtr,
+    max_pairs: u32,
+    stream: u64,
+) -> Result<()> {
+    if max_pairs == 0 {
+        return Ok(());
+    }
+    debug_assert!(k_bytes % 16 == 0 && v_bytes % 16 == 0);
+    let n16 = (k_bytes.max(v_bytes) as u32) >> 4;
+    let chunks = div_ceil(n16.max(1), 256).clamp(1, 64);
+    KernelLaunch::new(gpu, kernel)
+        .grid([chunks, max_pairs, 2])
+        .block([256, 1, 1])
+        .arg_ptr(k_pool)
+        .arg_ptr(v_pool)
+        .arg_u64(k_stride as u64)
+        .arg_u64(v_stride as u64)
+        .arg_u32(k_bytes as u32)
+        .arg_u32(v_bytes as u32)
+        .arg_ptr(meta)
+        .launch(stream)
+}
+
 // ── KV cache ───────────────────────────────────────────────────────
+
+/// Fused multi-seq verify epilogue: per-head q/k rms_norm → yarn-scaled
+/// RoPE → paged BF16 cache write (K) + verbatim V cache write, all rows and
+/// heads in ONE launch. Bit-identical to the unfused chain
+/// (`rms_norm[_vanilla]` per head-row → `rope_forward_yarn_scaled` per row →
+/// `reshape_and_cache_flash` per row) — see
+/// kernels/gb10/common/fused_verify_elemwise.cu for the exactness contract.
+///
+/// `q` is normed+roped IN PLACE in its contiguous [n, nq*hd] GEMM-output
+/// layout (which is also the paged-decode Q input), replacing the per-row
+/// scatter → norms → rope → gather round-trip through `qkv_buf`.
+///
+/// Kernel: `fused_qkv_norm_rope_cache_write_bf16`
+/// Grid: (nq + 2*nkv, n, 1)  Block: (head_dim, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn fused_qkv_norm_rope_cache_write(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr, // [n, nq*hd] BF16, in/out
+    k: DevicePtr, // [n, nkv*hd] BF16
+    v: DevicePtr, // [n, nkv*hd] BF16
+    q_norm_w: &DenseWeight,
+    k_norm_w: &DenseWeight,
+    positions: DevicePtr, // u32 [n]
+    inv_freq: DevicePtr,  // f32 [rotary_dim/2]
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    slot_mapping: DevicePtr, // i64 [n]
+    n: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    block_size: u32,
+    eps: f32,
+    attention_factor: f32,
+    norm_offset_one: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(head_dim.is_multiple_of(2) && head_dim <= 256);
+    debug_assert!(rotary_dim >= 2 && rotary_dim.is_multiple_of(2) && rotary_dim <= head_dim);
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads + 2 * num_kv_heads, n, 1])
+        .block([head_dim, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(v)
+        .arg_ptr(q_norm_w.weight)
+        .arg_ptr(k_norm_w.weight)
+        .arg_ptr(positions)
+        .arg_ptr(inv_freq)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(slot_mapping)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(rotary_dim)
+        .arg_u32(block_size)
+        .arg_f32(eps)
+        .arg_f32(attention_factor)
+        .arg_u32(norm_offset_one)
+        .launch(stream)
+}
 
 /// Write K/V to paged FP8 cache using slot_mapping.
 ///

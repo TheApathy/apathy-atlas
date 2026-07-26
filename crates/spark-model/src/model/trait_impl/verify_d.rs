@@ -47,6 +47,21 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+
+        // ── DDTree M2 (ATLAS_DFLASH_TREE=1): tree-shaped verify rows ──
+        // The payload's PRESENCE is the gate — when no payload was staged
+        // (env unset, or the scheduler passed nothing) this take() is None
+        // and the flat path below is byte-identical to before. Gate failures
+        // inside try_decode_verify_tree return Ok(None) → flat fallback
+        // (payload dropped, any scratch already reclaimed). Tree steps run
+        // EAGER inside try_decode_verify_tree; cached flat graphs are
+        // untouched.
+        if let Some(tree_payload) = seq.tree_payload.take()
+            && let Some(out) = self.try_decode_verify_tree(tokens, seq, &tree_payload)?
+        {
+            return Ok(out);
+        }
+
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -69,18 +84,22 @@ impl TransformerModel {
         // copy-on-write blocks so the two chains never collide at the same
         // positions. Flat path (fork = None) is byte-identical to before.
         static BLOCKFORK_V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let blockfork_on = *BLOCKFORK_V.get_or_init(|| {
-            std::env::var("ATLAS_DFLASH_BLOCKFORK").ok().as_deref() == Some("1")
-        });
+        let blockfork_on = *BLOCKFORK_V
+            .get_or_init(|| std::env::var("ATLAS_DFLASH_BLOCKFORK").ok().as_deref() == Some("1"));
         let hss_early = kv_cache.config().cache_blocks_per_seq.is_some();
         // The sliding-layer per-row fallback only processes chain-A rows; B
         // rows would carry garbage logits and corrupt the walk. Fork only
         // when every layer routes through decode_multi_seq.
-        let all_multiseq_on =
-            std::env::var("ATLAS_DFLASH_ALL_MULTISEQ").ok().as_deref() == Some("1");
+        // (Env read cached once — this fired on EVERY verify step.)
+        static ALL_MULTISEQ_V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let all_multiseq_on = *ALL_MULTISEQ_V.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_ALL_MULTISEQ").ok().as_deref() == Some("1")
+        });
         let fork = if blockfork_on && !hss_early && all_multiseq_on {
             // arena rows cap 20 (sizes.rs dflash_k); cliff must index drafts
-            seq.block_fork.take().filter(|(c, _)| c + 2 <= k && 2 * k <= 20)
+            seq.block_fork
+                .take()
+                .filter(|(c, _)| c + 2 <= k && 2 * k <= 20)
         } else {
             seq.block_fork = None;
             None
@@ -100,6 +119,13 @@ impl TransformerModel {
         };
         let kt = tokens_all.len();
 
+        // STEP_TIMING3 (rides ATLAS_LOOP_TRACE=1): split verify wall into
+        // pre-graph host / graph-launch->D2H-sync / post bookkeeping.
+        let st3 = {
+            static LT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LT.get_or_init(|| std::env::var("ATLAS_LOOP_TRACE").ok().as_deref() == Some("1"))
+        };
+        let st3_t0 = st3.then(std::time::Instant::now);
         // ── Phase 1: Pre-graph (varies per step, NOT captured) ──
 
         // 1a. Embed all verify rows (A chain, then the B fork chain).
@@ -161,7 +187,8 @@ impl TransformerModel {
                     )?;
                 }
                 fork_scratch_abs.push((ab, scratch));
-                seq.block_fork_scratch.push((ab.saturating_sub(ws), scratch));
+                seq.block_fork_scratch
+                    .push((ab.saturating_sub(ws), scratch));
             }
         }
 
@@ -190,8 +217,11 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
 
-        let seq_lens: Vec<i32> = (0..kt).map(|t| (seq.seq_len + (t % k) + 1) as i32).collect();
-        let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, kt * 4) };
+        let seq_lens: Vec<i32> = (0..kt)
+            .map(|t| (seq.seq_len + (t % k) + 1) as i32)
+            .collect();
+        let sl_bytes =
+            unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, kt * 4) };
         self.gpu
             .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
 
@@ -241,7 +271,11 @@ impl TransformerModel {
         // ATLAS_DFLASH_DEBUG_NO_GRAPH=1 forces eager (no graph capture) so
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
-        let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        // (Env read cached once — this fired on EVERY verify step.)
+        static FORCE_EAGER_V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let force_eager = *FORCE_EAGER_V.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+        });
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = self.comm.is_none()
@@ -262,7 +296,11 @@ impl TransformerModel {
             // can split the ~682ms/step into attention vs MoE. Gated on `!use_graphs`
             // because `prof!` calls `synchronize()`, illegal mid graph-capture — so
             // it only fires in eager mode (pair with ATLAS_DFLASH_DEBUG_NO_GRAPH=1).
-            profile: !use_graphs && std::env::var("ATLAS_PROFILE").is_ok(),
+            // (Env read cached once — this fired on EVERY verify step.)
+            profile: !use_graphs && {
+                static PROFILE_V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *PROFILE_V.get_or_init(|| std::env::var("ATLAS_PROFILE").is_ok())
+            },
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -271,6 +309,7 @@ impl TransformerModel {
             midchunk_capture: None,
         };
 
+        let st3_t1 = st3.then(std::time::Instant::now);
         // ── Phase 2: CUDA graph capture / replay ──
 
         let mut graph_cache = if use_graphs {
@@ -287,6 +326,25 @@ impl TransformerModel {
             && graph.0 != 0
         {
             self.gpu.launch_graph(graph, stream)?;
+            // ── ATLAS_DFLASH_SPEC_PROPOSE: speculative propose ‖ verify tail.
+            // The verify GPU work is now ENQUEUED but the blocking D2H below
+            // has not run. On the full-accept bet, everything the next
+            // propose needs is (or will be) on-device: the per-row tap-layer
+            // captures land in dflash_hidden_save inside the graph, and
+            // last_token = the argmax of row k-1. Enqueue the drafter forward
+            // on the dedicated propose stream, ordered after this graph via
+            // event — the scheduler adopts on realized full accept or
+            // discards (drain + ctx-watermark rollback) otherwise. Cached-
+            // replay steps only: a first-capture step must not run alongside
+            // a global-mode stream capture, and eager verify has no argmax-
+            // in-graph guarantee worth betting on. Flat frames only (no
+            // block-fork rows — the argmax row layout must be [0..k)).
+            if fork.is_none()
+                && crate::layers::dflash_head::spec_propose::dflash_spec_enabled()
+                && let Err(e) = self.try_dflash_spec_propose_fire(k, seq)
+            {
+                tracing::warn!("DFLASH_SPEC fire failed (sync propose will cover): {e:#}");
+            }
         }
         let need_run = cached_for_slot.is_none();
         if need_run {
@@ -299,7 +357,13 @@ impl TransformerModel {
                     }
                 }
                 (0..kt)
-                    .map(|t| if t >= k { fork_table.clone() } else { seq.block_table.clone() })
+                    .map(|t| {
+                        if t >= k {
+                            fork_table.clone()
+                        } else {
+                            seq.block_table.clone()
+                        }
+                    })
                     .collect()
             };
 
@@ -309,8 +373,8 @@ impl TransformerModel {
 
             // ATLAS_VERIFY_PROFILE=1 (eager only): per-layer sync timing of the
             // K=γ verify loop — itemizes the step against the bandwidth floor.
-            let vprof = !use_graphs
-                && std::env::var("ATLAS_VERIFY_PROFILE").ok().as_deref() == Some("1");
+            let vprof =
+                !use_graphs && std::env::var("ATLAS_VERIFY_PROFILE").ok().as_deref() == Some("1");
             let mut vprof_attn_us = 0u64;
             let mut vprof_slide_us = 0u64;
             let vprof_t0 = std::time::Instant::now();
@@ -498,6 +562,7 @@ impl TransformerModel {
             }
         }
 
+        let st3_t2 = st3.then(std::time::Instant::now);
         // ── Phase 3: Post-graph (D2H copy only) ──
 
         let out_ptr = self.buffers.scratch();
@@ -514,6 +579,25 @@ impl TransformerModel {
             ]));
         }
 
+        if let (Some(t0), Some(t1), Some(t2)) = (st3_t0, st3_t1, st3_t2) {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static PRE_US: AtomicU64 = AtomicU64::new(0);
+            static GPU_US: AtomicU64 = AtomicU64::new(0);
+            static N: AtomicU64 = AtomicU64::new(0);
+            let now = std::time::Instant::now();
+            PRE_US.fetch_add((t1 - t0).as_micros() as u64, Relaxed);
+            GPU_US.fetch_add((t2 - t1).as_micros() as u64, Relaxed);
+            // D2H+decode tail measured by caller-side wall minus these.
+            let n = N.fetch_add(1, Relaxed) + 1;
+            if n % 128 == 0 {
+                tracing::info!(
+                    "STEP_TIMING3 [{n}]: pre_graph={:.2}ms graph_to_sync_start={:.2}ms d2h_tail={:.2}ms",
+                    PRE_US.swap(0, Relaxed) as f64 / 128000.0,
+                    GPU_US.swap(0, Relaxed) as f64 / 128000.0,
+                    (now - t2).as_micros() as f64 / 1000.0,
+                );
+            }
+        }
         // See decode_verify_graphed for rationale on `seq_len += k` fix.
         for &t in tokens {
             seq.tokens.push(t);
@@ -521,5 +605,78 @@ impl TransformerModel {
         seq.seq_len += k;
 
         Ok(out)
+    }
+
+    /// ATLAS_DFLASH_SPEC_PROPOSE fire: hand the verify's on-device outputs to
+    /// the drafter head for the enqueue-only speculative launch. Called with
+    /// the verify graph enqueued and `seq.seq_len` still at its PRE-verify
+    /// value (the RoPE/ctx stamp base for the optimistic full-accept append).
+    ///
+    /// Model-side gates (the head applies its own env/readiness gates):
+    ///   * capture-all must be live (EAGLE_FIX / UNIFIED_CTX) — without it
+    ///     `dflash_hidden_save` holds only the k-1 row, not all k rows;
+    ///   * k must fit the capture arena;
+    ///   * rank-0 / no-comm (use_graphs already implies comm.is_none()).
+    fn try_dflash_spec_propose_fire(&self, k: usize, seq: &mut SequenceState) -> Result<bool> {
+        static CAPTURE_ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let capture_all = *CAPTURE_ALL.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1")
+                || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1")
+        });
+        if !capture_all {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "DFLASH_SPEC: requires ATLAS_DFLASH_UNIFIED_CTX=1 or ATLAS_DFLASH_EAGLE_FIX=1 \
+                     (all-k-row capture) — speculative propose stays off"
+                );
+            }
+            return Ok(false);
+        }
+        let Some(hidden_save) = self.dflash_hidden_save else {
+            return Ok(false);
+        };
+        if k == 0 || k > self.dflash_hidden_save_rows || self.dflash_capture_layers.is_empty() {
+            return Ok(false);
+        }
+        if let Some(ref c) = self.comm
+            && c.rank() != 0
+        {
+            return Ok(false);
+        }
+        let Some(proposer) = self.proposer.clone() else {
+            return Ok(false);
+        };
+        // Bonus slot on full accept = verify argmax of the LAST row (k-1),
+        // written by the graph into the scratch argmax region.
+        let device_last_token = self.buffers.scratch().offset((k - 1) * 4);
+        let base_pos = seq.seq_len; // pre-verify (advanced only at dispatch end)
+        let fctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            attn_metadata: None,
+            profile: false,
+            comm: None,
+            graph_capture: false,
+            gdn_exact_replay: false,
+            token_ids: None,
+            routed_lora_layers: None,
+            midchunk_capture: None,
+        };
+        let Some(state) = seq.proposer_state.as_mut() else {
+            return Ok(false);
+        };
+        proposer.spec_propose_launch(
+            self.gpu.as_ref(),
+            self.gpu.default_stream(),
+            device_last_token,
+            hidden_save,
+            k,
+            base_pos,
+            state.as_mut(),
+            &fctx,
+        )
     }
 }

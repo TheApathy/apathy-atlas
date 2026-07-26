@@ -228,6 +228,10 @@ impl TransformerModel {
             disk_last_offloaded_per_layer: vec![0; num_attn_layers],
             block_fork: None,
             block_fork_scratch: Vec::new(),
+            tree_payload: None,
+            tree_branch_scratch: Vec::new(),
+            tree_scratch_pool: Vec::new(),
+            tree_scratch_persistent: false,
         })
     }
 

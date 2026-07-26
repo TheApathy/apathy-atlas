@@ -72,7 +72,38 @@ pub(super) fn setup_lm_heads(
         );
         Some(q)
     } else if config.skip_lm_head_quantization() {
-        tracing::info!("LM head kept as BF16 (skip NVFP4 quantization per model config)");
+        // ATLAS_TARGET_LMHEAD_FP8=1 — FP8-E4M3 row-scaled MIRROR of the
+        // BF16-kept LM head (Laguna: [100352 × 3072] BF16 = 616MB read once
+        // per verify step and once per drafter propose; the mirror halves
+        // that to 308MB). Built exactly like the attention mirrors
+        // (`quantize_bf16_to_fp8` once at load); the BF16 weight stays
+        // resident and is still what the drafter shares when its own gate
+        // is off. Dispatch: `lm_head_fp8.is_some()` flips every LM-head
+        // site (verify `lm_head_batched`, decode `lm_head`, and — via the
+        // shared-mirror plumbing in build.rs — the DFlash propose tail).
+        // Numerics: logit perturbation is EAR-class (accept-rate must be
+        // measured serve-side); default OFF, independent of
+        // ATLAS_TARGET_ATTN_FP8_MIRROR so it A/Bs on its own.
+        if std::env::var("ATLAS_TARGET_LMHEAD_FP8").ok().as_deref() == Some("1") {
+            let quantize_fp8_k = gpu.kernel("gemv_fp8w", "quantize_bf16_to_fp8")?;
+            let q = quantize_to_fp8(
+                lm_head,
+                config.vocab_size,
+                config.hidden_size,
+                gpu,
+                quantize_fp8_k,
+                stream,
+            )?;
+            tracing::info!(
+                "LM head kept as BF16 + FP8 E4M3 row-scaled mirror built \
+                 (ATLAS_TARGET_LMHEAD_FP8=1, vocab={}, {}MB mirror)",
+                config.vocab_size,
+                config.vocab_size * config.hidden_size / (1024 * 1024),
+            );
+            lm_head_fp8 = Some(q);
+        } else {
+            tracing::info!("LM head kept as BF16 (skip NVFP4 quantization per model config)");
+        }
         None
     } else if config.lm_head_fp8 {
         // Runtime FP8 head. `quantize_bf16_to_fp8` (module `gemv_fp8w`) writes

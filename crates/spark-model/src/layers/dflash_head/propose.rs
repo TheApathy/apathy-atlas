@@ -30,9 +30,21 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        // ATLAS_DFLASH_SPEC_PROPOSE error-path safety net: the normal
+        // lifecycle resolves a speculative launch (adopt/discard) inside
+        // step_verify_dflash BEFORE any propose runs; if an error path left
+        // one dangling, drain it (sync + watermark rollback) here before this
+        // sync propose touches the shared drafter scratch.
+        if super::spec_propose::dflash_spec_enabled() {
+            self.resolve_async_inflight_impl(ctx.gpu, Some(&mut *dstate))?;
+        }
         // Block-fork (doc 16): never carry a stale fork across proposes —
         // source paths (SAM/echo/recycle) have no fresh drafter logits.
         dstate.pending_block_fork = None;
+        // DDTree M0: same staleness rule for the top-2 measurement stash.
+        dstate.pending_m0_top2 = None;
+        // DDTree M1: never carry a stale tree payload across proposes.
+        dstate.pending_tree_payload = None;
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator at propose entry ──
         // Gated ATLAS_DFLASH_CTX_PARITY_DUMP=1. One-shot. Writes the ENTIRE
@@ -310,7 +322,31 @@ impl BlockDiffusionDraftHead {
                     .iter()
                     .flat_map(|b| b.to_le_bytes())
                     .collect();
-                let bt_dev = ctx.gpu.alloc(bt_bytes.len())?;
+                // ONEGRAPH slot-stable transport: borrow a head-lifetime
+                // buffer from `bt_dev_pool` (or allocate one at the head-max
+                // size — identical for every sequence) so the pointer baked
+                // into the captured onegraph stays valid across sequences;
+                // the H2D below overwrites the CONTENTS with this sequence's
+                // block ids before any replay. Default (gate off): fresh
+                // per-sequence alloc, freed in free_state — byte-identical
+                // to pre-ONEGRAPH behavior.
+                let bt_dev = if super::dflash_propose_onegraph_enabled() {
+                    let pool_bytes = self.bt_pool_buf_bytes();
+                    anyhow::ensure!(
+                        bt_bytes.len() <= pool_bytes,
+                        "DFlash Option B: block table ({} B) exceeds ONEGRAPH \
+                         pool buffer size ({} B) — bt_pool_buf_bytes formula \
+                         drifted from the lazy-init blocks_needed formula",
+                        bt_bytes.len(),
+                        pool_bytes,
+                    );
+                    match self.bt_dev_pool.lock().pop() {
+                        Some(p) => p,
+                        None => ctx.gpu.alloc(pool_bytes)?,
+                    }
+                } else {
+                    ctx.gpu.alloc(bt_bytes.len())?
+                };
                 ctx.gpu.copy_h2d(&bt_bytes, bt_dev)?;
                 dstate.block_table_dev = Some(bt_dev);
                 dstate.max_ctx_count_drafter = blocks_needed * BLOCK_SIZE;
@@ -578,8 +614,7 @@ impl BlockDiffusionDraftHead {
             // attribute the previous step's accept to retrieval; cool down on
             // consecutive misfires (measured on atlas-src: counting content
             // regressed 77→65 without this — runs match, next number is new).
-            let adaptive =
-                std::env::var("ATLAS_DFLASH_SAM_ADAPTIVE").ok().as_deref() != Some("0");
+            let adaptive = std::env::var("ATLAS_DFLASH_SAM_ADAPTIVE").ok().as_deref() != Some("0");
             if adaptive {
                 let min_accept: usize = std::env::var("ATLAS_DFLASH_SAM_MIN_ACCEPT")
                     .ok()
@@ -609,6 +644,57 @@ impl BlockDiffusionDraftHead {
             let retr_suppressed = adaptive && dstate.retr_cooldown > 0;
             if dstate.retr_cooldown > 0 {
                 dstate.retr_cooldown -= 1;
+            }
+            // ── WIDE retrieval mega-block (ATLAS_DFLASH_RETR_WIDE=N, 0=off) ──
+            // On a STRONG suffix match with N follow-on tokens available,
+            // propose N drafts (N up to 19 → K=N+1 verify rows, dflash_k=20
+            // arena cap) instead of γ-1. One weight sweep then verifies a
+            // whole copied span — code-edit workloads commit 15-19 tokens in
+            // a single ~1.5x-cost step. Lossless: proposal-only; a misfire
+            // costs one wide verify and feeds the same misfire cooldown.
+            // Gated on match_len >= RETR_WIDE_MIN (default 12: strong
+            // evidence only — a wide misfire is ~2x a normal step).
+            static WIDE_N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let wide_n = *WIDE_N.get_or_init(|| {
+                std::env::var("ATLAS_DFLASH_RETR_WIDE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0usize)
+                    .min(19)
+            });
+            static WIDE_MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let wide_min = *WIDE_MIN.get_or_init(|| {
+                std::env::var("ATLAS_DFLASH_RETR_WIDE_MIN")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(12usize)
+            });
+            if !retr_suppressed && wide_n > source_gamma_eff && rcfg.sam {
+                let wide_cfg = super::retrieval::RetrievalConfig {
+                    draft_count: wide_n,
+                    ..rcfg
+                };
+                if let Some(hit) =
+                    super::retrieval::retrieve_longest(&dstate.pld_tokens, last_token, &wide_cfg)
+                    && hit.match_len >= wide_min.max(rcfg.hybrid_min)
+                    && hit.drafts.len() == wide_n
+                {
+                    static WIDE_DBG: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let nw = WIDE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if nw <= 4 || nw % 64 == 0 {
+                        tracing::info!(
+                            "DFlash RETR_WIDE fire #{nw}: match_len={} drafts={} (K={})",
+                            hit.match_len,
+                            hit.drafts.len(),
+                            hit.drafts.len() + 1,
+                        );
+                    }
+                    dstate.last_num_drafted = hit.drafts.len();
+                    dstate.retr_used_last = true;
+                    resolve_async_before_source!();
+                    return Ok(hit.drafts);
+                }
             }
             let lookup = if retr_suppressed {
                 None
@@ -696,9 +782,8 @@ impl BlockDiffusionDraftHead {
         // failure mode (26% of steps measured 2026-07-23) that verbatim
         // re-offers (echo/recycle) could not: here the drafter gets to REVISE.
         static REDENOISE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let redenoise_on = *REDENOISE.get_or_init(|| {
-            std::env::var("ATLAS_DFLASH_REDENOISE").ok().as_deref() == Some("1")
-        });
+        let redenoise_on = *REDENOISE
+            .get_or_init(|| std::env::var("ATLAS_DFLASH_REDENOISE").ok().as_deref() == Some("1"));
         let warm_tail_owned: Option<Vec<u32>> = if redenoise_on
             && dstate.first_propose_done
             && dstate.recycle_valid
@@ -759,6 +844,7 @@ impl BlockDiffusionDraftHead {
                 option_b_arg,
                 false,
                 warm_tail,
+                None,
             )
             .map_err(|e| {
                 tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
@@ -838,7 +924,7 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        let drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
+        let mut drafts = drafts.into_iter().take(cap).collect::<Vec<_>>();
         dstate.last_num_drafted = drafts.len();
         dstate.first_propose_done = true;
 
@@ -847,9 +933,33 @@ impl BlockDiffusionDraftHead {
         // draft position is the coin flip to hedge. Payload rides dstate to
         // the scheduler (dflash_take_block_fork) next to the drafts.
         static BLOCKFORK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BLOCKFORK.get_or_init(|| {
-            std::env::var("ATLAS_DFLASH_BLOCKFORK").ok().as_deref() == Some("1")
-        }) && self.kernels.top2.0 != 0
+        let blockfork_on = *BLOCKFORK
+            .get_or_init(|| std::env::var("ATLAS_DFLASH_BLOCKFORK").ok().as_deref() == Some("1"));
+        // DDTree M0 (measurement-only): stash per-draft top-2 so the verify
+        // step can score "would the drafter's 2nd choice have matched the
+        // target's correction at the death position" — the accept ceiling
+        // for a tree verify. Reuses the blockfork top2 kernel + D2H.
+        static TREE_M0: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tree_m0_on = *TREE_M0
+            .get_or_init(|| std::env::var("ATLAS_DFLASH_TREE_M0").ok().as_deref() == Some("1"));
+        // DDTree M1 (ATLAS_DFLASH_TREE=1): build a free-slots TreePayload from
+        // the same top-2 extraction and stash it on dstate. Built but UNUSED
+        // by verify in M1 (the M2 milestone consumes it) — byte-identical
+        // execution when the gate is off.
+        static TREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tree_on =
+            *TREE.get_or_init(|| std::env::var("ATLAS_DFLASH_TREE").ok().as_deref() == Some("1"));
+        // Margin-truncated γ also needs the top-2 margins (read the gate here
+        // so the extraction block runs when truncation is the only consumer).
+        static TRUNC_GATE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        let trunc_gate = *TRUNC_GATE.get_or_init(|| {
+            std::env::var("ATLAS_DFLASH_TRUNC_MARGIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0)
+        });
+        if (blockfork_on || tree_m0_on || tree_on || trunc_gate > 0.0)
+            && self.kernels.top2.0 != 0
             && drafts.len() >= 3
         {
             // logits row j+1 produced (row-0-dropped) draft j.
@@ -870,15 +980,65 @@ impl BlockDiffusionDraftHead {
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
+            if tree_m0_on {
+                // row j+1 produced draft j (row 0 dropped)
+                dstate.pending_m0_top2 = Some(
+                    (1..rows as usize)
+                        .map(|r| {
+                            (
+                                w[r * 4],
+                                f32::from_bits(w[r * 4 + 1]),
+                                w[r * 4 + 2],
+                                f32::from_bits(w[r * 4 + 3]),
+                            )
+                        })
+                        .collect(),
+                );
+            }
+            // ── Margin-truncated γ (ATLAS_DFLASH_TRUNC_MARGIN, 0 = off) ──
+            // 48% of steps die at draft position ≤1 and their doom is visible
+            // in the drafter's own top1−top2 margin. Rows past the first
+            // low-margin position are conditionally dead yet still cost
+            // expert-union bandwidth in the K-row verify. Truncate the chain
+            // just past that cliff: the verify shrinks on exactly the steps
+            // that waste it. A cut below the ≥4-draft dispatch threshold
+            // routes the step to plain single-token decode (58ms — cheaper
+            // than a 145ms verify that dies at 0). LOSSLESS: proposal-only.
+            let trunc_margin = trunc_gate;
+            if trunc_margin > 0.0 {
+                let mut cut = drafts.len();
+                for di in 0..drafts.len() {
+                    let r = di + 1;
+                    let margin = f32::from_bits(w[r * 4 + 1]) - f32::from_bits(w[r * 4 + 3]);
+                    if margin < trunc_margin {
+                        cut = di + 1; // keep the cliff draft itself (may accept)
+                        break;
+                    }
+                }
+                if cut < drafts.len() {
+                    static TRUNC_DBG: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let n = TRUNC_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 4 || n % 512 == 0 {
+                        tracing::info!(
+                            "DFLASH_TRUNC #{n}: cut chain {} -> {} (first margin<{trunc_margin})",
+                            drafts.len(),
+                            cut,
+                        );
+                    }
+                    drafts.truncate(cut);
+                    dstate.last_num_drafted = drafts.len();
+                }
+            }
             let mut best: Option<(usize, u32, f32)> = None;
-            for r in 1..rows as usize {
+            for r in 1..=drafts.len() {
                 let margin = f32::from_bits(w[r * 4 + 1]) - f32::from_bits(w[r * 4 + 3]);
                 let draft_idx = r - 1;
                 if best.is_none_or(|(_, _, bm)| margin < bm) {
                     best = Some((draft_idx, w[r * 4 + 2], margin));
                 }
             }
-            if let Some((di, fork_tok, margin)) = best {
+            if let Some((di, fork_tok, margin)) = best.filter(|_| blockfork_on) {
                 dstate.pending_block_fork = Some((di, fork_tok));
                 static FORK_DBG: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -889,6 +1049,133 @@ impl BlockDiffusionDraftHead {
                          margin={margin:.3} (drafts[cliff]={})",
                         drafts[di],
                     );
+                }
+            }
+            // ── DDTree M1 free-slots payload (ATLAS_DFLASH_TREE=1) ──
+            // Spine = the full draft chain, laid flat (slot == depth). M4
+            // shape: up to ATLAS_DFLASH_TREE_BRANCHES cliff forks chosen
+            // among draft positions 0..=3 by lowest top1−top2 margin (the
+            // chain dies at the FIRST cliff it reaches, so a deep fork the
+            // walk never reaches is wasted), each carrying the following
+            // top-1 drafts re-rooted onto the fork as an
+            // ATLAS_DFLASH_TREE_TAIL-token tail — the
+            // "spine + N×(fork@cliff + tail-T)" shape. K_t budget = bonus
+            // row + spine + Σ(1 + tail_len) verify rows, capped at the
+            // 20-row dflash_k arena (verify_d_tree.rs TREE_MAX_ROWS).
+            if tree_on {
+                // Transparency gate (M2 acceptance, ATLAS_DFLASH_TREE_DEGEN=1):
+                // force the branch fork token = the spine draft at the same
+                // depth. Branch rows then verify the exact same tokens as the
+                // spine rows through the scratch KV, so the committed output
+                // MUST be byte-identical to the flat path — proving the tree
+                // metadata/COW/per-layer-seeding are sound. (Mirrors the
+                // ATLAS_DFLASH_FORK_DEGEN pattern in verify_dflash_step.rs.)
+                static TREE_DEGEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let tree_degen = *TREE_DEGEN.get_or_init(|| {
+                    std::env::var("ATLAS_DFLASH_TREE_DEGEN").ok().as_deref() == Some("1")
+                });
+                // M4 shape knobs. DEGEN keeps the landed single-branch
+                // tail-1 shape over positions 0..=2 (the transparency test
+                // must stay byte-identical to the validated M2 run).
+                static TREE_BRANCHES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                static TREE_TAIL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let (max_branches, tail_cfg, window) = if tree_degen {
+                    (1, 1, 3)
+                } else {
+                    (
+                        *TREE_BRANCHES.get_or_init(|| {
+                            std::env::var("ATLAS_DFLASH_TREE_BRANCHES")
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(1)
+                                .clamp(1, 3)
+                        }),
+                        *TREE_TAIL.get_or_init(|| {
+                            std::env::var("ATLAS_DFLASH_TREE_TAIL")
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(1)
+                                .clamp(1, 3)
+                        }),
+                        4,
+                    )
+                };
+                // M4 economics gate (ATLAS_DFLASH_TREE_MARGIN, default 2.5):
+                // only pay the tree step (eager verify + reseed + extra rows)
+                // when the cliff margin says an early death is LIKELY.
+                // Measured: death-position margins run ~1.0-2.1; live win
+                // rate without the gate was ~8% because the payload fired on
+                // confident steps too. Confident steps keep the flat graph.
+                // The gate applies PER CLIFF; a step with zero qualifying
+                // cliffs builds no payload.
+                static TREE_MARGIN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+                let margin_gate = *TREE_MARGIN.get_or_init(|| {
+                    std::env::var("ATLAS_DFLASH_TREE_MARGIN")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(2.5)
+                });
+                // Qualifying cliffs among draft positions 0..window: logits
+                // row di+1 produced (row-0-dropped) draft di.
+                let mut cliffs: Vec<(usize, u32, f32)> = Vec::new();
+                for di in 0..drafts.len().min(window) {
+                    let r = di + 1;
+                    let margin = f32::from_bits(w[r * 4 + 1]) - f32::from_bits(w[r * 4 + 3]);
+                    let fork_tok = if tree_degen { drafts[di] } else { w[r * 4 + 2] };
+                    // Skip a degenerate fork that equals the spine token —
+                    // EXCEPT under DEGEN, where the degenerate fork IS the
+                    // test (and the margin gate is bypassed).
+                    if tree_degen || (fork_tok != drafts[di] && margin < margin_gate) {
+                        cliffs.push((di, fork_tok, margin));
+                    }
+                }
+                // N lowest-margin cliffs (stable sort keeps shallower first
+                // on ties; build_free_slots_payload re-orders shallowest
+                // first regardless).
+                cliffs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+                cliffs.truncate(max_branches);
+                if !cliffs.is_empty() {
+                    let branches: Vec<super::ddtree::FreeSlotBranch> = cliffs
+                        .iter()
+                        .map(|&(di, fork_tok, _)| super::ddtree::FreeSlotBranch {
+                            // Fork is a SIBLING of drafts[di] → attaches below
+                            // spine depth di+1 (1-based cliff convention).
+                            cliff_depth: di + 1,
+                            fork_token: fork_tok,
+                            // Tail = following top-1 drafts re-rooted after
+                            // the fork, clamped at the chain end.
+                            tail: drafts[di + 1..(di + 1 + tail_cfg).min(drafts.len())].to_vec(),
+                        })
+                        .collect();
+                    // K_t budget: bonus + spine + Σ(1 + tail_len) rows must
+                    // stay ≤ 20 (the dflash_k arena cap, verify_d_tree.rs
+                    // TREE_MAX_ROWS). build_free_slots_payload's budget arg
+                    // is in NODES (rows minus the bonus), so cap at 19; the
+                    // builder lays shallowest branches first, truncating
+                    // tails (never forks) and dropping the deepest branches
+                    // when the budget runs out.
+                    const TREE_MAX_ROWS: usize = 20;
+                    let want_nodes =
+                        drafts.len() + branches.iter().map(|b| 1 + b.tail.len()).sum::<usize>();
+                    let budget = want_nodes.min(TREE_MAX_ROWS - 1);
+                    let payload =
+                        super::ddtree::build_free_slots_payload(&drafts, &branches, budget);
+                    let (di, fork_tok, margin) = cliffs[0];
+                    static TREE_DBG: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let n = TREE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n <= 4 || n % 256 == 0 {
+                        tracing::info!(
+                            "DFLASH_TREE payload #{n}: branches={} tail={tail_cfg} \
+                             cliff_draft={di} fork_tok={fork_tok} margin={margin:.3} \
+                             nodes={} spine={} (drafts[cliff]={})",
+                            cliffs.len(),
+                            payload.tree_token_ids.len(),
+                            drafts.len(),
+                            drafts[di],
+                        );
+                    }
+                    dstate.pending_tree_payload = Some(payload);
                 }
             }
         }

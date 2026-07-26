@@ -349,6 +349,7 @@ pub fn resume_swapped_seq(
         grammar_state: None,
         pending_drafts: Vec::new(),
         pending_block_fork: None,
+        pending_tree_payload: None,
         last_token_time: Instant::now(),
         request_start: s.request_start,
         decode_start: s.decode_start,

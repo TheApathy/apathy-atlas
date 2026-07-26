@@ -41,6 +41,17 @@ impl BlockDiffusionDraftHead {
         // unmasking is the in-distribution precedent). Proposal-only ⇒
         // lossless. None ⇒ classic all-MASK seeding, byte-identical.
         warm_tail: Option<&[u32]>,
+        // ATLAS_DFLASH_SPEC_PROPOSE: indirect last_token. When `Some`, the
+        // anchor row's token id is read DEVICE-side: a 4-byte D2D from this
+        // pointer (the verify argmax slot of row K-1) overwrites the host-
+        // uploaded id after the H2D and before `batched_embed` consumes it —
+        // the "indirect embed" without a new kernel. Additionally ALL host
+        // uploads in this call switch to `copy_h2d_async(stream)`: the
+        // blocking `copy_h2d` syncs the DEFAULT stream, which at spec-fire
+        // time is executing the 100ms verify graph — the sync would stall
+        // the scheduler thread for the whole verify and defeat the overlap.
+        // `None` = byte-identical legacy behaviour.
+        device_last_token: Option<DevicePtr>,
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
@@ -313,7 +324,18 @@ impl BlockDiffusionDraftHead {
             .chain((0..self.gamma).map(|i| (position + i) as i32))
             .collect();
         let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
-        gpu.copy_h2d(&pos_bytes, self.scratch.position_ids)?;
+        // Enqueue-only H2D helper for spec-propose launches (see
+        // `device_last_token` doc above). Pageable-source async H2D is
+        // host-synchronous w.r.t. the source buffer (driver staging), the
+        // same contract verify_d.rs relies on for its stack uploads.
+        let h2d = |bytes: &[u8], dst: DevicePtr| -> Result<()> {
+            if device_last_token.is_some() {
+                gpu.copy_h2d_async(bytes, dst, stream)
+            } else {
+                gpu.copy_h2d(bytes, dst)
+            }
+        };
+        h2d(&pos_bytes, self.scratch.position_ids)?;
         if debug_dump {
             tracing::info!(
                 "DFLASH DUMP positions: eff_ctx={} ctx_total={} position={} pos_ids[0..min(8,n_attn)]={:?}",
@@ -364,7 +386,20 @@ impl BlockDiffusionDraftHead {
             .iter()
             .flat_map(|t| t.to_le_bytes())
             .collect();
-        gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
+        h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
+        // Indirect last_token (spec propose): overwrite the anchor row's id
+        // with the verify argmax read device-side, stream-ordered after the
+        // H2D above and before the embed below. The host-uploaded value was
+        // the MASK sentinel, so a hypothetical failure of this copy degrades
+        // to an all-mismatch chain (bonus-only step) — lossless.
+        if let Some(tok_ptr) = device_last_token {
+            gpu.copy_d2d_async(
+                tok_ptr,
+                self.scratch.draft_tokens_dev.offset(eff_ctx * 4),
+                4,
+                stream,
+            )?;
+        }
         ops::batched_embed(
             gpu,
             self.kernels.batched_embed,
@@ -390,7 +425,9 @@ impl BlockDiffusionDraftHead {
             gpu.synchronize(stream)?;
             let mut b = vec![0u8; nb];
             gpu.copy_d2h(
-                self.scratch.stream_buf.offset(eff_ctx * self.hidden_size * bf16),
+                self.scratch
+                    .stream_buf
+                    .offset(eff_ctx * self.hidden_size * bf16),
                 &mut b,
             )?;
             let _ = std::fs::write("/tmp/atlas_blk_input.bin", &b);
@@ -478,7 +515,7 @@ impl BlockDiffusionDraftHead {
                 b[8..12].copy_from_slice(&q_rope_pos.to_ne_bytes());
                 b
             };
-            gpu.copy_h2d(&indirect_bytes, self.scratch.option_b_indirect_args_dev)?;
+            h2d(&indirect_bytes, self.scratch.option_b_indirect_args_dev)?;
             Some(self.scratch.slot_mapping_dev)
         } else {
             None
@@ -621,10 +658,33 @@ impl BlockDiffusionDraftHead {
             // the FP8 mirror of the shared lm_head weight. The earlier
             // 0%-accept bug was a half-loaded smem_A K-tile in that
             // kernel (fixed: 2-round A-load covers all 32 K-cols).
-            // BF16 path (default, or Fp8 mirror missing) unchanged.
-            let lm_head_fp8 = matches!(self.quant, super::DflashQuantization::Fp8Weights);
-            if lm_head_fp8 {
-                if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
+            // BF16 path (default, attn-only FP8 mode, or Fp8 mirror
+            // missing) unchanged. Dispatch is on FP8 mirror presence: the
+            // mirror is built in full FP8 mode (ATLAS_DFLASH_DRAFTER_FP8=1)
+            // OR adopted from the target's lm_head mirror under
+            // ATLAS_TARGET_LMHEAD_FP8=1 (lm_head-only: drafter layer GEMMs
+            // stay BF16 — see from_weights.rs); attn-only mode
+            // (ATLAS_DFLASH_DRAFTER_FP8_ATTN=1) leaves lm_head BF16.
+            if let Some(fp8) = self.lm_head_shared_fp8.as_ref() {
+                if self.gamma <= 8
+                    && h_local.is_multiple_of(32)
+                    && self.kernels.fp8_gemm_row_scaled_mtile8.0 != 0
+                {
+                    // γ ≤ 8: the weight-read-bound mtile8 tile streams the
+                    // vocab×hidden mirror once at near-wall GB/s (the
+                    // single-warp _m16 tile measured ~40% lower cold).
+                    ops::fp8_gemm_row_scaled_smallm(
+                        gpu,
+                        self.kernels.fp8_gemm_row_scaled_mtile8,
+                        norm_noise_local,
+                        fp8,
+                        self.scratch.logits,
+                        self.gamma as u32,
+                        self.vocab_size as u32,
+                        h_local,
+                        stream,
+                    )?;
+                } else {
                     ops::fp8_gemm_n128_row_scaled_m16(
                         gpu,
                         self.kernels.fp8_gemm_n128_row_scaled_m16,
@@ -636,21 +696,24 @@ impl BlockDiffusionDraftHead {
                         h_local,
                         stream,
                     )?;
-                } else {
-                    ops::dense_gemm_bf16_pipelined(
-                        gpu,
-                        self.kernels.dense_gemm_pipelined,
-                        norm_noise_local,
-                        &crate::weight_map::DenseWeight {
-                            weight: self.lm_head_shared,
-                        },
-                        self.scratch.logits,
-                        self.gamma as u32,
-                        self.vocab_size as u32,
-                        h_local,
-                        stream,
-                    )?;
                 }
+            } else if self.try_fastgemm(
+                gpu,
+                norm_noise_local,
+                &crate::weight_map::DenseWeight {
+                    weight: self.lm_head_shared,
+                },
+                self.scratch.logits,
+                self.gamma as u32,
+                self.vocab_size as u32,
+                h_local,
+                stream,
+            )? {
+                // ATLAS_DFLASH_DRAFTER_FASTGEMM=1: the lm_head is the
+                // single biggest weight read of the propose (vocab × h
+                // BF16 — Laguna: 100352 × 3072 × 2 B ≈ 616 MB), dispatched
+                // through the bit-identical small-M streaming kernel
+                // (N_TILE=128 wide-stream at vocab-scale N).
             } else {
                 ops::dense_gemm_bf16_pipelined(
                     gpu,
@@ -852,10 +915,124 @@ impl BlockDiffusionDraftHead {
             run_tail()
         };
 
+        // ── ATLAS_DFLASH_PROPOSE_ONEGRAPH=1 (default off): collapse the
+        // ENTIRE propose compute into ONE captured graph — all layers
+        // (pre-attn GEMMs + indirect paged attention + post-attn GEMMs)
+        // plus the tail (final norm + lm_head + argmax). The piecewise
+        // path pays ~19 host launch boundaries per propose (6 × [pre
+        // graph, eager attention kernel, post graph] + tail graph); this
+        // pays 1. The attention is capture-safe because the default path
+        // already launches `inferspark_prefill_paged_indirect`, which
+        // reads its per-step `[kv_len, q_offset, q_rope_pos]` from
+        // `option_b_indirect_args_dev` at kernel entry — the H2D above
+        // stashes the fresh triple BEFORE every replay. Same kernels,
+        // same order as the eager/piecewise path ⇒ bit-identical output.
+        //
+        // Per-step dynamics riding device buffers (all written pre-launch,
+        // above): indirect-args triple, position_ids, token ids in
+        // draft_tokens_dev (incl. the spec-propose device_last_token D2D
+        // overwrite), and the γ slot mapping (the eager `fill_slots`
+        // launch above rebuilds slot_mapping_dev each step — it takes
+        // ctx_count as a host scalar, so it stays OUTSIDE the graph; the
+        // captured reshape_and_cache reads only the buffer contents).
+        //
+        // Keying: the captured attention launches bake `block_table_dev`
+        // as a kernel arg — the ONLY per-sequence pointer in the region
+        // (k_pool/v_pool and all scratch pointers are head-lifetime
+        // stable). Under ONEGRAPH that buffer is SLOT-STABLE transport
+        // borrowed from the head's `bt_dev_pool` (returned, never freed,
+        // in free_state; contents re-uploaded H2D at each sequence's
+        // lazy block-table init), so a key is captured against AT MOST
+        // ONCE for the head's lifetime — one graph per pool buffer
+        // (bounded by peak concurrent sequences, 1-2 in production).
+        // The first landing of this feature keyed on a per-sequence
+        // transient pointer instead: every new request re-captured
+        // (~200-400 ms) against only ~40-60 propose steps of saving —
+        // net-negative. No destroy path remains: pool pointers are never
+        // invalidated, and all shape-class inputs inside the region are
+        // head-lifetime constants (γ, layer count, scratch sizing — the
+        // same invariant the keyless piecewise cache below relies on),
+        // so entries stay valid forever.
+        //
+        // The CONTIG attention ablation injects D2H + sync inside the
+        // layer loop — not capture-safe — so the shared gate
+        // (`dflash_propose_onegraph_enabled`, also used by the pool
+        // borrow/return sites) forces itself off; it's read once so
+        // capture and replay always agree.
+        let onegraph_on = super::dflash_propose_onegraph_enabled();
+
+        if graph_eligible && option_b_on && onegraph_on {
+            let bt_key = option_b_block_table
+                .expect("option_b block table available")
+                .0;
+            let mut og = self.propose_onegraph.lock();
+            match og.iter().find(|(key, _)| *key == bt_key).copied() {
+                Some((_, handle)) => {
+                    if handle.0 != 0 {
+                        // Hot replay: one launch for the whole propose.
+                        gpu.launch_graph(handle, stream)?;
+                    } else {
+                        // Empty-capture sentinel: replay eager forever
+                        // for this pool buffer (mirrors the piecewise
+                        // per-slot sentinel semantics).
+                        run_all_eager()?;
+                    }
+                }
+                None => {
+                    let warmed = self
+                        .propose_warmup_count
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if warmed < warmup_target {
+                        // Warm-up: eager only, no capture (PTX→SASS JIT,
+                        // clock ramp, L2 warm — same policy as piecewise).
+                        self.propose_warmup_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        run_all_eager()?;
+                    } else {
+                        // Capture pass: first post-warm-up propose against
+                        // a pool buffer we haven't captured yet. Happens at
+                        // most once per pool buffer per head lifetime — the
+                        // buffer is slot-stable (free_state returns it to
+                        // the pool instead of freeing), so later sequences
+                        // reusing it hit the hot-replay arm above. Nothing
+                        // to destroy: existing entries stay valid forever.
+                        tracing::info!(
+                            "DFlash onegraph capture: starting (warmup_count={}, \
+                             target={}, layers={}, key={bt_key:#x}, cached_keys={})",
+                            warmed,
+                            warmup_target,
+                            self.layers.len(),
+                            og.len(),
+                        );
+                        gpu.begin_capture(stream)?;
+                        // Run the FULL region under capture — identical
+                        // call sequence to the eager path (layer loop +
+                        // tail). Close the capture before propagating any
+                        // body error so the stream never leaks capture
+                        // mode.
+                        let body = run_all_eager();
+                        let graph = gpu.end_capture(stream);
+                        body?;
+                        let graph = graph?;
+                        og.push((bt_key, graph));
+                        if graph.0 != 0 {
+                            tracing::info!("DFlash onegraph capture: complete (key={bt_key:#x})");
+                            gpu.launch_graph(graph, stream)?;
+                        } else {
+                            tracing::warn!(
+                                "DFlash onegraph: empty capture — eager fallback \
+                                 (permanent for this pool buffer)"
+                            );
+                            run_all_eager()?;
+                        }
+                    }
+                }
+            }
+        }
         // Phase F.2: piecewise capture/replay path. Only enabled for
         // option_b (paged) — legacy path stays single-shot eager since
         // it's not graph-ready and exists only for ablation.
-        if graph_eligible && option_b_on {
+        else if graph_eligible && option_b_on {
             // Subgraph slot layout: [pre_0, post_0, ..., pre_{N-1}, post_{N-1}, tail].
             // 2 × num_layers + 1 slots total.
             let num_layers = self.layers.len();
@@ -1057,7 +1234,9 @@ impl BlockDiffusionDraftHead {
             gpu.synchronize(stream)?;
             let mut b = vec![0u8; nb];
             gpu.copy_d2h(
-                self.scratch.stream_buf.offset(eff_ctx * self.hidden_size * 2),
+                self.scratch
+                    .stream_buf
+                    .offset(eff_ctx * self.hidden_size * 2),
                 &mut b,
             )?;
             let _ = std::fs::write("/tmp/atlas_blk_final_hidden.bin", &b);

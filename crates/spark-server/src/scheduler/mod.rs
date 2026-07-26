@@ -26,6 +26,7 @@ mod lifecycle;
 mod logit_dump;
 mod logit_processors;
 mod logprobs;
+mod low_gear;
 mod mod_helpers;
 mod mtp_gate;
 mod mtp_step;
@@ -40,6 +41,7 @@ mod repetition;
 mod rollback;
 mod sample_step;
 mod spec_step;
+pub(crate) mod step_timing2;
 mod ssm_decode_ring;
 mod types;
 mod verify_dflash_step;
@@ -308,9 +310,18 @@ pub fn run(
     install_high_speed_swap(&*model, high_speed_swap_cfg);
 
     loop {
+        // ATLAS_LOOP_TRACE=1: 3-section loop timing (drain+phases / step /
+        // tail) to localize the measured ~7.5ms/step loop_gap. Host-only.
+        let loop_trace = {
+            static LT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LT.get_or_init(|| std::env::var("ATLAS_LOOP_TRACE").ok().as_deref() == Some("1"))
+        };
+        let lt_t0 = loop_trace.then(std::time::Instant::now);
+
         // ── Drain pending → start prefill (chunked or full) ──
         let new_reqs =
             drain_pending_requests(&pending, &active, &prefilling, &*policy, max_batch_size);
+        let lt_t_drain = loop_trace.then(std::time::Instant::now);
 
         // ── Apply queued LoRA adapter rotations at a QUIESCENT point ──
         // Only when nothing is in flight (no active decode, no in-progress
@@ -415,7 +426,9 @@ pub fn run(
             }
         }
 
+        let lt_t_preq = loop_trace.then(std::time::Instant::now);
         // ── Start new requests ──
+        if !new_reqs.is_empty() {
         start_new_requests(
             &*model,
             new_reqs,
@@ -435,7 +448,11 @@ pub fn run(
             &mut active,
             &mut prefilling,
         );
+        }
 
+        let lt_t_mid = loop_trace.then(std::time::Instant::now);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let lt_t_postreq = loop_trace.then(std::time::Instant::now);
         // ── Continue in-progress prefills ──
         let did_mixed_step = continue_in_progress_prefills(
             &*model,
@@ -461,6 +478,7 @@ pub fn run(
         if active.is_empty() {
             continue;
         }
+        let lt_t_prestep = loop_trace.then(std::time::Instant::now);
 
         // Skip decode when mixed_forward already processed decode logits.
         if !did_mixed_step {
@@ -633,6 +651,52 @@ pub fn run(
                     tool_call_start_token,
                     tool_call_end_token,
                     adaptive_sampling,
+                );
+            }
+        }
+
+        if let (Some(t0), Some(td), Some(tp)) = (lt_t0, lt_t_drain, lt_t_prestep) {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static DRAIN_US: AtomicU64 = AtomicU64::new(0);
+            static PHASES_US: AtomicU64 = AtomicU64::new(0);
+            static STEP_US: AtomicU64 = AtomicU64::new(0);
+            static TAIL_US: AtomicU64 = AtomicU64::new(0);
+            static N: AtomicU64 = AtomicU64::new(0);
+            static PREV_EXIT_NS: AtomicU64 = AtomicU64::new(0);
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let epoch = *EPOCH.get_or_init(std::time::Instant::now);
+            let now = std::time::Instant::now();
+            static ROT_US: AtomicU64 = AtomicU64::new(0);
+            static SNR_US: AtomicU64 = AtomicU64::new(0);
+            static CONT_US: AtomicU64 = AtomicU64::new(0);
+            DRAIN_US.fetch_add((td - t0).as_micros() as u64, Relaxed);
+            PHASES_US.fetch_add((tp - td).as_micros() as u64, Relaxed);
+            static MID_US: AtomicU64 = AtomicU64::new(0);
+            if let (Some(tq), Some(tm), Some(tr)) = (lt_t_preq, lt_t_mid, lt_t_postreq) {
+                ROT_US.fetch_add((tq - td).as_micros() as u64, Relaxed);
+                MID_US.fetch_add((tm - tq).as_micros() as u64, Relaxed);
+                SNR_US.fetch_add((tr - tm).as_micros() as u64, Relaxed);
+                CONT_US.fetch_add((tp - tr).as_micros() as u64, Relaxed);
+            }
+            STEP_US.fetch_add((now - tp).as_micros() as u64, Relaxed);
+            let prev = PREV_EXIT_NS.swap((now - epoch).as_nanos() as u64, Relaxed);
+            if prev != 0 {
+                let iter_span_us = ((now - epoch).as_nanos() as u64 - prev) / 1000;
+                let this_iter_us = (now - t0).as_micros() as u64;
+                TAIL_US.fetch_add(iter_span_us.saturating_sub(this_iter_us), Relaxed);
+            }
+            let n = N.fetch_add(1, Relaxed) + 1;
+            if n % 64 == 0 {
+                tracing::info!(
+                    "LOOP_TRACE [{n}]: drain={:.2}ms phases={:.2}ms (rot={:.2} mid={:.2} snr={:.2} cont={:.2}) step={:.2}ms tail(prev-exit->entry)={:.2}ms",
+                    DRAIN_US.swap(0, Relaxed) as f64 / 64000.0,
+                    PHASES_US.swap(0, Relaxed) as f64 / 64000.0,
+                    ROT_US.swap(0, Relaxed) as f64 / 64000.0,
+                    MID_US.swap(0, Relaxed) as f64 / 64000.0,
+                    SNR_US.swap(0, Relaxed) as f64 / 64000.0,
+                    CONT_US.swap(0, Relaxed) as f64 / 64000.0,
+                    STEP_US.swap(0, Relaxed) as f64 / 64000.0,
+                    TAIL_US.swap(0, Relaxed) as f64 / 64000.0,
                 );
             }
         }

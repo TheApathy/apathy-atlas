@@ -100,6 +100,77 @@ impl TransformerModel {
                     h,
                     stream,
                 )?;
+            } else if num_tokens >= 3
+                && num_tokens <= 8
+                && h.is_multiple_of(32)
+                && self.fp8_gemm_row_scaled_mtile8_kernel.0 != 0
+            {
+                // K=3..8 verify lm_head (ATLAS_TARGET_LMHEAD_FP8 mirror on
+                // Laguna: M=7-8 rows over the [100352, 3072] FP8 head): one
+                // weight-read-bound mtile8 GEMM streams the 308MB mirror
+                // ONCE for all verify rows. The per-token GEMV loop below
+                // would re-read it num_tokens times — worse than the BF16
+                // dense GEMM it replaces.
+                ops::fp8_gemm_row_scaled_smallm(
+                    self.gpu.as_ref(),
+                    self.fp8_gemm_row_scaled_mtile8_kernel,
+                    hidden,
+                    fp8,
+                    logits,
+                    num_tokens,
+                    v,
+                    h,
+                    stream,
+                )?;
+            } else if num_tokens >= 3
+                && num_tokens <= 16
+                && self.fp8_gemm_row_scaled_m16_kernel.0 != 0
+            {
+                // 9..16 rows (or K not a multiple of 32): single-warp
+                // M_TILE=16 tile, still one weight read for all rows.
+                ops::fp8_gemm_n128_row_scaled_m16(
+                    self.gpu.as_ref(),
+                    self.fp8_gemm_row_scaled_m16_kernel,
+                    hidden,
+                    fp8,
+                    logits,
+                    num_tokens,
+                    v,
+                    h,
+                    stream,
+                )?;
+            } else if num_tokens == 1
+                && ops::serial_mirror_gemm_enabled()
+                && self.fp8_gemm_row_scaled_mtile8_kernel.0 != 0
+                && h.is_multiple_of(32)
+            {
+                // ATLAS_SERIAL_MIRROR_GEMM=1: K=1 tier — otherwise it falls
+                // to the per-token `dense_gemv_fp8w` loop below. Same
+                // serve-side A/B gate as the single-token `lm_head`; the
+                // cold M=1 microbench favors the GEMV (256 vs 206 GB/s).
+                ops::fp8_gemm_row_scaled_smallm(
+                    self.gpu.as_ref(),
+                    self.fp8_gemm_row_scaled_mtile8_kernel,
+                    hidden,
+                    fp8,
+                    logits,
+                    1,
+                    v,
+                    h,
+                    stream,
+                )?;
+            } else if num_tokens > 16 && self.fp8_gemm_row_scaled_kernel.0 != 0 {
+                ops::fp8_gemm_n128_row_scaled(
+                    self.gpu.as_ref(),
+                    self.fp8_gemm_row_scaled_kernel,
+                    hidden,
+                    fp8,
+                    logits,
+                    num_tokens,
+                    v,
+                    h,
+                    stream,
+                )?;
             } else {
                 for i in 0..num_tokens as usize {
                     ops::dense_gemv_fp8w(
@@ -227,16 +298,38 @@ impl TransformerModel {
             // FP32-output variant — it writes to whichever buffer is passed.
             // `use_fp32_logits` is false in production, so `logits` is the
             // shared BF16 buffer; the FP32-logits path is unused here.
-            ops::dense_gemv_fp8w(
-                self.gpu.as_ref(),
-                self.dense_gemv_fp8w_kernel,
-                hidden,
-                fp8,
-                logits,
-                v,
-                h,
-                stream,
-            )?;
+            if ops::serial_mirror_gemm_enabled()
+                && self.fp8_gemm_row_scaled_mtile8_kernel.0 != 0
+                && h.is_multiple_of(32)
+            {
+                // ATLAS_SERIAL_MIRROR_GEMM=1: serial (M=1) lm_head through
+                // the weight-read-bound mtile8 GEMM (same BF16 write-out).
+                // NOTE: the cold M=1 microbench (fp8gemv_m1_serial_microtest)
+                // shows the GEMV below is FASTER at this shape ([100352,
+                // 3072]: 256 vs 206 GB/s) — gate kept for serve-side A/B.
+                ops::fp8_gemm_row_scaled_smallm(
+                    self.gpu.as_ref(),
+                    self.fp8_gemm_row_scaled_mtile8_kernel,
+                    hidden,
+                    fp8,
+                    logits,
+                    1,
+                    v,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemv_fp8w(
+                    self.gpu.as_ref(),
+                    self.dense_gemv_fp8w_kernel,
+                    hidden,
+                    fp8,
+                    logits,
+                    v,
+                    h,
+                    stream,
+                )?;
+            }
         } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
             // Pick FP32-output variant when the FP32 logits buffer is the
             // destination. Same packed-NVFP4 weights, same activation, but the

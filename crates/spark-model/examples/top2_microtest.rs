@@ -3,7 +3,7 @@
 //! Correctness gate for `top2_bf16_rows` (block-fork tree cliff detection,
 //! doc 16 stage 1): per-row top-2 (idx, val) over BF16 logits vs host ref.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kernel_args::KernelLaunch;
