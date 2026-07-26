@@ -244,7 +244,9 @@ fn load_moe_ffn(
     // SFB swizzle below (which read the null NVFP4 expert scales) must be
     // skipped — the keep-packed MoE prefill arm consumes the packed blocks via
     // q4k_mmq instead.
-    let experts_keep_packed = layer.weights.packed_experts.is_some();
+    // (Our tree lacks the GGUF keep-packed MoE arm — packed_experts field
+    // comes from later upstream commits not cherry-picked; always NVFP4 here.)
+    let experts_keep_packed = false;
     if unified_moe_layout && !experts_keep_packed {
         layer.transpose_for_prefill_unified(gpu, config)?;
     }
