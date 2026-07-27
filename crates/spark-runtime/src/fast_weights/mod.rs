@@ -155,6 +155,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 gib(oom_reserve_bytes),
                 has_fp8,
             );
+            crate::progress::preflight(gib(estimated), gib(free));
             if peak + oom_reserve_bytes > free {
                 bail!(
                     "OOM pre-flight: peak {:.2} GB ({:.2} GB weights × {:.1}x \
@@ -201,6 +202,7 @@ impl WeightLoader for FastSafetensorsLoader {
                     .map(|v| format!(" ({} tensors)", v.len()))
                     .unwrap_or_default(),
             );
+            crate::progress::shard_start(i + 1, total_shards, shard_name);
 
             load_shard_fast(
                 shard_path,
@@ -217,6 +219,12 @@ impl WeightLoader for FastSafetensorsLoader {
             let used = initial_free.saturating_sub(free_now);
             tracing::info!(
                 "  Shard {}/{} done — GPU memory: {:.2} GB used, {:.2} GB free",
+                i + 1,
+                total_shards,
+                used as f64 / (1024.0 * 1024.0 * 1024.0),
+                free_now as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            crate::progress::shard_done(
                 i + 1,
                 total_shards,
                 used as f64 / (1024.0 * 1024.0 * 1024.0),

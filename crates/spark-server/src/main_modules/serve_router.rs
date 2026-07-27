@@ -125,6 +125,9 @@ pub(crate) async fn build_and_serve(
             require_auth_middleware,
         ))
         .layer(axum::middleware::from_fn(openai_observability_middleware))
+        .layer(axum::middleware::from_fn(
+            crate::main_modules::byte_count::byte_count_middleware,
+        ))
         .layer(cors)
         .layer(catch_panic)
         .with_state(state);
@@ -152,7 +155,9 @@ pub(crate) async fn build_and_serve(
         );
     }
     tracing::info!("Listening on {addr}");
+    spark_runtime::progress::phase(11, "listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    spark_runtime::progress::ready(port);
     // Disable Nagle's algorithm (set TCP_NODELAY) on every accepted
     // connection. Task #41 (2026-07-07): SSE token streaming ships one
     // tiny `data:` frame per committed token, and DFlash spec-decode
@@ -179,11 +184,15 @@ pub(crate) async fn build_and_serve(
     // `into_make_service_with_connect_info` exposes the socket peer addr
     // to extractors — needed by `rate_limit_middleware` when the caller
     // didn't send X-Forwarded-For.
+    crate::tui::shutdown::disarm_startup_escape();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(crate::tui::shutdown::wait())
     .await?;
 
+    crate::tui::init::flush_tee();
+    tracing::info!("Shutdown complete");
     Ok(())
 }

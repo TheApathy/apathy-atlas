@@ -154,6 +154,11 @@ impl AtlasCudaBackend {
 /// 30-50%. We take the max of CUDA's report and `/proc/meminfo` MemAvailable
 /// to get the true available memory.
 pub fn cuda_free_memory_bytes() -> Option<usize> {
+    cuda_memory_bytes().map(|(free, _)| free)
+}
+
+/// Query free and total GPU memory without requiring a backend reference.
+pub fn cuda_memory_bytes() -> Option<(usize, usize)> {
     let mut free: usize = 0;
     let mut total: usize = 0;
     let status = unsafe { cuMemGetInfo_v2(&mut free, &mut total) };
@@ -166,7 +171,7 @@ pub fn cuda_free_memory_bytes() -> Option<usize> {
     if let Some(mem_available) = system_available_memory_bytes() {
         free = free.max(mem_available);
     }
-    Some(free)
+    Some((free, total))
 }
 
 /// Read MemAvailable from /proc/meminfo (Linux only).

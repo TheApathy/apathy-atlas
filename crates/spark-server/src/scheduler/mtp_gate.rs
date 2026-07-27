@@ -341,6 +341,22 @@ pub struct MtpGate {
 }
 
 impl MtpGate {
+    /// Current gate mode and delivered-throughput estimate for observability.
+    pub fn observe(&self) -> (super::snapshot::MtpModeSnap, f32) {
+        use super::snapshot::MtpModeSnap;
+
+        let effective = self.effective();
+        let mode = if self.probing.is_some() {
+            MtpModeSnap::Probing
+        } else {
+            match self.arms[effective].kind {
+                ArmKind::Spec { .. } => MtpModeSnap::Mtp,
+                ArmKind::Serial => MtpModeSnap::Serial,
+            }
+        };
+        (mode, self.stats[effective].tps.unwrap_or(0.0) as f32)
+    }
+
     /// `arms` must be non-empty; index 0 is the primary arm and the arm the
     /// gate starts in, so it should be the operator's configured default
     /// (today: the external DFlash/DDTree drafter).

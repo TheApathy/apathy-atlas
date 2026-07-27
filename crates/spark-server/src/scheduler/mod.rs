@@ -35,6 +35,7 @@ mod proposal_lifecycle;
 mod repetition;
 mod rollback;
 mod sample_step;
+pub mod snapshot;
 mod spec_policy_accept;
 mod spec_step;
 mod spec_timing;
@@ -450,11 +451,34 @@ pub fn run(
         reflection_suppress_ids: &reflection_suppress_ids,
         adaptive_sampling,
     };
-
+    let mut snapshot_steps: u64 = 0;
     loop {
         // ── Drain pending → start prefill (chunked or full) ──
         let new_reqs =
             drain_pending_requests(&pending, &active, &prefilling, &*policy, max_batch_size);
+        // Publish only when the dashboard is active. Plain/benchmark mode
+        // pays one atomic branch and never takes the snapshot mutex.
+        if crate::tui::is_active() {
+            snapshot_steps += 1;
+            let (mtp_mode, delivered_tps) = match spec_gate.as_ref() {
+                Some(g) => g.observe(),
+                None => (snapshot::MtpModeSnap::Off, 0.0),
+            };
+            snapshot::publish(snapshot::SchedulerSnapshot {
+                active_seqs: active.len() as u32,
+                prefilling_seqs: prefilling.len() as u32,
+                swapped_seqs: swapped.len() as u32,
+                pending_len: new_reqs.len() as u32,
+                kv_blocks_free: model.num_free_blocks() as u32,
+                kv_blocks_total: model.num_total_blocks() as u32,
+                ssm_slots_used: session_manager.session_count() as u32,
+                ssm_slots_total: session_manager.total_slots() as u32,
+                mtp_mode,
+                delivered_tps,
+                steps_total: snapshot_steps,
+                published_at: std::time::Instant::now(),
+            });
+        }
         if new_reqs.is_empty() && active.is_empty() && prefilling.is_empty() {
             // Receiver thread was closed (shutdown).
             let pending_closed = pending.0.lock().closed;

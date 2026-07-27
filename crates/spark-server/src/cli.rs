@@ -19,7 +19,7 @@ pub enum Command {
 }
 
 /// Arguments for the `serve` subcommand.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct ServeArgs {
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
     /// or a local directory path containing config.json.
@@ -77,6 +77,12 @@ pub struct ServeArgs {
     /// `docs/FORK_VS_UPSTREAM.md`.
     #[arg(long, default_value_t = false)]
     pub check_kernels: bool,
+
+    /// Disable the interactive dashboard and retain plain log output.
+    ///
+    /// Plain mode is also selected automatically when stdout is not a TTY.
+    #[arg(long, default_value_t = false)]
+    pub no_tui: bool,
 
     /// Override HuggingFace cache directory
     /// (default: $HF_HUB_CACHE, $HF_HOME/hub, or ~/.cache/huggingface/hub).
