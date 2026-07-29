@@ -222,17 +222,7 @@ impl BlockDiffusionDraftHead {
                          k_in: u32|
          -> Result<()> {
             if let Some(fp8) = w_fp8 {
-                return ops::fp8_gemm_n128_row_scaled(
-                    gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    src,
-                    fp8,
-                    dst,
-                    g,
-                    n_out,
-                    k_in,
-                    stream,
-                );
+                return self.fp8_gemm_dispatch(gpu, src, fp8, dst, g, n_out, k_in, stream);
             }
             // ATLAS_DFLASH_DRAFTER_FASTGEMM=1: small-M weight-streaming
             // BF16 GEMM (bit-identical accumulate chain; pure device args
@@ -942,17 +932,7 @@ impl BlockDiffusionDraftHead {
                          k_in: u32|
          -> Result<()> {
             if let Some(fp8) = w_fp8 {
-                return ops::fp8_gemm_n128_row_scaled(
-                    gpu,
-                    self.kernels.fp8_gemm_n128_row_scaled,
-                    src,
-                    fp8,
-                    dst,
-                    g,
-                    n_out,
-                    k_in,
-                    stream,
-                );
+                return self.fp8_gemm_dispatch(gpu, src, fp8, dst, g, n_out, k_in, stream);
             }
             // ATLAS_DFLASH_DRAFTER_FASTGEMM=1: small-M weight-streaming
             // BF16 GEMM (bit-identical accumulate chain; pure device args

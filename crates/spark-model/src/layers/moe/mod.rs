@@ -52,6 +52,25 @@ pub(crate) struct Bf16SharedExpert {
     down_proj: DenseWeight,
 }
 
+/// FP8-E4M3 row-scaled MIRROR of a BF16 shared expert
+/// (ATLAS_TARGET_SHARED_FP8=1).
+///
+/// Same machinery as the attention mirrors (`build_attn_fp8_mirrors`): the
+/// BF16 weights stay resident and authoritative (prefill and every multi-token
+/// path keep reading them), while the M=1 decode GEMVs read these half-width
+/// copies instead. On Laguna S-2.1 the BF16 shared expert costs 18.9 MB/layer
+/// x 47 layers = 887 MB/token (~3.62 ms at the 245 GB/s wall); the mirror
+/// halves that.
+///
+/// NOT bit-exact — this is a quantization, so it is quality-gated rather than
+/// parity-gated.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Fp8SharedExpertMirror {
+    pub gate_proj: crate::weight_map::Fp8DenseWeight,
+    pub up_proj: crate::weight_map::Fp8DenseWeight,
+    pub down_proj: crate::weight_map::Fp8DenseWeight,
+}
+
 impl Bf16SharedExpert {
     fn new(gate_proj: DenseWeight, up_proj: DenseWeight, down_proj: DenseWeight) -> Result<Self> {
         anyhow::ensure!(
@@ -121,6 +140,10 @@ pub struct MoeLayer {
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
     dense_gemm_pipelined: KernelHandle,
+    /// Batched-M BF16 GEMV for the router gate at small `n`
+    /// (ATLAS_MOE_GATE_GEMV=1). Zero when the kernel is absent from this
+    /// target's module set — dispatch then stays on `dense_gemm`.
+    dense_gemv_batchm: KernelHandle,
     /// FP32-output router GEMM + FP32-input top-K for the ATLAS_FP32_GATE path.
     /// Zero (unresolved) when the kernels are absent; dispatch falls back to BF16.
     dense_gemm_f32out: KernelHandle,
@@ -425,6 +448,13 @@ pub struct MoeLayer {
     // Checkpoint-native BF16 shared expert. Independent of routed-expert
     // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
     bf16_shared_expert: Option<Bf16SharedExpert>,
+    // FP8-E4M3 row-scaled mirror of `bf16_shared_expert`, built at load time
+    // under ATLAS_TARGET_SHARED_FP8=1. Consumed ONLY by the M=1 decode GEMVs
+    // in `run_bf16_shared_expert`; every multi-token/prefill path keeps the
+    // BF16 originals. `None` => BF16 everywhere (unchanged behaviour).
+    fp8_shared_expert_mirror: Option<Fp8SharedExpertMirror>,
+    // Kernel handle for the FP8 row-scaled GEMV that consumes the mirror.
+    dense_gemv_fp8w_k: KernelHandle,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     fp8_shared_expert: Option<Fp8ExpertWeight>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>

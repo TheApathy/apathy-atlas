@@ -17,6 +17,16 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 
 impl Qwen3AttentionLayer {
+    /// `ATLAS_DECODE_GPROJ_GEMV=1`: route the M=1 decode head-gate projection
+    /// through `dense_gemv_bf16` instead of the prefill `dense_gemm_tc`.
+    /// Cached — this is read once per layer per token on the decode hot path.
+    fn gproj_decode_gemv() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("ATLAS_DECODE_GPROJ_GEMV").ok().as_deref() == Some("1")
+        })
+    }
+
     pub(in super::super) fn attention_forward(
         &self,
         normed: DevicePtr,
@@ -719,17 +729,37 @@ impl Qwen3AttentionLayer {
         if let Some(ref g_proj) = self.head_gate_weight {
             // For decode, n=1 (single token). Reuse q_out scratch for gate [1, nq].
             let gate_buf = q_out;
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                1, // decode: single token
-                nq,
-                h,
-                stream,
-            )?;
+            // `dense_gemm_tc` is a prefill kernel: its 16x64 tile gives
+            // grid = (ceil(nq/64), ceil(1/16), 1) = (1, 1, 1) at M=1 — ONE CTA,
+            // 128 threads, computing 16 rows to use one. nsys measured 218us per
+            // layer (294KB of g_proj at ~1.3 GB/s, 0.5% of the 245 GB/s wall)
+            // = 10.5ms/token across 48 layers, 22% of the serial step. The
+            // M=1 GEMV grid is (ceil(nq/4), 1, 1) = 12 CTAs with no wasted tile
+            // rows, which is what dense_ffn.rs:1356 already assumes decode does.
+            if Self::gproj_decode_gemv() && self.dense_gemv_k.0 != 0 {
+                ops::dense_gemv(
+                    ctx.gpu,
+                    self.dense_gemv_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    nq,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm_tc(
+                    ctx.gpu,
+                    self.dense_gemm_tc_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    1, // decode: single token
+                    nq,
+                    h,
+                    stream,
+                )?;
+            }
             match self.head_gate_activation {
                 super::super::types::HeadGateActivation::Sigmoid => {
                     ops::sigmoid_gate_mul_head_broadcast(

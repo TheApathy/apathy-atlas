@@ -238,6 +238,15 @@ fn load_moe_ffn(
     // (same machinery as the routed NVFP4 experts) is the authoritative path.
     if let Some((sg, su, sd)) = bf16_shared {
         layer.set_bf16_shared_expert(sg, su, sd)?;
+        // ── FP8-E4M3 row-scaled mirror of the BF16 shared expert ──
+        // (ATLAS_TARGET_SHARED_FP8=1, default OFF = unchanged BF16.)
+        // Same machinery as the attention mirrors above; consumed only by the
+        // M=1 decode GEMVs (prefill/multi-token keep BF16). The BF16 originals
+        // stay resident, so this trades ~9.4 MiB/layer of VRAM for half the
+        // decode-time shared-expert bandwidth. Soft-fails to BF16.
+        // Announces itself once from inside (layer 0 is dense, so a
+        // `layer_idx == 0` gate here would never fire).
+        let _ = layer.build_shared_fp8_mirror(gpu, config.hidden_size, si)?;
     }
     // Keep-packed GGUF experts: the routed experts are raw Q4_K/Q6_K blocks and
     // carry NO NVFP4 scale tables, so the NVFP4-specific transpose and CUTLASS

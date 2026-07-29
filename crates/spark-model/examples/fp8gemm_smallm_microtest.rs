@@ -228,14 +228,60 @@ fn main() -> Result<()> {
     // never L2-resident — matching the serve-side reality where each of the
     // 48 layers' mirrors is cold every verify step. (The earlier single-buffer
     // bench was L2-hot and overstated GB/s at these ≤28MB weights.)
-    const ROT: usize = 8;
+    // FOOTPRINT KNOB (`ATLAS_MICRO_ROT`, default 8). ROT controls the aggregate
+    // resident footprint the bench walks: ROT copies of an N*K FP8 weight.
+    //
+    // Why this is the interesting variable, not a tuning detail. At ROT=8 these
+    // kernels hit 200-215 GB/s (82-88% of GB10's 245 GB/s usable wall), but the
+    // SAME kernel at the SAME shape measures ~1.4-1.5x slower inside the serve
+    // loop (nsys vgp.sqlite, decode steady state: q_proj p50 = 140us here vs
+    // 92us standalone). Sustained-throttle was falsified -- 8 back-to-back
+    // rounds showed zero decay. The remaining structural difference is
+    // FOOTPRINT: the bench walks ~150 MB while the serve loop walks a ~47 GB
+    // resident weight set in expert-selection order. 47 GB does not fit any
+    // plausible GPU TLB reach, so every weight access risks a page walk that
+    // the 150 MB bench never pays.
+    //
+    // Sweeping ROT interpolates between those two worlds on ONE kernel with
+    // everything else held fixed. If GB/s decays as the footprint grows toward
+    // tens of GB, the 46% stack-wide efficiency gap is address-translation, not
+    // arithmetic and not bandwidth -- which would explain why cutting expert
+    // BYTES (W3, -22%) lost while leaving the footprint's page count intact.
+    let rot_env: usize = std::env::var("ATLAS_MICRO_ROT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let rot = rot_env.max(1);
+    #[allow(non_snake_case)]
+    let ROT = rot;
     let bench_shapes: &[(&str, usize, usize, usize)] = &[
         ("qkv-q48", 7, 6144, 3072),
         ("qkv-q72", 7, 9216, 3072),
         ("oproj48", 7, 3072, 6144),
         ("oproj72", 7, 3072, 9216),
+        // ── The DFlash DRAFTER-step shapes (M=5, 94% of steps) ──
+        // The four above are all M=7 (the RETRIEVAL regime, 6% of steps) and
+        // all have N >= 3072. They MISS the K/V projections entirely: Laguna
+        // has 8 kv-heads x 128 = N=1024, so `fp8_mirror_gemm` sends k_proj and
+        // v_proj to the N_TILE=64 kernel (k=3072 fails its `k >= 4096` n32
+        // gate) at a grid of ceil(1024/64) = 16 CTAs — one third of GB10's 48
+        // SMs, and 1/6 of the in-flight cp.async depth the q/o shapes get.
+        // That is the exact pathology the _n32 variant was written for, at a
+        // shape the dispatch predicate does not route to it.
+        ("kv-m5", 5, 1024, 3072),
+        ("q-m5", 5, 6144, 3072),
+        ("o-m5", 5, 3072, 6144),
     ];
+    // Shape filter (`ATLAS_MICRO_SHAPE`, default all). A footprint sweep only
+    // needs one shape, and at large ROT the upload alone is tens of GB — so
+    // restrict rather than pay it four times over.
+    let shape_filter = std::env::var("ATLAS_MICRO_SHAPE").ok();
     for &(tag, m, n, k) in bench_shapes {
+        if let Some(f) = shape_filter.as_deref()
+            && tag != f
+        {
+            continue;
+        }
         let mut rng = Rng(0xBEEF);
         let a_bf16: Vec<u16> = (0..m * k)
             .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))

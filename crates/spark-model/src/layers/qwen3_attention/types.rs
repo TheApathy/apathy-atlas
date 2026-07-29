@@ -178,6 +178,11 @@ pub struct Qwen3AttentionLayer {
     /// Gemma-4 FP32-input rms_norm (absolute formula).
     pub(super) rms_norm_f32_in_k: KernelHandle,
     pub(super) dense_gemv_k: KernelHandle,
+    /// Small-M sibling of `dense_gemv_k` (`dense_gemv_bf16_batchm`); 0 if the
+    /// target has no such kernel. Used for the DFlash verify head-gate
+    /// projection, where M = gamma+1 is far too small to fill the prefill
+    /// tensor-core GEMM's 16x64 tile.
+    pub(super) dense_gemv_batchm_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,

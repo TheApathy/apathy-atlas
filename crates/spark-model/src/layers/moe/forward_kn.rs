@@ -115,17 +115,65 @@ impl MoeLayer {
         // 1. Router gate: [num_tokens, num_experts] (dense, Laguna).
         let router_in = self.router_input(input, n, h, ctx, stream)?;
         let gate_logits = ctx.buffers.gate_logits();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm,
-            router_in,
-            &self.weights.gate,
-            gate_logits,
-            n,
-            num_experts,
-            h,
-            stream,
-        )?;
+        // ATLAS_MOE_GATE_GEMV=1 (default off): route the router gate through the
+        // batched-M GEMV. `dense_gemm_bf16` tiles 16 M-rows x 16 N-cols, so at the
+        // DFlash verify shape (n = 5, num_experts = 256, h = 3072) it launches
+        // grid (16, 1, 1) — 16 CTAs on 48 SMs with 5 of 16 M-rows live. The GEMV
+        // parallelises over N instead and measures 0.0108 vs 0.0697 ms/layer
+        // kernel-only (6.5x, dense_gemm_microtest M=5 N=256 K=3072) => ~2.8 ms/step.
+        //
+        // NOT bit-exact, unlike the g_proj sibling: at this shape the GEMV drifts
+        // up to 7.3e-3 rel where the GEMM is exact, and rank-10/rank-11 logits tie
+        // exactly in BF16 on ~half of sampled inputs — so a tie-break flip can
+        // change the selected expert. Default off; gate on output-hash parity AND
+        // a quality bench before promoting.
+        let gate_gemv = Self::moe_gate_gemv()
+            && self.dense_gemv_batchm.0 != 0
+            && n <= ops::DENSE_GEMV_BATCHM_MAX_M;
+        // Positive arming signal: `try_kernel` is silent at info level on a miss,
+        // so without this an absent kernel would look exactly like a null A/B
+        // result. Printed once (Once, not per-step) and only when the env asked
+        // for it, so it cannot pollute a base run.
+        if Self::moe_gate_gemv() {
+            static ARMED: std::sync::Once = std::sync::Once::new();
+            ARMED.call_once(|| {
+                eprintln!(
+                    "MOE gate GEMV: kernel={} first_n={} armed={}",
+                    if self.dense_gemv_batchm.0 != 0 { "loaded" } else { "MISSING" },
+                    n,
+                    gate_gemv
+                );
+            });
+        }
+        if gate_gemv {
+            // router_in [n, h] and gate_logits [n, num_experts] are both densely
+            // packed here, so the strides are exactly h and num_experts.
+            ops::dense_gemv_batchm(
+                ctx.gpu,
+                self.dense_gemv_batchm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                n,
+                num_experts,
+                h,
+                h,
+                num_experts,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm,
+                router_in,
+                &self.weights.gate,
+                gate_logits,
+                n,
+                num_experts,
+                h,
+                stream,
+            )?;
+        }
         kn_ck!("gate_dense_gemm");
 
         // 2. Batched top-K → [num_tokens*top_k] indices + weights. Match the

@@ -234,6 +234,14 @@ impl BlockDiffusionDraftHead {
                 "w4a16",
                 "fp8_gemm_t_row_scaled_mtile8",
             ),
+            // N_TILE=32 sibling — small-N/large-K M≤8 shapes (the drafter's
+            // o_proj / down_proj at N=3072), where the N_TILE=64 grid is only
+            // 1 CTA/SM. Used by the DRAFTER_FP8_SMALLM ladder.
+            fp8_gemm_row_scaled_mtile8_n32: crate::layers::try_kernel(
+                gpu,
+                "w4a16",
+                "fp8_gemm_t_row_scaled_mtile8_n32",
+            ),
             // Laguna per-head softplus attention-output gate. Module/function
             // both `softplus_gate_mul_head_broadcast` (kernels/gb10/common/
             // residual_add.cu). Only invoked when a layer has `g_proj`; still
@@ -673,6 +681,31 @@ impl BlockDiffusionDraftHead {
             head.target_layer_ids,
         );
 
+        // Arming line for the BF16 N_TILE threshold A/B. Printed only when the
+        // gate is on, and only when FASTGEMM is actually live — the threshold
+        // sits inside try_fastgemm, so with FASTGEMM off this gate is inert and
+        // saying "armed" would be a lie. A dormant gate reading as a clean null
+        // has already cost this campaign one arm, hence a dedicated grep target
+        // rather than a field appended to the banner above.
+        if crate::layers::dflash_head::dflash_bf16_ntile64_3072_enabled() {
+            if crate::layers::dflash_head::drafter_fastgemm_enabled() {
+                tracing::info!(
+                    "DFlash BF16 fastgemm: N_TILE=64 cutoff raised 2048 -> 3072 \
+                     [ATLAS_DFLASH_BF16_NTILE64_3072] — o_proj/down_proj (N={}) \
+                     now take the 64-wide kernel ({} CTAs, was {})",
+                    head.hidden_size,
+                    head.hidden_size.div_ceil(64),
+                    head.hidden_size.div_ceil(128),
+                );
+            } else {
+                tracing::warn!(
+                    "ATLAS_DFLASH_BF16_NTILE64_3072=1 but ATLAS_DFLASH_DRAFTER_FASTGEMM \
+                     is OFF — the N_TILE threshold lives inside try_fastgemm, so this \
+                     gate is INERT and this arm will measure as base."
+                );
+            }
+        }
+
         // Phase G — opt-in drafter FP8. Two modes:
         //   ATLAS_DFLASH_DRAFTER_FP8=1      — FULL: quantize all seven
         //     dense-GEMM weights per layer (q/k/v/o/gate/up/down) plus the
@@ -691,13 +724,63 @@ impl BlockDiffusionDraftHead {
         // Acceptance gate (G.4 design doc §16.7): bench must hold
         // ≥43% accept (vs 44.9% BF16) AND ≥11.0 tok/s (vs 8.70). If hard
         // fail, layer-by-layer ablation; skip layer 0 first.
-        let fp8_full = std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
-        let fp8_attn_only = !fp8_full
+        // ATLAS_DFLASH_DRAFTER_FP8_MASK — per-weight ablation override.
+        // Comma list drawn from {q,k,v,o,gate,up,down,lm_head}; when set it
+        // REPLACES the full/attn-only booleans so each of the seven layer
+        // GEMMs (plus the lm_head mirror) can be quantized independently
+        // without a rebuild. `ATLAS_DFLASH_DRAFTER_FP8_MASK=` (empty) or
+        // unset → no override, existing behaviour bit-identical.
+        //   full mode      ≡ MASK=q,k,v,o,gate,up,down,lm_head
+        //   attn-only mode ≡ MASK=q,k,v,o
+        // Purpose: localize which weight's FP8 rounding costs drafter
+        // acceptance, given full-FP8 measured 2.83 tok/step vs BF16's 3.02.
+        let fp8_mask: Option<std::collections::HashSet<String>> =
+            std::env::var("ATLAS_DFLASH_DRAFTER_FP8_MASK")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().to_ascii_lowercase())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                });
+        if let Some(mask) = fp8_mask.as_ref() {
+            const KNOWN: [&str; 8] = ["q", "k", "v", "o", "gate", "up", "down", "lm_head"];
+            for name in mask {
+                if !KNOWN.contains(&name.as_str()) {
+                    anyhow::bail!(
+                        "ATLAS_DFLASH_DRAFTER_FP8_MASK: unknown weight {name:?} \
+                         (expected a comma list from {KNOWN:?})"
+                    );
+                }
+            }
+        }
+        let masked = |name: &str| {
+            fp8_mask
+                .as_ref()
+                .is_some_and(|m| m.contains(name))
+        };
+
+        let fp8_full = fp8_mask.is_none()
+            && std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
+        let fp8_attn_only = fp8_mask.is_none()
+            && !fp8_full
             && std::env::var("ATLAS_DFLASH_DRAFTER_FP8_ATTN")
                 .ok()
                 .as_deref()
                 == Some("1");
-        let fp8_requested = fp8_full || fp8_attn_only;
+        // Per-weight arming: mask mode consults the mask, legacy mode
+        // reproduces full (all seven) / attn-only (q/k/v/o) exactly.
+        let want = |name: &str| -> bool {
+            if fp8_mask.is_some() {
+                return masked(name);
+            }
+            match name {
+                "q" | "k" | "v" | "o" => fp8_full || fp8_attn_only,
+                _ => fp8_full,
+            }
+        };
+        let fp8_requested = fp8_full || fp8_attn_only || fp8_mask.is_some();
         let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
             && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
         if fp8_requested && !fp8_kernels_present {
@@ -709,15 +792,37 @@ impl BlockDiffusionDraftHead {
             );
         }
         if fp8_requested && fp8_kernels_present {
+            let armed: Vec<&str> = ["q", "k", "v", "o", "gate", "up", "down", "lm_head"]
+                .into_iter()
+                .filter(|n| want(n))
+                .collect();
+            // `tile =` names the rung the ladder will actually land on, not the
+            // rung that was requested: it folds in whether the kernels resolved
+            // (a 0-handle silently demotes). A dormant gate reading as a clean
+            // null has burned this campaign before, so the sweep asserts this
+            // string rather than trusting the env it exported.
+            let tile = if !crate::layers::dflash_head::dflash_drafter_fp8_smallm_enabled() {
+                "stock-M64"
+            } else if crate::layers::dflash_head::dflash_drafter_fp8_smallm_no_mtile8() {
+                "m16 [NO_MTILE8: bench only]"
+            } else if head.kernels.fp8_gemm_row_scaled_mtile8_n32.0 != 0 {
+                "mtile8+n32"
+            } else if head.kernels.fp8_gemm_row_scaled_mtile8.0 != 0 {
+                "mtile8 (n32 handle missing)"
+            } else {
+                "m16 (mtile8 handles missing)"
+            };
             tracing::info!(
-                "DFlash Phase G: quantizing drafter weights to FP8 E4M3 ({} layers × {} GEMMs{})",
+                "DFlash Phase G: quantizing drafter weights to FP8 E4M3 \
+                 ({} layers, armed = {:?}{}, tile = {})",
                 head.num_layers,
-                if fp8_attn_only { 4 } else { 7 },
-                if fp8_attn_only {
-                    ", attn-only: q/k/v/o"
+                armed,
+                if fp8_mask.is_some() {
+                    " [ATLAS_DFLASH_DRAFTER_FP8_MASK]"
                 } else {
                     ""
-                }
+                },
+                tile
             );
             let stream = 0u64; // default stream — load-time, no concurrency
             let q_dim_local = q_dim;
@@ -726,49 +831,61 @@ impl BlockDiffusionDraftHead {
             let inter = head.intermediate_size;
             let quant_k = head.kernels.quantize_bf16_to_fp8;
             for (layer_idx, layer) in head.layers.iter_mut().enumerate() {
-                // Q proj: [q_dim, h]
-                layer.q_proj_fp8 =
-                    Some(
-                        layer
-                            .q_proj
-                            .quantize_to_fp8(gpu, quant_k, q_dim_local, h, stream)?,
-                    );
-                // K proj: [kv_dim, h]
-                layer.k_proj_fp8 =
-                    Some(
-                        layer
-                            .k_proj
-                            .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
-                    );
-                // V proj: [kv_dim, h]
-                layer.v_proj_fp8 =
-                    Some(
-                        layer
-                            .v_proj
-                            .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
-                    );
-                // O proj: [h, q_dim]
-                layer.o_proj_fp8 =
-                    Some(
-                        layer
-                            .o_proj
-                            .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
-                    );
-                // MLP (gate/up/down) — FULL mode only. Attn-only mode leaves
-                // the mirrors None so the per-GEMM dispatch stays on BF16.
-                if fp8_full {
+                // Each mirror is armed independently; a weight left None
+                // keeps its BF16 dispatch in `gemm_swap`.
+                if want("q") {
+                    // Q proj: [q_dim, h]
+                    layer.q_proj_fp8 =
+                        Some(
+                            layer
+                                .q_proj
+                                .quantize_to_fp8(gpu, quant_k, q_dim_local, h, stream)?,
+                        );
+                }
+                if want("k") {
+                    // K proj: [kv_dim, h]
+                    layer.k_proj_fp8 =
+                        Some(
+                            layer
+                                .k_proj
+                                .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
+                        );
+                }
+                if want("v") {
+                    // V proj: [kv_dim, h]
+                    layer.v_proj_fp8 =
+                        Some(
+                            layer
+                                .v_proj
+                                .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
+                        );
+                }
+                if want("o") {
+                    // O proj: [h, q_dim]
+                    layer.o_proj_fp8 =
+                        Some(
+                            layer
+                                .o_proj
+                                .quantize_to_fp8(gpu, quant_k, h, q_dim_local, stream)?,
+                        );
+                }
+                if want("gate") {
                     // Gate proj: [inter, h]
                     layer.gate_proj_fp8 = Some(
                         layer
                             .gate_proj
                             .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
                     );
+                }
+                if want("up") {
                     // Up proj: [inter, h]
                     layer.up_proj_fp8 = Some(
                         layer
                             .up_proj
                             .quantize_to_fp8(gpu, quant_k, inter, h, stream)?,
                     );
+                }
+                if want("down") {
                     // Down proj: [h, inter]
                     layer.down_proj_fp8 = Some(
                         layer
@@ -778,7 +895,7 @@ impl BlockDiffusionDraftHead {
                 }
                 tracing::debug!("DFlash Phase G: layer {} quantized", layer_idx);
             }
-            if fp8_full {
+            if want("lm_head") {
                 // Phase G — also quantize the shared lm_head weight. It's the
                 // largest GEMM in the drafter (vocab × hidden = 248320 × 5120 ≈
                 // 1.27B weights, ~14× any per-layer GEMM). We allocate a SEPARATE
@@ -801,16 +918,19 @@ impl BlockDiffusionDraftHead {
                     stream,
                 )?);
             }
-            head.quant = if fp8_full {
+            // Informational only — every hot-path dispatch keys off the
+            // per-weight mirror's presence, not this enum. Under a mask,
+            // report Fp8Weights when any MLP weight is armed and
+            // Fp8AttnWeights when the armed set is attention-only.
+            head.quant = if armed.iter().any(|n| matches!(*n, "gate" | "up" | "down")) {
                 DflashQuantization::Fp8Weights
             } else {
                 DflashQuantization::Fp8AttnWeights
             };
             tracing::info!(
-                "DFlash Phase G: drafter weights ready as FP8 (quant = {:?}). \
-                 Unset ATLAS_DFLASH_DRAFTER_FP8{} to revert to BF16.",
+                "DFlash Phase G: drafter weights ready as FP8 (quant = {:?}, armed = {:?}).",
                 head.quant,
-                if fp8_attn_only { "_ATTN" } else { "" }
+                armed
             );
         }
 

@@ -120,6 +120,14 @@ pub struct DflashKernels {
     /// bandwidth at the mirror shapes). 0-handle on miss — dispatch falls
     /// back to `_m16`.
     pub fp8_gemm_row_scaled_mtile8: KernelHandle,
+    /// N_TILE=32 sibling of `_mtile8` for small-N/large-K M ≤ 8 shapes
+    /// (`w4a16::fp8_gemm_t_row_scaled_mtile8_n32`). At N=3072 the N_TILE=64
+    /// tile launches ceil(3072/64) = 48 CTAs = exactly 1/SM on GB10, and one
+    /// 4-stage cp.async ring per SM cannot hide LPDDR5x latency; the N_TILE=32
+    /// grid doubles that to 96 CTAs = 2/SM. Bit-identical accumulation chain.
+    /// Serves the drafter's o_proj (N=3072, K=9216) and down_proj (N=3072,
+    /// K=12288). 0-handle on miss — dispatch falls back to `_mtile8`.
+    pub fp8_gemm_row_scaled_mtile8_n32: KernelHandle,
     /// Laguna per-head attention-output gate: applies
     /// `out[t,h,d] = in[t,h,d] * softplus(gate[t,h])`, broadcasting one
     /// softplus scalar per head across `head_dim`. Consumes the `[γ, num_q_heads]`
@@ -686,6 +694,105 @@ pub(crate) fn drafter_fastgemm_enabled() -> bool {
     })
 }
 
+/// ATLAS_DFLASH_DRAFTER_FP8_SMALLM=1 (default OFF): route the drafter's
+/// seven per-layer FP8 GEMMs off the stock `fp8_gemm_t_row_scaled`
+/// (M_TILE=64) onto the small-M tile ladder.
+///
+/// At the propose shape M=γ=5 the M_TILE=64 kernel wastes ~92% of its
+/// MMA cycles and smem_A traffic: grid Y is ceil(M/64)=1, but each CTA
+/// still runs a full 64-row A tile. The `_mtile8` header (w4a16_gemm.cu)
+/// puts the stock tile at ~43% of the LPDDR5x bound at M=7 vs ≥85%
+/// expected. Phase G checks these kernels are loaded as an arming
+/// precondition and then never calls them on the layer path — only the
+/// lm_head tail reaches them.
+///
+/// The ladder mirrors the target's `fp8_mirror_gemm` (qwen3_attention/
+/// trait_impl/multi_seq/qkv.rs), measured at 82-88% of the wall at M=5:
+///
+/// ```text
+/// m<=8 && n<=3072 && k>=4096  -> _mtile8_n32  (N_TILE=32)
+/// m<=8                        -> _mtile8      (N_TILE=64)
+/// m<=16                       -> _m16
+/// else                        -> stock M_TILE=64
+/// ```
+///
+/// The n32 rung matters for o_proj (N=3072, K=9216) and down_proj
+/// (N=3072, K=12288): at N=3072 the N_TILE=64 grid is ceil(3072/64) = 48
+/// CTAs = exactly 1/SM on GB10, and one 4-stage cp.async ring per SM
+/// cannot hide LPDDR5x latency. N_TILE=32 doubles the grid to 2/SM.
+///
+/// Guarded on `m` rather than γ so a future γ > 8 falls through to `_m16`
+/// instead of tripping the `debug_assert!(m <= 8)` in the smallm
+/// launchers. All rungs share the m16n8k32 MMA shape, ascending-K
+/// accumulate order and scale-then-cast epilogue, so this is intended as
+/// a pure occupancy change with identical output — but note `g_proj`'s
+/// GEMV was bit-exact against its GEMM while the MoE router-gate GEMV
+/// diverged on 5/6 hashes, so parity is asserted by the bench, not
+/// assumed. Read once (OnceLock) so graph capture and replay agree.
+pub(crate) fn dflash_drafter_fp8_smallm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_DRAFTER_FP8_SMALLM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+/// ATLAS_DFLASH_DRAFTER_FP8_SMALLM_NO_MTILE8=1 (default OFF, BENCH ONLY):
+/// with `ATLAS_DFLASH_DRAFTER_FP8_SMALLM=1` also set, skips both mtile8
+/// rungs so the ladder falls through to `_m16`. Exists so the ablation
+/// can price the two rungs against each other in one binary — the
+/// drafter's lm_head tail already records `_m16` as ~40% slower cold, and
+/// if the two rungs also disagree *numerically* we want that isolated
+/// from the M_TILE=64 arm rather than confounded with it. No production
+/// arm sets this. Read once (OnceLock) so graph capture and replay agree.
+pub(crate) fn dflash_drafter_fp8_smallm_no_mtile8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_DRAFTER_FP8_SMALLM_NO_MTILE8")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+/// ATLAS_DFLASH_BF16_NTILE64_3072=1 (default OFF): raise `try_fastgemm`'s
+/// N_TILE=64 cutoff from 2048 to 3072, so o_proj (N=3072, K=9216) and
+/// down_proj (N=3072, K=12288) take the 64-wide kernel instead of the
+/// 128-wide one.
+///
+/// The 2048 threshold appears never to have been measured at N=3072. Its
+/// doc scores both arms against `dense_gemm_bf16_pipelined` — kv_proj at
+/// N=1024, o/down/fc/lm_head at N>2048 — but not against each other, and
+/// 2048 sits as a round number between two measured endpoints. Three
+/// facts collide at N=3072: (1) the N_TILE=64 kernel's header names
+/// "o/down = 48 CTAs" as a design goal; (2) this dispatcher sends those
+/// two shapes to N_TILE=128, i.e. ceil(3072/128) = 24 CTAs on 48 SMs,
+/// half the machine idle; (3) the 128-wide kernel's stated rationale is
+/// relieving DRAM page thrash from "MANY concurrent 64-row B streams
+/// (96+ CTAs)" — but the 64-wide tile makes 48 streams here, not 96+, so
+/// that rationale does not obviously reach this shape. q_proj (144 CTAs)
+/// and gate/up (192 CTAs) DO clear 96+, which is why the cutoff moves to
+/// exactly 3072 and not higher.
+///
+/// Both kernels document the same ascending-K m16n8k16 accumulate chain
+/// and both claim bit-identity with the pipelined kernel, so this is
+/// expected to be a pure occupancy change with 6/6 hash parity — asserted
+/// by the bench, not assumed. A divergence would falsify one of those two
+/// bit-identity claims and is worth reporting on its own.
+///
+/// Read once (OnceLock) so graph capture and replay agree.
+pub(crate) fn dflash_bf16_ntile64_3072_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_BF16_NTILE64_3072")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 /// ATLAS_DFLASH_PROPOSE_ONEGRAPH=1 (default OFF): single full-propose
 /// captured graph (see `propose_onegraph`). Shared gate for the three
 /// coupled sites — the `forward_block` capture/replay branch, the
@@ -718,6 +825,99 @@ impl BlockDiffusionDraftHead {
         (self.max_seq_len + self.gamma + 1).div_ceil(BLOCK_SIZE) * std::mem::size_of::<u32>()
     }
 
+    /// Dispatch one row-scaled FP8 drafter GEMM through the small-M tile
+    /// ladder when `ATLAS_DFLASH_DRAFTER_FP8_SMALLM=1`, else the stock
+    /// M_TILE=64 kernel. See `dflash_drafter_fp8_smallm_enabled` for the
+    /// ladder and its rationale.
+    ///
+    /// Both smallm launchers `debug_assert!(m <= 8)`, so the `m <= 8`
+    /// guards are load-bearing, not cosmetic. `k % 32 == 0` is the
+    /// kernels' documented contract (all drafter K ∈ {3072, 9216, 12288}
+    /// qualify); a miss falls through rather than launching a kernel
+    /// whose K-step ring would read past the tail.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fp8_gemm_dispatch(
+        &self,
+        gpu: &dyn GpuBackend,
+        src: DevicePtr,
+        weight: &crate::weight_map::Fp8DenseWeight,
+        dst: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if dflash_drafter_fp8_smallm_enabled() {
+            // Bench-only: skip both mtile8 rungs so the ladder lands on `_m16`.
+            // Lets the sweep price mtile8 against _m16 without rebuilding, and
+            // isolates any mtile8-vs-_m16 numeric disagreement from the
+            // M_TILE=64 comparison. Never set in production.
+            let no_mtile8 = dflash_drafter_fp8_smallm_no_mtile8();
+            if !no_mtile8
+                && m <= 8
+                && k.is_multiple_of(32)
+                && n <= 3072
+                && k >= 4096
+                && self.kernels.fp8_gemm_row_scaled_mtile8_n32.0 != 0
+            {
+                // Small-N/large-K: o_proj and down_proj. N_TILE=64 would put
+                // only 1 CTA/SM here — see the field docs.
+                return crate::layers::ops::fp8_gemm_row_scaled_smallm_n32(
+                    gpu,
+                    self.kernels.fp8_gemm_row_scaled_mtile8_n32,
+                    src,
+                    weight,
+                    dst,
+                    m,
+                    n,
+                    k,
+                    stream,
+                );
+            }
+            if !no_mtile8
+                && m <= 8
+                && k.is_multiple_of(32)
+                && self.kernels.fp8_gemm_row_scaled_mtile8.0 != 0
+            {
+                return crate::layers::ops::fp8_gemm_row_scaled_smallm(
+                    gpu,
+                    self.kernels.fp8_gemm_row_scaled_mtile8,
+                    src,
+                    weight,
+                    dst,
+                    m,
+                    n,
+                    k,
+                    stream,
+                );
+            }
+            if m <= 16 && self.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0 {
+                return crate::layers::ops::fp8_gemm_n128_row_scaled_m16(
+                    gpu,
+                    self.kernels.fp8_gemm_n128_row_scaled_m16,
+                    src,
+                    weight,
+                    dst,
+                    m,
+                    n,
+                    k,
+                    stream,
+                );
+            }
+        }
+        crate::layers::ops::fp8_gemm_n128_row_scaled(
+            gpu,
+            self.kernels.fp8_gemm_n128_row_scaled,
+            src,
+            weight,
+            dst,
+            m,
+            n,
+            k,
+            stream,
+        )
+    }
+
     /// Try to dispatch an `[m, n] = [m, k] · [n, k]ᵀ` BF16 GEMM through the
     /// small-M weight-streaming kernels. Returns `Ok(true)` when the fast
     /// path launched (caller skips the pipelined fallback), `Ok(false)`
@@ -748,7 +948,15 @@ impl BlockDiffusionDraftHead {
         if !drafter_fastgemm_enabled() || m > 16 || k % 8 != 0 {
             return Ok(false);
         }
-        let (kernel, wide) = if n <= 2048 {
+        // ATLAS_DFLASH_BF16_NTILE64_3072=1 raises the N_TILE=64 cutoff from
+        // 2048 to 3072, moving o_proj and down_proj (both N=hidden=3072) off
+        // the wide kernel. See `dflash_bf16_ntile64_3072_enabled`.
+        let cutoff = if dflash_bf16_ntile64_3072_enabled() {
+            3072
+        } else {
+            2048
+        };
+        let (kernel, wide) = if n <= cutoff {
             (self.kernels.dense_gemm_mtile16, false)
         } else {
             (self.kernels.dense_gemm_mtile16_n128, true)

@@ -68,6 +68,14 @@ impl MoeLayer {
                 "gemm",
                 "dense_gemm_bf16_pipelined",
             ),
+            // Router-gate GEMV (ATLAS_MOE_GATE_GEMV). Same module/symbol pair the
+            // attention head-gate uses (qwen3_attention/init.rs) — try_kernel so an
+            // older kernel set just leaves it zero and dispatch stays on the GEMM.
+            dense_gemv_batchm: super::super::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
             // FP32 gate path (ATLAS_FP32_GATE) — optional; KernelHandle(0) if the
             // target's kernel set predates these symbols, dispatch then stays BF16.
             dense_gemm_f32out: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_f32out"),
@@ -506,6 +514,10 @@ impl MoeLayer {
             bf16_up_weight_ptrs: None,
             bf16_down_weight_ptrs: None,
             bf16_shared_expert: None,
+            // Built later by `build_shared_fp8_mirror` (ATLAS_TARGET_SHARED_FP8=1),
+            // after the BF16 shared expert has been installed by the loader.
+            fp8_shared_expert_mirror: None,
+            dense_gemv_fp8w_k: super::super::try_kernel(gpu, "gemv_fp8w", "dense_gemv_fp8w"),
             fp8_shared_expert: None,
             moe_down_t_k64_fp4: super::super::try_kernel(
                 gpu,

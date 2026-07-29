@@ -152,6 +152,15 @@ fn grid_block(name: &str, m: u32, n: u32) -> Result<([u32; 3], [u32; 3])> {
         // 4 warps. Validates the WMMA fragment layout shared by the FP8/NVFP4
         // GEMMs. Grid (ceil(N/64), ceil(M/16), 1), Block (128,1,1).
         "dense_gemm_tc" => ([n.div_ceil(64), m.div_ceil(16), 1], [128u32, 1, 1]),
+        // M=1 decode GEMV. Same math and same operand layout as the GEMM arms
+        // (C = A·Bᵀ, B is [N,K] row-major), so it grades against the identical
+        // CPU oracle — which is exactly the point: this arm exists to prove the
+        // GEMV and the tensor-core GEMM agree on g_proj, not merely that each
+        // is self-consistent. N_PER_BLOCK=4, 256 threads (see dense_gemv_bf16.cu).
+        "dense_gemv_bf16" => ([n.div_ceil(4), 1, 1], [256u32, 1, 1]),
+        // Small-M sibling of the above: same N-parallel geometry, M rides in
+        // registers. Exists for the DFlash verify g_proj (M = gamma+1, N = 48).
+        "dense_gemv_bf16_batchm" => ([n.div_ceil(4), 1, 1], [256u32, 1, 1]),
         other => bail!("no launch geometry registered for kernel '{other}' — add an arm"),
     })
 }
@@ -160,7 +169,12 @@ fn grid_block(name: &str, m: u32, n: u32) -> Result<([u32; 3], [u32; 3])> {
 /// dense_gemm_tc.cu is its own TU → module = file stem.
 fn module_for(name: &str) -> &'static str {
     match name {
-        "dense_gemm_tc" => "dense_gemm_tc",
+        // Per kernels/gb10/common/KERNEL.toml [modules]: the dense_gemm_tc.cu
+        // TU is published as module "gemm_tc", not its file stem.
+        "dense_gemm_tc" => "gemm_tc",
+        "dense_gemv_bf16" => "gemv",
+        // No [modules] override — module name is the file stem.
+        "dense_gemv_bf16_batchm" => "dense_gemv_bf16_batchm",
         _ => "gemm",
     }
 }
@@ -180,16 +194,38 @@ fn launch(
     // function symbol is the kernel name.
     let handle = gpu.kernel(module_for(name), name)?;
     let (grid, block) = grid_block(name, m, n)?;
-    KernelLaunch::new(gpu, handle)
+    let launch = KernelLaunch::new(gpu, handle)
         .grid(grid)
         .block(block)
         .arg_ptr(a)
         .arg_ptr(b)
-        .arg_ptr(c)
-        .arg_u32(m)
-        .arg_u32(n)
-        .arg_u32(k)
-        .launch(stream)?;
+        .arg_ptr(c);
+    // Scalar-argument tails differ across the family:
+    //   GEMM   (A, B, C, M, N, K)
+    //   GEMV   (A, B, C,    N, K)         — M is implicitly 1
+    //   batchM (A, B, C, M, N, K, a_stride, out_stride)
+    match name {
+        "dense_gemv_bf16" => {
+            if m != 1 {
+                bail!("dense_gemv_bf16 is an M=1 kernel — got M={m}");
+            }
+            launch.arg_u32(n).arg_u32(k).launch(stream)?;
+        }
+        "dense_gemv_bf16_batchm" => {
+            // Densely-packed A [M,K] and C [M,N] — the layout the verify-path
+            // g_proj call site uses, and the one the CPU oracle assumes.
+            launch
+                .arg_u32(m)
+                .arg_u32(n)
+                .arg_u32(k)
+                .arg_u32(k)
+                .arg_u32(n)
+                .launch(stream)?;
+        }
+        _ => {
+            launch.arg_u32(m).arg_u32(n).arg_u32(k).launch(stream)?;
+        }
+    }
     if sync {
         gpu.synchronize(stream)?;
     }
@@ -257,6 +293,62 @@ fn main() -> Result<()> {
     }
     let cosine = dot / (ng.sqrt() * nc.sqrt());
     let mean_rel = sum_rel / (m * n) as f64;
+
+    // ATLAS_MICROTEST_TOPK=<k>: grade the output as a ROUTER, not as a matrix.
+    //
+    // For the MoE router gate (N=256 experts, K=3072) cosine and max_rel are
+    // the wrong oracle: nothing downstream consumes the logits, only the
+    // top-k *argmax set* and its softmax weights. A candidate kernel whose
+    // max_rel is one BF16 ULP (3.91e-3 = 2^-8) is numerically indistinguishable
+    // from the reference — but that is only an argument, and the thing worth
+    // measuring is whether any selected expert actually changes. Ties in BF16
+    // are exact ties, so a flip here means two experts stored the identical
+    // logit and the kernels broke the tie differently.
+    if let Ok(kk) = std::env::var("ATLAS_MICROTEST_TOPK") {
+        let kk: usize = kk.parse().unwrap_or(0);
+        if kk > 0 && kk <= n {
+            let rank = |row: &[u16]| -> Vec<usize> {
+                let mut idx: Vec<usize> = (0..n).collect();
+                // Descending by value; index ascending as the tie-break so the
+                // comparison isn't polluted by sort instability.
+                idx.sort_by(|&x, &y| {
+                    bf16_bits_to_f32(row[y])
+                        .partial_cmp(&bf16_bits_to_f32(row[x]))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(x.cmp(&y))
+                });
+                idx.truncate(kk);
+                idx
+            };
+            let (mut set_mismatch, mut order_mismatch, mut slot_diff) = (0usize, 0usize, 0usize);
+            let mut min_gap = f64::INFINITY; // rank-k vs rank-(k+1) margin
+            for r in 0..m {
+                let g = rank(&c_gpu[r * n..(r + 1) * n]);
+                let c = rank(&c_cpu[r * n..(r + 1) * n]);
+                if g != c {
+                    order_mismatch += 1;
+                }
+                let mut gs = g.clone();
+                let mut cs = c.clone();
+                gs.sort_unstable();
+                cs.sort_unstable();
+                if gs != cs {
+                    set_mismatch += 1;
+                    slot_diff += cs.iter().filter(|e| !gs.contains(e)).count();
+                }
+                // Margin on the CPU oracle: how close the decision actually was.
+                let mut vals: Vec<f32> = (0..n).map(|j| bf16_bits_to_f32(c_cpu[r * n + j])).collect();
+                vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                min_gap = min_gap.min((vals[kk - 1] - vals[kk]) as f64);
+            }
+            println!(
+                "topk({kk}): set_mismatch={set_mismatch}/{m} rows  \
+                 swapped_slots={slot_diff}/{}  order_mismatch={order_mismatch}/{m} rows  \
+                 min_rank{kk}_margin={min_gap:.3e}",
+                m * kk
+            );
+        }
+    }
 
     // ── rough throughput (wall-clock, includes launch overhead; relative A/B) ──
     let iters = 50;

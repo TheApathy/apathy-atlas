@@ -14,6 +14,19 @@ use crate::layers::qwen3_attention::HeadGateActivation;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
 impl Qwen3AttentionLayer {
+    /// `ATLAS_VERIFY_GPROJ_GEMV=1`: route the small-M (speculative verify)
+    /// head-gate projection through `dense_gemv_bf16_batchm` instead of the
+    /// prefill `dense_gemm_tc`. Cached — read once per layer per verify step.
+    ///
+    /// Sibling of `ATLAS_DECODE_GPROJ_GEMV`, which does the same for the M=1
+    /// serial decode path.
+    fn gproj_verify_gemv() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("ATLAS_VERIFY_GPROJ_GEMV").ok().as_deref() == Some("1")
+        })
+    }
+
     /// ATLAS_FUSED_ELEMWISE=1 flat-verify epilogue eligibility. Every term is
     /// load-fixed (weights/kernels/dtypes) or capture-shape-fixed (`n`), so
     /// the decision is stable across a CUDA-graph capture and its replays.
@@ -399,17 +412,46 @@ impl Qwen3AttentionLayer {
 
         if let Some(ref g_proj) = self.head_gate_weight {
             let gate_buf = qkv_buf;
-            ops::dense_gemm_tc(
-                fwd.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                n as u32,
-                nq,
-                h as u32,
-                stream,
-            )?;
+            // `normed` is [n, h] and `gate_buf` [n, nq], both densely packed —
+            // the layout dense_gemm_tc assumes, so the strides below are exact.
+            //
+            // At the DFlash verify shape (n = gamma+1 = 7, nq = 48, h = 3072)
+            // dense_gemm_tc's 16x64 tile gives grid (1, 1, 1): one CTA pulling
+            // the full 294 KB BF16 weight through a single SM, ~162 us. The
+            // batched GEMV parallelises over nq instead (12 CTAs, weight still
+            // read once) at ~12 us — 13x, and exact where the tensor-core GEMM
+            // drifts a BF16 ulp (see dense_gemm_microtest, M=7 N=48 K=3072:
+            // gemm_tc max_rel 7.5e-3 vs batchm 0.0 against the CPU oracle).
+            let use_batchm = Self::gproj_verify_gemv()
+                && self.dense_gemv_batchm_k.0 != 0
+                && (n as u32) <= ops::DENSE_GEMV_BATCHM_MAX_M;
+            if use_batchm {
+                ops::dense_gemv_batchm(
+                    fwd.gpu,
+                    self.dense_gemv_batchm_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    n as u32,
+                    nq,
+                    h as u32,
+                    h as u32,
+                    nq,
+                    stream,
+                )?;
+            } else {
+                ops::dense_gemm_tc(
+                    fwd.gpu,
+                    self.dense_gemm_tc_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    n as u32,
+                    nq,
+                    h as u32,
+                    stream,
+                )?;
+            }
             match self.head_gate_activation {
                 HeadGateActivation::Sigmoid => ops::sigmoid_gate_mul_head_broadcast(
                     fwd.gpu,

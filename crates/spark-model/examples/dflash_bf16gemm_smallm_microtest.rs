@@ -248,6 +248,19 @@ fn main() -> Result<()> {
     }
 
     // ── Part 2: bench old vs new at the drafter's real propose shapes ──
+    // M=16 rows are the historical set. The M=5 rows are the shape the
+    // drafter ACTUALLY runs (γ=5) — both kernels are M_TILE=16 so the grid
+    // is identical either way, but the A-tile smem/cp.async traffic is not,
+    // and the N_TILE=64-vs-128 threshold at dflash_head.rs:915 has to be
+    // decided at the M we ship, not the M the harness happened to use.
+    //
+    // The o_proj/down rows are the whole question: N=3072 sends them to the
+    // n128 kernel (24 CTAs on 48 SMs) while the mtile16 header names 48 CTAs
+    // at exactly those shapes as a design goal. n128's rationale is relieving
+    // page thrash at "96+ CTAs"; at N=3072 the 64-wide tile makes 48, not
+    // 96+, so that argument may not reach this shape. q/gate/up ARE at 144
+    // and 192 CTAs, where the thrash argument plausibly does hold — they are
+    // here as the contrast, not as candidates.
     let bench_shapes: &[(&str, usize, usize, usize)] = &[
         ("q_proj  ", 16, 9216, 3072),
         ("kv_proj ", 16, 1024, 3072),
@@ -257,6 +270,12 @@ fn main() -> Result<()> {
         ("fc      ", 1, 3072, 18432),
         ("fused_kv", 1, 12288, 3072),
         ("lm_head ", 16, 100352, 3072),
+        // γ=5: the shipping propose shapes.
+        ("q_proj g5", 5, 9216, 3072),
+        ("kv_proj g5", 5, 1024, 3072),
+        ("o_proj g5", 5, 3072, 9216),
+        ("gate/up g5", 5, 12288, 3072),
+        ("down    g5", 5, 3072, 12288),
     ];
     for &(tag, m, n, k) in bench_shapes {
         let mut rng = Rng(0xBEEF);

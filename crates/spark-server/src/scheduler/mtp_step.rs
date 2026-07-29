@@ -4,6 +4,22 @@
 
 use super::*;
 
+/// Smallest `drafts.len()` that routes to `step_verify_dflash` (default 4).
+///
+/// Lowering this is the only way to measure K=3/K=4 on the DFlash verify path
+/// — below the floor the step silently drops onto the MTP-shaped k4/k3 graphs.
+fn dflash_dispatch_min() -> usize {
+    use std::sync::OnceLock;
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ATLAS_DFLASH_DISPATCH_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(4)
+    })
+}
+
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 ///
@@ -424,7 +440,7 @@ pub fn step_mtp(
         // for step_verify_dflash firing (needs len>=4). If this logs a branch
         // other than "dflash", propose is returning <4 for Laguna.
         if crate::scheduler::verify_pipeline_helper::dflash_diag_enabled() {
-            let branch = if drafts.len() >= 4 {
+            let branch = if drafts.len() >= dflash_dispatch_min() {
                 "dflash (K=γ)"
             } else if num_drafts >= 3 && drafts.len() >= 3 {
                 "k4"
@@ -435,10 +451,11 @@ pub fn step_mtp(
             };
             tracing::info!(
                 "DFLASH DIAG scheduler Phase-B verify dispatch: drafts.len()={} num_drafts={} \
-                 → branch={} (step_verify_dflash fires iff len>=4)",
+                 → branch={} (step_verify_dflash fires iff len>={})",
                 drafts.len(),
                 num_drafts,
                 branch,
+                dflash_dispatch_min(),
             );
         }
 
@@ -447,7 +464,18 @@ pub fn step_mtp(
         // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
         // MTP keeps using the existing graphed paths; this dispatch is purely
         // additive.
-        if drafts.len() >= 4 {
+        //
+        // The `>= 4` floor is why `--dflash-gamma 4` measured 9.3 tok/s and
+        // gamma 3 measured 13.2 while gamma 5 measured 26.6: gamma G yields
+        // num_drafts = G-1, so G <= 4 never reaches step_verify_dflash at all
+        // and drops onto the MTP-shaped k4/k3 paths (no STEP_TIMING lines are
+        // emitted there — that is the cheapest way to tell which path ran).
+        // `step_verify_dflash` itself is generic in `drafts.len()`; nothing
+        // below hard-codes K. ATLAS_DFLASH_DISPATCH_MIN lowers the floor so
+        // the small-K economics can actually be measured — pair it with
+        // ATLAS_MOE_BATCH_MIN_N=4 or the batched MoE still won't engage at
+        // K=4. See laguna-expert-union-curve for why small K might win.
+        if drafts.len() >= dflash_dispatch_min() {
             step_verify_dflash(
                 model,
                 a,

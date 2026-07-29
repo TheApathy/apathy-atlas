@@ -226,6 +226,12 @@ pub fn moe_expert_gemv_silu_down_2x(
 /// Eliminates separate shared expert gate+up kernel launch.
 ///
 /// Grid: (ceil(N/8), top_k+1, 2)  Block: (128, 1, 1)
+///
+/// `skip_shared` (ATLAS_MOE_SKIP_PLACEHOLDER_SHARED) drops the shared slot by
+/// launching grid.y = top_k instead of top_k+1. The kernel selects the shared
+/// expert solely via `blockIdx.y == top_k`, so the removed blocks are exactly
+/// the shared ones and every routed slot is untouched — bit-exact. Only valid
+/// when the caller overwrites the shared scratch afterwards (mixed BF16 shared).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_gate_up_shared(
     gpu: &dyn GpuBackend,
@@ -247,10 +253,11 @@ pub fn moe_expert_gate_up_shared(
     n: u32,
     k: u32,
     top_k: u32,
+    skip_shared: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), top_k + 1, 2])
+        .grid([div_ceil(n, 8), if skip_shared { top_k } else { top_k + 1 }, 2])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_ptrs)
@@ -283,6 +290,8 @@ pub fn moe_expert_gate_up_shared(
 /// Eliminates separate shared expert silu+down kernel launch.
 ///
 /// Grid: (ceil(N/8), top_k+1, 1)  Block: (128, 1, 1)
+///
+/// See `moe_expert_gate_up_shared` for `skip_shared` semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_silu_down_shared(
     gpu: &dyn GpuBackend,
@@ -301,10 +310,11 @@ pub fn moe_expert_silu_down_shared(
     n: u32,
     k: u32,
     top_k: u32,
+    skip_shared: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), top_k + 1, 1])
+        .grid([div_ceil(n, 8), if skip_shared { top_k } else { top_k + 1 }, 1])
         .block([128, 1, 1])
         .shared_mem(k * 4) // s_act[K] for precomputed SiLU(gate)*up activation
         .arg_ptr(gate_out)
@@ -332,6 +342,8 @@ pub fn moe_expert_silu_down_shared(
 /// bit-identical outputs. Requires k == 1024 (caller-guarded).
 ///
 /// Grid: (ceil(N/16), top_k+1, 1)  Block: (128, 1, 1)
+///
+/// See `moe_expert_gate_up_shared` for `skip_shared` semantics.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_silu_down_shared_v5(
     gpu: &dyn GpuBackend,
@@ -350,10 +362,11 @@ pub fn moe_expert_silu_down_shared_v5(
     n: u32,
     k: u32,
     top_k: u32,
+    skip_shared: bool,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 16), top_k + 1, 1])
+        .grid([div_ceil(n, 16), if skip_shared { top_k } else { top_k + 1 }, 1])
         .block([128, 1, 1])
         .shared_mem(k * 4) // s_act[K] for precomputed SiLU(gate)*up activation
         .arg_ptr(gate_out)

@@ -113,6 +113,9 @@ impl MoeLayer {
         // offset past `shared_expert_intermediate_size * 2` bytes.
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
+        // See forward.rs / helpers_c.rs: skip the fused kernel's placeholder
+        // shared slot when the BF16 shared expert overwrites it below.
+        let skip_placeholder_shared = self.skip_placeholder_shared();
 
         for t in 0..num_tokens {
             let input_t = input.offset(t * h_usize * bf16);
@@ -430,6 +433,7 @@ impl MoeLayer {
                     inter,
                     h,
                     top_k,
+                    skip_placeholder_shared,
                     stream,
                 )?;
                 ops::moe_expert_silu_down_shared(
@@ -449,6 +453,7 @@ impl MoeLayer {
                     h,
                     inter,
                     top_k,
+                    skip_placeholder_shared,
                     stream,
                 )?;
             }

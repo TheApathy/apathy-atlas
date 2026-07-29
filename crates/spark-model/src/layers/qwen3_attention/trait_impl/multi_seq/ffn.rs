@@ -16,6 +16,29 @@ fn pairwise_moe_decode_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_MOE_PAIRWISE_DECODE").as_deref() != Ok("0"))
 }
 
+/// Smallest `n` that may use the batched `forward_kn` MoE path.
+///
+/// The dispatch below has a hole at n == 4: n == 2 goes to `forward_k2`,
+/// n == 3 to `forward_k3`, n > 4 to `forward_kn`, and **n == 4 falls through
+/// to the per-token sequential loop** — which re-reads every routed expert
+/// weight 4 times instead of once. That is worth ~1.5x the expert bandwidth
+/// (4 x top_k = 40 expert loads vs the measured union(4) = 26.8; see
+/// bench/union_curve.py and laguna-expert-union-curve) and is the mechanism
+/// behind the gamma<=4 throughput cliff.
+///
+/// Default 5 keeps the historical behaviour exactly. `ATLAS_MOE_BATCH_MIN_N=4`
+/// closes the hole so K=4 verify steps get the batched path too.
+fn batch_moe_min_n() -> usize {
+    use std::sync::OnceLock;
+    static MIN_N: OnceLock<usize> = OnceLock::new();
+    *MIN_N.get_or_init(|| {
+        std::env::var("ATLAS_MOE_BATCH_MIN_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+    })
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_ffn(&self, c: &MultiSeqCtx<'_>, o_out: DevicePtr) -> Result<()> {
         let MultiSeqCtx {
@@ -106,7 +129,7 @@ impl Qwen3AttentionLayer {
             )?;
         } else if !force_seq_ffn
             && !self.ffn.is_dense()
-            && n > 4
+            && n >= batch_moe_min_n()
             && std::env::var("ATLAS_DFLASH_BATCH_MOE").ok().as_deref() == Some("1")
         {
             // EXPERIMENT (task #30, env-gated A/B): the per-token MoE loop below

@@ -130,6 +130,52 @@ pub fn dense_gemv(
         .launch(stream)
 }
 
+/// Dense BF16 GEMV batched over M rows (small M): one pass over the weight
+/// produces all M output rows.
+///
+/// `input`: `[M, K]` BF16, row `t` at `input + t * a_stride`;
+/// `output`: `[M, N]` BF16, row `t` at `output + t * out_stride` (both strides
+/// in BF16 elements). Row 0 is bit-identical to a `dense_gemv` call.
+///
+/// Exists because the prefill tensor-core GEMM tiles 16 M-rows x 64 N-cols, so
+/// at the DFlash verify shape (M = gamma+1 = 7, N = num_heads = 48) it launches
+/// a single CTA and drags the whole weight through one SM. Callers must fall
+/// back to `dense_gemm_tc` when `m` exceeds the kernel's `MAX_M` (16).
+///
+/// Kernel: `dense_gemv_bf16_batchm(A, B, C, M, N, K, a_stride, out_stride)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_batchm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    a_stride: u32,
+    out_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(a_stride)
+        .arg_u32(out_stride)
+        .launch(stream)
+}
+
+/// Largest M the `dense_gemv_bf16_batchm` kernel accumulates in registers.
+/// Must track `MAX_M` in `dense_gemv_bf16_batchm.cu`.
+pub const DENSE_GEMV_BATCHM_MAX_M: u32 = 16;
+
 /// Dense BF16 GEMV, batched over 2 rows (M=2): one pass over the weight
 /// produces both output rows, halving weight bandwidth vs two `dense_gemv`
 /// launches. Bit-identical to two M=1 `dense_gemv` calls — each row's

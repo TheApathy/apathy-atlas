@@ -127,10 +127,154 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// Build the FP8-E4M3 row-scaled MIRROR of the BF16 shared expert
+    /// (ATLAS_TARGET_SHARED_FP8=1). Returns the device bytes allocated, or 0
+    /// when the mirror was not built.
+    ///
+    /// Mirrors `build_attn_fp8_mirrors` exactly, including its soft-fail
+    /// contract: a missing kernel, an absent BF16 shared expert, or an
+    /// allocation failure all fall back to the BF16 path and must NEVER abort
+    /// model load.
+    ///
+    /// Shapes (checkpoint `[N, K]` row-major): gate/up `[shared_inter, h]`,
+    /// down `[h, shared_inter]`.
+    pub fn build_shared_fp8_mirror(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        h: usize,
+        shared_inter: usize,
+    ) -> Result<usize> {
+        use std::sync::Once;
+        static WARN_KERNELS: Once = Once::new();
+        static WARN_SOURCE: Once = Once::new();
+        static WARN_ALLOC: Once = Once::new();
+
+        if std::env::var("ATLAS_TARGET_SHARED_FP8").ok().as_deref() != Some("1") {
+            return Ok(0);
+        }
+        let quantize_k = crate::layers::try_kernel(gpu, "gemv_fp8w", "quantize_bf16_to_fp8");
+        if quantize_k.0 == 0 || self.dense_gemv_fp8w_k.0 == 0 {
+            WARN_KERNELS.call_once(|| {
+                tracing::warn!(
+                    "ATLAS_TARGET_SHARED_FP8=1 but quantize_bf16_to_fp8 / dense_gemv_fp8w \
+                     are absent from this kernel set — shared expert stays BF16"
+                );
+            });
+            return Ok(0);
+        }
+        let Some(shared) = self.bf16_shared_expert else {
+            WARN_SOURCE.call_once(|| {
+                tracing::warn!(
+                    "ATLAS_TARGET_SHARED_FP8=1 but this layer has no BF16 shared expert — \
+                     nothing to mirror"
+                );
+            });
+            return Ok(0);
+        };
+        anyhow::ensure!(
+            h > 0 && shared_inter > 0,
+            "shared-expert FP8 mirror requires non-zero hidden/intermediate dims"
+        );
+
+        let stream = gpu.default_stream();
+        let mut built: Vec<crate::weight_map::Fp8DenseWeight> = Vec::with_capacity(3);
+        let specs: [(&DenseWeight, usize, usize); 3] = [
+            (&shared.gate_proj, shared_inter, h),
+            (&shared.up_proj, shared_inter, h),
+            (&shared.down_proj, h, shared_inter),
+        ];
+        for (src, n, k) in specs {
+            match src.quantize_to_fp8(gpu, quantize_k, n, k, stream) {
+                Ok(m) => built.push(m),
+                Err(e) => {
+                    for m in built {
+                        let _ = gpu.free(m.weight);
+                        let _ = gpu.free(m.row_scale);
+                    }
+                    WARN_ALLOC.call_once(|| {
+                        tracing::warn!(
+                            "ATLAS_TARGET_SHARED_FP8=1: shared-expert mirror quantization \
+                             failed ({e:#}); this layer (and any later failures) stay BF16"
+                        );
+                    });
+                    return Ok(0);
+                }
+            }
+        }
+        // Order matches `specs`: gate, up, down.
+        let down_proj = built.pop().expect("down mirror");
+        let up_proj = built.pop().expect("up mirror");
+        let gate_proj = built.pop().expect("gate mirror");
+        self.fp8_shared_expert_mirror = Some(Fp8SharedExpertMirror {
+            gate_proj,
+            up_proj,
+            down_proj,
+        });
+        // Load-time proof the mirror is armed: log-grepping layer 0 is useless
+        // here because layer 0 is dense (no shared expert), so the first MoE
+        // layer to build a mirror announces it once for the whole model.
+        {
+            static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+            ANNOUNCE.call_once(|| {
+                tracing::info!(
+                    "ATLAS_TARGET_SHARED_FP8=1: FP8 row-scaled shared-expert mirrors ARMED \
+                     (first MoE layer built; ~{:.1} MiB per MoE layer, decode GEMVs only)",
+                    (2 * shared_inter * h + h * shared_inter) as f64 / (1024.0 * 1024.0)
+                );
+            });
+        }
+        let scale = std::mem::size_of::<f32>();
+        Ok(2 * shared_inter * h + h * shared_inter + scale * (2 * shared_inter + h))
+    }
+
     /// Whether a BF16 shared expert must overwrite the contribution produced
     /// by a quantized fused routed-expert kernel.
     pub(super) fn has_mixed_bf16_shared_expert(&self) -> bool {
         self.bf16_shared_expert.is_some() && self.bf16_gate_weight_ptrs.is_none()
+    }
+
+    /// ATLAS_MOE_SKIP_PLACEHOLDER_SHARED=1: in the mixed NVFP4-routed /
+    /// BF16-shared config (Laguna S-2.1), drop the shared expert slot from the
+    /// fused routed kernel's grid entirely.
+    ///
+    /// Rationale: when `has_mixed_bf16_shared_expert()` is true the NVFP4
+    /// shared weights are load-time PLACEHOLDERS (weight_loader/laguna/
+    /// load_layers.rs excludes the shared expert from NVFP4; BF16 is
+    /// authoritative). The fused kernel computes them into
+    /// shared_gate/up/out scratch, and `run_bf16_shared_expert` then
+    /// unconditionally OVERWRITES all three from BF16. So the fused kernel's
+    /// shared slot is pure waste: ~5.3 MB/layer x 47 layers = ~250 MB/token
+    /// read and discarded (~1.0 ms/token at a 245 GB/s wall).
+    ///
+    /// The kernels select the shared expert solely via `blockIdx.y == top_k`
+    /// (moe_shared_expert_fused.cu), so launching grid.y = top_k instead of
+    /// top_k+1 removes exactly those blocks and touches no routed slot —
+    /// BIT-EXACT by construction.
+    ///
+    /// The batch2/batch3 verify paths (forward_k2/forward_k3) already achieve
+    /// this by passing NULL shared weights; only the M=1 serial decode path
+    /// still pays for the placeholder.
+    pub(super) fn skip_placeholder_shared(&self) -> bool {
+        static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SKIP.get_or_init(|| {
+            std::env::var("ATLAS_MOE_SKIP_PLACEHOLDER_SHARED").ok().as_deref() == Some("1")
+        }) && self.has_mixed_bf16_shared_expert()
+    }
+
+    /// ATLAS_MOE_GATE_GEMV=1 (default OFF): run the router gate through
+    /// `dense_gemv_bf16_batchm` instead of `dense_gemm_bf16` at small `n`.
+    ///
+    /// Read once via OnceLock so the choice cannot differ between a CUDA-graph
+    /// capture and its replays (same discipline as
+    /// `dflash_propose_onegraph_enabled`). The caller additionally checks the
+    /// kernel handle and the `n <= DENSE_GEMV_BATCHM_MAX_M` bound, so this is
+    /// only the operator's opt-in, not the whole predicate.
+    ///
+    /// Default OFF because this one is NOT bit-exact — see the dispatch comment
+    /// in `forward_kn.rs`.
+    pub(super) fn moe_gate_gemv() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("ATLAS_MOE_GATE_GEMV").ok().as_deref() == Some("1"))
     }
 
     /// Evaluate a checkpoint-native BF16 shared expert into `down_out`.
@@ -158,13 +302,35 @@ impl MoeLayer {
             "BF16 shared expert requires non-zero token and intermediate dimensions"
         );
 
+        // ATLAS_TARGET_SHARED_FP8=1: the M=1 decode GEMVs read the FP8-E4M3
+        // row-scaled mirror instead of the BF16 original — half the weight
+        // bytes (887 -> ~444 MB/token across 47 layers). Multi-token and
+        // prefill paths below deliberately keep BF16: the mirror exists only
+        // to relieve the decode bandwidth wall, and cuBLASLt BF16 already wins
+        // at those shapes. NOT bit-exact (quantization) — quality-gated.
+        let mirror = self.fp8_shared_expert_mirror;
         let project = |activation: DevicePtr,
                        weight: &DenseWeight,
+                       fp8: Option<&crate::weight_map::Fp8DenseWeight>,
                        output: DevicePtr,
                        n: u32,
                        k: u32|
          -> Result<()> {
             if num_tokens == 1 {
+                if let Some(w8) = fp8
+                    && self.dense_gemv_fp8w_k.0 != 0
+                {
+                    return ops::dense_gemv_fp8w(
+                        ctx.gpu,
+                        self.dense_gemv_fp8w_k,
+                        activation,
+                        w8,
+                        output,
+                        n,
+                        k,
+                        stream,
+                    );
+                }
                 ops::dense_gemv(
                     ctx.gpu,
                     self.dense_gemv,
@@ -207,6 +373,7 @@ impl MoeLayer {
         project(
             input,
             &shared.gate_proj,
+            mirror.as_ref().map(|m| &m.gate_proj),
             gate_out,
             shared_intermediate,
             hidden_size,
@@ -214,6 +381,7 @@ impl MoeLayer {
         project(
             input,
             &shared.up_proj,
+            mirror.as_ref().map(|m| &m.up_proj),
             up_out,
             shared_intermediate,
             hidden_size,
@@ -230,6 +398,7 @@ impl MoeLayer {
         project(
             gate_out,
             &shared.down_proj,
+            mirror.as_ref().map(|m| &m.down_proj),
             down_out,
             hidden_size,
             shared_intermediate,

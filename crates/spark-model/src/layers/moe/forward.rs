@@ -291,6 +291,13 @@ impl MoeLayer {
         let shared_gate_scratch = ctx.buffers.logits();
         let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let shared_out = ctx.buffers.attn_output();
+        // ATLAS_MOE_SKIP_PLACEHOLDER_SHARED=1 (mixed BF16-shared only): drop the
+        // fused routed kernel's shared slot (grid.y top_k+1 -> top_k). The
+        // `run_bf16_shared_expert` call below rewrites all three shared scratch
+        // buffers from the authoritative BF16 weights, so the skipped NVFP4
+        // placeholder work was pure waste. Bit-exact; see
+        // `skip_placeholder_shared` in helpers_c.rs.
+        let skip_placeholder_shared = self.skip_placeholder_shared();
 
         if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
             self.bf16_gate_weight_ptrs,
@@ -501,6 +508,7 @@ impl MoeLayer {
                     inter,
                     h,
                     top_k,
+                    skip_placeholder_shared,
                     stream,
                 )
             })?;
@@ -567,6 +575,7 @@ impl MoeLayer {
                         h,
                         inter,
                         top_k,
+                        skip_placeholder_shared,
                         stream,
                     )
                 } else {
@@ -587,6 +596,7 @@ impl MoeLayer {
                         h,
                         inter,
                         top_k,
+                        skip_placeholder_shared,
                         stream,
                     )
                 }
