@@ -736,18 +736,42 @@ impl Qwen3AttentionLayer {
             // Reuse q_contiguous as scratch for gate output [n, nq] BF16.
             // Q buffer is no longer needed after flash attention.
             let gate_buf = q_contiguous;
-            // GEMM: normed [n, H] × g_proj^T [H, nq] → gate_buf [n, nq]
-            ops::dense_gemm_tc(
-                ctx.gpu,
-                self.dense_gemm_tc_k,
-                normed,
-                g_proj,
-                gate_buf,
-                n,
-                nq,
-                h,
-                stream,
-            )?;
+            // GEMM: normed [n, H] × g_proj^T [H, nq] → gate_buf [n, nq].
+            // N = nq (72 for Laguna) is tiny, and dense_gemm_tc is inefficient
+            // there: its grid is [ceil(N/64), ceil(M/16)] = 2 N-blocks. Route it
+            // through the same cuBLASLt path q/k/v/o use (bf16_gemm_act_weight_t),
+            // which handles small N better (~2.5% C=1 prefill, A/B ISL 1024/8192);
+            // dense_gemm_tc stays as the fallback when cuBLAS is off.
+            // Separate gate from ATLAS_CUBLAS_GEMM so one binary serves both
+            // A/B arms. The [paged] vs [cache_skip] tag in the route line also
+            // settles WHICH prefill path a given probe took — 8628bb3b's own
+            // message records that patching only cache_skip showed no change
+            // because fresh C=1 prefill goes through paged.rs.
+            let hg_cublas = ops::prefill_cublas_dense_enabled();
+            {
+                static ROUTE_ONCE: std::sync::Once = std::sync::Once::new();
+                ROUTE_ONCE.call_once(|| {
+                    tracing::info!(
+                        "HEAD_GATE prefill[cache_skip] route={} n={n} nq={nq} h={h}",
+                        if hg_cublas { "cublaslt" } else { "dense_gemm_tc" }
+                    );
+                });
+            }
+            if hg_cublas {
+                ops::cublas_bf16_proj_dense(normed, g_proj.weight, gate_buf, n, nq, h, stream)?;
+            } else {
+                ops::dense_gemm_tc(
+                    ctx.gpu,
+                    self.dense_gemm_tc_k,
+                    normed,
+                    g_proj,
+                    gate_buf,
+                    n,
+                    nq,
+                    h,
+                    stream,
+                )?;
+            }
             // Sigmoid + broadcast multiply: attn_out[t,h,d] *= sigmoid(gate[t,h])
             match self.head_gate_activation {
                 super::super::types::HeadGateActivation::Sigmoid => {

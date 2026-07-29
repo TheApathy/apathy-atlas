@@ -59,6 +59,29 @@ pub fn cublas_gemm_enabled() -> bool {
     *EN.get_or_init(|| std::env::var("ATLAS_CUBLAS_GEMM").ok().as_deref() == Some("1"))
 }
 
+/// Route the BF16 *prefill* dense-FFN and head-gate GEMMs through cuBLASLt
+/// instead of `dense_gemm_tc`? (`ATLAS_PREFILL_CUBLAS=1`), cached.
+///
+/// `dense_gemm_tc` runs the large dense-FFN shapes (Laguna layer-0 gate/up/down,
+/// N=12288/3072 K=3072) at ~1.4 TFLOP/s against 90+ on cuBLASLt, and tiles the
+/// head-gate's N=nq=72 output into a 2-block grid. Both are the same
+/// BF16xBF16->FP32 GEMM q/k/v/o already send to `cublas_bf16_proj_dense`.
+///
+/// Kept as a separate gate from [`cublas_gemm_enabled`] so a single binary can
+/// serve both arms of the A/B: production exports `ATLAS_CUBLAS_GEMM=1`
+/// already, so folding this into that flag would make the control leg
+/// unreachable without a second build.
+///
+/// NOT bit-exact — cuBLASLt and the mma.sync kernel differ in accumulation
+/// order, so this needs an output-hash check on long prompts, not just tok/s.
+pub fn prefill_cublas_dense_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| {
+        cublas_gemm_enabled() && std::env::var("ATLAS_PREFILL_CUBLAS").ok().as_deref() == Some("1")
+    })
+}
+
 /// Fused elementwise-swarm kernels enabled? (`ATLAS_FUSED_ELEMWISE=1`), cached.
 /// Default OFF — gates the fused q/k norm+rope+cache-write epilogue of the
 /// multi-seq flat verify AND the serial (M=1) decode path, plus the fused MoE

@@ -1357,10 +1357,47 @@ impl DenseFfnLayer {
         // separate path, so TPOT is unaffected; BF16 MMA preserves coherence.
         if let Some(ref bf16w) = self.bf16_weights {
             let tc = self.dense_gemm_tc_k.0 != 0;
-            // helper: tensor-core GEMM when available, else scalar
+            // helper: cuBLASLt when enabled (the big win at prefill M), else the
+            // tensor-core MMA kernel, else scalar. dense_gemm_tc is ~1.4 TFLOP/s
+            // on the large dense-FFN shapes (e.g. Laguna layer-0 gate/up/down at
+            // N=12288/3072, K=3072) — nsys measured its 3 launches at ~100 ms
+            // EACH = 33% of the whole C=1 prefill. cuBLASLt runs the identical
+            // BF16×BF16→FP32 GEMM at 90+ TFLOP/s (~65× faster), the same path
+            // q/k/v/o and the head-gate already use. Gated on ATLAS_CUBLAS_GEMM.
+            // Dispatch proof. dense_ffn.rs carries no `prof_step!`, so this
+            // layer is INVISIBLE in the ATLAS_PREFILL_HOST_TIMING phase table
+            // (480 ATTN + 470 MoE entries cover attention and the 47 MoE
+            // layers and nothing here). Without a line naming the route taken,
+            // a flat A/B cannot distinguish "cuBLASLt is no faster" from
+            // "the cuBLASLt branch never ran". One-shot, so it costs nothing.
+            //
+            // A/B GATE. One binary must serve BOTH arms or the comparison
+            // confounds the patch with the build. `ATLAS_PREFILL_CUBLAS=1`
+            // takes the new route; OMITTING it reproduces production byte for
+            // byte. Presence-based on purpose — the control leg unsets the var
+            // rather than setting it to 0, which is the only spelling that is
+            // safe across this tree's mixed gate predicates.
+            let cublas_dense = ops::prefill_cublas_dense_enabled();
+            {
+                static ROUTE_ONCE: std::sync::Once = std::sync::Once::new();
+                ROUTE_ONCE.call_once(|| {
+                    let route = if cublas_dense {
+                        "cublaslt"
+                    } else if tc {
+                        "dense_gemm_tc"
+                    } else {
+                        "scalar"
+                    };
+                    tracing::info!(
+                        "DENSE_FFN prefill route={route} m={m} inter={inter} h={h}"
+                    );
+                });
+            }
             macro_rules! ffn_gemm {
                 ($a:expr, $b:expr, $c:expr, $n:expr, $k:expr) => {
-                    if tc {
+                    if cublas_dense {
+                        ops::cublas_bf16_proj_dense($a, $b.weight, $c, m, $n, $k, stream)?;
+                    } else if tc {
                         ops::dense_gemm_tc(
                             ctx.gpu,
                             self.dense_gemm_tc_k,
