@@ -117,11 +117,26 @@ qwen_wait_ready "$LOG" 120
 # --- POST-BOOT ASSERTS: fail loudly if any invariant is off -------------------
 fail=0
 
-# 1. Right kernel target. Matched as a PREFIX: the serve prints the target's
-#    Display, which is "<model>, <quant>", and pinning the quant suffix here
-#    would produce a false FAIL the day it changes for an unrelated reason.
-[ "$(grep -cF "Selected kernel target: $KERNEL_TARGET" "$LOG" || true)" -ge 1 ] \
-  || { echo "ASSERT FAIL: kernel target is not $KERNEL_TARGET"; fail=1; }
+# 1. Right kernel target. The serve prints the target's Display, and that Display
+#    is a THREE-field tuple with the SM arch first:
+#      Selected kernel target: (sm_121, qwen3.6-27b, nvfp4) (136 modules)
+#    An earlier version of this assert matched "Selected kernel target: <model>"
+#    as a prefix, on the belief that the Display was "<model>, <quant>". It is
+#    not, so the assert failed a serve that had loaded exactly the right target.
+#
+#    So match the model as a whole FIELD inside the tuple: preceded by '(' or
+#    ',' and followed by ',' or ')'. That tolerates the sm_ prefix and the quant
+#    suffix changing for unrelated reasons -- which was the original intent --
+#    while still refusing to match a longer name that merely starts the same way
+#    (qwen3.6-27b must not be satisfied by qwen3.6-27b-instruct).
+#
+#    The model name contains '.', a regex metacharacter, so it is escaped rather
+#    than trusted to match itself.
+kt_re=$(printf '%s' "$KERNEL_TARGET" | sed 's/[][\.*^$+?(){}|\\]/\\&/g')
+[ "$(grep -cE "Selected kernel target:.*[(,][[:space:]]*${kt_re}[,)]" "$LOG" || true)" -ge 1 ] \
+  || { echo "ASSERT FAIL: kernel target is not $KERNEL_TARGET"
+       echo "  serve reported: $(grep -oE 'Selected kernel target:.*' "$LOG" | head -1)"
+       fail=1; }
 
 # 2. Determinism. The same temperature-0 prompt twice must be byte-identical.
 #    Without this, every hash comparison in this harness is measured against a
