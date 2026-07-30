@@ -246,10 +246,15 @@ def main() -> None:
             if row["engine_agree"] is False:
                 marks.append(f"** ENGINE SIGNALS DISAGREE: spec_frac={row['spec_frac']} vs "
                              f"adapt_suspend={row['adapt_suspend']} -- do not quote this row")
+            # Print "-" for an unmeasured cell, never 0. `or 0` would render an
+            # empty scrape as accept 0.00, which reads as "the drafter accepted
+            # nothing" -- a finding -- when the truth is that nothing was
+            # measured. Same rule as the three-state verdict above.
+            srv_c = f"{row['server_tok_s']:.1f}" if row["server_tok_s"] is not None else "-"
             print(f"{task_id:<13}{_LANG_NAME[lang]:<8}{row['tok_s']:>8.1f}"
-                  f"{(row['server_tok_s'] or 0):>7.1f}{row['completion_tokens']:>6}"
+                  f"{srv_c:>7}{row['completion_tokens']:>6}"
                   f"{('Y' if row['capped'] else '-'):>5}"
-                  f"{(row['mean_accept'] or 0):>8.2f}{row['attempts']:>5}"
+                  f"{acc:>8}{row['attempts']:>5}"
                   f"  {row['hash'][:10]}" + ("  " + "  ".join(marks) if marks else ""),
                   flush=True)
 
