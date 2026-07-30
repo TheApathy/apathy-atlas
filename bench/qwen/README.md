@@ -53,20 +53,30 @@ This launcher asserts its own invariants and refuses to report a healthy serve
 unless all of them hold. Every assert exists because its absence once produced a
 clean-looking but wrong measurement:
 
-1. **Gate guard (pre-launch).** Every `ATLAS_*` gate the stack exports must exist
+1. **Gate parity (pre-launch).** `env.sh`'s `qwen_champion_env()` is a second copy
+   of the configuration in `local/serve-aeon-27b-dflash.sh`, the script the
+   published numbers were measured on. `verify_gate_parity.sh` re-derives the
+   gate set from that launcher on every run and refuses to serve on any
+   difference. It runs *before* the preflight kill, so a config error does not
+   cost you a running serve. This one is not hypothetical: eleven gates were
+   missing from `env.sh` for a while, because the check that cleared it had been
+   pointed at a stale copy of the launcher and so agreed with itself. Run
+   `bash bench/qwen/verify_gate_parity.sh --self-test` to confirm the comparator
+   fires on a planted divergence before you trust it passing.
+2. **Gate guard (pre-launch).** Every `ATLAS_*` gate the stack exports must exist
    as a string in the binary. A gate the binary cannot read is a silent no-op,
    and the serve is then healthy while running a configuration nobody asked for.
    The gate list is derived from the function body at runtime, never from a
    hand-maintained copy.
-2. **Kernel target.** Matched as a prefix — the serve prints `<model>, <quant>`,
+3. **Kernel target.** Matched as a prefix — the serve prints `<model>, <quant>`,
    and pinning the quant suffix would produce a false failure the day it changes
    for an unrelated reason.
-3. **Determinism.** The same temperature-0 prompt twice must be byte-identical.
+4. **Determinism.** The same temperature-0 prompt twice must be byte-identical.
    Without this, every hash comparison in the harness is measured against a
    moving target.
-4. **No SSM corruption signature.** See trap 1 below — the failure mode is a run
+5. **No SSM corruption signature.** See trap 1 below — the failure mode is a run
    of `!` in otherwise valid output, not a crash.
-5. **Speculation actually ran, at width 16.** A serve that silently decodes
+6. **Speculation actually ran, at width 16.** A serve that silently decodes
    serially is fast enough to look plausible and produces numbers that are not
    about DFlash at all.
 
@@ -88,9 +98,10 @@ of zero must never be readable as "nothing wrong".
 
 | File | Purpose |
 |---|---|
-| `env.sh` | Every path, port, gate and geometry setting. Single source of truth. |
+| `env.sh` | Every path, port, gate and geometry setting for the harness. |
+| `verify_gate_parity.sh` | Re-derives the gate set from `local/serve-aeon-27b-dflash.sh` and fails on drift. That launcher, not `env.sh`, is the source of truth. |
 | `build_cutlass.sh` | Release build with the correct kernel target. |
-| `serve_champion.sh` | Self-verifying launcher (the five asserts above). |
+| `serve_champion.sh` | Self-verifying launcher (the six asserts above). |
 | `benchenv.py` | Log scraping. Owns the accept anchor — read it before editing a regex. |
 | `decode_bench.py` | The six-prompt deterministic decode benchmark. |
 

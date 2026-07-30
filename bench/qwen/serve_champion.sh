@@ -16,6 +16,19 @@
 source "$(dirname "${BASH_SOURCE[0]:-$0}")/env.sh"
 qwen_require_model
 
+# --- GATE PARITY --------------------------------------------------------------
+# qwen_champion_env() is a second copy of the configuration in
+# local/serve-aeon-27b-dflash.sh, which is the script the published numbers were
+# actually measured on. Two copies of one truth drift, and this pair already did
+# -- silently, for eleven gates. Re-derive from the launcher and refuse to serve
+# on any difference, rather than producing numbers for a near-miss of the
+# configuration the README describes.
+#
+# Runs BEFORE qwen_kill_serves below: a config error should not cost you a
+# running serve before it tells you what is wrong.
+bash "$BENCH_DIR/verify_gate_parity.sh" \
+  || { echo "FATAL: refusing to serve a configuration that is not the champion." >&2; exit 7; }
+
 LOG="${QWEN_SERVE_LOG:-$OUT_ROOT/serve-champion.log}"
 mkdir -p "$(dirname "$LOG")"
 

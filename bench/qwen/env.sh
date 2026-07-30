@@ -186,6 +186,44 @@ qwen_champion_env() {
   export ATLAS_FFN_DOWN_SPLITK=4
   export ATLAS_ATTN_QKV_BATCHED=1
   export ATLAS_ATTN_QKV_SPLITK=4
+
+  # Split-K over the two big SSM projections. out_proj [M=17..32, N=5120,
+  # K=6144] ran at 28% of its DRAM roofline; split-K x4 takes it to 84%
+  # (228 GB/s), a 2.6x kernel win worth ~6.7ms/step across 48 SSM layers.
+  # qkvz [N=12288, K=5120] goes 220.5us -> 167.3us, ~2.2ms/step. Both keep
+  # FP32 partials and reduce, so both are bit-exact by construction -- the
+  # same pattern as the already-shipped ffn_down split-K.
+  export ATLAS_SSM_OUT_SPLITK=4
+  export ATLAS_SSM_QKVZ_SPLITK=4
+  # Batches the 17 per-token BA GEMVs into one `dense_gemv_bf16_batchn` launch
+  # per SSM layer: 144 launches -> 48. Worth ~1% on counting. The batchn kernel
+  # is bit-exact; the `dense_gemm` variant of the same batching is NOT, so this
+  # is a specific kernel choice and not an interchangeable one.
+  export ATLAS_SSM_BA_BATCH=1
+
+  # Attention and LM-head fast paths from the same kernel wave. Individually
+  # small, collectively part of the configuration the published coding number
+  # was measured on -- they are listed separately rather than folded into one
+  # gate because each is independently revertible.
+  export ATLAS_FA2_KGAMMA=1
+  export ATLAS_LM_HEAD_BATCH3=1
+  export ATLAS_NVFP4_GATE_UP_M128=1
+  export ATLAS_PAGED_DECODE_SPLITK=1
+  export ATLAS_FLASH_ATTN_KGAMMA_SPLITK=1
+
+  # ---- MEASURED AND NOT SHIPPED ----------------------------------------------
+  # Async propose overlaps the drafter forward with the step-tail CPU work. It
+  # is lossless -- the drafter only proposes, verify still commits the target's
+  # greedy token -- so it was rejected on speed alone: the drafter's own GPU
+  # time (~35ms) is about equal to the sync propose it removes (29ms), so the
+  # next step's collect blocks for nearly as long as was saved, and the step
+  # interval grows (140ms -> 166ms) even though the step itself shrinks.
+  # These are explicit zeros, not omissions: leaving them unset would make the
+  # published config depend on whatever the binary's default happens to be.
+  export ATLAS_DFLASH_ASYNC=0
+  export ATLAS_DFLASH_SAM_ASYNC=0
+  export ATLAS_DFLASH_FUSED=0
+
   # The gamma=16 correctness fix: the tree WY path is wrong at this width.
   export ATLAS_DISABLE_TREE_WY=1
   export ATLAS_WY17_LAZY=8

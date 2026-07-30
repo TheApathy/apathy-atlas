@@ -158,6 +158,22 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.logprobs_data.push(lp);
     }
 
+    // Silent exit for zero-content thinking episodes (DDTree cliff or spontaneous
+    // <think> with budget=0). Skip pushing </think> to output_tokens — the tag
+    // would appear as a spurious delimiter and cause strip_thinking_tags to
+    // truncate everything before it, treating the real output as "reasoning".
+    if a.inside_thinking
+        && a.think_end_token == Some(tok)
+        && a.thinking_budget == Some(0)
+    {
+        a.inside_thinking = false;
+        a.force_end_thinking = false;
+        a.think_ended = true;
+        a.think_just_ended = true;
+        tracing::info!("Thinking ended after 0 tokens (budget=Some(0)) [silent]");
+        return;
+    }
+
     a.output_tokens.push(tok);
 
     // Thinking tokens are "free" (don't decrement remaining).

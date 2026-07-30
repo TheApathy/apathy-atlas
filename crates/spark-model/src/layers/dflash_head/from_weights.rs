@@ -120,6 +120,8 @@ impl BlockDiffusionDraftHead {
                 .kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8")?,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
+            scaled_add: gpu.kernel("residual_add", "bf16_scaled_add")?,
+            token_recommit: gpu.kernel("residual_add", "dflash_token_recommit")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             // Top-K kernel lives in the same `argmax` module .cu file
             // (kernels/gb10/nvfp4/argmax_bf16.cu). Resolved unconditionally

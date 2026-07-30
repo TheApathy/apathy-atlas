@@ -93,11 +93,21 @@ pub struct AsyncEnvEligibility {
     /// prior in-flight async propose is never resolved — violating the
     /// single-in-flight scratch invariant (measured: silent serve death at
     /// drafter init, variants.md 2026-07-18).
+    ///
+    /// `ATLAS_DFLASH_SAM_ASYNC=1` opts out of this disqualifier. It is safe
+    /// when the mtp_step collect (which always runs before propose) resolves the
+    /// prior in-flight handle — the retrieval early-return in propose_drafts
+    /// only fires AFTER collect has already synced the handle. The disqualifier
+    /// is kept as the default because 2026-07-18 crash on GB10+SM120 was
+    /// empirically real; the opt-in enables testing SAM+ASYNC coexistence.
     pub retrieval: bool,
     /// `ATLAS_DFLASH_PLD=1`: same host-draft early-return class as retrieval.
     pub pld: bool,
     /// `ATLAS_DFLASH_RECYCLE=1`: same host-draft early-return class.
     pub recycle: bool,
+    /// `ATLAS_DFLASH_DEEPLOOP=1`: multi-pass denoise with GPU-side commit-all.
+    /// Removes the inter-pass host D2H, making `denoise_steps > 1` async-eligible.
+    pub deeploop: bool,
 }
 
 impl AsyncEnvEligibility {
@@ -126,9 +136,15 @@ impl AsyncEnvEligibility {
             debug_dump: flag("ATLAS_DFLASH_DEBUG_DUMP")
                 || flag("ATLAS_DFLASH_DEBUG_DUMP_FULL")
                 || flag("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS"),
-            retrieval: flag("ATLAS_DFLASH_RETRIEVAL") || flag("ATLAS_DFLASH_SAM"),
+            // ATLAS_DFLASH_SAM_ASYNC=1 overrides this: when the mtp_step
+            // collect always precedes propose, the retrieval early-return in
+            // propose_drafts cannot leave a stale in-flight handle (collect
+            // already synced it). See field-level comment for safety argument.
+            retrieval: (flag("ATLAS_DFLASH_RETRIEVAL") || flag("ATLAS_DFLASH_SAM"))
+                && !flag("ATLAS_DFLASH_SAM_ASYNC"),
             pld: flag("ATLAS_DFLASH_PLD"),
             recycle: flag("ATLAS_DFLASH_RECYCLE"),
+            deeploop: flag("ATLAS_DFLASH_DEEPLOOP"),
         }
     }
 
@@ -152,7 +168,9 @@ pub fn async_launch_eligible(
 ) -> bool {
     !has_markov
         && !grammar_masked
-        && env.denoise_steps <= 1
+        // DeepLoop uses GPU-side commit-all (no inter-pass host D2H) so
+        // denoise_steps > 1 is async-eligible when deeploop is active.
+        && (env.denoise_steps <= 1 || env.deeploop)
         && !env.margin_gate_on
         && !env.adaptive_gamma
         && !env.tree_method

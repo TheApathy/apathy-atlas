@@ -161,7 +161,7 @@ pub fn step_verify_dflash(
     }
 
     let t_verify = Instant::now();
-    let verified = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
+    let mut verified = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("decode_verify_dflash: {e:#}");
@@ -171,6 +171,21 @@ pub fn step_verify_dflash(
         }
     };
     let t_verify_us = t_verify.elapsed().as_micros();
+
+    // ── Verify-time think mask (throughput fix) ──
+    // The verify oracle above returns the target's RAW unmasked argmax, but the
+    // plain sample path suppresses `<think>`/`</think>` once thinking has ended.
+    // A raw `<think>` argmax at a verify position scores the drafter's correct
+    // content guess against `<think>` and REJECTS it, collapsing the γ chain to
+    // a 0-accept (measured: `<think>` is the single most common first-token miss
+    // on coding). Re-derive those positions as the masked content argmax so the
+    // verified stream matches the masked plain path — turning forced rejections
+    // into accepts. Runs BEFORE the accept/bonus logic so every consumer sees
+    // the corrected stream. Gated on think_ended (never inside an active span).
+    let think_masked = dflash_think_mask_verified(model, a, &mut verified);
+    if think_masked > 0 {
+        tracing::debug!("think mask: verified patched {think_masked} position(s) this step");
+    }
     // Note: clear_ddtree_parent_ids is deferred until AFTER
     // commit_verify_state_async so the commit knows tree mode was active
     // and routes through the partial-accept (intermediate→h_state) path.
@@ -617,7 +632,13 @@ pub fn step_verify_dflash(
         };
         let bonus_tok = match grammar_accept {
             Some((_, b)) => Some(b),
-            None => verified.get(bonus_idx).copied(),
+            // V4 bonus-source fix: re-derive a <think>/</think>/EOS bonus into a
+            // content token when thinking has already ended, so the spurious tag
+            // never enters the verified/KV stream. No-op on content bonuses.
+            None => verified
+                .get(bonus_idx)
+                .copied()
+                .map(|b| reargmax_bonus_skip_think(model, a, bonus_idx, b)),
         };
         if let Some(bonus) = bonus_tok {
             emit_token(a, bonus, None);
@@ -1382,6 +1403,139 @@ fn relax_row_accepts(bytes: &[u8], vocab: usize, tok: u32, topk: usize, ln_ratio
         return true;
     }
     false
+}
+
+/// Verify-time think mask — the throughput fix. Patches `verified` in place:
+/// for every position whose raw target argmax is `<think>`/`</think>` (a tag
+/// the plain sample path suppresses once thinking has ended), re-derive the
+/// masked content argmax from that position's logits row and substitute it.
+/// Returns the number of positions patched.
+///
+/// Why this recovers throughput: the DFlash accept loop scores each drafter
+/// token against `verified[i]`. When the target's raw argmax is a spurious
+/// `<think>`, the drafter's (correct) content prediction never matches, so the
+/// entire γ chain is rejected at that position (a 0-2 token accept). Masking
+/// `verified[i]` to the content token the plain path WOULD have committed makes
+/// the drafter's guess match again → the chain accepts. This is a correctness
+/// alignment: DFlash must reproduce the masked plain-path stream, not the
+/// unmasked argmax.
+///
+/// EOS is deliberately NOT masked (a target EOS is a legitimate stop). No-op
+/// when thinking never ended / is active, the flag is disabled, logits are
+/// fp32, or the row's raw argmax doesn't match `verified[i]` (layout guard).
+fn dflash_think_mask_verified(model: &dyn Model, a: &ActiveSeq, verified: &mut [u32]) -> usize {
+    if !a.think_ended || a.inside_thinking {
+        return 0;
+    }
+    if std::env::var("ATLAS_DFLASH_THINK_MASK_VERIFY").ok().as_deref() == Some("0") {
+        return 0;
+    }
+    let mut skip: Vec<u32> = Vec::with_capacity(2);
+    if let Some(t) = a.think_start_token {
+        skip.push(t);
+    }
+    if let Some(t) = a.think_end_token {
+        skip.push(t);
+    }
+    if skip.is_empty() || !verified.iter().any(|t| skip.contains(t)) {
+        return 0;
+    }
+    let base = model.logits_buffer_ptr();
+    if model.logits_ptr_is_fp32(base) {
+        return 0; // row scan assumes BF16
+    }
+    let vocab = model.vocab_size();
+    let mut row = vec![0u8; vocab * 2];
+    let mut patched = 0usize;
+    for i in 0..verified.len() {
+        if !skip.contains(&verified[i]) {
+            continue;
+        }
+        if let Err(e) = model.copy_logits_to_host(base.offset(i * vocab * 2), &mut row) {
+            tracing::warn!("think mask: verified D2H failed at pos {i} ({e:#}); leaving raw");
+            continue;
+        }
+        // Layout guard: the row's unskipped argmax must equal the raw verified
+        // token, else `i` doesn't map to a contiguous logits row (tree
+        // compaction) and re-deriving would corrupt an unrelated position.
+        match argmax_bf16_skip_tokens(&row, &[], vocab) {
+            Some(raw) if raw == verified[i] => {}
+            _ => continue,
+        }
+        if let Some(clean) = argmax_bf16_skip_tokens(&row, &skip, vocab) {
+            tracing::info!("think mask: verified pos={i} raw={} -> clean={clean}", verified[i]);
+            verified[i] = clean;
+            patched += 1;
+        }
+    }
+    patched
+}
+
+/// V4 bonus-source fix. The DDTree/flat bonus is the target's raw GPU argmax
+/// at the path-tip logits row. When thinking has ALREADY ended, that argmax is
+/// occasionally `<think>`/`</think>`/EOS — committing it re-opens a spurious
+/// thinking block mid-content (the coding-throughput collapse). The downstream
+/// `emit_step` force-exit only papers over it after the fact and still pollutes
+/// the KV with the tag. This re-derives the bonus from the SAME logits row,
+/// skipping the think/EOS ids, so a valid content token is committed instead —
+/// `<think>` never enters the verified stream.
+///
+/// Returns the ORIGINAL bonus (no-op) when: thinking is not ended, the bonus is
+/// already a content token, logits are fp32 (row scan assumes BF16), the D2H
+/// fails, or the row's UNSKIPPED argmax doesn't match the passed bonus (a
+/// row-index sanity guard — under tree compaction `bonus_idx` may not map to a
+/// contiguous logits row, and re-deriving there would commit an unrelated
+/// token). Only the `None`-grammar bonus path calls this; the grammar-masked
+/// bonus is an intentional constrained argmax and is left untouched.
+fn reargmax_bonus_skip_think(
+    model: &dyn Model,
+    a: &ActiveSeq,
+    bonus_idx: usize,
+    bonus: u32,
+) -> u32 {
+    if !a.think_ended {
+        return bonus;
+    }
+    // Only the think tags are masked — a legitimate EOS bonus MUST stop the
+    // sequence, so it is never substituted. (The upstream verify-time think
+    // mask usually already cleaned this; this is defense-in-depth for the
+    // bonus slot, e.g. tree-compaction rows the layout guard skipped there.)
+    let mut skip: Vec<u32> = Vec::with_capacity(2);
+    if let Some(t) = a.think_start_token {
+        skip.push(t);
+    }
+    if let Some(t) = a.think_end_token {
+        skip.push(t);
+    }
+    if !skip.contains(&bonus) {
+        return bonus; // already a content token — nothing to fix
+    }
+    let base = model.logits_buffer_ptr();
+    if model.logits_ptr_is_fp32(base) {
+        return bonus; // row scan assumes BF16
+    }
+    let vocab = model.vocab_size();
+    let mut row = vec![0u8; vocab * 2];
+    if let Err(e) = model.copy_logits_to_host(base.offset(bonus_idx * vocab * 2), &mut row) {
+        tracing::warn!("DDTree bonus source: logits D2H failed ({e:#}); keeping raw bonus");
+        return bonus;
+    }
+    // Row-index sanity: the row's unskipped argmax MUST equal the raw bonus,
+    // else the logits layout doesn't match `bonus_idx` (tree compaction) and
+    // re-deriving would commit an unrelated token. Bail to the raw bonus.
+    match argmax_bf16_skip_tokens(&row, &[], vocab) {
+        Some(raw) if raw == bonus => {}
+        _ => return bonus,
+    }
+    match argmax_bf16_skip_tokens(&row, &skip, vocab) {
+        Some(clean) => {
+            tracing::info!(
+                "DDTree bonus source: <think>+EOS masked (raw={bonus} -> clean={clean}, row={bonus_idx})"
+            );
+            clean
+        }
+        None => bonus, // whole row was skip tokens (degenerate) — keep raw
+    }
 }
 
 /// Argmax over a host-copied BF16 logits row, skipping a set of token indices.

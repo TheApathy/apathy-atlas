@@ -26,6 +26,21 @@ use spark_runtime::kv_cache::PagedKvCache;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+/// Cached gate for `ATLAS_DFLASH_DEEPLOOP=1` (multi-pass denoise residual scaling).
+///
+/// Defined in the head module so `forward_block_layer` and `noise_pass` can
+/// both import it without a circular dependency.
+pub(crate) fn dflash_deeploop_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = std::env::var("ATLAS_DFLASH_DEEPLOOP").ok().as_deref() == Some("1");
+        if on {
+            tracing::info!("DFlash DeepLoop residual scaling ENABLED (ATLAS_DFLASH_DEEPLOOP=1)");
+        }
+        on
+    })
+}
+
 /// Compile-time cap on the per-position top-K used by the DDTree (M4B v2)
 /// builder. Must match `MAX_TOP_K` in `kernels/gb10/nvfp4/argmax_bf16.cu`.
 /// Runtime `top_k` comes from `ATLAS_DDTREE_TOP_K` (default 8) and is
@@ -46,6 +61,14 @@ pub struct DflashKernels {
     pub prefill_attn_dflash_fp8: KernelHandle,
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
+    /// BF16 scaled accumulate: `output[i] += scale * src[i]`. Same module
+    /// as `residual_add` (`residual_add.cu`). Used by DeepLoop multi-pass
+    /// residual scaling (`ATLAS_DFLASH_DEEPLOOP=1`).
+    pub scaled_add: KernelHandle,
+    /// GPU-side token recommit for DeepLoop multi-pass: reconstructs
+    /// `draft_tokens_dev` for pass N+1 without host D2H (async-safe).
+    /// Same module as `scaled_add` (`residual_add.cu`).
+    pub token_recommit: KernelHandle,
     pub argmax: KernelHandle,
     /// Top-K over BF16 logits — used by the DDTree (M4B v2) propose path
     /// to seed per-position branch candidates. Same `argmax` module as

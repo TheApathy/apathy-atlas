@@ -50,6 +50,7 @@ impl BlockDiffusionDraftHead {
         &self,
         a: &NoisePassArgs,
         committed: &[Option<u32>],
+        loop_pass: usize,
         ctx: &ForwardContext,
         dstate: &mut DflashProposerState,
     ) -> Result<()> {
@@ -118,23 +119,48 @@ impl BlockDiffusionDraftHead {
             )?;
         }
         // [eff_ctx zeros, last_token (bonus), per-row mask-or-committed × γ_eff].
-        let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
-            .chain(std::iter::once(last_token as i32))
-            .chain((0..gamma_eff).map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)))
-            .collect();
-        if debug_dump {
-            tracing::info!(
-                "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
-                self.mask_token_id,
-                eff_ctx,
-                &token_ids_host[..token_ids_host.len().min(8)],
-            );
+        //
+        // Pass ≥1 with DeepLoop enabled: use the GPU-side commit-all path.
+        // Stage pass N's argmax from draft_tokens_dev[0..gamma_eff] into
+        // topk_tokens_dev (non-overlapping), then reconstruct draft_tokens_dev
+        // on-stream via dflash_token_recommit — no host D2H, async-safe.
+        if loop_pass > 0 && super::dflash_deeploop_enabled() {
+            gpu.copy_d2d_async(
+                self.scratch.draft_tokens_dev,
+                self.scratch.topk_tokens_dev,
+                gamma_eff * 4,
+                stream,
+            )?;
+            ops::token_recommit(
+                gpu,
+                self.kernels.token_recommit,
+                self.scratch.draft_tokens_dev,
+                self.scratch.topk_tokens_dev,
+                last_token,
+                eff_ctx as u32,
+                n_attn,
+                stream,
+            )?;
+        } else {
+            let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
+                .chain(std::iter::once(last_token as i32))
+                .chain(
+                    (0..gamma_eff)
+                        .map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)),
+                )
+                .collect();
+            if debug_dump {
+                tracing::info!(
+                    "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
+                    self.mask_token_id,
+                    eff_ctx,
+                    &token_ids_host[..token_ids_host.len().min(8)],
+                );
+            }
+            let tid_bytes: Vec<u8> =
+                token_ids_host.iter().flat_map(|t| t.to_le_bytes()).collect();
+            gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
         }
-        let tid_bytes: Vec<u8> = token_ids_host
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
-        gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
         ops::batched_embed(
             gpu,
             self.kernels.batched_embed,
@@ -206,6 +232,7 @@ impl BlockDiffusionDraftHead {
                 stream,
                 needed_start,
                 window: self.ctx_window,
+                loop_pass,
             };
             self.forward_block_layer(layer, &args, ctx, debug_dump, dstate, kprofile)?;
         }

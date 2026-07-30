@@ -644,19 +644,22 @@ impl BlockDiffusionDraftHead {
             // target's greedy token regardless.
             let adaptive = std::env::var("ATLAS_DFLASH_SAM_ADAPTIVE").ok().as_deref() != Some("0");
             if adaptive {
-                const MIN_ACCEPT: usize = 3; // retrieval step below this = misfire
-                const MISFIRE_LIMIT: u32 = 3; // consecutive misfires → cooldown
-                const COOLDOWN: u32 = 24; // steps to skip retrieval, then retry
+                let min_accept: usize = std::env::var("ATLAS_DFLASH_SAM_MIN_ACCEPT")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+                let misfire_limit: u32 = std::env::var("ATLAS_DFLASH_SAM_MISFIRE_LIMIT")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+                let cooldown: u32 = std::env::var("ATLAS_DFLASH_SAM_COOLDOWN")
+                    .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
                 if dstate.retr_used_last {
-                    if dstate.last_num_accepted < MIN_ACCEPT {
+                    if dstate.last_num_accepted < min_accept {
                         dstate.retr_misfire_streak += 1;
                     } else {
                         dstate.retr_misfire_streak = 0;
                     }
                 }
                 dstate.retr_used_last = false;
-                if dstate.retr_cooldown == 0 && dstate.retr_misfire_streak >= MISFIRE_LIMIT {
-                    dstate.retr_cooldown = COOLDOWN;
+                if dstate.retr_cooldown == 0 && dstate.retr_misfire_streak >= misfire_limit {
+                    dstate.retr_cooldown = cooldown;
                     dstate.retr_misfire_streak = 0;
                 }
             }
@@ -704,6 +707,15 @@ impl BlockDiffusionDraftHead {
                 // Flat chain → requires_tree_kernel false → wy17 verify path,
                 // identical dispatch to drafter output. No tree payload.
                 dstate.pending_tree_payload = None;
+                // Resolve any stale async inflight BEFORE returning SAM drafts.
+                // When SAM fires, the early-return skips the async section at
+                // lines 923-940. If the previous step launched an async propose
+                // (and SAM fires on this step), the inflight handle is never
+                // resolved — free_sequence then calls gpu.synchronize on a
+                // stale stream, causing 10-17s inter-request stalls.
+                if super::async_propose::dflash_async_enabled() {
+                    self.resolve_async_inflight_impl(ctx.gpu, None)?;
+                }
                 return Ok(hit.drafts);
             }
         }
