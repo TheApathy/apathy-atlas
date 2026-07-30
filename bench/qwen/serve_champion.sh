@@ -50,14 +50,60 @@ qwen_champion_env
 # makes `strings` take SIGPIPE and the pipeline report failure, which would mark
 # EVERY gate absent -- the guard against silent no-ops getting its own silent
 # failure.
-missing=""
+#
+# NOT every ATLAS_* var is read from the environment by the binary. A few are
+# consumed by the SHELL and forwarded on the command line -- ATLAS_DFLASH_QUANT
+# becomes `--dflash-quantization "$ATLAS_DFLASH_QUANT"`. Nothing in the binary
+# ever looks that name up, so its absence from `strings` is correct, and the
+# first version of this guard failed a perfectly good binary on it. A guard that
+# cries wolf gets switched off, so the classification matters.
+#
+# Waving those through by name would be worse than the false positive: it would
+# turn a real "binary predates this flag" into a pass. So a forwarded var is not
+# exempted, it is REDIRECTED -- we require the flag it feeds to be in the binary
+# instead. Both the forwarding map and the gate list are re-derived from the
+# authoritative scripts on every run; neither is a remembered list.
+FWD_SRC="$REPO/local/serve-aeon-27b-dflash.sh $BENCH_DIR/env.sh"
+for f in $FWD_SRC; do
+  [ -f "$f" ] || { echo "FATAL: forwarding map source missing: $f"; \
+    echo "(cannot classify shell-forwarded gates -- refusing to guess)"; exit 6; }
+done
+# shellcheck disable=SC2086
+fwd_flag_for() {
+  grep -hoE -- "--[a-z0-9-]+[= ]\"?\\\$\{?$1\b" $FWD_SRC 2>/dev/null \
+    | grep -oE -- '--[a-z0-9-]+' | head -1
+}
+
+missing=""; forwarded=""; n_env=0
 for v in $( { grep -hE '^export ' "$0"; declare -f qwen_champion_env; } \
             | grep -oE 'ATLAS_[A-Z0-9_]+' | sort -u); do
-  [ "$(strings -a "$BIN" | grep -cF -- "$v" || true)" -gt 0 ] || missing="$missing $v"
+  if [ "$(strings -a "$BIN" | grep -cF -- "$v" || true)" -gt 0 ]; then
+    n_env=$((n_env + 1)); continue
+  fi
+  flag="$(fwd_flag_for "$v")"
+  if [ -n "$flag" ]; then
+    # Forwarded on the command line. The value still has to reach the binary:
+    # if the flag is missing too, this really is the wrong binary.
+    if [ "$(strings -a "$BIN" | grep -cF -- "$flag" || true)" -gt 0 ]; then
+      forwarded="$forwarded $v($flag)"
+    else
+      missing="$missing $v(forwarded as $flag, which $BIN does not accept)"
+    fi
+  else
+    missing="$missing $v"
+  fi
 done
 [ -z "$missing" ] || { echo "FATAL: $BIN cannot read gate(s):$missing"; \
   echo "(the export would be a silent no-op -- wrong binary for this launcher)"; exit 6; }
-echo "OK gate guard: $BIN can read every ATLAS_* gate this stack exports"
+# Print the counts, not just "ok". A guard that reports success without saying
+# how much it looked at reads identically whether it checked 32 gates or zero.
+# "$n_env names the binary can read" -- deliberately not "gates this stack
+# exports". The list is harvested from the function BODY, so it also picks up
+# names guarded by a conditional (ATLAS_DFLASH_STEP_TIMING is not exported at
+# the champion default). Checking those is right -- the stack can export them --
+# but calling them exported would be a claim the number does not support.
+echo "OK gate guard: $BIN can read $n_env of the ATLAS_* names this stack references"
+[ -z "$forwarded" ] || echo "   + forwarded on the command line (flag verified present):$forwarded"
 
 # A binary built without this kernel target loads nothing, and it fails only at
 # serve time -- long after the build looked clean.

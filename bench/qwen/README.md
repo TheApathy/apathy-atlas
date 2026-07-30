@@ -68,6 +68,14 @@ clean-looking but wrong measurement:
    and the serve is then healthy while running a configuration nobody asked for.
    The gate list is derived from the function body at runtime, never from a
    hand-maintained copy.
+
+   One wrinkle worth knowing before it fails you: not every `ATLAS_*` variable is
+   read from the environment. `ATLAS_DFLASH_QUANT` is consumed by the shell and
+   forwarded as `--dflash-quantization`, so nothing in the binary looks that name
+   up and its absence from `strings` is correct. Such a variable is not exempted
+   — that would turn a genuinely too-old binary into a pass — it is redirected:
+   the guard requires the *flag* it feeds to be present instead. The forwarding
+   map is re-derived from the launcher and `env.sh`, like everything else here.
 3. **Kernel target.** Matched as a prefix — the serve prints `<model>, <quant>`,
    and pinning the quant suffix would produce a false failure the day it changes
    for an unrelated reason.
