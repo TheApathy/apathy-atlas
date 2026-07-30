@@ -76,9 +76,12 @@ clean-looking but wrong measurement:
    — that would turn a genuinely too-old binary into a pass — it is redirected:
    the guard requires the *flag* it feeds to be present instead. The forwarding
    map is re-derived from the launcher and `env.sh`, like everything else here.
-3. **Kernel target.** Matched as a prefix — the serve prints `<model>, <quant>`,
-   and pinning the quant suffix would produce a false failure the day it changes
-   for an unrelated reason.
+3. **Kernel target.** The serve prints a three-field tuple with the SM arch
+   first — `Selected kernel target: (sm_121, qwen3.6-27b, nvfp4)` — so the model
+   is matched as a whole *field* inside it, not as a prefix after the colon.
+   Pinning the arch or the quant suffix would produce a false failure the day
+   either changes for an unrelated reason; matching a bare prefix, which is what
+   this assert used to do, fails a serve that loaded the right target.
 4. **Determinism.** The same temperature-0 prompt twice must be byte-identical.
    Without this, every hash comparison in the harness is measured against a
    moving target.
