@@ -6,9 +6,20 @@ reproduction harness under `bench/<model>/`.
 
 | Branch | Model | Harness | What it measures |
 |---|---|---|---|
-| `base` / `main` | — | — | Upstream Atlas, unmodified. Fork point for everything below. |
-| `laguna` | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | Single-stream DFlash speculative decode, prefill, capacity, and a 69-case tool-calling eval. |
-| `qwen` | Qwen3.6-27B (dense) + DFlash drafter | `bench/qwen/` | The champion single-stream speculative-decode configuration. |
+| `base` / `main` | — | — | Upstream Atlas, unmodified. |
+| `laguna` | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | Single-stream DFlash speculative decode, prefill, capacity, and a 69-case tool-calling eval. Shares history with `base`, so `base...laguna` is a meaningful diff. |
+| `qwen` | Qwen3.6-27B (dense) + DFlash drafter | `bench/qwen/` | The champion single-stream speculative-decode configuration. A standalone snapshot — see the warning below. |
+
+### `qwen` is a snapshot, not a diff
+
+`laguna` branches from `base`. **`qwen` does not.** It descends from a different
+upstream lineage, and its tree is older than `base` by 1066 files. Comparing the
+two renders as though this fork deleted 399 crates and 375 kernels, which is an
+artifact of the two histories, not a change anyone made.
+
+So do not read `base...qwen`. Check `qwen` out and build it: it is the tree the
+published Qwen numbers were actually measured on, which is exactly why it has
+not been rewritten into something tidier that has never been run.
 
 Both branches target GB10-class hardware (Grace Blackwell, `sm_121f`, unified
 LPDDR5x). Nothing in either harness is hardcoded to a particular machine: paths,
