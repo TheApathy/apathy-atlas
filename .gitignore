@@ -1,9 +1,15 @@
 # Build artifacts
 target/
 **/target/
+# Out-of-tree cargo target dirs used for parallel/experiment builds
+# (target-final, target-fu, target-i84, target-phc, target-rc, ...).
+target-*/
 *.o
 *.ptx
 *.bak
+# Local docker build input: release binary copied in before `docker build`.
+# Regenerated from `target/release/spark`; never tracked.
+docker/gb10/spark-fastbin
 
 # tool-eval-bench run reports — local benchmark output, not source
 /runs/
@@ -47,11 +53,97 @@ __pycache__/
 *.qdrep
 *.sqlite
 perf.data*
-core.*
+# Core dumps (PID-suffixed, e.g. core.12345) — NOT source files like
+# vendor/cudarc/src/driver/safe/core.rs, which the bare `core.*` glob swallowed.
+core.[0-9]*
 
-# Environment / secrets
+# ---------------------------------------------------------------------------
+# CREDENTIALS. Nothing that authenticates anything may ever be tracked here.
+#
+# This repo is PUBLIC and AGPL-3.0. A token committed here is a token leaked to
+# the world, and git history keeps it even after a follow-up "remove secret"
+# commit -- the only real remedy is rotation. So the rule is prevention, not
+# cleanup: if a file's job is to hold a credential, it is ignored by pattern
+# BEFORE anyone can `git add` it.
+#
+# Serving these models needs a Hugging Face token (the Laguna and Qwen/AEON
+# checkpoints are gated). Keep it in the HF CLI's own store or an untracked
+# .env, and read it as $HF_TOKEN -- never inline it in a serve script.
+# ---------------------------------------------------------------------------
 .env
 .env.*
+*.env
+!example.env
+!*.env.example
+.envrc
+.direnv/
+
+# Hugging Face / model-hub tokens
+.huggingface/
+hf_token*
+.hf_token
+huggingface_token*
+
+# Generic secret-bearing filenames
+secrets.*
+*.secret
+*secrets.y*ml
+credentials
+credentials.*
+.netrc
+.npmrc
+.pypirc
+
+# Keys and certificates (no .pem/.key/.crt source files exist in this tree;
+# verified before adding these globs so nothing tracked becomes ignored)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+*.gpg
+*.asc
+
+# Cloud / cluster credential stores
+.aws/
+.azure/
+.gcloud/
+gcloud-*.json
+*service-account*.json
+kubeconfig
+*.kubeconfig
+
+# ---------------------------------------------------------------------------
+# HOST-IDENTIFYING ARTIFACTS. Serve logs, profiles and run JSON embed absolute
+# paths ($HOME, model snapshot dirs), hostnames and device topology. They are
+# regenerated per run and per box, they are useless to anyone else, and they
+# are the most likely way for machine details to reach a public repo. Keep the
+# harness SCRIPTS, drop everything they emit.
+# ---------------------------------------------------------------------------
+serve*.log
+serve-*.log
+*-serve.log
+bench/ab/
+bench/**/ab/
+bench/**/*.out
+bench/**/*.contam
+nsys-*/
+*.nsys-rep
+
+# Local model/weight caches and requantization output (tens of GB).
+# A stray downloaded checkpoint is the easiest way to blow up a clone, so the
+# glob is broad -- but test_data/ holds small tracked LoRA fixtures the test
+# suite needs, so those are negated explicitly rather than the glob narrowed.
+w3cache/
+models/
+checkpoints/
+*.safetensors
+!test_data/**/*.safetensors
+*.gguf
 
 # Root-level ad-hoc logs (tracked test result logs under tests/ are intentional)
 /*.log
@@ -107,3 +199,20 @@ docker/gb10/Dockerfile.ffnbf16
 docker/gb10/Dockerfile.fp32res
 docker/gb10/Dockerfile.hangdiag
 docker/gb10/Dockerfile.zeropen
+# Catch-all for experiment-tag throwaway Dockerfiles (the canonical
+# `Dockerfile` and per-model `*/nvfp4/Dockerfile` have no suffix, so are
+# unaffected; already-tracked suffixed variants stay tracked).
+docker/gb10/Dockerfile.*
+
+# bench harness OUTPUT (data/logs, regenerated per run — keep scripts, drop artifacts)
+bench/**/runs/
+bench/**/reports/
+bench/**/logs/
+bench/**/*.jsonl
+bench/**/*.csv
+bench/**/*.pid
+bench/fp8_dgx2_drift/harness/oc
+
+# LoRA MVP: large fp32 reference deltas (regenerate via scripts/reference_deltas.py in seconds)
+test_data/lora-holo-tiny*/reference_deltas.safetensors
+adapters35/
