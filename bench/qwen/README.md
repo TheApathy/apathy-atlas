@@ -120,19 +120,58 @@ of zero must never be readable as "nothing wrong".
 
 ## 5. Measured numbers
 
-All figures below are from `results.md` in this repository, which is the
-measurement record these scripts were built around. They are **content-mix
-dependent**: this stack's throughput varies by more than 4× across prompt types,
-so a single headline number would be a fiction.
+Every figure below was produced by `decode_bench.py` in this directory, on the
+six prompts it actually ships, from a **fresh clone of this branch and a cold
+build** — two passes through a single serve. Nothing here is carried over from a
+prior measurement record; see [Provenance](#provenance-of-these-numbers) for why
+that distinction cost a rewrite.
 
-| Content | tok/s | Source |
-|---|---|---|
-| Counting (highly predictable) | ~73 baseline, up to ~80–83 | `results.md` (records-grade baseline; ~83 named as the ceiling) |
-| Novel coding | 17.8 → ~18.6 | `results.md` — PPL-neutral accept-gate relaxation, +4.5% |
-| Prose | ~12.9 | `results.md` records-grade baseline |
+They are **content-mix dependent**: throughput spans 4.3× from the most
+predictable prompt to the least, so a single headline number would be a fiction.
+The token-weighted row is the honest end-to-end figure.
 
-Acceptance on novel coding sits at roughly **3.35 of 16** drafted tokens. Raising
-it was attempted repeatedly and is documented as a dead end:
+| Prompt | pass 1 | pass 2 | mean accept /16 |
+|---|---|---|---|
+| `repetitive` | 70.1 | 71.5 | 10.43 |
+| `easy-code` | 53.8 | 56.5 | 9.13 |
+| `common-algo` | 61.4 | 62.7 | 9.78 |
+| `novel-logic` | 38.7 | 38.9 | 5.25 |
+| `math` | 39.0 | 38.4 | 5.28 |
+| `prose` | 16.5 | 16.5 | 1.60 |
+| **suite mean** | **46.6** | **47.4** | |
+| **token-weighted** | **36.5** | **36.8** | |
+
+All six rows are classified DFlash (none fell back to serial, none `UNGRADED`),
+and every verify step ran at width 16.
+
+**What reproduces exactly, and what does not.** Five of the six prompts are
+byte-identical across both passes *and* across a second, independently built
+binary — and the per-prompt mean accept agrees to the last digit on both builds.
+That is the strong evidence here; the tok/s figures are the weak evidence.
+
+`prose` is the exception and is **intermittently nondeterministic**: across four
+observed passes it produced one output three times and a different one once.
+Both outputs are fluent and on-topic — they diverge mid-sentence into different
+phrasings, not into corruption. It is also by far the lowest-acceptance row
+(1.60/16). This is *not* measurement contamination: under `max_batch=1` no
+co-batching is possible, and in the run that diverged the only foreign request in
+the log arrived 12 ms *after* the last prompt completed. Treat the `prose` row as
+an open item rather than a stable reference point. Note that
+`serve_champion.sh`'s determinism assert passes throughout — it probes a short
+code prompt, which is in the stable set.
+
+**Run-to-run spread on timing is wider than the output stability suggests.** An
+earlier run of this same suite, on a different build of the same tree, measured
+38.1–38.5 token-weighted against this run's 36.5–36.8 — about 4.4% higher, with
+*byte-identical output and identical accept histograms*. Nothing about the
+computation changed, so that gap is wall-clock only. Budget **±5% on tok/s**
+between runs and do not read a difference that size as a regression. GPU clocks
+are not locked here, and this particular serve was started shortly after a heavy
+compile.
+
+Acceptance on the two hardest code rows sits at roughly **5.2 of 16** drafted
+tokens, and on prose at **1.6 of 16**. Raising it was attempted repeatedly and is
+documented as a dead end:
 
 > the ~3/16 coding floor is drafter-**INTRINSIC**; the unlock to ≥13/16 /
 > 30–80 tok/s is a drafter **RETRAIN** (or a bit-exact tree-verify kernel), not
@@ -154,6 +193,30 @@ own record: `ATLAS_THINK_SPEC` scored HumanEval thinking-mode pass@1 **97.5%
 with** the flag versus **95.0% without** (CI `[0, +0.075]`, "not worse" → ship),
 and the shipped drafter checkpoint scored **95.0% vs 95.0%**, delta CI `[0,0]` —
 identical outputs on every problem.
+
+### Provenance of these numbers
+
+This section used to quote a table from `results.md` — the measurement record the
+scripts were built around — rather than from the scripts. When the suite was
+finally run from a clean clone, only one of those three rows survived contact
+with it. `results.md` reported counting at ~73 tok/s, which matches `repetitive`
+at 70–73. It also reported novel coding at ~17.8 and prose at ~12.9, where this
+harness measures 38.7 and 16.5. And it put coding acceptance at ~3.35/16 where
+the two hardest code rows measure 5.25 and 5.28.
+
+Those older figures are not necessarily wrong; they were taken on a
+configuration that cannot now be reconstructed from what is in this repository.
+But a reproduction harness whose headline table cannot be produced by running it
+is worse than one with no table at all, because the gap reads as a broken build
+to whoever runs it first. So the numbers were replaced rather than reconciled.
+The prose immediately above is kept because it is *analysis* — the reason the
+accept ceiling is drafter-intrinsic, and why two attractive levers do not pay —
+and that reasoning is unaffected by the absolute figures moving.
+
+The quoted "~3/16 coding floor" in the block above is left verbatim as a
+quotation from that record. Read it as directional: this harness measures ~5/16
+on the equivalent rows, and the conclusion it supports — that a retrain, not a
+gate relaxation, is the unlock — is what carries forward.
 
 ---
 
