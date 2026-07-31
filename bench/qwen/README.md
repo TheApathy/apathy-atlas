@@ -18,8 +18,8 @@ transfer between them; see [Traps](#5-five-things-that-will-cost-you-a-day).
 | What | Notes |
 |---|---|
 | A CUTLASS source checkout | `CUTLASS_HOME` must point at it. If you have built vLLM from source you already have one under its `.deps/`. |
-| Target checkpoint | A Qwen3.6-27B snapshot directory (must contain `config.json`). Ours is a locally assembled `Qwen3_5ForConditionalGeneration` build, not a published repo — read [Checkpoint availability](#checkpoint-availability) before you start. |
-| DFlash drafter checkpoint | The matching DFlash drafter snapshot directory (`DFlashDraftModel`, `block_size` 16). Ours is an in-house retrain and is likewise unpublished. |
+| Target checkpoint | Public: `AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP`, apache-2.0, ungated. **Pin the revision** — see [Checkpoint availability](#checkpoint-availability). |
+| DFlash drafter checkpoint | A `DFlashDraftModel` snapshot for that target. Ours is an in-house retrain and is **not published** — this is the one thing you cannot obtain. |
 | CUDA toolkit + a Blackwell-class GPU | ~50 GB of free memory at launch; γ=16 inflates the SSM-MTP pool and KV by roughly 24 GB over a non-speculative serve. |
 
 Nothing here has a machine-specific default. Every path comes from the
@@ -33,34 +33,51 @@ export QWEN_BIN=/path/to/spark          # optional; defaults to ./target/release
 
 ### Checkpoint availability
 
-**Neither checkpoint this branch was measured on is publicly downloadable, and
-that limit is on us, not on you.** The target is a locally assembled snapshot;
-the drafter is a DFlash model we retrained ourselves. Neither has been released.
+**The target is public. The drafter is not, and that limit is on us.**
+
+**Target — get the exact revision.**
+
+```bash
+hf download AEON-7/Qwen3.6-27B-AEON-Ultimate-Uncensored-Multimodal-NVFP4-MTP \
+    --revision 6f31471e2e1c3462420f14af9a9a0046bae3d9eb \
+    --local-dir ./qwen36-27b-target
+export QWEN_MODEL=$PWD/qwen36-27b-target
+```
+
+`--revision` is not optional decoration. The repo has moved on since we
+downloaded it: `model.safetensors` at the current head has the same byte length
+as ours but a **different content hash**, so an unpinned `hf download` gets you
+weights we never measured. Same size is not same file. Everything published here
+is against `6f31471e`, which still resolves.
+
+**Drafter — you cannot get ours.** It is a `DFlashDraftModel` we retrained
+in-house and have not released. Public Qwen3.6-27B DFlash drafters exist
+(`z-lab/Qwen3.6-27B-DFlash`, `KingsonHO/Qwen3.6-27B-DFlash`,
+`deepsweet/Qwen3.6-27B-DFlash-FP16`) and any of them will serve, but they are not
+a drop-in substitute for ours in the way "different weights" suggests — they are
+a **different hookup**. Theirs are 5-layer drafters tapping target layers
+`[1, 16, 31, 46, 61]` with `mask_token_id` 248070; ours is a 6-layer drafter
+tapping `[1, 10, 18, 27, 35, 44, 52, 61]` with `mask_token_id` 248077. Different
+acceptance, different throughput, different completions.
+
 So be clear about what this branch does and does not offer:
 
 * **Reproducible from this branch alone:** the build recipe, the serve
   configuration and its gate-parity assert, the benchmark harness, the
-  single-stream measurement protocol, and every trap in section 5. Point them at
-  any Qwen3.6-27B target and any DFlash drafter for that target and the whole
-  pipeline runs.
-* **Not reproducible from this branch alone:** the specific tok/s and the
-  completion hashes in `reference_hashes.json`. Those are properties of *our*
-  weights.
+  single-stream measurement protocol, and every trap in section 6.
+* **Not reproducible from this branch alone:** the tok/s in section 5 and the
+  completion hashes in `reference_hashes.json`. Those are properties of our
+  drafter.
 
-Public DFlash drafters for Qwen3.6-27B do exist (`z-lab/Qwen3.6-27B-DFlash`,
-`KingsonHO/Qwen3.6-27B-DFlash`, `deepsweet/Qwen3.6-27B-DFlash-FP16`). Any of them
-will serve. None of them are our weights, so acceptance will differ, throughput
-will differ, and the completions will differ. `check_repro.py` will report
-`MISMATCH` on every stable row and exit 1. **That is the correct result for a
-substituted drafter and is not a build failure** — do not go hunting a numerics
-bug you do not have. Run the checker only against a run made with the same two
-checkpoints we used.
+With a substituted drafter, `check_repro.py` will report `MISMATCH` on every
+stable row and exit 1. **That is the correct result for a different drafter and
+is not a build failure** — do not go hunting a numerics bug you do not have.
 
-If you want a decode result you can check against a published reference on
-hardware you control, use the `laguna` branch instead: its target
+If you want a decode result you can check against a published reference end to
+end, use the `laguna` branch instead: its target
 (`poolside/Laguna-S-2.1-NVFP4`) and drafter
 (`poolside/Laguna-S-2.1-DFlash-NVFP4`) are both public, so
-`bench/laguna/reference_hashes.json` is checkable end to end.
+`bench/laguna/reference_hashes.json` is checkable all the way through.
 
 ## 2. Build
 
