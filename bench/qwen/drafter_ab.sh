@@ -36,6 +36,35 @@ source "$BENCH/env.sh"
 
 DRAFT_A="${QWEN_DRAFT_A:-}"
 DRAFT_B="${QWEN_DRAFT_B:-}"
+
+# WHICH EVIDENCE THIS RUN PRODUCES.
+#
+#   matrix  (default)  eval_matrix.py -- 5 matched algorithm tasks x C/Python/Go
+#                      plus two non-code anchors, scored per cell by
+#                      eval_verdict.py against a coverage claim.
+#   decode             decode_bench.py -- the original six-prompt suite, five
+#                      Python and one prose. Kept because reference_hashes.json
+#                      is keyed on it, so it is the arm a REPRODUCTION checks
+#                      against. It is not adequate evidence for a drafter swap
+#                      and the default no longer pretends otherwise.
+SUITE="${QWEN_SUITE:-matrix}"
+CLAIMS="${QWEN_CLAIMS:-}"
+case "$SUITE" in
+  matrix|decode) ;;
+  *) echo "FATAL: QWEN_SUITE=$SUITE is not matrix or decode." >&2; exit 2 ;;
+esac
+
+# Say this BEFORE 25 minutes of GPU, not after. A drafter change always has a
+# target workload; if you cannot name it, the run cannot be checked for having
+# covered it, and this is precisely how a Go-tuned checkpoint came to be judged
+# by a suite with no Go in it.
+if [ "$SUITE" = matrix ] && [ -z "$CLAIMS" ]; then
+  echo "NOTE: \$QWEN_CLAIMS is unset, so coverage will NOT be enforced."
+  echo "      Set it to the workload this change targets, e.g."
+  echo "        export QWEN_CLAIMS=lang:go"
+  echo "      and the scorer will REFUSE to grade a run that never measured it."
+  echo
+fi
 for v in DRAFT_A DRAFT_B; do
   p="${!v}"
   [ -n "$p" ] || { echo "FATAL: \$QWEN_${v} is unset." >&2; exit 2; }
@@ -140,8 +169,13 @@ run_arm() {
   grep -qa "DFlash speculative decoding: ENABLED" "$log" \
     || { echo "    FATAL: DFlash not enabled ($tag)"; failed="$failed $tag"; qwen_kill_serves 0; return 1; }
 
-  python3 "$BENCH/decode_bench.py" --tag "$tag" --log "$log" \
-    --tokens 256 --json-out "$OUT/$tag.json" --dump-text "$OUT/text" 2>&1 | sed 's/^/    /'
+  if [ "$SUITE" = matrix ]; then
+    python3 "$BENCH/eval_matrix.py" --tag "$tag" --log "$log" \
+      --tokens 256 --json-out "$OUT/$tag.json" --dump-text "$OUT/text" 2>&1 | sed 's/^/    /'
+  else
+    python3 "$BENCH/decode_bench.py" --tag "$tag" --log "$log" \
+      --tokens 256 --json-out "$OUT/$tag.json" --dump-text "$OUT/text" 2>&1 | sed 's/^/    /'
+  fi
   local rc=${PIPESTATUS[0]}
   qwen_kill_serves 0
   [ "$rc" = 0 ] || failed="$failed $tag"
@@ -166,6 +200,29 @@ fi
 
 echo
 echo "=== table ==="
+
+if [ "$SUITE" = matrix ]; then
+  python3 "$BENCH/eval_verdict.py" \
+    --a "$OUT/a.json" --b "$OUT/b.json" --aa "$OUT/a-p2.json" --claims "$CLAIMS"
+  vrc=$?
+  echo
+  echo "  A = $DRAFT_A"
+  echo "  B = $DRAFT_B"
+  echo "  text sidecars: $OUT/text/"
+  [ -z "$failed" ] || { echo "RESULT: arms failed:$failed"; exit 2; }
+  # The scorer's exit code is the run's exit code. A refusal must NOT be
+  # laundered into success just because all three arms happened to complete:
+  # "we ran everything and learned nothing about the target workload" is a
+  # failure of the experiment, not of the machine.
+  case "$vrc" in
+    0) echo "RESULT: three arms ran and were scored. Read per-cell before pooled." ;;
+    3) echo "RESULT: three arms ran; SCORING REFUSED -- the matrix does not cover"
+       echo "        the claimed workload. This is not a null result." ;;
+    *) echo "RESULT: three arms ran; scoring refused (exit $vrc)." ;;
+  esac
+  exit "$vrc"
+fi
+
 QWEN_AB_A="$DRAFT_A" QWEN_AB_B="$DRAFT_B" python3 - "$OUT" $ARMS <<'PY'
 import json, os, sys
 out, arms = sys.argv[1], sys.argv[2:]
@@ -205,6 +262,16 @@ for a in arms:
     tw[a] = sum(r["completion_tokens"] for r in rs) / sum(r["wall"] for r in rs)
 
 # Accept pooled over verify STEPS, not averaged over prompts, for the same reason.
+#
+# CONFOUNDED, KNOWINGLY. Each arm is weighted by ITS OWN steps, and a step
+# commits accept+1 tokens -- so an arm that accepts more on a prompt takes fewer
+# steps there and gives that prompt less weight in its own average. Every arm is
+# scored on a mix tilted toward the prompts it is worst at. On the 2026-07-31
+# drafter A/B this halved a real gap (-7.2% read as -3.6%), because `prose`
+# carried 41% of the step weight purely by being the row both arms accept least
+# on. This is left as-is because it is the legacy path and reference_hashes.json
+# is keyed on its output; the fix lives in eval_verdict.pool(), which holds the
+# weights fixed across arms. The pooled accept row below prints a warning.
 acc = {}
 for a in arms:
     num = den = 0
@@ -219,6 +286,10 @@ print("\n-- pooled")
 print("token-weighted tok/s".ljust(24) + "".join(f"{tw[a]:.1f}".rjust(10) for a in arms))
 print("mean accept".ljust(24) + "".join(
     (f"{acc[a]:.2f}" if acc[a] is not None else "-").rjust(10) for a in arms))
+print("  NOTE the accept row is pooled over each arm's OWN steps, which under-")
+print("  credits the arm that accepts more (higher accept -> fewer steps -> less")
+print("  weight on its own good prompts). It understated a real gap by half once.")
+print("  Use QWEN_SUITE=matrix for the fixed-weight, per-cell, coverage-gated score.")
 
 aa_s = abs(tw["a-p2"] - tw["a"]) / tw["a"] * 100
 print(f"\nA/A noise floor (a vs a-p2, identical config): {aa_s:.2f}% on tok/s")

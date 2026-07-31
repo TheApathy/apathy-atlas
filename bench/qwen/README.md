@@ -86,18 +86,34 @@ elapsed time as the comparison it judges:
 | pooled | ours | `z-lab` 3.5 | A/A repeat |
 |---|---|---|---|
 | token-weighted tok/s | 36.1 | **38.0** | 37.0 |
-| mean accept /16 | 4.85 | **5.03** | 4.84 |
+| mean accept /16 | 4.85 | **5.23** | 4.84 |
 
-A/A floor: 2.36% on tok/s, 0.34% on accept. Ours came in **−4.8% tok/s and −3.6%
-accept**, clearing the floor on both. On this suite the public drafter is
-slightly *better* than ours.
+A/A floor: 2.36% on tok/s, 0.35% on accept. Ours came in **−4.8% tok/s and −7.2%
+accept**, clearing the accept floor by 21×. On this suite the public drafter is
+*better* than ours.
 
-Read that narrowly. This suite is five Python prompts and one prose prompt. Our
-retrain was warm-started to raise the **Go** share of its training corpus, and
-the A/B that justified shipping it reported Go +4.6% with Python neutral — an
-axis this suite does not contain a single row of. The honest statement is "ours
-loses on Python and prose here", not "the retrain was worthless". If you care
-about Go, add a Go row; nothing above tests it.
+> **Correction, and a trap worth the paragraph.** An earlier version of this
+> table said −3.6% on accept, pooling each arm over *its own* verify steps —
+> which is what a serve's `mean=` line gives you, and what our first harness
+> copied. That is confounded. A speculative step commits `accept+1` tokens, so a
+> drafter that accepts *more* on a cell takes *fewer* steps there, and its own
+> average therefore gives that cell *less* weight. Every arm gets scored on a
+> mix tilted toward the cells it is worst at, and the better drafter is
+> penalised for being better. It is not a rounding effect: `prose` alone carried
+> 41% of the step weight purely because `prose` is the row both drafters accept
+> least on. Holding the weights fixed across arms — same workload, two drafters,
+> which is the question actually being asked — the same six rows move from −3.6%
+> to −7.2%. The A/A floor barely moves (0.34% → 0.35%), because A and its own
+> repeat share a step distribution by construction. `eval_verdict.py` pools with
+> fixed weights and documents why; the numbers above are the re-pooled ones.
+
+Read the verdict narrowly. This suite is five Python prompts and one prose
+prompt. Our retrain was warm-started to raise the **Go** share of its training
+corpus, and the A/B that justified shipping it reported Go +4.6% with Python
+neutral — an axis this suite does not contain a single row of. The honest
+statement is "ours loses on Python and prose here", not "the retrain was
+worthless". That gap is why section 4 now defaults to a coverage-gated matrix
+instead of this suite.
 
 So be clear about what this branch does and does not offer:
 
@@ -232,6 +248,65 @@ Exit codes: `0` pass, `1` a stable row differs, `2` incomplete run, `3` nothing
 to compare. A `MISMATCH` almost always means a configuration difference rather
 than a numerics one — check the `serve_champion.sh` asserts first.
 
+### Evaluating a change (not the same thing as reproducing a number)
+
+`decode_bench.py` answers "did I rebuild your stack correctly". It is the wrong
+instrument for "is my change an improvement", and using it that way is how we
+shipped a drafter on evidence that never touched the workload it was built for.
+For that question:
+
+```bash
+export QWEN_DRAFT_A=/path/to/baseline     QWEN_DRAFT_B=/path/to/change
+export QWEN_CLAIMS=lang:go                # the workload the change targets
+bash bench/qwen/drafter_ab.sh
+```
+
+Three arms — `a`, `b`, and `a` repeated last so the noise floor spans the same
+elapsed time as the comparison it judges. Each arm runs `eval_matrix.py`: five
+matched algorithm tasks (`binsearch`, `mergesort`, `modinv`, `intervals`,
+`boilerplate`) in **C, Python and Go**, phrased identically apart from the
+language name, plus two non-code anchors. Then `eval_verdict.py` scores it. Four
+things it does that a pooled A/B does not:
+
+1. **Coverage is a gate.** `QWEN_CLAIMS` names the workload the change is
+   supposed to help. If the matrix grades zero cells there, the scorer prints
+   `REFUSING TO SCORE` and exits **3** — before any number, so it cannot be read
+   past. "We never tested the thing it was built for" is a distinct outcome from
+   "no significant difference", and the exit codes keep them distinct (`0`
+   scored, `3` uncovered claim, `4` too few comparable cells).
+2. **Every cell is judged against its own repeat**, not against a floor borrowed
+   from another sitting. Cell floors are n=1 — a lower bound on spread, not a
+   tolerance — and `TIE` therefore means "not distinguishable here", never
+   "proven equal".
+3. **The pooled number is printed next to the mix it depends on**: weighted by
+   tokens, by cell, and by language. If those disagree in *sign*, the report says
+   so, because "B beats A" is then a claim about your prompt mix. Weights are
+   held fixed across arms — see the correction in section 1 for what happens
+   when they are not.
+4. **Hashes are reported, never graded.** See the caveat in section 1.
+
+Accept leads the report. It is the only quantity a drafter alone controls, and
+its floor here came out ~7× tighter than tok/s (0.35% vs 2.36%). `tok/s` moves
+for reasons that have nothing to do with the drafter.
+
+`QWEN_SUITE=decode` falls back to the original six Python-and-prose prompts.
+That is the arm `reference_hashes.json` is keyed on, so it stays available for
+reproduction — but it is not adequate evidence for a change, and the default no
+longer pretends otherwise.
+
+The scorer is pure — it reads JSON and touches no GPU — so its refusal paths are
+tested offline against fixtures, including a replay of the real 2026-07-31
+drafter A/B that asserts this harness would have refused it:
+
+```bash
+python3 bench/qwen/test_eval_verdict.py   # ~1s, no serve required
+python3 bench/qwen/test_census.py
+```
+
+A guard tested by running the real thing is only tested on the path where it
+does nothing; if the refusal is broken, the live test's failure mode *is* the
+event the refusal exists to prevent.
+
 ### Files
 
 | File | Purpose |
@@ -241,7 +316,13 @@ than a numerics one — check the `serve_champion.sh` asserts first.
 | `build_cutlass.sh` | Release build with the correct kernel target. |
 | `serve_champion.sh` | Self-verifying launcher (the six asserts above). |
 | `benchenv.py` | Log scraping. Owns the accept anchor — read it before editing a regex. |
-| `decode_bench.py` | The six-prompt deterministic decode benchmark. |
+| `decode_bench.py` | The six-prompt deterministic decode benchmark. Reproduction, not evaluation. |
+| `check_repro.py` | Checks a `decode_bench.py` run against `reference_hashes.json`. |
+| `drafter_ab.sh` | Three-arm A/B driver. Refuses on hookup mismatch, gate drift, or a missing arm. |
+| `eval_matrix.py` | One arm of the evaluation matrix: matched tasks × C/Python/Go. |
+| `eval_verdict.py` | Scores the matrix. Pure; owns the coverage gate and the pooling rules. |
+| `test_eval_verdict.py` | Offline truth table for `eval_verdict.py`, including the real-A/B replay. |
+| `test_census.py` | Offline truth table for the contamination census. |
 
 ---
 
