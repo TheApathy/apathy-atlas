@@ -55,19 +55,53 @@ echo "    arms   : $ARMS"
 echo
 
 failed=""
+
+# run_arm <tag> <expected gproj gate> [KEY=VALUE ...]
+#
+# Overrides are passed POSITIONALLY, because that is how repro_arm.sh consumes
+# them (laguna_apply_overrides "$@"). An earlier version of this driver passed
+# them through `env` instead, which looked equivalent and was not: repro_arm.sh
+# calls laguna_prod_env FIRST, so the production value was exported over the top
+# of the env one, laguna_apply_overrides then received no arguments, and the
+# override silently evaporated. The nogproj arm ran WITH g_proj enabled and
+# reported 33.2 tok/s -- a completely plausible number, for the wrong arm.
+#
+# Hence the second parameter. An arm whose gate did not take is not a failed
+# arm; it is a DIFFERENT arm wearing this arm's name, and it scores clean.
 run_arm() {
-  local tag="$1"; shift
-  echo "--- [$(date +%H:%M:%S)] arm $tag"
-  if ! env "$@" bash "$BENCH/repro_arm.sh" "$tag" 2>&1 | sed 's/^/    /'; then
+  local tag="$1" expect="$2"; shift 2
+  local armlog="$OUT/arm-$tag.log"
+  echo "--- [$(date +%H:%M:%S)] arm $tag  (expect gproj gate: $expect)"
+  bash "$BENCH/repro_arm.sh" "$tag" "$@" 2>&1 | tee "$armlog" | sed 's/^/    /'
+  local rc=${PIPESTATUS[0]}
+
+  # repro_arm.sh echoes the gate value it is actually about to serve with.
+  # Compare against what this arm MEANT, and treat absence as a mismatch --
+  # "the line is missing" must not read the same as "the line agreed".
+  local got
+  got="$(grep -a -m1 '^=== gproj gate:' "$armlog" \
+         | sed -E 's/^=== gproj gate: (.*) ===$/\1/')"
+  if [ "$got" != "$expect" ]; then
+    echo "    ARM MISCONFIGURED: $tag wanted gproj gate [$expect], serve ran with [${got:-<line absent>}]"
+    echo "    This arm is not the arm it claims to be. Not scoring it."
+    failed="$failed $tag"
+    return 1
+  fi
+
+  if [ "$rc" != 0 ]; then
     echo "    ARM FAILED: $tag"
     failed="$failed $tag"
   fi
+  return "$rc"
 }
 
-run_arm serial   ARM_SERIAL=1
-run_arm nogproj  ARM_SERIAL=0 ATLAS_VERIFY_GPROJ_GEMV=
-run_arm gproj    ARM_SERIAL=0
-run_arm gproj-p2 ARM_SERIAL=0
+# The serial arm takes no speculative path at all, so its gate value is inert --
+# it is asserted as 1 only because that is what laguna_prod_env leaves set, and
+# an assert that matches reality is worth more than one that encodes intent.
+run_arm serial   1         ARM_SERIAL=1
+run_arm nogproj  '<unset>' ARM_SERIAL=0 ATLAS_VERIFY_GPROJ_GEMV=
+run_arm gproj    1         ARM_SERIAL=0
+run_arm gproj-p2 1         ARM_SERIAL=0
 
 # Refuse to score an incomplete campaign. Scoring whatever survived is how a
 # sweep whose arms had all died still printed a confident verdict: every
