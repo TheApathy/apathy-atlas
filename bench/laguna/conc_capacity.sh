@@ -65,7 +65,7 @@ echo "=== conc_capacity $TAG :: CONC=$CONC MAX_BATCH=$MAX_BATCH TOKENS=$TOKENS B
 # orphaned serve does not keep the lock. Follows laguna_serve's shape otherwise.
 cd "$REPO" || exit 3
 setsid "$BIN" serve "$MODEL" --draft-model "$DRAFT" --port "$PORT" \
-  --dflash --dflash-gamma "$GAMMA" --kv-cache-dtype fp8 \
+  --dflash --dflash-gamma "$GAMMA" --kv-cache-dtype "$KV_DTYPE" \
   --gpu-memory-utilization "$GPU_UTIL" --max-seq-len "$MAX_SEQ_LEN" --max-batch-size "$MAX_BATCH" \
   > "$LOG" 2>&1 < /dev/null 9>&- &
 disown 2>/dev/null || true

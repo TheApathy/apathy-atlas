@@ -3,11 +3,16 @@
 #
 #   bash bench/laguna/serve_prod.sh
 #
-# This is the launcher to start from if you want to reproduce the decode
-# numbers. It is not just a command line: it asserts every invariant the
+# This is the launcher for the INTERACTIVE single-stream stack: bf16 KV, 3072
+# context. It is not just a command line -- it asserts every invariant the
 # configuration depends on, and refuses to report a healthy serve unless all of
 # them hold. Each assert exists because its absence once produced a
 # clean-looking but wrong measurement.
+#
+# It is NOT the launcher for reproducing the decode table in README.md. Those
+# numbers were measured at fp8 KV / 8192 context, which is what env.sh defaults
+# to and what gate_run.sh therefore runs. Start from gate_run.sh for the table;
+# start from here for a serve you intend to talk to.
 #
 # Prerequisites (see README.md):
 #   LAGUNA_BIN    release binary built by build_cutlass.sh
@@ -39,8 +44,10 @@ mkdir -p "$(dirname "$LOG")"
 #                             scripts use fp8 and are a different stack, not a
 #                             knob to copy across.
 # 5. gamma=6, batch size 1 -> single-stream peak decode.
+# Set the variables laguna_serve reads; do NOT re-pass them as flags. They are
+# already on its command line, and clap rejects a repeated --kv-cache-dtype.
 KV_DTYPE=bf16
-SEQ_LEN=3072
+MAX_SEQ_LEN=3072
 
 laguna_kill_serves 3
 laguna_prod_env
@@ -99,13 +106,14 @@ echo "OK gate guard: $BIN can read every ATLAS_* gate this script exports"
 [ "$(strings -a "$BIN" | grep -cF -- 'laguna-s-2.1' || true)" -gt 0 ] \
   || { echo "FATAL: $BIN was built without ATLAS_TARGET_MODEL=laguna-s-2.1"; exit 6; }
 
-laguna_serve "$LOG" --kv-cache-dtype "$KV_DTYPE" --max-seq-len "$SEQ_LEN"
-echo "launched (gamma=$GAMMA, KV=$KV_DTYPE, CUTLASS on, no prefix cache); waiting for ready..."
+laguna_serve "$LOG"
+echo "launched (gamma=$GAMMA, KV=$KV_DTYPE, seq=$MAX_SEQ_LEN, CUTLASS on, no prefix cache); waiting for ready..."
 laguna_wait_ready "$LOG" 60
 
 # --- POST-BOOT ASSERTS: fail loudly if any invariant is off -------------------
 fail=0
 grep -q "laguna-s-2.1, nvfp4" "$LOG" || { echo "ASSERT FAIL: kernel target is not laguna-s-2.1"; fail=1; }
+laguna_assert_kv_dtype "$LOG" || fail=1
 
 # Invariant 1. Assert the property, not the spelling: either native template is
 # fine, ChatML never is.

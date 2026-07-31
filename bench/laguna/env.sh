@@ -66,6 +66,14 @@ EVAL_BIN="${LAGUNA_EVAL_BIN:-tool-eval-bench}"
 GAMMA="${LAGUNA_GAMMA:-6}"
 MAX_SEQ_LEN="${LAGUNA_MAX_SEQ_LEN:-8192}"
 GPU_UTIL="${LAGUNA_GPU_UTIL:-0.80}"
+# fp8 KV is the regime the published decode table was measured in. serve_prod.sh
+# deliberately runs bf16 instead -- see invariant 4 there. It is a variable and
+# not a literal in laguna_serve for a mechanical reason: when it was hardcoded,
+# the only script that wanted the other regime passed --kv-cache-dtype a SECOND
+# time, and clap rejects a repeated argument. That serve exited in under a
+# second and the readiness loop then waited out its full timeout on a process
+# that was already gone.
+KV_DTYPE="${LAGUNA_KV_DTYPE:-fp8}"
 # --max-batch-size 1 is a measured choice, not a default. Speculative decode is
 # disabled whenever more than one sequence is active, so concurrency 2-3 falls
 # to ~0.6x single-stream, and batched serial decode only overtakes single-stream
@@ -126,7 +134,7 @@ laguna_serve() {
   cd "$REPO" || exit 3   # CWD must be the repo root: the chat-template fallback
                          # is resolved relative to it.
   setsid "$BIN" serve "$MODEL" --draft-model "$DRAFT" --port "$PORT" \
-    --dflash --dflash-gamma "$GAMMA" --kv-cache-dtype fp8 \
+    --dflash --dflash-gamma "$GAMMA" --kv-cache-dtype "$KV_DTYPE" \
     --gpu-memory-utilization "$GPU_UTIL" --max-seq-len "$MAX_SEQ_LEN" \
     --max-batch-size "$MAX_BATCH_SIZE" "$@" \
     > "$log" 2>&1 < /dev/null &
@@ -138,19 +146,46 @@ laguna_serve() {
 # NOTE: /health answers `ready` on ANY serve bound to this port, including one
 # started by someone else. Readiness proves the port is answering, not that it
 # is answering with YOUR binary. laguna_lock is what makes it yours.
+#
+# Liveness is `pgrep -f`, NOT `ps -eo cmd | grep`. The latter's own command line
+# contains the pattern, so ps sees the grep and the check is TRUE FOREVER --
+# the abort-on-death branch is unreachable and every dead serve costs the whole
+# timeout. pgrep excludes itself by construction. This bit unreachable once.
+laguna_serve_alive() { pgrep -f -- "--port $PORT" >/dev/null 2>&1; }
+
 laguna_wait_ready() {
   local log="$1" tries="${2:-120}"
   for _ in $(seq 1 "$tries"); do
     curl -s -m 3 "$BASE_URL/health" 2>/dev/null | grep -q ready && return 0
-    ps -eo cmd | grep -q "port $PORT" || {
+    laguna_serve_alive || {
       echo "FATAL: serve died during load" >&2
-      grep -Ei "out of memory|illegal|CUDA_ERROR|panicked|Error: " "$log" | head -5 >&2
+      # Print the tail unconditionally as well as the known-fatal greps: an
+      # argv error ("cannot be used multiple times") matches none of these
+      # patterns, and a death with no explanation is the worst kind.
+      grep -aEi "out of memory|illegal|CUDA_ERROR|panicked|^error" "$log" | head -5 >&2
+      echo "--- last 10 lines of $log ---" >&2; tail -10 "$log" >&2
       exit 4
     }
     sleep 5
   done
   echo "FATAL: serve never became ready after $((tries * 5))s" >&2
   exit 4
+}
+
+# ARMED != DISPATCHED. Prove the KV dtype the serve actually built, rather than
+# trusting that the flag we passed was accepted: fp8 logs the per-layer k/v
+# scale load, bf16 logs the user-override warning (MODEL.toml recommends fp8
+# for this model). The two regimes differ in both speed and capacity, so a
+# silently-wrong dtype yields a confident answer to the wrong question -- and
+# the published decode table is an fp8 number while serve_prod.sh runs bf16.
+laguna_assert_kv_dtype() {
+  local log="$1" want
+  if [ "$KV_DTYPE" = fp8 ]; then want="FP8 KV cache using"; else want="KV cache dtype: bf16"; fi
+  [ "$(grep -ac "$want" "$log" || true)" -gt 0 ] || {
+    echo "FATAL: KV dtype did not take -- wanted '$want' for KV_DTYPE=$KV_DTYPE" >&2
+    return 1
+  }
+  echo "OK KV dtype: $KV_DTYPE (dispatched, not just requested)"
 }
 
 # The production decode stack. Every gate arm starts from exactly this set and

@@ -52,7 +52,7 @@ run_arm() {
   # orphaned serve does not keep the lock. Follows laguna_serve's shape.
   cd "$REPO" || exit 3
   setsid "$BIN" serve "$MODEL" --port "$PORT" \
-    --kv-cache-dtype fp8 --gpu-memory-utilization "$GPU_UTIL" \
+    --kv-cache-dtype "$KV_DTYPE" --gpu-memory-utilization "$GPU_UTIL" \
     --max-seq-len "$MAX_SEQ_LEN" --max-batch-size "$MAX_BATCH_SIZE" "$@" \
     > "$log" 2>&1 < /dev/null 9>&- &
   disown 2>/dev/null || true
