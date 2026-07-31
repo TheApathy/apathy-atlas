@@ -1,3 +1,26 @@
+> ### This is a fork — start with [REPRODUCING.md](REPRODUCING.md)
+>
+> Upstream is [Avarok-Cybersecurity/atlas](https://github.com/Avarok-Cybersecurity/atlas)
+> and the README below is theirs. This fork adds two self-contained
+> speculative-decode benchmark harnesses, one per branch. **Four branches are
+> ours; anything else you see was inherited from upstream.**
+>
+> | Branch | Model | Harness | Our changes |
+> |---|---|---|---|
+> | [`laguna`](../../tree/laguna) | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | `git diff upstream/monu-laguna-2.1..laguna` |
+> | [`qwen`](../../tree/qwen) | Qwen3.6-27B + DFlash drafter | `bench/qwen/` | `git diff upstream/avarok-qwen..qwen` |
+>
+> `main` and `base` track upstream unmodified.
+>
+> `laguna` has **two** upstreams — Avarok, plus 36 commits of Laguna-S-2.1
+> support from [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas)
+> that were never merged upstream. GitHub's "forked from" header can only name
+> one parent, so it cannot say this; three `upstream/*` tags mark each boundary
+> instead, and [REPRODUCING.md](REPRODUCING.md) gives a one-line diff for each
+> contributor's share.
+
+---
+
 <p align="center">
   <img src="assets/logo.svg" alt="Atlas Inference Engine" width="640" />
 </p>
