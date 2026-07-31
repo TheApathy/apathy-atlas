@@ -84,6 +84,34 @@ Other entry points:
 | `gate_ab.sh` | two-arm A/B that refuses an arm whose binary can't read its gates |
 | `full_eval.sh` | the 69-case tool-eval |
 
+### Checking your run against ours
+
+```bash
+python3 bench/laguna/check_repro.py --arm gproj bench/laguna/ab/gproj.json
+```
+
+`reference_hashes.json` holds the completion hash of every prompt in all three
+arms from our own cold-clone run, so a reproduction can be checked against *our*
+result rather than only against itself. Matching tok/s is weak evidence — two
+stacks can agree on throughput to a percent and still emit different tokens.
+
+`--arm` is required (`serial`, `nogproj`, `gproj`) and is not guessed from the
+tag, because **the arms legitimately disagree with each other**. DFlash is meant
+to be output-identical to serial and is on 5 of 6 rows, but the g_proj GEMV arm
+differs from both on 4 rows *by design*: it removes a ~1 ulp BF16 error present
+in the baseline GEMM, so some argmax ties break the other way. Checking one arm
+against another's reference therefore produces four very convincing mismatches
+that mean nothing.
+
+Three per-row states, deliberately not two: `MATCH`, `MISMATCH`, and
+`KNOWN-UNSTABLE` for `prose` on the `nogproj` arm, which we publish as
+nondeterministic (see trap 1 — it suspends to serial by design, and its text is
+not stable there; the same prompt *is* stable on `gproj`). The checker also
+refuses to pass a run that is missing prompts, per trap 4.
+
+Exit codes: `0` pass, `1` a stable row differs, `2` incomplete run, `3` nothing
+to compare.
+
 ---
 
 ## What the numbers look like

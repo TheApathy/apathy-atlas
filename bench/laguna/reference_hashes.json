@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "Reference completion hashes for the three published Laguna decode arms, so",
+    "that a reproduction can be checked against OUR result and not merely",
+    "against itself. Without this file a reproducer can only prove",
+    "self-consistency: run twice, get the same answer, learn nothing about",
+    "whether it is the same answer we got.",
+    "",
+    "Each sha is sha256(completion_text)[:16] -- the value decode_bench.py writes",
+    "to its --json-out. Produced at 256 max_tokens, temperature 0, gamma 6,",
+    "fp8 KV, 8192 max seq len, single stream. These are the fp8/8192 regime of",
+    "the published decode table, NOT the bf16/3072 interactive stack that",
+    "serve_prod.sh launches -- the two disagree and the hashes are not shared.",
+    "Start from gate_run.sh.",
+    "",
+    "Verified across a cold clone and cold build against the original run:",
+    "17 of 18 rows byte-identical.",
+    "",
+    "Note that the arms deliberately do NOT all agree with each other. DFlash is",
+    "meant to be output-identical to serial, and is on 5 of 6 rows. The g_proj",
+    "GEMV arm differs from both on 4 rows by design: it removes a ~1 ulp BF16",
+    "error present in the baseline GEMM, so some argmax ties break the other way.",
+    "That is why this file is keyed per arm and the arms are not cross-checked.",
+    "",
+    "Check a run with:  python3 bench/laguna/check_repro.py --arm <arm> <json>"
+  ],
+  "suite_tokens": 256,
+  "gamma": 6,
+  "kv_dtype": "fp8",
+  "max_seq_len": 8192,
+  "arms": {
+    "serial": {
+      "description": "Non-speculative baseline decode (no DFlash).",
+      "prompts": {
+        "repetitive":  { "stable": true, "sha": "e246afc2948dd901" },
+        "easy-code":   { "stable": true, "sha": "5ce1ef05f383ce3f" },
+        "common-algo": { "stable": true, "sha": "f04d123328fe92a2" },
+        "novel-logic": { "stable": true, "sha": "09756270ea146047" },
+        "math":        { "stable": true, "sha": "08efae83066c5326" },
+        "prose":       { "stable": true, "sha": "fcca236cb1b6c6e0" }
+      }
+    },
+    "nogproj": {
+      "description": "DFlash speculative decode at gamma=6, g_proj GEMV OFF.",
+      "prompts": {
+        "repetitive":  { "stable": true, "sha": "e246afc2948dd901" },
+        "easy-code":   { "stable": true, "sha": "5ce1ef05f383ce3f" },
+        "common-algo": { "stable": true, "sha": "0ef881ac79510d9e" },
+        "novel-logic": { "stable": true, "sha": "9d3c859bd7a7e54a" },
+        "math":        { "stable": true, "sha": "08efae83066c5326" },
+        "prose": {
+          "stable": false,
+          "observed": ["b276d91c08cd6ce9", "2bc069c923ca229c"],
+          "note": "The one row that does not reproduce. On every DFlash arm this prompt suspends to serial decode by design (adaptive_spec drops it below ADAPTIVE_MIN, reported as adapt_suspend=1 at roughly the serial rate), and on this arm its text is not stable run to run. A mismatch here is a known open item, not evidence your build is wrong. The same prompt IS stable on the gproj arm. See README."
+        }
+      }
+    },
+    "gproj": {
+      "description": "DFlash gamma=6 plus the g_proj verify GEMV. The shipping stack.",
+      "prompts": {
+        "repetitive":  { "stable": true, "sha": "e246afc2948dd901" },
+        "easy-code":   { "stable": true, "sha": "50e503c38fe6124d" },
+        "common-algo": { "stable": true, "sha": "bacb43533fdb1c76" },
+        "novel-logic": { "stable": true, "sha": "d72cc308965921ab" },
+        "math":        { "stable": true, "sha": "08efae83066c5326" },
+        "prose":       { "stable": true, "sha": "b371559ef7b27b66" }
+      }
+    }
+  }
+}
