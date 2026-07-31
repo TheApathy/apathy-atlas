@@ -33,7 +33,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchenv import (  # noqa: E402
-    CHAT_URL, GAMMA, MODEL_NAME, default_log, is_dflash, log_lines, scrape,
+    CHAT_URL, GAMMA, MODEL_NAME, census, default_log, is_dflash, log_lines, scrape,
 )
 
 URL = CHAT_URL
@@ -169,6 +169,41 @@ def main():
         print("  !! accept scrape EMPTY -- no verify steps matched in this window.")
         print("     Either the serve is not running DFlash, or --log points at the wrong file.")
 
+    # Contamination census. We issued one warmup plus the suite; anything else
+    # the serve finished in this window belonged to someone else, and under FIFO
+    # it was spending our wall clock. Checked AFTER the table is printed so the
+    # forensic numbers stay visible, but the arm is not allowed to produce a
+    # scoreable artifact.
+    expect = 1 + len(SUITE)
+    seen = census(args.log, start)
+    # Not `> expect`. An unreadable log, a short count, or a count of zero is
+    # also a FAILED census, not a passed one: "we could not check" must never
+    # render the same as "we checked and it was clean". Zero in particular means
+    # the guard could not see this serve's log format at all, which is the one
+    # case where a silent pass would be worst -- the guard would look installed
+    # and be inert.
+    contaminated = seen is None or len(seen) != expect
+    if contaminated:
+        ours = sorted(r["completion_tokens"] for r in results)
+        n = "<log unreadable>" if seen is None else len(seen)
+        print(f"\n  !! CENSUS FAILED: serve completed {n} requests, we issued {expect}.")
+        if seen is not None:
+            print(f"     completions seen      : {sorted(seen)}")
+            print(f"     ours (+ 8-tok warmup) : {ours}")
+        if seen is not None and len(seen) > expect:
+            print("     A foreign client is on this port. Under --max-batch-size 1 its")
+            print("     requests queue ahead of ours and the wait is billed as decode time,")
+            print("     so rows read SLOW while their completion hashes stay correct.")
+            print("     Move to a private QWEN_PORT and re-run this arm -- re-running on the")
+            print("     same port does NOT help; the foreign runner is a loop.")
+        elif seen is not None and not seen:
+            print("     ZERO Done lines matched. This is the guard failing to read the log,")
+            print("     not a clean run: check --log points at this arm's serve log and that")
+            print("     the serve still emits 'Done: <N> tokens'. Arm is UNGRADED, not clean.")
+        else:
+            print("     Fewer completions than requests issued -- the log this arm was")
+            print("     graded from is not the log its traffic went to. Do not score it.")
+
     if args.json_out:
         # Drop the text so --json-out stays a compact hash table; the sidecar is
         # the only place text lives.
@@ -177,11 +212,22 @@ def main():
             row = dict(r)
             row.pop("text", None)
             payload.append(row)
-        with open(args.json_out, "w") as fh:
+        # A contaminated arm is diverted to a sidecar path rather than written to
+        # the one the driver grades. drafter_ab.sh refuses to score a campaign
+        # with a missing arm JSON, so diverting turns a plausible-but-wrong table
+        # into a loud refusal. Writing the real path and merely exiting nonzero
+        # would still leave a full table on screen, and a printed table is read
+        # as a result no matter what follows it.
+        dest = (args.json_out + ".contaminated") if contaminated else args.json_out
+        with open(dest, "w") as fh:
             json.dump({"tag": args.tag, "gamma": GAMMA, "tokens": args.tokens,
-                       "rows": payload, "suite_mean": mean, "weighted": weighted}, fh, indent=2)
-        print(f"  wrote {args.json_out}")
+                       "rows": payload, "suite_mean": mean, "weighted": weighted,
+                       "contaminated": contaminated, "census": seen}, fh, indent=2)
+        print(f"  wrote {dest}")
+
+    if contaminated:
+        return 3
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

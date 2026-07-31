@@ -50,28 +50,84 @@ as ours but a **different content hash**, so an unpinned `hf download` gets you
 weights we never measured. Same size is not same file. Everything published here
 is against `6f31471e`, which still resolves.
 
-**Drafter — you cannot get ours.** It is a `DFlashDraftModel` we retrained
-in-house and have not released. Public Qwen3.6-27B DFlash drafters exist
-(`z-lab/Qwen3.6-27B-DFlash`, `KingsonHO/Qwen3.6-27B-DFlash`,
-`deepsweet/Qwen3.6-27B-DFlash-FP16`) and any of them will serve, but they are not
-a drop-in substitute for ours in the way "different weights" suggests — they are
-a **different hookup**. Theirs are 5-layer drafters tapping target layers
-`[1, 16, 31, 46, 61]` with `mask_token_id` 248070; ours is a 6-layer drafter
-tapping `[1, 10, 18, 27, 35, 44, 52, 61]` with `mask_token_id` 248077. Different
-acceptance, different throughput, different completions.
+**Drafter — you cannot get ours, but you can get the one we started from, and it
+is not worse.** Ours is a `DFlashDraftModel` we retrained in-house and have not
+released. An earlier version of this section said no public drafter was a
+drop-in. **That was wrong, and it was wrong in our favour**, so it is corrected
+here in full.
+
+Hookup matters more than weights: serving a drafter whose wiring the target does
+not expect does not fail loudly, it produces a plausible but much lower accept
+rate that reads exactly like "the other drafter is worse". Read from each
+checkpoint's own `config.json`:
+
+| checkpoint | layers | `target_layer_ids` | `mask_token_id` | drop-in? |
+|---|---|---|---|---|
+| ours (in-house retrain) | 6 | `[1,10,18,27,35,44,52,61]` | 248077 | — |
+| `z-lab/Qwen3.5-27B-DFlash` @ `25ee0025` | 6 | `[1,10,18,27,35,44,52,61]` | 248077 | **yes** |
+| `KingsonHO/Qwen3.6-27B-DFlash` | 5 | `[1,16,31,46,61]` | 248070 | no |
+| `deepsweet/Qwen3.6-27B-DFlash-FP16` | 5 | `[1,16,31,46,61]` | 248070 | no |
+| `z-lab/Qwen3.6-27B-DFlash` | — | — | — | not checked — do not assume either way |
+
+So `z-lab/Qwen3.5-27B-DFlash` at `25ee0025` **is** a structural drop-in. Pin the
+revision, for the same reason the target is pinned:
+
+```bash
+hf download z-lab/Qwen3.5-27B-DFlash \
+    --revision 25ee0025ff950496a634e100b75c2db4515e9824 \
+    --local-dir ./qwen-dflash-drafter
+export QWEN_DRAFT=$PWD/qwen-dflash-drafter
+```
+
+We measured it against ours with `bench/qwen/drafter_ab.sh` — three arms in one
+sitting, the third a repeat of the first so the noise floor spans the same
+elapsed time as the comparison it judges:
+
+| pooled | ours | `z-lab` 3.5 | A/A repeat |
+|---|---|---|---|
+| token-weighted tok/s | 36.1 | **38.0** | 37.0 |
+| mean accept /16 | 4.85 | **5.03** | 4.84 |
+
+A/A floor: 2.36% on tok/s, 0.34% on accept. Ours came in **−4.8% tok/s and −3.6%
+accept**, clearing the floor on both. On this suite the public drafter is
+slightly *better* than ours.
+
+Read that narrowly. This suite is five Python prompts and one prose prompt. Our
+retrain was warm-started to raise the **Go** share of its training corpus, and
+the A/B that justified shipping it reported Go +4.6% with Python neutral — an
+axis this suite does not contain a single row of. The honest statement is "ours
+loses on Python and prose here", not "the retrain was worthless". If you care
+about Go, add a Go row; nothing above tests it.
 
 So be clear about what this branch does and does not offer:
 
-* **Reproducible from this branch alone:** the build recipe, the serve
-  configuration and its gate-parity assert, the benchmark harness, the
-  single-stream measurement protocol, and every trap in section 6.
-* **Not reproducible from this branch alone:** the tok/s in section 5 and the
-  completion hashes in `reference_hashes.json`. Those are properties of our
-  drafter.
+* **Reproducible from this branch with public checkpoints only:** the build
+  recipe, the serve configuration and its gate-parity assert, the benchmark
+  harness, the single-stream measurement protocol, every trap in section 6, and
+  — using the `z-lab` drafter above — the section 5 tok/s to within a few
+  percent, in our measurement slightly better.
+* **Not reproducible without our drafter:** the completion hashes in
+  `reference_hashes.json`.
 
 With a substituted drafter, `check_repro.py` will report `MISMATCH` on every
 stable row and exit 1. **That is the correct result for a different drafter and
 is not a build failure** — do not go hunting a numerics bug you do not have.
+
+**A caveat we owe you, because it is our bug and not yours.** On a greedy target
+at temperature 0 the committed tokens are the target's own argmax, so they ought
+not to depend on which drafter proposed them. On this stack they do. In the A/B
+above, 4 of 6 rows produced different completion text under the two drafters, and
+3 of those (`common-algo`, `novel-logic`, `math`) are byte-stable when the
+drafter is held fixed across two runs — so the drafter swap, not run-to-run
+nondeterminism, is what moved them. The divergences are substantive, not
+tie-breaks: the `math` row returns a structurally different implementation and a
+different length. The mechanism is not yet identified and we are not going to
+guess at one here. Two consequences:
+
+* Do not use hash equality as a correctness gate when comparing drafters on this
+  stack. Grade acceptance; report hashes without grading them.
+* The `prose` row is separately nondeterministic run-to-run even with the drafter
+  held fixed, and `check_repro.py` already excludes it from the stable set.
 
 If you want a decode result you can check against a published reference end to
 end, use the `laguna` branch instead: its target
