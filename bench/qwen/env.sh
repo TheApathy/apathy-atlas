@@ -285,13 +285,24 @@ qwen_serve() {
 # NOTE: /health answers `ready` on ANY serve bound to this port, including one
 # started by someone else. Readiness proves the port is answering, not that it is
 # answering with YOUR binary. qwen_lock is what makes it yours.
+#
+# Liveness is `pgrep -f`, NOT `ps -eo cmd | grep`. The latter's own command line
+# contains the pattern, so ps sees the grep and the check is TRUE FOREVER -- the
+# abort-on-death branch is unreachable and a serve that died in one second costs
+# the whole timeout. pgrep excludes itself by construction. This bit once.
+qwen_serve_alive() { pgrep -f -- "--port $PORT" >/dev/null 2>&1; }
+
 qwen_wait_ready() {
   local log="$1" tries="${2:-120}"
   for _ in $(seq 1 "$tries"); do
     curl -s -m 3 "$BASE_URL/health" 2>/dev/null | grep -q ready && return 0
-    ps -eo cmd | grep -q "port $PORT" || {
+    qwen_serve_alive || {
       echo "FATAL: serve died during load" >&2
-      grep -Ei "out of memory|illegal|CUDA_ERROR|panicked|Error: " "$log" | head -5 >&2
+      # Tail unconditionally as well as the known-fatal greps: an argv error
+      # ("cannot be used multiple times") matches none of these patterns, and a
+      # death with no explanation is the worst kind of failure to debug.
+      grep -aEi "out of memory|illegal|CUDA_ERROR|panicked|^error" "$log" | head -5 >&2
+      echo "--- last 10 lines of $log ---" >&2; tail -10 "$log" >&2
       exit 4
     }
     sleep 5
