@@ -105,6 +105,29 @@ classified DFlash-or-serial **before** it is aggregated, and a row that cannot b
 graded is reported as `UNGRADED` rather than folded into either bucket. A count
 of zero must never be readable as "nothing wrong".
 
+### Checking your run against ours
+
+```bash
+python3 bench/qwen/check_repro.py bench/qwen/ab/champion.json
+```
+
+`reference_hashes.json` holds the completion hash of every prompt from our own
+cold-clone run, so a reproduction can be checked against *our* result rather
+than only against itself. Matching tok/s is weak evidence — two stacks can agree
+on throughput to a percent and still emit different tokens. The hashes are what
+constrain the computation.
+
+Three per-row states, deliberately not two: `MATCH`, `MISMATCH`, and
+`KNOWN-UNSTABLE` for the `prose` row, which we publish as nondeterministic. A
+legitimately unstable row must not read the same as a broken one, and must not
+be quietly dropped either. The checker also refuses to pass a run that is
+missing prompts, since that would report zero mismatches and look exactly like a
+clean result.
+
+Exit codes: `0` pass, `1` a stable row differs, `2` incomplete run, `3` nothing
+to compare. A `MISMATCH` almost always means a configuration difference rather
+than a numerics one — check the `serve_champion.sh` asserts first.
+
 ### Files
 
 | File | Purpose |

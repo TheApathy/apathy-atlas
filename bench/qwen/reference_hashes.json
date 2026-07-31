@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Reference completion hashes for the Qwen3.6-27B champion stack, so that a",
+    "reproduction can be checked against OUR result and not merely against",
+    "itself. Without this file a reproducer can only prove self-consistency:",
+    "run twice, get the same answer, learn nothing about whether it is the same",
+    "answer we got.",
+    "",
+    "Each sha is sha256(completion_text)[:16] -- the same value decode_bench.py",
+    "writes to its --json-out. Produced at 256 max_tokens, temperature 0,",
+    "enable_thinking=false, gamma=16, single stream (--max-batch-size 1).",
+    "Confirmed across two independently built binaries and four passes.",
+    "",
+    "Check a run with:  python3 bench/qwen/check_repro.py <json-out file>"
+  ],
+  "suite_tokens": 256,
+  "gamma": 16,
+  "arms": {
+    "champion": {
+      "description": "The champion configuration launched by serve_champion.sh.",
+      "prompts": {
+        "repetitive":  { "stable": true,  "sha": "c9f270a964bca544" },
+        "easy-code":   { "stable": true,  "sha": "0dd8f2b7e02cb3c3" },
+        "common-algo": { "stable": true,  "sha": "1007997cc9909ac0" },
+        "novel-logic": { "stable": true,  "sha": "89524f70c87146ea" },
+        "math":        { "stable": true,  "sha": "4c974dd8533817b4" },
+        "prose": {
+          "stable": false,
+          "observed": ["b9dd90c67c391cfc", "28a49937e6e6d5f3"],
+          "note": "Intermittently nondeterministic: 3 of 4 observed passes gave the first hash, 1 gave the second. Lowest-acceptance row (1.60/16). Both outputs are fluent and on-topic, diverging mid-sentence into different phrasing rather than into corruption. A mismatch here is NOT evidence your build is wrong. See README section 5."
+        }
+      }
+    }
+  }
+}
