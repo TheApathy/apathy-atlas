@@ -100,6 +100,37 @@ Measured single-stream on GB10-class hardware, token-weighted across the
 Prefill, fitted over a length sweep: ~2160 tok/s, rising ~50% with
 `ATLAS_PREFILL_CUBLAS=1`. Quality: 82/100 on the 69-case tool-eval.
 
+**Reproduction record.** The table above was re-measured from a cold clone of
+this branch at `6b070c15` — fresh checkout, fresh build (158/158 nvcc
+invocations, 0 cache hits), no warm `target/`:
+
+| stack | published | cold-clone re-measure | delta |
+|---|---|---|---|
+| serial decode | 21.3 | 20.9 | −1.9% |
+| + DFlash (γ=6) | 29.9 | 29.7 | −0.7% |
+| + g_proj verify GEMV | 32.7 | 32.4 | −0.9% |
+
+Expect **±2% on tok/s** and treat anything inside that as agreement. The
+stronger check is the text: 17 of the 18 prompt outputs were byte-identical to
+the original run, on a different binary three days later, and the shipping arm
+reproduced byte-for-byte across two separate serve launches in the same
+session. That is what `--dump-text` and the `sha=` column are for — a tok/s
+number that lands on target while the text moved is not a reproduction.
+
+Two things to expect rather than treat as breakage:
+
+- **The `prose` row suspends.** `ATLAS_DFLASH_ADAPTIVE=1` drops a row to serial
+  decode when measured speedup falls under `ATLAS_DFLASH_ADAPTIVE_MIN=1.2`, and
+  prose does that every time (`adapt_suspend: 1`, ~20.6 tok/s — the serial
+  rate). `decode_bench.py` marks it `** SUSPENDED->serial` and prints a
+  `DFlash-only` mean beside the headline. The headline *includes* the suspended
+  row on purpose: it is a content-mix figure, not a peak.
+- **`prose` text differs between the serial and DFlash arms**, and the DFlash
+  arm's prose is the one cell that is not stable run-to-run. Committed tokens
+  are supposed to be drafter-independent, so this is a known open defect, not a
+  configuration error. It predates this branch and is confined to that row —
+  every other prompt agrees byte-for-byte across arms and across runs.
+
 **Decode throughput is a content-mix property, not one number.** On the same
 stack, the spread across prompts is far larger than any lever in this repo:
 
