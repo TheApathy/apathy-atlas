@@ -144,6 +144,15 @@ The token-weighted row is the honest end-to-end figure.
 All six rows are classified DFlash (none fell back to serial, none `UNGRADED`),
 and every verify step ran at width 16.
 
+**These are single-stream figures**, and that is a property of the stack rather
+than a shortcut in the harness: `decode_bench.py` issues one blocking request at
+a time, and the serve is launched with `--max-batch-size 1` / `--max-num-seqs 1`.
+Speculative decoding is a latency optimization — it spends extra compute per step
+to shorten the critical path — so its advantage shrinks as soon as more than one
+sequence is active and the GPU is no longer idle-waiting. Do not compare these
+against a concurrent aggregate throughput number; that is a different regime with
+a different optimum, and it will be higher.
+
 **What reproduces exactly, and what does not.** Five of the six prompts are
 byte-identical across both passes *and* across a second, independently built
 binary — and the per-prompt mean accept agrees to the last digit on both builds.
