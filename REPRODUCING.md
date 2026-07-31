@@ -1,25 +1,78 @@
 # Reproducing the measurements in this fork
 
-This is a fork of Atlas. The default branch tracks upstream unchanged; the work
-lives on per-model branches, and each one carries its own self-contained
-reproduction harness under `bench/<model>/`.
+This is a fork of [Atlas](https://github.com/Avarok-Cybersecurity/atlas). The
+default branch tracks upstream unchanged; the work lives on per-model branches,
+and each one carries its own self-contained reproduction harness under
+`bench/<model>/`.
+
+Upstream is Avarok-Cybersecurity/atlas. The `laguna` branch additionally builds
+on 36 commits from [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas)
+that were never merged upstream — see [Where every commit came from](#where-every-commit-came-from),
+which gives you a one-line diff for each contributor's share.
 
 | Branch | Model | Harness | What it measures |
 |---|---|---|---|
-| `base` / `main` | — | — | Upstream Atlas, unmodified. |
-| `laguna` | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | Single-stream DFlash speculative decode, prefill, capacity, and a 69-case tool-calling eval. Shares history with `base`, so `base...laguna` is a meaningful diff. |
-| `qwen` | Qwen3.6-27B (dense) + DFlash drafter | `bench/qwen/` | The champion single-stream speculative-decode configuration. A standalone snapshot — see the warning below. |
+| `base` / `main` | — | — | Upstream Atlas, unmodified. Same commit on both; `base` exists as a stable anchor to diff against. |
+| `laguna` | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | Single-stream DFlash speculative decode, prefill, capacity, and a 69-case tool-calling eval. |
+| `qwen` | Qwen3.6-27B (dense) + DFlash drafter | `bench/qwen/` | The champion single-stream speculative-decode configuration. |
 
-### `qwen` is a snapshot, not a diff
+Those four are the whole map. Any other branch you see was inherited from
+upstream and is not part of this work.
 
-`laguna` branches from `base`. **`qwen` does not.** It descends from a different
-upstream lineage, and its tree is older than `base` by 1066 files. Comparing the
-two renders as though this fork deleted 399 crates and 375 kernels, which is an
-artifact of the two histories, not a change anyone made.
+## Where every commit came from
 
-So do not read `base...qwen`. Check `qwen` out and build it: it is the tree the
-published Qwen numbers were actually measured on, which is exactly why it has
-not been rewritten into something tidier that has never been run.
+The two branches do not have the same lineage, and `laguna` has **two**
+upstreams rather than one. GitHub's "forked from" header can only ever name a
+single parent, so it cannot state this correctly — these three tags do:
+
+| Tag | Commit | What it marks |
+|---|---|---|
+| `upstream/avarok-laguna` | `f8ff5f78` | The Avarok commit `laguna` forked from |
+| `upstream/monu-laguna-2.1` | `93ff1113` | Tip of MonumentalSystems' Laguna-S-2.1 enablement work |
+| `upstream/avarok-qwen` | `ddc7080f` | The Avarok commit `qwen` forked from |
+
+`laguna` is three contiguous stages with no interleaving:
+
+```bash
+# 36 commits, all by Richard Safier, from MonumentalSystems' unmerged
+# feat/laguna-s-2.1 branch -- 124 files, +7,938 / -686
+git diff upstream/avarok-laguna..upstream/monu-laguna-2.1
+
+# 44 commits -- ours -- 185 files, +32,899 / -625
+git diff upstream/monu-laguna-2.1..laguna
+```
+
+Those 36 commits are **load-bearing**: they include `spark-model: add
+Laguna-S-2.1 inference support`, so the model does not load without them, and
+they were never merged into Avarok. If you want the Laguna-S-2.1 support by
+itself, that segment is where it is. This branch carries it so you do not have
+to chase an unmerged upstream branch to build.
+
+`qwen` is two stages and involves MonumentalSystems not at all:
+
+```bash
+# 294 commits -- ours -- 589 files, +118,579 / -3,251
+git diff upstream/avarok-qwen..qwen
+```
+
+### If you diff against `base`, use three dots
+
+`base` tracks upstream's *current* tip, which is newer than either fork point.
+A two-dot diff against it subtracts that newer tip and reports upstream's own
+later commits as though this fork had deleted them:
+
+| | two-dot `base..X` — misleading | three-dot `base...X` — correct |
+|---|---|---|
+| `laguna` | 557 files, −29,129 lines | **267 files, +40,814 / −1,288** |
+| `qwen` | 1,989 files, −283,621 lines, 1,066 "deletions" | **589 files, +118,579 / −3,251** |
+
+The three-dot form resolves to each branch's own fork point, so it is equivalent
+to the tag commands above and shows what changed here and nothing else.
+`base...laguna` deletes zero files.
+
+Neither branch has been rebased onto `base` to make that diff tidier. These are
+the trees the published numbers were actually measured on, and rewriting them
+into something neater would produce a history that has never been run.
 
 Both branches target GB10-class hardware (Grace Blackwell, `sm_121f`, unified
 LPDDR5x). Nothing in either harness is hardcoded to a particular machine: paths,
