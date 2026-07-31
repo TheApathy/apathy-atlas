@@ -18,8 +18,8 @@ transfer between them; see [Traps](#5-five-things-that-will-cost-you-a-day).
 | What | Notes |
 |---|---|
 | A CUTLASS source checkout | `CUTLASS_HOME` must point at it. If you have built vLLM from source you already have one under its `.deps/`. |
-| Target checkpoint | A Qwen3.6-27B snapshot directory (must contain `config.json`). |
-| DFlash drafter checkpoint | The matching DFlash drafter snapshot directory. |
+| Target checkpoint | A Qwen3.6-27B snapshot directory (must contain `config.json`). Ours is a locally assembled `Qwen3_5ForConditionalGeneration` build, not a published repo — read [Checkpoint availability](#checkpoint-availability) before you start. |
+| DFlash drafter checkpoint | The matching DFlash drafter snapshot directory (`DFlashDraftModel`, `block_size` 16). Ours is an in-house retrain and is likewise unpublished. |
 | CUDA toolkit + a Blackwell-class GPU | ~50 GB of free memory at launch; γ=16 inflates the SSM-MTP pool and KV by roughly 24 GB over a non-speculative serve. |
 
 Nothing here has a machine-specific default. Every path comes from the
@@ -30,6 +30,37 @@ export QWEN_MODEL=/path/to/Qwen3.6-27B-target
 export QWEN_DRAFT=/path/to/Qwen3.6-27B-DFlash-drafter
 export QWEN_BIN=/path/to/spark          # optional; defaults to ./target/release/spark
 ```
+
+### Checkpoint availability
+
+**Neither checkpoint this branch was measured on is publicly downloadable, and
+that limit is on us, not on you.** The target is a locally assembled snapshot;
+the drafter is a DFlash model we retrained ourselves. Neither has been released.
+So be clear about what this branch does and does not offer:
+
+* **Reproducible from this branch alone:** the build recipe, the serve
+  configuration and its gate-parity assert, the benchmark harness, the
+  single-stream measurement protocol, and every trap in section 5. Point them at
+  any Qwen3.6-27B target and any DFlash drafter for that target and the whole
+  pipeline runs.
+* **Not reproducible from this branch alone:** the specific tok/s and the
+  completion hashes in `reference_hashes.json`. Those are properties of *our*
+  weights.
+
+Public DFlash drafters for Qwen3.6-27B do exist (`z-lab/Qwen3.6-27B-DFlash`,
+`KingsonHO/Qwen3.6-27B-DFlash`, `deepsweet/Qwen3.6-27B-DFlash-FP16`). Any of them
+will serve. None of them are our weights, so acceptance will differ, throughput
+will differ, and the completions will differ. `check_repro.py` will report
+`MISMATCH` on every stable row and exit 1. **That is the correct result for a
+substituted drafter and is not a build failure** — do not go hunting a numerics
+bug you do not have. Run the checker only against a run made with the same two
+checkpoints we used.
+
+If you want a decode result you can check against a published reference on
+hardware you control, use the `laguna` branch instead: its target
+(`poolside/Laguna-S-2.1-NVFP4`) and drafter
+(`poolside/Laguna-S-2.1-DFlash-NVFP4`) are both public, so
+`bench/laguna/reference_hashes.json` is checkable end to end.
 
 ## 2. Build
 
