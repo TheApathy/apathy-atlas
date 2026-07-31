@@ -47,22 +47,58 @@ Two related traps worth knowing before you debug a "working" build:
   stale kernel caller there survives a green build. Use
   `--features="cuda gpu-examples"` when that matters.
 
-## 3. Serve
+## 3. Reproduce the table
+
+```bash
+bash bench/laguna/repro_table.sh
+```
+
+**This is the entry point for the decode table below.** It runs all four arms
+back to back on one box, grades every completion hash against
+`reference_hashes.json`, and prints the table. Budget ~25 minutes.
+
+| arm | what it is |
+|---|---|
+| `serial` | no speculation at all — the denominator |
+| `nogproj` | DFlash, `ATLAS_VERIFY_GPROJ_GEMV` off |
+| `gproj` | DFlash, full production stack — the headline arm |
+| `gproj-p2` | `gproj` again, unchanged — your box's A/A noise floor |
+
+The fourth arm is the one people skip and shouldn't. A reproduction that lands
+3% off ours means nothing until you know what 3% costs on *your* machine, and
+that number is not a constant: it belongs to a harness plus a config plus a
+session, not to the hardware. Ours came out at 1.1%. Measure your own rather
+than inheriting it.
+
+The driver refuses to print a table if any arm produced no output. Scoring
+whichever arms survived is how a sweep whose arms had *all* died still printed a
+confident verdict — see trap 4.
+
+Run a single arm with `repro_arm.sh <tag> [ENV=VAL ...]` when a reproduction
+disagrees and you are bisecting which arm moved.
+
+## 4. Serve interactively
 
 ```bash
 bash bench/laguna/serve_prod.sh
 ```
 
-This is the canonical launcher and it is self-verifying: it refuses to report a
-healthy serve unless the chat template resolved to a native Laguna template
-(never the ChatML fallback), CUTLASS scale-factor blocks were built, every
-`ATLAS_*` gate it exports actually exists as a string in the binary, and the same
-temperature-0 prompt twice returns byte-identical output.
+For poking at the model by hand, not for reproducing the table. It is
+self-verifying — it refuses to report a healthy serve unless the chat template
+resolved to a native Laguna template (never the ChatML fallback), CUTLASS
+scale-factor blocks were built, every `ATLAS_*` gate it exports actually exists
+as a string in the binary, and the same temperature-0 prompt twice returns
+byte-identical output. That last one is load-bearing: every hash comparison in
+this directory is meaningless if the baseline is not deterministic.
 
-That last one is load-bearing for everything else in this directory. Every hash
-comparison in the harness is meaningless if the baseline is not deterministic.
+> **`serve_prod.sh` is a different regime from the table.** It serves
+> **bf16 KV at 3072** context; the published numbers were measured at **fp8 KV
+> at 8192**, which is what `env.sh` defaults to and what `repro_table.sh` uses.
+> Benchmarking against a `serve_prod.sh` serve and comparing to the table below
+> is comparing two different configurations, and it will look like a
+> reproduction failure when nothing is wrong.
 
-## 4. Measure
+To measure against a serve you launched yourself:
 
 ```bash
 python3 bench/laguna/decode_bench.py --tag mine --log bench/laguna/ab/serve-prod.log
@@ -76,6 +112,8 @@ Other entry points:
 
 | script | what it answers |
 |---|---|
+| `repro_table.sh` | **the published decode table, all four arms, hash-graded** |
+| `repro_arm.sh` | one arm of the above, for bisecting a disagreement |
 | `lang_bench.py` | does coding throughput hold across C / Python / Go |
 | `prefill_cublas.sh` | prefill throughput, and the cuBLASLt prefill route A/B |
 | `conc_capacity.sh` | throughput and latency vs concurrency |
@@ -87,7 +125,7 @@ Other entry points:
 ### Checking your run against ours
 
 ```bash
-python3 bench/laguna/check_repro.py --arm gproj bench/laguna/ab/gproj.json
+python3 bench/laguna/check_repro.py --arm gproj bench/laguna/ab/repro/gproj.json
 ```
 
 `reference_hashes.json` holds the completion hash of every prompt in all three
