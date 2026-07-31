@@ -36,6 +36,43 @@ def log_lines(path):
         return 0
 
 
+def census(path, start):
+    """Completion sizes seen in a log window -- the contamination check.
+
+    Returns the token count of every request the serve finished during the
+    window, ours and anyone else's. The caller knows how many it issued; any
+    excess is foreign traffic.
+
+    Why this is not paranoia. Port 8890 is a shared default, and a foreign
+    client landing on our serve mid-suite does not crash anything: under
+    --max-batch-size 1 the scheduler is FIFO, so its requests simply push ours
+    back in the queue. decode_bench times from request to response, so that
+    queueing is billed to the model as if it were decode. On 2026-07-31 nine
+    foreign 3/9/16-token requests arrived between two prompts and turned a
+    7.6s decode into a 16.2s row: 15.8 tok/s reported where the serve's own
+    Done line said 33.6, with a byte-IDENTICAL completion hash. Same output,
+    half the speed, and no arm-level assertion that could notice.
+
+    Census the REQUESTS, not a content feature. An earlier guard on this
+    project keyed on the string "Thinking" and was wrong in both directions:
+    our own traffic thinks by default, and the serve prints "Thinking start
+    token" at boot whether or not any client ever connects.
+
+    One residual case this cannot see: a foreign request that began before the
+    window and had not finished by the end of it emits no Done line inside the
+    window. It would still show up as an unexplained slow row, which is what
+    sent us looking here in the first place.
+    """
+    try:
+        with open(path, errors="ignore") as fh:
+            lines = fh.readlines()[start:]
+    except OSError:
+        return None
+    return [int(m.group(1))
+            for line in lines
+            for m in [re.search(r"Done: (\d+) tokens", line)] if m]
+
+
 def scrape(path, start):
     """Accept distribution and mean verify/propose ms over a log window.
 

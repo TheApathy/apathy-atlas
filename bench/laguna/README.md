@@ -263,11 +263,48 @@ inherits the descriptor deliberately: an orphaned serve keeps the lock, so the
 next arm refuses to start rather than racing a process it cannot see. A stale
 lock means "kill the serve", not "delete the lock file".
 
-`assert_decode_clean.sh` censuses the requests that *arrived inside the
-measurement window*. Census arrivals, not completions, and not a content
-feature of the traffic — an earlier version keyed on whether requests were
-thinking, and flagged three provably-clean runs because our own traffic thinks
-by default.
+**The lock stops foreign *serves*. It does nothing about foreign *clients*.**
+These are separate threats and only the first one has a mutex. Nothing prevents
+another process on the box from sending requests to a port you legitimately
+hold, and under `--max-batch-size 1` the scheduler is FIFO, so those requests
+queue *ahead* of yours. `decode_bench.py` times from request to response, so
+the queueing is billed to the model as decode time.
+
+This is not hypothetical and it is not loud. On 2026-07-31 nine foreign
+requests (five capped at 16 tokens, ~1/sec) landed between two prompts of the
+`nogproj` arm. One row reported **15.8 tok/s where the serve's own `Done:` line
+said 33.6** — and its completion hash was byte-identical, so every correctness
+check passed. Re-running reproduced it. Same output, half the speed, nothing
+flagged. The token-weighted arm total read 25.6 instead of 30.5.
+
+Two defenses, both now in the harness:
+
+- `decode_bench.py` censuses the serve log and refuses to write a scoreable
+  JSON unless the serve completed *exactly* the requests it issued (one warmup
+  plus the suite). A contaminated arm is diverted to `<arm>.json.contaminated`,
+  which makes `repro_table.sh` refuse to score the campaign rather than print a
+  plausible table. Diverting matters more than a nonzero exit: a printed table
+  is read as a result no matter what follows it.
+- `export LAGUNA_PORT=<something private>` if you share the box. `8890` is a
+  default that a lot of unrelated scripts also default to, which is precisely
+  why it keeps happening. Moving ports is the only fix that does not depend on
+  the other process cooperating.
+
+Census the *requests*, not a content feature of the traffic. An earlier guard
+keyed on whether requests were thinking and was wrong in both directions: our
+own traffic thinks by default, and the serve prints `Thinking start token` at
+boot whether or not any client ever connects.
+
+`assert_decode_clean.sh` is the standalone form of the same census, for logs
+this bench did not write — `gate_run.sh` logs, where the tool-eval phase adds
+~38 more requests and the count has to be cut at the decode/eval boundary
+first. It is what `gate_ab.sh` calls (advisorily, with `|| true`). It expects a
+hardcoded `WANT_DONE=7`; the in-bench census derives the same number from
+`len(SUITE)`, so adding a prompt cannot silently desynchronise it.
+
+One case a completion census cannot see: a foreign request that started before
+your window and had not finished inside it emits no `Done:` line to count. It
+still shows up as an unexplained slow row — which is what sent us looking.
 
 ### 3. ARMED is not DISPATCHED
 
