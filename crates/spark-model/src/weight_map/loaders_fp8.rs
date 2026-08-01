@@ -14,8 +14,10 @@ use super::*;
 ///
 /// The FP8 checkpoint stores:
 ///   - `{prefix}.weight`: FP8E4M3 tensor [N, K]
-///   - `{prefix}.weight_scale_inv`: BF16 (Qwen/DeepSeek) or FP32 (MiniMax)
-///     tensor [N/block, K/block]
+///   - the block scale [N/block, K/block], under whichever name the producer
+///     used: `weight_scale_inv` (Qwen/DeepSeek-V3, BF16 or FP32),
+///     `weight_scale` (compressed-tensors, 2D; ModelOpt ships it as a scalar),
+///     or `scale` (DeepSeek-V4, FP8E8M0)
 ///
 /// The `w8a16_gemv` kernel uses 2D block scales directly:
 ///   `dequant[i,j] = E4M3_LUT[fp8[i,j]] * block_scale[i/BS, j/BS]`
@@ -58,14 +60,21 @@ pub fn load_fp8_block_scaled_as_fp8weight(
     // the W8A16 kernels apply in FP32. Prefer whichever 2D block scale exists.
     let scale_inv_key = format!("{prefix}.weight_scale_inv");
     let plain_scale_key = format!("{prefix}.weight_scale");
+    let short_scale_key = format!("{prefix}.scale");
+    let is_2d = |key: &str| store.get(key).map(|s| s.shape.len() == 2).unwrap_or(false);
     let block_scale_key = if store.contains(&scale_inv_key) {
         Some(scale_inv_key.clone())
-    } else if store
-        .get(&plain_scale_key)
-        .map(|s| s.shape.len() == 2)
-        .unwrap_or(false)
-    {
+    } else if is_2d(&plain_scale_key) {
         Some(plain_scale_key.clone())
+    } else if is_2d(&short_scale_key) {
+        // DeepSeek-V4 spells it plainly `.scale` and stores it as F8_E8M0 — the
+        // same per-block dequant multiplier, just a shorter key and a one-byte
+        // exponent dtype. `dequant_fp8_blockwise_to_bf16` in `quant_helpers`
+        // already accepts this spelling; this loader did not, so every MLA
+        // projection lookup missed, the caller's `.ok()` swallowed the error,
+        // and all five projections silently fell back to BF16 — double the
+        // weight traffic on the most bandwidth-bound path in decode.
+        Some(short_scale_key.clone())
     } else {
         None
     };
@@ -77,8 +86,11 @@ pub fn load_fp8_block_scaled_as_fp8weight(
             s.shape,
         );
         ensure!(
-            s.dtype == WeightDtype::BF16 || s.dtype == WeightDtype::FP32,
-            "Expected BF16 or FP32 for {scale_key}, got {:?}",
+            matches!(
+                s.dtype,
+                WeightDtype::BF16 | WeightDtype::FP32 | WeightDtype::FP8E8M0
+            ),
+            "Expected BF16, FP32, or FP8E8M0 for {scale_key}, got {:?}",
             s.dtype,
         );
 
@@ -89,25 +101,44 @@ pub fn load_fp8_block_scaled_as_fp8weight(
             s.dtype,
         );
 
-        // Widen the block scale to a genuine FP32 device buffer (lossless from
-        // BF16, straight copy from FP32). The W8A8/W8A16 kernels apply this scale
-        // in FP32; reading the checkpoint BF16 directly would clamp it to BF16
-        // precision (and an FP32-scale checkpoint would be misread as BF16).
         let scale_total = s.shape[0] * s.shape[1];
-        let row_scale = gpu.alloc(scale_total * 4)?;
-        let kernel = gpu.kernel("widen_block_scale_f32", "widen_block_scale_f32")?;
-        let stream = gpu.default_stream();
-        crate::layers::ops::widen_block_scale_f32(
-            gpu,
-            kernel,
-            s.ptr,
-            row_scale,
-            scale_total as u32,
-            s.dtype == WeightDtype::FP32,
-            stream,
-        )?;
-        gpu.synchronize(stream)?;
-        row_scale
+        if s.dtype == WeightDtype::FP8E8M0 {
+            // E8M0 is a bare power-of-two exponent, so widening is a LUT lookup
+            // rather than a float conversion and the `widen_block_scale_f32`
+            // kernel cannot do it. Round-trip through the host instead: these
+            // buffers are at most a few KiB (the largest here is wq_b's [256,8]
+            // = 2 KiB) and this runs once at load, so a device kernel would buy
+            // nothing. The value is the dequant *multiplier*, matching
+            // `quant_helpers`' `fp8_e4m3_to_f32(w) * scale` — no reciprocal.
+            let mut raw = vec![0u8; scale_total];
+            gpu.copy_d2h(s.ptr, &mut raw)?;
+            let mut widened = Vec::with_capacity(scale_total * 4);
+            for byte in raw {
+                widened.extend_from_slice(&fp8_e8m0_to_f32(byte).to_le_bytes());
+            }
+            let row_scale = gpu.alloc(widened.len())?;
+            gpu.copy_h2d(&widened, row_scale)?;
+            row_scale
+        } else {
+            // Widen the block scale to a genuine FP32 device buffer (lossless from
+            // BF16, straight copy from FP32). The W8A8/W8A16 kernels apply this scale
+            // in FP32; reading the checkpoint BF16 directly would clamp it to BF16
+            // precision (and an FP32-scale checkpoint would be misread as BF16).
+            let row_scale = gpu.alloc(scale_total * 4)?;
+            let kernel = gpu.kernel("widen_block_scale_f32", "widen_block_scale_f32")?;
+            let stream = gpu.default_stream();
+            crate::layers::ops::widen_block_scale_f32(
+                gpu,
+                kernel,
+                s.ptr,
+                row_scale,
+                scale_total as u32,
+                s.dtype == WeightDtype::FP32,
+                stream,
+            )?;
+            gpu.synchronize(stream)?;
+            row_scale
+        }
     } else {
         let scalar_key = plain_scale_key;
         let scale = scalar_f32(store, &scalar_key, gpu)

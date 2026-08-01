@@ -441,13 +441,28 @@ pub fn assemble_layer(
     // reads these at 1 byte/elem via w8a16_gemv instead of the BF16 dequant's
     // 2 bytes — ~2× less weight traffic on the memory-bound MLA projections,
     // lossless (in-kernel F32 dequant). `None` when the checkpoint isn't FP8.
+    // Falling back is legitimate for a non-FP8 checkpoint but catastrophic for
+    // an FP8 one: it doubles decode weight traffic with no error anywhere. So
+    // only stay quiet when there is genuinely no FP8 tensor to load; if the
+    // weight is there and only the scale handling failed, say so loudly.
     let load_fp8_mla = |suffix: &str| {
-        crate::weight_map::load_fp8_block_scaled_as_fp8weight(
-            store,
-            &format!("{lp}.attn.{suffix}"),
-            gpu,
-        )
-        .ok()
+        let prefix = format!("{lp}.attn.{suffix}");
+        match crate::weight_map::load_fp8_block_scaled_as_fp8weight(store, &prefix, gpu) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                let is_fp8 = store
+                    .get(&format!("{prefix}.weight"))
+                    .map(|w| w.dtype == spark_runtime::weights::WeightDtype::FP8E4M3)
+                    .unwrap_or(false);
+                if is_fp8 {
+                    tracing::warn!(
+                        "{prefix}: FP8 tensor present but not loadable, falling back to BF16 \
+                         (2x decode weight traffic on this projection): {e:#}"
+                    );
+                }
+                None
+            }
+        }
     };
     let wq_a_fp8 = load_fp8_mla("wq_a");
     let wq_b_fp8 = load_fp8_mla("wq_b");
