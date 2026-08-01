@@ -160,6 +160,9 @@ impl TransformerModel {
                 .suppress_graphs
                 .load(std::sync::atomic::Ordering::Relaxed)
             && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            // Calibration is only ONE reason suppress_graphs may be set; do not
+            // clobber an explicit ATLAS_DEBUG_NO_GRAPH=1 (forced-eager) request.
+            && std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() != Ok("1")
         {
             self.suppress_graphs
                 .store(false, std::sync::atomic::Ordering::Relaxed);
