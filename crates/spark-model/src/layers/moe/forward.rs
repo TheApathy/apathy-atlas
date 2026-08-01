@@ -466,6 +466,19 @@ impl MoeLayer {
                 )
             })?;
         } else {
+            // This fallback dequantizes as NVFP4 — it reads the scale buffer as
+            // [N, K/16]. deepseek_v4's native-MXFP4 routed experts store E8M0
+            // scales as [N, K/32], so landing here with E8M0 weights reads twice
+            // the scale bytes that exist and walks off the end of the allocation.
+            // In prefill the equivalent fallback has this same guard; decode did
+            // not, so a layer that missed the transpose pass (the MTP body used
+            // to) faulted with CUDA 700 instead of saying why. Keep the guard
+            // even now that the transpose covers the MTP body — it turns any
+            // future layout regression back into a legible panic.
+            self.experts_scale_kind.expect(
+                crate::weight_map::WeightQuantFormat::Nvfp4,
+                "decode non-transposed gate_up fallback (no E8M0 variant wired)",
+            );
             // ATLAS_KN_V5=1 also arms the M=1 serial-decode v5 kernels:
             // cp.async whole-slice staged variants of the two serial NVFP4
             // kernels below, BIT-IDENTICAL outputs (same lane partition,

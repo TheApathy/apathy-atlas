@@ -10,10 +10,17 @@ use crate::layer::TransformerLayer;
 
 /// Pre-flight memory audit + MoE-transpose pass for MiniMax-M2 unified /
 /// hybrid layout modes.
+///
+/// `mtp_body` is the DeepSeek-V4 MTP draft layer, which lives outside the main
+/// `layers` slice but is a full MoE layer that decodes on every propose step.
+/// It must get the same treatment: its routed experts are native MXFP4, and the
+/// only decode path wired for E8M0 scales is the transposed one. Left out, it
+/// falls to the NVFP4 fallback and reads past the end of its scale buffer.
 pub(super) fn maybe_run_minimax_m2_moe_transpose(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     layers: &mut [Box<dyn TransformerLayer>],
+    mtp_body: Option<&mut Box<dyn TransformerLayer>>,
 ) -> Result<()> {
     // ARM-2 Phase-K: deepseek_v4 native-MXFP4 routed experts REQUIRE the
     // transposed prefill tables (gate_ptrs_t/up_ptrs_t/down_ptrs_t) to reach the
@@ -38,11 +45,16 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
     let local_experts: usize = (0..config.num_experts)
         .filter(|e| config.is_local_expert(*e))
         .count();
+    // The MTP body is one extra MoE layer, so it costs one extra layer's worth
+    // of transposed weights and must be inside every budget check below.
+    let mut targets: Vec<&mut Box<dyn TransformerLayer>> =
+        layers.iter_mut().chain(mtp_body).collect();
+    let n_moe_layers = targets.len();
     // Per expert weight = packed (n*k/2 bytes) + scale (n*k/16 bytes) =
     // n*k * 9/16 bytes, where n*k = inter*hidden.
     let per_expert_one: usize = config.moe_intermediate_size * config.hidden_size * 9 / 16;
-    let cost_full: usize = local_experts * 3 * per_expert_one * config.num_hidden_layers;
-    let cost_gate_up: usize = local_experts * 2 * per_expert_one * config.num_hidden_layers;
+    let cost_full: usize = local_experts * 3 * per_expert_one * n_moe_layers;
+    let cost_gate_up: usize = local_experts * 2 * per_expert_one * n_moe_layers;
     let safety: usize = std::env::var("ATLAS_MOE_TRANSPOSE_SAFETY_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -75,7 +87,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
             gb(2 * cost_full),
             gb(free),
         );
-        for layer in layers.iter_mut() {
+        for layer in targets.iter_mut() {
             layer.transpose_moe_for_prefill_hybrid(gpu, config)?;
         }
         tracing::info!(
@@ -91,7 +103,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
              phased transpose with frees, free pre-pass {:.1} GB → RUNNING",
             gb(free),
         );
-        for layer in layers.iter_mut() {
+        for layer in targets.iter_mut() {
             layer.transpose_moe_for_prefill_unified(gpu, config)?;
         }
         tracing::info!(
@@ -105,7 +117,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
             gb(cost_full),
             gb(free),
         );
-        for layer in layers.iter_mut() {
+        for layer in targets.iter_mut() {
             layer.transpose_moe_for_prefill(gpu, config)?;
         }
         tracing::info!(
@@ -120,7 +132,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
             gb(free),
             gb(cost_gate_up),
         );
-        for layer in layers.iter_mut() {
+        for layer in targets.iter_mut() {
             layer.transpose_moe_gate_up_for_prefill(gpu, config)?;
         }
         tracing::info!(
@@ -178,7 +190,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
         gpu.copy_h2d(&packed_ptrs_host, packed_ptrs_t)?;
         let scale_ptrs_t = gpu.alloc(config.num_experts * 8)?;
         gpu.copy_h2d(&scale_ptrs_host, scale_ptrs_t)?;
-        for layer in layers.iter_mut() {
+        for layer in targets.iter_mut() {
             layer.set_moe_down_transpose_scratch(
                 scratch_packed,
                 scratch_scale,
@@ -190,7 +202,7 @@ pub(super) fn maybe_run_minimax_m2_moe_transpose(
             "MoE down scratch: {:.0} MB packed + {:.0} MB scale, shared across {} layers",
             scratch_packed_bytes as f64 / (1024.0 * 1024.0),
             scratch_scale_bytes as f64 / (1024.0 * 1024.0),
-            config.num_hidden_layers,
+            n_moe_layers,
         );
     } else {
         tracing::warn!(

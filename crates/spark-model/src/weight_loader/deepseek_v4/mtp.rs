@@ -5,7 +5,8 @@
 //! `nvidia/DeepSeek-V4-Flash-NVFP4` ships one MTP module
 //! (`num_nextn_predict_layers = 1`, 1575 tensors). Its body is structurally a
 //! main V4 layer — MLA attention, manifold-constrained hyper-connections (mHC),
-//! and a 256-expert NVFP4 MoE, full attention (no compressor) — stored under the
+//! and a native-MXFP4 routed MoE (`num_experts` from config — 144 on
+//! DeepSeek-V4-Flash), full attention (no compressor) — stored under the
 //! `mtp.0.*` prefix. On top of the body sit the MTP-specific pieces:
 //!
 //!   h_in = e_proj(rmsnorm(embed(token), enorm)) + h_proj(rmsnorm(h_prev, hnorm))
@@ -174,8 +175,9 @@ pub fn load_v4_mtp_module(
     let h_proj = dense_auto(store, &format!("{prefix}.h_proj.weight"), gpu)?;
 
     tracing::info!(
-        "DeepSeek-V4 MTP module loaded: reused V4 body (MLA + mHC + 256-expert MoE) \
-         + combiner (enorm/hnorm + e_proj/h_proj) + final norm"
+        "DeepSeek-V4 MTP module loaded: reused V4 body (MLA + mHC + {}-expert MoE) \
+         + combiner (enorm/hnorm + e_proj/h_proj) + final norm",
+        config.num_experts,
     );
 
     Ok(Some(DeepseekV4MtpModule {

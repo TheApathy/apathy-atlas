@@ -173,7 +173,7 @@ pub fn build_model(
     // verification then dropped.
     // Only rank 0 runs the MTP draft (no-EP, all experts local). Skip loading it
     // on the worker ranks — they never call propose(), so it would be dead weight.
-    let v4_mtp_module =
+    let mut v4_mtp_module =
         if config.model_type == "deepseek_v4" && use_speculative && config.ep_rank == 0 {
             match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
                 store,
@@ -204,7 +204,10 @@ pub fn build_model(
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
     // this loudly so the user knows the flag was inert.
-    if use_speculative && mtp_weights.is_empty() {
+    // `v4_mtp_module` is DeepSeek-V4's own MTP head, which does not populate the
+    // Qwen-shaped `mtp_weights`. Without that second condition this warns that
+    // speculation is disabled on the exact runs where it is about to be enabled.
+    if use_speculative && mtp_weights.is_empty() && v4_mtp_module.is_none() {
         tracing::warn!(
             "`--speculative` was requested but no MTP weights were loaded for this \
              model — speculative decoding will be disabled. Either drop `--speculative` \
@@ -270,7 +273,17 @@ pub fn build_model(
     // window but not the pre-load one. Other loaders (qwen35, qwen3,
     // gemma4) still call `transpose_for_prefill` inline during layer
     // construction; this default-no-op hook doesn't perturb them.
-    maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
+    // The MTP draft body rides along: it is a full MoE layer that runs on every
+    // propose step, so it needs the transposed E8M0 decode tables exactly as the
+    // main layers do. It is not in `layers` (it is loaded separately above), so
+    // it has to be handed over explicitly or it silently keeps the untransposed
+    // layout and the decode path misreads its scales.
+    maybe_run_minimax_m2_moe_transpose(
+        &config,
+        gpu.as_ref(),
+        &mut layers,
+        v4_mtp_module.as_mut().map(|m| &mut m.body),
+    )?;
     // ── Step 4: Create buffer arena ──
     let buffers = BufferArena::new(
         &config,
