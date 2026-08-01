@@ -54,6 +54,11 @@ pub struct BufferSizes {
     pub hc_post: usize,
     /// HC `comb` Sinkhorn matrix: `[M, hc_mult, hc_mult]` F32.
     pub hc_comb: usize,
+    /// HC decode mix scratch: `[M, mix_hc + 1]` F32, handing the per-row dot
+    /// products (and the trailing sum-of-squares) from `hc_pre_mix` to
+    /// `hc_pre_finish`. Only the decode split path uses it; the fused `hc_pre`
+    /// keeps these in shared memory.
+    pub hc_mix: usize,
     /// Token IDs `[M]` u32 for the current pass — stable across the layer loop
     /// so DeepSeek-V4 hash-MoE layers can read `tid2eid[token_id]`. Always
     /// allocated (small); unused by models without hash routing.
@@ -427,6 +432,11 @@ impl BufferSizes {
             } else {
                 256
             },
+            hc_mix: if config.hc_mult > 0 {
+                (m * ((2 + config.hc_mult) * config.hc_mult + 1) * 4).max(256)
+            } else {
+                256
+            },
             // Token IDs [M] u32 (stable across the layer loop for hash-MoE).
             token_ids: (m * 4).max(256),
             ffn_act_q8,
@@ -468,6 +478,7 @@ impl BufferSizes {
             + self.hc_streams
             + self.hc_post
             + self.hc_comb
+            + self.hc_mix
             + self.token_ids
             + self.ffn_act_q8
             + self.ffn_act_a

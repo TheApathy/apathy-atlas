@@ -83,6 +83,8 @@ pub struct BufferArena {
     hc_post: DevicePtr,
     /// HC `comb` Sinkhorn matrix: [M, hc_mult, hc_mult] F32.
     hc_comb: DevicePtr,
+    /// HC decode mix scratch: [M, mix_hc + 1] F32 (hc_pre_mix -> hc_pre_finish).
+    hc_mix: DevicePtr,
     /// GDN FLA chunked-prefill scratch (W|U|S|uc sub-divided). NULL unless the
     /// model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
     gdn_fla_scratch: DevicePtr,
@@ -162,6 +164,7 @@ impl BufferArena {
         let hc_streams = gpu.alloc(sizes.hc_streams)?;
         let hc_post = gpu.alloc(sizes.hc_post)?;
         let hc_comb = gpu.alloc(sizes.hc_comb)?;
+        let hc_mix = gpu.alloc(sizes.hc_mix)?;
         // GDN FLA scratch: only allocate for the 128-dim-linear-head GDN path
         // (size 0 → NULL → ATLAS_GDN_FLA dispatch stays disabled).
         let ssd_scratch = if sizes.ssd_scratch > 0 {
@@ -252,6 +255,7 @@ impl BufferArena {
             hc_streams,
             hc_post,
             hc_comb,
+            hc_mix,
             gdn_fla_scratch,
             ssd_scratch,
             token_ids,

@@ -136,6 +136,10 @@ pub struct Qwen3AttentionLayer {
     pub(crate) hc: Option<HcWeights>,
     /// HC `hc_pre` kernel handle (NULL when HC disabled).
     pub(super) hc_pre_k: KernelHandle,
+    /// HC `hc_pre_mix` / `hc_pre_finish` handles — the decode-only multi-block
+    /// split of `hc_pre` (NULL when the kernel module predates the split).
+    pub(super) hc_pre_mix_k: KernelHandle,
+    pub(super) hc_pre_finish_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
     /// HC `hc_expand` kernel handle (NULL when HC disabled).

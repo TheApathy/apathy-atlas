@@ -450,41 +450,109 @@ impl Qwen3AttentionLayer {
         let comb = ctx.buffers.hc_comb();
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
-        let diag_this = self.attn_layer_idx == 0 || diag_all;
+        // diag_norm syncs the stream + reads device memory back per probe. That
+        // is illegal under CUDA-graph capture (invalidates it, 901) and costs
+        // real decode throughput in eager mode (~30k probes over a short serve),
+        // so probing is strictly opt-in — same posture as the gemma4 diag.
+        let diag_this = diag_all && !ctx.graph_capture;
+
+        // The mHC ops used to be the only unprofiled block in the decode path,
+        // so their cost was silently charged to whichever neighbouring op was
+        // timed next. Use the same `µ` (U+00B5 micro sign) the attention and MoE
+        // profilers use so one grep aggregates the whole token.
+        let profile = ctx.profile;
+        macro_rules! prof {
+            ($label:expr, $body:expr) => {{
+                if profile {
+                    let _t = std::time::Instant::now();
+                    let _r = $body;
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!("    HC {}: {:.0}µs", $label, _t.elapsed().as_micros());
+                    _r
+                } else {
+                    $body
+                }
+            }};
+        }
 
         // 1. Expand single-stream embedding into hc_mult copies on first layer.
         if is_first_layer {
-            ops::hc_expand(
-                ctx.gpu,
-                self.hc_expand_k,
-                hidden,
-                hc_streams,
-                1,
-                h as u32,
-                hc_mult,
-                stream,
+            prof!(
+                "expand",
+                ops::hc_expand(
+                    ctx.gpu,
+                    self.hc_expand_k,
+                    hidden,
+                    hc_streams,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )
             )?;
         }
 
+        // Decode is a single token, so the fused `hc_pre`/`hc_post` — one block
+        // per token — run on 1 of the GB10's 25 SMs. `hc_pre` streams the whole
+        // 1.5 MiB `hc_fn` matrix in that one block, twice per layer, so the HC
+        // sites alone pull ~129 MiB/token at single-SM bandwidth. Prefer the
+        // sharded split; `ATLAS_HC_SPLIT=0` restores the fused path for A/B.
+        let hc_split = self.hc_pre_mix_k.0 != 0
+            && self.hc_pre_finish_k.0 != 0
+            && !std::env::var("ATLAS_HC_SPLIT").is_ok_and(|v| v == "0");
+        // One block per 256 hidden lanes — 16 blocks at H=4096, enough to cover
+        // the SMs without splintering the coalesced reads.
+        let post_shards = if hc_split {
+            (h as u32).div_ceil(256)
+        } else {
+            1
+        };
+        let hc_pre_dispatch = |site: &super::super::types_weights::HcSiteWeights| -> Result<()> {
+            if hc_split {
+                ops::hc_pre_split(
+                    ctx.gpu,
+                    self.hc_pre_mix_k,
+                    self.hc_pre_finish_k,
+                    hc_streams,
+                    site.hc_fn,
+                    site.hc_scale,
+                    site.hc_base,
+                    hidden,
+                    post,
+                    comb,
+                    ctx.buffers.hc_mix(),
+                    1,
+                    h as u32,
+                    hc_mult,
+                    hc.sinkhorn_iters as u32,
+                    eps,
+                    hc.hc_eps,
+                    stream,
+                )
+            } else {
+                ops::hc_pre(
+                    ctx.gpu,
+                    self.hc_pre_k,
+                    hc_streams,
+                    site.hc_fn,
+                    site.hc_scale,
+                    site.hc_base,
+                    hidden,
+                    post,
+                    comb,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    hc.sinkhorn_iters as u32,
+                    eps,
+                    hc.hc_eps,
+                    stream,
+                )
+            }
+        };
+
         // ── Attention sublayer ──
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.attn.hc_fn,
-            hc.attn.hc_scale,
-            hc.attn.hc_base,
-            hidden,
-            post,
-            comb,
-            1,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+        prof!("pre-attn", hc_pre_dispatch(&hc.attn))?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -556,7 +624,7 @@ impl Qwen3AttentionLayer {
 
         // Standalone attention (no FFN)
         if self.ffn.is_none() {
-            ops::hc_post(
+            ops::hc_post_sharded(
                 ctx.gpu,
                 self.hc_post_k,
                 attn_out,
@@ -567,6 +635,7 @@ impl Qwen3AttentionLayer {
                 1,
                 h as u32,
                 hc_mult,
+                post_shards,
                 stream,
             )?;
             if is_last_layer && let Some(ref head) = hc.head {
@@ -590,18 +659,21 @@ impl Qwen3AttentionLayer {
         }
 
         // Expand attention output back into multi-stream state.
-        ops::hc_post(
-            ctx.gpu,
-            self.hc_post_k,
-            attn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            1,
-            h as u32,
-            hc_mult,
-            stream,
+        prof!(
+            "post-attn",
+            ops::hc_post(
+                ctx.gpu,
+                self.hc_post_k,
+                attn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                hc_mult,
+                stream,
+            )
         )?;
         if diag_this {
             super::diag_norm(
@@ -624,24 +696,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── FFN sublayer ──
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.ffn.hc_fn,
-            hc.ffn.hc_scale,
-            hc.ffn.hc_base,
-            hidden,
-            post,
-            comb,
-            1,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+        prof!("pre-ffn", hc_pre_dispatch(&hc.ffn))?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -699,18 +754,22 @@ impl Qwen3AttentionLayer {
             self.apply_layer_scalar(ctx.gpu, ffn_out, h, scalar, stream)?;
         }
 
-        ops::hc_post(
-            ctx.gpu,
-            self.hc_post_k,
-            ffn_out,
-            hc_streams,
-            post,
-            comb,
-            hc_streams,
-            1,
-            h as u32,
-            hc_mult,
-            stream,
+        prof!(
+            "post-ffn",
+            ops::hc_post_sharded(
+                ctx.gpu,
+                self.hc_post_k,
+                ffn_out,
+                hc_streams,
+                post,
+                comb,
+                hc_streams,
+                1,
+                h as u32,
+                hc_mult,
+                post_shards,
+                stream,
+            )
         )?;
         if diag_this {
             super::diag_norm(
@@ -730,20 +789,23 @@ impl Qwen3AttentionLayer {
         }
 
         if is_last_layer && let Some(ref head) = hc.head {
-            ops::hc_head(
-                ctx.gpu,
-                self.hc_head_k,
-                hc_streams,
-                head.hc_fn,
-                head.hc_scale,
-                head.hc_base,
-                hidden,
-                1,
-                h as u32,
-                hc_mult,
-                eps,
-                hc.hc_eps,
-                stream,
+            prof!(
+                "head",
+                ops::hc_head(
+                    ctx.gpu,
+                    self.hc_head_k,
+                    hc_streams,
+                    head.hc_fn,
+                    head.hc_scale,
+                    head.hc_base,
+                    hidden,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    eps,
+                    hc.hc_eps,
+                    stream,
+                )
             )?;
             if diag_this {
                 super::diag_norm(

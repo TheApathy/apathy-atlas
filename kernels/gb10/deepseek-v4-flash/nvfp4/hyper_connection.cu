@@ -189,10 +189,212 @@ extern "C" __global__ void hc_pre(
     }
 }
 
+// ── hc_pre_mix / hc_pre_finish ──
+// Decode-only two-kernel split of `hc_pre`.
+//
+// `hc_pre` is a one-block-per-token kernel. That is the right shape for
+// prefill (T is large, so the grid fills the GPU), but at decode T == 1, so the
+// whole kernel runs on ONE SM of 25 — while its pass-2 loop streams the entire
+// `hc_fn` matrix, [mix_hc=24, hc*H=16384] fp32 = 1.5 MiB, from DRAM. With two
+// HC sites per layer over 43 layers that is ~129 MiB per token pulled at
+// single-SM bandwidth (~8 GB/s measured), i.e. tens of ms per token for work
+// that costs 0.5 ms at the 254 GB/s the rest of decode achieves.
+//
+// The fix is to give the `m` loop its own blocks. `hc_pre_mix` runs one block
+// per mix row (plus one for the RMS reduction) so the 24 independent dot
+// products issue concurrently across SMs; `hc_pre_finish` then does the scalar
+// Sinkhorn and the collapse, sharded over `d`. The extra cost is that every
+// block re-reads `x` (64 KiB) — but `x` is L2-resident after the first block
+// touches it, so DRAM traffic is unchanged and only the parallelism differs.
+//
+// Numerically identical to `hc_pre`: same reduction order within a row, same
+// rsqrt, same Sinkhorn, same collapse. Only the block decomposition moved.
+
+// mix_out layout: [T, mix_hc + 1] fp32 — slot `m` is the raw (unscaled) row
+// dot product, and the trailing slot `mix_hc` is sum(x^2) for the RMS.
+// Grid: (T, mix_hc+1, 1)  Block: (HC_MIX_BLOCK,1,1).
+//
+// Wide (float4) loads and 512 threads are both about memory-level parallelism,
+// not arithmetic: each thread's loop is a dependent accumulate, so throughput is
+// (bytes in flight) / (DRAM latency). At 256 scalar-loading threads this kernel
+// measured 19 GB/s even with all 25 SMs busy; 512 threads × 16-byte loads puts
+// 8× more in flight per SM.
+//
+// NOTE: float4 lanes reassociate the sum relative to the scalar `hc_pre` (fp32,
+// ~1e-7 relative drift on a 16384-term dot product). The Sinkhorn projection
+// downstream is contractive so this does not accumulate, but it does mean the
+// decode collapse is no longer bit-identical to the prefill one.
+#define HC_MIX_BLOCK 512
+extern "C" __global__ void hc_pre_mix(
+    const float* __restrict__ streams, // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ hc_fn,   // [mix_hc, hc*H]
+    float* __restrict__ mix_out,       // [T, mix_hc + 1]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int m = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int hc_dim = hc_mult * hidden_size;
+    const unsigned int mix_hc = (2 + hc_mult) * hc_mult;
+
+    const float* x = streams + (size_t)t * hc_dim;
+
+    __shared__ float red[HC_MIX_BLOCK];
+
+    float acc = 0.f;
+    // hc_dim = hc_mult * hidden_size; both operands are row-offset by whole
+    // multiples of it, so float4 alignment holds whenever hc_dim % 4 == 0.
+    if ((hc_dim & 3u) == 0u) {
+        const unsigned int nvec = hc_dim >> 2;
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        if (m == mix_hc) {
+            // The RMS reduction gets its own block rather than riding along on
+            // block 0: with mix_hc+1 == 25 blocks and 25 SMs, doubling any one
+            // block's work would double the whole kernel's wall time.
+            for (unsigned int k = tid; k < nvec; k += HC_MIX_BLOCK) {
+                float4 v = x4[k];
+                acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+            }
+        } else {
+            const float4* f4 =
+                reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim);
+            for (unsigned int k = tid; k < nvec; k += HC_MIX_BLOCK) {
+                float4 a = f4[k];
+                float4 b = x4[k];
+                acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    } else if (m == mix_hc) {
+        for (unsigned int k = tid; k < hc_dim; k += HC_MIX_BLOCK) {
+            float v = x[k];
+            acc += v * v;
+        }
+    } else {
+        const float* fn_row = hc_fn + (size_t)m * hc_dim;
+        for (unsigned int k = tid; k < hc_dim; k += HC_MIX_BLOCK) {
+            acc += fn_row[k] * x[k];
+        }
+    }
+    red[tid] = acc;
+    __syncthreads();
+    for (unsigned int s = HC_MIX_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) mix_out[(size_t)t * (mix_hc + 1) + m] = red[0];
+}
+
+// Grid: (T, ceil(H/256), 1)  Block: (256,1,1). Block y==0 owns the Sinkhorn
+// and the post/comb writes; every block recomputes the (scalar, ~30 flop)
+// `pre` weights locally rather than round-tripping them through memory.
+extern "C" __global__ void hc_pre_finish(
+    const float* __restrict__ streams,  // [T, hc, H] FP32 highway (mHC)
+    const float* __restrict__ mix_in,   // [T, mix_hc + 1] from hc_pre_mix
+    const float* __restrict__ hc_scale, // [3]
+    const float* __restrict__ hc_base,  // [mix_hc]
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult,
+    const unsigned int sinkhorn_iters,
+    const float norm_eps,
+    const float hc_eps
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const unsigned int hc = hc_mult;
+    const unsigned int hc_dim = hc * H;
+    const unsigned int mix_hc = (2 + hc) * hc;
+
+    const float* x = streams + (size_t)t * hc_dim;
+    const float* mi = mix_in + (size_t)t * (mix_hc + 1);
+
+    __shared__ float s_pre[HC_MAX_MULT];
+
+    if (tid == 0) {
+        const float rsqrt = rsqrtf(mi[mix_hc] / (float)hc_dim + norm_eps);
+        float s_mix[HC_MAX_MIX];
+        for (unsigned int m = 0; m < mix_hc; ++m) s_mix[m] = mi[m] * rsqrt;
+
+        for (unsigned int i = 0; i < hc; ++i) {
+            float pr = s_mix[i] * hc_scale[0] + hc_base[i];
+            s_pre[i] = 1.f / (1.f + expf(-pr)) + hc_eps;
+        }
+
+        if (blockIdx.y == 0) {
+            float comb[HC_MAX_MULT * HC_MAX_MULT];
+            for (unsigned int i = 0; i < hc; ++i) {
+                float po = s_mix[hc + i] * hc_scale[1] + hc_base[hc + i];
+                post_out[(size_t)t * hc + i] = 2.f * (1.f / (1.f + expf(-po)));
+            }
+            for (unsigned int i = 0; i < hc; ++i)
+                for (unsigned int j = 0; j < hc; ++j)
+                    comb[i * hc + j] =
+                        s_mix[2 * hc + i * hc + j] * hc_scale[2] + hc_base[2 * hc + i * hc + j];
+            // softmax over j (dim=-1) + eps
+            for (unsigned int i = 0; i < hc; ++i) {
+                float mx = -1e30f;
+                for (unsigned int j = 0; j < hc; ++j) mx = fmaxf(mx, comb[i * hc + j]);
+                float sum = 0.f;
+                for (unsigned int j = 0; j < hc; ++j) {
+                    float e = expf(comb[i * hc + j] - mx);
+                    comb[i * hc + j] = e;
+                    sum += e;
+                }
+                for (unsigned int j = 0; j < hc; ++j)
+                    comb[i * hc + j] = comb[i * hc + j] / sum + hc_eps;
+            }
+            // col-norm first (dim=-2, over i)
+            for (unsigned int j = 0; j < hc; ++j) {
+                float c = hc_eps;
+                for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
+                for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] /= c;
+            }
+            for (unsigned int it = 0; it + 1 < sinkhorn_iters; ++it) {
+                for (unsigned int i = 0; i < hc; ++i) {
+                    float r = hc_eps;
+                    for (unsigned int j = 0; j < hc; ++j) r += comb[i * hc + j];
+                    for (unsigned int j = 0; j < hc; ++j) comb[i * hc + j] /= r;
+                }
+                for (unsigned int j = 0; j < hc; ++j) {
+                    float c = hc_eps;
+                    for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
+                    for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] /= c;
+                }
+            }
+            // Final EXACT column projection — see the long note in `hc_pre`;
+            // this is load-bearing for coherence onset, not cosmetic.
+            for (unsigned int j = 0; j < hc; ++j) {
+                float c = 0.f;
+                for (unsigned int i = 0; i < hc; ++i) c += comb[i * hc + j];
+                float inv = (c > 0.f) ? (1.f / c) : 0.f;
+                for (unsigned int i = 0; i < hc; ++i) comb[i * hc + j] *= inv;
+            }
+            for (unsigned int i = 0; i < hc; ++i)
+                for (unsigned int j = 0; j < hc; ++j)
+                    comb_out[(size_t)t * hc * hc + i * hc + j] = comb[i * hc + j];
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int d = blockIdx.y * HC_BLOCK + tid; d < H; d += HC_BLOCK * gridDim.y) {
+        float acc = 0.f;
+        for (unsigned int i = 0; i < hc; ++i) acc += s_pre[i] * x[i * H + d];
+        y_out[(size_t)t * H + d] = __float2bfloat16(acc);
+    }
+}
+
 // ── hc_post ──
 // out[t,j,d] = post[t,j]*block_out[t,d] + sum_i comb[t,i,j]*residual[t,i,d].
 // `out` may alias `residual` (all hc residual values are read before write).
-// Grid: (T,1,1)  Block: (256,1,1).
+// Grid: (T, ceil(H/256) or 1, 1)  Block: (256,1,1).
+//
+// The `d` loop is embarrassingly parallel, so grid.y shards it. Callers that
+// launch with grid.y == 1 (prefill, where grid.x == T already fills the GPU)
+// get exactly the original single-block-per-token loop.
 extern "C" __global__ void hc_post(
     const __nv_bfloat16* __restrict__ block_out, // [T, H]
     const float* __restrict__ residual,          // [T, hc, H] FP32 highway (mHC)
@@ -213,7 +415,7 @@ extern "C" __global__ void hc_post(
     const float* c = comb + (size_t)t * hc * hc;
     float* o = out + (size_t)t * hc * H;
 
-    for (unsigned int d = tid; d < H; d += HC_BLOCK) {
+    for (unsigned int d = blockIdx.y * HC_BLOCK + tid; d < H; d += HC_BLOCK * gridDim.y) {
         float xd = (float)x[d];
         float rv[HC_MAX_MULT];
         for (unsigned int i = 0; i < hc; ++i) rv[i] = res[i * H + d];

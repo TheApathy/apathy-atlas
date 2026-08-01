@@ -139,6 +139,10 @@ impl BufferArena {
     pub fn hc_comb(&self) -> DevicePtr {
         self.hc_comb
     }
+    /// HC decode mix scratch [M, mix_hc + 1] F32 (`hc_pre_mix` → `hc_pre_finish`).
+    pub fn hc_mix(&self) -> DevicePtr {
+        self.hc_mix
+    }
     pub fn max_batch_tokens(&self) -> usize {
         self.max_batch_tokens
     }
