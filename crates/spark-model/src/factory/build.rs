@@ -597,6 +597,11 @@ pub fn build_model(
             v4_module,
             v4_mtp_embed,
             v4_mtp_lm_head,
+            // Share the target's runtime-quantized FP8 head (when active) so
+            // draft argmax and verify argmax agree at the margin — with the
+            // target on FP8 and the draft on BF16, low-margin head
+            // disagreements are pure acceptance loss.
+            target_lm_head_fp8_for_dflash,
             model.config_ref(),
             model.gpu_backend(),
             mtp_vocab_size,

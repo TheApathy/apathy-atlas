@@ -50,7 +50,7 @@ use crate::layer::{AttnMetadataDev, ForwardContext, LayerState};
 use crate::layers::ops;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_loader::deepseek_v4::DeepseekV4MtpModule;
-use crate::weight_map::DenseWeight;
+use crate::weight_map::{DenseWeight, Fp8DenseWeight};
 
 /// Scratch-buffer byte offset for the MTP attention metadata. Must be distinct
 /// from the target model's metadata (`32768`) so a `propose()` call does not
@@ -95,6 +95,12 @@ pub struct DeepseekV4MtpHead {
     /// target model. Every draft is re-verified by the target's head, so the
     /// draft head only affects acceptance, never an accepted token.
     lm_head: DenseWeight,
+    /// The target's runtime-quantized FP8 head (`--lm-head-dtype fp8`), when
+    /// active. The draft MUST argmax over the SAME head the target verifies
+    /// with: with the target on FP8 and the draft on BF16, low-margin argmax
+    /// disagreements between the two heads are pure acceptance loss. Bonus:
+    /// halves the draft's ~1 GB/propose vocab-projection read.
+    lm_head_fp8: Option<Fp8DenseWeight>,
     /// Reduced vocab size for the draft LM-head GEMV (0 = full vocab).
     mtp_vocab_size: u32,
     /// Single-layer MLA-shaped KV cache for the MTP attention.
@@ -103,6 +109,7 @@ pub struct DeepseekV4MtpHead {
     // Kernel handles.
     rms_norm_k: KernelHandle,
     dense_gemv_k: KernelHandle,
+    dense_gemv_fp8w_k: KernelHandle,
     residual_add_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_head_k: KernelHandle,
@@ -112,10 +119,12 @@ pub struct DeepseekV4MtpHead {
 impl DeepseekV4MtpHead {
     /// Build the proposer from a loaded `DeepseekV4MtpModule` and the shared
     /// embedding + NVFP4 LM head.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         module: DeepseekV4MtpModule,
         embed_tokens: DenseWeight,
         lm_head: DenseWeight,
+        lm_head_fp8: Option<Fp8DenseWeight>,
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
         mtp_vocab_size: u32,
@@ -161,12 +170,14 @@ impl DeepseekV4MtpHead {
             module,
             embed_tokens,
             lm_head,
+            lm_head_fp8,
             mtp_vocab_size,
             kv_cache: Mutex::new(kv_cache),
             // V4 ships HF-vanilla norm weights (enorm/hnorm/norm are loaded
             // exactly) — the offset-from-1 kernel would apply `1 + w`.
             rms_norm_k: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_fp8w_k: gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?,
             residual_add_k: gpu.kernel("residual_add", "bf16_residual_add")?,
             hc_expand_k: gpu.kernel("hyper_connection", "hc_expand")?,
             hc_head_k: gpu.kernel("hyper_connection", "hc_head")?,
@@ -433,16 +444,32 @@ impl DeepseekV4MtpHead {
             ctx.config.vocab_size as u32
         };
         let logits = ctx.buffers.logits();
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            final_normed,
-            &self.lm_head,
-            logits,
-            v,
-            h,
-            stream,
-        )?;
+        if let Some(ref fp8) = self.lm_head_fp8 {
+            // Same quantized head the target verifies with (argmax parity) at
+            // half the weight traffic. Row truncation (mtp_vocab_size) is
+            // safe: per-row scales index 1:1 with rows.
+            ops::dense_gemv_fp8w(
+                ctx.gpu,
+                self.dense_gemv_fp8w_k,
+                final_normed,
+                fp8,
+                logits,
+                v,
+                h,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                final_normed,
+                &self.lm_head,
+                logits,
+                v,
+                h,
+                stream,
+            )?;
+        }
 
         // ── 7. Argmax (grammar-masked when a bitmask is supplied) ──
         let out_ptr = ctx.buffers.scratch();
