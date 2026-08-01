@@ -144,9 +144,43 @@ have hidden this and made −2.4% look real; `eval_verdict.py` therefore prints 
 per-language floor beside every per-language delta and flags anything under 2×
 as `UNRESOLVED`, rather than reporting a direction.
 
-Practical consequence: we do not publish this drafter as a Go-specialist on this
-evidence. Settling Go needs repeats on the Go cells specifically — n=3 or more —
-not a wider suite.
+Settling Go needed repeats on the Go cells specifically, not a wider suite.
+
+### Go, resolved with repeats (2026-08-01)
+
+Four passes per side on the five Go cells, arms interleaved (`a1 b1 a2 b2 …`) so
+drift over the sitting is spread across both sides rather than charged to
+whichever ran last. A cell resolves **only** if the two samples do not overlap at
+all — at k=4 that is the ~1-in-35 tail, and anything less is left unresolved:
+
+| cell | ours (min–max) | `z-lab` (min–max) | delta | verdict |
+|---|---|---|---|---|
+| `mergesort/go` | 7.25–7.83 | 6.74–6.74 | **−11.0%** | **ours** |
+| `intervals/go` | 6.67–6.67 | 6.41–6.41 | −3.9% | **ours** |
+| `boilerplate/go` | 8.88–8.92 | 8.84–8.84 | −0.8% | ours *(trivial)* |
+| `binsearch/go` | 7.25–7.25 | 7.93–7.93 | +9.4% | `z-lab` |
+| `modinv/go` | 3.85–4.30 | 3.81–3.96 | −5.3% | unresolved |
+
+**Three cells resolve for ours, one for `z-lab`, one unresolved.** So the retrain
+*did* do what it was built to do: on Go it is genuinely the better drafter. The
+n=1 matrix called this `UNRESOLVED` at 1.4× its floor, and that was the correct
+call on that evidence — not a false negative to be embarrassed about.
+
+Two cautions the run itself produced:
+
+- **Resolution is about direction, not magnitude.** `boilerplate/go` separated
+  cleanly across all eight passes at 0.8%. Reproducible and worth nothing. The
+  scorer flags resolved-but-under-1% separately so "3 of 5" cannot be read as
+  three equal wins.
+- **Run-to-run spread is asymmetric between drafters.** Ours moved on 3 of 5
+  cells (max 11.0%); `z-lab` moved on 1 of 5 (max 3.9%). A floor measured on the
+  control does not automatically transfer to the treatment — an A/A repeat alone
+  assumes a symmetry it never tested.
+
+**Net.** Ours wins Go, loses C by 13.4% at 19× its floor, ties Python. That is a
+real specialisation with a real price, not a failed retrain and not a free win —
+and the C loss is larger than the Go gain, so `z-lab` remains the better default.
+See the publishing note in section 5.
 
 So be clear about what this branch does and does not offer:
 

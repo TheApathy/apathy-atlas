@@ -252,12 +252,29 @@ def main() -> int:
                     help="seconds to wait past a foreign burst before retrying")
     ap.add_argument("--dump-text", default=None, metavar="DIR")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--langs", default=None, metavar="L,L",
+                    help="restrict to these languages (e.g. 'go'). Narrows the "
+                         "matrix on purpose -- for buying REPEATS on one noisy "
+                         "axis, not for shopping a suite that flatters a change. "
+                         "The arm JSON records it so eval_verdict's coverage "
+                         "gate still sees what was and wasn't run.")
     args = ap.parse_args()
 
     if args.dump_text:
         os.makedirs(args.dump_text, exist_ok=True)
 
     matrix = list(cells())
+    if args.langs:
+        want = {s.strip() for s in args.langs.split(",") if s.strip()}
+        unknown = want - set(LANGS) - {"none"}
+        if unknown:
+            print(f"FATAL: unknown language(s): {', '.join(sorted(unknown))}",
+                  file=sys.stderr)
+            return 2
+        matrix = [c for c in matrix if c[2] in want]
+        if not matrix:
+            print("FATAL: --langs selected zero cells", file=sys.stderr)
+            return 2
     print(f"=== eval_matrix [{args.tag}] :: {len(matrix)} cells, "
           f"gamma={GAMMA} max_tokens={args.tokens} ===")
     print(f"  {'cell':<22}{'tok/s':>8}{'srv':>7}{'tok':>6}{'cap':>5}"
@@ -311,7 +328,13 @@ def main() -> int:
     if args.json_out:
         payload = {
             "arm": args.tag, "gamma": GAMMA, "tokens": args.tokens,
-            "langs": list(LANGS), "n_cells": len(rows),
+            # The languages actually RUN, not the ones the module can produce.
+            # Recording list(LANGS) here would let a --langs-narrowed arm claim
+            # full coverage in its own JSON -- the "0 comparisons rendered as 0
+            # differences" failure, one layer down.
+            "langs": sorted({r["lang"] for r in rows}),
+            "langs_available": list(LANGS),
+            "langs_filter": args.langs, "n_cells": len(rows),
             # Text lives in the sidecar; keeping it out of the JSON keeps the
             # scorer's input small enough to read by eye when it disagrees.
             "rows": [{k: v for k, v in r.items() if k not in ("text", "prompt")}

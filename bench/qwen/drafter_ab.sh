@@ -131,7 +131,35 @@ OUT="$OUT_ROOT/drafter-ab"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-ARMS="a b a-p2"
+# REPEATS mode. Default empty = the classic three arms (a, b, a-p2), where the
+# single A/A repeat is the floor. Set QWEN_REPEATS=k (k>=2) to run k passes per
+# side instead and score with eval_repeats.py, which compares distributions.
+#
+# Arms are INTERLEAVED (a1 b1 a2 b2 ...), never blocked (a1 a2 a3 b1 b2 b3).
+# Blocked ordering confounds the arm with elapsed time: if the box drifts over
+# the sitting -- thermals, fragmentation, a neighbour arriving -- a blocked
+# schedule charges the entire drift to whichever side ran last. Interleaving
+# spreads it across both.
+REPEATS="${QWEN_REPEATS:-}"
+if [ -n "$REPEATS" ]; then
+  case "$REPEATS" in
+    ''|*[!0-9]*) echo "FATAL: QWEN_REPEATS=$REPEATS is not an integer." >&2; exit 2 ;;
+  esac
+  [ "$REPEATS" -ge 2 ] || { echo "FATAL: QWEN_REPEATS must be >= 2 (got $REPEATS); k=1 is what eval_verdict.py already does." >&2; exit 2; }
+  [ "$SUITE" = matrix ] || { echo "FATAL: QWEN_REPEATS needs QWEN_SUITE=matrix." >&2; exit 2; }
+  ARMS=""
+  i=1
+  while [ "$i" -le "$REPEATS" ]; do ARMS="$ARMS a$i b$i"; i=$((i + 1)); done
+else
+  ARMS="a b a-p2"
+fi
+
+# Optional narrowing, forwarded to eval_matrix.py. Buys repeats on one noisy
+# axis; the arm JSON records which languages actually ran so a narrowed run
+# cannot later be read as full coverage.
+LANGS="${QWEN_LANGS:-}"
+LANG_ARG=""
+[ -z "$LANGS" ] || LANG_ARG="--langs $LANGS"
 
 echo "=== DFlash drafter A/B ==="
 echo "    binary : $BIN"
@@ -170,7 +198,7 @@ run_arm() {
     || { echo "    FATAL: DFlash not enabled ($tag)"; failed="$failed $tag"; qwen_kill_serves 0; return 1; }
 
   if [ "$SUITE" = matrix ]; then
-    python3 "$BENCH/eval_matrix.py" --tag "$tag" --log "$log" \
+    python3 "$BENCH/eval_matrix.py" --tag "$tag" --log "$log" $LANG_ARG \
       --tokens 256 --json-out "$OUT/$tag.json" --dump-text "$OUT/text" 2>&1 | sed 's/^/    /'
   else
     python3 "$BENCH/decode_bench.py" --tag "$tag" --log "$log" \
@@ -182,9 +210,18 @@ run_arm() {
   return "$rc"
 }
 
-run_arm a    "$DRAFT_A"
-run_arm b    "$DRAFT_B"
-run_arm a-p2 "$DRAFT_A"
+if [ -n "$REPEATS" ]; then
+  i=1
+  while [ "$i" -le "$REPEATS" ]; do
+    run_arm "a$i" "$DRAFT_A"
+    run_arm "b$i" "$DRAFT_B"
+    i=$((i + 1))
+  done
+else
+  run_arm a    "$DRAFT_A"
+  run_arm b    "$DRAFT_B"
+  run_arm a-p2 "$DRAFT_A"
+fi
 
 # Refuse to score an incomplete campaign rather than tabling whatever survived.
 missing=""
@@ -201,7 +238,31 @@ fi
 echo
 echo "=== table ==="
 
-if [ "$SUITE" = matrix ]; then
+if [ -n "$REPEATS" ]; then
+  a_json=""; b_json=""; i=1
+  while [ "$i" -le "$REPEATS" ]; do
+    a_json="$a_json $OUT/a$i.json"; b_json="$b_json $OUT/b$i.json"; i=$((i + 1))
+  done
+  python3 "$BENCH/eval_repeats.py" --a $a_json --b $b_json
+  vrc=$?
+  echo
+  echo "  A = $DRAFT_A"
+  echo "  B = $DRAFT_B"
+  echo "  passes per side: $REPEATS${LANGS:+   languages: $LANGS}"
+  echo "  text sidecars: $OUT/text/"
+  [ -z "$failed" ] || { echo "RESULT: arms failed:$failed"; exit 2; }
+  # Exit 5 is "ran fine, resolved nothing". That is a legitimate scientific
+  # outcome and must stay distinguishable from both success and breakage --
+  # it is the answer "the effect is smaller than this box's noise", which is
+  # exactly what a repeats run is for.
+  case "$vrc" in
+    0) echo "RESULT: $REPEATS passes per side, scored. Read per-cell before the aggregate." ;;
+    5) echo "RESULT: $REPEATS passes per side ran clean; NO CELL RESOLVED a direction."
+       echo "        Report as 'no measurable difference', not as a tie." ;;
+    *) echo "RESULT: repeats run scored with exit $vrc." ;;
+  esac
+  exit "$vrc"
+elif [ "$SUITE" = matrix ]; then
   python3 "$BENCH/eval_verdict.py" \
     --a "$OUT/a.json" --b "$OUT/b.json" --aa "$OUT/a-p2.json" --claims "$CLAIMS"
   vrc=$?
