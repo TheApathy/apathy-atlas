@@ -70,6 +70,20 @@ python3 bench/deepseek-v4/quality_probe.py --port 8899
 | `smoke.sh` | first-token "Paris" sanity check (mirrors ds4-on-spark) |
 | `quality_probe.py` | coherence gate + GSM8K-style accuracy vs the ds4 reference gate |
 
+## Measured (2026-08-01, single GB10, graphs on)
+
+| config | decode tok/s | TTFT | quality |
+|---|---|---|---|
+| bf16 lm-head | 17.2 | ~680ms | GSM8K 11/12, longgen 1/4 |
+| **fp8 lm-head (default)** | **18.0** | ~680ms | GSM8K 12/12, longgen 2/4 (no regression) |
+
+The longgen failures reproduce bit-identically at BF16 — they are REAP-model
+instruction-following quirks, not precision damage. Gate any further precision
+cut with `longgen_gate.py --baseline longgen_baseline_bf16.json` (regressions
+vs the recorded full-precision run), not the absolute verdict. MTP speculative
+decode currently LOSES (~7 tok/s): the draft head only reaches 19–36% accept
+on this checkpoint — open item.
+
 ## Notes that will save you time
 
 - **`--kv-cache-dtype fp8` is mandatory.** BF16 KV on this checkpoint produces

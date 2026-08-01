@@ -1,0 +1,22 @@
+{
+  "numbered-20": {
+    "passed": true,
+    "tokens": 594,
+    "why": null
+  },
+  "structured-essay": {
+    "passed": false,
+    "tokens": 1024,
+    "why": "structure check failed: expected all four headers, in order"
+  },
+  "long-chain-arithmetic": {
+    "passed": false,
+    "tokens": 49,
+    "why": "only 49 tokens generated (< 200); gate not exercised"
+  },
+  "code-block": {
+    "passed": false,
+    "tokens": 1024,
+    "why": "structure check failed: expected one closed fenced block with a complete class"
+  }
+}

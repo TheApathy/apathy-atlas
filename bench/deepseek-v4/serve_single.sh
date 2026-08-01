@@ -36,6 +36,16 @@ export ATLAS_UNIFIED_MOE_LAYOUT="${ATLAS_UNIFIED_MOE_LAYOUT:-1}"
 # ATLAS_DEBUG_NO_GRAPH=1 to force eager for diagnostics.
 export ATLAS_DEBUG_NO_GRAPH="${ATLAS_DEBUG_NO_GRAPH:-0}"
 
+# FP8 lm-head: the 129280x4096 BF16 vocab projection is 1.06 GB/token — the
+# single largest per-token weight read. FP8 halves it. This is the config the
+# --lm-head-dtype help text screams about (it collapsed Qwen3.6-35B-A3B), so it
+# was gated PER-MODEL on 2026-08-01: same-session A/B on DeepSeek-V4-Flash-162B
+# REAP measured bf16 17.2 -> fp8 18.0 tok/s with NO regression (longgen_gate
+# fp8 2/4 vs bf16 1/4 — the shared failures reproduce bit-identically at BF16,
+# i.e. they are the model, not the precision; GSM8K 12/12; coherence 4/4).
+# Set LM_HEAD_DTYPE=bf16 to fall back to the safe default.
+LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-fp8}"
+
 MODEL_DIR="${MODEL_DIR:-/home/flocka/models/DeepSeek-V4-Flash-162B}"
 BIN="${DS4_BIN:-$REPO/target/release/spark}"
 PORT="${PORT:-8899}"
@@ -51,7 +61,7 @@ LOG="${LOG:-$REPO/serve-deepseek-single.log}"
 
 echo "serve: $BIN"
 echo "model: $MODEL_DIR"
-echo "port : $HOST:$PORT   kv=$KV_DTYPE  gpu_mem=$GPU_MEM  max_seq=$MAX_SEQ  batch=$MAX_BATCH"
+echo "port : $HOST:$PORT   kv=$KV_DTYPE  lm_head=$LM_HEAD_DTYPE  gpu_mem=$GPU_MEM  max_seq=$MAX_SEQ  batch=$MAX_BATCH"
 echo "log  : $LOG"
 
 # EXTRA_ARGS is how perf variants are driven (--speculative, --lm-head-dtype
@@ -64,6 +74,7 @@ exec "$BIN" serve "$MODEL_DIR" \
   --host "$HOST" \
   --port "$PORT" \
   --kv-cache-dtype "$KV_DTYPE" \
+  --lm-head-dtype "$LM_HEAD_DTYPE" \
   --gpu-memory-utilization "$GPU_MEM" \
   --max-seq-len "$MAX_SEQ" \
   --max-batch-size "$MAX_BATCH" \

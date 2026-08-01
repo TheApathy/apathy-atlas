@@ -21,6 +21,16 @@ all the way to the end:
   python3 bench/deepseek-v4/longgen_gate.py --port 8977
 
 Exit 0 iff every task passes.
+
+ABSOLUTE vs RELATIVE: some models fail tasks here at FULL precision (measured
+2026-08-01 on DeepSeek-V4-Flash-162B REAP: the BF16 head passes only 1/4 —
+it EOSes the arithmetic chain at 49 tokens and ignores the exact-header
+instruction). Against such a model the absolute verdict gates the MODEL, not
+the precision change. For that, record the full-precision behavior once and
+gate the reduced-precision config on REGRESSIONS only:
+
+  python3 longgen_gate.py --port 8977 --save-baseline longgen_bf16.json   # bf16 serve
+  python3 longgen_gate.py --port 8977 --baseline longgen_bf16.json        # fp8 serve
 """
 import argparse, json, re, sys, urllib.request
 
@@ -104,15 +114,28 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--min-tokens", type=int, default=200,
                     help="a task that stops this early never exercised the failure mode")
+    ap.add_argument("--save-baseline", metavar="FILE",
+                    help="record per-task pass/fail to FILE (run against the "
+                         "full-precision serve) instead of gating")
+    ap.add_argument("--baseline", metavar="FILE",
+                    help="gate on REGRESSIONS vs a recorded full-precision "
+                         "baseline instead of absolute task success")
     a = ap.parse_args()
 
+    baseline = None
+    if a.baseline:
+        with open(a.baseline) as f:
+            baseline = json.load(f)
+
     print(f"== long-generation gate (max_tokens={a.max_tokens}, greedy) ==")
+    results = {}
     failures = 0
     for name, prompt, check, what in TASKS:
         try:
             out, ntok = call(a.host, a.port, a.model, prompt, a.max_tokens)
         except Exception as e:
             print(f"  [FAIL] {name}: request error: {e}")
+            results[name] = {"passed": False, "tokens": 0, "why": f"request error: {e}"}
             failures += 1
             continue
 
@@ -124,12 +147,30 @@ def main():
         elif not check(out):
             why = f"structure check failed: expected {what}"
 
+        results[name] = {"passed": why is None, "tokens": ntok, "why": why}
         if why:
             failures += 1
             print(f"  [FAIL] {name} ({ntok} tok): {why}")
             print(f"         tail: ...{out[-160:].strip()!r}")
         else:
             print(f"  [PASS] {name} ({ntok} tok): {what}")
+
+    if a.save_baseline:
+        with open(a.save_baseline, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\n  baseline recorded to {a.save_baseline} "
+              f"({len(TASKS) - failures}/{len(TASKS)} pass at this precision)")
+        sys.exit(0)
+
+    if baseline is not None:
+        regressions = [n for n, r in results.items()
+                       if not r["passed"] and baseline.get(n, {}).get("passed")]
+        for n in regressions:
+            print(f"  REGRESSION: {n} passed in baseline, fails here")
+        print(f"\n  VERDICT: {'PASS' if not regressions else 'FAIL'} "
+              f"({len(regressions)} regression(s) vs baseline; "
+              f"{len(TASKS) - failures}/{len(TASKS)} absolute)")
+        sys.exit(1 if regressions else 0)
 
     print(f"\n  VERDICT: {'PASS' if not failures else 'FAIL'} "
           f"({len(TASKS) - failures}/{len(TASKS)} long-generation tasks)")
