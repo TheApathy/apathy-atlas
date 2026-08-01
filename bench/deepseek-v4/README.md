@@ -80,9 +80,26 @@ python3 bench/deepseek-v4/quality_probe.py --port 8899
 The longgen failures reproduce bit-identically at BF16 — they are REAP-model
 instruction-following quirks, not precision damage. Gate any further precision
 cut with `longgen_gate.py --baseline longgen_baseline_bf16.json` (regressions
-vs the recorded full-precision run), not the absolute verdict. MTP speculative
-decode currently LOSES (~7 tok/s): the draft head only reaches 19–36% accept
-on this checkpoint — open item.
+vs the recorded full-precision run), not the absolute verdict.
+
+### MTP speculative decode (`EXTRA_ARGS="--speculative"` + the two env gates)
+
+| stage (2026-08-01) | accept | spec tok/s |
+|---|---|---|
+| as found (draft body on the generic BF16 MLA path) | 19–36% | ~7 |
+| + draft body/cache on the FP8 MLA decode arms | 40–48% | 12.4 |
+| + drafter prompt prefill & per-accept context feed | 49–67% | 13.3 |
+| + draft argmaxes the target's FP8 head | **68–71%** | **17.3** (warm) |
+
+Run with `ATLAS_MTP_DRAFTER_PREFILL=1 ATLAS_MTP_CATCHUP=1`; quality gates
+PASS (GSM8K 12/12, longgen 0 regressions). Not yet the default: at ~70%
+accept it only ties the 18.0 non-speculative baseline because the m=2
+verify costs ~2× a single decode (the m>1 GEMV paths re-read weights per
+row). Open items, in leverage order: (1) amortize verify weight reads
+(~17 → ~23 tok/s at current accept), (2) `--num-drafts 2` wedges on a
+CUDA-graph capture violation (stream-capture 900) in the K3 verify path —
+fix and the same accept compounds per draft, (3) push accept further
+(drafter FP8-KV scale calibration).
 
 ## Notes that will save you time
 
