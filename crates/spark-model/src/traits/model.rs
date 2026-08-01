@@ -584,6 +584,16 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// MTP K=2 accept-hole fix: feed the drafter the pair it skipped on an
+    /// accept — `(embed(accepted_draft), verify hidden row 0)` at the
+    /// accepted draft's position — BEFORE the next propose, so the drafter's
+    /// KV context stays gapless. Call after `save_hidden_for_mtp(1, …)` (the
+    /// feed clobbers the hidden buffer row 0 as scratch). Default no-op for
+    /// proposers without drafter-row support.
+    fn mtp_accept_feed(&self, _accepted_token: u32, _seq: &mut SequenceState) -> Result<()> {
+        Ok(())
+    }
+
     /// EAGLE-fix (K=gamma): append rows 0..=num_accepted at positions
     /// base_pos..=base_pos+num_accepted. Row num_accepted is appended LAST ->
     /// freshest ctx slot = the hidden that generated the bonus (EAGLE).

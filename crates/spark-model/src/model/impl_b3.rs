@@ -28,6 +28,63 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    /// K=2 ACCEPT-hole fix: feed the drafter the pair it never saw.
+    ///
+    /// On a K2 accept the sequence advances by 2 (accepted draft + bonus) but
+    /// the drafter appended only 1 row (at the pre-verify propose) — the pair
+    /// `(embed(accepted_draft), hidden_row0)` is skipped, punching a permanent
+    /// hole in the drafter's context at ~accept-rate density. `hidden_row0`
+    /// (the target's final hidden after the token that PRECEDED the draft) is
+    /// still sitting in `buffers.hidden_states()` row 0 from the just-run
+    /// verify, so feed it before the next propose clobbers the buffer. RoPE
+    /// position = post-commit `seq.seq_len - 1` (the accepted draft's own
+    /// position). Mirrors `dflash_eagle_accept_append` for the MTP proposer.
+    pub(super) fn mtp_accept_feed_inner(
+        &self,
+        accepted_token: u32,
+        seq: &mut SequenceState,
+    ) -> Result<()> {
+        let proposer = match &self.proposer {
+            Some(p) => p.as_ref(),
+            None => return Ok(()),
+        };
+        let stream = self.gpu.default_stream();
+        let ctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            attn_metadata: None,
+            profile: false,
+            comm: None,
+            graph_capture: false,
+            gdn_exact_replay: false,
+            token_ids: None,
+            routed_lora_layers: None,
+            midchunk_capture: None,
+        };
+        let Some(prop_state) = seq.proposer_state.as_mut() else {
+            return Ok(());
+        };
+        let row_base = proposer.drafter_rows(prop_state.as_mut());
+        if row_base == 0 {
+            // Proposer without drafter-row support (or fresh state): no-op.
+            return Ok(());
+        }
+        // feed_rows reads tokens[r+1] (r = 0): first element is a placeholder.
+        let toks = [0u32, accepted_token];
+        let pos = seq.seq_len.saturating_sub(1);
+        proposer.catchup_drafter(
+            &toks,
+            self.buffers.hidden_states(),
+            row_base,
+            pos,
+            prop_state.as_mut(),
+            &ctx,
+            stream,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn run_mtp_propose_inner(
         &self,
         token: u32,

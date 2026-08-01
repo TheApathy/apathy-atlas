@@ -130,8 +130,23 @@ pub fn load_v4_mtp_module(
     yarn_inv_freq = super::compute::ensure_yarn_inv_freq(&mut yarn_inv_freq, config, gpu)?;
 
     // Build the body by reusing `assemble_layer` with the `mtp.0` prefix.
-    // layer_idx = num_hidden_layers ⇒ compress_ratios.get()/hash-layer/kv-dtype
-    // all fall to safe defaults (no compressor, no hash routing, bf16 KV).
+    // layer_idx = num_hidden_layers ⇒ compress_ratios.get()/hash-layer fall to
+    // safe defaults (no compressor, no hash routing).
+    //
+    // The KV dtype must NOT fall to its Bf16 default: the V4-Flash MLA decode
+    // arms in `run_paged_decode` exist only for Nvfp4/Fp8 — a Bf16-dtype body
+    // silently takes the GENERIC paged-decode arm, which is numerically wrong
+    // for the MLA cache shape (V=K-rope reconstruction, attention sink). That
+    // made every draft "confidently wrong" (~30% accept). Extend the per-layer
+    // table so index `num_hidden_layers` carries the target layers' dtype (FP8
+    // in the mandatory `--kv-cache-dtype fp8` config); the proposer's own KV
+    // cache (`DeepseekV4MtpHead::new`) is allocated with the matching dtype.
+    let body_kv_dtype = layer_kv_dtypes
+        .first()
+        .copied()
+        .unwrap_or(KvCacheDtype::Fp8);
+    let mut kv_dtypes_ext = layer_kv_dtypes.to_vec();
+    kv_dtypes_ext.resize(config.num_hidden_layers + 1, body_kv_dtype);
     let body = super::assemble::assemble_layer(
         config.num_hidden_layers,
         prefix,
@@ -161,7 +176,7 @@ pub fn load_v4_mtp_module(
         store,
         config,
         gpu,
-        layer_kv_dtypes,
+        &kv_dtypes_ext,
     )?;
 
     // ── MTP-specific combiner + final norm ──

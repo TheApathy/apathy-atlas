@@ -210,6 +210,15 @@ pub fn step_verify_k2(
             tracing::error!("trim_proposer_state: {e:#}");
         }
         mtp_timing::record(Phase::TrimProposer, t_trim);
+        // Accept-hole fix: the sequence just advanced by 2 (draft + bonus)
+        // but the drafter only appended 1 row at the pre-verify propose. Feed
+        // it the skipped pair (embed(accepted_draft), verify hidden row 0)
+        // before propose, or its KV context accumulates a hole per accept.
+        // Must run AFTER save_hidden_for_mtp(1) — the feed clobbers the
+        // hidden buffer as scratch.
+        if let Err(e) = model.mtp_accept_feed(drafts[0], &mut a.seq) {
+            tracing::error!("mtp_accept_feed: {e:#}");
+        }
         let t_mask = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         mtp_timing::record(Phase::ProposeMask, t_mask);

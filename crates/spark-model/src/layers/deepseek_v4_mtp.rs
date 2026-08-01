@@ -66,6 +66,10 @@ pub struct DeepseekV4MtpProposerState {
     pub seq_len: usize,
     /// Drafts produced by the last `propose()` (for `after_verify` trimming).
     pub last_num_drafted: usize,
+    /// Sequence pair key of the newest drafter row (row for pair
+    /// `(embed(t_{k+1}), hidden_k)` has key `k` = its RoPE position - 1).
+    /// Drives the ATLAS_MTP_CATCHUP gap computation in `run_mtp_propose_inner`.
+    pub last_pair_key: Option<usize>,
     /// Per-layer state for the reused V4 body. MLA attention layers use
     /// `EmptyLayerState`, but we allocate it via `body.alloc_state` so any
     /// future stateful body type is handled correctly (no hard-coded assumption).
@@ -120,9 +124,18 @@ impl DeepseekV4MtpHead {
         // MTP KV cache: single MLA-absorbed attention layer. Matches the
         // target's MLA cache shape (num_kv_heads = 1, head_dim = kv_lora_rank
         // + qk_rope_head_dim) so `write_kv_cache` / `run_paged_decode` in the
-        // reused V4 body land at the correct strides. BF16 (the MTP cache is
-        // one tiny layer — BF16 cost is negligible and avoids the FP8 unit-
-        // scale collapse seen on the Qwen path).
+        // reused V4 body land at the correct strides.
+        //
+        // FP8 is REQUIRED, not an optimization: the V4-Flash MLA decode arms
+        // in `run_paged_decode` exist only for the Nvfp4/Fp8 cache dtypes
+        // (V=K-rope reconstruction, attention sink, 576-dim latent). A BF16
+        // cache silently falls through to the GENERIC paged-decode arm, which
+        // is numerically wrong for this shape — the draft body's attention
+        // output was garbage and acceptance pinned at ~30% ("confidently
+        // wrong attractor"). Same constraint as the target's mandatory
+        // `--kv-cache-dtype fp8`. Scales: the body layer's checkpoint
+        // k_scale/v_scale (the same values the target decodes with before
+        // its live calibration freezes).
         let mla_cache_dim = config.kv_lora_rank + config.qk_rope_head_dim;
         // The MTP body is a single layer, but it was built with
         // `attn_layer_idx = num_hidden_layers` (so its mHC/hash/compressor logic
@@ -136,7 +149,7 @@ impl DeepseekV4MtpHead {
             num_kv_heads: 1,
             head_dim: mla_cache_dim,
             num_layers,
-            dtype: KvCacheDtype::Bf16,
+            dtype: KvCacheDtype::Fp8,
             layer_dtypes: vec![],
             layer_dims: vec![],
             cache_blocks_per_seq: None,
@@ -168,11 +181,18 @@ impl DeepseekV4MtpHead {
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
+            last_pair_key: None,
             body_state: self.module.body.alloc_state(gpu)?,
         })
     }
 
     /// One MTP draft step. Returns the drafted token id.
+    ///
+    /// `kv_only = true` is the context-feed mode (drafter prefill / catch-up):
+    /// the body forward still runs — the MLA KV row it writes is the entire
+    /// point — but the mHC-head collapse, final norm, LM-head GEMV and argmax
+    /// D2H are skipped (no draft is sampled, return value is 0). This keeps
+    /// the feed fully async: no per-row stream sync.
     #[allow(clippy::too_many_arguments)]
     fn forward_one(
         &self,
@@ -183,6 +203,7 @@ impl DeepseekV4MtpHead {
         ctx: &ForwardContext,
         stream: u64,
         grammar_bitmask: Option<&[i32]>,
+        kv_only: bool,
     ) -> Result<u32> {
         let h = ctx.config.hidden_size as u32;
         let eps = ctx.config.rms_norm_eps as f32;
@@ -361,6 +382,13 @@ impl DeepseekV4MtpHead {
         )?;
         drop(kv_cache);
 
+        // Row for pair key `position - 1` is now in the drafter KV.
+        state.seq_len += 1;
+        state.last_pair_key = Some(position.saturating_sub(1));
+        if kv_only {
+            return Ok(0);
+        }
+
         // ── 5. mHC head: collapse hc_mult streams → single h_out (is_last) ──
         let h_out = ctx.buffers.hidden_states();
         if let Some(ref head) = self.module.hc_head {
@@ -427,8 +455,63 @@ impl DeepseekV4MtpHead {
             u32::from_le_bytes(buf)
         };
 
-        state.seq_len += 1;
         Ok(token_id)
+    }
+
+    /// Append drafter KV rows `row_base ..` for pairs
+    /// `(embed(tokens[r+1]), hiddens row r)` at RoPE positions `pos_base + r`.
+    /// Shared body of `prefill_drafter` (row_base 0, pos_base 1) and
+    /// `catchup_drafter`. Serial `forward_one(kv_only)` per row — the V4 body
+    /// is a full layer (mHC + MLA + MoE), so unlike the Qwen head there is no
+    /// cheap batched K/V-projection shortcut without duplicating the layer's
+    /// prefill plumbing; at ~1.5 ms/row this is fine for bring-up and the
+    /// catch-up feed (1-2 rows), and a batched pass can replace it later
+    /// without changing the row convention.
+    fn feed_rows(
+        &self,
+        tokens: &[u32],
+        hiddens: DevicePtr,
+        row_base: usize,
+        pos_base: usize,
+        state: &mut DeepseekV4MtpProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        // Rows must append exactly at the drafter's current length (classic
+        // prefill: fresh drafter; catch-up: row_base == seq_len). Anything
+        // else would hole or overwrite live rows.
+        if state.seq_len != row_base || tokens.len() < 2 {
+            return Ok(0);
+        }
+        let t0 = std::time::Instant::now();
+        let h = ctx.config.hidden_size;
+        let rows = tokens.len() - 1;
+        for r in 0..rows {
+            self.forward_one(
+                tokens[r + 1],
+                hiddens.offset(r * h * 2),
+                pos_base + r,
+                state,
+                ctx,
+                stream,
+                None,
+                true,
+            )?;
+        }
+        // Multi-row feeds (whole-prompt prefill) are one-shot and worth an
+        // INFO line; single-row feeds (per-accept hole fix) fire every accept.
+        if rows > 1 {
+            tracing::info!(
+                "V4 MTP drafter feed: {rows} rows @ slots {row_base}.. \
+                 (RoPE {pos_base}..) in {:.1} ms",
+                t0.elapsed().as_secs_f64() * 1e3,
+            );
+        } else {
+            tracing::debug!(
+                "V4 MTP drafter feed: {rows} row @ slot {row_base} (RoPE {pos_base})"
+            );
+        }
+        Ok(rows)
     }
 }
 
@@ -516,6 +599,7 @@ impl DraftProposer for DeepseekV4MtpHead {
                 ctx,
                 stream,
                 grammar_bitmask,
+                false,
             )?;
             tracing::debug!(
                 "V4 MTP propose[{i}]: token={current_token} pos={} mtp_seq_len={} → draft={draft}",
@@ -529,6 +613,58 @@ impl DraftProposer for DeepseekV4MtpHead {
         }
         v4_state.last_num_drafted = drafts.len();
         Ok(drafts)
+    }
+
+    fn prefill_drafter(
+        &self,
+        prompt_tokens: &[u32],
+        hiddens: DevicePtr,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        let v4_state = match state.as_any_mut().downcast_mut::<DeepseekV4MtpProposerState>() {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        // Whole-prompt drafter context: row i pairs embed(t_{i+1}) with
+        // hidden_i at RoPE position i+1, KV slot i, for i = 0..P-2. The first
+        // decode propose() then appends (first_sampled_token, hidden_{P-1}) at
+        // position P, slot P-1 — gapless. `feed_rows` fast-returns 0 unless
+        // the drafter is fresh (seq_len == 0).
+        self.feed_rows(prompt_tokens, hiddens, 0, 1, v4_state, ctx, stream)
+    }
+
+    fn drafter_rows(&self, state: &mut dyn ProposerState) -> usize {
+        state
+            .as_any_mut()
+            .downcast_mut::<DeepseekV4MtpProposerState>()
+            .map(|s| s.seq_len)
+            .unwrap_or(0)
+    }
+
+    fn last_pair_key(&self, state: &mut dyn ProposerState) -> Option<usize> {
+        state
+            .as_any_mut()
+            .downcast_mut::<DeepseekV4MtpProposerState>()
+            .and_then(|s| s.last_pair_key)
+    }
+
+    fn catchup_drafter(
+        &self,
+        tokens: &[u32],
+        hiddens: DevicePtr,
+        row_base: usize,
+        pos_base: usize,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        let v4_state = match state.as_any_mut().downcast_mut::<DeepseekV4MtpProposerState>() {
+            Some(s) => s,
+            None => return Ok(0),
+        };
+        self.feed_rows(tokens, hiddens, row_base, pos_base, v4_state, ctx, stream)
     }
 
     fn after_verify(
@@ -549,6 +685,11 @@ impl DraftProposer for DeepseekV4MtpHead {
         let old_sl = v4_state.seq_len;
         if num_to_trim > 0 {
             v4_state.seq_len = v4_state.seq_len.saturating_sub(num_to_trim);
+            // Trimmed rows have consecutive pair keys; the newest surviving
+            // key moves back by the same count.
+            if let Some(k) = v4_state.last_pair_key {
+                v4_state.last_pair_key = Some(k.saturating_sub(num_to_trim));
+            }
         }
         tracing::debug!(
             "V4 MTP after_verify: accepted={num_accepted} drafted={num_drafted} \
