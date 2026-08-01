@@ -450,9 +450,33 @@ fn load_attention(
     // follow-up for concurrency parity with GGUF. o_proj is [N=hidden, K=q_width].
     let (q_nvfp4, k_nvfp4, v_nvfp4) = if attn_nvfp4 {
         (
-            Some(quantize_to_nvfp4(&q_proj, q_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
-            Some(quantize_to_nvfp4(&k_proj, kv_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
-            Some(quantize_to_nvfp4(&v_proj, kv_width, config.hidden_size, gpu, absmax_k, quantize_k, stream)?),
+            Some(quantize_to_nvfp4(
+                &q_proj,
+                q_width,
+                config.hidden_size,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?),
+            Some(quantize_to_nvfp4(
+                &k_proj,
+                kv_width,
+                config.hidden_size,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?),
+            Some(quantize_to_nvfp4(
+                &v_proj,
+                kv_width,
+                config.hidden_size,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?),
         )
     } else {
         (None, None, None)

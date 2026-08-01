@@ -257,7 +257,11 @@ pub fn moe_expert_gate_up_shared(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), if skip_shared { top_k } else { top_k + 1 }, 2])
+        .grid([
+            div_ceil(n, 8),
+            if skip_shared { top_k } else { top_k + 1 },
+            2,
+        ])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_ptrs)
@@ -314,7 +318,11 @@ pub fn moe_expert_silu_down_shared(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), if skip_shared { top_k } else { top_k + 1 }, 1])
+        .grid([
+            div_ceil(n, 8),
+            if skip_shared { top_k } else { top_k + 1 },
+            1,
+        ])
         .block([128, 1, 1])
         .shared_mem(k * 4) // s_act[K] for precomputed SiLU(gate)*up activation
         .arg_ptr(gate_out)
@@ -366,7 +374,11 @@ pub fn moe_expert_silu_down_shared_v5(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 16), if skip_shared { top_k } else { top_k + 1 }, 1])
+        .grid([
+            div_ceil(n, 16),
+            if skip_shared { top_k } else { top_k + 1 },
+            1,
+        ])
         .block([128, 1, 1])
         .shared_mem(k * 4) // s_act[K] for precomputed SiLU(gate)*up activation
         .arg_ptr(gate_out)

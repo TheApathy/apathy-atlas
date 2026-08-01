@@ -181,7 +181,16 @@ fn main() -> Result<()> {
 
         // Correctness cross-check: GEMV is the incumbent reference.
         launch(
-            gpu, Variant::Gemv, h_gemv, a_ptr, b_ptrs[0], s_ptr, c_ptr, n as u32, k as u32, stream,
+            gpu,
+            Variant::Gemv,
+            h_gemv,
+            a_ptr,
+            b_ptrs[0],
+            s_ptr,
+            c_ptr,
+            n as u32,
+            k as u32,
+            stream,
         )?;
         gpu.synchronize(stream)?;
         let ref_row = read_row_f64(gpu, c_ptr, n)?;
@@ -193,7 +202,9 @@ fn main() -> Result<()> {
         ] {
             // Poison C so "kernel wrote nothing" can't pass the cosine gate.
             gpu.copy_h2d(&vec![0x7Fu8; n * 2], c_ptr)?;
-            launch(gpu, v, h, a_ptr, b_ptrs[0], s_ptr, c_ptr, n as u32, k as u32, stream)?;
+            launch(
+                gpu, v, h, a_ptr, b_ptrs[0], s_ptr, c_ptr, n as u32, k as u32, stream,
+            )?;
             gpu.synchronize(stream)?;
             let row = read_row_f64(gpu, c_ptr, n)?;
             let cos = cosine(&ref_row, &row);

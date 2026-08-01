@@ -139,7 +139,11 @@ impl MoeLayer {
             ARMED.call_once(|| {
                 eprintln!(
                     "MOE gate GEMV: kernel={} first_n={} armed={}",
-                    if self.dense_gemv_batchm.0 != 0 { "loaded" } else { "MISSING" },
+                    if self.dense_gemv_batchm.0 != 0 {
+                        "loaded"
+                    } else {
+                        "MISSING"
+                    },
                     n,
                     gate_gemv
                 );

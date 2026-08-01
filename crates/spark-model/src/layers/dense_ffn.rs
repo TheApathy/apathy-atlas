@@ -1388,9 +1388,7 @@ impl DenseFfnLayer {
                     } else {
                         "scalar"
                     };
-                    tracing::info!(
-                        "DENSE_FFN prefill route={route} m={m} inter={inter} h={h}"
-                    );
+                    tracing::info!("DENSE_FFN prefill route={route} m={m} inter={inter} h={h}");
                 });
             }
             macro_rules! ffn_gemm {

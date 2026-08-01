@@ -257,7 +257,10 @@ impl MoeLayer {
     pub(super) fn skip_placeholder_shared(&self) -> bool {
         static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *SKIP.get_or_init(|| {
-            std::env::var("ATLAS_MOE_SKIP_PLACEHOLDER_SHARED").ok().as_deref() == Some("1")
+            std::env::var("ATLAS_MOE_SKIP_PLACEHOLDER_SHARED")
+                .ok()
+                .as_deref()
+                == Some("1")
         }) && self.has_mixed_bf16_shared_expert()
     }
 

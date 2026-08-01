@@ -22,9 +22,7 @@ impl Qwen3AttentionLayer {
     /// Cached — this is read once per layer per token on the decode hot path.
     fn gproj_decode_gemv() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("ATLAS_DECODE_GPROJ_GEMV").ok().as_deref() == Some("1")
-        })
+        *ON.get_or_init(|| std::env::var("ATLAS_DECODE_GPROJ_GEMV").ok().as_deref() == Some("1"))
     }
 
     pub(in super::super) fn attention_forward(

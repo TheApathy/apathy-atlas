@@ -337,7 +337,8 @@ fn main() -> Result<()> {
                     slot_diff += cs.iter().filter(|e| !gs.contains(e)).count();
                 }
                 // Margin on the CPU oracle: how close the decision actually was.
-                let mut vals: Vec<f32> = (0..n).map(|j| bf16_bits_to_f32(c_cpu[r * n + j])).collect();
+                let mut vals: Vec<f32> =
+                    (0..n).map(|j| bf16_bits_to_f32(c_cpu[r * n + j])).collect();
                 vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
                 min_gap = min_gap.min((vals[kk - 1] - vals[kk]) as f64);
             }

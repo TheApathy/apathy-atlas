@@ -755,11 +755,7 @@ impl BlockDiffusionDraftHead {
                 }
             }
         }
-        let masked = |name: &str| {
-            fp8_mask
-                .as_ref()
-                .is_some_and(|m| m.contains(name))
-        };
+        let masked = |name: &str| fp8_mask.as_ref().is_some_and(|m| m.contains(name));
 
         let fp8_full = fp8_mask.is_none()
             && std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
@@ -844,21 +840,23 @@ impl BlockDiffusionDraftHead {
                 }
                 if want("k") {
                     // K proj: [kv_dim, h]
-                    layer.k_proj_fp8 =
-                        Some(
-                            layer
-                                .k_proj
-                                .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
-                        );
+                    layer.k_proj_fp8 = Some(layer.k_proj.quantize_to_fp8(
+                        gpu,
+                        quant_k,
+                        kv_dim_local,
+                        h,
+                        stream,
+                    )?);
                 }
                 if want("v") {
                     // V proj: [kv_dim, h]
-                    layer.v_proj_fp8 =
-                        Some(
-                            layer
-                                .v_proj
-                                .quantize_to_fp8(gpu, quant_k, kv_dim_local, h, stream)?,
-                        );
+                    layer.v_proj_fp8 = Some(layer.v_proj.quantize_to_fp8(
+                        gpu,
+                        quant_k,
+                        kv_dim_local,
+                        h,
+                        stream,
+                    )?);
                 }
                 if want("o") {
                     // O proj: [h, q_dim]

@@ -21,8 +21,8 @@ mod pack;
 
 pub use gemm::{bf16_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t};
 pub use grouped::{
-    nvfp4_grouped_down, nvfp4_grouped_down_dev, nvfp4_grouped_gate_up,
-    nvfp4_grouped_gate_up_fused, nvfp4_grouped_gate_up_fused_dev,
+    nvfp4_grouped_down, nvfp4_grouped_down_dev, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused,
+    nvfp4_grouped_gate_up_fused_dev,
 };
 pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
 

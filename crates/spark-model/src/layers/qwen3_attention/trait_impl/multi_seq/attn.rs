@@ -22,9 +22,7 @@ impl Qwen3AttentionLayer {
     /// serial decode path.
     fn gproj_verify_gemv() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("ATLAS_VERIFY_GPROJ_GEMV").ok().as_deref() == Some("1")
-        })
+        *ON.get_or_init(|| std::env::var("ATLAS_VERIFY_GPROJ_GEMV").ok().as_deref() == Some("1"))
     }
 
     /// ATLAS_FUSED_ELEMWISE=1 flat-verify epilogue eligibility. Every term is

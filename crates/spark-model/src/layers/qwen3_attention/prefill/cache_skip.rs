@@ -753,7 +753,11 @@ impl Qwen3AttentionLayer {
                 ROUTE_ONCE.call_once(|| {
                     tracing::info!(
                         "HEAD_GATE prefill[cache_skip] route={} n={n} nq={nq} h={h}",
-                        if hg_cublas { "cublaslt" } else { "dense_gemm_tc" }
+                        if hg_cublas {
+                            "cublaslt"
+                        } else {
+                            "dense_gemm_tc"
+                        }
                     );
                 });
             }
