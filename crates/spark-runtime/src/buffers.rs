@@ -72,6 +72,7 @@ pub struct BufferArena {
     expert_down_out: DevicePtr,
     /// Split-K decode attention workspace: partials from split CTAs (F32).
     splitk_workspace: DevicePtr,
+    moe_splitk_partials: DevicePtr,
     /// Grouped O-projection latent: [M, o_groups*o_lora_rank] BF16 (V4-Flash).
     o_latent: DevicePtr,
     /// Zero-filled BF16 weight (max_dim) for unweighted RMSNorm under the
@@ -155,6 +156,9 @@ impl BufferArena {
         let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
         let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
+        // 0 on dense models; alloc(0) is not meaningful, so floor at one byte
+        // and let the dispatch's size check keep the split-K path off.
+        let moe_splitk_partials = gpu.alloc(sizes.moe_splitk_partials.max(1))?;
         let o_latent = gpu.alloc(sizes.o_latent)?;
         // Zero-filled "weight" for unweighted RMSNorm under the offset-from-1
         // convention used by the rms_norm kernel (scale = 1 + weight). Weight = 0
@@ -250,6 +254,7 @@ impl BufferArena {
             expert_up_out,
             expert_down_out,
             splitk_workspace,
+            moe_splitk_partials,
             o_latent,
             norm_unit_w,
             hc_streams,

@@ -361,6 +361,39 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0",
             ),
+            // Split-K decode variants. The VEC and split factors are baked into
+            // the entry-point name, so these must stay in step with
+            // `ops::T_SPLIT_VEC` and `MOE_DECODE_MAX_SPLIT`.
+            moe_expert_gate_up_shared_t_splitk_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_v2s4",
+            ),
+            moe_expert_silu_down_shared_t_splitk_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_v2s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_splitk_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_v2s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_splitk_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_v2s4",
+            ),
+            moe_gate_up_partial_finalize_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_gate_up_partial_finalize",
+            ),
+            moe_down_partial_finalize_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_down_partial_finalize",
+            ),
             // sqrtsoftplus kernels: lazy-loaded via try_kernel so models that
             // don't register them (all except DeepSeek-V4) start fine.
             moe_topk_sqrtsoftplus_k: super::super::try_kernel(

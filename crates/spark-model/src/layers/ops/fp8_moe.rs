@@ -292,7 +292,7 @@ pub fn moe_transpose_u8_batched(
 // block — more blocks per silu_down/gate_up call → higher SM occupancy on
 // GB10 (only 25 SMs, so larger blocks under-utilise). Each thread owns one
 // output regardless of block size.
-pub(super) const T_BLOCK: u32 = 32;
+pub(crate) const T_BLOCK: u32 = 32;
 
 /// NVFP4 fused gate+up GEMV (transposed weight). Single-token decode.
 #[allow(clippy::too_many_arguments)]
@@ -342,6 +342,163 @@ pub fn moe_expert_gate_up_shared_t(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .launch(stream)
+}
+
+/// Outputs each thread owns (adjacent in `n`) in the split-K decode kernels.
+///
+/// Measured on GB10 at V4 decode shapes (`moe_unified_t_v4_microtest`): the
+/// 1-byte-per-lane load in the kernels above requests 32 bytes per warp per K
+/// iteration and is pinned near 130 GB/s no matter how many warps are resident
+/// — 4× the warps moved it only 128 → 136 GB/s. Widening to 64 bytes (VEC=2)
+/// lifts that ceiling but costs half the warps; 128 bytes (VEC=4) costs three
+/// quarters and lands slower at production top_k=6. VEC=2 with the warps put
+/// back by split-K measured 197 GB/s, or 32.5 → 20.6 ms/token of MoE.
+pub(crate) const T_SPLIT_VEC: u32 = 2;
+
+/// Bytes of f32 partial scratch the split-K decode path needs, given the split
+/// factor and the two projection widths. Mirrors `moe_splitk_partials` in
+/// `spark-runtime`'s buffer sizing; the dispatch checks the buffer against it.
+pub fn moe_splitk_partial_bytes(split: u32, inter: u32, h: u32, top_k: u32) -> usize {
+    let slots = (top_k + 1) as usize;
+    split as usize * slots * 4 * (2 * inter as usize + h as usize)
+}
+
+/// Byte offset of the down-projection region within the split-K partial buffer.
+pub fn moe_splitk_down_offset(split: u32, inter: u32, top_k: u32) -> usize {
+    2 * split as usize * (top_k + 1) as usize * inter as usize * 4
+}
+
+/// Split-K fused gate+up GEMV (transposed weight) + partial finalize.
+///
+/// `kernel` must be a `_v{T_SPLIT_VEC}s{split}` entry point and `finalize` the
+/// matching `moe_gate_up_partial_finalize`; the split factor is baked into the
+/// kernel at compile time and only the finalize reads it at runtime.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_t_splitk(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    finalize: KernelHandle,
+    input: DevicePtr,
+    gate_packed_t_ptrs: DevicePtr,
+    gate_scale_t_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_t_ptrs: DevicePtr,
+    up_scale_t_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_t: &QuantizedWeight,
+    sh_gate_out: DevicePtr,
+    sh_up_t: &QuantizedWeight,
+    sh_up_out: DevicePtr,
+    partials: DevicePtr,
+    split: u32,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / (T_BLOCK * T_SPLIT_VEC), top_k + 1, 2 * split])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate_packed_t_ptrs)
+        .arg_ptr(gate_scale_t_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_packed_t_ptrs)
+        .arg_ptr(up_scale_t_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_t.weight)
+        .arg_ptr(sh_gate_t.weight_scale)
+        .arg_f32(sh_gate_t.weight_scale_2)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(sh_up_t.weight)
+        .arg_ptr(sh_up_t.weight_scale)
+        .arg_f32(sh_up_t.weight_scale_2)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_ptr(partials)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, finalize)
+        .grid([div_ceil(n, T_BLOCK), top_k + 1, 2])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(partials)
+        .arg_ptr(gate_out)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(top_k)
+        .arg_u32(split)
+        .launch(stream)
+}
+
+/// Split-K fused SiLU+down GEMV (transposed weight) + partial finalize.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_t_splitk(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    finalize: KernelHandle,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_t_ptrs: DevicePtr,
+    scale_t_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down_t: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    partials: DevicePtr,
+    split: u32,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    stream: u64,
+) -> Result<()> {
+    // `s_act` now covers only this block's k slice, so the per-block shared
+    // memory drops by `split` — at K=2048 that is 8 KB → 2 KB, which is what
+    // was capping blocks-per-SM on the down projection.
+    let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32 / split;
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / (T_BLOCK * T_SPLIT_VEC), top_k + 1, split])
+        .block([T_BLOCK, 1, 1])
+        .shared_mem(smem_bytes)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_t_ptrs)
+        .arg_ptr(scale_t_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down_t.weight)
+        .arg_ptr(sh_down_t.weight_scale)
+        .arg_f32(sh_down_t.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_ptr(partials)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, finalize)
+        .grid([div_ceil(n, T_BLOCK), top_k + 1, 1])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(partials)
+        .arg_ptr(output)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(top_k)
+        .arg_u32(split)
         .launch(stream)
 }
 

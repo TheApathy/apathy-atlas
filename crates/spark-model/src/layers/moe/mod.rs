@@ -265,6 +265,16 @@ pub struct MoeLayer {
     // decode variants. KernelHandle(0) on models that don't ship them.
     moe_expert_gate_up_shared_t_e8m0_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_k: KernelHandle,
+    // Split-K decode: wide (VEC=2) loads with the warps put back by splitting
+    // K four ways, plus the fixed-order finalize that sums the partials. See
+    // `ops::T_SPLIT_VEC`. KernelHandle(0) on targets that don't ship them; the
+    // dispatch falls back to the non-split kernels above.
+    moe_expert_gate_up_shared_t_splitk_k: KernelHandle,
+    moe_expert_silu_down_shared_t_splitk_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_splitk_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_splitk_k: KernelHandle,
+    moe_gate_up_partial_finalize_k: KernelHandle,
+    moe_down_partial_finalize_k: KernelHandle,
     // ── sqrtsoftplus routing (DeepSeek-V4) ──
     moe_topk_sqrtsoftplus_k: KernelHandle,
     moe_topk_sqrtsoftplus_batched_k: KernelHandle,
@@ -503,6 +513,24 @@ impl MoeLayer {
         } else {
             nvfp4
         }
+    }
+
+    /// `e8m0_or` without the assert: returns `None` when the variant this
+    /// model needs isn't compiled into the target image. The split-K decode
+    /// path is an optional fast path, so it declines and falls through to the
+    /// single-sweep kernels rather than aborting.
+    #[inline]
+    fn e8m0_or_opt(
+        &self,
+        nvfp4: spark_runtime::gpu::KernelHandle,
+        e8m0: spark_runtime::gpu::KernelHandle,
+    ) -> Option<spark_runtime::gpu::KernelHandle> {
+        let h = if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
+            e8m0
+        } else {
+            nvfp4
+        };
+        (h.0 != 0).then_some(h)
     }
 
     /// True when the routed experts are W3 Lloyd-Max (3-bit) — every

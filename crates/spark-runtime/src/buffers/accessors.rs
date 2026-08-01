@@ -119,6 +119,16 @@ impl BufferArena {
     pub fn splitk_workspace(&self) -> DevicePtr {
         self.splitk_workspace
     }
+    /// MoE decode split-K f32 partials. Layout: gate_up `[2, S, top_k+1, inter]`
+    /// then down `[S, top_k+1, hidden]` — the down region starts at
+    /// [`Self::moe_splitk_down_offset`]. NULL-sized (0 bytes) on dense models.
+    pub fn moe_splitk_partials(&self) -> DevicePtr {
+        self.moe_splitk_partials
+    }
+    /// Allocated byte size of `moe_splitk_partials` (bounds-check at dispatch).
+    pub fn moe_splitk_partials_bytes(&self) -> usize {
+        self.sizes.moe_splitk_partials
+    }
     /// Grouped O-projection latent [M, o_groups*o_lora_rank] BF16 (V4-Flash).
     pub fn o_latent(&self) -> DevicePtr {
         self.o_latent
@@ -255,6 +265,11 @@ impl BufferArena {
             "splitk_workspace",
             self.splitk_workspace,
             self.sizes.splitk_workspace,
+        );
+        probe(
+            "moe_splitk_partials",
+            self.moe_splitk_partials,
+            self.sizes.moe_splitk_partials,
         );
     }
 
