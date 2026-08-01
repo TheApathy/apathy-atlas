@@ -335,6 +335,39 @@ check("prose has the lowest accept of any cell",
 check("...and the largest step weight",
       prose["steps_a"] == max(r["steps_a"] for r in rrows), True)
 
+print("\n== per-language floor: a language delta inside its own A/A noise")
+# The 2026-08-01 GoHeavy run in miniature. Language `go` gets a delta that
+# looks like a clear win in isolation (-6%) but sits on cells that move by
+# nearly as much under a FIXED drafter. Language `c` gets the same-sized
+# delta on cells that reproduce exactly. Identical numbers in the B column,
+# opposite readings -- which is the whole point of printing the floor.
+_noisy = [
+    row("t1/go", "go", "t1", 8.00, 40.0), row("t2/go", "go", "t2", 6.00, 35.0),
+    row("t1/c", "c", "t1", 8.00, 40.0), row("t2/c", "c", "t2", 6.00, 35.0),
+]
+_noisy_b = [
+    row("t1/go", "go", "t1", 7.50, 40.0), row("t2/go", "go", "t2", 5.65, 35.0),
+    row("t1/c", "c", "t1", 7.50, 40.0), row("t2/c", "c", "t2", 5.65, 35.0),
+]
+_noisy_aa = [
+    row("t1/go", "go", "t1", 7.60, 40.0), row("t2/go", "go", "t2", 5.75, 35.0),
+    row("t1/c", "c", "t1", 8.00, 40.0), row("t2/c", "c", "t2", 6.00, 35.0),
+]
+_, ntxt = run(arm("a", _noisy), arm("b", _noisy_b), arm("a-p2", _noisy_aa))
+_gline = [l for l in ntxt.splitlines() if l.strip().startswith("go ")][0]
+_cline = [l for l in ntxt.splitlines() if l.strip().startswith("c ")][0]
+check("go and c have the SAME B-vs-A delta", "-6.1%" in _gline and "-6.1%" in _cline, True)
+check("go is flagged UNRESOLVED (delta inside its own floor)",
+      "UNRESOLVED at n=1: the go delta" in ntxt, True)
+check("c is NOT flagged (its cells reproduce exactly)",
+      "UNRESOLVED at n=1: the c delta" in ntxt, False)
+check("the flag names how many cells moved under a fixed drafter",
+      "2 of 2 go cells move under a FIXED drafter" in ntxt, True)
+# A zero floor must not render as an infinitely-resolvable ratio: at n=1 it
+# means "did not move once", not "cannot move".
+check("a zero A/A floor prints n/a, never inf", "inf" in _cline, False)
+check("...and prints n/a", "n/a" in _cline, True)
+
 check("hash divergence surfaces: 4 of 6 differ A vs B",
       "A vs B differ on   4/6" in txt, True)
 check("and exactly 1 is not self-reproducible (prose)",

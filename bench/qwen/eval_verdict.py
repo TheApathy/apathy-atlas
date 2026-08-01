@@ -357,17 +357,44 @@ def report(a_pay, b_pay, aa_pay, claims, out=sys.stdout) -> int:
                 p(f"             {v}: {', '.join(tally[v])}")
 
     # -- per language, because that is the axis a drafter change acts on.
-    p("\n-- by language (mean accept, and the cell verdicts within it)")
+    #
+    # The FLOOR column is the point of this block. An earlier version printed
+    # the language delta alone, and on the 2026-08-01 GoHeavy run that read as
+    # "go -2.4%, ours wins on Go" -- the one claim the run existed to settle.
+    # It is not a win: 4 of the 5 go cells move under a FIXED drafter, so the
+    # aggregate go floor is 1.7% and the signal is 1.4x it. Meanwhile c is
+    # 19.3x its floor. A language delta without its own floor next to it is
+    # unreadable, because per-language reproducibility is itself per-language.
+    p("\n-- by language (mean accept vs the A/A floor ON THE SAME CELLS)")
+    p(f"    {'lang':<8} {'n':<4} {'B vs A':>9} {'A/A floor':>10} {'ratio':>7}"
+      f"   cell verdicts")
     for lg in sorted({r["lang"] for r in rows}):
         rs = [r for r in rows if r["lang"] == lg]
         accs_a = [r["accept_a"] for r in rs if r["accept_a"] is not None]
         accs_b = [r["accept_b"] for r in rs if r["accept_b"] is not None]
+        accs_aa = [r["accept_aa"] for r in rs if r["accept_aa"] is not None]
         d = rel(statistics.fmean(accs_b), statistics.fmean(accs_a)) \
             if accs_a and accs_b else None
+        f = rel(statistics.fmean(accs_aa), statistics.fmean(accs_a)) \
+            if accs_a and accs_aa else None
+        # Ratio of signal to same-axis noise. Below ~2x, n=1 cannot separate
+        # them and the honest word is UNRESOLVED, not the sign of d.
+        ratio = abs(d / f) if (d is not None and f) else None
+        moved = sum(1 for r in rs if r["f_accept"] not in (None, 0.0))
         w = sum(1 for r in rs if r["v_accept"] == "WIN")
         l = sum(1 for r in rs if r["v_accept"] == "LOSS")
-        p(f"    {lg:<8} n={len(rs):<3} accept {_fmt(d, 9)}   "
-          f"{w} win / {l} loss / {len(rs) - w - l} tie-or-ungraded")
+        # A zero floor at n=1 is "did not move in one repeat", NOT "cannot
+        # move". Dividing by it would print inf and read as infinitely
+        # resolvable. The ratio is undefined, and says so.
+        rtxt = f"{ratio:6.1f}x" if ratio is not None else \
+               ("   n/a" if d is not None else "     -")
+        p(f"    {lg:<8} n={len(rs):<3}{_fmt(d, 9)}{_fmt(f, 10)} {rtxt}"
+          f"   {w} win / {l} loss / {len(rs) - w - l} tie-or-ungraded")
+        if ratio is not None and ratio < 2.0:
+            p(f"             !! UNRESOLVED at n=1: the {lg} delta is only "
+              f"{ratio:.1f}x its own A/A floor")
+            p(f"                ({moved} of {len(rs)} {lg} cells move under a "
+              f"FIXED drafter). Do not report a direction here.")
 
     # -- mix sensitivity. The pooled number, and what it is standing on.
     p("\n-- pooled, under three weightings (see pool() for why three)")

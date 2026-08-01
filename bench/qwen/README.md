@@ -115,6 +115,39 @@ statement is "ours loses on Python and prose here", not "the retrain was
 worthless". That gap is why section 4 now defaults to a coverage-gated matrix
 instead of this suite.
 
+### The Go question, settled (2026-08-01)
+
+We re-ran the same three arms through that matrix — 17 cells, five tasks × {C,
+Python, Go} plus two non-code anchors, `--claims lang:go` so the scorer refuses
+if Go fails to grade. All 17 cells graded on all three arms. Mean accept, `z-lab`
+relative to ours, against the A/A floor computed **on the same cells**:
+
+| language | n | `z-lab` vs ours | A/A floor | ratio | reading |
+|---|---|---|---|---|---|
+| C | 5 | **+13.4%** | 0.7% | 19.3× | decisive, `z-lab` better |
+| Python | 5 | −0.5% | 0.0% | — | tie |
+| Go | 5 | −2.4% | 1.7% | 1.4× | **unresolved at n=1** |
+| anchors | 2 | −2.1% | 2.6% | 0.8× | unresolved at n=1 |
+
+So the retrain did **not** demonstrably pay for itself even on Go. Ours is
+nominally ahead there, but by less than twice the noise on the very same cells —
+and it gives up 13.4% accept on C, at 19× the noise. Pooled across the matrix
+`z-lab` is +4.3% accept and +4.3% tok/s, consistent in sign with section 1 and
+with all three weightings (no mix sensitivity).
+
+The reason the Go row cannot be called: **reproducibility is itself
+language-dependent.** Re-running one fixed drafter, accept reproduced *exactly*
+on 11 of 17 cells but moved on 6 — and 4 of those 6 are the Go cells (vs 2 of 5
+C, 0 of 5 Python). Go is the noisiest axis in the matrix, so it is the axis that
+needs the most repeats and had exactly one. A single corpus-wide A/A floor would
+have hidden this and made −2.4% look real; `eval_verdict.py` therefore prints a
+per-language floor beside every per-language delta and flags anything under 2×
+as `UNRESOLVED`, rather than reporting a direction.
+
+Practical consequence: we do not publish this drafter as a Go-specialist on this
+evidence. Settling Go needs repeats on the Go cells specifically — n=3 or more —
+not a wider suite.
+
 So be clear about what this branch does and does not offer:
 
 * **Reproducible from this branch with public checkpoints only:** the build
