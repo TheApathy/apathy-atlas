@@ -42,6 +42,7 @@ impl TransformerModel {
     pub(super) fn mtp_accept_feed_inner(
         &self,
         accepted_token: u32,
+        hidden_row: usize,
         seq: &mut SequenceState,
     ) -> Result<()> {
         let proposer = match &self.proposer {
@@ -73,9 +74,10 @@ impl TransformerModel {
         // feed_rows reads tokens[r+1] (r = 0): first element is a placeholder.
         let toks = [0u32, accepted_token];
         let pos = seq.seq_len.saturating_sub(1);
+        let h = self.config.hidden_size;
         proposer.catchup_drafter(
             &toks,
-            self.buffers.hidden_states(),
+            self.buffers.hidden_states().offset(hidden_row * h * 2),
             row_base,
             pos,
             prop_state.as_mut(),

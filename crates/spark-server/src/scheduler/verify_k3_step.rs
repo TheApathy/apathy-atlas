@@ -182,6 +182,12 @@ pub fn step_verify_k3(
         if let Err(e) = model.trim_proposer_state(&mut a.seq, 2, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
+        // Accept-hole fix (see verify_k2_step): sequence advanced 3, drafter
+        // appended 2 — feed the skipped pair (embed(drafts[1]), verify hidden
+        // row 1) before propose.
+        if let Err(e) = model.mtp_accept_feed(drafts[1], 1, &mut a.seq) {
+            tracing::error!("mtp_accept_feed (K3 accept-2): {e:#}");
+        }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         match model.run_mtp_propose_multi(
@@ -228,6 +234,11 @@ pub fn step_verify_k3(
         if let Err(e) = model.save_hidden_for_mtp(1, 0) {
             tracing::error!("save_hidden_for_mtp(1): {e:#}");
             return;
+        }
+        // Accept-hole fix: sequence advanced 2, drafter kept 1 row after the
+        // trim — feed the skipped pair (embed(drafts[0]), verify hidden row 0).
+        if let Err(e) = model.mtp_accept_feed(drafts[0], 0, &mut a.seq) {
+            tracing::error!("mtp_accept_feed (K3 accept-1): {e:#}");
         }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);

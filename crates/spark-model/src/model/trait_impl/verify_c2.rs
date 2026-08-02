@@ -164,7 +164,32 @@ impl TransformerModel {
         // the K=2 path (verify_b.rs). Diagnostic only — default behavior is
         // byte-for-byte unchanged when the env is unset.
         let k4_diag = std::env::var("ATLAS_K4_DIAG").ok().as_deref() == Some("1");
-        let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager && !k4_diag;
+        // Honor `suppress_graphs` + post-calibration auto-unsuppress — same
+        // fix as the K=3 verify (see verify_c.rs): ignoring it started
+        // captures during forced-eager runs and wedged the stream on any
+        // mid-capture layer error.
+        if self
+            .suppress_graphs
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            && std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() != Ok("1")
+        {
+            self.suppress_graphs
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs (K4 verify)");
+        }
+        let use_graphs = self.comm.is_none()
+            && !self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !hss_engaged
+            && !lora_eager
+            && !k4_diag;
+
+        // DeepSeek-V4 hash-MoE token-id routing — see verify_c.rs.
+        let tid_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -175,7 +200,7 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
-            token_ids: None,
+            token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
         };

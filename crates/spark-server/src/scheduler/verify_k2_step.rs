@@ -216,7 +216,7 @@ pub fn step_verify_k2(
         // before propose, or its KV context accumulates a hole per accept.
         // Must run AFTER save_hidden_for_mtp(1) — the feed clobbers the
         // hidden buffer as scratch.
-        if let Err(e) = model.mtp_accept_feed(drafts[0], &mut a.seq) {
+        if let Err(e) = model.mtp_accept_feed(drafts[0], 0, &mut a.seq) {
             tracing::error!("mtp_accept_feed: {e:#}");
         }
         let t_mask = Instant::now();

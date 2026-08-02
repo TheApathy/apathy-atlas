@@ -374,8 +374,13 @@ impl Model for TransformerModel {
         Ok(())
     }
 
-    fn mtp_accept_feed(&self, accepted_token: u32, seq: &mut SequenceState) -> Result<()> {
-        self.mtp_accept_feed_inner(accepted_token, seq)
+    fn mtp_accept_feed(
+        &self,
+        accepted_token: u32,
+        hidden_row: usize,
+        seq: &mut SequenceState,
+    ) -> Result<()> {
+        self.mtp_accept_feed_inner(accepted_token, hidden_row, seq)
     }
 
     fn dflash_eagle_kgamma_append(

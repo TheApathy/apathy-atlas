@@ -167,7 +167,38 @@ impl TransformerModel {
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
         // ATLAS_LORA_EAGER: LoRA graph-vs-eager debugging hatch (see decode_a).
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
-        let use_graphs = self.comm.is_none() && !hss_engaged && !lora_eager;
+        // Honor `suppress_graphs` (FP8-KV calibration warmup / explicit
+        // ATLAS_DEBUG_NO_GRAPH=1), with the same post-calibration
+        // auto-unsuppress as the K=2 verify — with MTP every decode step is a
+        // verify, so nothing else would ever flip it back. Ignoring it here
+        // started captures during forced-eager runs; any layer error mid-
+        // capture then left the stream capturing and wedged the server
+        // (every later sync → CUDA 900).
+        if self
+            .suppress_graphs
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && seq.seq_len > self.config.fp8_kv_calibration_tokens + 10
+            && std::env::var("ATLAS_DEBUG_NO_GRAPH").as_deref() != Ok("1")
+        {
+            self.suppress_graphs
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("FP8 calibration frozen — re-enabling CUDA graphs (K3 verify)");
+        }
+        let use_graphs = self.comm.is_none()
+            && !self
+                .suppress_graphs
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && !hss_engaged
+            && !lora_eager;
+
+        // DeepSeek-V4 hash-MoE routes experts by token id — the verify
+        // forward needs the K verify tokens in the stable `token_ids` device
+        // buffer (uploaded pre-capture; the graph reads the stable address).
+        // Mirrors verify_b.rs; without it every V4 K=3 verify errored out of
+        // the first hash layer.
+        let tid_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -178,7 +209,7 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
-            token_ids: None,
+            token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
         };

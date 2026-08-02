@@ -584,13 +584,21 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
-    /// MTP K=2 accept-hole fix: feed the drafter the pair it skipped on an
-    /// accept — `(embed(accepted_draft), verify hidden row 0)` at the
-    /// accepted draft's position — BEFORE the next propose, so the drafter's
-    /// KV context stays gapless. Call after `save_hidden_for_mtp(1, …)` (the
-    /// feed clobbers the hidden buffer row 0 as scratch). Default no-op for
-    /// proposers without drafter-row support.
-    fn mtp_accept_feed(&self, _accepted_token: u32, _seq: &mut SequenceState) -> Result<()> {
+    /// MTP accept-hole fix: on an accept the sequence advances past the
+    /// newest drafter row, skipping exactly one pair —
+    /// `(embed(drafts[num_accepted-1]), verify hidden row num_accepted-1)`
+    /// at position `seq_len - 1` post-commit. Feed it BEFORE the next
+    /// propose so the drafter's KV context stays gapless (K=2: token =
+    /// accepted draft, row 0; K=3 accept-1: drafts[0], row 0; K=3 accept-2:
+    /// drafts[1], row 1). Call after `save_hidden_for_mtp` — the feed
+    /// clobbers hidden-buffer row 0 as scratch (higher rows are safe).
+    /// Default no-op for proposers without drafter-row support.
+    fn mtp_accept_feed(
+        &self,
+        _accepted_token: u32,
+        _hidden_row: usize,
+        _seq: &mut SequenceState,
+    ) -> Result<()> {
         Ok(())
     }
 
