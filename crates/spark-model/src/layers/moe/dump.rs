@@ -271,3 +271,124 @@ pub fn dump_moe_out(
     tracing::info!("ATLAS_MOE_OUT last_tok: |x|={:.4} first5={:?}", mag, first5);
     Ok(())
 }
+
+/// ATLAS_MOE_OVERLAP=1 — measure expert-set overlap across the rows of a
+/// speculative-verify step.
+///
+/// The m-row verify MoE dispatches the SINGLE-token kernel m times (see
+/// `multi_seq/mod.rs`: "MLA models always take this path"), so it reads
+/// `m * top_k` expert weight tensors. A dedup/batched kernel would read only
+/// `|union|`. The speedup ceiling of ever building that kernel is therefore
+/// exactly `m*top_k / |union|` — 1.0x means fully disjoint routing and no win
+/// at all, m.0x means all rows share every expert. `forward_k2.rs` asserted
+/// "mostly disjoint" from first principles; this measures it, split by routing
+/// kind: DeepSeek-V4 hash layers pick experts as a static function of the
+/// token id (`tid2eid[token_id]`, so overlap is luck of the draw) while the
+/// learned-gate layers route on the hidden state, where temporal locality
+/// between consecutive tokens could plausibly create real overlap.
+use std::sync::Mutex;
+use std::sync::OnceLock;
+
+struct RouteAcc {
+    rows: Vec<u32>,
+    expect: usize,
+    hash: (u64, u64, u64),
+    gate: (u64, u64, u64),
+}
+
+fn route_acc() -> &'static Mutex<RouteAcc> {
+    static ACC: OnceLock<Mutex<RouteAcc>> = OnceLock::new();
+    ACC.get_or_init(|| {
+        Mutex::new(RouteAcc {
+            rows: Vec::new(),
+            expect: 0,
+            hash: (0, 0, 0),
+            gate: (0, 0, 0),
+        })
+    })
+}
+
+#[inline]
+pub fn overlap_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1"))
+}
+
+/// Open a row group of `n` rows (one speculative-verify MoE fire).
+pub fn route_group_begin(n: usize) {
+    if !overlap_enabled() || n < 2 {
+        return;
+    }
+    if let Ok(mut a) = route_acc().lock() {
+        a.rows.clear();
+        a.expect = n;
+    }
+}
+
+/// Record one row's `top_k` expert ids; reports when the group is full.
+pub fn route_group_row(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    indices: DevicePtr,
+    top_k: u32,
+    is_hash_routed: bool,
+) -> Result<()> {
+    if !overlap_enabled() {
+        return Ok(());
+    }
+    let mut a = route_acc()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("route overlap mutex poisoned"))?;
+    if a.expect < 2 {
+        return Ok(());
+    }
+
+    gpu.synchronize(stream)?;
+    let mut buf = vec![0u8; top_k as usize * 4];
+    let _ = gpu.copy_d2h(indices, &mut buf);
+    for c in buf.chunks_exact(4) {
+        a.rows.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    }
+
+    if a.rows.len() < a.expect * top_k as usize {
+        return Ok(());
+    }
+
+    let slots = a.rows.len() as u64;
+    let mut uniq = std::mem::take(&mut a.rows);
+    uniq.sort_unstable();
+    uniq.dedup();
+    let union = uniq.len() as u64;
+    let n = a.expect;
+
+    let bucket = if is_hash_routed {
+        &mut a.hash
+    } else {
+        &mut a.gate
+    };
+    bucket.0 += 1;
+    bucket.1 += slots;
+    bucket.2 += union;
+
+    let (h, g) = (a.hash, a.gate);
+    if (h.0 + g.0) % 512 == 0 {
+        let ratio = |b: (u64, u64, u64)| {
+            if b.2 == 0 {
+                0.0
+            } else {
+                b.1 as f64 / b.2 as f64
+            }
+        };
+        tracing::info!(
+            "MOE_OVERLAP m={n} top_k={top_k}: hash fires={} amortization={:.3}x | \
+             gate fires={} amortization={:.3}x  (1.000x = fully disjoint / no win, \
+             {:.3}x = every row shares every expert)",
+            h.0,
+            ratio(h),
+            g.0,
+            ratio(g),
+            n as f64,
+        );
+    }
+    Ok(())
+}

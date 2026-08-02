@@ -297,6 +297,30 @@ impl Qwen3AttentionLayer {
         let ql_batch = v_batch.offset(row(kv_dim)); //             [n, q_lora]
         let ol_batch = ql_batch.offset(row(q_lora)); //            [n, latent_dim]
 
+        // ATLAS_PROFILE_VERIFY: A/B/C split of the batched attention. Phase A
+        // and C are batched GEMVs (weights read ONCE for all n rows, so they
+        // should barely grow with n); phase B is the per-row rope/cache/paged
+        // attention loop (grows linearly with n by construction). Which of the
+        // three dominates decides whether more batching is worth anything.
+        let phase_prof = c.fwd.profile && !c.fwd.graph_capture;
+        let mark = |label: &str, t: &mut std::time::Instant| -> Result<()> {
+            if phase_prof {
+                gpu.synchronize(stream)?;
+                tracing::info!(
+                    "MLAPROF L{} {label}={}µs",
+                    self.attn_layer_idx,
+                    t.elapsed().as_micros()
+                );
+                *t = std::time::Instant::now();
+            }
+            Ok(())
+        };
+        let mut t_phase = std::time::Instant::now();
+        if phase_prof {
+            gpu.synchronize(stream)?;
+            t_phase = std::time::Instant::now();
+        }
+
         // ── Phase A: batched Q + KV projections (weights read once) ──
         let wqa = mla.wq_a_fp8.as_ref().unwrap();
         ops::w8a16_gemv_batch4(
@@ -395,6 +419,8 @@ impl Qwen3AttentionLayer {
         // K=V for V4-Flash direct KV projection — all n rows in one copy.
         gpu.copy_d2d_async(kv_batch, v_batch, row(kv_dim), stream)?;
 
+        mark("A_proj", &mut t_phase)?;
+
         // ── Phase B: per-row rope / cache write / paged attention ──
         for i in 0..n {
             let meta_i = Self::meta_row(meta, i);
@@ -421,6 +447,8 @@ impl Qwen3AttentionLayer {
             };
             self.attention_forward_v4(kv_cache, &ctx_i, &args)?;
         }
+
+        mark("B_attn", &mut t_phase)?;
 
         // ── Phase C: batched O projection ──
         // wo_a is block-diagonal: group g reads attn cols [g*group_in ..) with
@@ -497,6 +525,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        mark("C_oproj", &mut t_phase)?;
         Ok(o_out)
     }
 

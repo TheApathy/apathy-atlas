@@ -226,6 +226,20 @@ impl MoeLayer {
             })?;
         }
 
+        // ATLAS_MOE_OVERLAP=1 (no-op otherwise). This — not forward_batched —
+        // is the routine the m-row speculative verify actually calls, once per
+        // row (`multi_seq/mod.rs`: "MLA models always take this path"), so it
+        // is where the per-row expert sets have to be sampled. See moe/dump.rs.
+        if !ctx.graph_capture {
+            super::dump::route_group_row(
+                ctx.gpu,
+                stream,
+                indices_dev,
+                top_k,
+                self.tid2eid_dev.is_some(),
+            )?;
+        }
+
         if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
             ctx.gpu.synchronize(stream)?;
             // Read expert indices (u32[top_k]) and weights (f32[top_k])

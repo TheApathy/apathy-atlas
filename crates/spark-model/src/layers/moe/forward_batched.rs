@@ -203,6 +203,14 @@ impl MoeLayer {
             if t == num_tokens - 1 {
                 super::dump::dump_expert_ids(ctx.gpu, stream, indices_dev, weights_dev, 1, top_k)?;
             }
+            // ATLAS_MOE_OVERLAP=1 (no-op otherwise): see moe/dump.rs.
+            super::dump::route_group_row(
+                ctx.gpu,
+                stream,
+                indices_dev,
+                top_k,
+                self.tid2eid_dev.is_some(),
+            )?;
 
             let shared_out = ctx.buffers.attn_output();
             if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
