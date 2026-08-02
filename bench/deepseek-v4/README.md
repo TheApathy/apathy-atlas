@@ -70,6 +70,25 @@ python3 bench/deepseek-v4/quality_probe.py --port 8899
 | `smoke.sh` | first-token "Paris" sanity check (mirrors ds4-on-spark) |
 | `quality_probe.py` | coherence gate + GSM8K-style accuracy vs the ds4 reference gate |
 
+## mtp-bench suite (2026-08-02, wall tok/s, 512 tok, methodology of the
+## Entrpi/ds4 published table — run `mtp_bench.py`)
+
+| workload | Atlas plain | Atlas spec | ref plain (2-bit) | ref DSpark |
+|---|---|---|---|---|
+| stepwise_math | 18.6 | 18.6 | 20.1 | 34.5 |
+| code_cpp | 19.5 | 19.1 | 20.4 | 30.0 |
+| code_python | 19.7 | 19.4 | 20.5 | 26.4 |
+| explain_concept | 19.8 | 19.4 | 20.5 | 25.2 |
+| creative_short | 19.8 | 19.1 | 20.6 | 19.9 |
+| **suite mean** | **17.7** | **17.4** | 20.1 | 27.7 |
+
+Server-side decode (excl. prefill/HTTP): plain **21.0**, speculative **20.0**
+tok/s. Wall numbers carry our ~680ms TTFT (reference: 340ms) — at 512 tokens
+that costs ~2 wall tok/s; prefill/TTFT is an unmined lever. The reference's
+DSpark column rides a separately-trained 3-layer drafter with 5-token blocks
+(tok/step up to 4.0) — not reproducible with the checkpoint's 1-step MTP
+module; our K=2 ceiling is 2.0 tok/step at 55-80% accept.
+
 ## Measured (2026-08-01, single GB10, graphs on)
 
 | config | decode tok/s | TTFT | quality |
