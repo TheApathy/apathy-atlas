@@ -470,12 +470,56 @@ pub fn assemble_layer(
     let wo_a_fp8 = load_fp8_mla("wo_a");
     let wkv_a_fp8 = load_fp8_mla("wkv");
 
+    // ATLAS_V4_ATTN_NVFP4=1: runtime-transcode the three FAT MLA projections
+    // (wq_b / wo_a / wo_b — ~117 of the ~124 MB/layer attention weight read)
+    // from the checkpoint FP8 to NVFP4, halving their decode traffic again
+    // (~2.3 GB/token across 43 layers). LOSSY on top of the FP8 checkpoint —
+    // strictly quality-gate with the longgen baseline + GSM8K probe before
+    // adopting. Dims come from the ACTUAL tensor shapes (an earlier attempt
+    // hardcoded wrong dims and crashed — see load_layers.rs). The FP8 mirrors
+    // stay resident: the batched multi-seq verify still reads FP8; only the
+    // single-token decode arms prefer NVFP4.
+    let attn_nvfp4_on = std::env::var("ATLAS_V4_ATTN_NVFP4").ok().as_deref() == Some("1");
+    let nvfp4_of = |suffix: &str, bf16: &DenseWeight| -> Option<QuantizedWeight> {
+        if !attn_nvfp4_on || bf16.weight.is_null() {
+            return None;
+        }
+        let shape = store.get(&format!("{lp}.attn.{suffix}.weight")).ok()?.shape.clone();
+        if shape.len() != 2 {
+            return None;
+        }
+        let (n_rows, k_cols) = (shape[0], shape[1]);
+        match crate::weight_map::quantize_to_nvfp4(
+            bf16,
+            n_rows,
+            k_cols,
+            gpu,
+            qctx.absmax_k,
+            qctx.quantize_k,
+            qctx.stream,
+        ) {
+            Ok(q) => {
+                tracing::info!(
+                    "{lp}.attn.{suffix}: NVFP4 transcode [{n_rows}, {k_cols}] (ATLAS_V4_ATTN_NVFP4=1)"
+                );
+                Some(q)
+            }
+            Err(e) => {
+                tracing::warn!("{lp}.attn.{suffix}: NVFP4 transcode failed ({e:#}); keeping FP8");
+                None
+            }
+        }
+    };
+    let wq_b_nvfp4_v4 = nvfp4_of("wq_b", &wq_b);
+    let wo_a_nvfp4_v4 = nvfp4_of("wo_a", &wo_a);
+    let wo_b_nvfp4_v4 = nvfp4_of("wo_b", &o_dense);
+
     let mla = MlaWeights {
         wq_a,
         wq_a_nvfp4,
         wq_a_fp8,
         wq_b,
-        wq_b_nvfp4,
+        wq_b_nvfp4: wq_b_nvfp4_v4.or(wq_b_nvfp4),
         wq_b_fp8,
         q_a_norm,
         wkv_a,
@@ -490,10 +534,10 @@ pub fn assemble_layer(
         wo: o_dense,
         wo_nvfp4: o_nvfp4,
         wo_a,
-        wo_a_nvfp4: None,
+        wo_a_nvfp4: wo_a_nvfp4_v4,
         wo_a_fp8,
         wo_b: o_dense,
-        wo_b_nvfp4: None,
+        wo_b_nvfp4: wo_b_nvfp4_v4,
         wo_b_fp8,
         w_uk_t,
         w_uv,

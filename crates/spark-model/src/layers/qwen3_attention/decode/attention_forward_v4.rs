@@ -748,7 +748,38 @@ impl Qwen3AttentionLayer {
             for g in 0..o_groups {
                 let in_g = attn_out.offset((g * group_in) as usize * 2);
                 let out_g = o_latent.offset((g * o_lora) as usize * 2);
-                if let Some(ref woa_fp8) = mla.wo_a_fp8 {
+                if let Some(ref woa4) = mla.wo_a_nvfp4 {
+                    // NVFP4 per group: packed rows [g*o_lora ..) at 0.5 B/elem,
+                    // block scales [N, K/16] row-major (1 B/scale), shared
+                    // per-tensor scale2 (quantized as ONE tensor).
+                    let sub = crate::weight_map::QuantizedWeight {
+                        weight: woa4
+                            .weight
+                            .offset((g as usize) * (o_lora as usize) * (group_in as usize) / 2),
+                        weight_scale: woa4
+                            .weight_scale
+                            .offset((g as usize) * (o_lora as usize) * (group_in as usize / 16)),
+                        weight_scale_2: woa4.weight_scale_2,
+                        input_scale: woa4.input_scale,
+                        weight_scale_2_vec: if woa4.weight_scale_2_vec.is_null() {
+                            woa4.weight_scale_2_vec
+                        } else {
+                            woa4
+                                .weight_scale_2_vec
+                                .offset((g as usize) * (o_lora as usize) * 4)
+                        },
+                    };
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv_k,
+                        in_g,
+                        &sub,
+                        out_g,
+                        o_lora,
+                        group_in,
+                        stream,
+                    )?;
+                } else if let Some(ref woa_fp8) = mla.wo_a_fp8 {
                     // Native block-scaled FP8 per group (block-diagonal):
                     // weight rows [g*o_lora:(g+1)*o_lora] (fp8, 1 byte/elem) and the
                     // matching [o_lora/128, group_in/128] block-scale sub-tile.
@@ -788,7 +819,18 @@ impl Qwen3AttentionLayer {
             Ok::<(), anyhow::Error>(())
         })?;
         prof!("wo_b", {
-            if let Some(ref wob_fp8) = mla.wo_b_fp8 {
+            if let Some(ref wob4) = mla.wo_b_nvfp4 {
+                ops::w4a16_gemv(
+                    ctx.gpu,
+                    self.w4a16_gemv_k,
+                    o_latent,
+                    wob4,
+                    o_out,
+                    h,
+                    latent_dim,
+                    stream,
+                )
+            } else if let Some(ref wob_fp8) = mla.wo_b_fp8 {
                 ops::w8a16_gemv(
                     ctx.gpu,
                     self.w8a16_gemv_k,
