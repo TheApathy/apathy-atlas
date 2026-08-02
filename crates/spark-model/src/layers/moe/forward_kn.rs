@@ -97,7 +97,13 @@ impl MoeLayer {
             }
         }
         if !can_fast {
-            self.forward_batched(input, num_tokens, ctx, stream)?;
+            // Unified `_t` layout (DeepSeek-V4): the dedup'd multi-row split-K
+            // kernels read each routed expert's bytes ONCE for every verify row
+            // that selected it, instead of once per row. Falls through to the
+            // per-token loop when the width or the layer isn't eligible.
+            if !self.forward_km(input, num_tokens, ctx, stream)? {
+                self.forward_batched(input, num_tokens, ctx, stream)?;
+            }
             return Ok(false); // residual NOT folded — caller adds it
         }
 

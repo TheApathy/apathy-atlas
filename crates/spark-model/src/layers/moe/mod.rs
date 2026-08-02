@@ -13,6 +13,15 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
 
+/// Widest speculative verify the dedup'd multi-row `_t` MoE covers in one
+/// launch — the DSpark block (5 proposed rows + the committed one).
+///
+/// This is the MROW of the widest compiled `_m` entry point AND the row count
+/// `spark_runtime::buffers::MOE_DECODE_MAX_ROWS` sizes the split-K partial
+/// buffer for; the two must move together or the dispatch's `space_ok` check
+/// silently drops every verify back to the per-row loop.
+pub(crate) const MOE_VERIFY_MAX_ROWS: u32 = spark_runtime::buffers::MOE_DECODE_MAX_ROWS as u32;
+
 /// Device-side pointer table for one projection across all experts.
 ///
 /// Enables GPU-side expert dispatch: the batched GEMV kernel reads
@@ -278,14 +287,21 @@ pub struct MoeLayer {
     // Multi-row split-K decode (`_m`): the same v2s4 body, but each block
     // dedups the slots routed to its expert and carries an accumulator per
     // gathered row, so the weight bytes are read once for up to MROW rows.
-    // MROW=2 backs the MTP K=2 verify; MROW=1 exists so the microtest can
-    // prove the dedup rewrite is bit-identical to the shipping single-row
-    // path before the wider variant is trusted. KernelHandle(0) where not
-    // compiled — the dispatch falls back to per-row `_splitk_k` launches.
+    // MROW=2 backs the MTP K=2 verify, MROW=6 the DSpark block verify (5
+    // proposed rows + the committed one, and every narrower γ in between —
+    // an MROW=R kernel is correct for any num_tokens <= R). MROW=1 exists so
+    // the microtest can prove the dedup rewrite is bit-identical to the
+    // shipping single-row path before the wider variants are trusted.
+    // KernelHandle(0) where not compiled — the dispatch falls back to per-row
+    // `_splitk_k` launches.
     moe_expert_gate_up_shared_t_m2_k: KernelHandle,
     moe_expert_silu_down_shared_t_m2_k: KernelHandle,
     moe_expert_gate_up_shared_t_e8m0_m2_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_m2_k: KernelHandle,
+    moe_expert_gate_up_shared_t_m6_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m6_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m6_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m6_k: KernelHandle,
     moe_gate_up_partial_finalize_m_k: KernelHandle,
     moe_down_partial_finalize_m_k: KernelHandle,
     // ── sqrtsoftplus routing (DeepSeek-V4) ──
@@ -594,33 +610,59 @@ impl MoeLayer {
     // batchn kernels, so the `_t` pair (and its new `_e8m0` twin) has no call
     // site to select for. Add the accessor when the wide verify moves to `_t`.
 
-    /// Kernel pair for the MROW=2 dedup'd split-K `_t` decode, picked to match
-    /// the routed-expert scale format — same both-or-neither contract as
-    /// [`Self::batch2_t_handles`], and the same reason: a half-resolved pair
-    /// would run one stage multi-row and the other per-row against buffers
-    /// whose partial layouts disagree.
+    /// Kernel pair for the dedup'd split-K `_t` decode at the narrowest
+    /// compiled MROW that covers `num_tokens`, picked to match the
+    /// routed-expert scale format.
+    ///
+    /// Same both-or-neither contract as [`Self::batch2_t_handles`], and the
+    /// same reason: a half-resolved pair would run one stage multi-row and the
+    /// other per-row against buffers whose partial layouts disagree.
+    ///
+    /// Returns the compiled MROW alongside the handles — the down kernel sizes
+    /// its dynamic shared memory by it, so the caller must pass the entry
+    /// point's MROW and not `num_tokens`.
     #[inline]
-    pub(crate) fn splitk_m2_t_handles(
+    pub(crate) fn splitk_m_t_handles(
         &self,
-    ) -> (
+        num_tokens: u32,
+    ) -> Option<(
         spark_runtime::gpu::KernelHandle,
         spark_runtime::gpu::KernelHandle,
-    ) {
-        let gate_up = self.e8m0_or_opt(
-            self.moe_expert_gate_up_shared_t_m2_k,
-            self.moe_expert_gate_up_shared_t_e8m0_m2_k,
-        );
-        let silu_down = self.e8m0_or_opt(
-            self.moe_expert_silu_down_shared_t_m2_k,
-            self.moe_expert_silu_down_shared_t_e8m0_m2_k,
-        );
-        match (gate_up, silu_down) {
-            (Some(g), Some(s)) => (g, s),
-            _ => (
-                spark_runtime::gpu::KernelHandle(0),
-                spark_runtime::gpu::KernelHandle(0),
+        u32,
+    )> {
+        // Narrowest first: a wider entry point is correct but carries the
+        // ladder's extra arms and a wider `slots`/`s_idx`, so K=2 should keep
+        // landing on m2.
+        let candidates: &[(u32, KernelHandle, KernelHandle, KernelHandle, KernelHandle)] = &[
+            (
+                2,
+                self.moe_expert_gate_up_shared_t_m2_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m2_k,
+                self.moe_expert_silu_down_shared_t_m2_k,
+                self.moe_expert_silu_down_shared_t_e8m0_m2_k,
             ),
+            (
+                MOE_VERIFY_MAX_ROWS,
+                self.moe_expert_gate_up_shared_t_m6_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m6_k,
+                self.moe_expert_silu_down_shared_t_m6_k,
+                self.moe_expert_silu_down_shared_t_e8m0_m6_k,
+            ),
+        ];
+        for &(mrow, gu, gu_e8m0, sd, sd_e8m0) in candidates {
+            if num_tokens > mrow {
+                continue;
+            }
+            let gate_up = self.e8m0_or_opt(gu, gu_e8m0);
+            let silu_down = self.e8m0_or_opt(sd, sd_e8m0);
+            if let (Some(g), Some(s)) = (gate_up, silu_down)
+                && g.0 != 0
+                && s.0 != 0
+            {
+                return Some((g, s, mrow));
+            }
         }
+        None
     }
 
     /// True when the routed experts are W3 Lloyd-Max (3-bit) — every
@@ -663,6 +705,7 @@ mod forward_batched;
 mod forward_ep;
 mod forward_k2;
 mod forward_k3;
+mod forward_km;
 mod forward_kn;
 mod forward_phase;
 mod forward_prefill;

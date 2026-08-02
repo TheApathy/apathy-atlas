@@ -416,6 +416,29 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0_m2v2s4",
             ),
+            // MROW=6 — the DSpark block verify, and every narrower γ that the
+            // m2 pair can't cover. `m6` must stay in step with
+            // `MOE_VERIFY_MAX_ROWS`.
+            moe_expert_gate_up_shared_t_m6_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m6v2s4",
+            ),
+            moe_expert_silu_down_shared_t_m6_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m6v2s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m6_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m6v2s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m6_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m6v2s4",
+            ),
             moe_gate_up_partial_finalize_m_k: super::super::try_kernel(
                 gpu,
                 "moe_shared_expert_fused_t",

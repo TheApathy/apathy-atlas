@@ -380,7 +380,7 @@ impl MoeLayer {
             // the pre-4a43f2d0 shape (byte-per-thread loads, no split-K, no
             // dedup, ~125 GB/s), which measured 17.0 vs 19.8 tok/s server-side
             // — its 1.33x amortization cannot cover a ~2x per-byte deficit.
-            if self.dispatch_splitk_m2_t(
+            if self.dispatch_splitk_m_t(
                 ctx,
                 input,
                 expert_gate_out,
@@ -399,6 +399,7 @@ impl MoeLayer {
                 h,
                 inter,
                 top_k,
+                2,
                 stream,
             )? {
                 // Fall through to the shared-expert fixup + blend below.

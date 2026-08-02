@@ -11,11 +11,14 @@ use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 pub const MOE_DECODE_MAX_SPLIT: usize = 4;
 
 /// Largest row count the unified-`_t` MoE decode dispatch may launch at once —
-/// 1 for plain decode, 2 for the MTP K=2 speculative verify, which runs both
-/// candidate rows through one dedup'd launch. Sizing SSOT alongside
-/// `MOE_DECODE_MAX_SPLIT`: the partial buffer holds `rows * (top_k + 1)` f32
-/// accumulator rows, so it scales linearly in this.
-pub const MOE_DECODE_MAX_ROWS: usize = 2;
+/// 1 for plain decode, 2 for the MTP K=2 speculative verify, 6 for the DSpark
+/// block verify (a 5-token proposed block plus the committed row), each of
+/// which runs every candidate row through one dedup'd launch. Sizing SSOT
+/// alongside `MOE_DECODE_MAX_SPLIT`: the partial buffer holds
+/// `rows * (top_k + 1)` f32 accumulator rows, so it scales linearly in this —
+/// 1.8 MB at 2 rows, 5.5 MB at 6, against ~94 MB of expert weights streamed
+/// per layer.
+pub const MOE_DECODE_MAX_ROWS: usize = 6;
 
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
@@ -256,10 +259,10 @@ impl BufferSizes {
         let splitk_workspace = 48 * (hd + 2) * 4;
 
         // MoE decode split-K partials — see the field doc. Decode carries at
-        // most `MOE_DECODE_MAX_ROWS` rows (1 plain, 2 for the MTP K=2 verify),
-        // so this scales linearly in that and not in the prefill M: ~1.8 MB for
-        // DeepSeek-V4-Flash (S=4, R=2, top_k=6, inter=2048, hidden=4096)
-        // against ~94 MB of expert weights streamed per layer.
+        // most `MOE_DECODE_MAX_ROWS` rows, so this scales linearly in that and
+        // not in the prefill M: ~5.5 MB for DeepSeek-V4-Flash (S=4, R=6,
+        // top_k=6, inter=2048, hidden=4096) against ~94 MB of expert weights
+        // streamed per layer.
         let moe_splitk_partials = if config.moe_intermediate_size > 0 {
             MOE_DECODE_MAX_SPLIT
                 * MOE_DECODE_MAX_ROWS

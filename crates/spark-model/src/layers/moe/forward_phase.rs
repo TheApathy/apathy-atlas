@@ -81,7 +81,7 @@ impl MoeLayer {
         inter: u32,
         top_k: u32,
         num_tokens: u32,
-    ) -> Option<u32> {
+    ) -> Option<(u32, KernelHandle, KernelHandle, u32)> {
         if std::env::var("ATLAS_MOE_SPLITK").as_deref() == Ok("0") {
             return None;
         }
@@ -95,22 +95,24 @@ impl MoeLayer {
         let vec = ops::T_SPLIT_VEC;
         let widths_ok = inter % (ops::T_BLOCK * vec) == 0 && h % (ops::T_BLOCK * vec) == 0;
         let depths_ok = h % (32 * split) == 0 && inter % (32 * split) == 0;
-        // MROW is baked into the entry point. Only the MROW=2 pair is compiled,
-        // and a kernel whose MROW is below `num_tokens` would silently drop the
-        // rows past it — hence `==`, not `<=`.
-        let rows_ok = num_tokens == 2;
-        let (gate_up, silu_down) = self.splitk_m2_t_handles();
-        let handles_ok = gate_up.0 != 0
-            && silu_down.0 != 0
-            && self.moe_gate_up_partial_finalize_m_k.0 != 0
-            && self.moe_down_partial_finalize_m_k.0 != 0;
-        let need = ops::moe_splitk_m_partial_bytes(split, inter, h, top_k, num_tokens);
-        let space_ok = ctx.buffers.moe_splitk_partials_bytes() >= need;
-        if widths_ok && depths_ok && rows_ok && handles_ok && space_ok {
-            Some(split)
-        } else {
-            None
+        if !(widths_ok && depths_ok) || num_tokens < 2 {
+            return None;
         }
+        // MROW is baked into the entry point, and a kernel whose MROW is below
+        // `num_tokens` would silently drop the rows past it. `splitk_m_t_handles`
+        // returns the narrowest compiled entry that covers this row count, or
+        // `None` when nothing does.
+        let (gate_up, silu_down, mrow) = self.splitk_m_t_handles(num_tokens)?;
+        if self.moe_gate_up_partial_finalize_m_k.0 == 0
+            || self.moe_down_partial_finalize_m_k.0 == 0
+        {
+            return None;
+        }
+        let need = ops::moe_splitk_m_partial_bytes(split, inter, h, top_k, num_tokens);
+        if ctx.buffers.moe_splitk_partials_bytes() < need {
+            return None;
+        }
+        Some((split, gate_up, silu_down, mrow))
     }
 
     /// True when a 2-row verify would take the MROW=2 dedup'd split-K `_t`
@@ -121,16 +123,23 @@ impl MoeLayer {
     /// 19.8 tok/s against the per-row loop, so "batch when we can" is only the
     /// right default while the fast path is the one that fires.
     pub fn k2_verify_ffn_is_batched(&self, ctx: &ForwardContext) -> bool {
+        self.verify_ffn_is_batched(ctx, 2)
+    }
+
+    /// [`Self::k2_verify_ffn_is_batched`] for an arbitrary verify width.
+    pub fn verify_ffn_is_batched(&self, ctx: &ForwardContext, num_tokens: u32) -> bool {
         if !self.use_t_layout_for_decode() {
             return false;
         }
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;
-        self.unified_t_split_k_m(ctx, h, inter, top_k, 2).is_some()
+        self.unified_t_split_k_m(ctx, h, inter, top_k, num_tokens)
+            .is_some()
     }
 
-    /// Run the K=2 verify MoE through the MROW=2 dedup'd split-K `_t` kernels.
+    /// Run a `num_tokens`-row verify MoE through the dedup'd split-K `_t`
+    /// kernels.
     ///
     /// Returns `Ok(false)` without touching any buffer when the path is not
     /// eligible, so the caller can fall back. On `Ok(true)` the outputs are in
@@ -139,7 +148,7 @@ impl MoeLayer {
     /// per token in the shared scratch buffers — so the blend downstream is
     /// unchanged.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn dispatch_splitk_m2_t(
+    pub(super) fn dispatch_splitk_m_t(
         &self,
         ctx: &ForwardContext,
         input: DevicePtr,
@@ -159,10 +168,12 @@ impl MoeLayer {
         h: u32,
         inter: u32,
         top_k: u32,
+        num_tokens: u32,
         stream: u64,
     ) -> Result<bool> {
-        const NUM_TOKENS: u32 = 2;
-        let Some(split) = self.unified_t_split_k_m(ctx, h, inter, top_k, NUM_TOKENS) else {
+        let Some((split, gate_up_k, silu_down_k, mrow)) =
+            self.unified_t_split_k_m(ctx, h, inter, top_k, num_tokens)
+        else {
             return Ok(false);
         };
         // Same RIDER A1 precondition as the single-row unified_t path: the
@@ -171,13 +182,12 @@ impl MoeLayer {
         if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
             self.shared_experts_scale_kind.expect(
                 crate::weight_map::WeightQuantFormat::Nvfp4,
-                "K=2 verify fused _e8m0 kernel assumes an NVFP4 shared expert",
+                "multi-row verify fused _e8m0 kernel assumes an NVFP4 shared expert",
             );
         }
-        let (gate_up_k, silu_down_k) = self.splitk_m2_t_handles();
         let partials = ctx.buffers.moe_splitk_partials();
         let down_partials = partials.offset(ops::moe_splitk_m_down_offset(
-            split, inter, top_k, NUM_TOKENS,
+            split, inter, top_k, num_tokens,
         ));
         ops::moe_expert_gate_up_shared_t_splitk_m(
             ctx.gpu,
@@ -202,7 +212,7 @@ impl MoeLayer {
             inter,
             h,
             top_k,
-            NUM_TOKENS,
+            num_tokens,
             stream,
         )?;
         ops::moe_expert_silu_down_shared_t_splitk_m(
@@ -225,9 +235,9 @@ impl MoeLayer {
             h,
             inter,
             top_k,
-            NUM_TOKENS,
+            num_tokens,
             // MROW of the compiled entry point, which sets the s_act stride.
-            2,
+            mrow,
             stream,
         )?;
         Ok(true)

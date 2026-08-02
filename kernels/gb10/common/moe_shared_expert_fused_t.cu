@@ -1127,13 +1127,26 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
             } \
         } \
         _Pragma("unroll") \
-        for (int m = 0; m < (ROWS_); ++m) emit(m, acc[m]); \
+        for (int m = 0; m < (ROWS_); ++m) if (m < (int)M) emit(m, acc[m]); \
     } while(0)
     // Two-level dispatch: scale format (compile-time except in the mixed case)
-    // then row count. GATEUP_M_ROWS expands one arm per possible M.
+    // then row count.
+    //
+    // The arms are a LADDER, not one per M. Past MROW=2 that would be a body
+    // per row count, and the bodies are large; instead an M that falls between
+    // rungs runs the next rung up, with the surplus rows pointed at A row 0
+    // (slots[] is zero-filled past M) and dropped by the `m < M` guard at
+    // emit. The surplus costs FMAs, which this GEMV — memory-bound on the
+    // weight bytes it just hoisted out of the row loop — has to spare. What it
+    // must NOT do is over-provision the M==1 arm: that is the common case
+    // under duplicate-heavy real routing, and carrying MROW accumulators live
+    // through the whole k sweep there is what pushed occupancy down.
+    #define MROW_ARM(N_) (MROW < (N_) ? MROW : (N_))
     #define GATEUP_M_ROWS(GS_, E8M0_) do { \
-        if (MROW == 1 || M == 1) { GATEUP_M_ACCUM(GS_, E8M0_, 1); } \
-        else                     { GATEUP_M_ACCUM(GS_, E8M0_, (MROW < 2 ? 1 : 2)); } \
+        if (MROW == 1 || M == 1)      { GATEUP_M_ACCUM(GS_, E8M0_, 1); } \
+        else if (MROW <= 2 || M <= 2) { GATEUP_M_ACCUM(GS_, E8M0_, MROW_ARM(2)); } \
+        else if (MROW <= 4 || M <= 4) { GATEUP_M_ACCUM(GS_, E8M0_, MROW_ARM(4)); } \
+        else                          { GATEUP_M_ACCUM(GS_, E8M0_, MROW); } \
     } while(0)
     if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
         GATEUP_M_ROWS(GS_R, E8M0_R);
@@ -1142,6 +1155,7 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
         else           { GATEUP_M_ROWS(GS_R, E8M0_R); }
     }
     #undef GATEUP_M_ROWS
+    #undef MROW_ARM
     #undef GATEUP_M_ACCUM
 }
 
@@ -1238,6 +1252,16 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
 
     if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
 
+    // One activation slice per accumulator row. Only slices [0, M) were
+    // staged above, so the ladder's surplus rows (see GATEUP_M_ROWS) alias
+    // slice 0 rather than reading smem nobody wrote — their result is
+    // discarded at emit either way, but aliasing keeps the arithmetic defined.
+    const float* act_row[MROW];
+    #pragma unroll
+    for (int m = 0; m < MROW; ++m) {
+        act_row[m] = s_act_m + (unsigned long long)((m < (int)M) ? m : 0) * k_len;
+    }
+
     const unsigned int K_half = K / 2;
     // Accumulator and emit both live INSIDE the macro so they are sized by the
     // literal ROWS_ — see the gate_up twin for why (unrolling, and keeping the
@@ -1271,7 +1295,7 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
                 } \
                 _Pragma("unroll") \
                 for (int m = 0; m < (ROWS_); ++m) { \
-                    const float* act = s_act_m + (unsigned long long)m * k_len; \
+                    const float* act = act_row[m]; \
                     float a_lo = act[k_half * 2 - k_lo]; \
                     float a_hi = act[k_half * 2 + 1 - k_lo]; \
                     _Pragma("unroll") \
@@ -1283,13 +1307,15 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
             if (kh_base + ((GS_) / 2) > K_half) break; \
         } \
         _Pragma("unroll") \
-        for (int m = 0; m < (ROWS_); ++m) emit(m, acc[m]); \
+        for (int m = 0; m < (ROWS_); ++m) if (m < (int)M) emit(m, acc[m]); \
     } while(0)
-    // See the gate_up twin: ROWS_ must be a literal, so dispatch on the
-    // block-uniform M once instead of branching per k iteration.
+    // See the gate_up twin for the ladder and why M==1 keeps its own arm.
+    #define MROW_ARM(N_) (MROW < (N_) ? MROW : (N_))
     #define SILUDOWN_M_ROWS(GS_, E8M0_) do { \
-        if (MROW == 1 || M == 1) { SILUDOWN_M_ACCUM(GS_, E8M0_, 1); } \
-        else                     { SILUDOWN_M_ACCUM(GS_, E8M0_, (MROW < 2 ? 1 : 2)); } \
+        if (MROW == 1 || M == 1)      { SILUDOWN_M_ACCUM(GS_, E8M0_, 1); } \
+        else if (MROW <= 2 || M <= 2) { SILUDOWN_M_ACCUM(GS_, E8M0_, MROW_ARM(2)); } \
+        else if (MROW <= 4 || M <= 4) { SILUDOWN_M_ACCUM(GS_, E8M0_, MROW_ARM(4)); } \
+        else                          { SILUDOWN_M_ACCUM(GS_, E8M0_, MROW); } \
     } while(0)
     if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
         SILUDOWN_M_ROWS(GS_R, E8M0_R);
@@ -1298,6 +1324,7 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
         else           { SILUDOWN_M_ROWS(GS_R, E8M0_R); }
     }
     #undef SILUDOWN_M_ROWS
+    #undef MROW_ARM
     #undef SILUDOWN_M_ACCUM
 }
 
@@ -1363,15 +1390,25 @@ extern "C" __global__ void NAME(                                               \
 
 // MROW=2: the MTP K=2 verify. MROW=1 exists only as the microtest's
 // bit-exactness reference against the shipping single-row v2s4 kernel.
+//
+// MROW=6: the DSpark block verify (5 proposed rows + the committed one). An
+// MROW=R kernel is correct for ANY num_tokens <= R — the gather caps at MROW
+// and an expert can be duplicated at most num_tokens times — so this one entry
+// covers the whole 3..6 range and the m2 pair stays the K=2 fast path (it does
+// not carry the ladder's wider arms).
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m6v2s4,      GROUP_SIZE, false, 2, 4, 6)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m6v2s4, 32,         true,  2, 4, 6)
 
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6v2s4,      GROUP_SIZE, false, 2, 4, 6)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6v2s4, 32,         true,  2, 4, 6)
 
 #undef GATEUP_M_ENTRY
 #undef DOWN_M_ENTRY

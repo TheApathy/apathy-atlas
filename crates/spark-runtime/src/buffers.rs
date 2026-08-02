@@ -12,7 +12,7 @@ use atlas_core::config::ModelConfig;
 mod accessors;
 mod sizes;
 mod sizes_q12;
-pub use sizes::BufferSizes;
+pub use sizes::{BufferSizes, MOE_DECODE_MAX_ROWS, MOE_DECODE_MAX_SPLIT};
 pub use sizes_q12::{
     Q12_SIZING_STREAMS, q12_batched_scratch_bytes, q12_batched_scratch_bytes_varlen,
 };
