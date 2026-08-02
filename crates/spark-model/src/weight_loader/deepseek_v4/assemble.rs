@@ -225,130 +225,10 @@ pub fn assemble_layer(
         stream: gpu.default_stream(),
     };
 
-    // ── MoE FFN ──
-    // RedHatAI re-quant uses ffn.gate.weight and ffn.experts.E.w1/w2/w3 naming.
-    let p = &lp;
-    let gate = dense(store, &format!("{p}.ffn.gate.weight"))?;
-    // ROUTER GATE MUST STAY HIGH-PRECISION. The checkpoint ships `ffn.gate.weight`
-    // in BF16 (the quant recipes deliberately exclude the router from NVFP4). A
-    // 4-bit router flips the low-margin top-6 expert selection on essentially
-    // every token -> incoherent "token salad" output. Route through the BF16
-    // `dense_gemv` path (gate_nvfp4 = None) instead of re-quantizing to NVFP4.
-    let gate_nvfp4 = None;
-
-    let mut experts = Vec::with_capacity(config.num_experts);
-    for e in 0..config.num_experts {
-        if force_all_experts || config.is_local_expert(e) {
-            let ep = format!("{p}.ffn.experts.{e}");
-            let gate_proj = load_expert_proj(store, &format!("{ep}.w1"), gpu, qctx)
-                .with_context(|| format!("DeepSeek-V4 expert {e}: w1"))?;
-            let up_proj = load_expert_proj(store, &format!("{ep}.w3"), gpu, qctx)
-                .with_context(|| format!("DeepSeek-V4 expert {e}: w3"))?;
-            let down_proj = load_expert_proj(store, &format!("{ep}.w2"), gpu, qctx)
-                .with_context(|| format!("DeepSeek-V4 expert {e}: w2"))?;
-            experts.push(ExpertWeight {
-                gate_proj,
-                up_proj,
-                down_proj,
-            });
-        } else {
-            experts.push(ExpertWeight::null());
-        }
-    }
-    // Shared expert: DeepSeek-V4 has n_shared_experts=1, always-on and UNGATED
-    // (reference MoE.forward does `y += shared_experts(x)` after the routed
-    // all-reduce). It is NOT EP-sharded — every rank loads the full shared
-    // expert and adds it once post-all-reduce (forward_prefill handles the
-    // EP-once blend; moe_batched_blend treats a NULL gate as sigmoid=1.0).
-    // The weights live under `ffn.shared_experts.{w1,w2,w3}` (NVFP4), same
-    // packing as the routed experts. Leaving this null caused the MoE prefill
-    // to dereference null gate/up/down pointers (CUDA illegal address).
-    let sep = format!("{p}.ffn.shared_experts");
-    let shared_expert = ExpertWeight {
-        gate_proj: load_expert_proj(store, &format!("{sep}.w1"), gpu, qctx)
-            .with_context(|| "DeepSeek-V4 shared expert: w1")?,
-        up_proj: load_expert_proj(store, &format!("{sep}.w3"), gpu, qctx)
-            .with_context(|| "DeepSeek-V4 shared expert: w3")?,
-        down_proj: load_expert_proj(store, &format!("{sep}.w2"), gpu, qctx)
-            .with_context(|| "DeepSeek-V4 shared expert: w2")?,
-    };
-
-    // ── Shared-expert gate ──
-    // DeepSeek-V4-Flash ships `ffn.shared_expert_gate.weight` (RedHatAI
-    // re-quant) or `mlp.shared_expert_gate.weight` (original HF checkpoint).
-    // The shared expert is sigmoid-gated (`output += sigmoid(gate·x) * shared`),
-    // NOT ungated. Leaving it NULL makes `moe_weighted_sum_blend` treat the
-    // gate as 1.0, over-adding the shared expert every layer.
-    let shared_expert_gate = match store
-        .get(&format!("{p}.ffn.shared_expert_gate.weight"))
-        .or_else(|_| store.get(&format!("{p}.mlp.shared_expert_gate.weight")))
-    {
-        Ok(t) => DenseWeight { weight: t.ptr },
-        Err(_) => DenseWeight {
-            weight: DevicePtr::NULL,
-        },
-    };
-
-    // ── MoE routing (noaux_tc, sigmoid scoring) ──
-    // DeepSeek-V4 scores experts with `sigmoid(logits)` and normalizes the
-    // top-k gate weights as `σ(l_i)/Σσ(l_j)` — NOT softmax. The MoE layer
-    // keys the sigmoid path off `correction_bias` being `Some`, so we must
-    // supply a bias even though V4-Flash ships none: a zero `[num_experts]`
-    // buffer gives `topk(sigmoid(logits) + 0)` with correct weight
-    // normalization. (Falling back to softmax selects right experts but
-    // wrong blend weights → degraded output.)
-    let correction_bias = load_correction_bias(store, &lp, config.num_experts, gpu)?;
-
-    let moe_weights = MoeWeights {
-        gate,
-        shared_expert,
-        shared_expert_gate,
-        experts,
-        router_pre_norm: None,
-        correction_bias,
-    };
-    // ── Hash-MoE routing (DeepSeek-V4 paper §2.1) ──
-    // The first `num_hash_layers` MoE layers select experts via a static
-    // `tid2eid[token_id]` table ([vocab_size, top_k] i64) instead of top-K of
-    // the gate scores. The learned gate still supplies the sqrtsoftplus scores
-    // that weight the selected experts. `Some(table)` here is the SSOT marking
-    // this as a hash-routed layer.
-    let tid2eid_dev = if layer_idx < config.num_hash_layers {
-        let t = store
-            .get(&format!("{lp}.ffn.gate.tid2eid"))
-            .with_context(|| {
-                format!(
-                    "DeepSeek-V4 hash layer {layer_idx}: missing ffn.gate.tid2eid \
-                 (num_hash_layers={})",
-                    config.num_hash_layers
-                )
-            })?;
-        let expected = config.vocab_size * config.num_experts_per_tok;
-        anyhow::ensure!(
-            t.num_elements() == expected,
-            "DeepSeek-V4 tid2eid layer {layer_idx}: {} elements != vocab_size*top_k ({})",
-            t.num_elements(),
-            expected
-        );
-        Some(t.ptr)
-    } else {
-        None
-    };
-    let mut moe = MoeLayer::new_with_hash(
-        moe_weights,
-        config.num_experts,
-        gate_nvfp4,
-        tid2eid_dev,
-        gpu,
-        config,
-    )?;
-    // Tag routed-expert quant format so the Phase-K E8M0 MoE-GEMM variants
-    // dispatch on native MXFP4 (transcode-free) vs the standard NVFP4 kernels.
-    moe.experts_scale_kind = detect_routed_scale_kind(store, p, config, force_all_experts);
-    // Tag the SHARED expert format independently (RIDER A1): the native ckpt is
-    // heterogeneous — routed E8M0-MXFP4, shared FP8→NVFP4. The dual-format decode
-    // kernel asserts shared==Nvfp4; a different shared format fires the `expect`.
-    moe.shared_experts_scale_kind = detect_shared_scale_kind(store, p);
+    // ── MoE FFN — extracted to `assemble_moe` so the DSpark drafter loader
+    // can build a stage's MoE without the full layer body. Zero behavior
+    // change: the body below is the moved block, verbatim.
+    let moe = assemble_moe(store, &lp, layer_idx, force_all_experts, config, gpu, qctx)?;
 
     // ── MLA weights ──
     // RedHatAI checkpoint: wkv_a may only contain kv_lora_rank rows (no rope).
@@ -636,11 +516,151 @@ pub fn assemble_layer(
     Ok(Box::new(layer))
 }
 
+
+/// Build one V4 MoE FFN (`{prefix}.ffn.*`) — routed experts, shared expert,
+/// gate, optional hash table — exactly as `assemble_layer` always did; the
+/// block is extracted verbatim so the DSpark drafter loader can construct a
+/// stage's MoE without instantiating the full layer body around it.
+pub(super) fn assemble_moe(
+    store: &WeightStore,
+    layer_prefix: &str,
+    layer_idx: usize,
+    force_all_experts: bool,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    qctx: crate::weight_map::QuantizeCtx,
+) -> Result<MoeLayer> {
+    let lp = layer_prefix.to_string();
+    let p = &lp;
+    let gate = dense(store, &format!("{p}.ffn.gate.weight"))?;
+    // ROUTER GATE MUST STAY HIGH-PRECISION. The checkpoint ships `ffn.gate.weight`
+    // in BF16 (the quant recipes deliberately exclude the router from NVFP4). A
+    // 4-bit router flips the low-margin top-6 expert selection on essentially
+    // every token -> incoherent "token salad" output. Route through the BF16
+    // `dense_gemv` path (gate_nvfp4 = None) instead of re-quantizing to NVFP4.
+    let gate_nvfp4 = None;
+
+    let mut experts = Vec::with_capacity(config.num_experts);
+    for e in 0..config.num_experts {
+        if force_all_experts || config.is_local_expert(e) {
+            let ep = format!("{p}.ffn.experts.{e}");
+            let gate_proj = load_expert_proj(store, &format!("{ep}.w1"), gpu, qctx)
+                .with_context(|| format!("DeepSeek-V4 expert {e}: w1"))?;
+            let up_proj = load_expert_proj(store, &format!("{ep}.w3"), gpu, qctx)
+                .with_context(|| format!("DeepSeek-V4 expert {e}: w3"))?;
+            let down_proj = load_expert_proj(store, &format!("{ep}.w2"), gpu, qctx)
+                .with_context(|| format!("DeepSeek-V4 expert {e}: w2"))?;
+            experts.push(ExpertWeight {
+                gate_proj,
+                up_proj,
+                down_proj,
+            });
+        } else {
+            experts.push(ExpertWeight::null());
+        }
+    }
+    // Shared expert: DeepSeek-V4 has n_shared_experts=1, always-on and UNGATED
+    // (reference MoE.forward does `y += shared_experts(x)` after the routed
+    // all-reduce). It is NOT EP-sharded — every rank loads the full shared
+    // expert and adds it once post-all-reduce (forward_prefill handles the
+    // EP-once blend; moe_batched_blend treats a NULL gate as sigmoid=1.0).
+    // The weights live under `ffn.shared_experts.{w1,w2,w3}` (NVFP4), same
+    // packing as the routed experts. Leaving this null caused the MoE prefill
+    // to dereference null gate/up/down pointers (CUDA illegal address).
+    let sep = format!("{p}.ffn.shared_experts");
+    let shared_expert = ExpertWeight {
+        gate_proj: load_expert_proj(store, &format!("{sep}.w1"), gpu, qctx)
+            .with_context(|| "DeepSeek-V4 shared expert: w1")?,
+        up_proj: load_expert_proj(store, &format!("{sep}.w3"), gpu, qctx)
+            .with_context(|| "DeepSeek-V4 shared expert: w3")?,
+        down_proj: load_expert_proj(store, &format!("{sep}.w2"), gpu, qctx)
+            .with_context(|| "DeepSeek-V4 shared expert: w2")?,
+    };
+
+    // ── Shared-expert gate ──
+    // DeepSeek-V4-Flash ships `ffn.shared_expert_gate.weight` (RedHatAI
+    // re-quant) or `mlp.shared_expert_gate.weight` (original HF checkpoint).
+    // The shared expert is sigmoid-gated (`output += sigmoid(gate·x) * shared`),
+    // NOT ungated. Leaving it NULL makes `moe_weighted_sum_blend` treat the
+    // gate as 1.0, over-adding the shared expert every layer.
+    let shared_expert_gate = match store
+        .get(&format!("{p}.ffn.shared_expert_gate.weight"))
+        .or_else(|_| store.get(&format!("{p}.mlp.shared_expert_gate.weight")))
+    {
+        Ok(t) => DenseWeight { weight: t.ptr },
+        Err(_) => DenseWeight {
+            weight: DevicePtr::NULL,
+        },
+    };
+
+    // ── MoE routing (noaux_tc, sigmoid scoring) ──
+    // DeepSeek-V4 scores experts with `sigmoid(logits)` and normalizes the
+    // top-k gate weights as `σ(l_i)/Σσ(l_j)` — NOT softmax. The MoE layer
+    // keys the sigmoid path off `correction_bias` being `Some`, so we must
+    // supply a bias even though V4-Flash ships none: a zero `[num_experts]`
+    // buffer gives `topk(sigmoid(logits) + 0)` with correct weight
+    // normalization. (Falling back to softmax selects right experts but
+    // wrong blend weights → degraded output.)
+    let correction_bias = load_correction_bias(store, &lp, config.num_experts, gpu)?;
+
+    let moe_weights = MoeWeights {
+        gate,
+        shared_expert,
+        shared_expert_gate,
+        experts,
+        router_pre_norm: None,
+        correction_bias,
+    };
+    // ── Hash-MoE routing (DeepSeek-V4 paper §2.1) ──
+    // The first `num_hash_layers` MoE layers select experts via a static
+    // `tid2eid[token_id]` table ([vocab_size, top_k] i64) instead of top-K of
+    // the gate scores. The learned gate still supplies the sqrtsoftplus scores
+    // that weight the selected experts. `Some(table)` here is the SSOT marking
+    // this as a hash-routed layer.
+    let tid2eid_dev = if layer_idx < config.num_hash_layers {
+        let t = store
+            .get(&format!("{lp}.ffn.gate.tid2eid"))
+            .with_context(|| {
+                format!(
+                    "DeepSeek-V4 hash layer {layer_idx}: missing ffn.gate.tid2eid \
+                 (num_hash_layers={})",
+                    config.num_hash_layers
+                )
+            })?;
+        let expected = config.vocab_size * config.num_experts_per_tok;
+        anyhow::ensure!(
+            t.num_elements() == expected,
+            "DeepSeek-V4 tid2eid layer {layer_idx}: {} elements != vocab_size*top_k ({})",
+            t.num_elements(),
+            expected
+        );
+        Some(t.ptr)
+    } else {
+        None
+    };
+    let mut moe = MoeLayer::new_with_hash(
+        moe_weights,
+        config.num_experts,
+        gate_nvfp4,
+        tid2eid_dev,
+        gpu,
+        config,
+    )?;
+    // Tag routed-expert quant format so the Phase-K E8M0 MoE-GEMM variants
+    // dispatch on native MXFP4 (transcode-free) vs the standard NVFP4 kernels.
+    moe.experts_scale_kind = detect_routed_scale_kind(store, p, config, force_all_experts);
+    // Tag the SHARED expert format independently (RIDER A1): the native ckpt is
+    // heterogeneous — routed E8M0-MXFP4, shared FP8→NVFP4. The dual-format decode
+    // kernel asserts shared==Nvfp4; a different shared format fires the `expect`.
+    moe.shared_experts_scale_kind = detect_shared_scale_kind(store, p);
+    Ok(moe)
+}
+
 /// Load one HC site (`attn` or `ffn`) for a block as float32 device buffers.
 /// Tries the flat `hc_<site>_*` (DeepSeek reference / RedHatAI re-quant) and
 /// the HF `<site>_hc.*` naming. Fails fast if a tensor is missing — HC is
 /// load-bearing, so a silent skip would produce gibberish.
-fn load_hc_site(
+pub(super) fn load_hc_site(
     store: &WeightStore,
     layer_prefix: &str,
     site: &str,

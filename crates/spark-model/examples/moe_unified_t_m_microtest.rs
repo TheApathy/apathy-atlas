@@ -385,8 +385,10 @@ fn main() -> Result<()> {
 
     // ── multi-row chain: one launch pair covers `tokens` rows ──
     let m_chain = |mrow: u32, tokens: u32, o: &Outs, st: u64| -> Result<()> {
-        let gu: KernelHandle =
-            gpu.kernel(MODULE, &format!("moe_expert_gate_up_shared_t_e8m0_m{mrow}v2s4"))?;
+        let gu: KernelHandle = gpu.kernel(
+            MODULE,
+            &format!("moe_expert_gate_up_shared_t_e8m0_m{mrow}v2s4"),
+        )?;
         let dn: KernelHandle = gpu.kernel(
             MODULE,
             &format!("moe_expert_silu_down_shared_t_e8m0_m{mrow}v2s4"),

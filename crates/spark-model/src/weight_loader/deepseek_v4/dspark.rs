@@ -12,24 +12,27 @@
 //! concatenated to [3·h]) through `main_proj`/`main_norm`, and stage 2 carries
 //! the Markov + confidence heads. Reference implementation:
 //! `inference/model.py` in the official repo (`DSparkBlock` et al.); full port
-//! design in `docs/dspark_port.md`.
+//! design in `docs/dspark_port.md`; offline acceptance (3.50 tok/step ungated)
+//! measured by `bench/deepseek-v4/dspark_probe/`.
 //!
-//! This module only loads weights. The propose forward (5-row bidirectional
-//! block over a 128-entry `main_kv` ring per stage) lives in the forthcoming
-//! `layers::dspark_head`.
+//! Each stage is loaded PIECEWISE — MoE via [`super::assemble::assemble_moe`],
+//! mHC sites via `load_hc_site`, attention weights dequanted dense — rather
+//! than as an assembled `TransformerLayer`: the drafter's attention is a
+//! 5-row bidirectional block over a 128-entry `main_kv` ring, which the
+//! layer's causal paged decode cannot express, so the propose forward
+//! (`layers::dspark_head`) drives every op itself.
 // Dead-code allowance is temporary: consumed by the forthcoming
 // `DsparkDraftHead` proposer + factory wiring (docs/dspark_port.md, tasks
-// #11–#13). Mirrors how `DeepseekV4MtpModule` landed ahead of its proposer.
+// #12–#13). Mirrors how `DeepseekV4MtpModule` landed ahead of its proposer.
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::ModelConfig;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::kv_cache::KvCacheDtype;
+use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::layer::TransformerLayer;
-use crate::layers::qwen3_attention::HcHeadWeights;
+use crate::layers::MoeLayer;
+use crate::layers::qwen3_attention::{HcHeadWeights, HcSiteWeights};
 use crate::weight_map::{DenseWeight, dense_auto};
 
 /// DSpark hyper-parameters. The 0731 checkpoint does not repeat these in the
@@ -62,27 +65,39 @@ impl DsparkParams {
     };
 }
 
-/// One drafter stage: the reused V4 layer body plus pointer clones of the
-/// attention weights the custom propose-attention needs to drive directly.
-///
-/// The body's own decode path is never called — its causal paged attention
-/// cannot express the drafter's bidirectional 5-row block over a sliding
-/// window — but building it through `assemble_layer` places the mHC + MoE
-/// weights and gives the propose forward the layer's batched FFN for free.
-/// The clones share GPU memory with the body (same `DevicePtr`s), exactly the
-/// `hc_head` pattern `load_v4_mtp_module` already uses.
+/// One drafter stage: MoE + mHC sites + dequanted-dense attention weights,
+/// driven directly by the propose forward.
 pub struct DsparkStage {
-    pub body: Box<dyn TransformerLayer>,
-    pub wq_a: DenseWeight,
-    pub wq_b: DenseWeight,
-    pub q_norm: DenseWeight,
-    pub wkv: DenseWeight,
-    pub kv_norm: DenseWeight,
-    pub wo_a: DenseWeight,
-    pub wo_b: DenseWeight,
-    /// Per-head attention sink logits `[num_heads]` (F32 in the checkpoint).
-    pub attn_sink: DenseWeight,
+    /// 256-expert native-MXFP4 routed MoE + FP8→NVFP4 shared expert, built by
+    /// the same `assemble_moe` the target layers use — its batched decode
+    /// paths (`forward_kn`) run the 5-row block FFN.
+    pub moe: MoeLayer,
+    /// mHC mixing at the attention site (`hc_attn_fn/scale/base`).
+    pub hc_attn: HcSiteWeights,
+    /// mHC mixing at the FFN site (`hc_ffn_fn/scale/base`).
+    pub hc_ffn: HcSiteWeights,
+    /// Pre-attention RMSNorm (`attn_norm`).
     pub attn_norm: DenseWeight,
+    /// Pre-FFN RMSNorm (`ffn_norm`).
+    pub ffn_norm: DenseWeight,
+    // ── MLA attention weights, dequanted to dense BF16 ──
+    /// `[q_lora, h]` = [1024, 4096].
+    pub wq_a: DenseWeight,
+    /// `[heads·head_dim, q_lora]` = [32768, 1024].
+    pub wq_b: DenseWeight,
+    /// Q-LoRA RMSNorm `[q_lora]`.
+    pub q_norm: DenseWeight,
+    /// `[head_dim, h]` = [512, 4096] — MQA: one shared KV row.
+    pub wkv: DenseWeight,
+    /// KV RMSNorm `[head_dim]`.
+    pub kv_norm: DenseWeight,
+    /// Grouped O-LoRA down: `[groups·o_lora, heads·head_dim/groups]` = [8192, 4096]; group g
+    /// reads attn cols `[g·(heads·head_dim/groups) ..)`.
+    pub wo_a: DenseWeight,
+    /// `[h, groups·o_lora]` = [4096, 8192].
+    pub wo_b: DenseWeight,
+    /// Per-head attention sink logits `[heads]` F32.
+    pub attn_sink: DenseWeight,
 }
 
 /// The loaded DSpark drafter: 3 stages + target-fusion projection + heads.
@@ -94,9 +109,9 @@ pub struct DsparkDrafterModule {
     pub main_proj: DenseWeight,
     /// RMSNorm over the fused vector.
     pub main_norm: DenseWeight,
-    /// Final RMSNorm (stage 2) before the shared lm_head.
+    /// Final RMSNorm (last stage) before the shared lm_head.
     pub norm: DenseWeight,
-    /// Stage-2 head hyper-connection collapse (`mtp.2.hc_head_*`).
+    /// Last stage's head hyper-connection collapse (`hc_head_*`).
     pub hc_head: Option<HcHeadWeights>,
     /// Markov bigram head, `[vocab, markov_rank]` each. `w1` is a gather
     /// table (embedding-style), `w2` a head (`logits += w2 · w1[prev]`).
@@ -126,7 +141,6 @@ pub fn load_dspark_drafter(
     target_config: &ModelConfig,
     params: DsparkParams,
     gpu: &dyn GpuBackend,
-    layer_kv_dtypes: &[KvCacheDtype],
 ) -> Result<DsparkDrafterModule> {
     if !store_is_dspark(store) {
         bail!("drafter store has no mtp.0.main_proj.weight — not a DSpark checkpoint");
@@ -135,7 +149,7 @@ pub fn load_dspark_drafter(
 
     // The drafter ships the unpruned expert set; the target may be REAP-pruned
     // (144 on DeepSeek-V4-Flash-162B). The gate is `[num_experts, h]` BF16, so
-    // its byte length is the authoritative count.
+    // its shape is the authoritative count.
     let gate = store
         .get("mtp.0.ffn.gate.weight")
         .context("DSpark drafter store is missing mtp.0.ffn.gate.weight")?;
@@ -156,48 +170,39 @@ pub fn load_dspark_drafter(
         bail!("DSpark drafter store has main_proj but no mtp.0.attn_norm.weight");
     }
 
-    // See `load_v4_mtp_module`: the KV-dtype table must cover the drafter's
-    // layer_idx so the body doesn't fall onto the generic (numerically wrong
-    // for MLA) paged-decode arm if it is ever invoked.
-    let body_kv_dtype = layer_kv_dtypes
-        .first()
-        .copied()
-        .unwrap_or(KvCacheDtype::Fp8);
-    let mut kv_dtypes_ext = layer_kv_dtypes.to_vec();
-    kv_dtypes_ext.resize(config.num_hidden_layers + 1, body_kv_dtype);
-
-    let mut yarn_inv_freq = DevicePtr::NULL;
-    yarn_inv_freq = super::compute::ensure_yarn_inv_freq(&mut yarn_inv_freq, &config, gpu)?;
-    let null = DenseWeight {
-        weight: DevicePtr::NULL,
+    let qctx = crate::weight_map::QuantizeCtx {
+        absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
+        quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+        stream: gpu.default_stream(),
     };
 
     let mut stages = Vec::with_capacity(n_stages);
-    // The final stage's head hyper-connection, kept out of the loop for the
-    // module struct (pointer clones — same GPU memory as the body's copy).
     let mut last_hc_head: Option<HcHeadWeights> = None;
     for s in 0..n_stages {
         let prefix = format!("mtp.{s}");
         let ap = format!("{prefix}.attn");
 
-        let attn_norm = dense_auto(store, &format!("{prefix}.attn_norm.weight"), gpu)?;
-        let post_attn_norm = dense_auto(store, &format!("{prefix}.ffn_norm.weight"), gpu)?;
-        let wq_a = dense_auto(store, &format!("{ap}.wq_a.weight"), gpu)?;
-        let wq_b = dense_auto(store, &format!("{ap}.wq_b.weight"), gpu)?;
-        let q_norm = dense_auto(store, &format!("{ap}.q_norm.weight"), gpu)?;
-        let wkv = dense_auto(store, &format!("{ap}.wkv.weight"), gpu)?;
-        let kv_norm = dense_auto(store, &format!("{ap}.kv_norm.weight"), gpu)?;
-        let wo_a = dense_auto(store, &format!("{ap}.wo_a.weight"), gpu)?;
-        let wo_b = dense_auto(store, &format!("{ap}.wo_b.weight"), gpu)?;
-        let attn_sink = dense_auto(store, &format!("{ap}.attn_sink"), gpu)?;
+        // `layer_idx = num_hidden_layers` ⇒ past every hash-routed layer, so
+        // the MoE takes the learned-gate path (the drafter has no tid2eid).
+        let moe = super::assemble::assemble_moe(
+            store,
+            &prefix,
+            config.num_hidden_layers,
+            true, // force_all_experts — drafter runs no-EP on rank 0
+            &config,
+            gpu,
+            qctx,
+        )
+        .with_context(|| format!("assembling DSpark stage {s} MoE"))?;
 
-        // Only the FINAL stage carries a head hyper-connection; the body of
-        // every stage still runs its MIDDLE mHC mixing (hc_attn/hc_ffn load
-        // inside `assemble_layer`).
-        let hc_head = if config.hc_mult > 0 && store.contains(&format!("{prefix}.hc_head_scale")) {
+        let hc_attn = super::assemble::load_hc_site(store, &prefix, "attn", &config, gpu)?;
+        let hc_ffn = super::assemble::load_hc_site(store, &prefix, "ffn", &config, gpu)?;
+
+        // Only the FINAL stage carries a head hyper-connection.
+        if s == n_stages - 1 && config.hc_mult > 0 {
             let hc = config.hc_mult;
             let hc_dim = hc * h;
-            Some(HcHeadWeights {
+            last_hc_head = Some(HcHeadWeights {
                 hc_fn: super::assemble::load_hc_f32(
                     store,
                     &[format!("{prefix}.hc_head_fn")],
@@ -216,83 +221,37 @@ pub fn load_dspark_drafter(
                     1,
                     gpu,
                 )?,
-            })
-        } else {
-            None
-        };
-        if s == n_stages - 1 {
-            last_hc_head = hc_head.clone();
+            });
         }
 
-        let body = super::assemble::assemble_layer(
-            config.num_hidden_layers, // ⇒ no compressor, no hash routing
-            &prefix,
-            true, // force_all_experts — drafter runs no-EP on rank 0
-            attn_norm.clone(),
-            post_attn_norm,
-            wq_a.clone(),
-            None, // wq_a_nvfp4 — drafter attn is FP8 block-scaled
-            wq_b.clone(),
-            None,
-            q_norm.clone(),
-            wkv.clone(),
-            None,
-            null.clone(), // wkv_b — unused for V4-Flash direct-KV
-            kv_norm.clone(),
-            wo_b.clone(), // o_dense
-            None,
-            null.clone(), // w_uk_t
-            null.clone(), // w_uv
-            null.clone(), // wq_b_rope
-            null.clone(), // w_qk_absorbed
-            null.clone(), // w_uk_block_diag
-            null.clone(), // w_uv_block_diag
-            yarn_inv_freq,
-            wo_a.clone(),
-            hc_head.clone(),
-            store,
-            &config,
-            gpu,
-            &kv_dtypes_ext,
-        )
-        .with_context(|| format!("assembling DSpark stage {s}"))?;
-
         stages.push(DsparkStage {
-            body,
-            wq_a,
-            wq_b,
-            q_norm,
-            wkv,
-            kv_norm,
-            wo_a,
-            wo_b,
-            attn_sink,
-            attn_norm,
+            moe,
+            hc_attn,
+            hc_ffn,
+            attn_norm: dense_auto(store, &format!("{prefix}.attn_norm.weight"), gpu)?,
+            ffn_norm: dense_auto(store, &format!("{prefix}.ffn_norm.weight"), gpu)?,
+            wq_a: dense_auto(store, &format!("{ap}.wq_a.weight"), gpu)?,
+            wq_b: dense_auto(store, &format!("{ap}.wq_b.weight"), gpu)?,
+            q_norm: dense_auto(store, &format!("{ap}.q_norm.weight"), gpu)?,
+            wkv: dense_auto(store, &format!("{ap}.wkv.weight"), gpu)?,
+            kv_norm: dense_auto(store, &format!("{ap}.kv_norm.weight"), gpu)?,
+            wo_a: dense_auto(store, &format!("{ap}.wo_a.weight"), gpu)?,
+            wo_b: dense_auto(store, &format!("{ap}.wo_b.weight"), gpu)?,
+            attn_sink: dense_auto(store, &format!("{ap}.attn_sink"), gpu)?,
         });
     }
 
     // ── DSpark-specific heads ──
-    // Stage 0: target fusion. Stage n-1: final norm + hc_head + Markov +
-    // confidence. `dense_auto` dequants the FP8 block-scaled main_proj.
+    // Stage 0: target fusion. Last stage: final norm + Markov + confidence.
+    // `dense_auto` dequants the FP8 block-scaled main_proj.
     let last = n_stages - 1;
     let main_proj = dense_auto(store, "mtp.0.main_proj.weight", gpu)?;
     let main_norm = dense_auto(store, "mtp.0.main_norm.weight", gpu)?;
     let norm = dense_auto(store, &format!("mtp.{last}.norm.weight"), gpu)?;
-    let markov_w1 = dense_auto(
-        store,
-        &format!("mtp.{last}.markov_head.markov_w1.weight"),
-        gpu,
-    )?;
-    let markov_w2 = dense_auto(
-        store,
-        &format!("mtp.{last}.markov_head.markov_w2.weight"),
-        gpu,
-    )?;
-    let confidence_proj = dense_auto(
-        store,
-        &format!("mtp.{last}.confidence_head.proj.weight"),
-        gpu,
-    )?;
+    let markov_w1 = dense_auto(store, &format!("mtp.{last}.markov_head.markov_w1.weight"), gpu)?;
+    let markov_w2 = dense_auto(store, &format!("mtp.{last}.markov_head.markov_w2.weight"), gpu)?;
+    let confidence_proj =
+        dense_auto(store, &format!("mtp.{last}.confidence_head.proj.weight"), gpu)?;
 
     tracing::info!(
         "DSpark drafter loaded: {n_stages} V4 stages ({drafter_experts}-expert MoE) + \

@@ -13,7 +13,7 @@
 use anyhow::{Context, Result};
 use spark_model::weight_loader::deepseek_v4::dspark;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::kv_cache::KvCacheDtype;
+
 use spark_runtime::weights::WeightLoader;
 
 fn main() -> Result<()> {
@@ -61,7 +61,6 @@ fn main() -> Result<()> {
         &target_config,
         dspark::DsparkParams::V4_FLASH_0731(),
         gpu,
-        &[KvCacheDtype::Fp8],
     )?;
     println!(
         "drafter assembled in {:.1}s: {} stages, hc_head={}, block_size={}",
