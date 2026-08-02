@@ -467,6 +467,40 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
 
+        // n == 2 (opt-in, ATLAS_MSHC_FFN_K2=1): fused K=2 MoE — gate batch2 +
+        // batched topK + batch2 expert kernels, shared expert and gate read
+        // ONCE for both tokens. NOT the default: on E8M0 (MXFP4) expert
+        // tables the batch2_t kernels CUDA-700 in the expert dispatch — they
+        // only exist in NVFP4-scale flavor (the single-token path has
+        // dedicated `_e8m0` variants; batch2 never got them). Until e8m0
+        // batch2 kernels exist the per-token loop below is the safe route —
+        // its only loss vs a correct fused path is the duplicated shared
+        // expert + gate read (~50-100µs/layer at n=2).
+        let ffn_k2 = n == 2
+            && std::env::var("ATLAS_MSHC_FFN_K2").is_ok_and(|v| v == "1");
+        if ffn_k2 {
+            self.ffn.forward_k2(c.normed, ctx, stream)?;
+            let moe_out_base = ctx.buffers.moe_output();
+            for i in 0..n {
+                let moe_out = moe_out_base.offset(i * c.h * c.bf16);
+                let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
+                let post_i = post.offset(i * hc.hc_mult * 4);
+                let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
+                ops::hc_post(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    moe_out,
+                    hc_streams_i,
+                    post_i,
+                    comb_i,
+                    hc_streams_i,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )?;
+            }
+        } else {
         // Per-token sequential FFN (MLA models always take this path).
         for i in 0..n {
             let normed2_i = c.normed.offset(i * c.h * c.bf16);
@@ -489,6 +523,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        } // end ffn_k2 / per-token dispatch
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
