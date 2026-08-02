@@ -136,6 +136,37 @@ impl FfnComponent {
         }
     }
 
+    /// Wide verify FFN for models whose dispatch can't use the fused
+    /// batch2/batch3 kernels (MLA — see `force_seq_ffn` in
+    /// `qwen3_attention::trait_impl::multi_seq::ffn`).
+    ///
+    /// Tries the dedup'd multi-row split-K `_t` path
+    /// ([`MoeLayer::forward_km`]), which reads each routed expert's bytes ONCE
+    /// for every row that selected it, and falls back to
+    /// [`MoeLayer::forward_batched`] — a per-row loop, but one that routes row
+    /// `t` with `token_ids[t]`, which the single-row [`Self::forward`] cannot
+    /// do (it always reads `token_ids[0]`).
+    ///
+    /// `Ok(true)` means `moe_output()` holds all `n` rows. `Ok(false)` means
+    /// nothing was written and the caller must handle the rows itself.
+    pub fn forward_verify_rows(
+        &self,
+        input: DevicePtr,
+        n: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        match self {
+            Self::Moe(m) => {
+                if !m.forward_km(input, n, ctx, stream)? {
+                    m.forward_batched(input, n, ctx, stream)?;
+                }
+                Ok(true)
+            }
+            Self::Dense(_) | Self::None => Ok(false),
+        }
+    }
+
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k3(input, ctx, stream),

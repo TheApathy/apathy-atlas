@@ -502,13 +502,40 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else {
-            // Per-token sequential FFN (MLA models always take this path).
+            // WIDE VERIFY (DSpark γ=6 → n=6). One dedup'd dispatch for all n
+            // rows, ahead of the per-token loop, for two reasons:
+            //
+            //  1. Bandwidth. `forward` reads every routed expert's ~94 MB layer
+            //     once PER ROW. At n=6 that is 72% of the verify step
+            //     (measured: MoE 6×544µs vs attention 1.29ms per layer). The
+            //     dedup'd `_t` split-K kernels read each expert once for every
+            //     row that selected it.
+            //  2. Correctness. `forward` is a single-token entry point — its
+            //     hash-MoE routing reads `token_ids[0]` unconditionally
+            //     (moe/forward.rs: "decode: single token at offset 0"), so rows
+            //     1.. were routed with row 0's experts. On DeepSeek-V4's hash
+            //     layers that silently corrupts the verify logits, which costs
+            //     acceptance directly.
+            //
+            // `forward_verify_rows` falls back internally (and returns false
+            // for dense/no FFN), so the per-token loop below still covers every
+            // layer and width it declines.
+            let batched = n > 1 && self.ffn.forward_verify_rows(c.normed, n, ctx, stream)?;
             // ATLAS_MOE_OVERLAP=1 (no-op otherwise): open a row group so the
             // per-row MoE fires below can be scored for expert-set overlap.
-            crate::layers::moe::dump::route_group_begin(n);
+            // The batched dispatch routes all rows in one launch — nothing to
+            // score, and `forward_km` samples the union itself.
+            if !batched {
+                crate::layers::moe::dump::route_group_begin(n);
+            }
+            let moe_out_base = ctx.buffers.moe_output();
             for i in 0..n {
-                let normed2_i = c.normed.offset(i * c.h * c.bf16);
-                let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
+                let moe_out = if batched {
+                    moe_out_base.offset(i * c.h * c.bf16)
+                } else {
+                    let normed2_i = c.normed.offset(i * c.h * c.bf16);
+                    self.ffn.forward(normed2_i, ctx, stream)?
+                };
                 // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
                 let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
                 let post_i = post.offset(i * hc.hc_mult * 4);

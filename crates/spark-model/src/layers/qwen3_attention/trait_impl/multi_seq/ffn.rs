@@ -251,30 +251,70 @@ impl Qwen3AttentionLayer {
             // is `i * h * 2`; a hardcoded `i * h * 4` would over-stride into
             // the wrong batch slot for i>=1.
             let residual_elem = 2usize;
-            for i in 0..n {
-                let hidden_i = hidden.offset(i * h * residual_elem);
-                let o_out_i = o_out.offset(i * h * bf16); // BF16 attn output
-                let residual_i = residual.offset(i * h * residual_elem);
-                let normed2_i = fwd.buffers.norm_output().offset(i * h * bf16);
+            let normed_base = fwd.buffers.norm_output();
+            if n > 1 {
+                // One launch for all n rows — the count=n kernel is the same
+                // one the K=2/K=3 branches above use, row-for-row identical to
+                // the n count=1 launches it replaces.
                 ops::residual_add_rms_norm(
                     fwd.gpu,
                     self.residual_add_rms_norm_k,
-                    hidden_i,
-                    o_out_i,
+                    hidden,
+                    o_out,
                     &self.post_attn_norm,
-                    normed2_i,
-                    residual_i,
+                    normed_base,
+                    residual,
+                    n as u32,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+                // WIDE VERIFY (DSpark γ=6). Two reasons this must not go
+                // through the per-token loop below:
+                //
+                //  1. Bandwidth. `forward` reads every routed expert's ~94 MB
+                //     layer once PER ROW; the dedup'd `_t` split-K kernels read
+                //     it once for the whole block.
+                //  2. Correctness. `forward` is a single-token entry point —
+                //     its hash-MoE routing reads `token_ids[0]` unconditionally
+                //     (moe/forward.rs: "decode: single token at offset 0"), so
+                //     rows 1.. were routed with row 0's experts. That is a
+                //     silent verify-numerics bug on DeepSeek-V4's hash layers,
+                //     and it costs acceptance directly.
+                //
+                // Distinct kernel family from the batch2/batch3 fused path that
+                // `force_seq_ffn` exists to avoid, and both entry points fall
+                // back internally when a layer isn't eligible.
+                if self.ffn.forward_verify_rows(normed_base, n, fwd, stream)? {
+                    ops::residual_add(
+                        fwd.gpu,
+                        self.residual_add_k,
+                        hidden,
+                        fwd.buffers.moe_output(),
+                        (n * h) as u32,
+                        stream,
+                    )?;
+                    return Ok(());
+                }
+            } else {
+                ops::residual_add_rms_norm(
+                    fwd.gpu,
+                    self.residual_add_rms_norm_k,
+                    hidden,
+                    o_out,
+                    &self.post_attn_norm,
+                    normed_base,
+                    residual,
                     1,
                     h as u32,
                     eps,
                     stream,
                 )?;
             }
-            // Per-token MoE + residual (256-expert MoE: grouped-GEMM is a net
-            // loss at small batch — per-expert M ~1, sort/permute overhead
-            // dominates). Each forward() writes moe_output[0]; consume it
-            // immediately before the next iteration overwrites it.
-            let normed_base = fwd.buffers.norm_output();
+            // Per-token FFN + residual — dense/no-FFN layers, and any MoE
+            // width `forward_verify_rows` declined. Each forward() writes
+            // moe_output[0]; consume it immediately before the next iteration
+            // overwrites it.
             for i in 0..n {
                 let hidden_i = hidden.offset(i * h * residual_elem);
                 let normed2_i = normed_base.offset(i * h * bf16);

@@ -77,48 +77,74 @@ impl MoeLayer {
             return Ok(false);
         }
 
+        // ATLAS_PROFILE: synchronized per-stage split, mirroring the per-token
+        // path's `prof!` in `moe/forward.rs`. The per-token macro never covered
+        // this path, so the wide verify's MoE showed up only inside the
+        // VERIFY_PROFILE per-layer total — leaving the split between the
+        // expert dispatch (bandwidth, irreducible at the batch's expert union)
+        // and everything around it unmeasured.
+        let profile = ctx.profile && !ctx.graph_capture;
+        macro_rules! prof {
+            ($label:expr, $body:expr) => {{
+                if profile {
+                    let t = std::time::Instant::now();
+                    let r = $body;
+                    ctx.gpu.synchronize(stream)?;
+                    tracing::info!("    MoE-km {}: {:.0}μs", $label, t.elapsed().as_micros());
+                    r
+                } else {
+                    $body
+                }
+            }};
+        }
+
         // ── Routing. Identical kernels to the per-token path, writing flat
         //    [num_tokens*top_k] indices/weights instead of one row's worth.
         let router_in = self.router_input(input, n, h, ctx, stream)?;
         let gate_logits = ctx.buffers.gate_logits(); // [n, num_experts] BF16
-        if let Some(ref nvfp4) = self.gate_nvfp4 {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm,
-                router_in,
-                nvfp4,
-                gate_logits,
-                n,
-                num_experts,
-                h,
-                stream,
-            )?;
-        } else {
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm,
-                router_in,
-                &self.weights.gate,
-                gate_logits,
-                n,
-                num_experts,
-                h,
-                stream,
-            )?;
-        }
+        prof!("gate", {
+            if let Some(ref nvfp4) = self.gate_nvfp4 {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm,
+                    router_in,
+                    nvfp4,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h,
+                    stream,
+                )
+            } else {
+                ops::dense_gemm(
+                    ctx.gpu,
+                    self.dense_gemm,
+                    router_in,
+                    &self.weights.gate,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h,
+                    stream,
+                )
+            }
+        })?;
 
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch; // [n*top_k] u32
         let weights_dev = scratch.offset(n as usize * top_k as usize * 4); // [n*top_k] f32
-        self.route_rows_flat(
-            ctx,
-            gate_logits,
-            indices_dev,
-            weights_dev,
-            num_experts,
-            top_k,
-            n,
-            stream,
+        prof!(
+            "route",
+            self.route_rows_flat(
+                ctx,
+                gate_logits,
+                indices_dev,
+                weights_dev,
+                num_experts,
+                top_k,
+                n,
+                stream,
+            )
         )?;
         super::union_stats::maybe_sample_expert_union(
             ctx.gpu,
@@ -143,48 +169,55 @@ impl MoeLayer {
         let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
         let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
 
-        if !self.dispatch_splitk_m_t(
-            ctx,
-            input,
-            expert_gate_out,
-            expert_up_out,
-            expert_down_out,
-            shared_gate_scratch,
-            shared_up_scratch,
-            shared_down_out,
-            indices_dev,
-            gate_t,
-            up_t,
-            down_t,
-            sh_gate_t,
-            sh_up_t,
-            sh_down_t,
-            h,
-            inter,
-            top_k,
-            n,
-            stream,
-        )? {
+        let dispatched = prof!(
+            "exp_splitk_m_t",
+            self.dispatch_splitk_m_t(
+                ctx,
+                input,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_down_out,
+                indices_dev,
+                gate_t,
+                up_t,
+                down_t,
+                sh_gate_t,
+                sh_up_t,
+                sh_down_t,
+                h,
+                inter,
+                top_k,
+                n,
+                stream,
+            )
+        )?;
+        if !dispatched {
             // `verify_ffn_is_batched` above cleared the same predicate, so this
             // is unreachable barring an env flag flipping mid-forward. Fall
             // back rather than leave `moe_output` unwritten.
             return Ok(false);
         }
 
-        ops::moe_weighted_sum_blend_batchn(
-            ctx.gpu,
-            self.moe_weighted_sum_blend_batch2,
-            output,
-            expert_down_out,
-            weights_dev,
-            shared_down_out,
-            input,
-            self.weights.shared_expert_gate.weight,
-            h,
-            top_k,
-            h,
-            n,
-            stream,
+        prof!(
+            "blend",
+            ops::moe_weighted_sum_blend_batchn(
+                ctx.gpu,
+                self.moe_weighted_sum_blend_batch2,
+                output,
+                expert_down_out,
+                weights_dev,
+                shared_down_out,
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                top_k,
+                h,
+                n,
+                stream,
+            )
         )?;
         Ok(true)
     }
