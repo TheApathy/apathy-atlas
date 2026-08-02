@@ -218,8 +218,8 @@ impl TransformerModel {
         // timing of the K=2 verify forward. Syncs per layer — only honored on
         // the eager path (combine with ATLAS_DEBUG_NO_GRAPH=1); a captured
         // graph can't host the syncs and would measure nothing anyway.
-        let profile_verify = !use_graphs
-            && std::env::var("ATLAS_PROFILE_VERIFY").ok().as_deref() == Some("1");
+        let profile_verify =
+            !use_graphs && std::env::var("ATLAS_PROFILE_VERIFY").ok().as_deref() == Some("1");
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),

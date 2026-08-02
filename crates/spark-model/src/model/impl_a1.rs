@@ -271,24 +271,22 @@ impl TransformerModel {
         // DeepSeek-V4's own MTP module loads later (factory/build.rs) and is
         // config-detectable here — without this arm the V4 drafter prefill
         // silently never ran (capture buffer NULL ⇒ propose-site skip).
-        let v4_mtp_expected = use_speculative
-            && config.model_type == "deepseek_v4"
-            && config.ep_rank == 0;
-        let mtp_prefill_hidden = if (has_mtp || v4_mtp_expected)
-            && crate::layers::mtp_drafter_prefill_enabled()
-        {
-            let bytes = max_seq_len * config.hidden_size * 2;
-            tracing::info!(
-                "ATLAS_MTP_DRAFTER_PREFILL=1: allocating {:.0} MB prompt-hidden \
+        let v4_mtp_expected =
+            use_speculative && config.model_type == "deepseek_v4" && config.ep_rank == 0;
+        let mtp_prefill_hidden =
+            if (has_mtp || v4_mtp_expected) && crate::layers::mtp_drafter_prefill_enabled() {
+                let bytes = max_seq_len * config.hidden_size * 2;
+                tracing::info!(
+                    "ATLAS_MTP_DRAFTER_PREFILL=1: allocating {:.0} MB prompt-hidden \
                  capture ({} x {} BF16) for MTP drafter prefill",
-                bytes as f64 / 1e6,
-                max_seq_len,
-                config.hidden_size,
-            );
-            gpu.alloc(bytes)?
-        } else {
-            DevicePtr::NULL
-        };
+                    bytes as f64 / 1e6,
+                    max_seq_len,
+                    config.hidden_size,
+                );
+                gpu.alloc(bytes)?
+            } else {
+                DevicePtr::NULL
+            };
 
         // DFlash 5-layer hidden-state stack. Allocated only when a
         // BlockDiffusionDraftHead is the active proposer (`config.dflash_capture_layers`

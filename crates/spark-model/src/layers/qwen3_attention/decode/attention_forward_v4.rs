@@ -274,193 +274,193 @@ impl Qwen3AttentionLayer {
         // pass over all verify rows — skip straight to RoPE (Step 3).
         // `q_latent` (ssm_ba) stays bound: Step 3 reuses it as k_rope_tmp.
         if !skip_qkv {
-        prof!("wq_a", {
-            if let Some(ref wqa_nvfp4) = mla.wq_a_nvfp4 {
-                ops::w4a16_gemv(
+            prof!("wq_a", {
+                if let Some(ref wqa_nvfp4) = mla.wq_a_nvfp4 {
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv_k,
+                        normed,
+                        wqa_nvfp4,
+                        q_latent,
+                        q_lora,
+                        h,
+                        stream,
+                    )
+                } else if let Some(ref wqa_fp8) = mla.wq_a_fp8 {
+                    // Native block-scaled FP8 GEMV — half the weight traffic of BF16,
+                    // lossless (in-kernel F32 dequant).
+                    ops::w8a16_gemv(
+                        ctx.gpu,
+                        self.w8a16_gemv_k,
+                        normed,
+                        wqa_fp8.weight,
+                        wqa_fp8.row_scale,
+                        q_latent,
+                        q_lora,
+                        h,
+                        stream,
+                    )
+                } else {
+                    ops::dense_gemv(
+                        ctx.gpu,
+                        self.dense_gemv_k,
+                        normed,
+                        &mla.wq_a,
+                        q_latent,
+                        q_lora,
+                        h,
+                        stream,
+                    )
+                }
+            })?;
+            prof!("q_norm", {
+                ops::rms_norm(
                     ctx.gpu,
-                    self.w4a16_gemv_k,
-                    normed,
-                    wqa_nvfp4,
+                    self.rms_norm_w_k,
                     q_latent,
+                    &mla.q_a_norm,
+                    q_latent,
+                    1,
                     q_lora,
-                    h,
+                    eps,
                     stream,
                 )
-            } else if let Some(ref wqa_fp8) = mla.wq_a_fp8 {
-                // Native block-scaled FP8 GEMV — half the weight traffic of BF16,
-                // lossless (in-kernel F32 dequant).
-                ops::w8a16_gemv(
+            })?;
+            prof!("wq_b", {
+                if let Some(ref wqb_nvfp4) = mla.wq_b_nvfp4 {
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv_k,
+                        q_latent,
+                        wqb_nvfp4,
+                        q_out,
+                        q_dim,
+                        q_lora,
+                        stream,
+                    )
+                } else if let Some(ref wqb_fp8) = mla.wq_b_fp8 {
+                    ops::w8a16_gemv(
+                        ctx.gpu,
+                        self.w8a16_gemv_k,
+                        q_latent,
+                        wqb_fp8.weight,
+                        wqb_fp8.row_scale,
+                        q_out,
+                        q_dim,
+                        q_lora,
+                        stream,
+                    )
+                } else {
+                    ops::dense_gemv(
+                        ctx.gpu,
+                        self.dense_gemv_k,
+                        q_latent,
+                        &mla.wq_b,
+                        q_out,
+                        q_dim,
+                        q_lora,
+                        stream,
+                    )
+                }
+            })?;
+            // q_b_norm: per-head unweighted RMSNorm over head_dim (DeepSeek-V4).
+            // Reference (DeepseekV4UnweightedRMSNorm) renormalizes each of nq heads'
+            // hd-dim Q vector to unit RMS BEFORE rope. Missing this makes Q ~sqrt(hd)x
+            // too small → near-flat softmax → incoherent output. Weight = all-ones.
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                q_out,
+                &crate::weight_map::DenseWeight {
+                    weight: ctx.buffers.norm_unit_w(),
+                },
+                q_out,
+                nq,
+                hd,
+                eps,
+                stream,
+            )?;
+            if diag_this {
+                super::super::trait_impl::diag_norm(
                     ctx.gpu,
-                    self.w8a16_gemv_k,
-                    normed,
-                    wqa_fp8.weight,
-                    wqa_fp8.row_scale,
-                    q_latent,
-                    q_lora,
-                    h,
+                    q_out,
+                    q_dim as usize,
                     stream,
-                )
-            } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &mla.wq_a,
-                    q_latent,
-                    q_lora,
-                    h,
-                    stream,
-                )
+                    &format!("V4-decode L{} Q after q_b_norm", self.attn_layer_idx),
+                );
             }
-        })?;
-        prof!("q_norm", {
+
+            // ── Step 2: Direct KV projection ──
+            prof!("wkv", {
+                if let Some(ref wkva_nvfp4) = mla.wkv_a_nvfp4 {
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv_k,
+                        normed,
+                        wkva_nvfp4,
+                        k_out,
+                        kv_dim,
+                        h,
+                        stream,
+                    )
+                } else if let Some(ref wkva_fp8) = mla.wkv_a_fp8 {
+                    ops::w8a16_gemv(
+                        ctx.gpu,
+                        self.w8a16_gemv_k,
+                        normed,
+                        wkva_fp8.weight,
+                        wkva_fp8.row_scale,
+                        k_out,
+                        kv_dim,
+                        h,
+                        stream,
+                    )
+                } else {
+                    ops::dense_gemv(
+                        ctx.gpu,
+                        self.dense_gemv_k,
+                        normed,
+                        &mla.wkv_a,
+                        k_out,
+                        kv_dim,
+                        h,
+                        stream,
+                    )
+                }
+            })?;
+            // kv_norm: weighted RMSNorm over the kv latent BEFORE rope (DeepSeek-V4
+            // reference: kv = kv_norm(kv_proj(h))). Missing this left K ~8x too large
+            // → attention score overflow → NaN. nkv heads × (kv_dim/nkv) each.
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
-                q_latent,
-                &mla.q_a_norm,
-                q_latent,
-                1,
-                q_lora,
+                k_out,
+                &mla.kv_a_norm,
+                k_out,
+                nkv,
+                kv_dim / nkv,
                 eps,
                 stream,
-            )
-        })?;
-        prof!("wq_b", {
-            if let Some(ref wqb_nvfp4) = mla.wq_b_nvfp4 {
-                ops::w4a16_gemv(
+            )?;
+            // K=V for V4-Flash direct KV projection
+            ctx.gpu
+                .copy_d2d_async(k_out, v_out, (kv_dim as usize) * 2, stream)?;
+            if diag_this {
+                super::super::trait_impl::diag_norm(
                     ctx.gpu,
-                    self.w4a16_gemv_k,
-                    q_latent,
-                    wqb_nvfp4,
-                    q_out,
-                    q_dim,
-                    q_lora,
+                    k_out,
+                    kv_dim as usize,
                     stream,
-                )
-            } else if let Some(ref wqb_fp8) = mla.wq_b_fp8 {
-                ops::w8a16_gemv(
+                    &format!("V4-decode L{} K after proj", self.attn_layer_idx),
+                );
+                super::super::trait_impl::diag_norm(
                     ctx.gpu,
-                    self.w8a16_gemv_k,
-                    q_latent,
-                    wqb_fp8.weight,
-                    wqb_fp8.row_scale,
-                    q_out,
-                    q_dim,
-                    q_lora,
+                    v_out,
+                    kv_dim as usize,
                     stream,
-                )
-            } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    q_latent,
-                    &mla.wq_b,
-                    q_out,
-                    q_dim,
-                    q_lora,
-                    stream,
-                )
+                    &format!("V4-decode L{} V after copy", self.attn_layer_idx),
+                );
             }
-        })?;
-        // q_b_norm: per-head unweighted RMSNorm over head_dim (DeepSeek-V4).
-        // Reference (DeepseekV4UnweightedRMSNorm) renormalizes each of nq heads'
-        // hd-dim Q vector to unit RMS BEFORE rope. Missing this makes Q ~sqrt(hd)x
-        // too small → near-flat softmax → incoherent output. Weight = all-ones.
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            q_out,
-            &crate::weight_map::DenseWeight {
-                weight: ctx.buffers.norm_unit_w(),
-            },
-            q_out,
-            nq,
-            hd,
-            eps,
-            stream,
-        )?;
-        if diag_this {
-            super::super::trait_impl::diag_norm(
-                ctx.gpu,
-                q_out,
-                q_dim as usize,
-                stream,
-                &format!("V4-decode L{} Q after q_b_norm", self.attn_layer_idx),
-            );
-        }
-
-        // ── Step 2: Direct KV projection ──
-        prof!("wkv", {
-            if let Some(ref wkva_nvfp4) = mla.wkv_a_nvfp4 {
-                ops::w4a16_gemv(
-                    ctx.gpu,
-                    self.w4a16_gemv_k,
-                    normed,
-                    wkva_nvfp4,
-                    k_out,
-                    kv_dim,
-                    h,
-                    stream,
-                )
-            } else if let Some(ref wkva_fp8) = mla.wkv_a_fp8 {
-                ops::w8a16_gemv(
-                    ctx.gpu,
-                    self.w8a16_gemv_k,
-                    normed,
-                    wkva_fp8.weight,
-                    wkva_fp8.row_scale,
-                    k_out,
-                    kv_dim,
-                    h,
-                    stream,
-                )
-            } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &mla.wkv_a,
-                    k_out,
-                    kv_dim,
-                    h,
-                    stream,
-                )
-            }
-        })?;
-        // kv_norm: weighted RMSNorm over the kv latent BEFORE rope (DeepSeek-V4
-        // reference: kv = kv_norm(kv_proj(h))). Missing this left K ~8x too large
-        // → attention score overflow → NaN. nkv heads × (kv_dim/nkv) each.
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            k_out,
-            &mla.kv_a_norm,
-            k_out,
-            nkv,
-            kv_dim / nkv,
-            eps,
-            stream,
-        )?;
-        // K=V for V4-Flash direct KV projection
-        ctx.gpu
-            .copy_d2d_async(k_out, v_out, (kv_dim as usize) * 2, stream)?;
-        if diag_this {
-            super::super::trait_impl::diag_norm(
-                ctx.gpu,
-                k_out,
-                kv_dim as usize,
-                stream,
-                &format!("V4-decode L{} K after proj", self.attn_layer_idx),
-            );
-            super::super::trait_impl::diag_norm(
-                ctx.gpu,
-                v_out,
-                kv_dim as usize,
-                stream,
-                &format!("V4-decode L{} V after copy", self.attn_layer_idx),
-            );
-        }
         } // end !skip_qkv (Steps 1-2)
 
         // ── Step 3: RoPE for Q and K ──
@@ -764,8 +764,7 @@ impl Qwen3AttentionLayer {
                         weight_scale_2_vec: if woa4.weight_scale_2_vec.is_null() {
                             woa4.weight_scale_2_vec
                         } else {
-                            woa4
-                                .weight_scale_2_vec
+                            woa4.weight_scale_2_vec
                                 .offset((g as usize) * (o_lora as usize) * 4)
                         },
                     };

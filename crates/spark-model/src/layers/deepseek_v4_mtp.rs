@@ -534,9 +534,7 @@ impl DeepseekV4MtpHead {
                 t0.elapsed().as_secs_f64() * 1e3,
             );
         } else {
-            tracing::debug!(
-                "V4 MTP drafter feed: {rows} row @ slot {row_base} (RoPE {pos_base})"
-            );
+            tracing::debug!("V4 MTP drafter feed: {rows} row @ slot {row_base} (RoPE {pos_base})");
         }
         Ok(rows)
     }
@@ -650,7 +648,10 @@ impl DraftProposer for DeepseekV4MtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<usize> {
-        let v4_state = match state.as_any_mut().downcast_mut::<DeepseekV4MtpProposerState>() {
+        let v4_state = match state
+            .as_any_mut()
+            .downcast_mut::<DeepseekV4MtpProposerState>()
+        {
             Some(s) => s,
             None => return Ok(0),
         };
@@ -687,7 +688,10 @@ impl DraftProposer for DeepseekV4MtpHead {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<usize> {
-        let v4_state = match state.as_any_mut().downcast_mut::<DeepseekV4MtpProposerState>() {
+        let v4_state = match state
+            .as_any_mut()
+            .downcast_mut::<DeepseekV4MtpProposerState>()
+        {
             Some(s) => s,
             None => return Ok(0),
         };

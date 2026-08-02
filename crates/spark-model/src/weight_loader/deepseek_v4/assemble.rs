@@ -488,7 +488,11 @@ pub fn assemble_layer(
         if !attn_nvfp4_on || bf16.weight.is_null() {
             return None;
         }
-        let shape = store.get(&format!("{lp}.attn.{suffix}.weight")).ok()?.shape.clone();
+        let shape = store
+            .get(&format!("{lp}.attn.{suffix}.weight"))
+            .ok()?
+            .shape
+            .clone();
         if shape.len() != 2 {
             return None;
         }
