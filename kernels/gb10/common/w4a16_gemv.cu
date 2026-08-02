@@ -597,6 +597,37 @@ extern "C" __global__ void w4a16_gemv_batch4_ld(
     w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, lda, ldc);
 }
 
+// M<=8 (DSpark block verify: 5 proposed rows + the committed one) — sibling of
+// w8a16_gemv_batch8. See there for why 8 and not 16.
+extern "C" __global__ void w4a16_gemv_batch8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w4a16_gemv_batchm_impl<8>(A, B_packed, B_scale, scale2, C, M, N, K, K, N);
+}
+
+// M<=8, explicit A/C row strides — sibling of w8a16_gemv_batch8_ld.
+extern "C" __global__ void w4a16_gemv_batch8_ld(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w4a16_gemv_batchm_impl<8>(A, B_packed, B_scale, scale2, C, M, N, K, lda, ldc);
+}
+
 // M<=16 (high-concurrency decode, n=5..16) — sibling of w8a16_gemv_batch16.
 extern "C" __global__ void w4a16_gemv_batch16(
     const __nv_bfloat16* __restrict__ A,

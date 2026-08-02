@@ -227,6 +227,39 @@ extern "C" __global__ void w8a16_gemv_batch4_ld(
     w8a16_gemv_batchm_impl<4>(A, B, block_scale, C, M, N, K, lda, ldc);
 }
 
+// M<=8 (DSpark block verify: 5 proposed rows + the committed one). The batch4
+// pair cannot serve n=6 and the fallback is a full per-row re-read of every
+// projection — six passes over the same weights. MAX_M=8 rather than 16 keeps
+// the unroll and the `acc`/`smem` arrays half as wide for a width that only has
+// to reach 6.
+extern "C" __global__ void w8a16_gemv_batch8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w8a16_gemv_batchm_impl<8>(A, B, block_scale, C, M, N, K, K, N);
+}
+
+// M<=8, explicit A/C row strides — the strided sibling the V4-Flash
+// block-diagonal wo_a needs at verify width.
+extern "C" __global__ void w8a16_gemv_batch8_ld(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w8a16_gemv_batchm_impl<8>(A, B, block_scale, C, M, N, K, lda, ldc);
+}
+
 // M<=16 (high-concurrency decode, n=5..16). Same weight-streaming pass; one
 // extra weight read serves up to 16 activation rows instead of the M-padded
 // MMA the pipelined kernel would use at these batch sizes.

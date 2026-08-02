@@ -42,7 +42,7 @@
 //! overhead is negligible.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ctx::MultiSeqCtx;
@@ -51,7 +51,52 @@ use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
+/// The batched-GEMV entry points that serve one verify width — FP8 packed and
+/// strided, plus their NVFP4 mirrors. Selected once per call and threaded
+/// through both projection phases so a width can never mix kernel families.
+#[derive(Clone, Copy)]
+struct BatchGemv {
+    w8: KernelHandle,
+    w8_ld: KernelHandle,
+    w4: KernelHandle,
+    w4_ld: KernelHandle,
+}
+
 impl Qwen3AttentionLayer {
+    /// Narrowest compiled batched-GEMV pair covering `n` rows.
+    ///
+    /// The `batch4` pair is the common path and must keep serving n<=4: its
+    /// accumulator array, unroll and cross-warp reduction smem are all half
+    /// the `batch8` pair's. The `batch8` pair exists for the DSpark block
+    /// verify (γ=6), where the alternative isn't a slightly wider kernel but
+    /// the per-row fallback — six full re-reads of every attention projection.
+    fn batch_gemv_for(&self, n: usize) -> Option<BatchGemv> {
+        let candidates = [
+            (
+                4usize,
+                self.w8a16_gemv_batch4_k,
+                self.w8a16_gemv_batch4_ld_k,
+                self.w4a16_gemv_batch4_k,
+                self.w4a16_gemv_batch4_ld_k,
+            ),
+            (
+                8,
+                self.w8a16_gemv_batch8_k,
+                self.w8a16_gemv_batch8_ld_k,
+                self.w4a16_gemv_batch8_k,
+                self.w4a16_gemv_batch8_ld_k,
+            ),
+        ];
+        for (max_m, w8, w8_ld, w4, w4_ld) in candidates {
+            // The FP8 pair is the floor — the NVFP4 mirrors are an
+            // optimization the caller gates on separately.
+            if n <= max_m && w8.0 != 0 && w8_ld.0 != 0 {
+                return Some(BatchGemv { w8, w8_ld, w4, w4_ld });
+            }
+        }
+        None
+    }
+
     /// Batched MLA decode for `c.n` sequences. Writes each sequence's
     /// O-projection output into `moe_output[i*h .. (i+1)*h]` and returns
     /// the `moe_output` base pointer for `ms_phase_ffn`.
@@ -224,9 +269,9 @@ impl Qwen3AttentionLayer {
         // the compressor ring in `attention_forward_v4`).
         let row = |elems: u32| n * elems as usize * bf16;
         let need = row(q_dim) * 2 + row(kv_dim) * 2 + row(q_lora) + row(latent_dim);
-        let batch_ok = (2..=4).contains(&n)
-            && self.w8a16_gemv_batch4_k.0 != 0
-            && self.w8a16_gemv_batch4_ld_k.0 != 0
+        let gemv = self.batch_gemv_for(n);
+        let batch_ok = n >= 2
+            && gemv.is_some()
             && mla.wq_a_fp8.is_some()
             && mla.wq_b_fp8.is_some()
             && mla.wkv_a_fp8.is_some()
@@ -238,10 +283,10 @@ impl Qwen3AttentionLayer {
             static ROUTE_ONCE: std::sync::Once = std::sync::Once::new();
             ROUTE_ONCE.call_once(|| {
                 tracing::info!(
-                    "V4-msdecode route: {} (n={n} batch4={} batch4_ld={} fp8 q_a/q_b/kv/o_a/o_b={}/{}/{}/{}/{} scratch={}B need={need}B)",
+                    "V4-msdecode route: {} (n={n} batch4={} batch8={} fp8 q_a/q_b/kv/o_a/o_b={}/{}/{}/{}/{} scratch={}B need={need}B)",
                     if batch_ok { "BATCHED" } else { "per-row fallback" },
                     self.w8a16_gemv_batch4_k.0 != 0,
-                    self.w8a16_gemv_batch4_ld_k.0 != 0,
+                    self.w8a16_gemv_batch8_k.0 != 0,
                     mla.wq_a_fp8.is_some(),
                     mla.wq_b_fp8.is_some(),
                     mla.wkv_a_fp8.is_some(),
@@ -289,6 +334,9 @@ impl Qwen3AttentionLayer {
             return Ok(o_out);
         }
 
+        // `batch_ok` above already proved a pair covers `n`.
+        let gemv = gemv.expect("batch_ok implies a batched-GEMV pair for n");
+
         let scratch = c.fwd.buffers.expert_up_out();
         let q_batch = scratch; //                                  [n, q_dim]
         let attn_batch = q_batch.offset(row(q_dim)); //            [n, q_dim]
@@ -325,7 +373,7 @@ impl Qwen3AttentionLayer {
         let wqa = mla.wq_a_fp8.as_ref().unwrap();
         ops::w8a16_gemv_batch4(
             gpu,
-            self.w8a16_gemv_batch4_k,
+            gemv.w8,
             c.normed,
             wqa.weight,
             wqa.row_scale,
@@ -350,11 +398,11 @@ impl Qwen3AttentionLayer {
         // projections — half the FP8 traffic; same weights the single-token
         // decode argmaxes with (precision-consistency matters for the MTP
         // accept rate).
-        let nv4_ok = self.w4a16_gemv_batch4_k.0 != 0 && self.w4a16_gemv_batch4_ld_k.0 != 0;
+        let nv4_ok = gemv.w4.0 != 0 && gemv.w4_ld.0 != 0;
         if nv4_ok && let Some(ref wqb4) = mla.wq_b_nvfp4 {
             ops::w4a16_gemv_batchm(
                 gpu,
-                self.w4a16_gemv_batch4_k,
+                gemv.w4,
                 ql_batch,
                 wqb4,
                 q_batch,
@@ -367,7 +415,7 @@ impl Qwen3AttentionLayer {
             let wqb = mla.wq_b_fp8.as_ref().unwrap();
             ops::w8a16_gemv_batch4(
                 gpu,
-                self.w8a16_gemv_batch4_k,
+                gemv.w8,
                 ql_batch,
                 wqb.weight,
                 wqb.row_scale,
@@ -395,7 +443,7 @@ impl Qwen3AttentionLayer {
         let wkv = mla.wkv_a_fp8.as_ref().unwrap();
         ops::w8a16_gemv_batch4(
             gpu,
-            self.w8a16_gemv_batch4_k,
+            gemv.w8,
             c.normed,
             wkv.weight,
             wkv.row_scale,
@@ -463,7 +511,7 @@ impl Qwen3AttentionLayer {
                 let s_off = (g as usize) * (o_lora as usize) * (group_in as usize / 16);
                 ops::w4a16_gemv_batch4_ld(
                     gpu,
-                    self.w4a16_gemv_batch4_ld_k,
+                    gemv.w4_ld,
                     attn_batch.offset(g as usize * group_in as usize * bf16),
                     woa4.weight.offset(w_off),
                     woa4.weight_scale.offset(s_off),
@@ -484,7 +532,7 @@ impl Qwen3AttentionLayer {
                 let s_off = (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4;
                 ops::w8a16_gemv_batch4_ld(
                     gpu,
-                    self.w8a16_gemv_batch4_ld_k,
+                    gemv.w8_ld,
                     attn_batch.offset(g as usize * group_in as usize * bf16),
                     woa.weight.offset(w_off),
                     woa.row_scale.offset(s_off),
@@ -501,7 +549,7 @@ impl Qwen3AttentionLayer {
         if nv4_ok && let Some(ref wob4) = mla.wo_b_nvfp4 {
             ops::w4a16_gemv_batchm(
                 gpu,
-                self.w4a16_gemv_batch4_k,
+                gemv.w4,
                 ol_batch,
                 wob4,
                 o_out,
@@ -514,7 +562,7 @@ impl Qwen3AttentionLayer {
             let wob = mla.wo_b_fp8.as_ref().unwrap();
             ops::w8a16_gemv_batch4(
                 gpu,
-                self.w8a16_gemv_batch4_k,
+                gemv.w8,
                 ol_batch,
                 wob.weight,
                 wob.row_scale,

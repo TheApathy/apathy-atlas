@@ -250,6 +250,23 @@ impl Qwen3AttentionLayer {
                 "w4a16_gemv",
                 "w4a16_gemv_batch4_ld",
             ),
+            // M<=8 siblings — the DSpark block verify (γ=6) is past the batch4
+            // window, and without these it has no batched path at all.
+            w8a16_gemv_batch8_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch8",
+            ),
+            w8a16_gemv_batch8_ld_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batch8_ld",
+            ),
+            w4a16_gemv_batch8_ld_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch8_ld",
+            ),
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             w8a16_gemm_pipelined_k: super::super::try_kernel(
                 gpu,
@@ -486,6 +503,7 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemv_batch4_k: crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch4"),
+            w4a16_gemv_batch8_k: crate::layers::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch8"),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_k64"),
