@@ -184,7 +184,7 @@ pub fn load_dspark_drafter(
 
         // `layer_idx = num_hidden_layers` ⇒ past every hash-routed layer, so
         // the MoE takes the learned-gate path (the drafter has no tid2eid).
-        let moe = super::assemble::assemble_moe(
+        let mut moe = super::assemble::assemble_moe(
             store,
             &prefix,
             config.num_hidden_layers,
@@ -194,6 +194,12 @@ pub fn load_dspark_drafter(
             qctx,
         )
         .with_context(|| format!("assembling DSpark stage {s} MoE"))?;
+        // The decode/batchN dispatch keys on the unified `_t` (transposed)
+        // expert layout — the same pass the factory runs over the target's
+        // layers (m2_setup). Skipping it left the `_t` kernels reading
+        // untransposed bytes: NaN out of the very first drafter MoE call.
+        moe.transpose_for_prefill_unified(gpu, &config)
+            .with_context(|| format!("DSpark stage {s}: unified MoE transpose"))?;
 
         let hc_attn = super::assemble::load_hc_site(store, &prefix, "attn", &config, gpu)?;
         let hc_ffn = super::assemble::load_hc_site(store, &prefix, "ffn", &config, gpu)?;
@@ -248,10 +254,21 @@ pub fn load_dspark_drafter(
     let main_proj = dense_auto(store, "mtp.0.main_proj.weight", gpu)?;
     let main_norm = dense_auto(store, "mtp.0.main_norm.weight", gpu)?;
     let norm = dense_auto(store, &format!("mtp.{last}.norm.weight"), gpu)?;
-    let markov_w1 = dense_auto(store, &format!("mtp.{last}.markov_head.markov_w1.weight"), gpu)?;
-    let markov_w2 = dense_auto(store, &format!("mtp.{last}.markov_head.markov_w2.weight"), gpu)?;
-    let confidence_proj =
-        dense_auto(store, &format!("mtp.{last}.confidence_head.proj.weight"), gpu)?;
+    let markov_w1 = dense_auto(
+        store,
+        &format!("mtp.{last}.markov_head.markov_w1.weight"),
+        gpu,
+    )?;
+    let markov_w2 = dense_auto(
+        store,
+        &format!("mtp.{last}.markov_head.markov_w2.weight"),
+        gpu,
+    )?;
+    let confidence_proj = dense_auto(
+        store,
+        &format!("mtp.{last}.confidence_head.proj.weight"),
+        gpu,
+    )?;
 
     tracing::info!(
         "DSpark drafter loaded: {n_stages} V4 stages ({drafter_experts}-expert MoE) + \

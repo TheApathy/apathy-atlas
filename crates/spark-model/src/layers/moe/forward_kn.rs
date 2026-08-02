@@ -64,7 +64,15 @@ impl MoeLayer {
             && self.gate_nvfp4.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && batchn_ok;
+            && batchn_ok
+            // The batchn kernel family reads the NON-transposed expert
+            // buffers. Under the unified `_t` layout those originals are
+            // FREED by the transpose pass — the stale pointer tables are
+            // dangling, and dispatching batchn is an illegal address (first
+            // hit: the DSpark drafter's 5-row block MoE). The per-token
+            // fallback dispatches the `_t` decode kernels, which is the
+            // layout this layer actually holds.
+            && !self.use_t_layout_for_decode();
 
         {
             use std::sync::atomic::{AtomicBool, Ordering};

@@ -204,6 +204,19 @@ def main():
     print(f"dump: {len(recs)} records, {len(seqs)} sequences")
     assert seqs, "no prefill records — rebuild the server with the prefill_b hook"
 
+    # ATLAS_PROBE_DEBUG=1: print intermediate norms for the first propose of
+    # seq 0 — the oracle side of the engine bisect (dspark_head.rs `dbg`).
+    if os.environ.get("ATLAS_PROBE_DEBUG") == "1":
+        def mk_hook(label):
+            def hook(mod, args, out):
+                t = out[0] if isinstance(out, tuple) else out
+                print(f"PROBE_DBG {label}: norm={t.float().norm():.4f} "
+                      f"first={t.flatten()[:4].float().tolist()}")
+            return hook
+        for si_, b_ in enumerate(blocks):
+            b_.attn.register_forward_hook(mk_hook(f"s{si_}.attn_out"))
+            b_.ffn.register_forward_hook(mk_hook(f"s{si_}.moe_out"))
+
     def fuse(rec_slice):  # [nl, n, h] -> [1, n, nl*h]
         return rec_slice.permute(1, 0, 2).reshape(1, rec_slice.shape[1], -1).to(dev)
 
@@ -213,6 +226,10 @@ def main():
     pos_match = [0] * bs
     pos_total = [0] * bs
     conf_kept_chain = []
+    # Reference drafts for the engine-vs-reference diff
+    # (examples/dspark_engine_probe.rs). Record: seq u32, pos u32,
+    # bs×u32 drafts, bs×f32 confidences.
+    ref_out = open(os.path.join(os.path.dirname(DUMP), "dspark_ref_drafts.bin"), "wb")
     with torch.inference_mode():
         for si, seq in enumerate(seqs):
             pre = [r for r in seq if r["kind"] == 0]
@@ -249,6 +266,7 @@ def main():
                 out_ids, logits, conf = blocks[-1].forward_head(h, ids[:, 0])
                 drafts = out_ids[0, 1:].tolist()
                 confs = torch.sigmoid(conf[0].float()).tolist()
+                ref_out.write(struct.pack(f"<2I{bs}I{bs}f", si, p, *drafts, *confs))
                 actual = [tok_at.get(p + 2 + j) for j in range(bs)]
                 if actual[0] is None:
                     continue
