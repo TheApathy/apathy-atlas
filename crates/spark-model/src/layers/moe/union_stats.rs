@@ -19,8 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-const SAMPLE_EVERY: u64 = 64;
-const LOG_EVERY: u64 = 64;
+// 1-in-8 sampled, logged every 16 samples → first line at 128 layer-steps,
+// i.e. within the first three verify steps of a 43-layer model. The 64/64
+// pair needed 4096 calls, which a 128-token run never reaches.
+const SAMPLE_EVERY: u64 = 8;
+const LOG_EVERY: u64 = 16;
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
