@@ -134,6 +134,81 @@ impl MoeLayer {
         Ok(())
     }
 
+    /// Unified-layout transpose for a MoE whose expert bytes live inside
+    /// shard-sized store allocations (the DSpark drafter): transposes every
+    /// projection IN PLACE (host bounce, zero new device allocations) and
+    /// builds the `_t` pointer tables aliasing the store memory. Footprint
+    /// delta: pointer tables only. Caller must set ATLAS_UNIFIED_MOE_LAYOUT=1
+    /// (same dispatch contract as `transpose_for_prefill_unified`).
+    pub fn transpose_for_prefill_unified_inplace(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        let h = config.hidden_size;
+        let inter = config.moe_intermediate_size;
+        let shared_inter = config.shared_expert_intermediate_size;
+        let routed_gs =
+            if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
+                32
+            } else {
+                16
+            };
+        let num_experts = self.weights.experts.len();
+        let mut gate_t = Vec::with_capacity(num_experts);
+        let mut up_t = Vec::with_capacity(num_experts);
+        let mut down_t = Vec::with_capacity(num_experts);
+        for expert in &self.weights.experts {
+            if expert.gate_proj.is_null() {
+                gate_t.push(QuantizedWeight::null());
+                up_t.push(QuantizedWeight::null());
+                down_t.push(QuantizedWeight::null());
+            } else {
+                gate_t.push(
+                    expert
+                        .gate_proj
+                        .transpose_for_gemm_gs_inplace(gpu, inter, h, routed_gs)?,
+                );
+                up_t.push(
+                    expert
+                        .up_proj
+                        .transpose_for_gemm_gs_inplace(gpu, inter, h, routed_gs)?,
+                );
+                down_t.push(
+                    expert
+                        .down_proj
+                        .transpose_for_gemm_gs_inplace(gpu, h, inter, routed_gs)?,
+                );
+            }
+        }
+        self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
+        self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
+        self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
+        if !self.weights.shared_expert.gate_proj.is_null() && shared_inter > 0 {
+            // The drafter's shared expert is a load-time FP8→NVFP4 transcode
+            // (own allocation, per-16 scales); in-place is still correct.
+            self.shared_gate_t = Some(
+                self.weights
+                    .shared_expert
+                    .gate_proj
+                    .transpose_for_gemm_gs_inplace(gpu, shared_inter, h, 16)?,
+            );
+            self.shared_up_t = Some(
+                self.weights
+                    .shared_expert
+                    .up_proj
+                    .transpose_for_gemm_gs_inplace(gpu, shared_inter, h, 16)?,
+            );
+            self.shared_down_t = Some(
+                self.weights
+                    .shared_expert
+                    .down_proj
+                    .transpose_for_gemm_gs_inplace(gpu, h, shared_inter, 16)?,
+            );
+        }
+        Ok(())
+    }
+
     /// Phase 8a unified-layout transpose pass: build persistent transposed
     /// gate/up/down for all experts, freeing the untransposed copies between
     /// phases so the entire pass fits in tight memory budgets that the

@@ -102,6 +102,10 @@ pub struct DsparkDraftHead {
     mbias: DevicePtr,     // [vocab]
     conf_in: DevicePtr,   // [h + markov_rank]
     scratch_u32: DevicePtr,
+    /// The model's `[layers, rows, h]` hc-mean capture buffer
+    /// (ATLAS_DSPARK_CAPTURE=1), installed by the factory after model build.
+    capture_buf: DevicePtr,
+    capture_rows: usize,
 }
 
 impl DsparkDraftHead {
@@ -225,6 +229,8 @@ impl DsparkDraftHead {
             mbias: alloc(vocab as usize)?,
             conf_in: alloc(hu + mr)?,
             scratch_u32: gpu.alloc(4)?,
+            capture_buf: DevicePtr::NULL,
+            capture_rows: 0,
             module,
         })
     }
@@ -826,5 +832,152 @@ impl DsparkDraftHead {
             prev = tok;
         }
         Ok((drafts, confs))
+    }
+}
+
+/// Per-sequence DSpark proposer state. The ring itself lives on the head
+/// (single-stream serving); this tracks how far it has been seeded so the
+/// propose site can catch up over verify-accepted positions from the
+/// model's capture buffer.
+pub struct DsparkProposerState {
+    /// Highest sequence position whose `main_kv` is in the rings; -1 = none.
+    pub last_seeded: i64,
+}
+
+impl crate::speculative::ProposerState for DsparkProposerState {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl DsparkDraftHead {
+    /// Capture-buffer geometry, installed post-model-build by the factory:
+    /// `[num_capture_layers, rows, h]` BF16, rows at sequence positions.
+    pub fn set_capture(&mut self, buf: DevicePtr, rows: usize) {
+        self.capture_buf = buf;
+        self.capture_rows = rows;
+    }
+
+    fn captures_at(&self, pos: usize) -> [DevicePtr; 3] {
+        let h = self.h as usize;
+        [
+            self.capture_buf.offset(pos * h * 2),
+            self.capture_buf.offset((self.capture_rows + pos) * h * 2),
+            self.capture_buf.offset((2 * self.capture_rows + pos) * h * 2),
+        ]
+    }
+}
+
+impl crate::speculative::DraftProposer for DsparkDraftHead {
+    fn alloc_state(
+        &self,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Box<dyn crate::speculative::ProposerState>> {
+        Ok(Box::new(DsparkProposerState { last_seeded: -1 }))
+    }
+
+    /// Contract at the propose site (matches the V4 MTP head's convention):
+    /// `last_token` was just committed at sequence position `position`; the
+    /// captures of the step that GENERATED it live at row `position - 1`.
+    /// Ring catch-up walks every unseeded position up to there — verify
+    /// captured all its rows, so multi-accept gaps are covered.
+    fn propose(
+        &self,
+        last_token: u32,
+        _target_hidden: DevicePtr,
+        position: usize,
+        num_drafts: usize,
+        state: &mut dyn crate::speculative::ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+        _draft_embed_target: Option<DevicePtr>,
+        grammar_bitmask: Option<&[i32]>,
+        _target_hidden_stack: Option<DevicePtr>,
+    ) -> Result<Vec<u32>> {
+        if grammar_bitmask.is_some() {
+            // Grammar-constrained drafting is not wired for the block drafter
+            // yet; declining to draft is lossless (plain decode).
+            return Ok(vec![]);
+        }
+        let st = state
+            .as_any_mut()
+            .downcast_mut::<DsparkProposerState>()
+            .context("DSpark propose: wrong state type")?;
+        if self.capture_buf.is_null() || position == 0 {
+            return Ok(vec![]);
+        }
+        let p = position - 1;
+        if p >= self.capture_rows {
+            return Ok(vec![]);
+        }
+        let gpu = ctx.gpu;
+        // Catch-up: seed every position since the last propose (multi-accept
+        // rows were captured by the verify forward).
+        let from = (st.last_seeded + 1).max(0) as usize;
+        for q in from..p {
+            self.seed_position(gpu, self.captures_at(q), q, stream)?;
+        }
+        let (drafts, confs) = self.propose_block(gpu, ctx, self.captures_at(p), last_token, p, stream)?;
+        st.last_seeded = p as i64;
+
+        // Confidence gate (ATLAS_DSPARK_CONF, 0 = ungated). The offline
+        // calibration (docs/dspark_port.md) shows 0.9 over-truncates on our
+        // cost model; default ungated until tuned in-server.
+        let thr: f32 = std::env::var("ATLAS_DSPARK_CONF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        let mut keep = drafts.len().min(num_drafts.max(1));
+        if thr > 0.0 {
+            let mut k = 0;
+            while k < keep && confs[k] >= thr {
+                k += 1;
+            }
+            keep = k;
+        }
+        Ok(drafts[..keep].to_vec())
+    }
+
+    /// Nothing to roll back: the rings hold only committed-position
+    /// `main_kv` rows (draft rows are never persisted), and the next
+    /// propose's catch-up walk seeds exactly the accepted positions.
+    fn after_verify(
+        &self,
+        _num_accepted: usize,
+        _state: &mut dyn crate::speculative::ProposerState,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Ring seeding over the prompt: the chunked-prefill capture wrote every
+    /// prompt position's hc-mean at its sequence row.
+    fn prefill_drafter(
+        &self,
+        prompt_tokens: &[u32],
+        _hiddens: DevicePtr,
+        state: &mut dyn crate::speculative::ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<usize> {
+        let st = state
+            .as_any_mut()
+            .downcast_mut::<DsparkProposerState>()
+            .context("DSpark prefill: wrong state type")?;
+        if self.capture_buf.is_null() {
+            return Ok(0);
+        }
+        let n = prompt_tokens.len().min(self.capture_rows);
+        // Only the last `window` positions can ever be attended; skipping the
+        // rest keeps re-prefill O(window) at long prompts.
+        let start = n.saturating_sub(self.module.params.window);
+        for q in start..n {
+            self.seed_position(ctx.gpu, self.captures_at(q), q, stream)?;
+        }
+        st.last_seeded = n as i64 - 1;
+        Ok(n - start)
     }
 }

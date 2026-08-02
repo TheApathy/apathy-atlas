@@ -317,8 +317,24 @@ impl TransformerModel {
         // hiddens at ATLAS_DSPARK_CAPTURE_LAYERS (default 40,41,42) streamed
         // to disk for the offline drafter acceptance probe. Probe-only I/O;
         // the hc_mean capture is the mechanism the in-server proposer reuses.
+        // Capture arms with EITHER the probe dump (file I/O) or the pure
+        // in-memory mode the DSpark proposer needs (ATLAS_DSPARK_CAPTURE=1).
+        let dspark_capture_only = std::env::var("ATLAS_DSPARK_CAPTURE").as_deref() == Ok("1");
         let (dspark_dump, dspark_dump_buf, dspark_capture_layers, dspark_dump_rows) =
             match std::env::var("ATLAS_DSPARK_DUMP") {
+                _ if dspark_capture_only => {
+                    let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
+                        .unwrap_or_else(|_| "40,41,42".into())
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    let buf = gpu.alloc(layers.len() * max_seq_len * config.hidden_size * 2)?;
+                    tracing::info!(
+                        "ATLAS_DSPARK_CAPTURE=1: hc-mean capture at layers {layers:?}                          ({} MB, no dump file)",
+                        layers.len() * max_seq_len * config.hidden_size * 2 / (1 << 20),
+                    );
+                    (None, buf, layers, max_seq_len)
+                }
                 Ok(path) if !path.is_empty() => {
                     let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
                         .unwrap_or_else(|_| "40,41,42".into())

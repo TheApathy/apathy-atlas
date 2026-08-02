@@ -194,12 +194,15 @@ pub fn load_dspark_drafter(
             qctx,
         )
         .with_context(|| format!("assembling DSpark stage {s} MoE"))?;
-        // The decode/batchN dispatch keys on the unified `_t` (transposed)
-        // expert layout — the same pass the factory runs over the target's
-        // layers (m2_setup). Skipping it left the `_t` kernels reading
-        // untransposed bytes: NaN out of the very first drafter MoE call.
-        moe.transpose_for_prefill_unified(gpu, &config)
-            .with_context(|| format!("DSpark stage {s}: unified MoE transpose"))?;
+        // IN-PLACE unified transpose: the drafter's expert bytes are slices
+        // of shard-sized store allocations, so the standard
+        // allocate-new-free-old transpose frees nothing and transiently
+        // doubles ~9.7 GB (OOM-killed the serve). The in-place variant
+        // writes the transposed layout back into the store's own memory —
+        // footprint delta is just the pointer tables. There is no non-`_t`
+        // e8m0 decode path (measured 0% drafts without this).
+        moe.transpose_for_prefill_unified_inplace(gpu, &config)
+            .with_context(|| format!("DSpark stage {s}: in-place MoE transpose"))?;
 
         let hc_attn = super::assemble::load_hc_site(store, &prefix, "attn", &config, gpu)?;
         let hc_ffn = super::assemble::load_hc_site(store, &prefix, "ffn", &config, gpu)?;

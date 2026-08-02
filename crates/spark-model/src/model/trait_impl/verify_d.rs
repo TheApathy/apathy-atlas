@@ -304,10 +304,15 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
-            token_ids: None,
+            // Hash-MoE routing needs the verify tokens (uploaded to the
+            // stable buffer below, pre-graph — mirrors verify_b).
+            token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
         };
+        let tid_bytes: Vec<u8> = tokens_all.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
 
         let st3_t1 = st3.then(std::time::Instant::now);
         // ── Phase 2: CUDA graph capture / replay ──
@@ -493,6 +498,10 @@ impl TransformerModel {
                 } else {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
                 }
+                // DSpark capture: all k verify rows at their sequence
+                // positions — accepted rows become the ring catch-up feed
+                // for the next propose (no-op unless DSpark capture is on).
+                self.try_dspark_capture(layer_idx, k, seq.seq_len, stream)?;
                 if vprof {
                     self.gpu.synchronize(stream)?;
                     let us = vprof_l0.elapsed().as_micros() as u64;

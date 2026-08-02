@@ -217,3 +217,4 @@ bench/fp8_dgx2_drift/harness/oc
 test_data/lora-holo-tiny*/reference_deltas.safetensors
 adapters35/
 /dspark_dump*.bin
+/dspark_ref_drafts.bin

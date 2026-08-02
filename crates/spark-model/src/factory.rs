@@ -30,7 +30,10 @@ use crate::weight_loader::{
 /// target before constructing [`crate::layers::BlockDiffusionDraftHead`].
 pub struct DflashBuildArgs<'a> {
     pub drafter_store: &'a WeightStore,
-    pub drafter_config: DflashConfig,
+    /// `Some` = DFlash drafter (parsed drafter config.json); `None` = the
+    /// store holds a DSpark block drafter (`mtp.0.main_proj.weight` marker;
+    /// its hyper-parameters come from `DsparkParams`, not a config file).
+    pub drafter_config: Option<DflashConfig>,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,
 }

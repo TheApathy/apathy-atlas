@@ -193,6 +193,14 @@ impl TransformerModel {
             && !hss_engaged
             && !lora_eager;
 
+        // DeepSeek-V4 hash-MoE (first `num_hash_layers`) routes experts by
+        // token id via tid2eid, so the verify forward needs the M tokens in
+        // the stable token_ids buffer — without it hash layers error out
+        // (first hit: the DSpark γ/K4 verify; the K=2/3 paths always did
+        // this). Uploaded pre-graph, mirrors verify_b.
+        let tid_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), _stream)?;
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -202,7 +210,7 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
-            token_ids: None,
+            token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
         };
@@ -347,6 +355,8 @@ impl TransformerModel {
                 // always conditions on an accepted token's per-layer hidden, never
                 // on a potentially-rejected draft's hidden.
                 self.try_dflash_capture(layer_idx, 0, stream)?;
+                // DSpark capture: all m verify rows at their positions.
+                self.try_dspark_capture(layer_idx, m, seq.seq_len, stream)?;
             }
 
             // Final norm over all M rows.

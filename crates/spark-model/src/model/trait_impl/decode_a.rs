@@ -463,7 +463,7 @@ impl TransformerModel {
             // `hidden` is single-stream scratch after a layer, so the DFlash
             // capture above cannot serve it.
             if !use_graphs {
-                self.try_dspark_capture(i, 1, stream)?;
+                self.try_dspark_capture(i, 1, seq.seq_len, stream)?;
             }
         }
         // MLA absorbed attention: defensive sync before final norm in eager

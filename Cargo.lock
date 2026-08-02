@@ -2122,6 +2122,7 @@ dependencies = [
  "spark-storage",
  "tokenizers",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

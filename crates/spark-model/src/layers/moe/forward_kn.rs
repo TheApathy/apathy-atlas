@@ -72,7 +72,11 @@ impl MoeLayer {
             // hit: the DSpark drafter's 5-row block MoE). The per-token
             // fallback dispatches the `_t` decode kernels, which is the
             // layout this layer actually holds.
-            && !self.use_t_layout_for_decode();
+            && !self.use_t_layout_for_decode()
+            // ... and it decodes NVFP4 scale tables. Native-MXFP4 (E8M0)
+            // experts — the DSpark drafter's format — read as garbage (NaN
+            // out of the first block MoE). Per-token handles e8m0.
+            && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4;
 
         {
             use std::sync::atomic::{AtomicBool, Ordering};

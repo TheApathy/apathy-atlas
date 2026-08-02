@@ -114,7 +114,7 @@ pub(crate) fn load_dflash_drafter(
 ) -> Result<
     Option<(
         spark_runtime::weights::WeightStore,
-        spark_model::weight_loader::DflashConfig,
+        Option<spark_model::weight_loader::DflashConfig>,
     )>,
 > {
     use spark_runtime::weights::WeightLoader;
@@ -133,15 +133,28 @@ pub(crate) fn load_dflash_drafter(
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
-    let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
-        .with_context(|| {
-            format!(
-                "Failed to read drafter config.json at {}",
-                drafter_dir.display()
-            )
-        })?;
-    let drafter_config =
-        spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+    // DSpark block drafter (docs/dspark_port.md): the official 0731 drafter
+    // shards carry no drafter config.json; the `mtp.0.main_proj.weight`
+    // tensor in the safetensors index is the marker. `None` config tells the
+    // factory to build the DSpark head instead of DFlash.
+    let is_dspark = std::fs::read_to_string(drafter_dir.join("model.safetensors.index.json"))
+        .map(|j| j.contains("mtp.0.main_proj.weight"))
+        .unwrap_or(false);
+    let drafter_config = if is_dspark {
+        tracing::info!("Drafter store detected as DSpark (mtp.0.main_proj marker)");
+        None
+    } else {
+        let drafter_config_json = std::fs::read_to_string(drafter_dir.join("config.json"))
+            .with_context(|| {
+                format!(
+                    "Failed to read drafter config.json at {}",
+                    drafter_dir.display()
+                )
+            })?;
+        Some(spark_model::weight_loader::dflash_loader::parse_dflash_config(
+            &drafter_config_json,
+        )?)
+    };
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
     let drafter_store = loader

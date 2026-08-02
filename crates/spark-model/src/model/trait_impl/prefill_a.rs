@@ -434,7 +434,7 @@ impl TransformerModel {
             // DSpark capture (ATLAS_DSPARK_DUMP): hc-mean of all proc_count
             // rows for this chunk. Prefill is eager (graph_capture: false),
             // so the flush after the loop can host-sync.
-            self.try_dspark_capture(i, proc_count, stream)?;
+            self.try_dspark_capture(i, proc_count, seq_len_start, stream)?;
 
             // MLA diagnostic: dump per-layer hidden state norm (once per session)
             static DIAG_DONE: std::sync::atomic::AtomicBool =

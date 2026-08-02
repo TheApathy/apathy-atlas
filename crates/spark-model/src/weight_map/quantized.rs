@@ -252,6 +252,47 @@ impl QuantizedWeight {
         })
     }
 
+    /// [`Self::transpose_for_gemm_gs`] but IN PLACE: the transposed bytes are
+    /// written back into the ORIGINAL device buffers through the host bounce
+    /// this transpose already uses — zero new device allocations. Built for
+    /// the DSpark drafter, whose expert bytes are slices of shard-sized store
+    /// allocations: the allocate-new-free-old transpose there frees nothing
+    /// and transiently doubles ~9.7 GB, which OOM-killed the serve. The
+    /// returned QuantizedWeight aliases self.
+    pub fn transpose_for_gemm_gs_inplace(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<QuantizedWeight> {
+        let half_k = k / 2;
+        let packed_size = n * half_k;
+        let mut buf = vec![0u8; packed_size];
+        gpu.copy_d2h(self.weight, &mut buf)?;
+        let mut t_buf = vec![0u8; packed_size];
+        for i in 0..n {
+            for j in 0..half_k {
+                t_buf[j * n + i] = buf[i * half_k + j];
+            }
+        }
+        gpu.copy_h2d(&t_buf, self.weight)?;
+
+        let num_groups = k / group_size;
+        let scale_size = n * num_groups;
+        let mut sbuf = vec![0u8; scale_size];
+        gpu.copy_d2h(self.weight_scale, &mut sbuf)?;
+        let mut st_buf = vec![0u8; scale_size];
+        for i in 0..n {
+            for j in 0..num_groups {
+                st_buf[j * n + i] = sbuf[i * num_groups + j];
+            }
+        }
+        gpu.copy_h2d(&st_buf, self.weight_scale)?;
+
+        Ok(*self)
+    }
+
     /// Pre-dequant NVFP4 → FP8 E4M3 for zero-overhead prefill GEMMs.
     ///
     /// Reads B_packed[N, K/2] + B_scale[N, K/GROUP_SIZE] + scale2 and produces

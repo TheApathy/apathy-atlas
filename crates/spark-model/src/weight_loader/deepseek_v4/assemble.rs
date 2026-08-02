@@ -516,7 +516,6 @@ pub fn assemble_layer(
     Ok(Box::new(layer))
 }
 
-
 /// Build one V4 MoE FFN (`{prefix}.ffn.*`) — routed experts, shared expert,
 /// gate, optional hash table — exactly as `assemble_layer` always did; the
 /// block is extracted verbatim so the DSpark drafter loader can construct a

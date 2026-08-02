@@ -128,7 +128,8 @@ pub fn build_model(
     // ATLAS_DFLASH_CAPTURE_LAYER_OFFSET=0 to disable this adjustment for
     // a back-to-back A/B test.
     if let Some(ref args) = dflash_args
-        && let Some(ref sub) = args.drafter_config.dflash_config
+        && let Some(ref dcfg) = args.drafter_config
+        && let Some(ref sub) = dcfg.dflash_config
     {
         let offset: i64 = std::env::var("ATLAS_DFLASH_CAPTURE_LAYER_OFFSET")
             .ok()
@@ -173,8 +174,14 @@ pub fn build_model(
     // verification then dropped.
     // Only rank 0 runs the MTP draft (no-EP, all experts local). Skip loading it
     // on the worker ranks — they never call propose(), so it would be dead weight.
-    let mut v4_mtp_module =
-        if config.model_type == "deepseek_v4" && use_speculative && config.ep_rank == 0 {
+    // Under --dflash the step-7 drafter (DFlash or DSpark) replaces this
+    // proposer unconditionally, so loading the legacy MTP module is ~2.5 GB
+    // of dead weight — memory the DSpark drafter itself needs.
+    let mut v4_mtp_module = if config.model_type == "deepseek_v4"
+        && use_speculative
+        && config.ep_rank == 0
+        && dflash_args.is_none()
+    {
             match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
                 store,
                 &config,
@@ -623,9 +630,42 @@ pub fn build_model(
     // `lm_head` pointers (the drafter checkpoint omits these — they're
     // shared at runtime, mirroring vLLM PR #40898's `skip_substrs` flow).
     if let Some(args) = dflash_args {
+        // DSpark block drafter (docs/dspark_port.md): the store carries the
+        // official 0731 drafter shards instead of a DFlash checkpoint.
+        let Some(ref dflash_config) = args.drafter_config else {
+            let module = crate::weight_loader::deepseek_v4::dspark::load_dspark_drafter(
+                args.drafter_store,
+                model.config_ref(),
+                crate::weight_loader::deepseek_v4::dspark::DsparkParams::V4_FLASH_0731(),
+                model.gpu_backend(),
+            )?;
+            let mut head = crate::layers::dspark_head::DsparkDraftHead::new(
+                module,
+                model.config_ref(),
+                crate::weight_map::DenseWeight {
+                    weight: target_embed_for_dflash,
+                },
+                Some(crate::weight_map::DenseWeight {
+                    weight: target_lm_head_for_dflash,
+                }),
+                target_lm_head_fp8_for_dflash,
+                256,
+                max_seq_len,
+                model.gpu_backend(),
+            )?;
+            let (cap_buf, cap_rows) = model.dspark_capture_buf();
+            anyhow::ensure!(
+                !cap_buf.is_null(),
+                "DSpark drafter needs the hc-mean capture: set ATLAS_DSPARK_CAPTURE=1"
+            );
+            head.set_capture(cap_buf, cap_rows);
+            model.set_dflash_proposer(std::sync::Arc::new(head));
+            tracing::info!("DSpark block drafter installed as the active proposer");
+            return Ok(Box::new(model));
+        };
         let weights = load_dflash_weights(
             args.drafter_store,
-            &args.drafter_config,
+            dflash_config,
             model.gpu_backend(),
             1, // tp_size for the drafter side: replicated, so always 1
         )?;

@@ -561,9 +561,10 @@ impl TransformerModel {
         &self,
         layer_idx: usize,
         num_tokens: usize,
+        start_row: usize,
         stream: u64,
     ) -> Result<()> {
-        if self.dspark_dump.is_none() || self.hc_mean_k.0 == 0 {
+        if self.dspark_dump_buf.is_null() || self.hc_mean_k.0 == 0 {
             return Ok(());
         }
         let Some(slot) = self
@@ -573,11 +574,17 @@ impl TransformerModel {
         else {
             return Ok(());
         };
-        let n = num_tokens.min(self.dspark_dump_rows);
+        if start_row >= self.dspark_dump_rows {
+            return Ok(());
+        }
+        let n = num_tokens.min(self.dspark_dump_rows - start_row);
         let h = self.config.hidden_size;
+        // Rows live at their SEQUENCE positions, so chunked prefill, decode,
+        // and the K-row verify all accumulate one coherent [slot, pos, h]
+        // capture history the DSpark proposer can seed its ring from.
         let out = self
             .dspark_dump_buf
-            .offset(slot * self.dspark_dump_rows * h * 2);
+            .offset((slot * self.dspark_dump_rows + start_row) * h * 2);
         crate::layers::ops::hc_mean(
             self.gpu.as_ref(),
             self.hc_mean_k,
@@ -632,11 +639,21 @@ impl TransformerModel {
         for slot in 0..nl {
             let src = self
                 .dspark_dump_buf
-                .offset(slot * self.dspark_dump_rows * h * 2);
+                .offset((slot * self.dspark_dump_rows + start_pos.min(self.dspark_dump_rows)) * h * 2);
             self.gpu.copy_d2h(src, &mut host)?;
             w.write_all(&host)?;
         }
         w.flush()?;
         Ok(())
+    }
+}
+
+impl TransformerModel {
+    /// The DSpark hc-mean capture buffer `[layers, rows, h]` BF16 + its row
+    /// capacity. NULL/0 unless ATLAS_DSPARK_CAPTURE=1 (or the dump probe)
+    /// armed the capture at model build. The factory hands this to
+    /// `DsparkDraftHead::set_capture` when installing the block drafter.
+    pub fn dspark_capture_buf(&self) -> (DevicePtr, usize) {
+        (self.dspark_dump_buf, self.dspark_dump_rows)
     }
 }
