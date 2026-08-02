@@ -51,9 +51,14 @@ impl MoeLayer {
         // kernels are usable only since 37e818ad NULL-guarded their shared
         // expert (their `_t` siblings always had that guard); before it, this
         // faulted with CUDA 700 on the first 2-sequence batch.
+        // Handle pair actually used by the `_t` branch below: native-MXFP4
+        // (E8M0 per-32 routed scales) checkpoints need the `_e8m0` entries;
+        // feeding E8M0 tables to the NVFP4 kernels misreads the [N, K/32]
+        // scales as [N, K/16] and faults (CUDA 700).
+        let (batch2_t_gate_up_k, batch2_t_silu_down_k) = self.batch2_t_handles();
         let mixed_t_ok = self.use_t_layout_for_decode()
-            && self.moe_expert_gate_up_shared_batch2_t_k.0 != 0
-            && self.moe_expert_silu_down_shared_batch2_t_k.0 != 0;
+            && batch2_t_gate_up_k.0 != 0
+            && batch2_t_silu_down_k.0 != 0;
         let mixed_orig_ok = !self.use_t_layout_for_decode()
             && self.moe_expert_gate_up_shared_batch2.0 != 0
             && self.moe_expert_silu_down_shared_batch2.0 != 0
@@ -323,11 +328,15 @@ impl MoeLayer {
             // per-token passes of the m=1 decode path instead of the fused
             // batch2_t kernels. The batch2_t kernels predate the split-K +
             // wide-load rework of the m=1 `exp_unified_t` GEMV (4a43f2d0,
-            // ~125 → ~254 GB/s); with top-6-of-144 routing the two verify
-            // tokens' expert sets are mostly disjoint, so batch2's only
-            // bandwidth win is the shared expert — running the optimized m=1
-            // kernel twice is faster until the batch2_t kernels get the same
-            // treatment.
+            // ~125 → ~254 GB/s), so on a target where they are still the
+            // pre-rework code, two optimized m=1 passes can win.
+            //
+            // The escape hatch is NOT justified by disjoint routing —
+            // `ATLAS_MOE_OVERLAP=1` (see `dump::route_group_row`) measured the
+            // opposite on V4-Flash: hash-routed layers (~7% of MoE fires) pick
+            // the *identical* top-6 for both rows (2.01x amortization), and
+            // learned-gate layers (~93%) still share ~2.6 of 12 slots (1.28x),
+            // on top of the always-duplicated shared expert and gate.
             {
                 static PER_TOKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let per_token = *PER_TOKEN.get_or_init(|| {
@@ -363,47 +372,79 @@ impl MoeLayer {
                     self.shared_down_t.as_ref().unwrap_or(&null_qw),
                 )
             };
-            ops::moe_expert_gate_up_shared_batch2_t(
-                ctx.gpu,
-                self.moe_expert_gate_up_shared_batch2_t_k,
+            // Preferred: the MROW=2 dedup'd split-K `_t` kernels. Same v2s4
+            // body as the m=1 decode GEMV (wide loads + split-K, ~200 GB/s),
+            // but each block computes every slot routed to its expert, so the
+            // overlap measured above is turned into real bandwidth savings.
+            // `batch2_t` is the fallback and is NOT equivalent in cost: it is
+            // the pre-4a43f2d0 shape (byte-per-thread loads, no split-K, no
+            // dedup, ~125 GB/s), which measured 17.0 vs 19.8 tok/s server-side
+            // — its 1.33x amortization cannot cover a ~2x per-byte deficit.
+            if self.dispatch_splitk_m2_t(
+                ctx,
                 input,
-                gate_t.packed_ptrs,
-                gate_t.scale_ptrs,
-                gate_t.scale2_vals,
-                expert_gate_out,
-                up_t.packed_ptrs,
-                up_t.scale_ptrs,
-                up_t.scale2_vals,
-                expert_up_out,
-                indices_dev,
-                sh_gate_t,
-                shared_gate_scratch,
-                sh_up_t,
-                shared_up_scratch,
-                inter,
-                h,
-                top_k,
-                stream,
-            )?;
-            ops::moe_expert_silu_down_shared_batch2_t(
-                ctx.gpu,
-                self.moe_expert_silu_down_shared_batch2_t_k,
                 expert_gate_out,
                 expert_up_out,
-                down_t.packed_ptrs,
-                down_t.scale_ptrs,
-                down_t.scale2_vals,
                 expert_down_out,
-                indices_dev,
                 shared_gate_scratch,
                 shared_up_scratch,
-                sh_down_t,
                 shared_down_out,
+                indices_dev,
+                gate_t,
+                up_t,
+                down_t,
+                sh_gate_t,
+                sh_up_t,
+                sh_down_t,
                 h,
                 inter,
                 top_k,
                 stream,
-            )?;
+            )? {
+                // Fall through to the shared-expert fixup + blend below.
+            } else {
+                ops::moe_expert_gate_up_shared_batch2_t(
+                    ctx.gpu,
+                    batch2_t_gate_up_k,
+                    input,
+                    gate_t.packed_ptrs,
+                    gate_t.scale_ptrs,
+                    gate_t.scale2_vals,
+                    expert_gate_out,
+                    up_t.packed_ptrs,
+                    up_t.scale_ptrs,
+                    up_t.scale2_vals,
+                    expert_up_out,
+                    indices_dev,
+                    sh_gate_t,
+                    shared_gate_scratch,
+                    sh_up_t,
+                    shared_up_scratch,
+                    inter,
+                    h,
+                    top_k,
+                    stream,
+                )?;
+                ops::moe_expert_silu_down_shared_batch2_t(
+                    ctx.gpu,
+                    batch2_t_silu_down_k,
+                    expert_gate_out,
+                    expert_up_out,
+                    down_t.packed_ptrs,
+                    down_t.scale_ptrs,
+                    down_t.scale2_vals,
+                    expert_down_out,
+                    indices_dev,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    sh_down_t,
+                    shared_down_out,
+                    h,
+                    inter,
+                    top_k,
+                    stream,
+                )?;
+            }
             // Mixed config: one batched BF16 shared-expert pass for both tokens
             // (3 GEMMs + silu_mul total, vs 4 launches per token in the
             // per-token fallback). Must run after silu_down_t, which owns the

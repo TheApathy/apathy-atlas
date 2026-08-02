@@ -275,6 +275,19 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_t_e8m0_splitk_k: KernelHandle,
     moe_gate_up_partial_finalize_k: KernelHandle,
     moe_down_partial_finalize_k: KernelHandle,
+    // Multi-row split-K decode (`_m`): the same v2s4 body, but each block
+    // dedups the slots routed to its expert and carries an accumulator per
+    // gathered row, so the weight bytes are read once for up to MROW rows.
+    // MROW=2 backs the MTP K=2 verify; MROW=1 exists so the microtest can
+    // prove the dedup rewrite is bit-identical to the shipping single-row
+    // path before the wider variant is trusted. KernelHandle(0) where not
+    // compiled — the dispatch falls back to per-row `_splitk_k` launches.
+    moe_expert_gate_up_shared_t_m2_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m2_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m2_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m2_k: KernelHandle,
+    moe_gate_up_partial_finalize_m_k: KernelHandle,
+    moe_down_partial_finalize_m_k: KernelHandle,
     // ── sqrtsoftplus routing (DeepSeek-V4) ──
     moe_topk_sqrtsoftplus_k: KernelHandle,
     moe_topk_sqrtsoftplus_batched_k: KernelHandle,
@@ -288,9 +301,19 @@ pub struct MoeLayer {
     tid2eid_dev: Option<DevicePtr>,
     moe_expert_gate_up_shared_batch2_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch2_t_k: KernelHandle,
+    // Native-MXFP4 (E8M0 per-32 routed scales, NVFP4 shared) flavor of the
+    // batched verify kernels. Without these the m-row speculative verify has
+    // to fall back to the single-token kernel once per row, re-reading every
+    // expert / the shared expert / the gate for each row — worth 1.28x
+    // (learned-gate layers) to 2.01x (hash-routed layers) of the routed-expert
+    // weight traffic on DeepSeek-V4-Flash, measured with ATLAS_MOE_OVERLAP=1.
+    moe_expert_gate_up_shared_batch2_t_e8m0_k: KernelHandle,
+    moe_expert_silu_down_shared_batch2_t_e8m0_k: KernelHandle,
     // forward_k16 wide-verify batched MoE (num_tokens generalization of batch2_t).
     moe_expert_gate_up_shared_batchn_t_k: KernelHandle,
     moe_expert_silu_down_shared_batchn_t_k: KernelHandle,
+    moe_expert_gate_up_shared_batchn_t_e8m0_k: KernelHandle,
+    moe_expert_silu_down_shared_batchn_t_e8m0_k: KernelHandle,
     moe_expert_gate_up_shared_batch3_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch3_t_k: KernelHandle,
     moe_expert_gate_up_shared_fp8_t_k: KernelHandle,
@@ -533,6 +556,73 @@ impl MoeLayer {
         (h.0 != 0).then_some(h)
     }
 
+    /// Kernel pair for the two-row batched `_t` decode MoE, picked to match the
+    /// routed-expert scale format. Native-MXFP4 checkpoints need the `_e8m0`
+    /// entries: the NVFP4 kernels read the routed scale table as `[N, K/16]`,
+    /// so an E8M0 `[N, K/32]` table walks off the end and faults (CUDA 700).
+    ///
+    /// Returns `(0, 0)` handles when the needed variant isn't compiled into
+    /// this target — the batched path is an optimization, so the caller's
+    /// `!= 0` guard falls back to two single-row dispatches instead of aborting.
+    #[inline]
+    pub(crate) fn batch2_t_handles(
+        &self,
+    ) -> (
+        spark_runtime::gpu::KernelHandle,
+        spark_runtime::gpu::KernelHandle,
+    ) {
+        let gate_up = self.e8m0_or_opt(
+            self.moe_expert_gate_up_shared_batch2_t_k,
+            self.moe_expert_gate_up_shared_batch2_t_e8m0_k,
+        );
+        let silu_down = self.e8m0_or_opt(
+            self.moe_expert_silu_down_shared_batch2_t_k,
+            self.moe_expert_silu_down_shared_batch2_t_e8m0_k,
+        );
+        match (gate_up, silu_down) {
+            // Both or neither: a half-resolved pair would dispatch one stage
+            // batched and the other per-row against the same buffers.
+            (Some(g), Some(s)) => (g, s),
+            _ => (
+                spark_runtime::gpu::KernelHandle(0),
+                spark_runtime::gpu::KernelHandle(0),
+            ),
+        }
+    }
+
+    // NOTE: no `batchn_t_handles` yet — `forward_kn` dispatches the *non*-`_t`
+    // batchn kernels, so the `_t` pair (and its new `_e8m0` twin) has no call
+    // site to select for. Add the accessor when the wide verify moves to `_t`.
+
+    /// Kernel pair for the MROW=2 dedup'd split-K `_t` decode, picked to match
+    /// the routed-expert scale format — same both-or-neither contract as
+    /// [`Self::batch2_t_handles`], and the same reason: a half-resolved pair
+    /// would run one stage multi-row and the other per-row against buffers
+    /// whose partial layouts disagree.
+    #[inline]
+    pub(crate) fn splitk_m2_t_handles(
+        &self,
+    ) -> (
+        spark_runtime::gpu::KernelHandle,
+        spark_runtime::gpu::KernelHandle,
+    ) {
+        let gate_up = self.e8m0_or_opt(
+            self.moe_expert_gate_up_shared_t_m2_k,
+            self.moe_expert_gate_up_shared_t_e8m0_m2_k,
+        );
+        let silu_down = self.e8m0_or_opt(
+            self.moe_expert_silu_down_shared_t_m2_k,
+            self.moe_expert_silu_down_shared_t_e8m0_m2_k,
+        );
+        match (gate_up, silu_down) {
+            (Some(g), Some(s)) => (g, s),
+            _ => (
+                spark_runtime::gpu::KernelHandle(0),
+                spark_runtime::gpu::KernelHandle(0),
+            ),
+        }
+    }
+
     /// True when the routed experts are W3 Lloyd-Max (3-bit) — every
     /// expert-weight-reading dispatch site must select a `_w3` kernel.
     #[inline]
@@ -566,7 +656,7 @@ impl MoeLayer {
 }
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
-mod dump;
+pub(crate) mod dump;
 mod forward;
 mod forward_atomic_c4;
 mod forward_batched;

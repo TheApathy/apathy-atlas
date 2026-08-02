@@ -394,6 +394,38 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_down_partial_finalize",
             ),
+            // Multi-row (dedup'd) split-K decode. Same VEC/split as above, so
+            // the `m2v2s4` suffix must stay in step with `ops::T_SPLIT_VEC`.
+            moe_expert_gate_up_shared_t_m2_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m2v2s4",
+            ),
+            moe_expert_silu_down_shared_t_m2_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m2v2s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m2_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m2v2s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m2_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m2v2s4",
+            ),
+            moe_gate_up_partial_finalize_m_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_gate_up_partial_finalize_m",
+            ),
+            moe_down_partial_finalize_m_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_down_partial_finalize_m",
+            ),
             // sqrtsoftplus kernels: lazy-loaded via try_kernel so models that
             // don't register them (all except DeepSeek-V4) start fine.
             moe_topk_sqrtsoftplus_k: super::super::try_kernel(
@@ -424,6 +456,20 @@ impl MoeLayer {
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_silu_down_shared_batch2_t",
             )?,
+            // `try_kernel`, not `kernel`: the `_e8m0` entries only resolve in
+            // targets built with native-MXFP4 experts. A 0 handle makes
+            // `e8m0_or_opt` fall back to the per-row path rather than fail
+            // startup on a checkpoint that has no E8M0 weights anyway.
+            moe_expert_gate_up_shared_batch2_t_e8m0_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_batch2_t",
+                "moe_expert_gate_up_shared_batch2_t_e8m0",
+            ),
+            moe_expert_silu_down_shared_batch2_t_e8m0_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_batch2_t",
+                "moe_expert_silu_down_shared_batch2_t_e8m0",
+            ),
             moe_expert_gate_up_shared_batchn_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_gate_up_shared_batchN_t",
@@ -432,6 +478,16 @@ impl MoeLayer {
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_silu_down_shared_batchN_t",
             )?,
+            moe_expert_gate_up_shared_batchn_t_e8m0_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_batch2_t",
+                "moe_expert_gate_up_shared_batchN_t_e8m0",
+            ),
+            moe_expert_silu_down_shared_batchn_t_e8m0_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_batch2_t",
+                "moe_expert_silu_down_shared_batchN_t_e8m0",
+            ),
             moe_expert_gate_up_shared_batch3_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch3_t",
                 "moe_expert_gate_up_shared_batch3_t",

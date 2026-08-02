@@ -899,3 +899,532 @@ extern "C" __global__ void moe_down_partial_finalize(
     if (dst == 0) return;
     dst[n] = __float2bfloat16(s);
 }
+
+// ============================================================================
+// Multi-row (MTP speculative verify) decode GEMV — MROW tokens per launch.
+//
+// The K=2 verify runs the same MoE twice, once per candidate row, and the two
+// rows' routed expert sets are NOT disjoint: `ATLAS_MOE_OVERLAP=1` measured
+// 1.28x of shared slots on the learned-gate layers (~93% of MoE fires) and
+// 2.01x on the hash-routed layers, where both rows select the IDENTICAL top-6.
+// The shared expert is duplicated outright. Reading those weights once and
+// FMA-ing them into both rows is the whole point of this kernel.
+//
+// It is the single-row split-K kernel above with two changes:
+//   1. DEDUP. grid.y spans `num_tokens*top_k + 1` flat slots. The FIRST slot
+//      holding a given expert id is the leader and computes every slot routed
+//      to that expert; later duplicates exit before touching memory. The one
+//      shared block-set (y == total_routed) serves all `num_tokens` rows.
+//   2. MROW accumulators. `acc[MROW][VEC]`; the weight byte is decoded ONCE
+//      and FMA'd across the gathered rows, so weight bytes per useful FLOP
+//      drop by exactly the overlap factor above.
+//
+// Per (row, n) the k iteration order is unchanged from the single-row kernel,
+// so MROW=1 is bit-identical to it — the microtest gates on that.
+//
+// Launch contract (partial rows = num_tokens*top_k + num_tokens):
+//   gate_up: grid = [N/(block*VEC), num_tokens*top_k + 1, 2*SPLIT]
+//   down:    grid = [N/(block*VEC), num_tokens*top_k + 1, SPLIT],
+//            smem = MROW * K*4/SPLIT   (one s_act slice per gathered row)
+// then `moe_gate_up_partial_finalize_m` / `moe_down_partial_finalize_m`.
+// ============================================================================
+
+// Leader election + slot gather, shared by the gate_up/silu_down multi-row
+// bodies. Returns false when this block is a duplicate and must exit. Every
+// branch is block-uniform (y and is_shared come from blockIdx), so the
+// __syncthreads below is reached by all threads or none.
+template<int MROW>
+__device__ __forceinline__ bool mrow_gather_slots(
+    const unsigned int* __restrict__ expert_indices,
+    unsigned int y, unsigned int total_routed, unsigned int num_tokens,
+    bool is_shared, unsigned int (&slots)[MROW], unsigned int& m_out
+) {
+    // 32 slots per row is well past any top_k this family serves (production is
+    // 6); the stage loop is bounded by total_routed, so a wider routing would
+    // overrun. Kept as a fixed bound because the array must be compile-time.
+    __shared__ unsigned int s_idx[MROW * 32];
+    __shared__ unsigned int s_slot[MROW];
+    __shared__ unsigned int s_m;
+    // Stage the routing cooperatively. The scan below is serial on thread 0, so
+    // leaving it against global memory made every block pay up to `y` dependent
+    // loads with the rest of the block parked at the barrier.
+    if (!is_shared) {
+        for (unsigned int i = threadIdx.x; i < total_routed; i += blockDim.x) {
+            s_idx[i] = expert_indices[i];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        unsigned int m = 0;
+        if (is_shared) {
+            // One block-set computes the shared projection for every row.
+            for (unsigned int t = 0; t < num_tokens && m < MROW; ++t) s_slot[m++] = t;
+        } else {
+            const unsigned int e = s_idx[y];
+            bool leader = true;
+            for (unsigned int s = 0; s < y; ++s) {
+                if (s_idx[s] == e) { leader = false; break; }
+            }
+            if (leader) {
+                for (unsigned int s = y; s < total_routed && m < MROW; ++s) {
+                    if (s_idx[s] == e) s_slot[m++] = s;
+                }
+            }
+        }
+        s_m = m;   // 0 => duplicate slot, nothing to do
+    }
+    __syncthreads();
+    m_out = s_m;
+    #pragma unroll
+    for (int i = 0; i < MROW; ++i) slots[i] = (i < (int)s_m) ? s_slot[i] : 0u;
+    return s_m > 0;
+}
+
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW>
+__device__ __forceinline__ void gate_up_shared_t_m_impl(
+    const __nv_bfloat16* __restrict__ A,                    // [num_tokens, K]
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,
+    const float* __restrict__ gate_scale2_vals,
+    __nv_bfloat16* __restrict__ gate_out,                   // [num_tokens*top_k, N]
+    const unsigned long long* __restrict__ up_packed_t_ptrs,
+    const unsigned long long* __restrict__ up_scale_t_ptrs,
+    const float* __restrict__ up_scale2_vals,
+    __nv_bfloat16* __restrict__ up_out,                     // [num_tokens*top_k, N]
+    const unsigned int* __restrict__ expert_indices,        // [num_tokens*top_k]
+    const unsigned char* __restrict__ sh_gate_t_packed,
+    const unsigned char* __restrict__ sh_gate_t_scale,
+    float sh_gate_s2,
+    __nv_bfloat16* __restrict__ sh_gate_out,                // [num_tokens, N]
+    const unsigned char* __restrict__ sh_up_t_packed,
+    const unsigned char* __restrict__ sh_up_t_scale,
+    float sh_up_s2,
+    __nv_bfloat16* __restrict__ sh_up_out,                  // [num_tokens, N]
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int num_tokens,
+    float* __restrict__ partial                             // [2, SPLIT, rows, N]
+) {
+    const unsigned int total_routed = num_tokens * top_k;
+    const unsigned int y = blockIdx.y;
+    const bool is_shared = (y >= total_routed);
+    const unsigned int proj = (SPLIT == 1) ? blockIdx.z : (blockIdx.z / SPLIT);
+    const unsigned int ks = (SPLIT == 1) ? 0u : (blockIdx.z % SPLIT);
+    const unsigned int rows = total_routed + num_tokens;
+    const unsigned int n = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+
+    unsigned int slots[MROW];
+    unsigned int M;
+    if (!mrow_gather_slots<MROW>(expert_indices, y, total_routed, num_tokens,
+                                 is_shared, slots, M)) return;
+
+    // Partial row for gathered row m: routed slot s -> s; shared row t -> total_routed + t.
+    const auto row_of = [&](int m) -> unsigned int {
+        return is_shared ? (total_routed + slots[m]) : slots[m];
+    };
+    const auto emit = [&](int m, const float (&vals)[VEC]) {
+        if constexpr (SPLIT == 1) {
+            __nv_bfloat16* base = is_shared
+                ? ((proj == 0) ? sh_gate_out : sh_up_out)
+                : ((proj == 0) ? gate_out : up_out);
+            store_vec_bf16<VEC>(base + (unsigned long long)slots[m] * N + n, vals);
+        } else {
+            float* o = partial + ((unsigned long long)blockIdx.z * rows + row_of(m)) * N;
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) o[n + v] = vals[v];
+        }
+    };
+    const auto emit_zero_all = [&]() {
+        float zero[VEC];
+        #pragma unroll
+        for (int v = 0; v < VEC; ++v) zero[v] = 0.0f;
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            if (n + VEC <= N) emit(m, zero);
+        }
+    };
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    if (is_shared) {
+        if (proj == 0) { B_packed = sh_gate_t_packed; B_scale = sh_gate_t_scale; s2 = sh_gate_s2; }
+        else           { B_packed = sh_up_t_packed;   B_scale = sh_up_t_scale;   s2 = sh_up_s2; }
+        // An absent shared half writes zeros into every row, matching the
+        // single-row kernel's emit_zero (the blend downstream reads them).
+        if (B_packed == 0) { emit_zero_all(); return; }
+    } else {
+        const unsigned int expert_id = expert_indices[y];
+        if (proj == 0) {
+            B_packed = (const unsigned char*)gate_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)gate_scale_t_ptrs[expert_id];
+            s2 = gate_scale2_vals[expert_id];
+        } else {
+            B_packed = (const unsigned char*)up_packed_t_ptrs[expert_id];
+            B_scale = (const unsigned char*)up_scale_t_ptrs[expert_id];
+            s2 = up_scale2_vals[expert_id];
+        }
+        if (B_packed == 0) { emit_zero_all(); return; }   // EP remote expert
+    }
+
+    // See the single-row kernel: VEC>1 cannot serve a partial group.
+    if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
+
+    // A row per gathered slot. Routed slots are flat (token = slot / top_k);
+    // shared slots ARE the token index.
+    const __nv_bfloat16* A_row[MROW];
+    #pragma unroll
+    for (int m = 0; m < MROW; ++m) {
+        const unsigned int t = is_shared ? slots[m] : (slots[m] / top_k);
+        A_row[m] = A + (unsigned long long)t * K;
+    }
+
+    // Weight load + decode hoisted out of the row loop — that hoist IS the win.
+    //
+    // ROWS_ is a LITERAL, never the runtime `M`, and the accumulator and the
+    // emit live INSIDE this macro so both are sized by it. An `if (m >= M)
+    // break` inside the k loop measured a fixed ~21% per-byte penalty: it keeps
+    // the row loop from unrolling and puts a branch in the innermost FMA block,
+    // which the duplicate-heavy real routing (most leaders gather M=1) pays on
+    // every byte while collecting none of the reuse. Leaving `acc[MROW][VEC]`
+    // outside costs a second time over: the unused half stays register-live
+    // through the whole k sweep and pushes occupancy down. `M` is
+    // block-uniform, so dispatching once to a compile-time-sized body costs a
+    // single uniform branch.
+    #define GATEUP_M_ACCUM(GS_, E8M0_, ROWS_) do { \
+        float acc[(ROWS_)][VEC]; \
+        _Pragma("unroll") \
+        for (int m = 0; m < (ROWS_); ++m) { \
+            _Pragma("unroll") \
+            for (int v = 0; v < VEC; ++v) acc[m][v] = 0.0f; \
+        } \
+        const unsigned int gpk = K / (GS_) / SPLIT; \
+        for (unsigned int sg = ks * gpk; sg < (ks + 1) * gpk; sg++) { \
+            unsigned char sb[VEC]; \
+            load_vec_u8<VEC>(B_scale + (unsigned long long)sg * N + n, sb); \
+            float sc[VEC]; \
+            _Pragma("unroll") \
+            for (int v = 0; v < VEC; ++v) sc[v] = mx_block_scale<(E8M0_)>(sb[v], s2); \
+            const unsigned int kh_base = sg * ((GS_) / 2); \
+            _Pragma("unroll") \
+            for (unsigned int kh_off = 0; kh_off < ((GS_) / 2); kh_off++) { \
+                unsigned int k_half = kh_base + kh_off; \
+                unsigned char byte[VEC]; \
+                load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte); \
+                float w_lo[VEC], w_hi[VEC]; \
+                _Pragma("unroll") \
+                for (int v = 0; v < VEC; ++v) { \
+                    w_lo[v] = e2m1_decode(byte[v] & 0xFu) * sc[v]; \
+                    w_hi[v] = e2m1_decode((byte[v] >> 4) & 0xFu) * sc[v]; \
+                } \
+                _Pragma("unroll") \
+                for (int m = 0; m < (ROWS_); ++m) { \
+                    float a_lo = __bfloat162float(A_row[m][k_half * 2]); \
+                    float a_hi = __bfloat162float(A_row[m][k_half * 2 + 1]); \
+                    _Pragma("unroll") \
+                    for (int v = 0; v < VEC; ++v) { \
+                        acc[m][v] += a_lo * w_lo[v] + a_hi * w_hi[v]; \
+                    } \
+                } \
+            } \
+        } \
+        _Pragma("unroll") \
+        for (int m = 0; m < (ROWS_); ++m) emit(m, acc[m]); \
+    } while(0)
+    // Two-level dispatch: scale format (compile-time except in the mixed case)
+    // then row count. GATEUP_M_ROWS expands one arm per possible M.
+    #define GATEUP_M_ROWS(GS_, E8M0_) do { \
+        if (MROW == 1 || M == 1) { GATEUP_M_ACCUM(GS_, E8M0_, 1); } \
+        else                     { GATEUP_M_ACCUM(GS_, E8M0_, (MROW < 2 ? 1 : 2)); } \
+    } while(0)
+    if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
+        GATEUP_M_ROWS(GS_R, E8M0_R);
+    } else {
+        if (is_shared) { GATEUP_M_ROWS(GS_S, E8M0_S); }
+        else           { GATEUP_M_ROWS(GS_R, E8M0_R); }
+    }
+    #undef GATEUP_M_ROWS
+    #undef GATEUP_M_ACCUM
+}
+
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW>
+__device__ __forceinline__ void silu_down_shared_t_m_impl(
+    const __nv_bfloat16* __restrict__ gate_out,             // [num_tokens*top_k, K]
+    const __nv_bfloat16* __restrict__ up_out,
+    const unsigned long long* __restrict__ packed_t_ptrs,
+    const unsigned long long* __restrict__ scale_t_ptrs,
+    const float* __restrict__ scale2_vals,
+    __nv_bfloat16* __restrict__ C,                          // [num_tokens*top_k, N]
+    const unsigned int* __restrict__ expert_indices,
+    const __nv_bfloat16* __restrict__ sh_gate_in,           // [num_tokens, K]
+    const __nv_bfloat16* __restrict__ sh_up_in,
+    const unsigned char* __restrict__ sh_down_t_packed,
+    const unsigned char* __restrict__ sh_down_t_scale,
+    float sh_down_s2,
+    __nv_bfloat16* __restrict__ sh_down_out,                // [num_tokens, N]
+    unsigned int N, unsigned int K, unsigned int top_k, unsigned int num_tokens,
+    float* __restrict__ partial                             // [SPLIT, rows, N]
+) {
+    const unsigned int total_routed = num_tokens * top_k;
+    const unsigned int y = blockIdx.y;
+    const bool is_shared = (y >= total_routed);
+    const unsigned int ks = (SPLIT == 1) ? 0u : blockIdx.z;
+    const unsigned int rows = total_routed + num_tokens;
+    const unsigned int n = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+
+    unsigned int slots[MROW];
+    unsigned int M;
+    if (!mrow_gather_slots<MROW>(expert_indices, y, total_routed, num_tokens,
+                                 is_shared, slots, M)) return;
+
+    const auto row_of = [&](int m) -> unsigned int {
+        return is_shared ? (total_routed + slots[m]) : slots[m];
+    };
+    const auto emit = [&](int m, const float (&vals)[VEC]) {
+        if constexpr (SPLIT == 1) {
+            __nv_bfloat16* base = is_shared ? sh_down_out : C;
+            store_vec_bf16<VEC>(base + (unsigned long long)slots[m] * N + n, vals);
+        } else {
+            float* o = partial + ((unsigned long long)ks * rows + row_of(m)) * N;
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) o[n + v] = vals[v];
+        }
+    };
+    const auto emit_zero_all = [&]() {
+        float zero[VEC];
+        #pragma unroll
+        for (int v = 0; v < VEC; ++v) zero[v] = 0.0f;
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            if (n + VEC <= N) emit(m, zero);
+        }
+    };
+
+    const unsigned char* B_packed;
+    const unsigned char* B_scale;
+    float s2;
+    if (is_shared) {
+        B_packed = sh_down_t_packed;
+        B_scale = sh_down_t_scale;
+        s2 = sh_down_s2;
+        if (B_packed == 0) { emit_zero_all(); return; }
+    } else {
+        const unsigned int expert_id = expert_indices[y];
+        B_packed = (const unsigned char*)packed_t_ptrs[expert_id];
+        B_scale = (const unsigned char*)scale_t_ptrs[expert_id];
+        s2 = scale2_vals[expert_id];
+        if (B_packed == 0) { emit_zero_all(); return; }
+    }
+
+    // Phase 1: one s_act slice per gathered row — SiLU(gate)*up over this
+    // block's k window. Callers size dynamic smem to MROW * K*4/SPLIT.
+    const unsigned int k_len = K / SPLIT;
+    const unsigned int k_lo = (SPLIT == 1) ? 0u : ks * k_len;
+    extern __shared__ float s_act_m[];
+    for (int m = 0; m < MROW; ++m) {
+        if (m >= (int)M) break;
+        const __nv_bfloat16* g_ptr = is_shared
+            ? sh_gate_in + (unsigned long long)slots[m] * K
+            : gate_out + (unsigned long long)slots[m] * K;
+        const __nv_bfloat16* u_ptr = is_shared
+            ? sh_up_in + (unsigned long long)slots[m] * K
+            : up_out + (unsigned long long)slots[m] * K;
+        float* dst = s_act_m + (unsigned long long)m * k_len;
+        for (unsigned int i = threadIdx.x; i < k_len; i += blockDim.x) {
+            float gf = __bfloat162float(g_ptr[k_lo + i]);
+            float uf = __bfloat162float(u_ptr[k_lo + i]);
+            dst[i] = (gf / (1.0f + __expf(-gf))) * uf;
+        }
+    }
+    __syncthreads();
+
+    if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
+
+    const unsigned int K_half = K / 2;
+    // Accumulator and emit both live INSIDE the macro so they are sized by the
+    // literal ROWS_ — see the gate_up twin for why (unrolling, and keeping the
+    // unused half of `acc[MROW][VEC]` from staying register-live in the M==1
+    // arm, which is the common case under duplicate-heavy real routing).
+    #define SILUDOWN_M_ACCUM(GS_, E8M0_, ROWS_) do { \
+        float acc[(ROWS_)][VEC]; \
+        _Pragma("unroll") \
+        for (int m = 0; m < (ROWS_); ++m) { \
+            _Pragma("unroll") \
+            for (int v = 0; v < VEC; ++v) acc[m][v] = 0.0f; \
+        } \
+        const unsigned int gpk = K / (GS_) / SPLIT; \
+        for (unsigned int sg = ks * gpk; sg < (ks + 1) * gpk; sg++) { \
+            unsigned char sb[VEC]; \
+            load_vec_u8<VEC>(B_scale + (unsigned long long)sg * N + n, sb); \
+            float sc[VEC]; \
+            _Pragma("unroll") \
+            for (int v = 0; v < VEC; ++v) sc[v] = mx_block_scale<(E8M0_)>(sb[v], s2); \
+            const unsigned int kh_base = sg * ((GS_) / 2); \
+            _Pragma("unroll") \
+            for (unsigned int kh_off = 0; kh_off < ((GS_) / 2); kh_off++) { \
+                unsigned int k_half = kh_base + kh_off; \
+                unsigned char byte[VEC]; \
+                load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte); \
+                float w_lo[VEC], w_hi[VEC]; \
+                _Pragma("unroll") \
+                for (int v = 0; v < VEC; ++v) { \
+                    w_lo[v] = e2m1_decode(byte[v] & 0xFu) * sc[v]; \
+                    w_hi[v] = e2m1_decode((byte[v] >> 4) & 0xFu) * sc[v]; \
+                } \
+                _Pragma("unroll") \
+                for (int m = 0; m < (ROWS_); ++m) { \
+                    const float* act = s_act_m + (unsigned long long)m * k_len; \
+                    float a_lo = act[k_half * 2 - k_lo]; \
+                    float a_hi = act[k_half * 2 + 1 - k_lo]; \
+                    _Pragma("unroll") \
+                    for (int v = 0; v < VEC; ++v) { \
+                        acc[m][v] += a_lo * w_lo[v] + a_hi * w_hi[v]; \
+                    } \
+                } \
+            } \
+            if (kh_base + ((GS_) / 2) > K_half) break; \
+        } \
+        _Pragma("unroll") \
+        for (int m = 0; m < (ROWS_); ++m) emit(m, acc[m]); \
+    } while(0)
+    // See the gate_up twin: ROWS_ must be a literal, so dispatch on the
+    // block-uniform M once instead of branching per k iteration.
+    #define SILUDOWN_M_ROWS(GS_, E8M0_) do { \
+        if (MROW == 1 || M == 1) { SILUDOWN_M_ACCUM(GS_, E8M0_, 1); } \
+        else                     { SILUDOWN_M_ACCUM(GS_, E8M0_, (MROW < 2 ? 1 : 2)); } \
+    } while(0)
+    if constexpr (GS_R == GS_S && E8M0_R == E8M0_S) {
+        SILUDOWN_M_ROWS(GS_R, E8M0_R);
+    } else {
+        if (is_shared) { SILUDOWN_M_ROWS(GS_S, E8M0_S); }
+        else           { SILUDOWN_M_ROWS(GS_R, E8M0_R); }
+    }
+    #undef SILUDOWN_M_ROWS
+    #undef SILUDOWN_M_ACCUM
+}
+
+#define GATEUP_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_)              \
+extern "C" __global__ void NAME(                                               \
+    const __nv_bfloat16* __restrict__ A,                                       \
+    const unsigned long long* __restrict__ gate_packed_t_ptrs,                 \
+    const unsigned long long* __restrict__ gate_scale_t_ptrs,                  \
+    const float* __restrict__ gate_scale2_vals,                                \
+    __nv_bfloat16* __restrict__ gate_out,                                      \
+    const unsigned long long* __restrict__ up_packed_t_ptrs,                   \
+    const unsigned long long* __restrict__ up_scale_t_ptrs,                    \
+    const float* __restrict__ up_scale2_vals,                                  \
+    __nv_bfloat16* __restrict__ up_out,                                        \
+    const unsigned int* __restrict__ expert_indices,                           \
+    const unsigned char* __restrict__ sh_gate_t_packed,                        \
+    const unsigned char* __restrict__ sh_gate_t_scale,                         \
+    float sh_gate_s2,                                                          \
+    __nv_bfloat16* __restrict__ sh_gate_out,                                   \
+    const unsigned char* __restrict__ sh_up_t_packed,                          \
+    const unsigned char* __restrict__ sh_up_t_scale,                           \
+    float sh_up_s2,                                                            \
+    __nv_bfloat16* __restrict__ sh_up_out,                                     \
+    unsigned int N, unsigned int K, unsigned int top_k,                        \
+    unsigned int num_tokens,                                                   \
+    float* __restrict__ partial                                                \
+) {                                                                            \
+    gate_up_shared_t_m_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false,             \
+                            (VEC_), (SPLIT_), (MROW_)>(                        \
+        A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out,  \
+        up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out,             \
+        expert_indices, sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2,         \
+        sh_gate_out, sh_up_t_packed, sh_up_t_scale, sh_up_s2, sh_up_out,       \
+        N, K, top_k, num_tokens, partial);                                     \
+}
+
+#define DOWN_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_)                \
+extern "C" __global__ void NAME(                                               \
+    const __nv_bfloat16* __restrict__ gate_out,                                \
+    const __nv_bfloat16* __restrict__ up_out,                                  \
+    const unsigned long long* __restrict__ packed_t_ptrs,                      \
+    const unsigned long long* __restrict__ scale_t_ptrs,                       \
+    const float* __restrict__ scale2_vals,                                     \
+    __nv_bfloat16* __restrict__ C,                                             \
+    const unsigned int* __restrict__ expert_indices,                           \
+    const __nv_bfloat16* __restrict__ sh_gate_in,                              \
+    const __nv_bfloat16* __restrict__ sh_up_in,                                \
+    const unsigned char* __restrict__ sh_down_t_packed,                        \
+    const unsigned char* __restrict__ sh_down_t_scale,                         \
+    float sh_down_s2,                                                          \
+    __nv_bfloat16* __restrict__ sh_down_out,                                   \
+    unsigned int N, unsigned int K, unsigned int top_k,                        \
+    unsigned int num_tokens,                                                   \
+    float* __restrict__ partial                                                \
+) {                                                                            \
+    silu_down_shared_t_m_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false,           \
+                              (VEC_), (SPLIT_), (MROW_)>(                      \
+        gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C,         \
+        expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed,                \
+        sh_down_t_scale, sh_down_s2, sh_down_out, N, K, top_k, num_tokens,     \
+        partial);                                                              \
+}
+
+// MROW=2: the MTP K=2 verify. MROW=1 exists only as the microtest's
+// bit-exactness reference against the shipping single-row v2s4 kernel.
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2)
+
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2)
+
+#undef GATEUP_M_ENTRY
+#undef DOWN_M_ENTRY
+
+// Multi-row finalize. `rows = total_routed + num_tokens`: the routed slots in
+// flat order, then one shared row per token.
+// Launch: grid = [ceil(N/block), rows, 2], block = [block,1,1].
+extern "C" __global__ void moe_gate_up_partial_finalize_m(
+    const float* __restrict__ partial,          // [2, split, rows, N]
+    __nv_bfloat16* __restrict__ gate_out,       // [total_routed, N]
+    __nv_bfloat16* __restrict__ sh_gate_out,    // [num_tokens, N]
+    __nv_bfloat16* __restrict__ up_out,         // [total_routed, N]
+    __nv_bfloat16* __restrict__ sh_up_out,      // [num_tokens, N]
+    unsigned int N, unsigned int total_routed, unsigned int num_tokens,
+    unsigned int split
+) {
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const unsigned int row = blockIdx.y;
+    const unsigned int proj = blockIdx.z;
+    const unsigned int rows = total_routed + num_tokens;
+
+    float s = 0.0f;
+    for (unsigned int ks = 0; ks < split; ++ks) {
+        s += partial[(((unsigned long long)proj * split + ks) * rows + row) * N + n];
+    }
+    __nv_bfloat16* dst = (row >= total_routed)
+        ? (((proj == 0) ? sh_gate_out : sh_up_out) + (unsigned long long)(row - total_routed) * N)
+        : (((proj == 0) ? gate_out : up_out) + (unsigned long long)row * N);
+    if (dst == 0) return;
+    dst[n] = __float2bfloat16(s);
+}
+
+// Launch: grid = [ceil(N/block), rows, 1], block = [block,1,1].
+extern "C" __global__ void moe_down_partial_finalize_m(
+    const float* __restrict__ partial,          // [split, rows, N]
+    __nv_bfloat16* __restrict__ C,              // [total_routed, N]
+    __nv_bfloat16* __restrict__ sh_down_out,    // [num_tokens, N]
+    unsigned int N, unsigned int total_routed, unsigned int num_tokens,
+    unsigned int split
+) {
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const unsigned int row = blockIdx.y;
+    const unsigned int rows = total_routed + num_tokens;
+
+    float s = 0.0f;
+    for (unsigned int ks = 0; ks < split; ++ks) {
+        s += partial[((unsigned long long)ks * rows + row) * N + n];
+    }
+    __nv_bfloat16* dst = (row >= total_routed)
+        ? (sh_down_out + (unsigned long long)(row - total_routed) * N)
+        : (C + (unsigned long long)row * N);
+    if (dst == 0) return;
+    dst[n] = __float2bfloat16(s);
+}

@@ -66,6 +66,173 @@ impl MoeLayer {
         }
     }
 
+    /// Split factor for a `num_tokens`-row dedup'd `_t` decode, or `None` when
+    /// this shape/target can't take that path.
+    ///
+    /// Same shape and space rules as [`Self::unified_t_split_k`] — only the
+    /// partial-buffer sizing differs, because the multi-row kernels keep one
+    /// accumulator row per (slot, token) rather than per slot. Shares the
+    /// `ATLAS_MOE_SPLITK=0` kill switch: that flag exists to A/B split-K
+    /// reassociation, and the multi-row kernels reassociate the same way.
+    fn unified_t_split_k_m(
+        &self,
+        ctx: &ForwardContext,
+        h: u32,
+        inter: u32,
+        top_k: u32,
+        num_tokens: u32,
+    ) -> Option<u32> {
+        if std::env::var("ATLAS_MOE_SPLITK").as_deref() == Ok("0") {
+            return None;
+        }
+        // `ATLAS_MOE_SPLITK_M=0` turns off only the multi-row rewrite, so the
+        // K=2 verify can be measured against the batch2_t fallback on one
+        // binary without also disabling split-K for plain decode.
+        if std::env::var("ATLAS_MOE_SPLITK_M").as_deref() == Ok("0") {
+            return None;
+        }
+        let split = T_SPLIT;
+        let vec = ops::T_SPLIT_VEC;
+        let widths_ok = inter % (ops::T_BLOCK * vec) == 0 && h % (ops::T_BLOCK * vec) == 0;
+        let depths_ok = h % (32 * split) == 0 && inter % (32 * split) == 0;
+        // MROW is baked into the entry point. Only the MROW=2 pair is compiled,
+        // and a kernel whose MROW is below `num_tokens` would silently drop the
+        // rows past it — hence `==`, not `<=`.
+        let rows_ok = num_tokens == 2;
+        let (gate_up, silu_down) = self.splitk_m2_t_handles();
+        let handles_ok = gate_up.0 != 0
+            && silu_down.0 != 0
+            && self.moe_gate_up_partial_finalize_m_k.0 != 0
+            && self.moe_down_partial_finalize_m_k.0 != 0;
+        let need = ops::moe_splitk_m_partial_bytes(split, inter, h, top_k, num_tokens);
+        let space_ok = ctx.buffers.moe_splitk_partials_bytes() >= need;
+        if widths_ok && depths_ok && rows_ok && handles_ok && space_ok {
+            Some(split)
+        } else {
+            None
+        }
+    }
+
+    /// True when a 2-row verify would take the MROW=2 dedup'd split-K `_t`
+    /// kernels rather than falling back to `batch2_t`.
+    ///
+    /// Callers use this to decide whether batching the verify MoE is worth it
+    /// at all: `batch2_t` is the pre-split-K kernel shape and measured 17.0 vs
+    /// 19.8 tok/s against the per-row loop, so "batch when we can" is only the
+    /// right default while the fast path is the one that fires.
+    pub fn k2_verify_ffn_is_batched(&self, ctx: &ForwardContext) -> bool {
+        if !self.use_t_layout_for_decode() {
+            return false;
+        }
+        let h = ctx.config.hidden_size as u32;
+        let inter = ctx.config.moe_intermediate_size as u32;
+        let top_k = ctx.config.num_experts_per_tok as u32;
+        self.unified_t_split_k_m(ctx, h, inter, top_k, 2).is_some()
+    }
+
+    /// Run the K=2 verify MoE through the MROW=2 dedup'd split-K `_t` kernels.
+    ///
+    /// Returns `Ok(false)` without touching any buffer when the path is not
+    /// eligible, so the caller can fall back. On `Ok(true)` the outputs are in
+    /// exactly the layout `batch2_t` would have produced — routed slots flat in
+    /// `expert_gate_out` / `expert_up_out` / `expert_down_out`, one shared row
+    /// per token in the shared scratch buffers — so the blend downstream is
+    /// unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_splitk_m2_t(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        expert_gate_out: DevicePtr,
+        expert_up_out: DevicePtr,
+        expert_down_out: DevicePtr,
+        shared_gate_scratch: DevicePtr,
+        shared_up_scratch: DevicePtr,
+        shared_out: DevicePtr,
+        indices_dev: DevicePtr,
+        gate_t: &ExpertPtrTable,
+        up_t: &ExpertPtrTable,
+        down_t: &ExpertPtrTable,
+        sh_gate_t: &QuantizedWeight,
+        sh_up_t: &QuantizedWeight,
+        sh_down_t: &QuantizedWeight,
+        h: u32,
+        inter: u32,
+        top_k: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        const NUM_TOKENS: u32 = 2;
+        let Some(split) = self.unified_t_split_k_m(ctx, h, inter, top_k, NUM_TOKENS) else {
+            return Ok(false);
+        };
+        // Same RIDER A1 precondition as the single-row unified_t path: the
+        // `_e8m0` variants compute an NVFP4 shared expert alongside E8M0 routed
+        // weights, so a native-MXFP4 shared expert would be misread.
+        if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Mxfp4E8m0 {
+            self.shared_experts_scale_kind.expect(
+                crate::weight_map::WeightQuantFormat::Nvfp4,
+                "K=2 verify fused _e8m0 kernel assumes an NVFP4 shared expert",
+            );
+        }
+        let (gate_up_k, silu_down_k) = self.splitk_m2_t_handles();
+        let partials = ctx.buffers.moe_splitk_partials();
+        let down_partials = partials.offset(ops::moe_splitk_m_down_offset(
+            split, inter, top_k, NUM_TOKENS,
+        ));
+        ops::moe_expert_gate_up_shared_t_splitk_m(
+            ctx.gpu,
+            gate_up_k,
+            self.moe_gate_up_partial_finalize_m_k,
+            input,
+            gate_t.packed_ptrs,
+            gate_t.scale_ptrs,
+            gate_t.scale2_vals,
+            expert_gate_out,
+            up_t.packed_ptrs,
+            up_t.scale_ptrs,
+            up_t.scale2_vals,
+            expert_up_out,
+            indices_dev,
+            sh_gate_t,
+            shared_gate_scratch,
+            sh_up_t,
+            shared_up_scratch,
+            partials,
+            split,
+            inter,
+            h,
+            top_k,
+            NUM_TOKENS,
+            stream,
+        )?;
+        ops::moe_expert_silu_down_shared_t_splitk_m(
+            ctx.gpu,
+            silu_down_k,
+            self.moe_down_partial_finalize_m_k,
+            expert_gate_out,
+            expert_up_out,
+            down_t.packed_ptrs,
+            down_t.scale_ptrs,
+            down_t.scale2_vals,
+            expert_down_out,
+            indices_dev,
+            shared_gate_scratch,
+            shared_up_scratch,
+            sh_down_t,
+            shared_out,
+            down_partials,
+            split,
+            h,
+            inter,
+            top_k,
+            NUM_TOKENS,
+            // MROW of the compiled entry point, which sets the s_act stride.
+            2,
+            stream,
+        )?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn dispatch_unified_t_decode(
         &self,

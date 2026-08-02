@@ -10,6 +10,13 @@ use super::sizes_q12::{Q12_SIZING_STREAMS, q12_batched_scratch_bytes};
 /// SSOT for `moe_splitk_partials`; the dispatch must not exceed it.
 pub const MOE_DECODE_MAX_SPLIT: usize = 4;
 
+/// Largest row count the unified-`_t` MoE decode dispatch may launch at once —
+/// 1 for plain decode, 2 for the MTP K=2 speculative verify, which runs both
+/// candidate rows through one dedup'd launch. Sizing SSOT alongside
+/// `MOE_DECODE_MAX_SPLIT`: the partial buffer holds `rows * (top_k + 1)` f32
+/// accumulator rows, so it scales linearly in this.
+pub const MOE_DECODE_MAX_ROWS: usize = 2;
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -39,11 +46,12 @@ pub struct BufferSizes {
     pub expert_down_out: usize,
     pub splitk_workspace: usize,
     /// MoE decode split-K partials (unified-`_t` path). One f32 accumulator per
-    /// (k-split, expert slot, output): gate_up `[2, S, top_k+1, inter]` followed
-    /// by down `[S, top_k+1, hidden]`, at the largest split factor the decode
-    /// dispatch may pick. 0 for dense models. Shared across MoE layers — they
-    /// run sequentially on one stream, and each layer's finalize consumes its
-    /// own partials before the next layer writes them.
+    /// (k-split, expert slot, output): gate_up `[2, S, R*(top_k+1), inter]`
+    /// followed by down `[S, R*(top_k+1), hidden]`, at the largest split factor
+    /// and row count the decode dispatch may pick (`MOE_DECODE_MAX_SPLIT` /
+    /// `MOE_DECODE_MAX_ROWS`). 0 for dense models. Shared across MoE layers —
+    /// they run sequentially on one stream, and each layer's finalize consumes
+    /// its own partials before the next layer writes them.
     pub moe_splitk_partials: usize,
     /// GDN FLA chunked-prefill scratch (single buffer, sub-divided W|U|S|uc).
     /// 0 unless the model is a 128-dim-linear-head GDN model (ATLAS_GDN_FLA path).
@@ -247,12 +255,17 @@ impl BufferSizes {
         // Total slots = num_seqs * num_splits ≤ NUM_SMS, so this is constant ~48 KB.
         let splitk_workspace = 48 * (hd + 2) * 4;
 
-        // MoE decode split-K partials — see the field doc. Decode is a single
-        // token, so this does not scale with M: ~0.9 MB for DeepSeek-V4-Flash
-        // (S=4, top_k=6, inter=2048, hidden=4096) against ~94 MB of expert
-        // weights streamed per layer.
+        // MoE decode split-K partials — see the field doc. Decode carries at
+        // most `MOE_DECODE_MAX_ROWS` rows (1 plain, 2 for the MTP K=2 verify),
+        // so this scales linearly in that and not in the prefill M: ~1.8 MB for
+        // DeepSeek-V4-Flash (S=4, R=2, top_k=6, inter=2048, hidden=4096)
+        // against ~94 MB of expert weights streamed per layer.
         let moe_splitk_partials = if config.moe_intermediate_size > 0 {
-            MOE_DECODE_MAX_SPLIT * (top_k + 1) * 4 * (2 * config.moe_intermediate_size + h)
+            MOE_DECODE_MAX_SPLIT
+                * MOE_DECODE_MAX_ROWS
+                * (top_k + 1)
+                * 4
+                * (2 * config.moe_intermediate_size + h)
         } else {
             0
         };

@@ -467,17 +467,18 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
 
-        // n == 2 (opt-in, ATLAS_MSHC_FFN_K2=1): fused K=2 MoE — gate batch2 +
-        // batched topK + batch2 expert kernels, shared expert and gate read
-        // ONCE for both tokens. NOT the default: on E8M0 (MXFP4) expert
-        // tables the batch2_t kernels CUDA-700 in the expert dispatch — they
-        // only exist in NVFP4-scale flavor (the single-token path has
-        // dedicated `_e8m0` variants; batch2 never got them). Until e8m0
-        // batch2 kernels exist the per-token loop below is the safe route —
-        // its only loss vs a correct fused path is the duplicated shared
-        // expert + gate read (~50-100µs/layer at n=2).
+        // n == 2: fused K=2 MoE — gate batch2 + batched topK + the MROW=2
+        // dedup'd `_t` expert kernels, so the shared expert, the gate, and
+        // every expert both candidate rows happen to share are read ONCE.
+        //
+        // Default-on only when `k2_verify_ffn_is_batched` says the fast path
+        // will fire. Batching is NOT unconditionally a win: the older
+        // `batch2_t` fallback is the pre-split-K kernel shape and measured 17.0
+        // tok/s against 19.8 for this per-token loop. The MROW=2 rewrite
+        // measured 21.0. `ATLAS_MSHC_FFN_K2=0` forces the per-token loop back.
         let ffn_k2 = n == 2
-            && std::env::var("ATLAS_MSHC_FFN_K2").is_ok_and(|v| v == "1");
+            && std::env::var("ATLAS_MSHC_FFN_K2").as_deref() != Ok("0")
+            && self.ffn.k2_verify_ffn_is_batched(ctx);
         if ffn_k2 {
             self.ffn.forward_k2(c.normed, ctx, stream)?;
             let moe_out_base = ctx.buffers.moe_output();
@@ -501,28 +502,31 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else {
-        // Per-token sequential FFN (MLA models always take this path).
-        for i in 0..n {
-            let normed2_i = c.normed.offset(i * c.h * c.bf16);
-            let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
-            // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
-            let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
-            let post_i = post.offset(i * hc.hc_mult * 4);
-            let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
-            ops::hc_post(
-                ctx.gpu,
-                self.hc_post_k,
-                moe_out,
-                hc_streams_i,
-                post_i,
-                comb_i,
-                hc_streams_i,
-                1,
-                h as u32,
-                hc_mult,
-                stream,
-            )?;
-        }
+            // Per-token sequential FFN (MLA models always take this path).
+            // ATLAS_MOE_OVERLAP=1 (no-op otherwise): open a row group so the
+            // per-row MoE fires below can be scored for expert-set overlap.
+            crate::layers::moe::dump::route_group_begin(n);
+            for i in 0..n {
+                let normed2_i = c.normed.offset(i * c.h * c.bf16);
+                let moe_out = self.ffn.forward(normed2_i, ctx, stream)?;
+                // hc_streams is the FP32 mHC highway (4 bytes/elem), not BF16.
+                let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
+                let post_i = post.offset(i * hc.hc_mult * 4);
+                let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
+                ops::hc_post(
+                    ctx.gpu,
+                    self.hc_post_k,
+                    moe_out,
+                    hc_streams_i,
+                    post_i,
+                    comb_i,
+                    hc_streams_i,
+                    1,
+                    h as u32,
+                    hc_mult,
+                    stream,
+                )?;
+            }
         } // end ffn_k2 / per-token dispatch
         if diag_this {
             super::diag_norm(

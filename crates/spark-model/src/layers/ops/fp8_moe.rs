@@ -369,6 +369,183 @@ pub fn moe_splitk_down_offset(split: u32, inter: u32, top_k: u32) -> usize {
     2 * split as usize * (top_k + 1) as usize * inter as usize * 4
 }
 
+/// Rows of f32 partials the multi-row (`_m`) split-K decode writes: the routed
+/// slots in flat order, then one shared-expert row per token.
+pub fn moe_splitk_m_rows(top_k: u32, num_tokens: u32) -> u32 {
+    num_tokens * top_k + num_tokens
+}
+
+/// `moe_splitk_partial_bytes` for the multi-row path. Same layout, `rows`
+/// instead of `top_k + 1` — the m=1 case is byte-identical to the single-row
+/// sizing, so one buffer serves both.
+pub fn moe_splitk_m_partial_bytes(
+    split: u32,
+    inter: u32,
+    h: u32,
+    top_k: u32,
+    num_tokens: u32,
+) -> usize {
+    let rows = moe_splitk_m_rows(top_k, num_tokens) as usize;
+    split as usize * rows * 4 * (2 * inter as usize + h as usize)
+}
+
+/// Byte offset of the down region in the multi-row partial buffer.
+pub fn moe_splitk_m_down_offset(split: u32, inter: u32, top_k: u32, num_tokens: u32) -> usize {
+    2 * split as usize * moe_splitk_m_rows(top_k, num_tokens) as usize * inter as usize * 4
+}
+
+/// Multi-row split-K fused gate+up GEMV — one launch covers `num_tokens`
+/// candidate rows, with slots routed to the same expert collapsed onto a single
+/// leader block (see the `_m` kernels in `moe_shared_expert_fused_t.cu`).
+///
+/// `kernel` must be an `_m{MROW}v{T_SPLIT_VEC}s{split}` entry point whose MROW
+/// is >= `num_tokens`; a smaller MROW silently drops rows, so the caller checks.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_gate_up_shared_t_splitk_m(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    finalize: KernelHandle,
+    input: DevicePtr,
+    gate_packed_t_ptrs: DevicePtr,
+    gate_scale_t_ptrs: DevicePtr,
+    gate_scale2_vals: DevicePtr,
+    gate_out: DevicePtr,
+    up_packed_t_ptrs: DevicePtr,
+    up_scale_t_ptrs: DevicePtr,
+    up_scale2_vals: DevicePtr,
+    up_out: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_t: &QuantizedWeight,
+    sh_gate_out: DevicePtr,
+    sh_up_t: &QuantizedWeight,
+    sh_up_out: DevicePtr,
+    partials: DevicePtr,
+    split: u32,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    stream: u64,
+) -> Result<()> {
+    let total_routed = num_tokens * top_k;
+    KernelLaunch::new(gpu, kernel)
+        // grid.y is total_routed + 1, not + num_tokens: one block-set computes
+        // the shared projection for every row.
+        .grid([n / (T_BLOCK * T_SPLIT_VEC), total_routed + 1, 2 * split])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate_packed_t_ptrs)
+        .arg_ptr(gate_scale_t_ptrs)
+        .arg_ptr(gate_scale2_vals)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_packed_t_ptrs)
+        .arg_ptr(up_scale_t_ptrs)
+        .arg_ptr(up_scale2_vals)
+        .arg_ptr(up_out)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_t.weight)
+        .arg_ptr(sh_gate_t.weight_scale)
+        .arg_f32(sh_gate_t.weight_scale_2)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(sh_up_t.weight)
+        .arg_ptr(sh_up_t.weight_scale)
+        .arg_f32(sh_up_t.weight_scale_2)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .arg_ptr(partials)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, finalize)
+        .grid([
+            div_ceil(n, T_BLOCK),
+            moe_splitk_m_rows(top_k, num_tokens),
+            2,
+        ])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(partials)
+        .arg_ptr(gate_out)
+        .arg_ptr(sh_gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(sh_up_out)
+        .arg_u32(n)
+        .arg_u32(total_routed)
+        .arg_u32(num_tokens)
+        .arg_u32(split)
+        .launch(stream)
+}
+
+/// Multi-row split-K fused SiLU+down GEMV + finalize (see the gate+up twin).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_expert_silu_down_shared_t_splitk_m(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    finalize: KernelHandle,
+    gate_out: DevicePtr,
+    up_out: DevicePtr,
+    packed_t_ptrs: DevicePtr,
+    scale_t_ptrs: DevicePtr,
+    scale2_vals: DevicePtr,
+    output: DevicePtr,
+    expert_indices: DevicePtr,
+    sh_gate_in: DevicePtr,
+    sh_up_in: DevicePtr,
+    sh_down_t: &QuantizedWeight,
+    sh_down_out: DevicePtr,
+    partials: DevicePtr,
+    split: u32,
+    n: u32,
+    k: u32,
+    top_k: u32,
+    num_tokens: u32,
+    mrow: u32,
+    stream: u64,
+) -> Result<()> {
+    // One `s_act` k-slice per row the leader may gather — MROW, not
+    // num_tokens: the kernel indexes slices by the compile-time MROW stride.
+    let smem_bytes = mrow * (k as usize * std::mem::size_of::<f32>()) as u32 / split;
+    let total_routed = num_tokens * top_k;
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / (T_BLOCK * T_SPLIT_VEC), total_routed + 1, split])
+        .block([T_BLOCK, 1, 1])
+        .shared_mem(smem_bytes)
+        .arg_ptr(gate_out)
+        .arg_ptr(up_out)
+        .arg_ptr(packed_t_ptrs)
+        .arg_ptr(scale_t_ptrs)
+        .arg_ptr(scale2_vals)
+        .arg_ptr(output)
+        .arg_ptr(expert_indices)
+        .arg_ptr(sh_gate_in)
+        .arg_ptr(sh_up_in)
+        .arg_ptr(sh_down_t.weight)
+        .arg_ptr(sh_down_t.weight_scale)
+        .arg_f32(sh_down_t.weight_scale_2)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(top_k)
+        .arg_u32(num_tokens)
+        .arg_ptr(partials)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, finalize)
+        .grid([
+            div_ceil(n, T_BLOCK),
+            moe_splitk_m_rows(top_k, num_tokens),
+            1,
+        ])
+        .block([T_BLOCK, 1, 1])
+        .arg_ptr(partials)
+        .arg_ptr(output)
+        .arg_ptr(sh_down_out)
+        .arg_u32(n)
+        .arg_u32(total_routed)
+        .arg_u32(num_tokens)
+        .arg_u32(split)
+        .launch(stream)
+}
+
 /// Split-K fused gate+up GEMV (transposed weight) + partial finalize.
 ///
 /// `kernel` must be a `_v{T_SPLIT_VEC}s{split}` entry point and `finalize` the

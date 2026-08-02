@@ -121,6 +121,20 @@ impl FfnComponent {
         }
     }
 
+    /// True when [`Self::forward_k2`] would batch the two verify rows through a
+    /// path that is actually faster than two single-row passes.
+    ///
+    /// Dense FFNs read one weight set regardless of row count, so batching is
+    /// unconditionally right for them. MoE has to check — see
+    /// `MoeLayer::k2_verify_ffn_is_batched`.
+    pub fn k2_verify_ffn_is_batched(&self, ctx: &ForwardContext) -> bool {
+        match self {
+            Self::Moe(m) => m.k2_verify_ffn_is_batched(ctx),
+            Self::Dense(_) => true,
+            Self::None => false,
+        }
+    }
+
     pub fn forward_k3(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
         match self {
             Self::Moe(m) => m.forward_k3(input, ctx, stream),
