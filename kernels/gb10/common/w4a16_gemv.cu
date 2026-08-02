@@ -472,10 +472,12 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
     const unsigned char* __restrict__ B_packed,   // [N, K/2] uint8
     const unsigned char* __restrict__ B_scale,    // [N, K/GROUP_SIZE] FP8-E4M3
     const float scale2,
-    __nv_bfloat16* __restrict__ C,                // [M, N]
+    __nv_bfloat16* __restrict__ C,                // [M, N] (row stride ldc)
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int lda,                             // A row stride, elements (== K for packed)
+    unsigned int ldc                              // C row stride, elements (== N for packed)
 ) {
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
@@ -523,7 +525,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
         #pragma unroll
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
-            const __nv_bfloat16* At = A + (unsigned long long)t * K;
+            const __nv_bfloat16* At = A + (unsigned long long)t * lda;
             uint4 a_lo = ((const uint4*)At)[k16 * 2];
             uint4 a_hi = ((const uint4*)At)[k16 * 2 + 1];
             const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
@@ -558,7 +560,7 @@ __device__ __forceinline__ void w4a16_gemv_batchm_impl(
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
             float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
-            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
+            C[(unsigned long long)t * ldc + n] = __float2bfloat16(r);
         }
     }
 }
@@ -574,7 +576,25 @@ extern "C" __global__ void w4a16_gemv_batch4(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, K, N);
+}
+
+// M<=4, explicit A/C row strides (elements) — sibling of w8a16_gemv_batch4_ld.
+// For batched GEMVs over a ROW SLICE of a wider activation matrix (V4-Flash
+// block-diagonal wo_a in the batched verify).
+extern "C" __global__ void w4a16_gemv_batch4_ld(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w4a16_gemv_batchm_impl<4>(A, B_packed, B_scale, scale2, C, M, N, K, lda, ldc);
 }
 
 // M<=16 (high-concurrency decode, n=5..16) — sibling of w8a16_gemv_batch16.
@@ -588,7 +608,7 @@ extern "C" __global__ void w4a16_gemv_batch16(
     unsigned int N,
     unsigned int K
 ) {
-    w4a16_gemv_batchm_impl<16>(A, B_packed, B_scale, scale2, C, M, N, K);
+    w4a16_gemv_batchm_impl<16>(A, B_packed, B_scale, scale2, C, M, N, K, K, N);
 }
 
 // ============================================================

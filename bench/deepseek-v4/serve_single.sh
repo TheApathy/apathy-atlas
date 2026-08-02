@@ -46,13 +46,22 @@ export ATLAS_DEBUG_NO_GRAPH="${ATLAS_DEBUG_NO_GRAPH:-0}"
 # Set LM_HEAD_DTYPE=bf16 to fall back to the safe default.
 LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-fp8}"
 
+# NVFP4 transcode for the fat MLA projections (wq_b/wo_a/wo_b): plain decode
+# 18.0 -> 21.0 tok/s, gated 2026-08-02 (GSM8K 12/12, longgen 0 regressions vs
+# the BF16 baseline). ATLAS_V4_ATTN_NVFP4=0 restores the FP8 mirrors.
+export ATLAS_V4_ATTN_NVFP4="${ATLAS_V4_ATTN_NVFP4:-1}"
+
 MODEL_DIR="${MODEL_DIR:-/home/flocka/models/DeepSeek-V4-Flash-162B}"
 BIN="${DS4_BIN:-$REPO/target/release/spark}"
 PORT="${PORT:-8899}"
 HOST="${HOST:-127.0.0.1}"
 KV_DTYPE="${KV_DTYPE:-fp8}"                       # fp8 REQUIRED for coherence
 GPU_MEM="${GPU_MEM:-0.94}"                        # 0.94*119 ~= 112 GB budget
-MAX_SEQ="${MAX_SEQ:-16384}"
+# 12288 (not 16384): the NVFP4 attention mirrors (~2.2 GB) + the BF16
+# prefill fallbacks squeeze the KV pool at gpu_mem 0.94-0.96; 16384 no longer
+# boots. Freeing the BF16 fallbacks (switch prefill to the FP8 GEMMs) is the
+# open memory item that buys the headroom back.
+MAX_SEQ="${MAX_SEQ:-12288}"
 MAX_BATCH="${MAX_BATCH:-1}"
 LOG="${LOG:-$REPO/serve-deepseek-single.log}"
 

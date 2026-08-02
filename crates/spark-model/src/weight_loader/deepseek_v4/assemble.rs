@@ -479,7 +479,11 @@ pub fn assemble_layer(
     // hardcoded wrong dims and crashed — see load_layers.rs). The FP8 mirrors
     // stay resident: the batched multi-seq verify still reads FP8; only the
     // single-token decode arms prefer NVFP4.
-    let attn_nvfp4_on = std::env::var("ATLAS_V4_ATTN_NVFP4").ok().as_deref() == Some("1");
+    // The MTP DRAFT module is exempt: its weights are read once per draft
+    // (negligible bandwidth) while draft QUALITY is the accept rate — 4-bit
+    // drafting measured accept 65% -> 55% (spec 19.1 -> 18.2 tok/s).
+    let attn_nvfp4_on = std::env::var("ATLAS_V4_ATTN_NVFP4").ok().as_deref() == Some("1")
+        && !layer_prefix.starts_with("mtp");
     let nvfp4_of = |suffix: &str, bf16: &DenseWeight| -> Option<QuantizedWeight> {
         if !attn_nvfp4_on || bf16.weight.is_null() {
             return None;

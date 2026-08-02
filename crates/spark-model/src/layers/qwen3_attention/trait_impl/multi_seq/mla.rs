@@ -322,19 +322,38 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
-        let wqb = mla.wq_b_fp8.as_ref().unwrap();
-        ops::w8a16_gemv_batch4(
-            gpu,
-            self.w8a16_gemv_batch4_k,
-            ql_batch,
-            wqb.weight,
-            wqb.row_scale,
-            q_batch,
-            n as u32,
-            q_dim,
-            q_lora,
-            stream,
-        )?;
+        // Prefer the NVFP4 mirrors (ATLAS_V4_ATTN_NVFP4) for the fat
+        // projections — half the FP8 traffic; same weights the single-token
+        // decode argmaxes with (precision-consistency matters for the MTP
+        // accept rate).
+        let nv4_ok = self.w4a16_gemv_batch4_k.0 != 0 && self.w4a16_gemv_batch4_ld_k.0 != 0;
+        if nv4_ok && let Some(ref wqb4) = mla.wq_b_nvfp4 {
+            ops::w4a16_gemv_batchm(
+                gpu,
+                self.w4a16_gemv_batch4_k,
+                ql_batch,
+                wqb4,
+                q_batch,
+                n as u32,
+                q_dim,
+                q_lora,
+                stream,
+            )?;
+        } else {
+            let wqb = mla.wq_b_fp8.as_ref().unwrap();
+            ops::w8a16_gemv_batch4(
+                gpu,
+                self.w8a16_gemv_batch4_k,
+                ql_batch,
+                wqb.weight,
+                wqb.row_scale,
+                q_batch,
+                n as u32,
+                q_dim,
+                q_lora,
+                stream,
+            )?;
+        }
         // q_b_norm: per-head unweighted RMSNorm (see attention_forward_v4).
         ops::rms_norm(
             gpu,
@@ -408,38 +427,76 @@ impl Qwen3AttentionLayer {
         // row stride q_dim and writes latent cols [g*o_lora ..) with row
         // stride latent_dim — the strided batch kernel expresses that
         // directly (offsets mirror attention_forward_v4 Step 6).
-        let woa = mla.wo_a_fp8.as_ref().unwrap();
-        for g in 0..o_groups {
-            let w_off = (g as usize) * (o_lora as usize) * (group_in as usize);
-            let s_off = (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4;
-            ops::w8a16_gemv_batch4_ld(
+        if nv4_ok && let Some(ref woa4) = mla.wo_a_nvfp4 {
+            // NVFP4 groups: packed 0.5 B/elem, scales [N, K/16] 1 B row-major,
+            // shared per-tensor scale2 (quantized as one tensor).
+            for g in 0..o_groups {
+                let w_off = (g as usize) * (o_lora as usize) * (group_in as usize) / 2;
+                let s_off = (g as usize) * (o_lora as usize) * (group_in as usize / 16);
+                ops::w4a16_gemv_batch4_ld(
+                    gpu,
+                    self.w4a16_gemv_batch4_ld_k,
+                    attn_batch.offset(g as usize * group_in as usize * bf16),
+                    woa4.weight.offset(w_off),
+                    woa4.weight_scale.offset(s_off),
+                    woa4.weight_scale_2,
+                    ol_batch.offset(g as usize * o_lora as usize * bf16),
+                    n as u32,
+                    o_lora,
+                    group_in,
+                    q_dim,
+                    latent_dim,
+                    stream,
+                )?;
+            }
+        } else {
+            let woa = mla.wo_a_fp8.as_ref().unwrap();
+            for g in 0..o_groups {
+                let w_off = (g as usize) * (o_lora as usize) * (group_in as usize);
+                let s_off = (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4;
+                ops::w8a16_gemv_batch4_ld(
+                    gpu,
+                    self.w8a16_gemv_batch4_ld_k,
+                    attn_batch.offset(g as usize * group_in as usize * bf16),
+                    woa.weight.offset(w_off),
+                    woa.row_scale.offset(s_off),
+                    ol_batch.offset(g as usize * o_lora as usize * bf16),
+                    n as u32,
+                    o_lora,
+                    group_in,
+                    q_dim,
+                    latent_dim,
+                    stream,
+                )?;
+            }
+        }
+        if nv4_ok && let Some(ref wob4) = mla.wo_b_nvfp4 {
+            ops::w4a16_gemv_batchm(
                 gpu,
-                self.w8a16_gemv_batch4_ld_k,
-                attn_batch.offset(g as usize * group_in as usize * bf16),
-                woa.weight.offset(w_off),
-                woa.row_scale.offset(s_off),
-                ol_batch.offset(g as usize * o_lora as usize * bf16),
+                self.w4a16_gemv_batch4_k,
+                ol_batch,
+                wob4,
+                o_out,
                 n as u32,
-                o_lora,
-                group_in,
-                q_dim,
+                h,
+                latent_dim,
+                stream,
+            )?;
+        } else {
+            let wob = mla.wo_b_fp8.as_ref().unwrap();
+            ops::w8a16_gemv_batch4(
+                gpu,
+                self.w8a16_gemv_batch4_k,
+                ol_batch,
+                wob.weight,
+                wob.row_scale,
+                o_out,
+                n as u32,
+                h,
                 latent_dim,
                 stream,
             )?;
         }
-        let wob = mla.wo_b_fp8.as_ref().unwrap();
-        ops::w8a16_gemv_batch4(
-            gpu,
-            self.w8a16_gemv_batch4_k,
-            ol_batch,
-            wob.weight,
-            wob.row_scale,
-            o_out,
-            n as u32,
-            h,
-            latent_dim,
-            stream,
-        )?;
         Ok(o_out)
     }
 

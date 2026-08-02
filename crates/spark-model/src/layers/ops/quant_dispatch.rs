@@ -207,6 +207,42 @@ pub fn w4a16_gemv_batchm(
         .launch(stream)
 }
 
+/// W4A16 batched GEMV (M<=4) with explicit A/C row strides (elements) — the
+/// NVFP4 sibling of `w8a16_gemv_batch4_ld`. For batched GEMVs over a ROW
+/// SLICE of a wider activation matrix (V4-Flash block-diagonal `wo_a` in the
+/// batched verify). Weight/scale pointers may be group sub-views.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batch4_ld(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight_packed: DevicePtr,
+    weight_scale: DevicePtr,
+    weight_scale_2: f32,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_packed)
+        .arg_ptr(weight_scale)
+        .arg_f32(weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .launch(stream)
+}
+
 /// W4A16 GEMV with inline Q/Gate deinterleave on output write.
 ///
 /// Same as `w4a16_gemv` but writes Q and Gate to deinterleaved positions,

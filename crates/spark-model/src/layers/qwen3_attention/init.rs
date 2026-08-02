@@ -245,6 +245,11 @@ impl Qwen3AttentionLayer {
                 "w8a16_gemv_batch4",
                 "w8a16_gemv_batch4_ld",
             ),
+            w4a16_gemv_batch4_ld_k: super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch4_ld",
+            ),
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             w8a16_gemm_pipelined_k: super::super::try_kernel(
                 gpu,
