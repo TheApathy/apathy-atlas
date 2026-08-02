@@ -81,6 +81,12 @@ impl BufferArena {
     pub fn expert_up_out(&self) -> DevicePtr {
         self.expert_up_out
     }
+    /// Size of `expert_up_out` in bytes — for callers that borrow it as
+    /// generic scratch while the MoE stage is idle (e.g. the V4-Flash
+    /// batched-verify attention) and must bounds-check their layout.
+    pub fn expert_up_out_bytes(&self) -> usize {
+        self.sizes.expert_up_out
+    }
     /// Batched expert down projection output.
     pub fn expert_down_out(&self) -> DevicePtr {
         self.expert_down_out

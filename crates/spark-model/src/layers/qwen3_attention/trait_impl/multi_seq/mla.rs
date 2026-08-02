@@ -91,6 +91,14 @@ impl Qwen3AttentionLayer {
         // consumes the same buffer for both paths.
         let o_out = c.fwd.buffers.moe_output();
 
+        // DeepSeek-V4-Flash (o_lora_rank > 0) takes the dedicated multi-seq
+        // path: a weight-amortized batched Q/KV/O pipeline around the per-row
+        // rope/cache/attention middle (or the legacy per-row loop when the
+        // batched preconditions are unmet).
+        if mla.o_lora_rank > 0 {
+            return self.ms_mla_decode_v4_flash(c, kv_cache, &meta, o_out);
+        }
+
         for i in 0..c.n {
             let normed_i = c.normed.offset(i * c.h * bf16);
             // Per-sequence metadata views. The batched metadata packs
@@ -112,63 +120,6 @@ impl Qwen3AttentionLayer {
                 seq_slot: spark_runtime::gpu::DevicePtr(0),
             };
             let o_out_i = o_out.offset(i * c.h * bf16);
-
-            // DeepSeek-V4-Flash (o_lora_rank > 0) uses the DIRECT-KV
-            // attention algorithm, NOT the absorbed-MLA chain. Its
-            // V3-style absorption weights (`w_uk_t` / `w_uv` / `wkv_b`)
-            // are loaded as NULL `DevicePtr` stubs (see
-            // `deepseek_v4::load_layers`: `is_v4_flash` branch), so the
-            // absorbed `ms_mla_decode_one` here would dereference a NULL
-            // weight in the Q-absorb / V-extract GEMVs → CUDA illegal
-            // address on the K=2 MTP verify. Drive the single-token
-            // V4-Flash decode chain (`attention_forward_v4`, the same one
-            // the n=1 path uses) once per verify token instead — SSOT
-            // with the correct algorithm and buffer layout.
-            if mla.o_lora_rank > 0 {
-                // Per-token forward context carrying this token's sliced
-                // attention metadata (positions / slot / seq_len /
-                // block_table). All other ctx fields are copied verbatim.
-                let ctx_i = crate::layer::ForwardContext {
-                    attn_metadata: Some(meta_i),
-                    midchunk_capture: None,
-                    ..*c.fwd
-                };
-                // Q/K/V projection destinations inside `qkv_output`,
-                // matching the single-token `attention_forward` layout:
-                // Q `[nq*hd]`, then K `[nkv*hd]`, then V `[nkv*hd]`. V4 is
-                // ungated MLA, so `q_proj_dim == q_dim`.
-                let qkv = c.fwd.buffers.qkv_output();
-                let q_proj_bytes = q_dim as usize * bf16;
-                let kv_bytes = (c.nkv * hd) as usize * bf16;
-                let k_out = qkv.offset(q_proj_bytes);
-                let v_out = k_out.offset(kv_bytes);
-                let args = super::super::super::decode::attention_forward_mla::DecodeMlaArgs {
-                    normed: normed_i,
-                    q_out: qkv,
-                    k_out,
-                    v_out,
-                    q_dim,
-                    h,
-                    nq,
-                    hd,
-                    eps,
-                    bs,
-                    stream,
-                    // Batched / MTP-verify path: skip the inc-3 compressed-pool
-                    // append (a shared per-layer position counter can't track
-                    // interleaved verify tokens) → frozen inc-2 pool here.
-                    pos: None,
-                };
-                let o_v4 = self.attention_forward_v4(kv_cache, &ctx_i, &args)?;
-                // `attention_forward_v4` writes its O projection into the
-                // shared `qkv_output` buffer and returns it; copy this
-                // token's row into its dedicated `o_out` slot before the
-                // next iteration reuses `qkv_output`.
-                c.fwd
-                    .gpu
-                    .copy_d2d_async(o_v4, o_out_i, c.h * bf16, stream)?;
-                continue;
-            }
 
             self.ms_mla_decode_one(
                 c,
@@ -218,6 +169,296 @@ impl Qwen3AttentionLayer {
             }
         }
         Ok(o_out)
+    }
+
+    /// DeepSeek-V4-Flash (o_lora_rank > 0) multi-seq decode.
+    ///
+    /// V4-Flash uses the DIRECT-KV attention algorithm, NOT the absorbed-MLA
+    /// chain (its V3-style absorption weights are NULL stubs), so this drives
+    /// the same `attention_forward_v4` chain as the n=1 path — but with the
+    /// weight-heavy stages batched across the n rows:
+    ///
+    ///   Phase A (batched): wq_a → q_a_norm → wq_b → q_b_norm, wkv → kv_norm
+    ///     → V copy — one pass over each FP8 weight serves all n rows
+    ///     (`w8a16_gemv_batch4`).
+    ///   Phase B (per row): rope → cache write → paged attention →
+    ///     de-rotation via `attention_forward_v4` with `skip_qkv` +
+    ///     `attn_dest` (the per-row parts are position/slot-dependent and
+    ///     read no large weights).
+    ///   Phase C (batched): block-diagonal wo_a (strided
+    ///     `w8a16_gemv_batch4_ld` per group) → wo_b straight into the
+    ///     per-row `o_out` slots.
+    ///
+    /// Without this, the K=2 MTP verify re-read all ~125 MB/layer of
+    /// attention projections once PER ROW (~20 ms/step at n=2). Falls back
+    /// to the legacy per-row loop when the FP8 projections / batch kernels
+    /// are absent, n is out of batch range, or the borrowed MoE scratch
+    /// (`expert_up_out`, idle during attention) is too small.
+    fn ms_mla_decode_v4_flash(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        kv_cache: &mut PagedKvCache,
+        meta: &AttnMetadataDev,
+        o_out: DevicePtr,
+    ) -> Result<DevicePtr> {
+        let mla = self.mla.as_ref().unwrap();
+        let h = c.h as u32;
+        let nq = c.nq;
+        let hd = c.hd;
+        let eps = c.eps;
+        let bf16 = c.bf16;
+        let stream = c.stream;
+        let bs = c.bs as usize;
+        let n = c.n;
+        let q_lora = mla.q_lora_rank as u32;
+        let q_dim = nq * hd;
+        let kv_dim = c.nkv * hd;
+        let o_groups = c.fwd.config.o_groups.max(1) as u32;
+        let group_in = q_dim / o_groups;
+        let o_lora = mla.o_lora_rank as u32;
+        let latent_dim = o_groups * o_lora;
+        let gpu = c.fwd.gpu;
+
+        // Borrowed scratch layout (bytes, in `expert_up_out` — MoE runs after
+        // attention within the layer, so it is idle here; same precedent as
+        // the compressor ring in `attention_forward_v4`).
+        let row = |elems: u32| n * elems as usize * bf16;
+        let need = row(q_dim) * 2 + row(kv_dim) * 2 + row(q_lora) + row(latent_dim);
+        let batch_ok = (2..=4).contains(&n)
+            && self.w8a16_gemv_batch4_k.0 != 0
+            && self.w8a16_gemv_batch4_ld_k.0 != 0
+            && mla.wq_a_fp8.is_some()
+            && mla.wq_b_fp8.is_some()
+            && mla.wkv_a_fp8.is_some()
+            && mla.wo_a_fp8.is_some()
+            && mla.wo_b_fp8.is_some()
+            && c.fwd.buffers.expert_up_out_bytes() >= need;
+
+        {
+            static ROUTE_ONCE: std::sync::Once = std::sync::Once::new();
+            ROUTE_ONCE.call_once(|| {
+                tracing::info!(
+                    "V4-msdecode route: {} (n={n} batch4={} batch4_ld={} fp8 q_a/q_b/kv/o_a/o_b={}/{}/{}/{}/{} scratch={}B need={need}B)",
+                    if batch_ok { "BATCHED" } else { "per-row fallback" },
+                    self.w8a16_gemv_batch4_k.0 != 0,
+                    self.w8a16_gemv_batch4_ld_k.0 != 0,
+                    mla.wq_a_fp8.is_some(),
+                    mla.wq_b_fp8.is_some(),
+                    mla.wkv_a_fp8.is_some(),
+                    mla.wo_a_fp8.is_some(),
+                    mla.wo_b_fp8.is_some(),
+                    c.fwd.buffers.expert_up_out_bytes(),
+                );
+            });
+        }
+        if !batch_ok {
+            // Legacy per-row loop: full `attention_forward_v4` per token, O
+            // row copied out of the shared `qkv_output` before reuse.
+            for i in 0..n {
+                let meta_i = Self::meta_row(meta, i);
+                let ctx_i = crate::layer::ForwardContext {
+                    attn_metadata: Some(meta_i),
+                    midchunk_capture: None,
+                    ..*c.fwd
+                };
+                let qkv = c.fwd.buffers.qkv_output();
+                let k_out = qkv.offset(q_dim as usize * bf16);
+                let v_out = k_out.offset(kv_dim as usize * bf16);
+                let args = super::super::super::decode::attention_forward_mla::DecodeMlaArgs {
+                    normed: c.normed.offset(i * c.h * bf16),
+                    q_out: qkv,
+                    k_out,
+                    v_out,
+                    q_dim,
+                    h,
+                    nq,
+                    hd,
+                    eps,
+                    bs,
+                    stream,
+                    // Batched / MTP-verify path: skip the inc-3 compressed-pool
+                    // append (a shared per-layer position counter can't track
+                    // interleaved verify tokens) → frozen inc-2 pool here.
+                    pos: None,
+                    skip_qkv: false,
+                    attn_dest: None,
+                };
+                let o_v4 = self.attention_forward_v4(kv_cache, &ctx_i, &args)?;
+                gpu.copy_d2d_async(o_v4, o_out.offset(i * c.h * bf16), c.h * bf16, stream)?;
+            }
+            return Ok(o_out);
+        }
+
+        let scratch = c.fwd.buffers.expert_up_out();
+        let q_batch = scratch; //                                  [n, q_dim]
+        let attn_batch = q_batch.offset(row(q_dim)); //            [n, q_dim]
+        let kv_batch = attn_batch.offset(row(q_dim)); //           [n, kv_dim]
+        let v_batch = kv_batch.offset(row(kv_dim)); //             [n, kv_dim]
+        let ql_batch = v_batch.offset(row(kv_dim)); //             [n, q_lora]
+        let ol_batch = ql_batch.offset(row(q_lora)); //            [n, latent_dim]
+
+        // ── Phase A: batched Q + KV projections (weights read once) ──
+        let wqa = mla.wq_a_fp8.as_ref().unwrap();
+        ops::w8a16_gemv_batch4(
+            gpu,
+            self.w8a16_gemv_batch4_k,
+            c.normed,
+            wqa.weight,
+            wqa.row_scale,
+            ql_batch,
+            n as u32,
+            q_lora,
+            h,
+            stream,
+        )?;
+        ops::rms_norm(
+            gpu,
+            self.rms_norm_w_k,
+            ql_batch,
+            &mla.q_a_norm,
+            ql_batch,
+            n as u32,
+            q_lora,
+            eps,
+            stream,
+        )?;
+        let wqb = mla.wq_b_fp8.as_ref().unwrap();
+        ops::w8a16_gemv_batch4(
+            gpu,
+            self.w8a16_gemv_batch4_k,
+            ql_batch,
+            wqb.weight,
+            wqb.row_scale,
+            q_batch,
+            n as u32,
+            q_dim,
+            q_lora,
+            stream,
+        )?;
+        // q_b_norm: per-head unweighted RMSNorm (see attention_forward_v4).
+        ops::rms_norm(
+            gpu,
+            self.rms_norm_k,
+            q_batch,
+            &crate::weight_map::DenseWeight {
+                weight: c.fwd.buffers.norm_unit_w(),
+            },
+            q_batch,
+            n as u32 * nq,
+            hd,
+            eps,
+            stream,
+        )?;
+        let wkv = mla.wkv_a_fp8.as_ref().unwrap();
+        ops::w8a16_gemv_batch4(
+            gpu,
+            self.w8a16_gemv_batch4_k,
+            c.normed,
+            wkv.weight,
+            wkv.row_scale,
+            kv_batch,
+            n as u32,
+            kv_dim,
+            h,
+            stream,
+        )?;
+        ops::rms_norm(
+            gpu,
+            self.rms_norm_w_k,
+            kv_batch,
+            &mla.kv_a_norm,
+            kv_batch,
+            n as u32 * c.nkv as u32,
+            kv_dim / c.nkv as u32,
+            eps,
+            stream,
+        )?;
+        // K=V for V4-Flash direct KV projection — all n rows in one copy.
+        gpu.copy_d2d_async(kv_batch, v_batch, row(kv_dim), stream)?;
+
+        // ── Phase B: per-row rope / cache write / paged attention ──
+        for i in 0..n {
+            let meta_i = Self::meta_row(meta, i);
+            let ctx_i = crate::layer::ForwardContext {
+                attn_metadata: Some(meta_i),
+                midchunk_capture: None,
+                ..*c.fwd
+            };
+            let args = super::super::super::decode::attention_forward_mla::DecodeMlaArgs {
+                normed: c.normed.offset(i * c.h * bf16),
+                q_out: q_batch.offset(i * q_dim as usize * bf16),
+                k_out: kv_batch.offset(i * kv_dim as usize * bf16),
+                v_out: v_batch.offset(i * kv_dim as usize * bf16),
+                q_dim,
+                h,
+                nq,
+                hd,
+                eps,
+                bs,
+                stream,
+                pos: None,
+                skip_qkv: true,
+                attn_dest: Some(attn_batch.offset(i * q_dim as usize * bf16)),
+            };
+            self.attention_forward_v4(kv_cache, &ctx_i, &args)?;
+        }
+
+        // ── Phase C: batched O projection ──
+        // wo_a is block-diagonal: group g reads attn cols [g*group_in ..) with
+        // row stride q_dim and writes latent cols [g*o_lora ..) with row
+        // stride latent_dim — the strided batch kernel expresses that
+        // directly (offsets mirror attention_forward_v4 Step 6).
+        let woa = mla.wo_a_fp8.as_ref().unwrap();
+        for g in 0..o_groups {
+            let w_off = (g as usize) * (o_lora as usize) * (group_in as usize);
+            let s_off = (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4;
+            ops::w8a16_gemv_batch4_ld(
+                gpu,
+                self.w8a16_gemv_batch4_ld_k,
+                attn_batch.offset(g as usize * group_in as usize * bf16),
+                woa.weight.offset(w_off),
+                woa.row_scale.offset(s_off),
+                ol_batch.offset(g as usize * o_lora as usize * bf16),
+                n as u32,
+                o_lora,
+                group_in,
+                q_dim,
+                latent_dim,
+                stream,
+            )?;
+        }
+        let wob = mla.wo_b_fp8.as_ref().unwrap();
+        ops::w8a16_gemv_batch4(
+            gpu,
+            self.w8a16_gemv_batch4_k,
+            ol_batch,
+            wob.weight,
+            wob.row_scale,
+            o_out,
+            n as u32,
+            h,
+            latent_dim,
+            stream,
+        )?;
+        Ok(o_out)
+    }
+
+    /// Per-row view of the batched attention metadata (positions `[n]` u32,
+    /// slot `[n]` i64, seq_len `[n]` i32, block_table `[n, max_blocks]` i32).
+    fn meta_row(meta: &AttnMetadataDev, i: usize) -> AttnMetadataDev {
+        AttnMetadataDev {
+            positions: meta.positions.offset(i * 4),
+            positions_h: meta.positions_h.offset(i * 4),
+            positions_w: meta.positions_w.offset(i * 4),
+            slot: meta.slot.offset(i * 8),
+            seq_len: meta.seq_len.offset(i * 4),
+            block_table: meta
+                .block_table
+                .offset(i * meta.max_blocks_per_seq as usize * 4),
+            max_blocks_per_seq: meta.max_blocks_per_seq,
+            num_seqs: 1,
+            seq_slot: spark_runtime::gpu::DevicePtr(0),
+        }
     }
 
     /// Single-sequence absorbed-MLA decode chain. Mirrors

@@ -319,6 +319,24 @@ impl MoeLayer {
                 stream,
             )?;
         } else if self.use_t_layout_for_decode() {
+            // ATLAS_K2_MOE_PER_TOKEN=1: route the K=2 verify MoE through TWO
+            // per-token passes of the m=1 decode path instead of the fused
+            // batch2_t kernels. The batch2_t kernels predate the split-K +
+            // wide-load rework of the m=1 `exp_unified_t` GEMV (4a43f2d0,
+            // ~125 → ~254 GB/s); with top-6-of-144 routing the two verify
+            // tokens' expert sets are mostly disjoint, so batch2's only
+            // bandwidth win is the shared expert — running the optimized m=1
+            // kernel twice is faster until the batch2_t kernels get the same
+            // treatment.
+            {
+                static PER_TOKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let per_token = *PER_TOKEN.get_or_init(|| {
+                    std::env::var("ATLAS_K2_MOE_PER_TOKEN").ok().as_deref() == Some("1")
+                });
+                if per_token {
+                    return self.forward_batched(input, 2, ctx, stream);
+                }
+            }
             // Phase 8a unified-layout NVFP4 batch=2 verify (MTP K=2). Hybrid
             // mode skips this branch — small-N MTP verify wins on warp-
             // reduction originals.

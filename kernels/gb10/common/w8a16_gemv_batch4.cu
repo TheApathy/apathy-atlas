@@ -100,13 +100,15 @@ __device__ __constant__ float E4M3_LUT_B4[256] = {
 // back to the M-padded MMA.
 template <int MAX_M>
 __device__ __forceinline__ void w8a16_gemv_batchm_impl(
-    const __nv_bfloat16* __restrict__ A,    // [M, K] BF16
+    const __nv_bfloat16* __restrict__ A,    // [M, K] BF16 (row stride lda)
     const unsigned char* __restrict__ B,     // [N, K] FP8 E4M3
     const float* __restrict__ block_scale,   // [N/128, K/128] FP32
-    __nv_bfloat16* __restrict__ C,           // [M, N] BF16
+    __nv_bfloat16* __restrict__ C,           // [M, N] BF16 (row stride ldc)
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int lda,                        // A row stride, elements (== K for packed)
+    unsigned int ldc                         // C row stride, elements (== N for packed)
 ) {
     const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
     const unsigned int local_out = threadIdx.x / threads_per_out;
@@ -151,7 +153,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
         #pragma unroll
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
-            const __nv_bfloat16* At = A + (unsigned long long)t * K;
+            const __nv_bfloat16* At = A + (unsigned long long)t * lda;
             uint4 a_lo = ((const uint4*)At)[k16 * 2];
             uint4 a_hi = ((const uint4*)At)[k16 * 2 + 1];
             const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
@@ -187,7 +189,7 @@ __device__ __forceinline__ void w8a16_gemv_batchm_impl(
         for (int t = 0; t < MAX_M; t++) {
             if ((unsigned int)t >= M) continue;
             float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
-            C[(unsigned long long)t * N + n] = __float2bfloat16(r);
+            C[(unsigned long long)t * ldc + n] = __float2bfloat16(r);
         }
     }
 }
@@ -202,7 +204,27 @@ extern "C" __global__ void w8a16_gemv_batch4(
     unsigned int N,
     unsigned int K
 ) {
-    w8a16_gemv_batchm_impl<4>(A, B, block_scale, C, M, N, K);
+    w8a16_gemv_batchm_impl<4>(A, B, block_scale, C, M, N, K, K, N);
+}
+
+// M<=4, explicit A/C row strides (elements). For batched GEMVs over a ROW
+// SLICE of a wider activation matrix — e.g. the V4-Flash block-diagonal
+// wo_a: group g reads cols [g*group_in, (g+1)*group_in) of the [M, nq*hd]
+// attention output (lda = nq*hd) and writes cols [g*o_lora, (g+1)*o_lora)
+// of the [M, o_groups*o_lora] latent (ldc = o_groups*o_lora). Bit-identical
+// per row to w8a16_gemv on the same slice.
+extern "C" __global__ void w8a16_gemv_batch4_ld(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w8a16_gemv_batchm_impl<4>(A, B, block_scale, C, M, N, K, lda, ldc);
 }
 
 // M<=16 (high-concurrency decode, n=5..16). Same weight-streaming pass; one
@@ -217,5 +239,5 @@ extern "C" __global__ void w8a16_gemv_batch16(
     unsigned int N,
     unsigned int K
 ) {
-    w8a16_gemv_batchm_impl<16>(A, B, block_scale, C, M, N, K);
+    w8a16_gemv_batchm_impl<16>(A, B, block_scale, C, M, N, K, K, N);
 }

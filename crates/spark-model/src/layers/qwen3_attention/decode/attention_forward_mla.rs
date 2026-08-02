@@ -33,6 +33,17 @@ pub(in crate::layers::qwen3_attention) struct DecodeMlaArgs {
     /// compressed-pool append); `None` on the batched / MTP-verify path, where
     /// append is skipped (frozen inc-2 pool) to avoid a shared per-layer counter.
     pub pos: Option<u32>,
+    /// V4-Flash batched-verify seam: `q_out`/`k_out`/`v_out` already hold this
+    /// row's projections (computed by a weight-amortized batched pre-pass) —
+    /// skip the per-row Q/KV projection GEMVs and their norms. `q_out` must be
+    /// post-q_b_norm, `k_out` post-kv_norm (pre-RoPE), `v_out` the unmodified
+    /// latent copy. Only honored by `attention_forward_v4`.
+    pub skip_qkv: bool,
+    /// V4-Flash batched-verify seam: when `Some`, write the (de-rotated)
+    /// attention output to this pointer and return it, skipping the O
+    /// projection (the caller runs a weight-amortized batched wo pass over all
+    /// rows). Only honored by `attention_forward_v4`.
+    pub attn_dest: Option<DevicePtr>,
 }
 
 impl Qwen3AttentionLayer {
@@ -49,6 +60,8 @@ impl Qwen3AttentionLayer {
             q_out: _,
             k_out,
             v_out,
+            skip_qkv: _,
+            attn_dest: _,
             q_dim,
             h,
             nq,

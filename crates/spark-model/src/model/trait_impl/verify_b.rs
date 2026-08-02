@@ -214,12 +214,18 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
 
+        // ATLAS_PROFILE_VERIFY=1: per-layer (and V4 per-op, via ctx.profile)
+        // timing of the K=2 verify forward. Syncs per layer — only honored on
+        // the eager path (combine with ATLAS_DEBUG_NO_GRAPH=1); a captured
+        // graph can't host the syncs and would measure nothing anyway.
+        let profile_verify = !use_graphs
+            && std::env::var("ATLAS_PROFILE_VERIFY").ok().as_deref() == Some("1");
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
             config: &self.config,
             attn_metadata: Some(metadata),
-            profile: false,
+            profile: profile_verify,
             comm: self.comm_ref(),
             graph_capture: use_graphs,
             gdn_exact_replay: false,
@@ -257,6 +263,12 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            let mut layer_us: Vec<u128> = Vec::new();
+            let mut t_layer = std::time::Instant::now();
+            if profile_verify {
+                self.gpu.synchronize(stream)?;
+                t_layer = std::time::Instant::now();
+            }
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
 
@@ -332,6 +344,27 @@ impl TransformerModel {
                 // `propose()` has fresh target hiddens. No-op when DFlash
                 // is disabled.
                 self.try_dflash_capture(layer_idx, k - 1, stream)?;
+                if profile_verify {
+                    self.gpu.synchronize(stream)?;
+                    layer_us.push(t_layer.elapsed().as_micros());
+                    t_layer = std::time::Instant::now();
+                }
+            }
+            if profile_verify {
+                let total: u128 = layer_us.iter().sum();
+                let mut idx: Vec<(usize, u128)> = layer_us.iter().copied().enumerate().collect();
+                idx.sort_by_key(|x| std::cmp::Reverse(x.1));
+                let top: Vec<String> = idx
+                    .iter()
+                    .take(5)
+                    .map(|(i, us)| format!("L{i}={:.2}ms", *us as f64 / 1e3))
+                    .collect();
+                tracing::info!(
+                    "VERIFY_PROFILE k={k}: layers={:.1}ms avg={:.0}µs top5=[{}]",
+                    total as f64 / 1e3,
+                    total as f64 / layer_us.len().max(1) as f64,
+                    top.join(", "),
+                );
             }
 
             // Final norm [2, H]

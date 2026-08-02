@@ -218,6 +218,13 @@ impl Qwen3AttentionLayer {
         let diag_this = std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
             .is_ok_and(|v| v == "1" || v == "true")
             && !ctx.graph_capture;
+        // ATLAS_PROFILE_VERIFY phase split: attention block vs mHC+FFN block.
+        let t_phase = if ctx.profile && !ctx.graph_capture {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         if is_first_layer {
             ops::hc_expand(
@@ -232,25 +239,61 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        // Fused `hc_pre` streams the whole ~1.5 MiB `hc_fn` matrix in ONE
+        // block per token — at n=2 that is 2 of the GB10's SMs doing all the
+        // mHC work, twice per layer (~the largest single cost of the K=2
+        // verify before this). Use the sharded mix+finish split whenever its
+        // kernels are present, exactly like the single-token decode
+        // (decode_inner.rs); `ATLAS_HC_SPLIT=0` restores fused for A/B.
+        let hc_split = self.hc_pre_mix_k.0 != 0
+            && self.hc_pre_finish_k.0 != 0
+            && !std::env::var("ATLAS_HC_SPLIT").is_ok_and(|v| v == "0");
+        let hc_pre_dispatch = |site: &super::super::types_weights::HcSiteWeights| -> Result<()> {
+            if hc_split {
+                ops::hc_pre_split(
+                    ctx.gpu,
+                    self.hc_pre_mix_k,
+                    self.hc_pre_finish_k,
+                    hc_streams,
+                    site.hc_fn,
+                    site.hc_scale,
+                    site.hc_base,
+                    c.hidden,
+                    post,
+                    comb,
+                    ctx.buffers.hc_mix(),
+                    n as u32,
+                    h as u32,
+                    hc_mult,
+                    hc.sinkhorn_iters as u32,
+                    eps,
+                    hc.hc_eps,
+                    stream,
+                )
+            } else {
+                ops::hc_pre(
+                    ctx.gpu,
+                    self.hc_pre_k,
+                    hc_streams,
+                    site.hc_fn,
+                    site.hc_scale,
+                    site.hc_base,
+                    c.hidden,
+                    post,
+                    comb,
+                    n as u32,
+                    h as u32,
+                    hc_mult,
+                    hc.sinkhorn_iters as u32,
+                    eps,
+                    hc.hc_eps,
+                    stream,
+                )
+            }
+        };
+
         // ── Phase 1: collapse + norm for N tokens ──
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.attn.hc_fn,
-            hc.attn.hc_scale,
-            hc.attn.hc_base,
-            c.hidden,
-            post,
-            comb,
-            n as u32,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+        hc_pre_dispatch(&hc.attn)?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -342,6 +385,15 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        let attn_us = match t_phase {
+            Some(t0) => {
+                ctx.gpu.synchronize(stream)?;
+                Some(t0.elapsed().as_micros())
+            }
+            None => None,
+        };
+        let t_ffn = attn_us.map(|_| std::time::Instant::now());
+
         // Standalone attention (no FFN)
         if self.ffn.is_none() {
             if is_last_layer && let Some(ref head) = hc.head {
@@ -379,24 +431,7 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Phase 7: FFN + hc_post (per-token sequential only) ──
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.ffn.hc_fn,
-            hc.ffn.hc_scale,
-            hc.ffn.hc_base,
-            c.hidden,
-            post,
-            comb,
-            n as u32,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+        hc_pre_dispatch(&hc.ffn)?;
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -503,6 +538,15 @@ impl Qwen3AttentionLayer {
             tracing::warn!(
                 "V4-msdecode L{}: hc_head SKIPPED (no head weights)",
                 self.attn_layer_idx
+            );
+        }
+
+        if let (Some(a), Some(f0)) = (attn_us, t_ffn) {
+            ctx.gpu.synchronize(stream)?;
+            tracing::info!(
+                "MSPROF L{}: attn={a}µs ffn={}µs",
+                self.attn_layer_idx,
+                f0.elapsed().as_micros(),
             );
         }
 

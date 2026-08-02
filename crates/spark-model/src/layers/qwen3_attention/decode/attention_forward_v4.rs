@@ -40,6 +40,8 @@ impl Qwen3AttentionLayer {
             bs,
             stream,
             pos,
+            skip_qkv,
+            attn_dest,
         } = *args;
         let mla = self
             .mla
@@ -266,6 +268,12 @@ impl Qwen3AttentionLayer {
 
         // ── Step 1: Q latent → norm → expand ──
         let q_latent = ctx.buffers.ssm_ba();
+        let kv_dim = nkv * hd;
+        // Batched-verify seam: the caller precomputed q_out (post-q_b_norm),
+        // k_out (post-kv_norm) and v_out for this row in one weight-amortized
+        // pass over all verify rows — skip straight to RoPE (Step 3).
+        // `q_latent` (ssm_ba) stays bound: Step 3 reuses it as k_rope_tmp.
+        if !skip_qkv {
         prof!("wq_a", {
             if let Some(ref wqa_nvfp4) = mla.wq_a_nvfp4 {
                 ops::w4a16_gemv(
@@ -383,7 +391,6 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Step 2: Direct KV projection ──
-        let kv_dim = nkv * hd;
         prof!("wkv", {
             if let Some(ref wkva_nvfp4) = mla.wkv_a_nvfp4 {
                 ops::w4a16_gemv(
@@ -454,6 +461,7 @@ impl Qwen3AttentionLayer {
                 &format!("V4-decode L{} V after copy", self.attn_layer_idx),
             );
         }
+        } // end !skip_qkv (Steps 1-2)
 
         // ── Step 3: RoPE for Q and K ──
         // V4-Flash: rope dims are at offset `nope` per head (matching MLA layout),
@@ -623,7 +631,9 @@ impl Qwen3AttentionLayer {
         })?;
 
         // ── Step 5: Paged decode attention ──
-        let attn_out = ctx.buffers.attn_output();
+        // Batched-verify seam: land the attention output directly in the
+        // caller's row slot so the batched wo pass reads contiguous rows.
+        let attn_out = attn_dest.unwrap_or_else(|| ctx.buffers.attn_output());
         let inv_sqrt_d = self.effective_attn_scale(hd);
         prof!("paged_attn", {
             self.run_paged_decode(
@@ -715,6 +725,12 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
+        }
+
+        // Batched-verify seam: the caller runs the O projection itself as a
+        // weight-amortized batched pass over all rows' `attn_dest` slots.
+        if attn_dest.is_some() {
+            return Ok(attn_out);
         }
 
         // ── Step 6: Grouped low-rank O projection (wo_a → wo_b) ──
