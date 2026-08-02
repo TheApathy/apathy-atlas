@@ -109,16 +109,42 @@ vs the recorded full-precision run), not the absolute verdict.
 | + draft body/cache on the FP8 MLA decode arms | 40–48% | 12.4 |
 | + drafter prompt prefill & per-accept context feed | 49–67% | 13.3 |
 | + draft argmaxes the target's FP8 head | **68–71%** | **17.3** (warm) |
+| + MROW=2 dedup'd multi-row verify MoE (2026-08-02) | 63% | **21.0** |
 
 Run with `ATLAS_MTP_DRAFTER_PREFILL=1 ATLAS_MTP_CATCHUP=1`; quality gates
-PASS (GSM8K 12/12, longgen 0 regressions). Not yet the default: at ~70%
-accept it only ties the 18.0 non-speculative baseline because the m=2
-verify costs ~2× a single decode (the m>1 GEMV paths re-read weights per
-row). Open items, in leverage order: (1) amortize verify weight reads
-(~17 → ~23 tok/s at current accept), (2) `--num-drafts 2` wedges on a
-CUDA-graph capture violation (stream-capture 900) in the K3 verify path —
-fix and the same accept compounds per draft, (3) push accept further
-(drafter FP8-KV scale calibration).
+PASS at every stage (GSM8K 11–12/12, longgen 0 regressions vs the BF16
+baseline).
+
+Open item (1) — amortize the verify weight reads — is **done**. The MROW=2
+`_m2v2s4` kernels dedup the experts the two candidate rows share, and the
+K=2 batched verify FFN is now default-on (gated on
+`k2_verify_ffn_is_batched`; `ATLAS_MSHC_FFN_K2=0` opts out). 19.8 → 21.0
+server tok/s. Note the earlier `batch2_t` batching was a *loss* (17.0):
+its 1.33× amortization could not cover a ~2× per-byte deficit against the
+split-K decode GEMV. Batching only pays on top of the fast kernel shape.
+
+### `--num-drafts 2` (K=3) is a measured net loss — don't re-try it blind
+
+Open item (2) is resolved as **won't-fix**. The K=3 verify no longer wedges
+on graph capture, so it can be measured directly, and it loses:
+
+| config | tok/s (server) | mean accepted | tok/step |
+|---|---|---|---|
+| `--num-drafts 1` (K=2, default) | **21.0** | 0.63 | 1.63 |
+| `--num-drafts 2` (K=3) | 16.5 | 0.86 | 1.86 |
+
+The reason is the *second* draft, not the machinery. Draft-1 is accepted
+63% of the time, but draft-2 given draft-1 only 23/63 ≈ **37%** — the MTP
+head is a 1-step predictor being applied recurrently to its own hidden
+state, so error compounds immediately. K=3 buys +14% tok/step for a step
+that costs ~45% more (one extra draft forward, plus a 3-row verify that
+falls off the MROW=2 path onto the per-token loop).
+
+An MROW=3 kernel does **not** close this. The 3-row MoE dedup would recover
+roughly 8 ms of a ~35 ms/step penalty → ~18 tok/s, still under 21.0. The
+ceiling here is draft *quality* at depth, not verify bandwidth. Spend
+effort on accept rate (drafter FP8-KV scale calibration) or on the base
+forward, not on deeper MTP chains.
 
 ## Notes that will save you time
 
