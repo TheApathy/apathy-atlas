@@ -14,7 +14,10 @@
 //!   - `nemotron`: Nemotron-H (Mamba-2 + MoE + Attention)
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
-pub(crate) mod deepseek_v4;
+// `pub` (not crate-private) so the DSpark loader smoke example can drive
+// `deepseek_v4::dspark` against the real drafter shards before the in-server
+// proposer exists (docs/dspark_port.md).
+pub mod deepseek_v4;
 pub mod dflash_loader;
 mod gemma4;
 mod laguna;

@@ -10,6 +10,8 @@ mod attn_sink;
 mod compute;
 mod csa_ape;
 mod load_layers;
+// DSpark block-drafter loader for the official 0731 drafter shards.
+pub mod dspark;
 // MTP draft-module loader for nvidia/DeepSeek-V4-Flash-NVFP4.
 mod mtp;
 pub(crate) use mtp::{DeepseekV4MtpModule, load_v4_mtp_module};
