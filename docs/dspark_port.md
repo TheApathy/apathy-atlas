@@ -112,6 +112,26 @@ terminally disable speculation for the request when deficit > ~4 plain-steps.
    0731 non-REAP hiddens, our target is REAP-162B — acceptance may sag;
    measure per-workload accept before optimizing further.
 
+## Measured: offline acceptance (2026-08-02)
+
+The make-or-break risk is resolved. `bench/deepseek-v4/dspark_probe/`
+replays ATLAS_DSPARK_DUMP captures (hc-mean at layers 40/41/42, greedy token
+stream from the Atlas server on the REAP-162B target) through the OFFICIAL
+reference implementation with the target's shared embed/lm_head. On 634
+propose points across 3 workloads (math steps / python code / networking
+explanation):
+
+    draft[0..4] match: 72.6 / 65.3 / 57.0 / 49.4 / 38.9 %
+    chain hist (0..5 accepted): [174, 74, 77, 61, 65, 183]
+    mean accepted chain 2.50  →  tok/step 3.50 (ungated)
+    confidence@0.9: tok/step 2.12 — under-keeps 319/634; recalibrate
+    against OUR verify cost model, not ds4's (chain profile is bimodal:
+    27% accept zero, 29% accept all five → adaptive depth pays)
+
+Compare 1.63 tok/step for the shipping K=2 MTP path. The drafter, trained
+against non-REAP 0731 hiddens, transfers to the REAP target at full
+strength.
+
 ## Expected outcome
 
 Reference law: `speedup = tok/step ÷ ~2.05` per DSpark verify step (theirs).
