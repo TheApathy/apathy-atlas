@@ -232,16 +232,24 @@ def main():
 
             tok_at = {r["start"]: r["token"] for r in dec}
             for r in dec:
-                p, t = r["start"], r["token"]
+                # Reference alignment (model.py __main__): forward_spec is
+                # called with the token GENERATED from position p (= the next
+                # record's input token) as the committed block row, and
+                # main_hidden@p. Record p's own token is already folded into
+                # its hidden — embedding it again is off-distribution.
+                p = r["start"]
+                nxt = tok_at.get(p + 1)
+                if nxt is None:
+                    continue
                 mh = fuse(r["h"])
-                ids = torch.tensor([[t]], device=dev)
+                ids = torch.tensor([[nxt]], device=dev)
                 h, main_x = blocks[0].forward_embed(mh, ids[:, 0])
                 for b in blocks:
                     h = b(h, p, ids, main_x)
                 out_ids, logits, conf = blocks[-1].forward_head(h, ids[:, 0])
                 drafts = out_ids[0, 1:].tolist()
                 confs = torch.sigmoid(conf[0].float()).tolist()
-                actual = [tok_at.get(p + 1 + j) for j in range(bs)]
+                actual = [tok_at.get(p + 2 + j) for j in range(bs)]
                 if actual[0] is None:
                     continue
                 n_props += 1

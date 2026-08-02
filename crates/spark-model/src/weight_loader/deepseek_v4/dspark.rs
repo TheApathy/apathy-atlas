@@ -12,7 +12,7 @@
 //! concatenated to [3·h]) through `main_proj`/`main_norm`, and stage 2 carries
 //! the Markov + confidence heads. Reference implementation:
 //! `inference/model.py` in the official repo (`DSparkBlock` et al.); full port
-//! design in `docs/dspark_port.md`; offline acceptance (3.50 tok/step ungated)
+//! design in `docs/dspark_port.md`; offline acceptance (3.81 tok/step ungated)
 //! measured by `bench/deepseek-v4/dspark_probe/`.
 //!
 //! Each stage is loaded PIECEWISE — MoE via [`super::assemble::assemble_moe`],

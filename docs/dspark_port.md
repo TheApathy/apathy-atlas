@@ -121,10 +121,10 @@ reference implementation with the target's shared embed/lm_head. On 634
 propose points across 3 workloads (math steps / python code / networking
 explanation):
 
-    draft[0..4] match: 72.6 / 65.3 / 57.0 / 49.4 / 38.9 %
-    chain hist (0..5 accepted): [174, 74, 77, 61, 65, 183]
-    mean accepted chain 2.50  →  tok/step 3.50 (ungated)
-    confidence@0.9: tok/step 2.12 — under-keeps 319/634; recalibrate
+    draft[0..4] match: 84.5 / 71.8 / 62.1 / 51.0 / 43.1 %
+    chain hist (0..5 accepted): [98, 104, 88, 75, 59, 207]
+    mean accepted chain 2.81  →  tok/step 3.81 (ungated)
+    confidence@0.9: tok/step 2.67 — under-keeps 311/631; recalibrate
     against OUR verify cost model, not ds4's (chain profile is bimodal:
     27% accept zero, 29% accept all five → adaptive depth pays)
 
