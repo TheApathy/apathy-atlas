@@ -300,6 +300,14 @@ impl TransformerModel {
             stream,
         )?;
 
+        // DSpark capture dump: one decode record per step, carrying this
+        // step's INPUT token and the hc-mean captures. `token` sits at
+        // position seq.seq_len (pre-increment). Eager-gated: the flush
+        // host-syncs, which is illegal under graph capture.
+        if !use_graphs {
+            self.dspark_dump_flush(1, seq.seq_len, 1, token, stream)?;
+        }
+
         // Decode-step diagnostic for Gemma-4 degeneration analysis. Only fires
         // when ATLAS_DIAG_GEMMA4=1 (which also disables CUDA graphs upstream,
         // so the d2h sync below is safe). Reads top-5 tokens by logit so we
@@ -450,6 +458,13 @@ impl TransformerModel {
             // activation. Cheap d2d when the layer index matches; otherwise a
             // hashmap-free position() probe over a 5-element vec.
             self.try_dflash_capture(i, 0, stream)?;
+            // DSpark capture (ATLAS_DSPARK_DUMP, eager only): the drafter is
+            // conditioned on the hc-STREAM mean, not `hidden` — for V4+mHC
+            // `hidden` is single-stream scratch after a layer, so the DFlash
+            // capture above cannot serve it.
+            if !use_graphs {
+                self.try_dspark_capture(i, 1, stream)?;
+            }
         }
         // MLA absorbed attention: defensive sync before final norm in eager
         // mode. Skipped under graph capture because cuStreamSynchronize is

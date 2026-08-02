@@ -550,3 +550,93 @@ impl TransformerModel {
         Ok(())
     }
 }
+
+impl TransformerModel {
+    /// DSpark capture: hc-mean of `hc_streams` for `num_tokens` rows into
+    /// this capture layer's slot of `dspark_dump_buf`. No-op unless
+    /// ATLAS_DSPARK_DUMP is set and `layer_idx` is a capture layer. Eager
+    /// only — callers must not invoke under graph capture (the dump flush
+    /// host-syncs).
+    pub(super) fn try_dspark_capture(
+        &self,
+        layer_idx: usize,
+        num_tokens: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.dspark_dump.is_none() || self.hc_mean_k.0 == 0 {
+            return Ok(());
+        }
+        let Some(slot) = self
+            .dspark_capture_layers
+            .iter()
+            .position(|&l| l == layer_idx)
+        else {
+            return Ok(());
+        };
+        let n = num_tokens.min(self.dspark_dump_rows);
+        let h = self.config.hidden_size;
+        let out = self
+            .dspark_dump_buf
+            .offset(slot * self.dspark_dump_rows * h * 2);
+        crate::layers::ops::hc_mean(
+            self.gpu.as_ref(),
+            self.hc_mean_k,
+            self.buffers.hc_streams(),
+            out,
+            n as u32,
+            h as u32,
+            self.config.hc_mult as u32,
+            stream,
+        )
+    }
+
+    /// Flush one captured pass to the ATLAS_DSPARK_DUMP file. Record layout
+    /// (little-endian, mirrored by the offline probe):
+    ///   magic  u32 = 0x4453504B ("DSPK")
+    ///   kind   u32   (0 = prefill, 1 = decode)
+    ///   start  u32   (sequence position of row 0)
+    ///   n      u32   (rows)
+    ///   h      u32   (hidden size)
+    ///   layers u32   (capture-layer count)
+    ///   token  u32   (decode: the input token id; prefill: 0)
+    ///   data   layers × n × h BF16
+    pub(super) fn dspark_dump_flush(
+        &self,
+        kind: u32,
+        start_pos: usize,
+        num_tokens: usize,
+        token: u32,
+        stream: u64,
+    ) -> Result<()> {
+        use std::io::Write;
+        let Some(ref dump) = self.dspark_dump else {
+            return Ok(());
+        };
+        let n = num_tokens.min(self.dspark_dump_rows);
+        let h = self.config.hidden_size;
+        let nl = self.dspark_capture_layers.len();
+        self.gpu.synchronize(stream)?;
+        let mut w = dump.lock();
+        for v in [
+            0x4453504Bu32,
+            kind,
+            start_pos as u32,
+            n as u32,
+            h as u32,
+            nl as u32,
+            token,
+        ] {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        let mut host = vec![0u8; n * h * 2];
+        for slot in 0..nl {
+            let src = self
+                .dspark_dump_buf
+                .offset(slot * self.dspark_dump_rows * h * 2);
+            self.gpu.copy_d2h(src, &mut host)?;
+            w.write_all(&host)?;
+        }
+        w.flush()?;
+        Ok(())
+    }
+}

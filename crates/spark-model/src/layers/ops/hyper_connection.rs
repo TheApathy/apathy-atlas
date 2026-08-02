@@ -231,3 +231,27 @@ pub fn hc_head(
         .arg_f32(hc_eps)
         .launch(stream)
 }
+
+/// DSpark target-hidden capture: plain mean over the `hc_mult` streams,
+/// BF16 out — the drafter's `main_proj` is trained on `h.mean(dim=2)`
+/// (official `inference/model.py`), NOT the learned `hc_head` collapse.
+/// One block per token.
+pub fn hc_mean(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    streams: DevicePtr,
+    out: DevicePtr,
+    num_tokens: u32,
+    hidden_size: u32,
+    hc_mult: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(streams)
+        .arg_ptr(out)
+        .arg_u32(hidden_size)
+        .arg_u32(hc_mult)
+        .launch(stream)
+}

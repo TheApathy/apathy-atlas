@@ -313,6 +313,37 @@ impl TransformerModel {
             Some(gpu.alloc(dflash_hidden_save_rows * n * config.hidden_size * 2)?)
         };
 
+        // DSpark capture dump (ATLAS_DSPARK_DUMP=<path>, eager only): hc-mean
+        // hiddens at ATLAS_DSPARK_CAPTURE_LAYERS (default 40,41,42) streamed
+        // to disk for the offline drafter acceptance probe. Probe-only I/O;
+        // the hc_mean capture is the mechanism the in-server proposer reuses.
+        let (dspark_dump, dspark_dump_buf, dspark_capture_layers, dspark_dump_rows) =
+            match std::env::var("ATLAS_DSPARK_DUMP") {
+                Ok(path) if !path.is_empty() => {
+                    let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
+                        .unwrap_or_else(|_| "40,41,42".into())
+                        .split(',')
+                        .filter_map(|s| s.trim().parse().ok())
+                        .collect();
+                    let file = std::fs::File::create(&path)
+                        .map_err(|e| anyhow::anyhow!("ATLAS_DSPARK_DUMP: creating {path}: {e}"))?;
+                    let buf = gpu.alloc(layers.len() * max_seq_len * config.hidden_size * 2)?;
+                    tracing::info!(
+                        "ATLAS_DSPARK_DUMP={path}: capturing hc-mean at layers {layers:?} \
+                         ({} MB scratch)",
+                        layers.len() * max_seq_len * config.hidden_size * 2 / (1 << 20),
+                    );
+                    (
+                        Some(Mutex::new(std::io::BufWriter::new(file))),
+                        buf,
+                        layers,
+                        max_seq_len,
+                    )
+                }
+                _ => (None, DevicePtr::NULL, Vec::new(), 0),
+            };
+        let hc_mean_k = crate::layers::try_kernel(gpu.as_ref(), "hyper_connection", "hc_mean");
+
         // EP command buffer for token broadcast (4 bytes, u32)
         let ep_cmd_buf = gpu.alloc(4)?;
 
@@ -569,6 +600,11 @@ impl TransformerModel {
             mtp_prefill_capture_len: std::sync::atomic::AtomicUsize::new(0),
             dflash_hidden_save,
             dflash_hidden_save_rows,
+            dspark_dump,
+            dspark_dump_buf,
+            dspark_dump_rows,
+            dspark_capture_layers,
+            hc_mean_k,
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),

@@ -488,3 +488,28 @@ extern "C" __global__ void hc_head(
         y_out[(size_t)t * H + d] = __float2bfloat16(acc);
     }
 }
+
+// ── hc_mean ──
+// DSpark target-hidden capture: the drafter's main_proj is trained on the
+// PLAIN mean over the hc streams (official inference/model.py:
+// `h.mean(dim=2)` at the dspark_target_layer_ids), NOT the learned hc_head
+// collapse — using hc_head here would feed the drafter a distribution it was
+// never trained on. out[t, d] = mean_i streams[t, i, d], BF16 to match the
+// capture buffer the drafter reads. Grid: (T,1,1)  Block: (256,1,1).
+extern "C" __global__ void hc_mean(
+    const float* __restrict__ streams,   // [T, hc, H] FP32 highway (mHC)
+    __nv_bfloat16* __restrict__ out,     // [T, H]
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    const unsigned int t = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int H = hidden_size;
+    const float* s = streams + (size_t)t * hc_mult * H;
+    const float inv = 1.0f / (float)hc_mult;
+    for (unsigned int d = tid; d < H; d += HC_BLOCK) {
+        float acc = 0.f;
+        for (unsigned int i = 0; i < hc_mult; ++i) acc += s[i * H + d];
+        out[(size_t)t * H + d] = __float2bfloat16(acc * inv);
+    }
+}

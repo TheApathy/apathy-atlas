@@ -210,6 +210,10 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // DSpark capture (ATLAS_DSPARK_DUMP): hc-mean of the chunk's rows.
+            // This chunked path — not prefill_a — is what the V4 scheduler
+            // drives, so the dump's prefill records come from here.
+            self.try_dspark_capture(i, proc_count, stream)?;
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
             }
@@ -318,6 +322,10 @@ impl TransformerModel {
         // ATLAS_MTP_DRAFTER_PREFILL: capture this chunk's final-layer hidden
         // rows for the whole-prompt drafter prefill. No-op when disabled.
         self.try_mtp_prefill_capture(effective_seq_len_start, proc_count, stream)?;
+
+        // DSpark capture dump: one prefill record per chunk (token=0 — the
+        // probe needs only positions + hiddens for ring seeding).
+        self.dspark_dump_flush(0, effective_seq_len_start, proc_count, 0, stream)?;
         if let Some(t0) = prefill_t0 {
             self.gpu.synchronize(stream)?;
             let total_us = t0.elapsed().as_micros();

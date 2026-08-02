@@ -188,6 +188,25 @@ pub struct TransformerModel {
     /// `try_dflash_capture_all` must never write past this many rows. Single
     /// source of truth for the buffer's KMAX; 0 when DFlash is disabled.
     pub(super) dflash_hidden_save_rows: usize,
+    /// DSpark capture dump (`ATLAS_DSPARK_DUMP=<path>`, eager only): binary
+    /// stream of per-pass hc-mean hiddens at `dspark_capture_layers`, consumed
+    /// by the offline drafter acceptance probe (docs/dspark_port.md). The
+    /// capture itself (hc_mean into `dspark_dump_buf`) is the same mechanism
+    /// the in-server DSpark proposer will use; only the file write is
+    /// probe-specific. None when the env var is unset.
+    pub(super) dspark_dump: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
+    /// `[num_capture_layers, max_seq_len, hidden] BF16` scratch the hc_mean
+    /// kernel writes into. NULL when dumping is off.
+    pub(super) dspark_dump_buf: DevicePtr,
+    /// Row capacity of `dspark_dump_buf` per capture layer (== max_seq_len at
+    /// alloc). Bound for every hc_mean write; 0 when dumping is off.
+    pub(super) dspark_dump_rows: usize,
+    /// Layer indices whose post-layer hc-mean is captured for DSpark
+    /// (`[40, 41, 42]` for V4-Flash-0731). Empty when dumping is off.
+    pub(super) dspark_capture_layers: Vec<usize>,
+    /// `hyper_connection::hc_mean` — plain mean over hc streams (the collapse
+    /// the drafter's main_proj was trained on; NOT the learned hc_head).
+    pub(super) hc_mean_k: spark_runtime::gpu::KernelHandle,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for

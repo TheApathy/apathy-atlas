@@ -431,6 +431,10 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // DSpark capture (ATLAS_DSPARK_DUMP): hc-mean of all proc_count
+            // rows for this chunk. Prefill is eager (graph_capture: false),
+            // so the flush after the loop can host-sync.
+            self.try_dspark_capture(i, proc_count, stream)?;
 
             // MLA diagnostic: dump per-layer hidden state norm (once per session)
             static DIAG_DONE: std::sync::atomic::AtomicBool =
@@ -483,6 +487,10 @@ impl TransformerModel {
         // ATLAS_MTP_DRAFTER_PREFILL: capture the processed rows' final-layer
         // hiddens for the whole-prompt drafter prefill. No-op when disabled.
         self.try_mtp_prefill_capture(seq_len_start, proc_count, stream)?;
+
+        // DSpark capture dump: one prefill record per chunk (token=0 —
+        // the probe only needs positions + hiddens for ring seeding).
+        self.dspark_dump_flush(0, seq_len_start, proc_count, 0, stream)?;
 
         // ── 5. Final norm on LAST token only ──
         let last_hidden = hidden.offset((proc_count - 1) * h * fp32);
