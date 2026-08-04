@@ -938,7 +938,7 @@ extern "C" __global__ void moe_down_partial_finalize(
 #define GROUP_DUPLICATED 2
 #define GROUP_COUNT_2 3
 #define GROUP_COUNT_3_4 4
-#define GROUP_COUNT_5_6 5
+#define GROUP_COUNT_5_PLUS 5
 
 template<int MROW, int GROUP_MODE = GROUP_ALL>
 __device__ __forceinline__ bool mrow_gather_slots(
@@ -947,11 +947,15 @@ __device__ __forceinline__ bool mrow_gather_slots(
     bool is_shared, unsigned int (&slots)[MROW], unsigned int& m_out
 ) {
     // 32 slots per row is well past any top_k this family serves (production is
-    // 6). The partitioned unique arm is compiled at MROW=1 but scans the full
-    // six-row verify to determine whether a leader occurs exactly once, so only
-    // that arm needs the wider routing scratch. Keep the original MROW-sized
-    // allocation for the shipping all-group entries.
-    constexpr int ROUTING_MROW = GROUP_MODE == GROUP_ALL ? MROW : 6;
+    // 6). The partitioned arms are compiled at an MROW that bounds only how many
+    // slots one leader may GATHER (m1u gathers 1), but their leader scan must
+    // still walk every routed slot of the whole verify — so they size the
+    // routing scratch by the max verify width, not by their own MROW. That
+    // width is `MOE_DECODE_MAX_ROWS` on the host (buffers/sizes.rs); the
+    // invariant this constant needs is `num_tokens * top_k <= ROUTING_MROW * 32`,
+    // which at 8 rows / top_k 6 is 48 <= 256. Keep the MROW-sized allocation for
+    // the all-group entries, which gather and scan the same rows.
+    constexpr int ROUTING_MROW = GROUP_MODE == GROUP_ALL ? MROW : 8;
     __shared__ unsigned int s_idx[ROUTING_MROW * 32];
     __shared__ unsigned int s_slot[MROW];
     __shared__ unsigned int s_m;
@@ -998,7 +1002,13 @@ __device__ __forceinline__ bool mrow_gather_slots(
         if (s_m != 2) return false;
     } else if constexpr (GROUP_MODE == GROUP_COUNT_3_4) {
         if (s_m < 3 || s_m > 4) return false;
-    } else if constexpr (GROUP_MODE == GROUP_COUNT_5_6) {
+    } else if constexpr (GROUP_MODE == GROUP_COUNT_5_PLUS) {
+        // Open-ended on purpose: the count buckets must TILE 1..num_tokens with
+        // no gap, or a group whose count falls in the gap gets no down arm at
+        // all and its rows come out unwritten. So the top bucket takes
+        // everything from 5 up, and the host must instantiate it at an
+        // MROW >= num_tokens (m6c56 for the 6-row verify, m8c58 for 8) —
+        // otherwise the clamp below silently drops the rows past MROW.
         if (s_m < 5) return false;
     }
     m_out = min(s_m, (unsigned int)MROW);
@@ -1451,6 +1461,16 @@ extern "C" __global__ void NAME(                                               \
 // and an expert can be duplicated at most num_tokens times — so this one entry
 // covers the whole 3..6 range and the m2 pair stays the K=2 fast path (it does
 // not carry the ladder's wider arms).
+//
+// MROW=8: the DDTree 8-row verify (6 spine + 2 branch) and any drafter wider
+// than γ=5. Past `MOE_DECODE_MAX_ROWS` the host has to fall back to
+// `forward_batched`, which re-streams every routed expert's ~94 MB layer once
+// PER ROW — measured 124.8 ms at 6 rows against 288.8 ms at 8 on GB10. The m8
+// entries exist to close that cliff. They are strictly WIDER than the m6 pair,
+// not a replacement: an MROW=8 gather burns two more accumulator registers per
+// thread, so the host keeps selecting m6 for num_tokens <= 6 and only reaches
+// for m8 at 7..8. That keeps the 6-row verify launch-for-launch identical to
+// what it was before m8 existed.
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1, GROUP_ALL)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1, GROUP_ALL)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2, GROUP_ALL)
@@ -1461,6 +1481,10 @@ GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1uv2s4,      GROUP_SIZE, false, 2, 4
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1uv2s4, 32,         true,  2, 4, 1, GROUP_UNIQUE)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m6dv2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_DUPLICATED)
 GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m6dv2s4, 32,         true,  2, 4, 6, GROUP_DUPLICATED)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m8v2s4,      GROUP_SIZE, false, 2, 4, 8, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m8v2s4, 32,         true,  2, 4, 8, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m8dv2s4,      GROUP_SIZE, false, 2, 4, 8, GROUP_DUPLICATED)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m8dv2s4, 32,         true,  2, 4, 8, GROUP_DUPLICATED)
 
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1, GROUP_ALL, false)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1, GROUP_ALL, false)
@@ -1476,8 +1500,15 @@ DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2c2v2s4,      GROUP_SIZE, false, 2, 
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2c2v2s4, 32,         true,  2, 4, 2, GROUP_COUNT_2, true)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m4c34v2s4,      GROUP_SIZE, false, 2, 4, 4, GROUP_COUNT_3_4, true)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m4c34v2s4, 32,         true,  2, 4, 4, GROUP_COUNT_3_4, true)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6c56v2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_COUNT_5_6, true)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6c56v2s4, 32,         true,  2, 4, 6, GROUP_COUNT_5_6, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6c56v2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_COUNT_5_PLUS, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6c56v2s4, 32,         true,  2, 4, 6, GROUP_COUNT_5_PLUS, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m8v2s4,      GROUP_SIZE, false, 2, 4, 8, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m8v2s4, 32,         true,  2, 4, 8, GROUP_ALL, false)
+// The 7..8-row top bucket. Same open-ended GROUP_COUNT_5_PLUS predicate as
+// m6c56 — at 8 rows it is the arm that absorbs counts 5 through 8, so the
+// buckets still tile with no gap.
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m8c58v2s4,      GROUP_SIZE, false, 2, 4, 8, GROUP_COUNT_5_PLUS, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m8c58v2s4, 32,         true,  2, 4, 8, GROUP_COUNT_5_PLUS, true)
 
 #undef GATEUP_M_ENTRY
 #undef DOWN_M_ENTRY
@@ -1486,7 +1517,7 @@ DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6c56v2s4, 32,         true,  2,
 #undef GROUP_DUPLICATED
 #undef GROUP_COUNT_2
 #undef GROUP_COUNT_3_4
-#undef GROUP_COUNT_5_6
+#undef GROUP_COUNT_5_PLUS
 
 // Multi-row finalize. `rows = total_routed + num_tokens`: the routed slots in
 // flat order, then one shared row per token.

@@ -418,7 +418,7 @@ impl MoeLayer {
             ),
             // MROW=6 — the DSpark block verify, and every narrower γ that the
             // m2 pair can't cover. `m6` must stay in step with
-            // `MOE_VERIFY_MAX_ROWS`.
+            // `MOE_VERIFY_M6_ROWS`.
             moe_expert_gate_up_shared_t_m6_k: super::super::try_kernel(
                 gpu,
                 "moe_shared_expert_fused_t",
@@ -438,6 +438,28 @@ impl MoeLayer {
                 gpu,
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0_m6v2s4",
+            ),
+            // MROW=8 — the DDTree tree verify, and any drafter past γ=5. `m8`
+            // must stay in step with `MOE_VERIFY_MAX_ROWS`.
+            moe_expert_gate_up_shared_t_m8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m8v2s4",
+            ),
+            moe_expert_silu_down_shared_t_m8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m8v2s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m8v2s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m8v2s4",
             ),
             moe_expert_gate_up_shared_t_m1u_k: super::super::try_kernel(
                 gpu,
@@ -498,6 +520,29 @@ impl MoeLayer {
                 gpu,
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0_m6c56v2s4",
+            ),
+            // The 7..8-row partition arms. Same GROUP_DUPLICATED /
+            // count-5-or-more predicates as the m6 pair, widened so the gather
+            // is not clamped at six rows.
+            moe_expert_gate_up_shared_t_m8d_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m8dv2s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m8d_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m8dv2s4",
+            ),
+            moe_expert_silu_down_shared_t_m8c58_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m8c58v2s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m8c58_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m8c58v2s4",
             ),
             moe_gate_up_partial_finalize_m_k: super::super::try_kernel(
                 gpu,

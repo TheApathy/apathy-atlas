@@ -12,13 +12,22 @@ pub const MOE_DECODE_MAX_SPLIT: usize = 4;
 
 /// Largest row count the unified-`_t` MoE decode dispatch may launch at once —
 /// 1 for plain decode, 2 for the MTP K=2 speculative verify, 6 for the DSpark
-/// block verify (a 5-token proposed block plus the committed row), each of
-/// which runs every candidate row through one dedup'd launch. Sizing SSOT
-/// alongside `MOE_DECODE_MAX_SPLIT`: the partial buffer holds
-/// `rows * (top_k + 1)` f32 accumulator rows, so it scales linearly in this —
-/// 1.8 MB at 2 rows, 5.5 MB at 6, against ~94 MB of expert weights streamed
-/// per layer.
-pub const MOE_DECODE_MAX_ROWS: usize = 6;
+/// block verify (a 5-token proposed block plus the committed row), 8 for the
+/// DDTree tree verify (6 spine rows + 2 branch), each of which runs every
+/// candidate row through one dedup'd launch. Sizing SSOT alongside
+/// `MOE_DECODE_MAX_SPLIT`: the partial buffer holds `rows * (top_k + 1)` f32
+/// accumulator rows, so it scales linearly in this — 1.8 MB at 2 rows, 5.5 MB
+/// at 6, 7.3 MB at 8, against ~94 MB of expert weights streamed per layer.
+///
+/// This is a CLIFF, not a soft cap. One row past it, `MoeLayer::forward_km`
+/// declines and the caller falls back to `forward_batched`, which re-streams
+/// the whole routed expert set once PER ROW: measured on DeepSeek-V4-Flash /
+/// GB10 the verify goes 124.8 ms at 6 rows to 288.8 ms at 8 when the dedup path
+/// is unavailable, i.e. ~82 ms marginal per row against ~16 ms/row inside the
+/// cap. Raising it therefore requires compiling matching `_m{N}` entry points
+/// in `moe_shared_expert_fused_t.cu` — the constant alone would only move the
+/// buffer sizing, and the kernel selector would still find nothing wide enough.
+pub const MOE_DECODE_MAX_ROWS: usize = 8;
 
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]

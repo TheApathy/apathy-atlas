@@ -66,8 +66,16 @@ const SPLIT: u32 = 4; // must match `forward_phase::T_SPLIT`
 const VEC: u32 = 2; // must match `ops::T_SPLIT_VEC`
 const LAYERS: f64 = 43.0; // DeepSeek-V4-Flash
 /// Widest compiled `_m` entry point — must track
-/// `spark_runtime::buffers::MOE_DECODE_MAX_ROWS` and the `_m6v2s4` entries.
-const MROW_MAX: u32 = 6;
+/// `spark_runtime::buffers::MOE_DECODE_MAX_ROWS` and the `_m8v2s4` entries.
+const MROW_MAX: u32 = 8;
+/// The MROW=6 rung of the ladder. `MoeLayer::splitk_m_t_handles` stops here for
+/// any verify that fits it, so the oracle has to as well or it would validate a
+/// kernel the engine never launches at six rows.
+const MROW_M6: u32 = 6;
+/// The persistent Stage-0 entry points top out at `_m6_persistent_v2s4`; that
+/// leg is pinned to the six-row DSpark bridge shape and is not part of the
+/// MROW=8 widening.
+const MROW_PERSIST: u32 = 6;
 const ITERS: usize = 200;
 const PERSISTENT_BLOCK: u32 = 256;
 const PERSISTENT_TASKS_PER_RECORD: u32 = SPLIT * 4;
@@ -192,6 +200,10 @@ fn build_table(gpu: &dyn GpuBackend, ws: &[Wt]) -> Result<Table> {
 /// Host-built, device-consumed work descriptor. Keeping the exact 48-byte
 /// layout here and in CUDA is part of the microtest contract: the persistent
 /// kernels do no pointer-table lookup and no routing scan.
+///
+/// `slots` is sized by `MROW_PERSIST`, NOT `MROW_MAX` — 6 u32 is what makes the
+/// struct 48 bytes, and the CUDA side hard-codes that. Widening the `_m` ladder
+/// to MROW=8 must not silently restride this.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C, align(16))]
 struct PersistentWork {
@@ -199,7 +211,7 @@ struct PersistentWork {
     scale: u64,
     scale2_bits: u32,
     meta: u32,
-    slots: [u32; MROW_MAX as usize],
+    slots: [u32; MROW_PERSIST as usize],
 }
 
 impl PersistentWork {
@@ -212,9 +224,9 @@ impl PersistentWork {
         up: bool,
         gathered: &[u32],
     ) -> Self {
-        assert!((1..=MROW_MAX as usize).contains(&count));
+        assert!((1..=MROW_PERSIST as usize).contains(&count));
         assert_eq!(count, gathered.len());
-        let mut slots = [gathered[0]; MROW_MAX as usize];
+        let mut slots = [gathered[0]; MROW_PERSIST as usize];
         slots[..count].copy_from_slice(gathered);
         Self {
             packed,
@@ -416,19 +428,20 @@ fn persistent_fixtures(pool: usize, seed: u64) -> Vec<RoutingFixture> {
         pool >= 36,
         "persistent fixtures require at least 36 experts"
     );
-    let bridge = (0..MROW_MAX as usize)
+    // Six rows: the persistent Stage-0 kernels top out at `_m6_persistent`.
+    let bridge = (0..MROW_PERSIST as usize)
         .map(|row| {
             (0..6)
                 .map(|column| ((row * 2 + column) % 13) as u32)
                 .collect()
         })
         .collect();
-    let distinct = (0..MROW_MAX as usize)
+    let distinct = (0..MROW_PERSIST as usize)
         .map(|row| (0..6).map(|column| (row * 6 + column) as u32).collect())
         .collect();
-    let repeated = vec![(0..6).map(|expert| expert as u32).collect(); MROW_MAX as usize];
+    let repeated = vec![(0..6).map(|expert| expert as u32).collect(); MROW_PERSIST as usize];
     let mut random_rng = Rng(seed ^ 0xB71D_6E5A_8C29_F043);
-    let random = (0..MROW_MAX as usize)
+    let random = (0..MROW_PERSIST as usize)
         .map(|_| {
             let mut row = Vec::with_capacity(6);
             while row.len() < 6 {
@@ -583,7 +596,13 @@ fn main() -> Result<()> {
 
     // Narrowest compiled `_m` entry point that covers `tokens`, exactly as
     // `MoeLayer::splitk_m_t_handles` picks it.
-    let mrow: u32 = if tokens <= 2 { 2 } else { MROW_MAX };
+    let mrow: u32 = if tokens <= 2 {
+        2
+    } else if tokens as u32 <= MROW_M6 {
+        MROW_M6
+    } else {
+        MROW_MAX
+    };
 
     println!(
         "=== V4 multi-row (_m) decode MoE: block={block} pool={pool} top_k={top_k} \
@@ -807,16 +826,39 @@ fn main() -> Result<()> {
                 "m1"
             } else if mrow == 2 {
                 "m2"
-            } else {
+            } else if mrow <= MROW_M6 {
                 "m6"
+            } else {
+                "m8"
             };
+            // The duplicated gate arm and the open-ended top down bucket must be
+            // compiled at an MROW >= tokens, or their gather clamps and the rows
+            // past MROW are never written. Everything below the top bucket is
+            // width-independent: its multiplicity is bounded by the bucket.
+            let wide = tokens > MROW_M6;
             let gu_suffixes: Vec<(&str, u32)> = if partition && tokens > 2 {
-                vec![("m1u", 1), ("m6d", MROW_MAX)]
+                vec![
+                    ("m1u", 1),
+                    if wide {
+                        ("m8d", MROW_MAX)
+                    } else {
+                        ("m6d", MROW_M6)
+                    },
+                ]
             } else {
                 vec![(regular_suffix, mrow)]
             };
             let dn_suffixes: Vec<(&str, u32)> = if partition && tokens > 2 {
-                vec![("m1u", 1), ("m2c2", 2), ("m4c34", 4), ("m6c56", 6)]
+                vec![
+                    ("m1u", 1),
+                    ("m2c2", 2),
+                    ("m4c34", 4),
+                    if wide {
+                        ("m8c58", MROW_MAX)
+                    } else {
+                        ("m6c56", MROW_M6)
+                    },
+                ]
             } else {
                 vec![(regular_suffix, mrow)]
             };
@@ -1200,10 +1242,11 @@ fn main() -> Result<()> {
             bail!("GATE 2 FAILED: worst rel {worst:.5} > {REL_MAX:.5} at {worst_at}");
         }
         println!(
-            "  GATE 2 PASS: partitioned gate m1u+m6d / down multiplicity buckets == \
+            "  GATE 2 PASS: partitioned gate m1u+{dup} / down multiplicity buckets == \
              {tokens}x _v2s4, worst rel {worst:.2e} \
-             (bound {REL_MAX:.2e}){}",
-            if exact { ", bit-identical" } else { "" }
+             (bound {REL_MAX:.2e}){exact}",
+            dup = if tokens as u32 > MROW_M6 { "m8d" } else { "m6d" },
+            exact = if exact { ", bit-identical" } else { "" }
         );
     }
 
@@ -1244,7 +1287,7 @@ fn main() -> Result<()> {
     // Persistent Stage-0 is deliberately pinned to the production DSpark
     // bridge shape: six rows, top-6, and enough uploaded experts for the fully
     // distinct fixture. Other invocations retain the original `_m` oracle.
-    if tokens == MROW_MAX as usize && top_k == 6 && pool >= 36 {
+    if tokens == MROW_PERSIST as usize && top_k == 6 && pool >= 36 {
         println!();
         println!("=== persistent host-work Stage-0: raw-bit parity + timing ===");
         let gu_words = 2 * s * m_rows * INTER;
@@ -1284,7 +1327,7 @@ fn main() -> Result<()> {
             poison(&m_out)?;
             poison_partial(partial_gu, gu_words, 0x1357_0000)?;
             poison_partial(partial_dn, dn_words, 0x2468_0000)?;
-            p_chain(MROW_MAX, MROW_MAX, &m_out, stream)?;
+            p_chain(MROW_PERSIST, MROW_PERSIST, &m_out, stream)?;
             poison(&persistent_out)?;
             poison_partial(persistent_gu, gu_words, 0x9ABC_0000)?;
             poison_partial(persistent_dn, dn_words, 0xDEF0_0000)?;
@@ -1376,7 +1419,7 @@ fn main() -> Result<()> {
                 require_raw_equal(fixture.label, label, control, candidate, bytes)?;
             }
 
-            let t_control = time(&|st| p_chain(MROW_MAX, MROW_MAX, &m_out, st))?;
+            let t_control = time(&|st| p_chain(MROW_PERSIST, MROW_PERSIST, &m_out, st))?;
             let t_leader = time(&|st| persistent_chain(&leader, &persistent_out, st))?;
             let t_pointer = time(&|st| persistent_chain(&pointer, &persistent_out, st))?;
             let best = t_leader.min(t_pointer);

@@ -14,7 +14,7 @@ use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
 
 /// Widest speculative verify the dedup'd multi-row `_t` MoE covers in one
-/// launch — the DSpark block (5 proposed rows + the committed one).
+/// launch — the DDTree tree verify (6 spine rows + 2 branch).
 ///
 /// This is the MROW of the widest compiled `_m` entry point AND the row count
 /// `spark_runtime::buffers::MOE_DECODE_MAX_ROWS` sizes the split-K partial
@@ -22,11 +22,22 @@ use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeigh
 /// silently drops every verify back to the per-row loop.
 pub(crate) const MOE_VERIFY_MAX_ROWS: u32 = spark_runtime::buffers::MOE_DECODE_MAX_ROWS as u32;
 
+/// Widest verify the MROW=6 entry points cover. The m8 pair is strictly wider,
+/// not better: an MROW=8 gather carries two more accumulator registers per
+/// thread through the same loop, so the selectors below stay on m6 whenever the
+/// row count fits it. That keeps the DSpark 6-row block verify — still the
+/// default path — launch-for-launch identical to before m8 existed.
+const MOE_VERIFY_M6_ROWS: u32 = 6;
+
 #[derive(Clone, Copy)]
 pub(crate) struct SplitkMPartitionHandles {
     pub(crate) gate_unique: KernelHandle,
     pub(crate) gate_duplicated: KernelHandle,
     pub(crate) down_unique: KernelHandle,
+    /// `(kernel, MROW)` per multiplicity bucket. The buckets must TILE
+    /// `2..=num_tokens` with no gap — the top one is open-ended (counts ≥ 5),
+    /// so widening the verify means widening THAT arm's MROW, not appending a
+    /// bucket.
     pub(crate) down_buckets: [(KernelHandle, u32); 3],
 }
 
@@ -310,10 +321,19 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_t_m6_k: KernelHandle,
     moe_expert_gate_up_shared_t_e8m0_m6_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_m6_k: KernelHandle,
+    // MROW=8: the DDTree tree verify (6 spine + 2 branch) and any drafter past
+    // γ=5. Selected ONLY for 7..8 rows — see `MOE_VERIFY_M6_ROWS`.
+    moe_expert_gate_up_shared_t_m8_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m8_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m8_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m8_k: KernelHandle,
     // Wide-verify partitions. Gate/up uses lean MROW=1 for unique groups and
-    // MROW=6 for duplicated groups. Down additionally buckets multiplicity as
-    // 2, 3-4, and 5-6 so each launch reserves only the dynamic shared memory
-    // its accumulator width needs.
+    // MROW=6 (MROW=8 past six rows) for duplicated groups. Down additionally
+    // buckets multiplicity as 2, 3-4, and 5-or-more so each launch reserves only
+    // the dynamic shared memory its accumulator width needs. The top bucket is
+    // open-ended, so widening the verify widens ITS MROW (m6c56 → m8c58) rather
+    // than adding a fourth bucket: a gap in the tiling would leave the groups
+    // whose count lands in it with no down arm at all.
     moe_expert_gate_up_shared_t_m1u_k: KernelHandle,
     moe_expert_silu_down_shared_t_m1u_k: KernelHandle,
     moe_expert_gate_up_shared_t_e8m0_m1u_k: KernelHandle,
@@ -326,6 +346,10 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_t_e8m0_m4c34_k: KernelHandle,
     moe_expert_silu_down_shared_t_m6c56_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_m6c56_k: KernelHandle,
+    moe_expert_gate_up_shared_t_m8d_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m8d_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m8c58_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m8c58_k: KernelHandle,
     moe_gate_up_partial_finalize_m_k: KernelHandle,
     moe_gate_up_partial_finalize_m_act_k: KernelHandle,
     moe_down_partial_finalize_m_k: KernelHandle,
@@ -667,11 +691,18 @@ impl MoeLayer {
                 self.moe_expert_silu_down_shared_t_e8m0_m2_k,
             ),
             (
-                MOE_VERIFY_MAX_ROWS,
+                MOE_VERIFY_M6_ROWS,
                 self.moe_expert_gate_up_shared_t_m6_k,
                 self.moe_expert_gate_up_shared_t_e8m0_m6_k,
                 self.moe_expert_silu_down_shared_t_m6_k,
                 self.moe_expert_silu_down_shared_t_e8m0_m6_k,
+            ),
+            (
+                MOE_VERIFY_MAX_ROWS,
+                self.moe_expert_gate_up_shared_t_m8_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m8_k,
+                self.moe_expert_silu_down_shared_t_m8_k,
+                self.moe_expert_silu_down_shared_t_e8m0_m8_k,
             ),
         ];
         for &(mrow, gu, gu_e8m0, sd, sd_e8m0) in candidates {
@@ -690,10 +721,13 @@ impl MoeLayer {
         None
     }
 
-    /// Partitioned 3--6-row verify kernels. Every arm writes disjoint rows of
-    /// the same partial buffer, selected by the expert group's exact
-    /// multiplicity. The MROW=6 duplicated/count-5--6 arms are correct for
-    /// narrower inputs because their gather loop is capped by `num_tokens`.
+    /// Partitioned 3..=`MOE_VERIFY_MAX_ROWS`-row verify kernels. Every arm
+    /// writes disjoint rows of the same partial buffer, selected by the expert
+    /// group's exact multiplicity. The duplicated / count-5-or-more arms are
+    /// correct for narrower inputs because their gather loop is capped by
+    /// `num_tokens`, so the MROW=6 pair serves the whole 3..=6 range and the
+    /// MROW=8 pair is reached only at 7..8 — where m6 would clamp the gather
+    /// and silently drop rows.
     pub(crate) fn splitk_m_t_partition_handles(
         &self,
         num_tokens: u32,
@@ -701,6 +735,7 @@ impl MoeLayer {
         if !(3..=MOE_VERIFY_MAX_ROWS).contains(&num_tokens) {
             return None;
         }
+        let wide = num_tokens > MOE_VERIFY_M6_ROWS;
         if self.moe_gate_up_partial_finalize_m_act_k.0 == 0 {
             return None;
         }
@@ -712,10 +747,17 @@ impl MoeLayer {
             self.moe_expert_silu_down_shared_t_m1u_k,
             self.moe_expert_silu_down_shared_t_e8m0_m1u_k,
         )?;
-        let gate_duplicated = self.e8m0_or_opt(
-            self.moe_expert_gate_up_shared_t_m6d_k,
-            self.moe_expert_gate_up_shared_t_e8m0_m6d_k,
-        )?;
+        let gate_duplicated = if wide {
+            self.e8m0_or_opt(
+                self.moe_expert_gate_up_shared_t_m8d_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m8d_k,
+            )?
+        } else {
+            self.e8m0_or_opt(
+                self.moe_expert_gate_up_shared_t_m6d_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m6d_k,
+            )?
+        };
         let down_buckets = [
             (
                 self.e8m0_or_opt(
@@ -731,13 +773,26 @@ impl MoeLayer {
                 )?,
                 4,
             ),
-            (
-                self.e8m0_or_opt(
-                    self.moe_expert_silu_down_shared_t_m6c56_k,
-                    self.moe_expert_silu_down_shared_t_e8m0_m6c56_k,
-                )?,
-                MOE_VERIFY_MAX_ROWS,
-            ),
+            // Open-ended top bucket (counts ≥ 5): its MROW must cover
+            // `num_tokens`, or `m_out = min(s_m, MROW)` in the kernel clamps the
+            // gather and the rows past MROW never get written.
+            if wide {
+                (
+                    self.e8m0_or_opt(
+                        self.moe_expert_silu_down_shared_t_m8c58_k,
+                        self.moe_expert_silu_down_shared_t_e8m0_m8c58_k,
+                    )?,
+                    MOE_VERIFY_MAX_ROWS,
+                )
+            } else {
+                (
+                    self.e8m0_or_opt(
+                        self.moe_expert_silu_down_shared_t_m6c56_k,
+                        self.moe_expert_silu_down_shared_t_e8m0_m6c56_k,
+                    )?,
+                    MOE_VERIFY_M6_ROWS,
+                )
+            },
         ];
         Some(SplitkMPartitionHandles {
             gate_unique,
