@@ -437,8 +437,15 @@ impl Qwen3AttentionLayer {
         // compressed block from earlier traffic. Store this sequence's own block
         // count (0 when sub-ratio) up front so requests never leak across each other.
         if let Some(c) = mla.compressor.as_ref() {
+            let prefill_blocks = n / c.ratio as u32;
             self.v4_comp_pool_filled
-                .store(n / c.ratio as u32, std::sync::atomic::Ordering::Relaxed);
+                .store(prefill_blocks, std::sync::atomic::Ordering::Relaxed);
+            // Mirror to the device word the graphed decode/verify kernels read
+            // (on-stream so it lands before the first decode/verify of this req).
+            if !self.v4_comp_count_dev.is_null() {
+                ctx.gpu
+                    .memset_u32_async(self.v4_comp_count_dev, prefill_blocks, 1, stream)?;
+            }
         }
         let csa = match mla.compressor {
             Some(c) if self.csa_compress_k.0 != 0 && (n / c.ratio as u32) > 0 => Some(c),

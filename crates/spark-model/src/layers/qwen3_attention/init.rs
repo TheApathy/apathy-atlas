@@ -548,6 +548,9 @@ impl Qwen3AttentionLayer {
                 "prefill_attn_compressed",
             ),
             v4_comp_pool_filled: std::sync::atomic::AtomicU32::new(0),
+            // Device mirror of the above; allocated (compressor layers only) by
+            // `alloc_verify_comp_normed`. NULL → kernel reads count 0.
+            v4_comp_count_dev: spark_runtime::gpu::DevicePtr::NULL,
             v4_comp_prev_valid: std::sync::atomic::AtomicBool::new(false),
             v4_decode_started: std::sync::atomic::AtomicBool::new(false),
             v4_decode_first_pos: std::sync::atomic::AtomicU32::new(0),

@@ -165,6 +165,17 @@ impl GpuBackend for MockGpuBackend {
         self.memset(ptr, value, bytes)
     }
 
+    fn memset_u32_async(
+        &self,
+        _ptr: DevicePtr,
+        _value: u32,
+        _count: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        // Mock backend does not model device memory contents.
+        Ok(())
+    }
+
     fn total_memory(&self) -> Result<usize> {
         Ok(128 * 1024 * 1024 * 1024) // 128 GB
     }

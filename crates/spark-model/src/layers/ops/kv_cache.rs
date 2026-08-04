@@ -881,7 +881,7 @@ pub fn mla_paged_decode_fp8(
     sliding_window: u32,
     sinks: DevicePtr,
     comp_pool: DevicePtr, // 4b: flat FP8 compressed-KV pool (NULL = no compressed arm)
-    comp_block_count: u32, // 4b: # compressed blocks to attend (0 = no-op)
+    comp_block_count_ptr: DevicePtr, // 4b: DEVICE word holding # compressed blocks (NULL = 0). Graph-safe: kernel reads it at replay.
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -906,7 +906,7 @@ pub fn mla_paged_decode_fp8(
         .arg_u32(sliding_window)
         .arg_ptr(sinks)
         .arg_ptr(comp_pool)
-        .arg_u32(comp_block_count)
+        .arg_ptr(comp_block_count_ptr)
         .launch(stream)
 }
 

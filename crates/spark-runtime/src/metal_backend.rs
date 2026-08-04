@@ -558,6 +558,38 @@ impl GpuBackend for MetalGpuBackend {
         self.memset(ptr, value, bytes)
     }
 
+    fn memset_u32_async(
+        &self,
+        ptr: DevicePtr,
+        value: u32,
+        count: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let bytes = count * 4;
+        let allocs = self.allocations.lock();
+        let (buf, offset) = Self::find_buffer(&allocs, ptr)
+            .ok_or_else(|| anyhow!("memset_u32: ptr {ptr} not allocated"))?;
+        if offset + bytes > buf.length() {
+            bail!(
+                "memset_u32: range overflows buffer ({} + {} > {})",
+                offset,
+                bytes,
+                buf.length()
+            );
+        }
+        let contents = buf.contents();
+        unsafe {
+            let dst = (contents.as_ptr() as *mut u8).add(offset) as *mut u32;
+            for i in 0..count {
+                dst.add(i).write(value);
+            }
+        }
+        Ok(())
+    }
+
     fn total_memory(&self) -> Result<usize> {
         // On Apple Silicon UMA, "device memory" = system RAM. Probe
         // hw.memsize via sysctl for the authoritative number; fall

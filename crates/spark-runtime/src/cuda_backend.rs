@@ -34,6 +34,11 @@ unsafe extern "C" {
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
     pub(super) fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     pub(super) fn cuMemsetD8Async(dst: u64, value: u8, n: usize, stream: u64) -> i32;
+    // Set N 32-bit words to `value` on `stream`. Used to publish the compressed-KV
+    // block count into a device word the graphed decode/verify kernels read at
+    // replay time (a by-value launch arg would freeze at capture — see the
+    // DSpark compressor-asymmetry fix).
+    pub(super) fn cuMemsetD32Async(dst: u64, value: u32, n: usize, stream: u64) -> i32;
     // CUDA graph capture/replay
     pub(super) fn cuStreamBeginCapture(hStream: u64, mode: u32) -> i32;
     // Capture-status query (telemetry taps must not sync/copy inside an

@@ -96,27 +96,39 @@ impl Qwen3AttentionLayer {
                 // (compressor=None) → NULL pool + 0 blocks = kernel no-op. Compress
                 // layers → prefill-written blocks [0, filled) (inc-2: prefill blocks
                 // only, no decode-time append yet — cap is the frozen prefill count).
-                let (comp_pool, comp_blocks) = match mla.compressor {
+                // `comp_pool` is the FP8 block store; the block COUNT is now read
+                // by the kernel from a device word (`v4_comp_count_dev`) at
+                // execution time, so a captured graph replay observes the
+                // compressor's per-step growth instead of the value baked at
+                // capture — the fix for the DSpark acceptance collapse. `comp_blocks`
+                // (host mirror) is kept only for the diagnostic log below.
+                let (comp_pool, comp_count_ptr, comp_blocks) = match mla.compressor {
                     Some(c) => (
                         c.pool,
+                        self.v4_comp_count_dev,
                         self.v4_comp_pool_filled
                             .load(std::sync::atomic::Ordering::Relaxed),
                     ),
-                    None => (spark_runtime::gpu::DevicePtr::NULL, 0u32),
+                    None => (
+                        spark_runtime::gpu::DevicePtr::NULL,
+                        spark_runtime::gpu::DevicePtr::NULL,
+                        0u32,
+                    ),
                 };
                 // ATLAS_V4_FORCE_NO_COMP=1: drop the compressed arm on EVERY
                 // path (decode + verify). Diagnostic only — proves the
                 // decode/verify compressed-pool asymmetry is the greedy-spec
                 // divergence source: with it set, both paths attend the raw
-                // window alone and greedy spec must match plain greedy exactly.
-                let comp_blocks = {
+                // window alone (NULL count ptr → kernel reads 0) and greedy spec
+                // must match plain greedy exactly.
+                let (comp_count_ptr, comp_blocks) = {
                     static NC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                     if *NC.get_or_init(|| {
                         std::env::var("ATLAS_V4_FORCE_NO_COMP").as_deref() == Ok("1")
                     }) {
-                        0
+                        (spark_runtime::gpu::DevicePtr::NULL, 0)
                     } else {
-                        comp_blocks
+                        (comp_count_ptr, comp_blocks)
                     }
                 };
                 if self.attn_layer_idx == 2
@@ -183,7 +195,7 @@ impl Qwen3AttentionLayer {
                     128, // V4 decode sliding_window (config sliding_window=128), item 4a
                     self.mla.as_ref().unwrap().attn_sink,
                     comp_pool,
-                    comp_blocks,
+                    comp_count_ptr,
                     stream,
                 )
             }

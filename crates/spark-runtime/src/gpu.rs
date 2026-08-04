@@ -264,6 +264,17 @@ pub trait GpuBackend: Send + Sync {
     /// Set device memory to a byte value on the given stream (async — does not wait).
     fn memset_async(&self, ptr: DevicePtr, value: u8, bytes: usize, stream: u64) -> Result<()>;
 
+    /// Set `count` 32-bit words at `ptr` to `value` on the given stream (async).
+    /// Used to publish a small device-resident counter that graphed kernels read
+    /// at replay time (a by-value launch arg would freeze at graph capture).
+    fn memset_u32_async(
+        &self,
+        ptr: DevicePtr,
+        value: u32,
+        count: usize,
+        stream: u64,
+    ) -> Result<()>;
+
     /// Total device memory in bytes.
     fn total_memory(&self) -> Result<usize>;
 

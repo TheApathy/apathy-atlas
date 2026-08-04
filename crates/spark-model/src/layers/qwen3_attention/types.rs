@@ -334,6 +334,14 @@ pub struct Qwen3AttentionLayer {
     /// `&self`; V4 serves max_batch=1 so one counter suffices (inc-3: per-seq
     /// tracking + decode-time append will grow this each boundary crossing).
     pub(super) v4_comp_pool_filled: std::sync::atomic::AtomicU32,
+    /// 4b: DEVICE mirror of `v4_comp_pool_filled` — a single u32 the graphed
+    /// decode/verify `mla_paged_decode_fp8` kernels read at execution time. A
+    /// by-value launch arg froze at graph capture, so a captured γ-verify replay
+    /// never saw the compressor's per-step growth and rejected every draft (the
+    /// DSpark acceptance bug). Written on-stream via `memset_u32_async` at every
+    /// `v4_compress_append` and at per-request init. Allocated ONLY when this
+    /// layer owns a compressor (else `DevicePtr::NULL` → kernel reads 0).
+    pub(super) v4_comp_count_dev: DevicePtr,
     /// 4b inc-3 decode-append state (V4 serves max_batch=1 → scalar per layer).
     /// `prev_valid`: the CSA `prev_win` ring holds a real previous decode window
     /// (false until the first decode append, and reset each prefill) — when false

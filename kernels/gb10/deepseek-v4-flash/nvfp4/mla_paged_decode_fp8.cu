@@ -78,8 +78,13 @@ __device__ void mla_paged_decode_fp8_impl(
     const unsigned int sliding_window,               // 0 = full; else attend only the last `sliding_window` positions
     const float* __restrict__ sinks,                 // [num_q_heads] per-head attn sink (s_aux); may be NULL. FP32: checkpoint-native (reading as bf16 hard-zeroed 7 heads)
     const unsigned char* __restrict__ comp_pool,     // 4b: flat FP8 compressed-KV pool [comp_block_count][576]; may be NULL
-    const unsigned int comp_block_count              // 4b: # completed compressed blocks to attend; 0 = no compressed arm (ratio-0 layers)
+    const unsigned int* __restrict__ comp_block_count_ptr  // 4b: DEVICE word holding # completed compressed blocks (NULL = 0). Read at execution so graph replay sees the live count, not the value baked at capture.
 ) {
+    // Deref the device-resident count once. A by-value launch arg would freeze at
+    // graph-capture time; sourcing it from device memory lets the graphed decode/
+    // verify replays observe the compressor's per-step growth (DSpark fix #21).
+    const unsigned int comp_block_count =
+        comp_block_count_ptr ? __ldg(comp_block_count_ptr) : 0u;
     const unsigned int q_head = blockIdx.x;
     const unsigned int seq_idx = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -500,13 +505,13 @@ __device__ void mla_paged_decode_fp8_impl(
     const unsigned int sliding_window,                                         \
     const float* __restrict__ sinks,                                           \
     const unsigned char* __restrict__ comp_pool,                               \
-    const unsigned int comp_block_count
+    const unsigned int* __restrict__ comp_block_count_ptr
 
 #define MLA_PAGED_DECODE_FP8_ARGS                                              \
     Q, K_cache, V_cache, O, block_tables, seq_lens, max_blocks_per_seq,        \
     num_q_heads, num_kv_heads, q_head_dim, kv_cache_dim, block_size,           \
     inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, sliding_window, sinks,   \
-    comp_pool, comp_block_count
+    comp_pool, comp_block_count_ptr
 
 extern "C" __global__ void mla_paged_decode_fp8(MLA_PAGED_DECODE_FP8_PARAMS) {
     mla_paged_decode_fp8_impl<false>(MLA_PAGED_DECODE_FP8_ARGS);

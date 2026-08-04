@@ -64,6 +64,11 @@ impl Qwen3AttentionLayer {
             .is_some();
         if has_comp {
             self.verify_comp_normed = gpu.alloc(MAX_VERIFY_ROWS * hidden_size * 2)?;
+            // Device mirror of `v4_comp_pool_filled` the graphed kernels read at
+            // replay (see the field doc). Seed to 0; prefill/init publishes the
+            // real prefill count before the first decode/verify.
+            self.v4_comp_count_dev = gpu.alloc(4)?;
+            gpu.memset_u32_async(self.v4_comp_count_dev, 0, 1, gpu.default_stream())?;
         }
         Ok(())
     }

@@ -893,6 +893,13 @@ impl Qwen3AttentionLayer {
                     )?;
                     // Publish: decode's compressed arm now attends [0, w+1).
                     self.v4_comp_pool_filled.store(w + 1, Relaxed);
+                    // Mirror to the device word the graphed kernels read at replay,
+                    // on THIS stream so it is ordered before the next kernel that
+                    // reads it (the fix for the graph-baked count freeze).
+                    if !self.v4_comp_count_dev.is_null() {
+                        ctx.gpu
+                            .memset_u32_async(self.v4_comp_count_dev, w + 1, 1, stream)?;
+                    }
                     if self.attn_layer_idx == 0
                         && std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok()
                     {
