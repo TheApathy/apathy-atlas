@@ -1132,16 +1132,24 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
             _Pragma("unroll") \
             for (int v = 0; v < VEC; ++v) sc[v] = mx_block_scale<(E8M0_)>(sb[v], s2); \
             const unsigned int kh_base = sg * ((GS_) / 2); \
+            /* Prefetch every weight byte in this scale-group up front so all */ \
+            /* GS/2 global loads are in flight at once — the m6 GEMV is */ \
+            /* long_scoreboard-bound (~20% mem pipe, 64-86% load-latency stall), */ \
+            /* not bandwidth-bound, so exposing load MLP is the 2x lever. */ \
+            /* Bit-identical: same decode + same FMA order, loads only hoisted. */ \
+            unsigned char pbyte[(GS_) / 2][VEC]; \
+            _Pragma("unroll") \
+            for (unsigned int kh_off = 0; kh_off < ((GS_) / 2); kh_off++) { \
+                load_vec_u8<VEC>(B_packed + (unsigned long long)(kh_base + kh_off) * N + n, pbyte[kh_off]); \
+            } \
             _Pragma("unroll") \
             for (unsigned int kh_off = 0; kh_off < ((GS_) / 2); kh_off++) { \
                 unsigned int k_half = kh_base + kh_off; \
-                unsigned char byte[VEC]; \
-                load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte); \
                 float w_lo[VEC], w_hi[VEC]; \
                 _Pragma("unroll") \
                 for (int v = 0; v < VEC; ++v) { \
-                    w_lo[v] = e2m1_decode(byte[v] & 0xFu) * sc[v]; \
-                    w_hi[v] = e2m1_decode((byte[v] >> 4) & 0xFu) * sc[v]; \
+                    w_lo[v] = e2m1_decode(pbyte[kh_off][v] & 0xFu) * sc[v]; \
+                    w_hi[v] = e2m1_decode((pbyte[kh_off][v] >> 4) & 0xFu) * sc[v]; \
                 } \
                 _Pragma("unroll") \
                 for (int m = 0; m < (ROWS_); ++m) { \
@@ -1319,16 +1327,23 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
             _Pragma("unroll") \
             for (int v = 0; v < VEC; ++v) sc[v] = mx_block_scale<(E8M0_)>(sb[v], s2); \
             const unsigned int kh_base = sg * ((GS_) / 2); \
+            /* Prefetch the whole scale-group's weight bytes up front (load MLP); */ \
+            /* down GEMV is long_scoreboard-bound like the gate_up twin. Same */ \
+            /* byte set as the original (the K_half break is at group boundary), */ \
+            /* same decode + FMA order → bit-identical. */ \
+            unsigned char pbyte[(GS_) / 2][VEC]; \
+            _Pragma("unroll") \
+            for (unsigned int kh_off = 0; kh_off < ((GS_) / 2); kh_off++) { \
+                load_vec_u8<VEC>(B_packed + (unsigned long long)(kh_base + kh_off) * N + n, pbyte[kh_off]); \
+            } \
             _Pragma("unroll") \
             for (unsigned int kh_off = 0; kh_off < ((GS_) / 2); kh_off++) { \
                 unsigned int k_half = kh_base + kh_off; \
-                unsigned char byte[VEC]; \
-                load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte); \
                 float w_lo[VEC], w_hi[VEC]; \
                 _Pragma("unroll") \
                 for (int v = 0; v < VEC; ++v) { \
-                    w_lo[v] = e2m1_decode(byte[v] & 0xFu) * sc[v]; \
-                    w_hi[v] = e2m1_decode((byte[v] >> 4) & 0xFu) * sc[v]; \
+                    w_lo[v] = e2m1_decode(pbyte[kh_off][v] & 0xFu) * sc[v]; \
+                    w_hi[v] = e2m1_decode((pbyte[kh_off][v] >> 4) & 0xFu) * sc[v]; \
                 } \
                 _Pragma("unroll") \
                 for (int m = 0; m < (ROWS_); ++m) { \

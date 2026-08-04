@@ -793,6 +793,16 @@ fn main() -> Result<()> {
     // 0xF is the whole chain and the only setting that leaves valid outputs.
     let m_chain_stages =
         |mrow: u32, tokens: u32, partition: bool, o: &Outs, stages: u32, st: u64| -> Result<()> {
+            // The partition/precompute arms (m1u, m*c*) only exist for the >2-row
+            // verify; at tokens<=2 the chain falls back to the regular m1/m2
+            // kernels even when `partition` is requested. Every downstream choice
+            // that assumes precomputed activation — finalize variant, its grid.z
+            // and activation arg, and the down kernel's dynamic smem — must key
+            // off this EFFECTIVE flag, not the raw request. Keying the smem off
+            // the raw `partition` while the regular (non-precomputed) down kernel
+            // is what actually launches passes shared_mem=0 to a kernel that reads
+            // `s_act_m` → CUDA_ERROR_ILLEGAL_ADDRESS.
+            let partition = partition && tokens > 2;
             let regular_suffix = if mrow == 1 {
                 "m1"
             } else if mrow == 2 {
