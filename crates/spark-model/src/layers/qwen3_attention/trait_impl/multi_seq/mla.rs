@@ -494,31 +494,84 @@ impl Qwen3AttentionLayer {
 
         mark("A_proj", &mut t_phase)?;
 
-        // ── Phase B: per-row rope / cache write / paged attention ──
-        for i in 0..n {
-            let meta_i = Self::meta_row(meta, i);
-            let ctx_i = crate::layer::ForwardContext {
-                attn_metadata: Some(meta_i),
-                midchunk_capture: None,
-                ..*c.fwd
-            };
-            let args = super::super::super::decode::attention_forward_mla::DecodeMlaArgs {
-                normed: c.normed.offset(i * c.h * bf16),
-                q_out: q_batch.offset(i * q_dim as usize * bf16),
-                k_out: kv_batch.offset(i * kv_dim as usize * bf16),
-                v_out: v_batch.offset(i * kv_dim as usize * bf16),
-                q_dim,
-                h,
+        // ── Phase B: batched rope / cache write, per-row paged attention ──
+        // Every kernel in the rope + cache-write half already takes a row
+        // count and is exercised at n≫1 by prefill, so it runs once for all n
+        // instead of n times at 1 row (see decode/rows_rope_cache.rs). That was
+        // ~347 µs of the measured 467 µs/layer; only the ~120 µs of paged
+        // attention is genuinely per-row, because `mla_paged_decode_fp8`
+        // indexes only seq_lens/block_tables by blockIdx.y and documents Q/O as
+        // `[1, nq * q_dim]` — raising num_seqs would alias every row onto row 0.
+        //
+        // ATLAS_MLA_ROWS_BATCH=0 restores the per-row chain for A/B.
+        let rows_batched = {
+            static RB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *RB.get_or_init(|| std::env::var("ATLAS_MLA_ROWS_BATCH").as_deref() != Ok("0"))
+        };
+        if rows_batched {
+            let rargs = super::super::super::decode::rows_rope_cache::RowsRopeArgs {
+                q_batch,
+                k_batch: kv_batch,
+                v_batch,
+                // `ql_batch` is dead after wq_b consumed it above — the
+                // single-row chain reuses q_latent for the K rope the same way.
+                k_rope_tmp: ql_batch,
+                n: n as u32,
                 nq,
                 hd,
-                eps,
-                bs,
+                bs: bs as u32,
                 stream,
-                pos: None,
-                skip_qkv: true,
-                attn_dest: Some(attn_batch.offset(i * q_dim as usize * bf16)),
             };
-            self.attention_forward_v4(kv_cache, &ctx_i, &args)?;
+            self.mla_rows_rope_and_cache(kv_cache, c.fwd, meta, &rargs)?;
+            let inv_sqrt_d = self.effective_attn_scale(hd);
+            for i in 0..n {
+                self.run_paged_decode(
+                    gpu,
+                    q_batch.offset(i * q_dim as usize * bf16),
+                    kv_cache,
+                    attn_batch.offset(i * q_dim as usize * bf16),
+                    meta.block_table
+                        .offset(i * meta.max_blocks_per_seq as usize * 4),
+                    meta.seq_len.offset(i * 4),
+                    meta.max_blocks_per_seq,
+                    1,
+                    nq,
+                    c.nkv,
+                    hd,
+                    bs as u32,
+                    inv_sqrt_d,
+                    q_dim,
+                    c.fwd.buffers.splitk_workspace(),
+                    stream,
+                )?;
+            }
+            self.mla_rows_derotate(c.fwd, meta, attn_batch, n as u32, nq, hd, stream)?;
+        } else {
+            for i in 0..n {
+                let meta_i = Self::meta_row(meta, i);
+                let ctx_i = crate::layer::ForwardContext {
+                    attn_metadata: Some(meta_i),
+                    midchunk_capture: None,
+                    ..*c.fwd
+                };
+                let args = super::super::super::decode::attention_forward_mla::DecodeMlaArgs {
+                    normed: c.normed.offset(i * c.h * bf16),
+                    q_out: q_batch.offset(i * q_dim as usize * bf16),
+                    k_out: kv_batch.offset(i * kv_dim as usize * bf16),
+                    v_out: v_batch.offset(i * kv_dim as usize * bf16),
+                    q_dim,
+                    h,
+                    nq,
+                    hd,
+                    eps,
+                    bs,
+                    stream,
+                    pos: None,
+                    skip_qkv: true,
+                    attn_dest: Some(attn_batch.offset(i * q_dim as usize * bf16)),
+                };
+                self.attention_forward_v4(kv_cache, &ctx_i, &args)?;
+            }
         }
 
         mark("B_attn", &mut t_phase)?;

@@ -17,6 +17,9 @@ mod attention_forward_oproj;
 mod attention_forward_v4;
 mod fused_epilogue;
 mod high_speed_swap;
+// `pub(in …)`: the multi-sequence MLA verify path drives the batched γ-row
+// rope + cache write out of `trait_impl::multi_seq::mla`.
+pub(in crate::layers::qwen3_attention) mod rows_rope_cache;
 mod run_paged_decode;
 mod write_kv_cache;
 
