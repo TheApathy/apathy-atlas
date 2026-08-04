@@ -41,7 +41,7 @@ impl MoeLayer {
         // The vector load/store serves whole VEC groups only, and each block
         // must cover a whole number of scale groups. Routed MXFP4 is per-32,
         // NVFP4 per-16, so `32 * split` covers both.
-        let widths_ok = inter % (ops::T_BLOCK * vec) == 0 && h % (ops::T_BLOCK * vec) == 0;
+        let widths_ok = inter % (ops::t_block() * vec) == 0 && h % (ops::t_block() * vec) == 0;
         let depths_ok = h % (32 * split) == 0 && inter % (32 * split) == 0;
         let handles_ok = self.moe_gate_up_partial_finalize_k.0 != 0
             && self.moe_down_partial_finalize_k.0 != 0
@@ -93,7 +93,7 @@ impl MoeLayer {
         }
         let split = T_SPLIT;
         let vec = ops::T_SPLIT_VEC;
-        let widths_ok = inter % (ops::T_BLOCK * vec) == 0 && h % (ops::T_BLOCK * vec) == 0;
+        let widths_ok = inter % (ops::t_block() * vec) == 0 && h % (ops::t_block() * vec) == 0;
         let depths_ok = h % (32 * split) == 0 && inter % (32 * split) == 0;
         if !(widths_ok && depths_ok) || num_tokens < 2 {
             return None;

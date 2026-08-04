@@ -36,6 +36,13 @@ pub trait TransformerLayer: Send + Sync {
         None
     }
 
+    /// `&dyn Any` downcast hook for read-only layer walks (e.g. the DSpark
+    /// γ-verify compressed-pool catch-up). Default `None`; layers that expose
+    /// per-layer state override.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

@@ -37,6 +37,26 @@
 #define NUM_WARPS 8
 #define BC 4
 
+// Is the packed-uint32 FP8 load path actually valid at this HDIM?
+//
+// Each lane owns `VEC_BF16 = HDIM/32` consecutive *bytes* of the K/V row, at byte
+// offset `lane_id * VEC_BF16`. Reading them as uint32 needs two things that only
+// hold when HDIM is a multiple of WARP_SIZE*4:
+//
+//   1. **Coverage.** `VEC_U32_FP8 * 4 == VEC_BF16`. At HDIM=576 the integer
+//      division gives `VEC_U32_FP8 = 4`, so the loops read 16 of the 18 bytes the
+//      lane owns — dims 16 and 17 of every lane (64 of 576) are never loaded for
+//      K or V, yet `o_reg[16..17]` is still accumulated and written out.
+//   2. **Alignment.** `lane_id * VEC_BF16` must be 4-byte aligned. At HDIM=576
+//      that is `lane_id * 18`, which is only 2-byte aligned for odd lanes — a
+//      misaligned 4-byte load, i.e. undefined behaviour, in 3 of every 4 lanes.
+//
+// Both failures were silent. When the geometry does not hold we fall back to
+// byte-granular loads, which are correct at any HDIM. This file hard-defines
+// HDIM 576 (`:5`), so the scalar path is the one that is actually compiled here;
+// the vectorised branch is kept for reuse at HDIM 256/512.
+#define FP8_U32_OK (HDIM % (WARP_SIZE * 4) == 0)
+
 // Unpack 2 BF16 from uint32 → 2 F32 (reused for Q loading)
 __device__ __forceinline__ void unpack2_bf16(unsigned int packed, float& v0, float& v1) {
     v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
@@ -57,6 +77,23 @@ __device__ __forceinline__ void unpack4_fp8(
     v1 = __half2float(__nv_cvt_fp8_to_halfraw(b1, __NV_E4M3)) * dq_scale;
     v2 = __half2float(__nv_cvt_fp8_to_halfraw(b2, __NV_E4M3)) * dq_scale;
     v3 = __half2float(__nv_cvt_fp8_to_halfraw(b3, __NV_E4M3)) * dq_scale;
+}
+
+// Load and dequantise this lane's whole slice (VEC_BF16 bytes) of one K/V row.
+// Picks the packed-uint32 path only when FP8_U32_OK; see the note on that macro.
+__device__ __forceinline__ void load_lane_fp8(
+    const __nv_fp8_storage_t* __restrict__ p, float dq_scale, float (&out)[VEC_BF16]
+) {
+    if constexpr (FP8_U32_OK) {
+        const unsigned int* p32 = (const unsigned int*)p;
+        #pragma unroll
+        for (int i = 0; i < VEC_U32_FP8; i++)
+            unpack4_fp8(p32[i], dq_scale, out[4*i], out[4*i+1], out[4*i+2], out[4*i+3]);
+    } else {
+        #pragma unroll
+        for (int i = 0; i < VEC_BF16; i++)
+            out[i] = __half2float(__nv_cvt_fp8_to_halfraw(p[i], __NV_E4M3)) * dq_scale;
+    }
 }
 
 // ============================================================================
@@ -144,7 +181,10 @@ extern "C" __global__ void paged_decode_attn_fp8(
                                                           + (unsigned long long)kv_head * head_dim;
 
         unsigned int processed = 0;
-        unsigned int aligned_count = (batch_count / BC) * BC;
+        // The BC-batched path stages K/V as raw uint32, so it is only usable when
+        // the uint32 geometry is valid; otherwise every position goes through the
+        // byte-granular single-position loop below.
+        unsigned int aligned_count = FP8_U32_OK ? (batch_count / BC) * BC : 0;
 
         // Batched path: BC=4 positions at a time
         for (; processed < aligned_count; processed += BC) {
@@ -226,16 +266,13 @@ extern "C" __global__ void paged_decode_attn_fp8(
 
         // Remainder: single positions
         for (; processed < batch_count; processed++) {
-            const unsigned int* k32 = (const unsigned int*)(k_block_base
-                + (unsigned long long)processed * head_stride_kv + vec_offset_fp8);
+            float k_vals[VEC_BF16];
+            load_lane_fp8(k_block_base + (unsigned long long)processed * head_stride_kv
+                              + vec_offset_fp8, k_scale, k_vals);
             float dot = 0.0f;
             #pragma unroll
-            for (int i = 0; i < VEC_U32_FP8; i++) {
-                float k0, k1, k2, k3;
-                unpack4_fp8(k32[i], k_scale, k0, k1, k2, k3);
-                dot += q_reg[4*i] * k0 + q_reg[4*i+1] * k1
-                     + q_reg[4*i+2] * k2 + q_reg[4*i+3] * k3;
-            }
+            for (int i = 0; i < VEC_BF16; i++)
+                dot += q_reg[i] * k_vals[i];
             #pragma unroll
             for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
                 dot += __shfl_xor_sync(0xffffffff, dot, offset);
@@ -246,17 +283,12 @@ extern "C" __global__ void paged_decode_attn_fp8(
             float exp_new = __expf(score - m_new);
             l = l * exp_old + exp_new;
 
-            const unsigned int* v32 = (const unsigned int*)(v_block_base
-                + (unsigned long long)processed * head_stride_kv + vec_offset_fp8);
+            float v_vals[VEC_BF16];
+            load_lane_fp8(v_block_base + (unsigned long long)processed * head_stride_kv
+                              + vec_offset_fp8, v_scale, v_vals);
             #pragma unroll
-            for (int i = 0; i < VEC_U32_FP8; i++) {
-                float v0, v1, v2, v3;
-                unpack4_fp8(v32[i], v_scale, v0, v1, v2, v3);
-                o_reg[4*i]   = o_reg[4*i]   * exp_old + exp_new * v0;
-                o_reg[4*i+1] = o_reg[4*i+1] * exp_old + exp_new * v1;
-                o_reg[4*i+2] = o_reg[4*i+2] * exp_old + exp_new * v2;
-                o_reg[4*i+3] = o_reg[4*i+3] * exp_old + exp_new * v3;
-            }
+            for (int i = 0; i < VEC_BF16; i++)
+                o_reg[i] = o_reg[i] * exp_old + exp_new * v_vals[i];
             m = m_new;
         }
 
@@ -398,19 +430,16 @@ extern "C" __global__ void paged_decode_attn_splitk_fp8(
         unsigned int block_offset = pos % block_size;
         unsigned int physical_block = (unsigned int)my_block_table[logical_block];
 
-        const unsigned int* k32 = (const unsigned int*)(K_cache
+        float k_vals[VEC_BF16];
+        load_lane_fp8(K_cache
             + (unsigned long long)physical_block * cache_stride
             + (unsigned long long)block_offset * head_stride_kv
-            + (unsigned long long)kv_head * head_dim + vec_offset_fp8);
+            + (unsigned long long)kv_head * head_dim + vec_offset_fp8, k_scale, k_vals);
 
         float dot = 0.0f;
         #pragma unroll
-        for (int i = 0; i < VEC_U32_FP8; i++) {
-            float k0, k1, k2, k3;
-            unpack4_fp8(k32[i], k_scale, k0, k1, k2, k3);
-            dot += q_reg[4*i] * k0 + q_reg[4*i+1] * k1
-                 + q_reg[4*i+2] * k2 + q_reg[4*i+3] * k3;
-        }
+        for (int i = 0; i < VEC_BF16; i++)
+            dot += q_reg[i] * k_vals[i];
         #pragma unroll
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
             dot += __shfl_xor_sync(0xffffffff, dot, offset);
@@ -421,20 +450,15 @@ extern "C" __global__ void paged_decode_attn_splitk_fp8(
         float exp_new = __expf(score - m_new);
         l_val = l_val * exp_old + exp_new;
 
-        const unsigned int* v32 = (const unsigned int*)(V_cache
+        float v_vals[VEC_BF16];
+        load_lane_fp8(V_cache
             + (unsigned long long)physical_block * cache_stride
             + (unsigned long long)block_offset * head_stride_kv
-            + (unsigned long long)kv_head * head_dim + vec_offset_fp8);
+            + (unsigned long long)kv_head * head_dim + vec_offset_fp8, v_scale, v_vals);
 
         #pragma unroll
-        for (int i = 0; i < VEC_U32_FP8; i++) {
-            float v0, v1, v2, v3;
-            unpack4_fp8(v32[i], v_scale, v0, v1, v2, v3);
-            o_reg[4*i]   = o_reg[4*i]   * exp_old + exp_new * v0;
-            o_reg[4*i+1] = o_reg[4*i+1] * exp_old + exp_new * v1;
-            o_reg[4*i+2] = o_reg[4*i+2] * exp_old + exp_new * v2;
-            o_reg[4*i+3] = o_reg[4*i+3] * exp_old + exp_new * v3;
-        }
+        for (int i = 0; i < VEC_BF16; i++)
+            o_reg[i] = o_reg[i] * exp_old + exp_new * v_vals[i];
         m_val = m_new;
     }
 

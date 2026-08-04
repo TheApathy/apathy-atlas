@@ -288,11 +288,51 @@ pub fn moe_transpose_u8_batched(
 // MUST pass the transposed buffers — there is no runtime layout flag.
 // ─────────────────────────────────────────────────────────────────────
 
-// Block size for the transposed-layout decode kernels. 32 = one warp per
-// block — more blocks per silu_down/gate_up call → higher SM occupancy on
-// GB10 (only 25 SMs, so larger blocks under-utilise). Each thread owns one
-// output regardless of block size.
-pub(crate) const T_BLOCK: u32 = 32;
+/// Block size for the transposed-layout decode kernels.
+///
+/// This was 32 (one warp per block) on the theory that more blocks → higher SM
+/// occupancy "on GB10 (only 25 SMs, so larger blocks under-utilise)". **Both
+/// halves of that were wrong.** `cudaGetDeviceProperties` reports 48 SMs, and
+/// occupancy at one warp per block is not limited by block count at all — it is
+/// pinned by the hardware max-CTAs-per-SM cap (24 on sm_12x):
+///
+/// ```text
+/// T_BLOCK=32:  40 regs => 51 warps/SM allowed, 1536 threads => 48 CTAs/SM,
+///              but CTA cap 24 binds  =>  24 warps/SM  =  50% occupancy
+/// T_BLOCK=64:  same everything, 2 warps per CTA        =>  48 warps/SM = 100%
+/// ```
+///
+/// Adding warps *inside* the CTA is the only way past the cap. This is
+/// bit-identical, not an approximation: the kernels index every output off
+/// `blockIdx.x * blockDim.x + threadIdx.x` (`moe_shared_expert_fused_t.cu:35-37`,
+/// `:1012`, `:1185`), each thread still owns exactly one output, so the
+/// per-output k-sequence and FMA order do not change. There are no warp-
+/// synchronous primitives in the family (no `__shfl`/`__ballot`/`warpSize`), the
+/// `s_act` staging loops stride by `blockDim.x` and are followed by
+/// `__syncthreads()`, and every branch around those barriers is block-uniform.
+///
+/// `ATLAS_MOE_T_BLOCK` overrides it for A/B. Must divide the widths — the
+/// caller gates on `inter % (T_BLOCK*vec) == 0 && h % (T_BLOCK*vec) == 0`
+/// (`moe/forward_phase.rs:44`), and the split-K grids use exact integer division
+/// `n / (T_BLOCK * T_SPLIT_VEC)`. Production widths are 2048 and 4096, so 32/64
+/// /128 all divide cleanly at VEC=2; anything else is rejected here.
+pub(crate) fn t_block() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let v = std::env::var("ATLAS_MOE_T_BLOCK")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(64);
+        if !matches!(v, 32 | 64 | 128 | 256) {
+            tracing::warn!("ATLAS_MOE_T_BLOCK={v} is not one of 32/64/128/256 — using 64");
+            return 64;
+        }
+        if v != 64 {
+            tracing::info!("MoE T_BLOCK overridden to {v} (default 64)");
+        }
+        v
+    })
+}
 
 /// NVFP4 fused gate+up GEMV (transposed weight). Single-token decode.
 #[allow(clippy::too_many_arguments)]
@@ -319,8 +359,8 @@ pub fn moe_expert_gate_up_shared_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), top_k + 1, 2])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -431,8 +471,8 @@ pub fn moe_expert_gate_up_shared_t_splitk_m(
     KernelLaunch::new(gpu, kernel)
         // grid.y is total_routed + 1, not + num_tokens: one block-set computes
         // the shared projection for every row.
-        .grid([n / (T_BLOCK * T_SPLIT_VEC), total_routed + 1, 2 * split])
-        .block([T_BLOCK, 1, 1])
+        .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, 2 * split])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -459,11 +499,11 @@ pub fn moe_expert_gate_up_shared_t_splitk_m(
         .launch(stream)?;
     KernelLaunch::new(gpu, finalize)
         .grid([
-            div_ceil(n, T_BLOCK),
+            div_ceil(n, t_block()),
             moe_splitk_m_rows(top_k, num_tokens),
             2,
         ])
-        .block([T_BLOCK, 1, 1])
+        .block([t_block(), 1, 1])
         .arg_ptr(partials)
         .arg_ptr(gate_out)
         .arg_ptr(sh_gate_out)
@@ -507,8 +547,8 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
     let smem_bytes = mrow * (k as usize * std::mem::size_of::<f32>()) as u32 / split;
     let total_routed = num_tokens * top_k;
     KernelLaunch::new(gpu, kernel)
-        .grid([n / (T_BLOCK * T_SPLIT_VEC), total_routed + 1, split])
-        .block([T_BLOCK, 1, 1])
+        .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, split])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)
@@ -531,11 +571,11 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
         .launch(stream)?;
     KernelLaunch::new(gpu, finalize)
         .grid([
-            div_ceil(n, T_BLOCK),
+            div_ceil(n, t_block()),
             moe_splitk_m_rows(top_k, num_tokens),
             1,
         ])
-        .block([T_BLOCK, 1, 1])
+        .block([t_block(), 1, 1])
         .arg_ptr(partials)
         .arg_ptr(output)
         .arg_ptr(sh_down_out)
@@ -578,8 +618,8 @@ pub fn moe_expert_gate_up_shared_t_splitk(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([n / (T_BLOCK * T_SPLIT_VEC), top_k + 1, 2 * split])
-        .block([T_BLOCK, 1, 1])
+        .grid([n / (t_block() * T_SPLIT_VEC), top_k + 1, 2 * split])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -604,8 +644,8 @@ pub fn moe_expert_gate_up_shared_t_splitk(
         .arg_ptr(partials)
         .launch(stream)?;
     KernelLaunch::new(gpu, finalize)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), top_k + 1, 2])
+        .block([t_block(), 1, 1])
         .arg_ptr(partials)
         .arg_ptr(gate_out)
         .arg_ptr(sh_gate_out)
@@ -646,8 +686,8 @@ pub fn moe_expert_silu_down_shared_t_splitk(
     // was capping blocks-per-SM on the down projection.
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32 / split;
     KernelLaunch::new(gpu, kernel)
-        .grid([n / (T_BLOCK * T_SPLIT_VEC), top_k + 1, split])
-        .block([T_BLOCK, 1, 1])
+        .grid([n / (t_block() * T_SPLIT_VEC), top_k + 1, split])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)
@@ -668,8 +708,8 @@ pub fn moe_expert_silu_down_shared_t_splitk(
         .arg_ptr(partials)
         .launch(stream)?;
     KernelLaunch::new(gpu, finalize)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), top_k + 1, 1])
+        .block([t_block(), 1, 1])
         .arg_ptr(partials)
         .arg_ptr(output)
         .arg_ptr(sh_down_out)
@@ -702,8 +742,8 @@ pub fn moe_expert_silu_down_shared_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), top_k + 1, 1])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)

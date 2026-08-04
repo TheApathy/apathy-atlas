@@ -46,6 +46,28 @@ impl Qwen3AttentionLayer {
         self.hc = Some(hc);
     }
 
+    /// 4b inc-3 γ-verify catch-up: allocate the per-layer `verify_comp_normed`
+    /// scratch `[MAX_VERIFY_ROWS × hidden]` BF16 — but ONLY for layers that own
+    /// a compressor (full-attention layers have no compressed pool to advance).
+    /// Must be called AFTER `set_mla_weights`. Arms `v4_compress_catchup`; NULL
+    /// otherwise. `MAX_VERIFY_ROWS = 8` covers γ≤7 verify widths (kt≤8).
+    pub fn alloc_verify_comp_normed(
+        &mut self,
+        gpu: &dyn spark_runtime::gpu::GpuBackend,
+        hidden_size: usize,
+    ) -> anyhow::Result<()> {
+        const MAX_VERIFY_ROWS: usize = 8;
+        let has_comp = self
+            .mla
+            .as_ref()
+            .and_then(|m| m.compressor.as_ref())
+            .is_some();
+        if has_comp {
+            self.verify_comp_normed = gpu.alloc(MAX_VERIFY_ROWS * hidden_size * 2)?;
+        }
+        Ok(())
+    }
+
     /// Set per-layer dimension overrides for heterogeneous models (Gemma-4).
     /// Full-attention layers have different Q/KV head counts and head_dim
     /// than sliding layers.

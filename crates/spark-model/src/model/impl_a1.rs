@@ -358,6 +358,21 @@ impl TransformerModel {
                 }
                 _ => (None, DevicePtr::NULL, Vec::new(), 0),
             };
+        // Graph-safe landing pad for the hc-mean capture. The direct write into
+        // `dspark_dump_buf` is indexed by `start_row = seq.seq_len`, a host value
+        // that grows every step — baking it into a captured graph pins every
+        // replay to the first step's rows. Capture into this fixed row-0 address
+        // instead and relocate eagerly post-launch (`dspark_capture_commit`).
+        let dspark_capture_stage = if dspark_capture_layers.is_empty() {
+            DevicePtr::NULL
+        } else {
+            gpu.alloc(
+                dspark_capture_layers.len()
+                    * crate::model::DSPARK_STAGE_ROWS
+                    * config.hidden_size
+                    * 2,
+            )?
+        };
         let hc_mean_k = crate::layers::try_kernel(gpu.as_ref(), "hyper_connection", "hc_mean");
 
         // EP command buffer for token broadcast (4 bytes, u32)
@@ -620,6 +635,7 @@ impl TransformerModel {
             dspark_dump_buf,
             dspark_dump_rows,
             dspark_capture_layers,
+            dspark_capture_stage,
             hc_mean_k,
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),

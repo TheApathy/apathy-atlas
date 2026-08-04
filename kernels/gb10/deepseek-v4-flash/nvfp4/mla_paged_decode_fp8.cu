@@ -34,8 +34,31 @@ __device__ __forceinline__ float fp8e4m3_to_f32(__nv_fp8_storage_t b) {
 // ============================================================================
 // MLA Paged Decode Attention (FP8)
 // ============================================================================
+//
+// KV_ALIAS — skip the V load entirely because V is a byte-for-byte copy of K.
+//
+// DeepSeek-V4 MLA passes the kv latent as BOTH key and value.
+// `mla_cache_assemble_batched` (mla_absorbed.cu:288-320) writes k_cache[i] and
+// v_cache[i] from the SAME source value on every dim: the latent from
+// `kv_latent`, the tail from `k_rope`. The FP8 write then scales K by
+// `k_scale` and V by `v_scale` — and those two scales are calibrated from the
+// absmax of those byte-identical BF16 buffers (write_kv_cache.rs:482-499 ->
+// fp8_calibration.rs:209-210), so k_scale == v_scale bit-exactly. The V pool
+// therefore holds exactly the bytes the K pool holds, and every V load in this
+// kernel is redundant DRAM traffic.
+//
+// With KV_ALIAS = true the V loads are deleted and the K registers are reused.
+// That halves the attention DRAM traffic AND frees `v_vals[BC][VEC_BF16]`
+// (64 FP32 registers), which lifts occupancy on a kernel that had ~160 live
+// FP32. It is bit-exact by construction, not an approximation.
+//
+// Two entry points are emitted at the bottom of this file instead of a runtime
+// flag so the register allocator actually sees the shorter live range. The host
+// selects the alias entry point only after checking k_scale == v_scale
+// (run_paged_decode.rs); ATLAS_MLA_NO_V_FUSE=1 forces the original kernel.
 
-extern "C" __global__ void mla_paged_decode_fp8(
+template <bool KV_ALIAS>
+__device__ void mla_paged_decode_fp8_impl(
     const __nv_bfloat16* __restrict__ Q,            // [1, nq * q_dim] = [1, 32768]
     const unsigned char* __restrict__ K_cache,     // FP8 compressed KV cache (bytes)
     const unsigned char* __restrict__ V_cache,     // FP8 compressed KV cache (bytes)
@@ -169,28 +192,6 @@ extern "C" __global__ void mla_paged_decode_fp8(
                 scores[b] = dot * inv_sqrt_d;
             }
 
-            float v_vals[BC][VEC_BF16];
-            #pragma unroll
-            for (int b = 0; b < BC; b++) {
-                unsigned int p = block_offset + processed + b;
-
-                // Load V from FP8. K==V in MLA: V's tail 448-511 is the rotated
-                // rope (mirror the K rope overwrite), not the latent.
-                const unsigned char* v_latent = v_block + p * token_stride + kv_latent_offset;
-                #pragma unroll
-                for (int i = 0; i < VEC_BF16; i++) {
-                    v_vals[b][i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_latent[i]) * v_scale;
-                }
-                if (lane_id >= 28) {
-                    const unsigned int rope_offset = (lane_id - 28) * VEC_BF16;
-                    const unsigned char* v_rope = v_block + p * token_stride + kv_latent_dim + rope_offset;
-                    #pragma unroll
-                    for (int i = 0; i < VEC_BF16; i++) {
-                        v_vals[b][i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_rope[i]) * v_scale;
-                    }
-                }
-            }
-
             float m_new = m;
             #pragma unroll
             for (int b = 0; b < BC; b++)
@@ -210,12 +211,51 @@ extern "C" __global__ void mla_paged_decode_fp8(
             }
             m = m_new;
 
-            #pragma unroll
-            for (int b = 0; b < BC; b++) {
-                float ef = exp_factors[b];
+            // ── o += exp_factor * V ──
+            // The V load is deferred to here (it has no dependency on the
+            // scores) so the KV_ALIAS arm can consume `k_vals` directly and the
+            // non-alias arm keeps `v_vals` live for as short a span as possible.
+            if constexpr (KV_ALIAS) {
+                // V == K byte-for-byte, so `k_vals` already holds V — rope tail
+                // included, because the V path mirrors the same lane>=28
+                // overwrite with the same scale.
                 #pragma unroll
-                for (int i = 0; i < VEC_BF16; i++)
-                    o_reg[i] += ef * v_vals[b][i];
+                for (int b = 0; b < BC; b++) {
+                    float ef = exp_factors[b];
+                    #pragma unroll
+                    for (int i = 0; i < VEC_BF16; i++)
+                        o_reg[i] += ef * k_vals[b][i];
+                }
+            } else {
+                float v_vals[BC][VEC_BF16];
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    unsigned int p = block_offset + processed + b;
+
+                    // Load V from FP8. K==V in MLA: V's tail 448-511 is the rotated
+                    // rope (mirror the K rope overwrite), not the latent.
+                    const unsigned char* v_latent = v_block + p * token_stride + kv_latent_offset;
+                    #pragma unroll
+                    for (int i = 0; i < VEC_BF16; i++) {
+                        v_vals[b][i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_latent[i]) * v_scale;
+                    }
+                    if (lane_id >= 28) {
+                        const unsigned int rope_offset = (lane_id - 28) * VEC_BF16;
+                        const unsigned char* v_rope = v_block + p * token_stride + kv_latent_dim + rope_offset;
+                        #pragma unroll
+                        for (int i = 0; i < VEC_BF16; i++) {
+                            v_vals[b][i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_rope[i]) * v_scale;
+                        }
+                    }
+                }
+
+                #pragma unroll
+                for (int b = 0; b < BC; b++) {
+                    float ef = exp_factors[b];
+                    #pragma unroll
+                    for (int i = 0; i < VEC_BF16; i++)
+                        o_reg[i] += ef * v_vals[b][i];
+                }
             }
         }
 
@@ -260,24 +300,31 @@ extern "C" __global__ void mla_paged_decode_fp8(
             // tail dims 448-511 are the ROTATED rope, not the latent — mirror the
             // K rope overwrite so the attention output carries the rope (then the
             // dispatch de-rotates it per eq.26).
-            float v_tmp[VEC_BF16];
-            const unsigned char* v_latent = v_block + p * token_stride + kv_latent_offset;
-            #pragma unroll
-            for (int i = 0; i < VEC_BF16; i++) {
-                v_tmp[i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_latent[i]) * v_scale;
-            }
-            if (lane_id >= 28) {
-                const unsigned int rope_offset = (lane_id - 28) * VEC_BF16;
-                const unsigned char* v_rope = v_block + p * token_stride + kv_latent_dim + rope_offset;
+            if constexpr (KV_ALIAS) {
+                // `k_tmp` already holds exactly what the V load would produce.
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++)
+                    o_reg[i] = o_reg[i] * exp_old + exp_new * k_tmp[i];
+            } else {
+                float v_tmp[VEC_BF16];
+                const unsigned char* v_latent = v_block + p * token_stride + kv_latent_offset;
                 #pragma unroll
                 for (int i = 0; i < VEC_BF16; i++) {
-                    v_tmp[i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_rope[i]) * v_scale;
+                    v_tmp[i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_latent[i]) * v_scale;
                 }
-            }
+                if (lane_id >= 28) {
+                    const unsigned int rope_offset = (lane_id - 28) * VEC_BF16;
+                    const unsigned char* v_rope = v_block + p * token_stride + kv_latent_dim + rope_offset;
+                    #pragma unroll
+                    for (int i = 0; i < VEC_BF16; i++) {
+                        v_tmp[i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_rope[i]) * v_scale;
+                    }
+                }
 
-            #pragma unroll
-            for (int i = 0; i < VEC_BF16; i++)
-                o_reg[i] = o_reg[i] * exp_old + exp_new * v_tmp[i];
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++)
+                    o_reg[i] = o_reg[i] * exp_old + exp_new * v_tmp[i];
+            }
             m = m_new;
         }
 
@@ -333,15 +380,26 @@ extern "C" __global__ void mla_paged_decode_fp8(
             // Load V (== comp_k) as PURE LATENT over dims 0-511 — NO rope overwrite,
             // mirroring the K side and prefill's compressed-arm output accumulation
             // (prefill_attn_compressed accumulates Vc over dims 0-511 only).
-            float v_tmp[VEC_BF16];
-            const unsigned char* v_latent = c_block + kv_latent_offset;
-            #pragma unroll
-            for (int i = 0; i < VEC_BF16; i++)
-                v_tmp[i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_latent[i]) * v_scale;
+            //
+            // This arm is the strongest case for the alias: K and V here are read
+            // from the *same address* (`c_block + kv_latent_offset`) with the only
+            // difference being k_scale vs v_scale — which the host has already
+            // proven equal before selecting this entry point.
+            if constexpr (KV_ALIAS) {
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++)
+                    o_reg[i] = o_reg[i] * exp_old + exp_new * k_tmp[i];
+            } else {
+                float v_tmp[VEC_BF16];
+                const unsigned char* v_latent = c_block + kv_latent_offset;
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++)
+                    v_tmp[i] = fp8e4m3_to_f32((__nv_fp8_storage_t)v_latent[i]) * v_scale;
 
-            #pragma unroll
-            for (int i = 0; i < VEC_BF16; i++)
-                o_reg[i] = o_reg[i] * exp_old + exp_new * v_tmp[i];
+                #pragma unroll
+                for (int i = 0; i < VEC_BF16; i++)
+                    o_reg[i] = o_reg[i] * exp_old + exp_new * v_tmp[i];
+            }
             m = m_new;
         }
     }
@@ -407,4 +465,47 @@ extern "C" __global__ void mla_paged_decode_fp8(
             o32[i] = lo | (hi << 16);
         }
     }
+}
+
+// ---- Entry points -----------------------------------------------------------
+//
+// Both entry points take the IDENTICAL argument list, so the launcher can swap
+// one for the other without touching the arg-pack. `_kvalias` ignores V_cache
+// and v_scale; the host must have proven `k_scale == v_scale` before selecting
+// it (see the KV_ALIAS comment above `mla_paged_decode_fp8_impl`).
+
+#define MLA_PAGED_DECODE_FP8_PARAMS                                            \
+    const __nv_bfloat16* __restrict__ Q,                                       \
+    const unsigned char* __restrict__ K_cache,                                 \
+    const unsigned char* __restrict__ V_cache,                                 \
+    __nv_bfloat16* __restrict__ O,                                             \
+    const int* __restrict__ block_tables,                                      \
+    const int* __restrict__ seq_lens,                                          \
+    const unsigned int max_blocks_per_seq,                                     \
+    const unsigned int num_q_heads,                                            \
+    const unsigned int num_kv_heads,                                           \
+    const unsigned int q_head_dim,                                             \
+    const unsigned int kv_cache_dim,                                           \
+    const unsigned int block_size,                                             \
+    const float inv_sqrt_d,                                                    \
+    const float k_scale,                                                       \
+    const float v_scale,                                                       \
+    const unsigned long long cache_stride_bytes,                               \
+    const unsigned int sliding_window,                                         \
+    const float* __restrict__ sinks,                                           \
+    const unsigned char* __restrict__ comp_pool,                               \
+    const unsigned int comp_block_count
+
+#define MLA_PAGED_DECODE_FP8_ARGS                                              \
+    Q, K_cache, V_cache, O, block_tables, seq_lens, max_blocks_per_seq,        \
+    num_q_heads, num_kv_heads, q_head_dim, kv_cache_dim, block_size,           \
+    inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, sliding_window, sinks,   \
+    comp_pool, comp_block_count
+
+extern "C" __global__ void mla_paged_decode_fp8(MLA_PAGED_DECODE_FP8_PARAMS) {
+    mla_paged_decode_fp8_impl<false>(MLA_PAGED_DECODE_FP8_ARGS);
+}
+
+extern "C" __global__ void mla_paged_decode_fp8_kvalias(MLA_PAGED_DECODE_FP8_PARAMS) {
+    mla_paged_decode_fp8_impl<true>(MLA_PAGED_DECODE_FP8_ARGS);
 }

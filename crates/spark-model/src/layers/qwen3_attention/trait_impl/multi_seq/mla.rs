@@ -131,6 +131,23 @@ impl Qwen3AttentionLayer {
         let q_dim = nq * hd;
         let inv_sqrt_d = self.effective_attn_scale(hd);
 
+        // 4b inc-3 γ-verify catch-up capture: snapshot this layer's compressor
+        // input (`c.normed`, the layer-input RMSNorm output — the SAME tensor the
+        // decode append feeds `wkv`/`wgate`) for all `n` verify rows BEFORE the
+        // MLA chain overwrites the shared scratch. The post-accept
+        // `dspark_compress_catchup` replays `v4_compress_append` over the
+        // committed rows from here, advancing the compressed pool that this
+        // batched (`pos:None`) path otherwise freezes — the decode/verify
+        // asymmetry fix. Armed (non-NULL) only on compressor layers; the ring
+        // holds MAX_VERIFY_ROWS=8, and multi-seq verify never exceeds that.
+        if !self.verify_comp_normed.is_null() {
+            let hb = c.h * bf16; // BF16 bytes per token row
+            let rows = c.n.min(8);
+            c.fwd
+                .gpu
+                .copy_d2d_async(c.normed, self.verify_comp_normed, rows * hb, stream)?;
+        }
+
         // O-projection output destination. `ms_phase_o_proj` (the non-MLA
         // sibling) returns `moe_output`; match it so `ms_phase_ffn`
         // consumes the same buffer for both paths.
@@ -270,7 +287,15 @@ impl Qwen3AttentionLayer {
         let row = |elems: u32| n * elems as usize * bf16;
         let need = row(q_dim) * 2 + row(kv_dim) * 2 + row(q_lora) + row(latent_dim);
         let gemv = self.batch_gemv_for(n);
-        let batch_ok = n >= 2
+        // ATLAS_MLA_NO_BATCH=1: force the per-row fallback, for A/B testing
+        // whether the batched-GEMV projections perturb verify argmax vs the
+        // single-row decode path (greedy-losslessness check).
+        let no_batch = {
+            static NB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *NB.get_or_init(|| std::env::var("ATLAS_MLA_NO_BATCH").as_deref() == Ok("1"))
+        };
+        let batch_ok = !no_batch
+            && n >= 2
             && gemv.is_some()
             && mla.wq_a_fp8.is_some()
             && mla.wq_b_fp8.is_some()

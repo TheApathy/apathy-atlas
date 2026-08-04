@@ -104,9 +104,65 @@ impl Qwen3AttentionLayer {
                     ),
                     None => (spark_runtime::gpu::DevicePtr::NULL, 0u32),
                 };
+                // ATLAS_V4_FORCE_NO_COMP=1: drop the compressed arm on EVERY
+                // path (decode + verify). Diagnostic only — proves the
+                // decode/verify compressed-pool asymmetry is the greedy-spec
+                // divergence source: with it set, both paths attend the raw
+                // window alone and greedy spec must match plain greedy exactly.
+                let comp_blocks = {
+                    static NC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *NC.get_or_init(|| {
+                        std::env::var("ATLAS_V4_FORCE_NO_COMP").as_deref() == Ok("1")
+                    }) {
+                        0
+                    } else {
+                        comp_blocks
+                    }
+                };
+                if self.attn_layer_idx == 2
+                    && std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok()
+                {
+                    static N: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Sample LATE reads (steps ~10-15) to see if the verify
+                    // observes the catch-up's pool growth, not just step 1.
+                    if (60..=80).contains(&k) {
+                        tracing::info!(
+                            "VERIFY READ L2 #{k}: num_seqs={num_seqs} comp_blocks={comp_blocks}"
+                        );
+                    }
+                }
+                // KV-alias fast path. V4 MLA assembles the cache with
+                // `v_cache[i] = k_cache[i]` on every dim (mla_absorbed.cu:288-320),
+                // and the FP8 scales are calibrated off those same buffers
+                // (write_kv_cache.rs:482 -> fp8_calibration.rs:209), so the V pool
+                // holds byte-identical contents to K and every V load in the kernel
+                // is redundant DRAM traffic. Halving it is bit-exact by
+                // construction — but only while `k_scale == v_scale` actually holds,
+                // so that is checked here rather than assumed. Equality is an exact
+                // f32 compare on purpose: any drift means the pools have diverged
+                // and we must fall back, not approximate.
+                //
+                // ATLAS_MLA_NO_V_FUSE=1 forces the original two-pool kernel (A/B
+                // harness for confirming bit-exactness empirically).
+                let kernel = {
+                    static NO_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let no_fuse = *NO_FUSE.get_or_init(|| {
+                        std::env::var("ATLAS_MLA_NO_V_FUSE").as_deref() == Ok("1")
+                    });
+                    if !no_fuse
+                        && k_scale == v_scale
+                        && self.mla_paged_decode_fp8_kvalias_k.0 != 0
+                    {
+                        self.mla_paged_decode_fp8_kvalias_k
+                    } else {
+                        self.mla_paged_decode_fp8_k
+                    }
+                };
                 ops::mla_paged_decode_fp8(
                     gpu,
-                    self.mla_paged_decode_fp8_k,
+                    kernel,
                     q,
                     kv_cache.k_pool_ptr(self.attn_layer_idx),
                     kv_cache.v_pool_ptr(self.attn_layer_idx),

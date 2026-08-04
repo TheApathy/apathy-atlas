@@ -257,6 +257,11 @@ impl TransformerModel {
             && graph.0 != 0
         {
             self.gpu.launch_graph(*graph, stream)?;
+            // Relocate the staged DSpark hc-mean capture to this token's
+            // sequence position — the in-graph write lands at a fixed row-0
+            // address because `seq.seq_len` would otherwise be baked into the
+            // replay. Ordered behind the launch on the same stream.
+            self.dspark_capture_commit(1, seq.seq_len, stream)?;
             seq.tokens.push(token);
             seq.seq_len += 1;
             return Ok(self.decode_logits_ptr());
@@ -365,6 +370,7 @@ impl TransformerModel {
                         cache.insert(seq.slot_idx, graph);
                     }
                     self.gpu.launch_graph(graph, stream)?;
+                    self.dspark_capture_commit(1, seq.seq_len, stream)?;
                 }
                 Ok(_) => {
                     tracing::warn!("CUDA graph capture returned null handle — running eagerly");
@@ -458,13 +464,14 @@ impl TransformerModel {
             // activation. Cheap d2d when the layer index matches; otherwise a
             // hashmap-free position() probe over a 5-element vec.
             self.try_dflash_capture(i, 0, stream)?;
-            // DSpark capture (ATLAS_DSPARK_DUMP, eager only): the drafter is
-            // conditioned on the hc-STREAM mean, not `hidden` — for V4+mHC
-            // `hidden` is single-stream scratch after a layer, so the DFlash
-            // capture above cannot serve it.
-            if !use_graphs {
-                self.try_dspark_capture(i, 1, seq.seq_len, stream)?;
-            }
+            // DSpark capture: the drafter is conditioned on the hc-STREAM mean,
+            // not `hidden` — for V4+mHC `hidden` is single-stream scratch after
+            // a layer, so the DFlash capture above cannot serve it. Under graph
+            // capture this stages to a fixed row-0 address (the sequence-position
+            // write would be baked into the replay); `dspark_capture_commit`
+            // after the graph launch relocates it. Previously this was skipped
+            // outright under graphs, starving the drafter of decode captures.
+            self.try_dspark_capture(i, 1, seq.seq_len, use_graphs, stream)?;
         }
         // MLA absorbed attention: defensive sync before final norm in eager
         // mode. Skipped under graph capture because cuStreamSynchronize is

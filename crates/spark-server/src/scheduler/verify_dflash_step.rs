@@ -359,6 +359,19 @@ pub fn step_verify_dflash(
             a.seq.tokens.pop();
         }
     }
+
+    // DSpark 4b inc-3: advance the DeepSeek-V4 compressed-KV pool for the
+    // committed verify positions (rows 0..=num_accepted at absolute positions
+    // pre_verify_len..). The batched verify path runs with pos:None and skips
+    // the decode-time compressed-block append, so without this the compressed
+    // attention arm freezes during speculative decode and its logits diverge
+    // from plain greedy decode — the drafter's correct proposals then get
+    // rejected. Replays the append from each layer's captured verify normed-x.
+    // Eager only (verify runs under ATLAS_DEBUG_NO_GRAPH=1); ignores the rare
+    // block-fork committed_extra. Non-fatal on error — the next step recovers.
+    if let Err(e) = model.dspark_compress_catchup(pre_verify_len, num_accepted + 1, 0) {
+        tracing::error!("dspark_compress_catchup: {e:#}");
+    }
     if b_win {
         // The pushed A-chain slot at the fork position holds the REJECTED
         // draft; patch in the fork token (the B tail beyond it is identical

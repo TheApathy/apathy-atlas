@@ -377,6 +377,11 @@ impl Qwen3AttentionLayer {
                 "mla_paged_decode_fp8",
                 "mla_paged_decode_fp8",
             ),
+            mla_paged_decode_fp8_kvalias_k: super::super::try_kernel(
+                gpu,
+                "mla_paged_decode_fp8",
+                "mla_paged_decode_fp8_kvalias",
+            ),
             mla_batched_gemv_k: super::super::try_kernel(gpu, "mla_absorbed", "mla_batched_gemv"),
             mla_q_rope_scatter_k: super::super::try_kernel(
                 gpu,
@@ -546,6 +551,9 @@ impl Qwen3AttentionLayer {
             v4_comp_prev_valid: std::sync::atomic::AtomicBool::new(false),
             v4_decode_started: std::sync::atomic::AtomicBool::new(false),
             v4_decode_first_pos: std::sync::atomic::AtomicU32::new(0),
+            // Armed post-construction (only for compressor layers) via
+            // `alloc_verify_comp_normed`; NULL disables the γ-verify catch-up.
+            verify_comp_normed: spark_runtime::gpu::DevicePtr::NULL,
             prefill_attn_paged_512_k: super::super::try_kernel(
                 gpu,
                 "inferspark_prefill_paged_512",

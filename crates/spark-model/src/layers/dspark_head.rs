@@ -920,6 +920,25 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         for q in from..p {
             self.seed_position(gpu, self.captures_at(q), q, stream)?;
         }
+        // ATLAS_DSPARK_PROBE_DUMP=<path>: append the exact capture bytes the
+        // drafter reads at `p` (the verify-capture the online path feeds
+        // propose), so it can be diffed against the plain-decode probe dump at
+        // the same sequence position. Debug-only host sync.
+        if let Ok(path) = std::env::var("ATLAS_DSPARK_PROBE_DUMP") {
+            use std::io::Write;
+            let h = self.h as usize;
+            let caps = self.captures_at(p);
+            let mut host = vec![0u8; 3 * h * 2];
+            gpu.synchronize(stream)?;
+            for (i, c) in caps.iter().enumerate() {
+                gpu.copy_d2h(*c, &mut host[i * h * 2..(i + 1) * h * 2])?;
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = f.write_all(&(p as u32).to_le_bytes());
+                let _ = f.write_all(&(last_token).to_le_bytes());
+                let _ = f.write_all(&host);
+            }
+        }
         let (drafts, confs) = self.propose_block(gpu, ctx, self.captures_at(p), last_token, p, stream)?;
         st.last_seeded = p as i64;
 

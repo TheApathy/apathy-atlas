@@ -501,7 +501,7 @@ impl TransformerModel {
                 // DSpark capture: all k verify rows at their sequence
                 // positions — accepted rows become the ring catch-up feed
                 // for the next propose (no-op unless DSpark capture is on).
-                self.try_dspark_capture(layer_idx, k, seq.seq_len, stream)?;
+                self.try_dspark_capture(layer_idx, k, seq.seq_len, use_graphs, stream)?;
                 if vprof {
                     self.gpu.synchronize(stream)?;
                     let us = vprof_l0.elapsed().as_micros() as u64;
@@ -569,6 +569,17 @@ impl TransformerModel {
                     self.gpu.launch_graph(graph, stream)?;
                 }
             }
+        }
+
+        // Relocate the staged DSpark hc-mean capture to this step's sequence
+        // positions. Under graphs the in-loop capture wrote to a fixed row-0
+        // address (a `seq.seq_len`-indexed destination would be baked into the
+        // replay and pin the drafter to the first step's hiddens forever); this
+        // d2d is enqueued behind the graph launch on the same stream, so it sees
+        // the graph's writes and a freshly-computed `start_row`. Eager mode
+        // already wrote in place.
+        if use_graphs {
+            self.dspark_capture_commit(k, seq.seq_len, stream)?;
         }
 
         let st3_t2 = st3.then(std::time::Instant::now);

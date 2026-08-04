@@ -213,7 +213,7 @@ impl TransformerModel {
             // DSpark capture (ATLAS_DSPARK_DUMP): hc-mean of the chunk's rows.
             // This chunked path — not prefill_a — is what the V4 scheduler
             // drives, so the dump's prefill records come from here.
-            self.try_dspark_capture(i, proc_count, effective_seq_len_start, stream)?;
+            self.try_dspark_capture(i, proc_count, effective_seq_len_start, false, stream)?;
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
             }

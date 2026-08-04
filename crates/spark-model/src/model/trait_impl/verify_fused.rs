@@ -356,7 +356,7 @@ impl TransformerModel {
                 // on a potentially-rejected draft's hidden.
                 self.try_dflash_capture(layer_idx, 0, stream)?;
                 // DSpark capture: all m verify rows at their positions.
-                self.try_dspark_capture(layer_idx, m, seq.seq_len, stream)?;
+                self.try_dspark_capture(layer_idx, m, seq.seq_len, use_graphs, stream)?;
             }
 
             // Final norm over all M rows.
@@ -405,6 +405,13 @@ impl TransformerModel {
                     self.gpu.launch_graph(graph, stream)?;
                 }
             }
+        }
+
+        // Relocate the staged DSpark hc-mean capture to its sequence positions
+        // — see the twin in verify_d.rs for why the in-graph write must land at
+        // a fixed address.
+        if use_graphs {
+            self.dspark_capture_commit(m, seq.seq_len, stream)?;
         }
 
         // ── Phase 3: Post-graph D2H ──

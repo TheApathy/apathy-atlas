@@ -789,6 +789,22 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// DSpark 4b inc-3 γ-verify catch-up: advance the DeepSeek-V4 compressed-KV
+    /// pool for the `num_committed` positions the last verify committed (rows
+    /// `0..num_committed` at absolute positions `pre_len..`). The batched verify
+    /// path (`pos:None`) skips the decode-time compressed-block append, freezing
+    /// the compressed arm during speculative decode and diverging verify logits
+    /// from greedy decode. Default no-op (non-V4 targets); overridden by the
+    /// TransformerModel V4 impl. Eager only — never call under graph capture.
+    fn dspark_compress_catchup(
+        &self,
+        _pre_len: usize,
+        _num_committed: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(

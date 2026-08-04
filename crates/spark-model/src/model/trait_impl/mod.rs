@@ -508,6 +508,18 @@ impl Model for TransformerModel {
         Ok(())
     }
 
+    fn dspark_compress_catchup(
+        &self,
+        pre_len: usize,
+        num_committed: usize,
+        stream: u64,
+    ) -> Result<()> {
+        // Delegate to the inherent impl (impl_b3) that walks the transformer
+        // layers and replays the compressed-block append for the committed
+        // verify positions. Fixes the decode/verify compressed-pool asymmetry.
+        TransformerModel::dspark_compress_catchup(self, pre_len, num_committed, stream)
+    }
+
     fn dflash_collect_async_drafts(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
         let proposer = match &self.proposer {
             Some(p) => p.as_ref(),

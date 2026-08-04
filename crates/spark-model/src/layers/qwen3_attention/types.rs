@@ -253,6 +253,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) mla_paged_decode_k: KernelHandle,
     /// MLA paged decode kernel for DeepSeek-V4-Flash with FP8 KV cache
     pub(super) mla_paged_decode_fp8_k: KernelHandle,
+    /// Same kernel with the V load elided (V4 MLA writes V == K byte-for-byte, so
+    /// the V pool is pure redundant DRAM traffic). Selected only when the host has
+    /// verified `k_scale == v_scale`; see `mla_paged_decode_fp8.cu`'s KV_ALIAS note.
+    pub(super) mla_paged_decode_fp8_kvalias_k: KernelHandle,
     /// MLA batched GEMV for Q absorption and V extraction.
     pub(super) mla_batched_gemv_k: KernelHandle,
     /// MLA fused kernels — decode.
@@ -340,6 +344,13 @@ pub struct Qwen3AttentionLayer {
     pub(super) v4_comp_prev_valid: std::sync::atomic::AtomicBool,
     pub(super) v4_decode_started: std::sync::atomic::AtomicBool,
     pub(super) v4_decode_first_pos: std::sync::atomic::AtomicU32,
+    /// 4b inc-3 γ-verify catch-up: per-layer BF16 scratch `[MAX_VERIFY_ROWS × h]`
+    /// capturing `c.normed` (the compressor input) for every verify row, so the
+    /// post-accept `v4_compress_catchup` can replay `v4_compress_append` for the
+    /// committed positions and advance the compressed pool the `pos:None` batched
+    /// verify path skips. Allocated ONLY when this layer owns a compressor
+    /// (else `DevicePtr::NULL`); MAX_VERIFY_ROWS=8 covers γ≤7 (kt≤8).
+    pub(super) verify_comp_normed: DevicePtr,
     /// HDIM=512 paged prefill (BF16 KV) for Gemma-4 chunked long-context prefill
     pub(super) prefill_attn_paged_512_k: KernelHandle,
     pub(super) prefill_attn_64_k: KernelHandle,

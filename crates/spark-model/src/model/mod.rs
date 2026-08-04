@@ -46,3 +46,9 @@ pub(crate) mod types;
 pub mod nllb;
 
 pub use types::TransformerModel;
+
+/// Row capacity of `TransformerModel::dspark_capture_stage`, the graph-safe
+/// landing pad for the DSpark hc-mean capture. Must cover the widest single
+/// capture the verify path can request: γ spec depth is asserted ≤ 32 in
+/// `verify_d.rs`, and a K=γ verify captures `k ≤ γ` rows at once.
+pub(crate) const DSPARK_STAGE_ROWS: usize = 32;

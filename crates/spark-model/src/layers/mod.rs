@@ -158,7 +158,14 @@ impl FfnComponent {
     ) -> Result<bool> {
         match self {
             Self::Moe(m) => {
-                if !m.forward_km(input, n, ctx, stream)? {
+                // ATLAS_MOE_NO_KM=1: skip the dedup'd multi-row path and route
+                // every row through the per-row `forward_batched` — for A/B
+                // testing whether forward_km perturbs verify argmax.
+                let no_km = {
+                    static NK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *NK.get_or_init(|| std::env::var("ATLAS_MOE_NO_KM").as_deref() == Ok("1"))
+                };
+                if no_km || !m.forward_km(input, n, ctx, stream)? {
                     m.forward_batched(input, n, ctx, stream)?;
                 }
                 Ok(true)

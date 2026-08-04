@@ -553,15 +553,23 @@ impl TransformerModel {
 
 impl TransformerModel {
     /// DSpark capture: hc-mean of `hc_streams` for `num_tokens` rows into
-    /// this capture layer's slot of `dspark_dump_buf`. No-op unless
-    /// ATLAS_DSPARK_DUMP is set and `layer_idx` is a capture layer. Eager
-    /// only — callers must not invoke under graph capture (the dump flush
-    /// host-syncs).
+    /// this capture layer's slot of `dspark_dump_buf`. No-op unless DSpark
+    /// capture is armed and `layer_idx` is a capture layer.
+    ///
+    /// `staged` selects the CUDA-graph-safe variant. The eager write below is
+    /// indexed by `start_row` (= `seq.seq_len`), a host value that grows every
+    /// step; baking it into a captured graph pins every replay to the first
+    /// step's rows, so the drafter would be fed one frozen snapshot forever.
+    /// Under capture the caller passes `staged = true`, sending hc_mean to the
+    /// fixed row-0 address of `dspark_capture_stage`, and calls
+    /// `dspark_capture_commit` after the graph launch to relocate the rows to
+    /// their sequence positions eagerly.
     pub(super) fn try_dspark_capture(
         &self,
         layer_idx: usize,
         num_tokens: usize,
         start_row: usize,
+        staged: bool,
         stream: u64,
     ) -> Result<()> {
         if self.dspark_dump_buf.is_null() || self.hc_mean_k.0 == 0 {
@@ -574,17 +582,28 @@ impl TransformerModel {
         else {
             return Ok(());
         };
-        if start_row >= self.dspark_dump_rows {
-            return Ok(());
-        }
-        let n = num_tokens.min(self.dspark_dump_rows - start_row);
         let h = self.config.hidden_size;
-        // Rows live at their SEQUENCE positions, so chunked prefill, decode,
-        // and the K-row verify all accumulate one coherent [slot, pos, h]
-        // capture history the DSpark proposer can seed its ring from.
-        let out = self
-            .dspark_dump_buf
-            .offset((slot * self.dspark_dump_rows + start_row) * h * 2);
+        let (out, n) = if staged {
+            let n = num_tokens.min(crate::model::DSPARK_STAGE_ROWS);
+            (
+                self.dspark_capture_stage
+                    .offset(slot * crate::model::DSPARK_STAGE_ROWS * h * 2),
+                n,
+            )
+        } else {
+            if start_row >= self.dspark_dump_rows {
+                return Ok(());
+            }
+            let n = num_tokens.min(self.dspark_dump_rows - start_row);
+            // Rows live at their SEQUENCE positions, so chunked prefill,
+            // decode, and the K-row verify all accumulate one coherent
+            // [slot, pos, h] history the DSpark proposer seeds its ring from.
+            (
+                self.dspark_dump_buf
+                    .offset((slot * self.dspark_dump_rows + start_row) * h * 2),
+                n,
+            )
+        };
         crate::layers::ops::hc_mean(
             self.gpu.as_ref(),
             self.hc_mean_k,
@@ -595,6 +614,36 @@ impl TransformerModel {
             self.config.hc_mult as u32,
             stream,
         )
+    }
+
+    /// Relocate a staged DSpark capture (see `try_dspark_capture(staged=true)`)
+    /// from `dspark_capture_stage` row 0 to its sequence position `start_row`
+    /// in `dspark_dump_buf`, for every capture layer. Enqueued on `stream`
+    /// AFTER the verify graph launch, so it is ordered behind the graph's
+    /// hc_mean writes and the host-computed `start_row` is fresh each step.
+    pub(super) fn dspark_capture_commit(
+        &self,
+        num_tokens: usize,
+        start_row: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if self.dspark_capture_stage.is_null() || start_row >= self.dspark_dump_rows {
+            return Ok(());
+        }
+        let h = self.config.hidden_size;
+        let n = num_tokens
+            .min(crate::model::DSPARK_STAGE_ROWS)
+            .min(self.dspark_dump_rows - start_row);
+        for slot in 0..self.dspark_capture_layers.len() {
+            let src = self
+                .dspark_capture_stage
+                .offset(slot * crate::model::DSPARK_STAGE_ROWS * h * 2);
+            let dst = self
+                .dspark_dump_buf
+                .offset((slot * self.dspark_dump_rows + start_row) * h * 2);
+            self.gpu.copy_d2d_async(src, dst, n * h * 2, stream)?;
+        }
+        Ok(())
     }
 
     /// Flush one captured pass to the ATLAS_DSPARK_DUMP file. Record layout
@@ -655,5 +704,52 @@ impl TransformerModel {
     /// `DsparkDraftHead::set_capture` when installing the block drafter.
     pub fn dspark_capture_buf(&self) -> (DevicePtr, usize) {
         (self.dspark_dump_buf, self.dspark_dump_rows)
+    }
+
+    /// 4b inc-3 γ-verify catch-up: advance every compressor layer's compressed
+    /// KV pool for the `num_committed` positions committed by the last verify
+    /// (rows `0..num_committed` at absolute positions
+    /// `pre_len..pre_len+num_committed`). The batched verify path
+    /// (`ms_mla_decode_v4_flash`, `pos:None`) skips the decode-time compressed
+    /// append, so the compressed arm would freeze during speculative decode and
+    /// diverge from greedy; this replays that append from the per-layer
+    /// `verify_comp_normed` capture. Eager only — the caller must NOT be under
+    /// graph capture (the append re-runs host logic and reads MoE scratch, free
+    /// post-forward). No-op on non-compressor layers (`verify_comp_normed` NULL).
+    pub(crate) fn dspark_compress_catchup(
+        &self,
+        pre_len: usize,
+        num_committed: usize,
+        _stream: u64,
+    ) -> Result<()> {
+        // The verify forward runs on `default_stream()` (verify_d.rs), so the
+        // append that feeds `v4_comp_pool_filled` MUST be enqueued there too —
+        // otherwise the next verify step reads the advanced count but races the
+        // pool-content writes (the fix would be inert). Ignore the passed value.
+        let stream = self.gpu.default_stream();
+        let ctx = ForwardContext {
+            buffers: &self.buffers,
+            gpu: self.gpu.as_ref(),
+            config: &self.config,
+            attn_metadata: None,
+            profile: false,
+            comm: None,
+            graph_capture: false,
+            gdn_exact_replay: false,
+            token_ids: None,
+            routed_lora_layers: None,
+            midchunk_capture: None,
+        };
+        let eps = self.config.rms_norm_eps as f32;
+        for layer in self.layers.iter() {
+            let Some(attn) = layer
+                .as_any()
+                .and_then(|a| a.downcast_ref::<crate::layers::Qwen3AttentionLayer>())
+            else {
+                continue;
+            };
+            attn.v4_compress_catchup(&ctx, pre_len, num_committed, eps, stream)?;
+        }
+        Ok(())
     }
 }

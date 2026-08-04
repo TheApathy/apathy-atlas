@@ -483,6 +483,11 @@ pub fn assemble_layer(
         config,
     )?;
     layer.set_mla_weights(mla);
+    // 4b inc-3: arm the γ-verify compressed-pool catch-up scratch (only for
+    // compressor layers). Must follow set_mla_weights so it can see the
+    // compressor. Fixes the decode/verify pool asymmetry: the batched verify
+    // path passes pos:None and skips the compressed-block append.
+    layer.alloc_verify_comp_normed(gpu, h)?;
 
     // ── Manifold-Constrained Hyper-Connections (mHC) ──
     // Every block keeps `hc_mult` residual streams mixed by a per-block

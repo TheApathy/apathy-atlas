@@ -38,8 +38,8 @@ pub fn moe_expert_gate_up_shared_batch2_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), 2 * (top_k + 1), 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), 2 * (top_k + 1), 2])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -87,8 +87,8 @@ pub fn moe_expert_silu_down_shared_batch2_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), 2 * (top_k + 1), 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), 2 * (top_k + 1), 1])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)
@@ -137,8 +137,8 @@ pub fn moe_expert_gate_up_shared_batchn_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), num_tokens * (top_k + 1), 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), num_tokens * (top_k + 1), 2])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -188,8 +188,8 @@ pub fn moe_expert_silu_down_shared_batchn_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), num_tokens * (top_k + 1), 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), num_tokens * (top_k + 1), 1])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)
@@ -236,8 +236,8 @@ pub fn moe_expert_gate_up_shared_batch3_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), 3 * (top_k + 1), 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), 3 * (top_k + 1), 2])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
         .arg_ptr(gate_scale_t_ptrs)
@@ -285,8 +285,8 @@ pub fn moe_expert_silu_down_shared_batch3_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), 3 * (top_k + 1), 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), 3 * (top_k + 1), 1])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)
@@ -330,8 +330,8 @@ pub fn moe_expert_gate_up_shared_fp8_t(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 2])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), top_k + 1, 2])
+        .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_weight_t_ptrs)
         .arg_ptr(gate_block_scale_t_ptrs)
@@ -374,8 +374,8 @@ pub fn moe_expert_silu_down_shared_fp8_t(
 ) -> Result<()> {
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, T_BLOCK), top_k + 1, 1])
-        .block([T_BLOCK, 1, 1])
+        .grid([div_ceil(n, t_block()), top_k + 1, 1])
+        .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
         .arg_ptr(up_out)

@@ -204,6 +204,15 @@ pub struct TransformerModel {
     /// Layer indices whose post-layer hc-mean is captured for DSpark
     /// (`[40, 41, 42]` for V4-Flash-0731). Empty when dumping is off.
     pub(super) dspark_capture_layers: Vec<usize>,
+    /// `[num_capture_layers, DSPARK_STAGE_ROWS, hidden] BF16` landing pad for
+    /// the hc-mean capture **under CUDA graph capture**. The direct write into
+    /// `dspark_dump_buf` bakes `start_row = seq.seq_len` into a host-computed
+    /// pointer, so a replayed graph would forever re-write the first captured
+    /// step's rows and feed the drafter stale hiddens. Writing to this fixed
+    /// row-0 address instead is graph-safe; `dspark_capture_commit` then does
+    /// the position-dependent d2d relocation eagerly after the graph launch.
+    /// NULL when capture is off.
+    pub(super) dspark_capture_stage: DevicePtr,
     /// `hyper_connection::hc_mean` — plain mean over hc streams (the collapse
     /// the drafter's main_proj was trained on; NOT the learned hc_head).
     pub(super) hc_mean_k: spark_runtime::gpu::KernelHandle,
