@@ -68,12 +68,19 @@ fn reprobe_tokens() -> usize {
     *C.get_or_init(|| env_usize("ATLAS_MTP_GATE_REPROBE", 256))
 }
 
-/// MTP tokens between serial-baseline refreshes while in Mtp mode. One
-/// 16-step window per 1024 tokens bounds refresh overhead at ≤0.3% even if
-/// serial were 18% slower.
+/// MTP tokens between serial-baseline refreshes while in Mtp mode.
+///
+/// Was 1024, which bounds refresh overhead at ≤0.3% for long batch generations
+/// — but 1024 ≫ a typical interactive request (100–300 tokens), so on a request
+/// whose content the drafter predicts poorly (prose: ~1.2 accepted/step, spec
+/// ~11 tok/s vs plain ~21) the gate NEVER re-checked the serial baseline within
+/// the request and stayed stuck in losing MTP the whole time. 128 lets the gate
+/// detect a losing MTP within one request and fall back to plain; the refresh is
+/// one 16-step window, so overhead is ~1 window per 128 tokens (still small), and
+/// it only fires while MTP is running (where the tax is already being paid).
 fn serial_refresh_tokens() -> usize {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *C.get_or_init(|| env_usize("ATLAS_MTP_GATE_REFRESH", 1024))
+    *C.get_or_init(|| env_usize("ATLAS_MTP_GATE_REFRESH", 128))
 }
 
 /// What the gate wants the scheduler to run for the NEXT step.
