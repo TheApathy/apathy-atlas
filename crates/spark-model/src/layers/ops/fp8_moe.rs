@@ -460,6 +460,7 @@ pub fn moe_expert_gate_up_shared_t_splitk_m(
     sh_up_t: &QuantizedWeight,
     sh_up_out: DevicePtr,
     partials: DevicePtr,
+    partition_tail: Option<KernelHandle>,
     split: u32,
     n: u32,
     k: u32,
@@ -468,47 +469,58 @@ pub fn moe_expert_gate_up_shared_t_splitk_m(
     stream: u64,
 ) -> Result<()> {
     let total_routed = num_tokens * top_k;
-    KernelLaunch::new(gpu, kernel)
-        // grid.y is total_routed + 1, not + num_tokens: one block-set computes
-        // the shared projection for every row.
-        .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, 2 * split])
-        .block([t_block(), 1, 1])
-        .arg_ptr(input)
-        .arg_ptr(gate_packed_t_ptrs)
-        .arg_ptr(gate_scale_t_ptrs)
-        .arg_ptr(gate_scale2_vals)
-        .arg_ptr(gate_out)
-        .arg_ptr(up_packed_t_ptrs)
-        .arg_ptr(up_scale_t_ptrs)
-        .arg_ptr(up_scale2_vals)
-        .arg_ptr(up_out)
-        .arg_ptr(expert_indices)
-        .arg_ptr(sh_gate_t.weight)
-        .arg_ptr(sh_gate_t.weight_scale)
-        .arg_f32(sh_gate_t.weight_scale_2)
-        .arg_ptr(sh_gate_out)
-        .arg_ptr(sh_up_t.weight)
-        .arg_ptr(sh_up_t.weight_scale)
-        .arg_f32(sh_up_t.weight_scale_2)
-        .arg_ptr(sh_up_out)
-        .arg_u32(n)
-        .arg_u32(k)
-        .arg_u32(top_k)
-        .arg_u32(num_tokens)
-        .arg_ptr(partials)
-        .launch(stream)?;
-    KernelLaunch::new(gpu, finalize)
+    let precompute_activation = partition_tail.is_some();
+    let launch_partition_arm = |arm: KernelHandle| {
+        KernelLaunch::new(gpu, arm)
+            // grid.y is total_routed + 1, not + num_tokens: one block-set computes
+            // the shared projection for every row.
+            .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, 2 * split])
+            .block([t_block(), 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(gate_packed_t_ptrs)
+            .arg_ptr(gate_scale_t_ptrs)
+            .arg_ptr(gate_scale2_vals)
+            .arg_ptr(gate_out)
+            .arg_ptr(up_packed_t_ptrs)
+            .arg_ptr(up_scale_t_ptrs)
+            .arg_ptr(up_scale2_vals)
+            .arg_ptr(up_out)
+            .arg_ptr(expert_indices)
+            .arg_ptr(sh_gate_t.weight)
+            .arg_ptr(sh_gate_t.weight_scale)
+            .arg_f32(sh_gate_t.weight_scale_2)
+            .arg_ptr(sh_gate_out)
+            .arg_ptr(sh_up_t.weight)
+            .arg_ptr(sh_up_t.weight_scale)
+            .arg_f32(sh_up_t.weight_scale_2)
+            .arg_ptr(sh_up_out)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(top_k)
+            .arg_u32(num_tokens)
+            .arg_ptr(partials)
+            .launch(stream)
+    };
+    launch_partition_arm(kernel)?;
+    if let Some(tail) = partition_tail {
+        launch_partition_arm(tail)?;
+    }
+    let mut finalize_launch = KernelLaunch::new(gpu, finalize)
         .grid([
             div_ceil(n, t_block()),
             moe_splitk_m_rows(top_k, num_tokens),
-            2,
+            if precompute_activation { 1 } else { 2 },
         ])
         .block([t_block(), 1, 1])
         .arg_ptr(partials)
         .arg_ptr(gate_out)
         .arg_ptr(sh_gate_out)
         .arg_ptr(up_out)
-        .arg_ptr(sh_up_out)
+        .arg_ptr(sh_up_out);
+    if precompute_activation {
+        finalize_launch = finalize_launch.arg_ptr(partials);
+    }
+    finalize_launch
         .arg_u32(n)
         .arg_u32(total_routed)
         .arg_u32(num_tokens)
@@ -533,7 +545,9 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
     sh_up_in: DevicePtr,
     sh_down_t: &QuantizedWeight,
     sh_down_out: DevicePtr,
+    activations: DevicePtr,
     partials: DevicePtr,
+    partition_buckets: Option<[(KernelHandle, u32); 3]>,
     split: u32,
     n: u32,
     k: u32,
@@ -542,33 +556,47 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
     mrow: u32,
     stream: u64,
 ) -> Result<()> {
-    // One `s_act` k-slice per row the leader may gather — MROW, not
-    // num_tokens: the kernel indexes slices by the compile-time MROW stride.
-    let smem_bytes = mrow * (k as usize * std::mem::size_of::<f32>()) as u32 / split;
     let total_routed = num_tokens * top_k;
-    KernelLaunch::new(gpu, kernel)
-        .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, split])
-        .block([t_block(), 1, 1])
-        .shared_mem(smem_bytes)
-        .arg_ptr(gate_out)
-        .arg_ptr(up_out)
-        .arg_ptr(packed_t_ptrs)
-        .arg_ptr(scale_t_ptrs)
-        .arg_ptr(scale2_vals)
-        .arg_ptr(output)
-        .arg_ptr(expert_indices)
-        .arg_ptr(sh_gate_in)
-        .arg_ptr(sh_up_in)
-        .arg_ptr(sh_down_t.weight)
-        .arg_ptr(sh_down_t.weight_scale)
-        .arg_f32(sh_down_t.weight_scale_2)
-        .arg_ptr(sh_down_out)
-        .arg_u32(n)
-        .arg_u32(k)
-        .arg_u32(top_k)
-        .arg_u32(num_tokens)
-        .arg_ptr(partials)
-        .launch(stream)?;
+    let precomputed_activation = partition_buckets.is_some();
+    let launch_partition_arm = |arm: KernelHandle, arm_mrow: u32| {
+        // One `s_act` k-slice per row the leader may gather — the compiled
+        // arm's MROW, not num_tokens.
+        let smem_bytes = if precomputed_activation {
+            0
+        } else {
+            arm_mrow * (k as usize * std::mem::size_of::<f32>()) as u32 / split
+        };
+        KernelLaunch::new(gpu, arm)
+            .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, split])
+            .block([t_block(), 1, 1])
+            .shared_mem(smem_bytes)
+            .arg_ptr(gate_out)
+            .arg_ptr(up_out)
+            .arg_ptr(activations)
+            .arg_ptr(packed_t_ptrs)
+            .arg_ptr(scale_t_ptrs)
+            .arg_ptr(scale2_vals)
+            .arg_ptr(output)
+            .arg_ptr(expert_indices)
+            .arg_ptr(sh_gate_in)
+            .arg_ptr(sh_up_in)
+            .arg_ptr(sh_down_t.weight)
+            .arg_ptr(sh_down_t.weight_scale)
+            .arg_f32(sh_down_t.weight_scale_2)
+            .arg_ptr(sh_down_out)
+            .arg_u32(n)
+            .arg_u32(k)
+            .arg_u32(top_k)
+            .arg_u32(num_tokens)
+            .arg_ptr(partials)
+            .launch(stream)
+    };
+    launch_partition_arm(kernel, mrow)?;
+    if let Some(buckets) = partition_buckets {
+        for (bucket, bucket_mrow) in buckets {
+            launch_partition_arm(bucket, bucket_mrow)?;
+        }
+    }
     KernelLaunch::new(gpu, finalize)
         .grid([
             div_ceil(n, t_block()),

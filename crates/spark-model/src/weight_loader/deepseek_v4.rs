@@ -6,6 +6,7 @@
 //! MLA attention pattern as Mistral Small 4 with DeepSeek weight naming.
 
 mod assemble;
+mod attention_residency;
 mod attn_sink;
 mod compute;
 mod csa_ape;

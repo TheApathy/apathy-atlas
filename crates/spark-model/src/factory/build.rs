@@ -39,6 +39,7 @@ pub fn build_model(
     kv_dtype: KvCacheDtype,
     inference_reserve: usize,
     gpu_memory_utilization: f64,
+    kv_cache_cap_tokens: Option<usize>,
     ssm_cache_slots: usize,
     layer_dtypes: Vec<KvCacheDtype>,
     ssm_checkpoint_interval: usize,
@@ -182,31 +183,31 @@ pub fn build_model(
         && config.ep_rank == 0
         && dflash_args.is_none()
     {
-            match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
-                store,
-                &config,
-                gpu.as_ref(),
-                &attn_layer_dtypes,
-            ) {
-                Ok(Some(m)) => {
-                    tracing::info!(
-                        "DeepSeek-V4 MTP draft module loaded OK (num_mtp_modules={})",
-                        config.num_mtp_modules
-                    );
-                    Some(m)
-                }
-                Ok(None) => {
-                    tracing::info!("DeepSeek-V4: no MTP module in checkpoint (MTP off)");
-                    None
-                }
-                Err(e) => {
-                    tracing::error!("DeepSeek-V4 MTP module load FAILED: {e:#}");
-                    None
-                }
+        match crate::weight_loader::deepseek_v4::load_v4_mtp_module(
+            store,
+            &config,
+            gpu.as_ref(),
+            &attn_layer_dtypes,
+        ) {
+            Ok(Some(m)) => {
+                tracing::info!(
+                    "DeepSeek-V4 MTP draft module loaded OK (num_mtp_modules={})",
+                    config.num_mtp_modules
+                );
+                Some(m)
             }
-        } else {
-            None
-        };
+            Ok(None) => {
+                tracing::info!("DeepSeek-V4: no MTP module in checkpoint (MTP off)");
+                None
+            }
+            Err(e) => {
+                tracing::error!("DeepSeek-V4 MTP module load FAILED: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Capability warning: user asked for `--speculative` but the model has no
     // MTP head bundled, so speculative decoding will silently no-op. Surface
@@ -417,6 +418,16 @@ pub fn build_model(
         .saturating_sub(used_so_far)
         .saturating_sub(inference_reserve)
         .min(actual_free.saturating_sub(inference_reserve));
+    let kv_cap = super::kv_cap::KvCacheCap {
+        block_size: kv_block_size,
+        max_seq_len,
+        max_batch_size,
+        cap_tokens: kv_cache_cap_tokens,
+        high_speed_swap: hss_cache_blocks_per_seq.is_some(),
+    };
+    if hss_cache_blocks_per_seq.is_some() {
+        kv_cap.validated_blocks()?;
+    }
     // Phase 6.1.f: when HBM-shrink is active, size the production cache to
     // `max_batch_size × cache_blocks_per_seq` rather than the unbounded
     // budget-driven sum. This is the *whole point* of the HBM-shrink
@@ -473,8 +484,15 @@ pub fn build_model(
                     (used_so_far + inference_reserve) as f64 / (1024.0 * 1024.0 * 1024.0),
                 );
             }
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let budget_blocks = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let n = kv_cap.resolve_num_blocks(budget_blocks)?;
             let max_kv_tokens = n * kv_block_size;
+            if let Some(cap_tokens) = kv_cache_cap_tokens {
+                tracing::info!(
+                    "KV cache explicit cap: {cap_tokens} tokens; budget allowed \
+                     {budget_blocks} blocks, allocating {n} blocks"
+                );
+            }
             tracing::info!(
                 "KV cache: {:.1} GB total × {:.0}% util = {:.1} GB budget; \
                  {:.1} GB pre-KV + {:.1} GB reserve → {:.1} GB for KV \

@@ -279,13 +279,31 @@ impl MoeLayer {
                 };
                 if ctx.config.scoring_func == "sqrtsoftplus" {
                     ops::moe_topk_sqrtsoftplus(
-                        ctx.gpu, kernel, gate_t, bias, idx_t, wgt_t, num_experts, top_k, norm,
-                        scale, stream,
+                        ctx.gpu,
+                        kernel,
+                        gate_t,
+                        bias,
+                        idx_t,
+                        wgt_t,
+                        num_experts,
+                        top_k,
+                        norm,
+                        scale,
+                        stream,
                     )?;
                 } else {
                     ops::moe_topk_sigmoid(
-                        ctx.gpu, kernel, gate_t, bias, idx_t, wgt_t, num_experts, top_k, norm,
-                        scale, stream,
+                        ctx.gpu,
+                        kernel,
+                        gate_t,
+                        bias,
+                        idx_t,
+                        wgt_t,
+                        num_experts,
+                        top_k,
+                        norm,
+                        scale,
+                        stream,
                     )?;
                 }
             } else {

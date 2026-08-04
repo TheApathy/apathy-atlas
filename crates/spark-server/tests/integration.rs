@@ -114,6 +114,7 @@ fn setup_model(
         spark_runtime::kv_cache::KvCacheDtype::Fp8,
         1024 * 1024 * 1024, // inference_reserve: 1 GB
         0.90,               // gpu_memory_utilization
+        None,               // kv_cache_cap_tokens
         0,                  // ssm_cache_slots
         Vec::new(),         // layer_dtypes
         0,                  // ssm_checkpoint_interval

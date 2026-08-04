@@ -933,16 +933,26 @@ extern "C" __global__ void moe_down_partial_finalize(
 // bodies. Returns false when this block is a duplicate and must exit. Every
 // branch is block-uniform (y and is_shared come from blockIdx), so the
 // __syncthreads below is reached by all threads or none.
-template<int MROW>
+#define GROUP_ALL 0
+#define GROUP_UNIQUE 1
+#define GROUP_DUPLICATED 2
+#define GROUP_COUNT_2 3
+#define GROUP_COUNT_3_4 4
+#define GROUP_COUNT_5_6 5
+
+template<int MROW, int GROUP_MODE = GROUP_ALL>
 __device__ __forceinline__ bool mrow_gather_slots(
     const unsigned int* __restrict__ expert_indices,
     unsigned int y, unsigned int total_routed, unsigned int num_tokens,
     bool is_shared, unsigned int (&slots)[MROW], unsigned int& m_out
 ) {
     // 32 slots per row is well past any top_k this family serves (production is
-    // 6); the stage loop is bounded by total_routed, so a wider routing would
-    // overrun. Kept as a fixed bound because the array must be compile-time.
-    __shared__ unsigned int s_idx[MROW * 32];
+    // 6). The partitioned unique arm is compiled at MROW=1 but scans the full
+    // six-row verify to determine whether a leader occurs exactly once, so only
+    // that arm needs the wider routing scratch. Keep the original MROW-sized
+    // allocation for the shipping all-group entries.
+    constexpr int ROUTING_MROW = GROUP_MODE == GROUP_ALL ? MROW : 6;
+    __shared__ unsigned int s_idx[ROUTING_MROW * 32];
     __shared__ unsigned int s_slot[MROW];
     __shared__ unsigned int s_m;
     // Stage the routing cooperatively. The scan below is serial on thread 0, so
@@ -958,7 +968,10 @@ __device__ __forceinline__ bool mrow_gather_slots(
         unsigned int m = 0;
         if (is_shared) {
             // One block-set computes the shared projection for every row.
-            for (unsigned int t = 0; t < num_tokens && m < MROW; ++t) s_slot[m++] = t;
+            for (unsigned int t = 0; t < num_tokens; ++t) {
+                if (m < MROW) s_slot[m] = t;
+                ++m;
+            }
         } else {
             const unsigned int e = s_idx[y];
             bool leader = true;
@@ -966,21 +979,36 @@ __device__ __forceinline__ bool mrow_gather_slots(
                 if (s_idx[s] == e) { leader = false; break; }
             }
             if (leader) {
-                for (unsigned int s = y; s < total_routed && m < MROW; ++s) {
-                    if (s_idx[s] == e) s_slot[m++] = s;
+                for (unsigned int s = y; s < total_routed; ++s) {
+                    if (s_idx[s] == e) {
+                        if (m < MROW) s_slot[m] = s;
+                        ++m;
+                    }
                 }
             }
         }
         s_m = m;   // 0 => duplicate slot, nothing to do
     }
     __syncthreads();
-    m_out = s_m;
+    if constexpr (GROUP_MODE == GROUP_UNIQUE) {
+        if (s_m != 1) return false;
+    } else if constexpr (GROUP_MODE == GROUP_DUPLICATED) {
+        if (s_m <= 1) return false;
+    } else if constexpr (GROUP_MODE == GROUP_COUNT_2) {
+        if (s_m != 2) return false;
+    } else if constexpr (GROUP_MODE == GROUP_COUNT_3_4) {
+        if (s_m < 3 || s_m > 4) return false;
+    } else if constexpr (GROUP_MODE == GROUP_COUNT_5_6) {
+        if (s_m < 5) return false;
+    }
+    m_out = min(s_m, (unsigned int)MROW);
     #pragma unroll
     for (int i = 0; i < MROW; ++i) slots[i] = (i < (int)s_m) ? s_slot[i] : 0u;
     return s_m > 0;
 }
 
-template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW>
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW,
+         int GROUP_MODE = GROUP_ALL>
 __device__ __forceinline__ void gate_up_shared_t_m_impl(
     const __nv_bfloat16* __restrict__ A,                    // [num_tokens, K]
     const unsigned long long* __restrict__ gate_packed_t_ptrs,
@@ -1013,8 +1041,8 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
 
     unsigned int slots[MROW];
     unsigned int M;
-    if (!mrow_gather_slots<MROW>(expert_indices, y, total_routed, num_tokens,
-                                 is_shared, slots, M)) return;
+    if (!mrow_gather_slots<MROW, GROUP_MODE>(expert_indices, y, total_routed, num_tokens,
+                                             is_shared, slots, M)) return;
 
     // Partial row for gathered row m: routed slot s -> s; shared row t -> total_routed + t.
     const auto row_of = [&](int m) -> unsigned int {
@@ -1159,10 +1187,12 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
     #undef GATEUP_M_ACCUM
 }
 
-template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW>
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW,
+         int GROUP_MODE = GROUP_ALL, bool PRECOMPUTED_ACT = false>
 __device__ __forceinline__ void silu_down_shared_t_m_impl(
     const __nv_bfloat16* __restrict__ gate_out,             // [num_tokens*top_k, K]
     const __nv_bfloat16* __restrict__ up_out,
+    const float* __restrict__ precomputed_act,              // [rows, K] or null
     const unsigned long long* __restrict__ packed_t_ptrs,
     const unsigned long long* __restrict__ scale_t_ptrs,
     const float* __restrict__ scale2_vals,
@@ -1186,8 +1216,8 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
 
     unsigned int slots[MROW];
     unsigned int M;
-    if (!mrow_gather_slots<MROW>(expert_indices, y, total_routed, num_tokens,
-                                 is_shared, slots, M)) return;
+    if (!mrow_gather_slots<MROW, GROUP_MODE>(expert_indices, y, total_routed, num_tokens,
+                                             is_shared, slots, M)) return;
 
     const auto row_of = [&](int m) -> unsigned int {
         return is_shared ? (total_routed + slots[m]) : slots[m];
@@ -1233,22 +1263,24 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
     const unsigned int k_len = K / SPLIT;
     const unsigned int k_lo = (SPLIT == 1) ? 0u : ks * k_len;
     extern __shared__ float s_act_m[];
-    for (int m = 0; m < MROW; ++m) {
-        if (m >= (int)M) break;
-        const __nv_bfloat16* g_ptr = is_shared
-            ? sh_gate_in + (unsigned long long)slots[m] * K
-            : gate_out + (unsigned long long)slots[m] * K;
-        const __nv_bfloat16* u_ptr = is_shared
-            ? sh_up_in + (unsigned long long)slots[m] * K
-            : up_out + (unsigned long long)slots[m] * K;
-        float* dst = s_act_m + (unsigned long long)m * k_len;
-        for (unsigned int i = threadIdx.x; i < k_len; i += blockDim.x) {
-            float gf = __bfloat162float(g_ptr[k_lo + i]);
-            float uf = __bfloat162float(u_ptr[k_lo + i]);
-            dst[i] = (gf / (1.0f + __expf(-gf))) * uf;
+    if constexpr (!PRECOMPUTED_ACT) {
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            const __nv_bfloat16* g_ptr = is_shared
+                ? sh_gate_in + (unsigned long long)slots[m] * K
+                : gate_out + (unsigned long long)slots[m] * K;
+            const __nv_bfloat16* u_ptr = is_shared
+                ? sh_up_in + (unsigned long long)slots[m] * K
+                : up_out + (unsigned long long)slots[m] * K;
+            float* dst = s_act_m + (unsigned long long)m * k_len;
+            for (unsigned int i = threadIdx.x; i < k_len; i += blockDim.x) {
+                float gf = __bfloat162float(g_ptr[k_lo + i]);
+                float uf = __bfloat162float(u_ptr[k_lo + i]);
+                dst[i] = (gf / (1.0f + __expf(-gf))) * uf;
+            }
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
 
@@ -1259,7 +1291,12 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
     const float* act_row[MROW];
     #pragma unroll
     for (int m = 0; m < MROW; ++m) {
-        act_row[m] = s_act_m + (unsigned long long)((m < (int)M) ? m : 0) * k_len;
+        if constexpr (PRECOMPUTED_ACT) {
+            const unsigned int row = (m < (int)M) ? row_of(m) : row_of(0);
+            act_row[m] = precomputed_act + (unsigned long long)row * K + k_lo;
+        } else {
+            act_row[m] = s_act_m + (unsigned long long)((m < (int)M) ? m : 0) * k_len;
+        }
     }
 
     const unsigned int K_half = K / 2;
@@ -1328,7 +1365,7 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
     #undef SILUDOWN_M_ACCUM
 }
 
-#define GATEUP_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_)              \
+#define GATEUP_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_) \
 extern "C" __global__ void NAME(                                               \
     const __nv_bfloat16* __restrict__ A,                                       \
     const unsigned long long* __restrict__ gate_packed_t_ptrs,                 \
@@ -1353,7 +1390,7 @@ extern "C" __global__ void NAME(                                               \
     float* __restrict__ partial                                                \
 ) {                                                                            \
     gate_up_shared_t_m_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false,             \
-                            (VEC_), (SPLIT_), (MROW_)>(                        \
+                            (VEC_), (SPLIT_), (MROW_), (GROUP_MODE_)>(         \
         A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out,  \
         up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out,             \
         expert_indices, sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2,         \
@@ -1361,10 +1398,11 @@ extern "C" __global__ void NAME(                                               \
         N, K, top_k, num_tokens, partial);                                     \
 }
 
-#define DOWN_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_)                \
+#define DOWN_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_, PRECOMPUTED_) \
 extern "C" __global__ void NAME(                                               \
     const __nv_bfloat16* __restrict__ gate_out,                                \
     const __nv_bfloat16* __restrict__ up_out,                                  \
+    const float* __restrict__ precomputed_act,                                 \
     const unsigned long long* __restrict__ packed_t_ptrs,                      \
     const unsigned long long* __restrict__ scale_t_ptrs,                       \
     const float* __restrict__ scale2_vals,                                     \
@@ -1381,8 +1419,10 @@ extern "C" __global__ void NAME(                                               \
     float* __restrict__ partial                                                \
 ) {                                                                            \
     silu_down_shared_t_m_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false,           \
-                              (VEC_), (SPLIT_), (MROW_)>(                      \
-        gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C,         \
+                              (VEC_), (SPLIT_), (MROW_), (GROUP_MODE_),        \
+                              (PRECOMPUTED_)>(                                 \
+        gate_out, up_out, precomputed_act, packed_t_ptrs, scale_t_ptrs,       \
+        scale2_vals, C,                                                        \
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed,                \
         sh_down_t_scale, sh_down_s2, sh_down_out, N, K, top_k, num_tokens,     \
         partial);                                                              \
@@ -1396,22 +1436,42 @@ extern "C" __global__ void NAME(                                               \
 // and an expert can be duplicated at most num_tokens times — so this one entry
 // covers the whole 3..6 range and the m2 pair stays the K=2 fast path (it does
 // not carry the ladder's wider arms).
-GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1)
-GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1)
-GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2)
-GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2)
-GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m6v2s4,      GROUP_SIZE, false, 2, 4, 6)
-GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m6v2s4, 32,         true,  2, 4, 6)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m6v2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m6v2s4, 32,         true,  2, 4, 6, GROUP_ALL)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m1uv2s4,      GROUP_SIZE, false, 2, 4, 1, GROUP_UNIQUE)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m1uv2s4, 32,         true,  2, 4, 1, GROUP_UNIQUE)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_m6dv2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_DUPLICATED)
+GATEUP_M_ENTRY(moe_expert_gate_up_shared_t_e8m0_m6dv2s4, 32,         true,  2, 4, 6, GROUP_DUPLICATED)
 
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6v2s4,      GROUP_SIZE, false, 2, 4, 6)
-DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6v2s4, 32,         true,  2, 4, 6)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m1v2s4,      GROUP_SIZE, false, 2, 4, 1, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m1v2s4, 32,         true,  2, 4, 1, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2v2s4,      GROUP_SIZE, false, 2, 4, 2, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2v2s4, 32,         true,  2, 4, 2, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6v2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6v2s4, 32,         true,  2, 4, 6, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m1uv2s4,      GROUP_SIZE, false, 2, 4, 1, GROUP_UNIQUE, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m1uv2s4, 32,         true,  2, 4, 1, GROUP_UNIQUE, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6dv2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_DUPLICATED, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6dv2s4, 32,         true,  2, 4, 6, GROUP_DUPLICATED, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2c2v2s4,      GROUP_SIZE, false, 2, 4, 2, GROUP_COUNT_2, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2c2v2s4, 32,         true,  2, 4, 2, GROUP_COUNT_2, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m4c34v2s4,      GROUP_SIZE, false, 2, 4, 4, GROUP_COUNT_3_4, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m4c34v2s4, 32,         true,  2, 4, 4, GROUP_COUNT_3_4, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6c56v2s4,      GROUP_SIZE, false, 2, 4, 6, GROUP_COUNT_5_6, true)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6c56v2s4, 32,         true,  2, 4, 6, GROUP_COUNT_5_6, true)
 
 #undef GATEUP_M_ENTRY
 #undef DOWN_M_ENTRY
+#undef GROUP_ALL
+#undef GROUP_UNIQUE
+#undef GROUP_DUPLICATED
+#undef GROUP_COUNT_2
+#undef GROUP_COUNT_3_4
+#undef GROUP_COUNT_5_6
 
 // Multi-row finalize. `rows = total_routed + num_tokens`: the routed slots in
 // flat order, then one shared row per token.
@@ -1442,6 +1502,48 @@ extern "C" __global__ void moe_gate_up_partial_finalize_m(
     dst[n] = __float2bfloat16(s);
 }
 
+// Partitioned γ=6 finalize: preserve the two BF16 outputs and materialize the
+// exact BF16-rounded SiLU(gate)*up value once. The activation may alias the
+// beginning of `partial`: this block has already consumed both projections for
+// its unique (row,n) element before writing that location, and no other block
+// reads it. Launch: grid = [ceil(N/block), rows, 1].
+extern "C" __global__ void moe_gate_up_partial_finalize_m_act(
+    const float* __restrict__ partial,
+    __nv_bfloat16* __restrict__ gate_out,
+    __nv_bfloat16* __restrict__ sh_gate_out,
+    __nv_bfloat16* __restrict__ up_out,
+    __nv_bfloat16* __restrict__ sh_up_out,
+    float* __restrict__ activation,                   // [rows, N]
+    unsigned int N, unsigned int total_routed, unsigned int num_tokens,
+    unsigned int split
+) {
+    const unsigned int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const unsigned int row = blockIdx.y;
+    const unsigned int rows = total_routed + num_tokens;
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (unsigned int ks = 0; ks < split; ++ks) {
+        gate += partial[((unsigned long long)ks * rows + row) * N + n];
+        up += partial[(((unsigned long long)split + ks) * rows + row) * N + n];
+    }
+    const __nv_bfloat16 gate_bf16 = __float2bfloat16(gate);
+    const __nv_bfloat16 up_bf16 = __float2bfloat16(up);
+    __nv_bfloat16* gate_dst = (row >= total_routed)
+        ? sh_gate_out + (unsigned long long)(row - total_routed) * N
+        : gate_out + (unsigned long long)row * N;
+    __nv_bfloat16* up_dst = (row >= total_routed)
+        ? sh_up_out + (unsigned long long)(row - total_routed) * N
+        : up_out + (unsigned long long)row * N;
+    gate_dst[n] = gate_bf16;
+    up_dst[n] = up_bf16;
+    const float gf = __bfloat162float(gate_bf16);
+    const float uf = __bfloat162float(up_bf16);
+    activation[(unsigned long long)row * N + n] =
+        (gf / (1.0f + __expf(-gf))) * uf;
+}
+
 // Launch: grid = [ceil(N/block), rows, 1], block = [block,1,1].
 extern "C" __global__ void moe_down_partial_finalize_m(
     const float* __restrict__ partial,          // [split, rows, N]
@@ -1465,3 +1567,299 @@ extern "C" __global__ void moe_down_partial_finalize_m(
     if (dst == 0) return;
     dst[n] = __float2bfloat16(s);
 }
+
+// ============================================================================
+// Stage-0 persistent M6 experiment (microtest only).
+//
+// The host has already gathered each expert's routed slots and resolved the
+// packed/scale/s2 pointers. A 48-byte record therefore replaces both the
+// per-CTA routing scan and the three device pointer-table reads. Work is a
+// record x split-K x four-N-stripe product consumed by a fixed grid. The
+// arithmetic inside a (row,n,split) remains byte-for-byte the v2s4 loop above:
+// sg increases first, then kh_off, and every thread owns two adjacent n values.
+//
+// This is intentionally not wired to the production Rust dispatch. The
+// moe_unified_t_m_microtest is the sole caller until exact parity, >=213 GB/s,
+// <=64 registers and zero spills have all been demonstrated.
+// ============================================================================
+
+struct __align__(16) MoePersistentM6Work {
+    unsigned long long packed;
+    unsigned long long scale;
+    float scale2;
+    unsigned int meta;       // low 3 bits: row count; bit 8: shared; bit 9: up
+    unsigned int slots[6];   // combined rows: routed slots, then shared tokens
+};
+
+static_assert(sizeof(MoePersistentM6Work) == 48, "persistent work record must be 48 bytes");
+
+#define MOE_PERSIST_COUNT_MASK 0x7u
+#define MOE_PERSIST_SHARED     (1u << 8)
+#define MOE_PERSIST_UP         (1u << 9)
+
+template<int GS, bool E8M0, int ROWS>
+__device__ __forceinline__ void persistent_m6_gate_up_body(
+    const __nv_bfloat16* __restrict__ A,
+    const MoePersistentM6Work& work,
+    float* __restrict__ partial,
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int total_routed, unsigned int num_tokens,
+    unsigned int proj, unsigned int ks, unsigned int stripe
+) {
+    constexpr unsigned int VEC = 2;
+    constexpr unsigned int SPLIT = 4;
+    const unsigned int rows = total_routed + num_tokens;
+    const unsigned int M = work.meta & MOE_PERSIST_COUNT_MASK;
+    const bool shared = (work.meta & MOE_PERSIST_SHARED) != 0;
+    const unsigned char* B_packed = (const unsigned char*)work.packed;
+    const unsigned char* B_scale = (const unsigned char*)work.scale;
+    const unsigned int stripe_width = N / 4;
+    const unsigned int stripe_base = stripe * stripe_width;
+
+    const __nv_bfloat16* A_row[ROWS];
+    #pragma unroll
+    for (int m = 0; m < ROWS; ++m) {
+        const unsigned int slot = work.slots[m];
+        const unsigned int token = shared ? (slot - total_routed) : (slot / top_k);
+        A_row[m] = A + (unsigned long long)token * K;
+    }
+
+    for (unsigned int local = threadIdx.x * VEC;
+         local < stripe_width;
+         local += blockDim.x * VEC) {
+        const unsigned int n = stripe_base + local;
+        float acc[ROWS][VEC];
+        #pragma unroll
+        for (int m = 0; m < ROWS; ++m) {
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) acc[m][v] = 0.0f;
+        }
+        if (B_packed != 0) {
+            const unsigned int gpk = K / GS / SPLIT;
+            for (unsigned int sg = ks * gpk; sg < (ks + 1) * gpk; ++sg) {
+                unsigned char sb[VEC];
+                load_vec_u8<VEC>(B_scale + (unsigned long long)sg * N + n, sb);
+                float sc[VEC];
+                #pragma unroll
+                for (int v = 0; v < VEC; ++v) {
+                    sc[v] = mx_block_scale<E8M0>(sb[v], work.scale2);
+                }
+                const unsigned int kh_base = sg * (GS / 2);
+                #pragma unroll
+                for (unsigned int kh_off = 0; kh_off < (GS / 2); ++kh_off) {
+                    const unsigned int k_half = kh_base + kh_off;
+                    unsigned char byte[VEC];
+                    load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte);
+                    float w_lo[VEC], w_hi[VEC];
+                    #pragma unroll
+                    for (int v = 0; v < VEC; ++v) {
+                        w_lo[v] = e2m1_decode(byte[v] & 0xFu) * sc[v];
+                        w_hi[v] = e2m1_decode((byte[v] >> 4) & 0xFu) * sc[v];
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < ROWS; ++m) {
+                        const float a_lo = __bfloat162float(A_row[m][k_half * 2]);
+                        const float a_hi = __bfloat162float(A_row[m][k_half * 2 + 1]);
+                        #pragma unroll
+                        for (int v = 0; v < VEC; ++v) {
+                            acc[m][v] += a_lo * w_lo[v] + a_hi * w_hi[v];
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < ROWS; ++m) {
+            if (m >= (int)M) break;
+            const unsigned int slot = work.slots[m];
+            float* out = partial
+                + (((unsigned long long)proj * SPLIT + ks) * rows + slot) * N + n;
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) out[v] = acc[m][v];
+        }
+    }
+}
+
+template<int GS, bool E8M0, int ROWS>
+__device__ __forceinline__ void persistent_m6_down_body(
+    const float* __restrict__ activation,
+    const MoePersistentM6Work& work,
+    float* __restrict__ partial,
+    unsigned int N, unsigned int K,
+    unsigned int total_routed, unsigned int num_tokens,
+    unsigned int ks, unsigned int stripe
+) {
+    constexpr unsigned int VEC = 2;
+    constexpr unsigned int SPLIT = 4;
+    const unsigned int rows = total_routed + num_tokens;
+    const unsigned int M = work.meta & MOE_PERSIST_COUNT_MASK;
+    const unsigned char* B_packed = (const unsigned char*)work.packed;
+    const unsigned char* B_scale = (const unsigned char*)work.scale;
+    const unsigned int stripe_width = N / 4;
+    const unsigned int stripe_base = stripe * stripe_width;
+    const unsigned int k_lo = ks * (K / SPLIT);
+
+    const float* act_row[ROWS];
+    #pragma unroll
+    for (int m = 0; m < ROWS; ++m) {
+        act_row[m] = activation + (unsigned long long)work.slots[m] * K + k_lo;
+    }
+
+    for (unsigned int local = threadIdx.x * VEC;
+         local < stripe_width;
+         local += blockDim.x * VEC) {
+        const unsigned int n = stripe_base + local;
+        float acc[ROWS][VEC];
+        #pragma unroll
+        for (int m = 0; m < ROWS; ++m) {
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) acc[m][v] = 0.0f;
+        }
+        if (B_packed != 0) {
+            const unsigned int gpk = K / GS / SPLIT;
+            for (unsigned int sg = ks * gpk; sg < (ks + 1) * gpk; ++sg) {
+                unsigned char sb[VEC];
+                load_vec_u8<VEC>(B_scale + (unsigned long long)sg * N + n, sb);
+                float sc[VEC];
+                #pragma unroll
+                for (int v = 0; v < VEC; ++v) {
+                    sc[v] = mx_block_scale<E8M0>(sb[v], work.scale2);
+                }
+                const unsigned int kh_base = sg * (GS / 2);
+                #pragma unroll
+                for (unsigned int kh_off = 0; kh_off < (GS / 2); ++kh_off) {
+                    const unsigned int k_half = kh_base + kh_off;
+                    unsigned char byte[VEC];
+                    load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte);
+                    float w_lo[VEC], w_hi[VEC];
+                    #pragma unroll
+                    for (int v = 0; v < VEC; ++v) {
+                        w_lo[v] = e2m1_decode(byte[v] & 0xFu) * sc[v];
+                        w_hi[v] = e2m1_decode((byte[v] >> 4) & 0xFu) * sc[v];
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < ROWS; ++m) {
+                        const float a_lo = act_row[m][k_half * 2 - k_lo];
+                        const float a_hi = act_row[m][k_half * 2 + 1 - k_lo];
+                        #pragma unroll
+                        for (int v = 0; v < VEC; ++v) {
+                            acc[m][v] += a_lo * w_lo[v] + a_hi * w_hi[v];
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < ROWS; ++m) {
+            if (m >= (int)M) break;
+            const unsigned int slot = work.slots[m];
+            float* out = partial + ((unsigned long long)ks * rows + slot) * N + n;
+            #pragma unroll
+            for (int v = 0; v < VEC; ++v) out[v] = acc[m][v];
+        }
+    }
+}
+
+#define PERSISTENT_M6_GU_DISPATCH(GS_, E8M0_) do {                            \
+    if (count == 1) {                                                          \
+        persistent_m6_gate_up_body<(GS_), (E8M0_), 1>(                        \
+            A, work, partial, N, K, top_k, total_routed, num_tokens,          \
+            proj, ks, stripe);                                                 \
+    } else if (count <= 2) {                                                   \
+        persistent_m6_gate_up_body<(GS_), (E8M0_), 2>(                        \
+            A, work, partial, N, K, top_k, total_routed, num_tokens,          \
+            proj, ks, stripe);                                                 \
+    } else if (count <= 4) {                                                   \
+        persistent_m6_gate_up_body<(GS_), (E8M0_), 4>(                        \
+            A, work, partial, N, K, top_k, total_routed, num_tokens,          \
+            proj, ks, stripe);                                                 \
+    } else {                                                                   \
+        persistent_m6_gate_up_body<(GS_), (E8M0_), 6>(                        \
+            A, work, partial, N, K, top_k, total_routed, num_tokens,          \
+            proj, ks, stripe);                                                 \
+    }                                                                          \
+} while (0)
+
+#define PERSISTENT_M6_DN_DISPATCH(GS_, E8M0_) do {                            \
+    if (count == 1) {                                                          \
+        persistent_m6_down_body<(GS_), (E8M0_), 1>(                           \
+            activation, work, partial, N, K, total_routed, num_tokens,        \
+            ks, stripe);                                                       \
+    } else if (count <= 2) {                                                   \
+        persistent_m6_down_body<(GS_), (E8M0_), 2>(                           \
+            activation, work, partial, N, K, total_routed, num_tokens,        \
+            ks, stripe);                                                       \
+    } else if (count <= 4) {                                                   \
+        persistent_m6_down_body<(GS_), (E8M0_), 4>(                           \
+            activation, work, partial, N, K, total_routed, num_tokens,        \
+            ks, stripe);                                                       \
+    } else {                                                                   \
+        persistent_m6_down_body<(GS_), (E8M0_), 6>(                           \
+            activation, work, partial, N, K, total_routed, num_tokens,        \
+            ks, stripe);                                                       \
+    }                                                                          \
+} while (0)
+
+// Launch: fixed grid (192 in the microtest), block [256,1,1]. Every record has
+// 16 tasks: four split-K slices x four contiguous N stripes. Routed E8M0 and
+// shared E4M3 records deliberately use separate entry points, so ptxas never
+// has both scale-format ladders live in one kernel.
+#define PERSISTENT_M6_GU_ENTRY(NAME_, GS_, E8M0_, ROWS_)                      \
+extern "C" __global__ __launch_bounds__(256, 4) void NAME_(                   \
+    const __nv_bfloat16* __restrict__ A,                                      \
+    const MoePersistentM6Work* __restrict__ worklist,                         \
+    unsigned int work_count, float* __restrict__ partial,                     \
+    unsigned int N, unsigned int K, unsigned int top_k,                       \
+    unsigned int total_routed, unsigned int num_tokens                        \
+) {                                                                           \
+    const unsigned int task_count = work_count * 16;                          \
+    const unsigned int task = blockIdx.x;                                     \
+    if (task >= task_count) return;                                            \
+    const MoePersistentM6Work& work = worklist[task / 16];                     \
+    const unsigned int lane = task & 15u;                                     \
+    const unsigned int ks = lane >> 2;                                        \
+    const unsigned int stripe = lane & 3u;                                    \
+    const unsigned int proj = (work.meta & MOE_PERSIST_UP) != 0;              \
+    persistent_m6_gate_up_body<(GS_), (E8M0_), (ROWS_)>(                      \
+        A, work, partial, N, K, top_k, total_routed, num_tokens,              \
+        proj, ks, stripe);                                                     \
+}
+
+#define PERSISTENT_M6_DN_ENTRY(NAME_, GS_, E8M0_, ROWS_)                      \
+extern "C" __global__ __launch_bounds__(256, 4) void NAME_(                   \
+    const float* __restrict__ activation,                                     \
+    const MoePersistentM6Work* __restrict__ worklist,                         \
+    unsigned int work_count, float* __restrict__ partial,                     \
+    unsigned int N, unsigned int K,                                           \
+    unsigned int total_routed, unsigned int num_tokens                        \
+) {                                                                           \
+    const unsigned int task_count = work_count * 16;                          \
+    const unsigned int task = blockIdx.x;                                     \
+    if (task >= task_count) return;                                            \
+    const MoePersistentM6Work& work = worklist[task / 16];                     \
+    const unsigned int lane = task & 15u;                                     \
+    const unsigned int ks = lane >> 2;                                        \
+    const unsigned int stripe = lane & 3u;                                    \
+    persistent_m6_down_body<(GS_), (E8M0_), (ROWS_)>(                         \
+        activation, work, partial, N, K, total_routed, num_tokens,            \
+        ks, stripe);                                                           \
+}
+
+PERSISTENT_M6_GU_ENTRY(moe_expert_gate_up_t_e8m0_m1_persistent_v2s4, 32, true, 1)
+PERSISTENT_M6_GU_ENTRY(moe_expert_gate_up_t_e8m0_m2_persistent_v2s4, 32, true, 2)
+PERSISTENT_M6_GU_ENTRY(moe_expert_gate_up_t_e8m0_m4_persistent_v2s4, 32, true, 4)
+PERSISTENT_M6_GU_ENTRY(moe_expert_gate_up_t_e8m0_m6_persistent_v2s4, 32, true, 6)
+PERSISTENT_M6_GU_ENTRY(moe_shared_gate_up_t_m6_persistent_v2s4, 16, false, 6)
+PERSISTENT_M6_DN_ENTRY(moe_expert_silu_down_t_e8m0_m1_persistent_v2s4, 32, true, 1)
+PERSISTENT_M6_DN_ENTRY(moe_expert_silu_down_t_e8m0_m2_persistent_v2s4, 32, true, 2)
+PERSISTENT_M6_DN_ENTRY(moe_expert_silu_down_t_e8m0_m4_persistent_v2s4, 32, true, 4)
+PERSISTENT_M6_DN_ENTRY(moe_expert_silu_down_t_e8m0_m6_persistent_v2s4, 32, true, 6)
+PERSISTENT_M6_DN_ENTRY(moe_shared_silu_down_t_m6_persistent_v2s4, 16, false, 6)
+
+#undef PERSISTENT_M6_GU_DISPATCH
+#undef PERSISTENT_M6_DN_DISPATCH
+#undef PERSISTENT_M6_GU_ENTRY
+#undef PERSISTENT_M6_DN_ENTRY
+#undef MOE_PERSIST_COUNT_MASK
+#undef MOE_PERSIST_SHARED
+#undef MOE_PERSIST_UP

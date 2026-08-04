@@ -69,6 +69,11 @@ const LAYERS: f64 = 43.0; // DeepSeek-V4-Flash
 /// `spark_runtime::buffers::MOE_DECODE_MAX_ROWS` and the `_m6v2s4` entries.
 const MROW_MAX: u32 = 6;
 const ITERS: usize = 200;
+const PERSISTENT_BLOCK: u32 = 256;
+const PERSISTENT_TASKS_PER_RECORD: u32 = SPLIT * 4;
+const WORK_COUNT_MASK: u32 = 0x7;
+const WORK_SHARED: u32 = 1 << 8;
+const WORK_UP: u32 = 1 << 9;
 
 struct Rng(u64);
 impl Rng {
@@ -160,6 +165,9 @@ struct Table {
     packed: DevicePtr,
     scales: DevicePtr,
     s2: DevicePtr,
+    packed_host: Vec<u64>,
+    scales_host: Vec<u64>,
+    s2_host: Vec<f32>,
 }
 
 fn build_table(gpu: &dyn GpuBackend, ws: &[Wt]) -> Result<Table> {
@@ -175,7 +183,349 @@ fn build_table(gpu: &dyn GpuBackend, ws: &[Wt]) -> Result<Table> {
         packed: upload(gpu, &u64s(&wp))?,
         scales: upload(gpu, &u64s(&sp))?,
         s2: upload(gpu, &f32s(&s2))?,
+        packed_host: wp,
+        scales_host: sp,
+        s2_host: s2,
     })
+}
+
+/// Host-built, device-consumed work descriptor. Keeping the exact 48-byte
+/// layout here and in CUDA is part of the microtest contract: the persistent
+/// kernels do no pointer-table lookup and no routing scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+struct PersistentWork {
+    packed: u64,
+    scale: u64,
+    scale2_bits: u32,
+    meta: u32,
+    slots: [u32; MROW_MAX as usize],
+}
+
+impl PersistentWork {
+    fn new(
+        packed: u64,
+        scale: u64,
+        scale2: f32,
+        count: usize,
+        shared: bool,
+        up: bool,
+        gathered: &[u32],
+    ) -> Self {
+        assert!((1..=MROW_MAX as usize).contains(&count));
+        assert_eq!(count, gathered.len());
+        let mut slots = [gathered[0]; MROW_MAX as usize];
+        slots[..count].copy_from_slice(gathered);
+        Self {
+            packed,
+            scale,
+            scale2_bits: scale2.to_bits(),
+            meta: count as u32
+                | if shared { WORK_SHARED } else { 0 }
+                | if up { WORK_UP } else { 0 },
+            slots,
+        }
+    }
+
+    fn count(self) -> usize {
+        (self.meta & WORK_COUNT_MASK) as usize
+    }
+
+    fn to_bytes(self) -> [u8; 48] {
+        let mut out = [0u8; 48];
+        out[0..8].copy_from_slice(&self.packed.to_le_bytes());
+        out[8..16].copy_from_slice(&self.scale.to_le_bytes());
+        out[16..20].copy_from_slice(&self.scale2_bits.to_le_bytes());
+        out[20..24].copy_from_slice(&self.meta.to_le_bytes());
+        for (i, slot) in self.slots.iter().enumerate() {
+            out[24 + i * 4..28 + i * 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkOrder {
+    Leader,
+    Pointer,
+}
+
+fn work_bytes(work: &[PersistentWork]) -> Vec<u8> {
+    work.iter().flat_map(|record| record.to_bytes()).collect()
+}
+
+fn gathered_experts(routing: &[Vec<u32>]) -> Vec<(u32, Vec<u32>)> {
+    let mut groups: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (slot, expert) in routing.iter().flatten().copied().enumerate() {
+        if let Some((_, slots)) = groups.iter_mut().find(|(e, _)| *e == expert) {
+            slots.push(slot as u32);
+        } else {
+            groups.push((expert, vec![slot as u32]));
+        }
+    }
+    groups
+}
+
+fn make_work(
+    routing: &[Vec<u32>],
+    tokens: usize,
+    order: WorkOrder,
+    gate: &Table,
+    up: &Table,
+    down: &Table,
+    shared: [(u64, u64, f32); 3],
+) -> (Vec<PersistentWork>, Vec<PersistentWork>) {
+    let total_routed = routing.iter().map(Vec::len).sum::<usize>() as u32;
+    let groups = gathered_experts(routing);
+    let shared_slots: Vec<u32> = (0..tokens)
+        .map(|token| total_routed + token as u32)
+        .collect();
+    let mut gu = Vec::with_capacity(2 * (groups.len() + 1));
+    for (is_up, table, sh) in [(false, gate, shared[0]), (true, up, shared[1])] {
+        for (expert, slots) in &groups {
+            let e = *expert as usize;
+            gu.push(PersistentWork::new(
+                table.packed_host[e],
+                table.scales_host[e],
+                table.s2_host[e],
+                slots.len(),
+                false,
+                is_up,
+                slots,
+            ));
+        }
+        gu.push(PersistentWork::new(
+            sh.0,
+            sh.1,
+            sh.2,
+            tokens,
+            true,
+            is_up,
+            &shared_slots,
+        ));
+    }
+    let mut dn = Vec::with_capacity(groups.len() + 1);
+    for (expert, slots) in &groups {
+        let e = *expert as usize;
+        dn.push(PersistentWork::new(
+            down.packed_host[e],
+            down.scales_host[e],
+            down.s2_host[e],
+            slots.len(),
+            false,
+            false,
+            slots,
+        ));
+    }
+    dn.push(PersistentWork::new(
+        shared[2].0,
+        shared[2].1,
+        shared[2].2,
+        tokens,
+        true,
+        false,
+        &shared_slots,
+    ));
+    if matches!(order, WorkOrder::Pointer) {
+        gu.sort_unstable_by_key(|record| (record.packed, record.scale, record.meta & WORK_UP));
+        dn.sort_unstable_by_key(|record| (record.packed, record.scale));
+    }
+    (gu, dn)
+}
+
+struct DeviceWork {
+    ptr: DevicePtr,
+    count: u32,
+}
+
+struct PersistentWorkSet {
+    gu: [Option<DeviceWork>; 4],
+    down: [Option<DeviceWork>; 4],
+    shared_gu: DeviceWork,
+    shared_down: DeviceWork,
+}
+
+fn work_bucket(count: usize) -> usize {
+    match count {
+        1 => 0,
+        2 => 1,
+        3 | 4 => 2,
+        5 | 6 => 3,
+        _ => panic!("invalid persistent row count {count}"),
+    }
+}
+
+fn upload_work(gpu: &dyn GpuBackend, records: &[PersistentWork]) -> Result<DeviceWork> {
+    assert!(!records.is_empty());
+    Ok(DeviceWork {
+        ptr: upload(gpu, &work_bytes(records))?,
+        count: records.len() as u32,
+    })
+}
+
+fn upload_work_set(
+    gpu: &dyn GpuBackend,
+    gu: &[PersistentWork],
+    down: &[PersistentWork],
+) -> Result<PersistentWorkSet> {
+    let mut gu_buckets: [Vec<PersistentWork>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut down_buckets: [Vec<PersistentWork>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut shared_gu = Vec::new();
+    let mut shared_down = Vec::new();
+    for record in gu {
+        if record.meta & WORK_SHARED != 0 {
+            shared_gu.push(*record);
+        } else {
+            gu_buckets[work_bucket(record.count())].push(*record);
+        }
+    }
+    for record in down {
+        if record.meta & WORK_SHARED != 0 {
+            shared_down.push(*record);
+        } else {
+            down_buckets[work_bucket(record.count())].push(*record);
+        }
+    }
+    assert_eq!(shared_gu.len(), 2);
+    assert_eq!(shared_down.len(), 1);
+    let upload_buckets = |buckets: &[Vec<PersistentWork>; 4]| -> Result<_> {
+        let mut uploaded = [None, None, None, None];
+        for (i, bucket) in buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                uploaded[i] = Some(upload_work(gpu, bucket)?);
+            }
+        }
+        Ok(uploaded)
+    };
+    Ok(PersistentWorkSet {
+        gu: upload_buckets(&gu_buckets)?,
+        down: upload_buckets(&down_buckets)?,
+        shared_gu: upload_work(gpu, &shared_gu)?,
+        shared_down: upload_work(gpu, &shared_down)?,
+    })
+}
+
+#[derive(Clone)]
+struct RoutingFixture {
+    label: &'static str,
+    routing: Vec<Vec<u32>>,
+}
+
+fn persistent_fixtures(pool: usize, seed: u64) -> Vec<RoutingFixture> {
+    assert!(
+        pool >= 36,
+        "persistent fixtures require at least 36 experts"
+    );
+    let bridge = (0..MROW_MAX as usize)
+        .map(|row| {
+            (0..6)
+                .map(|column| ((row * 2 + column) % 13) as u32)
+                .collect()
+        })
+        .collect();
+    let distinct = (0..MROW_MAX as usize)
+        .map(|row| (0..6).map(|column| (row * 6 + column) as u32).collect())
+        .collect();
+    let repeated = vec![(0..6).map(|expert| expert as u32).collect(); MROW_MAX as usize];
+    let mut random_rng = Rng(seed ^ 0xB71D_6E5A_8C29_F043);
+    let random = (0..MROW_MAX as usize)
+        .map(|_| {
+            let mut row = Vec::with_capacity(6);
+            while row.len() < 6 {
+                let expert = (random_rng.next_u64() % pool as u64) as u32;
+                if !row.contains(&expert) {
+                    row.push(expert);
+                }
+            }
+            row
+        })
+        .collect();
+    vec![
+        RoutingFixture {
+            label: "bridge-u13",
+            routing: bridge,
+        },
+        RoutingFixture {
+            label: "distinct-u36",
+            routing: distinct,
+        },
+        RoutingFixture {
+            label: "random",
+            routing: random,
+        },
+        RoutingFixture {
+            label: "repeated-u6",
+            routing: repeated,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_work_wire_layout_is_exactly_48_bytes() {
+        assert_eq!(std::mem::size_of::<PersistentWork>(), 48);
+        assert_eq!(std::mem::align_of::<PersistentWork>(), 16);
+        let record = PersistentWork::new(1, 2, 0.5, 2, true, true, &[9, 11]);
+        let bytes = record.to_bytes();
+        assert_eq!(u64::from_le_bytes(bytes[0..8].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            0.5f32.to_bits()
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            2 | WORK_SHARED | WORK_UP
+        );
+        assert_eq!(record.count(), 2);
+        assert_eq!(record.slots, [9, 11, 9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn parity_fixtures_pin_bridge_distinct_random_and_repeated_shapes() {
+        let fixtures = persistent_fixtures(40, 0xD54);
+        let summary: Vec<_> = fixtures
+            .iter()
+            .map(|fixture| {
+                (
+                    fixture.label,
+                    fixture.routing.len(),
+                    gathered_experts(&fixture.routing).len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("bridge-u13", 6, 13),
+                ("distinct-u36", 6, 36),
+                ("random", 6, gathered_experts(&fixtures[2].routing).len()),
+                ("repeated-u6", 6, 6),
+            ]
+        );
+        for fixture in fixtures {
+            assert!(fixture.routing.iter().all(|row| {
+                row.len() == 6 && row.iter().enumerate().all(|(i, e)| !row[..i].contains(e))
+            }));
+        }
+    }
+
+    #[test]
+    fn four_stripes_cover_gu_once_and_down_twice_per_thread() {
+        let outputs_per_iteration = PERSISTENT_BLOCK as usize * VEC as usize;
+        let stripe_iterations = |n: usize| {
+            assert_eq!(n % 4, 0);
+            let stripe_width = n / 4;
+            assert_eq!(stripe_width % outputs_per_iteration, 0);
+            stripe_width / outputs_per_iteration
+        };
+        assert_eq!(PERSISTENT_TASKS_PER_RECORD, 16);
+        assert_eq!(stripe_iterations(INTER), 1);
+        assert_eq!(stripe_iterations(HIDDEN), 2);
+        assert_eq!(4 * (HIDDEN / 4), HIDDEN);
+    }
 }
 
 /// Buffers one chain writes into. The `_m` chain and the per-row reference get
@@ -319,7 +669,9 @@ fn main() -> Result<()> {
     // different routing.
     let flat: Vec<u32> = routing.iter().flatten().copied().collect();
     let idx_flat = upload(gpu, &u32s(&flat))?;
-    let idx_row: Vec<DevicePtr> = (0..tokens).map(|t| idx_flat.offset(t * top_k * 4)).collect();
+    let idx_row: Vec<DevicePtr> = (0..tokens)
+        .map(|t| idx_flat.offset(t * top_k * 4))
+        .collect();
 
     let rows = tokens * top_k;
     let m_out = Outs::alloc(gpu, rows, tokens)?;
@@ -331,6 +683,9 @@ fn main() -> Result<()> {
     let m_rows = rows + tokens;
     let partial_gu = gpu.alloc(2 * s * m_rows * INTER * 4)?;
     let partial_dn = gpu.alloc(s * m_rows * HIDDEN * 4)?;
+    let persistent_out = Outs::alloc(gpu, rows, tokens)?;
+    let persistent_gu = gpu.alloc(2 * s * m_rows * INTER * 4)?;
+    let persistent_dn = gpu.alloc(s * m_rows * HIDDEN * 4)?;
 
     // ── single-row reference chain (the shipping `_v2s4` path), one row ──
     let ref_chain_stages = |row: usize, o: &Outs, stages: u32, st: u64| -> Result<()> {
@@ -343,88 +698,88 @@ fn main() -> Result<()> {
         let shu = o.sh_up.offset(row * INTER * 2);
         let shd = o.sh_down.offset(row * HIDDEN * 2);
         if stages & 1 != 0 {
-        KernelLaunch::new(
-            gpu,
-            gpu.kernel(MODULE, "moe_expert_gate_up_shared_t_e8m0_v2s4")?,
-        )
-        .grid([INTER as u32 / (block * VEC), top_k as u32 + 1, 2 * SPLIT])
-        .block([block, 1, 1])
-        .arg_ptr(a)
-        .arg_ptr(gate_tbl.packed)
-        .arg_ptr(gate_tbl.scales)
-        .arg_ptr(gate_tbl.s2)
-        .arg_ptr(g_off)
-        .arg_ptr(up_tbl.packed)
-        .arg_ptr(up_tbl.scales)
-        .arg_ptr(up_tbl.s2)
-        .arg_ptr(u_off)
-        .arg_ptr(idx)
-        .arg_ptr(sh_gate_p)
-        .arg_ptr(sh_gate_s)
-        .arg_f32(sh_gate.s2)
-        .arg_ptr(shg)
-        .arg_ptr(sh_up_p)
-        .arg_ptr(sh_up_s)
-        .arg_f32(sh_up.s2)
-        .arg_ptr(shu)
-        .arg_u32(INTER as u32)
-        .arg_u32(HIDDEN as u32)
-        .arg_u32(top_k as u32)
-        .arg_ptr(partial_gu)
-        .launch(st)?;
-        }
-        if stages & 2 != 0 {
-        KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_gate_up_partial_finalize")?)
-            .grid([(INTER as u32).div_ceil(block), top_k as u32 + 1, 2])
+            KernelLaunch::new(
+                gpu,
+                gpu.kernel(MODULE, "moe_expert_gate_up_shared_t_e8m0_v2s4")?,
+            )
+            .grid([INTER as u32 / (block * VEC), top_k as u32 + 1, 2 * SPLIT])
             .block([block, 1, 1])
-            .arg_ptr(partial_gu)
+            .arg_ptr(a)
+            .arg_ptr(gate_tbl.packed)
+            .arg_ptr(gate_tbl.scales)
+            .arg_ptr(gate_tbl.s2)
             .arg_ptr(g_off)
-            .arg_ptr(shg)
+            .arg_ptr(up_tbl.packed)
+            .arg_ptr(up_tbl.scales)
+            .arg_ptr(up_tbl.s2)
             .arg_ptr(u_off)
+            .arg_ptr(idx)
+            .arg_ptr(sh_gate_p)
+            .arg_ptr(sh_gate_s)
+            .arg_f32(sh_gate.s2)
+            .arg_ptr(shg)
+            .arg_ptr(sh_up_p)
+            .arg_ptr(sh_up_s)
+            .arg_f32(sh_up.s2)
             .arg_ptr(shu)
             .arg_u32(INTER as u32)
-            .arg_u32(top_k as u32)
-            .arg_u32(SPLIT)
-            .launch(st)?;
-        }
-        if stages & 4 != 0 {
-        KernelLaunch::new(
-            gpu,
-            gpu.kernel(MODULE, "moe_expert_silu_down_shared_t_e8m0_v2s4")?,
-        )
-        .grid([HIDDEN as u32 / (block * VEC), top_k as u32 + 1, SPLIT])
-        .block([block, 1, 1])
-        .shared_mem(INTER as u32 * 4 / SPLIT)
-        .arg_ptr(g_off)
-        .arg_ptr(u_off)
-        .arg_ptr(down_tbl.packed)
-        .arg_ptr(down_tbl.scales)
-        .arg_ptr(down_tbl.s2)
-        .arg_ptr(d_off)
-        .arg_ptr(idx)
-        .arg_ptr(shg)
-        .arg_ptr(shu)
-        .arg_ptr(sh_down_p)
-        .arg_ptr(sh_down_s)
-        .arg_f32(sh_down.s2)
-        .arg_ptr(shd)
-        .arg_u32(HIDDEN as u32)
-        .arg_u32(INTER as u32)
-        .arg_u32(top_k as u32)
-        .arg_ptr(partial_dn)
-        .launch(st)?;
-        }
-        if stages & 8 != 0 {
-        KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_down_partial_finalize")?)
-            .grid([(HIDDEN as u32).div_ceil(block), top_k as u32 + 1, 1])
-            .block([block, 1, 1])
-            .arg_ptr(partial_dn)
-            .arg_ptr(d_off)
-            .arg_ptr(shd)
             .arg_u32(HIDDEN as u32)
             .arg_u32(top_k as u32)
-            .arg_u32(SPLIT)
+            .arg_ptr(partial_gu)
             .launch(st)?;
+        }
+        if stages & 2 != 0 {
+            KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_gate_up_partial_finalize")?)
+                .grid([(INTER as u32).div_ceil(block), top_k as u32 + 1, 2])
+                .block([block, 1, 1])
+                .arg_ptr(partial_gu)
+                .arg_ptr(g_off)
+                .arg_ptr(shg)
+                .arg_ptr(u_off)
+                .arg_ptr(shu)
+                .arg_u32(INTER as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(SPLIT)
+                .launch(st)?;
+        }
+        if stages & 4 != 0 {
+            KernelLaunch::new(
+                gpu,
+                gpu.kernel(MODULE, "moe_expert_silu_down_shared_t_e8m0_v2s4")?,
+            )
+            .grid([HIDDEN as u32 / (block * VEC), top_k as u32 + 1, SPLIT])
+            .block([block, 1, 1])
+            .shared_mem(INTER as u32 * 4 / SPLIT)
+            .arg_ptr(g_off)
+            .arg_ptr(u_off)
+            .arg_ptr(down_tbl.packed)
+            .arg_ptr(down_tbl.scales)
+            .arg_ptr(down_tbl.s2)
+            .arg_ptr(d_off)
+            .arg_ptr(idx)
+            .arg_ptr(shg)
+            .arg_ptr(shu)
+            .arg_ptr(sh_down_p)
+            .arg_ptr(sh_down_s)
+            .arg_f32(sh_down.s2)
+            .arg_ptr(shd)
+            .arg_u32(HIDDEN as u32)
+            .arg_u32(INTER as u32)
+            .arg_u32(top_k as u32)
+            .arg_ptr(partial_dn)
+            .launch(st)?;
+        }
+        if stages & 8 != 0 {
+            KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_down_partial_finalize")?)
+                .grid([(HIDDEN as u32).div_ceil(block), top_k as u32 + 1, 1])
+                .block([block, 1, 1])
+                .arg_ptr(partial_dn)
+                .arg_ptr(d_off)
+                .arg_ptr(shd)
+                .arg_u32(HIDDEN as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(SPLIT)
+                .launch(st)?;
         }
         Ok(())
     };
@@ -436,105 +791,278 @@ fn main() -> Result<()> {
     // `stages` is a bitmask over {gate_up, gu-finalize, down, dn-finalize} so
     // the timing leg can attribute the win (or the loss) to a single kernel;
     // 0xF is the whole chain and the only setting that leaves valid outputs.
-    let m_chain_stages = |mrow: u32, tokens: u32, o: &Outs, stages: u32, st: u64| -> Result<()> {
-        let gu: KernelHandle = gpu.kernel(
-            MODULE,
-            &format!("moe_expert_gate_up_shared_t_e8m0_m{mrow}v2s4"),
-        )?;
-        let dn: KernelHandle = gpu.kernel(
-            MODULE,
-            &format!("moe_expert_silu_down_shared_t_e8m0_m{mrow}v2s4"),
-        )?;
-        let total_routed = tokens * top_k as u32;
-        let fin_rows = total_routed + tokens;
-        if stages & 1 != 0 {
-        KernelLaunch::new(gpu, gu)
-            .grid([INTER as u32 / (block * VEC), total_routed + 1, 2 * SPLIT])
-            .block([block, 1, 1])
-            .arg_ptr(a_ptr)
-            .arg_ptr(gate_tbl.packed)
-            .arg_ptr(gate_tbl.scales)
-            .arg_ptr(gate_tbl.s2)
-            .arg_ptr(o.gate)
-            .arg_ptr(up_tbl.packed)
-            .arg_ptr(up_tbl.scales)
-            .arg_ptr(up_tbl.s2)
-            .arg_ptr(o.up)
-            .arg_ptr(idx_flat)
-            .arg_ptr(sh_gate_p)
-            .arg_ptr(sh_gate_s)
-            .arg_f32(sh_gate.s2)
-            .arg_ptr(o.sh_gate)
-            .arg_ptr(sh_up_p)
-            .arg_ptr(sh_up_s)
-            .arg_f32(sh_up.s2)
-            .arg_ptr(o.sh_up)
-            .arg_u32(INTER as u32)
-            .arg_u32(HIDDEN as u32)
-            .arg_u32(top_k as u32)
-            .arg_u32(tokens)
-            .arg_ptr(partial_gu)
-            .launch(st)?;
-        }
-        if stages & 2 != 0 {
-        KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_gate_up_partial_finalize_m")?)
-            .grid([(INTER as u32).div_ceil(block), fin_rows, 2])
-            .block([block, 1, 1])
-            .arg_ptr(partial_gu)
-            .arg_ptr(o.gate)
-            .arg_ptr(o.sh_gate)
-            .arg_ptr(o.up)
-            .arg_ptr(o.sh_up)
-            .arg_u32(INTER as u32)
-            .arg_u32(total_routed)
-            .arg_u32(tokens)
-            .arg_u32(SPLIT)
-            .launch(st)?;
-        }
-        if stages & 4 != 0 {
-        KernelLaunch::new(gpu, dn)
-            .grid([HIDDEN as u32 / (block * VEC), total_routed + 1, SPLIT])
-            .block([block, 1, 1])
-            // One s_act k-slice per row the leader may gather: MROW, not
-            // `tokens` — the kernel strides slices by the compile-time MROW.
-            .shared_mem(mrow * INTER as u32 * 4 / SPLIT)
-            .arg_ptr(o.gate)
-            .arg_ptr(o.up)
-            .arg_ptr(down_tbl.packed)
-            .arg_ptr(down_tbl.scales)
-            .arg_ptr(down_tbl.s2)
-            .arg_ptr(o.down)
-            .arg_ptr(idx_flat)
-            .arg_ptr(o.sh_gate)
-            .arg_ptr(o.sh_up)
-            .arg_ptr(sh_down_p)
-            .arg_ptr(sh_down_s)
-            .arg_f32(sh_down.s2)
-            .arg_ptr(o.sh_down)
-            .arg_u32(HIDDEN as u32)
-            .arg_u32(INTER as u32)
-            .arg_u32(top_k as u32)
-            .arg_u32(tokens)
-            .arg_ptr(partial_dn)
-            .launch(st)?;
-        }
-        if stages & 8 != 0 {
-        KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_down_partial_finalize_m")?)
-            .grid([(HIDDEN as u32).div_ceil(block), fin_rows, 1])
-            .block([block, 1, 1])
-            .arg_ptr(partial_dn)
-            .arg_ptr(o.down)
-            .arg_ptr(o.sh_down)
-            .arg_u32(HIDDEN as u32)
-            .arg_u32(total_routed)
-            .arg_u32(tokens)
-            .arg_u32(SPLIT)
-            .launch(st)?;
-        }
-        Ok(())
-    };
+    let m_chain_stages =
+        |mrow: u32, tokens: u32, partition: bool, o: &Outs, stages: u32, st: u64| -> Result<()> {
+            let regular_suffix = if mrow == 1 {
+                "m1"
+            } else if mrow == 2 {
+                "m2"
+            } else {
+                "m6"
+            };
+            let gu_suffixes: Vec<(&str, u32)> = if partition && tokens > 2 {
+                vec![("m1u", 1), ("m6d", MROW_MAX)]
+            } else {
+                vec![(regular_suffix, mrow)]
+            };
+            let dn_suffixes: Vec<(&str, u32)> = if partition && tokens > 2 {
+                vec![("m1u", 1), ("m2c2", 2), ("m4c34", 4), ("m6c56", 6)]
+            } else {
+                vec![(regular_suffix, mrow)]
+            };
+            let gu: Vec<(KernelHandle, u32)> = gu_suffixes
+                .iter()
+                .map(|(suffix, rows)| {
+                    Ok((
+                        gpu.kernel(
+                            MODULE,
+                            &format!("moe_expert_gate_up_shared_t_e8m0_{suffix}v2s4"),
+                        )?,
+                        *rows,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let dn: Vec<(KernelHandle, u32)> = dn_suffixes
+                .iter()
+                .map(|(suffix, rows)| {
+                    Ok((
+                        gpu.kernel(
+                            MODULE,
+                            &format!("moe_expert_silu_down_shared_t_e8m0_{suffix}v2s4"),
+                        )?,
+                        *rows,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+            let total_routed = tokens * top_k as u32;
+            let fin_rows = total_routed + tokens;
+            if stages & 1 != 0 {
+                for &(gu, _) in &gu {
+                    KernelLaunch::new(gpu, gu)
+                        .grid([INTER as u32 / (block * VEC), total_routed + 1, 2 * SPLIT])
+                        .block([block, 1, 1])
+                        .arg_ptr(a_ptr)
+                        .arg_ptr(gate_tbl.packed)
+                        .arg_ptr(gate_tbl.scales)
+                        .arg_ptr(gate_tbl.s2)
+                        .arg_ptr(o.gate)
+                        .arg_ptr(up_tbl.packed)
+                        .arg_ptr(up_tbl.scales)
+                        .arg_ptr(up_tbl.s2)
+                        .arg_ptr(o.up)
+                        .arg_ptr(idx_flat)
+                        .arg_ptr(sh_gate_p)
+                        .arg_ptr(sh_gate_s)
+                        .arg_f32(sh_gate.s2)
+                        .arg_ptr(o.sh_gate)
+                        .arg_ptr(sh_up_p)
+                        .arg_ptr(sh_up_s)
+                        .arg_f32(sh_up.s2)
+                        .arg_ptr(o.sh_up)
+                        .arg_u32(INTER as u32)
+                        .arg_u32(HIDDEN as u32)
+                        .arg_u32(top_k as u32)
+                        .arg_u32(tokens)
+                        .arg_ptr(partial_gu)
+                        .launch(st)?;
+                }
+            }
+            if stages & 2 != 0 {
+                let finalize = if partition {
+                    "moe_gate_up_partial_finalize_m_act"
+                } else {
+                    "moe_gate_up_partial_finalize_m"
+                };
+                let mut launch = KernelLaunch::new(gpu, gpu.kernel(MODULE, finalize)?)
+                    .grid([
+                        (INTER as u32).div_ceil(block),
+                        fin_rows,
+                        if partition { 1 } else { 2 },
+                    ])
+                    .block([block, 1, 1])
+                    .arg_ptr(partial_gu)
+                    .arg_ptr(o.gate)
+                    .arg_ptr(o.sh_gate)
+                    .arg_ptr(o.up)
+                    .arg_ptr(o.sh_up);
+                if partition {
+                    launch = launch.arg_ptr(partial_gu);
+                }
+                launch
+                    .arg_u32(INTER as u32)
+                    .arg_u32(total_routed)
+                    .arg_u32(tokens)
+                    .arg_u32(SPLIT)
+                    .launch(st)?;
+            }
+            if stages & 4 != 0 {
+                for &(dn, arm_mrow) in &dn {
+                    KernelLaunch::new(gpu, dn)
+                        .grid([HIDDEN as u32 / (block * VEC), total_routed + 1, SPLIT])
+                        .block([block, 1, 1])
+                        // One s_act k-slice per row the leader may gather: MROW, not
+                        // `tokens` — the kernel strides slices by the compile-time MROW.
+                        .shared_mem(if partition {
+                            0
+                        } else {
+                            arm_mrow * INTER as u32 * 4 / SPLIT
+                        })
+                        .arg_ptr(o.gate)
+                        .arg_ptr(o.up)
+                        .arg_ptr(partial_gu)
+                        .arg_ptr(down_tbl.packed)
+                        .arg_ptr(down_tbl.scales)
+                        .arg_ptr(down_tbl.s2)
+                        .arg_ptr(o.down)
+                        .arg_ptr(idx_flat)
+                        .arg_ptr(o.sh_gate)
+                        .arg_ptr(o.sh_up)
+                        .arg_ptr(sh_down_p)
+                        .arg_ptr(sh_down_s)
+                        .arg_f32(sh_down.s2)
+                        .arg_ptr(o.sh_down)
+                        .arg_u32(HIDDEN as u32)
+                        .arg_u32(INTER as u32)
+                        .arg_u32(top_k as u32)
+                        .arg_u32(tokens)
+                        .arg_ptr(partial_dn)
+                        .launch(st)?;
+                }
+            }
+            if stages & 8 != 0 {
+                KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_down_partial_finalize_m")?)
+                    .grid([(HIDDEN as u32).div_ceil(block), fin_rows, 1])
+                    .block([block, 1, 1])
+                    .arg_ptr(partial_dn)
+                    .arg_ptr(o.down)
+                    .arg_ptr(o.sh_down)
+                    .arg_u32(HIDDEN as u32)
+                    .arg_u32(total_routed)
+                    .arg_u32(tokens)
+                    .arg_u32(SPLIT)
+                    .launch(st)?;
+            }
+            Ok(())
+        };
     let m_chain = |mrow: u32, tokens: u32, o: &Outs, st: u64| -> Result<()> {
-        m_chain_stages(mrow, tokens, o, 0xF, st)
+        m_chain_stages(mrow, tokens, false, o, 0xF, st)
+    };
+    let p_chain = |mrow: u32, tokens: u32, o: &Outs, st: u64| -> Result<()> {
+        m_chain_stages(mrow, tokens, true, o, 0xF, st)
+    };
+
+    // ── host-prebuilt persistent chain (Stage-0 microtest only) ──
+    let persistent_chain_stages =
+        |work: &PersistentWorkSet, o: &Outs, stages: u32, st: u64| -> Result<()> {
+            let total_routed = (tokens * top_k) as u32;
+            let fin_rows = total_routed + tokens as u32;
+            let bucket_rows = [1u32, 2, 4, 6];
+            if stages & 1 != 0 {
+                for (bucket, rows_cap) in work.gu.iter().zip(bucket_rows) {
+                    let Some(records) = bucket else { continue };
+                    let name = format!("moe_expert_gate_up_t_e8m0_m{rows_cap}_persistent_v2s4");
+                    KernelLaunch::new(gpu, gpu.kernel(MODULE, &name)?)
+                        .grid([records.count * PERSISTENT_TASKS_PER_RECORD, 1, 1])
+                        .block([PERSISTENT_BLOCK, 1, 1])
+                        .arg_ptr(a_ptr)
+                        .arg_ptr(records.ptr)
+                        .arg_u32(records.count)
+                        .arg_ptr(persistent_gu)
+                        .arg_u32(INTER as u32)
+                        .arg_u32(HIDDEN as u32)
+                        .arg_u32(top_k as u32)
+                        .arg_u32(total_routed)
+                        .arg_u32(tokens as u32)
+                        .launch(st)?;
+                }
+                let records = &work.shared_gu;
+                KernelLaunch::new(
+                    gpu,
+                    gpu.kernel(MODULE, "moe_shared_gate_up_t_m6_persistent_v2s4")?,
+                )
+                .grid([records.count * PERSISTENT_TASKS_PER_RECORD, 1, 1])
+                .block([PERSISTENT_BLOCK, 1, 1])
+                .arg_ptr(a_ptr)
+                .arg_ptr(records.ptr)
+                .arg_u32(records.count)
+                .arg_ptr(persistent_gu)
+                .arg_u32(INTER as u32)
+                .arg_u32(HIDDEN as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(total_routed)
+                .arg_u32(tokens as u32)
+                .launch(st)?;
+            }
+            if stages & 2 != 0 {
+                KernelLaunch::new(
+                    gpu,
+                    gpu.kernel(MODULE, "moe_gate_up_partial_finalize_m_act")?,
+                )
+                .grid([(INTER as u32).div_ceil(PERSISTENT_BLOCK), fin_rows, 1])
+                .block([PERSISTENT_BLOCK, 1, 1])
+                .arg_ptr(persistent_gu)
+                .arg_ptr(o.gate)
+                .arg_ptr(o.sh_gate)
+                .arg_ptr(o.up)
+                .arg_ptr(o.sh_up)
+                .arg_ptr(persistent_gu)
+                .arg_u32(INTER as u32)
+                .arg_u32(total_routed)
+                .arg_u32(tokens as u32)
+                .arg_u32(SPLIT)
+                .launch(st)?;
+            }
+            if stages & 4 != 0 {
+                for (bucket, rows_cap) in work.down.iter().zip(bucket_rows) {
+                    let Some(records) = bucket else { continue };
+                    let name = format!("moe_expert_silu_down_t_e8m0_m{rows_cap}_persistent_v2s4");
+                    KernelLaunch::new(gpu, gpu.kernel(MODULE, &name)?)
+                        .grid([records.count * PERSISTENT_TASKS_PER_RECORD, 1, 1])
+                        .block([PERSISTENT_BLOCK, 1, 1])
+                        .arg_ptr(persistent_gu)
+                        .arg_ptr(records.ptr)
+                        .arg_u32(records.count)
+                        .arg_ptr(persistent_dn)
+                        .arg_u32(HIDDEN as u32)
+                        .arg_u32(INTER as u32)
+                        .arg_u32(total_routed)
+                        .arg_u32(tokens as u32)
+                        .launch(st)?;
+                }
+                let records = &work.shared_down;
+                KernelLaunch::new(
+                    gpu,
+                    gpu.kernel(MODULE, "moe_shared_silu_down_t_m6_persistent_v2s4")?,
+                )
+                .grid([records.count * PERSISTENT_TASKS_PER_RECORD, 1, 1])
+                .block([PERSISTENT_BLOCK, 1, 1])
+                .arg_ptr(persistent_gu)
+                .arg_ptr(records.ptr)
+                .arg_u32(records.count)
+                .arg_ptr(persistent_dn)
+                .arg_u32(HIDDEN as u32)
+                .arg_u32(INTER as u32)
+                .arg_u32(total_routed)
+                .arg_u32(tokens as u32)
+                .launch(st)?;
+            }
+            if stages & 8 != 0 {
+                KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_down_partial_finalize_m")?)
+                    .grid([(HIDDEN as u32).div_ceil(PERSISTENT_BLOCK), fin_rows, 1])
+                    .block([PERSISTENT_BLOCK, 1, 1])
+                    .arg_ptr(persistent_dn)
+                    .arg_ptr(o.down)
+                    .arg_ptr(o.sh_down)
+                    .arg_u32(HIDDEN as u32)
+                    .arg_u32(total_routed)
+                    .arg_u32(tokens as u32)
+                    .arg_u32(SPLIT)
+                    .launch(st)?;
+            }
+            Ok(())
+        };
+    let persistent_chain = |work: &PersistentWorkSet, o: &Outs, st: u64| -> Result<()> {
+        persistent_chain_stages(work, o, 0xF, st)
     };
 
     let read = |ptr: DevicePtr, count: usize| -> Result<Vec<u16>> {
@@ -545,6 +1073,24 @@ fn main() -> Result<()> {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect())
     };
+    let read_raw = |ptr: DevicePtr, bytes: usize| -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; bytes];
+        gpu.copy_d2h(ptr, &mut buf)?;
+        Ok(buf)
+    };
+    let require_raw_equal =
+        |case: &str, label: &str, a: DevicePtr, b: DevicePtr, bytes: usize| -> Result<()> {
+            let (lhs, rhs) = (read_raw(a, bytes)?, read_raw(b, bytes)?);
+            if let Some(offset) = lhs.iter().zip(&rhs).position(|(x, y)| x != y) {
+                bail!(
+                    "PERSISTENT PARITY FAILED {case} {label}: byte {offset}/{bytes}, \
+                     control=0x{:02x} candidate=0x{:02x}",
+                    lhs[offset],
+                    rhs[offset]
+                );
+            }
+            Ok(())
+        };
     // Poison every output so an unwritten element cannot fake a match.
     let poison = |o: &Outs| -> Result<()> {
         let junk = |n: usize| -> Vec<u16> {
@@ -558,6 +1104,13 @@ fn main() -> Result<()> {
         gpu.copy_h2d(&u16s(&junk(tokens * INTER)), o.sh_gate)?;
         gpu.copy_h2d(&u16s(&junk(tokens * INTER)), o.sh_up)?;
         gpu.copy_h2d(&u16s(&junk(tokens * HIDDEN)), o.sh_down)?;
+        Ok(())
+    };
+    let poison_partial = |ptr: DevicePtr, words: usize, salt: u32| -> Result<()> {
+        let junk: Vec<f32> = (0..words)
+            .map(|i| f32::from_bits(0x7FC0_0000u32 ^ (i as u32).rotate_left(9) ^ salt))
+            .collect();
+        gpu.copy_h2d(&f32s(&junk), ptr)?;
         Ok(())
     };
 
@@ -602,7 +1155,7 @@ fn main() -> Result<()> {
         ref_chain(r, &ref_out, stream)?;
     }
     poison(&m_out)?;
-    m_chain(mrow, tokens as u32, &m_out, stream)?;
+    p_chain(mrow, tokens as u32, &m_out, stream)?;
     gpu.synchronize(stream)?;
     {
         // bf16 carries 8 mantissa bits; 1/64 is 3 ULP of headroom over the
@@ -637,7 +1190,8 @@ fn main() -> Result<()> {
             bail!("GATE 2 FAILED: worst rel {worst:.5} > {REL_MAX:.5} at {worst_at}");
         }
         println!(
-            "  GATE 2 PASS: _m{mrow}v2s4 == {tokens}x _v2s4, worst rel {worst:.2e} \
+            "  GATE 2 PASS: partitioned gate m1u+m6d / down multiplicity buckets == \
+             {tokens}x _v2s4, worst rel {worst:.2e} \
              (bound {REL_MAX:.2e}){}",
             if exact { ", bit-identical" } else { "" }
         );
@@ -677,6 +1231,176 @@ fn main() -> Result<()> {
         + 2 * shared_b(HIDDEN, INTER)
         + shared_b(INTER, HIDDEN)) as f64;
 
+    // Persistent Stage-0 is deliberately pinned to the production DSpark
+    // bridge shape: six rows, top-6, and enough uploaded experts for the fully
+    // distinct fixture. Other invocations retain the original `_m` oracle.
+    if tokens == MROW_MAX as usize && top_k == 6 && pool >= 36 {
+        println!();
+        println!("=== persistent host-work Stage-0: raw-bit parity + timing ===");
+        let gu_words = 2 * s * m_rows * INTER;
+        let dn_words = s * m_rows * HIDDEN;
+        let shared_records = [
+            (sh_gate_p.0, sh_gate_s.0, sh_gate.s2),
+            (sh_up_p.0, sh_up_s.0, sh_up.s2),
+            (sh_down_p.0, sh_down_s.0, sh_down.s2),
+        ];
+        let mut bridge_go = false;
+        let mut secondary_ok = true;
+        for fixture in persistent_fixtures(pool, seed) {
+            let flat_fixture: Vec<u32> = fixture.routing.iter().flatten().copied().collect();
+            gpu.copy_h2d(&u32s(&flat_fixture), idx_flat)?;
+            let union_count = gathered_experts(&fixture.routing).len();
+            let (leader_gu, leader_down) = make_work(
+                &fixture.routing,
+                tokens,
+                WorkOrder::Leader,
+                &gate_tbl,
+                &up_tbl,
+                &down_tbl,
+                shared_records,
+            );
+            let (pointer_gu, pointer_down) = make_work(
+                &fixture.routing,
+                tokens,
+                WorkOrder::Pointer,
+                &gate_tbl,
+                &up_tbl,
+                &down_tbl,
+                shared_records,
+            );
+            let leader = upload_work_set(gpu, &leader_gu, &leader_down)?;
+            let pointer = upload_work_set(gpu, &pointer_gu, &pointer_down)?;
+
+            poison(&m_out)?;
+            poison_partial(partial_gu, gu_words, 0x1357_0000)?;
+            poison_partial(partial_dn, dn_words, 0x2468_0000)?;
+            p_chain(MROW_MAX, MROW_MAX, &m_out, stream)?;
+            poison(&persistent_out)?;
+            poison_partial(persistent_gu, gu_words, 0x9ABC_0000)?;
+            poison_partial(persistent_dn, dn_words, 0xDEF0_0000)?;
+            persistent_chain(&leader, &persistent_out, stream)?;
+            gpu.synchronize(stream)?;
+            for (label, control, candidate, bytes) in [
+                ("gate", m_out.gate, persistent_out.gate, rows * INTER * 2),
+                ("up", m_out.up, persistent_out.up, rows * INTER * 2),
+                ("down", m_out.down, persistent_out.down, rows * HIDDEN * 2),
+                (
+                    "shared-gate",
+                    m_out.sh_gate,
+                    persistent_out.sh_gate,
+                    tokens * INTER * 2,
+                ),
+                (
+                    "shared-up",
+                    m_out.sh_up,
+                    persistent_out.sh_up,
+                    tokens * INTER * 2,
+                ),
+                (
+                    "shared-down",
+                    m_out.sh_down,
+                    persistent_out.sh_down,
+                    tokens * HIDDEN * 2,
+                ),
+                (
+                    "gate-up-partial+act",
+                    partial_gu,
+                    persistent_gu,
+                    gu_words * 4,
+                ),
+                ("down-partial", partial_dn, persistent_dn, dn_words * 4),
+            ] {
+                require_raw_equal(fixture.label, label, control, candidate, bytes)?;
+            }
+
+            poison(&persistent_out)?;
+            poison_partial(persistent_gu, gu_words, 0x55AA_0000)?;
+            poison_partial(persistent_dn, dn_words, 0xAA55_0000)?;
+            persistent_chain(&pointer, &persistent_out, stream)?;
+            gpu.synchronize(stream)?;
+            for (label, control, candidate, bytes) in [
+                (
+                    "pointer-gate",
+                    m_out.gate,
+                    persistent_out.gate,
+                    rows * INTER * 2,
+                ),
+                ("pointer-up", m_out.up, persistent_out.up, rows * INTER * 2),
+                (
+                    "pointer-down",
+                    m_out.down,
+                    persistent_out.down,
+                    rows * HIDDEN * 2,
+                ),
+                (
+                    "pointer-shared-gate",
+                    m_out.sh_gate,
+                    persistent_out.sh_gate,
+                    tokens * INTER * 2,
+                ),
+                (
+                    "pointer-shared-up",
+                    m_out.sh_up,
+                    persistent_out.sh_up,
+                    tokens * INTER * 2,
+                ),
+                (
+                    "pointer-shared-down",
+                    m_out.sh_down,
+                    persistent_out.sh_down,
+                    tokens * HIDDEN * 2,
+                ),
+                (
+                    "pointer-gate-up-partial+act",
+                    partial_gu,
+                    persistent_gu,
+                    gu_words * 4,
+                ),
+                (
+                    "pointer-down-partial",
+                    partial_dn,
+                    persistent_dn,
+                    dn_words * 4,
+                ),
+            ] {
+                require_raw_equal(fixture.label, label, control, candidate, bytes)?;
+            }
+
+            let t_control = time(&|st| p_chain(MROW_MAX, MROW_MAX, &m_out, st))?;
+            let t_leader = time(&|st| persistent_chain(&leader, &persistent_out, st))?;
+            let t_pointer = time(&|st| persistent_chain(&pointer, &persistent_out, st))?;
+            let best = t_leader.min(t_pointer);
+            let actual_bytes = (union_count
+                * (2 * routed_b(HIDDEN, INTER) + routed_b(INTER, HIDDEN))
+                + 2 * shared_b(HIDDEN, INTER)
+                + shared_b(INTER, HIDDEN)) as f64;
+            let actual_gbs = |elapsed_ms: f64| actual_bytes / (elapsed_ms * 1e-3) / 1e9;
+            println!(
+                "  {:<12} U={union_count:>2}: control {t_control:.4} ms | \
+                 leader {t_leader:.4} ms ({:.1} GB/s) | pointer {t_pointer:.4} ms \
+                 ({:.1} GB/s) | raw-bit PASS",
+                fixture.label,
+                actual_gbs(t_leader),
+                actual_gbs(t_pointer)
+            );
+            if fixture.label == "bridge-u13" {
+                bridge_go = actual_gbs(best) >= 213.0 && best <= 0.883 && best <= t_control * 0.65;
+            }
+            if matches!(fixture.label, "distinct-u36" | "repeated-u6") {
+                secondary_ok &= best <= t_control * 1.03;
+            }
+        }
+        gpu.copy_h2d(&u32s(&flat), idx_flat)?;
+        let persistent_hard_go = bridge_go && secondary_ok;
+        println!(
+            "  PERSISTENT PERFORMANCE GATE: {} (bridge >=213 GB/s, <=0.883 ms, \
+             >=35% faster; distinct/repeated <=3% regression)",
+            if persistent_hard_go { "GO" } else { "NO-GO" }
+        );
+    } else {
+        println!("  persistent Stage-0 skipped: run with [top_k]=6 [tokens]=6 [pool]>=36");
+    }
+
     let t_ref = time(&|st| {
         for r in 0..tokens {
             ref_chain(r, &ref_out, st)?;
@@ -684,6 +1408,7 @@ fn main() -> Result<()> {
         Ok(())
     })?;
     let t_m = time(&|st| m_chain(mrow, tokens as u32, &m_out, st))?;
+    let t_p = time(&|st| p_chain(mrow, tokens as u32, &m_out, st))?;
 
     // The reference reads every row's weights in full; the `_m` chain reads the
     // union, so its effective GB/s is quoted against the SAME nominal byte
@@ -701,6 +1426,12 @@ fn main() -> Result<()> {
         gbs(t_m),
         (t_ref / t_m - 1.0) * 100.0
     );
+    println!(
+        "  partitioned + bucketed down:             {t_p:.4} ms  ({:.0} GB/s nominal)  \
+         [{:+.1}% vs m{mrow}]",
+        gbs(t_p),
+        (t_m / t_p - 1.0) * 100.0
+    );
     // Ceiling: only the union of the rows' experts plus ONE shared expert has to
     // be read; the duplicate picks collapse.
     let union_bytes = (distinct * (2 * routed_b(HIDDEN, INTER) + routed_b(INTER, HIDDEN))
@@ -715,14 +1446,17 @@ fn main() -> Result<()> {
     println!(
         "  verify MoE across {LAYERS:.0} layers: {:.2} ms -> {:.2} ms",
         t_ref * LAYERS,
-        t_m * LAYERS
+        t_p * LAYERS
     );
 
     // Per-stage attribution. The two GEMVs carry all the weight traffic; the
     // finalizes only sum SPLIT float partials. If the dedup win lands on one
     // GEMV and not the other, that GEMV is the one to tune.
     println!();
-    println!("  stage                {:>10} {:>10} {:>9}", "per-row", "dedup", "gain");
+    println!(
+        "  stage                {:>10} {:>10} {:>9}",
+        "per-row", "dedup", "gain"
+    );
     for (label, bit) in [
         ("gate_up GEMV", 1u32),
         ("gate_up finalize", 2),
@@ -735,7 +1469,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         })?;
-        let m = time(&|st| m_chain_stages(mrow, tokens as u32, &m_out, bit, st))?;
+        let m = time(&|st| m_chain_stages(mrow, tokens as u32, true, &m_out, bit, st))?;
         println!(
             "  {label:<20} {r:>8.4} ms {m:>8.4} ms {:>+8.1}%",
             (r / m - 1.0) * 100.0

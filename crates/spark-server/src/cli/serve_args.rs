@@ -86,6 +86,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f64,
 
+    /// Explicit maximum total KV-cache capacity in tokens. The value must be
+    /// block-aligned and large enough for max_seq_len * max_batch_size.
+    /// Unset preserves budget-driven serving/prefix-cache capacity.
+    #[arg(long)]
+    pub kv_cache_cap_tokens: Option<usize>,
+
     /// Maximum concurrent sequences.
     #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,

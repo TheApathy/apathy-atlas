@@ -18,6 +18,8 @@ use super::*;
 /// `init.rs`.
 const T_SPLIT: u32 = 4;
 
+static MOE_MROW_PARTITION_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 impl MoeLayer {
     /// Split factor for this decode call, or `None` to use the non-split
     /// kernels.
@@ -81,7 +83,13 @@ impl MoeLayer {
         inter: u32,
         top_k: u32,
         num_tokens: u32,
-    ) -> Option<(u32, KernelHandle, KernelHandle, u32)> {
+    ) -> Option<(
+        u32,
+        KernelHandle,
+        KernelHandle,
+        u32,
+        Option<SplitkMPartitionHandles>,
+    )> {
         if std::env::var("ATLAS_MOE_SPLITK").as_deref() == Ok("0") {
             return None;
         }
@@ -102,9 +110,17 @@ impl MoeLayer {
         // `num_tokens` would silently drop the rows past it. `splitk_m_t_handles`
         // returns the narrowest compiled entry that covers this row count, or
         // `None` when nothing does.
-        let (gate_up, silu_down, mrow) = self.splitk_m_t_handles(num_tokens)?;
-        if self.moe_gate_up_partial_finalize_m_k.0 == 0
-            || self.moe_down_partial_finalize_m_k.0 == 0
+        let partition_enabled = *MOE_MROW_PARTITION_ENABLED
+            .get_or_init(|| std::env::var("ATLAS_MOE_MROW_PARTITION").as_deref() == Ok("1"));
+        let (gate_up, silu_down, mrow, partition) = if partition_enabled
+            && let Some(handles) = self.splitk_m_t_partition_handles(num_tokens)
+        {
+            (handles.gate_unique, handles.down_unique, 1, Some(handles))
+        } else {
+            let regular = self.splitk_m_t_handles(num_tokens)?;
+            (regular.0, regular.1, regular.2, None)
+        };
+        if self.moe_gate_up_partial_finalize_m_k.0 == 0 || self.moe_down_partial_finalize_m_k.0 == 0
         {
             return None;
         }
@@ -112,7 +128,7 @@ impl MoeLayer {
         if ctx.buffers.moe_splitk_partials_bytes() < need {
             return None;
         }
-        Some((split, gate_up, silu_down, mrow))
+        Some((split, gate_up, silu_down, mrow, partition))
     }
 
     /// True when a 2-row verify would take the MROW=2 dedup'd split-K `_t`
@@ -171,7 +187,7 @@ impl MoeLayer {
         num_tokens: u32,
         stream: u64,
     ) -> Result<bool> {
-        let Some((split, gate_up_k, silu_down_k, mrow)) =
+        let Some((split, gate_up_k, silu_down_k, mrow, partition)) =
             self.unified_t_split_k_m(ctx, h, inter, top_k, num_tokens)
         else {
             return Ok(false);
@@ -189,10 +205,15 @@ impl MoeLayer {
         let down_partials = partials.offset(ops::moe_splitk_m_down_offset(
             split, inter, top_k, num_tokens,
         ));
+        let gate_finalize = if partition.is_some() {
+            self.moe_gate_up_partial_finalize_m_act_k
+        } else {
+            self.moe_gate_up_partial_finalize_m_k
+        };
         ops::moe_expert_gate_up_shared_t_splitk_m(
             ctx.gpu,
             gate_up_k,
-            self.moe_gate_up_partial_finalize_m_k,
+            gate_finalize,
             input,
             gate_t.packed_ptrs,
             gate_t.scale_ptrs,
@@ -208,6 +229,7 @@ impl MoeLayer {
             sh_up_t,
             shared_up_scratch,
             partials,
+            partition.map(|handles| handles.gate_duplicated),
             split,
             inter,
             h,
@@ -230,7 +252,9 @@ impl MoeLayer {
             shared_up_scratch,
             sh_down_t,
             shared_out,
+            partials,
             down_partials,
+            partition.map(|handles| handles.down_buckets),
             split,
             h,
             inter,

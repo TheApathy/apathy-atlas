@@ -79,16 +79,17 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         let q_full = ctx.buffers.qkv_output();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.v4_project_prefill(
+            ctx,
             q_latent,
             &mla.wq_b,
+            mla.wq_b_fp8,
             q_full,
             n,
             nq * hd_mla,
             q_lora,
             stream,
+            "V4 wq_b",
         )?;
         // q_b_norm: per-head unweighted RMSNorm over head_dim (DeepSeek-V4),
         // each of the n*nq head vectors renormalized to unit RMS before rope.
@@ -374,42 +375,23 @@ impl Qwen3AttentionLayer {
         // Per-token×group GEMVs avoid the strided-input limitation of dense_gemm;
         // wo_b stays a single GEMM since o_latent is contiguous [n, latent_dim].
         let o_groups = ctx.config.o_groups.max(1) as u32;
-        let group_in = (nq * hd_mla) / o_groups;
         let latent_dim = o_groups * o_lora;
         let o_latent = ctx.buffers.o_latent();
         let o_out = ctx.buffers.qkv_output();
-        for t in 0..n {
-            for g in 0..o_groups {
-                let in_g = attn_out.offset(((t * nq * hd_mla) + g * group_in) as usize * 2);
-                let w_g = crate::weight_map::DenseWeight {
-                    weight: mla
-                        .wo_a
-                        .weight
-                        .offset((g as usize) * (o_lora as usize) * (group_in as usize) * 2),
-                };
-                let out_g = o_latent.offset(((t * latent_dim) + g * o_lora) as usize * 2);
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    in_g,
-                    &w_g,
-                    out_g,
-                    o_lora,
-                    group_in,
-                    stream,
-                )?;
-            }
-        }
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        self.v4_grouped_wo_a_prefill(
+            ctx, mla, attn_out, o_latent, n, nq, hd_mla, o_groups, o_lora, stream,
+        )?;
+        self.v4_project_prefill(
+            ctx,
             o_latent,
             &mla.wo_b,
+            mla.wo_b_fp8,
             o_out,
             n,
             h,
             latent_dim,
             stream,
+            "V4 wo_b",
         )?;
 
         Ok(o_out)

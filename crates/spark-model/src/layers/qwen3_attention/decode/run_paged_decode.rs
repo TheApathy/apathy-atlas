@@ -50,7 +50,7 @@ impl Qwen3AttentionLayer {
             KvCacheDtype::Nvfp4 if is_v4_flash => {
                 let mla = self.mla.as_ref().unwrap();
                 let kv_cache_dim = (mla.kv_lora_rank + mla.rope) as u32; // 512 + 64 = 576
-                tracing::info!(
+                tracing::trace!(
                     "V4-Flash MLA decode (NVFP4): q_head_dim={}, kv_cache_dim={}",
                     head_dim,
                     kv_cache_dim
@@ -80,7 +80,7 @@ impl Qwen3AttentionLayer {
             KvCacheDtype::Fp8 if is_v4_flash => {
                 let mla = self.mla.as_ref().unwrap();
                 let kv_cache_dim = (mla.kv_lora_rank + mla.rope) as u32; // 512 + 64 = 576
-                tracing::info!(
+                tracing::trace!(
                     "V4-Flash MLA decode (FP8): q_head_dim={}, kv_cache_dim={}",
                     head_dim,
                     kv_cache_dim

@@ -433,11 +433,17 @@ __device__ void mla_paged_decode_fp8_impl(
                 float m_new = fmaxf(my_m, mw);
                 float scale_me = __expf(my_m - m_new);
                 float scale_w = __expf(mw - m_new);
-                smem_l[warp_id] = my_l * scale_me + lw * scale_w;
-                smem_m[warp_id] = m_new;
+                if (lane_id == 0) {
+                    smem_l[warp_id] = my_l * scale_me + lw * scale_w;
+                    smem_m[warp_id] = m_new;
+                }
+                // Each lane owns the same 16 dimensions it accumulated above.
+                // Having every lane update all 512 dimensions repeated this
+                // work 32 times and introduced same-value shared-memory races.
                 #pragma unroll
-                for (int i = 0; i < 512; i++) {
-                    smem_o[warp_id][i] = smem_o[warp_id][i] * scale_me + smem_o[other][i] * scale_w;
+                for (int i = 0; i < VEC_BF16; i++) {
+                    unsigned int dim = lane_id * VEC_BF16 + i;
+                    smem_o[warp_id][dim] = smem_o[warp_id][dim] * scale_me + smem_o[other][dim] * scale_w;
                 }
             }
         }

@@ -180,14 +180,14 @@ pub fn assemble_layer(
     post_attn_norm: DenseWeight,
     wq_a: DenseWeight,
     wq_a_nvfp4: Option<QuantizedWeight>,
-    wq_b: DenseWeight,
+    mut wq_b: DenseWeight,
     wq_b_nvfp4: Option<QuantizedWeight>,
     q_a_norm: DenseWeight,
     wkv_a: DenseWeight,
     wkv_a_nvfp4: Option<QuantizedWeight>,
     wkv_b: DenseWeight,
     kv_a_norm: DenseWeight,
-    o_dense: DenseWeight,
+    mut o_dense: DenseWeight,
     o_nvfp4: Option<QuantizedWeight>,
     w_uk_t: DenseWeight,
     w_uv: DenseWeight,
@@ -196,7 +196,7 @@ pub fn assemble_layer(
     w_uk_block_diag: DenseWeight,
     w_uv_block_diag: DenseWeight,
     yarn_inv_freq: DevicePtr,
-    wo_a: DenseWeight,
+    mut wo_a: DenseWeight,
     hc_head: Option<HcHeadWeights>,
     store: &WeightStore,
     config: &ModelConfig,
@@ -401,6 +401,22 @@ pub fn assemble_layer(
     let wq_b_nvfp4_v4 = nvfp4_of("wq_b", &wq_b);
     let wo_a_nvfp4_v4 = nvfp4_of("wo_a", &wo_a);
     let wo_b_nvfp4_v4 = nvfp4_of("wo_b", &o_dense);
+    let release_bf16 = std::env::var("ATLAS_V4_ATTN_RELEASE_BF16").ok().as_deref() == Some("1");
+    if release_bf16 && !layer_prefix.starts_with("mtp.") {
+        super::attention_residency::release_bf16_projection_mirrors(
+            layer_prefix,
+            config,
+            &mut wq_b,
+            &mut wo_a,
+            &mut o_dense,
+            wq_b_fp8,
+            wo_a_fp8,
+            wo_b_fp8,
+            wq_b_nvfp4_v4.is_some() && wo_a_nvfp4_v4.is_some() && wo_b_nvfp4_v4.is_some(),
+            gpu,
+            qctx.stream,
+        )?;
+    }
 
     let mla = MlaWeights {
         wq_a,

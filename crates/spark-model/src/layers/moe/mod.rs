@@ -22,6 +22,14 @@ use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeigh
 /// silently drops every verify back to the per-row loop.
 pub(crate) const MOE_VERIFY_MAX_ROWS: u32 = spark_runtime::buffers::MOE_DECODE_MAX_ROWS as u32;
 
+#[derive(Clone, Copy)]
+pub(crate) struct SplitkMPartitionHandles {
+    pub(crate) gate_unique: KernelHandle,
+    pub(crate) gate_duplicated: KernelHandle,
+    pub(crate) down_unique: KernelHandle,
+    pub(crate) down_buckets: [(KernelHandle, u32); 3],
+}
+
 /// Device-side pointer table for one projection across all experts.
 ///
 /// Enables GPU-side expert dispatch: the batched GEMV kernel reads
@@ -302,7 +310,24 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_t_m6_k: KernelHandle,
     moe_expert_gate_up_shared_t_e8m0_m6_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_m6_k: KernelHandle,
+    // Wide-verify partitions. Gate/up uses lean MROW=1 for unique groups and
+    // MROW=6 for duplicated groups. Down additionally buckets multiplicity as
+    // 2, 3-4, and 5-6 so each launch reserves only the dynamic shared memory
+    // its accumulator width needs.
+    moe_expert_gate_up_shared_t_m1u_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m1u_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m1u_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m1u_k: KernelHandle,
+    moe_expert_gate_up_shared_t_m6d_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m6d_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m2c2_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m2c2_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m4c34_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m4c34_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m6c56_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m6c56_k: KernelHandle,
     moe_gate_up_partial_finalize_m_k: KernelHandle,
+    moe_gate_up_partial_finalize_m_act_k: KernelHandle,
     moe_down_partial_finalize_m_k: KernelHandle,
     // ── sqrtsoftplus routing (DeepSeek-V4) ──
     moe_topk_sqrtsoftplus_k: KernelHandle,
@@ -663,6 +688,63 @@ impl MoeLayer {
             }
         }
         None
+    }
+
+    /// Partitioned 3--6-row verify kernels. Every arm writes disjoint rows of
+    /// the same partial buffer, selected by the expert group's exact
+    /// multiplicity. The MROW=6 duplicated/count-5--6 arms are correct for
+    /// narrower inputs because their gather loop is capped by `num_tokens`.
+    pub(crate) fn splitk_m_t_partition_handles(
+        &self,
+        num_tokens: u32,
+    ) -> Option<SplitkMPartitionHandles> {
+        if !(3..=MOE_VERIFY_MAX_ROWS).contains(&num_tokens) {
+            return None;
+        }
+        if self.moe_gate_up_partial_finalize_m_act_k.0 == 0 {
+            return None;
+        }
+        let gate_unique = self.e8m0_or_opt(
+            self.moe_expert_gate_up_shared_t_m1u_k,
+            self.moe_expert_gate_up_shared_t_e8m0_m1u_k,
+        )?;
+        let down_unique = self.e8m0_or_opt(
+            self.moe_expert_silu_down_shared_t_m1u_k,
+            self.moe_expert_silu_down_shared_t_e8m0_m1u_k,
+        )?;
+        let gate_duplicated = self.e8m0_or_opt(
+            self.moe_expert_gate_up_shared_t_m6d_k,
+            self.moe_expert_gate_up_shared_t_e8m0_m6d_k,
+        )?;
+        let down_buckets = [
+            (
+                self.e8m0_or_opt(
+                    self.moe_expert_silu_down_shared_t_m2c2_k,
+                    self.moe_expert_silu_down_shared_t_e8m0_m2c2_k,
+                )?,
+                2,
+            ),
+            (
+                self.e8m0_or_opt(
+                    self.moe_expert_silu_down_shared_t_m4c34_k,
+                    self.moe_expert_silu_down_shared_t_e8m0_m4c34_k,
+                )?,
+                4,
+            ),
+            (
+                self.e8m0_or_opt(
+                    self.moe_expert_silu_down_shared_t_m6c56_k,
+                    self.moe_expert_silu_down_shared_t_e8m0_m6c56_k,
+                )?,
+                MOE_VERIFY_MAX_ROWS,
+            ),
+        ];
+        Some(SplitkMPartitionHandles {
+            gate_unique,
+            gate_duplicated,
+            down_unique,
+            down_buckets,
+        })
     }
 
     /// True when the routed experts are W3 Lloyd-Max (3-bit) — every

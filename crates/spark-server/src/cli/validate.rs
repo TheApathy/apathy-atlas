@@ -221,6 +221,22 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         ));
     }
 
+    if let Err(error) = (spark_model::factory::kv_cap::KvCacheCap {
+        block_size: args.block_size,
+        max_seq_len: args.max_seq_len,
+        max_batch_size: args.max_batch_size,
+        cap_tokens: args.kv_cache_cap_tokens,
+        high_speed_swap: args.high_speed_swap,
+    })
+    .validated_blocks()
+    {
+        v.push(Violation::new(
+            error.to_string(),
+            "the explicit KV pool must fit every configured active sequence and map exactly to physical cache blocks.",
+            "use a block-aligned cap at least ceil(max_seq_len/block_size) * max_batch_size * block_size, or drop the cap.",
+        ));
+    }
+
     if v.is_empty() {
         return Ok(());
     }
@@ -332,6 +348,37 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn kv_cache_cap_must_be_block_aligned_and_hold_the_active_batch() {
+        assert!(
+            validate_serve_args(&parse(&[
+                "--max-seq-len",
+                "1024",
+                "--max-batch-size",
+                "1",
+                "--kv-cache-cap-tokens",
+                "1024",
+            ]))
+            .is_ok()
+        );
+        for invalid in ["0", "1023"] {
+            let error =
+                validate_serve_args(&parse(&["--kv-cache-cap-tokens", invalid])).unwrap_err();
+            assert!(error.contains("--kv-cache-cap-tokens"));
+        }
+        let error = validate_serve_args(&parse(&[
+            "--max-seq-len",
+            "1024",
+            "--max-batch-size",
+            "2",
+            "--kv-cache-cap-tokens",
+            "1024",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("128 blocks"));
+        assert!(error.contains("64 blocks"));
     }
 
     #[test]

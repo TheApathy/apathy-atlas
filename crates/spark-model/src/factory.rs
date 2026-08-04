@@ -121,6 +121,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+pub mod kv_cap;
 mod lm_head_setup;
 mod m2_setup;
 
@@ -161,6 +162,7 @@ mod tests {
             KvCacheDtype::Fp8,
             1024 * 1024 * 1024,
             0.90,
+            None,
             0,
             vec![],
             0,
