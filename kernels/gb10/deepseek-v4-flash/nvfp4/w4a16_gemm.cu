@@ -1397,3 +1397,142 @@ void fp8_fp8_gemm_t_m128(
         if (r1 < M && c1 < N) C[r1 * N + c1] = __float2bfloat16(acc1[nt][3]);
     }
 }
+
+// ── Ported verbatim from kernels/gb10/laguna-s-2.1/nvfp4/w4a16_gemm.cu:1706-1836.
+// This model-specific override REPLACES the common w4a16_gemm.cu, so every
+// caller that gates on fp8_gemm_row_scaled_mtile8 (impl_a3::lm_head's
+// serial-mirror path, dflash_head's M=γ tail, the γ-row verify lm_head in
+// model/trait_impl/decode_b2.rs, and dspark_head's block tail) was silently
+// resolving KernelHandle(0) on deepseek-v4-flash and falling back to the
+// per-row GEMV loop. Nothing about the kernel is model-specific.
+// ═══════════════════════════════════════════════════════════════════
+
+#define M8_N_TILE 64
+#define M8_K_STEP 64
+#define M8_STAGES 4
+#define M8_A_STRIDE 72   // 64 + 8 pad elems: 144B rows, 16B-aligned, kills the
+                         // 8-way bank conflict a 128B stride would produce.
+
+__device__ __forceinline__ void cp_async_wait_prior_2() {
+    // Wait until at most 2 commit-groups are pending. With the ring below
+    // there are always exactly 3 outstanding groups before this call, so
+    // this waits precisely for the oldest (the stage about to be computed).
+    asm volatile("cp.async.wait_group 2;");
+}
+
+extern "C" __global__ void fp8_gemm_t_row_scaled_mtile8(
+    const __nv_bfloat16* __restrict__ A,        // [M, K] BF16, M <= 8
+    const unsigned char* __restrict__ B_fp8,    // [N, K] FP8 E4M3
+    const float* __restrict__ row_scale,        // [N] f32
+    __nv_bfloat16* __restrict__ C,              // [M, N] BF16
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * M8_N_TILE;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[M8_STAGES][8][M8_A_STRIDE];
+    __shared__ unsigned char smem_B[M8_STAGES][M8_N_TILE][M8_K_STEP];
+
+    // Per-lane accumulators: 2 n8 tiles per warp. acc[nt][2..3] hold mma
+    // rows 8..15 — dead for M≤8, but the mma writes them regardless.
+    float acc[2][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int num_k = (K + M8_K_STEP - 1) / M8_K_STEP;
+
+    // Stage load: A = 8 rows × 64 cols BF16 (64 × 16B chunks, threads 0..63),
+    // B = 64 rows × 64 B (256 × 16B chunks, 2 per thread). False predicates
+    // zero-fill (cp.async src_bytes=0), so M/N/K edges contribute exact 0.
+    #define M8_LOAD(stage, kb) do { \
+        if (threadIdx.x < 64) { \
+            unsigned int ar = threadIdx.x >> 3; \
+            unsigned int ac = (threadIdx.x & 7) << 3; \
+            unsigned int gc = (kb) + ac; \
+            cp_async_pred_16(&smem_A[(stage)][ar][ac], \
+                &A[(unsigned long long)ar * K + gc], \
+                (ar < M) && (gc + 7 < K)); \
+        } \
+        _Pragma("unroll") \
+        for (int rnd = 0; rnd < 2; rnd++) { \
+            unsigned int ch = (threadIdx.x << 1) + rnd; \
+            unsigned int br = ch >> 2; \
+            unsigned int bo = (ch & 3) << 4; \
+            unsigned int gn = cta_n + br; \
+            unsigned int gk = (kb) + bo; \
+            cp_async_pred_16(&smem_B[(stage)][br][bo], \
+                &B_fp8[(unsigned long long)gn * K + gk], \
+                (gn < N) && (gk + 15 < K)); \
+        } \
+    } while (0)
+
+    // Stage compute: 2 k32 chunks × 2 n8 tiles = 4 MMAs per warp.
+    // A-fragment upper rows (a1, a3 = rows 8..15) are constant zero.
+    #define M8_COMPUTE(stage) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(stage)]; \
+        _Pragma("unroll") \
+        for (int kc = 0; kc < 2; kc++) { \
+            unsigned int kb32 = kc * 32; \
+            unsigned int a0 = bf16x4_to_e4m3x4( \
+                &sA[group_id * M8_A_STRIDE + kb32 + tid * 4]); \
+            unsigned int a2 = bf16x4_to_e4m3x4( \
+                &sA[group_id * M8_A_STRIDE + kb32 + 16 + tid * 4]); \
+            _Pragma("unroll") \
+            for (int nt = 0; nt < 2; nt++) { \
+                unsigned int nc = warp_id * 16 + nt * 8 + group_id; \
+                unsigned int b0 = *(const unsigned int*)&smem_B[(stage)][nc][kb32 + 4 * tid]; \
+                unsigned int b1 = *(const unsigned int*)&smem_B[(stage)][nc][kb32 + 16 + 4 * tid]; \
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    :"=f"(acc[nt][0]),"=f"(acc[nt][1]), \
+                     "=f"(acc[nt][2]),"=f"(acc[nt][3]) \
+                    :"r"(a0),"r"(0u),"r"(a2),"r"(0u), \
+                     "r"(b0),"r"(b1), \
+                     "f"(acc[nt][0]),"f"(acc[nt][1]), \
+                     "f"(acc[nt][2]),"f"(acc[nt][3])); \
+            } \
+        } \
+    } while (0)
+
+    // Prologue: always commit STAGES-1 groups (empty groups are legal), so
+    // the in-loop wait_group 2 invariant holds even when num_k < STAGES-1.
+    #pragma unroll
+    for (unsigned int s = 0; s < M8_STAGES - 1; s++) {
+        if (s < num_k) M8_LOAD(s, s * M8_K_STEP);
+        cp_async_commit();
+    }
+
+    for (unsigned int s = 0; s < num_k; s++) {
+        cp_async_wait_prior_2();   // stage s landed
+        __syncthreads();           // …and is visible to all warps; also all
+                                   // warps are done computing stage s-1, so
+                                   // its buffer (= (s+3)&3) can be reloaded.
+        unsigned int pf = s + M8_STAGES - 1;
+        if (pf < num_k) M8_LOAD(pf & (M8_STAGES - 1), pf * M8_K_STEP);
+        cp_async_commit();         // always commit: keeps 3 groups in flight
+        M8_COMPUTE(s & (M8_STAGES - 1));
+    }
+
+    #undef M8_LOAD
+    #undef M8_COMPUTE
+
+    // Per-column scale multiply + BF16 write-out. Only mma rows 0..7 are
+    // real for M≤8 (acc[nt][2..3] are rows 8..15 — never emitted).
+    #pragma unroll
+    for (int nt = 0; nt < 2; nt++) {
+        unsigned int c0 = cta_n + warp_id * 16 + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = group_id;   // 0..7
+        float sc0 = (c0 < N) ? row_scale[c0] : 0.0f;
+        float sc1 = (c1 < N) ? row_scale[c1] : 0.0f;
+        if (r0 < M && c0 < N) C[r0 * N + c0] = __float2bfloat16(acc[nt][0] * sc0);
+        if (r0 < M && c1 < N) C[r0 * N + c1] = __float2bfloat16(acc[nt][1] * sc1);
+    }
+}
+

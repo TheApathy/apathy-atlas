@@ -58,6 +58,12 @@ pub struct DsparkDraftHead {
     k_gemm: KernelHandle,
     k_gemv: KernelHandle,
     k_gemv_fp8: KernelHandle,
+    /// M≤8 row-scaled FP8 tile. The lm_head tail used to run one GEMV per
+    /// block row, re-streaming the whole `[vocab, h]` FP8 mirror `block`
+    /// times; this does all `block` rows in one pass over the weight.
+    /// `KernelHandle(0)` when the `w4a16` module is absent — the per-row
+    /// GEMV loop is kept as the fallback.
+    k_gemm_smallm: KernelHandle,
     k_rms: KernelHandle, // rms_norm_vanilla — HF-exact weights
     k_residual_add: KernelHandle,
     k_hc_expand: KernelHandle,
@@ -192,6 +198,11 @@ impl DsparkDraftHead {
             k_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             k_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             k_gemv_fp8: gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?,
+            k_gemm_smallm: crate::layers::try_kernel(
+                gpu,
+                "w4a16",
+                "fp8_gemm_t_row_scaled_mtile8",
+            ),
             k_rms: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             k_residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             k_hc_expand: gpu.kernel("hyper_connection", "hc_expand")?,
@@ -746,22 +757,66 @@ impl DsparkDraftHead {
             stream,
         )?;
         self.dbg(gpu, "f5.r0", self.f5, hu, stream);
-        for r in 0..b as usize {
-            let row_in = self.f5.offset(r * hu * 2);
-            let row_out = self.logits5.offset(r * self.vocab as usize * 2);
-            if let Some(ref fp8) = self.lm_head_fp8 {
-                ops::dense_gemv_fp8w(
-                    gpu,
-                    self.k_gemv_fp8,
-                    row_in,
-                    fp8,
-                    row_out,
-                    self.vocab,
+        // `f5` is `[b, h]` and `logits5` is `[b, vocab]`, both contiguous, so
+        // the M≤8 tile can take all b rows in one pass over the FP8 mirror
+        // instead of streaming `[vocab, h]` once per row. The tile's f32
+        // accumulation order differs from the GEMV's, so the drafted tokens
+        // can differ in the rare near-tie; served text does not, because
+        // verify only accepts a draft that matches the target's own argmax.
+        let lmhead_batched = self.k_gemm_smallm.0 != 0
+            && b <= 8
+            && h.is_multiple_of(32)
+            && {
+                static LB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *LB.get_or_init(|| {
+                    std::env::var("ATLAS_DSPARK_LMHEAD_BATCH").as_deref() != Ok("0")
+                })
+            };
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    "DSpark lm_head: batched={} (kernel={:#x} b={} h={} fp8={} bf16={})",
+                    lmhead_batched && self.lm_head_fp8.is_some(),
+                    self.k_gemm_smallm.0,
+                    b,
                     h,
-                    stream,
-                )?;
-            } else if let Some(ref bf) = self.lm_head_bf16 {
-                ops::dense_gemv(gpu, self.k_gemv, row_in, bf, row_out, self.vocab, h, stream)?;
+                    self.lm_head_fp8.is_some(),
+                    self.lm_head_bf16.is_some(),
+                );
+            });
+        }
+        match (&self.lm_head_fp8, lmhead_batched) {
+            (Some(fp8), true) => ops::fp8_gemm_row_scaled_smallm(
+                gpu,
+                self.k_gemm_smallm,
+                self.f5,
+                fp8,
+                self.logits5,
+                b,
+                self.vocab,
+                h,
+                stream,
+            )?,
+            _ => {
+                for r in 0..b as usize {
+                    let row_in = self.f5.offset(r * hu * 2);
+                    let row_out = self.logits5.offset(r * self.vocab as usize * 2);
+                    if let Some(ref fp8) = self.lm_head_fp8 {
+                        ops::dense_gemv_fp8w(
+                            gpu,
+                            self.k_gemv_fp8,
+                            row_in,
+                            fp8,
+                            row_out,
+                            self.vocab,
+                            h,
+                            stream,
+                        )?;
+                    } else if let Some(ref bf) = self.lm_head_bf16 {
+                        ops::dense_gemv(gpu, self.k_gemv, row_in, bf, row_out, self.vocab, h, stream)?;
+                    }
+                }
             }
         }
 
