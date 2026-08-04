@@ -99,7 +99,63 @@ throughput and keeps MTP on.
 competitive on the third, and the prose loss is bounded at −10%. Switch to γ=4 if
 the workload is known to be code.
 
-## Why raw γ=6 loses — the step budget
+## Verify attribution, re-measured after the batching work
+
+The attribution below the fold ("attention 46.7 ms = 33% of verify") is
+**stale and was the basis for two wrong priorities.** Re-measured on
+`389d8b2b` + `ATLAS_MOE_T_BLOCK=128` with `ATLAS_PROFILE=1`
+`ATLAS_DFLASH_DEBUG_NO_GRAPH=1`, 774 layer-samples per phase:
+
+| MLA phase | µs/layer | ×43 layers | what it is |
+|-----------|----------|-----------|------------|
+| A_proj  | 215.2 | 9.3 ms | batched Q + KV projections |
+| B_attn  | **81.2** | **3.5 ms** | rope + cache write + paged attention |
+| C_oproj | 303.3 | 13.0 ms | output projection (o_lora_rank=1024, o_groups=8) |
+| **MLA total** | 599.7 | **25.8 ms** | |
+
+Phase B was **467 µs/layer** before this session's two commits. It is now
+81 µs — a **5.7× collapse** — because the whole rope/cache chain runs once for
+all γ rows (`decode/rows_rope_cache.rs`) and the paged attention now runs as a
+single `num_seqs=γ` launch instead of γ launches.
+
+Three consequences, all of which redirect effort:
+
+* **Attention is no longer a lever.** The actual attention kernel is 3.5 ms of
+  a 140 ms verify — 2.5%. Task #29 (head-tile the paged decode so 64 Q heads
+  stop re-reading KV) is now worth at most a couple of ms and should be
+  deprioritised.
+* **`C_oproj` is now 3.7× `B_attn`.** The output projection is the largest
+  single piece of MLA and has never been looked at.
+* **MoE is ~114 ms of the 140.5 ms verify (81%)**, not the 77.4 ms the stale
+  table claimed. At ~10.4 GB of expert weights per step (18.1 unique experts ×
+  3 matrices × 8.389 M params × ~0.53 B/param × 43 layers) that is **~99 GB/s**,
+  against the m=1 plain-decode path's 154 GB/s on the same weights. Closing
+  *that* ratio is the whole remaining story.
+
+### Session deltas (all bit-exact, γ=6, `ATLAS_DFLASH_STEP_TIMING=1`)
+
+| change | verify | Δ |
+|--------|--------|---|
+| baseline (per-row phase B) | 151.0 ms | — |
+| + batched rope/cache write (`559bcb9d`) | 145.1 ms | −5.9 |
+| + `num_seqs=γ` paged attention (`389d8b2b`) | 143.2 ms | −1.9 |
+| + `ATLAS_MOE_T_BLOCK=128` | **140.5 ms** | −2.7 |
+| (`ATLAS_MOE_T_BLOCK=256`) | 140.8 ms | saturated |
+
+**−10.5 ms total (−7.0%).** Every leg was verified with the four-workload
+sha256 probe: 8/8 exact text matches per leg against the baseline, two passes
+each. Nothing here trades accuracy for speed.
+
+`T_BLOCK` works because `fp8_moe.rs:565-568` sizes shared memory as
+`arm_mrow * k * 4 / split` — **independent of `t_block`**. The MROW_PARTITION
+duplicated arm (`arm_mrow=6, k=4096, split=4`) therefore burns 24 KB/block and
+caps residency at ~9 blocks/SM; at the default `T_BLOCK=64` that is only 18
+warps, far too few to hide the load latency the kernel is documented to stall
+on. Doubling `t_block` doubles warps per block at identical shared memory. It
+saturates at 128, which says occupancy was a real but secondary constraint —
+the m=6 GEMV does not become bandwidth-bound just by adding warps.
+
+## Why raw γ=6 loses — the step budget (stale attribution below)
 
 `ATLAS_DFLASH_STEP_TIMING=1` / `ATLAS_STEP_TIMING2=1`, 64-step means:
 
