@@ -66,12 +66,22 @@ impl Qwen3AttentionLayer {
     ///
     /// Mirrors `attention_forward_v4` steps 3/3.5/4 argument for argument; the
     /// only difference is `n` in place of the literal `1`.
+    ///
+    /// `tree` arms the DDTree split cache write: `Some((spine_rows, reseed))`
+    /// writes rows `[0, spine_rows)` (bonus + spine → canonical blocks), then
+    /// re-seeds this layer's branch scratch blocks from canonical, then writes
+    /// rows `[spine_rows, n)` (branch rows → scratch). Only the *cache write*
+    /// splits: rope and assemble stay single-launch over all `n` rows because
+    /// they touch the batch scratch buffers only, never the paged cache. `None`
+    /// is the flat verify — one write over all `n` rows, bit-identical to the
+    /// pre-DDTree code.
     pub(in crate::layers::qwen3_attention) fn mla_rows_rope_and_cache(
         &self,
         kv_cache: &mut PagedKvCache,
         ctx: &ForwardContext,
         meta: &AttnMetadataDev,
         args: &RowsRopeArgs,
+        tree: Option<(usize, &crate::layer::TreeReseed<'_>)>,
     ) -> Result<()> {
         let RowsRopeArgs {
             q_batch,
@@ -202,13 +212,82 @@ impl Qwen3AttentionLayer {
         // meta.slot holds n slots; each row lands in its own slot, so the n
         // writes are independent and the ordering the per-row loop used to
         // provide is not needed (see the causality note at the top of the file).
-        self.write_kv_cache(
-            ctx.gpu,
+        let Some((spine_rows, reseed)) = tree else {
+            return self.mla_rows_cache_write_range(
+                ctx,
+                kv_cache,
+                meta,
+                k_cache_assembled,
+                v_cache_assembled,
+                mla_cache_dim,
+                bs,
+                0,
+                n,
+                stream,
+            );
+        };
+        // DDTree: spine → re-seed → branch. All three are queued on the one
+        // stream, so the ordering is exactly the intra-step ancestor
+        // visibility the tree accept walk assumes.
+        let spine_rows = (spine_rows as u32).min(n);
+        self.mla_rows_cache_write_range(
+            ctx,
+            kv_cache,
+            meta,
             k_cache_assembled,
             v_cache_assembled,
+            mla_cache_dim,
+            bs,
+            0,
+            spine_rows,
+            stream,
+        )?;
+        self.tree_reseed_blocks(ctx, kv_cache, reseed, stream)?;
+        self.mla_rows_cache_write_range(
+            ctx,
             kv_cache,
-            meta.slot,
+            meta,
+            k_cache_assembled,
+            v_cache_assembled,
+            mla_cache_dim,
+            bs,
+            spine_rows,
             n,
+            stream,
+        )
+    }
+
+    /// Paged cache write for the assembled row range `[lo, hi)`.
+    ///
+    /// The assembled `[n, mla_cache_dim]` entries and the `[n]` i64 slot array
+    /// are both row-contiguous, so a range is just a base offset plus a row
+    /// count — `lo == 0 && hi == n` is launch-for-launch identical to the
+    /// single whole-batch write it replaces.
+    #[allow(clippy::too_many_arguments)]
+    fn mla_rows_cache_write_range(
+        &self,
+        ctx: &ForwardContext,
+        kv_cache: &PagedKvCache,
+        meta: &AttnMetadataDev,
+        k_assembled: DevicePtr,
+        v_assembled: DevicePtr,
+        mla_cache_dim: u32,
+        bs: u32,
+        lo: u32,
+        hi: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if hi <= lo {
+            return Ok(());
+        }
+        let off = lo as usize * mla_cache_dim as usize * 2;
+        self.write_kv_cache(
+            ctx.gpu,
+            k_assembled.offset(off),
+            v_assembled.offset(off),
+            kv_cache,
+            meta.slot.offset(lo as usize * 8),
+            hi - lo,
             1,
             mla_cache_dim,
             bs,

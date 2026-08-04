@@ -97,6 +97,64 @@ impl Qwen3AttentionLayer {
         None
     }
 
+    /// Whether the V4-Flash batched attention pipeline will fire for `c.n`
+    /// rows, and how many scratch bytes it needs from `expert_up_out`.
+    ///
+    /// Single source of truth for `batch_ok`: `ms_mla_decode_v4_flash` asks it
+    /// to pick its route, and `decode_multi_seq_tree_inner` asks it BEFORE
+    /// launching anything so it can honour the trait's "`Ok(false)` means no
+    /// work queued" contract.
+    fn ms_mla_v4_batch_ok(&self, c: &MultiSeqCtx<'_>) -> (bool, usize) {
+        let Some(mla) = self.mla.as_ref() else {
+            return (false, 0);
+        };
+        let n = c.n;
+        let q_dim = c.nq * c.hd;
+        let kv_dim = c.nkv * c.hd;
+        let q_lora = mla.q_lora_rank as u32;
+        let o_groups = c.fwd.config.o_groups.max(1) as u32;
+        let latent_dim = o_groups * mla.o_lora_rank as u32;
+        let row = |elems: u32| n * elems as usize * c.bf16;
+        let need = row(q_dim) * 2 + row(kv_dim) * 2 + row(q_lora) + row(latent_dim);
+        // ATLAS_MLA_NO_BATCH=1: force the per-row fallback, for A/B testing
+        // whether the batched-GEMV projections perturb verify argmax vs the
+        // single-row decode path (greedy-losslessness check).
+        let no_batch = {
+            static NB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *NB.get_or_init(|| std::env::var("ATLAS_MLA_NO_BATCH").as_deref() == Ok("1"))
+        };
+        let ok = !no_batch
+            && n >= 2
+            && self.batch_gemv_for(n).is_some()
+            && mla.wq_a_fp8.is_some()
+            && mla.wq_b_fp8.is_some()
+            && mla.wkv_a_fp8.is_some()
+            && mla.wo_a_fp8.is_some()
+            && mla.wo_b_fp8.is_some()
+            && c.fwd.buffers.expert_up_out_bytes() >= need;
+        (ok, need)
+    }
+
+    /// Whether this layer can serve a DDTree tree-verify row batch.
+    ///
+    /// The split cache write lives in `mla_rows_rope_and_cache`, which only
+    /// runs on the V4-Flash batched route with `ATLAS_MLA_ROWS_BATCH` left on.
+    /// Every other route (legacy per-row `attention_forward_v4`, the
+    /// `rows_batched=0` A/B leg) writes the cache through paths that cannot be
+    /// range-split, so the caller must take the per-row sequential fallback.
+    pub(super) fn ms_mla_v4_tree_capable(&self, c: &MultiSeqCtx<'_>) -> bool {
+        self.mla.as_ref().is_some_and(|m| m.o_lora_rank > 0)
+            && Self::ms_mla_rows_batched()
+            && self.ms_mla_v4_batch_ok(c).0
+    }
+
+    /// `ATLAS_MLA_ROWS_BATCH` (default on): batched rope + cache write for all
+    /// verify rows, vs the per-row `attention_forward_v4` chain.
+    fn ms_mla_rows_batched() -> bool {
+        static RB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *RB.get_or_init(|| std::env::var("ATLAS_MLA_ROWS_BATCH").as_deref() != Ok("0"))
+    }
+
     /// Batched MLA decode for `c.n` sequences. Writes each sequence's
     /// O-projection output into `moe_output[i*h .. (i+1)*h]` and returns
     /// the `moe_output` base pointer for `ms_phase_ffn`.
@@ -285,24 +343,8 @@ impl Qwen3AttentionLayer {
         // attention within the layer, so it is idle here; same precedent as
         // the compressor ring in `attention_forward_v4`).
         let row = |elems: u32| n * elems as usize * bf16;
-        let need = row(q_dim) * 2 + row(kv_dim) * 2 + row(q_lora) + row(latent_dim);
         let gemv = self.batch_gemv_for(n);
-        // ATLAS_MLA_NO_BATCH=1: force the per-row fallback, for A/B testing
-        // whether the batched-GEMV projections perturb verify argmax vs the
-        // single-row decode path (greedy-losslessness check).
-        let no_batch = {
-            static NB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *NB.get_or_init(|| std::env::var("ATLAS_MLA_NO_BATCH").as_deref() == Ok("1"))
-        };
-        let batch_ok = !no_batch
-            && n >= 2
-            && gemv.is_some()
-            && mla.wq_a_fp8.is_some()
-            && mla.wq_b_fp8.is_some()
-            && mla.wkv_a_fp8.is_some()
-            && mla.wo_a_fp8.is_some()
-            && mla.wo_b_fp8.is_some()
-            && c.fwd.buffers.expert_up_out_bytes() >= need;
+        let (batch_ok, need) = self.ms_mla_v4_batch_ok(c);
 
         {
             static ROUTE_ONCE: std::sync::Once = std::sync::Once::new();
@@ -321,6 +363,20 @@ impl Qwen3AttentionLayer {
                 );
             });
         }
+        // The DDTree split cache write exists only on the batched rope/cache
+        // route below. `decode_multi_seq_tree_inner` gates on exactly the same
+        // predicate, so this is unreachable — it exists so a future route
+        // change surfaces as a loud error instead of a silently flat verify
+        // whose branch rows read unseeded scratch blocks.
+        if c.tree.is_some() && !self.ms_mla_v4_tree_capable(c) {
+            anyhow::bail!(
+                "V4-msdecode L{}: tree split armed but the batched rope/cache route is unavailable \
+                 (n={n} batch_ok={batch_ok} rows_batch={})",
+                self.attn_layer_idx,
+                Self::ms_mla_rows_batched(),
+            );
+        }
+
         if !batch_ok {
             // Legacy per-row loop: full `attention_forward_v4` per token, O
             // row copied out of the shared `qkv_output` before reuse.
@@ -506,10 +562,7 @@ impl Qwen3AttentionLayer {
         // stride; it is now launched once at num_seqs=n too.
         //
         // ATLAS_MLA_ROWS_BATCH=0 restores the per-row chain for A/B.
-        let rows_batched = {
-            static RB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *RB.get_or_init(|| std::env::var("ATLAS_MLA_ROWS_BATCH").as_deref() != Ok("0"))
-        };
+        let rows_batched = Self::ms_mla_rows_batched();
         if rows_batched {
             let rargs = super::super::super::decode::rows_rope_cache::RowsRopeArgs {
                 q_batch,
@@ -524,7 +577,16 @@ impl Qwen3AttentionLayer {
                 bs: bs as u32,
                 stream,
             };
-            self.mla_rows_rope_and_cache(kv_cache, c.fwd, meta, &rargs)?;
+            // DDTree: `c.tree` splits the cache write into
+            // spine → branch-scratch re-seed → branch. `None` on every flat
+            // path, where this stays the single whole-batch write.
+            self.mla_rows_rope_and_cache(
+                kv_cache,
+                c.fwd,
+                meta,
+                &rargs,
+                c.tree.map(|t| (t.spine_rows, t.reseed)),
+            )?;
             let inv_sqrt_d = self.effective_attn_scale(hd);
             // One launch for all n rows. `mla_paged_decode_fp8` now strides Q/O
             // by `seq_idx * nq * q_head_dim`, and it already indexed

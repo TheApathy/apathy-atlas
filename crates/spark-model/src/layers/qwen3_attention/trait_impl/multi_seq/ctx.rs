@@ -5,8 +5,22 @@
 
 use spark_runtime::gpu::DevicePtr;
 
-use crate::layer::ForwardContext;
+use crate::layer::{ForwardContext, TreeReseed};
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
+
+/// DDTree: the split-cache-write instruction for a batched tree-verify
+/// forward. Rows `[0, spine_rows)` are the bonus + spine and write their K/V
+/// into canonical blocks; rows `[spine_rows, n)` are branch rows and write
+/// into scratch blocks, after `reseed` has copied this layer's canonical
+/// blocks into that scratch.
+///
+/// `None` (the default) means the ordinary flat verify: one cache write over
+/// all `n` rows, no re-seed — bit-identical to the pre-DDTree path.
+#[derive(Clone, Copy)]
+pub(super) struct TreeSplit<'a> {
+    pub spine_rows: usize,
+    pub reseed: &'a TreeReseed<'a>,
+}
 
 /// Shared scalars / buffer pointers for `super::decode_multi_seq_inner`.
 /// Built once in the orchestrator, then handed to each phase by `&self`.
@@ -54,6 +68,10 @@ pub(super) struct MultiSeqCtx<'a> {
     /// [`Qwen3AttentionLayer::ms_fused_epilogue_eligible`] holds; defaults to
     /// false so the tree-verify and mHC paths are untouched.
     pub fused_qk_epilogue: bool,
+    /// DDTree split cache write, armed ONLY by
+    /// [`Qwen3AttentionLayer::decode_multi_seq_tree_inner`]. Every other
+    /// entry point leaves it `None`, so the flat verify is untouched.
+    pub tree: Option<TreeSplit<'a>>,
 }
 
 impl<'a> MultiSeqCtx<'a> {
@@ -103,6 +121,7 @@ impl<'a> MultiSeqCtx<'a> {
             qkv_buf,
             seq_slot: DevicePtr(0),
             fused_qk_epilogue: false,
+            tree: None,
         }
     }
 }

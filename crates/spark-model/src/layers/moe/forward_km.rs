@@ -39,6 +39,24 @@ impl MoeLayer {
     ) -> Result<bool> {
         let n = num_tokens as u32;
         if n < 2 || n > MOE_VERIFY_MAX_ROWS {
+            // The width cap is a THROUGHPUT CLIFF, not a mere fallback: past
+            // `MOE_VERIFY_MAX_ROWS` every row re-streams the whole routed
+            // expert set. Measured on DeepSeek-V4-Flash / GB10, verify goes
+            // 124.8 ms at 6 rows → 288.8 ms at 8 rows (~82 ms marginal per
+            // row, vs ~16 ms/row inside the cap). Any widening of the drafter
+            // (γ > 5) or of the tree (K_t > 6) silently loses far more than it
+            // gains until the `_m` kernels are widened, so say so once.
+            if n > MOE_VERIFY_MAX_ROWS {
+                static WIDE_ONCE: std::sync::Once = std::sync::Once::new();
+                WIDE_ONCE.call_once(|| {
+                    tracing::warn!(
+                        "MoE dedup verify declined: n={n} > MOE_VERIFY_MAX_ROWS={MOE_VERIFY_MAX_ROWS} \
+                         — falling back to per-row forward_batched, which re-streams every routed \
+                         expert once PER ROW (~82ms/row on GB10). Widen the `_m` kernels before \
+                         raising the draft width."
+                    );
+                });
+            }
             return Ok(false);
         }
         // The `_m` kernels read the transposed expert tables and compute the
