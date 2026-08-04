@@ -433,6 +433,19 @@ impl TransformerModel {
             } else {
                 self.try_dflash_capture(layer_idx, k - 1, stream)?;
             }
+            // DSpark capture: the FLAT frame's k rows at their sequence
+            // positions, exactly as verify_d.rs does it. Omitting this was the
+            // tree's accept collapse (0.50 vs the flat path's 1.33 tok/step):
+            // the DSpark drafter seeds its ring from `dspark_dump_buf` at
+            // `base..base+k`, and a tree step that never writes those rows
+            // leaves the next propose reading whatever the last flat step (or
+            // prefill) left there. Every step builds a payload under
+            // TREE_DEGEN, so the ring went stale immediately and the drafts
+            // were near-garbage from the first tree step on. Rows past k are
+            // branch rows — they live at DUPLICATE depths, so writing them
+            // here would clobber the spine's hiddens at the same positions.
+            // `base`, not `seq.seq_len`: the tail below advances seq_len by k.
+            self.try_dspark_capture(layer_idx, k, base, false, stream)?;
         }
 
         // Final norm over ALL K_t rows.

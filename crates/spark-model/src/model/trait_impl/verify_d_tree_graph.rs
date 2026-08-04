@@ -377,6 +377,13 @@ impl TransformerModel {
                 } else {
                     self.try_dflash_capture(layer_idx, k - 1, stream)?;
                 }
+                // DSpark capture, staged: a `base`-indexed destination would be
+                // baked into the replay and pin the drafter to the first
+                // captured step's hiddens. `dspark_capture_commit` below
+                // relocates row 0 to `base` after the launch. Same k-row flat
+                // frame as the eager tree path and verify_d.rs — see the note
+                // there on why omitting it collapses acceptance.
+                self.try_dspark_capture(layer_idx, k, base, true, stream)?;
             }
 
             // Final norm over ALL K_t rows.
@@ -428,6 +435,12 @@ impl TransformerModel {
             // the work eagerly during "capture" — results are valid, no
             // caching (mirrors verify_d.rs).
         }
+
+        // Relocate the staged DSpark hc-mean capture to this step's sequence
+        // positions. Enqueued behind the graph launch on the same stream, so it
+        // sees the graph's writes with a freshly-computed `base` (verify_d.rs
+        // does the identical d2d after its own launch).
+        self.dspark_capture_commit(k, base, stream)?;
 
         // ── Post-graph: D2H + flat bookkeeping (identical to eager tail).
         let argmax_out = self.buffers.scratch();
