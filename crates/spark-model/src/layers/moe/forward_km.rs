@@ -105,6 +105,15 @@ impl MoeLayer {
         macro_rules! prof {
             ($label:expr, $body:expr) => {{
                 if profile {
+                    // Drain FIRST. Without this the timer starts while earlier
+                    // launches are still in flight, and the trailing sync bills
+                    // this stage for all of them. "gate" — the first prof! here,
+                    // and preceded by `router_input` plus whatever the layer's
+                    // attention left queued — read 221 μs/layer against a
+                    // kernel-only 92 μs measured at the identical shape by
+                    // `dense_gemm_microtest dense_gemm_bf16 6 256 4096`. Every
+                    // stage below inherited the same skew.
+                    ctx.gpu.synchronize(stream)?;
                     let t = std::time::Instant::now();
                     let r = $body;
                     ctx.gpu.synchronize(stream)?;
@@ -120,8 +129,49 @@ impl MoeLayer {
         //    [num_tokens*top_k] indices/weights instead of one row's worth.
         let router_in = self.router_input(input, n, h, ctx, stream)?;
         let gate_logits = ctx.buffers.gate_logits(); // [n, num_experts] BF16
+        // Router-gate GEMV (ATLAS_MOE_GATE_GEMV), the `forward_kn` lever applied
+        // to the wide verify. `dense_gemm_bf16` tiles 64 N-cols × 64 M-rows, so
+        // the gate's `[n, 4096] × [4096, 256]` launches `ceil(256/64) = 4` blocks
+        // on a 48-SM part and idles 58 of every 64 M-lanes at n=6.
+        // `dense_gemv_bf16_batchm` parallelises over N instead (64 blocks) and
+        // carries M in registers: 0.0922 → 0.0144 ms kernel-only at this exact
+        // shape (`dense_gemm_microtest dense_gemv_bf16_batchm 6 256 4096`),
+        // 6.4× ⇒ ~3.3 ms/step across 43 layers.
+        //
+        // Default OFF, and MEASURED not worth promoting. In-server γ=6 A/B:
+        // gate 143 → 24 μs/layer (6.16 → 1.03 ms/step), verify 125.6 → 121.5 ms,
+        // step 151.0 → 146.8 ms — but 3 of 4 probe outputs changed hash and mean
+        // accepted slipped 1.22 → 1.17, so end-to-end was a wash (14.7 → 14.8
+        // implied tok/s). It is NOT bit-exact for the same reason `forward_kn`
+        // flags: 4 of 5 seeds are exact at M=6/N=256/K=4096, but 0xFACE drifts
+        // 7.6e-3 max_rel, and near-tied logits decide the top-6 on the 40
+        // non-hash layers (the 3 hash layers select from `tid2eid`, so only their
+        // score weighting moves). Kept behind the flag because the shape lesson
+        // generalises, not because this shaves tok/s — at 6 ms/step the whole
+        // gate is too small to matter next to `exp_splitk_m_t`'s 74 ms.
+        let gate_gemv = Self::moe_gate_gemv()
+            && self.dense_gemv_batchm.0 != 0
+            && n <= ops::DENSE_GEMV_BATCHM_MAX_M
+            && self.gate_nvfp4.is_none();
         prof!("gate", {
-            if let Some(ref nvfp4) = self.gate_nvfp4 {
+            if gate_gemv {
+                // router_in [n, h] and gate_logits [n, num_experts] are both
+                // densely packed here, so the strides are exactly h and
+                // num_experts.
+                ops::dense_gemv_batchm(
+                    ctx.gpu,
+                    self.dense_gemv_batchm,
+                    router_in,
+                    &self.weights.gate,
+                    gate_logits,
+                    n,
+                    num_experts,
+                    h,
+                    h,
+                    num_experts,
+                    stream,
+                )
+            } else if let Some(ref nvfp4) = self.gate_nvfp4 {
                 ops::w4a16_gemm(
                     ctx.gpu,
                     self.w4a16_gemm,
