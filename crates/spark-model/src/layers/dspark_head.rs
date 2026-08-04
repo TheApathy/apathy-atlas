@@ -71,6 +71,10 @@ pub struct DsparkDraftHead {
     k_hc_post: KernelHandle,
     k_hc_head: KernelHandle,
     k_argmax: KernelHandle,
+    /// Device-indexed row gather (`token_ids[i] → table[token_ids[i], :]`).
+    /// Lets the Markov chain read `markov_w1[prev]` without `prev` ever
+    /// touching the host. `KernelHandle(0)` → the host-routed fallback.
+    k_batched_embed: KernelHandle,
     k_rope: KernelHandle,
     k_attn: KernelHandle,
 
@@ -108,6 +112,13 @@ pub struct DsparkDraftHead {
     mbias: DevicePtr,     // [vocab]
     conf_in: DevicePtr,   // [h + markov_rank]
     scratch_u32: DevicePtr,
+    /// `[1 + B]` u32 greedy chain: slot 0 is the committed token, slot `r+1`
+    /// is row `r`'s argmax. Slot `r` is the gather index for row `r`, so the
+    /// `prev → markov_w1[prev]` dependency stays device-side.
+    tok_dev: DevicePtr,
+    /// `[B]` BF16 confidence logits, one per row — lets all `B` rows be read
+    /// back in a single D2H after one sync.
+    conf_dev: DevicePtr,
     /// The model's `[layers, rows, h]` hc-mean capture buffer
     /// (ATLAS_DSPARK_CAPTURE=1), installed by the factory after model build.
     capture_buf: DevicePtr,
@@ -210,6 +221,7 @@ impl DsparkDraftHead {
             k_hc_post: gpu.kernel("hyper_connection", "hc_post")?,
             k_hc_head: gpu.kernel("hyper_connection", "hc_head")?,
             k_argmax: gpu.kernel("argmax", "argmax_bf16")?,
+            k_batched_embed: crate::layers::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
             k_rope: gpu.kernel("dspark_drafter", "dspark_rope")?,
             k_attn: gpu.kernel("dspark_drafter", "dspark_attn")?,
             rings,
@@ -240,6 +252,8 @@ impl DsparkDraftHead {
             mbias: alloc(vocab as usize)?,
             conf_in: alloc(hu + mr)?,
             scratch_u32: gpu.alloc(4)?,
+            tok_dev: gpu.alloc((b + 1) * 4)?,
+            conf_dev: alloc(b)?,
             capture_buf: DevicePtr::NULL,
             capture_rows: 0,
             module,
@@ -821,18 +835,58 @@ impl DsparkDraftHead {
         }
 
         // ── Markov-biased greedy chain + confidence ──
+        //
+        // The chain is `prev → markov_w1[prev] → logits → argmax → prev`.
+        // Indexing `markov_w1` on the host makes every row a full pipeline
+        // flush: `block` syncs + 2·`block` D2H per propose. `batched_embed`
+        // gathers the row from a DEVICE-resident index, so the whole chain
+        // stays on the stream and only the final `block` tokens come back.
+        // Same kernels in the same order — bit-exact with the host route.
         let mr = self.module.params.markov_rank;
+        let chain_on_device = self.k_batched_embed.0 != 0 && {
+            static CD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *CD.get_or_init(|| std::env::var("ATLAS_DSPARK_CHAIN_DEV").as_deref() != Ok("0"))
+        };
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    "DSpark markov chain: on_device={} (kernel={:#x} block={} mr={})",
+                    chain_on_device,
+                    self.k_batched_embed.0,
+                    b,
+                    mr,
+                );
+            });
+        }
+
         let mut drafts = Vec::with_capacity(b as usize);
         let mut confs = Vec::with_capacity(b as usize);
+        if chain_on_device {
+            gpu.copy_h2d_async(&committed.to_le_bytes(), self.tok_dev, stream)?;
+        }
         let mut prev = committed;
         for r in 0..b as usize {
             // markov_w1[prev] → state; logits_r += markov_w2 · state.
-            gpu.copy_d2d_async(
-                self.module.markov_w1.weight.offset(prev as usize * mr * 2),
-                self.mstate,
-                mr * 2,
-                stream,
-            )?;
+            if chain_on_device {
+                ops::batched_embed(
+                    gpu,
+                    self.k_batched_embed,
+                    self.tok_dev.offset(r * 4),
+                    self.module.markov_w1.weight,
+                    self.mstate,
+                    1,
+                    mr as u32,
+                    stream,
+                )?;
+            } else {
+                gpu.copy_d2d_async(
+                    self.module.markov_w1.weight.offset(prev as usize * mr * 2),
+                    self.mstate,
+                    mr * 2,
+                    stream,
+                )?;
+            }
             ops::dense_gemv(
                 gpu,
                 self.k_gemv,
@@ -852,29 +906,37 @@ impl DsparkDraftHead {
                 self.vocab,
                 stream,
             )?;
-            ops::argmax_bf16(
-                gpu,
-                self.k_argmax,
-                row,
-                self.scratch_u32,
-                self.vocab,
-                stream,
-            )?;
+            // On-device: row `r`'s argmax lands in slot `r + 1`, which is the
+            // next iteration's gather index. Host route keeps the single slot.
+            let tok_out = if chain_on_device {
+                self.tok_dev.offset((r + 1) * 4)
+            } else {
+                self.scratch_u32
+            };
+            ops::argmax_bf16(gpu, self.k_argmax, row, tok_out, self.vocab, stream)?;
 
             // Confidence: sigmoid(proj · [hidden_row | markov_state]).
             gpu.copy_d2d_async(self.f5.offset(r * hu * 2), self.conf_in, hu * 2, stream)?;
             gpu.copy_d2d_async(self.mstate, self.conf_in.offset(hu * 2), mr * 2, stream)?;
+            let conf_out = if chain_on_device {
+                self.conf_dev.offset(r * 2)
+            } else {
+                self.mbias
+            };
             ops::dense_gemv(
                 gpu,
                 self.k_gemv,
                 self.conf_in,
                 &self.module.confidence_proj,
-                self.mbias,
+                conf_out,
                 1,
                 (hu + mr) as u32,
                 stream,
             )?;
 
+            if chain_on_device {
+                continue;
+            }
             gpu.synchronize(stream)?;
             let mut tb = [0u8; 4];
             gpu.copy_d2h(self.scratch_u32, &mut tb)?;
@@ -886,6 +948,21 @@ impl DsparkDraftHead {
             confs.push(1.0 / (1.0 + (-logit).exp()));
             prev = tok;
         }
+        if chain_on_device {
+            // One flush for the whole chain instead of `block` of them.
+            gpu.synchronize(stream)?;
+            let mut tb = vec![0u8; b as usize * 4];
+            gpu.copy_d2h(self.tok_dev.offset(4), &mut tb)?;
+            let mut cb = vec![0u8; b as usize * 2];
+            gpu.copy_d2h(self.conf_dev, &mut cb)?;
+            for r in 0..b as usize {
+                drafts.push(u32::from_le_bytes(tb[r * 4..r * 4 + 4].try_into().unwrap()));
+                let bits = u16::from_le_bytes(cb[r * 2..r * 2 + 2].try_into().unwrap());
+                let logit = f32::from_bits((bits as u32) << 16);
+                confs.push(1.0 / (1.0 + (-logit).exp()));
+            }
+        }
+        let _ = prev;
         Ok((drafts, confs))
     }
 }
