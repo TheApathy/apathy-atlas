@@ -494,14 +494,16 @@ impl Qwen3AttentionLayer {
 
         mark("A_proj", &mut t_phase)?;
 
-        // ── Phase B: batched rope / cache write, per-row paged attention ──
+        // ── Phase B: batched rope / cache write + batched paged attention ──
         // Every kernel in the rope + cache-write half already takes a row
         // count and is exercised at n≫1 by prefill, so it runs once for all n
         // instead of n times at 1 row (see decode/rows_rope_cache.rs). That was
-        // ~347 µs of the measured 467 µs/layer; only the ~120 µs of paged
-        // attention is genuinely per-row, because `mla_paged_decode_fp8`
-        // indexes only seq_lens/block_tables by blockIdx.y and documents Q/O as
-        // `[1, nq * q_dim]` — raising num_seqs would alias every row onto row 0.
+        // ~347 µs of the measured 467 µs/layer. The remaining ~120 µs of paged
+        // attention used to be genuinely per-row — `mla_paged_decode_fp8`
+        // indexed only seq_lens/block_tables by blockIdx.y and documented Q/O
+        // as `[1, nq * q_dim]`, so raising num_seqs aliased every row onto row
+        // 0 — until the kernel gained the `seq_idx * nq * q_head_dim` Q/O
+        // stride; it is now launched once at num_seqs=n too.
         //
         // ATLAS_MLA_ROWS_BATCH=0 restores the per-row chain for A/B.
         let rows_batched = {
@@ -524,17 +526,33 @@ impl Qwen3AttentionLayer {
             };
             self.mla_rows_rope_and_cache(kv_cache, c.fwd, meta, &rargs)?;
             let inv_sqrt_d = self.effective_attn_scale(hd);
-            for i in 0..n {
+            // One launch for all n rows. `mla_paged_decode_fp8` now strides Q/O
+            // by `seq_idx * nq * q_head_dim`, and it already indexed
+            // `seq_lens[seq_idx]` / `block_tables + seq_idx * max_blocks_per_seq`
+            // — which is exactly the row-i offsetting the per-row loop below
+            // does by hand, so the two are launch-for-launch equivalent.
+            //
+            // The occupancy argument: one row is gridDim=[nq=64, 1, 1] = 64
+            // CTAs on 48 SMs, so the tail wave runs 16/48 SMs busy and n of
+            // those waves run back to back. n rows in one launch is 384 CTAs,
+            // which fills 8 full waves instead of n ragged ones.
+            //
+            // ATLAS_MLA_ATTN_BATCH=0 restores the per-row launches (the kernel
+            // change is a no-op at num_seqs=1, so that leg is unaffected).
+            let attn_batched = {
+                static AB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *AB.get_or_init(|| std::env::var("ATLAS_MLA_ATTN_BATCH").as_deref() != Ok("0"))
+            };
+            if attn_batched {
                 self.run_paged_decode(
                     gpu,
-                    q_batch.offset(i * q_dim as usize * bf16),
+                    q_batch,
                     kv_cache,
-                    attn_batch.offset(i * q_dim as usize * bf16),
-                    meta.block_table
-                        .offset(i * meta.max_blocks_per_seq as usize * 4),
-                    meta.seq_len.offset(i * 4),
+                    attn_batch,
+                    meta.block_table,
+                    meta.seq_len,
                     meta.max_blocks_per_seq,
-                    1,
+                    n as u32,
                     nq,
                     c.nkv,
                     hd,
@@ -544,6 +562,28 @@ impl Qwen3AttentionLayer {
                     c.fwd.buffers.splitk_workspace(),
                     stream,
                 )?;
+            } else {
+                for i in 0..n {
+                    self.run_paged_decode(
+                        gpu,
+                        q_batch.offset(i * q_dim as usize * bf16),
+                        kv_cache,
+                        attn_batch.offset(i * q_dim as usize * bf16),
+                        meta.block_table
+                            .offset(i * meta.max_blocks_per_seq as usize * 4),
+                        meta.seq_len.offset(i * 4),
+                        meta.max_blocks_per_seq,
+                        1,
+                        nq,
+                        c.nkv,
+                        hd,
+                        bs as u32,
+                        inv_sqrt_d,
+                        q_dim,
+                        c.fwd.buffers.splitk_workspace(),
+                        stream,
+                    )?;
+                }
             }
             self.mla_rows_derotate(c.fwd, meta, attn_batch, n as u32, nq, hd, stream)?;
         } else {

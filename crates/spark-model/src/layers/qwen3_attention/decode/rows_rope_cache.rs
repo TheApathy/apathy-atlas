@@ -27,11 +27,13 @@
 //! ever changes to a flat `seq_len + k`, this batching becomes WRONG and the
 //! per-row loop must come back.
 //!
-//! What is NOT batched here: the paged attention itself. `mla_paged_decode_fp8`
-//! documents `Q`/`O` as `[1, nq * q_dim]` and indexes only `seq_lens` and
-//! `block_tables` by `blockIdx.y`, never Q or O — so raising `num_seqs` would
-//! make all rows read the same Q and race on the same output. Batching that
-//! needs a kernel change (stride Q/O by `seq_idx`), tracked separately.
+//! The paged attention between these two calls is batched separately, in the
+//! caller. It could not be at first: `mla_paged_decode_fp8` documented `Q`/`O`
+//! as `[1, nq * q_dim]` and indexed only `seq_lens` and `block_tables` by
+//! `blockIdx.y`, never Q or O, so raising `num_seqs` made all rows read the
+//! same Q and race on the same output. The kernel now adds
+//! `seq_idx * nq * q_head_dim` to both, which is zero at `num_seqs=1` and so
+//! left every single-row caller bit-identical.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;

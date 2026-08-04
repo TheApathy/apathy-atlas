@@ -59,10 +59,10 @@ __device__ __forceinline__ float fp8e4m3_to_f32(__nv_fp8_storage_t b) {
 
 template <bool KV_ALIAS>
 __device__ void mla_paged_decode_fp8_impl(
-    const __nv_bfloat16* __restrict__ Q,            // [1, nq * q_dim] = [1, 32768]
+    const __nv_bfloat16* __restrict__ Q,            // [num_seqs, nq * q_dim], row = 32768
     const unsigned char* __restrict__ K_cache,     // FP8 compressed KV cache (bytes)
     const unsigned char* __restrict__ V_cache,     // FP8 compressed KV cache (bytes)
-    __nv_bfloat16* __restrict__ O,                  // [1, nq * q_dim] = [1, 32768]
+    __nv_bfloat16* __restrict__ O,                  // [num_seqs, nq * q_dim], row = 32768
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
     const unsigned int max_blocks_per_seq,
@@ -111,9 +111,16 @@ __device__ void mla_paged_decode_fp8_impl(
 
     const int* my_block_table = block_tables + seq_idx * max_blocks_per_seq;
 
+    // Row base for multi-seq launches. Q/O are `[num_seqs, nq * q_head_dim]`
+    // contiguous, so row `seq_idx` starts `nq * q_head_dim` elements in. At
+    // num_seqs=1 (every non-verify caller) seq_idx is 0 and this term vanishes,
+    // so the single-row path is bit-identical to before this was added.
+    const unsigned long long qo_row_base =
+        (unsigned long long)seq_idx * num_q_heads * q_head_dim;
+
     // Load Q (BF16, flattened [nq * q_dim])
     // Each thread loads 16 elements (512 / 32 = 16)
-    const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)q_head * q_head_dim + vec_offset_bf16);
+    const unsigned int* q32 = (const unsigned int*)(Q + qo_row_base + (unsigned long long)q_head * q_head_dim + vec_offset_bf16);
     float q_reg[VEC_BF16];
     #pragma unroll
     for (int i = 0; i < VEC_U32; i++) {
@@ -466,7 +473,7 @@ __device__ void mla_paged_decode_fp8_impl(
             final_l += __expf(sinks[q_head] - smem_m[0]);
         }
         float inv_l = (final_l > 0.0f) ? (1.0f / final_l) : 0.0f;
-        unsigned int* o32 = (unsigned int*)(O + (unsigned long long)q_head * q_head_dim + vec_offset_bf16);
+        unsigned int* o32 = (unsigned int*)(O + qo_row_base + (unsigned long long)q_head * q_head_dim + vec_offset_bf16);
         #pragma unroll
         for (int i = 0; i < VEC_U32; i++) {
             float v0 = smem_o[0][lane_id * VEC_BF16 + 2*i]     * inv_l;
