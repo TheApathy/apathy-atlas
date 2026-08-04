@@ -814,10 +814,15 @@ impl Model for TransformerModel {
         &self,
         seq: &mut SequenceState,
     ) -> Option<crate::layers::DDTreePayload> {
-        seq.proposer_state
-            .as_mut()?
-            .as_any_mut()
-            .downcast_mut::<crate::layers::DflashProposerState>()?
+        // Either drafter can arm a tree: DFlash under ATLAS_DFLASH_TREE,
+        // DSpark under ATLAS_DSPARK_TREE. The payload is drafter-agnostic
+        // (`build_free_slots_payload` takes only spine + branches), and so
+        // is the verify that consumes it — only the state type differs.
+        let any = seq.proposer_state.as_mut()?.as_any_mut();
+        if let Some(st) = any.downcast_mut::<crate::layers::DflashProposerState>() {
+            return st.pending_tree_payload.take();
+        }
+        any.downcast_mut::<crate::layers::dspark_head::DsparkProposerState>()?
             .pending_tree_payload
             .take()
     }

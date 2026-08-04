@@ -75,6 +75,10 @@ pub struct DsparkDraftHead {
     /// Lets the Markov chain read `markov_w1[prev]` without `prev` ever
     /// touching the host. `KernelHandle(0)` → the host-routed fallback.
     k_batched_embed: KernelHandle,
+    /// Per-row top-2 over `[block, vocab]` logits. Only the runner-up token
+    /// and the top-1/top-2 margin are needed, and only when DDTree is armed
+    /// (`ATLAS_DSPARK_TREE=1`); `KernelHandle(0)` disables tree payloads.
+    k_top2: KernelHandle,
     k_rope: KernelHandle,
     k_attn: KernelHandle,
 
@@ -119,6 +123,8 @@ pub struct DsparkDraftHead {
     /// `[B]` BF16 confidence logits, one per row — lets all `B` rows be read
     /// back in a single D2H after one sync.
     conf_dev: DevicePtr,
+    /// `[B, 4]` u32 top-2 quads `(idx1, bits(val1), idx2, bits(val2))`.
+    top2_out: DevicePtr,
     /// The model's `[layers, rows, h]` hc-mean capture buffer
     /// (ATLAS_DSPARK_CAPTURE=1), installed by the factory after model build.
     capture_buf: DevicePtr,
@@ -222,6 +228,7 @@ impl DsparkDraftHead {
             k_hc_head: gpu.kernel("hyper_connection", "hc_head")?,
             k_argmax: gpu.kernel("argmax", "argmax_bf16")?,
             k_batched_embed: crate::layers::try_kernel(gpu, "embed_from_argmax", "batched_embed"),
+            k_top2: crate::layers::try_kernel(gpu, "argmax", "top2_bf16_rows"),
             k_rope: gpu.kernel("dspark_drafter", "dspark_rope")?,
             k_attn: gpu.kernel("dspark_drafter", "dspark_attn")?,
             rings,
@@ -254,6 +261,7 @@ impl DsparkDraftHead {
             scratch_u32: gpu.alloc(4)?,
             tok_dev: gpu.alloc((b + 1) * 4)?,
             conf_dev: alloc(b)?,
+            top2_out: gpu.alloc(b * 16)?,
             capture_buf: DevicePtr::NULL,
             capture_rows: 0,
             module,
@@ -409,8 +417,9 @@ impl DsparkDraftHead {
     }
 
     /// Full propose: seed `pos`, then run the 5-row block and the
-    /// Markov-biased greedy chain. Returns `block_size` drafts and their
-    /// confidence-head sigmoids (ungated — the caller applies the policy).
+    /// Markov-biased greedy chain. Returns `block_size` drafts, their
+    /// confidence-head sigmoids (ungated — the caller applies the policy),
+    /// and the per-row top-2 quads when DDTree is armed (empty otherwise).
     ///
     /// Contract (pinned by the probe alignment fix): `committed` is the token
     /// GENERATED from position `pos`; `captures` are the hc-mean hiddens OF
@@ -424,7 +433,7 @@ impl DsparkDraftHead {
         committed: u32,
         pos: usize,
         stream: u64,
-    ) -> Result<(Vec<u32>, Vec<f32>)> {
+    ) -> Result<(Vec<u32>, Vec<f32>, Vec<u32>)> {
         self.seed_position(gpu, captures, pos, stream)?;
         self.dbg(gpu, "main_x", self.main_x, self.h as usize, stream);
         self.dbg(
@@ -860,6 +869,15 @@ impl DsparkDraftHead {
             });
         }
 
+        // DDTree (ATLAS_DSPARK_TREE=1): the runner-up token at each row is
+        // the branch the tree verify would explore. `residual_add` folds the
+        // Markov bias into `logits5` in place, so the top-2 must be taken
+        // AFTER the chain loop — the same biased rows the argmax read.
+        let tree_on = self.k_top2.0 != 0 && {
+            static TR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *TR.get_or_init(|| std::env::var("ATLAS_DSPARK_TREE").as_deref() == Ok("1"))
+        };
+
         let mut drafts = Vec::with_capacity(b as usize);
         let mut confs = Vec::with_capacity(b as usize);
         if chain_on_device {
@@ -948,6 +966,18 @@ impl DsparkDraftHead {
             confs.push(1.0 / (1.0 + (-logit).exp()));
             prev = tok;
         }
+        // Queued before the flush so the top-2 rides the chain's single sync.
+        if tree_on {
+            ops::top2_bf16_rows(
+                gpu,
+                self.k_top2,
+                self.logits5,
+                self.top2_out,
+                b,
+                self.vocab,
+                stream,
+            )?;
+        }
         if chain_on_device {
             // One flush for the whole chain instead of `block` of them.
             gpu.synchronize(stream)?;
@@ -962,9 +992,48 @@ impl DsparkDraftHead {
                 confs.push(1.0 / (1.0 + (-logit).exp()));
             }
         }
+        let top2 = if tree_on {
+            if !chain_on_device {
+                gpu.synchronize(stream)?;
+            }
+            let mut w = vec![0u8; b as usize * 16];
+            gpu.copy_d2h(self.top2_out, &mut w)?;
+            w.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let _ = prev;
-        Ok((drafts, confs))
+        Ok((drafts, confs, top2))
     }
+}
+
+/// DDTree shape knobs, mirroring the DFlash names so a sweep can drive both
+/// drafters: `(max_branches, tail_len, margin_gate)`.
+///
+/// The margin gate is the economics knob. A tree step forfeits the flat CUDA
+/// graph and pays for its extra rows, so it only pays off where an early
+/// death is likely — i.e. where the drafter's top-1 barely beat its top-2.
+fn tree_shape() -> (usize, usize, f32) {
+    static V: std::sync::OnceLock<(usize, usize, f32)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let env = |k: &str, d: usize, hi: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(d)
+                .clamp(1, hi)
+        };
+        (
+            env("ATLAS_DSPARK_TREE_BRANCHES", 1, 3),
+            env("ATLAS_DSPARK_TREE_TAIL", 1, 3),
+            std::env::var("ATLAS_DSPARK_TREE_MARGIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2.5),
+        )
+    })
 }
 
 /// Per-sequence DSpark proposer state. The ring itself lives on the head
@@ -974,6 +1043,9 @@ impl DsparkDraftHead {
 pub struct DsparkProposerState {
     /// Highest sequence position whose `main_kv` is in the rings; -1 = none.
     pub last_seeded: i64,
+    /// DDTree payload for the drafts just proposed (`ATLAS_DSPARK_TREE=1`).
+    /// Consumed by `dflash_take_tree_payload`; `None` keeps the flat path.
+    pub pending_tree_payload: Option<crate::layers::DDTreePayload>,
 }
 
 impl crate::speculative::ProposerState for DsparkProposerState {
@@ -1008,7 +1080,10 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         &self,
         _gpu: &dyn GpuBackend,
     ) -> Result<Box<dyn crate::speculative::ProposerState>> {
-        Ok(Box::new(DsparkProposerState { last_seeded: -1 }))
+        Ok(Box::new(DsparkProposerState {
+            last_seeded: -1,
+            pending_tree_payload: None,
+        }))
     }
 
     /// Contract at the propose site (matches the V4 MTP head's convention):
@@ -1071,7 +1146,8 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
                 let _ = f.write_all(&host);
             }
         }
-        let (drafts, confs) = self.propose_block(gpu, ctx, self.captures_at(p), last_token, p, stream)?;
+        let (drafts, confs, top2) =
+            self.propose_block(gpu, ctx, self.captures_at(p), last_token, p, stream)?;
         st.last_seeded = p as i64;
 
         // Confidence gate (ATLAS_DSPARK_CONF, 0 = ungated). The offline
@@ -1089,7 +1165,66 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             }
             keep = k;
         }
-        Ok(drafts[..keep].to_vec())
+        let kept = drafts[..keep].to_vec();
+
+        // ── DDTree payload (ATLAS_DSPARK_TREE=1) ──
+        //
+        // The spine is exactly the drafts the verify will see, which is what
+        // `try_decode_verify_tree`'s staleness guard requires. Each cliff
+        // adds a sibling row carrying the runner-up token plus a re-rooted
+        // tail, so a step that dies at the cliff still commits the branch
+        // instead of stopping. Chain acceptance decays 84.5% -> 43.1% by
+        // position while verify costs only ~16ms per extra row, so width is
+        // the cheap axis. Gate on the top-1/top-2 margin: on confident steps
+        // the branch is wasted rows AND forfeits the flat CUDA graph.
+        st.pending_tree_payload = None;
+        if !top2.is_empty() && kept.len() >= 2 {
+            // Transparency gate (ATLAS_DSPARK_TREE_DEGEN=1): force the fork
+            // token to the spine draft at the same depth. The branch rows
+            // then verify exactly what the spine rows verify, through the
+            // scratch KV, so the committed text MUST be byte-identical to
+            // the flat path. Any drift is a bug in the tree metadata, the
+            // COW block table, or the per-layer branch re-seed — not a
+            // modelling difference. Mirrors ATLAS_DFLASH_TREE_DEGEN.
+            static DEGEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let degen =
+                *DEGEN.get_or_init(|| std::env::var("ATLAS_DSPARK_TREE_DEGEN").as_deref() == Ok("1"));
+            let (max_branches, tail_cfg, margin_gate) = tree_shape();
+            let mut cliffs: Vec<(usize, u32, f32)> = Vec::new();
+            // Draft `di` came from logits row `di` (no row-0 drop here — the
+            // DSpark block emits one draft per row, unlike DFlash).
+            for di in 0..kept.len().saturating_sub(1) {
+                let margin = f32::from_bits(top2[di * 4 + 1]) - f32::from_bits(top2[di * 4 + 3]);
+                let fork = if degen { kept[di] } else { top2[di * 4 + 2] };
+                if degen || (fork != kept[di] && margin < margin_gate) {
+                    cliffs.push((di, fork, margin));
+                }
+            }
+            cliffs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+            cliffs.truncate(max_branches);
+            if !cliffs.is_empty() {
+                let branches: Vec<crate::layers::dflash_head::ddtree::FreeSlotBranch> = cliffs
+                    .iter()
+                    .map(
+                        |&(di, fork, _)| crate::layers::dflash_head::ddtree::FreeSlotBranch {
+                            cliff_depth: di + 1,
+                            fork_token: fork,
+                            tail: kept[di + 1..(di + 1 + tail_cfg).min(kept.len())].to_vec(),
+                        },
+                    )
+                    .collect();
+                // K_t = bonus row + spine + Σ(fork + tail); the verify arena
+                // holds 20 rows (verify_d_tree.rs TREE_MAX_ROWS).
+                let want = kept.len() + branches.iter().map(|b| 1 + b.tail.len()).sum::<usize>();
+                let payload = crate::layers::dflash_head::ddtree::build_free_slots_payload(
+                    &kept,
+                    &branches,
+                    want.min(19),
+                );
+                st.pending_tree_payload = Some(payload);
+            }
+        }
+        Ok(kept)
     }
 
     /// Nothing to roll back: the rings hold only committed-position

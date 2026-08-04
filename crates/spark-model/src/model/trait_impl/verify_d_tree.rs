@@ -284,10 +284,24 @@ impl TransformerModel {
             comm: self.comm_ref(),
             graph_capture: false, // tree steps are ALWAYS eager
             gdn_exact_replay: false,
-            token_ids: None,
+            // Hash-MoE routing reads `tid2eid[token_id]` per row, so the
+            // K_t row tokens must be resident exactly as the flat path
+            // uploads its `tokens_all` (verify_d.rs). Leaving this None made
+            // DeepSeek-V4 abort the whole verify with "hash-MoE layer
+            // requires ForwardContext.token_ids (decode)" — the tree had
+            // simply never run on a hash-routed model.
+            token_ids: Some(self.buffers.token_ids()),
             routed_lora_layers: None,
             midchunk_capture: None,
         };
+        // Row 0 = bonus anchor, rows 1.. = payload nodes — the same order the
+        // embed loop above uses, so row t's id sits at offset t.
+        let tid_bytes: Vec<u8> = std::iter::once(tokens[0])
+            .chain(payload.tree_token_ids.iter().copied())
+            .flat_map(|t| t.to_le_bytes())
+            .collect();
+        self.gpu
+            .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
 
         let capture_all = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_UNIFIED_CTX").ok().as_deref() == Some("1");
@@ -389,7 +403,10 @@ impl TransformerModel {
                         comm: ctx.comm,
                         graph_capture: false,
                         gdn_exact_replay: ctx.gdn_exact_replay,
-                        token_ids: ctx.token_ids,
+                        // Per-row view, same reason as the metadata offsets
+                        // above: this decode sees num_seqs=1, so hash-MoE
+                        // would route EVERY row on row 0's token without it.
+                        token_ids: ctx.token_ids.map(|p| p.offset(t * 4)),
                         routed_lora_layers: ctx.routed_lora_layers,
                         midchunk_capture: None,
                     };
