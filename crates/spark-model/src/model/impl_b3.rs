@@ -756,7 +756,12 @@ impl TransformerModel {
             // the catch-up below byte-identical to the non-speculative path.
             // No-op when speculation did not run this step.
             attn.v4_compress_restore(&ctx, stream)?;
-            attn.v4_compress_catchup(&ctx, pre_len, num_committed, eps, stream)?;
+            // `pre_len` counts the last emitted-but-unforwarded token, so the
+            // first committed verify row's FORWARD position is `pre_len - 1`
+            // (task #45: basing the replay at `pre_len` wrote every ring slot
+            // one position late and left one slot stale, so every replayed
+            // pool block differed bytewise from plain decode's).
+            attn.v4_compress_catchup(&ctx, pre_len.saturating_sub(1), num_committed, eps, stream)?;
         }
         Ok(())
     }

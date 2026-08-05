@@ -139,22 +139,31 @@ impl<'a> MultiSeqCtx<'a> {
 
 /// Recognise a contiguous single-sequence γ-verify window from the HOST
 /// `seq_lens` the batched decode was called with, returning row 0's absolute
-/// position.
+/// FORWARD position.
 ///
-/// The verify builder emits `seq_lens[r] = seq.seq_len + r`
-/// (`verify_d.rs:356`), and `AttnMetadataDev::seq_len` is that value **+1** —
-/// so host `seq_lens[0]` is already the absolute position of row 0. Requiring
-/// the exact `+r` stride is what distinguishes a γ window from a genuine
-/// multi-sequence co-batch, where advancing one compressor frontier over all
-/// rows would be meaningless.
+/// The verify builder emits `seq_lens[r] = seq.seq_len + r` (`verify_d.rs`),
+/// where `seq.seq_len` COUNTS the last emitted-but-not-yet-forwarded token —
+/// so row 0's forward position is `seq_lens[0] - 1`, not `seq_lens[0]`.
+/// Measured (task #45, the compressed-arm divergence): plain decode appends
+/// token X's normed at ring slot `pos % ratio` with `pos = seq_len_at_decode
+/// = seq_lens[0] - 1`; a replay based at `seq_lens[0]` wrote every row one
+/// slot late and left one slot holding stale bytes, so every replayed pool
+/// block differed from plain's ([12,13,residue,row0] vs [12,13,row0,row1]).
+///
+/// Requiring the exact `+r` stride is what distinguishes a γ window from a
+/// genuine multi-sequence co-batch, where advancing one compressor frontier
+/// over all rows would be meaningless.
 pub(super) fn verify_base_pos_of(seq_lens: &[usize], n: usize) -> Option<usize> {
     if n == 0 || seq_lens.len() < n {
         return None;
     }
     let base = seq_lens[0];
+    if base == 0 {
+        return None;
+    }
     seq_lens[..n]
         .iter()
         .enumerate()
         .all(|(r, &l)| l == base + r)
-        .then_some(base)
+        .then_some(base - 1)
 }

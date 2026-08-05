@@ -786,24 +786,58 @@ impl Qwen3AttentionLayer {
                         (comp.ring, ratio, 1u32, 0u32)
                     };
 
-                    // Task #45: hash the compress input window (prev_win ‖
-                    // ring staging, or ring alone) — the append produced
-                    // different block bytes per path with believed-equal
-                    // inputs; this decides which ingredient differs.
+                    // Task #45: hash each compress-input ingredient — the
+                    // append produced different block bytes per path (plain /
+                    // speculate / catchup) with believed-equal inputs; these
+                    // decide which ingredient actually differs.
                     if std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
                         .is_ok_and(|v| v == "1" || v == "true")
                         && !ctx.graph_capture
                     {
+                        let half = ratio as usize * h as usize;
+                        if t_rows == 2 * ratio {
+                            super::super::trait_impl::diag_norm(
+                                ctx.gpu,
+                                comp_in,
+                                half,
+                                stream,
+                                &format!("V4-comp L{} in-prevwin w={w} pos={pos}", self.attn_layer_idx),
+                            );
+                            super::super::trait_impl::diag_norm(
+                                ctx.gpu,
+                                comp_in.offset(half * 2),
+                                half,
+                                stream,
+                                &format!("V4-comp L{} in-ring w={w} pos={pos}", self.attn_layer_idx),
+                            );
+                        } else {
+                            super::super::trait_impl::diag_norm(
+                                ctx.gpu,
+                                comp_in,
+                                t_rows as usize * h as usize,
+                                stream,
+                                &format!("V4-comp L{} in-ring w={w} pos={pos}", self.attn_layer_idx),
+                            );
+                        }
                         super::super::trait_impl::diag_norm(
                             ctx.gpu,
-                            comp_in,
-                            t_rows as usize * h as usize,
+                            normed,
+                            h as usize,
                             stream,
-                            &format!(
-                                "V4-comp L{} comp-in w={w} pos={pos} t_rows={t_rows} prev_valid={prev_valid}",
-                                self.attn_layer_idx
-                            ),
+                            &format!("V4-comp L{} in-normed pos={pos}", self.attn_layer_idx),
                         );
+                        for j in 0..ratio as usize {
+                            super::super::trait_impl::diag_norm(
+                                ctx.gpu,
+                                comp.ring.offset(j * hb),
+                                h as usize,
+                                stream,
+                                &format!(
+                                    "V4-comp L{} in-slot{j} w={w} pos={pos}",
+                                    self.attn_layer_idx
+                                ),
+                            );
+                        }
                     }
                     // compressor projections kv/gate = W·comp_in [T, proj_dim]
                     let kv_comp = ctx.buffers.expert_up_out();
