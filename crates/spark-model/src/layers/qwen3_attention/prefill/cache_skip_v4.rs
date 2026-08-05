@@ -638,6 +638,22 @@ impl Qwen3AttentionLayer {
             let crem = n % cratio;
             let hbytes = h as usize * 2;
             self.v4_decode_started.store(false, Relaxed);
+            // Zero the WHOLE ring before seeding. The straddle seed below
+            // covers only `crem` slots and the decode appends only reach slots
+            // from the first decode position onward, so any slot in between
+            // keeps whatever the previous request — or the server-load WARMUP
+            // forward — left there. Measured (task #45): at a 13-token prompt,
+            // ring slot 1 (position 13) is never written by anyone and both
+            // the plain and verify paths built compress block 3 from warmup
+            // residue; the two engines only disagreed because their warmups
+            // differ. Zeroing makes the unwritten region deterministic and
+            // path-independent, so the γ-replay is bit-exact with plain.
+            ctx.gpu.memset_u32_async(
+                comp.ring,
+                0,
+                (cratio as usize * hbytes) / 4,
+                stream,
+            )?;
             // Discard any unrolled γ-verify speculation from a PREVIOUS request
             // (one that ended mid-verify, e.g. on a tree win or an early
             // return). Without this, `v4_compress_speculate`'s self-heal would

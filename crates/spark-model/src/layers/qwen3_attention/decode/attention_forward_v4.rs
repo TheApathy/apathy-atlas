@@ -837,6 +837,22 @@ impl Qwen3AttentionLayer {
                                     self.attn_layer_idx
                                 ),
                             );
+                            // The STAGE's copy of the same slot: the ring
+                            // probes above read exact bytes while the staged
+                            // ring half hashes differently — hash each stage
+                            // region so the stale tensor identifies itself.
+                            if t_rows == 2 * ratio {
+                                super::super::trait_impl::diag_norm(
+                                    ctx.gpu,
+                                    comp_in.offset((ratio as usize + j) * hb),
+                                    h as usize,
+                                    stream,
+                                    &format!(
+                                        "V4-comp L{} in-stage{j} w={w} pos={pos}",
+                                        self.attn_layer_idx
+                                    ),
+                                );
+                            }
                         }
                     }
                     // compressor projections kv/gate = W·comp_in [T, proj_dim]
