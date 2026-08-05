@@ -37,7 +37,7 @@ impl Qwen3AttentionLayer {
         num_seqs: usize,
         states: &'a mut [&'b mut (dyn LayerState + 'static)],
         kv_cache: &mut PagedKvCache,
-        _seq_lens: &[usize],
+        seq_lens: &[usize],
         _block_tables: &[Vec<u32>],
         ctx: &ForwardContext,
         stream: u64,
@@ -45,6 +45,11 @@ impl Qwen3AttentionLayer {
         let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
         let mut c = ctx::MultiSeqCtx::new(self, ctx, hidden, residual, num_seqs, bs, stream);
+        // V4 compressed-arm speculation needs row 0's ABSOLUTE position on the
+        // host (see `MultiSeqCtx::verify_base_pos`). `seq_lens` is the only
+        // host-side view of it that reaches this path — everything else the
+        // attention consumes is the pre-uploaded device `attn_metadata`.
+        c.verify_base_pos = ctx::verify_base_pos_of(seq_lens, num_seqs);
         // Per-request LoRA routing slot buffer for this step (from metadata).
         if let Some(m) = ctx.attn_metadata.as_ref() {
             c.seq_slot = m.seq_slot;
@@ -351,6 +356,20 @@ impl Qwen3AttentionLayer {
             comm.all_reduce_async(o_out.0, bytes, c.stream)?;
         }
 
+        // Row-0 attention output, pre-hc_post — pairs with the plain path's
+        // "V4-decode L{} o_out" probe (attention_forward_v4). Layer-diff
+        // harness: this is the only tensor in the L0 divergence window
+        // [attention epilogue → hc_post(attn) → hc_pre(ffn)] that had no
+        // spec-side probe.
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                o_out,
+                h,
+                stream,
+                &format!("V4-msdecode L{} o_out", self.attn_layer_idx),
+            );
+        }
         // Expand attention output back into multi-stream state.
         ops::hc_post(
             ctx.gpu,
@@ -521,6 +540,17 @@ impl Qwen3AttentionLayer {
             // for dense/no FFN), so the per-token loop below still covers every
             // layer and width it declines.
             let batched = n > 1 && self.ffn.forward_verify_rows(c.normed, n, ctx, stream)?;
+            // Row-0 FFN output — pairs with plain's "V4-decode L{} ffn-out"
+            // for the task-#45 byte-level layer diff (m-row MoE exactness).
+            if batched && diag_this {
+                super::diag_norm(
+                    ctx.gpu,
+                    ctx.buffers.moe_output(),
+                    h,
+                    stream,
+                    &format!("V4-msdecode L{} ffn-out", self.attn_layer_idx),
+                );
+            }
             // ATLAS_MOE_OVERLAP=1 (no-op otherwise): open a row group so the
             // per-row MoE fires below can be scored for expert-set overlap.
             // The batched dispatch routes all rows in one launch — nothing to

@@ -753,6 +753,15 @@ impl Qwen3AttentionLayer {
         if let Some(scalar) = self.layer_scalar {
             self.apply_layer_scalar(ctx.gpu, ffn_out, h, scalar, stream)?;
         }
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                ffn_out,
+                h,
+                stream,
+                &format!("V4-decode L{} ffn-out", self.attn_layer_idx),
+            );
+        }
 
         prof!(
             "post-ffn",

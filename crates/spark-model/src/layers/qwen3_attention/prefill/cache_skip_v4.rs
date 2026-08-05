@@ -638,6 +638,13 @@ impl Qwen3AttentionLayer {
             let crem = n % cratio;
             let hbytes = h as usize * 2;
             self.v4_decode_started.store(false, Relaxed);
+            // Discard any unrolled γ-verify speculation from a PREVIOUS request
+            // (one that ended mid-verify, e.g. on a tree win or an early
+            // return). Without this, `v4_compress_speculate`'s self-heal would
+            // "restore" the old request's ring bytes and pool count over this
+            // freshly-prefilled state. Drop, don't restore: everything below
+            // re-seeds from scratch, so the stale snapshot is meaningless here.
+            self.spec_rows.store(0, Relaxed);
             if comp.is_csa && cnwin > 0 {
                 ctx.gpu.copy_d2d_async(
                     normed.offset(((cnwin - 1) * cratio) as usize * hbytes),

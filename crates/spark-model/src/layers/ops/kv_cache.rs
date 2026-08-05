@@ -882,6 +882,7 @@ pub fn mla_paged_decode_fp8(
     sinks: DevicePtr,
     comp_pool: DevicePtr, // 4b: flat FP8 compressed-KV pool (NULL = no compressed arm)
     comp_block_count_ptr: DevicePtr, // 4b: DEVICE word holding # compressed blocks (NULL = 0). Graph-safe: kernel reads it at replay.
+    comp_ratio: u32, // 4b: compressor window size. Non-zero → the kernel derives each row's visible block count as `seq_len / ratio` (clamped to the pool count) instead of sharing one scalar across the γ-verify rows. 0 restores the shared-count behaviour.
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
@@ -907,6 +908,7 @@ pub fn mla_paged_decode_fp8(
         .arg_ptr(sinks)
         .arg_ptr(comp_pool)
         .arg_ptr(comp_block_count_ptr)
+        .arg_u32(comp_ratio)
         .launch(stream)
 }
 

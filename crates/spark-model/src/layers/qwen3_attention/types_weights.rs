@@ -85,6 +85,14 @@ pub struct MlaWeights {
     pub attn_sink: spark_runtime::gpu::DevicePtr,
 }
 
+/// Widest γ-verify launch the per-layer verify scratches are sized for (covers
+/// γ≤7, i.e. kt≤8). `Qwen3AttentionLayer::verify_comp_normed`,
+/// [`CompressorWeights::ring_snap`] and `v4_compress_speculate`'s row cap all
+/// key off this, so it lives here rather than being re-declared at each
+/// allocation site — they must agree or a wide verify silently runs off the end
+/// of a scratch.
+pub const MAX_VERIFY_ROWS: usize = 8;
+
 /// DeepSeek-V4 compressed-attention compressor weights (one per compressed layer).
 /// Produces `n_win = usable/ratio` compressed KV entries that are concatenated to
 /// the raw sliding-window KV before core attention. CSA (ratio 4) uses a 2×ratio
@@ -137,6 +145,23 @@ pub struct CompressorWeights {
     /// ring, the 2×ratio-token input the CSA compress kernel indexes for one
     /// overlapped window. `DevicePtr::NULL` for HCA.
     pub stage: spark_runtime::gpu::DevicePtr,
+    /// γ-verify frontier snapshot of the ring slots speculation will clobber
+    /// `[min(ratio, MAX_VERIFY_ROWS) × hidden]` BF16.
+    ///
+    /// `v4_compress_speculate` advances the compressor over ALL γ rows before
+    /// the verify attention so every row's compressed blocks exist; a partial
+    /// accept then has to rewind to the committed prefix. The ring cannot be
+    /// reconstructed by replay — speculative rows overwrite slots holding
+    /// tokens from *before* the verify window (ratio 4, base 15, 6 rows: slots
+    /// 1 and 2 still hold positions 13 and 14) — so the clobbered slots are
+    /// copied out first. Only `min(ratio, rows)` slots can ever be touched, so
+    /// this stays ~64 KB even on the ratio-128 HCA layers whose ring is 1 MB.
+    pub ring_snap: spark_runtime::gpu::DevicePtr,
+    /// γ-verify frontier snapshot of `prev_win` `[ratio × hidden]` BF16 (CSA
+    /// only; `DevicePtr::NULL` for HCA, which has no overlap window). A
+    /// speculative block emit overwrites `prev_win` with the emitting window,
+    /// and unlike the ring there is no cheaper partial to save.
+    pub prev_win_snap: spark_runtime::gpu::DevicePtr,
 }
 
 /// Per-block Manifold-Constrained Hyper-Connection (mHC) parameters for one

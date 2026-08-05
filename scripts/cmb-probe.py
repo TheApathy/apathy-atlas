@@ -64,10 +64,19 @@ def main() -> int:
 
     mark = sum(1 for _ in open(log, errors="replace"))
 
+    # Dump the generated text next to the log. A hash tells you two configs
+    # DIVERGED; only the text tells you WHERE, and speculative decoding is
+    # supposed to be lossless, so the divergence point is the bug location.
+    texts = []
     for i, p in enumerate(PROMPTS):
         text, tps = complete(p, max_tokens)
         h = hashlib.sha256(text.encode()).hexdigest()[:16]
         print(f"probe{i}: hash={h} tok/s={tps:.2f} chars={len(text)}")
+        texts.append(text)
+    out = re.sub(r"\.log$", "", log) + ".out.json"
+    with open(out, "w") as f:
+        json.dump({"prompts": PROMPTS, "texts": texts}, f, indent=1)
+    print(f"texts -> {out}")
 
     lines = open(log, errors="replace").read().splitlines()[mark:]
     # "DFLASH STEP_TIMING: verify=128.0ms propose=30.4ms (K=7, accepted=2)"

@@ -200,10 +200,27 @@ impl Qwen3AttentionLayer {
         // holds MAX_VERIFY_ROWS=8, and multi-seq verify never exceeds that.
         if !self.verify_comp_normed.is_null() {
             let hb = c.h * bf16; // BF16 bytes per token row
-            let rows = c.n.min(8);
+            let rows = c.n.min(crate::layers::qwen3_attention::MAX_VERIFY_ROWS);
             c.fwd
                 .gpu
                 .copy_d2d_async(c.normed, self.verify_comp_normed, rows * hb, stream)?;
+
+            // …and immediately run the compressor FORWARD over all `rows`
+            // draft positions, before the attention below reads the pool.
+            //
+            // Without this the pool sits at `pre_len/ratio` for the whole
+            // verify while row `r` needs `(pre_len+r+1)/ratio` — every row
+            // attends a shorter compressed history than plain decode would, so
+            // its logits diverge and prefix-accept truncates. The capture above
+            // is what makes it possible: all `rows` compressor inputs are in
+            // hand here, before the MLA chain overwrites the shared scratch.
+            //
+            // Speculative state is undone by `v4_compress_restore` on the
+            // post-accept path; see `v4_compress_speculate` for the full
+            // argument and the ds4 references.
+            if let Some(base) = c.verify_base_pos {
+                self.v4_compress_speculate(c.fwd, base, rows, eps, stream)?;
+            }
         }
 
         // O-projection output destination. `ms_phase_o_proj` (the non-MLA
@@ -449,6 +466,16 @@ impl Qwen3AttentionLayer {
             gpu.synchronize(stream)?;
             t_phase = std::time::Instant::now();
         }
+        // Layer-diff harness (task #45): row-0 probes at the batched phase
+        // seams, labels matching attention_forward_v4's plain-side probes so
+        // the two paths diff line-for-line. Norms, not first4, decide — the
+        // L0 divergence hid behind four coincidentally-equal leading elems.
+        let diag_this = {
+            static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *D.get_or_init(|| {
+                std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true")
+            })
+        } && !c.fwd.graph_capture;
 
         // ── Phase A: batched Q + KV projections (weights read once) ──
         let wqa = mla.wq_a_fp8.as_ref().unwrap();
@@ -521,6 +548,15 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        if diag_this {
+            super::super::diag_norm(
+                gpu,
+                q_batch,
+                q_dim as usize,
+                stream,
+                &format!("V4-msdecode L{} Q after q_b_norm", self.attn_layer_idx),
+            );
+        }
         let wkv = mla.wkv_a_fp8.as_ref().unwrap();
         ops::w8a16_gemv_batch4(
             gpu,
@@ -547,6 +583,15 @@ impl Qwen3AttentionLayer {
         )?;
         // K=V for V4-Flash direct KV projection — all n rows in one copy.
         gpu.copy_d2d_async(kv_batch, v_batch, row(kv_dim), stream)?;
+        if diag_this {
+            super::super::diag_norm(
+                gpu,
+                kv_batch,
+                kv_dim as usize,
+                stream,
+                &format!("V4-msdecode L{} K after proj", self.attn_layer_idx),
+            );
+        }
 
         mark("A_proj", &mut t_phase)?;
 
@@ -647,7 +692,25 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
             }
+            if diag_this {
+                super::super::diag_norm(
+                    gpu,
+                    attn_batch,
+                    q_dim as usize,
+                    stream,
+                    &format!("V4-msdecode L{} attn_out", self.attn_layer_idx),
+                );
+            }
             self.mla_rows_derotate(c.fwd, meta, attn_batch, n as u32, nq, hd, stream)?;
+            if diag_this {
+                super::super::diag_norm(
+                    gpu,
+                    attn_batch,
+                    q_dim as usize,
+                    stream,
+                    &format!("V4-msdecode L{} attn_out derot", self.attn_layer_idx),
+                );
+            }
         } else {
             for i in 0..n {
                 let meta_i = Self::meta_row(meta, i);
@@ -683,6 +746,128 @@ impl Qwen3AttentionLayer {
         // row stride q_dim and writes latent cols [g*o_lora ..) with row
         // stride latent_dim — the strided batch kernel expresses that
         // directly (offsets mirror attention_forward_v4 Step 6).
+        //
+        // ATLAS_OPROJ_EXACT=1: run Step 6 PER ROW with the SAME single-row
+        // kernels plain decode uses. The layer-diff harness (task #45) proved
+        // this phase is the verify's FIRST divergence from plain: with every
+        // upstream tensor norm-exact at L0, `attn_out derot` matches to 6
+        // digits and `o_out` does not (95.3864 vs 95.3873). The batch4_ld /
+        // batchm kernels reduce K in a different order than the single-row
+        // GEMVs, the hyper-connection streams amplify the ulps 43 layers deep
+        // into the 2-3% capture drift that collapses drafter acceptance
+        // (1.06 online vs 3.69 offline). Per-row cost: wo weights re-read per
+        // row (~n× the C_oproj 303µs/layer weight traffic) — the price of
+        // bit-exactness until the batch kernels adopt the single-row K order.
+        let oproj_exact = {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| std::env::var("ATLAS_OPROJ_EXACT").as_deref() == Ok("1"))
+        };
+        if oproj_exact {
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        "OPROJ_EXACT: per-row Step-6 O projection active (n={n} nvfp4_woa={} nvfp4_wob={})",
+                        mla.wo_a_nvfp4.is_some(),
+                        mla.wo_b_nvfp4.is_some(),
+                    );
+                });
+            }
+            // Stage every row through the SAME buffers plain's Step 6 uses
+            // (attn_output → o_latent → qkv_output). The GEMV kernels pick
+            // their vectorized-load path from pointer alignment, so identical
+            // VALUES at a different base address can still accumulate in a
+            // different order — running at plain's addresses removes the last
+            // free variable. Sequential rows on one stream, so reuse is safe.
+            let stage_in = c.fwd.buffers.attn_output();
+            let stage_lat = c.fwd.buffers.o_latent();
+            let stage_out = c.fwd.buffers.qkv_output();
+            for i in 0..n {
+                gpu.copy_d2d_async(
+                    attn_batch.offset(i * q_dim as usize * bf16),
+                    stage_in,
+                    q_dim as usize * bf16,
+                    stream,
+                )?;
+                let attn_i = stage_in;
+                let lat_i = stage_lat;
+                for g in 0..o_groups {
+                    let in_g = attn_i.offset((g * group_in) as usize * 2);
+                    let out_g = lat_i.offset((g * o_lora) as usize * 2);
+                    if let Some(ref woa4) = mla.wo_a_nvfp4 {
+                        let sub = crate::weight_map::QuantizedWeight {
+                            weight: woa4
+                                .weight
+                                .offset((g as usize) * (o_lora as usize) * (group_in as usize) / 2),
+                            weight_scale: woa4
+                                .weight_scale
+                                .offset((g as usize) * (o_lora as usize) * (group_in as usize / 16)),
+                            weight_scale_2: woa4.weight_scale_2,
+                            input_scale: woa4.input_scale,
+                            weight_scale_2_vec: if woa4.weight_scale_2_vec.is_null() {
+                                woa4.weight_scale_2_vec
+                            } else {
+                                woa4.weight_scale_2_vec.offset((g as usize) * (o_lora as usize) * 4)
+                            },
+                        };
+                        ops::w4a16_gemv(
+                            gpu,
+                            self.w4a16_gemv_k,
+                            in_g,
+                            &sub,
+                            out_g,
+                            o_lora,
+                            group_in,
+                            stream,
+                        )?;
+                    } else {
+                        let woa = mla.wo_a_fp8.as_ref().unwrap();
+                        let w_off = (g as usize) * (o_lora as usize) * (group_in as usize);
+                        let s_off =
+                            (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4;
+                        ops::w8a16_gemv(
+                            gpu,
+                            self.w8a16_gemv_k,
+                            in_g,
+                            woa.weight.offset(w_off),
+                            woa.row_scale.offset(s_off),
+                            out_g,
+                            o_lora,
+                            group_in,
+                            stream,
+                        )?;
+                    }
+                }
+                if let Some(ref wob4) = mla.wo_b_nvfp4 {
+                    ops::w4a16_gemv(
+                        gpu,
+                        self.w4a16_gemv_k,
+                        lat_i,
+                        wob4,
+                        stage_out,
+                        h,
+                        latent_dim,
+                        stream,
+                    )?;
+                } else {
+                    let wob = mla.wo_b_fp8.as_ref().unwrap();
+                    ops::w8a16_gemv(
+                        gpu,
+                        self.w8a16_gemv_k,
+                        lat_i,
+                        wob.weight,
+                        wob.row_scale,
+                        stage_out,
+                        h,
+                        latent_dim,
+                        stream,
+                    )?;
+                }
+                gpu.copy_d2d_async(stage_out, o_out.offset(i * c.h * bf16), c.h * bf16, stream)?;
+            }
+            mark("C_oproj", &mut t_phase)?;
+            return Ok(o_out);
+        }
         if nv4_ok && let Some(ref woa4) = mla.wo_a_nvfp4 {
             // NVFP4 groups: packed 0.5 B/elem, scales [N, K/16] 1 B row-major,
             // shared per-tensor scale2 (quantized as one tensor).

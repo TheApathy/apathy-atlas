@@ -558,6 +558,15 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        if diag_this {
+            super::super::trait_impl::diag_norm(
+                ctx.gpu,
+                attn_out,
+                (nq * hd) as usize,
+                stream,
+                &format!("V4-decode L{} attn_out derot", self.attn_layer_idx),
+            );
+        }
 
         // Batched-verify seam: the caller runs the O projection itself as a
         // weight-amortized batched pass over all rows' `attn_dest` slots.
@@ -965,6 +974,218 @@ impl Qwen3AttentionLayer {
         for r in 0..num_committed {
             let normed = self.verify_comp_normed.offset(r * hb);
             self.v4_compress_append(ctx, normed, (pre_len + r) as u32, eps, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Report — once per distinct reason for the whole process — why
+    /// [`Self::v4_compress_speculate`] declined to advance the compressor.
+    ///
+    /// Every bail path leaves the engine bit-identical to the pre-fix
+    /// behaviour, so a skipped speculation is invisible in throughput: it looks
+    /// exactly like "the fix ran and bought nothing". Warn at `warn!` (not
+    /// `debug!`) because a skip is a silent correctness regression in the γ
+    /// verify, and dedupe so a 43-layer × 40-step run does not emit thousands
+    /// of identical lines.
+    fn spec_skip_reason(&self, reason: &str) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let first = match seen.lock() {
+            Ok(mut g) => g.insert(reason.to_string()),
+            // A poisoned lock means another thread panicked mid-insert; log
+            // rather than swallow, since dropping the message is the failure
+            // mode this helper exists to prevent.
+            Err(_) => true,
+        };
+        if first {
+            tracing::warn!(
+                "[v4-spec] compressor speculation SKIPPED (layer {} filled={}): {}",
+                self.attn_layer_idx,
+                self.v4_comp_pool_filled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                reason,
+            );
+        }
+    }
+
+    /// γ-verify SPECULATIVE compressor advance — run BEFORE the verify
+    /// attention, over ALL `n_rows` draft rows.
+    ///
+    /// # Why this exists
+    ///
+    /// The compressed arm's causality rule is that a query at absolute position
+    /// `p` may attend `(p+1)/ratio` compressed blocks, and every writer of
+    /// `v4_comp_pool_filled` upholds `filled == seq_len/ratio` (prefill stores
+    /// `n/ratio`; `v4_compress_append` stores `(pos+1)/ratio` and runs BEFORE
+    /// attention on the plain-decode path). The batched verify path took
+    /// `pos: None` and never appended, so the pool sat at `pre_len/ratio` while
+    /// row `r` needed `(pre_len+r+1)/ratio` — at ratio 4 with `pre_len=15`, the
+    /// six rows want 4,4,4,4,5,5 blocks and the pool holds **3**. Every row
+    /// therefore attended a different (smaller) compressed history than plain
+    /// decode would, its logits diverged, and prefix-accept truncated — the
+    /// measured `accepted=1.33` against `2.18` with the arm disabled entirely.
+    ///
+    /// Advancing the pool over the drafts closes that gap, at the cost of
+    /// putting speculative state into an append-only structure — hence the
+    /// frontier snapshot here and [`Self::v4_compress_restore`] afterwards.
+    /// This is ds4's `spec_frontier_snapshot` (ds4.c:30585) in Atlas terms.
+    ///
+    /// Cheap-exit: if no window boundary falls inside `[base_pos, base_pos+n)`
+    /// nothing can be emitted, so neither the snapshot nor the appends run.
+    /// That is the common case on the ratio-128 HCA layers (a 6-wide window
+    /// crosses a boundary ~5% of steps) and never the case on ratio-4 CSA.
+    pub(crate) fn v4_compress_speculate(
+        &self,
+        ctx: &ForwardContext,
+        base_pos: usize,
+        n_rows: usize,
+        eps: f32,
+        stream: u64,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Self-heal: a previous speculation that never got rolled back would
+        // otherwise be snapshotted AS the baseline here, making the corruption
+        // permanent instead of one-step. The post-accept path always calls
+        // `v4_compress_restore`, so this should never fire — but the failure
+        // mode is silent divergence, which is exactly what we are trying to
+        // eliminate, so it is not left to trust.
+        if self.spec_rows.load(Relaxed) != 0 {
+            self.v4_compress_restore(ctx, stream)?;
+        }
+        // Every early return below leaves behaviour bit-identical to the
+        // pre-fix engine, so "the fix ran and did not help" and "the fix never
+        // ran" are indistinguishable from throughput alone. Name the reason.
+        macro_rules! bail_spec {
+            ($reason:expr) => {{
+                self.spec_skip_reason($reason);
+                return Ok(());
+            }};
+        }
+        if self.verify_comp_normed.is_null() {
+            bail_spec!("verify_comp_normed unarmed (non-compressor layer)")
+        }
+        if n_rows == 0 {
+            bail_spec!("n_rows == 0")
+        }
+        let comp = match self.mla.as_ref().and_then(|m| m.compressor.as_ref()) {
+            Some(c) => c,
+            None => bail_spec!("layer has no compressor"),
+        };
+        // A captured graph cannot re-run this host-side logic, so speculation
+        // would silently not happen and the asymmetry would return.
+        if ctx.graph_capture {
+            bail_spec!(
+                "under graph capture — host-side compressor logic cannot run inside a \
+                 captured verify, so the compressed arm keeps the pre-fix shared block count"
+            )
+        }
+        let ratio = comp.ratio;
+        let n_rows = n_rows.min(super::super::MAX_VERIFY_ROWS);
+        // No boundary inside the window → no emit → no state change to undo.
+        if (base_pos + n_rows) / ratio == base_pos / ratio {
+            bail_spec!("no window boundary inside the γ span (nothing would be emitted)")
+        }
+
+        let hb = ctx.config.hidden_size * 2;
+        // Snapshot the frontiers. Only the ring slots this window can clobber
+        // are saved: slot `(base_pos+j) % ratio` for j in [0, min(n_rows,
+        // ratio)). Beyond `ratio` slots the map repeats, and since every save
+        // happens before any write the repeats would copy identical bytes.
+        let snap_slots = n_rows.min(ratio);
+        for j in 0..snap_slots {
+            let slot = (base_pos + j) % ratio;
+            ctx.gpu.copy_d2d_async(
+                comp.ring.offset(slot * hb),
+                comp.ring_snap.offset(j * hb),
+                hb,
+                stream,
+            )?;
+        }
+        if comp.is_csa && !comp.prev_win_snap.is_null() {
+            ctx.gpu
+                .copy_d2d_async(comp.prev_win, comp.prev_win_snap, ratio * hb, stream)?;
+        }
+        self.spec_saved_filled
+            .store(self.v4_comp_pool_filled.load(Relaxed), Relaxed);
+        self.spec_saved_prev_valid
+            .store(self.v4_comp_prev_valid.load(Relaxed), Relaxed);
+        self.spec_base_pos.store(base_pos as u32, Relaxed);
+        self.spec_rows.store(n_rows as u32, Relaxed);
+
+        // Advance over every draft row, in absolute-position order — the same
+        // call plain decode makes, so the blocks are byte-identical to the ones
+        // a non-speculative decode would have produced at those positions.
+        for r in 0..n_rows {
+            let normed = self.verify_comp_normed.offset(r * hb);
+            self.v4_compress_append(ctx, normed, (base_pos + r) as u32, eps, stream)?;
+        }
+        if std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok() {
+            tracing::info!(
+                "[v4-spec] layer {} base={} rows={} ratio={} filled {} -> {}",
+                self.attn_layer_idx,
+                base_pos,
+                n_rows,
+                ratio,
+                self.spec_saved_filled.load(Relaxed),
+                self.v4_comp_pool_filled.load(Relaxed),
+            );
+        }
+        Ok(())
+    }
+
+    /// γ-verify frontier rollback (ds4's `spec_frontier_restore`, ds4.c:30620).
+    /// Rewinds every frontier [`Self::v4_compress_speculate`] moved back to its
+    /// pre-speculation value.
+    ///
+    /// This does NOT advance to the accepted prefix — the caller runs
+    /// [`Self::v4_compress_catchup`] straight after, which replays the append
+    /// for exactly the committed rows. Rewinding fully and replaying (rather
+    /// than trying to "un-append" down to the committed count) leaves the
+    /// committed path byte-identical to the pre-speculation catch-up, which is
+    /// the behaviour prefix-accept losslessness is defined against, and keeps
+    /// one replay implementation instead of two.
+    ///
+    /// Idempotent: `spec_rows` is swapped to 0, so a second call is a no-op.
+    pub(crate) fn v4_compress_restore(
+        &self,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let rows = self.spec_rows.swap(0, Relaxed) as usize;
+        if rows == 0 {
+            return Ok(());
+        }
+        let comp = match self.mla.as_ref().and_then(|m| m.compressor.as_ref()) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let ratio = comp.ratio;
+        let base_pos = self.spec_base_pos.load(Relaxed) as usize;
+        let hb = ctx.config.hidden_size * 2;
+
+        for j in 0..rows.min(ratio) {
+            let slot = (base_pos + j) % ratio;
+            ctx.gpu.copy_d2d_async(
+                comp.ring_snap.offset(j * hb),
+                comp.ring.offset(slot * hb),
+                hb,
+                stream,
+            )?;
+        }
+        if comp.is_csa && !comp.prev_win_snap.is_null() {
+            ctx.gpu
+                .copy_d2d_async(comp.prev_win_snap, comp.prev_win, ratio * hb, stream)?;
+        }
+        let saved = self.spec_saved_filled.load(Relaxed);
+        self.v4_comp_pool_filled.store(saved, Relaxed);
+        self.v4_comp_prev_valid
+            .store(self.spec_saved_prev_valid.load(Relaxed), Relaxed);
+        if !self.v4_comp_count_dev.is_null() {
+            ctx.gpu
+                .memset_u32_async(self.v4_comp_count_dev, saved, 1, stream)?;
         }
         Ok(())
     }

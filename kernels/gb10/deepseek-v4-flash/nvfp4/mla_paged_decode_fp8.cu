@@ -78,7 +78,8 @@ __device__ void mla_paged_decode_fp8_impl(
     const unsigned int sliding_window,               // 0 = full; else attend only the last `sliding_window` positions
     const float* __restrict__ sinks,                 // [num_q_heads] per-head attn sink (s_aux); may be NULL. FP32: checkpoint-native (reading as bf16 hard-zeroed 7 heads)
     const unsigned char* __restrict__ comp_pool,     // 4b: flat FP8 compressed-KV pool [comp_block_count][576]; may be NULL
-    const unsigned int* __restrict__ comp_block_count_ptr  // 4b: DEVICE word holding # completed compressed blocks (NULL = 0). Read at execution so graph replay sees the live count, not the value baked at capture.
+    const unsigned int* __restrict__ comp_block_count_ptr, // 4b: DEVICE word holding # completed compressed blocks (NULL = 0). Read at execution so graph replay sees the live count, not the value baked at capture.
+    const unsigned int comp_ratio                    // 4b: compressor window size (0 = disable per-row visibility, use the raw pool count)
 ) {
     // Deref the device-resident count once. A by-value launch arg would freeze at
     // graph-capture time; sourcing it from device memory lets the graphed decode/
@@ -352,11 +353,37 @@ __device__ void mla_paged_decode_fp8_impl(
     // context lives ONLY here (compressed); recent tokens are double-represented
     // (raw window + compressed) — that overlap is correct (matches prefill).
     // comp_block_count == 0 (ratio-0 layers, or empty pool) → this loop is a no-op.
-    if (comp_pool != nullptr && comp_block_count > 0u) {
-        const unsigned int cchunk = (comp_block_count + NUM_WARPS - 1) / NUM_WARPS;
+    //
+    // PER-ROW VISIBILITY (γ-verify boundary fix). `comp_block_count` is ONE
+    // device scalar shared by every row of the launch, but each γ-verify row
+    // sits at a different absolute position and must therefore see a different
+    // number of compressed blocks. Block `w` covers raw positions
+    // [w*ratio, (w+1)*ratio-1], so a query at position `p` may attend it only
+    // once (w+1)*ratio-1 <= p — i.e. exactly `(p+1)/ratio` blocks are causally
+    // visible. The kernel's `seq_len` is already per-row and equals p+1, so the
+    // count falls straight out of it with no extra argument.
+    //
+    // This mirrors the compressor's own invariant: `v4_comp_pool_filled` is
+    // stored as `n/ratio` at prefill (cache_skip_v4) and advanced to
+    // `(pos+1)/ratio` by each decode append (v4_compress_append), so on the
+    // single-row decode path `seq_len/comp_ratio == comp_block_count` and the
+    // min() below is provably an identity — plain decode is bit-unchanged.
+    // On the verify path the pool has been built forward over ALL γ rows
+    // (v4_compress_speculate), so this clamp is what stops row r from
+    // attending blocks belonging to rows > r.
+    //
+    // comp_ratio == 0 disables the derivation and restores the old shared-count
+    // behaviour (the A/B escape hatch, and the ratio-0 layers' no-op).
+    unsigned int comp_visible = comp_block_count;
+    if (comp_ratio > 0u) {
+        const unsigned int causal = seq_len / comp_ratio;
+        if (causal < comp_visible) comp_visible = causal;
+    }
+    if (comp_pool != nullptr && comp_visible > 0u) {
+        const unsigned int cchunk = (comp_visible + NUM_WARPS - 1) / NUM_WARPS;
         unsigned int cstart = warp_id * cchunk;
         unsigned int cend = cstart + cchunk;
-        if (cend > comp_block_count) cend = comp_block_count;
+        if (cend > comp_visible) cend = comp_visible;
         for (unsigned int cb = cstart; cb < cend; cb++) {
             const unsigned char* c_block = comp_pool + (unsigned long long)cb * COMP_BLOCK_DIM;
 
@@ -512,13 +539,14 @@ __device__ void mla_paged_decode_fp8_impl(
     const unsigned int sliding_window,                                         \
     const float* __restrict__ sinks,                                           \
     const unsigned char* __restrict__ comp_pool,                               \
-    const unsigned int* __restrict__ comp_block_count_ptr
+    const unsigned int* __restrict__ comp_block_count_ptr,                     \
+    const unsigned int comp_ratio
 
 #define MLA_PAGED_DECODE_FP8_ARGS                                              \
     Q, K_cache, V_cache, O, block_tables, seq_lens, max_blocks_per_seq,        \
     num_q_heads, num_kv_heads, q_head_dim, kv_cache_dim, block_size,           \
     inv_sqrt_d, k_scale, v_scale, cache_stride_bytes, sliding_window, sinks,   \
-    comp_pool, comp_block_count_ptr
+    comp_pool, comp_block_count_ptr, comp_ratio
 
 extern "C" __global__ void mla_paged_decode_fp8(MLA_PAGED_DECODE_FP8_PARAMS) {
     mla_paged_decode_fp8_impl<false>(MLA_PAGED_DECODE_FP8_ARGS);

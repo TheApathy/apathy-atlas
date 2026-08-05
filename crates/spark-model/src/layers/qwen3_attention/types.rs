@@ -359,6 +359,29 @@ pub struct Qwen3AttentionLayer {
     /// verify path skips. Allocated ONLY when this layer owns a compressor
     /// (else `DevicePtr::NULL`); MAX_VERIFY_ROWS=8 covers γ≤7 (kt≤8).
     pub(super) verify_comp_normed: DevicePtr,
+    /// γ-verify compressor frontier snapshot (the ds4 `spec_frontier_snapshot`
+    /// analogue). `v4_compress_speculate` runs the compressor forward over ALL
+    /// γ rows *before* the verify attention so each row's causally-visible
+    /// compressed blocks actually exist; a partial accept must then rewind
+    /// every frontier to the committed prefix. These hold the pre-speculation
+    /// scalars — the device buffers go to `CompressorWeights::ring_snap` /
+    /// `prev_win_snap`.
+    ///
+    /// `spec_saved_filled`: `v4_comp_pool_filled` before speculation.
+    /// `spec_saved_prev_valid`: `v4_comp_prev_valid` before speculation.
+    /// `spec_rows`: how many rows were speculated (0 = speculation did not run
+    /// this step, so the rollback is a no-op). `spec_base_pos`: absolute
+    /// position of verify row 0, so the rollback can rebuild the ring slot map.
+    ///
+    /// Pool BYTES past the committed prefix are deliberately NOT restored:
+    /// blocks beyond the rewound count are unreachable (the kernel clamps every
+    /// row to `seq_len/ratio`) and are overwritten by the next real append.
+    /// This mirrors ds4's "invisible garbage" note — only the frontiers and
+    /// counters have to be exact.
+    pub(super) spec_saved_filled: std::sync::atomic::AtomicU32,
+    pub(super) spec_saved_prev_valid: std::sync::atomic::AtomicBool,
+    pub(super) spec_rows: std::sync::atomic::AtomicU32,
+    pub(super) spec_base_pos: std::sync::atomic::AtomicU32,
     /// HDIM=512 paged prefill (BF16 KV) for Gemma-4 chunked long-context prefill
     pub(super) prefill_attn_paged_512_k: KernelHandle,
     pub(super) prefill_attn_64_k: KernelHandle,

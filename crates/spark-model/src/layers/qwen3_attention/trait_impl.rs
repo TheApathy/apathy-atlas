@@ -43,7 +43,19 @@ pub(super) fn diag_norm(
     } else {
         format!("{:?}", &vals[..vals.len().min(4)])
     };
-    tracing::info!("DIAG {label}: norm={norm:.4} max={max_abs:.4} first4={f4} n={n_elements}");
+    // FNV-1a over the raw bytes: printed norms round to 4 decimals, which
+    // hid a real divergence during the task-#45 layer diff — only byte
+    // equality proves two probes saw the same tensor.
+    let mut fnv: u64 = 0xcbf29ce484222325;
+    for &w in buf.iter() {
+        for b in w.to_le_bytes() {
+            fnv ^= b as u64;
+            fnv = fnv.wrapping_mul(0x100000001b3);
+        }
+    }
+    tracing::info!(
+        "DIAG {label}: norm={norm:.4} max={max_abs:.4} first4={f4} n={n_elements} bhash={fnv:016x}"
+    );
 }
 
 /// Debug: read back FP32 GPU tensor and compute L2 norm + first 4 values.

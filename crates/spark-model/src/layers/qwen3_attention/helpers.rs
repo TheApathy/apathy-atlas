@@ -56,7 +56,7 @@ impl Qwen3AttentionLayer {
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         hidden_size: usize,
     ) -> anyhow::Result<()> {
-        const MAX_VERIFY_ROWS: usize = 8;
+        use super::types_weights::MAX_VERIFY_ROWS;
         let has_comp = self
             .mla
             .as_ref()

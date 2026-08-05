@@ -215,11 +215,14 @@ impl DsparkDraftHead {
             k_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             k_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             k_gemv_fp8: gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?,
-            k_gemm_smallm: crate::layers::try_kernel(
-                gpu,
-                "w4a16",
-                "fp8_gemm_t_row_scaled_mtile8",
-            ),
+            // ATLAS_LMHEAD_EXACT=1: zero the handle so the block tail takes
+            // the per-row GEMV — this GEMM casts BF16 activations to FP8 in-
+            // kernel and its near-tie argmax can differ (see impl_a1's gate).
+            k_gemm_smallm: if std::env::var("ATLAS_LMHEAD_EXACT").as_deref() == Ok("1") {
+                spark_runtime::gpu::KernelHandle(0)
+            } else {
+                crate::layers::try_kernel(gpu, "w4a16", "fp8_gemm_t_row_scaled_mtile8")
+            },
             k_rms: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             k_residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             k_hc_expand: gpu.kernel("hyper_connection", "hc_expand")?,
@@ -881,7 +884,13 @@ impl DsparkDraftHead {
         let mut drafts = Vec::with_capacity(b as usize);
         let mut confs = Vec::with_capacity(b as usize);
         if chain_on_device {
-            gpu.copy_h2d_async(&committed.to_le_bytes(), self.tok_dev, stream)?;
+            // Device-side write, NOT copy_h2d_async(&committed.to_le_bytes()):
+            // that rvalue temporary dies at the end of the statement while the
+            // async copy may still be queued (first sync is after the whole
+            // chain loop), and a torn read here poisons tok_dev[0] — the
+            // gather index every subsequent chain row derives from. This was a
+            // measured source of greedy non-determinism in the DSpark path.
+            gpu.memset_u32_async(self.tok_dev, committed, 1, stream)?;
         }
         let mut prev = committed;
         for r in 0..b as usize {

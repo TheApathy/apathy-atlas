@@ -557,6 +557,12 @@ impl Qwen3AttentionLayer {
             // Armed post-construction (only for compressor layers) via
             // `alloc_verify_comp_normed`; NULL disables the γ-verify catch-up.
             verify_comp_normed: spark_runtime::gpu::DevicePtr::NULL,
+            // γ-verify frontier snapshot. `spec_rows: 0` = nothing speculated
+            // yet, so a rollback before the first speculation is a no-op.
+            spec_saved_filled: std::sync::atomic::AtomicU32::new(0),
+            spec_saved_prev_valid: std::sync::atomic::AtomicBool::new(false),
+            spec_rows: std::sync::atomic::AtomicU32::new(0),
+            spec_base_pos: std::sync::atomic::AtomicU32::new(0),
             prefill_attn_paged_512_k: super::super::try_kernel(
                 gpu,
                 "inferspark_prefill_paged_512",

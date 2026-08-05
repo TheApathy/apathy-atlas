@@ -153,8 +153,57 @@ impl MoeLayer {
             && self.dense_gemv_batchm.0 != 0
             && n <= ops::DENSE_GEMV_BATCHM_MAX_M
             && self.gate_nvfp4.is_none();
+        // ATLAS_MOE_GATE_EXACT=1: compute each row's gate logits with the SAME
+        // single-row kernel the m=1 decode path uses (`dense_gemv` /
+        // `w4a16_gemv`), one launch per row. The tiled `dense_gemm_bf16` below
+        // has a different f32 accumulation order, and its BF16 logits can
+        // differ from the GEMV's by an ULP — enough to flip the top-6 expert
+        // set on near-tied rows (the routing-cascade failure this file already
+        // documents at the gate_gemv note). A flipped expert set makes the
+        // verify row's FFN diverge from what plain decode computes at the same
+        // position, the hyper-connection streams amplify it layer over layer,
+        // and the γ-verify argmax leaves the plain-greedy stream — task #45's
+        // measured 2-3% capture drift and acceptance collapse. Per-row cost is
+        // trivial: the gate weight is ~2 MB against the ~74 ms expert sweep.
+        let gate_exact = {
+            static GE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *GE.get_or_init(|| std::env::var("ATLAS_MOE_GATE_EXACT").as_deref() == Ok("1"))
+        };
         prof!("gate", {
-            if gate_gemv {
+            if gate_exact {
+                let hb = h as usize * 2;
+                let eb = num_experts as usize * 2;
+                let mut r = Ok(());
+                for i in 0..n as usize {
+                    r = if let Some(ref nvfp4) = self.gate_nvfp4 {
+                        ops::w4a16_gemv(
+                            ctx.gpu,
+                            self.w4a16_gemv,
+                            router_in.offset(i * hb),
+                            nvfp4,
+                            gate_logits.offset(i * eb),
+                            num_experts,
+                            h,
+                            stream,
+                        )
+                    } else {
+                        ops::dense_gemv(
+                            ctx.gpu,
+                            self.dense_gemv,
+                            router_in.offset(i * hb),
+                            &self.weights.gate,
+                            gate_logits.offset(i * eb),
+                            num_experts,
+                            h,
+                            stream,
+                        )
+                    };
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                r
+            } else if gate_gemv {
                 // router_in [n, h] and gate_logits [n, num_experts] are both
                 // densely packed here, so the strides are exactly h and
                 // num_experts.

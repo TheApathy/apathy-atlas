@@ -98,12 +98,26 @@ impl TransformerModel {
         // verify lm_head when the FP8 mirror is active. try_kernel: 0-handle
         // on targets whose w4a16 module predates them — the lm_head_batched
         // dispatch falls back to the per-token GEMV loop.
-        let fp8_gemm_row_scaled_mtile8_kernel =
-            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "fp8_gemm_t_row_scaled_mtile8");
-        let fp8_gemm_row_scaled_m16_kernel =
-            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "fp8_gemm_t_row_scaled_m16");
-        let fp8_gemm_row_scaled_kernel =
-            crate::layers::try_kernel(gpu.as_ref(), "w4a16", "fp8_gemm_t_row_scaled");
+        //
+        // ATLAS_LMHEAD_EXACT=1 zeroes all three handles, forcing that same
+        // per-token `dense_gemv_fp8w` fallback: these GEMMs cast the BF16
+        // activations to FP8-E4M3 in-kernel (bf16x4_to_e4m3x4 → e4m3·e4m3
+        // MMA, w4a16_gemm.cu), so their logits carry ~2-3% activation-
+        // quantization noise the GEMV path does not. On the γ-row verify that
+        // flips near-tie argmaxes: correct drafts get rejected and the
+        // committed text leaves the plain-greedy stream — the measured
+        // acceptance collapse (1.06 online vs 3.69 offline, task #45).
+        let lmhead_exact = std::env::var("ATLAS_LMHEAD_EXACT").as_deref() == Ok("1");
+        let gemm_tier = |module: &str, name: &str| {
+            if lmhead_exact {
+                spark_runtime::gpu::KernelHandle(0)
+            } else {
+                crate::layers::try_kernel(gpu.as_ref(), module, name)
+            }
+        };
+        let fp8_gemm_row_scaled_mtile8_kernel = gemm_tier("w4a16", "fp8_gemm_t_row_scaled_mtile8");
+        let fp8_gemm_row_scaled_m16_kernel = gemm_tier("w4a16", "fp8_gemm_t_row_scaled_m16");
+        let fp8_gemm_row_scaled_kernel = gemm_tier("w4a16", "fp8_gemm_t_row_scaled");
         let dense_gemm_kernel = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
         let argmax_logits_kernel = gpu.kernel("argmax", "argmax_fp32")?;

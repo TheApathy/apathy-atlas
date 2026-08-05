@@ -748,6 +748,14 @@ impl TransformerModel {
             else {
                 continue;
             };
+            // Rewind anything the pre-verify speculation moved, THEN replay the
+            // append for the committed rows. Order matters: the speculation ran
+            // the compressor over all γ draft positions so each verify row could
+            // see its own compressed blocks, and on a partial accept those
+            // frontiers point past the accepted prefix. Restoring first leaves
+            // the catch-up below byte-identical to the non-speculative path.
+            // No-op when speculation did not run this step.
+            attn.v4_compress_restore(&ctx, stream)?;
             attn.v4_compress_catchup(&ctx, pre_len, num_committed, eps, stream)?;
         }
         Ok(())

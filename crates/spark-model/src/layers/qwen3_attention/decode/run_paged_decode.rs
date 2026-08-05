@@ -102,18 +102,42 @@ impl Qwen3AttentionLayer {
                 // compressor's per-step growth instead of the value baked at
                 // capture — the fix for the DSpark acceptance collapse. `comp_blocks`
                 // (host mirror) is kept only for the diagnostic log below.
-                let (comp_pool, comp_count_ptr, comp_blocks) = match mla.compressor {
+                //
+                // `comp_ratio` (the γ-verify boundary fix) lets the kernel derive
+                // each ROW's causally-visible block count as `seq_len / ratio`
+                // rather than sharing one scalar across all rows. Every writer of
+                // `v4_comp_pool_filled` maintains `filled == seq_len / ratio`
+                // (prefill stores `n / ratio`; each decode append stores
+                // `(pos+1) / ratio`), so on this single-row path the derived count
+                // equals the scalar and the kernel is bit-unchanged. It only bites
+                // on the multi-row verify launch, where the pool has been built
+                // forward over every γ row by `v4_compress_speculate`.
+                let (comp_pool, comp_count_ptr, comp_blocks, comp_ratio) = match mla.compressor {
                     Some(c) => (
                         c.pool,
                         self.v4_comp_count_dev,
                         self.v4_comp_pool_filled
                             .load(std::sync::atomic::Ordering::Relaxed),
+                        c.ratio as u32,
                     ),
                     None => (
                         spark_runtime::gpu::DevicePtr::NULL,
                         spark_runtime::gpu::DevicePtr::NULL,
                         0u32,
+                        0u32,
                     ),
+                };
+                // ATLAS_V4_NO_PERROW_COMP=1: fall back to the pre-fix shared count
+                // (A/B harness for isolating the per-row visibility change).
+                let comp_ratio = {
+                    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    if *OFF.get_or_init(|| {
+                        std::env::var("ATLAS_V4_NO_PERROW_COMP").as_deref() == Ok("1")
+                    }) {
+                        0u32
+                    } else {
+                        comp_ratio
+                    }
                 };
                 // ATLAS_V4_FORCE_NO_COMP=1: drop the compressed arm on EVERY
                 // path (decode + verify). Diagnostic only — proves the
@@ -196,6 +220,7 @@ impl Qwen3AttentionLayer {
                     self.mla.as_ref().unwrap().attn_sink,
                     comp_pool,
                     comp_count_ptr,
+                    comp_ratio,
                     stream,
                 )
             }

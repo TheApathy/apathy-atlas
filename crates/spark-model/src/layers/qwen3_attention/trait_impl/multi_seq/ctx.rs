@@ -72,6 +72,16 @@ pub(super) struct MultiSeqCtx<'a> {
     /// [`Qwen3AttentionLayer::decode_multi_seq_tree_inner`]. Every other
     /// entry point leaves it `None`, so the flat verify is untouched.
     pub tree: Option<TreeSplit<'a>>,
+    /// Absolute position of row 0, when this batch is a contiguous γ-verify
+    /// window over ONE sequence (host `seq_lens[r] == seq_lens[0] + r`).
+    /// `None` for a genuine multi-sequence co-batch, where the rows are
+    /// unrelated streams and no single compressor frontier applies.
+    ///
+    /// Read only by the V4 compressed-arm speculation
+    /// (`v4_compress_speculate`), which needs a HOST-side position: the
+    /// `AttnMetadataDev` positions live on device, and the compressor's window
+    /// bookkeeping is host logic.
+    pub verify_base_pos: Option<usize>,
 }
 
 impl<'a> MultiSeqCtx<'a> {
@@ -122,6 +132,29 @@ impl<'a> MultiSeqCtx<'a> {
             seq_slot: DevicePtr(0),
             fused_qk_epilogue: false,
             tree: None,
+            verify_base_pos: None,
         }
     }
+}
+
+/// Recognise a contiguous single-sequence γ-verify window from the HOST
+/// `seq_lens` the batched decode was called with, returning row 0's absolute
+/// position.
+///
+/// The verify builder emits `seq_lens[r] = seq.seq_len + r`
+/// (`verify_d.rs:356`), and `AttnMetadataDev::seq_len` is that value **+1** —
+/// so host `seq_lens[0]` is already the absolute position of row 0. Requiring
+/// the exact `+r` stride is what distinguishes a γ window from a genuine
+/// multi-sequence co-batch, where advancing one compressor frontier over all
+/// rows would be meaningless.
+pub(super) fn verify_base_pos_of(seq_lens: &[usize], n: usize) -> Option<usize> {
+    if n == 0 || seq_lens.len() < n {
+        return None;
+    }
+    let base = seq_lens[0];
+    seq_lens[..n]
+        .iter()
+        .enumerate()
+        .all(|(r, &l)| l == base + r)
+        .then_some(base)
 }

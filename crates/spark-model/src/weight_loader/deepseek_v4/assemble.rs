@@ -11,7 +11,8 @@ use crate::layer::TransformerLayer;
 use crate::layers::FfnComponent;
 use crate::layers::MoeLayer;
 use crate::layers::qwen3_attention::{
-    CompressorWeights, HcHeadWeights, HcSiteWeights, HcWeights, MlaWeights, Qwen3AttentionLayer,
+    CompressorWeights, HcHeadWeights, HcSiteWeights, HcWeights, MAX_VERIFY_ROWS, MlaWeights,
+    Qwen3AttentionLayer,
 };
 use crate::weight_map::{
     AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, QuantizedWeight, dense, dense_auto,
@@ -290,6 +291,16 @@ pub fn assemble_layer(
                     spark_runtime::gpu::DevicePtr::NULL,
                 )
             };
+            // γ-verify frontier snapshots (see CompressorWeights docs). The ring
+            // snapshot only covers the slots a γ window can clobber — at most
+            // MAX_VERIFY_ROWS of them — so the ratio-128 HCA layers pay 8 slots
+            // (64 KB), not their full 1 MB ring. prev_win is CSA-only.
+            let ring_snap = gpu.alloc(ratio.min(MAX_VERIFY_ROWS) * h * 2)?;
+            let prev_win_snap = if is_csa {
+                gpu.alloc(ratio * h * 2)?
+            } else {
+                spark_runtime::gpu::DevicePtr::NULL
+            };
             Some(CompressorWeights {
                 wkv,
                 wgate,
@@ -303,6 +314,8 @@ pub fn assemble_layer(
                 ring,
                 prev_win,
                 stage,
+                ring_snap,
+                prev_win_snap,
             })
         } else {
             None
