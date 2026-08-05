@@ -1390,8 +1390,37 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
     #undef SILUDOWN_M_ACCUM
 }
 
+// Register-budget hint for the whole multi-row (_m) family.
+//
+// Without it ptxas tunes every arm to the same ~64-register point, which is the
+// wrong target at BOTH ends of the dedup ladder and cost ~13 GB/s at the
+// production overlap. Measured on GB10 (sm_121, 65536 regs/SM, t_block=64),
+// gate_up at overlap=4, bandwidth taken as `union_bytes / kernel_time`:
+//
+//   arm    regs before -> after   occupancy      effect
+//   m1u      64  ->  56           67% -> 75%     more warps hide the load latency
+//   m6d      64  -> 128           67% -> 26%     deep load pipelining; the
+//                                                long_scoreboard stall drops
+//                                                9.94 -> 2.28 cycles/issue and
+//                                                the kernel still gets faster
+//
+// The two arms want opposite things: the M=1 arm is warp-starved and wants a
+// small footprint, while the M=6 arm already carries MROW accumulators and is
+// latency-bound, so it wants registers to keep many loads in flight. `(256, 2)`
+// expresses exactly that — "at least 2 CTAs of up to 256 threads per SM" — and
+// lets ptxas spend up to 128 regs where that pays while still squeezing the
+// single-row arm. Swept 1/2/3/4/5: 2 wins at every overlap (LB=1 lets the M=1
+// arm bloat again, LB>=3 clamps the M=6 arm's pipelining).
+//
+// 256 is the widest t_block the host may choose (`ATLAS_MOE_T_BLOCK`,
+// fp8_moe.rs:319-335), so the bound is valid for every launch this family takes.
+//
+// This is a scheduling hint only: no code, no decode and no FMA order changes,
+// so both microtest gates stay bit-identical.
+#define MOE_M_LB __launch_bounds__(256, 2)
+
 #define GATEUP_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_) \
-extern "C" __global__ void NAME(                                               \
+extern "C" __global__ MOE_M_LB void NAME(                                      \
     const __nv_bfloat16* __restrict__ A,                                       \
     const unsigned long long* __restrict__ gate_packed_t_ptrs,                 \
     const unsigned long long* __restrict__ gate_scale_t_ptrs,                  \
@@ -1424,7 +1453,7 @@ extern "C" __global__ void NAME(                                               \
 }
 
 #define DOWN_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_, PRECOMPUTED_) \
-extern "C" __global__ void NAME(                                               \
+extern "C" __global__ MOE_M_LB void NAME(                                      \
     const __nv_bfloat16* __restrict__ gate_out,                                \
     const __nv_bfloat16* __restrict__ up_out,                                  \
     const float* __restrict__ precomputed_act,                                 \

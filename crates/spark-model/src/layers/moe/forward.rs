@@ -98,6 +98,13 @@ impl MoeLayer {
         macro_rules! prof {
             ($label:expr, $body:expr) => {{
                 if profile {
+                    // Drain FIRST — same fix as the wide-verify macro in
+                    // `forward_km`. Without it the timer starts with earlier
+                    // launches still in flight and the trailing sync bills them
+                    // to this stage; there it inflated the first stage 2.4x
+                    // (221 vs a kernel-only 92 us) and sent a whole
+                    // investigation after a 6 ms/step non-lever.
+                    ctx.gpu.synchronize(stream)?;
                     let t = std::time::Instant::now();
                     let r = $body;
                     ctx.gpu.synchronize(stream)?;
