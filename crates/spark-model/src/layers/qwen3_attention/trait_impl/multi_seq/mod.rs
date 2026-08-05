@@ -232,6 +232,22 @@ impl Qwen3AttentionLayer {
         };
 
         if is_first_layer {
+            // Task #45: raw layer-entry hidden per row (= the embedding at
+            // L0). Row 1 collapsed to a DIFFERENT token's collapse than its
+            // host-side draft — this probe, hashed against embedding-table
+            // rows read straight from the safetensors, decides whether the
+            // wrong token was embedded or the row was clobbered afterwards.
+            if diag_this {
+                for r in 0..n {
+                    super::diag_norm(
+                        ctx.gpu,
+                        c.hidden.offset(r * c.h * c.bf16),
+                        h,
+                        stream,
+                        &format!("V4-msdecode L{} pre r{r}", self.attn_layer_idx),
+                    );
+                }
+            }
             ops::hc_expand(
                 ctx.gpu,
                 self.hc_expand_k,
@@ -333,6 +349,27 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        // Task #45 rows>0 localization: per-row collapsed hidden and normed —
+        // rows>0 diverge from plain at the MLA's Q input, so the layer-front
+        // (hc collapse → rms) is under byte-level suspicion per row.
+        if diag_this {
+            for r in 0..n {
+                super::diag_norm(
+                    ctx.gpu,
+                    c.hidden.offset(r * c.h * c.bf16),
+                    h,
+                    stream,
+                    &format!("V4-msdecode L{} collapsed r{r}", self.attn_layer_idx),
+                );
+                super::diag_norm(
+                    ctx.gpu,
+                    c.normed.offset(r * c.h * c.bf16),
+                    h,
+                    stream,
+                    &format!("V4-msdecode L{} normed r{r}", self.attn_layer_idx),
+                );
+            }
+        }
 
         let meta = ctx
             .attn_metadata
@@ -540,16 +577,23 @@ impl Qwen3AttentionLayer {
             // for dense/no FFN), so the per-token loop below still covers every
             // layer and width it declines.
             let batched = n > 1 && self.ffn.forward_verify_rows(c.normed, n, ctx, stream)?;
-            // Row-0 FFN output — pairs with plain's "V4-decode L{} ffn-out"
-            // for the task-#45 byte-level layer diff (m-row MoE exactness).
+            // Per-row FFN output — pairs with plain's "V4-decode L{} ffn-out"
+            // for the task-#45 byte-level layer diff. Row r of the verify at
+            // position p+r computes the SAME function plain's step r+1 does
+            // (when the draft matches plain's token), so occurrence r here
+            // byte-pairs with plain-log occurrence r+1. Row 0 exactness is
+            // proven; rows>0 are where the bonus token still leaves the plain
+            // stream.
             if batched && diag_this {
-                super::diag_norm(
-                    ctx.gpu,
-                    ctx.buffers.moe_output(),
-                    h,
-                    stream,
-                    &format!("V4-msdecode L{} ffn-out", self.attn_layer_idx),
-                );
+                for r in 0..n {
+                    super::diag_norm(
+                        ctx.gpu,
+                        ctx.buffers.moe_output().offset(r * c.h * c.bf16),
+                        h,
+                        stream,
+                        &format!("V4-msdecode L{} ffn-out r{r}", self.attn_layer_idx),
+                    );
+                }
             }
             // ATLAS_MOE_OVERLAP=1 (no-op otherwise): open a row group so the
             // per-row MoE fires below can be scored for expert-set overlap.

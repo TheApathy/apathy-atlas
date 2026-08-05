@@ -14,6 +14,18 @@ mod decode_inner;
 mod multi_seq;
 mod prefill_inner;
 
+/// Public re-export of [`diag_norm`] for probes outside the attention module
+/// (the task-#45 verify_d post-embed bracket).
+pub fn diag_norm_pub(
+    gpu: &dyn GpuBackend,
+    ptr: DevicePtr,
+    n_elements: usize,
+    stream: u64,
+    label: &str,
+) {
+    diag_norm(gpu, ptr, n_elements, stream, label)
+}
+
 /// Debug: read back BF16 GPU tensor and compute L2 norm + first 4 values.
 pub(super) fn diag_norm(
     gpu: &dyn GpuBackend,

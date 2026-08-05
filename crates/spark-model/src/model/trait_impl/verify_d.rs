@@ -132,6 +132,42 @@ impl TransformerModel {
         for t in 0..kt {
             self.embed(tokens_all[t], hidden.offset(t * h * fp32), stream)?;
         }
+        // Task #45: hash each freshly-embedded row. At L0 the layer saw rows
+        // 0..3 holding something OTHER than their tokens' embedding-table rows
+        // while rows 4..5 were pristine — this probe brackets whether the
+        // overwrite happens before or after this point.
+        {
+            static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *D.get_or_init(|| {
+                std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true")
+            }) {
+                static ADDRS: std::sync::Once = std::sync::Once::new();
+                ADDRS.call_once(|| {
+                    tracing::info!(
+                        "BUFADDR hidden={:#x} residual={:#x} scratch={:#x} norm_out={:#x} \
+                         qkv_out={:#x} attn_out={:#x} moe_out={:#x} token_ids={:#x} h*2={:#x}",
+                        hidden.0,
+                        residual.0,
+                        self.buffers.scratch().0,
+                        self.buffers.norm_output().0,
+                        self.buffers.qkv_output().0,
+                        self.buffers.attn_output().0,
+                        self.buffers.moe_output().0,
+                        self.buffers.token_ids().0,
+                        h * 2,
+                    );
+                });
+                for t in 0..kt {
+                    crate::layers::qwen3_attention::diag_norm_pub(
+                        self.gpu.as_ref(),
+                        hidden.offset(t * h * fp32),
+                        h,
+                        stream,
+                        &format!("V4-verify post-embed r{t} tok={}", tokens_all[t]),
+                    );
+                }
+            }
+        }
 
         // 1b. Allocate KV blocks for all K positions
         let bs = kv_cache.block_size();

@@ -37,6 +37,7 @@ mod types_weights;
 
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;
+pub use trait_impl::diag_norm_pub;
 // V4: re-export the new hyper-connection / compressor weight types alongside the
 // existing ones. These are only constructed under DeepSeek-V4 detection.
 pub(crate) use types::HeadGateActivation;

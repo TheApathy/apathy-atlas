@@ -589,6 +589,15 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        if diag_this {
+            super::diag_norm(
+                ctx.gpu,
+                normed,
+                h,
+                stream,
+                &format!("V4-decode L{} normed", self.attn_layer_idx),
+            );
+        }
 
         let attn_out = self.attention_forward(
             normed,

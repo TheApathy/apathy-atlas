@@ -248,6 +248,24 @@ pub fn step_verify_dflash(
             break;
         }
     }
+    // ATLAS_DFLASH_VSTEP_DIAG=1: one line per verify step with the full
+    // draft/verified vectors. The task-#45 fork localization needs to know,
+    // at the step where the committed text leaves the plain-greedy stream,
+    // whether the divergent token was a BONUS (verified[acc], i.e. a row>acc
+    // logits problem) or a wrongly-accepted draft (an accept-walk problem).
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_VSTEP_DIAG").as_deref() == Ok("1")) {
+            tracing::info!(
+                "VSTEP pre={} in={:?} verified={:?} acc={} bonus={}",
+                a.seq.seq_len.saturating_sub(tokens.len()),
+                tokens,
+                verified,
+                num_accepted,
+                verified.get(num_accepted).copied().unwrap_or(u32::MAX),
+            );
+        }
+    }
 
     // Block-fork walk: A died exactly at the hedged cliff AND the target's
     // correction IS the fork token → continue on chain B (its rows verified
