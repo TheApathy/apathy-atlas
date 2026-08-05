@@ -155,6 +155,21 @@ impl Qwen3AttentionLayer {
                         (comp_count_ptr, comp_blocks)
                     }
                 };
+                // Task #45: per-launch comp-read parameters at the first CSA
+                // layer, diag-gated. Pairs with the "V4-comp append" pool-block
+                // hashes: if the pool bytes match plain but these read params
+                // differ (count/ratio the kernel sees), the CSA divergence is
+                // on the read side.
+                if self.attn_layer_idx == 2
+                    && std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
+                        .is_ok_and(|v| v == "1" || v == "true")
+                {
+                    tracing::info!(
+                        "V4-comp READ L2: num_seqs={num_seqs} comp_blocks={comp_blocks} \
+                         comp_ratio={comp_ratio} count_ptr_null={}",
+                        comp_count_ptr.is_null(),
+                    );
+                }
                 if self.attn_layer_idx == 2
                     && std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok()
                 {

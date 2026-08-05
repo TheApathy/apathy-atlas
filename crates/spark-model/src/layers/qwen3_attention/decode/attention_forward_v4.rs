@@ -786,6 +786,25 @@ impl Qwen3AttentionLayer {
                         (comp.ring, ratio, 1u32, 0u32)
                     };
 
+                    // Task #45: hash the compress input window (prev_win ‖
+                    // ring staging, or ring alone) — the append produced
+                    // different block bytes per path with believed-equal
+                    // inputs; this decides which ingredient differs.
+                    if std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
+                        .is_ok_and(|v| v == "1" || v == "true")
+                        && !ctx.graph_capture
+                    {
+                        super::super::trait_impl::diag_norm(
+                            ctx.gpu,
+                            comp_in,
+                            t_rows as usize * h as usize,
+                            stream,
+                            &format!(
+                                "V4-comp L{} comp-in w={w} pos={pos} t_rows={t_rows} prev_valid={prev_valid}",
+                                self.attn_layer_idx
+                            ),
+                        );
+                    }
                     // compressor projections kv/gate = W·comp_in [T, proj_dim]
                     let kv_comp = ctx.buffers.expert_up_out();
                     let gate_comp = ctx.buffers.expert_down_out();
@@ -900,6 +919,26 @@ impl Qwen3AttentionLayer {
                         hd_mla,
                         stream,
                     )?;
+                    // Task #45: hash the just-written pool block. This append
+                    // is SHARED between plain decode and the γ-speculate
+                    // replay, so byte-equal hashes here at the same (w, pos)
+                    // prove the pool content is path-independent — pushing the
+                    // CSA divergence into the attention's comp READ side.
+                    if std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
+                        .is_ok_and(|v| v == "1" || v == "true")
+                        && !ctx.graph_capture
+                    {
+                        super::super::trait_impl::diag_norm(
+                            ctx.gpu,
+                            comp.pool.offset(w as usize * hd_mla as usize),
+                            hd_mla as usize / 2, // FP8 bytes read as bf16 pairs — hash-only probe
+                            stream,
+                            &format!(
+                                "V4-comp L{} append w={w} pos={pos}",
+                                self.attn_layer_idx
+                            ),
+                        );
+                    }
                     // Publish: decode's compressed arm now attends [0, w+1).
                     self.v4_comp_pool_filled.store(w + 1, Relaxed);
                     // Mirror to the device word the graphed kernels read at replay,
