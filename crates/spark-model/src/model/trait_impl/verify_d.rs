@@ -350,6 +350,19 @@ impl TransformerModel {
         self.gpu
             .copy_h2d_async(&tid_bytes, self.buffers.token_ids(), stream)?;
 
+        // Arm the compressor-speculation gate for THIS verify only, cleared
+        // on every exit path (drop guard). See DFLASH_VERIFY_ACTIVE's doc.
+        struct VerifyGate;
+        impl Drop for VerifyGate {
+            fn drop(&mut self) {
+                crate::layers::qwen3_attention::DFLASH_VERIFY_ACTIVE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        crate::layers::qwen3_attention::DFLASH_VERIFY_ACTIVE
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _verify_gate = VerifyGate;
+
         let st3_t1 = st3.then(std::time::Instant::now);
         // ── Phase 2: CUDA graph capture / replay ──
 

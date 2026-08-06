@@ -801,7 +801,7 @@ impl Qwen3AttentionLayer {
                                 comp_in,
                                 half,
                                 stream,
-                                &format!("V4-comp L{} in-prevwin w={w} pos={pos}", self.attn_layer_idx),
+                                &format!("V4-comp L{} in-prevwin w={w} pos={pos} obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
                             );
                             super::super::trait_impl::diag_norm(
                                 ctx.gpu,
@@ -984,8 +984,9 @@ impl Qwen3AttentionLayer {
                             hd_mla as usize / 2, // FP8 bytes read as bf16 pairs — hash-only probe
                             stream,
                             &format!(
-                                "V4-comp L{} append w={w} pos={pos}",
-                                self.attn_layer_idx
+                                "V4-comp L{} append w={w} pos={pos} obj={:x}",
+                                self.attn_layer_idx,
+                                (self as *const _ as usize >> 4) & 0xffff
                             ),
                         );
                     }

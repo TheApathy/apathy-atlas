@@ -680,6 +680,26 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+            // Task #45: hash the seeded ring right here — the step-1 build
+            // later sees a slot-1 value that differs between engines; this
+            // probe decides whether the seed itself wrote it or a later
+            // writer clobbered it.
+            if std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true")
+                && self.attn_layer_idx == 2
+            {
+                for j in 0..cratio as usize {
+                    super::super::trait_impl::diag_norm(
+                        ctx.gpu,
+                        comp.ring.offset(j * hbytes),
+                        h as usize,
+                        stream,
+                        &format!(
+                            "V4-comp L2 seed-slot{j} crem={crem} obj={:x}",
+                            (self as *const _ as usize >> 4) & 0xffff
+                        ),
+                    );
+                }
+            }
         }
         if !did_csa {
             // V4 full-attention (non-CSA) is always HDIM=512 → the 512 kernel.

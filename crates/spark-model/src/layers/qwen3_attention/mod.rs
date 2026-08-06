@@ -38,6 +38,17 @@ mod types_weights;
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;
 pub use trait_impl::diag_norm_pub;
+
+/// Armed ONLY while `decode_verify_dflash` runs its layer loop (RAII-cleared
+/// by a drop guard on every exit path). The V4 compressor speculation must
+/// fire exclusively on the REAL γ-verify: other multi-row forwards (measured:
+/// a per-step 4-row target forward right after the drafter propose) also
+/// present contiguous seq_lens, and their speculate appends advanced
+/// `prev_win` with non-committed rows — the last deterministic divergence
+/// from plain greedy (task #45). Process-global is sound here: single-GPU
+/// serving runs one scheduler thread.
+pub static DFLASH_VERIFY_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 // V4: re-export the new hyper-connection / compressor weight types alongside the
 // existing ones. These are only constructed under DeepSeek-V4 detection.
 pub(crate) use types::HeadGateActivation;

@@ -49,7 +49,16 @@ impl Qwen3AttentionLayer {
         // host (see `MultiSeqCtx::verify_base_pos`). `seq_lens` is the only
         // host-side view of it that reaches this path — everything else the
         // attention consumes is the pre-uploaded device `attn_metadata`.
-        c.verify_base_pos = ctx::verify_base_pos_of(seq_lens, num_seqs);
+        c.verify_base_pos = if crate::layers::qwen3_attention::DFLASH_VERIFY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ctx::verify_base_pos_of(seq_lens, num_seqs)
+        } else {
+            // Not the γ-verify: other multi-row forwards (drafter-adjacent
+            // per-step forwards, warmups) also present contiguous seq_lens,
+            // and running the compressor speculation there poisons prev_win
+            // with non-committed rows (task #45's last divergence).
+            None
+        };
         // Per-request LoRA routing slot buffer for this step (from metadata).
         if let Some(m) = ctx.attn_metadata.as_ref() {
             c.seq_slot = m.seq_slot;
