@@ -282,6 +282,13 @@ impl DsparkDraftHead {
         if gpu.copy_d2h(ptr, &mut b).is_err() {
             return;
         }
+        // bhash decides equality — 4-decimal norms hide byte drift (task #45:
+        // the norm-based probes falsely cleared every stage before s0.o5).
+        let mut fnv: u64 = 0xcbf29ce484222325;
+        for &byte in b.iter() {
+            fnv ^= byte as u64;
+            fnv = fnv.wrapping_mul(0x100000001b3);
+        }
         let v: Vec<f32> = b
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
@@ -292,7 +299,7 @@ impl DsparkDraftHead {
             .sum::<f64>()
             .sqrt();
         eprintln!(
-            "DSPARK_DBG {label}: norm={norm:.4} first={:?}",
+            "DSPARK_DBG {label}: bhash={fnv:016x} norm={norm:.4} first={:?}",
             &v[..4.min(v.len())]
         );
     }
@@ -307,6 +314,11 @@ impl DsparkDraftHead {
         if gpu.copy_d2h(ptr, &mut b).is_err() {
             return;
         }
+        let mut fnv: u64 = 0xcbf29ce484222325;
+        for &byte in b.iter() {
+            fnv ^= byte as u64;
+            fnv = fnv.wrapping_mul(0x100000001b3);
+        }
         let v: Vec<f32> = b
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -317,7 +329,7 @@ impl DsparkDraftHead {
             .sum::<f64>()
             .sqrt();
         eprintln!(
-            "DSPARK_DBG {label}: norm={norm:.4} first={:?}",
+            "DSPARK_DBG {label}: bhash={fnv:016x} norm={norm:.4} first={:?}",
             &v[..4.min(v.len())]
         );
     }
