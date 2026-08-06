@@ -241,7 +241,7 @@ fn main() -> Result<()> {
                 cap_dev.offset(2 * h * 2),
             ];
             let tp = std::time::Instant::now();
-            let (drafts, _confs) =
+            let (drafts, _confs, _top2) =
                 head.propose_block(gpu, &ctx, caps, committed, p as usize, stream)?;
             propose_ms += tp.elapsed().as_secs_f64() * 1e3;
             n_props += 1;

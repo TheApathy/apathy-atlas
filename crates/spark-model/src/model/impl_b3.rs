@@ -564,6 +564,28 @@ impl TransformerModel {
     /// fixed row-0 address of `dspark_capture_stage`, and calls
     /// `dspark_capture_commit` after the graph launch to relocate the rows to
     /// their sequence positions eagerly.
+    /// Sequence-position base the γ-verify's DSpark capture writes at.
+    ///
+    /// Task #45: the online captures the drafter reads were measured (probe
+    /// dump vs a plain-decode `ATLAS_DSPARK_DUMP`) to hold the hidden of
+    /// position `p-1` at row `p` — cos 0.98-0.99 against plain `p-1` where
+    /// row `p` itself scores 0.45 — from the exact step the verify path takes
+    /// over from plain decode. A one-row shift in the drafter's whole ring is
+    /// enough to explain the 3.69 -> 1.02 tok/step online collapse.
+    /// `ATLAS_DSPARK_CAP_WSHIFT=<int>` A/Bs the write base without a rebuild;
+    /// the plain-decode and prefill captures (which agree with the offline
+    /// oracle by construction) are never shifted.
+    pub(super) fn dspark_verify_row_base(&self, seq_len: usize) -> usize {
+        static WS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        let shift = *WS.get_or_init(|| {
+            std::env::var("ATLAS_DSPARK_CAP_WSHIFT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
+        (seq_len as i64 + shift).max(0) as usize
+    }
+
     pub(super) fn try_dspark_capture(
         &self,
         layer_idx: usize,

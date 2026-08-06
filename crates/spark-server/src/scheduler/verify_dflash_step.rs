@@ -390,6 +390,24 @@ pub fn step_verify_dflash(
     if let Err(e) = model.dspark_compress_catchup(pre_verify_len, num_accepted + 1, 0) {
         tracing::error!("dspark_compress_catchup: {e:#}");
     }
+    // ATLAS_DSPARK_DUMP diagnostic (task #45): emit the ONLINE γ-verify-generated
+    // hc-mean captures as kind=1 records so the engine probe can replay them and
+    // isolate whether the acceptance collapse is the capture SOURCE (verify
+    // numerics) vs the drafter. One record per committed position with its
+    // committed token; no-op unless the model armed the dump file.
+    {
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DUMP.get_or_init(|| std::env::var("ATLAS_DSPARK_DUMP").is_ok()) {
+            for i in 0..=num_accepted {
+                let pos = pre_verify_len + i;
+                if let Some(&tok) = a.seq.tokens.get(pos) {
+                    if let Err(e) = model.dspark_dump_flush_pos(pos, tok, 0) {
+                        tracing::error!("dspark_dump_flush_pos: {e:#}");
+                    }
+                }
+            }
+        }
+    }
     if b_win {
         // The pushed A-chain slot at the fork position holds the REJECTED
         // draft; patch in the fork token (the B tail beyond it is identical

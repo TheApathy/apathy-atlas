@@ -550,7 +550,8 @@ impl TransformerModel {
                 // DSpark capture: all k verify rows at their sequence
                 // positions — accepted rows become the ring catch-up feed
                 // for the next propose (no-op unless DSpark capture is on).
-                self.try_dspark_capture(layer_idx, k, seq.seq_len, use_graphs, stream)?;
+                let cap_base = self.dspark_verify_row_base(seq.seq_len);
+                self.try_dspark_capture(layer_idx, k, cap_base, use_graphs, stream)?;
                 if vprof {
                     self.gpu.synchronize(stream)?;
                     let us = vprof_l0.elapsed().as_micros() as u64;
@@ -628,7 +629,7 @@ impl TransformerModel {
         // the graph's writes and a freshly-computed `start_row`. Eager mode
         // already wrote in place.
         if use_graphs {
-            self.dspark_capture_commit(k, seq.seq_len, stream)?;
+            self.dspark_capture_commit(k, self.dspark_verify_row_base(seq.seq_len), stream)?;
         }
 
         let st3_t2 = st3.then(std::time::Instant::now);

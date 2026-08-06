@@ -805,6 +805,16 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Debug (ATLAS_DSPARK_DUMP): flush one committed verify position's hc-mean
+    /// capture as a kind=1 decode record, so the engine probe can replay the
+    /// ONLINE (γ-verify-generated) captures and isolate the acceptance collapse
+    /// to the capture source vs the drafter code. Default no-op; V4 override
+    /// reads `dspark_dump_buf[pos]` (written by `try_dspark_capture`). Eager
+    /// only. No-op unless ATLAS_DSPARK_DUMP armed the dump file at build.
+    fn dspark_dump_flush_pos(&self, _pos: usize, _token: u32, _stream: u64) -> Result<()> {
+        Ok(())
+    }
+
     /// Run the MTP proposer for one draft token off the saved hidden state.
     /// `None` when no proposer is wired.
     fn run_mtp_propose(

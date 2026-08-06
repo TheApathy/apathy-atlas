@@ -520,6 +520,12 @@ impl Model for TransformerModel {
         TransformerModel::dspark_compress_catchup(self, pre_len, num_committed, stream)
     }
 
+    fn dspark_dump_flush_pos(&self, pos: usize, token: u32, stream: u64) -> Result<()> {
+        // kind=1 (decode) record at sequence position `pos`, reading the
+        // capture `try_dspark_capture` wrote to dspark_dump_buf during verify.
+        TransformerModel::dspark_dump_flush(self, 1, pos, 1, token, stream)
+    }
+
     fn dflash_collect_async_drafts(&self, seq: &mut SequenceState) -> Result<Option<Vec<u32>>> {
         let proposer = match &self.proposer {
             Some(p) => p.as_ref(),

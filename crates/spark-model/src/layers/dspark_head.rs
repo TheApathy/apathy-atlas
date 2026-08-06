@@ -1122,10 +1122,35 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             .as_any_mut()
             .downcast_mut::<DsparkProposerState>()
             .context("DSpark propose: wrong state type")?;
-        if self.capture_buf.is_null() || position == 0 {
+        // Block-position alignment (task #45 — THE online acceptance fix).
+        // The official reference (`bench/.../dspark_probe/probe.py`) conditions
+        // stage 0 on `main_hidden@p` with the block forwarded at position `p`,
+        // so `forward_embed`'s committed row (the NEXT token, `tok@p+1`) lands
+        // at block position `p+1` and the drafts predict `p+2…`. In-engine the
+        // committed frontier is `position` and the last committed token is
+        // `tok@(position-1)`; matching the reference's "row-0 token sits one
+        // position below where we draft" means the block base must be
+        // `pos = position-2`: then row 0 (last_token = tok@position-1) sits at
+        // `pos+1 = position-1` (its TRUE position) and the drafts fill
+        // `position…`, conditioned on `hidden@(position-2)` (which predicts
+        // position-1 = last_token) — the reference's exact contract. The old
+        // `position-1` shifted the whole block one slot high (row 0 at
+        // `position`, drafts at `position+1`) AND read the bonus-poisoned
+        // capture row, capping online acceptance at ~1.0 vs 3.8 offline.
+        // `ATLAS_DSPARK_POS_BEHIND` A/Bs the base (2 = fix, 1 = old).
+        let behind: usize = {
+            static PB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *PB.get_or_init(|| {
+                std::env::var("ATLAS_DSPARK_POS_BEHIND")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1)
+            })
+        };
+        if self.capture_buf.is_null() || position < behind {
             return Ok(vec![]);
         }
-        let p = position - 1;
+        let p = position - behind;
         if p >= self.capture_rows {
             return Ok(vec![]);
         }
@@ -1155,8 +1180,25 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
                 let _ = f.write_all(&host);
             }
         }
+        // ATLAS_DSPARK_CAP_SHIFT: A/B the capture-row alignment fed to the
+        // drafter. The online pairing is (captures_at(p), last_token) where
+        // last_token sits at index p+1 — the hidden is one position BEHIND
+        // the chain token, a distribution the drafter may not have been
+        // trained on (offline eval scores 3.69 tok/step; online ~1.0-1.4).
+        // shift=-1 feeds an even older hidden; 0 = current; the off-by-one
+        // family already produced the compressor-replay bug (task #45).
+        let cap_shift: i64 = {
+            static CS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+            *CS.get_or_init(|| {
+                std::env::var("ATLAS_DSPARK_CAP_SHIFT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            })
+        };
+        let p_eff = ((p as i64 + cap_shift).max(0) as usize).min(self.capture_rows - 1);
         let (drafts, confs, top2) =
-            self.propose_block(gpu, ctx, self.captures_at(p), last_token, p, stream)?;
+            self.propose_block(gpu, ctx, self.captures_at(p_eff), last_token, p, stream)?;
         st.last_seeded = p as i64;
 
         // Confidence gate (ATLAS_DSPARK_CONF, 0 = ungated). The offline
@@ -1242,9 +1284,26 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
     fn after_verify(
         &self,
         _num_accepted: usize,
-        _state: &mut dyn crate::speculative::ProposerState,
+        state: &mut dyn crate::speculative::ProposerState,
         _stream: u64,
     ) -> Result<()> {
+        // Task #45 acceptance fix: rewind the seed frontier so the next
+        // propose RE-SEEDS the ring rows for every position the verify just
+        // re-captured. Without this, ring rows seeded during earlier proposes
+        // keep hiddens from REJECTED trajectories forever: the verify
+        // overwrites the capture buffer rows with the corrected hiddens, but
+        // `last_seeded` had already advanced past them, so the drafter's
+        // attention window stays poisoned on every partial accept (~most
+        // steps) — a mechanical cap on acceptance regardless of capture
+        // fidelity. Re-seeding is idempotent (pure copy from the capture
+        // buffer), so rewinding a couple of rows extra is harmless.
+        if let Some(st) = state
+            .as_any_mut()
+            .downcast_mut::<DsparkProposerState>()
+        {
+            let rewind = self.block as i64 + 2;
+            st.last_seeded = (st.last_seeded - rewind).max(-1);
+        }
         Ok(())
     }
 
