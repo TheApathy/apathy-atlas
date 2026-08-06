@@ -437,6 +437,9 @@ impl DsparkDraftHead {
         pos: usize,
         stream: u64,
     ) -> Result<(Vec<u32>, Vec<f32>, Vec<u32>)> {
+        if std::env::var("ATLAS_DSPARK_DEBUG").as_deref() == Ok("1") {
+            eprintln!("DSPARK_DBG ==PROPOSE pos={pos} committed={committed}==");
+        }
         self.seed_position(gpu, captures, pos, stream)?;
         self.dbg(gpu, "main_x", self.main_x, self.h as usize, stream);
         self.dbg(
@@ -446,6 +449,33 @@ impl DsparkDraftHead {
             HEAD_DIM as usize,
             stream,
         );
+        // ATLAS_DSPARK_RING_DUMP=1 (task #45): FNV byte-hash of EVERY visible
+        // ring slot (stage 0), one line per propose. The attention output was
+        // proven to be the first divergent stage with byte-identical probed
+        // inputs — the divergence must live in unprobed slots; this names them.
+        // Hashes, not norms: 4-decimal norms hide byte drift (hard-won rule).
+        if std::env::var("ATLAS_DSPARK_RING_DUMP").as_deref() == Ok("1") {
+            let vis = (pos + 1).min(self.module.params.window);
+            let hd = HEAD_DIM as usize * 2;
+            let _ = gpu.synchronize(stream);
+            let mut line = format!("RINGHASH pos={pos} s0:");
+            let mut buf = vec![0u8; hd];
+            for slot in 0..vis {
+                if gpu
+                    .copy_d2h(self.rings[0].offset(slot * hd), &mut buf)
+                    .is_err()
+                {
+                    break;
+                }
+                let mut fnv: u64 = 0xcbf29ce484222325;
+                for &b in buf.iter() {
+                    fnv ^= b as u64;
+                    fnv = fnv.wrapping_mul(0x100000001b3);
+                }
+                line.push_str(&format!(" {slot}={:08x}", (fnv >> 32) as u32));
+            }
+            eprintln!("{line}");
+        }
 
         let b = self.block;
         let h = self.h;
@@ -483,8 +513,24 @@ impl DsparkDraftHead {
             midchunk_capture: None,
         };
 
-        let ring_vis = (pos + 1).min(self.module.params.window) as u32;
-        let blk_pos = (pos + 1) as u32; // block rows at pos+1 .. pos+b
+        // Block-row base position. The ds4 reference (Entrpi/ds4 ds4.c:30738)
+        // places the committed token (block row 0) at the SAME position as the
+        // target hidden — `positions[i+1] = pos + i`, so row 0 sits at `pos`,
+        // drafts at pos+1... Our original `pos + 1` put row 0 one position ABOVE
+        // the target hidden, the measured +1 draft offset that collapses online
+        // acceptance (drafts predict position+1 while the verify checks position).
+        // ATLAS_DSPARK_BLK_SHIFT A/Bs it: 0 = ds4-aligned (row0 at pos), 1 = old.
+        let blk_shift: i64 = {
+            static BS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+            *BS.get_or_init(|| {
+                std::env::var("ATLAS_DSPARK_BLK_SHIFT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1)
+            })
+        };
+        let blk_pos = ((pos as i64 + blk_shift).max(0) as u32).min(u32::MAX);
+        let ring_vis = (blk_pos).min(self.module.params.window as u32);
         let mut cur = self.hc_a;
         let mut nxt = self.hc_b;
         for (s, stage) in self.module.stages.iter().enumerate() {
@@ -609,6 +655,25 @@ impl DsparkDraftHead {
                 stream,
             );
 
+            // Probe prior ring slots + sink to localize the o5 divergence:
+            // slot 0 already matches engine; check whether a specific PRIOR
+            // slot is grossly wrong (fixable) or all are slightly off (numerics).
+            {
+                let win = self.module.params.window;
+                for back in [1usize, 5, 10] {
+                    if pos >= back {
+                        let slot = (pos - back) % win;
+                        self.dbg(
+                            gpu,
+                            &format!("s{s}.ring@pos-{back}"),
+                            self.rings[s].offset(slot * HEAD_DIM as usize * 2),
+                            HEAD_DIM as usize,
+                            stream,
+                        );
+                    }
+                }
+                self.dbg(gpu, &format!("s{s}.sink"), stage.attn_sink.weight, HEADS as usize, stream);
+            }
             // Windowed bidirectional attention + MLA output de-rotation.
             KernelLaunch::new(gpu, self.k_attn)
                 .grid([b, HEADS, 1])
@@ -1218,6 +1283,30 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         let p_eff = ((p as i64 + cap_shift).max(0) as usize).min(self.capture_rows - 1);
         let (drafts, confs, top2) =
             self.propose_block(gpu, ctx, self.captures_at(p_eff), last_token, p, stream)?;
+        // ATLAS_DSPARK_ZERO_SLOT=<abs pos> (task #45 equivalence test): after
+        // each propose, zero that position's ring slot in every stage. The
+        // engine probe's ring has a never-seeded (zero) hole at the first
+        // decode position; the live ring holds a real capture there — the ONLY
+        // byte difference between the two rings (RINGHASH proof). Zeroing it
+        // makes the live ring byte-identical to the engine's, so live drafts
+        // must reproduce the engine's 2.38 tok/step if the analysis is right.
+        {
+            static ZS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+            let zs = *ZS.get_or_init(|| {
+                std::env::var("ATLAS_DSPARK_ZERO_SLOT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(-1)
+            });
+            if zs >= 0 {
+                let win = self.module.params.window;
+                let slot = (zs as usize) % win;
+                let hd = HEAD_DIM as usize * 2;
+                for ring in &self.rings {
+                    gpu.memset_u32_async(ring.offset(slot * hd), 0, hd / 4, stream)?;
+                }
+            }
+        }
         // ATLAS_DSPARK_DRAFT_LOG=1 (task #45): log the LIVE drafts per propose
         // position so they can be diffed against the engine probe's drafts on
         // the SAME committed captures — the first divergence at byte-exact
