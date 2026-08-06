@@ -218,7 +218,7 @@ impl Qwen3AttentionLayer {
                     q_out,
                     q_dim as usize,
                     stream,
-                    &format!("V4-decode L{} Q after q_b_norm", self.attn_layer_idx),
+                    &format!("V4-decode L{} Q after q_b_norm obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
                 );
             }
 
@@ -283,14 +283,14 @@ impl Qwen3AttentionLayer {
                     k_out,
                     kv_dim as usize,
                     stream,
-                    &format!("V4-decode L{} K after proj", self.attn_layer_idx),
+                    &format!("V4-decode L{} K after proj obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
                 );
                 super::super::trait_impl::diag_norm(
                     ctx.gpu,
                     v_out,
                     kv_dim as usize,
                     stream,
-                    &format!("V4-decode L{} V after copy", self.attn_layer_idx),
+                    &format!("V4-decode L{} V after copy obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
                 );
             }
         } // end !skip_qkv (Steps 1-2)
@@ -402,21 +402,21 @@ impl Qwen3AttentionLayer {
                 k_out,
                 kv_dim as usize,
                 stream,
-                &format!("V4-decode L{} K after RoPE", self.attn_layer_idx),
+                &format!("V4-decode L{} K after RoPE obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
             );
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
                 k_out.offset(mla.nope * 2),
                 (kv_dim - mla.nope as u32) as usize,
                 stream,
-                &format!("V4-decode L{} K rope after RoPE", self.attn_layer_idx),
+                &format!("V4-decode L{} K rope after RoPE obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
             );
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
                 q_out.offset(mla.nope * 2),
                 (hd - mla.nope as u32) as usize,
                 stream,
-                &format!("V4-decode L{} Q rope after RoPE", self.attn_layer_idx),
+                &format!("V4-decode L{} Q rope after RoPE obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
             );
         }
 
@@ -493,7 +493,7 @@ impl Qwen3AttentionLayer {
                 attn_out,
                 (nq * hd) as usize,
                 stream,
-                &format!("V4-decode L{} attn_out", self.attn_layer_idx),
+                &format!("V4-decode L{} attn_out obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
             );
         }
 
@@ -564,7 +564,7 @@ impl Qwen3AttentionLayer {
                 attn_out,
                 (nq * hd) as usize,
                 stream,
-                &format!("V4-decode L{} attn_out derot", self.attn_layer_idx),
+                &format!("V4-decode L{} attn_out derot obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
             );
         }
 
@@ -701,7 +701,7 @@ impl Qwen3AttentionLayer {
                 o_out,
                 h as usize,
                 stream,
-                &format!("V4-decode L{} o_out", self.attn_layer_idx),
+                &format!("V4-decode L{} o_out obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
             );
         }
 

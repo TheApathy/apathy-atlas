@@ -49,13 +49,32 @@ PROMPT_LEN_GUESS = None  # derived from VSTEP pre of step 1
 
 
 def parse_series(path, tag, layers):
-    """(layer, label) -> [bhash...] in log order, for one tag only."""
-    out = {}
-    rx = re.compile(rf"DIAG {tag} L(\d+) ([^:]+): .*bhash=([0-9a-f]+)")
+    """(layer, label) -> [bhash...] in log order, for one tag only.
+
+    Probes may carry an ` obj=<hex>` suffix identifying the layer OBJECT.
+    The DSpark drafter is itself a 3-layer V4 model whose layers reuse
+    attn_layer_idx 0..2 and fire identical labels — mixing its occurrences
+    into the target's series poisoned two rounds of layer walks. When obj
+    tags are present, keep ONLY the objs that also appear at layer >= 3
+    (the drafter never has an L3).
+    """
+    raw = []
+    rx = re.compile(rf"DIAG {tag} L(\d+) ([^:]+?)( obj=([0-9a-f]+))?: .*bhash=([0-9a-f]+)")
+    target_objs = set()
     for line in open(path, errors="replace"):
         m = rx.search(line)
-        if m and int(m[1]) < layers:
-            out.setdefault((int(m[1]), m[2]), []).append(m[3])
+        if m:
+            L = int(m[1])
+            raw.append((L, m[2], m[4], m[5]))
+            if m[4] and L >= 3:
+                target_objs.add(m[4])
+    out = {}
+    for L, label, obj, h in raw:
+        if L >= layers:
+            continue
+        if obj is not None and target_objs and obj not in target_objs:
+            continue  # drafter-layer probe
+        out.setdefault((L, label), []).append(h)
     return out
 
 
