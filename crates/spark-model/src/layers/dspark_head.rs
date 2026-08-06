@@ -1157,7 +1157,26 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         let gpu = ctx.gpu;
         // Catch-up: seed every position since the last propose (multi-accept
         // rows were captured by the verify forward).
-        let from = (st.last_seeded + 1).max(0) as usize;
+        //
+        // ATLAS_DSPARK_FULL_RESEED=1 (task #45): rebuild the ENTIRE active
+        // sliding window [p+1-window .. p) from the current capture buffer every
+        // propose, instead of only the incremental [last_seeded+1 .. p). The
+        // engine probe (dspark_engine_probe) hits 2.38 tok/step on the SAME
+        // online captures but the live server gets ~1.0 — the only difference is
+        // ring STATE. The incremental catch-up never refreshes positions already
+        // seeded, so a ring slot that received a rejected-trajectory capture (or
+        // draft-row pollution from a prior propose_block) stays stale inside the
+        // window the drafter attends over. A full reseed from the committed
+        // capture buffer makes the live ring match the clean engine-probe ring.
+        static FULL_RESEED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let full_reseed =
+            *FULL_RESEED.get_or_init(|| std::env::var("ATLAS_DSPARK_FULL_RESEED").as_deref() == Ok("1"));
+        let win = self.module.params.window;
+        let from = if full_reseed {
+            (p + 1).saturating_sub(win)
+        } else {
+            (st.last_seeded + 1).max(0) as usize
+        };
         for q in from..p {
             self.seed_position(gpu, self.captures_at(q), q, stream)?;
         }
