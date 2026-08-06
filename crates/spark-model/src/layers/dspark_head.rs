@@ -1218,6 +1218,14 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         let p_eff = ((p as i64 + cap_shift).max(0) as usize).min(self.capture_rows - 1);
         let (drafts, confs, top2) =
             self.propose_block(gpu, ctx, self.captures_at(p_eff), last_token, p, stream)?;
+        // ATLAS_DSPARK_DRAFT_LOG=1 (task #45): log the LIVE drafts per propose
+        // position so they can be diffed against the engine probe's drafts on
+        // the SAME committed captures — the first divergence at byte-exact
+        // inputs pinpoints the propose_block execution-context bug.
+        static DRAFT_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DRAFT_LOG.get_or_init(|| std::env::var("ATLAS_DSPARK_DRAFT_LOG").as_deref() == Ok("1")) {
+            tracing::info!("DRAFTLOG pos={p} last_token={last_token} drafts={drafts:?}");
+        }
         st.last_seeded = p as i64;
 
         // Confidence gate (ATLAS_DSPARK_CONF, 0 = ungated). The offline

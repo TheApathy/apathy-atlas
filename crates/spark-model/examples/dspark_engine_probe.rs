@@ -245,6 +245,9 @@ fn main() -> Result<()> {
                 head.propose_block(gpu, &ctx, caps, committed, p as usize, stream)?;
             propose_ms += tp.elapsed().as_secs_f64() * 1e3;
             n_props += 1;
+            if std::env::var("ATLAS_DSPARK_DRAFT_LOG").as_deref() == Ok("1") {
+                println!("ENGDRAFT pos={p} committed={committed} drafts={drafts:?}");
+            }
 
             if let Some(rd) = refs.get(&(si as u32, p)) {
                 for j in 0..block {
