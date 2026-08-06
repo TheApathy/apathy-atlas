@@ -296,6 +296,9 @@ pub fn assemble_layer(
             // MAX_VERIFY_ROWS of them — so the ratio-128 HCA layers pay 8 slots
             // (64 KB), not their full 1 MB ring. prev_win is CSA-only.
             let ring_snap = gpu.alloc(ratio.min(MAX_VERIFY_ROWS) * h * 2)?;
+            // hd_mla (576) FP8 bytes per pool block; MAX_VERIFY_ROWS/ratio+2
+            // bounds the blocks a gamma window can write or overlap-rewrite.
+            let pool_snap = gpu.alloc((MAX_VERIFY_ROWS / ratio.max(1) + 2) * 576)?;
             let prev_win_snap = if is_csa {
                 gpu.alloc(ratio * h * 2)?
             } else {
@@ -316,6 +319,7 @@ pub fn assemble_layer(
                 stage,
                 ring_snap,
                 prev_win_snap,
+                pool_snap,
             })
         } else {
             None

@@ -382,6 +382,13 @@ pub struct Qwen3AttentionLayer {
     pub(super) spec_saved_prev_valid: std::sync::atomic::AtomicBool,
     pub(super) spec_rows: std::sync::atomic::AtomicU32,
     pub(super) spec_base_pos: std::sync::atomic::AtomicU32,
+    /// First/last pool block saved into `CompressorWeights::pool_snap` by the
+    /// γ-speculation snapshot (u32::MAX = nothing saved). Restored with the
+    /// frontiers: the CSA boundary append rewrites block w-1, and a rejected
+    /// row's rewrite lands INSIDE the committed range, so the "invisible
+    /// garbage" rule for un-counted blocks does not cover it.
+    pub(super) spec_pool_w_lo: std::sync::atomic::AtomicU32,
+    pub(super) spec_pool_w_hi: std::sync::atomic::AtomicU32,
     /// HDIM=512 paged prefill (BF16 KV) for Gemma-4 chunked long-context prefill
     pub(super) prefill_attn_paged_512_k: KernelHandle,
     pub(super) prefill_attn_64_k: KernelHandle,

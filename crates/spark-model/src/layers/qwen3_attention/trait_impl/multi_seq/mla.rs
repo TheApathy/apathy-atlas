@@ -219,7 +219,12 @@ impl Qwen3AttentionLayer {
             // post-accept path; see `v4_compress_speculate` for the full
             // argument and the ds4 references.
             if let Some(base) = c.verify_base_pos {
-                self.v4_compress_speculate(c.fwd, base, rows, eps, stream)?;
+                // The per-row fallback (batch_ok=false) interleaves the
+                // appends itself (args.pos above) — the speculate must then
+                // only SNAPSHOT the frontiers so the post-accept restore can
+                // rewind; appending here too would double-append.
+                let appends = self.ms_mla_v4_batch_ok(c).0;
+                self.v4_compress_speculate(c.fwd, base, rows, eps, appends, stream)?;
             }
         }
 
@@ -419,10 +424,18 @@ impl Qwen3AttentionLayer {
                     eps,
                     bs,
                     stream,
-                    // Batched / MTP-verify path: skip the inc-3 compressed-pool
-                    // append (a shared per-layer position counter can't track
-                    // interleaved verify tokens) → frozen inc-2 pool here.
-                    pos: None,
+                    // γ-verify (task #45): interleave the compressed-pool
+                    // append per row, exactly like plain decode. The up-front
+                    // speculate advanced the WHOLE pool before any row's
+                    // attention — but plain REWRITES the CSA overlap block
+                    // (w-1) as part of each boundary append, so early rows
+                    // saw post-rewrite pool bytes where plain's equivalent
+                    // decode saw pre-rewrite ones (measured: pool-b2 differed
+                    // at the aligned launches; the last byte divergence from
+                    // plain greedy). Per-row `pos` makes the append↔attention
+                    // ordering identical to plain; the post-accept
+                    // restore+catchup still rewinds rejected rows' appends.
+                    pos: c.verify_base_pos.map(|b| (b + i) as u32),
                     skip_qkv: false,
                     attn_dest: None,
                 };

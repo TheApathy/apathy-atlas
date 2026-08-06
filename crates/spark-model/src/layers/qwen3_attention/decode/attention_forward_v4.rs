@@ -1132,6 +1132,7 @@ impl Qwen3AttentionLayer {
         base_pos: usize,
         n_rows: usize,
         eps: f32,
+        do_appends: bool,
         stream: u64,
     ) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1197,6 +1198,47 @@ impl Qwen3AttentionLayer {
             ctx.gpu
                 .copy_d2d_async(comp.prev_win, comp.prev_win_snap, ratio * hb, stream)?;
         }
+        // Pool-block snapshot: every boundary in [base, base+n) writes block
+        // w = (pos+1)/ratio - 1 AND (CSA overlap) rewrites block w-1. Save
+        // the touched range so a rejected row's rewrite can be undone — it
+        // lands INSIDE the committed range, where "invisible garbage" does
+        // not apply. hd_mla = nope + rope FP8 bytes per block.
+        {
+            let hd_mla = self
+                .mla
+                .as_ref()
+                .map(|m| m.nope + m.rope)
+                .unwrap_or(576);
+            let mut w_lo = u32::MAX;
+            let mut w_hi = 0u32;
+            for r in 0..n_rows {
+                let pos = base_pos + r;
+                if (pos + 1) % ratio == 0 {
+                    let w = ((pos + 1) / ratio - 1) as u32;
+                    let lo = w.saturating_sub(1);
+                    if lo < w_lo {
+                        w_lo = lo;
+                    }
+                    if w > w_hi {
+                        w_hi = w;
+                    }
+                }
+            }
+            if w_lo != u32::MAX && !comp.pool_snap.is_null() {
+                for (i, w) in (w_lo..=w_hi).enumerate() {
+                    ctx.gpu.copy_d2d_async(
+                        comp.pool.offset(w as usize * hd_mla),
+                        comp.pool_snap.offset(i * hd_mla),
+                        hd_mla,
+                        stream,
+                    )?;
+                }
+                self.spec_pool_w_lo.store(w_lo, Relaxed);
+                self.spec_pool_w_hi.store(w_hi, Relaxed);
+            } else {
+                self.spec_pool_w_lo.store(u32::MAX, Relaxed);
+            }
+        }
         self.spec_saved_filled
             .store(self.v4_comp_pool_filled.load(Relaxed), Relaxed);
         self.spec_saved_prev_valid
@@ -1207,9 +1249,11 @@ impl Qwen3AttentionLayer {
         // Advance over every draft row, in absolute-position order — the same
         // call plain decode makes, so the blocks are byte-identical to the ones
         // a non-speculative decode would have produced at those positions.
-        for r in 0..n_rows {
-            let normed = self.verify_comp_normed.offset(r * hb);
-            self.v4_compress_append(ctx, normed, (base_pos + r) as u32, eps, stream)?;
+        if do_appends {
+            for r in 0..n_rows {
+                let normed = self.verify_comp_normed.offset(r * hb);
+                self.v4_compress_append(ctx, normed, (base_pos + r) as u32, eps, stream)?;
+            }
         }
         if std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok() {
             tracing::info!(
@@ -1268,6 +1312,25 @@ impl Qwen3AttentionLayer {
         if comp.is_csa && !comp.prev_win_snap.is_null() {
             ctx.gpu
                 .copy_d2d_async(comp.prev_win_snap, comp.prev_win, ratio * hb, stream)?;
+        }
+        // Restore any pool blocks the speculation window touched (the CSA
+        // overlap rewrite of block w-1 included).
+        let w_lo = self.spec_pool_w_lo.swap(u32::MAX, Relaxed);
+        if w_lo != u32::MAX && !comp.pool_snap.is_null() {
+            let hd_mla = self
+                .mla
+                .as_ref()
+                .map(|m| m.nope + m.rope)
+                .unwrap_or(576);
+            let w_hi = self.spec_pool_w_hi.load(Relaxed);
+            for (i, w) in (w_lo..=w_hi).enumerate() {
+                ctx.gpu.copy_d2d_async(
+                    comp.pool_snap.offset(i * hd_mla),
+                    comp.pool.offset(w as usize * hd_mla),
+                    hd_mla,
+                    stream,
+                )?;
+            }
         }
         let saved = self.spec_saved_filled.load(Relaxed);
         self.v4_comp_pool_filled.store(saved, Relaxed);

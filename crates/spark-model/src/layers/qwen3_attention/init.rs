@@ -563,6 +563,8 @@ impl Qwen3AttentionLayer {
             spec_saved_prev_valid: std::sync::atomic::AtomicBool::new(false),
             spec_rows: std::sync::atomic::AtomicU32::new(0),
             spec_base_pos: std::sync::atomic::AtomicU32::new(0),
+            spec_pool_w_lo: std::sync::atomic::AtomicU32::new(u32::MAX),
+            spec_pool_w_hi: std::sync::atomic::AtomicU32::new(u32::MAX),
             prefill_attn_paged_512_k: super::super::try_kernel(
                 gpu,
                 "inferspark_prefill_paged_512",

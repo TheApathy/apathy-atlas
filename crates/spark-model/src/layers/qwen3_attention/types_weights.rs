@@ -162,6 +162,14 @@ pub struct CompressorWeights {
     /// speculative block emit overwrites `prev_win` with the emitting window,
     /// and unlike the ring there is no cheaper partial to save.
     pub prev_win_snap: spark_runtime::gpu::DevicePtr,
+    /// γ-speculation POOL-BLOCK snapshot. The CSA boundary append REWRITES
+    /// block w-1 (the overlap half) in addition to writing block w; a
+    /// rejected row's rewrite would otherwise survive the frontier restore
+    /// (pool bytes past the count are invisible, but w-1 is INSIDE the
+    /// committed range). Holds up to MAX_VERIFY_ROWS/ratio + 2 blocks of
+    /// hd_mla FP8 bytes each; the range actually saved is recorded in the
+    /// layer's `spec_pool_w_lo/hi` atomics.
+    pub pool_snap: spark_runtime::gpu::DevicePtr,
 }
 
 /// Per-block Manifold-Constrained Hyper-Connection (mHC) parameters for one
