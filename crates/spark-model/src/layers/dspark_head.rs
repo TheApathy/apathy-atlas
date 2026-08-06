@@ -877,7 +877,19 @@ impl DsparkDraftHead {
                 );
             });
         }
-        match (&self.lm_head_fp8, lmhead_batched) {
+        // ATLAS_DSPARK_LMHEAD_BF16=1 (task #45 A/B, MEASURED NO-OP): forces the
+        // engine probe's BF16 lm_head instead of the FP8 mirror. Tested
+        // 2026-08-06: accepted 1.02 == FP8 baseline, output hash identical,
+        // propose +18ms — the FP8 head does NOT cause the online acceptance
+        // collapse (the near-tie flip hypothesis is disproven). Default OFF.
+        let force_bf16 = self.lm_head_bf16.is_some() && {
+            static FB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *FB.get_or_init(|| {
+                std::env::var("ATLAS_DSPARK_LMHEAD_BF16").as_deref() == Ok("1")
+            })
+        };
+        let fp8_head = if force_bf16 { None } else { self.lm_head_fp8.as_ref() };
+        match (fp8_head, lmhead_batched) {
             (Some(fp8), true) => ops::fp8_gemm_row_scaled_smallm(
                 gpu,
                 self.k_gemm_smallm,
@@ -893,7 +905,7 @@ impl DsparkDraftHead {
                 for r in 0..b as usize {
                     let row_in = self.f5.offset(r * hu * 2);
                     let row_out = self.logits5.offset(r * self.vocab as usize * 2);
-                    if let Some(ref fp8) = self.lm_head_fp8 {
+                    if let Some(fp8) = fp8_head {
                         ops::dense_gemv_fp8w(
                             gpu,
                             self.k_gemv_fp8,
