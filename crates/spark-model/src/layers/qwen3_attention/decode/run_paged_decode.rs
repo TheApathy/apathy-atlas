@@ -155,6 +155,39 @@ impl Qwen3AttentionLayer {
                         (comp_count_ptr, comp_blocks)
                     }
                 };
+                // Task #45 kernel-input dump: at the first CSA layer hash
+                // every remaining attention input that could explain an
+                // attn_out divergence with byte-exact Q/K/rope — the count
+                // word VALUE, the pool blocks as-read, and the seq_len word.
+                if self.attn_layer_idx == 2
+                    && std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
+                        .is_ok_and(|v| v == "1" || v == "true")
+                    && !comp_count_ptr.is_null()
+                {
+                    super::super::trait_impl::diag_norm(
+                        gpu,
+                        comp_count_ptr,
+                        2,
+                        stream,
+                        "V4-kin L2 count-word",
+                    );
+                    super::super::trait_impl::diag_norm(
+                        gpu,
+                        seq_lens,
+                        2,
+                        stream,
+                        "V4-kin L2 seqlen-word",
+                    );
+                    for b in 0..4usize {
+                        super::super::trait_impl::diag_norm(
+                            gpu,
+                            comp_pool.offset(b * 576),
+                            288,
+                            stream,
+                            &format!("V4-kin L2 pool-b{b}"),
+                        );
+                    }
+                }
                 // Task #45: per-launch comp-read parameters at the first CSA
                 // layer, diag-gated. Pairs with the "V4-comp append" pool-block
                 // hashes: if the pool bytes match plain but these read params
