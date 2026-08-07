@@ -364,6 +364,7 @@ pub enum ToolCallFormat {
     MinimaxXml,
     BareJson,
     PoolsideV1,
+    DsmlV4,
 }
 
 impl std::str::FromStr for ToolCallFormat {
@@ -378,8 +379,9 @@ impl std::str::FromStr for ToolCallFormat {
             "minimax_xml" => Ok(Self::MinimaxXml),
             "bare_json" => Ok(Self::BareJson),
             "poolside_v1" => Ok(Self::PoolsideV1),
+            "dsml_v4" => Ok(Self::DsmlV4),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, bare_json, poolside_v1",
+                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, bare_json, poolside_v1, dsml_v4",
             )),
         }
     }
@@ -397,6 +399,7 @@ impl ToolCallFormat {
             Self::MinimaxXml => Box::new(MinimaxXmlParser),
             Self::BareJson => Box::new(BareJsonParser),
             Self::PoolsideV1 => Box::new(PoolsideV1Parser),
+            Self::DsmlV4 => Box::new(DsmlV4Parser),
         }
     }
 
@@ -424,6 +427,7 @@ impl ToolCallFormat {
             Self::MinimaxXml => "minimax_xml",
             Self::BareJson => "bare_json",
             Self::PoolsideV1 => "poolside_v1",
+            Self::DsmlV4 => "dsml_v4",
         }
     }
 }
@@ -432,6 +436,7 @@ impl ToolCallFormat {
 
 // ── Sub-modules (split from monolithic file) ──
 mod bare_json;
+mod dsml_v4;
 mod fuzzy_match;
 mod gemma4;
 mod helpers_a;
@@ -455,6 +460,7 @@ mod type_coerce;
 pub(crate) mod validation;
 
 pub use bare_json::*;
+pub use dsml_v4::*;
 pub use gemma4::*;
 use helpers_a::*;
 use helpers_b::*;

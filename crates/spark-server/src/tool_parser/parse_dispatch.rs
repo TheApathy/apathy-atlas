@@ -42,6 +42,15 @@ pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
     } else {
         text
     };
+    // DeepSeek-V4 DSML envelope (`<｜DSML｜tool_calls>` etc.) — normalize to
+    // the canonical shapes first, same strategy as the MiniMax rewrite below.
+    let owned_dsml: String;
+    let text: &str = if let Some(n) = super::dsml_v4::normalize_dsml(text) {
+        owned_dsml = n;
+        owned_dsml.as_str()
+    } else {
+        text
+    };
     // MiniMax uses `<minimax:tool_call>` as the outer wrapper (different
     // tag from Qwen's `<tool_call>`). Normalize both wrappers to the
     // same outer form so the scanning loop below doesn't need
