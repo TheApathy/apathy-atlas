@@ -58,6 +58,10 @@ impl StreamingToolDetector {
     pub fn process(&mut self, new_text: &str) -> Vec<DetectorOutput> {
         let mut outputs = Vec::new();
         self.buffer.push_str(new_text);
+        // DeepSeek-V4 DSML: rewrite complete DSML tags to the canonical
+        // shapes before scanning (one <tool_call> per <invoke>). Partial
+        // straddling tokens stay buffered via safe_emit_len's DSML prefixes.
+        super::dsml_v4::rewrite_dsml_in_buffer(&mut self.buffer);
         loop {
             if self.inside_tag {
                 // Check for closing tag. Recognised forms:
@@ -476,6 +480,16 @@ impl StreamingToolDetector {
         // `content`. Close tags don't need preserving here — close
         // matching only runs when `inside_tag=true`, where the buffer
         // accumulates the entire inner block until close lands.
+        // DeepSeek-V4 DSML forms (fullwidth `｜` = U+FF5C, 3 bytes each): the
+        // buffer rewrite in `process()` only fires on COMPLETE tags, so a
+        // straddling prefix must be held here or it leaks as content and the
+        // rewrite can never reconstruct the tag.
+        const DSML_TC: &str = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
+        const DSML_BROKEN: &str = "<\u{ff5c}DSML\u{ff5c}_calls>";
+        const DSML_INVOKE: &str = "<\u{ff5c}DSML\u{ff5c}invoke ";
+        const DSML_PARAM: &str = "<\u{ff5c}DSML\u{ff5c}parameter ";
+        const DSML_TC_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        const DSML_BROKEN_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}_calls>";
         for tag in [
             b"<tool_call>" as &[u8],
             b"<|tool_call>",
@@ -484,6 +498,12 @@ impl StreamingToolDetector {
             b"<function",
             b"call:",
             MISTRAL_TOOL_CALLS_TAG.as_bytes(),
+            DSML_TC.as_bytes(),
+            DSML_BROKEN.as_bytes(),
+            DSML_INVOKE.as_bytes(),
+            DSML_PARAM.as_bytes(),
+            DSML_TC_CLOSE.as_bytes(),
+            DSML_BROKEN_CLOSE.as_bytes(),
         ] {
             for i in (buf.len().saturating_sub(tag.len() - 1))..buf.len() {
                 if tag.starts_with(&buf[i..]) {

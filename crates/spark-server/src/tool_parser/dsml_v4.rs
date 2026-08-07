@@ -113,11 +113,14 @@ pub(super) fn normalize_dsml(text: &str) -> Option<String> {
     }
     // DSML packs MULTIPLE `<invoke>` blocks inside one `tool_calls`
     // envelope; the shared scanning loop expects one call per
-    // `<tool_call>` envelope. Drop the outer envelope and give each
+    // `<tool_call>` envelope. Drop the outer envelope (canonical AND the
+    // live-observed BPE-broken `<｜DSML｜_calls>` merge) and give each
     // invoke its own.
     let s = text
         .replace(&format!("<{DSML}tool_calls>"), "")
         .replace(&format!("</{DSML}tool_calls>"), "")
+        .replace(&format!("<{DSML}_calls>"), "")
+        .replace(&format!("</{DSML}_calls>"), "")
         .replace(&format!("<{DSML}invoke "), "<tool_call><invoke ")
         .replace(&format!("</{DSML}invoke>"), "</invoke></tool_call>")
         .replace(&format!("<{DSML}parameter "), "<parameter ")
@@ -125,6 +128,21 @@ pub(super) fn normalize_dsml(text: &str) -> Option<String> {
         .replace(" string=\"true\">", ">")
         .replace(" string=\"false\">", ">");
     Some(s)
+}
+
+/// Streaming twin of [`normalize_dsml`]: rewrite COMPLETE DSML tags inside
+/// the detector's accumulation buffer to the canonical shapes the scanning
+/// loop knows. Partial (chunk-straddling) DSML tokens don't match any
+/// replace and stay buffered — `safe_emit_len`'s DSML prefixes keep them
+/// from leaking as content until the rest arrives. Idempotent: the rewrite
+/// consumes every DSML token it matches.
+pub(super) fn rewrite_dsml_in_buffer(buf: &mut String) {
+    if !buf.contains(DSML) {
+        return;
+    }
+    if let Some(s) = normalize_dsml(buf) {
+        *buf = s;
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +190,75 @@ mod dsml_tests {
         assert_eq!(calls.len(), 2, "expected two calls, got {calls:?}");
         assert_eq!(calls[0].function.name, "a");
         assert_eq!(calls[1].function.name, "b");
+    }
+}
+
+#[cfg(test)]
+mod dsml_bpe_tests {
+    use super::super::parse_dispatch::parse_tool_calls;
+    use super::*;
+
+    #[test]
+    fn dsml_bpe_broken_envelope_still_parses() {
+        // Live-observed on GB10 (tool-eval-bench TC-01): the envelope token
+        // BPE-merges to `<｜DSML｜_calls>`; invoke/parameter stay intact.
+        let text = format!(
+            "\n<{DSML}_calls>\n\
+             <{DSML}invoke name=\"get_weather\">\n\
+             <{DSML}parameter name=\"location\" string=\"true\">Berlin</{DSML}parameter>\n\
+             </{DSML}invoke>\n\
+             </{DSML}_calls>"
+        );
+        let (_c, calls) = parse_tool_calls(&text);
+        assert_eq!(calls.len(), 1, "broken envelope should still parse: {calls:?}");
+        assert_eq!(calls[0].function.name, "get_weather");
+    }
+}
+
+#[cfg(test)]
+mod dsml_stream_tests {
+    use super::super::streaming::{DetectorOutput, StreamingToolDetector};
+    use super::*;
+
+    fn collect(det: &mut StreamingToolDetector, chunks: &[&str]) -> (String, Vec<String>) {
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut handle = |o: DetectorOutput| match o {
+            DetectorOutput::Content(c) => content.push_str(&c),
+            DetectorOutput::ToolCall(tc, _) => calls.push(tc.function.name),
+            DetectorOutput::ToolCallStart { name, .. } => calls.push(name),
+            _ => {}
+        };
+        for ch in chunks {
+            for o in det.process(ch) {
+                handle(o);
+            }
+        }
+        for o in det.flush() {
+            handle(o);
+        }
+        (content, calls)
+    }
+
+    #[test]
+    fn dsml_streams_to_tool_call_even_chunked() {
+        // Split mid-DSML-token to exercise the straddle holdback.
+        let text = format!(
+            "Sure.\n<{DSML}_calls>\n<{DSML}invoke name=\"get_weather\">\n\
+             <{DSML}parameter name=\"city\" string=\"true\">Berlin</{DSML}parameter>\n\
+             </{DSML}invoke>\n</{DSML}_calls>"
+        );
+        let mid = text.find("DSML").unwrap() + 2; // split inside the first DSML token
+        let (a, b) = text.split_at(mid);
+        let mut det = StreamingToolDetector::new();
+        let (content, calls) = collect(&mut det, &[a, b]);
+        assert!(
+            calls.iter().any(|n| n == "get_weather"),
+            "expected get_weather in streamed calls, got calls={calls:?} content={content:?}"
+        );
+        assert!(
+            !content.contains("DSML"),
+            "DSML markup leaked into content: {content:?}"
+        );
     }
 }
