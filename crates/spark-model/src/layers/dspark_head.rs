@@ -1141,6 +1141,14 @@ fn tree_shape() -> (usize, usize, f32) {
 pub struct DsparkProposerState {
     /// Highest sequence position whose `main_kv` is in the rings; -1 = none.
     pub last_seeded: i64,
+    /// The first decode position (= prompt length), set by `prefill_drafter`.
+    /// Task #45 byte-proof: this position's capture is written by the graphed
+    /// BOOTSTRAP step and is poisoned — it was the ONLY ring byte-difference
+    /// between the live server and the 2.38-tok/step engine probe (which
+    /// leaves the slot zero), and it forked every draft chain. The propose
+    /// path keeps this slot ZERO (skip seeding + post-propose memset), which
+    /// took draft[0] to 9/9 engine parity and accepted 1.02 → 1.10.
+    pub boundary_pos: i64,
     /// DDTree payload for the drafts just proposed (`ATLAS_DSPARK_TREE=1`).
     /// Consumed by `dflash_take_tree_payload`; `None` keeps the flat path.
     pub pending_tree_payload: Option<crate::layers::DDTreePayload>,
@@ -1180,6 +1188,7 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
     ) -> Result<Box<dyn crate::speculative::ProposerState>> {
         Ok(Box::new(DsparkProposerState {
             last_seeded: -1,
+            boundary_pos: -1,
             pending_tree_payload: None,
         }))
     }
@@ -1266,7 +1275,20 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         } else {
             (st.last_seeded + 1).max(0) as usize
         };
+        // Boundary fix (task #45, byte-proven): never seed the bootstrap
+        // position — its capture is poisoned and this slot must stay zero
+        // (see `DsparkProposerState::boundary_pos`). ATLAS_DSPARK_BOUNDARY_FIX=0
+        // restores the old behavior for A/B.
+        let boundary_fix = st.boundary_pos >= 0 && {
+            static BF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *BF.get_or_init(|| {
+                std::env::var("ATLAS_DSPARK_BOUNDARY_FIX").as_deref() != Ok("0")
+            })
+        };
         for q in from..p {
+            if boundary_fix && q as i64 == st.boundary_pos {
+                continue;
+            }
             self.seed_position(gpu, self.captures_at(q), q, stream)?;
         }
         // ATLAS_DSPARK_PROBE_DUMP=<path>: append the exact capture bytes the
@@ -1322,9 +1344,19 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(-1)
             });
-            if zs >= 0 {
+            // Auto boundary fix: keep the bootstrap position's slot zero.
+            // propose_block itself seeds `pos` when the propose lands on the
+            // boundary, so the memset must follow it. Idempotent afterwards.
+            let target = if zs >= 0 {
+                zs
+            } else if boundary_fix {
+                st.boundary_pos
+            } else {
+                -1
+            };
+            if target >= 0 {
                 let win = self.module.params.window;
-                let slot = (zs as usize) % win;
+                let slot = (target as usize) % win;
                 let hd = HEAD_DIM as usize * 2;
                 for ring in &self.rings {
                     gpu.memset_u32_async(ring.offset(slot * hd), 0, hd / 4, stream)?;
@@ -1472,6 +1504,10 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             self.seed_position(ctx.gpu, self.captures_at(q), q, stream)?;
         }
         st.last_seeded = n as i64 - 1;
+        // The first decode position's capture (written by the graphed
+        // bootstrap step, position n) is poisoned — see `boundary_pos` docs.
+        // Recording it here lets propose() keep that ring slot zero.
+        st.boundary_pos = n as i64;
         Ok(n - start)
     }
 }
