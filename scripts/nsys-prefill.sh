@@ -19,9 +19,17 @@ LOG="$WORKTREE/serve-$NAME.log"
 ENV_ARGS=( ATLAS_UNIFIED_MOE_LAYOUT=1 )
 for kv in "$@"; do ENV_ARGS+=("$kv"); done
 
+# Capture must NOT start at process launch: the ~6-minute model load issues
+# enough CUDA activity to overrun nsys's buffers, and the prefill trace is then
+# silently dropped (a run captured only 2 load-time quantize kernels). DELAY
+# seconds skips the load so the trace holds prefill only. Drive prefills in a
+# loop once the server answers so at least one lands inside the window.
+DELAY="${DELAY:-400}"
+
 cd "$WORKTREE"
 : >"$LOG"
 env "${ENV_ARGS[@]}" nsys profile -t cuda -s none --cpuctxsw=none \
+  --delay "$DELAY" \
   --cuda-memory-usage=false --force-overwrite=true -o "$OUT" \
   ./target/release/spark serve "$MODEL" --port 8977 \
   --kv-cache-dtype fp8 --lm-head-dtype fp8 \

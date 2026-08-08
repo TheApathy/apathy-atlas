@@ -28,9 +28,24 @@
 // for K and V (MLA keeps V==K, rope in the tail) the tile is loaded once and
 // used for both when the pointers match.
 //
-// BIT-EXACTNESS: rows no longer carry per-row loop bounds (which made the
-// warp-level shuffles diverge); every row walks the whole tile union and keys
-// outside a row's own window get score = -INFINITY. That is an exact no-op in
+// ── lane -> dim mapping is INTERLEAVED, not contiguous ────────────────────
+// A lane owning a contiguous 64-dim block put the 8 lanes of a row 64 elements
+// = 128 bytes apart, which with 32 4-byte banks is the SAME bank for all eight
+// — an 8-way conflict on every one of the ~128 scalar 2-byte smem loads per
+// key. Profiled cost: 104.8 ms/layer, 73% of prefill wall, at 0.16 TFLOPS on
+// 17 GFLOP/layer — ~50x off even the scalar FP32 peak, with global traffic
+// only ~7% of the time, i.e. smem-instruction bound.
+// Lane l now owns dims { l*8 + k*64 + j : k,j in [0,8) } and loads each k-chunk
+// as one 16-byte vector: the 8 lanes then cover 128 contiguous bytes = all 32
+// banks, conflict-free, with 8x fewer load instructions.
+//
+// This REORDERS the dot-product summation (same terms, different order), so it
+// is not bit-identical to the contiguous mapping — validated by tool-eval-bench
+// rather than by byte comparison.
+//
+// The masking below IS exact: rows no longer carry per-row loop bounds (which
+// made the warp-level shuffles diverge); every row walks the whole tile union
+// and keys outside a row's own window get score = -INFINITY. That is an exact no-op in
 // the online softmax — m_new = max(m, -inf) = m, so eo = exp(0) = 1 and
 // en = exp(-inf) = 0, leaving m, l and o_acc untouched — so each row still
 // folds exactly its own keys, in ascending order, in the same order and with
@@ -45,6 +60,11 @@
 // buffers → 32 KB, under the 48 KB static-smem limit with no opt-in.
 #define KT 16
 #define MAX_HD 512
+// Chunks per lane. MUST be a compile-time constant: with a runtime chunk count
+// the per-lane arrays are dynamically indexed, ptxas cannot keep them in
+// registers, and they land in local memory (a 768-byte stack frame was
+// measured). head_dim is 512 for this model = 8 lanes x NCHUNK x 8 dims.
+#define NCHUNK 8
 
 extern "C" __global__ void prefill_attn_compressed(
     const __nv_bfloat16* __restrict__ Q,       // [S, num_q_heads, head_dim]
@@ -63,9 +83,13 @@ extern "C" __global__ void prefill_attn_compressed(
     const unsigned int sliding_window,   // raw arm attends only the last `sliding_window` keys (0 = full)
     const float inv_sqrt_d
 ) {
-    __shared__ __nv_bfloat16 sK[KT * MAX_HD];
-    __shared__ __nv_bfloat16 sV[KT * MAX_HD];
-
+    // __align__(16) is REQUIRED, not cosmetic: the inner loops read each
+    // 8-dim chunk as a uint4, and a bf16 array is only 2-byte aligned by
+    // default. head_dim (512) and lane_base (multiples of 8) keep every chunk
+    // offset a multiple of 16 bytes, so aligning the base makes every uint4
+    // access 16-byte aligned.
+    __shared__ __align__(16) __nv_bfloat16 sK[KT * MAX_HD];
+    __shared__ __align__(16) __nv_bfloat16 sV[KT * MAX_HD];
     const unsigned int q_head = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
     const unsigned int tid = threadIdx.x;
@@ -74,69 +98,102 @@ extern "C" __global__ void prefill_attn_compressed(
     const unsigned int q_row = q_block * BR + (tid / 8);
     const bool valid = q_row < seq_len;
     const unsigned int dim_lane = tid % 8;
-    const unsigned int dim_start = dim_lane * 64;
-    // NOTE: no early `return` on dim_start >= head_dim — every thread must
-    // reach the __syncthreads() in the tile loop. head_dim <= MAX_HD = 8*64
-    // holds for this model; a lane past the end simply does no useful work.
-    const bool lane_live = dim_start < head_dim;
+    // Interleaved ownership: lane l owns dims { l*8 + k*64 + j }, k,j in [0,8).
+    // Chunk k starts at element `lane_base + k*64` and spans 8 bf16 = 16 bytes,
+    // so the 8 lanes of a row cover 128 contiguous bytes = all 32 banks.
+    const unsigned int lane_base = dim_lane * 8;
+    // No early `return` for out-of-range lanes: every thread must reach the
+    // __syncthreads() in the tile loops.
+    const bool lane_live = lane_base < head_dim;
 
     const unsigned int gqa = num_q_heads / num_kv_heads;
     const unsigned int kv_head = q_head / gqa;
     const unsigned int q_stride = num_q_heads * head_dim;
     const unsigned int kv_stride = num_kv_heads * head_dim;
     // Shuffle partners are the 8 lanes of ONE row (xor 1/2/4 never leaves the
-    // aligned 8-group), so reduce over that group's mask rather than the whole
-    // warp — the block is now uniform, but the narrow mask states the intent.
+    // aligned 8-group), so reduce over that group's mask rather than 0xFFFFFFFF.
     const unsigned int lane_in_warp = tid & 31u;
     const unsigned int row_mask = 0xFFu << (lane_in_warp & ~7u);
 
     const __nv_bfloat16* Qr = Q + (size_t)q_row * q_stride + (size_t)q_head * head_dim;
 
     float m = -1e30f, l = 0.0f;
+    // o_acc[k*8 + j] holds dim (lane_base + k*64 + j).
     float o_acc[64];
-    for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d) o_acc[d] = 0.0f;
+    #pragma unroll
+    for (unsigned int i = 0; i < 64; ++i) o_acc[i] = 0.0f;
 
-    // Q row into registers once: it is reused by every key.
+    // Q row into registers once: reused by every key (it used to be re-read
+    // from global memory per key).
     float q_reg[64];
-    for (unsigned int d = 0; d < 64; ++d) {
-        q_reg[d] = (valid && lane_live && dim_start + d < head_dim)
-                     ? __bfloat162float(Qr[dim_start + d])
-                     : 0.0f;
+    #pragma unroll
+    for (unsigned int i = 0; i < 64; ++i) q_reg[i] = 0.0f;
+    if (valid && lane_live) {
+        for (unsigned int k = 0; k < NCHUNK; ++k) {
+            const unsigned int d0 = lane_base + k * 64;
+            #pragma unroll
+            for (unsigned int j = 0; j < 8; ++j)
+                q_reg[k * 8 + j] = __bfloat162float(Qr[d0 + j]);
+        }
     }
 
-    // Fold one staged key into the online softmax. `in_range` false ⇒ exact
-    // no-op (see BIT-EXACTNESS above). Every thread in the block executes
-    // this for every staged key, so the shuffles stay convergent.
-    #define ATTEND_S(SLOT, IN_RANGE)                                          \
-    do {                                                                       \
-        const __nv_bfloat16* Ks = sK + (size_t)(SLOT) * head_dim;             \
-        const __nv_bfloat16* Vs = sV + (size_t)(SLOT) * head_dim;             \
-        float dot = 0.0f;                                                     \
-        if (lane_live) {                                                      \
-            for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d) \
-                dot += q_reg[d] * __bfloat162float(Ks[dim_start + d]);        \
-        }                                                                     \
-        dot += __shfl_xor_sync(row_mask, dot, 1);                             \
-        dot += __shfl_xor_sync(row_mask, dot, 2);                             \
-        dot += __shfl_xor_sync(row_mask, dot, 4);                             \
-        float score = (IN_RANGE) ? (dot * inv_sqrt_d) : -INFINITY;            \
-        float m_new = fmaxf(m, score);                                        \
-        float eo = __expf(m - m_new);                                         \
-        float en = __expf(score - m_new);                                     \
-        for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d)     \
-            o_acc[d] = o_acc[d] * eo + en * __bfloat162float(Vs[dim_start + d]); \
-        l = l * eo + en;                                                      \
-        m = m_new;                                                            \
+    // Fold one staged key into the online softmax. IN_RANGE false => score is
+    // -INFINITY, an exact no-op: m_new = max(m, -inf) = m, eo = exp(0) = 1,
+    // en = exp(-inf) = 0. Every thread runs this for every staged key, so the
+    // shuffles stay convergent.
+    #define ATTEND_TILE(KS, VS, IN_RANGE)                                      \
+    do {                                                                        \
+        float dot = 0.0f;                                                      \
+        if (lane_live) {                                                       \
+            _Pragma("unroll")                                                  \
+            for (unsigned int k = 0; k < NCHUNK; ++k) {                        \
+                const uint4 kv4 =                                              \
+                    *reinterpret_cast<const uint4*>((KS) + lane_base + k * 64);\
+                const __nv_bfloat16* kb =                                      \
+                    reinterpret_cast<const __nv_bfloat16*>(&kv4);              \
+                _Pragma("unroll")                                              \
+                for (unsigned int j = 0; j < 8; ++j)                           \
+                    dot += q_reg[k * 8 + j] * __bfloat162float(kb[j]);         \
+            }                                                                  \
+        }                                                                      \
+        dot += __shfl_xor_sync(row_mask, dot, 1);                              \
+        dot += __shfl_xor_sync(row_mask, dot, 2);                              \
+        dot += __shfl_xor_sync(row_mask, dot, 4);                              \
+        float score = (IN_RANGE) ? (dot * inv_sqrt_d) : -INFINITY;             \
+        float m_new = fmaxf(m, score);                                         \
+        float eo = __expf(m - m_new);                                          \
+        float en = __expf(score - m_new);                                      \
+        if (lane_live) {                                                       \
+            _Pragma("unroll")                                                  \
+            for (unsigned int k = 0; k < NCHUNK; ++k) {                        \
+                const uint4 vv4 =                                              \
+                    *reinterpret_cast<const uint4*>((VS) + lane_base + k * 64);\
+                const __nv_bfloat16* vb =                                      \
+                    reinterpret_cast<const __nv_bfloat16*>(&vv4);              \
+                _Pragma("unroll")                                              \
+                for (unsigned int j = 0; j < 8; ++j)                           \
+                    o_acc[k * 8 + j] = o_acc[k * 8 + j] * eo                   \
+                                     + en * __bfloat162float(vb[j]);           \
+            }                                                                  \
+        }                                                                      \
+        l = l * eo + en;                                                       \
+        m = m_new;                                                             \
     } while (0)
 
-    // Stage `count` rows starting at `base` from a [*, stride] source.
-    #define STAGE(SRC, STRIDE, HEAD_OFF, BASE, COUNT)                          \
-    do {                                                                       \
+    // Stage COUNT rows starting at BASE into sK (and sV when V does not alias).
+    #define STAGE_TILE(KSRC, VSRC, STRIDE, HEAD_OFF, BASE, COUNT, SAME)        \
+    do {                                                                        \
         for (unsigned int kk = 0; kk < (COUNT); ++kk) {                        \
-            const __nv_bfloat16* src =                                         \
-                (SRC) + (size_t)((BASE) + kk) * (STRIDE) + (HEAD_OFF);         \
+            const __nv_bfloat16* ks =                                          \
+                (KSRC) + (size_t)((BASE) + kk) * (STRIDE) + (HEAD_OFF);        \
             for (unsigned int dd = tid; dd < head_dim; dd += 128)              \
-                sK[kk * head_dim + dd] = src[dd];                              \
+                sK[kk * head_dim + dd] = ks[dd];                               \
+            if (!(SAME)) {                                                     \
+                const __nv_bfloat16* vs =                                      \
+                    (VSRC) + (size_t)((BASE) + kk) * (STRIDE) + (HEAD_OFF);    \
+                for (unsigned int dd = tid; dd < head_dim; dd += 128)          \
+                    sV[kk * head_dim + dd] = vs[dd];                           \
+            }                                                                  \
         }                                                                      \
     } while (0)
 
@@ -145,8 +202,8 @@ extern "C" __global__ void prefill_attn_compressed(
     const bool comp_same = (Kc == Vc);
 
     // ── raw keys (sliding-window causal) ──────────────────────────────────
-    // Union over the block's 16 rows: row q covers [max(0,q+1-W), q]. Rows
-    // walk the union and mask; the extra keys are exact no-ops.
+    // Union over the block's 16 rows: row q covers [max(0,q+1-W), q]. Rows walk
+    // the union and mask; the extra keys are exact no-ops.
     const unsigned int q_first = q_block * BR;
     const unsigned int q_last_excl = (q_first + BR < seq_len) ? (q_first + BR) : seq_len;
     const unsigned int kv_start = valid ? ((sliding_window > 0u && q_row + 1u > sliding_window)
@@ -162,39 +219,14 @@ extern "C" __global__ void prefill_attn_compressed(
             unsigned int count = union_hi - base;
             if (count > KT) count = KT;
             __syncthreads();
-            STAGE(K, kv_stride, (size_t)kv_head * head_dim, base, count);
-            if (!kv_same) {
-                for (unsigned int kk = 0; kk < count; ++kk) {
-                    const __nv_bfloat16* src =
-                        V + (size_t)(base + kk) * kv_stride + (size_t)kv_head * head_dim;
-                    for (unsigned int dd = tid; dd < head_dim; dd += 128)
-                        sV[kk * head_dim + dd] = src[dd];
-                }
-            }
+            STAGE_TILE(K, V, kv_stride, (size_t)kv_head * head_dim, base, count, kv_same);
             __syncthreads();
             const __nv_bfloat16* Vtile = kv_same ? sK : sV;
             for (unsigned int kk = 0; kk < count; ++kk) {
                 const unsigned int kp = base + kk;
                 const bool in_range = valid && kp >= kv_start && kp < kv_len;
-                // Re-point the V read when V aliases K.
-                const __nv_bfloat16* Vs = Vtile + (size_t)kk * head_dim;
-                const __nv_bfloat16* Ks = sK + (size_t)kk * head_dim;
-                float dot = 0.0f;
-                if (lane_live) {
-                    for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d)
-                        dot += q_reg[d] * __bfloat162float(Ks[dim_start + d]);
-                }
-                dot += __shfl_xor_sync(row_mask, dot, 1);
-                dot += __shfl_xor_sync(row_mask, dot, 2);
-                dot += __shfl_xor_sync(row_mask, dot, 4);
-                float score = in_range ? (dot * inv_sqrt_d) : -INFINITY;
-                float m_new = fmaxf(m, score);
-                float eo = __expf(m - m_new);
-                float en = __expf(score - m_new);
-                for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d)
-                    o_acc[d] = o_acc[d] * eo + en * __bfloat162float(Vs[dim_start + d]);
-                l = l * eo + en;
-                m = m_new;
+                ATTEND_TILE(sK + (size_t)kk * head_dim,
+                            Vtile + (size_t)kk * head_dim, in_range);
             }
         }
     }
@@ -202,44 +234,20 @@ extern "C" __global__ void prefill_attn_compressed(
     // ── compressed keys (windowed-causal) ─────────────────────────────────
     unsigned int comp_vis = valid ? ((q_row + 1u) / ratio) : 0u;
     if (comp_vis > n_comp) comp_vis = n_comp;
-    // Union: comp_vis is monotonic in q_row, so the block's max is the last
-    // valid row's. Compute it without assuming which rows are valid.
+    // comp_vis is monotonic in q_row, so the block's union is the last row's.
     unsigned int comp_union = (q_last_excl > 0u) ? (q_last_excl / ratio) : 0u;
     if (comp_union > n_comp) comp_union = n_comp;
     for (unsigned int base = 0; base < comp_union; base += KT) {
         unsigned int count = comp_union - base;
         if (count > KT) count = KT;
         __syncthreads();
-        STAGE(Kc, head_dim, 0u, base, count);
-        if (!comp_same) {
-            for (unsigned int kk = 0; kk < count; ++kk) {
-                const __nv_bfloat16* src = Vc + (size_t)(base + kk) * head_dim;
-                for (unsigned int dd = tid; dd < head_dim; dd += 128)
-                    sV[kk * head_dim + dd] = src[dd];
-            }
-        }
+        STAGE_TILE(Kc, Vc, head_dim, 0u, base, count, comp_same);
         __syncthreads();
         const __nv_bfloat16* Vtile = comp_same ? sK : sV;
         for (unsigned int kk = 0; kk < count; ++kk) {
             const bool in_range = (base + kk) < comp_vis;
-            const __nv_bfloat16* Ks = sK + (size_t)kk * head_dim;
-            const __nv_bfloat16* Vs = Vtile + (size_t)kk * head_dim;
-            float dot = 0.0f;
-            if (lane_live) {
-                for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d)
-                    dot += q_reg[d] * __bfloat162float(Ks[dim_start + d]);
-            }
-            dot += __shfl_xor_sync(row_mask, dot, 1);
-            dot += __shfl_xor_sync(row_mask, dot, 2);
-            dot += __shfl_xor_sync(row_mask, dot, 4);
-            float score = in_range ? (dot * inv_sqrt_d) : -INFINITY;
-            float m_new = fmaxf(m, score);
-            float eo = __expf(m - m_new);
-            float en = __expf(score - m_new);
-            for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d)
-                o_acc[d] = o_acc[d] * eo + en * __bfloat162float(Vs[dim_start + d]);
-            l = l * eo + en;
-            m = m_new;
+            ATTEND_TILE(sK + (size_t)kk * head_dim,
+                        Vtile + (size_t)kk * head_dim, in_range);
         }
     }
 
@@ -248,7 +256,8 @@ extern "C" __global__ void prefill_attn_compressed(
         float sg = sinks[q_head];
         float m_new = fmaxf(m, sg);
         float eo = __expf(m - m_new);
-        for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d) o_acc[d] *= eo;
+        #pragma unroll
+        for (unsigned int i = 0; i < 64; ++i) o_acc[i] *= eo;
         l = l * eo + __expf(sg - m_new);
         m = m_new;
     }
@@ -256,9 +265,13 @@ extern "C" __global__ void prefill_attn_compressed(
     if (valid && lane_live) {
         float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
         __nv_bfloat16* Or = O + (size_t)q_row * q_stride + (size_t)q_head * head_dim;
-        for (unsigned int d = 0; d < 64 && dim_start + d < head_dim; ++d)
-            Or[dim_start + d] = __float2bfloat16(o_acc[d] * inv_l);
+        for (unsigned int k = 0; k < NCHUNK; ++k) {
+            const unsigned int d0 = lane_base + k * 64;
+            #pragma unroll
+            for (unsigned int j = 0; j < 8; ++j)
+                Or[d0 + j] = __float2bfloat16(o_acc[k * 8 + j] * inv_l);
+        }
     }
-    #undef ATTEND_S
-    #undef STAGE
+    #undef ATTEND_TILE
+    #undef STAGE_TILE
 }

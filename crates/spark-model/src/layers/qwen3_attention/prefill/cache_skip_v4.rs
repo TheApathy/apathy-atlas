@@ -76,6 +76,40 @@ impl Qwen3AttentionLayer {
             }
         }
 
+        // ATLAS_PROFILE=1 phase split for the V4 attention prefill, mirroring
+        // the MoE prefill's `prof!`. Without it the MoE stage timers accounted
+        // for only 3% of prefill wall (694 ms of 23,200 ms) and the rest was
+        // an unattributed lump; nsys could not fill the gap either — the
+        // ~6-minute model load overruns its buffers and the prefill trace is
+        // silently dropped. Syncs, so it is measurement-only.
+        // Declared BEFORE the macro: macro_rules identifiers are hygienic, so a
+        // body referencing `_aprof_t` only resolves if the binding is already in
+        // scope at the definition site.
+        #[allow(unused_assignments)]
+        let mut _aprof_t = if ctx.profile {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        #[allow(unused_macros)]
+        macro_rules! aprof {
+            ($label:expr) => {
+                if ctx.profile {
+                    ctx.gpu.synchronize(stream)?;
+                    if let Some(t) = _aprof_t {
+                        tracing::info!(
+                            "  ATTN prefill [{}] N={}: {}µs",
+                            $label,
+                            n,
+                            t.elapsed().as_micros()
+                        );
+                    }
+                    _aprof_t = Some(std::time::Instant::now());
+                }
+            };
+        }
+
         // ── 1. Q latent → norm → expand ──
         let q_latent = ctx.buffers.ssm_ba();
         if use_tc {
@@ -172,6 +206,7 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        aprof!("1_q_latent_expand");
         // ── 2. Direct KV projection (V4-Flash: K=V, no absorption) ──
         // Layout in qkv_output: [Q | K | V]  (mirrors decode path)
         let q_dim = nq * hd_mla;
@@ -289,6 +324,7 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        aprof!("2_kv_proj");
         // ── 3. RoPE on Q and K (V is NOT RoPE'd) ──
         // V4-Flash: rope dims are at offset `nope` per head (matching MLA layout),
         // not at the beginning. Extract → RoPE → writeback.
@@ -411,6 +447,7 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        aprof!("3_rope");
         // ── 4. Core attention ──
         // CSA layers (compress_ratios[L]=4): attend over [raw causal KV | compressed
         // windowed KV] + per-head sink (DeepSeek Sparse Attention). For short prompts
@@ -804,6 +841,7 @@ impl Qwen3AttentionLayer {
             );
         }
 
+        aprof!("4_core_attention");
         // ── 5. Assemble KV cache (V4-Flash: requires latent+rope assembly) ──
         // NOTE: k_out is 512-dim (complete K), but cache needs 576-dim (512 latent + 64 rope).
         // We need to extract the latent portion (first 512 dims), reassemble with rope, then write.
@@ -841,6 +879,7 @@ impl Qwen3AttentionLayer {
             .synchronize(stream)
             .map_err(|e| anyhow::anyhow!("V4 attn: write_kv_cache sync failed: {e}"))?;
 
+        aprof!("5_kv_cache_assemble");
         // ── 6. Grouped low-rank O projection (block-diagonal wo_a → wo_b) ──
         // wo_a is block-diagonal over o_groups (DeepseekV4GroupedLinear); see
         // decode/attention_forward_v4.rs. Per-token×group GEMVs avoid the
