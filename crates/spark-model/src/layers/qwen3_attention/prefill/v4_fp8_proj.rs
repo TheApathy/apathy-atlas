@@ -130,41 +130,35 @@ impl Qwen3AttentionLayer {
             .checked_mul(o_lora)
             .ok_or_else(|| anyhow::anyhow!("V4 wo_a: latent width overflow"))?;
 
-        if !mla.wo_a.weight.is_null() {
-            for token in 0..n {
-                for group in 0..o_groups {
-                    let input = attn_out
-                        .offset(((token * input_width + group * group_in) as usize) * BF16_BYTES);
-                    let weight = DenseWeight {
-                        weight: mla
-                            .wo_a
-                            .weight
-                            .offset(((group * o_lora * group_in) as usize) * BF16_BYTES),
-                    };
-                    let output = o_latent
-                        .offset(((token * latent_dim + group * o_lora) as usize) * BF16_BYTES);
-                    ops::dense_gemv(
-                        ctx.gpu,
-                        self.dense_gemv_k,
-                        input,
-                        &weight,
-                        output,
-                        o_lora,
-                        group_in,
-                        stream,
-                    )?;
-                }
-            }
-            return Ok(());
-        }
-
-        let weight = validate_fp8(
-            mla.wo_a_fp8
-                .ok_or_else(|| anyhow::anyhow!("V4 wo_a: BF16 released but FP8 is absent"))?,
-            latent_dim,
-            group_in,
-            "V4 wo_a",
-        )?;
+        // BOTH weight formats take the same gather → one GEMM over all `n`
+        // rows → scatter shape, differing only in the weight handed to
+        // `v4_project_prefill`.
+        //
+        // The BF16 arm used to loop `for token in 0..n { for group in
+        // 0..o_groups { dense_gemv(..) } }` — n × o_groups GEMV launches per
+        // layer where the FP8 arm already issued o_groups GEMMs total. On a
+        // 911-token prefill that is 911 × 8 × 43 = 313k launches, and nsys
+        // measured `dense_gemv_bf16` at 272,414 instances / 9.64 s — 49% of
+        // ALL prefill GPU time, against 694 ms for the entire MoE. It is why
+        // prefill throughput was FLAT in prompt length (~38 tok/s at both 113
+        // and 3281 tokens): the projections got zero batching amortization.
+        //
+        // `attn_out` is group-strided (`input_width` per row), so each group's
+        // columns are gathered into contiguous scratch first — a real GEMM
+        // needs contiguous rows. Scratch is the dead Q buffer, live here
+        // because wo_a runs after attention has consumed Q.
+        let bf16 = !mla.wo_a.weight.is_null();
+        let fp8 = if bf16 {
+            None
+        } else {
+            Some(validate_fp8(
+                mla.wo_a_fp8
+                    .ok_or_else(|| anyhow::anyhow!("V4 wo_a: BF16 released but FP8 is absent"))?,
+                latent_dim,
+                group_in,
+                "V4 wo_a",
+            )?)
+        };
         let scratch_in = ctx.buffers.qkv_output();
         let scratch_out = scratch_in.offset((n * group_in) as usize * BF16_BYTES);
         ensure!(
@@ -185,20 +179,25 @@ impl Qwen3AttentionLayer {
                 n as usize,
                 stream,
             )?;
-            let group_weight = Fp8Weight {
-                weight: weight.weight.offset(group as usize * weight_group_bytes),
-                row_scale: weight.row_scale.offset(group as usize * scale_group_bytes),
+            let dense_group = DenseWeight {
+                weight: if bf16 {
+                    mla.wo_a.weight.offset(group as usize * weight_group_bytes * BF16_BYTES)
+                } else {
+                    DevicePtr::NULL
+                },
+            };
+            let fp8_group = fp8.map(|w| Fp8Weight {
+                weight: w.weight.offset(group as usize * weight_group_bytes),
+                row_scale: w.row_scale.offset(group as usize * scale_group_bytes),
                 n: o_lora,
                 k: group_in,
-                scale_format: weight.scale_format,
-            };
+                scale_format: w.scale_format,
+            });
             self.v4_project_prefill(
                 ctx,
                 scratch_in,
-                &DenseWeight {
-                    weight: DevicePtr::NULL,
-                },
-                Some(group_weight),
+                &dense_group,
+                fp8_group,
                 scratch_out,
                 n,
                 o_lora,
