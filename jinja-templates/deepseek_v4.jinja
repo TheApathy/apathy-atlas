@@ -4,6 +4,7 @@
 {%- set thinking_end_token = "" -%}
 {%- set user_token = "<｜User｜>" -%}
 {%- set assistant_token = "<｜Assistant｜>" -%}
+{%- set dsml_token = "｜DSML｜" -%}
 
 {%- if not messages %}
     {{- raise_exception('No messages provided.') }}
@@ -29,6 +30,43 @@
     {%- endif %}
 {%- endmacro %}
 
+{#- Assistant tool calls in the checkpoint's native DSML syntax
+    (encoding_dsv4.py: tool_calls_template / tool_call_template /
+    encode_arguments_to_dsml). `｜` is U+FF5C FULLWIDTH VERTICAL LINE.
+    String args go raw with string="true"; every other type is JSON
+    with string="false" — the DsmlV4Parser decodes the mirror image. -#}
+{%- macro render_tool_calls(tool_calls) %}
+    {{- '\n\n<' + dsml_token + 'tool_calls>\n' }}
+    {%- for tool_call in tool_calls %}
+        {%- if tool_call.function is defined %}
+            {%- set tool_call = tool_call.function %}
+        {%- endif %}
+        {%- if not loop.first %}
+            {{- '\n' }}
+        {%- endif %}
+        {{- '<' + dsml_token + 'invoke name="' + tool_call.name + '">\n' }}
+        {%- if tool_call.arguments is defined %}
+            {%- if tool_call.arguments is mapping %}
+                {%- for args_name, args_value in tool_call.arguments|items %}
+                    {%- if not loop.first %}
+                        {{- '\n' }}
+                    {%- endif %}
+                    {%- if args_value is string %}
+                        {{- '<' + dsml_token + 'parameter name="' + args_name + '" string="true">' + args_value }}
+                    {%- else %}
+                        {{- '<' + dsml_token + 'parameter name="' + args_name + '" string="false">' + (args_value | tojson) }}
+                    {%- endif %}
+                    {{- '</' + dsml_token + 'parameter>' }}
+                {%- endfor %}
+            {%- elif tool_call.arguments is string %}
+                {{- tool_call.arguments }}
+            {%- endif %}
+        {%- endif %}
+        {{- '\n</' + dsml_token + 'invoke>' }}
+    {%- endfor %}
+    {{- '\n</' + dsml_token + 'tool_calls>' }}
+{%- endmacro %}
+
 {%- set first_message = true -%}
 {%- for message in messages %}
     {%- set content = render_content(message.content) -%}
@@ -51,7 +89,28 @@
         {%- if reasoning_content %}
             {{- thinking_start_token + reasoning_content + thinking_end_token }}
         {%- endif %}
-        {{- content + eos_token }}
+        {{- content }}
+        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+            {{- render_tool_calls(message.tool_calls) }}
+        {%- endif %}
+        {{- eos_token }}
+    {%- elif message.role == "tool" %}
+        {#- The checkpoint has no `tool` role: merge_tool_messages() folds
+            tool results into a USER turn as <tool_result> blocks joined by
+            "\n\n". So open <｜User｜> once per RUN of tool messages and
+            close with <｜Assistant｜> once the run ends. -#}
+        {%- if not loop.previtem or loop.previtem.role != "tool" %}
+            {%- if first_message %}
+                {{- bos_token }}
+            {%- endif %}
+            {{- user_token }}
+        {%- else %}
+            {{- '\n\n' }}
+        {%- endif %}
+        {{- '<tool_result>' + content + '</tool_result>' }}
+        {%- if loop.last or loop.nextitem.role != "tool" %}
+            {{- assistant_token }}
+        {%- endif %}
     {%- else %}
         {{- raise_exception('Unexpected message role.') }}
     {%- endif %}

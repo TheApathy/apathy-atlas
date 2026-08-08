@@ -102,3 +102,5 @@ impl StreamingDecoder<'_> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_dsv4;

@@ -271,10 +271,48 @@ impl DsparkDraftHead {
         })
     }
 
+    /// `ATLAS_DSPARK_DEBUG=1`, read ONCE.
+    ///
+    /// This gates 14 `dbg` probes inside `propose_block` plus the `==PROPOSE==`
+    /// marker, and `propose` runs every speculative step on the hot path.
+    /// `std::env::var` is not free — it takes the process-wide env lock and
+    /// allocates a `String` per call — so reading it per probe put ~18 locked
+    /// allocations in front of every propose for a flag that is off in
+    /// production. Same read-once discipline as every other gate in this file.
+    fn debug_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var("ATLAS_DSPARK_DEBUG").as_deref() == Ok("1"))
+    }
+
+    /// `ATLAS_DSPARK_RING_DUMP=1`, read once (per-propose host sync when on).
+    fn ring_dump_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var("ATLAS_DSPARK_RING_DUMP").as_deref() == Ok("1"))
+    }
+
+    /// `ATLAS_DSPARK_PROBE_DUMP=<path>`, read once.
+    fn probe_dump_path() -> Option<&'static str> {
+        static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        CACHED
+            .get_or_init(|| std::env::var("ATLAS_DSPARK_PROBE_DUMP").ok())
+            .as_deref()
+    }
+
+    /// `ATLAS_DSPARK_CONF` confidence threshold, read once (0 = ungated).
+    fn conf_threshold() -> f32 {
+        static CACHED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("ATLAS_DSPARK_CONF")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0)
+        })
+    }
+
     /// ATLAS_DSPARK_DEBUG=1: sync + print the L2 norm and first values of a
     /// BF16 buffer. Bisects the propose chain against the Python reference.
     fn dbg(&self, gpu: &dyn GpuBackend, label: &str, ptr: DevicePtr, n: usize, stream: u64) {
-        if std::env::var("ATLAS_DSPARK_DEBUG").as_deref() != Ok("1") {
+        if !Self::debug_enabled() {
             return;
         }
         let _ = gpu.synchronize(stream);
@@ -306,7 +344,7 @@ impl DsparkDraftHead {
 
     #[allow(dead_code)]
     fn dbg_f32(&self, gpu: &dyn GpuBackend, label: &str, ptr: DevicePtr, n: usize, stream: u64) {
-        if std::env::var("ATLAS_DSPARK_DEBUG").as_deref() != Ok("1") {
+        if !Self::debug_enabled() {
             return;
         }
         let _ = gpu.synchronize(stream);
@@ -449,7 +487,7 @@ impl DsparkDraftHead {
         pos: usize,
         stream: u64,
     ) -> Result<(Vec<u32>, Vec<f32>, Vec<u32>)> {
-        if std::env::var("ATLAS_DSPARK_DEBUG").as_deref() == Ok("1") {
+        if Self::debug_enabled() {
             eprintln!("DSPARK_DBG ==PROPOSE pos={pos} committed={committed}==");
         }
         self.seed_position(gpu, captures, pos, stream)?;
@@ -466,7 +504,7 @@ impl DsparkDraftHead {
         // proven to be the first divergent stage with byte-identical probed
         // inputs — the divergence must live in unprobed slots; this names them.
         // Hashes, not norms: 4-decimal norms hide byte drift (hard-won rule).
-        if std::env::var("ATLAS_DSPARK_RING_DUMP").as_deref() == Ok("1") {
+        if Self::ring_dump_enabled() {
             let vis = (pos + 1).min(self.module.params.window);
             let hd = HEAD_DIM as usize * 2;
             let _ = gpu.synchronize(stream);
@@ -1295,7 +1333,7 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         // drafter reads at `p` (the verify-capture the online path feeds
         // propose), so it can be diffed against the plain-decode probe dump at
         // the same sequence position. Debug-only host sync.
-        if let Ok(path) = std::env::var("ATLAS_DSPARK_PROBE_DUMP") {
+        if let Some(path) = Self::probe_dump_path() {
             use std::io::Write;
             let h = self.h as usize;
             let caps = self.captures_at(p);
@@ -1376,10 +1414,7 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         // Confidence gate (ATLAS_DSPARK_CONF, 0 = ungated). The offline
         // calibration (docs/dspark_port.md) shows 0.9 over-truncates on our
         // cost model; default ungated until tuned in-server.
-        let thr: f32 = std::env::var("ATLAS_DSPARK_CONF")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.0);
+        let thr: f32 = Self::conf_threshold();
         let mut keep = drafts.len().min(num_drafts.max(1));
         if thr > 0.0 {
             let mut k = 0;
