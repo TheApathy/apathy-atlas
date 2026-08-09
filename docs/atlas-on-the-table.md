@@ -75,3 +75,20 @@ ceiling-perfect plain ≈ 36 ms ≈ 28 tok/s  ← matches the reference floor ar
 
 Update this file when a row changes state. A row moves to CLOSED only with a
 measurement, never with an argument.
+
+## Full-stack decode decomposition — measured 2026-08-09 end-of-session
+
+```
+verify  = 106 ms   (exact GEMV chain; m6 MoE at 183 GB/s is the bulk)
+propose = 12.6 ms  (true, PROPOSE_PROF; STEP_TIMING bucket reads ~20 inflated)
+plain   = 50 ms    →  C = 2.37;  accept 2.9-3.0 four-workload, 3.54 bench mix
+today:  code 22.5 / repeat 29.9 / quote 21.0 / prose 20.8-20.9
+```
+
+The 28+ arithmetic, all measured quantities: at accept 3.0, 28 tok/s needs
+step ≤ 107 ms → verify ≤ ~94. Route: m6 MoE dedup 183 → 210 GB/s (−10 ms;
+the ONE remaining verify item — persistent Stage-0 already NO-GO, T_BLOCK
+saturated, needs a new idea against the 229 ceiling) + propose lm_head
+2.7 → ~1 ms (batch the FP8 tile) → step ~98 ms → **30+ at accept 3.0**.
+Prefill next: TC round 2 (KT=32/cp.async/occupancy), wq_b w8a16_gemm_pipelined
+(~4% of peak), the 13 unconditional per-layer synchronize() calls.
