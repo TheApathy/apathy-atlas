@@ -114,6 +114,81 @@ pub fn w4a16_gemv(
         .launch(stream)
 }
 
+/// W4A16 GEMV over a BLOCK-DIAGONAL weight in ONE launch (the V4 MLA wo_a
+/// shape): `n_total = o_groups * rows_per_group` output rows, row r reading
+/// activation segment `input[(r / rows_per_group) * k ..]`. Bit-identical per
+/// row to per-group `w4a16_gemv` launches; replaces 8 serial ~2.3 MB launches
+/// with one 19 MB stream (153 -> 194 GB/s measured at the wo_a shape).
+///
+/// Kernel: `w4a16_gemv_grouped(A, B_packed, B_scale, scale2, C, N, K, rpg)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_grouped(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    n_total: u32,
+    k: u32,
+    rows_per_group: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_total, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(n_total)
+        .arg_u32(k)
+        .arg_u32(rows_per_group)
+        .launch(stream)
+}
+
+/// Batched (M<=8) `w4a16_gemv_grouped`: per-row math byte-identical to
+/// single-row `w4a16_gemv` (weights read once per chunk for all M rows), so
+/// it delivers the ATLAS_OPROJ_EXACT verify numerics at batch speed. Strided:
+/// input row i at `input + i*lda`, output row i at `output + i*ldc`
+/// (elements). `rows_per_group = n_total` degenerates to a batched PLAIN
+/// GEMV with single-row K order (the wo_b case).
+///
+/// Kernel: `w4a16_gemv_grouped_batchm(A, B, S, s2, C, M, N, K, lda, ldc, rpg)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_grouped_batchm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n_total: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    rows_per_group: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_total, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n_total)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .arg_u32(rows_per_group)
+        .launch(stream)
+}
+
 /// W4A16 double-GEMV (M=2): reads weights once, computes 2 outputs.
 ///
 /// A: [2, K] BF16 contiguous, B: NVFP4 packed, C: [2, N] BF16 contiguous.

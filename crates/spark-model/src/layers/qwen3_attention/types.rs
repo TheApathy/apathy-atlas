@@ -188,6 +188,19 @@ pub struct Qwen3AttentionLayer {
     /// tensor-core GEMM's 16x64 tile.
     pub(super) dense_gemv_batchm_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
+    /// One-launch block-diagonal wo_a (`w4a16_gemv_grouped`): replaces the
+    /// 8-per-layer per-group launches. Bit-identical per row; measured
+    /// 153 -> 194 GB/s at the wo_a shape (grouped microtest, 2026-08-09).
+    /// 0 if the target has no such kernel — dispatch falls back per group.
+    pub(super) w4a16_gemv_grouped_k: KernelHandle,
+    /// Batched (M<=8) sibling of `w4a16_gemv_grouped` whose PER-ROW math is
+    /// byte-identical to single-row `w4a16_gemv` — the ATLAS_OPROJ_EXACT
+    /// semantics at batch speed (3.07x the per-row cost in the grouped
+    /// microtest). Serves BOTH verify o-projection phases: wo_a with
+    /// rows_per_group=o_lora, wo_b with rows_per_group=N (single group).
+    /// 0 when absent — verify falls back to the `_ld` kernels (K-order
+    /// drift documented at the OPROJ_EXACT comment in multi_seq/mla.rs).
+    pub(super) w4a16_gemv_grouped_batchm_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_ld_k: KernelHandle,

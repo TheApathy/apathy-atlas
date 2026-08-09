@@ -585,6 +585,33 @@ impl Qwen3AttentionLayer {
         let latent_dim = o_groups * o_lora; // 8192 = 8*1024
         let o_latent = ctx.buffers.o_latent();
         let o_out = ctx.buffers.qkv_output();
+        // One-launch block-diagonal wo_a: bit-identical to the per-group loop
+        // (same kernel body, same per-row k order), 153 -> 194 GB/s at this
+        // shape (w4a16_gemv_grouped_microtest). ATLAS_V4_WOA_GROUPED=0 opts
+        // back into the 8-launch path for A/B.
+        let use_grouped_woa = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var("ATLAS_V4_WOA_GROUPED").as_deref() != Ok("0")
+            })
+        };
+        if use_grouped_woa && self.w4a16_gemv_grouped_k.0 != 0
+            && let Some(ref woa4) = mla.wo_a_nvfp4
+        {
+            prof!("wo_a_grouped", {
+                ops::w4a16_gemv_grouped(
+                    ctx.gpu,
+                    self.w4a16_gemv_grouped_k,
+                    attn_out,
+                    woa4,
+                    o_latent,
+                    latent_dim,
+                    group_in,
+                    o_lora,
+                    stream,
+                )
+            })?;
+        } else {
         prof!("wo_a_grouped", {
             for g in 0..o_groups {
                 let in_g = attn_out.offset((g * group_in) as usize * 2);
@@ -658,6 +685,7 @@ impl Qwen3AttentionLayer {
             }
             Ok::<(), anyhow::Error>(())
         })?;
+        } // use_grouped_woa
         prof!("wo_b", {
             if let Some(ref wob4) = mla.wo_b_nvfp4 {
                 ops::w4a16_gemv(

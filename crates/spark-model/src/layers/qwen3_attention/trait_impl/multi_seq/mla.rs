@@ -881,6 +881,58 @@ impl Qwen3AttentionLayer {
             mark("C_oproj", &mut t_phase)?;
             return Ok(o_out);
         }
+        // ── Bit-exact batched O projection (ATLAS_OPROJ_BATCH_EXACT, default
+        // on). `w4a16_gemv_grouped_batchm` keeps the single-row K order per
+        // row, so the verify's o_out matches plain decode BYTE-FOR-BYTE —
+        // removing the first divergence the layer-diff harness convicted for
+        // the 2-3% capture drift — at 3.07x the per-row OPROJ_EXACT cost
+        // (grouped microtest 2026-08-09). `=0` opts back into the `_ld`
+        // kernels below for A/B.
+        let oproj_batch_exact = {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| {
+                std::env::var("ATLAS_OPROJ_BATCH_EXACT").as_deref() != Ok("0")
+            })
+        };
+        if oproj_batch_exact
+            && self.w4a16_gemv_grouped_batchm_k.0 != 0
+            && n <= 8
+            && let (Some(woa4), Some(wob4)) = (&mla.wo_a_nvfp4, &mla.wo_b_nvfp4)
+        {
+            // wo_a: block-diagonal, rows_per_group = o_lora.
+            ops::w4a16_gemv_grouped_batchm(
+                gpu,
+                self.w4a16_gemv_grouped_batchm_k,
+                attn_batch,
+                woa4,
+                ol_batch,
+                n as u32,
+                latent_dim,
+                group_in,
+                q_dim,
+                latent_dim,
+                o_lora,
+                stream,
+            )?;
+            // wo_b: plain batched GEMV with single-row K order
+            // (rows_per_group = N ⇒ every row reads A cols [0..K)).
+            ops::w4a16_gemv_grouped_batchm(
+                gpu,
+                self.w4a16_gemv_grouped_batchm_k,
+                ol_batch,
+                wob4,
+                o_out,
+                n as u32,
+                h,
+                latent_dim,
+                latent_dim,
+                h,
+                h,
+                stream,
+            )?;
+            mark("C_oproj", &mut t_phase)?;
+            return Ok(o_out);
+        }
         if nv4_ok && let Some(ref woa4) = mla.wo_a_nvfp4 {
             // NVFP4 groups: packed 0.5 B/elem, scales [N, K/16] 1 B row-major,
             // shared per-tensor scale2 (quantized as one tensor).
