@@ -38,10 +38,10 @@ Targets this ledger serves: plain **27–29** · DFlash sustained **30–35**
 
 | # | item | evidence | prize |
 |---|---|---|---|
-| 1 | **Tensor-core rewrite of `prefill_attn_compressed.cu`** | scalar kernel at 2.2 TFLOPS = 45% of prefill; design + verified MMA fragment math complete in `docs/kernels/prefill-attn-tensorcore.md` | 385 → ~800 tok/s |
-| 2 | `q_latent_expand` GEMMs (261 ms at ~11 TFLOPS) | `ATLAS_PROFILE` budget | ~800 → ~950 |
-| 3 | Measure our prefill curve at 8K/32K/128K | reference's 1055 is at 252K — not our 911-token regime; our plateau is unmeasured | honest comparison + maybe free wins |
-| 4 | Sparse-MLA / indexer path for long context | their 252K enabler; V4 has native compress_ratios | new serving envelope, separate campaign |
+| 1 | **TC attention round 2**: KT=32 tiles (halve syncs), cp.async staging, occupancy (39KB smem = 2 blocks/SM) | round 1 SHIPPED 2026-08-09 (6d8216a3, default-on, gate 90/100 held): uniform 4.1–4.2× — CSA 28.8→7.0, HCA full-causal 76.9→18.3 ms/call @S=2176; prefill 385→420-441. **The doc's 11× assumed window-bounded work; the HCA (ratio=128) layers are FULL-CAUSAL and quadratic — they dominate at length** | 4.2× → ~8× on the attention slice |
+| 2 | `q_latent_expand` — now co-#1: **14.3 ms/layer = 0.62 s/pass @N=2177** | `ATLAS_PROFILE` buckets 2026-08-09 | 3× → −0.4 s/pass |
+| 3 | `kv_proj` 6.7 ms/layer (0.29 s/pass) + the non-attention remainder (~3 s of the 4.99 s TTFT@2177: MoE prefill block, norms, hc, fixed overhead — needs its own profile pass) | same buckets | the actual road to 1000 |
+| 4 | Measure the curve at longer N + sparse-MLA path for long context | reference's 1055 is at 252K | length amortization |
 
 ## Prefill — CLOSED
 
