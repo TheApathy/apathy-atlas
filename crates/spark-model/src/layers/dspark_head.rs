@@ -641,6 +641,7 @@ impl DsparkDraftHead {
                 self.hc_eps,
                 stream,
             )?;
+            pprof!("a_hc_pre");
             ops::rms_norm(
                 gpu,
                 self.k_rms,
@@ -762,6 +763,7 @@ impl DsparkDraftHead {
                 }
                 self.dbg(gpu, &format!("s{s}.sink"), stage.attn_sink.weight, HEADS as usize, stream);
             }
+            pprof!("b_qkv_proj");
             // Windowed bidirectional attention + MLA output de-rotation.
             KernelLaunch::new(gpu, self.k_attn)
                 .grid([b, HEADS, 1])
@@ -786,18 +788,30 @@ impl DsparkDraftHead {
                 stream,
             );
 
+            pprof!("c_attn_kernel");
             // Grouped wo_a (einsum bsgd,grd->bsgr) then wo_b.
             let group_in = (HEADS * HEAD_DIM / O_GROUPS) as usize; // 4096
             let row_o = (HEADS * HEAD_DIM) as usize;
+            // The gather and scatter are ONE strided 2D copy each, not a
+            // per-row loop. Both were `for r in 0..b { copy_d2d_async }`, so a
+            // stage issued 8 groups x (5 + 5) = 80 tiny copies and a propose
+            // issued 240 — each only 8 KB (gather) or 2 KB (scatter), i.e.
+            // pure launch latency. Phase timing put this block at 7.79 ms of a
+            // 19.8 ms propose (39%), against 0.62 ms for the attention kernel
+            // it feeds. Same defect and same fix as the prefill
+            // `v4_grouped_wo_a_prefill` loop earlier in this branch.
             for g in 0..O_GROUPS as usize {
-                for r in 0..b as usize {
-                    gpu.copy_d2d_async(
-                        self.o5.offset((r * row_o + g * group_in) * 2),
-                        self.ogrp.offset(r * group_in * 2),
-                        group_in * 2,
-                        stream,
-                    )?;
-                }
+                // gather: o5 rows are row_o-strided; group g is a group_in-wide
+                // column slice → contiguous [b, group_in] in ogrp.
+                gpu.copy_d2d_2d_async(
+                    self.o5.offset(g * group_in * 2),
+                    row_o * 2,
+                    self.ogrp,
+                    group_in * 2,
+                    group_in * 2,
+                    b as usize,
+                    stream,
+                )?;
                 let wg = DenseWeight {
                     weight: stage.wo_a.weight.offset(g * O_LORA as usize * group_in * 2),
                 };
@@ -812,15 +826,17 @@ impl DsparkDraftHead {
                     group_in as u32,
                     stream,
                 )?;
-                for r in 0..b as usize {
-                    gpu.copy_d2d_async(
-                        self.ogrp_out.offset(r * O_LORA as usize * 2),
-                        self.o_lora5
-                            .offset((r * (O_GROUPS * O_LORA) as usize + g * O_LORA as usize) * 2),
-                        O_LORA as usize * 2,
-                        stream,
-                    )?;
-                }
+                // scatter: contiguous [b, O_LORA] back into the g-th slot of
+                // each o_lora5 row (row stride O_GROUPS*O_LORA).
+                gpu.copy_d2d_2d_async(
+                    self.ogrp_out,
+                    O_LORA as usize * 2,
+                    self.o_lora5.offset(g * O_LORA as usize * 2),
+                    (O_GROUPS * O_LORA) as usize * 2,
+                    O_LORA as usize * 2,
+                    b as usize,
+                    stream,
+                )?;
             }
             ops::dense_gemm(
                 gpu,
@@ -834,6 +850,7 @@ impl DsparkDraftHead {
                 stream,
             )?;
             self.dbg(gpu, &format!("s{s}.attn5.r0"), self.attn5, hu, stream);
+            pprof!("d_o_proj");
             ops::hc_post(
                 gpu,
                 self.k_hc_post,
@@ -850,7 +867,7 @@ impl DsparkDraftHead {
             self.dbg_f32(gpu, &format!("s{s}.hc_post_attn"), nxt, 8, stream);
             std::mem::swap(&mut cur, &mut nxt);
 
-            pprof!("stage_attn");
+            pprof!("e_hc_post");
             // ── FFN site ──
             ops::hc_pre(
                 gpu,
