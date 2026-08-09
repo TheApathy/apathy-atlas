@@ -46,13 +46,33 @@ always with `ATLAS_MTP_GATE_FORCE=1` so the gate cannot hide acceptance):
   `lm_head` 2.71, `stage_moe` 1.47, **`c_attn_kernel` 0.62 — attention is free**.
   The drafter's PROJECTIONS are the cost.
 
-Route to 28.5, all three required:
+Route to 28.5 — REVISED 2026-08-09 by the bandwidth-ceiling probe
+(`docs/2026-08-09-bandwidth-frontier.md`). The real kernel ceiling is
+~229 GB/s (measured streaming read 228.9, contiguous 1-GiB GEMV 225.5), not
+the long-assumed 183. Both the plain step AND the verify are re-based:
+
 ```
-verify  113 -> ~95 ms   m=6 MoE dedup 135 -> 183 GB/s ([[moe-dedup-bandwidth-vs-rows]])
-propose  19 -> ~10 ms   small-M GEMM kernels for the projections
-=> C ~2.10, at today's 2.68 tok/step = 1.28x = 25.5 tok/s
-then acceptance 42% -> 74% (3.08 tok/step) = 1.47x = 29.4 tok/s
+lever 1  expert-major streaming MoE GEMV (bit-exact):
+         plain  50.0 -> ~34 ms  (7.227 GB @ 210+)        plain 20 -> 27-29
+         verify 113  -> ~74 ms  (m=6 dedup 135 -> ~205)
+lever 2  MXFP8 fused o_proj (B12X wo_projection port, quality-gated):
+         verify -> ~68 ms, propose 19.4 -> ~11 ms
+         => C ~2.3, at today's 2.68 tok/step = 1.17x     DFlash ~33-34
+lever 3  acceptance 2.68 -> 3.08 tok/step (bimodal zero-accept thread):
+         3.08 / 2.3 = 1.34x                              DFlash ~37-39
+lever 4  3.0 bpw Trellis requant (separate campaign, quality-gated):
+         sustained median 35-38, peaks 40+ (reference-validated)
 ```
+
+Targets that follow: **plain 27-29 · DSpark propose ≤11 ms (≤0.33 of the
+plain step) · DFlash sustained 30-35 without requant, 35-38 with.** The
+reference's implied floor (median 38.1 / measured 1.43x multiplier = ~26.6
+plain) confirms the plain target is the right anchor.
+
+Expert weights are maximally incompressible — every lossless byte-reduction
+door is measured shut (flat spectra, orthogonal experts, zero MI, 1.028x
+entropy ceiling; see the frontier doc). Kernel bandwidth + lossy requant are
+the only decode levers. Do not re-chase compression schemes.
 
 ## Prefill: one kernel away from ~950
 

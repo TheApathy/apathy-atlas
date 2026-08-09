@@ -35,7 +35,7 @@ cd "$REPO"
 {
   echo "serve: $REPO/target/release/spark"
   echo "cwd  : $REPO  (jinja-templates override dir)"
-  echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=fp8 gpu_mem=0.96 max_seq=4096 batch=1"
+  echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=fp8 gpu_mem=0.96 max_seq=16384 batch=1"
   echo "env  : ${ENV_ARGS[*]}"
   echo "spec : ${SPEC[*]:-<none, plain decode>}"
 } >"$LOG"
@@ -45,10 +45,10 @@ env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --kv-cache-dtype fp8 \
   --lm-head-dtype fp8 \
   --gpu-memory-utilization 0.96 \
-  --max-seq-len 4096 \
+  --max-seq-len 16384 \
   --max-num-seqs 1 \
   --max-batch-size 1 \
-  --max-prefill-tokens 4096 \
+  --max-prefill-tokens 16384 \
   "${SPEC[@]}" >>"$LOG" 2>&1 &
 
 echo "pid=$! log=$LOG"
