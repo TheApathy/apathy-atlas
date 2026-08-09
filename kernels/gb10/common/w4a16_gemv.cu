@@ -700,8 +700,13 @@ extern "C" __global__ void w4a16_gemv_batch2(
 // weight read the way w8a16_gemv_batch4/16 does for FP8; without it the FP4
 // multi-seq path capped at batch3 and re-streamed the weight ~3x at C=8.
 //
-// Per-row accumulation order is IDENTICAL to `w4a16_gemv` (M=1), so the output
-// is bit-identical to running w4a16_gemv M times.
+// NOT bit-identical to `w4a16_gemv` M times (MEASURED 2026-08-09, grouped
+// microtest gate 4: 1/49152 outputs differ on random weights): the chunk-to-
+// lane assignment differs (k16=lane stride-64 vs the single-row paired
+// lane*2/+128 walk with the acc0/acc1 split), and the scale is pre-multiplied
+// into the weights ((w*s)*a) where single-row regroups as s*(w*a). Use
+// `w4a16_gemv_grouped_batchm` when bit-identity with the single-row kernel
+// is required (verify capture chain).
 // A:[M,K] BF16, B_packed:[N,K/2], B_scale:[N,K/16] FP8-E4M3, scale2 FP32,
 // C:[M,N] BF16. Grid: (ceil(N/4),1,1) Block: (256,1,1).
 template <int MAX_M>

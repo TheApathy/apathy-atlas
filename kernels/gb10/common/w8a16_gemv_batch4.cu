@@ -13,9 +13,12 @@
 // (32x compute over-provision, issue/occupancy-bound). One DRAM pass over the
 // same weight bytes, no tensor cores, no M padding.
 //
-// Per-row accumulation order is IDENTICAL to `w8a16_gemv`, so the output is
-// bit-identical to running `w8a16_gemv` M times (verify with a cos>=0.9999
-// microtest). A:[M,K] BF16, B:[N,K] FP8 E4M3, block_scale:[N/128,K/128] FP32,
+// NOT bit-identical to `w8a16_gemv` M times (MEASURED 2026-08-09): the chunk
+// order matches, but the inner loop sums PAIRS (acc += x + y) where the
+// single-row kernel adds sequentially (acc += x; acc += y) — different
+// rounding under --fmad=false. Use `w8a16_gemv_batchm_exact` below when
+// bit-identity with the single-row kernel is required (verify capture chain).
+// A:[M,K] BF16, B:[N,K] FP8 E4M3, block_scale:[N/128,K/128] FP32,
 // C:[M,N] BF16. Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1).
 
 #include <cuda_bf16.h>
@@ -258,6 +261,129 @@ extern "C" __global__ void w8a16_gemv_batch8_ld(
     unsigned int ldc
 ) {
     w8a16_gemv_batchm_impl<8>(A, B, block_scale, C, M, N, K, lda, ldc);
+}
+
+// ── EXACT (single-row-order) batched sibling ────────────────────────────────
+//
+// `w8a16_gemv_batchm_impl` above is NOT bit-identical to M x `w8a16_gemv`,
+// despite its header comment: the chunk-to-lane assignment matches, but its
+// inner loop sums PAIRS (`acc += a_lo*w + a_hi*w2` = acc + (x + y)) where the
+// single-row kernel adds sequentially (`acc += x; acc += y`). With
+// --fmad=false those round differently, and 43 layers of hyper-connections
+// amplify the ulps into the verify-vs-plain capture drift (see the
+// ATLAS_OPROJ_EXACT comment in multi_seq/mla.rs). This impl is the same
+// weight-streaming pass with the inner accumulation split to match
+// `w8a16_gemv` EXACTLY — per-row output is byte-identical to M single-row
+// calls. Cost: 16 dependent adds per chunk per row instead of 8 — acceptable
+// at verify widths, and the weight read is still amortized M ways.
+template <int MAX_M>
+__device__ __forceinline__ void w8a16_gemv_batchm_exact_impl(
+    const __nv_bfloat16* __restrict__ A,    // [M, K] BF16 (row stride lda)
+    const unsigned char* __restrict__ B,     // [N, K] FP8 E4M3
+    const float* __restrict__ block_scale,   // [N/128, K/128] FP32
+    __nv_bfloat16* __restrict__ C,           // [M, N] BF16 (row stride ldc)
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+
+    __shared__ float s_lut[256];
+    s_lut[threadIdx.x] = E4M3_LUT_B4[threadIdx.x];
+    __syncthreads();
+
+    if (n >= N) return;
+
+    const unsigned int K16 = K / 16;
+    const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
+    const unsigned int n_block = n / FP8_BLOCK;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) acc[t] = 0.0f;
+
+    for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+        const unsigned int base_k = k16 * 16;
+        const unsigned int k_block = base_k / FP8_BLOCK;
+        const float scale = block_scale[n_block * k_blocks + k_block];
+
+        uint4 b_data = ((const uint4*)(B + (unsigned long long)n * K))[k16];
+        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+        float wf[16];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned int w32 = b_raw[i];
+            wf[i * 4 + 0] = s_lut[(w32      ) & 0xFF] * scale;
+            wf[i * 4 + 1] = s_lut[(w32 >>  8) & 0xFF] * scale;
+            wf[i * 4 + 2] = s_lut[(w32 >> 16) & 0xFF] * scale;
+            wf[i * 4 + 3] = s_lut[(w32 >> 24) & 0xFF] * scale;
+        }
+
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t >= M) continue;
+            const __nv_bfloat16* At = A + (unsigned long long)t * lda;
+            uint4 a_lo = ((const uint4*)At)[k16 * 2];
+            uint4 a_hi = ((const uint4*)At)[k16 * 2 + 1];
+            const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+            // SEQUENTIAL adds, one product at a time — the exact w8a16_gemv
+            // accumulation order. Do NOT fuse into pair-sums.
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                __nv_bfloat16 lo, hi;
+                *(unsigned short*)&lo = (unsigned short)(ar[j] & 0xFFFF);
+                *(unsigned short*)&hi = (unsigned short)(ar[j] >> 16);
+                acc[t] += __bfloat162float(lo) * wf[j * 2];
+                acc[t] += __bfloat162float(hi) * wf[j * 2 + 1];
+            }
+        }
+    }
+
+    __shared__ float smem[MAX_M][N_PER_BLOCK * 2];
+    const unsigned int warp_in_out = lane / WARP_SIZE;
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) {
+        if ((unsigned int)t >= M) continue;
+        float a = acc[t];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+        }
+        if (lane % WARP_SIZE == 0) smem[t][local_out * 2 + warp_in_out] = a;
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t >= M) continue;
+            float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            C[(unsigned long long)t * ldc + n] = __float2bfloat16(r);
+        }
+    }
+}
+
+// M<=8, strided, EXACT single-row order — the verify Phase-A projections
+// under ATLAS_VERIFY_EXACT_GEMV=1.
+extern "C" __global__ void w8a16_gemv_batchm_exact(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w8a16_gemv_batchm_exact_impl<8>(A, B, block_scale, C, M, N, K, lda, ldc);
 }
 
 // M<=16 (high-concurrency decode, n=5..16). Same weight-streaming pass; one

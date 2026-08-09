@@ -490,8 +490,40 @@ impl Qwen3AttentionLayer {
             })
         } && !c.fwd.graph_capture;
 
+        // ── ATLAS_VERIFY_EXACT_GEMV=1: every batched GEMV projection in this
+        // verify (Phase A wq_a/wq_b/wkv AND Phase C wo_a/wo_b) runs a kernel
+        // whose per-row accumulation is byte-identical to the single-row
+        // kernels plain decode uses. Both stock batch families measurably
+        // drift (w4: chunk order + scale regroup; w8: pair-sum fusion — see
+        // the kernel headers, measured 2026-08-09). This flag is the
+        // instrument for the capture-drift → acceptance experiment.
+        let verify_exact_gemv = {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| {
+                std::env::var("ATLAS_VERIFY_EXACT_GEMV").as_deref() == Ok("1")
+            })
+        } && self.w8a16_gemv_batchm_exact_k.0 != 0
+            && self.w4a16_gemv_grouped_batchm_k.0 != 0
+            && n <= 8;
+
         // ── Phase A: batched Q + KV projections (weights read once) ──
         let wqa = mla.wq_a_fp8.as_ref().unwrap();
+        if verify_exact_gemv {
+            ops::w8a16_gemv_batchm_exact(
+                gpu,
+                self.w8a16_gemv_batchm_exact_k,
+                c.normed,
+                wqa.weight,
+                wqa.row_scale,
+                ql_batch,
+                n as u32,
+                q_lora,
+                h,
+                h,
+                q_lora,
+                stream,
+            )?;
+        } else {
         ops::w8a16_gemv_batch4(
             gpu,
             gemv.w8,
@@ -504,6 +536,7 @@ impl Qwen3AttentionLayer {
             h,
             stream,
         )?;
+        }
         ops::rms_norm(
             gpu,
             self.rms_norm_w_k,
@@ -520,7 +553,24 @@ impl Qwen3AttentionLayer {
         // decode argmaxes with (precision-consistency matters for the MTP
         // accept rate).
         let nv4_ok = gemv.w4.0 != 0 && gemv.w4_ld.0 != 0;
-        if nv4_ok && let Some(ref wqb4) = mla.wq_b_nvfp4 {
+        if verify_exact_gemv && let Some(ref wqb4) = mla.wq_b_nvfp4 {
+            // rows_per_group = N ⇒ single group ⇒ batched plain GEMV in
+            // single-row K order.
+            ops::w4a16_gemv_grouped_batchm(
+                gpu,
+                self.w4a16_gemv_grouped_batchm_k,
+                ql_batch,
+                wqb4,
+                q_batch,
+                n as u32,
+                q_dim,
+                q_lora,
+                q_lora,
+                q_dim,
+                q_dim,
+                stream,
+            )?;
+        } else if nv4_ok && let Some(ref wqb4) = mla.wq_b_nvfp4 {
             ops::w4a16_gemv_batchm(
                 gpu,
                 gemv.w4,
@@ -571,6 +621,22 @@ impl Qwen3AttentionLayer {
             );
         }
         let wkv = mla.wkv_a_fp8.as_ref().unwrap();
+        if verify_exact_gemv {
+            ops::w8a16_gemv_batchm_exact(
+                gpu,
+                self.w8a16_gemv_batchm_exact_k,
+                c.normed,
+                wkv.weight,
+                wkv.row_scale,
+                kv_batch,
+                n as u32,
+                kv_dim,
+                h,
+                h,
+                kv_dim,
+                stream,
+            )?;
+        } else {
         ops::w8a16_gemv_batch4(
             gpu,
             gemv.w8,
@@ -583,6 +649,7 @@ impl Qwen3AttentionLayer {
             h,
             stream,
         )?;
+        }
         ops::rms_norm(
             gpu,
             self.rms_norm_w_k,
@@ -898,7 +965,7 @@ impl Qwen3AttentionLayer {
             *E.get_or_init(|| {
                 std::env::var("ATLAS_OPROJ_BATCH_EXACT").as_deref() == Ok("1")
             })
-        };
+        } || verify_exact_gemv;
         if oproj_batch_exact
             && self.w4a16_gemv_grouped_batchm_k.0 != 0
             && n <= 8

@@ -201,6 +201,11 @@ pub struct Qwen3AttentionLayer {
     /// 0 when absent — verify falls back to the `_ld` kernels (K-order
     /// drift documented at the OPROJ_EXACT comment in multi_seq/mla.rs).
     pub(super) w4a16_gemv_grouped_batchm_k: KernelHandle,
+    /// FP8 sibling of the exact batched GEMV (`w8a16_gemv_batchm_exact`,
+    /// M<=8, strided): per-row byte-identical to single-row `w8a16_gemv`.
+    /// With the w4 exact kernel this makes EVERY verify GEMV projection
+    /// single-row-order under ATLAS_VERIFY_EXACT_GEMV=1. 0 on miss.
+    pub(super) w8a16_gemv_batchm_exact_k: KernelHandle,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_ld_k: KernelHandle,

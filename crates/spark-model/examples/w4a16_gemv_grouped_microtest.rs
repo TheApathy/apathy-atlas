@@ -486,6 +486,133 @@ fn main() -> Result<()> {
         t_exact / t_bat
     );
 
+    // ── Gate 4: the SHIPPING verify wo_a path (8x batch8_ld per-group) vs
+    //    grouped_batchm — head-to-head timing (never measured before the
+    //    2026-08-09 serve A/B pointed at verify speed), and a bit-identity
+    //    check of the _ld impl's "bit-identical to M x w4a16_gemv" claim. ──
+    let ld_h = gpu.kernel("w4a16_gemv", "w4a16_gemv_batch8_ld")?;
+    let cb_ld = gpu.alloc(M * ldc * 2)?;
+    let half_k = GROUP_IN / 2;
+    let ngroups = GROUP_IN / GROUP_SIZE;
+    let launch_ld = |p: DevicePtr, s: DevicePtr, c_out: DevicePtr| -> Result<()> {
+        for g in 0..O_GROUPS {
+            KernelLaunch::new(&gpu, ld_h)
+                .grid([(O_LORA.div_ceil(4)) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(ab_ptr.offset(g * GROUP_IN * 2))
+                .arg_ptr(p.offset(g * O_LORA * half_k))
+                .arg_ptr(s.offset(g * O_LORA * ngroups))
+                .arg_f32(scale2)
+                .arg_ptr(c_out.offset(g * O_LORA * 2))
+                .arg_u32(M as u32)
+                .arg_u32(O_LORA as u32)
+                .arg_u32(GROUP_IN as u32)
+                .arg_u32(lda as u32)
+                .arg_u32(ldc as u32)
+                .launch(stream)?;
+        }
+        Ok(())
+    };
+    launch_ld(packed, scale, cb_ld)?;
+    gpu.synchronize(stream)?;
+    let mut rld = vec![0u8; M * ldc * 2];
+    gpu.copy_d2h(cb_ld, &mut rld)?;
+    let ld_bit_id = rld == rr;
+    let (mism, total) = rld
+        .chunks_exact(2)
+        .zip(rr.chunks_exact(2))
+        .fold((0usize, 0usize), |(m, t), (a, b)| {
+            (m + usize::from(a != b), t + 1)
+        });
+    println!(
+        "  batch8_ld vs per-row single-row: bit-identical = {ld_bit_id} \
+         ({mism}/{total} bf16 outputs differ) — the impl comment claims true"
+    );
+
+    for it in 0..8usize {
+        let (p, s) = packs[it % n_inst];
+        launch_ld(p, s, cb_ld)?;
+    }
+    gpu.synchronize(stream)?;
+    let ev = Events::new();
+    unsafe { cuEventRecord(ev.0, stream) };
+    for it in 0..ITERS as usize {
+        let (p, s) = packs[it % n_inst];
+        launch_ld(p, s, cb_ld)?;
+    }
+    unsafe { cuEventRecord(ev.1, stream) };
+    gpu.synchronize(stream)?;
+    let t_ld = ev.elapsed_ms() as f64 / ITERS as f64;
+    println!(
+        "  8x batch8_ld per-group (shipping):  {t_ld:.4} ms  ({:.1} GB/s eff)  \
+         [grouped_batchm is {:.2}x vs _ld]",
+        gbs(t_ld),
+        t_ld / t_bat
+    );
+
+    // ── Gate 5: w8a16_gemv_batchm_exact (M=6) must be BIT-IDENTICAL to M x
+    //    single-row w8a16_gemv (the Phase-A FP8 projections under
+    //    ATLAS_VERIFY_EXACT_GEMV=1). Shape: wq_a-like [1024, 4096]. ──
+    let w8_h = gpu.kernel("w8a16_gemv", "w8a16_gemv")?;
+    let w8x_h = gpu.kernel("w8a16_gemv_batch4", "w8a16_gemv_batchm_exact")?;
+    let (w8n, w8k) = (1024usize, 4096usize);
+    let mut w8_bytes = vec![0u8; w8n * w8k];
+    for b in w8_bytes.iter_mut() {
+        // Avoid NaN encodings (0x7F/0xFF map to 0 in the LUT but keep it tame)
+        *b = (rng.next_u64() & 0x7F) as u8;
+    }
+    let mut w8_scales = vec![0u8; w8n.div_ceil(128) * w8k.div_ceil(128) * 4];
+    for c in w8_scales.chunks_exact_mut(4) {
+        c.copy_from_slice(&rng.uniform(0.001, 0.02).to_le_bytes());
+    }
+    let w8_w = upload(&gpu, &w8_bytes)?;
+    let w8_s = upload(&gpu, &w8_scales)?;
+    let a8: Vec<u16> = (0..6 * w8k)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
+        .collect();
+    let a8_ptr = upload(&gpu, &u16s_to_le(&a8))?;
+    let c8_ref = gpu.alloc(6 * w8n * 2)?;
+    let c8_x = gpu.alloc(6 * w8n * 2)?;
+    for i in 0..6usize {
+        KernelLaunch::new(&gpu, w8_h)
+            .grid([(w8n.div_ceil(4)) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a8_ptr.offset(i * w8k * 2))
+            .arg_ptr(w8_w)
+            .arg_ptr(w8_s)
+            .arg_ptr(c8_ref.offset(i * w8n * 2))
+            .arg_u32(w8n as u32)
+            .arg_u32(w8k as u32)
+            .launch(stream)?;
+    }
+    KernelLaunch::new(&gpu, w8x_h)
+        .grid([(w8n.div_ceil(4)) as u32, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a8_ptr)
+        .arg_ptr(w8_w)
+        .arg_ptr(w8_s)
+        .arg_ptr(c8_x)
+        .arg_u32(6)
+        .arg_u32(w8n as u32)
+        .arg_u32(w8k as u32)
+        .arg_u32(w8k as u32)
+        .arg_u32(w8n as u32)
+        .launch(stream)?;
+    gpu.synchronize(stream)?;
+    let mut r8r = vec![0u8; 6 * w8n * 2];
+    let mut r8x = vec![0u8; 6 * w8n * 2];
+    gpu.copy_d2h(c8_ref, &mut r8r)?;
+    gpu.copy_d2h(c8_x, &mut r8x)?;
+    let nz8 = r8r.chunks_exact(2).filter(|c| *c != [0, 0]).count();
+    if nz8 == 0 {
+        bail!("GATE 5: dead w8 reference output");
+    }
+    if r8r != r8x {
+        let first = r8r.iter().zip(r8x.iter()).position(|(x, y)| x != y).unwrap_or(0);
+        bail!("GATE 5 FAIL: w8a16_gemv_batchm_exact != per-row w8a16_gemv (first diff byte {first})");
+    }
+    println!("  GATE 5 PASS: w8a16_gemv_batchm_exact (M=6) == per-row single-row, bit-identical ({nz8} nonzero)");
+
     println!("PASS");
     Ok(())
 }

@@ -241,6 +241,11 @@ impl Qwen3AttentionLayer {
                 "w4a16_gemv",
                 "w4a16_gemv_grouped_batchm",
             ),
+            w8a16_gemv_batchm_exact_k: super::super::try_kernel(
+                gpu,
+                "w8a16_gemv_batch4",
+                "w8a16_gemv_batchm_exact",
+            ),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
             // Batched (m<=4) FP8 GEMVs for the weight-amortized V4-Flash
             // multi-seq verify. Optional: absent kernels leave handle 0 and
