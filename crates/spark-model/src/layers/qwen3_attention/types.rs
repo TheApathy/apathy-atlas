@@ -346,6 +346,11 @@ pub struct Qwen3AttentionLayer {
     pub(super) csa_compress_k: KernelHandle,
     /// DeepSeek-V4 CSA prefill attention over [raw | compressed] KV + sink.
     pub(super) prefill_attn_compressed_k: KernelHandle,
+    /// Tensor-core sibling (m16n8k16; head_dim=512 only). Default when
+    /// present; `ATLAS_V4_PREFILL_TC=0` opts back into the scalar kernel.
+    /// Oracle: prefill_attn_tc_microtest — cos 0.9999975 vs scalar,
+    /// 7.12 -> 1.85 ms/call at S=896 (2026-08-09). 0 on miss.
+    pub(super) prefill_attn_compressed_tc_k: KernelHandle,
     /// 4b: # compressed blocks prefill wrote to `mla.compressor.pool` for the
     /// active sequence (= prefill_len / ratio). Decode's compressed arm attends
     /// blocks `[0, this)`. AtomicU32 for interior mutability under prefill's

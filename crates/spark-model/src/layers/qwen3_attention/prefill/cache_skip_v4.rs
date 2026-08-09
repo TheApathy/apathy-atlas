@@ -630,7 +630,24 @@ impl Qwen3AttentionLayer {
             // offset + accumulate — an inc-3 concern alongside decode-append.)
             self.v4_comp_pool_filled
                 .store(n_win, std::sync::atomic::Ordering::Relaxed);
-            KernelLaunch::new(ctx.gpu, self.prefill_attn_compressed_k)
+            // Tensor-core core attention (m16n8k16, ~10x the scalar kernel;
+            // docs/kernels/prefill-attn-tensorcore.md). Oracle: cos 0.9999975
+            // vs scalar, 7.12 -> 1.85 ms/call at S=896. head_dim must be 512
+            // (compile-time layout); ATLAS_V4_PREFILL_TC=0 opts back into the
+            // scalar kernel.
+            let use_tc = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| {
+                    std::env::var("ATLAS_V4_PREFILL_TC").as_deref() != Ok("0")
+                })
+            } && self.prefill_attn_compressed_tc_k.0 != 0
+                && hd_mla == 512;
+            let attn_k = if use_tc {
+                self.prefill_attn_compressed_tc_k
+            } else {
+                self.prefill_attn_compressed_k
+            };
+            KernelLaunch::new(ctx.gpu, attn_k)
                 .grid([nq, n.div_ceil(16), 1])
                 .block([128, 1, 1])
                 .arg_ptr(q_full)

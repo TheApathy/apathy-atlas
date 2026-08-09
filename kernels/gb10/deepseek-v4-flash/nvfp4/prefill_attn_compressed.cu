@@ -275,3 +275,375 @@ extern "C" __global__ void prefill_attn_compressed(
     #undef ATTEND_TILE
     #undef STAGE_TILE
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TENSOR-CORE variant (design: docs/kernels/prefill-attn-tensorcore.md).
+//
+// Same semantics as the scalar kernel above — raw sliding-window arm,
+// compressed windowed-causal arm, per-head sink, -INFINITY masking as an
+// exact softmax no-op — with the two GEMMs per key tile on
+// mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 (fragment index math
+// copied from the verified moe_w4a16_grouped_gemm.cu:148-168 block).
+//
+// Mapping (the corrected one): the BLOCK owns BR=16 q-rows; 4 warps split
+// head_dim=512, 128 dims each = 16 m16n8 n-tiles = 64 f32 o_acc per thread
+// (the known-good register footprint). One refinement over the design doc:
+// with PARTIAL-S contraction (each warp contracts only its own 128-dim
+// k-slice, partials summed through smem) a warp needs only its own slice of
+// Q — 8 k-steps x 8 bf16 = 32 u32 registers — so Q never touches shared
+// memory and the whole working set fits in ~39 KB STATIC smem (no dynamic-
+// smem opt-in needed):
+//     sKT  512 x (16+1)  bf16  transposed K tile (QK^T B operand)   17.0 KB
+//     sV    16 x (512+8) bf16  natural V tile    (PV   B operand)   16.3 KB
+//     sSp    4 x 16 x 16 f32   per-warp S partials                   4.0 KB
+//     sP    16 x 18      bf16  softmaxed P       (PV   A operand)    0.6 KB
+//
+// The softmax is REPLICATED per warp instead of cross-warp: after the
+// partial-sum every warp reconstructs the full [16 x KT] S from sSp (its
+// 2 n-tiles of D-fragments cover all 16 columns across the 4 lanes of a row
+// group), so row max/sum are warp-local shuffles and every warp derives
+// bit-identical m/l/eo — no cross-warp softmax state at all.
+//
+// Tile-level online softmax processes KT=16 keys per rescale instead of the
+// scalar kernel's one-key-at-a-time loop, so this is NOT bit-identical to
+// the scalar kernel (same terms, different reduction order) — validated
+// behaviourally: microtest cosine vs scalar, prefill_scan curve,
+// tool-eval-bench >= 90/100 (same contract as the interleaved-lane rewrite).
+//
+// head_dim MUST be 512 (compile-time layout); the dispatcher falls back to
+// the scalar kernel otherwise.
+// Grid: (num_q_heads, ceil(S/16), 1)   Block: (128, 1, 1) = 4 warps
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define TC_KT 16
+#define TC_KT_PAD 17
+#define TC_HD 512
+#define TC_VPAD 520
+#define TC_PPAD 18
+
+extern "C" __global__ void prefill_attn_compressed_tc(
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_bfloat16* __restrict__ K,
+    const __nv_bfloat16* __restrict__ V,
+    const __nv_bfloat16* __restrict__ Kc,
+    const __nv_bfloat16* __restrict__ Vc,
+    const float* __restrict__ sinks,
+    __nv_bfloat16* __restrict__ O,
+    const unsigned int seq_len,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int n_comp,
+    const unsigned int ratio,
+    const unsigned int sliding_window,
+    const float inv_sqrt_d
+) {
+    __shared__ __align__(16) __nv_bfloat16 sKT[TC_HD * TC_KT_PAD];
+    __shared__ __align__(16) __nv_bfloat16 sV[TC_KT * TC_VPAD];
+    __shared__ float sSp[4][BR][TC_KT];
+    __shared__ __align__(4) __nv_bfloat16 sP[BR * TC_PPAD];
+
+    const unsigned int q_head = blockIdx.x;
+    const unsigned int q_block = blockIdx.y;
+    if (q_head >= num_q_heads || head_dim != TC_HD) return;
+
+    const unsigned int tid_x = threadIdx.x;
+    const unsigned int warp = tid_x >> 5;          // 0..3: owns dims [warp*128, +128)
+    const unsigned int laneid = tid_x & 31u;
+    const unsigned int g = laneid >> 2;            // fragment group_id (row g / g+8)
+    const unsigned int t = laneid & 3u;            // fragment tid (col pair t*2)
+
+    const unsigned int gqa = num_q_heads / num_kv_heads;
+    const unsigned int kv_head = q_head / gqa;
+    const unsigned int q_stride = num_q_heads * head_dim;
+    const unsigned int kv_stride = num_kv_heads * head_dim;
+
+    const unsigned int q_first = q_block * BR;
+    const unsigned int q_last_excl =
+        (q_first + BR < seq_len) ? (q_first + BR) : seq_len;
+    if (q_first >= seq_len) return;
+
+    // This thread's two fragment rows and their per-row softmax state.
+    const unsigned int r0 = g, r1 = g + 8;
+    const unsigned int qrow0 = q_first + r0, qrow1 = q_first + r1;
+    const bool v0 = qrow0 < seq_len, v1 = qrow1 < seq_len;
+    // Raw-arm visibility per row (same bounds math as the scalar kernel).
+    const unsigned int kvs0 =
+        (sliding_window > 0u && qrow0 + 1u > sliding_window) ? (qrow0 + 1u - sliding_window) : 0u;
+    const unsigned int kvl0 = qrow0 + 1u;
+    const unsigned int kvs1 =
+        (sliding_window > 0u && qrow1 + 1u > sliding_window) ? (qrow1 + 1u - sliding_window) : 0u;
+    const unsigned int kvl1 = qrow1 + 1u;
+    unsigned int cvis0 = (qrow0 + 1u) / ratio; if (cvis0 > n_comp) cvis0 = n_comp;
+    unsigned int cvis1 = (qrow1 + 1u) / ratio; if (cvis1 > n_comp) cvis1 = n_comp;
+
+    float m0 = -1e30f, l0 = 0.0f, m1 = -1e30f, l1 = 0.0f;
+
+    // o_acc: 16 n-tiles (dims warp*128 + nt*8 + {t*2, t*2+1}) x 4 f32.
+    float o_acc[16][4];
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        o_acc[nt][0] = 0.0f; o_acc[nt][1] = 0.0f;
+        o_acc[nt][2] = 0.0f; o_acc[nt][3] = 0.0f;
+    }
+
+    // ── Q A-fragments for this warp's 128-dim k-slice, loaded from global
+    // ONCE (8 k-steps x a0..a3). Invalid rows load zeros (their scores are
+    // masked to -INFINITY regardless).
+    unsigned int qa[8][4];
+    {
+        const unsigned int col_base = warp * 128u + t * 2u;
+        const __nv_bfloat16* Qr0 =
+            Q + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim;
+        const __nv_bfloat16* Qr1 =
+            Q + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim;
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            const unsigned int c0 = col_base + (unsigned int)s * 16u;
+            const unsigned int c1 = c0 + 8u;
+            qa[s][0] = v0 ? *reinterpret_cast<const unsigned int*>(Qr0 + c0) : 0u;
+            qa[s][1] = v1 ? *reinterpret_cast<const unsigned int*>(Qr1 + c0) : 0u;
+            qa[s][2] = v0 ? *reinterpret_cast<const unsigned int*>(Qr0 + c1) : 0u;
+            qa[s][3] = v1 ? *reinterpret_cast<const unsigned int*>(Qr1 + c1) : 0u;
+        }
+    }
+
+    const bool kv_same = (K == V);
+    const bool comp_same = (Kc == Vc);
+
+    // ── One KT-key tile: stage → QK^T partials → replicated softmax → PV. ──
+    // IN0/IN1 are per-(row, key) visibility lambdas via macro args.
+    #define TC_TILE(KSRC, VSRC, STRIDE, HEAD_OFF, BASE, COUNT, SAME,           \
+                    LO0, HI0, LO1, HI1)                                        \
+    do {                                                                        \
+        __syncthreads();                                                       \
+        /* Stage K transposed + V natural; one global read when V aliases. */  \
+        for (unsigned int idx = tid_x; idx < (COUNT) * 64u; idx += 128u) {     \
+            const unsigned int kk = idx / 64u;                                 \
+            const unsigned int d0 = (idx % 64u) * 8u;                          \
+            const __nv_bfloat16* ks =                                          \
+                (KSRC) + (size_t)((BASE) + kk) * (STRIDE) + (HEAD_OFF) + d0;   \
+            const uint4 kq = *reinterpret_cast<const uint4*>(ks);              \
+            const __nv_bfloat16* kb =                                          \
+                reinterpret_cast<const __nv_bfloat16*>(&kq);                   \
+            _Pragma("unroll")                                                  \
+            for (unsigned int j = 0; j < 8; ++j)                               \
+                sKT[(d0 + j) * TC_KT_PAD + kk] = kb[j];                        \
+            if (SAME) {                                                        \
+                *reinterpret_cast<uint4*>(&sV[kk * TC_VPAD + d0]) = kq;        \
+            } else {                                                           \
+                const __nv_bfloat16* vs =                                      \
+                    (VSRC) + (size_t)((BASE) + kk) * (STRIDE) + (HEAD_OFF) + d0;\
+                *reinterpret_cast<uint4*>(&sV[kk * TC_VPAD + d0]) =            \
+                    *reinterpret_cast<const uint4*>(vs);                       \
+            }                                                                  \
+        }                                                                      \
+        /* Zero sV tail rows on partial tiles: P is exactly 0 there, but      \
+           0 * NaN (uninitialized smem) would poison the PV MMA. */           \
+        for (unsigned int idx = tid_x; idx < (TC_KT - (COUNT)) * 64u;          \
+             idx += 128u) {                                                    \
+            const unsigned int kk = (COUNT) + idx / 64u;                       \
+            const unsigned int d0 = (idx % 64u) * 8u;                          \
+            *reinterpret_cast<uint4*>(&sV[kk * TC_VPAD + d0]) =                \
+                make_uint4(0u, 0u, 0u, 0u);                                    \
+        }                                                                      \
+        __syncthreads();                                                       \
+        /* QK^T partial over this warp's 128 dims: 8 k-steps x 2 n-tiles. */   \
+        {                                                                      \
+            float sp[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};                     \
+            const unsigned short* sB = (const unsigned short*)sKT;             \
+            _Pragma("unroll")                                                  \
+            for (int s = 0; s < 8; s++) {                                      \
+                const unsigned int kd = warp * 128u + (unsigned int)s * 16u;   \
+                _Pragma("unroll")                                              \
+                for (int nt = 0; nt < 2; nt++) {                               \
+                    const unsigned int nc = (unsigned int)nt * 8u + g;         \
+                    const unsigned int k0 = kd + t * 2u, k1 = k0 + 8u;         \
+                    unsigned int b0 =                                          \
+                        ((unsigned int)sB[(k0 + 1) * TC_KT_PAD + nc] << 16) |  \
+                        (unsigned int)sB[k0 * TC_KT_PAD + nc];                 \
+                    unsigned int b1 =                                          \
+                        ((unsigned int)sB[(k1 + 1) * TC_KT_PAD + nc] << 16) |  \
+                        (unsigned int)sB[k1 * TC_KT_PAD + nc];                 \
+                    asm volatile(                                              \
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+                        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"\
+                        : "=f"(sp[nt][0]), "=f"(sp[nt][1]),                    \
+                          "=f"(sp[nt][2]), "=f"(sp[nt][3])                     \
+                        : "r"(qa[s][0]), "r"(qa[s][1]),                        \
+                          "r"(qa[s][2]), "r"(qa[s][3]),                        \
+                          "r"(b0), "r"(b1),                                    \
+                          "f"(sp[nt][0]), "f"(sp[nt][1]),                      \
+                          "f"(sp[nt][2]), "f"(sp[nt][3]));                     \
+                }                                                              \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int nt = 0; nt < 2; nt++) {                                   \
+                const unsigned int c0 = (unsigned int)nt * 8u + t * 2u;        \
+                sSp[warp][r0][c0] = sp[nt][0];                                 \
+                sSp[warp][r0][c0 + 1] = sp[nt][1];                             \
+                sSp[warp][r1][c0] = sp[nt][2];                                 \
+                sSp[warp][r1][c0 + 1] = sp[nt][3];                             \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+        /* Replicated softmax: reconstruct full S rows, tile-level online. */  \
+        {                                                                      \
+            float s0[4], s1[4];                                                \
+            _Pragma("unroll")                                                  \
+            for (int cix = 0; cix < 4; cix++) {                                \
+                const unsigned int c =                                         \
+                    (cix / 2) * 8u + t * 2u + (unsigned int)(cix % 2);         \
+                float a = sSp[0][r0][c] + sSp[1][r0][c] +                      \
+                          sSp[2][r0][c] + sSp[3][r0][c];                       \
+                float b = sSp[0][r1][c] + sSp[1][r1][c] +                      \
+                          sSp[2][r1][c] + sSp[3][r1][c];                       \
+                const unsigned int kp = (BASE) + c;                            \
+                const bool in0 = v0 && c < (COUNT) && kp >= (LO0) && kp < (HI0);\
+                const bool in1 = v1 && c < (COUNT) && kp >= (LO1) && kp < (HI1);\
+                s0[cix] = in0 ? (a * inv_sqrt_d) : -INFINITY;                  \
+                s1[cix] = in1 ? (b * inv_sqrt_d) : -INFINITY;                  \
+            }                                                                  \
+            float mx0 = fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s0[2], s0[3]));       \
+            float mx1 = fmaxf(fmaxf(s1[0], s1[1]), fmaxf(s1[2], s1[3]));       \
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFFu, mx0, 1));            \
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xFFFFFFFFu, mx0, 2));            \
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFFu, mx1, 1));            \
+            mx1 = fmaxf(mx1, __shfl_xor_sync(0xFFFFFFFFu, mx1, 2));            \
+            const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);            \
+            const float eo0 = __expf(m0 - mn0), eo1 = __expf(m1 - mn1);        \
+            float en0[4], en1[4], se0 = 0.0f, se1 = 0.0f;                      \
+            _Pragma("unroll")                                                  \
+            for (int cix = 0; cix < 4; cix++) {                                \
+                en0[cix] = __expf(s0[cix] - mn0);                              \
+                en1[cix] = __expf(s1[cix] - mn1);                              \
+                se0 += en0[cix]; se1 += en1[cix];                              \
+            }                                                                  \
+            se0 += __shfl_xor_sync(0xFFFFFFFFu, se0, 1);                       \
+            se0 += __shfl_xor_sync(0xFFFFFFFFu, se0, 2);                       \
+            se1 += __shfl_xor_sync(0xFFFFFFFFu, se1, 1);                       \
+            se1 += __shfl_xor_sync(0xFFFFFFFFu, se1, 2);                       \
+            l0 = l0 * eo0 + se0; m0 = mn0;                                     \
+            l1 = l1 * eo1 + se1; m1 = mn1;                                     \
+            /* P to smem (warp 0 writes; all warps hold identical values). */  \
+            if (warp == 0) {                                                   \
+                _Pragma("unroll")                                              \
+                for (int cix = 0; cix < 4; cix++) {                            \
+                    const unsigned int c =                                     \
+                        (cix / 2) * 8u + t * 2u + (unsigned int)(cix % 2);     \
+                    sP[r0 * TC_PPAD + c] = __float2bfloat16(en0[cix]);         \
+                    sP[r1 * TC_PPAD + c] = __float2bfloat16(en1[cix]);         \
+                }                                                              \
+            }                                                                  \
+            /* Rescale this warp's o_acc by eo (rows r0 / r1). */              \
+            _Pragma("unroll")                                                  \
+            for (int nt = 0; nt < 16; nt++) {                                  \
+                o_acc[nt][0] *= eo0; o_acc[nt][1] *= eo0;                      \
+                o_acc[nt][2] *= eo1; o_acc[nt][3] *= eo1;                      \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+        /* PV: A = sP [16 x 16] (one k-step), B = sV natural, 16 n-tiles. */   \
+        {                                                                      \
+            const unsigned short* sPa = (const unsigned short*)sP;             \
+            const unsigned short* sBv = (const unsigned short*)sV;             \
+            const unsigned int fc0 = t * 2u, fc1 = fc0 + 8u;                   \
+            unsigned int pa0 = ((unsigned int)sPa[r0 * TC_PPAD + fc0 + 1] << 16)\
+                             | (unsigned int)sPa[r0 * TC_PPAD + fc0];          \
+            unsigned int pa1 = ((unsigned int)sPa[r1 * TC_PPAD + fc0 + 1] << 16)\
+                             | (unsigned int)sPa[r1 * TC_PPAD + fc0];          \
+            unsigned int pa2 = ((unsigned int)sPa[r0 * TC_PPAD + fc1 + 1] << 16)\
+                             | (unsigned int)sPa[r0 * TC_PPAD + fc1];          \
+            unsigned int pa3 = ((unsigned int)sPa[r1 * TC_PPAD + fc1 + 1] << 16)\
+                             | (unsigned int)sPa[r1 * TC_PPAD + fc1];          \
+            _Pragma("unroll")                                                  \
+            for (int nt = 0; nt < 16; nt++) {                                  \
+                const unsigned int nc = warp * 128u + (unsigned int)nt * 8u + g;\
+                const unsigned int k0 = t * 2u, k1 = k0 + 8u;                  \
+                unsigned int b0 =                                              \
+                    ((unsigned int)sBv[(k0 + 1) * TC_VPAD + nc] << 16) |       \
+                    (unsigned int)sBv[k0 * TC_VPAD + nc];                      \
+                unsigned int b1 =                                              \
+                    ((unsigned int)sBv[(k1 + 1) * TC_VPAD + nc] << 16) |       \
+                    (unsigned int)sBv[k1 * TC_VPAD + nc];                      \
+                asm volatile(                                                  \
+                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "     \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"   \
+                    : "=f"(o_acc[nt][0]), "=f"(o_acc[nt][1]),                  \
+                      "=f"(o_acc[nt][2]), "=f"(o_acc[nt][3])                   \
+                    : "r"(pa0), "r"(pa1), "r"(pa2), "r"(pa3),                  \
+                      "r"(b0), "r"(b1),                                        \
+                      "f"(o_acc[nt][0]), "f"(o_acc[nt][1]),                    \
+                      "f"(o_acc[nt][2]), "f"(o_acc[nt][3]));                   \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
+
+    // ── raw arm: block-union sliding-window causal tiles ──
+    {
+        unsigned int union_lo = 0u;
+        if (sliding_window > 0u && q_first + 1u > sliding_window)
+            union_lo = q_first + 1u - sliding_window;
+        const unsigned int union_hi = q_last_excl;
+        for (unsigned int base = union_lo; base < union_hi; base += TC_KT) {
+            unsigned int count = union_hi - base;
+            if (count > TC_KT) count = TC_KT;
+            TC_TILE(K, V, kv_stride, (size_t)kv_head * head_dim, base, count,
+                    kv_same, kvs0, kvl0, kvs1, kvl1);
+        }
+    }
+
+    // ── compressed arm: windowed-causal tiles ──
+    {
+        unsigned int comp_union = (q_last_excl > 0u) ? (q_last_excl / ratio) : 0u;
+        if (comp_union > n_comp) comp_union = n_comp;
+        for (unsigned int base = 0; base < comp_union; base += TC_KT) {
+            unsigned int count = comp_union - base;
+            if (count > TC_KT) count = TC_KT;
+            TC_TILE(Kc, Vc, head_dim, (size_t)0u, base, count,
+                    comp_same, 0u, cvis0, 0u, cvis1);
+        }
+    }
+    #undef TC_TILE
+
+    // ── sink: per-head logit in the denominator only ──
+    if (sinks != nullptr) {
+        const float sg = sinks[q_head];
+        const float mn0 = fmaxf(m0, sg), mn1 = fmaxf(m1, sg);
+        const float eo0 = __expf(m0 - mn0), eo1 = __expf(m1 - mn1);
+        #pragma unroll
+        for (int nt = 0; nt < 16; nt++) {
+            o_acc[nt][0] *= eo0; o_acc[nt][1] *= eo0;
+            o_acc[nt][2] *= eo1; o_acc[nt][3] *= eo1;
+        }
+        l0 = l0 * eo0 + __expf(sg - mn0);
+        l1 = l1 * eo1 + __expf(sg - mn1);
+        m0 = mn0; m1 = mn1;
+    }
+
+    // ── epilogue: normalize and store this warp's 128-dim slice ──
+    {
+        const float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f;
+        const float il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
+        __nv_bfloat16* O0 =
+            O + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim;
+        __nv_bfloat16* O1 =
+            O + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim;
+        #pragma unroll
+        for (int nt = 0; nt < 16; nt++) {
+            const unsigned int c = warp * 128u + (unsigned int)nt * 8u + t * 2u;
+            if (v0) {
+                __nv_bfloat162 p;
+                p.x = __float2bfloat16(o_acc[nt][0] * il0);
+                p.y = __float2bfloat16(o_acc[nt][1] * il0);
+                *reinterpret_cast<__nv_bfloat162*>(O0 + c) = p;
+            }
+            if (v1) {
+                __nv_bfloat162 p;
+                p.x = __float2bfloat16(o_acc[nt][2] * il1);
+                p.y = __float2bfloat16(o_acc[nt][3] * il1);
+                *reinterpret_cast<__nv_bfloat162*>(O1 + c) = p;
+            }
+        }
+    }
+}
