@@ -103,3 +103,66 @@ against BF16 and must be validated behaviourally:
   overruns its buffers and the prefill trace is silently dropped — a run
   captured only 2 load-time quantize kernels, and `--delay` did not help.
   Do not spend time on it.
+
+---
+
+# Concrete design (fragment layouts extracted from the working in-tree MMA)
+
+`moe_w4a16_grouped_gemm.cu:148-168` is a VERIFIED m16n8k16 block on this
+target. Its index math is reproduced here so the kernel can be written in one
+pass instead of rediscovering PTX operand layouts.
+
+With `group_id = laneid >> 2` and `tid = laneid & 3`:
+
+```
+A [16 x 16] row-major, a_stride = row length:
+    fr0 = warp_m_offset + group_id;  fr1 = fr0 + 8
+    fc0 = tid*2;                     fc1 = fc0 + 8
+    a0 = A[fr0][fc0..fc0+1]   a1 = A[fr1][fc0..fc0+1]
+    a2 = A[fr0][fc1..fc1+1]   a3 = A[fr1][fc1..fc1+1]   (2 bf16 packed per u32)
+
+B [16 x 8], indexed sB[k][n], b_stride = n length:
+    nc = nt*8 + group_id;  k0 = tid*2;  k1 = k0 + 8
+    b0 = B[k0..k0+1][nc]      b1 = B[k1..k1+1][nc]
+
+D/C [16 x 8] f32, 4 per thread:
+    acc[0],acc[1] -> row group_id,     cols tid*2, tid*2+1
+    acc[2],acc[3] -> row group_id + 8, cols tid*2, tid*2+1
+```
+
+## Block mapping — one warp owns its own rows
+
+**Give each warp its own 16 q-rows** (block = 4 warps = 64 q-rows,
+`grid.y = ceil(S/64)`). Then the softmax reduction never crosses warps. The
+alternative — splitting the key dimension across warps — forces a cross-warp
+row-max/row-sum and is not worth it.
+
+## The two GEMMs
+
+**1. S = Q·Kᵀ → [16 rows x 8 keys], contraction over head_dim = 512 (32 k-steps).**
+A = Q tile, row-major `[16][head_dim]`, natural layout.
+B must be indexed `sB[k][n]` = `[dim][key]` — **K must be staged TRANSPOSED**
+(`sKT[dim][key]`), not in today's `sK[key][dim]`. Do the transpose while
+staging from global; pad the key stride to dodge bank conflicts.
+
+**2. O += P·V → [16 rows x 8 dims], contraction over keys.**
+B is indexed `[key][dim]`, which IS today's natural `sV[key][dim]` layout —
+no transpose needed here.
+A = P (softmax-weighted S) — the **S output fragment layout does not match the
+A input fragment layout**, so P must round-trip through shared memory. This is
+standard for flash attention; budget smem for it.
+
+## Online softmax on the fragment
+
+A row's 8 columns live across the 4 threads sharing a `group_id` (consecutive
+lanes), so the row max/sum is `__shfl_xor_sync` over lanes 1 and 2 within that
+group of 4, then combined with the running `m`/`l` exactly as the scalar
+version does. Masking is applied to the S fragment AFTER the mma and BEFORE
+the softmax — `-INFINITY`, never a large negative constant (see trap 3).
+
+## Expected
+
+Core attention 864.6 -> ~78 ms/pass at 10% tensor-core efficiency; prefill
+474 -> ~800 tok/s, and ~950 with the q_latent_expand GEMMs. Anything under
+~5x on this stage means the MMA pipeline is stalling — check smem bank
+conflicts on the transposed K tile first.
