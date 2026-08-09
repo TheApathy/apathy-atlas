@@ -15,6 +15,10 @@ use serde_json::json;
 const DSML: &str = "\u{ff5c}DSML\u{ff5c}";
 
 fn render_dsv4(messages: &[serde_json::Value]) -> String {
+    render_dsv4_thinking(messages, false)
+}
+
+fn render_dsv4_thinking(messages: &[serde_json::Value], enable_thinking: bool) -> String {
     let raw = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../jinja-templates/deepseek_v4.jinja"
@@ -29,7 +33,7 @@ fn render_dsv4(messages: &[serde_json::Value]) -> String {
         .render(minijinja::context! {
             messages => minijinja::Value::from_serialize(&messages),
             add_generation_prompt => true,
-            enable_thinking => false,
+            enable_thinking => enable_thinking,
         })
         .expect("template renders")
 }
@@ -155,10 +159,42 @@ fn dsv4_multi_turn_tool_chain_renders() {
         json!({"role": "user", "content": "and b.txt?"}),
     ]);
     assert!(out.starts_with("<｜begin▁of▁sentence｜>be terse"), "{out:?}");
-    assert!(out.ends_with("and b.txt?<｜Assistant｜>"), "{out:?}");
+    // enable_thinking=false ⇒ the generation prompt CLOSES thinking, matching
+    // encoding_dsv4.py:381 (`thinking_end_token if thinking_mode != "thinking"`).
+    assert!(
+        out.ends_with("and b.txt?<｜Assistant｜></think>"),
+        "{out:?}"
+    );
     assert_eq!(
         out.matches("<｜begin▁of▁sentence｜>").count(),
         1,
         "bos must appear exactly once: {out:?}"
+    );
+}
+
+/// The thinking markers are the checkpoint's own (encoding_dsv4.py:19-20).
+/// Both were the empty string since the original port, so the template opened
+/// no `<think>` when thinking was requested and closed none when it was not —
+/// which also left the scheduler's `inside_thinking` tracking (and hence the
+/// speculation think-gate) with nothing to key on.
+#[test]
+fn dsv4_generation_prompt_opens_or_closes_thinking() {
+    let msgs = [json!({"role": "user", "content": "hi"})];
+    let on = render_dsv4_thinking(&msgs, true);
+    let off = render_dsv4_thinking(&msgs, false);
+    assert!(on.ends_with("<｜Assistant｜><think>"), "thinking on: {on:?}");
+    assert!(off.ends_with("<｜Assistant｜></think>"), "thinking off: {off:?}");
+}
+
+/// Historical assistant reasoning replays wrapped in the markers, not raw.
+#[test]
+fn dsv4_historical_reasoning_is_wrapped() {
+    let out = render_dsv4(&[
+        json!({"role": "user", "content": "q"}),
+        json!({"role": "assistant", "content": "A.", "reasoning_content": "weigh it"}),
+    ]);
+    assert!(
+        out.contains("<think>weigh it</think>A."),
+        "reasoning must be wrapped: {out:?}"
     );
 }

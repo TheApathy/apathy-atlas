@@ -553,7 +553,21 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         &mut config,
         &tokenizer,
         &mut eos_tokens,
-        supports_thinking,
+        // `Capabilities::supports_thinking` is architecture-derived
+        // (`has_ssm || has_mamba2`) and its own comment says it "should be
+        // derived from tokenizer vocabulary, not architecture". DeepSeek-V4-Flash
+        // is MLA + MoE with NO SSM layers, so it came back false even though the
+        // checkpoint ships `<think>` (128821) and `</think>` (128822) and its
+        // template opens a think block. That selected NO reasoning parser, which
+        // left `think_end_token` = None, so reasoning was never split out of
+        // `content` (a literal `</think>` leaked into the answer,
+        // reasoning_tokens stayed 0) and every `inside_thinking` consumer —
+        // including the speculation think-gate — had nothing to key on.
+        //
+        // Widen it here, where the tokenizer is available: a model whose vocab
+        // carries BOTH markers as single tokens supports thinking regardless of
+        // architecture. Architecture-derived support still wins on its own.
+        supports_thinking || tokenizer.has_think_markers(),
     );
 
     // 7. Create scheduler channel + spawn scheduler

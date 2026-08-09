@@ -1,7 +1,14 @@
 {%- set bos_token = "<｜begin▁of▁sentence｜>" -%}
 {%- set eos_token = "<｜end▁of▁sentence｜>" -%}
-{%- set thinking_start_token = "" -%}
-{%- set thinking_end_token = "" -%}
+{#- The checkpoint's own markers (encoding_dsv4.py:19-20). These were BOTH the
+    empty string since the original port, so the template emitted neither
+    marker: the generation prompt never opened `<think>` when thinking was
+    requested, never closed it with `</think>` when it was not, and historical
+    reasoning_content was replayed unwrapped. That also broke the scheduler's
+    `inside_thinking` tracking, which gates speculation — with no `</think>`
+    ever emitted it cannot tell reasoning from answer. -#}
+{%- set thinking_start_token = "<think>" -%}
+{%- set thinking_end_token = "</think>" -%}
 {%- set user_token = "<｜User｜>" -%}
 {%- set assistant_token = "<｜Assistant｜>" -%}
 {%- set dsml_token = "｜DSML｜" -%}

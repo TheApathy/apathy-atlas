@@ -104,6 +104,25 @@ impl ChatTokenizer {
         &self.tokenizer
     }
 
+    /// Does this checkpoint's vocabulary carry BOTH thinking markers as single
+    /// tokens? The vocabulary-derived answer to "does this model think", used
+    /// to widen the architecture-derived `Capabilities::supports_thinking`
+    /// (`has_ssm || has_mamba2`), which is false for thinking models that have
+    /// no SSM layers — DeepSeek-V4-Flash is MLA + MoE and ships `<think>`
+    /// (128821) / `</think>` (128822).
+    ///
+    /// Both markers are required: the end token is what the reasoning parser
+    /// splits on, so a vocab with only `<think>` cannot separate reasoning from
+    /// answer and is not usefully "thinking-capable" here.
+    pub fn has_think_markers(&self) -> bool {
+        let single = |s: &str| {
+            self.encode(s)
+                .ok()
+                .is_some_and(|ids| ids.len() == 1)
+        };
+        single("<think>") && single("</think>")
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .tokenizer
