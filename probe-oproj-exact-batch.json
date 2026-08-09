@@ -1,0 +1,66 @@
+{
+  "tag": "oproj-exact-batch",
+  "model": "/home/flocka/models/DeepSeek-V4-Flash-162B",
+  "runs": [
+    {
+      "code": {
+        "tok_s": 20.55,
+        "completion_tokens": 300,
+        "wall_s": 15.03,
+        "sha256": "3cf8869ce0d6c024",
+        "prefix": "Here's a Python implementation of an LRU (Least Recently Use"
+      },
+      "repeat": {
+        "tok_s": 28.42,
+        "completion_tokens": 49,
+        "wall_s": 2.06,
+        "sha256": "f42ca9a1830af7ec",
+        "prefix": "1. the quick brown fox jumps over the lazy dog 2. the quick "
+      },
+      "quote": {
+        "tok_s": 21.36,
+        "completion_tokens": 300,
+        "wall_s": 14.38,
+        "sha256": "0b32c1a8655d4bfa",
+        "prefix": "Here is the first stanza of **\"The Road Not Taken\"** by Robe"
+      },
+      "prose": {
+        "tok_s": 19.85,
+        "completion_tokens": 300,
+        "wall_s": 15.46,
+        "sha256": "5955d9b68d231d47",
+        "prefix": "The history of lighthouse keeping is a story of solitary her"
+      }
+    },
+    {
+      "code": {
+        "tok_s": 22.64,
+        "completion_tokens": 300,
+        "wall_s": 13.61,
+        "sha256": "f001d29f57284ae0",
+        "prefix": "Here's a Python implementation of an LRU (Least Recently Use"
+      },
+      "repeat": {
+        "tok_s": 28.43,
+        "completion_tokens": 49,
+        "wall_s": 2.05,
+        "sha256": "f42ca9a1830af7ec",
+        "prefix": "1. the quick brown fox jumps over the lazy dog 2. the quick "
+      },
+      "quote": {
+        "tok_s": 21.72,
+        "completion_tokens": 300,
+        "wall_s": 14.22,
+        "sha256": "ed84e50989c69a2f",
+        "prefix": "Here is the first stanza of **\"The Road Not Taken\"** by Robe"
+      },
+      "prose": {
+        "tok_s": 19.8,
+        "completion_tokens": 300,
+        "wall_s": 15.46,
+        "sha256": "5955d9b68d231d47",
+        "prefix": "The history of lighthouse keeping is a story of solitary her"
+      }
+    }
+  ]
+}
