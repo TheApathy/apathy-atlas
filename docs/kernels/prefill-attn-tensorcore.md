@@ -130,12 +130,38 @@ D/C [16 x 8] f32, 4 per thread:
     acc[2],acc[3] -> row group_id + 8, cols tid*2, tid*2+1
 ```
 
-## Block mapping — one warp owns its own rows
+## Block mapping — CORRECTED: head_dim=512 forces a dim split
 
-**Give each warp its own 16 q-rows** (block = 4 warps = 64 q-rows,
-`grid.y = ceil(S/64)`). Then the softmax reduction never crosses warps. The
-alternative — splitting the key dimension across warps — forces a cross-warp
-row-max/row-sum and is not worth it.
+An earlier revision of this doc said "give each warp its own 16 q-rows so the
+softmax never crosses warps". **That is infeasible here and would have been
+found only after writing the kernel.** Checked arithmetic:
+
+```
+O accumulator for a [16 x 512] tile in ONE warp:
+    512/8 = 64 n-tiles of m16n8 x 4 f32/thread = 256 f32 REGISTERS per thread
+    (budget is ~166 total, measured on the current kernel)
+Q held in registers across the key loop:
+    512/16 = 32 k-steps x 8 bf16 = 128 u32 per thread — on top of the above
+Q staged in smem instead, 4 warps x 16 rows:
+    sQ 64 KB + sKT 16 KB + sV 16 KB = 96 KB  (48 KB static limit)
+```
+
+head_dim = 512 is 4-8x the 64-128 that flash-attention layouts assume, so a
+warp cannot hold an output tile spanning the full head_dim. This is precisely
+why the current scalar kernel splits dims across 8 lanes (64 dims and 64 f32
+`o_acc` per thread).
+
+**Correct mapping: the BLOCK owns 16 q-rows; warps split the head_dim.**
+- 4 warps x 128 dims each ⇒ 16 n-tiles ⇒ 64 f32 accumulators per thread,
+  which matches today's register footprint and is known to fit.
+- QK^T: every warp needs the same S, so either compute it redundantly per warp
+  (cheap — it is 16x KT) or compute once and share via smem.
+- **The softmax row max/sum DOES cross warps** and must go through shared
+  memory with a `__syncthreads()`. Budget for it; it is unavoidable at this
+  head_dim, not a design smell.
+- P then round-trips through smem for the PV A-operand anyway (the S output
+  fragment layout does not match the A input layout), so the same smem
+  staging serves both.
 
 ## The two GEMMs
 
