@@ -284,6 +284,13 @@ impl DsparkDraftHead {
         *CACHED.get_or_init(|| std::env::var("ATLAS_DSPARK_DEBUG").as_deref() == Ok("1"))
     }
 
+    /// `ATLAS_DSPARK_PROPOSE_PROF=1`, read once. Phase timing for the propose
+    /// step (syncs per phase, so measurement builds only).
+    fn propose_prof_enabled() -> bool {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var("ATLAS_DSPARK_PROPOSE_PROF").as_deref() == Ok("1"))
+    }
+
     /// `ATLAS_DSPARK_RING_DUMP=1`, read once (per-propose host sync when on).
     fn ring_dump_enabled() -> bool {
         static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -527,6 +534,36 @@ impl DsparkDraftHead {
             eprintln!("{line}");
         }
 
+        // ATLAS_DSPARK_PROPOSE_PROF=1: phase split of the propose step.
+        // Propose is 36 ms of the 131.8 ms gamma-verify step = 0.64 of the
+        // break-even constant C, and it is the ENTIRE deficit vs the reference
+        // (our verify alone is 2.00 plain-steps, better than their whole C of
+        // 2.16). Its own bandwidth floor is ~10 ms, so it runs at ~25%
+        // efficiency and the question is which phase. Syncs; measurement only.
+        #[allow(unused_assignments)]
+        let mut _pp_t = if Self::propose_prof_enabled() {
+            let _ = gpu.synchronize(stream);
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        #[allow(unused_macros)]
+        macro_rules! pprof {
+            ($label:expr) => {
+                if Self::propose_prof_enabled() {
+                    let _ = gpu.synchronize(stream);
+                    if let Some(t) = _pp_t {
+                        tracing::info!(
+                            "  PROPOSE [{}]: {}us",
+                            $label,
+                            t.elapsed().as_micros()
+                        );
+                    }
+                    _pp_t = Some(std::time::Instant::now());
+                }
+            };
+        }
+
         let b = self.block;
         let h = self.h;
         let hu = h as usize;
@@ -544,6 +581,7 @@ impl DsparkDraftHead {
             )?;
         }
         ops::hc_expand(gpu, self.k_hc_expand, self.x5, self.hc_a, b, h, hc, stream)?;
+        pprof!("embed_hc_expand");
         self.dbg(gpu, "x5.row0", self.x5, hu, stream);
 
         // MoE runs against the DRAFTER config (256 experts) — the target ctx
@@ -812,6 +850,7 @@ impl DsparkDraftHead {
             self.dbg_f32(gpu, &format!("s{s}.hc_post_attn"), nxt, 8, stream);
             std::mem::swap(&mut cur, &mut nxt);
 
+            pprof!("stage_attn");
             // ── FFN site ──
             ops::hc_pre(
                 gpu,
@@ -865,6 +904,7 @@ impl DsparkDraftHead {
             std::mem::swap(&mut cur, &mut nxt);
         }
 
+        pprof!("stage_moe");
         // ── head: hc collapse → final norm → shared lm_head ──
         let hh = self
             .module
@@ -973,6 +1013,7 @@ impl DsparkDraftHead {
             }
         }
 
+        pprof!("lm_head");
         // ── Markov-biased greedy chain + confidence ──
         //
         // The chain is `prev → markov_w1[prev] → logits → argmax → prev`.
