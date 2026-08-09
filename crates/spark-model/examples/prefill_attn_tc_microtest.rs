@@ -23,9 +23,19 @@ use spark_runtime::kernel_args::KernelLaunch;
 const HD: usize = 512;
 const NQ: usize = 64;
 const NKV: usize = 1;
-const RATIO: usize = 4;
-const WINDOW: usize = 128;
 const ITERS: u32 = 50;
+// Overridable at argv[2..]: S window ratio (defaults 896 128 4).
+fn cfg() -> (usize, usize, usize) {
+    let a: Vec<usize> = std::env::args()
+        .skip(2)
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    (
+        a.first().copied().unwrap_or(896),
+        a.get(1).copied().unwrap_or(128),
+        a.get(2).copied().unwrap_or(4),
+    )
+}
 
 unsafe extern "C" {
     fn cuEventCreate(event: *mut u64, flags: u32) -> i32;
@@ -90,6 +100,8 @@ fn launch(
     o: DevicePtr,
     s: usize,
     n_comp: usize,
+    window: usize,
+    ratio: usize,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, h)
@@ -107,8 +119,8 @@ fn launch(
         .arg_u32(NKV as u32)
         .arg_u32(HD as u32)
         .arg_u32(n_comp as u32)
-        .arg_u32(RATIO as u32)
-        .arg_u32(WINDOW as u32)
+        .arg_u32(ratio as u32)
+        .arg_u32(window as u32)
         .arg_f32(1.0 / (HD as f32).sqrt())
         .launch(stream)
 }
@@ -127,7 +139,7 @@ fn main() -> Result<()> {
     // ── Correctness at S=253 (non-multiple of 16: invalid tail rows,
     //    partial key tiles on both arms), V==K aliased. ──
     for &(s, aliased) in &[(253usize, true), (160usize, false)] {
-        let n_comp = s / RATIO;
+        let n_comp = s / 4;
         let q = gen_bf16(&mut rng, s * NQ * HD);
         let kraw = gen_bf16(&mut rng, s * NKV * HD);
         let vraw = if aliased {
@@ -154,8 +166,8 @@ fn main() -> Result<()> {
         let o_scalar = gpu.alloc(s * NQ * HD * 2)?;
         let o_tc = gpu.alloc(s * NQ * HD * 2)?;
 
-        launch(&gpu, scalar_h, qd, kd, vd, kcd, vcd, sd, o_scalar, s, n_comp, stream)?;
-        launch(&gpu, tc_h, qd, kd, vd, kcd, vcd, sd, o_tc, s, n_comp, stream)?;
+        launch(&gpu, scalar_h, qd, kd, vd, kcd, vcd, sd, o_scalar, s, n_comp, 128, 4, stream)?;
+        launch(&gpu, tc_h, qd, kd, vd, kcd, vcd, sd, o_tc, s, n_comp, 128, 4, stream)?;
         gpu.synchronize(stream)?;
 
         let mut rs = vec![0u8; s * NQ * HD * 2];
@@ -198,9 +210,9 @@ fn main() -> Result<()> {
     }
     println!("  CORRECTNESS PASS (cos gate 0.999 overall / 0.995 worst-row)");
 
-    // ── Timing at S=896 (production-like), V==K aliased. ──
-    let s = 896usize;
-    let n_comp = s / RATIO;
+    // ── Timing (argv-configurable), V==K aliased. ──
+    let (s, window, ratio) = cfg();
+    let n_comp = s / ratio;
     let q = gen_bf16(&mut rng, s * NQ * HD);
     let kraw = gen_bf16(&mut rng, s * NKV * HD);
     let kcomp = gen_bf16(&mut rng, n_comp * HD);
@@ -215,7 +227,7 @@ fn main() -> Result<()> {
 
     let time_kernel = |h: spark_runtime::gpu::KernelHandle| -> Result<f64> {
         for _ in 0..5 {
-            launch(&gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, stream)?;
+            launch(&gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, window, ratio, stream)?;
         }
         gpu.synchronize(stream)?;
         let (mut e0, mut e1) = (0u64, 0u64);
@@ -225,7 +237,7 @@ fn main() -> Result<()> {
             cuEventRecord(e0, stream);
         }
         for _ in 0..ITERS {
-            launch(&gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, stream)?;
+            launch(&gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, window, ratio, stream)?;
         }
         unsafe { cuEventRecord(e1, stream) };
         gpu.synchronize(stream)?;
@@ -240,7 +252,7 @@ fn main() -> Result<()> {
     };
     let t_scalar = time_kernel(scalar_h)?;
     let t_tc = time_kernel(tc_h)?;
-    println!("  S={s}: scalar {t_scalar:.3} ms/call | TC {t_tc:.3} ms/call  [{:.1}x]", t_scalar / t_tc);
+    println!("  S={s} window={window} ratio={ratio}: scalar {t_scalar:.3} ms/call | TC {t_tc:.3} ms/call  [{:.1}x]", t_scalar / t_tc);
     println!(
         "  projected prefill core-attention/pass (43 layers): {:.1} -> {:.1} ms",
         t_scalar * 43.0,

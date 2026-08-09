@@ -642,6 +642,16 @@ impl Qwen3AttentionLayer {
                 })
             } && self.prefill_attn_compressed_tc_k.0 != 0
                 && hd_mla == 512;
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        "V4 prefill core attention: {} (tc_handle={} hd={hd_mla})",
+                        if use_tc { "TENSOR-CORE" } else { "scalar" },
+                        self.prefill_attn_compressed_tc_k.0,
+                    );
+                });
+            }
             let attn_k = if use_tc {
                 self.prefill_attn_compressed_tc_k
             } else {
