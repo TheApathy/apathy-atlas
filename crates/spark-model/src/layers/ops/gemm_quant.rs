@@ -176,6 +176,45 @@ pub fn dense_gemv_batchm(
 /// Must track `MAX_M` in `dense_gemv_bf16_batchm.cu`.
 pub const DENSE_GEMV_BATCHM_MAX_M: u32 = 16;
 
+/// GROUPED (block-diagonal) `dense_gemv_bf16_batchm`: output row n reads
+/// activation columns `[(n / rows_per_group) * k ..)` of each strided A row.
+/// One weight-streaming launch for the DSpark drafter's block-diagonal wo_a
+/// (replacing 8 x small-M `dense_gemm` + 16 gather/scatter copies per
+/// stage); `rows_per_group = n` degenerates to plain batchm (drafter wo_b).
+/// Per-row order identical to `dense_gemv_bf16` on the same slice.
+///
+/// Kernel: `dense_gemv_bf16_grouped_batchm(A, B, C, M, N, K, lda, ldc, rpg)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_grouped_batchm(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    a_stride: u32,
+    out_stride: u32,
+    rows_per_group: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(a_stride)
+        .arg_u32(out_stride)
+        .arg_u32(rows_per_group)
+        .launch(stream)
+}
+
 /// Dense BF16 GEMV, batched over 2 rows (M=2): one pass over the weight
 /// produces both output rows, halving weight bandwidth vs two `dense_gemv`
 /// launches. Bit-identical to two M=1 `dense_gemv` calls — each row's

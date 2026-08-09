@@ -146,3 +146,125 @@ extern "C" __global__ void dense_gemv_bf16_batchm(
         }
     }
 }
+
+// ── GROUPED (block-diagonal) sibling ────────────────────────────────────────
+//
+// One launch for a block-diagonal projection: output row n belongs to group
+// g = n / rows_per_group and reads A columns [g*K, (g+1)*K) of each activation
+// row. The DSpark drafter's wo_a (o_groups=8 x [o_lora=1024, group_in=4096],
+// weight rows contiguous) previously ran 8 x dense_gemm(16x64 TC tiles at
+// M<=6 — 27 GB/s) PLUS 16 gather/scatter 2D copies per stage; this kernel
+// replaces the whole block with one weight-streaming launch reading A/C
+// strided in place. rows_per_group = N degenerates to plain batchm (used for
+// the drafter wo_b so both projections leave the tensor-core GEMM).
+//
+// Per-row K-iteration and reduction order are identical to
+// dense_gemv_bf16_batchm (and therefore to M x dense_gemv_bf16 on the same
+// slice).
+//
+// Grid: (ceil(N / 4), 1, 1)   Block: (256, 1, 1)
+extern "C" __global__ void dense_gemv_bf16_grouped_batchm(
+    const __nv_bfloat16* __restrict__ A,  // [M, a_stride], group cols inside
+    const __nv_bfloat16* __restrict__ B,  // [N, K] rows contiguous across groups
+    __nv_bfloat16* __restrict__ C,        // [M, out_stride]
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int a_stride,
+    unsigned int out_stride,
+    unsigned int rows_per_group
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool active = (n < N);
+
+    // The one delta vs dense_gemv_bf16_batchm: this output row's activation
+    // column segment.
+    const unsigned long long a_col =
+        (unsigned long long)(active ? n / rows_per_group : 0) * K;
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int t = 0; t < MAX_M; t++) acc[t] = 0.0f;
+
+    const unsigned int K_VEC = K / VEC_SIZE;
+    const uint4* B_vec = (const uint4*)(B + (unsigned long long)(active ? n : 0) * K);
+
+    for (unsigned int kv = lane; kv < K_VEC && active; kv += threads_per_out) {
+        const uint4 b_data = B_vec[kv];
+        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+
+        float bf[8];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            __nv_bfloat16 b_lo, b_hi;
+            *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
+            *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
+            bf[2 * i] = __bfloat162float(b_lo);
+            bf[2 * i + 1] = __bfloat162float(b_hi);
+        }
+
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t < M) {
+                const uint4 a_data = ((const uint4*)(
+                    A + (unsigned long long)t * a_stride + a_col))[kv];
+                const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    __nv_bfloat16 a_lo, a_hi;
+                    *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
+                    *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
+                    acc[t] += __bfloat162float(a_lo) * bf[2 * i];
+                    acc[t] += __bfloat162float(a_hi) * bf[2 * i + 1];
+                }
+            }
+        }
+    }
+
+    if (active) {
+        const unsigned int tail_start = K_VEC * VEC_SIZE;
+        const __nv_bfloat16* B_row = B + (unsigned long long)n * K;
+        for (unsigned int k = tail_start + lane; k < K; k += threads_per_out) {
+            const float b = __bfloat162float(B_row[k]);
+            #pragma unroll
+            for (int t = 0; t < MAX_M; t++) {
+                if ((unsigned int)t < M) {
+                    acc[t] += __bfloat162float(
+                        A[(unsigned long long)t * a_stride + a_col + k]) * b;
+                }
+            }
+        }
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t < M) {
+                acc[t] += __shfl_down_sync(0xFFFFFFFF, acc[t], offset);
+            }
+        }
+    }
+
+    __shared__ float smem_g[MAX_M][N_PER_BLOCK * 2];
+    if (warp_lane == 0) {
+        const unsigned int smem_idx = local_out * 2 + (lane / WARP_SIZE);
+        #pragma unroll
+        for (int t = 0; t < MAX_M; t++) {
+            if ((unsigned int)t < M) smem_g[t][smem_idx] = acc[t];
+        }
+    }
+    __syncthreads();
+
+    if (lane == 0 && active) {
+        for (unsigned int t = 0; t < M; t++) {
+            const float r = smem_g[t][local_out * 2] + smem_g[t][local_out * 2 + 1];
+            C[(unsigned long long)t * out_stride + n] = __float2bfloat16(r);
+        }
+    }
+}

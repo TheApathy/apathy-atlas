@@ -58,6 +58,12 @@ pub struct DsparkDraftHead {
     k_gemm: KernelHandle,
     k_gemv: KernelHandle,
     k_gemv_fp8: KernelHandle,
+    /// One-launch block-diagonal drafter o-projection
+    /// (`dense_gemv_bf16_grouped_batchm`): replaces 8 x small-M dense_gemm
+    /// + 16 gather/scatter copies per stage AND the wo_b small-M dense_gemm
+    /// (rows_per_group = N). d_o_proj measured 7.39 ms at 27 GB/s on the
+    /// GEMM path. ATLAS_DSPARK_OPROJ_GEMV=0 opts back. 0 on miss.
+    k_oproj_gemv: KernelHandle,
     /// M≤8 row-scaled FP8 tile. The lm_head tail used to run one GEMV per
     /// block row, re-streaming the whole `[vocab, h]` FP8 mirror `block`
     /// times; this does all `block` rows in one pass over the weight.
@@ -215,6 +221,15 @@ impl DsparkDraftHead {
             k_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             k_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             k_gemv_fp8: gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?,
+            k_oproj_gemv: if std::env::var("ATLAS_DSPARK_OPROJ_GEMV").as_deref() == Ok("0") {
+                spark_runtime::gpu::KernelHandle(0)
+            } else {
+                crate::layers::try_kernel(
+                    gpu,
+                    "dense_gemv_bf16_batchm",
+                    "dense_gemv_bf16_grouped_batchm",
+                )
+            },
             // ATLAS_LMHEAD_EXACT=1: zero the handle so the block tail takes
             // the per-row GEMV — this GEMM casts BF16 activations to FP8 in-
             // kernel and its near-tie argmax can differ (see impl_a1's gate).
@@ -800,6 +815,42 @@ impl DsparkDraftHead {
             // 19.8 ms propose (39%), against 0.62 ms for the attention kernel
             // it feeds. Same defect and same fix as the prefill
             // `v4_grouped_wo_a_prefill` loop earlier in this branch.
+            if self.k_oproj_gemv.0 != 0 && b <= ops::DENSE_GEMV_BATCHM_MAX_M {
+                // One weight-streaming launch per projection: block-diagonal
+                // wo_a reads o5 strided in place (no gather/scatter copies),
+                // wo_b runs the same kernel with rows_per_group = N. The
+                // small-M dense_gemm path below measured 27 GB/s on 201 MB
+                // of drafter wo weights (d_o_proj 7.39 ms of a 19.4 ms
+                // propose); this streams at GEMV rates.
+                ops::dense_gemv_grouped_batchm(
+                    gpu,
+                    self.k_oproj_gemv,
+                    self.o5,
+                    &stage.wo_a,
+                    self.o_lora5,
+                    b,
+                    O_GROUPS * O_LORA,
+                    group_in as u32,
+                    row_o as u32,
+                    O_GROUPS * O_LORA,
+                    O_LORA,
+                    stream,
+                )?;
+                ops::dense_gemv_grouped_batchm(
+                    gpu,
+                    self.k_oproj_gemv,
+                    self.o_lora5,
+                    &stage.wo_b,
+                    self.attn5,
+                    b,
+                    h,
+                    O_GROUPS * O_LORA,
+                    O_GROUPS * O_LORA,
+                    h,
+                    h,
+                    stream,
+                )?;
+            } else {
             for g in 0..O_GROUPS as usize {
                 // gather: o5 rows are row_o-strided; group g is a group_in-wide
                 // column slice → contiguous [b, group_in] in ogrp.
@@ -849,6 +900,7 @@ impl DsparkDraftHead {
                 O_GROUPS * O_LORA,
                 stream,
             )?;
+            }
             self.dbg(gpu, &format!("s{s}.attn5.r0"), self.attn5, hu, stream);
             pprof!("d_o_proj");
             ops::hc_post(
