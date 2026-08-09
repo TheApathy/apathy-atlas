@@ -12,6 +12,7 @@
 //! When busy: drains pending queue (mutex lock) after each decode step.
 
 // ── Submodules (split for ≤500 LoC files) ──────────────────────────────────
+mod accept_log;
 mod adaptive_spec;
 mod beam_prefill;
 mod confidence;

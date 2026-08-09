@@ -357,6 +357,16 @@ pub fn step_verify_dflash(
     // accept window; may suspend this seq's speculation (see adaptive_spec).
     crate::scheduler::adaptive_spec::record_verify(a, num_accepted + committed_extra);
 
+    // ATLAS_DSPARK_ACCEPT_LOG=1: periodic accept HISTOGRAM, not just a mean.
+    // The reference reports 3.08 tok/step suite mean (4.00 on code, 2.18 on
+    // adversarial prose) where our online figure sits near 1.0 despite the
+    // offline engine probe reaching 3.79 on the same drafter — so the first
+    // question is the SHAPE. A mean of ~1 can be a uniformly-bad drafter or a
+    // bimodal one that nails whole blocks and whiffs the rest; those have
+    // completely different fixes, and a peer session measured exactly such a
+    // bimodal split (modes at 0 and full) on a different model.
+    accept_log::record(num_accepted + committed_extra, drafts.len());
+
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix
     // bonus slot). We keep the original prefix + `num_accepted` drafts +
