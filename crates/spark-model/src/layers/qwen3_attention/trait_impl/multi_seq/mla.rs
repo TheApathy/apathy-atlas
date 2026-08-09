@@ -490,17 +490,23 @@ impl Qwen3AttentionLayer {
             })
         } && !c.fwd.graph_capture;
 
-        // ── ATLAS_VERIFY_EXACT_GEMV=1: every batched GEMV projection in this
-        // verify (Phase A wq_a/wq_b/wkv AND Phase C wo_a/wo_b) runs a kernel
-        // whose per-row accumulation is byte-identical to the single-row
-        // kernels plain decode uses. Both stock batch families measurably
-        // drift (w4: chunk order + scale regroup; w8: pair-sum fusion — see
-        // the kernel headers, measured 2026-08-09). This flag is the
-        // instrument for the capture-drift → acceptance experiment.
+        // ── ATLAS_VERIFY_EXACT_GEMV (default ON): every batched GEMV
+        // projection in this verify (Phase A wq_a/wq_b/wkv AND Phase C
+        // wo_a/wo_b) runs a kernel whose per-row accumulation is
+        // byte-identical to the single-row kernels plain decode uses. Both
+        // stock batch families measurably drift (w4: chunk order + scale
+        // regroup; w8: pair-sum fusion — see the kernel headers).
+        //
+        // MEASURED 2026-08-09, γ=5 serve A/B vs the _ld control: acceptance
+        // 2.92–3.01 tok/step vs 2.83, zero-accept 17.7–18.8% vs 20.3%, prose
+        // +1 tok/s, repeat parity; tool-eval-bench 90/100 (12/3/0) — the
+        // quality bar exactly. A PARTIALLY exact chain is WORSE than either
+        // extreme (o-proj-only: 2.54) — flip all legs together or none.
+        // `=0` restores the drifted _ld/batchm kernels for A/B.
         let verify_exact_gemv = {
             static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *E.get_or_init(|| {
-                std::env::var("ATLAS_VERIFY_EXACT_GEMV").as_deref() == Ok("1")
+                std::env::var("ATLAS_VERIFY_EXACT_GEMV").as_deref() != Ok("0")
             })
         } && self.w8a16_gemv_batchm_exact_k.0 != 0
             && self.w4a16_gemv_grouped_batchm_k.0 != 0
