@@ -881,17 +881,22 @@ impl Qwen3AttentionLayer {
             mark("C_oproj", &mut t_phase)?;
             return Ok(o_out);
         }
-        // ── Bit-exact batched O projection (ATLAS_OPROJ_BATCH_EXACT, default
-        // on). `w4a16_gemv_grouped_batchm` keeps the single-row K order per
-        // row, so the verify's o_out matches plain decode BYTE-FOR-BYTE —
-        // removing the first divergence the layer-diff harness convicted for
-        // the 2-3% capture drift — at 3.07x the per-row OPROJ_EXACT cost
-        // (grouped microtest 2026-08-09). `=0` opts back into the `_ld`
-        // kernels below for A/B.
+        // ── Bit-exact batched O projection (ATLAS_OPROJ_BATCH_EXACT=1,
+        // OPT-IN). `w4a16_gemv_grouped_batchm` keeps the single-row K order
+        // per row, so the verify's o_out matches plain decode BYTE-FOR-BYTE
+        // at 3.07x the per-row OPROJ_EXACT cost (grouped microtest).
+        //
+        // MEASURED 2026-08-09 serve A/B: o-proj exactness ALONE does not
+        // recover acceptance (2.54 vs 2.83 tok/step control) — the residual
+        // capture drift lives in the other reordered verify kernels (m=6
+        // dedup MoE, batched attention), and the _ld kernels below were the
+        // faster end-to-end config (repeat 31.2 vs 28.4). Default therefore
+        // stays _ld; this path is the cheap bit-exactness instrument for
+        // capture-chain experiments (pair it with a bit-exact MoE leg).
         let oproj_batch_exact = {
             static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *E.get_or_init(|| {
-                std::env::var("ATLAS_OPROJ_BATCH_EXACT").as_deref() != Ok("0")
+                std::env::var("ATLAS_OPROJ_BATCH_EXACT").as_deref() == Ok("1")
             })
         };
         if oproj_batch_exact

@@ -1,0 +1,66 @@
+{
+  "tag": "oproj-ld-control",
+  "model": "/home/flocka/models/DeepSeek-V4-Flash-162B",
+  "runs": [
+    {
+      "code": {
+        "tok_s": 19.97,
+        "completion_tokens": 300,
+        "wall_s": 15.71,
+        "sha256": "cba8da0d99fb3458",
+        "prefix": "Here's a Python implementation of an LRU (Least Recently Use"
+      },
+      "repeat": {
+        "tok_s": 30.66,
+        "completion_tokens": 49,
+        "wall_s": 1.97,
+        "sha256": "f42ca9a1830af7ec",
+        "prefix": "1. the quick brown fox jumps over the lazy dog 2. the quick "
+      },
+      "quote": {
+        "tok_s": 22.22,
+        "completion_tokens": 300,
+        "wall_s": 13.85,
+        "sha256": "661ac5383fc274d0",
+        "prefix": "Here is the first stanza of Robert Frost's poem **\"The Road "
+      },
+      "prose": {
+        "tok_s": 20.2,
+        "completion_tokens": 300,
+        "wall_s": 15.24,
+        "sha256": "c79cd619e6990063",
+        "prefix": "The history of lighthouse keeping is a story of human courag"
+      }
+    },
+    {
+      "code": {
+        "tok_s": 22.08,
+        "completion_tokens": 300,
+        "wall_s": 13.99,
+        "sha256": "0c22f2c0b9ad423d",
+        "prefix": "Here's a Python implementation of an LRU (Least Recently Use"
+      },
+      "repeat": {
+        "tok_s": 31.24,
+        "completion_tokens": 49,
+        "wall_s": 1.91,
+        "sha256": "f42ca9a1830af7ec",
+        "prefix": "1. the quick brown fox jumps over the lazy dog 2. the quick "
+      },
+      "quote": {
+        "tok_s": 22.19,
+        "completion_tokens": 300,
+        "wall_s": 13.84,
+        "sha256": "661ac5383fc274d0",
+        "prefix": "Here is the first stanza of Robert Frost's poem **\"The Road "
+      },
+      "prose": {
+        "tok_s": 19.99,
+        "completion_tokens": 300,
+        "wall_s": 15.49,
+        "sha256": "d75b0a2daac00b8a",
+        "prefix": "The history of lighthouse keeping is a story of human courag"
+      }
+    }
+  ]
+}
