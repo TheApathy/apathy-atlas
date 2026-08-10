@@ -121,8 +121,28 @@ impl Qwen3AttentionLayer {
             })
         };
         // ── 1. Q latent → norm → expand ──
+        // wq_a keeps a BF16 mirror, so v4_project_prefill's BF16-first
+        // preference routed it to the weak dense_gemm_tc — measured 9 ms/layer
+        // = 385 ms/pass at N=2410 (bucket 1a) for a GEMM the FP8 pipelined
+        // kernel does in ~0.8 ms. Prefer the FP8 mirror when loaded.
         let q_latent = ctx.buffers.ssm_ba();
-        if use_tc {
+        if let Some(wqa8) = mla
+            .wq_a_fp8
+            .filter(|_| self.w8a16_gemm_pipelined_k.0 != 0)
+        {
+            ops::w8a16_gemm_pipelined(
+                ctx.gpu,
+                self.w8a16_gemm_pipelined_k,
+                normed,
+                wqa8.weight,
+                wqa8.row_scale,
+                q_latent,
+                n,
+                q_lora,
+                h,
+                stream,
+            )?;
+        } else if use_tc {
             ops::dense_gemm_tc(
                 ctx.gpu,
                 self.dense_gemm_tc_k,
@@ -168,6 +188,7 @@ impl Qwen3AttentionLayer {
                 .synchronize(stream)
                 .map_err(|e| anyhow::anyhow!("V4 attn: q_a_norm sync failed: {e}"))?;
         }
+        aprof!("1a_wq_a_norm");
         let q_full = ctx.buffers.qkv_output();
         self.v4_project_prefill(
             ctx,
@@ -186,6 +207,7 @@ impl Qwen3AttentionLayer {
                 .synchronize(stream)
                 .map_err(|e| anyhow::anyhow!("V4 attn: q_full gemm sync failed: {e}"))?;
         }
+        aprof!("1b_wq_b");
         // q_b_norm: per-head unweighted RMSNorm over head_dim (DeepSeek-V4),
         // each of the n*nq head vectors renormalized to unit RMS before rope.
         ops::rms_norm(
