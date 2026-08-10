@@ -23,7 +23,7 @@ fn wide_verify_partitions_unique_and_duplicated_experts() {
     assert!(KERNEL.contains("GROUP_DUPLICATED"));
     assert!(KERNEL.contains("GROUP_COUNT_2"));
     assert!(KERNEL.contains("GROUP_COUNT_3_4"));
-    assert!(KERNEL.contains("GROUP_COUNT_5_6"));
+    assert!(KERNEL.contains("GROUP_COUNT_5_PLUS"));
     assert!(KERNEL.contains("moe_gate_up_partial_finalize_m_act"));
     assert!(KERNEL.contains("PRECOMPUTED_ACT"));
     assert!(DISPATCH.contains("ATLAS_MOE_MROW_PARTITION"));

@@ -339,6 +339,25 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_t_m8_k: KernelHandle,
     moe_expert_gate_up_shared_t_e8m0_m8_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_m8_k: KernelHandle,
+    // V2 wide-load tier (`ATLAS_MOE_SPLITK_V2=1`): the same MROW ladder at
+    // VEC=4 / SPLIT=4 (`_m{2,6,8}v4s4`). Weight requests widen from 64 to 128
+    // bytes per warp, and the gate_up side stages all gathered rows'
+    // activations in dynamic smem once per k-window instead of re-issuing M
+    // narrow global reads per weight byte pair. SPLIT is unchanged, so the
+    // tier is BIT-IDENTICAL to the v2s4 incumbent (same split points, same
+    // per-output FMA order; VEC only remaps thread→output).
+    moe_expert_gate_up_shared_t_m2_v2t_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m2_v2t_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m2_v2t_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m2_v2t_k: KernelHandle,
+    moe_expert_gate_up_shared_t_m6_v2t_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m6_v2t_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m6_v2t_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m6_v2t_k: KernelHandle,
+    moe_expert_gate_up_shared_t_m8_v2t_k: KernelHandle,
+    moe_expert_silu_down_shared_t_m8_v2t_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_m8_v2t_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_m8_v2t_k: KernelHandle,
     // Wide-verify partitions. Gate/up uses lean MROW=1 for unique groups and
     // MROW=6 (MROW=8 past six rows) for duplicated groups. Down additionally
     // buckets multiplicity as 2, 3-4, and 5-or-more so each launch reserves only
@@ -725,6 +744,58 @@ impl MoeLayer {
                 self.moe_expert_gate_up_shared_t_e8m0_m8_k,
                 self.moe_expert_silu_down_shared_t_m8_k,
                 self.moe_expert_silu_down_shared_t_e8m0_m8_k,
+            ),
+        ];
+        for &(mrow, gu, gu_e8m0, sd, sd_e8m0) in candidates {
+            if num_tokens > mrow {
+                continue;
+            }
+            let gate_up = self.e8m0_or_opt(gu, gu_e8m0);
+            let silu_down = self.e8m0_or_opt(sd, sd_e8m0);
+            if let (Some(g), Some(s)) = (gate_up, silu_down)
+                && g.0 != 0
+                && s.0 != 0
+            {
+                return Some((g, s, mrow));
+            }
+        }
+        None
+    }
+
+    /// [`Self::splitk_m_t_handles`] over the V2 wide-load `_v4s4` entries
+    /// (`ATLAS_MOE_SPLITK_V2=1`). Same ladder, same both-or-neither contract.
+    /// The gate_up entries additionally require dynamic smem for the staged
+    /// activation slices — the ops wrapper sizes it off the returned MROW.
+    #[inline]
+    pub(crate) fn splitk_m_t_v2_handles(
+        &self,
+        num_tokens: u32,
+    ) -> Option<(
+        spark_runtime::gpu::KernelHandle,
+        spark_runtime::gpu::KernelHandle,
+        u32,
+    )> {
+        let candidates: &[(u32, KernelHandle, KernelHandle, KernelHandle, KernelHandle)] = &[
+            (
+                2,
+                self.moe_expert_gate_up_shared_t_m2_v2t_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m2_v2t_k,
+                self.moe_expert_silu_down_shared_t_m2_v2t_k,
+                self.moe_expert_silu_down_shared_t_e8m0_m2_v2t_k,
+            ),
+            (
+                MOE_VERIFY_M6_ROWS,
+                self.moe_expert_gate_up_shared_t_m6_v2t_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m6_v2t_k,
+                self.moe_expert_silu_down_shared_t_m6_v2t_k,
+                self.moe_expert_silu_down_shared_t_e8m0_m6_v2t_k,
+            ),
+            (
+                MOE_VERIFY_MAX_ROWS,
+                self.moe_expert_gate_up_shared_t_m8_v2t_k,
+                self.moe_expert_gate_up_shared_t_e8m0_m8_v2t_k,
+                self.moe_expert_silu_down_shared_t_m8_v2t_k,
+                self.moe_expert_silu_down_shared_t_e8m0_m8_v2t_k,
             ),
         ];
         for &(mrow, gu, gu_e8m0, sd, sd_e8m0) in candidates {

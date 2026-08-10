@@ -791,6 +791,31 @@ weight-outside/rows-inside structure.
 
   Combined, these should recover a large share of the 136 -> 194 GB/s gap. See Finding 4.
 
+## The V2 wide-load tier: `_m{2,6,8}v4s4` (`ATLAS_MOE_SPLITK_V2=1`, default OFF)
+
+The two inefficiencies called out above — narrow weight requests and the raw-global
+`A_row[m]` reads — are closed by the V2 entries (12 of them, `GATEUP_M_ENTRY_ACT` /
+`DOWN_M_ENTRY` at VEC=4), selected by `splitk_m_t_v2_handles` when
+`ATLAS_MOE_SPLITK_V2=1`:
+
+- **VEC=4 at the SAME SPLIT=4.** Weight requests go 64 → 128 B/warp (SASS: the packed
+  prefetch is `LD.E` 32-bit instead of `LD.E.U16`, still 16-deep unrolled). Unlike the
+  single-row v4s8 tier, no SPLIT bump is needed: the `_m` grid has `M*top_k + 1` y-slots
+  (37 at γ=6 vs the single row's 7), so grid.x halving does not starve 48 SMs. Same
+  split points + same per-output FMA order = **bit-identical to v2s4** (GATE V2 in
+  `moe_unified_t_m_microtest` byte-compares them).
+- **ACT_SMEM on gate_up.** All gathered rows' bf16 activation slices for the block's
+  k-window are staged into dynamic smem once (`MROW * K/SPLIT * 2` B = 12 KiB at m6),
+  then the K loop's `16*M` per-scale-group activation reads are `LDS` instead of M
+  dependent 4-byte warp-uniform global loads per weight byte pair. At M=6 the incumbent
+  issues 96 activation LDGs against 17 weight LDGs per scale-group — that inverted
+  request ratio is the 206 → 135 GB/s falloff vs the m=1 sibling.
+- The down kernel already staged activations; its V2 is the VEC widening alone.
+
+Registers 84-101, zero spills, `__launch_bounds__(256,2)` held. Every pre-existing
+kernel's SASS is instruction-identical after the change (85/85 verified) — the tier is
+purely additive.
+
 ## GATEUP_M_ENTRY / DOWN_M_ENTRY (12 MROW entries)
 
 `moe_shared_expert_fused_t.cu:1332` and `:1365`, instantiated at `:1399-1411`

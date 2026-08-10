@@ -438,8 +438,13 @@ pub fn moe_splitk_m_down_offset(split: u32, inter: u32, top_k: u32, num_tokens: 
 /// candidate rows, with slots routed to the same expert collapsed onto a single
 /// leader block (see the `_m` kernels in `moe_shared_expert_fused_t.cu`).
 ///
-/// `kernel` must be an `_m{MROW}v{T_SPLIT_VEC}s{split}` entry point whose MROW
-/// is >= `num_tokens`; a smaller MROW silently drops rows, so the caller checks.
+/// `kernel` must be an `_m{MROW}v{vec}s{split}` entry point whose MROW covers
+/// `num_tokens`; a smaller MROW silently drops rows, so the caller checks.
+/// `vec` sizes the grid to the entry point's compile-time VEC. `stage_mrow`
+/// is nonzero ONLY for the V2 `_v4s4` gate_up entries, which stage the
+/// gathered rows' activations in dynamic smem — it must be the compiled
+/// entry's MROW (the kernel strides slices by it), and it sizes the smem to
+/// `stage_mrow * K/split` bf16. The partition arms never stage.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_gate_up_shared_t_splitk_m(
     gpu: &dyn GpuBackend,
@@ -462,6 +467,8 @@ pub fn moe_expert_gate_up_shared_t_splitk_m(
     partials: DevicePtr,
     partition_tail: Option<KernelHandle>,
     split: u32,
+    vec: u32,
+    stage_mrow: u32,
     n: u32,
     k: u32,
     top_k: u32,
@@ -474,8 +481,12 @@ pub fn moe_expert_gate_up_shared_t_splitk_m(
         KernelLaunch::new(gpu, arm)
             // grid.y is total_routed + 1, not + num_tokens: one block-set computes
             // the shared projection for every row.
-            .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, 2 * split])
+            .grid([n / (t_block() * vec), total_routed + 1, 2 * split])
             .block([t_block(), 1, 1])
+            // V2 `_v4s4` only: one bf16 activation slice of K/split elements
+            // per row the compiled entry may gather. 0 for the incumbent and
+            // the partition arms.
+            .shared_mem(stage_mrow * (k / split) * 2)
             .arg_ptr(input)
             .arg_ptr(gate_packed_t_ptrs)
             .arg_ptr(gate_scale_t_ptrs)
@@ -549,6 +560,7 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
     partials: DevicePtr,
     partition_buckets: Option<[(KernelHandle, u32); 3]>,
     split: u32,
+    vec: u32,
     n: u32,
     k: u32,
     top_k: u32,
@@ -567,7 +579,7 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
             arm_mrow * (k as usize * std::mem::size_of::<f32>()) as u32 / split
         };
         KernelLaunch::new(gpu, arm)
-            .grid([n / (t_block() * T_SPLIT_VEC), total_routed + 1, split])
+            .grid([n / (t_block() * vec), total_routed + 1, split])
             .block([t_block(), 1, 1])
             .shared_mem(smem_bytes)
             .arg_ptr(gate_out)

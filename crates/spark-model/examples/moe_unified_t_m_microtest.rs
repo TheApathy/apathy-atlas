@@ -29,6 +29,12 @@
 //! the per-token fallback, or `ATLAS_K2_MOE_PER_TOKEN=1` at K=2) vs one
 //! `_m{MROW}v2s4` chain.
 //!
+//! V2 leg (when the `_v4s4` entries are compiled): GATE V2 requires the
+//! `ATLAS_MOE_SPLITK_V2` tier — `_m{MROW}v4s4`, VEC=4 weight loads at the same
+//! SPLIT plus smem-staged gate_up activations — to be **BIT-IDENTICAL** to the
+//! `_m{MROW}v2s4` incumbent, then times the two chains. Sweep `tokens` over
+//! 4/6/8 and `overlap` to read the row-per-leader curve.
+//!
 //! Usage:
 //!   cargo run --release -p spark-model --example moe_unified_t_m_microtest \
 //!       -- [block] [pool] [seed-hex] [top_k] [overlap] [tokens]
@@ -695,6 +701,7 @@ fn main() -> Result<()> {
     let rows = tokens * top_k;
     let m_out = Outs::alloc(gpu, rows, tokens)?;
     let ref_out = Outs::alloc(gpu, rows, tokens)?;
+    let v2_out = Outs::alloc(gpu, rows, tokens)?;
 
     // Partials. Single-row: [2, SPLIT, top_k+1, INTER] / [SPLIT, top_k+1, HIDDEN].
     // Multi-row: `rows + tokens` accumulator rows instead of `top_k + 1`.
@@ -1003,6 +1010,132 @@ fn main() -> Result<()> {
         m_chain_stages(mrow, tokens, true, o, 0xF, st)
     };
 
+    // ── V2 wide-load chain (`ATLAS_MOE_SPLITK_V2` tier): `_m{mrow}v4s4` ──
+    //
+    // Same SPLIT as the incumbent, VEC=4 weight loads (128-byte warp requests
+    // instead of 64) and smem-staged activations on the gate_up side. The
+    // whole point of keeping SPLIT at 4 is that the tier must be BIT-IDENTICAL
+    // to `_m{mrow}v2s4` — GATE V2 below enforces exactly that. The finalize
+    // kernels and partial layout are the incumbent's.
+    const VEC_V2: u32 = 4;
+    let v2_chain_stages = |mrow: u32, tokens: u32, o: &Outs, stages: u32, st: u64| -> Result<()> {
+        let suffix = if mrow == 1 {
+            "m1"
+        } else if mrow == 2 {
+            "m2"
+        } else if mrow <= MROW_M6 {
+            "m6"
+        } else {
+            "m8"
+        };
+        let gu = gpu.kernel(
+            MODULE,
+            &format!("moe_expert_gate_up_shared_t_e8m0_{suffix}v4s4"),
+        )?;
+        let dn = gpu.kernel(
+            MODULE,
+            &format!("moe_expert_silu_down_shared_t_e8m0_{suffix}v4s4"),
+        )?;
+        let total_routed = tokens * top_k as u32;
+        let fin_rows = total_routed + tokens;
+        if stages & 1 != 0 {
+            KernelLaunch::new(gpu, gu)
+                .grid([INTER as u32 / (block * VEC_V2), total_routed + 1, 2 * SPLIT])
+                .block([block, 1, 1])
+                // One bf16 activation slice of K/SPLIT elements per row the
+                // compiled entry may gather (MROW, not `tokens`).
+                .shared_mem(mrow * (HIDDEN as u32 / SPLIT) * 2)
+                .arg_ptr(a_ptr)
+                .arg_ptr(gate_tbl.packed)
+                .arg_ptr(gate_tbl.scales)
+                .arg_ptr(gate_tbl.s2)
+                .arg_ptr(o.gate)
+                .arg_ptr(up_tbl.packed)
+                .arg_ptr(up_tbl.scales)
+                .arg_ptr(up_tbl.s2)
+                .arg_ptr(o.up)
+                .arg_ptr(idx_flat)
+                .arg_ptr(sh_gate_p)
+                .arg_ptr(sh_gate_s)
+                .arg_f32(sh_gate.s2)
+                .arg_ptr(o.sh_gate)
+                .arg_ptr(sh_up_p)
+                .arg_ptr(sh_up_s)
+                .arg_f32(sh_up.s2)
+                .arg_ptr(o.sh_up)
+                .arg_u32(INTER as u32)
+                .arg_u32(HIDDEN as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(tokens)
+                .arg_ptr(partial_gu)
+                .launch(st)?;
+        }
+        if stages & 2 != 0 {
+            KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_gate_up_partial_finalize_m")?)
+                .grid([(INTER as u32).div_ceil(block), fin_rows, 2])
+                .block([block, 1, 1])
+                .arg_ptr(partial_gu)
+                .arg_ptr(o.gate)
+                .arg_ptr(o.sh_gate)
+                .arg_ptr(o.up)
+                .arg_ptr(o.sh_up)
+                .arg_u32(INTER as u32)
+                .arg_u32(total_routed)
+                .arg_u32(tokens)
+                .arg_u32(SPLIT)
+                .launch(st)?;
+        }
+        if stages & 4 != 0 {
+            KernelLaunch::new(gpu, dn)
+                .grid([HIDDEN as u32 / (block * VEC_V2), total_routed + 1, SPLIT])
+                .block([block, 1, 1])
+                // f32 s_act slices, exactly the incumbent's contract.
+                .shared_mem(mrow * INTER as u32 * 4 / SPLIT)
+                .arg_ptr(o.gate)
+                .arg_ptr(o.up)
+                .arg_ptr(partial_gu)
+                .arg_ptr(down_tbl.packed)
+                .arg_ptr(down_tbl.scales)
+                .arg_ptr(down_tbl.s2)
+                .arg_ptr(o.down)
+                .arg_ptr(idx_flat)
+                .arg_ptr(o.sh_gate)
+                .arg_ptr(o.sh_up)
+                .arg_ptr(sh_down_p)
+                .arg_ptr(sh_down_s)
+                .arg_f32(sh_down.s2)
+                .arg_ptr(o.sh_down)
+                .arg_u32(HIDDEN as u32)
+                .arg_u32(INTER as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(tokens)
+                .arg_ptr(partial_dn)
+                .launch(st)?;
+        }
+        if stages & 8 != 0 {
+            KernelLaunch::new(gpu, gpu.kernel(MODULE, "moe_down_partial_finalize_m")?)
+                .grid([(HIDDEN as u32).div_ceil(block), fin_rows, 1])
+                .block([block, 1, 1])
+                .arg_ptr(partial_dn)
+                .arg_ptr(o.down)
+                .arg_ptr(o.sh_down)
+                .arg_u32(HIDDEN as u32)
+                .arg_u32(total_routed)
+                .arg_u32(tokens)
+                .arg_u32(SPLIT)
+                .launch(st)?;
+        }
+        Ok(())
+    };
+    let v2_chain = |mrow: u32, tokens: u32, o: &Outs, st: u64| -> Result<()> {
+        v2_chain_stages(mrow, tokens, o, 0xF, st)
+    };
+    let v2_available = gpu
+        .kernel(MODULE, "moe_expert_gate_up_shared_t_e8m0_m6v4s4")
+        .is_ok()
+        && INTER % (block as usize * VEC_V2 as usize) == 0
+        && HIDDEN % (block as usize * VEC_V2 as usize) == 0;
+
     // ── host-prebuilt persistent chain (Stage-0 microtest only) ──
     let persistent_chain_stages =
         |work: &PersistentWorkSet, o: &Outs, stages: u32, st: u64| -> Result<()> {
@@ -1250,6 +1383,48 @@ fn main() -> Result<()> {
         );
     }
 
+    // ── GATE V2: `_m{mrow}v4s4` must be BIT-IDENTICAL to `_m{mrow}v2s4` ──
+    //
+    // The V2 tier keeps SPLIT=4, so the split points and every per-output FMA
+    // order are the incumbent's; VEC=4 only remaps thread→output and the smem
+    // activation staging feeds the same bf16 bytes through the same
+    // conversion. Any mismatch here is a bug, not reassociation — raw bits.
+    if v2_available && tokens >= 2 {
+        poison(&m_out)?;
+        m_chain(mrow, tokens as u32, &m_out, stream)?;
+        poison(&v2_out)?;
+        v2_chain(mrow, tokens as u32, &v2_out, stream)?;
+        gpu.synchronize(stream)?;
+        let mut bad = 0usize;
+        for (label, a, b, n) in [
+            ("gate", m_out.gate, v2_out.gate, rows * INTER),
+            ("up", m_out.up, v2_out.up, rows * INTER),
+            ("down", m_out.down, v2_out.down, rows * HIDDEN),
+            ("sh_gate", m_out.sh_gate, v2_out.sh_gate, tokens * INTER),
+            ("sh_up", m_out.sh_up, v2_out.sh_up, tokens * INTER),
+            ("sh_down", m_out.sh_down, v2_out.sh_down, tokens * HIDDEN),
+        ] {
+            let (x, y) = (read(a, n)?, read(b, n)?);
+            let diff = x.iter().zip(&y).filter(|(p, q)| p != q).count();
+            if diff > 0 {
+                let i = x.iter().zip(&y).position(|(p, q)| p != q).unwrap();
+                println!(
+                    "  GATE V2 {label}: {diff}/{n} differ, first at [{i}] \
+                     v2s4={:.6} v4s4={:.6}",
+                    bf16_to_f32(x[i]),
+                    bf16_to_f32(y[i])
+                );
+                bad += diff;
+            }
+        }
+        if bad > 0 {
+            bail!("GATE V2 FAILED: _m{mrow}v4s4 is not bit-identical to _m{mrow}v2s4 ({bad} elems)");
+        }
+        println!("  GATE V2 PASS: _m{mrow}v4s4 == _m{mrow}v2s4, bit-identical (all 6 outputs)");
+    } else if !v2_available {
+        println!("  GATE V2 skipped: _v4s4 entries not compiled or block*4 doesn't divide N");
+    }
+
     // ── timing ──
     let time = |f: &dyn Fn(u64) -> Result<()>| -> Result<f64> {
         for _ in 0..20 {
@@ -1462,6 +1637,11 @@ fn main() -> Result<()> {
     })?;
     let t_m = time(&|st| m_chain(mrow, tokens as u32, &m_out, st))?;
     let t_p = time(&|st| p_chain(mrow, tokens as u32, &m_out, st))?;
+    let t_v2 = if v2_available && tokens >= 2 {
+        Some(time(&|st| v2_chain(mrow, tokens as u32, &v2_out, st))?)
+    } else {
+        None
+    };
 
     // The reference reads every row's weights in full; the `_m` chain reads the
     // union, so its effective GB/s is quoted against the SAME nominal byte
@@ -1485,6 +1665,14 @@ fn main() -> Result<()> {
         gbs(t_p),
         (t_m / t_p - 1.0) * 100.0
     );
+    if let Some(t_v2) = t_v2 {
+        println!(
+            "  1x _m{mrow}v4s4 V2 (wide-load, staged):  {t_v2:.4} ms  ({:.0} GB/s nominal)  \
+             [{:+.1}% vs m{mrow}v2s4]",
+            gbs(t_v2),
+            (t_m / t_v2 - 1.0) * 100.0
+        );
+    }
     // Ceiling: only the union of the rows' experts plus ONE shared expert has to
     // be read; the duplicate picks collapse.
     let union_bytes = (distinct * (2 * routed_b(HIDDEN, INTER) + routed_b(INTER, HIDDEN))
@@ -1507,8 +1695,8 @@ fn main() -> Result<()> {
     // GEMV and not the other, that GEMV is the one to tune.
     println!();
     println!(
-        "  stage                {:>10} {:>10} {:>9}",
-        "per-row", "dedup", "gain"
+        "  stage                {:>10} {:>10} {:>9} {:>10} {:>9}",
+        "per-row", "dedup", "gain", "v2", "v2 gain"
     );
     for (label, bit) in [
         ("gate_up GEMV", 1u32),
@@ -1523,10 +1711,22 @@ fn main() -> Result<()> {
             Ok(())
         })?;
         let m = time(&|st| m_chain_stages(mrow, tokens as u32, true, &m_out, bit, st))?;
-        println!(
-            "  {label:<20} {r:>8.4} ms {m:>8.4} ms {:>+8.1}%",
-            (r / m - 1.0) * 100.0
-        );
+        // The incumbent (non-partitioned) dedup chain is the V2 comparison
+        // point — same kernels the engine launches without extra env flags.
+        let mi = time(&|st| m_chain_stages(mrow, tokens as u32, false, &m_out, bit, st))?;
+        if v2_available && tokens >= 2 {
+            let v = time(&|st| v2_chain_stages(mrow, tokens as u32, &v2_out, bit, st))?;
+            println!(
+                "  {label:<20} {r:>8.4} ms {m:>8.4} ms {:>+8.1}% {v:>8.4} ms {:>+8.1}%",
+                (r / m - 1.0) * 100.0,
+                (mi / v - 1.0) * 100.0
+            );
+        } else {
+            println!(
+                "  {label:<20} {r:>8.4} ms {m:>8.4} ms {:>+8.1}%",
+                (r / m - 1.0) * 100.0
+            );
+        }
     }
     Ok(())
 }

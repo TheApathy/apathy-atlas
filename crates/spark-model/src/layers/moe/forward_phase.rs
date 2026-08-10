@@ -25,8 +25,18 @@ const T_SPLIT: u32 = 4;
 const T_SPLIT_WIDE: u32 = 8;
 const T_SPLIT_VEC_WIDE: u32 = 4;
 
+/// `ATLAS_MOE_SPLITK_V2=1` wide-load tier for the multi-row (`_m`) verify
+/// kernels: VEC=4 at the SAME SPLIT=4 (`_m{2,6,8}v4s4`), plus smem-staged
+/// activations on the gate_up side. Unlike the single-row v4s8 tier this one
+/// keeps the split points, so it is BIT-IDENTICAL to the v2s4 incumbent — the
+/// multi-row grid has `num_tokens*top_k + 1` y-slots (37 at the 6-row verify vs
+/// the single-row 7), so the CTAs VEC=4 gives up don't starve the SMs and no
+/// SPLIT bump is needed to win them back. Default OFF until serve-validated.
+const T_SPLIT_M_VEC_WIDE: u32 = 4;
+
 static MOE_MROW_PARTITION_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static MOE_GEMV_V2_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static MOE_SPLITK_M_V2_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Kernel selection for the single-row unified-`_t` split-K decode.
 pub(super) struct UnifiedTSplitCfg {
@@ -34,6 +44,20 @@ pub(super) struct UnifiedTSplitCfg {
     pub vec: u32,
     pub gate_up: KernelHandle,
     pub silu_down: KernelHandle,
+}
+
+/// Kernel selection for the multi-row (`_m`) dedup'd split-K verify.
+struct SplitkMCfg {
+    split: u32,
+    /// Compile-time VEC of the selected entries — sizes grid.x, and marks the
+    /// V2 tier (== [`T_SPLIT_M_VEC_WIDE`]), whose gate_up entries need the
+    /// staged-activation smem.
+    vec: u32,
+    gate_up: KernelHandle,
+    silu_down: KernelHandle,
+    /// MROW of the compiled entry point (sets smem strides), NOT `num_tokens`.
+    mrow: u32,
+    partition: Option<SplitkMPartitionHandles>,
 }
 
 impl MoeLayer {
@@ -126,13 +150,7 @@ impl MoeLayer {
         inter: u32,
         top_k: u32,
         num_tokens: u32,
-    ) -> Option<(
-        u32,
-        KernelHandle,
-        KernelHandle,
-        u32,
-        Option<SplitkMPartitionHandles>,
-    )> {
+    ) -> Option<SplitkMCfg> {
         if std::env::var("ATLAS_MOE_SPLITK").as_deref() == Ok("0") {
             return None;
         }
@@ -143,10 +161,11 @@ impl MoeLayer {
             return None;
         }
         let split = T_SPLIT;
-        let vec = ops::T_SPLIT_VEC;
-        let widths_ok = inter % (ops::t_block() * vec) == 0 && h % (ops::t_block() * vec) == 0;
-        let depths_ok = h % (32 * split) == 0 && inter % (32 * split) == 0;
-        if !(widths_ok && depths_ok) || num_tokens < 2 {
+        let widths_ok = |vec: u32| {
+            inter.is_multiple_of(ops::t_block() * vec) && h.is_multiple_of(ops::t_block() * vec)
+        };
+        let depths_ok = h.is_multiple_of(32 * split) && inter.is_multiple_of(32 * split);
+        if !(widths_ok(ops::T_SPLIT_VEC) && depths_ok) || num_tokens < 2 {
             return None;
         }
         // MROW is baked into the entry point, and a kernel whose MROW is below
@@ -155,13 +174,29 @@ impl MoeLayer {
         // `None` when nothing does.
         let partition_enabled = *MOE_MROW_PARTITION_ENABLED
             .get_or_init(|| std::env::var("ATLAS_MOE_MROW_PARTITION").as_deref() == Ok("1"));
-        let (gate_up, silu_down, mrow, partition) = if partition_enabled
+        let v2_enabled = *MOE_SPLITK_M_V2_ENABLED
+            .get_or_init(|| std::env::var("ATLAS_MOE_SPLITK_V2").as_deref() == Ok("1"));
+        let (gate_up, silu_down, mrow, vec, partition) = if partition_enabled
             && let Some(handles) = self.splitk_m_t_partition_handles(num_tokens)
         {
-            (handles.gate_unique, handles.down_unique, 1, Some(handles))
+            (
+                handles.gate_unique,
+                handles.down_unique,
+                1,
+                ops::T_SPLIT_VEC,
+                Some(handles),
+            )
+        } else if v2_enabled
+            && widths_ok(T_SPLIT_M_VEC_WIDE)
+            && let Some((gu, sd, mrow)) = self.splitk_m_t_v2_handles(num_tokens)
+        {
+            // Same SPLIT, so the partial buffer sizing and both finalize
+            // kernels are the incumbent's — only the GEMV entries and the
+            // gate_up smem contract change.
+            (gu, sd, mrow, T_SPLIT_M_VEC_WIDE, None)
         } else {
             let regular = self.splitk_m_t_handles(num_tokens)?;
-            (regular.0, regular.1, regular.2, None)
+            (regular.0, regular.1, regular.2, ops::T_SPLIT_VEC, None)
         };
         if self.moe_gate_up_partial_finalize_m_k.0 == 0 || self.moe_down_partial_finalize_m_k.0 == 0
         {
@@ -171,7 +206,14 @@ impl MoeLayer {
         if ctx.buffers.moe_splitk_partials_bytes() < need {
             return None;
         }
-        Some((split, gate_up, silu_down, mrow, partition))
+        Some(SplitkMCfg {
+            split,
+            vec,
+            gate_up,
+            silu_down,
+            mrow,
+            partition,
+        })
     }
 
     /// True when a 2-row verify would take the MROW=2 dedup'd split-K `_t`
@@ -230,11 +272,21 @@ impl MoeLayer {
         num_tokens: u32,
         stream: u64,
     ) -> Result<bool> {
-        let Some((split, gate_up_k, silu_down_k, mrow, partition)) =
-            self.unified_t_split_k_m(ctx, h, inter, top_k, num_tokens)
+        let Some(SplitkMCfg {
+            split,
+            vec,
+            gate_up: gate_up_k,
+            silu_down: silu_down_k,
+            mrow,
+            partition,
+        }) = self.unified_t_split_k_m(ctx, h, inter, top_k, num_tokens)
         else {
             return Ok(false);
         };
+        // V2 (`_v4s4`) gate_up entries stage the gathered rows' activation
+        // slices in dynamic smem — MROW slices of K/SPLIT bf16 each. The
+        // incumbent and the partition arms take none.
+        let gate_stage_mrow = if vec == T_SPLIT_M_VEC_WIDE { mrow } else { 0 };
         // Same RIDER A1 precondition as the single-row unified_t path: the
         // `_e8m0` variants compute an NVFP4 shared expert alongside E8M0 routed
         // weights, so a native-MXFP4 shared expert would be misread.
@@ -274,6 +326,8 @@ impl MoeLayer {
             partials,
             partition.map(|handles| handles.gate_duplicated),
             split,
+            vec,
+            gate_stage_mrow,
             inter,
             h,
             top_k,
@@ -299,6 +353,7 @@ impl MoeLayer {
             down_partials,
             partition.map(|handles| handles.down_buckets),
             split,
+            vec,
             h,
             inter,
             top_k,
