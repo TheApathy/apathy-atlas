@@ -231,3 +231,7 @@ required-features = ["cuda", "gpu-examples"]
 [[example]]
 name = "exl3_gemv_microtest"
 required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "cublaslt_v4_bench"
+required-features = ["cuda", "gpu-examples"]
