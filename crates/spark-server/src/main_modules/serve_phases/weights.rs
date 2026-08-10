@@ -11,8 +11,28 @@ use atlas_core::config::ModelConfig;
 use crate::cli;
 
 pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
+    // Manual override for checkpoints whose peak/on-disk ratio the format
+    // heuristics below misjudge (e.g. bring-up of a new quant format).
+    if let Some(m) = std::env::var("ATLAS_PEAK_MEM_MULT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&m| m >= 1.0)
+    {
+        return Some(m);
+    }
     if config.model_type == "minimax_m2" || config.model_type == "step3p7" {
         Some(1.02)
+    } else if config
+        .quantization_config
+        .as_ref()
+        .is_some_and(|qc| qc.quant_method == "exl3")
+    {
+        // EXL3 trellis experts load zero-copy as-is (no transpose pass, no
+        // NVFP4 tables, no BF16 dequant staging) and the base FP8 tensors
+        // follow the normal FP8 path; without this arm the loader falls to
+        // the has_fp8 default of 1.5x and the ~99 GiB tp1 checkpoint fails
+        // the pre-flight on a GB10 that fits it comfortably.
+        Some(1.05)
     } else if config
         .quantization_config
         .as_ref()
