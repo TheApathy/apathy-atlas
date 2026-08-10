@@ -386,6 +386,152 @@ extern "C" __global__ void w8a16_gemv_batchm_exact(
     w8a16_gemv_batchm_exact_impl<8>(A, B, block_scale, C, M, N, K, lda, ldc);
 }
 
+// ── EXACT batched sibling, V2 (ATLAS_VERIFY_GEMV_V2) ────────────────────────
+//
+// Data-movement rework of `w8a16_gemv_batchm_exact_impl`. BIT-IDENTICAL per
+// row BY CONSTRUCTION: the chunk-to-lane walk (k16 = lane, stride 64 — the
+// single-row `w8a16_gemv` order), the shared dequant (`s_lut[b] * scale` into
+// wf[16]), the per-row SEQUENTIAL adds, the two-warp shuffle tree, the smem
+// combine and the output write are copied from the incumbent verbatim. Only
+// how bytes reach registers changed:
+//   1. M is a compile-time template parameter (one entry per verify width):
+//      the per-row `t >= M` guards leave the hot loop, and acc[]/smem shrink
+//      from the MAX_M=8 template width to the real width.
+//   2. Weight/scale/activation cursors advance by constant strides instead
+//      of re-deriving 64-bit addresses per load. The scale index is affine
+//      in the loop counter (k_block = lane/8 + 8*iter since 64 % 8 == 0),
+//      so it becomes a running index — same f32 loaded.
+// Weight loads were already 128-bit (uint4); they stay per-chunk single
+// loads read ONCE for all M rows.
+template <int M_ROWS>
+__device__ __forceinline__ void w8a16_gemv_batchm_exact_v2_impl(
+    const __nv_bfloat16* __restrict__ A,    // [M, K] BF16 (row stride lda)
+    const unsigned char* __restrict__ B,     // [N, K] FP8 E4M3
+    const float* __restrict__ block_scale,   // [N/128, K/128] FP32
+    __nv_bfloat16* __restrict__ C,           // [M, N] BF16 (row stride ldc)
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+
+    __shared__ float s_lut[256];
+    s_lut[threadIdx.x] = E4M3_LUT_B4[threadIdx.x];
+    __syncthreads();
+
+    if (n >= N) return;
+
+    const unsigned int K16 = K / 16;
+    const unsigned int k_blocks = (K + FP8_BLOCK - 1) / FP8_BLOCK;
+    const unsigned int n_block = n / FP8_BLOCK;
+
+    float acc[M_ROWS];
+    #pragma unroll
+    for (int t = 0; t < M_ROWS; t++) acc[t] = 0.0f;
+
+    // Cursors for this lane's chunk walk (k16 = lane, stride 64).
+    const unsigned char* w_ptr =
+        B + (unsigned long long)n * K + (unsigned long long)lane * 16u;
+    // k_block = (lane*16 + iter*64*16) / 128 = lane/8 + iter*8 exactly.
+    unsigned long long s_idx =
+        (unsigned long long)n_block * k_blocks + lane / 8u;
+    const __nv_bfloat16* a_ptr[M_ROWS];
+    #pragma unroll
+    for (int t = 0; t < M_ROWS; t++) {
+        a_ptr[t] = A + (unsigned long long)t * lda
+                 + (unsigned long long)lane * 16u;  // 16 elems/chunk
+    }
+
+    for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+        const float scale = block_scale[s_idx];
+
+        // 16 FP8 weight bytes, dequantized + scaled ONCE for all M rows.
+        const uint4 b_data = *(const uint4*)w_ptr;
+        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+        float wf[16];
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned int w32 = b_raw[i];
+            wf[i * 4 + 0] = s_lut[(w32      ) & 0xFF] * scale;
+            wf[i * 4 + 1] = s_lut[(w32 >>  8) & 0xFF] * scale;
+            wf[i * 4 + 2] = s_lut[(w32 >> 16) & 0xFF] * scale;
+            wf[i * 4 + 3] = s_lut[(w32 >> 24) & 0xFF] * scale;
+        }
+
+        #pragma unroll
+        for (int t = 0; t < M_ROWS; t++) {
+            const uint4* ap = (const uint4*)a_ptr[t];
+            const uint4 a_lo = ap[0];
+            const uint4 a_hi = ap[1];
+            const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                        a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+            // SEQUENTIAL adds, one product at a time — the exact w8a16_gemv
+            // accumulation order. Do NOT fuse into pair-sums.
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                __nv_bfloat16 lo, hi;
+                *(unsigned short*)&lo = (unsigned short)(ar[j] & 0xFFFF);
+                *(unsigned short*)&hi = (unsigned short)(ar[j] >> 16);
+                acc[t] += __bfloat162float(lo) * wf[j * 2];
+                acc[t] += __bfloat162float(hi) * wf[j * 2 + 1];
+            }
+        }
+
+        w_ptr += (unsigned long long)threads_per_out * 16u;  // 64 chunks x 16 B
+        s_idx += 8u;                                          // 64 chunks / 8 per block
+        #pragma unroll
+        for (int t = 0; t < M_ROWS; t++)
+            a_ptr[t] += (unsigned long long)threads_per_out * 16u;  // elems
+    }
+
+    __shared__ float smem[M_ROWS][N_PER_BLOCK * 2];
+    const unsigned int warp_in_out = lane / WARP_SIZE;
+    #pragma unroll
+    for (int t = 0; t < M_ROWS; t++) {
+        float a = acc[t];
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            a += __shfl_down_sync(0xFFFFFFFF, a, offset);
+        }
+        if (lane % WARP_SIZE == 0) smem[t][local_out * 2 + warp_in_out] = a;
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < M_ROWS; t++) {
+            float r = smem[t][local_out * 2] + smem[t][local_out * 2 + 1];
+            C[(unsigned long long)t * ldc + n] = __float2bfloat16(r);
+        }
+    }
+}
+
+// One entry per verify width (M compile-time; the wrapper picks by m and
+// falls back to `w8a16_gemv_batchm_exact` for other widths).
+#define W8A16_BX_V2_ENTRY(MM)                                                  \
+    extern "C" __global__ void w8a16_gemv_batchm_exact_v2_m##MM(               \
+        const __nv_bfloat16* __restrict__ A,                                   \
+        const unsigned char* __restrict__ B,                                   \
+        const float* __restrict__ block_scale,                                 \
+        __nv_bfloat16* __restrict__ C,                                         \
+        unsigned int N,                                                        \
+        unsigned int K,                                                        \
+        unsigned int lda,                                                      \
+        unsigned int ldc                                                       \
+    ) {                                                                        \
+        w8a16_gemv_batchm_exact_v2_impl<MM>(A, B, block_scale, C, N, K, lda, ldc); \
+    }
+
+W8A16_BX_V2_ENTRY(4)
+W8A16_BX_V2_ENTRY(5)
+W8A16_BX_V2_ENTRY(6)
+W8A16_BX_V2_ENTRY(8)
+
 // M<=16 (high-concurrency decode, n=5..16). Same weight-streaming pass; one
 // extra weight read serves up to 16 activation rows instead of the M-padded
 // MMA the pipelined kernel would use at these batch sizes.

@@ -155,6 +155,31 @@ impl Qwen3AttentionLayer {
         *RB.get_or_init(|| std::env::var("ATLAS_MLA_ROWS_BATCH").as_deref() != Ok("0"))
     }
 
+    /// `ATLAS_VERIFY_GEMV_V2=1` (default OFF): route the exact verify GEMV
+    /// chain through the compile-time-M V2 kernels (`*_v2_m4/m5/m6/m8`).
+    /// Per-row math is byte-identical to the incumbent exact kernels by
+    /// construction (SASS-verified — see the kernel headers); only load
+    /// widths, addressing and the runtime-M guards changed. Because the V2
+    /// legs are bit-identical, flipping this flag does NOT violate the
+    /// all-or-nothing exactness law: the chain stays exact either way.
+    fn verify_gemv_v2() -> bool {
+        static V2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V2.get_or_init(|| std::env::var("ATLAS_VERIFY_GEMV_V2").as_deref() == Ok("1"))
+    }
+
+    /// Handle for the compile-time-M V2 exact GEMV at width `m`
+    /// (`[m4, m5, m6, m8]` array order), `KernelHandle(0)` when the width
+    /// has no V2 entry — callers fall back to the runtime-M incumbent.
+    fn verify_gemv_v2_handle(arr: &[KernelHandle; 4], m: usize) -> KernelHandle {
+        match m {
+            4 => arr[0],
+            5 => arr[1],
+            6 => arr[2],
+            8 => arr[3],
+            _ => KernelHandle(0),
+        }
+    }
+
     /// Batched MLA decode for `c.n` sequences. Writes each sequence's
     /// O-projection output into `moe_output[i*h .. (i+1)*h]` and returns
     /// the `moe_output` base pointer for `ms_phase_ffn`.
@@ -512,23 +537,53 @@ impl Qwen3AttentionLayer {
             && self.w4a16_gemv_grouped_batchm_k.0 != 0
             && n <= 8;
 
+        // V2 exact kernels (ATLAS_VERIFY_GEMV_V2=1, default OFF): per-row
+        // byte-identical to the incumbents, so this is a pure speed A/B
+        // inside the exact chain. Handle(0) = flag off / no entry for this
+        // width / kernel absent — each site falls back to the incumbent.
+        let (v2_w8, v2_w4) = if verify_exact_gemv && Self::verify_gemv_v2() {
+            (
+                Self::verify_gemv_v2_handle(&self.w8a16_gemv_batchm_exact_v2_k, n),
+                Self::verify_gemv_v2_handle(&self.w4a16_gemv_grouped_batchm_v2_k, n),
+            )
+        } else {
+            (KernelHandle(0), KernelHandle(0))
+        };
+
         // ── Phase A: batched Q + KV projections (weights read once) ──
         let wqa = mla.wq_a_fp8.as_ref().unwrap();
         if verify_exact_gemv {
-            ops::w8a16_gemv_batchm_exact(
-                gpu,
-                self.w8a16_gemv_batchm_exact_k,
-                c.normed,
-                wqa.weight,
-                wqa.row_scale,
-                ql_batch,
-                n as u32,
-                q_lora,
-                h,
-                h,
-                q_lora,
-                stream,
-            )?;
+            if v2_w8.0 != 0 {
+                ops::w8a16_gemv_batchm_exact_v2(
+                    gpu,
+                    v2_w8,
+                    c.normed,
+                    wqa.weight,
+                    wqa.row_scale,
+                    ql_batch,
+                    n as u32,
+                    q_lora,
+                    h,
+                    h,
+                    q_lora,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemv_batchm_exact(
+                    gpu,
+                    self.w8a16_gemv_batchm_exact_k,
+                    c.normed,
+                    wqa.weight,
+                    wqa.row_scale,
+                    ql_batch,
+                    n as u32,
+                    q_lora,
+                    h,
+                    h,
+                    q_lora,
+                    stream,
+                )?;
+            }
         } else {
         ops::w8a16_gemv_batch4(
             gpu,
@@ -562,20 +617,37 @@ impl Qwen3AttentionLayer {
         if verify_exact_gemv && let Some(ref wqb4) = mla.wq_b_nvfp4 {
             // rows_per_group = N ⇒ single group ⇒ batched plain GEMV in
             // single-row K order.
-            ops::w4a16_gemv_grouped_batchm(
-                gpu,
-                self.w4a16_gemv_grouped_batchm_k,
-                ql_batch,
-                wqb4,
-                q_batch,
-                n as u32,
-                q_dim,
-                q_lora,
-                q_lora,
-                q_dim,
-                q_dim,
-                stream,
-            )?;
+            if v2_w4.0 != 0 && q_lora.is_multiple_of(32) {
+                ops::w4a16_gemv_grouped_batchm_v2(
+                    gpu,
+                    v2_w4,
+                    ql_batch,
+                    wqb4,
+                    q_batch,
+                    n as u32,
+                    q_dim,
+                    q_lora,
+                    q_lora,
+                    q_dim,
+                    q_dim,
+                    stream,
+                )?;
+            } else {
+                ops::w4a16_gemv_grouped_batchm(
+                    gpu,
+                    self.w4a16_gemv_grouped_batchm_k,
+                    ql_batch,
+                    wqb4,
+                    q_batch,
+                    n as u32,
+                    q_dim,
+                    q_lora,
+                    q_lora,
+                    q_dim,
+                    q_dim,
+                    stream,
+                )?;
+            }
         } else if nv4_ok && let Some(ref wqb4) = mla.wq_b_nvfp4 {
             ops::w4a16_gemv_batchm(
                 gpu,
@@ -628,20 +700,37 @@ impl Qwen3AttentionLayer {
         }
         let wkv = mla.wkv_a_fp8.as_ref().unwrap();
         if verify_exact_gemv {
-            ops::w8a16_gemv_batchm_exact(
-                gpu,
-                self.w8a16_gemv_batchm_exact_k,
-                c.normed,
-                wkv.weight,
-                wkv.row_scale,
-                kv_batch,
-                n as u32,
-                kv_dim,
-                h,
-                h,
-                kv_dim,
-                stream,
-            )?;
+            if v2_w8.0 != 0 {
+                ops::w8a16_gemv_batchm_exact_v2(
+                    gpu,
+                    v2_w8,
+                    c.normed,
+                    wkv.weight,
+                    wkv.row_scale,
+                    kv_batch,
+                    n as u32,
+                    kv_dim,
+                    h,
+                    h,
+                    kv_dim,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemv_batchm_exact(
+                    gpu,
+                    self.w8a16_gemv_batchm_exact_k,
+                    c.normed,
+                    wkv.weight,
+                    wkv.row_scale,
+                    kv_batch,
+                    n as u32,
+                    kv_dim,
+                    h,
+                    h,
+                    kv_dim,
+                    stream,
+                )?;
+            }
         } else {
         ops::w8a16_gemv_batch4(
             gpu,
@@ -978,36 +1067,70 @@ impl Qwen3AttentionLayer {
             && let (Some(woa4), Some(wob4)) = (&mla.wo_a_nvfp4, &mla.wo_b_nvfp4)
         {
             // wo_a: block-diagonal, rows_per_group = o_lora.
-            ops::w4a16_gemv_grouped_batchm(
-                gpu,
-                self.w4a16_gemv_grouped_batchm_k,
-                attn_batch,
-                woa4,
-                ol_batch,
-                n as u32,
-                latent_dim,
-                group_in,
-                q_dim,
-                latent_dim,
-                o_lora,
-                stream,
-            )?;
+            if v2_w4.0 != 0 && group_in.is_multiple_of(32) {
+                ops::w4a16_gemv_grouped_batchm_v2(
+                    gpu,
+                    v2_w4,
+                    attn_batch,
+                    woa4,
+                    ol_batch,
+                    n as u32,
+                    latent_dim,
+                    group_in,
+                    q_dim,
+                    latent_dim,
+                    o_lora,
+                    stream,
+                )?;
+            } else {
+                ops::w4a16_gemv_grouped_batchm(
+                    gpu,
+                    self.w4a16_gemv_grouped_batchm_k,
+                    attn_batch,
+                    woa4,
+                    ol_batch,
+                    n as u32,
+                    latent_dim,
+                    group_in,
+                    q_dim,
+                    latent_dim,
+                    o_lora,
+                    stream,
+                )?;
+            }
             // wo_b: plain batched GEMV with single-row K order
             // (rows_per_group = N ⇒ every row reads A cols [0..K)).
-            ops::w4a16_gemv_grouped_batchm(
-                gpu,
-                self.w4a16_gemv_grouped_batchm_k,
-                ol_batch,
-                wob4,
-                o_out,
-                n as u32,
-                h,
-                latent_dim,
-                latent_dim,
-                h,
-                h,
-                stream,
-            )?;
+            if v2_w4.0 != 0 && latent_dim.is_multiple_of(32) {
+                ops::w4a16_gemv_grouped_batchm_v2(
+                    gpu,
+                    v2_w4,
+                    ol_batch,
+                    wob4,
+                    o_out,
+                    n as u32,
+                    h,
+                    latent_dim,
+                    latent_dim,
+                    h,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::w4a16_gemv_grouped_batchm(
+                    gpu,
+                    self.w4a16_gemv_grouped_batchm_k,
+                    ol_batch,
+                    wob4,
+                    o_out,
+                    n as u32,
+                    h,
+                    latent_dim,
+                    latent_dim,
+                    h,
+                    h,
+                    stream,
+                )?;
+            }
             mark("C_oproj", &mut t_phase)?;
             return Ok(o_out);
         }

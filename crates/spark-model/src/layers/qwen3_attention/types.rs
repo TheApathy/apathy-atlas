@@ -208,11 +208,20 @@ pub struct Qwen3AttentionLayer {
     /// 0 when absent — verify falls back to the `_ld` kernels (K-order
     /// drift documented at the OPROJ_EXACT comment in multi_seq/mla.rs).
     pub(super) w4a16_gemv_grouped_batchm_k: KernelHandle,
+    /// V2 data-movement rework of `w4a16_gemv_grouped_batchm`
+    /// (ATLAS_VERIFY_GEMV_V2=1, default OFF): compile-time M entries
+    /// [m4, m5, m6, m8], SASS-verified bit-identical per row (same FFMA
+    /// sequence; only load widths / addressing / guards changed). Requires
+    /// K % 32 == 0 — dispatch falls back to the incumbent otherwise.
+    pub(super) w4a16_gemv_grouped_batchm_v2_k: [KernelHandle; 4],
     /// FP8 sibling of the exact batched GEMV (`w8a16_gemv_batchm_exact`,
     /// M<=8, strided): per-row byte-identical to single-row `w8a16_gemv`.
     /// With the w4 exact kernel this makes EVERY verify GEMV projection
     /// single-row-order under ATLAS_VERIFY_EXACT_GEMV=1. 0 on miss.
     pub(super) w8a16_gemv_batchm_exact_k: KernelHandle,
+    /// V2 of `w8a16_gemv_batchm_exact` (ATLAS_VERIFY_GEMV_V2=1): same
+    /// [m4, m5, m6, m8] compile-time-M scheme, same bit-identity proof.
+    pub(super) w8a16_gemv_batchm_exact_v2_k: [KernelHandle; 4],
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_k: KernelHandle,
     pub(super) w8a16_gemv_batch4_ld_k: KernelHandle,

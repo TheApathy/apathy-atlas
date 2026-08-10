@@ -20,6 +20,12 @@
 //!   Also times the wo_b single-launch shape [4096, 8192] as the big-launch
 //!   reference point on the same silicon.
 //!
+//! Gate 6 (ATLAS_VERIFY_GEMV_V2 kernels): the compile-time-M V2 entries
+//! (`w4a16_gemv_grouped_batchm_v2_m{4,5,6,8}` and
+//! `w8a16_gemv_batchm_exact_v2_m{4,5,6,8}`) must be BYTE-IDENTICAL to their
+//! runtime-M incumbents at every width, plus cold-weight (rotated) GB/s at
+//! M=6 for both families — the DSpark γ=5 verify width.
+//!
 //! Usage:
 //!   cargo run --release -p spark-model --example w4a16_gemv_grouped_microtest \
 //!       --features cuda,gpu-examples -- [seed]
@@ -612,6 +618,266 @@ fn main() -> Result<()> {
         bail!("GATE 5 FAIL: w8a16_gemv_batchm_exact != per-row w8a16_gemv (first diff byte {first})");
     }
     println!("  GATE 5 PASS: w8a16_gemv_batchm_exact (M=6) == per-row single-row, bit-identical ({nz8} nonzero)");
+
+    // ── Gate 6: ATLAS_VERIFY_GEMV_V2 kernels — byte-identity vs the
+    //    runtime-M incumbents at n ∈ {4,5,6,8}, then cold-weight GB/s at
+    //    M=6 (the DSpark γ=5 verify width) for both families. The V2
+    //    kernels claim tier-1 bit-identity BY CONSTRUCTION (same per-row
+    //    FP sequence, only load widths / addressing / guards changed);
+    //    this gate is the byte proof. ──
+    let widths: [usize; 4] = [4, 5, 6, 8];
+    // 8-row activation batches (the earlier gates only built 6).
+    let a_w4: Vec<u16> = (0..8 * lda)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
+        .collect();
+    let a_w4_ptr = upload(&gpu, &u16s_to_le(&a_w4))?;
+    let a_w8: Vec<u16> = (0..8 * w8k)
+        .map(|_| f32_to_bf16_bits(rng.uniform(-1.0, 1.0)))
+        .collect();
+    let a_w8_ptr = upload(&gpu, &u16s_to_le(&a_w8))?;
+    let c_inc4 = gpu.alloc(8 * ldc * 2)?;
+    let c_v2_4 = gpu.alloc(8 * ldc * 2)?;
+    let c_inc8 = gpu.alloc(8 * w8n * 2)?;
+    let c_v2_8 = gpu.alloc(8 * w8n * 2)?;
+
+    let launch_w4_inc = |m: usize, c_out: DevicePtr| -> Result<()> {
+        KernelLaunch::new(&gpu, batch_h)
+            .grid([(n_total.div_ceil(4)) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a_w4_ptr)
+            .arg_ptr(packed)
+            .arg_ptr(scale)
+            .arg_f32(scale2)
+            .arg_ptr(c_out)
+            .arg_u32(m as u32)
+            .arg_u32(n_total as u32)
+            .arg_u32(GROUP_IN as u32)
+            .arg_u32(lda as u32)
+            .arg_u32(ldc as u32)
+            .arg_u32(O_LORA as u32)
+            .launch(stream)
+    };
+    let launch_w4_v2 = |h: spark_runtime::gpu::KernelHandle, c_out: DevicePtr| -> Result<()> {
+        KernelLaunch::new(&gpu, h)
+            .grid([(n_total.div_ceil(4)) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a_w4_ptr)
+            .arg_ptr(packed)
+            .arg_ptr(scale)
+            .arg_f32(scale2)
+            .arg_ptr(c_out)
+            .arg_u32(n_total as u32)
+            .arg_u32(GROUP_IN as u32)
+            .arg_u32(lda as u32)
+            .arg_u32(ldc as u32)
+            .arg_u32(O_LORA as u32)
+            .launch(stream)
+    };
+    let launch_w8_inc = |m: usize, c_out: DevicePtr| -> Result<()> {
+        KernelLaunch::new(&gpu, w8x_h)
+            .grid([(w8n.div_ceil(4)) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a_w8_ptr)
+            .arg_ptr(w8_w)
+            .arg_ptr(w8_s)
+            .arg_ptr(c_out)
+            .arg_u32(m as u32)
+            .arg_u32(w8n as u32)
+            .arg_u32(w8k as u32)
+            .arg_u32(w8k as u32)
+            .arg_u32(w8n as u32)
+            .launch(stream)
+    };
+    let launch_w8_v2 = |h: spark_runtime::gpu::KernelHandle, c_out: DevicePtr| -> Result<()> {
+        KernelLaunch::new(&gpu, h)
+            .grid([(w8n.div_ceil(4)) as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a_w8_ptr)
+            .arg_ptr(w8_w)
+            .arg_ptr(w8_s)
+            .arg_ptr(c_out)
+            .arg_u32(w8n as u32)
+            .arg_u32(w8k as u32)
+            .arg_u32(w8k as u32)
+            .arg_u32(w8n as u32)
+            .launch(stream)
+    };
+
+    let mut v2_w4_m6 = spark_runtime::gpu::KernelHandle(0);
+    let mut v2_w8_m6 = spark_runtime::gpu::KernelHandle(0);
+    for &m in &widths {
+        let h4 = gpu.kernel("w4a16_gemv", &format!("w4a16_gemv_grouped_batchm_v2_m{m}"))?;
+        let h8 = gpu.kernel(
+            "w8a16_gemv_batch4",
+            &format!("w8a16_gemv_batchm_exact_v2_m{m}"),
+        )?;
+        if m == 6 {
+            v2_w4_m6 = h4;
+            v2_w8_m6 = h8;
+        }
+        // Poison the outputs so untouched rows cannot fake a match.
+        let poison4 = vec![0xA5u8; 8 * ldc * 2];
+        gpu.copy_h2d(&poison4, c_inc4)?;
+        gpu.copy_h2d(&poison4, c_v2_4)?;
+        let poison8 = vec![0xA5u8; 8 * w8n * 2];
+        gpu.copy_h2d(&poison8, c_inc8)?;
+        gpu.copy_h2d(&poison8, c_v2_8)?;
+
+        launch_w4_inc(m, c_inc4)?;
+        launch_w4_v2(h4, c_v2_4)?;
+        launch_w8_inc(m, c_inc8)?;
+        launch_w8_v2(h8, c_v2_8)?;
+        gpu.synchronize(stream)?;
+
+        let cmp = |a: DevicePtr, b: DevicePtr, bytes: usize, what: &str| -> Result<()> {
+            let mut ra = vec![0u8; bytes];
+            let mut rb = vec![0u8; bytes];
+            gpu.copy_d2h(a, &mut ra)?;
+            gpu.copy_d2h(b, &mut rb)?;
+            if ra != rb {
+                let first = ra.iter().zip(rb.iter()).position(|(x, y)| x != y).unwrap_or(0);
+                bail!("GATE 6 FAIL: {what} v2_m{m} != incumbent (first diff byte {first})");
+            }
+            Ok(())
+        };
+        // Compare only the m live rows (rows m..8 keep poison on both sides,
+        // which must ALSO match: v2 writes exactly m rows, incumbent m rows).
+        cmp(c_inc4, c_v2_4, 8 * ldc * 2, "w4a16_gemv_grouped_batchm")?;
+        cmp(c_inc8, c_v2_8, 8 * w8n * 2, "w8a16_gemv_batchm_exact")?;
+        println!("  GATE 6 PASS: v2_m{m} == incumbent, byte-identical (w4 grouped + w8 exact)");
+    }
+
+    // Cold-weight timing at M=6: rotate weights over >=256 MB so both legs
+    // stream from DRAM (decode reality: 43 cold layers/step).
+    let time_w4 = |v2: bool| -> Result<f64> {
+        for it in 0..8usize {
+            let (p, s) = packs[it % n_inst];
+            let mut l = KernelLaunch::new(&gpu, if v2 { v2_w4_m6 } else { batch_h })
+                .grid([(n_total.div_ceil(4)) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a_w4_ptr)
+                .arg_ptr(p)
+                .arg_ptr(s)
+                .arg_f32(scale2)
+                .arg_ptr(c_v2_4);
+            if !v2 {
+                l = l.arg_u32(6);
+            }
+            l.arg_u32(n_total as u32)
+                .arg_u32(GROUP_IN as u32)
+                .arg_u32(lda as u32)
+                .arg_u32(ldc as u32)
+                .arg_u32(O_LORA as u32)
+                .launch(stream)?;
+        }
+        gpu.synchronize(stream)?;
+        let ev = Events::new();
+        unsafe { cuEventRecord(ev.0, stream) };
+        for it in 0..ITERS as usize {
+            let (p, s) = packs[it % n_inst];
+            let mut l = KernelLaunch::new(&gpu, if v2 { v2_w4_m6 } else { batch_h })
+                .grid([(n_total.div_ceil(4)) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a_w4_ptr)
+                .arg_ptr(p)
+                .arg_ptr(s)
+                .arg_f32(scale2)
+                .arg_ptr(c_v2_4);
+            if !v2 {
+                l = l.arg_u32(6);
+            }
+            l.arg_u32(n_total as u32)
+                .arg_u32(GROUP_IN as u32)
+                .arg_u32(lda as u32)
+                .arg_u32(ldc as u32)
+                .arg_u32(O_LORA as u32)
+                .launch(stream)?;
+        }
+        unsafe { cuEventRecord(ev.1, stream) };
+        gpu.synchronize(stream)?;
+        Ok(ev.elapsed_ms() as f64 / ITERS as f64)
+    };
+    let t_inc_w4 = time_w4(false)?;
+    let t_v2_w4 = time_w4(true)?;
+    println!(
+        "  M=6 w4 grouped_batchm incumbent: {t_inc_w4:.4} ms ({:.1} GB/s)  v2: {t_v2_w4:.4} ms ({:.1} GB/s)  [{:.2}x]",
+        gbs(t_inc_w4),
+        gbs(t_v2_w4),
+        t_inc_w4 / t_v2_w4
+    );
+
+    // w8 rotation set (wq_a-shaped instances).
+    let w8_inst = w8_bytes.len() + w8_scales.len();
+    let n_inst8 = ROTATION_BYTES.div_ceil(w8_inst).max(2);
+    let mut packs8 = Vec::with_capacity(n_inst8);
+    for _ in 0..n_inst8 {
+        let mut wb = vec![0u8; w8n * w8k];
+        for b in wb.iter_mut() {
+            *b = (rng.next_u64() & 0x7F) as u8;
+        }
+        let mut ws = vec![0u8; w8n.div_ceil(128) * w8k.div_ceil(128) * 4];
+        for c in ws.chunks_exact_mut(4) {
+            c.copy_from_slice(&rng.uniform(0.001, 0.02).to_le_bytes());
+        }
+        packs8.push((upload(&gpu, &wb)?, upload(&gpu, &ws)?));
+    }
+    let time_w8 = |v2: bool| -> Result<f64> {
+        for it in 0..8usize {
+            let (p, s) = packs8[it % n_inst8];
+            let mut l = KernelLaunch::new(&gpu, if v2 { v2_w8_m6 } else { w8x_h })
+                .grid([(w8n.div_ceil(4)) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a_w8_ptr)
+                .arg_ptr(p)
+                .arg_ptr(s)
+                .arg_ptr(c_v2_8);
+            if !v2 {
+                l = l.arg_u32(6);
+            }
+            l.arg_u32(w8n as u32)
+                .arg_u32(w8k as u32)
+                .arg_u32(w8k as u32)
+                .arg_u32(w8n as u32)
+                .launch(stream)?;
+        }
+        gpu.synchronize(stream)?;
+        let ev = Events::new();
+        unsafe { cuEventRecord(ev.0, stream) };
+        for it in 0..ITERS as usize {
+            let (p, s) = packs8[it % n_inst8];
+            let mut l = KernelLaunch::new(&gpu, if v2 { v2_w8_m6 } else { w8x_h })
+                .grid([(w8n.div_ceil(4)) as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(a_w8_ptr)
+                .arg_ptr(p)
+                .arg_ptr(s)
+                .arg_ptr(c_v2_8);
+            if !v2 {
+                l = l.arg_u32(6);
+            }
+            l.arg_u32(w8n as u32)
+                .arg_u32(w8k as u32)
+                .arg_u32(w8k as u32)
+                .arg_u32(w8n as u32)
+                .launch(stream)?;
+        }
+        unsafe { cuEventRecord(ev.1, stream) };
+        gpu.synchronize(stream)?;
+        Ok(ev.elapsed_ms() as f64 / ITERS as f64)
+    };
+    let t_inc_w8 = time_w8(false)?;
+    let t_v2_w8 = time_w8(true)?;
+    let w8_weight_bytes = (w8n * w8k + w8n.div_ceil(128) * w8k.div_ceil(128) * 4) as f64;
+    let gbs8 = |t_ms: f64| w8_weight_bytes / (t_ms / 1e3) / 1e9;
+    println!(
+        "  M=6 w8 batchm_exact incumbent:   {t_inc_w8:.4} ms ({:.1} GB/s)  v2: {t_v2_w8:.4} ms ({:.1} GB/s)  [{:.2}x]",
+        gbs8(t_inc_w8),
+        gbs8(t_v2_w8),
+        t_inc_w8 / t_v2_w8
+    );
+    if t_v2_w4 > t_inc_w4 * 1.02 || t_v2_w8 > t_inc_w8 * 1.02 {
+        bail!("GATE 6 FAIL: a V2 kernel is slower than its incumbent at M=6");
+    }
 
     println!("PASS");
     Ok(())
