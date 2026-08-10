@@ -34,9 +34,17 @@ const PASS_COS: f64 = 0.99999;
 const MCG_MULT: u32 = 0xCBAC_1FED;
 
 /// (label, N, K) — the expert matrix decode shapes from EXPERT-3BPW-PLAN §3.
+///
+/// The N=128 shape is a DRAM-pattern DIAGNOSTIC, not a production shape: at
+/// N=128 there is one tile-strip, so each CTA's trellis stream is perfectly
+/// contiguous (row stride == strip width == 768 B). The production shapes
+/// read 768-B islands with an N/16*96-B jump between them; if the ~156 GB/s
+/// plateau is island-pattern inefficiency, this shape clears it with the
+/// SAME kernel. K=32768 keeps the payload comparable (1.57 MB).
 const SHAPES: &[(&str, usize, usize)] = &[
     ("w1/w3 N=2048 K=4096", 2048, 4096),
     ("w2    N=4096 K=2048", 4096, 2048),
+    ("diag  N=128  K=32768", 128, 32768),
 ];
 
 // ---------------------------------------------------------------------------
@@ -373,8 +381,12 @@ fn main() -> Result<()> {
 
         // ---- GATE 2: GEMV cosine, SPLIT_K = 1 and production split ----
         let strips = n / 128;
+        // Contract: the kernel's s_x staging holds at most 4096 K per block
+        // K-slice (EXL3_MAX_XCHUNKS) — splits below K/4096 are illegal.
+        let min_split = k.div_ceil(4096).max(1) as u32;
         let prod_split = (48usize.div_ceil(strips)).clamp(1, max_split) as u32;
-        for split in [1u32, prod_split] {
+        let prod_split = prod_split.max(min_split);
+        for split in [min_split, prod_split] {
             launch_gemv(
                 g, kh_gemv, stream, split, d_a, d_trellis, d_suh, d_svh, d_c, d_ws, d_cnt, n, k,
             )?;
@@ -463,7 +475,7 @@ fn main() -> Result<()> {
             }
             Ok(ms as f64 / iters as f64)
         };
-        for split in 1u32..=(max_split as u32) {
+        for split in min_split..=(max_split as u32).max(min_split) {
             let ms = time_split(split)?;
             let gbs = payload_bytes as f64 / (ms * 1e-3) / 1e9;
             eprintln!(
