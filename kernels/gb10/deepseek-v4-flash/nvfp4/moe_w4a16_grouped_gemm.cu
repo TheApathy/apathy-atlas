@@ -27,6 +27,23 @@
 #define BP_PAD 16
 #define GROUP_SIZE 16
 
+// ── Packed bf16x2 epilogue store (K64 prefill kernels) ────────────────────
+// Default ON. Fuses the two adjacent 2-byte bf16 result stores of each MMA
+// accumulator pair into one 4-byte __nv_bfloat162 store, halving the 8192
+// epilogue stores per CTA. BIT-IDENTICAL: the float→bf16 conversion is NOT
+// changed — each accumulator still goes through the very same
+// __float2bfloat16() call, and only the two resulting bf16 words are packed
+// with __halves2bfloat162(). We deliberately do NOT use
+// __floats2bfloat162_rn() (which would emit cvt.rn.bf16x2.f32 in place of two
+// cvt.rn.bf16.f32) so that no rounding question can arise at all.
+// Revert without touching source:
+//   ATLAS_EXTRA_NVCC_FLAGS="-DATLAS_MOE_NO_PACKED_EPILOGUE"
+#ifdef ATLAS_MOE_NO_PACKED_EPILOGUE
+#define ATLAS_MOE_PACKED_EPILOGUE 0
+#else
+#define ATLAS_MOE_PACKED_EPILOGUE 1
+#endif
+
 __device__ __constant__ float E2M1_LUT_MOE[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -715,6 +732,25 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
     #undef K64_DEQUANT
     #undef K64_COMPUTE_MMA
 
+    // PACKED EPILOGUE (bit-identical — see ATLAS_MOE_PACKED_EPILOGUE at top).
+    // acc[nt][0]/acc[nt][1] (and [2]/[3]) land in COLUMNS c0, c0+1 of the SAME
+    // row, i.e. adjacent __nv_bfloat16 elements, so the pair is one 4-byte
+    // store. Alignment proof for &C[r*N + c0]:
+    //   * c0 = cta_n + nt*8 + tid*2 — cta_n = blockIdx.x*N_TILE_LG (128), and
+    //     nt*8 / tid*2 are even, so c0 is ALWAYS even;
+    //   * r*N is even iff N is even — r is data-dependent, so N's parity is a
+    //     real precondition (the "cta_n is a multiple of 128" argument alone is
+    //     NOT sufficient). Guarded at runtime by (N & 1) == 0.
+    //   * C's own base must be 4-byte aligned; device allocations are, but we
+    //     assert it in the guard rather than assume it.
+    // Both are warp-uniform, so `pack_ok` costs one predicate, not a divergence.
+    // The packed path is taken only when BOTH columns are in range (c1 < N
+    // implies c0 < N); otherwise the original scalar pair runs unchanged.
+#if ATLAS_MOE_PACKED_EPILOGUE
+    const bool pack_ok = ((N & 1u) == 0u) && ((((unsigned long long)C) & 3ull) == 0ull);
+#else
+    const bool pack_ok = false;
+#endif
     #pragma unroll
     for (int nt = 0; nt < 16; nt++) {
         unsigned int c0 = cta_n + nt*8 + tid*2;
@@ -723,10 +759,17 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
         unsigned int r1 = r0 + 8;
         bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
         bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
-        if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
-        if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
-        if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
-        if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        if (pack_ok && c1 < N) {
+            if (r0v) *(__nv_bfloat162*)&C[r0*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][0]), __float2bfloat16(acc[nt][1]));
+            if (r1v) *(__nv_bfloat162*)&C[r1*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][2]), __float2bfloat16(acc[nt][3]));
+        } else {
+            if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
+            if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
+            if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
+            if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        }
     }
 }
 
@@ -973,6 +1016,16 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
     #undef FGU64_DEQUANT
     #undef FGU64_COMPUTE_MMA
 
+    // PACKED EPILOGUE (bit-identical — see ATLAS_MOE_PACKED_EPILOGUE at top).
+    // Same argument as the down GEMM epilogue above. One extra wrinkle here:
+    // for the up half `cta_n = global_n - N`, so cta_n stays even only because
+    // N is even — which is exactly the condition `pack_ok` already tests, so a
+    // single guard covers both the c0 parity and the r*N parity.
+#if ATLAS_MOE_PACKED_EPILOGUE
+    const bool pack_ok = ((N & 1u) == 0u) && ((((unsigned long long)C) & 3ull) == 0ull);
+#else
+    const bool pack_ok = false;
+#endif
     #pragma unroll
     for (int nt = 0; nt < 16; nt++) {
         unsigned int c0 = cta_n + nt*8 + tid*2;
@@ -981,10 +1034,17 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
         unsigned int r1 = r0 + 8;
         bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
         bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
-        if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
-        if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
-        if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
-        if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        if (pack_ok && c1 < N) {
+            if (r0v) *(__nv_bfloat162*)&C[r0*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][0]), __float2bfloat16(acc[nt][1]));
+            if (r1v) *(__nv_bfloat162*)&C[r1*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][2]), __float2bfloat16(acc[nt][3]));
+        } else {
+            if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
+            if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
+            if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
+            if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        }
     }
 }
 
