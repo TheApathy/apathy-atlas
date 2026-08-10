@@ -112,3 +112,27 @@ Prefill next: TC round 2 (KT=32/cp.async/occupancy), wq_b w8a16_gemm_pipelined
   on acceptance (3.0→3.3 via head-gate + attention exactness) and propose
   lm_head NVFP4 (2.7→~1.4 ms, drafter-only numerics = acceptance-gated)
   as the nearer levers.
+
+## Prefill waterfall CLOSED — 2026-08-10, N=2410, TTFT ~5.0 s
+
+Every millisecond attributed (hprof layer-glue probes + bucket 6):
+
+```
+FP8-GEMM class (w8a16_gemm_pipelined @ ~12 TFLOPS):
+    q_latent_expand 661 + kv_proj 306 + o_proj ~580     ≈ 1.55 s  ← TOP PRIZE
+MoE block (149-183 GB/s vs 229)                          ≈ 1.36 s
+TC attention (incl. derotate + 2 dense-layer full attn)  ≈ 1.03 s
+CSA compressor (post-TC-GEMM fix)                        ≈ 0.51 s
+hc glue (hc_pre sinkhorn + hc_post + norms)              ≈ 0.51 s
+small buckets                                            ≈ 0.09 s
+host/tokenizer/first-decode                              ≈ 0.05 s
+```
+
+Consequence: the single biggest prefill lever is now the FP8 GEMM class —
+w8a16_gemm_pipelined is a TUNED kernel at its design point (~12 TFLOPS,
+occupancy-swept, TMA corrupts on sm121 per its header). A 3x needs
+FP8-native MMA (m16n8k32) or NVFP4-weight GEMM — a full kernel campaign,
+prize ~1 s. Then: MoE bandwidth pass (~0.4 s), TC attention round 2
+(~0.4 s), csa_compress kernel (~0.25 s), hc glue fusion (~0.25 s).
+Sum of prizes ≈ 2.3-2.6 s → TTFT ~2.4-2.7 s ≈ 900-1000 @ 2410; >1000 at
+3900 with length amortization.

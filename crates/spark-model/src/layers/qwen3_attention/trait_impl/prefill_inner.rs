@@ -500,6 +500,34 @@ impl Qwen3AttentionLayer {
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
         let diag_this = diag_all; // probing is opt-in (ATLAS_DIAG_V4_ALL_LAYERS=1): each probe syncs + reads D2H, real tok/s + TTFT cost
 
+        // Layer-glue attribution (the ~800 ms/pass the bucket waterfall could
+        // not name): hc_expand/hc_pre/hc_post + norms between the attention
+        // and FFN blocks. `xw_*` labels WRAP the internally-bucketed blocks
+        // (wrapper − interior = launch/host gap); `hc*` labels are new ground.
+        let mut _hprof_t = if ctx.profile {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        #[allow(unused_macros)]
+        macro_rules! hprof {
+            ($label:expr) => {
+                if ctx.profile {
+                    ctx.gpu.synchronize(stream)?;
+                    if let Some(t) = _hprof_t {
+                        tracing::info!(
+                            "  HC prefill [{}] N={}: {}µs",
+                            $label,
+                            n,
+                            t.elapsed().as_micros()
+                        );
+                    }
+                    _hprof_t = Some(std::time::Instant::now());
+                }
+            };
+        }
+
         if is_first_layer {
             ops::hc_expand(
                 ctx.gpu,
@@ -568,6 +596,7 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        hprof!("hc0_pre_attn");
 
         if batched_meta.is_some() && seq_len_start == 0 {
             anyhow::bail!(
@@ -647,6 +676,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        hprof!("xw_attn_block");
 
         if self.ffn.is_none() {
             ops::hc_post(
@@ -770,6 +800,7 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        hprof!("hc1_mid");
 
         self.ffn
             .forward_prefill(normed2, num_tokens, ctx, stream)
@@ -791,6 +822,7 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
+        hprof!("xw_ffn_block");
         ops::hc_post(
             ctx.gpu,
             self.hc_post_k,
@@ -804,6 +836,7 @@ impl Qwen3AttentionLayer {
             hc_mult,
             stream,
         )?;
+        hprof!("hc2_post_ffn");
         if diag_this {
             super::diag_norm(
                 ctx.gpu,

@@ -946,6 +946,7 @@ impl Qwen3AttentionLayer {
         ctx.gpu
             .synchronize(stream)
             .map_err(|e| anyhow::anyhow!("V4 attn: wo_b gemm sync failed: {e}"))?;
+        aprof!("6_o_proj");
         if diag_this {
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
