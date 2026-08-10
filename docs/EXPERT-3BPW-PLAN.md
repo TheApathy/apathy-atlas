@@ -274,3 +274,54 @@ of S6: 24.1 GB freed (§3) for KV/context.
    for anything beyond local kernel validation.
 5. **Spec-decode interaction** — the verify chain's exact-GEMV twin (§4.7)
    is mandatory scope of S6, not optional.
+
+---
+
+## Bring-up result (2026-08-10, measured on hardware)
+
+**The EXL3 stack serves and is correct.** First end-to-end run of the
+reference checkpoint (`/home/flocka/sparkinfer-ref/data/tp1`, 216 experts,
+3.0 bpw) on Atlas produced clean prose at temp 0 (a correct Rayleigh-
+scattering explanation, no degradation), with loader, bit-exact dequant,
+Hadamard rotations and the device-indexed GEMV all exercised on real trellis
+weights rather than the synthetic oracle.
+
+**It is also slower than the MXFP4 path it replaces**, and the reason is
+dispatch, not bandwidth:
+
+| | MXFP4 (144 experts) | EXL3 (216 experts) |
+|---|---:|---:|
+| per-token expert bytes (top-6) | 3.45 GB | **2.43 GB** (−29%) |
+| resident expert bytes (all) | 82.8 GB | **87.7 GB** (worse) |
+| launches/layer | ~3 (fused) | **~21** (3·top_k+3) |
+| plain decode | ~22.0 tok/s | **21.2** |
+
+Two corrections to earlier planning in this document:
+
+1. **Loading the reference checkpoint frees no memory.** 216 experts at
+   3.0 bpw is *more* resident than 144 at MXFP4's 4.25. Only per-token bytes
+   fall, because top-6 stream regardless of pool size. The −24 GB residency
+   win (which is what would let cuBLASLt prefill and the DSpark drafter
+   coexist on one 128 GB box) requires quantizing OUR 144-expert master:
+   82.8 → 58.4 GB. That remains future work and is NOT on the path to 28
+   plain.
+2. **The byte cut cannot pay until the dispatch is fused.** ~900 launches
+   per token against the fused path's ~130 reintroduces exactly the GPU
+   under-fill that the wide-verify work exists to remove. Fused gate_up /
+   down riders (all top_k slots per launch, expert id resolved per-CTA from
+   the routing buffer on device) are the prerequisite for any EXL3 decode
+   win, ahead of further GEMV bandwidth tuning.
+
+### Revised plain-decode ladder (no new quantization required)
+
+Decode step is 45.3 ms, of which only ~32 ms is byte movement:
+
+| lever | −ms | nature |
+|---|---:|---|
+| EXL3 experts, dispatch fused | −2.1 | prerequisite above |
+| EXL3 GEMV 166 → 200+ GB/s | −2.4 | kernel; rounds 2-3 got 156→168, barrier cadence named next |
+| the ~13 ms non-byte residue → ~8 | −5.0 | HC fusion, remaining glue, fewer graph nodes |
+| **total** | **−9.5** | **45.3 → 35.8 ms = 28.0 tok/s** |
+
+The MLA chain (232 GB/s) and lm_head (230) are already at the DRAM ceiling;
+NVFP4 lm_head is a recorded quality NO-GO. Everything above is engineering.
