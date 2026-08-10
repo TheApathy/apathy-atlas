@@ -127,16 +127,21 @@ pub(crate) fn auto_detect_weight_prefix(
     }
 }
 
+/// Everything the factory needs about the drafter checkpoint: its on-device
+/// store, its parsed DFlash config (`None` = DSpark), and — for a DSpark
+/// drafter under `ATLAS_DSPARK_REF_DRAFT=1` — the compact-draft routed-expert
+/// subset resolved from the checkpoint's own REAP provenance map.
+pub(crate) type DrafterState = (
+    spark_runtime::weights::WeightStore,
+    Option<spark_model::weight_loader::DflashConfig>,
+    Option<spark_model::weight_loader::deepseek_v4::dspark_reap::DraftExpertSubset>,
+);
+
 pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
     gpu: &dyn spark_runtime::gpu::GpuBackend,
-) -> Result<
-    Option<(
-        spark_runtime::weights::WeightStore,
-        Option<spark_model::weight_loader::DflashConfig>,
-    )>,
-> {
+) -> Result<Option<DrafterState>> {
     use spark_runtime::weights::WeightLoader;
     if !args.dflash {
         return Ok(None);
@@ -171,21 +176,38 @@ pub(crate) fn load_dflash_drafter(
                     drafter_dir.display()
                 )
             })?;
-        Some(spark_model::weight_loader::dflash_loader::parse_dflash_config(
-            &drafter_config_json,
-        )?)
+        Some(spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?)
     };
+    // Compact DSpark draft (ATLAS_DSPARK_REF_DRAFT=1, default off): resolve
+    // WHICH routed experts the draft keeps before loading, so the other ~70%
+    // of the drafter's expert bytes are never read off disk or allocated.
+    // Resolved here because this is where the drafter DIRECTORY is known — the
+    // REAP provenance map sits next to the shards.
+    let dspark_subset = if is_dspark {
+        spark_model::weight_loader::deepseek_v4::dspark::resolve_ref_draft_subset(&drafter_dir)?
+    } else {
+        None
+    };
+
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
+    if let Some(ref subset) = dspark_subset {
+        loader.extra_skip =
+            Some(spark_model::weight_loader::deepseek_v4::dspark::compact_draft_skip_fn(subset));
+    }
     let drafter_store = loader
         .load(&drafter_dir, gpu, 0)
         .context("Failed to load DFlash drafter weights")?;
     tracing::info!(
-        "DFlash drafter store: {} tensors, {} bytes",
+        "DFlash drafter store: {} tensors, {} bytes{}",
         drafter_store.len(),
-        drafter_store.total_bytes()
+        drafter_store.total_bytes(),
+        match dspark_subset {
+            Some(ref s) => format!(" (compact draft: {} routed experts)", s.len()),
+            None => String::new(),
+        }
     );
-    Ok(Some((drafter_store, drafter_config)))
+    Ok(Some((drafter_store, drafter_config, dspark_subset)))
 }
 
 /// Startup-loaded LoRA adapter: its own WeightStore + parsed PEFT config.

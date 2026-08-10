@@ -125,12 +125,21 @@ fn main() -> Result<()> {
     // ── drafter + shared embed/head ──
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
+    // ATLAS_DSPARK_REF_DRAFT=1 makes this probe the offline oracle for the
+    // compact draft: same captures, same replay, 64 routed experts instead of
+    // the checkpoint's full set — so the acceptance delta is attributable to
+    // the expert subset alone.
+    let subset = dspark::resolve_ref_draft_subset(std::path::Path::new(DRAFTER_DIR))?;
+    if let Some(ref s) = subset {
+        loader.extra_skip = Some(dspark::compact_draft_skip_fn(s));
+    }
     let store = loader.load(std::path::Path::new(DRAFTER_DIR), gpu, 0)?;
     let module = dspark::load_dspark_drafter(
         &store,
         &target_config,
         dspark::DsparkParams::V4_FLASH_0731(),
         gpu,
+        subset.as_ref(),
     )?;
     let block = module.params.block_size;
     let embed = spark_model::weight_map::DenseWeight {

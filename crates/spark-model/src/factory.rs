@@ -36,6 +36,12 @@ pub struct DflashBuildArgs<'a> {
     pub drafter_config: Option<DflashConfig>,
     pub gamma: Option<usize>,
     pub window_size: Option<usize>,
+    /// DSpark only (`drafter_config: None`): the compact-draft routed-expert
+    /// subset under `ATLAS_DSPARK_REF_DRAFT=1`, resolved by the server from
+    /// the drafter dir's `REAP_K216_PLAN.json`. `None` = serve every routed
+    /// expert the drafter shards carry (the default).
+    pub dspark_expert_subset:
+        Option<crate::weight_loader::deepseek_v4::dspark_reap::DraftExpertSubset>,
 }
 
 /// LoRA adapter build arguments (`--lora-adapter NAME=PATH`). `None` for

@@ -105,6 +105,12 @@ pub struct DsparkStage {
 /// proposer-build time (they are not present in the drafter shards).
 pub struct DsparkDrafterModule {
     pub stages: Vec<DsparkStage>,
+    /// Routed experts each stage's MoE actually holds. Equals the checkpoint's
+    /// drafter gate rows normally, or the compact-draft subset size under
+    /// `ATLAS_DSPARK_REF_DRAFT=1`. The proposer must be configured from THIS,
+    /// never from a literal — routing with the wrong expert count reads past
+    /// the pointer tables.
+    pub num_experts: usize,
     /// `[h, target_layers·h]` — fuses the concatenated target captures.
     pub main_proj: DenseWeight,
     /// RMSNorm over the fused vector.
@@ -129,6 +135,93 @@ pub fn store_is_dspark(store: &WeightStore) -> bool {
     store.contains("mtp.0.main_proj.weight")
 }
 
+/// Env gate for the reference stack's **compact draft** (default OFF).
+///
+/// The checkpoint ships the drafter with the target's full routed-expert set
+/// (216 on the REAP reference, 8.07 GiB of expert bytes). The reference
+/// SparkInfer recipe serves a 64-expert subset instead, chosen by
+/// [`super::dspark_reap`]. `ATLAS_DSPARK_REF_DRAFT=1` reproduces that subset at
+/// load time — no second checkpoint on disk — with the count overridable via
+/// `ATLAS_DSPARK_DRAFT_EXPERTS` / `ATLAS_DSPARK_STRUCTURED_PER_CATEGORY`
+/// (their `DSPARK_DRAFT_EXPERTS` / `DSPARK_STRUCTURED_EXPERTS_PER_CATEGORY`).
+pub fn ref_draft_enabled() -> bool {
+    matches!(
+        std::env::var("ATLAS_DSPARK_REF_DRAFT").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn env_usize(key: &str, default: usize) -> Result<usize> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(v) => v
+            .trim()
+            .parse()
+            .with_context(|| format!("{key}={v:?} is not a non-negative integer")),
+    }
+}
+
+/// Resolve the compact-draft expert subset, or `None` when the gate is off.
+///
+/// `plan_dir` is the directory holding the drafter's `REAP_K216_PLAN.json` —
+/// the checkpoint dir the drafter shards came from. The plan is REQUIRED when
+/// the gate is on: guessing a subset (e.g. "the first 64") would load real
+/// weights under wrong ids and silently draft garbage, so a missing plan is a
+/// hard error rather than a fallback.
+pub fn resolve_ref_draft_subset(
+    plan_dir: &std::path::Path,
+) -> Result<Option<super::dspark_reap::DraftExpertSubset>> {
+    use super::dspark_reap as reap;
+    if !ref_draft_enabled() {
+        return Ok(None);
+    }
+    let experts = env_usize("ATLAS_DSPARK_DRAFT_EXPERTS", reap::DEFAULT_DRAFT_EXPERTS)?;
+    let per_cat = env_usize(
+        "ATLAS_DSPARK_STRUCTURED_PER_CATEGORY",
+        reap::DEFAULT_STRUCTURED_PER_CATEGORY,
+    )?;
+    let plan_path = plan_dir.join(reap::REAP_PLAN_FILE);
+    let body = std::fs::read_to_string(&plan_path).with_context(|| {
+        format!(
+            "ATLAS_DSPARK_REF_DRAFT=1 needs the REAP provenance map at {} — it records which \
+             checkpoint experts the compact draft keeps. Unset the flag to serve the full \
+             drafter instead.",
+            plan_path.display()
+        )
+    })?;
+    let subset = reap::select_draft_experts(&body, experts, per_cat)?;
+    tracing::info!(
+        "DSpark compact draft: {} of the checkpoint's routed experts ({} from the structured \
+         categories {:?}, {} from the global REAP ranking); plan {}",
+        subset.len(),
+        subset.structured_count,
+        reap::STRUCTURED_CATEGORIES,
+        subset.len() - subset.structured_count,
+        plan_path.display(),
+    );
+    Ok(Some(subset))
+}
+
+/// The `SafetensorsLoader::extra_skip` predicate for a compact draft: drop
+/// every routed-expert tensor outside the subset so its bytes are never read
+/// off disk, counted in the OOM pre-flight, or allocated on device.
+///
+/// Deliberately keyed on the expert index alone. The shared expert, the
+/// router, attention, the mHC sites and the DSpark heads carry no `experts.N.`
+/// segment and are always loaded; the router's surplus rows are sliced later,
+/// at assemble time, because the subset must index the FULL gate to do so.
+pub fn compact_draft_skip_fn(
+    subset: &super::dspark_reap::DraftExpertSubset,
+) -> spark_runtime::weights::TensorSkipFn {
+    let keep: std::collections::HashSet<usize> = subset.checkpoint_ids.iter().copied().collect();
+    std::sync::Arc::new(
+        move |name: &str| match spark_runtime::weights::parse_expert_index(name) {
+            Some(idx) => !keep.contains(&idx),
+            None => false,
+        },
+    )
+}
+
 /// Loads the DSpark drafter from its own store (the 0731 drafter shards).
 ///
 /// `target_config` is the TARGET model's config; the drafter differs only in
@@ -136,11 +229,17 @@ pub fn store_is_dspark(store: &WeightStore) -> bool {
 /// target is REAP-pruned), which is read from the gate shape rather than
 /// trusted from config. Everything else — h, heads, lora ranks, hc_mult,
 /// rope — is validated V4-Flash geometry shared with the target.
+///
+/// `subset` (from [`resolve_ref_draft_subset`]) serves a compact draft: the
+/// stages load only those checkpoint experts and renumber them densely, which
+/// is the entire architectural difference between this drafter and the
+/// reference stack's 64-expert one.
 pub fn load_dspark_drafter(
     store: &WeightStore,
     target_config: &ModelConfig,
     params: DsparkParams,
     gpu: &dyn GpuBackend,
+    subset: Option<&super::dspark_reap::DraftExpertSubset>,
 ) -> Result<DsparkDrafterModule> {
     if !store_is_dspark(store) {
         bail!("drafter store has no mtp.0.main_proj.weight — not a DSpark checkpoint");
@@ -153,13 +252,29 @@ pub fn load_dspark_drafter(
     let gate = store
         .get("mtp.0.ffn.gate.weight")
         .context("DSpark drafter store is missing mtp.0.ffn.gate.weight")?;
-    let drafter_experts = gate.shape.first().copied().unwrap_or(0);
-    if drafter_experts == 0 || h == 0 {
+    let checkpoint_experts = gate.shape.first().copied().unwrap_or(0);
+    if checkpoint_experts == 0 || h == 0 {
         bail!(
             "DSpark gate shape {:?} / hidden {h} — refusing to load",
             gate.shape
         );
     }
+    let expert_ids: Option<&[usize]> = subset.map(|s| s.checkpoint_ids.as_slice());
+    if let Some(s) = subset {
+        // The subset's ids are POSITIONS in the plan's kept set, so the plan
+        // must describe exactly these shards. A bounds check is not enough:
+        // every reference id is < 216 and so would also "fit" the unpruned
+        // 256-expert 0731 drafter while naming completely different experts.
+        anyhow::ensure!(
+            s.source_experts == checkpoint_experts,
+            "compact DSpark draft: the REAP plan describes a {}-expert drafter but these \
+             shards carry {checkpoint_experts} — the plan belongs to a different checkpoint, \
+             and its expert ids would name the wrong weights. Point --draft-model at the \
+             checkpoint the plan came from, or unset ATLAS_DSPARK_REF_DRAFT.",
+            s.source_experts
+        );
+    }
+    let drafter_experts = expert_ids.map_or(checkpoint_experts, |ids| ids.len());
     let mut config = target_config.clone();
     config.num_experts = drafter_experts;
 
@@ -184,7 +299,7 @@ pub fn load_dspark_drafter(
 
         // `layer_idx = num_hidden_layers` ⇒ past every hash-routed layer, so
         // the MoE takes the learned-gate path (the drafter has no tid2eid).
-        let mut moe = super::assemble::assemble_moe(
+        let mut moe = super::assemble::assemble_moe_subset(
             store,
             &prefix,
             config.num_hidden_layers,
@@ -192,6 +307,7 @@ pub fn load_dspark_drafter(
             &config,
             gpu,
             qctx,
+            expert_ids,
         )
         .with_context(|| format!("assembling DSpark stage {s} MoE"))?;
         // IN-PLACE unified transpose: the drafter's expert bytes are slices
@@ -274,9 +390,14 @@ pub fn load_dspark_drafter(
     )?;
 
     tracing::info!(
-        "DSpark drafter loaded: {n_stages} V4 stages ({drafter_experts}-expert MoE) + \
+        "DSpark drafter loaded: {n_stages} V4 stages ({drafter_experts}-expert MoE{}) + \
          main_proj [{h}, {}] + Markov(rank {}) + confidence head; block_size={} \
          window={} target_layers={:?}",
+        if expert_ids.is_some() {
+            format!(", compact draft subset of {checkpoint_experts}")
+        } else {
+            String::new()
+        },
         params.target_layer_ids.len() * h,
         params.markov_rank,
         params.block_size,
@@ -286,6 +407,7 @@ pub fn load_dspark_drafter(
 
     Ok(DsparkDrafterModule {
         stages,
+        num_experts: drafter_experts,
         main_proj,
         main_norm,
         norm,

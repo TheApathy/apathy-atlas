@@ -656,7 +656,14 @@ pub fn build_model(
                 model.config_ref(),
                 crate::weight_loader::deepseek_v4::dspark::DsparkParams::V4_FLASH_0731(),
                 model.gpu_backend(),
+                args.dspark_expert_subset.as_ref(),
             )?;
+            // Expert count MUST come from what the loader actually built (gate
+            // shape, or the compact-draft subset size) — never a literal. The
+            // 0731 shards carry 256, the REAP reference checkpoint 216, and a
+            // compact draft 64; a stale constant here routes the drafter's MoE
+            // against the wrong expert table.
+            let drafter_num_experts = module.num_experts;
             let mut head = crate::layers::dspark_head::DsparkDraftHead::new(
                 module,
                 model.config_ref(),
@@ -667,7 +674,7 @@ pub fn build_model(
                     weight: target_lm_head_for_dflash,
                 }),
                 target_lm_head_fp8_for_dflash,
-                256,
+                drafter_num_experts,
                 max_seq_len,
                 model.gpu_backend(),
             )?;

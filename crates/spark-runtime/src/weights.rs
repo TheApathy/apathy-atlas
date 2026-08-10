@@ -238,7 +238,20 @@ pub struct SafetensorsLoader {
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
     pub peak_memory_multiplier: Option<f64>,
+    /// Extra "don't load this tensor" predicate, ORed with the EP rule.
+    ///
+    /// Unlike EP sharding this is unconditional — it applies at
+    /// `ep_world_size == 1` and to `mtp.*` — because its user is the compact
+    /// DSpark draft, which loads a 64-expert subset of the drafter's `mtp.*`
+    /// experts and must never allocate the other 152. Skipped tensors are
+    /// excluded from the pre-flight OOM estimate too, since the same predicate
+    /// feeds `estimate_load_bytes`.
+    pub extra_skip: Option<TensorSkipFn>,
 }
+
+/// A "don't load this tensor" predicate, shareable across the loader's
+/// pre-flight estimate and its per-shard passes.
+pub type TensorSkipFn = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl Default for SafetensorsLoader {
     fn default() -> Self {
@@ -254,6 +267,7 @@ impl SafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             peak_memory_multiplier: None,
+            extra_skip: None,
         }
     }
 
@@ -264,13 +278,20 @@ impl SafetensorsLoader {
             ep_world_size,
             num_experts,
             peak_memory_multiplier: None,
+            extra_skip: None,
         }
     }
 
-    /// Check if a tensor should be skipped under EP.
-    /// Skips `*.experts.{E}.*` tensors where E is not in local range.
-    /// MTP head experts are never skipped (small, fully replicated).
+    /// Check if a tensor should be skipped under EP or the [`Self::extra_skip`]
+    /// predicate. Skips `*.experts.{E}.*` tensors where E is not in local
+    /// range. MTP head experts are never skipped by the EP rule (small, fully
+    /// replicated) — only `extra_skip` can drop them.
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if let Some(ref extra) = self.extra_skip
+            && extra(name)
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }

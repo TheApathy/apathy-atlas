@@ -386,7 +386,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let dflash_args =
         dflash_drafter_state
             .as_ref()
-            .map(|(s, c)| spark_model::factory::DflashBuildArgs {
+            .map(|(s, c, subset)| spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
                 drafter_config: c.clone(),
                 gamma: Some(args.dflash_gamma),
@@ -395,6 +395,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
                 } else {
                     None
                 },
+                dspark_expert_subset: subset.clone(),
             });
     // NLLB / M2M-100: resolve the translation language pair to token ids from
     // the checkpoint tokenizer (the ChatTokenizer isn't built until after the
@@ -712,11 +713,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             unsafe {
                 let mut set: libc::cpu_set_t = std::mem::zeroed();
                 libc::CPU_SET(core, &mut set);
-                let rc = libc::sched_setaffinity(
-                    0,
-                    std::mem::size_of::<libc::cpu_set_t>(),
-                    &set,
-                );
+                let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
                 if rc == 0 {
                     tracing::info!("scheduler thread pinned to core {core}");
                 } else {
