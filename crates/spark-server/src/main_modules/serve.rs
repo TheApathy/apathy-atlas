@@ -1149,6 +1149,13 @@ fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bool {
         // The NVFP4-labeled bundle today carries native FP8 paths
         // (FP8 fused MoE batch1/2/3, w8a16_gemv decode, FP8 prefill).
         ("nvfp4", "fp8") |
+        // EXL3 trellis experts (the reference tp1 checkpoint): the bundle
+        // carries exl3_gemv_m1/_idx + the P1 prefill kernels (all under
+        // kernels/gb10/common, compiled into every target), and the
+        // non-expert tensors are FP8/BF16, covered by the pairs above.
+        // The loader hard-fails on any EXL3 tensor it cannot route, so
+        // this pair cannot silently enter a garbage path.
+        ("nvfp4", "exl3") |
         // The NVFP4 bundle also handles unquantized BF16 inputs via
         // runtime dequant → quantize. Slow but correct.
         ("nvfp4", "bf16") |

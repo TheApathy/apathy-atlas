@@ -79,7 +79,10 @@ fn check_quant_method(config: &ModelConfig) -> Result<()> {
     if qc.quant_method.is_empty() {
         return Ok(());
     }
-    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8"];
+    // "exl3": EXL3 trellis routed experts (the reference tp1 checkpoint) —
+    // loader support in `weight_map/exl3.rs`; non-expert tensors are plain
+    // FP8/BF16 under `base_quantization_config`.
+    const KNOWN_METHODS: &[&str] = &["compressed-tensors", "modelopt", "fp8", "exl3"];
     if !KNOWN_METHODS.contains(&qc.quant_method.as_str()) {
         bail!(
             "Pre-flight: checkpoint declares quant_method={:?} which Atlas doesn't \

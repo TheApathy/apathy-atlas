@@ -122,9 +122,15 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
         let (dtype, from_f16) = match dtype_str {
             "F32" => (WeightDtype::FP32, false),
             "BF16" => (WeightDtype::BF16, false),
-            // F16 is not store-legal (WeightDtype is closed to store dtypes):
-            // stage as BF16 and mark for byte conversion in the copy loop.
-            // centml modelopt W4A4 exports ship all unquantized tensors as F16.
+            // F16 normally stages as BF16 with byte conversion in the copy
+            // loop (centml modelopt W4A4 exports ship unquantized tensors as
+            // F16) — EXCEPT the EXL3 sign/Hadamard vectors (`.rank0.suh` /
+            // `.rank0.svh`), which the exl3_gemv kernels read as `__half*`;
+            // converting those truncates mantissa bits 8-10. Mirrors the same
+            // exemption in weights.rs (the slow loader).
+            "F16" if name.ends_with(".suh") || name.ends_with(".svh") => {
+                (WeightDtype::F16, false)
+            }
             "F16" => (WeightDtype::BF16, true),
             "U8" => (WeightDtype::UInt8, false),
             // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP
@@ -136,6 +142,10 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             "F8_E4M3" => (WeightDtype::FP8E4M3, false),
             "F8_E8M0" => (WeightDtype::FP8E8M0, false),
             "I64" => (WeightDtype::Int64, false),
+            // EXL3 trellis payloads ([K/16, N/16, 48] I16) and the mcg
+            // codebook scalar (I32) — raw device bytes, no conversion.
+            "I16" => (WeightDtype::Int16, false),
+            "I32" => (WeightDtype::Int32, false),
             other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
         };
         let shape: Vec<usize> = info["shape"]

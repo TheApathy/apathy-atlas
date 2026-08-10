@@ -21,6 +21,11 @@ PORT="${PORT:-8977}"
 # 529 MB/token lm_head stream. Default stays fp8 until the quality gate signs
 # off on the argmax-flip risk.
 LMHEAD="${LMHEAD:-fp8}"
+# OOM guard (MB of free GPU memory to keep in reserve during load). The
+# cuBLASLt prefill arm needs the BF16 mirrors resident (+8.06 GiB), which
+# lands peak within ~1.4 GB of the default 4096 MB guard on this box —
+# OOM_GUARD=2048 buys the headroom without changing any allocation.
+OOM_GUARD="${OOM_GUARD:-4096}"
 LOG="$REPO/serve-$NAME.log"
 
 ENV_ARGS=(
@@ -53,6 +58,7 @@ env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --max-num-seqs 1 \
   --max-batch-size 1 \
   --max-prefill-tokens 4096 \
+  --oom-guard-mb "$OOM_GUARD" \
   "${SPEC[@]}" >>"$LOG" 2>&1 &
 
 echo "pid=$! log=$LOG"
