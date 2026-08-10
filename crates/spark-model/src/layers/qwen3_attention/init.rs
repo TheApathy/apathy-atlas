@@ -311,6 +311,11 @@ impl Qwen3AttentionLayer {
                 "w8a8_gemm_pipelined",
                 "w8a8_gemm_pipelined",
             ),
+            w8a8_gemm_pipelined_ld_k: super::super::try_kernel(
+                gpu,
+                "w8a8_gemm_pipelined",
+                "w8a8_gemm_pipelined_ld",
+            ),
             quantize_a_fp8_rows_k: super::super::try_kernel(
                 gpu,
                 "w8a8_gemm_pipelined",

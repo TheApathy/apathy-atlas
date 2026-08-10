@@ -238,6 +238,10 @@ pub struct Qwen3AttentionLayer {
     /// activation quantizer. Both 0 unless `w8a8_gemm_pipelined.cu` loaded;
     /// the V4 projection dispatch falls back to `w8a16_gemm_pipelined`.
     pub(super) w8a8_gemm_pipelined_k: KernelHandle,
+    /// Strided-A/C sibling of the above: the block-diagonal wo_a runs its
+    /// groups in place against ONE full-row activation quantization (lda =
+    /// nq*head_dim, ldc = o_groups*o_lora). 0 unless the module loaded.
+    pub(super) w8a8_gemm_pipelined_ld_k: KernelHandle,
     pub(super) quantize_a_fp8_rows_k: KernelHandle,
     /// Strided-A/C siblings (`..._ld`) — let the block-diagonal wo_a run its
     /// groups in place, deleting 8 gather + 8 scatter copies per layer.

@@ -517,6 +517,47 @@ pub fn w8a8_gemm_pipelined(
         .launch(stream)
 }
 
+/// Strided-A/C sibling of [`w8a8_gemm_pipelined`] (`lda`/`ldc` = A and C row
+/// strides in ELEMENTS; A is FP8 bytes so lda elements == lda bytes). Lets the
+/// V4 block-diagonal wo_a run its groups in place over ONE full-row activation
+/// quantization: group g reads A cols [g*group_in, ...) with lda = nq*head_dim
+/// and writes C cols [g*o_lora, ...) with ldc = o_groups*o_lora. lda == K &&
+/// ldc == N is byte-identical to the packed kernel.
+/// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub fn w8a8_gemm_pipelined_ld(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_fp8: DevicePtr,
+    a_row_scale: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    stream: u64,
+) -> Result<()> {
+    super::log_gemm_shape("w8a8_gemm_pipelined_ld", m, n, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input_fp8)
+        .arg_ptr(a_row_scale)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .launch(stream)
+}
+
 /// Row-wise BF16 -> FP8 E4M3 activation quantizer for [`w8a8_gemm_pipelined`]:
 /// scale[m] = max(absmax(A[m,:]), eps)/448, A_fp8 = A/scale[m].
 ///
