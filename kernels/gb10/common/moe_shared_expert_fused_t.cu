@@ -130,7 +130,17 @@ __device__ __forceinline__ void store_vec_bf16(__nv_bfloat16* __restrict__ p,
 // `moe_gate_up_partial_finalize` sums the SPLIT of them in ascending-ks order —
 // a fixed order, not atomicAdd, so decode stays bit-reproducible run to run.
 // It is NOT bit-equal to SPLIT==1, which adds the same terms in one sweep.
-template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC = 1, int SPLIT = 1>
+//
+// WIDE_ACT: read the activation pair A[2k], A[2k+1] with ONE 32-bit load
+// (__nv_bfloat162) instead of two 2-byte loads. SASS of the v2s4 incumbent
+// shows the pair compiles to two separate LDG.E.U16 — at GS=32 that is 32
+// activation requests against 16 weight requests per scale group, so the A
+// stream (L2-resident, ~8 KB) costs twice the LSU issue slots of the weight
+// stream it feeds. Same two bf16 values, same converts, same FMA order —
+// bit-identical; default off so every existing entry point keeps its exact
+// SASS (the honest-A/B rule, playbook §4).
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC = 1, int SPLIT = 1,
+         bool WIDE_ACT = false>
 __device__ __forceinline__ void gate_up_shared_t_impl(
     const __nv_bfloat16* __restrict__ A,
     const unsigned long long* __restrict__ gate_packed_t_ptrs,
@@ -261,8 +271,18 @@ __device__ __forceinline__ void gate_up_shared_t_impl(
                 unsigned int k_half = kh_base + kh_off; \
                 unsigned char byte[VEC]; \
                 load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte); \
-                float a_lo = __bfloat162float(A[k_half * 2]); \
-                float a_hi = __bfloat162float(A[k_half * 2 + 1]); \
+                float a_lo, a_hi; \
+                if constexpr (WIDE_ACT) { \
+                    /* One 32-bit load; k_half*2 is even so the address is */ \
+                    /* 4-byte aligned. Values identical to the two-load path. */ \
+                    const __nv_bfloat162 a2 = \
+                        *reinterpret_cast<const __nv_bfloat162*>(A + k_half * 2); \
+                    a_lo = __bfloat162float(a2.x); \
+                    a_hi = __bfloat162float(a2.y); \
+                } else { \
+                    a_lo = __bfloat162float(A[k_half * 2]); \
+                    a_hi = __bfloat162float(A[k_half * 2 + 1]); \
+                } \
                 _Pragma("unroll") \
                 for (int v = 0; v < VEC; ++v) { \
                     float w_lo = e2m1_decode(byte[v] & 0xFu) * sc[v]; \
@@ -480,7 +500,12 @@ extern "C" __global__ void moe_expert_gate_up_shared_t_e8m0_v2(
 // warps (see gate_up_shared_t_impl), split-K shrinks the `s_act` shared buffer
 // from K*4 to K*4/SPLIT bytes, which is what was capping blocks-per-SM here —
 // 8 KB/block at K=2048 allows only ~12 blocks/SM.
-template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC = 1, int SPLIT = 1>
+// WIDE_ACT (see gate_up_shared_t_impl): here the activation pair lives in
+// shared memory, so the merge is two LDS.32 → one LDS.64. The index
+// k_half*2 - k_lo is even (k_lo is a multiple of K/SPLIT), so the float2
+// address is 8-byte aligned. Bit-identical; default off.
+template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC = 1, int SPLIT = 1,
+         bool WIDE_ACT = false>
 __device__ __forceinline__ void silu_down_shared_t_impl(
     const __nv_bfloat16* __restrict__ gate_out,
     const __nv_bfloat16* __restrict__ up_out,
@@ -602,8 +627,16 @@ __device__ __forceinline__ void silu_down_shared_t_impl(
                 unsigned int k_half = kh_base + kh_off; \
                 unsigned char byte[VEC]; \
                 load_vec_u8<VEC>(B_packed + (unsigned long long)k_half * N + n, byte); \
-                float a_lo = s_act[k_half * 2 - k_lo]; \
-                float a_hi = s_act[k_half * 2 + 1 - k_lo]; \
+                float a_lo, a_hi; \
+                if constexpr (WIDE_ACT) { \
+                    const float2 aa = \
+                        *reinterpret_cast<const float2*>(s_act + (k_half * 2 - k_lo)); \
+                    a_lo = aa.x; \
+                    a_hi = aa.y; \
+                } else { \
+                    a_lo = s_act[k_half * 2 - k_lo]; \
+                    a_hi = s_act[k_half * 2 + 1 - k_lo]; \
+                } \
                 _Pragma("unroll") \
                 for (int v = 0; v < VEC; ++v) { \
                     float w_lo = e2m1_decode(byte[v] & 0xFu) * sc[v]; \
@@ -771,6 +804,8 @@ extern "C" __global__ void moe_expert_silu_down_shared_t_e8m0_v2(
 //   down:     grid = [N/(block*VEC), top_k+1, SPLIT], smem = K*4/SPLIT
 // then `moe_gate_up_partial_finalize` / `moe_down_partial_finalize`.
 #define GATEUP_SPLIT_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_)                 \
+    GATEUP_SPLIT_ENTRY_WA(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, false)
+#define GATEUP_SPLIT_ENTRY_WA(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, WIDE_ACT_)   \
 extern "C" __global__ void NAME(                                               \
     const __nv_bfloat16* __restrict__ A,                                       \
     const unsigned long long* __restrict__ gate_packed_t_ptrs,                 \
@@ -793,7 +828,7 @@ extern "C" __global__ void NAME(                                               \
     unsigned int N, unsigned int K, unsigned int top_k,                        \
     float* __restrict__ partial                                                \
 ) {                                                                            \
-    gate_up_shared_t_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false, (VEC_), (SPLIT_)>( \
+    gate_up_shared_t_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false, (VEC_), (SPLIT_), (WIDE_ACT_)>( \
         A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out,  \
         up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out,             \
         expert_indices, sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2,         \
@@ -802,6 +837,8 @@ extern "C" __global__ void NAME(                                               \
 }
 
 #define DOWN_SPLIT_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_)                   \
+    DOWN_SPLIT_ENTRY_WA(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, false)
+#define DOWN_SPLIT_ENTRY_WA(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, WIDE_ACT_)     \
 extern "C" __global__ void NAME(                                               \
     const __nv_bfloat16* __restrict__ gate_out,                                \
     const __nv_bfloat16* __restrict__ up_out,                                  \
@@ -819,7 +856,7 @@ extern "C" __global__ void NAME(                                               \
     unsigned int N, unsigned int K, unsigned int top_k,                        \
     float* __restrict__ partial                                                \
 ) {                                                                            \
-    silu_down_shared_t_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false, (VEC_), (SPLIT_)>( \
+    silu_down_shared_t_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false, (VEC_), (SPLIT_), (WIDE_ACT_)>( \
         gate_out, up_out, packed_t_ptrs, scale_t_ptrs, scale2_vals, C,         \
         expert_indices, sh_gate_in, sh_up_in, sh_down_t_packed,                \
         sh_down_t_scale, sh_down_s2, sh_down_out, N, K, top_k, partial);       \
@@ -833,6 +870,20 @@ GATEUP_SPLIT_ENTRY(moe_expert_gate_up_shared_t_v4s2,       GROUP_SIZE, false, 4,
 GATEUP_SPLIT_ENTRY(moe_expert_gate_up_shared_t_e8m0_v4s2,  32,         true,  4, 2)
 GATEUP_SPLIT_ENTRY(moe_expert_gate_up_shared_t_v4s4,       GROUP_SIZE, false, 4, 4)
 GATEUP_SPLIT_ENTRY(moe_expert_gate_up_shared_t_e8m0_v4s4,  32,         true,  4, 4)
+// ── s8 tier (ATLAS_MOE_GEMV_V2) ──
+// v4s8 is the production candidate: 128-byte warp requests on the weight
+// stream (VEC=4) at EXACTLY the v2s4 CTA count — halving grid.x from VEC and
+// doubling grid.z from SPLIT cancel (gate_up 8·7·16 vs 16·7·8 = 896 CTAs at
+// N=2048), so no occupancy is given up for the wider request. WIDE_ACT merges
+// the two per-k activation loads into one. v2s8 is the narrow-load witness:
+// same split points, same per-output FMA order as v4s8, so v4s8 MUST be
+// bit-identical to it (moe_unified_t_v4_microtest gates on that) — the only
+// difference is data movement. v2s8-vs-v2s4 is the pure split-reassociation
+// delta, held to the microtest's RMS bound like every other split leg.
+GATEUP_SPLIT_ENTRY(moe_expert_gate_up_shared_t_v2s8,          GROUP_SIZE, false, 2, 8)
+GATEUP_SPLIT_ENTRY(moe_expert_gate_up_shared_t_e8m0_v2s8,     32,         true,  2, 8)
+GATEUP_SPLIT_ENTRY_WA(moe_expert_gate_up_shared_t_v4s8,       GROUP_SIZE, false, 4, 8, true)
+GATEUP_SPLIT_ENTRY_WA(moe_expert_gate_up_shared_t_e8m0_v4s8,  32,         true,  4, 8, true)
 
 DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_v2s2,       GROUP_SIZE, false, 2, 2)
 DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_e8m0_v2s2,  32,         true,  2, 2)
@@ -842,9 +893,17 @@ DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_v4s2,       GROUP_SIZE, false, 4,
 DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_e8m0_v4s2,  32,         true,  4, 2)
 DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_v4s4,       GROUP_SIZE, false, 4, 4)
 DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_e8m0_v4s4,  32,         true,  4, 4)
+// s8 tier — see the gate_up block above. down at N=4096: 16·7·8 = 896 CTAs,
+// identical to v2s4's 32·7·4; s_act shrinks to K*4/8 = 1 KB.
+DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_v2s8,          GROUP_SIZE, false, 2, 8)
+DOWN_SPLIT_ENTRY(moe_expert_silu_down_shared_t_e8m0_v2s8,     32,         true,  2, 8)
+DOWN_SPLIT_ENTRY_WA(moe_expert_silu_down_shared_t_v4s8,       GROUP_SIZE, false, 4, 8, true)
+DOWN_SPLIT_ENTRY_WA(moe_expert_silu_down_shared_t_e8m0_v4s8,  32,         true,  4, 8, true)
 
 #undef GATEUP_SPLIT_ENTRY
+#undef GATEUP_SPLIT_ENTRY_WA
 #undef DOWN_SPLIT_ENTRY
+#undef DOWN_SPLIT_ENTRY_WA
 
 // Sum the split-K partials and write the model's bf16 buffers. `split` is a
 // runtime argument here (unlike SPLIT in the GEMV) because this kernel is

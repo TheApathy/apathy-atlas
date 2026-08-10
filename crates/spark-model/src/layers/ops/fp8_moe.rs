@@ -616,14 +616,16 @@ pub fn moe_expert_silu_down_shared_t_splitk_m(
 
 /// Split-K fused gate+up GEMV (transposed weight) + partial finalize.
 ///
-/// `kernel` must be a `_v{T_SPLIT_VEC}s{split}` entry point and `finalize` the
-/// matching `moe_gate_up_partial_finalize`; the split factor is baked into the
-/// kernel at compile time and only the finalize reads it at runtime.
+/// `kernel` must be a `_v{vec}s{split}` entry point and `finalize` the
+/// matching `moe_gate_up_partial_finalize`; the VEC and split factors are
+/// baked into the kernel at compile time — `vec` here only sizes the grid to
+/// match, and only the finalize reads `split` at runtime.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_gate_up_shared_t_splitk(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     finalize: KernelHandle,
+    vec: u32,
     input: DevicePtr,
     gate_packed_t_ptrs: DevicePtr,
     gate_scale_t_ptrs: DevicePtr,
@@ -646,7 +648,7 @@ pub fn moe_expert_gate_up_shared_t_splitk(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([n / (t_block() * T_SPLIT_VEC), top_k + 1, 2 * split])
+        .grid([n / (t_block() * vec), top_k + 1, 2 * split])
         .block([t_block(), 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_t_ptrs)
@@ -686,11 +688,13 @@ pub fn moe_expert_gate_up_shared_t_splitk(
 }
 
 /// Split-K fused SiLU+down GEMV (transposed weight) + partial finalize.
+/// `vec` must match the `_v{vec}s{split}` entry point (see the gate+up twin).
 #[allow(clippy::too_many_arguments)]
 pub fn moe_expert_silu_down_shared_t_splitk(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
     finalize: KernelHandle,
+    vec: u32,
     gate_out: DevicePtr,
     up_out: DevicePtr,
     packed_t_ptrs: DevicePtr,
@@ -714,7 +718,7 @@ pub fn moe_expert_silu_down_shared_t_splitk(
     // was capping blocks-per-SM on the down projection.
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32 / split;
     KernelLaunch::new(gpu, kernel)
-        .grid([n / (t_block() * T_SPLIT_VEC), top_k + 1, split])
+        .grid([n / (t_block() * vec), top_k + 1, split])
         .block([t_block(), 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)

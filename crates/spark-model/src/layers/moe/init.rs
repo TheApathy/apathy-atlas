@@ -390,6 +390,28 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0_v2s4",
             ),
+            // ATLAS_MOE_GEMV_V2 wide-load tier (VEC=4, SPLIT=8) — see the
+            // field docs in mod.rs.
+            moe_expert_gate_up_shared_t_splitk8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_v4s8",
+            ),
+            moe_expert_silu_down_shared_t_splitk8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_v4s8",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_splitk8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_v4s8",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_splitk8_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_v4s8",
+            ),
             moe_gate_up_partial_finalize_k: super::super::try_kernel(
                 gpu,
                 "moe_shared_expert_fused_t",
