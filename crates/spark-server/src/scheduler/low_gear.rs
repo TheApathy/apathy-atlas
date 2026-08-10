@@ -316,6 +316,13 @@ pub(crate) fn step_low_gear(
     }
     let committed = n_ok + 1; // accepted drafts + correction/bonus token
 
+    // Free re-engagement signal: sustained n-gram accepts mean the content
+    // turned structured (verbatim repeats) — where the neural drafter wins —
+    // so adaptive can lift suspension now instead of waiting out the
+    // token-count re-probe backstop. Deliberately NOT record_verify (that
+    // window judges the neural drafter; see the module doc's bookkeeping).
+    crate::scheduler::adaptive_spec::record_low_gear(a, n_ok);
+
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
         extract_verify_logprobs(model, &vs[..m], top_logprobs)
     } else {
