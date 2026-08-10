@@ -91,6 +91,30 @@ secrets.*
 credentials
 credentials.*
 .netrc
+.git-credentials
+
+# Private keys and certificates. A key committed to a PUBLIC repo is a key
+# that must be rotated -- there is no "I deleted the commit" recovery.
+*.pem
+*.key
+!**/testdata/**/*.key
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ecdsa*
+id_ed25519*
+*.ppk
+
+# Tool configs that carry registry/cloud tokens in plaintext.
+.npmrc
+.pypirc
+.docker/config.json
+.kube/config
+gcloud-service-key*.json
+*service-account*.json
+.aws/
+.ssh/
 .npmrc
 .pypirc
 
