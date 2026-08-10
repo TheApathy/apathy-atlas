@@ -38,21 +38,32 @@
 //   - grid.x = N/128 output strips (8 tile-columns each), grid.y = SPLIT_K.
 //   - block = 256 threads = 8 warps. Warp w owns tile-column w of the strip;
 //     lane accumulates 2 outputs (n = 16w + lane/4 and +8) in fp32.
-//   - Phase 1: block computes x' (fp32) for its K-slice into smem, one
-//     128-chunk per warp via the warp-shuffle Hadamard (4 elems/lane).
+//   - Phase 1: block computes x' (fp32) for one SUPERBLOCK (up to 16 chunks
+//     = 2048 k) of its K-slice into smem, one 128-chunk per warp via the
+//     warp-shuffle Hadamard (4 elems/lane); refilled per superblock, so the
+//     K-slice length is unbounded.
 //   - Phase 2: trellis is streamed through a 2-stage cp.async smem pipeline;
-//     each stage is 16 tile-rows x 8 tile-cols = 12 KB, issued as 16-B
-//     cp.async per thread (3 per thread per stage) — wide, coalesced,
-//     contiguous 768-B runs per tile-row. One warp decodes one 96-B tile per
-//     iteration with the dq8 batching (8 weights per lane from two u32 loads).
+//     each stage is 8 tile-rows x 8 tile-cols = 6 KB (one 128-k chunk),
+//     issued as 16-B cp.async per thread — wide, coalesced, contiguous 768-B
+//     runs per tile-row. One warp decodes one 96-B tile per iteration with
+//     the dq8 batching (8 weights per lane from two u32 loads); the window
+//     extraction is restructured for ILP (see exl3_dq8) and the fp32
+//     accumulators are split even/odd-row so consecutive tiles' dequant and
+//     FMA chains are independent in the scoreboard.
 //   - Phase 3: quad shuffle-reduce, strip partial in smem, then (split 0 of 1,
 //     or the LAST split to finish, elected by an atomic counter) applies the
 //     output Hadamard-128 + svh and stores bf16. Split partials are combined
 //     in fixed split order, so the result is deterministic for a fixed grid.
 //
+// Occupancy: smem = 8 KB x' + 2 x 6 KB stages + 0.5 KB partials ~ 20.5 KB,
+// __launch_bounds__(256, 4) -> 4 CTAs/SM (32 warps) on GB10's 100 KB SMs,
+// vs 2 CTAs/SM for the first bring-up (42.5 KB). The kernel is issue-latency
+// bound, not DRAM-bound, at 2 CTAs/SM — the extra warps hide the dependent
+// dequant chains.
+//
 // Constraints: K % 128 == 0, N % 128 == 0, gridDim.y splits K in 128-aligned
-// chunks; K-slice per block <= EXL3_MAX_XCHUNKS*128 = 4096 (use gridDim.y > 1
-// for larger K). Expert shapes (N=2048 K=4096, N=4096 K=2048) all satisfy this.
+// chunks (any split works; the x' superblock loop removes the old 4096-K
+// per-slice cap). Expert shapes (N=2048 K=4096, N=4096 K=2048) satisfy this.
 //
 // The trellis decode and Hadamard logic is ported from ExLlamaV3
 // (https://github.com/turboderp-org/exllamav3, MIT License, Copyright (c)
@@ -68,19 +79,15 @@
 #define EXL3_TILE_U32 24  // 96 B per 16x16 tile
 #define EXL3_MCG_MULT 0xCBAC1FEDu
 #define EXL3_BLOCK 256
-#define EXL3_NSTRIP 128      // output columns per block (8 tiles of 16)
-#define EXL3_STAGE_ROWS 16   // tile-rows per cp.async stage (16*8*96 B = 12 KB)
-#define EXL3_MAX_XCHUNKS 32  // fp32 x' smem: up to 4096 K per block K-slice
+#define EXL3_NSTRIP 128     // output columns per block (8 tiles of 16)
+#define EXL3_STAGE_ROWS 8   // tile-rows per cp.async stage (8*8*96 B = 6 KB = 1 chunk)
+#define EXL3_STAGE_U4 (EXL3_STAGE_ROWS * 8 * 6)  // 16-B copies per stage (384)
+#define EXL3_MAX_XCHUNKS 16  // fp32 x' smem superblock: 2048 k, 8 KB (refilled per superblock)
 #define EXL3_RSQRT128 0.088388347648f
 
 // ---------------------------------------------------------------------------
 // Decode primitives (port of exl3_dq.cuh / codebook.cuh, bits=3, cb=1)
 // ---------------------------------------------------------------------------
-
-__device__ __forceinline__ unsigned int exl3_fshift(unsigned int b, unsigned int a, int shift) {
-    unsigned long long merged = ((unsigned long long)a << 32) | (unsigned long long)b;
-    return (unsigned int)(merged >> shift);
-}
 
 union exl3_h2u32 {
     unsigned int u;
@@ -103,6 +110,13 @@ __device__ __forceinline__ __half2 exl3_decode2(unsigned int x0, unsigned int x1
 
 // Per-lane window geometry for t_offset = lane*8 (compile-time function of
 // lane; hoist out of the K loop). Circular within the 24-u32 tile.
+//
+// For t = 8*lane the geometry is provably benign:
+//   b1 = (8*lane + 257)*3 = 24*lane + 771, b0 = b1 - 16, b2 = b1 + 21.
+//   b0 % 32 cycles {19, 11, 3, 27} (all <= 27), so the 37-bit span of the 8
+//   windows never crosses THREE u32 words: ib == ia + 1 (mod 24) always, and
+//   s2 = (i2+1)*32 - b2 is always one of {0, 8, 16, 24} — in particular
+//   s2 < 32, which exl3_dq8 relies on for its single-funnel-shift alignment.
 struct Exl3LaneGeom {
     int ia, ib, s2;
 };
@@ -121,20 +135,35 @@ __device__ __forceinline__ Exl3LaneGeom exl3_lane_geom(int lane) {
     return g;
 }
 
-// dq8 (align=4 variant, exl3_dq.cuh): 8 weights per lane from two u32 loads.
-// d01=(t0,t1) d23=(t2,t3) d45=(t4,t5) d67=(t6,t7); t = lane*8 + s.
+// dq8: 8 weights per lane from two u32 loads. d01=(t0,t1) d23=(t2,t3)
+// d45=(t4,t5) d67=(t6,t7); t = lane*8 + s.
+//
+// ILP restructure vs the vendored align=4 dq8: the reference derives the
+// even windows by a SERIAL shift chain (w7 -> w6 -> w5 -> w4), which puts 7
+// dependent ops in front of the last window's decode and caps the warp at
+// IPC ~1 (measured 156 GB/s plateau, issue-latency bound). Instead we align
+// the whole 37-bit window span ONCE (m = merged >> s2; s2 < 32 by the lane
+// geometry above, so m_lo is a single funnel shift), then extract the four
+// odd windows with INDEPENDENT immediate funnel shifts and the four even
+// windows with independent `>> 3`s. Every window is a pure function of
+// (m_lo, m_hi), so the four decode2 chains interleave in the scoreboard.
+// Bit-exact vs the serial chain: all windows are masked to 16 bits, and
+// bits [s2+3j, s2+3j+16) of `merged` are identical whether reached by one
+// funnel shift or by truncate-then-shift.
 __device__ __forceinline__ void exl3_dq8(const unsigned int* __restrict__ tile,
                                          const Exl3LaneGeom g, __half2& d01, __half2& d23,
                                          __half2& d45, __half2& d67) {
     unsigned int a = tile[g.ia];
     unsigned int b = tile[g.ib];
-    unsigned int w7 = exl3_fshift(b, a, g.s2);
+    unsigned int mlo = __funnelshift_r(b, a, g.s2);  // s2 in {0,8,16,24} < 32
+    unsigned int mhi = a >> g.s2;
+    unsigned int w7 = mlo;
+    unsigned int w5 = __funnelshift_r(mlo, mhi, 2 * EXL3_BITS);
+    unsigned int w3 = __funnelshift_r(mlo, mhi, 4 * EXL3_BITS);
+    unsigned int w1 = __funnelshift_r(mlo, mhi, 6 * EXL3_BITS);
     unsigned int w6 = w7 >> EXL3_BITS;
-    unsigned int w5 = w6 >> EXL3_BITS;
     unsigned int w4 = w5 >> EXL3_BITS;
-    unsigned int w3 = exl3_fshift(b, a, g.s2 + 4 * EXL3_BITS);
     unsigned int w2 = w3 >> EXL3_BITS;
-    unsigned int w1 = w2 >> EXL3_BITS;
     unsigned int w0 = w1 >> EXL3_BITS;
     d01 = exl3_decode2(w0 & 0xffff, w1 & 0xffff);
     d23 = exl3_decode2(w2 & 0xffff, w3 & 0xffff);
@@ -192,15 +221,17 @@ __device__ __forceinline__ void exl3_cp_async_16(void* dst_smem, const void* src
 __device__ __forceinline__ void exl3_cp_commit() { asm volatile("cp.async.commit_group;"); }
 
 // Issue one stage: tile-rows [r0, r0+EXL3_STAGE_ROWS) of the block's 8-tile
-// strip. Each tile-row is a contiguous 768-B run (48 uint4).
+// strip. Each tile-row is a contiguous 768-B run (48 uint4). 384 copies over
+// 256 threads: iteration 0 is full, iteration 1 is half-predicated.
 __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
                                                 const uint4* __restrict__ trellis_u4, int r0,
                                                 int rows_hi, int n_tiles_row, int nb0) {
     int nrows = rows_hi - r0;
     if (nrows > EXL3_STAGE_ROWS) nrows = EXL3_STAGE_ROWS;
 #pragma unroll
-    for (int i = 0; i < (EXL3_STAGE_ROWS * 48) / EXL3_BLOCK; ++i) {
+    for (int i = 0; i < (EXL3_STAGE_U4 + EXL3_BLOCK - 1) / EXL3_BLOCK; ++i) {
         int idx = i * EXL3_BLOCK + (int)threadIdx.x;
+        if (idx >= EXL3_STAGE_U4) break;
         int r = idx / 48;
         int o = idx % 48;
         bool p = r < nrows;
@@ -209,6 +240,28 @@ __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
         exl3_cp_async_16(dst + idx, src, p);
     }
     exl3_cp_commit();
+}
+
+// Phase-1 input pass for one x' superblock: x' = H128(diag(suh) . x)/sqrt(128)
+// in fp32 for chunks [c0, c1), stored at s_x[(c - c0)*128 ..]. One 128-chunk
+// per warp per iteration.
+__device__ __forceinline__ void exl3_input_pass(const __nv_bfloat16* __restrict__ A,
+                                                const __half* __restrict__ suh,
+                                                float* __restrict__ s_x, int c0, int c1,
+                                                int warp, int lane) {
+    for (int c = c0 + warp; c < c1; c += EXL3_BLOCK / 32) {
+        int base = (c << 7) + lane * 4;
+        float h0 = __bfloat162float(A[base + 0]) * __half2float(suh[base + 0]);
+        float h1 = __bfloat162float(A[base + 1]) * __half2float(suh[base + 1]);
+        float h2 = __bfloat162float(A[base + 2]) * __half2float(suh[base + 2]);
+        float h3 = __bfloat162float(A[base + 3]) * __half2float(suh[base + 3]);
+        exl3_had128(h0, h1, h2, h3, lane);
+        int lb = ((c - c0) << 7) + lane * 4;
+        s_x[lb + 0] = h0 * EXL3_RSQRT128;
+        s_x[lb + 1] = h1 * EXL3_RSQRT128;
+        s_x[lb + 2] = h2 * EXL3_RSQRT128;
+        s_x[lb + 3] = h3 * EXL3_RSQRT128;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +273,8 @@ __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
 //             them to 0 on completion, so back-to-back launches are safe.
 // ---------------------------------------------------------------------------
 
+// (body shared by exl3_gemv_m1 and exl3_gemv_m1_idx; the 4-CTA/SM occupancy
+// bound from the ILP-tuning pass lives on the __global__ wrappers below.)
 __device__ __forceinline__ void exl3_gemv_m1_body(
     const __nv_bfloat16* __restrict__ A,         // [K]
     const unsigned short* __restrict__ trellis,  // [K/16, N/16, 48]
@@ -229,8 +284,8 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     float* __restrict__ ws,                      // [gridDim.y, N]
     int* __restrict__ counters,                  // [N/128]
     unsigned int N, unsigned int K) {
-    __shared__ __align__(16) float s_x[EXL3_MAX_XCHUNKS * 128];             // 16 KB
-    __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 24 KB
+    __shared__ __align__(16) float s_x[EXL3_MAX_XCHUNKS * 128];             // 8 KB
+    __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 12 KB
     __shared__ float s_y[EXL3_NSTRIP];
     __shared__ int s_elect;
 
@@ -248,7 +303,9 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     const int c_hi = (int)(((long long)chunks_total * (split + 1)) / S);
     const int rows_lo = c_lo * 8;  // tile-rows (16 k each)
     const int rows_hi = c_hi * 8;
-    const int nstages = (rows_hi - rows_lo + EXL3_STAGE_ROWS - 1) / EXL3_STAGE_ROWS;
+    // One stage per 128-k chunk (EXL3_STAGE_ROWS == 8), so every stage is
+    // exactly full and nstages == chunks in the slice.
+    const int nstages = c_hi - c_lo;
 
     // Kick off the trellis pipeline before the x' pass so the DRAM stream
     // starts immediately.
@@ -258,60 +315,64 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
         exl3_load_stage((uint4*)s_stage[1], trellis_u4, rows_lo + EXL3_STAGE_ROWS, rows_hi,
                         n_tiles_row, nb0);
 
-    // ---- Phase 1: x' = H128(diag(suh) . x) / sqrt(128), fp32, into smem ----
-    for (int c = c_lo + warp; c < c_hi; c += EXL3_BLOCK / 32) {
-        int base = (c << 7) + lane * 4;
-        float h0 = __bfloat162float(A[base + 0]) * __half2float(suh[base + 0]);
-        float h1 = __bfloat162float(A[base + 1]) * __half2float(suh[base + 1]);
-        float h2 = __bfloat162float(A[base + 2]) * __half2float(suh[base + 2]);
-        float h3 = __bfloat162float(A[base + 3]) * __half2float(suh[base + 3]);
-        exl3_had128(h0, h1, h2, h3, lane);
-        int lb = ((c - c_lo) << 7) + lane * 4;
-        s_x[lb + 0] = h0 * EXL3_RSQRT128;
-        s_x[lb + 1] = h1 * EXL3_RSQRT128;
-        s_x[lb + 2] = h2 * EXL3_RSQRT128;
-        s_x[lb + 3] = h3 * EXL3_RSQRT128;
+    // ---- Phase 1: x' for the first superblock (up to 2048 k) ----
+    {
+        int sb1 = c_lo + EXL3_MAX_XCHUNKS;
+        if (sb1 > c_hi) sb1 = c_hi;
+        exl3_input_pass(A, suh, s_x, c_lo, sb1, warp, lane);
     }
     __syncthreads();
 
     // ---- Phase 2: stream + decode + accumulate ----
-    float acc0 = 0.0f, acc1 = 0.0f;  // n = 16*warp + lane/4, and +8
+    // Accumulators split even/odd-row so consecutive tiles' FMA tails are
+    // independent chains; combined in fixed order below (deterministic).
+    float acc0[2] = {0.0f, 0.0f};  // n = 16*warp + lane/4
+    float acc1[2] = {0.0f, 0.0f};  // n = 16*warp + lane/4 + 8
     const Exl3LaneGeom g = exl3_lane_geom(lane);
     const int xk = 2 * (lane & 3);
 
     for (int s = 0; s < nstages; ++s) {
+        if (s != 0 && (s & (EXL3_MAX_XCHUNKS - 1)) == 0) {
+            // Superblock boundary: refill x' for chunks [c_lo+s, +16). The
+            // previous iteration's trailing __syncthreads() ordered all
+            // reads of the old superblock before this overwrite; the two
+            // in-flight cp.async stages are unaffected (s_stage only).
+            int sb0 = c_lo + s;
+            int sb1 = sb0 + EXL3_MAX_XCHUNKS;
+            if (sb1 > c_hi) sb1 = c_hi;
+            exl3_input_pass(A, suh, s_x, sb0, sb1, warp, lane);
+            __syncthreads();
+        }
         if (s + 1 < nstages)
             asm volatile("cp.async.wait_group 1;");
         else
             asm volatile("cp.async.wait_group 0;");
         __syncthreads();
 
-        int r0 = rows_lo + s * EXL3_STAGE_ROWS;
-        int nrows = rows_hi - r0;
-        if (nrows > EXL3_STAGE_ROWS) nrows = EXL3_STAGE_ROWS;
         const unsigned int* stage32 = (const unsigned int*)s_stage[s & 1];
+        const int xbase = ((s & (EXL3_MAX_XCHUNKS - 1)) << 7) + xk;
 
 #pragma unroll 4
-        for (int r = 0; r < nrows; ++r) {
+        for (int r = 0; r < EXL3_STAGE_ROWS; ++r) {
             const unsigned int* tile = stage32 + (r * 8 + warp) * EXL3_TILE_U32;
             __half2 d01, d23, d45, d67;
             exl3_dq8(tile, g, d01, d23, d45, d67);
-            int xb = ((r0 - rows_lo + r) << 4) + xk;
+            int xb = xbase + (r << 4);
             float2 xa = *(const float2*)&s_x[xb];      // k, k+1
             float2 xc = *(const float2*)&s_x[xb + 8];  // k+8, k+9
             float2 f;
             f = __half22float2(d01);
-            acc0 = __fmaf_rn(f.x, xa.x, acc0);
-            acc0 = __fmaf_rn(f.y, xa.y, acc0);
+            acc0[r & 1] = __fmaf_rn(f.x, xa.x, acc0[r & 1]);
+            acc0[r & 1] = __fmaf_rn(f.y, xa.y, acc0[r & 1]);
             f = __half22float2(d23);
-            acc0 = __fmaf_rn(f.x, xc.x, acc0);
-            acc0 = __fmaf_rn(f.y, xc.y, acc0);
+            acc0[r & 1] = __fmaf_rn(f.x, xc.x, acc0[r & 1]);
+            acc0[r & 1] = __fmaf_rn(f.y, xc.y, acc0[r & 1]);
             f = __half22float2(d45);
-            acc1 = __fmaf_rn(f.x, xa.x, acc1);
-            acc1 = __fmaf_rn(f.y, xa.y, acc1);
+            acc1[r & 1] = __fmaf_rn(f.x, xa.x, acc1[r & 1]);
+            acc1[r & 1] = __fmaf_rn(f.y, xa.y, acc1[r & 1]);
             f = __half22float2(d67);
-            acc1 = __fmaf_rn(f.x, xc.x, acc1);
-            acc1 = __fmaf_rn(f.y, xc.y, acc1);
+            acc1[r & 1] = __fmaf_rn(f.x, xc.x, acc1[r & 1]);
+            acc1[r & 1] = __fmaf_rn(f.y, xc.y, acc1[r & 1]);
         }
         __syncthreads();
         if (s + 2 < nstages)
@@ -320,15 +381,17 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     }
 
     // ---- Phase 3: reduce + (elected) output Hadamard + svh + store ----
-    // Quad reduction: lanes {q, q+1, q+2, q+3} share n = 16*warp + q/... —
-    // lanes with equal lane/4 hold the same n over disjoint k.
-    acc0 += __shfl_xor_sync(0xffffffffu, acc0, 1);
-    acc0 += __shfl_xor_sync(0xffffffffu, acc0, 2);
-    acc1 += __shfl_xor_sync(0xffffffffu, acc1, 1);
-    acc1 += __shfl_xor_sync(0xffffffffu, acc1, 2);
+    // Fixed-order combine of the even/odd-row partials (deterministic), then
+    // quad reduction: lanes with equal lane/4 hold the same n over disjoint k.
+    float acc0f = acc0[0] + acc0[1];
+    float acc1f = acc1[0] + acc1[1];
+    acc0f += __shfl_xor_sync(0xffffffffu, acc0f, 1);
+    acc0f += __shfl_xor_sync(0xffffffffu, acc0f, 2);
+    acc1f += __shfl_xor_sync(0xffffffffu, acc1f, 1);
+    acc1f += __shfl_xor_sync(0xffffffffu, acc1f, 2);
     if ((lane & 3) == 0) {
-        s_y[warp * 16 + (lane >> 2)] = acc0;
-        s_y[warp * 16 + (lane >> 2) + 8] = acc1;
+        s_y[warp * 16 + (lane >> 2)] = acc0f;
+        s_y[warp * 16 + (lane >> 2) + 8] = acc1f;
     }
     __syncthreads();
 
@@ -370,7 +433,7 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1(
+extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1(
     const __nv_bfloat16* __restrict__ A,         // [K]
     const unsigned short* __restrict__ trellis,  // [K/16, N/16, 48]
     const __half* __restrict__ suh,              // [K]
@@ -394,7 +457,7 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1(
 //   grid/block/ws/counters: exactly as exl3_gemv_m1.
 // ---------------------------------------------------------------------------
 
-extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1_idx(
+extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_idx(
     const __nv_bfloat16* __restrict__ A,              // [K]
     const unsigned long long* __restrict__ trellis_tab,  // [num_experts]
     const unsigned long long* __restrict__ suh_tab,      // [num_experts]

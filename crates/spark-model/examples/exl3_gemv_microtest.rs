@@ -346,8 +346,10 @@ fn main() -> Result<()> {
         let d_c = g.alloc(n * 2)?;
         let d_w = g.alloc(n * k * 2)?;
         // Split sweep widened 4 -> 12: at N=2048 the strip grid is 16 CTAs, and
-        // with 2 blocks/SM the GB10 has 96 slots — split 6 fills them exactly.
-        // First hardware run measured 135-151 GB/s at splits 1-3 (underfilled).
+        // with the round-2 kernel at 4 blocks/SM the GB10 has 192 slots —
+        // split 12 fills them exactly (N=4096: 32 strips, split 6).
+        // First hardware run measured 135-151 GB/s at splits 1-3 (underfilled);
+        // round 1 plateaued at ~156 GB/s across splits 4-12 (issue-bound).
         let max_split = 12usize;
         let d_ws = g.alloc(max_split * n * 4)?;
         let d_cnt = g.alloc((n / 128) * 4)?;

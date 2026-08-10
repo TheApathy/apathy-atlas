@@ -74,24 +74,29 @@ Hadamard (reference: `had_hf_r_128_inner<true,false>` on input,
 `had_ff/fh_r_128_inner<false,true>` on output in `exl3_gemm_kernel` /
 `output_had_sh_gl`).
 
-## 2. Kernel design (`exl3_gemv_m1`)
+## 2. Kernel design (`exl3_gemv_m1`) — tuning round 2 (2026-08-10)
 
-Grid `(N/128, SPLIT_K)`, block 256 threads (8 warps), static smem 42.5 KB,
-52 registers, no spills (sm_121a).
+Grid `(N/128, SPLIT_K)`, block 256 threads (8 warps), static smem ~20.6 KB,
+`__launch_bounds__(256, 4)` → **4 CTAs/SM** (reg cap 64; bring-up build was
+52 regs at 42.5 KB smem = 2 CTAs/SM).
 
 - **Strip ownership**: block owns a 128-wide output strip = 8 tile-columns,
   which makes the output Hadamard-128 block-local. Warp w owns tile-column w;
-  each lane accumulates 2 outputs (`n = 16w + lane/4`, `+8`) in fp32.
-- **Phase 1 — input pass**: x' (fp32) for the block's 128-aligned K-slice
-  into smem (up to 32 chunks = 16 KB); one 128-chunk per warp per iteration
-  via the warp-shuffle Hadamard. Issued AFTER the first trellis cp.async
-  stages so the DRAM stream starts immediately.
+  each lane accumulates 2 outputs (`n = 16w + lane/4`, `+8`) in fp32, split
+  into even/odd-row partials (independent FMA chains, combined in fixed
+  order at the end — deterministic).
+- **Phase 1 — input pass**: x' (fp32) for one SUPERBLOCK of the K-slice
+  (≤ 16 chunks = 2048 k, 8 KB smem), refilled per superblock inside the
+  stage loop — the per-slice K cap is gone. One 128-chunk per warp per
+  iteration via the warp-shuffle Hadamard. Issued AFTER the first trellis
+  cp.async stages so the DRAM stream starts immediately.
 - **Phase 2 — weight stream**: 2-stage cp.async (`.cg`, 16 B per thread)
-  pipeline; each stage = 16 tile-rows × 8 tiles = 12 KB, fetched as
-  contiguous 768-B runs per tile-row (stride N/16·96 B between rows). Every
-  trellis byte is read exactly once, as 128-bit transactions. A warp decodes
-  one 96-B tile per iteration: `dq8` gives 8 weights/lane from two u32 smem
-  words; products and accumulation in fp32 (`__fmaf_rn`).
+  pipeline; each stage = 8 tile-rows × 8 tiles = 6 KB = exactly one 128-k
+  chunk, fetched as contiguous 768-B runs per tile-row (stride N/16·96 B
+  between rows). Every trellis byte is read exactly once, as 128-bit
+  transactions. A warp decodes one 96-B tile per iteration: `dq8` gives 8
+  weights/lane from two u32 smem words; products and accumulation in fp32
+  (`__fmaf_rn`).
 - **Phase 3 — reduce + output**: quad shuffle-reduce → 128 fp32 partials in
   smem. `SPLIT_K = 1`: the block applies Hadamard-128 + svh and stores bf16.
   `SPLIT_K > 1`: each split publishes its raw partial to `ws[split][N]`; an
@@ -99,30 +104,57 @@ Grid `(N/128, SPLIT_K)`, block 256 threads (8 warps), static smem 42.5 KB,
   split order (deterministic), then does the output pass. Counters self-reset
   → back-to-back launches need no host memset.
 
-Constraints: `N % 128 == 0`, `K % 128 == 0`, per-block K-slice ≤ 4096
-(`EXL3_MAX_XCHUNKS`); use `SPLIT_K > 1` for larger K and for occupancy
-(N=2048 → 16 strips → SPLIT_K=3 → 48 blocks ≙ 48 SMs).
+Constraints: `N % 128 == 0`, `K % 128 == 0`; any `SPLIT_K ≥ 1` (the x'
+superblock loop removed the old ≤4096-K slice cap). Use `SPLIT_K` for
+occupancy: at 4 CTAs/SM the GB10 has 192 slots (N=2048 → 16 strips →
+SPLIT_K=12 fills exactly; N=4096 → 32 strips → SPLIT_K=6).
+
+Shared-memory budget: `s_x` 8 KB + `s_stage` 2×6 KB + `s_y`/`s_elect`
+~0.6 KB ≈ 20.6 KB → 4 CTAs/SM on the 100 KB GB10 SM; registers are the
+co-binding limit (64 regs × 256 thr × 4 CTAs = the full 64 K file).
 
 ## 3. Dequant instruction budget
 
-Per 96-B tile (256 weights) per warp, per lane (8 weights):
+**Measured diagnosis (2026-08-10 hardware round)**: the bring-up kernel
+plateaued at ~156 GB/s across splits 4–12 at both production shapes
+(~1.95 GB/s per CTA × 80 CTAs), against a 229 GB/s ceiling that sibling
+GEMVs reach. A fully-contiguous diagnostic shape ran ~6.7 GB/s per CTA, so
+the DRAM pattern was not the constraint — the kernel was
+**issue-latency-bound**: the dequant was one DEPENDENT chain (serial window
+shifts → u32 mul → lop3 → hadd), effective IPC ≈ 1, ~19 µs per 3.158 MB
+matrix ≈ 166 GB/s-equivalent. Fix = break the chains (ILP) + more warps
+(occupancy):
 
-| stage | lane-ops |
-|---|---|
-| 2 × LDS.32 (tile words a, b) | 2 |
-| window extraction (2 × 64-bit funnel shift + 6 derived `>>3` + 8 AND) | ~18 |
-| 3INST (8 IMAD + 8 LOP3 + 8 PRMT lo/hi + 4 HADD2) | 28 |
-| half2→float2 (4 × cvt) | ~8 |
-| x' loads (2 × LDS.64, k-pairs shared between both n-halves) | 2 |
-| dot (8 FFMA) | 8 |
+Per 96-B tile (256 weights) per warp, per lane (8 weights), round-2 sequence:
 
-≈ **66 lane-ops / 8 weights ≈ 8.3 ops/weight** (the plan's 4.3 counted only
-extraction+decode; the fp32-exact dot and conversions add the rest).
+| stage | lane-ops | depth |
+|---|---|---|
+| 2 × LDS.32 (tile words a, b) | 2 | 1 |
+| span align: `mlo = SHF.R(b,a,s2)`, `mhi = a>>s2` (s2 ∈ {0,8,16,24}) | 2 | 1 |
+| odd windows: 3 × immediate funnel shift (w5,w3,w1; w7 = mlo free) | 3 | 1 |
+| even windows: 4 × independent `>>3` | 4 | 1 |
+| mask: 8 AND | 8 | 1 |
+| 3INST (8 IMAD + 8 LOP3 + 8 PRMT lo/hi + 4 HADD2) | 28 | 4 |
+| half2→float2 (4 × cvt) | ~8 | 1 |
+| x' loads (2 × LDS.64, k-pairs shared between both n-halves) | 2 | 1 |
+| dot (8 FFMA, 4 accumulator chains: acc{0,1} × even/odd row) | 8 | 2 |
 
-Roofline: at the 229 GB/s ceiling the stream demands 229/0.3765 B ≈
-608 Gweights/s → ~5.0 T lane-ops/s against ~23 T lane-op issue capacity
-(48 SM × 2.5 GHz × ~192 lanes) → **~22 % issue utilization. Decode is not
-the bottleneck**; the kernel is DRAM-bound as intended.
+≈ **65 lane-ops / 8 weights ≈ 8.1 ops/weight**, but now as **four
+independent window-pair chains** (each window is a pure function of
+`(mlo, mhi)`) instead of one depth-7 serial chain — the vendored align=4
+`dq8` derives w6..w4 by serial `>>3` from w7, which is what capped IPC.
+The even/odd-row accumulator split removes the serial FFMA tail across
+tiles. Expected effective IPC ≈ 2 per warp; combined with 4 CTAs/SM
+(32 warps vs 16) the issue side stops binding: the dependent-chain time
+~19 µs drops under the 13.8 µs DRAM floor → expected **~200–229 GB/s**
+(gate 3 verifies on hardware).
+
+The lane geometry guarantees the restructure is safe: for `t = 8·lane`,
+`b0 % 32 ∈ {19, 11, 3, 27}`, so the 37-bit window span never crosses three
+u32 words and `s2 ∈ {0, 8, 16, 24} < 32` (single funnel-shift alignment).
+Bit-exactness is unchanged — every window is masked to 16 bits, and bits
+`[s2+3j, s2+3j+16)` of the 64-bit pair are identical whether reached by one
+funnel shift or truncate-then-shift.
 
 ## 4. Roofline arithmetic per expert matrix
 
@@ -186,3 +218,14 @@ STILL OPEN:
   (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides),
   possible half2-accumulate variant if issue-bound.
 - Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.
+
+- m-row (γ-verify) MROW variant — mandatory from day one per plan §3/§4.7
+  (partial-exactness law: the verify chain flips as a whole).
+- Real-checkpoint spot-check (plan option a): run the dump gate against
+  tiles from `/home/flocka/sparkinfer-ref/data/tp1` once readable.
+- ~~Perf tuning after first GPU measurement~~ round 2 done (§2/§3): ILP
+  dequant restructure + 4 CTAs/SM. If gate 3 still lands under ~200 GB/s,
+  the next lever is the half2-accumulate variant (`EXL3_GEMM_H_ACC`-style)
+  to shed the 8 cvt + fp32 FFMA per tile — quality re-gate required.
+- Shared-expert rider (grid.y expert slot) when wiring into
+  `moe_shared_expert_fused_t` dispatch.
