@@ -142,6 +142,19 @@ impl Qwen3AttentionLayer {
                 h,
                 stream,
             )?;
+        } else if self.dense_gemm_pipelined_k.0 != 0 {
+            // 18x dense_gemm_tc at this shape (see the compressor note below).
+            ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.dense_gemm_pipelined_k,
+                normed,
+                &mla.wq_a,
+                q_latent,
+                n,
+                q_lora,
+                h,
+                stream,
+            )?;
         } else if use_tc {
             ops::dense_gemm_tc(
                 ctx.gpu,
@@ -539,10 +552,22 @@ impl Qwen3AttentionLayer {
             // prefill numerics change).
             let kv_comp = ctx.buffers.expert_up_out();
             let gate_comp = ctx.buffers.expert_down_out();
-            let comp_gemm_tc = self.dense_gemm_tc_k.0 != 0
-                && std::env::var("ATLAS_V4_COMP_GEMM_TC").as_deref() != Ok("0");
+            // MEASURED 2026-08-10 (dense_gemm_microtest, M=2410 K=4096):
+            // dense_gemm_tc 8.07 ms @ N=1024 / 4.0 @ N=512 vs
+            // dense_gemm_bf16_pipelined 0.44 / 0.23 ms — 18x, cosine
+            // 1.000000 against the same CPU oracle. dense_gemm_tc's 16x64
+            // tile loads B scalar with stride K (32 sectors per warp
+            // instruction vs 2 MMAs); the pipelined kernel is the 128x128
+            // cp.async tiling. ATLAS_V4_COMP_GEMM_TC=0 forces the scalar
+            // kernel (kept as the last-resort A/B arm).
+            let comp_gemm_tc = std::env::var("ATLAS_V4_COMP_GEMM_TC").as_deref() != Ok("0");
             let (gk, gemm): (_, fn(_, _, _, _, _, _, _, _, _) -> Result<()>) =
-                if comp_gemm_tc {
+                if comp_gemm_tc && self.dense_gemm_pipelined_k.0 != 0 {
+                    (
+                        self.dense_gemm_pipelined_k,
+                        ops::dense_gemm_bf16_pipelined as _,
+                    )
+                } else if comp_gemm_tc && self.dense_gemm_tc_k.0 != 0 {
                     (self.dense_gemm_tc_k, ops::dense_gemm_tc as _)
                 } else {
                     (self.dense_gemm_k, ops::dense_gemm as _)

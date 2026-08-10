@@ -293,6 +293,16 @@ impl Qwen3AttentionLayer {
                 "w8a16_gemm_pipelined",
                 "w8a16_gemm_pipelined",
             ),
+            w8a8_gemm_pipelined_k: super::super::try_kernel(
+                gpu,
+                "w8a8_gemm_pipelined",
+                "w8a8_gemm_pipelined",
+            ),
+            quantize_a_fp8_rows_k: super::super::try_kernel(
+                gpu,
+                "w8a8_gemm_pipelined",
+                "quantize_a_fp8_rows",
+            ),
             w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
             rope_k: gpu.kernel("rope", "rope_forward")?,
             rope_mrope_interleaved_k: super::super::try_kernel(

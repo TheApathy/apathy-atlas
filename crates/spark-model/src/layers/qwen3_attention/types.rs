@@ -222,6 +222,11 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemv_batch8_ld_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
     pub(super) w8a16_gemm_pipelined_k: KernelHandle,
+    /// FP8-native W8A8 prefill GEMM (`mma.m16n8k32.e4m3`) and its per-row
+    /// activation quantizer. Both 0 unless `w8a8_gemm_pipelined.cu` loaded;
+    /// the V4 projection dispatch falls back to `w8a16_gemm_pipelined`.
+    pub(super) w8a8_gemm_pipelined_k: KernelHandle,
+    pub(super) quantize_a_fp8_rows_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.
