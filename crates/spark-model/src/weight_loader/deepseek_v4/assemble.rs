@@ -721,7 +721,8 @@ pub(super) fn assemble_moe(
     // format `Exl3Trellis` (set_exl3_experts does both). Must come AFTER the
     // detect above so the EXL3 tag wins.
     if exl3_detected {
-        moe.set_exl3_experts(&exl3_experts, gpu)
+        // top_k sizes the fused decode split-K scratch (2·top_k launch groups).
+        moe.set_exl3_experts(&exl3_experts, config.num_experts_per_tok as u32, gpu)
             .with_context(|| format!("{p}: EXL3 expert tables"))?;
         tracing::info!(
             "{p}: EXL3 trellis routed experts — {} experts, gate/up [{}x{}], down [{}x{}] \

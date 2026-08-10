@@ -32,6 +32,16 @@
 //!      `moe_bf16_grouped_gemm` → post) COSINE >= 0.999 vs the f64 full-
 //!      pipeline reference at M=64 (per-row expert routing, gathered A).
 //!
+//! Fused decode-dispatch gate (the launch collapse in `exl3_decode.rs`):
+//!   8. FUSED == PER-SLOT, BYTE-IDENTICAL. The same synthetic experts and
+//!      routing are pushed through both the per-slot bring-up chain
+//!      (`exl3_gemv_m1_idx` × 3·top_k + `moe_silu_mul` × top_k) and the fused
+//!      pair (`exl3_gemv_m1_fused_gate_up` + one flat `moe_silu_mul` +
+//!      `exl3_gemv_m1_fused_down`); all three output buffers must byte-match,
+//!      the fused path must be self-byte-identical across a relaunch (split-K
+//!      determinism with per-slot scratch regions), and the launch counts are
+//!      asserted (4·top_k → 3 per layer).
+//!
 //!   cargo run -p spark-model --release --example exl3_gemv_microtest \
 //!       --features cuda,gpu-examples
 //!
@@ -540,9 +550,11 @@ fn main() -> Result<()> {
     }
 
     all_ok &= prefill_gates(g, &lut)?;
+    all_ok &= fused_decode_gate(g)?;
 
     eprintln!(
-        "EXL3 GEMV GATE (bit-exact dequant + cos>={PASS_COS} + determinism + P1 prefill): {}",
+        "EXL3 GEMV GATE (bit-exact dequant + cos>={PASS_COS} + determinism + P1 prefill \
+         + fused decode byte-identity): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {
@@ -827,4 +839,277 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
         let _ = g.free(p);
     }
     Ok(ok)
+}
+
+// ---------------------------------------------------------------------------
+// GATE 8: fused decode dispatch == per-slot chain, byte for byte.
+//
+// The production decode dispatch (`layers/moe/exl3_decode.rs`) collapses the
+// routed FFN from 4·top_k launches per layer (gate, up, SwiGLU, down per slot)
+// to 3 (`exl3_gemv_m1_fused_gate_up`, one flat `moe_silu_mul`,
+// `exl3_gemv_m1_fused_down`). Fusion moves only WHICH CTA owns which
+// (slot, strip, split) triple — the per-output accumulation order, the
+// per-128-k-chunk fp32 combine and the fixed split-order combine are the same
+// device code — so the two paths must agree BIT FOR BIT at equal SPLIT_K.
+// That is the gate below; it also re-runs the fused path to prove the split-K
+// election still lands deterministically now that every launch group carries
+// its own `ws`/`counters` region and the groups run concurrently.
+//
+// Output buffers are poisoned with a DIFFERENT byte before each path (0x00 vs
+// 0xFF), so a slot or strip that no CTA writes cannot pass by accident.
+// ---------------------------------------------------------------------------
+
+/// Routed slots (DeepSeek-V4 tp1 routes 8; 6 keeps the gate quick and still
+/// exercises 12 concurrent gate+up launch groups).
+const FUSED_TOP_K: usize = 6;
+/// Distinct synthetic experts the routing draws from.
+const FUSED_NE: usize = 8;
+
+/// One EXL3 projection's device pointer tables: (trellis, suh, svh).
+type ProjTabs = (DevicePtr, DevicePtr, DevicePtr);
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_idx(
+    g: &dyn GpuBackend,
+    kh: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+    split: u32,
+    a: DevicePtr,
+    tab: ProjTabs,
+    idx: DevicePtr,
+    slot: u32,
+    c: DevicePtr,
+    ws: DevicePtr,
+    cnt: DevicePtr,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    KernelLaunch::new(g, kh)
+        .grid([(n / 128) as u32, split, 1])
+        .block([256, 1, 1])
+        .arg_ptr(a)
+        .arg_ptr(tab.0)
+        .arg_ptr(tab.1)
+        .arg_ptr(tab.2)
+        .arg_ptr(idx)
+        .arg_u32(slot)
+        .arg_ptr(c)
+        .arg_ptr(ws)
+        .arg_ptr(cnt)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
+        .launch(stream)
+}
+
+fn launch_silu(
+    g: &dyn GpuBackend,
+    kh: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+    gate: DevicePtr,
+    upp: DevicePtr,
+    out: DevicePtr,
+    total: u32,
+) -> Result<()> {
+    KernelLaunch::new(g, kh)
+        .grid([total.div_ceil(256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(upp)
+        .arg_ptr(out)
+        .arg_u32(total)
+        .launch(stream)
+}
+
+#[allow(clippy::too_many_lines)]
+fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
+    let stream = 0u64;
+    let (h, inter) = (4096usize, 2048usize);
+    let (top_k, ne) = (FUSED_TOP_K, FUSED_NE);
+    // Distinct routed ids, deliberately NOT slot-ordered: a fused CTA must
+    // resolve its expert from indices[slot] on device, not from blockIdx.
+    let indices: Vec<u32> = vec![5, 0, 7, 2, 6, 1];
+    assert_eq!(indices.len(), top_k, "GATE8 index list must have top_k entries");
+    assert!(indices.iter().all(|&e| (e as usize) < ne));
+
+    let kh_idx = g.kernel("exl3_gemv", "exl3_gemv_m1_idx")?;
+    let kh_gu = g.kernel("exl3_gemv", "exl3_gemv_m1_fused_gate_up")?;
+    let kh_dn = g.kernel("exl3_gemv", "exl3_gemv_m1_fused_down")?;
+    let kh_silu = g.kernel("moe_silu_mul", "moe_silu_mul")?;
+
+    let to_b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let mut r = Rng(0x5EED_F05E_2026_0810);
+    let mut owned: Vec<DevicePtr> = Vec::new();
+
+    // Build the [ne] pointer tables for one projection of shape [n, k].
+    let build =
+        |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
+            let words = (k / 16) * (n / 16) * 48;
+            let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..ne {
+                let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
+                let su: Vec<u16> = (0..k).map(|_| r.sign_f16()).collect();
+                let sv: Vec<u16> = (0..n).map(|_| r.sign_f16()).collect();
+                tp.push(up(g, &to_b(&t))?);
+                sup.push(up(g, &to_b(&su))?);
+                svp.push(up(g, &to_b(&sv))?);
+            }
+            let tab =
+                |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
+            let out = (up(g, &tab(&tp))?, up(g, &tab(&sup))?, up(g, &tab(&svp))?);
+            owned.extend(tp);
+            owned.extend(sup);
+            owned.extend(svp);
+            owned.extend([out.0, out.1, out.2]);
+            Ok(out)
+        };
+    let gate_t = build(&mut r, &mut owned, inter, h)?;
+    let up_t = build(&mut r, &mut owned, inter, h)?;
+    let down_t = build(&mut r, &mut owned, h, inter)?;
+
+    let a_host: Vec<u16> = (0..h)
+        .map(|_| bf16::from_f32((r.unit() - 0.5) * 0.5).to_bits())
+        .collect();
+    let d_a = up(g, &to_b(&a_host))?;
+    let idx_bytes: Vec<u8> = indices.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let d_idx = up(g, &idx_bytes)?;
+
+    let gu_bytes = top_k * inter * 2;
+    let dn_bytes = top_k * h * 2;
+    let d_gate = g.alloc(gu_bytes)?;
+    let d_upo = g.alloc(gu_bytes)?;
+    let d_down = g.alloc(dn_bytes)?;
+
+    // Scratch sized exactly as `set_exl3_experts` sizes it: one private
+    // [SPLIT_K, N] fp32 region + [N/128] counters per launch GROUP, widest
+    // group count = 2·top_k (gate+up).
+    let (max_split, max_n) = (12usize, 4096usize);
+    let groups = 2 * top_k;
+    let cnt_bytes = groups * (max_n / 128) * 4;
+    let d_ws = g.alloc(groups * max_split * max_n * 4)?;
+    let d_cnt = g.alloc(cnt_bytes)?;
+    g.memset(d_cnt, 0, cnt_bytes)?;
+
+    // Production split policy (Exl3MoeState::split_for): fill ~96 CTAs.
+    let split_for = |n: usize| -> u32 { (96 / (n / 128).max(1)).clamp(1, max_split) as u32 };
+    let (split_gu, split_dn) = (split_for(inter), split_for(h));
+
+    // ---- Path A: per-slot bring-up chain (4·top_k launches) ----
+    let mut launches_a = 0usize;
+    g.memset(d_gate, 0x00, gu_bytes)?;
+    g.memset(d_upo, 0x00, gu_bytes)?;
+    g.memset(d_down, 0x00, dn_bytes)?;
+    for slot in 0..top_k as u32 {
+        let gate_row = d_gate.offset(slot as usize * inter * 2);
+        let up_row = d_upo.offset(slot as usize * inter * 2);
+        let down_row = d_down.offset(slot as usize * h * 2);
+        launch_gemv_idx(
+            g, kh_idx, stream, split_gu, d_a, gate_t, d_idx, slot, gate_row, d_ws, d_cnt,
+            inter, h,
+        )?;
+        launch_gemv_idx(
+            g, kh_idx, stream, split_gu, d_a, up_t, d_idx, slot, up_row, d_ws, d_cnt, inter, h,
+        )?;
+        launch_silu(g, kh_silu, stream, gate_row, up_row, gate_row, inter as u32)?;
+        launch_gemv_idx(
+            g, kh_idx, stream, split_dn, gate_row, down_t, d_idx, slot, down_row, d_ws, d_cnt,
+            h, inter,
+        )?;
+        launches_a += 4;
+    }
+    g.synchronize(stream)?;
+    let (mut a_gate, mut a_up, mut a_down) =
+        (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+    g.copy_d2h(d_gate, &mut a_gate)?;
+    g.copy_d2h(d_upo, &mut a_up)?;
+    g.copy_d2h(d_down, &mut a_down)?;
+
+    // ---- Path B: fused (3 launches), poisoned with the opposite byte ----
+    let fused = |g: &dyn GpuBackend| -> Result<usize> {
+        g.memset(d_gate, 0xFF, gu_bytes)?;
+        g.memset(d_upo, 0xFF, gu_bytes)?;
+        g.memset(d_down, 0xFF, dn_bytes)?;
+        KernelLaunch::new(g, kh_gu)
+            .grid([(inter / 128) as u32, split_gu, 2 * top_k as u32])
+            .block([256, 1, 1])
+            .arg_ptr(d_a)
+            .arg_ptr(gate_t.0)
+            .arg_ptr(gate_t.1)
+            .arg_ptr(gate_t.2)
+            .arg_ptr(up_t.0)
+            .arg_ptr(up_t.1)
+            .arg_ptr(up_t.2)
+            .arg_ptr(d_idx)
+            .arg_ptr(d_gate)
+            .arg_ptr(d_upo)
+            .arg_ptr(d_ws)
+            .arg_ptr(d_cnt)
+            .arg_u32(inter as u32)
+            .arg_u32(h as u32)
+            .launch(stream)?;
+        launch_silu(g, kh_silu, stream, d_gate, d_upo, d_gate, (top_k * inter) as u32)?;
+        KernelLaunch::new(g, kh_dn)
+            .grid([(h / 128) as u32, split_dn, top_k as u32])
+            .block([256, 1, 1])
+            .arg_ptr(d_gate)
+            .arg_ptr(down_t.0)
+            .arg_ptr(down_t.1)
+            .arg_ptr(down_t.2)
+            .arg_ptr(d_idx)
+            .arg_ptr(d_down)
+            .arg_ptr(d_ws)
+            .arg_ptr(d_cnt)
+            .arg_u32(h as u32)
+            .arg_u32(inter as u32)
+            .launch(stream)?;
+        g.synchronize(stream)?;
+        Ok(3)
+    };
+    let launches_b = fused(g)?;
+    let (mut b_gate, mut b_up, mut b_down) =
+        (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+    g.copy_d2h(d_gate, &mut b_gate)?;
+    g.copy_d2h(d_upo, &mut b_up)?;
+    g.copy_d2h(d_down, &mut b_down)?;
+
+    let diff = |x: &[u8], y: &[u8]| x.iter().zip(y).filter(|(a, b)| a != b).count();
+    let (dg, du, dd) = (diff(&a_gate, &b_gate), diff(&a_up, &b_up), diff(&a_down, &b_down));
+    // Guard against "both paths wrote nothing": each path starts from a
+    // DIFFERENT poison byte, so an unwritten region cannot compare equal —
+    // and the fused result must not still be the poison.
+    let nontrivial = b_down.iter().any(|&x| x != 0xFF) && b_gate.iter().any(|&x| x != 0xFF);
+    let g8 = dg == 0 && du == 0 && dd == 0 && nontrivial;
+    eprintln!(
+        "FUSED GATE8 fused==per-slot byte-identical: gate_diff={dg}/{gu_bytes} \
+         up_diff={du}/{gu_bytes} down_diff={dd}/{dn_bytes} nontrivial={nontrivial}  {}",
+        if g8 { "PASS" } else { "FAIL" }
+    );
+
+    // Relaunch determinism on the fused path (per-group split-K scratch +
+    // self-resetting counters must survive back-to-back launches).
+    let _ = fused(g)?;
+    let (mut c_gate, mut c_up, mut c_down) =
+        (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+    g.copy_d2h(d_gate, &mut c_gate)?;
+    g.copy_d2h(d_upo, &mut c_up)?;
+    g.copy_d2h(d_down, &mut c_down)?;
+    let g8b = c_gate == b_gate && c_up == b_up && c_down == b_down;
+    eprintln!(
+        "FUSED GATE8b fused relaunch byte-identical (split={split_gu}/{split_dn}, \
+         {groups} concurrent groups): {}",
+        if g8b { "PASS" } else { "FAIL" }
+    );
+
+    // Launch-count assertion: this is the whole point of the change.
+    let g8c = launches_a == 4 * top_k && launches_b == 3;
+    eprintln!(
+        "FUSED GATE8c launches/layer (top_k={top_k}): per-slot={launches_a} fused={launches_b} \
+         ({:.1}x fewer; +4 for the NVFP4 shared expert in both)  {}",
+        launches_a as f64 / launches_b as f64,
+        if g8c { "PASS" } else { "FAIL" }
+    );
+
+    for p in owned.into_iter().chain([d_a, d_idx, d_gate, d_upo, d_down, d_ws, d_cnt]) {
+        let _ = g.free(p);
+    }
+    Ok(g8 && g8b && g8c)
 }

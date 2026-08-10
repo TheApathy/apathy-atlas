@@ -493,6 +493,97 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_idx(
 }
 
 // ---------------------------------------------------------------------------
+// FUSED MoE decode entry points: ONE launch for ALL routed slots.
+//
+// `exl3_gemv_m1_idx` above is the bring-up shape — one launch per (slot,
+// projection), i.e. 3·top_k GEMV launches per layer. At 43 layers × top_k 6-8
+// that is ~800-1000 launches per decoded token, and the EXL3 byte win (2.43
+// GB/token vs MXFP4's 3.45) is eaten by launch + tail underfill.
+//
+// The fused pair below mirrors the MXFP4/BF16 fused decode organization
+// (`moe_expert_gate_up_shared_bf16`: expert slot on blockIdx.y, projection on
+// blockIdx.z, expert id resolved per-CTA from the routing buffer). EXL3 needs
+// blockIdx.y for SPLIT_K, so the (slot, projection) pair rides blockIdx.z:
+//
+//   exl3_gemv_m1_fused_gate_up  grid = (N/128, SPLIT_K, 2·top_k)
+//                               z = 2·slot + proj   (proj 0 = gate, 1 = up)
+//   exl3_gemv_m1_fused_down     grid = (N/128, SPLIT_K, top_k)
+//                               z = slot
+//
+// Per-CTA work is IDENTICAL to the per-slot kernel — same body, same K-slice
+// for a given (blockIdx.y, gridDim.y), same fixed-order per-chunk fp32
+// combine, same fixed-order split combine. Fusing changes only WHICH CTA does
+// which (slot, strip, split) triple, so the outputs are BIT-IDENTICAL to the
+// per-slot chain at equal SPLIT_K (gated in exl3_gemv_microtest.rs, GATE8).
+//
+// SPLIT-K SCRATCH ACROSS SLOTS (the one thing that must not be got wrong):
+// per-slot launches serialize on the stream and can therefore share ONE
+// ws/counters scratch. Fused slots run CONCURRENTLY, so every group gets a
+// private region:
+//
+//   ws       + group · gridDim.y · N        (fp32 [group][SPLIT_K][N])
+//   counters + group · (N / 128)            (i32  [group][N/128])
+//
+// Both offsets are computed from the launch geometry, so the host only has to
+// size the allocation for the widest (groups, SPLIT_K, N) it will ever launch.
+// The self-resetting counter logic is untouched: within a group exactly
+// SPLIT_K CTAs hit counters[group][strip], the last one elected re-arms it to
+// 0, and groups never touch each other's counters — so back-to-back launches
+// (and CUDA-graph replays) still start from an all-zero counter array.
+// ---------------------------------------------------------------------------
+
+// Fused gate+up over all routed slots. Every slot reads the SAME activation
+// A[K]; outputs land in the per-slot rows the existing SwiGLU expects
+// (gate_out[slot·N .. ], up_out[slot·N .. ]).
+extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_gate_up(
+    const __nv_bfloat16* __restrict__ A,                    // [K] (shared by all slots)
+    const unsigned long long* __restrict__ gate_trellis_tab,  // [num_experts]
+    const unsigned long long* __restrict__ gate_suh_tab,      // [num_experts]
+    const unsigned long long* __restrict__ gate_svh_tab,      // [num_experts]
+    const unsigned long long* __restrict__ up_trellis_tab,    // [num_experts]
+    const unsigned long long* __restrict__ up_suh_tab,        // [num_experts]
+    const unsigned long long* __restrict__ up_svh_tab,        // [num_experts]
+    const unsigned int* __restrict__ indices,               // [top_k] routed ids
+    __nv_bfloat16* __restrict__ gate_out,                   // [top_k, N]
+    __nv_bfloat16* __restrict__ up_out,                     // [top_k, N]
+    float* __restrict__ ws,                                 // [gridDim.z, gridDim.y, N]
+    int* __restrict__ counters,                             // [gridDim.z, N/128]
+    unsigned int N, unsigned int K) {
+    const unsigned int group = blockIdx.z;
+    const unsigned int slot = group >> 1;
+    const unsigned int proj = group & 1u;  // 0 = gate, 1 = up
+    const unsigned int e = indices[slot];
+    const unsigned long long* tt = proj ? up_trellis_tab : gate_trellis_tab;
+    const unsigned long long* su = proj ? up_suh_tab : gate_suh_tab;
+    const unsigned long long* sv = proj ? up_svh_tab : gate_svh_tab;
+    __nv_bfloat16* C = (proj ? up_out : gate_out) + (size_t)slot * N;
+    exl3_gemv_m1_body(A, (const unsigned short*)tt[e], (const __half*)su[e],
+                      (const __half*)sv[e], C,
+                      ws + (size_t)group * gridDim.y * N, counters + group * (N >> 7), N,
+                      K);
+}
+
+// Fused down over all routed slots. Slot s consumes the SwiGLU activation row
+// `act + s·K` (K = intermediate size) and writes `down_out + s·N`.
+extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_down(
+    const __nv_bfloat16* __restrict__ act,               // [top_k, K] per-slot activations
+    const unsigned long long* __restrict__ trellis_tab,  // [num_experts]
+    const unsigned long long* __restrict__ suh_tab,      // [num_experts]
+    const unsigned long long* __restrict__ svh_tab,      // [num_experts]
+    const unsigned int* __restrict__ indices,            // [top_k] routed ids
+    __nv_bfloat16* __restrict__ down_out,                // [top_k, N]
+    float* __restrict__ ws,                              // [gridDim.z, gridDim.y, N]
+    int* __restrict__ counters,                          // [gridDim.z, N/128]
+    unsigned int N, unsigned int K) {
+    const unsigned int slot = blockIdx.z;
+    const unsigned int e = indices[slot];
+    exl3_gemv_m1_body(act + (size_t)slot * K, (const unsigned short*)trellis_tab[e],
+                      (const __half*)suh_tab[e], (const __half*)svh_tab[e],
+                      down_out + (size_t)slot * N, ws + (size_t)slot * gridDim.y * N,
+                      counters + slot * (N >> 7), N, K);
+}
+
+// ---------------------------------------------------------------------------
 // exl3_dequant_dump: debug oracle — decode every tile and store the raw fp16
 // weights as W[n][k] row-major [N, K] (NO Hadamard / suh / svh applied). The
 // microtest byte-compares this against the CPU reference decode: the gate is
