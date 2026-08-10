@@ -58,6 +58,30 @@ pub(crate) fn fp4_decode_smallm_min() -> u32 {
     })
 }
 
+/// Minimum `worst_case_m_tiles` before the exact-tiles grid sizing is worth
+/// its host-blocking `cuStreamSynchronize` (see the call site).
+///
+/// The empty-CTA overprovision scales with `worst_case_m_tiles`: at prefill
+/// N=2410 it is 226, of which only `blockIdx.y == 0` does work, so 8192 live
+/// CTAs are launched inside a grid of 1,851,392. At decode-M it is 1-2 and
+/// there is nothing to recover — but the sync would still drain the pipeline
+/// every MoE layer, which is exactly what must not happen in the decode loop.
+///
+/// Default 32 (≈250+ tokens in flight at top_k=8) keeps every decode fire and
+/// every tiny prefill chunk on the zero-sync worst-case grid, where the
+/// recoverable time is below the cost of the drain. Tunable via
+/// `ATLAS_MOE_PREFILL_EXACT_TILES_MIN`; 0 = always take the exact path.
+fn prefill_exact_tiles_min() -> u32 {
+    use std::sync::OnceLock;
+    static MIN: OnceLock<u32> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES_MIN")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(32)
+    })
+}
+
 impl MoeLayer {
     /// Routed-expert grouped-GEMM path: upper-bound grid sizing → grouped
     /// gate+up GEMM → SiLU+mul → grouped down GEMM.
@@ -102,11 +126,40 @@ impl MoeLayer {
         // Holo experiments trade that safety margin for fewer empty expert
         // tiles after validating the router histogram.
         let worst_case_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
-        let exact_tiles = std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES")
-            .ok()
-            .as_deref()
-            == Some("1")
-            && !ctx.graph_capture;
+        // EMPTY-CTA GRID. `worst_case_m_tiles` assumes one expert receives every
+        // routed token. At prefill N the router is near-uniform, so every expert
+        // holds <= 64 rows and only `blockIdx.y == 0` does any work: at N=2410
+        // that is 8192 live CTAs inside a grid of 1,851,392, and grid.y is pure
+        // launch overhead (no kernel in moe_w4a16_grouped_gemm.cu reads gridDim,
+        // and every one of them opens with `if (cta_m_local >= M_expert) return;`,
+        // so the surplus blocks are exact no-ops — shrinking grid.y is
+        // bit-identical, it only stops launching blocks that returned anyway).
+        //
+        // The exact path reads the real per-expert histogram, so it is a
+        // MEASUREMENT, not a heuristic cap like ATLAS_MOE_PREFILL_MAX_LOAD_FACTOR
+        // below: it can never truncate an expert, and it is still clamped into
+        // [1, worst_case_m_tiles].
+        //
+        // Why it was not already the default: `copy_d2h_on_stream` issues a
+        // `cuStreamSynchronize` (crates/spark-runtime/src/cuda_backend/gpu_impl.rs)
+        // — a full pipeline drain per MoE layer. That is illegal under CUDA-graph
+        // capture and ruinous at decode-M, where the whole step is ~1 ms and
+        // `worst_case_m_tiles` is already 1-2 so there is nothing to win. Both
+        // are now gated instead of leaving the whole optimization off:
+        //   * `!ctx.graph_capture` — capture keeps the worst-case grid (unchanged),
+        //   * `worst_case_m_tiles >= prefill_exact_tiles_min()` — every decode
+        //     fire (total_expanded <= 2048 at the default 32) and every tiny
+        //     prefill chunk keeps the worst-case grid, so the decode path is
+        //     bit- AND timing-identical to before this change.
+        // `ATLAS_MOE_PREFILL_EXACT_TILES=0` forces off (full revert of the
+        // default change), `=1` forces on regardless of the tile threshold.
+        let exact_tiles_force = std::env::var("ATLAS_MOE_PREFILL_EXACT_TILES");
+        let exact_tiles = !ctx.graph_capture
+            && match exact_tiles_force.as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => worst_case_m_tiles >= prefill_exact_tiles_min(),
+            };
         let max_m_tiles = if exact_tiles {
             let mut offsets = vec![0u8; (ne + 1) * 4];
             ctx.gpu

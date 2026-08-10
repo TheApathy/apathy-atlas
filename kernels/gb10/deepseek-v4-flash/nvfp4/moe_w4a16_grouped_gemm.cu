@@ -27,6 +27,44 @@
 #define BP_PAD 16
 #define GROUP_SIZE 16
 
+// ── Packed bf16x2 epilogue store (K64 prefill kernels) ────────────────────
+// Default ON. Fuses the two adjacent 2-byte bf16 result stores of each MMA
+// accumulator pair into one 4-byte __nv_bfloat162 store, halving the 8192
+// epilogue stores per CTA. BIT-IDENTICAL: the float→bf16 conversion is NOT
+// changed — each accumulator still goes through the very same
+// __float2bfloat16() call, and only the two resulting bf16 words are packed
+// with __halves2bfloat162(). We deliberately do NOT use
+// __floats2bfloat162_rn() (which would emit cvt.rn.bf16x2.f32 in place of two
+// cvt.rn.bf16.f32) so that no rounding question can arise at all.
+// Revert without touching source:
+//   ATLAS_EXTRA_NVCC_FLAGS="-DATLAS_MOE_NO_PACKED_EPILOGUE"
+#ifdef ATLAS_MOE_NO_PACKED_EPILOGUE
+#define ATLAS_MOE_PACKED_EPILOGUE 0
+#else
+#define ATLAS_MOE_PACKED_EPILOGUE 1
+#endif
+
+// ── Widened dequant STS (K64 prefill kernels) ─────────────────────────────
+// Default ON. The FP4->FP8 dequant loop emitted one 2-byte STS per `kp`
+// (32 per thread per k-step). Unrolling by 2 and OR-ing the two 16-bit
+// cvt.rn.satfinite.e4m3x2.f32 results into one 32-bit STS halves that to 16.
+// BIT-IDENTICAL: identical LUT lookups, identical `* s` multiply, identical
+// cvt instruction with identical operands, in the identical order — only the
+// two resulting halfwords are merged before the store. Nothing about the
+// dequant math or its order changes.
+// Bank-conflict note: smem_B_fp8 row stride is K_STEP_T64+16 = 80 B = 20
+// words, and gcd(20,32) = 4, so lane `my_n` hits bank (my_n*20 + off) % 32 —
+// only 8 distinct banks across a warp, i.e. a 4-way conflict. Widening does
+// NOT remove the conflict (the row stride is what causes it); it halves the
+// number of conflicting transactions.
+// Revert without touching source:
+//   ATLAS_EXTRA_NVCC_FLAGS="-DATLAS_MOE_NO_WIDE_DEQUANT_STORE"
+#ifdef ATLAS_MOE_NO_WIDE_DEQUANT_STORE
+#define ATLAS_MOE_WIDE_DEQUANT_STORE 0
+#else
+#define ATLAS_MOE_WIDE_DEQUANT_STORE 1
+#endif
+
 __device__ __constant__ float E2M1_LUT_MOE[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -567,7 +605,7 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
     __shared__ __nv_bfloat16 smem_A_k64[2][M_TILE][K_STEP_T64 + PAD_T64];
     __shared__ unsigned char smem_Bp_k64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
     __shared__ unsigned char smem_Bs_k64[2][K_STEP_T64 / GS][N_TILE_LG + BP_PAD];
-    __shared__ unsigned char smem_B_fp8_k64[N_TILE_LG][K_STEP_T64 + 16];
+    __shared__ __align__(4) unsigned char smem_B_fp8_k64[N_TILE_LG][K_STEP_T64 + 16];
     __shared__ float smem_LUT_k64[16];
     __shared__ int smem_tok_k64[M_TILE];
 
@@ -631,6 +669,42 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
 
     // Dequant B: FP4 → FP8 E4M3. K_STEP_T64/GS scale groups (NVFP4 GS=16 → 4;
     // E8M0 GS=32 → 2). sv[g] = mx_block_scale<E8M0> (RIDER 1); NVFP4 byte-identical.
+    //
+    // WIDENED STORE (bit-identical — see ATLAS_MOE_WIDE_DEQUANT_STORE at top).
+    // The kp loop is unrolled by 2 so the two 16-bit cvt results of kp and kp+1,
+    // which target the CONSECUTIVE byte pairs [kp*2, kp*2+1] and [kp*2+2,
+    // kp*2+3] of the same row, are merged into one 32-bit STS: 32 stores/thread
+    // → 16. Every LUT lookup, every `* s` multiply and every
+    // cvt.rn.satfinite.e4m3x2.f32 keeps its exact operands and its exact order;
+    // only the store instruction is merged, so the bytes written are identical.
+    // The scale index is unaffected: kp/(GS/2) with GS/2 ∈ {8,16} is the same
+    // for kp = 2*kq and 2*kq+1 because GS/2 is even.
+#if ATLAS_MOE_WIDE_DEQUANT_STORE
+    #define K64_DEQUANT(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        float sv[K_STEP_T64 / GS]; \
+        _Pragma("unroll") \
+        for (int g = 0; g < K_STEP_T64 / GS; g++) \
+            sv[g] = mx_block_scale<E8M0>(smem_Bs_k64[(buf)][g][my_n], scale2); \
+        _Pragma("unroll") \
+        for (int kq = 0; kq < K_STEP_T64 / 4; kq++) { \
+            unsigned short fp8_pair[2]; \
+            _Pragma("unroll") \
+            for (int hh = 0; hh < 2; hh++) { \
+                int kp = kq * 2 + hh; \
+                float s = sv[kp / (GS / 2)]; \
+                unsigned char packed = smem_Bp_k64[(buf)][kp][my_n]; \
+                float lo = smem_LUT_k64[packed & 0xF] * s; \
+                float hi = smem_LUT_k64[packed >> 4] * s; \
+                asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                             : "=h"(fp8_pair[hh]) : "f"(hi), "f"(lo)); \
+            } \
+            *(unsigned int*)&smem_B_fp8_k64[my_n][kq * 4] = \
+                ((unsigned int)fp8_pair[1] << 16) | (unsigned int)fp8_pair[0]; \
+        } \
+    } while(0)
+#else
+    // ORIGINAL narrow form: one 2-byte STS per kp.
     #define K64_DEQUANT(buf) do { \
         unsigned int my_n = threadIdx.x; \
         float sv[K_STEP_T64 / GS]; \
@@ -649,6 +723,7 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
             *(unsigned short*)&smem_B_fp8_k64[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
+#endif
 
     // Two m16n8k32 MMA calls per N-tile: first covers k=0..31, second k=32..63.
     // a0..a3 loaded first, all N-tile first-half MMAs done, then a4..a7, then second-half.
@@ -715,6 +790,25 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
     #undef K64_DEQUANT
     #undef K64_COMPUTE_MMA
 
+    // PACKED EPILOGUE (bit-identical — see ATLAS_MOE_PACKED_EPILOGUE at top).
+    // acc[nt][0]/acc[nt][1] (and [2]/[3]) land in COLUMNS c0, c0+1 of the SAME
+    // row, i.e. adjacent __nv_bfloat16 elements, so the pair is one 4-byte
+    // store. Alignment proof for &C[r*N + c0]:
+    //   * c0 = cta_n + nt*8 + tid*2 — cta_n = blockIdx.x*N_TILE_LG (128), and
+    //     nt*8 / tid*2 are even, so c0 is ALWAYS even;
+    //   * r*N is even iff N is even — r is data-dependent, so N's parity is a
+    //     real precondition (the "cta_n is a multiple of 128" argument alone is
+    //     NOT sufficient). Guarded at runtime by (N & 1) == 0.
+    //   * C's own base must be 4-byte aligned; device allocations are, but we
+    //     assert it in the guard rather than assume it.
+    // Both are warp-uniform, so `pack_ok` costs one predicate, not a divergence.
+    // The packed path is taken only when BOTH columns are in range (c1 < N
+    // implies c0 < N); otherwise the original scalar pair runs unchanged.
+#if ATLAS_MOE_PACKED_EPILOGUE
+    const bool pack_ok = ((N & 1u) == 0u) && ((((unsigned long long)C) & 3ull) == 0ull);
+#else
+    const bool pack_ok = false;
+#endif
     #pragma unroll
     for (int nt = 0; nt < 16; nt++) {
         unsigned int c0 = cta_n + nt*8 + tid*2;
@@ -723,10 +817,17 @@ __device__ __forceinline__ void moe_w4a16_grouped_gemm_ptrtable_t_k64_impl(
         unsigned int r1 = r0 + 8;
         bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
         bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
-        if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
-        if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
-        if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
-        if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        if (pack_ok && c1 < N) {
+            if (r0v) *(__nv_bfloat162*)&C[r0*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][0]), __float2bfloat16(acc[nt][1]));
+            if (r1v) *(__nv_bfloat162*)&C[r1*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][2]), __float2bfloat16(acc[nt][3]));
+        } else {
+            if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
+            if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
+            if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
+            if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        }
     }
 }
 
@@ -831,7 +932,7 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
     __shared__ unsigned char smem_Bp_fgu64[2][K_STEP_T64 / 2][N_TILE_LG + BP_PAD];
     __shared__ unsigned char smem_Bs_fgu64[2][K_STEP_T64 / GS][N_TILE_LG + BP_PAD];
     // B_fp8 row stride 80 bytes → zero smem bank conflicts (see K64_DEQUANT comment above).
-    __shared__ unsigned char smem_B_fp8_fgu64[N_TILE_LG][K_STEP_T64 + 16];
+    __shared__ __align__(4) unsigned char smem_B_fp8_fgu64[N_TILE_LG][K_STEP_T64 + 16];
     __shared__ float smem_LUT_fgu64[16];
     __shared__ int smem_tok_fgu64[M_TILE];
 
@@ -892,6 +993,34 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
 
     // Dequant B: FP4 → FP8 E4M3. K_STEP_T64/GS scale groups (NVFP4 GS=16 → 4;
     // E8M0 GS=32 → 2). sv[g] = mx_block_scale<E8M0> (RIDER 1); NVFP4 byte-identical.
+    // WIDENED STORE — identical transform and identical bit-identity argument
+    // as K64_DEQUANT above (see ATLAS_MOE_WIDE_DEQUANT_STORE at top).
+#if ATLAS_MOE_WIDE_DEQUANT_STORE
+    #define FGU64_DEQUANT(buf) do { \
+        unsigned int my_n = threadIdx.x; \
+        float sv[K_STEP_T64 / GS]; \
+        _Pragma("unroll") \
+        for (int g = 0; g < K_STEP_T64 / GS; g++) \
+            sv[g] = mx_block_scale<E8M0>(smem_Bs_fgu64[(buf)][g][my_n], scale2); \
+        _Pragma("unroll") \
+        for (int kq = 0; kq < K_STEP_T64 / 4; kq++) { \
+            unsigned short fp8_pair[2]; \
+            _Pragma("unroll") \
+            for (int hh = 0; hh < 2; hh++) { \
+                int kp = kq * 2 + hh; \
+                float s = sv[kp / (GS / 2)]; \
+                unsigned char packed = smem_Bp_fgu64[(buf)][kp][my_n]; \
+                float lo = smem_LUT_fgu64[packed & 0xF] * s; \
+                float hi = smem_LUT_fgu64[packed >> 4] * s; \
+                asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" \
+                             : "=h"(fp8_pair[hh]) : "f"(hi), "f"(lo)); \
+            } \
+            *(unsigned int*)&smem_B_fp8_fgu64[my_n][kq * 4] = \
+                ((unsigned int)fp8_pair[1] << 16) | (unsigned int)fp8_pair[0]; \
+        } \
+    } while(0)
+#else
+    // ORIGINAL narrow form: one 2-byte STS per kp.
     #define FGU64_DEQUANT(buf) do { \
         unsigned int my_n = threadIdx.x; \
         float sv[K_STEP_T64 / GS]; \
@@ -910,6 +1039,7 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
             *(unsigned short*)&smem_B_fp8_fgu64[my_n][kp * 2] = fp8_pair; \
         } \
     } while(0)
+#endif
 
     #define FGU64_COMPUTE_MMA(a_buf) do { \
         const unsigned short* sA = (const unsigned short*)smem_A_fgu64[(a_buf)]; \
@@ -973,6 +1103,16 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
     #undef FGU64_DEQUANT
     #undef FGU64_COMPUTE_MMA
 
+    // PACKED EPILOGUE (bit-identical — see ATLAS_MOE_PACKED_EPILOGUE at top).
+    // Same argument as the down GEMM epilogue above. One extra wrinkle here:
+    // for the up half `cta_n = global_n - N`, so cta_n stays even only because
+    // N is even — which is exactly the condition `pack_ok` already tests, so a
+    // single guard covers both the c0 parity and the r*N parity.
+#if ATLAS_MOE_PACKED_EPILOGUE
+    const bool pack_ok = ((N & 1u) == 0u) && ((((unsigned long long)C) & 3ull) == 0ull);
+#else
+    const bool pack_ok = false;
+#endif
     #pragma unroll
     for (int nt = 0; nt < 16; nt++) {
         unsigned int c0 = cta_n + nt*8 + tid*2;
@@ -981,10 +1121,17 @@ __device__ __forceinline__ void moe_w4a16_fused_gate_up_t_k64_impl(
         unsigned int r1 = r0 + 8;
         bool r0v = (int)(warp_m_offset + group_id + cta_m_local) < M_expert;
         bool r1v = (int)(warp_m_offset + group_id + 8 + cta_m_local) < M_expert;
-        if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
-        if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
-        if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
-        if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        if (pack_ok && c1 < N) {
+            if (r0v) *(__nv_bfloat162*)&C[r0*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][0]), __float2bfloat16(acc[nt][1]));
+            if (r1v) *(__nv_bfloat162*)&C[r1*N+c0] = __halves2bfloat162(
+                __float2bfloat16(acc[nt][2]), __float2bfloat16(acc[nt][3]));
+        } else {
+            if (r0v && c0 < N) C[r0*N+c0] = __float2bfloat16(acc[nt][0]);
+            if (r0v && c1 < N) C[r0*N+c1] = __float2bfloat16(acc[nt][1]);
+            if (r1v && c0 < N) C[r1*N+c0] = __float2bfloat16(acc[nt][2]);
+            if (r1v && c1 < N) C[r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        }
     }
 }
 
