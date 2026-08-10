@@ -74,6 +74,11 @@ const NAMES: [&str; NUM_PHASES] = [
 static SUM_US: [AtomicU64; NUM_PHASES] = [const { AtomicU64::new(0) }; NUM_PHASES];
 static COUNT: [AtomicU64; NUM_PHASES] = [const { AtomicU64::new(0) }; NUM_PHASES];
 static STEPS: AtomicU64 = AtomicU64::new(0);
+/// Tokens committed (accepted drafts + bonus) across the current window —
+/// fed by `record_committed` from the verify step so the summary line can
+/// print tok/step and effective tok/s alongside the phase wall times
+/// (the joined quantities the SPEC-3X arithmetic needs; docs/SPEC-3X-PLAN.md).
+static COMMITTED_TOKS: AtomicU64 = AtomicU64::new(0);
 
 /// Scheduler-thread step clock (guarded for soundness; uncontended).
 struct Clock {
@@ -100,6 +105,16 @@ pub(crate) fn enabled() -> bool {
 fn add(phase: Phase2, us: u64) {
     SUM_US[phase as usize].fetch_add(us, Ordering::Relaxed);
     COUNT[phase as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record the tokens a verify step committed (accepted drafts + bonus).
+/// No-op when disarmed. Called once per verify step, right next to
+/// `accept_log::record`, so the window matches the phase timings exactly.
+pub(crate) fn record_committed(toks: usize) {
+    if !enabled() {
+        return;
+    }
+    COMMITTED_TOKS.fetch_add(toks as u64, Ordering::Relaxed);
 }
 
 /// Record an out-of-step span (e.g. `Collect`) measured by the caller.
@@ -200,7 +215,15 @@ fn summarize() {
     let wall_ms = (sums[Phase2::StepTotal as usize] + sums[Phase2::LoopGap as usize]) as f64
         / 1000.0
         / SUMMARY_PERIOD as f64;
+    // Joined acceptance × step-time view: committed tokens over the SAME
+    // window as the wall times, so `spec_tok_s` is the actual speculative
+    // throughput this window sustained (committed / wall), not an estimate
+    // stitched from two differently-windowed logs.
+    let committed = COMMITTED_TOKS.swap(0, Ordering::Relaxed) as f64;
+    let tok_step = committed / SUMMARY_PERIOD as f64;
+    let spec_tok_s = if wall_ms > 0.0 { tok_step * 1000.0 / wall_ms } else { 0.0 };
     tracing::info!(
-        "DFLASH STEP_TIMING2 [{SUMMARY_PERIOD} steps]:{line} other={other_ms:.2}ms wall={wall_ms:.2}ms/step"
+        "DFLASH STEP_TIMING2 [{SUMMARY_PERIOD} steps]:{line} other={other_ms:.2}ms \
+         wall={wall_ms:.2}ms/step tok_step={tok_step:.2} spec_tok_s={spec_tok_s:.1}"
     );
 }

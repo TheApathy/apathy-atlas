@@ -366,6 +366,11 @@ pub fn step_verify_dflash(
     // completely different fixes, and a peer session measured exactly such a
     // bimodal split (modes at 0 and full) on a different model.
     accept_log::record(num_accepted + committed_extra, drafts.len());
+    // STEP_TIMING2 companion: feed committed tokens (accepted drafts + bonus)
+    // into the same 64-step window as the phase timings, so ONE summary line
+    // yields tok/step AND effective tok/s = committed / wall — the two
+    // quantities the SPEC-3X arithmetic needs joined (docs/SPEC-3X-PLAN.md).
+    crate::scheduler::step_timing2::record_committed(num_accepted + committed_extra + 1);
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix
