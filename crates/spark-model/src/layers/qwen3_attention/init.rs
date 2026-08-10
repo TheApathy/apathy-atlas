@@ -179,6 +179,7 @@ impl Qwen3AttentionLayer {
                 "hyper_connection",
                 "hc_pre_mix_tiled",
             ),
+            hc_pre_fused_k: super::super::try_kernel(gpu, "hyper_connection", "hc_pre_fused"),
             hc_post_k: super::super::try_kernel(gpu, "hyper_connection", "hc_post"),
             hc_expand_k: super::super::try_kernel(gpu, "hyper_connection", "hc_expand"),
             hc_head_k: super::super::try_kernel(gpu, "hyper_connection", "hc_head"),
@@ -457,6 +458,16 @@ impl Qwen3AttentionLayer {
                 gpu,
                 "mla_absorbed",
                 "mla_cache_assemble_batched",
+            ),
+            v4_decode_rope_fused_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "v4_decode_rope_fused",
+            ),
+            v4_decode_cache_fused_fp8_k: super::super::try_kernel(
+                gpu,
+                "mla_absorbed",
+                "v4_decode_cache_fused_fp8",
             ),
             prefill_attn_mla320_k: super::super::try_kernel(
                 gpu,

@@ -144,6 +144,9 @@ pub struct Qwen3AttentionLayer {
     /// ~once (fn per 32-token tile, x once). 2.39 vs 3.99 ms at T=2410,
     /// y cosine 1.0000000 vs hc_pre. 0 on miss.
     pub(super) hc_pre_mix_tiled_k: KernelHandle,
+    /// Single-launch multi-block decode hc_pre (ATLAS_V4_DECODE_FUSED=1):
+    /// row-parallel mix + last-block finish, T==1 only. Zero when absent.
+    pub(super) hc_pre_fused_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
     /// HC `hc_expand` kernel handle (NULL when HC disabled).
@@ -299,6 +302,13 @@ pub struct Qwen3AttentionLayer {
     pub(super) mla_q_rope_writeback_batched_k: KernelHandle,
     pub(super) mla_kv_assemble_batched_k: KernelHandle,
     pub(super) mla_cache_assemble_batched_k: KernelHandle,
+    /// V4 M=1 decode glue fusion (ATLAS_V4_DECODE_FUSED=1): in-place fused
+    /// Q+K interleaved-YaRN rope (replaces extract×2 + rope + writeback×2)
+    /// and fused MLA cache assemble + FP8 paged write (replaces
+    /// cache_assemble + reshape_and_cache_flash_fp8). Zero handle when the
+    /// model's `mla_absorbed` module doesn't ship them (non-V4 targets).
+    pub(super) v4_decode_rope_fused_k: KernelHandle,
+    pub(super) v4_decode_cache_fused_fp8_k: KernelHandle,
     /// MLA absorbed prefill flash attention (HDIM=320, GQA 32:1)
     pub(super) prefill_attn_mla320_k: KernelHandle,
     /// Grouped GEMM for MLA Q absorption + V extraction.

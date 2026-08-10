@@ -12,6 +12,19 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+use super::super::helpers::v4_decode_fused_enabled;
+
+/// Opt-in post-freeze FP8-KV EMA recalibration needs the per-token
+/// `observe()` on the assembled BF16 rows — which the fused cache write
+/// never materializes — so its presence forces the unfused path.
+fn fp8_ema_recal_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_FP8_KV_EMA_RECAL")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 impl Qwen3AttentionLayer {
     /// Run the DeepSeek-V4-Flash decode chain. Returns the O-projection
     /// output (`ctx.buffers.qkv_output()`).
@@ -295,9 +308,61 @@ impl Qwen3AttentionLayer {
             }
         } // end !skip_qkv (Steps 1-2)
 
+        // Rope table + attention-temperature scale for this layer type.
+        // Sliding layers (compressor==None) = reference "main" rope: plain
+        // θ=10000, mscale=1 (no yarn). CSA/HCA keep θ=160000 yarn.
+        let (rope_inv_freq, rope_mscale) = if mla.compressor.is_none() {
+            (mla.main_inv_freq, 1.0f32)
+        } else {
+            (
+                mla.yarn_inv_freq,
+                super::super::helpers::yarn_rope_mscale(ctx.config),
+            )
+        };
+
+        // ── ATLAS_V4_DECODE_FUSED=1 (default OFF): collapse the M=1 decode
+        // glue — rope extract×2 + rope + writeback×2 → one in-place kernel,
+        // and cache_assemble + FP8 paged write → one kernel (waterfall
+        // 2026-08-10: these are launch/node-bound 5-8µs kernels ×43 layers).
+        // Both fusions are tier-1 bit-identical (see mla_absorbed.cu).
+        // Constraints: FP8 KV only, and only once FP8 calibration is frozen
+        // (the unfused path's `observe()` needs the assembled BF16 rows; the
+        // fused path never materializes them). ATLAS_FP8_KV_EMA_RECAL also
+        // forces the unfused path — post-freeze recalibration re-observes.
+        let fused_glue = v4_decode_fused_enabled()
+            && self.v4_decode_rope_fused_k.0 != 0
+            && self.v4_decode_cache_fused_fp8_k.0 != 0
+            && matches!(self.kv_dtype, spark_runtime::kv_cache::KvCacheDtype::Fp8)
+            && !fp8_ema_recal_enabled()
+            && !self
+                .fp8_calibration
+                .as_ref()
+                .is_some_and(|c| c.is_calibrating());
+
         // ── Step 3: RoPE for Q and K ──
         // V4-Flash: rope dims are at offset `nope` per head (matching MLA layout),
-        // not at the beginning. Extract → RoPE → writeback.
+        // not at the beginning. Extract → RoPE → writeback (or the fused
+        // in-place kernel when `fused_glue`).
+        if fused_glue {
+            prof!("rope_fused", {
+                ops::v4_decode_rope_fused(
+                    ctx.gpu,
+                    self.v4_decode_rope_fused_k,
+                    q_out,
+                    k_out,
+                    meta.positions,
+                    nq,
+                    1,
+                    hd,
+                    mla.nope as u32,
+                    mla_rope,
+                    rope_inv_freq,
+                    rope_mscale,
+                    false,
+                    stream,
+                )
+            })?;
+        } else {
         let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
         let k_rope_tmp = q_latent; // reuse after wq_b is done
         prof!("rope_extract", {
@@ -351,18 +416,8 @@ impl Qwen3AttentionLayer {
                 1,
                 mla_rope,
                 mla_rope,
-                // Sliding layers (compressor==None) = reference "main" rope:
-                // plain θ=10000, mscale=1 (no yarn). CSA/HCA keep θ=160000 yarn.
-                if mla.compressor.is_none() {
-                    mla.main_inv_freq
-                } else {
-                    mla.yarn_inv_freq
-                },
-                if mla.compressor.is_none() {
-                    1.0f32
-                } else {
-                    super::super::helpers::yarn_rope_mscale(ctx.config)
-                },
+                rope_inv_freq,
+                rope_mscale,
                 stream,
             )
         })?;
@@ -396,6 +451,7 @@ impl Qwen3AttentionLayer {
                 stream,
             )
         })?;
+        } // end !fused_glue rope chain
         if diag_this {
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
@@ -420,47 +476,75 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        // ── Step 3.5: Assemble KV cache (V4-Flash: requires latent+rope assembly) ──
+        // ── Step 3.5 + 4: Assemble KV cache and write to paged pools ──
         // Cache needs 576-dim (512 latent + 64 rope), but k_out/v_out are 512-dim.
-        // Extract RoPE from Q (which has correct [nope|rope] structure) and reuse for K cache.
-        let k_cache_assembled = ctx.buffers.ssm_deinterleaved();
-        let v_cache_assembled = ctx.buffers.ssm_qkvz();
         let kv_lora = mla.kv_lora_rank as u32;
         let mla_cache_dim = kv_lora + mla_rope;
-        prof!("cache_assemble", {
-            ops::mla_cache_assemble_batched(
-                ctx.gpu,
-                self.mla_cache_assemble_batched_k,
-                v_out,      // 512-dim latent K (unmodified copy before RoPE writeback)
-                k_rope_tmp, // 64-dim RoPE from K
-                k_cache_assembled,
-                v_cache_assembled,
-                1,
-                kv_lora,
-                mla_rope,
-                mla_cache_dim,
-                stream,
-            )
-        })?;
+        if fused_glue {
+            // One kernel: quantize [v_out latent | roped K tail] straight into
+            // the FP8 K/V pools (K row == V row content, per-pool scales) —
+            // replaces cache_assemble + write_kv_cache. The roped K tail lives
+            // in-place at k_out[nope..nope+rope) after the fused rope above.
+            let (k_scale, v_scale) = self.effective_fp8_scales();
+            prof!("cache_fused", {
+                ops::v4_decode_cache_fused_fp8(
+                    ctx.gpu,
+                    self.v4_decode_cache_fused_fp8_k,
+                    v_out, // 512-dim latent K (unmodified copy before RoPE)
+                    k_out.offset(mla.nope * 2), // 64-dim roped K tail
+                    kv_cache.k_pool_ptr(self.attn_layer_idx),
+                    kv_cache.v_pool_ptr(self.attn_layer_idx),
+                    meta.slot,
+                    kv_lora,
+                    mla_rope,
+                    bs as u32,
+                    k_scale,
+                    v_scale,
+                    kv_cache.cache_stride() as u64,
+                    stream,
+                )
+            })?;
+        } else {
+            let k_cache_assembled = ctx.buffers.ssm_deinterleaved();
+            let v_cache_assembled = ctx.buffers.ssm_qkvz();
+            // 64-dim roped K in the contiguous rope scratch (aliases q_latent;
+            // written by the unfused rope chain above).
+            let k_rope_tmp = q_latent;
+            prof!("cache_assemble", {
+                ops::mla_cache_assemble_batched(
+                    ctx.gpu,
+                    self.mla_cache_assemble_batched_k,
+                    v_out,      // 512-dim latent K (unmodified copy before RoPE writeback)
+                    k_rope_tmp, // 64-dim RoPE from K
+                    k_cache_assembled,
+                    v_cache_assembled,
+                    1,
+                    kv_lora,
+                    mla_rope,
+                    mla_cache_dim,
+                    stream,
+                )
+            })?;
 
-        // ── Step 4: Write assembled K/V to paged cache ──
-        prof!("write_kv_cache", {
-            self.write_kv_cache(
-                ctx.gpu,
-                k_cache_assembled,
-                v_cache_assembled,
-                kv_cache,
-                meta.slot,
-                1,
-                1,
-                mla_cache_dim,
-                bs as u32,
-                mla_cache_dim,
-                mla_cache_dim,
-                stream,
-                ctx.graph_capture,
-            )
-        })?;
+            // ── Step 4: Write assembled K/V to paged cache ──
+            prof!("write_kv_cache", {
+                self.write_kv_cache(
+                    ctx.gpu,
+                    k_cache_assembled,
+                    v_cache_assembled,
+                    kv_cache,
+                    meta.slot,
+                    1,
+                    1,
+                    mla_cache_dim,
+                    bs as u32,
+                    mla_cache_dim,
+                    mla_cache_dim,
+                    stream,
+                    ctx.graph_capture,
+                )
+            })?;
+        }
 
         // ── Step 5: Paged decode attention ──
         // Batched-verify seam: land the attention output directly in the
@@ -503,7 +587,29 @@ impl Qwen3AttentionLayer {
         // relative-distance. Since V==K carries the rotated rope in its trailing
         // `mla_rope` dims, undo that rotation on the output before o_proj. Reuse
         // the Q rope extract/writeback with the conjugate (negated-sin) kernel.
-        {
+        // Fused variant: conjugate in-place rotation of the Q-head tails —
+        // one launch instead of extract → inv-rope → writeback. Independent of
+        // the cache-side conditions (tier-1 bit-identical either way).
+        if v4_decode_fused_enabled() && self.v4_decode_rope_fused_k.0 != 0 {
+            ops::v4_decode_rope_fused(
+                ctx.gpu,
+                self.v4_decode_rope_fused_k,
+                attn_out,
+                attn_out, // unused (nkv=0); must be a valid pointer arg
+                meta.positions,
+                nq,
+                0, // no KV heads — de-rotate the query/output heads only
+                hd,
+                mla.nope as u32,
+                mla_rope,
+                // MUST match the Q/K rope inv_freq for this layer type (rope-in
+                // == de-rotate-out), else the output is scrambled.
+                rope_inv_freq,
+                rope_mscale,
+                true,
+                stream,
+            )?;
+        } else {
             let o_rope_tmp = ctx.buffers.ssm_conv_out_f32();
             ops::mla_q_rope_extract_batched(
                 ctx.gpu,
@@ -532,16 +638,8 @@ impl Qwen3AttentionLayer {
                 // MUST match the Q/K rope inv_freq for this layer type (rope-in
                 // == de-rotate-out), else the output is scrambled. Sliding =
                 // main θ=10000; CSA/HCA = θ=160000 yarn.
-                if mla.compressor.is_none() {
-                    mla.main_inv_freq
-                } else {
-                    mla.yarn_inv_freq
-                },
-                if mla.compressor.is_none() {
-                    1.0f32
-                } else {
-                    super::super::helpers::yarn_rope_mscale(ctx.config)
-                },
+                rope_inv_freq,
+                rope_mscale,
                 stream,
             )?;
             ops::mla_q_rope_writeback_batched(

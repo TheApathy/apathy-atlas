@@ -32,6 +32,19 @@ pub(crate) fn yarn_rope_mscale(config: &atlas_core::config::ModelConfig) -> f32 
     num / den
 }
 
+/// ATLAS_V4_DECODE_FUSED=1 enables the fused M=1 decode glue kernels:
+/// V4 rope extract/rotate/writeback ×5 → 1, cache assemble + FP8 write
+/// ×2 → 1, attention-output de-rotation ×3 → 1, and the single-launch
+/// multi-block `hc_pre_fused`. Default OFF until serve-validated (playbook
+/// §6); every fusion is tier-1 bit-identical (`v4_decode_fused_microtest`).
+pub(crate) fn v4_decode_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_V4_DECODE_FUSED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 impl Qwen3AttentionLayer {
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.

@@ -353,6 +353,163 @@ extern "C" __global__ void mla_q_final_assemble_batched(
 // DECODE SINGLE-TOKEN VARIANTS (existing)
 // ════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+// V4 M=1 DECODE GLUE FUSION (ATLAS_V4_DECODE_FUSED=1)
+//
+// The plain-decode attention chain launches 8 tiny glue kernels per layer
+// (waterfall 2026-08-10: rope_extract 6.7µs, rope 6.1, rope_writeback 5.1,
+// k_rope_extract 5.1, k_rope_writeback 5.1, cache_assemble 5.2, write_kv_cache
+// 7.6 — each moving KBs, all launch/node-bound at M=1). The two kernels below
+// collapse the rope group (5 launches) and the cache group (2 launches) into
+// one launch each:
+//
+//   v4_decode_rope_fused      = mla_q_rope_extract_batched (Q) +
+//                               mla_q_rope_extract_batched (K) +
+//                               rope_forward_yarn_interleaved[_inv] +
+//                               mla_q_rope_writeback_batched (Q) +
+//                               mla_q_rope_writeback_batched (K)
+//   v4_decode_cache_fused_fp8 = mla_cache_assemble_batched +
+//                               reshape_and_cache_flash_fp8
+//
+// Numerics tier 1 (bit-identical): the extract/writeback stages are pure BF16
+// data movement (copies do not change bits) and the remaining arithmetic is
+// written with the exact same expressions, operand order, and conversion
+// intrinsics as the incumbent kernels (see rope.cu:rope_forward_yarn_interleaved
+// and reshape_and_cache.cu:reshape_and_cache_flash_fp8). No reductions anywhere
+// in the chain, so there is no reassociation to worry about.
+// ════════════════════════════════════════════════════════════════════════════
+
+#include <cuda_fp8.h>
+
+// Fused decode-step rope for the V4-Flash direct-KV chain: rotates the
+// trailing `rope` interleaved channels of each Q head (and the single K head
+// when nkv==1) IN PLACE, replacing the extract → rotate → writeback triple.
+//
+// Layout contract (matches attention_forward_v4.rs step 3): each head's rope
+// channels live at [nope, nope+rope) within its `hd`-wide slice; pairs are
+// interleaved (2i, 2i+1); frequency for pair i is inv_freq[i]; the YaRN
+// attention-temperature mscale is folded into cos/sin exactly as the
+// incumbent kernel does. `conjugate != 0` selects the negated-sin (inverse)
+// rotation used by the step-5.5 attention-output de-rotation (pass nkv=0 and
+// k_full may be null in that mode).
+//
+// Single token only (positions[0] is THE decode position).
+// Grid: (ceil((nq+nkv)*rope/2 / 256), 1, 1)  Block: (256, 1, 1)
+extern "C" __global__ void v4_decode_rope_fused(
+    __nv_bfloat16* __restrict__ q_full,          // [nq, hd] rotated in place
+    __nv_bfloat16* __restrict__ k_full,          // [nkv, hd] rotated in place (nkv==0: unused)
+    const unsigned int* __restrict__ positions,  // [1] absolute decode position
+    const unsigned int nq,
+    const unsigned int nkv,                      // 0 or 1
+    const unsigned int hd,
+    const unsigned int nope,
+    const unsigned int rope,
+    const float* __restrict__ inv_freq,          // [rope/2]
+    const float mscale,
+    const unsigned int conjugate                 // 0 = forward, 1 = inverse (eq.26 de-rotation)
+) {
+    const unsigned int pairs_per_head = rope / 2;
+    const unsigned int total = (nq + nkv) * pairs_per_head;
+    const unsigned int abs_pos = positions[0];
+    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += gridDim.x * blockDim.x) {
+        const unsigned int head = idx / pairs_per_head;
+        const unsigned int pair_idx = idx % pairs_per_head;
+        __nv_bfloat16* ptr = (head < nq)
+            ? (q_full + (unsigned long long)head * hd + nope)
+            : (k_full + (unsigned long long)(head - nq) * hd + nope);
+        // Same expressions as rope_forward_yarn_interleaved (bit-identical).
+        const float freq = inv_freq[pair_idx];
+        const float angle = (float)abs_pos * freq;
+        const float cos_val = cosf(angle) * mscale;
+        const float sin_val = sinf(angle) * mscale;
+        const unsigned int d0 = 2 * pair_idx;
+        const unsigned int d1 = d0 + 1;
+        float x0 = (float)ptr[d0];
+        float x1 = (float)ptr[d1];
+        float y0, y1;
+        if (conjugate) {
+            y0 = x0 * cos_val + x1 * sin_val;
+            y1 = x1 * cos_val - x0 * sin_val;
+        } else {
+            y0 = x0 * cos_val - x1 * sin_val;
+            y1 = x1 * cos_val + x0 * sin_val;
+        }
+        ptr[d0] = __float2bfloat16(y0);
+        ptr[d1] = __float2bfloat16(y1);
+    }
+}
+
+// Same vectorized BF16→FP8 pair conversion as reshape_and_cache.cu (kept
+// textually identical so the fused write is bit-identical to the incumbent).
+__device__ __forceinline__ __nv_fp8x2_storage_t
+v4_bf16x2_to_fp8x2(unsigned int packed_bf16, float inv_scale) {
+    float v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed_bf16 & 0xFFFF)));
+    float v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed_bf16 >> 16)));
+    float2 scaled = make_float2(v0 * inv_scale, v1 * inv_scale);
+    return __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+}
+
+// Fused decode-step MLA cache assemble + FP8 paged write. Replaces
+// mla_cache_assemble_batched (build the 576-dim [latent|rope] row twice in
+// BF16 scratch) + reshape_and_cache_flash_fp8 (re-read + quantize) with one
+// kernel that quantizes straight from the sources.
+//
+// Cache layout contract (mla_paged_decode_fp8.cu): each token row in BOTH the
+// K and the V pool is [kv_lora latent | rope] = 576 FP8 bytes; K and V carry
+// the SAME values (V4-Flash V==K, incl. the rotated rope tail — see the
+// mla_cache_assemble_batched comment for why V's rope must not be zeros) but
+// are quantized with their own k_scale / v_scale. Addressing is identical to
+// reshape_and_cache_flash_fp8 with num_kv_heads=1, head_dim=kv_lora+rope.
+//
+// Pair grouping matches the incumbent: pairs never straddle the latent/rope
+// boundary because kv_lora is even (512). REQUIRES kv_lora and rope even and
+// both source pointers 4-byte aligned (asserted host-side).
+//
+// Single token only (slot_mapping[0] is THE decode slot; slot<0 = skip).
+// Grid: (1, 1, 1)  Block: (256, 1, 1)
+extern "C" __global__ void v4_decode_cache_fused_fp8(
+    const __nv_bfloat16* __restrict__ kv_latent,   // [kv_lora] pre-rope latent (v_out)
+    const __nv_bfloat16* __restrict__ k_rope,      // [rope] ROPED K tail (k_out + nope)
+    __nv_fp8_storage_t* __restrict__ k_cache,      // paged FP8 pool
+    __nv_fp8_storage_t* __restrict__ v_cache,      // paged FP8 pool
+    const long long* __restrict__ slot_mapping,    // [1], int64; <0 = padding
+    const unsigned int kv_lora,
+    const unsigned int rope,
+    const unsigned int block_size,
+    const float k_scale,                           // dequant: bf16 = fp8 * k_scale
+    const float v_scale,
+    const unsigned long long cache_stride          // pool block stride in elements
+) {
+    const long long slot = slot_mapping[0];
+    if (slot < 0) return;
+
+    const unsigned int block_idx = (unsigned int)(slot / block_size);
+    const unsigned int block_offset = (unsigned int)(slot % block_size);
+    const unsigned int n_elems = kv_lora + rope;
+
+    __nv_fp8_storage_t* key_dst = k_cache + (unsigned long long)block_idx * cache_stride
+                                          + (unsigned long long)block_offset * n_elems;
+    __nv_fp8_storage_t* val_dst = v_cache + (unsigned long long)block_idx * cache_stride
+                                          + (unsigned long long)block_offset * n_elems;
+
+    const float inv_k_scale = 1.0f / k_scale;
+    const float inv_v_scale = 1.0f / v_scale;
+
+    const unsigned int lat_pairs = kv_lora / 2;
+    const unsigned int n_pairs = n_elems / 2;
+    const unsigned int* lat32 = (const unsigned int*)kv_latent;
+    const unsigned int* rope32 = (const unsigned int*)k_rope;
+    __nv_fp8x2_storage_t* key_dst16 = (__nv_fp8x2_storage_t*)key_dst;
+    __nv_fp8x2_storage_t* val_dst16 = (__nv_fp8x2_storage_t*)val_dst;
+
+    for (unsigned int i = threadIdx.x; i < n_pairs; i += blockDim.x) {
+        const unsigned int packed = (i < lat_pairs) ? lat32[i] : rope32[i - lat_pairs];
+        key_dst16[i] = v4_bf16x2_to_fp8x2(packed, inv_k_scale);
+        val_dst16[i] = v4_bf16x2_to_fp8x2(packed, inv_v_scale);
+    }
+}
+
 // Fused KV cache assembly: concatenate [kv_latent | k_rope] → K_cache and [kv_latent | zeros] → V_cache.
 // Eliminates 4 D2D copies + 1 memset per decode step.
 extern "C" __global__ void mla_cache_assemble(

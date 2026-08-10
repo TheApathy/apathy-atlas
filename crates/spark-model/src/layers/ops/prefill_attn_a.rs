@@ -138,6 +138,90 @@ pub fn mla_cache_assemble_batched(
         .launch(stream)
 }
 
+/// V4 M=1 decode fused rope (ATLAS_V4_DECODE_FUSED=1): rotates the trailing
+/// `rope` interleaved-YaRN channels of nq Q heads (and the single K head when
+/// `nkv==1`) IN PLACE — one launch replacing extract×2 + rope_yarn +
+/// writeback×2. `conjugate=true` selects the negated-sin inverse rotation
+/// (attention-output de-rotation, pass `nkv=0`). Bit-identical to the
+/// unfused chain (tier 1; see v4_decode_rope_fused in mla_absorbed.cu).
+#[allow(clippy::too_many_arguments)]
+pub fn v4_decode_rope_fused(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q_full: DevicePtr,
+    k_full: DevicePtr,
+    positions: DevicePtr,
+    nq: u32,
+    nkv: u32,
+    hd: u32,
+    nope: u32,
+    rope: u32,
+    inv_freq: DevicePtr,
+    mscale: f32,
+    conjugate: bool,
+    stream: u64,
+) -> Result<()> {
+    let total = (nq + nkv) * (rope / 2);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(total, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(q_full)
+        .arg_ptr(k_full)
+        .arg_ptr(positions)
+        .arg_u32(nq)
+        .arg_u32(nkv)
+        .arg_u32(hd)
+        .arg_u32(nope)
+        .arg_u32(rope)
+        .arg_ptr(inv_freq)
+        .arg_f32(mscale)
+        .arg_u32(if conjugate { 1 } else { 0 })
+        .launch(stream)
+}
+
+/// V4 M=1 decode fused MLA cache assemble + FP8 paged write
+/// (ATLAS_V4_DECODE_FUSED=1): quantizes [kv_latent | roped k_rope] straight
+/// into the K and V FP8 pools at `slot` — one launch replacing
+/// mla_cache_assemble_batched + reshape_and_cache_flash_fp8. Bit-identical
+/// (tier 1): same pair grouping and FP8 conversion intrinsics as the
+/// incumbent write kernel. Requires kv_lora and rope even and 4-byte-aligned
+/// source pointers (debug-asserted).
+#[allow(clippy::too_many_arguments)]
+pub fn v4_decode_cache_fused_fp8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    kv_latent: DevicePtr,
+    k_rope: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    slot_mapping: DevicePtr,
+    kv_lora: u32,
+    rope: u32,
+    block_size: u32,
+    k_scale: f32,
+    v_scale: f32,
+    cache_stride: u64,
+    stream: u64,
+) -> Result<()> {
+    debug_assert!(kv_lora % 2 == 0 && rope % 2 == 0);
+    debug_assert!(kv_latent.0 % 4 == 0 && k_rope.0 % 4 == 0);
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(kv_latent)
+        .arg_ptr(k_rope)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(slot_mapping)
+        .arg_u32(kv_lora)
+        .arg_u32(rope)
+        .arg_u32(block_size)
+        .arg_f32(k_scale)
+        .arg_f32(v_scale)
+        .arg_u64(cache_stride)
+        .launch(stream)
+}
+
 /// Fused MLA prefill: Q_absorption + attention + V_extraction in one kernel.
 /// Grid: (num_heads, seq_len, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
