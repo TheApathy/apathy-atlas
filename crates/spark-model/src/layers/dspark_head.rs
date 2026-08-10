@@ -64,6 +64,14 @@ pub struct DsparkDraftHead {
     /// (rows_per_group = N). d_o_proj measured 7.39 ms at 27 GB/s on the
     /// GEMM path. ATLAS_DSPARK_OPROJ_GEMV=0 opts back. 0 on miss.
     k_oproj_gemv: KernelHandle,
+    /// Small-M batched GEMV (`dense_gemv_bf16_batchm`, MAX_M=16) for the
+    /// drafter's Q/KV projections. At the propose width (b = gamma, <= 8) the
+    /// 16x16-tile `dense_gemm` wastes 11/16 of its lanes and drags the whole
+    /// weight through few CTAs; the GEMV parallelizes over N with M in
+    /// registers. Measured (dense_gemm_microtest): M=5 N=32768 K=1024
+    /// 0.777 -> 0.273 ms (2.8x); M=5 N=1024 K=4096 0.153 -> 0.023 ms (6.8x);
+    /// cosine 1.000000 both. 0 on miss. ATLAS_DSPARK_QKV_GEMV=0 opts out.
+    k_qkv_gemv: KernelHandle,
     /// M≤8 row-scaled FP8 tile. The lm_head tail used to run one GEMV per
     /// block row, re-streaming the whole `[vocab, h]` FP8 mirror `block`
     /// times; this does all `block` rows in one pass over the weight.
@@ -221,6 +229,15 @@ impl DsparkDraftHead {
             k_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             k_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             k_gemv_fp8: gpu.kernel("gemv_fp8w", "dense_gemv_fp8w")?,
+            k_qkv_gemv: if std::env::var("ATLAS_DSPARK_QKV_GEMV").as_deref() == Ok("0") {
+                spark_runtime::gpu::KernelHandle(0)
+            } else {
+                crate::layers::try_kernel(
+                    gpu,
+                    "dense_gemv_bf16_batchm",
+                    "dense_gemv_bf16_batchm",
+                )
+            },
             k_oproj_gemv: if std::env::var("ATLAS_DSPARK_OPROJ_GEMV").as_deref() == Ok("0") {
                 spark_runtime::gpu::KernelHandle(0)
             } else {
@@ -671,6 +688,21 @@ impl DsparkDraftHead {
             self.dbg(gpu, &format!("s{s}.attn.n5"), self.n5, hu, stream);
 
             // Q path: wq_a → q_norm → wq_b → per-head parameterless RMS → rope.
+            if self.k_qkv_gemv.0 != 0 && b <= ops::DENSE_GEMV_BATCHM_MAX_M {
+                ops::dense_gemv_batchm(
+                    gpu,
+                    self.k_qkv_gemv,
+                    self.n5,
+                &stage.wq_a,
+                self.q_lora5,
+                    b,
+                    Q_LORA,
+                    h,
+                    h,
+                    Q_LORA,
+                    stream,
+                )?;
+            } else {
             ops::dense_gemm(
                 gpu,
                 self.k_gemm,
@@ -682,6 +714,7 @@ impl DsparkDraftHead {
                 h,
                 stream,
             )?;
+            }
             ops::rms_norm(
                 gpu,
                 self.k_rms,
@@ -693,6 +726,21 @@ impl DsparkDraftHead {
                 self.eps,
                 stream,
             )?;
+            if self.k_qkv_gemv.0 != 0 && b <= ops::DENSE_GEMV_BATCHM_MAX_M {
+                ops::dense_gemv_batchm(
+                    gpu,
+                    self.k_qkv_gemv,
+                    self.q_lora5,
+                &stage.wq_b,
+                self.q5,
+                    b,
+                    HEADS * HEAD_DIM,
+                    Q_LORA,
+                    Q_LORA,
+                    HEADS * HEAD_DIM,
+                    stream,
+                )?;
+            } else {
             ops::dense_gemm(
                 gpu,
                 self.k_gemm,
@@ -704,6 +752,7 @@ impl DsparkDraftHead {
                 Q_LORA,
                 stream,
             )?;
+            }
             let ones = DenseWeight {
                 weight: self.ones_hd,
             };
@@ -728,6 +777,21 @@ impl DsparkDraftHead {
             );
 
             // KV path: wkv → kv_norm → rope (norm BEFORE rope, per reference).
+            if self.k_qkv_gemv.0 != 0 && b <= ops::DENSE_GEMV_BATCHM_MAX_M {
+                ops::dense_gemv_batchm(
+                    gpu,
+                    self.k_qkv_gemv,
+                    self.n5,
+                &stage.wkv,
+                self.kv5,
+                    b,
+                    HEAD_DIM,
+                    h,
+                    h,
+                    HEAD_DIM,
+                    stream,
+                )?;
+            } else {
             ops::dense_gemm(
                 gpu,
                 self.k_gemm,
@@ -739,6 +803,7 @@ impl DsparkDraftHead {
                 h,
                 stream,
             )?;
+            }
             ops::rms_norm(
                 gpu,
                 self.k_rms,
