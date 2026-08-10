@@ -153,3 +153,21 @@ qle 682 (sub-probe internals; q_b_norm [154k x 512] suspect) | o_proj 616
 hc glue ~510 (fusion ~-0.25s) | kv_proj 311 | TC attn 250 (round 2).
 Realistic near-term sum ≈ -1.3s → ~820 tok/s @2410; 1000 needs the
 FP8-GEMM class deeper + MoE deeper + length amortization (N=3900).
+
+## 2026-08-10 round 3 — 562 → 599 tok/s (0fbef449, gate 93/100 ABOVE bar)
+
+wq_a was on the weak dense_gemm_tc via its BF16 mirror (9 ms/layer); FP8
+pipelined routing cut it to ~0.8 and RAISED quality (13/2/0). q_b_norm
+cleared (1.5 ms/layer). Length curve measured near-FLAT (590 @ 1525 /
+610 @ 3065) — the quadratic HCA arm eats amortization; 1000 must come from
+kernels, and the map now CLOSES at 2410:
+
+| # | item | prize | mechanism |
+|---|---|---|---|
+| 1 | MoE prefill bandwidth 127 → 229 GB/s | −0.6 s | grouped MMA kernel streams ~97 GB/pass; small per-expert M → latency-bound |
+| 2 | hc fused one-pass rewrite | −0.4 s | hc_pre reads each token's 16 KB stream 24× (one pass per mix row); sinkhorn is data-dependent (NO precompute) but the traffic fuses to 1× |
+| 3 | intra-layer stream overlap | −0.3 s | compressor block (0.52 s) depends only on `normed` — can run ∥ Q-side projections |
+| 4 | csa_compress kernel | −0.25 s | never profiled internally |
+| 5 | o_proj w8a8 wiring | −0.1 s | kernel built + oracle'd, needs quant scratch plumbing |
+
+Sum −1.65 s → TTFT ~2.38 s ≈ **1010 tok/s @ 2410**.
