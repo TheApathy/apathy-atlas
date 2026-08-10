@@ -1077,7 +1077,7 @@ __device__ __forceinline__ bool mrow_gather_slots(
 }
 
 template<int GS_R, bool E8M0_R, int GS_S, bool E8M0_S, int VEC, int SPLIT, int MROW,
-         int GROUP_MODE = GROUP_ALL>
+         int GROUP_MODE = GROUP_ALL, bool ACT_SMEM = false>
 __device__ __forceinline__ void gate_up_shared_t_m_impl(
     const __nv_bfloat16* __restrict__ A,                    // [num_tokens, K]
     const unsigned long long* __restrict__ gate_packed_t_ptrs,
@@ -1162,8 +1162,13 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
         if (B_packed == 0) { emit_zero_all(); return; }   // EP remote expert
     }
 
-    // See the single-row kernel: VEC>1 cannot serve a partial group.
-    if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
+    // See the single-row kernel: VEC>1 cannot serve a partial group. Under
+    // ACT_SMEM the guard moves BELOW the staging loop — every thread must
+    // cooperate in the copy — so this instantiation keeps the incumbent's
+    // instruction order bit-for-bit when ACT_SMEM is off.
+    if constexpr (!ACT_SMEM) {
+        if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
+    }
 
     // A row per gathered slot. Routed slots are flat (token = slot / top_k);
     // shared slots ARE the token index.
@@ -1172,6 +1177,49 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
     for (int m = 0; m < MROW; ++m) {
         const unsigned int t = is_shared ? slots[m] : (slots[m] / top_k);
         A_row[m] = A + (unsigned long long)t * K;
+    }
+
+    // ACT_SMEM (the `_v4s4` V2 tier): stage every gathered row's activation
+    // slice for this block's k-window into dynamic shared memory ONCE, then
+    // serve the K loop's 16*M activation reads per scale-group from smem.
+    // Without this, each scale-group's FMA block issues M dependent 4-byte
+    // warp-uniform GLOBAL loads per weight byte pair — at M=6 that is 96
+    // activation LDGs against 17 weight LDGs per group, and the long-scoreboard
+    // stalls on that stream are what bleed the dedup kernel from the m=1
+    // sibling's ~200 GB/s down to ~135 (measured, `exp_splitk_m_t`).
+    //
+    // BIT-IDENTICAL to the v2s4 incumbent: the staged bytes are the exact bf16
+    // the global loop would have read, the read-back converts them with the
+    // same __bfloat162float in the same k order, and SPLIT is unchanged so the
+    // split points are unchanged (VEC only remaps thread->output). All threads
+    // cooperate here — this runs BEFORE the VEC alignment guard — and the
+    // ladder's surplus rows alias slice 0, like the down kernel's s_act.
+    // Launch contract: dynamic smem = MROW * K/SPLIT * sizeof(bf16).
+    if constexpr (ACT_SMEM) {
+        extern __shared__ __nv_bfloat16 s_a_m[]; // [MROW, K/SPLIT]
+        const unsigned int k_len = K / SPLIT;
+        const unsigned int k_lo = ks * k_len;
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            // uint2 = 4 bf16 per copy; depths_ok on the host guarantees
+            // K % (32*SPLIT) == 0, so k_len % 4 == 0 and both sides are
+            // 8-byte aligned (k_lo*2 and m*k_len*2 are multiples of 64).
+            const uint2* src = reinterpret_cast<const uint2*>(A_row[m] + k_lo);
+            uint2* dst = reinterpret_cast<uint2*>(s_a_m + (unsigned long long)m * k_len);
+            for (unsigned int i = threadIdx.x; i < k_len / 4; i += blockDim.x) {
+                dst[i] = src[i];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            const int slice = (m < (int)M) ? m : 0;
+            // Biased so the K loop's `A_row[m][k_half * 2]` (a GLOBAL k index)
+            // lands on the right smem element without touching the macro.
+            A_row[m] = s_a_m + (unsigned long long)slice * k_len - k_lo;
+        }
+        // The staged twin of the incumbent's VEC alignment guard above.
+        if (!((VEC == 1) ? (n < N) : (n + VEC <= N))) return;
     }
 
     // Weight load + decode hoisted out of the row loop — that hoist IS the win.
@@ -1481,7 +1529,7 @@ __device__ __forceinline__ void silu_down_shared_t_m_impl(
 // so both microtest gates stay bit-identical.
 #define MOE_M_LB __launch_bounds__(256, 2)
 
-#define GATEUP_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_) \
+#define GATEUP_M_ENTRY_ACT(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_, ACT_) \
 extern "C" __global__ MOE_M_LB void NAME(                                      \
     const __nv_bfloat16* __restrict__ A,                                       \
     const unsigned long long* __restrict__ gate_packed_t_ptrs,                 \
@@ -1506,13 +1554,16 @@ extern "C" __global__ MOE_M_LB void NAME(                                      \
     float* __restrict__ partial                                                \
 ) {                                                                            \
     gate_up_shared_t_m_impl<(GS_R_), (E8M0_R_), GROUP_SIZE, false,             \
-                            (VEC_), (SPLIT_), (MROW_), (GROUP_MODE_)>(         \
+                            (VEC_), (SPLIT_), (MROW_), (GROUP_MODE_), (ACT_)>( \
         A, gate_packed_t_ptrs, gate_scale_t_ptrs, gate_scale2_vals, gate_out,  \
         up_packed_t_ptrs, up_scale_t_ptrs, up_scale2_vals, up_out,             \
         expert_indices, sh_gate_t_packed, sh_gate_t_scale, sh_gate_s2,         \
         sh_gate_out, sh_up_t_packed, sh_up_t_scale, sh_up_s2, sh_up_out,       \
         N, K, top_k, num_tokens, partial);                                     \
 }
+
+#define GATEUP_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_) \
+    GATEUP_M_ENTRY_ACT(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_, false)
 
 #define DOWN_M_ENTRY(NAME, GS_R_, E8M0_R_, VEC_, SPLIT_, MROW_, GROUP_MODE_, PRECOMPUTED_) \
 extern "C" __global__ MOE_M_LB void NAME(                                      \
@@ -1601,7 +1652,43 @@ DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m8v2s4, 32,         true,  2, 4,
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m8c58v2s4,      GROUP_SIZE, false, 2, 4, 8, GROUP_COUNT_5_PLUS, true)
 DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m8c58v2s4, 32,         true,  2, 4, 8, GROUP_COUNT_5_PLUS, true)
 
+// ── V2 wide-load tier (`ATLAS_MOE_SPLITK_V2=1`) — VEC=4 at the SAME SPLIT=4 ──
+//
+// The v2s4 incumbent's per-thread loads are 2 bytes wide, so the weight stream
+// issues 64-byte warp requests — the request shape the single-row v4s8 work
+// measured pinned near ~136 GB/s. VEC=4 widens every weight request to 128
+// bytes. Unlike the single-row family, the multi-row grid has `num_tokens*top_k
+// + 1` y-slots (37 at the 6-row verify vs 7), so the CTA count VEC=4 gives up
+// (grid.x halves) does not starve the SMs and SPLIT can stay at 4 — which is
+// what keeps this tier BIT-IDENTICAL to the incumbent: same split points, same
+// per-output k/FMA order, same partial layout. The second half of the fix is
+// ACT_SMEM on the gate_up side (see the staging comment in the impl): the m-row
+// falloff is the activation stream re-issuing M narrow global reads per weight
+// byte pair inside the K loop, and staging all M rows once per k-window removes
+// that stream entirely. The down kernel already stages activations in smem, so
+// its V2 is the VEC widening alone.
+//
+// Launch contract (per the host `_splitk_m` wrappers, vec=4):
+//   gate_up: grid = [N/(block*4), num_tokens*top_k + 1, 2*SPLIT],
+//            smem = MROW * K/SPLIT * 2   (bf16 activation slices)
+//   down:    grid = [N/(block*4), num_tokens*top_k + 1, SPLIT],
+//            smem = MROW * K*4/SPLIT     (unchanged)
+GATEUP_M_ENTRY_ACT(moe_expert_gate_up_shared_t_m2v4s4,      GROUP_SIZE, false, 4, 4, 2, GROUP_ALL, true)
+GATEUP_M_ENTRY_ACT(moe_expert_gate_up_shared_t_e8m0_m2v4s4, 32,         true,  4, 4, 2, GROUP_ALL, true)
+GATEUP_M_ENTRY_ACT(moe_expert_gate_up_shared_t_m6v4s4,      GROUP_SIZE, false, 4, 4, 6, GROUP_ALL, true)
+GATEUP_M_ENTRY_ACT(moe_expert_gate_up_shared_t_e8m0_m6v4s4, 32,         true,  4, 4, 6, GROUP_ALL, true)
+GATEUP_M_ENTRY_ACT(moe_expert_gate_up_shared_t_m8v4s4,      GROUP_SIZE, false, 4, 4, 8, GROUP_ALL, true)
+GATEUP_M_ENTRY_ACT(moe_expert_gate_up_shared_t_e8m0_m8v4s4, 32,         true,  4, 4, 8, GROUP_ALL, true)
+
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m2v4s4,      GROUP_SIZE, false, 4, 4, 2, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m2v4s4, 32,         true,  4, 4, 2, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m6v4s4,      GROUP_SIZE, false, 4, 4, 6, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m6v4s4, 32,         true,  4, 4, 6, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_m8v4s4,      GROUP_SIZE, false, 4, 4, 8, GROUP_ALL, false)
+DOWN_M_ENTRY(moe_expert_silu_down_shared_t_e8m0_m8v4s4, 32,         true,  4, 4, 8, GROUP_ALL, false)
+
 #undef GATEUP_M_ENTRY
+#undef GATEUP_M_ENTRY_ACT
 #undef DOWN_M_ENTRY
 #undef GROUP_ALL
 #undef GROUP_UNIQUE

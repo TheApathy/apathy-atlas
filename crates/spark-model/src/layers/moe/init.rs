@@ -489,6 +489,69 @@ impl MoeLayer {
                 "moe_shared_expert_fused_t",
                 "moe_expert_silu_down_shared_t_e8m0_m8v2s4",
             ),
+            // V2 wide-load tier (`ATLAS_MOE_SPLITK_V2=1`): the same MROW
+            // ladder at VEC=4 / SPLIT=4. Bit-identical to v2s4 — same split
+            // points, same per-output FMA order.
+            moe_expert_gate_up_shared_t_m2_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m2v4s4",
+            ),
+            moe_expert_silu_down_shared_t_m2_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m2v4s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m2_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m2v4s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m2_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m2v4s4",
+            ),
+            moe_expert_gate_up_shared_t_m6_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m6v4s4",
+            ),
+            moe_expert_silu_down_shared_t_m6_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m6v4s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m6_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m6v4s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m6_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m6v4s4",
+            ),
+            moe_expert_gate_up_shared_t_m8_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_m8v4s4",
+            ),
+            moe_expert_silu_down_shared_t_m8_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_m8v4s4",
+            ),
+            moe_expert_gate_up_shared_t_e8m0_m8_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_gate_up_shared_t_e8m0_m8v4s4",
+            ),
+            moe_expert_silu_down_shared_t_e8m0_m8_v2t_k: super::super::try_kernel(
+                gpu,
+                "moe_shared_expert_fused_t",
+                "moe_expert_silu_down_shared_t_e8m0_m8v4s4",
+            ),
             moe_expert_gate_up_shared_t_m1u_k: super::super::try_kernel(
                 gpu,
                 "moe_shared_expert_fused_t",
