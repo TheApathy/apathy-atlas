@@ -43,20 +43,11 @@ impl MoeLayer {
         // FP8 grouped path is HIP-ready (kernel ported); do not force-batch it.
         let hip_force_batched_fp8 = false;
 
-        // EXL3 trellis experts: NO M>1 path exists yet. The trellis tiles are
-        // not per-(k,n) addressable, so none of the grouped GEMMs below can
-        // read them, and the NVFP4 pointer tables are null. The bring-up plan
-        // (docs/EXPERT-3BPW-PLAN.md §3 "P1") is per-layer dequant-to-scratch
-        // via `exl3_dequant_dump` + activation-side H128 pre/post passes over
-        // the M rows, feeding the existing BF16 grouped GEMM. Until that
-        // lands, fail loudly instead of dereferencing null NVFP4 tables.
-        if self.exl3.is_some() {
-            anyhow::bail!(
-                "EXL3 routed experts have no prefill (M>1) path yet — decode M=1 only. \
-                 Implement plan §3 P1 (scratch dequant + H128 activation passes) before \
-                 serving prompts through this checkpoint."
-            );
-        }
+        // EXL3 trellis experts: routed through the generic head below (gate
+        // GEMM → topk → sort), then `run_routed_grouped_gemm` branches to the
+        // P1 scratch-dequant path (forward_prefill_exl3.rs) in place of the
+        // NVFP4/FP8 grouped GEMMs — for ALL prefill sizes (no forward_batched
+        // fallback; the per-token path has no EXL3 arm).
 
         // BF16 experts (FP8-dequant-on-load path): same dispatch shape as
         // FP8 — grouped GEMM for long prefills, fused per-token for short.
@@ -359,6 +350,7 @@ impl MoeLayer {
             expert_input,
             expert_offsets,
             sorted_token_ids,
+            sorted_expert_ids,
             n,
             h,
             inter,

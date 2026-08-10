@@ -205,27 +205,63 @@ LANDED (combined-residency, loader/dispatch legs — GPU-unvalidated):
   via `w4a16_gemv` + unclamped SwiGLU. Routed format tag `Exl3Trellis` fences
   every legacy NVFP4/E8M0 path.
 
+LANDED (P1 prefill leg — GPU-unvalidated, gates 4-7 of the microtest):
+
+- Prefill / M>1 (plan §3 P1): `forward_prefill` now routes EXL3 through
+  `run_routed_grouped_gemm_exl3` (forward_prefill_exl3.rs) — design
+  option (a): rotations ride on the ACTIVATIONS, scratch holds the RAW
+  decoded weights. Kernels (all in this module):
+  * `exl3_h128_pre_rows` — expands the token-major input into the sorted
+    layout with `A_rot[r] = H128(diag(suh_e)·A[tok_r])/√128` per row (suh
+    is per EXPERT, so a token routed to k experts gets k distinct rows —
+    the grouped GEMM then runs with `sorted_token_ids = NULL`). One warp
+    per 128-chunk via `exl3_had128`; in-place legal with identity gather
+    (used for the down-input rotation over the post-SiLU intermediate).
+  * `exl3_h128_post_rows` — in-place `Y[r] = diag(svh_e)·H128(Y[r])/√128`.
+  * `exl3_dequant_chunk_bf16` — decodes experts `[e0, e0+count)` into
+    slot-major BF16 `[N,K]` scratch (fp16→bf16 RN tail on the bit-exact
+    dump path); consumed by `moe_bf16_grouped_gemm` launched per chunk
+    SUB-RANGE (`weight_ptrs = static slot table`, `expert_offsets + e0`,
+    `num_experts = count` — offsets are absolute rows, so sub-range
+    launches read/write the correct global rows).
+  Scratch: `ATLAS_EXL3_PREFILL_CHUNK` (default 8) × 16.78 MB = 134 MB —
+  one slot size serves all three projections (each is inter×h elements).
+  Host reads `expert_offsets` once per layer (prefill-only D2H, same
+  pattern as the exact-tiles grid sizing) for exact per-chunk m-tiles +
+  empty-chunk skip. NOT graph-capture-legal (prefill never captures).
+
 STILL OPEN:
 
-- Prefill / M>1 (plan §3 P1): `forward_prefill` / `forward_batched` fail
-  loudly. Design: per-expert `exl3_dequant_dump` to F16/BF16 scratch + an
-  M-row H128 activation pre-pass (`x' = H128(diag(suh)·x)`) and post-pass
-  (`y = diag(svh)·H128(y0)`), feeding the existing grouped BF16 GEMM.
 - m-row (γ-verify) MROW variant — `forward_km` declines for EXL3 (falls to
-  the guarded per-row path); the exact-verify twin is mandatory S6 scope.
-- Real-checkpoint spot-check: run the dump gate against tp1 tiles.
-- Perf tuning after first GPU measurement: stage depth, `SPLIT_K` policy
-  (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides),
-  possible half2-accumulate variant if issue-bound.
-- Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.
-
-- m-row (γ-verify) MROW variant — mandatory from day one per plan §3/§4.7
+  the guarded per-row path); mandatory S6 scope per plan §3/§4.7
   (partial-exactness law: the verify chain flips as a whole).
 - Real-checkpoint spot-check (plan option a): run the dump gate against
-  tiles from `/home/flocka/sparkinfer-ref/data/tp1` once readable.
+  tiles from `/home/flocka/sparkinfer-ref/data/tp1` (world-readable now).
 - ~~Perf tuning after first GPU measurement~~ round 2 done (§2/§3): ILP
   dequant restructure + 4 CTAs/SM. If gate 3 still lands under ~200 GB/s,
   the next lever is the half2-accumulate variant (`EXL3_GEMM_H_ACC`-style)
   to shed the 8 cvt + fp32 FFMA per tile — quality re-gate required.
 - Shared-expert rider (grid.y expert slot) when wiring into
   `moe_shared_expert_fused_t` dispatch.
+- Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.
+- Prefill P2 (plan §3): grouped trellis GEMM decoding straight to MMA
+  fragments, to recover the P1 dequant traffic below.
+
+## 7. P1 prefill cost arithmetic (honest, supersedes the plan's estimate)
+
+Per MoE layer, per prefill chunk, once the chunk is long enough that all
+216 experts are routed (N ≳ 1024 at top-6):
+
+| traffic | bytes |
+|---|---:|
+| trellis read (dequant) | 216 × 9.44 MB = 2.04 GB |
+| BF16 scratch write | 216 × 3 × 16.78 MB = 10.87 GB |
+| GEMM scratch re-read | 10.87 GB × ceil(rows/expert/64) (1× at N=1024, 2× at N=2410) |
+| activations (A_rot ×2 + in-place passes) | ~0.4 GB |
+
+≈ 24–35 GB/layer ≈ 120–175 ms/layer @ ~200 GB/s ≈ **5–7.5 s per 43-layer
+pass over a 2410-token prompt** — NOT the ~0.2 s a per-pass reading of the
+bytes suggests (the dequant repeats per LAYER, ×43). Under chunked prefill
+the cost multiplies again by the number of chunks (plan §6.3's flagged
+risk): a 2410-token prompt at `--max-prefill-tokens 1024` = 3 chunks ≈
+15–20 s prefill. Acceptable for the bring-up smoke; P2 is the fix.

@@ -98,6 +98,7 @@ impl MoeLayer {
         expert_input: DevicePtr,
         expert_offsets: DevicePtr,
         sorted_token_ids: DevicePtr,
+        sorted_expert_ids: DevicePtr,
         n: u32,
         h: u32,
         inter: u32,
@@ -109,6 +110,25 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // ── EXL3 trellis routed experts: none of the quantized grouped GEMMs
+        // below can read trellis tiles (not per-(k,n) addressable) and the
+        // NVFP4/E8M0 pointer tables are null — branch to the P1 scratch-
+        // dequant path (forward_prefill_exl3.rs) before anything dereferences
+        // them. ──
+        if self.exl3.is_some() {
+            return self.run_routed_grouped_gemm_exl3(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                sorted_expert_ids,
+                h,
+                inter,
+                num_experts,
+                n * top_k,
+                ctx,
+                stream,
+            );
+        }
         macro_rules! prof_step {
             ($label:expr) => {
                 if let Some(t) = t0.take() {
