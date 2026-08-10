@@ -38,9 +38,24 @@ fn main() -> Result<()> {
         spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let gpu: &dyn GpuBackend = &backend;
 
+    // ATLAS_DSPARK_REF_DRAFT=1 exercises the compact draft (the reference
+    // stack's 64-expert subset) through the exact server path.
+    let subset = dspark::resolve_ref_draft_subset(std::path::Path::new(&drafter_dir))?;
+    if let Some(ref s) = subset {
+        println!(
+            "compact draft: {} routed experts ({} structured) — {:?}…",
+            s.len(),
+            s.structured_count,
+            &s.checkpoint_ids[..s.len().min(8)]
+        );
+    }
+
     let t0 = std::time::Instant::now();
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
+    if let Some(ref s) = subset {
+        loader.extra_skip = Some(dspark::compact_draft_skip_fn(s));
+    }
     let store = loader
         .load(std::path::Path::new(&drafter_dir), gpu, 0)
         .context("loading drafter shards")?;
@@ -61,6 +76,7 @@ fn main() -> Result<()> {
         &target_config,
         dspark::DsparkParams::V4_FLASH_0731(),
         gpu,
+        subset.as_ref(),
     )?;
     println!(
         "drafter assembled in {:.1}s: {} stages, hc_head={}, block_size={}",

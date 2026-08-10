@@ -120,12 +120,16 @@ fn detect_routed_scale_kind(
     layer_prefix: &str,
     config: &ModelConfig,
     force_all_experts: bool,
+    expert_ids: Option<&[usize]>,
 ) -> crate::weight_map::WeightQuantFormat {
     use crate::weight_map::WeightQuantFormat;
     use spark_runtime::weights::WeightDtype;
     for e in 0..config.num_experts {
         if force_all_experts || config.is_local_expert(e) {
-            let wp = format!("{layer_prefix}.ffn.experts.{e}.w1");
+            // Under a compact-draft subset the checkpoint tensor for draft
+            // expert `e` is named for `expert_ids[e]`, not `e`.
+            let ckpt = expert_ids.map_or(e, |ids| ids[e]);
+            let wp = format!("{layer_prefix}.ffn.experts.{ckpt}.w1");
             let native = !store.contains(&format!("{wp}.weight_packed"))
                 && !store.contains(&format!("{wp}.weight_scale_2"))
                 && store.contains(&format!("{wp}.scale"))
@@ -567,9 +571,59 @@ pub(super) fn assemble_moe(
     gpu: &dyn GpuBackend,
     qctx: crate::weight_map::QuantizeCtx,
 ) -> Result<MoeLayer> {
+    assemble_moe_subset(
+        store,
+        layer_prefix,
+        layer_idx,
+        force_all_experts,
+        config,
+        gpu,
+        qctx,
+        None,
+    )
+}
+
+/// [`assemble_moe`] with an optional **expert subset**.
+///
+/// `expert_ids`, when `Some`, maps dense MoE expert `n` (`0..config.num_experts`)
+/// to the CHECKPOINT expert id whose `…ffn.experts.{id}.*` tensors it loads,
+/// and to the router row it takes from the full `[ckpt_experts, h]` gate. It
+/// must be ascending and `config.num_experts` long. The only user today is the
+/// compact DSpark draft (see [`super::dspark_reap`]), which serves 64 of the
+/// checkpoint's 216 drafter experts; target layers always pass `None` and take
+/// the identity path with no behavioural change.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn assemble_moe_subset(
+    store: &WeightStore,
+    layer_prefix: &str,
+    layer_idx: usize,
+    force_all_experts: bool,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    qctx: crate::weight_map::QuantizeCtx,
+    expert_ids: Option<&[usize]>,
+) -> Result<MoeLayer> {
     let lp = layer_prefix.to_string();
     let p = &lp;
-    let gate = dense(store, &format!("{p}.ffn.gate.weight"))?;
+    if let Some(ids) = expert_ids {
+        anyhow::ensure!(
+            ids.len() == config.num_experts,
+            "{p}: expert subset has {} ids but config.num_experts={}",
+            ids.len(),
+            config.num_experts
+        );
+        anyhow::ensure!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "{p}: expert subset must be strictly ascending (gate rows are sliced in this order)"
+        );
+    }
+    // Router gate: a subset needs its `[ckpt_experts, h]` rows gathered down to
+    // `[num_experts, h]` so router column `n` scores draft expert `n`.
+    let gate = match expert_ids {
+        None => dense(store, &format!("{p}.ffn.gate.weight"))?,
+        Some(ids) => gather_gate_rows(store, &format!("{p}.ffn.gate.weight"), ids, gpu)
+            .with_context(|| format!("{p}: gathering compact-draft router gate rows"))?,
+    };
     // ROUTER GATE MUST STAY HIGH-PRECISION. The checkpoint ships `ffn.gate.weight`
     // in BF16 (the quant recipes deliberately exclude the router from NVFP4). A
     // 4-bit router flips the low-margin top-6 expert selection on essentially
@@ -601,7 +655,7 @@ pub(super) fn assemble_moe(
     let mut exl3_experts: Vec<crate::weight_map::Exl3ExpertWeight> = Vec::new();
     let mut experts = Vec::with_capacity(config.num_experts);
     for e in 0..config.num_experts {
-        let ep = format!("{p}.ffn.experts.{e}");
+        let ep = format!("{p}.ffn.experts.{}", expert_ids.map_or(e, |ids| ids[e]));
         if exl3_detected {
             // EXL3 tiles load as-is (no transpose pass, no NVFP4 tables);
             // the legacy `experts` vec stays null — every dispatch that
@@ -669,7 +723,7 @@ pub(super) fn assemble_moe(
     // buffer gives `topk(sigmoid(logits) + 0)` with correct weight
     // normalization. (Falling back to softmax selects right experts but
     // wrong blend weights → degraded output.)
-    let correction_bias = load_correction_bias(store, &lp, config.num_experts, gpu)?;
+    let correction_bias = load_correction_bias(store, &lp, config.num_experts, gpu, expert_ids)?;
 
     let moe_weights = MoeWeights {
         gate,
@@ -716,7 +770,8 @@ pub(super) fn assemble_moe(
     )?;
     // Tag routed-expert quant format so the Phase-K E8M0 MoE-GEMM variants
     // dispatch on native MXFP4 (transcode-free) vs the standard NVFP4 kernels.
-    moe.experts_scale_kind = detect_routed_scale_kind(store, p, config, force_all_experts);
+    moe.experts_scale_kind =
+        detect_routed_scale_kind(store, p, config, force_all_experts, expert_ids);
     // EXL3: attach the trellis experts + pointer tables and re-tag the routed
     // format `Exl3Trellis` (set_exl3_experts does both). Must come AFTER the
     // detect above so the EXL3 tag wins.
@@ -836,11 +891,16 @@ pub fn load_hc_f32(
 /// balancing bias) as an F32 `[num_experts]` tensor. The RedHatAI re-quant
 /// flattens layer keys to `layers.N.ffn.gate.*`. Returns `None` (softmax
 /// routing) only if the checkpoint genuinely lacks the tensor.
+///
+/// `expert_ids` (compact DSpark draft only) gathers the checkpoint's
+/// `[ckpt_experts]` bias down to the subset's `[num_experts]`, in the same
+/// ascending order the gate rows and expert tensors use.
 fn load_correction_bias(
     store: &WeightStore,
     layer_prefix: &str,
     num_experts: usize,
     gpu: &dyn GpuBackend,
+    expert_ids: Option<&[usize]>,
 ) -> Result<Option<DenseWeight>> {
     use spark_runtime::weights::WeightDtype;
     let candidates = [
@@ -864,24 +924,94 @@ fn load_correction_bias(
         return Ok(Some(DenseWeight { weight: ptr }));
     };
     let n = bias_t.num_elements();
+    // Without a subset the bias must already be exactly `num_experts` long.
+    // With one it is the FULL checkpoint bias that the subset indexes into.
+    let expected = match expert_ids {
+        None => num_experts,
+        Some(ids) => {
+            anyhow::ensure!(
+                ids.last().is_some_and(|&last| last < n),
+                "DeepSeek-V4 correction_bias length {n} does not cover expert subset (max id {:?})",
+                ids.last()
+            );
+            n
+        }
+    };
     anyhow::ensure!(
-        n == num_experts,
+        n == expected,
         "DeepSeek-V4 correction_bias length {n} != num_experts {num_experts}"
     );
-    // The moe_topk_sigmoid kernel consumes an F32 bias. F32 tensors pass
-    // through unchanged; BF16 must be widened (zero-extend mantissa).
-    if bias_t.dtype == WeightDtype::BF16 {
-        let mut bf16_buf = vec![0u8; n * 2];
-        gpu.copy_d2h(bias_t.ptr, &mut bf16_buf)?;
-        let mut f32_buf = vec![0u8; n * 4];
-        for i in 0..n {
-            f32_buf[i * 4 + 2] = bf16_buf[i * 2];
-            f32_buf[i * 4 + 3] = bf16_buf[i * 2 + 1];
-        }
-        let ptr = gpu.alloc(f32_buf.len())?;
-        gpu.copy_h2d(&f32_buf, ptr)?;
-        Ok(Some(DenseWeight { weight: ptr }))
-    } else {
-        Ok(Some(DenseWeight { weight: bias_t.ptr }))
+    // The moe_topk_sigmoid kernel consumes a DENSE F32 `[num_experts]` bias.
+    // F32 with no subset passes through unchanged; BF16 must be widened
+    // (zero-extend mantissa), and a subset must be gathered.
+    if bias_t.dtype != WeightDtype::BF16 && expert_ids.is_none() {
+        return Ok(Some(DenseWeight { weight: bias_t.ptr }));
     }
+    let elem = if bias_t.dtype == WeightDtype::BF16 {
+        2
+    } else {
+        4
+    };
+    let mut src = vec![0u8; n * elem];
+    gpu.copy_d2h(bias_t.ptr, &mut src)?;
+    let mut f32_buf = vec![0u8; num_experts * 4];
+    for out in 0..num_experts {
+        let i = expert_ids.map_or(out, |ids| ids[out]);
+        if elem == 2 {
+            // BF16 -> F32: the BF16 bits ARE the F32 high half.
+            f32_buf[out * 4 + 2] = src[i * 2];
+            f32_buf[out * 4 + 3] = src[i * 2 + 1];
+        } else {
+            f32_buf[out * 4..out * 4 + 4].copy_from_slice(&src[i * 4..i * 4 + 4]);
+        }
+    }
+    let ptr = gpu.alloc(f32_buf.len())?;
+    gpu.copy_h2d(&f32_buf, ptr)?;
+    Ok(Some(DenseWeight { weight: ptr }))
+}
+
+/// Gather `ids.len()` rows out of a `[rows, cols]` router gate into a fresh,
+/// contiguous device buffer. Used only by the compact DSpark draft: the
+/// checkpoint ships the drafter's full `[216, 4096]` BF16 router, but a
+/// 64-expert draft must present the kernel a dense `[64, 4096]` gate whose row
+/// `n` is the checkpoint row `ids[n]`.
+///
+/// Round-trips through the host (the same D2H/H2D shape `load_correction_bias`
+/// already uses) rather than a device gather kernel: this runs once per stage
+/// at load and moves 1.7 MB, so a kernel would only add a dispatch to maintain.
+fn gather_gate_rows(
+    store: &WeightStore,
+    name: &str,
+    ids: &[usize],
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    let t = store
+        .get(name)
+        .with_context(|| format!("{name}: missing router gate"))?;
+    let rows = *t
+        .shape
+        .first()
+        .context("router gate has no leading expert dimension")?;
+    anyhow::ensure!(rows > 0, "{name}: router gate has zero rows");
+    let total = t.byte_size();
+    anyhow::ensure!(
+        total % rows == 0,
+        "{name}: {total} bytes is not divisible by {rows} rows"
+    );
+    let row_bytes = total / rows;
+    anyhow::ensure!(
+        ids.last().is_some_and(|&last| last < rows),
+        "{name}: expert subset (max id {:?}) exceeds the gate's {rows} rows",
+        ids.last()
+    );
+    let mut src = vec![0u8; total];
+    gpu.copy_d2h(t.ptr, &mut src)?;
+    let mut out = vec![0u8; ids.len() * row_bytes];
+    for (n, &i) in ids.iter().enumerate() {
+        out[n * row_bytes..(n + 1) * row_bytes]
+            .copy_from_slice(&src[i * row_bytes..(i + 1) * row_bytes]);
+    }
+    let ptr = gpu.alloc(out.len())?;
+    gpu.copy_h2d(&out, ptr)?;
+    Ok(DenseWeight { weight: ptr })
 }
