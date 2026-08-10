@@ -9,6 +9,22 @@
 > |---|---|---|---|
 > | [`laguna`](../../tree/laguna) | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | `git diff upstream/monu-laguna-2.1..laguna` |
 > | [`qwen`](../../tree/qwen) | Qwen3.6-27B + DFlash drafter | `bench/qwen/` | `git diff upstream/avarok-qwen..qwen` |
+> | [`ds4-flash`](../../tree/ds4-flash) | DeepSeek-V4-Flash-162B + DSpark drafter | `scripts/dsflash-serve-bench.sh` | `git diff main..ds4-flash` |
+>
+> **`ds4-flash`** (this branch, if you're reading it there) serves
+> DeepSeek-V4-Flash-162B on ONE DGX Spark (GB10): **905 tok/s prefill,
+> ~22 tok/s plain decode, 22–33 tok/s speculative**, quality-gated at
+> 90/100 on every commit. Start with
+> [docs/REPRODUCE-PREFILL.md](docs/REPRODUCE-PREFILL.md) (deterministic
+> build/serve/bench protocol + the env-flag bisect table), then
+> [docs/MODEL-MIGRATION-PLAYBOOK.md](docs/MODEL-MIGRATION-PLAYBOOK.md)
+> (the portable methodology behind the numbers),
+> [docs/PREFILL-CAMPAIGN-2026-08-10.md](docs/PREFILL-CAMPAIGN-2026-08-10.md)
+> (the 385→905 ladder with its NO-GO table),
+> [docs/DECODE-WATERFALL-2026-08-10.md](docs/DECODE-WATERFALL-2026-08-10.md)
+> (every decode millisecond attributed), and
+> [docs/EXPERT-3BPW-PLAN.md](docs/EXPERT-3BPW-PLAN.md) (the road past the
+> 34 tok/s byte ceiling).
 >
 > `main` and `base` track upstream unmodified.
 >
