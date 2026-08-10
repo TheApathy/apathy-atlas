@@ -462,6 +462,16 @@ pub struct MoeLayer {
     fp4_decode_smallm_max: u32,
     moe_fp8_grouped_gemm_t: KernelHandle,
     w4a16_gemm_t: KernelHandle,
+    /// Faster shadows of `w4a16_gemm_t` for the shared-expert prefill GEMMs,
+    /// selected by `ATLAS_MOE_SHARED_K64` (see `shared_prefill_arm`). All three
+    /// consume the SAME NVFP4 tables as `w4a16_gemm_t` (transposed
+    /// `B_packed[K/2, N]` + `B_scale[K/16, N]` E4M3 bytes + per-tensor
+    /// `scale2`), so they are drop-in on `shared_gate_t`/`shared_up_t`/
+    /// `shared_down_t`. `try_kernel` → 0 on model dirs that don't ship them.
+    w4a16_gemm_t_v2: KernelHandle,
+    w4a16_gemm_t_k64: KernelHandle,
+    w4a16_gemm_t_k64_v2: KernelHandle,
+    w4a16_gemm_t_m128: KernelHandle,
     bf16_to_fp8_k: KernelHandle,
     /// Pre-dequanted FP8 weights for zero-overhead prefill GEMMs.
     gate_fp8: Option<DevicePtr>,

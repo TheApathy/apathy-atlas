@@ -23,6 +23,13 @@
 //!   cargo run -p spark-model --release --example w4a16_parity_microtest \
 //!       --features cuda,gpu-examples
 //!
+//! Optional argv override `[M] [N] [K]` swaps the built-in shape table for a
+//! single (M, N, K) — used to gate the DeepSeek-V4 shared-expert PREFILL
+//! shapes that `ATLAS_MOE_SHARED_K64` re-routes:
+//!
+//!   ... --example w4a16_parity_microtest -- 2410 2048 4096   # gate / up
+//!   ... --example w4a16_parity_microtest -- 2410 4096 2048   # down
+//!
 //! Exit 0 = all kernels agree with base; 1 = at least one mismatch (named).
 
 use anyhow::Result;
@@ -31,7 +38,7 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-const M: usize = 17;
+const DEFAULT_M: usize = 17;
 const GROUP: usize = 16;
 const PASS_COS: f64 = 0.999;
 
@@ -91,6 +98,7 @@ fn launch(
     b: DevicePtr,
     bs: DevicePtr,
     c: DevicePtr,
+    m: usize,
     n: usize,
     k: usize,
 ) -> Result<()> {
@@ -102,35 +110,55 @@ fn launch(
         .arg_ptr(bs)
         .arg_f32(0.01) // scale2: keeps outputs in a sane BF16 range
         .arg_ptr(c)
-        .arg_u32(M as u32)
+        .arg_u32(m as u32)
         .arg_u32(n as u32)
         .arg_u32(k as u32)
         .launch(0)
 }
 
 fn main() -> Result<()> {
+    // Optional `-- M N K` override: gate one explicit shape (e.g. the
+    // DeepSeek-V4 shared-expert prefill shapes) instead of the table.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (m, shapes): (usize, Vec<(String, usize, usize)>) = if argv.len() >= 3 {
+        let m: usize = argv[0].parse()?;
+        let n: usize = argv[1].parse()?;
+        let k: usize = argv[2].parse()?;
+        (m, vec![(format!("argv M={m} N={n} K={k}"), n, k)])
+    } else {
+        (
+            DEFAULT_M,
+            SHAPES
+                .iter()
+                .map(|&(l, n, k)| (l.to_string(), n, k))
+                .collect(),
+        )
+    };
+
     let g0 = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &g0;
 
     let base_k = g.kernel("w4a16", "w4a16_gemm")?;
     // (name, handle, grid geometry as fn of (n, k... unused), uses transposed B)
     let t_kernels: Vec<(&str, KernelHandle)> = [
-        ("w4a16_gemm_t     ", "w4a16_gemm_t"),
-        ("w4a16_gemm_t_k64 ", "w4a16_gemm_t_k64"),
-        ("w4a16_gemm_t_m128", "w4a16_gemm_t_m128"),
+        ("w4a16_gemm_t       ", "w4a16_gemm_t"),
+        ("w4a16_gemm_t_v2    ", "w4a16_gemm_t_v2"),
+        ("w4a16_gemm_t_k64   ", "w4a16_gemm_t_k64"),
+        ("w4a16_gemm_t_k64_v2", "w4a16_gemm_t_k64_v2"),
+        ("w4a16_gemm_t_m128  ", "w4a16_gemm_t_m128"),
     ]
     .into_iter()
     .filter_map(|(name, f)| g.kernel("w4a16", f).ok().map(|h| (name, h)))
     .collect();
 
     let mut all_ok = true;
-    for &(label, n, k) in SHAPES {
+    for (label, n, k) in shapes.iter().map(|(l, n, k)| (l.as_str(), *n, *k)) {
         let mut r = Rng(0x517A_C0DE ^ (n as u64) << 20 ^ k as u64);
         let half_k = k / 2;
         let groups = k / GROUP;
 
         // A: [M, K] BF16, small values.
-        let a_host: Vec<u8> = (0..M * k)
+        let a_host: Vec<u8> = (0..m * k)
             .flat_map(|_| {
                 bf16::from_f32((r.unit() - 0.5) * 0.5)
                     .to_bits()
@@ -162,50 +190,71 @@ fn main() -> Result<()> {
         let bs = up(g, &bs_host)?;
         let bt = up(g, &bt_host)?;
         let bst = up(g, &bst_host)?;
-        let c_base = g.alloc(M * n * 2)?;
-        let c_test = g.alloc(M * n * 2)?;
+        let c_base = g.alloc(m * n * 2)?;
+        let c_test = g.alloc(m * n * 2)?;
 
         // Base reference: grid (N/64, M/64).
         launch(
             g,
             base_k,
-            [div_ceil(n as u32, 64), div_ceil(M as u32, 64), 1],
+            [div_ceil(n as u32, 64), div_ceil(m as u32, 64), 1],
             a,
             b,
             bs,
             c_base,
+            m,
             n,
             k,
         )?;
         g.synchronize(0)?;
-        let base_out = dn_bf16(g, c_base, M * n)?;
+        let base_out = dn_bf16(g, c_base, m * n)?;
+
+        // `w4a16_gemm_t` is the kernel the shared-expert prefill uses today,
+        // so the K64/K64V2/M128 shadows must be BIT-IDENTICAL to it (same
+        // dequant math, same per-row K accumulation order). Cosine-vs-base is
+        // the loose gate; `bitdiff` vs _t is the strict one.
+        let mut t_ref: Option<Vec<f32>> = None;
 
         for &(name, kh) in &t_kernels {
-            // _t and _t_k64: grid (N/128, M/64). _t_m128: grid (N/128, M/128).
+            // _t / _t_k64 / _t_k64_v2: grid (N/128, M/64). _t_m128: (N/128, M/128).
             let grid = if name.trim_end() == "w4a16_gemm_t_m128" {
-                [div_ceil(n as u32, 128), div_ceil(M as u32, 128), 1]
+                [div_ceil(n as u32, 128), div_ceil(m as u32, 128), 1]
             } else {
-                [div_ceil(n as u32, 128), div_ceil(M as u32, 64), 1]
+                [div_ceil(n as u32, 128), div_ceil(m as u32, 64), 1]
             };
-            g.memset(c_test, 0, M * n * 2)?;
-            launch(g, kh, grid, a, bt, bst, c_test, n, k)?;
+            g.memset(c_test, 0, m * n * 2)?;
+            launch(g, kh, grid, a, bt, bst, c_test, m, n, k)?;
             g.synchronize(0)?;
-            let out = dn_bf16(g, c_test, M * n)?;
+            let out = dn_bf16(g, c_test, m * n)?;
 
             let c = cos(&out, &base_out);
-            let max_abs_base = base_out.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let max_abs_base = base_out.iter().fold(0f32, |acc, v| acc.max(v.abs()));
             let max_d = out
                 .iter()
                 .zip(&base_out)
-                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-            let ok = c >= PASS_COS;
+                .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+            let bitdiff = match &t_ref {
+                None => {
+                    t_ref = Some(out.clone());
+                    0usize
+                }
+                Some(rf) => rf
+                    .iter()
+                    .zip(&out)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count(),
+            };
+            let ok = c >= PASS_COS && bitdiff == 0;
             all_ok &= ok;
             eprintln!(
-                "{label}  {name}  cos={c:.7}  max|Δ|={max_d:.5} (base max|C|={max_abs_base:.3})  {}",
+                "{label}  {name}  cos={c:.7}  max|Δ|={max_d:.5} \
+                 (base max|C|={max_abs_base:.3})  bitdiff_vs_t={bitdiff}  {}",
                 if ok {
                     "PASS"
-                } else {
+                } else if c < PASS_COS {
                     "FAIL ← kernel disagrees with base"
+                } else {
+                    "FAIL ← not bit-identical to w4a16_gemm_t"
                 }
             );
         }
@@ -216,7 +265,8 @@ fn main() -> Result<()> {
     }
 
     eprintln!(
-        "W4A16 parity GATE (all transposed kernels vs base, cos≥{PASS_COS}): {}",
+        "W4A16 parity GATE (cos≥{PASS_COS} vs base AND bit-identical to \
+         w4a16_gemm_t): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {
