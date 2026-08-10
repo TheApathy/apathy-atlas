@@ -45,6 +45,64 @@ fn validate_fp8(weight: Fp8Weight, n: u32, k: u32, label: &str) -> Result<Fp8Wei
 }
 
 impl Qwen3AttentionLayer {
+    /// Try the FP8-native MMA path for one packed prefill projection: quantize
+    /// the activations per-row into the fp8_act arena and run
+    /// `w8a8_gemm_pipelined`. Returns `Ok(false)` — caller falls back to its
+    /// existing kernel, bit-exactly as before — when the ATLAS_V4_PROJ_FP8MMA
+    /// gate is off, the kernels are absent, the arena cannot hold [M, K], or
+    /// the FP8 weight does not match the [n, k] block-scaled contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn try_w8a8_project_prefill(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        weight: Fp8Weight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        if !v4_proj_fp8mma_enabled()
+            || self.w8a8_gemm_pipelined_k.0 == 0
+            || self.quantize_a_fp8_rows_k.0 == 0
+            || ctx.buffers.fp8_act_bytes() < (m as usize) * (k as usize)
+            || weight.scale_format != WeightQuantFormat::Fp8BlockScaled
+            || weight.n != n
+            || weight.k != k
+            || !n.is_multiple_of(FP8_BLOCK)
+            || !k.is_multiple_of(FP8_BLOCK)
+        {
+            return Ok(false);
+        }
+        let a_fp8 = ctx.buffers.fp8_act();
+        let a_scale = ctx.buffers.fp8_act_scale();
+        ops::quantize_a_fp8_rows(
+            ctx.gpu,
+            self.quantize_a_fp8_rows_k,
+            input,
+            a_fp8,
+            a_scale,
+            m,
+            k,
+            stream,
+        )?;
+        ops::w8a8_gemm_pipelined(
+            ctx.gpu,
+            self.w8a8_gemm_pipelined_k,
+            a_fp8,
+            a_scale,
+            weight.weight,
+            weight.row_scale,
+            output,
+            m,
+            n,
+            k,
+            stream,
+        )?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn v4_project_prefill(
         &self,
@@ -102,36 +160,8 @@ impl Qwen3AttentionLayer {
         // (w8a8_gemm_microtest): 1.04-1.22x at these shapes, cos 0.9997.
         // Falls through when the arena can't hold [M, K] (wo_b's o_latent at
         // full batch is the largest consumer).
-        if v4_proj_fp8mma_enabled()
-            && self.w8a8_gemm_pipelined_k.0 != 0
-            && self.quantize_a_fp8_rows_k.0 != 0
-            && ctx.buffers.fp8_act_bytes() >= (m as usize) * (k as usize)
-        {
-            let a_fp8 = ctx.buffers.fp8_act();
-            let a_scale = ctx.buffers.fp8_act_scale();
-            ops::quantize_a_fp8_rows(
-                ctx.gpu,
-                self.quantize_a_fp8_rows_k,
-                input,
-                a_fp8,
-                a_scale,
-                m,
-                k,
-                stream,
-            )?;
-            return ops::w8a8_gemm_pipelined(
-                ctx.gpu,
-                self.w8a8_gemm_pipelined_k,
-                a_fp8,
-                a_scale,
-                weight.weight,
-                weight.row_scale,
-                output,
-                m,
-                n,
-                k,
-                stream,
-            );
+        if self.try_w8a8_project_prefill(ctx, input, weight, output, m, n, k, stream)? {
+            return Ok(());
         }
         if self.w8a16_gemm_pipelined_k.0 != 0 {
             ops::w8a16_gemm_pipelined(
@@ -247,6 +277,66 @@ impl Qwen3AttentionLayer {
         } && ((fp8.is_some() && self.w8a16_gemm_pipelined_ld_k.0 != 0)
             || (bf16 && self.dense_gemm_pipelined_ld_k.0 != 0));
         if inplace {
+            // FP8-native MMA arm for the grouped in-place path: quantize the
+            // FULL attn_out [n, input_width] ONCE (one quantize_a_fp8_rows over
+            // the widest input — the fp8_act arena is sized m*max(h, nq*hd) so
+            // [n, nq*hd] fits by construction), then run each group's GEMM
+            // against its FP8 column slice at lda = input_width.
+            //
+            // Scale-slice correctness: quantize_a_fp8_rows computes ONE scale
+            // per ROW over the full input_width row (absmax/448) and quantizes
+            // every element of the row with it. A group GEMM consumes only the
+            // k-slice [g*group_in, (g+1)*group_in) of that row, but since each
+            // slice element was quantized as a/scale[m] and the kernel's
+            // epilogue multiplies a_row_scale[m] uniformly across the whole
+            // output row (K-independent, per-row), the slice dequantizes with
+            // exactly the scale it was quantized at — the math is consistent.
+            // The full-row absmax is an upper bound of the slice absmax, so a
+            // slice whose peak lives in another group quantizes slightly
+            // coarser than a per-slice scale would (bounded by the same E4M3
+            // relative-error class as the packed arm; gated by the same
+            // microtest cosine + tool-eval). ATLAS_V4_PROJ_FP8MMA=0 restores
+            // the w8a16 LUT-dequant groups below bit-exactly.
+            let w8a8_inplace = fp8.is_some()
+                && v4_proj_fp8mma_enabled()
+                && self.w8a8_gemm_pipelined_ld_k.0 != 0
+                && self.quantize_a_fp8_rows_k.0 != 0
+                && ctx.buffers.fp8_act_bytes() >= (n as usize) * (input_width as usize);
+            if w8a8_inplace {
+                let a_fp8 = ctx.buffers.fp8_act();
+                let a_scale = ctx.buffers.fp8_act_scale();
+                ops::quantize_a_fp8_rows(
+                    ctx.gpu,
+                    self.quantize_a_fp8_rows_k,
+                    attn_out,
+                    a_fp8,
+                    a_scale,
+                    n,
+                    input_width,
+                    stream,
+                )?;
+                let w = fp8.expect("w8a8_inplace requires the FP8 wo_a");
+                for group in 0..o_groups {
+                    ops::w8a8_gemm_pipelined_ld(
+                        ctx.gpu,
+                        self.w8a8_gemm_pipelined_ld_k,
+                        // FP8 A: 1 byte/elem, so the column-slice byte offset
+                        // is the element offset.
+                        a_fp8.offset((group * group_in) as usize),
+                        a_scale,
+                        w.weight.offset(group as usize * weight_group_bytes),
+                        w.row_scale.offset(group as usize * scale_group_bytes),
+                        o_latent.offset((group * o_lora) as usize * BF16_BYTES),
+                        n,
+                        o_lora,
+                        group_in,
+                        input_width,
+                        latent_dim,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
             for group in 0..o_groups {
                 let a_in = attn_out.offset((group * group_in) as usize * BF16_BYTES);
                 let c_out = o_latent.offset((group * o_lora) as usize * BF16_BYTES);

@@ -61,15 +61,28 @@ __device__ __forceinline__ void p8_cp_wait_le(unsigned int n) {
     }
 }
 
-extern "C" __global__ void w8a8_gemm_pipelined(
-    const unsigned char* __restrict__ A,        // [M, K] FP8 E4M3 (pre-quantized)
+// Shared body. `lda`/`ldc` are the A and C ROW STRIDES in elements (A is FP8
+// bytes, so lda elements == lda bytes; C is BF16). With lda > K the kernel
+// reads a K-wide column slice of a wider pre-quantized activation matrix, and
+// with ldc > N it writes an N-wide column slice of a wider output — the V4
+// block-diagonal wo_a shape (group g reads cols [g*group_in, ...) of the
+// [M, nq*head_dim] quantized attn_out and writes cols [g*o_lora, ...) of
+// o_latent). The per-row activation scale `a_row_scale[m]` is applied ONCE per
+// output row in the epilogue, uniformly across all K — so a K-slice of a row
+// quantized at the FULL row's scale dequantizes exactly (see the grouped wo_a
+// dispatch note in v4_fp8_proj.rs). lda == K && ldc == N reproduces the packed
+// kernel exactly.
+__device__ __forceinline__ void w8a8_gemm_pipelined_impl(
+    const unsigned char* __restrict__ A,        // [M, lda] FP8 E4M3 (pre-quantized)
     const float* __restrict__ a_row_scale,      // [M] FP32
     const unsigned char* __restrict__ B,         // [N, K] FP8 E4M3
     const float* __restrict__ block_scale,       // [N/128, K/128] FP32
-    __nv_bfloat16* __restrict__ C,               // [M, N] BF16
+    __nv_bfloat16* __restrict__ C,               // [M, ldc] BF16
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
 ) {
     const unsigned int cta_m = blockIdx.y * P8_M_TILE;
     const unsigned int cta_n = blockIdx.x * P8_N_TILE;
@@ -110,13 +123,13 @@ extern "C" __global__ void w8a8_gemm_pipelined(
             const unsigned int gc = k_base + col;
             unsigned char* dst = &smem_A[stage][row][col];
             if (gr < M && gc + 16 <= K) {
-                p8_cp_async_16(dst, &A[(unsigned long long)gr * K + gc]);
+                p8_cp_async_16(dst, &A[(unsigned long long)gr * lda + gc]);
             } else {
                 #pragma unroll
                 for (unsigned int e = 0; e < 16; e++) {
                     const unsigned int gce = gc + e;
                     dst[e] = (gr < M && gce < K)
-                        ? A[(unsigned long long)gr * K + gce]
+                        ? A[(unsigned long long)gr * lda + gce]
                         : 0;
                 }
             }
@@ -232,14 +245,46 @@ extern "C" __global__ void w8a8_gemm_pipelined(
         const float s0 = (row0 < M) ? a_row_scale[row0] : 0.0f;
         const float s1 = (row1 < M) ? a_row_scale[row1] : 0.0f;
         if (row0 < M && col0 < N)
-            C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0] * s0);
+            C[(unsigned long long)row0 * ldc + col0] = __float2bfloat16(outer_acc[n_tile][0] * s0);
         if (row0 < M && col1 < N)
-            C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1] * s0);
+            C[(unsigned long long)row0 * ldc + col1] = __float2bfloat16(outer_acc[n_tile][1] * s0);
         if (row1 < M && col0 < N)
-            C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2] * s1);
+            C[(unsigned long long)row1 * ldc + col0] = __float2bfloat16(outer_acc[n_tile][2] * s1);
         if (row1 < M && col1 < N)
-            C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3] * s1);
+            C[(unsigned long long)row1 * ldc + col1] = __float2bfloat16(outer_acc[n_tile][3] * s1);
     }
+}
+
+// Original contract: packed A [M,K] and C [M,N].
+extern "C" __global__ void w8a8_gemm_pipelined(
+    const unsigned char* __restrict__ A,        // [M, K] FP8 E4M3 (pre-quantized)
+    const float* __restrict__ a_row_scale,      // [M] FP32
+    const unsigned char* __restrict__ B,         // [N, K] FP8 E4M3
+    const float* __restrict__ block_scale,       // [N/128, K/128] FP32
+    __nv_bfloat16* __restrict__ C,               // [M, N] BF16
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w8a8_gemm_pipelined_impl(A, a_row_scale, B, block_scale, C, M, N, K, K, N);
+}
+
+// Strided A/C sibling — the V4 block-diagonal wo_a runs its 8 groups against
+// this with lda = nq*head_dim (bytes == elements for FP8 A) and
+// ldc = o_groups*o_lora, in place over ONE full-row activation quantization.
+extern "C" __global__ void w8a8_gemm_pipelined_ld(
+    const unsigned char* __restrict__ A,
+    const float* __restrict__ a_row_scale,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w8a8_gemm_pipelined_impl(A, a_row_scale, B, block_scale, C, M, N, K, lda, ldc);
 }
 
 // ── Activation row-quantizer: BF16 [M, K] → E4M3 [M, K] + FP32 scale[M] ──

@@ -140,7 +140,20 @@ impl Qwen3AttentionLayer {
         // = 385 ms/pass at N=2410 (bucket 1a) for a GEMM the FP8 pipelined
         // kernel does in ~0.8 ms. Prefer the FP8 mirror when loaded.
         let q_latent = ctx.buffers.ssm_ba();
-        if let Some(wqa8) = mla
+        // ATLAS_V4_PROJ_FP8MMA=1: wq_a keeps its BF16 mirror (the release only
+        // frees wq_b/wo_a/wo_b), so it never reaches v4_project_prefill's FP8
+        // arm — route the FP8 mirror through the same w8a8 helper here.
+        // Returns false (→ the pre-existing w8a16 arm, bit-exact) when the
+        // gate is off or the kernels/arena are absent.
+        let wqa_w8a8 = match mla.wq_a_fp8 {
+            Some(wqa8) => {
+                self.try_w8a8_project_prefill(ctx, normed, wqa8, q_latent, n, q_lora, h, stream)?
+            }
+            None => false,
+        };
+        if wqa_w8a8 {
+            // FP8-native MMA arm took it.
+        } else if let Some(wqa8) = mla
             .wq_a_fp8
             .filter(|_| self.w8a16_gemm_pipelined_k.0 != 0)
         {
@@ -291,8 +304,21 @@ impl Qwen3AttentionLayer {
         // 0.23 ms, both cosine 1.000000 vs the CPU oracle. Watch for NaN in the
         // K-FULL diag below if this ever regresses; ATLAS_V4_KV_PIPELINED=0
         // restores the scalar arm.
+        // ATLAS_V4_PROJ_FP8MMA=1: prefer the checkpoint-native FP8 wkv over
+        // the BF16 mirror (same w8a8 helper/gate as wq_a above; this output
+        // feeds the KV cache, so it sits under the same tool-eval gate as the
+        // rest of the fp8mma class). false → the pre-existing BF16 chain
+        // below, bit-exact.
+        let wkv_w8a8 = match mla.wkv_a_fp8 {
+            Some(wkv8) => {
+                self.try_w8a8_project_prefill(ctx, normed, wkv8, kv_latent, n, kv_lora, h, stream)?
+            }
+            None => false,
+        };
         #[allow(clippy::overly_complex_bool_expr)]
-        if self.dense_gemm_pipelined_k.0 != 0
+        if wkv_w8a8 {
+            // FP8-native MMA arm took it.
+        } else if self.dense_gemm_pipelined_k.0 != 0
             && std::env::var("ATLAS_V4_KV_PIPELINED").as_deref() != Ok("0")
         {
             ops::dense_gemm_bf16_pipelined(
