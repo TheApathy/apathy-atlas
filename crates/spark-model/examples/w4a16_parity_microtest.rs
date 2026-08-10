@@ -265,7 +265,8 @@ fn main() -> Result<()> {
     }
 
     eprintln!(
-        "W4A16 parity GATE (all transposed kernels vs base, cos≥{PASS_COS}): {}",
+        "W4A16 parity GATE (cos≥{PASS_COS} vs base AND bit-identical to \
+         w4a16_gemm_t): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {
