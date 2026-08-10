@@ -100,8 +100,15 @@ Prefill next: TC round 2 (KT=32/cp.async/occupancy), wq_b w8a16_gemm_pipelined
   register pressure at MROW=6 than the latency hiding buys — consistent with
   the kernel's own occupancy notes. Reverted.
 - bf16x2 activation loads: kept (bit-identical, gate 1 PASS, 1.777 → 1.761 ms).
-- Remaining untried ideas, oracle-iterable: __launch_bounds__/maxrregcount
-  sweep; VEC=4 width; gate_up activations staged in smem (down already does);
-  cp.async.bulk/TMA if SM121 exposes it. The kernel sits near its
-  occupancy-vs-latency optimum with the intra-group hoist — the −10 ms verify
-  from 183→210 GB/s remains open and is the gating item for 28+ decode.
+- __launch_bounds__ sweep: ALREADY DONE in-tree — `(256,2)` swept 1-5 and
+  documented; the m6 arm deliberately runs 128 regs so ptxas does deep load
+  pipelining (long_scoreboard 9.94→2.28 cycles/issue). This EXPLAINS the
+  double-buffer NO-GO: the compiler already pipelines; manual buffers only
+  add register pressure.
+- Remaining structural ideas (each ~half-day, oracle-iterable): VEC=4 width;
+  gate_up activations staged in smem (down already does); cp.async.bulk/TMA.
+  The kernel is near its practical optimum — 183 of 229 with multi-row
+  gather access may be close to real. CONSEQUENCE for the 28+ route: lean
+  on acceptance (3.0→3.3 via head-gate + attention exactness) and propose
+  lm_head NVFP4 (2.7→~1.4 ms, drafter-only numerics = acceptance-gated)
+  as the nearer levers.
