@@ -325,6 +325,89 @@ extern "C" __global__ void hc_pre_v2(
     }
 }
 
+// ── hc_pre_mix_tiled: prefill-width mix — both operands read ~once ─────────
+//
+// hc_pre is fn-L2-bound (3.98 ms at T=2410:每 token re-streams the 1.5 MB fn
+// matrix through L2); the decode split (hc_pre_mix) inverts the problem and
+// re-fetches every token row 25x from DRAM (measured 17.8 ms at T=2410).
+// This kernel tiles TOKENS: a block owns HC_TB tokens and sweeps k in
+// chunks, staging the fn chunk in smem once per block — fn DRAM traffic
+// becomes (T/HC_TB) * 1.5 MB ≈ 57 MB and x is read exactly once (154 MB).
+// DRAM floor ≈ 0.9 ms. Emits the same mix_out [T, mix_hc+1] contract as
+// hc_pre_mix, so hc_pre_finish consumes it unchanged. Reduction order
+// differs from hc_pre (chunked k, warp shuffles) — behaviour-gated.
+//
+// Fixed shape: hc=4, H=4096 (hc_dim=16384, mix_hc=24); dispatcher guards.
+// Grid: (ceil(T/HC_TB), 1, 1)  Block: (256, 1, 1) = 8 warps.
+#define HC_TB 32
+#define HC_KC 256          // k-chunk floats; fn chunk smem = 24*256*4 = 24 KB
+
+extern "C" __global__ void hc_pre_mix_tiled(
+    const float* __restrict__ streams, // [T, hc*H] FP32
+    const float* __restrict__ hc_fn,   // [mix_hc, hc*H]
+    float* __restrict__ mix_out,       // [T, mix_hc + 1]
+    const unsigned int num_tokens,
+    const unsigned int hidden_size,
+    const unsigned int hc_mult
+) {
+    const unsigned int hc_dim = hc_mult * hidden_size;   // 16384
+    const unsigned int mix_hc = (2 + hc_mult) * hc_mult; // 24
+    if (hc_dim != 16384u || mix_hc != 24u) return;       // dispatcher guards
+
+    const unsigned int t0 = blockIdx.x * HC_TB;
+    const unsigned int warp = threadIdx.x >> 5;          // 0..7
+    const unsigned int lane = threadIdx.x & 31u;
+
+    __shared__ float s_fn[24][HC_KC];
+    __shared__ float s_acc[HC_TB][25];                   // 24 dots + sumsq
+
+    for (unsigned int i = threadIdx.x; i < HC_TB * 25u; i += 256u)
+        ((float*)s_acc)[i] = 0.f;
+    __syncthreads();
+
+    const unsigned int nchunks = hc_dim / HC_KC;         // 64
+    for (unsigned int c = 0; c < nchunks; ++c) {
+        const unsigned int kbase = c * HC_KC;
+        // Stage the fn chunk: 24 x 256 floats, coalesced rows.
+        for (unsigned int i = threadIdx.x; i < 24u * HC_KC; i += 256u) {
+            const unsigned int m = i / HC_KC, k = i % HC_KC;
+            s_fn[m][k] = hc_fn[(size_t)m * hc_dim + kbase + k];
+        }
+        __syncthreads();
+
+        // warp w owns tokens t_local = w, w+8, w+16, w+24.
+        for (unsigned int tl = warp; tl < HC_TB; tl += 8u) {
+            const unsigned int t = t0 + tl;
+            if (t >= num_tokens) break;
+            const float* xr = streams + (size_t)t * hc_dim + kbase;
+            float part[25];
+            #pragma unroll
+            for (int m = 0; m < 25; ++m) part[m] = 0.f;
+            for (unsigned int k = lane; k < HC_KC; k += 32u) {
+                const float v = xr[k];
+                part[24] += v * v;
+                #pragma unroll
+                for (int m = 0; m < 24; ++m) part[m] += s_fn[m][k] * v;
+            }
+            #pragma unroll
+            for (int m = 0; m < 25; ++m) {
+                float r = part[m];
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    r += __shfl_down_sync(0xFFFFFFFFu, r, off);
+                if (lane == 0) s_acc[tl][m] += r;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int i = threadIdx.x; i < HC_TB * 25u; i += 256u) {
+        const unsigned int tl = i / 25u, m = i % 25u;
+        const unsigned int t = t0 + tl;
+        if (t < num_tokens) mix_out[(size_t)t * 25u + m] = s_acc[tl][m];
+    }
+}
+
 // ── hc_pre_mix / hc_pre_finish ──
 // Decode-only two-kernel split of `hc_pre`.
 //

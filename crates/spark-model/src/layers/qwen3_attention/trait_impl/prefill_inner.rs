@@ -542,6 +542,40 @@ impl Qwen3AttentionLayer {
         }
 
         // ── Attention sublayer ──
+        // Token-tiled hc_pre at prefill width (2.39 vs 3.99 ms/call at T=2410,
+        // y cosine 1.0000000): both operands stream ~once. mix scratch is the
+        // idle MoE up buffer — consumed within this call pair. ATLAS_HC_TILED=0
+        // opts back into the one-block-per-token hc_pre.
+        if {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("ATLAS_HC_TILED").as_deref() != Ok("0"))
+        } && self.hc_pre_mix_tiled_k.0 != 0
+            && self.hc_pre_finish_k.0 != 0
+            && n >= 64
+            && h == 4096
+            && hc_mult == 4
+        {
+            ops::hc_pre_tiled(
+                ctx.gpu,
+                self.hc_pre_mix_tiled_k,
+                self.hc_pre_finish_k,
+                hc_streams,
+                hc.attn.hc_fn,
+                hc.attn.hc_scale,
+                hc.attn.hc_base,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.expert_up_out(),
+                n,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                stream,
+            )?;
+        } else {
         ops::hc_pre(
             ctx.gpu,
             self.hc_pre_k,
@@ -560,6 +594,7 @@ impl Qwen3AttentionLayer {
             hc.hc_eps,
             stream,
         )?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -746,6 +781,40 @@ impl Qwen3AttentionLayer {
         }
 
         // ── FFN sublayer ──
+        // Token-tiled hc_pre at prefill width (2.39 vs 3.99 ms/call at T=2410,
+        // y cosine 1.0000000): both operands stream ~once. mix scratch is the
+        // idle MoE up buffer — consumed within this call pair. ATLAS_HC_TILED=0
+        // opts back into the one-block-per-token hc_pre.
+        if {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("ATLAS_HC_TILED").as_deref() != Ok("0"))
+        } && self.hc_pre_mix_tiled_k.0 != 0
+            && self.hc_pre_finish_k.0 != 0
+            && n >= 64
+            && h == 4096
+            && hc_mult == 4
+        {
+            ops::hc_pre_tiled(
+                ctx.gpu,
+                self.hc_pre_mix_tiled_k,
+                self.hc_pre_finish_k,
+                hc_streams,
+                hc.ffn.hc_fn,
+                hc.ffn.hc_scale,
+                hc.ffn.hc_base,
+                hidden,
+                post,
+                comb,
+                ctx.buffers.expert_up_out(),
+                n,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                stream,
+            )?;
+        } else {
         ops::hc_pre(
             ctx.gpu,
             self.hc_pre_k,
@@ -764,6 +833,7 @@ impl Qwen3AttentionLayer {
             hc.hc_eps,
             stream,
         )?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,

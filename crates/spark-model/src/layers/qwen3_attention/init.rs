@@ -174,6 +174,11 @@ impl Qwen3AttentionLayer {
             hc_pre_k: super::super::try_kernel(gpu, "hyper_connection", "hc_pre"),
             hc_pre_mix_k: super::super::try_kernel(gpu, "hyper_connection", "hc_pre_mix"),
             hc_pre_finish_k: super::super::try_kernel(gpu, "hyper_connection", "hc_pre_finish"),
+            hc_pre_mix_tiled_k: super::super::try_kernel(
+                gpu,
+                "hyper_connection",
+                "hc_pre_mix_tiled",
+            ),
             hc_post_k: super::super::try_kernel(gpu, "hyper_connection", "hc_post"),
             hc_expand_k: super::super::try_kernel(gpu, "hyper_connection", "hc_expand"),
             hc_head_k: super::super::try_kernel(gpu, "hyper_connection", "hc_head"),

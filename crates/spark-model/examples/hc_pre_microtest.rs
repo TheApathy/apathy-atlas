@@ -159,6 +159,107 @@ fn main() -> Result<()> {
     let t_pre2 = time(&launch_pre2)?;
     println!("hc_pre_v2 T={T}: {t_pre2:.3} ms/call");
 
+    // split path (decode-built): mix (grid [T,25], 512thr) + finish
+    let mix_h = gpu.kernel("hyper_connection", "hc_pre_mix")?;
+    let fin_h = gpu.kernel("hyper_connection", "hc_pre_finish")?;
+    let mixs_d = gpu.alloc(T * (MIX + 1) * 4)?;
+    let y3_d = gpu.alloc(T * H * 2)?;
+    let post3_d = gpu.alloc(T * HC * 4)?;
+    let comb3_d = gpu.alloc(T * HC * HC * 4)?;
+    let launch_split = || -> Result<()> {
+        KernelLaunch::new(&gpu, mix_h)
+            .grid([T as u32, (MIX + 1) as u32, 1])
+            .block([512, 1, 1])
+            .arg_ptr(streams_d)
+            .arg_ptr(fn_d)
+            .arg_ptr(mixs_d)
+            .arg_u32(H as u32)
+            .arg_u32(HC as u32)
+            .launch(stream)?;
+        KernelLaunch::new(&gpu, fin_h)
+            .grid([T as u32, (H as u32).div_ceil(256), 1])
+            .block([256, 1, 1])
+            .arg_ptr(streams_d)
+            .arg_ptr(mixs_d)
+            .arg_ptr(scale_d)
+            .arg_ptr(base_d)
+            .arg_ptr(y3_d)
+            .arg_ptr(post3_d)
+            .arg_ptr(comb3_d)
+            .arg_u32(H as u32)
+            .arg_u32(HC as u32)
+            .arg_u32(3)
+            .arg_f32(1e-6)
+            .arg_f32(1e-6)
+            .launch(stream)
+    };
+    launch_split()?;
+    gpu.synchronize(stream)?;
+    // cosine vs hc_pre outputs (different reduction order -> not bit)
+    let mut ry = vec![0u8; T * H * 2];
+    let mut ry3 = vec![0u8; T * H * 2];
+    gpu.copy_d2h(y_d, &mut ry)?;
+    gpu.copy_d2h(y3_d, &mut ry3)?;
+    let f = |b: &[u8]| -> Vec<f64> {
+        b.chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64)
+            .collect()
+    };
+    let (a, b) = (f(&ry), f(&ry3));
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    println!("  split-vs-hc_pre y cosine: {:.7}", dot / (na.sqrt() * nb.sqrt()));
+    let t_split = time(&launch_split)?;
+    println!("hc_pre_split T={T}: {t_split:.3} ms/call");
+
+    // tiled mix + finish
+    let mixt_h = gpu.kernel("hyper_connection", "hc_pre_mix_tiled")?;
+    let launch_tiled = || -> Result<()> {
+        KernelLaunch::new(&gpu, mixt_h)
+            .grid([(T as u32).div_ceil(32), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(streams_d)
+            .arg_ptr(fn_d)
+            .arg_ptr(mixs_d)
+            .arg_u32(T as u32)
+            .arg_u32(H as u32)
+            .arg_u32(HC as u32)
+            .launch(stream)?;
+        KernelLaunch::new(&gpu, fin_h)
+            .grid([T as u32, (H as u32).div_ceil(256), 1])
+            .block([256, 1, 1])
+            .arg_ptr(streams_d)
+            .arg_ptr(mixs_d)
+            .arg_ptr(scale_d)
+            .arg_ptr(base_d)
+            .arg_ptr(y3_d)
+            .arg_ptr(post3_d)
+            .arg_ptr(comb3_d)
+            .arg_u32(H as u32)
+            .arg_u32(HC as u32)
+            .arg_u32(3)
+            .arg_f32(1e-6)
+            .arg_f32(1e-6)
+            .launch(stream)
+    };
+    launch_tiled()?;
+    gpu.synchronize(stream)?;
+    let mut ry4 = vec![0u8; T * H * 2];
+    gpu.copy_d2h(y3_d, &mut ry4)?;
+    let b2 = f(&ry4);
+    let (mut dot2, mut nb2) = (0f64, 0f64);
+    for i in 0..a.len() {
+        dot2 += a[i] * b2[i];
+        nb2 += b2[i] * b2[i];
+    }
+    println!("  tiled-vs-hc_pre y cosine: {:.7}", dot2 / (na.sqrt() * nb2.sqrt()));
+    let t_tiled = time(&launch_tiled)?;
+    println!("hc_pre TILED T={T}: {t_tiled:.3} ms/call");
+
     let t_pre = time(&launch_pre)?;
     let t_post = time(&launch_post)?;
     println!("hc_pre  T={T}: {t_pre:.3} ms/call  (x2 calls/layer x43 = {:.0} ms/pass)", t_pre * 86.0);

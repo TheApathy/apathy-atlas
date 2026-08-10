@@ -140,6 +140,10 @@ pub struct Qwen3AttentionLayer {
     /// split of `hc_pre` (NULL when the kernel module predates the split).
     pub(super) hc_pre_mix_k: KernelHandle,
     pub(super) hc_pre_finish_k: KernelHandle,
+    /// Prefill-width tiled mix (`hc_pre_mix_tiled`): both operands read
+    /// ~once (fn per 32-token tile, x once). 2.39 vs 3.99 ms at T=2410,
+    /// y cosine 1.0000000 vs hc_pre. 0 on miss.
+    pub(super) hc_pre_mix_tiled_k: KernelHandle,
     /// HC `hc_post` kernel handle (NULL when HC disabled).
     pub(super) hc_post_k: KernelHandle,
     /// HC `hc_expand` kernel handle (NULL when HC disabled).
