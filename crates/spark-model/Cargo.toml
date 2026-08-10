@@ -197,6 +197,10 @@ name = "rope_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "v4_decode_fused_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kernel_probe"
 required-features = ["cuda", "gpu-examples"]
 
