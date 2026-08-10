@@ -18,6 +18,7 @@ use super::*;
 /// Eliminates cascading if/else chains in layer forward methods. The enum
 /// branch (~1 cycle) is negligible vs GPU kernel launch overhead (~5μs).
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn quant_gemv(
     gpu: &dyn GpuBackend,
     gemv_nvfp4: KernelHandle,
@@ -53,6 +54,7 @@ pub fn quant_gemv(
 ///
 /// For M>1 prefill projections (Q/K/V/O). Falls back to dense GEMM for BF16.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn quant_gemm(
     gpu: &dyn GpuBackend,
     gemm_nvfp4: KernelHandle,
@@ -93,6 +95,7 @@ pub fn quant_gemm(
 ///
 /// Kernel: `w4a16_gemv(A, B_packed, B_scale, scale2, C, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn w4a16_gemv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -199,6 +202,7 @@ pub fn w4a16_gemv_grouped_batchm(
 ///
 /// Kernel: `w4a16_gemv_batch2(A, B_packed, B_scale, scale2, C, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn w4a16_gemv_batch2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -230,6 +234,7 @@ pub fn w4a16_gemv_batch2(
 ///
 /// Kernel: `w4a16_gemv_batch3(A, B_packed, B_scale, scale2, C, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn w4a16_gemv_batch3(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -262,6 +267,7 @@ pub fn w4a16_gemv_batch3(
 ///
 /// Kernel: `w4a16_gemv_batch4/16(A, B_packed, B_scale, scale2, C, M, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn w4a16_gemv_batchm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -293,6 +299,7 @@ pub fn w4a16_gemv_batchm(
 /// SLICE of a wider activation matrix (V4-Flash block-diagonal `wo_a` in the
 /// batched verify). Weight/scale pointers may be group sub-views.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_batch4_ld(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -333,6 +340,7 @@ pub fn w4a16_gemv_batch4_ld(
 /// Kernel: `w4a16_gemv_qg(A, B, S, s2, C, N, K, num_heads, head_dim)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_qg(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -369,6 +377,7 @@ pub fn w4a16_gemv_qg(
 /// Kernel: `w4a16_gemv_qkvz(A, B, S, s2, C, N, K, ng, kd, vpg, vd)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_qkvz(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -410,6 +419,7 @@ pub fn w4a16_gemv_qkvz(
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 /// Input A: [2, K], Output C: [2, N] deinterleaved [Q|G] per token.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_qg_batch2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -447,6 +457,7 @@ pub fn w4a16_gemv_qg_batch2(
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 /// Input A: [3, K], Output C: [3, N] deinterleaved [Q|G] per token.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_qg_batch3(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -484,6 +495,7 @@ pub fn w4a16_gemv_qg_batch3(
 /// Grid: (ceil(N/4), 1, 2)  Block: (256, 1, 1)
 /// Input A: [3, K], Output C0: [3, N], C1: [3, N].
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_dual_batch3(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -523,6 +535,7 @@ pub fn w4a16_gemv_dual_batch3(
 /// Grid: (ceil(N/4), 1, 2)  Block: (256, 1, 1)
 /// Input A: [2, K], Output C0: [2, N], C1: [2, N].
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemv_dual_batch2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

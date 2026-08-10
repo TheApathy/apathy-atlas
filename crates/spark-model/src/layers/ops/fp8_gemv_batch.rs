@@ -18,6 +18,7 @@ use crate::weight_map::Fp8DenseWeight;
 
 /// FP8-weight dual-GEMV. `input` is `[2, K]` BF16, `output` is `[2, N]` BF16.
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn dense_gemv_fp8w_batch2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -48,6 +49,7 @@ pub fn dense_gemv_fp8w_batch2(
 /// decode (which pads M to a 128-row MMA tile). Bit-identical per-row to
 /// `w8a16_gemv`. Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemv_batch4(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -82,6 +84,7 @@ pub fn w8a16_gemv_batch4(
 /// output (`ldc = latent`). Bit-identical per row to `w8a16_gemv` on the
 /// same slice. Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemv_batch4_ld(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -118,6 +121,7 @@ pub fn w8a16_gemv_batch4_ld(
 /// projections under `ATLAS_VERIFY_EXACT_GEMV=1`. Strided A/C.
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemv_batchm_exact(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -152,6 +156,7 @@ pub fn w8a16_gemv_batchm_exact(
 /// `[2, N]` BF16; `weight`/`block_scale` are the raw `w8a16_gemv` pointers.
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemv_batch2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

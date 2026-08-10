@@ -17,6 +17,10 @@ REPO=/home/flocka/dsflash-combined
 MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
 DRAFTER=/home/flocka/models/DeepSeek-V4-Flash-0731-drafter
 PORT="${PORT:-8977}"
+# S1 of the 28-tok/s plan (docs/EXPERT-3BPW-PLAN.md): LMHEAD=nvfp4 halves the
+# 529 MB/token lm_head stream. Default stays fp8 until the quality gate signs
+# off on the argmax-flip risk.
+LMHEAD="${LMHEAD:-fp8}"
 LOG="$REPO/serve-$NAME.log"
 
 ENV_ARGS=(
@@ -35,7 +39,7 @@ cd "$REPO"
 {
   echo "serve: $REPO/target/release/spark"
   echo "cwd  : $REPO  (jinja-templates override dir)"
-  echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=fp8 gpu_mem=0.96 max_seq=4096 batch=1"
+  echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=$LMHEAD gpu_mem=0.96 max_seq=4096 batch=1"
   echo "env  : ${ENV_ARGS[*]}"
   echo "spec : ${SPEC[*]:-<none, plain decode>}"
 } >"$LOG"
@@ -43,7 +47,7 @@ cd "$REPO"
 env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --port "$PORT" \
   --kv-cache-dtype fp8 \
-  --lm-head-dtype fp8 \
+  --lm-head-dtype "$LMHEAD" \
   --gpu-memory-utilization 0.96 \
   --max-seq-len 4096 \
   --max-num-seqs 1 \

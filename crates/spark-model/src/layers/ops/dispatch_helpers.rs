@@ -191,6 +191,7 @@ pub fn log_cutlass_nvfp4_route(name: &str, m: u32, n: u32, k: u32) {
 /// Roofline instrumentation: log each unique (kernel, M, N, K) GEMM shape once,
 /// gated by `ATLAS_GEMM_SHAPE_LOG=1`. Used to cross-reference nsys per-call
 /// durations → achieved TFLOPS/bandwidth vs GB10 peak.
+#[track_caller]
 pub fn log_gemm_shape(name: &str, m: u32, n: u32, k: u32) {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -206,7 +207,16 @@ pub fn log_gemm_shape(name: &str, m: u32, n: u32, k: u32) {
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     if seen.lock().unwrap().insert(key) {
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
-        tracing::warn!("GEMM_SHAPE {name} M={m} N={n} K={k} FLOP={flop:.3e}");
+        // #[track_caller] on this fn and the thin ops wrappers means `caller`
+        // names the layer-code dispatch site — added after the decode audit
+        // spent a search cycle hunting which layer owned two anonymous BF16
+        // dense_gemv shapes.
+        let loc = std::panic::Location::caller();
+        tracing::warn!(
+            "GEMM_SHAPE {name} M={m} N={n} K={k} FLOP={flop:.3e} at={}:{}",
+            loc.file(),
+            loc.line()
+        );
     }
 }
 

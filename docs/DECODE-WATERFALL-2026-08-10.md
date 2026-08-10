@@ -94,7 +94,9 @@ entire MoE bucket during the first aggregation pass).
 | 1 | Graph the spec-armed suspended serial path (currently eager: prose 19.75 vs plain 21.9) | +2 tok/s on prose/quote under spec | none — engineering; restores adaptive's "never slower than plain" contract |
 | 2 | MoE expert GEMV 192 → ~220 GB/s (SASS/bank-conflict audit, same method as the prefill shared-expert fix) | +1.5–2 tok/s all workloads | none if bit-identical like prior MoE fixes |
 | 3 | Small-N GEMV shapes (kv_proj 170, n144 at 144 GB/s) | +0.2 tok/s | none; low priority |
-| 4 | **Fewer bytes**: 3.0 bpw Trellis experts (4.0→2.6 GB/token; ceiling 34→~44), NVFP4 lm_head (529→265 MB) | +6–10 tok/s | **quality decision — needs explicit sign-off + gate** |
+| 4 | **Fewer bytes**: 3.0 bpw Trellis experts (4.0→2.6 GB/token; ceiling 34→~44) | +6–10 tok/s | **quality decision — needs explicit sign-off + gate** |
+| ~~4b~~ | ~~NVFP4 lm_head (529→265 MB)~~ | **NO-GO 2026-08-10** | measured: fabricates verbatim recall (misquoted the Frost stanza at temp 0; prose/code/repeat fine at +0.5 tok/s). Head argmax needs ≥FP8 — the reference stack reaches the same conclusion (EXL3 config keeps its head FP8). `LMHEAD=nvfp4` knob kept in dsflash-serve-bench.sh for re-testing. |
+| ~~4c~~ | ~~FP8 the BF16 MLA stragglers~~ | closed: nothing safe | caller-tagged shape log: the only per-layer BF16 M=1 GEMV is the MoE ROUTER gate ([144,4096], ~0.35 ms/token at 144 GB/s) — quantizing the router changes routing; not worth ~0.2 ms. |
 | 5 | Drafter/acceptance quality on prose (spec side; C=2.64 decomposition) | workload-dependent | model work, not kernels |
 
 Items 1+2 take plain ~21.9 → ~25 and spec-prose to parity or better; item 4 is

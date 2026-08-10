@@ -18,6 +18,7 @@ use super::*;
 /// Both A (activations) and B (weights) are pre-converted FP8 E4M3.
 /// No BF16→FP8 conversion in inner loop — pure MMA throughput.
 /// Grid: (ceil(N/128), ceil(M/64))  Block: (128, 1, 1)
+#[track_caller]
 pub fn fp8_fp8_gemm_n128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -49,6 +50,7 @@ pub fn fp8_fp8_gemm_n128(
 ///
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn fp8_gemm_n128_m128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -81,6 +83,7 @@ pub fn fp8_gemm_n128_m128(
 ///
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn fp8_fp8_gemm_n128_m128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -112,6 +115,7 @@ pub fn fp8_fp8_gemm_n128_m128(
 ///
 /// Kernel: `dense_gemv_bf16(A, B, C, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn dense_gemv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -149,6 +153,7 @@ pub fn dense_gemv(
 /// Kernel: `dense_gemv_bf16_batchm(A, B, C, M, N, K, a_stride, out_stride)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemv_batchm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -191,6 +196,7 @@ pub const DENSE_GEMV_BATCHM_MAX_M: u32 = 16;
 /// Kernel: `dense_gemv_bf16_grouped_batchm(A, B, C, M, N, K, lda, ldc, rpg)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemv_grouped_batchm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -233,6 +239,7 @@ pub fn dense_gemv_grouped_batchm(
 ///
 /// Kernel: `dense_gemv_bf16_batch2(A, B, C, N, K, out_stride)`
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemv_batch2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -265,6 +272,7 @@ pub fn dense_gemv_batch2(
 ///
 /// Kernel: `dense_gemv_fp8w(A, B, row_scale, C, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn dense_gemv_fp8w(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -298,6 +306,7 @@ pub fn dense_gemv_fp8w(
 /// Kernel: `w8a16_gemv(A, B, row_scale, C, N, K)`
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -327,6 +336,7 @@ pub fn w8a16_gemv(
 /// Uses 256-entry E4M3 LUT + BF16 2D block scales.
 /// Grid: (ceil(N/64), ceil(M/64), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -370,6 +380,7 @@ pub fn w8a16_gemm(
 /// Lets the V4 block-diagonal wo_a run its groups IN PLACE — no gather/scatter.
 /// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemm_pipelined_ld(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -403,6 +414,7 @@ pub fn w8a16_gemm_pipelined_ld(
 /// BF16-weight sibling of the above (`dense_gemm_bf16_pipelined_ld`).
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemm_bf16_pipelined_ld(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -440,6 +452,7 @@ pub fn dense_gemm_bf16_pipelined_ld(
 ///
 /// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemm_pipelined(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -509,6 +522,7 @@ pub fn per_token_group_quant_fp8(
 ///
 /// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn fp8_gemm_t_blockscaled(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -634,6 +648,7 @@ pub fn moe_build_tile_worklist(
 ///
 /// Grid: (max_tiles.clamp(1, MAX_GRID_CTAS), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn moe_fp8_grouped_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -692,6 +707,7 @@ pub fn moe_fp8_grouped_gemm(
 /// `a_scale` (per-token, FP32) and `b_scale` (per-block, BF16) are applied
 /// in the FP32 epilogue per K=128 block.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn moe_w8a8_grouped_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -734,6 +750,7 @@ pub fn moe_w8a8_grouped_gemm(
 ///
 /// Grid: (ceil(N/64), max_m_tiles, num_experts)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn moe_bf16_grouped_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -769,6 +786,7 @@ pub fn moe_bf16_grouped_gemm(
 /// coalesced N-dimension reads. ~14x faster than non-transposed w8a16_gemm at long M.
 /// Grid: (ceil(N/64), ceil(M/64), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemm_t(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -802,6 +820,7 @@ pub fn w8a16_gemm_t(
 /// N/128]); reuses the transpose_fp8 / transpose_block_scale output as-is.
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemm_n128_m128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -833,6 +852,7 @@ pub fn w8a16_gemm_n128_m128(
 /// K-contiguous smem_B + 128x32 occupancy tile.
 /// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w8a16_gemm_t_pipelined(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -861,6 +881,7 @@ pub fn w8a16_gemm_t_pipelined(
 
 /// Transpose FP8 weight matrix on GPU: `B[N,K]` → `B_t[K,N]`.
 /// Grid: (ceil(N*K/256), 1, 1)  Block: (256, 1, 1)
+#[track_caller]
 pub fn transpose_fp8(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

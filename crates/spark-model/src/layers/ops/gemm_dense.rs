@@ -23,6 +23,7 @@ use super::*;
 /// Grid: (ceil(N/16), ceil(M/16), 1)  Block: (16, 16, 1)
 /// Tensor-core BF16 GEMM: m16n8k16 MMA for 3-5x speedup over scalar.
 /// Grid: (ceil(N/64), ceil(M/16), 1), Block: (128, 1, 1)
+#[track_caller]
 pub fn dense_gemm_tc(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -50,6 +51,7 @@ pub fn dense_gemm_tc(
 /// Split-K GEMM: partial products over K_splits chunks, then reduce.
 /// Uses FP32 workspace of size K_splits * M * N * 4 bytes.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemm_splitk(
     gpu: &dyn GpuBackend,
     partial_kernel: KernelHandle,
@@ -89,6 +91,7 @@ pub fn dense_gemm_splitk(
         .launch(stream)
 }
 
+#[track_caller]
 pub fn dense_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -118,6 +121,7 @@ pub fn dense_gemm(
 /// tile. ~40x the scalar `dense_gemm` on large-M shapes (cosine=1.0, same math).
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemm_bf16_pipelined(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -150,6 +154,7 @@ pub fn dense_gemm_bf16_pipelined(
 /// drafter shapes. Contract: M ≤ 16, K % 8 == 0 (caller-guarded).
 /// Grid: (ceil(N/64), 1, 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemm_bf16_mtile16(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -188,6 +193,7 @@ pub fn dense_gemm_bf16_mtile16(
 /// contiguous B streams win on LPDDR5x. Contract: M ≤ 16, K % 8 == 0.
 /// Grid: (ceil(N/128), 1, 1)  Block: (256, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemm_bf16_mtile16_n128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -224,6 +230,7 @@ pub fn dense_gemm_bf16_mtile16_n128(
 /// selected target ships it, and retain the scalar kernel as an explicit
 /// compatibility fallback for older targets.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn dense_gemm_prefill(
     gpu: &dyn GpuBackend,
     fallback_kernel: KernelHandle,
@@ -262,6 +269,7 @@ pub fn dense_gemm_prefill(
 ///
 /// Kernel: `w4a16_gemm(A, B_packed, B_scale, scale2, C, M, N, K)`
 /// Grid: (ceil(N/64), ceil(M/64), 1)  Block: (128, 1, 1)
+#[track_caller]
 pub fn w4a16_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -292,6 +300,7 @@ pub fn w4a16_gemm(
 ///
 /// Grid: (ceil(N/128), ceil(M/64), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemm_n128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -322,6 +331,7 @@ pub fn w4a16_gemm_n128(
 /// Halves K-iteration count; doubles per-iter MMA count. 1 CTA/SM
 /// (was 3 for v2) due to larger SMEM footprint.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemm_n128_m128_v3(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -359,6 +369,7 @@ pub fn w4a16_gemm_n128_m128_v3(
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
 /// SMEM: ~42.6 KB → 2 CTAs/SM (vs 3 for v1), but 2× warps/CTA.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemm_n128_m128_v2(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -402,6 +413,7 @@ pub fn w4a16_gemm_n128_m128_v2(
 /// wants the m-fast (L2-friendly) order, add a SEPARATELY NAMED kernel + launcher
 /// (see `w4a4_gemm_mfast` / `fp8_gemm_t_m128_mfast`) rather than mutating this one.
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemm_n128_m128(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -439,6 +451,7 @@ pub fn w4a16_gemm_n128_m128(
 ///
 /// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (128, 1, 1)
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 pub fn w4a16_gemm_n128_m128_bf16(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
