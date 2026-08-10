@@ -270,8 +270,29 @@ impl Qwen3AttentionLayer {
         // bug exposed once the upstream norms were corrected. Use the scalar
         // dense_gemm path for wkv until the TC kernel is fixed. wq_a above is
         // unaffected (TC output is correct there).
+        // The NaN note above is specific to `dense_gemm_tc` (16x64 tile), which
+        // stays disabled. `dense_gemm_bf16_pipelined` is a DIFFERENT kernel
+        // (128x128 cp.async tiling) and is 30x the scalar arm at this shape:
+        // microtest M=2410 N=512 K=4096 measures scalar 6.96 ms vs pipelined
+        // 0.23 ms, both cosine 1.000000 vs the CPU oracle. Watch for NaN in the
+        // K-FULL diag below if this ever regresses; ATLAS_V4_KV_PIPELINED=0
+        // restores the scalar arm.
         #[allow(clippy::overly_complex_bool_expr)]
-        if false && use_tc {
+        if self.dense_gemm_pipelined_k.0 != 0
+            && std::env::var("ATLAS_V4_KV_PIPELINED").as_deref() != Ok("0")
+        {
+            ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.dense_gemm_pipelined_k,
+                normed,
+                &mla.wkv_a,
+                kv_latent,
+                n,
+                kv_lora,
+                h,
+                stream,
+            )?;
+        } else if false && use_tc {
             ops::dense_gemm_tc(
                 ctx.gpu,
                 self.dense_gemm_tc_k,

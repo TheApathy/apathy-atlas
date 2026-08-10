@@ -51,6 +51,23 @@ impl Qwen3AttentionLayer {
         label: &str,
     ) -> Result<()> {
         if !dense.weight.is_null() {
+            // The BF16 arm (wq_b / wo_a groups / wo_b when the mirrors are NOT
+            // released) ran the SIMT scalar GEMM: microtest M=2410 N=512 K=4096
+            // measures 6.96 ms vs 0.23 ms for dense_gemm_bf16_pipelined, both
+            // cosine 1.000000. Same math, 128x128 cp.async tiling.
+            if self.dense_gemm_pipelined_k.0 != 0 {
+                return ops::dense_gemm_bf16_pipelined(
+                    ctx.gpu,
+                    self.dense_gemm_pipelined_k,
+                    input,
+                    dense,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                );
+            }
             return ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
