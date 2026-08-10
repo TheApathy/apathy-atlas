@@ -500,6 +500,22 @@ impl Qwen3AttentionLayer {
         let hc_split = self.hc_pre_mix_k.0 != 0
             && self.hc_pre_finish_k.0 != 0
             && !std::env::var("ATLAS_HC_SPLIT").is_ok_and(|v| v == "0");
+        // One-shot dispatch visibility: the decode waterfall showed HC pre at
+        // fused-path cost (78µs/site) while the split path microbenches at
+        // ~20µs, and the two candidate explanations (split not engaged vs
+        // split latency-bound in-serve) are indistinguishable from bucket
+        // times alone. Log which branch actually runs, once.
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    "HC decode dispatch: split={} (mix_k={:#x} finish_k={:#x})",
+                    hc_split,
+                    self.hc_pre_mix_k.0,
+                    self.hc_pre_finish_k.0
+                );
+            });
+        }
         // One block per 256 hidden lanes — 16 blocks at H=4096, enough to cover
         // the SMs without splintering the coalesced reads.
         let post_shards = if hc_split {

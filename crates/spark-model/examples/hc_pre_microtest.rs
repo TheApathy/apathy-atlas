@@ -11,7 +11,10 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kernel_args::KernelLaunch;
 
-const T: usize = 2410;
+// T overridable at argv[1] (decode audit runs T=1).
+fn t_tokens() -> usize {
+    std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2410)
+}
 const HC: usize = 4;
 const H: usize = 4096;
 const HC_DIM: usize = HC * H;
@@ -34,6 +37,7 @@ fn upload_f32(gpu: &dyn GpuBackend, v: &[f32]) -> Result<DevicePtr> {
 }
 
 fn main() -> Result<()> {
+    let t_dyn: usize = t_tokens();
     let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let stream = gpu.default_stream();
     let pre_h = gpu.kernel("hyper_connection", "hc_pre")?;
@@ -44,7 +48,7 @@ fn main() -> Result<()> {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     };
-    let streams: Vec<f32> = (0..T * HC_DIM).map(|_| rnd()).collect();
+    let streams: Vec<f32> = (0..t_dyn * HC_DIM).map(|_| rnd()).collect();
     let fn_w: Vec<f32> = (0..MIX * HC_DIM).map(|_| rnd() * 0.01).collect();
     let scale: Vec<f32> = vec![1.0, 1.0, 1.0];
     let base: Vec<f32> = (0..MIX).map(|_| rnd() * 0.1).collect();
@@ -53,14 +57,14 @@ fn main() -> Result<()> {
     let fn_d = upload_f32(&gpu, &fn_w)?;
     let scale_d = upload_f32(&gpu, &scale)?;
     let base_d = upload_f32(&gpu, &base)?;
-    let y_d = gpu.alloc(T * H * 2)?;
-    let post_d = gpu.alloc(T * HC * 4)?;
-    let comb_d = gpu.alloc(T * HC * HC * 4)?;
-    let attn_d = gpu.alloc(T * H * 2)?; // bf16 sublayer output for hc_post
+    let y_d = gpu.alloc(t_dyn * H * 2)?;
+    let post_d = gpu.alloc(t_dyn * HC * 4)?;
+    let comb_d = gpu.alloc(t_dyn * HC * HC * 4)?;
+    let attn_d = gpu.alloc(t_dyn * H * 2)?; // bf16 sublayer output for hc_post
 
     let launch_pre = || -> Result<()> {
         KernelLaunch::new(&gpu, pre_h)
-            .grid([T as u32, 1, 1])
+            .grid([t_dyn as u32, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(streams_d)
             .arg_ptr(fn_d)
@@ -78,7 +82,7 @@ fn main() -> Result<()> {
     };
     let launch_post = || -> Result<()> {
         KernelLaunch::new(&gpu, post_h)
-            .grid([T as u32, 1, 1])
+            .grid([t_dyn as u32, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(attn_d)
             .arg_ptr(streams_d)
@@ -118,12 +122,12 @@ fn main() -> Result<()> {
 
     // v2: bit-exactness gate + timing
     let pre2_h = gpu.kernel("hyper_connection", "hc_pre_v2")?;
-    let y2_d = gpu.alloc(T * H * 2)?;
-    let post2_d = gpu.alloc(T * HC * 4)?;
-    let comb2_d = gpu.alloc(T * HC * HC * 4)?;
+    let y2_d = gpu.alloc(t_dyn * H * 2)?;
+    let post2_d = gpu.alloc(t_dyn * HC * 4)?;
+    let comb2_d = gpu.alloc(t_dyn * HC * HC * 4)?;
     let launch_pre2 = || -> Result<()> {
         KernelLaunch::new(&gpu, pre2_h)
-            .grid([T as u32, 1, 1])
+            .grid([t_dyn as u32, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(streams_d)
             .arg_ptr(fn_d)
@@ -143,9 +147,9 @@ fn main() -> Result<()> {
     launch_pre2()?;
     gpu.synchronize(stream)?;
     for (a, b, len, name) in [
-        (y_d, y2_d, T * H * 2, "y"),
-        (post_d, post2_d, T * HC * 4, "post"),
-        (comb_d, comb2_d, T * HC * HC * 4, "comb"),
+        (y_d, y2_d, t_dyn * H * 2, "y"),
+        (post_d, post2_d, t_dyn * HC * 4, "post"),
+        (comb_d, comb2_d, t_dyn * HC * HC * 4, "comb"),
     ] {
         let mut ra = vec![0u8; len];
         let mut rb = vec![0u8; len];
@@ -157,18 +161,18 @@ fn main() -> Result<()> {
     }
     println!("  GATE PASS: hc_pre_v2 == hc_pre bit-identical (y/post/comb)");
     let t_pre2 = time(&launch_pre2)?;
-    println!("hc_pre_v2 T={T}: {t_pre2:.3} ms/call");
+    println!("hc_pre_v2 t_dyn={t_dyn}: {t_pre2:.3} ms/call");
 
-    // split path (decode-built): mix (grid [T,25], 512thr) + finish
+    // split path (decode-built): mix (grid [t_dyn,25], 512thr) + finish
     let mix_h = gpu.kernel("hyper_connection", "hc_pre_mix")?;
     let fin_h = gpu.kernel("hyper_connection", "hc_pre_finish")?;
-    let mixs_d = gpu.alloc(T * (MIX + 1) * 4)?;
-    let y3_d = gpu.alloc(T * H * 2)?;
-    let post3_d = gpu.alloc(T * HC * 4)?;
-    let comb3_d = gpu.alloc(T * HC * HC * 4)?;
+    let mixs_d = gpu.alloc(t_dyn * (MIX + 1) * 4)?;
+    let y3_d = gpu.alloc(t_dyn * H * 2)?;
+    let post3_d = gpu.alloc(t_dyn * HC * 4)?;
+    let comb3_d = gpu.alloc(t_dyn * HC * HC * 4)?;
     let launch_split = || -> Result<()> {
         KernelLaunch::new(&gpu, mix_h)
-            .grid([T as u32, (MIX + 1) as u32, 1])
+            .grid([t_dyn as u32, (MIX + 1) as u32, 1])
             .block([512, 1, 1])
             .arg_ptr(streams_d)
             .arg_ptr(fn_d)
@@ -177,7 +181,7 @@ fn main() -> Result<()> {
             .arg_u32(HC as u32)
             .launch(stream)?;
         KernelLaunch::new(&gpu, fin_h)
-            .grid([T as u32, (H as u32).div_ceil(256), 1])
+            .grid([t_dyn as u32, (H as u32).div_ceil(256), 1])
             .block([256, 1, 1])
             .arg_ptr(streams_d)
             .arg_ptr(mixs_d)
@@ -196,8 +200,8 @@ fn main() -> Result<()> {
     launch_split()?;
     gpu.synchronize(stream)?;
     // cosine vs hc_pre outputs (different reduction order -> not bit)
-    let mut ry = vec![0u8; T * H * 2];
-    let mut ry3 = vec![0u8; T * H * 2];
+    let mut ry = vec![0u8; t_dyn * H * 2];
+    let mut ry3 = vec![0u8; t_dyn * H * 2];
     gpu.copy_d2h(y_d, &mut ry)?;
     gpu.copy_d2h(y3_d, &mut ry3)?;
     let f = |b: &[u8]| -> Vec<f64> {
@@ -214,23 +218,23 @@ fn main() -> Result<()> {
     }
     println!("  split-vs-hc_pre y cosine: {:.7}", dot / (na.sqrt() * nb.sqrt()));
     let t_split = time(&launch_split)?;
-    println!("hc_pre_split T={T}: {t_split:.3} ms/call");
+    println!("hc_pre_split t_dyn={t_dyn}: {t_split:.3} ms/call");
 
     // tiled mix + finish
     let mixt_h = gpu.kernel("hyper_connection", "hc_pre_mix_tiled")?;
     let launch_tiled = || -> Result<()> {
         KernelLaunch::new(&gpu, mixt_h)
-            .grid([(T as u32).div_ceil(32), 1, 1])
+            .grid([(t_dyn as u32).div_ceil(32), 1, 1])
             .block([256, 1, 1])
             .arg_ptr(streams_d)
             .arg_ptr(fn_d)
             .arg_ptr(mixs_d)
-            .arg_u32(T as u32)
+            .arg_u32(t_dyn as u32)
             .arg_u32(H as u32)
             .arg_u32(HC as u32)
             .launch(stream)?;
         KernelLaunch::new(&gpu, fin_h)
-            .grid([T as u32, (H as u32).div_ceil(256), 1])
+            .grid([t_dyn as u32, (H as u32).div_ceil(256), 1])
             .block([256, 1, 1])
             .arg_ptr(streams_d)
             .arg_ptr(mixs_d)
@@ -248,7 +252,7 @@ fn main() -> Result<()> {
     };
     launch_tiled()?;
     gpu.synchronize(stream)?;
-    let mut ry4 = vec![0u8; T * H * 2];
+    let mut ry4 = vec![0u8; t_dyn * H * 2];
     gpu.copy_d2h(y3_d, &mut ry4)?;
     let b2 = f(&ry4);
     let (mut dot2, mut nb2) = (0f64, 0f64);
@@ -258,11 +262,11 @@ fn main() -> Result<()> {
     }
     println!("  tiled-vs-hc_pre y cosine: {:.7}", dot2 / (na.sqrt() * nb2.sqrt()));
     let t_tiled = time(&launch_tiled)?;
-    println!("hc_pre TILED T={T}: {t_tiled:.3} ms/call");
+    println!("hc_pre TILED t_dyn={t_dyn}: {t_tiled:.3} ms/call");
 
     let t_pre = time(&launch_pre)?;
     let t_post = time(&launch_post)?;
-    println!("hc_pre  T={T}: {t_pre:.3} ms/call  (x2 calls/layer x43 = {:.0} ms/pass)", t_pre * 86.0);
-    println!("hc_post T={T}: {t_post:.3} ms/call (x2 calls/layer x43 = {:.0} ms/pass)", t_post * 86.0);
+    println!("hc_pre  t_dyn={t_dyn}: {t_pre:.3} ms/call  (x2 calls/layer x43 = {:.0} ms/pass)", t_pre * 86.0);
+    println!("hc_post t_dyn={t_dyn}: {t_post:.3} ms/call (x2 calls/layer x43 = {:.0} ms/pass)", t_post * 86.0);
     Ok(())
 }
