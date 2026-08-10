@@ -136,3 +136,20 @@ prize ~1 s. Then: MoE bandwidth pass (~0.4 s), TC attention round 2
 (~0.4 s), csa_compress kernel (~0.25 s), hc glue fusion (~0.25 s).
 Sum of prizes ≈ 2.3-2.6 s → TTFT ~2.4-2.7 s ≈ 900-1000 @ 2410; >1000 at
 3900 with length amortization.
+
+## 2026-08-10 prefill round 2 — 459 → 562 tok/s (889abbfe)
+
+Convicted & fixed: the two ratio-0 dense layers ran the old
+prefill_attention_512_sink at **770 ms/pass** (bucket-4d sub-split); routed
+through the TC kernel (n_comp=0) → TTFT 5.16 → 4.29 s. Refuted with data:
+SM clock ramp (cold==hot, 2.4-2.6 GHz throughout) and per-stage sync tax
+(ATLAS_V4_STAGE_SYNCS=0 no-op end-to-end). Also: w8a16_gemm_pipelined
+measures 27 TFLOPS at our real shapes (not its documented 12); w8a8 FP8-MMA
+sibling built + oracle'd (cos 0.9997, 1.04-1.22x, unwired).
+
+Remaining @2410 (TTFT 4.29, target 2.41): MoE 1366 (bandwidth pass ~-0.4s) |
+qle 682 (sub-probe internals; q_b_norm [154k x 512] suspect) | o_proj 616
+(wire w8a8 ~-0.1s+) | compressor 518 (csa_compress kernel ~-0.25s) |
+hc glue ~510 (fusion ~-0.25s) | kv_proj 311 | TC attn 250 (round 2).
+Realistic near-term sum ≈ -1.3s → ~820 tok/s @2410; 1000 needs the
+FP8-GEMM class deeper + MoE deeper + length amortization (N=3900).
