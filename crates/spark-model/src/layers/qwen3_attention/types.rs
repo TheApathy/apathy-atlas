@@ -364,6 +364,12 @@ pub struct Qwen3AttentionLayer {
     /// Oracle: prefill_attn_tc_microtest — cos 0.9999975 vs scalar,
     /// 7.12 -> 1.85 ms/call at S=896 (2026-08-09). 0 on miss.
     pub(super) prefill_attn_compressed_tc_k: KernelHandle,
+    /// Round-2 sibling of the above: identical semantics and arithmetic, pure
+    /// data-movement rewrite (natural-K staging, one aliased K/V tile,
+    /// ldmatrix B operands, P kept in registers, 20,992 B smem = 3 CTAs/SM
+    /// where tc gets 2). OPT-IN while it is being A/B'd on hardware:
+    /// `ATLAS_V4_PREFILL_TC2=1`. 0 on miss.
+    pub(super) prefill_attn_compressed_tc2_k: KernelHandle,
     /// 4b: # compressed blocks prefill wrote to `mla.compressor.pool` for the
     /// active sequence (= prefill_len / ratio). Decode's compressed arm attends
     /// blocks `[0, this)`. AtomicU32 for interior mutability under prefill's

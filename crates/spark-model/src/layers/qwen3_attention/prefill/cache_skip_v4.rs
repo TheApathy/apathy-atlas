@@ -11,6 +11,19 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+/// Round-2 tensor-core prefill attention (`prefill_attn_compressed_tc2`) is
+/// OPT-IN while it is A/B'd on hardware: `ATLAS_V4_PREFILL_TC2=1` selects it,
+/// anything else keeps the shipping `prefill_attn_compressed_tc`. The two are
+/// launch-compatible — same grid, same block, same argument list, same
+/// semantics — and tc2 differs only in data movement (natural-K staging, one
+/// aliased K/V tile, ldmatrix B operands, P kept in registers; 20,992 B smem
+/// = 3 CTAs/SM where tc gets 2). `ATLAS_V4_PREFILL_TC=0` still overrides both
+/// back to the scalar kernel.
+fn v4_prefill_tc2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_TC2").as_deref() == Ok("1"))
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn prefill_attention_cache_skip_v4(
         &self,
@@ -736,18 +749,25 @@ impl Qwen3AttentionLayer {
                 })
             } && self.prefill_attn_compressed_tc_k.0 != 0
                 && hd_mla == 512;
+            // tc2 when opted in and present; otherwise the shipping tc.
+            let tc_k = if v4_prefill_tc2_enabled() && self.prefill_attn_compressed_tc2_k.0 != 0 {
+                self.prefill_attn_compressed_tc2_k
+            } else {
+                self.prefill_attn_compressed_tc_k
+            };
             {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     tracing::info!(
-                        "V4 prefill core attention: {} (tc_handle={} hd={hd_mla})",
+                        "V4 prefill core attention: {} (tc_handle={} tc2={} hd={hd_mla})",
                         if use_tc { "TENSOR-CORE" } else { "scalar" },
-                        self.prefill_attn_compressed_tc_k.0,
+                        tc_k.0,
+                        v4_prefill_tc2_enabled(),
                     );
                 });
             }
             let attn_k = if use_tc {
-                self.prefill_attn_compressed_tc_k
+                tc_k
             } else {
                 self.prefill_attn_compressed_k
             };
@@ -876,8 +896,14 @@ impl Qwen3AttentionLayer {
                 })
             } && self.prefill_attn_compressed_tc_k.0 != 0
                 && hd_mla == 512;
+            let tc_dense_k =
+                if v4_prefill_tc2_enabled() && self.prefill_attn_compressed_tc2_k.0 != 0 {
+                    self.prefill_attn_compressed_tc2_k
+                } else {
+                    self.prefill_attn_compressed_tc_k
+                };
             if use_tc_dense {
-                KernelLaunch::new(ctx.gpu, self.prefill_attn_compressed_tc_k)
+                KernelLaunch::new(ctx.gpu, tc_dense_k)
                     .grid([nq, n.div_ceil(16), 1])
                     .block([128, 1, 1])
                     .arg_ptr(q_full)

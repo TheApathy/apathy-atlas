@@ -592,6 +592,11 @@ impl Qwen3AttentionLayer {
                 "prefill_attn_compressed",
                 "prefill_attn_compressed_tc",
             ),
+            prefill_attn_compressed_tc2_k: super::super::try_kernel(
+                gpu,
+                "prefill_attn_compressed",
+                "prefill_attn_compressed_tc2",
+            ),
             v4_comp_pool_filled: std::sync::atomic::AtomicU32::new(0),
             // Device mirror of the above; allocated (compressor layers only) by
             // `alloc_verify_comp_normed`. NULL → kernel reads count 0.

@@ -192,3 +192,183 @@ Core attention 864.6 -> ~78 ms/pass at 10% tensor-core efficiency; prefill
 474 -> ~800 tok/s, and ~950 with the q_latent_expand GEMMs. Anything under
 ~5x on this stage means the MMA pipeline is stalling — check smem bank
 conflicts on the transposed K tile first.
+
+---
+
+# Round 2 — `prefill_attn_compressed_tc2`
+
+Round 1 (`prefill_attn_compressed_tc`) landed a uniform **4.1-4.2x** over the
+scalar kernel: 7.03 ms/call at the CSA config (S=2176, window=128, ratio=4)
+and 18.30 ms/call at the HCA config (window=0, ratio=128, full-causal),
+~490 ms/pass at N=2410. That is 5x short of the "10% of tensor-core peak"
+target above, and the reason turns out to be that **the design's own diagnosis
+was wrong twice**. Both errors are corrected below and in the kernel.
+
+## The measurement that reframes everything
+
+At S=2176 full-causal the grid is 64 heads x 136 row-blocks = 8,704 blocks,
+each walking ~68.5 key tiles on average = 596,224 block-tiles. Each block-tile
+retires 128 MMAs (4 warps x 32). At ~1.5 GHz, 18.30 ms = 27.45e6 cycles:
+
+```
+MMA cycles     = 596,224 x 128 / (48 SM x 4 quadrants) x 4 cyc = 1.59e6
+wall cycles                                                    = 27.45e6
+                                                       MMA share = 5.8%
+per warp per key tile: 27.45e6 x 192 / (596,224 x 4)   = 2210 cycles
+```
+
+**94% of the kernel is not tensor-core work.** Round 1's issue mix, per warp
+per key tile, all at 2-byte granularity (confirmed in SASS):
+
+| what | count | conflict |
+|---|---|---|
+| `LDS.U16` rebuilding both B fragments | 128 | 2-way |
+| `STS.U16` building the TRANSPOSED K tile | 64 | 4-way |
+| `LDS.64` reading the 4 warps' S partials | 32 | 4-way |
+| `STS`/`LDS` round-tripping P through smem | 16 | — |
+| `HMMA.16816` | 32 | — |
+
+169 shared-memory instructions per 32 MMAs, most of them replayed, against
+8 warps/SM of latency hiding. This is an instruction-issue and occupancy
+problem, not an MMA-pipeline problem.
+
+## Correction 1: K never needed to be transposed
+
+The doc above says (twice) that the `.col` B operand forces `sKT[dim][key]`.
+It does not. `mma...row.col` means the B operand's **contraction index is the
+contiguous one**, and the b register packs `B[k][n], B[k+1][n]` — two
+consecutive **dims** of one key. That is exactly `sK[key][dim]`, the natural
+layout. Round 1 paid 64 4-way-conflicted 2-byte stores per warp per tile to
+build a transpose that was never required.
+
+The 4-way conflict was not fixable by padding either: consecutive staging
+lanes are 8 dims apart, so the transposed store's lane-to-lane bank stride is
+`4*PAD mod 32`, always a multiple of 4 ⇒ at most 8 distinct banks for 32
+lanes ⇒ a 4-way floor for any pad. Deleting the transpose is the only fix.
+
+## Correction 2: P does not round-trip through smem
+
+The doc says "the S output fragment layout does not match the A input fragment
+layout, so P must round-trip through shared memory". For **this** mapping it
+already matches. The replicated softmax reconstructs, per thread, column
+`c = (cix/2)*8 + 2t + (cix%2)` for rows `g` and `g+8`, i.e.
+
+```
+en0[0..1] = P[g  ][2t, 2t+1]      = a0
+en1[0..1] = P[g+8][2t, 2t+1]      = a1
+en0[2..3] = P[g  ][2t+8, 2t+9]    = a2
+en1[2..3] = P[g+8][2t+8, 2t+9]    = a3
+```
+
+which is verbatim the m16n8k16 A fragment. (This is the general fact that two
+adjacent n-tiles' D fragments concatenate into the A fragment of the following
+16x16 GEMM.) `sP`, its 16 smem ops and **the barrier that guarded it** are all
+deleted.
+
+## What tc2 does
+
+| | tc | tc2 |
+|---|---|---|
+| K tile layout | transposed, `sKT[512][17]` | natural, `sKV[16][520]` |
+| V tile | separate `sV[16][520]` | **same buffer** (V==K) |
+| QK^T B operand | 64 `LDS.U16`, 2-way | 8 `ldmatrix.x4`, conflict-free |
+| PV B operand | 64 `LDS.U16`, 2-way | 8 `ldmatrix.x4.trans`, conflict-free |
+| S partials | `[warp][row][key]` f32, 32 loads 4-way | `[row][key]` float4, 8 loads conflict-free |
+| P | bf16 via smem + barrier | stays in registers |
+| smem / block | 38,720 B | **20,992 B** |
+| CTAs/SM | 2 (smem-bound) | **3** (register-bound at 167) |
+| barriers / key tile | 4 | **3** (4 only when V ≠ K) |
+| smem instrs / warp / tile | 169 | **40** |
+
+SASS confirms the intent: `16 LDSM.16.M88.4 + 16 LDSM.16.MT88.4 + 16 LDS.128
++ 32 STS.128 + 16 STS` and **zero** `LDS.U16`, 0 spills, 20,992 B smem.
+
+### Why stride 520 makes both ldmatrix forms conflict-free
+
+A row is `520 * 2 = 1040 B = 260 words ≡ 4 (mod 32)`. An ldmatrix phase reads
+8 rows x 16 B; row `k` starts at bank `4k + c`, spanning banks `4k+c ..
+4k+c+3`, so `k = 0..7` tiles all 32 banks exactly once. The same 4-word
+row-stride trick sizes `sSp` at 17 float4 (`68 words ≡ 4 mod 32`).
+
+### The aliasing question
+
+`V == K` is always true at the model call site (MLA keeps V in K's buffer,
+rope in the tail), and that is what lets one buffer feed both GEMMs. When it
+is **not** true (microtest only) tc2 re-stages the same tile with V between
+the QK^T and the PV — legal because barrier (3) has already retired every
+warp's QK^T reads, and free of extra barriers on the aliased path. This keeps
+smem at 20,992 B **unconditionally**, so no dynamic-smem opt-in and no
+host/kernel size contract that can be got wrong. (The Rust launcher *can* set
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` — `KernelLaunch::shared_mem`
+→ `AtlasRegistry::launch_on_stream` does it automatically above 48 KB — it
+simply is not needed here.)
+
+## Levers REJECTED, with the arithmetic
+
+- **KT=32.** Halves barriers per key traversed, but *every* per-key cost
+  (staging, both B-fragment streams, sSp) scales linearly with KT, so nothing
+  improves per key. Cost: `sKV 32x520x2 = 33.3 KB + sSp 32x17x16 = 8.7 KB =
+  42 KB` ⇒ 2 CTAs/SM, down from 4-by-smem. Trading 33% of the occupancy for
+  2 fewer barriers per 32 keys is the wrong direction when the stall is
+  latency. (KT=24 dodges the smem cliff at 31.9 KB / 3 CTAs but makes KT no
+  longer 2 n-tiles, complicating the softmax reconstruction for no new win.)
+- **cp.async.cg double buffering.** Needs a second 16.6 KB tile ⇒ 37.6 KB ⇒
+  back to 2 CTAs/SM, the same trade as KT=32. And the global side is not the
+  problem: K/V is 2.5 MB at N=2410 and is served from L2, which is why the
+  measured HCA time (18.3 ms) is less than half the 42 ms that 11.6 GB of
+  DRAM re-streaming would cost. With 3 CTAs/SM the remaining global latency is
+  covered by the other blocks.
+- **`window == 0` compile-time specialization.** The per-row window bound is
+  `v0 && c < COUNT && kp >= LO && kp < HI` — ~32 ALU ops per thread per tile
+  against ~2200 cycles. Unmeasurable.
+- **BR=32 q-rows per block** (the other half of the HCA lever: halve the K
+  re-streaming and reuse each B fragment across two m-tiles; per-16-row smem
+  traffic drops ~35%). Rejected for round 2 on register arithmetic:
+  `o_acc 16 n-tiles x 2 m-tiles x 4 f32 = 128` plus
+  `qa 8 k-steps x 2 m-tiles x 4 u32 = 64` = 192 registers before any
+  transient, so ~220-234 live. That is under the 255 cap but pins occupancy
+  at `65536/(2*128) = 2` CTAs/SM — 2 CTAs x 32 rows = 64 rows/SM, the same
+  row throughput as tc2's 3 CTAs x 16 = 48 rows/SM only if nothing spills,
+  and the doc's own trap 1 (a 768-byte stack frame erased an earlier win)
+  says the downside is worse than the upside is good. Splitting BR=32 over 8
+  warps instead keeps registers flat but turns the S partial into an 8-way
+  reduction (sSp read traffic 16 KB → 128 KB per tile). **Revisit only with
+  the warp-0 softmax reduction below in place.**
+- **`__launch_bounds__(128, 4)`** to buy the 4th CTA the smem now allows:
+  ptxas hits 128 registers but spills (40 B stack frame, 80 B spill stores,
+  68 B spill loads). Left off; 167 registers / 3 CTAs with 0 spills is the
+  shipped configuration. This is a one-line A/B if the hardware says
+  otherwise.
+
+## Next lever, if tc2 is not enough
+
+The remaining smem traffic per block-tile is roughly `16 KB stage + 16 KB
+QK-B + 16 KB PV-B + 4 KB sSp write + 16 KB sSp read ≈ 68 KB`, i.e. the S
+partials are now the single largest non-fragment term at ~29%. Having **warp 0
+alone** reduce the partials and broadcast `eo`/`P` would take that to ~10 KB
+(≈ -15% of all smem traffic) and remove three quarters of the redundant
+`__expf` MUFU work, at the cost of serializing the softmax in one warp — which
+is cheap at 3 CTAs/SM because the other blocks fill the idle warps. That is
+also the precondition that makes BR=32 affordable.
+
+## Validating round 2
+
+```
+cargo run --release -p spark-model --example prefill_attn_tc_microtest \
+    --features cuda,gpu-examples -- 7C21 2176 128 4     # CSA
+cargo run --release -p spark-model --example prefill_attn_tc_microtest \
+    --features cuda,gpu-examples -- 7C21 2176 0   128   # HCA, full causal
+```
+
+The microtest gates all three kernels. Because tc2 is a data-movement-only
+rewrite — same MMA operand *values*, same sSp summation order, same softmax
+terms, same bf16 rounding of P — it is held to `cos >= 0.9999999` against tc
+(only FMA re-association may separate them) on top of the standard
+`0.999 / 0.995` bar against the scalar reference, at S=253 aliased and S=160
+NOT aliased (which drives the V re-stage path), crossed with CSA and HCA.
+A tc2-vs-tc failure therefore points at an ldmatrix fragment mapping, not at
+numerics.
+
+In the engine, `ATLAS_V4_PREFILL_TC2=1` swaps tc2 in at both call sites
+(compressor and full-attention); unset keeps tc; `ATLAS_V4_PREFILL_TC=0`
+still falls all the way back to the scalar kernel.
