@@ -2,26 +2,43 @@
 
 //! EXL3 trellis (3.0 bpw) routed-expert DECODE dispatch (M=1).
 //!
-//! Bring-up arm for the reference tp1 checkpoint (`quant_method: "exl3"`,
-//! 216 routed experts/layer): per routed slot, three `exl3_gemv_m1_idx`
-//! launches (gate/up/down) + the clamped SwiGLU elementwise kernel; the
-//! FP8→NVFP4 shared expert rides on the existing `w4a16_gemv` path. The
-//! blend downstream (`moe_weighted_sum_blend`) is unchanged — outputs land
-//! in exactly the layout the fused NVFP4 decode kernels produce.
+//! Reference tp1 checkpoint (`quant_method: "exl3"`, 216 routed experts/layer).
+//! The routed FFN is THREE launches — fused gate+up over all slots, one flat
+//! SwiGLU, fused down over all slots — plus the FP8→NVFP4 shared expert on the
+//! existing `w4a16_gemv` path. The blend downstream (`moe_weighted_sum_blend`)
+//! is unchanged: outputs land in exactly the layout the fused NVFP4 decode
+//! kernels produce.
 //!
-//! Launch sequence is identical every step (the expert id is read ON DEVICE
-//! from the routed `indices` buffer by `exl3_gemv_m1_idx`), so the arm is
+//! ## Launch budget per layer (top_k = 8)
+//!
+//! | stage                | bring-up (per-slot) | fused |
+//! |----------------------|--------------------:|------:|
+//! | routed gate          | top_k = 8           | 1     |
+//! | routed up            | top_k = 8           | (same launch) |
+//! | routed SwiGLU        | top_k = 8           | 1     |
+//! | routed down          | top_k = 8           | 1     |
+//! | shared (NVFP4)       | 4                   | 4     |
+//! | **total**            | **36**              | **7** |
+//!
+//! At 43 layers that is 301 launches/token instead of 1548. The bring-up arm
+//! is retained behind `ATLAS_EXL3_FUSED=0` for A/B — it is BIT-IDENTICAL
+//! (same body, same K-slice per split, same fixed-order combines; fusion moves
+//! only WHICH CTA owns which (slot, strip, split) triple — gated by GATE8 of
+//! `exl3_gemv_microtest`).
+//!
+//! Launch sequence is identical every step (expert ids are read ON DEVICE from
+//! the routed `indices` buffer inside the kernels), so the arm is
 //! CUDA-graph-safe and needs no D2H of the routing.
 //!
-//! Known bring-up costs vs the end-state kernel (plan §3 / exl3-gemv.md §6):
-//!   - 3·top_k + 3 GEMV launches + 7 elementwise/blend per layer instead of
-//!     2 fused kernels — launch overhead only, the weight stream is optimal
-//!     (each expert matrix read exactly once, 3.012 bpw).
-//!   - routed slots are serialized on the stream; the split-K grid fills the
-//!     48 SMs per launch (split chosen to land ~96 CTAs), so the serialization
-//!     costs latency, not bandwidth.
-//!   - NOT yet wired: prefill / wide-verify (M>1) — those paths fail loudly
-//!     via the `Exl3Trellis` format tag (see plan §3 "P1 scratch dequant").
+//! Split-K scratch: the per-slot chain serialized on the stream and could
+//! share ONE `ws`/`counters` region. Fused slots run CONCURRENTLY, so the
+//! kernels carve a private region per launch group (`group·gridDim.y·N` floats
+//! of `ws`, `group·N/128` ints of `counters`) and the host sizes both for the
+//! widest group count it will ever launch (`2·top_k`, from gate+up).
+//!
+//! NOT yet wired: prefill / wide-verify (M>1) go through
+//! `forward_prefill_exl3.rs`; every legacy NVFP4/E8M0 decode site fails loudly
+//! via the `Exl3Trellis` format tag.
 
 use anyhow::{Context, Result, ensure};
 use spark_runtime::kernel_args::KernelLaunch;
@@ -33,6 +50,10 @@ use crate::weight_map::Exl3ExpertWeight;
 const EXL3_MAX_SPLIT: u32 = 12;
 /// Largest N across the expert shapes (w2: N = hidden = 4096).
 const EXL3_MAX_N: u32 = 4096;
+/// Hard cap on routed slots the split-K scratch will be sized for. Guards the
+/// `2·top_k` group count against a pathological config before it can silently
+/// overrun `ws`/`counters`.
+const EXL3_MAX_TOP_K: u32 = 32;
 
 /// Device pointer tables for one EXL3 projection across all routed experts.
 pub(crate) struct Exl3ProjTable {
@@ -53,15 +74,27 @@ pub(crate) struct Exl3MoeState {
     pub(crate) gate: Exl3ProjTable, // checkpoint w1: [h -> inter]
     pub(crate) up: Exl3ProjTable,   // checkpoint w3: [h -> inter]
     pub(crate) down: Exl3ProjTable, // checkpoint w2: [inter -> h]
-    gemv_idx_k: KernelHandle,
-    silu_mul_clamped_k: KernelHandle, // routed: DeepSeek-V4 swiglu_limit=10
-    silu_mul_noclamp_k: KernelHandle, // shared expert: unclamped
-    /// f32 `[EXL3_MAX_SPLIT, EXL3_MAX_N]` split-K partial scratch.
+    gemv_idx_k: KernelHandle,           // bring-up: one launch per (slot, proj)
+    gemv_fused_gate_up_k: KernelHandle, // fused: all slots × {gate, up}
+    gemv_fused_down_k: KernelHandle,    // fused: all slots
+    silu_mul_clamped_k: KernelHandle,   // routed: DeepSeek-V4 swiglu_limit=10
+    silu_mul_noclamp_k: KernelHandle,   // shared expert: unclamped
+    /// f32 `[groups, EXL3_MAX_SPLIT, EXL3_MAX_N]` split-K partial scratch —
+    /// one private region per fused launch group (see module docs). The
+    /// kernels address it as `ws + group·gridDim.y·N`, which is inside this
+    /// allocation for every `(groups ≤ self.groups, split ≤ EXL3_MAX_SPLIT,
+    /// N ≤ EXL3_MAX_N)` launch.
     ws: DevicePtr,
-    /// i32 `[EXL3_MAX_N/128]` split-election counters (self-resetting).
+    /// i32 `[groups, EXL3_MAX_N/128]` split-election counters (self-resetting;
+    /// addressed as `counters + group·N/128`).
     counters: DevicePtr,
+    /// Widest launch-group count the scratch is sized for: `2·top_k` (gate+up).
+    groups: u32,
     /// Split override from `ATLAS_EXL3_SPLIT` (0 = auto).
     split_override: u32,
+    /// `ATLAS_EXL3_FUSED=0` falls back to the per-slot bring-up chain (A/B;
+    /// bit-identical, ~5x the launches).
+    fused: bool,
     /// P1 prefill state (scratch dequant + H128 activation passes).
     pub(crate) prefill: Exl3PrefillState,
 }
@@ -92,6 +125,17 @@ pub(crate) struct Exl3PrefillState {
 impl Exl3MoeState {
     /// SPLIT_K policy: fill ~2 CTAs/SM (96 slots on GB10's 48 SMs) — the
     /// microtest measured splits 1-3 underfilled at N=2048 (16 strips).
+    ///
+    /// NOTE (unmeasured, deliberately NOT the default): this policy was tuned
+    /// for the per-slot chain, where ONE launch had to fill the GPU by itself.
+    /// The fused launches carry `top_k`/`2·top_k` groups, so at top_k = 8 even
+    /// SPLIT_K = 1 lands 16×16 = 256 (gate+up) and 32×8 = 256 (down) CTAs —
+    /// already past 4 CTAs/SM × 48 SMs. `ATLAS_EXL3_SPLIT=1` therefore drops
+    /// the whole `ws` round-trip, the election atomics and the partial re-read
+    /// while KEEPING the grid full, and gives each CTA the full K-slice (one
+    /// long contiguous trellis stream instead of `S` islands). It is the first
+    /// thing to A/B on hardware after this change — but it re-slices K, so it
+    /// is NOT bit-identical to the default and is left opt-in.
     fn split_for(&self, n: u32) -> u32 {
         if self.split_override > 0 {
             return self.split_override.min(EXL3_MAX_SPLIT);
@@ -182,6 +226,7 @@ impl MoeLayer {
     pub fn set_exl3_experts(
         &mut self,
         experts: &[Exl3ExpertWeight],
+        top_k: u32,
         gpu: &dyn GpuBackend,
     ) -> Result<()> {
         let gate = build_proj_table(experts, |e| &e.gate_proj, gpu)?;
@@ -193,11 +238,24 @@ impl MoeLayer {
             gate.n,
             down.n
         );
-        let ws = gpu.alloc((EXL3_MAX_SPLIT as usize) * (EXL3_MAX_N as usize) * 4)?;
-        let counters = gpu.alloc((EXL3_MAX_N as usize / 128) * 4)?;
+        ensure!(
+            top_k > 0 && top_k <= EXL3_MAX_TOP_K,
+            "EXL3 decode scratch sized for top_k in 1..={EXL3_MAX_TOP_K}, got {top_k}"
+        );
+        // Widest fused launch: gate+up = 2·top_k groups (down uses top_k).
+        // Every group needs its own [SPLIT_K, N] fp32 partial region and its
+        // own [N/128] election counters, since fused groups run concurrently.
+        let groups = 2 * top_k;
+        let ws_floats =
+            groups as usize * EXL3_MAX_SPLIT as usize * EXL3_MAX_N as usize;
+        let counter_bytes = groups as usize * (EXL3_MAX_N as usize / 128) * 4;
+        let ws = gpu.alloc(ws_floats * 4)?;
+        let counters = gpu.alloc(counter_bytes)?;
         // Counters must be zero before the FIRST launch; the kernel re-arms
         // them to zero on completion, so this is the only memset ever needed.
-        gpu.memset(counters, 0, EXL3_MAX_N as usize / 128 * 4)?;
+        // (Groups never touch each other's counters, so the invariant "all
+        // zero at rest" survives fusion and CUDA-graph replay unchanged.)
+        gpu.memset(counters, 0, counter_bytes)?;
         let split_override = std::env::var("ATLAS_EXL3_SPLIT")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -247,11 +305,15 @@ impl MoeLayer {
             gemv_idx_k: gpu
                 .kernel("exl3_gemv", "exl3_gemv_m1_idx")
                 .context("EXL3 checkpoint needs the exl3_gemv kernel module")?,
+            gemv_fused_gate_up_k: gpu.kernel("exl3_gemv", "exl3_gemv_m1_fused_gate_up")?,
+            gemv_fused_down_k: gpu.kernel("exl3_gemv", "exl3_gemv_m1_fused_down")?,
             silu_mul_clamped_k: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             silu_mul_noclamp_k: gpu.kernel("moe_silu_mul", "silu_mul_noclamp")?,
             ws,
             counters,
+            groups,
             split_override,
+            fused: std::env::var("ATLAS_EXL3_FUSED").as_deref() != Ok("0"),
             prefill,
         });
         self.experts_scale_kind = crate::weight_map::WeightQuantFormat::Exl3Trellis;
@@ -288,36 +350,103 @@ impl MoeLayer {
             st.down.n,
             st.down.k
         );
+        ensure!(
+            2 * top_k <= st.groups,
+            "EXL3 decode scratch sized for {} launch groups, need {} (top_k={top_k})",
+            st.groups,
+            2 * top_k
+        );
         let gpu = ctx.gpu;
         let split_gu = st.split_for(inter);
         let split_dn = st.split_for(h);
 
-        // ── Routed slots: gate → up → swiglu(clamped) → down, per slot. ──
-        // Same-stream launches serialize, so one ws/counters scratch is safe.
-        for slot in 0..top_k {
-            let gate_row = expert_gate_out.offset(slot as usize * inter as usize * 2);
-            let up_row = expert_up_out.offset(slot as usize * inter as usize * 2);
-            let down_row = expert_down_out.offset(slot as usize * h as usize * 2);
-            launch_gemv_idx(
-                gpu, st.gemv_idx_k, expert_input, &st.gate, indices_dev, slot, gate_row,
-                st.ws, st.counters, split_gu, stream,
+        if st.fused {
+            // ── 3 launches for the whole routed FFN. ──
+            // (1) gate+up over all slots: grid.z = 2·top_k, z = 2·slot + proj.
+            KernelLaunch::new(gpu, st.gemv_fused_gate_up_k)
+                .grid([inter / 128, split_gu, 2 * top_k])
+                .block([256, 1, 1])
+                .arg_ptr(expert_input)
+                .arg_ptr(st.gate.trellis_tab)
+                .arg_ptr(st.gate.suh_tab)
+                .arg_ptr(st.gate.svh_tab)
+                .arg_ptr(st.up.trellis_tab)
+                .arg_ptr(st.up.suh_tab)
+                .arg_ptr(st.up.svh_tab)
+                .arg_ptr(indices_dev)
+                .arg_ptr(expert_gate_out)
+                .arg_ptr(expert_up_out)
+                .arg_ptr(st.ws)
+                .arg_ptr(st.counters)
+                .arg_u32(inter)
+                .arg_u32(h)
+                .launch(stream)?;
+            // (2) ONE flat clamped SwiGLU over all slots: gate/up are
+            // contiguous `[top_k, inter]`, the kernel is a pure elementwise
+            // map over `total_elements`, and the write is same-index in place
+            // over the gate rows — bit-identical to the per-slot calls.
+            ops::moe_silu_mul(
+                gpu,
+                st.silu_mul_clamped_k,
+                expert_gate_out,
+                expert_up_out,
+                expert_gate_out,
+                top_k * inter,
+                stream,
             )?;
-            launch_gemv_idx(
-                gpu, st.gemv_idx_k, expert_input, &st.up, indices_dev, slot, up_row,
-                st.ws, st.counters, split_gu, stream,
-            )?;
-            // act = clamped_swiglu(gate, up), in place over the gate row
-            // (elementwise same-index read/write — safe).
-            ops::moe_silu_mul(gpu, st.silu_mul_clamped_k, gate_row, up_row, gate_row, inter, stream)?;
-            launch_gemv_idx(
-                gpu, st.gemv_idx_k, gate_row, &st.down, indices_dev, slot, down_row,
-                st.ws, st.counters, split_dn, stream,
-            )?;
+            // (3) down over all slots: grid.z = top_k, A row = act + slot·inter.
+            KernelLaunch::new(gpu, st.gemv_fused_down_k)
+                .grid([h / 128, split_dn, top_k])
+                .block([256, 1, 1])
+                .arg_ptr(expert_gate_out)
+                .arg_ptr(st.down.trellis_tab)
+                .arg_ptr(st.down.suh_tab)
+                .arg_ptr(st.down.svh_tab)
+                .arg_ptr(indices_dev)
+                .arg_ptr(expert_down_out)
+                .arg_ptr(st.ws)
+                .arg_ptr(st.counters)
+                .arg_u32(h)
+                .arg_u32(inter)
+                .launch(stream)?;
+        } else {
+            // ── A/B fallback (`ATLAS_EXL3_FUSED=0`): the per-slot bring-up
+            // chain, 4·top_k launches. Same-stream launches serialize, so
+            // group 0 of the ws/counters scratch serves every slot.
+            for slot in 0..top_k {
+                let gate_row = expert_gate_out.offset(slot as usize * inter as usize * 2);
+                let up_row = expert_up_out.offset(slot as usize * inter as usize * 2);
+                let down_row = expert_down_out.offset(slot as usize * h as usize * 2);
+                launch_gemv_idx(
+                    gpu, st.gemv_idx_k, expert_input, &st.gate, indices_dev, slot, gate_row,
+                    st.ws, st.counters, split_gu, stream,
+                )?;
+                launch_gemv_idx(
+                    gpu, st.gemv_idx_k, expert_input, &st.up, indices_dev, slot, up_row,
+                    st.ws, st.counters, split_gu, stream,
+                )?;
+                // act = clamped_swiglu(gate, up), in place over the gate row
+                // (elementwise same-index read/write — safe).
+                ops::moe_silu_mul(
+                    gpu, st.silu_mul_clamped_k, gate_row, up_row, gate_row, inter, stream,
+                )?;
+                launch_gemv_idx(
+                    gpu, st.gemv_idx_k, gate_row, &st.down, indices_dev, slot, down_row,
+                    st.ws, st.counters, split_dn, stream,
+                )?;
+            }
         }
 
         // ── Shared expert: FP8-block-scaled on disk → NVFP4 at load (the
         // heterogeneous-checkpoint arm of `load_expert_proj`). UNCLAMPED
-        // SwiGLU (DeepseekV4MLP — see moe_shared_expert_fused.cu). ──
+        // SwiGLU (DeepseekV4MLP — see moe_shared_expert_fused.cu).
+        //
+        // NOT EXL3, so it keeps its own `w4a16_gemv` kernels. It is data-
+        // independent of the routed chain (same `expert_input`, disjoint
+        // outputs), but shares this stream, so it runs after. Overlapping it
+        // would need a side stream + event join around the fused pair — worth
+        // measuring, but it is 4 small NVFP4 GEMVs against 3 large trellis
+        // launches, so the routed side is what the launch collapse targets. ──
         self.shared_experts_scale_kind.expect(
             crate::weight_map::WeightQuantFormat::Nvfp4,
             "EXL3 decode arm computes the shared expert via w4a16_gemv (NVFP4)",

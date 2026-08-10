@@ -255,6 +255,19 @@ Gates (exit code enforced):
 3. **Cold-rotation GB/s** through a ≥512 MB weight ring (defeats the 24 MB
    L2) at both expert shapes; judged against the 229 GB/s ceiling.
 
+Gates 4–7 cover the P1 prefill leg (§6). Gate 8 covers the fused decode
+dispatch:
+
+8. **Fused == per-slot, byte-identical.** 8 synthetic experts, 6 routed slots
+   with a deliberately non-slot-ordered index list, pushed through both the
+   per-slot chain (4·top_k launches) and the fused pair (3 launches) at the
+   same production SPLIT_K. All three output buffers must byte-match; the
+   buffers are poisoned with 0x00 before path A and 0xFF before path B so an
+   unwritten slot/strip cannot pass. GATE8b re-runs the fused path and
+   requires byte-identity with itself (split-K election determinism with 12
+   concurrent groups sharing one allocation); GATE8c asserts the launch
+   counts (24 → 3).
+
 ## 6. Open items toward S6 (serve integration)
 
 LANDED (combined-residency, loader/dispatch legs — GPU-unvalidated):
@@ -270,6 +283,23 @@ LANDED (combined-residency, loader/dispatch legs — GPU-unvalidated):
   gate/up (idx-GEMV) → clamped SwiGLU → down (idx-GEMV); NVFP4 shared expert
   via `w4a16_gemv` + unclamped SwiGLU. Routed format tag `Exl3Trellis` fences
   every legacy NVFP4/E8M0 path.
+- **Fused decode dispatch** (supersedes the per-slot chain as the default):
+  `exl3_gemv_m1_fused_gate_up` + one flat `moe_silu_mul` +
+  `exl3_gemv_m1_fused_down`. The (slot, projection) pair rides `blockIdx.z`
+  (SPLIT_K keeps `blockIdx.y`), mirroring
+  `moe_expert_gate_up_shared_bf16`'s slot-on-y / proj-on-z organization; each
+  CTA still resolves its expert from `indices[slot]` on device, so the arm
+  stays graph-safe. Routed launches per layer drop 4·top_k → 3 (36 → 3 at
+  top_k = 8; 1548 → 129 per token over 43 layers, +172 for the unchanged
+  4-launch NVFP4 shared expert). Bit-identical to the per-slot chain at equal
+  SPLIT_K — gated by microtest GATE8. `ATLAS_EXL3_FUSED=0` restores the
+  per-slot chain for A/B.
+  Split-K scratch is now **per launch group**: `ws + group·gridDim.y·N`
+  (fp32) and `counters + group·N/128` (i32), sized at load for `2·top_k`
+  groups. This is load-bearing — per-slot launches serialized on the stream
+  and could share one region; fused groups run concurrently and would corrupt
+  each other's partials without it. The self-resetting counter logic is
+  unchanged and stays correct per group, so replays still start all-zero.
 
 LANDED (P1 prefill leg — GPU-unvalidated, gates 4-7 of the microtest):
 
@@ -304,7 +334,11 @@ STILL OPEN:
 - Perf tuning after first GPU measurement: stage depth, `SPLIT_K` policy
   (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides).
   Half2-accumulate landed in round 3 (§3/§3b).
-- Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.
+- ~~Fused gate+up riders to cut the 3·top_k+3 launch count~~ LANDED (§6
+  LANDED list): `exl3_gemv_m1_fused_gate_up` / `exl3_gemv_m1_fused_down`,
+  4·top_k+4 → 3+4 launches/layer, bit-identical (GATE8). A silu-in-GEMV
+  rider is no longer worth it — the SwiGLU is now ONE flat elementwise
+  launch per layer over `[top_k, inter]`.
 
 - m-row (γ-verify) MROW variant — mandatory from day one per plan §3/§4.7
   (partial-exactness law: the verify chain flips as a whole).
@@ -329,7 +363,11 @@ STILL OPEN:
   to shed the 8 cvt + fp32 FFMA per tile — quality re-gate required.
 - Shared-expert rider (grid.y expert slot) when wiring into
   `moe_shared_expert_fused_t` dispatch.
-- Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.
+- ~~Fused gate+up riders to cut the 3·top_k+3 launch count~~ LANDED (§6
+  LANDED list): `exl3_gemv_m1_fused_gate_up` / `exl3_gemv_m1_fused_down`,
+  4·top_k+4 → 3+4 launches/layer, bit-identical (GATE8). A silu-in-GEMV
+  rider is no longer worth it — the SwiGLU is now ONE flat elementwise
+  launch per layer over `[top_k, inter]`.
 - Prefill P2 (plan §3): grouped trellis GEMM decoding straight to MMA
   fragments, to recover the P1 dequant traffic below.
 
