@@ -67,7 +67,15 @@ impl ToolCallParser for DsmlV4Parser {
         prompt.push_str(body.trim_end());
         prompt.push_str(
             "\n\nYou MUST strictly follow the above defined tool name and parameter \
-             schemas to invoke tool calls.\n",
+             schemas to invoke tool calls.\n\n\
+             Call a tool only when it supplies information or an action you cannot \
+             produce yourself. Answer directly for facts you already know and for \
+             arithmetic you can do reliably in your head. When a parameter's schema \
+             does not state a format, pass the value in the tool's own notation \
+             (for example, a calculator expression as `0.15*200`, not as prose).\n\n\
+             This restraint does NOT apply to recovery: if a tool returns an error \
+             or is unavailable, try another tool that could supply the same \
+             information before telling the user you could not get it.\n",
         );
         append_tool_choice_instruction(&mut prompt, tool_choice);
         prompt
