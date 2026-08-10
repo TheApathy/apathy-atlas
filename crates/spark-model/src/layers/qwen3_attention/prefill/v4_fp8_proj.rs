@@ -25,6 +25,109 @@ fn v4_proj_fp8mma_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_V4_PROJ_FP8MMA").as_deref() == Ok("1"))
 }
 
+/// ATLAS_V4_PREFILL_CUBLASLT (cached once, DEFAULT ON; =0 opts out): route the
+/// V4 prefill projections through cuBLASLt BF16 (`bf16_gemm_act_weight_t`)
+/// whenever a BF16 weight is resident. Measured (cublaslt_v4_bench, M=2410,
+/// cosine 1.000000 vs dense_gemm_bf16_pipelined — same-math tier, only the
+/// accumulation-order class every BF16 GEMM swap shares): wq_b [2410,32768,
+/// 1024] 8.28→1.92 ms (84 TF), wo_b [2410,4096,8192] →1.92, wo_a-group
+/// [2410,1024,4096] →0.188 (108 TF), wq_a →0.188, kv_proj →0.117 — ≈480 ms
+/// less per pass, prefill ~973 → ~1200 tok/s.
+///
+/// RELEASE_BF16 interaction (do NOT change the release logic): under
+/// ATLAS_V4_ATTN_RELEASE_BF16=1 the wq_b/wo_a/wo_b BF16 mirrors are FREED and
+/// `dense.weight` is null, so this arm never fires there and the FP8/w8a8
+/// dispatch is untouched. The serve-side A/B is therefore
+///   RELEASE_BF16=0 + ATLAS_V4_PREFILL_CUBLASLT=1   (cuBLASLt, +~8 GiB resident)
+/// vs today's
+///   RELEASE_BF16=1 + ATLAS_V4_PROJ_FP8MMA=1        (FP8 MMA, mirrors freed).
+/// Dispatch order per site: BF16 present → cuBLASLt (this gate) → pipelined
+/// kernel; BF16 released → existing FP8/w8a8 arms.
+pub(super) fn v4_prefill_cublaslt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_CUBLASLT").as_deref() != Ok("0"))
+}
+
+/// Sticky failure latch: if cuBLASLt errors once (handle creation, no algo for
+/// a shape, launch failure), warn once and stop attempting it for the rest of
+/// the process — every caller falls back to its custom-kernel arm, so a broken
+/// or absent cuBLASLt runtime degrades to exactly the pre-cuBLASLt behavior.
+fn v4_cublaslt_poisoned() -> &'static std::sync::atomic::AtomicBool {
+    static POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &POISONED
+}
+
+/// Try one packed V4 prefill projection through cuBLASLt BF16. Returns `true`
+/// when cuBLASLt handled it; `false` (gate off / poisoned / error) means the
+/// caller must run its own kernel arm — on error the output buffer is
+/// untouched (cuBLASLt validates before writing) and the latch trips.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_v4_cublas_prefill(
+    act: DevicePtr,
+    weight_bf16: DevicePtr,
+    out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    label: &str,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !v4_prefill_cublaslt_enabled()
+        || weight_bf16.is_null()
+        || v4_cublaslt_poisoned().load(Relaxed)
+    {
+        return false;
+    }
+    match ops::cublas_bf16_proj_dense(act, weight_bf16, out, m, n, k, stream) {
+        Ok(()) => true,
+        Err(e) => {
+            v4_cublaslt_poisoned().store(true, Relaxed);
+            tracing::warn!(
+                "{label}: cuBLASLt prefill GEMM failed ({e}); falling back to the \
+                 custom kernels for the rest of the process"
+            );
+            false
+        }
+    }
+}
+
+/// Strided sibling of [`try_v4_cublas_prefill`] for the grouped wo_a in-place
+/// path: A is a column slice at row stride `lda` elements, C a column slice at
+/// row stride `ldc` elements (the weight group is packed `[N,K]`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_v4_cublas_prefill_strided(
+    act: DevicePtr,
+    lda: u32,
+    weight_bf16: DevicePtr,
+    out: DevicePtr,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    label: &str,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !v4_prefill_cublaslt_enabled()
+        || weight_bf16.is_null()
+        || v4_cublaslt_poisoned().load(Relaxed)
+    {
+        return false;
+    }
+    match ops::cublas_bf16_proj_dense_strided(act, lda, weight_bf16, out, ldc, m, n, k, stream) {
+        Ok(()) => true,
+        Err(e) => {
+            v4_cublaslt_poisoned().store(true, Relaxed);
+            tracing::warn!(
+                "{label}: cuBLASLt strided prefill GEMM failed ({e}); falling back \
+                 to the custom kernels for the rest of the process"
+            );
+            false
+        }
+    }
+}
+
 fn validate_fp8(weight: Fp8Weight, n: u32, k: u32, label: &str) -> Result<Fp8Weight> {
     ensure!(
         weight.scale_format == WeightQuantFormat::Fp8BlockScaled,
@@ -118,6 +221,14 @@ impl Qwen3AttentionLayer {
         label: &str,
     ) -> Result<()> {
         if !dense.weight.is_null() {
+            // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON): 1.7-4.3x
+            // the pipelined kernel at the V4 prefill shapes, cosine 1.000000
+            // (same-math tier). See v4_prefill_cublaslt_enabled() for the
+            // measurements and the RELEASE_BF16 A/B; falls through to the
+            // pipelined kernel on gate-off or any cuBLASLt failure.
+            if try_v4_cublas_prefill(input, dense.weight, output, m, n, k, stream, label) {
+                return Ok(());
+            }
             // The BF16 arm (wq_b / wo_a groups / wo_b when the mirrors are NOT
             // released) ran the SIMT scalar GEMM: microtest M=2410 N=512 K=4096
             // measures 6.96 ms vs 0.23 ms for dense_gemm_bf16_pipelined, both
@@ -356,13 +467,35 @@ impl Qwen3AttentionLayer {
                         stream,
                     )?;
                 } else {
+                    let w_group = mla
+                        .wo_a
+                        .weight
+                        .offset(group as usize * weight_group_bytes * BF16_BYTES);
+                    // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON):
+                    // strided A slice ([n, group_in] at row stride input_width)
+                    // and strided C slice ([n, o_lora] at row stride
+                    // latent_dim) go through the ld-carrying cublasLt layouts —
+                    // measured 0.188 ms/group at [2410, 1024, 4096] vs 0.8 for
+                    // the pipelined_ld kernel, cosine 1.000000. 8 calls/layer.
+                    if try_v4_cublas_prefill_strided(
+                        a_in,
+                        input_width,
+                        w_group,
+                        c_out,
+                        latent_dim,
+                        n,
+                        o_lora,
+                        group_in,
+                        stream,
+                        "V4 wo_a group",
+                    ) {
+                        continue;
+                    }
                     ops::dense_gemm_bf16_pipelined_ld(
                         ctx.gpu,
                         self.dense_gemm_pipelined_ld_k,
                         a_in,
-                        mla.wo_a
-                            .weight
-                            .offset(group as usize * weight_group_bytes * BF16_BYTES),
+                        w_group,
                         c_out,
                         n,
                         o_lora,

@@ -184,9 +184,12 @@ struct TunedPlan {
 unsafe impl Send for TunedPlan {}
 unsafe impl Sync for TunedPlan {}
 
-static PLANS: OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), &'static TunedPlan>>,
-> = OnceLock::new();
+/// Plan-cache key: (m, n, k, lda, ldc) — lda/ldc are the row strides of the
+/// row-major activation/output (elements); packed calls use (k, n).
+type PlanKey = (u32, u32, u32, u32, u32);
+type PlanMap = std::sync::Mutex<std::collections::HashMap<PlanKey, &'static TunedPlan>>;
+
+static PLANS: OnceLock<PlanMap> = OnceLock::new();
 
 /// Build desc+layouts for `out[M,N]=act[M,K]@W[N,K]ᵀ` (same mapping as
 /// `bf16_gemm_act_weight_t`), autotune over the heuristic's top-16 algos on a
@@ -194,9 +197,16 @@ static PLANS: OnceLock<
 /// another stream is mid graph-capture), and cache the winner. The naive
 /// heuristic[0] pick left the K=8 verify o_proj at 113 GB/s (~24 CTAs on 48
 /// SMs, no split-K) — tuning recovers the split-K/tile choice per shape.
-fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
+///
+/// `lda`/`ldc` are the ROW strides (in elements) of the row-major activation
+/// and output: `lda == k` / `ldc == n` is the packed case; larger values read
+/// A as a column slice of a wider matrix and write C as a column slice of a
+/// wider matrix (cublasLtMatrixLayout carries ld natively — same GEMM, same
+/// math, only WHERE operands are read/written changes). The weight is always
+/// packed `[N,K]`.
+fn tuned_plan(m: u32, n: u32, k: u32, lda: u32, ldc: u32) -> Result<&'static TunedPlan> {
     let plans = PLANS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(p) = plans.lock().unwrap().get(&(m, n, k)) {
+    if let Some(p) = plans.lock().unwrap().get(&(m, n, k, lda, ldc)) {
         return Ok(p);
     }
     let ctx = ctx()?;
@@ -234,11 +244,11 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             "LayoutA",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, lda as i64),
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, ldc as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -282,22 +292,23 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         }
 
         // Dummy operands (zeroed) + private stream: tune without touching the
-        // caller's stream (which may be mid graph-capture).
+        // caller's stream (which may be mid graph-capture). Extents cover the
+        // FULL row strides so strided plans tune against realistic addresses.
         let (mut dw, mut da, mut dd): (u64, u64, u64) = (0, 0, 0);
         chk(
             cuMemAlloc_v2(&mut dw, n as usize * k as usize * 2),
             "tuneAllocW",
         )?;
         chk(
-            cuMemAlloc_v2(&mut da, m as usize * k as usize * 2),
+            cuMemAlloc_v2(&mut da, m as usize * lda as usize * 2),
             "tuneAllocA",
         )?;
         chk(
-            cuMemAlloc_v2(&mut dd, m as usize * n as usize * 2),
+            cuMemAlloc_v2(&mut dd, m as usize * ldc as usize * 2),
             "tuneAllocD",
         )?;
         cuMemsetD8_v2(dw, 0, n as usize * k as usize * 2);
-        cuMemsetD8_v2(da, 0, m as usize * k as usize * 2);
+        cuMemsetD8_v2(da, 0, m as usize * lda as usize * 2);
         let mut ts: u64 = 0;
         chk(cuStreamCreate(&mut ts, 1), "tuneStream")?;
         let (mut e0, mut e1): (u64, u64) = (0, 0);
@@ -360,8 +371,8 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
 
         let bytes = n as u64 * k as u64 * 2;
         tracing::info!(
-            "cuBLASLt tune {m}x{n}x{k}: algo[{best}] of {returned} @ {best_ms:.3}ms \
-             ({:.0} GB/s weight-read)",
+            "cuBLASLt tune {m}x{n}x{k} (lda={lda} ldc={ldc}): algo[{best}] of {returned} \
+             @ {best_ms:.3}ms ({:.0} GB/s weight-read)",
             bytes as f64 / (best_ms as f64 / 1e3) / 1e9,
         );
         let plan: &'static TunedPlan = Box::leak(Box::new(TunedPlan {
@@ -371,7 +382,7 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             ld: ld_ as usize,
             algo: results[best].algo,
         }));
-        plans.lock().unwrap().insert((m, n, k), plan);
+        plans.lock().unwrap().insert((m, n, k, lda, ldc), plan);
         Ok(plan)
     }
 }
@@ -387,7 +398,7 @@ pub fn bf16_gemm_act_weight_t_tuned(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let plan = tuned_plan(m, n, k)?;
+    let plan = tuned_plan(m, n, k, k, n)?;
     let ctx = ctx()?;
     let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
@@ -412,6 +423,58 @@ pub fn bf16_gemm_act_weight_t_tuned(
                 stream as *mut c_void,
             ),
             "MatmulTuned",
+        )
+    }
+}
+
+/// Strided variant of [`bf16_gemm_act_weight_t_tuned`] for block-diagonal /
+/// grouped projections (V4 grouped wo_a prefill): the activation is a COLUMN
+/// SLICE `[M,K]` of a wider row-major matrix (row stride `lda` elements) and
+/// the output is a column slice `[M,N]` of a wider row-major matrix (row
+/// stride `ldc` elements). The weight stays packed `[N,K]`.
+/// cublasLtMatrixLayout carries ld natively, so this is the SAME GEMM/math as
+/// the packed call — only the operand addressing changes. Plans are cached per
+/// (m, n, k, lda, ldc) and autotuned on first use.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_strided(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if lda < k || ldc < n {
+        bail!("cuBLASLt strided: lda ({lda}) < k ({k}) or ldc ({ldc}) < n ({n})");
+    }
+    let plan = tuned_plan(m, n, k, lda, ldc)?;
+    let ctx = ctx()?;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    unsafe {
+        chk(
+            cublasLtMatmul(
+                ctx.handle,
+                plan.desc as cublasLtMatmulDesc_t,
+                &alpha as *const f32 as *const c_void,
+                weight as *const c_void,
+                plan.la as cublasLtMatrixLayout_t,
+                act as *const c_void,
+                plan.lb as cublasLtMatrixLayout_t,
+                &beta as *const f32 as *const c_void,
+                out as *const c_void,
+                plan.ld as cublasLtMatrixLayout_t,
+                out as *mut c_void,
+                plan.ld as cublasLtMatrixLayout_t,
+                plan.algo.as_ptr() as *const c_void,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            ),
+            "MatmulStrided",
         )
     }
 }

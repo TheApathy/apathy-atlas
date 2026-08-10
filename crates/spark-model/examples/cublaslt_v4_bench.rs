@@ -137,7 +137,164 @@ fn main() -> Result<()> {
             gpu.free(p).ok();
         }
     }
+
+    // ── strided wo_a group case (the v4_grouped_wo_a_prefill in-place path) ──
+    // Production layout: 8 block-diagonal groups; per group A = [2410, 4096]
+    // COLUMN SLICE of attn_out [2410, 32768] (row stride lda = 32768 elems),
+    // C = [2410, 1024] column slice of o_latent [2410, 8192] (ldc = 8192);
+    // W packed [1024, 4096]. Validates `bf16_gemm_act_weight_t_strided`
+    // (ld-carrying cublasLtMatrixLayout) against the gather→packed pipelined
+    // oracle, and times it against `dense_gemm_bf16_pipelined_ld` (the custom
+    // in-place kernel it replaces under ATLAS_V4_PREFILL_CUBLASLT).
+    {
+        let (m, n, k, groups) = (2410usize, 1024usize, 4096usize, 8usize);
+        let (lda, ldc) = (k * groups, n * groups); // 32768, 8192
+        let mut rng = Rng(0xC0FF_EE01);
+        let a_full = upload(gpu, &bf16s(&mut rng, m * lda))?;
+        let w_all = upload(gpu, &bf16s(&mut rng, groups * n * k))?;
+        let c_full = gpu.alloc(m * ldc * 2)?;
+        let a_pack = gpu.alloc(m * k * 2)?;
+        let c_pack = gpu.alloc(m * n * 2)?;
+        let c_slice = gpu.alloc(m * n * 2)?;
+        let ld_kernel = gpu.kernel("gemm", "dense_gemm_bf16_pipelined_ld")?;
+
+        // correctness: per group, strided cuBLASLt vs gather → packed pipelined
+        let mut min_cos = 1.0f64;
+        for g in 0..groups {
+            spark_runtime::cublaslt::bf16_gemm_act_weight_t_strided(
+                a_full.offset(g * k * 2).0,
+                lda as u32,
+                w_all.offset(g * n * k * 2).0,
+                c_full.offset(g * n * 2).0,
+                ldc as u32,
+                m as u32,
+                n as u32,
+                k as u32,
+                stream,
+            )?;
+            gpu.copy_d2d_2d_async(a_full.offset(g * k * 2), lda * 2, a_pack, k * 2, k * 2, m, stream)?;
+            spark_model_ops_dense_gemm_bf16_pipelined(
+                gpu,
+                pipelined,
+                a_pack,
+                &crate_weight(w_all.offset(g * n * k * 2)),
+                c_pack,
+                m,
+                n,
+                k,
+                stream,
+            )?;
+            gpu.copy_d2d_2d_async(c_full.offset(g * n * 2), ldc * 2, c_slice, n * 2, n * 2, m, stream)?;
+            gpu.synchronize(stream)?;
+            let oracle = read_f64(gpu, c_pack, m * n)?;
+            let strided = read_f64(gpu, c_slice, m * n)?;
+            min_cos = min_cos.min(cosine(&oracle, &strided));
+        }
+
+        // timing: 8 strided cuBLASLt calls vs 8 pipelined_ld calls per pass
+        let run_lt = |_: ()| -> Result<()> {
+            for g in 0..groups {
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t_strided(
+                    a_full.offset(g * k * 2).0,
+                    lda as u32,
+                    w_all.offset(g * n * k * 2).0,
+                    c_full.offset(g * n * 2).0,
+                    ldc as u32,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    stream,
+                )?;
+            }
+            Ok(())
+        };
+        let run_ld = |_: ()| -> Result<()> {
+            for g in 0..groups {
+                dense_gemm_bf16_pipelined_ld_shim(
+                    gpu,
+                    ld_kernel,
+                    a_full.offset(g * k * 2),
+                    w_all.offset(g * n * k * 2),
+                    c_full.offset(g * n * 2),
+                    m,
+                    n,
+                    k,
+                    lda,
+                    ldc,
+                    stream,
+                )?;
+            }
+            Ok(())
+        };
+        let flop = 2.0 * (groups * m * n * k) as f64;
+        let t_ld = {
+            for _ in 0..3 {
+                run_ld(())?;
+            }
+            gpu.synchronize(stream)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                run_ld(())?;
+            }
+            gpu.synchronize(stream)?;
+            t0.elapsed().as_secs_f64() / ITERS as f64
+        };
+        let t_lt = {
+            for _ in 0..3 {
+                run_lt(())?;
+            }
+            gpu.synchronize(stream)?;
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                run_lt(())?;
+            }
+            gpu.synchronize(stream)?;
+            t0.elapsed().as_secs_f64() / ITERS as f64
+        };
+        println!(
+            "wo_a x8str {:>7.3} ms {:>4.0}TF {:>10.3} ms {:>6.0}TF [{:>4.2}x] {min_cos:>9.6}  (8 groups, lda={lda} ldc={ldc}; custom=pipelined_ld)",
+            t_ld * 1e3,
+            flop / t_ld / 1e12,
+            t_lt * 1e3,
+            flop / t_lt / 1e12,
+            t_ld / t_lt,
+        );
+        for p in [a_full, w_all, c_full, a_pack, c_pack, c_slice] {
+            gpu.free(p).ok();
+        }
+    }
     Ok(())
+}
+
+/// `dense_gemm_bf16_pipelined_ld` launch shim (same grid/block as the packed
+/// kernel; lda/ldc are ROW strides in elements — mirrors ops::dense_gemm_bf16_pipelined_ld).
+#[allow(clippy::too_many_arguments)]
+fn dense_gemm_bf16_pipelined_ld_shim(
+    gpu: &dyn GpuBackend,
+    kernel: spark_runtime::gpu::KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldc: usize,
+    stream: u64,
+) -> Result<()> {
+    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n as u32, 128), div_ceil(m as u32, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(output)
+        .arg_u32(m as u32)
+        .arg_u32(n as u32)
+        .arg_u32(k as u32)
+        .arg_u32(lda as u32)
+        .arg_u32(ldc as u32)
+        .launch(stream)
 }
 
 // dense_gemm_bf16_pipelined wrapper shim (examples can't see pub(crate) ops)

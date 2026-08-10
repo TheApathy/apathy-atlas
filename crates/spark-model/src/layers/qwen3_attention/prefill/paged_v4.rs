@@ -56,17 +56,31 @@ impl Qwen3AttentionLayer {
 
         // ── 1. Q latent → norm → expand ──
         let q_latent = ctx.buffers.ssm_ba();
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON) — same gate
+        // and helper as the cache_skip_v4 wq_a site; wq_a always keeps its
+        // BF16 mirror. Falls back to the scalar dense_gemm below.
+        if !super::v4_fp8_proj::try_v4_cublas_prefill(
             normed,
-            &mla.wq_a,
+            mla.wq_a.weight,
             q_latent,
             n,
             q_lora,
             h,
             stream,
-        )?;
+            "V4 wq_a (paged)",
+        ) {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_k,
+                normed,
+                &mla.wq_a,
+                q_latent,
+                n,
+                q_lora,
+                h,
+                stream,
+            )?;
+        }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -113,17 +127,31 @@ impl Qwen3AttentionLayer {
         let kv_dim = nkv * hd_mla;
         let k_out = q_full.offset((n * q_dim) as usize * 2);
         let v_out = k_out.offset((n * kv_dim) as usize * 2);
-        ops::dense_gemm(
-            ctx.gpu,
-            self.dense_gemm_k,
+        // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON) — same gate
+        // and helper as the cache_skip_v4 wkv_a site (BF16 mirror never
+        // released). Falls back to the scalar dense_gemm below.
+        if !super::v4_fp8_proj::try_v4_cublas_prefill(
             normed,
-            &mla.wkv_a,
+            mla.wkv_a.weight,
             k_out,
             n,
             kv_lora,
             h,
             stream,
-        )?;
+            "V4 wkv_a (paged)",
+        ) {
+            ops::dense_gemm(
+                ctx.gpu,
+                self.dense_gemm_k,
+                normed,
+                &mla.wkv_a,
+                k_out,
+                n,
+                kv_lora,
+                h,
+                stream,
+            )?;
+        }
         // kv_norm: weighted RMSNorm over each token's kv latent BEFORE rope
         // (DeepSeek-V4: kv = kv_norm(kv_proj(h))). n*nkv rows of kv_lora dims.
         ops::rms_norm(
