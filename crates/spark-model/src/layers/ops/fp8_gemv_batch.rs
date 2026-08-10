@@ -28,6 +28,7 @@ pub fn dense_gemv_fp8w_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemv_fp8w_batch2", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -59,6 +60,7 @@ pub fn w8a16_gemv_batch4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemv_batch4", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -94,6 +96,7 @@ pub fn w8a16_gemv_batch4_ld(
     ldc: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemv_batch4_ld", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -129,6 +132,7 @@ pub fn w8a16_gemv_batchm_exact(
     ldc: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemv_batchm_exact", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -159,6 +163,7 @@ pub fn w8a16_gemv_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemv_batch2", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])

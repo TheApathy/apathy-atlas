@@ -29,6 +29,7 @@ pub fn fp8_fp8_gemm_n128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("fp8_fp8_gemm_n128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -59,6 +60,7 @@ pub fn fp8_gemm_n128_m128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("fp8_gemm_n128_m128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([128, 1, 1])
@@ -90,6 +92,7 @@ pub fn fp8_fp8_gemm_n128_m128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("fp8_fp8_gemm_n128_m128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([128, 1, 1])
@@ -119,6 +122,7 @@ pub fn dense_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemv", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -158,6 +162,7 @@ pub fn dense_gemv_batchm(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemv_batchm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -200,6 +205,7 @@ pub fn dense_gemv_grouped_batchm(
     rows_per_group: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemv_grouped_batchm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -238,6 +244,7 @@ pub fn dense_gemv_batch2(
     out_stride: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemv_batch2", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -268,6 +275,7 @@ pub fn dense_gemv_fp8w(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemv_fp8w", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -301,6 +309,7 @@ pub fn w8a16_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemv", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -330,6 +339,7 @@ pub fn w8a16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemm", m, n, k);
     // Launch geometry is target-specific because the `w8a16_gemm` kernel SOURCE
     // differs per target. The native-HIP (gfx1151) kernel is a 256×128 M×N
     // tile / 512-thread (16-warp) block (kernels/strix-hip/common/w8a16_gemm.cu)
@@ -374,6 +384,7 @@ pub fn w8a16_gemm_pipelined_ld(
     ldc: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemm_pipelined_ld", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -405,6 +416,7 @@ pub fn dense_gemm_bf16_pipelined_ld(
     ldc: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_bf16_pipelined_ld", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -440,6 +452,7 @@ pub fn w8a16_gemm_pipelined(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemm_pipelined", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -638,6 +651,7 @@ pub fn moe_fp8_grouped_gemm(
     max_tiles: u32,         // caller's upper bound on tile count (wl_cap_items)
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("moe_fp8_grouped_gemm", 1, n, k);
     // The kernel strides by gridDim.x, so the grid is sized to the work-list's
     // tile-count upper bound. Clamp to MAX_GRID_CTAS to bound the launch.
     const MAX_GRID_CTAS: u32 = 16384;
@@ -694,6 +708,7 @@ pub fn moe_w8a8_grouped_gemm(
     max_m_tiles: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("moe_w8a8_grouped_gemm", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), max_m_tiles, num_experts])
         .block([128, 1, 1])
@@ -733,6 +748,7 @@ pub fn moe_bf16_grouped_gemm(
     max_m_tiles: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("moe_bf16_grouped_gemm", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), max_m_tiles, num_experts])
         .block([128, 1, 1])
@@ -765,6 +781,7 @@ pub fn w8a16_gemm_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemm_t", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -853,6 +870,7 @@ pub fn transpose_fp8(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("transpose_fp8", 1, n, k);
     let total = n as u64 * k as u64;
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(total as u32, 256), 1, 1])

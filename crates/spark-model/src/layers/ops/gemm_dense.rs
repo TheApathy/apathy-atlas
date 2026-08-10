@@ -34,6 +34,7 @@ pub fn dense_gemm_tc(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_tc", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 16), 1])
         .block([128, 1, 1])
@@ -63,6 +64,7 @@ pub fn dense_gemm_splitk(
     k_splits: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_splitk", m, n, k);
     // Phase 1: partial products
     KernelLaunch::new(gpu, partial_kernel)
         .grid([div_ceil(n, 16), div_ceil(m, 16), k_splits])
@@ -98,6 +100,7 @@ pub fn dense_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 16), div_ceil(m, 16), 1])
         .block([16, 16, 1])
@@ -126,6 +129,7 @@ pub fn dense_gemm_bf16_pipelined(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_bf16_pipelined", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -157,6 +161,7 @@ pub fn dense_gemm_bf16_mtile16(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_bf16_mtile16", m, n, k);
     debug_assert!(
         m <= 16,
         "dense_gemm_bf16_mtile16 requires M <= 16 (got {m})"
@@ -194,6 +199,7 @@ pub fn dense_gemm_bf16_mtile16_n128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_bf16_mtile16_n128", m, n, k);
     debug_assert!(
         m <= 16,
         "dense_gemm_bf16_mtile16_n128 requires M <= 16 (got {m})"
@@ -230,6 +236,7 @@ pub fn dense_gemm_prefill(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("dense_gemm_prefill", m, n, k);
     if pipelined_kernel.0 != 0 {
         dense_gemm_bf16_pipelined(
             gpu,
@@ -266,6 +273,7 @@ pub fn w4a16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -295,6 +303,7 @@ pub fn w4a16_gemm_n128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemm_n128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -324,6 +333,7 @@ pub fn w4a16_gemm_n128_m128_v3(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemm_n128_m128_v3", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -360,6 +370,7 @@ pub fn w4a16_gemm_n128_m128_v2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemm_n128_m128_v2", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([256, 1, 1])
@@ -402,6 +413,7 @@ pub fn w4a16_gemm_n128_m128(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemm_n128_m128", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([128, 1, 1])
@@ -438,6 +450,7 @@ pub fn w4a16_gemm_n128_m128_bf16(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemm_n128_m128_bf16", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
         .block([128, 1, 1])

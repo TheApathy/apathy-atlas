@@ -218,3 +218,13 @@ test_data/lora-holo-tiny*/reference_deltas.safetensors
 adapters35/
 /dspark_dump*.bin
 /dspark_ref_drafts.bin
+
+# ── Benchmark/serve run artifacts (2026-08-10 prefill campaign) ──
+# Serve logs, streaming-probe JSON and raw device dumps are RUN OUTPUT: they
+# differ every run and must never gate a reproduction. Curated results that
+# back a claim live in docs/probes/ and are tracked there explicitly.
+serve-*.log
+serve-*.out.json
+probe-*.json
+nograph-extra.json
+*.bin

@@ -30,6 +30,7 @@ pub fn quant_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("quant_gemv", 1, n, k);
     use crate::weight_map::QuantWeight;
     match weight {
         QuantWeight::Nvfp4(w) => w4a16_gemv(gpu, gemv_nvfp4, input, w, output, n, k, stream),
@@ -65,6 +66,7 @@ pub fn quant_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("quant_gemm", m, n, k);
     use crate::weight_map::QuantWeight;
     match weight {
         QuantWeight::Nvfp4(w) => w4a16_gemm(gpu, gemm_nvfp4, input, w, output, m, n, k, stream),
@@ -101,6 +103,7 @@ pub fn w4a16_gemv(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -206,6 +209,7 @@ pub fn w4a16_gemv_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_batch2", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -236,6 +240,7 @@ pub fn w4a16_gemv_batch3(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_batch3", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -268,6 +273,7 @@ pub fn w4a16_gemv_batchm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_batchm", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -302,6 +308,7 @@ pub fn w4a16_gemv_batch4_ld(
     ldc: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_batch4_ld", m, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -338,6 +345,7 @@ pub fn w4a16_gemv_qg(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_qg", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -375,6 +383,7 @@ pub fn w4a16_gemv_qkvz(
     head_v_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_qkvz", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -413,6 +422,7 @@ pub fn w4a16_gemv_qg_batch2(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_qg_batch2", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -449,6 +459,7 @@ pub fn w4a16_gemv_qg_batch3(
     head_dim: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_qg_batch3", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 1])
         .block([256, 1, 1])
@@ -485,6 +496,7 @@ pub fn w4a16_gemv_dual_batch3(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_dual_batch3", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 2])
         .block([256, 1, 1])
@@ -523,6 +535,7 @@ pub fn w4a16_gemv_dual_batch2(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    super::log_gemm_shape("w4a16_gemv_dual_batch2", 1, n, k);
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 4), 1, 2])
         .block([256, 1, 1])
