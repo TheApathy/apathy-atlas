@@ -228,3 +228,21 @@ serve-*.out.json
 probe-*.json
 nograph-extra.json
 *.bin
+# Same rule, second sweep (2026-08-10): remaining root droppings not caught
+# by the block above. `*.bin` already covers device dumps regardless of stem
+# (paged_dump.bin, online_caps.bin, plain-paged.bin, ...); these close the
+# rest of the family.
+#   *.out.json     — streaming-probe output not named serve-* (cfg-*.out.json)
+#   /scratch_*.txt — ad-hoc perf scratch notes at repo root
+*.out.json
+/scratch_*.txt
+# Nested agent/experiment checkouts at repo root (e.g. codex-work/ holding a
+# secondary atlas worktree) — same class as /tmp/ and /tools/ above.
+/codex-work/
+# SQLite write-ahead sidecars. data/benchmarks.sqlite itself is TRACKED (the
+# bare `*.sqlite` glob under "Profiling artifacts" does not affect it), but
+# the -shm/-wal/-journal transients a live connection creates next to it are
+# per-process state and must never be committed.
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal

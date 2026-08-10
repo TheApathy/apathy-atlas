@@ -1,5 +1,14 @@
 # Reproducing the DeepSeek-V4-Flash prefill numbers (792 tok/s @ N=2410)
 
+> **SUPERSEDED NUMBER (flagged 2026-08-10): the protocol is current, the
+> headline is not.** Three later commits landed default-ON on top of the
+> 792 rung: `d8ebbd90` (884) and `e66088e9` (905, TTFT 2.66 s). On current
+> `combined-residency` expect **TTFT ~2.66 s ≈ 905 tok/s**. Their opt-outs
+> extend the bisect table in §2: `ATLAS_V4_PREFILL_TC2=0`,
+> `ATLAS_MOE_SHARED_K64=0`, `ATLAS_MOE_PREFILL_EXACT_TILES=0`, and
+> `ATLAS_EXTRA_NVCC_FLAGS="-DATLAS_MOE_NO_WIDE_DEQUANT_STORE"` /
+> `"-DATLAS_MOE_NO_PACKED_EPILOGUE"` for the SASS-level toggles.
+
 Everything below runs from a clean checkout of `combined-residency` on one
 GB10 (DGX Spark, sm_121). No hidden state: the only inputs are the model
 directory and the env flags listed here.

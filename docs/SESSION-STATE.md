@@ -1,5 +1,13 @@
 # DeepSeek-V4-Flash on one GB10 — state, targets, next action
 
+> **STALE-NUMBERS FLAG (2026-08-10 sanitation pass — kept for history, do not
+> plan from the table below).** The "Where we are" figures predate the prefill
+> campaign and the dispatch fixes that followed. Current measured state:
+> **prefill 905 tok/s @ N=2410** (TTFT 2.66 s, 5-run median, `e66088e9`) and
+> **decode repeat record 33.13 tok/s** (`d7aff34d`), quality gate 90/100 held.
+> The current ladder lives in `docs/PREFILL-CAMPAIGN-2026-08-10.md` and the
+> commit log; the methodology in `docs/MODEL-MIGRATION-PLAYBOOK.md`.
+
 Branch `combined-residency`. All numbers measured on this box unless marked
 arithmetic. Serve config for every number below:
 
