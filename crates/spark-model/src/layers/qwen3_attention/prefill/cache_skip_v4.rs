@@ -110,6 +110,16 @@ impl Qwen3AttentionLayer {
             };
         }
 
+        // ATLAS_V4_STAGE_SYNCS=0 skips the per-stage error-surfacing syncs in
+        // this function (stream ordering already guarantees correctness; the
+        // syncs only localize errors). A/B instrument for the measured gap
+        // between bucket totals and standalone kernel times.
+        let stage_syncs = {
+            static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *E.get_or_init(|| {
+                std::env::var("ATLAS_V4_STAGE_SYNCS").as_deref() != Ok("0")
+            })
+        };
         // ── 1. Q latent → norm → expand ──
         let q_latent = ctx.buffers.ssm_ba();
         if use_tc {
@@ -137,9 +147,11 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
-        ctx.gpu
-            .synchronize(stream)
-            .map_err(|e| anyhow::anyhow!("V4 attn: q_latent gemm sync failed: {e}"))?;
+        if stage_syncs {
+            ctx.gpu
+                .synchronize(stream)
+                .map_err(|e| anyhow::anyhow!("V4 attn: q_latent gemm sync failed: {e}"))?;
+        }
         ops::rms_norm(
             ctx.gpu,
             self.rms_norm_w_k,
@@ -151,9 +163,11 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
-        ctx.gpu
-            .synchronize(stream)
-            .map_err(|e| anyhow::anyhow!("V4 attn: q_a_norm sync failed: {e}"))?;
+        if stage_syncs {
+            ctx.gpu
+                .synchronize(stream)
+                .map_err(|e| anyhow::anyhow!("V4 attn: q_a_norm sync failed: {e}"))?;
+        }
         let q_full = ctx.buffers.qkv_output();
         self.v4_project_prefill(
             ctx,
@@ -167,9 +181,11 @@ impl Qwen3AttentionLayer {
             stream,
             "V4 wq_b",
         )?;
-        ctx.gpu
-            .synchronize(stream)
-            .map_err(|e| anyhow::anyhow!("V4 attn: q_full gemm sync failed: {e}"))?;
+        if stage_syncs {
+            ctx.gpu
+                .synchronize(stream)
+                .map_err(|e| anyhow::anyhow!("V4 attn: q_full gemm sync failed: {e}"))?;
+        }
         // q_b_norm: per-head unweighted RMSNorm over head_dim (DeepSeek-V4),
         // each of the n*nq head vectors renormalized to unit RMS before rope.
         ops::rms_norm(
@@ -687,6 +703,7 @@ impl Qwen3AttentionLayer {
                 .arg_u32(V4_WINDOW)
                 .arg_f32(1.0f32 / (hd_mla as f32).sqrt())
                 .launch(stream)?;
+            aprof!("4b_attn_kernel");
             true
         } else {
             false
@@ -775,35 +792,73 @@ impl Qwen3AttentionLayer {
                 }
             }
         }
+        aprof!("4c_ring_seed");
         if !did_csa {
-            // V4 full-attention (non-CSA) is always HDIM=512 → the 512 kernel.
-            // MLA: V==K (k_out carries the rope tail; v_out is the plain latent).
-            // Pass the per-head attention sink so the softmax denominator matches
-            // the decode path (the reference applies the sink on EVERY layer).
-            ops::prefill_attention_512_sink(
-                ctx.gpu,
-                self.prefill_attn_512_k,
-                q_full,
-                k_out,
-                k_out,
-                attn_out,
-                n,
-                1,
-                nq,
-                nkv,
-                hd_mla,
-                1.0f32 / (hd_mla as f32).sqrt(),
-                true,
-                V4_WINDOW,
-                mla.attn_sink,
-                stream,
-            )
-            .map_err(|e| anyhow::anyhow!("V4 attn: prefill_attention_512_sink failed: {e}"))?;
+            // V4 full-attention (non-CSA) is always HDIM=512. The old
+            // `prefill_attention_512_sink` measured 770 ms/pass for the TWO
+            // ratio-0 layers at N=2410 (sub-split bucket 4d — 15% of TTFT).
+            // The TC kernel covers the same semantics with n_comp=0:
+            // windowed-causal raw arm (same V4_WINDOW), no compressed arm,
+            // per-head sink in the denominator, V==K aliasing.
+            // ATLAS_V4_PREFILL_TC=0 opts back into the 512 kernel.
+            let use_tc_dense = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(|| {
+                    std::env::var("ATLAS_V4_PREFILL_TC").as_deref() != Ok("0")
+                })
+            } && self.prefill_attn_compressed_tc_k.0 != 0
+                && hd_mla == 512;
+            if use_tc_dense {
+                KernelLaunch::new(ctx.gpu, self.prefill_attn_compressed_tc_k)
+                    .grid([nq, n.div_ceil(16), 1])
+                    .block([128, 1, 1])
+                    .arg_ptr(q_full)
+                    .arg_ptr(k_out)
+                    .arg_ptr(k_out)
+                    .arg_ptr(k_out) // Kc: unused at n_comp=0
+                    .arg_ptr(k_out) // Vc: unused at n_comp=0
+                    .arg_ptr(mla.attn_sink)
+                    .arg_ptr(attn_out)
+                    .arg_u32(n)
+                    .arg_u32(nq)
+                    .arg_u32(nkv)
+                    .arg_u32(hd_mla)
+                    .arg_u32(0) // n_comp = 0: compressed arm entirely skipped
+                    .arg_u32(1) // ratio: irrelevant at n_comp=0; nonzero for div
+                    .arg_u32(V4_WINDOW)
+                    .arg_f32(1.0f32 / (hd_mla as f32).sqrt())
+                    .launch(stream)?;
+            } else {
+                ops::prefill_attention_512_sink(
+                    ctx.gpu,
+                    self.prefill_attn_512_k,
+                    q_full,
+                    k_out,
+                    k_out,
+                    attn_out,
+                    n,
+                    1,
+                    nq,
+                    nkv,
+                    hd_mla,
+                    1.0f32 / (hd_mla as f32).sqrt(),
+                    true,
+                    V4_WINDOW,
+                    mla.attn_sink,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("V4 attn: prefill_attention_512_sink failed: {e}")
+                })?;
+            }
         }
-        ctx.gpu
-            .synchronize(stream)
-            .map_err(|e| anyhow::anyhow!("V4 attn: prefill_attention sync failed: {e}"))?;
+        if stage_syncs {
+            ctx.gpu
+                .synchronize(stream)
+                .map_err(|e| anyhow::anyhow!("V4 attn: prefill_attention sync failed: {e}"))?;
+        }
 
+        aprof!("4d_dense_fallback");
         // DeepSeek-V4 eq.26: de-rotate the attention output by each query position
         // (inverse interleaved YaRN RoPE on the trailing rope dims) before o_proj.
         {
@@ -928,9 +983,11 @@ impl Qwen3AttentionLayer {
         self.v4_grouped_wo_a_prefill(
             ctx, mla, attn_out, o_latent, n, nq, hd_mla, o_groups, o_lora, stream,
         )?;
-        ctx.gpu
-            .synchronize(stream)
-            .map_err(|e| anyhow::anyhow!("V4 attn: wo_a grouped gemv sync failed: {e}"))?;
+        if stage_syncs {
+            ctx.gpu
+                .synchronize(stream)
+                .map_err(|e| anyhow::anyhow!("V4 attn: wo_a grouped gemv sync failed: {e}"))?;
+        }
         self.v4_project_prefill(
             ctx,
             o_latent,
@@ -943,9 +1000,11 @@ impl Qwen3AttentionLayer {
             stream,
             "V4 wo_b",
         )?;
-        ctx.gpu
-            .synchronize(stream)
-            .map_err(|e| anyhow::anyhow!("V4 attn: wo_b gemm sync failed: {e}"))?;
+        if stage_syncs {
+            ctx.gpu
+                .synchronize(stream)
+                .map_err(|e| anyhow::anyhow!("V4 attn: wo_b gemm sync failed: {e}"))?;
+        }
         aprof!("6_o_proj");
         if diag_this {
             super::super::trait_impl::diag_norm(
