@@ -120,3 +120,33 @@ scripts/dsflash-serve-bench.sh <name> 5 ... ATLAS_PROFILE=1
 # graphed truth + host-share
 scripts/dsflash-serve-bench.sh <name> - ... ATLAS_LOOP_TRACE=1
 ```
+
+## 6. Addendum (later 2026-08-10): the VERIFY-step waterfall — the road to 28
+
+External insight, confirmed by measurement: the ceiling is not raw DRAM
+bandwidth but GPU under-fill from the inference graph's complexity — and
+verifying many tokens at once amortizes it. The γ=5 (m=6) verify step,
+eager, ATLAS_VERIFY_PROFILE + MLAPROF marks, ~48 steps of accepting content:
+
+| bucket | ms/step | floor | mechanism |
+|---|---:|---:|---|
+| MoE expert union (`exp_splitk_m_t`) | 54.1 | ~35 | 135 GB/s vs the m=1 sibling's 206 (v4s8); rows-per-leader falloff 183→103 documented |
+| attention `A_proj` (batched Q/KV GEMVs) | 10.8 | ~4.5 | weights read once ⇒ n=6 should cost ≈ m=1; runs 2.4× that |
+| attention `C_oproj` | 11.5 | ~7.5 | 1.5× its weight-bound floor |
+| attention `B_attn` (rope/cache/paged) | 4.0 | ~4 | fine |
+| MoE gate | 6.2 | — | KNOWN wash (ATLAS_MOE_GATE_GEMV measured: speed −5 ms but routing flips cost the acceptance back — see forward_km.rs comment; do not re-chase) |
+| HC/norms/glue + probe sync | ~16 | ~8 | partially probe artifact |
+| MoE route/blend | 1.7 | 1.7 | fine |
+
+Total eager ≈ 113 ms + propose ~10 + head ~3. **~28 ms is recoverable in
+the two starred buckets alone** → verify step ~110 ms graphed. The verify
+economics then change qualitatively: per accepted token the MLA/lm_head
+weights are already amortized ×(accepted+1), and acceptance ≥1.5 starts
+beating plain decode — prose included. Combined with EXL3 experts
+(the union is the one stream that still scales with m), the 28 target is
+reached through the SPECULATIVE path, matching how the reference stack
+actually achieves its 38.
+
+Constraint carried from measurement: the exact-GEMV law (partial exactness
+is worse than none) binds every verify-side kernel change to per-row
+bit-identity with the plain path.
