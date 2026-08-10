@@ -67,6 +67,15 @@ pub enum WeightQuantFormat {
     /// (`moe_fused_w3` / `moe_w3a16` modules). Feeding these bytes through an
     /// NVFP4 kernel = silent garbage — assert via `expect` at dispatch sites.
     W3LloydMax,
+    /// EXL3 trellis-coded 3.0 bpw (ExLlamaV3 / QTIP "3INST" cb=1): bit-packed
+    /// 96-B tiles `[K/16, N/16, 48]` I16 + F16 `suh`/`svh` sign vectors, NO
+    /// scales of any kind. Loaded from the reference tp1 checkpoint
+    /// (`quant_method: "exl3"`) by `weight_map::exl3`; consumed ONLY by the
+    /// `exl3_gemv` kernel family through `MoeLayer::exl3` (the trellis bytes
+    /// are not per-(k,n) addressable, so NO other GEMM/GEMV kernel can read
+    /// them). Any legacy dispatch site that would touch `gate_ptrs`/NVFP4
+    /// tables must `expect`-fail on this tag rather than dereference nulls.
+    Exl3Trellis,
 }
 
 impl WeightQuantFormat {

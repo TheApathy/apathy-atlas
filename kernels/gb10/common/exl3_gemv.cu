@@ -220,7 +220,7 @@ __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
 //             them to 0 on completion, so back-to-back launches are safe.
 // ---------------------------------------------------------------------------
 
-extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1(
+__device__ __forceinline__ void exl3_gemv_m1_body(
     const __nv_bfloat16* __restrict__ A,         // [K]
     const unsigned short* __restrict__ trellis,  // [K/16, N/16, 48]
     const __half* __restrict__ suh,              // [K]
@@ -368,6 +368,47 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1(
         C[nb + 2] = __float2bfloat16(h2 * EXL3_RSQRT128 * __half2float(svh[nb + 2]));
         C[nb + 3] = __float2bfloat16(h3 * EXL3_RSQRT128 * __half2float(svh[nb + 3]));
     }
+}
+
+extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1(
+    const __nv_bfloat16* __restrict__ A,         // [K]
+    const unsigned short* __restrict__ trellis,  // [K/16, N/16, 48]
+    const __half* __restrict__ suh,              // [K]
+    const __half* __restrict__ svh,              // [N]
+    __nv_bfloat16* __restrict__ C,               // [N]
+    float* __restrict__ ws,                      // [gridDim.y, N]
+    int* __restrict__ counters,                  // [N/128]
+    unsigned int N, unsigned int K) {
+    exl3_gemv_m1_body(A, trellis, suh, svh, C, ws, counters, N, K);
+}
+
+// ---------------------------------------------------------------------------
+// exl3_gemv_m1_idx: device-indexed variant for the MoE decode dispatch.
+//
+// Instead of per-expert pointers it takes device POINTER TABLES (one u64 per
+// expert, built by the loader) plus the routed `indices` buffer the top-k
+// kernel wrote, and a compile-side `slot` (0..top_k-1). The expert id is read
+// ON DEVICE (e = indices[slot]) so the launch sequence is identical every
+// step — no D2H of the routing, safe under CUDA graph capture.
+//
+//   grid/block/ws/counters: exactly as exl3_gemv_m1.
+// ---------------------------------------------------------------------------
+
+extern "C" __global__ void __launch_bounds__(EXL3_BLOCK) exl3_gemv_m1_idx(
+    const __nv_bfloat16* __restrict__ A,              // [K]
+    const unsigned long long* __restrict__ trellis_tab,  // [num_experts]
+    const unsigned long long* __restrict__ suh_tab,      // [num_experts]
+    const unsigned long long* __restrict__ svh_tab,      // [num_experts]
+    const unsigned int* __restrict__ indices,         // [top_k] routed ids
+    unsigned int slot,                                // which routed slot
+    __nv_bfloat16* __restrict__ C,                    // [N]
+    float* __restrict__ ws,                           // [gridDim.y, N]
+    int* __restrict__ counters,                       // [N/128]
+    unsigned int N, unsigned int K) {
+    const unsigned int e = indices[slot];
+    exl3_gemv_m1_body(A, (const unsigned short*)trellis_tab[e],
+                      (const __half*)suh_tab[e], (const __half*)svh_tab[e], C, ws,
+                      counters, N, K);
 }
 
 // ---------------------------------------------------------------------------

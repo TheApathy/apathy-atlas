@@ -11,6 +11,14 @@ use super::super::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_byte
 use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 use crate::gpu::GpuBackend;
 
+/// True for the EXL3 trellis sign vectors, which must land as native F16
+/// (kernels read `__half*`). Ground-truth naming from the reference tp1
+/// checkpoint headers: `layers.{L}.ffn.experts.{E}.{w1|w2|w3}.rank{r}.suh`
+/// (and `.svh`).
+fn exl3_keep_f16(name: &str) -> bool {
+    name.ends_with(".suh") || name.ends_with(".svh")
+}
+
 pub(super) fn load_sharded(
     model_dir: &Path,
     index_path: &Path,
@@ -102,10 +110,17 @@ pub(super) fn load_sharded(
             let shape: Vec<usize> = view.shape().to_vec();
             // F16 shards: convert bytes to BF16 before upload (same length,
             // different bit layout). WeightDtype stays closed to store dtypes.
+            // EXCEPTION: EXL3 sign vectors (`.suh` / `.svh`) must stay native
+            // F16 — the exl3_gemv kernels read them as `__half*`, and the
+            // F16→BF16→F16 round-trip would truncate mantissa bits 8..10.
             let converted: Vec<u8>;
-            let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16 {
+            let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16
+                && !exl3_keep_f16(name)
+            {
                 converted = f16_to_bf16_bytes(view.data());
                 (&converted, WeightDtype::BF16)
+            } else if view.dtype() == safetensors::Dtype::F16 {
+                (view.data(), WeightDtype::F16)
             } else {
                 (view.data(), WeightDtype::from_safetensors(view.dtype())?)
             };
@@ -188,11 +203,16 @@ pub(super) fn load_single(
             continue;
         }
         let shape: Vec<usize> = view.shape().to_vec();
-        // F16: convert to BF16 at load — see load_sharded above.
+        // F16: convert to BF16 at load — see load_sharded above (same EXL3
+        // sign-vector exemption).
         let converted: Vec<u8>;
-        let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16 {
+        let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16
+            && !exl3_keep_f16(&name)
+        {
             converted = f16_to_bf16_bytes(view.data());
             (&converted, WeightDtype::BF16)
+        } else if view.dtype() == safetensors::Dtype::F16 {
+            (view.data(), WeightDtype::F16)
         } else {
             (view.data(), WeightDtype::from_safetensors(view.dtype())?)
         };

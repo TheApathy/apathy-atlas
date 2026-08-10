@@ -37,6 +37,11 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // EXL3 trellis experts: no multi-row dedup kernels — decline so the
+        // caller falls back to the per-row loop, which takes the EXL3 M=1 arm.
+        if self.exl3.is_some() {
+            return Ok(false);
+        }
         let n = num_tokens as u32;
         if n < 2 || n > MOE_VERIFY_MAX_ROWS {
             // The width cap is a THROUGHPUT CLIFF, not a mere fallback: past

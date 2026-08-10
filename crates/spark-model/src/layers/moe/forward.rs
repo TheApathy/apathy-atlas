@@ -320,7 +320,28 @@ impl MoeLayer {
         // `skip_placeholder_shared` in helpers_c.rs.
         let skip_placeholder_shared = self.skip_placeholder_shared();
 
-        if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
+        if self.exl3.is_some() {
+            // EXL3 trellis routed experts (reference tp1 checkpoint):
+            // per-slot exl3_gemv_m1_idx chain + NVFP4 shared expert. Expert
+            // ids are read on device — graph-safe, no D2H. See exl3_decode.rs.
+            prof!("exp_exl3", {
+                self.dispatch_exl3_decode(
+                    ctx,
+                    expert_input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_out,
+                    indices_dev,
+                    h,
+                    inter,
+                    top_k,
+                    stream,
+                )
+            })?;
+        } else if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
             self.bf16_gate_weight_ptrs,
             self.bf16_up_weight_ptrs,
             self.bf16_down_weight_ptrs,

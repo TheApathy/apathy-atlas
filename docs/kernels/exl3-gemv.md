@@ -159,11 +159,30 @@ Gates (exit code enforced):
 
 ## 6. Open items toward S6 (serve integration)
 
-- m-row (γ-verify) MROW variant — mandatory from day one per plan §3/§4.7
-  (partial-exactness law: the verify chain flips as a whole).
-- Real-checkpoint spot-check (plan option a): run the dump gate against
-  tiles from `/home/flocka/sparkinfer-ref/data/tp1` once readable.
-- Perf tuning after first GPU measurement: stage depth, `SPLIT_K` policy,
-  possible half2-accumulate variant (`EXL3_GEMM_H_ACC`-style) if issue-bound.
-- Shared-expert rider (grid.y expert slot) when wiring into
-  `moe_shared_expert_fused_t` dispatch.
+LANDED (combined-residency, loader/dispatch legs — GPU-unvalidated):
+
+- `exl3_gemv_m1_idx` — device-indexed twin of `exl3_gemv_m1` (pointer tables
+  + on-device `indices[slot]` read; graph-safe, no D2H of the routing).
+- Loader: `weight_map/exl3.rs` (`Exl3Weight`/`Exl3ExpertWeight`, shape/dtype/
+  `mcg` validation), store I16/I32/F16 passthrough (suh/svh stay native F16 —
+  `load_fns::exl3_keep_f16`), `assemble_moe` EXL3 arm (auto-detected from
+  `…rank0.trellis`, `ATLAS_EXPERT_EXL3=0` refuses), expert count from config
+  (216 on the reference REAP checkpoint). NO transpose pass — tiles load as-is.
+- Decode M=1 dispatch: `layers/moe/exl3_decode.rs` — per routed slot
+  gate/up (idx-GEMV) → clamped SwiGLU → down (idx-GEMV); NVFP4 shared expert
+  via `w4a16_gemv` + unclamped SwiGLU. Routed format tag `Exl3Trellis` fences
+  every legacy NVFP4/E8M0 path.
+
+STILL OPEN:
+
+- Prefill / M>1 (plan §3 P1): `forward_prefill` / `forward_batched` fail
+  loudly. Design: per-expert `exl3_dequant_dump` to F16/BF16 scratch + an
+  M-row H128 activation pre-pass (`x' = H128(diag(suh)·x)`) and post-pass
+  (`y = diag(svh)·H128(y0)`), feeding the existing grouped BF16 GEMM.
+- m-row (γ-verify) MROW variant — `forward_km` declines for EXL3 (falls to
+  the guarded per-row path); the exact-verify twin is mandatory S6 scope.
+- Real-checkpoint spot-check: run the dump gate against tp1 tiles.
+- Perf tuning after first GPU measurement: stage depth, `SPLIT_K` policy
+  (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides),
+  possible half2-accumulate variant if issue-bound.
+- Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.

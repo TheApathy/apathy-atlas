@@ -577,10 +577,41 @@ pub(super) fn assemble_moe(
     // `dense_gemv` path (gate_nvfp4 = None) instead of re-quantizing to NVFP4.
     let gate_nvfp4 = None;
 
+    // ── EXL3 trellis routed experts (reference tp1 checkpoint) ──
+    // Detected from the tensors themselves (`…experts.0.w1.rank0.trellis`),
+    // matching `quantization_config.quant_method == "exl3"`. When present it
+    // is the ONLY routed-expert format on disk, so ATLAS_EXPERT_EXL3 defaults
+    // ON; =0 refuses to load rather than silently serving null experts.
+    // Expert count flows from config (n_routed_experts → num_experts = 216 on
+    // the reference REAP model); nothing here assumes 144/256.
+    let exl3_detected = crate::weight_map::store_has_exl3_experts(store, p);
+    if exl3_detected {
+        anyhow::ensure!(
+            std::env::var("ATLAS_EXPERT_EXL3").as_deref() != Ok("0"),
+            "{p}: checkpoint ships EXL3 routed experts (its only routed format) \
+             but ATLAS_EXPERT_EXL3=0 — nothing else to serve; unset the flag"
+        );
+        anyhow::ensure!(
+            config.ep_world_size <= 1,
+            "{p}: EXL3 routed experts do not support expert parallelism yet \
+             (ep_world_size={})",
+            config.ep_world_size
+        );
+    }
+    let mut exl3_experts: Vec<crate::weight_map::Exl3ExpertWeight> = Vec::new();
     let mut experts = Vec::with_capacity(config.num_experts);
     for e in 0..config.num_experts {
-        if force_all_experts || config.is_local_expert(e) {
-            let ep = format!("{p}.ffn.experts.{e}");
+        let ep = format!("{p}.ffn.experts.{e}");
+        if exl3_detected {
+            // EXL3 tiles load as-is (no transpose pass, no NVFP4 tables);
+            // the legacy `experts` vec stays null — every dispatch that
+            // would read it is fenced by the `Exl3Trellis` format tag.
+            exl3_experts.push(
+                crate::weight_map::exl3_expert(store, &ep, gpu)
+                    .with_context(|| format!("DeepSeek-V4 EXL3 expert {e}"))?,
+            );
+            experts.push(ExpertWeight::null());
+        } else if force_all_experts || config.is_local_expert(e) {
             let gate_proj = load_expert_proj(store, &format!("{ep}.w1"), gpu, qctx)
                 .with_context(|| format!("DeepSeek-V4 expert {e}: w1"))?;
             let up_proj = load_expert_proj(store, &format!("{ep}.w3"), gpu, qctx)
@@ -686,6 +717,22 @@ pub(super) fn assemble_moe(
     // Tag routed-expert quant format so the Phase-K E8M0 MoE-GEMM variants
     // dispatch on native MXFP4 (transcode-free) vs the standard NVFP4 kernels.
     moe.experts_scale_kind = detect_routed_scale_kind(store, p, config, force_all_experts);
+    // EXL3: attach the trellis experts + pointer tables and re-tag the routed
+    // format `Exl3Trellis` (set_exl3_experts does both). Must come AFTER the
+    // detect above so the EXL3 tag wins.
+    if exl3_detected {
+        moe.set_exl3_experts(&exl3_experts, gpu)
+            .with_context(|| format!("{p}: EXL3 expert tables"))?;
+        tracing::info!(
+            "{p}: EXL3 trellis routed experts — {} experts, gate/up [{}x{}], down [{}x{}] \
+             (3.0 bpw, decode M=1 arm; prefill P1 pending)",
+            exl3_experts.len(),
+            exl3_experts[0].gate_proj.n,
+            exl3_experts[0].gate_proj.k,
+            exl3_experts[0].down_proj.n,
+            exl3_experts[0].down_proj.k,
+        );
+    }
     // Tag the SHARED expert format independently (RIDER A1): the native ckpt is
     // heterogeneous — routed E8M0-MXFP4, shared FP8→NVFP4. The dual-format decode
     // kernel asserts shared==Nvfp4; a different shared format fires the `expect`.

@@ -7,6 +7,8 @@
 //!
 //! Refactor wave 4a (2026-05-03): split into `weight_map/` sub-modules.
 
+#[path = "weight_map/exl3.rs"]
+mod exl3;
 #[path = "weight_map/expert.rs"]
 mod expert;
 #[path = "weight_map/fp8_dequant.rs"]
@@ -46,6 +48,7 @@ mod w3cache;
 #[path = "weight_map/tests.rs"]
 mod tests;
 
+pub use exl3::*;
 pub use expert::*;
 pub(crate) use fp8_dequant::*;
 pub use loaders_fp8::*;

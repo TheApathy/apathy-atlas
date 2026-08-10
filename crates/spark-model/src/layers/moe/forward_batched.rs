@@ -16,6 +16,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // EXL3 trellis experts have no M>1 kernels; the NVFP4/E8M0 pointer
+        // tables this path reads are null. Fail loudly (see forward_prefill).
+        anyhow::ensure!(
+            self.exl3.is_none(),
+            "EXL3 routed experts: forward_batched (M>1) not wired — decode M=1 only"
+        );
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;

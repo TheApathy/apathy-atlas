@@ -597,6 +597,14 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
+    /// EXL3 trellis (3.0 bpw) routed experts — `Some` only when the loader
+    /// found `…ffn.experts.{E}.{w}.rank0.trellis` tensors (the reference tp1
+    /// checkpoint, `quant_method: "exl3"`). Set post-construction by
+    /// `set_exl3_experts`, which also flips `experts_scale_kind` to
+    /// `Exl3Trellis` so every non-EXL3 dispatch path fails loudly. Decode
+    /// M=1 dispatch lives in `exl3_decode.rs`; prefill/verify M>1 are NOT
+    /// wired yet (plan §3 P1).
+    pub(crate) exl3: Option<exl3_decode::Exl3MoeState>,
 }
 
 impl MoeLayer {
@@ -858,6 +866,7 @@ impl MoeLayer {
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 pub(crate) mod dump;
+mod exl3_decode;
 mod forward;
 mod forward_atomic_c4;
 mod forward_batched;

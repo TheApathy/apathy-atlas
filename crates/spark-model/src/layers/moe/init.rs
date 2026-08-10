@@ -777,6 +777,9 @@ impl MoeLayer {
             moe_permute_tokens_k: super::super::try_kernel(gpu, "moe", "moe_permute_tokens"),
             // Phase 2.7 Tier C — set by loader after construction (qwen35.rs).
             is_dflash_capture_layer: false,
+            // EXL3 trellis experts — set by the DeepSeek-V4 loader after
+            // construction (set_exl3_experts) when the checkpoint is EXL3.
+            exl3: None,
             correction_bias_dev: weights_correction_bias,
             // `moe_topk_sig` is only registered for sigmoid-gated MoE models
             // (MiniMax-M2, Nemotron-Nano, Nemotron-Super). Softmax-gated MoEs

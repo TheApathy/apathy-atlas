@@ -39,6 +39,19 @@ pub enum WeightDtype {
     FP8E8M0,
     UInt8,
     Int64,
+    /// Raw 2-byte container for EXL3 trellis payload words (`.rank0.trellis`
+    /// tensors, safetensors I16). Opaque bit-stream consumed only by the
+    /// `exl3_gemv` kernel family — signedness is irrelevant.
+    Int16,
+    /// Raw 4-byte container (safetensors I32). EXL3 ships a scalar `mcg`
+    /// codebook selector per expert matrix; the loader validates its value
+    /// (0xCBAC1FED) on the host and never feeds it to a kernel.
+    Int32,
+    /// Native IEEE fp16, kept UNCONVERTED. Only the EXL3 sign vectors
+    /// (`.rank0.suh` / `.rank0.svh`) land as F16 — the `exl3_gemv` kernels
+    /// read them as `__half*`. Every other F16 tensor is still converted to
+    /// BF16 at load (`f16_to_bf16_bytes`); no generic GEMM path consumes F16.
+    F16,
 }
 
 impl WeightDtype {
@@ -50,6 +63,9 @@ impl WeightDtype {
             Self::FP8E8M0 => 1,
             Self::UInt8 => 1,
             Self::Int64 => 8,
+            Self::Int16 => 2,
+            Self::Int32 => 4,
+            Self::F16 => 2,
         }
     }
 
@@ -64,6 +80,9 @@ impl WeightDtype {
             safetensors::Dtype::F8_E4M3 => Ok(Self::FP8E4M3),
             safetensors::Dtype::F8_E8M0 => Ok(Self::FP8E8M0),
             safetensors::Dtype::I64 => Ok(Self::Int64),
+            // EXL3 checkpoint containers (trellis payload / mcg selector).
+            safetensors::Dtype::I16 => Ok(Self::Int16),
+            safetensors::Dtype::I32 => Ok(Self::Int32),
             other => bail!("Unsupported safetensors dtype: {other:?}"),
         }
     }
@@ -84,6 +103,9 @@ impl WeightDtype {
             "F8_E4M3" => Self::FP8E4M3,
             "F8_E8M0" => Self::FP8E8M0,
             "I64" => Self::Int64,
+            "I16" => Self::Int16,
+            "I32" => Self::Int32,
+            "F16" => Self::F16,
             other => bail!("Unsupported safetensors dtype '{other}'"),
         })
     }
