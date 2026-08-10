@@ -492,23 +492,27 @@ impl Qwen3AttentionLayer {
             let ratio = comp.ratio as u32;
             let proj_dim = comp.proj_dim as u32;
             let n_win = n / ratio;
-            // compressor projections kv/gate = W·normed [n, proj_dim]
+            // compressor projections kv/gate = W·normed [n, proj_dim].
+            // These ran the SIMT dense_gemm_bf16 at prefill M — the split
+            // waterfall measured the whole compressor block at 890 ms/pass
+            // (16% of TTFT@2410), dominated by these two GEMMs. Route to the
+            // tensor-core GEMM when present (same wrapper contract; TC MMA
+            // reorders the K reduction, so this is behaviour-gated like every
+            // prefill numerics change).
             let kv_comp = ctx.buffers.expert_up_out();
             let gate_comp = ctx.buffers.expert_down_out();
-            ops::dense_gemm(
+            let comp_gemm_tc = self.dense_gemm_tc_k.0 != 0
+                && std::env::var("ATLAS_V4_COMP_GEMM_TC").as_deref() != Ok("0");
+            let (gk, gemm): (_, fn(_, _, _, _, _, _, _, _, _) -> Result<()>) =
+                if comp_gemm_tc {
+                    (self.dense_gemm_tc_k, ops::dense_gemm_tc as _)
+                } else {
+                    (self.dense_gemm_k, ops::dense_gemm as _)
+                };
+            gemm(ctx.gpu, gk, normed, &comp.wkv, kv_comp, n, proj_dim, h, stream)?;
+            gemm(
                 ctx.gpu,
-                self.dense_gemm_k,
-                normed,
-                &comp.wkv,
-                kv_comp,
-                n,
-                proj_dim,
-                h,
-                stream,
-            )?;
-            ops::dense_gemm(
-                ctx.gpu,
-                self.dense_gemm_k,
+                gk,
                 normed,
                 &comp.wgate,
                 gate_comp,
@@ -630,6 +634,12 @@ impl Qwen3AttentionLayer {
             // offset + accumulate — an inc-3 concern alongside decode-append.)
             self.v4_comp_pool_filled
                 .store(n_win, std::sync::atomic::Ordering::Relaxed);
+            // Split of the old 4_core_attention bucket: everything above —
+            // the two dense_gemm compressor projections, csa_compress, norm,
+            // rope, pool copies — is the compressor; the kernel below is the
+            // attention. The unsplit bucket read 44 ms/layer at N=2410 while
+            // the standalone TC kernel measures ~13 — this names the gap.
+            aprof!("4a_csa_compressor");
             // Tensor-core core attention (m16n8k16, ~10x the scalar kernel;
             // docs/kernels/prefill-attn-tensorcore.md). Oracle: cos 0.9999975
             // vs scalar, 7.12 -> 1.85 ms/call at S=896. head_dim must be 512
