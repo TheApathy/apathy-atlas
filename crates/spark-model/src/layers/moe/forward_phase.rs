@@ -18,54 +18,97 @@ use super::*;
 /// `init.rs`.
 const T_SPLIT: u32 = 4;
 
+/// `ATLAS_MOE_GEMV_V2=1` wide-load decode tier: VEC=4 (128-byte warp requests
+/// on the weight stream) with SPLIT=8, which lands on exactly the same CTA
+/// count as the v2s4 default — grid.x halves, grid.z doubles — so the wider
+/// request costs no occupancy. Default OFF until serve-validated.
+const T_SPLIT_WIDE: u32 = 8;
+const T_SPLIT_VEC_WIDE: u32 = 4;
+
 static MOE_MROW_PARTITION_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static MOE_GEMV_V2_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Kernel selection for the single-row unified-`_t` split-K decode.
+pub(super) struct UnifiedTSplitCfg {
+    pub split: u32,
+    pub vec: u32,
+    pub gate_up: KernelHandle,
+    pub silu_down: KernelHandle,
+}
 
 impl MoeLayer {
-    /// Split factor for this decode call, or `None` to use the non-split
+    /// Split-K config for this decode call, or `None` to use the non-split
     /// kernels.
     ///
     /// Split-K reassociates each output's dot product — the sum is over a fixed
     /// block order so decode stays bit-reproducible run to run, but it is not
     /// bit-equal to the single-sweep kernels. `ATLAS_MOE_SPLITK=0` turns it off
     /// to A/B that, or to reproduce a reference hash captured before it landed.
+    ///
+    /// `ATLAS_MOE_GEMV_V2=1` selects the `_v4s8` wide-load entries instead of
+    /// `_v2s4` when the shape and target allow (falls back silently when not):
+    /// same warp count, 128-byte weight requests instead of 64. SPLIT=8 cuts
+    /// each dot product at different points than SPLIT=4, so the two tiers are
+    /// reassociation-equivalent, not bit-equal; both stay bit-reproducible.
     fn unified_t_split_k(
         &self,
         ctx: &ForwardContext,
         h: u32,
         inter: u32,
         top_k: u32,
-    ) -> Option<u32> {
+    ) -> Option<UnifiedTSplitCfg> {
         if std::env::var("ATLAS_MOE_SPLITK").as_deref() == Ok("0") {
             return None;
         }
-        let split = T_SPLIT;
-        let vec = ops::T_SPLIT_VEC;
-        // The vector load/store serves whole VEC groups only, and each block
-        // must cover a whole number of scale groups. Routed MXFP4 is per-32,
-        // NVFP4 per-16, so `32 * split` covers both.
-        let widths_ok = inter % (ops::t_block() * vec) == 0 && h % (ops::t_block() * vec) == 0;
-        let depths_ok = h % (32 * split) == 0 && inter % (32 * split) == 0;
-        let handles_ok = self.moe_gate_up_partial_finalize_k.0 != 0
-            && self.moe_down_partial_finalize_k.0 != 0
-            && self
-                .e8m0_or_opt(
-                    self.moe_expert_gate_up_shared_t_splitk_k,
-                    self.moe_expert_gate_up_shared_t_e8m0_splitk_k,
-                )
-                .is_some()
-            && self
-                .e8m0_or_opt(
-                    self.moe_expert_silu_down_shared_t_splitk_k,
-                    self.moe_expert_silu_down_shared_t_e8m0_splitk_k,
-                )
-                .is_some();
-        let need = ops::moe_splitk_partial_bytes(split, inter, h, top_k);
-        let space_ok = ctx.buffers.moe_splitk_partials_bytes() >= need;
-        if widths_ok && depths_ok && handles_ok && space_ok {
-            Some(split)
-        } else {
-            None
+        let base_finalize_ok = self.moe_gate_up_partial_finalize_k.0 != 0
+            && self.moe_down_partial_finalize_k.0 != 0;
+        if !base_finalize_ok {
+            return None;
         }
+        let eligible = |split: u32, vec: u32, gu: KernelHandle, dn: KernelHandle| {
+            // The vector load/store serves whole VEC groups only, and each
+            // block must cover a whole number of scale groups. Routed MXFP4 is
+            // per-32, NVFP4 per-16, so `32 * split` covers both.
+            let widths_ok = inter.is_multiple_of(ops::t_block() * vec)
+                && h.is_multiple_of(ops::t_block() * vec);
+            let depths_ok = h.is_multiple_of(32 * split) && inter.is_multiple_of(32 * split);
+            let need = ops::moe_splitk_partial_bytes(split, inter, h, top_k);
+            let space_ok = ctx.buffers.moe_splitk_partials_bytes() >= need;
+            (widths_ok && depths_ok && space_ok && gu.0 != 0 && dn.0 != 0).then_some(
+                UnifiedTSplitCfg {
+                    split,
+                    vec,
+                    gate_up: gu,
+                    silu_down: dn,
+                },
+            )
+        };
+        let wide = *MOE_GEMV_V2_ENABLED
+            .get_or_init(|| std::env::var("ATLAS_MOE_GEMV_V2").as_deref() == Ok("1"));
+        if wide
+            && let (Some(gu), Some(dn)) = (
+                self.e8m0_or_opt(
+                    self.moe_expert_gate_up_shared_t_splitk8_k,
+                    self.moe_expert_gate_up_shared_t_e8m0_splitk8_k,
+                ),
+                self.e8m0_or_opt(
+                    self.moe_expert_silu_down_shared_t_splitk8_k,
+                    self.moe_expert_silu_down_shared_t_e8m0_splitk8_k,
+                ),
+            )
+            && let Some(cfg) = eligible(T_SPLIT_WIDE, T_SPLIT_VEC_WIDE, gu, dn)
+        {
+            return Some(cfg);
+        }
+        let gu = self.e8m0_or_opt(
+            self.moe_expert_gate_up_shared_t_splitk_k,
+            self.moe_expert_gate_up_shared_t_e8m0_splitk_k,
+        )?;
+        let dn = self.e8m0_or_opt(
+            self.moe_expert_silu_down_shared_t_splitk_k,
+            self.moe_expert_silu_down_shared_t_e8m0_splitk_k,
+        )?;
+        eligible(T_SPLIT, ops::T_SPLIT_VEC, gu, dn)
     }
 
     /// Split factor for a `num_tokens`-row dedup'd `_t` decode, or `None` when
@@ -308,17 +351,15 @@ impl MoeLayer {
                 "decode fused _e8m0 kernel assumes an NVFP4 shared expert",
             );
         }
-        if let Some(split) = self.unified_t_split_k(ctx, h, inter, top_k) {
+        if let Some(cfg) = self.unified_t_split_k(ctx, h, inter, top_k) {
+            let split = cfg.split;
             let partials = ctx.buffers.moe_splitk_partials();
             let down_partials = partials.offset(ops::moe_splitk_down_offset(split, inter, top_k));
             ops::moe_expert_gate_up_shared_t_splitk(
                 ctx.gpu,
-                self.e8m0_or(
-                    self.moe_expert_gate_up_shared_t_splitk_k,
-                    self.moe_expert_gate_up_shared_t_e8m0_splitk_k,
-                    "decode gate_up_shared_t split-K (unified_t)",
-                ),
+                cfg.gate_up,
                 self.moe_gate_up_partial_finalize_k,
+                cfg.vec,
                 expert_input,
                 gate_t.packed_ptrs,
                 gate_t.scale_ptrs,
@@ -342,12 +383,9 @@ impl MoeLayer {
             )?;
             ops::moe_expert_silu_down_shared_t_splitk(
                 ctx.gpu,
-                self.e8m0_or(
-                    self.moe_expert_silu_down_shared_t_splitk_k,
-                    self.moe_expert_silu_down_shared_t_e8m0_splitk_k,
-                    "decode silu_down_shared_t split-K (unified_t)",
-                ),
+                cfg.silu_down,
                 self.moe_down_partial_finalize_k,
+                cfg.vec,
                 expert_gate_out,
                 expert_up_out,
                 down_t.packed_ptrs,

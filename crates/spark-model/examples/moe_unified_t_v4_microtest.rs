@@ -17,6 +17,14 @@
 //! accumulation order is unchanged, so `_v4` must be BIT-IDENTICAL — that is
 //! the gate here; the timing legs are only meaningful if it holds.
 //!
+//! The s8 legs validate the `ATLAS_MOE_GEMV_V2` tier: `_v4s8` widens the
+//! weight stream to 128-byte warp requests at exactly the `_v2s4` CTA count
+//! (grid.x halves, grid.z doubles), plus a merged 32-bit activation read
+//! (WIDE_ACT). Gates: `v4s8` must be BIT-IDENTICAL to the narrow-load `_v2s8`
+//! witness (same split points, same FMA order — only data movement differs),
+//! and both s8 legs must hold the split-reassociation RMS bound vs scalar.
+//! Perf: compare `chain v4s8` GB/s against `chain v2s4` (the incumbent).
+//!
 //! Usage:
 //!   cargo run --release -p spark-model --example moe_unified_t_v4_microtest \
 //!       -- [block] [pool] [seed-hex] [top_k]
@@ -261,8 +269,8 @@ fn main() -> Result<()> {
 
     // Split-K scratch, sized for the largest split under test. gate_up needs
     // [2, split, slots, INTER] f32, down needs [split, slots, HIDDEN] f32 —
-    // ~0.5 MB together at split=4, against 94 MB/layer of weight traffic.
-    let max_split = 4usize;
+    // ~1 MB together at split=8, against 94 MB/layer of weight traffic.
+    let max_split = 8usize;
     let slots = top_k + 1;
     let partial_gu = gpu.alloc(2 * max_split * slots * INTER * 4)?;
     let partial_dn = gpu.alloc(max_split * slots * HIDDEN * 4)?;
@@ -376,7 +384,22 @@ fn main() -> Result<()> {
     // (vec, split). split>1 sums SPLIT partials instead of one straight sweep,
     // so it is deterministic but not bit-equal to the scalar order; those legs
     // are held to a bf16-ULP bound instead.
-    const CFGS: [(u32, u32); 7] = [(1, 1), (2, 1), (4, 1), (2, 2), (2, 4), (4, 2), (4, 4)];
+    //
+    // The s8 pair backs ATLAS_MOE_GEMV_V2: v4s8 (128-byte warp requests +
+    // WIDE_ACT merged activation reads) must be BIT-IDENTICAL to v2s8 (same
+    // split points, same per-output FMA order, narrow loads) — that pairwise
+    // gate below is the Tier-1 proof that only data movement changed.
+    const CFGS: [(u32, u32); 9] = [
+        (1, 1),
+        (2, 1),
+        (4, 1),
+        (2, 2),
+        (2, 4),
+        (4, 2),
+        (4, 4),
+        (2, 8),
+        (4, 8),
+    ];
     let suffix_of = |v: u32, s: u32| match (v, s) {
         (1, 1) => String::new(),
         (v, 1) => format!("_v{v}"),
@@ -488,6 +511,32 @@ fn main() -> Result<()> {
                 bf16_to_f32(b[at]),
             );
             if !ok {
+                fail = true;
+            }
+        }
+    }
+
+    // ── v4s8 vs v2s8 bit-identity (the ATLAS_MOE_GEMV_V2 Tier-1 gate) ──
+    // Same SPLIT → same reduction split points; same per-output FMA order;
+    // WIDE_ACT reads the same bytes with one instruction. Any mismatch means
+    // the wide loads changed math, which is a hard bug.
+    {
+        let i28 = CFGS.iter().position(|c| *c == (2, 8)).unwrap();
+        let i48 = CFGS.iter().position(|c| *c == (4, 8)).unwrap();
+        for (i, name) in names.iter().enumerate() {
+            let (a, b) = (&captured[i28][i], &captured[i48][i]);
+            let bad = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+            if bad == 0 {
+                println!("  v4s8-vs-v2s8 {name}: BIT-EXACT ({} u16s)", a.len());
+            } else {
+                let first = a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap();
+                println!(
+                    "  v4s8-vs-v2s8 {name}: {bad}/{} MISMATCHED (first at {first}: \
+                     {:#06x} vs {:#06x})",
+                    a.len(),
+                    a[first],
+                    b[first]
+                );
                 fail = true;
             }
         }

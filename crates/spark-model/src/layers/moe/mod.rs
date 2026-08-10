@@ -301,6 +301,18 @@ pub struct MoeLayer {
     moe_expert_silu_down_shared_t_splitk_k: KernelHandle,
     moe_expert_gate_up_shared_t_e8m0_splitk_k: KernelHandle,
     moe_expert_silu_down_shared_t_e8m0_splitk_k: KernelHandle,
+    // ATLAS_MOE_GEMV_V2 wide-load tier: `_v4s8` — 128-byte warp requests on
+    // the weight stream (VEC=4 uchar4 loads) at exactly the v2s4 CTA count
+    // (SPLIT=8 puts back the blocks VEC=4 gives up), plus the merged 32-bit
+    // activation read (WIDE_ACT). Same fixed-order finalize; SPLIT=8 splits
+    // each dot product at different points than SPLIT=4, so this tier is
+    // reassociation-equivalent (not bit-equal) to v2s4 — v4s8 IS bit-equal to
+    // the v2s8 witness entry, which the microtest gates on. KernelHandle(0)
+    // where not compiled; the dispatch falls back to v2s4.
+    moe_expert_gate_up_shared_t_splitk8_k: KernelHandle,
+    moe_expert_silu_down_shared_t_splitk8_k: KernelHandle,
+    moe_expert_gate_up_shared_t_e8m0_splitk8_k: KernelHandle,
+    moe_expert_silu_down_shared_t_e8m0_splitk8_k: KernelHandle,
     moe_gate_up_partial_finalize_k: KernelHandle,
     moe_down_partial_finalize_k: KernelHandle,
     // Multi-row split-K decode (`_m`): the same v2s4 body, but each block
