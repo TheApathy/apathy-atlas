@@ -186,6 +186,60 @@ impl Qwen3AttentionLayer {
         let scale_group_bytes =
             ((o_lora / FP8_BLOCK) * (group_in / FP8_BLOCK)) as usize * size_of::<f32>();
 
+        // ── In-place arm: the pipelined GEMMs now take A/C row strides, so a
+        // group reads its column slice of `attn_out` and writes its slice of
+        // `o_latent` directly. That deletes 8 gather + 8 scatter
+        // copy_d2d_2d_async per layer (~316 MB/layer of pure BF16 copy traffic
+        // at N=2410) and 16 launches. Same GEMM, same math, same tiling —
+        // lda/ldc only change WHERE the operands are read/written.
+        // ATLAS_V4_WOA_INPLACE=0 restores the gather/scatter path.
+        let inplace = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var("ATLAS_V4_WOA_INPLACE").as_deref() != Ok("0")
+            })
+        } && ((fp8.is_some() && self.w8a16_gemm_pipelined_ld_k.0 != 0)
+            || (bf16 && self.dense_gemm_pipelined_ld_k.0 != 0));
+        if inplace {
+            for group in 0..o_groups {
+                let a_in = attn_out.offset((group * group_in) as usize * BF16_BYTES);
+                let c_out = o_latent.offset((group * o_lora) as usize * BF16_BYTES);
+                if let Some(w) = fp8 {
+                    ops::w8a16_gemm_pipelined_ld(
+                        ctx.gpu,
+                        self.w8a16_gemm_pipelined_ld_k,
+                        a_in,
+                        w.weight.offset(group as usize * weight_group_bytes),
+                        w.row_scale.offset(group as usize * scale_group_bytes),
+                        c_out,
+                        n,
+                        o_lora,
+                        group_in,
+                        input_width,
+                        latent_dim,
+                        stream,
+                    )?;
+                } else {
+                    ops::dense_gemm_bf16_pipelined_ld(
+                        ctx.gpu,
+                        self.dense_gemm_pipelined_ld_k,
+                        a_in,
+                        mla.wo_a
+                            .weight
+                            .offset(group as usize * weight_group_bytes * BF16_BYTES),
+                        c_out,
+                        n,
+                        o_lora,
+                        group_in,
+                        input_width,
+                        latent_dim,
+                        stream,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
         for group in 0..o_groups {
             ctx.gpu.copy_d2d_2d_async(
                 attn_out.offset((group * group_in) as usize * BF16_BYTES),

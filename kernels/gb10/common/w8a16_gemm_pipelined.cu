@@ -171,14 +171,24 @@ __device__ __forceinline__ void pm_mma_kstep(
 
 /// W8A16 pipelined GEMM: B[N,K] row-major FP8 E4M3 with 2D block scales.
 /// 128×32 tile (M×N), 8 warps, PM_STAGES-deep cp.async prefetch pipeline.
-extern "C" __global__ void w8a16_gemm_pipelined(
-    const __nv_bfloat16* __restrict__ A,            // [M, K] BF16 activations
-    const unsigned char* __restrict__ B,             // [N, K] FP8 E4M3
-    const float* __restrict__ block_scale,           // [N/128, K/128] FP32
-    __nv_bfloat16* __restrict__ C,                   // [M, N] BF16 output
+// Shared body. `lda`/`ldc` are the A and C ROW STRIDES in elements: with
+// lda > K the kernel reads a K-wide column slice of a wider activation matrix,
+// and with ldc > N it writes an N-wide column slice of a wider output. That is
+// exactly the DeepSeek-V4 block-diagonal wo_a shape (group g reads
+// attn_out cols [g*group_in, ...) of a [M, 32768] matrix and writes o_latent
+// cols [g*o_lora, ...) of a [M, 8192] one), so the 8 gather + 8 scatter
+// copy_d2d_2d per layer disappear. lda == K && ldc == N reproduces the
+// original kernel exactly.
+__device__ __forceinline__ void w8a16_gemm_pipelined_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
 ) {
     const unsigned int cta_m = blockIdx.y * PM_M_TILE;
     const unsigned int cta_n = blockIdx.x * PM_N_TILE;
@@ -255,12 +265,12 @@ extern "C" __global__ void w8a16_gemm_pipelined(
             unsigned int gc = k_base + col;
             __nv_bfloat16* dst = &smem_A[stage][row][col];
             if (gr < M && gc + 8 <= K) {
-                cp_async_cg_16(dst, &A[(unsigned long long)gr * K + gc]);
+                cp_async_cg_16(dst, &A[(unsigned long long)gr * lda + gc]);
             } else {
                 #pragma unroll
                 for (unsigned int e = 0; e < 8; e++) {
                     unsigned int gcol = gc + e;
-                    dst[e] = (gr < M && gcol < K) ? A[(unsigned long long)gr * K + gcol]
+                    dst[e] = (gr < M && gcol < K) ? A[(unsigned long long)gr * lda + gcol]
                                                   : __float2bfloat16(0.0f);
                 }
             }
@@ -391,9 +401,38 @@ extern "C" __global__ void w8a16_gemm_pipelined(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
-        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(outer_acc[n_tile][0]);
-        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(outer_acc[n_tile][1]);
-        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(outer_acc[n_tile][2]);
-        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(outer_acc[n_tile][3]);
+        if (row0 < M && col0 < N) C[(unsigned long long)row0 * ldc + col0] = __float2bfloat16(outer_acc[n_tile][0]);
+        if (row0 < M && col1 < N) C[(unsigned long long)row0 * ldc + col1] = __float2bfloat16(outer_acc[n_tile][1]);
+        if (row1 < M && col0 < N) C[(unsigned long long)row1 * ldc + col0] = __float2bfloat16(outer_acc[n_tile][2]);
+        if (row1 < M && col1 < N) C[(unsigned long long)row1 * ldc + col1] = __float2bfloat16(outer_acc[n_tile][3]);
     }
+}
+
+// Original contract: packed A [M,K] and C [M,N].
+extern "C" __global__ void w8a16_gemm_pipelined(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    w8a16_gemm_pipelined_impl(A, B, block_scale, C, M, N, K, K, N);
+}
+
+// Strided A/C sibling — the V4 block-diagonal wo_a runs its 8 groups against
+// this with lda = nq*head_dim and ldc = o_groups*o_lora, in place.
+extern "C" __global__ void w8a16_gemm_pipelined_ld(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B,
+    const float* __restrict__ block_scale,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    w8a16_gemm_pipelined_impl(A, B, block_scale, C, M, N, K, lda, ldc);
 }

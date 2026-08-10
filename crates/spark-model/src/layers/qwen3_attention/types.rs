@@ -227,6 +227,10 @@ pub struct Qwen3AttentionLayer {
     /// the V4 projection dispatch falls back to `w8a16_gemm_pipelined`.
     pub(super) w8a8_gemm_pipelined_k: KernelHandle,
     pub(super) quantize_a_fp8_rows_k: KernelHandle,
+    /// Strided-A/C siblings (`..._ld`) — let the block-diagonal wo_a run its
+    /// groups in place, deleting 8 gather + 8 scatter copies per layer.
+    pub(super) w8a16_gemm_pipelined_ld_k: KernelHandle,
+    pub(super) dense_gemm_pipelined_ld_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.

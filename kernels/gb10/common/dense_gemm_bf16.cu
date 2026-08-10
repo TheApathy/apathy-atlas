@@ -328,13 +328,18 @@ __device__ __forceinline__ void dm_mma_kstep(
 
 /// Tensor-core pipelined BF16 dense GEMM: C[M,N] = A[M,K] · B[N,K]^T.
 /// 128×32 tile (M×N), 8 warps, DM_STAGES-deep cp.async prefetch pipeline.
-extern "C" __global__ void dense_gemm_bf16_pipelined(
-    const __nv_bfloat16* __restrict__ A,   // [M, K] BF16 activations
-    const __nv_bfloat16* __restrict__ B,   // [N, K] BF16 weights (read transposed)
-    __nv_bfloat16* __restrict__ C,          // [M, N] BF16 output
+// Shared body; `lda`/`ldc` are A and C ROW STRIDES in elements (see the
+// w8a16_gemm_pipelined_ld note — same purpose, BF16 weights). lda == K &&
+// ldc == N reproduces the original kernel exactly.
+__device__ __forceinline__ void dense_gemm_bf16_pipelined_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
     unsigned int M,
     unsigned int N,
-    unsigned int K
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
 ) {
     const unsigned int cta_m = blockIdx.y * DM_M_TILE;
     const unsigned int cta_n = blockIdx.x * DM_N_TILE;
@@ -393,12 +398,12 @@ extern "C" __global__ void dense_gemm_bf16_pipelined(
             unsigned int gc = k_base + col;
             __nv_bfloat16* dst = &smem_A[stage][row][col];
             if (gr < M && gc + 8 <= K && k_vec_aligned) {
-                dm_cp_async_cg_16(dst, &A[(unsigned long long)gr * K + gc]);
+                dm_cp_async_cg_16(dst, &A[(unsigned long long)gr * lda + gc]);
             } else {
                 #pragma unroll
                 for (unsigned int e = 0; e < 8; e++) {
                     unsigned int gcol = gc + e;
-                    dst[e] = (gr < M && gcol < K) ? A[(unsigned long long)gr * K + gcol]
+                    dst[e] = (gr < M && gcol < K) ? A[(unsigned long long)gr * lda + gcol]
                                                   : __float2bfloat16(0.0f);
                 }
             }
@@ -461,10 +466,10 @@ extern "C" __global__ void dense_gemm_bf16_pipelined(
         unsigned int row0 = cta_m + warp_m_offset + group_id;
         unsigned int row1 = row0 + 8;
 
-        if (row0 < M && col0 < N) C[row0 * N + col0] = __float2bfloat16(acc[n_tile][0]);
-        if (row0 < M && col1 < N) C[row0 * N + col1] = __float2bfloat16(acc[n_tile][1]);
-        if (row1 < M && col0 < N) C[row1 * N + col0] = __float2bfloat16(acc[n_tile][2]);
-        if (row1 < M && col1 < N) C[row1 * N + col1] = __float2bfloat16(acc[n_tile][3]);
+        if (row0 < M && col0 < N) C[(unsigned long long)row0 * ldc + col0] = __float2bfloat16(acc[n_tile][0]);
+        if (row0 < M && col1 < N) C[(unsigned long long)row0 * ldc + col1] = __float2bfloat16(acc[n_tile][1]);
+        if (row1 < M && col0 < N) C[(unsigned long long)row1 * ldc + col0] = __float2bfloat16(acc[n_tile][2]);
+        if (row1 < M && col1 < N) C[(unsigned long long)row1 * ldc + col1] = __float2bfloat16(acc[n_tile][3]);
     }
 }
 
@@ -511,4 +516,30 @@ extern "C" __global__ void fused_silu_mul(
     unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(r0));
     unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(r1));
     out32[col_pair] = lo | (hi << 16);
+}
+
+// Original contract: packed A [M,K] and C [M,N].
+extern "C" __global__ void dense_gemm_bf16_pipelined(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    dense_gemm_bf16_pipelined_impl(A, B, C, M, N, K, K, N);
+}
+
+// Strided A/C sibling for the V4 block-diagonal wo_a (BF16-weight arm).
+extern "C" __global__ void dense_gemm_bf16_pipelined_ld(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    unsigned int lda,
+    unsigned int ldc
+) {
+    dense_gemm_bf16_pipelined_impl(A, B, C, M, N, K, lda, ldc);
 }

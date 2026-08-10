@@ -354,6 +354,71 @@ pub fn w8a16_gemm(
         .launch(stream)
 }
 
+/// Strided-A/C sibling of `w8a16_gemm_pipelined` (`..._ld`): `lda`/`ldc` are
+/// row strides in ELEMENTS, so a K-wide column slice of a wider activation
+/// matrix feeds the GEMM and an N-wide slice of a wider output receives it.
+/// Lets the V4 block-diagonal wo_a run its groups IN PLACE — no gather/scatter.
+/// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w8a16_gemm_pipelined_ld(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .launch(stream)
+}
+
+/// BF16-weight sibling of the above (`dense_gemm_bf16_pipelined_ld`).
+/// Grid: (ceil(N/128), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_bf16_pipelined_ld(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 128), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .launch(stream)
+}
+
 /// W8A16 GEMM pipelined (M>1): bit-identical (cosine=1.0) faster rewrite of
 /// `w8a16_gemm` — same args, same numerics, ~4.6× faster on GB10/sm_121.
 ///
