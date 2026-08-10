@@ -95,7 +95,14 @@ impl MoeLayer {
                 Some("2") => SharedPrefillArm::K64V2,
                 Some("3") => SharedPrefillArm::M128,
                 Some("4") => SharedPrefillArm::K32V2,
-                _ => SharedPrefillArm::K32,
+                // K32V2 is the DEFAULT: bit-identical to K32 (parity microtest
+                // reports bitdiff_vs_t=0 on every shape) and it removes the
+                // 8-way smem bank conflict on the dequant store — 496 -> 192
+                // shared-memory transactions per warp per K=64 — at 21632 B
+                // smem so occupancy stays 4 CTAs/SM (the K64 arms drop to 2).
+                // `ATLAS_MOE_SHARED_K64=0` restores the original K32 kernel.
+                Some("0") => SharedPrefillArm::K32,
+                _ => SharedPrefillArm::K32V2,
             }
         })
     }
