@@ -92,3 +92,16 @@ saturated, needs a new idea against the 229 ceiling) + propose lm_head
 2.7 → ~1 ms (batch the FP8 tile) → step ~98 ms → **30+ at accept 3.0**.
 Prefill next: TC round 2 (KT=32/cp.async/occupancy), wq_b w8a16_gemm_pipelined
 (~4% of peak), the 13 unconditional per-layer synchronize() calls.
+
+## m6 MoE dedup 183→210 — attempt log (2026-08-10)
+
+- **Cross-group double-buffer prefetch: NO-GO measured.** Partitioned leg
+  regressed 1.777 → 1.983 ms (+12%): the 2× pbyte/scale buffers cost more in
+  register pressure at MROW=6 than the latency hiding buys — consistent with
+  the kernel's own occupancy notes. Reverted.
+- bf16x2 activation loads: kept (bit-identical, gate 1 PASS, 1.777 → 1.761 ms).
+- Remaining untried ideas, oracle-iterable: __launch_bounds__/maxrregcount
+  sweep; VEC=4 width; gate_up activations staged in smem (down already does);
+  cp.async.bulk/TMA if SM121 exposes it. The kernel sits near its
+  occupancy-vs-latency optimum with the intra-group hoist — the −10 ms verify
+  from 183→210 GB/s remains open and is the gating item for 28+ decode.

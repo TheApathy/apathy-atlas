@@ -1163,8 +1163,11 @@ __device__ __forceinline__ void gate_up_shared_t_m_impl(
                 } \
                 _Pragma("unroll") \
                 for (int m = 0; m < (ROWS_); ++m) { \
-                    float a_lo = __bfloat162float(A_row[m][k_half * 2]); \
-                    float a_hi = __bfloat162float(A_row[m][k_half * 2 + 1]); \
+                    /* one 4-byte bf16x2 load instead of two scalar bf16 loads */ \
+                    const __nv_bfloat162 a2m = \
+                        *(const __nv_bfloat162*)&A_row[m][k_half * 2]; \
+                    float a_lo = __bfloat162float(a2m.x); \
+                    float a_hi = __bfloat162float(a2m.y); \
                     _Pragma("unroll") \
                     for (int v = 0; v < VEC; ++v) { \
                         acc[m][v] += a_lo * w_lo[v] + a_hi * w_hi[v]; \
