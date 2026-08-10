@@ -526,3 +526,127 @@ extern "C" __global__ void exl3_dequant_dump(const unsigned short* __restrict__ 
     wc[8] = __low2half(d67);   // s=6
     wc[9] = __high2half(d67);  // s=7
 }
+
+// ---------------------------------------------------------------------------
+// P1 prefill kernels (plan §3 / exl3-gemv.md §6): scratch-dequant + M-row
+// activation rotations. The trellis stores W in the ROTATED space; instead of
+// baking rotations into the scratch weights, the raw decoded W feeds the
+// existing BF16 grouped GEMM and the rotations ride on the ACTIVATIONS —
+// exactly the composition the M=1 GEMV applies (verified f64 oracle,
+// exl3_gemv_microtest.rs):
+//
+//   x'  = H128( diag(suh_e) · x ) / sqrt(128)     (pre,  along K, per row)
+//   y0  = W_decoded · x'                          (BF16 grouped GEMM)
+//   y   = diag(svh_e) · H128( y0 ) / sqrt(128)    (post, along N, per row)
+//
+// suh/svh are PER EXPERT, so a token routed to k experts needs k different
+// pre-rotations: the pre kernel writes the EXPANDED sorted-layout activation
+// (one row per (token, slot) pair, gathered via sorted_token_ids), and the
+// grouped GEMM then runs with sorted_token_ids = NULL (identity gather).
+// Both kernels reuse exl3_had128 — one warp per aligned 128-chunk, 4 fp32
+// per lane, the SAME op order as the m1 GEMV's output pass.
+// ---------------------------------------------------------------------------
+
+#define EXL3_HROW_WARPS 8  // 128-chunks per 256-thread block
+
+// x' rows for the grouped GEMM: Aout[row] = H128(suh_e ⊙ A[token]) / sqrt(128).
+//   row    = blockIdx.y (expanded sorted-layout row)
+//   token  = sorted_token_ids[row] (NULL → identity: token = row)
+//   e      = sorted_expert_ids[row]
+// In-place legal iff sorted_token_ids == NULL (each warp reads only the
+// 128-chunk it overwrites, all in registers). Grid: (rows, ceil(K/1024)) —
+// rows on grid.x (2^31 cap; grid.y's 65535 would clip a >10.9K-token chunk).
+extern "C" __global__ void exl3_h128_pre_rows(
+    const __nv_bfloat16* __restrict__ A,             // [num_tokens, K] token-major
+    const int* __restrict__ sorted_token_ids,        // [rows] or NULL
+    const int* __restrict__ sorted_expert_ids,       // [rows]
+    const unsigned long long* __restrict__ suh_tab,  // [num_experts] → F16 [K]
+    __nv_bfloat16* __restrict__ Aout,                // [rows, K] sorted layout
+    unsigned int K) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int chunk = blockIdx.y * EXL3_HROW_WARPS + warp;
+    if (chunk * 128 >= K) return;
+    const int e = sorted_expert_ids[row];
+    const __half* suh = (const __half*)suh_tab[e] + chunk * 128;
+    const long long tok = sorted_token_ids ? (long long)sorted_token_ids[row] : (long long)row;
+    const __nv_bfloat16* a = A + (unsigned long long)tok * K + chunk * 128 + 4 * lane;
+    __nv_bfloat16* o = Aout + (unsigned long long)row * K + chunk * 128 + 4 * lane;
+    float h0 = __bfloat162float(a[0]) * __half2float(suh[4 * lane + 0]);
+    float h1 = __bfloat162float(a[1]) * __half2float(suh[4 * lane + 1]);
+    float h2 = __bfloat162float(a[2]) * __half2float(suh[4 * lane + 2]);
+    float h3 = __bfloat162float(a[3]) * __half2float(suh[4 * lane + 3]);
+    exl3_had128(h0, h1, h2, h3, lane);
+    o[0] = __float2bfloat16(h0 * EXL3_RSQRT128);
+    o[1] = __float2bfloat16(h1 * EXL3_RSQRT128);
+    o[2] = __float2bfloat16(h2 * EXL3_RSQRT128);
+    o[3] = __float2bfloat16(h3 * EXL3_RSQRT128);
+}
+
+// Output pass, IN PLACE over the sorted-layout GEMM result:
+//   Y[row] = svh_e ⊙ H128(Y[row]) / sqrt(128),  e = sorted_expert_ids[row].
+// Grid: (rows, ceil(N/1024)). In-place safe (warp-private 128-chunk).
+extern "C" __global__ void exl3_h128_post_rows(
+    __nv_bfloat16* __restrict__ Y,                   // [rows, N] sorted layout
+    const int* __restrict__ sorted_expert_ids,       // [rows]
+    const unsigned long long* __restrict__ svh_tab,  // [num_experts] → F16 [N]
+    unsigned int N) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int chunk = blockIdx.y * EXL3_HROW_WARPS + warp;
+    if (chunk * 128 >= N) return;
+    const int e = sorted_expert_ids[row];
+    const __half* svh = (const __half*)svh_tab[e] + chunk * 128;
+    __nv_bfloat16* y = Y + (unsigned long long)row * N + chunk * 128 + 4 * lane;
+    float h0 = __bfloat162float(y[0]);
+    float h1 = __bfloat162float(y[1]);
+    float h2 = __bfloat162float(y[2]);
+    float h3 = __bfloat162float(y[3]);
+    exl3_had128(h0, h1, h2, h3, lane);
+    y[0] = __float2bfloat16(h0 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 0]));
+    y[1] = __float2bfloat16(h1 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 1]));
+    y[2] = __float2bfloat16(h2 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 2]));
+    y[3] = __float2bfloat16(h3 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 3]));
+}
+
+// Chunked scratch dequant for the grouped BF16 prefill GEMM: decode experts
+// [e0, e0+count) into slot-major BF16 scratch (slot z = expert e0+z at
+// Wout + z·N·K, layout [N, K] — the exact layout moe_bf16_grouped_gemm's
+// pointer table expects). Same per-tile decode as exl3_dequant_dump, with a
+// final fp16 → bf16 RN convert. NO rotations applied (they ride on the
+// activations, above).
+//
+//   grid = (N/16, K/16, count), block = (32, 1, 1) — one warp per tile.
+extern "C" __global__ void exl3_dequant_chunk_bf16(
+    const unsigned long long* __restrict__ trellis_tab,  // [num_experts]
+    unsigned int e0, unsigned int count,
+    __nv_bfloat16* __restrict__ Wout,  // [count, N, K] slot-major scratch
+    unsigned int N, unsigned int K) {
+    const unsigned int slot = blockIdx.z;
+    if (slot >= count) return;
+    const int nb = blockIdx.x;
+    const int kb = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const unsigned short* trellis = (const unsigned short*)trellis_tab[e0 + slot];
+    const unsigned int* tile =
+        (const unsigned int*)(trellis + ((size_t)kb * (N >> 4) + nb) * 48);
+    Exl3LaneGeom g = exl3_lane_geom(lane);
+    __half2 d01, d23, d45, d67;
+    exl3_dq8(tile, g, d01, d23, d45, d67);
+    __nv_bfloat16* W = Wout + (unsigned long long)slot * N * K;
+    size_t krow = (size_t)kb * 16 + 2 * (lane & 3);
+    size_t na = (size_t)nb * 16 + (lane >> 2);
+    size_t nc = na + 8;
+    __nv_bfloat16* wa = W + na * K + krow;
+    __nv_bfloat16* wc = W + nc * K + krow;
+    wa[0] = __float2bfloat16(__half2float(__low2half(d01)));   // s=0: k+0
+    wa[1] = __float2bfloat16(__half2float(__high2half(d01)));  // s=1: k+1
+    wa[8] = __float2bfloat16(__half2float(__low2half(d23)));   // s=2: k+8
+    wa[9] = __float2bfloat16(__half2float(__high2half(d23)));  // s=3: k+9
+    wc[0] = __float2bfloat16(__half2float(__low2half(d45)));   // s=4
+    wc[1] = __float2bfloat16(__half2float(__high2half(d45)));  // s=5
+    wc[8] = __float2bfloat16(__half2float(__low2half(d67)));   // s=6
+    wc[9] = __float2bfloat16(__half2float(__high2half(d67)));  // s=7
+}

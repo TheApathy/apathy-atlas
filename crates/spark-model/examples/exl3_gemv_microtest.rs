@@ -19,6 +19,19 @@
 //!   3. COLD-ROTATION GB/s at the expert decode shapes, weights rotated
 //!      through a >=512 MB ring so every iteration streams from DRAM.
 //!
+//! P1 prefill-path gates (M=64 rows over 4 experts, chunk=2 — exercises the
+//! sub-range grouped-GEMM launches exactly as forward_prefill_exl3.rs):
+//!   4. `exl3_h128_pre_rows` BIT-EXACT vs a CPU f32 replica of the GPU
+//!      Hadamard op order (4-point in-register stage + 5 fma xor-stages),
+//!      including the sorted_token_ids gather and per-expert suh.
+//!   5. `exl3_dequant_chunk_bf16` BIT-EXACT vs CPU decode + fp16→bf16 RN.
+//!   6. `exl3_h128_post_rows` BIT-EXACT via download-before/after: the CPU
+//!      replica applied to the pre-post GEMM output must byte-match the
+//!      kernel's in-place result.
+//!   7. FULL PREFILL PATH (pre → chunked dequant + sub-range
+//!      `moe_bf16_grouped_gemm` → post) COSINE >= 0.999 vs the f64 full-
+//!      pipeline reference at M=64 (per-row expert routing, gathered A).
+//!
 //!   cargo run -p spark-model --release --example exl3_gemv_microtest \
 //!       --features cuda,gpu-examples
 //!
@@ -188,6 +201,35 @@ fn decode_tile(words: &[u16], lut: &[u16; 65536], out: &mut [[u16; 16]; 16]) {
         out[k][n] = lut[w16 as usize];
     }
 }
+
+/// CPU f32 replica of the GPU `exl3_had128` op ORDER over one 128-chunk
+/// (element i owned by lane i/4, slot i%4): the in-register 4-point stage,
+/// then 5 xor shuffle-stages computed as `fma(sgn, h_old, p_old)`. Bit-exact
+/// vs the kernel by construction (`f32::mul_add` == `__fmaf_rn`; sgn = ±1 so
+/// the product is exact; both round once per op).
+fn had128_f32_gpu(x: &mut [f32; 128]) {
+    for l in 0..32 {
+        let (a, b, c, d) = (x[4 * l], x[4 * l + 1], x[4 * l + 2], x[4 * l + 3]);
+        let (s0, d0, s1, d1) = (a + b, a - b, c + d, c - d);
+        x[4 * l] = s0 + s1;
+        x[4 * l + 1] = d0 + d1;
+        x[4 * l + 2] = s0 - s1;
+        x[4 * l + 3] = d0 - d1;
+    }
+    for i in [1usize, 2, 4, 8, 16] {
+        let old = *x;
+        for l in 0..32 {
+            let sgn: f32 = if l & i != 0 { -1.0 } else { 1.0 };
+            for r in 0..4 {
+                x[4 * l + r] = sgn.mul_add(old[4 * l + r], old[4 * (l ^ i) + r]);
+            }
+        }
+    }
+}
+
+/// GPU constant from exl3_gemv.cu (EXL3_RSQRT128) — must match bit-for-bit
+/// for the H128 bit-exact gates.
+const RSQRT128_F32: f32 = 0.088388347648;
 
 /// Blockwise-128 Sylvester Hadamard in f64: y[i] = sum_j (-1)^pc(i&j) x[j],
 /// per aligned 128-chunk, scaled 1/sqrt(128).
@@ -497,12 +539,292 @@ fn main() -> Result<()> {
         }
     }
 
+    all_ok &= prefill_gates(g, &lut)?;
+
     eprintln!(
-        "EXL3 GEMV GATE (bit-exact dequant + cos>={PASS_COS} + determinism): {}",
+        "EXL3 GEMV GATE (bit-exact dequant + cos>={PASS_COS} + determinism + P1 prefill): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {
         std::process::exit(1);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P1 prefill-path gates (4-7): H128 pre/post row kernels, chunked BF16
+// dequant, and the full scratch-dequant prefill pipeline vs the f64 oracle.
+// Mirrors forward_prefill_exl3.rs exactly: 4 experts, chunk = 2 (two
+// sub-range grouped-GEMM launches), sorted-layout expansion with a real
+// token gather.
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
+    let stream = 0u64;
+    let (ne, n, k) = (4usize, 2048usize, 4096usize);
+    let (tokens, rows, chunk) = (32usize, 64usize, 2usize);
+    let rows_per_expert = rows / ne; // 16
+    let mut ok = true;
+
+    let kh_pre = g.kernel("exl3_gemv", "exl3_h128_pre_rows")?;
+    let kh_post = g.kernel("exl3_gemv", "exl3_h128_post_rows")?;
+    let kh_dq = g.kernel("exl3_gemv", "exl3_dequant_chunk_bf16")?;
+    let kh_gemm = g.kernel("moe_bf16_grouped_gemm", "moe_bf16_grouped_gemm")?;
+
+    let mut r = Rng(0x91E7_2026_0810u64); // P1 prefill-gate seed
+    let tiles_k = k / 16;
+    let tiles_n = n / 16;
+    let trellis_words = tiles_k * tiles_n * 48;
+
+    // ---- synthetic experts + tokens + routing ----
+    let trellis_h: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..trellis_words).map(|_| r.u16()).collect())
+        .collect();
+    let suh_h: Vec<Vec<u16>> = (0..ne).map(|_| (0..k).map(|_| r.sign_f16()).collect()).collect();
+    let svh_h: Vec<Vec<u16>> = (0..ne).map(|_| (0..n).map(|_| r.sign_f16()).collect()).collect();
+    let a_h: Vec<u16> = (0..tokens * k)
+        .map(|_| bf16::from_f32((r.unit() - 0.5) * 0.5).to_bits())
+        .collect();
+    // Row r → token (r*7+3)%tokens (repeats = one token, several experts),
+    // expert r/16; offsets are the absolute sorted-layout prefix sums.
+    let sti: Vec<i32> = (0..rows).map(|rr| ((rr * 7 + 3) % tokens) as i32).collect();
+    let sei: Vec<i32> = (0..rows).map(|rr| (rr / rows_per_expert) as i32).collect();
+    let offs: Vec<i32> = (0..=ne).map(|e| (e * rows_per_expert) as i32).collect();
+
+    // ---- CPU: per-expert decoded W bits [N][K] ----
+    let mut w_bits: Vec<Vec<u16>> = Vec::with_capacity(ne);
+    for th in &trellis_h {
+        let mut wb = vec![0u16; n * k];
+        let mut tile = [[0u16; 16]; 16];
+        for kb in 0..tiles_k {
+            for nb in 0..tiles_n {
+                let base = (kb * tiles_n + nb) * 48;
+                decode_tile(&th[base..base + 48], lut, &mut tile);
+                for (kit, row) in tile.iter().enumerate() {
+                    for (nit, bits) in row.iter().enumerate() {
+                        wb[(nb * 16 + nit) * k + kb * 16 + kit] = *bits;
+                    }
+                }
+            }
+        }
+        w_bits.push(wb);
+    }
+
+    // ---- CPU f64 oracle: y_ref[row][n] through the full pipeline ----
+    let mut y_ref = vec![0.0f64; rows * n];
+    for rr in 0..rows {
+        let (tok, e) = (sti[rr] as usize, sei[rr] as usize);
+        let x: Vec<f64> = (0..k)
+            .map(|kk| {
+                bf16::from_bits(a_h[tok * k + kk]).to_f64() * f16_to_f64(suh_h[e][kk])
+            })
+            .collect();
+        let xp = had128(&x);
+        let mut y0 = vec![0.0f64; n];
+        for (nn, y) in y0.iter_mut().enumerate() {
+            let row = &w_bits[e][nn * k..(nn + 1) * k];
+            *y = row.iter().zip(&xp).map(|(&wb, &v)| f16_to_f64(wb) * v).sum();
+        }
+        for (nn, &v) in had128(&y0).iter().enumerate() {
+            y_ref[rr * n + nn] = v * f16_to_f64(svh_h[e][nn]);
+        }
+    }
+
+    // ---- upload ----
+    let to_b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let to_bi = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let d_trellis: Vec<DevicePtr> =
+        trellis_h.iter().map(|t| up(g, &to_b(t))).collect::<Result<_>>()?;
+    let d_suh: Vec<DevicePtr> = suh_h.iter().map(|t| up(g, &to_b(t))).collect::<Result<_>>()?;
+    let d_svh: Vec<DevicePtr> = svh_h.iter().map(|t| up(g, &to_b(t))).collect::<Result<_>>()?;
+    let tab = |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
+    let d_trellis_tab = up(g, &tab(&d_trellis))?;
+    let d_suh_tab = up(g, &tab(&d_suh))?;
+    let d_svh_tab = up(g, &tab(&d_svh))?;
+    let d_a = up(g, &to_b(&a_h))?;
+    let d_sti = up(g, &to_bi(&sti))?;
+    let d_sei = up(g, &to_bi(&sei))?;
+    let d_offs = up(g, &to_bi(&offs))?;
+    let d_arot = g.alloc(rows * k * 2)?;
+    let slot_bytes = n * k * 2;
+    let d_scratch = g.alloc(chunk * slot_bytes)?;
+    let slot_tab: Vec<u8> = (0..chunk)
+        .flat_map(|z| (d_scratch.0 + (z * slot_bytes) as u64).to_le_bytes())
+        .collect();
+    let d_slot_tab = up(g, &slot_tab)?;
+    let d_c = g.alloc(rows * n * 2)?;
+
+    // ---- GATE 4: exl3_h128_pre_rows bit-exact vs the f32 CPU replica ----
+    KernelLaunch::new(g, kh_pre)
+        .grid([rows as u32, (k as u32).div_ceil(1024), 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_a)
+        .arg_ptr(d_sti)
+        .arg_ptr(d_sei)
+        .arg_ptr(d_suh_tab)
+        .arg_ptr(d_arot)
+        .arg_u32(k as u32)
+        .launch(stream)?;
+    g.synchronize(stream)?;
+    let mut arot_gpu = vec![0u8; rows * k * 2];
+    g.copy_d2h(d_arot, &mut arot_gpu)?;
+    let mut arot_ref = vec![0u16; rows * k];
+    for rr in 0..rows {
+        let (tok, e) = (sti[rr] as usize, sei[rr] as usize);
+        for c in 0..k / 128 {
+            let mut buf = [0f32; 128];
+            for (j, b) in buf.iter_mut().enumerate() {
+                let kk = c * 128 + j;
+                *b = bf16::from_bits(a_h[tok * k + kk]).to_f32()
+                    * half::f16::from_bits(suh_h[e][kk]).to_f32();
+            }
+            had128_f32_gpu(&mut buf);
+            for (j, &v) in buf.iter().enumerate() {
+                arot_ref[rr * k + c * 128 + j] = bf16::from_f32(v * RSQRT128_F32).to_bits();
+            }
+        }
+    }
+    let prediff = arot_gpu
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .zip(&arot_ref)
+        .filter(|(a, b)| a != *b)
+        .count();
+    let g4 = prediff == 0;
+    ok &= g4;
+    eprintln!(
+        "P1 GATE4 h128_pre bit-exact: diff={prediff}/{} {}",
+        rows * k,
+        if g4 { "PASS" } else { "FAIL" }
+    );
+
+    // ---- GATES 5 + GEMM: chunked dequant (bit-exact) + sub-range GEMM ----
+    let mut dqdiff = 0usize;
+    for e0 in (0..ne).step_by(chunk) {
+        let cnt = chunk.min(ne - e0);
+        KernelLaunch::new(g, kh_dq)
+            .grid([tiles_n as u32, tiles_k as u32, cnt as u32])
+            .block([32, 1, 1])
+            .arg_ptr(d_trellis_tab)
+            .arg_u32(e0 as u32)
+            .arg_u32(cnt as u32)
+            .arg_ptr(d_scratch)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .launch(stream)?;
+        g.synchronize(stream)?;
+        let mut sc = vec![0u8; cnt * slot_bytes];
+        g.copy_d2h(d_scratch, &mut sc)?;
+        for z in 0..cnt {
+            let slot = &sc[z * slot_bytes..(z + 1) * slot_bytes];
+            dqdiff += slot
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .zip(&w_bits[e0 + z])
+                .filter(|(got, want)| {
+                    *got != bf16::from_f32(half::f16::from_bits(**want).to_f32()).to_bits()
+                })
+                .count();
+        }
+        // Sub-range grouped GEMM: offsets + e0, num_experts = cnt,
+        // sorted_token_ids = NULL (A already expanded + rotated).
+        let max_m_tiles = (rows_per_expert as u32).div_ceil(64).max(1);
+        KernelLaunch::new(g, kh_gemm)
+            .grid([(n as u32).div_ceil(64), max_m_tiles, cnt as u32])
+            .block([128, 1, 1])
+            .arg_ptr(d_arot)
+            .arg_ptr(d_slot_tab)
+            .arg_ptr(d_c)
+            .arg_ptr(d_offs.offset(e0 * 4))
+            .arg_ptr(DevicePtr(0))
+            .arg_u32(cnt as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .launch(stream)?;
+        g.synchronize(stream)?;
+    }
+    let g5 = dqdiff == 0;
+    ok &= g5;
+    eprintln!(
+        "P1 GATE5 dequant_chunk_bf16 bit-exact: diff={dqdiff}/{} {}",
+        ne * n * k,
+        if g5 { "PASS" } else { "FAIL" }
+    );
+
+    // ---- GATE 6: exl3_h128_post_rows bit-exact (download before/after) ----
+    let mut c_pre = vec![0u8; rows * n * 2];
+    g.copy_d2h(d_c, &mut c_pre)?;
+    KernelLaunch::new(g, kh_post)
+        .grid([rows as u32, (n as u32).div_ceil(1024), 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_c)
+        .arg_ptr(d_sei)
+        .arg_ptr(d_svh_tab)
+        .arg_u32(n as u32)
+        .launch(stream)?;
+    g.synchronize(stream)?;
+    let mut c_post = vec![0u8; rows * n * 2];
+    g.copy_d2h(d_c, &mut c_post)?;
+    let mut postdiff = 0usize;
+    for rr in 0..rows {
+        let e = sei[rr] as usize;
+        for c in 0..n / 128 {
+            let mut buf = [0f32; 128];
+            for (j, b) in buf.iter_mut().enumerate() {
+                let idx = (rr * n + c * 128 + j) * 2;
+                *b = bf16::from_bits(u16::from_le_bytes([c_pre[idx], c_pre[idx + 1]])).to_f32();
+            }
+            had128_f32_gpu(&mut buf);
+            for (j, &v) in buf.iter().enumerate() {
+                let nn = c * 128 + j;
+                let want = bf16::from_f32(
+                    v * RSQRT128_F32 * half::f16::from_bits(svh_h[e][nn]).to_f32(),
+                )
+                .to_bits();
+                let idx = (rr * n + nn) * 2;
+                let got = u16::from_le_bytes([c_post[idx], c_post[idx + 1]]);
+                if got != want {
+                    postdiff += 1;
+                }
+            }
+        }
+    }
+    let g6 = postdiff == 0;
+    ok &= g6;
+    eprintln!(
+        "P1 GATE6 h128_post bit-exact: diff={postdiff}/{} {}",
+        rows * n,
+        if g6 { "PASS" } else { "FAIL" }
+    );
+
+    // ---- GATE 7: full prefill path cosine vs the f64 oracle ----
+    let y_gpu: Vec<f64> = c_post
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f64())
+        .collect();
+    let cs = cos(&y_gpu, &y_ref);
+    let g7 = cs >= 0.999;
+    ok &= g7;
+    eprintln!(
+        "P1 GATE7 prefill path (pre+dequant+GEMM+post) M={rows}: cos={cs:.8} {}",
+        if g7 { "PASS" } else { "FAIL" }
+    );
+
+    for p in d_trellis.into_iter().chain(d_suh).chain(d_svh).chain([
+        d_trellis_tab,
+        d_suh_tab,
+        d_svh_tab,
+        d_a,
+        d_sti,
+        d_sei,
+        d_offs,
+        d_arot,
+        d_scratch,
+        d_slot_tab,
+        d_c,
+    ]) {
+        let _ = g.free(p);
+    }
+    Ok(ok)
 }

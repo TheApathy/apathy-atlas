@@ -62,6 +62,31 @@ pub(crate) struct Exl3MoeState {
     counters: DevicePtr,
     /// Split override from `ATLAS_EXL3_SPLIT` (0 = auto).
     split_override: u32,
+    /// P1 prefill state (scratch dequant + H128 activation passes).
+    pub(crate) prefill: Exl3PrefillState,
+}
+
+/// P1 prefill (M>1) state: fixed-size expert-chunk scratch ring for the
+/// dequant-to-BF16 path feeding `moe_bf16_grouped_gemm` (plan §3 "P1").
+///
+/// All three expert projections have the same element count
+/// (`inter×h == h×inter`), so ONE slot size and ONE static pointer table
+/// serve gate, up and down: slot `z` of every chunk lives at
+/// `scratch + z·slot_elems·2`, and the grouped GEMM is launched per chunk
+/// with `weight_ptrs = slot_tab`, `expert_offsets + e0`, `num_experts =
+/// chunk_len` (offsets are absolute rows, so sub-range launches read and
+/// write the correct global rows).
+pub(crate) struct Exl3PrefillState {
+    /// BF16 `[chunk, n·k]` slot-major dequant scratch.
+    pub(crate) scratch: DevicePtr,
+    /// `[chunk]` u64 device table → the scratch slots (static across chunks).
+    pub(crate) slot_tab: DevicePtr,
+    /// Experts dequanted per chunk (`ATLAS_EXL3_PREFILL_CHUNK`, default 8
+    /// → 8 × 16.8 MB = 134 MB scratch at the V4 expert shapes).
+    pub(crate) chunk: u32,
+    pub(crate) dequant_chunk_k: KernelHandle,
+    pub(crate) h128_pre_k: KernelHandle,
+    pub(crate) h128_post_k: KernelHandle,
 }
 
 impl Exl3MoeState {
@@ -177,6 +202,44 @@ impl MoeLayer {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
+
+        // ── P1 prefill scratch (see Exl3PrefillState) ──
+        // One slot size serves gate/up/down: all three are inter×h elements.
+        ensure!(
+            gate.n as u64 * gate.k as u64 == down.n as u64 * down.k as u64
+                && up.n == gate.n
+                && up.k == gate.k,
+            "EXL3 prefill scratch assumes equal-element projections \
+             (gate {}x{}, up {}x{}, down {}x{})",
+            gate.n,
+            gate.k,
+            up.n,
+            up.k,
+            down.n,
+            down.k
+        );
+        let chunk = std::env::var("ATLAS_EXL3_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(8)
+            .min(experts.len() as u32);
+        let slot_bytes = gate.n as usize * gate.k as usize * 2;
+        let scratch = gpu.alloc(chunk as usize * slot_bytes)?;
+        let slot_ptr_bytes: Vec<u8> = (0..chunk as usize)
+            .flat_map(|z| (scratch.0 + (z * slot_bytes) as u64).to_le_bytes())
+            .collect();
+        let slot_tab = gpu.alloc(slot_ptr_bytes.len())?;
+        gpu.copy_h2d(&slot_ptr_bytes, slot_tab)?;
+        let prefill = Exl3PrefillState {
+            scratch,
+            slot_tab,
+            chunk,
+            dequant_chunk_k: gpu.kernel("exl3_gemv", "exl3_dequant_chunk_bf16")?,
+            h128_pre_k: gpu.kernel("exl3_gemv", "exl3_h128_pre_rows")?,
+            h128_post_k: gpu.kernel("exl3_gemv", "exl3_h128_post_rows")?,
+        };
+
         self.exl3 = Some(Exl3MoeState {
             gate,
             up,
@@ -189,6 +252,7 @@ impl MoeLayer {
             ws,
             counters,
             split_override,
+            prefill,
         });
         self.experts_scale_kind = crate::weight_map::WeightQuantFormat::Exl3Trellis;
         Ok(())
