@@ -183,3 +183,53 @@ tree deserve one more A/B.
 3. Start R2(a): head-gate `dense_gemv_batchm` exactness leg — the harness
    and the law are already in-tree; this is the highest-EV work item in the
    entire plan.
+
+---
+
+## Matched-protocol measurement vs the reference (2026-08-10)
+
+Ran the reference's **published protocol verbatim** — 5 independent 512-token
+code generations, concurrency 1, steady state excluding TTFT and the first
+generated token, min/median/mean — against our own stack. This supersedes
+every prior cross-stack decode comparison in this repo, which used our
+`decode_ab_probe` workloads and is NOT the same measurement.
+
+| | min | median | mean | draft accept |
+|---|---:|---:|---:|---:|
+| ours, γ=5 | 16.06 | **17.41** | 17.22 | 61.6% (473/768) |
+| ours, γ=8 | 17.13 | **18.80** | 18.55 | 54.7% (525/960) |
+| **reference** | 34.30 | **38.12** | 39.49 | ~95% (implied) |
+
+**Gap: 2.0×, and it is draft acceptance, not engine speed.**
+
+Arithmetic: at γ=8 we commit 3.73 tok/step at an 18.80 tok/s rate ⇒ 198 ms
+step. For the reference to reach 38.12 on comparable hardware and a
+comparable K5 verify step, it must commit ~5.7 of a maximum 6 per step ⇒
+~95% per-token draft acceptance. Ours is 55-62%. Same GPU, same model size,
+same verify math — their drafter is right nine times in ten where ours is
+right roughly one time in two.
+
+Corollary: **deeper γ helps us slightly (γ=8 > γ=5 here) because our
+acceptance is poor**, which is the opposite of the reference's regime; with
+95% acceptance the shallower K5 wins on step time. Optimal γ is a function of
+draft quality, so any γ policy must be re-derived after a drafter change.
+
+### Context on the reference's other published numbers
+
+- Their **concurrency-1 general** decode (`results/c1-c2-c4.json`) is
+  **18.94 tok/s** — the 38.12 is a curated code scenario. Against the general
+  figure we are at parity or ahead.
+- Their **1055 tok/s prefill** is a single **252,047-token** prompt. Ours is
+  1062 (n=20 median) at **2,410** tokens — two orders of magnitude shorter and
+  much harder to saturate. Prefill is not a gap.
+- They explicitly do not claim the decode number is settled: "a steady
+  35 tok/s floor remains an open optimization gate… not claimed as complete";
+  the prefill figure is labelled "tuning evidence".
+
+### What this does to the ranked plan
+
+Kernel work on plain decode (the 28-tok/s ladder in DECODE-WATERFALL §6) is
+real but bounded at roughly +6 tok/s. **Draft acceptance is worth +19.** The
+reference's 64-expert compact drafter with sparse MLA attention ships inside
+the EXL3 checkpoint already loaded and served successfully on this box, so
+the drafter comparison is now the highest-value open experiment.
