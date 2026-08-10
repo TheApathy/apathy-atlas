@@ -195,6 +195,51 @@ pub fn w4a16_gemv_grouped_batchm(
         .launch(stream)
 }
 
+/// V2 of `w4a16_gemv_grouped_batchm` (ATLAS_VERIFY_GEMV_V2): M is compiled
+/// into the kernel (`_v2_m4/m5/m6/m8` — the caller picks the handle by m),
+/// so the kernel takes NO m argument; `m` here is for the shape log only.
+/// Bit-identical per row to the incumbent by construction (SASS-verified:
+/// identical per-row fmaf sequence; the pair of 8-B weight loads becomes one
+/// 16-B load, the pair of scale bytes one 16-bit load, addressing moves to
+/// running cursors, and the runtime-M guards leave the hot loop).
+/// REQUIRES k % 32 == 0 — the caller must fall back to the incumbent
+/// otherwise (checked here with a debug assert).
+///
+/// Kernel: `w4a16_gemv_grouped_batchm_v2_mX(A, B, S, s2, C, N, K, lda, ldc, rpg)`
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_grouped_batchm_v2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n_total: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    rows_per_group: u32,
+    stream: u64,
+) -> Result<()> {
+    debug_assert_eq!(k % 32, 0, "grouped_batchm_v2 requires K % 32 == 0");
+    super::log_gemm_shape("w4a16_gemv_grouped_batchm_v2", m, n_total, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_total, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(n_total)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .arg_u32(rows_per_group)
+        .launch(stream)
+}
+
 /// W4A16 double-GEMV (M=2): reads weights once, computes 2 outputs.
 ///
 /// A: [2, K] BF16 contiguous, B: NVFP4 packed, C: [2, N] BF16 contiguous.

@@ -152,6 +152,43 @@ pub fn w8a16_gemv_batchm_exact(
         .launch(stream)
 }
 
+/// V2 of `w8a16_gemv_batchm_exact` (ATLAS_VERIFY_GEMV_V2): M is compiled
+/// into the kernel (`_v2_m4/m5/m6/m8` — the caller picks the handle by m),
+/// so the kernel takes NO m argument. Bit-identical per row to the incumbent
+/// by construction (SASS-verified: identical FMUL/FADD sequence, only load
+/// widths/addressing/guards changed). `m` here is for the shape log only.
+/// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub fn w8a16_gemv_batchm_exact_v2(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    lda: u32,
+    ldc: u32,
+    stream: u64,
+) -> Result<()> {
+    super::log_gemm_shape("w8a16_gemv_batchm_exact_v2", m, n, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(lda)
+        .arg_u32(ldc)
+        .launch(stream)
+}
+
 /// Block-scaled FP8 dual-GEMV (batch=2). `input` is `[2, K]` BF16, `output` is
 /// `[2, N]` BF16; `weight`/`block_scale` are the raw `w8a16_gemv` pointers.
 /// Grid: (ceil(N/4), 1, 1)  Block: (256, 1, 1)

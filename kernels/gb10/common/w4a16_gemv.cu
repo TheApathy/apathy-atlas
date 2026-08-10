@@ -395,6 +395,213 @@ extern "C" __global__ void w4a16_gemv_grouped_batchm(
 }
 
 // ============================================================
+// W4A16 GEMV — GROUPED + BATCHED, V2 (ATLAS_VERIFY_GEMV_V2, data-movement
+// rework of `w4a16_gemv_grouped_batchm` above). BIT-IDENTICAL per row to the
+// incumbent (and therefore to single-row `w4a16_gemv`) BY CONSTRUCTION:
+//
+//   - Thread geometry, chunk-to-lane walk (k16 = lane*2, stride 128,
+//     acc0 <- chunk kk / acc1 <- chunk kk+1), the per-chunk `part` fmaf
+//     sequence, the acc = acc0+acc1 combine, the two-warp shuffle tree, the
+//     smem layout and the final adds are copied from the incumbent verbatim.
+//     Every FP op per output element has the same opcode, operands, order.
+//   - What changed is ONLY how bytes reach registers:
+//       1. The two 8-B weight loads of a chunk pair (adjacent in memory)
+//          become ONE 16-B load; the two 1-B group-scale loads become ONE
+//          2-B load. Same bytes, decomposed in registers.
+//       2. The 16 raw E2M1 LUT values of each chunk are read from shared
+//          memory ONCE and broadcast to all M rows through registers. The
+//          incumbent re-issued the same 16 LDS per row (the compiler CSE'd
+//          them, but left ~30% of the loop in guard/address overhead); the
+//          per-row fmaf still consumes the identical s_lut VALUE, so
+//          register reuse cannot change any byte (re-load vs reuse of a
+//          pure value is not an arithmetic change).
+//       3. M is a compile-time template parameter (one entry per verify
+//          width), deleting the per-row `i >= M` ISETP/BRA pairs from the
+//          hot loop and shrinking acc[]/smem to the real width.
+//       4. Per-row activation cursors advance by a constant stride instead
+//          of re-deriving 64-bit addresses per load (IMAD.WIDE per LDG in
+//          the incumbent SASS); the 4 activation loads of a chunk pair are
+//          immediate offsets off one register.
+//
+// REQUIRES K % 32 == 0 (even K16 — makes the incumbent's `K16 + 1` tail
+// guard vacuous — and 16-B/2-B alignment of the pair loads; q_lora=1024,
+// group_in=4096, latent_dim=8192 all qualify). The dispatch wrapper checks
+// and falls back to the incumbent otherwise.
+//
+// Grid: (ceil(N/4), 1, 1)   Block: (256, 1, 1)   N = o_groups*rows_per_group
+template <int M_ROWS>
+__device__ __forceinline__ void w4a16_gemv_grouped_batchm_v2_impl(
+    const __nv_bfloat16* __restrict__ A,        // [M, lda] bf16
+    const unsigned char* __restrict__ B_packed,  // [N, K/2] uint8, 16-B aligned rows
+    const unsigned char* __restrict__ B_scale,   // [N, K/GROUP_SIZE] FP8-E4M3
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,               // [M, ldc] bf16
+    unsigned int N,
+    unsigned int K,                              // % 32 == 0
+    unsigned int lda,
+    unsigned int ldc,
+    unsigned int rows_per_group
+) {
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    if (n >= N) return;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    // This row's activation column segment (same for every batch row).
+    const unsigned long long a_col = (unsigned long long)(n / rows_per_group) * K;
+
+    __shared__ float s_lut[16];
+    __shared__ float smem[N_PER_BLOCK * 2 * M_ROWS];
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc0[M_ROWS], acc1[M_ROWS];
+    #pragma unroll
+    for (int i = 0; i < M_ROWS; i++) { acc0[i] = 0.0f; acc1[i] = 0.0f; }
+
+    // Cursors: this lane's first chunk pair. Advanced by the pair stride at
+    // the end of each iteration (constant increments; no per-load IMAD.WIDE).
+    const unsigned char* w_ptr =
+        B_packed + (unsigned long long)n * half_K + (unsigned long long)lane * 16u;
+    const unsigned char* s_ptr =
+        B_scale + (unsigned long long)n * num_groups + (unsigned long long)lane * 2u;
+    const __nv_bfloat16* a_ptr[M_ROWS];
+    #pragma unroll
+    for (int i = 0; i < M_ROWS; i++) {
+        a_ptr[i] = A + (unsigned long long)i * lda + a_col
+                 + (unsigned long long)lane * 32u;  // chunk kk = lane*2, 16 elems/chunk
+    }
+
+    const unsigned int stride2 = threads_per_out * 2u;  // 128 chunks/iteration
+    for (unsigned int k16 = lane * 2u; k16 < K16; k16 += stride2) {
+        // Chunk pair kk = k16 (c=0) and kk+1 (c=1): 16 contiguous weight
+        // bytes in ONE load, 2 contiguous scale bytes in ONE load. Identical
+        // bytes to the incumbent's 2x uint64 + 2x uint8.
+        const ulonglong2 wpair = *(const ulonglong2*)w_ptr;
+        const unsigned short spair = *(const unsigned short*)s_ptr;
+        const unsigned long long packed8_c0 = wpair.x;
+        const unsigned long long packed8_c1 = wpair.y;
+
+        __nv_fp8_e4m3 fp8_c0, fp8_c1;
+        *(unsigned char*)&fp8_c0 = (unsigned char)(spair & 0xFF);   // byte s_ptr[0]
+        *(unsigned char*)&fp8_c1 = (unsigned char)(spair >> 8);     // byte s_ptr[1]
+#if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)
+        const float scale_c0 = scl_fp8((unsigned char)(spair & 0xFF)) * scale2;
+        const float scale_c1 = scl_fp8((unsigned char)(spair >> 8)) * scale2;
+#else
+        const float scale_c0 = (float)fp8_c0 * scale2;
+        const float scale_c1 = (float)fp8_c1 * scale2;
+#endif
+
+        // c-outer / row-inner, exactly the incumbent's phase order, so only
+        // ONE chunk's 16 raw LUT values are live at a time (register
+        // pressure: 16 floats, not 32). The values are the exact s_lut
+        // operands the incumbent's per-row fmaf reads — fetched once per
+        // chunk and broadcast to all M rows through registers.
+        #pragma unroll
+        for (int c = 0; c < 2; c++) {
+            const unsigned long long packed8 = (c == 0) ? packed8_c0 : packed8_c1;
+            const float scale = (c == 0) ? scale_c0 : scale_c1;
+            float w_raw[16];
+            #pragma unroll
+            for (int b = 0; b < 8; b++) {
+                const unsigned char byte_val = (unsigned char)(packed8 >> (b * 8));
+                w_raw[b * 2]     = s_lut[byte_val & 0xF];
+                w_raw[b * 2 + 1] = s_lut[byte_val >> 4];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < M_ROWS; i++) {
+                // This chunk's 32 activation bytes: immediate offsets off the
+                // row cursor (c=1 is the adjacent 32 bytes).
+                const uint4* ap = (const uint4*)a_ptr[i] + c * 2;
+                const uint4 a_lo = ap[0];
+                const uint4 a_hi = ap[1];
+                const unsigned int ar[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                            a_hi.x, a_hi.y, a_hi.z, a_hi.w};
+                // EXACT single-row per-chunk sequence: part over 8 bytes,
+                // then acc = fma(scale, part, acc); kk -> acc0, kk+1 -> acc1.
+                float part = 0.0f;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    const float2 af =
+                        __bfloat1622float2(*(const __nv_bfloat162*)&ar[b]);
+                    part = fmaf(af.x, w_raw[b * 2], part);
+                    part = fmaf(af.y, w_raw[b * 2 + 1], part);
+                }
+                if (c == 0) acc0[i] = fmaf(scale, part, acc0[i]);
+                else        acc1[i] = fmaf(scale, part, acc1[i]);
+            }
+        }
+
+        w_ptr += (unsigned long long)stride2 * 8u;   // 128 chunks x 8 B
+        s_ptr += stride2;                            // 128 groups x 1 B
+        #pragma unroll
+        for (int i = 0; i < M_ROWS; i++) a_ptr[i] += (unsigned long long)stride2 * 16u;
+    }
+
+    const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
+    #pragma unroll
+    for (int i = 0; i < M_ROWS; i++) {
+        float acc = acc0[i] + acc1[i];
+        // Same two-warp reduction tree as w4a16_gemv, per batch row.
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+        }
+        if (warp_lane == 0) {
+            smem[(i * N_PER_BLOCK + local_out) * 2 + (lane / WARP_SIZE)] = acc;
+        }
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int i = 0; i < M_ROWS; i++) {
+            float result = smem[(i * N_PER_BLOCK + local_out) * 2]
+                         + smem[(i * N_PER_BLOCK + local_out) * 2 + 1];
+            C[(unsigned long long)i * ldc + n] = __float2bfloat16(result);
+        }
+    }
+}
+
+// One entry per verify width (M compile-time; the wrapper picks by m and
+// falls back to `w4a16_gemv_grouped_batchm` for other widths / K % 32 != 0).
+// m4/m5/m6 take __launch_bounds__(256, 3) to hold the incumbent's 3-CTA/SM
+// occupancy (76-80 regs, zero spills). m8 is left unbounded: capping it at
+// 85 regs makes ptxas spill 64 B/thread into the hot loop, which is worse
+// than the 3->2 CTA occupancy dip (90 regs); n=8 is not the production
+// verify width.
+#define W4A16_GB_V2_ENTRY(MM, BOUNDS)                                          \
+    extern "C" __global__ void BOUNDS                                          \
+    w4a16_gemv_grouped_batchm_v2_m##MM(                                        \
+        const __nv_bfloat16* __restrict__ A,                                   \
+        const unsigned char* __restrict__ B_packed,                            \
+        const unsigned char* __restrict__ B_scale,                             \
+        const float scale2,                                                    \
+        __nv_bfloat16* __restrict__ C,                                         \
+        unsigned int N,                                                        \
+        unsigned int K,                                                        \
+        unsigned int lda,                                                      \
+        unsigned int ldc,                                                      \
+        unsigned int rows_per_group                                            \
+    ) {                                                                        \
+        w4a16_gemv_grouped_batchm_v2_impl<MM>(                                 \
+            A, B_packed, B_scale, scale2, C, N, K, lda, ldc, rows_per_group);  \
+    }
+
+W4A16_GB_V2_ENTRY(4, __launch_bounds__(BLOCK_SIZE, 3))
+W4A16_GB_V2_ENTRY(5, __launch_bounds__(BLOCK_SIZE, 3))
+W4A16_GB_V2_ENTRY(6, __launch_bounds__(BLOCK_SIZE, 3))
+W4A16_GB_V2_ENTRY(8, )
+
+// ============================================================
 // W4A16 GEMV — SINGLE-WARP-PER-OUTPUT variant (lossless, opt-in).
 //
 // Bit-identical to w4a16_gemv above, but uses 32 threads (1 warp) per output

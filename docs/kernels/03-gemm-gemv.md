@@ -1224,3 +1224,57 @@ roofline** given the current weight dtypes. The two levers that actually move it
 Everything else in this document is worth 0.1-1.5 ms each. There is no
 weight-re-streaming bug to fix in the batched GEMVs — they are already optimal
 on bandwidth.
+
+---
+
+# 2026-08-10 addendum — the EXACT verify chain at n=6 (V2 kernels)
+
+Audit of the γ=5 verify step's batched MLA projections under
+`ATLAS_VERIFY_EXACT_GEMV` (default ON): measured A_proj 250 µs/layer and
+C_oproj 266 µs/layer vs m=1 weight-bound floors of ~105 / ~174 µs. The excess
+is NOT weight re-reading (F0's verdict holds for both exact kernels — weight
+bytes and group scales are fetched once per chunk and broadcast to all M rows
+through registers) and NOT DRAM: it is the **per-row instruction stream**.
+SASS loop-body budgets per thread at the verify width, incumbents:
+
+**`w4a16_gemv_grouped_batchm`** (wq_b, wo_a, wo_b legs — the dominant cost),
+per chunk-pair (32 K-values), M=8-encoded body = 908 instrs:
+
+| class | count | note |
+|---|---:|---|
+| FFMA | 272 | 17/row/chunk — the exact math, irreducible |
+| bf16→f32 + weight-nibble int ops (SHF/PRMT/IMAD/LOP3) | ~450 | per-row conversions irreducible; addressing is not |
+| LDG.E.128 | 32 | activations (4/row) — fine |
+| LDG.E.64 + LDG.E.U8 | 2 + 2 | weights 8 B + scales 1 B — NARROW |
+| LDS | 32 | LUT, already CSE'd across rows by ptxas |
+| IMAD.WIDE (addressing) | 19 | re-derived per load |
+| ISETP + BRA (runtime-M guards) | 15 + 17 | `i >= M` break, every row, every pair |
+
+**`w8a16_gemv_batchm_exact`** (wq_a, wkv legs), per chunk (16 K-values),
+M=8 body = 575 instrs: weight load already 128-bit; excess = 8 UISETP + 8
+BRA.U guards + per-load addressing. These shapes are small (≤4.2 MB) and
+stay near-DRAM-bound; the w4 legs are where the 11 ms/verify-step goes.
+
+## The V2 kernels (`ATLAS_VERIFY_GEMV_V2=1`, default OFF)
+
+`w4a16_gemv_grouped_batchm_v2_m{4,5,6,8}` (`w4a16_gemv.cu`) and
+`w8a16_gemv_batchm_exact_v2_m{4,5,6,8}` (`w8a16_gemv_batch4.cu`):
+compile-time M, ONE 16-B weight load + ONE 16-bit scale load per chunk pair
+(w4; requires K % 32 == 0, wrapper-guarded), running-cursor addressing.
+**Tier-1 bit-identical by construction AND by SASS**: per executed row the
+FFMA/FMUL/FADD sequence is unchanged (w4: 34 FFMA/row/pair both; w8:
+16 FMUL + 16 FADD/row/chunk both); only load widths, addressing and guards
+moved. Loop bodies: w4 908 (M8-encoded) → 677 (m6, zero guards);
+w8 575 → 429. Registers: w4 80 (3 CTAs/SM, matches incumbent's 76; m8
+floats to 90 — bounded variants spilled, so m8 accepts the 2-CTA dip);
+w8 56 (unchanged). Byte-proof + cold-weight timing: gate 6 of
+`w4a16_gemv_grouped_microtest` (n ∈ {4,5,6,8}).
+
+Expected at n=6 (issue-slot arithmetic, to be confirmed on GPU): the w4
+legs' executed loop stream shrinks ~9-13 % with two fewer memory ops per
+pair and no divergent guard branches; A_proj 250 → ~200-220 µs/layer,
+C_oproj 266 → ~220-240 µs/layer, i.e. ~3-4 ms of the ~11 ms/verify-step
+excess. The remaining excess is the irreducible per-row FFMA + bf16→f32
+conversion stream at M=6 — a hard issue floor no data-movement change can
+remove; past it lies only a reduction-order change (tier-2, forbidden here
+by the partial-exactness law).
