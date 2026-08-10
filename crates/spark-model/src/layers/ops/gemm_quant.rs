@@ -479,6 +479,69 @@ pub fn w8a16_gemm_pipelined(
         .launch(stream)
 }
 
+/// FP8-native W8A8 prefill GEMM (`mma.m16n8k32.e4m3`): C[M,N] BF16 =
+/// (A_fp8[M,K] * a_row_scale) @ (B_fp8[N,K] * block_scale)^T. A must be
+/// pre-quantized with [`quantize_a_fp8_rows`]. Same 128x32 tiling and grid
+/// as `w8a16_gemm_pipelined`, but the MMA consumes E4M3 directly — no
+/// in-kernel LUT dequant of B (oracle: 1.04-1.22x at the V4 projection
+/// shapes, cosine 0.9997 vs the w8a16 reference).
+///
+/// Grid: (ceil(N/32), ceil(M/128), 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub fn w8a8_gemm_pipelined(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_fp8: DevicePtr,
+    a_row_scale: DevicePtr,
+    weight: DevicePtr,
+    block_scale: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    super::log_gemm_shape("w8a8_gemm_pipelined", m, n, k);
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 32), div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input_fp8)
+        .arg_ptr(a_row_scale)
+        .arg_ptr(weight)
+        .arg_ptr(block_scale)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Row-wise BF16 -> FP8 E4M3 activation quantizer for [`w8a8_gemm_pipelined`]:
+/// scale[m] = max(absmax(A[m,:]), eps)/448, A_fp8 = A/scale[m].
+///
+/// Grid: (M, 1, 1)  Block: (256, 1, 1)
+pub fn quantize_a_fp8_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_bf16: DevicePtr,
+    output_fp8: DevicePtr,
+    row_scale: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([m, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input_bf16)
+        .arg_ptr(output_fp8)
+        .arg_ptr(row_scale)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// Per-token-per-128-K-group FP8 activation quantization. Output: A_fp8
 /// [M, K] FP8 E4M3 + a_scale [M, K/128] FP32. Matches vLLM's
 /// `per_token_group_quant_fp8`.

@@ -16,6 +16,15 @@ use crate::weight_map::{DenseWeight, Fp8Weight, WeightQuantFormat};
 const BF16_BYTES: usize = 2;
 const FP8_BLOCK: u32 = 128;
 
+/// ATLAS_V4_PROJ_FP8MMA=1 (cached once): route the released-BF16 projections
+/// through the FP8-native m16n8k32 MMA instead of the LUT-dequant W8A16
+/// path. Default OFF — activation quantization is a numerics change (same
+/// class as the FP8 mirrors), gated on serve A/B + tool-eval.
+fn v4_proj_fp8mma_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PROJ_FP8MMA").as_deref() == Ok("1"))
+}
+
 fn validate_fp8(weight: Fp8Weight, n: u32, k: u32, label: &str) -> Result<Fp8Weight> {
     ensure!(
         weight.scale_format == WeightQuantFormat::Fp8BlockScaled,
@@ -87,6 +96,43 @@ impl Qwen3AttentionLayer {
             k,
             label,
         )?;
+        // FP8-native MMA arm: quantize the activations once (row-scaled E4M3
+        // into the fp8_act arena) and feed both operands to mma.m16n8k32.e4m3
+        // — the W8A16 path below LUT-dequants B per tile instead. Oracle
+        // (w8a8_gemm_microtest): 1.04-1.22x at these shapes, cos 0.9997.
+        // Falls through when the arena can't hold [M, K] (wo_b's o_latent at
+        // full batch is the largest consumer).
+        if v4_proj_fp8mma_enabled()
+            && self.w8a8_gemm_pipelined_k.0 != 0
+            && self.quantize_a_fp8_rows_k.0 != 0
+            && ctx.buffers.fp8_act_bytes() >= (m as usize) * (k as usize)
+        {
+            let a_fp8 = ctx.buffers.fp8_act();
+            let a_scale = ctx.buffers.fp8_act_scale();
+            ops::quantize_a_fp8_rows(
+                ctx.gpu,
+                self.quantize_a_fp8_rows_k,
+                input,
+                a_fp8,
+                a_scale,
+                m,
+                k,
+                stream,
+            )?;
+            return ops::w8a8_gemm_pipelined(
+                ctx.gpu,
+                self.w8a8_gemm_pipelined_k,
+                a_fp8,
+                a_scale,
+                weight.weight,
+                weight.row_scale,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            );
+        }
         if self.w8a16_gemm_pipelined_k.0 != 0 {
             ops::w8a16_gemm_pipelined(
                 ctx.gpu,
