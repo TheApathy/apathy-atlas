@@ -38,24 +38,30 @@
 //   - grid.x = N/128 output strips (8 tile-columns each), grid.y = SPLIT_K.
 //   - block = 256 threads = 8 warps. Warp w owns tile-column w of the strip;
 //     lane accumulates 2 outputs (n = 16w + lane/4 and +8) in fp32.
-//   - Phase 1: block computes x' (fp32) for one SUPERBLOCK (up to 16 chunks
+//   - Phase 1: block computes x' for one SUPERBLOCK (up to 16 chunks
 //     = 2048 k) of its K-slice into smem, one 128-chunk per warp via the
-//     warp-shuffle Hadamard (4 elems/lane); refilled per superblock, so the
-//     K-slice length is unbounded.
+//     warp-shuffle Hadamard (4 elems/lane, fp32 math); refilled per
+//     superblock, so the K-slice length is unbounded. x' is STORED as
+//     packed __half2 (k, k+1) pairs — 4 KB — feeding the half2 dot path
+//     below (round 3; the fp16 store is a quantization of x', part of the
+//     documented numerics tier, see docs/kernels/exl3-gemv.md §3b).
 //   - Phase 2: trellis is streamed through a 2-stage cp.async smem pipeline;
 //     each stage is 8 tile-rows x 8 tile-cols = 6 KB (one 128-k chunk),
 //     issued as 16-B cp.async per thread — wide, coalesced, contiguous 768-B
 //     runs per tile-row. One warp decodes one 96-B tile per iteration with
-//     the dq8 batching (8 weights per lane from two u32 loads); the window
-//     extraction is restructured for ILP (see exl3_dq8) and the fp32
-//     accumulators are split even/odd-row so consecutive tiles' dequant and
-//     FMA chains are independent in the scoreboard.
+//     the dq8 batching (8 weights per lane from two u32 loads). The dot is
+//     accumulated in __half2 HFMA2 chains (4 independent chains: {acc0,acc1}
+//     x even/odd tile-row), converted to fp32 ONCE PER 128-k CHUNK in fixed
+//     order — this removes the 8 HADD2.F32 cvts + 8 FFMAs per tile that the
+//     round-2 SASS showed to be 24% of the issue stream (the kernel is
+//     warp-issue-bound, ~67 ops per 96-B tile; LDS runs at ~17% of its
+//     bandwidth at the DRAM target and is NOT the constraint).
 //   - Phase 3: quad shuffle-reduce, strip partial in smem, then (split 0 of 1,
 //     or the LAST split to finish, elected by an atomic counter) applies the
 //     output Hadamard-128 + svh and stores bf16. Split partials are combined
 //     in fixed split order, so the result is deterministic for a fixed grid.
 //
-// Occupancy: smem = 8 KB x' + 2 x 6 KB stages + 0.5 KB partials ~ 20.5 KB,
+// Occupancy: smem = 4 KB x' + 2 x 6 KB stages + 0.5 KB partials ~ 16.5 KB,
 // __launch_bounds__(256, 4) -> 4 CTAs/SM (32 warps) on GB10's 100 KB SMs,
 // vs 2 CTAs/SM for the first bring-up (42.5 KB). The kernel is issue-latency
 // bound, not DRAM-bound, at 2 CTAs/SM — the extra warps hide the dependent
@@ -82,7 +88,7 @@
 #define EXL3_NSTRIP 128     // output columns per block (8 tiles of 16)
 #define EXL3_STAGE_ROWS 8   // tile-rows per cp.async stage (8*8*96 B = 6 KB = 1 chunk)
 #define EXL3_STAGE_U4 (EXL3_STAGE_ROWS * 8 * 6)  // 16-B copies per stage (384)
-#define EXL3_MAX_XCHUNKS 16  // fp32 x' smem superblock: 2048 k, 8 KB (refilled per superblock)
+#define EXL3_MAX_XCHUNKS 16  // x' smem superblock: 2048 k as __half2 pairs, 4 KB (refilled per superblock)
 #define EXL3_RSQRT128 0.088388347648f
 
 // ---------------------------------------------------------------------------
@@ -243,11 +249,13 @@ __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
 }
 
 // Phase-1 input pass for one x' superblock: x' = H128(diag(suh) . x)/sqrt(128)
-// in fp32 for chunks [c0, c1), stored at s_x[(c - c0)*128 ..]. One 128-chunk
-// per warp per iteration.
+// computed in fp32 for chunks [c0, c1), stored as packed __half2 (k, k+1)
+// pairs at s_x[(c - c0)*64 ..]. One 128-chunk per warp per iteration. The
+// fp16 store quantizes x' (rel. 2^-11 per element, incoherent across k) —
+// covered by the GEMV cosine gate, see docs/kernels/exl3-gemv.md §3b.
 __device__ __forceinline__ void exl3_input_pass(const __nv_bfloat16* __restrict__ A,
                                                 const __half* __restrict__ suh,
-                                                float* __restrict__ s_x, int c0, int c1,
+                                                __half2* __restrict__ s_x, int c0, int c1,
                                                 int warp, int lane) {
     for (int c = c0 + warp; c < c1; c += EXL3_BLOCK / 32) {
         int base = (c << 7) + lane * 4;
@@ -256,11 +264,9 @@ __device__ __forceinline__ void exl3_input_pass(const __nv_bfloat16* __restrict_
         float h2 = __bfloat162float(A[base + 2]) * __half2float(suh[base + 2]);
         float h3 = __bfloat162float(A[base + 3]) * __half2float(suh[base + 3]);
         exl3_had128(h0, h1, h2, h3, lane);
-        int lb = ((c - c0) << 7) + lane * 4;
-        s_x[lb + 0] = h0 * EXL3_RSQRT128;
-        s_x[lb + 1] = h1 * EXL3_RSQRT128;
-        s_x[lb + 2] = h2 * EXL3_RSQRT128;
-        s_x[lb + 3] = h3 * EXL3_RSQRT128;
+        int lb = ((c - c0) << 6) + lane * 2;
+        s_x[lb + 0] = __floats2half2_rn(h0 * EXL3_RSQRT128, h1 * EXL3_RSQRT128);
+        s_x[lb + 1] = __floats2half2_rn(h2 * EXL3_RSQRT128, h3 * EXL3_RSQRT128);
     }
 }
 
@@ -284,7 +290,7 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     float* __restrict__ ws,                      // [gridDim.y, N]
     int* __restrict__ counters,                  // [N/128]
     unsigned int N, unsigned int K) {
-    __shared__ __align__(16) float s_x[EXL3_MAX_XCHUNKS * 128];             // 8 KB
+    __shared__ __align__(16) __half2 s_x[EXL3_MAX_XCHUNKS * 64];            // 4 KB
     __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 12 KB
     __shared__ float s_y[EXL3_NSTRIP];
     __shared__ int s_elect;
@@ -324,12 +330,15 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     __syncthreads();
 
     // ---- Phase 2: stream + decode + accumulate ----
-    // Accumulators split even/odd-row so consecutive tiles' FMA tails are
-    // independent chains; combined in fixed order below (deterministic).
-    float acc0[2] = {0.0f, 0.0f};  // n = 16*warp + lane/4
-    float acc1[2] = {0.0f, 0.0f};  // n = 16*warp + lane/4 + 8
+    // The dot runs in __half2 within each 128-k chunk (= one stage): four
+    // independent HFMA2 chains ({acc0,acc1} x even/odd tile-row, depth 4
+    // each), combined in FIXED order into fp32 once per chunk. Chunks never
+    // straddle a split boundary (splits are chunk-aligned), so the grouping
+    // — and therefore the fp32 result — is deterministic for a fixed grid.
+    float acc0 = 0.0f;  // n = 16*warp + lane/4       (fp32 across chunks)
+    float acc1 = 0.0f;  // n = 16*warp + lane/4 + 8
     const Exl3LaneGeom g = exl3_lane_geom(lane);
-    const int xk = 2 * (lane & 3);
+    const int xkh = lane & 3;  // half2 (k-pair) index within the 16-k tile row
 
     for (int s = 0; s < nstages; ++s) {
         if (s != 0 && (s & (EXL3_MAX_XCHUNKS - 1)) == 0) {
@@ -350,30 +359,40 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
         __syncthreads();
 
         const unsigned int* stage32 = (const unsigned int*)s_stage[s & 1];
-        const int xbase = ((s & (EXL3_MAX_XCHUNKS - 1)) << 7) + xk;
+        const __half2* xrow = s_x + ((s & (EXL3_MAX_XCHUNKS - 1)) << 6) + xkh;
 
-#pragma unroll 4
+        const __half2 hz = __float2half2_rn(0.0f);
+        __half2 hacc0e = hz, hacc0o = hz;  // acc0, even/odd tile-row
+        __half2 hacc1e = hz, hacc1o = hz;  // acc1, even/odd tile-row
+#pragma unroll
         for (int r = 0; r < EXL3_STAGE_ROWS; ++r) {
             const unsigned int* tile = stage32 + (r * 8 + warp) * EXL3_TILE_U32;
             __half2 d01, d23, d45, d67;
             exl3_dq8(tile, g, d01, d23, d45, d67);
-            int xb = xbase + (r << 4);
-            float2 xa = *(const float2*)&s_x[xb];      // k, k+1
-            float2 xc = *(const float2*)&s_x[xb + 8];  // k+8, k+9
-            float2 f;
-            f = __half22float2(d01);
-            acc0[r & 1] = __fmaf_rn(f.x, xa.x, acc0[r & 1]);
-            acc0[r & 1] = __fmaf_rn(f.y, xa.y, acc0[r & 1]);
-            f = __half22float2(d23);
-            acc0[r & 1] = __fmaf_rn(f.x, xc.x, acc0[r & 1]);
-            acc0[r & 1] = __fmaf_rn(f.y, xc.y, acc0[r & 1]);
-            f = __half22float2(d45);
-            acc1[r & 1] = __fmaf_rn(f.x, xa.x, acc1[r & 1]);
-            acc1[r & 1] = __fmaf_rn(f.y, xa.y, acc1[r & 1]);
-            f = __half22float2(d67);
-            acc1[r & 1] = __fmaf_rn(f.x, xc.x, acc1[r & 1]);
-            acc1[r & 1] = __fmaf_rn(f.y, xc.y, acc1[r & 1]);
+            __half2 xa = xrow[(r << 3)];      // k, k+1
+            __half2 xc = xrow[(r << 3) + 4];  // k+8, k+9
+            if (r & 1) {
+                hacc0o = __hfma2(d01, xa, hacc0o);
+                hacc0o = __hfma2(d23, xc, hacc0o);
+                hacc1o = __hfma2(d45, xa, hacc1o);
+                hacc1o = __hfma2(d67, xc, hacc1o);
+            } else {
+                hacc0e = __hfma2(d01, xa, hacc0e);
+                hacc0e = __hfma2(d23, xc, hacc0e);
+                hacc1e = __hfma2(d45, xa, hacc1e);
+                hacc1e = __hfma2(d67, xc, hacc1e);
+            }
         }
+        // Fixed-order per-chunk combine into fp32 (deterministic).
+        __half2 h0 = __hadd2(hacc0e, hacc0o);
+        __half2 h1 = __hadd2(hacc1e, hacc1o);
+        float2 f0 = __half22float2(h0);
+        float2 f1 = __half22float2(h1);
+        acc0 += f0.x;
+        acc0 += f0.y;
+        acc1 += f1.x;
+        acc1 += f1.y;
+
         __syncthreads();
         if (s + 2 < nstages)
             exl3_load_stage((uint4*)s_stage[s & 1], trellis_u4,
@@ -381,10 +400,9 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     }
 
     // ---- Phase 3: reduce + (elected) output Hadamard + svh + store ----
-    // Fixed-order combine of the even/odd-row partials (deterministic), then
-    // quad reduction: lanes with equal lane/4 hold the same n over disjoint k.
-    float acc0f = acc0[0] + acc0[1];
-    float acc1f = acc1[0] + acc1[1];
+    // Quad reduction: lanes with equal lane/4 hold the same n over disjoint k.
+    float acc0f = acc0;
+    float acc1f = acc1;
     acc0f += __shfl_xor_sync(0xffffffffu, acc0f, 1);
     acc0f += __shfl_xor_sync(0xffffffffu, acc0f, 2);
     acc1f += __shfl_xor_sync(0xffffffffu, acc1f, 1);

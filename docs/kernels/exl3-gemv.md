@@ -74,29 +74,31 @@ Hadamard (reference: `had_hf_r_128_inner<true,false>` on input,
 `had_ff/fh_r_128_inner<false,true>` on output in `exl3_gemm_kernel` /
 `output_had_sh_gl`).
 
-## 2. Kernel design (`exl3_gemv_m1`) — tuning round 2 (2026-08-10)
+## 2. Kernel design (`exl3_gemv_m1`) — tuning rounds 2–3 (2026-08-10)
 
-Grid `(N/128, SPLIT_K)`, block 256 threads (8 warps), static smem ~20.6 KB,
-`__launch_bounds__(256, 4)` → **4 CTAs/SM** (reg cap 64; bring-up build was
-52 regs at 42.5 KB smem = 2 CTAs/SM).
+Grid `(N/128, SPLIT_K)`, block 256 threads (8 warps), static smem ~16.6 KB,
+`__launch_bounds__(256, 4)` → **4 CTAs/SM** (reg cap 64, exactly met, no
+spills; bring-up build was 52 regs at 42.5 KB smem = 2 CTAs/SM).
 
 - **Strip ownership**: block owns a 128-wide output strip = 8 tile-columns,
   which makes the output Hadamard-128 block-local. Warp w owns tile-column w;
-  each lane accumulates 2 outputs (`n = 16w + lane/4`, `+8`) in fp32, split
-  into even/odd-row partials (independent FMA chains, combined in fixed
-  order at the end — deterministic).
-- **Phase 1 — input pass**: x' (fp32) for one SUPERBLOCK of the K-slice
-  (≤ 16 chunks = 2048 k, 8 KB smem), refilled per superblock inside the
-  stage loop — the per-slice K cap is gone. One 128-chunk per warp per
-  iteration via the warp-shuffle Hadamard. Issued AFTER the first trellis
-  cp.async stages so the DRAM stream starts immediately.
+  each lane accumulates 2 outputs (`n = 16w + lane/4`, `+8`).
+- **Phase 1 — input pass**: x' for one SUPERBLOCK of the K-slice
+  (≤ 16 chunks = 2048 k), computed in fp32 via the warp-shuffle Hadamard,
+  stored as packed `__half2` (k, k+1) pairs (4 KB smem — round 3), refilled
+  per superblock inside the stage loop — the per-slice K cap is gone.
+  Issued AFTER the first trellis cp.async stages so the DRAM stream starts
+  immediately.
 - **Phase 2 — weight stream**: 2-stage cp.async (`.cg`, 16 B per thread)
   pipeline; each stage = 8 tile-rows × 8 tiles = 6 KB = exactly one 128-k
   chunk, fetched as contiguous 768-B runs per tile-row (stride N/16·96 B
   between rows). Every trellis byte is read exactly once, as 128-bit
   transactions. A warp decodes one 96-B tile per iteration: `dq8` gives 8
-  weights/lane from two u32 smem words; products and accumulation in fp32
-  (`__fmaf_rn`).
+  weights/lane from two u32 smem words. The dot runs in `__half2` HFMA2
+  chains within each 128-k chunk — 4 independent chains ({acc0,acc1} ×
+  even/odd tile-row, depth 4 each) — combined into fp32 in FIXED order once
+  per chunk (round 3; numerics tier in §3b). The row loop is fully unrolled
+  (8 tiles per stage per warp).
 - **Phase 3 — reduce + output**: quad shuffle-reduce → 128 fp32 partials in
   smem. `SPLIT_K = 1`: the block applies Hadamard-128 + svh and stores bf16.
   `SPLIT_K > 1`: each split publishes its raw partial to `ws[split][N]`; an
@@ -109,9 +111,9 @@ superblock loop removed the old ≤4096-K slice cap). Use `SPLIT_K` for
 occupancy: at 4 CTAs/SM the GB10 has 192 slots (N=2048 → 16 strips →
 SPLIT_K=12 fills exactly; N=4096 → 32 strips → SPLIT_K=6).
 
-Shared-memory budget: `s_x` 8 KB + `s_stage` 2×6 KB + `s_y`/`s_elect`
-~0.6 KB ≈ 20.6 KB → 4 CTAs/SM on the 100 KB GB10 SM; registers are the
-co-binding limit (64 regs × 256 thr × 4 CTAs = the full 64 K file).
+Shared-memory budget: `s_x` 4 KB + `s_stage` 2×6 KB + `s_y`/`s_elect`
+~0.6 KB ≈ 16.6 KB → 4 CTAs/SM on the 100 KB GB10 SM; registers are the
+binding limit (64 regs × 256 thr × 4 CTAs = the full 64 K file).
 
 ## 3. Dequant instruction budget
 
@@ -156,6 +158,68 @@ Bit-exactness is unchanged — every window is masked to 16 bits, and bits
 `[s2+3j, s2+3j+16)` of the 64-bit pair are identical whether reached by one
 funnel shift or truncate-then-shift.
 
+**Round-2 post-mortem by SASS (2026-08-10, no-GPU round): why it only
+gained 8%.** Both the bring-up and round-2 kernels were compiled with
+`nvcc -arch=sm_121a -cubin --resource-usage` and nvdisasm'd:
+
+- **No spills either round** (r1: 52 regs, r2: 64 regs exactly — the
+  `__launch_bounds__(256,4)` target was met cleanly, ptxas did not
+  serialize).
+- **The expected IPC win never existed**: ptxas had ALREADY parallelized
+  the bring-up kernel's "serial" `>>3` window chain — the r1 loop extracts
+  windows with independent `SHF.R.U64` funnel shifts straight from the
+  (a, b) word pair. Measured loop bodies: r1 = 262 SASS instr / 4 tiles,
+  r2 = 269 / 4 tiles — the SAME ~65–67 instructions per 96-B tile, with a
+  well-interleaved schedule in both. Round 2's +8% (156→168) was the
+  occupancy doubling (2→4 CTAs/SM), not ILP.
+- **The real bound is warp-issue throughput, not LDS**: per-tile LDS
+  traffic was 2×LDS.32 (tile words) + 2×LDS.64 (x', 2 wavefronts each) =
+  6 LSU wavefronts and 768 B read per 96-B tile. At the 229 GB/s target
+  that is ~38 GB/s/SM of shared traffic vs the ~218 GB/s/SM (128 B/cycle)
+  shared ceiling — 17%, not binding. What binds is the ~67-op stream per
+  tile: the r2 opcode census per 4 tiles is 32 FFMA + 32 HADD2.F32 (the
+  fp32 dot tail = 24% of all issue) + 64 LOP3 + 36 SHF + 39 IMAD +
+  32 PRMT + 16 LDS + ~17 HADD2/HFMA2.
+
+**Round 3 (this round): shrink ops/byte — half2 dot + half2 x'.** The
+only lever that moves an issue-bound kernel is fewer instructions per
+trellis byte:
+
+| change | per-tile effect |
+|---|---|
+| accumulate `d·x` in `__half2` HFMA2 chains, cvt to fp32 once per 128-k chunk | −8 HADD2.F32, −8 FFMA, +4 HFMA2 (+~1 amortized chunk-combine) |
+| store x' as packed `__half2` pairs | 2×LDS.64 → 2×LDS.32 (6→4 LSU wavefronts, 768→384 LDS B/tile, s_x 8→4 KB) |
+| full unroll of the 8-row stage loop | loop overhead → 0, whole-stage scheduling window |
+
+Verified in the round-3 SASS: the stage loop is **447 instr / 8 tiles =
+55.9/tile** (−17% vs 67), FFMA count in the loop is 0, HADD2.F32 dropped
+32→~4 per stage (the per-chunk combine), all LDS are 32-bit, still 64 regs
+/ 0 spills / 16.9 KB smem / 4 CTAs/SM. Expected from pure issue scaling:
+168 × 67/55.9 ≈ **~200 GB/s**, plus whatever the shorter FMA chains and
+halved LSU wavefronts recover of the 1.4-of-4 effective IPC — estimate
+**~195–215 GB/s** (gate 3 on hardware decides; ceiling 229).
+
+## 3b. Numerics tier (changed in round 3 — recorded per the microtest law)
+
+- **Dequant is still bit-exact** (gate 1 unchanged): `exl3_dq8` and the
+  3INST decode are untouched; `exl3_dequant_dump` must still show
+  bitdiff == 0.
+- **The GEMV accumulation tier moved** from "fp32 throughout" to:
+  x' quantized to fp16 after the fp32 Hadamard (rel. 2⁻¹¹/element,
+  incoherent across k), products+accumulate in fp16 within each 128-k
+  chunk (≤8 fp16 FMAs deep per half2 slot), fp32 across chunks and splits.
+  Expected end-to-end relative output error ~1e-3 ⇒ cosine ≈ 1−1e-6 —
+  passes the unchanged **cosine ≥ 0.99999** gate with ~10× margin.
+  fp16 range is safe: |w| < 4 and x' is a normalized Hadamard mix, so
+  chunk partials sit far below 65504.
+- **Determinism is preserved**: the fp16 chains and the per-chunk fp32
+  combine run in a fixed order, and the split combine remains fixed-order
+  → bit-identical relaunches for a fixed grid (gate 2's relaunch
+  byte-identity probe applies as-is). Chunks are 128-k aligned and never
+  straddle a split boundary, so the fp16 grouping itself is even
+  SPLIT_K-invariant; only the fp32 cross-chunk summation order varies
+  with the grid, exactly as in rounds 1–2.
+
 ## 4. Roofline arithmetic per expert matrix
 
 Bytes per matrix = `N·K·3/8 + (N+K)·2`:
@@ -185,7 +249,9 @@ Gates (exit code enforced):
    (FNV `be697083fb057234`), so a dump mismatch convicts the GPU kernel.
 2. **GEMV cosine ≥ 0.99999** vs the f64 full-pipeline reference, at
    SPLIT_K=1 and the production split, plus a relaunch byte-identity probe
-   (determinism of the split combine).
+   (determinism of the split combine). Round 3 changed the accumulation
+   tier (fp16 x' + per-chunk fp16 accumulate, §3b) — the gate value is
+   unchanged, but this run is the tier's acceptance test.
 3. **Cold-rotation GB/s** through a ≥512 MB weight ring (defeats the 24 MB
    L2) at both expert shapes; judged against the 229 GB/s ceiling.
 
@@ -215,17 +281,21 @@ STILL OPEN:
   the guarded per-row path); the exact-verify twin is mandatory S6 scope.
 - Real-checkpoint spot-check: run the dump gate against tp1 tiles.
 - Perf tuning after first GPU measurement: stage depth, `SPLIT_K` policy
-  (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides),
-  possible half2-accumulate variant if issue-bound.
+  (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides).
+  Half2-accumulate landed in round 3 (§3/§3b).
 - Fused gate+up / silu-in-GEMV riders to cut the 3·top_k+3 launch count.
 
 - m-row (γ-verify) MROW variant — mandatory from day one per plan §3/§4.7
   (partial-exactness law: the verify chain flips as a whole).
 - Real-checkpoint spot-check (plan option a): run the dump gate against
   tiles from `/home/flocka/sparkinfer-ref/data/tp1` once readable.
-- ~~Perf tuning after first GPU measurement~~ round 2 done (§2/§3): ILP
-  dequant restructure + 4 CTAs/SM. If gate 3 still lands under ~200 GB/s,
-  the next lever is the half2-accumulate variant (`EXL3_GEMM_H_ACC`-style)
-  to shed the 8 cvt + fp32 FFMA per tile — quality re-gate required.
+- ~~Perf tuning after first GPU measurement~~ round 2 done (ILP restructure
+  + 4 CTAs/SM, +8%); ~~half2-accumulate variant~~ round 3 done (§3/§3b):
+  half2 dot + half2 x' + full unroll, 67→55.9 SASS instr/tile, expected
+  ~195–215 GB/s — needs the gate-2 quality re-gate on hardware. If gate 3
+  still lands under ~200 GB/s after round 3, the remaining suspects are
+  the per-stage barrier/cp.async wait overhead (measure with a
+  barrier-free single-stage probe) and grid-size occupancy at the
+  production split, NOT the instruction stream.
 - Shared-expert rider (grid.y expert slot) when wiring into
   `moe_shared_expert_fused_t` dispatch.
