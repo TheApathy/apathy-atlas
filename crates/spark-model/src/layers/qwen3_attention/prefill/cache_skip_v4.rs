@@ -145,14 +145,31 @@ impl Qwen3AttentionLayer {
         // arm — route the FP8 mirror through the same w8a8 helper here.
         // Returns false (→ the pre-existing w8a16 arm, bit-exact) when the
         // gate is off or the kernels/arena are absent.
-        let wqa_w8a8 = match mla.wq_a_fp8 {
-            Some(wqa8) => {
-                self.try_w8a8_project_prefill(ctx, normed, wqa8, q_latent, n, q_lora, h, stream)?
-            }
-            None => false,
-        };
-        if wqa_w8a8 {
-            // FP8-native MMA arm took it.
+        // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON): wq_a ALWAYS
+        // keeps its BF16 mirror (the release only frees wq_b/wo_a/wo_b), so
+        // this arm applies regardless of ATLAS_V4_ATTN_RELEASE_BF16. Measured
+        // 0.188 ms at [2410, 1024, 4096] (cosine 1.000000, same-math tier) vs
+        // ~0.8 ms for the FP8 pipelined arm — cuBLASLt outranks the FP8 mirror
+        // when the gate is on; =0 restores the FP8MMA/w8a16/pipelined chain
+        // below bit-exactly.
+        let wqa_cublas = super::v4_fp8_proj::try_v4_cublas_prefill(
+            normed,
+            mla.wq_a.weight,
+            q_latent,
+            n,
+            q_lora,
+            h,
+            stream,
+            "V4 wq_a",
+        );
+        let wqa_w8a8 = !wqa_cublas
+            && match mla.wq_a_fp8 {
+                Some(wqa8) => self
+                    .try_w8a8_project_prefill(ctx, normed, wqa8, q_latent, n, q_lora, h, stream)?,
+                None => false,
+            };
+        if wqa_cublas || wqa_w8a8 {
+            // cuBLASLt / FP8-native MMA arm took it.
         } else if let Some(wqa8) = mla
             .wq_a_fp8
             .filter(|_| self.w8a16_gemm_pipelined_k.0 != 0)
@@ -309,15 +326,31 @@ impl Qwen3AttentionLayer {
         // feeds the KV cache, so it sits under the same tool-eval gate as the
         // rest of the fp8mma class). false → the pre-existing BF16 chain
         // below, bit-exact.
-        let wkv_w8a8 = match mla.wkv_a_fp8 {
-            Some(wkv8) => {
-                self.try_w8a8_project_prefill(ctx, normed, wkv8, kv_latent, n, kv_lora, h, stream)?
-            }
-            None => false,
-        };
+        // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON): wkv_a keeps
+        // its BF16 mirror (never released), so this fires regardless of
+        // RELEASE_BF16. Measured 0.117 ms at [2410, 512, 4096], cosine
+        // 1.000000 vs the pipelined kernel (0.23 ms). Feeds the KV cache like
+        // the arms below — same-math tier, so no separate quality gate.
+        let wkv_cublas = super::v4_fp8_proj::try_v4_cublas_prefill(
+            normed,
+            mla.wkv_a.weight,
+            kv_latent,
+            n,
+            kv_lora,
+            h,
+            stream,
+            "V4 wkv_a",
+        );
+        let wkv_w8a8 = !wkv_cublas
+            && match mla.wkv_a_fp8 {
+                Some(wkv8) => self.try_w8a8_project_prefill(
+                    ctx, normed, wkv8, kv_latent, n, kv_lora, h, stream,
+                )?,
+                None => false,
+            };
         #[allow(clippy::overly_complex_bool_expr)]
-        if wkv_w8a8 {
-            // FP8-native MMA arm took it.
+        if wkv_cublas || wkv_w8a8 {
+            // cuBLASLt / FP8-native MMA arm took it.
         } else if self.dense_gemm_pipelined_k.0 != 0
             && std::env::var("ATLAS_V4_KV_PIPELINED").as_deref() != Ok("0")
         {
@@ -633,18 +666,46 @@ impl Qwen3AttentionLayer {
                 } else {
                     (self.dense_gemm_k, ops::dense_gemm as _)
                 };
-            gemm(ctx.gpu, gk, normed, &comp.wkv, kv_comp, n, proj_dim, h, stream)?;
-            gemm(
-                ctx.gpu,
-                gk,
+            // cuBLASLt-first (ATLAS_V4_PREFILL_CUBLASLT, default ON): the
+            // compressor kv/gate weights are BF16-only DenseWeights — they
+            // never had FP8 mirrors and are never released, so cuBLASLt
+            // applies under every residency config. Same [M, proj_dim, h]
+            // shape class as wq_a (0.188 ms vs 0.44 pipelined at N=1024,
+            // cosine 1.000000); falls back to the gemm selection below.
+            if !super::v4_fp8_proj::try_v4_cublas_prefill(
                 normed,
-                &comp.wgate,
+                comp.wkv.weight,
+                kv_comp,
+                n,
+                proj_dim,
+                h,
+                stream,
+                "V4 comp wkv",
+            ) {
+                gemm(ctx.gpu, gk, normed, &comp.wkv, kv_comp, n, proj_dim, h, stream)?;
+            }
+            if !super::v4_fp8_proj::try_v4_cublas_prefill(
+                normed,
+                comp.wgate.weight,
                 gate_comp,
                 n,
                 proj_dim,
                 h,
                 stream,
-            )?;
+                "V4 comp wgate",
+            ) {
+                gemm(
+                    ctx.gpu,
+                    gk,
+                    normed,
+                    &comp.wgate,
+                    gate_comp,
+                    n,
+                    proj_dim,
+                    h,
+                    stream,
+                )?;
+            }
             // window softmax-gated compression → compressed [n_win, hd_mla]
             let compressed = ctx.buffers.moe_output();
             KernelLaunch::new(ctx.gpu, self.csa_compress_k)

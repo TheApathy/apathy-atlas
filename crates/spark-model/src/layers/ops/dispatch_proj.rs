@@ -290,6 +290,38 @@ pub fn cublas_bf16_proj_dense(
     spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight_bf16.0, out.0, m, n, k, stream)
 }
 
+/// Strided sibling of [`cublas_bf16_proj_dense`] for block-diagonal / grouped
+/// projections: the activation is a column slice of a wider row-major matrix
+/// (row stride `lda` elements) and the output is a column slice of a wider
+/// row-major matrix (row stride `ldc` elements); the BF16 weight is packed
+/// `[N,K]`. Always uses the cached per-(m,n,k,lda,ldc) autotuned plan (there
+/// is no per-call-heuristic strided entry point — the plan cache is strictly
+/// cheaper at 8 calls/layer).
+#[allow(clippy::too_many_arguments)]
+pub fn cublas_bf16_proj_dense_strided(
+    act: spark_runtime::gpu::DevicePtr,
+    lda: u32,
+    weight_bf16: spark_runtime::gpu::DevicePtr,
+    out: spark_runtime::gpu::DevicePtr,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<()> {
+    spark_runtime::cublaslt::bf16_gemm_act_weight_t_strided(
+        act.0,
+        lda,
+        weight_bf16.0,
+        out.0,
+        ldc,
+        m,
+        n,
+        k,
+        stream,
+    )
+}
+
 /// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through CUTLASS BF16.
 /// This is the M0 de-risk path for replacing Atlas/cuBLAS GEMMs with
 /// CUTLASS-backed kernels on GB10; keep it behind `ATLAS_CUTLASS_GEMM=1`.
