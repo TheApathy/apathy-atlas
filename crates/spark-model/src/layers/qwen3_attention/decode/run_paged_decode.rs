@@ -49,6 +49,40 @@ impl Qwen3AttentionLayer {
             // ── DeepSeek-V4-Flash MLA decode (guarded; before the generic arms) ──
             KvCacheDtype::Nvfp4 if is_v4_flash => {
                 let mla = self.mla.as_ref().unwrap();
+                // CORRECTNESS GUARD (2026-08-10, docs/KV-RECORD-ARITHMETIC-2026-08-10.md).
+                //
+                // `mla_paged_decode_nvfp4` (mla_paged_decode.cu) predates the V4
+                // hybrid-attention bring-up. Its parameter list has **no**
+                // `sliding_window`, **no** `attn_sink`, and **no**
+                // `comp_pool`/`comp_block_count`/`comp_ratio` — compare the FP8
+                // sibling `mla_paged_decode_fp8`, which takes all five. On
+                // DeepSeek-V4-Flash that means this kernel silently computes
+                // FULL causal attention over the raw pool and drops the CSA
+                // compressed pool entirely, on a model whose config is
+                // `sliding_window=128` with `compress_ratios` 4/128 on 41 of 43
+                // layers. Its header also documents `inv_sqrt_d // 1/sqrt(576)`,
+                // the softmax scale the FP8 path records as a measured
+                // regression (correct is 1/sqrt(512)).
+                //
+                // The result is not "slightly less precise" — it is a different
+                // attention operator. Failing loudly beats serving wrong tokens.
+                // There is no plan to build the missing kernel: the same doc
+                // measures the whole V4 KV read at 14.5 MB/step at 4096 ctx
+                // (0.22% of the 6.7 GB/token weight stream), so NVFP4 KV buys
+                // 0.17 ms of a 199 ms verify step. See the doc before reviving.
+                if mla.compressor.is_some() || self.sliding_window.is_some() {
+                    anyhow::bail!(
+                        "--kv-cache-dtype nvfp4 is not supported on DeepSeek-V4-Flash: \
+                         mla_paged_decode_nvfp4 has no sliding-window/attn-sink/compressed-pool \
+                         support and would compute full causal attention over the raw pool \
+                         (layer {}: compressor={}, sliding_window={:?}). Use --kv-cache-dtype fp8. \
+                         Rationale and the measured cost/benefit: \
+                         docs/KV-RECORD-ARITHMETIC-2026-08-10.md",
+                        self.attn_layer_idx,
+                        mla.compressor.is_some(),
+                        self.sliding_window,
+                    );
+                }
                 let kv_cache_dim = (mla.kv_lora_rank + mla.rope) as u32; // 512 + 64 = 576
                 tracing::trace!(
                     "V4-Flash MLA decode (NVFP4): q_head_dim={}, kv_cache_dim={}",
