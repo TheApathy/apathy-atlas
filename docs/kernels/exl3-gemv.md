@@ -328,8 +328,9 @@ LANDED (P1 prefill leg — GPU-unvalidated, gates 4-7 of the microtest):
 
 STILL OPEN:
 
-- m-row (γ-verify) MROW variant — `forward_km` declines for EXL3 (falls to
-  the guarded per-row path); the exact-verify twin is mandatory S6 scope.
+- ~~m-row (γ-verify) MROW variant — `forward_km` declines for EXL3~~ LANDED,
+  GPU-unvalidated — see §8. `exl3_gemv_mrow_fused_{gate_up,down}_m{1,2,4,6,8}`
+  + `MoeLayer::dispatch_exl3_verify`; `forward_km` no longer declines.
 - Real-checkpoint spot-check: run the dump gate against tp1 tiles.
 - Perf tuning after first GPU measurement: stage depth, `SPLIT_K` policy
   (dispatch default fills ~96 CTAs; `ATLAS_EXL3_SPLIT` overrides).
@@ -340,8 +341,7 @@ STILL OPEN:
   rider is no longer worth it — the SwiGLU is now ONE flat elementwise
   launch per layer over `[top_k, inter]`.
 
-- m-row (γ-verify) MROW variant — mandatory from day one per plan §3/§4.7
-  (partial-exactness law: the verify chain flips as a whole).
+- ~~m-row (γ-verify) MROW variant~~ LANDED — see §8.
 - Real-checkpoint spot-check (plan option a): run the dump gate against
   tiles from `/home/flocka/sparkinfer-ref/data/tp1` once readable.
 - ~~Perf tuning after first GPU measurement~~ round 2 done (ILP restructure
@@ -389,3 +389,144 @@ bytes suggests (the dequant repeats per LAYER, ×43). Under chunked prefill
 the cost multiplies again by the number of chunks (plan §6.3's flagged
 risk): a 2410-token prompt at `--max-prefill-tokens 1024` = 3 chunks ≈
 15–20 s prefill. Acceptable for the bring-up smoke; P2 is the fix.
+
+## 8. m-row (γ-verify) path — `exl3_gemv_mrow_fused_*` (2026-08-12)
+
+GPU-UNVALIDATED. Compiles for `gb10/deepseek-v4-flash` (zero spills), gated by
+GATE9 of `exl3_gemv_microtest`, which has NOT been run on hardware yet.
+
+### 8.1 Why this file is the gate on everything above 28 tok/s
+
+MXFP4 plain 21.89 / EXL3+fused plain 23.58 tok/s, measured back-to-back. But
+speculation did not work on EXL3 at all: `forward_km` declined for trellis
+layers, and its fallback `forward_batched` *hard-errors* on EXL3
+("forward_batched (M>1) not wired"). So arming DSpark on EXL3 was not merely
+slower — it was unavailable.
+
+The economics (docs/DECODE-WATERFALL-2026-08-10.md §6, docs/SPEC-3X-PLAN.md):
+the γ=5 verify step is ~113 ms eager, of which the m=6 expert union is 54.1 ms
+— the largest bucket and the only one that scales with verify width. At 3.0 bpw
+that bucket goes to ~38.4 ms, dropping the verify:plain step ratio 3.8 → ~2.85.
+At the committed 3.46 tok/step that turns speculation from a 0.91x LOSS into a
+1.21x win. The EXL3 byte cut helps VERIFY more than it helps plain.
+
+### 8.2 The contract, mirrored from MXFP4 `exp_splitk_m_t`
+
+Studied end to end (`moe_shared_expert_fused_t.cu` `mrow_gather_slots` +
+`gate_up_shared_t_m_impl` + `silu_down_shared_t_m_impl`,
+`forward_phase.rs::dispatch_splitk_m_t`, `forward_km.rs`). Reproduced exactly,
+so the scheduler above the dispatch is unchanged:
+
+| aspect | MXFP4 `_m` | EXL3 `_mrow` |
+|---|---|---|
+| flat routing | `indices[num_tokens*top_k]`, slot `y` ⇒ token `y/top_k` | same |
+| grid.y / z | `y` on grid.y, `proj*SPLIT+ks` on grid.z | SPLIT on grid.y (EXL3 needs it there), `2*y+proj` on grid.z |
+| dedup | first slot holding an id is LEADER, computes every slot routed to it; later duplicates exit before touching memory | same, `exl3_mrow_gather` |
+| gather bound | `M = min(count, MROW)`, surplus rows alias row 0 | same |
+| ladder | `_m{1,2,6,8}` + count-bucketed arms; host picks `MROW >= num_tokens` | `_m{1,2,4,6,8}`; host picks the smallest rung `>= num_tokens` |
+| shared expert | computed in-kernel on the `y == total_routed` block-set | NOT in-kernel — EXL3 shared weights are NVFP4, so it is the same per-row `w4a16_gemv` chain plain decode runs, `num_tokens` times |
+| output layout | routed slots flat in `expert_{gate,up,down}_out`, shared rows in the shared scratch | identical (blend untouched) |
+| split-K partials | `partial[2][SPLIT][rows][N]`, separate `*_finalize_m` launch | `ws` keyed by OUTPUT ROW (`2*slot+proj` / `slot`), `[S][N]` each; combine is in-kernel via the existing last-split election, so there is NO finalize launch |
+| graph safety | expert ids read on device, geometry independent of routing | same |
+
+The one contract that is *not* a mirror is the partial layout, and it is forced:
+the m=1 EXL3 kernels already do the split-K combine in-kernel (last split to
+arrive is elected by a self-resetting atomic), so a separate finalize kernel
+would change the accumulation structure and break bit-identity. Keying `ws` by
+the flat routed slot instead of by launch group is what makes that safe under
+dedup — slots are unique across leaders, so concurrent leaders never collide,
+while `counters` stays keyed by launch group exactly as at m=1.
+
+### 8.3 The exact-GEMV law, and how per-row bit-identity is guaranteed
+
+The binding constraint, learned expensively (memory
+`oproj-grouped-kernels-ab-2026-08-09`): a PARTIALLY exact verify chain is WORSE
+than either extreme — o-proj-only exactness measured 2.54 tok/step against 2.83
+for none and 2.92–3.01 for full. So each verify row's expert output must be
+bit-identical to the m=1 fused path's output for that same token.
+
+This is guaranteed structurally, not statistically:
+
+1. **x'** is produced by the SAME `exl3_input_pass` device function on the same
+   activation row and the same per-expert `suh`. The Hadamard is per aligned
+   128-chunk, so a chunk's x' bits depend only on that chunk — the smaller m-row
+   superblock (`EXL3_M_XCHUNKS = 8` vs `EXL3_MAX_XCHUNKS = 16`, a pure
+   smem/refill trade) cannot move a bit.
+2. **K-slice**: same `chunks_total*split/S` formula at the same `S`. The host
+   passes the m=1 `split_for(N)` — `dispatch_exl3_verify` deliberately does not
+   re-tune it, because re-slicing K is exactly how bit-identity would be lost.
+3. **Per-output op order**: same `r` order over the 8 tile-rows, same
+   `exl3_dq8` decode of the same trellis bytes, same four HFMA2 chains with the
+   same even/odd tile-row split, same fixed-order `__hadd2` +
+   `__half22float2` + four fp32 adds per 128-k chunk, same quad shuffle-reduce,
+   same fixed split-order combine (`p = 0..S-1`), same output
+   `exl3_had128` + `svh` + `*RSQRT128` + `__float2bfloat16`.
+4. **Rows never interact arithmetically.** Each row owns a private accumulator
+   chain; the ladder's surplus rows alias x' slice 0 and are dropped at emit.
+   Dedup changes only WHICH CTA evaluates a row — the same argument that makes
+   the m=1 → fused collapse bit-identical (GATE8).
+5. FP results are invariant under instruction scheduling, so the different
+   register allocation (110 regs / 2 CTAs per SM at MROW=6, vs 56–64 / 4 at
+   m=1) cannot move them either.
+
+The chain AROUND the GEMV is held exact the same way: the SwiGLU is the same
+elementwise `moe_silu_mul` over a wider flat extent, and the shared expert runs
+the SAME single-row `w4a16_gemv` chain once per row rather than a batched
+`w4a16_gemm` (different accumulation order ⇒ partial exactness ⇒ the law). That
+costs `4*num_tokens` small NVFP4 launches per layer — ~24 at γ=6, ~1000 per
+step across 43 layers, ~3 ms against a ~110 ms verify step. Batching it needs a
+bit-exact `w4a16_gemv_batchm`; that is the next lever here, not a shortcut.
+
+### 8.4 Launch and occupancy budget
+
+Per MoE layer at `num_tokens = 6`, `top_k = 8`:
+
+| stage | per-row fallback (today) | m-row |
+|---|---:|---:|
+| routed gate+up | 6 | 1 |
+| routed SwiGLU | 6 | 1 |
+| routed down | 6 | 1 |
+| shared (NVFP4) | 24 | 24 |
+| **total** | **42** | **27** |
+
+and, far more importantly, the routed trellis stream drops from
+`num_tokens * top_k` expert reads to `|union|` — the measured DSpark union is
+far below `6*top_k` (hash-routed layers pick the identical top-6 for every row;
+learned-gate layers measured 1.28x overlap at K=2).
+
+ptxas, sm_121, zero spills / zero stack on every arm:
+
+| arm | regs | smem | CTAs/SM |
+|---|---:|---:|---:|
+| `_m1` | 71–78 | 14 988 | 2 |
+| `_m2` | 86–89 | 17 680 | 2 |
+| `_m4` | 114–120 | 23 064 | 2 |
+| `_m6` | 109–110 | 28 448 | 2 |
+| `_m8` | 108–110 | 33 832 | 2 |
+
+`__launch_bounds__(256, 2)`, the MXFP4 `MOE_M_LB` lesson applied: the m-row arm
+carries MROW accumulator chains and is load-latency bound, so it wants
+registers to keep loads in flight, and smem already caps it near 3 CTAs/SM. The
+m=1 entries are UNTOUCHED (56/63/64 regs, 16 900 B smem — unchanged).
+
+Split-K scratch grew: `exl3_ws_floats` now sizes for the widest of the four
+claims (m=1 gate+up / down, m-row gate+up / down) using the ACTUAL splits
+rather than `EXL3_MAX_SPLIT`. At the V4 shapes the binding term is the m-row
+gate+up, 2·64·6·2048 f32 = 6.3 MB/layer (was 3.1 MB).
+
+### 8.5 What is NOT done
+
+- **Never run on a GPU.** GATE9 is the acceptance test; run it first.
+- The shared expert is `4*num_tokens` launches (see §8.3). A bit-exact
+  `w4a16_gemv_batchm` would take it to 4.
+- `EXL3_MROW_ARMS` tops out at 8 (= `MOE_DECODE_MAX_ROWS`). Past that
+  `verify_ffn_is_batched` declines, `forward_km` returns false, and
+  `forward_batched` hard-errors on EXL3 — the loud pre-existing failure, kept
+  deliberately over silently-wrong output. Widen the ladder before widening the
+  drafter.
+- No `GROUP_UNIQUE` / count-bucketed partition arms (the MXFP4 family's
+  `_m1u` / `_m6c56` tier). Whether the M==1-heavy leader distribution wants its
+  own arm here is a measurement, not a guess.
+- `forward_k2` (the n==2 fused K=2 path) still has no EXL3 arm;
+  `k2_verify_ffn_is_batched` therefore stays `_t`-only and EXL3 n==2 batches
+  through `forward_km` instead.

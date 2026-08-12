@@ -583,6 +583,474 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_d
                       counters + slot * (N >> 7), N, K);
 }
 
+// ===========================================================================
+// M-ROW (speculative verify) decode GEMV — the EXL3 twin of the MXFP4
+// `exp_splitk_m_t` family in moe_shared_expert_fused_t.cu.
+//
+// WHY. At the γ-verify the MoE runs num_tokens rows through the SAME routed
+// expert set. Without dedup every row re-streams the whole set: measured on
+// GB10 the m=6 MXFP4 expert union is 54.1 ms of a ~113 ms verify step, the
+// single largest bucket and the only one that scales with verify width. The
+// MXFP4 `_m` kernels elect ONE leader block per distinct expert id across all
+// rows and FMA the decoded weight into every row that selected it, so the
+// weight bytes are read once per expert instead of once per (expert, row).
+// This file's twin does the same for the 3.0 bpw trellis stream.
+//
+// CONTRACT MIRRORED FROM `exp_splitk_m_t` (so the scheduler above is unchanged):
+//
+//  1. ROW -> EXPERT. `indices` is the flat `[num_tokens*top_k]` routing buffer
+//     the per-row top-k kernels wrote. Flat slot y holds token `y / top_k`'s
+//     `y % top_k`-th expert. `total_routed = num_tokens * top_k`.
+//  2. UNION / DEDUP. One CTA-set per flat slot (gate_up rides `2*y + proj` on
+//     grid.z, down rides `y`). The FIRST slot holding a given expert id is the
+//     LEADER and computes every slot routed to that expert; later duplicates
+//     exit before touching memory. Election and the gather are done ON DEVICE
+//     by thread 0 over a cooperatively staged copy of `indices`.
+//  3. OUTPUT LAYOUT. Row m writes `out + slots[m]*N` — the same flat routed
+//     slot row the per-row m=1 chain writes, so SwiGLU and the blend are
+//     untouched.
+//  4. SPLIT-K PARTIALS. `ws` is indexed by the OUTPUT ROW, not by the launch
+//     group: region `ws_row = ws_row_mul*slots[m] + ws_row_add` (gate_up:
+//     `2*slot + proj`; down: `slot`), each `[S][N]` fp32. Flat routed slots
+//     are unique across leaders, so leaders never collide. `counters` stays
+//     indexed by launch group (`N/128` ints each) and is self-resetting, so
+//     back-to-back launches and graph replays still start from all-zero.
+//  5. GRAPH SAFETY. Expert ids are read on device; the launch geometry is a
+//     function of (num_tokens, top_k, N, K) only, never of the routing
+//     content. No D2H, identical launch sequence every step.
+//
+// THE EXACT-GEMV LAW (docs/DECODE-WATERFALL-2026-08-10.md, and the measured
+// o-proj result: partial exactness scored 2.54 tok/step against 2.83 for none
+// and 2.92-3.01 for full). Every verify row's expert output MUST be BIT-
+// IDENTICAL to what the m=1 fused path computes for that same token. This
+// kernel guarantees that STRUCTURALLY, not statistically:
+//
+//   * x' is produced by the SAME `exl3_input_pass` device function, on the
+//     same activation row and the same per-expert `suh`. The Hadamard is per
+//     aligned 128-chunk, so the x' bits for a chunk depend only on that chunk
+//     — the smaller m-row superblock (EXL3_M_XCHUNKS vs EXL3_MAX_XCHUNKS,
+//     which only trades smem for refill frequency) cannot move a single bit.
+//   * the K-slice per split uses the SAME `chunks_total*split/S` formula at
+//     the SAME S (the host passes the m=1 `split_for(N)`), so every split sees
+//     the identical 128-aligned chunk range.
+//   * per row the k order, the four HFMA2 chains, their even/odd tile-row
+//     assignment, the per-128-k-chunk `__hadd2` + `__half22float2` + four fp32
+//     adds, the quad shuffle-reduce, the fixed split-order combine (p = 0..S-1)
+//     and the output Hadamard/svh/bf16 store are the SAME op sequence, in the
+//     same order, as `exl3_gemv_m1_body`.
+//   * rows NEVER interact arithmetically. Each row owns a private accumulator
+//     chain; dedup changes only WHICH CTA evaluates a row, exactly like the
+//     m=1 -> fused collapse gated by GATE8. FP results are invariant under
+//     instruction scheduling, so register allocation and occupancy cannot move
+//     them either.
+//
+// Gated by GATE9 of `exl3_gemv_microtest` (every row byte-identical to the m=1
+// fused path at m in {2,4,6,8} with a non-slot-ordered, duplicate-heavy index
+// list, plus relaunch byte-identity across concurrent groups).
+// ===========================================================================
+
+// x' superblock per gathered row: 8 chunks = 1024 k, stored as packed __half2
+// = 2 KB/row. Eight chunks is exactly one per warp, so the input pass fills a
+// superblock in ONE fully-occupied iteration per row. Smaller than the m=1
+// kernel's 16 purely to keep MROW slices affordable in smem (MROW=6 -> 12 KB
+// x' + 12 KB stage + 3 KB s_y ~ 27 KB, 3 CTAs/SM on GB10's 100 KB). It is a
+// power of two, which the `s & (EXL3_M_XCHUNKS - 1)` refill/index arithmetic
+// requires, and it is numerically inert (see the law above).
+#define EXL3_M_XCHUNKS 8
+
+// Leader election + slot gather. Algorithmic twin of `mrow_gather_slots` in
+// moe_shared_expert_fused_t.cu, minus the shared-expert block-set (EXL3
+// checkpoints serve the shared expert through the NVFP4 `w4a16_gemv` chain,
+// outside this family).
+//
+// Returns a pointer to the block's shared `slots[MROW]`, or nullptr when this
+// block is a duplicate and must exit. Surplus ladder entries (MROW > gathered
+// count) are filled with slots[0] so every `s_slot[m]` read is defined; their
+// results are discarded at emit.
+//
+// `MROW*32` routing staging bounds `total_routed = num_tokens*top_k`: the host
+// picks MROW >= num_tokens, so the invariant is top_k <= 32 (EXL3_MAX_TOP_K).
+// Every branch below is block-uniform (y comes from blockIdx, total_routed from
+// the launch), so the __syncthreads are reached by all threads or none.
+template <int MROW>
+__device__ __forceinline__ const unsigned int* exl3_mrow_gather(
+    const unsigned int* __restrict__ indices, unsigned int y, unsigned int total_routed,
+    unsigned int& m_out) {
+    __shared__ unsigned int s_idx[MROW * 32];
+    __shared__ unsigned int s_slot[MROW];
+    __shared__ unsigned int s_m;
+    // Stage the routing cooperatively — the scan below is serial on thread 0,
+    // and leaving it against global memory makes every block pay up to `y`
+    // dependent loads with the rest of the block parked at the barrier.
+    for (unsigned int i = threadIdx.x; i < total_routed; i += blockDim.x) {
+        s_idx[i] = indices[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned int m = 0;
+        const unsigned int e = s_idx[y];
+        bool leader = true;
+        for (unsigned int s = 0; s < y; ++s) {
+            if (s_idx[s] == e) {
+                leader = false;
+                break;
+            }
+        }
+        if (leader) {
+            for (unsigned int s = y; s < total_routed; ++s) {
+                if (s_idx[s] == e) {
+                    if (m < MROW) s_slot[m] = s;
+                    ++m;
+                }
+            }
+        }
+        s_m = m;  // 0 => duplicate slot, nothing to do
+        // Alias the ladder's surplus rows onto row 0 (see the header note).
+        if (m > 0) {
+            for (unsigned int i = m; i < MROW; ++i) s_slot[i] = s_slot[0];
+        }
+    }
+    __syncthreads();
+    if (s_m == 0) return nullptr;
+    m_out = min(s_m, (unsigned int)MROW);
+    return s_slot;
+}
+
+// The m-row body. `A_IS_TOKEN` picks the activation row mapping:
+//   true  (gate/up): A is `[num_tokens, K]`, row = slots[m] / top_k
+//   false (down)   : A is `[total_routed, K]`, row = slots[m]
+template <int MROW, bool A_IS_TOKEN>
+__device__ __forceinline__ void exl3_gemv_mrow_body(
+    const __nv_bfloat16* __restrict__ A,         // activation base (see A_IS_TOKEN)
+    const unsigned short* __restrict__ trellis,  // [K/16, N/16, 48] for this expert
+    const __half* __restrict__ suh,              // [K]
+    const __half* __restrict__ svh,              // [N]
+    __nv_bfloat16* __restrict__ C,               // [total_routed, N] output base
+    float* __restrict__ ws,                      // base; row region = [S, N]
+    int* __restrict__ counters,                  // pre-offset by launch group
+    const unsigned int* __restrict__ s_slot,     // shared [MROW] from the gather
+    unsigned int M,                              // gathered rows (<= MROW)
+    unsigned int ws_row_mul, unsigned int ws_row_add, unsigned int top_k, unsigned int N,
+    unsigned int K) {
+    __shared__ __align__(16) __half2 s_x[MROW * EXL3_M_XCHUNKS * 64];
+    __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 12 KB
+    __shared__ float s_y[MROW][EXL3_NSTRIP];
+    __shared__ int s_elect;
+
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int n0 = blockIdx.x * EXL3_NSTRIP;
+    const int nb0 = n0 >> 4;  // first tile-column of the strip
+    const int n_tiles_row = N >> 4;
+    const int S = gridDim.y;
+    const int split = blockIdx.y;
+
+    // 128-aligned K-slice for this split — IDENTICAL formula and identical S
+    // to exl3_gemv_m1_body, which is half the exact-GEMV argument.
+    const int chunks_total = K >> 7;
+    const int c_lo = (int)(((long long)chunks_total * split) / S);
+    const int c_hi = (int)(((long long)chunks_total * (split + 1)) / S);
+    const int rows_lo = c_lo * 8;
+    const int rows_hi = c_hi * 8;
+    const int nstages = c_hi - c_lo;
+
+    // Kick the trellis pipeline before the x' pass — this is the ONE stream
+    // the dedup exists to read once, so it starts first.
+    const uint4* trellis_u4 = (const uint4*)trellis;
+    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, rows_hi, n_tiles_row, nb0);
+    if (nstages > 1)
+        exl3_load_stage((uint4*)s_stage[1], trellis_u4, rows_lo + EXL3_STAGE_ROWS, rows_hi,
+                        n_tiles_row, nb0);
+
+    // Per-row activation base. Read from smem at the point of use rather than
+    // cached in an `A_row[MROW]` register array: it is touched only in the
+    // (cold) input pass, and MROW live pointers through the k sweep is exactly
+    // the register pressure the MXFP4 twin's ladder note warns about.
+#define EXL3_M_AROW(m_) \
+    (A + (unsigned long long)(A_IS_TOKEN ? (s_slot[(m_)] / top_k) : s_slot[(m_)]) * K)
+
+    // ---- Phase 1: x' for the first superblock, one slice per gathered row ----
+    {
+        int sb1 = c_lo + EXL3_M_XCHUNKS;
+        if (sb1 > c_hi) sb1 = c_hi;
+#pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            exl3_input_pass(EXL3_M_AROW(m), suh, s_x + m * (EXL3_M_XCHUNKS * 64), c_lo, sb1,
+                            warp, lane);
+        }
+    }
+    __syncthreads();
+
+    // ---- Phase 2: stream + decode ONCE + accumulate into every row ----
+    float acc0[MROW];  // n = 16*warp + lane/4
+    float acc1[MROW];  // n = 16*warp + lane/4 + 8
+#pragma unroll
+    for (int m = 0; m < MROW; ++m) {
+        acc0[m] = 0.0f;
+        acc1[m] = 0.0f;
+    }
+    const Exl3LaneGeom g = exl3_lane_geom(lane);
+    const int xkh = lane & 3;  // half2 (k-pair) index within the 16-k tile row
+    // Surplus ladder rows alias x' slice 0 — defined arithmetic, discarded at
+    // emit (the twin of the MXFP4 `act_row[m]` slice-0 aliasing).
+    int xoff[MROW];
+#pragma unroll
+    for (int m = 0; m < MROW; ++m)
+        xoff[m] = ((m < (int)M) ? m : 0) * (EXL3_M_XCHUNKS * 64);
+
+    for (int s = 0; s < nstages; ++s) {
+        if (s != 0 && (s & (EXL3_M_XCHUNKS - 1)) == 0) {
+            // Superblock boundary: refill every row's x' for chunks
+            // [c_lo+s, +EXL3_M_XCHUNKS). The previous iteration's trailing
+            // __syncthreads() ordered all reads of the old superblock before
+            // this overwrite; the two in-flight cp.async stages are unaffected.
+            int sb0 = c_lo + s;
+            int sb1 = sb0 + EXL3_M_XCHUNKS;
+            if (sb1 > c_hi) sb1 = c_hi;
+#pragma unroll
+            for (int m = 0; m < MROW; ++m) {
+                if (m >= (int)M) break;
+                exl3_input_pass(EXL3_M_AROW(m), suh, s_x + m * (EXL3_M_XCHUNKS * 64), sb0,
+                                sb1, warp, lane);
+            }
+            __syncthreads();
+        }
+        if (s + 1 < nstages)
+            asm volatile("cp.async.wait_group 1;");
+        else
+            asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+
+        const unsigned int* stage32 = (const unsigned int*)s_stage[s & 1];
+        const int xc = ((s & (EXL3_M_XCHUNKS - 1)) << 6) + xkh;
+
+        const __half2 hz = __float2half2_rn(0.0f);
+        __half2 hacc0e[MROW], hacc0o[MROW], hacc1e[MROW], hacc1o[MROW];
+#pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            hacc0e[m] = hz;
+            hacc0o[m] = hz;
+            hacc1e[m] = hz;
+            hacc1o[m] = hz;
+        }
+#pragma unroll
+        for (int r = 0; r < EXL3_STAGE_ROWS; ++r) {
+            const unsigned int* tile = stage32 + (r * 8 + warp) * EXL3_TILE_U32;
+            __half2 d01, d23, d45, d67;
+            // THE WIN: one 96-B tile decoded once, FMA'd into all M rows.
+            exl3_dq8(tile, g, d01, d23, d45, d67);
+#pragma unroll
+            for (int m = 0; m < MROW; ++m) {
+                const __half2* xrow = s_x + xoff[m] + xc;
+                __half2 xa = xrow[(r << 3)];      // k, k+1
+                __half2 xb = xrow[(r << 3) + 4];  // k+8, k+9
+                // Per row: the SAME four chains, the SAME even/odd tile-row
+                // assignment, the SAME operand order as exl3_gemv_m1_body.
+                if (r & 1) {
+                    hacc0o[m] = __hfma2(d01, xa, hacc0o[m]);
+                    hacc0o[m] = __hfma2(d23, xb, hacc0o[m]);
+                    hacc1o[m] = __hfma2(d45, xa, hacc1o[m]);
+                    hacc1o[m] = __hfma2(d67, xb, hacc1o[m]);
+                } else {
+                    hacc0e[m] = __hfma2(d01, xa, hacc0e[m]);
+                    hacc0e[m] = __hfma2(d23, xb, hacc0e[m]);
+                    hacc1e[m] = __hfma2(d45, xa, hacc1e[m]);
+                    hacc1e[m] = __hfma2(d67, xb, hacc1e[m]);
+                }
+            }
+        }
+        // Fixed-order per-chunk combine into fp32, per row (deterministic, and
+        // the same expression sequence the single-row kernel uses).
+#pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            __half2 h0 = __hadd2(hacc0e[m], hacc0o[m]);
+            __half2 h1 = __hadd2(hacc1e[m], hacc1o[m]);
+            float2 f0 = __half22float2(h0);
+            float2 f1 = __half22float2(h1);
+            acc0[m] += f0.x;
+            acc0[m] += f0.y;
+            acc1[m] += f1.x;
+            acc1[m] += f1.y;
+        }
+
+        __syncthreads();
+        if (s + 2 < nstages)
+            exl3_load_stage((uint4*)s_stage[s & 1], trellis_u4,
+                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, rows_hi, n_tiles_row, nb0);
+    }
+
+    // ---- Phase 3: reduce + (elected) output Hadamard + svh + store ----
+    // Quad reduction per row: lanes with equal lane/4 hold the same n over
+    // disjoint k. Run for ALL MROW rows — the shuffles need full-warp
+    // participation and MROW is a literal, so no lane can diverge.
+#pragma unroll
+    for (int m = 0; m < MROW; ++m) {
+        float a0 = acc0[m];
+        float a1 = acc1[m];
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 1);
+        a0 += __shfl_xor_sync(0xffffffffu, a0, 2);
+        a1 += __shfl_xor_sync(0xffffffffu, a1, 1);
+        a1 += __shfl_xor_sync(0xffffffffu, a1, 2);
+        if ((lane & 3) == 0) {
+            s_y[m][warp * 16 + (lane >> 2)] = a0;
+            s_y[m][warp * 16 + (lane >> 2) + 8] = a1;
+        }
+    }
+    __syncthreads();
+
+    if (S > 1) {
+        // Publish each row's raw (pre-Hadamard) partial into ITS OWN region —
+        // keyed by the flat routed slot, which is unique across leaders — then
+        // elect the LAST split of this launch group to finish. Fixed combine
+        // order (split 0..S-1) keeps the fp32 sum deterministic, and identical
+        // to the single-row kernel's.
+#pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            if (threadIdx.x < EXL3_NSTRIP) {
+                const unsigned long long wr =
+                    (unsigned long long)ws_row_mul * s_slot[m] + ws_row_add;
+                ws[(wr * S + split) * N + n0 + threadIdx.x] = s_y[m][threadIdx.x];
+            }
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int prev = atomicAdd(&counters[blockIdx.x], 1);
+            s_elect = (prev == S - 1) ? 1 : 0;
+        }
+        __syncthreads();
+        if (!s_elect) return;
+        __threadfence();
+#pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;
+            if (threadIdx.x < EXL3_NSTRIP) {
+                const unsigned long long wr =
+                    (unsigned long long)ws_row_mul * s_slot[m] + ws_row_add;
+                float sum = 0.0f;
+                for (int p = 0; p < S; ++p) sum += ws[(wr * S + p) * N + n0 + threadIdx.x];
+                s_y[m][threadIdx.x] = sum;
+            }
+        }
+        if (threadIdx.x == 0) counters[blockIdx.x] = 0;  // re-arm for next launch
+        __syncthreads();
+    }
+
+    if (warp == 0) {
+#pragma unroll
+        for (int m = 0; m < MROW; ++m) {
+            if (m >= (int)M) break;  // warp-uniform: had128's shuffles stay full
+            const int nb = n0 + lane * 4;
+            float h0 = s_y[m][lane * 4 + 0];
+            float h1 = s_y[m][lane * 4 + 1];
+            float h2 = s_y[m][lane * 4 + 2];
+            float h3 = s_y[m][lane * 4 + 3];
+            exl3_had128(h0, h1, h2, h3, lane);
+            __nv_bfloat16* dst = C + (unsigned long long)s_slot[m] * N;
+            dst[nb + 0] = __float2bfloat16(h0 * EXL3_RSQRT128 * __half2float(svh[nb + 0]));
+            dst[nb + 1] = __float2bfloat16(h1 * EXL3_RSQRT128 * __half2float(svh[nb + 1]));
+            dst[nb + 2] = __float2bfloat16(h2 * EXL3_RSQRT128 * __half2float(svh[nb + 2]));
+            dst[nb + 3] = __float2bfloat16(h3 * EXL3_RSQRT128 * __half2float(svh[nb + 3]));
+        }
+    }
+#undef EXL3_M_AROW
+}
+
+// Register-budget hint for the whole m-row family, mirroring the MXFP4 twin's
+// `MOE_M_LB`. The m-row arm carries MROW accumulator chains and is
+// load-latency bound, so it wants registers to keep loads in flight; smem
+// already caps it at 3 CTAs/SM at MROW=6, so "(256, 2)" is the honest floor
+// and lets ptxas spend up to 128 registers where that pays. Scheduling hint
+// only — no op changes, so the exact-GEMV law is untouched.
+#define EXL3_MROW_LB __launch_bounds__(EXL3_BLOCK, 2)
+
+// Fused gate+up over all routed slots of the whole verify block.
+//   grid = (N/128, SPLIT_K, 2*num_tokens*top_k), z = 2*slot + proj
+//   ws   >= 2*num_tokens*top_k * SPLIT_K * N floats
+//   counters >= 2*num_tokens*top_k * (N/128) ints, zero before the FIRST launch
+#define EXL3_MROW_GATE_UP_ENTRY(NAME, MROW_)                                                 \
+    extern "C" __global__ void EXL3_MROW_LB NAME(                                            \
+        const __nv_bfloat16* __restrict__ A,                    /* [num_tokens, K] */        \
+        const unsigned long long* __restrict__ gate_trellis_tab,                             \
+        const unsigned long long* __restrict__ gate_suh_tab,                                 \
+        const unsigned long long* __restrict__ gate_svh_tab,                                 \
+        const unsigned long long* __restrict__ up_trellis_tab,                               \
+        const unsigned long long* __restrict__ up_suh_tab,                                   \
+        const unsigned long long* __restrict__ up_svh_tab,                                   \
+        const unsigned int* __restrict__ indices,               /* [num_tokens*top_k] */     \
+        __nv_bfloat16* __restrict__ gate_out,                   /* [num_tokens*top_k, N] */  \
+        __nv_bfloat16* __restrict__ up_out,                                                  \
+        float* __restrict__ ws, int* __restrict__ counters, unsigned int N, unsigned int K,  \
+        unsigned int top_k, unsigned int num_tokens) {                                       \
+        const unsigned int total_routed = num_tokens * top_k;                                \
+        const unsigned int group = blockIdx.z;                                               \
+        const unsigned int y = group >> 1;                                                   \
+        const unsigned int proj = group & 1u; /* 0 = gate, 1 = up */                         \
+        unsigned int M = 0;                                                                  \
+        const unsigned int* slots = exl3_mrow_gather<(MROW_)>(indices, y, total_routed, M);  \
+        if (!slots) return; /* duplicate expert: the leader covers this slot */              \
+        const unsigned int e = indices[y];                                                   \
+        const unsigned long long* tt = proj ? up_trellis_tab : gate_trellis_tab;             \
+        const unsigned long long* su = proj ? up_suh_tab : gate_suh_tab;                     \
+        const unsigned long long* sv = proj ? up_svh_tab : gate_svh_tab;                     \
+        exl3_gemv_mrow_body<(MROW_), true>(                                                  \
+            A, (const unsigned short*)tt[e], (const __half*)su[e], (const __half*)sv[e],     \
+            proj ? up_out : gate_out, ws, counters + group * (N >> 7), slots, M, 2u, proj,   \
+            top_k, N, K);                                                                    \
+    }
+
+// Fused down over all routed slots. Slot s consumes the SwiGLU activation row
+// `act + s*K` (K = intermediate size) and writes `down_out + s*N`.
+//   grid = (N/128, SPLIT_K, num_tokens*top_k), z = slot
+#define EXL3_MROW_DOWN_ENTRY(NAME, MROW_)                                                    \
+    extern "C" __global__ void EXL3_MROW_LB NAME(                                            \
+        const __nv_bfloat16* __restrict__ act,                  /* [num_tokens*top_k, K] */  \
+        const unsigned long long* __restrict__ trellis_tab,                                  \
+        const unsigned long long* __restrict__ suh_tab,                                      \
+        const unsigned long long* __restrict__ svh_tab,                                      \
+        const unsigned int* __restrict__ indices,                                            \
+        __nv_bfloat16* __restrict__ down_out,                   /* [num_tokens*top_k, N] */  \
+        float* __restrict__ ws, int* __restrict__ counters, unsigned int N, unsigned int K,  \
+        unsigned int top_k, unsigned int num_tokens) {                                       \
+        const unsigned int total_routed = num_tokens * top_k;                                \
+        const unsigned int y = blockIdx.z;                                                   \
+        unsigned int M = 0;                                                                  \
+        const unsigned int* slots = exl3_mrow_gather<(MROW_)>(indices, y, total_routed, M);  \
+        if (!slots) return;                                                                  \
+        const unsigned int e = indices[y];                                                   \
+        exl3_gemv_mrow_body<(MROW_), false>(                                                 \
+            act, (const unsigned short*)trellis_tab[e], (const __half*)suh_tab[e],           \
+            (const __half*)svh_tab[e], down_out, ws, counters + y * (N >> 7), slots, M, 1u,  \
+            0u, top_k, N, K);                                                                \
+    }
+
+// The ladder. An MROW=R entry is correct for ANY num_tokens <= R (an expert can
+// be duplicated at most num_tokens times, since a token's top-k ids are
+// distinct), so the host picks the SMALLEST rung >= num_tokens and never over-
+// provisions the accumulator array. Going the other way is a CORRECTNESS bug,
+// not a slowdown: a gather of more than MROW slots silently drops the tail and
+// those rows come out unwritten.
+//
+// MROW=1 exists solely as the microtest's bit-exactness reference against the
+// shipping `exl3_gemv_m1_fused_*` pair (same discipline as the MXFP4
+// `_m1v2s4` entries).
+EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m1, 1)
+EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m2, 2)
+EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m4, 4)
+EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m6, 6)
+EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m8, 8)
+
+EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m1, 1)
+EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m2, 2)
+EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m4, 4)
+EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m6, 6)
+EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m8, 8)
+
+#undef EXL3_MROW_GATE_UP_ENTRY
+#undef EXL3_MROW_DOWN_ENTRY
+
 // ---------------------------------------------------------------------------
 // exl3_dequant_dump: debug oracle — decode every tile and store the raw fp16
 // weights as W[n][k] row-major [N, K] (NO Hadamard / suh / svh applied). The

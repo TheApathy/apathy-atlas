@@ -224,11 +224,20 @@ impl MoeLayer {
     /// 19.8 tok/s against the per-row loop, so "batch when we can" is only the
     /// right default while the fast path is the one that fires.
     pub fn k2_verify_ffn_is_batched(&self, ctx: &ForwardContext) -> bool {
-        self.verify_ffn_is_batched(ctx, 2)
+        // `_t`-layout ONLY. The caller gates `forward_k2`, whose fallback arm
+        // reaches straight for `down_ptrs_t` and would panic on an EXL3 layer;
+        // trellis experts batch through `forward_km` (the width-parameterised
+        // predicate below), not through the K=2 fused path.
+        self.exl3.is_none() && self.verify_ffn_is_batched(ctx, 2)
     }
 
     /// [`Self::k2_verify_ffn_is_batched`] for an arbitrary verify width.
     pub fn verify_ffn_is_batched(&self, ctx: &ForwardContext, num_tokens: u32) -> bool {
+        if self.exl3.is_some() {
+            // EXL3 trellis experts answer through their own dedup'd m-row
+            // family (`exl3_gemv_mrow_fused_*`), not the `_t` split-K ladder.
+            return self.exl3_verify_is_batched(ctx, num_tokens);
+        }
         if !self.use_t_layout_for_decode() {
             return false;
         }
