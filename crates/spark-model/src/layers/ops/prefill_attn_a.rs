@@ -13,6 +13,38 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight}
 
 use super::*;
 
+/// Pick (block, grid) for the batched rope extract/writeback pair.
+///
+/// Both kernels are pure element copies over one flat index
+/// (`mla_absorbed.cu:199` and `:222`:
+/// `for (idx = blockIdx.x*blockDim.x + threadIdx.x; idx < total;
+///       idx += gridDim.x*blockDim.x)`), fully parameterised on `blockDim.x`
+/// and `gridDim.x`. The body is `dst[f(idx)] = src[g(idx)]` — no arithmetic, no
+/// shared memory, no `__syncthreads`, no atomics, no reduction — so ANY
+/// (grid, block) partition of `total` produces bit-identical output: each
+/// destination element is written exactly once with a value that was only
+/// copied.
+///
+/// Prefill (`total` in the millions) already covers the machine at 256 threads
+/// and stays there. Decode is the underfilled case: `total = nq*rope = 4096`,
+/// which at 256 threads is `div_ceil(4096,256) = 16` CTAs — 16 of 48 SMs, with
+/// grid alone unable to help because raising it past `total/blockDim` only adds
+/// CTAs that fall straight out of the loop. Dropping to 64 threads gives 64
+/// CTAs at the same one-element-per-thread density and the same coalescing
+/// (64 contiguous BF16 = 128 B), covering every SM.
+///
+/// Occupancy census: `docs/DECODE-OCCUPANCY-CENSUS.md`.
+fn rope_copy_launch_dims(total: u32) -> (u32, u32) {
+    const WIDE: u32 = 256;
+    const NARROW: u32 = 64;
+    let wide_grid = div_ceil(total, WIDE);
+    if wide_grid >= atlas_core::device::sm121::NUM_SMS {
+        (wide_grid, WIDE)
+    } else {
+        (div_ceil(total, NARROW).max(1), NARROW)
+    }
+}
+
 /// Batched Q rope extract: [N, nq, hd] → [N, nq, rope] at offset nope per head.
 /// 1 kernel replaces N*nq D2D copies per layer.
 #[allow(clippy::too_many_arguments)]
@@ -30,9 +62,10 @@ pub fn mla_q_rope_extract_batched(
     stream: u64,
 ) -> Result<()> {
     let total = num_tokens * nq * rope;
+    let (grid, block) = rope_copy_launch_dims(total);
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(total, 256), 1, 1])
-        .block([256, 1, 1])
+        .grid([grid, 1, 1])
+        .block([block, 1, 1])
         .arg_ptr(q_full)
         .arg_ptr(q_rope_out)
         .arg_u32(num_tokens)
@@ -60,9 +93,10 @@ pub fn mla_q_rope_writeback_batched(
     stream: u64,
 ) -> Result<()> {
     let total = num_tokens * nq * rope;
+    let (grid, block) = rope_copy_launch_dims(total);
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(total, 256), 1, 1])
-        .block([256, 1, 1])
+        .grid([grid, 1, 1])
+        .block([block, 1, 1])
         .arg_ptr(q_rope_in)
         .arg_ptr(q_full)
         .arg_u32(num_tokens)

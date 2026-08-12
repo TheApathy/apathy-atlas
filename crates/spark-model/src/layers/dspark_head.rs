@@ -601,6 +601,15 @@ impl DsparkDraftHead {
         let hu = h as usize;
         let hc = self.hc_mult;
         let noise = self.module.params.noise_token_id;
+        // One block per 256 hidden lanes (16 at H=4096), matching the plain
+        // decode path (`decode_inner.rs:521`). `hc_post` is a grid-stride loop
+        // over the hidden dim (`hyper_connection.cu:637`) whose iterations are
+        // independent — no __syncthreads, no atomics, no shared reduction, and
+        // each lane writes only its own `d` — so extra blocks partition the
+        // same lanes and the arithmetic per output element is unchanged. The
+        // drafter's block width `b` is 1-8, so the unsharded grid (b,1,1) left
+        // 40+ of 48 SMs idle at every stage boundary.
+        let post_shards = h.div_ceil(256);
 
         // Block rows: [committed, noise×(b-1)] embedded from the shared table.
         for r in 0..b as usize {
@@ -968,7 +977,7 @@ impl DsparkDraftHead {
             }
             self.dbg(gpu, &format!("s{s}.attn5.r0"), self.attn5, hu, stream);
             pprof!("d_o_proj");
-            ops::hc_post(
+            ops::hc_post_sharded(
                 gpu,
                 self.k_hc_post,
                 self.attn5,
@@ -979,6 +988,7 @@ impl DsparkDraftHead {
                 b,
                 h,
                 hc,
+                post_shards,
                 stream,
             )?;
             self.dbg_f32(gpu, &format!("s{s}.hc_post_attn"), nxt, 8, stream);
@@ -1022,7 +1032,7 @@ impl DsparkDraftHead {
                 .with_context(|| format!("DSpark stage {s} MoE"))?;
             let moe_out = ctx.buffers.moe_output();
             self.dbg(gpu, &format!("s{s}.moe.r0"), moe_out, hu, stream);
-            ops::hc_post(
+            ops::hc_post_sharded(
                 gpu,
                 self.k_hc_post,
                 moe_out,
@@ -1033,6 +1043,7 @@ impl DsparkDraftHead {
                 b,
                 h,
                 hc,
+                post_shards,
                 stream,
             )?;
             std::mem::swap(&mut cur, &mut nxt);

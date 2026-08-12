@@ -227,6 +227,19 @@ impl Qwen3AttentionLayer {
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
+        // One block per 256 hidden lanes — 16 at H=4096 — the same shard count
+        // the plain path computes at `decode_inner.rs:521`. `hc_post` is a
+        // grid-stride loop over the hidden dim
+        // (`d = blockIdx.y*HC_BLOCK + tid; d < H; d += HC_BLOCK*gridDim.y`,
+        // `hyper_connection.cu:637`) whose iterations are independent: no
+        // __syncthreads, no atomics, no shared-memory reduction, and `out` is
+        // only ever written at the `d` each lane owns. So extra blocks purely
+        // partition the same lanes and every output element keeps identical
+        // arithmetic. Constant at graph-capture time (H is fixed), so this is
+        // graph-safe. All three verify-path sites below used the unsharded
+        // `ops::hc_post`, i.e. grid.y == 1: at n=6 that put 6 rows on 6 of 48
+        // SMs, and the per-row loop sites put ONE row on ONE SM.
+        let post_shards = (h as u32).div_ceil(256);
         // diag_norm syncs the stream — illegal under CUDA-graph capture (see
         // decode_inner.rs); never probe while capturing.
         let diag_this = std::env::var("ATLAS_DIAG_V4_ALL_LAYERS")
@@ -417,7 +430,9 @@ impl Qwen3AttentionLayer {
             );
         }
         // Expand attention output back into multi-stream state.
-        ops::hc_post(
+        // Sharded over the hidden dim — see the `post_shards` note above; the
+        // grid goes (n,1,1) -> (n,16,1) with bit-identical output.
+        ops::hc_post_sharded(
             ctx.gpu,
             self.hc_post_k,
             o_out,
@@ -428,6 +443,7 @@ impl Qwen3AttentionLayer {
             n as u32,
             h as u32,
             hc_mult,
+            post_shards,
             stream,
         )?;
         if diag_this {
@@ -552,7 +568,10 @@ impl Qwen3AttentionLayer {
                 let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
                 let post_i = post.offset(i * hc.hc_mult * 4);
                 let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
-                ops::hc_post(
+                // Sharded over the hidden dim — see `post_shards` above. This
+                // is a per-ROW loop, so the unsharded form was grid (1,1,1):
+                // one CTA of 48 SMs, n times per layer. Bit-identical.
+                ops::hc_post_sharded(
                     ctx.gpu,
                     self.hc_post_k,
                     moe_out,
@@ -563,6 +582,7 @@ impl Qwen3AttentionLayer {
                     1,
                     h as u32,
                     hc_mult,
+                    post_shards,
                     stream,
                 )?;
             }
@@ -623,7 +643,10 @@ impl Qwen3AttentionLayer {
                 let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
                 let post_i = post.offset(i * hc.hc_mult * 4);
                 let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
-                ops::hc_post(
+                // Sharded over the hidden dim — see `post_shards` above. This
+                // is a per-ROW loop, so the unsharded form was grid (1,1,1):
+                // one CTA of 48 SMs, n times per layer. Bit-identical.
+                ops::hc_post_sharded(
                     ctx.gpu,
                     self.hc_post_k,
                     moe_out,
@@ -634,6 +657,7 @@ impl Qwen3AttentionLayer {
                     1,
                     h as u32,
                     hc_mult,
+                    post_shards,
                     stream,
                 )?;
             }

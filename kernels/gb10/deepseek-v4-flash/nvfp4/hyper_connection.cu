@@ -413,7 +413,7 @@ extern "C" __global__ void hc_pre_mix_tiled(
 //
 // `hc_pre` is a one-block-per-token kernel. That is the right shape for
 // prefill (T is large, so the grid fills the GPU), but at decode T == 1, so the
-// whole kernel runs on ONE SM of 25 — while its pass-2 loop streams the entire
+// whole kernel runs on ONE SM of 48 — while its pass-2 loop streams the entire
 // `hc_fn` matrix, [mix_hc=24, hc*H=16384] fp32 = 1.5 MiB, from DRAM. With two
 // HC sites per layer over 43 layers that is ~129 MiB per token pulled at
 // single-SM bandwidth (~8 GB/s measured), i.e. tens of ms per token for work
@@ -436,7 +436,7 @@ extern "C" __global__ void hc_pre_mix_tiled(
 // Wide (float4) loads and 512 threads are both about memory-level parallelism,
 // not arithmetic: each thread's loop is a dependent accumulate, so throughput is
 // (bytes in flight) / (DRAM latency). At 256 scalar-loading threads this kernel
-// measured 19 GB/s even with all 25 SMs busy; 512 threads × 16-byte loads puts
+// measured 19 GB/s even with every block resident; 512 threads × 16-byte loads puts
 // 8× more in flight per SM.
 //
 // NOTE: float4 lanes reassociate the sum relative to the scalar `hc_pre` (fp32,
@@ -469,8 +469,20 @@ extern "C" __global__ void hc_pre_mix(
         const float4* x4 = reinterpret_cast<const float4*>(x);
         if (m == mix_hc) {
             // The RMS reduction gets its own block rather than riding along on
-            // block 0: with mix_hc+1 == 25 blocks and 25 SMs, doubling any one
-            // block's work would double the whole kernel's wall time.
+            // block 0: the grid is mix_hc+1 == 25 blocks, all launched at once,
+            // so doubling any one block's work doubles the whole kernel's wall
+            // time.
+            //
+            // NOTE (occupancy census, docs/DECODE-OCCUPANCY-CENSUS.md): this
+            // comment used to read "25 blocks and 25 SMs" and treated the grid
+            // as SM-filling. It is not — `cudaGetDeviceProperties` reports 48
+            // SMs on this box (`atlas-core::device::sm121::NUM_SMS`), so a
+            // 25-block grid covers 52% of the machine at 1 block/SM and 17% of
+            // the 144-CTA resident capacity. The coincidence that mix_hc+1
+            // equals the *wrongly remembered* SM count is why this grid was
+            // never split. Fixing it needs split-k over `nvec` plus a finalize
+            // pass, which reassociates the dot product — a kernel change gated
+            // on the quality oracle, not a launcher change.
             for (unsigned int k = tid; k < nvec; k += HC_MIX_BLOCK) {
                 float4 v = x4[k];
                 acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
