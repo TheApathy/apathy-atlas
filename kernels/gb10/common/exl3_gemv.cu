@@ -38,14 +38,16 @@
 //   - grid.x = N/128 output strips (8 tile-columns each), grid.y = SPLIT_K.
 //   - block = 256 threads = 8 warps. Warp w owns tile-column w of the strip;
 //     lane accumulates 2 outputs (n = 16w + lane/4 and +8) in fp32.
-//   - Phase 1: block computes x' for one SUPERBLOCK (up to 16 chunks
-//     = 2048 k) of its K-slice into smem, one 128-chunk per warp via the
+//   - Phase 1: block computes x' for one SUPERBLOCK (up to 8 chunks
+//     = 1024 k) of its K-slice into smem, one 128-chunk per warp via the
 //     warp-shuffle Hadamard (4 elems/lane, fp32 math); refilled per
 //     superblock, so the K-slice length is unbounded. x' is STORED as
-//     packed __half2 (k, k+1) pairs — 4 KB — feeding the half2 dot path
+//     packed __half2 (k, k+1) pairs — 2 KB — feeding the half2 dot path
 //     below (round 3; the fp16 store is a quantization of x', part of the
 //     documented numerics tier, see docs/kernels/exl3-gemv.md §3b).
-//   - Phase 2: trellis is streamed through a 2-stage cp.async smem pipeline;
+//     At the production geometry a CTA runs 4-6 stages, so the refill never
+//     fires after the prologue.
+//   - Phase 2: trellis is streamed through a 3-stage cp.async smem ring;
 //     each stage is 8 tile-rows x 8 tile-cols = 6 KB (one 128-k chunk),
 //     issued as 16-B cp.async per thread — wide, coalesced, contiguous 768-B
 //     runs per tile-row. One warp decodes one 96-B tile per iteration with
@@ -53,19 +55,37 @@
 //     accumulated in __half2 HFMA2 chains (4 independent chains: {acc0,acc1}
 //     x even/odd tile-row), converted to fp32 ONCE PER 128-k CHUNK in fixed
 //     order — this removes the 8 HADD2.F32 cvts + 8 FFMAs per tile that the
-//     round-2 SASS showed to be 24% of the issue stream (the kernel is
-//     warp-issue-bound, ~67 ops per 96-B tile; LDS runs at ~17% of its
-//     bandwidth at the DRAM target and is NOT the constraint).
+//     round-2 SASS showed to be 24% of the issue stream. The ring re-arms
+//     stage s+2 at the TOP of iteration s (legal because the third buffer
+//     holds the stage consumed at s-1, which the top barrier already ordered)
+//     — ONE block barrier per 6 KB stage, prefetch window = two compute
+//     periods. Round 4; rationale below.
 //   - Phase 3: quad shuffle-reduce, strip partial in smem, then (split 0 of 1,
 //     or the LAST split to finish, elected by an atomic counter) applies the
 //     output Hadamard-128 + svh and stores bf16. Split partials are combined
 //     in fixed split order, so the result is deterministic for a fixed grid.
 //
-// Occupancy: smem = 4 KB x' + 2 x 6 KB stages + 0.5 KB partials ~ 16.5 KB,
-// __launch_bounds__(256, 4) -> 4 CTAs/SM (32 warps) on GB10's 100 KB SMs,
-// vs 2 CTAs/SM for the first bring-up (42.5 KB). The kernel is issue-latency
-// bound, not DRAM-bound, at 2 CTAs/SM — the extra warps hide the dependent
-// dequant chains.
+// Occupancy: smem = 2 KB x' + 3 x 6 KB stages + 0.5 KB partials = 20,996 B
+// (ptxas), 64 regs, 0 spills -> __launch_bounds__(256, 4) = 4 CTAs/SM
+// (32 warps) on GB10's 100 KB SMs: 4 x (20,996 + 1 KB driver reserve) =
+// 88 KB. Registers, not smem, are the binding limit (64 x 256 x 4 = the full
+// 64 K file), so the extra stage buffer is free.
+//
+// ROUND-4 DIAGNOSIS (docs/kernels/exl3-gemv.md §3c). Rounds 1-3 chased the
+// instruction stream and stalled at 156 -> 168 -> 168 GB/s. The SASS cycle
+// budget says why: at the measured 19.0 us / 166 GB/s the SM issues ~39 K
+// warp-instructions against ~45.6 K cycles of 4-wide issue = 21.5% issue
+// utilisation, and LDS is 6%. ~78% of the wall clock is memory stall, so
+// instruction count cannot bind and round 3's null result was expected.
+// Wave quantisation is also dead: the microtest sweep already covered the
+// split that exactly fills 192 CTA slots and it gained ~1%, and the fused
+// production grid (strips x split x groups) is already an exact multiple of
+// 192 for gate/up at every top_k. What is left is the ONE structural
+// difference from every fast GEMV in this directory: those are barrier-free
+// warp-private LDG loops (0 barriers, or 1 per 32 KB) and reach 194-206 GB/s;
+// this kernel paid 2 block barriers per 6 KB and capped its fetch window at
+// one compute period. Round 4 halves the first and doubles the second without
+// touching the arithmetic.
 //
 // Constraints: K % 128 == 0, N % 128 == 0, gridDim.y splits K in 128-aligned
 // chunks (any split works; the x' superblock loop removes the old 4096-K
@@ -88,7 +108,8 @@
 #define EXL3_NSTRIP 128     // output columns per block (8 tiles of 16)
 #define EXL3_STAGE_ROWS 8   // tile-rows per cp.async stage (8*8*96 B = 6 KB = 1 chunk)
 #define EXL3_STAGE_U4 (EXL3_STAGE_ROWS * 8 * 6)  // 16-B copies per stage (384)
-#define EXL3_MAX_XCHUNKS 16  // x' smem superblock: 2048 k as __half2 pairs, 4 KB (refilled per superblock)
+#define EXL3_STAGES 3        // cp.async ring depth (round 4; see the barrier note below)
+#define EXL3_MAX_XCHUNKS 8   // x' smem superblock: 1024 k as __half2 pairs, 2 KB (refilled per superblock)
 #define EXL3_RSQRT128 0.088388347648f
 
 // ---------------------------------------------------------------------------
@@ -212,38 +233,49 @@ __device__ __forceinline__ void exl3_had128(float& h0, float& h1, float& h2, flo
 
 // ---------------------------------------------------------------------------
 // cp.async helpers (same pattern as fp8_gemm_t_blockscaled.cu; .cg to bypass
-// L1 — the trellis stream is read exactly once). src-size predication makes
-// the copy a zero-fill no-op for tail rows.
+// L1 — the trellis stream is read exactly once). Round 4 dropped the
+// src-size tail predication: every stage is provably a full
+// EXL3_STAGE_ROWS-row stage (proof at exl3_load_stage), so the copy is
+// unconditional and the issue block carries no branches.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ void exl3_cp_async_16(void* dst_smem, const void* src_gmem,
-                                                 bool pred) {
+__device__ __forceinline__ void exl3_cp_async_16(void* dst_smem, const void* src_gmem) {
     unsigned int dst = (unsigned int)__cvta_generic_to_shared(dst_smem);
-    int src_bytes = pred ? 16 : 0;
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src_gmem),
-                 "r"(src_bytes));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src_gmem));
 }
 
 __device__ __forceinline__ void exl3_cp_commit() { asm volatile("cp.async.commit_group;"); }
 
 // Issue one stage: tile-rows [r0, r0+EXL3_STAGE_ROWS) of the block's 8-tile
 // strip. Each tile-row is a contiguous 768-B run (48 uint4). 384 copies over
-// 256 threads: iteration 0 is full, iteration 1 is half-predicated.
+// 256 threads: iteration 0 is full, iteration 1 covers threads 0..127.
+//
+// EVERY stage is exactly EXL3_STAGE_ROWS full tile-rows, so there is no tail
+// predication (round 4 removed it). Proof: splits are 128-k-chunk aligned
+// (rows_lo = 8*c_lo, rows_hi = 8*c_hi), one stage is exactly one chunk
+// (EXL3_STAGE_ROWS == 8), nstages == c_hi - c_lo, and stage s is only ever
+// issued for s < nstages -> r0 + 8 = 8*(c_lo + s + 1) <= 8*c_hi = rows_hi.
+//
+// Lane geometry of the copy: thread t handles (r = t/48, o = t%48), so 2 of
+// every 3 warps issue ONE 512-B contiguous request and the third issues two
+// 256-B requests — averaging ~427 B per warp-request. That width is why the
+// stage is block-cooperative rather than warp-private: a warp-private variant
+// would have to fetch 96-B tiles (one tile-column, stride N/16*96), and the
+// measured GB10 law in moe_shared_expert_fused_t.cu (:65-75) is that a
+// 32-B/warp request pins a GEMV at ~130 GB/s while a 128-B request has no such
+// ceiling. Narrowing the request to buy barrier-freedom would lose more than
+// it gains.
 __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
                                                 const uint4* __restrict__ trellis_u4, int r0,
-                                                int rows_hi, int n_tiles_row, int nb0) {
-    int nrows = rows_hi - r0;
-    if (nrows > EXL3_STAGE_ROWS) nrows = EXL3_STAGE_ROWS;
+                                                int n_tiles_row, int nb0) {
+    const size_t base = ((size_t)r0 * n_tiles_row + nb0) * 6;
 #pragma unroll
     for (int i = 0; i < (EXL3_STAGE_U4 + EXL3_BLOCK - 1) / EXL3_BLOCK; ++i) {
         int idx = i * EXL3_BLOCK + (int)threadIdx.x;
         if (idx >= EXL3_STAGE_U4) break;
         int r = idx / 48;
-        int o = idx % 48;
-        bool p = r < nrows;
-        const uint4* src =
-            trellis_u4 + ((size_t)(r0 + (p ? r : 0)) * n_tiles_row + nb0) * 6 + o;
-        exl3_cp_async_16(dst + idx, src, p);
+        int o = idx - r * 48;
+        exl3_cp_async_16(dst + idx, trellis_u4 + base + (size_t)r * n_tiles_row * 6 + o);
     }
     exl3_cp_commit();
 }
@@ -290,8 +322,8 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     float* __restrict__ ws,                      // [gridDim.y, N]
     int* __restrict__ counters,                  // [N/128]
     unsigned int N, unsigned int K) {
-    __shared__ __align__(16) __half2 s_x[EXL3_MAX_XCHUNKS * 64];            // 4 KB
-    __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 12 KB
+    __shared__ __align__(16) __half2 s_x[EXL3_MAX_XCHUNKS * 64];            // 2 KB
+    __shared__ __align__(16) unsigned short s_stage[EXL3_STAGES][EXL3_STAGE_ROWS * 8 * 48];  // 18 KB
     __shared__ float s_y[EXL3_NSTRIP];
     __shared__ int s_elect;
 
@@ -308,20 +340,22 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     const int c_lo = (int)(((long long)chunks_total * split) / S);
     const int c_hi = (int)(((long long)chunks_total * (split + 1)) / S);
     const int rows_lo = c_lo * 8;  // tile-rows (16 k each)
-    const int rows_hi = c_hi * 8;
     // One stage per 128-k chunk (EXL3_STAGE_ROWS == 8), so every stage is
-    // exactly full and nstages == chunks in the slice.
+    // exactly full (rows_lo + 8*nstages == 8*c_hi) and nstages == chunks in
+    // the slice. exl3_load_stage relies on this: no tail predication.
     const int nstages = c_hi - c_lo;
 
     // Kick off the trellis pipeline before the x' pass so the DRAM stream
     // starts immediately.
+    // Two stages in flight from the prologue; the third buffer stays free so
+    // the steady-state loop can re-arm it BEFORE it computes (see below).
     const uint4* trellis_u4 = (const uint4*)trellis;
-    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, rows_hi, n_tiles_row, nb0);
+    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, n_tiles_row, nb0);
     if (nstages > 1)
-        exl3_load_stage((uint4*)s_stage[1], trellis_u4, rows_lo + EXL3_STAGE_ROWS, rows_hi,
+        exl3_load_stage((uint4*)s_stage[1], trellis_u4, rows_lo + EXL3_STAGE_ROWS,
                         n_tiles_row, nb0);
 
-    // ---- Phase 1: x' for the first superblock (up to 2048 k) ----
+    // ---- Phase 1: x' for the first superblock (up to 1024 k) ----
     {
         int sb1 = c_lo + EXL3_MAX_XCHUNKS;
         if (sb1 > c_hi) sb1 = c_hi;
@@ -340,25 +374,63 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     const Exl3LaneGeom g = exl3_lane_geom(lane);
     const int xkh = lane & 3;  // half2 (k-pair) index within the 16-k tile row
 
+    // ROUND 4 — ONE block barrier per stage, prefetch distance 2.
+    //
+    // Rounds 1-3 ran a 2-buffer pipeline with TWO __syncthreads() per 6 KB
+    // stage: one after `cp.async.wait_group` (stage s landed) and one after
+    // the compute (so no warp is still reading s_stage[s&1] when the same
+    // buffer is re-armed for stage s+2). The re-arm therefore had to sit at
+    // the BOTTOM of the iteration, giving the fetch only ONE compute window
+    // to land in.
+    //
+    // With a THIRD buffer the re-arm target at iteration s is buffer
+    // (s+2) % 3 == (s-1) % 3 — the buffer that was consumed at iteration
+    // s-1. The single barrier at the top of iteration s already orders every
+    // warp past that consume, so the re-arm is legal immediately after it and
+    // the trailing barrier is redundant. Net per stage: 2 barriers -> 1, and
+    // the fetch for stage s+2 now has compute(s) + compute(s+1) to land in.
+    // The wait_group immediates are unchanged (1 in steady state, 0 on the
+    // last stage), because the ring still holds exactly two groups in flight.
+    //
+    // Nothing about the arithmetic moves: the same 8 tiles are decoded from
+    // the same bytes in the same order, the fp16 chains are still grouped per
+    // 128-k chunk, and the per-chunk fp32 combine and the split combine keep
+    // their fixed order. For a fixed grid this is BIT-IDENTICAL to round 3.
+    static_assert(EXL3_STAGES == 3,
+                  "the single-barrier schedule below is written for a 3-deep ring with "
+                  "2 groups in flight: it re-arms stage s+2 into buffer (s+2)%3 == (s-1)%3, "
+                  "which is exactly the buffer the top barrier just freed");
+    int buf_cur = 0;                  // buffer holding stage s
+    int buf_fre = EXL3_STAGES - 1;    // buffer to re-arm with stage s+2
     for (int s = 0; s < nstages; ++s) {
+        if (s + 1 < nstages)
+            asm volatile("cp.async.wait_group 1;");
+        else
+            asm volatile("cp.async.wait_group 0;");
+        // The ONE barrier: (i) stage s has landed for every warp, and
+        // (ii) every warp is past compute(s-1), which frees buf_fre and the
+        // old x' superblock.
+        __syncthreads();
+
+        if (s + 2 < nstages)
+            exl3_load_stage((uint4*)s_stage[buf_fre], trellis_u4,
+                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, n_tiles_row, nb0);
+
         if (s != 0 && (s & (EXL3_MAX_XCHUNKS - 1)) == 0) {
-            // Superblock boundary: refill x' for chunks [c_lo+s, +16). The
-            // previous iteration's trailing __syncthreads() ordered all
-            // reads of the old superblock before this overwrite; the two
-            // in-flight cp.async stages are unaffected (s_stage only).
+            // Superblock boundary: refill x' for chunks [c_lo+s, +XCHUNKS).
+            // The barrier above ordered all reads of the old superblock
+            // before this overwrite; the in-flight cp.async stages are
+            // unaffected (s_stage only). Costs one extra barrier once every
+            // EXL3_MAX_XCHUNKS stages — never taken at the production
+            // geometry, where a CTA runs 4-6 stages.
             int sb0 = c_lo + s;
             int sb1 = sb0 + EXL3_MAX_XCHUNKS;
             if (sb1 > c_hi) sb1 = c_hi;
             exl3_input_pass(A, suh, s_x, sb0, sb1, warp, lane);
             __syncthreads();
         }
-        if (s + 1 < nstages)
-            asm volatile("cp.async.wait_group 1;");
-        else
-            asm volatile("cp.async.wait_group 0;");
-        __syncthreads();
 
-        const unsigned int* stage32 = (const unsigned int*)s_stage[s & 1];
+        const unsigned int* stage32 = (const unsigned int*)s_stage[buf_cur];
         const __half2* xrow = s_x + ((s & (EXL3_MAX_XCHUNKS - 1)) << 6) + xkh;
 
         const __half2 hz = __float2half2_rn(0.0f);
@@ -393,10 +465,9 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
         acc1 += f1.x;
         acc1 += f1.y;
 
-        __syncthreads();
-        if (s + 2 < nstages)
-            exl3_load_stage((uint4*)s_stage[s & 1], trellis_u4,
-                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, rows_hi, n_tiles_row, nb0);
+        // Rotate the ring (no trailing barrier — see the round-4 note above).
+        buf_cur = (buf_cur + 1 == EXL3_STAGES) ? 0 : buf_cur + 1;
+        buf_fre = (buf_fre + 1 == EXL3_STAGES) ? 0 : buf_fre + 1;
     }
 
     // ---- Phase 3: reduce + (elected) output Hadamard + svh + store ----
