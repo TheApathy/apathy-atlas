@@ -325,3 +325,37 @@ Decode step is 45.3 ms, of which only ~32 ms is byte movement:
 
 The MLA chain (232 GB/s) and lm_head (230) are already at the DRAM ceiling;
 NVFP4 lm_head is a recorded quality NO-GO. Everything above is engineering.
+
+
+## Measured: fused dispatch makes the byte cut pay (2026-08-12)
+
+Back-to-back on one box within one hour — the only comparison this hardware
+supports, since it drifted 13% across earlier sessions:
+
+|  | code | quote | prose | repeat |
+|---|---:|---:|---:|---:|
+| MXFP4 (control) | 21.89 | 22.19 | 22.18 | 22.03 |
+| **EXL3 + fused dispatch** | **23.58** | **23.67** | **23.63** | 21.97 |
+| delta | +1.69 | +1.48 | +1.45 | −0.06 |
+
++7% on three of four workloads, matching the byte model (2.43 vs 3.45
+GB/token at the GEMV's measured 166 GB/s predicts ~+1.4).
+
+The earlier unfused number was 21.2 — *slower* than MXFP4 — because the
+bring-up dispatch issued 4·top_k+4 ≈ 36 launches/layer (~1548/token) against
+the fused pair's 7 (~301). The byte cut was always real; the launches ate it.
+
+**Repeat did not move.** It is the most reuse-heavy workload, so the MXFP4
+path was likely already achieving effective locality there. That is a hint
+about where the remaining MoE inefficiency lives, and it is the one workload
+a further GEMV bandwidth win may not help.
+
+### Ladder from here (all measured on this box)
+
+```
+22.0   MXFP4 control
+23.6   + EXL3 experts, fused dispatch        MEASURED
+~26    + EXL3 GEMV 166 -> 200 GB/s           issue-bound; rounds 2-3 got 156->168
+~27    + MoE-family 192 -> 220 GB/s
+~27.5  + hc_pre_mix grid fix
+```
