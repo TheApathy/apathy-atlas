@@ -684,9 +684,18 @@ impl Qwen3AttentionLayer {
         }
 
         // Expand attention output back into multi-stream state.
+        // The SHARDED launch, same as the standalone-attention site above and
+        // the pre-* sites: `hc_post` is a grid-stride loop over the hidden dim
+        // (`d = blockIdx.y*HC_BLOCK + tid; d < H; d += HC_BLOCK*gridDim.y`)
+        // with every `d` independent — no __syncthreads, no atomics, no shared
+        // reduction — so more blocks only partition the same lanes and every
+        // output element keeps identical arithmetic. This site (the MAIN path,
+        // 43x per token) was launching 1 CTA while the rare no-FFN branch got
+        // `post_shards` (16 at H=4096); the kernel handle and every argument
+        // are otherwise the same.
         prof!(
             "post-attn",
-            ops::hc_post(
+            ops::hc_post_sharded(
                 ctx.gpu,
                 self.hc_post_k,
                 attn_out,
@@ -697,6 +706,7 @@ impl Qwen3AttentionLayer {
                 1,
                 h as u32,
                 hc_mult,
+                post_shards,
                 stream,
             )
         )?;
