@@ -41,6 +41,15 @@ for kv in "$@"; do ENV_ARGS+=("$kv"); done
   echo "spec : <none, plain decode — EXL3 wide-verify twin not built>"
 } >"$LOG"
 
+# GAMMA=<n> arms DSpark. The tp1 checkpoint carries its own DSpark drafter
+# (mtp.* in the carried-* shards), so --draft-model is the model dir itself.
+# --max-batch-size 1 is required once the drafter is resident: at
+# --max-seq-len 1024 the KV pool holds 7 sequences and the default 8 aborts.
+SPEC=()
+if [ -n "${GAMMA:-}" ]; then
+  SPEC=(--dflash --draft-model "$MODEL" --dflash-gamma "$GAMMA")
+fi
+
 env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --port "$PORT" \
   --kv-cache-dtype fp8 \
@@ -48,7 +57,8 @@ env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --gpu-memory-utilization 0.95 \
   --max-seq-len 1024 \
   --max-num-seqs 1 \
+  --max-batch-size 1 \
   --max-prefill-tokens 1024 \
-  >>"$LOG" 2>&1 &
+  "${SPEC[@]}" >>"$LOG" 2>&1 &
 
 echo "pid=$! log=$LOG"
