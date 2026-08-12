@@ -259,11 +259,25 @@ impl TransformerModel {
         if self_speculative {
             let num_ssm = config.num_ssm_layers();
             let num_attn = config.num_attention_layers();
-            tracing::info!(
-                "Self-speculative decoding: ENABLED (skipping {} SSM layers, keeping {} attention layers)",
-                num_ssm,
-                num_attn,
-            );
+            if num_ssm == 0 {
+                // Layer-TYPE skipping with nothing to skip: `decode_draft`
+                // would run a full forward per draft. `has_self_speculative`
+                // now refuses this (trait_impl/speculative.rs) so the
+                // scheduler falls back to plain decode; say so instead of
+                // printing a cheerful "ENABLED (skipping 0 SSM layers)".
+                tracing::warn!(
+                    "--self-speculative requested but this model has 0 SSM layers to skip \
+                     ({num_attn} attention layers): self-speculative drafting is a full \
+                     forward per draft and cannot beat plain decode at ANY acceptance rate \
+                     (docs/SELF-SPECULATION-ANALYSIS.md). Falling back to plain decode.",
+                );
+            } else {
+                tracing::info!(
+                    "Self-speculative decoding: ENABLED (skipping {} SSM layers, keeping {} attention layers)",
+                    num_ssm,
+                    num_attn,
+                );
+            }
         }
 
         // MTP hidden state save buffer (1 × hidden_size FP32)

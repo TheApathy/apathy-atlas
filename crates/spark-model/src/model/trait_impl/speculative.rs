@@ -78,8 +78,29 @@ impl TransformerModel {
         self.proposer.is_some() || self.self_speculative
     }
 
+    /// Whether self-speculative drafting can actually do anything on THIS
+    /// model. Requesting it is not the same as being capable of it.
+    ///
+    /// The mechanism is layer-*type* skipping, not depth truncation:
+    /// [`TransformerModel::decode_draft`] runs the full layer loop and
+    /// `continue`s only on `LayerType::LinearAttention` (impl_b1.rs). On a
+    /// model with zero SSM layers it therefore skips NOTHING — the "draft" is
+    /// a complete forward pass, so a step costs `num_drafts` full forwards
+    /// plus a verify.
+    ///
+    /// On DeepSeek-V4-Flash (43/43 `FullAttention`, see
+    /// `config/parsers/deepseek_v4.rs`) that arms a path whose ceiling AT
+    /// PERFECT ACCEPTANCE is 13.6–18.1 tok/s against plain decode's 21.9 —
+    /// i.e. it cannot win at any acceptance rate. Full derivation in
+    /// `docs/SELF-SPECULATION-ANALYSIS.md` §0.
+    ///
+    /// So the predicate is derived from the config, never from the request —
+    /// the same SSOT idiom as `ModelConfig::has_recurrent_state`
+    /// (`atlas-core/src/config/methods.rs`). `serve.rs` already falls back to
+    /// plain decode when this returns false, so the degradation is graceful.
+    /// Hybrid SSM/attention models (Qwen3-Next, Nemotron-H) are unaffected.
     pub(super) fn has_self_speculative_dispatch(&self) -> bool {
-        self.self_speculative
+        self.self_speculative && self.config.num_ssm_layers() > 0
     }
 
     pub(super) fn decode_draft_dispatch(
