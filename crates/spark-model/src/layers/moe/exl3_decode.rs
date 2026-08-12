@@ -48,6 +48,10 @@ use crate::weight_map::Exl3ExpertWeight;
 
 /// Widest split the scratch is sized for (matches the microtest sweep).
 const EXL3_MAX_SPLIT: u32 = 12;
+
+/// CTAs in one full GB10 wave for `exl3_gemv_m1*`: 48 SMs × 4 CTAs/SM
+/// (`__launch_bounds__(256, 4)`; 64 regs and 20,996 B smem both admit 4).
+const EXL3_WAVE_CTAS: u32 = 192;
 /// Largest N across the expert shapes (w2: N = hidden = 4096).
 const EXL3_MAX_N: u32 = 4096;
 /// Hard cap on routed slots the split-K scratch will be sized for. Guards the
@@ -123,25 +127,46 @@ pub(crate) struct Exl3PrefillState {
 }
 
 impl Exl3MoeState {
-    /// SPLIT_K policy: fill ~2 CTAs/SM (96 slots on GB10's 48 SMs) — the
-    /// microtest measured splits 1-3 underfilled at N=2048 (16 strips).
+    /// SPLIT_K policy: ~96 CTAs per launch GROUP (2 CTAs/SM on GB10's 48 SMs),
+    /// then rounded UP to the first split that makes the whole fused grid an
+    /// exact multiple of a 192-CTA wave.
     ///
-    /// NOTE (unmeasured, deliberately NOT the default): this policy was tuned
-    /// for the per-slot chain, where ONE launch had to fill the GPU by itself.
-    /// The fused launches carry `top_k`/`2·top_k` groups, so at top_k = 8 even
-    /// SPLIT_K = 1 lands 16×16 = 256 (gate+up) and 32×8 = 256 (down) CTAs —
-    /// already past 4 CTAs/SM × 48 SMs. `ATLAS_EXL3_SPLIT=1` therefore drops
-    /// the whole `ws` round-trip, the election atomics and the partial re-read
-    /// while KEEPING the grid full, and gives each CTA the full K-slice (one
-    /// long contiguous trellis stream instead of `S` islands). It is the first
-    /// thing to A/B on hardware after this change — but it re-slices K, so it
-    /// is NOT bit-identical to the default and is left opt-in.
-    fn split_for(&self, n: u32) -> u32 {
+    /// The kernel is `__launch_bounds__(256, 4)` at 64 registers / 20,996 B
+    /// smem, so a full wave is 4 CTAs/SM × 48 SMs = **192 CTAs**. A fused
+    /// launch runs `strips · split · groups` CTAs, and any remainder leaves the
+    /// tail wave partly empty — SMs idle for the whole tail.
+    ///
+    /// At the V4 shapes the base target already lands wave-exact for gate/up:
+    /// `inter = 2048` → 16 strips, base split 6 → `16·6·2·top_k = 192·top_k`
+    /// for ANY `top_k`. `down` is the exposed one: `h = 4096` → 32 strips,
+    /// base split 3 → `32·3·top_k = 96·top_k`, which is a whole wave only when
+    /// `top_k` is EVEN. With adaptive top-K merged, an odd routed width would
+    /// run the last `down` wave half empty; walking the split up to 6 restores
+    /// `192·top_k`. For even `top_k` (the measured configuration) this returns
+    /// the same value as before — the guard is a no-op on the hot path.
+    ///
+    /// `groups` MUST be the FUSED group count (`2·top_k` for gate+up, `top_k`
+    /// for down) even when the per-slot fallback arm runs, so that both arms
+    /// use the same SPLIT_K and stay bit-identical (microtest GATE8).
+    ///
+    /// NOTE (unmeasured, deliberately NOT the default): `ATLAS_EXL3_SPLIT=1`
+    /// drops the whole `ws` round-trip, the election atomics and the partial
+    /// re-read, and gives each CTA the full K-slice (one long trellis stream
+    /// instead of `S` islands) — but it re-slices K, so it is NOT bit-identical
+    /// to the default, and at 16·1·2·top_k = 32·top_k CTAs it underfills.
+    fn split_for(&self, n: u32, groups: u32) -> u32 {
         if self.split_override > 0 {
             return self.split_override.min(EXL3_MAX_SPLIT);
         }
         let strips = (n / 128).max(1);
-        (96 / strips).clamp(1, EXL3_MAX_SPLIT)
+        let base = (96 / strips).clamp(1, EXL3_MAX_SPLIT);
+        let groups = groups.max(1);
+        for s in base..=EXL3_MAX_SPLIT {
+            if (strips * s * groups) % EXL3_WAVE_CTAS == 0 {
+                return s;
+            }
+        }
+        base
     }
 }
 
@@ -357,8 +382,10 @@ impl MoeLayer {
             2 * top_k
         );
         let gpu = ctx.gpu;
-        let split_gu = st.split_for(inter);
-        let split_dn = st.split_for(h);
+        // Group counts are the FUSED ones for BOTH arms, so the per-slot
+        // fallback keeps the same SPLIT_K and stays bit-identical (GATE8).
+        let split_gu = st.split_for(inter, 2 * top_k);
+        let split_dn = st.split_for(h, top_k);
 
         if st.fused {
             // ── 3 launches for the whole routed FFN. ──

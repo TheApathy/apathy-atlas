@@ -989,9 +989,17 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
     let d_cnt = g.alloc(cnt_bytes)?;
     g.memset(d_cnt, 0, cnt_bytes)?;
 
-    // Production split policy (Exl3MoeState::split_for): fill ~96 CTAs.
-    let split_for = |n: usize| -> u32 { (96 / (n / 128).max(1)).clamp(1, max_split) as u32 };
-    let (split_gu, split_dn) = (split_for(inter), split_for(h));
+    // Production split policy (mirrors Exl3MoeState::split_for): ~96 CTAs per
+    // launch group, rounded up to the first split that makes
+    // `strips · split · groups` an exact multiple of a 192-CTA GB10 wave.
+    let split_for = |n: usize, grp: usize| -> u32 {
+        let strips = (n / 128).max(1);
+        let base = (96 / strips).clamp(1, max_split);
+        (base..=max_split)
+            .find(|s| (strips * s * grp.max(1)) % 192 == 0)
+            .unwrap_or(base) as u32
+    };
+    let (split_gu, split_dn) = (split_for(inter, 2 * top_k), split_for(h, top_k));
 
     // ---- Path A: per-slot bring-up chain (4·top_k launches) ----
     let mut launches_a = 0usize;
@@ -1107,6 +1115,123 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
         launches_a as f64 / launches_b as f64,
         if g8c { "PASS" } else { "FAIL" }
     );
+
+    // ---- GATE 9 (informational): GB/s at the PRODUCTION fused geometry ----
+    //
+    // Why this exists (round-4 diagnosis). GATE3 times ONE matrix: grid =
+    // (N/128, SPLIT_K) = 128-192 CTAs, i.e. a SINGLE 192-CTA wave, so the
+    // per-CTA prologue (x' input pass) and epilogue (split-K fence + atomic
+    // election + ws re-read) are fully exposed and are amortised over only
+    // 32/SPLIT_K stages. Production NEVER runs that shape: the fused launch
+    // carries `2·top_k` / `top_k` groups on grid.z, so gate+up is
+    // 16·6·2·top_k = 192·top_k CTAs = `top_k` FULL WAVES, where a retiring
+    // CTA's tail overlaps the next CTA's prologue. Tuning against GATE3 alone
+    // optimises a regime the model does not run in — GATE9 is the number the
+    // end-to-end tok/s arithmetic should be built on.
+    //
+    // Cache: gate+up streams `2·top_k` distinct expert matrices (16 × 3.15 MB
+    // = 50 MB at top_k = 8) against a 24 MB L2 in a cyclic pattern, so the
+    // re-read hit rate across iterations is ~0 — cold enough without a ring.
+    {
+        let iters = 200u32;
+        let time_it = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+            for _ in 0..10 {
+                f()?;
+            }
+            g.synchronize(stream)?;
+            let (mut ev0, mut ev1): (u64, u64) = (0, 0);
+            unsafe {
+                if cuEventCreate(&mut ev0, 0) != 0 || cuEventCreate(&mut ev1, 0) != 0 {
+                    bail!("cuEventCreate failed");
+                }
+                if cuEventRecord(ev0, stream) != 0 {
+                    bail!("cuEventRecord failed");
+                }
+            }
+            for _ in 0..iters {
+                f()?;
+            }
+            let mut ms = 0f32;
+            unsafe {
+                if cuEventRecord(ev1, stream) != 0 || cuEventSynchronize(ev1) != 0 {
+                    bail!("event sync failed");
+                }
+                if cuEventElapsedTime(&mut ms, ev0, ev1) != 0 {
+                    bail!("cuEventElapsedTime failed");
+                }
+                cuEventDestroy_v2(ev0);
+                cuEventDestroy_v2(ev1);
+            }
+            Ok(ms as f64 / iters as f64)
+        };
+        let launch_gu = || -> Result<()> {
+            KernelLaunch::new(g, kh_gu)
+                .grid([(inter / 128) as u32, split_gu, 2 * top_k as u32])
+                .block([256, 1, 1])
+                .arg_ptr(d_a)
+                .arg_ptr(gate_t.0)
+                .arg_ptr(gate_t.1)
+                .arg_ptr(gate_t.2)
+                .arg_ptr(up_t.0)
+                .arg_ptr(up_t.1)
+                .arg_ptr(up_t.2)
+                .arg_ptr(d_idx)
+                .arg_ptr(d_gate)
+                .arg_ptr(d_upo)
+                .arg_ptr(d_ws)
+                .arg_ptr(d_cnt)
+                .arg_u32(inter as u32)
+                .arg_u32(h as u32)
+                .launch(stream)
+        };
+        let launch_dn = || -> Result<()> {
+            KernelLaunch::new(g, kh_dn)
+                .grid([(h / 128) as u32, split_dn, top_k as u32])
+                .block([256, 1, 1])
+                .arg_ptr(d_gate)
+                .arg_ptr(down_t.0)
+                .arg_ptr(down_t.1)
+                .arg_ptr(down_t.2)
+                .arg_ptr(d_idx)
+                .arg_ptr(d_down)
+                .arg_ptr(d_ws)
+                .arg_ptr(d_cnt)
+                .arg_u32(h as u32)
+                .arg_u32(inter as u32)
+                .launch(stream)
+        };
+        // Payload = trellis + suh/svh actually streamed by each launch.
+        let mat = |n: usize, k: usize| n * k * 3 / 8 + (n + k) * 2;
+        let by_gu = 2 * top_k * mat(inter, h);
+        let by_dn = top_k * mat(h, inter);
+        let ms_gu = time_it(&launch_gu)?;
+        let ms_dn = time_it(&launch_dn)?;
+        let ctas_gu = (inter / 128) * split_gu as usize * 2 * top_k;
+        let ctas_dn = (h / 128) * split_dn as usize * top_k;
+        eprintln!(
+            "FUSED GATE9 gate+up: {:.1} us  {:.1} GB/s  ({ctas_gu} CTAs = {:.2} waves of 192, \
+             split={split_gu}, {} chunks/CTA)",
+            ms_gu * 1e3,
+            by_gu as f64 / (ms_gu * 1e-3) / 1e9,
+            ctas_gu as f64 / 192.0,
+            (h / 128) as f64 / split_gu as f64,
+        );
+        eprintln!(
+            "FUSED GATE9 down:    {:.1} us  {:.1} GB/s  ({ctas_dn} CTAs = {:.2} waves of 192, \
+             split={split_dn}, {} chunks/CTA)",
+            ms_dn * 1e3,
+            by_dn as f64 / (ms_dn * 1e-3) / 1e9,
+            ctas_dn as f64 / 192.0,
+            (inter / 128) as f64 / split_dn as f64,
+        );
+        eprintln!(
+            "FUSED GATE9 routed FFN per layer: {:.1} us for {:.2} MB  =>  {:.1} GB/s \
+             (ceiling 229)",
+            (ms_gu + ms_dn) * 1e3,
+            (by_gu + by_dn) as f64 / 1e6,
+            (by_gu + by_dn) as f64 / ((ms_gu + ms_dn) * 1e-3) / 1e9,
+        );
+    }
 
     for p in owned.into_iter().chain([d_a, d_idx, d_gate, d_upo, d_down, d_ws, d_cnt]) {
         let _ = g.free(p);
