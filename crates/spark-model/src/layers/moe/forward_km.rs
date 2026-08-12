@@ -37,12 +37,12 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        // EXL3 trellis experts: no multi-row dedup kernels — decline so the
-        // caller falls back to the per-row loop, which takes the EXL3 M=1 arm.
-        if self.exl3.is_some() {
-            return Ok(false);
-        }
         let n = num_tokens as u32;
+        // EXL3 trellis experts take the `exl3_gemv_mrow_fused_*` twin of the
+        // `_m` kernels below — same dedup contract, same output layout, same
+        // routing. Everything from `router_input` down to the blend is shared,
+        // so the branch is only over the expert dispatch itself.
+        let is_exl3 = self.exl3.is_some();
         if n < 2 || n > MOE_VERIFY_MAX_ROWS {
             // The width cap is a THROUGHPUT CLIFF, not a mere fallback: past
             // `MOE_VERIFY_MAX_ROWS` every row re-streams the whole routed
@@ -70,22 +70,34 @@ impl MoeLayer {
         // BF16/FP8 experts (different kernel families), and the mixed
         // NVFP4-routed/BF16-shared Laguna config (the fused kernel can't do a
         // BF16 shared expert) — belongs to the per-token path.
+        //
+        // The EXL3 arm has its own kernel family and its own shared-expert
+        // chain, so it skips the `_t`-layout predicates entirely — but NOT the
+        // EP one: EP adds the shared half after the all-reduce, which neither
+        // family models.
         let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-        if is_ep
-            || self.is_w3()
-            || self.bf16_gate_weight_ptrs.is_some()
-            || self.fp8_gate_weight_ptrs.is_some()
-            || self.has_mixed_bf16_shared_expert()
-            || !self.use_t_layout_for_decode()
-        {
+        if is_ep {
             return Ok(false);
         }
-        let (Some(gate_t), Some(up_t), Some(down_t)) = (
-            self.gate_ptrs_t.as_ref(),
-            self.up_ptrs_t.as_ref(),
-            self.down_ptrs_t.as_ref(),
-        ) else {
-            return Ok(false);
+        let t_tables = if is_exl3 {
+            None
+        } else {
+            if self.is_w3()
+                || self.bf16_gate_weight_ptrs.is_some()
+                || self.fp8_gate_weight_ptrs.is_some()
+                || self.has_mixed_bf16_shared_expert()
+                || !self.use_t_layout_for_decode()
+            {
+                return Ok(false);
+            }
+            let (Some(gate_t), Some(up_t), Some(down_t)) = (
+                self.gate_ptrs_t.as_ref(),
+                self.up_ptrs_t.as_ref(),
+                self.down_ptrs_t.as_ref(),
+            ) else {
+                return Ok(false);
+            };
+            Some((gate_t, up_t, down_t))
         };
 
         let h = ctx.config.hidden_size as u32;
@@ -94,9 +106,18 @@ impl MoeLayer {
         let top_k = ctx.config.num_experts_per_tok as u32;
 
         // Bail before writing anything if the kernels/partial buffer can't
-        // serve this width — `dispatch_splitk_m_t` re-checks, but the routing
-        // below would already have clobbered the scratch by then.
+        // serve this width — the dispatch re-checks, but the routing below
+        // would already have clobbered the scratch by then. `_is_batched`
+        // routes to the EXL3 m-row predicate on trellis layers.
         if !self.verify_ffn_is_batched(ctx, n) {
+            static WIDE_ONCE: std::sync::Once = std::sync::Once::new();
+            WIDE_ONCE.call_once(|| {
+                tracing::warn!(
+                    "MoE dedup verify declined at n={n} (exl3={is_exl3}) — falling back to \
+                     per-row forward_batched, which re-streams every routed expert once PER ROW. \
+                     Widen the `_m` / `EXL3_MROW_ARMS` kernels before raising the draft width."
+                );
+            });
             return Ok(false);
         }
 
@@ -286,36 +307,57 @@ impl MoeLayer {
         let shared_down_out = ctx.buffers.attn_output();
         let output = ctx.buffers.moe_output();
 
-        let null_qw = QuantizedWeight::null();
-        let sh_gate_t = self.shared_gate_t.as_ref().unwrap_or(&null_qw);
-        let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
-        let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
-
-        let dispatched = prof!(
-            "exp_splitk_m_t",
-            self.dispatch_splitk_m_t(
-                ctx,
-                input,
-                expert_gate_out,
-                expert_up_out,
-                expert_down_out,
-                shared_gate_scratch,
-                shared_up_scratch,
-                shared_down_out,
-                indices_dev,
-                gate_t,
-                up_t,
-                down_t,
-                sh_gate_t,
-                sh_up_t,
-                sh_down_t,
-                h,
-                inter,
-                top_k,
-                n,
-                stream,
-            )
-        )?;
+        let dispatched = if let Some((gate_t, up_t, down_t)) = t_tables {
+            let null_qw = QuantizedWeight::null();
+            let sh_gate_t = self.shared_gate_t.as_ref().unwrap_or(&null_qw);
+            let sh_up_t = self.shared_up_t.as_ref().unwrap_or(&null_qw);
+            let sh_down_t = self.shared_down_t.as_ref().unwrap_or(&null_qw);
+            prof!(
+                "exp_splitk_m_t",
+                self.dispatch_splitk_m_t(
+                    ctx,
+                    input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_down_out,
+                    indices_dev,
+                    gate_t,
+                    up_t,
+                    down_t,
+                    sh_gate_t,
+                    sh_up_t,
+                    sh_down_t,
+                    h,
+                    inter,
+                    top_k,
+                    n,
+                    stream,
+                )
+            )?
+        } else {
+            prof!(
+                "exp_exl3_mrow",
+                self.dispatch_exl3_verify(
+                    ctx,
+                    input,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_down_out,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_down_out,
+                    indices_dev,
+                    h,
+                    inter,
+                    top_k,
+                    n,
+                    stream,
+                )
+            )?
+        };
         if !dispatched {
             // `verify_ffn_is_batched` above cleared the same predicate, so this
             // is unreachable barring an env flag flipping mid-forward. Fall

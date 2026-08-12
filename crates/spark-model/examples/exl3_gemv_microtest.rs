@@ -551,10 +551,11 @@ fn main() -> Result<()> {
 
     all_ok &= prefill_gates(g, &lut)?;
     all_ok &= fused_decode_gate(g)?;
+    all_ok &= mrow_verify_gate(g)?;
 
     eprintln!(
         "EXL3 GEMV GATE (bit-exact dequant + cos>={PASS_COS} + determinism + P1 prefill \
-         + fused decode byte-identity): {}",
+         + fused decode byte-identity + m-row verify byte-identity): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {
@@ -1237,4 +1238,316 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
         let _ = g.free(p);
     }
     Ok(g8 && g8b && g8c)
+}
+
+// ---------------------------------------------------------------------------
+// GATE 9: the m-row (speculative verify) dispatch == the m=1 fused path, row by
+// row, byte for byte.
+//
+// THE EXACT-GEMV LAW. docs/DECODE-WATERFALL-2026-08-10.md and the o-proj A/B
+// (memory `oproj-grouped-kernels-ab-2026-08-09`) measured that a PARTIALLY
+// exact verify chain is WORSE than either extreme: o-proj-only exactness scored
+// 2.54 tok/step against 2.83 for none and 2.92-3.01 for full. So the m-row
+// expert output for a verify row must equal, BIT FOR BIT, what the m=1 fused
+// decode path computes for that same token — not "close", not "cosine 0.9999".
+// This gate is the only thing standing between that law and a regression, so it
+// is deliberately hostile:
+//
+//   * m in {2, 4, 6, 8} — every compiled ladder rung the host can dispatch.
+//   * the index list is NOT slot-ordered (a CTA must resolve its expert from
+//     `indices[y]` on device, never from blockIdx) and is duplicate-HEAVY
+//     across rows, including one row that repeats another row's set verbatim
+//     (every leader gathers M = m) and one that reverses it (the same expert
+//     lands in a different slot position on different rows). Within a row the
+//     ids stay distinct, which is the routing invariant the gather relies on to
+//     bound M by num_tokens.
+//   * the two paths are poisoned with DIFFERENT bytes (0xAA vs 0x55), so a
+//     (row, slot) that no CTA writes cannot pass by both paths agreeing on
+//     garbage, and the result must additionally not still BE the poison.
+//   * the m-row path is relaunched and must be byte-identical to itself —
+//     split-K determinism with many concurrent, per-slot-keyed `ws` regions and
+//     self-resetting counters is the thing most likely to break silently.
+// ---------------------------------------------------------------------------
+
+/// Ladder rungs the host may dispatch (`EXL3_MROW_ARMS` in exl3_decode.rs,
+/// minus the m1 reference rung which GATE8 already covers).
+const MROW_WIDTHS: [usize; 4] = [2, 4, 6, 8];
+
+#[allow(clippy::too_many_lines)]
+fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
+    let stream = 0u64;
+    let (h, inter) = (4096usize, 2048usize);
+    let (top_k, ne) = (FUSED_TOP_K, FUSED_NE);
+
+    let kh_gu_1 = g.kernel("exl3_gemv", "exl3_gemv_m1_fused_gate_up")?;
+    let kh_dn_1 = g.kernel("exl3_gemv", "exl3_gemv_m1_fused_down")?;
+    let kh_silu = g.kernel("moe_silu_mul", "moe_silu_mul")?;
+
+    let to_b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let mut r = Rng(0x9A17_C0DE_2026_0812);
+    let mut owned: Vec<DevicePtr> = Vec::new();
+
+    let build =
+        |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
+            let words = (k / 16) * (n / 16) * 48;
+            let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..ne {
+                let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
+                let su: Vec<u16> = (0..k).map(|_| r.sign_f16()).collect();
+                let sv: Vec<u16> = (0..n).map(|_| r.sign_f16()).collect();
+                tp.push(up(g, &to_b(&t))?);
+                sup.push(up(g, &to_b(&su))?);
+                svp.push(up(g, &to_b(&sv))?);
+            }
+            let tab =
+                |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
+            let out = (up(g, &tab(&tp))?, up(g, &tab(&sup))?, up(g, &tab(&svp))?);
+            owned.extend(tp);
+            owned.extend(sup);
+            owned.extend(svp);
+            owned.extend([out.0, out.1, out.2]);
+            Ok(out)
+        };
+    let gate_t = build(&mut r, &mut owned, inter, h)?;
+    let up_t = build(&mut r, &mut owned, inter, h)?;
+    let down_t = build(&mut r, &mut owned, h, inter)?;
+
+    // Per-row expert sets. Row 1 repeats row 0 verbatim (maximum dedup: every
+    // leader gathers all m rows); row 2 reverses it (same union, different slot
+    // positions); the rest rotate so leaders land at assorted flat slots and
+    // gather assorted subsets.
+    let base: [u32; FUSED_TOP_K] = [5, 0, 7, 2, 6, 1];
+    let row_ids = |t: usize| -> Vec<u32> {
+        match t {
+            0 | 1 => base.to_vec(),
+            2 => base.iter().rev().copied().collect(),
+            _ => (0..top_k).map(|s| base[(s + t) % top_k] ^ ((t as u32) & 1)).collect(),
+        }
+    };
+    // Sanity: within a row the ids must be distinct (the routing invariant that
+    // bounds a leader's gather by num_tokens) and inside [0, ne).
+    for t in 0..*MROW_WIDTHS.last().unwrap() {
+        let ids = row_ids(t);
+        assert!(ids.iter().all(|&e| (e as usize) < ne), "row {t} id out of range");
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), top_k, "row {t} must route to top_k DISTINCT experts");
+    }
+
+    let max_m = *MROW_WIDTHS.last().unwrap();
+    let a_host: Vec<u16> = (0..max_m * h)
+        .map(|_| bf16::from_f32((r.unit() - 0.5) * 0.5).to_bits())
+        .collect();
+    let d_a = up(g, &to_b(&a_host))?;
+
+    let gu_bytes_max = max_m * top_k * inter * 2;
+    let dn_bytes_max = max_m * top_k * h * 2;
+    let d_gate = g.alloc(gu_bytes_max)?;
+    let d_upo = g.alloc(gu_bytes_max)?;
+    let d_down = g.alloc(dn_bytes_max)?;
+
+    // Production split policy — the m-row dispatch MUST pass the same splits
+    // the m=1 path passes, or the K-slice per split moves and bit-identity is
+    // gone by construction. Using one `split_for` for both paths encodes that.
+    let max_split = 12usize;
+    let split_for = |n: usize| -> u32 { (96 / (n / 128).max(1)).clamp(1, max_split) as u32 };
+    let (split_gu, split_dn) = (split_for(inter), split_for(h));
+
+    // Scratch sized exactly as `set_exl3_experts` sizes it (`exl3_ws_floats`):
+    // the m-row `ws` is keyed by the flat routed SLOT (`2*slot + proj` for
+    // gate+up, `slot` for down), so it must span every slot of the widest row
+    // count; `counters` stays keyed by launch group.
+    let slots_max = max_m * top_k;
+    let ws_floats = (2 * slots_max * split_gu as usize * inter)
+        .max(slots_max * split_dn as usize * h)
+        .max(2 * top_k * max_split * 4096);
+    let cnt_ints = (2 * slots_max).max(2 * top_k) * (4096 / 128);
+    let d_ws = g.alloc(ws_floats * 4)?;
+    let d_cnt = g.alloc(cnt_ints * 4)?;
+    g.memset(d_cnt, 0, cnt_ints * 4)?;
+
+    let mut ok = true;
+    for &m in &MROW_WIDTHS {
+        let total_routed = m * top_k;
+        let gu_bytes = total_routed * inter * 2;
+        let dn_bytes = total_routed * h * 2;
+        let indices: Vec<u32> = (0..m).flat_map(row_ids).collect();
+        let d_idx = up(g, &indices.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+
+        let kh_gu_m = g.kernel("exl3_gemv", &format!("exl3_gemv_mrow_fused_gate_up_m{m}"))?;
+        let kh_dn_m = g.kernel("exl3_gemv", &format!("exl3_gemv_mrow_fused_down_m{m}"))?;
+
+        // ---- Path A: the m-row dedup'd dispatch (3 launches for ALL rows) ----
+        let mrow = |g: &dyn GpuBackend| -> Result<()> {
+            g.memset(d_gate, 0xAA, gu_bytes)?;
+            g.memset(d_upo, 0xAA, gu_bytes)?;
+            g.memset(d_down, 0xAA, dn_bytes)?;
+            KernelLaunch::new(g, kh_gu_m)
+                .grid([(inter / 128) as u32, split_gu, 2 * total_routed as u32])
+                .block([256, 1, 1])
+                .arg_ptr(d_a)
+                .arg_ptr(gate_t.0)
+                .arg_ptr(gate_t.1)
+                .arg_ptr(gate_t.2)
+                .arg_ptr(up_t.0)
+                .arg_ptr(up_t.1)
+                .arg_ptr(up_t.2)
+                .arg_ptr(d_idx)
+                .arg_ptr(d_gate)
+                .arg_ptr(d_upo)
+                .arg_ptr(d_ws)
+                .arg_ptr(d_cnt)
+                .arg_u32(inter as u32)
+                .arg_u32(h as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(m as u32)
+                .launch(stream)?;
+            launch_silu(g, kh_silu, stream, d_gate, d_upo, d_gate, (total_routed * inter) as u32)?;
+            KernelLaunch::new(g, kh_dn_m)
+                .grid([(h / 128) as u32, split_dn, total_routed as u32])
+                .block([256, 1, 1])
+                .arg_ptr(d_gate)
+                .arg_ptr(down_t.0)
+                .arg_ptr(down_t.1)
+                .arg_ptr(down_t.2)
+                .arg_ptr(d_idx)
+                .arg_ptr(d_down)
+                .arg_ptr(d_ws)
+                .arg_ptr(d_cnt)
+                .arg_u32(h as u32)
+                .arg_u32(inter as u32)
+                .arg_u32(top_k as u32)
+                .arg_u32(m as u32)
+                .launch(stream)?;
+            g.synchronize(stream)
+        };
+        mrow(g)?;
+        let (mut a_gate, mut a_up, mut a_down) =
+            (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+        g.copy_d2h(d_gate, &mut a_gate)?;
+        g.copy_d2h(d_upo, &mut a_up)?;
+        g.copy_d2h(d_down, &mut a_down)?;
+
+        // ---- Path B: the shipping m=1 fused path, once per row (what the
+        //      per-row `forward_batched` fallback runs today). Poisoned with
+        //      the OPPOSITE byte. ----
+        g.memset(d_gate, 0x55, gu_bytes)?;
+        g.memset(d_upo, 0x55, gu_bytes)?;
+        g.memset(d_down, 0x55, dn_bytes)?;
+        for t in 0..m {
+            let a_row = d_a.offset(t * h * 2);
+            let idx_row = d_idx.offset(t * top_k * 4);
+            let gate_row = d_gate.offset(t * top_k * inter * 2);
+            let up_row = d_upo.offset(t * top_k * inter * 2);
+            let down_row = d_down.offset(t * top_k * h * 2);
+            KernelLaunch::new(g, kh_gu_1)
+                .grid([(inter / 128) as u32, split_gu, 2 * top_k as u32])
+                .block([256, 1, 1])
+                .arg_ptr(a_row)
+                .arg_ptr(gate_t.0)
+                .arg_ptr(gate_t.1)
+                .arg_ptr(gate_t.2)
+                .arg_ptr(up_t.0)
+                .arg_ptr(up_t.1)
+                .arg_ptr(up_t.2)
+                .arg_ptr(idx_row)
+                .arg_ptr(gate_row)
+                .arg_ptr(up_row)
+                .arg_ptr(d_ws)
+                .arg_ptr(d_cnt)
+                .arg_u32(inter as u32)
+                .arg_u32(h as u32)
+                .launch(stream)?;
+            launch_silu(g, kh_silu, stream, gate_row, up_row, gate_row, (top_k * inter) as u32)?;
+            KernelLaunch::new(g, kh_dn_1)
+                .grid([(h / 128) as u32, split_dn, top_k as u32])
+                .block([256, 1, 1])
+                .arg_ptr(gate_row)
+                .arg_ptr(down_t.0)
+                .arg_ptr(down_t.1)
+                .arg_ptr(down_t.2)
+                .arg_ptr(idx_row)
+                .arg_ptr(down_row)
+                .arg_ptr(d_ws)
+                .arg_ptr(d_cnt)
+                .arg_u32(h as u32)
+                .arg_u32(inter as u32)
+                .launch(stream)?;
+        }
+        g.synchronize(stream)?;
+        let (mut b_gate, mut b_up, mut b_down) =
+            (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+        g.copy_d2h(d_gate, &mut b_gate)?;
+        g.copy_d2h(d_upo, &mut b_up)?;
+        g.copy_d2h(d_down, &mut b_down)?;
+
+        // Per-ROW diff, so a failure names the row that drifted rather than a
+        // byte count over the whole block.
+        let row_diffs = |x: &[u8], y: &[u8], row_bytes: usize| -> Vec<usize> {
+            x.chunks_exact(row_bytes)
+                .zip(y.chunks_exact(row_bytes))
+                .map(|(a, b)| a.iter().zip(b).filter(|(p, q)| p != q).count())
+                .collect()
+        };
+        let dg = row_diffs(&a_gate, &b_gate, top_k * inter * 2);
+        let du = row_diffs(&a_up, &b_up, top_k * inter * 2);
+        let dd = row_diffs(&a_down, &b_down, top_k * h * 2);
+        let bad: Vec<usize> = (0..m)
+            .filter(|&t| dg[t] != 0 || du[t] != 0 || dd[t] != 0)
+            .collect();
+        // Neither path may have left its poison behind.
+        let nontrivial = a_gate.iter().any(|&x| x != 0xAA)
+            && a_down.iter().any(|&x| x != 0xAA)
+            && b_gate.iter().any(|&x| x != 0x55)
+            && b_down.iter().any(|&x| x != 0x55);
+        let g9 = bad.is_empty() && nontrivial;
+        ok &= g9;
+        eprintln!(
+            "MROW GATE9 m={m}: every row byte-identical to the m=1 fused path \
+             (rows={m} slots={total_routed}, drifted rows={bad:?}, \
+             gate={dg:?} up={du:?} down={dd:?}, nontrivial={nontrivial})  {}",
+            if g9 { "PASS" } else { "FAIL" }
+        );
+
+        // Relaunch determinism: per-slot-keyed ws regions + self-resetting
+        // counters across many concurrent groups must land the same every time.
+        mrow(g)?;
+        let (mut c_gate, mut c_up, mut c_down) =
+            (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+        g.copy_d2h(d_gate, &mut c_gate)?;
+        g.copy_d2h(d_upo, &mut c_up)?;
+        g.copy_d2h(d_down, &mut c_down)?;
+        let g9b = c_gate == a_gate && c_up == a_up && c_down == a_down;
+        ok &= g9b;
+        eprintln!(
+            "MROW GATE9b m={m}: relaunch byte-identical \
+             (split={split_gu}/{split_dn}, {} concurrent gate+up groups): {}",
+            2 * total_routed,
+            if g9b { "PASS" } else { "FAIL" }
+        );
+
+        // Launch-count assertion: this is the whole point of the change. The
+        // per-row fallback runs the WHOLE routed expert set once per row; the
+        // m-row path streams each distinct expert's trellis once for the block.
+        let distinct: usize = {
+            let mut v = indices.clone();
+            v.sort_unstable();
+            v.dedup();
+            v.len()
+        };
+        eprintln!(
+            "MROW GATE9c m={m}: launches {} -> 3, expert-trellis reads {total_routed} -> \
+             {distinct} ({:.2}x fewer bytes on the union)",
+            3 * m,
+            total_routed as f64 / distinct as f64
+        );
+
+        let _ = g.free(d_idx);
+    }
+
+    for p in owned.into_iter().chain([d_a, d_gate, d_upo, d_down, d_ws, d_cnt]) {
+        let _ = g.free(p);
+    }
+    Ok(ok)
 }

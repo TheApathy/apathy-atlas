@@ -59,6 +59,12 @@ const EXL3_MAX_N: u32 = 4096;
 /// overrun `ws`/`counters`.
 const EXL3_MAX_TOP_K: u32 = 32;
 
+/// Compiled `exl3_gemv_mrow_fused_*` ladder rungs, ascending. An `MROW = R`
+/// entry is correct for any `num_tokens <= R`; the host picks the SMALLEST rung
+/// `>= num_tokens` so the accumulator array is never over-provisioned, and
+/// declines past the last rung (a gather wider than MROW silently drops rows).
+const EXL3_MROW_ARMS: [u32; 5] = [1, 2, 4, 6, 8];
+
 /// Device pointer tables for one EXL3 projection across all routed experts.
 pub(crate) struct Exl3ProjTable {
     /// `[num_experts]` u64 → each expert's I16 trellis payload.
@@ -81,18 +87,26 @@ pub(crate) struct Exl3MoeState {
     gemv_idx_k: KernelHandle,           // bring-up: one launch per (slot, proj)
     gemv_fused_gate_up_k: KernelHandle, // fused: all slots × {gate, up}
     gemv_fused_down_k: KernelHandle,    // fused: all slots
-    silu_mul_clamped_k: KernelHandle,   // routed: DeepSeek-V4 swiglu_limit=10
-    silu_mul_noclamp_k: KernelHandle,   // shared expert: unclamped
-    /// f32 `[groups, EXL3_MAX_SPLIT, EXL3_MAX_N]` split-K partial scratch —
-    /// one private region per fused launch group (see module docs). The
-    /// kernels address it as `ws + group·gridDim.y·N`, which is inside this
-    /// allocation for every `(groups ≤ self.groups, split ≤ EXL3_MAX_SPLIT,
-    /// N ≤ EXL3_MAX_N)` launch.
+    /// `exl3_gemv_mrow_fused_gate_up_m{1,2,4,6,8}` — the dedup'd wide-verify
+    /// twin, indexed alongside [`EXL3_MROW_ARMS`].
+    mrow_gate_up_k: [KernelHandle; EXL3_MROW_ARMS.len()],
+    /// `exl3_gemv_mrow_fused_down_m{1,2,4,6,8}`.
+    mrow_down_k: [KernelHandle; EXL3_MROW_ARMS.len()],
+    silu_mul_clamped_k: KernelHandle, // routed: DeepSeek-V4 swiglu_limit=10
+    silu_mul_noclamp_k: KernelHandle, // shared expert: unclamped
+    /// f32 split-K partial scratch. The M=1 fused pair addresses it as
+    /// `ws + group·gridDim.y·N` (one region per launch group); the m-row pair
+    /// addresses it as `ws + (ws_row·S + split)·N` where `ws_row` is keyed by
+    /// the flat routed SLOT (`2·slot + proj` for gate+up, `slot` for down) —
+    /// slots are unique across leaders, so leaders never collide. Sized by
+    /// [`Self::ws_floats_needed`] for the widest of the two.
     ws: DevicePtr,
-    /// i32 `[groups, EXL3_MAX_N/128]` split-election counters (self-resetting;
-    /// addressed as `counters + group·N/128`).
+    /// i32 `[groups, N/128]` split-election counters (self-resetting; both
+    /// families address them as `counters + group·N/128`, so the sizing is
+    /// simply the widest group count either family launches).
     counters: DevicePtr,
-    /// Widest launch-group count the scratch is sized for: `2·top_k` (gate+up).
+    /// Widest launch-group count the scratch is sized for: `2·top_k` at M=1,
+    /// `2·MOE_VERIFY_MAX_ROWS·top_k` for the m-row verify.
     groups: u32,
     /// Split override from `ATLAS_EXL3_SPLIT` (0 = auto).
     split_override: u32,
@@ -168,6 +182,63 @@ impl Exl3MoeState {
         }
         base
     }
+
+    /// The m-row ladder rung that serves `num_tokens`: the smallest compiled
+    /// `MROW >= num_tokens`. `None` past the widest arm — going wider would
+    /// silently drop the gathered rows past MROW, which is a correctness bug,
+    /// not a slowdown.
+    fn mrow_arm(&self, num_tokens: u32) -> Option<(usize, u32)> {
+        EXL3_MROW_ARMS
+            .iter()
+            .position(|&r| r >= num_tokens)
+            .map(|i| (i, EXL3_MROW_ARMS[i]))
+    }
+}
+
+/// [`Exl3MoeState::split_for`] as a free function so the constructor can size
+/// the split-K scratch by the SAME splits the dispatch will launch with.
+fn exl3_split_for(n: u32, split_override: u32, groups: u32) -> u32 {
+    if split_override > 0 {
+        return split_override.min(EXL3_MAX_SPLIT);
+    }
+    let strips = (n / 128).max(1);
+    let base = (96 / strips).clamp(1, EXL3_MAX_SPLIT);
+    let groups = groups.max(1);
+    for s in base..=EXL3_MAX_SPLIT {
+        if (strips * s * groups) % EXL3_WAVE_CTAS == 0 {
+            return s;
+        }
+    }
+    base
+}
+
+/// f32 slots the split-K partial scratch must hold to serve every launch this
+/// state can make.
+///
+/// Four claims, take the max:
+///   * M=1 gate+up — `2·top_k` groups × `[split_gu, inter]`
+///   * M=1 down    — `top_k` groups × `[split_dn, h]`
+///   * m-row gate+up — `ws_row` runs to `2·max_rows·top_k`, each `[split_gu, inter]`
+///   * m-row down    — `ws_row` runs to `max_rows·top_k`, each `[split_dn, h]`
+///
+/// Sized from the ACTUAL splits (not `EXL3_MAX_SPLIT`), so the override arm is
+/// covered without paying for it by default. At the DeepSeek-V4 shapes
+/// (inter 2048, h 4096, top_k 8, max_rows 8) the binding term is the m-row
+/// gate+up: 2·64·6·2048 f32 = 6.3 MB per layer.
+fn exl3_ws_floats(
+    gate_n: u32,
+    down_n: u32,
+    top_k: u32,
+    split_gu: u32,
+    split_dn: u32,
+    max_rows: u32,
+) -> usize {
+    let gu = |groups: u32| groups as usize * split_gu as usize * gate_n as usize;
+    let dn = |groups: u32| groups as usize * split_dn as usize * down_n as usize;
+    gu(2 * top_k)
+        .max(dn(top_k))
+        .max(gu(2 * max_rows * top_k))
+        .max(dn(max_rows * top_k))
 }
 
 fn build_proj_table(
@@ -208,6 +279,22 @@ fn build_proj_table(
         n,
         k,
     })
+}
+
+/// Resolve the `EXL3_MROW_ARMS` ladder for one projection family
+/// (`prefix` + the rung's MROW).
+fn mrow_handles(
+    gpu: &dyn GpuBackend,
+    prefix: &str,
+) -> Result<[KernelHandle; EXL3_MROW_ARMS.len()]> {
+    let mut out = [KernelHandle(0); EXL3_MROW_ARMS.len()];
+    for (slot, &mrow) in out.iter_mut().zip(EXL3_MROW_ARMS.iter()) {
+        let name = format!("{prefix}{mrow}");
+        *slot = gpu
+            .kernel("exl3_gemv", &name)
+            .with_context(|| format!("EXL3 wide verify needs the {name} kernel"))?;
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -267,24 +354,38 @@ impl MoeLayer {
             top_k > 0 && top_k <= EXL3_MAX_TOP_K,
             "EXL3 decode scratch sized for top_k in 1..={EXL3_MAX_TOP_K}, got {top_k}"
         );
-        // Widest fused launch: gate+up = 2·top_k groups (down uses top_k).
-        // Every group needs its own [SPLIT_K, N] fp32 partial region and its
-        // own [N/128] election counters, since fused groups run concurrently.
-        let groups = 2 * top_k;
-        let ws_floats =
-            groups as usize * EXL3_MAX_SPLIT as usize * EXL3_MAX_N as usize;
+        let split_override = std::env::var("ATLAS_EXL3_SPLIT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        // Widest launch-group count. M=1 fused gate+up takes `2·top_k`; the
+        // m-row verify takes `2·max_rows·top_k` (one CTA-set per flat routed
+        // slot per projection, duplicates exiting at the leader election).
+        // Every group needs its own [N/128] election counters, and every
+        // OUTPUT ROW its own [SPLIT_K, N] fp32 partial region, since fused /
+        // dedup'd groups run concurrently.
+        let max_rows = super::MOE_VERIFY_MAX_ROWS.min(*EXL3_MROW_ARMS.last().unwrap());
+        let groups = 2 * max_rows * top_k;
+        // MUST match what the dispatch launches with, for EVERY arm: the
+        // wave-walk in `split_for` can round the split UP, and the partial
+        // region is [split, N] per row — sizing with a smaller split would
+        // undersize the scratch (memory corruption, not a slowdown). Take the
+        // max over the m=1 fused group counts (2*top_k / top_k) and the m-row
+        // ones (2*max_rows*top_k / max_rows*top_k).
+        let split_gu = exl3_split_for(gate.n, split_override, 2 * top_k)
+            .max(exl3_split_for(gate.n, split_override, groups));
+        let split_dn = exl3_split_for(down.n, split_override, top_k)
+            .max(exl3_split_for(down.n, split_override, max_rows * top_k));
+        let ws_floats = exl3_ws_floats(gate.n, down.n, top_k, split_gu, split_dn, max_rows);
         let counter_bytes = groups as usize * (EXL3_MAX_N as usize / 128) * 4;
         let ws = gpu.alloc(ws_floats * 4)?;
         let counters = gpu.alloc(counter_bytes)?;
         // Counters must be zero before the FIRST launch; the kernel re-arms
         // them to zero on completion, so this is the only memset ever needed.
         // (Groups never touch each other's counters, so the invariant "all
-        // zero at rest" survives fusion and CUDA-graph replay unchanged.)
+        // zero at rest" survives fusion, dedup and CUDA-graph replay
+        // unchanged — a duplicate slot's group returns before the atomic.)
         gpu.memset(counters, 0, counter_bytes)?;
-        let split_override = std::env::var("ATLAS_EXL3_SPLIT")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
 
         // ── P1 prefill scratch (see Exl3PrefillState) ──
         // One slot size serves gate/up/down: all three are inter×h elements.
@@ -332,6 +433,8 @@ impl MoeLayer {
                 .context("EXL3 checkpoint needs the exl3_gemv kernel module")?,
             gemv_fused_gate_up_k: gpu.kernel("exl3_gemv", "exl3_gemv_m1_fused_gate_up")?,
             gemv_fused_down_k: gpu.kernel("exl3_gemv", "exl3_gemv_m1_fused_down")?,
+            mrow_gate_up_k: mrow_handles(gpu, "exl3_gemv_mrow_fused_gate_up_m")?,
+            mrow_down_k: mrow_handles(gpu, "exl3_gemv_mrow_fused_down_m")?,
             silu_mul_clamped_k: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             silu_mul_noclamp_k: gpu.kernel("moe_silu_mul", "silu_mul_noclamp")?,
             ws,
@@ -520,5 +623,215 @@ impl MoeLayer {
             stream,
         )?;
         Ok(())
+    }
+
+    /// True when a `num_tokens`-row verify would take the dedup'd EXL3 m-row
+    /// kernels. The twin of [`Self::verify_ffn_is_batched`] for the trellis
+    /// arm — callers use it to decide whether batching the verify MoE is worth
+    /// it at all, since the fallback (`forward_batched`) re-streams the whole
+    /// routed expert set once PER ROW.
+    pub(super) fn exl3_verify_is_batched(&self, ctx: &ForwardContext, num_tokens: u32) -> bool {
+        let Some(st) = self.exl3.as_ref() else {
+            return false;
+        };
+        if st.mrow_arm(num_tokens).is_none() {
+            return false;
+        }
+        if st.mrow_gate_up_k.iter().chain(&st.mrow_down_k).any(|k| k.0 == 0) {
+            return false;
+        }
+        // The shared expert rides the per-row NVFP4 chain (see below), which
+        // needs the shared scratch to hold `num_tokens` rows at a stride the
+        // MXFP4 wide verify already provisions (`moe_intermediate_size`).
+        (ctx.config.shared_expert_intermediate_size as u32)
+            <= ctx.config.moe_intermediate_size as u32
+    }
+
+    /// `num_tokens`-row speculative-verify expert FFN over EXL3 routed experts
+    /// + NVFP4 shared expert, through the dedup'd m-row kernels.
+    ///
+    /// Output layout is EXACTLY what `dispatch_splitk_m_t` leaves behind —
+    /// routed slots flat in `expert_{gate,up,down}_out`, one shared row per
+    /// token in the shared scratch — so `moe_weighted_sum_blend_batchn`
+    /// downstream is untouched.
+    ///
+    /// ## The exact-GEMV law
+    ///
+    /// Every row's routed output is BIT-IDENTICAL to what
+    /// [`Self::dispatch_exl3_decode`] computes for that token, because:
+    ///   * the m-row kernels run the same per-row op sequence as
+    ///     `exl3_gemv_m1_body` (see the kernel header's structural argument),
+    ///   * this dispatch passes the SAME `split_for(N)` the M=1 path passes, so
+    ///     the K-slice per split is identical,
+    ///   * the SwiGLU is the same elementwise `moe_silu_mul` kernel over a
+    ///     wider flat extent, and
+    ///   * the shared expert runs the SAME single-row `w4a16_gemv` chain, once
+    ///     per row.
+    ///
+    /// That last point is why the shared half is a per-row loop and not a
+    /// batched GEMM: `w4a16_gemm` has a different accumulation order, and a
+    /// PARTIALLY exact verify chain measured WORSE than either extreme
+    /// (o-proj-only exactness: 2.54 tok/step vs 2.83 for none and 2.92-3.01 for
+    /// full). It costs `4·num_tokens` small launches per layer; batching it
+    /// needs a bit-exact `w4a16_gemv_batchm`, which is the next lever here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_exl3_verify(
+        &self,
+        ctx: &ForwardContext,
+        expert_input: DevicePtr, // [num_tokens, h] BF16
+        expert_gate_out: DevicePtr,
+        expert_up_out: DevicePtr,
+        expert_down_out: DevicePtr,
+        shared_gate_scratch: DevicePtr,
+        shared_up_scratch: DevicePtr,
+        shared_out: DevicePtr,
+        indices_dev: DevicePtr, // [num_tokens*top_k] u32
+        h: u32,
+        inter: u32,
+        top_k: u32,
+        num_tokens: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        let st = self.exl3.as_ref().expect("dispatch_exl3_verify without state");
+        if !self.exl3_verify_is_batched(ctx, num_tokens) {
+            return Ok(false);
+        }
+        ensure!(
+            st.gate.n == inter && st.gate.k == h && st.down.n == h && st.down.k == inter,
+            "EXL3 dims mismatch: gate [{}x{}] down [{}x{}] vs h={h} inter={inter}",
+            st.gate.n,
+            st.gate.k,
+            st.down.n,
+            st.down.k
+        );
+        let (arm, _mrow) = st.mrow_arm(num_tokens).expect("checked above");
+        let gpu = ctx.gpu;
+        // SAME splits as the M=1 decode path — this is half the bit-identity
+        // argument, so it must not be re-tuned independently.
+        // Pass the M=1 FUSED group counts (2*top_k for gate+up, top_k for
+        // down), NOT the m-row ones: split_for's wave-walk is a function of
+        // `groups`, so feeding the wider m-row count could round the split to
+        // a different value and silently break per-row bit-identity with the
+        // M=1 path — which is the property GATE9 exists to prove.
+        let split_gu = st.split_for(inter, 2 * top_k as u32);
+        let split_dn = st.split_for(h, top_k as u32);
+        let total_routed = num_tokens * top_k;
+        // `set_exl3_experts` sized ws/counters for `2·max_rows·top_k` groups;
+        // re-check before any launch can walk off the end.
+        ensure!(
+            2 * total_routed <= st.groups,
+            "EXL3 verify scratch sized for {} launch groups, need {} \
+             (num_tokens={num_tokens} top_k={top_k})",
+            st.groups,
+            2 * total_routed
+        );
+
+        // (1) gate+up over every routed slot of every row: grid.z = 2·slots,
+        //     z = 2·slot + proj. Duplicate expert ids exit at the leader
+        //     election, so each distinct expert's trellis is streamed ONCE for
+        //     the whole verify block.
+        KernelLaunch::new(gpu, st.mrow_gate_up_k[arm])
+            .grid([inter / 128, split_gu, 2 * total_routed])
+            .block([256, 1, 1])
+            .arg_ptr(expert_input)
+            .arg_ptr(st.gate.trellis_tab)
+            .arg_ptr(st.gate.suh_tab)
+            .arg_ptr(st.gate.svh_tab)
+            .arg_ptr(st.up.trellis_tab)
+            .arg_ptr(st.up.suh_tab)
+            .arg_ptr(st.up.svh_tab)
+            .arg_ptr(indices_dev)
+            .arg_ptr(expert_gate_out)
+            .arg_ptr(expert_up_out)
+            .arg_ptr(st.ws)
+            .arg_ptr(st.counters)
+            .arg_u32(inter)
+            .arg_u32(h)
+            .arg_u32(top_k)
+            .arg_u32(num_tokens)
+            .launch(stream)?;
+        // (2) ONE flat clamped SwiGLU over every slot of every row — same
+        //     kernel, same same-index in-place map, just a wider extent.
+        ops::moe_silu_mul(
+            gpu,
+            st.silu_mul_clamped_k,
+            expert_gate_out,
+            expert_up_out,
+            expert_gate_out,
+            total_routed * inter,
+            stream,
+        )?;
+        // (3) down over every routed slot: grid.z = slots, A row = act + slot·inter.
+        KernelLaunch::new(gpu, st.mrow_down_k[arm])
+            .grid([h / 128, split_dn, total_routed])
+            .block([256, 1, 1])
+            .arg_ptr(expert_gate_out)
+            .arg_ptr(st.down.trellis_tab)
+            .arg_ptr(st.down.suh_tab)
+            .arg_ptr(st.down.svh_tab)
+            .arg_ptr(indices_dev)
+            .arg_ptr(expert_down_out)
+            .arg_ptr(st.ws)
+            .arg_ptr(st.counters)
+            .arg_u32(h)
+            .arg_u32(inter)
+            .arg_u32(top_k)
+            .arg_u32(num_tokens)
+            .launch(stream)?;
+
+        // ── Shared expert, one row at a time on the SAME single-row NVFP4
+        //    kernels plain decode uses (see the exact-GEMV note above). ──
+        self.shared_experts_scale_kind.expect(
+            crate::weight_map::WeightQuantFormat::Nvfp4,
+            "EXL3 verify arm computes the shared expert via w4a16_gemv (NVFP4)",
+        );
+        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+        let sh = &self.weights.shared_expert;
+        for t in 0..num_tokens as usize {
+            let a_row = expert_input.offset(t * h as usize * 2);
+            let g_row = shared_gate_scratch.offset(t * shared_inter as usize * 2);
+            let u_row = shared_up_scratch.offset(t * shared_inter as usize * 2);
+            let o_row = shared_out.offset(t * h as usize * 2);
+            ops::w4a16_gemv(
+                gpu,
+                self.w4a16_gemv,
+                a_row,
+                &sh.gate_proj,
+                g_row,
+                shared_inter,
+                h,
+                stream,
+            )?;
+            ops::w4a16_gemv(
+                gpu,
+                self.w4a16_gemv,
+                a_row,
+                &sh.up_proj,
+                u_row,
+                shared_inter,
+                h,
+                stream,
+            )?;
+            ops::moe_silu_mul(
+                gpu,
+                st.silu_mul_noclamp_k,
+                g_row,
+                u_row,
+                g_row,
+                shared_inter,
+                stream,
+            )?;
+            ops::w4a16_gemv(
+                gpu,
+                self.w4a16_gemv,
+                g_row,
+                &sh.down_proj,
+                o_row,
+                h,
+                shared_inter,
+                stream,
+            )?;
+        }
+        Ok(true)
     }
 }
