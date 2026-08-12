@@ -116,6 +116,45 @@ pub fn moe_topk_sqrtsoftplus(
         .launch(stream)
 }
 
+/// Adaptive top-K prune (`ATLAS_MOE_ADAPTIVE_TOPK`) — QUALITY-AFFECTING,
+/// default OFF; the caller only reaches here when the knob is set.
+///
+/// Rewrites the router's `(expert_indices, expert_weights)` in place: any slot
+/// carrying less than `threshold` of the gate mass gets `skip_index` (the
+/// sentinel expert whose pointer-table entry is NULL) and weight 0, so the
+/// expert GEMV's existing NULL guard zeroes that slot and returns BEFORE
+/// streaming any weight bytes. The arg-max slot is never dropped.
+///
+/// Graph-safe by construction: constant grid/block, all data device-side. See
+/// `kernels/gb10/common/moe_adaptive_topk.cu` and docs/ADAPTIVE-TOPK.md.
+///
+/// Kernel: `moe_adaptive_topk_prune(expert_indices, expert_weights, top_k,
+///          skip_index, threshold, renormalize)`
+/// Grid: (1, 1, 1)  Block: (32, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn moe_adaptive_topk_prune(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    expert_indices: DevicePtr,
+    expert_weights: DevicePtr,
+    top_k: u32,
+    skip_index: u32,
+    threshold: f32,
+    renormalize: bool,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([1, 1, 1])
+        .block([32, 1, 1])
+        .arg_ptr(expert_indices)
+        .arg_ptr(expert_weights)
+        .arg_u32(top_k)
+        .arg_u32(skip_index)
+        .arg_f32(threshold)
+        .arg_u32(if renormalize { 1 } else { 0 })
+        .launch(stream)
+}
+
 /// GPU-side MoE hash routing (DeepSeek-V4 hash_moe layers).
 ///
 /// Expert selection is a static `tid2eid[token_id]` lookup (frozen table);
