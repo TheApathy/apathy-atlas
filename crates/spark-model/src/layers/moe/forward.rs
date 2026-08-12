@@ -245,6 +245,23 @@ impl MoeLayer {
                 top_k,
                 self.tid2eid_dev.is_some(),
             )?;
+            // ATLAS_MOE_ROUTE_LOG=1 (no-op otherwise). Orthogonal axis to the
+            // line above: `route_group_row` measures expert overlap ACROSS the
+            // rows of one verify batch; this measures overlap ACROSS CONSECUTIVE
+            // TOKENS at a FIXED layer — the only statistic that can justify a
+            // predictive expert prefetcher. See `route_locality.rs` and
+            // docs/MOE-PREFETCH-ANALYSIS.md. The layer is keyed by the MoeLayer
+            // instance address (no layer_idx field exists, and threading one
+            // through would touch every weight loader); first-seen order of
+            // those addresses is model order.
+            super::route_locality::record_decode_route(
+                ctx.gpu,
+                stream,
+                std::ptr::from_ref(self) as usize,
+                indices_dev,
+                top_k,
+                self.tid2eid_dev.is_some(),
+            )?;
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
