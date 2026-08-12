@@ -387,6 +387,11 @@ pub struct MoeLayer {
     // ── sqrtsoftplus routing (DeepSeek-V4) ──
     moe_topk_sqrtsoftplus_k: KernelHandle,
     moe_topk_sqrtsoftplus_batched_k: KernelHandle,
+    /// `ATLAS_MOE_ADAPTIVE_TOPK=<threshold>` — QUALITY-AFFECTING, default OFF.
+    /// Post-router in-place prune of negligible-gate-weight routed slots. Zero
+    /// when the target's kernel set lacks `moe_adaptive_topk` (the feature then
+    /// refuses to arm and says so once). See docs/ADAPTIVE-TOPK.md.
+    moe_adaptive_topk_prune_k: KernelHandle,
     // ── hash routing (DeepSeek-V4 first `num_hash_layers` MoE layers) ──
     moe_hash_route_k: KernelHandle,
     moe_hash_route_batched_k: KernelHandle,
@@ -954,6 +959,7 @@ mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
 mod forward_token_major;
+pub(crate) mod gate_hist;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;

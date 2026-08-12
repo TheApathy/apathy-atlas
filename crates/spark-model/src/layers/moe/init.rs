@@ -662,6 +662,13 @@ impl MoeLayer {
                 "moe_topk_sqrt",
                 "moe_topk_sqrtsoftplus_batched",
             ),
+            // Adaptive top-K prune (ATLAS_MOE_ADAPTIVE_TOPK): lazy-loaded; the
+            // dispatch never launches it unless the env knob is set.
+            moe_adaptive_topk_prune_k: super::super::try_kernel(
+                gpu,
+                "moe_adaptive_topk",
+                "moe_adaptive_topk_prune",
+            ),
             // Hash routing (DeepSeek-V4 hash_moe layers): lazy-loaded so other
             // models start fine. `tid2eid_dev` is the per-layer table (Some
             // only for hash layers).

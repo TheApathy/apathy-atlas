@@ -233,6 +233,61 @@ impl MoeLayer {
             })?;
         }
 
+        // ATLAS_MOE_ADAPTIVE_TOPK=<threshold> — QUALITY-AFFECTING, default OFF.
+        //
+        // Prune routed slots whose gate-mass fraction is below the threshold by
+        // rewriting their expert id to the NULL-pointer sentinel and their
+        // weight to 0. Graph-safe: the prune kernel is a constant (1,1,1)/(32,1,1)
+        // launch reading only device memory, and the expert GEMVs below keep
+        // their static `grid.y = top_k + 1` — the expert COUNT is unchanged, only
+        // which slots stream bytes. See docs/ADAPTIVE-TOPK.md.
+        //
+        // Renormalization is gated on `norm_topk_prob`, and that is the whole
+        // argument: DeepSeek-V4's sqrtsoftplus scores are NOT a probability
+        // simplex, so "the weights sum to 1" is not a property of the scoring
+        // function — it is a property of the router having divided by the sum of
+        // the SELECTED set. When it did (V4: norm_topk_prob=true, weights sum to
+        // routed_scaling_factor=1.5), dropping a slot without rescaling
+        // attenuates the whole routed branch by the dropped mass, every layer,
+        // 43 times over; rescaling the survivors reproduces exactly what the
+        // router would have emitted had it selected the smaller set, which is
+        // the model's own semantics. When it did NOT normalize, the weights are
+        // raw scores and their sum carries meaning, so rescaling would INVENT
+        // magnitude — there we drop and leave the rest alone.
+        if let Some((threshold, skip_index)) = self.adaptive_topk() {
+            prof!("adaptive_topk", {
+                ops::moe_adaptive_topk_prune(
+                    ctx.gpu,
+                    self.moe_adaptive_topk_prune_k,
+                    indices_dev,
+                    weights_dev,
+                    top_k,
+                    skip_index,
+                    threshold,
+                    ctx.config.norm_topk_prob,
+                    stream,
+                )
+            })?;
+        }
+
+        // ATLAS_MOE_GATE_HIST=1 (no-op otherwise): the gate-weight distribution
+        // that adaptive top-K lives or dies on. Placed AFTER the prune so a run
+        // with both knobs on logs what actually reached the experts; with the
+        // prune off (the normal measurement run) it logs the untouched router
+        // output. Synchronizes + reads back, so it is skipped under capture.
+        if !ctx.graph_capture {
+            super::gate_hist::record(
+                ctx.gpu,
+                stream,
+                indices_dev,
+                weights_dev,
+                top_k,
+                self.weights.gate.weight.0,
+                self.tid2eid_dev.is_some(),
+                ctx.config.routed_scaling_factor as f32,
+            )?;
+        }
+
         // ATLAS_MOE_OVERLAP=1 (no-op otherwise). This — not forward_batched —
         // is the routine the m-row speculative verify actually calls, once per
         // row (`multi_seq/mod.rs`: "MLA models always take this path"), so it

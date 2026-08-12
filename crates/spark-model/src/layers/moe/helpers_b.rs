@@ -2,6 +2,8 @@
 
 //! set_down_transpose_scratch.
 
+use std::sync::OnceLock;
+
 use super::*;
 
 impl MoeLayer {
@@ -188,5 +190,88 @@ impl MoeLayer {
             && self.up_ptrs_t.is_some()
             && self.down_ptrs_t.is_some()
             && self.down_t_scratch_packed.is_none()
+    }
+
+    /// `ATLAS_MOE_ADAPTIVE_TOPK=<threshold>` — **QUALITY-AFFECTING, default OFF.**
+    ///
+    /// Returns `Some((threshold, skip_index))` when the adaptive top-K prune
+    /// should run for THIS layer's decode dispatch, `None` (exact current
+    /// behaviour, not one extra kernel node) otherwise. Threshold is a
+    /// gate-mass FRACTION in `(0, 1)`; anything outside that, or an unparseable
+    /// value, disarms the feature loudly rather than silently.
+    ///
+    /// ### Why the dispatch-path gate
+    ///
+    /// The prune works by writing the sentinel expert id (`num_experts`, whose
+    /// pointer-table entry is NULL — see `ptr_table_build::SENTINEL_SLOTS`) into
+    /// the pruned slot, so the expert GEMV's EP-remote NULL guard zeroes the
+    /// slot and returns *before* the K loop. That guard is what turns a pruned
+    /// slot into zero streamed bytes. It is verified present, ahead of any
+    /// weight read, in:
+    ///
+    /// * `moe_shared_expert_fused_t.cu` — `moe_expert_gate_up_shared_t`,
+    ///   `moe_expert_silu_down_shared_t`, their split-K and `_m` multi-row
+    ///   siblings (all share `gate_up_shared_t_impl` / `silu_down_shared_t_impl`)
+    /// * `moe_shared_expert_fused.cu` / `moe_expert_gemv_fused.cu` — the
+    ///   non-transposed NVFP4 fused decode pair
+    ///
+    /// It is NOT verified for the EXL3, BF16-dequant, FP8 or W3 routed paths, so
+    /// those refuse to arm. This is a correctness gate, not a taste one: without
+    /// the guard the sentinel would be dereferenced as a weight pointer.
+    #[inline]
+    pub(crate) fn adaptive_topk(&self) -> Option<(f32, u32)> {
+        static THRESHOLD: OnceLock<Option<f32>> = OnceLock::new();
+        let thr = (*THRESHOLD.get_or_init(|| {
+            let raw = std::env::var("ATLAS_MOE_ADAPTIVE_TOPK").ok()?;
+            match raw.trim().parse::<f32>() {
+                Ok(v) if v > 0.0 && v < 1.0 => {
+                    tracing::warn!(
+                        "ATLAS_MOE_ADAPTIVE_TOPK={v}: routed experts carrying <{:.1}% of the \
+                         gate mass will be SKIPPED. This is a quality-affecting change — run \
+                         the docs/ADAPTIVE-TOPK.md protocol before trusting any output.",
+                        v * 100.0
+                    );
+                    Some(v)
+                }
+                Ok(v) => {
+                    tracing::error!(
+                        "ATLAS_MOE_ADAPTIVE_TOPK={v} out of range (need 0 < t < 1) — DISARMED"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::error!("ATLAS_MOE_ADAPTIVE_TOPK={raw:?} unparseable ({e}) — DISARMED");
+                    None
+                }
+            }
+        }))?;
+
+        if self.moe_adaptive_topk_prune_k.0 == 0 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::error!(
+                    "ATLAS_MOE_ADAPTIVE_TOPK set but this target ships no `moe_adaptive_topk` \
+                     module — DISARMED"
+                );
+            });
+            return None;
+        }
+        // Only the NULL-guarded routed-expert decode kernels (see doc comment).
+        let path_ok = self.use_t_layout_for_decode()
+            || (self.exl3.is_none()
+                && self.bf16_gate_weight_ptrs.is_none()
+                && self.fp8_gate_weight_ptrs.is_none()
+                && !self.is_w3());
+        if !path_ok {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::error!(
+                    "ATLAS_MOE_ADAPTIVE_TOPK set but this layer's routed-expert decode path has \
+                     no verified NULL-pointer early-out — DISARMED (see helpers_b::adaptive_topk)"
+                );
+            });
+            return None;
+        }
+        Some((thr, self.weights.experts.len() as u32))
     }
 }
