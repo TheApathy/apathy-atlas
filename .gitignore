@@ -270,3 +270,6 @@ nograph-extra.json
 *.sqlite-shm
 *.sqlite-wal
 *.sqlite-journal
+
+# Agent worktrees created inside the repo — never commit as an embedded repo.
+.worktrees/
