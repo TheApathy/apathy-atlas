@@ -137,6 +137,20 @@ pub(crate) type DrafterState = (
     Option<spark_model::weight_loader::deepseek_v4::dspark_reap::DraftExpertSubset>,
 );
 
+/// Does this tensor belong to the DSpark drafter rather than the target?
+///
+/// Only meaningful for the shared-checkpoint layout (the reference tp1 build),
+/// where the drafter's `mtp.*` stages sit in the same directory as the target
+/// weights. `load_dspark_drafter` consumes the mtp stages plus the Markov and
+/// confidence heads; everything else in that directory is the target's and is
+/// already resident by the time the drafter loads.
+fn is_drafter_tensor(name: &str) -> bool {
+    name.starts_with("mtp.")
+        || name.contains("markov")
+        || name.contains("confidence")
+        || name.starts_with("dspark")
+}
+
 pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
@@ -155,6 +169,19 @@ pub(crate) fn load_dflash_drafter(
              or use a target whose MODEL.toml has a [dflash] section",
         )?;
     tracing::info!("DFlash: resolving drafter '{drafter_id}'");
+    // Does the drafter live in the target's own directory? Compare canonical
+    // paths so a trailing slash or a symlink cannot defeat it.
+    let shares_target_dir = args
+        .model
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| p.canonicalize().ok())
+        .zip(
+            std::path::Path::new(&drafter_id)
+                .canonicalize()
+                .ok(),
+        )
+        .is_some_and(|(a, b)| a == b);
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
@@ -207,9 +234,33 @@ pub(crate) fn load_dflash_drafter(
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&m| m >= 1.0);
+    // The two predicates are ORTHOGONAL and must COMPOSE: the compact-draft one
+    // prunes routed experts WITHIN mtp.*, the shared-dir one excludes the
+    // target's tensors entirely. Applying only the first (the original
+    // `else if`) still admitted every target tensor minus pruned experts —
+    // measured 35.58 GB where the drafter needs 2.94.
     if let Some(ref subset) = dspark_subset {
-        loader.extra_skip =
-            Some(spark_model::weight_loader::deepseek_v4::dspark::compact_draft_skip_fn(subset));
+        let compact =
+            spark_model::weight_loader::deepseek_v4::dspark::compact_draft_skip_fn(subset);
+        loader.extra_skip = if shares_target_dir {
+            Some(std::sync::Arc::new(move |name: &str| {
+                !is_drafter_tensor(name) || compact(name)
+            }))
+        } else {
+            Some(compact)
+        };
+    } else if shares_target_dir {
+        // SHARED-CHECKPOINT LAYOUT (the reference tp1 build): the DSpark
+        // drafter's `mtp.*` shards sit in the SAME directory as the target
+        // weights. With no skip predicate the drafter load admits every tensor
+        // in the directory — it would pull the target's ~99 GB into a second
+        // store, and the OOM pre-flight was correctly reporting that intent
+        // (99.26 GB estimate) rather than mis-measuring.
+        //
+        // Admit only what the drafter actually consumes: the `mtp.*` stages
+        // plus the Markov / confidence heads that `load_dspark_drafter` looks
+        // up by name. Everything else is the target's, already resident.
+        loader.extra_skip = Some(std::sync::Arc::new(|name: &str| !is_drafter_tensor(name)));
     }
     let drafter_store = loader
         .load(&drafter_dir, gpu, 0)
