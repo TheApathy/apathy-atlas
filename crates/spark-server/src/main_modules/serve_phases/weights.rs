@@ -190,7 +190,23 @@ pub(crate) fn load_dflash_drafter(
     };
 
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
-    loader.peak_memory_multiplier = None;
+    // Honour the SAME multiplier the target used, instead of falling to the
+    // 1.3x default. When the drafter shares the target's directory — which is
+    // exactly the DSpark-in-checkpoint layout of the reference tp1 build — the
+    // pre-flight sizes the WHOLE shared dir, so 99.26 GB x 1.3 = 129.04 GB and
+    // the serve aborts before loading a byte, even though the drafter only
+    // reads the mtp.* shards (~8.6 GiB). Passing the target's multiplier makes
+    // `ATLAS_PEAK_MEM_MULT` and the EXL3 1.05 case reach this path.
+    //
+    // NOTE: this is the conservative half of the fix. The estimate is still
+    // computed over the whole directory rather than the mtp.* subset the skip
+    // function actually loads, so it remains an OVER-estimate — safe, just not
+    // tight. Sizing from the subset is the real fix and needs the loader to
+    // know its own skip predicate before the pre-flight runs.
+    loader.peak_memory_multiplier = std::env::var("ATLAS_PEAK_MEM_MULT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|&m| m >= 1.0);
     if let Some(ref subset) = dspark_subset {
         loader.extra_skip =
             Some(spark_model::weight_loader::deepseek_v4::dspark::compact_draft_skip_fn(subset));

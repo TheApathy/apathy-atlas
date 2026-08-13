@@ -59,6 +59,7 @@ env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --max-num-seqs 1 \
   --max-batch-size 1 \
   --max-prefill-tokens 1024 \
+  --oom-guard-mb "${OOM_GUARD:-2048}" \
   "${SPEC[@]}" >>"$LOG" 2>&1 &
 
 echo "pid=$! log=$LOG"
