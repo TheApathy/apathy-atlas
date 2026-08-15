@@ -123,6 +123,60 @@ impl SsmStatePool {
             0
         };
 
+        // Predict the pool footprint BEFORE allocating any of it.
+        //
+        // These pools are the single largest allocation Atlas makes on a
+        // hybrid-GDN model — larger than the weights. The size is
+        //   num_ssm_layers * total_slots * ni * (h_bytes + conv_bytes)
+        // which is linear in BOTH the batch slots and the verify window
+        // ni = γ+1. On Qwen3.8-27B (48 GDN layers, γ=16 → ni=33) that measured
+        // 5.15 GB *per slot*: 25.2 GB at --max-batch-size 4, and ~85 GB at 16.
+        //
+        // Until this check existed the size was only logged AFTER the
+        // allocations succeeded, so an over-large request was not reported —
+        // it just OOMed. On GB10 the memory is unified, so that OOM is a
+        // *global* one: it takes down the host, not just this process
+        // (observed 2026-08-14, --max-batch-size 16 → hard reboot).
+        {
+            let per_slot = num_ssm_layers
+                * if has_mtp {
+                    num_intermediates * (h_bytes + conv_bytes)
+                        + h_bytes
+                        + conv_bytes
+                        + kv_retain_bytes
+                        + gate_retain_bytes
+                } else {
+                    h_bytes + conv_bytes
+                };
+            let predicted = total_slots.saturating_mul(per_slot);
+            let free = gpu.free_memory().unwrap_or(0);
+            tracing::info!(
+                "SSM pool pre-flight: {} layers × {} slots × (ni={}) = {:.1} GB predicted \
+                 ({:.2} GB/slot), {:.1} GB free",
+                num_ssm_layers,
+                total_slots,
+                num_intermediates,
+                predicted as f64 / (1024.0 * 1024.0 * 1024.0),
+                per_slot as f64 / (1024.0 * 1024.0 * 1024.0),
+                free as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+            if free > 0 && predicted > free {
+                anyhow::bail!(
+                    "SSM pools need {:.1} GB but only {:.1} GB is free. This scales \
+                     linearly with --max-batch-size ({:.2} GB per slot) and with the \
+                     verify window (--dflash-gamma {} → ni={}). Reduce --max-batch-size, \
+                     lower --dflash-gamma, or disable MTP/DFlash. \
+                     NOTE: on unified-memory parts (GB10) exceeding this global-OOMs the \
+                     host rather than failing cleanly, so this is a hard error.",
+                    predicted as f64 / (1024.0 * 1024.0 * 1024.0),
+                    free as f64 / (1024.0 * 1024.0 * 1024.0),
+                    per_slot as f64 / (1024.0 * 1024.0 * 1024.0),
+                    num_intermediates.saturating_sub(1),
+                    num_intermediates,
+                );
+            }
+        }
+
         for _ in 0..num_ssm_layers {
             let h_pool = gpu.alloc(total_slots * h_bytes)?;
             gpu.memset(h_pool, 0, total_slots * h_bytes)?;

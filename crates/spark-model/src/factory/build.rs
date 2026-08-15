@@ -290,7 +290,44 @@ pub fn build_model(
             n
         }
         None => {
-            let n = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+            let budget_blocks = PagedKvCache::compute_num_blocks(&kv_config, kv_budget)?;
+
+            // Cap the pool at what the configured sequences can actually
+            // address. Without this, KV is sized purely from `free_memory()`
+            // and the server grabs a cache far larger than any request can
+            // reach: on Qwen3.8-27B at --max-seq-len 8192 --max-batch-size 4
+            // the budget path produced 28079 blocks = 449,264 tokens (22.3 GB)
+            // when only 4 x 8192 = 32,768 tokens are addressable — 13.7x waste.
+            //
+            // On a discrete GPU that is merely wasteful. On GB10 the memory is
+            // UNIFIED, so `free_memory()` reports most of host RAM and the
+            // oversized cache drives the *host* into a global OOM that takes
+            // the machine down (observed 2026-08-14). The HBM-shrink branch
+            // above already caps this way; the budget path simply never did.
+            //
+            // Same shape as the hss cap: +1 spare block per sequence for the
+            // slide-then-alloc round trip, +1 dummy block for OOB-safe reads.
+            let blocks_per_seq = max_seq_len.div_ceil(kv_block_size);
+            let reachable = max_batch_size
+                .saturating_mul(blocks_per_seq.saturating_add(1))
+                .saturating_add(1);
+            let n = budget_blocks.min(reachable);
+            if n < budget_blocks {
+                tracing::info!(
+                    "KV cache capped to addressable size: {} blocks ({} batch × \
+                     ({} blocks/seq + 1 spare) + 1 dummy) instead of the \
+                     budget-derived {} blocks — saves {:.1} GB",
+                    n,
+                    max_batch_size,
+                    blocks_per_seq,
+                    budget_blocks,
+                    // bytes/block derived from the budget that produced
+                    // `budget_blocks`, so this needs no extra KvCacheConfig API.
+                    (budget_blocks - n) as f64
+                        * (kv_budget as f64 / budget_blocks.max(1) as f64)
+                        / (1024.0 * 1024.0 * 1024.0),
+                );
+            }
             let max_kv_tokens = n * kv_block_size;
             tracing::info!(
                 "KV cache (post-construction): {:.1} GB free, {:.1} GB allocatable, \
@@ -392,7 +429,7 @@ pub fn build_model(
             1, // tp_size for the drafter side: replicated, so always 1
         )?;
         if let Some(weights) = weights {
-            let head = crate::layers::BlockDiffusionDraftHead::from_weights(
+            let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
                 weights,
                 target_embed_for_dflash,
                 target_lm_head_for_dflash,
@@ -404,6 +441,14 @@ pub fn build_model(
                 max_seq_len,
                 args.quantization,
             )?;
+            // Share the target's NVFP4-T lm_head (ATLAS_LM_HEAD_T) with the
+            // drafter's propose lm_head fast path (gated at the call site by
+            // ATLAS_DFLASH_LM_HEAD_NVFP4=1). Same device allocation — the
+            // drafter reads the --mtp-vocab column prefix via ldb.
+            if let Some((t, ldb)) = model.dflash_lm_head_t() {
+                head.lm_head_shared_t = Some(t);
+                head.lm_head_shared_t_ldb = ldb;
+            }
             model.set_dflash_proposer(std::sync::Arc::new(head));
             tracing::info!("DFlash drafter installed as the active proposer");
         } else {
