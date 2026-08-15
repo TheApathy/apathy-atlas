@@ -24,7 +24,7 @@
 #
 # Env overrides:
 #   PORT=8890  LIMIT=  (blank = full 164 HumanEval + full MBPP sample/set)
-#   SERVE=/home/flocka/atlas-src/local/serve-aeon-27b-dflash.sh
+#   SERVE=/home/flocka/atlas/src/local/serve-aeon-27b-dflash.sh
 #   EPSILON=0.01  ITERS=10000
 set -euo pipefail
 
@@ -32,7 +32,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${PORT:-8890}"
 LIMIT_ARG=""
 [ -n "${LIMIT:-}" ] && LIMIT_ARG="--limit ${LIMIT}"
-SERVE="${SERVE:-/home/flocka/atlas-src/local/serve-aeon-27b-dflash.sh}"
+SERVE="${SERVE:-/home/flocka/atlas/src/local/serve-aeon-27b-dflash.sh}"
 EPSILON="${EPSILON:-0.01}"
 ITERS="${ITERS:-10000}"
 OUTDIR="${OUTDIR:-/tmp/evals_think_spec}"

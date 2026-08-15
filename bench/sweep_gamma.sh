@@ -3,7 +3,7 @@
 # γ=16 (current default) is the "kgamma maximum"; smaller γ trades per-step
 # work for higher accept-rate-per-attempt on natural language.
 set -uo pipefail
-ATLAS_BIN=/home/flocka/atlas-src/target/release/spark
+ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
 MODELS=/home/flocka/models
 PORT=8890
 LOG=/tmp/gamma_sweep.log
@@ -28,14 +28,14 @@ run_gamma() {
         --max-seq-len 4096 --max-batch-size 1 --max-num-seqs 1 \
         --dflash --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash" \
         --dflash-gamma $gamma --dflash-quantization nvfp4 \
-        --warmup-prompt /home/flocka/atlas-src/local/warmup.txt \
+        --warmup-prompt /home/flocka/atlas/src/local/warmup.txt \
         > /tmp/spark_g${gamma}.log 2>&1 &
   SPARK_PID=$!
   for i in $(seq 1 80); do
     if curl -sf "http://localhost:$PORT/v1/models" -o /dev/null 2>&1; then break; fi
     sleep 5
   done
-  cd /home/flocka/atlas-src/bench
+  cd /home/flocka/atlas/src/bench
   python3 bench_aeon27b.py "$PORT" "$label" 2 512 | tee -a "$LOG"
   kill -9 $SPARK_PID 2>/dev/null || true
   wait $SPARK_PID 2>/dev/null || true

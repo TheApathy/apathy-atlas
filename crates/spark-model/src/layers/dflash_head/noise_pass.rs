@@ -50,6 +50,7 @@ impl BlockDiffusionDraftHead {
         &self,
         a: &NoisePassArgs,
         committed: &[Option<u32>],
+        loop_pass: usize,
         ctx: &ForwardContext,
         dstate: &mut DflashProposerState,
     ) -> Result<()> {
@@ -118,23 +119,48 @@ impl BlockDiffusionDraftHead {
             )?;
         }
         // [eff_ctx zeros, last_token (bonus), per-row mask-or-committed × γ_eff].
-        let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
-            .chain(std::iter::once(last_token as i32))
-            .chain((0..gamma_eff).map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)))
-            .collect();
-        if debug_dump {
-            tracing::info!(
-                "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
-                self.mask_token_id,
-                eff_ctx,
-                &token_ids_host[..token_ids_host.len().min(8)],
-            );
+        //
+        // Pass ≥1 with DeepLoop enabled: use the GPU-side commit-all path.
+        // Stage pass N's argmax from draft_tokens_dev[0..gamma_eff] into
+        // topk_tokens_dev (non-overlapping), then reconstruct draft_tokens_dev
+        // on-stream via dflash_token_recommit — no host D2H, async-safe.
+        if loop_pass > 0 && super::dflash_deeploop_enabled() {
+            gpu.copy_d2d_async(
+                self.scratch.draft_tokens_dev,
+                self.scratch.topk_tokens_dev,
+                gamma_eff * 4,
+                stream,
+            )?;
+            ops::token_recommit(
+                gpu,
+                self.kernels.token_recommit,
+                self.scratch.draft_tokens_dev,
+                self.scratch.topk_tokens_dev,
+                last_token,
+                eff_ctx as u32,
+                n_attn,
+                stream,
+            )?;
+        } else {
+            let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
+                .chain(std::iter::once(last_token as i32))
+                .chain(
+                    (0..gamma_eff)
+                        .map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)),
+                )
+                .collect();
+            if debug_dump {
+                tracing::info!(
+                    "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
+                    self.mask_token_id,
+                    eff_ctx,
+                    &token_ids_host[..token_ids_host.len().min(8)],
+                );
+            }
+            let tid_bytes: Vec<u8> =
+                token_ids_host.iter().flat_map(|t| t.to_le_bytes()).collect();
+            gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
         }
-        let tid_bytes: Vec<u8> = token_ids_host
-            .iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
-        gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
         ops::batched_embed(
             gpu,
             self.kernels.batched_embed,
@@ -206,6 +232,7 @@ impl BlockDiffusionDraftHead {
                 stream,
                 needed_start,
                 window: self.ctx_window,
+                loop_pass,
             };
             self.forward_block_layer(layer, &args, ctx, debug_dump, dstate, kprofile)?;
         }
@@ -238,19 +265,64 @@ impl BlockDiffusionDraftHead {
         // lm_head GEMM is bandwidth-bound on weight read (~1GB at 273GB/s
         // ≈ 4ms) — TC compute doesn't shrink the floor. Left as scalar
         // dense_gemm to keep the dispatch simple.
-        ops::dense_gemm(
-            gpu,
-            self.kernels.dense_gemm,
-            norm_noise,
-            &crate::weight_map::DenseWeight {
-                weight: self.lm_head_shared,
-            },
-            self.scratch.logits,
-            gamma_eff as u32,
-            lm_vocab,
-            h,
-            stream,
-        )?;
+        //
+        // ATLAS_DFLASH_LM_HEAD_NVFP4=1 (2026-07-31, propose-to-floor): the
+        // floor is the weight READ, so shrink the read — the target's
+        // NVFP4-T lm_head (shared allocation, ATLAS_LM_HEAD_T) holds the
+        // same rows at 1/4 the bytes; the 96k --mtp-vocab prefix is a
+        // column slice of the T layout read via ldb. ~1 GB BF16 → ~0.26 GB.
+        // Drafter-only (verify commits the target's own argmax) — gated on
+        // accept-rate hold + md5 constitution, not bit-parity of drafts.
+        // ATLAS_DFLASH_LM_HEAD_FP8 (2026-07-31, second attempt): halve the
+        // read instead of quartering it — pre-scaled E4M3 slice (built at
+        // load; see lm_head_shared_fp8 field doc) keeps ~3 mantissa bits of
+        // logit fidelity where the NVFP4 slice's E2M1 measured accepted
+        // 5.88→5.36 and lost more than the bandwidth bought. The 1/s
+        // compensation lives in `self.norm`, so these logits are true-scale.
+        let lm_head_t_fast = std::env::var("ATLAS_DFLASH_LM_HEAD_NVFP4").ok().as_deref()
+            == Some("1")
+            && self.lm_head_shared_t.is_some()
+            && self.kernels.w4a16_gemm_t_m32_n64.0 != 0;
+        if let Some(fp8) = self.lm_head_shared_fp8 {
+            ops::fp8_gemm_n128(
+                gpu,
+                self.kernels.fp8_gemm_t,
+                norm_noise,
+                fp8,
+                self.scratch.logits,
+                gamma_eff as u32,
+                lm_vocab,
+                h,
+                stream,
+            )?;
+        } else if lm_head_t_fast {
+            ops::w4a16_gemm_n64_m32_ldb(
+                gpu,
+                self.kernels.w4a16_gemm_t_m32_n64,
+                norm_noise,
+                self.lm_head_shared_t.as_ref().unwrap(),
+                self.scratch.logits,
+                gamma_eff as u32,
+                lm_vocab,
+                h,
+                self.lm_head_shared_t_ldb,
+                stream,
+            )?;
+        } else {
+            ops::dense_gemm(
+                gpu,
+                self.kernels.dense_gemm,
+                norm_noise,
+                &crate::weight_map::DenseWeight {
+                    weight: self.lm_head_shared,
+                },
+                self.scratch.logits,
+                gamma_eff as u32,
+                lm_vocab,
+                h,
+                stream,
+            )?;
+        }
 
         // Optional full-stream dump after final norm (debug; before lm_head).
         if debug_dump {

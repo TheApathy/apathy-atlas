@@ -60,7 +60,7 @@ export DDTREE_COMPACT_RECURRENT_STATE=${DDTREE_COMPACT_RECURRENT_STATE:-0}
 export DDTREE_ALLOW_BRANCH_STATE_COMPACTION=${DDTREE_ALLOW_BRANCH_STATE_COMPACTION:-0}
 export DDTREE_FULL_BRANCH_COMMIT=${DDTREE_FULL_BRANCH_COMMIT:-0}
 
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path /home/flocka/models/AEON-Q36-27B-Full \
   --model-name aeon-27b-ddtree \
   --port "${PORT}" \
@@ -78,4 +78,4 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --dflash-gamma 16 \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

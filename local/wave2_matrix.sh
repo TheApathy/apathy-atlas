@@ -41,7 +41,7 @@ run_config() {
   log "waiting for free GPU for $label..."
   wait_gpu_free
   log "=== CONFIG $label (env: $*) ==="
-  env "$@" setsid nohup bash /home/flocka/atlas-src/local/serve-aeon-27b-dflash.sh \
+  env "$@" setsid nohup bash /home/flocka/atlas/src/local/serve-aeon-27b-dflash.sh \
     > "/tmp/wave2-serve-$label.log" 2>&1 < /dev/null &
   # Grace period: the serve script runs preflight (incl. up to 4s pkill
   # sleep) before exec'ing spark — don't death-check for the first 30s.
@@ -61,7 +61,7 @@ run_config() {
     sleep 10
   done
   log "$label: ready after $(( 30 + $(date +%s) - t0 ))s"
-  python3 /home/flocka/atlas-src/local/bench_wave2.py 8890 5 "$label" 2>&1 | tee -a "$RES"
+  python3 /home/flocka/atlas/src/local/bench_wave2.py 8890 5 "$label" 2>&1 | tee -a "$RES"
   pkill -9 -x spark || true
   sleep 4
 }

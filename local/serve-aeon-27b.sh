@@ -119,7 +119,7 @@ export ATLAS_FFN_M16_TRANSPOSED=1
 # 4 op-level launch-reductions per SSM layer per token. No regression at
 # N=1, no regression at N=8 concurrent; correctness validated.
 export ATLAS_SSM_MULTI_SEQ_KERNEL=1
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path /home/flocka/models/AEON-Q36-27B-XS \
   --model-name aeon-27b \
   --port "${PORT}" \
@@ -138,4 +138,4 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --ssm-checkpoint-interval 16 \
   --max-prefill-tokens 1024 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

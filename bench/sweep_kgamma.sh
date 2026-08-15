@@ -4,7 +4,7 @@
 # Output: appends one line per config to /tmp/kgamma_sweep.log
 set -uo pipefail
 
-ATLAS_BIN=/home/flocka/atlas-src/target/release/spark
+ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
 MODELS=/home/flocka/models
 PORT=8890
 LOG=/tmp/kgamma_sweep.log
@@ -30,7 +30,7 @@ run_one() {
       --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash" \
       --dflash-gamma 16 \
       --dflash-quantization nvfp4 \
-      --warmup-prompt /home/flocka/atlas-src/local/warmup.txt \
+      --warmup-prompt /home/flocka/atlas/src/local/warmup.txt \
       > /tmp/atlas_kgamma_${label}.log 2>&1 &
   SPARK_PID=$!
 
@@ -41,7 +41,7 @@ run_one() {
     sleep 5
   done
 
-  python3 /home/flocka/atlas-src/bench/bench_dflash_quick.py "$PORT" "$label" 2 | tee -a "$LOG"
+  python3 /home/flocka/atlas/src/bench/bench_dflash_quick.py "$PORT" "$label" 2 | tee -a "$LOG"
 
   kill -9 $SPARK_PID 2>/dev/null || true
   wait $SPARK_PID 2>/dev/null || true

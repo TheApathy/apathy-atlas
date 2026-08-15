@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-SPARK="${SPARK_BIN:-/home/flocka/atlas-src/target/release/spark}"
+SPARK="${SPARK_BIN:-/home/flocka/atlas/src/target/release/spark}"
 PORT="${SPARK_PORT:-8889}"
 MODELS="${MODELS_DIR:-/home/flocka/models}"
 

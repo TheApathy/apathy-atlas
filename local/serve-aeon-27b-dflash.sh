@@ -239,6 +239,33 @@ export ATLAS_FFN_DOWN_SPLITK=${ATLAS_FFN_DOWN_SPLITK:-4}
 #   All three combined: 85.7 counting / 42.7 coding, step 152.3ms.
 export ATLAS_ATTN_QKV_SPLITK=${ATLAS_ATTN_QKV_SPLITK:-4}
 
+# 2026-07-20 (kernel wave 3: SSM projections): split-K for SSM out_proj
+# [M=17-32, N=5120, K=6144]. Production w4a16_gemm_t runs 234.7µs = 28%
+# of the 66µs DRAM floor; split-K×4 = 90.8µs (84%, 228 GB/s) — 2.6× win,
+# ~6.7ms/step across 48 SSM layers at M=17 (scales well to M=32 DDTree).
+# Same lossless FP32-partials + reduce pattern as shipped ffn_down split-K.
+# Guard: k>3 && k<=32 covers both flat K=γ (M=17) and DDTree (M=32).
+# Counting-md5 gate still pending; bit-exact by construction.
+export ATLAS_SSM_OUT_SPLITK=${ATLAS_SSM_OUT_SPLITK:-4}
+# split-K for SSM qkvz [M=17-32, N=12288, K=5120]: 220.5µs → 167.3µs
+# (split-K×2); ~2.2ms/step across 48 layers. Lossless FP32 partials.
+export ATLAS_SSM_QKVZ_SPLITK=${ATLAS_SSM_QKVZ_SPLITK:-4}
+# ATLAS_SSM_BA_BATCH=1: batches 17 BA GEMVs → 1 dense_gemv_bf16_batchn
+# launch per SSM layer (from 3 launches×48 layers=144 to 48). md5 clean
+# (bit-exact batchn kernel; dense_gemm variant was NOT bit-exact — don't
+# swap back). ~1% counting gain measured same-day as ATTN_QKV_SPLITK.
+export ATLAS_SSM_BA_BATCH=${ATLAS_SSM_BA_BATCH:-1}
+
+# 2026-07-20 (kernel wave 3: attention + LM head fast paths): FA2 flash
+# attention kgamma, LM head batch3 GEMV, NVFP4 gate/up M128, paged-decode
+# and flash-attn-kgamma split-K. All present in the coding-73.3-tok/s
+# armC-nosam bench; carried forward here for AEON HTML parity.
+export ATLAS_FA2_KGAMMA=${ATLAS_FA2_KGAMMA:-1}
+export ATLAS_LM_HEAD_BATCH3=${ATLAS_LM_HEAD_BATCH3:-1}
+export ATLAS_NVFP4_GATE_UP_M128=${ATLAS_NVFP4_GATE_UP_M128:-1}
+export ATLAS_PAGED_DECODE_SPLITK=${ATLAS_PAGED_DECODE_SPLITK:-1}
+export ATLAS_FLASH_ATTN_KGAMMA_SPLITK=${ATLAS_FLASH_ATTN_KGAMMA_SPLITK:-1}
+
 # 2026-07-05 (WY17 lazy Hi-writes): the gated_delta_rule_wy17 verify kernel
 # writes 16 per-token intermediate states as a partial-accept safety net —
 # 86% of its DRAM traffic. Lazy mode writes only checkpoint slots {0, K-2,
@@ -261,6 +288,24 @@ export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-1}
 # CI [0,+0.075] "not worse" = SHIP. /v1/completions (no thinking) unaffected;
 # counting md5 constitution holds.
 export ATLAS_THINK_SPEC=${ATLAS_THINK_SPEC:-1}
+
+# 2026-07-20 (async propose): ATLAS_DFLASH_ASYNC=1 overlaps the drafter forward
+# with the step-tail CPU work (tree-payload drain, HTTP stream flush, scheduler
+# loop). LOSSLESS — drafter only PROPOSES, verify commits the target's greedy.
+# SAM_ASYNC=1 is required when SAM=1 (safe after propose.rs:710-717 fix).
+#
+# REVISED 2026-07-20: ASYNC is NEUTRAL-TO-NEGATIVE on this config.
+# Step timing from logs: sync propose=29ms, collect_async overhead=30-58ms.
+# Root cause: pstream GPU time (~35ms) ≈ sync propose time → collect_async
+# in next step blocks for almost as long as sync propose saved.
+#   SYNC mk-base:        step=140ms, propose=29ms, step_interval=140ms
+#   ASYNC timing-diag:   step=108ms, propose=1.2ms, step_interval=166ms
+#   DDTree+ASYNC vs DDTree+SYNC: 13-18% SLOWER (collect overhead dominates)
+# A/B test script ready (run_async_ab.sh); empirical confirmation pending.
+# NOT SHIPPED.
+export ATLAS_DFLASH_ASYNC=${ATLAS_DFLASH_ASYNC:-0}
+export ATLAS_DFLASH_SAM_ASYNC=${ATLAS_DFLASH_SAM_ASYNC:-0}
+export ATLAS_DFLASH_FUSED=${ATLAS_DFLASH_FUSED:-0}
 
 # ── DO NOT ENABLE: TC_NVFP4_M16 attention path corrupts at K=17 ───────
 # ATLAS_TC_NVFP4_M16=1 + ATLAS_TC_NVFP4_M16_MS_ATTN=1 (ms_phase_qkv
@@ -290,9 +335,9 @@ export ATLAS_TC_NVFP4_M16_MS_ATTN=${ATLAS_TC_NVFP4_M16_MS_ATTN:-0}
 # harness A/B vs v4-scale: go +4.6%, counting +1.2%, py neutral; counting md5
 # byte-identical (lossless swap) and ABBA HumanEval x60 chat pass@1 gate:
 # 95.0% vs 95.0%, delta CI [0,0] — identical outputs on every problem. SHIP.
-DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/dflash-retrain/v5-ckpt-goheavy/epoch_2_step_16732}
+DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/atlas/dflash/retrain/v5-ckpt-goheavy/epoch_2_step_16732}
 
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path "${TARGET_MODEL:-/home/flocka/models/AEON-Q36-27B-Full}" \
   --model-name aeon-27b-dflash \
   --port 8890 \
@@ -310,4 +355,4 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --mtp-vocab "${MTP_VOCAB:-96000}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

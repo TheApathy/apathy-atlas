@@ -26,6 +26,21 @@ use spark_runtime::kv_cache::PagedKvCache;
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+/// Cached gate for `ATLAS_DFLASH_DEEPLOOP=1` (multi-pass denoise residual scaling).
+///
+/// Defined in the head module so `forward_block_layer` and `noise_pass` can
+/// both import it without a circular dependency.
+pub(crate) fn dflash_deeploop_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let on = std::env::var("ATLAS_DFLASH_DEEPLOOP").ok().as_deref() == Some("1");
+        if on {
+            tracing::info!("DFlash DeepLoop residual scaling ENABLED (ATLAS_DFLASH_DEEPLOOP=1)");
+        }
+        on
+    })
+}
+
 /// Compile-time cap on the per-position top-K used by the DDTree (M4B v2)
 /// builder. Must match `MAX_TOP_K` in `kernels/gb10/nvfp4/argmax_bf16.cu`.
 /// Runtime `top_k` comes from `ATLAS_DDTREE_TOP_K` (default 8) and is
@@ -46,6 +61,14 @@ pub struct DflashKernels {
     pub prefill_attn_dflash_fp8: KernelHandle,
     pub silu_mul: KernelHandle,
     pub residual_add: KernelHandle,
+    /// BF16 scaled accumulate: `output[i] += scale * src[i]`. Same module
+    /// as `residual_add` (`residual_add.cu`). Used by DeepLoop multi-pass
+    /// residual scaling (`ATLAS_DFLASH_DEEPLOOP=1`).
+    pub scaled_add: KernelHandle,
+    /// GPU-side token recommit for DeepLoop multi-pass: reconstructs
+    /// `draft_tokens_dev` for pass N+1 without host D2H (async-safe).
+    /// Same module as `scaled_add` (`residual_add.cu`).
+    pub token_recommit: KernelHandle,
     pub argmax: KernelHandle,
     /// Top-K over BF16 logits — used by the DDTree (M4B v2) propose path
     /// to seed per-position branch candidates. Same `argmax` module as
@@ -75,6 +98,9 @@ pub struct DflashKernels {
     /// `w4a16_gemm_t_m32_n64` — single B read × full occupancy at M ≤ 32.
     /// Preferred over m16 (2× B reads at M=17) for drafter kgamma GEMMs.
     pub w4a16_gemm_t_m32_n64: KernelHandle,
+    /// `fp8_gemm_t` (BF16 A × FP8-E4M3 B) — the propose lm_head FP8 fast
+    /// path (`ATLAS_DFLASH_LM_HEAD_FP8=1`). `try_kernel`; sentinel 0 on miss.
+    pub fp8_gemm_t: KernelHandle,
 }
 
 /// Per-step scratch buffers for the γ-block forward.
@@ -533,6 +559,27 @@ pub struct BlockDiffusionDraftHead {
     /// Target's lm_head GPU pointer. Used for the drafter's per-position
     /// argmax over `[γ, vocab]` logits.
     pub lm_head_shared: DevicePtr,
+    /// Target's transposed NVFP4 lm_head (shared pointer, no extra memory)
+    /// for the propose lm_head fast path (`ATLAS_DFLASH_LM_HEAD_NVFP4=1`):
+    /// reads the `--mtp-vocab` column prefix of the T-weight via
+    /// `w4a16_gemm_t_m32_n64` (~0.25 GB at 96k vocab) instead of streaming
+    /// the ~1 GB BF16 slice through scalar `dense_gemm`. Drafter-only —
+    /// verify commits the target's own argmax, so this affects acceptance,
+    /// never committed tokens. Wired post-construction in `factory/build.rs`.
+    pub lm_head_shared_t: Option<crate::weight_map::QuantizedWeight>,
+    /// Row stride (padded full-vocab N) of `lm_head_shared_t`.
+    pub lm_head_shared_t_ldb: u32,
+    /// Pre-scaled FP8-E4M3 copy of the `--mtp-vocab` lm_head slice
+    /// (`ATLAS_DFLASH_LM_HEAD_FP8=1`, built at load in `from_weights`):
+    /// `[lm_vocab, K]` row-major, weights multiplied by a power-of-2 scale
+    /// `s` chosen so absmax·s ≈ 256 (keeps small weights out of the E4M3
+    /// subnormal floor). The compensating `1/s` is folded into the drafter's
+    /// final `norm` weight — whose ONLY consumer is this lm_head — so the
+    /// logits come out in true scale and the DDTree cliff margins are
+    /// undistorted. Halves the propose lm_head read vs BF16 (0.98→0.49 GB)
+    /// at far higher logit fidelity than the NVFP4 slice (which measured
+    /// accepted 5.88→5.36 and was refuted, 2026-07-31).
+    pub lm_head_shared_fp8: Option<DevicePtr>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing

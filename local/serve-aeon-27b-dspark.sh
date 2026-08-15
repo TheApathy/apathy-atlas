@@ -99,7 +99,7 @@ export ATLAS_DFLASH_SAM=${ATLAS_DFLASH_SAM:-1}
 # DSpark-AEON draft checkpoint (5-layer DFlash + rank-256 VanillaMarkov head).
 DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/models/DSpark-AEON-draft}
 
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path "${TARGET_MODEL:-/home/flocka/models/AEON-Q36-27B-Full}" \
   --model-name aeon-27b-dspark \
   --port "${PORT}" \
@@ -115,4 +115,4 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --mtp-vocab "${MTP_VOCAB:-32000}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

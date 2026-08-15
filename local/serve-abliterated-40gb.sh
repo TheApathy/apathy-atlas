@@ -13,7 +13,7 @@
 #
 # On a literal 40 GB GPU, change --gpu-memory-utilization 0.34 to 1.0.
 # The 0.34 here simulates a 40 GB cap on our 119.7 GB GB10.
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path /home/flocka/models/Huihui-NVFP4-Sehyo-MTP \
   --model-name qwen36-abl \
   --port 8889 \
@@ -33,4 +33,4 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --swap-space-gb 0 \
   --oom-guard-mb 1024 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

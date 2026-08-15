@@ -35,7 +35,7 @@ if [ "${FREE_GB:-0}" -lt 30 ]; then
 fi
 echo "[serve-supergemma4] preflight ok: ${FREE_GB} GB free"
 
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path /home/flocka/models/SuperGemma4-26B-abl-NVFP4 \
   --model-name supergemma4 \
   --port "${PORT}" \

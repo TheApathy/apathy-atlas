@@ -44,7 +44,7 @@ export ATLAS_THINK_SPEC=${ATLAS_THINK_SPEC:-0}
 export ATLAS_TC_NVFP4_M16=0
 export ATLAS_TC_NVFP4_M16_MS_ATTN=0
 
-DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/dflash-retrain/v5-ckpt-goheavy/epoch_2_step_16732}
+DRAFT_MODEL=${DRAFT_MODEL:-/home/flocka/atlas/dflash/retrain/v5-ckpt-goheavy/epoch_2_step_16732}
 BATCH=${BATCH:-8}
 
 echo "[v39] booting ${BINARY} port ${PORT} BATCH=${BATCH} batched_verify=${ATLAS_DFLASH_BATCHED_VERIFY}"
@@ -64,4 +64,4 @@ exec "${BINARY}" serve \
   --mtp-vocab "${MTP_VOCAB:-96000}" \
   --dflash-quantization "$ATLAS_DFLASH_QUANT" \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

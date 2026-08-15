@@ -120,6 +120,8 @@ impl BlockDiffusionDraftHead {
                 .kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8")?,
             silu_mul: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
+            scaled_add: gpu.kernel("residual_add", "bf16_scaled_add")?,
+            token_recommit: gpu.kernel("residual_add", "dflash_token_recommit")?,
             argmax: gpu.kernel("argmax", "argmax_bf16")?,
             // Top-K kernel lives in the same `argmax` module .cu file
             // (kernels/gb10/nvfp4/argmax_bf16.cu). Resolved unconditionally
@@ -153,6 +155,7 @@ impl BlockDiffusionDraftHead {
             // `KernelHandle(0)` and falls back to the M_TILE=64 path.
             w4a16_gemm_t_m16: crate::layers::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
             w4a16_gemm_t_m32_n64: crate::layers::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
+            fp8_gemm_t: crate::layers::try_kernel(gpu, "w4a16", "fp8_gemm_t"),
         };
 
         // Per-step scratch buffers. BF16 = 2 bytes/element.
@@ -621,6 +624,79 @@ impl BlockDiffusionDraftHead {
             rank: m.rank,
         });
 
+        // ── ATLAS_DFLASH_LM_HEAD_FP8=1: pre-scaled E4M3 copy of the propose
+        // lm_head slice (see the field doc on `lm_head_shared_fp8`). One-time
+        // load cost: absmax scan + scaled BF16 copy + FP8 cast over
+        // lm_vocab × K (~0.5 GB result, ~1 GB transient). The compensating
+        // 1/s goes into the final `norm` weight — its only consumer is the
+        // propose lm_head GEMM (noise_pass Step 4), so all downstream logit
+        // consumers (argmax, top-2 cliff margins) see true-scale values.
+        let mut lm_head_shared_fp8 = None;
+        let mut norm_after = weights.norm;
+        if std::env::var("ATLAS_DFLASH_LM_HEAD_FP8").ok().as_deref() == Some("1") {
+            let absmax_k = crate::layers::try_kernel(gpu, "quantize_nvfp4", "nvfp4_global_absmax");
+            let tofp8_k = crate::layers::try_kernel(gpu, "w4a16", "bf16_to_fp8");
+            if kernels.fp8_gemm_t.0 == 0 || absmax_k.0 == 0 || tofp8_k.0 == 0 {
+                tracing::warn!(
+                    "ATLAS_DFLASH_LM_HEAD_FP8=1 but fp8_gemm_t/absmax/bf16_to_fp8 \
+                     kernel symbols missing — propose lm_head stays BF16"
+                );
+            } else {
+                let n = target_vocab_size.min(vocab_size);
+                let k = target_hidden_size;
+                let total = (n * k) as u32;
+                let qstream = gpu.default_stream();
+                let gmax = gpu.alloc(4)?;
+                gpu.memset(gmax, 0, 4)?;
+                crate::layers::ops::nvfp4_global_absmax(
+                    gpu, absmax_k, lm_head_shared, gmax, total, qstream,
+                )?;
+                gpu.synchronize(qstream)?;
+                let mut b4 = [0u8; 4];
+                gpu.copy_d2h(gmax, &mut b4)?;
+                gpu.free(gmax)?;
+                let absmax = f32::from_le_bytes(b4);
+                // Power-of-2 scale targeting absmax·s ≈ 256 (E4M3 max 448):
+                // exact in BF16 and in the folded norm, so the only lossy
+                // step is the E4M3 cast itself.
+                let s = if absmax > 0.0 {
+                    (256.0f32 / absmax).log2().floor().exp2()
+                } else {
+                    1.0
+                };
+                let tmp = gpu.alloc(n * k * 2)?;
+                gpu.memset(tmp, 0, n * k * 2)?;
+                crate::layers::ops::scaled_add(
+                    gpu, kernels.scaled_add, tmp, lm_head_shared, s, total, qstream,
+                )?;
+                let fp8 = gpu.alloc(n * k)?;
+                crate::layers::ops::bf16_to_fp8(gpu, tofp8_k, tmp, fp8, total, qstream)?;
+                gpu.synchronize(qstream)?;
+                gpu.free(tmp)?;
+                let norm_scaled = gpu.alloc(hidden_size * 2)?;
+                gpu.memset(norm_scaled, 0, hidden_size * 2)?;
+                crate::layers::ops::scaled_add(
+                    gpu,
+                    kernels.scaled_add,
+                    norm_scaled,
+                    weights.norm.weight,
+                    1.0 / s,
+                    hidden_size as u32,
+                    qstream,
+                )?;
+                gpu.synchronize(qstream)?;
+                norm_after = DenseWeight {
+                    weight: norm_scaled,
+                };
+                lm_head_shared_fp8 = Some(fp8);
+                tracing::info!(
+                    "DFlash propose lm_head FP8: [{n} x {k}] absmax={absmax:.4} \
+                     scale=2^{} (1/s folded into final norm)",
+                    s.log2() as i32,
+                );
+            }
+        }
+
         let head = Self {
             num_layers,
             hidden_size,
@@ -641,8 +717,11 @@ impl BlockDiffusionDraftHead {
 
             embed_tokens_shared,
             lm_head_shared,
+            lm_head_shared_t: None,
+            lm_head_shared_t_ldb: 0,
+            lm_head_shared_fp8,
             hidden_norm: weights.hidden_norm,
-            norm: weights.norm,
+            norm: norm_after,
             fc: fc_after,
             fc_nvfp4,
             draft_id_to_target_id: None,

@@ -70,6 +70,11 @@ fn dflash_noise_only_enabled() -> bool {
     })
 }
 
+/// DeepLoop residual scaling (arxiv 2607.13491). When enabled and loop_pass ≥ 1,
+/// residual updates are scaled by β = (8·N)^{-½} where N = loop_pass.
+/// Gate re-exported from the head module for local use.
+use super::dflash_deeploop_enabled;
+
 /// Inputs passed to the per-layer kernel chain. Holds local computations
 /// from the surrounding `forward_block` body so the helper can be called
 /// without re-deriving them in every layer iteration.
@@ -87,6 +92,9 @@ pub(super) struct LayerArgs {
     pub stream: u64,
     pub needed_start: usize,
     pub window: usize,
+    /// 0-indexed denoise pass number. Pass 0 = standard residual (scale 1.0).
+    /// Passes ≥1 with `ATLAS_DFLASH_DEEPLOOP=1` apply DeepLoop β scaling.
+    pub loop_pass: usize,
 }
 
 impl BlockDiffusionDraftHead {
@@ -145,7 +153,19 @@ impl BlockDiffusionDraftHead {
             stream,
             needed_start,
             window,
+            loop_pass,
         } = *args;
+        // DeepLoop (arxiv 2607.13491): β = (8·N)^{-½} on passes ≥1.
+        let deeploop = loop_pass > 0 && dflash_deeploop_enabled();
+        // β=1.0 default: pure iterative refinement. See NVFP4 path below.
+        let loop_beta: f32 = if deeploop {
+            std::env::var("ATLAS_DFLASH_DEEPLOOP_BETA")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
         // Kernel profiler helper: synchronize+time when kprofile=true, then
         // accumulate into the thread-local KPROF_ACC field. Free when off.
         macro_rules! kp {
@@ -236,7 +256,7 @@ impl BlockDiffusionDraftHead {
         // 3b. Q projection for all n_attn tokens (ctx + noise).
         kp!(
             q_proj_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.norm_buf,
@@ -317,7 +337,7 @@ impl BlockDiffusionDraftHead {
                 let kv_offset = old_ctx_count * kv_dim as usize * bf16;
                 kp!(
                     kv_ctx_new_us,
-                    ops::dense_gemm(
+                    ops::dense_gemm_routed(
                         gpu,
                         self.kernels.dense_gemm,
                         self.scratch.fc_proj.offset(fc_offset),
@@ -331,7 +351,7 @@ impl BlockDiffusionDraftHead {
                 )?;
                 kp!(
                     kv_ctx_new_us,
-                    ops::dense_gemm(
+                    ops::dense_gemm_routed(
                         gpu,
                         self.kernels.dense_gemm,
                         self.scratch.fc_proj.offset(fc_offset),
@@ -388,7 +408,7 @@ impl BlockDiffusionDraftHead {
         let noise_kv_offset = eff_ctx * kv_dim as usize * bf16;
         kp!(
             kv_noise_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.norm_buf.offset(noise_offset),
@@ -402,7 +422,7 @@ impl BlockDiffusionDraftHead {
         )?;
         kp!(
             kv_noise_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.norm_buf.offset(noise_offset),
@@ -633,7 +653,7 @@ impl BlockDiffusionDraftHead {
         // 3f. o_proj.
         kp!(
             o_proj_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.attn_out,
@@ -676,17 +696,17 @@ impl BlockDiffusionDraftHead {
             n_attn as usize * h as usize,
         )?;
 
-        // 3g. residual: stream_buf += stream_acc (n_attn rows).
+        // 3g. residual: stream_buf += [β·]stream_acc. β=1 on pass 0 (standard);
+        // β=(8·N)^{-½} on pass N≥1 with ATLAS_DFLASH_DEEPLOOP=1 (DeepLoop).
         kp!(
             resid1_us,
-            ops::residual_add(
-                gpu,
-                self.kernels.residual_add,
-                self.scratch.stream_buf,
-                self.scratch.stream_acc,
-                n_attn * h,
-                stream,
-            )
+            if deeploop {
+                ops::scaled_add(gpu, self.kernels.scaled_add, self.scratch.stream_buf,
+                    self.scratch.stream_acc, loop_beta, n_attn * h, stream)
+            } else {
+                ops::residual_add(gpu, self.kernels.residual_add, self.scratch.stream_buf,
+                    self.scratch.stream_acc, n_attn * h, stream)
+            }
         )?;
         if layer_idx == 0 {
             let noise_offset = eff_ctx * self.hidden_size * bf16;
@@ -716,7 +736,7 @@ impl BlockDiffusionDraftHead {
         // 3i. MLP: gate + up.
         kp!(
             gate_up_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.norm_buf,
@@ -730,7 +750,7 @@ impl BlockDiffusionDraftHead {
         )?;
         kp!(
             gate_up_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.norm_buf,
@@ -760,7 +780,7 @@ impl BlockDiffusionDraftHead {
         // 3k. down_proj.
         kp!(
             down_proj_us,
-            ops::dense_gemm(
+            ops::dense_gemm_routed(
                 gpu,
                 self.kernels.dense_gemm,
                 self.scratch.mlp_intermediate,
@@ -773,17 +793,16 @@ impl BlockDiffusionDraftHead {
             )
         )?;
 
-        // 3l. residual.
+        // 3l. residual (DeepLoop β same as 3g).
         kp!(
             resid2_us,
-            ops::residual_add(
-                gpu,
-                self.kernels.residual_add,
-                self.scratch.stream_buf,
-                self.scratch.stream_acc,
-                n_attn * h,
-                stream,
-            )
+            if deeploop {
+                ops::scaled_add(gpu, self.kernels.scaled_add, self.scratch.stream_buf,
+                    self.scratch.stream_acc, loop_beta, n_attn * h, stream)
+            } else {
+                ops::residual_add(gpu, self.kernels.residual_add, self.scratch.stream_buf,
+                    self.scratch.stream_acc, n_attn * h, stream)
+            }
         )?;
         if layer_idx == 0 {
             let noise_offset = eff_ctx * self.hidden_size * bf16;
@@ -833,7 +852,20 @@ impl BlockDiffusionDraftHead {
             stream,
             needed_start,
             window,
+            loop_pass,
         } = *args;
+        let deeploop = loop_pass > 0 && dflash_deeploop_enabled();
+        // β=1.0 default: pure iterative refinement. DeepLoop's (8N)^{-0.5}
+        // paper formula requires a model trained for it — override via
+        // ATLAS_DFLASH_DEEPLOOP_BETA for experimentation.
+        let loop_beta: f32 = if deeploop {
+            std::env::var("ATLAS_DFLASH_DEEPLOOP_BETA")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
         // Kernel profiler helper (NVFP4 path). Identical to BF16 helper.
         macro_rules! kp {
             ($field:ident, $body:expr) => {{
@@ -1366,17 +1398,20 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // 3g. residual.
+        // 3g. residual (DeepLoop β on passes ≥1 with ATLAS_DFLASH_DEEPLOOP=1).
         kp!(
             resid1_us,
-            ops::residual_add(
-                gpu,
-                self.kernels.residual_add,
-                self.scratch.stream_buf.offset(row0_h),
-                self.scratch.stream_acc.offset(row0_h),
-                m_rows * h,
-                stream,
-            )
+            if deeploop {
+                ops::scaled_add(gpu, self.kernels.scaled_add,
+                    self.scratch.stream_buf.offset(row0_h),
+                    self.scratch.stream_acc.offset(row0_h),
+                    loop_beta, m_rows * h, stream)
+            } else {
+                ops::residual_add(gpu, self.kernels.residual_add,
+                    self.scratch.stream_buf.offset(row0_h),
+                    self.scratch.stream_acc.offset(row0_h),
+                    m_rows * h, stream)
+            }
         )?;
 
         // 3h. post_attention_layernorm.
@@ -1546,17 +1581,20 @@ impl BlockDiffusionDraftHead {
             )?;
         }
 
-        // 3l. residual.
+        // 3l. residual (DeepLoop β same as 3g).
         kp!(
             resid2_us,
-            ops::residual_add(
-                gpu,
-                self.kernels.residual_add,
-                self.scratch.stream_buf.offset(row0_h),
-                self.scratch.stream_acc.offset(row0_h),
-                m_rows * h,
-                stream,
-            )
+            if deeploop {
+                ops::scaled_add(gpu, self.kernels.scaled_add,
+                    self.scratch.stream_buf.offset(row0_h),
+                    self.scratch.stream_acc.offset(row0_h),
+                    loop_beta, m_rows * h, stream)
+            } else {
+                ops::residual_add(gpu, self.kernels.residual_add,
+                    self.scratch.stream_buf.offset(row0_h),
+                    self.scratch.stream_acc.offset(row0_h),
+                    m_rows * h, stream)
+            }
         )?;
 
         // Debug breadcrumb (cheap when debug_dump=false).

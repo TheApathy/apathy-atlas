@@ -27,7 +27,7 @@ export ATLAS_FFN_M16_TRANSPOSED=1
 # ATLAS_SSM_BA_BATCHED, ATLAS_E2M1_GEMM_DOWN_ONLY, etc.
 echo "[serve-test] gates active:"
 env | grep -E "^ATLAS_" | sort
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path /home/flocka/models/AEON-Q36-27B-XS \
   --model-name aeon-27b \
   --port "${PORT}" \
@@ -46,4 +46,4 @@ exec /home/flocka/atlas-src/target/release/spark serve \
   --ssm-checkpoint-interval 16 \
   --max-prefill-tokens 1024 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt

@@ -9,7 +9,7 @@ set -euo pipefail
 LABEL="${1:?label required}"
 UNSET_VAR="${2:-}"
 
-ATLAS_BIN=/home/flocka/atlas-src/target/release/spark
+ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
 MODELS=/home/flocka/models
 PORT="${PORT:-8889}"
 
@@ -60,7 +60,7 @@ env "${ENV_ARGS[@]}" "$ATLAS_BIN" serve \
   --ssm-checkpoint-interval 16 \
   --max-prefill-tokens 1024 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas-src/local/warmup.txt &
+  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt &
 SPARK_PID=$!
 
 # Wait for ready
@@ -73,7 +73,7 @@ for i in $(seq 1 60); do
 done
 
 # Run bench
-cd /home/flocka/atlas-src/bench
+cd /home/flocka/atlas/src/bench
 python3 bench_aeon27b.py "$PORT" "$LABEL" 3 512 || true
 
 # Stop spark

@@ -7,7 +7,7 @@ set -euo pipefail
 PORT=${PORT:-8897}
 pkill -9 -x spark 2>/dev/null || true; sleep 4
 export ATLAS_TARGET_LMHEAD_VOCAB=120000
-exec /home/flocka/atlas-src/target/release/spark serve \
+exec /home/flocka/atlas/src/target/release/spark serve \
   --model-from-path /home/flocka/models/Qwen3.5-122B-heretic-MTP-NVFP4 \
   --model-name q122b-atlas --port "${PORT}" \
   --kernel-target qwen3.5-122b-a10b \

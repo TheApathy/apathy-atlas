@@ -24,7 +24,7 @@ import sys
 
 from datasets import load_dataset
 
-OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/flocka/dflash-retrain/regen_input.jsonl"
+OUT = sys.argv[1] if len(sys.argv) > 1 else "/home/flocka/atlas/dflash/retrain/regen_input.jsonl"
 random.seed(42)
 
 rows: list[dict] = []

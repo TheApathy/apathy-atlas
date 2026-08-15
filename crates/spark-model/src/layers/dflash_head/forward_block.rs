@@ -642,9 +642,15 @@ impl BlockDiffusionDraftHead {
         let mut committed: Vec<Option<u32>> = vec![None; gamma_eff];
         let t_layers = std::time::Instant::now();
         for pass in 0..denoise_steps {
-            self.run_noise_pass(&pass_args, &committed, ctx, dstate)?;
+            self.run_noise_pass(&pass_args, &committed, pass, ctx, dstate)?;
             if pass + 1 == denoise_steps {
                 break;
+            }
+            // DeepLoop GPU-side commit-all: run_noise_pass stages argmax and
+            // reconstructs draft_tokens_dev on-stream for pass N+1 — no host
+            // D2H, async-eligible. Skip the margin-gated D2H path entirely.
+            if super::dflash_deeploop_enabled() {
+                continue;
             }
             // Confidence feedback: top-2 over this pass's logits gives the
             // per-row top1−top2 margin; the argmax tokens are already in
