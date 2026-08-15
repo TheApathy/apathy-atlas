@@ -87,6 +87,74 @@ pub fn dense_gemm_splitk(
         .launch(stream)
 }
 
+/// cuBLASLt BF16 GEMM path enabled? (`ATLAS_CUBLAS_GEMM=1`), cached.
+///
+/// Ported from the Laguna decode campaign (atlas-laguna 6ac39db3): the naive
+/// scalar `dense_gemm` ran the Laguna verify o_proj at 6.5x off the bandwidth
+/// floor; cuBLASLt runs the identical BF16×BF16→FP32 GEMM at the wall. In
+/// this tree the eligible sites are the BF16 DFlash drafter projections
+/// (`dense_gemm_routed` call sites in `dflash_head/forward_block_layer.rs`).
+pub fn cublas_gemm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static EN: OnceLock<bool> = OnceLock::new();
+    *EN.get_or_init(|| std::env::var("ATLAS_CUBLAS_GEMM").ok().as_deref() == Some("1"))
+}
+
+/// Route a projection `out[M,N] = act[M,K] @ weightᵀ` through cuBLASLt BF16
+/// for a weight that is native BF16 `[N,K]` row-major (the drafter's layout).
+///
+/// `ATLAS_CUBLAS_TUNED=1` additionally uses the per-shape autotuned immortal
+/// plan (first use times the heuristic top-16 on a private stream — see
+/// `spark_runtime::cublaslt::bf16_gemm_act_weight_t_tuned`, atlas-laguna
+/// 02834be4). Same math, same precision — A/B gate only. NOT bit-exact vs
+/// the hand kernels (accumulation order differs), so serve gating is
+/// text-parity, same policy as the Laguna cuBLASLt ladder.
+pub fn cublas_bf16_proj_dense(
+    act: DevicePtr,
+    weight: &DenseWeight,
+    out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    use std::sync::OnceLock;
+    static TUNED: OnceLock<bool> = OnceLock::new();
+    if *TUNED.get_or_init(|| std::env::var("ATLAS_CUBLAS_TUNED").ok().as_deref() == Some("1")) {
+        return spark_runtime::cublaslt::bf16_gemm_act_weight_t_tuned(
+            act.0,
+            weight.weight.0,
+            out.0,
+            m,
+            n,
+            k,
+            stream,
+        );
+    }
+    spark_runtime::cublaslt::bf16_gemm_act_weight_t(act.0, weight.weight.0, out.0, m, n, k, stream)
+}
+
+/// Drop-in replacement for [`dense_gemm`]: takes the cuBLASLt route when
+/// `ATLAS_CUBLAS_GEMM=1`, else launches the naive scalar kernel unchanged
+/// (gate off ⇒ byte-identical to production).
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemm_routed(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if cublas_gemm_enabled() {
+        return cublas_bf16_proj_dense(input, weight, output, m, n, k, stream);
+    }
+    dense_gemm(gpu, kernel, input, weight, output, m, n, k, stream)
+}
+
 pub fn dense_gemm(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

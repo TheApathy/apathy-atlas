@@ -5,6 +5,13 @@
 
 pub mod buffers;
 #[cfg(feature = "cuda")]
+pub mod cublaslt;
+// Metal/no-cuda builds get unreachable stubs so spark-model's unconditional
+// references to these cuda-only entry points still resolve (compile-only).
+#[cfg(not(feature = "cuda"))]
+#[path = "cublaslt_metal_stub.rs"]
+pub mod cublaslt;
+#[cfg(feature = "cuda")]
 pub mod cuda_backend;
 #[cfg(unix)]
 pub mod fast_weights;

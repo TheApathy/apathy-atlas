@@ -177,4 +177,34 @@ pub fn sigmoid_blend(
         .launch(stream)
 }
 
+/// GPU-side token recommit for DeepLoop multi-pass (no inter-pass D2H).
+///
+/// Caller must D2D-copy `draft_tokens_dev[0..gamma_eff*4]` to `staged`
+/// (= topk_tokens_dev) before this call. This kernel then writes:
+///   `dst[0..n_attn] = [0]*eff_ctx + [last_token] + staged[0..gamma_eff]`
+/// entirely on-stream, so async drafter passes need no host barrier.
+///
+/// Kernel: `dflash_token_recommit(dst, staged, last_token, eff_ctx, n_attn)`
+/// Grid: (ceil(n_attn / 256), 1, 1)  Block: (256, 1, 1)
+pub fn token_recommit(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    dst: DevicePtr,
+    staged: DevicePtr,
+    last_token: u32,
+    eff_ctx: u32,
+    n_attn: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n_attn, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(dst)
+        .arg_ptr(staged)
+        .arg_i32(last_token as i32)
+        .arg_u32(eff_ctx)
+        .arg_u32(n_attn)
+        .launch(stream)
+}
+
 // ── SSM Preprocessing ─────────────────────────────────────────────

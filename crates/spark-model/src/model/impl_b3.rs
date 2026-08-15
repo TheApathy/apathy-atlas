@@ -159,6 +159,17 @@ impl TransformerModel {
         self.gpu.as_ref()
     }
 
+    /// The target's transposed NVFP4 lm_head (`ATLAS_LM_HEAD_T=1` builds it)
+    /// plus its padded row stride, for post-construction sharing with the
+    /// DFlash drafter's propose lm_head. The T layout is `[K/2, N_pad]` with
+    /// `N_pad = ceil(vocab/64)*64` (see `QuantizedWeight::transpose_for_gemm`),
+    /// so a vocab-prefix slice (`--mtp-vocab`) is a column sub-range read with
+    /// `ldb = N_pad` — no extra memory.
+    pub fn dflash_lm_head_t(&self) -> Option<(crate::weight_map::QuantizedWeight, u32)> {
+        self.lm_head_nvfp4_t
+            .map(|w| (w, (self.config.vocab_size.div_ceil(64) * 64) as u32))
+    }
+
     /// Install a DFlash drafter as the active proposer, replacing whatever
     /// MTP proposer (if any) `TransformerModel::new` built. The target's
     /// hidden-state capture buffer is already allocated when the config's

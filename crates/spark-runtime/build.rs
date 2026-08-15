@@ -20,6 +20,10 @@ fn main() {
     // The actual CUDA driver is a stub at compile time; at runtime
     // it resolves to the NVIDIA driver installed on the system.
     println!("cargo:rustc-link-lib=dylib=cuda");
+    // cublaslt.rs FFI references cublasLt symbols that must resolve at LINK
+    // time. -lcuda is emitted above; -lcublasLt is our own (the search paths
+    // below already cover libcublasLt.so, same treatment as libcuda).
+    println!("cargo:rustc-link-lib=dylib=cublasLt");
 
     if let Ok(cuda_path) = std::env::var("CUDA_HOME") {
         println!("cargo:rustc-link-search=native={cuda_path}/lib64");

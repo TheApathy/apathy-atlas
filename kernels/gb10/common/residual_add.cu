@@ -152,6 +152,32 @@ extern "C" __global__ void bf16_concat(
     }
 }
 
+// DeepLoop token recommit: GPU-side reconstruct of draft_tokens_dev for pass N+1.
+//
+// After pass N's argmax, staged[0..gamma_eff] holds those argmax tokens
+// (D2D-copied to topk_tokens_dev before calling this kernel). Writes to dst:
+//   [0]*eff_ctx + [last_token] + staged[0..gamma_eff]
+// so that batched_embed can immediately proceed on-stream without host D2H.
+//
+// Grid: (ceil(n_attn / 256), 1, 1)  Block: (256, 1, 1)
+extern "C" __global__ void dflash_token_recommit(
+    int* __restrict__ dst,           // draft_tokens_dev [n_attn] — overwritten
+    const int* __restrict__ staged,  // topk_tokens_dev [gamma_eff] — pass-N argmax
+    int last_token,
+    unsigned int eff_ctx,
+    unsigned int n_attn             // = eff_ctx + 1 + gamma_eff
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_attn) return;
+    if (i < eff_ctx) {
+        dst[i] = 0;
+    } else if (i == eff_ctx) {
+        dst[i] = last_token;
+    } else {
+        dst[i] = staged[i - eff_ctx - 1];
+    }
+}
+
 // Device-pointer sigmoid blend: reads gate scalar from device BF16 pointer.
 //
 // output[i] += sigmoid(bf16_to_f32(*gate_ptr)) * src[i]
