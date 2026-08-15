@@ -141,8 +141,28 @@ impl ChatTokenizer {
         // The api.rs layer controls enable_thinking based on thinking_in_tools MODEL.toml.
         // Mistral's template defaults `reasoning_effort` to "high" when
         // undefined, so we must explicitly pass "none" to disable thinking.
+        // Do NOT hardcode "high". That was a Mistral-specific workaround
+        // (its template defaults the field to "high" when undefined) applied
+        // globally, and it breaks every template with a different vocabulary:
+        // Qwen3.8 validates `reasoning_effort not in ('xhigh','medium','low')`
+        // and raises, so EVERY thinking request returned 400.
+        //
+        // Leaving it undefined is strictly better — each template then applies
+        // its own default via `|default(...)`, which yields "high" for Mistral
+        // (unchanged behaviour) and "xhigh" for Qwen3.8 (correct). The
+        // thinking-off path still needs an explicit "none" for Mistral; Qwen's
+        // template only validates the field when thinking is enabled, so
+        // "none" is inert there.
+        //
+        // ATLAS_REASONING_EFFORT overrides for callers that want medium/low.
+        // TODO: plumb the request's own `reasoning_effort`
+        // (chat_request.rs defines it and nothing reads it) through the five
+        // apply_chat_template_* call sites.
         let reasoning_effort: minijinja::Value = if enable_thinking {
-            "high".into()
+            match std::env::var("ATLAS_REASONING_EFFORT") {
+                Ok(v) if !v.is_empty() => v.into(),
+                _ => minijinja::Value::UNDEFINED,
+            }
         } else {
             "none".into()
         };
@@ -195,8 +215,13 @@ impl ChatTokenizer {
             let messages_for_render = normalize_tool_call_arguments(messages);
             let messages_val = minijinja::Value::from_serialize(&messages_for_render);
             let tools_val = tools.map(minijinja::Value::from_serialize);
+            // Same fix as apply_chat_template_jinja above: undefined lets each
+            // template apply its own default. Hardcoding "high" 400s on Qwen3.8.
             let reasoning_effort: minijinja::Value = if enable_thinking {
-                "high".into()
+                match std::env::var("ATLAS_REASONING_EFFORT") {
+                    Ok(v) if !v.is_empty() => v.into(),
+                    _ => minijinja::Value::UNDEFINED,
+                }
             } else {
                 "none".into()
             };
