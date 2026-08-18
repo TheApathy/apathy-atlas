@@ -1,9 +1,9 @@
 # Qwen3.8 coding reproduction
 
-This package is the public, secret-free reproduction interface for the
-TheApathy Atlas fork. It records benchmark evidence without publishing model
-weights, credentials, host paths, process state, full generated responses or
-machine-specific logs.
+This package is the public, secret-free reproduction interface for Apathy
+Atlas, TheApathy's performance-focused Atlas fork. It records benchmark
+evidence without publishing model weights, credentials, host paths, process
+state, full generated responses or machine-specific logs.
 
 ## Current status
 
@@ -17,8 +17,8 @@ gain build, model-download and serve phases only after those revisions exist.
 
 ```bash
 git clone --depth 1 --branch feat/qwen38-repro-public \
-  https://github.com/TheApathy/atlas.git
-cd atlas
+  https://github.com/TheApathy/apathy-atlas.git
+cd apathy-atlas
 ./scripts/reproduce qwen38-coding
 ```
 

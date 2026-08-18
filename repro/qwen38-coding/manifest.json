@@ -14,7 +14,7 @@
   "release_status": "framework-only-source-and-drafter-publication-pending",
   "schema": "theapathy-qwen38-release-manifest-v1",
   "source": {
-    "repository": "https://github.com/TheApathy/atlas",
+    "repository": "https://github.com/TheApathy/apathy-atlas",
     "revision": null
   }
 }

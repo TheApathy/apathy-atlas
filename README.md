@@ -1,4 +1,6 @@
-> ### This is a fork — start with [REPRODUCING.md](REPRODUCING.md)
+> ### Apathy Atlas — a performance-focused Atlas fork
+>
+> Start with [REPRODUCING.md](REPRODUCING.md).
 >
 > Upstream is [Avarok-Cybersecurity/atlas](https://github.com/Avarok-Cybersecurity/atlas)
 > and the README below is theirs. This fork adds two self-contained
