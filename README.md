@@ -1,3 +1,14 @@
+> ### Apathy Atlas — experimental benchmark TUI branch
+>
+> This branch of [TheApathy/apathy-atlas](https://github.com/TheApathy/apathy-atlas)
+> adds a plugin-driven benchmark suite to the `spark serve` TUI and refactors
+> mutable model/run state into explicit owners. Start with
+> [`REPRODUCING.md`](REPRODUCING.md) and
+> [`docs/APATHY_TUI_BENCHMARKS.md`](docs/APATHY_TUI_BENCHMARKS.md).
+>
+> This is infrastructure work, not a model-performance release. See the full
+> [Apathy Atlas branch map](BRANCHES.md). The README below is upstream's.
+
 <p align="center">
   <img src="assets/logo.svg" alt="Atlas Inference Engine" width="640" />
 </p>
