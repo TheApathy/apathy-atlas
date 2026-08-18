@@ -15,9 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Check no .rs file exceeds 500 lines
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # Cap is 500 LoC per Rust source file in crates/.
@@ -122,8 +128,19 @@ jobs:
             "crates/spark-runtime/src/metal_backend.rs"
           )
 
+          files=()
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            while IFS= read -r -d '' file; do
+              [[ "$file" == crates/*.rs && "$file" != *.bak && "$file" != */target/* ]] && files+=("$file")
+            done < <(git diff --name-only --diff-filter=ACMRT -z "$BASE_SHA" "$HEAD_SHA")
+          else
+            while IFS= read -r -d '' file; do
+              files+=("$file")
+            done < <(find crates -name '*.rs' -not -name '*.bak' -not -path '*/target/*' -print0)
+          fi
+
           violations=0
-          while IFS= read -r -d '' file; do
+          for file in "${files[@]}"; do
             lines=$(wc -l < "$file")
             if [[ $lines -gt 500 ]]; then
               # Strip leading "./" if present
@@ -143,7 +160,7 @@ jobs:
                 violations=$((violations + 1))
               fi
             fi
-          done < <(find crates -name '*.rs' -not -name '*.bak' -not -path '*/target/*' -print0)
+          done
 
           if [[ $violations -gt 0 ]]; then
             echo ""

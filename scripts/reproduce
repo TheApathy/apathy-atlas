@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Public reproduction entry point. This script never reads repository-local
+# credentials and never uploads benchmark output.
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/reproduce qwen38-coding [options]
+  scripts/reproduce verify-public-safety
+
+qwen38-coding options:
+  --endpoint URL       OpenAI-compatible chat endpoint
+                       (default: http://127.0.0.1:8896/v1/chat/completions)
+  --output PATH        Result JSON path (default: runs/repro/qwen38-coding.json)
+  --repetitions N      Sequential repetitions (default: 3)
+  --no-expected-gate   Record evidence without enforcing the published result
+
+The Qwen3.8 source/model release is not published yet. Until its immutable
+manifest is complete, this command verifies an already-running server and
+fails closed rather than guessing private model or drafter paths.
+EOF
+}
+
+case "${1:-}" in
+  qwen38-coding)
+    shift
+    exec python3 "$ROOT/repro/qwen38-coding/run.py" "$@"
+    ;;
+  verify-public-safety)
+    shift
+    exec "$ROOT/scripts/public-safety-check" "$@"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "unknown reproduction target: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

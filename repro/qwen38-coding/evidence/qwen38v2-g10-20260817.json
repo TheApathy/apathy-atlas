@@ -1,0 +1,52 @@
+{
+  "concurrency": 1,
+  "deterministic": true,
+  "median_server_response_tokens_per_second": 40.94657070905109,
+  "prompt_sha256": "202498f2a136366a7320e9fd95255de1d1ae999ea9c41301903728e6f02759f2",
+  "protocol": "effort-none",
+  "repetitions": 3,
+  "request_body_sha256": "941f5fd6d4f49d67a0e0983fab754aa9706b4be1c6b7dfa0e829cf369ee2e75f",
+  "runs": [
+    {
+      "completion_tokens": 1500,
+      "content_bytes": 5560,
+      "content_sha256": "12e0c0adf4452a608ef9c8d8d226959e274a4e4ccdf427fc9684a96fee1a0bde",
+      "finish_reason": "length",
+      "index": 0,
+      "prompt_tokens": 38,
+      "reasoning_bytes": 0,
+      "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "server_response_tokens_per_second": 40.94657070905109,
+      "stable_output_sha256": "26223dbb48b999e5ac76535c1bb8a234a93688140e1326c184a447cb278ac9ad",
+      "wall_seconds": 37.46622291699896
+    },
+    {
+      "completion_tokens": 1500,
+      "content_bytes": 5560,
+      "content_sha256": "12e0c0adf4452a608ef9c8d8d226959e274a4e4ccdf427fc9684a96fee1a0bde",
+      "finish_reason": "length",
+      "index": 1,
+      "prompt_tokens": 38,
+      "reasoning_bytes": 0,
+      "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "server_response_tokens_per_second": 40.98569117701721,
+      "stable_output_sha256": "26223dbb48b999e5ac76535c1bb8a234a93688140e1326c184a447cb278ac9ad",
+      "wall_seconds": 37.15378246200271
+    },
+    {
+      "completion_tokens": 1500,
+      "content_bytes": 5560,
+      "content_sha256": "12e0c0adf4452a608ef9c8d8d226959e274a4e4ccdf427fc9684a96fee1a0bde",
+      "finish_reason": "length",
+      "index": 2,
+      "prompt_tokens": 38,
+      "reasoning_bytes": 0,
+      "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "server_response_tokens_per_second": 40.51931492008791,
+      "stable_output_sha256": "26223dbb48b999e5ac76535c1bb8a234a93688140e1326c184a447cb278ac9ad",
+      "wall_seconds": 37.571422601999075
+    }
+  ],
+  "schema": "theapathy-qwen38-sanitized-evidence-v1",
+  "source_artifact_sha256": "724a21109452d31cc2d6e11cb78b8bf7e9e429ded892d5a0242a46ffb794beb0"
+}
