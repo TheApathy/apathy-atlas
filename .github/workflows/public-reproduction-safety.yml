@@ -1,0 +1,34 @@
+name: Public reproduction safety
+
+on:
+  pull_request:
+    paths:
+      - "repro/**"
+      - "scripts/reproduce"
+      - "scripts/public-safety-check"
+      - "docs/reproduction/**"
+      - ".github/workflows/public-reproduction-safety.yml"
+  push:
+    branches:
+      - qwen
+      - "feat/**"
+    paths:
+      - "repro/**"
+      - "scripts/reproduce"
+      - "scripts/public-safety-check"
+      - "docs/reproduction/**"
+
+permissions:
+  contents: read
+
+jobs:
+  safety:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate public reproduction package
+        run: ./scripts/public-safety-check
+      - name: Validate Python syntax
+        run: python3 -m py_compile repro/qwen38-coding/run.py
+      - name: Run reproduction-client tests
+        run: python3 -m unittest repro/tests/test_qwen38_coding.py

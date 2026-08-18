@@ -1,0 +1,34 @@
+{
+  "completion_tokens": 1500,
+  "finish_reason": "length",
+  "prompt_sha256": "202498f2a136366a7320e9fd95255de1d1ae999ea9c41301903728e6f02759f2",
+  "request_body_sha256": "941f5fd6d4f49d67a0e0983fab754aa9706b4be1c6b7dfa0e829cf369ee2e75f",
+  "rows": [
+    {
+      "configuration": "native-v1-gamma-8",
+      "median_server_tps": 38.8741162800893,
+      "run_server_tps": [39.06953058821525, 38.8741162800893, 38.79905082126311],
+      "source_artifact_sha256": "46a8cb4569735810aab05411c4666bf00ad7b3beca559609584077c85c792ef7"
+    },
+    {
+      "configuration": "native-v1-gamma-10",
+      "median_server_tps": 39.60582661817406,
+      "run_server_tps": [39.60582661817406, 39.655860042355904, 39.60069610950057],
+      "source_artifact_sha256": "45f7d5e69c0c5069e09778ccf2337f1efcd693aa145b79c60ce0fd1ec01f1b00"
+    },
+    {
+      "configuration": "native-v1-gamma-12",
+      "median_server_tps": 39.542862211609176,
+      "run_server_tps": [39.542862211609176, 39.55458994319447, 39.47161806409837],
+      "source_artifact_sha256": "772c564c5db959940490dbae7722b414494a70a474ba0013352086fd50f7aa12"
+    },
+    {
+      "configuration": "native-v1-gamma-10-qtrim",
+      "median_server_tps": 39.532630017193256,
+      "run_server_tps": [39.71138529827936, 39.532630017193256, 39.271638653281784],
+      "source_artifact_sha256": "b5867c136ad35c4537e5f21f07b31c0e7e02bfb5f44aa9465ea49c1d3b45739d"
+    }
+  ],
+  "schema": "theapathy-qwen38-sanitized-gamma-sweep-v1",
+  "stable_output_sha256": "26223dbb48b999e5ac76535c1bb8a234a93688140e1326c184a447cb278ac9ad"
+}

@@ -12,6 +12,12 @@
 >
 > `main` and `base` track upstream unmodified.
 >
+> A public-safe Qwen3.8 coding reproduction package is being prepared under
+> [`repro/qwen38-coding/`](repro/qwen38-coding/). It includes sanitized result
+> evidence and an endpoint verifier, but deliberately remains marked incomplete
+> until the source stack and native drafter have immutable public revisions.
+> See [the Qwen3.8 reproduction guide](docs/reproduction/qwen38.md).
+>
 > `laguna` has **two** upstreams — Avarok, plus 36 commits of Laguna-S-2.1
 > support from [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas)
 > that were never merged upstream. GitHub's "forked from" header can only name

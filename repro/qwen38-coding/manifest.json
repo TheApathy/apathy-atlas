@@ -1,0 +1,20 @@
+{
+  "artifact_policy": "hashes-and-metrics-only",
+  "benchmark": "repro/qwen38-coding/run.py",
+  "checkpoint": {
+    "draft_model_revision": null,
+    "target_model_revision": null
+  },
+  "hardware": {
+    "architecture": "aarch64",
+    "cuda": "13.x",
+    "gpu": "NVIDIA GB10",
+    "sm": "12.1"
+  },
+  "release_status": "framework-only-source-and-drafter-publication-pending",
+  "schema": "theapathy-qwen38-release-manifest-v1",
+  "source": {
+    "repository": "https://github.com/TheApathy/atlas",
+    "revision": null
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "completion_tokens": 1500,
+  "finish_reason": "length",
+  "minimum_median_server_tps": 39.0,
+  "reference_median_server_tps": 39.60582661817406,
+  "required_repetitions": 3,
+  "schema": "theapathy-qwen38-coding-expected-v1",
+  "stable_output_sha256": "26223dbb48b999e5ac76535c1bb8a234a93688140e1326c184a447cb278ac9ad"
+}

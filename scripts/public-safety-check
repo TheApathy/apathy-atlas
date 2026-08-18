@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+set -euo pipefail
+
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+
+fail=0
+
+if git ls-files -s repro | awk '$1 == "120000" { print $4 }' | grep -q .; then
+  echo "public-safety: symlinks are forbidden under repro/" >&2
+  git ls-files -s repro | awk '$1 == "120000" { print "  " $4 }' >&2
+  fail=1
+fi
+
+if git ls-files repro | grep -E '\.(safetensors|gguf|pt|pth|bin|pem|key|p12|pfx)$' >/dev/null; then
+  echo "public-safety: model, binary, or key material found under repro/" >&2
+  fail=1
+fi
+
+if rg -n --hidden \
+  '(/home/(flocka|claude|pidtom)/|hf_[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY)' \
+  repro scripts/reproduce docs/reproduction 2>/dev/null; then
+  echo "public-safety: private path or credential-shaped text found" >&2
+  fail=1
+fi
+
+while IFS= read -r path; do
+  size=$(wc -c < "$path")
+  if [ "$size" -gt 1048576 ]; then
+    echo "public-safety: oversized reproduction artifact: $path ($size bytes)" >&2
+    fail=1
+  fi
+done < <(git ls-files repro docs/reproduction scripts/reproduce scripts/public-safety-check)
+
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks detect --no-banner --redact --no-git --source .; then
+    echo "public-safety: gitleaks rejected the current tree" >&2
+    fail=1
+  fi
+else
+  echo "public-safety: gitleaks unavailable; structural checks only" >&2
+fi
+
+if [ "$fail" -ne 0 ]; then
+  exit 1
+fi
+
+echo "public-safety: PASS"
