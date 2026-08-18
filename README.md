@@ -1,23 +1,17 @@
-> ### This is a fork — start with [REPRODUCING.md](REPRODUCING.md)
+> ### Apathy Atlas — Laguna-S-2.1 branch
 >
-> Upstream is [Avarok-Cybersecurity/atlas](https://github.com/Avarok-Cybersecurity/atlas)
-> and the README below is theirs. This fork adds two self-contained
-> speculative-decode benchmark harnesses, one per branch. **Four branches are
-> ours; anything else you see was inherited from upstream.**
+> This is the maintained Laguna branch of
+> [TheApathy/apathy-atlas](https://github.com/TheApathy/apathy-atlas). Start
+> with [`bench/laguna/README.md`](bench/laguna/README.md) for the measured
+> configuration and [`REPRODUCING.md`](REPRODUCING.md) for lineage.
 >
-> | Branch | Model | Harness | Our changes |
-> |---|---|---|---|
-> | [`laguna`](../../tree/laguna) | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | `git diff upstream/monu-laguna-2.1..laguna` |
-> | [`qwen`](../../tree/qwen) | Qwen3.6-27B + DFlash drafter | `bench/qwen/` | `git diff upstream/avarok-qwen..qwen` |
+> The branch carries the unmerged MonumentalSystems Laguna enablement followed
+> by Apathy's correctness-gated DFlash, prefill, capacity, and tool-calling
+> work. The checked-in harness reports the workload mix and hashes alongside
+> throughput; do not treat one prompt's tok/s as the branch result.
 >
-> `main` and `base` track upstream unmodified.
->
-> `laguna` has **two** upstreams — Avarok, plus 36 commits of Laguna-S-2.1
-> support from [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas)
-> that were never merged upstream. GitHub's "forked from" header can only name
-> one parent, so it cannot say this; three `upstream/*` tags mark each boundary
-> instead, and [REPRODUCING.md](REPRODUCING.md) gives a one-line diff for each
-> contributor's share.
+> See the complete [Apathy Atlas branch map](BRANCHES.md). `main` and `base`
+> remain upstream mirrors; the README below is upstream's.
 
 ---
 
