@@ -31,7 +31,7 @@ Use a different endpoint when necessary:
 
 The gate requires three sequential requests, temperature zero,
 `reasoning_effort: none`, 1,500 completion tokens, one stable output hash and a
-39 tok/s median floor. Results are written under ignored `runs/` and contain
+40 tok/s median floor. Results are written under ignored `runs/` and contain
 hashes and metrics, not response text.
 
 ## Evidence policy
