@@ -8,7 +8,7 @@ state, full generated responses or machine-specific logs.
 ## Current status
 
 The harness and sanitized reference evidence are public. The exact Qwen3.8
-source stack and the native-v1 drafter do not yet have immutable public
+source stack and the native-v2 drafter do not yet have immutable public
 revisions, so `manifest.json` deliberately marks the release as incomplete.
 The command currently verifies an already-running compatible server. It will
 gain build, model-download and serve phases only after those revisions exist.
@@ -31,8 +31,10 @@ Use a different endpoint when necessary:
 
 The gate requires three sequential requests, temperature zero,
 `reasoning_effort: none`, 1,500 completion tokens, one stable output hash and a
-40 tok/s median floor. Results are written under ignored `runs/` and contain
-hashes and metrics, not response text.
+40 tok/s median floor. The checked-in reference is 40.9466 tok/s median across
+three deterministic runs (40.9466, 40.9857 and 40.5193 tok/s), each producing
+1,500 completion tokens and the same content fingerprint. Results are written
+under ignored `runs/` and contain hashes and metrics, not response text.
 
 ## Evidence policy
 

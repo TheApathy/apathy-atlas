@@ -1,20 +1,22 @@
 > ### Apathy Atlas — a performance-focused Atlas fork
 >
-> Start with [REPRODUCING.md](REPRODUCING.md).
+> Start with the [branch map](BRANCHES.md), then read the reproduction guide on
+> the model branch you intend to run.
 >
 > Upstream is [Avarok-Cybersecurity/atlas](https://github.com/Avarok-Cybersecurity/atlas)
-> and the README below is theirs. This fork adds two self-contained
-> speculative-decode benchmark harnesses, one per branch. **Four branches are
-> ours; anything else you see was inherited from upstream.**
+> and the README below is theirs. Apathy Atlas keeps measured model work and
+> experimental infrastructure isolated on named branches; `main` and `base`
+> remain upstream mirrors.
 >
-> | Branch | Model | Harness | Our changes |
-> |---|---|---|---|
-> | [`laguna`](../../tree/laguna) | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | `git diff upstream/monu-laguna-2.1..laguna` |
-> | [`qwen`](../../tree/qwen) | Qwen3.6-27B + DFlash drafter | `bench/qwen/` | `git diff upstream/avarok-qwen..qwen` |
+> | Branch | Focus | Maturity |
+> |---|---|---|
+> | [`laguna`](../../tree/laguna) | Laguna-S-2.1 DFlash | maintained, measured |
+> | [`qwen`](../../tree/qwen) | Qwen3.6-27B DFlash | maintained, measured |
+> | [`ds4-flash`](../../tree/ds4-flash) | DeepSeek-V4-Flash on one GB10 | research, measured |
+> | [`feat/tui-benchmarks`](../../tree/feat/tui-benchmarks) | benchmark plugin and TUI | experimental |
+> | [`feat/qwen38-repro-public`](../../tree/feat/qwen38-repro-public) | Qwen3.8 coding reproduction | review branch, incomplete release |
 >
-> `main` and `base` track upstream unmodified.
->
-> A public-safe Qwen3.8 coding reproduction package is being prepared under
+> This branch contains a public-safe Qwen3.8 coding reproduction package under
 > [`repro/qwen38-coding/`](repro/qwen38-coding/). It includes sanitized result
 > evidence and an endpoint verifier, but deliberately remains marked incomplete
 > until the source stack and native drafter have immutable public revisions.
