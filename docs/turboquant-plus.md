@@ -114,7 +114,7 @@ The pieces ported into Atlas in this work:
 All numbers were measured on:
 
   - **Hardware:** NVIDIA GB10 (ASUS Ascent GX10), 128 GB unified memory
-  - **Model:** `Qwen3.6-35B-FP8` at `/home/pidtom/models/qwen3.6-35b-fp8`
+  - **Model:** `Qwen3.6-35B-FP8` at a local `$MODEL_DIR`
   - **OS:** Ubuntu 24.04 inside the Atlas runtime container
   - **Driver/CUDA:** NVIDIA driver supporting CUDA 13.0, container base `nvidia/cuda:13.0.0-runtime-ubuntu24.04`
 
