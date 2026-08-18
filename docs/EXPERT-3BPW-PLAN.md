@@ -9,11 +9,11 @@ what the kernels cost on GB10, the quality gate, and the phasing.
 
 Sources examined (read-only, on this box):
 
-- `/home/flocka/sparkinfer-ref` — 0xSero serving recipe + the **actual
+- `$SPARKINFER_REF` — 0xSero serving recipe + the **actual
   quantized checkpoint on disk** under `data/tp1/` (~106 GB, root-owned)
-- `/home/flocka/sparkinfer-upstream` — SparkInfer/B12X kernels (CuTe DSL +
+- `$SPARKINFER_SRC` — SparkInfer/B12X kernels (CuTe DSL +
   vendored ExLlamaV3 CUDA)
-- `/home/flocka/models/DeepSeek-V4-Flash-162B` — our 88 GB FP8 master
+- `$MODEL_DIR` — our 88 GB FP8 master
   (144 routed experts, top-6, 43 layers, hidden 4096, moe_inter 2048)
 
 ---
@@ -25,7 +25,7 @@ quantization**. It is NOT a grouped-int + LUT scheme: there are **no group
 scales, no zero points, no codebook table in memory**.
 
 Hard evidence from the checkpoint
-(`/home/flocka/sparkinfer-ref/data/tp1/quantization_config.json`):
+(`$SPARKINFER_REF/data/tp1/quantization_config.json`):
 
 ```
 "quant_method": "exl3", "bits": 3.0, "codebook": "mcg",
@@ -45,7 +45,7 @@ Per-matrix tensor layout (safetensors header of
 | `mcg` | I32 | scalar | codebook selector/marker (multiplicative congruential) |
 
 Mechanics (vendored ExLlamaV3 source, MIT-licensed, at
-`/home/flocka/sparkinfer-upstream/b12x/gemm/trellis_linear/csrc/vendor/quant/`):
+`$SPARKINFER_SRC/b12x/gemm/trellis_linear/csrc/vendor/quant/`):
 
 - **Decode**: each weight is a 16-bit window into the tile's bit-stream,
   windows overlap and advance by `bits` (=3) per weight
@@ -85,7 +85,7 @@ cheap (see §3) and the format is the reason 3.0 bpw holds quality where
 Key context: the reference artifact
 (HF `0xSero/deepseek-v4-flash-0731-spark`, rev `22f28d32…`) is a
 **216-expert REAP model**; our master
-(`/home/flocka/models/DeepSeek-V4-Flash-162B`) is the **144-expert** variant.
+(`$MODEL_DIR`) is the **144-expert** variant.
 They are different models — per-token decode bytes are identical (top-6
 either way) but residency and quality baselines differ.
 
@@ -103,7 +103,7 @@ Options, ranked:
 | rank | option | what | effort | cost/risk |
 |---|---|---|---|---|
 | 1 (ship) | **(b) run exllamav3 `787d1582` on our 144-expert master** | dequant FP8 master → BF16, quantize routed experts only, keep everything else FP8/NVFP4 as today | ~1–2 wks: stand up exllamav3 (arch support proven at that revision; Transformers 5.13.1 loads the model), reproduce the calibration recipe (corpus + natural-routing capture), quant run (~GPU-days; RunPod precedent), loader for `trellis/suh/svh/mcg` schema | preserves model identity → all existing baselines/gates stay valid; our FP8 master is a better-conditioned source than their MXFP4 source |
-| 2 (de-risk, do FIRST) | **(a) use their checkpoint as kernel oracle** | already coalesced TP1 **on this box** at `/home/flocka/sparkinfer-ref/data/tp1` (root-owned, ~106 GB) | ~2–4 days for a read-only loader; zero quant compute | 216-expert model → NOT a drop-in serve target (gate dims, REAP plan, +5.3 GB residency vs today: 216×43×25.17M×0.3765 B = 88.1 GB routed vs our current 82.8). License: recipe is Apache-2.0, EXL3 code MIT; the **model card license must be verified** before any redistribution. Use it to validate the loader, the dequant unit test, and the decode kernel against known-good weights *before* spending on a quant run |
+| 2 (de-risk, do FIRST) | **(a) use their checkpoint as kernel oracle** | already coalesced TP1 under `$SPARKINFER_REF/data/tp1` (~106 GB) | ~2–4 days for a read-only loader; zero quant compute | 216-expert model → NOT a drop-in serve target (gate dims, REAP plan, +5.3 GB residency vs today: 216×43×25.17M×0.3765 B = 88.1 GB routed vs our current 82.8). License: recipe is Apache-2.0, EXL3 code MIT; the **model card license must be verified** before any redistribution. Use it to validate the loader, the dequant unit test, and the decode kernel against known-good weights *before* spending on a quant run |
 | 3 (reject) | (c) write our own trellis quantizer | QTIP-style Hessian-weighted trellis search + Hadamard pipeline | 3–6 wks, high risk | no benefit over (b) — the quantizer is open source, MIT, pinned, and proven on this exact model family |
 
 Note: `EXL3_MANIFEST.json` counts 11,008 quantized triplets (=256×43) while
@@ -280,7 +280,7 @@ of S6: 24.1 GB freed (§3) for KV/context.
 ## Bring-up result (2026-08-10, measured on hardware)
 
 **The EXL3 stack serves and is correct.** First end-to-end run of the
-reference checkpoint (`/home/flocka/sparkinfer-ref/data/tp1`, 216 experts,
+reference checkpoint (`$SPARKINFER_REF/data/tp1`, 216 experts,
 3.0 bpw) on Atlas produced clean prose at temp 0 (a correct Rayleigh-
 scattering explanation, no degradation), with loader, bit-exact dequant,
 Hadamard rotations and the device-indexed GEMV all exercised on real trellis

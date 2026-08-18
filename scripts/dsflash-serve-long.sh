@@ -13,9 +13,9 @@ NAME="${1:?usage: dsflash-serve-bench.sh <log-name> [gamma] [ENV=VAL ...]}"
 GAMMA="${2:-5}"
 shift 2 || shift 1 || true
 
-REPO=/home/flocka/dsflash-combined
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
-DRAFTER=/home/flocka/models/DeepSeek-V4-Flash-0731-drafter
+REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
+DRAFTER="${DRAFTER:?set DRAFTER to the DSpark drafter directory}"
 PORT="${PORT:-8977}"
 LOG="$REPO/serve-$NAME.log"
 

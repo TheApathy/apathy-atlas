@@ -18,7 +18,7 @@ ours. Beat the drafter, beat the number.
 ## The DSpark drafter (authoritative: official 0731 `inference/model.py`)
 
 Artifacts on disk:
-- Weights: `/home/flocka/models/DeepSeek-V4-Flash-0731-drafter/model-000{46,47,48}-of-00048.safetensors`
+- Weights: `$DRAFT_MODEL_DIR/model-000{46,47,48}-of-00048.safetensors`
   (~10.9 GB, pure `mtp.*`, verified headers; from `deepseek-ai/DeepSeek-V4-Flash-0731`).
 - Reference impl: same dir, `inference-model.py` (classes `DSparkAttention`,
   `DSparkBlock`, `DSparkMarkovHead`, `DSparkConfidenceHead`), `inference-generate.py`,

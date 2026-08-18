@@ -16,10 +16,10 @@ set -euo pipefail
 NAME="${1:?usage: plain-serve.sh <log-name> [ENV=VAL ...]}"
 shift 1 || true
 
-WORKTREE=/home/flocka/deepseek-flash/codex-work/atlas-plain-exp
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
 PORT="${PORT:-8977}"
-LOG="/home/flocka/deepseek-flash/serve-$NAME.log"
+LOG="${LOG:-$WORKTREE/serve-$NAME.log}"
 
 # ATLAS_UNIFIED_MOE_LAYOUT=1 is REQUIRED (V4 experts only assembled in unified-T).
 # ATLAS_V4_ATTN_NVFP4=1 selects the fast NVFP4 attention projections. No DSpark

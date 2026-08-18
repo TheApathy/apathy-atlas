@@ -67,9 +67,9 @@ seconds. Serve is for composite validation only.
 - **Prose ~19.5 tok/s — below our plain.** Repeat ~58.6. Their fixed-K5 has
   no adaptive fallback; they lose ~26% vs their own floor on prose. The gap
   to close is structured content only.
-- Stack: `/home/flocka/sparkinfer-ref` (compose; `docker compose start` to
+- Stack: `$SPARKINFER_REF` (compose; `docker compose start` to
   re-boot, ~15 min: weights cached in ./data). Patches are loading/format
-  only — kernels are stock SparkInfer (`/home/flocka/sparkinfer-upstream`).
+  only — kernels are stock SparkInfer (`$SPARKINFER_SRC`).
 - Their artifact: 3.0 bpw EXL3/Trellis experts + REAP-216. Implied plain
   floor ~26.2 on this box.
 

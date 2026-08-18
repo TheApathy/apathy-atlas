@@ -18,9 +18,9 @@ set -euo pipefail
 NAME="${1:?usage: nsys-verify.sh <out-name> [ENV=VAL ...]}"
 shift
 
-WORKTREE=/home/flocka/dsflash-combined
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
-DRAFTER=/home/flocka/models/DeepSeek-V4-Flash-0731-drafter
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
+DRAFTER="${DRAFTER:?set DRAFTER to the DSpark drafter directory}"
 OUT="/tmp/$NAME"
 LOG="$WORKTREE/serve-$NAME.log"
 

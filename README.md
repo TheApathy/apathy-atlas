@@ -1,17 +1,11 @@
-> ### This is a fork — start with [REPRODUCING.md](REPRODUCING.md)
+> ### Apathy Atlas — DeepSeek-V4-Flash research branch
 >
-> Upstream is [Avarok-Cybersecurity/atlas](https://github.com/Avarok-Cybersecurity/atlas)
-> and the README below is theirs. This fork adds two self-contained
-> speculative-decode benchmark harnesses, one per branch. **Four branches are
-> ours; anything else you see was inherited from upstream.**
+> This branch of [TheApathy/apathy-atlas](https://github.com/TheApathy/apathy-atlas)
+> is the single-GB10 DeepSeek-V4-Flash/REAP research tree. It contains real
+> measurements and quality gates, but REAP removes experts and is not identical
+> to the stock 256-expert model.
 >
-> | Branch | Model | Harness | Our changes |
-> |---|---|---|---|
-> | [`laguna`](../../tree/laguna) | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | `git diff upstream/monu-laguna-2.1..laguna` |
-> | [`qwen`](../../tree/qwen) | Qwen3.6-27B + DFlash drafter | `bench/qwen/` | `git diff upstream/avarok-qwen..qwen` |
-> | [`ds4-flash`](../../tree/ds4-flash) | DeepSeek-V4-Flash-162B + DSpark drafter | `scripts/dsflash-serve-bench.sh` | `git diff main..ds4-flash` |
->
-> **`ds4-flash`** (this branch, if you're reading it there) serves
+> The branch serves
 > DeepSeek-V4-Flash-162B on ONE DGX Spark (GB10): **905 tok/s prefill,
 > ~22 tok/s plain decode, 22–33 tok/s speculative**, quality-gated at
 > 90/100 on every commit. Start with
@@ -26,14 +20,10 @@
 > [docs/EXPERT-3BPW-PLAN.md](docs/EXPERT-3BPW-PLAN.md) (the road past the
 > 34 tok/s byte ceiling).
 >
-> `main` and `base` track upstream unmodified.
->
-> `laguna` has **two** upstreams — Avarok, plus 36 commits of Laguna-S-2.1
-> support from [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas)
-> that were never merged upstream. GitHub's "forked from" header can only name
-> one parent, so it cannot say this; three `upstream/*` tags mark each boundary
-> instead, and [REPRODUCING.md](REPRODUCING.md) gives a one-line diff for each
-> contributor's share.
+> See [`bench/deepseek-v4/README.md`](bench/deepseek-v4/README.md) for the
+> runnable entry point, [`REPRODUCING.md`](REPRODUCING.md) for lineage and
+> [`BRANCHES.md`](BRANCHES.md) for the complete Apathy Atlas map. `main` and
+> `base` remain upstream mirrors; the README below is upstream's.
 
 ---
 

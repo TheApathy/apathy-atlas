@@ -1,7 +1,7 @@
 # DeepSeek-V4-Flash on a single GB10 with Atlas (NVFP4/FP8)
 
-This is the single-node bring-up + reproduction harness for DeepSeek-V4-Flash on
-the champion `laguna` Atlas build. It is the DeepSeek analog of `bench/laguna/`.
+This is the single-node bring-up and reproduction harness for
+DeepSeek-V4-Flash on the `ds4-flash` Apathy Atlas branch.
 
 ## The single-node problem (why this harness exists)
 
@@ -43,19 +43,22 @@ or EP=2 across two GB10s.
 ## Run it
 
 ```bash
+# Pick public, machine-local locations once. No repository script requires
+# these exact paths.
+export CUTLASS_HOME=/path/to/cutlass
+export MODEL_DIR=/path/to/DeepSeek-V4-Flash-162B
+
 # 1. Build the deepseek-v4-flash NVFP4 engine (once):
-CUTLASS_HOME=/home/flocka/vllm-build/.deps/cutlass-src \
 ATLAS_TARGET_MODEL=deepseek-v4-flash ATLAS_TARGET_QUANT=nvfp4 \
 ATLAS_TARGET_HW=gb10 ATLAS_CUDA_ARCH=sm_121f \
 bash bench/laguna/build_cutlass.sh
 
 # 2. Download a single-node checkpoint (~94 GB):
 hf download 0xSero/DeepSeek-V4-Flash-162B \
-    --local-dir /home/flocka/models/DeepSeek-V4-Flash-162B
+    --local-dir "$MODEL_DIR"
 
 # 3. Serve on one GB10 (EP=1, FP8 KV required):
-MODEL_DIR=/home/flocka/models/DeepSeek-V4-Flash-162B \
-    bash bench/deepseek-v4/serve_single.sh
+bash bench/deepseek-v4/serve_single.sh
 
 # 4. In another shell — prove coherence, then measure quality:
 PORT=8899 bash bench/deepseek-v4/smoke.sh          # asserts "Paris"

@@ -9,7 +9,7 @@ has no metadata, so random i16 words are a valid payload).
   `exl3_gemv_m1`, `exl3_dequant_dump`)
 - Oracle: `crates/spark-model/examples/exl3_gemv_microtest.rs`
 - Decode logic ported from ExLlamaV3 (MIT, Turboderp 2025), vendored at
-  `/home/flocka/sparkinfer-upstream/b12x/gemm/trellis_linear/csrc/vendor/quant/`
+  `$SPARKINFER_SRC/b12x/gemm/trellis_linear/csrc/vendor/quant/`
   (`codebook.cuh`, `exl3_dq.cuh`, `hadamard_inner.cuh`,
   `exl3_gemm_inner.cuh`); vendored rev 704aefd7, checkpoint rev 787d1582.
 
@@ -552,7 +552,7 @@ STILL OPEN:
 
 - ~~m-row (γ-verify) MROW variant~~ LANDED — see §8.
 - Real-checkpoint spot-check (plan option a): run the dump gate against
-  tiles from `/home/flocka/sparkinfer-ref/data/tp1` once readable.
+  tiles from `$SPARKINFER_REF/data/tp1` once readable.
 - ~~Perf tuning after first GPU measurement~~ round 2 done (ILP restructure
   + 4 CTAs/SM, +8%); ~~half2-accumulate variant~~ round 3 done (§3/§3b):
   half2 dot + half2 x' + full unroll, 67→55.9 SASS instr/tile — measured
@@ -568,7 +568,7 @@ STILL OPEN:
   the guarded per-row path); mandatory S6 scope per plan §3/§4.7
   (partial-exactness law: the verify chain flips as a whole).
 - Real-checkpoint spot-check (plan option a): run the dump gate against
-  tiles from `/home/flocka/sparkinfer-ref/data/tp1` (world-readable now).
+  tiles from `$SPARKINFER_REF/data/tp1`.
 - ~~Perf tuning after first GPU measurement~~ round 2 done (§2/§3): ILP
   dequant restructure + 4 CTAs/SM. If gate 3 still lands under ~200 GB/s,
   the next lever is the half2-accumulate variant (`EXL3_GEMM_H_ACC`-style)

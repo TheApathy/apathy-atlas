@@ -8,7 +8,9 @@ set -euo pipefail
 NAME="${1:?usage: bisect-verify.sh <name> [ENV=VAL ...]}"
 shift || true
 
-WORKTREE=/home/flocka/dsflash-combined
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
+DRAFTER="${DRAFTER:?set DRAFTER to the DSpark drafter directory}"
 LOG="$WORKTREE/serve-bisect-$NAME.log"
 
 ENV_ARGS=(
@@ -25,10 +27,10 @@ for kv in "$@"; do ENV_ARGS+=("$kv"); done
 
 echo "env: ${ENV_ARGS[*]}" >"$LOG"
 cd "$WORKTREE"
-env "${ENV_ARGS[@]}" ./target/release/spark serve /home/flocka/models/DeepSeek-V4-Flash-162B \
+env "${ENV_ARGS[@]}" ./target/release/spark serve "$MODEL" \
   --port 8977 --kv-cache-dtype fp8 --lm-head-dtype fp8 \
   --gpu-memory-utilization 0.91 --max-seq-len 1024 --max-num-seqs 1 \
   --max-batch-size 1 --max-prefill-tokens 1024 --kv-cache-cap-tokens 1040 \
-  --dflash --draft-model /home/flocka/models/DeepSeek-V4-Flash-0731-drafter \
+  --dflash --draft-model "$DRAFTER" \
   --dflash-gamma 6 >>"$LOG" 2>&1 &
 echo "pid=$! log=$LOG"

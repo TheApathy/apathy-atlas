@@ -21,9 +21,9 @@ NAME="${1:?usage: cb-serve.sh <log-name> <gamma|-> [ENV=VAL ...]}"
 GAMMA="${2:-6}"
 shift 2 || shift 1 || true
 
-WORKTREE=/home/flocka/dsflash-combined
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
-DRAFTER=/home/flocka/models/DeepSeek-V4-Flash-0731-drafter
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
+DRAFTER="${DRAFTER:?set DRAFTER to the DSpark drafter directory}"
 PORT="${PORT:-8977}"
 GPU_MEM="${GPU_MEM:-0.91}"
 KV_CAP="${KV_CAP:-1040}"   # 65 blocks @16 = 64 for the 1024-tok seq + 1 safety
