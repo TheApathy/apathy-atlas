@@ -17,7 +17,7 @@ directory and the env flags listed here.
 
 - One GB10, 128 GB unified memory, no other process holding the GPU
   (a resident server will OOM the microtests — kill it first).
-- `DeepSeek-V4-Flash-162B` at `/home/flocka/models/DeepSeek-V4-Flash-162B`
+- `DeepSeek-V4-Flash-162B` downloaded to a local `$MODEL_DIR`
   and the 0731 drafter at `.../DeepSeek-V4-Flash-0731-drafter`.
 - `tool-eval-bench` (the quality gate) — any recent build.
 

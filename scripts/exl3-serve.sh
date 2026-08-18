@@ -7,7 +7,7 @@
 #   scripts/exl3-serve.sh exl3-chunk16 ATLAS_EXL3_PREFILL_CHUNK=16
 #
 # Differences vs dspark-serve.sh:
-#   - MODEL points at /home/flocka/sparkinfer-ref/data/tp1 (quant_method
+#   - MODEL points at a local SparkInfer TP1 checkpoint (quant_method
 #     "exl3": routed experts EXL3 trellis, everything else FP8; config.json
 #     model_type deepseek_v4, 216 experts, top-6).
 #   - PLAIN decode only: the DSpark drafter ships in-dir (mtp.*) but the
@@ -26,7 +26,7 @@ NAME="${1:?usage: exl3-serve.sh <log-name> [ENV=VAL ...]}"
 shift 1 || true
 
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
-MODEL="${MODEL:-/home/flocka/sparkinfer-ref/data/tp1}"
+MODEL="${MODEL:?set MODEL to the SparkInfer TP1 checkpoint directory}"
 PORT="${PORT:-8977}"
 LOG="$REPO/serve-$NAME.log"
 

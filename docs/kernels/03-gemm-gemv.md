@@ -3,7 +3,7 @@
 Target: **DeepSeek-V4-Flash-162B**, one **NVIDIA GB10 (DGX Spark)**, sm_121, LPDDR5X,
 **273 GB/s**, 120 GB, **48 SMs**.
 
-Shapes confirmed from `/home/flocka/models/DeepSeek-V4-Flash-162B/config.json`:
+Shapes confirmed from `$MODEL_DIR/config.json`:
 
 | symbol | value | source |
 |---|---|---|

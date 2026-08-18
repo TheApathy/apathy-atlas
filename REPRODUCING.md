@@ -1,9 +1,8 @@
 # Reproducing the measurements in this fork
 
 This is a fork of [Atlas](https://github.com/Avarok-Cybersecurity/atlas). The
-default branch tracks upstream unchanged; the work lives on per-model branches,
-and each one carries its own self-contained reproduction harness under
-`bench/<model>/`.
+GitHub default is the measured `laguna` branch. See
+[`BRANCHES.md`](BRANCHES.md) for the complete maintained branch map.
 
 Upstream is Avarok-Cybersecurity/atlas. The `laguna` branch additionally builds
 on 36 commits from [MonumentalSystems/atlas](https://github.com/MonumentalSystems/atlas)
@@ -15,9 +14,11 @@ which gives you a one-line diff for each contributor's share.
 | `base` / `main` | — | — | Upstream Atlas, unmodified. Same commit on both; `base` exists as a stable anchor to diff against. |
 | `laguna` | poolside/Laguna-S-2.1-NVFP4 | `bench/laguna/` | Single-stream DFlash speculative decode, prefill, capacity, and a 69-case tool-calling eval. |
 | `qwen` | Qwen3.6-27B (dense) + DFlash drafter | `bench/qwen/` | The champion single-stream speculative-decode configuration. |
+| `ds4-flash` | DeepSeek-V4-Flash/REAP | `bench/deepseek-v4/` | Single-GB10 bring-up, prefill, decode, MTP and quality evidence. |
+| `feat/tui-benchmarks` | Atlas infrastructure | plugin and TUI | Experimental benchmark UI and run-scoped state work. |
+| `feat/qwen38-repro-public` | Qwen3.8-27B | `repro/qwen38-coding/` | Sanitized deterministic coding evidence; source/drafter publication pending. |
 
-Those four are the whole map. Any other branch you see was inherited from
-upstream and is not part of this work.
+Other remote branches are not implied Apathy Atlas release channels.
 
 ## Where every commit came from
 

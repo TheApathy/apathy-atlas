@@ -3,8 +3,8 @@
 set -euo pipefail
 NAME="${1:?usage: nsys-plain.sh <out-name> [ENV=VAL ...]}"
 shift || true
-WORKTREE=/home/flocka/dsflash-combined
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
 OUT="/tmp/$NAME"
 LOG="$WORKTREE/serve-$NAME.log"
 ENV_ARGS=( ATLAS_UNIFIED_MOE_LAYOUT=1 ATLAS_V4_ATTN_NVFP4=1 ATLAS_V4_ATTN_RELEASE_BF16=1 ATLAS_MOE_MROW_PARTITION=1 ATLAS_MOE_T_BLOCK=128 )

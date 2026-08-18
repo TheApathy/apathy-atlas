@@ -12,7 +12,7 @@ set -uo pipefail
 PORT="${PORT:-8977}"
 NTOK="${NTOK:-256}"
 PROMPT="${PROMPT:-Write a detailed technical explanation of how virtual memory paging works in a modern operating system.}"
-MODEL="${MODEL:-/home/flocka/models/DeepSeek-V4-Flash-162B}"
+MODEL="${MODEL:?set MODEL to the served model path or model identifier}"
 
 req() {
   curl -s -m 600 "http://127.0.0.1:$PORT/v1/chat/completions" \
@@ -34,7 +34,7 @@ export MODEL PROMPT NTOK
 # the log ends BEFORE the runs: reading the whole file and tailing it printed a
 # stale line from an earlier serve whenever LOG pointed at a log this run never
 # appended to, which silently passed off an old number as "authoritative".
-SERVE_LOG="${LOG:-/home/flocka/deepseek-flash/serve-deepseek-single.log}"
+SERVE_LOG="${LOG:-$PWD/serve-deepseek-single.log}"
 LOG_MARK=0
 [ -f "$SERVE_LOG" ] && LOG_MARK=$(wc -c <"$SERVE_LOG")
 

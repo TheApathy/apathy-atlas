@@ -11,8 +11,8 @@
 set -euo pipefail
 NAME="${1:?usage: nsys-prefill.sh <out-name> [ENV=VAL ...]}"
 shift || true
-WORKTREE=/home/flocka/dsflash-combined
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
 OUT="/tmp/$NAME"
 LOG="$WORKTREE/serve-$NAME.log"
 

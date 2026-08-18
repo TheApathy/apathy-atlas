@@ -51,7 +51,7 @@ LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-fp8}"
 # the BF16 baseline). ATLAS_V4_ATTN_NVFP4=0 restores the FP8 mirrors.
 export ATLAS_V4_ATTN_NVFP4="${ATLAS_V4_ATTN_NVFP4:-1}"
 
-MODEL_DIR="${MODEL_DIR:-/home/flocka/models/DeepSeek-V4-Flash-162B}"
+MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the DeepSeek-V4-Flash checkpoint directory}"
 BIN="${DS4_BIN:-$REPO/target/release/spark}"
 PORT="${PORT:-8899}"
 HOST="${HOST:-127.0.0.1}"

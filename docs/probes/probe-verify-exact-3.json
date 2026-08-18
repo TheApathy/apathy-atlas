@@ -1,6 +1,6 @@
 {
   "tag": "verify-exact-3",
-  "model": "/home/flocka/models/DeepSeek-V4-Flash-162B",
+  "model": "/path/to/DeepSeek-V4-Flash-162B",
   "runs": [
     {
       "code": {

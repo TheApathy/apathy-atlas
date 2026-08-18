@@ -9,13 +9,13 @@ Sources, all on this box:
 
 | What | Path |
 |---|---|
-| Their serve recipe | `/home/flocka/sparkinfer-ref/config/recipe.json` |
-| Their draft builder | `/home/flocka/sparkinfer-ref/scripts/build_dspark_draft.py` |
-| Their entrypoint | `/home/flocka/sparkinfer-ref/scripts/entrypoint.sh` |
-| Their vLLM patch | `/home/flocka/sparkinfer-ref/patches/vllm-dspark-compact-draft.patch` |
-| Target checkpoint | `/home/flocka/sparkinfer-ref/data/tp1/` |
-| REAP provenance map | `/home/flocka/sparkinfer-ref/data/tp1/REAP_K216_PLAN.json` |
-| Their built draft | `/home/flocka/sparkinfer-ref/data/dspark-draft-k64/` (root, 0600) |
+| Their serve recipe | `$SPARKINFER_REF/config/recipe.json` |
+| Their draft builder | `$SPARKINFER_REF/scripts/build_dspark_draft.py` |
+| Their entrypoint | `$SPARKINFER_REF/scripts/entrypoint.sh` |
+| Their vLLM patch | `$SPARKINFER_REF/patches/vllm-dspark-compact-draft.patch` |
+| Target checkpoint | `$SPARKINFER_REF/data/tp1/` |
+| REAP provenance map | `$SPARKINFER_REF/data/tp1/REAP_K216_PLAN.json` |
+| Their built draft | `$SPARKINFER_REF/data/dspark-draft-k64/` |
 
 ## 1. How the 64 experts are selected — the crux
 
@@ -184,7 +184,7 @@ draft, since it may move the current 55-62% number on its own.
 
 `REAP_K216_PLAN.json` is a 0xSero REAP artifact of the **reference tp1
 checkpoint**. The official `DeepSeek-V4-Flash-0731` drafter shards
-(`/home/flocka/models/DeepSeek-V4-Flash-0731-drafter`, 256 experts, what
+(`$DRAFT_MODEL_DIR`, 256 experts, what
 `scripts/dspark-serve.sh` points `--draft-model` at today) do **not** carry
 one, and the gate is a hard error there — guessing a subset would load real
 weights under wrong ids and draft silently wrong tokens, so the loader refuses

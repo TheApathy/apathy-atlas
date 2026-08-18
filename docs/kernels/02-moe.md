@@ -56,7 +56,7 @@ streamed from HBM exactly ONCE PER DISTINCT EXPERT ID, fully amortised across ev
 routed to that expert. There is no per-row weight reload anywhere in that path.**
 
 The proof is three links long and all of it is in
-`/home/flocka/deepseek-flash/kernels/gb10/common/moe_shared_expert_fused_t.cu`:
+`kernels/gb10/common/moe_shared_expert_fused_t.cu`:
 
 1. **Leader election** — `mrow_gather_slots<MROW>` at
    `moe_shared_expert_fused_t.cu:936-981`. Each `grid.y` block owns one flat routed slot
@@ -113,7 +113,7 @@ expert union (measured mean 19.5). 2247 us / 19.5 = 115 us; 2247 us / 36 = 62 us
 the arithmetic error.
 
 Also note `exp_splitk_m_t` is **not a CUDA kernel name**. It is a `prof!` label at
-`/home/flocka/deepseek-flash/crates/spark-model/src/layers/moe/forward_km.rs:173`
+`crates/spark-model/src/layers/moe/forward_km.rs:173`
 wrapping the whole of `dispatch_splitk_m_t` — two GEMVs plus two finalize kernels. It is
 the only occurrence of that string in the repository.
 
@@ -181,7 +181,7 @@ roofline. Staging `A` into smem once per block (or into registers, since 4096 BF
 8 KB per row) should recover most of the gap. Estimated **~6-10 ms/step**.
 
 **4. `silu_down` dynamic smem scales linearly with MROW.**
-`/home/flocka/deepseek-flash/crates/spark-model/src/layers/ops/fp8_moe.rs:507`:
+`crates/spark-model/src/layers/ops/fp8_moe.rs:507`:
 
 ```rust
 let smem_bytes = mrow * (k as usize * size_of::<f32>()) as u32 / split;
@@ -240,7 +240,7 @@ they serialise the whole grouped-GEMM launch chain.
 
 ## Launch geometry summary
 
-Derived from `/home/flocka/deepseek-flash/crates/spark-model/src/layers/ops/fp8_moe.rs`
+Derived from `crates/spark-model/src/layers/ops/fp8_moe.rs`
 at hidden=4096, moe_intermediate=2048, top_k=6, `T_BLOCK=32`, `T_SPLIT_VEC=2`,
 `T_SPLIT=4`.
 
@@ -282,7 +282,7 @@ gamma=6 verify unions near-disjoint: the six speculated tokens are six different
 ids, so they index six unrelated rows of `tid2eid`.
 
 - **grid/block**: one block of 256 threads per token; grid `[num_tokens]`. Launched from
-  `/home/flocka/deepseek-flash/crates/spark-model/src/layers/moe/forward_km.rs:234`
+  `crates/spark-model/src/layers/moe/forward_km.rs:234`
   (`route_rows_flat`, one launch per row) and from the batched path via
   `moe_hash_route_batched`.
 - **dtypes**: `tid2eid` i32, gate logits f32, output ids i32 + weights f32.
@@ -535,7 +535,7 @@ Transposes packed u8 (2x E2M1 nibbles) expert weight tensors from the original
 GEMVs need for coalescing. Runs **once at model load**, not per token.
 
 - **grid/block**: `[div_ceil(cols,32), div_ceil(rows,32), num_experts]` x `[32,8,1]`
-  — from `/home/flocka/deepseek-flash/crates/spark-model/src/layers/ops/fp8_moe.rs:260`.
+  — from `crates/spark-model/src/layers/ops/fp8_moe.rs:260`.
   32x32 smem tile, 8 rows per thread.
 - **smem**: `32 * 33` u8 = 1056 B (the +1 pad kills the bank conflict).
 - **bytes/call**: `2 * num_experts * N * K/2`. For the full model: 43 layers x 256 experts
@@ -552,7 +552,7 @@ GEMVs need for coalescing. Runs **once at model load**, not per token.
 # Part C — The `_t` decode GEMV family (the hot path)
 
 Everything in this section lives in
-`/home/flocka/deepseek-flash/kernels/gb10/common/moe_shared_expert_fused_t.cu` (1467
+`kernels/gb10/common/moe_shared_expert_fused_t.cu` (1467
 lines). This is the file that determines decode speed.
 
 Shared infrastructure:
@@ -661,7 +661,7 @@ since f32 addition is not associative).
   100 MB/layer weight stream. The split-K reduction overhead is negligible; the 4x block
   count it buys is worth far more.
 - **Split-K accuracy note**: the partial buffer is `MOE_DECODE_MAX_SPLIT = 4` deep
-  (`/home/flocka/deepseek-flash/crates/spark-runtime/src/buffers/sizes.rs:11`), so SPLIT
+  (`crates/spark-runtime/src/buffers/sizes.rs:11`), so SPLIT
   cannot exceed 4 without a buffer resize.
 
 ## moe_gate_up_partial_finalize
@@ -825,13 +825,13 @@ Twelve `extern "C"` entries: `moe_expert_gate_up_shared_t{,_e8m0}_m{1,2,6}v2s4` 
 parameter**, so `s_slot[MROW]` and the `acc[ROWS_][VEC]` register file are sized exactly.
 
 Handle selection is at
-`/home/flocka/deepseek-flash/crates/spark-model/src/layers/moe/mod.rs:625`
+`crates/spark-model/src/layers/moe/mod.rs:625`
 (`splitk_m_t_handles`): a narrowest-first candidate list
 `[(2, m2 handles), (MOE_VERIFY_MAX_ROWS=6, m6 handles)]`. A 4-row verify picks the m6
 kernel and pays 2 surplus rows of FMAs — bandwidth-neutral.
 
 - **Kill switches**: `ATLAS_MOE_SPLITK=0` and `ATLAS_MOE_SPLITK_M=0`
-  (`/home/flocka/deepseek-flash/crates/spark-model/src/layers/moe/forward_phase.rs:29,77`).
+  (`crates/spark-model/src/layers/moe/forward_phase.rs:29,77`).
   The `_m` path additionally requires `num_tokens >= 2`.
 
 ## moe_gate_up_partial_finalize_m
@@ -1201,7 +1201,7 @@ Tile constants:
 Baseline: `M_TILE=64, N_TILE_SM=64, K_STEP=16`, no `cp.async`. Untransposed weights.
 
 - **grid**: `[ptrtable_legacy_grid_x(n_out), max_m_tiles, num_experts]`, block 128 —
-  `/home/flocka/deepseek-flash/crates/spark-model/src/layers/ops/moe_grouped_a.rs:153`.
+  `crates/spark-model/src/layers/ops/moe_grouped_a.rs:153`.
 - **bytes/expert**: `N*K/2 + N*K/16`. For gate_up `[4096, 4096]`: **9.44 MB**.
 - **AI at full tile**: `2 * 64 * 64 * K / (64*K/2 + 64*K/16)` = **~29 FLOP/byte**.
 - **`_e8m0`**: identical but E8M0 scales, `9.44 - 0.26 = ` **8.92 MB/expert**, 5.5% less.

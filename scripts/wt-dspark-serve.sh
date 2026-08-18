@@ -15,11 +15,11 @@ NAME="${1:?usage: wt-dspark-serve.sh <log-name> [gamma] [ENV=VAL ...]}"
 GAMMA="${2:-6}"
 shift 2 || shift 1 || true
 
-WORKTREE=/home/flocka/deepseek-flash/codex-work/atlas-plain-exp
-MODEL=/home/flocka/models/DeepSeek-V4-Flash-162B
-DRAFTER=/home/flocka/models/DeepSeek-V4-Flash-0731-drafter
+WORKTREE="${WORKTREE:-$(cd "$(dirname "$0")/.." && pwd)}"
+MODEL="${MODEL:?set MODEL to the DeepSeek-V4-Flash checkpoint directory}"
+DRAFTER="${DRAFTER:?set DRAFTER to the DSpark drafter directory}"
 PORT="${PORT:-8977}"
-LOG="/home/flocka/deepseek-flash/serve-$NAME.log"
+LOG="${LOG:-$WORKTREE/serve-$NAME.log}"
 
 # Residency + MoE wins ON by default; ATLAS_DSPARK_CAPTURE arms the hc-mean
 # capture the block drafter conditions on. Overridable via trailing ENV=VAL.

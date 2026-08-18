@@ -22,7 +22,7 @@
 # throughput with extra steps. serve_single.sh takes MAX_BATCH for that.
 set -uo pipefail
 PORT="${PORT:-8977}" CONC="${CONC:-12}" NTOK="${NTOK:-256}"
-MODEL="${MODEL:-/home/flocka/models/DeepSeek-V4-Flash-162B}"
+MODEL="${MODEL:?set MODEL to the served model path or model identifier}"
 export PORT CONC NTOK MODEL
 
 python3 - <<'PY'

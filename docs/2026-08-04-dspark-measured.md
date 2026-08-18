@@ -258,7 +258,7 @@ Two consequences:
 ## Reproduce
 
 ```bash
-cd /home/flocka/dsflash-combined
+cd /path/to/apathy-atlas
 ./scripts/cb-serve.sh plain -                  # baseline leg
 ./scripts/cb-serve.sh spec 6 ATLAS_MTP_GATE_FORCE=1 \
     ATLAS_DFLASH_ADAPTIVE=1 ATLAS_DFLASH_LOW_GEAR=1 ATLAS_DFLASH_UNIFIED_CTX=1

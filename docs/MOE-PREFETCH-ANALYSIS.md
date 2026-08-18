@@ -273,7 +273,7 @@ prior says 0.28" into a measured per-layer, hash-vs-gate split.
 #    ATLAS_PROFILE=1 is REQUIRED — under graph replay the tap is blind (§2.5).
 scripts/dsflash-serve-bench.sh routelog - \
   ATLAS_MOE_ROUTE_LOG=1 \
-  ATLAS_MOE_ROUTE_LOG_FILE=/home/flocka/dsflash-combined/route-locality.csv \
+  ATLAS_MOE_ROUTE_LOG_FILE="$PWD/route-locality.csv" \
   ATLAS_MOE_ROUTE_LOG_EVERY=2048 \
   ATLAS_PROFILE=1
 
