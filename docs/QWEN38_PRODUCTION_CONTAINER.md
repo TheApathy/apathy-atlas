@@ -46,53 +46,106 @@ cannot prune its checkpoints or breaks the image build. The stable name breaks
 that coupling; `provenance.json` records the source path and the sha256 of every
 file, so nothing about the lineage is lost.
 
-### Why the binary is pinned, not built
+### What the pin does and does not prove
 
-The tree is now committed, so a from-source build has become *meaningful*. It
-has not yet become *justified*, and the binary stays pinned until it is.
+**The gate is the measurement, not the digest.** That is a change of position,
+and it was forced by evidence rather than chosen.
 
-The binary that produced the reference number was built at 19:20 from a working
-tree that was uncommitted at the time. That tree has since been committed as
-`bedfb478` on `qwen38/gb10-perf-and-packaging` (verified: the commit exists, it
-is `HEAD`, and the working tree is clean). What has **not** been established is
-that this binary is what `bedfb478` produces. Nothing links them but sequence —
-the build predates the commit, and no one has rebuilt and compared.
+The original plan was: rebuild from the recorded commit, compare hashes, and let
+digest equality prove that the shipped binary is what the source says it is. That
+plan does not work here, for a reason worth stating plainly because it is easy to
+believe the opposite:
 
-Two signals that look like evidence against correspondence are not, and are
-recorded here so they do not get re-litigated:
+> **This workspace is cache-stable, not reproducible.**
 
-- 909 files under `crates/` and `kernels/` carry mtimes later than the binary.
-  That is a bulk touch, not editing: `crates/atlas-embed/src/token.rs` is among
-  them and its last content-changing commit is the original open-source release,
-  with a clean `git status` proving the working copy still matches it.
-- A `git diff e8b00332 bedfb478` does not hash to the working-tree diff recorded
-  before the commit. Expected: the commit range renders the previously-untracked
-  files as new-file diffs, and `git diff HEAD` never showed them at all.
+Two builds of the same commit that share `target/` are byte-identical — that was
+measured twice, by two operators, 33 minutes apart. It is tempting to read that as
+determinism. It is not. A build of the *same commit* from a *clean* `target/`
+produces a **different hash**. The two binaries are the same size to the byte and
+their only differing strings are a date and a time:
 
-So correspondence is **unproven in both directions**, and only one thing settles
-it: rebuild in-image, extract the binary, run the MinHeap probe at 400 tokens ×5,
-and require the median within drift of 63.96 / 63.77. If it lands low, that is a
-finding about the committed tree, not a reason to relax the gate.
+| build | embedded |
+|---|---|
+| shared `target/` | `Jun  3 2026` / `15:09:53` |
+| clean `target/` | `Aug 23 2026` / `22:20:52` |
 
-Meanwhile `target/release/spark` is rebuilt continuously with *different kernel
-targets* — at one point during this work it was `03a1dbb9…`, a different binary
-from the pinned `1ce470d6…`. Pinning by path would have shipped whichever build
-happened to be on disk.
+That is a C-style `__DATE__`/`__TIME__` pair from one of the C-compiling
+dependencies (`xgrammar-rs`, `libmimalloc-sys`, `onig_sys`, `esaxx-rs` all have
+objects cached since June 3). Every build that reuses `target/` inherits June 3
+and therefore agrees with every other such build. Agreement between two builds
+sharing a stale artifact is evidence that they shared an artifact, nothing more.
 
-So the pin is by **content hash**, enforced three times: `build-local.sh`
-refuses to stage a mismatched binary, the Dockerfile fails the build on it, and
-`entrypoint.sh` refuses to start on it. All three additionally check that the
-string `qwen3.8-27b` is present in the binary, because kernels are compiled per
-target and a binary built for the wrong one fails late and confusingly.
+A corollary that applies to everyone working in this tree: our `target/` has been
+serving five-month-old C objects to every build any of us has run. Nothing is
+wrong with the result, but "it builds clean from our tree" has been a weaker
+statement than it sounds, for all of us, all along. A clean build is the only one
+that exercises the C dependencies — which is also how the `nvcc` requirement
+below surfaced.
 
-What a build stage now needs: `FROM nvidia/cuda:13.0.0-devel-ubuntu24.04`, copy
+#### Correspondence: disproven
+
+Hash is unusable, but **size is not** — the timestamp difference costs exactly
+zero bytes, while real source differences cost real bytes. On that instrument:
+
+| binary | size | delta vs pin |
+|---|---:|---:|
+| production pin | 39,068,536 | — |
+| build of `bedfb478` | 39,138,920 | **+70,384** |
+| build of tip `320e0060` | 39,138,832 | +70,296 |
+
+Same source across timestamps differs by 0 bytes; different source (`bedfb478`
+vs the tip) differs by 88. A 70 KB gap is three orders of magnitude past that
+noise floor. **The pinned binary is not what `bedfb478` builds.**
+
+The mechanism is deliberately left unattributed. The leading explanation — and it
+is labelled a hypothesis because it has not been established — is that the pin was
+built at 19:20:45 from a working tree that kept changing until it was committed
+around 20:50, with several agents editing `crates/` in between. That intermediate
+tree state no longer exists anywhere, so no rebuild can recover which edits landed
+when. The decision this feeds does not depend on the answer.
+
+#### What replaces it
+
+Lineage is expressed as **commit + measured throughput**, and the floor assertion
+in `make repro` is the gate. Not an adjunct to a hash check — the gate.
+
+The digest pin stays, with its scope narrowed to what it can actually do: it stops
+the wrong file being staged into an image. `build-local.sh`, the Dockerfile, and
+`entrypoint.sh` all still refuse a mismatched binary, and all three still check
+that `qwen3.8-27b` is present, because kernels are compiled per target and the
+wrong one fails late and confusingly. What the digest no longer claims is that the
+artifact came from a particular commit.
+
+Chasing byte-for-byte reproducibility (`SOURCE_DATE_EPOCH`, `-D__DATE__`
+overrides on the C dependencies) was considered and **rejected**: it is real work
+with a maintenance tail across toolchain updates, and it buys a property that has
+no consumer now that measurement is the gate.
+
+#### If a from-source build stage is added later
+
+It will produce a different hash on every build, by construction — a clean
+`target/` stamps a fresh timestamp every time. Pin the commit and require the
+floor; do not try to pin the resulting digest.
+
+The stage needs: `FROM nvidia/cuda:13.0.0-devel-ubuntu24.04`, a copy of
 `Cargo.toml Cargo.lock rust-toolchain.toml crates/ kernels/ jinja-templates/`,
-`ENV RUSTUP_TOOLCHAIN=stable` (the `rust-toolchain.toml` pin is 1.85 and a
-transitive dep needs ≥1.88), the three `ATLAS_TARGET_*` variables, then
-`cargo build --release -p spark-server`. It does **not** need `COPY vendor/` —
-that line was stale in all nine `docker/gb10/*` Dockerfiles and has been removed;
-the vendored C++ xgrammar tree was deliberately deleted when the grammar stack
-went pure-Rust.
+`ENV RUSTUP_TOOLCHAIN=stable` (the toml pins 1.85; a transitive dep needs ≥1.88),
+the three `ATLAS_TARGET_*` variables, and `cargo build --release -p spark-server`.
+Assert on the build's own `compiled 151 kernels for target 0 (gb10, qwen3.8-27b,
+nvfp4)` line — it fails at build time, where grepping the binary afterwards fails
+later.
+
+Two things it must **not** omit:
+
+- `ENV PATH="/usr/local/cuda/bin:${PATH}"`. `cudarc` 0.19.2's `build.rs:115`
+  shells out to a bare `nvcc --version` and panics if it is unresolvable — it does
+  **not** consult `CUDA_HOME`. The devel images set this themselves, so a build
+  that relies on inheritance works until a base-image bump quietly removes it.
+  This is invisible from our tree because the cached `cudarc` build-script output
+  predates any of us.
+- `COPY vendor/`. There is no `vendor/` directory — the vendored C++ xgrammar tree
+  was deliberately deleted when the grammar stack went pure-Rust. That stale line
+  was present in all nine `docker/gb10/*` Dockerfiles and has been removed.
 
 ---
 
@@ -142,6 +195,13 @@ so anything the caller exports wins.
 ---
 
 ## 4. Reproduce the benchmark
+
+**This is the gate.** The binary digest proves only that the intended file was
+staged; it does not prove the artifact came from any particular source (section
+1). What links this image to a claim about its behaviour is the measurement
+below, and nothing else. A change that cannot clear the floor is a regression
+regardless of what any hash says.
+
 
 ```bash
 make repro
@@ -244,11 +304,14 @@ statement elsewhere on this page is not backed here, treat it as untested.
 | Container resolves `libcuda.so.1` from the host driver | **verified** | `--gpus all` + `ldd`: `libcuda.so.1 => /usr/lib/aarch64-linux-gnu/libcuda.so.1`; in-container `nvidia-smi` reports `NVIDIA GB10, driver 580.126.09` |
 | **`make repro` reaches the 60 tok/s floor** | **NOT VERIFIED** | never executed — see below |
 | **Weight cache survives a container restart and makes the second start fast** | **NOT VERIFIED** | never executed — see below |
-| Pinned binary is what `bedfb478` builds | **NOT VERIFIED** | build predates the commit; only a rebuild + re-measure settles it |
+| Pinned binary is what `bedfb478` builds | **DISPROVEN** | built `bedfb478`: 39,138,920 bytes vs the pin's 39,068,536, a 70,384-byte gap against a 0-byte timestamp noise floor |
+| Build is byte-reproducible | **DISPROVEN** | same commit, clean `target/` → different hash; differs only in an embedded `__DATE__`/`__TIME__` pair |
+| Build is stable when `target/` is shared | **verified** | two operators, 33 min apart, same `target/` → identical sha256 `8568f485…` |
+| A clean build needs `nvcc` on `PATH` | **verified** | clean-`target/` build panicked in `cudarc` 0.19.2 `build.rs:115` on a bare `nvcc --version`; passed once `/usr/local/cuda/bin` was on `PATH` |
 
-The two unverified rows both need exclusive use of the GPU, and the box has
-been continuously occupied by a long-running corpus generation since this image
-was built. Launching a second 22 GB model server alongside it on unified memory
+The two remaining unverified rows both need exclusive use of the GPU, and the
+box has been continuously occupied by a long-running corpus generation since this
+image was built. Launching a second 22 GB model server alongside it on unified memory
 is the exact condition that previously caused a global OOM and a hard host
 reboot, so neither was attempted.
 
@@ -265,7 +328,9 @@ Specifically:
   the host**. Whether that survives a container restart on a named Docker volume
   is an extrapolation, not a measurement.
 
-Both are one GPU-free window away from being settled.
+Both are one GPU-free window away from being settled — and since the digest no
+longer carries lineage (see section 1), the first of them is now the **primary**
+gate on this image rather than a secondary check.
 
 ---
 

@@ -22,6 +22,13 @@ RUN apt-get update -qq && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_HOME=/usr/local/cuda
+# nvcc must be ON PATH, not merely findable via CUDA_HOME: cudarc 0.19.2's
+# build.rs:115 shells out to a bare `nvcc --version` and panics if it is not
+# resolvable, regardless of CUDA_HOME/CUDA_PATH/CUDA_ROOT. The nvidia/cuda
+# devel images happen to set this themselves, so today the build works by
+# INHERITANCE rather than by declaration — which breaks silently on a base
+# image bump. Declare it.
+ENV PATH="/usr/local/cuda/bin:${PATH}"
 # Override rust-toolchain.toml's 1.85 pin: a transitive dep (libloading 0.9)
 # now requires >= 1.88. Using `stable` defers to the toolchain that rustup
 # installed above (currently 1.93).
