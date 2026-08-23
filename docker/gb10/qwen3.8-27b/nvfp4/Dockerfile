@@ -55,6 +55,10 @@ COPY crates/ crates/
 # when the grammar stack went pure-Rust (see Cargo.toml, `[patch.crates-io]`
 # note). The directory does not exist, so the line broke every build here.
 COPY kernels/ kernels/
+# The runtime stage copies /build/jinja-templates/ from this stage, so it has to
+# exist here first — docker/gb10/Dockerfile (the one image that has been built)
+# does the same.
+COPY jinja-templates/ jinja-templates/
 
 ENV ATLAS_TARGET_HW=gb10
 ENV ATLAS_TARGET_MODEL=qwen3.8-27b
@@ -70,7 +74,7 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 # NCCL for multi-GPU (EP=2), RDMA userspace for RoCE transport
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends --allow-change-held-packages \
-      "libnccl2 (>= 2.28)" libibverbs1 librdmacm1 ibverbs-providers \
+      libnccl2 libibverbs1 librdmacm1 ibverbs-providers \
       libnl-3-200 libnl-route-3-200 && \
     rm -rf /var/lib/apt/lists/* && \
     NCCL_VER=$(dpkg-query -W -f='${Version}' libnccl2) && \
@@ -79,6 +83,11 @@ RUN apt-get update -qq && \
       (echo "ERROR: NCCL $NCCL_VER < 2.28 — symmetric memory APIs unavailable" && exit 1)
 
 COPY --from=builder /build/target/release/spark /usr/local/bin/spark
+# Match docker/gb10/Dockerfile, the only image in this tree that has been
+# built and exercised. Qwen3.8 ships its own chat_template.jinja inside the
+# checkpoint, but the templates cost little and a model whose checkpoint
+# lacks one would otherwise fail at serve time rather than at build time.
+COPY --from=builder /build/jinja-templates/ /jinja-templates/
 COPY LICENSE /LICENSE
 
 ENV RUST_LOG=info

@@ -16,7 +16,7 @@
 //! than on any SM literal.)
 //!
 //! Measured achieved bandwidth per drafter kernel (6 layers, γ_eff=12, from
-//! `qwen38/benchmark/results/kprof-raw.txt`), against the CTA count its N
+//! an internal kernel profile, not published), against the CTA count its N
 //! implies:
 //!
 //! | kernel      |    N  | CTAs | weight bytes | measured | achieved  |

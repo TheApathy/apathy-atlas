@@ -74,7 +74,7 @@ pub struct ServeArgs {
     /// PURE DIAGNOSTIC: a normal serve is unaffected by an unresolved lookup
     /// and there is no `--dangerously-allow-unresolved-kernel-lookups`,
     /// because upstream's fail-closed boot gate was not ported. See
-    /// `qwen38/analysis/UPSTREAM-PORT.md`.
+    /// `docs/FORK_VS_UPSTREAM.md`.
     #[arg(long, default_value_t = false)]
     pub check_kernels: bool,
 

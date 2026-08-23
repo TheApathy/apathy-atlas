@@ -17,7 +17,7 @@
 //! here: the seal rides on `run_metrics` (absent in this tree), and turning a
 //! silent fallback into a refusal-to-serve is a behaviour change to a server
 //! that is currently mid-campaign. A normal serve is entirely unaffected by
-//! this file. See `qwen38/analysis/UPSTREAM-PORT.md`.
+//! this file. See `docs/FORK_VS_UPSTREAM.md`.
 
 use spark_runtime::kernel_audit;
 

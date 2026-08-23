@@ -5,7 +5,7 @@
 //! Phase 1 is a **behavior-preserving** type/trait scaffold. Nothing here is
 //! wired into `propose.rs`; the legacy flat path remains the only publisher
 //! and the target verifier remains the only commit authority. See
-//! `qwen38/analysis/DFLASH3-BUILD-GUIDE-20260819.md` §5–§8 for the full
+//! the DFlash3 build guide (internal, not published) for the full
 //! architecture (observation → sources → lattice → plan → compile → verify).
 #![allow(dead_code)]
 
