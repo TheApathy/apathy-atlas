@@ -76,6 +76,11 @@ pub struct ChatTokenizer {
     /// OpenAI-variant template: gates historical `<think>` wrappers on enable_thinking.
     /// Falls back to jinja_env if no openai/ variant exists.
     openai_jinja_env: Option<minijinja::Environment<'static>>,
+    /// The checkpoint template consumes Qwen3.8's three-level
+    /// `reasoning_effort` vocabulary (`xhigh | medium | low`).  This is
+    /// detected from the template contract rather than from `model_type`:
+    /// Qwen3.5/3.6/3.8 dense checkpoints all report `qwen3_5`.
+    qwen38_reasoning_effort: bool,
 }
 
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.

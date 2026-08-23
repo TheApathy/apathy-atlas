@@ -105,7 +105,11 @@ pub(super) async fn translate_chat_response_to_responses(
     store: Option<Arc<crate::response_store::ResponseStore>>,
     input_messages: Vec<crate::openai::IncomingMessage>,
     store_flag: bool,
-    conversation: Option<(Arc<crate::conversation_store::ConversationStore>, String)>,
+    conversation: Option<(
+        Arc<crate::conversation_store::ConversationStore>,
+        String,
+        Vec<serde_json::Value>,
+    )>,
 ) -> Response {
     let (parts, body) = resp.into_parts();
     if !parts.status.is_success() {
@@ -233,6 +237,11 @@ pub(super) async fn translate_chat_response_to_responses(
         usage,
         metadata: req_metadata,
     };
+    let assistant_conversation_items: Vec<serde_json::Value> = resp
+        .output
+        .iter()
+        .filter_map(|item| serde_json::to_value(item).ok())
+        .collect();
 
     // Persist the full transcript for previous_response_id resume. We
     // serialize before returning so the stored body is byte-identical to
@@ -264,35 +273,8 @@ pub(super) async fn translate_chat_response_to_responses(
     }
 
     // Conversation append: new user items + assistant reply.
-    if let Some((conv_store, conv_id)) = conversation {
-        let prior = conv_store.get(&conv_id).map(|s| s.items.len()).unwrap_or(0);
-        let mut batch: Vec<serde_json::Value> = input_messages
-            .iter()
-            .skip(prior)
-            .map(|m| {
-                serde_json::json!({
-                    "type": "message",
-                    "role": m.role,
-                    "content": [{"type": "input_text", "text": m.content.text}],
-                })
-            })
-            .collect();
-        let assistant_text = chat
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !assistant_text.is_empty() {
-            batch.push(serde_json::json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": assistant_text}],
-            }));
-        }
+    if let Some((conv_store, conv_id, mut batch)) = conversation {
+        batch.extend(assistant_conversation_items);
         if !batch.is_empty()
             && let Err(e) = conv_store.add_items(&conv_id, batch)
         {
@@ -303,4 +285,37 @@ pub(super) async fn translate_chat_response_to_responses(
     }
 
     Json(body).into_response()
+}
+
+#[cfg(test)]
+mod conversation_output_tests {
+    #[test]
+    fn responses_output_serializes_as_replayable_conversation_items() {
+        let output = [
+            crate::openai::ResponsesOutputItem::FunctionCall {
+                id: "fc_item".into(),
+                call_id: "call_weather".into(),
+                name: "get_weather".into(),
+                arguments: "{\"location\":\"Paris\"}".into(),
+                status: "completed",
+            },
+            crate::openai::ResponsesOutputItem::Message {
+                id: "msg_item".into(),
+                status: "completed",
+                role: "assistant",
+                content: vec![crate::openai::ResponsesContentPart::OutputText {
+                    text: "18 C and sunny".into(),
+                    annotations: None,
+                }],
+            },
+        ];
+        let wire: Vec<serde_json::Value> = output
+            .iter()
+            .map(|item| serde_json::to_value(item).unwrap())
+            .collect();
+        assert_eq!(wire[0]["type"], "function_call");
+        assert_eq!(wire[0]["call_id"], "call_weather");
+        assert_eq!(wire[1]["type"], "message");
+        assert_eq!(wire[1]["content"][0]["text"], "18 C and sunny");
+    }
 }

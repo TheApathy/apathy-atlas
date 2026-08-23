@@ -30,6 +30,7 @@
 //! exception.
 
 use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use anyhow::{Result, bail};
@@ -40,11 +41,43 @@ use super::{
     AtlasCudaBackend, cuCtxSetCurrent, cuEventCreate, cuEventDestroy_v2, cuEventRecord,
     cuGraphDestroy, cuGraphExecDestroy, cuGraphInstantiateWithFlags, cuGraphLaunch, cuMemAlloc_v2,
     cuMemAllocHost_v2, cuMemAllocManaged, cuMemFree_v2, cuMemFreeHost, cuMemGetInfo_v2,
-    cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
+    cuMemcpyDtoDAsync_v2, cuMemcpyDtoH_v2, cuMemcpyHtoD_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
     cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
     cuStreamWaitEvent,
 };
-use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use crate::gpu::{
+    DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle, PinnedHostBuffer,
+    PinnedHostSlice, PinnedHostStorage,
+};
+
+struct CudaPinnedHostStorage {
+    ptr: NonNull<u8>,
+    bytes: usize,
+}
+
+unsafe impl Send for CudaPinnedHostStorage {}
+unsafe impl Sync for CudaPinnedHostStorage {}
+
+impl PinnedHostStorage for CudaPinnedHostStorage {
+    fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for CudaPinnedHostStorage {
+    fn drop(&mut self) {
+        let status = unsafe { cuMemFreeHost(self.ptr.as_ptr().cast()) };
+        if status != 0 {
+            tracing::warn!(
+                "cuMemFreeHost failed while dropping pinned host buffer: status {status}"
+            );
+        }
+    }
+}
 
 impl GpuBackend for AtlasCudaBackend {
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
@@ -89,86 +122,123 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {
-        let status = unsafe {
-            cuMemcpyHtoDAsync_v2(
-                dst.0,
-                src.as_ptr() as *const c_void,
-                src.len(),
-                self.default_stream,
-            )
-        };
-        if status != 0 {
-            bail!("cuMemcpyHtoDAsync_v2 failed: status {status}");
-        }
-        // Synchronize to ensure the copy completes before host buffer is freed.
+        // This API accepts any Rust slice, including ordinary pageable memory.
+        // CUDA's async host-copy APIs require page-locked storage; use the
+        // synchronous driver call for this intentionally blocking interface.
+        // Atlas uses a non-blocking CUDA stream, so drain it first to preserve
+        // the old method's ordering against earlier work on that stream.
         let sync = unsafe { cuStreamSynchronize(self.default_stream) };
         if sync != 0 {
             bail!(
-                "cuStreamSynchronize after H2D failed: {}",
+                "cuStreamSynchronize before H2D failed: {}",
                 cuda_error_text(sync)
             );
+        }
+        let status = unsafe { cuMemcpyHtoD_v2(dst.0, src.as_ptr() as *const c_void, src.len()) };
+        if status != 0 {
+            bail!("cuMemcpyHtoD_v2 failed: status {status}");
         }
         Ok(())
     }
 
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
-        let status = unsafe {
-            cuMemcpyDtoHAsync_v2(
-                dst.as_mut_ptr() as *mut c_void,
-                src.0,
-                dst.len(),
-                self.default_stream,
-            )
-        };
-        if status != 0 {
-            bail!("cuMemcpyDtoHAsync_v2 failed: status {status}");
-        }
+        // `dst` is not required to be page-locked. The synchronous API is the
+        // CUDA-supported path for arbitrary pageable host buffers and returns
+        // only after the bytes are safe for the caller to read.
+        // Synchronize Atlas's non-blocking stream before the streamless driver
+        // copy so prior kernels cannot race the host read.
         let sync = unsafe { cuStreamSynchronize(self.default_stream) };
         if sync != 0 {
             bail!(
-                "cuStreamSynchronize after D2H failed: {}",
+                "cuStreamSynchronize before D2H failed: {}",
                 cuda_error_text(sync)
             );
+        }
+        let status = unsafe { cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len()) };
+        if status != 0 {
+            bail!("cuMemcpyDtoH_v2 failed: status {status}");
         }
         Ok(())
     }
 
     fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
-        // Enqueue the copy on the caller's stream so CUDA orders it after
-        // any prior kernel launches on the same stream. Without this, the
-        // copy may run on the default stream concurrently with kernels on
-        // `stream` and read torn bytes (HSS Turbo8 race, 2026-04-28).
-        let status = unsafe {
-            cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len(), stream)
-        };
-        if status != 0 {
-            bail!("cuMemcpyDtoHAsync_v2 (on_stream) failed: status {status}");
-        }
+        // This is a blocking API over an arbitrary host slice. Drain the
+        // producer stream for ordering, then use the pageable-safe synchronous
+        // copy. The coalesced pair API below uses the same safe ordering.
         let sync = unsafe { cuStreamSynchronize(stream) };
         if sync != 0 {
             bail!(
-                "cuStreamSynchronize after D2H on_stream failed: {}",
+                "cuStreamSynchronize before D2H on_stream failed: {}",
                 cuda_error_text(sync)
             );
+        }
+        let status = unsafe { cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len()) };
+        if status != 0 {
+            bail!("cuMemcpyDtoH_v2 (on_stream) failed: status {status}");
         }
         Ok(())
     }
 
-    fn copy_d2h_async_on_stream(
+    fn copy_d2h_pair_on_stream(
         &self,
-        src: DevicePtr,
-        dst: &mut [u8],
+        first_src: DevicePtr,
+        first_dst: &mut [u8],
+        second_src: DevicePtr,
+        second_dst: &mut [u8],
         stream: u64,
     ) -> Result<()> {
-        // Async-only D2H — caller is responsible for syncing the stream
-        // before reading `dst`. Used by HSS offload to coalesce multiple
-        // D2H copies (K + V per layer) under a single trailing sync,
-        // dropping per-call host syncs from 2/layer to 1/layer.
-        let status = unsafe {
-            cuMemcpyDtoHAsync_v2(dst.as_mut_ptr() as *mut c_void, src.0, dst.len(), stream)
+        // Both destinations may be ordinary pageable Vec storage. Drain the
+        // producer stream once, then use the synchronous driver entry point
+        // for each copy. This preserves the hot paths' two-copy/one-sync
+        // shape without passing pageable memory to cuMemcpyDtoHAsync_v2.
+        let sync = unsafe { cuStreamSynchronize(stream) };
+        if sync != 0 {
+            bail!(
+                "cuStreamSynchronize before D2H pair failed: {}",
+                cuda_error_text(sync)
+            );
+        }
+        let first_status = unsafe {
+            cuMemcpyDtoH_v2(
+                first_dst.as_mut_ptr() as *mut c_void,
+                first_src.0,
+                first_dst.len(),
+            )
         };
-        if status != 0 {
-            bail!("cuMemcpyDtoHAsync_v2 (async_on_stream) failed: status {status}");
+        if first_status != 0 {
+            bail!("first cuMemcpyDtoH_v2 in pair failed: status {first_status}");
+        }
+        let second_status = unsafe {
+            cuMemcpyDtoH_v2(
+                second_dst.as_mut_ptr() as *mut c_void,
+                second_src.0,
+                second_dst.len(),
+            )
+        };
+        if second_status != 0 {
+            bail!("second cuMemcpyDtoH_v2 in pair failed: status {second_status}");
+        }
+        Ok(())
+    }
+
+    fn copy_h2d_group_on_stream(&self, copies: &[HostToDeviceCopy<'_>], stream: u64) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        let sync = unsafe { cuStreamSynchronize(stream) };
+        if sync != 0 {
+            bail!(
+                "cuStreamSynchronize before H2D group failed: {}",
+                cuda_error_text(sync)
+            );
+        }
+        for (index, copy) in copies.iter().copied().enumerate() {
+            let src = copy.src();
+            let status =
+                unsafe { cuMemcpyHtoD_v2(copy.dst().0, src.as_ptr() as *const c_void, src.len()) };
+            if status != 0 {
+                bail!("cuMemcpyHtoD_v2 group member {index} failed: status {status}");
+            }
         }
         Ok(())
     }
@@ -224,18 +294,36 @@ impl GpuBackend for AtlasCudaBackend {
         self.default_stream
     }
 
+    fn sm_count(&self) -> Option<u32> {
+        super::AtlasCudaBackend::cached_sm_count()
+    }
+
+    #[track_caller]
     fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle> {
         // Ephemeral OnceLock — no cross-call caching, but kernel() is only
         // called at model init time. Layers store the returned KernelHandle.
         let cache: OnceLock<RawCudaFunc> = OnceLock::new();
         let registry = AtlasRegistry::get();
-        let raw = registry
-            .raw_function_cached(&cache, module, func_name)
-            .map_err(|e| anyhow::anyhow!("Kernel lookup {module}::{func_name}: {e}"))?;
+        let found = registry.raw_function_cached(&cache, module, func_name);
+        // Record BEFORE the `?`: a failed lookup is the only kind worth
+        // auditing, and `try_kernel` swallows the error.
+        crate::kernel_audit::record(
+            module,
+            func_name,
+            found.is_ok(),
+            std::panic::Location::caller(),
+        );
+        let raw = found.map_err(|e| anyhow::anyhow!("Kernel lookup {module}::{func_name}: {e}"))?;
         Ok(KernelHandle(raw.0 as u64))
     }
 
-    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
+    unsafe fn copy_h2d_pinned_async(
+        &self,
+        src: PinnedHostSlice<'_>,
+        dst: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let src = src.as_bytes();
         let status = unsafe {
             cuMemcpyHtoDAsync_v2(dst.0, src.as_ptr() as *const c_void, src.len(), stream)
         };
@@ -405,22 +493,19 @@ impl GpuBackend for AtlasCudaBackend {
         Ok(())
     }
 
-    fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
+    fn alloc_host_pinned(&self, bytes: usize) -> Result<PinnedHostBuffer> {
+        if bytes == 0 {
+            bail!("pinned host allocation must be non-empty");
+        }
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let status = unsafe { cuMemAllocHost_v2(&mut ptr, bytes) };
         if status != 0 {
             bail!("cuMemAllocHost_v2 failed: status {status}, requested {bytes} bytes");
         }
-        Ok(ptr as *mut u8)
-    }
-
-    fn free_host_pinned(&self, ptr: *mut u8, _bytes: usize) -> Result<()> {
-        if !ptr.is_null() {
-            let status = unsafe { cuMemFreeHost(ptr as *mut c_void) };
-            if status != 0 {
-                bail!("cuMemFreeHost failed: status {status}");
-            }
-        }
-        Ok(())
+        let ptr = NonNull::new(ptr.cast::<u8>())
+            .ok_or_else(|| anyhow::anyhow!("cuMemAllocHost_v2 returned null"))?;
+        Ok(PinnedHostBuffer::from_storage(Box::new(
+            CudaPinnedHostStorage { ptr, bytes },
+        )))
     }
 }

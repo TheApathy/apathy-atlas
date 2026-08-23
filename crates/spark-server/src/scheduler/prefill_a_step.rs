@@ -98,6 +98,16 @@ pub fn start_chunked_prefill(
     let chunk_len = total.min(max_prefill_tokens);
     let is_last = chunk_len >= total;
 
+    let pstep_on = std::env::var("ATLAS_PREFILL_PHASE_PROFILE").ok().as_deref() == Some("1");
+    let mut pstep_ms: Vec<(&str, f64)> = Vec::new();
+    macro_rules! pstep_mark {
+        ($name:expr) => {
+            if pstep_on {
+                pstep_ms.push(($name, request_start.elapsed().as_secs_f64() * 1000.0));
+            }
+        };
+    }
+
     tracing::info!(
         "Chunked prefill start: {} prompt tokens, chunk_size={}, max_tokens={max_tokens}",
         total,
@@ -117,6 +127,7 @@ pub fn start_chunked_prefill(
         }
     };
     seq.session_hash = req_session_hash;
+    pstep_mark!("alloc_sequence");
 
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
@@ -135,15 +146,18 @@ pub fn start_chunked_prefill(
         model.ep_broadcast_cmd(0)?; // chunk_start
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
         model.ep_broadcast_tokens(&prompt_tokens)?;
+        pstep_mark!("ep_broadcast");
 
-        model.prefill_chunk(
+        let r = model.prefill_chunk(
             &prompt_tokens,
             &mut seq,
             0,
             chunk_len,
             is_last,
             prefill_stream,
-        )
+        );
+        pstep_mark!("prefill_chunk");
+        r
     })();
 
     let logits = match prefill_result {
@@ -172,6 +186,17 @@ pub fn start_chunked_prefill(
     }
     if let Err(e) = model.stream_wait_event(model.default_stream(), prefill_event) {
         tracing::error!("prefill_a_step: stream_wait_event(default_stream, prefill_event): {e:#}");
+    }
+    pstep_mark!("event_wait");
+
+    if pstep_on {
+        let mut joined: Vec<String> = Vec::with_capacity(pstep_ms.len());
+        let mut prev = 0.0f64;
+        for (name, t) in &pstep_ms {
+            joined.push(format!("{name}={:.1}", t - prev));
+            prev = *t;
+        }
+        tracing::info!("PREFILL_STEPS | {}", joined.join(" "));
     }
 
     if is_last {
@@ -218,6 +243,7 @@ pub fn start_chunked_prefill(
                 session_hash: req_session_hash,
                 last_token: first,
                 output_tokens: vec![first],
+                max_output_tokens: max_tokens,
                 remaining: 0,
                 min_tokens: req_min_tokens,
                 eos_tokens: eos_tokens.to_vec(),
@@ -240,6 +266,9 @@ pub fn start_chunked_prefill(
                 dry_sequence_breakers: Vec::new(),
                 logit_bias: logit_bias.clone(),
                 pending_drafts: Vec::new(),
+                draft_origin: DraftOrigin::default(),
+                last_verify_accepted: 0,
+                self_context: Default::default(),
                 pending_tree_payload: None,
                 inside_thinking: req_enable_thinking && think_end_token.is_some(),
                 enable_thinking: req_enable_thinking,
@@ -292,6 +321,7 @@ pub fn start_chunked_prefill(
                 } else {
                     vec![first]
                 },
+                max_output_tokens: max_tokens,
                 remaining: max_tokens - 1,
                 min_tokens: req_min_tokens,
                 eos_tokens: eos_tokens.to_vec(),
@@ -314,6 +344,9 @@ pub fn start_chunked_prefill(
                 dry_sequence_breakers: Vec::new(),
                 logit_bias: logit_bias.clone(),
                 pending_drafts: Vec::new(),
+                draft_origin: DraftOrigin::default(),
+                last_verify_accepted: 0,
+                self_context: Default::default(),
                 pending_tree_payload: None,
                 inside_thinking: spontaneous_think
                     || (req_enable_thinking && think_end_token.is_some()),

@@ -10,8 +10,9 @@ use super::*;
 /// 1. **Type coercion**: Converts string values to the schema-expected type
 ///    (number, boolean, integer, object, array). Prevents "expected number,
 ///    received string" errors from clients like OpenCode.
-/// 2. **Backfill**: Adds empty strings for missing required string parameters.
-///    Prevents cascading error loops from missing params.
+/// 2. **Backfill**: fills a missing/empty required parameter only when a real
+///    value can be derived from model-authored arguments or the tool definition.
+///    It never invents a placeholder.
 ///
 /// Matches vLLM's qwen3coder_tool_parser behavior (schema-aware type conversion).
 ///
@@ -35,6 +36,58 @@ fn resolve_schema_type(schema: &serde_json::Value) -> Option<&str> {
         }
     }
     None
+}
+
+fn parse_agent_types(description: &str) -> Vec<String> {
+    description
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("- ")?;
+            let (name, _) = rest.split_once(':')?;
+            let name = name.trim();
+            (!name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn infer_default_subagent_type(description: Option<&str>) -> String {
+    let candidates = description.map(parse_agent_types).unwrap_or_default();
+    candidates
+        .iter()
+        .find(|candidate| candidate.to_ascii_lowercase().contains("general"))
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_else(|| "general".to_string())
+}
+
+/// Derive a real value for a required parameter, or return `None` when the
+/// server cannot know the model's intent. Paths, search strings, cities, and
+/// other payload-bearing values must remain absent rather than becoming `""`.
+fn derive_required_param(
+    key: &str,
+    func_name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    tool_def: &ToolDefinition,
+) -> Option<String> {
+    match key {
+        "description" => Some(match args.get("command").and_then(|value| value.as_str()) {
+            Some(command) if command.len() > 50 => {
+                let head: String = command.chars().take(47).collect();
+                format!("Run: {head}...")
+            }
+            Some(command) => format!("Run: {command}"),
+            None => format!("{func_name} operation"),
+        }),
+        "subagent_type" | "subagentType" => Some(infer_default_subagent_type(
+            tool_def.function.description.as_deref(),
+        )),
+        _ => None,
+    }
 }
 
 pub fn backfill_required_params(calls: &mut [ToolCall], tools: &[ToolDefinition]) {
@@ -120,53 +173,22 @@ pub fn backfill_required_params(calls: &mut [ToolCall], tools: &[ToolDefinition]
             }
         }
 
-        // 3. Backfill missing required string parameters.
-        for key in &required {
-            if !args.contains_key(*key) {
-                let is_string = properties
-                    .and_then(|p| p.get(*key))
-                    .and_then(|v| v.get("type"))
-                    .and_then(|t| t.as_str())
-                    .is_none_or(|t| t == "string"); // default to string if no schema
-                if is_string {
-                    args.insert(key.to_string(), serde_json::Value::String(String::new()));
-                    changed = true;
-                }
-            }
-        }
-
-        // 4. Auto-fill empty parameters with sensible defaults.
-        // The model often generates empty required fields. Instead of rejecting
-        // (which causes error loops), fill them with context-derived defaults.
+        // 3. Derive only values the server can determine honestly. An absent
+        // key makes the client's JSON-Schema `required` check fail loudly; a
+        // fabricated empty string is valid `type:string` and can execute the
+        // wrong call without any downstream layer knowing Atlas authored it.
         let func_name = call.function.name.clone();
         for key in &required {
-            if let Some(serde_json::Value::String(val)) = args.get(*key) {
-                if !val.trim().is_empty() {
-                    continue;
-                }
-                let auto_val = match *key {
-                    "description" => {
-                        if let Some(serde_json::Value::String(cmd)) = args.get("command") {
-                            if cmd.len() > 50 {
-                                format!("Run: {}...", &cmd[..47])
-                            } else {
-                                format!("Run: {cmd}")
-                            }
-                        } else {
-                            format!("{func_name} operation")
-                        }
-                    }
-                    "filePath" | "file_path" => {
-                        // Can't guess the path — leave empty so validation catches it
-                        continue;
-                    }
-                    "oldString" | "old_string" => {
-                        // Can't guess what to replace — leave empty
-                        continue;
-                    }
-                    _ => continue,
-                };
-                args.insert(key.to_string(), serde_json::Value::String(auto_val));
+            let model_supplied = match args.get(*key) {
+                Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+                Some(_) => true,
+                None => false,
+            };
+            if model_supplied {
+                continue;
+            }
+            if let Some(derived) = derive_required_param(key, &func_name, &args, tool_def) {
+                args.insert(key.to_string(), serde_json::Value::String(derived));
                 changed = true;
             }
         }
@@ -269,6 +291,25 @@ pub fn normalize_paths(calls: &mut [ToolCall], cwd: &str) {
 
 // ── Tool call validation ──
 
+const FILE_TOOLS: &[&str] = &["Write", "write", "Edit", "edit", "Read", "read"];
+const PATH_KEYS: &[&str] = &["file_path", "filePath", "path"];
+const WRITE_FAMILY: &[&str] = &[
+    "Write",
+    "write",
+    "Edit",
+    "edit",
+    "MultiEdit",
+    "multiEdit",
+    "multi_edit",
+    "write_file",
+    "writeFile",
+];
+const SHELL_FAMILY: &[&str] = &[
+    "bash", "Bash", "shell", "Shell", "exec", "Exec", "run", "Run", "execute", "Execute",
+    "terminal", "Terminal",
+];
+const CMD_KEYS: &[&str] = &["command", "cmd", "script", "code"];
+
 /// Result of validating a batch of tool calls against their schemas.
 pub struct ValidatedToolCalls {
     /// Tool calls that passed all validations.
@@ -279,13 +320,42 @@ pub struct ValidatedToolCalls {
     pub errors: Vec<String>,
 }
 
+/// Validation severity determines whether a parsed call can be attached to
+/// the response. Missing ordinary/read-only arguments remain attached so the
+/// client can return actionable schema feedback; unexecutable mutation/shell
+/// calls and structurally invalid calls are withheld.
+#[derive(Debug)]
+pub enum ToolCallIssue {
+    MissingParam(String),
+    EmptyRequired(String),
+    Hard(String),
+}
+
+impl ToolCallIssue {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::MissingParam(message) | Self::EmptyRequired(message) | Self::Hard(message) => {
+                message
+            }
+        }
+    }
+
+    pub fn into_message(self) -> String {
+        match self {
+            Self::MissingParam(message) | Self::EmptyRequired(message) | Self::Hard(message) => {
+                message
+            }
+        }
+    }
+}
+
 /// Validate tool calls against their schemas. Returns valid calls and
 /// error messages for invalid ones.
 ///
 /// Checks:
 /// 1. Tool name exists in definitions
 /// 2. Arguments are valid JSON
-/// 3. Required string params are non-empty
+/// 3. Required params are present, with family-specific attachment policy
 /// 4. file_path params don't look like directories (end with `/`)
 pub fn validate_tool_calls(
     mut calls: Vec<ToolCall>,
@@ -308,29 +378,36 @@ pub fn validate_tool_calls(
             );
             call.function.name = best;
         }
-        match validate_single_tool_call(call, tools) {
+        match assess_tool_call(call, tools) {
             Ok(()) => valid.push(call.clone()),
-            Err(msg) => errors.push(msg),
+            Err(ToolCallIssue::MissingParam(message)) => {
+                valid.push(call.clone());
+                errors.push(message);
+            }
+            Err(issue) => errors.push(issue.into_message()),
         }
     }
 
     ValidatedToolCalls { valid, errors }
 }
 
-/// Validate a single tool call. Returns `Ok(())` if valid,
-/// `Err(error_message)` with a clear, actionable error if invalid.
+/// Compatibility wrapper for callers that only need pass/fail.
 pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(), String> {
+    assess_tool_call(call, tools).map_err(ToolCallIssue::into_message)
+}
+
+pub fn assess_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> Result<(), ToolCallIssue> {
     let name = &call.function.name;
 
     // 1. Check tool name exists
     let tool_def = tools.iter().find(|t| t.function.name == *name);
     if tool_def.is_none() {
         let available: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
-        return Err(format!(
+        return Err(ToolCallIssue::Hard(format!(
             "Error: Unknown tool '{}'. Available tools: {}",
             name,
             available.join(", ")
-        ));
+        )));
     }
     let tool_def = tool_def.unwrap();
 
@@ -339,11 +416,10 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
         match serde_json::from_str(&call.function.arguments) {
             Ok(a) => a,
             Err(_) => {
-                return Err(format!(
-                    "Error: {} arguments must be valid JSON. Got: {}",
-                    name,
-                    &call.function.arguments[..call.function.arguments.len().min(100)]
-                ));
+                let preview: String = call.function.arguments.chars().take(100).collect();
+                return Err(ToolCallIssue::Hard(format!(
+                    "Error: {name} arguments must be valid JSON. Got: {preview}"
+                )));
             }
         };
 
@@ -357,19 +433,32 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
 
-        for key in &required {
-            if args.get(*key).is_none() {
-                return Err(format!(
-                    "Error: {} requires parameter '{}' but it was not provided.",
-                    name, key
-                ));
-            }
+        let missing: Vec<&str> = required
+            .iter()
+            .copied()
+            .filter(|key| args.get(*key).is_none())
+            .collect();
+        if !missing.is_empty() {
+            // Do not let JSON-Schema array ordering weaken the disposition.
+            // If a write has neither content nor path and `content` appears
+            // first, the missing path must still withhold the call; likewise
+            // for a shell schema that lists metadata before its command.
+            let unexecutable = missing.iter().find(|key| {
+                (WRITE_FAMILY.contains(&name.as_str()) && PATH_KEYS.contains(key))
+                    || (SHELL_FAMILY.contains(&name.as_str()) && CMD_KEYS.contains(key))
+            });
+            let key = unexecutable.copied().unwrap_or(missing[0]);
+            let message =
+                format!("Error: {name} requires parameter '{key}' but it was not provided.");
+            return Err(if unexecutable.is_some() {
+                ToolCallIssue::EmptyRequired(message)
+            } else {
+                ToolCallIssue::MissingParam(message)
+            });
         }
     }
 
     // 4. Path-specific validation for file tools
-    const FILE_TOOLS: &[&str] = &["Write", "write", "Edit", "edit", "Read", "read"];
-    const PATH_KEYS: &[&str] = &["file_path", "filePath", "path"];
     // F78 (2026-04-30): file MUTATION tools must have a non-empty
     // path. Live opencode session
     // `ses_2215a95d6ffe6gAzHMBrcXqGXX` looped 11 turns because the
@@ -382,25 +471,27 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
     // chance to recover instead of opencode echoing EISDIR forever.
     // Read/Glob/LS keep the lenient behavior (Theia's
     // getWorkspaceFileList legitimately passes path="").
-    const WRITE_FAMILY: &[&str] = &[
-        "Write",
-        "write",
-        "Edit",
-        "edit",
-        "MultiEdit",
-        "multiEdit",
-        "multi_edit",
-    ];
     if WRITE_FAMILY.contains(&name.as_str()) {
         for key in PATH_KEYS {
             if let Some(serde_json::Value::String(path)) = args.get(*key)
                 && path.trim().is_empty()
             {
-                return Err(format!(
+                return Err(ToolCallIssue::EmptyRequired(format!(
                     "Error: {name} requires a non-empty '{key}'. \
                          Got empty string — provide an absolute path \
                          like '/tmp/calc-test75/Cargo.toml'."
-                ));
+                )));
+            }
+        }
+    }
+    if SHELL_FAMILY.contains(&name.as_str()) {
+        for key in CMD_KEYS {
+            if let Some(serde_json::Value::String(command)) = args.get(*key)
+                && command.trim().len() < 2
+            {
+                return Err(ToolCallIssue::EmptyRequired(format!(
+                    "Error: {name} requires a non-empty '{key}'. Provide the shell command to execute."
+                )));
             }
         }
     }
@@ -408,12 +499,12 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
         for key in PATH_KEYS {
             if let Some(serde_json::Value::String(path)) = args.get(*key) {
                 if path.ends_with('/') {
-                    return Err(format!(
+                    return Err(ToolCallIssue::Hard(format!(
                         "Error: {} file_path must be a FILE, not a directory. Got '{}'. Use e.g. '{}/index.ts'",
                         name,
                         path,
                         path.trim_end_matches('/')
-                    ));
+                    )));
                 }
                 // Check if it looks like just a directory name (no extension, no dots, no uppercase)
                 // Allow extensionless files like LICENSE, Makefile, Dockerfile, Cargo.lock etc.
@@ -424,10 +515,10 @@ pub fn validate_single_tool_call(call: &ToolCall, tools: &[ToolDefinition]) -> R
                         .chars()
                         .all(|c| c.is_lowercase() || c == '-' || c == '_')
                 {
-                    return Err(format!(
+                    return Err(ToolCallIssue::Hard(format!(
                         "Error: {} file_path '{}' looks like a directory. Add a filename, e.g. '{}/index.ts'",
                         name, path, path
-                    ));
+                    )));
                 }
             }
         }

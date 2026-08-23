@@ -6,7 +6,6 @@
 //   1. graph-replay output is bit-identical to eager kernel chain output
 //   2. graph-replay throughput is ≥ 1.3× eager (per the plan)
 
-use std::ffi::c_void;
 use std::time::Instant;
 
 use half::bf16;
@@ -17,7 +16,7 @@ use rand_distr::StandardNormal;
 
 use spark_storage::cuda_graph::CapturedStep;
 use spark_storage::cuda_min::{
-    CudaCtx, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+    CudaCtx, DeviceBuffer, HostToDeviceCopy, copy_d_to_h, copy_h_to_d_group, stream_sync,
 };
 use spark_storage::predictor::{Predictor, PredictorDims};
 use spark_storage::tiled_attention::{TiledAttention, TiledAttentionDims};
@@ -100,38 +99,14 @@ fn build(ctx: &CudaCtx, seed: u64) -> Bundle {
     let scores = DeviceBuffer::new(NUM_BLOCKS * 4).unwrap();
     let output = DeviceBuffer::new(NUM_SEQS * NUM_Q_HEADS * HEAD_DIM * 2).unwrap();
 
-    copy_h_to_d_async(
-        q.ptr,
-        q_host.as_ptr() as *const c_void,
-        q_host.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        k.ptr,
-        k_host.as_ptr() as *const c_void,
-        k_host.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        v.ptr,
-        v_host.as_ptr() as *const c_void,
-        v_host.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        block_table.ptr,
-        block_table_host.as_ptr() as *const c_void,
-        block_table_host.len() * 4,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        counts.ptr,
-        counts_host.as_ptr() as *const c_void,
-        counts_host.len() * 4,
+    copy_h_to_d_group(
+        &[
+            HostToDeviceCopy::new(q.ptr, &q_host),
+            HostToDeviceCopy::new(k.ptr, &k_host),
+            HostToDeviceCopy::new(v.ptr, &v_host),
+            HostToDeviceCopy::new(block_table.ptr, &block_table_host),
+            HostToDeviceCopy::new(counts.ptr, &counts_host),
+        ],
         ctx.stream,
     )
     .unwrap();
@@ -193,14 +168,7 @@ fn issue_decode_body(ctx: &CudaCtx, b: &Bundle) -> anyhow::Result<()> {
 
 fn read_output(ctx: &CudaCtx, b: &Bundle) -> Vec<bf16> {
     let mut out = vec![bf16::from_f32(0.0); b.n_out];
-    copy_d_to_h_async(
-        out.as_mut_ptr() as *mut c_void,
-        b.output.ptr,
-        out.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut out, b.output.ptr, ctx.stream).unwrap();
     out
 }
 

@@ -35,6 +35,13 @@ pub fn step_verify_k2_batched_csk(
         return;
     }
 
+    if proposal_lifecycle::flat_batch_preflight_at(active, batched_idxs)
+        != proposal_lifecycle::FlatBatchPreflight::Ready
+    {
+        tracing::error!("CSK-K2 received a tree-bearing proposal; refusing flat batch");
+        return;
+    }
+
     if let Err(e) = model.sync_secondary() {
         tracing::error!("CSK-K2 sync_secondary: {e:#}");
         for &idx in batched_idxs {
@@ -50,9 +57,12 @@ pub fn step_verify_k2_batched_csk(
     let mut per_seq_drafts: Vec<u32> = Vec::with_capacity(c);
     let mut original_seq_lens: Vec<usize> = Vec::with_capacity(c);
 
-    for &idx in batched_idxs {
+    let Some(batch_drafts) = proposal_lifecycle::take_flat_batch_at(active, batched_idxs) else {
+        tracing::error!("CSK-K2 flat batch changed after preflight; refusing batch");
+        return;
+    };
+    for (&idx, drafts) in batched_idxs.iter().zip(batch_drafts) {
         let a = &mut active[idx];
-        let drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
         debug_assert_eq!(drafts.len(), 1, "CSK-K2 eligibility guarantees 1 draft");
         tokens_per_seq.push([a.last_token, drafts[0]]);
         per_seq_drafts.push(drafts[0]);
@@ -165,15 +175,13 @@ pub fn step_verify_k2_batched_csk(
                 tracing::error!("CSK-K2 trim_proposer_state: {e:#}");
             }
             let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
+            match proposal_lifecycle::propose_and_install(
+                model,
+                a,
                 v1,
-                a.seq.seq_len,
                 num_drafts,
-                &mut a.seq,
-                0,
                 _mtp_grammar_mask.as_deref(),
             ) {
-                Ok(d) if !d.is_empty() => a.pending_drafts = d,
                 Ok(_) => {}
                 Err(e) => tracing::error!("CSK-K2 run_mtp_propose_multi: {e:#}"),
             }
@@ -197,15 +205,13 @@ pub fn step_verify_k2_batched_csk(
                 continue;
             }
             let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
+            match proposal_lifecycle::propose_and_install(
+                model,
+                a,
                 v0,
-                a.seq.seq_len,
                 num_drafts,
-                &mut a.seq,
-                0,
                 _mtp_grammar_mask.as_deref(),
             ) {
-                Ok(d) if !d.is_empty() => a.pending_drafts = d,
                 Ok(_) => {}
                 Err(e) => tracing::error!("CSK-K2 run_mtp_propose_multi: {e:#}"),
             }

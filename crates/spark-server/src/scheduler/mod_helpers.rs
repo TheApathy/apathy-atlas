@@ -130,21 +130,36 @@ pub(super) fn drain_pending_requests(
 /// slots [0..N)).
 ///
 /// CRITICAL: compact_sequence MUST run BEFORE finish_sequence (BUG #35).
-pub(super) fn retire_finished_sequences(model: &dyn Model, active: &mut Vec<ActiveSeq>) {
+pub(super) fn retire_finished_sequences(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    cache_on_finish: &mut Vec<bool>,
+) {
+    assert_eq!(active.len(), cache_on_finish.len());
     let mut i = 0;
     while i < active.len() {
         if active[i].finished {
             let mut a = active.swap_remove(i);
+            let cache_sequence = cache_on_finish.swap_remove(i);
             if i < active.len() && active[i].seq.slot_idx != i {
                 // Compact the swapped-in sequence to reuse the retired
                 // seq's slot. Mark the retired seq's slot as reused so
                 // free_sequence doesn't double-release it.
-                if let Err(e) = model.compact_sequence(&mut active[i].seq, i) {
-                    tracing::error!("compact_sequence: {e:#}");
+                match model.compact_sequence(&mut active[i].seq, i) {
+                    Ok(()) => {
+                        a.seq.slot_idx = usize::MAX; // sentinel: slot reused by compact
+                    }
+                    Err(e) => {
+                        tracing::error!("compact_sequence: {e:#}");
+                        // Q38-BUG-001: the destination slot `i` was NOT
+                        // repopulated. Leave `a.seq.slot_idx` at `i` so
+                        // finish_sequence releases the retired sequence's
+                        // own slot. Setting the sentinel here would leak
+                        // slot `i` (free_sequence skips usize::MAX).
+                    }
                 }
-                a.seq.slot_idx = usize::MAX; // sentinel: slot reused by compact
             }
-            finish_sequence(model, &mut a);
+            finish_sequence_with_cache(model, &mut a, cache_sequence);
         } else {
             i += 1;
         }

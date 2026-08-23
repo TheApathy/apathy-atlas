@@ -18,7 +18,6 @@
 //       --dir /tmp/atlas-hsw-bench --context-blocks 256 --scratch-blocks 32 \
 //       --steps 64
 
-use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -30,7 +29,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 
 use spark_storage::cuda_min::{
-    CudaCtx, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+    CudaCtx, DeviceBuffer, HostToDeviceCopy, copy_h_to_d, copy_h_to_d_group, stream_sync,
 };
 use spark_storage::tiled_attention::{TiledAttention, TiledAttentionDims};
 use spark_storage::{HighSpeedSwap, HighSpeedSwapConfig, ModelDims};
@@ -142,13 +141,7 @@ fn main() -> Result<()> {
     let t_offload = Instant::now();
     for blk in 0..args.context_blocks {
         let off = blk as usize * block_floats;
-        copy_h_to_d_async(
-            k_block_dev.ptr,
-            k[off..off + block_floats].as_ptr() as *const c_void,
-            block_bytes,
-            ctx.stream,
-        )?;
-        stream_sync(ctx.stream)?;
+        copy_h_to_d(k_block_dev.ptr, &k[off..off + block_floats], ctx.stream)?;
         hss.offload_block(
             &ctx,
             0,
@@ -170,13 +163,7 @@ fn main() -> Result<()> {
 
     let q_dev = DeviceBuffer::new(q.len() * 2)?;
     let out_dev = DeviceBuffer::new(NUM_Q_HEADS as usize * HEAD_DIM as usize * 2)?;
-    copy_h_to_d_async(
-        q_dev.ptr,
-        q.as_ptr() as *const c_void,
-        q.len() * 2,
-        ctx.stream,
-    )?;
-    stream_sync(ctx.stream)?;
+    copy_h_to_d(q_dev.ptr, &q, ctx.stream)?;
     let seq: Vec<u32> = (0..args.context_blocks).collect();
 
     // Warmup.
@@ -242,34 +229,14 @@ fn run_in_hbm(
     let counts_dev = DeviceBuffer::new(4)?;
     let counts = [blocks as i32];
     let out_dev = DeviceBuffer::new(NUM_Q_HEADS as usize * HEAD_DIM as usize * 2)?;
-    copy_h_to_d_async(
-        q_dev.ptr,
-        q.as_ptr() as *const c_void,
-        q.len() * 2,
-        ctx.stream,
-    )?;
-    copy_h_to_d_async(
-        k_dev.ptr,
-        k.as_ptr() as *const c_void,
-        k.len() * 2,
-        ctx.stream,
-    )?;
-    copy_h_to_d_async(
-        v_dev.ptr,
-        v.as_ptr() as *const c_void,
-        v.len() * 2,
-        ctx.stream,
-    )?;
-    copy_h_to_d_async(
-        bt_dev.ptr,
-        bt.as_ptr() as *const c_void,
-        bt.len() * 4,
-        ctx.stream,
-    )?;
-    copy_h_to_d_async(
-        counts_dev.ptr,
-        counts.as_ptr() as *const c_void,
-        4,
+    copy_h_to_d_group(
+        &[
+            HostToDeviceCopy::new(q_dev.ptr, q),
+            HostToDeviceCopy::new(k_dev.ptr, k),
+            HostToDeviceCopy::new(v_dev.ptr, v),
+            HostToDeviceCopy::new(bt_dev.ptr, &bt),
+            HostToDeviceCopy::new(counts_dev.ptr, &counts),
+        ],
         ctx.stream,
     )?;
     let (s_blk, s_tok, s_kvh) = attn.paged_strides();
@@ -313,13 +280,5 @@ fn run_in_hbm(
     stream_sync(ctx.stream)?;
     let dt = t.elapsed().as_secs_f64();
     let _ = (q_dev, k_dev, v_dev, bt_dev, counts_dev, out_dev);
-    let mut _swallow = vec![0_u8; 1];
-    copy_d_to_h_async(
-        _swallow.as_mut_ptr() as *mut c_void,
-        ctx.stream,
-        0,
-        ctx.stream,
-    )
-    .ok();
     Ok(dt * 1e6 / steps as f64)
 }

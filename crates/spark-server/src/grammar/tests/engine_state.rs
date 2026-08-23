@@ -114,6 +114,34 @@ fn test_grammar_state_rollback() {
 }
 
 #[test]
+fn test_terminated_tokens_do_not_inflate_rollback_history() {
+    let vocab = test_vocab();
+    let stop_ids = vec![130i32];
+    let mut engine = GrammarEngine::new(&vocab, &stop_ids).unwrap();
+
+    let compiled = engine.compile_json_grammar().unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+
+    assert!(state.accept_token(b'{' as u32));
+    assert!(state.accept_token(b'}' as u32));
+    let history_before_stop = state.num_history_steps();
+    assert!(state.accept_token(130));
+    let history_after_stop = state.num_history_steps();
+    assert_eq!(history_after_stop, history_before_stop + 1);
+
+    // The wrapper intentionally treats tokens after termination as accepted,
+    // but the matcher does not advance and records no rollback entry.
+    assert!(state.accept_token(b'x' as u32));
+    assert!(state.accept_token(b'y' as u32));
+    assert_eq!(state.num_history_steps(), history_after_stop);
+
+    // A speculative validator must therefore roll back only the history delta.
+    state.rollback(history_after_stop - history_before_stop);
+    assert_eq!(state.num_history_steps(), history_before_stop);
+    assert!(!state.is_terminated());
+}
+
+#[test]
 fn test_apply_bitmask_to_logits() {
     let vocab = test_vocab();
     let stop_ids = vec![130i32];

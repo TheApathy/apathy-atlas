@@ -39,6 +39,10 @@ pub struct FastSafetensorsLoader {
     pub ep_world_size: usize,
     pub num_experts: usize,
     pub peak_memory_multiplier: Option<f64>,
+    /// Absolute bytes the *model builder* will retain on top of the weight
+    /// store, added to the pre-flight peak. See the field of the same name
+    /// on [`crate::weights::SafetensorsLoader`].
+    pub construction_overhead_bytes: usize,
     /// When true (default), attempt `O_DIRECT`; fall back to buffered reads if
     /// the filesystem rejects it (tmpfs, overlayfs, some FUSE backends).
     pub try_direct_io: bool,
@@ -72,6 +76,7 @@ impl FastSafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             peak_memory_multiplier: None,
+            construction_overhead_bytes: 0,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
         }
@@ -83,6 +88,7 @@ impl FastSafetensorsLoader {
             ep_world_size,
             num_experts,
             peak_memory_multiplier: None,
+            construction_overhead_bytes: 0,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
         }
@@ -130,14 +136,20 @@ impl WeightLoader for FastSafetensorsLoader {
             let mult = self
                 .peak_memory_multiplier
                 .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
-            let peak = (estimated as f64 * mult) as usize;
+            // The multiplier covers the store + its transient staging;
+            // buffers the model builder retains afterwards are
+            // architecture-dependent and come in as absolute bytes.
+            let construction = self.construction_overhead_bytes;
+            let peak = (estimated as f64 * mult) as usize + construction;
             let free = gpu.free_memory()?;
             let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
             tracing::info!(
-                "Fast-load pre-flight: {:.2} GB on-disk, {:.1}x overhead = {:.2} GB peak, \
+                "Fast-load pre-flight: {:.2} GB on-disk, {:.1}x overhead \
+                 + {:.2} GB model-construction = {:.2} GB peak, \
                  {:.2} GB free, {:.1} GB reserve (FP8: {})",
                 gib(estimated),
                 mult,
+                gib(construction),
                 gib(peak),
                 gib(free),
                 gib(oom_reserve_bytes),
@@ -145,9 +157,14 @@ impl WeightLoader for FastSafetensorsLoader {
             );
             if peak + oom_reserve_bytes > free {
                 bail!(
-                    "OOM pre-flight: peak {:.2} GB + {:.2} GB reserve exceeds {:.2} GB free. \
+                    "OOM pre-flight: peak {:.2} GB ({:.2} GB weights × {:.1}x \
+                     + {:.2} GB retained model-construction buffers) \
+                     + {:.2} GB reserve exceeds {:.2} GB free. \
                      Use a smaller quantization or add more GPUs for EP.",
                     gib(peak),
+                    gib(estimated),
+                    mult,
+                    gib(construction),
                     gib(oom_reserve_bytes),
                     gib(free),
                 );

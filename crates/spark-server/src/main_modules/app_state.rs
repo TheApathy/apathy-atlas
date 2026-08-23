@@ -77,6 +77,9 @@ pub struct AppState {
     /// thinking is forced OFF regardless of the request body or the
     /// model's MODEL.toml default. Wired from `--disable-thinking`.
     pub disable_thinking: bool,
+    /// Per-process kill switch for the API streaming SimHash semantic-loop
+    /// guard. Scheduler watchdog controls remain independent.
+    pub disable_simhash_watchdog: bool,
     /// Server-level default chat template kwargs applied when the client
     /// sends no thinking parameters. Overridden per-request by the request
     /// body. Wired from `--default-chat-template-kwargs`.

@@ -16,7 +16,6 @@
 // gates Phase 1; if it fails we bump r and re-run.
 
 use std::collections::HashSet;
-use std::ffi::c_void;
 
 use half::bf16;
 use rand::SeedableRng;
@@ -24,9 +23,7 @@ use rand::distributions::Distribution;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 
-use spark_storage::cuda_min::{
-    CudaCtx, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
-};
+use spark_storage::cuda_min::{CudaCtx, DeviceBuffer, copy_d_to_h, copy_h_to_d};
 use spark_storage::predictor::{Predictor, PredictorDims};
 
 const NUM_LAYERS: usize = 1;
@@ -116,26 +113,14 @@ fn recall_at_10_percent_meets_target() {
         let k_block_dev = DeviceBuffer::new(block_bytes).unwrap();
         for blk in 0..NUM_BLOCKS {
             let off = blk * block_floats;
-            copy_h_to_d_async(
-                k_block_dev.ptr,
-                k[off..off + block_floats].as_ptr() as *const c_void,
-                block_bytes,
-                ctx.stream,
-            )
-            .unwrap();
+            copy_h_to_d(k_block_dev.ptr, &k[off..off + block_floats], ctx.stream).unwrap();
             pred.project_kv_block(&ctx, 0, blk, k_block_dev.ptr)
                 .unwrap();
         }
         // Project Q.
         let q_dev = DeviceBuffer::new(q.len() * 2).unwrap();
         let q_proj_dev = DeviceBuffer::new(NUM_Q_HEADS * R * 2).unwrap();
-        copy_h_to_d_async(
-            q_dev.ptr,
-            q.as_ptr() as *const c_void,
-            q.len() * 2,
-            ctx.stream,
-        )
-        .unwrap();
+        copy_h_to_d(q_dev.ptr, &q, ctx.stream).unwrap();
         pred.project_q(&ctx, q_dev.ptr, q_proj_dev.ptr).unwrap();
 
         // Score every block (a_g_seq points at the contiguous layer slice).
@@ -149,14 +134,7 @@ fn recall_at_10_percent_meets_target() {
         )
         .unwrap();
         let mut scores = vec![0.0_f32; NUM_BLOCKS];
-        copy_d_to_h_async(
-            scores.as_mut_ptr() as *mut c_void,
-            scores_dev.ptr,
-            NUM_BLOCKS * 4,
-            ctx.stream,
-        )
-        .unwrap();
-        stream_sync(ctx.stream).unwrap();
+        copy_d_to_h(&mut scores, scores_dev.ptr, ctx.stream).unwrap();
 
         // Recall against the planted needle blocks: pick top-K predictor
         // blocks where K = number of needles, count overlap with the

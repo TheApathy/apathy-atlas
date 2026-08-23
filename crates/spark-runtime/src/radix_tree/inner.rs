@@ -192,8 +192,20 @@ impl RadixTreeInner {
 
     /// Decrement ref_count on all nodes along the matched path.
     pub(super) fn dec_refs(&mut self, tokens: &[u32], block_size: usize) {
+        self.dec_refs_matched(tokens, block_size, tokens.len());
+    }
+
+    /// Decrement only the full-block nodes acquired by a lookup of
+    /// `num_matched` tokens. Paired hybrid lookup uses this when a KV walk has
+    /// no SSM checkpoint and must be demoted to a miss before returning.
+    pub(super) fn dec_refs_matched(
+        &mut self,
+        tokens: &[u32],
+        block_size: usize,
+        num_matched: usize,
+    ) {
         let mut current = self.root;
-        let num_full_blocks = tokens.len() / block_size;
+        let num_full_blocks = num_matched / block_size;
 
         for i in 0..num_full_blocks {
             let chunk = &tokens[i * block_size..(i + 1) * block_size];

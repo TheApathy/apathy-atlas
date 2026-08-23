@@ -173,8 +173,10 @@ struct TunedPlan {
 unsafe impl Send for TunedPlan {}
 unsafe impl Sync for TunedPlan {}
 
-static PLANS: OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), &'static TunedPlan>>> =
-    OnceLock::new();
+type PlanShape = (u32, u32, u32);
+type PlanCache = std::collections::HashMap<PlanShape, &'static TunedPlan>;
+
+static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
 
 /// Build desc+layouts for `out[M,N]=act[M,K]@W[N,K]ᵀ` (same mapping as
 /// `bf16_gemm_act_weight_t`), autotune over the heuristic's top-16 algos on a
@@ -190,17 +192,45 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
     let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
-        chk(cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), "DescCreate")?;
+        chk(
+            cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+            "DescCreate",
+        )?;
         let ta = CUBLAS_OP_T;
         let tb = CUBLAS_OP_N;
-        chk(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSA, &ta as *const i32 as *const c_void, 4), "TRANSA")?;
-        chk(cublasLtMatmulDescSetAttribute(desc, DESC_TRANSB, &tb as *const i32 as *const c_void, 4), "TRANSB")?;
+        chk(
+            cublasLtMatmulDescSetAttribute(
+                desc,
+                DESC_TRANSA,
+                &ta as *const i32 as *const c_void,
+                4,
+            ),
+            "TRANSA",
+        )?;
+        chk(
+            cublasLtMatmulDescSetAttribute(
+                desc,
+                DESC_TRANSB,
+                &tb as *const i32 as *const c_void,
+                4,
+            ),
+            "TRANSB",
+        )?;
         let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
-        chk(cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64), "LayoutA")?;
-        chk(cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64), "LayoutB")?;
-        chk(cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64), "LayoutD")?;
+        chk(
+            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+            "LayoutA",
+        )?;
+        chk(
+            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+            "LayoutB",
+        )?;
+        chk(
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            "LayoutD",
+        )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
         chk(cublasLtMatmulPreferenceCreate(&mut pref), "PrefCreate")?;
         let ws_size = ctx.ws_size;
@@ -213,12 +243,26 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             ),
             "PrefWorkspace",
         )?;
-        let mut results = [HeurResult { algo: [0; 64], workspace_size: 0, state: 0, waves_count: 0.0, reserved: [0; 4] }; 16];
+        let mut results = [HeurResult {
+            algo: [0; 64],
+            workspace_size: 0,
+            state: 0,
+            waves_count: 0.0,
+            reserved: [0; 4],
+        }; 16];
         let mut returned: i32 = 0;
         chk(
             cublasLtMatmulAlgoGetHeuristic(
-                ctx.handle, desc, la, lb, ld_, ld_, pref, 16,
-                results.as_mut_ptr() as *mut c_void, &mut returned,
+                ctx.handle,
+                desc,
+                la,
+                lb,
+                ld_,
+                ld_,
+                pref,
+                16,
+                results.as_mut_ptr() as *mut c_void,
+                &mut returned,
             ),
             "AlgoGetHeuristic",
         )?;
@@ -230,9 +274,18 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         // Dummy operands (zeroed) + private stream: tune without touching the
         // caller's stream (which may be mid graph-capture).
         let (mut dw, mut da, mut dd): (u64, u64, u64) = (0, 0, 0);
-        chk(cuMemAlloc_v2(&mut dw, n as usize * k as usize * 2), "tuneAllocW")?;
-        chk(cuMemAlloc_v2(&mut da, m as usize * k as usize * 2), "tuneAllocA")?;
-        chk(cuMemAlloc_v2(&mut dd, m as usize * n as usize * 2), "tuneAllocD")?;
+        chk(
+            cuMemAlloc_v2(&mut dw, n as usize * k as usize * 2),
+            "tuneAllocW",
+        )?;
+        chk(
+            cuMemAlloc_v2(&mut da, m as usize * k as usize * 2),
+            "tuneAllocA",
+        )?;
+        chk(
+            cuMemAlloc_v2(&mut dd, m as usize * n as usize * 2),
+            "tuneAllocD",
+        )?;
         cuMemsetD8_v2(dw, 0, n as usize * k as usize * 2);
         cuMemsetD8_v2(da, 0, m as usize * k as usize * 2);
         let mut ts: u64 = 0;
@@ -251,15 +304,21 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             }
             let run = |st: u64| {
                 cublasLtMatmul(
-                    ctx.handle, desc,
+                    ctx.handle,
+                    desc,
                     &alpha as *const f32 as *const c_void,
-                    dw as *const c_void, la,
-                    da as *const c_void, lb,
+                    dw as *const c_void,
+                    la,
+                    da as *const c_void,
+                    lb,
                     &beta as *const f32 as *const c_void,
-                    dd as *const c_void, ld_,
-                    dd as *mut c_void, ld_,
+                    dd as *const c_void,
+                    ld_,
+                    dd as *mut c_void,
+                    ld_,
                     r.algo.as_ptr() as *const c_void,
-                    ctx.workspace as *mut c_void, ctx.ws_size,
+                    ctx.workspace as *mut c_void,
+                    ctx.ws_size,
                     st as *mut c_void,
                 )
             };

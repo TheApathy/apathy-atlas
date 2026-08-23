@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Phase-C: mid-step rollback + re-steer for decode-time watchdogs.
+//! Phase-C: mid-step rollback for decode-time watchdogs.
 //!
-//! Atlas's degeneration watchdogs (content-phase loop, fuzzy-repetition,
-//! inter-tool prose budget) historically *hard-stopped* a sequence —
-//! `finished = true` — which kills the response, often mid-tool-call.
-//!
-//! Per arXiv:2603.27905 (ATLAS-RTC) and ROM boundary-truncation
-//! (arXiv:2603.22016), the principled recovery is to **roll back to the
-//! last well-formed boundary and let generation re-steer**, rather than
-//! discarding the whole turn. [`rollback_to_boundary`] implements that.
+//! Blocking degeneration watchdogs may rewind a proven-flat token/KV history
+//! before stopping. Streaming watchdogs never call this module: they discard
+//! only the current uncommitted sample and keep server/client history equal.
 //!
 //! ## KV-cache rewind: what is and is not feasible mid-decode
 //!
@@ -57,7 +52,8 @@ use super::*;
 /// Outcome of a [`rollback_to_boundary`] attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollbackOutcome {
-    /// The sequence was rewound to a boundary; generation should continue.
+    /// The sequence was rewound to a boundary. The caller must choose an
+    /// explicit post-rewind disposition; streaming callers hard-stop.
     RolledBack {
         /// Number of trailing tokens dropped from `output_tokens`.
         dropped: usize,
@@ -84,6 +80,31 @@ pub enum RollbackFallback {
     /// every subsequent token — so the rollback is honestly declined and
     /// the caller hard-stops instead.
     NoSsmSnapshot,
+    /// The generated history crosses a thinking/tool/grammar phase boundary,
+    /// or its token-indexed sidecars are not exactly aligned. Rewinding that
+    /// history would require restoring more state than this rollback owns.
+    UnsafeObservableHistory,
+}
+
+/// Whether the sole pre-commit caller can rewind this generated history
+/// without crossing a thinking/tool/grammar phase or misaligning logprobs.
+pub(super) fn precommit_rollback_history_is_safe(a: &ActiveSeq) -> bool {
+    let phase_is_flat = a.grammar_state.is_none()
+        && !a.inside_thinking
+        && !a.think_ended
+        && a.thinking_tokens == 0
+        && !a.tool_call_opened
+        && !a.inside_tool_body
+        && !a.require_tool_call
+        && !a.suppress_tool_call
+        && a.content_tokens as usize == a.output_tokens.len().saturating_add(1);
+    let logprobs_are_aligned = a.logprobs_data.is_empty()
+        || (a.logprobs_data.len() == a.output_tokens.len()
+            && a.logprobs_data
+                .iter()
+                .zip(&a.output_tokens)
+                .all(|(lp, &tok)| lp.token_id == tok));
+    phase_is_flat && logprobs_are_aligned
 }
 
 /// Find the index (into `output_tokens`) of the last well-formed
@@ -147,8 +168,7 @@ pub fn find_last_boundary_with_snapshot(
     None
 }
 
-/// Roll an [`ActiveSeq`] back to the last well-formed boundary and
-/// re-steer, instead of hard-stopping.
+/// Roll an [`ActiveSeq`] back to the last well-formed boundary.
 ///
 /// Steps:
 /// 1. Honor the `[behavior].rollback_resteer` flag and the per-sequence
@@ -167,13 +187,8 @@ pub fn find_last_boundary_with_snapshot(
 ///    instantly re-fire).
 /// 6. Bump `rollback_count`.
 ///
-/// The "re-steer cue" is the rollback itself: with the degenerate tail
-/// removed, the model resumes from a clean boundary and — because the
-/// repeated suffix is gone and the sampler state advances — naturally
-/// picks a different continuation. No synthetic context tokens are
-/// injected (that would require a tokenizer-specific cue string and
-/// risk corrupting tool-call structure); the boundary truncation is the
-/// minimal, structure-safe steering signal.
+/// No synthetic context tokens are injected. The blocking caller terminates
+/// after a successful rewind; streaming callers do not enter this function.
 ///
 /// `min_keep` is the minimum number of trailing tokens the rollback
 /// must discard — it must be large enough to escape the detected
@@ -196,6 +211,9 @@ pub fn rollback_to_boundary(
     min_keep: usize,
     model: &dyn Model,
 ) -> RollbackOutcome {
+    if !precommit_rollback_history_is_safe(a) {
+        return RollbackOutcome::Fallback(RollbackFallback::UnsafeObservableHistory);
+    }
     if !watchdog_params().rollback_resteer {
         return RollbackOutcome::Fallback(RollbackFallback::Disabled);
     }
@@ -356,15 +374,10 @@ pub fn rewind_buffers(
 
 /// Apply the truncation + KV/position rewind + watchdog-state reset to a
 /// live [`ActiveSeq`]. Delegates the buffer rewind to [`rewind_buffers`].
-fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize) {
+pub(super) fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize) {
     // 1+2. Truncate the generated-token buffer and rewind the
     //       attention-KV cursor (`seq.tokens` + `seq_len`).
-    a.seq.seq_len = rewind_buffers(
-        &mut a.output_tokens,
-        &mut a.seq.tokens,
-        a.seq.seq_len,
-        keep_len,
-    );
+    rewind_observable_buffers(a, keep_len);
 
     // 3. Restore the generation budget that the dropped tokens consumed
     //    (only content tokens decrement `remaining`; thinking is free,
@@ -392,6 +405,20 @@ fn apply_rollback(a: &mut ActiveSeq, keep_len: usize, dropped: usize) {
     //    not immediately re-trigger before fresh tokens arrive.
     a.prose_tokens_since_last_tool = 0;
     a.consecutive_confident = 0;
+}
+
+/// Rewind generated tokens, the sequence cursor, and blocking-response metadata
+/// as one observable-history operation. Returns the number of removed tokens.
+pub(super) fn rewind_observable_buffers(a: &mut ActiveSeq, keep_len: usize) -> usize {
+    let dropped = a.output_tokens.len().saturating_sub(keep_len);
+    a.seq.seq_len = rewind_buffers(
+        &mut a.output_tokens,
+        &mut a.seq.tokens,
+        a.seq.seq_len,
+        keep_len,
+    );
+    a.logprobs_data.truncate(a.output_tokens.len());
+    dropped
 }
 
 // ── Phase-C ROM (arXiv:2603.22016) scaffold — OPTIONAL hook ──────────

@@ -68,6 +68,9 @@ pub mod reasoning_parser;
 mod refusal;
 mod request_dumper;
 mod response_store;
+// REST retrieval draft store: conditional pre-emption of the DFlash
+// proposal in `scheduler::mtp_step`. Inert unless ATLAS_REST_STORE is set.
+mod rest_store;
 mod retrieval_heads;
 mod scheduler;
 mod scheduling_policy;

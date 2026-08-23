@@ -18,11 +18,7 @@ pub(crate) fn resolve_prefill_budget(
     args: &cli::ServeArgs,
     ssm_prefill_chunk: usize,
 ) -> PrefillBudget {
-    let spec_tokens = if args.speculative || args.self_speculative || args.ngram_speculative {
-        args.num_drafts + 2
-    } else {
-        1
-    };
+    let spec_tokens = super::speculative_draft_count(args).map_or(1, |drafts| drafts + 2);
     let user_set_prefill = args.max_prefill_tokens != 8192;
     let prefill_budget_pre_hss = if user_set_prefill && args.max_prefill_tokens > 0 {
         args.max_prefill_tokens

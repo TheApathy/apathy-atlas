@@ -17,7 +17,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::cuda_min::{CudaCtx, DeviceBuffer, PinnedBuffer, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{CudaCtx, DeviceBuffer, PinnedBuffer, copy_h_to_d_pinned};
 
 pub const SEQ_IO_BYTES: usize = 4 * 1024 * 1024;
 pub const RAND_IO_BYTES: usize = 64 * 1024;
@@ -110,7 +110,7 @@ pub fn bench_io_uring(
     ctx: &CudaCtx,
     fd: RawFd,
     file_bytes: u64,
-    pinned: &PinnedBuffer,
+    pinned: &mut PinnedBuffer,
     dev: &DeviceBuffer,
     io_bytes: usize,
     iters: usize,
@@ -123,7 +123,7 @@ pub fn bench_io_uring(
         .context("io_uring setup_sqpoll")?;
     let t = Instant::now();
     let chunk = io_bytes;
-    let host_ptr = pinned.ptr as *mut u8;
+    let host_ptr = pinned.as_mut_ptr().cast::<u8>();
     for i in 0..iters {
         let off = if sequential {
             ((i % SEQ_ITERS) * chunk) as u64
@@ -151,9 +151,8 @@ pub fn bench_io_uring(
             );
         }
         drop(cq);
-        copy_h_to_d_async(dev.ptr, host_ptr as *const c_void, chunk, ctx.stream)?;
+        copy_h_to_d_pinned(dev.ptr, pinned.pinned_slice(chunk)?, ctx.stream)?;
     }
-    stream_sync(ctx.stream)?;
     let dt = t.elapsed().as_secs_f64();
     let bytes = (io_bytes * iters) as f64;
     Ok(BenchResult {
@@ -168,13 +167,13 @@ pub fn bench_posix(
     ctx: &CudaCtx,
     fd: RawFd,
     file_bytes: u64,
-    pinned: &PinnedBuffer,
+    pinned: &mut PinnedBuffer,
     dev: &DeviceBuffer,
     io_bytes: usize,
     iters: usize,
     sequential: bool,
 ) -> Result<BenchResult> {
-    let host_ptr = pinned.ptr as *mut u8;
+    let host_ptr = pinned.as_mut_ptr().cast::<u8>();
     let t = Instant::now();
     for i in 0..iters {
         let off = if sequential {
@@ -189,9 +188,8 @@ pub fn bench_posix(
                 std::io::Error::last_os_error()
             );
         }
-        copy_h_to_d_async(dev.ptr, host_ptr as *const c_void, io_bytes, ctx.stream)?;
+        copy_h_to_d_pinned(dev.ptr, pinned.pinned_slice(io_bytes)?, ctx.stream)?;
     }
-    stream_sync(ctx.stream)?;
     let dt = t.elapsed().as_secs_f64();
     let bytes = (io_bytes * iters) as f64;
     Ok(BenchResult {

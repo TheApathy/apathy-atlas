@@ -97,6 +97,25 @@ impl PrefixMatch {
     pub fn is_empty(&self) -> bool {
         self.matched_tokens == 0
     }
+
+    /// SSM checkpoint that can seed an exact hybrid reconstruction through
+    /// this KV match, or `None` when the match is attention-only.
+    ///
+    /// A shallower checkpoint is valid in this fork: prefill restores at that
+    /// point, replays recurrent state to `matched_tokens`, and preserves the
+    /// already-cached KV rows. A checkpoint deeper than the KV walk cannot be
+    /// restored against this prefix and fails closed.
+    pub fn paired_ssm_tokens(&self) -> Option<usize> {
+        let snapshot_tokens = self
+            .ssm_snapshot
+            .is_some()
+            .then_some(self.ssm_snapshot_tokens)?;
+        (self.matched_tokens > 0
+            && !self.matched_blocks.is_empty()
+            && snapshot_tokens > 0
+            && snapshot_tokens <= self.matched_tokens)
+            .then_some(snapshot_tokens)
+    }
 }
 
 /// Trait for prefix caching strategies.
@@ -123,6 +142,16 @@ pub trait PrefixCache: Send + Sync {
     /// while the sequence is active. `session_hash` is used for SSM
     /// snapshot isolation (0 = legacy/no session tracking).
     fn lookup(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch;
+
+    /// Hybrid/GDN lookup: return a hit only when the KV walk has an SSM
+    /// checkpoint that can seed recurrent replay. Implementations must release
+    /// any KV walk refs before returning an unpaired miss.
+    ///
+    /// Pure-attention callers keep using [`Self::lookup`]. No-op caches can use
+    /// this default because they never return a match.
+    fn lookup_paired(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        self.lookup(tokens, block_size, session_hash)
+    }
 
     /// Insert a completed prefill's blocks into the cache.
     ///
@@ -206,6 +235,13 @@ pub trait PrefixCache: Send + Sync {
     /// Called when a sequence finishes. Decrements ref_count on cache
     /// nodes matching the token prefix, making them eligible for eviction.
     fn release(&self, tokens: &[u32], block_size: usize);
+
+    /// Release only refs acquired for `matched_tokens`, not every cache node
+    /// that happens to exist under the longer request. Used when EP agreement
+    /// or paired classification shortens a lookup result.
+    fn release_matched(&self, tokens: &[u32], block_size: usize, matched_tokens: usize) {
+        self.release(&tokens[..matched_tokens.min(tokens.len())], block_size);
+    }
 
     /// Evict up to `num_blocks` cached blocks, returning their physical
     /// indices and parallel disk-block IDs (Phase 6.1.e).

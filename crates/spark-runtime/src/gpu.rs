@@ -8,6 +8,7 @@
 
 use anyhow::Result;
 use std::fmt;
+use std::ptr::NonNull;
 
 /// Opaque device pointer wrapping a CUDA CUdeviceptr (u64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,6 +55,143 @@ pub enum KernelArg<'a> {
     Bytes(&'a [u8]),
 }
 
+/// One pageable host-to-device transfer in a stream-ordered blocking group.
+#[derive(Debug, Clone, Copy)]
+pub struct HostToDeviceCopy<'a> {
+    src: &'a [u8],
+    dst: DevicePtr,
+}
+
+impl<'a> HostToDeviceCopy<'a> {
+    pub fn new(src: &'a [u8], dst: DevicePtr) -> Self {
+        Self { src, dst }
+    }
+
+    pub fn src(self) -> &'a [u8] {
+        self.src
+    }
+
+    pub fn dst(self) -> DevicePtr {
+        self.dst
+    }
+}
+
+pub(crate) trait PinnedHostStorage: Send + Sync {
+    fn ptr(&self) -> NonNull<u8>;
+    fn len(&self) -> usize;
+}
+
+/// Owning backend-issued page-locked host allocation.
+///
+/// The backend-specific storage object releases the allocation on drop, so
+/// partially constructed models cannot leak pinned memory on a later error.
+pub struct PinnedHostBuffer {
+    storage: Box<dyn PinnedHostStorage>,
+}
+
+impl PinnedHostBuffer {
+    pub(crate) fn from_storage(storage: Box<dyn PinnedHostStorage>) -> Self {
+        Self { storage }
+    }
+
+    fn heap(bytes: usize) -> Result<Self> {
+        struct HeapStorage {
+            ptr: NonNull<u8>,
+            layout: std::alloc::Layout,
+        }
+
+        unsafe impl Send for HeapStorage {}
+        unsafe impl Sync for HeapStorage {}
+
+        impl PinnedHostStorage for HeapStorage {
+            fn ptr(&self) -> NonNull<u8> {
+                self.ptr
+            }
+
+            fn len(&self) -> usize {
+                self.layout.size()
+            }
+        }
+
+        impl Drop for HeapStorage {
+            fn drop(&mut self) {
+                unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+            }
+        }
+
+        if bytes == 0 {
+            anyhow::bail!("pinned host allocation must be non-empty");
+        }
+        let layout = std::alloc::Layout::from_size_align(bytes, 64)
+            .map_err(|e| anyhow::anyhow!("invalid pinned host layout: {e}"))?;
+        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })
+            .ok_or_else(|| anyhow::anyhow!("pinned host allocation failed: {bytes} bytes"))?;
+        Ok(Self::from_storage(Box::new(HeapStorage { ptr, layout })))
+    }
+
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.storage.ptr().as_ptr()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.ptr().as_ptr()
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+    }
+
+    pub fn pinned_slice(&self, bytes: usize) -> Result<PinnedHostSlice<'_>> {
+        self.pinned_slice_range(0, bytes)
+    }
+
+    /// Borrow a bounded subrange while preserving this owner's page-locked
+    /// provenance. Disjoint ranges let callers keep multiple H2D transfers in
+    /// flight without rewriting bytes that an earlier transfer still reads.
+    pub fn pinned_slice_range(&self, offset: usize, bytes: usize) -> Result<PinnedHostSlice<'_>> {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("pinned host slice range overflow"))?;
+        if end > self.len() {
+            anyhow::bail!(
+                "pinned host slice exceeds allocation: {offset} + {bytes} > {}",
+                self.len()
+            );
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(self.as_ptr().add(offset), bytes) };
+        Ok(PinnedHostSlice { bytes })
+    }
+}
+
+/// Borrow of bytes whose page-locked provenance is guaranteed by
+/// [`PinnedHostBuffer`]. It cannot be constructed from an arbitrary slice.
+#[derive(Clone, Copy)]
+pub struct PinnedHostSlice<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> PinnedHostSlice<'a> {
+    pub fn len(self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub(crate) fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
 /// GPU backend trait — SBIO IORouter for all CUDA operations.
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
@@ -77,41 +215,50 @@ pub trait GpuBackend: Send + Sync {
 
     /// Synchronous device-to-host copy ordered after work on `stream`.
     ///
-    /// Unlike `copy_d2h` (which uses the default stream and only orders
-    /// against work already on the default stream), this method enqueues
-    /// the copy on `stream`. CUDA serializes the copy after any prior
-    /// kernel launches on `stream`, so the bytes read are guaranteed to
-    /// reflect post-kernel state.
+    /// The producer stream is drained before the blocking host copy, so the
+    /// returned bytes reflect all prior kernel launches on `stream`.
     ///
     /// Required when reading bytes that were just written by kernels on
     /// a non-default stream — e.g. `high_speed_swap_offload_new_blocks`
     /// reading WHT+quantize output bytes.
     fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
-        // Default impl for mocks: sync the caller's stream then fall
-        // back to copy_d2h. The CUDA backend overrides this for a
-        // single-stream copy + sync.
+        // Default impl for mocks: sync the caller's stream then fall back to
+        // the backend's blocking D2H implementation.
         self.synchronize(stream)?;
         self.copy_d2h(src, dst)
     }
 
-    /// Copy device to host on `stream` WITHOUT a trailing sync. The caller
-    /// MUST `synchronize(stream)` before reading `dst` on the host. Used
-    /// by hot-path code (e.g. `high_speed_swap_offload_new_blocks`) that
-    /// issues several D2H copies in a row and only needs one sync at the
-    /// end. The default (with-sync) variant pays a stream sync per call,
-    /// which on the HSS decode path adds 124 host-side syncs/token at
-    /// 62 attention layers — measurable as ~25ms/token of dead time on
-    /// the MiniMax-M2.7-NVFP4 EP=2 GB10 baseline.
-    fn copy_d2h_async_on_stream(
+    /// Copy two device buffers to arbitrary host slices with one producer-
+    /// stream synchronization.
+    ///
+    /// This is the safe coalescing boundary for pageable host storage: drain
+    /// `stream` exactly once, then perform both blocking D2H copies. It avoids
+    /// exposing CUDA async D2H to an unconstrained Rust slice while retaining
+    /// the hot paths' two-copy/one-sync shape.
+    fn copy_d2h_pair_on_stream(
         &self,
-        src: DevicePtr,
-        dst: &mut [u8],
+        first_src: DevicePtr,
+        first_dst: &mut [u8],
+        second_src: DevicePtr,
+        second_dst: &mut [u8],
         stream: u64,
     ) -> Result<()> {
-        // Default: just call the syncing version. Backends that can do
-        // a true async-only copy (CUDA via `cuMemcpyDtoHAsync_v2` with
-        // no following sync) override this.
-        self.copy_d2h_on_stream(src, dst, stream)
+        self.synchronize(stream)?;
+        self.copy_d2h(first_src, first_dst)?;
+        self.copy_d2h(second_src, second_dst)
+    }
+
+    /// Copy a group of arbitrary pageable host slices after draining their
+    /// producer stream exactly once.
+    fn copy_h2d_group_on_stream(&self, copies: &[HostToDeviceCopy<'_>], stream: u64) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.synchronize(stream)?;
+        for copy in copies {
+            self.copy_h2d(copy.src, copy.dst)?;
+        }
+        Ok(())
     }
 
     /// Copy device to device.
@@ -172,16 +319,29 @@ pub trait GpuBackend: Send + Sync {
     fn default_stream(&self) -> u64;
 
     /// Look up a kernel function by module and function name.
+    ///
+    /// `#[track_caller]` so implementations can hand the DISPATCH SITE to
+    /// [`crate::kernel_audit::record`]. It survives `dyn` dispatch (rustc emits
+    /// a location shim for the vtable entry), which matters because every
+    /// caller here holds a `&dyn GpuBackend`. Without it the audit would report
+    /// the one line inside the backend that every lookup in the tree passes
+    /// through, which is worth nothing.
+    #[track_caller]
     fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle>;
 
-    /// Async host-to-device copy (no stream synchronization).
+    /// Async host-to-device copy from backend-owned page-locked storage.
     ///
-    /// **Lifetime requirement**: the source buffer must remain valid until the
-    /// copy completes (i.e., until the next synchronization point on this
-    /// stream). All current callers use stack-local byte arrays or pinned
-    /// memory that outlives the stream sync, satisfying this requirement.
-    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64) -> Result<()> {
-        self.copy_h2d(src, dst)
+    /// # Safety
+    /// The owner must not mutate or drop the source until `stream` completes.
+    /// If graph capture records the copy, the allocation and address must stay
+    /// valid through every replay, and mutation must not overlap a replay.
+    unsafe fn copy_h2d_pinned_async(
+        &self,
+        src: PinnedHostSlice<'_>,
+        dst: DevicePtr,
+        _stream: u64,
+    ) -> Result<()> {
+        self.copy_h2d(src.as_bytes(), dst)
     }
 
     /// Async device-to-device copy (no stream synchronization).
@@ -244,6 +404,23 @@ pub trait GpuBackend: Send + Sync {
         Ok(()) // No-op for mock backend
     }
 
+    /// Streaming-multiprocessor count of the device, when the backend can
+    /// answer.
+    ///
+    /// Occupancy decisions — split-K slice counts above all — need to know how
+    /// many CTAs it takes to fill the machine. Before this existed, every such
+    /// site hardcoded a literal, and the literals disagreed with each other
+    /// (48 in `layers/mod.rs` and `qwen3_ssm/mod.rs`, 110 in
+    /// `dflash_head/draft_splitk.rs` and `ops/gemm_dense.rs`). Nothing in the
+    /// tree had ever asked the device.
+    ///
+    /// Returns `None` when the backend cannot answer (mock, Metal, or a failed
+    /// driver query). Callers MUST keep working in that case — fall back to
+    /// whatever literal they used before rather than refusing to launch.
+    fn sm_count(&self) -> Option<u32> {
+        None
+    }
+
     /// Create a CUDA event (for inter-stream synchronization).
     fn create_event(&self) -> Result<u64> {
         Ok(0)
@@ -264,34 +441,15 @@ pub trait GpuBackend: Send + Sync {
         Ok(())
     }
 
-    /// Allocate page-locked (pinned) host memory for efficient async H2D.
+    /// Allocate owning page-locked host memory for efficient async H2D.
     ///
     /// On DGX Spark (UMA/LPDDR5X), pinned memory enables true async DMA
     /// without internal CUDA staging overhead. Small metadata buffers
     /// should be packed into a single pinned region and copied in one call.
     ///
-    /// Returns a raw pointer to `bytes` of page-locked host memory.
-    /// Caller must call `free_host_pinned` to release.
-    fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
-        // Default: regular heap allocation (mock backend, no pinning)
-        let layout = std::alloc::Layout::from_size_align(bytes, 64)
-            .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            anyhow::bail!("host alloc failed: {bytes} bytes");
-        }
-        Ok(ptr)
-    }
-
-    /// Free page-locked host memory previously allocated by `alloc_host_pinned`.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    fn free_host_pinned(&self, ptr: *mut u8, bytes: usize) -> Result<()> {
-        if !ptr.is_null() {
-            let layout = std::alloc::Layout::from_size_align(bytes, 64)
-                .map_err(|e| anyhow::anyhow!("invalid layout: {e}"))?;
-            unsafe { std::alloc::dealloc(ptr, layout) };
-        }
-        Ok(())
+    /// The returned owner releases the backend allocation on drop.
+    fn alloc_host_pinned(&self, bytes: usize) -> Result<PinnedHostBuffer> {
+        PinnedHostBuffer::heap(bytes)
     }
 }
 
@@ -453,6 +611,7 @@ pub mod mock {
             0
         }
 
+        #[track_caller]
         fn kernel(&self, _module: &str, _func_name: &str) -> Result<KernelHandle> {
             Ok(KernelHandle(0xDEAD))
         }

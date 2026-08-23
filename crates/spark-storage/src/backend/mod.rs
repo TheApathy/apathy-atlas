@@ -26,11 +26,11 @@ pub struct ReadRequest {
 }
 
 pub trait StorageBackend: Send + Sync {
-    /// Synchronously fulfil all `requests`, returning when the corresponding
-    /// HBM destinations are populated and visible on `stream`. The backend
-    /// chooses how to schedule (blocking POSIX `pread`, batched `io_uring`,
-    /// etc.). At return, the `stream` has been synchronised so the caller
-    /// can issue subsequent kernels that depend on the data.
+    /// Fulfil all file reads and order their H2D copies before later work on
+    /// `stream`. A backend may return before those copies are host-visible;
+    /// callers may enqueue dependent kernels on the same stream without an
+    /// extra barrier, but must keep the backend and every destination
+    /// allocation alive until a later stream completion barrier.
     fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()>;
 
     /// One-shot sequential write — used at offload time to populate disk

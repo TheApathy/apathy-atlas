@@ -269,8 +269,12 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     let stream = reg.raw_stream();
 
     let w4a16_kernel = gpu::get_kernel(reg, &W4A16_M128_FN, "w4a16", "w4a16_gemm_t_m128");
-    let nvfp4_kernel =
-        gpu::get_kernel(reg, &NVFP4_GEMM_FN, "nvfp4_cutlass", "nvfp4_nvfp4_gemm_t_m64");
+    let nvfp4_kernel = gpu::get_kernel(
+        reg,
+        &NVFP4_GEMM_FN,
+        "nvfp4_cutlass",
+        "nvfp4_nvfp4_gemm_t_m64",
+    );
     let nvfp4_sk_kernel = gpu::get_kernel(
         reg,
         &NVFP4_GEMM_SK_FN,
@@ -284,8 +288,7 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
         "nvfp4_splitk_reduce",
     );
     let absmax_kernel = gpu::get_kernel(reg, &ABSMAX_FN, "quantize_nvfp4", "nvfp4_global_absmax");
-    let quant_kernel =
-        gpu::get_kernel(reg, &QUANT_FN, "quantize_nvfp4", "quantize_bf16_to_nvfp4");
+    let quant_kernel = gpu::get_kernel(reg, &QUANT_FN, "quantize_nvfp4", "quantize_bf16_to_nvfp4");
 
     let (mm, kk, nn) = bench_shape();
     // Bind to local aliases used in unsafe param pointers; CUDA kernels
@@ -334,8 +337,11 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
         // kernel sees during MMA).
         let mut b_dequant_bf16 = vec![0u16; n as usize * k as usize];
         for r in 0..n as usize {
-            let row_f =
-                dequant_nvfp4_row(&weight_packed_per_row[r], &weight_scale_per_row[r], scale2_w);
+            let row_f = dequant_nvfp4_row(
+                &weight_packed_per_row[r],
+                &weight_scale_per_row[r],
+                scale2_w,
+            );
             for kk_i in 0..k as usize {
                 b_dequant_bf16[r * k as usize + kk_i] = bf16_from_f32(row_f[kk_i]);
             }
@@ -372,8 +378,8 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     for r in 0..n as usize {
         let dst_p = &mut b_packed_hf[r * k as usize / 2..(r + 1) * k as usize / 2];
         dst_p.copy_from_slice(&weight_packed_per_row[r]);
-        let dst_s = &mut b_scale_hf[r * k as usize / GROUP_SIZE as usize
-            ..(r + 1) * k as usize / GROUP_SIZE as usize];
+        let dst_s = &mut b_scale_hf
+            [r * k as usize / GROUP_SIZE as usize..(r + 1) * k as usize / GROUP_SIZE as usize];
         dst_s.copy_from_slice(&weight_scale_per_row[r]);
     }
     // Path A (K-major transposed): B_packed_t[K/2][N], B_scale_t[K/16][N].
@@ -629,8 +635,7 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     if !skip_ref {
         let cos_a = cosine_sim(&f_a, &c_ref);
         let cos_b = cosine_sim(&f_b, &c_ref);
-        let ref_norm: f32 =
-            (c_ref.iter().map(|x| x * x).sum::<f32>() / c_ref.len() as f32).sqrt();
+        let ref_norm: f32 = (c_ref.iter().map(|x| x * x).sum::<f32>() / c_ref.len() as f32).sqrt();
         let rel_err = |out: &[f32]| -> f32 {
             let mut sum = 0.0f64;
             for i in 0..out.len() {
@@ -656,7 +661,9 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
         eprintln!(
             "[nvfp4_gemm validation]   Path B-splitK (K_SPLITS={k_splits}): cos_vs_ref={cos_b_sk:.4}  rel_rms_err={rel_b_sk:.4}"
         );
-        eprintln!("[nvfp4_gemm validation]   cos(A, B) = {cos_ab:.4}   cos(B, B-splitK) = {cos_b_sk_vs_b:.4}");
+        eprintln!(
+            "[nvfp4_gemm validation]   cos(A, B) = {cos_ab:.4}   cos(B, B-splitK) = {cos_b_sk_vs_b:.4}"
+        );
         let pass_a = cos_a >= 0.99;
         let pass_b = cos_b >= 0.99;
         let pass_b_sk = cos_b_sk >= 0.99;
@@ -678,18 +685,19 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
             "[nvfp4_gemm validation] M={m} K={k} N={n}  a_absmax={a_absmax:.4}  \
              scale2_w={scale2_w:.5} scale2_a={scale2_a:.5}"
         );
-        eprintln!(
-            "[nvfp4_gemm validation]   Path A max_abs={max_abs_a:.2} nan/inf={nan_a}"
-        );
-        eprintln!(
-            "[nvfp4_gemm validation]   Path B max_abs={max_abs_b:.2} nan/inf={nan_b}"
-        );
+        eprintln!("[nvfp4_gemm validation]   Path A max_abs={max_abs_a:.2} nan/inf={nan_a}");
+        eprintln!("[nvfp4_gemm validation]   Path B max_abs={max_abs_b:.2} nan/inf={nan_b}");
         let max_abs_b_sk = f_b_sk.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let nan_b_sk = f_b_sk.iter().filter(|v| v.is_nan() || v.is_infinite()).count();
+        let nan_b_sk = f_b_sk
+            .iter()
+            .filter(|v| v.is_nan() || v.is_infinite())
+            .count();
         eprintln!(
             "[nvfp4_gemm validation]   Path B-splitK (K_SPLITS={k_splits}) max_abs={max_abs_b_sk:.2} nan/inf={nan_b_sk}"
         );
-        eprintln!("[nvfp4_gemm validation]   cos(A, B) = {cos_ab:.4}   cos(B, B-splitK) = {cos_b_sk_vs_b:.4}");
+        eprintln!(
+            "[nvfp4_gemm validation]   cos(A, B) = {cos_ab:.4}   cos(B, B-splitK) = {cos_b_sk_vs_b:.4}"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -795,8 +803,16 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
                     &k_splits as *const u32 as *mut c_void,
                 ];
                 unsafe {
-                    gpu::launch(reg, nvfp4_sk_reduce, red_grid, (256, 1, 1), 0, stream, &mut p2)
-                        .unwrap();
+                    gpu::launch(
+                        reg,
+                        nvfp4_sk_reduce,
+                        red_grid,
+                        (256, 1, 1),
+                        0,
+                        stream,
+                        &mut p2,
+                    )
+                    .unwrap();
                 }
             });
             Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
@@ -839,8 +855,16 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
                     &k as *const u32 as *mut c_void,
                 ];
                 unsafe {
-                    gpu::launch(reg, quant_kernel, (m, 1, 1), (256, 1, 1), 0, stream, &mut p2)
-                        .unwrap();
+                    gpu::launch(
+                        reg,
+                        quant_kernel,
+                        (m, 1, 1),
+                        (256, 1, 1),
+                        0,
+                        stream,
+                        &mut p2,
+                    )
+                    .unwrap();
                 }
                 let mut p3: Vec<*mut c_void> = vec![
                     &g_a_packed as *const u64 as *mut c_void,

@@ -38,65 +38,92 @@ pub fn process_decode_logits(
         || any_logprobs
         || model_logits_fp32;
 
-    let new_tokens: Vec<(u32, Option<crate::api::TokenLogprobs>)> =
-        if active.iter().all(|a| a.temperature == 0.0) && !any_grammar && !needs_host_logits {
-            // Fast path: all greedy, no grammar, no thinking — GPU argmax for the full batch.
-            match model.argmax_batch(logits, n, 0) {
-                Ok(t) => t.into_iter().map(|tok| (tok, None)).collect(),
-                Err(e) => {
-                    tracing::error!("argmax_batch error: {e:#}");
-                    for mut a in active.drain(..) {
-                        send_error(model, &mut a, &format!("{e:#}"));
-                    }
-                    return;
-                }
-            }
-        } else {
-            // Host-side path: copy all batch logits to host, sample per-sequence.
-            // Required when any sequence has temperature > 0 or grammar constraints.
-            let vocab_size = model.vocab_size();
-            // FP32 lm_head dispatch (Gemma-4 dense + ATLAS_GEMMA4_FP32_LMHEAD=1).
-            // When the model writes FP32 logits to its decode-logits buffer, we
-            // copy 4 bytes/element and skip the BF16→FP32 expansion. Earlier
-            // bisection at model.rs:1192-1201 incorrectly concluded FP32 lm_head
-            // had no effect on Gemma-4 because this dispatch was never wired —
-            // the scheduler always read the (stale) BF16 logits buffer.
-            // FP32 lm_head dispatch (Gemma-4 dense). When `use_fp32_logits` is
-            // on, the per-token decode lm_head writes 4 bytes/element. The
-            // passed `logits` pointer is whatever the most-recent forward
-            // returned — that's already the correct buffer (prefill or decode).
-            // We just need to read it with the matching width.
-            let logits_fp32 = model.decode_logits_fp32();
-            let elem_bytes = if logits_fp32 { 4 } else { 2 };
-            let mut buf = vec![0u8; n * vocab_size * elem_bytes];
-            if let Err(e) = model.copy_logits_to_host(logits, &mut buf) {
-                tracing::error!("copy_logits_to_host error: {e:#}");
+    let new_tokens: Vec<(u32, Option<crate::api::TokenLogprobs>)> = if active
+        .iter()
+        .all(fast_path_seq_eligible)
+        && !any_grammar
+        && !needs_host_logits
+    {
+        // Fast path: all greedy, no grammar, no thinking — GPU argmax for the full batch.
+        match model.argmax_batch(logits, n, 0) {
+            Ok(t) => t.into_iter().map(|tok| (tok, None)).collect(),
+            Err(e) => {
+                tracing::error!("argmax_batch error: {e:#}");
                 for mut a in active.drain(..) {
                     send_error(model, &mut a, &format!("{e:#}"));
                 }
                 return;
             }
-            active
-                .iter_mut()
-                .enumerate()
-                .map(|(i, a)| {
-                    process_seq_logits(
-                        a,
-                        &buf,
-                        i,
-                        vocab_size,
-                        elem_bytes,
-                        logits_fp32,
-                        think_end_token,
-                        think_start_token,
-                        tool_call_start_token,
-                        tool_call_end_token,
-                        reflection_suppress_ids,
-                        adaptive_sampling,
-                    )
-                })
-                .collect()
-        };
+        }
+    } else {
+        // Host-side path: copy all batch logits to host, sample per-sequence.
+        // Required when any sequence has temperature > 0 or grammar constraints.
+        let vocab_size = model.vocab_size();
+        // FP32 lm_head dispatch (Gemma-4 dense + ATLAS_GEMMA4_FP32_LMHEAD=1).
+        // When the model writes FP32 logits to its decode-logits buffer, we
+        // copy 4 bytes/element and skip the BF16→FP32 expansion. Earlier
+        // bisection at model.rs:1192-1201 incorrectly concluded FP32 lm_head
+        // had no effect on Gemma-4 because this dispatch was never wired —
+        // the scheduler always read the (stale) BF16 logits buffer.
+        // FP32 lm_head dispatch (Gemma-4 dense). When `use_fp32_logits` is
+        // on, the per-token decode lm_head writes 4 bytes/element. The
+        // passed `logits` pointer is whatever the most-recent forward
+        // returned — that's already the correct buffer (prefill or decode).
+        // We just need to read it with the matching width.
+        let logits_fp32 = model.decode_logits_fp32();
+        let elem_bytes = if logits_fp32 { 4 } else { 2 };
+        let mut buf = vec![0u8; n * vocab_size * elem_bytes];
+        if let Err(e) = model.copy_logits_to_host(logits, &mut buf) {
+            tracing::error!("copy_logits_to_host error: {e:#}");
+            for mut a in active.drain(..) {
+                send_error(model, &mut a, &format!("{e:#}"));
+            }
+            return;
+        }
+        active
+            .iter_mut()
+            .enumerate()
+            .map(|(i, a)| {
+                let sampled = process_seq_logits(
+                    a,
+                    &buf,
+                    i,
+                    vocab_size,
+                    elem_bytes,
+                    logits_fp32,
+                    think_end_token,
+                    think_start_token,
+                    tool_call_start_token,
+                    tool_call_end_token,
+                    reflection_suppress_ids,
+                    adaptive_sampling,
+                );
+                if n == 1
+                    && std::env::var("ATLAS_SPEC_BOOTSTRAP_TRACE").ok().as_deref() == Some("1")
+                {
+                    let row = &buf[i * vocab_size * elem_bytes..(i + 1) * vocab_size * elem_bytes];
+                    let read = |j: usize| {
+                        if logits_fp32 {
+                            let off = j * 4;
+                            f32::from_le_bytes([row[off], row[off + 1], row[off + 2], row[off + 3]])
+                        } else {
+                            bf16_to_f32(row[j * 2], row[j * 2 + 1])
+                        }
+                    };
+                    let raw_argmax = (0..vocab_size)
+                        .max_by(|&x, &y| read(x).total_cmp(&read(y)))
+                        .unwrap_or(0);
+                    tracing::info!(
+                        raw_argmax,
+                        sampled = sampled.0,
+                        think_ended = a.think_ended,
+                        "SERIAL_POLICY_DECODE"
+                    );
+                }
+                sampled
+            })
+            .collect()
+    };
 
     // ── ATLAS_DUMP_HIDDEN: append token records (catch-all path) ──
     // Pairs decode-step hidden states (dumped per-layer) with the token that
@@ -133,10 +160,21 @@ pub fn process_decode_logits(
     }
 
     let now = Instant::now();
-    for (i, (tok, logprobs)) in new_tokens.into_iter().enumerate() {
+    for (i, (tok, mut logprobs)) in new_tokens.into_iter().enumerate() {
         let a = &mut active[i];
+        let was_inside_thinking = a.inside_thinking;
+        let previous_last_token = a.last_token;
+        let previous_last_token_time = a.last_token_time;
         a.last_token = tok;
         a.last_token_time = now;
+
+        // A ChatML role boundary ends the assistant turn even when an active
+        // grammar, required tool call, or min_tokens would suppress ordinary
+        // EOS. Keep this before every phase/grammar side effect, exactly like
+        // speculative `emit_token`.
+        if commit_chatml_role_boundary(a, tok, im_start_hard_stop()) {
+            continue;
+        }
 
         // Spontaneous <think>: model generates <think> even when thinking
         // was not requested. Enter thinking mode so EOS is suppressed and
@@ -158,13 +196,16 @@ pub fn process_decode_logits(
         // so we must enter thinking mode but force an immediate exit: next token
         // is forced to </think> (0 thinking content tokens, 1 </think> overhead).
         if !a.inside_thinking && think_start_token == Some(tok) {
+            // Re-entering thinking re-arms the response-entry counter for the
+            // next `</think>` boundary.
+            a.post_think_gate_steps = 0;
             if !a.think_ended {
-                let decay_shift = a.think_watchdog_fires.min(4);
-                let decayed = a.spontaneous_think_budget >> decay_shift;
+                let decayed =
+                    resolve_rethink_budget(a.spontaneous_think_budget, a.think_watchdog_fires);
                 a.inside_thinking = true;
                 a.think_ended = false; // reset so </think> detection path works
                 a.think_skip_count = 0;
-                a.thinking_budget = Some(decayed.max(8)); // floor to keep watchdog functional
+                a.thinking_budget = Some(decayed);
                 if a.think_watchdog_fires > 0 {
                     tracing::debug!(
                         fires = a.think_watchdog_fires,
@@ -203,16 +244,6 @@ pub fn process_decode_logits(
             a.think_skip_count = 0;
         }
 
-        // Advance grammar state with the sampled token — but only
-        // once thinking is finished, because thinking tokens are
-        // stripped from the API output and should not consume grammar
-        // slots (matches the bitmask-skip in the sampler above).
-        if !a.inside_thinking
-            && let Some(ref mut gs) = a.grammar_state
-        {
-            gs.accept_token(tok);
-        }
-
         // Thinking tokens don't count toward remaining (thinking is "free").
         if a.inside_thinking {
             if think_end_token == Some(tok) {
@@ -221,6 +252,7 @@ pub fn process_decode_logits(
                 a.consecutive_confident = 0;
                 a.in_code_fence = false;
                 a.think_ended = true;
+                a.post_think_gate_steps = 0;
                 // One-shot: pin the next sampled token to the
                 // tool-call-start token if the request requires a
                 // tool call (Change 3b). Cleared in the `else`
@@ -250,7 +282,8 @@ pub fn process_decode_logits(
                 // phrase attractor (`Running:\`\`\`bash cmd\`\`\`Executing:…`
                 // cycling) within ~24-60 tokens of the loop starting,
                 // instead of waiting for the 256-token thinking budget.
-                if !a.force_end_thinking
+                if enable_thinking_loop_watchdog()
+                    && !a.force_end_thinking
                     && a.thinking_tokens >= THINK_LOOP_MIN_TOKENS
                     && a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
                     && detect_thinking_token_loop(&a.output_tokens)
@@ -272,7 +305,16 @@ pub fn process_decode_logits(
             // `decode_logits_content.rs` to keep this file ≤500 LoC.
             // `model` is threaded through so a watchdog rollback can
             // restore SSM recurrent state on hybrid models (Phase-C).
-            handle_content_token(a, model);
+            match handle_content_token(a, tok, model, previous_last_token, previous_last_token_time)
+            {
+                ContentTokenDisposition::CommitSample => {
+                    advance_content_grammar(a, tok);
+                }
+                ContentTokenDisposition::DiscardSampleAndStop { dropped } => {
+                    tracing::debug!(dropped, "Discarded sample after rollback hard-stop");
+                    continue;
+                }
+            }
         }
 
         // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
@@ -282,13 +324,12 @@ pub fn process_decode_logits(
             a.require_tool_call = false;
             a.tool_call_opened = true;
         }
-        // F2 (2026-04-26): reset the inter-tool prose budget on
-        // every `<tool_call>` open. This keeps the budget scoped to
-        // "free-text since the last tool call started" rather than
-        // accumulating across the whole response.
-        if tool_call_start_token == Some(tok) && !a.inside_thinking {
-            a.prose_tokens_since_last_tool = 0;
-        }
+        // Update the tool-body phase AFTER content handling: the opening token
+        // is the boundary into the body, while the closing token still belongs
+        // to the body for watchdog accounting. `process_seq_logits` observes
+        // this flag on the next position and disables prose penalties inside
+        // structured JSON exactly like speculative emission.
+        update_tool_body_phase(a, tok);
         // Safety: if require_tool_call is still set after 512 tokens, the model
         // isn't generating a tool call (grammar may have failed to compile).
         // Clear the flag so EOS is no longer suppressed — prevents infinite gen.
@@ -299,108 +340,21 @@ pub fn process_decode_logits(
             a.require_tool_call = false;
         }
 
-        // Accumulate logprobs data for blocking responses.
-        if let Some(lp) = logprobs {
-            a.logprobs_data.push(lp);
-        }
-
         // </tool_call> stop: in legacy mode (no grammar), stop after first tool call.
         // When grammar is active, allow the model to generate multiple tool calls —
         // the grammar controls when EOS is valid.
         if tool_call_end_token == Some(tok) && !a.inside_thinking {
-            a.output_tokens.push(tok);
-            if let ResponseSink::Streaming(ref tx) = a.sink {
-                let event = if let Some(lp) = a.logprobs_data.last().cloned() {
-                    StreamEvent::TokenWithLogprobs(tok, lp)
-                } else {
-                    StreamEvent::Token(tok)
-                };
-                match tx.try_send(event) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::warn!(
-                            "Streaming receiver dropped during tool_call_end, finishing sequence"
-                        );
-                        a.finished = true;
-                        continue;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                        if let Err(e) = tx.blocking_send(event) {
-                            tracing::error!(
-                                "Streaming send failed during tool_call_end backpressure: {e}"
-                            );
-                            a.finished = true;
-                            continue;
-                        }
-                    }
-                }
+            if let Some(lp) = logprobs.take() {
+                a.logprobs_data.push(lp);
             }
-            if a.grammar_state.is_none() {
-                // Legacy mode: one tool call per response
-                a.finished = true;
-            }
-            // Mirror finish_sequence (lines ~3445-3448): keep
-            // `inside_tool_body` and the grammar FSM in sync with the
-            // emitted token stream. The `continue;` below skips the
-            // `emit_token()` path that would normally do this, so
-            // without these two lines the flag stays `true` for all
-            // subsequent prose tokens — sampler penalties stay
-            // disabled for the rest of the response, and the grammar
-            // bitmask drifts out of sync with the actual emission.
-            // Root-caused 2026-04-26 (8-agent sweep, F1).
-            a.inside_tool_body = false;
-            if let Some(ref mut gs) = a.grammar_state {
-                gs.accept_token(tok);
-            }
-            // F9 companion (2026-04-26): clear `think_ended` at every
-            // </tool_call> boundary so legitimate post-tool
-            // re-thinking is allowed. F9 masks <think> when
-            // `think_ended=true`, but between tool calls the model
-            // SHOULD be allowed to re-think (MiniMax-M2 / Qwen3.6
-            // pattern per project_minimax_m27_final.md). F10's
-            // watchdog-fire counter still applies — repeated
-            // re-thinking that loops will decay its budget.
-            a.think_ended = false;
+            commit_tool_call_close(a, tok, was_inside_thinking);
             continue;
         }
 
-        // EOS handling: grammar-based, legacy, or min_tokens.
-        // Grammar-based: grammar controls when EOS is allowed (is_terminated()).
-        // Legacy: require_tool_call suppresses EOS until <tool_call> is seen.
-        // min_tokens: suppress EOS until output_tokens.len() >= min_tokens.
-        let grammar_suppresses_eos = a
-            .grammar_state
-            .as_ref()
-            .is_some_and(|gs| !gs.is_terminated());
-        let legacy_suppresses_eos = a.require_tool_call;
-        let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-        // Suppress EOS during thinking: <|im_end|> inside <think> is spurious.
-        // Only </think> (think_end_token) should end the thinking phase.
-        let thinking_suppresses_eos = a.inside_thinking;
-        // Post-thinking EOS guard. Empirically (dump fix22b 2026-04-25
-        // ses_23b4781f7ffebc7UgkKWedTmjd seq=43): when the thinking-loop
-        // watchdog force-closes `</think>` mid-narration, the model can
-        // emerge into content mode briefly (often emitting a bare
-        // `<write>\n\n` opener) and immediately sample EOS — the
-        // session ends with a partial tool-call shell but no real
-        // call. We require at least POST_THINK_MIN_CONTENT non-thinking
-        // tokens after `think_ended` before EOS is allowed, giving the
-        // model the room to actually open a `<tool_call>` block. Same
-        // shape as the existing `min_tokens` guard, but counted from
-        // the `</think>` boundary so it doesn't penalise turns that
-        // never entered thinking. 16 tokens is enough to start
-        // `<tool_call>\n<function=NAME>\n<parameter=…` and is well
-        // below typical real tool-call output sizes (>100 tokens).
-        const POST_THINK_MIN_CONTENT: u32 = 16;
-        let post_think_content_tokens =
-            (a.output_tokens.len() as u32).saturating_sub(a.thinking_tokens);
-        let post_think_suppresses_eos =
-            a.think_ended && post_think_content_tokens < POST_THINK_MIN_CONTENT;
-        let suppress_eos = grammar_suppresses_eos
-            || legacy_suppresses_eos
-            || min_tokens_suppresses
-            || thinking_suppresses_eos
-            || post_think_suppresses_eos;
+        // Keep this identical to speculative emission. Required tools are
+        // protected by grammar / legacy-required mode, but an ordinary answer
+        // may terminate on its first EOS after `</think>`.
+        let suppress_eos = eos_is_suppressed(a, a.output_tokens.len());
 
         // Single-pass over eos_tokens (was 2× linear scan).
         let is_eos = a.eos_tokens.contains(&tok);
@@ -409,6 +363,9 @@ pub fn process_decode_logits(
             // must not contain the stop sequence). The token is still added to
             // output_tokens for correct token count; the API layer strips the
             // decoded text for blocking responses.
+            if let Some(lp) = logprobs.take() {
+                a.logprobs_data.push(lp);
+            }
             a.output_tokens.push(tok);
             a.finished = true;
         } else if is_eos {
@@ -416,7 +373,13 @@ pub fn process_decode_logits(
             // Don't stop, don't stream the EOS — the model must keep generating.
             // Don't add to output_tokens (EOS is discarded).
         } else {
+            if let Some(lp) = logprobs.take() {
+                a.logprobs_data.push(lp);
+            }
             a.output_tokens.push(tok);
+            if a.think_ended && !was_inside_thinking && !a.inside_thinking {
+                a.post_think_gate_steps = mtp_gate::advance_entry_counter(a.post_think_gate_steps);
+            }
             // Phase-C: if this committed token is a content-phase
             // boundary token (sentence end / newline) and the model is
             // hybrid (attention + SSM), snapshot the recurrent SSM
@@ -466,6 +429,15 @@ pub fn process_decode_logits(
                     }
                 }
             }
+            if a.output_tokens.len() >= a.max_output_tokens {
+                tracing::info!(
+                    "process_decode_logits: max_output_tokens={} reached, output_tokens={}, thinking_tokens={}",
+                    a.max_output_tokens,
+                    a.output_tokens.len(),
+                    a.thinking_tokens,
+                );
+                a.finished = true;
+            }
             if a.remaining == 0 {
                 tracing::info!(
                     "process_decode_logits: remaining=0, output_tokens={}, thinking_tokens={}",
@@ -487,66 +459,8 @@ pub fn process_decode_logits(
                 a.finished = true;
             }
 
-            // Intra-response fuzzy repetition detection: if the last 2*W tokens
-            // approximately match the same W-token pattern, the model is looping.
-            // Uses Hamming distance with ~12% tolerance to catch loops where the
-            // model narrates the same plan with slight wording variations.
-            // Skip during tool calls: XML parameter tags have natural repetition
-            // (<parameter=..>...</parameter>) that triggers false positives.
-            // Use last occurrence positions — completed tool calls shouldn't
-            // disable the detector for subsequent text generation.
-            let last_tc_start = a
-                .tool_call_start_token
-                .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
-            let last_tc_end = a
-                .tool_call_end_token
-                .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
-            let inside_tool_call = match (last_tc_start, last_tc_end) {
-                (Some(start), Some(end)) => start > end,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if enable_loop_watchdog()
-                && !a.finished
-                && !a.inside_thinking
-                && !inside_tool_call
-                && let Some((pattern_len, mis_a, mis_b)) = detect_fuzzy_repetition(&a.output_tokens)
-            {
-                // Phase-C: roll back past the repeated window and
-                // re-steer. `min_keep` = pattern_len * 3 guarantees all
-                // three near-copies of the detected pattern are dropped
-                // so generation cannot resume straight back into the
-                // loop. Falls back to the hard stop when declined.
-                let min_keep = pattern_len * 3;
-                match rollback_to_boundary(a, min_keep, model) {
-                    RollbackOutcome::RolledBack { dropped } => {
-                        tracing::warn!(
-                            pattern_len,
-                            mismatches = mis_a + mis_b,
-                            dropped,
-                            rollback = a.rollback_count,
-                            "Fuzzy repetition detected; rolled back to boundary, re-steering"
-                        );
-                    }
-                    RollbackOutcome::Fallback(reason) => {
-                        tracing::warn!(
-                            "Fuzzy repetition: {pattern_len}-tok pattern x3 ({mis_a}+{mis_b} \
-                             mismatches), stopping at {} tokens (rollback declined: {reason:?})",
-                            a.output_tokens.len()
-                        );
-                        a.finished = true;
-                    }
-                }
-            }
-
             // Check request timeout.
-            if !a.finished
-                && let Some(deadline) = a.timeout_at
-                && Instant::now() >= deadline
-            {
-                tracing::warn!("Request timeout after {:?}", a.request_start.elapsed());
-                a.finished = true;
-            }
+            check_request_timeout(a);
         }
     }
 }

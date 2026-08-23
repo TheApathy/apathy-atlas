@@ -15,10 +15,7 @@ use anyhow::{Context, Result, bail};
 use half::bf16;
 use std::ffi::c_void;
 
-use crate::cuda_min::{
-    CudaCtx, CudaModule, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, launch_kernel,
-    stream_sync,
-};
+use crate::cuda_min::{CudaCtx, CudaModule, DeviceBuffer, copy_d_to_h, copy_h_to_d, launch_kernel};
 use crate::projection::{PredictorShape, build_projection};
 
 include!(concat!(env!("OUT_DIR"), "/storage_ptx.rs"));
@@ -106,12 +103,7 @@ impl Predictor {
         let shape = PredictorShape::new(dims.head_dim, dims.r);
         let p_host = build_projection(shape, projection_seed);
         let p_dev = DeviceBuffer::new(dims.p_bytes())?;
-        copy_h_to_d_async(
-            p_dev.ptr,
-            p_host.as_ptr() as *const c_void,
-            dims.p_bytes(),
-            stream,
-        )?;
+        copy_h_to_d(p_dev.ptr, &p_host, stream)?;
         // Preflight A_g sizing against free HBM. A_g grows linearly with
         // `r × max_blocks × num_layers × num_kv_heads × block_size`, so a
         // greedy `r=32` default plus a max-seq-len-sized block pool can blow
@@ -151,7 +143,6 @@ impl Predictor {
         // unwritten slots are unused; the predictor never reads a slot that
         // hasn't been populated by `project_kv_block`).
         let a_g_dev = DeviceBuffer::new(a_g_need)?;
-        stream_sync(stream)?;
         Ok(Self {
             dims,
             _modules: modules,
@@ -324,7 +315,6 @@ pub fn read_k_lr_slot(
     let n = dims.per_layer_block_floats();
     let slot = pred.a_g_dev.ptr + (((layer * dims.max_blocks + block) * n) * 2) as u64;
     let mut host = vec![bf16::from_f32(0.0); n];
-    copy_d_to_h_async(host.as_mut_ptr() as *mut c_void, slot, n * 2, ctx.stream)?;
-    stream_sync(ctx.stream)?;
+    copy_d_to_h(&mut host, slot, ctx.stream)?;
     Ok(host)
 }

@@ -2,16 +2,14 @@
 //
 //! Additional `HighSpeedSwap` methods (offload + attention orchestration).
 
-use anyhow::Result;
-use std::ffi::c_void;
-
 use super::HighSpeedSwap;
 use crate::backend::{ReadRequest, StorageBackend};
 use crate::config::HighSpeedSwapConfig;
-use crate::cuda_min::{CudaCtx, copy_d_to_h_async, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{CudaCtx, HostToDeviceCopy, copy_d_to_h, copy_h_to_d_group};
 use crate::group::{GroupKey, KvKind};
 use crate::predictor::Predictor;
 use crate::scratch_pool::{ResidentKey, ScratchPool};
+use anyhow::Result;
 
 impl HighSpeedSwap {
     /// Persist a freshly-written KV block to disk and update the predictor's
@@ -218,13 +216,7 @@ impl HighSpeedSwap {
                 self.block_scores_dev.ptr,
                 m.max_blocks_per_layer as usize,
             )?;
-            copy_d_to_h_async(
-                self.score_host_buf.as_mut_ptr() as *mut c_void,
-                self.block_scores_dev.ptr,
-                self.score_host_buf.len() * 4,
-                stream,
-            )?;
-            stream_sync(stream)?;
+            copy_d_to_h(&mut self.score_host_buf, self.block_scores_dev.ptr, stream)?;
         }
 
         // 3. Tile loop.
@@ -284,16 +276,11 @@ impl HighSpeedSwap {
 
             // 4. Tiled attention launch.
             let counts = [(tile.len()) as i32];
-            copy_h_to_d_async(
-                self.block_table_dev.ptr,
-                block_table.as_ptr() as *const c_void,
-                tile_cap * 4,
-                stream,
-            )?;
-            copy_h_to_d_async(
-                self.counts_dev.ptr,
-                counts.as_ptr() as *const c_void,
-                4,
+            copy_h_to_d_group(
+                &[
+                    HostToDeviceCopy::new(self.block_table_dev.ptr, &block_table),
+                    HostToDeviceCopy::new(self.counts_dev.ptr, &counts),
+                ],
                 stream,
             )?;
             let (s_blk, s_tok, s_kvh) = self.attn.scratch_pool_strides();

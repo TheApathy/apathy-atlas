@@ -158,6 +158,15 @@ impl GrammarMatcher {
         self.inner.rollback(num_tokens);
     }
 
+    /// Number of accepted matcher steps currently available for rollback.
+    ///
+    /// This additive introspection is needed by speculative callers because
+    /// tokens presented after matcher termination are logical no-ops and do
+    /// not add rollback history.
+    pub fn num_history_steps(&self) -> usize {
+        self.inner.num_history_steps()
+    }
+
     /// Whether the matcher has terminated. Port of the vendored
     /// `GrammarMatcher::is_terminated`.
     pub fn is_terminated(&self) -> bool {

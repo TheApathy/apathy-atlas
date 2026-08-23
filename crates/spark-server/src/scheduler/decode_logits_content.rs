@@ -1,123 +1,252 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Content-phase token handling for `process_decode_logits` — the
-//! non-thinking branch of the per-token decode loop. Extracted from
-//! `decode_logits_step.rs` to keep that file ≤500 LoC.
+//! Non-thinking token bookkeeping and degeneration watchdogs. Blocking
+//! responses may rewind a proven-flat history; streaming responses discard
+//! only the uncommitted sample because emitted tail tokens are irreversible.
 //!
-//! Runs once per sampled token while the sequence is *outside*
-//! `<think>…</think>`: budget bookkeeping plus the two content-phase
-//! degeneration watchdogs (content-loop, inter-tool prose). Both
-//! watchdogs were converted in Phase-C to roll back to the last
-//! well-formed boundary and re-steer (`rollback_to_boundary`) instead
-//! of hard-stopping the response.
+//! Every watchdog decides before sample commit and then stops; a rewind is
+//! terminal tail cleanup, never a re-steer.
+//!
+//! [`super::rollback::precommit_rollback_history_is_safe`] admits only a flat
+//! history — no grammar, no thinking, no tool phase, sidecars exactly aligned.
+//! The inter-tool prose budget fires only while a grammar is live, so its
+//! rewind is always declined and it keeps its legacy commit-then-stop
+//! behaviour; the content-loop and fuzzy watchdogs can rewind a plain answer.
 
 use super::*;
 
-/// Handle one sampled token that lands in the content phase (model is
-/// not inside `<think>`). Mutates `a` in place: decrements the
-/// generation budget, advances content counters, and runs the
-/// content-loop + inter-tool-prose watchdogs.
-///
-/// `model` is needed by the Phase-C boundary rollback so it can restore
-/// SSM recurrent state on hybrid models (see
-/// [`super::rollback::rollback_to_boundary`]).
-pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContentTokenDisposition {
+    CommitSample,
+    DiscardSampleAndStop { dropped: usize },
+}
+
+fn without_current_sample(
+    remaining_after_rollback: usize,
+    content_tokens_after_rollback: u32,
+    content_started_before: bool,
+    think_just_ended_before: bool,
+) -> (usize, u32, bool, bool) {
+    (
+        remaining_after_rollback.saturating_add(1),
+        content_tokens_after_rollback.saturating_sub(1),
+        content_started_before,
+        think_just_ended_before,
+    )
+}
+
+/// Committed length of a fuzzy window the detector matched on the projected
+/// history. The window's last token is the uncommitted sample, so a rewind of
+/// the committed tail must discard exactly one fewer token than the detector
+/// compared — `pattern_len * 3` would demand a token that is not there.
+fn committed_fuzzy_window(pattern_len: usize) -> usize {
+    (pattern_len * 3).saturating_sub(1)
+}
+
+/// Run the fuzzy detector with a temporary, uncommitted tail sample.
+fn projected_fuzzy_repetition(a: &mut ActiveSeq, sample: u32) -> Option<(usize, usize, usize)> {
+    a.output_tokens.push(sample);
+    let detection = fuzzy_repetition_outside_tool(a);
+    let removed = a.output_tokens.pop();
+    debug_assert_eq!(removed, Some(sample));
+    detection
+}
+
+fn discard_sample_after_rollback(
+    a: &mut ActiveSeq,
+    dropped: usize,
+    content_started_before: bool,
+    think_just_ended_before: bool,
+    streaming_state: Option<(u32, Instant, u32)>,
+) -> ContentTokenDisposition {
+    // The sampled token was charged but never committed.
+    (
+        a.remaining,
+        a.content_tokens,
+        a.content_started,
+        a.think_just_ended,
+    ) = without_current_sample(
+        a.remaining,
+        a.content_tokens,
+        content_started_before,
+        think_just_ended_before,
+    );
+    if let Some((last_token, last_token_time, prose_tokens)) = streaming_state {
+        a.last_token = last_token;
+        a.last_token_time = last_token_time;
+        a.prose_tokens_since_last_tool = prose_tokens;
+    }
+    a.finished = true;
+    ContentTokenDisposition::DiscardSampleAndStop { dropped }
+}
+
+/// Stop without retracting a stream; only blocking responses may rewind.
+fn stop_uncommitted_loop_with<F>(
+    a: &mut ActiveSeq,
+    min_keep: usize,
+    content_started_before: bool,
+    think_just_ended_before: bool,
+    previous_last_token: u32,
+    previous_last_token_time: Instant,
+    prose_tokens_before: u32,
+    rollback: &mut F,
+) -> ContentTokenDisposition
+where
+    F: FnMut(&mut ActiveSeq, usize) -> RollbackOutcome,
+{
+    if matches!(&a.sink, ResponseSink::Streaming(_)) {
+        return discard_sample_after_rollback(
+            a,
+            0,
+            content_started_before,
+            think_just_ended_before,
+            Some((
+                previous_last_token,
+                previous_last_token_time,
+                prose_tokens_before,
+            )),
+        );
+    }
+    match rollback(a, min_keep) {
+        RollbackOutcome::RolledBack { dropped } => discard_sample_after_rollback(
+            a,
+            dropped,
+            content_started_before,
+            think_just_ended_before,
+            None,
+        ),
+        RollbackOutcome::Fallback(reason) => {
+            tracing::debug!(
+                ?reason,
+                "Serial loop rollback declined; committing stop sample"
+            );
+            a.finished = true;
+            ContentTokenDisposition::CommitSample
+        }
+    }
+}
+
+/// Return `CommitSample` before the caller mutates observable history.
+pub fn handle_content_token(
+    a: &mut ActiveSeq,
+    sample: u32,
+    model: &dyn Model,
+    previous_last_token: u32,
+    previous_last_token_time: Instant,
+) -> ContentTokenDisposition {
+    handle_content_token_with(
+        a,
+        sample,
+        enable_loop_watchdog(),
+        previous_last_token,
+        previous_last_token_time,
+        |a, min_keep| rollback_to_boundary(a, min_keep, model),
+    )
+}
+
+fn handle_content_token_with<F>(
+    a: &mut ActiveSeq,
+    sample: u32,
+    loop_watchdog_enabled: bool,
+    previous_last_token: u32,
+    previous_last_token_time: Instant,
+    mut rollback: F,
+) -> ContentTokenDisposition
+where
+    F: FnMut(&mut ActiveSeq, usize) -> RollbackOutcome,
+{
+    let content_started_before = a.content_started;
+    let think_just_ended_before = a.think_just_ended;
+    let prose_tokens_before = a.prose_tokens_since_last_tool;
     a.remaining -= 1;
     a.content_started = true;
     a.content_tokens = a.content_tokens.saturating_add(1);
-    // think_just_ended is a one-shot: it was set when the prior
-    // token was `</think>`; clear it now that we've emitted the
-    // first content token (which Change 3b's mask pinned to
-    // tool_call_start_token when require_tool_call was set).
+    // `think_just_ended` is consumed by the first content sample.
     a.think_just_ended = false;
 
-    // Content-phase loop watchdog (2026-04-26 Claude Code
-    // degeneration fix). Catches the agentic-failure mode
-    // where the model emits the same sentence over and over
-    // ("I see I've been creating Cargo.toml files but the
-    // user hasn't given me a task. Let me wait for their
-    // instructions." × 12). LZ penalty at strength 0.2 nudges
-    // but cannot break the attractor once established.
-    // Disabled inside grammar/tool-body because structured JSON
-    // repeats are legitimate.
-    if enable_loop_watchdog()
-        && a.grammar_state.is_none()
-        && !a.inside_tool_body
+    // Repeated structured JSON inside grammar/tool bodies is legitimate.
+    let catastrophic_loop = a.content_tokens >= CATASTROPHIC_LOOP_MIN_TOKENS as u32
+        && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+        && detect_catastrophic_content_loop(&a.output_tokens);
+    let configured_loop = loop_watchdog_enabled
         && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
         && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
         && (detect_content_token_loop(&a.output_tokens)
             || numeric_token_mask()
                 .as_deref()
-                .is_some_and(|m| detect_content_token_loop_normalized(&a.output_tokens, m)))
-    {
-        // Phase-C: roll back to the last well-formed boundary
-        // and re-steer instead of killing the response. `min_keep`
-        // = CONTENT_LOOP_PERIOD_MAX so the rollback always escapes
-        // the detected period. Falls back to the legacy hard stop
-        // when disabled / capped / no boundary found.
-        match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model) {
-            RollbackOutcome::RolledBack { dropped } => {
-                tracing::warn!(
-                    content_tokens = a.content_tokens,
-                    dropped,
-                    rollback = a.rollback_count,
-                    "Content-loop watchdog fired (period-{}…{} repeat); rolled back to boundary, re-steering",
-                    CONTENT_LOOP_PERIOD_MIN,
-                    CONTENT_LOOP_PERIOD_MAX,
-                );
-            }
-            RollbackOutcome::Fallback(reason) => {
-                tracing::warn!(
-                    content_tokens = a.content_tokens,
-                    output_len = a.output_tokens.len(),
-                    ?reason,
-                    "Content-loop watchdog fired (period-{}…{} repeat); ending response early (rollback declined)",
-                    CONTENT_LOOP_PERIOD_MIN,
-                    CONTENT_LOOP_PERIOD_MAX,
-                );
-                a.finished = true;
-            }
-        }
+                .is_some_and(|m| detect_content_token_loop_normalized(&a.output_tokens, m)));
+    if a.grammar_state.is_none() && !a.inside_tool_body && (catastrophic_loop || configured_loop) {
+        tracing::warn!(
+            content_tokens = a.content_tokens,
+            output_len = a.output_tokens.len(),
+            catastrophic = catastrophic_loop,
+            "Content-loop watchdog fired (period-{}…{} repeat); ending response",
+            CONTENT_LOOP_PERIOD_MIN,
+            CONTENT_LOOP_PERIOD_MAX,
+        );
+        return stop_uncommitted_loop_with(
+            a,
+            CONTENT_LOOP_PERIOD_MAX,
+            content_started_before,
+            think_just_ended_before,
+            previous_last_token,
+            previous_last_token_time,
+            prose_tokens_before,
+            &mut rollback,
+        );
     }
 
-    // F2 (2026-04-26): bounded inter-tool prose budget.
-    // Counts only free-text tokens (not inside tool body,
-    // not inside grammar-constrained emission). When the
-    // budget trips we recover the turn so the next attempt can
-    // re-plan, instead of letting the model emit
-    // prose↔tool↔prose↔tool forever (the `tool_choice="auto"`
-    // grammar never self-terminates — see grammar.rs:461-462).
+    // Bound free prose between grammar-constrained tool bodies.
     if !a.inside_tool_body && a.grammar_state.is_some() {
         a.prose_tokens_since_last_tool = a.prose_tokens_since_last_tool.saturating_add(1);
         let max_prose = watchdog_params().max_inter_tool_prose;
         if a.prose_tokens_since_last_tool > max_prose {
-            // Phase-C: roll back to the last boundary and
-            // re-steer so the model can re-attempt the tool
-            // call cleanly, instead of killing the turn
-            // mid-plan. `rollback_to_boundary` rewinds the
-            // grammar FSM in lock-step (step 5), so the
-            // constrained tool-call decoder stays valid.
-            // `min_keep` = CONTENT_LOOP_PERIOD_MAX drops a full
-            // run-on sentence of stalled prose.
-            match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model) {
-                RollbackOutcome::RolledBack { dropped } => {
-                    tracing::warn!(
-                        max = max_prose,
-                        dropped,
-                        rollback = a.rollback_count,
-                        "Inter-tool prose budget exhausted; rolled back to boundary, re-steering"
-                    );
-                }
-                RollbackOutcome::Fallback(reason) => {
-                    tracing::warn!(
-                        prose_tokens = a.prose_tokens_since_last_tool,
-                        max = max_prose,
-                        ?reason,
-                        "Inter-tool prose budget exhausted, ending response (rollback declined)"
-                    );
-                    a.finished = true;
-                }
-            }
+            tracing::warn!(
+                prose_tokens = a.prose_tokens_since_last_tool,
+                max = max_prose,
+                "Inter-tool prose budget exhausted; ending response"
+            );
+            return stop_uncommitted_loop_with(
+                a,
+                CONTENT_LOOP_PERIOD_MAX,
+                content_started_before,
+                think_just_ended_before,
+                previous_last_token,
+                previous_last_token_time,
+                prose_tokens_before,
+                &mut rollback,
+            );
         }
     }
+
+    if loop_watchdog_enabled
+        && !a.finished
+        && let Some((pattern_len, mis_a, mis_b)) = projected_fuzzy_repetition(a, sample)
+    {
+        tracing::warn!(
+            pattern_len,
+            mismatches = mis_a + mis_b,
+            output_len = a.output_tokens.len(),
+            "Fuzzy repetition detected before serial commit; ending response"
+        );
+        return stop_uncommitted_loop_with(
+            a,
+            committed_fuzzy_window(pattern_len),
+            content_started_before,
+            think_just_ended_before,
+            previous_last_token,
+            previous_last_token_time,
+            prose_tokens_before,
+            &mut rollback,
+        );
+    }
+    ContentTokenDisposition::CommitSample
 }
+
+#[cfg(test)]
+#[path = "decode_logits_content_tests.rs"]
+mod precommit_tests;
+
+#[cfg(test)]
+#[path = "decode_logits_content_integration_tests.rs"]
+mod integration_tests;

@@ -25,8 +25,10 @@ pub struct HighSpeedSwap {
     cfg: HighSpeedSwapConfig,
     model: ModelDims,
     predictor: Predictor,
-    pool: ScratchPool,
+    // Must drop before `pool`: it may own pending H2D transfers targeting
+    // scratch-pool device allocations and drains them in its Drop.
     backend: IoUringBackend,
+    pool: ScratchPool,
     attn: TiledAttention,
     eviction: EvictionPolicy,
     // Reusable scratch buffers.
@@ -119,8 +121,8 @@ impl HighSpeedSwap {
             cfg,
             model,
             predictor,
-            pool,
             backend,
+            pool,
             attn,
             eviction,
             q_proj,

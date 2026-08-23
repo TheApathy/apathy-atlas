@@ -77,23 +77,31 @@ impl WeightLoader for SafetensorsLoader {
         // Empirical overhead multipliers (peak memory / on-disk weight bytes):
         //   NVFP4 (Sehyo): ~2.0x  (store aliased + transposed/predequant copies)
         //   FP8 native:    ~1.5x  (store stays FP8, only attention prefill gets NVFP4 copies)
+        //
+        // The ratio covers the store and its transient staging only. Buffers
+        // the model *builder* retains afterwards are architecture-dependent
+        // and arrive as absolute bytes in `construction_overhead_bytes`.
         {
             let estimated = estimate_load_bytes(&shard_files, &skip_fn)?;
             let has_fp8 = estimate_has_fp8(&shard_files, &skip_fn)?;
             let overhead_multiplier: f64 =
                 self.peak_memory_multiplier
                     .unwrap_or(if has_fp8 { 1.5 } else { 1.3 });
-            let peak_estimated = (estimated as f64 * overhead_multiplier) as usize;
+            let construction = self.construction_overhead_bytes;
+            let peak_estimated = (estimated as f64 * overhead_multiplier) as usize + construction;
             let free = gpu.free_memory()?;
             let free_gb = free as f64 / (1024.0 * 1024.0 * 1024.0);
             let est_gb = estimated as f64 / (1024.0 * 1024.0 * 1024.0);
+            let construction_gb = construction as f64 / (1024.0 * 1024.0 * 1024.0);
             let peak_gb = peak_estimated as f64 / (1024.0 * 1024.0 * 1024.0);
             let reserve_gb = oom_reserve_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
             tracing::info!(
-                "Pre-flight estimate: {:.2} GB on-disk weights, {:.1}x overhead = {:.2} GB peak, \
+                "Pre-flight estimate: {:.2} GB on-disk weights, {:.1}x overhead \
+                 + {:.2} GB model-construction = {:.2} GB peak, \
                  {:.2} GB free, {:.1} GB reserve (FP8: {})",
                 est_gb,
                 overhead_multiplier,
+                construction_gb,
                 peak_gb,
                 free_gb,
                 reserve_gb,
@@ -102,13 +110,15 @@ impl WeightLoader for SafetensorsLoader {
             if peak_estimated + oom_reserve_bytes > free {
                 bail!(
                     "OOM pre-flight: model peak memory ({:.2} GB = {:.2} GB weights × {:.1}x \
-                     model-building overhead) + {:.1} GB reserve = {:.2} GB, \
+                     load overhead + {:.2} GB retained model-construction buffers) \
+                     + {:.1} GB reserve = {:.2} GB, \
                      but only {:.2} GB GPU memory is available. \
                      This model is too large. Use a smaller quantization (NVFP4 instead of FP8) \
                      or add more GPUs for expert parallelism.",
                     peak_gb,
                     est_gb,
                     overhead_multiplier,
+                    construction_gb,
                     reserve_gb,
                     peak_gb + reserve_gb,
                     free_gb,

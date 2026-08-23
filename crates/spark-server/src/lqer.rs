@@ -72,14 +72,14 @@ impl LqerCorrection {
     /// Sanity-check the descriptor's matrix sizes match the rank.
     /// Returns `Err(reason)` if the shape is impossible.
     pub fn validate(&self) -> Result<(), String> {
-        let expected_left = self.rows * self.rank * 2;
+        let expected_left = checked_bf16_matrix_bytes(self.rows, self.rank, "rows × rank")?;
         if self.left_bf16.len() != expected_left {
             return Err(format!(
                 "left matrix size mismatch: expected {expected_left}B, got {}B",
                 self.left_bf16.len()
             ));
         }
-        let expected_right = self.rank * self.cols * 2;
+        let expected_right = checked_bf16_matrix_bytes(self.rank, self.cols, "rank × cols")?;
         if self.right_bf16.len() != expected_right {
             return Err(format!(
                 "right matrix size mismatch: expected {expected_right}B, got {}B",
@@ -88,6 +88,13 @@ impl LqerCorrection {
         }
         Ok(())
     }
+}
+
+fn checked_bf16_matrix_bytes(outer: usize, inner: usize, label: &str) -> Result<usize, String> {
+    outer
+        .checked_mul(inner)
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| format!("{label} × 2 byte size overflowed"))
 }
 
 /// Set of LQER corrections keyed by layer name. Loaded from a
@@ -167,7 +174,7 @@ pub enum LqerLoadError {
     BadMagic,
     UnsupportedVersion(u32),
     Truncated { expected: usize, got: usize },
-    InvalidName(std::string::FromUtf8Error),
+    InvalidName(std::str::Utf8Error),
     ShapeMismatch(String),
 }
 
@@ -216,53 +223,66 @@ pub fn parse_lqer_bytes(buf: &[u8]) -> Result<LqerCorrection, LqerLoadError> {
     let cols = u32::from_le_bytes(buf[20..24].try_into().unwrap()) as usize;
     let name_len = u32::from_le_bytes(buf[24..28].try_into().unwrap()) as usize;
 
-    let name_end = 28 + name_len;
+    let name_end = 28usize
+        .checked_add(name_len)
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("name length overflowed".into()))?;
     if buf.len() < name_end {
         return Err(LqerLoadError::Truncated {
             expected: name_end,
             got: buf.len(),
         });
     }
-    let layer_name = std::str::from_utf8(&buf[28..name_end])
-        .map_err(|_| {
-            LqerLoadError::InvalidName(String::from_utf8(buf[28..name_end].to_vec()).unwrap_err())
-        })?
-        .to_string();
-
     // Pad name region up to 8-byte alignment.
-    let aligned = (name_end + 7) & !7;
+    let aligned = name_end
+        .checked_add(7)
+        .map(|end| end & !7)
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("name alignment overflowed".into()))?;
     if buf.len() < aligned {
         return Err(LqerLoadError::Truncated {
             expected: aligned,
             got: buf.len(),
         });
     }
+    if buf[name_end..aligned].iter().any(|&byte| byte != 0) {
+        return Err(LqerLoadError::ShapeMismatch(
+            "name padding must be zero".into(),
+        ));
+    }
 
     // rows × rank × 2 (BF16) for left
-    let left_bytes = rows
-        .checked_mul(rank)
-        .and_then(|x| x.checked_mul(2))
-        .ok_or_else(|| LqerLoadError::ShapeMismatch("rows × rank × 2 overflowed".into()))?;
-    let left_end = aligned + left_bytes;
+    let left_bytes = checked_bf16_matrix_bytes(rows, rank, "rows × rank")
+        .map_err(LqerLoadError::ShapeMismatch)?;
+    let left_end = aligned
+        .checked_add(left_bytes)
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("left matrix end overflowed".into()))?;
     if buf.len() < left_end {
         return Err(LqerLoadError::Truncated {
             expected: left_end,
             got: buf.len(),
         });
     }
-    let left_bf16 = buf[aligned..left_end].to_vec();
-
-    let right_bytes = rank
-        .checked_mul(cols)
-        .and_then(|x| x.checked_mul(2))
-        .ok_or_else(|| LqerLoadError::ShapeMismatch("rank × cols × 2 overflowed".into()))?;
-    let right_end = left_end + right_bytes;
+    let right_bytes = checked_bf16_matrix_bytes(rank, cols, "rank × cols")
+        .map_err(LqerLoadError::ShapeMismatch)?;
+    let right_end = left_end
+        .checked_add(right_bytes)
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("right matrix end overflowed".into()))?;
     if buf.len() < right_end {
         return Err(LqerLoadError::Truncated {
             expected: right_end,
             got: buf.len(),
         });
     }
+    if buf.len() != right_end {
+        return Err(LqerLoadError::ShapeMismatch(format!(
+            "trailing bytes after correction: expected {right_end}, got {}",
+            buf.len()
+        )));
+    }
+
+    let layer_name = std::str::from_utf8(&buf[28..name_end])
+        .map_err(LqerLoadError::InvalidName)?
+        .to_string();
+    let left_bf16 = buf[aligned..left_end].to_vec();
     let right_bf16 = buf[left_end..right_end].to_vec();
 
     let c = LqerCorrection {
@@ -282,16 +302,32 @@ pub fn parse_lqer_bytes(buf: &[u8]) -> Result<LqerCorrection, LqerLoadError> {
 pub fn write_lqer_bytes(c: &LqerCorrection) -> Result<Vec<u8>, LqerLoadError> {
     c.validate().map_err(LqerLoadError::ShapeMismatch)?;
     let name_bytes = c.layer_name.as_bytes();
-    let header_end = 28 + name_bytes.len();
-    let aligned = (header_end + 7) & !7;
-    let total = aligned + c.left_bf16.len() + c.right_bf16.len();
+    let rank = u32::try_from(c.rank)
+        .map_err(|_| LqerLoadError::ShapeMismatch("rank exceeds u32 wire format".into()))?;
+    let rows = u32::try_from(c.rows)
+        .map_err(|_| LqerLoadError::ShapeMismatch("rows exceed u32 wire format".into()))?;
+    let cols = u32::try_from(c.cols)
+        .map_err(|_| LqerLoadError::ShapeMismatch("cols exceed u32 wire format".into()))?;
+    let name_len = u32::try_from(name_bytes.len())
+        .map_err(|_| LqerLoadError::ShapeMismatch("layer name exceeds u32 wire format".into()))?;
+    let header_end = 28usize
+        .checked_add(name_bytes.len())
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("header length overflowed".into()))?;
+    let aligned = header_end
+        .checked_add(7)
+        .map(|end| end & !7)
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("header alignment overflowed".into()))?;
+    let total = aligned
+        .checked_add(c.left_bf16.len())
+        .and_then(|size| size.checked_add(c.right_bf16.len()))
+        .ok_or_else(|| LqerLoadError::ShapeMismatch("serialized size overflowed".into()))?;
     let mut buf = Vec::with_capacity(total);
     buf.extend_from_slice(LQER_MAGIC);
     buf.extend_from_slice(&LQER_VERSION.to_le_bytes());
-    buf.extend_from_slice(&(c.rank as u32).to_le_bytes());
-    buf.extend_from_slice(&(c.rows as u32).to_le_bytes());
-    buf.extend_from_slice(&(c.cols as u32).to_le_bytes());
-    buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&rank.to_le_bytes());
+    buf.extend_from_slice(&rows.to_le_bytes());
+    buf.extend_from_slice(&cols.to_le_bytes());
+    buf.extend_from_slice(&name_len.to_le_bytes());
     buf.extend_from_slice(name_bytes);
     while buf.len() < aligned {
         buf.push(0);
@@ -369,6 +405,67 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_shape_overflow_instead_of_panicking() {
+        let c = LqerCorrection {
+            layer_name: "overflow".into(),
+            rank: 2,
+            rows: usize::MAX,
+            cols: 1,
+            left_bf16: Vec::new(),
+            right_bf16: Vec::new(),
+        };
+        assert!(c.validate().unwrap_err().contains("overflow"));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn writer_rejects_dimensions_that_do_not_fit_the_wire_format() {
+        let c = LqerCorrection {
+            layer_name: "too-wide".into(),
+            rank: u32::MAX as usize + 1,
+            rows: 0,
+            cols: 0,
+            left_bf16: Vec::new(),
+            right_bf16: Vec::new(),
+        };
+        let error = write_lqer_bytes(&c).unwrap_err();
+        assert!(matches!(error, LqerLoadError::ShapeMismatch(_)));
+        assert!(error.to_string().contains("wire format"));
+
+        for (rows, cols) in [(u32::MAX as usize + 1, 0), (0, u32::MAX as usize + 1)] {
+            let c = LqerCorrection {
+                layer_name: "too-wide".into(),
+                rank: 0,
+                rows,
+                cols,
+                left_bf16: Vec::new(),
+                right_bf16: Vec::new(),
+            };
+            assert!(
+                write_lqer_bytes(&c)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("wire format")
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_left_and_right_bf16_byte_overflow() {
+        for (rows, cols) in [(usize::MAX / 2 + 1, 0), (0, usize::MAX / 2 + 1)] {
+            let c = LqerCorrection {
+                layer_name: "overflow".into(),
+                rank: 1,
+                rows,
+                cols,
+                left_bf16: Vec::new(),
+                right_bf16: Vec::new(),
+            };
+            assert!(c.validate().unwrap_err().contains("overflow"));
+        }
+    }
+
+    #[test]
     fn memory_bytes_is_sum_of_matrices() {
         let c = dummy(64, 128, 8);
         // 64*8*2 + 8*128*2 = 1024 + 2048 = 3072
@@ -425,6 +522,67 @@ mod tests {
         assert_eq!(parsed.cols, original.cols);
         assert_eq!(parsed.left_bf16, original.left_bf16);
         assert_eq!(parsed.right_bf16, original.right_bf16);
+    }
+
+    #[test]
+    fn canonical_v1_wire_bytes_are_exact() {
+        let correction = LqerCorrection {
+            layer_name: "xy".into(),
+            rank: 2,
+            rows: 1,
+            cols: 3,
+            left_bf16: vec![0x10, 0x11, 0x12, 0x13],
+            right_bf16: (0x20..=0x2b).collect(),
+        };
+        let expected = vec![
+            b'A', b'T', b'L', b'A', b'S', b'L', b'Q', b'E', 1, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 3,
+            0, 0, 0, 2, 0, 0, 0, b'x', b'y', 0, 0, 0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x23,
+            0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b,
+        ];
+        assert_eq!(write_lqer_bytes(&correction).unwrap(), expected);
+        let parsed = parse_lqer_bytes(&expected).unwrap();
+        assert_eq!(parsed.layer_name, "xy");
+        assert_eq!((parsed.rank, parsed.rows, parsed.cols), (2, 1, 3));
+        assert_eq!(parsed.left_bf16, [0x10, 0x11, 0x12, 0x13]);
+        assert_eq!(parsed.right_bf16, (0x20..=0x2b).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parse_rejects_nonzero_padding_and_trailing_bytes() {
+        let canonical = write_lqer_bytes(&make_correction("x", 1, 1, 1)).unwrap();
+        let mut nonzero_padding = canonical.clone();
+        nonzero_padding[29] = 1;
+        assert!(matches!(
+            parse_lqer_bytes(&nonzero_padding),
+            Err(LqerLoadError::ShapeMismatch(_))
+        ));
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(matches!(
+            parse_lqer_bytes(&trailing),
+            Err(LqerLoadError::ShapeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_extreme_header_before_copying_payloads() {
+        let mut header = vec![0u8; 32];
+        header[..8].copy_from_slice(LQER_MAGIC);
+        header[8..12].copy_from_slice(&LQER_VERSION.to_le_bytes());
+        for offset in [12, 16, 20] {
+            header[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert!(matches!(
+            parse_lqer_bytes(&header),
+            Err(LqerLoadError::ShapeMismatch(_))
+        ));
+
+        header[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            parse_lqer_bytes(&header),
+            Err(LqerLoadError::ShapeMismatch(_))
+        ));
     }
 
     #[test]

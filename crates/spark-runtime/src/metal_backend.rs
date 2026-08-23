@@ -50,7 +50,9 @@ use objc2_metal::{
 };
 use parking_lot::Mutex;
 
-use crate::gpu::{DevicePtr, GpuBackend, KernelArg, KernelHandle};
+use crate::gpu::{
+    DevicePtr, GpuBackend, KernelArg, KernelHandle, PinnedHostBuffer, PinnedHostStorage,
+};
 
 // ── Internal type aliases (Retained<ProtocolObject<dyn _>> is verbose) ────
 
@@ -61,6 +63,27 @@ type ObjCmdBuf = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 type ObjLibrary = Retained<ProtocolObject<dyn MTLLibrary>>;
 type ObjPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 type ObjSharedEvent = Retained<ProtocolObject<dyn MTLSharedEvent>>;
+
+struct MetalPinnedHostStorage {
+    _buffer: ObjBuffer,
+    ptr: NonNull<u8>,
+    bytes: usize,
+}
+
+// SAFETY: identical to `MetalGpuBackend`: the retained Shared MTLBuffer is
+// thread-safe, and the raw contents pointer remains stable until owner drop.
+unsafe impl Send for MetalPinnedHostStorage {}
+unsafe impl Sync for MetalPinnedHostStorage {}
+
+impl PinnedHostStorage for MetalPinnedHostStorage {
+    fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.bytes
+    }
+}
 
 // ── Stream + slab types ──────────────────────────────────────────────────
 
@@ -497,6 +520,10 @@ impl GpuBackend for MetalGpuBackend {
         0
     }
 
+    // Matches the `#[track_caller]` on the trait declaration. This backend does
+    // not feed `kernel_audit` — the audit exists for the CUDA serve path's
+    // `--check-kernels`, and Metal resolves against a different module set.
+    #[track_caller]
     fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle> {
         let key: PipelineKey = (module.to_string(), func_name.to_string());
         if let Some(handle) = self.pipeline_cache.lock().get(&key) {
@@ -667,41 +694,26 @@ impl GpuBackend for MetalGpuBackend {
         Ok(())
     }
 
-    fn alloc_host_pinned(&self, bytes: usize) -> Result<*mut u8> {
+    fn alloc_host_pinned(&self, bytes: usize) -> Result<PinnedHostBuffer> {
+        if bytes == 0 {
+            bail!("pinned host allocation must be non-empty");
+        }
         // UMA: a Shared MTLBuffer's contents() pointer IS host-pinned
-        // memory from the GPU's perspective. We park the buffer in
-        // the alloc table keyed by gpuAddress, then return the host
-        // pointer. `free_host_pinned` looks the buffer up by host
-        // pointer to release it.
+        // memory from the GPU's perspective. The returned RAII owner retains
+        // the MTLBuffer and releases it automatically on drop.
         let buf = self
             .device
-            .newBufferWithLength_options(bytes.max(1), MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| anyhow!("alloc_host_pinned: newBufferWithLength failed"))?;
-        let host_ptr = buf.contents().as_ptr() as *mut u8;
-        // Stash by gpuAddress so plain `free()` on the DevicePtr would
-        // also work; the host-pinned variant is purely a CPU view.
-        let addr = buf.gpuAddress();
-        if addr == 0 {
-            bail!("alloc_host_pinned: gpuAddress returned 0");
-        }
-        self.allocations.lock().insert(addr, buf);
-        Ok(host_ptr)
-    }
-
-    fn free_host_pinned(&self, ptr: *mut u8, _bytes: usize) -> Result<()> {
-        if ptr.is_null() {
-            return Ok(());
-        }
-        // Find the buffer whose contents() pointer matches.
-        let mut allocs = self.allocations.lock();
-        let target_addr = allocs.iter().find_map(|(addr, buf)| {
-            let host = buf.contents().as_ptr() as *mut u8;
-            if host == ptr { Some(*addr) } else { None }
-        });
-        if let Some(addr) = target_addr {
-            allocs.remove(&addr);
-        }
-        Ok(())
+        let ptr = NonNull::new(buf.contents().as_ptr() as *mut u8)
+            .ok_or_else(|| anyhow!("alloc_host_pinned: contents returned null"))?;
+        Ok(PinnedHostBuffer::from_storage(Box::new(
+            MetalPinnedHostStorage {
+                _buffer: buf,
+                ptr,
+                bytes,
+            },
+        )))
     }
 }
 

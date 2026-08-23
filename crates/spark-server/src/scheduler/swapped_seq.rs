@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! CPU metadata retained while a sequence's model state is swapped to disk.
+
+use super::ResponseSink;
+use crate::grammar::GrammarState;
+use std::time::Instant;
+
+/// A sequence that has been swapped out to disk (KV + SSM state saved to file).
+pub(in crate::scheduler) struct SwappedSeq {
+    pub tokens: Vec<u32>,
+    pub session_hash: u64,
+    pub seq_len: usize,
+    pub num_blocks: usize,
+    pub last_token: u32,
+    pub output_tokens: Vec<u32>,
+    pub max_output_tokens: usize,
+    pub remaining: usize,
+    pub min_tokens: usize,
+    pub eos_tokens: Vec<u32>,
+    pub sink: ResponseSink,
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub temperature: f32,
+    pub top_k: u32,
+    pub top_p: f32,
+    pub top_n_sigma: f32,
+    pub min_p: f32,
+    pub repetition_penalty: f32,
+    pub repetition_penalty_window: u32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub lz_penalty: f32,
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: u32,
+    pub dry_sequence_breakers: Vec<u32>,
+    pub logit_bias: Vec<(u32, f32)>,
+    pub inside_thinking: bool,
+    pub enable_thinking: bool,
+    pub thinking_budget: Option<u32>,
+    pub spontaneous_think_budget: u32,
+    pub thinking_tokens: u32,
+    pub force_end_thinking: bool,
+    pub consecutive_confident: u32,
+    pub in_code_fence: bool,
+    pub think_end_token: Option<u32>,
+    pub think_start_token: Option<u32>,
+    pub think_ended: bool,
+    pub think_just_ended: bool,
+    pub think_skip_count: u32,
+    pub post_think_gate_steps: u8,
+    pub require_tool_call: bool,
+    pub suppress_tool_call: bool,
+    /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
+    pub disable_mtp: bool,
+    pub content_started: bool,
+    pub content_tokens: u32,
+    pub prose_tokens_since_last_tool: u32,
+    pub think_watchdog_fires: u32,
+    /// Phase-C: watchdog rollback counter, preserved across snapshot/restore.
+    pub rollback_count: u32,
+    pub tool_call_start_token: Option<u32>,
+    pub tool_call_opened: bool,
+    pub inside_tool_body: bool,
+    pub tool_call_end_token: Option<u32>,
+    /// Live CPU-owned grammar matcher, moved intact across disk swap.
+    pub grammar_state: Option<GrammarState>,
+    pub last_token_time: Instant,
+    pub request_start: Instant,
+    pub decode_start: Instant,
+    pub seed: Option<u64>,
+    pub top_logprobs: Option<u8>,
+    pub logprobs_data: Vec<crate::api::TokenLogprobs>,
+    /// Number of prompt tokens served by the prefix cache (no prefill cost).
+    pub cached_prompt_tokens: u32,
+    pub adaptive: crate::adaptive_sampler::AdaptiveSamplingState,
+    pub difficulty_probe: crate::scheduler::thinking_efficiency::DifficultyProbe,
+    pub timeout_at: Option<Instant>,
+    pub swap_id: u64,
+}

@@ -24,16 +24,20 @@ mod helpers;
 mod lifecycle;
 mod logprobs;
 mod mod_helpers;
+mod mtp_gate;
 mod mtp_step;
 mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
 mod prefill_a_step;
 mod prefill_b_step;
+mod proposal_lifecycle;
 mod repetition;
 mod rollback;
 mod sample_step;
+mod spec_policy_accept;
 mod spec_step;
+mod spec_timing;
 mod ssm_decode_ring;
 mod think_spec_accept;
 mod thinking_efficiency;
@@ -57,14 +61,16 @@ use decode_step::*;
 use emit_step::*;
 pub use helpers::set_boundary_token_mask;
 pub use helpers::set_enable_loop_watchdog;
+pub use helpers::set_enable_thinking_loop_watchdog;
 pub use helpers::set_im_start_hard_stop;
 pub use helpers::set_numeric_token_mask;
 use helpers::*;
 pub use helpers::{CONTENT_LOOP_PERIOD_MAX, CONTENT_LOOP_PERIOD_MIN};
-pub use helpers::{WatchdogParams, set_watchdog_params};
+pub use helpers::{WatchdogParams, resolve_max_inter_tool_prose, set_watchdog_params};
 use lifecycle::*;
 use logprobs::*;
 use mod_helpers::*;
+use mtp_gate::{ArmKind, ArmSpec, MtpGate};
 use mtp_step::*;
 use phase_continue_prefills::continue_in_progress_prefills;
 use phase_start_prefills::start_new_requests;
@@ -73,6 +79,7 @@ use prefill_b_step::*;
 use repetition::*;
 use rollback::{RollbackOutcome, rollback_to_boundary};
 use sample_step::*;
+use spec_policy_accept::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;
 use think_spec_accept::*;
@@ -95,7 +102,7 @@ use verify_k4_step::*;
 // of them directly (see scheduler/decode_step.rs etc.).
 use anyhow::Result;
 use parking_lot::{Condvar, Mutex};
-use spark_model::traits::{Model, SequenceState};
+use spark_model::traits::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT, Model, SequenceState};
 use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_spill::KvSpillManager;
 use spark_runtime::sampler::{SamplingParams, sample_with_params, sample_with_params_history};
@@ -108,6 +115,170 @@ use crate::api::{GrammarSpec, InferenceRequest, InferenceResponse, StreamEvent};
 use crate::grammar::{GrammarEngine, GrammarState};
 use crate::ngram::NgramProposer;
 use crate::scheduling_policy::SchedulingPolicy;
+
+/// Build the speculation gate's arm set, or `None` to leave it disarmed.
+///
+/// Disarmed is the DEFAULT and must stay that way: `--mtp-gate` absent means
+/// the champion configuration runs byte-for-byte as it did before the gate
+/// existed, which is what makes an A/B against it meaningful.
+///
+/// `mode` is the resolved `--mtp-gate` value:
+///   - `None`            → no gate (default)
+///   - `Some("force")`   → no gate, and say so (diagnostic; verify keeps
+///                          flowing even where the gate would measure it
+///                          net-negative)
+///   - `Some("auto")`    → arbitrate over every arm this build can offer
+///   - `Some("dflash")`  → pin proposer arm 0
+///   - `Some("mtp")`     → pin proposer arm 1
+///
+/// Optional extra arms, opt-in because neither is measured yet:
+///   - `ATLAS_MTP_GATE_GAMMA_ARM=N` adds a γ-capped variant of arm 0. See
+///     `speculative::set_dflash_gamma_override` for why a runtime cap is not
+///     the same thing as serving with `--dflash-gamma N`.
+///   - `ATLAS_MTP_GATE_SERIAL_ARM=1` adds a no-speculation arm. Measured floor
+///     is ~13 tok/s on every task, i.e. dominated by both proposer arms on
+///     this model — hence off by default.
+fn build_speculation_gate(model: &dyn Model, use_mtp: bool, mode: Option<&str>) -> Option<MtpGate> {
+    let mode = mode?;
+    if !use_mtp {
+        tracing::warn!("--mtp-gate {mode} ignored: speculation is not active for this run");
+        return None;
+    }
+    if mode == "force" {
+        tracing::warn!(
+            "--mtp-gate force: speculation gate DISARMED (diagnostic; verify runs even \
+             where the gate would measure it net-negative)"
+        );
+        return None;
+    }
+
+    let arms_available = model.proposer_arm_count();
+    let primary_is_dflash = model.proposer_is_dflash();
+    let primary_name = if primary_is_dflash { "dflash" } else { "mtp" };
+    // The alternate arm is the in-checkpoint MTP head, which is measured
+    // monotonically worse with more drafts on this model family (K=2 beats
+    // K=4 on every benchmark task; K=8 falls below the no-speculation floor).
+    // The run's `num_drafts` belongs to the DFlash arm — with a block-16
+    // checkpoint it is the actual trained draft count γ=15 — so the MTP arm
+    // gets its own, overridable for a
+    // model whose head really does want a wider K.
+    let alt_num_drafts = std::env::var("ATLAS_MTP_GATE_ALT_DRAFTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+
+    // Pinned arms are a one-arm "gate": no probing, no switching, but the
+    // arm-selection plumbing still runs so `--mtp-gate mtp` is a real A/B
+    // against `--mtp-gate dflash` on one binary and one set of weights.
+    match mode {
+        "dflash" => {
+            return Some(MtpGate::new(vec![ArmSpec::spec(
+                "pinned-dflash",
+                mtp_gate::PROPOSER_ARM_PRIMARY,
+                0,
+                0,
+            )]));
+        }
+        "mtp" => {
+            if arms_available < 2 {
+                tracing::warn!(
+                    "--mtp-gate mtp: this build has only one proposer arm ({primary_name}); \
+                     pass --dflash AND --speculative to build both. Pinning arm 0 instead."
+                );
+                return Some(MtpGate::new(vec![ArmSpec::spec(
+                    "pinned-arm0",
+                    mtp_gate::PROPOSER_ARM_PRIMARY,
+                    0,
+                    0,
+                )]));
+            }
+            return Some(MtpGate::new(vec![ArmSpec::spec(
+                "pinned-mtp",
+                mtp_gate::PROPOSER_ARM_ALT,
+                0,
+                alt_num_drafts,
+            )]));
+        }
+        "auto" => {}
+        other => {
+            tracing::error!("--mtp-gate {other}: unknown mode, gate DISARMED");
+            return None;
+        }
+    }
+
+    let mut arms = vec![ArmSpec::spec(
+        if primary_is_dflash { "dflash" } else { "mtp" },
+        mtp_gate::PROPOSER_ARM_PRIMARY,
+        0,
+        0,
+    )];
+    if arms_available >= 2 {
+        arms.push(ArmSpec::spec(
+            "mtp-alt",
+            mtp_gate::PROPOSER_ARM_ALT,
+            0,
+            alt_num_drafts,
+        ));
+    }
+    if primary_is_dflash
+        && let Ok(v) = std::env::var("ATLAS_MTP_GATE_GAMMA_ARM")
+        && let Ok(g) = v.trim().parse::<usize>()
+        && g > 0
+    {
+        arms.push(ArmSpec::spec(
+            "dflash-gamma-capped",
+            mtp_gate::PROPOSER_ARM_PRIMARY,
+            g,
+            0,
+        ));
+    }
+    if std::env::var("ATLAS_MTP_GATE_SERIAL_ARM").ok().as_deref() == Some("1") {
+        arms.push(ArmSpec::serial("serial"));
+    }
+
+    if arms.len() < 2 {
+        tracing::warn!(
+            "--mtp-gate auto: only one arm is available ({primary_name}) — the gate will \
+             measure but can never switch. Pass --dflash AND --speculative to build both \
+             proposers, or set ATLAS_MTP_GATE_SERIAL_ARM=1 to arbitrate against plain decode."
+        );
+    }
+    Some(MtpGate::new(arms))
+}
+
+/// Point the model at `arm`'s proposer and γ cap, moving every live sequence's
+/// parked proposer state across with it.
+///
+/// The state swap is what makes an arm change safe: each proposer owns a
+/// differently-typed per-sequence state and readers downcast
+/// `seq.proposer_state` to the type they expect, so repointing the model
+/// without moving the states would hand the incoming drafter the outgoing
+/// one's buffers.
+fn select_gate_arm(model: &dyn Model, active: &mut [ActiveSeq], arm: ArmSpec) {
+    // `num_drafts` is read at the dispatch site, not here — this function only
+    // repoints the model. The `..` keeps it that way without re-binding it.
+    let ArmKind::Spec {
+        proposer_arm,
+        draft_cap,
+        ..
+    } = arm.kind
+    else {
+        // Serial arm: nothing to select. The γ override is left alone because
+        // no propose will run this step.
+        return;
+    };
+    let previous = model.proposer_arm();
+    if previous != proposer_arm {
+        let effective = model.set_proposer_arm(proposer_arm);
+        if effective != previous {
+            for a in active.iter_mut() {
+                model.swap_proposer_state(&mut a.seq);
+            }
+        }
+    }
+    spark_model::speculative::set_dflash_gamma_override(draft_cap);
+}
 
 /// Run the scheduler loop on the current thread.
 #[allow(clippy::too_many_arguments)]
@@ -136,11 +307,32 @@ pub fn run(
     adaptive_sampling: bool,
     mut session_manager: crate::session_manager::SessionSsmManager,
     spontaneous_think_budget: u32,
+    // Resolved `--mtp-gate` value; `None` (the default) leaves the speculation
+    // gate disarmed and the run byte-identical to before. (A plain comment,
+    // not a doc comment: rustc rejects `///` on a function parameter.)
+    mtp_gate_mode: Option<String>,
 ) {
+    match spec_timing::configure(max_batch_size) {
+        Ok(true) => tracing::info!("DFlash spec-cycle schema 2 timing armed (C=1, async=0)"),
+        Ok(false) => {}
+        Err(error) => tracing::error!("DFlash spec-cycle schema 2 timing disabled: {error}"),
+    }
     model
         .bind_gpu_to_thread()
         .expect("Failed to bind CUDA context to scheduler thread");
-    let use_mtp = use_speculative && model.has_proposer();
+    // Diagnostic/correctness escape hatch: keep the proposer and all of its
+    // model-side buffers loaded, but route every request through the ordinary
+    // decode scheduler.  This is deliberately evaluated once at scheduler
+    // startup so it cannot change state-machine arms in the middle of a
+    // sequence.
+    let force_disable_speculation =
+        std::env::var("ATLAS_DISABLE_SPECULATION").ok().as_deref() == Some("1");
+    let use_mtp = use_speculative && model.has_proposer() && !force_disable_speculation;
+    if force_disable_speculation && use_speculative && model.has_proposer() {
+        tracing::warn!(
+            "ATLAS_DISABLE_SPECULATION=1: proposer remains loaded; using ordinary decode scheduling"
+        );
+    }
     let num_drafts = if use_mtp || use_self_speculative || use_ngram_speculative {
         num_drafts.max(1)
     } else {
@@ -152,6 +344,36 @@ pub fn run(
     } else {
         None
     };
+    // Throughput-arbitrated speculation gate. `None` unless `--mtp-gate` was
+    // passed, so the default path below is exactly the pre-gate `step_mtp`
+    // call. `last_gate_arm` tracks the arm the PREVIOUS step actually ran, so
+    // the transition cleanup fires on probe excursions too and not only on
+    // committed switches.
+    let primary_proposer_is_dflash = model.proposer_is_dflash();
+    let mut spec_gate = build_speculation_gate(&*model, use_mtp, mtp_gate_mode.as_deref());
+    let entry_pin =
+        mtp_gate::parse_entry_pin_tokens(std::env::var("ATLAS_SPEC_ENTRY_PIN").ok().as_deref());
+    if use_mtp {
+        tracing::info!(
+            env = "ATLAS_SPEC_ENTRY_PIN",
+            tokens = entry_pin.tokens,
+            source = entry_pin.source,
+            gate_armed = spec_gate.is_some(),
+            "spec-entry dispatch provenance"
+        );
+    }
+    // Hoisted out of the step loop: the arm set is fixed at construction, so
+    // "can this gate ever change what we run?" is a constant for the whole
+    // serve. False for `--mtp-gate dflash|mtp` (a pinned arm) and for `auto`
+    // on a build that only produced one proposer. When false the scheduler
+    // skips ALL of the gate's measurement below — see the step dispatch.
+    let gate_arbitrates = spec_gate.as_ref().is_some_and(MtpGate::arbitrates);
+    let mut last_gate_arm: Option<usize> = None;
+    // A Serial arm leaves the previously selected proposer installed. Keep its
+    // own request width as well: the DFlash primary normally uses γ=15 while
+    // the native MTP alternate uses one draft.
+    let mut last_spec_num_drafts = num_drafts;
+    let mut last_step_was_entry_pin = false;
     tracing::info!(
         "Scheduler started (batched mode, max_batch={max_batch_size}, mtp={}, ngram={}, num_drafts={num_drafts}, policy={}, chunked_prefill={}, max_prefill_tokens={})",
         use_mtp,
@@ -210,19 +432,23 @@ pub fn run(
 
     install_high_speed_swap(&*model, high_speed_swap_cfg);
 
-    // ATLAS_THINK_SPEC=1: allow MTP/DFlash speculative decode DURING
-    // `<think>` spans. The post-verify accept filter
+    // Native MTP verifies DURING `<think>` spans by default. DFlash keeps the
+    // ATLAS_THINK_SPEC=1 opt-in because its wide forward is a distinct
+    // numerical path. The post-verify accept filter
     // (`think_spec_accept::dflash_thinking_accept`) re-derives the
     // plain-path token per position, so output stays byte-identical to
     // `step_decode_only`. Disqualified when the model emits fp32 decode
-    // logits (the filter's row D2H assumes BF16) or `--adaptive-sampling`
-    // is on (its per-token entropy observation is plain-path-only state).
-    // Default OFF: `enabled=false` reproduces the historical
-    // `!inside_thinking` gate bit-for-bit.
+    // logits (the filter's row D2H assumes BF16). Adaptive sampling is
+    // threaded through the same per-row function, including state updates.
+    // FP32 verify logits remain serial because the current per-row oracle reads
+    // BF16. `dflash_spec_think` is resolved once so request scheduling cannot
+    // change if the environment is mutated mid-serve.
+    let dflash_spec_think = think_spec_enabled();
     let think_ctx = ThinkSpecCtx {
-        enabled: think_spec_enabled() && !adaptive_sampling && !model.decode_logits_fp32(),
+        enabled: !model.decode_logits_fp32(),
         code_fence_token,
         reflection_suppress_ids: &reflection_suppress_ids,
+        adaptive_sampling,
     };
 
     loop {
@@ -316,6 +542,11 @@ pub fn run(
             continue;
         }
 
+        // Retirement consumes this in lockstep with `active`. Ordinary,
+        // bootstrap and serial finishes stay cacheable; `step_mtp` clears only
+        // entries that finish inside an over-planned speculative verify frame.
+        let mut cache_on_finish = vec![true; active.len()];
+
         // Skip decode when mixed_forward already processed decode logits.
         if !did_mixed_step {
             // Ensure any in-flight prefill work on the prefill stream is complete
@@ -328,54 +559,296 @@ pub fn run(
             if use_ngram_speculative && active.len() == 1 && active[0].grammar_state.is_none() {
                 // N-gram speculative: CPU proposer + CUDA-graphed K=2 verify.
                 if let Some(ref mut proposer) = ngram_proposer {
+                    let was_verify = !active[0].pending_drafts.is_empty();
                     step_ngram(&*model, &mut active, proposer);
+                    if was_verify && active[0].finished {
+                        cache_on_finish[0] = false;
+                    }
                 }
             } else if use_self_speculative && active.len() == 1 && active[0].grammar_state.is_none()
             {
                 // Self-speculative: draft via layer-skipping, verify with full model.
                 step_self_spec(&*model, &mut active, num_drafts);
-            } else if use_mtp
-                && active.iter().all(|a| {
-                    // ATLAS_THINK_SPEC=1: `inside_thinking` no longer
-                    // disqualifies — the DFlash verify path re-derives the
-                    // plain-path thinking interventions post-verify (see
-                    // think_spec_accept.rs). suppress_tool_call /
-                    // disable_mtp gates unchanged.
-                    (!a.inside_thinking || think_ctx.enabled)
+                if active[0].finished {
+                    // The self-spec helper may have over-planned a dense verify
+                    // frame before the terminal emission. Conservatively skip
+                    // the final cache insert; sequence teardown is unchanged.
+                    cache_on_finish[0] = false;
+                }
+            } else if use_mtp {
+                let thinking_step_allowed = if let Some(gate) = spec_gate.as_ref() {
+                    mtp_gate::arm_allows_thinking(
+                        gate.next_arm().kind,
+                        primary_proposer_is_dflash,
+                        dflash_spec_think,
+                        think_ctx.enabled,
+                    )
+                } else {
+                    let current = ArmKind::Spec {
+                        proposer_arm: if primary_proposer_is_dflash {
+                            mtp_gate::PROPOSER_ARM_PRIMARY
+                        } else {
+                            model.proposer_arm()
+                        },
+                        draft_cap: 0,
+                        num_drafts,
+                    };
+                    mtp_gate::arm_allows_thinking(
+                        current,
+                        primary_proposer_is_dflash,
+                        dflash_spec_think,
+                        think_ctx.enabled,
+                    )
+                };
+                if active.iter().all(|a| {
+                    // Native MTP may verify while thinking; DFlash requires
+                    // ATLAS_THINK_SPEC=1. Both use the same post-verify policy
+                    // oracle (see think_spec_accept.rs). suppress_tool_call /
+                    // disable_mtp gates are unchanged.
+                    (!a.inside_thinking || thinking_step_allowed)
                         && !a.suppress_tool_call
                         && !a.disable_mtp
-                })
-            {
-                // MTP speculative decode for ALL active sequences.
-                //
-                // Concurrent-decode fix (2026-05-22): previously gated on
-                // `active.len() == 1`, which forced n>=2 into
-                // `step_decode_only`. That path runs the SSM
-                // `decode_multi_seq_inner` which sequentially calls
-                // per-seq `decode()` (see qwen3_ssm/trait_decode_multi_seq.rs
-                // — comment: "delegate to per-sequence single decode") with
-                // no CUDA graphs and no MTP, collapsing throughput to ~14
-                // tok/s aggregate at c=2 (down from 28 at c=1).
-                //
-                // `step_mtp` already loops bootstrap+verify across all
-                // active sequences (see mtp_step.rs lines 21,96). Each
-                // sequence reuses its own per-slot CUDA graph for K=3
-                // verify (graph cache is keyed on `seq.slot_idx` in
-                // verify_c.rs), so n>=2 captures one graph per slot on
-                // first iteration and replays on every subsequent step.
-                //
-                // Per-seq guards (inside_thinking / suppress_tool_call /
-                // disable_mtp) are checked across ALL active sequences
-                // because step_mtp doesn't conditionally bootstrap per
-                // active flag; if any seq disables MTP we fall back to
-                // batched decode_only for the whole batch this tick.
-                step_mtp(&*model, &mut active, num_drafts, &think_ctx);
+                }) {
+                    // MTP speculative decode for ALL active sequences.
+                    //
+                    // Concurrent-decode fix (2026-05-22): previously gated on
+                    // `active.len() == 1`, which forced n>=2 into
+                    // `step_decode_only`. That path runs the SSM
+                    // `decode_multi_seq_inner` which sequentially calls
+                    // per-seq `decode()` (see qwen3_ssm/trait_decode_multi_seq.rs
+                    // — comment: "delegate to per-sequence single decode") with
+                    // no CUDA graphs and no MTP, collapsing throughput to ~14
+                    // tok/s aggregate at c=2 (down from 28 at c=1).
+                    //
+                    // `step_mtp` already loops bootstrap+verify across all
+                    // active sequences (see mtp_step.rs lines 21,96). Each
+                    // sequence reuses its own per-slot CUDA graph for K=3
+                    // verify (graph cache is keyed on `seq.slot_idx` in
+                    // verify_c.rs), so n>=2 captures one graph per slot on
+                    // first iteration and replays on every subsequent step.
+                    //
+                    // Per-seq guards (inside_thinking / suppress_tool_call /
+                    // disable_mtp) are checked across ALL active sequences
+                    // because step_mtp doesn't conditionally bootstrap per
+                    // active flag; if any seq disables MTP we fall back to
+                    // batched decode_only for the whole batch this tick.
+                    //
+                    // ── Speculation gate (`--mtp-gate`) ──
+                    //
+                    // When armed, the gate picks which arm to run for THIS step —
+                    // the external DFlash/DDTree drafter, the native MTP head, a
+                    // γ-capped drafter, or plain decode — by comparing DELIVERED
+                    // tok/s per arm over 16-step windows with hysteresis and
+                    // periodic probing. Every arm emits real, correct tokens, so
+                    // arbitration never wastes work. See `mtp_gate` for why this
+                    // measures throughput and not draft acceptance.
+                    //
+                    // Disarmed (the default) this is exactly the previous call.
+                    if let Some(gate) = spec_gate.as_mut() {
+                        let arm_idx = gate.next_arm_index();
+                        let arm = gate.next_arm();
+                        let pin_active = matches!(arm.kind, ArmKind::Serial)
+                            && mtp_gate::entry_pin_active(
+                                entry_pin.tokens,
+                                active.iter().map(|a| {
+                                    (a.think_ended, a.inside_thinking, a.post_think_gate_steps)
+                                }),
+                            );
+                        let pinned_spec_width = mtp_gate::entry_pin_spec_width(
+                            arm.kind,
+                            pin_active,
+                            last_spec_num_drafts,
+                        );
+                        // Everything the gate measures exists to feed arbitration,
+                        // so a gate that cannot arbitrate must not pay for it. A
+                        // PINNED arm therefore skips the depth scan, both
+                        // `seq_len` scans, the `Instant` pair and the window
+                        // accounting, and what remains between it and the disarmed
+                        // path is one `Option` compare plus a `match` on a value
+                        // that never changes.
+                        //
+                        // `Some(before)` doubles as the "measure this step" flag.
+                        let measure = if gate_arbitrates && pinned_spec_width.is_none() {
+                            // One pass, two answers. Depth is the MAX `seq_len`
+                            // (arm economics are depth-dependent: weight-bound at
+                            // short context, KV/SSM-bound at depth). Delivered
+                            // tokens are the SUM — counting only `active[0]` would
+                            // under-report a speculative arm by a factor of n and
+                            // bias the gate toward whichever arm is cheapest per
+                            // step rather than fastest per token.
+                            let (depth, before) =
+                                active.iter().fold((0usize, 0usize), |(d, s), a| {
+                                    (d.max(a.seq.seq_len), s + a.seq.seq_len)
+                                });
+                            gate.observe_depth(depth);
+                            Some(before)
+                        } else {
+                            None
+                        };
+
+                        let arm_changed = last_gate_arm != Some(arm_idx);
+                        if arm_changed {
+                            // Arm transition. Drafts in flight belong to the
+                            // OUTGOING arm and would be verified against the
+                            // incoming one's assumptions, so drop them (and the
+                            // paired DDTree payload) and order the previous
+                            // verify's async live-state restore before the next
+                            // step reads h_state/conv_state. The next speculative
+                            // step then re-enters through `step_mtp`'s bootstrap
+                            // phase, whose `trim_proposer_state(seq, 0, 0)` resets
+                            // the drafter's RoPE conditioning — which is what
+                            // makes re-entry lossless.
+                            for a in active.iter_mut() {
+                                a.pending_drafts.clear();
+                                a.pending_tree_payload = None;
+                            }
+                            if let Err(e) = model.sync_secondary() {
+                                tracing::error!("gate arm switch sync_secondary: {e:#}");
+                            }
+                            select_gate_arm(&*model, &mut active, arm);
+                            tracing::debug!(
+                                "speculation gate: running arm {} ({})",
+                                arm_idx,
+                                gate.arm_name(arm_idx)
+                            );
+                            last_gate_arm = Some(arm_idx);
+                        } else if mtp_gate::entry_pin_exits_to_serial(
+                            arm.kind,
+                            last_step_was_entry_pin,
+                            pinned_spec_width,
+                        ) {
+                            // The gate stayed on Serial while the entry pin ran the
+                            // installed proposer, so no arm transition exists to
+                            // drop that last pinned step's drafts or order its
+                            // async recurrent-state restore.
+                            for a in active.iter_mut() {
+                                a.pending_drafts.clear();
+                                a.pending_tree_payload = None;
+                            }
+                            if let Err(e) = model.sync_secondary() {
+                                tracing::error!("entry-pin→serial sync_secondary: {e:#}");
+                            }
+                        }
+
+                        // Taken as late as possible so the one-shot transition
+                        // work above is not charged to the arm being switched TO.
+                        let t0 = measure.map(|_| Instant::now());
+                        if let Some(nd) = pinned_spec_width {
+                            // Entry pins are correctness dispatches, not samples of
+                            // the Serial arm. Run the proposer which remains selected
+                            // across the serial dwell and leave gate statistics
+                            // untouched. `step_mtp`'s post-think policy gate routes
+                            // both native short drafts and DFlash γ blocks through
+                            // the row-by-row sampler oracle.
+                            step_mtp(&*model, &mut active, nd, &think_ctx, &mut cache_on_finish);
+                        } else {
+                            match arm.kind {
+                                ArmKind::Serial => {
+                                    step_decode_only(
+                                        &*model,
+                                        &mut active,
+                                        think_end_token,
+                                        think_start_token,
+                                        code_fence_token,
+                                        tool_call_start_token,
+                                        tool_call_end_token,
+                                        &reflection_suppress_ids,
+                                        adaptive_sampling,
+                                    );
+                                }
+                                ArmKind::Spec {
+                                    num_drafts: arm_drafts,
+                                    ..
+                                } => {
+                                    // 0 means "the run's configured value" — the
+                                    // DFlash arm — so only the alternate arm departs
+                                    // from it.
+                                    let nd = if arm_drafts == 0 {
+                                        num_drafts
+                                    } else {
+                                        arm_drafts
+                                    };
+                                    last_spec_num_drafts = nd;
+                                    step_mtp(
+                                        &*model,
+                                        &mut active,
+                                        nd,
+                                        &think_ctx,
+                                        &mut cache_on_finish,
+                                    );
+                                }
+                            }
+                        }
+                        if let (Some(before), Some(t0)) = (measure, t0) {
+                            let after: usize = active.iter().map(|a| a.seq.seq_len).sum();
+                            gate.record_step(t0.elapsed(), after.saturating_sub(before));
+                            // Drained rather than acted on: the arm change is
+                            // applied from `next_arm_index` at the top of the next
+                            // step (which also covers probe excursions, where no
+                            // "switch" is reported). Taking it here keeps the
+                            // one-shot from going stale and gives the switch a
+                            // single owner. Only reachable when arbitrating —
+                            // a pinned gate never produces a switch to drain.
+                            let _ = gate.take_fresh_switch();
+                        }
+                        last_step_was_entry_pin = pinned_spec_width.is_some();
+                    } else {
+                        step_mtp(
+                            &*model,
+                            &mut active,
+                            num_drafts,
+                            &think_ctx,
+                            &mut cache_on_finish,
+                        );
+                    }
+                } else {
+                    // Fall through to the ordinary decode path below.
+                    if use_mtp {
+                        for a in active.iter_mut() {
+                            a.pending_drafts.clear();
+                            a.pending_tree_payload = None;
+                        }
+                        if let Err(e) = model.sync_secondary() {
+                            tracing::error!("mtp→decode sync_secondary: {e:#}");
+                        }
+                        last_step_was_entry_pin = false;
+                    }
+                    step_decode_only(
+                        &*model,
+                        &mut active,
+                        think_end_token,
+                        think_start_token,
+                        code_fence_token,
+                        tool_call_start_token,
+                        tool_call_end_token,
+                        &reflection_suppress_ids,
+                        adaptive_sampling,
+                    );
+                }
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.
                 if use_mtp {
                     for a in active.iter_mut() {
                         a.pending_drafts.clear();
+                        // `pending_tree_payload` is paired with `pending_drafts`
+                        // (types.rs:194) and mtp_step.rs:49-50 always clears the
+                        // two together. Clearing only the drafts here let a stale
+                        // DDTree payload survive an MTP→decode→MTP round trip and
+                        // be applied against a different `seq_len`.
+                        a.pending_tree_payload = None;
                     }
+                    // MTP→decode-only transition: the last verify commit's
+                    // live-state restore runs async on the secondary stream;
+                    // order it before this decode reads h_state/conv_state
+                    // (GPU-side event wait, zero CPU cost). Every other verify
+                    // path already does this (verify_k3_step.rs:9,
+                    // verify_k4_step.rs:10, verify_dflash_batched_step.rs:43,
+                    // spec_step.rs:227, verify_csk_step_k2.rs:38) — this exit
+                    // edge was the one that did not.
+                    if let Err(e) = model.sync_secondary() {
+                        tracing::error!("mtp→decode sync_secondary: {e:#}");
+                    }
+                    last_step_was_entry_pin = false;
                 }
                 step_decode_only(
                     &*model,
@@ -391,7 +864,7 @@ pub fn run(
             }
         }
 
-        retire_finished_sequences(&*model, &mut active);
+        retire_finished_sequences(&*model, &mut active, &mut cache_on_finish);
 
         // ── Swap-in: resume swapped sequences when blocks free up ──
         if let Some(ref mut spill) = spill_manager {

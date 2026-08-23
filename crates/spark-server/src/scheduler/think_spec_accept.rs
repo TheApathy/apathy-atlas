@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_THINK_SPEC=1` — speculative decode inside `<think>` spans.
+//! Policy-aware speculative decode inside `<think>` spans.
 //!
 //! The scheduler historically forced every batch containing a thinking
 //! sequence into plain `step_decode_only` (see the `!a.inside_thinking`
@@ -35,9 +35,9 @@
 //! keeps the plain-path contract of "committed but not yet fed to the
 //! model" across the transition.
 //!
-//! Default OFF: with the env var unset, `ThinkSpecCtx::enabled` is false,
-//! the scheduler gate keeps excluding thinking sequences from MTP, and no
-//! code path here runs — byte-identical to the historical behavior.
+//! Native MTP uses this path by default when the BF16 row oracle is available.
+//! DFlash keeps the historical `ATLAS_THINK_SPEC=1` opt-in because its wider
+//! raw verify path has a separate correctness contract.
 
 use super::*;
 
@@ -51,21 +51,23 @@ pub(super) fn think_spec_enabled() -> bool {
 /// `step_verify_dflash` (the tokens not carried on `ActiveSeq`).
 #[derive(Clone, Copy)]
 pub(super) struct ThinkSpecCtx<'a> {
-    /// Master gate: `ATLAS_THINK_SPEC=1` AND the model has BF16 decode
-    /// logits AND `--adaptive-sampling` is off (its per-token entropy
-    /// observation is plain-path state this filter does not replicate).
+    /// The BF16 per-row policy oracle is available. Scheduler dispatch enables
+    /// native MTP thinking by default and separately keeps DFlash behind
+    /// `ATLAS_THINK_SPEC=1`.
     pub enabled: bool,
     /// ``` fence token — `in_code_fence` parity (gates the forced
     /// `</think>` injection deferral).
     pub code_fence_token: Option<u32>,
     /// F1 reflection-suppression id set (`-10.0` during thinking).
     pub reflection_suppress_ids: &'a [u32],
+    /// Mirror the scheduler's request-wide adaptive sampler setting.
+    pub adaptive_sampling: bool,
 }
 
-/// Result of a thinking-span accept walk. Tokens (accepted prefix AND
-/// bonus) are already committed/streamed by the walk itself — the caller
-/// must skip its own emit loop and only run the seq/SSM bookkeeping.
-pub(super) struct ThinkAcceptOutcome {
+/// Result of a sampler-policy accept walk. Tokens (accepted prefix AND bonus)
+/// are already committed/streamed by the walk itself — the caller must skip
+/// its own emit loop and only run the seq/SSM bookkeeping.
+pub(super) struct SpecAcceptOutcome {
     /// Drafts accepted (excludes the bonus). Same contract as the legacy
     /// accept-prefix: `seq` rollback and the SSM commit use it unchanged.
     pub num_accepted: usize,
@@ -154,15 +156,16 @@ pub(super) fn dflash_thinking_accept(
     ctx: &ThinkSpecCtx<'_>,
     mut fetch_row: impl FnMut(usize, &mut Vec<u8>) -> bool,
     mut on_think_end: impl FnMut(&mut ActiveSeq),
-) -> ThinkAcceptOutcome {
+) -> SpecAcceptOutcome {
     debug_assert!(a.inside_thinking);
-    let seq_fast = fast_path_seq_eligible(a);
+    let seq_fast = fast_path_seq_eligible(a) && !ctx.adaptive_sampling;
     let wave_active = think_efficiency_config().is_active();
     let mut row_buf: Vec<u8> = Vec::new();
     let mut num_accepted = 0usize;
     for i in 0..verified.len() {
         let raw = verified[i];
         let fast = seq_fast
+            && a.thinking_tokens >= crate::scheduler::helpers::min_thinking_floor()
             && position_fast_path_ok(
                 raw,
                 ctx.reflection_suppress_ids,
@@ -187,7 +190,7 @@ pub(super) fn dflash_thinking_accept(
                 // be lossy — end the sequence instead.
                 tracing::error!("think-spec verify: logits row {i} unavailable; finishing seq");
                 a.finished = true;
-                return ThinkAcceptOutcome {
+                return SpecAcceptOutcome {
                     num_accepted,
                     bonus: None,
                 };
@@ -205,10 +208,7 @@ pub(super) fn dflash_thinking_accept(
                 a.tool_call_start_token,
                 a.tool_call_end_token,
                 ctx.reflection_suppress_ids,
-                // --adaptive-sampling disqualifies think-spec at the
-                // scheduler gate, so the plain path would also run with
-                // the adaptive observer inert here.
-                false,
+                ctx.adaptive_sampling,
             )
         };
         // `</think>` / EOS are phase-boundary tokens: always the bonus,
@@ -222,13 +222,13 @@ pub(super) fn dflash_thinking_accept(
             if !a.finished {
                 a.last_token = target;
             }
-            return ThinkAcceptOutcome {
+            return SpecAcceptOutcome {
                 num_accepted,
                 bonus: Some(target),
             };
         }
         if a.finished {
-            return ThinkAcceptOutcome {
+            return SpecAcceptOutcome {
                 num_accepted: num_accepted + 1,
                 bonus: None,
             };
@@ -246,7 +246,7 @@ pub(super) fn dflash_thinking_accept(
         "think-spec walk fell off a non-empty verified loop"
     );
     a.finished = true;
-    ThinkAcceptOutcome {
+    SpecAcceptOutcome {
         num_accepted,
         bonus: None,
     }
@@ -326,7 +326,8 @@ fn commit_thinking_token(
 /// keep the scan frame identical. The suppressed-EOS branch never pushes,
 /// so it scans the full vec.
 fn run_think_loop_watchdog(a: &mut ActiveSeq, exclude_last: bool) {
-    if a.force_end_thinking
+    if !enable_thinking_loop_watchdog()
+        || a.force_end_thinking
         || a.thinking_tokens < THINK_LOOP_MIN_TOKENS
         || !a.thinking_tokens.is_multiple_of(THINK_LOOP_CHECK_STRIDE)
     {
@@ -363,50 +364,45 @@ fn clear_stale_require_tool_call(a: &mut ActiveSeq, committed_len: usize) {
     }
 }
 
-/// Per-token request-timeout check — plain path runs it for every pushed
-/// token (decode_logits_step ~527-534); `emit_token` never does, so the
-/// commit helper restores it for the thinking span.
-fn check_request_timeout(a: &mut ActiveSeq) {
-    if !a.finished
-        && let Some(deadline) = a.timeout_at
-        && Instant::now() >= deadline
-    {
-        tracing::warn!("Request timeout after {:?}", a.request_start.elapsed());
-        a.finished = true;
-    }
-}
-
 /// Production wrapper: bind the walk to the model's resident `[K, vocab]`
 /// BF16 verify-logits buffer (same lazy per-row D2H as
-/// `dflash_masked_accept`) and to the SSM boundary snapshot. Returns
-/// `None` (caller falls back to the legacy unmasked accept) only for the
-/// defensive cases that the scheduler gate should already exclude —
-/// fp32-logits models and an empty `verified`.
+/// `dflash_masked_accept`) and to the SSM boundary snapshot. The scheduler
+/// gate should already exclude FP32-logits models. If that gate
+/// and the actual resident buffer ever disagree, fail closed: falling through
+/// to the legacy raw accept would silently bypass all thinking interventions.
 pub(super) fn run_dflash_thinking_accept(
     model: &dyn Model,
     a: &mut ActiveSeq,
     drafts: &[u32],
     verified: &[u32],
     ctx: &ThinkSpecCtx<'_>,
-) -> Option<ThinkAcceptOutcome> {
+) -> Option<SpecAcceptOutcome> {
     if verified.is_empty() {
-        return None;
+        tracing::error!("ATLAS_THINK_SPEC: empty target result; finishing seq");
+        a.finished = true;
+        return Some(SpecAcceptOutcome {
+            num_accepted: 0,
+            bonus: None,
+        });
     }
     let logits_base = model.logits_buffer_ptr();
     if model.logits_ptr_is_fp32(logits_base) {
-        // The scheduler gate clears `ctx.enabled` for fp32-logits models;
-        // reaching here means the gate and the buffer disagree — fall
-        // back to the legacy (lossy-in-thinking) accept and say so.
-        tracing::warn!(
-            "ATLAS_THINK_SPEC: fp32 verify logits despite BF16 gate; thinking filter skipped"
-        );
-        return None;
+        // The scheduler gate clears `ctx.enabled` for FP32-logits models.
+        // Reaching here means the gate and resident buffer disagree. Do not
+        // return None: the caller interprets that as permission to use the
+        // legacy raw accept, which is lossy inside thinking.
+        tracing::error!("ATLAS_THINK_SPEC: FP32 verify logits despite BF16 gate; finishing seq");
+        a.finished = true;
+        return Some(SpecAcceptOutcome {
+            num_accepted: 0,
+            bonus: None,
+        });
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         tracing::info!(
-            "ATLAS_THINK_SPEC=1: speculative decode active inside <think> spans \
-             (post-verify plain-path accept filter)"
+            "ATLAS_THINK_SPEC: policy-aware speculative decode active inside <think> spans \
+             (native MTP default; DFlash env opt-in; post-verify plain-path accept filter)"
         );
     });
     let vocab = model.vocab_size();
@@ -462,7 +458,7 @@ pub(super) fn bootstrap_thinking_token(
         a.tool_call_start_token,
         a.tool_call_end_token,
         ctx.reflection_suppress_ids,
-        false, // see dflash_thinking_accept: adaptive-sampling is gated off
+        ctx.adaptive_sampling,
     );
     commit_thinking_token(a, tok, lp, ctx.code_fence_token, &mut |a| {
         rollback::snapshot_boundary_if_ssm(a, model)

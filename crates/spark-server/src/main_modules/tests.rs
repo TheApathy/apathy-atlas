@@ -56,6 +56,50 @@ fn test_cli_parse_model_from_path() {
 }
 
 #[test]
+fn test_cli_parse_disable_loop_watchdog() {
+    let cli =
+        Cli::try_parse_from(["spark", "serve", "nvidia/model", "--disable-loop-watchdog"]).unwrap();
+    match cli.command {
+        Command::Serve(args) => assert!(args.disable_loop_watchdog),
+    }
+}
+
+#[test]
+fn test_cli_parse_disable_thinking_loop_watchdog() {
+    let cli = Cli::try_parse_from([
+        "spark",
+        "serve",
+        "nvidia/model",
+        "--disable-thinking-loop-watchdog",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Serve(args) => assert!(args.disable_thinking_loop_watchdog),
+    }
+}
+
+#[test]
+fn test_cli_parse_disable_confidence_early_stop() {
+    let cli = Cli::parse_from([
+        "spark",
+        "serve",
+        "test/model",
+        "--disable-confidence-early-stop",
+    ]);
+    match cli.command {
+        Command::Serve(args) => assert!(args.disable_confidence_early_stop),
+    }
+}
+
+#[test]
+fn test_cli_parse_disable_simhash_watchdog() {
+    let cli = Cli::parse_from(["spark", "serve", "test/model", "--disable-simhash-watchdog"]);
+    match cli.command {
+        Command::Serve(args) => assert!(args.disable_simhash_watchdog),
+    }
+}
+
+#[test]
 fn test_cli_parse_slai_policy() {
     let cli = Cli::try_parse_from([
         "spark",

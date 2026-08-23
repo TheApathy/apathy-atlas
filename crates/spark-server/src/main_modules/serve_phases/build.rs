@@ -61,7 +61,7 @@ pub(crate) fn build_model(
         comm,
         args.self_speculative || args.ngram_speculative,
         if args.dflash {
-            args.dflash_gamma.saturating_sub(1).max(1)
+            args.dflash_gamma.unwrap_or(15).max(1)
         } else {
             args.num_drafts
         },

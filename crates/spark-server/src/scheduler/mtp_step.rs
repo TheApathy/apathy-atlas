@@ -3,15 +3,181 @@
 //! MTP speculative draft proposal step.
 
 use super::*;
+use proposal_lifecycle::{
+    clear_orphan_tree, install_collected, propose_and_install, retain_prefix,
+};
 
-/// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
-/// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifyDispatch {
+    Bootstrap,
+    K2,
+    K3,
+    K4,
+    Generic,
+}
+
+/// Pick the verifier from draft width and whether raw argmax is policy-safe.
+fn select_verify_dispatch(
+    draft_len: usize,
+    policy_required: bool,
+    has_tree: bool,
+) -> VerifyDispatch {
+    if draft_len >= 4 {
+        return VerifyDispatch::Generic;
+    }
+    if draft_len == 0 {
+        return VerifyDispatch::Bootstrap;
+    }
+    if policy_required || has_tree {
+        return VerifyDispatch::Generic;
+    }
+    match draft_len {
+        1 => VerifyDispatch::K2,
+        2 => VerifyDispatch::K3,
+        3 => VerifyDispatch::K4,
+        _ => VerifyDispatch::Bootstrap,
+    }
+}
+
+fn verify_policy_required(a: &ActiveSeq, think: &ThinkSpecCtx<'_>) -> bool {
+    if a.inside_thinking {
+        think.enabled
+    } else {
+        content_policy_required(a, think)
+    }
+}
+
+fn batched_dflash_verify_allowed(
+    enabled: bool,
+    sequence_count: usize,
+    is_ep: bool,
+    proposer_is_dflash: bool,
+) -> bool {
+    enabled && sequence_count >= 2 && !is_ep && proposer_is_dflash
+}
+
+/// Save the accepted bonus hidden state into the buffer consumed by the active
+/// proposer. DFlash keys its captured row by the emitted token; native MTP
+/// consumes the accepted row index from `mtp_hidden_save`.
+pub(super) fn save_hidden_for_active_proposer(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    token: u32,
+    row: usize,
+) -> Result<()> {
+    if model.proposer_is_dflash() {
+        model.save_hidden_for_dflash(token, &mut a.seq, 0)
+    } else {
+        model.save_hidden_for_mtp(row, 0)
+    }
+}
+
+fn dispatch_verify(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    drafts: &[u32],
+    num_drafts: usize,
+    think: &ThinkSpecCtx<'_>,
+) {
+    let policy_required = verify_policy_required(a, think);
+    let dispatch = select_verify_dispatch(
+        drafts.len(),
+        policy_required,
+        a.pending_tree_payload.is_some(),
+    );
+    if dispatch != VerifyDispatch::Generic {
+        // Only the generic verifier consumes tree topology.
+        a.pending_tree_payload = None;
+        // ...and only it attributes accepted tokens to a retrieval tier. A
+        // frame narrowed below the generic width (grammar truncation)
+        // leaves the counters alone rather than crediting the next frame's
+        // acceptances to retrieval.
+        a.draft_origin = DraftOrigin::Proposer;
+    }
+    match dispatch {
+        VerifyDispatch::Generic => {
+            step_verify_dflash(model, a, drafts, num_drafts, think);
+        }
+        VerifyDispatch::K4 => step_verify_k4(model, a, drafts, num_drafts),
+        VerifyDispatch::K3 => step_verify_k3(model, a, drafts, num_drafts),
+        VerifyDispatch::K2 => step_verify_k2(model, a, drafts, num_drafts),
+        VerifyDispatch::Bootstrap => {
+            debug_assert!(drafts.is_empty());
+        }
+    }
+    // Fail-closed exits cannot retain an orphaned old tree.
+    clear_orphan_tree(&a.pending_drafts, &mut a.pending_tree_payload);
+}
+
+fn suppress_finished_verify_cache(
+    active: &[ActiveSeq],
+    verify_idxs: &[usize],
+    cache_on_finish: &mut [bool],
+) {
+    debug_assert_eq!(active.len(), cache_on_finish.len());
+    for &idx in verify_idxs {
+        if active[idx].finished {
+            cache_on_finish[idx] = false;
+        }
+    }
+}
+
+/// Ask each retrieval tier, in cascade order, for a chain to pre-empt the
+/// drafter with.
+///
+/// Self-context goes first: it is drawn from this sequence's own history,
+/// so when it matches at all it matches text the model demonstrably just
+/// produced. The static store is the broader, less specific fallback.
+/// Both are inert unless their own environment gate is set, and both
+/// return a chain of exactly `num_drafts` tokens or nothing.
+///
+/// `tok` is the token just sampled, or the bonus just accepted. At BOTH
+/// propose sites it is the sequence's next token and is not yet in
+/// `a.seq.tokens` — the verifier pushes only its INPUT tokens
+/// (`verify_d.rs`) — so the committed history is `a.seq.tokens ++ [tok]`
+/// and the chain continues from there.
+pub(super) fn retrieval_chain(
+    a: &mut ActiveSeq,
+    tok: u32,
+    num_drafts: usize,
+) -> Option<(DraftOrigin, Vec<u32>)> {
+    if num_drafts < crate::rest_store::MIN_PREEMPT_WIDTH {
+        return None;
+    }
+    // Do not pre-empt a drafter that is currently winning. Retrieval
+    // engages on repetitive text, which is exactly where the neural
+    // drafter is also strongest — the engine has been observed accepting
+    // 15/15 on repetitive parser code. Displacing a frame like that costs
+    // the difference, and the offline eval cannot see it because it has
+    // no drafter. `last_verify_accepted` can: it is what the drafter just
+    // did, on this sequence, on this kind of text.
+    let drafter_recent = usize::from(a.last_verify_accepted);
+    if crate::rest_store::self_context::enabled()
+        && drafter_recent < crate::rest_store::self_context::max_drafter_accept()
+    {
+        // `a.seq.tokens` is prompt + everything committed so far; `tok`
+        // was sampled this step and is not in it yet.
+        let chain = a.self_context.propose(&a.seq.tokens, tok, num_drafts);
+        if let Some(chain) = chain {
+            return Some((DraftOrigin::SelfContext, chain));
+        }
+    }
+    if drafter_recent >= crate::rest_store::max_drafter_accept() {
+        return None;
+    }
+    let chain = crate::rest_store::preempt(&a.seq.tokens, tok, num_drafts)?;
+    Some((DraftOrigin::RestStore, chain))
+}
+
+/// Bootstrap empty sequences, then dispatch policy-safe speculative verify.
 pub fn step_mtp(
     model: &dyn Model,
     active: &mut [ActiveSeq],
     num_drafts: usize,
     think: &ThinkSpecCtx<'_>,
+    cache_on_finish: &mut [bool],
 ) {
+    assert_eq!(active.len(), cache_on_finish.len());
     // Stage-1 DFlash grammar gate: drop drafts proposed before the grammar
     // became constraining (e.g. the block whose emission opened a
     // `<tool_call>`). DFlash drafts and the K=γ verify argmax bypass the
@@ -28,7 +194,6 @@ pub fn step_mtp(
         if !a.pending_drafts.is_empty() {
             match model.dflash_collect_async_drafts(&mut a.seq) {
                 Ok(Some(drafts)) => {
-                    a.pending_drafts = drafts;
                     // ASYNC+DDTree: collect_async_drafts_impl may have built a
                     // tree payload from the previous step's top-K kernel. Drain
                     // it NOW so this step's verify (which checks a.pending_tree_payload
@@ -38,10 +203,8 @@ pub fn step_mtp(
                     // run_mtp_propose_multi, which on the async path clears
                     // dstate.pending_tree_payload — so line 883 returns None and
                     // does not overwrite the tree we set here.
-                    let tree = model.take_pending_tree_payload(&mut a.seq);
-                    if tree.is_some() {
-                        a.pending_tree_payload = tree;
-                    }
+                    install_collected(model, a, Ok(drafts))
+                        .expect("an infallible collected proposal cannot fail");
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -71,6 +234,41 @@ pub fn step_mtp(
         if think.enabled && a.inside_thinking && a.pending_tree_payload.is_some() {
             a.pending_tree_payload = None;
         }
+        // A tree walk is indexed by raw verify argmaxes. When the serving
+        // sampler has any active policy (Qwen defaults include presence/LZ/DRY
+        // penalties), or a post-think mask cannot prove every tree row safe,
+        // correctness requires a linear row-by-row policy walk. Keep the
+        // drafter's top-1 spine but discard the sibling topology.
+        if !a.inside_thinking
+            && content_policy_required(a, think)
+            && a.pending_tree_payload.is_some()
+        {
+            if tree_content_raw_argmax_eligible(a, think) {
+                static TREE_POLICY_KEEP_DBG: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = TREE_POLICY_KEEP_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 3 {
+                    tracing::info!("DDTree policy gate: keeping neutral-greedy tree");
+                }
+            } else {
+                static TREE_POLICY_DROP_DBG: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = TREE_POLICY_DROP_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 3 {
+                    tracing::info!(
+                        "DDTree policy gate: dropping tree; using flat sampler-policy walk"
+                    );
+                }
+                a.pending_tree_payload = None;
+            }
+        }
+        // EP synchronizes flat variable-width token frames, but DDTree parent
+        // topology/branch compaction is not part of that protocol. Preserve
+        // the proposer's top-1 spine and fail closed to flat verification.
+        if model.is_ep() && a.pending_tree_payload.is_some() {
+            a.pending_tree_payload = None;
+        }
+        clear_orphan_tree(&a.pending_drafts, &mut a.pending_tree_payload);
     }
 
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
@@ -84,6 +282,21 @@ pub fn step_mtp(
     }
 
     // ── Phase A: Bootstrap decode for sequences without a draft ──
+    // A previous verify may have committed its live SSM state asynchronously
+    // and then intentionally left drafts empty (grammar transition, proposer
+    // miss, diagnostic arm, or error recovery).  Every verify entry waits for
+    // that restore; the bootstrap edge must do the same before `decode` reads
+    // h_state/conv_state.  Missing this wait made the next token depend on GPU
+    // timing and looked like a corrupt partial-accept intermediate.
+    if !bootstrap_idxs.is_empty()
+        && let Err(e) = model.sync_secondary()
+    {
+        tracing::error!("sync_secondary before MTP bootstrap: {e:#}");
+        for &idx in &bootstrap_idxs {
+            active[idx].finished = true;
+        }
+        return;
+    }
     for &idx in &bootstrap_idxs {
         let a = &mut active[idx];
         // EP: broadcast token to worker before decode (worker runs decode in lockstep).
@@ -112,8 +325,21 @@ pub fn step_mtp(
             // `model.decode` above, so drafter ctx conditioning matches
             // the propose/verify steps that follow.
             match bootstrap_thinking_token(model, a, logits, think) {
-                Some(t) => t,
+                Some(t) => {
+                    if std::env::var("ATLAS_SPEC_BOOTSTRAP_TRACE").ok().as_deref() == Some("1") {
+                        tracing::info!(sampled = t, "SPEC_THINK_BOOTSTRAP");
+                    }
+                    t
+                }
                 None => continue, // D2H failure: sequence finished
+            }
+        } else if !a.inside_thinking && content_policy_required(a, think) {
+            // DFlash bootstrap must use the exact same sampler as ordinary
+            // decode.  Raw `sample_token_with_grammar` omits history
+            // penalties, logit bias, think masks, and adaptive state.
+            match bootstrap_content_token(model, a, logits, think) {
+                Some(t) => t,
+                None => continue,
             }
         } else {
             let tok = match sample_token_with_grammar(
@@ -139,6 +365,10 @@ pub fn step_mtp(
             } else {
                 None
             };
+
+            if std::env::var("ATLAS_SPEC_BOOTSTRAP_TRACE").ok().as_deref() == Some("1") {
+                tracing::info!(sampled = tok, "SPEC_RAW_BOOTSTRAP");
+            }
 
             emit_token(a, tok, lp);
             tok
@@ -169,22 +399,47 @@ pub fn step_mtp(
         // stay non-speculative (the bootstrap decode above already sampled
         // through the grammar; drafting would bypass it at verify).
         if !dflash_grammar_skip_propose(model, a) {
-            let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
-                tok,
-                a.seq.seq_len,
-                num_drafts,
-                &mut a.seq,
-                0,
-                _mtp_grammar_mask.as_deref(),
-            ) {
-                Ok(drafts) if !drafts.is_empty() => {
-                    tracing::debug!("MTP bootstrap: tok={tok} → drafts={drafts:?}");
-                    a.pending_drafts = drafts;
+            // ── REST conditional pre-emption (default off) ──
+            //
+            // When the retrieval store holds a long enough verbatim match
+            // for this context, its continuation replaces the drafter's
+            // chain for THIS step only — the drafter forward pass is then
+            // skipped, which is where the second half of the win comes
+            // from. REST never displaces DFlash: `preempt` declines unless
+            // the match and the resulting chain clear gates set well above
+            // break-even, and every decline falls through to the unchanged
+            // proposal below. `ATLAS_REST_STORE` unset ⇒ always `None`.
+            //
+            // Skipping one propose costs at most one stale ctx-accumulator
+            // slot in the DFlash proposer, not a lasting shift: the append
+            // writes at ABSOLUTE positions and self-realigns on the next
+            // propose (`dflash_head/propose.rs`, "A skipped step now costs
+            // one stale slot, not a permanent shift"). Verification is
+            // untouched, so emitted tokens are unchanged either way.
+            //
+            // Cascade order: self-context first — it is the tier most
+            // specific to THIS sequence and needs no corpus — then the
+            // static store, then the drafter. Each tier declines cheaply
+            // when its own env gate is unset.
+            let retrieved = retrieval_chain(a, tok, num_drafts);
+            if let Some((origin, chain)) = retrieved {
+                let installed = proposal_lifecycle::install_external_flat(model, a, chain);
+                debug_assert!(installed, "a proposed retrieval chain is never empty");
+                if installed {
+                    a.draft_origin = origin;
                 }
-                Ok(_) => tracing::warn!("MTP propose returned empty"),
-                Err(e) => {
-                    tracing::error!("run_mtp_propose_multi: {e:#}");
+                tracing::debug!(
+                    "retrieval bootstrap ({origin:?}): tok={tok} → drafts={:?}",
+                    a.pending_drafts
+                );
+            } else {
+                let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+                match propose_and_install(model, a, tok, num_drafts, _mtp_grammar_mask.as_deref()) {
+                    Ok(true) => {
+                        tracing::debug!("MTP bootstrap: tok={tok} → drafts={:?}", a.pending_drafts);
+                    }
+                    Ok(false) => tracing::warn!("MTP propose returned empty"),
+                    Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
                 }
             }
         }
@@ -207,13 +462,19 @@ pub fn step_mtp(
         let mut leftover_idxs: Vec<usize> = Vec::new();
         for &idx in &verify_idxs {
             let a = &active[idx];
-            // Eligibility: exactly 1 draft (K=2), no grammar, not finished,
-            // and num_drafts==1 (defensive — the K=2 trait path is shaped
-            // for the production num_drafts=1 case).
-            if a.pending_drafts.len() == 1
-                && a.grammar_state.is_none()
-                && !a.finished
-                && num_drafts == 1
+            let eligibility = proposal_lifecycle::FixedBatchEligibility {
+                draft_len: a.pending_drafts.len(),
+                grammar_active: a.grammar_state.is_some(),
+                finished: a.finished,
+                configured_num_drafts: num_drafts,
+                policy_required: verify_policy_required(a, think),
+                has_tree: a.pending_tree_payload.is_some(),
+            };
+            if proposal_lifecycle::fixed_batch_decision(
+                proposal_lifecycle::FixedBatchWidth::K2,
+                eligibility,
+            )
+            .is_eligible()
             {
                 batched_idxs.push(idx);
             } else {
@@ -241,23 +502,13 @@ pub fn step_mtp(
                 && let Some(ref mut gs) = a.grammar_state
             {
                 let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
-                if kept < drafts.len() {
-                    drafts.truncate(kept);
-                }
-                if drafts.is_empty() {
+                if !retain_prefix(&mut drafts, &mut a.pending_tree_payload, kept) {
                     continue;
                 }
             }
-            if drafts.len() >= 4 {
-                step_verify_dflash(model, a, &drafts, num_drafts, think);
-            } else if drafts.len() >= 3 {
-                step_verify_k4(model, a, &drafts, num_drafts);
-            } else if drafts.len() >= 2 {
-                step_verify_k3(model, a, &drafts, num_drafts);
-            } else {
-                step_verify_k2(model, a, &drafts, num_drafts);
-            }
+            dispatch_verify(model, a, &drafts, num_drafts, think);
         }
+        suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
         return;
     }
 
@@ -274,8 +525,20 @@ pub fn step_mtp(
         let mut leftover_idxs: Vec<usize> = Vec::new();
         for &idx in &verify_idxs {
             let a = &active[idx];
-            // Eligibility: exactly 2 drafts (K=3), no grammar, not finished.
-            if a.pending_drafts.len() == 2 && a.grammar_state.is_none() && !a.finished {
+            let eligibility = proposal_lifecycle::FixedBatchEligibility {
+                draft_len: a.pending_drafts.len(),
+                grammar_active: a.grammar_state.is_some(),
+                finished: a.finished,
+                configured_num_drafts: num_drafts,
+                policy_required: verify_policy_required(a, think),
+                has_tree: a.pending_tree_payload.is_some(),
+            };
+            if proposal_lifecycle::fixed_batch_decision(
+                proposal_lifecycle::FixedBatchWidth::K3,
+                eligibility,
+            )
+            .is_eligible()
+            {
                 batched_idxs.push(idx);
             } else {
                 leftover_idxs.push(idx);
@@ -302,23 +565,13 @@ pub fn step_mtp(
                 && let Some(ref mut gs) = a.grammar_state
             {
                 let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
-                if kept < drafts.len() {
-                    drafts.truncate(kept);
-                }
-                if drafts.is_empty() {
+                if !retain_prefix(&mut drafts, &mut a.pending_tree_payload, kept) {
                     continue;
                 }
             }
-            if drafts.len() >= 4 {
-                step_verify_dflash(model, a, &drafts, num_drafts, think);
-            } else if drafts.len() >= 3 {
-                step_verify_k4(model, a, &drafts, num_drafts);
-            } else if drafts.len() >= 2 {
-                step_verify_k3(model, a, &drafts, num_drafts);
-            } else {
-                step_verify_k2(model, a, &drafts, num_drafts);
-            }
+            dispatch_verify(model, a, &drafts, num_drafts, think);
         }
+        suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
         return;
     }
 
@@ -327,7 +580,12 @@ pub fn step_mtp(
     // ONE batched forward (FFN weights read once across c seqs). Eligible =
     // drafts.len()>=4, equal K, no grammar, not thinking, no tree payload /
     // tree-or-portfolio method, not finished. Others fall through per-seq.
-    if dflash_batched_verify_enabled() && verify_idxs.len() >= 2 {
+    if batched_dflash_verify_allowed(
+        dflash_batched_verify_enabled(),
+        verify_idxs.len(),
+        model.is_ep(),
+        model.proposer_is_dflash(),
+    ) {
         let mut batched_idxs: Vec<usize> = Vec::new();
         let mut leftover_idxs: Vec<usize> = Vec::new();
         // Reference K = first eligible seq's draft count; the batch must share it.
@@ -335,14 +593,12 @@ pub fn step_mtp(
         for &idx in &verify_idxs {
             let a = &active[idx];
             let dl = a.pending_drafts.len();
-            let grammar_ok = a
-                .grammar_state
-                .as_ref()
-                .is_none_or(|gs| gs.is_terminated());
+            let grammar_ok = a.grammar_state.as_ref().is_none_or(|gs| gs.is_terminated());
             let eligible = dl >= 4
                 && grammar_ok
                 && !a.finished
                 && !(think.enabled && a.inside_thinking)
+                && !content_policy_required(a, think)
                 && a.pending_tree_payload.is_none()
                 && !dflash_tree_method_active()
                 && !dflash_portfolio_active()
@@ -355,6 +611,14 @@ pub fn step_mtp(
             }
         }
         if batched_idxs.len() >= 2 {
+            // The batched verifier reports no per-sequence acceptance the
+            // retrieval counters could consume, so clear provenance here: under
+            // ATLAS_DFLASH_BATCHED_VERIFY=1 (default off) engagement and
+            // skipped-drafter counts stay exact and accepted-from-retrieval
+            // undercounts rather than crediting the wrong frame.
+            for &idx in &batched_idxs {
+                active[idx].draft_origin = DraftOrigin::Proposer;
+            }
             step_verify_dflash_batched(model, active, &batched_idxs, num_drafts);
         } else {
             leftover_idxs.extend(batched_idxs);
@@ -370,23 +634,13 @@ pub fn step_mtp(
                 && let Some(ref mut gs) = a.grammar_state
             {
                 let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
-                if kept < drafts.len() {
-                    drafts.truncate(kept);
-                }
-                if drafts.is_empty() {
+                if !retain_prefix(&mut drafts, &mut a.pending_tree_payload, kept) {
                     continue;
                 }
             }
-            if drafts.len() >= 4 {
-                step_verify_dflash(model, a, &drafts, num_drafts, think);
-            } else if drafts.len() >= 3 {
-                step_verify_k4(model, a, &drafts, num_drafts);
-            } else if drafts.len() >= 2 {
-                step_verify_k3(model, a, &drafts, num_drafts);
-            } else {
-                step_verify_k2(model, a, &drafts, num_drafts);
-            }
+            dispatch_verify(model, a, &drafts, num_drafts, think);
         }
+        suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
         return;
     }
 
@@ -415,32 +669,117 @@ pub fn step_mtp(
             && let Some(ref mut gs) = a.grammar_state
         {
             let kept = truncate_drafts_at_grammar_boundary(gs, &drafts);
-            if kept < drafts.len() {
-                drafts.truncate(kept);
-            }
-            if drafts.is_empty() {
+            if !retain_prefix(&mut drafts, &mut a.pending_tree_payload, kept) {
                 continue;
             }
         }
 
-        // DFlash γ-block drafters return ≥4 drafts per step (γ=16 typical).
-        // The K=2/3/4 graphed paths are MTP-shaped and don't generalize past
-        // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
-        // MTP keeps using the existing graphed paths; this dispatch is purely
-        // additive.
+        // DFlash γ-block drafters return ≥4 drafts per step (γ=15 for a
+        // block-16 checkpoint, whose first row is the known anchor), so
+        // wide windows route through `step_verify_dflash`. Neutral MTP windows
+        // keep the fixed K2/K3/K4 graphs; short policy-sensitive windows also
+        // use the generic path because the fixed paths expose only raw argmax.
         //
         // Fix (2026-05-12): route by `drafts.len()` not `num_drafts`. DFlash
         // produces a full γ-block regardless of `num_drafts`; capping via
         // ATLAS_DFLASH_DRAFT_CAP should not force K=2 verify and discard
         // valid drafts.
-        if drafts.len() >= 4 {
-            step_verify_dflash(model, a, &drafts, num_drafts, think);
-        } else if drafts.len() >= 3 {
-            step_verify_k4(model, a, &drafts, num_drafts);
-        } else if drafts.len() >= 2 {
-            step_verify_k3(model, a, &drafts, num_drafts);
-        } else {
-            step_verify_k2(model, a, &drafts, num_drafts);
+        dispatch_verify(model, a, &drafts, num_drafts, think);
+    }
+    suppress_finished_verify_cache(active, &verify_idxs, cache_on_finish);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerifyDispatch, batched_dflash_verify_allowed, select_verify_dispatch};
+
+    #[test]
+    fn cross_sequence_dflash_batching_requires_dflash_proposer() {
+        assert!(batched_dflash_verify_allowed(true, 2, false, true));
+        assert!(!batched_dflash_verify_allowed(true, 2, false, false));
+        assert!(!batched_dflash_verify_allowed(true, 1, false, true));
+        assert!(!batched_dflash_verify_allowed(true, 2, true, true));
+        assert!(!batched_dflash_verify_allowed(false, 2, false, true));
+    }
+
+    #[test]
+    fn specialized_verifiers_route_hidden_save_through_proposer_pairing() {
+        let cases = [
+            (
+                "batched DFlash",
+                include_str!("verify_dflash_batched_step.rs"),
+                1,
+            ),
+            ("K3", include_str!("verify_k3_step.rs"), 3),
+            ("CSK", include_str!("verify_csk_step.rs"), 3),
+        ];
+        for (label, source, expected_calls) in cases {
+            assert_eq!(
+                source.matches("save_hidden_for_active_proposer(").count(),
+                expected_calls,
+                "{label} must pair every accepted outcome with the active proposer"
+            );
+            assert!(
+                !source.contains("model.save_hidden_for_mtp("),
+                "{label} must not hard-code the native-MTP hidden buffer"
+            );
+            assert!(
+                !source.contains("model.save_hidden_for_dflash("),
+                "{label} must not hard-code the DFlash hidden buffer"
+            );
         }
     }
+
+    #[test]
+    fn neutral_short_windows_keep_fixed_verifiers() {
+        assert_eq!(select_verify_dispatch(1, false, false), VerifyDispatch::K2);
+        assert_eq!(select_verify_dispatch(2, false, false), VerifyDispatch::K3);
+        assert_eq!(select_verify_dispatch(3, false, false), VerifyDispatch::K4);
+    }
+
+    #[test]
+    fn policy_short_windows_use_generic_verifier() {
+        for draft_len in 1..=3 {
+            assert_eq!(
+                select_verify_dispatch(draft_len, true, false),
+                VerifyDispatch::Generic,
+                "draft_len={draft_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_bootstraps_and_wide_windows_use_generic_verify() {
+        assert_eq!(
+            select_verify_dispatch(0, false, false),
+            VerifyDispatch::Bootstrap
+        );
+        assert_eq!(
+            select_verify_dispatch(0, true, false),
+            VerifyDispatch::Bootstrap
+        );
+        for draft_len in 4..=17 {
+            assert_eq!(
+                select_verify_dispatch(draft_len, false, false),
+                VerifyDispatch::Generic,
+                "draft_len={draft_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_bearing_width_one_and_two_use_the_topology_consumer() {
+        assert_eq!(
+            select_verify_dispatch(1, false, true),
+            VerifyDispatch::Generic
+        );
+        assert_eq!(
+            select_verify_dispatch(2, false, true),
+            VerifyDispatch::Generic
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "rest_preempt_tests.rs"]
+mod rest_preempt_tests;

@@ -18,15 +18,11 @@ mod gpu_impl;
 unsafe extern "C" {
     pub(super) fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> i32;
     pub(super) fn cuMemFree_v2(dptr: u64) -> i32;
+    pub(super) fn cuMemcpyHtoD_v2(dst: u64, src: *const c_void, bytes: usize) -> i32;
+    pub(super) fn cuMemcpyDtoH_v2(dst: *mut c_void, src: u64, bytes: usize) -> i32;
     pub(super) fn cuMemcpyHtoDAsync_v2(
         dst: u64,
         src: *const c_void,
-        bytes: usize,
-        stream: u64,
-    ) -> i32;
-    pub(super) fn cuMemcpyDtoHAsync_v2(
-        dst: *mut c_void,
-        src: u64,
         bytes: usize,
         stream: u64,
     ) -> i32;
@@ -47,6 +43,9 @@ unsafe extern "C" {
     pub(super) fn cuGraphDestroy(hGraph: u64) -> i32;
     fn cuCtxGetCurrent(pctx: *mut u64) -> i32;
     pub(super) fn cuCtxSetCurrent(ctx: u64) -> i32;
+    // Device properties. `CUdevice` is an opaque int handle, not a pointer.
+    pub(super) fn cuCtxGetDevice(device: *mut i32) -> i32;
+    pub(super) fn cuDeviceGetAttribute(pi: *mut i32, attrib: u32, dev: i32) -> i32;
     pub(super) fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
     // Page-locked host memory for efficient async transfers
     pub(super) fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;
@@ -98,6 +97,44 @@ impl AtlasCudaBackend {
         Ok(Self {
             default_stream,
             cuda_ctx,
+        })
+    }
+
+    /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
+    const ATTR_MULTIPROCESSOR_COUNT: u32 = 16;
+
+    /// Device SM count, queried once and cached for the process.
+    ///
+    /// The query needs only the current context's device handle — no
+    /// allocation, no launch — but it still goes through the driver, so it is
+    /// resolved on first use and never repeated. A failure is logged once and
+    /// cached as `None` so a broken driver cannot turn into a per-launch log
+    /// storm.
+    pub(super) fn cached_sm_count() -> Option<u32> {
+        static CACHE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            let mut device: i32 = 0;
+            let status = unsafe { cuCtxGetDevice(&mut device) };
+            if status != 0 {
+                tracing::warn!(
+                    "cuCtxGetDevice failed (status {status}); occupancy sizing falls back to \
+                     its compiled-in SM literal"
+                );
+                return None;
+            }
+            let mut count: i32 = 0;
+            let status = unsafe {
+                cuDeviceGetAttribute(&mut count, Self::ATTR_MULTIPROCESSOR_COUNT, device)
+            };
+            if status != 0 || count <= 0 {
+                tracing::warn!(
+                    "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT) failed (status {status}, \
+                     count {count}); occupancy sizing falls back to its compiled-in SM literal"
+                );
+                return None;
+            }
+            tracing::info!("GPU multiprocessor count: {count}");
+            Some(count as u32)
         })
     }
 }

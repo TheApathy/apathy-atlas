@@ -158,6 +158,13 @@ pub struct SafetensorsLoader {
     /// Set from QuantFormat::peak_memory_multiplier() in the caller.
     /// When None, the pre-flight uses its own heuristic (1.3x NVFP4 / 1.5x FP8).
     pub peak_memory_multiplier: Option<f64>,
+    /// Absolute bytes the *model builder* will retain on top of the weight
+    /// store, added to the pre-flight peak. Architecture-dependent (see
+    /// `spark-server`'s `construction_overhead_bytes`), so it cannot be
+    /// expressed as a ratio of on-disk bytes: a ratio large enough for a
+    /// hybrid linear-attention model false-OOMs a plain one. Zero means
+    /// "unknown / nothing extra", which is the pre-existing behaviour.
+    pub construction_overhead_bytes: usize,
 }
 
 impl Default for SafetensorsLoader {
@@ -174,6 +181,7 @@ impl SafetensorsLoader {
             ep_world_size: 1,
             num_experts: 0,
             peak_memory_multiplier: None,
+            construction_overhead_bytes: 0,
         }
     }
 
@@ -184,6 +192,7 @@ impl SafetensorsLoader {
             ep_world_size,
             num_experts,
             peak_memory_multiplier: None,
+            construction_overhead_bytes: 0,
         }
     }
 

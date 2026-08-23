@@ -26,9 +26,7 @@ use super::*;
 /// Whether the cross-seq batched DFlash verify is enabled. Read once.
 pub(super) fn dflash_batched_verify_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("ATLAS_DFLASH_BATCHED_VERIFY").ok().as_deref() == Some("1")
-    })
+    *ON.get_or_init(|| std::env::var("ATLAS_DFLASH_BATCHED_VERIFY").ok().as_deref() == Some("1"))
 }
 
 /// Run the batched DFlash verify over `batched_idxs` (indices into `active`),
@@ -40,7 +38,32 @@ pub(super) fn step_verify_dflash_batched(
     batched_idxs: &[usize],
     num_drafts: usize,
 ) {
-    if let Err(e) = model.sync_secondary() {
+    let sync_result = super::verify_dflash_step::dflash_capacity::preflight_batch_then(
+        model.proposer_is_dflash(),
+        || model.dflash_verify_capacity_k(),
+        num_drafts,
+        batched_idxs.iter().map(|&idx| {
+            (
+                active[idx].pending_drafts.len(),
+                active[idx].pending_tree_payload.as_ref(),
+            )
+        }),
+        || model.sync_secondary(),
+    );
+    let sync_result = match sync_result {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(
+                "DFlash batched pre-verify capacity guard rejected the batch: {error:#}"
+            );
+            for &idx in batched_idxs {
+                active[idx].pending_drafts.clear();
+                active[idx].pending_tree_payload = None;
+            }
+            return;
+        }
+    };
+    if let Err(e) = sync_result {
         tracing::error!("sync_secondary (batched dflash): {e:#}");
         for &idx in batched_idxs {
             active[idx].finished = true;
@@ -91,7 +114,11 @@ pub(super) fn step_verify_dflash_batched(
     };
     let t_verify_us = t_verify.elapsed().as_micros();
 
-    if std::env::var("ATLAS_DFLASH_BATCHED_VERIFY_LOG").ok().as_deref() == Some("1") {
+    if std::env::var("ATLAS_DFLASH_BATCHED_VERIFY_LOG")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         tracing::info!(
             "DFLASH BATCHED verify: c={} K={} forward={t_verify_us}μs",
             batched_idxs.len(),
@@ -130,8 +157,7 @@ fn finalize_flat_dflash_verify(
     // Roll back the over-extended seq_len / seq.tokens to
     // pre_verify_len + num_accepted + 1 (accepted drafts + bonus slot).
     let k_tokens = drafts.len() + 1;
-    let (target_seq_len, to_drop) =
-        flat_rollback_plan(a.seq.seq_len, drafts.len(), num_accepted);
+    let (target_seq_len, to_drop) = flat_rollback_plan(a.seq.seq_len, drafts.len(), num_accepted);
     if to_drop > 0 {
         a.seq.seq_len = target_seq_len;
         let pop_n = to_drop.min(a.seq.tokens.len());
@@ -177,22 +203,20 @@ fn finalize_flat_dflash_verify(
         return;
     }
 
-    // Save the bonus token's hidden for the next propose.
+    // Save the bonus token's hidden for the active proposer. Cross-sequence
+    // batching is DFlash-only; the shared boundary keeps the pairing explicit.
     let bonus = a.last_token;
-    if let Err(e) = model.save_hidden_for_dflash(bonus, &mut a.seq, 0) {
-        tracing::error!("save_hidden_for_dflash (batched dflash): {e:#}");
+    if let Err(e) = save_hidden_for_active_proposer(model, a, bonus, num_accepted) {
+        tracing::error!("save hidden for active proposer (batched verify): {e:#}");
+        return;
     }
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state (batched dflash): {e:#}");
     }
 
-    // Re-propose for next step.
-    match model.run_mtp_propose_multi(a.last_token, a.seq.seq_len, num_drafts, &mut a.seq, 0, None) {
-        Ok(d) if !d.is_empty() => {
-            a.pending_drafts = d;
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!("run_mtp_propose_multi (batched dflash): {e:#}"),
+    let token = a.last_token;
+    if let Err(e) = proposal_lifecycle::propose_and_install(model, a, token, num_drafts, None) {
+        tracing::error!("run_mtp_propose_multi (batched dflash): {e:#}");
     }
 }
 

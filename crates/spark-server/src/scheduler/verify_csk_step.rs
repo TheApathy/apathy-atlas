@@ -31,6 +31,13 @@ pub fn step_verify_k3_batched_csk(
         return;
     }
 
+    if proposal_lifecycle::flat_batch_preflight_at(active, batched_idxs)
+        != proposal_lifecycle::FlatBatchPreflight::Ready
+    {
+        tracing::error!("CSK-K3 received a tree-bearing proposal; refusing flat batch");
+        return;
+    }
+
     if let Err(e) = model.sync_secondary() {
         tracing::error!("CSK sync_secondary: {e:#}");
         for &idx in batched_idxs {
@@ -46,10 +53,12 @@ pub fn step_verify_k3_batched_csk(
     let mut per_seq_drafts: Vec<[u32; 2]> = Vec::with_capacity(c);
     let mut original_seq_lens: Vec<usize> = Vec::with_capacity(c);
 
-    // Take drafts out of each ActiveSeq up-front (matches single-seq path).
-    for &idx in batched_idxs {
+    let Some(batch_drafts) = proposal_lifecycle::take_flat_batch_at(active, batched_idxs) else {
+        tracing::error!("CSK-K3 flat batch changed after preflight; refusing batch");
+        return;
+    };
+    for (&idx, drafts) in batched_idxs.iter().zip(batch_drafts) {
         let a = &mut active[idx];
-        let drafts: Vec<u32> = std::mem::take(&mut a.pending_drafts);
         debug_assert_eq!(drafts.len(), 2, "CSK eligibility guarantees 2 drafts");
         tokens_per_seq.push([a.last_token, drafts[0], drafts[1]]);
         per_seq_drafts.push([drafts[0], drafts[1]]);
@@ -197,23 +206,21 @@ pub fn step_verify_k3_batched_csk(
                 tracing::error!("CSK commit_verify_state_async (K=3 accept-3): {e:#}");
                 continue;
             }
-            if let Err(e) = model.save_hidden_for_mtp(2, 0) {
-                tracing::error!("CSK save_hidden_for_mtp(2): {e:#}");
+            if let Err(e) = save_hidden_for_active_proposer(model, a, v2, 2) {
+                tracing::error!("CSK save hidden for active proposer (row 2): {e:#}");
                 continue;
             }
             if let Err(e) = model.trim_proposer_state(&mut a.seq, 2, 0) {
                 tracing::error!("CSK trim_proposer_state: {e:#}");
             }
             let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
+            match proposal_lifecycle::propose_and_install(
+                model,
+                a,
                 v2,
-                a.seq.seq_len,
                 num_drafts,
-                &mut a.seq,
-                0,
                 _mtp_grammar_mask.as_deref(),
             ) {
-                Ok(d) if !d.is_empty() => a.pending_drafts = d,
                 Ok(_) => {}
                 Err(e) => tracing::error!("CSK run_mtp_propose_multi: {e:#}"),
             }
@@ -235,20 +242,18 @@ pub fn step_verify_k3_batched_csk(
                 continue;
             }
             a.last_token = v1;
-            if let Err(e) = model.save_hidden_for_mtp(1, 0) {
-                tracing::error!("CSK save_hidden_for_mtp(1): {e:#}");
+            if let Err(e) = save_hidden_for_active_proposer(model, a, v1, 1) {
+                tracing::error!("CSK save hidden for active proposer (row 1): {e:#}");
                 continue;
             }
             let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
+            match proposal_lifecycle::propose_and_install(
+                model,
+                a,
                 v1,
-                a.seq.seq_len,
                 num_drafts,
-                &mut a.seq,
-                0,
                 _mtp_grammar_mask.as_deref(),
             ) {
-                Ok(d) if !d.is_empty() => a.pending_drafts = d,
                 Ok(_) => {}
                 Err(e) => tracing::error!("CSK run_mtp_propose_multi: {e:#}"),
             }
@@ -267,20 +272,18 @@ pub fn step_verify_k3_batched_csk(
                 continue;
             }
             a.last_token = v0;
-            if let Err(e) = model.save_hidden_for_mtp(0, 0) {
-                tracing::error!("CSK save_hidden_for_mtp(0): {e:#}");
+            if let Err(e) = save_hidden_for_active_proposer(model, a, v0, 0) {
+                tracing::error!("CSK save hidden for active proposer (row 0): {e:#}");
                 continue;
             }
             let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-            match model.run_mtp_propose_multi(
+            match proposal_lifecycle::propose_and_install(
+                model,
+                a,
                 v0,
-                a.seq.seq_len,
                 num_drafts,
-                &mut a.seq,
-                0,
                 _mtp_grammar_mask.as_deref(),
             ) {
-                Ok(d) if !d.is_empty() => a.pending_drafts = d,
                 Ok(_) => {}
                 Err(e) => tracing::error!("CSK run_mtp_propose_multi: {e:#}"),
             }

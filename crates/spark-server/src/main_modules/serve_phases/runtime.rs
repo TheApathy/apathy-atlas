@@ -51,39 +51,57 @@ pub(crate) struct SamplingDefaults {
     pub(crate) min_p: f32,
 }
 
-pub(crate) fn load_sampling_defaults(model_dir: &Path, args: &cli::ServeArgs) -> SamplingDefaults {
+pub(crate) fn load_sampling_defaults(
+    model_dir: &Path,
+    args: &cli::ServeArgs,
+    preset: &atlas_kernels::SamplingCategory,
+) -> SamplingDefaults {
     let gen_config_path = model_dir.join("generation_config.json");
     let gen_cfg = std::fs::read_to_string(&gen_config_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let defaults = resolve_sampling_defaults(gen_cfg.as_ref(), args, preset);
+    tracing::info!(
+        "Default sampling: temperature={}, top_k={}, top_p={}, top_n_sigma={}, min_p={}",
+        defaults.temperature,
+        defaults.top_k,
+        defaults.top_p,
+        defaults.top_n_sigma,
+        defaults.min_p,
+    );
+    defaults
+}
+
+/// Resolve each field independently. Checkpoint generation_config.json is
+/// most specific, then MODEL.toml, then the operator's CLI default. `min_p`
+/// uses `Option` in the model preset because absent and explicit zero have
+/// opposite meanings.
+pub(crate) fn resolve_sampling_defaults(
+    gen_cfg: Option<&serde_json::Value>,
+    args: &cli::ServeArgs,
+    preset: &atlas_kernels::SamplingCategory,
+) -> SamplingDefaults {
     let temperature = gen_cfg
-        .as_ref()
         .and_then(|v| v.get("temperature")?.as_f64())
         .map(|t| t as f32)
-        .unwrap_or(0.6);
+        .unwrap_or(preset.temperature);
     let top_k = gen_cfg
-        .as_ref()
         .and_then(|v| v.get("top_k")?.as_u64())
         .map(|k| k as u32)
-        .unwrap_or(20);
+        .unwrap_or(preset.top_k);
     let top_p = gen_cfg
-        .as_ref()
         .and_then(|v| v.get("top_p")?.as_f64())
         .map(|p| p as f32)
-        .unwrap_or(0.95);
+        .unwrap_or(preset.top_p);
     let top_n_sigma = gen_cfg
-        .as_ref()
         .and_then(|v| v.get("top_n_sigma")?.as_f64())
         .map(|s| s as f32)
         .unwrap_or(args.default_top_n_sigma);
     let min_p = gen_cfg
-        .as_ref()
         .and_then(|v| v.get("min_p")?.as_f64())
         .map(|p| p as f32)
+        .or(preset.min_p)
         .unwrap_or(args.default_min_p);
-    tracing::info!(
-        "Default sampling: temperature={temperature}, top_k={top_k}, top_p={top_p}, top_n_sigma={top_n_sigma}, min_p={min_p}"
-    );
     SamplingDefaults {
         temperature,
         top_k,
@@ -164,27 +182,72 @@ pub(crate) fn log_behavior_audit(args: &cli::ServeArgs, ptx_set: &atlas_kernels:
         },
         ptx_set.behavior.thinking_default,
     );
-    crate::scheduler::set_enable_loop_watchdog(ptx_set.behavior.enable_loop_watchdog);
-    if ptx_set.behavior.enable_loop_watchdog {
+    let loop_watchdog_enabled =
+        ptx_set.behavior.enable_loop_watchdog && !args.disable_loop_watchdog;
+    crate::scheduler::set_enable_loop_watchdog(loop_watchdog_enabled);
+    if loop_watchdog_enabled {
         tracing::info!(
             "Model behavior: content-loop watchdog ENABLED (period-{}…{} repetition detector)",
             crate::scheduler::CONTENT_LOOP_PERIOD_MIN,
             crate::scheduler::CONTENT_LOOP_PERIOD_MAX,
         );
+    } else if args.disable_loop_watchdog && ptx_set.behavior.enable_loop_watchdog {
+        tracing::info!("Model behavior: content-loop watchdog DISABLED (CLI override)");
     }
+    let thinking_loop_watchdog_enabled = !args.disable_thinking_loop_watchdog;
+    crate::scheduler::set_enable_thinking_loop_watchdog(thinking_loop_watchdog_enabled);
+    tracing::info!(
+        "Model behavior: thinking-loop watchdog {}{}",
+        if thinking_loop_watchdog_enabled {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        },
+        if args.disable_thinking_loop_watchdog {
+            " (CLI override; thinking budget remains active)"
+        } else {
+            ""
+        },
+    );
     // Phase-A: per-model watchdog tunables from MODEL.toml [behavior].
     let b = &ptx_set.behavior;
+    let env_max_inter_tool_prose = match std::env::var("ATLAS_MAX_INTER_TOOL_PROSE") {
+        Ok(value) => match value.parse::<u32>() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                tracing::warn!(
+                    value = %value,
+                    "ATLAS_MAX_INTER_TOOL_PROSE is not a u32; ignoring override"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    };
+    let max_inter_tool_prose = crate::scheduler::resolve_max_inter_tool_prose(
+        b.max_inter_tool_prose,
+        env_max_inter_tool_prose,
+        args.max_inter_tool_prose,
+    );
+    let confidence_early_stop = b.confidence_early_stop && !args.disable_confidence_early_stop;
     crate::scheduler::set_watchdog_params(crate::scheduler::WatchdogParams {
         think_loop_min_repeats: b.think_loop_min_repeats as usize,
         think_loop_scan_window: b.think_loop_scan_window as usize,
-        confidence_early_stop: b.confidence_early_stop,
+        confidence_early_stop,
         confidence_run_length: b.confidence_run_length,
         fuzzy_repeat_tolerance_div: b.fuzzy_repeat_tolerance_div as usize,
-        max_inter_tool_prose: b.max_inter_tool_prose,
+        max_inter_tool_prose,
         rollback_resteer: b.rollback_resteer,
     });
-    if !b.confidence_early_stop {
+    tracing::info!(
+        max_inter_tool_prose,
+        "Model behavior: effective inter-tool prose cap (u32::MAX = disabled)"
+    );
+    if !confidence_early_stop {
         tracing::info!("Model behavior: F2 confidence early-stop DISABLED");
+    }
+    if args.disable_simhash_watchdog {
+        tracing::info!("Model behavior: API SimHash semantic-loop watchdog DISABLED");
     }
     // Phase-C: watchdog rollback + re-steer (arXiv:2603.27905).
     if b.rollback_resteer {
@@ -311,4 +374,68 @@ pub(crate) fn resolve_tool_call_parser(
         }
     }
     Ok(tool_call_format.map(|f| std::sync::Arc::from(f.into_parser())))
+}
+
+#[cfg(test)]
+mod sampling_defaults_tests {
+    use clap::Parser;
+
+    use super::resolve_sampling_defaults;
+    use crate::cli;
+
+    fn preset(min_p: Option<f32>) -> atlas_kernels::SamplingCategory {
+        atlas_kernels::SamplingCategory {
+            temperature: 0.7,
+            top_p: 0.8,
+            top_k: 40,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty: 1.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            lz_penalty: 0.0,
+            min_p,
+        }
+    }
+
+    fn args() -> cli::ServeArgs {
+        // Use a nonzero operator default so `None` and `Some(0.0)` have
+        // observably different outcomes even though this fork's CLI default
+        // currently happens to be zero.
+        cli::ServeArgs::parse_from(["spark", "org/model", "--default-min-p", "0.08"])
+    }
+
+    #[test]
+    fn absent_model_min_p_preserves_cli_default() {
+        let args = args();
+        assert!(args.default_min_p > 0.0, "negative-control prerequisite");
+        let defaults = resolve_sampling_defaults(None, &args, &preset(None));
+        assert_eq!(defaults.min_p, args.default_min_p);
+    }
+
+    #[test]
+    fn explicit_model_min_p_zero_beats_cli_default() {
+        let args = args();
+        assert!(args.default_min_p > 0.0, "negative-control prerequisite");
+        let defaults = resolve_sampling_defaults(None, &args, &preset(Some(0.0)));
+        assert_eq!(defaults.min_p, 0.0);
+    }
+
+    #[test]
+    fn checkpoint_min_p_outranks_model_preset() {
+        let config = serde_json::json!({"min_p": 0.31});
+        let defaults = resolve_sampling_defaults(Some(&config), &args(), &preset(Some(0.0)));
+        assert_eq!(defaults.min_p, 0.31);
+    }
+
+    #[test]
+    fn absent_checkpoint_fields_fall_back_independently() {
+        let config = serde_json::json!({"top_k": 64});
+        let defaults = resolve_sampling_defaults(Some(&config), &args(), &preset(Some(0.0)));
+        assert_eq!(defaults.top_k, 64);
+        assert_eq!(defaults.temperature, 0.7);
+        assert_eq!(defaults.top_p, 0.8);
+        assert_eq!(defaults.min_p, 0.0);
+    }
 }

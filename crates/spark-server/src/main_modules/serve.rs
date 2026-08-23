@@ -26,6 +26,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     tracing::info!("Atlas Spark starting...");
     tracing::info!("Licensed under AGPL-3.0-only — see /LICENSE in this container");
 
+    // Parse before model resolution/weight loading. Recognized dynamic values
+    // are rejected against the resolved drafter family below; unknown values
+    // are always an immediate user error rather than a fallback.
+    let dspark_verify_mode = args
+        .dspark_verify_mode
+        .parse::<spark_model::weight_loader::DsparkVerifyMode>()
+        .context("Invalid --dspark-verify-mode")?;
+
     // 0. Resolve model directory from HF ID or path
     let model_dir = serve_phases::resolve_model_dir(&args)?;
 
@@ -221,6 +229,25 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         max_batch_tokens,
         spec_tokens: _spec_tokens,
     } = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
+    // `--mtp-gate` accepts a closed set. There is no `cli/validate.rs` enum
+    // layer in this fork, so reject a typo here rather than let
+    // `--mtp-gate always` silently mean "no gate" and quietly invalidate a
+    // benchmark arm.
+    const MTP_GATES: &[&str] = &["auto", "force", "dflash", "mtp"];
+    if let Some(gate) = args.mtp_gate.as_deref()
+        && !MTP_GATES.contains(&gate)
+    {
+        anyhow::bail!(
+            "--mtp-gate {gate}: unknown value (expected one of {MTP_GATES:?}). \
+             Omit the flag to run with no gate."
+        );
+    }
+    if args.mtp_gate.is_some() && !(args.speculative || args.dflash) {
+        anyhow::bail!(
+            "--mtp-gate needs speculation: pass --dflash and/or --speculative, \
+             or omit --mtp-gate."
+        );
+    }
     if args.dflash && args.enable_prefix_caching {
         tracing::warn!(
             "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
@@ -241,7 +268,11 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         layer_dtypes,
         hss_cache_blocks_per_seq,
     } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
-    let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let dflash_drafter_state =
+        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?;
+    if let Some((_, drafter_config)) = dflash_drafter_state.as_ref() {
+        args.dflash_gamma = Some(drafter_config.resolve_draft_count(args.dflash_gamma)?);
+    }
     let dflash_quantization = match args.dflash_quantization.as_str() {
         "bf16" => spark_model::layers::DflashQuantization::Bf16,
         "nvfp4" => spark_model::layers::DflashQuantization::Nvfp4,
@@ -259,7 +290,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             .map(|(s, c)| spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
                 drafter_config: c.clone(),
-                gamma: Some(args.dflash_gamma),
+                gamma: args.dflash_gamma,
+                dspark_verify_mode,
                 window_size: if args.dflash_window_size > 0 {
                     Some(args.dflash_window_size)
                 } else {
@@ -281,6 +313,16 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         comm,
         dflash_args,
     )?;
+
+    // `--check-kernels`: every kernel lookup is eager and lives in a layer
+    // constructor on the `build_model` path above, so the audit is complete
+    // exactly here — and a check that ran any earlier would resolve a
+    // DIFFERENT set than a real serve. Prints the report and exits with the
+    // unresolved count; never returns. The scheduler is not started and no
+    // port is bound.
+    if args.check_kernels {
+        serve_phases::check_and_exit(&ptx_set);
+    }
 
     // Phase 6.3 — HSS config built early so the EP worker can install it.
     let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
@@ -320,7 +362,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         top_p: default_top_p,
         top_n_sigma: default_top_n_sigma,
         min_p: default_min_p,
-    } = serve_phases::load_sampling_defaults(&model_dir, &args);
+    } = serve_phases::load_sampling_defaults(&model_dir, &args, &sampling_presets.non_thinking);
+    serve_phases::log_sampling_presets(&sampling_presets, default_min_p);
 
     // 6. Load tokenizer
     // Thinking support is derived from model capabilities, not hardcoded model names.
@@ -335,6 +378,10 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         &config.model_type,
         Some(std::path::Path::new(".")), // repo root for override templates
     )?;
+
+    // REST retrieval draft store (ATLAS_REST_STORE). Validated against the
+    // tokenizer just loaded; a fingerprint mismatch aborts startup.
+    serve_phases::init_rest_store(&model_dir)?;
 
     // Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
     // im_start hard-stop, reflection suppression, tool-call open/close tokens,
@@ -378,11 +425,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
     let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
     let use_ngram_spec = args.ngram_speculative;
-    // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
-    // proposer for γ tokens (DraftProposer::propose semantics: "up to
-    // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
+    // `DraftProposer::propose` defines `num_drafts` as the actual maximum
+    // number of speculative tokens, not verify width K. DFlash currently owns
+    // its configured block width internally, but keep the scheduler value in
+    // the same unit for early-exit and future proposer implementations.
     let num_drafts = if args.dflash {
-        args.dflash_gamma.saturating_sub(1).max(1)
+        args.dflash_gamma.unwrap_or(15).max(1)
     } else {
         args.num_drafts
     };
@@ -390,7 +438,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     if args.dflash {
         tracing::info!(
             "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
-            args.dflash_gamma,
+            args.dflash_gamma.unwrap_or(15),
             if args.dflash_window_size == 0 {
                 "full".to_string()
             } else {
@@ -503,6 +551,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let scheduler_spontaneous_think_budget = args
         .max_thinking_budget
         .unwrap_or(ptx_set.behavior.max_thinking_budget);
+    // Moved into the scheduler thread; `None` leaves the gate disarmed.
+    let scheduler_mtp_gate = args.mtp_gate.clone();
     std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
@@ -529,6 +579,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             adaptive_sampling,
             session_manager,
             scheduler_spontaneous_think_budget,
+            scheduler_mtp_gate,
         );
     });
 
@@ -574,6 +625,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             b
         },
         disable_thinking: args.disable_thinking,
+        disable_simhash_watchdog: args.disable_simhash_watchdog,
         default_chat_template_kwargs: args
             .default_chat_template_kwargs
             .as_ref()
@@ -586,6 +638,30 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     });
 
     serve_phases::log_behavior_audit(&args, &ptx_set);
+
+    // Runtime per-kernel profiling toggle. SIGUSR1 enables `ATLAS_FULL_PROFILE`
+    // behavior on the live instance (disables CUDA graph capture + activates
+    // kprof! per-kernel timing on the DFlash K-γ verify path), SIGUSR2
+    // disables it. Lets the operator profile without restarting the server.
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut enable =
+            signal(SignalKind::user_defined1()).context("install SIGUSR1 profile handler")?;
+        let mut disable =
+            signal(SignalKind::user_defined2()).context("install SIGUSR2 profile handler")?;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = enable.recv() => spark_model::full_profile::set_runtime_profile(true),
+                    _ = disable.recv() => spark_model::full_profile::set_runtime_profile(false),
+                    else => break,
+                }
+            }
+        });
+        tracing::info!(
+            "runtime profile toggle armed: SIGUSR1=enable SIGUSR2=disable"
+        );
+    }
 
     // 9-11. Build router + start HTTP server (extracted: serve_router.rs).
     crate::main_modules::serve_router::build_and_serve(state, model_ready, &args.bind, args.port)

@@ -160,9 +160,7 @@ impl BufferSizes {
             const SPLIT_TILE: usize = 512;
             const MAX_SPLITS_CAP: usize = 64;
             const MAX_DECODE_SEQS: usize = 32;
-            let max_splits = max_seq_len
-                .div_ceil(SPLIT_TILE)
-                .clamp(2, MAX_SPLITS_CAP);
+            let max_splits = max_seq_len.div_ceil(SPLIT_TILE).clamp(2, MAX_SPLITS_CAP);
             MAX_DECODE_SEQS * q_heads * max_splits * (hd + 2) * 4
         } else {
             48 * (hd + 2) * 4
@@ -197,12 +195,24 @@ impl BufferSizes {
             // SSM buffers are also reused by attention prefill/multi-seq as scratch:
             //   ssm_qkvz: K+V contiguous storage in prefill [M, 2*kv_dim]
             //             Mamba-2 in_proj output [M, in_proj_size]
+            //             multi-seq attention Q staging [M, q_heads*q_proj_mul*hd]
             //   ssm_deinterleaved: Q contiguous copy [M, nq*hd]
             //                      Mamba-2 conv1d output [M, d_xBC]
             // Use max across all uses with minimum 256 to avoid 0-byte alloc.
+            //
+            // The Q-staging term is load-bearing, not defensive padding. The
+            // multi-seq attention QKV routes (`ms_qkv_exact`, `ms_qkv_batch3`,
+            // `ms_qkv_batched_plain`) all stage Q in `ssm_qkvz()` at the FULL
+            // projection width, which is 2*nq*hd on a gated model. On
+            // Qwen3.8-27B that is 12288 — numerically equal to this arch's
+            // `ssm_qkvz_size()`, so the buffer fit by coincidence, not by
+            // construction. Any model whose gated q_proj_dim exceeds its SSM
+            // QKVZ width would have overrun the allocation and silently
+            // corrupted whatever followed it in the arena.
             ssm_qkvz: (m * config.ssm_qkvz_size() * bf16)
                 .max(m * config.mamba2_in_proj_size() * bf16)
                 .max(m * 2 * kv_heads * hd * bf16)
+                .max(m * q_heads * q_proj_mul * hd * bf16) // gated attention Q staging
                 .max(m * config.shared_expert_intermediate_size * bf16) // MoE shared up scratch
                 .max(256),
             ssm_ba: (m * config.ssm_ba_size() * bf16)

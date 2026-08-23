@@ -95,6 +95,23 @@ pub async fn responses_endpoint(
             );
         }
     };
+    // Preserve the current turn in its original Responses wire shape for
+    // Conversations persistence. Reconstructing these items after lowering
+    // loses `function_call` / `function_call_output` structure and breaks the
+    // next tool-result turn.
+    let conversation_new_items: Vec<serde_json::Value> = if conversation_id.is_some() {
+        match &r.input {
+            serde_json::Value::String(text) => vec![serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            })],
+            serde_json::Value::Array(items) => items.clone(),
+            _ => Vec::new(), // lowering below returns the canonical 400
+        }
+    } else {
+        Vec::new()
+    };
     let conversation_prefix: Vec<crate::openai::IncomingMessage> = match &conversation_id {
         None => Vec::new(),
         Some(cid) => match state.conversation_store.get(cid) {
@@ -148,8 +165,15 @@ pub async fn responses_endpoint(
     }
 
     if streaming {
-        return responses_endpoint_stream(state, chat_req, metadata, store_flag, conversation_id)
-            .await;
+        return responses_endpoint_stream(
+            state,
+            chat_req,
+            metadata,
+            store_flag,
+            conversation_id,
+            conversation_new_items,
+        )
+        .await;
     }
 
     // Capture the input transcript BEFORE moving chat_req into the handler
@@ -161,7 +185,13 @@ pub async fn responses_endpoint(
     // struct (no raw bytes available to dump at this layer; the Responses
     // handler dumps at its own entry point if --dump is enabled).
     let resp = chat_completions_inner(state.0.clone(), None, chat_req, None).await;
-    let conv_pair = conversation_id.map(|cid| (state.conversation_store.clone(), cid));
+    let conv_pair = conversation_id.map(|cid| {
+        (
+            state.conversation_store.clone(),
+            cid,
+            conversation_new_items,
+        )
+    });
     translate_chat_response_to_responses(
         resp,
         metadata,
@@ -174,35 +204,40 @@ pub async fn responses_endpoint(
 }
 
 /// Convert a conversation item into an IncomingMessage for pipeline
-/// replay. Items we don't recognize (tool outputs in exotic shapes)
-/// are silently dropped — they wouldn't contribute to the text
-/// context anyway.
+/// replay. Use the same Responses-item lowering as direct request input so
+/// structured `function_call` / `function_call_output` turns survive.
 pub(super) fn conversation_item_to_message(
     item: &serde_json::Value,
 ) -> Option<crate::openai::IncomingMessage> {
-    let role = item.get("role").and_then(|v| v.as_str())?;
-    let content = item.get("content");
-    let text = match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|p| {
-                p.get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    };
-    Some(crate::openai::IncomingMessage {
-        role: role.to_string(),
-        content: crate::openai::ParsedContent {
-            text,
-            images: Vec::new(),
-        },
-        tool_calls: None,
-        tool_call_id: None,
-        name: None,
-    })
+    crate::openai::IncomingMessage::from_responses_input_item(item)
+}
+
+#[cfg(test)]
+mod conversation_tool_replay_tests {
+    use super::conversation_item_to_message;
+
+    #[test]
+    fn function_call_and_output_remain_structured() {
+        let call = conversation_item_to_message(&serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_weather",
+            "name": "get_weather",
+            "arguments": "{\"location\":\"Paris\"}",
+        }))
+        .expect("function call");
+        assert_eq!(call.role, "assistant");
+        let calls = call.tool_calls.expect("structured tool call");
+        assert_eq!(calls[0].id.as_deref(), Some("call_weather"));
+        assert_eq!(calls[0].function.name, "get_weather");
+
+        let output = conversation_item_to_message(&serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_weather",
+            "output": "18 C and sunny",
+        }))
+        .expect("function output");
+        assert_eq!(output.role, "tool");
+        assert_eq!(output.tool_call_id.as_deref(), Some("call_weather"));
+        assert_eq!(output.content.text, "18 C and sunny");
+    }
 }

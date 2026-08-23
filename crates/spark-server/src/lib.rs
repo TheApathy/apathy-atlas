@@ -25,3 +25,10 @@ pub mod auth;
 pub mod rate_limiter;
 #[path = "refusal.rs"]
 pub mod refusal;
+
+// REST retrieval draft store runtime binding. The binary crate declares its
+// own `mod rest_store;` (`main.rs`) next to the scheduler call site; this
+// declaration exists so `cargo test -p spark-server --lib` can exercise the
+// module's unit tests without building the full binary.
+#[path = "rest_store/mod.rs"]
+pub mod rest_store;

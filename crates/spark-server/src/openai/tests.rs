@@ -183,6 +183,27 @@ fn responses_string_tool_choice_accepted() {
 }
 
 #[test]
+fn top_level_reasoning_effort_is_explicit_and_template_visible() {
+    let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "solve it"}],
+        "reasoning_effort": "max"
+    }))
+    .unwrap();
+    assert!(req.thinking_explicitly_requested());
+    assert_eq!(req.requested_reasoning_effort(), Some("max"));
+    assert_eq!(req.resolve_thinking(false), (true, Some(1024)));
+}
+
+#[test]
+fn preserve_thinking_template_kwarg_stays_tristate() {
+    let absent = ChatTemplateKwargs::from_json(r#"{"enable_thinking":true}"#).unwrap();
+    assert_eq!(absent.preserve_thinking, None);
+    let disabled = ChatTemplateKwargs::from_json(r#"{"preserve_thinking":false}"#).unwrap();
+    assert_eq!(disabled.preserve_thinking, Some(false));
+}
+
+#[test]
 fn markdown_link_with_parens_in_url_preserved() {
     // Wikipedia URLs contain `(...)` which the bare `find(')')` would
     // truncate. Verify the balanced-paren scan keeps the full URL.
@@ -232,6 +253,13 @@ fn empty_chat_request() -> ChatCompletionRequest {
 }
 
 #[test]
+fn model_default_thinking_defers_to_the_model_budget() {
+    let req = empty_chat_request();
+    assert_eq!(req.resolve_thinking(true), (true, None));
+    assert_eq!(req.resolve_thinking(false), (false, None));
+}
+
+#[test]
 fn server_default_merged_when_request_silent() {
     let mut req = empty_chat_request();
     assert!(req.chat_template_kwargs.is_none());
@@ -239,6 +267,7 @@ fn server_default_merged_when_request_silent() {
     let server_kw = ChatTemplateKwargs {
         enable_thinking: Some(true),
         thinking_budget: None,
+        preserve_thinking: None,
     };
     if !req.thinking_explicitly_requested() {
         req.chat_template_kwargs = Some(server_kw);
@@ -263,6 +292,7 @@ fn server_default_not_merged_when_request_explicit() {
     let server_kw = ChatTemplateKwargs {
         enable_thinking: Some(false),
         thinking_budget: None,
+        preserve_thinking: None,
     };
     if !req.thinking_explicitly_requested() {
         req.chat_template_kwargs = Some(server_kw);

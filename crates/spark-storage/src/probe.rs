@@ -117,7 +117,7 @@ pub fn run_probe(cfg: &ProbeConfig) -> Result<ProbeResult> {
 
     let cuda = CudaCtx::new(0).context("init CUDA context for probe")?;
     let dev = DeviceBuffer::new(SEQ_IO_BYTES)?;
-    let pinned = PinnedBuffer::new(SEQ_IO_BYTES)?;
+    let mut pinned = PinnedBuffer::new(SEQ_IO_BYTES)?;
     let (file, file_bytes) = open_test_file(&test_path)?;
     let fd = file.as_raw_fd();
 
@@ -136,7 +136,7 @@ pub fn run_probe(cfg: &ProbeConfig) -> Result<ProbeResult> {
             &cuda,
             fd,
             file_bytes,
-            &pinned,
+            &mut pinned,
             &dev,
             SEQ_IO_BYTES,
             SEQ_ITERS,
@@ -148,7 +148,7 @@ pub fn run_probe(cfg: &ProbeConfig) -> Result<ProbeResult> {
             &cuda,
             fd,
             file_bytes,
-            &pinned,
+            &mut pinned,
             &dev,
             RAND_IO_BYTES,
             RAND_ITERS,
@@ -160,7 +160,7 @@ pub fn run_probe(cfg: &ProbeConfig) -> Result<ProbeResult> {
             &cuda,
             fd,
             file_bytes,
-            &pinned,
+            &mut pinned,
             &dev,
             SEQ_IO_BYTES,
             SEQ_ITERS,
@@ -172,7 +172,7 @@ pub fn run_probe(cfg: &ProbeConfig) -> Result<ProbeResult> {
             &cuda,
             fd,
             file_bytes,
-            &pinned,
+            &mut pinned,
             &dev,
             RAND_IO_BYTES,
             RAND_ITERS,

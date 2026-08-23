@@ -52,8 +52,8 @@ unsafe extern "C" {
         hmod: *mut c_void,
         name: *const i8,
     ) -> i32;
-    fn cuMemcpyHtoDAsync_v2(dst: u64, src: *const c_void, bytes: usize, stream: u64) -> i32;
-    fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: u64) -> i32;
+    fn cuMemcpyHtoD_v2(dst: u64, src: *const c_void, bytes: usize) -> i32;
+    fn cuMemcpyDtoH_v2(dst: *mut c_void, src: u64, bytes: usize) -> i32;
     fn cuStreamSynchronize(stream: u64) -> i32;
 }
 
@@ -277,45 +277,36 @@ impl AtlasRegistry {
         Ok((dptr, bytes))
     }
 
-    /// Async H2D copy into a previously-resolved device pointer.
+    /// Copy a group of pageable host byte slices to device memory in order.
     ///
-    /// # Safety
-    /// Caller must ensure `dst` is a valid device pointer and the bytes
-    /// pointed to by `src` outlive the copy (host buffers must persist
-    /// until the next sync on `stream`).
-    pub unsafe fn copy_h2d_async(
-        &self,
-        dst: u64,
-        src: *const c_void,
-        bytes: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let status = unsafe { cuMemcpyHtoDAsync_v2(dst, src, bytes, stream) };
-        if status != 0 {
-            return Err(AtlasError::KernelLaunch(format!(
-                "cuMemcpyHtoDAsync_v2 failed: {}",
-                cuda_error_text(status)
-            )));
+    /// The producer stream is drained once before the synchronous copies.
+    /// A failing member suppresses every later member in the group.
+    pub fn copy_h2d_group(&self, copies: &[(u64, &[u8])], stream: u64) -> Result<()> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.stream_synchronize(stream)?;
+        for (index, (dst, src)) in copies.iter().enumerate() {
+            let status = unsafe { cuMemcpyHtoD_v2(*dst, src.as_ptr().cast::<c_void>(), src.len()) };
+            if status != 0 {
+                return Err(AtlasError::KernelLaunch(format!(
+                    "cuMemcpyHtoD_v2 group member {index} failed: {}",
+                    cuda_error_text(status)
+                )));
+            }
         }
         Ok(())
     }
 
-    /// Async D2H copy from a device pointer. Same lifetime caveats as the
-    /// H2D variant.
+    /// Copy device bytes into ordinary pageable host storage.
     ///
-    /// # Safety
-    /// Caller must keep `dst` alive until `stream` is synchronised.
-    pub unsafe fn copy_d2h_async(
-        &self,
-        dst: *mut c_void,
-        src: u64,
-        bytes: usize,
-        stream: u64,
-    ) -> Result<()> {
-        let status = unsafe { cuMemcpyDtoHAsync_v2(dst, src, bytes, stream) };
+    /// The producer stream is drained before the streamless synchronous copy.
+    pub fn copy_d2h(&self, dst: &mut [u8], src: u64, stream: u64) -> Result<()> {
+        self.stream_synchronize(stream)?;
+        let status = unsafe { cuMemcpyDtoH_v2(dst.as_mut_ptr().cast::<c_void>(), src, dst.len()) };
         if status != 0 {
             return Err(AtlasError::KernelLaunch(format!(
-                "cuMemcpyDtoHAsync_v2 failed: {}",
+                "cuMemcpyDtoH_v2 failed: {}",
                 cuda_error_text(status)
             )));
         }

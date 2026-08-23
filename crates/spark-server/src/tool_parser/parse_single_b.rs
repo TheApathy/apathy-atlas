@@ -131,6 +131,10 @@ pub(super) fn parse_qwen3_coder_call(text: &str, _idx: u32) -> Option<ToolCall> 
         }
     }
 
+    // XML-attribute drift salvage. Runs after the strict loop and only fills
+    // keys it did not already produce, so a well-formed call is untouched.
+    harvest_attribute_params(after_name, &mut args);
+
     // Fallback: if no <parameter> tags found, try JSON between the function
     // tag and </function>. Grammar-constrained decoding emits:
     //   <function=Bash>{"command":"which cargo"}</function>
@@ -165,6 +169,70 @@ pub(super) fn parse_qwen3_coder_call(text: &str, _idx: u32) -> Option<ToolCall> 
                 .unwrap_or_else(|_| "{}".into()),
         },
     })
+}
+
+/// Recover the narrow XML-attribute drift of the qwen3_coder parameter form:
+/// `<parameter key="value">...` and `<parameter name="key">value`.
+/// Exactly one fully quoted attribute is required and a sibling function
+/// boundary is never crossed.
+fn harvest_attribute_params(body: &str, args: &mut serde_json::Map<String, serde_json::Value>) {
+    let mut rest = body;
+    while let Some(p) = rest.find("<parameter ") {
+        if let Some(fc) = rest.find("</function>")
+            && fc < p
+        {
+            return;
+        }
+        rest = &rest[p + "<parameter ".len()..];
+        let Some(tag_end) = rest.find('>') else {
+            return;
+        };
+        let attrs = &rest[..tag_end];
+        let after_tag = &rest[tag_end + 1..];
+        let inner_end = after_tag.find("</parameter>").unwrap_or(after_tag.len());
+        let inner = after_tag[..inner_end].trim();
+        rest = if inner_end < after_tag.len() {
+            &after_tag[inner_end + "</parameter>".len()..]
+        } else {
+            ""
+        };
+        let Some((ident, value)) = split_single_attribute(attrs) else {
+            continue;
+        };
+        let (key, val) = if ident.eq_ignore_ascii_case("name") {
+            (value, inner.to_string())
+        } else {
+            (ident, value)
+        };
+        if !key.is_empty() {
+            args.entry(key).or_insert(serde_json::Value::String(val));
+        }
+    }
+}
+
+/// Split exactly one `KEY="VALUE"` (or single-quoted equivalent).
+fn split_single_attribute(attrs: &str) -> Option<(String, String)> {
+    let attrs = attrs.trim().trim_end_matches('/').trim_end();
+    let (ident, value) = attrs.split_once('=')?;
+    let ident = ident.trim();
+    if ident.is_empty()
+        || !ident.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        || !ident
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let value = value.trim();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let unquoted = value.strip_prefix(quote)?.strip_suffix(quote)?;
+    if unquoted.contains(quote) {
+        return None;
+    }
+    Some((ident.to_string(), unquoted.to_string()))
 }
 
 /// Parse tag-style function call: `<function>NAME</function>` with optional `<parameters>` block.

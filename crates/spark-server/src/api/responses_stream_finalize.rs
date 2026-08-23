@@ -321,13 +321,12 @@ pub(super) async fn finalize_responses_stream(
     // SSE stream is never disrupted by conversation-store issues).
     if let Some(cid) = conversation_id.as_ref() {
         let mut batch = conv_new_user_items.clone();
-        if !transcript_text.is_empty() {
-            batch.push(serde_json::json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": transcript_text}],
-            }));
-        }
+        batch.extend(
+            final_resp
+                .output
+                .iter()
+                .filter_map(|item| serde_json::to_value(item).ok()),
+        );
         if !batch.is_empty()
             && let Err(e) = state_arc.conversation_store.add_items(cid, batch)
         {

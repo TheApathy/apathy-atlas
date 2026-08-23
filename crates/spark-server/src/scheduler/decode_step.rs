@@ -83,10 +83,11 @@ pub fn step_decode_only(
     // per-seq capture hook anyway. Drafter-conditioning only — the model's
     // method is a no-op unless the flag is set and a DFlash proposer state is
     // present, so this is free on the production default-off path.
-    if active.len() == 1 && active[0].inside_thinking {
-        if let Err(e) = model.dflash_capture_thinking(&mut active[0].seq, 0) {
-            tracing::warn!("dflash_capture_thinking: {e:#}");
-        }
+    if active.len() == 1
+        && active[0].inside_thinking
+        && let Err(e) = model.dflash_capture_thinking(&mut active[0].seq, 0)
+    {
+        tracing::warn!("dflash_capture_thinking: {e:#}");
     }
 
     process_decode_logits(

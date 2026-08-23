@@ -23,17 +23,10 @@ pub(super) struct StreamState {
     pub(super) emitted: usize,
     /// Lazy streaming-decoder over the content phase (post-thinking).
     pub(super) content_decoder: Option<crate::tokenizer::StreamingDecoder<'static>>,
-    /// Buffer used for stop-string matching across delta boundaries.
-    pub(super) accumulated_content: String,
-    /// Byte position in `accumulated_content` up to which stop-string
-    /// scans have already searched (and not matched). On each new
-    /// token only `accumulated_content[scan_floor..]` needs scanning,
-    /// keeping the total scan work O(n) over a response instead of the
-    /// previous O(n²) (re-scan all of accumulated_content per token).
-    /// scan_floor moves forward only — never resets — because once a
-    /// suffix has been scanned without a stop-string match, prepending
-    /// more text can't introduce a match in the already-scanned prefix.
-    pub(super) stop_scan_floor: usize,
+    /// Decoded output suffix that is also a prefix of a configured
+    /// stop string. It is withheld until the next delta proves it is
+    /// ordinary content, completes the stop, or Done flushes it.
+    pub(super) stop_holdback: String,
     /// Mirror of the post-sanitizer content stream; used by the
     /// post-stream refusal classifier and the `--dump` synthesiser.
     pub(super) refusal_scan_buf: String,
@@ -135,8 +128,7 @@ impl StreamState {
             all_toks: Vec::new(),
             emitted: 0,
             content_decoder: None,
-            accumulated_content: String::new(),
-            stop_scan_floor: 0,
+            stop_holdback: String::new(),
             refusal_scan_buf: String::new(),
             stop_string_triggered: false,
             suppressing_param_leak: false,
@@ -165,5 +157,35 @@ impl StreamState {
             thinking_done: !enable_thinking,
             pending_token_ids: Vec::new(),
         }
+    }
+}
+
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        // Axum drops the response-body stream when the HTTP peer disconnects
+        // or its timeout expires.  The scheduler owns another sender clone,
+        // so dropping ReceiverStream alone does not reliably close the token
+        // channel.  Explicitly publish cancellation while the shared flag is
+        // still alive; emit_token observes it at the next token boundary and
+        // releases the sequence instead of generating to max_tokens.
+        self.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    use super::StreamState;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn dropping_http_stream_cancels_scheduler_work() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let state = StreamState::new(false, false, Arc::clone(&cancel));
+
+        drop(state);
+
+        assert!(cancel.load(Ordering::Acquire));
     }
 }

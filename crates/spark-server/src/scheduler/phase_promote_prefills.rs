@@ -105,7 +105,7 @@ fn build_active_seq_from_prefill(
     // mimalloc the slop from over-allocation is reclaimed quickly.
     let output_capacity = p.max_tokens.max(1);
     let mut output_tokens = Vec::with_capacity(output_capacity);
-    if !(!immediate_finish && spontaneous_think) {
+    if immediate_finish || !spontaneous_think {
         output_tokens.push(first);
     }
     ActiveSeq {
@@ -113,6 +113,7 @@ fn build_active_seq_from_prefill(
         session_hash: p.session_hash,
         last_token: first,
         output_tokens,
+        max_output_tokens: p.max_tokens,
         remaining: if immediate_finish {
             0
         } else {
@@ -139,6 +140,9 @@ fn build_active_seq_from_prefill(
         dry_sequence_breakers: Vec::new(),
         logit_bias: p.logit_bias,
         pending_drafts: Vec::new(),
+        draft_origin: DraftOrigin::default(),
+        last_verify_accepted: 0,
+        self_context: Default::default(),
         pending_tree_payload: None,
         inside_thinking: if immediate_finish {
             p.enable_thinking && think_end_token.is_some()

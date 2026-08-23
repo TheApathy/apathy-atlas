@@ -45,6 +45,22 @@ pub(super) fn validate_input(req: &ChatCompletionRequest) -> Result<(), Response
             None,
         ));
     }
+    if req.stop.len() > 4 {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "stop must contain at most 4 sequences".into(),
+            Some("stop"),
+            None,
+        ));
+    }
+    if req.stop.iter().any(String::is_empty) {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "stop sequences must not be empty".into(),
+            Some("stop"),
+            None,
+        ));
+    }
     if let Some(t) = req.temperature
         && (!(0.0..=2.0).contains(&t))
     {
@@ -56,12 +72,42 @@ pub(super) fn validate_input(req: &ChatCompletionRequest) -> Result<(), Response
         ));
     }
     if let Some(p) = req.top_p
-        && (p <= 0.0 || p > 1.0)
+        && !(p > 0.0 && p <= 1.0)
     {
         return Err(openai_error_response_with_param(
             StatusCode::BAD_REQUEST,
             "top_p must be between 0 (exclusive) and 1".into(),
             Some("top_p"),
+            None,
+        ));
+    }
+    if let Some(top_n_sigma) = req.top_n_sigma
+        && !(top_n_sigma.is_finite() && top_n_sigma >= 0.0)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "top_n_sigma must be finite and non-negative".into(),
+            Some("top_n_sigma"),
+            None,
+        ));
+    }
+    if let Some(min_p) = req.min_p
+        && !(0.0..=1.0).contains(&min_p)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "min_p must be between 0 and 1".into(),
+            Some("min_p"),
+            None,
+        ));
+    }
+    if let Some(repetition_penalty) = req.repetition_penalty
+        && !(repetition_penalty.is_finite() && repetition_penalty > 0.0)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "repetition_penalty must be finite and greater than 0".into(),
+            Some("repetition_penalty"),
             None,
         ));
     }
@@ -72,6 +118,26 @@ pub(super) fn validate_input(req: &ChatCompletionRequest) -> Result<(), Response
             Some("max_tokens"),
             None,
         ));
+    }
+    if let Some(logit_bias) = &req.logit_bias {
+        for (token_id, bias) in logit_bias {
+            if token_id.parse::<u32>().is_err() {
+                return Err(openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    format!("logit_bias key '{token_id}' must be a token ID"),
+                    Some("logit_bias"),
+                    None,
+                ));
+            }
+            if !(-100.0..=100.0).contains(bias) {
+                return Err(openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    "logit_bias values must be between -100 and 100".into(),
+                    Some("logit_bias"),
+                    None,
+                ));
+            }
+        }
     }
     if let Some(crate::tool_parser::ToolChoice::Mode(ref s)) = req.tool_choice {
         if !["auto", "none", "required"].contains(&s.as_str()) {
@@ -86,6 +152,22 @@ pub(super) fn validate_input(req: &ChatCompletionRequest) -> Result<(), Response
             return Err(openai_error_response(
                 StatusCode::BAD_REQUEST,
                 "tool_choice is 'required' but no tools were provided".into(),
+            ));
+        }
+    }
+    if let Some(crate::tool_parser::ToolChoice::Specific { ref function }) = req.tool_choice {
+        let Some(tools) = req.tools.as_ref().filter(|tools| !tools.is_empty()) else {
+            return Err(openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "specific tool_choice was provided but no tools were provided".into(),
+            ));
+        };
+        if !tools.iter().any(|tool| tool.function.name == function.name) {
+            return Err(openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                format!("tool_choice selected unknown function '{}'.", function.name),
+                Some("tool_choice"),
+                Some("tool_not_found"),
             ));
         }
     }
@@ -199,4 +281,158 @@ pub(super) fn apply_failure_guards(req: &mut ChatCompletionRequest) -> F23Progre
     }
 
     f23_metrics
+}
+
+#[cfg(test)]
+mod tool_choice_validation_tests {
+    use super::validate_input;
+    use axum::http::StatusCode;
+
+    fn request(value: serde_json::Value) -> crate::openai::ChatCompletionRequest {
+        serde_json::from_value(value).expect("valid request fixture")
+    }
+
+    #[test]
+    fn specific_choice_requires_a_matching_declared_tool() {
+        let absent = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "weather"}],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }));
+        assert_eq!(
+            validate_input(&absent).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let unknown = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }));
+        assert_eq!(
+            validate_input(&unknown).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let matching = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }));
+        assert!(validate_input(&matching).is_ok());
+    }
+
+    #[test]
+    fn numeric_sampling_contract_rejects_nonfinite_and_out_of_range_values() {
+        let mut value = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+
+        for invalid in [-1.0, 2.1, f32::NAN, f32::INFINITY] {
+            value.temperature = Some(invalid);
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.temperature = None;
+        for invalid in [0.0, -0.1, 1.1, f32::NAN, f32::INFINITY] {
+            value.top_p = Some(invalid);
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn logit_bias_rejects_invalid_keys_and_values() {
+        let mut value = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        value.logit_bias = Some(std::collections::HashMap::from([
+            ("0".to_string(), -100.0),
+            (u32::MAX.to_string(), 100.0),
+        ]));
+        assert!(validate_input(&value).is_ok());
+
+        for key in ["not-token", "-1", "4294967296"] {
+            value.logit_bias = Some(std::collections::HashMap::from([(key.to_string(), 0.0)]));
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        for bias in [-100.1, 100.1, f32::NAN, f32::INFINITY] {
+            value.logit_bias = Some(std::collections::HashMap::from([("0".to_string(), bias)]));
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn extended_sampling_contract_is_fail_closed() {
+        let mut value = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        for invalid in [-0.1, f32::NAN, f32::INFINITY] {
+            value.top_n_sigma = Some(invalid);
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.top_n_sigma = None;
+        for invalid in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            value.min_p = Some(invalid);
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.min_p = None;
+        for invalid in [0.0, -0.1, f32::NAN, f32::INFINITY] {
+            value.repetition_penalty = Some(invalid);
+            assert_eq!(
+                validate_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.repetition_penalty = Some(f32::MIN_POSITIVE);
+        assert!(validate_input(&value).is_ok());
+    }
+
+    #[test]
+    fn stop_contract_rejects_empty_or_excess_entries() {
+        let mut value = request(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }));
+        value.stop = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert!(validate_input(&value).is_ok());
+
+        value.stop.push("e".into());
+        assert_eq!(
+            validate_input(&value).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        value.stop = vec![String::new()];
+        assert_eq!(
+            validate_input(&value).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

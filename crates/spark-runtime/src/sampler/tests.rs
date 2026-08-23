@@ -180,6 +180,24 @@ fn test_sample_with_params_seeded_temperature_zero_returns_argmax() {
 }
 
 #[test]
+fn test_greedy_with_neutral_history_penalties_returns_raw_argmax() {
+    // Qwen3.8 code generation intentionally disables every history-based
+    // processor. Even when the winning token occurred repeatedly, neutral
+    // settings must leave temperature-zero decoding at the raw target argmax.
+    let logits_f32 = [0.5f32, 1.7, 0.3, 1.2];
+    let logits: Vec<u8> = logits_f32.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let params = SamplingParams::greedy(10);
+    let history = vec![1u32, 2, 1, 2, 1, 2, 1];
+
+    assert_eq!(argmax_f32(&logits), 1);
+    assert_eq!(
+        sample_with_params_seeded(&logits, &params, &history, None),
+        1,
+        "neutral repetition/presence/frequency/LZ/DRY settings must preserve raw argmax"
+    );
+}
+
+#[test]
 fn test_greedy_applies_repetition_penalty_before_argmax() {
     // Regression for 2026-05-01 Gemma-4-31B greedy creative collapse.
     // At temperature=0, repetition_penalty MUST shift argmax when the

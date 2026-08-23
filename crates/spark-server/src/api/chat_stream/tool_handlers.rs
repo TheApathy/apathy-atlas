@@ -18,6 +18,28 @@ use super::state::StreamState;
 
 type SseVec = Vec<Result<Event, std::convert::Infallible>>;
 
+/// Streaming must use the same attachment policy as blocking responses.
+/// An ordinary/read-only call with a missing required argument is emitted as
+/// the model produced it so the client's schema validator can return useful
+/// feedback. Structurally invalid calls and unexecutable write/shell calls are
+/// still withheld.
+fn validate_for_stream(
+    call: &tool_parser::ToolCall,
+    tools: &[tool_parser::ToolDefinition],
+) -> Result<(), String> {
+    match tool_parser::assess_tool_call(call, tools) {
+        Ok(()) => Ok(()),
+        Err(tool_parser::ToolCallIssue::MissingParam(message)) => {
+            tracing::warn!(
+                tool = %call.function.name,
+                "tool call has a missing ordinary parameter; emitting for client schema feedback: {message}"
+            );
+            Ok(())
+        }
+        Err(issue) => Err(issue.into_message()),
+    }
+}
+
 /// `DetectorOutput::ToolCall(tc, idx)`: complete tool call.
 pub(super) fn handle_complete_tool_call(
     state: &mut StreamState,
@@ -43,7 +65,7 @@ pub(super) fn handle_complete_tool_call(
     if let Some(ref cwd) = ctx.cwd_for_normalize {
         tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
     }
-    if let Err(e) = tool_parser::validate_single_tool_call(tc, &ctx.tool_defs_for_backfill) {
+    if let Err(e) = validate_for_stream(tc, &ctx.tool_defs_for_backfill) {
         tracing::warn!(
             tool = %tc.function.name,
             "tool call validation error: {e}; replacing with content and ending"
@@ -176,8 +198,8 @@ pub(super) fn handle_tool_call_start(
 /// `<parameter=>` blocks (observed under qwen3_coder + multi-turn agentic
 /// loops with 21 tools, OpenClaw 2026.5.7) streams literal `"{}"` to the
 /// client even when required parameters are declared in the schema —
-/// while the non-streaming path would have backfilled `{"required_key": ""}`
-/// and at least logged a warning. Issue #40 (iromu) called out this
+/// while the non-streaming path runs the same honest no-fabrication backfill
+/// and family-specific disposition. Issue #40 (iromu) called out this
 /// "Opencode breaks tool calling more often" symptom.
 pub(super) fn handle_tool_call_delta(
     state: &mut StreamState,
@@ -204,7 +226,7 @@ pub(super) fn handle_tool_call_delta(
         if let Some(ref cwd) = ctx.cwd_for_normalize {
             tool_parser::normalize_paths(std::slice::from_mut(&mut tc), cwd);
         }
-        if let Err(e) = tool_parser::validate_single_tool_call(&tc, &ctx.tool_defs_for_backfill) {
+        if let Err(e) = validate_for_stream(&tc, &ctx.tool_defs_for_backfill) {
             tracing::warn!(
                 tool = %name,
                 "tool call validation error (stream Δ): {e}; replacing with content and ending"
@@ -295,5 +317,53 @@ pub(super) fn handle_tool_call_end(state: &mut StreamState, ctx: &StreamCtx, idx
             tracing::info!("Tool call: {name}({preview}{s})");
             crate::metrics::TOOL_CALLS_TOTAL.inc();
         }
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::validate_for_stream;
+    use crate::tool_parser::{FunctionCall, FunctionDefinition, ToolCall, ToolDefinition};
+
+    fn tool(name: &str, required: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {required: {"type": "string"}},
+                    "required": [required]
+                })),
+            },
+        }
+    }
+
+    fn empty_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call_test".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn streaming_matches_blocking_attachment_disposition() {
+        assert!(
+            validate_for_stream(&empty_call("get_weather"), &[tool("get_weather", "city")]).is_ok(),
+            "ordinary missing param stays attached"
+        );
+        assert!(
+            validate_for_stream(&empty_call("write"), &[tool("write", "filePath")]).is_err(),
+            "write without a path is withheld"
+        );
+        assert!(
+            validate_for_stream(&empty_call("exec"), &[tool("exec", "command")]).is_err(),
+            "shell without a command is withheld"
+        );
     }
 }

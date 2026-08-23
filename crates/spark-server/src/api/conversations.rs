@@ -2,9 +2,10 @@
 
 #![allow(unused_imports, dead_code)]
 
-use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::{BytesRejection, JsonRejection};
+use axum::extract::{FromRequest, State};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Json, Response, Sse};
 use futures::StreamExt;
@@ -91,20 +92,55 @@ pub(super) fn conversation_body(
     })
 }
 
+fn empty_create_conversation_request() -> CreateConversationRequest {
+    CreateConversationRequest {
+        items: None,
+        metadata: None,
+    }
+}
+
+/// Parse an optional create body without treating a nonempty untyped body as absent.
+async fn parse_optional_create_conversation_request(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<CreateConversationRequest, JsonRejection> {
+    if headers.get(header::CONTENT_TYPE).is_none() && body.is_empty() {
+        return Ok(empty_create_conversation_request());
+    }
+
+    // Use Axum itself to enforce its exact JSON media-type rules. The actual
+    // bytes were already collected through the limit-aware `Bytes` extractor.
+    let mut content_type_probe = Request::new(Body::from("null"));
+    *content_type_probe.headers_mut() = headers.clone();
+    let _ = Json::<serde_json::Value>::from_request(content_type_probe, &()).await?;
+
+    let Json(req) = Json::<CreateConversationRequest>::from_bytes(body)?;
+    Ok(req)
+}
+
 /// POST /v1/conversations — create a conversation with optional
 /// initial items + metadata.
 pub async fn create_conversation(
     State(state): State<Arc<AppState>>,
-    req: Result<Json<CreateConversationRequest>, JsonRejection>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let Json(req) = match req {
-        Ok(r) => r,
-        Err(_) => {
-            // Body is optional per the OpenAI spec — empty body is OK.
-            Json(CreateConversationRequest {
-                items: None,
-                metadata: None,
-            })
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {error}"),
+            );
+        }
+    };
+    let req = match parse_optional_create_conversation_request(&headers, &body).await {
+        Ok(req) => req,
+        Err(error) => {
+            return openai_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request JSON: {error}"),
+            );
         }
     };
     let items = req.items.unwrap_or_default();
@@ -120,10 +156,9 @@ pub async fn create_conversation(
             Some("items_too_many"),
         );
     }
-    let id = state
+    let snap = state
         .conversation_store
-        .create(items, req.metadata.unwrap_or_default());
-    let snap = state.conversation_store.get(&id).expect("just created");
+        .create_snapshot(items, req.metadata.unwrap_or_default());
     Json(conversation_body(&snap)).into_response()
 }
 
@@ -327,5 +362,69 @@ pub async fn delete_conversation_item(
             Some("item_id"),
             Some("item_not_found"),
         )
+    }
+}
+
+#[cfg(test)]
+mod create_request_tests {
+    use super::parse_optional_create_conversation_request;
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    fn json_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn optional_json_distinguishes_absent_valid_and_malformed_bodies() {
+        let absent_headers = HeaderMap::new();
+        let absent = parse_optional_create_conversation_request(&absent_headers, &Bytes::new())
+            .await
+            .unwrap();
+        assert!(absent.items.is_none());
+        assert!(absent.metadata.is_none());
+
+        let valid_body = Bytes::from_static(br#"{"metadata":{"team":"atlas"}}"#);
+        let valid = parse_optional_create_conversation_request(&json_headers(), &valid_body)
+            .await
+            .unwrap();
+        assert_eq!(
+            valid.metadata.unwrap().get("team").map(String::as_str),
+            Some("atlas")
+        );
+
+        let malformed = Bytes::from_static(b"{not-json");
+        assert!(
+            parse_optional_create_conversation_request(&json_headers(), &malformed)
+                .await
+                .is_err()
+        );
+
+        // Optional means genuinely absent, not merely missing Content-Type.
+        assert!(
+            parse_optional_create_conversation_request(&absent_headers, &valid_body)
+                .await
+                .is_err()
+        );
+        assert!(
+            parse_optional_create_conversation_request(&absent_headers, &malformed)
+                .await
+                .is_err()
+        );
+        assert!(
+            parse_optional_create_conversation_request(&json_headers(), &Bytes::new())
+                .await
+                .is_err()
+        );
+
+        let handler = include_str!("conversations.rs");
+        assert!(handler.contains("body: Result<Bytes, BytesRejection>"));
+        assert!(handler.contains("headers.get(header::CONTENT_TYPE).is_none() && body.is_empty()"));
+        assert!(handler.contains("Invalid request JSON: {error}"));
     }
 }

@@ -6,7 +6,6 @@
 // is forced to fetch from disk and evict prior-tile blocks. Output must
 // match the in-HBM single-tile reference attention.
 
-use std::ffi::c_void;
 use std::path::PathBuf;
 
 use half::bf16;
@@ -16,7 +15,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 
 use spark_storage::cuda_min::{
-    CudaCtx, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+    CudaCtx, DeviceBuffer, HostToDeviceCopy, copy_d_to_h, copy_h_to_d, copy_h_to_d_group,
 };
 use spark_storage::tiled_attention::{TiledAttention, TiledAttentionDims};
 use spark_storage::{HighSpeedSwap, HighSpeedSwapConfig, ModelDims};
@@ -65,38 +64,14 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
     let counts_dev = DeviceBuffer::new(4).unwrap();
     let counts = [SEQ_BLOCKS as i32];
     let out_dev = DeviceBuffer::new(NUM_Q_HEADS as usize * HEAD_DIM as usize * 2).unwrap();
-    copy_h_to_d_async(
-        q_dev.ptr,
-        q.as_ptr() as *const c_void,
-        q.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        k_dev.ptr,
-        k.as_ptr() as *const c_void,
-        k.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        v_dev.ptr,
-        v.as_ptr() as *const c_void,
-        v.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        bt_dev.ptr,
-        bt.as_ptr() as *const c_void,
-        SEQ_BLOCKS as usize * 4,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        counts_dev.ptr,
-        counts.as_ptr() as *const c_void,
-        4,
+    copy_h_to_d_group(
+        &[
+            HostToDeviceCopy::new(q_dev.ptr, q),
+            HostToDeviceCopy::new(k_dev.ptr, k),
+            HostToDeviceCopy::new(v_dev.ptr, v),
+            HostToDeviceCopy::new(bt_dev.ptr, &bt),
+            HostToDeviceCopy::new(counts_dev.ptr, &counts),
+        ],
         ctx.stream,
     )
     .unwrap();
@@ -118,14 +93,7 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
     .unwrap();
     attn.finalize(ctx, out_dev.ptr, 1).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_Q_HEADS as usize * HEAD_DIM as usize];
-    copy_d_to_h_async(
-        out.as_mut_ptr() as *mut c_void,
-        out_dev.ptr,
-        out.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut out, out_dev.ptr, ctx.stream).unwrap();
     out
 }
 
@@ -171,14 +139,7 @@ fn orchestrator_multi_tile_with_eviction() {
     let k_block_dev = DeviceBuffer::new(block_bytes).unwrap();
     for blk in 0..SEQ_BLOCKS {
         let off = blk as usize * block_floats;
-        copy_h_to_d_async(
-            k_block_dev.ptr,
-            k[off..off + block_floats].as_ptr() as *const c_void,
-            block_bytes,
-            ctx.stream,
-        )
-        .unwrap();
-        stream_sync(ctx.stream).unwrap();
+        copy_h_to_d(k_block_dev.ptr, &k[off..off + block_floats], ctx.stream).unwrap();
         hss.offload_block(
             &ctx,
             0,
@@ -193,26 +154,13 @@ fn orchestrator_multi_tile_with_eviction() {
     // Run streaming attention via the orchestrator.
     let q_dev = DeviceBuffer::new(q.len() * 2).unwrap();
     let out_dev = DeviceBuffer::new(NUM_Q_HEADS as usize * HEAD_DIM as usize * 2).unwrap();
-    copy_h_to_d_async(
-        q_dev.ptr,
-        q.as_ptr() as *const c_void,
-        q.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
+    copy_h_to_d(q_dev.ptr, &q, ctx.stream).unwrap();
     let seq_blocks: Vec<u32> = (0..SEQ_BLOCKS).collect();
     hss.attend_layer(&ctx, 0, &seq_blocks, q_dev.ptr, out_dev.ptr)
         .unwrap();
 
     let mut out = vec![bf16::from_f32(0.0); NUM_Q_HEADS as usize * HEAD_DIM as usize];
-    copy_d_to_h_async(
-        out.as_mut_ptr() as *mut c_void,
-        out_dev.ptr,
-        out.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut out, out_dev.ptr, ctx.stream).unwrap();
 
     let mut max_d = 0.0_f32;
     for (a, b) in reference.iter().zip(&out) {

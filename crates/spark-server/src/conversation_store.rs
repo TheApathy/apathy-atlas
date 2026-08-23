@@ -94,6 +94,17 @@ impl ConversationStore {
         initial_items: Vec<serde_json::Value>,
         metadata: HashMap<String, String>,
     ) -> String {
+        self.create_snapshot(initial_items, metadata).id
+    }
+
+    /// Create and return the public snapshot from the same insertion
+    /// transaction. Callers that must respond with the created object
+    /// must not perform a racy second lookup after this lock is released.
+    pub fn create_snapshot(
+        &self,
+        initial_items: Vec<serde_json::Value>,
+        metadata: HashMap<String, String>,
+    ) -> ConversationSnapshot {
         let id = format!("conv_{}", crate::openai::uuid_v4());
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -103,7 +114,13 @@ impl ConversationStore {
             .into_iter()
             .enumerate()
             .map(|(i, v)| stamp_id(v, &id, i))
-            .collect();
+            .collect::<Vec<_>>();
+        let snapshot = ConversationSnapshot {
+            id: id.clone(),
+            created_at: now_unix,
+            metadata: metadata.clone(),
+            items: items.clone(),
+        };
         let entry = Conversation {
             id: id.clone(),
             created_at: now_unix,
@@ -121,7 +138,7 @@ impl ConversationStore {
                 break;
             }
         }
-        id
+        snapshot
     }
 
     /// Fetch a snapshot of the conversation. TTL-expired entries are
@@ -297,6 +314,23 @@ mod tests {
         assert_eq!(snap.items.len(), 1);
         assert_eq!(snap.items[0]["role"], "user");
         assert!(snap.items[0]["id"].as_str().unwrap().starts_with("item_"));
+    }
+
+    #[test]
+    fn create_snapshot_does_not_depend_on_a_second_lookup() {
+        let store = ConversationStore::with_config(0, Duration::from_secs(60));
+        let snapshot = store.create_snapshot(
+            vec![json!({"type": "message", "role": "user", "content": "hi"})],
+            HashMap::from([("tenant".to_string(), "test".to_string())]),
+        );
+        assert!(snapshot.id.starts_with("conv_"));
+        assert_eq!(snapshot.items[0]["content"], "hi");
+        assert_eq!(snapshot.metadata["tenant"], "test");
+        assert!(store.get(&snapshot.id).is_none());
+
+        let handler = include_str!("api/conversations.rs");
+        assert!(handler.contains(".create_snapshot("));
+        assert!(!handler.contains("expect(\"just created\")"));
     }
 
     #[test]

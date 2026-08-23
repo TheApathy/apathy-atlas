@@ -56,23 +56,24 @@ impl RadixTree {
             snapshot_index: Mutex::new(SsmSnapshotIndex::new()),
         }
     }
-}
 
-impl PrefixCache for RadixTree {
-    fn lookup(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
-        // Phase 1: walk tree (lock inner, then release)
+    /// KV walk plus snapshot-index lookup without publishing hit/miss
+    /// telemetry. The paired and attention-only entrypoints classify the same
+    /// raw result differently, and each must record exactly one outcome.
+    fn lookup_uncounted(
+        &self,
+        tokens: &[u32],
+        block_size: usize,
+        session_hash: u64,
+    ) -> PrefixMatch {
         let (matched_blocks, matched_disk_block_ids, matched_tokens) = {
             let mut inner = self.inner.lock();
             let (blocks, disk, matched) = inner.walk(tokens, block_size);
             if matched > 0 {
                 inner.inc_refs(tokens, block_size, matched);
-                crate::prefix_cache::record_cache_hit(matched);
-            } else {
-                crate::prefix_cache::record_cache_miss();
             }
             (blocks, disk, matched)
         };
-        // Phase 2: snapshot lookup (lock snapshot_index, inner NOT held)
         let (ssm_snapshot, ssm_snapshot_tokens) = if matched_tokens > 0 {
             let mut idx = self.snapshot_index.lock();
             match idx.lookup(tokens, matched_tokens, session_hash) {
@@ -82,10 +83,6 @@ impl PrefixCache for RadixTree {
         } else {
             (None, 0)
         };
-        // Filter disk_block_ids to MAX-free entries when HSS isn't in use, so
-        // the caller can check `!matched_disk_block_ids.is_empty()` as the
-        // HSS-engaged signal. When HSS *is* in use every entry should be a
-        // valid disk_id (not MAX).
         let matched_disk_block_ids = if matched_disk_block_ids.iter().all(|&id| id == u32::MAX) {
             Vec::new()
         } else {
@@ -97,6 +94,39 @@ impl PrefixCache for RadixTree {
             matched_tokens,
             ssm_snapshot,
             ssm_snapshot_tokens,
+        }
+    }
+}
+
+impl PrefixCache for RadixTree {
+    fn lookup(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        let prefix_match = self.lookup_uncounted(tokens, block_size, session_hash);
+        if prefix_match.matched_tokens > 0 {
+            crate::prefix_cache::record_cache_hit(prefix_match.matched_tokens);
+        } else {
+            crate::prefix_cache::record_cache_miss();
+        }
+        prefix_match
+    }
+
+    fn lookup_paired(&self, tokens: &[u32], block_size: usize, session_hash: u64) -> PrefixMatch {
+        let prefix_match = self.lookup_uncounted(tokens, block_size, session_hash);
+        if prefix_match.paired_ssm_tokens().is_some() {
+            crate::prefix_cache::record_cache_hit(prefix_match.matched_tokens);
+            prefix_match
+        } else {
+            if prefix_match.matched_tokens > 0 {
+                tracing::info!(
+                    "Prefix cache miss: {} KV tokens ({} blocks) without a restorable SSM snapshot — full prefill",
+                    prefix_match.matched_tokens,
+                    prefix_match.matched_blocks.len(),
+                );
+                self.inner
+                    .lock()
+                    .dec_refs_matched(tokens, block_size, prefix_match.matched_tokens);
+            }
+            crate::prefix_cache::record_cache_miss();
+            PrefixMatch::empty()
         }
     }
 
@@ -162,6 +192,12 @@ impl PrefixCache for RadixTree {
 
     fn release(&self, tokens: &[u32], block_size: usize) {
         self.inner.lock().dec_refs(tokens, block_size);
+    }
+
+    fn release_matched(&self, tokens: &[u32], block_size: usize, matched_tokens: usize) {
+        self.inner
+            .lock()
+            .dec_refs_matched(tokens, block_size, matched_tokens);
     }
 
     fn evict(&self, num_blocks: usize) -> EvictedBlocks {

@@ -56,3 +56,27 @@ fn test_buffer_sizes_scale_with_batch() {
     // so s128.logits = 16 * vocab * 4 (not 128× the unbatched value).
     assert_eq!(s128.logits, 16 * cfg.vocab_size * 4);
 }
+
+/// `ssm_qkvz` is the Q staging buffer for the multi-seq attention QKV routes,
+/// at the full gated projection width. On Qwen3.8-27B that width (2*24*256 =
+/// 12288) happens to equal `ssm_qkvz_size()`, so the fit was a coincidence of
+/// this architecture rather than something the sizing guaranteed. Pin the
+/// invariant directly so a future model with a wider gated q_proj_dim fails
+/// here instead of overrunning the arena at runtime.
+#[test]
+fn ssm_qkvz_covers_gated_attention_q_staging() {
+    for m in [1usize, 17, 128] {
+        let cfg = ModelConfig::qwen3_next_80b_nvfp4();
+        let sizes = BufferSizes::from_config(&cfg, m, 4096, 16);
+        let q_proj_mul = if cfg.attn_gated { 2 } else { 1 };
+        let q_staging = m * cfg.num_attention_heads * q_proj_mul * cfg.head_dim * 2;
+        assert!(
+            sizes.ssm_qkvz >= q_staging,
+            "m={m}: ssm_qkvz={} < gated Q staging={q_staging}",
+            sizes.ssm_qkvz
+        );
+        // The same buffer still has to hold the prefill K+V staging.
+        let kv_staging = m * 2 * cfg.num_key_value_heads * cfg.head_dim * 2;
+        assert!(sizes.ssm_qkvz >= kv_staging, "m={m}: ssm_qkvz < K+V staging");
+    }
+}

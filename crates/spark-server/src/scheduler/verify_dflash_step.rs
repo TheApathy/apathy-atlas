@@ -2,7 +2,11 @@
 
 //! DFlash-based verify step (drafted token verification).
 
+use super::spec_timing::SpecCycle;
 use super::*;
+
+#[path = "verify_dflash_capacity.rs"]
+pub(super) mod dflash_capacity;
 
 /// ATLAS_DFLASH_BRANCH_AUDIT=1 cross-step stash: session_hash →
 /// `(expected_argmax_after_fork, fork_token)` recorded on a step whose
@@ -21,6 +25,256 @@ fn branch_audit_stash() -> &'static std::sync::Mutex<std::collections::HashMap<u
 /// Running audit tally: (matches, mismatches). Logged on every comparison.
 static BRANCH_AUDIT_TALLY: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
 
+fn ep_kgamma_result(
+    num_accepted: usize,
+    policy_walk_active: bool,
+    sequence_finished: bool,
+    bonus_available: bool,
+) -> u32 {
+    if policy_walk_active && (sequence_finished || !bonus_available) {
+        EP_VERIFY_KGAMMA_ABORT
+    } else {
+        u32::try_from(num_accepted).unwrap_or(EP_VERIFY_KGAMMA_ABORT)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WideVerifyHiddenSave {
+    DflashToken(u32),
+    NativeMtpRow(usize),
+}
+
+/// Select the hidden-state handoff consumed by the active proposer after a
+/// wide verify. Row `n` is the target hidden after the prefix plus `n`
+/// accepted drafts; its argmax/sample is the bonus token passed separately to
+/// native MTP. A DDTree fork can end at a non-contiguous compact row, but that
+/// case belongs to DFlash and is retained here for a fail-safe caller contract.
+fn wide_verify_hidden_save(
+    proposer_is_dflash: bool,
+    bonus: u32,
+    num_accepted: usize,
+    tree_bonus_row: Option<usize>,
+) -> WideVerifyHiddenSave {
+    if proposer_is_dflash {
+        WideVerifyHiddenSave::DflashToken(bonus)
+    } else {
+        WideVerifyHiddenSave::NativeMtpRow(tree_bonus_row.unwrap_or(num_accepted))
+    }
+}
+
+#[derive(Debug)]
+struct SerialOracleReplay {
+    verified: Vec<u32>,
+    logits_rows: Vec<Vec<u8>>,
+    logits_format: VerifyLogitsFormat,
+}
+
+fn serial_oracle_requested(model: &dyn Model, a: &ActiveSeq) -> bool {
+    std::env::var("ATLAS_DFLASH_SERIAL_COMMIT").ok().as_deref() == Some("1")
+        && std::env::var("ATLAS_DFLASH_SKIP_REPROPOSE").ok().as_deref() == Some("1")
+        && a.pending_tree_payload.is_none()
+        && !model.is_ep()
+}
+
+const TRAJECTORY_DIAG_ENV: &str = "ATLAS_DFLASH_K1_TRAJECTORY_DIAG";
+const TRAJECTORY_SEQ_LEN_ENV: &str = "ATLAS_DFLASH_K1_TRAJECTORY_SEQ_LEN";
+const TRAJECTORY_TOKENS_ENV: &str = "ATLAS_DFLASH_K1_TRAJECTORY_TOKENS";
+
+fn optional_env(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} is not valid Unicode")
+        }
+    }
+}
+
+fn canonical_usize(name: &str, raw: &str) -> Result<usize> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("{name} must be a canonical decimal usize"))?;
+    if value.to_string() != raw {
+        anyhow::bail!("{name} must be a canonical decimal usize");
+    }
+    Ok(value)
+}
+
+fn canonical_u32_csv(name: &str, raw: &str) -> Result<Vec<u32>> {
+    if raw.is_empty()
+        || raw
+            .bytes()
+            .any(|byte| !(byte.is_ascii_digit() || byte == b','))
+    {
+        anyhow::bail!("{name} must be a nonempty comma-separated canonical u32 vector");
+    }
+    raw.split(',')
+        .map(|item| {
+            let value = item.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("{name} must be a nonempty comma-separated canonical u32 vector")
+            })?;
+            if value.to_string() != item {
+                anyhow::bail!("{name} must be a nonempty comma-separated canonical u32 vector");
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn trajectory_selector_matches(pre_verify_len: usize, tokens: &[u32]) -> Result<bool> {
+    let enabled = optional_env(TRAJECTORY_DIAG_ENV)?;
+    // The serving wrapper exports the whole snapshotted selector contract on
+    // every run. Treat only empty selector values as absent while retaining a
+    // fail-closed error for any nonempty selector when diagnostics are off.
+    let seq_len = optional_env(TRAJECTORY_SEQ_LEN_ENV)?.filter(|value| !value.is_empty());
+    let selected_tokens = optional_env(TRAJECTORY_TOKENS_ENV)?.filter(|value| !value.is_empty());
+    trajectory_selector_values_match(
+        enabled.as_deref(),
+        seq_len.as_deref(),
+        selected_tokens.as_deref(),
+        pre_verify_len,
+        tokens,
+    )
+}
+
+fn trajectory_selector_values_match(
+    enabled: Option<&str>,
+    seq_len: Option<&str>,
+    selected_tokens: Option<&str>,
+    pre_verify_len: usize,
+    tokens: &[u32],
+) -> Result<bool> {
+    match enabled {
+        None | Some("0") => {
+            if seq_len.is_some() || selected_tokens.is_some() {
+                anyhow::bail!("trajectory selector variables require {TRAJECTORY_DIAG_ENV}=1");
+            }
+            Ok(false)
+        }
+        Some("1") => {
+            let selected_seq_len = canonical_usize(
+                TRAJECTORY_SEQ_LEN_ENV,
+                seq_len.ok_or_else(|| {
+                    anyhow::anyhow!("{TRAJECTORY_DIAG_ENV}=1 requires {TRAJECTORY_SEQ_LEN_ENV}")
+                })?,
+            )?;
+            let selected_tokens = canonical_u32_csv(
+                TRAJECTORY_TOKENS_ENV,
+                selected_tokens.ok_or_else(|| {
+                    anyhow::anyhow!("{TRAJECTORY_DIAG_ENV}=1 requires {TRAJECTORY_TOKENS_ENV}")
+                })?,
+            )?;
+            if selected_tokens.len() != 5 {
+                anyhow::bail!("{TRAJECTORY_TOKENS_ENV} must contain exact gamma4 K=5 inputs");
+            }
+            Ok(pre_verify_len == selected_seq_len && tokens == selected_tokens)
+        }
+        Some(_) => anyhow::bail!("{TRAJECTORY_DIAG_ENV} must be exactly 0 or 1"),
+    }
+}
+
+fn canonical_u32_csv_text(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Run the target's ordinary one-token path over the full forced verify input,
+/// preserving both argmaxes and logits rows for the later sampler-policy walk.
+/// The recurrent checkpoint and host sequence counters are restored before
+/// returning, so the normal batched verifier still starts from the same state.
+fn collect_serial_oracle(
+    model: &dyn Model,
+    seq: &mut SequenceState,
+    tokens: &[u32],
+) -> Result<SerialOracleReplay> {
+    let pre_verify_len = seq.seq_len;
+    let pre_verify_tokens = seq.tokens.len();
+    let capture_stages = model.k1_stage_diag_requested(pre_verify_len, tokens)?;
+    if trajectory_selector_matches(pre_verify_len, tokens)? {
+        if pre_verify_tokens != pre_verify_len {
+            anyhow::bail!(
+                "DFLASH_K1_TRAJECTORY sequence extent mismatch: tokens={} seq_len={}",
+                pre_verify_tokens,
+                pre_verify_len
+            );
+        }
+        tracing::info!(
+            "DFLASH_K1_TRAJECTORY schema=1 pre_verify_len={} prefix_tokens={} input_tokens={}",
+            pre_verify_len,
+            canonical_u32_csv_text(&seq.tokens),
+            canonical_u32_csv_text(tokens),
+        );
+    }
+    model.pre_verify_copy_async(seq)?;
+    if capture_stages {
+        model.k1_stage_diag_begin(pre_verify_len, tokens)?;
+    }
+
+    let logits_format = if model.decode_logits_fp32() {
+        VerifyLogitsFormat::Fp32
+    } else {
+        VerifyLogitsFormat::Bf16
+    };
+    let elem_bytes = if logits_format == VerifyLogitsFormat::Fp32 {
+        4
+    } else {
+        2
+    };
+    let vocab = model.vocab_size();
+    let replay = (|| {
+        let mut verified = Vec::with_capacity(tokens.len());
+        let mut logits_rows = Vec::with_capacity(tokens.len());
+        for &token in tokens {
+            let logits = model.decode(token, seq, 0)?;
+            verified.push(model.argmax_on_device(logits, 0)?);
+            let mut row = vec![0u8; vocab * elem_bytes];
+            model.copy_logits_to_host(logits, &mut row)?;
+            logits_rows.push(row);
+            if capture_stages {
+                model.k1_stage_diag_finish_serial_row()?;
+            }
+        }
+        if capture_stages {
+            model.k1_stage_diag_finish_serial()?;
+        }
+        Ok(SerialOracleReplay {
+            verified,
+            logits_rows,
+            logits_format,
+        })
+    })();
+
+    // Always put the caller back in the pre-verify frame, including on a
+    // mid-replay D2H/decode failure. The KV rows written above are harmless:
+    // the immediately-following batched verifier overwrites the same slots.
+    seq.seq_len = pre_verify_len;
+    seq.tokens.truncate(pre_verify_tokens);
+    let restore = model.pre_verify_copy_async(seq);
+    if replay.is_err() || restore.is_err() {
+        model.k1_stage_diag_abort();
+    }
+    match (replay, restore) {
+        (Ok(replay), Ok(())) => Ok(replay),
+        (Err(e), _) => Err(e),
+        (Ok(_), Err(e)) => Err(e),
+    }
+}
+
+fn selected_verified<'a>(batched: &'a [u32], serial: Option<&'a [u32]>) -> &'a [u32] {
+    serial.unwrap_or(batched)
+}
+
+fn exact_accept_prefix(drafts: &[u32], verified: &[u32]) -> usize {
+    drafts
+        .iter()
+        .zip(verified.iter())
+        .take_while(|(draft, target)| draft == target)
+        .count()
+}
+
 /// DFlash γ-token verify with accept-prefix.
 ///
 /// Phase 3 minimal-viable implementation: routes `[last_token, drafts...]`
@@ -31,9 +285,6 @@ static BRANCH_AUDIT_TALLY: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new(
 /// dropped.
 ///
 /// Deferred to Phase 6 (full integration):
-///   * EP=2 broadcast of verify-cmd + drafts (drafter currently runs only
-///     on rank 0; verify on a single-rank target is correct, but EP=2 needs
-///     the broadcast pattern from `step_verify_k2`).
 ///   * Per-position logprobs extraction.
 ///   * SSM `commit_verify_state_async(num_accepted, k)` loop. Without it,
 ///     hybrid models (Qwen3.6-A3B has GDN layers) will see SSM state drift
@@ -50,18 +301,52 @@ pub fn step_verify_dflash(
     num_drafts: usize,
     think: &ThinkSpecCtx<'_>,
 ) {
+    let (mut spec_cycle, spec_phase) = SpecCycle::begin(a, drafts);
+    // Provenance for the retrieval counters only — taken here so an early
+    // return cannot misattribute a later frame's acceptances. Nothing
+    // downstream reads it, so acceptance is decided exactly as before.
+    let draft_origin = std::mem::take(&mut a.draft_origin);
     // ATLAS_DFLASH_STEP_TIMING=1: per-phase wall-clock breakdown of the
     // verify step, logged once per step. Companion to ATLAS_DFLASH_PROPOSE_LOG
     // (which only covers the re-propose at the tail of this function).
     let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
     let t_step = Instant::now();
 
-    if let Err(e) = model.sync_secondary() {
+    let sync_result = dflash_capacity::preflight_frame_then(
+        model.proposer_is_dflash(),
+        || model.dflash_verify_capacity_k(),
+        num_drafts,
+        drafts.len(),
+        a.pending_tree_payload.as_ref(),
+        || model.sync_secondary(),
+    );
+    let sync_result = match sync_result {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!("DFlash pre-verify capacity guard rejected the step: {error:#}");
+            a.pending_drafts.clear();
+            a.pending_tree_payload = None;
+            return;
+        }
+    };
+    if let Err(e) = sync_result {
         tracing::error!("sync_secondary: {e:#}");
         a.finished = true;
         return;
     }
+    let spec_phase = spec_cycle.secondary_wait_enqueue(spec_phase);
     let t_sync_secondary_us = t_step.elapsed().as_micros();
+
+    // EP's variable-width command synchronizes a flat token chain only. Tree
+    // topology and sparse branch-compaction metadata are rank-0-local, so a
+    // direct caller that bypassed `step_mtp` must still fail closed to the
+    // linear drafter spine before constructing/uploading a tree verify.
+    if model.is_ep() && a.pending_tree_payload.is_some() {
+        tracing::warn!(
+            "EP K=gamma verify dropping unsynchronized DDTree payload; using flat spine"
+        );
+        a.pending_tree_payload = None;
+    }
 
     // tokens = [last_verified, draft_0, draft_1, ..., draft_{γ-1}]
     //
@@ -92,10 +377,31 @@ pub fn step_verify_dflash(
         .ok()
         .as_deref()
         == Some("1");
+    let tree_verify_capable = model.dflash_tree_verify_capable();
     let use_tree_tokens = tree_tokens_verify
+        && tree_verify_capable
         && a.pending_tree_payload
             .as_ref()
             .is_some_and(|p| !p.is_empty());
+
+    // Fail closed before widening the target verify. A partial tree path
+    // (for example FP8 indirection in only six layers of a mixed BF16/FP8
+    // cache) cannot safely commit branches, so K=32 would spend roughly a
+    // second verifier width for rows the scheduler must discard. Dropping the
+    // payload here keeps the proven flat DFlash path and prevents the later
+    // GDN parent upload / tree sampler from seeing mismatched linear tokens.
+    if tree_tokens_verify && !tree_verify_capable && a.pending_tree_payload.is_some() {
+        static INCAPABLE_TREE_DBG: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = INCAPABLE_TREE_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            tracing::warn!(
+                "DDTree payload dropped before verify: model lacks exact tree support for every \
+                 attention/SSM layer; preserving the flat DFlash verifier"
+            );
+        }
+        a.pending_tree_payload = None;
+    }
 
     let mut tokens = Vec::with_capacity(drafts.len() + 1);
     tokens.push(a.last_token);
@@ -151,6 +457,38 @@ pub fn step_verify_dflash(
         verify_input_tokens.extend_from_slice(drafts);
     }
 
+    // Diagnostic fail-closed oracle. Collect the ordinary one-token target
+    // rows BEFORE the batched verifier so the latter still owns the resident
+    // logits/capture buffers on the normal path. The saved serial logits are
+    // used below whenever sampler policy needs more than raw argmaxes.
+    let serial_oracle = if serial_oracle_requested(model, a) {
+        match collect_serial_oracle(model, &mut a.seq, &tokens) {
+            Ok(replay) => Some(replay),
+            Err(e) => {
+                tracing::error!("DFLASH serial oracle replay failed: {e:#}");
+                a.finished = true;
+                return;
+            }
+        }
+    } else if match model.k1_stage_diag_requested(a.seq.seq_len, &tokens) {
+        Ok(requested) => requested,
+        Err(e) => {
+            tracing::error!("DFLASH_K1_STAGE_DIAG selector invalid: {e:#}");
+            model.k1_stage_diag_abort();
+            a.finished = true;
+            return;
+        }
+    } {
+        tracing::error!(
+            "DFLASH_K1_STAGE_DIAG requires C=1 serial-commit/skip-repropose oracle mode"
+        );
+        model.k1_stage_diag_abort();
+        a.finished = true;
+        return;
+    } else {
+        None
+    };
+
     // M8A: if a tree payload is present from the previous propose, upload its
     // parent_indices to the model's per-step scratch so the GDN dispatch can
     // fire gdn_tree_k. Cleared after verify completes (Ok or Err).
@@ -160,17 +498,52 @@ pub fn step_verify_dflash(
         tracing::warn!("set_ddtree_parent_ids failed (falling back to flat): {e:#}");
     }
 
+    // EP rank 0 owns proposal and acceptance policy, but all ranks must enter
+    // the same arbitrary-K target forward for MoE collectives. Send one framed
+    // command and a bulk token payload before invoking the verifier locally.
+    if model.is_ep() {
+        let broadcast = model
+            .ep_broadcast_cmd(EP_CMD_VERIFY_KGAMMA)
+            .and_then(|()| model.ep_broadcast_cmd(tokens.len() as u32))
+            .and_then(|()| model.ep_broadcast_tokens(&tokens).map(|_| ()));
+        if let Err(e) = broadcast {
+            tracing::error!("EP broadcast K=gamma verify frame: {e:#}");
+            a.finished = true;
+            return;
+        }
+    }
+
+    let spec_phase = spec_cycle.setup(spec_phase);
     let t_verify = Instant::now();
     let mut verified = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("decode_verify_dflash: {e:#}");
+            model.k1_stage_diag_abort();
+            if model.is_ep() {
+                let _ = model.ep_broadcast_cmd(EP_VERIFY_KGAMMA_ABORT);
+            }
             model.clear_ddtree_parent_ids();
             a.finished = true;
             return;
         }
     };
+    let spec_phase = spec_cycle.verify_complete(spec_phase);
     let t_verify_us = t_verify.elapsed().as_micros();
+    if verified.len() != tokens.len() {
+        tracing::error!(
+            expected = tokens.len(),
+            actual = verified.len(),
+            "K=gamma verifier returned the wrong row count"
+        );
+        if model.is_ep() {
+            let _ = model.ep_broadcast_cmd(EP_VERIFY_KGAMMA_ABORT);
+        }
+        model.k1_stage_diag_abort();
+        model.clear_ddtree_parent_ids();
+        a.finished = true;
+        return;
+    }
 
     // ── Verify-time think mask (throughput fix) ──
     // The verify oracle above returns the target's RAW unmasked argmax, but the
@@ -182,7 +555,30 @@ pub fn step_verify_dflash(
     // verified stream matches the masked plain path — turning forced rejections
     // into accepts. Runs BEFORE the accept/bonus logic so every consumer sees
     // the corrected stream. Gated on think_ended (never inside an active span).
-    let think_masked = dflash_think_mask_verified(model, a, &mut verified);
+    // Preserve raw batch rows for the diagnostic, select serial when active,
+    // then mask the selected vector from its matching logits rows.
+    let batched_verified_for_oracle = serial_oracle.as_ref().map(|_| verified.clone());
+    verified = selected_verified(
+        &verified,
+        serial_oracle
+            .as_ref()
+            .map(|oracle| oracle.verified.as_slice()),
+    )
+    .to_vec();
+    let think_masked = if let Some(ref oracle) = serial_oracle {
+        dflash_think_mask_verified_rows(a, &mut verified, oracle.logits_format, |i, buf| {
+            match oracle.logits_rows.get(i) {
+                Some(row) => {
+                    buf.clear();
+                    buf.extend_from_slice(row);
+                    true
+                }
+                None => false,
+            }
+        })
+    } else {
+        dflash_think_mask_verified(model, a, &mut verified)
+    };
     if think_masked > 0 {
         tracing::debug!("think mask: verified patched {think_masked} position(s) this step");
     }
@@ -209,27 +605,25 @@ pub fn step_verify_dflash(
     if let Some((expected, fork_tok)) = {
         let mut stash = branch_audit_stash().lock().unwrap();
         stash.remove(&a.session_hash)
-    } {
-        if tokens[0] == fork_tok
-            && let Some(&actual) = verified.first()
-        {
-            let is_match = actual == expected;
-            let (m, mm) = {
-                let mut t = BRANCH_AUDIT_TALLY.lock().unwrap();
-                if is_match {
-                    t.0 += 1;
-                } else {
-                    t.1 += 1;
-                }
-                *t
-            };
-            tracing::info!(
-                "BRANCH_AUDIT: fork_tok={fork_tok} expected_after_fork={expected} \
-                 true_after_fork={actual} match={} tally={m}/{}",
-                is_match as u8,
-                m + mm,
-            );
-        }
+    } && tokens[0] == fork_tok
+        && let Some(&actual) = verified.first()
+    {
+        let is_match = actual == expected;
+        let (m, mm) = {
+            let mut t = BRANCH_AUDIT_TALLY.lock().unwrap();
+            if is_match {
+                t.0 += 1;
+            } else {
+                t.1 += 1;
+            }
+            *t
+        };
+        tracing::info!(
+            "BRANCH_AUDIT: fork_tok={fork_tok} expected_after_fork={expected} \
+             true_after_fork={actual} match={} tally={m}/{}",
+            is_match as u8,
+            m + mm,
+        );
     }
 
     // `decode_verify` already advanced `seq.seq_len` by `tokens.len()` and
@@ -294,14 +688,76 @@ pub fn step_verify_dflash(
     // suspended inside `<think>` (dflash_masked_accept bails on
     // `inside_thinking`), and tree payloads are cleared for thinking
     // sequences in step_mtp before verify.
-    let thinking_accept: Option<ThinkAcceptOutcome> =
+    let thinking_accept: Option<SpecAcceptOutcome> =
         if think.enabled && a.inside_thinking && a.pending_tree_payload.is_none() {
-            run_dflash_thinking_accept(model, a, &verify_input_tokens, &verified, think)
+            if let Some(ref oracle) = serial_oracle {
+                if oracle.logits_format == VerifyLogitsFormat::Fp32 {
+                    tracing::error!(
+                        "DFLASH serial oracle cannot run BF16 think policy over FP32 logits"
+                    );
+                    a.finished = true;
+                    Some(SpecAcceptOutcome {
+                        num_accepted: 0,
+                        bonus: None,
+                    })
+                } else {
+                    Some(dflash_thinking_accept(
+                        a,
+                        &verify_input_tokens,
+                        &verified,
+                        think,
+                        |i, buf| match oracle.logits_rows.get(i) {
+                            Some(row) => {
+                                buf.clear();
+                                buf.extend_from_slice(row);
+                                true
+                            }
+                            None => false,
+                        },
+                        |a| rollback::snapshot_boundary_if_ssm(a, model),
+                    ))
+                }
+            } else {
+                run_dflash_thinking_accept(model, a, &verify_input_tokens, &verified, think)
+            }
         } else {
             None
         };
 
+    // Outside thinking, raw target argmax is only an oracle for a neutral
+    // greedy sampler.  Qwen's default presence/LZ/DRY penalties are
+    // non-neutral, so re-sample each flat verify row through the same policy
+    // pipeline as serial decode and truncate at the first true mismatch.
+    let content_accept: Option<SpecAcceptOutcome> = if thinking_accept.is_none()
+        && !a.inside_thinking
+        && a.pending_tree_payload.is_none()
+        && content_policy_required(a, think)
+    {
+        if let Some(ref oracle) = serial_oracle {
+            Some(dflash_content_accept(
+                a,
+                &verify_input_tokens,
+                &verified,
+                think,
+                oracle.logits_format,
+                |i, buf| match oracle.logits_rows.get(i) {
+                    Some(row) => {
+                        buf.clear();
+                        buf.extend_from_slice(row);
+                        true
+                    }
+                    None => false,
+                },
+            ))
+        } else {
+            run_dflash_content_accept(model, a, &verify_input_tokens, &verified, think)
+        }
+    } else {
+        None
+    };
+
     let grammar_accept: Option<(usize, u32)> = if thinking_accept.is_none()
+        && content_accept.is_none()
         && dflash_grammar_mode() == DflashGrammarMode::Verify
         && a.pending_tree_payload.is_none()
     {
@@ -346,7 +802,8 @@ pub fn step_verify_dflash(
         }
     }
     let mut tree_accepted_path: Option<(Vec<usize>, usize)> = None;
-    let (num_accepted, tree_last_inter_slot) = if let Some(ref t) = thinking_accept {
+    let committed_accept = thinking_accept.as_ref().or(content_accept.as_ref());
+    let (num_accepted, tree_last_inter_slot) = if let Some(t) = committed_accept {
         (t.num_accepted, None)
     } else if let Some((n, _)) = grammar_accept {
         (n, None)
@@ -509,28 +966,47 @@ pub fn step_verify_dflash(
         // Tried BEFORE typical-accept: relaxed is the more general gate
         // (subsumes typical's α·p_max test as a special case) and is the
         // one that also fires at temp0.
-        let n = match dflash_relax_accept(model, a, drafts, &verified) {
-            Some(n) => n,
-            None => match dflash_typical_accept(model, a, drafts, &verified) {
+        let n = if serial_oracle.is_some() {
+            // The serial diagnostic is an exact, fail-closed oracle. Never
+            // widen its acceptance with batch-resident relaxed/typical logits.
+            exact_accept_prefix(drafts, &verified)
+        } else {
+            match dflash_relax_accept(model, a, drafts, &verified) {
                 Some(n) => n,
-                None => {
-                    let mut n = 0usize;
-                    for i in 0..drafts.len() {
-                        if i + 1 >= verified.len() {
-                            break;
-                        }
-                        if drafts[i] == verified[i] {
-                            n += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    n
-                }
-            },
+                None => match dflash_typical_accept(model, a, drafts, &verified) {
+                    Some(n) => n,
+                    None => exact_accept_prefix(drafts, &verified),
+                },
+            }
         };
         (n, None)
     };
+
+    // Release the EP worker immediately after rank 0 derives acceptance. A
+    // policy/D2H failure cannot commit a valid prefix, so send the abort
+    // sentinel; otherwise the worker mirrors seq trim + recurrent checkpoint
+    // from the accepted-draft count before returning to its command loop.
+    if model.is_ep() {
+        let policy_walk_active = committed_accept.is_some();
+        let bonus_available = committed_accept.is_none_or(|outcome| outcome.bonus.is_some());
+        let result = ep_kgamma_result(
+            num_accepted,
+            policy_walk_active,
+            a.finished,
+            bonus_available,
+        );
+        let policy_failed = result == EP_VERIFY_KGAMMA_ABORT;
+        if let Err(e) = model.ep_broadcast_cmd(result) {
+            tracing::error!("EP broadcast K=gamma verify result: {e:#}");
+            model.clear_ddtree_parent_ids();
+            a.finished = true;
+            return;
+        }
+        if policy_failed {
+            model.clear_ddtree_parent_ids();
+            return;
+        }
+    }
 
     // Roll back the over-extended `seq_len` and `seq.tokens`. The verify
     // advanced both by `tokens.len() = γ+1` (all γ drafts + the prefix
@@ -567,6 +1043,27 @@ pub fn step_verify_dflash(
         );
     }
 
+    tracing::info!(
+        "DFLASH K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={} verify_input={:?} verified={:?}",
+        drafts.len(),
+        num_accepted,
+        drafts.len(),
+        100.0 * (num_accepted as f64) / (drafts.len() as f64),
+        a.seq.seq_len,
+        verify_input_tokens,
+        verified,
+    );
+
+    // One-sample evidence of how the drafter is doing on this text. Read
+    // by the retrieval tiers on the NEXT propose, never by this frame.
+    a.last_verify_accepted = u16::try_from(num_accepted).unwrap_or(u16::MAX);
+
+    match draft_origin {
+        DraftOrigin::RestStore => crate::rest_store::record_accepted(num_accepted),
+        DraftOrigin::SelfContext => crate::rest_store::self_context::record_accepted(num_accepted),
+        DraftOrigin::Proposer => {}
+    }
+
     // Emit accepted drafts.
     //
     // ATLAS_DDTREE_TREE_TOKENS_VERIFY=1: when the verify input was built
@@ -589,15 +1086,18 @@ pub fn step_verify_dflash(
     // accepted token by its compact index (compact slot `c` carries
     // `verify_input_tokens[c-1]`) rather than slicing the contiguous prefix.
     // Falls back to the legacy contiguous slice on every flat/non-tree path.
-    if let Some(ref t) = thinking_accept {
-        // ATLAS_THINK_SPEC: the thinking walk already committed/streamed
-        // its accepted prefix AND bonus with plain-path in-thinking
-        // semantics (suppressed EOS never reaches output_tokens,
-        // `</think>` runs the phase transition, `a.last_token` already
-        // points at the bonus). A missing bonus means the walk finished
-        // the sequence mid-emission (stream drop / cancel / D2H failure)
-        // — bail out exactly like the legacy emit loop's early return.
+    if let Some(t) = committed_accept {
+        // The policy walk already committed/streamed its accepted prefix
+        // AND bonus with serial sampler semantics. A missing bonus means
+        // the sequence finished mid-emission (stream drop / cancel / D2H
+        // failure), so bail out like the legacy emit loop.
         if a.finished || t.bonus.is_none() {
+            model.clear_ddtree_parent_ids();
+            if let Some(record) =
+                spec_cycle.terminal(spec_phase, num_accepted, a.output_tokens.len())
+            {
+                tracing::info!("{record}");
+            }
             return;
         }
     } else {
@@ -612,6 +1112,12 @@ pub fn step_verify_dflash(
         for &tok in &emit_tokens {
             emit_token(a, tok, None);
             if a.finished {
+                model.clear_ddtree_parent_ids();
+                if let Some(record) =
+                    spec_cycle.terminal(spec_phase, num_accepted, a.output_tokens.len())
+                {
+                    tracing::info!("{record}");
+                }
                 return;
             }
         }
@@ -643,6 +1149,12 @@ pub fn step_verify_dflash(
         if let Some(bonus) = bonus_tok {
             emit_token(a, bonus, None);
             if a.finished {
+                model.clear_ddtree_parent_ids();
+                if let Some(record) =
+                    spec_cycle.terminal(spec_phase, num_accepted, a.output_tokens.len())
+                {
+                    tracing::info!("{record}");
+                }
                 return;
             }
             a.last_token = bonus;
@@ -659,21 +1171,6 @@ pub fn step_verify_dflash(
             },
         ])
         .inc();
-
-    tracing::info!(
-        "DFLASH K=γ verify: γ={} accepted={}/{} ({:.0}%) seq_len={} verify_input={:?} verified={:?}",
-        drafts.len(),
-        num_accepted,
-        drafts.len(),
-        100.0 * (num_accepted as f64) / (drafts.len() as f64),
-        a.seq.seq_len,
-        // verify_input_tokens reflects what was ACTUALLY embedded — equals
-        // `drafts` in chain mode, equals the tree-topology tokens when
-        // ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 (mixed with chain-tail padding
-        // for slots beyond budget).
-        verify_input_tokens,
-        verified,
-    );
 
     // SSM commit / rollback. Hybrid models (Qwen3.6-A3B has 30 GDN layers)
     // advance recurrent SSM state per-position during verify; without this
@@ -701,8 +1198,55 @@ pub fn step_verify_dflash(
         Some(slot) => slot,
         None => total_accepted.saturating_sub(1),
     };
+    let spec_phase = spec_cycle.accept(spec_phase);
     let t_commit = Instant::now();
-    let commit_res = if tree_last_inter_slot.is_some() {
+    // Diagnostic oracle: acceptance, bonus selection, and emission above used
+    // the ordinary one-token argmax/logit rows collected before the batched
+    // verifier. Discard the batched target state, restore the pre-verify
+    // checkpoint, and rebuild exactly that serial-selected committed prefix.
+    // This is deliberately slow and is only supported with SKIP_REPROPOSE:
+    // sequential decodes overwrite DFlash's captured hidden rows, so they are
+    // a correctness oracle rather than a production proposal handoff.
+    let commit_res = if let Some(ref oracle) = serial_oracle {
+        let batched = batched_verified_for_oracle
+            .as_deref()
+            .expect("serial oracle always preserves batched results");
+        for (row, &serial_argmax) in oracle.verified.iter().enumerate() {
+            let batch_argmax = batched.get(row).copied().unwrap_or(u32::MAX);
+            tracing::info!(
+                "DFLASH_SERIAL_ORACLE pre_verify_len={} row={} input={} batch_argmax={} serial_argmax={} match={}",
+                pre_verify_len,
+                row,
+                tokens.get(row).copied().unwrap_or(u32::MAX),
+                batch_argmax,
+                serial_argmax,
+                batch_argmax == serial_argmax,
+            );
+        }
+        a.seq.seq_len = pre_verify_len;
+        a.seq.tokens.truncate(pre_verify_len);
+        let mut result = model.pre_verify_copy_async(&mut a.seq);
+        if result.is_ok() {
+            for &token in tokens.iter().take(total_accepted) {
+                match model.decode(token, &mut a.seq, 0) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_ok() {
+            tracing::info!(
+                "DFLASH_SERIAL_COMMIT rebuilt={} seq_len={} pre_verify_len={}",
+                total_accepted,
+                a.seq.seq_len,
+                pre_verify_len,
+            );
+        }
+        result
+    } else if tree_last_inter_slot.is_some() {
         model.commit_verify_state_async_with_slot(
             &mut a.seq,
             total_accepted,
@@ -713,6 +1257,7 @@ pub fn step_verify_dflash(
         model.commit_verify_state_async(&mut a.seq, total_accepted, k_verify)
     };
     let t_commit_us = t_commit.elapsed().as_micros();
+    let spec_phase = spec_cycle.commit_enqueue(spec_phase);
     if let Err(e) = commit_res {
         tracing::error!("commit_verify_state_async (dflash): {e:#}");
         model.clear_ddtree_parent_ids();
@@ -741,27 +1286,51 @@ pub fn step_verify_dflash(
     if let Some((ref path, _)) = tree_accepted_path
         && !path.is_empty()
         && !path.iter().enumerate().all(|(i, &c)| c == i + 1)
+        && let Err(e) = model.compact_verify_kv(&a.seq, path, pre_verify_len)
     {
-        if let Err(e) = model.compact_verify_kv(&a.seq, path, pre_verify_len) {
-            tracing::error!("compact_verify_kv (dflash tree-fork): {e:#}");
-            a.finished = true;
-            return;
-        }
+        tracing::error!("compact_verify_kv (dflash tree-fork): {e:#}");
+        a.finished = true;
+        return;
     }
 
     // Save the bonus token's hidden state for the NEXT propose() call.
-    // DFlash needs the target's hidden states for the full prefix including
-    // the bonus token; the verify forward pass only processed the drafts.
+    //
+    // This verifier is selected by draft width (`drafts.len() >= 4`), not by
+    // proposer type.  A native MTP proposer configured with four or more
+    // drafts therefore lands here too.  DFlash consumes its layer-capture
+    // buffer, whereas native MTP consumes `mtp_hidden_save`; updating only the
+    // former left native MTP conditioned on a stale hidden row after its first
+    // wide verify.  The resulting proposals rapidly collapsed to reserved
+    // chat-control tokens with ~0 acceptance.  Preserve the DFlash path and
+    // save the verified bonus row explicitly for native MTP.
     let t_save = Instant::now();
     // `a.last_token` already holds the emitted bonus (masked argmax under
     // grammar verify mode, else `verified[bonus_idx]`; unchanged when no
     // bonus row existed).
     let bonus = a.last_token;
-    if let Err(e) = model.save_hidden_for_dflash(bonus, &mut a.seq, 0) {
-        tracing::error!("save_hidden_for_dflash (dflash): {e:#}");
+    let proposer_is_dflash = model.proposer_is_dflash();
+    let tree_bonus_row = tree_accepted_path.as_ref().map(|(_, row)| *row);
+    let save_hidden_result =
+        match wide_verify_hidden_save(proposer_is_dflash, bonus, num_accepted, tree_bonus_row) {
+            WideVerifyHiddenSave::DflashToken(token) => {
+                model.save_hidden_for_dflash(token, &mut a.seq, 0)
+            }
+            WideVerifyHiddenSave::NativeMtpRow(row) => model.save_hidden_for_mtp(row, 0),
+        };
+    if let Err(e) = save_hidden_result {
+        tracing::error!("save hidden after wide verify: {e:#}");
+        // Native MTP consumes this buffer immediately. Its established K=2/3/4
+        // paths abort the step on a failed save so the next scheduler tick can
+        // bootstrap from a clean one-token decode. Continuing here would feed
+        // the proposer a known-stale hidden row—the exact corruption this path
+        // exists to prevent. Preserve DFlash's prior log-and-continue behavior.
+        if !proposer_is_dflash {
+            return;
+        }
     }
     let t_save_us = t_save.elapsed().as_micros();
 
+    let spec_phase = spec_cycle.post_commit_enqueue(spec_phase);
     let t_trim = Instant::now();
     if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
         tracing::error!("trim_proposer_state: {e:#}");
@@ -789,10 +1358,9 @@ pub fn step_verify_dflash(
     // what is PROPOSED next step, never what is committed.
     if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() == Some("1")
         && a.pending_tree_payload.is_none()
+        && let Err(e) = model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token)
     {
-        if let Err(e) = model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token) {
-            tracing::warn!("dflash_stash_recycle: {e:#}");
-        }
+        tracing::warn!("dflash_stash_recycle: {e:#}");
     }
 
     // ── ATLAS_DFLASH_ECHO=1: stash the target's own rejected-tail argmaxes ──
@@ -817,11 +1385,11 @@ pub fn step_verify_dflash(
         && !dflash_tree_method_active()
         && !dflash_portfolio_active()
         && thinking_accept.is_none()
+        && content_accept.is_none()
         && grammar_accept.is_none()
+        && let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token)
     {
-        if let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token) {
-            tracing::warn!("dflash_stash_echo: {e:#}");
-        }
+        tracing::warn!("dflash_stash_echo: {e:#}");
     }
 
     // Re-propose for next step — unless the stage-1 grammar gate fires
@@ -834,74 +1402,118 @@ pub fn step_verify_dflash(
     } else {
         mtp_grammar_mask_for(a)
     };
+    let spec_phase = spec_cycle.proposer_state(spec_phase);
     let t_propose = std::time::Instant::now();
-    let propose_result = if skip_propose {
-        Ok(Vec::new())
+    // Diagnostic isolation: leave drafts empty after each verify so the next
+    // scheduler tick runs one ordinary bootstrap decode against the just-
+    // committed target state.  This distinguishes a bad partial-state restore
+    // from a K=gamma verify-logit mismatch without unloading the proposer.
+    let skip_repropose_diag =
+        std::env::var("ATLAS_DFLASH_SKIP_REPROPOSE").ok().as_deref() == Some("1");
+    let proposal_token = a.last_token;
+    // ── Retrieval pre-emption for the NEXT frame ──
+    //
+    // The same cascade as the Phase A bootstrap (`mtp_step`), and the
+    // reason it is repeated here: in steady-state decoding a sequence
+    // almost never returns to the bootstrap, so a tier wired only there
+    // would measure as inert no matter how well it does offline.
+    //
+    // It rides the existing proposal seam rather than installing
+    // separately. `should_propose = false` skips the drafter's forward
+    // pass entirely — the win, on top of the accepted tokens — and the
+    // `after_propose` hook substitutes the retrieved chain into the same
+    // result the model would have returned, so `install_collected` still
+    // publishes exactly one frame and drains the producer tree exactly
+    // once. Phase accounting is untouched.
+    let retrieved = if skip_propose || skip_repropose_diag {
+        None
     } else {
-        model.run_mtp_propose_multi(
-            a.last_token,
-            a.seq.seq_len,
-            num_drafts,
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        )
+        retrieval_chain(a, proposal_token, num_drafts)
     };
-    let propose_us = t_propose.elapsed().as_micros();
-    if std::env::var("ATLAS_DFLASH_PROPOSE_LOG").ok().as_deref() == Some("1") {
-        tracing::info!(
-            "DFlash propose: {}μs num_accepted={} seq_len={}",
-            propose_us,
-            num_accepted,
-            a.seq.seq_len
-        );
-    }
-    match propose_result {
-        Ok(d) if !d.is_empty() => {
-            let mut drafts = d;
-            // ── ATLAS_DFLASH_CFG_JF=1: CFG jump-forward splice (default off) ──
-            //
-            // Splice structurally-forced tokens (closing brackets/quotes) into
-            // the freshly-proposed draft chain at positions where the neural
-            // drafter disagreed with the single legal next token. LOSSLESS: the
-            // verify above is a greedy oracle, so a wrong splice is rejected
-            // exactly like a wrong drafter token. Skipped when a
-            // NON-terminated grammar is active (xgrammar already forces those
-            // positions; we must not fight it) and when the tree payload is set
-            // (drafts are compact tree indices, not a flat chain). No-op unless
-            // the classification table was built at startup.
-            cfg_jf_splice_drafts(a, &mut drafts);
-            a.pending_drafts = drafts;
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
-    }
+    let should_propose = !skip_propose && !skip_repropose_diag && retrieved.is_none();
+    let used_retrieval = retrieved.is_some();
+    let (_, spec_phase) = proposal_lifecycle::propose_and_install_with(
+        model,
+        a,
+        proposal_token,
+        num_drafts,
+        _mtp_grammar_mask.as_deref(),
+        should_propose,
+        |a, propose_result| {
+            if let Some((origin, chain)) = retrieved {
+                *propose_result = Ok(chain);
+                a.draft_origin = origin;
+            }
+            let spec_phase = spec_cycle.propose_complete(spec_phase);
+            let propose_us = t_propose.elapsed().as_micros();
+            if std::env::var("ATLAS_DFLASH_PROPOSE_LOG").ok().as_deref() == Some("1") {
+                tracing::info!(
+                    "DFlash propose: {}μs num_accepted={} seq_len={}",
+                    propose_us,
+                    num_accepted,
+                    a.seq.seq_len
+                );
+            }
+            match propose_result {
+                Ok(drafts) if !drafts.is_empty() => {
+                    // ── ATLAS_DFLASH_CFG_JF=1: CFG jump-forward splice (default off) ──
+                    //
+                    // Splice structurally-forced tokens (closing brackets/quotes) into
+                    // the freshly-proposed draft chain at positions where the neural
+                    // drafter disagreed with the single legal next token. LOSSLESS: the
+                    // verify above is a greedy oracle, so a wrong splice is rejected
+                    // exactly like a wrong drafter token. Skipped when a
+                    // NON-terminated grammar is active (xgrammar already forces those
+                    // positions; we must not fight it) and when the tree payload is set
+                    // (drafts are compact tree indices, not a flat chain). No-op unless
+                    // the classification table was built at startup.
+                    cfg_jf_splice_drafts(a, drafts);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!("run_mtp_propose_multi (dflash): {e:#}"),
+            }
 
-    if step_timing {
-        let total_us = t_step.elapsed().as_micros();
-        let other_us = total_us.saturating_sub(
-            t_sync_secondary_us + t_verify_us + t_commit_us + t_save_us + t_trim_us + propose_us,
-        );
-        tracing::info!(
-            "DFLASH step timing: total={total_us}μs sync_secondary={t_sync_secondary_us}μs \
-             verify={t_verify_us}μs commit={t_commit_us}μs save_hidden={t_save_us}μs \
-             trim={t_trim_us}μs propose={propose_us}μs other={other_us}μs accepted={num_accepted}",
-        );
-    }
+            if step_timing {
+                let total_us = t_step.elapsed().as_micros();
+                let other_us = total_us.saturating_sub(
+                    t_sync_secondary_us
+                        + t_verify_us
+                        + t_commit_us
+                        + t_save_us
+                        + t_trim_us
+                        + propose_us,
+                );
+                tracing::info!(
+                    "DFLASH step timing: total={total_us}μs sync_secondary={t_sync_secondary_us}μs \
+                     verify={t_verify_us}μs commit={t_commit_us}μs save_hidden={t_save_us}μs \
+                     trim={t_trim_us}μs propose={propose_us}μs other={other_us}μs accepted={num_accepted}",
+                );
+            }
 
-    // ATLAS_FULL_PROFILE: emit per-kernel KPROF every 150 verify steps — the
-    // DFlash scheduler bypasses the lifecycle.rs dump so wire it here.
-    if spark_model::full_profile::is_enabled() {
-        static DFKP_CTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if DFKP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 150 == 149 {
-            spark_model::full_profile::dump();
-        }
-    }
+            // ATLAS_FULL_PROFILE: emit per-kernel KPROF every 150 verify steps — the
+            // DFlash scheduler bypasses the lifecycle.rs dump so wire it here.
+            if spark_model::full_profile::is_enabled() {
+                static DFKP_CTR: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if DFKP_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 150 == 149 {
+                    spark_model::full_profile::dump();
+                }
+            }
 
-    // DDTree M6: drain any tree payload the drafter built during the propose
-    // above and stash it on ActiveSeq for the next-step verifier. Default
-    // proposers return None (flat path preserved).
-    a.pending_tree_payload = model.take_pending_tree_payload(&mut a.seq);
+            spec_phase
+        },
+    );
+    if used_retrieval {
+        // A retrieved chain is flat by construction. `install` publishes
+        // whatever the producer's tree slot held, and no propose ran to
+        // refill it, so drop any topology that predates this frame rather
+        // than letting it describe token positions it was not built for.
+        a.pending_tree_payload = None;
+    }
+    let spec_phase = spec_cycle.finalize(spec_phase);
+    if let Some(record) = spec_cycle.complete(spec_phase, num_accepted, a.output_tokens.len()) {
+        tracing::info!("{record}");
+    }
 }
 
 /// Whether any DFlash TREE draft method is active (BRANCH / CATERPILLAR /
@@ -1423,11 +2035,20 @@ fn relax_row_accepts(bytes: &[u8], vocab: usize, tok: u32, topk: usize, ln_ratio
 /// EOS is deliberately NOT masked (a target EOS is a legitimate stop). No-op
 /// when thinking never ended / is active, the flag is disabled, logits are
 /// fp32, or the row's raw argmax doesn't match `verified[i]` (layout guard).
-fn dflash_think_mask_verified(model: &dyn Model, a: &ActiveSeq, verified: &mut [u32]) -> usize {
+fn dflash_think_mask_verified_rows(
+    a: &ActiveSeq,
+    verified: &mut [u32],
+    logits_format: VerifyLogitsFormat,
+    mut fetch_row: impl FnMut(usize, &mut Vec<u8>) -> bool,
+) -> usize {
     if !a.think_ended || a.inside_thinking {
         return 0;
     }
-    if std::env::var("ATLAS_DFLASH_THINK_MASK_VERIFY").ok().as_deref() == Some("0") {
+    if std::env::var("ATLAS_DFLASH_THINK_MASK_VERIFY")
+        .ok()
+        .as_deref()
+        == Some("0")
+    {
         return 0;
     }
     let mut skip: Vec<u32> = Vec::with_capacity(2);
@@ -1440,21 +2061,20 @@ fn dflash_think_mask_verified(model: &dyn Model, a: &ActiveSeq, verified: &mut [
     if skip.is_empty() || !verified.iter().any(|t| skip.contains(t)) {
         return 0;
     }
-    let base = model.logits_buffer_ptr();
-    if model.logits_ptr_is_fp32(base) {
+    if logits_format == VerifyLogitsFormat::Fp32 {
         return 0; // row scan assumes BF16
     }
-    let vocab = model.vocab_size();
-    let mut row = vec![0u8; vocab * 2];
+    let mut row = Vec::new();
     let mut patched = 0usize;
     for i in 0..verified.len() {
         if !skip.contains(&verified[i]) {
             continue;
         }
-        if let Err(e) = model.copy_logits_to_host(base.offset(i * vocab * 2), &mut row) {
-            tracing::warn!("think mask: verified D2H failed at pos {i} ({e:#}); leaving raw");
+        if !fetch_row(i, &mut row) || row.is_empty() || !row.len().is_multiple_of(2) {
+            tracing::warn!("think mask: verified logits unavailable at pos {i}; leaving raw");
             continue;
         }
+        let vocab = row.len() / 2;
         // Layout guard: the row's unskipped argmax must equal the raw verified
         // token, else `i` doesn't map to a contiguous logits row (tree
         // compaction) and re-deriving would corrupt an unrelated position.
@@ -1463,12 +2083,35 @@ fn dflash_think_mask_verified(model: &dyn Model, a: &ActiveSeq, verified: &mut [
             _ => continue,
         }
         if let Some(clean) = argmax_bf16_skip_tokens(&row, &skip, vocab) {
-            tracing::info!("think mask: verified pos={i} raw={} -> clean={clean}", verified[i]);
+            tracing::info!(
+                "think mask: verified pos={i} raw={} -> clean={clean}",
+                verified[i]
+            );
             verified[i] = clean;
             patched += 1;
         }
     }
     patched
+}
+
+fn dflash_think_mask_verified(model: &dyn Model, a: &ActiveSeq, verified: &mut [u32]) -> usize {
+    let base = model.logits_buffer_ptr();
+    let logits_format = if model.logits_ptr_is_fp32(base) {
+        VerifyLogitsFormat::Fp32
+    } else {
+        VerifyLogitsFormat::Bf16
+    };
+    let vocab = model.vocab_size();
+    dflash_think_mask_verified_rows(a, verified, logits_format, |i, row| {
+        row.resize(vocab * 2, 0);
+        match model.copy_logits_to_host(base.offset(i * vocab * 2), row) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("think mask: verified D2H failed at pos {i} ({e:#}); leaving raw");
+                false
+            }
+        }
+    })
 }
 
 /// V4 bonus-source fix. The DDTree/flat bonus is the target's raw GPU argmax
@@ -1578,4 +2221,148 @@ fn masked_argmax_bf16(bytes: &[u8], bitmask: &[i32], vocab: usize) -> Option<u32
         }
     }
     best_tok
+}
+
+#[cfg(test)]
+mod wide_verify_hidden_save_tests {
+    use super::{
+        WideVerifyHiddenSave, canonical_u32_csv, canonical_u32_csv_text, canonical_usize,
+        ep_kgamma_result, exact_accept_prefix, selected_verified, trajectory_selector_values_match,
+        wide_verify_hidden_save,
+    };
+    use spark_model::traits::EP_VERIFY_KGAMMA_ABORT;
+
+    #[test]
+    fn ep_rank0_aborts_failed_policy_walks_but_not_valid_results() {
+        assert_eq!(ep_kgamma_result(3, true, false, true), 3);
+        assert_eq!(ep_kgamma_result(3, false, false, false), 3);
+        assert_eq!(
+            ep_kgamma_result(usize::MAX, false, false, true),
+            EP_VERIFY_KGAMMA_ABORT
+        );
+        assert_eq!(
+            ep_kgamma_result(1, true, true, false),
+            EP_VERIFY_KGAMMA_ABORT
+        );
+        assert_eq!(
+            ep_kgamma_result(1, true, false, false),
+            EP_VERIFY_KGAMMA_ABORT
+        );
+    }
+
+    #[test]
+    fn native_mtp_uses_bonus_input_row_for_every_nd4_accept_count() {
+        for accepted in 0..=4 {
+            assert_eq!(
+                wide_verify_hidden_save(false, 99, accepted, None),
+                WideVerifyHiddenSave::NativeMtpRow(accepted),
+                "accepted={accepted}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposer_kind_keeps_dflash_token_and_tree_row_contracts_distinct() {
+        assert_eq!(
+            wide_verify_hidden_save(true, 99, 2, Some(7)),
+            WideVerifyHiddenSave::DflashToken(99)
+        );
+        assert_eq!(
+            wide_verify_hidden_save(false, 99, 2, Some(7)),
+            WideVerifyHiddenSave::NativeMtpRow(7)
+        );
+    }
+
+    #[test]
+    fn serial_selection_controls_exact_acceptance_bonus_and_emission() {
+        let drafts = [10, 20, 30, 40];
+        let batched = [10, 20, 30, 40, 50];
+        let serial = [10, 99, 30, 40, 50];
+
+        let selected = selected_verified(&batched, Some(&serial));
+        let accepted = exact_accept_prefix(&drafts, selected);
+        let bonus = selected[accepted];
+        let mut emitted = drafts[..accepted].to_vec();
+        emitted.push(bonus);
+
+        assert_eq!(accepted, 1);
+        assert_eq!(bonus, 99);
+        assert_eq!(emitted, [10, 99]);
+    }
+
+    #[test]
+    fn normal_path_keeps_batched_acceptance_when_serial_is_absent() {
+        let drafts = [10, 20, 30, 40];
+        let batched = [10, 20, 30, 40, 50];
+
+        let selected = selected_verified(&batched, None);
+        let accepted = exact_accept_prefix(&drafts, selected);
+
+        assert_eq!(accepted, drafts.len());
+        assert_eq!(selected[accepted], 50);
+    }
+
+    #[test]
+    fn trajectory_selector_values_are_canonical_and_exact() {
+        let tokens = [15, 11, 271, 13, 11];
+        assert_eq!(canonical_usize("SEQ", "31").unwrap(), 31);
+        assert_eq!(
+            canonical_u32_csv("TOKENS", "15,11,271,13,11").unwrap(),
+            [15, 11, 271, 13, 11]
+        );
+        assert_eq!(
+            canonical_u32_csv_text(&[15, 11, 271, 13, 11]),
+            "15,11,271,13,11"
+        );
+
+        for invalid in ["", "031", "+31", " 31", "31 "] {
+            assert!(canonical_usize("SEQ", invalid).is_err(), "{invalid:?}");
+        }
+        for invalid in ["", "01", "1,", ",1", "1,,2", "1, 2", "+1", "4294967296"] {
+            assert!(canonical_u32_csv("TOKENS", invalid).is_err(), "{invalid:?}");
+        }
+        assert!(!trajectory_selector_values_match(None, None, None, 31, &tokens).unwrap());
+        assert!(!trajectory_selector_values_match(Some("0"), None, None, 31, &tokens).unwrap());
+        assert!(
+            trajectory_selector_values_match(
+                Some("1"),
+                Some("31"),
+                Some("15,11,271,13,11"),
+                31,
+                &tokens,
+            )
+            .unwrap()
+        );
+        assert!(
+            !trajectory_selector_values_match(
+                Some("1"),
+                Some("32"),
+                Some("15,11,271,13,11"),
+                31,
+                &tokens,
+            )
+            .unwrap()
+        );
+        assert!(
+            trajectory_selector_values_match(
+                Some("0"),
+                Some("31"),
+                Some("15,11,271,13,11"),
+                31,
+                &tokens,
+            )
+            .is_err()
+        );
+        assert!(
+            trajectory_selector_values_match(
+                Some("1"),
+                Some("31"),
+                Some("15,11,271,13"),
+                31,
+                &tokens,
+            )
+            .is_err()
+        );
+        assert!(trajectory_selector_values_match(Some("yes"), None, None, 31, &tokens).is_err());
+    }
 }

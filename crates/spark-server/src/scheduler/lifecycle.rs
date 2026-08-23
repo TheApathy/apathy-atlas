@@ -4,18 +4,40 @@
 
 use super::*;
 
-/// Send final response and free GPU resources for a completed sequence.
-pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
-    let last_tok = a.output_tokens.last().copied();
-    let is_eos = last_tok.is_some_and(|t| a.eos_tokens.contains(&t));
-    let is_tool_call_end = last_tok == a.tool_call_end_token;
-    let reason = if is_eos {
+fn finish_reason(
+    output_tokens: &[u32],
+    eos_tokens: &[u32],
+    tool_call_end_token: Option<u32>,
+) -> &'static str {
+    let last_tok = output_tokens.last().copied();
+    let is_eos = last_tok.is_some_and(|t| eos_tokens.contains(&t));
+    let is_chatml_role_boundary = last_tok.is_some_and(|token| im_start_hard_stop() == Some(token));
+    let is_tool_call_end = last_tok.is_some_and(|token| tool_call_end_token == Some(token));
+    if is_eos || is_chatml_role_boundary {
         "stop"
     } else if is_tool_call_end {
         "tool_calls"
     } else {
         "length"
-    };
+    }
+}
+
+/// Send final response and free GPU resources for a completed sequence.
+pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
+    finish_sequence_with_cache(model, a, true);
+}
+
+/// Finish a sequence while explicitly controlling final prefix-cache admission.
+///
+/// Speculative verification may stop while only a prefix of an over-planned
+/// verify frame has been emitted. Until that frame has an exact recurrent/KV
+/// commit boundary, its `seq.tokens` must never become a reusable prefix.
+pub(super) fn finish_sequence_with_cache(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    cache_sequence: bool,
+) {
+    let reason = finish_reason(&a.output_tokens, &a.eos_tokens, a.tool_call_end_token);
     match &mut a.sink {
         ResponseSink::Streaming(tx) => {
             let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
@@ -74,7 +96,9 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
     // Cache the full sequence (prompt + generated) in the prefix cache.
     // Must happen BEFORE free_sequence() so block indices are still valid.
     // Enables multi-turn sessions to reuse KV cache for prior assistant responses.
-    model.cache_sequence(&a.seq);
+    if cache_sequence {
+        model.cache_sequence(&a.seq);
+    }
     if let Err(e) = model.free_sequence(&mut a.seq) {
         tracing::error!("free_sequence: {e:#}");
     }
@@ -132,198 +156,10 @@ pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
     }
 }
 
-/// Swap out an active sequence to disk, freeing its GPU blocks.
-///
-/// Removes the sequence at `victim_idx` from `active`, saves its state
-/// to a swap file, frees GPU resources, and returns a `SwappedSeq`.
-pub fn swap_out_sequence(
-    model: &dyn Model,
-    active: &mut Vec<ActiveSeq>,
-    victim_idx: usize,
-    spill: &mut KvSpillManager,
-) -> Result<SwappedSeq> {
-    let mut a = active.swap_remove(victim_idx);
+#[path = "swap_lifecycle.rs"]
+mod swap_lifecycle;
+pub(super) use swap_lifecycle::{resume_swapped_seq, swap_out_sequence};
 
-    // Compact the swapped-in sequence (same logic as retire path).
-    if victim_idx < active.len() && active[victim_idx].seq.slot_idx != victim_idx {
-        model.compact_sequence(&mut active[victim_idx].seq, victim_idx)?;
-        a.seq.slot_idx = usize::MAX; // sentinel: slot reused by compact
-    }
-
-    let (swap_id, mut writer) = spill.create_file()?;
-    model.save_sequence_state(&a.seq, &mut writer)?;
-    drop(writer);
-    spill.record_usage(swap_id);
-
-    let num_blocks = a.seq.block_table.len();
-    let seq_len = a.seq.seq_len;
-    let tokens = a.seq.tokens.clone();
-
-    // Free GPU resources (KV blocks + SSM slot).
-    model.free_sequence(&mut a.seq)?;
-    let _ = model.ep_broadcast_cmd(0xFFFFFFF1);
-
-    Ok(SwappedSeq {
-        tokens,
-        session_hash: a.session_hash,
-        seq_len,
-        num_blocks,
-        last_token: a.last_token,
-        output_tokens: a.output_tokens,
-        remaining: a.remaining,
-        min_tokens: a.min_tokens,
-        eos_tokens: a.eos_tokens,
-        sink: a.sink,
-        temperature: a.temperature,
-        top_k: a.top_k,
-        top_p: a.top_p,
-        top_n_sigma: a.top_n_sigma,
-        min_p: a.min_p,
-        repetition_penalty: a.repetition_penalty,
-        presence_penalty: a.presence_penalty,
-        frequency_penalty: a.frequency_penalty,
-        repetition_penalty_window: 256,
-        lz_penalty: DEFAULT_LZ_PENALTY,
-        dry_multiplier: a.dry_multiplier,
-        dry_base: a.dry_base,
-        dry_allowed_length: a.dry_allowed_length,
-        dry_sequence_breakers: a.dry_sequence_breakers,
-        logit_bias: a.logit_bias,
-        inside_thinking: a.inside_thinking,
-        enable_thinking: a.enable_thinking,
-        thinking_budget: a.thinking_budget,
-        spontaneous_think_budget: a.spontaneous_think_budget,
-        thinking_tokens: a.thinking_tokens,
-        force_end_thinking: a.force_end_thinking,
-        consecutive_confident: a.consecutive_confident,
-        in_code_fence: a.in_code_fence,
-        think_end_token: a.think_end_token,
-        think_start_token: a.think_start_token,
-        think_ended: a.think_ended,
-        think_just_ended: a.think_just_ended,
-        think_skip_count: a.think_skip_count,
-        post_think_gate_steps: a.post_think_gate_steps,
-        require_tool_call: a.require_tool_call,
-        suppress_tool_call: a.suppress_tool_call,
-        disable_mtp: a.disable_mtp,
-        content_started: a.content_started,
-        content_tokens: a.content_tokens,
-        prose_tokens_since_last_tool: a.prose_tokens_since_last_tool,
-        think_watchdog_fires: a.think_watchdog_fires,
-        rollback_count: a.rollback_count,
-        tool_call_start_token: a.tool_call_start_token,
-        tool_call_opened: a.tool_call_opened,
-        tool_call_end_token: a.tool_call_end_token,
-        last_token_time: a.last_token_time,
-        request_start: a.request_start,
-        decode_start: a.decode_start,
-        seed: a.seed,
-        top_logprobs: a.top_logprobs,
-        logprobs_data: a.logprobs_data,
-        timeout_at: a.timeout_at,
-        swap_id,
-        cached_prompt_tokens: a.cached_prompt_tokens,
-    })
-}
-
-/// Resume a swapped-out sequence by restoring its state from disk.
-pub fn resume_swapped_seq(
-    _think_end_token: Option<u32>,
-    _think_start_token: Option<u32>,
-    model: &dyn Model,
-    s: SwappedSeq,
-    spill: &mut KvSpillManager,
-) -> Result<ActiveSeq> {
-    let mut seq = model.alloc_sequence()?;
-    let mut reader = spill.open_file(s.swap_id)?;
-    model.restore_sequence_state(&mut seq, s.num_blocks, &mut reader)?;
-    drop(reader);
-    spill.remove_file(s.swap_id)?;
-
-    // Restore CPU-side metadata.
-    seq.tokens = s.tokens;
-    seq.seq_len = s.seq_len;
-
-    Ok(ActiveSeq {
-        seq,
-        session_hash: s.session_hash,
-        last_token: s.last_token,
-        output_tokens: s.output_tokens,
-        remaining: s.remaining,
-        min_tokens: s.min_tokens,
-        eos_tokens: s.eos_tokens,
-        finished: false,
-        sink: s.sink,
-        // cancel_flag isn't preserved across spill/restore — the
-        // original stream is long gone by the time a swapped-out seq
-        // resumes from disk, so the live guards don't apply here.
-        cancel_flag: None,
-        temperature: s.temperature,
-        top_k: s.top_k,
-        top_p: s.top_p,
-        top_n_sigma: s.top_n_sigma,
-        min_p: s.min_p,
-        repetition_penalty: s.repetition_penalty,
-        presence_penalty: s.presence_penalty,
-        frequency_penalty: s.frequency_penalty,
-        repetition_penalty_window: 256,
-        lz_penalty: DEFAULT_LZ_PENALTY,
-        dry_multiplier: s.dry_multiplier,
-        dry_base: s.dry_base,
-        dry_allowed_length: s.dry_allowed_length,
-        dry_sequence_breakers: s.dry_sequence_breakers,
-        logit_bias: s.logit_bias,
-        inside_thinking: s.inside_thinking,
-        enable_thinking: s.enable_thinking,
-        thinking_budget: s.thinking_budget,
-        spontaneous_think_budget: s.spontaneous_think_budget,
-        thinking_tokens: s.thinking_tokens,
-        force_end_thinking: s.force_end_thinking,
-        consecutive_confident: s.consecutive_confident,
-        in_code_fence: s.in_code_fence,
-        think_end_token: s.think_end_token,
-        think_start_token: s.think_start_token,
-        think_ended: s.think_ended,
-        think_just_ended: s.think_just_ended,
-        think_skip_count: s.think_skip_count,
-        post_think_gate_steps: s.post_think_gate_steps,
-        require_tool_call: s.require_tool_call,
-        suppress_tool_call: s.suppress_tool_call,
-        disable_mtp: s.disable_mtp,
-        content_started: false,
-        content_tokens: 0,
-        prose_tokens_since_last_tool: 0,
-        think_watchdog_fires: s.think_watchdog_fires,
-        rollback_count: s.rollback_count,
-        // Decode-rollback SSM snapshots are GPU-resident and not part of
-        // the disk swap image — a resumed sequence starts with an empty
-        // ring. New boundary snapshots accrue as it decodes again; until
-        // one exists, a hybrid-model rollback declines to the hard stop
-        // (correct: there is no live snapshot to restore).
-        ssm_rollback_ring: SsmDecodeRing::new(model.decode_rollback_ring_slots()),
-        tool_call_start_token: s.tool_call_start_token,
-        tool_call_opened: s.tool_call_opened,
-        // Resumed sequences re-enter outside any tool body — even if
-        // the snapshot was mid-tool-call, the sample path needs a
-        // safe default. Cleared at next emit if we re-cross a marker.
-        inside_tool_body: false,
-        tool_call_end_token: s.tool_call_end_token,
-        // Grammar state is not serializable; resumed sequences use legacy fallback.
-        grammar_state: None,
-        pending_drafts: Vec::new(),
-        pending_tree_payload: None,
-        last_token_time: Instant::now(),
-        request_start: s.request_start,
-        decode_start: s.decode_start,
-        seed: s.seed,
-        top_logprobs: s.top_logprobs,
-        logprobs_data: s.logprobs_data,
-        timeout_at: s.timeout_at,
-        adaptive: crate::adaptive_sampler::AdaptiveSamplingState::new(s.temperature),
-        cached_prompt_tokens: s.cached_prompt_tokens,
-        // Swap-in resets the difficulty probe: a resumed sequence is past its
-        // thinking-probe window (or the budget already committed), so a fresh
-        // (inert) probe is correct — it never re-observes post-`</think>`.
-        difficulty_probe: Default::default(),
-    })
-}
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod tests;

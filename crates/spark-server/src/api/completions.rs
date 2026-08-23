@@ -53,6 +53,120 @@ use super::failures::*;
 use super::inference_types::*;
 use super::sanitizer::*;
 
+#[allow(clippy::result_large_err)]
+fn validate_completion_input(req: &CompletionRequest) -> Result<(), Response> {
+    if req.max_tokens == 0 {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "max_tokens must be at least 1".into(),
+            Some("max_tokens"),
+            None,
+        ));
+    }
+    if req.stop.len() > 4 {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "stop must contain at most 4 sequences".into(),
+            Some("stop"),
+            None,
+        ));
+    }
+    if req.stop.iter().any(String::is_empty) {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "stop sequences must not be empty".into(),
+            Some("stop"),
+            None,
+        ));
+    }
+    if let Some(temperature) = req.temperature
+        && !(0.0..=2.0).contains(&temperature)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "temperature must be between 0 and 2".into(),
+            Some("temperature"),
+            None,
+        ));
+    }
+    if let Some(top_p) = req.top_p
+        && !(top_p > 0.0 && top_p <= 1.0)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "top_p must be between 0 (exclusive) and 1".into(),
+            Some("top_p"),
+            None,
+        ));
+    }
+    if let Some(top_n_sigma) = req.top_n_sigma
+        && !(top_n_sigma.is_finite() && top_n_sigma >= 0.0)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "top_n_sigma must be finite and non-negative".into(),
+            Some("top_n_sigma"),
+            None,
+        ));
+    }
+    if let Some(min_p) = req.min_p
+        && !(0.0..=1.0).contains(&min_p)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "min_p must be between 0 and 1".into(),
+            Some("min_p"),
+            None,
+        ));
+    }
+    if let Some(repetition_penalty) = req.repetition_penalty
+        && !(repetition_penalty.is_finite() && repetition_penalty > 0.0)
+    {
+        return Err(openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "repetition_penalty must be finite and greater than 0".into(),
+            Some("repetition_penalty"),
+            None,
+        ));
+    }
+    for (name, penalty) in [
+        ("presence_penalty", req.presence_penalty),
+        ("frequency_penalty", req.frequency_penalty),
+    ] {
+        if let Some(value) = penalty
+            && !(-2.0..=2.0).contains(&value)
+        {
+            return Err(openai_error_response_with_param(
+                StatusCode::BAD_REQUEST,
+                format!("{name} must be between -2.0 and 2.0"),
+                Some(name),
+                None,
+            ));
+        }
+    }
+    if let Some(logit_bias) = &req.logit_bias {
+        for (token_id, bias) in logit_bias {
+            if token_id.parse::<u32>().is_err() {
+                return Err(openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    format!("logit_bias key '{token_id}' must be a token ID"),
+                    Some("logit_bias"),
+                    None,
+                ));
+            }
+            if !(-100.0..=100.0).contains(bias) {
+                return Err(openai_error_response_with_param(
+                    StatusCode::BAD_REQUEST,
+                    "logit_bias values must be between -100 and 100".into(),
+                    Some("logit_bias"),
+                    None,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn completions(
     State(state): State<Arc<AppState>>,
     req: Result<Json<CompletionRequest>, JsonRejection>,
@@ -66,6 +180,9 @@ pub async fn completions(
             );
         }
     };
+    if let Err(response) = validate_completion_input(&req) {
+        return response;
+    }
     // For thinking models, prepend <think></think>\n\n to suppress think-tag
     // leakage in raw completions mode (the model expects this prefix after
     // training). Users who construct their own think tokens can include them
@@ -145,6 +262,7 @@ pub async fn completions(
             frequency_penalty,
             logit_bias.clone(),
             stop_tokens,
+            req.stop.clone(),
             req.seed,
         )
         .await
@@ -282,6 +400,7 @@ pub(super) async fn completions_stream(
     frequency_penalty: f32,
     logit_bias: Vec<(u32, f32)>,
     stop_tokens: Vec<u32>,
+    stop_strings: Vec<String>,
     seed: Option<u64>,
 ) -> Result<Response, (StatusCode, String)> {
     // Match chat_stream/mod.rs sizing; see comment there.
@@ -289,6 +408,7 @@ pub(super) async fn completions_stream(
     let prompt_len = prompt_tokens.len();
 
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let request = InferenceRequest::Streaming {
         prompt_tokens,
         session_hash,
@@ -320,10 +440,10 @@ pub(super) async fn completions_stream(
         top_logprobs: None,
         timeout_at: None,
         token_tx,
-        // /v1/completions has no guard pipeline yet — the flag is
-        // created so the scheduler's emit_step type-checks cleanly,
-        // but never flipped.
-        cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // Legacy completions has no agentic guard pipeline; this flag
+        // is reserved for the streaming string-stop matcher so a full
+        // match terminates scheduler work as well as suppressing SSE.
+        cancel_flag: cancel_flag.clone(),
     };
 
     state.request_tx.send(request).await.map_err(|_| {
@@ -340,58 +460,86 @@ pub(super) async fn completions_stream(
     let id = chunk_id.clone();
     let mut all_toks: Vec<u32> = Vec::new();
     let mut emitted: usize = 0;
-    let token_stream = ReceiverStream::new(token_rx).map(move |event| match event {
-        StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
-            all_toks.push(tok);
-            let full = state.tokenizer.decode(&all_toks).unwrap_or_default();
-            let stable_end = full.trim_end_matches('\u{FFFD}').len();
-            if stable_end <= emitted {
-                let chunk = CompletionChunk::text_chunk(&model, &id, String::new());
-                let json = serde_json::to_string(&chunk).unwrap_or_default();
-                return Ok::<_, std::convert::Infallible>(Event::default().data(json));
+    let mut stop_holdback = String::new();
+    let mut stop_triggered = false;
+    let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
+        let mut events = Vec::new();
+        match event {
+            StreamEvent::Token(tok) | StreamEvent::TokenWithLogprobs(tok, _) => {
+                if stop_triggered {
+                    return futures::stream::iter(events);
+                }
+                all_toks.push(tok);
+                let full = state.tokenizer.decode(&all_toks).unwrap_or_default();
+                let stable_end = full.trim_end_matches('\u{FFFD}').len();
+                if stable_end <= emitted {
+                    return futures::stream::iter(events);
+                }
+                let delta = &full[emitted..stable_end];
+                emitted = stable_end;
+                let (safe, matched) =
+                    super::chat_stream::filter_stop_delta(&mut stop_holdback, delta, &stop_strings);
+                if matched {
+                    stop_triggered = true;
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if !safe.is_empty() {
+                    let chunk = CompletionChunk::text_chunk(&model, &id, safe);
+                    let json = serde_json::to_string(&chunk).unwrap_or_default();
+                    events.push(Ok::<_, std::convert::Infallible>(
+                        Event::default().data(json),
+                    ));
+                }
             }
-            let delta = full[emitted..stable_end].to_string();
-            emitted = stable_end;
-            let chunk = CompletionChunk::text_chunk(&model, &id, delta);
-            let json = serde_json::to_string(&chunk).unwrap_or_default();
-            Ok::<_, std::convert::Infallible>(Event::default().data(json))
-        }
-        StreamEvent::Done {
-            finish_reason,
-            prompt_tokens: _,
-            completion_tokens,
-            time_to_first_token_ms,
-            decode_time_ms,
-            reasoning_tokens,
-            cached_prompt_tokens,
-        } => {
-            let tps = if decode_time_ms > 0.0 {
-                completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
-            } else {
-                0.0
-            };
-            let usage = Usage {
-                prompt_tokens: prompt_len,
+            StreamEvent::Done {
+                finish_reason,
+                prompt_tokens: _,
                 completion_tokens,
-                total_tokens: prompt_len + completion_tokens,
-                prompt_tokens_details: Some(crate::openai::PromptTokensDetails {
-                    cached_tokens: cached_prompt_tokens as usize,
-                    audio_tokens: 0,
-                }),
-                completion_tokens_details: Some(crate::openai::CompletionTokensDetails {
-                    reasoning_tokens: reasoning_tokens as usize,
-                    audio_tokens: 0,
-                    accepted_prediction_tokens: 0,
-                    rejected_prediction_tokens: 0,
-                }),
                 time_to_first_token_ms,
-                response_tokens_per_second: tps,
-            };
-            let chunk = CompletionChunk::done_chunk(&model, &id, &finish_reason, usage);
-            let json = serde_json::to_string(&chunk).unwrap_or_default();
-            Ok(Event::default().data(json))
+                decode_time_ms,
+                reasoning_tokens,
+                cached_prompt_tokens,
+            } => {
+                if !stop_triggered && !stop_holdback.is_empty() {
+                    let chunk = CompletionChunk::text_chunk(
+                        &model,
+                        &id,
+                        std::mem::take(&mut stop_holdback),
+                    );
+                    let json = serde_json::to_string(&chunk).unwrap_or_default();
+                    events.push(Ok(Event::default().data(json)));
+                }
+                let tps = if decode_time_ms > 0.0 {
+                    completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let usage = Usage {
+                    prompt_tokens: prompt_len,
+                    completion_tokens,
+                    total_tokens: prompt_len + completion_tokens,
+                    prompt_tokens_details: Some(crate::openai::PromptTokensDetails {
+                        cached_tokens: cached_prompt_tokens as usize,
+                        audio_tokens: 0,
+                    }),
+                    completion_tokens_details: Some(crate::openai::CompletionTokensDetails {
+                        reasoning_tokens: reasoning_tokens as usize,
+                        audio_tokens: 0,
+                        accepted_prediction_tokens: 0,
+                        rejected_prediction_tokens: 0,
+                    }),
+                    time_to_first_token_ms,
+                    response_tokens_per_second: tps,
+                };
+                let chunk = CompletionChunk::done_chunk(&model, &id, &finish_reason, usage);
+                let json = serde_json::to_string(&chunk).unwrap_or_default();
+                events.push(Ok(Event::default().data(json)));
+            }
+            StreamEvent::Error(msg) => {
+                events.push(Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#))));
+            }
         }
-        StreamEvent::Error(msg) => Ok(Event::default().data(format!(r#"{{"error":"{msg}"}}"#))),
+        futures::stream::iter(events)
     });
 
     let done_event = futures::stream::once(async {
@@ -452,4 +600,142 @@ pub async fn embeddings_stub() -> Response {
 /// as "wrong URL".
 pub(super) fn not_supported(message: &'static str) -> Response {
     openai_error_response(StatusCode::NOT_IMPLEMENTED, message.into())
+}
+
+#[cfg(test)]
+mod completion_input_validation_tests {
+    use super::validate_completion_input;
+    use axum::http::StatusCode;
+
+    fn request() -> crate::openai::CompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "prompt": "hello"
+        }))
+        .expect("valid completion request")
+    }
+
+    #[test]
+    fn completion_numeric_contract_matches_chat() {
+        let mut value = request();
+        assert!(validate_completion_input(&value).is_ok());
+
+        value.max_tokens = 0;
+        assert_eq!(
+            validate_completion_input(&value).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        value = request();
+        for invalid in [-1.0, 2.1, f32::NAN, f32::INFINITY] {
+            value.temperature = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value = request();
+        for invalid in [0.0, -0.1, 1.1, f32::NAN, f32::INFINITY] {
+            value.top_p = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.top_p = None;
+        for invalid in [-2.1, 2.1, f32::NAN, f32::INFINITY] {
+            value.presence_penalty = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+            value.presence_penalty = None;
+            value.frequency_penalty = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+            value.frequency_penalty = None;
+        }
+    }
+
+    #[test]
+    fn completion_logit_bias_rejects_invalid_keys_and_values() {
+        let mut value = request();
+        value.logit_bias = Some(std::collections::HashMap::from([
+            ("0".to_string(), -100.0),
+            (u32::MAX.to_string(), 100.0),
+        ]));
+        assert!(validate_completion_input(&value).is_ok());
+
+        for key in ["not-token", "-1", "4294967296"] {
+            value.logit_bias = Some(std::collections::HashMap::from([(key.to_string(), 0.0)]));
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        for bias in [-100.1, 100.1, f32::NAN, f32::INFINITY] {
+            value.logit_bias = Some(std::collections::HashMap::from([("0".to_string(), bias)]));
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn completion_extended_sampling_contract_is_fail_closed() {
+        let mut value = request();
+        for invalid in [-0.1, f32::NAN, f32::INFINITY] {
+            value.top_n_sigma = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.top_n_sigma = None;
+        for invalid in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            value.min_p = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.min_p = None;
+        for invalid in [0.0, -0.1, f32::NAN, f32::INFINITY] {
+            value.repetition_penalty = Some(invalid);
+            assert_eq!(
+                validate_completion_input(&value).unwrap_err().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        value.repetition_penalty = Some(f32::MIN_POSITIVE);
+        assert!(validate_completion_input(&value).is_ok());
+    }
+
+    #[test]
+    fn completion_stop_contract_rejects_empty_or_excess_entries() {
+        let mut value = request();
+        value.stop = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert!(validate_completion_input(&value).is_ok());
+
+        value.stop.push("e".into());
+        assert_eq!(
+            validate_completion_input(&value).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        value.stop = vec![String::new()];
+        assert_eq!(
+            validate_completion_input(&value).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 }

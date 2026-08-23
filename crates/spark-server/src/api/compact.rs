@@ -191,7 +191,10 @@ pub fn compact_messages(
 ///
 /// Gated by `ATLAS_CTX_OVERFLOW_TRUNCATE` (default ON; set to `0` to restore
 /// the strict 400-on-overflow behavior).
-pub fn truncate_to_fit(msgs: &[serde_json::Value], keep_tail: usize) -> Option<Vec<serde_json::Value>> {
+pub fn truncate_to_fit(
+    msgs: &[serde_json::Value],
+    keep_tail: usize,
+) -> Option<Vec<serde_json::Value>> {
     // Need at least a system message + one droppable middle message + tail.
     if msgs.len() <= keep_tail.saturating_add(1) {
         return None;
@@ -313,7 +316,10 @@ mod truncate_tests {
         let out = truncate_to_fit(&msgs, 2).expect("should truncate");
         assert_eq!(out[0]["role"], "system");
         // The first non-system retained message must not be an orphaned tool reply.
-        assert_ne!(out[1]["role"], "tool", "tail must not strand a bare tool msg");
+        assert_ne!(
+            out[1]["role"], "tool",
+            "tail must not strand a bare tool msg"
+        );
     }
 
     #[test]
@@ -332,8 +338,15 @@ mod truncate_tests {
         // <tool_response> placeholder) so Jinja won't raise "No user query found".
         let has_user = out.iter().skip(1).any(|x| {
             x["role"] == "user"
-                && !x["content"].as_str().unwrap_or("").starts_with("<tool_response>")
+                && !x["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("<tool_response>")
         });
-        assert!(has_user, "retained tail must contain a real user query; roles={:?}", roles(&out));
+        assert!(
+            has_user,
+            "retained tail must contain a real user query; roles={:?}",
+            roles(&out)
+        );
     }
 }

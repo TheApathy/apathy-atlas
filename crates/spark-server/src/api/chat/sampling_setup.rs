@@ -57,9 +57,34 @@ pub(super) fn build_sampling(
     } else {
         &state.sampling_presets.non_thinking
     };
-    let temperature = req.temperature.unwrap_or(preset.temperature);
-    let top_k = req.top_k.unwrap_or(preset.top_k);
-    let top_p = req.top_p.unwrap_or(preset.top_p);
+    // ATLAS_IGNORE_REQUEST_SAMPLING=1: serve at the model card's presets even
+    // when the client pins sampling (e.g. a bench harness sending temperature
+    // 0.0). Greedy decoding of long thinking spans is a documented failure
+    // mode for this model family (repetition loops, instant think-close);
+    // the MODEL.toml presets are the vendor-recommended regime.
+    let ignore_req_sampling = {
+        static IG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *IG.get_or_init(|| {
+            std::env::var("ATLAS_IGNORE_REQUEST_SAMPLING").as_deref() == Ok("1")
+        })
+    };
+    let (req_temperature, req_top_k, req_top_p) = if ignore_req_sampling {
+        (None, None, None)
+    } else {
+        (req.temperature, req.top_k, req.top_p)
+    };
+    // ATLAS_TEMP_OVERRIDE: force this temperature (after preset/request
+    // resolution). Pairs with ATLAS_IGNORE_REQUEST_SAMPLING to serve a
+    // fixed sampling regime regardless of what the client pins.
+    let temp_override = {
+        static T: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("ATLAS_TEMP_OVERRIDE").ok().and_then(|v| v.parse().ok())
+        })
+    };
+    let temperature = temp_override.unwrap_or_else(|| req_temperature.unwrap_or(preset.temperature));
+    let top_k = req_top_k.unwrap_or(preset.top_k);
+    let top_p = req_top_p.unwrap_or(preset.top_p);
     let top_n_sigma = req.top_n_sigma.unwrap_or(state.default_top_n_sigma);
     let min_p = req.min_p.unwrap_or(state.default_min_p);
     let repetition_penalty = req.repetition_penalty.unwrap_or(preset.repetition_penalty);
@@ -107,21 +132,19 @@ pub(super) fn build_sampling(
         }
     }
 
-    // max_tokens cap when tools are active.
-    let max_tokens = if tools_active {
-        let capped = req.max_tokens.min(state.tool_max_tokens);
-        if capped < req.max_tokens {
-            tracing::info!(
-                "Tool max_tokens cap: {} → {} (tool_max_tokens={})",
-                req.max_tokens,
-                capped,
-                state.tool_max_tokens
-            );
-        }
-        capped
-    } else {
-        req.max_tokens
-    };
+    // Same effective ceiling consumed by thinking resolution. Keep the cap in
+    // one helper so tool turns cannot budget reasoning against the raw client
+    // max and only later shrink the actual generation allowance.
+    let max_tokens =
+        super::thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens);
+    if tools_active && max_tokens < req.max_tokens {
+        tracing::info!(
+            "Tool max_tokens cap: {} → {} (tool_max_tokens={})",
+            req.max_tokens,
+            max_tokens,
+            state.tool_max_tokens
+        );
+    }
 
     // Stop tokens.
     let mut stop_tokens = tokenize_stop_sequences(&state.tokenizer, &req.stop);

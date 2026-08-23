@@ -114,11 +114,16 @@ pub(super) fn render_template(
     let json_messages = if auto_compact_active && json_messages.len() > 4 {
         let trial_tokens = state
             .tokenizer
-            .apply_chat_template_openai(
+            .apply_chat_template_openai_with_options(
                 &json_messages,
                 jinja_tools.as_deref(),
                 template_thinking,
                 state.behavior.disable_tool_steering,
+                req.requested_reasoning_effort(),
+                req.chat_template_kwargs
+                    .as_ref()
+                    .and_then(|kw| kw.preserve_thinking)
+                    .or(state.behavior.preserve_thinking),
             )
             .map(|t| t.len())
             .unwrap_or(0);
@@ -132,11 +137,16 @@ pub(super) fn render_template(
     };
 
     let tokenize = |jm: &[serde_json::Value]| {
-        state.tokenizer.apply_chat_template_openai(
+        state.tokenizer.apply_chat_template_openai_with_options(
             jm,
             jinja_tools.as_deref(),
             template_thinking,
             state.behavior.disable_tool_steering,
+            req.requested_reasoning_effort(),
+            req.chat_template_kwargs
+                .as_ref()
+                .and_then(|kw| kw.preserve_thinking)
+                .or(state.behavior.preserve_thinking),
         )
     };
     let mut prompt_tokens = match tokenize(&json_messages) {
@@ -158,8 +168,7 @@ pub(super) fn render_template(
     // drop the OLDEST turns and re-render — bounded, never an infinite loop.
     // Opt out with ATLAS_CTX_OVERFLOW_TRUNCATE=0 to restore strict 400-on-overflow.
     if ctx_overflow_truncate_enabled() {
-        let output_reserve =
-            (state.behavior.max_thinking_budget as usize).saturating_add(256);
+        let output_reserve = (state.behavior.max_thinking_budget as usize).saturating_add(256);
         let fit_budget = state.max_seq_len.saturating_sub(output_reserve).max(1);
         if prompt_tokens.len() >= fit_budget {
             let mut jm = json_messages.clone();

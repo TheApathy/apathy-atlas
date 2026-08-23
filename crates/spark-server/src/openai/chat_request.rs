@@ -253,6 +253,9 @@ pub struct ReasoningConfig {
 pub struct ChatTemplateKwargs {
     pub enable_thinking: Option<bool>,
     pub thinking_budget: Option<u32>,
+    /// Dense Qwen template control. `None` deliberately leaves the Jinja
+    /// variable undefined so the checkpoint's own default applies.
+    pub preserve_thinking: Option<bool>,
 }
 
 impl ChatTemplateKwargs {
@@ -271,6 +274,15 @@ impl ChatTemplateKwargs {
 const DEFAULT_THINKING_BUDGET: u32 = 256;
 
 impl ChatCompletionRequest {
+    /// Accept both OpenAI reasoning-effort request spellings.  The nested
+    /// object wins when both are present.
+    pub fn requested_reasoning_effort(&self) -> Option<&str> {
+        self.reasoning
+            .as_ref()
+            .and_then(|r| r.effort.as_deref())
+            .or(self.reasoning_effort.as_deref())
+    }
+
     /// Resolve thinking parameters from all supported request-body formats
     /// into a single `(enable_thinking: bool, thinking_budget: Option<u32>)`
     /// pair. The client's per-request choice always wins over the model
@@ -306,6 +318,9 @@ impl ChatCompletionRequest {
         {
             return true;
         }
+        if self.reasoning_effort.is_some() {
+            return true;
+        }
         if let Some(ref kw) = self.chat_template_kwargs
             && (kw.thinking_budget.is_some() || kw.enable_thinking.is_some())
         {
@@ -338,10 +353,8 @@ impl ChatCompletionRequest {
         }
 
         // 3. OpenAI: reasoning.effort
-        if let Some(ref rc) = self.reasoning
-            && let Some(ref effort) = rc.effort
-        {
-            let budget = match effort.as_str() {
+        if let Some(effort) = self.requested_reasoning_effort() {
+            let budget = match effort {
                 "none" => 0,
                 "minimal" => 64,
                 "low" => 128,
@@ -374,8 +387,13 @@ impl ChatCompletionRequest {
         }
 
         // 6. Model default from MODEL.toml [behavior].thinking_default.
+        // Leave the budget unspecified here so the API policy layer uses
+        // this model target's `max_thinking_budget`. Returning the generic
+        // 256-token request default made per-model budgets (including
+        // Qwen3.8's 2048-token profile) silently inert whenever the client
+        // omitted an explicit reasoning field.
         if model_default {
-            (true, Some(DEFAULT_THINKING_BUDGET))
+            (true, None)
         } else {
             (false, None)
         }

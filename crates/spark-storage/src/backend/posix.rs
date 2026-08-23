@@ -5,13 +5,11 @@
 // pread overwriting in-flight DMA. Slow-but-deterministic; used by tests as
 // the oracle the io_uring backend is compared against.
 
-use anyhow::{Context, Result, bail};
-use std::ffi::c_void;
-
 use super::{ReadRequest, StorageBackend};
-use crate::cuda_min::{PinnedBuffer, copy_h_to_d_async, stream_sync};
+use crate::cuda_min::{PinnedBuffer, copy_h_to_d_pinned};
 use crate::group::GroupKey;
 use crate::layout::Layout;
+use anyhow::{Context, Result, bail};
 
 pub struct PosixBackend {
     layout: Layout,
@@ -32,7 +30,7 @@ impl PosixBackend {
 impl StorageBackend for PosixBackend {
     fn read(&mut self, requests: &[ReadRequest], stream: u64) -> Result<()> {
         let bytes = self.layout.group_bytes() as usize;
-        let bounce_ptr = self.bounce.ptr;
+        let bounce_ptr = self.bounce.as_mut_ptr();
         for req in requests {
             let fd = self.layout.fd(req.group.layer);
             let off = self.layout.offset(req.group) as i64;
@@ -48,8 +46,7 @@ impl StorageBackend for PosixBackend {
             // overwrites the buffer, otherwise the second cuMemcpyHtoDAsync
             // will read partial / stale bytes. Phase-3 io_uring backend uses
             // multiple registered buffers and avoids this serialization.
-            copy_h_to_d_async(req.dst_dev_ptr, bounce_ptr as *const c_void, bytes, stream)?;
-            stream_sync(stream)?;
+            copy_h_to_d_pinned(req.dst_dev_ptr, self.bounce.pinned_slice(bytes)?, stream)?;
         }
         Ok(())
     }
@@ -65,11 +62,15 @@ impl StorageBackend for PosixBackend {
         // O_DIRECT requires page-aligned source. Stage through the pinned
         // bounce buffer (which is page-aligned per cuMemAllocHost contract).
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), self.bounce.ptr as *mut u8, bytes);
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                self.bounce.as_mut_ptr().cast::<u8>(),
+                bytes,
+            );
         }
         let fd = self.layout.fd(key.layer);
         let off = self.layout.offset(key) as i64;
-        let n = unsafe { libc::pwrite(fd, self.bounce.ptr, bytes, off) };
+        let n = unsafe { libc::pwrite(fd, self.bounce.as_mut_ptr(), bytes, off) };
         if n != bytes as isize {
             bail!(
                 "pwrite {bytes}@{off} returned {n}, errno {}",
@@ -130,14 +131,7 @@ mod tests {
         // backend signature.
         backend.read(&[req], _ctx.stream).unwrap();
         let mut host_back = vec![0_u8; bytes];
-        crate::cuda_min::copy_d_to_h_async(
-            host_back.as_mut_ptr() as *mut c_void,
-            dev.ptr,
-            bytes,
-            _ctx.stream,
-        )
-        .unwrap();
-        crate::cuda_min::stream_sync(_ctx.stream).unwrap();
+        crate::cuda_min::copy_d_to_h(&mut host_back, dev.ptr, _ctx.stream).unwrap();
         assert_eq!(host_back, pat);
         std::fs::remove_dir_all(&dir).ok();
     }

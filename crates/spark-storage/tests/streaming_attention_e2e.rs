@@ -5,12 +5,10 @@
 
 mod common;
 
-use std::ffi::c_void;
-
 use half::bf16;
 use spark_storage::backend::{ReadRequest, StorageBackend};
 use spark_storage::cuda_min::{
-    CudaCtx, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+    CudaCtx, DeviceBuffer, HostToDeviceCopy, copy_d_to_h, copy_h_to_d, copy_h_to_d_group,
 };
 use spark_storage::group::{GroupKey, KvKind};
 use spark_storage::scratch_pool::{ResidentKey, ScratchDims, ScratchPool};
@@ -36,38 +34,14 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
     let bt_dev = DeviceBuffer::new(NUM_BLOCKS as usize * 4).unwrap();
     let counts_dev = DeviceBuffer::new(NUM_SEQS * 4).unwrap();
     let out_dev = DeviceBuffer::new(NUM_SEQS * NUM_Q_HEADS * HEAD_DIM as usize * 2).unwrap();
-    copy_h_to_d_async(
-        q_dev.ptr,
-        q.as_ptr() as *const c_void,
-        q.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        k_dev.ptr,
-        k.as_ptr() as *const c_void,
-        k.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        v_dev.ptr,
-        v.as_ptr() as *const c_void,
-        v.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        bt_dev.ptr,
-        block_table.as_ptr() as *const c_void,
-        NUM_BLOCKS as usize * 4,
-        ctx.stream,
-    )
-    .unwrap();
-    copy_h_to_d_async(
-        counts_dev.ptr,
-        counts.as_ptr() as *const c_void,
-        NUM_SEQS * 4,
+    copy_h_to_d_group(
+        &[
+            HostToDeviceCopy::new(q_dev.ptr, q),
+            HostToDeviceCopy::new(k_dev.ptr, k),
+            HostToDeviceCopy::new(v_dev.ptr, v),
+            HostToDeviceCopy::new(bt_dev.ptr, &block_table),
+            HostToDeviceCopy::new(counts_dev.ptr, &counts),
+        ],
         ctx.stream,
     )
     .unwrap();
@@ -89,14 +63,7 @@ fn run_in_hbm_reference(ctx: &CudaCtx, q: &[bf16], k: &[bf16], v: &[bf16]) -> Ve
     .unwrap();
     attn.finalize(ctx, out_dev.ptr, NUM_SEQS).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_SEQS * NUM_Q_HEADS * HEAD_DIM as usize];
-    copy_d_to_h_async(
-        out.as_mut_ptr() as *mut c_void,
-        out_dev.ptr,
-        out.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut out, out_dev.ptr, ctx.stream).unwrap();
     out
 }
 
@@ -126,13 +93,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
     let bt_dev = DeviceBuffer::new(NUM_SEQS * tile_size * 4).unwrap();
     let counts_dev = DeviceBuffer::new(NUM_SEQS * 4).unwrap();
     let out_dev = DeviceBuffer::new(NUM_SEQS * NUM_Q_HEADS * HEAD_DIM as usize * 2).unwrap();
-    copy_h_to_d_async(
-        q_dev.ptr,
-        q.as_ptr() as *const c_void,
-        q.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
+    copy_h_to_d(q_dev.ptr, q, ctx.stream).unwrap();
     attn.begin_step(ctx, NUM_SEQS).unwrap();
 
     let n_tiles = (NUM_BLOCKS as usize).div_ceil(tile_size);
@@ -165,17 +126,11 @@ fn run_streaming<B: StorageBackend + ?Sized>(
         backend.read(&reqs, ctx.stream).unwrap();
 
         let counts = [n as i32];
-        copy_h_to_d_async(
-            bt_dev.ptr,
-            block_table.as_ptr() as *const c_void,
-            tile_size * 4,
-            ctx.stream,
-        )
-        .unwrap();
-        copy_h_to_d_async(
-            counts_dev.ptr,
-            counts.as_ptr() as *const c_void,
-            NUM_SEQS * 4,
+        copy_h_to_d_group(
+            &[
+                HostToDeviceCopy::new(bt_dev.ptr, &block_table),
+                HostToDeviceCopy::new(counts_dev.ptr, &counts),
+            ],
             ctx.stream,
         )
         .unwrap();
@@ -198,14 +153,7 @@ fn run_streaming<B: StorageBackend + ?Sized>(
     }
     attn.finalize(ctx, out_dev.ptr, NUM_SEQS).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_SEQS * NUM_Q_HEADS * HEAD_DIM as usize];
-    copy_d_to_h_async(
-        out.as_mut_ptr() as *mut c_void,
-        out_dev.ptr,
-        out.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut out, out_dev.ptr, ctx.stream).unwrap();
     out
 }
 
@@ -265,8 +213,7 @@ fn round_trip_groups_through_disk() {
         )
         .unwrap();
     let mut got = vec![0_u8; bytes];
-    copy_d_to_h_async(got.as_mut_ptr() as *mut c_void, dev.ptr, bytes, ctx.stream).unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut got, dev.ptr, ctx.stream).unwrap();
     let head_dim = HEAD_DIM as usize;
     let bs = BLOCK_SIZE as usize;
     let nkv = NUM_KV_HEADS as usize;

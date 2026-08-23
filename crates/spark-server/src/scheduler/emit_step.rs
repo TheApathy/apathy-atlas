@@ -4,6 +4,194 @@
 
 use super::*;
 
+#[path = "rethink_budget.rs"]
+mod rethink_budget;
+pub(super) use rethink_budget::resolve_rethink_budget;
+
+/// Whether the ordinary EOS path must defer termination for this request.
+///
+/// This deliberately contains no blanket post-thinking minimum.  Required
+/// tool calls already have two authoritative protections (the grammar matcher
+/// and the legacy `require_tool_call` fallback), while an ordinary answer must
+/// be allowed to stop on its first EOS after `</think>`.  Ignoring that EOS can
+/// make the model continue into the next ChatML role boundary.
+pub(super) fn eos_is_suppressed(a: &ActiveSeq, output_len: usize) -> bool {
+    a.grammar_state
+        .as_ref()
+        .is_some_and(|gs| !gs.is_terminated())
+        || a.require_tool_call
+        || output_len < a.min_tokens
+        || a.inside_thinking
+}
+
+/// ChatML role boundaries end the assistant turn even when ordinary EOS is
+/// constrained. The only exception is a boundary sampled inside `<think>`,
+/// where special end tokens remain suppressed until `</think>`.
+pub(super) fn is_chatml_role_boundary(a: &ActiveSeq, tok: u32, im_start: Option<u32>) -> bool {
+    im_start == Some(tok) && !a.inside_thinking
+}
+
+/// Commit a ChatML role boundary before any ordinary token policy runs.
+///
+/// Both serial decode and speculative emission use this edge.  In particular,
+/// grammar / required-tool / minimum-token EOS suppression must never discard
+/// `<|im_start|>` and allow the following role text onto the assistant stream.
+pub(super) fn commit_chatml_role_boundary(
+    a: &mut ActiveSeq,
+    tok: u32,
+    im_start: Option<u32>,
+) -> bool {
+    if !is_chatml_role_boundary(a, tok, im_start) {
+        return false;
+    }
+    // Keep the stop token in output_tokens so lifecycle reports `stop`.  The
+    // API text path strips registered stop tokens, so it is never client text.
+    a.output_tokens.push(tok);
+    a.finished = true;
+    tracing::debug!(
+        id = im_start.unwrap_or_default(),
+        "<|im_start|> hard-stop fired; ending turn before grammar/suppress_eos"
+    );
+    true
+}
+
+/// Advance the sampler's tool-body phase after committing one content token.
+/// The content watchdog must observe the phase on entry (so a closing tag still
+/// belongs to the body), while the next token's sampler must observe the new
+/// phase. Both serial and speculative emission call this helper at that edge.
+pub(super) fn update_tool_body_phase(a: &mut ActiveSeq, tok: u32) {
+    if a.inside_thinking {
+        return;
+    }
+    if a.tool_call_start_token == Some(tok) {
+        a.inside_tool_body = true;
+        a.prose_tokens_since_last_tool = 0;
+    } else if a.tool_call_end_token == Some(tok) {
+        a.inside_tool_body = false;
+    }
+}
+
+/// Advance a content grammar exactly once for a committed non-thinking token.
+/// Both serial decode and speculative emission use this edge; special token
+/// handlers must not consume the same token again.
+pub(super) fn advance_content_grammar(a: &mut ActiveSeq, tok: u32) {
+    if !a.inside_thinking
+        && let Some(ref mut gs) = a.grammar_state
+    {
+        gs.accept_token(tok);
+    }
+}
+
+/// Commit a non-thinking tool-call close with one shared serial/spec contract.
+///
+/// Callers own the per-token content counters and must advance the grammar and
+/// tool-body phase first.  This helper owns the one output push, the one stream
+/// event, and all close-boundary termination decisions.
+pub(super) fn commit_tool_call_close(a: &mut ActiveSeq, tok: u32, was_inside_thinking: bool) {
+    debug_assert!(!a.inside_thinking);
+    debug_assert_eq!(a.tool_call_end_token, Some(tok));
+
+    a.output_tokens.push(tok);
+    if a.think_ended && !was_inside_thinking {
+        a.post_think_gate_steps = mtp_gate::advance_entry_counter(a.post_think_gate_steps);
+    }
+
+    if let ResponseSink::Streaming(ref tx) = a.sink {
+        let event = if let Some(lp) = a.logprobs_data.last().cloned() {
+            StreamEvent::TokenWithLogprobs(tok, lp)
+        } else {
+            StreamEvent::Token(tok)
+        };
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                tracing::warn!(
+                    "Streaming receiver dropped during tool_call_end, finishing sequence"
+                );
+                a.finished = true;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                if let Err(e) = tx.blocking_send(event) {
+                    tracing::error!("Streaming send failed during tool_call_end backpressure: {e}");
+                    a.finished = true;
+                }
+            }
+        }
+    }
+
+    let grammar_terminal = a
+        .grammar_state
+        .as_ref()
+        .is_some_and(|gs| gs.is_terminated());
+    if a.grammar_state.is_none() || grammar_terminal {
+        // Legacy mode is one-call-per-response. A stop-after-first grammar has
+        // the same boundary once its close token makes the matcher terminal.
+        a.finished = true;
+    } else {
+        // A nonterminal multi-call grammar may legitimately think again before
+        // its next call; post-think masks must not remain latched across calls.
+        a.think_ended = false;
+    }
+
+    if a.output_tokens.len() >= a.max_output_tokens || a.remaining == 0 {
+        a.finished = true;
+    }
+}
+
+/// Return a fuzzy tail-loop only when the current token stream is outside a
+/// tool call. This is shared by serial decode and speculative emission so both
+/// paths use identical start/end-token framing.
+pub(super) fn fuzzy_repetition_outside_tool(a: &ActiveSeq) -> Option<(usize, usize, usize)> {
+    if a.inside_thinking {
+        return None;
+    }
+    let last_tc_start = a
+        .tool_call_start_token
+        .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
+    let last_tc_end = a
+        .tool_call_end_token
+        .and_then(|t| a.output_tokens.iter().rposition(|&tok| tok == t));
+    let inside_tool_call = match (last_tc_start, last_tc_end) {
+        (Some(start), Some(end)) => start > end,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if inside_tool_call {
+        None
+    } else {
+        detect_fuzzy_repetition(&a.output_tokens)
+    }
+}
+
+/// Stop speculative emission on a fuzzy tail-loop. The serial path can roll
+/// back to a per-token SSM snapshot; a multi-token verify batch cannot safely
+/// do that after commit, so its parity behavior is the conservative hard stop.
+pub(super) fn apply_speculative_fuzzy_stop(a: &mut ActiveSeq) -> bool {
+    let Some((pattern_len, mis_a, mis_b)) = fuzzy_repetition_outside_tool(a) else {
+        return false;
+    };
+    tracing::warn!(
+        pattern_len,
+        mismatches = mis_a + mis_b,
+        output_len = a.output_tokens.len(),
+        "Fuzzy repetition detected during speculative emit; ending response early (batched rollback unavailable)"
+    );
+    a.finished = true;
+    true
+}
+
+/// Apply the request deadline at the same post-token boundary used by serial
+/// decode. Thinking and content-speculation paths share this implementation.
+pub(super) fn check_request_timeout(a: &mut ActiveSeq) {
+    if !a.finished
+        && let Some(deadline) = a.timeout_at
+        && Instant::now() >= deadline
+    {
+        tracing::warn!("Request timeout after {:?}", a.request_start.elapsed());
+        a.finished = true;
+    }
+}
+
 /// Emit a token for an active sequence (stream + bookkeeping).
 ///
 /// Per OpenAI spec, stop/EOS tokens are NOT streamed to the client —
@@ -13,6 +201,8 @@ use super::*;
 /// When `logprobs` is Some, the logprobs data is accumulated for blocking
 /// responses and sent via `StreamEvent::TokenWithLogprobs` for streaming.
 pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::TokenLogprobs>) {
+    let output_len_before_emit = a.output_tokens.len();
+    let was_inside_thinking = a.inside_thinking;
     // Cooperative cancellation from the streaming pipeline (PR #89). The
     // stream-side loop guards (Bug-2 name-run cap, F11 within-dedup, F44
     // perm-fail, loop-watchdog) flip this flag when they decide the
@@ -58,25 +248,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // (`user` / `assistant` — regular tokens) would stream to the client,
     // poisoning its context and causing the observed multi-turn drift /
     // "file was corrupted" hallucinations in opencode.
-    if let Some(ims) = im_start_hard_stop()
-        && tok == ims
-    {
-        // Push the hard-stop token to output_tokens so lifecycle.rs reports
-        // `finish_reason="stop"` (because `<|im_start|>` is registered in
-        // `eos_tokens` at startup — see tokenizer_runtime.rs::im_start_id).
-        // Without this push, `last_tok = output_tokens.last()` is the prior
-        // content token, lifecycle's `is_eos` check fails, and the response
-        // is mis-reported as `finish_reason="length"` (Bug 3 from OpenClaw
-        // 2026-05-08 session: "Done: 13 tokens (length) despite max_tokens=
-        // 8192" — clients then misinterpret the truncation as a real
-        // length-limit hit and either retry or surface a wrong error).
-        // The streamed-text path strips stop tokens server-side, so the
-        // client never sees the literal `<|im_start|>` bytes.
-        a.output_tokens.push(tok);
-        a.finished = true;
-        tracing::debug!(
-            "<|im_start|> hard-stop fired (id={ims}); ending turn before grammar/suppress_eos"
-        );
+    if commit_chatml_role_boundary(a, tok, im_start_hard_stop()) {
         return;
     }
 
@@ -95,11 +267,17 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // via force_end_thinking. The very next token becomes </think> (0 thinking
     // content tokens, 1 </think> overhead), and coding output continues cleanly.
     if !a.inside_thinking && a.think_start_token == Some(tok) {
+        // Re-entering thinking re-arms the response-entry counter for the
+        // next `</think>` boundary.
+        a.post_think_gate_steps = 0;
         if !a.think_ended {
             a.inside_thinking = true;
             a.think_ended = false;
             a.think_skip_count = 0;
-            a.thinking_budget = Some(a.spontaneous_think_budget);
+            a.thinking_budget = Some(resolve_rethink_budget(
+                a.spontaneous_think_budget,
+                a.think_watchdog_fires,
+            ));
             tracing::debug!("Spontaneous <think> detected in emit_token, entering thinking mode");
         } else {
             // DDTree cliff-path <think> bonus with think_ended=true: force-exit.
@@ -107,9 +285,8 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
             a.think_skip_count = 0;
             a.thinking_budget = Some(0);
             a.force_end_thinking = true;
-            a.post_think_gate_steps = 0;
             tracing::debug!(
-                "DDTree <think> bonus (think_ended=true): force-exit thinking (0 content tokens), gate=2"
+                "DDTree <think> bonus (think_ended=true): force-exit thinking (0 content tokens)"
             );
         }
         return; // don't emit <think> as content
@@ -123,6 +300,12 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         }
         return;
     }
+    // Match serial decode: a real post-thinking token breaks the aggregate
+    // stray-</think> run. Without this reset, speculative serving stopped after
+    // 50 non-consecutive close tags accumulated across otherwise valid output.
+    if a.think_ended {
+        a.think_skip_count = 0;
+    }
 
     // Track <tool_call> token: once seen, legacy tool call requirement is satisfied.
     // Guard with !inside_thinking — tool calls inside thinking are spurious.
@@ -131,27 +314,23 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.tool_call_opened = true;
     }
 
+    // Preserve the phase on entry for the content watchdog below.  A closing
+    // </tool_call> token still belongs to the tool body; flipping the flag
+    // first would incorrectly charge that token to the inter-tool prose
+    // budget (the plain decoder updates this flag after content handling).
+    let was_inside_tool_body = a.inside_tool_body;
+
     // Track CURRENT tool-body phase (P3.1, 2026-04-25). Set on the
     // open token, clear on the close. The flag drives sampler
     // scoping: when true, the main decode path zeroes
     // repetition/presence/frequency/DRY so legitimate JSON
     // micro-repetition (`":"`, `","`, key names) is not penalised.
-    if !a.inside_thinking {
-        if a.tool_call_start_token == Some(tok) {
-            a.inside_tool_body = true;
-        } else if a.tool_call_end_token == Some(tok) {
-            a.inside_tool_body = false;
-        }
-    }
+    update_tool_body_phase(a, tok);
 
     // Advance grammar state with the emitted token — skip while the
     // sequence is inside `<think>`…`</think>` so the matcher only
     // sees the final-output token stream.
-    if !a.inside_thinking
-        && let Some(ref mut gs) = a.grammar_state
-    {
-        gs.accept_token(tok);
-    }
+    advance_content_grammar(a, tok);
 
     // Accumulate logprobs data for blocking responses.
     if let Some(lp) = logprobs {
@@ -162,15 +341,81 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // <think> with budget=0). Skip pushing </think> to output_tokens — the tag
     // would appear as a spurious delimiter and cause strip_thinking_tags to
     // truncate everything before it, treating the real output as "reasoning".
-    if a.inside_thinking
-        && a.think_end_token == Some(tok)
-        && a.thinking_budget == Some(0)
-    {
+    if a.inside_thinking && a.think_end_token == Some(tok) && a.thinking_budget == Some(0) {
         a.inside_thinking = false;
         a.force_end_thinking = false;
         a.think_ended = true;
         a.think_just_ended = true;
+        a.post_think_gate_steps = 0;
         tracing::info!("Thinking ended after 0 tokens (budget=Some(0)) [silent]");
+        return;
+    }
+
+    // Speculative verify paths funnel through emit_token rather than
+    // process_decode_logits, so they must advance the same content counters
+    // and run the same degeneration detectors.  Historically they skipped
+    // this entire policy layer: a plain decode could stop/rollback at 96
+    // repeated tokens while DFlash/MTP emitted until max_tokens, making both
+    // serving behaviour and benchmark token counts mechanism-dependent.
+    //
+    // A speculative verify may have committed several target/SSM positions
+    // before reaching this function.  Calling rollback_to_boundary here would
+    // therefore be unsafe: the per-token boundary can sit in the middle of
+    // that already-committed batch.  Fail closed by ending the response.  A
+    // later design can replace this with batched commit truncation plus exact
+    // SSM snapshots; silent bypass is not an acceptable fallback.
+    let mut speculative_watchdog_stop = false;
+    if !a.inside_thinking {
+        a.content_started = true;
+        a.content_tokens = a.content_tokens.saturating_add(1);
+
+        let catastrophic_loop = a.content_tokens >= CATASTROPHIC_LOOP_MIN_TOKENS as u32
+            && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+            && detect_catastrophic_content_loop(&a.output_tokens);
+        let configured_loop = enable_loop_watchdog()
+            && a.content_tokens >= CONTENT_LOOP_MIN_TOKENS
+            && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
+            && (detect_content_token_loop(&a.output_tokens)
+                || numeric_token_mask()
+                    .as_deref()
+                    .is_some_and(|m| detect_content_token_loop_normalized(&a.output_tokens, m)));
+        if a.grammar_state.is_none()
+            && !was_inside_tool_body
+            && (catastrophic_loop || configured_loop)
+        {
+            tracing::warn!(
+                content_tokens = a.content_tokens,
+                output_len = a.output_tokens.len(),
+                catastrophic = catastrophic_loop,
+                "Content-loop watchdog fired during speculative emit; ending response early (batched rollback unavailable)"
+            );
+            speculative_watchdog_stop = true;
+        }
+
+        if !was_inside_tool_body && a.grammar_state.is_some() {
+            a.prose_tokens_since_last_tool = a.prose_tokens_since_last_tool.saturating_add(1);
+            let max_prose = watchdog_params().max_inter_tool_prose;
+            if a.prose_tokens_since_last_tool > max_prose {
+                tracing::warn!(
+                    prose_tokens = a.prose_tokens_since_last_tool,
+                    max = max_prose,
+                    "Inter-tool prose budget exhausted during speculative emit; ending response (batched rollback unavailable)"
+                );
+                speculative_watchdog_stop = true;
+            }
+        }
+    }
+
+    // Tool-call close is a structural boundary, not ordinary content. The
+    // serial decoder and every speculative verifier share the exact push /
+    // stream / finish contract through this helper.
+    if a.tool_call_end_token == Some(tok) && !a.inside_thinking {
+        a.remaining -= 1;
+        a.think_just_ended = false;
+        commit_tool_call_close(a, tok, was_inside_thinking);
+        if speculative_watchdog_stop {
+            a.finished = true;
+        }
         return;
     }
 
@@ -183,6 +428,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
             a.inside_thinking = false;
             a.force_end_thinking = false;
             a.think_ended = true;
+            a.post_think_gate_steps = 0;
             // One-shot for the next decode step: pin to
             // tool_call_start_token if require_tool_call (Change 3b).
             a.think_just_ended = true;
@@ -208,14 +454,9 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.think_just_ended = false;
     }
 
-    // EOS handling: grammar-based, legacy, or min_tokens suppression.
-    let grammar_suppresses_eos = a
-        .grammar_state
-        .as_ref()
-        .is_some_and(|gs| !gs.is_terminated());
-    let legacy_suppresses_eos = a.require_tool_call;
-    let min_tokens_suppresses = a.output_tokens.len() < a.min_tokens;
-    let suppress_eos = grammar_suppresses_eos || legacy_suppresses_eos || min_tokens_suppresses;
+    // Required tools remain protected by grammar / legacy-required mode;
+    // ordinary post-thinking answers are free to terminate immediately.
+    let suppress_eos = eos_is_suppressed(a, output_len_before_emit);
 
     // Single-pass over eos_tokens: previously this Vec was linearly
     // scanned twice per emit (once for each branch of the suppress_eos
@@ -228,8 +469,17 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     }
     if is_eos {
         // EOS suppressed: grammar not terminated, legacy tool call not yet seen,
-        // or min_tokens not reached. Don't stop — let the model continue generating.
+        // min_tokens not reached, or thinking is still active.
+        // The plain decode path discards this token rather than including it in
+        // output history; undo the speculative path's earlier bookkeeping push.
+        debug_assert_eq!(a.output_tokens.last(), Some(&tok));
+        a.output_tokens.pop();
         return;
+    }
+    // Count only committed non-EOS content. Suppressed EOS rows are popped
+    // above and therefore cannot age the entry pin accidentally.
+    if a.think_ended && !was_inside_thinking && !a.inside_thinking {
+        a.post_think_gate_steps = mtp_gate::advance_entry_counter(a.post_think_gate_steps);
     }
     // OPENCODE FIX: see process_decode_logits — same gate. Suppress streaming
     // of spontaneous-thinking content so it doesn't pollute opencode's history.
@@ -263,6 +513,31 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
             }
         }
     }
+    // Grammar termination is itself a sequence boundary. Serial decode stops
+    // immediately after the token that completes a stop-after-first grammar;
+    // speculative emission must not continue walking already-verified rows.
+    if a.grammar_state
+        .as_ref()
+        .is_some_and(|gs| gs.is_terminated())
+    {
+        a.finished = true;
+        return;
+    }
+    // `remaining` deliberately excludes reasoning tokens, but the API's
+    // max_tokens/max_completion_tokens envelope includes every generated
+    // completion token.  Keep thinking free for the content budget while
+    // enforcing the absolute response cap for both blocking and streaming
+    // speculative paths.
+    if a.output_tokens.len() >= a.max_output_tokens {
+        tracing::info!(
+            "emit_token: max_output_tokens={} reached, output_tokens={}, thinking_tokens={}",
+            a.max_output_tokens,
+            a.output_tokens.len(),
+            a.thinking_tokens,
+        );
+        a.finished = true;
+        return;
+    }
     if a.remaining == 0 {
         tracing::info!(
             "emit_token: remaining=0, output_tokens={}, thinking_tokens={}",
@@ -271,6 +546,13 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         );
         a.finished = true;
     }
+    if enable_loop_watchdog() && !a.finished {
+        apply_speculative_fuzzy_stop(a);
+    }
+    if speculative_watchdog_stop {
+        a.finished = true;
+    }
+    check_request_timeout(a);
 }
 
 // F72 (byte-level partial-trigger anchor) was removed in F73 / fix42.

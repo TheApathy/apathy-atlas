@@ -209,55 +209,12 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
         return sse_events;
     }
 
-    // Multi-token stop sequences via string matching.
-    //
-    // Incremental-scan optimisation: previously the search was
-    //   `accumulated_content.find(stop_str)` over the FULL accumulator
-    // on every token, which is O(n²) over a response. We now only
-    // scan from `stop_scan_floor` (advanced after each scan) backed
-    // off by `max_stop_len - 1` so a stop string straddling the
-    // floor boundary still matches. Net work is O(n) over the whole
-    // response with the same correctness as the original full scan.
-    if !ctx.stop_strings.is_empty() && !state.stop_string_triggered {
-        let already_emitted = state.accumulated_content.len();
-        state.accumulated_content.push_str(&delta);
-        let max_stop_len = ctx.stop_strings.iter().map(|s| s.len()).max().unwrap_or(0);
-        let scan_start = state.stop_scan_floor.saturating_sub(max_stop_len);
-        // Scan the trailing window once; the prefix before scan_start
-        // has been searched in a prior call without a match.
-        let scan_window = &state.accumulated_content[scan_start..];
-        for stop_str in &ctx.stop_strings {
-            if let Some(rel_pos) = scan_window.find(stop_str.as_str()) {
-                let pos = scan_start + rel_pos;
-                let content_before_stop = &state.accumulated_content[..pos];
-                if pos > already_emitted {
-                    delta = content_before_stop[already_emitted..].to_string();
-                } else {
-                    delta = String::new();
-                }
-                state.stop_string_triggered = true;
-                break;
-            }
-        }
-        if !state.stop_string_triggered {
-            // No match in the trailing window — advance the cursor so the
-            // next token only scans content added after this point. We
-            // leave a `max_stop_len - 1` overlap (via scan_start above)
-            // so partial matches at the boundary are recovered next call.
-            state.stop_scan_floor = state.accumulated_content.len();
-        }
-        if state.stop_string_triggered && delta.is_empty() {
-            return sse_events;
-        }
-    }
-
-    if state.stop_string_triggered {
-        if !delta.is_empty() {
-            let chunk = ChatCompletionChunk::content_chunk(&ctx.model, &ctx.id, delta)
-                .with_token_ids(state.take_ids_if(ctx.req_return_token_ids));
-            let json = serde_json::to_string(&chunk).unwrap_or_default();
-            sse_events.push(Ok(Event::default().data(json)));
-        }
+    // Hold back any trailing proper prefix of a configured stop before
+    // detector/sanitizer processing. This preserves stop semantics for
+    // both prose and tool-call bytes while preventing partial markers
+    // from becoming irreversible SSE output.
+    delta = filter_stream_content(state, ctx, &delta);
+    if delta.is_empty() {
         return sse_events;
     }
 
@@ -325,7 +282,7 @@ pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -
 /// has already been routed through `sanitize_content_chunk`. When
 /// called from the no-detector branch, the caller must pre-sanitize
 /// (the no-detector path uses the same sanitizer state).
-fn process_detector_content(
+pub(super) fn process_detector_content(
     state: &mut StreamState,
     ctx: &StreamCtx,
     sanitized_or_raw: &str,
@@ -345,7 +302,7 @@ fn process_detector_content(
     let sanitized = sanitized_or_raw;
 
     // F4 SimHash guard.
-    let semantic_trip = if !state.loop_watchdog_triggered {
+    let semantic_trip = if !ctx.state.disable_simhash_watchdog && !state.loop_watchdog_triggered {
         state.simhash_pending.push_str(sanitized);
         let mut dup = false;
         if crate::loop_simhash::ends_at_sentence_boundary(&state.simhash_pending).is_some()
@@ -440,4 +397,117 @@ fn detector_content_arm(state: &mut StreamState, ctx: &StreamCtx, text: &str) ->
         &ctx.leak_markers,
     );
     process_detector_content(state, ctx, &sanitized)
+}
+
+/// Return content that cannot still become part of a stop string. A
+/// trailing prefix is retained across deltas, preventing irreversible
+/// partial-marker emission on the SSE wire.
+pub(super) fn filter_stream_content(
+    state: &mut StreamState,
+    ctx: &StreamCtx,
+    content: &str,
+) -> String {
+    if state.stop_string_triggered {
+        return String::new();
+    }
+    let (safe, matched) = filter_stop_delta(&mut state.stop_holdback, content, &ctx.stop_strings);
+    if matched {
+        state.stop_string_triggered = true;
+        state
+            .cancel_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    safe
+}
+
+pub(in crate::api) fn filter_stop_delta(
+    holdback: &mut String,
+    delta: &str,
+    stops: &[String],
+) -> (String, bool) {
+    let mut candidate = std::mem::take(holdback);
+    candidate.push_str(delta);
+
+    if let Some(stop_at) = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| candidate.find(stop))
+        .min()
+    {
+        candidate.truncate(stop_at);
+        return (candidate, true);
+    }
+
+    let mut held_bytes = 0;
+    for stop in stops.iter().filter(|stop| !stop.is_empty()) {
+        for (start, _) in candidate.char_indices() {
+            let suffix = &candidate[start..];
+            if suffix.len() < stop.len() && stop.starts_with(suffix) {
+                held_bytes = held_bytes.max(suffix.len());
+            }
+        }
+    }
+    let safe_len = candidate.len() - held_bytes;
+    *holdback = candidate[safe_len..].to_string();
+    (candidate[..safe_len].to_string(), false)
+}
+
+#[cfg(test)]
+mod stop_prefix_tests {
+    use super::filter_stop_delta;
+
+    #[test]
+    fn split_stop_prefix_is_never_emitted() {
+        let stops = vec!["<STOP>".to_string()];
+        let mut held = String::new();
+        assert_eq!(
+            filter_stop_delta(&mut held, "answer<ST", &stops),
+            ("answer".into(), false)
+        );
+        assert_eq!(held, "<ST");
+        assert_eq!(
+            filter_stop_delta(&mut held, "OP>leak", &stops),
+            (String::new(), true)
+        );
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn overlap_unicode_and_incomplete_final_prefix_are_preserved() {
+        let stops = vec!["abab".to_string(), "🛑終".to_string()];
+        let mut held = String::new();
+        assert_eq!(
+            filter_stop_delta(&mut held, "xaba", &stops),
+            ("x".into(), false)
+        );
+        assert_eq!(held, "aba");
+        assert_eq!(
+            filter_stop_delta(&mut held, "x🛑", &stops),
+            ("abax".into(), false)
+        );
+        assert_eq!(held, "🛑");
+        assert_eq!(
+            filter_stop_delta(&mut held, "終tail", &stops),
+            (String::new(), true)
+        );
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn first_repeated_occurrence_wins_and_both_streams_share_the_filter() {
+        let mut held = String::new();
+        assert_eq!(
+            filter_stop_delta(&mut held, "a<X>b<X>c", &["<X>".to_string()]),
+            ("a".into(), true)
+        );
+
+        let completion = include_str!("../completions.rs");
+        assert!(completion.contains("super::chat_stream::filter_stop_delta("));
+        assert!(completion.contains("std::mem::take(&mut stop_holdback)"));
+        assert!(completion.contains("cancel_flag.store(true"));
+
+        let done = include_str!("handle_done.rs");
+        assert!(done.contains("std::mem::take(&mut state.stop_holdback)"));
+        assert!(done.contains("det.process(&incomplete_prefix)"));
+    }
 }

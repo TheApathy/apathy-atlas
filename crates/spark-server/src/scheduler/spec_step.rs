@@ -204,7 +204,10 @@ pub fn step_ngram(model: &dyn Model, active: &mut [ActiveSeq], proposer: &mut Ng
         a.last_token = tok;
 
         // N-gram propose (CPU-only, zero GPU cost)
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
+        if let Some(draft) = a
+            .self_context
+            .propose_one(&a.seq.tokens, proposer.min_match())
+        {
             a.pending_drafts = vec![draft];
 
             // Checkpoint SSM for potential rollback during verify
@@ -290,7 +293,10 @@ pub fn step_ngram_verify(
         }
 
         // Propose next draft
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
+        if let Some(draft) = a
+            .self_context
+            .propose_one(&a.seq.tokens, proposer.min_match())
+        {
             a.pending_drafts = vec![draft];
         }
 
@@ -323,7 +329,10 @@ pub fn step_ngram_verify(
         a.last_token = v0;
 
         // Propose next draft
-        if let Some(draft) = proposer.propose(&a.seq.tokens) {
+        if let Some(draft) = a
+            .self_context
+            .propose_one(&a.seq.tokens, proposer.min_match())
+        {
             a.pending_drafts = vec![draft];
         }
 
@@ -464,6 +473,7 @@ pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]
     if drafts.len() < 2 || gs.is_terminated() {
         return drafts.len();
     }
+    let history_before = gs.num_history_steps();
     let mut accepted = 0usize;
     for &tok in drafts {
         if !gs.accept_token(tok) {
@@ -471,8 +481,14 @@ pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]
         }
         accepted += 1;
     }
-    if accepted > 0 {
-        gs.rollback(accepted);
+    // `accept_token` returns true for tokens after grammar termination so the
+    // EOS handler, rather than this speculative boundary check, owns request
+    // termination. Those trailing tokens add no matcher history. Rolling back
+    // `accepted` therefore panics whenever an early stop token is followed by
+    // more drafts (for example, 12 logical accepts but one recorded step).
+    let recorded = gs.num_history_steps() - history_before;
+    if recorded > 0 {
+        gs.rollback(recorded);
     }
     if accepted < drafts.len() {
         tracing::warn!(
@@ -482,4 +498,41 @@ pub fn truncate_drafts_at_grammar_boundary(gs: &mut GrammarState, drafts: &[u32]
         );
     }
     accepted
+}
+
+#[cfg(test)]
+mod grammar_boundary_tests {
+    use super::truncate_drafts_at_grammar_boundary;
+    use crate::grammar::{GrammarEngine, GrammarState};
+
+    fn test_vocab() -> Vec<String> {
+        let mut vocab = (0u8..128)
+            .map(|byte| String::from(byte as char))
+            .collect::<Vec<_>>();
+        vocab.push("<tool_call>".to_string());
+        vocab.push("</tool_call>".to_string());
+        vocab.push("<eos>".to_string());
+        vocab
+    }
+
+    #[test]
+    fn rollback_uses_recorded_history_when_stop_precedes_draft_tail() {
+        let vocab = test_vocab();
+        let mut engine = GrammarEngine::new(&vocab, &[130]).unwrap();
+        let compiled = engine.compile_json_grammar().unwrap();
+        let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+
+        assert!(state.accept_token(b'{' as u32));
+        assert!(state.accept_token(b'}' as u32));
+        let history_before = state.num_history_steps();
+
+        // Reproduce the production crash shape: EOS is the only matcher step,
+        // while the remaining eleven speculative tokens are logical no-ops.
+        let mut drafts = vec![130];
+        drafts.extend(std::iter::repeat_n(b'x' as u32, 11));
+        assert_eq!(truncate_drafts_at_grammar_boundary(&mut state, &drafts), 12);
+        assert_eq!(state.num_history_steps(), history_before);
+        assert!(!state.is_terminated());
+        assert!(state.accept_token(130));
+    }
 }

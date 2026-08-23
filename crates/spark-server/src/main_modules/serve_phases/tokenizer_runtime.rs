@@ -236,12 +236,12 @@ pub(crate) fn resolve_tokenizer_runtime(
         // Build the hesitation id set only when the penalty is on (skips the
         // ~50 tokenizer encodes otherwise). Single-token variants only —
         // multi-token phrases can't be penalised at one logit position.
-        if cfg.hesitation_penalty.is_some() {
+        if let Some(hesitation_penalty) = cfg.hesitation_penalty {
             cfg.hesitation_ids =
                 crate::scheduler::build_hesitation_ids(|s| tokenizer.encode(s).ok());
             tracing::info!(
                 "Hesitation penalty ENABLED (ATLAS_HESITATION_PENALTY={}): {} token IDs resolved",
-                cfg.hesitation_penalty.unwrap(),
+                hesitation_penalty,
                 cfg.hesitation_ids.len(),
             );
         }

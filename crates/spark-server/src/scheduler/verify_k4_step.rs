@@ -121,19 +121,15 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
         }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
+        match proposal_lifecycle::propose_and_install(
+            model,
+            a,
             v3,
-            a.seq.seq_len,
             num_drafts,
-            &mut a.seq,
-            0,
             _mtp_grammar_mask.as_deref(),
         ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
             Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
+            Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
         }
         let propose_us = t_propose.elapsed().as_micros();
         if a.seq.seq_len.is_multiple_of(50) {
@@ -175,19 +171,15 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
         }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
+        match proposal_lifecycle::propose_and_install(
+            model,
+            a,
             v2,
-            a.seq.seq_len,
             num_drafts,
-            &mut a.seq,
-            0,
             _mtp_grammar_mask.as_deref(),
         ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
             Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
+            Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
         }
         let propose_us = t_propose.elapsed().as_micros();
         // Rate-limit to every 50 tokens (matches ACCEPT-3 above and the
@@ -234,19 +226,15 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
         }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
+        match proposal_lifecycle::propose_and_install(
+            model,
+            a,
             v1,
-            a.seq.seq_len,
             num_drafts,
-            &mut a.seq,
-            0,
             _mtp_grammar_mask.as_deref(),
         ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
             Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
+            Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
         }
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(
@@ -288,19 +276,15 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
         }
         let t_propose = Instant::now();
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
+        match proposal_lifecycle::propose_and_install(
+            model,
+            a,
             v0,
-            a.seq.seq_len,
             num_drafts,
-            &mut a.seq,
-            0,
             _mtp_grammar_mask.as_deref(),
         ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
             Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
+            Err(e) => tracing::error!("run_mtp_propose_multi: {e:#}"),
         }
         let propose_us = t_propose.elapsed().as_micros();
         tracing::debug!(

@@ -324,20 +324,17 @@ pub(crate) fn tokenize_stop_sequences(
     tokens
 }
 
-/// Strip any matching stop sequence from the end of the output text.
-/// Per OpenAI spec, returned text must not contain the stop sequence.
+/// Truncate blocking output at the earliest matching stop sequence.
+/// Per OpenAI spec, returned text must not contain the stop sequence or
+/// content generated after it.
 pub(crate) fn strip_stop_sequences(mut text: String, stops: &[String]) -> String {
-    // Try longest-first so overlapping prefixes (`["</answer", "</answer>"]`)
-    // don't truncate at the shorter (wrong) match boundary. strip_suffix
-    // is end-anchored, so usually only one of the two end-matches at a
-    // time, but defensive ordering handles the cases where it doesn't.
-    let mut sorted: Vec<&String> = stops.iter().collect();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for s in sorted {
-        if let Some(stripped) = text.strip_suffix(s.as_str()) {
-            text.truncate(stripped.len());
-            break;
-        }
+    if let Some(first_stop) = stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop))
+        .min()
+    {
+        text.truncate(first_stop);
     }
     text
 }
@@ -365,5 +362,44 @@ pub(crate) fn extract_thinking(
         p.extract_thinking(text, enable_thinking)
     } else {
         (None, text.to_string())
+    }
+}
+
+#[cfg(test)]
+mod stop_sequence_tests {
+    use super::strip_stop_sequences;
+
+    #[test]
+    fn blocking_output_truncates_at_the_earliest_in_band_stop() {
+        assert_eq!(
+            strip_stop_sequences(
+                "answer<STOP>must-not-leak<LATER>".to_string(),
+                &["<LATER>".to_string(), "<STOP>".to_string()],
+            ),
+            "answer"
+        );
+    }
+
+    #[test]
+    fn overlapping_and_empty_stops_are_safe() {
+        assert_eq!(
+            strip_stop_sequences(
+                "ok</answer>suffix".to_string(),
+                &[
+                    "".to_string(),
+                    "</answer".to_string(),
+                    "</answer>".to_string(),
+                ],
+            ),
+            "ok"
+        );
+        assert_eq!(
+            strip_stop_sequences("unchanged".to_string(), &["".to_string()]),
+            "unchanged"
+        );
+        assert_eq!(
+            strip_stop_sequences("a<X>b<X>c".to_string(), &["<X>".to_string()]),
+            "a"
+        );
     }
 }

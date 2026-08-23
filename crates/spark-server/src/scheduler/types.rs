@@ -82,6 +82,10 @@ pub(super) struct ActiveSeq {
     pub session_hash: u64,
     pub last_token: u32,
     pub output_tokens: Vec<u32>,
+    /// Absolute API response cap, including reasoning/thinking tokens.
+    /// `remaining` separately tracks the content-token budget so thinking can
+    /// remain free within this hard envelope.
+    pub max_output_tokens: usize,
     pub remaining: usize,
     pub min_tokens: usize,
     pub eos_tokens: Vec<u32>,
@@ -145,9 +149,9 @@ pub(super) struct ActiveSeq {
     pub think_just_ended: bool,
     /// Consecutive `</think>` tokens skipped outside thinking. Safety limit: 50.
     pub think_skip_count: u32,
-    /// Post-think DDTree gate: after a force-exit (think_ended+think bonus), suppress
-    /// DDTree for this many steps. Prevents the thinking-attractor cascade where the
-    /// target immediately re-selects <think> as verified[0] on the step after </think>.
+    /// Committed content tokens since the latest `</think>` transition. The
+    /// spec-entry dispatch pin consumes this counter; requests that never think
+    /// count from the start of their response.
     pub post_think_gate_steps: u8,
     /// Token ID for `</tool_call>` — acts as a stop token for one-call-per-response.
     pub tool_call_end_token: Option<u32>,
@@ -191,6 +195,23 @@ pub(super) struct ActiveSeq {
     pub grammar_state: Option<GrammarState>,
     /// MTP draft tokens awaiting verification.
     pub pending_drafts: Vec<u32>,
+    /// Where `pending_drafts` came from. Consumed (and reset) by the
+    /// verify path purely to attribute accepted tokens to the tier that
+    /// proposed them; nothing reads it to make a decision. See
+    /// [`crate::rest_store`].
+    pub draft_origin: DraftOrigin,
+    /// Drafts the neural proposer got accepted in this sequence's most
+    /// recent γ-block verify. Read by the retrieval tiers as a one-sample
+    /// estimate of how well the drafter is currently doing on THIS text:
+    /// a drafter that just filled its frame must not be pre-empted. Zero
+    /// before the first verify, which is when there is no evidence either
+    /// way and retrieval is free to try.
+    pub last_verify_accepted: u16,
+    /// Self-context draft index over this sequence's own history.
+    /// Empty and unallocated until a drafting tier syncs it, and
+    /// dropped with the sequence. See
+    /// [`crate::rest_store::self_context`].
+    pub self_context: crate::rest_store::self_context::SelfContextIndex,
     /// DDTree M3: optional tree payload paired with `pending_drafts`.
     /// `None` for flat DFlash / MTP / ngram paths. When set by a
     /// DDTree-capable proposer (M4B+), the verifier reads ancestor
@@ -224,68 +245,22 @@ pub(super) struct ActiveSeq {
     pub difficulty_probe: super::thinking_efficiency::DifficultyProbe,
 }
 
-/// A sequence that has been swapped out to disk (KV + SSM state saved to file).
-pub(super) struct SwappedSeq {
-    pub tokens: Vec<u32>,
-    pub session_hash: u64,
-    pub seq_len: usize,
-    pub num_blocks: usize,
-    pub last_token: u32,
-    pub output_tokens: Vec<u32>,
-    pub remaining: usize,
-    pub min_tokens: usize,
-    pub eos_tokens: Vec<u32>,
-    pub sink: ResponseSink,
-    pub temperature: f32,
-    pub top_k: u32,
-    pub top_p: f32,
-    pub top_n_sigma: f32,
-    pub min_p: f32,
-    pub repetition_penalty: f32,
-    pub repetition_penalty_window: u32,
-    pub presence_penalty: f32,
-    pub frequency_penalty: f32,
-    pub lz_penalty: f32,
-    pub dry_multiplier: f32,
-    pub dry_base: f32,
-    pub dry_allowed_length: u32,
-    pub dry_sequence_breakers: Vec<u32>,
-    pub logit_bias: Vec<(u32, f32)>,
-    pub inside_thinking: bool,
-    pub enable_thinking: bool,
-    pub thinking_budget: Option<u32>,
-    pub spontaneous_think_budget: u32,
-    pub thinking_tokens: u32,
-    pub force_end_thinking: bool,
-    pub consecutive_confident: u32,
-    pub in_code_fence: bool,
-    pub think_end_token: Option<u32>,
-    pub think_start_token: Option<u32>,
-    pub think_ended: bool,
-    pub think_just_ended: bool,
-    pub think_skip_count: u32,
-    pub post_think_gate_steps: u8,
-    pub require_tool_call: bool,
-    pub suppress_tool_call: bool,
-    /// F60 (2026-04-27): MTP-disable flag preserved across snapshot/restore.
-    pub disable_mtp: bool,
-    pub content_started: bool,
-    pub content_tokens: u32,
-    pub prose_tokens_since_last_tool: u32,
-    pub think_watchdog_fires: u32,
-    /// Phase-C: watchdog rollback counter, preserved across snapshot/restore.
-    pub rollback_count: u32,
-    pub tool_call_start_token: Option<u32>,
-    pub tool_call_opened: bool,
-    pub tool_call_end_token: Option<u32>,
-    pub last_token_time: Instant,
-    pub request_start: Instant,
-    pub decode_start: Instant,
-    pub seed: Option<u64>,
-    pub top_logprobs: Option<u8>,
-    pub logprobs_data: Vec<crate::api::TokenLogprobs>,
-    /// Number of prompt tokens served by the prefix cache (no prefill cost).
-    pub cached_prompt_tokens: u32,
-    pub timeout_at: Option<Instant>,
-    pub swap_id: u64,
+#[path = "swapped_seq.rs"]
+mod swapped_seq;
+pub(super) use swapped_seq::SwappedSeq;
+
+/// Which drafting tier proposed the current `pending_drafts` frame.
+///
+/// Accounting only. The verifier treats every frame identically — a
+/// retrieved chain is accepted token-by-token against the target's argmax
+/// exactly as a neural draft is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DraftOrigin {
+    /// The neural proposer (DFlash or native MTP).
+    #[default]
+    Proposer,
+    /// The static `.rest` retrieval store.
+    RestStore,
+    /// The sequence's own token history.
+    SelfContext,
 }

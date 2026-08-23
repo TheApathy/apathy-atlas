@@ -135,6 +135,15 @@ pub const CONTENT_LOOP_SCAN_WINDOW: usize = 280;
 /// legitimate 3-item numbered list (`- item 1\n- item 2\n- item 3`)
 /// from tripping the hard stop.
 pub const CONTENT_LOOP_NORM_MIN_REPEATS: usize = 4;
+/// Always-on last-resort loop guard.  Unlike the ordinary content watchdog,
+/// this requires many *contiguous* byte-identical cycles and therefore remains
+/// active when the more sensitive watchdog is disabled for code/HTML output.
+/// It exists to bound pathological generations such as the AEON period-10
+/// attractor that otherwise ran for tens of thousands of tokens.
+pub const CATASTROPHIC_LOOP_MIN_TOKENS: usize = 512;
+pub const CATASTROPHIC_LOOP_PERIOD_MIN: usize = 4;
+pub const CATASTROPHIC_LOOP_PERIOD_MAX: usize = 64;
+pub const CATASTROPHIC_LOOP_MIN_REPEATS: usize = 32;
 /// Sentinel substituted for every numeric token in the normalized
 /// scan-window tail. `u32::MAX` can never collide with a real vocab id
 /// (Qwen3.6 vocab ≤ ~152k), and the `(t as usize) < mask.len()` bound
@@ -143,6 +152,7 @@ pub const CONTENT_LOOP_NORM_MIN_REPEATS: usize = 4;
 pub const NUMERIC_SENTINEL: u32 = u32::MAX;
 
 static ENABLE_LOOP_WATCHDOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static ENABLE_THINKING_LOOP_WATCHDOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Set once at startup from the resolved `ModelBehavior.enable_loop_watchdog`.
 /// Idempotent: subsequent calls within the same process are ignored.
@@ -155,6 +165,17 @@ pub fn set_enable_loop_watchdog(enabled: bool) {
 /// behavior plumbing → scheduler start).
 pub fn enable_loop_watchdog() -> bool {
     *ENABLE_LOOP_WATCHDOG.get().unwrap_or(&false)
+}
+
+/// Set once at startup from the explicit CLI override. The thinking-loop
+/// watchdog historically ran unconditionally, so its fail-open default is
+/// `true` until startup plumbing resolves the operator setting.
+pub fn set_enable_thinking_loop_watchdog(enabled: bool) {
+    let _ = ENABLE_THINKING_LOOP_WATCHDOG.set(enabled);
+}
+
+pub fn enable_thinking_loop_watchdog() -> bool {
+    *ENABLE_THINKING_LOOP_WATCHDOG.get().unwrap_or(&true)
 }
 
 // ── Grammar forced-token fast-path (xgrammar Tier 3b) ───────────────────────
@@ -227,7 +248,7 @@ pub struct WatchdogParams {
     /// mismatches. Default 12 (~8%).
     pub fuzzy_repeat_tolerance_div: usize,
     /// Cap on free-text tokens between successive `<tool_call>` opens in
-    /// `tool_choice=auto`. Default 384 (`MAX_INTER_TOOL_PROSE`).
+    /// `tool_choice=auto`. Default [`MAX_INTER_TOOL_PROSE`].
     pub max_inter_tool_prose: u32,
     /// Phase-C: when a degeneration watchdog fires, roll back to the last
     /// well-formed boundary and re-steer instead of hard-stopping.
@@ -261,6 +282,21 @@ static WATCHDOG_PARAMS: std::sync::OnceLock<WatchdogParams> = std::sync::OnceLoc
 /// Set once at startup from the resolved `ModelBehavior`. Idempotent.
 pub fn set_watchdog_params(p: WatchdogParams) {
     let _ = WATCHDOG_PARAMS.set(p);
+}
+
+/// Minimum thinking tokens before `</think>` may be emitted (0 = off).
+/// `ATLAS_MIN_THINKING_TOKENS`. Counters the observed temp-0 anomaly where
+/// the model closes thinking on token 1 for some prompts and blurts a wrong
+/// answer (instruction expert.01 = 10 total output tokens). Serving-layer
+/// only: masks the </think> logit, weights untouched.
+pub fn min_thinking_floor() -> u32 {
+    static FLOOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("ATLAS_MIN_THINKING_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Read the per-model watchdog tunables. Returns the historical-default
@@ -314,12 +350,45 @@ pub fn boundary_token_mask() -> Option<std::sync::Arc<[bool]>> {
 /// in `auto` mode (grammar.rs:461-462) sets `at_least_one=false`
 /// and `stop_after_first=false`, so `is_terminated()` stays false
 /// forever after the first tool call — the model can emit
-/// prose↔tool↔prose↔tool indefinitely. 384 tokens is enough for
-/// three normal "I'll now do X" paragraphs of agentic narrative;
-/// anything beyond is the failure mode (re-narrating the plan
-/// rather than executing it). Counted across non-thinking,
+/// prose↔tool↔prose↔tool indefinitely. The shared default is deliberately
+/// plan-sized: coding agents can legitimately inspect results and explain a
+/// multi-step edit before the next call. Counted across non-thinking,
 /// non-tool-body tokens only.
-pub const MAX_INTER_TOOL_PROSE: u32 = 384;
+pub const MAX_INTER_TOOL_PROSE: u32 = atlas_kernels::DEFAULT_MAX_INTER_TOOL_PROSE;
+
+/// Resolve CLI > environment > MODEL.toml/default. Zero means disabled;
+/// keeping it as zero would fire the `prose_tokens > max` check on token 1.
+pub fn resolve_max_inter_tool_prose(toml: u32, env: Option<u32>, cli: Option<u32>) -> u32 {
+    match cli.or(env).unwrap_or(toml) {
+        0 => u32::MAX,
+        value => value,
+    }
+}
+
+#[cfg(test)]
+mod inter_tool_prose_tests {
+    use super::{MAX_INTER_TOOL_PROSE, resolve_max_inter_tool_prose};
+
+    #[test]
+    fn default_is_plan_sized_and_matches_kernels() {
+        assert_eq!(
+            MAX_INTER_TOOL_PROSE,
+            atlas_kernels::DEFAULT_MAX_INTER_TOOL_PROSE
+        );
+        const { assert!(MAX_INTER_TOOL_PROSE >= 2048) };
+    }
+
+    #[test]
+    fn precedence_and_zero_disable_are_explicit() {
+        assert_eq!(resolve_max_inter_tool_prose(384, None, None), 384);
+        assert_eq!(resolve_max_inter_tool_prose(384, Some(8192), None), 8192);
+        assert_eq!(
+            resolve_max_inter_tool_prose(384, Some(8192), Some(4096)),
+            4096
+        );
+        assert_eq!(resolve_max_inter_tool_prose(384, None, Some(0)), u32::MAX);
+    }
+}
 
 /// Return `true` iff some contiguous subsequence of length
 /// `p ∈ [THINK_LOOP_PERIOD_MIN, THINK_LOOP_PERIOD_MAX]` appears
@@ -356,6 +425,35 @@ pub fn detect_content_token_loop(tokens: &[u32]) -> bool {
         CONTENT_LOOP_MIN_REPEATS,
         CONTENT_LOOP_SCAN_WINDOW,
     )
+}
+
+/// Detect only a catastrophic, perfectly periodic tail.
+///
+/// The ordinary watchdog counts repeated substrings anywhere in a short scan
+/// window and is intentionally configurable because generated tables, CSS,
+/// and source code can resemble that shape.  This safety net is deliberately
+/// much stricter: the final 32 complete periods must be contiguous and exactly
+/// equal.  That makes it suitable as an always-on bound even when the ordinary
+/// watchdog is disabled.
+pub fn detect_catastrophic_content_loop(tokens: &[u32]) -> bool {
+    let n = tokens.len();
+    if n < CATASTROPHIC_LOOP_MIN_TOKENS {
+        return false;
+    }
+
+    let max_period = CATASTROPHIC_LOOP_PERIOD_MAX.min(n / CATASTROPHIC_LOOP_MIN_REPEATS);
+    for period in CATASTROPHIC_LOOP_PERIOD_MIN..=max_period {
+        let repeated_len = period * CATASTROPHIC_LOOP_MIN_REPEATS;
+        let tail = &tokens[n - repeated_len..];
+        let needle = &tail[..period];
+        if tail
+            .chunks_exact(period)
+            .all(|candidate| candidate == needle)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Digit-normalized content-loop detector. Maps every numeric token in

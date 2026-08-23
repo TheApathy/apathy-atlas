@@ -27,6 +27,8 @@ mod state;
 mod token_ids;
 mod tool_handlers;
 
+pub(in crate::api) use handle_token::filter_stop_delta;
+
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};

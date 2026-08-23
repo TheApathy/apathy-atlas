@@ -180,6 +180,19 @@ impl GrammarState {
         self.matcher.rollback(n as i32);
     }
 
+    /// Return the number of matcher-history entries currently available for
+    /// rollback.
+    ///
+    /// Speculative grammar validation may keep accepting a draft suffix after
+    /// the matcher has terminated. [`Self::accept_token`] deliberately treats
+    /// those trailing tokens as valid, but they do not advance the matcher and
+    /// therefore do not create history entries. Callers doing a transient
+    /// accept/rollback pass must use the history delta rather than the number
+    /// of logically accepted draft tokens.
+    pub(crate) fn num_history_steps(&self) -> usize {
+        self.matcher.num_history_steps()
+    }
+
     /// Reset the grammar state to the initial position.
     pub fn reset(&mut self) {
         self.matcher.reset();

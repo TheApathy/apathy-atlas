@@ -12,8 +12,15 @@
 //! caller sees.
 
 use super::super::*;
+use super::super::{
+    VerifyLogitsFormat, advance_content_grammar, apply_speculative_fuzzy_stop,
+    commit_chatml_role_boundary, content_policy_required, dflash_content_accept,
+    fuzzy_repetition_outside_tool, tree_content_raw_argmax_eligible, update_tool_body_phase,
+};
 use super::{ThinkSpecCtx, dflash_thinking_accept, fast_path_seq_eligible, position_fast_path_ok};
+use crate::grammar::{GrammarEngine, GrammarState};
 use spark_model::traits::SequenceState;
+use std::time::Duration;
 
 // Tiny test vocabulary (10 ids). Content ids: 0, 1, 9.
 const SUPPRESS: u32 = 2;
@@ -32,6 +39,7 @@ fn seq_state() -> SequenceState {
         seq_len: 0,
         layer_states: Vec::new(),
         proposer_state: None,
+        proposer_state_alt: None,
         slot_idx: 0,
         marconi_skip_to: 0,
         session_hash: 0,
@@ -54,6 +62,7 @@ fn think_seq() -> ActiveSeq {
         session_hash: 0,
         last_token: 0,
         output_tokens: Vec::new(),
+        max_output_tokens: 1000,
         remaining: 1000,
         min_tokens: 0,
         eos_tokens: vec![EOS],
@@ -104,6 +113,9 @@ fn think_seq() -> ActiveSeq {
         ssm_rollback_ring: SsmDecodeRing::new(0),
         grammar_state: None,
         pending_drafts: Vec::new(),
+        draft_origin: DraftOrigin::default(),
+        last_verify_accepted: 0,
+        self_context: Default::default(),
         pending_tree_payload: None,
         last_token_time: Instant::now(),
         request_start: Instant::now(),
@@ -123,7 +135,25 @@ fn ctx(suppress: &[u32]) -> ThinkSpecCtx<'_> {
         enabled: true,
         code_fence_token: Some(FENCE),
         reflection_suppress_ids: suppress,
+        adaptive_sampling: false,
     }
+}
+
+#[test]
+fn speculative_thinking_honors_absolute_output_cap() {
+    let mut a = think_seq();
+    a.max_output_tokens = 3;
+    a.remaining = 100;
+
+    emit_token(&mut a, 9, None);
+    assert!(!a.finished);
+    emit_token(&mut a, 9, None);
+    assert!(!a.finished);
+    emit_token(&mut a, 9, None);
+
+    assert!(a.finished);
+    assert_eq!(a.output_tokens.len(), 3);
+    assert_eq!(a.remaining, 100, "thinking remains free inside hard cap");
 }
 
 /// Encode f32 logits as little-endian BF16 bytes (truncation — test
@@ -132,6 +162,10 @@ fn bf16_row(vals: &[f32]) -> Vec<u8> {
     vals.iter()
         .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
         .collect()
+}
+
+fn fp32_row(vals: &[f32]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 /// A `[VOCAB]` row whose argmax is `top` (logit 8.0) over a -8.0 floor,
@@ -160,6 +194,313 @@ fn serve_rows(rows: &[Vec<u8>]) -> impl FnMut(usize, &mut Vec<u8>) -> bool + '_ 
 
 fn no_snapshot(_a: &mut ActiveSeq) {}
 
+fn json_grammar_after_empty_object() -> GrammarState {
+    let mut vocab: Vec<String> = (0u8..128).map(|byte| String::from(byte as char)).collect();
+    vocab.push("<tool_call>".to_string());
+    vocab.push("</tool_call>".to_string());
+    vocab.push("<eos>".to_string());
+    let mut engine = GrammarEngine::new(&vocab, &[130]).unwrap();
+    let compiled = engine.compile_json_grammar().unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+    assert!(state.accept_token(b'{' as u32));
+    assert!(state.accept_token(b'}' as u32));
+    assert!(!state.is_terminated());
+    state
+}
+
+fn json_grammar_after_open_object() -> GrammarState {
+    let mut vocab: Vec<String> = (0u8..128).map(|byte| String::from(byte as char)).collect();
+    vocab.push("<tool_call>".to_string());
+    vocab.push("</tool_call>".to_string());
+    vocab.push("<eos>".to_string());
+    let mut engine = GrammarEngine::new(&vocab, &[130]).unwrap();
+    let compiled = engine.compile_json_grammar().unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+    assert!(state.accept_token(b'{' as u32));
+    state
+}
+
+#[test]
+fn speculative_tool_close_stops_on_terminal_grammar() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.grammar_state = Some(json_grammar_after_empty_object());
+    a.tool_call_end_token = Some(130);
+
+    emit_token(&mut a, 130, None);
+
+    assert!(a.finished);
+    assert_eq!(a.output_tokens, vec![130]);
+    assert!(a.grammar_state.as_ref().unwrap().is_terminated());
+}
+
+#[test]
+fn fixed_verifier_emit_stops_on_legacy_tool_close() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.inside_tool_body = true;
+    a.think_ended = true;
+
+    emit_token(&mut a, TC_END, None);
+
+    assert!(a.finished);
+    assert_eq!(a.output_tokens, vec![TC_END]);
+    assert!(!a.inside_tool_body);
+}
+
+#[test]
+fn speculative_tool_close_keeps_nonterminal_multicall_grammar_open() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.inside_tool_body = true;
+    a.think_ended = true;
+    a.tool_call_end_token = Some(b'}' as u32);
+    a.grammar_state = Some(json_grammar_after_open_object());
+
+    emit_token(&mut a, b'}' as u32, None);
+
+    assert!(!a.finished);
+    assert_eq!(a.output_tokens, vec![b'}' as u32]);
+    assert!(!a.grammar_state.as_ref().unwrap().is_terminated());
+    assert!(!a.inside_tool_body);
+    assert!(!a.think_ended, "multi-call close must permit re-thinking");
+}
+
+#[test]
+fn generic_policy_walk_stops_at_one_legacy_tool_close() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.inside_tool_body = true;
+    let rows = [row_with(TC_END, &[]), row_with(1, &[])];
+
+    let out = dflash_content_accept(
+        &mut a,
+        &[TC_END],
+        &[TC_END, 1],
+        &ctx(&[]),
+        VerifyLogitsFormat::Bf16,
+        serve_rows(&rows),
+    );
+
+    assert_eq!(out.num_accepted, 1);
+    assert!(out.bonus.is_none());
+    assert!(a.finished);
+    assert_eq!(a.output_tokens, vec![TC_END]);
+}
+
+#[test]
+fn content_grammar_close_is_advanced_exactly_once() {
+    let mut vocab: Vec<String> = (0u8..128).map(|byte| String::from(byte as char)).collect();
+    vocab.push("<tool_call>".to_string());
+    vocab.push("</tool_call>".to_string());
+    vocab.push("<eos>".to_string());
+    let mut engine = GrammarEngine::new(&vocab, &[130]).unwrap();
+    let compiled = engine.compile_json_grammar().unwrap();
+    let mut state = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+    assert!(state.accept_token(b'{' as u32));
+
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.tool_call_end_token = Some(b'}' as u32);
+    a.grammar_state = Some(state);
+    advance_content_grammar(&mut a, b'}' as u32);
+
+    let state = a.grammar_state.as_mut().unwrap();
+    assert!(state.fill_bitmask());
+    assert!(state.is_token_allowed(130));
+    assert!(
+        !state.is_terminated(),
+        "close token must not consume EOS too"
+    );
+}
+
+#[test]
+fn tool_body_phase_is_symmetric_for_serial_and_speculative_callers() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.prose_tokens_since_last_tool = 17;
+
+    update_tool_body_phase(&mut a, TC_START);
+    assert!(a.inside_tool_body);
+    assert_eq!(a.prose_tokens_since_last_tool, 0);
+    update_tool_body_phase(&mut a, 9);
+    assert!(a.inside_tool_body);
+    update_tool_body_phase(&mut a, TC_END);
+    assert!(!a.inside_tool_body);
+}
+
+#[test]
+fn speculative_real_content_resets_stray_think_end_run() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    a.think_skip_count = 49;
+
+    emit_token(&mut a, 9, None);
+
+    assert_eq!(a.think_skip_count, 0);
+    assert!(!a.finished);
+    assert_eq!(a.output_tokens, vec![9]);
+}
+
+#[test]
+fn speculative_emit_applies_expired_request_deadline() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.timeout_at = Some(Instant::now() - Duration::from_millis(1));
+
+    emit_token(&mut a, 9, None);
+
+    assert!(a.finished);
+    assert_eq!(a.output_tokens, vec![9]);
+}
+
+#[test]
+fn speculative_fuzzy_repeat_stops_outside_but_not_inside_tool_body() {
+    let pattern: Vec<u32> = (20..50).collect();
+    let repeated: Vec<u32> = pattern.iter().copied().cycle().take(90).collect();
+
+    let mut outside = think_seq();
+    outside.inside_thinking = false;
+    outside.output_tokens = repeated.clone();
+    assert!(fuzzy_repetition_outside_tool(&outside).is_some());
+    assert!(apply_speculative_fuzzy_stop(&mut outside));
+    assert!(outside.finished);
+
+    let mut inside = think_seq();
+    inside.inside_thinking = false;
+    inside.output_tokens.push(TC_START);
+    inside.output_tokens.extend(repeated);
+    assert!(fuzzy_repetition_outside_tool(&inside).is_none());
+    assert!(!apply_speculative_fuzzy_stop(&mut inside));
+    assert!(!inside.finished);
+}
+
+#[test]
+fn content_policy_fp32_rows_apply_plain_sampler_bias() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    // The raw target argmax and draft are token 1. Plain serving applies this
+    // request's logit bias first, making token 0 the true target token.
+    a.logit_bias = vec![(0, 20.0)];
+    let rows = [fp32_row(&[
+        -8.0, 8.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0, -8.0,
+    ])];
+
+    let out = dflash_content_accept(
+        &mut a,
+        &[1],
+        &[1],
+        &ctx(&[]),
+        VerifyLogitsFormat::Fp32,
+        serve_rows(&rows),
+    );
+
+    assert_eq!(out.num_accepted, 0);
+    assert_eq!(out.bonus, Some(0));
+    assert_eq!(a.output_tokens, vec![0]);
+    assert_eq!(a.last_token, 0);
+}
+
+#[test]
+fn content_policy_malformed_row_fails_closed() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    let out = dflash_content_accept(
+        &mut a,
+        &[1],
+        &[1],
+        &ctx(&[]),
+        VerifyLogitsFormat::Fp32,
+        |_, buf| {
+            buf.extend_from_slice(&[0, 1, 2]);
+            true
+        },
+    );
+
+    assert_eq!(out.num_accepted, 0);
+    assert!(out.bonus.is_none());
+    assert!(a.finished);
+    assert!(a.output_tokens.is_empty());
+}
+
+#[test]
+fn post_think_content_policy_d2h_failure_fails_closed() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+
+    let out = dflash_content_accept(
+        &mut a,
+        &[1],
+        &[1],
+        &ctx(&[]),
+        VerifyLogitsFormat::Fp32,
+        |_, _| false,
+    );
+
+    assert_eq!(out.num_accepted, 0);
+    assert!(out.bonus.is_none());
+    assert!(a.finished);
+    assert!(a.output_tokens.is_empty());
+}
+
+#[test]
+fn ordinary_post_think_answer_may_stop_immediately() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    a.thinking_tokens = 0;
+    a.output_tokens = vec![1];
+    let remaining = a.remaining;
+
+    emit_token(&mut a, EOS, None);
+
+    assert_eq!(a.output_tokens, vec![1, EOS]);
+    assert!(a.finished, "ordinary answers must honor their first EOS");
+    assert_eq!(a.remaining, remaining - 1);
+    assert_eq!(a.content_tokens, 1);
+}
+
+#[test]
+fn required_tool_call_still_suppresses_post_think_eos() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    a.require_tool_call = true;
+    a.output_tokens = vec![1];
+
+    emit_token(&mut a, EOS, None);
+
+    assert_eq!(a.output_tokens, vec![1], "suppressed EOS is discarded");
+    assert!(!a.finished, "required tool calls must remain protected");
+}
+
+#[test]
+fn chatml_role_boundary_overrides_post_think_and_tool_eos_guards() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    a.require_tool_call = true;
+    a.min_tokens = 16;
+    a.grammar_state = Some(json_grammar_after_empty_object());
+
+    assert!(eos_is_suppressed(&a, 1));
+    assert!(commit_chatml_role_boundary(&mut a, EOS, Some(EOS)));
+    assert!(a.finished);
+    assert_eq!(a.output_tokens, vec![EOS]);
+    assert!(
+        !a.grammar_state.as_ref().unwrap().is_terminated(),
+        "hard stop must precede grammar advance"
+    );
+
+    let mut thinking = think_seq();
+    assert!(!commit_chatml_role_boundary(&mut thinking, EOS, Some(EOS)));
+    assert!(!thinking.finished);
+    assert!(thinking.output_tokens.is_empty());
+}
+
 // ── Pure gate tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -178,6 +519,54 @@ fn seq_eligibility_requires_greedy_and_neutral_penalties() {
     let mut l = think_seq();
     l.top_logprobs = Some(4);
     assert!(!fast_path_seq_eligible(&l));
+}
+
+#[test]
+fn post_think_tree_policy_routes_to_flat_generic_walk() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    a.thinking_tokens = 0;
+    assert!(content_policy_required(&a, &ctx(&[])));
+    assert!(!tree_content_raw_argmax_eligible(&a, &ctx(&[])));
+
+    // The flat generic walker supports FP32 rows and applies the same
+    // post-think tag mask as serial serving. A raw forbidden <think> argmax
+    // must therefore become content rather than being committed.
+    let mut logits = vec![-8.0f32; VOCAB];
+    logits[THINK_START as usize] = 8.0;
+    logits[1] = 7.0;
+    let rows = [fp32_row(&logits)];
+    let out = dflash_content_accept(
+        &mut a,
+        &[THINK_START],
+        &[THINK_START],
+        &ctx(&[]),
+        VerifyLogitsFormat::Fp32,
+        serve_rows(&rows),
+    );
+
+    assert_eq!(out.num_accepted, 0);
+    assert_eq!(out.bonus, Some(1));
+    assert_eq!(a.output_tokens, vec![1]);
+    assert_eq!(a.last_token, 1);
+}
+
+#[test]
+fn tree_policy_stays_closed_for_branch_dependent_interventions() {
+    let mut a = think_seq();
+    a.inside_thinking = false;
+    a.think_ended = true;
+    a.output_tokens.resize(16, 1);
+
+    a.think_just_ended = true;
+    assert!(!tree_content_raw_argmax_eligible(&a, &ctx(&[])));
+    a.think_just_ended = false;
+    a.require_tool_call = true;
+    assert!(!tree_content_raw_argmax_eligible(&a, &ctx(&[])));
+    a.require_tool_call = false;
+    a.min_tokens = 32;
+    assert!(!tree_content_raw_argmax_eligible(&a, &ctx(&[])));
 }
 
 #[test]

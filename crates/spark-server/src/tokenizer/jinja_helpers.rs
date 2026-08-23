@@ -8,6 +8,36 @@ use std::path::Path;
 
 pub(super) const TEMPLATE_OVERRIDE_DIR: &str = "jinja-templates";
 
+/// Resolve the template source without letting the stale dense-Qwen override
+/// hide a newer checkpoint contract.  Qwen3.5/3.6 retain the override (and
+/// therefore their established prompt bytes); a dense `qwen3_5` checkpoint
+/// that declares both Qwen3.8-only controls gets its own template.
+pub(super) fn select_chat_template(
+    model_type: &str,
+    override_tmpl: Option<String>,
+    checkpoint_tmpl: Option<String>,
+    supports_thinking: bool,
+) -> (String, bool) {
+    let checkpoint_is_qwen38 = model_type == "qwen3_5"
+        && checkpoint_tmpl.as_ref().is_some_and(|t| {
+            t.contains("resolved_reasoning_effort") && t.contains("preserve_thinking")
+        });
+    if checkpoint_is_qwen38 {
+        tracing::info!(
+            "Using checkpoint-owned dense-Qwen template (native reasoning_effort/preserve_thinking contract)"
+        );
+        return (checkpoint_tmpl.expect("checked Some above"), true);
+    }
+    if let Some(t) = override_tmpl {
+        return (t, false);
+    }
+    if let Some(t) = checkpoint_tmpl {
+        return (t, false);
+    }
+    tracing::warn!("No chat template found — using default ChatML");
+    (default_chatml_template(supports_thinking), false)
+}
+
 /// Build a precompiled minijinja Environment from the chat template.
 /// Leaks the template string to 'static — acceptable since one ChatTokenizer
 /// lives for the entire server lifetime.
@@ -309,4 +339,34 @@ pub(super) fn convert_python_jinja_to_minijinja(template: &str) -> String {
     // messages[1:] — minijinja 2.x supports slice syntax natively
 
     t
+}
+
+#[cfg(test)]
+mod template_selection_tests {
+    use super::select_chat_template;
+
+    #[test]
+    fn qwen38_checkpoint_contract_outranks_stale_dense_override() {
+        let checkpoint = "resolved_reasoning_effort preserve_thinking".to_string();
+        let (selected, is_qwen38) = select_chat_template(
+            "qwen3_5",
+            Some("retired-qwen3_5-override".into()),
+            Some(checkpoint.clone()),
+            true,
+        );
+        assert_eq!(selected, checkpoint);
+        assert!(is_qwen38);
+    }
+
+    #[test]
+    fn qwen36_keeps_existing_override_prompt_contract() {
+        let (selected, is_qwen38) = select_chat_template(
+            "qwen3_5",
+            Some("qwen36-established-override".into()),
+            Some("preserve_thinking only".into()),
+            true,
+        );
+        assert_eq!(selected, "qwen36-established-override");
+        assert!(!is_qwen38);
+    }
 }

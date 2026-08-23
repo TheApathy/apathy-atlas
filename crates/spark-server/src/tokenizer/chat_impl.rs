@@ -8,6 +8,18 @@ use tokenizers::Tokenizer;
 
 use super::{ChatTokenizer, StreamingDecoder, normalize_tool_call_arguments};
 
+/// Normalize OpenAI-style effort names to Qwen3.8's checkpoint vocabulary.
+/// Unknown future values are left undefined so the checkpoint can apply its
+/// own default instead of failing template validation.
+fn qwen38_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "high" | "xhigh" | "max" => Some("xhigh"),
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        _ => None,
+    }
+}
+
 impl ChatTokenizer {
     // The Jinja-template override directory constant is defined and used
     // in `tokenizer/jinja_helpers.rs` as `TEMPLATE_OVERRIDE_DIR`
@@ -29,19 +41,14 @@ impl ChatTokenizer {
             .with_truncation(None)
             .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
 
-        // Priority 1: Override template from jinja-templates/{model_type}.jinja
-        // Priority 2: Template from tokenizer_config.json (shipped with model weights)
-        // Priority 3: Default ChatML fallback
-        let chat_template = if let Some(override_tmpl) =
-            super::jinja_helpers::load_override_template(model_type, repo_root)
-        {
-            override_tmpl
-        } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)? {
-            config_tmpl
-        } else {
-            tracing::warn!("No chat template found — using default ChatML");
-            super::jinja_helpers::default_chatml_template(supports_thinking)
-        };
+        let checkpoint_tmpl = super::jinja_helpers::load_config_template(model_dir)?;
+        let override_tmpl = super::jinja_helpers::load_override_template(model_type, repo_root);
+        let (chat_template, qwen38_reasoning_effort) = super::jinja_helpers::select_chat_template(
+            model_type,
+            override_tmpl,
+            checkpoint_tmpl,
+            supports_thinking,
+        );
 
         let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
 
@@ -62,6 +69,7 @@ impl ChatTokenizer {
             chat_template,
             jinja_env,
             openai_jinja_env,
+            qwen38_reasoning_effort,
         })
     }
 
@@ -116,6 +124,27 @@ impl ChatTokenizer {
         enable_thinking: bool,
         disable_tool_steering: bool,
     ) -> Result<Vec<u32>> {
+        self.apply_chat_template_jinja_with_options(
+            messages,
+            tools,
+            enable_thinking,
+            disable_tool_steering,
+            None,
+            None,
+        )
+    }
+
+    /// Render with request-scoped Qwen3.8 template controls.  The ordinary
+    /// method above remains the compatibility wrapper for non-HTTP callers.
+    pub fn apply_chat_template_jinja_with_options(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+        requested_reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
         let tmpl = self
             .jinja_env
             .get_template("chat")
@@ -154,24 +183,35 @@ impl ChatTokenizer {
         // template only validates the field when thinking is enabled, so
         // "none" is inert there.
         //
-        // ATLAS_REASONING_EFFORT overrides for callers that want medium/low.
-        // TODO: plumb the request's own `reasoning_effort`
-        // (chat_request.rs defines it and nothing reads it) through the five
-        // apply_chat_template_* call sites.
+        // A request-scoped effort takes precedence for Qwen3.8. Other model
+        // families retain the established ATLAS_REASONING_EFFORT behavior
+        // because their accepted effort vocabularies differ.
         let reasoning_effort: minijinja::Value = if enable_thinking {
-            match std::env::var("ATLAS_REASONING_EFFORT") {
-                Ok(v) if !v.is_empty() => v.into(),
-                _ => minijinja::Value::UNDEFINED,
+            if self.qwen38_reasoning_effort
+                && let Some(effort) = requested_reasoning_effort
+            {
+                qwen38_reasoning_effort(effort)
+                    .map(minijinja::Value::from)
+                    .unwrap_or(minijinja::Value::UNDEFINED)
+            } else {
+                match std::env::var("ATLAS_REASONING_EFFORT") {
+                    Ok(v) if !v.is_empty() => v.into(),
+                    _ => minijinja::Value::UNDEFINED,
+                }
             }
         } else {
             "none".into()
         };
+        let preserve_thinking = preserve_thinking
+            .map(minijinja::Value::from)
+            .unwrap_or(minijinja::Value::UNDEFINED);
         let ctx = minijinja::context! {
             messages => messages_val,
             tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
             add_generation_prompt => true,
             enable_thinking => enable_thinking,
             reasoning_effort => reasoning_effort,
+            preserve_thinking => preserve_thinking,
             disable_tool_steering => disable_tool_steering,
             add_vision_id => false,
         };
@@ -205,6 +245,25 @@ impl ChatTokenizer {
         enable_thinking: bool,
         disable_tool_steering: bool,
     ) -> Result<Vec<u32>> {
+        self.apply_chat_template_openai_with_options(
+            messages,
+            tools,
+            enable_thinking,
+            disable_tool_steering,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_chat_template_openai_with_options(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        disable_tool_steering: bool,
+        requested_reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<Vec<u32>> {
         if let Some(ref env) = self.openai_jinja_env {
             let tmpl = env
                 .get_template("chat")
@@ -218,19 +277,31 @@ impl ChatTokenizer {
             // Same fix as apply_chat_template_jinja above: undefined lets each
             // template apply its own default. Hardcoding "high" 400s on Qwen3.8.
             let reasoning_effort: minijinja::Value = if enable_thinking {
-                match std::env::var("ATLAS_REASONING_EFFORT") {
-                    Ok(v) if !v.is_empty() => v.into(),
-                    _ => minijinja::Value::UNDEFINED,
+                if self.qwen38_reasoning_effort
+                    && let Some(effort) = requested_reasoning_effort
+                {
+                    qwen38_reasoning_effort(effort)
+                        .map(minijinja::Value::from)
+                        .unwrap_or(minijinja::Value::UNDEFINED)
+                } else {
+                    match std::env::var("ATLAS_REASONING_EFFORT") {
+                        Ok(v) if !v.is_empty() => v.into(),
+                        _ => minijinja::Value::UNDEFINED,
+                    }
                 }
             } else {
                 "none".into()
             };
+            let preserve_thinking = preserve_thinking
+                .map(minijinja::Value::from)
+                .unwrap_or(minijinja::Value::UNDEFINED);
             let ctx = minijinja::context! {
                 messages => messages_val,
                 tools => tools_val.unwrap_or(minijinja::Value::UNDEFINED),
                 add_generation_prompt => true,
                 enable_thinking => enable_thinking,
                 reasoning_effort => reasoning_effort,
+                preserve_thinking => preserve_thinking,
                 disable_tool_steering => disable_tool_steering,
                 add_vision_id => false,
             };
@@ -239,7 +310,14 @@ impl ChatTokenizer {
                 .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
             self.encode(&rendered)
         } else {
-            self.apply_chat_template_jinja(messages, tools, enable_thinking, disable_tool_steering)
+            self.apply_chat_template_jinja_with_options(
+                messages,
+                tools,
+                enable_thinking,
+                disable_tool_steering,
+                requested_reasoning_effort,
+                preserve_thinking,
+            )
         }
     }
 
@@ -325,5 +403,21 @@ impl ChatTokenizer {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod qwen38_template_option_tests {
+    use super::qwen38_reasoning_effort;
+
+    #[test]
+    fn effort_aliases_match_the_checkpoint_vocabulary() {
+        assert_eq!(qwen38_reasoning_effort("max"), Some("xhigh"));
+        assert_eq!(qwen38_reasoning_effort("high"), Some("xhigh"));
+        assert_eq!(qwen38_reasoning_effort("xhigh"), Some("xhigh"));
+        assert_eq!(qwen38_reasoning_effort("medium"), Some("medium"));
+        assert_eq!(qwen38_reasoning_effort("minimal"), Some("low"));
+        assert_eq!(qwen38_reasoning_effort("low"), Some("low"));
+        assert_eq!(qwen38_reasoning_effort("future-rung"), None);
     }
 }

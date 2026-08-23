@@ -5,7 +5,10 @@
 // full Atlas runtime / kernel registry. Only the symbols the probe needs.
 
 use anyhow::{Result, bail};
-use std::ffi::c_void;
+
+#[path = "cuda_host_copy.rs"]
+mod cuda_host_copy;
+pub use cuda_host_copy::*;
 
 // Re-export the helpers that used to live here, keeping
 // `cuda_min::{CudaModule, CudaEvent, launch_kernel}` paths working after the
@@ -19,10 +22,6 @@ unsafe extern "C" {
     fn cuCtxDestroy_v2(ctx: u64) -> i32;
     fn cuMemAlloc_v2(dptr: *mut u64, bytesize: usize) -> i32;
     fn cuMemFree_v2(dptr: u64) -> i32;
-    fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;
-    fn cuMemFreeHost(p: *mut c_void) -> i32;
-    fn cuMemcpyHtoDAsync_v2(dst: u64, src: *const c_void, bytes: usize, stream: u64) -> i32;
-    fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: u64) -> i32;
     fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
     fn cuStreamDestroy_v2(stream: u64) -> i32;
@@ -106,58 +105,6 @@ impl Drop for DeviceBuffer {
             let _ = cuMemFree_v2(self.ptr);
         }
     }
-}
-
-pub struct PinnedBuffer {
-    pub ptr: *mut c_void,
-    pub bytes: usize,
-}
-
-// SAFETY: `cuMemAllocHost` returns a process-pinned allocation whose
-// virtual address is stable for the buffer's entire lifetime — moving the
-// `PinnedBuffer` between threads only transfers a pointer + length + the
-// CUcontext handle used by Drop, none of which alias mutable state. The
-// inner pointer never escapes through `&self` accessors; concurrent users
-// of the underlying memory must coordinate externally (Atlas does this
-// via the io_uring submission queue, which is single-threaded per rank).
-unsafe impl Send for PinnedBuffer {}
-unsafe impl Sync for PinnedBuffer {}
-
-impl PinnedBuffer {
-    pub fn new(bytes: usize) -> Result<Self> {
-        let mut p: *mut c_void = std::ptr::null_mut();
-        let s = unsafe { cuMemAllocHost_v2(&mut p, bytes) };
-        if s != 0 {
-            bail!("cuMemAllocHost_v2({bytes}) failed: {s}");
-        }
-        Ok(Self { ptr: p, bytes })
-    }
-}
-
-impl Drop for PinnedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = cuMemFreeHost(self.ptr);
-        }
-    }
-}
-
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn copy_h_to_d_async(dst: u64, src: *const c_void, bytes: usize, stream: u64) -> Result<()> {
-    let s = unsafe { cuMemcpyHtoDAsync_v2(dst, src, bytes, stream) };
-    if s != 0 {
-        bail!("cuMemcpyHtoDAsync_v2 failed: {s}");
-    }
-    Ok(())
-}
-
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn copy_d_to_h_async(dst: *mut c_void, src: u64, bytes: usize, stream: u64) -> Result<()> {
-    let s = unsafe { cuMemcpyDtoHAsync_v2(dst, src, bytes, stream) };
-    if s != 0 {
-        bail!("cuMemcpyDtoHAsync_v2 failed: {s}");
-    }
-    Ok(())
 }
 
 pub fn stream_sync(stream: u64) -> Result<()> {

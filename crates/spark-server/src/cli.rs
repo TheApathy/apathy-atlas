@@ -52,6 +52,32 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MODEL_DIR")]
     pub kernel_target: Option<String>,
 
+    /// Resolve all kernels for the model and exit, reporting any that did not
+    /// resolve. Does not start the server. The EXIT CODE IS THE NUMBER of
+    /// unresolved kernels — 0 means every lookup resolved.
+    ///
+    /// A dry run that stops immediately after the kernel audit: config, GPU
+    /// init, weight load and model construction all run (every lookup lives in
+    /// a layer constructor, so a check that skipped them would resolve a
+    /// DIFFERENT set than a real serve), then the report is printed and the
+    /// process exits. The scheduler is never started and no port is bound.
+    ///
+    /// A POSIX status is 8 bits, so the code is CLAMPED at 255 — 256 would be
+    /// reported as 0, i.e. a broken model reading as a pass. Whenever the clamp
+    /// bites, the true count is printed alongside it and carried in the JSON.
+    ///
+    /// A one-line JSON object (`{"atlas_kernel_check": …}`) is printed on
+    /// stdout after the human report, so a sweep over every target can
+    /// aggregate without parsing prose.
+    ///
+    /// Ported from upstream `cli/serve_args.rs:99`. Unlike upstream this is a
+    /// PURE DIAGNOSTIC: a normal serve is unaffected by an unresolved lookup
+    /// and there is no `--dangerously-allow-unresolved-kernel-lookups`,
+    /// because upstream's fail-closed boot gate was not ported. See
+    /// `qwen38/analysis/UPSTREAM-PORT.md`.
+    #[arg(long, default_value_t = false)]
+    pub check_kernels: bool,
+
     /// Override HuggingFace cache directory
     /// (default: $HF_HUB_CACHE, $HF_HOME/hub, or ~/.cache/huggingface/hub).
     #[arg(long, value_name = "DIR")]
@@ -115,6 +141,33 @@ pub struct ServeArgs {
     #[arg(long, visible_alias = "stupify", default_value_t = false)]
     pub disable_thinking: bool,
 
+    /// Disable MODEL.toml's content-loop watchdog for workloads where repeated
+    /// structure is legitimate (for example long HTML/CSS/JavaScript output).
+    /// This does not change sampling; it only prevents the heuristic early stop.
+    #[arg(long, default_value_t = false)]
+    pub disable_loop_watchdog: bool,
+
+    /// Disable the thinking-loop watchdog. This is separate from the content
+    /// watchdog because repeated reasoning can be legitimate on long math and
+    /// code tasks. The explicit thinking-token budget remains enforced.
+    #[arg(long, default_value_t = false)]
+    pub disable_thinking_loop_watchdog: bool,
+
+    /// Disable MODEL.toml's F2 confidence-based early stop for reasoning.
+    /// This leaves the explicit thinking-token budget and both loop watchdogs
+    /// unchanged. Intended for controlled quality evaluation of cases where
+    /// F2 may force a premature answer transition.
+    #[arg(long, default_value_t = false)]
+    pub disable_confidence_early_stop: bool,
+
+    /// Disable the API streaming SimHash semantic-loop watchdog. This leaves
+    /// the scheduler content/thinking watchdogs unchanged. Intended for
+    /// controlled evaluation of long mathematical or structured answers where
+    /// legitimately repeated derivation language can resemble a paraphrase
+    /// loop.
+    #[arg(long, default_value_t = false)]
+    pub disable_simhash_watchdog: bool,
+
     /// Override MODEL.toml's `[behavior].max_thinking_budget` (tokens).
     /// Sets the per-request ceiling for thinking-block length. Per-request
     /// `thinking.budget_tokens` (or `reasoning_effort`) still wins below
@@ -122,10 +175,17 @@ pub struct ServeArgs {
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 
+    /// Override the MODEL.toml inter-tool prose cap. Precedence is CLI,
+    /// then `ATLAS_MAX_INTER_TOOL_PROSE`, then MODEL.toml/default. Zero
+    /// disables this guard.
+    #[arg(long)]
+    pub max_inter_tool_prose: Option<u32>,
+
     /// Default chat template kwargs applied when the client sends no
     /// thinking parameters (no `reasoning.effort`, `chat_template_kwargs`,
     /// or `enable_thinking` in the request body). A JSON object with
-    /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32).
+    /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32),
+    /// and `preserve_thinking` (bool, for checkpoint templates that support it).
     ///
     /// Precedence (highest wins): request body → this flag → MODEL.toml.
     /// Example: `--default-chat-template-kwargs '{"enable_thinking":true}'`
@@ -150,9 +210,48 @@ pub struct ServeArgs {
     /// arXiv 2602.06036). Pairs the target with a small Qwen3-architecture
     /// drafter (e.g. `z-lab/Qwen3.6-35B-A3B-DFlash`) that emits γ tokens
     /// per step via bidirectional in-block attention conditioned on captured
-    /// target hidden states. Mutually exclusive with `--speculative`.
-    #[arg(long, default_value_t = false, conflicts_with = "speculative")]
+    /// target hidden states.
+    ///
+    /// May be combined with `--speculative`: the DFlash drafter is installed
+    /// as proposer arm 0 and the target's in-checkpoint MTP head is kept on
+    /// arm 1 instead of being discarded, so `--mtp-gate auto` can arbitrate
+    /// between them per step. The two heads have opposite strengths on this
+    /// model family — the external drafter wins on code, the native head on
+    /// prose. Passing both costs one extra resident MTP head (~0.78 GB at the
+    /// default `--mtp-quantization bf16`, ~0.24 GB at nvfp4).
+    ///
+    /// These flags used to be `conflicts_with` each other. They no longer are:
+    /// the exclusion was a CLI convention, not an engine constraint — a
+    /// `--dflash` run already built the MTP head and threw it away.
+    #[arg(long, default_value_t = false)]
     pub dflash: bool,
+
+    /// Speculation throughput gate: `auto`, `force`, `dflash`, or `mtp`.
+    ///
+    /// Omitted (the DEFAULT) means NO gate — speculation runs exactly as
+    /// configured, byte-for-byte as it did before the gate existed. This is
+    /// deliberately not a clap default so that the champion configuration
+    /// stays the control in any A/B.
+    ///
+    /// `auto` arms the arbiter, which measures DELIVERED tok/s per arm over
+    /// 16-step windows and runs whichever arm is fastest right now, with
+    /// hysteresis, a dwell requirement, and periodic probing of the others.
+    /// It measures throughput rather than draft acceptance on purpose:
+    /// acceptance is expressed in each arm's own units (a mean of 3 is winning
+    /// for K=2 and losing badly for γ=16), so no acceptance threshold orders
+    /// the arms correctly.
+    ///
+    /// `force` DISARMS the arbiter so verify keeps flowing even where it would
+    /// measure net-negative — a diagnostic for collecting verify samples, and
+    /// never a production setting: if forcing wins, the gate is miscalibrated
+    /// and that is the fix. To run without speculation at all, omit
+    /// `--speculative` and `--dflash`.
+    ///
+    /// `dflash` / `mtp` PIN one proposer arm for the whole run. They exist so
+    /// the two arms can be A/B'd on one binary and one set of weights;
+    /// `mtp` requires a build that passed both `--dflash` and `--speculative`.
+    #[arg(long)]
+    pub mtp_gate: Option<String>,
 
     /// HuggingFace id (or local path) of the DFlash drafter checkpoint.
     /// When `--dflash` is set without `--draft-model`, the value falls
@@ -160,12 +259,22 @@ pub struct ServeArgs {
     #[arg(long)]
     pub draft_model: Option<String>,
 
-    /// DFlash block size γ (parallel draft tokens per step). Defaults to
-    /// the drafter's `block_size` from `config.json` (16 for the published
-    /// Qwen3.6-DFlash drafters); override only for ablation. Higher γ
-    /// increases per-step verify cost but raises peak speedup.
-    #[arg(long, default_value_t = 16)]
-    pub dflash_gamma: usize,
+    /// DFlash/DSpark draft count γ (parallel speculative tokens per step).
+    /// Width semantics are checkpoint-family specific: legacy DFlash counts
+    /// one known anchor (`B16 -> γ15`), while published DSpark counts draft
+    /// rows (`B7 -> γ7`, verified as K8 with the target bonus). Smaller widths
+    /// remain valid performance/cost tradeoffs. When omitted, Atlas derives the
+    /// trained width from config.
+    #[arg(long)]
+    pub dflash_gamma: Option<usize>,
+
+    /// DSpark target-verify planner: `static`, `cap-accept`, or `compact`.
+    /// Only `static` is currently supported. It verifies the full gamma+1
+    /// window and deliberately skips confidence scoring, matching SGLang PR
+    /// 34966's default. The dynamic modes are recognized but fail startup
+    /// until Atlas implements ragged verify layouts and SPS-based costing.
+    #[arg(long, default_value = "static", value_name = "MODE")]
+    pub dspark_verify_mode: String,
 
     /// DFlash drafter sliding-window size for long context. The drafter
     /// runs full-prefix attention by default; at Atlas's typical 16K
@@ -522,4 +631,36 @@ pub struct ServeArgs {
     /// `ps`/`/proc/<pid>/cmdline`. Use `--auth-tokens-file` instead.
     #[arg(long, value_name = "TOKEN", conflicts_with = "auth_tokens_file")]
     pub auth_token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::ServeArgs;
+
+    #[test]
+    fn dflash_gamma_is_family_derived_unless_explicitly_overridden() {
+        let automatic = ServeArgs::parse_from(["spark", "org/model", "--dflash"]);
+        assert_eq!(automatic.dflash_gamma, None);
+
+        let explicit =
+            ServeArgs::parse_from(["spark", "org/model", "--dflash", "--dflash-gamma", "7"]);
+        assert_eq!(explicit.dflash_gamma, Some(7));
+    }
+
+    #[test]
+    fn dspark_verify_mode_default_and_explicit_value_are_preserved() {
+        let automatic = ServeArgs::parse_from(["spark", "org/model", "--dflash"]);
+        assert_eq!(automatic.dspark_verify_mode, "static");
+
+        let explicit = ServeArgs::parse_from([
+            "spark",
+            "org/model",
+            "--dflash",
+            "--dspark-verify-mode",
+            "compact",
+        ]);
+        assert_eq!(explicit.dspark_verify_mode, "compact");
+    }
 }

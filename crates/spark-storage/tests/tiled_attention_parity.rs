@@ -7,8 +7,6 @@
 // reordering inside `__expf` and the running-state quantization at the
 // kernel boundaries (m, l, o stay fp32 — no quantization at boundaries).
 
-use std::ffi::c_void;
-
 use half::bf16;
 use rand::SeedableRng;
 use rand::distributions::Distribution;
@@ -17,7 +15,7 @@ use rand_distr::StandardNormal;
 
 use spark_storage::attention_ref::{AttnState, finalize_ref, step_tile_ref};
 use spark_storage::cuda_min::{
-    CudaCtx, DeviceBuffer, copy_d_to_h_async, copy_h_to_d_async, stream_sync,
+    CudaCtx, DeviceBuffer, HostToDeviceCopy, copy_d_to_h, copy_h_to_d_group,
 };
 use spark_storage::tiled_attention::{TiledAttention, TiledAttentionDims};
 
@@ -50,13 +48,6 @@ fn random_bf16(n: usize, rng: &mut ChaCha8Rng) -> Vec<bf16> {
         .collect()
 }
 
-fn upload_bf16(dst: u64, host: &[bf16], stream: u64) {
-    copy_h_to_d_async(dst, host.as_ptr() as *const c_void, host.len() * 2, stream).unwrap();
-}
-fn upload_i32(dst: u64, host: &[i32], stream: u64) {
-    copy_h_to_d_async(dst, host.as_ptr() as *const c_void, host.len() * 4, stream).unwrap();
-}
-
 fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[i32]) -> Vec<bf16> {
     let ctx = CudaCtx::new(0).expect("cuda init");
     let attn = TiledAttention::new(dims(tile_size)).unwrap();
@@ -66,9 +57,15 @@ fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[
     let tile_blocks_dev = DeviceBuffer::new(NUM_SEQS * tile_size * 4).unwrap();
     let tile_counts_dev = DeviceBuffer::new(NUM_SEQS * 4).unwrap();
     let output_dev = DeviceBuffer::new(NUM_SEQS * NUM_Q_HEADS * HEAD_DIM * 2).unwrap();
-    upload_bf16(q_dev.ptr, q, ctx.stream);
-    upload_bf16(k_dev.ptr, k, ctx.stream);
-    upload_bf16(v_dev.ptr, v, ctx.stream);
+    copy_h_to_d_group(
+        &[
+            HostToDeviceCopy::new(q_dev.ptr, q),
+            HostToDeviceCopy::new(k_dev.ptr, k),
+            HostToDeviceCopy::new(v_dev.ptr, v),
+        ],
+        ctx.stream,
+    )
+    .unwrap();
     attn.begin_step(&ctx, NUM_SEQS).unwrap();
 
     let n_tiles = block_table.len().div_ceil(tile_size);
@@ -80,8 +77,14 @@ fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[
         let mut tile = vec![0_i32; tile_size];
         tile[..n].copy_from_slice(&block_table[start..end]);
         let counts = vec![n as i32; NUM_SEQS];
-        upload_i32(tile_blocks_dev.ptr, &tile, ctx.stream);
-        upload_i32(tile_counts_dev.ptr, &counts, ctx.stream);
+        copy_h_to_d_group(
+            &[
+                HostToDeviceCopy::new(tile_blocks_dev.ptr, &tile),
+                HostToDeviceCopy::new(tile_counts_dev.ptr, &counts),
+            ],
+            ctx.stream,
+        )
+        .unwrap();
         let (s_blk, s_tok, s_kvh) = attn.paged_strides();
         attn.step_tile(
             &ctx,
@@ -100,14 +103,7 @@ fn run_gpu(tile_size: usize, q: &[bf16], k: &[bf16], v: &[bf16], block_table: &[
     }
     attn.finalize(&ctx, output_dev.ptr, NUM_SEQS).unwrap();
     let mut out = vec![bf16::from_f32(0.0); NUM_SEQS * NUM_Q_HEADS * HEAD_DIM];
-    copy_d_to_h_async(
-        out.as_mut_ptr() as *mut c_void,
-        output_dev.ptr,
-        out.len() * 2,
-        ctx.stream,
-    )
-    .unwrap();
-    stream_sync(ctx.stream).unwrap();
+    copy_d_to_h(&mut out, output_dev.ptr, ctx.stream).unwrap();
     out
 }
 

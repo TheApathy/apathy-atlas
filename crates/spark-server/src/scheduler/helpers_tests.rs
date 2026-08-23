@@ -232,6 +232,50 @@ fn exact_prose_loop_still_caught_regression() {
 }
 
 #[test]
+fn aeon_observed_ten_token_cycle_is_caught_in_both_phases() {
+    // Captured verbatim from the stalled AEON run on the archived 2026-08-15
+    // binary.  That binary emitted this exact ten-token cycle tens of
+    // thousands of times.  Current speculative emission must recognize it
+    // whether the request still believes it is reasoning or has entered the
+    // content phase.
+    const CYCLE: [u32; 10] = [15, 20, 18, 92, 198, 59, 76367, 90, 19, 13];
+    let mut tokens: Vec<u32> = (900u32..996).collect();
+    for _ in 0..42 {
+        tokens.extend(CYCLE);
+    }
+
+    assert!(detect_thinking_token_loop(&tokens));
+    assert!(detect_content_token_loop(&tokens));
+    assert!(detect_catastrophic_content_loop(&tokens));
+}
+
+#[test]
+fn catastrophic_guard_requires_32_contiguous_cycles() {
+    const CYCLE: [u32; 10] = [15, 20, 18, 92, 198, 59, 76367, 90, 19, 13];
+    let mut tokens: Vec<u32> = (0u32..202).collect();
+    for _ in 0..31 {
+        tokens.extend(CYCLE);
+    }
+    assert_eq!(tokens.len(), 512);
+    assert!(!detect_catastrophic_content_loop(&tokens));
+
+    tokens.extend(CYCLE);
+    assert!(detect_catastrophic_content_loop(&tokens));
+}
+
+#[test]
+fn catastrophic_guard_rejects_scattered_repetition() {
+    const CYCLE: [u32; 10] = [15, 20, 18, 92, 198, 59, 76367, 90, 19, 13];
+    let mut tokens = Vec::new();
+    for separator in 0..40u32 {
+        tokens.extend(CYCLE);
+        tokens.push(100_000 + separator);
+    }
+    tokens.resize(CATASTROPHIC_LOOP_MIN_TOKENS, 42);
+    assert!(!detect_catastrophic_content_loop(&tokens));
+}
+
+#[test]
 fn norm_fires_on_variable_length_digit_runs() {
     // The real shape: `- B(46) = 104509868777\n` — digit-level
     // tokenizer, so the index and value are RUNS of single-digit
