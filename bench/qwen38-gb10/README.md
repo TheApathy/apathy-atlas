@@ -6,7 +6,7 @@ Qwen3.8-27B on a DGX Spark (GB10).
 ```bash
 git clone https://github.com/TheApathy/apathy-atlas.git
 cd apathy-atlas
-git checkout qwen38/gb10-perf-and-packaging
+git checkout perf/qwen38-gb10-dflash
 ```
 
 Related work: Avarok-Cybersecurity/atlas#648 integrates DFlash2 for the same
