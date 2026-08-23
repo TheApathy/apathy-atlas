@@ -92,7 +92,23 @@ def main() -> int:
         runs.append(run)
         print(json.dumps(run, sort_keys=True), flush=True)
 
-    rates = [run["server_response_tokens_per_second"] for run in runs]
+    # `server_response_tokens_per_second` is an Atlas extension; a stock
+    # OpenAI-compatible server (vLLM, and anything else you might baseline
+    # against) does not return it. Fall back to completion_tokens/wall_seconds
+    # so the probe still reports a rate instead of dying after doing all the
+    # work — the client-side figure includes request overhead and so reads
+    # slightly low, which is why the server figure is preferred when present.
+    rates = [
+        run["server_response_tokens_per_second"]
+        if run["server_response_tokens_per_second"] is not None
+        else (run["completion_tokens"] / run["wall_seconds"] if run["wall_seconds"] else 0.0)
+        for run in runs
+    ]
+    rate_source = (
+        "server"
+        if all(run["server_response_tokens_per_second"] is not None for run in runs)
+        else "client_wall_clock"
+    )
     fingerprints = {
         (
             run["stable_output_sha256"],
@@ -113,6 +129,7 @@ def main() -> int:
         "request_body": body,
         "runs": runs,
         "median_server_response_tokens_per_second": statistics.median(rates),
+        "rate_source": rate_source,
         "deterministic": len(fingerprints) == 1,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
