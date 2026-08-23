@@ -77,10 +77,14 @@ RUN apt-get update -qq && \
       libnccl2 libibverbs1 librdmacm1 ibverbs-providers \
       libnl-3-200 libnl-route-3-200 && \
     rm -rf /var/lib/apt/lists/* && \
-    NCCL_VER=$(dpkg-query -W -f='${Version}' libnccl2) && \
+    NCCL_VER=$(dpkg-query -W -f='${Version}' libnccl2 2>/dev/null); \
+    if [ -z "$NCCL_VER" ]; then \
+      echo "ERROR: libnccl2 is not installed — the install step above failed"; exit 1; \
+    fi && \
     echo "Linked NCCL: $NCCL_VER" && \
-    dpkg --compare-versions "$NCCL_VER" ge "2.28" || \
-      (echo "ERROR: NCCL $NCCL_VER < 2.28 — symmetric memory APIs unavailable" && exit 1)
+    if ! dpkg --compare-versions "$NCCL_VER" ge "2.28"; then \
+      echo "ERROR: NCCL $NCCL_VER < 2.28 — symmetric memory APIs unavailable"; exit 1; \
+    fi
 
 COPY --from=builder /build/target/release/spark /usr/local/bin/spark
 # Match docker/gb10/Dockerfile, the only image in this tree that has been
