@@ -189,7 +189,7 @@ impl Qwen3AttentionLayer {
         } else if let Some(nvfp4) = weight_opt.and_then(|w| w.as_nvfp4()) {
             if crate::layers::prefill_proj_pipe_enabled()
                 && self.w4a16_gemm_pipe_k.0 != 0
-                && h % 64 == 0
+                && h.is_multiple_of(64)
             {
                 // Byte-exact pipelined shadow of the baseline below (see
                 // `prefill_proj_pipe_enabled`). Same dequant + MMA arithmetic,

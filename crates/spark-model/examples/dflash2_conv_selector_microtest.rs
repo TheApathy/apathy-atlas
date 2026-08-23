@@ -149,7 +149,7 @@ fn selector_ref(
     let mut margins = Vec::with_capacity(gamma);
     let mut pred = anchor as usize;
     for pos in 0..gamma {
-        let mut scores = vec![0.0f64; TOP_K];
+        let mut scores = [0.0f64; TOP_K];
         for k in 0..TOP_K {
             let cand = candidates[pos * TOP_K + k] as usize;
             let mut acc = 0.0f64;
@@ -232,8 +232,7 @@ fn test_conv(
         let l = i / (KERNEL_SIZE * groups);
         let o = (i / groups) % KERNEL_SIZE;
         let g = i % groups;
-        bf16_to_f32(dyn1[i])
-            == bf16_to_f32(dynamic[l * dyn_width + (1 * KERNEL_SIZE + o) * groups + g])
+        bf16_to_f32(dyn1[i]) == bf16_to_f32(dynamic[l * dyn_width + (KERNEL_SIZE + o) * groups + g])
     });
     eprintln!(
         "DIAG: dyn1_ok={dyn1_ok} dyn1[0..3]={:?} dyn[stage1 0..3]={:?}",
@@ -241,7 +240,7 @@ fn test_conv(
             .iter()
             .map(|&v| bf16_to_f32(v))
             .collect::<Vec<_>>(),
-        dynamic[1 * KERNEL_SIZE * groups..1 * KERNEL_SIZE * groups + 3]
+        dynamic[KERNEL_SIZE * groups..KERNEL_SIZE * groups + 3]
             .iter()
             .map(|&v| bf16_to_f32(v))
             .collect::<Vec<_>>()
@@ -292,8 +291,7 @@ fn test_conv(
         for o in 0..KERNEL_SIZE {
             for g in 0..groups {
                 let got_v = bf16_to_f32(dyn1[l * KERNEL_SIZE * groups + o * groups + g]);
-                let exp_v =
-                    bf16_to_f32(dynamic[l * dyn_width + (1 * KERNEL_SIZE + o) * groups + g]);
+                let exp_v = bf16_to_f32(dynamic[l * dyn_width + (KERNEL_SIZE + o) * groups + g]);
                 ensure!(
                     (got_v - exp_v).abs() < 1e-6,
                     "conv dyn1 export mismatch at ({l},{o},{g}): {got_v} vs {exp_v}"

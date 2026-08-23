@@ -153,7 +153,7 @@ impl Qwen3SsmLayer {
         } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
             if crate::layers::prefill_proj_pipe_enabled()
                 && self.w4a16_gemm_pipe_k.0 != 0
-                && (h as u32) % 64 == 0
+                && (h as u32).is_multiple_of(64)
             {
                 // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
                 // K = h must be a multiple of the pipe's 64-row stage.

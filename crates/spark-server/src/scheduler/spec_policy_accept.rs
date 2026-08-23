@@ -512,10 +512,7 @@ mod fast_argmax_tests {
             for j in 0..vocab {
                 // Mix of signs and magnitudes; includes exact ties via the
                 // quantized pool.
-                let pool = [
-                    (next() * 200.0 - 100.0) as f32,
-                    ((next() * 20.0) as i32 as f32),
-                ];
+                let pool = [(next() * 200.0 - 100.0), ((next() * 20.0) as i32 as f32)];
                 let v = if trial % 3 == 0 { pool[0] } else { pool[1] };
                 row[2 * j..2 * j + 2].copy_from_slice(&bf16(v).to_le_bytes());
             }

@@ -19,12 +19,12 @@ use super::tool_handlers::{
 
 type SseVec = Vec<Result<Event, std::convert::Infallible>>;
 
-fn resolved_finish_reason<'a>(
-    finish_reason: &'a str,
+fn resolved_finish_reason(
+    finish_reason: &str,
     tool_loop_capped: bool,
     has_tool_calls: bool,
     loop_watchdog_triggered: bool,
-) -> &'a str {
+) -> &str {
     if tool_loop_capped {
         // Tool loops must remain visibly truncated so agent clients do not
         // execute another tool round and perpetuate the outer loop.

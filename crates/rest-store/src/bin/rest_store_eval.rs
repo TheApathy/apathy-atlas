@@ -28,7 +28,10 @@ use rest_store::{
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
-#[command(name = "rest-store-eval", about = "Replay generations against a REST draft store")]
+#[command(
+    name = "rest-store-eval",
+    about = "Replay generations against a REST draft store"
+)]
 struct Args {
     /// Store built by `rest-store-build`.
     #[arg(long)]
@@ -160,7 +163,11 @@ fn load_jsonl(
         let mut tokens = enc_prompt.get_ids().to_vec();
         tokens.extend_from_slice(enc_completion.get_ids());
         if tokens.len() > score_from + 1 {
-            out.push(Sample { tokens, score_from, skip: Vec::new() });
+            out.push(Sample {
+                tokens,
+                score_from,
+                skip: Vec::new(),
+            });
         }
     }
     Ok(out)
@@ -169,8 +176,8 @@ fn load_jsonl(
 fn load_files(paths: &[PathBuf], tok: &Tokenizer, strip: bool) -> Result<Vec<Sample>> {
     let mut out = Vec::new();
     for p in paths {
-        let text = std::fs::read_to_string(p)
-            .with_context(|| format!("reading {}", p.display()))?;
+        let text =
+            std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
         let enc = tok
             .encode(text.as_str(), false)
             .map_err(|e| anyhow::anyhow!("tokenizing {}: {e}", p.display()))?;

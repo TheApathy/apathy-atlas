@@ -80,11 +80,14 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
-        } else if crate::layers::prefill_proj_fast_enabled() && self.o_nvfp4_t.is_some() {
+        } else if let Some(nvfp4_t) = self
+            .o_nvfp4_t
+            .as_ref()
+            .filter(|_| crate::layers::prefill_proj_fast_enabled())
+        {
             // Correctness lever: when the transposed-TC prefill gate is off,
             // fall through to the non-transposed M64 `w4a16_gemm` below
             // (same class as ATLAS_PREFILL_FFN_FAST=0).
-            let nvfp4_t = self.o_nvfp4_t.as_ref().unwrap();
             if n > 128 {
                 self.w4a16_gemm_m128_dispatch(
                     ctx.gpu,
@@ -138,37 +141,35 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
+        } else if crate::layers::prefill_proj_pipe_enabled()
+            && self.w4a16_gemm_pipe_k.0 != 0
+            && (nq * hd).is_multiple_of(64)
+        {
+            // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
+            // K = nq*hd must be a multiple of the pipe's 64-row stage.
+            ops::w4a16_gemm_pipe(
+                ctx.gpu,
+                self.w4a16_gemm_pipe_k,
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                n,
+                h,
+                nq * hd,
+                stream,
+            )?;
         } else {
-            if crate::layers::prefill_proj_pipe_enabled()
-                && self.w4a16_gemm_pipe_k.0 != 0
-                && (nq * hd) % 64 == 0
-            {
-                // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
-                // K = nq*hd must be a multiple of the pipe's 64-row stage.
-                ops::w4a16_gemm_pipe(
-                    ctx.gpu,
-                    self.w4a16_gemm_pipe_k,
-                    attn_out,
-                    &self.attn.o_proj,
-                    o_out,
-                    n,
-                    h,
-                    nq * hd,
-                    stream,
-                )?;
-            } else {
-                ops::w4a16_gemm(
-                    ctx.gpu,
-                    self.w4a16_gemm_k,
-                    attn_out,
-                    &self.attn.o_proj,
-                    o_out,
-                    n,
-                    h,
-                    nq * hd,
-                    stream,
-                )?;
-            }
+            ops::w4a16_gemm(
+                ctx.gpu,
+                self.w4a16_gemm_k,
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                n,
+                h,
+                nq * hd,
+                stream,
+            )?;
         }
         Ok(o_out)
     }

@@ -57,15 +57,30 @@ fn every_qualified_nvfp4_batch_uses_exact_or_serial_k1() {
     assert!(body.contains("ExactLmHeadRoute::SerialK1"));
     assert!(body.contains("for row in 0..num_tokens"));
 
+    // Unconditionally forbidden: these routes have no gate and would silently
+    // demote the qualified path.
     for forbidden in [
         "w4a16_gemv_batch2(",
         "w4a16_gemv_batch3_logits(",
-        "w4a16_gemm_n64_m32_ldb(",
         "w4a16_gemm(",
     ] {
         assert!(
             !body.contains(forbidden),
             "qualified production body retained lossy route {forbidden}"
+        );
+    }
+
+    // `w4a16_gemm_n64_m32_ldb` IS permitted, but only behind the
+    // `ATLAS_LM_HEAD_TC` gate. It is a deliberate tensor-core re-reference
+    // (REFREEZE 2026-08-17, reference hash 12e0c0ad), not an accident: the MMA
+    // reduction order differs from the scalar oracle, so it must never become
+    // reachable without the operator opting in. The guard therefore asserts
+    // the gate, not the absence of the call — an ungated appearance is still a
+    // failure.
+    if let Some(offset) = body.find("w4a16_gemm_n64_m32_ldb(") {
+        assert!(
+            body[..offset].contains("lm_head_tc_enabled()"),
+            "tensor-core LM-head route is reachable without the ATLAS_LM_HEAD_TC gate"
         );
     }
 }

@@ -97,11 +97,11 @@ impl Dflash3Config {
                 }
             }
         }
-        if let Ok(path) = std::env::var("ATLAS_DFLASH3_CONFIG") {
-            if !path.is_empty() {
-                cfg.config_path = Some(PathBuf::from(&path));
-                cfg.apply_toml_file(&path);
-            }
+        if let Ok(path) = std::env::var("ATLAS_DFLASH3_CONFIG")
+            && !path.is_empty()
+        {
+            cfg.config_path = Some(PathBuf::from(&path));
+            cfg.apply_toml_file(&path);
         }
         cfg
     }
@@ -200,8 +200,10 @@ mod tests {
 
     #[test]
     fn attestation_names_the_mode() {
-        let mut cfg = Dflash3Config::default();
-        cfg.mode = Dflash3Mode::Shadow;
+        let cfg = Dflash3Config {
+            mode: Dflash3Mode::Shadow,
+            ..Dflash3Config::default()
+        };
         assert!(cfg.attestation().contains("mode=shadow"));
         assert!(cfg.attestation().contains("schema=1"));
     }

@@ -81,10 +81,13 @@ impl Qwen3SsmLayer {
             .map_err(|e| {
                 anyhow::anyhow!("ssm prefill: QKVZ FP8 GEMM failed (M={k}, N={qkvz_size}): {e}")
             })?;
-        } else if crate::layers::prefill_proj_fast_enabled() && self.qkvz_nvfp4_t.is_some() {
+        } else if let Some(nvfp4_t) = self
+            .qkvz_nvfp4_t
+            .as_ref()
+            .filter(|_| crate::layers::prefill_proj_fast_enabled())
+        {
             // Correctness lever: fall through to non-transposed M64 when the
             // prefill-projection transposed-TC gate is off.
-            let nvfp4_t = self.qkvz_nvfp4_t.as_ref().unwrap();
             if k > 128 {
                 ops::w4a16_gemm_n128_m128(
                     ctx.gpu,

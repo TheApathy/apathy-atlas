@@ -26,7 +26,10 @@ use clap::Parser;
 use rest_store::symgen::{emit_file, module_path_for};
 
 #[derive(Parser, Debug)]
-#[command(name = "rest-store-symbols", about = "Harvest Rust symbols into draft-shaped text")]
+#[command(
+    name = "rest-store-symbols",
+    about = "Harvest Rust symbols into draft-shaped text"
+)]
 struct Args {
     /// Repo roots to harvest `.rs` files from.
     #[arg(long)]
@@ -61,7 +64,11 @@ struct Args {
     holdout_list: Option<PathBuf>,
 
     /// Directory names never descended into.
-    #[arg(long, value_delimiter = ',', default_value = ".git,target,node_modules,.venv")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = ".git,target,node_modules,.venv"
+    )]
     skip_dir: Vec<String>,
 }
 
@@ -89,7 +96,9 @@ fn collect_rs(root: &Path, skip: &[String]) -> Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+        {
             let entry = entry?;
             let path = entry.path();
             let ft = entry.file_type()?;
@@ -99,7 +108,11 @@ fn collect_rs(root: &Path, skip: &[String]) -> Result<Vec<(String, PathBuf)>> {
                     stack.push(path);
                 }
             } else if ft.is_file() && name.ends_with(".rs") {
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
                 out.push((rel, path));
             }
         }
@@ -125,7 +138,9 @@ fn main() -> Result<()> {
     let (mut n_fns, mut n_types, mut n_uses) = (0usize, 0usize, 0usize);
 
     for root in &args.root {
-        let root_name = root.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let root_name = root
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         for (rel, abs) in collect_rs(root, &args.skip_dir)? {
             // Hash the root-qualified path so two roots with the same
             // internal layout do not receive an identical partition.
@@ -172,7 +187,10 @@ fn main() -> Result<()> {
     }
 
     println!("rest-store-symbols");
-    println!("  files harvested  {n_kept}  ({} held out, {n_parse_fail} unreadable)", held.len());
+    println!(
+        "  files harvested  {n_kept}  ({} held out, {n_parse_fail} unreadable)",
+        held.len()
+    );
     println!("  symbols          {n_fns} fns, {n_types} types, {n_uses} use lines");
     println!(
         "  emitted          {shard} shards in {} -> {:.2} MiB",
@@ -194,15 +212,28 @@ mod tests {
 
     #[test]
     fn holdout_is_deterministic_and_roughly_the_requested_size() {
-        let paths: Vec<String> = (0..4000).map(|i| format!("crates/c{}/src/m{i}.rs", i % 17)).collect();
+        let paths: Vec<String> = (0..4000)
+            .map(|i| format!("crates/c{}/src/m{i}.rs", i % 17))
+            .collect();
         let picked = |seed: u64| -> Vec<&String> {
-            paths.iter().filter(|p| is_held_out(p, 0.15, seed)).collect()
+            paths
+                .iter()
+                .filter(|p| is_held_out(p, 0.15, seed))
+                .collect()
         };
         let a = picked(7);
-        assert_eq!(a, picked(7), "same seed must reproduce the partition exactly");
+        assert_eq!(
+            a,
+            picked(7),
+            "same seed must reproduce the partition exactly"
+        );
         let frac = a.len() as f64 / paths.len() as f64;
         assert!((0.13..0.17).contains(&frac), "got {frac}");
-        assert_ne!(a.len(), picked(8).len(), "a different seed must move the split");
+        assert_ne!(
+            a.len(),
+            picked(8).len(),
+            "a different seed must move the split"
+        );
     }
 
     #[test]

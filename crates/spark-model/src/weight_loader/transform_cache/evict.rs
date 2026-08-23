@@ -504,7 +504,7 @@ mod tests {
         // inside the 1h torn grace, i.e. plausibly a cold build in flight.
         let building = dir("building", 5, None, 30 * 60, false);
         assert!(
-            select_victims(&[building.clone()], "zzz", 0, 0, NOW).is_empty(),
+            select_victims(std::slice::from_ref(&building), "zzz", 0, 0, NOW).is_empty(),
             "a half-written build must not be deleted out from under its writer"
         );
 

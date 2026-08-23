@@ -77,6 +77,9 @@ fn ssm_qkvz_covers_gated_attention_q_staging() {
         );
         // The same buffer still has to hold the prefill K+V staging.
         let kv_staging = m * 2 * cfg.num_key_value_heads * cfg.head_dim * 2;
-        assert!(sizes.ssm_qkvz >= kv_staging, "m={m}: ssm_qkvz < K+V staging");
+        assert!(
+            sizes.ssm_qkvz >= kv_staging,
+            "m={m}: ssm_qkvz < K+V staging"
+        );
     }
 }

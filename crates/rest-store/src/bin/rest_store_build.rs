@@ -94,9 +94,9 @@ fn main() -> Result<()> {
         anyhow::bail!("--holdout-frac only applies to --jsonl rows, but no --jsonl was given");
     }
     let opts = CorpusOptions {
-        extensions: args.ext.unwrap_or_else(|| {
-            DEFAULT_EXTENSIONS.iter().map(|s| s.to_string()).collect()
-        }),
+        extensions: args
+            .ext
+            .unwrap_or_else(|| DEFAULT_EXTENSIONS.iter().map(|s| s.to_string()).collect()),
         max_file_bytes: args.max_file_bytes,
         sep_token: args.sep_token,
         jsonl: args.jsonl,
@@ -140,10 +140,7 @@ fn main() -> Result<()> {
             args.holdout_seed
         );
     }
-    println!(
-        "  corpus text      {:.1} MiB",
-        mib(stats.corpus_bytes)
-    );
+    println!("  corpus text      {:.1} MiB", mib(stats.corpus_bytes));
     println!(
         "  tokens           {} ({:.2} bytes/token)",
         stats.n_tokens,

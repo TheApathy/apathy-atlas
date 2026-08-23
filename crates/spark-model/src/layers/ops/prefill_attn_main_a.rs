@@ -159,20 +159,6 @@ pub fn prefill_attention_query_range(
         .launch(stream)
 }
 
-#[cfg(test)]
-mod query_range_tests {
-    use super::valid_attention_query_range;
-
-    #[test]
-    fn tail_query_range_keeps_full_kv_extent() {
-        assert!(valid_attention_query_range(526, 512, 14));
-        assert!(valid_attention_query_range(14, 0, 14));
-        assert!(!valid_attention_query_range(526, 512, 15));
-        assert!(!valid_attention_query_range(526, 512, 0));
-        assert!(!valid_attention_query_range(u32::MAX, u32::MAX, 2));
-    }
-}
-
 /// Contiguous prefill Flash Attention — FP8 E4M3 K/V variant (BR=64).
 ///
 /// Q is BF16, K/V are FP8 E4M3 (dequantized to BF16 in shared memory).
@@ -375,4 +361,18 @@ pub fn prefill_attention_paged_fp8_dflash(
         .arg_f32(v_scale)
         .arg_u64(cache_stride)
         .launch(stream)
+}
+
+#[cfg(test)]
+mod query_range_tests {
+    use super::valid_attention_query_range;
+
+    #[test]
+    fn tail_query_range_keeps_full_kv_extent() {
+        assert!(valid_attention_query_range(526, 512, 14));
+        assert!(valid_attention_query_range(14, 0, 14));
+        assert!(!valid_attention_query_range(526, 512, 15));
+        assert!(!valid_attention_query_range(526, 512, 0));
+        assert!(!valid_attention_query_range(u32::MAX, u32::MAX, 2));
+    }
 }

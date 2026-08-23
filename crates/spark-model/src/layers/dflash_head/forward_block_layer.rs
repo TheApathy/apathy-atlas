@@ -216,7 +216,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         use crate::layers::ops;
         let gpu = ctx.gpu;
-        let noise_bytes = noise_count as usize * conv.groups as usize * 16 * 2;
+        let noise_bytes = noise_count as usize * conv.groups * 16 * 2;
         ops::dflash2_conv_finish(
             gpu,
             self.kernels.dflash2_conv_finish,

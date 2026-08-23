@@ -368,10 +368,12 @@ mod tests {
             (7.0..7.3).contains(&drafter),
             "the break-even this gate was tuned against moved: {drafter}"
         );
-        assert!(
-            DEFAULT_MIN_MATCH >= 12,
-            "below 12 the eval measured fewer accepted tokens than the drafter it pre-empts"
-        );
+        const {
+            assert!(
+                DEFAULT_MIN_MATCH >= 12,
+                "below 12 the eval measured fewer accepted tokens than the drafter it pre-empts"
+            )
+        };
     }
 
     #[test]

@@ -3051,8 +3051,8 @@ impl DenseFfnLayer {
         // so any future topology change falls back to the exact baseline.
         if crate::layers::prefill_ffn_pipe_enabled()
             && self.w4a16_gemm_pipe.0 != 0
-            && h % 64 == 0
-            && inter % 64 == 0
+            && h.is_multiple_of(64)
+            && inter.is_multiple_of(64)
         {
             ops::w4a16_gemm_pipe(
                 ctx.gpu,

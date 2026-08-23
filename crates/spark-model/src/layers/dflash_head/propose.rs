@@ -70,30 +70,6 @@ fn retrieval_lookup(
     }
 }
 
-#[cfg(test)]
-mod corroboration_tests {
-    use super::retrieval_corroborates_drafter;
-
-    #[test]
-    fn requires_a_longer_chain_and_matching_prefix() {
-        assert!(retrieval_corroborates_drafter(
-            &[1, 2, 3, 4, 9, 9],
-            &[1, 2, 3, 4, 5, 6, 7],
-            4,
-        ));
-        assert!(!retrieval_corroborates_drafter(
-            &[1, 2, 3, 4, 9, 9],
-            &[1, 2, 3, 8, 5, 6, 7],
-            4,
-        ));
-        assert!(!retrieval_corroborates_drafter(
-            &[1, 2, 3, 4],
-            &[1, 2, 3, 4],
-            4,
-        ));
-    }
-}
-
 impl BlockDiffusionDraftHead {
     pub(super) fn propose_drafts(
         &self,
@@ -1917,5 +1893,29 @@ impl BlockDiffusionDraftHead {
             dstate.pending_tree_payload = None;
         }
         Ok(drafts)
+    }
+}
+
+#[cfg(test)]
+mod corroboration_tests {
+    use super::retrieval_corroborates_drafter;
+
+    #[test]
+    fn requires_a_longer_chain_and_matching_prefix() {
+        assert!(retrieval_corroborates_drafter(
+            &[1, 2, 3, 4, 9, 9],
+            &[1, 2, 3, 4, 5, 6, 7],
+            4,
+        ));
+        assert!(!retrieval_corroborates_drafter(
+            &[1, 2, 3, 4, 9, 9],
+            &[1, 2, 3, 8, 5, 6, 7],
+            4,
+        ));
+        assert!(!retrieval_corroborates_drafter(
+            &[1, 2, 3, 4],
+            &[1, 2, 3, 4],
+            4,
+        ));
     }
 }

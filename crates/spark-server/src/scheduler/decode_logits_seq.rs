@@ -63,12 +63,12 @@ pub fn process_seq_logits(
     // Inert at floor 0 (default) and never overrides a forced close.
     if a.inside_thinking && !a.force_end_thinking && !a.think_ended {
         let floor = crate::scheduler::helpers::min_thinking_floor();
-        if floor > 0 && a.thinking_tokens < floor {
-            if let Some(end) = think_end_token {
-                if (end as usize) < f32_logits.len() {
-                    f32_logits[end as usize] = f32::NEG_INFINITY;
-                }
-            }
+        if floor > 0
+            && a.thinking_tokens < floor
+            && let Some(end) = think_end_token
+            && (end as usize) < f32_logits.len()
+        {
+            f32_logits[end as usize] = f32::NEG_INFINITY;
         }
     }
 

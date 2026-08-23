@@ -1,7 +1,7 @@
 # Fork vs upstream — what we changed and what it bought
 
 A curated engineering record of how `TheApathy/apathy-atlas` (branch
-`flocka/abliterated-gb10-fixes`) differs from `Avarok-Cybersecurity/atlas`,
+`qwen38/gb10-perf-and-packaging`) differs from `Avarok-Cybersecurity/atlas`,
 grouped by subsystem, with the measured effect where one exists and an explicit
 "no measured effect" where one does not.
 
@@ -24,10 +24,10 @@ parts that did.
 
 | | |
 |---|---|
-| Fork HEAD | `e8b00332` (2026-08-15) |
-| Upstream `main` | `3e8c8f0d` (2026-08-17) |
+| Fork HEAD | `088a6fee` (2026-08-23) |
+| Upstream `main` | `00cf2c41` (2026-08-23) |
 | Merge base | `ddc7080f` (2026-05-24) |
-| Commits ahead | 286 |
+| Commits ahead | 296 |
 | Commits behind | 201 |
 | Diff | 594 files, +126,455 / −3,283 |
 

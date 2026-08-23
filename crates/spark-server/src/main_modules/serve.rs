@@ -658,9 +658,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
                 }
             }
         });
-        tracing::info!(
-            "runtime profile toggle armed: SIGUSR1=enable SIGUSR2=disable"
-        );
+        tracing::info!("runtime profile toggle armed: SIGUSR1=enable SIGUSR2=disable");
     }
 
     // 9-11. Build router + start HTTP server (extracted: serve_router.rs).

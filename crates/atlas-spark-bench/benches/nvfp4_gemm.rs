@@ -203,7 +203,7 @@ fn fp8_e4m3_to_float(b: u8) -> f32 {
 // when validating Path B.
 fn quant_bf16_row_to_nvfp4(row_bf16: &[u16], scale2: f32) -> (Vec<u8>, Vec<u8>) {
     let k = row_bf16.len();
-    assert!(k % GROUP_SIZE as usize == 0);
+    assert!(k.is_multiple_of(GROUP_SIZE as usize));
     let num_groups = k / GROUP_SIZE as usize;
     let mut packed = vec![0u8; k / 2];
     let mut scales = vec![0u8; num_groups];

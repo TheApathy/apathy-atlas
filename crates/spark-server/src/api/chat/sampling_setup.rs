@@ -64,9 +64,7 @@ pub(super) fn build_sampling(
     // the MODEL.toml presets are the vendor-recommended regime.
     let ignore_req_sampling = {
         static IG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *IG.get_or_init(|| {
-            std::env::var("ATLAS_IGNORE_REQUEST_SAMPLING").as_deref() == Ok("1")
-        })
+        *IG.get_or_init(|| std::env::var("ATLAS_IGNORE_REQUEST_SAMPLING").as_deref() == Ok("1"))
     };
     let (req_temperature, req_top_k, req_top_p) = if ignore_req_sampling {
         (None, None, None)
@@ -79,10 +77,13 @@ pub(super) fn build_sampling(
     let temp_override = {
         static T: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
         *T.get_or_init(|| {
-            std::env::var("ATLAS_TEMP_OVERRIDE").ok().and_then(|v| v.parse().ok())
+            std::env::var("ATLAS_TEMP_OVERRIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
         })
     };
-    let temperature = temp_override.unwrap_or_else(|| req_temperature.unwrap_or(preset.temperature));
+    let temperature =
+        temp_override.unwrap_or_else(|| req_temperature.unwrap_or(preset.temperature));
     let top_k = req_top_k.unwrap_or(preset.top_k);
     let top_p = req_top_p.unwrap_or(preset.top_p);
     let top_n_sigma = req.top_n_sigma.unwrap_or(state.default_top_n_sigma);
