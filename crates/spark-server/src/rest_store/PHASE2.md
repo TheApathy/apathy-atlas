@@ -9,7 +9,7 @@ did — what has to be true before it is worth doing.
 
 Replaying 1096 real Qwen3.8 generations (`regen_qwen38.jsonl`,
 777 338 decode steps) against a 16.9 M-token store built from
-`/home/flocka/atlas/src` + `qwen38/benchmark`:
+`<repo-root>` + `qwen38/benchmark`:
 
 | min_match | engagement | accepted lookahead / engaged step | / decode step |
 |---|---|---|---|

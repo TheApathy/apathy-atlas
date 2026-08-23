@@ -3,8 +3,12 @@
 # Strict no-regression rule: any config that loses on essay OR creative vs the
 # K=3 MTP reference (22.75 / 21.70) gets a ❌ marker.
 set -uo pipefail
-ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
-MODELS=/home/flocka/models
+# Repo root is derived from this script's location so the harness runs from
+# any checkout. Override MODELS to point at your checkpoint directory.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MODELS="${MODELS:-$HOME/models}"
+ATLAS_BIN=$REPO_ROOT/target/release/spark
+MODELS=$MODELS
 PORT=8890
 LOG=/tmp/per_metric_sweep.log
 
@@ -18,7 +22,7 @@ run() {
     if curl -sf "http://localhost:$PORT/v1/models" -o /dev/null 2>&1; then break; fi
     sleep 5
   done
-  cd /home/flocka/atlas/src/bench
+  cd $REPO_ROOT/bench
   python3 bench_aeon27b.py "$PORT" "$label" 2 512 2>&1 | tee -a "$LOG" | tail -7
   kill -9 $SPARK_PID 2>/dev/null || true
   wait $SPARK_PID 2>/dev/null || true
@@ -38,7 +42,7 @@ run k3_mtp_baseline env "$ATLAS_BIN" serve \
   --mtp-quantization nvfp4 --mtp-vocab 32000 \
   --ssm-cache-slots 16 --ssm-checkpoint-interval 16 --max-prefill-tokens 1024 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 run k3_mtp_fp8quant env "$ATLAS_BIN" serve \
   --model-from-path "$MODELS/AEON-Q36-27B-XS" \
@@ -48,7 +52,7 @@ run k3_mtp_fp8quant env "$ATLAS_BIN" serve \
   --enable-prefix-caching --speculative --num-drafts 2 \
   --mtp-quantization fp8 --mtp-vocab 32000 \
   --ssm-cache-slots 16 --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 run k3_mtp_vocab100k env "$ATLAS_BIN" serve \
   --model-from-path "$MODELS/AEON-Q36-27B-XS" \
@@ -58,7 +62,7 @@ run k3_mtp_vocab100k env "$ATLAS_BIN" serve \
   --enable-prefix-caching --speculative --num-drafts 2 \
   --mtp-quantization nvfp4 --mtp-vocab 100000 \
   --ssm-cache-slots 16 --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 run k3_mtp_prefillfast env ATLAS_PREFILL_FFN_FAST=1 ATLAS_FFN_M16_TRANSPOSED=1 \
   "$ATLAS_BIN" serve \
@@ -69,7 +73,7 @@ run k3_mtp_prefillfast env ATLAS_PREFILL_FFN_FAST=1 ATLAS_FFN_M16_TRANSPOSED=1 \
   --enable-prefix-caching --speculative --num-drafts 2 \
   --mtp-quantization nvfp4 --mtp-vocab 32000 \
   --ssm-cache-slots 16 --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 # DFlash with smaller γ + v2 drafter
 run dflash_g4_v2 env ATLAS_DFLASH_DRAFT_CAP=4 ATLAS_DFLASH_QUANT=nvfp4 \
@@ -84,7 +88,7 @@ run dflash_g4_v2 env ATLAS_DFLASH_DRAFT_CAP=4 ATLAS_DFLASH_QUANT=nvfp4 \
   --max-batch-size 1 --max-num-seqs 1 \
   --dflash --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash-aeon-v2" \
   --dflash-gamma 4 --dflash-quantization nvfp4 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 run dflash_g4_orig env ATLAS_DFLASH_DRAFT_CAP=4 ATLAS_DFLASH_QUANT=nvfp4 \
   ATLAS_FLASH_ATTN_KGAMMA=1 ATLAS_KGAMMA_VECDEQUANT=1 \
@@ -98,7 +102,7 @@ run dflash_g4_orig env ATLAS_DFLASH_DRAFT_CAP=4 ATLAS_DFLASH_QUANT=nvfp4 \
   --max-batch-size 1 --max-num-seqs 1 \
   --dflash --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash" \
   --dflash-gamma 4 --dflash-quantization nvfp4 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 run dflash_g8_orig env ATLAS_DFLASH_DRAFT_CAP=8 ATLAS_DFLASH_QUANT=nvfp4 \
   ATLAS_FLASH_ATTN_KGAMMA=1 ATLAS_KGAMMA_VECDEQUANT=1 \
@@ -112,7 +116,7 @@ run dflash_g8_orig env ATLAS_DFLASH_DRAFT_CAP=8 ATLAS_DFLASH_QUANT=nvfp4 \
   --max-batch-size 1 --max-num-seqs 1 \
   --dflash --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash" \
   --dflash-gamma 8 --dflash-quantization nvfp4 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt
+  --warmup-prompt $REPO_ROOT/local/warmup.txt
 
 echo ""
 echo "=== SWEEP COMPLETE ===" | tee -a "$LOG"

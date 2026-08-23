@@ -31,13 +31,16 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# Checkpoint directory; override with the MODELS env var.
+MODELS_DIR = os.environ.get("MODELS", os.path.expanduser("~/models"))
+
 CAPTURE_LAYERS = [1, 16, 31, 46, 61]
 HIDDEN = 5120
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/home/flocka/models/Qwen3.6-27B-base")
+    ap.add_argument("--model", default=os.path.join(MODELS_DIR, "Qwen3.6-27B-base"))
     ap.add_argument("--prompt", default="1 2 3 4 5")
     ap.add_argument("--n-tokens", type=int, default=20)
     ap.add_argument("--out-bin", default="/tmp/hf_target_hidden.bin")

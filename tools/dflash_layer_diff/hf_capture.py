@@ -24,7 +24,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-MODEL = os.environ.get("HF_CAPTURE_MODEL", "/home/flocka/models/AEON-Q36-27B-BF16-dequant")
+# Checkpoint directory; override with the MODELS env var.
+MODELS_DIR = os.environ.get("MODELS", os.path.expanduser("~/models"))
+
+MODEL = os.environ.get("HF_CAPTURE_MODEL", os.path.join(MODELS_DIR, "AEON-Q36-27B-BF16-dequant"))
 CAPTURE_LAYERS = [1, 16, 31, 46, 61]
 HIDDEN = 5120
 

@@ -306,7 +306,10 @@ mod tests {
     /// target's if present, otherwise skip rather than fail on a machine
     /// that has no model checkout.
     fn target_tokenizer() -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from("/home/flocka/atlas/qwen38/normal-qwen/tokenizer.json");
+        // Set REST_STORE_TEST_TOKENIZER to a tokenizer.json to enable these
+        // tests. Without it they skip, so a checkout with no model present
+        // still passes rather than failing on a missing local path.
+        let p = std::path::PathBuf::from(std::env::var("REST_STORE_TEST_TOKENIZER").ok()?);
         p.exists().then_some(p)
     }
 

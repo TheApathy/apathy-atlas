@@ -5,12 +5,16 @@
 # Sets all 5 gates ON, then unsets the named one (if any), restarts spark,
 # runs bench, writes /tmp/bench_aeon_<label>.json
 set -euo pipefail
+# Repo root is derived from this script's location so the harness runs from
+# any checkout. Override MODELS to point at your checkpoint directory.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MODELS="${MODELS:-$HOME/models}"
 
 LABEL="${1:?label required}"
 UNSET_VAR="${2:-}"
 
-ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
-MODELS=/home/flocka/models
+ATLAS_BIN=$REPO_ROOT/target/release/spark
+MODELS=$MODELS
 PORT="${PORT:-8889}"
 
 # Kill anything on the port
@@ -60,7 +64,7 @@ env "${ENV_ARGS[@]}" "$ATLAS_BIN" serve \
   --ssm-checkpoint-interval 16 \
   --max-prefill-tokens 1024 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt &
+  --warmup-prompt $REPO_ROOT/local/warmup.txt &
 SPARK_PID=$!
 
 # Wait for ready
@@ -73,7 +77,7 @@ for i in $(seq 1 60); do
 done
 
 # Run bench
-cd /home/flocka/atlas/src/bench
+cd $REPO_ROOT/bench
 python3 bench_aeon27b.py "$PORT" "$LABEL" 3 512 || true
 
 # Stop spark

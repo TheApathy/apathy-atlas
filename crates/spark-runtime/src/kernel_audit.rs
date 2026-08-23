@@ -184,6 +184,12 @@ pub fn unresolved_report(failed: &[AuditRow], model: &str, arch: &str, quant: &s
 
 #[cfg(test)]
 mod tests {
+    /// `LOG` is a process-global static and cargo runs the tests in a binary on
+    /// parallel threads, so every test that calls `reset()`/`record()` races
+    /// the others. This failed roughly one full-workspace run in three while
+    /// passing alone, single-threaded, and on repeat. Serialise them.
+    static LOG_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::*;
 
     fn row(module: &str, func: &str, loaded: bool) -> AuditRow {
@@ -213,6 +219,7 @@ mod tests {
     /// caller missed would make the list mostly noise.
     #[test]
     fn a_pair_that_resolved_anywhere_is_not_a_miss() {
+        let _g = LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let site = Location::caller();
         record("m", "f", false, site);
@@ -231,6 +238,7 @@ mod tests {
     /// unused" is the normal case and must not look like a defect.
     #[test]
     fn an_unrequested_embedded_module_is_not_a_failure() {
+        let _g = LOG_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let table = render_kernel_table(&[("mla_absorb", "<ptx>"), ("w4a16_gemv", "<ptx>")]);
         assert!(table.contains("mla_absorb"));

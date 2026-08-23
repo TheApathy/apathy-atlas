@@ -172,7 +172,7 @@ make serve                    # or the docker run below
 
 ```bash
 docker run --rm --gpus all --ipc=host \
-  -v /home/flocka/atlas/qwen38/optimized-qwen-unsloth-official:/model:ro \
+  -v <internal, not published>/optimized-qwen-unsloth-official:/model:ro \
   -v atlas-qwen38-weight-cache:/var/cache/atlas-weight-cache \
   -p 127.0.0.1:8896:8896 \
   atlas-qwen38:production-v2 serve

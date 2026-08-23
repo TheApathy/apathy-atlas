@@ -15,7 +15,7 @@ Why this exists:
 
 Usage:
     # On server (run on same GPU as Atlas):
-    python3 fla_sidecar.py --model /home/flocka/models/Qwen3.6-27B-base --port 8890
+    python3 fla_sidecar.py --model $MODELS/Qwen3.6-27B-base --port 8890
 
     # From Atlas: set env to point at sidecar (production wire-in TBD):
     export ATLAS_DFLASH_FLA_SIDECAR=http://localhost:8890

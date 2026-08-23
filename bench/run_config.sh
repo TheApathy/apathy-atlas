@@ -3,13 +3,17 @@
 # Usage:
 #   run_config.sh <label> <kv_dtype> <num_drafts> [extra_env]
 set -euo pipefail
+# Repo root is derived from this script's location so the harness runs from
+# any checkout. Override MODELS to point at your checkpoint directory.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MODELS="${MODELS:-$HOME/models}"
 
 LABEL="${1:?label}"
 KV_DTYPE="${2:-fp8}"
 NUM_DRAFTS="${3:-2}"
 EXTRA_ENV="${4:-}"
 
-ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
+ATLAS_BIN=$REPO_ROOT/target/release/spark
 PORT="${PORT:-8889}"
 
 pkill -9 -x spark || true
@@ -26,7 +30,7 @@ fi
 echo "[run_config $LABEL] kv=$KV_DTYPE drafts=$NUM_DRAFTS env=$EXTRA_ENV"
 
 "${CMD[@]}" "$ATLAS_BIN" serve \
-  --model-from-path /home/flocka/models/AEON-Q36-27B-XS \
+  --model-from-path $MODELS/AEON-Q36-27B-XS \
   --model-name aeon-27b \
   --port "$PORT" \
   --kernel-target qwen3.6-27b \
@@ -40,7 +44,7 @@ echo "[run_config $LABEL] kv=$KV_DTYPE drafts=$NUM_DRAFTS env=$EXTRA_ENV"
   --mtp-vocab 32000 \
   --ssm-cache-slots 16 \
   --max-thinking-budget 768 \
-  --warmup-prompt /home/flocka/atlas/src/local/warmup.txt &
+  --warmup-prompt $REPO_ROOT/local/warmup.txt &
 SPARK_PID=$!
 
 for i in $(seq 1 60); do
@@ -51,7 +55,7 @@ for i in $(seq 1 60); do
   sleep 5
 done
 
-cd /home/flocka/atlas/src/bench
+cd $REPO_ROOT/bench
 python3 bench_aeon27b.py "$PORT" "$LABEL" 3 512 || true
 
 kill -9 $SPARK_PID 2>/dev/null || true

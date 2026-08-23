@@ -13,8 +13,11 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-DRAFTER_PATH = "/home/flocka/models/z-lab-Qwen3.6-27B-DFlash/model.safetensors"
-TARGET_PATH  = "/home/flocka/models/AEON-Q36-27B-Full/model.safetensors"
+# Checkpoint directory; override with the MODELS env var.
+MODELS_DIR = os.environ.get("MODELS", os.path.expanduser("~/models"))
+
+DRAFTER_PATH = os.path.join(MODELS_DIR, "z-lab-Qwen3.6-27B-DFlash/model.safetensors")
+TARGET_PATH  = os.path.join(MODELS_DIR, "AEON-Q36-27B-Full/model.safetensors")
 TARGET_HIDDEN_BIN = "/tmp/atlas_target_hidden.bin"
 
 NUM_LAYERS = 5

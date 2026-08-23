@@ -3,9 +3,13 @@
 # Each gate stands alone; combined-winners test runs last.
 # Output: appends one line per config to /tmp/kgamma_sweep.log
 set -uo pipefail
+# Repo root is derived from this script's location so the harness runs from
+# any checkout. Override MODELS to point at your checkpoint directory.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+MODELS="${MODELS:-$HOME/models}"
 
-ATLAS_BIN=/home/flocka/atlas/src/target/release/spark
-MODELS=/home/flocka/models
+ATLAS_BIN=$REPO_ROOT/target/release/spark
+MODELS=$MODELS
 PORT=8890
 LOG=/tmp/kgamma_sweep.log
 
@@ -30,7 +34,7 @@ run_one() {
       --draft-model "$MODELS/z-lab-Qwen3.6-27B-DFlash" \
       --dflash-gamma 16 \
       --dflash-quantization nvfp4 \
-      --warmup-prompt /home/flocka/atlas/src/local/warmup.txt \
+      --warmup-prompt $REPO_ROOT/local/warmup.txt \
       > /tmp/atlas_kgamma_${label}.log 2>&1 &
   SPARK_PID=$!
 
@@ -41,7 +45,7 @@ run_one() {
     sleep 5
   done
 
-  python3 /home/flocka/atlas/src/bench/bench_dflash_quick.py "$PORT" "$label" 2 | tee -a "$LOG"
+  python3 $REPO_ROOT/bench/bench_dflash_quick.py "$PORT" "$label" 2 | tee -a "$LOG"
 
   kill -9 $SPARK_PID 2>/dev/null || true
   wait $SPARK_PID 2>/dev/null || true
