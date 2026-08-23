@@ -15,6 +15,27 @@ docker/
         Dockerfile                   # 35B model, NVFP4 quantization
 ```
 
+## Which of these images have actually been built
+
+Being explicit, because "we ship a Dockerfile per model" and "we have built one"
+are different claims and only the second is worth anything to you:
+
+| Image | Status |
+|---|---|
+| `docker/gb10/Dockerfile` (multi-target) | built and exercised |
+| `docker/gb10/qwen3.8-27b/nvfp4/` | **built, and measured** — a container-served instance clears the published decode floor at 64.05 tok/s median with byte-identical output. See [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) |
+| the other eight per-model Dockerfiles | **untested** — never built by us |
+
+That is not a guess about the untested eight. As of 2026-08-23 all nine per-model
+Dockerfiles carried two independent build-breaking bugs — a `COPY vendor/` of a
+directory deleted when the grammar stack went pure-Rust, and an
+`apt-get install "libnccl2 (>= 2.28)"` using dpkg dependency-field syntax that
+apt rejects outright. Both are now fixed in all nine, and one of the nine has
+since been built and measured. The other eight are *expected* to work and have
+not been demonstrated to.
+
+If you build one of the eight and it works, a PR saying so is welcome.
+
 ## Prerequisites
 
 - NVIDIA GPU with CUDA 13.0+ drivers
