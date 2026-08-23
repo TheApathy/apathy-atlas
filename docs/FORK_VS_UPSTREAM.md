@@ -1,7 +1,7 @@
 # Fork vs upstream — what we changed and what it bought
 
 A curated engineering record of how `TheApathy/apathy-atlas` (branch
-`qwen38/gb10-perf-and-packaging`) differs from `Avarok-Cybersecurity/atlas`,
+`perf/qwen38-gb10-dflash`) differs from `Avarok-Cybersecurity/atlas`,
 grouped by subsystem, with the measured effect where one exists and an explicit
 "no measured effect" where one does not.
 
