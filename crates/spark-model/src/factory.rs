@@ -12,14 +12,15 @@ use spark_runtime::weights::WeightStore;
 
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::{
-    DflashConfig, Gemma4WeightLoader, MinimaxM2WeightLoader, ModelWeightLoader,
+    DflashConfig, DsparkVerifyMode, Gemma4WeightLoader, MinimaxM2WeightLoader, ModelWeightLoader,
     NemotronHWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader,
     Qwen35WeightLoader,
 };
 
 /// DFlash speculative-decoding build arguments. `None` for non-DFlash runs;
 /// `Some(...)` carries the drafter's separate [`WeightStore`], parsed
-/// `config.json`, and CLI overrides for γ and the sliding-window size.
+/// `config.json`, the explicit DSpark verify planner mode, and CLI overrides
+/// for gamma and the sliding-window size.
 ///
 /// Construction order: the caller (`spark-server::main`) loads the drafter
 /// checkpoint into a fresh [`WeightStore`] via the same `WeightStore::load`
@@ -31,6 +32,7 @@ pub struct DflashBuildArgs<'a> {
     pub drafter_store: &'a WeightStore,
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
+    pub dspark_verify_mode: DsparkVerifyMode,
     pub window_size: Option<usize>,
     pub quantization: crate::layers::DflashQuantization,
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn argmax_bf16(data: &[u8]) -> u32 {
     debug_assert!(data.len().is_multiple_of(2));
@@ -40,6 +41,9 @@ struct MockModel {
     output_sequence: Vec<u32>,
     buffers: BufferArena,
     _kv_cache: parking_lot::Mutex<PagedKvCache>,
+    alloc_calls: AtomicUsize,
+    free_calls: AtomicUsize,
+    speculative_calls: AtomicUsize,
 }
 
 impl MockModel {
@@ -65,6 +69,9 @@ impl MockModel {
             output_sequence,
             buffers,
             _kv_cache: parking_lot::Mutex::new(kv_cache),
+            alloc_calls: AtomicUsize::new(0),
+            free_calls: AtomicUsize::new(0),
+            speculative_calls: AtomicUsize::new(0),
         }
     }
 
@@ -141,12 +148,14 @@ impl Model for MockModel {
     }
 
     fn alloc_sequence(&self) -> Result<SequenceState> {
+        self.alloc_calls.fetch_add(1, Ordering::Relaxed);
         Ok(SequenceState {
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
             layer_states: Vec::new(),
             proposer_state: None,
+            proposer_state_alt: None,
             slot_idx: 0,
             marconi_skip_to: 0,
             session_hash: 0,
@@ -219,6 +228,7 @@ impl Model for MockModel {
         params: &spark_runtime::sampler::SamplingParams,
         _num_drafts: usize,
     ) -> Result<crate::engine::GenerateResult> {
+        self.speculative_calls.fetch_add(1, Ordering::Relaxed);
         // Fallback to regular generation in mock
         crate::engine::generate(self, prompt_tokens, params)
     }
@@ -236,6 +246,7 @@ impl Model for MockModel {
     fn cache_sequence(&self, _seq: &SequenceState) {}
 
     fn free_sequence(&self, _seq: &mut SequenceState) -> Result<()> {
+        self.free_calls.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -338,6 +349,62 @@ fn test_generate_stops_on_max_tokens() {
     let result = generate(&model, &[1], &params).unwrap();
     assert_eq!(result.output_tokens, vec![10, 10, 10]);
     assert_eq!(result.finish_reason, "length");
+    assert_eq!(model.alloc_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.free_calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_generate_zero_max_tokens_skips_model_work() {
+    let model = MockModel::new(Vec::new());
+    let params = SamplingParams::greedy(0);
+
+    let result = generate(&model, &[1], &params).unwrap();
+    assert!(result.output_tokens.is_empty());
+    assert_eq!(result.finish_reason, "length");
+    assert_eq!(model.alloc_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model.free_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model.speculative_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_generate_streaming_zero_max_tokens_skips_callback() {
+    let model = MockModel::new(Vec::new());
+    let params = SamplingParams::greedy(0);
+    let mut callback_calls = 0;
+
+    let result = generate_streaming(&model, &[1], &params, |_| callback_calls += 1).unwrap();
+    assert!(result.output_tokens.is_empty());
+    assert_eq!(result.finish_reason, "length");
+    assert_eq!(callback_calls, 0);
+    assert_eq!(model.alloc_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model.free_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model.speculative_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_generate_speculative_zero_max_tokens_skips_delegation() {
+    let model = MockModel::new(Vec::new());
+    let params = SamplingParams::greedy(0);
+
+    let result = generate_speculative(&model, &[1], &params, 3).unwrap();
+    assert!(result.output_tokens.is_empty());
+    assert_eq!(result.finish_reason, "length");
+    assert_eq!(model.speculative_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model.alloc_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(model.free_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn test_generate_speculative_nonzero_delegates_once() {
+    let model = MockModel::new(vec![42]);
+    let params = SamplingParams::greedy(1);
+
+    let result = generate_speculative(&model, &[1], &params, 3).unwrap();
+    assert_eq!(result.output_tokens, vec![42]);
+    assert_eq!(result.finish_reason, "length");
+    assert_eq!(model.speculative_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.alloc_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.free_calls.load(Ordering::Relaxed), 1);
 }
 
 #[test]

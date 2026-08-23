@@ -23,6 +23,9 @@ struct SamplingCat {
     // over the recent token window. 0.0 = disabled. 0.2 is the SGLang
     // reference value; lossless on AIME/GPQA at that strength.
     lz_penalty: f32,
+    // None means MODEL.toml is silent, so --default-min-p still owns it.
+    // Some(0.0) is intentionally distinct from absence.
+    min_p: Option<f32>,
 }
 
 impl Default for SamplingCat {
@@ -38,6 +41,7 @@ impl Default for SamplingCat {
             dry_base: 1.75,
             dry_allowed_length: 2,
             lz_penalty: 0.0,
+            min_p: None,
         }
     }
 }
@@ -86,6 +90,7 @@ struct Target {
     behavior_disable_tool_grammar: bool,
     behavior_rollback_resteer: bool,
     behavior_rom_head: String,
+    behavior_preserve_thinking: Option<bool>,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -190,10 +195,7 @@ fn main() {
         // different model that happened to land at the same `idx`.
         let signature = format!(
             "{}|{}|{}|{}",
-            target.hw,
-            target.model,
-            target.quant,
-            target.arch,
+            target.hw, target.model, target.quant, target.arch,
         );
         let signature_file = out_dir.join(format!("t{idx}__signature"));
         let signature_matches = std::fs::read_to_string(&signature_file)
@@ -225,12 +227,8 @@ fn main() {
             // perf miss; false positives (skip when changed) would
             // silently ship stale PTX.
             if signature_matches {
-                let cu_mt = std::fs::metadata(cu_file)
-                    .and_then(|m| m.modified())
-                    .ok();
-                let out_mt = std::fs::metadata(&out_file)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let cu_mt = std::fs::metadata(cu_file).and_then(|m| m.modified()).ok();
+                let out_mt = std::fs::metadata(&out_file).and_then(|m| m.modified()).ok();
                 let src_floor = match (cu_mt, header_floor) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (Some(a), None) => Some(a),
@@ -470,6 +468,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_disable_tool_grammar: pb.disable_tool_grammar,
                 behavior_rollback_resteer: pb.rollback_resteer,
                 behavior_rom_head: pb.rom_head.clone(),
+                behavior_preserve_thinking: pb.preserve_thinking,
                 model_type_matches,
                 dflash,
             });
@@ -522,8 +521,8 @@ fn collect_cu_files(
     //   model_dir = kernels/$hw/$model/$quant/
     //   shared    = kernels/$hw/common/
     let shared_dir = model_dir
-        .parent()                          // kernels/$hw/$model/
-        .and_then(|p| p.parent())          // kernels/$hw/
+        .parent() // kernels/$hw/$model/
+        .and_then(|p| p.parent()) // kernels/$hw/
         .map(|p| p.join("common"));
 
     let mut files: HashMap<String, PathBuf> = HashMap::new();

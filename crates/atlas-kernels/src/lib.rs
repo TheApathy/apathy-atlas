@@ -18,6 +18,9 @@
 
 use atlas_core::target::KernelTarget;
 
+mod behavior_defaults;
+pub use behavior_defaults::DEFAULT_MAX_INTER_TOOL_PROSE;
+
 // Auto-generated: per-target PTX constants, ptx_modules() function,
 // and all_ptx_sets() for multi-target builds.
 include!(concat!(env!("OUT_DIR"), "/target_ptx.rs"));
@@ -63,6 +66,9 @@ pub struct SamplingCategory {
     /// `presence_penalty` regression. 0.0 = disabled. SGLang reference
     /// strength = 0.2 (lossless on AIME/GPQA).
     pub lz_penalty: f32,
+    /// Model-declared min-p. `None` preserves the server CLI default;
+    /// `Some(0.0)` deliberately disables min-p for this model/category.
+    pub min_p: Option<f32>,
 }
 
 /// Model-specific sampling presets loaded from MODEL.toml `[sampling.*]`.
@@ -91,6 +97,7 @@ impl Default for SamplingPresets {
             dry_base: 1.75,
             dry_allowed_length: 2,
             lz_penalty: 0.0,
+            min_p: None,
         };
         let tools_cat = SamplingCategory {
             temperature: 0.6,
@@ -103,6 +110,7 @@ impl Default for SamplingPresets {
             dry_base: 1.75,
             dry_allowed_length: 2,
             lz_penalty: 0.0,
+            min_p: None,
         };
         Self {
             thinking_text: default_cat,
@@ -179,7 +187,7 @@ pub struct ModelBehavior {
     /// mismatches. Default 12 (~8%).
     pub fuzzy_repeat_tolerance_div: u32,
     /// Cap on free-text tokens between successive `<tool_call>` opens in
-    /// `tool_choice=auto`. Default 384. Agentic coding may want larger.
+    /// `tool_choice=auto`. Default [`DEFAULT_MAX_INTER_TOOL_PROSE`].
     pub max_inter_tool_prose: u32,
     /// TSCG (Tool-Schema Compilation) enabled — compile tool JSON
     /// schemas to compact function signatures before prompting.
@@ -210,6 +218,9 @@ pub struct ModelBehavior {
     /// itself is intentionally NOT implemented (no per-model trained head
     /// is available); only the optional hook is wired.
     pub rom_head: &'static str,
+    /// Optional Jinja `preserve_thinking` pin. `None` leaves the variable
+    /// undefined so each checkpoint template keeps its native default.
+    pub preserve_thinking: Option<bool>,
 }
 
 /// Phase-C: maximum number of watchdog-triggered rollbacks a single
@@ -235,11 +246,12 @@ impl Default for ModelBehavior {
             confidence_early_stop: true,
             confidence_run_length: 30,
             fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: 384,
+            max_inter_tool_prose: DEFAULT_MAX_INTER_TOOL_PROSE,
             tscg: false,
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: "",
+            preserve_thinking: None,
         }
     }
 }
@@ -394,5 +406,13 @@ mod tests {
             found.is_some(),
             "ptx_for_model('qwen3-next-80b') should find the default target"
         );
+    }
+
+    #[test]
+    fn behavior_default_prose_budget_uses_shared_plan_sized_constant() {
+        let behavior = ModelBehavior::default();
+        assert_eq!(behavior.max_inter_tool_prose, DEFAULT_MAX_INTER_TOOL_PROSE);
+        assert!(behavior.max_inter_tool_prose >= 2048);
+        assert_eq!(behavior.preserve_thinking, None);
     }
 }

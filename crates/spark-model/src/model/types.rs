@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle, PinnedHostBuffer};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ssm_pool::SsmStatePool;
@@ -126,7 +126,7 @@ pub struct TransformerModel {
     /// before the upload completes → stale `kv_indir_base` → `1, 2, 2, 3`
     /// style token-duplication artifacts).
     /// `null` when DFlash is disabled.
-    pub tree_kv_indir_base_host_pinned: *mut u8,
+    pub tree_kv_indir_base_host_pinned: std::cell::UnsafeCell<Option<PinnedHostBuffer>>,
     /// ATLAS_TREE_KV_PACK: per-attention-layer packed-KV scratch pool.
     /// One entry per FullAttention layer; each is the K-pool base pointer
     /// for `[num_seqs blocks × stride tokens]` of the layer's KV dtype.
@@ -165,12 +165,23 @@ pub struct TransformerModel {
     pub(super) final_norm: DenseWeight,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
-    /// Transposed copy of the NVFP4 lm_head for the m32_n64 K=γ path.
-    /// Built at load when ATLAS_LM_HEAD_T=1 (~0.63 GB on qwen3.6-27b).
+    /// Transposed NVFP4 lm_head shared with the DFlash drafter propose path.
+    /// Target verification uses the exact row-major family instead. Built at
+    /// load when ATLAS_LM_HEAD_T=1 (~0.63 GB on qwen3.6-27b).
     pub(super) lm_head_nvfp4_t: Option<QuantizedWeight>,
     pub(super) layers: Vec<Box<dyn TransformerLayer>>,
     pub(super) buffers: BufferArena,
     pub(super) kv_cache: Mutex<PagedKvCache>,
+    /// Page-locked host staging for batched metadata H2D transfers.
+    /// Allocated once at init and released by its RAII owner before `gpu`.
+    ///
+    /// Uses UnsafeCell (not Mutex) because TransformerModel is only accessed
+    /// from the scheduler thread after construction. The Model trait requires
+    /// Send+Sync for the move to the scheduler thread, but the model is never
+    /// accessed from multiple threads simultaneously. A Mutex here caused a
+    /// 500x EP=2 decode regression (50 tok/s → 0.1 tok/s) due to contention
+    /// with the NCCL all-reduce path.
+    pub(super) pinned_staging: std::cell::UnsafeCell<PinnedMetaStaging>,
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
     pub(super) bf16_to_f32_kernel: KernelHandle,
@@ -184,15 +195,19 @@ pub struct TransformerModel {
     pub(super) dense_gemv_fp32out_kernel: KernelHandle,
     pub(super) w4a16_gemv_kernel: KernelHandle,
     pub(super) w4a16_gemv_logits_kernel: KernelHandle, // FP32 output for LM head
+    /// Exact K1-order multi-row NVFP4 LM-head kernels. Individual handles may
+    /// be absent; production then fails closed to independent row-major K1
+    /// GEMV launches for that tier.
+    pub(super) w4a16_exact_lm_head_kernels: ops::W4a16ExactLmHeadKernels,
     pub(super) w4a16_gemm_kernel: KernelHandle,
-    /// `w4a16_gemm_t_m32_n64` for the K=γ lm_head (single B read × full
-    /// occupancy at 3 < M ≤ 32). 0 when the symbol is absent.
+    /// `w4a16_gemm_t_m32_n64` used only to qualify/build the optional
+    /// transposed copy shared with the drafter. 0 when absent.
     pub(super) w4a16_gemm_t_m32_n64_kernel: KernelHandle,
+    /// Legacy handle retained for ABI compatibility; target LM-head verify
+    /// must not route through its different accumulation order.
     pub(super) w4a16_gemv_batch2_kernel: KernelHandle,
-    /// W4A16 M=3 GEMV specialized for LM head (large N=vocab).
-    /// Replaces the M=3 fallback through `w4a16_gemm` (95% wasted M-tile)
-    /// when `ATLAS_LM_HEAD_BATCH3=1`. See `w4a16_gemv_batch3_logits` in
-    /// `kernels/gb10/nvfp4/w4a16_gemv.cu`.
+    /// Legacy M=3 LM-head handle retained for ABI compatibility. Production
+    /// M=3 verification uses the exact m4 tier or serial K1 fallback.
     pub(super) w4a16_gemv_batch3_logits_kernel: KernelHandle,
     pub(super) dense_gemm_kernel: KernelHandle,
     pub(super) argmax_kernel: KernelHandle,
@@ -251,8 +266,34 @@ pub struct TransformerModel {
     /// When true, decode() skips CUDA graph capture/replay. Set during
     /// per-sequence batch decode to prevent SSM state pointer baking.
     pub(super) suppress_graphs: std::sync::atomic::AtomicBool,
-    /// MTP draft proposer (built from mtp_weights at init).
+    /// Draft proposer for arm 0 — the PRIMARY arm, whatever the build
+    /// installed last. With `--dflash` this is the `BlockDiffusionDraftHead`;
+    /// with plain `--speculative` it is the in-checkpoint `MtpHead`.
+    ///
+    /// Read through [`TransformerModel::active_proposer`], never directly,
+    /// so the speculation gate's arm selection is honoured. The two capability
+    /// predicates (`has_proposer`, `mtp_lastk` gating) deliberately ask
+    /// [`TransformerModel::any_proposer`] instead: "is speculation possible at
+    /// all" is not the same question as "which arm is live right now".
     pub(super) proposer: Option<Arc<dyn DraftProposer>>,
+    /// Draft proposer for arm 1 — the ALTERNATE arm. Populated only when the
+    /// build produced two proposers: `set_dflash_proposer` demotes the native
+    /// MTP head here instead of dropping it, so `--dflash --speculative`
+    /// yields DFlash on arm 0 and MTP on arm 1 and the gate can pick per step.
+    ///
+    /// `None` on every single-proposer build, which is every build that does
+    /// not pass both flags — so the default configuration is bit-identical to
+    /// before this field existed.
+    pub(super) proposer_alt: Option<Arc<dyn DraftProposer>>,
+    /// Which proposer arm is live. Read on the decode hot path by
+    /// [`TransformerModel::active_proposer`], written only by the scheduler's
+    /// speculation gate between steps.
+    ///
+    /// An atomic rather than a `&mut` field because the scheduler holds the
+    /// model as `&dyn Model` for the whole run and every step function takes a
+    /// shared reference; and a plain atomic rather than a lock because this is
+    /// read once per propose on the critical path.
+    pub(super) active_proposer_arm: std::sync::atomic::AtomicU8,
     /// Dedicated buffer for saving hidden state before MTP head runs.
     /// Size: hidden_size * 4 bytes (one FP32 vector). MTP overwrites shared
     /// buffers (norm_output etc.), so the target hidden must be saved here first.
@@ -351,16 +392,6 @@ pub struct TransformerModel {
     /// Allocated size in bytes of `vision_cache_buf`. Grows as needed
     /// when a larger image is encountered.
     pub(super) vision_cache_bytes: std::sync::atomic::AtomicUsize,
-    /// Page-locked host staging for batched metadata H2D transfers.
-    /// Allocated once at init via cuMemAllocHost, freed in Drop.
-    ///
-    /// Uses UnsafeCell (not Mutex) because TransformerModel is only accessed
-    /// from the scheduler thread after construction. The Model trait requires
-    /// Send+Sync for the move to the scheduler thread, but the model is never
-    /// accessed from multiple threads simultaneously. A Mutex here caused a
-    /// 500x EP=2 decode regression (50 tok/s → 0.1 tok/s) due to contention
-    /// with the NCCL all-reduce path.
-    pub(super) pinned_staging: std::cell::UnsafeCell<PinnedMetaStaging>,
     /// Save SSM snapshots every N blocks during chunked prefill.
     /// 0 = disabled (leaf-only). When > 0, intermediate checkpoints are saved
     /// at block boundaries, enabling partial prefix SSM restore.
@@ -371,6 +402,24 @@ pub struct TransformerModel {
     /// GPU buffer for ssm_state_clamp_norm_fused's pointer table `[num_ssm_layers]`.
     pub(super) ssm_norm_ptrs_buf: DevicePtr,
 
+    /// One-shot FP32 -> FP16 h-state converter (`ATLAS_SSM_H_FP16`, stage 2).
+    pub(super) ssm_h_f32_to_f16_kernel: KernelHandle,
+    /// Staging buffer for it, one layer wide (`h_bytes / 2`).
+    ///
+    /// The conversion is a narrowing COMPACTION and cannot be done in place:
+    /// thread `2i`'s write lands inside thread `i`'s read with nothing ordering
+    /// them. Allocated lazily on first use, so a serve without the flag pays
+    /// nothing.
+    pub(super) ssm_h_f16_scratch: std::sync::OnceLock<DevicePtr>,
+    /// One-shot FP16 -> FP32 h-state widener (`ATLAS_SSM_H_FP16`, stage 2).
+    ///
+    /// Used by the full-sequence disk-swap path so the swap FILE is always
+    /// FP32 regardless of what the slot held. See `ssm_h_f32_scratch`.
+    pub(super) ssm_h_f16_to_f32_kernel: KernelHandle,
+    /// Staging buffer for the widener, one layer wide (`h_bytes`).
+    ///
+    /// Widening is an EXPANSION and likewise cannot be done in place.
+    pub(super) ssm_h_f32_scratch: std::sync::OnceLock<DevicePtr>,
     // ── Two-phase SSM prefill buffers ──
     // These hold GDN inputs/outputs for the full sequence, allowing the GDN
     // recurrence to run in a single kernel launch while GEMM projections are
@@ -420,10 +469,8 @@ pub struct TransformerModel {
 
 /// Pinned host memory staging buffer with reusable metadata Vecs.
 pub(crate) struct PinnedMetaStaging {
-    /// Page-locked host buffer (cuMemAllocHost).
-    pub(super) ptr: *mut u8,
-    /// Size in bytes.
-    pub(super) bytes: usize,
+    /// Backend-owned page-locked host buffer.
+    pub(super) buffer: PinnedHostBuffer,
     /// Reusable `Vec<u32>` for positions (avoids per-chunk heap allocation).
     pub(super) positions: Vec<u32>,
     pub(super) positions_h: Vec<u32>,
@@ -439,8 +486,8 @@ pub(crate) struct PinnedMetaStaging {
 // Model is moved to the scheduler thread and accessed exclusively from there.
 // UnsafeCell<PinnedMetaStaging> is not inherently Sync, but single-thread
 // access is enforced at runtime by the scheduler architecture.
-// The raw pointer in PinnedMetaStaging points to cuMemAllocHost memory which
-// is process-global and valid from any thread.
+// PinnedMetaStaging owns backend-issued page-locked memory which is valid from
+// any thread and releases before the model's GPU backend field.
 unsafe impl Send for TransformerModel {}
 // SAFETY: Model methods are only called from the scheduler thread. No concurrent &self access.
 unsafe impl Sync for TransformerModel {}

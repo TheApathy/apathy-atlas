@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -86,7 +86,7 @@ impl TransformerModel {
 
         // 1c. Upload 2-entry attention metadata as a SINGLE packed H2D.
         // See verify_c.rs (K=3 sibling) for the rationale on the 4→1 H2D
-        // pack: each copy_h2d_async carries ~5 μs CUDA-driver overhead;
+        // pack: each separate H2D carries CUDA-driver overhead;
         // packing saves 3 syscalls per K=2 verify step.
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = self.max_blocks_per_seq;
@@ -139,7 +139,8 @@ impl TransformerModel {
         }
 
         // Single fused H2D
-        self.gpu.copy_h2d_async(pack, meta_base, stream)?;
+        self.gpu
+            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(pack, meta_base)], stream)?;
 
         let metadata = AttnMetadataDev {
             positions: meta_base,

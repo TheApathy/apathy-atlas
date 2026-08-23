@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -44,7 +44,10 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 fn layer_resolution_probe_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("ATLAS_LAYER_RESOLUTION_PROBE").ok().as_deref() == Some("1")
+        std::env::var("ATLAS_LAYER_RESOLUTION_PROBE")
+            .ok()
+            .as_deref()
+            == Some("1")
     })
 }
 
@@ -71,7 +74,11 @@ struct LrpAccum {
 
 impl LrpAccum {
     fn new(k: usize) -> Self {
-        Self { step: 0, matches: vec![vec![0u64; k]; LRP_PROBE_LAYERS.len()], k }
+        Self {
+            step: 0,
+            matches: vec![vec![0u64; k]; LRP_PROBE_LAYERS.len()],
+            k,
+        }
     }
 
     fn accumulate(&mut self, final_am: &[u32], probe_ams: &[Vec<u32>]) {
@@ -134,6 +141,14 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+
+        // ATLAS_SSM_H_FP16 stage 2. This entry point does NOT exist upstream —
+        // the speculative verify is ours — and it is the one that matters most
+        // here, because the WY kernels it dispatches are the h-state readers and
+        // writers whenever --speculative is on. Without this hook the FP16 twins
+        // selected in `wy_chunk_kernel` would run over an unconverted FP32 pool.
+        // Outside the graph capture that begins further down.
+        self.ssm_h_to_f16_dispatch(seq)?;
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -142,6 +157,38 @@ impl TransformerModel {
         } else {
             2usize
         };
+        let serial = crate::model::env_diag::DflashSerialControls::current();
+        let serial_family = serial.active_family()?;
+        let control_requests = crate::model::control_engagement::ControlRequests {
+            attn_paged: crate::layers::attn_paged_serial_enabled(),
+            attn_out: crate::layers::attn_out_serial_enabled(),
+            ffn: serial.ffn,
+            layer_norms: serial.layer_norms,
+        };
+        let controlled_verify = k > 1 && control_requests.any();
+        let stage_capture = crate::model::k1_stage_diag::requested_at(seq.seq_len, tokens)?;
+        crate::model::k1_stage_diag::validate_serial_control_overlap(
+            crate::model::k1_stage_diag::enabled(),
+            serial_family,
+        )?;
+        if stage_capture {
+            if self.use_fp32_logits || self.verify_lmhead_vocab() as usize != self.config.vocab_size
+            {
+                bail!("DFLASH_K1_STAGE_DIAG requires BF16 full-vocabulary logits");
+            }
+            crate::model::k1_stage_diag::begin_batch(seq.seq_len, tokens)?;
+        }
+        if let Some(family) = serial_family {
+            static PROOF: std::sync::Once = std::sync::Once::new();
+            PROOF.call_once(|| {
+                tracing::warn!(family, c = 1, k, "DFLASH_K1_BISECT C1 active");
+            });
+        }
+        let kgamma_debug_dump = std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok()
+            && std::env::var("ATLAS_KGAMMA_DEBUG_SEQ_LEN")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .is_none_or(|wanted| wanted == seq.seq_len);
 
         // F62 (2026-04-27): SpecMamba dual-buffer pre-verify copy.
         self.pre_verify_copy_async(seq)?;
@@ -243,6 +290,7 @@ impl TransformerModel {
             }
             anyhow::Result::<()>::Ok(())
         })?;
+        self.capture_k1_stage("embed", hidden, k, h * fp32, stream)?;
 
         // 1b. Allocate KV blocks for all K positions
         let bs = kv_cache.block_size();
@@ -396,9 +444,20 @@ impl TransformerModel {
         // are scattered across blocks for deep trees).
         let tree_aware_attn_enabled =
             std::env::var("ATLAS_TREE_AWARE_ATTN").ok().as_deref() == Some("1");
+        // A selective-boundary cache may mix attention KV dtypes. Do not pay
+        // the indirection cost on the supported subset when any attention
+        // layer would ignore the map: that verify cannot safely commit a
+        // branch anyway. This also keeps the fallback on the established
+        // batched chain kernel instead of running a strictly slower partial
+        // tree computation whose result must be discarded.
+        let all_attention_layers_exact = self
+            .layers
+            .iter()
+            .all(|layer| layer.ddtree_ancestor_attention_exact());
         let tree_kv_active = tree_aware_attn_enabled
             && !dfs_active
             && tree_depths.is_some()
+            && all_attention_layers_exact
             && self.tree_kv_indir_stride > 0
             && self.tree_kv_indir_persistent.0 != 0
             && k <= self.tree_kv_indir_stride;
@@ -442,10 +501,15 @@ impl TransformerModel {
         // corrupting all 48 GDN layer outputs for branch rows.
         // Gating branch commits on conv_exact prevents silent non-oracle commits.
         // ATLAS_DDTREE_ASSUME_CONV_EXACT=1 is the research escape hatch (repro only).
-        let tree_conv_exact_on = std::env::var("ATLAS_DDTREE_TREE_CONV_EXACT")
-            .ok()
-            .as_deref()
-            == Some("1")
+        let tree_conv_kernel_available = self
+            .layers
+            .iter()
+            .all(|layer| layer.ddtree_conv_state_exact());
+        let tree_conv_exact_on = (tree_conv_kernel_available
+            && std::env::var("ATLAS_DDTREE_TREE_CONV_EXACT")
+                .ok()
+                .as_deref()
+                == Some("1"))
             || std::env::var("ATLAS_DDTREE_ASSUME_CONV_EXACT")
                 .ok()
                 .as_deref()
@@ -453,9 +517,66 @@ impl TransformerModel {
         // For a non-flat tree payload, BOTH attention indirection AND conv reroot
         // must be active to guarantee oracle-correct branch logits. A flat payload
         // (or no payload) is always exact by construction.
-        let ancestor_attn_exact = !payload_non_flat || (tree_kv_active && tree_conv_exact_on);
+        // Indirection support is a per-attention-layer property. Selective
+        // boundary caches can mix BF16 and FP8 layers; treating a live FP8
+        // indirection buffer as a model-wide capability incorrectly certified
+        // the BF16 layers even though their decode kernel dropped the tree
+        // metadata. Require every layer to attest support and fail closed.
+        let ancestor_attn_exact = !payload_non_flat
+            || (tree_kv_active && tree_conv_exact_on && all_attention_layers_exact);
         self.dflash_tree_ancestor_attn
             .store(ancestor_attn_exact, std::sync::atomic::Ordering::Release);
+        if payload_non_flat && ancestor_attn_exact {
+            static EXACT_CERT_DBG: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = EXACT_CERT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                use spark_runtime::kv_cache::KvCacheDtype;
+                let attention_certificates: Vec<_> = self
+                    .layers
+                    .iter()
+                    .filter_map(|layer| layer.ddtree_attention_certificate())
+                    .collect();
+                let count = |dtype| {
+                    attention_certificates
+                        .iter()
+                        .filter(|(actual, _)| *actual == dtype)
+                        .count()
+                };
+                let exact = |dtype| {
+                    attention_certificates
+                        .iter()
+                        .filter(|(actual, supported)| *actual == dtype && *supported)
+                        .count()
+                };
+                let bf16 = count(KvCacheDtype::Bf16);
+                let fp8 = count(KvCacheDtype::Fp8);
+                let other = attention_certificates.len().saturating_sub(bf16 + fp8);
+                let conv_total = self
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.is_ssm_layer())
+                    .count();
+                let conv_exact = self
+                    .layers
+                    .iter()
+                    .filter(|layer| layer.is_ssm_layer() && layer.ddtree_conv_state_exact())
+                    .count();
+                tracing::info!(
+                    "DDTREE_EXACT_CERT #{n}: k={k} attention_layers={} \
+                     bf16_tree_handles={}/{} fp8_indirection={}/{} \
+                     other_attention={} conv_reroot={}/{}",
+                    attention_certificates.len(),
+                    exact(KvCacheDtype::Bf16),
+                    bf16,
+                    exact(KvCacheDtype::Fp8),
+                    fp8,
+                    other,
+                    conv_exact,
+                    conv_total,
+                );
+            }
+        }
         if payload_non_flat && !ancestor_attn_exact {
             static NONEXACT_DBG: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
@@ -464,13 +585,15 @@ impl TransformerModel {
                 tracing::info!(
                     "K=γ verify: non-flat tree payload — branch commits degraded to flat-safe \
                      (k={k}, dfs_active={dfs_active}, tree_aware_attn={tree_aware_attn_enabled}, \
-                     tree_depths_some={}, indir_stride={}, indir_ptr_ok={}, \
+                     tree_depths_some={}, indir_stride={}, indir_ptr_ok={}, all_attn_exact={}, \
+                     tree_conv_kernel_ok={tree_conv_kernel_available}, \
                      tree_conv_exact_on={tree_conv_exact_on}) — \
                      Enable ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 + \
                      ATLAS_DDTREE_TREE_CONV_EXACT=1 for lossless deep-branch commits.",
                     tree_depths.is_some(),
                     self.tree_kv_indir_stride,
                     self.tree_kv_indir_persistent.0 != 0,
+                    all_attention_layers_exact,
                 );
             }
         }
@@ -493,8 +616,6 @@ impl TransformerModel {
         };
         let pos_bytes =
             unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, k * 4) };
-        self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
-
         let mut slots = vec![0i64; k];
         for t in 0..k {
             let pos = seq.seq_len + t;
@@ -506,9 +627,6 @@ impl TransformerModel {
         // 256-byte gap mirrors K=4 layout for ABI compatibility with
         // attention kernels that index meta_base + fixed offsets.
         let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, k * 8) };
-        self.gpu
-            .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
-
         // seq_lens stays compact-index-based even in tree-aware mode. Reasoning:
         // setting seq_lens to depth+1 makes a depth-d query read positions
         // [0..seq.seq_len+d] which still are compact-ordered slots — those
@@ -542,9 +660,6 @@ impl TransformerModel {
             (0..k).map(|t| (seq.seq_len + t + 1) as i32).collect()
         };
         let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, k * 4) };
-        self.gpu
-            .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
-
         let mb = max_blocks as usize;
         let needed = k * mb;
         let mut bt_buf = vec![0i32; needed];
@@ -555,8 +670,14 @@ impl TransformerModel {
         }
         let bt_bytes =
             unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
+        let metadata_copies = [
+            HostToDeviceCopy::new(pos_bytes, meta_base),
+            HostToDeviceCopy::new(slot_bytes, meta_base.offset(256)),
+            HostToDeviceCopy::new(sl_bytes, meta_base.offset(512)),
+            HostToDeviceCopy::new(bt_bytes, meta_base.offset(768)),
+        ];
         self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
+            .copy_h2d_group_on_stream(&metadata_copies, stream)?;
 
         // ATLAS_TREE_AWARE_ATTN CUDA graph fix: upload `seq.seq_len as i32`
         // into the persistent 1×i32 device buffer that backs the kernel's
@@ -571,28 +692,28 @@ impl TransformerModel {
         // `kv_indir_base_ptr` / `abs_base_ptr` so captured CUDA graphs
         // pick up the fresh value on each replay (the prior scalar arg was
         // baked into the kernel-launch node at capture time).
-        if tree_kv_active
-            && !self.tree_kv_indir_base_persistent.is_null()
-            && !self.tree_kv_indir_base_host_pinned.is_null()
-        {
+        if tree_kv_active && !self.tree_kv_indir_base_persistent.is_null() {
+            let pinned = unsafe { &mut *self.tree_kv_indir_base_host_pinned.get() };
+            let pinned = pinned
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("tree KV base pinned host allocation is missing"))?;
             // Write the new base into the persistent pinned-host shadow
             // (in-place, host-side, no GPU involved) THEN fire the async
             // H2D copy from the pinned shadow. Pinned-host sources establish
             // a proper stream-ordered dependency for captured graph kernels;
             // pageable Vec sources do not (small pageable copies can race
             // ahead of subsequent graph launches → stale `kv_indir_base`).
+            pinned
+                .as_mut_slice()
+                .copy_from_slice(&(seq.seq_len as i32).to_ne_bytes());
+            let base_bytes = pinned.pinned_slice(std::mem::size_of::<i32>())?;
             unsafe {
-                let dst = self.tree_kv_indir_base_host_pinned as *mut i32;
-                *dst = seq.seq_len as i32;
+                self.gpu.copy_h2d_pinned_async(
+                    base_bytes,
+                    self.tree_kv_indir_base_persistent,
+                    stream,
+                )?;
             }
-            let base_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.tree_kv_indir_base_host_pinned,
-                    std::mem::size_of::<i32>(),
-                )
-            };
-            self.gpu
-                .copy_h2d_async(base_bytes, self.tree_kv_indir_base_persistent, stream)?;
         }
 
         // ATLAS_TREE_AWARE_ATTN: build + upload per-row KV indirection table.
@@ -628,8 +749,13 @@ impl TransformerModel {
                     indir.len() * std::mem::size_of::<i32>(),
                 )
             };
-            self.gpu
-                .copy_h2d_async(indir_bytes_view, self.tree_kv_indir_persistent, stream)?;
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(
+                    indir_bytes_view,
+                    self.tree_kv_indir_persistent,
+                )],
+                stream,
+            )?;
             static TREE_KV_DBG_DONE: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !TREE_KV_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -662,7 +788,8 @@ impl TransformerModel {
         // ATLAS_DFLASH_DEBUG_NO_GRAPH=1 forces eager (no graph capture) so
         // CUDA_LAUNCH_BLOCKING=1 reports the exact failing kernel — used
         // to localize K=γ illegal-address crashes downstream of SSM.
-        let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1");
+        let force_eager = std::env::var("ATLAS_DFLASH_DEBUG_NO_GRAPH").ok().as_deref() == Some("1")
+            || kgamma_debug_dump;
         // Mirror verify_b.rs (K=2) auto-unsuppress logic. Without this the
         // K=γ verify path stays EAGER forever once FP8/turbo KV calibration
         // sets suppress_graphs=true at startup, and never gets recaptured
@@ -690,7 +817,10 @@ impl TransformerModel {
             && !hss_engaged
             && !force_eager
             && !full_profile
-            && !layer_resolution_probe_enabled();
+            && !layer_resolution_probe_enabled()
+            && serial_family.is_none()
+            && !crate::model::k1_stage_diag::enabled()
+            && !controlled_verify;
 
         // M8A: upload DDTree parent_ids (when stashed) so the GDN dispatch
         // can fire the tree-aware kernel. Stash lives on the model so we
@@ -780,8 +910,13 @@ impl TransformerModel {
             if host_parents.len() == k {
                 let permuted = permute_parent_ids(&host_parents, &dfs_perm, &dfs_inv_perm);
                 let bytes: Vec<u8> = permuted.iter().flat_map(|p| p.to_le_bytes()).collect();
-                self.gpu
-                    .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)?;
+                self.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(
+                        &bytes,
+                        self.ddtree_parent_ids_persistent,
+                    )],
+                    stream,
+                )?;
                 // Make sure dispatch uses persistent buffer (which now holds
                 // DFS-frame parents).
                 ddtree_parent_ids_dev = Some(self.ddtree_parent_ids_persistent);
@@ -832,8 +967,13 @@ impl TransformerModel {
                         packed_seq_lens.len() * std::mem::size_of::<i32>(),
                     )
                 };
-                self.gpu
-                    .copy_h2d_async(sl_bytes_view, self.tree_kv_pack_seq_lens, stream)?;
+                self.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(
+                        sl_bytes_view,
+                        self.tree_kv_pack_seq_lens,
+                    )],
+                    stream,
+                )?;
                 // NOTE: kv_cache mutex is already held earlier in this fn
                 // (`let mut kv_cache = self.kv_cache.lock();`), so we must
                 // NOT re-lock it. Read block_size via the already-held
@@ -905,7 +1045,7 @@ impl TransformerModel {
             None
         };
 
-        // Cache key includes (slot, k, pack_active_flag). The pack flag is
+        // Cache key includes (slot, k, graph-shape flags). The pack flag is
         // critical: when ATLAS_TREE_KV_PACK is enabled, the first K=γ verify
         // (often pre-tree, flat-chain) captures a graph WITHOUT pack-pool
         // kernel arguments. Later verifies with non-flat trees can't reuse
@@ -916,8 +1056,14 @@ impl TransformerModel {
         // indirection kernel arguments (flat step, kv_indirection=NULL) must
         // never be replayed for a tree-indirected step of the same K (and
         // vice versa) — the kernel argument sets differ.
-        let pack_key = ctx.tree_aware_attn.and_then(|t| t.pack).is_some() as u32
-            | ((ctx.tree_aware_attn.is_some() as u32) << 1);
+        // Bit 2: a real/synthetic SSM tree parent pointer is active. Flat K4
+        // uses exact FP32 sequence recurrence, whereas a genuine DDTree K4
+        // uses the tree kernel family; those graph topologies cannot alias.
+        let pack_key = super::commit_plan::verify_graph_shape_key(
+            ctx.tree_aware_attn.and_then(|t| t.pack).is_some(),
+            ctx.tree_aware_attn.is_some(),
+            ctx.ddtree_parent_ids_dev.is_some(),
+        );
         let cache_key = (seq.slot_idx, k, pack_key);
         let cached_for_slot = graph_cache
             .as_ref()
@@ -932,6 +1078,31 @@ impl TransformerModel {
         if need_run {
             let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
             let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
+
+            let control_guard = if controlled_verify {
+                let counts = self.layers.iter().enumerate().fold(
+                    crate::model::control_engagement::LayerCounts::default(),
+                    |mut counts, (layer_idx, _)| {
+                        if !verify_skip_layer(layer_idx) {
+                            if self.config.layer_type(layer_idx) == LayerType::FullAttention {
+                                counts.attention += 1;
+                            } else {
+                                counts.ssm += 1;
+                            }
+                        }
+                        counts
+                    },
+                );
+                if hss_engaged && counts.attention > 0 && control_requests.attention_requested() {
+                    bail!(
+                        "DFLASH_CONTROL_PATH_PROOF requested=true engaged=false \
+                         requirement=attention controls require the multi-sequence HBM path"
+                    );
+                }
+                crate::model::control_engagement::begin(control_requests, counts)?
+            } else {
+                None
+            };
 
             if use_graphs {
                 self.gpu.begin_capture(stream)?;
@@ -977,33 +1148,44 @@ impl TransformerModel {
                             .collect::<Result<_>>()?;
                         let mut refs: Vec<&mut (dyn LayerState + 'static)> =
                             dummy_states.iter_mut().map(|s| s.as_mut()).collect();
-                        layer.decode_multi_seq(
+                        crate::kprof!(self.gpu.as_ref(), stream, "verify_attn", {
+                            layer.decode_multi_seq(
+                                hidden,
+                                residual,
+                                k,
+                                &mut refs,
+                                &mut kv_cache,
+                                &seq_lens_vec,
+                                &block_tables_vec,
+                                &ctx,
+                                stream,
+                            )
+                        })?;
+                    }
+                } else {
+                    crate::kprof!(self.gpu.as_ref(), stream, "verify_ssm", {
+                        layer.decode_batched(
                             hidden,
                             residual,
                             k,
-                            &mut refs,
+                            seq.layer_states[layer_idx].as_mut(),
                             &mut kv_cache,
-                            &seq_lens_vec,
-                            &block_tables_vec,
+                            seq.seq_len,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
                             &ctx,
                             stream,
-                        )?;
-                    }
-                } else {
-                    layer.decode_batched(
-                        hidden,
-                        residual,
-                        k,
-                        seq.layer_states[layer_idx].as_mut(),
-                        &mut kv_cache,
-                        seq.seq_len,
-                        &mut seq.block_table,
-                        &mut seq.disk_block_ids,
-                        &mut seq.disk_last_offloaded_per_layer,
-                        &ctx,
-                        stream,
-                    )?;
+                        )
+                    })?;
                 }
+                self.capture_k1_stage(
+                    &format!("layer_{layer_idx:02}"),
+                    hidden,
+                    k,
+                    h * fp32,
+                    stream,
+                )?;
                 // DFlash hidden capture for ctx conditioning. Save ALL k
                 // tokens so the scheduler can pick the correct one
                 // (num_accepted) after verify. Layout:
@@ -1013,14 +1195,12 @@ impl TransformerModel {
                 }
                 // ATLAS_LAYER_RESOLUTION_PROBE: snapshot [K, H] BF16 hidden
                 // at checkpoint layers. GPU sync required (probe is eager-only).
-                if layer_resolution_probe_enabled() {
-                    if LRP_PROBE_LAYERS.contains(&layer_idx) {
-                        let h_bytes = k * h * 2;
-                        let mut snap = vec![0u8; h_bytes];
-                        self.gpu.synchronize(stream)?;
-                        self.gpu.copy_d2h(hidden, &mut snap)?;
-                        lrp_snapshots.push(snap);
-                    }
+                if layer_resolution_probe_enabled() && LRP_PROBE_LAYERS.contains(&layer_idx) {
+                    let h_bytes = k * h * 2;
+                    let mut snap = vec![0u8; h_bytes];
+                    self.gpu.synchronize(stream)?;
+                    self.gpu.copy_d2h(hidden, &mut snap)?;
+                    lrp_snapshots.push(snap);
                 }
                 // ATLAS_KGAMMA_DEBUG_DUMP=1: dump per-position hidden state
                 // for K=γ verify so we can diff against HF reference
@@ -1028,7 +1208,7 @@ impl TransformerModel {
                 // /tmp/atlas_kgamma_layer{L}_pos{t}.bin one-shot per pair.
                 // Dump only when NOT capturing a CUDA graph (sync ops illegal
                 // during capture). Set ATLAS_DFLASH_DEBUG_NO_GRAPH=1 too.
-                if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
+                if kgamma_debug_dump && !use_graphs {
                     let h_bytes = h * 2;
                     for t in 0..k {
                         let path = format!("/tmp/atlas_kgamma_layer{}_pos{}.bin", layer_idx, t);
@@ -1042,25 +1222,33 @@ impl TransformerModel {
                 }
             }
 
-            // Final norm [K, H]
+            if let Some(guard) = control_guard {
+                guard.finish()?;
+            }
+
             let normed = self.buffers.norm_output();
-            crate::kprof!(self.gpu.as_ref(), stream, "final_norm", {
-                ops::rms_norm(
-                    self.gpu.as_ref(),
-                    self.rms_norm_kernel,
-                    hidden,
-                    &self.final_norm,
-                    normed,
-                    k as u32,
-                    h as u32,
-                    self.config.rms_norm_eps as f32,
-                    stream,
-                )?;
-                anyhow::Result::<()>::Ok(())
-            })?;
+            if serial.final_norm {
+                self.dflash_k1_final_norm(hidden, k, stream)?;
+            } else {
+                crate::kprof!(self.gpu.as_ref(), stream, "final_norm", {
+                    ops::rms_norm(
+                        self.gpu.as_ref(),
+                        self.rms_norm_kernel,
+                        hidden,
+                        &self.final_norm,
+                        normed,
+                        k as u32,
+                        h as u32,
+                        self.config.rms_norm_eps as f32,
+                        stream,
+                    )?;
+                    anyhow::Result::<()>::Ok(())
+                })?;
+            }
+            self.capture_k1_stage("final_norm", normed, k, h * bf16, stream)?;
 
             // DEBUG: dump post-final-norm hidden states (K positions)
-            if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
+            if kgamma_debug_dump && !use_graphs {
                 let h_bytes = h * 2;
                 for t in 0..k {
                     let path = format!("/tmp/atlas_kgamma_final_norm_pos{}.bin", t);
@@ -1073,14 +1261,70 @@ impl TransformerModel {
                 }
             }
 
-            // LM head for K tokens
-            crate::kprof!(self.gpu.as_ref(), stream, "lm_head", {
-                self.lm_head_batched(normed, k as u32, stream)?;
-                anyhow::Result::<()>::Ok(())
-            })?;
+            let lm_head_proof = if serial.lm_head {
+                let (_, proof) = self.dflash_k1_lm_head_argmax(normed, k, stream)?;
+                Some(proof)
+            } else {
+                crate::kprof!(self.gpu.as_ref(), stream, "lm_head", {
+                    self.lm_head_batched(normed, k as u32, stream)?;
+                    anyhow::Result::<()>::Ok(())
+                })?;
+                None
+            };
+            self.capture_k1_stage(
+                "logits",
+                self.buffers.logits(),
+                k,
+                self.config.vocab_size * bf16,
+                stream,
+            )?;
+
+            if stage_capture {
+                if let Some(proof) = lm_head_proof {
+                    let family = serial_family.ok_or_else(|| {
+                        anyhow::anyhow!("DFLASH_K1_LM_HEAD_PATH_PROOF lacks a named serial family")
+                    })?;
+                    let proof_line = proof.proof_line(family, seq.seq_len, tokens)?;
+                    tracing::warn!("{proof_line}");
+                }
+                let report = crate::model::k1_stage_diag::finish_batch()?;
+                if let Some(first) = report.first {
+                    tracing::warn!(
+                        run_id = report.manifest.run_id,
+                        verify_step = report.manifest.verify_step,
+                        pre_verify_len = report.manifest.pre_verify_len,
+                        tokens = ?report.manifest.tokens,
+                        absolute_seq_lens = ?report.manifest.absolute_seq_lens,
+                        family = report.manifest.family,
+                        stage = first.stage,
+                        row = first.row,
+                        mismatch_rows = ?first.mismatch_rows,
+                        first_byte = first.first_byte,
+                        serial_hash = format_args!("{:016x}", first.serial_hash),
+                        batch_hash = format_args!("{:016x}", first.batch_hash),
+                        stages = report.stages,
+                        terminal_stage = report.terminal_stage,
+                        logits_compared = report.logits_compared,
+                        "DFLASH_K1_STAGE_FIRST_DIVERGENCE in_process_exact"
+                    );
+                } else {
+                    tracing::info!(
+                        run_id = report.manifest.run_id,
+                        verify_step = report.manifest.verify_step,
+                        pre_verify_len = report.manifest.pre_verify_len,
+                        tokens = ?report.manifest.tokens,
+                        absolute_seq_lens = ?report.manifest.absolute_seq_lens,
+                        family = report.manifest.family,
+                        stages = report.stages,
+                        terminal_stage = report.terminal_stage,
+                        logits_compared = report.logits_compared,
+                        "DFLASH_K1_STAGE_MATCH in_process_exact"
+                    );
+                }
+            }
 
             // DEBUG: dump logits for first 100 vocab entries per position
-            if std::env::var("ATLAS_KGAMMA_DEBUG_DUMP").is_ok() && !use_graphs {
+            if kgamma_debug_dump && !use_graphs {
                 let vocab = self.config.vocab_size;
                 let bf16 = 2usize;
                 let dump_n = 100.min(vocab);
@@ -1101,23 +1345,25 @@ impl TransformerModel {
             // logits stride AND the argmax range match exactly what
             // `lm_head_batched` wrote for the K=γ transposed GEMM — full vocab
             // when `ATLAS_TARGET_LMHEAD_VOCAB` truncation is off.
-            let vocab = self.verify_lmhead_vocab() as usize;
-            let argmax_out = self.buffers.scratch();
-            crate::kprof!(self.gpu.as_ref(), stream, "argmax", {
-                for t in 0..k {
-                    let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-                    let out_t = argmax_out.offset(t * 4);
-                    ops::argmax_bf16(
-                        self.gpu.as_ref(),
-                        self.argmax_kernel,
-                        logits_t,
-                        out_t,
-                        vocab as u32,
-                        stream,
-                    )?;
-                }
-                anyhow::Result::<()>::Ok(())
-            })?;
+            if !serial.lm_head {
+                let vocab = self.verify_lmhead_vocab() as usize;
+                let argmax_out = self.buffers.scratch();
+                crate::kprof!(self.gpu.as_ref(), stream, "argmax", {
+                    for t in 0..k {
+                        let logits_t = self.buffers.logits().offset(t * vocab * bf16);
+                        let out_t = argmax_out.offset(t * 4);
+                        ops::argmax_bf16(
+                            self.gpu.as_ref(),
+                            self.argmax_kernel,
+                            logits_t,
+                            out_t,
+                            vocab as u32,
+                            stream,
+                        )?;
+                    }
+                    anyhow::Result::<()>::Ok(())
+                })?;
+            }
 
             if use_graphs {
                 let graph = self.gpu.end_capture(stream)?;
@@ -1208,7 +1454,7 @@ impl TransformerModel {
             let accum = LRP_ACCUM.get_or_init(|| Mutex::new(LrpAccum::new(k)));
             let mut g = accum.lock();
             g.accumulate(&out, &probe_ams);
-            if g.step % lrp_dump_every() == 0 {
+            if g.step.is_multiple_of(lrp_dump_every()) {
                 g.dump();
             }
         }

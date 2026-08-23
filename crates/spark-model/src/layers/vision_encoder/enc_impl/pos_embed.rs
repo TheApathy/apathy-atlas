@@ -4,7 +4,7 @@
 //! pos_embed grid + per-patch 2D rotary cos/sin builder.
 
 use anyhow::Result;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{GpuBackend, HostToDeviceCopy};
 
 use super::super::VisionEncoder;
 use super::f32_to_bf16_bits;
@@ -77,7 +77,10 @@ impl VisionEncoder {
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(out_bf16.as_ptr() as *const u8, out_bf16.len() * 2)
         };
-        gpu.copy_h2d_async(bytes, self.buf_pos_resampled, stream)
+        gpu.copy_h2d_group_on_stream(
+            &[HostToDeviceCopy::new(bytes, self.buf_pos_resampled)],
+            stream,
+        )
     }
 
     /// Build per-patch 2D rotary cos/sin in row-major patch order
@@ -147,7 +150,10 @@ impl VisionEncoder {
         let sin_b: &[u8] = unsafe {
             std::slice::from_raw_parts(sin_bf16.as_ptr() as *const u8, sin_bf16.len() * 2)
         };
-        gpu.copy_h2d_async(cos_b, self.buf_rope_cos, stream)?;
-        gpu.copy_h2d_async(sin_b, self.buf_rope_sin, stream)
+        let copies = [
+            HostToDeviceCopy::new(cos_b, self.buf_rope_cos),
+            HostToDeviceCopy::new(sin_b, self.buf_rope_sin),
+        ];
+        gpu.copy_h2d_group_on_stream(&copies, stream)
     }
 }

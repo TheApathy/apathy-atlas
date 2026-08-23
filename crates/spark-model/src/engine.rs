@@ -19,6 +19,13 @@ pub struct GenerateResult {
     pub finish_reason: String,
 }
 
+fn empty_length_result() -> GenerateResult {
+    GenerateResult {
+        output_tokens: Vec::new(),
+        finish_reason: "length".to_string(),
+    }
+}
+
 /// Generate response tokens from a prompt.
 ///
 /// Runs prefill on the prompt tokens, then iteratively decodes up to
@@ -28,6 +35,9 @@ pub fn generate(
     prompt_tokens: &[u32],
     params: &SamplingParams,
 ) -> Result<GenerateResult> {
+    if params.max_tokens == 0 {
+        return Ok(empty_length_result());
+    }
     let mut seq = model.alloc_sequence()?;
     let stream = 0u64; // Default CUDA stream.
 
@@ -97,6 +107,9 @@ pub fn generate_streaming<F>(
 where
     F: FnMut(u32),
 {
+    if params.max_tokens == 0 {
+        return Ok(empty_length_result());
+    }
     let mut seq = model.alloc_sequence()?;
     let stream = 0u64;
 
@@ -171,6 +184,9 @@ pub fn generate_speculative(
     params: &SamplingParams,
     num_drafts: usize,
 ) -> Result<GenerateResult> {
+    if params.max_tokens == 0 {
+        return Ok(empty_length_result());
+    }
     model.generate_speculative(prompt_tokens, params, num_drafts)
 }
 

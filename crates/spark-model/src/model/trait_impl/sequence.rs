@@ -75,12 +75,75 @@ impl TransformerModel {
         }
     }
 
+    /// Release one proposer state's DFlash per-sequence device buffers, if it
+    /// is a DFlash state at all. Extracted from `free_sequence_dispatch` so
+    /// both proposer arms can be freed by the same code — see the call sites.
+    ///
+    /// Takes `&mut Option<Box<dyn ProposerState>>` — the FIELD's own type —
+    /// rather than the `Option<&mut dyn ProposerState>` that reads more
+    /// naturally. That is a borrow-checker requirement, not a style choice.
+    /// `Box<dyn ProposerState>` carries the default object lifetime bound
+    /// `+ 'static`, while an elided `&'a mut dyn ProposerState` parameter
+    /// means `&'a mut (dyn ProposerState + 'a)`. `&mut` is INVARIANT in its
+    /// pointee, so handing it a `&'a mut (dyn ProposerState + 'static)`
+    /// derived from `seq: &'1 mut SequenceState` forces `'1: 'static` — the
+    /// borrow is then inferred to live forever and every later use of `seq`
+    /// in this method conflicts with it. Passing the field by reference keeps
+    /// both sides at `+ 'static` and never forms the mismatched `&mut dyn`.
+    fn free_dflash_state_buffers(
+        &self,
+        state: &mut Option<Box<dyn crate::speculative::ProposerState>>,
+    ) {
+        let Some(ps) = state.as_deref_mut() else {
+            return;
+        };
+        let Some(ds) = ps
+            .as_any_mut()
+            .downcast_mut::<crate::layers::DflashProposerState>()
+        else {
+            return;
+        };
+        // The multi-GB ctx accumulator is pooled across requests (see
+        // `ctx_acc_pool` in dflash_head.rs) — returning it to the pool
+        // instead of cuMemFree avoids the ~200-950 ms UMA first-touch
+        // page-fault cost of re-allocating it on the next request. The
+        // smaller fc/K/V caches are still freed normally.
+        let ctx_acc_bytes = ds.max_ctx_len * ds.ctx_slot_bytes;
+        crate::layers::dflash_head::ctx_acc_pool_return(ctx_acc_bytes, ds.ctx_hidden_acc);
+        ds.ctx_hidden_acc = spark_runtime::gpu::DevicePtr(0);
+        let mut ptrs: Vec<spark_runtime::gpu::DevicePtr> = vec![ds.ctx_fc_cache];
+        ptrs.append(&mut ds.ctx_k_cache);
+        ptrs.append(&mut ds.ctx_v_cache);
+        for p in ptrs {
+            if p.0 != 0
+                && let Err(e) = self.gpu.free(p)
+            {
+                tracing::warn!("free_sequence: dflash buffer free failed: {e:#}");
+            }
+        }
+        ds.ctx_fc_cache = spark_runtime::gpu::DevicePtr(0);
+    }
+
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // A verify-state commit may still be writing this slot on the
+        // secondary stream. Chain that event onto the default stream before
+        // zero_slot and its synchronize below; otherwise a newly allocated
+        // sequence can reuse the slot while the retired request is still
+        // overwriting its recurrent state.
+        self.sync_secondary_dispatch()?;
+
         // ATLAS_DFLASH_ASYNC: an in-flight second-stream propose reads this
         // sequence's ctx accumulator + fc/K/V caches — resolve (sync +
         // discard) BEFORE those buffers are freed below (use-after-free
         // guard). No-op when nothing is in flight.
-        if let Some(ref proposer) = self.proposer {
+        //
+        // Both arms are resolved and freed. A two-arm build allocated a
+        // proposer state per arm in `alloc_sequence`, and only ONE of them is
+        // in `seq.proposer_state` at any moment — freeing just that one would
+        // leak the parked arm's ctx accumulator + fc/K/V caches on every
+        // request, which is the same unbounded-UMA failure the single-arm
+        // free below was written to fix.
+        if let Some(proposer) = self.active_proposer() {
             let res = match seq.proposer_state.as_deref_mut() {
                 Some(ps) => proposer.resolve_async_inflight(self.gpu.as_ref(), Some(ps)),
                 None => proposer.resolve_async_inflight(self.gpu.as_ref(), None),
@@ -89,31 +152,23 @@ impl TransformerModel {
                 tracing::warn!("free_sequence: resolve_async_inflight failed: {e:#}");
             }
         }
+        if let Some(proposer) = self.inactive_proposer() {
+            let res = match seq.proposer_state_alt.as_deref_mut() {
+                Some(ps) => proposer.resolve_async_inflight(self.gpu.as_ref(), Some(ps)),
+                None => proposer.resolve_async_inflight(self.gpu.as_ref(), None),
+            };
+            if let Err(e) = res {
+                tracing::warn!("free_sequence: resolve_async_inflight (parked arm) failed: {e:#}");
+            }
+        }
 
         // Free the DFlash proposer state's per-sequence device buffers.
         // free_state can't (no GpuBackend in scope there); without this,
         // every request leaked the ctx accumulator + fc/K/V caches
         // (hundreds of MB per sequence — unbounded UMA growth while
         // serving).
-        if let Some(ps) = seq.proposer_state.as_mut()
-            && let Some(ds) = ps
-                .as_any_mut()
-                .downcast_mut::<crate::layers::DflashProposerState>()
-        {
-            let mut ptrs: Vec<spark_runtime::gpu::DevicePtr> =
-                vec![ds.ctx_hidden_acc, ds.ctx_fc_cache];
-            ptrs.extend(ds.ctx_k_cache.drain(..));
-            ptrs.extend(ds.ctx_v_cache.drain(..));
-            for p in ptrs {
-                if p.0 != 0
-                    && let Err(e) = self.gpu.free(p)
-                {
-                    tracing::warn!("free_sequence: dflash buffer free failed: {e:#}");
-                }
-            }
-            ds.ctx_hidden_acc = spark_runtime::gpu::DevicePtr(0);
-            ds.ctx_fc_cache = spark_runtime::gpu::DevicePtr(0);
-        }
+        self.free_dflash_state_buffers(&mut seq.proposer_state);
+        self.free_dflash_state_buffers(&mut seq.proposer_state_alt);
 
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
@@ -236,10 +291,32 @@ impl TransformerModel {
                 );
             }
         }
+        {
+            let mut cache = self.verify_kgamma_graph.lock();
+            let stale_keys = super::sequence_graph_cleanup::verify_kgamma_keys_for_slots(
+                &cache,
+                &[seq.slot_idx],
+            );
+            for key in stale_keys {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "free_sequence: destroy_graph(verify_kgamma_graph[{key:?}]): {e:#}"
+                    );
+                }
+            }
+        }
 
-        // Free MTP proposer state (KV cache blocks).
-        if let Some(ref proposer) = self.proposer
+        // Free MTP proposer state (KV cache blocks) — for both arms, each
+        // through the proposer that allocated it.
+        if let Some(proposer) = self.active_proposer()
             && let Some(ref mut pstate) = seq.proposer_state
+        {
+            proposer.free_state(pstate.as_mut())?;
+        }
+        if let Some(proposer) = self.inactive_proposer()
+            && let Some(ref mut pstate) = seq.proposer_state_alt
         {
             proposer.free_state(pstate.as_mut())?;
         }
@@ -330,15 +407,25 @@ impl TransformerModel {
         self.gpu.synchronize(stream)?;
         self.ssm_pool.release_slot(old_slot);
 
-        // Invalidate any cached batch-decode graphs referencing the old slot.
-        // The graph baked the old_slot's SSM pool pointers in; after compaction
-        // this seq uses new_slot and old_slot may be reassigned. Mirrors the
-        // free_sequence invalidation logic.
+        // Invalidate every graph bound to either side of the slot swap. Graphs
+        // for old_slot reference the moved sequence's former buffers. Graphs
+        // for new_slot reference the retired sequence that occupied the
+        // destination; its slot is set to usize::MAX before free_sequence, so
+        // compaction is the only place that can remove those entries.
+        for stale_slot in [old_slot, new_slot] {
+            if let Some(graph) = self.decode_graph.lock().remove(&stale_slot)
+                && let Err(e) = self.gpu.destroy_graph(graph)
+            {
+                tracing::error!(
+                    "compact_sequence: destroy_graph(decode_graph[{stale_slot}]): {e:#}"
+                );
+            }
+        }
         {
             let mut cache = self.batch_decode_graphs.lock();
             let stale_keys: Vec<(Vec<usize>, usize)> = cache
                 .keys()
-                .filter(|(slots, _)| slots.contains(&old_slot))
+                .filter(|(slots, _)| slots.contains(&old_slot) || slots.contains(&new_slot))
                 .cloned()
                 .collect();
             for key in stale_keys {
@@ -348,6 +435,35 @@ impl TransformerModel {
                     tracing::error!(
                         "compact_sequence: destroy_graph(batch_decode_graphs[{:?}]): {e:#}",
                         key
+                    );
+                }
+            }
+        }
+        for graph_mutex in [
+            &self.verify2_graph,
+            &self.verify3_graph,
+            &self.verify4_graph,
+        ] {
+            for stale_slot in [old_slot, new_slot] {
+                if let Some(graph) = graph_mutex.lock().remove(&stale_slot)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!("compact_sequence: destroy_graph(verify[{stale_slot}]): {e:#}");
+                }
+            }
+        }
+        {
+            let mut cache = self.verify_kgamma_graph.lock();
+            let stale_keys = super::sequence_graph_cleanup::verify_kgamma_keys_for_slots(
+                &cache,
+                &[old_slot, new_slot],
+            );
+            for key in stale_keys {
+                if let Some(graph) = cache.remove(&key)
+                    && let Err(e) = self.gpu.destroy_graph(graph)
+                {
+                    tracing::error!(
+                        "compact_sequence: destroy_graph(verify_kgamma_graph[{key:?}]): {e:#}"
                     );
                 }
             }
@@ -399,7 +515,19 @@ impl TransformerModel {
 
                 let mut h_buf = vec![0u8; self.ssm_pool.h_bytes];
                 let mut c_buf = vec![0u8; self.ssm_pool.conv_bytes];
-                gpu.copy_d2h(ssm.h_state, &mut h_buf)?;
+                // The swap FILE is always FP32, so a resumed sequence can be
+                // read back without carrying a dtype tag. Under
+                // ATLAS_SSM_H_FP16 a decoding slot holds FP16 packed into the
+                // first half of h_bytes; serializing that raw would resume into
+                // a freshly-allocated SequenceState whose h_is_f16 is false,
+                // and the next decode step would narrow already-narrow bytes.
+                // Widen here instead — the mirror of ssm_snapshot::save().
+                if ssm.h_is_f16 {
+                    let src = self.widen_h_to_f32_scratch(gpu, ssm.h_state)?;
+                    gpu.copy_d2h(src, &mut h_buf)?;
+                } else {
+                    gpu.copy_d2h(ssm.h_state, &mut h_buf)?;
+                }
                 gpu.copy_d2h(ssm.conv_state, &mut c_buf)?;
                 writer.write_all(&h_buf)?;
                 writer.write_all(&c_buf)?;

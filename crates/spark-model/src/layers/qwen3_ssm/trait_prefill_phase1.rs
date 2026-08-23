@@ -151,20 +151,42 @@ impl Qwen3SsmLayer {
                 })?;
             }
         } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed,
-                nvfp4,
-                proj_dst,
-                k,
-                qkvz_size as u32,
-                h as u32,
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("ssm phase1: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
-            })?;
+            if crate::layers::prefill_proj_pipe_enabled()
+                && self.w4a16_gemm_pipe_k.0 != 0
+                && (h as u32) % 64 == 0
+            {
+                // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
+                // K = h must be a multiple of the pipe's 64-row stage.
+                ops::w4a16_gemm_pipe(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe_k,
+                    normed,
+                    nvfp4,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("ssm phase1: QKVZ PIPE GEMM failed (M={k}, N={qkvz_size}): {e}")
+                })?;
+            } else {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm_k,
+                    normed,
+                    nvfp4,
+                    proj_dst,
+                    k,
+                    qkvz_size as u32,
+                    h as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("ssm phase1: QKVZ GEMM failed (M={k}, N={qkvz_size}): {e}")
+                })?;
+            }
         } else {
             ops::dense_gemm(
                 ctx.gpu,

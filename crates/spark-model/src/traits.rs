@@ -79,8 +79,26 @@ pub struct SequenceState {
     pub seq_len: usize,
     /// Per-layer state (EmptyLayerState for attention, SsmLayerState for SSM).
     pub layer_states: Vec<Box<dyn LayerState>>,
-    /// Per-sequence state for speculative decoding proposer (None if no proposer).
+    /// Per-sequence state for the speculative proposer on the ACTIVE arm
+    /// (None if no proposer). Every reader in the engine uses this field and
+    /// none of them need to know which arm is live — see
+    /// `proposer_state_alt` for how that invariant is maintained.
     pub proposer_state: Option<Box<dyn ProposerState>>,
+    /// Per-sequence state for the INACTIVE proposer arm, parked.
+    ///
+    /// Each proposer type owns a different concrete state (the DFlash drafter
+    /// keeps a ctx accumulator plus fc/K/V caches; the MTP head keeps its own
+    /// paged KV block table), and readers downcast `proposer_state` to the
+    /// type they expect. So an arm switch cannot simply repoint the model's
+    /// proposer: the per-sequence state has to move with it.
+    ///
+    /// `Model::swap_proposer_state` exchanges the two fields, keeping the
+    /// invariant that `proposer_state` ALWAYS belongs to the live arm. That
+    /// is what lets the other ~65 `seq.proposer_state` call sites stay
+    /// unchanged and arm-oblivious.
+    ///
+    /// `None` on every single-proposer build.
+    pub proposer_state_alt: Option<Box<dyn ProposerState>>,
     /// SSM state pool slot index. Used for CUDA graph stability — all sequences
     /// at the same slot_idx use the same fixed GPU addresses.
     pub slot_idx: usize,
@@ -210,4 +228,4 @@ impl SequenceState {
 /// thread. The `unsafe impl Sync` on `TransformerModel` documents this
 /// single-thread invariant — do NOT share `&dyn Model` across threads.
 mod model;
-pub use model::Model;
+pub use model::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT, Model};

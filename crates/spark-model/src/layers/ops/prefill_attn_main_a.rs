@@ -13,6 +13,13 @@ use crate::weight_map::{DenseWeight, Fp8DenseWeight, Fp8Weight, QuantizedWeight}
 
 use super::*;
 
+fn valid_attention_query_range(seq_len: u32, query_start: u32, query_len: u32) -> bool {
+    query_len > 0
+        && query_start
+            .checked_add(query_len)
+            .is_some_and(|end| end <= seq_len)
+}
+
 /// Flash Attention v2 prefill on contiguous Q/K/V.
 ///
 /// Kernel: `inferspark_prefill(Q, K, V, O, seq_len, num_q_heads, num_kv_heads,
@@ -49,6 +56,8 @@ pub fn prefill_attention(
         .arg_ptr(k)
         .arg_ptr(v)
         .arg_ptr(output)
+        .arg_u32(seq_len)
+        .arg_u32(0)
         .arg_u32(seq_len)
         .arg_u32(num_q_heads)
         .arg_u32(num_kv_heads)
@@ -90,6 +99,8 @@ pub fn prefill_attention_64(
         .arg_ptr(v)
         .arg_ptr(output)
         .arg_u32(seq_len)
+        .arg_u32(0)
+        .arg_u32(seq_len)
         .arg_u32(num_q_heads)
         .arg_u32(num_kv_heads)
         .arg_u32(head_dim)
@@ -97,6 +108,69 @@ pub fn prefill_attention_64(
         .arg_u32(if causal { 1 } else { 0 })
         .arg_u32(sliding_window)
         .launch(stream)
+}
+
+/// Flash Attention over a contiguous subset of query rows and the complete
+/// contiguous K/V sequence. The kernel and reduction order are identical to
+/// [`prefill_attention`]; only CTAs whose outputs are outside the requested
+/// range are omitted.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_query_range(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k: DevicePtr,
+    v: DevicePtr,
+    output: DevicePtr,
+    seq_len: u32,
+    query_start: u32,
+    query_len: u32,
+    batch: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    inv_sqrt_d: f32,
+    causal: bool,
+    sliding_window: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        valid_attention_query_range(seq_len, query_start, query_len),
+        "attention query range [{query_start}..{}) exceeds sequence length {seq_len}",
+        query_start.saturating_add(query_len),
+    );
+    let br = if head_dim > 256 { 16u32 } else { 32u32 };
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(query_len, br), batch])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(v)
+        .arg_ptr(output)
+        .arg_u32(seq_len)
+        .arg_u32(query_start)
+        .arg_u32(query_len)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(if causal { 1 } else { 0 })
+        .arg_u32(sliding_window)
+        .launch(stream)
+}
+
+#[cfg(test)]
+mod query_range_tests {
+    use super::valid_attention_query_range;
+
+    #[test]
+    fn tail_query_range_keeps_full_kv_extent() {
+        assert!(valid_attention_query_range(526, 512, 14));
+        assert!(valid_attention_query_range(14, 0, 14));
+        assert!(!valid_attention_query_range(526, 512, 15));
+        assert!(!valid_attention_query_range(526, 512, 0));
+        assert!(!valid_attention_query_range(u32::MAX, u32::MAX, 2));
+    }
 }
 
 /// Contiguous prefill Flash Attention — FP8 E4M3 K/V variant (BR=64).

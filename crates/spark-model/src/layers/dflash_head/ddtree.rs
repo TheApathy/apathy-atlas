@@ -398,6 +398,85 @@ pub fn build_ddtree(
     Ok(DDTree { nodes })
 }
 
+/// Build a parent-valid tree from a parallel block drafter.
+///
+/// A diffusion block supplies candidates by *depth*, not by arbitrary tree
+/// parent.  Consequently, row `d` is conditioned on the top-1 prefix through
+/// depth `d - 1`; reusing that row below an alternative node invents a child
+/// distribution the drafter never computed.  This conservative layout keeps
+/// the top-1 chain as a spine and spends remaining nodes on sibling leaves.
+/// Each sibling is attached to the same spine parent that conditioned its
+/// source row, and alternatives are never extended.
+pub fn build_parent_conditioned_tree(
+    candidates_by_depth: &[Vec<DraftCandidate>],
+    budget: usize,
+    top_k: usize,
+    root_token_id: u32,
+) -> Result<DDTree, DDTreeBuildError> {
+    if budget < 1 {
+        return Err(DDTreeBuildError::InvalidBudget);
+    }
+    let candidates = normalize_candidates(candidates_by_depth, top_k)?;
+    let mut nodes = vec![TreeNode {
+        index: 0,
+        parent_index: None,
+        token_id: root_token_id,
+        depth: 0,
+        score: 0.0,
+    }];
+    let mut spine_parents = Vec::with_capacity(candidates.len());
+    let mut cursor = 0usize;
+    for (depth, row) in candidates.iter().enumerate() {
+        if nodes.len() - 1 == budget {
+            break;
+        }
+        spine_parents.push(cursor);
+        let candidate = row[0];
+        let node = TreeNode {
+            index: nodes.len(),
+            parent_index: Some(cursor),
+            token_id: candidate.token_id,
+            depth: depth + 1,
+            score: nodes[cursor].score + candidate.logprob,
+        };
+        cursor = node.index;
+        nodes.push(node);
+    }
+
+    // Prefer alternatives by complete path score, while preserving stable
+    // depth/candidate ordering for equal scores.
+    let mut leaves = Vec::new();
+    for (depth, &parent_index) in spine_parents.iter().enumerate() {
+        for (candidate_index, &candidate) in candidates[depth].iter().enumerate().skip(1) {
+            leaves.push((
+                nodes[parent_index].score + candidate.logprob,
+                depth,
+                candidate_index,
+                parent_index,
+                candidate,
+            ));
+        }
+    }
+    leaves.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    for (score, depth, _, parent_index, candidate) in leaves {
+        if nodes.len() - 1 == budget {
+            break;
+        }
+        nodes.push(TreeNode {
+            index: nodes.len(),
+            parent_index: Some(parent_index),
+            token_id: candidate.token_id,
+            depth: depth + 1,
+            score,
+        });
+    }
+    Ok(DDTree { nodes })
+}
+
 // ============================================================================
 // Parent metadata — port of ddtree_parent_metadata.py
 // ============================================================================
@@ -1852,6 +1931,33 @@ mod tests {
     }
 
     #[test]
+    fn parent_conditioned_tree_only_extends_the_conditioning_spine() {
+        let tree = build_parent_conditioned_tree(&demo_candidates(), 8, 3, u32::MAX).unwrap();
+        assert_eq!(tree.nodes.len(), 9);
+        assert_eq!(tree.token_ids_for_verifier()[..4], [101, 201, 301, 401]);
+        assert_eq!(tree.parent_indices_for_verifier()[..4], [-1, 0, 1, 2]);
+
+        // Every post-spine node is a leaf attached to the spine node which
+        // actually conditioned that depth's parallel drafter row.
+        for node in &tree.nodes[5..] {
+            let expected_parent = if node.depth == 1 { 0 } else { node.depth - 1 };
+            assert_eq!(node.parent_index, Some(expected_parent));
+            assert!(
+                tree.nodes
+                    .iter()
+                    .all(|other| other.parent_index != Some(node.index))
+            );
+        }
+    }
+
+    #[test]
+    fn parent_conditioned_tree_respects_tight_budget_before_branching() {
+        let tree = build_parent_conditioned_tree(&demo_candidates(), 2, 3, u32::MAX).unwrap();
+        assert_eq!(tree.token_ids_for_verifier(), vec![101, 201]);
+        assert_eq!(tree.parent_indices_for_verifier(), vec![-1, 0]);
+    }
+
+    #[test]
     fn parent_indices_for_verifier_offsets_correctly() {
         let tree = build_ddtree(&demo_candidates(), 8, 3, true, 0, u32::MAX).unwrap();
         let parents = tree.parent_indices_for_verifier();
@@ -2998,9 +3104,7 @@ mod tests {
     /// coding tail corrupted.
     #[test]
     fn flat_chain_dfs_prefix_is_ancestor_exact() {
-        let kp: Vec<i32> = std::iter::once(-1)
-            .chain((0..16).map(|i| i as i32))
-            .collect();
+        let kp: Vec<i32> = std::iter::once(-1).chain(0..16).collect();
         assert!(dfs_prefix_reads_are_ancestor_exact(&kp));
     }
 

@@ -71,11 +71,10 @@
 
 use anyhow::{Result, bail};
 use atlas_core::config::LayerType;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, HostToDeviceCopy};
 
 use super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, FfnDefer, ForwardContext, LayerState};
-use crate::layers::ops;
 use crate::traits::{Model, SequenceState};
 
 impl TransformerModel {
@@ -133,6 +132,14 @@ impl TransformerModel {
         } else {
             2usize
         };
+        let serial = crate::model::env_diag::DflashSerialControls::current();
+        let serial_family = serial.active_family()?;
+        if let Some(family) = serial_family {
+            static PROOF: std::sync::Once = std::sync::Once::new();
+            PROOF.call_once(|| {
+                tracing::warn!(family, c, k, total_rows, "DFLASH_K1_BISECT active");
+            });
+        }
 
         // F62 SpecMamba dual-buffer pre-verify copy per seq (checkpoint →
         // live h_state) so the SSM verify kernels can scratch-write canonical
@@ -195,9 +202,8 @@ impl TransformerModel {
             // slice (attn-only) instead of re-projecting per sequence.
             let layer_qkv_batched = if batched_qkv && layer_type == LayerType::FullAttention {
                 let ctx = self.batched_verify_ctx(None, None);
-                match layer.decode_multi_seq_qkv_batched(
-                    hidden, total_rows, qkv_base, &ctx, stream,
-                ) {
+                match layer.decode_multi_seq_qkv_batched(hidden, total_rows, qkv_base, &ctx, stream)
+                {
                     Ok(()) => true,
                     // Weights unavailable for this layer — v1 per-seq fallback.
                     Err(_) => false,
@@ -229,10 +235,8 @@ impl TransformerModel {
                         stream,
                     )?;
                     let ctx = self.batched_verify_ctx(Some(meta), Some(defer));
-                    let seq_lens_vec: Vec<usize> =
-                        (0..k).map(|t| seq.seq_len + t).collect();
-                    let block_tables_vec: Vec<Vec<u32>> =
-                        vec![seq.block_table.clone(); k];
+                    let seq_lens_vec: Vec<usize> = (0..k).map(|t| seq.seq_len + t).collect();
+                    let block_tables_vec: Vec<Vec<u32>> = vec![seq.block_table.clone(); k];
                     let mut dummy_states: Vec<Box<dyn LayerState>> = (0..k)
                         .map(|_| layer.alloc_state(self.gpu.as_ref()))
                         .collect::<Result<_>>()?;
@@ -286,73 +290,31 @@ impl TransformerModel {
                 }
             }
 
-            // ── ONE batched FFN over all c*K rows: reads FFN weights ONCE ──
             let ffn_ctx = self.batched_verify_ctx(None, None);
-            layer.run_deferred_ffn(ffn_input, hidden, total_rows, &ffn_ctx, stream)?;
+            if serial.ffn {
+                // Exact K=1 FFN family, retaining row order and residual dtype.
+                for row in 0..total_rows {
+                    layer.run_deferred_ffn(
+                        ffn_input.offset(row * h * bf16),
+                        hidden.offset(row * h * fp32),
+                        1,
+                        &ffn_ctx,
+                        stream,
+                    )?;
+                }
+            } else {
+                // One batched FFN over all c*K rows: reads FFN weights once.
+                layer.run_deferred_ffn(ffn_input, hidden, total_rows, &ffn_ctx, stream)?;
+            }
         }
 
-        // ── Final norm over all c*K rows (pure row-parallel) ──
-        let normed = self.buffers.norm_output();
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
+        let all_argmax = self.dflash_batched_finalize(
             hidden,
-            &self.final_norm,
-            normed,
-            total_rows as u32,
-            h as u32,
-            self.config.rms_norm_eps as f32,
+            total_rows,
+            serial.final_norm,
+            serial.lm_head,
             stream,
         )?;
-
-        // ── BATCHED lm_head + argmax over ALL c*K rows (v2) ──
-        // The shared logits buffer is capped at 32 rows (`logits_tokens =
-        // m.min(32)` in buffers/sizes.rs), so we cannot land all `c*K` rows'
-        // logits at once. Instead of the v1 per-seq loop (`c` weight-read
-        // passes, one per sequence), chunk the CONTIGUOUS `[c*K, H]` normed
-        // buffer into `ceil(c*K/32)` runs of ≤32 rows — each run is ONE
-        // lm_head weight-read pass (the transposed m32_n64 kernel covers M≤32
-        // in a single coalesced sweep). At c=8/K=17 this is
-        // ceil(136/32)=5 passes vs 8. Rows may straddle sequence boundaries
-        // (row `r` = seq `r/K`, position `r%K`), which is fine: the lm_head
-        // projection + per-row argmax are independent per row, so a chunk that
-        // mixes two sequences' rows is bit-identical to running each row alone.
-        // Byte-identical to the single-seq `decode_verify` argmax: same kernel,
-        // same weights, same per-row math — only the M-dimension batches.
-        let vocab = self.verify_lmhead_vocab() as usize;
-        const LM_CHUNK: usize = 32;
-        let mut all_argmax: Vec<u32> = vec![0u32; total_rows];
-        let mut chunk_start = 0usize;
-        while chunk_start < total_rows {
-            let rows = (total_rows - chunk_start).min(LM_CHUNK);
-            let normed_chunk = normed.offset(chunk_start * h * bf16);
-            self.lm_head_batched(normed_chunk, rows as u32, stream)?;
-            let argmax_out = self.buffers.scratch();
-            for t in 0..rows {
-                let logits_t = self.buffers.logits().offset(t * vocab * bf16);
-                let out_t = argmax_out.offset(t * 4);
-                ops::argmax_bf16(
-                    self.gpu.as_ref(),
-                    self.argmax_kernel,
-                    logits_t,
-                    out_t,
-                    vocab as u32,
-                    stream,
-                )?;
-            }
-            self.gpu.synchronize(stream)?;
-            let mut buf = vec![0u8; rows * 4];
-            self.gpu.copy_d2h(argmax_out, &mut buf)?;
-            for t in 0..rows {
-                all_argmax[chunk_start + t] = u32::from_le_bytes([
-                    buf[t * 4],
-                    buf[t * 4 + 1],
-                    buf[t * 4 + 2],
-                    buf[t * 4 + 3],
-                ]);
-            }
-            chunk_start += rows;
-        }
         // Slice the flat per-row argmax back into per-seq K-length windows.
         let mut results: Vec<Vec<u32>> = Vec::with_capacity(c);
         for s in 0..c {
@@ -441,8 +403,6 @@ impl TransformerModel {
         let positions: Vec<u32> = (0..k).map(|t| (seq.seq_len + t) as u32).collect();
         let pos_bytes =
             unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, k * 4) };
-        self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
-
         let mut slots = vec![0i64; k];
         for (t, slot) in slots.iter_mut().enumerate() {
             let pos = seq.seq_len + t;
@@ -454,13 +414,8 @@ impl TransformerModel {
             *slot = (physical_block as i64) * (bs as i64) + (block_offset as i64);
         }
         let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, k * 8) };
-        self.gpu
-            .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
-
         let seq_lens: Vec<i32> = (0..k).map(|t| (seq.seq_len + t + 1) as i32).collect();
         let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, k * 4) };
-        self.gpu
-            .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
 
         let mb = max_blocks as usize;
         let mut bt_buf = vec![0i32; k * mb];
@@ -471,8 +426,13 @@ impl TransformerModel {
         }
         let bt_bytes =
             unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, k * mb * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
+        let copies = [
+            HostToDeviceCopy::new(pos_bytes, meta_base),
+            HostToDeviceCopy::new(slot_bytes, meta_base.offset(256)),
+            HostToDeviceCopy::new(sl_bytes, meta_base.offset(512)),
+            HostToDeviceCopy::new(bt_bytes, meta_base.offset(768)),
+        ];
+        self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
         Ok(AttnMetadataDev {
             positions: meta_base,

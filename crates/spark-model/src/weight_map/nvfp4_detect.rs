@@ -187,6 +187,24 @@ pub(crate) struct QuantizeCtx {
     pub stream: u64,
 }
 
+/// Return whether a projection is an FP8 island inside an otherwise-NVFP4
+/// mixed-precision checkpoint. Packed compressed-tensors and ModelOpt NVFP4
+/// are excluded by their format markers before the FP8 dtype is considered.
+pub(crate) fn is_mixed_precision_fp8_weight(
+    dtype: Option<WeightDtype>,
+    has_packed: bool,
+    has_global_scale: bool,
+    has_scale_2: bool,
+    has_scale: bool,
+    has_scale_inv: bool,
+) -> bool {
+    dtype == Some(WeightDtype::FP8E4M3)
+        && !has_packed
+        && !has_global_scale
+        && !has_scale_2
+        && (has_scale || has_scale_inv)
+}
+
 /// Load a quantized weight, dispatching by variant. Handles all three on-disk formats
 /// including FP8 block-scaled (requires dimensions for FP8→BF16→NVFP4 conversion).
 pub(crate) fn quantized_any(
@@ -206,11 +224,27 @@ pub(crate) fn quantized_any(
     let has_packed = store.contains(&format!("{prefix}.weight_packed"));
     let has_scale = store.contains(&format!("{prefix}.weight_scale"));
     let has_scale_inv = store.contains(&format!("{prefix}.weight_scale_inv"));
+    let has_global_scale = store.contains(&format!("{prefix}.weight_global_scale"));
+    let has_scale_2 = store.contains(&format!("{prefix}.weight_scale_2"));
+    let weight_dtype = store.get(&format!("{prefix}.weight")).ok().map(|w| w.dtype);
     let has_only_dense =
         !has_packed && !has_scale && !has_scale_inv && store.contains(&format!("{prefix}.weight"));
+    let has_fp8_dense = is_mixed_precision_fp8_weight(
+        weight_dtype,
+        has_packed,
+        has_global_scale,
+        has_scale_2,
+        has_scale,
+        has_scale_inv,
+    );
     let effective_variant = if has_only_dense && !matches!(variant, Nvfp4Variant::Bf16Raw) {
         tracing::debug!("{prefix}: no quantization metadata; falling back to runtime BF16→NVFP4");
         Nvfp4Variant::Bf16Raw
+    } else if has_fp8_dense
+        && !matches!(variant, Nvfp4Variant::Fp8Dequanted | Nvfp4Variant::Bf16Raw)
+    {
+        tracing::debug!("{prefix}: FP8 key inside an NVFP4 checkpoint; dequant FP8→BF16→NVFP4");
+        Nvfp4Variant::Fp8Dequanted
     } else {
         variant
     };

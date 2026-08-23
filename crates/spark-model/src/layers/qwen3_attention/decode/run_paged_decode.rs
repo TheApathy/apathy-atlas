@@ -41,8 +41,9 @@ fn paged_decode_splitk_enabled() -> bool {
 ///     entire KV history through 8 warps. For K=3 verify on aeon-27b
 ///     (24×3 = 72 CTAs ≥ 48 SMs → num_splits = 1), each CTA scans the full KV
 ///     history; this is the production setting.
-///   • Aggressive (`ATLAS_PAGED_DECODE_SPLITK=1`, EXPERIMENTAL): additionally
-///     split KV when `seq_len` is long. Empirically REGRESSES throughput on
+///   • Aggressive (`ATLAS_PAGED_DECODE_SPLITK=1`, EXPERIMENTAL): use the same
+///     base split geometry as an independent K1 row, then additionally split
+///     KV when `seq_len` is long. Empirically REGRESSES throughput on
 ///     FP8 KV at ctx=4K (measured 9 → 4 tok/s on aeon-27b K=3) because the
 ///     `paged_decode_attn_splitk_fp8` kernel processes one KV position at a
 ///     time (no BC=4 batching), while the non-splitk `paged_decode_attn_fp8`
@@ -54,7 +55,12 @@ fn paged_decode_splitk_enabled() -> bool {
 /// The aggressive regime is kept for completeness — it can be useful as a
 /// scaffold for a future BC=4-aware split-K kernel that combines work-stealing
 /// with batched loads — but the env var must remain OFF by default.
-fn compute_num_splits(num_q_heads: u32, num_seqs: u32, max_seq_len_host: u32) -> u32 {
+fn compute_num_splits_for(
+    num_q_heads: u32,
+    num_seqs: u32,
+    max_seq_len_host: u32,
+    aggressive: bool,
+) -> u32 {
     use atlas_core::device::sm121::NUM_SMS;
     const SPLIT_TILE: u32 = 512;
     const MAX_SPLITS_CAP: u32 = 64;
@@ -66,20 +72,87 @@ fn compute_num_splits(num_q_heads: u32, num_seqs: u32, max_seq_len_host: u32) ->
         NUM_SMS / current_ctas
     };
 
-    if !paged_decode_splitk_enabled() {
+    if !aggressive {
         return legacy;
     }
 
+    // The aggressive regime owns an extended [seq, head, split] arena with a
+    // guaranteed minimum of two splits per row. Use independent K1 geometry
+    // only when it fits that guarantee (Qwen3.8: 48 / 24 heads = 2). Smaller
+    // head counts can demand up to 48 K1 splits and would exceed the generic
+    // arena at 32 rows, so they retain the prior batch-derived occupancy.
+    // Keep the legacy/default regime above byte-for-byte unchanged.
+    let k1_legacy = if num_q_heads >= NUM_SMS {
+        1u32
+    } else {
+        NUM_SMS / num_q_heads
+    };
+    let occupancy_floor = if k1_legacy <= 2 { k1_legacy } else { legacy };
     let seq_target = max_seq_len_host
         .div_ceil(SPLIT_TILE)
         .clamp(1, MAX_SPLITS_CAP);
-    // Keep at least `legacy` splits — never regress on the fill-SMs heuristic.
-    // The kernel handles num_splits=1 directly via the non-splitk fallback, so
-    // only invoke split-K when we have something to gain (>= 2 splits).
-    seq_target.max(legacy)
+    seq_target.max(occupancy_floor)
+}
+
+const fn flat_window_min_seq_len_host(num_seqs: u32, max_seq_len_host: u32) -> u32 {
+    max_seq_len_host.saturating_sub(num_seqs.saturating_sub(1))
+}
+
+fn flat_window_crosses_k1_split_boundary_for(
+    num_q_heads: u32,
+    num_seqs: u32,
+    max_seq_len_host: u32,
+    aggressive: bool,
+) -> bool {
+    use atlas_core::device::sm121::NUM_SMS;
+    if !aggressive || num_seqs <= 1 {
+        return false;
+    }
+    let k1_legacy = if num_q_heads >= NUM_SMS {
+        1
+    } else {
+        NUM_SMS / num_q_heads
+    };
+    if k1_legacy > 2 {
+        return false;
+    }
+    let min_seq_len_host = flat_window_min_seq_len_host(num_seqs, max_seq_len_host);
+    compute_num_splits_for(num_q_heads, 1, min_seq_len_host, true)
+        != compute_num_splits_for(num_q_heads, 1, max_seq_len_host, true)
+}
+
+fn flat_window_crosses_k1_split_boundary(
+    num_q_heads: u32,
+    num_seqs: u32,
+    max_seq_len_host: u32,
+) -> bool {
+    flat_window_crosses_k1_split_boundary_for(
+        num_q_heads,
+        num_seqs,
+        max_seq_len_host,
+        paged_decode_splitk_enabled(),
+    )
+}
+
+fn compute_num_splits(num_q_heads: u32, num_seqs: u32, max_seq_len_host: u32) -> u32 {
+    compute_num_splits_for(
+        num_q_heads,
+        num_seqs,
+        max_seq_len_host,
+        paged_decode_splitk_enabled(),
+    )
 }
 
 impl Qwen3AttentionLayer {
+    pub(in crate::layers::qwen3_attention) fn flat_window_needs_k1_paged_rows(
+        &self,
+        num_q_heads: u32,
+        num_seqs: u32,
+        max_seq_len_host: u32,
+    ) -> bool {
+        flat_window_crosses_k1_split_boundary(num_q_heads, num_seqs, max_seq_len_host)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn run_paged_decode(
         &self,
@@ -513,8 +586,44 @@ impl Qwen3AttentionLayer {
                 }
             }
             KvCacheDtype::Bf16 => {
-                // BF16 paged decode — no Split-K (not implemented for BF16 yet)
-                // Use HDIM=512 kernel for Gemma-4 full-attention layers (head_dim > 256)
+                // Tree verify uses a Qwen-only ABI. Keep the shared BF16
+                // symbol byte-for-byte compatible with Gemma-4, whose final
+                // argument is `sliding_window` rather than tree metadata.
+                if kv_indirection != DevicePtr::NULL {
+                    anyhow::ensure!(
+                        self.paged_decode_bf16_qwen_tree_k.0 != 0,
+                        "BF16 DDTree indirection requested without the dedicated Qwen kernel"
+                    );
+                    anyhow::ensure!(
+                        kv_indir_base_ptr != DevicePtr::NULL && kv_indir_stride > 0,
+                        "BF16 DDTree indirection metadata is incomplete"
+                    );
+                    return ops::paged_decode_attn_bf16_qwen_tree(
+                        gpu,
+                        self.paged_decode_bf16_qwen_tree_k,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        kv_indirection,
+                        kv_indir_base_ptr,
+                        kv_indir_stride,
+                        stream,
+                    );
+                }
+
+                // Legacy BF16 decode — no Split-K. Gemma-4 uses the HDIM=512
+                // variant and retains its unchanged sliding-window ABI.
                 let kernel = if head_dim > 256 && self.paged_decode_512_k.0 != 0 {
                     self.paged_decode_512_k
                 } else {
@@ -636,3 +745,7 @@ impl Qwen3AttentionLayer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run_paged_decode_tests.rs"]
+mod tests;

@@ -117,8 +117,8 @@ pub fn paged_decode_attn_kgamma_nvfp4(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([num_q_heads, 1, 1])
-        .block([256, 1, 1])
+        .grid([num_q_heads, num_qtile.div_ceil(2), 1])
+        .block([512, 1, 1])
         .arg_ptr(q)
         .arg_ptr(k_cache)
         .arg_ptr(v_cache)
@@ -139,6 +139,99 @@ pub fn paged_decode_attn_kgamma_nvfp4(
         .arg_ptr(DevicePtr::NULL)
         .arg_ptr(DevicePtr::NULL)
         .arg_u32(0)
+        .launch(stream)
+}
+
+/// Qwen3.8 M=15 fused-query attention over per-tensor FP8 K/V cache.
+/// The kernel retains the established FP8 BC=4 online-softmax update.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_kgamma_fp8_bc4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_tables: DevicePtr,
+    seq_lens: DevicePtr,
+    max_blocks_per_seq: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    inv_sqrt_d: f32,
+    k_scale: f32,
+    v_scale: f32,
+    q_stride: u32,
+    cache_stride: u64,
+    num_qtile: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(num_qtile == 15, "FP8 Kgamma BC4 requires M=15");
+    anyhow::ensure!(head_dim == 128, "FP8 Kgamma BC4 requires HDIM=128");
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, num_qtile.div_ceil(2), 1])
+        .block([512, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_tables)
+        .arg_ptr(seq_lens)
+        .arg_u32(max_blocks_per_seq)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_f32(k_scale)
+        .arg_f32(v_scale)
+        .arg_u32(q_stride)
+        .arg_u64(cache_stride)
+        .arg_u32(num_qtile)
+        .launch(stream)
+}
+
+/// Flat K-gamma fused paged-decode attention for BF16 KV, HDIM=256.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_kgamma_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_tables: DevicePtr,
+    seq_lens: DevicePtr,
+    max_blocks_per_seq: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    inv_sqrt_d: f32,
+    q_stride: u32,
+    cache_stride: u64,
+    num_qtile: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, num_qtile.div_ceil(2), 1])
+        .block([512, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_tables)
+        .arg_ptr(seq_lens)
+        .arg_u32(max_blocks_per_seq)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(q_stride)
+        .arg_u64(cache_stride)
+        .arg_u32(num_qtile)
         .launch(stream)
 }
 
@@ -174,8 +267,8 @@ pub fn paged_decode_attn_kgamma_nvfp4_vec(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([num_q_heads, 1, 1])
-        .block([256, 1, 1])
+        .grid([num_q_heads, num_qtile.div_ceil(2), 1])
+        .block([512, 1, 1])
         .arg_ptr(q)
         .arg_ptr(k_cache)
         .arg_ptr(v_cache)
@@ -296,8 +389,8 @@ pub fn paged_decode_attn_kgamma_nvfp4_fa2(
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([num_q_heads, 1, 1])
-        .block([256, 1, 1])
+        .grid([num_q_heads, num_qtile.div_ceil(2), 1])
+        .block([512, 1, 1])
         .arg_ptr(q)
         .arg_ptr(k_cache)
         .arg_ptr(v_cache)

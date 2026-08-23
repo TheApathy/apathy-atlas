@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::block_mgmt::{
@@ -17,6 +17,7 @@ use super::block_mgmt::{
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
 use super::ssm_pool::SsmStatePool;
+use super::ssm_pool_geometry::{DDTREE_KERNEL_KMAX, checked_ssm_speculative_geometry};
 use super::ssm_snapshot::SsmSnapshotPool;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
@@ -79,6 +80,60 @@ impl TransformerModel {
         };
         let w4a16_gemv_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv")?;
         let w4a16_gemv_logits_kernel = gpu.kernel("w4a16_gemv", "w4a16_gemv_logits")?;
+        let w4a16_exact_lm_head_kernels = ops::W4a16ExactLmHeadKernels::new(
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv",
+                ops::ExactLmHeadTier::M4.symbol(),
+            ),
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv",
+                ops::ExactLmHeadTier::M8.symbol(),
+            ),
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv",
+                ops::ExactLmHeadTier::M17.symbol(),
+            ),
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv",
+                ops::ExactLmHeadTier::M32.symbol(),
+            ),
+        )
+        .with_rt2(
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv_rt",
+                ops::ExactLmHeadTier::M4.symbol_rt2(),
+            ),
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv_rt",
+                ops::ExactLmHeadTier::M8.symbol_rt2(),
+            ),
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv_rt",
+                ops::ExactLmHeadTier::M17.symbol_rt2(),
+            ),
+            crate::layers::try_kernel(
+                gpu.as_ref(),
+                "w4a16_gemv_rt",
+                ops::ExactLmHeadTier::M32.symbol_rt2(),
+            ),
+        );
+        tracing::info!(
+            target: "atlas::lm_head",
+            policy = "exact_dynamic_m_or_serial_k1",
+            m4 = w4a16_exact_lm_head_kernels.is_present(ops::ExactLmHeadTier::M4),
+            m8 = w4a16_exact_lm_head_kernels.is_present(ops::ExactLmHeadTier::M8),
+            m17 = w4a16_exact_lm_head_kernels.is_present(ops::ExactLmHeadTier::M17),
+            m32 = w4a16_exact_lm_head_kernels.is_present(ops::ExactLmHeadTier::M32),
+            rt2 = ops::w4a16_gemv_rt2_enabled(),
+            "LM_HEAD_EXACT_STARTUP"
+        );
         let w4a16_gemm_kernel = gpu.kernel("w4a16", "w4a16_gemm")?;
         let w4a16_gemm_t_m32_n64_kernel =
             crate::layers::try_kernel(gpu.as_ref(), "w4a16", "w4a16_gemm_t_m32_n64");
@@ -116,24 +171,7 @@ impl TransformerModel {
         // For MTP K=2/3/4 verify: K = num_drafts + 1.
         // For DFlash K=γ verify: K = γ + 1 (drafter's γ drafts + 1 verified bonus slot).
         // Pool size = max of both so DFlash and MTP can coexist on the same model.
-        let dflash_kgamma = if !config.dflash_capture_layers.is_empty() {
-            // `dflash_kgamma` is the verify token count T = γ+1 (the bonus
-            // last-token slot + γ draft slots) — it sizes every verify-side
-            // persistent buffer: parent_ids capacity (= kernel_parents.len()
-            // = T, see trait_impl/mod.rs), tree_kv_indir stride, and the
-            // tree_kv_pack num_seqs. The verify entry uses `k == capacity`
-            // (verify_d.rs) where k = tokens.len() = T, so the capacity MUST
-            // equal T, not γ.
-            //
-            // Drafter's γ is plumbed through `num_drafts`: for DFlash the
-            // scheduler is configured with `num_drafts = γ - 1` (serve.rs /
-            // build.rs), so T = γ+1 = num_drafts + 2. This MUST track the
-            // ACTUAL γ, not a literal 17, or γ>16 OOBs these buffers. For the
-            // canonical γ=16 run this evaluates to 15+2 = 17 (unchanged).
-            num_drafts + 2
-        } else {
-            0
-        };
+        let dflash_enabled = !config.dflash_capture_layers.is_empty();
         // ── DDTree wide-tree verify capacity (ATLAS_DDTREE_MAX_NODES) ──
         // The drafter emits γ draft positions, so the FLAT verify width is
         // `dflash_kgamma` (= γ+1). But a DDTree branch tree can hold MORE
@@ -147,22 +185,6 @@ impl TransformerModel {
         // ddtree_cap) routes through the proven wy_k path (the persistent
         // parent injection at `k == capacity` no longer matches at the flat
         // width — validated bit-identical to the tree_wy-linear-chain path).
-        const DDTREE_KERNEL_KMAX: usize = 32; // must match gated_delta_rule_tree_wy.cu K_MAX
-        let ddtree_cap = if dflash_kgamma > 0 {
-            std::env::var("ATLAS_DDTREE_MAX_NODES")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .unwrap_or(dflash_kgamma)
-                .clamp(dflash_kgamma, DDTREE_KERNEL_KMAX)
-        } else {
-            0
-        };
-        if ddtree_cap > dflash_kgamma {
-            tracing::info!(
-                "ATLAS_DDTREE_MAX_NODES: wide-tree verify capacity = {ddtree_cap} \
-                 (flat width dflash_kgamma = {dflash_kgamma}, kernel K_MAX = {DDTREE_KERNEL_KMAX})"
-            );
-        }
         // DFlash needs the SSM verify pools regardless of MTP weight presence
         // or lm_head quantization — its K=γ verify path checkpoints SSM state
         // for partial-accept rollback. Force `has_mtp` on whenever DFlash is
@@ -170,22 +192,25 @@ impl TransformerModel {
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && lm_head_nvfp4.is_some())
             || (use_speculative && mtp_dense_weights.is_some() && lm_head_nvfp4.is_some())
-            || dflash_kgamma > 0;
-        let num_intermediates = if has_mtp {
-            // wy17 writes K-1 inter slots (final state in h_state) so dflash_kgamma
-            // suffices for that path. M8A tree_wy / general-K verify writes ALL
-            // T = γ+1 slots into intermediates because tree topology needs every
-            // state addressable by token. With dflash_kgamma = T (= num_drafts+2),
-            // `dflash_kgamma + 1` = T+1 keeps one slot of headroom so tree mode
-            // never OOBs. For γ=16 this is 17+1 = 18 (unchanged from the prior
-            // hardcoded `.max(17 + 1)`). The MTP branch (`num_drafts + 2`) covers
-            // the K = num_drafts+1 verify when DFlash is inactive.
-            // `ddtree_cap + 1` keeps one slot of headroom so wide-tree mode
-            // (which writes all T tree slots into intermediates) never OOBs.
-            (num_drafts + 2).max(ddtree_cap + 1)
-        } else {
-            0
-        };
+            || dflash_enabled;
+        let requested_ddtree_capacity = std::env::var("ATLAS_DDTREE_MAX_NODES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        let speculative_geometry = checked_ssm_speculative_geometry(
+            has_mtp,
+            dflash_enabled,
+            num_drafts,
+            requested_ddtree_capacity,
+        )?;
+        let dflash_kgamma = speculative_geometry.dflash_verify_width;
+        let ddtree_cap = speculative_geometry.ddtree_capacity;
+        let num_intermediates = speculative_geometry.num_intermediates;
+        if ddtree_cap > dflash_kgamma {
+            tracing::info!(
+                "ATLAS_DDTREE_MAX_NODES: wide-tree verify capacity = {ddtree_cap} \
+                 (flat width dflash_kgamma = {dflash_kgamma}, kernel K_MAX = {DDTREE_KERNEL_KMAX})"
+            );
+        }
         let ssm_pool = SsmStatePool::new(
             &config,
             max_batch_size,
@@ -204,8 +229,8 @@ impl TransformerModel {
         // both default (linear-chain) and tree-mode payloads share the
         // same address, mutating only the contents.
         //
-        // Capacity = dflash_kgamma (17 on qwen3.6-27b). Tree-mode upload
-        // never exceeds K=γ tokens. Pre-stamped with the linear chain
+        // Capacity = ddtree_cap (at least dflash_kgamma). Tree-mode upload
+        // never exceeds that configured cap. Pre-stamped with the linear chain
         // `[-1, 0, 1, ..., K-2]` so flat-payload verify reuses tree_wy
         // without an upload (zero-copy bit-equivalence path).
         let (parent_ids_persistent, parent_ids_capacity) = if dflash_kgamma > 0 {
@@ -220,8 +245,10 @@ impl TransformerModel {
             }
             let byte_view =
                 unsafe { std::slice::from_raw_parts(chain.as_ptr() as *const u8, bytes) };
-            gpu.copy_h2d_async(byte_view, buf, gpu.default_stream())?;
-            gpu.synchronize(gpu.default_stream())?;
+            gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(byte_view, buf)],
+                gpu.default_stream(),
+            )?;
             tracing::info!(
                 "M8A: allocated graph-safe parent_ids buffer ({cap} slots, ptr={:?})",
                 buf
@@ -236,7 +263,7 @@ impl TransformerModel {
         // For K=γ verify, when tree-mode is active and the user opted in via
         // `ATLAS_TREE_AWARE_ATTN=1`, verify_d.rs builds a per-row indirection
         // table that maps each query's compact tree slot back to its ancestor
-        // chain. Layout: `[num_rows=dflash_kgamma, stride=dflash_kgamma]` i32,
+        // chain. Layout: `[num_rows=ddtree_cap, stride=ddtree_cap]` i32,
         // row-major. The kernel reads `indir[seq_idx*stride + (pos - base)]`
         // to remap positions in the tree window.
         //
@@ -256,8 +283,10 @@ impl TransformerModel {
             }
             let byte_view =
                 unsafe { std::slice::from_raw_parts(identity.as_ptr() as *const u8, bytes) };
-            gpu.copy_h2d_async(byte_view, buf, gpu.default_stream())?;
-            gpu.synchronize(gpu.default_stream())?;
+            gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(byte_view, buf)],
+                gpu.default_stream(),
+            )?;
             tracing::info!(
                 "ATLAS_TREE_AWARE_ATTN: allocated indirection buffer ({}x{} i32, ptr={:?})",
                 stride,
@@ -283,20 +312,18 @@ impl TransformerModel {
             let buf = gpu.alloc(std::mem::size_of::<i32>())?;
             gpu.memset_async(buf, 0, std::mem::size_of::<i32>(), gpu.default_stream())?;
             gpu.synchronize(gpu.default_stream())?;
-            let host_ptr = gpu.alloc_host_pinned(std::mem::size_of::<i32>())?;
+            let mut host = gpu.alloc_host_pinned(std::mem::size_of::<i32>())?;
             // Pre-zero the pinned shadow so any pre-tree verify (rare) is
             // consistent with the device buffer's zero-init.
-            unsafe {
-                std::ptr::write_bytes(host_ptr, 0u8, std::mem::size_of::<i32>());
-            }
+            host.as_mut_slice().fill(0);
             tracing::info!(
                 "ATLAS_TREE_AWARE_ATTN: allocated kv_indir_base buffer (1xi32, dev={:?}, host_pinned={:?})",
                 buf,
-                host_ptr
+                host.as_ptr()
             );
-            (buf, host_ptr)
+            (buf, Some(host))
         } else {
-            (DevicePtr::NULL, std::ptr::null_mut::<u8>())
+            (DevicePtr::NULL, None)
         };
 
         // ATLAS_TREE_KV_PACK: per-attention-layer packed-KV scratch pool.
@@ -396,7 +423,10 @@ impl TransformerModel {
                 let identity: Vec<i32> = (0..num_seqs as i32).collect();
                 let bt_view =
                     unsafe { std::slice::from_raw_parts(identity.as_ptr() as *const u8, bt_bytes) };
-                gpu.copy_h2d_async(bt_view, bt_buf, gpu.default_stream())?;
+                gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(bt_view, bt_buf)],
+                    gpu.default_stream(),
+                )?;
 
                 let seq_lens_bytes = num_seqs * std::mem::size_of::<i32>();
                 let seq_lens_buf = gpu.alloc(seq_lens_bytes)?;
@@ -456,19 +486,62 @@ impl TransformerModel {
             )
         };
 
-        // Marconi SSM snapshot pool for prefix caching.
-        // PR #74 added decode_ring_slots + decode_max_seqs args for the
-        // Phase-C decode-rollback region. We set both to 0 (decode rollback
-        // disabled) — Marconi caching still works the same.
+        // Marconi prefix-cache snapshots plus the Phase-C decode-rollback
+        // ring. Keep one boundary snapshot beyond the per-sequence rollback
+        // cap; startup preflight reserves this exact ring for every batch slot.
         let ssm_snapshots = SsmSnapshotPool::new(
             ssm_cache_slots,
             ssm_pool.h_bytes,
             ssm_pool.conv_bytes,
             ssm_pool.num_ssm_layers,
-            0, // decode_ring_slots
-            0, // decode_max_seqs
+            (atlas_kernels::ROLLBACK_RESTEER_CAP as usize) + 1,
+            max_batch_size,
             gpu.as_ref(),
         )?;
+        // ATLAS_SSM_H_FP16 x DFlash: REFUSE. Measured 2026-08-20.
+        //
+        // Only wy2/wy3/wy4 have f16 twins. The GDN h-state readers and writers
+        // the DFlash arm actually runs — gated_delta_rule_tree,
+        // gated_delta_rule_tree_wy and the wy17 family — are FP32 with no f16
+        // variant anywhere in this tree or upstream. An FP32 kernel reading an
+        // FP16 pool does not fault; it emits fluent garbage
+        // (kernels/gb10/common/README-f16-ssm-h.md).
+        //
+        // Measured on the serving config, gamma=7, MinHeap probe:
+        //     FP32   44.42 tok/s   accepted 4.78   content 49caed9e...
+        //     FP16    9.18 tok/s   accepted 0.20   content 7d0c2014...
+        // Different output hash: the flag changes what the model SAYS. Verify
+        // time was unchanged (100.87 -> 100.95 ms), so it was not even reducing
+        // state traffic — it was only corrupting it.
+        //
+        // Refuse rather than warn: the failure is silent, fluent and would be
+        // attributed to the drafter, not to a dtype flag.
+        if crate::layers::qwen3_ssm::ssm_h_fp16_enabled() && dflash_enabled {
+            anyhow::bail!(
+                "ATLAS_SSM_H_FP16=1 is incompatible with DFlash speculative decoding: \
+                 the tree/wy17 GDN kernels this path runs are FP32-only and would read \
+                 the FP16 pool as FP32, producing fluent but WRONG output (measured \
+                 9.18 vs 44.42 tok/s and a different content hash). Unset ATLAS_SSM_H_FP16, \
+                 or port gated_delta_rule_decode_f16_norm and the tree/wy17 f16 twins first."
+            );
+        }
+
+        // ATLAS_SSM_H_FP16 x Marconi.
+        //
+        // Under the flag a DECODING slot holds FP16, but every snapshot on disk
+        // and in the pool is FP32: `ssm_snapshots.save()` takes `h_is_f16` and
+        // widens per layer via ssm_h_state_f16_to_f32. That keeps restore,
+        // spill, fault-in, tier-fingerprint and swap all dtype-agnostic, so the
+        // two features compose. The widener is resolved at pool construction;
+        // `save()` bails if the flag is live and the kernel is missing rather
+        // than writing half-width bytes into an FP32 snapshot.
+        if crate::layers::qwen3_ssm::ssm_h_fp16_enabled() && ssm_cache_slots > 0 {
+            tracing::info!(
+                "ATLAS_SSM_H_FP16=1 with {ssm_cache_slots} Marconi slots: \
+                 snapshots widen FP16->FP32 on save"
+            );
+        }
+
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
             tracing::info!(
                 "Marconi intermediate checkpoints: every {} blocks ({} tokens at block_size={})",
@@ -491,11 +564,11 @@ impl TransformerModel {
         kv_cache.zero_block(dummy_kv_block, gpu.as_ref(), gpu.default_stream())?;
         gpu.synchronize(gpu.default_stream())?;
 
-        // ATLAS_LM_HEAD_T=1: transposed NVFP4 lm_head copy so the K=γ
-        // verify lm_head routes through w4a16_gemm_t_m32_n64 (single
-        // coalesced B read at M ≤ 32) instead of the strided plain
-        // w4a16_gemm (~5× off the bandwidth floor at M=17, ~15 ms/step
-        // on qwen3.6-27b's 248k vocab). ~0.63 GB extra device memory.
+        // ATLAS_LM_HEAD_T=1: transposed NVFP4 lm_head copy retained for
+        // post-construction sharing with the DFlash drafter's propose head
+        // (`dflash_lm_head_t`). Target verification no longer reads this
+        // layout: `lm_head_batched` routes M=2..=32 through the exact
+        // row-major family or independent K1 GEMVs. ~0.63 GB extra memory.
         let lm_head_nvfp4_t = if std::env::var("ATLAS_LM_HEAD_T").ok().as_deref() == Some("1")
             && w4a16_gemm_t_m32_n64_kernel.0 != 0
         {
@@ -505,7 +578,7 @@ impl TransformerModel {
                     {
                         Ok(t) => {
                             tracing::info!(
-                                "lm_head NVFP4-T built for K=γ m32 path (vocab={})",
+                                "lm_head NVFP4-T built for DFlash drafter sharing (vocab={})",
                                 config.vocab_size
                             );
                             Some(t)
@@ -660,10 +733,9 @@ impl TransformerModel {
             let n = dflash_capture_layers.len();
             // Max verify width T = γ+1 (= dflash_kgamma): the K=γ verify
             // captures hidden state for ALL T input rows via
-            // `try_dflash_capture(token_idx=0..T)`. Hardcoding 17 (γ=16)
-            // OOB-writes this buffer for γ>16 → GPU illegal-memory crash.
-            // Track the real γ so γ=20/24/32 size correctly.
-            let k_max = dflash_kgamma.max(ddtree_cap).max(17);
+            // `try_dflash_capture(token_idx=0..T)`. Track the real flat/tree
+            // capacities instead of hardcoding a historical width.
+            let k_max = dflash_kgamma.max(ddtree_cap);
             Some(gpu.alloc(k_max * n * config.hidden_size * 2)?)
         };
 
@@ -694,12 +766,11 @@ impl TransformerModel {
 
         // Allocate pinned host staging buffer for batched metadata H2D.
         let pinned_bytes = buffers.sizes().scratch.max(64 * 1024);
-        let pinned_ptr = gpu.alloc_host_pinned(pinned_bytes)?;
+        let pinned_buffer = gpu.alloc_host_pinned(pinned_bytes)?;
         tracing::info!("Pinned metadata staging: {} KB", pinned_bytes / 1024);
         let max_batch_tokens = buffers.max_batch_tokens();
         let pinned_staging = std::cell::UnsafeCell::new(PinnedMetaStaging {
-            ptr: pinned_ptr,
-            bytes: pinned_bytes,
+            buffer: pinned_buffer,
             positions: Vec::with_capacity(max_batch_tokens),
             positions_h: Vec::with_capacity(max_batch_tokens),
             positions_w: Vec::with_capacity(max_batch_tokens),
@@ -710,6 +781,15 @@ impl TransformerModel {
         let ssm_norm_k = gpu
             .kernel("ssm_state_norm", "ssm_state_clamp_norm_fused")
             .unwrap_or(KernelHandle(0));
+        // ATLAS_SSM_H_FP16 stage 2: one-shot FP32 -> FP16 h-state converter.
+        // try_kernel, not kernel: absent on targets that never built
+        // ssm_h_dtype, and its absence must not break an ordinary FP32 serve.
+        // A zero handle here makes ssm_h_to_f16_dispatch refuse loudly rather
+        // than run FP16 kernels over an unconverted pool.
+        let ssm_h_f32_to_f16_k =
+            crate::layers::try_kernel(gpu.as_ref(), "ssm_h_dtype", "ssm_h_state_f32_to_f16");
+        let ssm_h_f16_to_f32_k =
+            crate::layers::try_kernel(gpu.as_ref(), "ssm_h_dtype", "ssm_h_state_f16_to_f32");
 
         // Logit softcapping (Gemma-4: cap=30.0). Only load if model uses it.
         let logit_softcap_kernel = if config.final_logit_softcapping > 0.0 {
@@ -867,7 +947,9 @@ impl TransformerModel {
             tree_kv_indir_persistent,
             tree_kv_indir_stride,
             tree_kv_indir_base_persistent,
-            tree_kv_indir_base_host_pinned,
+            tree_kv_indir_base_host_pinned: std::cell::UnsafeCell::new(
+                tree_kv_indir_base_host_pinned,
+            ),
             tree_kv_pack_scratch_k,
             tree_kv_pack_scratch_v,
             tree_kv_pack_block_table,
@@ -892,6 +974,7 @@ impl TransformerModel {
             dense_gemv_fp32out_kernel,
             w4a16_gemv_kernel,
             w4a16_gemv_logits_kernel,
+            w4a16_exact_lm_head_kernels,
             w4a16_gemm_kernel,
             w4a16_gemm_t_m32_n64_kernel,
             w4a16_gemv_batch2_kernel,
@@ -922,6 +1005,13 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            // Arm 1 stays empty here. `set_dflash_proposer` (impl_b3.rs) is
+            // the only thing that fills it, by demoting the MTP head this
+            // constructor just built when a DFlash drafter is installed on
+            // top. A build with one proposer keeps `None` and behaves exactly
+            // as it did before the arm split existed.
+            proposer_alt: None,
+            active_proposer_arm: std::sync::atomic::AtomicU8::new(0),
             mtp_hidden_save,
             mtp_lastk_buf,
             mtp_lastk_capacity,
@@ -950,6 +1040,10 @@ impl TransformerModel {
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,
             ssm_norm_ptrs_buf: ssm_norm_ptrs,
+            ssm_h_f32_to_f16_kernel: ssm_h_f32_to_f16_k,
+            ssm_h_f16_scratch: std::sync::OnceLock::new(),
+            ssm_h_f16_to_f32_kernel: ssm_h_f16_to_f32_k,
+            ssm_h_f32_scratch: std::sync::OnceLock::new(),
             gdn_buf_qkv: gdn_qkv,
             gdn_buf_gate_beta: gdn_gate_beta,
             gdn_buf_out: gdn_out,
@@ -961,5 +1055,28 @@ impl TransformerModel {
             logits_fp32_buf,
             embed_scale_kernel,
         })
+    }
+}
+
+#[cfg(test)]
+mod dflash_verify_width_tests {
+    use super::checked_ssm_speculative_geometry;
+
+    #[test]
+    fn verify_width_is_anchor_plus_actual_drafts() {
+        for (drafts, expected) in [(15, 16), (6, 7), (1, 2)] {
+            assert_eq!(
+                checked_ssm_speculative_geometry(true, true, drafts, None)
+                    .unwrap()
+                    .dflash_verify_width,
+                expected
+            );
+        }
+        assert_eq!(
+            checked_ssm_speculative_geometry(false, false, 15, None)
+                .unwrap()
+                .dflash_verify_width,
+            0
+        );
     }
 }

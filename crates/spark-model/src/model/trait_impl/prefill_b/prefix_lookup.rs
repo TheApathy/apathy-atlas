@@ -27,7 +27,7 @@ impl TransformerModel {
             let mut prefix_match = if self.tokens_have_vision_pad(tokens) {
                 spark_runtime::prefix_cache::PrefixMatch::empty()
             } else {
-                self.prefix_cache.lookup(tokens, bs, seq.session_hash)
+                self.lookup_prefill_prefix(tokens, bs, seq.session_hash)
             };
             // F83 (2026-04-30): on EP>1, head and worker have
             // independent local prefix caches whose match counts can
@@ -54,11 +54,11 @@ impl TransformerModel {
                 let local = prefix_match.matched_tokens as u32;
                 let agreed = self.ep_min_u32(local)? as usize;
                 if agreed < prefix_match.matched_tokens {
-                    self.prefix_cache.release(tokens, bs);
+                    self.prefix_cache
+                        .release_matched(tokens, bs, prefix_match.matched_tokens);
                     if agreed > 0 {
                         prefix_match =
-                            self.prefix_cache
-                                .lookup(&tokens[..agreed], bs, seq.session_hash);
+                            self.lookup_prefill_prefix(&tokens[..agreed], bs, seq.session_hash);
                     } else {
                         prefix_match = spark_runtime::prefix_cache::PrefixMatch::empty();
                     }
@@ -69,6 +69,22 @@ impl TransformerModel {
                 } else if local > 0 || agreed > 0 {
                     tracing::debug!(
                         "F83 EP-cache-sync: local_matched={local} agreed_matched={agreed} (no cap)"
+                    );
+                }
+            }
+            // Re-pairing at the EP-agreed KV depth can demote one rank to a
+            // miss when that exact prefix has no SSM checkpoint. Take a second
+            // min so every rank either reuses the paired prefix or fully
+            // prefills; divergent proc_count values deadlock MoE collectives.
+            if ep_active && self.config.num_ssm_layers() > 0 {
+                let local = prefix_match.matched_tokens as u32;
+                let agreed = self.ep_min_u32(local)? as usize;
+                if agreed < prefix_match.matched_tokens {
+                    self.prefix_cache
+                        .release_matched(tokens, bs, prefix_match.matched_tokens);
+                    prefix_match = spark_runtime::prefix_cache::PrefixMatch::empty();
+                    tracing::info!(
+                        "F83 EP-cache-sync: hybrid paired miss local={local} agreed={agreed}"
                     );
                 }
             }
@@ -103,14 +119,14 @@ impl TransformerModel {
             }
             // Marconi: restore SSM snapshot if available.
             // With intermediate checkpoints, ssm_snapshot_tokens may be less than
-            // matched_tokens. We skip SSM computation only up to ssm_snapshot_tokens
-            // and recompute SSM (+ overwrite KV) for tokens between the checkpoint
-            // and matched_tokens. This trades some redundant KV writes for correct
-            // SSM state propagation.
+            // matched_tokens. We skip SSM computation only up to
+            // ssm_snapshot_tokens and replay recurrent state to the match;
+            // forward_layers preserves the already-cached KV rows.
             let mut skip = if let Some(snap_id) = prefix_match.ssm_snapshot {
                 let snap_tok = prefix_match.ssm_snapshot_tokens;
                 if snap_tok > 0
                     && matched <= total
+                    && super::should_restore_ssm_snapshot(snap_tok, matched, total)
                     && self
                         .ssm_snapshots
                         .session_matches(snap_id, seq.session_hash)
@@ -141,6 +157,12 @@ impl TransformerModel {
                     }
                     true
                 } else {
+                    if snap_tok == matched && matched == total {
+                        tracing::info!(
+                            "Exact full-prompt SSM snapshot bypassed; recomputing recurrent state \
+                             (ATLAS_MARCONI_EXACT=1 re-enables the unsafe shortcut)"
+                        );
+                    }
                     false
                 }
             } else {
@@ -149,29 +171,31 @@ impl TransformerModel {
             let has_ssm = self.config.num_ssm_layers() > 0;
             if matched > 0 && !skip && has_ssm {
                 tracing::info!(
-                    "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing all KV",
+                    "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing recurrent state",
                     matched,
                     prefix_match.matched_blocks.len(),
                 );
-            } else if matched > 0 && !skip {
-                // F82 (2026-04-30): non-SSM cache-hit skip path.
+            } else if super::attention_only_prefix_skip(matched, skip, has_ssm) {
+                // F82 (2026-04-30): attention-only cache-hit skip. A hybrid
+                // snapshot can be present but deliberately bypassed (exact
+                // full-prompt policy); it must full-prefill recurrent state.
                 skip = true;
                 tracing::info!(
-                    "Prefix cache hit: {} tokens ({} blocks) reused (F82+F83: non-SSM cache-hit skip)",
+                    "Prefix cache hit: {} tokens ({} blocks) reused (F82+F83: attention-only skip)",
                     matched,
                     prefix_match.matched_blocks.len(),
                 );
             }
-            // For SSM models: use ssm_snapshot_tokens (not matched) as skip point.
-            // Exception: when matched == total (exact prompt match), the snapshot
-            // covers the entire prompt, so skip all tokens.
-            // For pure attention (MLA/GQA): use matched tokens directly.
-            let skip_tokens = if skip && !has_ssm {
-                matched
-            } else if skip && matched == total {
-                matched
-            } else if skip {
-                prefix_match.ssm_snapshot_tokens
+            // SSM execution resumes at the restored checkpoint, which may be
+            // shallower than the KV match even when the whole prompt matched.
+            // Advancing to `matched` in that case leaves recurrent state behind
+            // the token/KV cursor and caused warm multi-turn completions to die.
+            let skip_tokens = if skip {
+                super::restored_prefix_skip_tokens(
+                    has_ssm,
+                    prefix_match.ssm_snapshot_tokens,
+                    matched,
+                )
             } else {
                 0
             };

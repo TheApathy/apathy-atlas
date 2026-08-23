@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -90,8 +90,6 @@ impl TransformerModel {
             (seq.seq_len + 3) as u32,
         ];
         let pos_bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, 16) };
-        self.gpu.copy_h2d_async(pos_bytes, meta_base, stream)?;
-
         let mut slots = [0i64; 4];
         for t in 0..k {
             let pos = seq.seq_len + t;
@@ -101,9 +99,6 @@ impl TransformerModel {
             slots[t] = (physical_block as i64) * (bs as i64) + (block_offset as i64);
         }
         let slot_bytes = unsafe { std::slice::from_raw_parts(slots.as_ptr() as *const u8, 32) };
-        self.gpu
-            .copy_h2d_async(slot_bytes, meta_base.offset(256), stream)?;
-
         let seq_lens = [
             (seq.seq_len + 1) as i32,
             (seq.seq_len + 2) as i32,
@@ -111,9 +106,6 @@ impl TransformerModel {
             (seq.seq_len + 4) as i32,
         ];
         let sl_bytes = unsafe { std::slice::from_raw_parts(seq_lens.as_ptr() as *const u8, 16) };
-        self.gpu
-            .copy_h2d_async(sl_bytes, meta_base.offset(512), stream)?;
-
         let mb = max_blocks as usize;
         let needed = k * mb;
         let mut bt_buf_vec;
@@ -131,8 +123,13 @@ impl TransformerModel {
         }
         let bt_bytes =
             unsafe { std::slice::from_raw_parts(bt_buf.as_ptr() as *const u8, needed * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(768), stream)?;
+        let copies = [
+            HostToDeviceCopy::new(pos_bytes, meta_base),
+            HostToDeviceCopy::new(slot_bytes, meta_base.offset(256)),
+            HostToDeviceCopy::new(sl_bytes, meta_base.offset(512)),
+            HostToDeviceCopy::new(bt_bytes, meta_base.offset(768)),
+        ];
+        self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
         let metadata = AttnMetadataDev {
             positions: meta_base,

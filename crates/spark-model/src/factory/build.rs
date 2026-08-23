@@ -56,15 +56,40 @@ pub fn build_model(
     // capture-layer indices from the drafter's `dflash_config.target_layer_ids`
     // so `TransformerModel::new` allocates the 5×hidden_size capture buffer.
     //
-    // vLLM PR #40898 (DFlash author @jianc99) applies a **+1 shift** to
-    // `target_layer_ids`: the drafter's raw ids [1,16,31,46,61] become
-    // capture layers [2,17,32,47,62]. The author calls this a correctness
-    // bug — without it "the drafter reads the wrong target hidden states
-    // and acceptance plummets". Atlas captures AFTER `layer.decode()` for
-    // the listed `dflash_capture_layers` index, so we add 1 (clamped).
+    // OFFSET 0 IS CORRECT. Do not "fix" it to 1 — see below, because the
+    // comment that used to live here argued for 1 and was wrong.
     //
-    // Set ATLAS_DFLASH_CAPTURE_LAYER_OFFSET=0 to disable the shift for
-    // an A/B test; set to -1 to restore the old (broken) behaviour.
+    // The drafter's raw `target_layer_ids` are used verbatim: Atlas must
+    // capture the SAME tensors SpecForge captured when it generated the
+    // training data, and it already does.
+    //
+    //   training  — specforge/modeling/target/dflash_target_model.py:270-276
+    //               reads `outputs.hidden_states[idx + 1]`. That `+1` skips
+    //               the HF tuple's element 0 (the embedding output), so
+    //               `hidden_states[N+1]` IS the OUTPUT OF LAYER N. It is a
+    //               tuple-index shift, NOT a semantic layer shift.
+    //   serving   — `trait_impl/decode_a.rs:188-205` calls
+    //               `try_dflash_capture(i, ..)` immediately AFTER
+    //               `layer.decode()` for index i, i.e. it already holds the
+    //               OUTPUT OF LAYER i. There is no tuple to index.
+    //
+    // Both sides therefore reference output-of-layer-N with no adjustment,
+    // and alignment requires offset == 0.
+    //
+    // The superseded comment cited vLLM PR #40898 (@jianc99) applying a "+1
+    // correctness fix" and concluded Atlas needs it too. vLLM adds 1 for the
+    // same tuple-indexing reason SpecForge does; importing it here would
+    // double-count the correction and read one layer too DEEP. The old text
+    // even contained its own disproof — "Atlas captures AFTER layer.decode()
+    // for the listed index, so we add 1" — where the premise is exactly why
+    // the conclusion does not follow. Git history agrees: shipped at -1 (one
+    // layer too shallow, genuinely broken), corrected to 0 in f81ae296, and
+    // never 1.
+    //
+    // ATLAS_DFLASH_CAPTURE_LAYER_OFFSET exists only for A/B testing that
+    // claim. Every nonzero value misaligns the drafter against its training
+    // data and shows up as degraded acceptance, never as an error — hence the
+    // warning below.
     if let Some(ref args) = dflash_args
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
@@ -72,6 +97,15 @@ pub fn build_model(
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        if offset != 0 {
+            tracing::warn!(
+                "ATLAS_DFLASH_CAPTURE_LAYER_OFFSET={offset}: capture layers are now \
+                 MISALIGNED against the drafter's training data, which captured \
+                 output-of-layer-N for the raw target_layer_ids. This degrades draft \
+                 acceptance silently — it will not error. Only 0 is correct; use a \
+                 nonzero value for A/B testing that claim and nothing else."
+            );
+        }
         config.dflash_capture_layers = sub
             .target_layer_ids
             .iter()
@@ -99,7 +133,7 @@ pub fn build_model(
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(store, &config)?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
-    let lm_head = loader.load_lm_head(store, &config)?;
+    let lm_head = loader.load_lm_head(store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
     // Probe dense MTP path for non-MoE models (Qwen3.5/3.6 27B family,
     // AEON-7 re-quants). Loader returns None for MoE models so this is a
@@ -323,8 +357,7 @@ pub fn build_model(
                     budget_blocks,
                     // bytes/block derived from the budget that produced
                     // `budget_blocks`, so this needs no extra KvCacheConfig API.
-                    (budget_blocks - n) as f64
-                        * (kv_budget as f64 / budget_blocks.max(1) as f64)
+                    (budget_blocks - n) as f64 * (kv_budget as f64 / budget_blocks.max(1) as f64)
                         / (1024.0 * 1024.0 * 1024.0),
                 );
             }
@@ -427,36 +460,37 @@ pub fn build_model(
             &args.drafter_config,
             model.gpu_backend(),
             1, // tp_size for the drafter side: replicated, so always 1
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DFlash was explicitly requested, but the drafter checkpoint contains no \
+                 DFlash weight schema (`fc.weight` or `model.fc.weight`)"
+            )
+        })?;
+        let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
+            weights,
+            target_embed_for_dflash,
+            target_lm_head_for_dflash,
+            target_hidden_for_dflash,
+            target_vocab_for_dflash,
+            args.gamma,
+            model.ddtree_parent_ids_capacity,
+            args.dspark_verify_mode,
+            args.window_size,
+            model.gpu_backend(),
+            max_seq_len,
+            args.quantization,
         )?;
-        if let Some(weights) = weights {
-            let mut head = crate::layers::BlockDiffusionDraftHead::from_weights(
-                weights,
-                target_embed_for_dflash,
-                target_lm_head_for_dflash,
-                target_hidden_for_dflash,
-                target_vocab_for_dflash,
-                args.gamma,
-                args.window_size,
-                model.gpu_backend(),
-                max_seq_len,
-                args.quantization,
-            )?;
-            // Share the target's NVFP4-T lm_head (ATLAS_LM_HEAD_T) with the
-            // drafter's propose lm_head fast path (gated at the call site by
-            // ATLAS_DFLASH_LM_HEAD_NVFP4=1). Same device allocation — the
-            // drafter reads the --mtp-vocab column prefix via ldb.
-            if let Some((t, ldb)) = model.dflash_lm_head_t() {
-                head.lm_head_shared_t = Some(t);
-                head.lm_head_shared_t_ldb = ldb;
-            }
-            model.set_dflash_proposer(std::sync::Arc::new(head));
-            tracing::info!("DFlash drafter installed as the active proposer");
-        } else {
-            tracing::warn!(
-                "DFlash drafter store had no fc.weight — proposer not installed; \
-                 falling back to whatever proposer (if any) the target's MTP path built"
-            );
+        // Share the target's NVFP4-T lm_head (ATLAS_LM_HEAD_T) with the
+        // drafter's propose lm_head fast path (gated at the call site by
+        // ATLAS_DFLASH_LM_HEAD_NVFP4=1). Same device allocation — the
+        // drafter reads the --mtp-vocab column prefix via ldb.
+        if let Some((t, ldb)) = model.dflash_lm_head_t() {
+            head.lm_head_shared_t = Some(t);
+            head.lm_head_shared_t_ldb = ldb;
         }
+        model.set_dflash_proposer(std::sync::Arc::new(head))?;
+        tracing::info!("DFlash drafter installed as the active proposer");
     }
 
     Ok(Box::new(model))

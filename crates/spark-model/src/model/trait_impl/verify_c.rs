@@ -5,16 +5,13 @@
 //! ## Safety contract for the `unsafe { from_raw_parts(...) }` blocks
 //!
 //! This file casts small stack arrays / `Vec`s of plain integers
-//! (`u32`, `i32`, `i64`) into byte slices to feed `copy_h2d_async`.
+//! (`u32`, `i32`, `i64`) into byte slices for H2D upload.
 //! Invariants:
 //! - All source types are POD (no padding, all-bits-valid), so the
 //!   reinterpretation as `&[u8]` is sound.
 //! - The byte length matches `N * size_of::<T>()` exactly.
-//! - The original array/`Vec` outlives the H2D copy: copy_h2d_async on
-//!   our cudarc backend completes synchronously enough for the caller
-//!   to drop the host buffer after this function returns (the actual
-//!   device copy is async on the stream, but the source bytes are
-//!   already in the driver's pinned-memory queue).
+//! - The grouped pageable-copy boundary synchronizes the producer stream,
+//!   then completes the host-to-device copy before these sources can drop.
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
@@ -25,7 +22,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -99,9 +96,9 @@ impl TransformerModel {
 
         // 1c. Upload 3-entry attention metadata as a SINGLE H2D copy.
         //
-        // Earlier shape issued FOUR copy_h2d_async calls (positions @ 0,
+        // Earlier shape issued FOUR separate H2D calls (positions @ 0,
         // slots @ 256, seq_lens @ 512, block_table @ 768) each carrying
-        // ~5 μs of CUDA-driver / cuMemcpyHtoDAsync API overhead. Pack
+        // CUDA-driver API overhead. Pack
         // them into one contiguous host buffer and issue a single H2D
         // covering the [0..768 + block_table_bytes] union. The gap
         // regions (12..256, 280..512, 524..768) are zero-initialised but
@@ -175,7 +172,8 @@ impl TransformerModel {
         }
 
         // Single fused H2D
-        self.gpu.copy_h2d_async(pack, meta_base, stream)?;
+        self.gpu
+            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(pack, meta_base)], stream)?;
 
         let metadata = AttnMetadataDev {
             positions: meta_base,

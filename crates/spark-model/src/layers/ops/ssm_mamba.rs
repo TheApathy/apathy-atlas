@@ -226,6 +226,51 @@ pub fn conv1d_update_l2norm_f32_multi_seq(
         .launch(stream)
 }
 
+/// Exact flat-chain FP32 conv recurrence for a multi-row verify window.
+///
+/// Rows advance sequentially inside each CTA and `state_inter` receives one
+/// full post-row conv-state snapshot per row. Strides are element counts.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_update_l2norm_f32_sequence(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state: DevicePtr,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    output: DevicePtr,
+    state_inter: DevicePtr,
+    rows: u32,
+    dim: u32,
+    d_conv: u32,
+    qk_channels: u32,
+    head_dim: u32,
+    l2_eps: f32,
+    input_stride: u32,
+    output_stride: u32,
+    state_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(dim, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(conv_state)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(DevicePtr::NULL)
+        .arg_ptr(output)
+        .arg_ptr(state_inter)
+        .arg_u32(rows)
+        .arg_u32(dim)
+        .arg_u32(d_conv)
+        .arg_u32(qk_channels)
+        .arg_u32(head_dim)
+        .arg_f32(l2_eps)
+        .arg_u32(input_stride)
+        .arg_u32(output_stride)
+        .arg_u32(state_stride)
+        .launch(stream)
+}
+
 /// K=3 fused conv1d-update + SiLU + L2 norm + intermediate-state save.
 ///
 /// Replaces the K=3 verify per-token loop (3 × `conv1d_update_l2norm` +

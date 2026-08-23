@@ -11,9 +11,9 @@ use crate::layer::TransformerLayer;
 use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, SsmWeights, dense, dense_auto,
-    detect_nvfp4_variant, gpu_concat_rows, interleave_ba, load_dense_ffn, load_kv_scales,
-    load_ssm_qwen35, quantize_to_nvfp4, quantized_auto,
+    AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, QuantizeCtx, SsmWeights, dense,
+    dense_auto, detect_nvfp4_variant, gpu_concat_rows, interleave_ba, load_dense_ffn,
+    load_kv_scales, load_ssm_qwen35, quantize_to_nvfp4, quantized_any,
 };
 
 pub struct Qwen35DenseWeightLoader;
@@ -58,6 +58,17 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             variant
         );
 
+        // Fast engine recovery: serve the per-layer transposed NVFP4 copies
+        // from disk instead of rebuilding them. No-op unless
+        // ATLAS_WEIGHT_CACHE=1. `finish` runs only on the success path, so a
+        // load that bails leaves the blob unpublished.
+        super::transform_cache::init(
+            store,
+            config,
+            gpu,
+            &format!("qwen35_dense/{weight_format:?}/{variant:?}"),
+        );
+
         for (i, lt) in layer_types.iter().enumerate() {
             let lp = config.layer_prefix(i);
             let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
@@ -79,26 +90,39 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             // FFN paths (BF16/FP8-LUT) — the transposed kernel only
             // accepts QuantizedWeight.
             //
-            // Memory cost: ~equivalent to original FFN weights (~150 MB on
-            // qwen3.6-27b — 64 layers × 3 projections × ~780 KB packed).
+            // Memory cost: ~equivalent to the original packed FFN weights,
+            // and retained for the process lifetime. One projection at
+            // qwen3.8-27b (intermediate=17408, hidden=5120) is
+            // 17408·5120·9/16 = 47.8 MiB packed+scale, so ~143 MiB per
+            // layer × 64 layers = ~9.0 GiB total. (The previous figure
+            // here — "~150 MB total, 64 layers × 3 × ~780 KB packed" —
+            // was the *per-layer* cost mislabelled as the total, off by
+            // ~64×. It is charged to the load pre-flight by
+            // spark-server's `construction_overhead_bytes`.)
             // Load-time cost: 3 H↔D round-trips per layer (~89 MB each),
             // ~few hundred ms total across 64 layers via host transpose.
             if crate::layers::ffn_m16_transposed_enabled() {
                 let inter = config.intermediate_size;
                 // gate: [intermediate, hidden]; up: [intermediate, hidden];
                 // down: [hidden, intermediate]. transpose_for_gemm(_, n, k):
-                let gate_t = ffn_layer
-                    .weights
-                    .gate_proj
-                    .transpose_for_gemm(gpu, inter, h)?;
-                let up_t = ffn_layer
-                    .weights
-                    .up_proj
-                    .transpose_for_gemm(gpu, inter, h)?;
-                let down_t = ffn_layer
-                    .weights
-                    .down_proj
-                    .transpose_for_gemm(gpu, h, inter)?;
+                let gate_t = ffn_layer.weights.gate_proj.transpose_for_gemm_cached(
+                    gpu,
+                    inter,
+                    h,
+                    &format!("L{i}.mlp.gate_proj.t"),
+                )?;
+                let up_t = ffn_layer.weights.up_proj.transpose_for_gemm_cached(
+                    gpu,
+                    inter,
+                    h,
+                    &format!("L{i}.mlp.up_proj.t"),
+                )?;
+                let down_t = ffn_layer.weights.down_proj.transpose_for_gemm_cached(
+                    gpu,
+                    h,
+                    inter,
+                    &format!("L{i}.mlp.down_proj.t"),
+                )?;
                 ffn_layer.set_transposed_weights(gate_t, up_t, down_t);
                 // Eagerly allocate the split-K FP32 workspace at load time
                 // (illegal during CUDA graph capture). Sized for the largest
@@ -182,7 +206,19 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                                               full_k: usize,
                                               kind: TpShardKind|
                              -> Result<crate::weight_map::QuantizedWeight> {
-                                let src = quantized_auto(store, &format!("{p}.{name}"), gpu, variant)?;
+                                let src = quantized_any(
+                                    store,
+                                    &format!("{p}.{name}"),
+                                    full_n,
+                                    full_k,
+                                    gpu,
+                                    variant,
+                                    QuantizeCtx {
+                                        absmax_k,
+                                        quantize_k,
+                                        stream,
+                                    },
+                                )?;
                                 if tp_size == 1 {
                                     return Ok(src);
                                 }
@@ -291,22 +327,30 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         num_heads * head_dim
                     };
                     if let Some(ref qw) = q_nvfp4 {
-                        let qt = qw.transpose_for_gemm(gpu, q_proj_n, h)?;
-                        let kt = k_nvfp4.as_ref().unwrap().transpose_for_gemm(
+                        let qt = qw.transpose_for_gemm_cached(
+                            gpu,
+                            q_proj_n,
+                            h,
+                            &format!("L{i}.self_attn.q_proj.t"),
+                        )?;
+                        let kt = k_nvfp4.as_ref().unwrap().transpose_for_gemm_cached(
                             gpu,
                             num_kv_heads * head_dim,
                             h,
+                            &format!("L{i}.self_attn.k_proj.t"),
                         )?;
-                        let vt = v_nvfp4.as_ref().unwrap().transpose_for_gemm(
+                        let vt = v_nvfp4.as_ref().unwrap().transpose_for_gemm_cached(
                             gpu,
                             num_kv_heads * head_dim,
                             h,
+                            &format!("L{i}.self_attn.v_proj.t"),
                         )?;
-                        let ot =
-                            layer
-                                .attn
-                                .o_proj
-                                .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
+                        let ot = layer.attn.o_proj.transpose_for_gemm_cached(
+                            gpu,
+                            h,
+                            num_heads * head_dim,
+                            &format!("L{i}.self_attn.o_proj.t"),
+                        )?;
                         layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
                         // Eagerly allocate the QKV split-K FP32 workspace
                         // (illegal during CUDA graph capture). Sized for the
@@ -360,7 +404,12 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         stream,
                     )?;
 
-                    let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm(gpu, qkvz_size, h)?;
+                    let qkvz_nvfp4_t = qkvz_nvfp4.transpose_for_gemm_cached(
+                        gpu,
+                        qkvz_size,
+                        h,
+                        &format!("L{i}.linear_attn.qkvz.t"),
+                    )?;
 
                     let out_proj_nvfp4 = quantize_to_nvfp4(
                         &out_proj_dense,
@@ -372,7 +421,12 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         stream,
                     )?;
 
-                    let out_proj_nvfp4_t = out_proj_nvfp4.transpose_for_gemm(gpu, h, value_dim)?;
+                    let out_proj_nvfp4_t = out_proj_nvfp4.transpose_for_gemm_cached(
+                        gpu,
+                        h,
+                        value_dim,
+                        &format!("L{i}.linear_attn.out_proj.t"),
+                    )?;
 
                     let ssm = SsmWeights {
                         in_proj_qkvz: qkvz_dense,
@@ -413,6 +467,8 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             layers.len() - attn_idx,
         );
 
+        super::transform_cache::finish();
+
         Ok(layers)
     }
 
@@ -431,17 +487,13 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
         dense(store, &format!("{prefix}.norm.weight"))
     }
 
-    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        for pattern in &[
-            "lm_head.weight",
-            "language_model.lm_head.weight",
-            "model.lm_head.weight",
-        ] {
-            if store.contains(pattern) {
-                return dense(store, pattern);
-            }
-        }
-        self.load_embedding(store, config)
+    fn load_lm_head(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        super::qwen35_mixed_precision::load_lm_head(store, config, gpu)
     }
 
     fn load_mtp_weights(

@@ -21,6 +21,25 @@ pub(in crate::model) struct MetaLayout {
     pub needs_paged: bool,
 }
 
+impl MetaLayout {
+    /// Exact page-locked host range retained by this async upload.
+    pub fn pinned_bytes(&self, proc_count: usize) -> Result<usize> {
+        if self.needs_paged {
+            self.pos_stream_bytes
+                .checked_mul(if self.use_mrope { 3 } else { 1 })
+                .ok_or_else(|| anyhow::anyhow!("pinned metadata size overflow"))
+        } else {
+            self.slot_offset
+                .checked_add(
+                    proc_count
+                        .checked_mul(std::mem::size_of::<i64>())
+                        .ok_or_else(|| anyhow::anyhow!("pinned slot metadata size overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("pinned metadata size overflow"))
+        }
+    }
+}
+
 impl TransformerModel {
     pub(super) fn prefill_b_upload_meta(
         &self,
@@ -49,6 +68,7 @@ impl TransformerModel {
             effective_seq_len_start,
             kv_cache,
             meta_base,
+            0,
             stream,
         )
     }
@@ -68,6 +88,7 @@ impl TransformerModel {
         effective_seq_len_start: usize,
         kv_cache: &PagedKvCache,
         meta_base: DevicePtr,
+        pinned_offset: usize,
         stream: u64,
     ) -> Result<MetaLayout> {
         // MRoPE-interleaved packs three u32 position streams (T, H, W).
@@ -79,6 +100,14 @@ impl TransformerModel {
             (pos_stream_bytes + 7) & !7
         };
         let needs_paged = effective_seq_len_start > 0;
+        let layout = MetaLayout {
+            meta_base,
+            slot_offset,
+            pos_stream_bytes,
+            use_mrope,
+            needs_paged,
+        };
+        let pinned_bytes = layout.pinned_bytes(proc_count)?;
 
         // Lock staging, build positions plus non-paged slots, and upload.
         {
@@ -147,7 +176,11 @@ impl TransformerModel {
                 }
             }
 
-            let pinned = stg.ptr;
+            // Validate the complete range before writing any bytes. In the
+            // kernel-batched path each outstanding async H2D receives a
+            // disjoint range of this one stable pinned allocation.
+            stg.buffer.pinned_slice_range(pinned_offset, pinned_bytes)?;
+            let pinned = unsafe { stg.buffer.as_mut_ptr().add(pinned_offset) };
             let mut cursor = pos_stream_bytes;
 
             unsafe {
@@ -193,21 +226,14 @@ impl TransformerModel {
                 cursor += proc_count * 8;
             }
 
-            assert!(
-                cursor <= stg.bytes,
-                "prefill_chunk metadata overflow: {cursor} > {}",
-                stg.bytes
-            );
-            let pinned_slice = unsafe { std::slice::from_raw_parts(pinned, cursor) };
-            self.gpu.copy_h2d_async(pinned_slice, meta_base, stream)?;
+            assert_eq!(cursor, pinned_bytes, "pinned metadata layout drift");
+            let pinned_slice = stg.buffer.pinned_slice_range(pinned_offset, pinned_bytes)?;
+            unsafe {
+                self.gpu
+                    .copy_h2d_pinned_async(pinned_slice, meta_base, stream)?;
+            }
         }
 
-        Ok(MetaLayout {
-            meta_base,
-            slot_offset,
-            pos_stream_bytes,
-            use_mrope,
-            needs_paged,
-        })
+        Ok(layout)
     }
 }

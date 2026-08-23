@@ -12,6 +12,42 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 use crate::layer::ForwardContext;
 
+/// Runtime override for the DFlash drafter's effective γ, in draft tokens.
+///
+/// 0 (the default) means "no override — use `ATLAS_DFLASH_DRAFT_CAP` if set,
+/// otherwise the drafter's own γ". Any other value caps γ for the NEXT
+/// propose, which shrinks the drafter's noise block and therefore its forward
+/// cost, not merely the number of drafts returned (see
+/// `layers::dflash_head::forward_block`).
+///
+/// This exists so the scheduler's speculation gate can offer a γ-capped arm
+/// alongside the full-γ arm without rebuilding the model. It is a process
+/// global rather than a model field because the drafter's `forward_block`
+/// reads it deep inside the propose path where no `&Model` is in scope, which
+/// is also where the `ATLAS_DFLASH_DRAFT_CAP` getenv it replaces already sat.
+///
+/// ⚠️ A runtime cap is NOT equivalent to serving with `--dflash-gamma N`.
+/// The launch flag also sizes construction-time state — `dflash_kgamma`, the
+/// DDTree verify capacity, and the SSM intermediate pools (`impl_a1.rs`) — and
+/// none of those can change after startup. Expect a runtime cap to recover the
+/// drafter-forward and verify-width share of the win, not the memory or the
+/// pool-sizing share.
+static DFLASH_GAMMA_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Set the runtime γ cap. 0 clears the override.
+pub fn set_dflash_gamma_override(gamma: usize) {
+    DFLASH_GAMMA_OVERRIDE.store(gamma, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The runtime γ cap, or `None` when unset.
+pub fn dflash_gamma_override() -> Option<usize> {
+    match DFLASH_GAMMA_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
 /// Per-sequence state owned by a [`DraftProposer`].
 ///
 /// Stores KV cache, hidden states, or whatever the proposer needs
@@ -39,6 +75,15 @@ pub trait DraftProposer: Send + Sync {
     /// ngram proposers honor the mask and keep the default `false`.
     fn is_dflash(&self) -> bool {
         false
+    }
+
+    /// Physical target-verify token capacity, including the bonus/root row.
+    ///
+    /// `None` means this proposer does not use the DFlash verify ABI. DFlash
+    /// implementations must return the exact model allocation they were
+    /// constructed against, never a fresh environment/config derivation.
+    fn physical_verify_k(&self) -> Option<usize> {
+        None
     }
 
     /// Propose up to `num_drafts` tokens autoregressively.
@@ -191,6 +236,35 @@ pub trait DraftProposer: Send + Sync {
     }
 }
 
+/// Validate the immutable DFlash proposer/model verify-capacity contract before
+/// installing the proposer into a model.
+///
+/// This deliberately accepts already-read values so the check has no hidden
+/// environment/config dependency. Callers must pass the proposer's stored
+/// physical K and the model's actual persistent verify allocation.
+pub(crate) fn validate_dflash_install_capacity(
+    proposer_is_dflash: bool,
+    proposer_k: Option<usize>,
+    model_k: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        proposer_is_dflash,
+        "set_dflash_proposer: proposer does not implement the DFlash ABI"
+    );
+    let proposer_k = proposer_k.ok_or_else(|| {
+        anyhow::anyhow!("set_dflash_proposer: DFlash proposer omitted its physical verify K")
+    })?;
+    anyhow::ensure!(
+        model_k > 0,
+        "set_dflash_proposer: model has no physical DFlash verify capacity"
+    );
+    anyhow::ensure!(
+        proposer_k == model_k,
+        "set_dflash_proposer: proposer physical verify K {proposer_k} != model capacity {model_k}"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +279,41 @@ mod tests {
         }
         fn as_any_mut(&mut self) -> &mut dyn Any {
             self
+        }
+    }
+
+    struct MockProposer;
+
+    impl DraftProposer for MockProposer {
+        fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
+            Ok(Box::new(MockProposerState {
+                tokens_proposed: Vec::new(),
+            }))
+        }
+
+        fn propose(
+            &self,
+            _last_token: u32,
+            _target_hidden: DevicePtr,
+            _position: usize,
+            _num_drafts: usize,
+            _state: &mut dyn ProposerState,
+            _ctx: &ForwardContext,
+            _stream: u64,
+            _draft_embed_target: Option<DevicePtr>,
+            _grammar_bitmask: Option<&[i32]>,
+            _target_hidden_stack: Option<DevicePtr>,
+        ) -> Result<Vec<u32>> {
+            Ok(Vec::new())
+        }
+
+        fn after_verify(
+            &self,
+            _num_accepted: usize,
+            _state: &mut dyn ProposerState,
+            _stream: u64,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -228,5 +337,20 @@ mod tests {
             .unwrap();
         mock.tokens_proposed.push(7);
         assert_eq!(mock.tokens_proposed, vec![7]);
+    }
+
+    #[test]
+    fn non_dflash_proposer_has_no_physical_verify_capacity() {
+        let proposer: &dyn DraftProposer = &MockProposer;
+        assert_eq!(proposer.physical_verify_k(), None);
+    }
+
+    #[test]
+    fn dflash_install_capacity_must_match_actual_model_allocation() {
+        assert!(validate_dflash_install_capacity(true, Some(17), 17).is_ok());
+        assert!(validate_dflash_install_capacity(false, Some(17), 17).is_err());
+        assert!(validate_dflash_install_capacity(true, None, 17).is_err());
+        assert!(validate_dflash_install_capacity(true, Some(17), 0).is_err());
+        assert!(validate_dflash_install_capacity(true, Some(17), 32).is_err());
     }
 }

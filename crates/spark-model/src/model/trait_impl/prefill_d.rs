@@ -11,7 +11,7 @@
 //! flavour when one was successfully saved.
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, HostToDeviceCopy};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::types::TransformerModel;
@@ -40,8 +40,10 @@ impl TransformerModel {
         let last_tok_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(&last_tok as *const u32 as *const u8, 4) };
         let token_id_dev = self.buffers.scratch();
-        self.gpu
-            .copy_h2d_async(last_tok_bytes, token_id_dev, stream)?;
+        self.gpu.copy_h2d_group_on_stream(
+            &[HostToDeviceCopy::new(last_tok_bytes, token_id_dev)],
+            stream,
+        )?;
         ops::batched_embed(
             self.gpu.as_ref(),
             self.batched_embed_kernel,
@@ -99,6 +101,7 @@ impl TransformerModel {
             let snap_result = match self.ssm_snapshots.save(
                 seq.slot_idx,
                 seq.session_hash,
+                Self::seq_h_is_f16(seq),
                 &self.ssm_pool,
                 self.gpu.as_ref(),
                 stream,
@@ -114,6 +117,7 @@ impl TransformerModel {
                             .save(
                                 seq.slot_idx,
                                 seq.session_hash,
+                                Self::seq_h_is_f16(seq),
                                 &self.ssm_pool,
                                 self.gpu.as_ref(),
                                 stream,
@@ -185,6 +189,7 @@ impl TransformerModel {
             let snap_result = match self.ssm_snapshots.save(
                 seq.slot_idx,
                 seq.session_hash,
+                Self::seq_h_is_f16(seq),
                 &self.ssm_pool,
                 self.gpu.as_ref(),
                 stream,
@@ -200,6 +205,7 @@ impl TransformerModel {
                             .save(
                                 seq.slot_idx,
                                 seq.session_hash,
+                                Self::seq_h_is_f16(seq),
                                 &self.ssm_pool,
                                 self.gpu.as_ref(),
                                 stream,

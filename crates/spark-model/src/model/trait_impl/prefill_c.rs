@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -116,8 +116,10 @@ impl TransformerModel {
             let token_ids_bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(tokens.as_ptr() as *const u8, total_len * 4) };
             let token_ids_dev = self.buffers.scratch();
-            self.gpu
-                .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                stream,
+            )?;
             ops::batched_embed(
                 self.gpu.as_ref(),
                 self.batched_embed_kernel,
@@ -162,7 +164,7 @@ impl TransformerModel {
         let prefix_match = if self.tokens_have_vision_pad(tokens) {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
-            self.prefix_cache.lookup(tokens, bs, seq.session_hash)
+            self.lookup_prefill_prefix(tokens, bs, seq.session_hash)
         };
         let matched = prefix_match.matched_tokens;
         seq.cached_prefix_tokens = matched;
@@ -182,6 +184,7 @@ impl TransformerModel {
             let snap_tok = prefix_match.ssm_snapshot_tokens;
             if snap_tok > 0
                 && matched <= total_len
+                && super::prefill_b::should_restore_ssm_snapshot(snap_tok, matched, total_len)
                 && self
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash)
@@ -197,14 +200,18 @@ impl TransformerModel {
                     "Marconi two-phase: restored SSM snapshot at token {snap_tok} \
                          ({matched} KV blocks cached)",
                 );
-                // Exact match: snapshot covers all tokens
-                let skip = if matched >= total_len {
-                    matched
-                } else {
-                    snap_tok
-                };
+                // KV may match deeper than the surviving recurrent checkpoint.
+                // Resume from the state actually restored, never from the raw
+                // KV depth. This is the same paired invariant as prefill A/B.
+                let skip = super::prefill_b::restored_prefix_skip_tokens(true, snap_tok, matched);
                 (skip, true)
             } else {
+                if snap_tok == matched && matched == total_len {
+                    tracing::info!(
+                        "Exact full-prompt SSM snapshot bypassed; recomputing recurrent state \
+                         (ATLAS_MARCONI_EXACT=1 re-enables the unsafe shortcut)"
+                    );
+                }
                 (0, false)
             }
         } else {
@@ -251,8 +258,10 @@ impl TransformerModel {
                 std::slice::from_raw_parts(uncached_tokens.as_ptr() as *const u8, proc_count * 4)
             };
             let token_ids_dev = self.buffers.scratch();
-            self.gpu
-                .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                stream,
+            )?;
             ops::batched_embed(
                 self.gpu.as_ref(),
                 self.batched_embed_kernel,
@@ -284,7 +293,7 @@ impl TransformerModel {
             stg.positions
                 .extend(proc_start as u32..(proc_start + proc_count) as u32);
 
-            let pinned = stg.ptr;
+            let pinned = stg.buffer.as_mut_ptr();
             let mut cursor = proc_count * 4;
 
             unsafe {
@@ -316,12 +325,15 @@ impl TransformerModel {
             }
 
             assert!(
-                cursor <= stg.bytes,
+                cursor <= stg.buffer.len(),
                 "prefill_twophase metadata overflow: {cursor} > {}",
-                stg.bytes
+                stg.buffer.len()
             );
-            let pinned_slice = unsafe { std::slice::from_raw_parts(pinned, cursor) };
-            self.gpu.copy_h2d_async(pinned_slice, meta_base, stream)?;
+            let pinned_slice = stg.buffer.pinned_slice(cursor)?;
+            unsafe {
+                self.gpu
+                    .copy_h2d_pinned_async(pinned_slice, meta_base, stream)?;
+            }
         }
 
         if needs_paged {
@@ -333,6 +345,9 @@ impl TransformerModel {
             // can't be uploaded by absolute index without re-mapping. The
             // orchestrator path bypasses the production paged kernel that
             // reads this metadata, so skip the upload entirely in HSS mode.
+            let seq_len_val = (proc_start + proc_count) as u32;
+            let seq_len_bytes = seq_len_val.to_ne_bytes();
+            let seq_len_base = seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
             if upload_start < current_blocks && seq.hss_window_start() == 0 {
                 let new_blocks = &seq.block_table[upload_start..];
                 let bt_bytes = unsafe {
@@ -342,24 +357,21 @@ impl TransformerModel {
                     )
                 };
                 let block_table_base = seq.chunked_prefill_meta.as_ref().unwrap().block_table;
-                self.gpu.copy_h2d_async(
-                    bt_bytes,
-                    block_table_base.offset(upload_start * std::mem::size_of::<u32>()),
+                let copies = [
+                    HostToDeviceCopy::new(
+                        bt_bytes,
+                        block_table_base.offset(upload_start * std::mem::size_of::<u32>()),
+                    ),
+                    HostToDeviceCopy::new(&seq_len_bytes, seq_len_base),
+                ];
+                self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
+                seq.chunked_prefill_meta.as_mut().unwrap().uploaded_blocks = current_blocks;
+            } else {
+                self.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(&seq_len_bytes, seq_len_base)],
                     stream,
                 )?;
-                seq.chunked_prefill_meta.as_mut().unwrap().uploaded_blocks = current_blocks;
             }
-
-            let seq_len_val = (proc_start + proc_count) as u32;
-            let seq_len_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &seq_len_val as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )
-            };
-            let seq_len_base = seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-            self.gpu
-                .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
 
             let block_table_base = seq.chunked_prefill_meta.as_ref().unwrap().block_table;
             ops::fill_slots_from_block_table(
@@ -411,7 +423,11 @@ impl TransformerModel {
         };
 
         // ── 4. Per-layer forward: SSM uses three-phase, attention uses standard ──
-        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
+        let layer_kv_write_start = if marconi_skip {
+            super::prefill_b::cached_kv_rows_in_slice(matched, proc_start, proc_count)
+        } else {
+            kv_write_start
+        };
         let gdn_bufs = GdnPrefillBuffers {
             qkv: self.gdn_buf_qkv,
             gate_beta: self.gdn_buf_gate_beta,

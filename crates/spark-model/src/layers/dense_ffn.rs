@@ -61,12 +61,178 @@ pub enum FfnActivation {
     GeLU,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactFfnDispatch {
+    Existing,
+    Batched,
+    PerRowK1,
+}
+
+const fn exact_ffn_dispatch(
+    rows: u32,
+    exact_w4_silu_eligible: bool,
+    selected_tier_present: bool,
+) -> ExactFfnDispatch {
+    if !exact_w4_silu_eligible || rows <= 1 || rows > 32 {
+        ExactFfnDispatch::Existing
+    } else if selected_tier_present {
+        ExactFfnDispatch::Batched
+    } else {
+        ExactFfnDispatch::PerRowK1
+    }
+}
+
+const fn exact_ffn_auto_kgamma_applicable(rows: u32, exact_w4_silu_eligible: bool) -> bool {
+    matches!(
+        exact_ffn_dispatch(rows, exact_w4_silu_eligible, false),
+        ExactFfnDispatch::PerRowK1
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExactFfnMaterializedAvailability {
+    m8_dual_silu: bool,
+    m8_f32_down: bool,
+    m17_dual_silu: bool,
+    m17_f32_down: bool,
+    m17_fused_dual_silu: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactFfnMaterializedRoute {
+    Inline,
+    Split,
+    FusedM17,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactFfnPhysicalRoute {
+    Native,
+    SplitM8x2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactFfnRowOffsets {
+    input: usize,
+    gate_up: usize,
+    preactivation: usize,
+    output: usize,
+}
+
+fn exact_ffn_row_offsets(
+    first_row: u32,
+    hidden: u32,
+    intermediate: u32,
+) -> Option<ExactFfnRowOffsets> {
+    let row = first_row as usize;
+    let hidden = hidden as usize;
+    let intermediate = intermediate as usize;
+    Some(ExactFfnRowOffsets {
+        input: row.checked_mul(hidden)?.checked_mul(2)?,
+        gate_up: row.checked_mul(intermediate)?.checked_mul(2)?,
+        preactivation: row.checked_mul(intermediate)?.checked_mul(4)?,
+        output: row.checked_mul(hidden)?.checked_mul(2)?,
+    })
+}
+
+fn exact_ffn_physical_route(
+    rows: u32,
+    intermediate: u32,
+    split_m8_enabled: bool,
+    m8_exact_complete: bool,
+    m8_materialized_complete: bool,
+    scratch_bytes: usize,
+) -> ExactFfnPhysicalRoute {
+    let required_bytes = (rows as usize)
+        .checked_mul(intermediate as usize)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()));
+    if rows == 16
+        && split_m8_enabled
+        && m8_exact_complete
+        && m8_materialized_complete
+        && required_bytes.is_some_and(|required| required <= scratch_bytes)
+    {
+        ExactFfnPhysicalRoute::SplitM8x2
+    } else {
+        ExactFfnPhysicalRoute::Native
+    }
+}
+
+fn exact_ffn_split_m8_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_EXACT_FFN_SPLIT_M8").ok().as_deref() == Some("1"))
+}
+
+fn exact_ffn_lowreg_gate_up_m16_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_EXACT_FFN_LOWREG_GATE_UP_M16")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+/// `ATLAS_FFN_TC=1` REFREEZE switch: bypass the bit-exact scalar-GEMV FFN
+/// path (`forward_kgamma_exact` / `forward_kgamma_k1_rows`) and route
+/// `forward_kgamma` through the tensor-core transposed-weight GEMMs
+/// (m32_n64 / m128). The MMA reduction order, BF16 weight rounding and
+/// dequant re-association differ from the serial FMA oracle, so enabling
+/// this changes token output: the reference completion hash MUST be
+/// re-established ("refreeze") after turning it on. Default off.
+fn exact_ffn_tc_override() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_FFN_TC").ok().as_deref() == Some("1"))
+}
+
+fn exact_ffn_materialized_route(
+    rows: u32,
+    intermediate: u32,
+    handles: ExactFfnMaterializedAvailability,
+    scratch_bytes: usize,
+) -> ExactFfnMaterializedRoute {
+    let (dual_silu_handle_present, f32_down_handle_present) = match rows {
+        5..=8 => (handles.m8_dual_silu, handles.m8_f32_down),
+        9..=17 => (handles.m17_dual_silu, handles.m17_f32_down),
+        _ => return ExactFfnMaterializedRoute::Inline,
+    };
+    let required_bytes = (rows as usize)
+        .checked_mul(intermediate as usize)
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()));
+    if required_bytes.is_none_or(|required| required > scratch_bytes) || !f32_down_handle_present {
+        return ExactFfnMaterializedRoute::Inline;
+    }
+    if matches!(rows, 9..=17) && handles.m17_fused_dual_silu {
+        ExactFfnMaterializedRoute::FusedM17
+    } else if dual_silu_handle_present {
+        ExactFfnMaterializedRoute::Split
+    } else {
+        ExactFfnMaterializedRoute::Inline
+    }
+}
+
 pub struct DenseFfnLayer {
     pub weights: DenseFfnWeights,
     activation: FfnActivation,
     w4a16_gemv: KernelHandle,
     w4a16_gemv_dual: KernelHandle,
     w4a16_gemv_silu_input: KernelHandle,
+    /// Exact K1-arithmetic-order W4 FFN kernels for dynamic M=2..=32.
+    /// Missing selected-tier handles fail closed to independent K1 rows.
+    exact_ffn_kernels: ops::W4a16ExactFfnKernels,
+    /// Optional full-M16 gate/up projections. The diagnostic route is atomic;
+    /// any missing handle retains the current split-M8 implementation.
+    exact_ffn_lowreg_m16: ops::W4a16ExactFfnLowregM16Kernels,
+    /// Single-warp-per-output M=1 decode GEMVs — lossless, 8 outputs per
+    /// 256-thread block instead of 4, no cross-warp smem round-trip. Loaded
+    /// via `try_kernel` so a kernel cache built before these symbols existed
+    /// still links; `KernelHandle(0)` on a miss falls back to the 64-thread
+    /// base kernels, which are bit-identical.
+    w4a16_gemv_sw: KernelHandle,
+    w4a16_gemv_dual_sw: KernelHandle,
+    w4a16_gemv_silu_input_sw: KernelHandle,
+    /// `ATLAS_NO_GEMV_SW != "1"`, cached at construction.
+    gemv_sw: bool,
     w4a16_gemv_dual_batch2: KernelHandle,
     w4a16_gemv_dual_batch3: KernelHandle,
     /// Tuned dual-batch3 variant: fuses gate+up into the SAME CTA so the
@@ -78,6 +244,11 @@ pub struct DenseFfnLayer {
     w4a16_gemv_batch2: KernelHandle,
     w4a16_gemv_batch3: KernelHandle,
     w4a16_gemm: KernelHandle,
+    /// cp.async double-buffered byte-exact shadow of `w4a16_gemm` for the
+    /// prefill FFN path. Same dequant arithmetic + MMA order; only the load
+    /// pipeline differs. Loaded via `try_kernel`; handle 0 disables the
+    /// `ATLAS_PREFILL_FFN_PIPE` route silently.
+    w4a16_gemm_pipe: KernelHandle,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -335,6 +506,75 @@ impl DenseFfnLayer {
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_dual: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
             w4a16_gemv_silu_input: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_silu_input")?,
+            exact_ffn_kernels: ops::W4a16ExactFfnKernels::new(
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_exact_m4"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_exact_m8"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_exact_m17"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_exact_m32"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_silu_input_exact_m4"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_silu_input_exact_m8"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_silu_input_exact_m17"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_silu_input_exact_m32"),
+            )
+            .with_materialized_m8(
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_silu_f32_exact_m8"),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_f32_input_exact_m8"),
+            )
+            .with_materialized_m17(
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_fused",
+                    "w4a16_gemv_dual_silu_f32_exact_m17",
+                ),
+                super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_f32_input_exact_m17"),
+            )
+            .with_fused_materialized_m17(super::try_kernel(
+                gpu,
+                "w4a16_gemv_fused",
+                "w4a16_gemv_dual_exact_materialize_f32_m17",
+            ))
+            .with_rt2(
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_fused_rt",
+                    "w4a16_gemv_dual_exact_materialize_f32_rt2_m17",
+                ),
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_fused_rt",
+                    "w4a16_gemv_f32_input_exact_rt2_m8",
+                ),
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_fused_rt",
+                    "w4a16_gemv_f32_input_exact_rt2_m17",
+                ),
+            ),
+            exact_ffn_lowreg_m16: ops::W4a16ExactFfnLowregM16Kernels::new(
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_ffn_lowreg_m16",
+                    "w4a16_gemv_gate_exact_m16_lowreg",
+                ),
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_ffn_lowreg_m16",
+                    "w4a16_gemv_up_exact_m16_lowreg",
+                ),
+                super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_ffn_lowreg_m16",
+                    "w4a16_gate_up_materialize_f32_m16",
+                ),
+            ),
+            w4a16_gemv_sw: super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            w4a16_gemv_dual_sw: super::try_kernel(gpu, "w4a16_gemv_fused", "w4a16_gemv_dual_sw"),
+            w4a16_gemv_silu_input_sw: super::try_kernel(
+                gpu,
+                "w4a16_gemv_fused",
+                "w4a16_gemv_silu_input_sw",
+            ),
+            gemv_sw: ops::gemv_sw_enabled(),
             w4a16_gemv_dual_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch2")?,
             w4a16_gemv_dual_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_dual_batch3_tuned: super::try_kernel(
@@ -345,6 +585,7 @@ impl DenseFfnLayer {
             w4a16_gemv_batch2: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w4a16_gemm_pipe: super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
@@ -969,9 +1210,11 @@ impl DenseFfnLayer {
         let up_out = ctx.buffers.expert_up_out();
 
         // gate/up stay DENSE (residual-stream input, low sparsity).
-        ops::w4a16_gemv_dual(
+        ops::w4a16_decode_gemv_dual(
             ctx.gpu,
             self.w4a16_gemv_dual,
+            self.w4a16_gemv_dual_sw,
+            self.gemv_sw,
             input,
             &self.weights.gate_proj,
             gate_out,
@@ -1096,9 +1339,11 @@ impl DenseFfnLayer {
 
         // Fused gate_proj + up_proj: [1, H] → [1, inter] × 2
         crate::kprof!(ctx.gpu, stream, "ffn_gate_up_dual_m1", {
-            ops::w4a16_gemv_dual(
+            ops::w4a16_decode_gemv_dual(
                 ctx.gpu,
                 self.w4a16_gemv_dual,
+                self.w4a16_gemv_dual_sw,
+                self.gemv_sw,
                 input,
                 &self.weights.gate_proj,
                 gate_out,
@@ -1150,9 +1395,11 @@ impl DenseFfnLayer {
             FfnActivation::SiLU => {
                 // Fused SiLU(gate)*up + down_proj: [1, inter] → [1, H]
                 crate::kprof!(ctx.gpu, stream, "ffn_down_silu_m1", {
-                    ops::w4a16_gemv_silu_input(
+                    ops::w4a16_decode_gemv_silu_input(
                         ctx.gpu,
                         self.w4a16_gemv_silu_input,
+                        self.w4a16_gemv_silu_input_sw,
+                        self.gemv_sw,
                         gate_out,
                         up_out,
                         &self.weights.down_proj,
@@ -1179,9 +1426,11 @@ impl DenseFfnLayer {
                     anyhow::Result::<()>::Ok(())
                 })?;
                 crate::kprof!(ctx.gpu, stream, "ffn_down_m1", {
-                    ops::w4a16_gemv(
+                    ops::w4a16_decode_gemv(
                         ctx.gpu,
                         self.w4a16_gemv,
+                        self.w4a16_gemv_sw,
+                        self.gemv_sw,
                         gate_out,
                         &self.weights.down_proj,
                         output,
@@ -1406,6 +1655,382 @@ impl DenseFfnLayer {
         Ok(())
     }
 
+    fn measure_exact_kgamma_inputs(
+        &self,
+        input: DevicePtr,
+        gate_out: DevicePtr,
+        up_out: DevicePtr,
+        ctx: &ForwardContext,
+        hidden: u32,
+        intermediate: u32,
+        stream: u64,
+    ) -> Result<()> {
+        if !self.sparsity_measure_active() || ctx.graph_capture {
+            return Ok(());
+        }
+
+        let (hist_g, count_g, hist_d, count_d, meas_silu) =
+            self.ensure_sparsity_meas(ctx.gpu, intermediate as usize)?;
+        self.measure_sparsity_site(ctx, input, hist_g, count_g, hidden, stream)?;
+        ops::silu_mul(
+            ctx.gpu,
+            self.act_mul,
+            gate_out,
+            up_out,
+            meas_silu,
+            intermediate,
+            stream,
+        )?;
+        self.measure_sparsity_site(ctx, meas_silu, hist_d, count_d, intermediate, stream)?;
+        self.maybe_dump_sparsity(ctx, "dense_ffn_kgamma_exact")
+    }
+
+    fn forward_kgamma_exact_split_m8_down(
+        &self,
+        ctx: &ForwardContext,
+        hidden: u32,
+        intermediate: u32,
+        stream: u64,
+    ) -> Result<()> {
+        const GROUP_ROWS: u32 = 8;
+        let preactivation = ctx.buffers.ssm_conv_out_f32();
+        let output = ctx.buffers.moe_output();
+
+        for first_row in [0, GROUP_ROWS] {
+            let offsets = exact_ffn_row_offsets(first_row, hidden, intermediate)
+                .ok_or_else(|| anyhow::anyhow!("exact FFN M8 down row-offset overflow"))?;
+            ops::w4a16_gemv_f32_input_exact(
+                ctx.gpu,
+                self.exact_ffn_kernels,
+                preactivation.offset(offsets.preactivation),
+                &self.weights.down_proj,
+                output.offset(offsets.output),
+                GROUP_ROWS,
+                hidden,
+                intermediate,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn forward_kgamma_exact_lowreg_gate_up_m16(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        hidden: u32,
+        intermediate: u32,
+        stream: u64,
+    ) -> Result<()> {
+        const ROWS: u32 = 16;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        let preactivation = ctx.buffers.ssm_conv_out_f32();
+
+        ops::w4a16_gemv_gate_exact_m16_lowreg(
+            ctx.gpu,
+            self.exact_ffn_lowreg_m16,
+            input,
+            &self.weights.gate_proj,
+            gate_out,
+            ROWS,
+            intermediate,
+            hidden,
+            stream,
+        )?;
+        ops::w4a16_gemv_up_exact_m16_lowreg(
+            ctx.gpu,
+            self.exact_ffn_lowreg_m16,
+            input,
+            &self.weights.up_proj,
+            up_out,
+            ROWS,
+            intermediate,
+            hidden,
+            stream,
+        )?;
+        self.measure_exact_kgamma_inputs(
+            input,
+            gate_out,
+            up_out,
+            ctx,
+            hidden,
+            intermediate,
+            stream,
+        )?;
+        ops::w4a16_gate_up_materialize_f32_m16(
+            ctx.gpu,
+            self.exact_ffn_lowreg_m16,
+            gate_out,
+            up_out,
+            preactivation,
+            ROWS,
+            intermediate,
+            stream,
+        )?;
+        self.forward_kgamma_exact_split_m8_down(ctx, hidden, intermediate, stream)
+    }
+
+    fn forward_kgamma_exact_split_m8(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        hidden: u32,
+        intermediate: u32,
+        stream: u64,
+    ) -> Result<()> {
+        const GROUP_ROWS: u32 = 8;
+        if ops::exact_ffn_lowreg_m16_route(
+            2 * GROUP_ROWS,
+            exact_ffn_lowreg_gate_up_m16_enabled(),
+            self.exact_ffn_lowreg_m16,
+        ) == Some(ops::ExactFfnLowregM16Route::Lowreg)
+        {
+            return self.forward_kgamma_exact_lowreg_gate_up_m16(
+                input,
+                ctx,
+                hidden,
+                intermediate,
+                stream,
+            );
+        }
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        let preactivation = ctx.buffers.ssm_conv_out_f32();
+        let output = ctx.buffers.moe_output();
+
+        for first_row in [0, GROUP_ROWS] {
+            let offsets = exact_ffn_row_offsets(first_row, hidden, intermediate)
+                .ok_or_else(|| anyhow::anyhow!("exact FFN M8 row-offset overflow"))?;
+            let input_group = input.offset(offsets.input);
+            let gate_group = gate_out.offset(offsets.gate_up);
+            let up_group = up_out.offset(offsets.gate_up);
+            let preactivation_group = preactivation.offset(offsets.preactivation);
+            let output_group = output.offset(offsets.output);
+
+            ops::w4a16_gemv_dual_exact(
+                ctx.gpu,
+                self.exact_ffn_kernels,
+                input_group,
+                &self.weights.gate_proj,
+                gate_group,
+                &self.weights.up_proj,
+                up_group,
+                GROUP_ROWS,
+                intermediate,
+                hidden,
+                stream,
+            )?;
+            self.measure_exact_kgamma_inputs(
+                input_group,
+                gate_group,
+                up_group,
+                ctx,
+                hidden,
+                intermediate,
+                stream,
+            )?;
+            ops::w4a16_gemv_dual_silu_f32_exact(
+                ctx.gpu,
+                self.exact_ffn_kernels,
+                gate_group,
+                up_group,
+                preactivation_group,
+                GROUP_ROWS,
+                intermediate,
+                stream,
+            )?;
+            ops::w4a16_gemv_f32_input_exact(
+                ctx.gpu,
+                self.exact_ffn_kernels,
+                preactivation_group,
+                &self.weights.down_proj,
+                output_group,
+                GROUP_ROWS,
+                hidden,
+                intermediate,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn forward_kgamma_exact(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let hidden = ctx.config.hidden_size as u32;
+        let intermediate = ctx.config.intermediate_size as u32;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+
+        if exact_ffn_physical_route(
+            rows,
+            intermediate,
+            exact_ffn_split_m8_enabled(),
+            self.exact_ffn_kernels
+                .tier_is_complete(ops::ExactFfnTier::M8),
+            self.exact_ffn_kernels.materialized_m8_is_complete(),
+            ctx.buffers.sizes().ssm_conv_out_f32,
+        ) == ExactFfnPhysicalRoute::SplitM8x2
+        {
+            return self.forward_kgamma_exact_split_m8(input, ctx, hidden, intermediate, stream);
+        }
+
+        // Attention/SSM has completed before FFN on this stream, so its FP32
+        // recurrence workspace is dead until the next layer. Reuse it only
+        // when the arena's authoritative byte capacity covers every row.
+        let route = exact_ffn_materialized_route(
+            rows,
+            intermediate,
+            ExactFfnMaterializedAvailability {
+                m8_dual_silu: self.exact_ffn_kernels.dual_silu_f32_m8_is_present(),
+                m8_f32_down: self.exact_ffn_kernels.f32_input_m8_is_present(),
+                m17_dual_silu: self.exact_ffn_kernels.dual_silu_f32_m17_is_present(),
+                m17_f32_down: self.exact_ffn_kernels.f32_input_m17_is_present(),
+                // The fused stage does not expose gate/up tensors required by
+                // sparsity diagnostics; retain the split exact route then.
+                m17_fused_dual_silu: self.exact_ffn_kernels.fused_materialized_m17_is_present()
+                    && (!self.sparsity_measure_active() || ctx.graph_capture),
+            },
+            ctx.buffers.sizes().ssm_conv_out_f32,
+        );
+
+        let preactivation_f32 = ctx.buffers.ssm_conv_out_f32();
+        match route {
+            ExactFfnMaterializedRoute::FusedM17 => {
+                ops::w4a16_gemv_dual_materialize_f32_exact_m17(
+                    ctx.gpu,
+                    self.exact_ffn_kernels,
+                    input,
+                    &self.weights.gate_proj,
+                    &self.weights.up_proj,
+                    preactivation_f32,
+                    rows,
+                    intermediate,
+                    hidden,
+                    stream,
+                )?;
+            }
+            ExactFfnMaterializedRoute::Split | ExactFfnMaterializedRoute::Inline => {
+                ops::w4a16_gemv_dual_exact(
+                    ctx.gpu,
+                    self.exact_ffn_kernels,
+                    input,
+                    &self.weights.gate_proj,
+                    gate_out,
+                    &self.weights.up_proj,
+                    up_out,
+                    rows,
+                    intermediate,
+                    hidden,
+                    stream,
+                )?;
+                self.measure_exact_kgamma_inputs(
+                    input,
+                    gate_out,
+                    up_out,
+                    ctx,
+                    hidden,
+                    intermediate,
+                    stream,
+                )?;
+            }
+        }
+
+        match route {
+            ExactFfnMaterializedRoute::Split => ops::w4a16_gemv_dual_silu_f32_exact(
+                ctx.gpu,
+                self.exact_ffn_kernels,
+                gate_out,
+                up_out,
+                preactivation_f32,
+                rows,
+                intermediate,
+                stream,
+            )?,
+            ExactFfnMaterializedRoute::Inline => {
+                return ops::w4a16_gemv_silu_input_exact(
+                    ctx.gpu,
+                    self.exact_ffn_kernels,
+                    gate_out,
+                    up_out,
+                    &self.weights.down_proj,
+                    ctx.buffers.moe_output(),
+                    rows,
+                    hidden,
+                    intermediate,
+                    stream,
+                );
+            }
+            ExactFfnMaterializedRoute::FusedM17 => {}
+        }
+        ops::w4a16_gemv_f32_input_exact(
+            ctx.gpu,
+            self.exact_ffn_kernels,
+            preactivation_f32,
+            &self.weights.down_proj,
+            ctx.buffers.moe_output(),
+            rows,
+            hidden,
+            intermediate,
+            stream,
+        )
+    }
+
+    fn forward_kgamma_k1_rows(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        rows: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let hidden = ctx.config.hidden_size as u32;
+        let intermediate = ctx.config.intermediate_size as u32;
+        let gate_out = ctx.buffers.expert_gate_out();
+        let up_out = ctx.buffers.expert_up_out();
+        let output = ctx.buffers.moe_output();
+
+        for row in 0..rows as usize {
+            let input_row = input.offset(row * hidden as usize * 2);
+            let gate_row = gate_out.offset(row * intermediate as usize * 2);
+            let up_row = up_out.offset(row * intermediate as usize * 2);
+            let output_row = output.offset(row * hidden as usize * 2);
+            ops::w4a16_decode_gemv_dual(
+                ctx.gpu,
+                self.w4a16_gemv_dual,
+                self.w4a16_gemv_dual_sw,
+                self.gemv_sw,
+                input_row,
+                &self.weights.gate_proj,
+                gate_row,
+                &self.weights.up_proj,
+                up_row,
+                intermediate,
+                hidden,
+                stream,
+            )?;
+            ops::w4a16_decode_gemv_silu_input(
+                ctx.gpu,
+                self.w4a16_gemv_silu_input,
+                self.w4a16_gemv_silu_input_sw,
+                self.gemv_sw,
+                gate_row,
+                up_row,
+                &self.weights.down_proj,
+                output_row,
+                hidden,
+                intermediate,
+                stream,
+            )?;
+        }
+
+        self.measure_exact_kgamma_inputs(input, gate_out, up_out, ctx, hidden, intermediate, stream)
+    }
+
     /// K=γ verify batch (DFlash γ ≥ 16, typical n=17 with γ=16).
     ///
     /// Replaces the per-token loop that calls `forward()` n times (n=γ+1).
@@ -1421,6 +2046,10 @@ impl DenseFfnLayer {
     ///
     /// Sequence: gate_proj (GEMM M=n) → up_proj (GEMM M=n) → silu_mul
     /// (n × intermediate) → down_proj (GEMM M=n).
+    /// W4+SiLU rows 2..=32 instead use exact dynamic-M dual and fused-down
+    /// GEMVs that preserve K1 accumulation order. If either selected-tier
+    /// symbol is missing, every row runs through the ordinary K1 kernels;
+    /// BF16, W3, GELU, and rows above 32 retain their existing routes.
     ///
     /// Reuses `ctx.buffers.expert_gate_out` / `expert_up_out` /
     /// `moe_output`, which are sized for `max_batch_tokens × intermediate`
@@ -1458,6 +2087,21 @@ impl DenseFfnLayer {
         let gate_out = ctx.buffers.expert_gate_out();
         let up_out = ctx.buffers.expert_up_out();
 
+        let exact_w4_silu_eligible = self.exact_kgamma_applicable(n);
+        let exact_tier_present = matches!(
+            self.exact_ffn_kernels.route_for_rows(n),
+            Some(ops::ExactFfnRoute::Exact(_))
+        );
+        match exact_ffn_dispatch(n, exact_w4_silu_eligible, exact_tier_present) {
+            ExactFfnDispatch::Batched => {
+                return self.forward_kgamma_exact(input, ctx, n, stream);
+            }
+            ExactFfnDispatch::PerRowK1 => {
+                return self.forward_kgamma_k1_rows(input, ctx, n, stream);
+            }
+            ExactFfnDispatch::Existing => {}
+        }
+
         // Route through M_TILE=16 + transposed weights when:
         //   - ATLAS_FFN_M16_TRANSPOSED=1 OR ATLAS_TC_NVFP4_M16=1
         //   - the loader installed transposed copies of all 3 FFN projections
@@ -1488,8 +2132,42 @@ impl DenseFfnLayer {
         // m128 upgrade of the m16 path: ONE M-tile at n ≤ 128 → single
         // weight read (m16 re-reads B per 16-row tile: 2× traffic at
         // n=17 on a memory-bound GEMM). See ffn_kgamma_m128_enabled.
+        //
+        // FAIL-CLOSED GUARD (2026-08-19): ATLAS_FFN_KGAMMA_M128=0 selects
+        // the M_TILE=16-only route (`w4a16_gemm_t_m16`, 2 M-tile rows at
+        // n=17). That route is NON-DETERMINISTIC in this binary — three
+        // identical 1,500-token MinHeap requests returned three different
+        // completions (513/1500/1500 tokens, three distinct SHAs). The
+        // m128/m32 route is deterministic (verified: 3/3 identical,
+        // 41.7 tok/s). Fail closed: when the transposed m16 family would
+        // otherwise be the only route, force the deterministic m128/m32
+        // path regardless of the flag and warn once.
+        let m128_forced =
+            m16_path && !crate::layers::ffn_kgamma_m128_enabled() && self.w4a16_gemm_t_m128.0 != 0;
+        if m128_forced {
+            static FORCED: std::sync::Once = std::sync::Once::new();
+            FORCED.call_once(|| {
+                tracing::warn!(
+                    "ATLAS_FFN_KGAMMA_M128=0 requests the M_TILE=16 verify FFN route, \
+                     which is NON-DETERMINISTIC in this binary — forcing the \
+                     deterministic m128/m32 route instead (fail-closed)."
+                );
+            });
+        }
         let m128_path =
-            m16_path && crate::layers::ffn_kgamma_m128_enabled() && self.w4a16_gemm_t_m128.0 != 0;
+            (m16_path && crate::layers::ffn_kgamma_m128_enabled() && self.w4a16_gemm_t_m128.0 != 0)
+                || m128_forced;
+        if crate::layers::ffn_kgamma_m128_enabled() && self.w4a16_gemm_t_m128.0 == 0 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            crate::layers::warn_kernel_fallback(
+                &WARNED,
+                "ATLAS_FFN_KGAMMA_M128=1",
+                "w4a16_gemm_t_m128",
+                "the K=γ verify FFN stays on the M_TILE=64 path, and every knob \
+                 downstream of m128_path (ATLAS_FFN_KGAMMA_M32, \
+                 ATLAS_FFN_GATEUP_SPLITK, ATLAS_FFN_FUSED_GATEUP) is disabled with it",
+            );
+        }
         // m32_n64: single B read AND full SM occupancy — strictly better
         // than m128 at n ≤ 32 when the kernel symbol is present. The n<=32
         // bound keeps the WIDE window off m32/fused/split-K variants (their
@@ -1527,6 +2205,16 @@ impl DenseFfnLayer {
             && !gateup_splitk_ok
             && crate::layers::ffn_fused_gateup_enabled()
             && self.w4a16_gemm_t_m32_n64_gateup_silu.0 != 0;
+        if crate::layers::ffn_fused_gateup_enabled() && self.w4a16_gemm_t_m32_n64_gateup_silu.0 == 0
+        {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            crate::layers::warn_kernel_fallback(
+                &WARNED,
+                "ATLAS_FFN_FUSED_GATEUP=1",
+                "w4a16_gemm_t_m32_n64_gateup_silu",
+                "gate/up stay on two separate GEMMs plus a silu_mul launch",
+            );
+        }
         if fused_gateup {
             let gt = self.gate_proj_t.as_ref().unwrap();
             let ut = self.up_proj_t.as_ref().unwrap();
@@ -1536,7 +2224,8 @@ impl DenseFfnLayer {
             //   default              → staged fused (smem_B_fp8 staging)
             let fused_kernel = if crate::layers::gateup_k64_enabled()
                 && self.w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64.0 != 0
-                && h % 64 == 0  // K must be divisible by 64
+                && h.is_multiple_of(64)
+            // K must be divisible by 64
             {
                 self.w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64
             } else if crate::layers::dequant_pipe_enabled()
@@ -1837,6 +2526,21 @@ impl DenseFfnLayer {
         })?;
 
         Ok(())
+    }
+
+    /// Whether `forward_kgamma` is the correctness-owned route for this FFN.
+    ///
+    /// Exact W4+SiLU rows must not depend on the legacy tensor-core opt-in:
+    /// the exact dispatcher either selects the dynamic-M kernel tier or
+    /// fails closed to ordinary K1 rows when that tier is unavailable.
+    pub fn exact_kgamma_applicable(&self, rows: u32) -> bool {
+        !exact_ffn_tc_override()
+            && exact_ffn_auto_kgamma_applicable(
+                rows,
+                self.bf16_weights.is_none()
+                    && !self.has_w3_gemm()
+                    && self.activation == FfnActivation::SiLU,
+            )
     }
 
     /// N-token prefill: GEMM for all projections.
@@ -2332,6 +3036,70 @@ impl DenseFfnLayer {
             return Ok(());
         }
 
+        // Byte-exact cp.async pipelined path (ATLAS_PREFILL_FFN_PIPE=1):
+        // `w4a16_gemm_pipe` is a load-pipelined byte-exact shadow of the
+        // baseline M_TILE=64 kernel below (same B dequant arithmetic, same
+        // m16n8k16 MMA sequence/accumulation order) — only the weight-load
+        // pipeline differs. Small-M prefills pay a latency-bound fixed cost
+        // per layer on the baseline kernel (~8ms/layer at M=18); the pipe
+        // kernel overlaps the stream and should land near the ~190 GB/s the
+        // verify-path kernels achieve. Default off; handle 0 falls back.
+        // `w4a16_gemm_pipe` is byte-exact ONLY when the K reduction is a
+        // multiple of its 64-row stage; a partial final stage would load past
+        // the row's packed-weight boundary and silently corrupt output. The
+        // FFN shapes (h=5120, inter=17408) satisfy this, but guard explicitly
+        // so any future topology change falls back to the exact baseline.
+        if crate::layers::prefill_ffn_pipe_enabled()
+            && self.w4a16_gemm_pipe.0 != 0
+            && h % 64 == 0
+            && inter % 64 == 0
+        {
+            ops::w4a16_gemm_pipe(
+                ctx.gpu,
+                self.w4a16_gemm_pipe,
+                input,
+                &self.weights.gate_proj,
+                gate_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::w4a16_gemm_pipe(
+                ctx.gpu,
+                self.w4a16_gemm_pipe,
+                input,
+                &self.weights.up_proj,
+                up_out,
+                m,
+                inter,
+                h,
+                stream,
+            )?;
+            ops::silu_mul(
+                ctx.gpu,
+                self.act_mul,
+                gate_out,
+                up_out,
+                gate_out,
+                m * inter,
+                stream,
+            )?;
+            let output = ctx.buffers.moe_output();
+            ops::w4a16_gemm_pipe(
+                ctx.gpu,
+                self.w4a16_gemm_pipe,
+                gate_out,
+                &self.weights.down_proj,
+                output,
+                m,
+                h,
+                inter,
+                stream,
+            )?;
+            return Ok(());
+        }
+
         // Baseline M_TILE=64 path (unchanged).
         // gate_proj GEMM: [M, H] → [M, inter]
         ops::w4a16_gemm(
@@ -2398,3 +3166,7 @@ impl DenseFfnLayer {
         self.forward_prefill(input, num_tokens, ctx, stream)
     }
 }
+
+#[cfg(test)]
+#[path = "dense_ffn/exact_route_tests.rs"]
+mod exact_route_tests;

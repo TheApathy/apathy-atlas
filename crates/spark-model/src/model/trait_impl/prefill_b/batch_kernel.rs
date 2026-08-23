@@ -14,16 +14,6 @@
 //! `prefill_batch_chunk_dispatch` before any state mutation. When
 //! ineligible, the dispatcher falls through to the existing per-stream
 //! body (commit baa16fa). When eligible, this function runs.
-//!
-//! Constraints encoded:
-//!   - N ≥ 2 streams
-//!   - All streams share `chunk_len`, `seq_len_start` (q_offset), and
-//!     `is_last_chunk` flag
-//!   - Total stacked tokens fits in buffer arena
-//!   - No MLA / HDIM=512 / HSS-engaged layer in the model
-//!   - All batched kernel handles loaded
-//!
-//! Validation status: compile-only. Hardware validation pending.
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
@@ -40,15 +30,47 @@ use crate::layer::{
 };
 use crate::traits::{Model, PrefillSlice, SequenceState};
 
+/// Drains outstanding pinned-host reads if Phase A exits before its normal
+/// post-upload barrier. This is cold error-path protection only; successful
+/// batches retain the single existing synchronization after all uploads.
+struct PinnedH2dCompletionGuard<'a> {
+    gpu: &'a dyn spark_runtime::gpu::GpuBackend,
+    stream: u64,
+    armed: bool,
+}
+
+impl Drop for PinnedH2dCompletionGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = self.gpu.synchronize(self.stream)
+        {
+            // Returning would make the model reusable while an async DMA may
+            // still read the staging owner. There is no sound recovery state,
+            // so fail closed before any caller can mutate those bytes.
+            tracing::error!(
+                "pinned H2D error-path synchronization failed on stream {}: {error:#}",
+                self.stream
+            );
+            std::process::abort();
+        }
+    }
+}
+
 impl TransformerModel {
     /// Returns true when the batched-kernel path is viable for these
     /// streams. Cheap upfront check — caller (dispatch) falls back to
     /// per-stream when false.
     pub(in crate::model) fn kernel_batched_eligible(&self, streams: &[PrefillSlice<'_>]) -> bool {
         check_kernel_batched_eligible(
-            streams
-                .iter()
-                .map(|s| (s.chunk_len, s.chunk_start, s.is_last_chunk)),
+            streams.iter().map(|s| {
+                (
+                    s.chunk_len,
+                    s.chunk_start,
+                    s.is_last_chunk,
+                    s.seq.cached_prefix_tokens,
+                    s.seq.marconi_skip_to,
+                )
+            }),
             streams.len(),
             self.buffers.max_batch_tokens(),
             &self.config.model_type,
@@ -59,7 +81,8 @@ impl TransformerModel {
 
 /// Pure-data predicate extracted from [`TransformerModel::kernel_batched_eligible`]
 /// so the gating rules are unit-testable without a real `TransformerModel`.
-/// Caller materialises per-stream tuples `(chunk_len, chunk_start, is_last_chunk)`.
+/// Caller materialises per-stream tuples `(chunk_len, chunk_start,
+/// is_last_chunk, cached_prefix_tokens, marconi_skip_to)`.
 pub(in crate::model) fn check_kernel_batched_eligible<I>(
     streams: I,
     n: usize,
@@ -68,7 +91,7 @@ pub(in crate::model) fn check_kernel_batched_eligible<I>(
     head_dim: usize,
 ) -> bool
 where
-    I: IntoIterator<Item = (usize, usize, bool)>,
+    I: IntoIterator<Item = (usize, usize, bool, usize, usize)>,
 {
     if n < 2 {
         return false;
@@ -85,7 +108,12 @@ where
     }
     let mut first: Option<(usize, usize, bool)> = None;
     let mut total = 0usize;
-    for (chunk_len, chunk_start, is_last) in streams {
+    for (chunk_len, chunk_start, is_last, cached_prefix_tokens, marconi_skip_to) in streams {
+        // First chunks can look up and later chunks can inherit replay. Route
+        // both sequentially before Phase A acquires refs or mutates state.
+        if chunk_start == 0 || cached_prefix_tokens > 0 || marconi_skip_to > 0 {
+            return false;
+        }
         // `chunk_len`, `chunk_start`, and `is_last_chunk` must all
         // match across streams. Different `chunk_start` produces
         // different `effective_seq_len_start` post-Marconi (which the
@@ -109,10 +137,8 @@ where
 impl TransformerModel {
     /// Q12 Path B: full kernel-batched prefill orchestration.
     ///
-    /// Caller (prefill_batch_chunk_dispatch) MUST have verified
-    /// `kernel_batched_eligible` before calling this; if a per-stream
-    /// constraint is later detected here (e.g. proc_count mismatch from
-    /// differing prefix-cache hits), this function bails Err.
+    /// Caller MUST verify `kernel_batched_eligible` first. Later errors
+    /// propagate without a partially-mutated sequential retry.
     pub(in crate::model) fn prefill_batch_chunk_kernel_batched(
         &self,
         streams: &mut [PrefillSlice<'_>],
@@ -178,6 +204,12 @@ impl TransformerModel {
         // staging area (per single-stream upload_meta convention).
         let moe_scratch_bytes = chunk_len * self.config.num_experts_per_tok * 4 * 2 * n;
         let mut scratch_cursor = (moe_scratch_bytes + 63) & !63;
+        let mut pinned_cursor = 0usize;
+        let mut pinned_h2d_guard = PinnedH2dCompletionGuard {
+            gpu: self.gpu.as_ref(),
+            stream,
+            armed: false,
+        };
 
         for (b, slice) in streams.iter_mut().enumerate() {
             let tokens = slice.prompt_tokens;
@@ -259,6 +291,9 @@ impl TransformerModel {
 
             // Per-stream meta upload to distinct scratch slice.
             let meta_base = self.buffers.scratch().offset(scratch_cursor);
+            // Arm before entering the unsafe submit helper so every error path
+            // drains any copy that the backend may already have enqueued.
+            pinned_h2d_guard.armed = true;
             let layout = self.prefill_b_upload_meta_at(
                 tokens,
                 seq,
@@ -269,8 +304,12 @@ impl TransformerModel {
                 effective_seq_len_start,
                 &kv_cache,
                 meta_base,
+                pinned_cursor,
                 stream,
             )?;
+            pinned_cursor = pinned_cursor
+                .checked_add(layout.pinned_bytes(proc_count)?)
+                .ok_or_else(|| anyhow::anyhow!("pinned metadata cursor overflow"))?;
             if layout.needs_paged {
                 self.prefill_b_upload_paged(
                     seq,
@@ -325,6 +364,7 @@ impl TransformerModel {
 
         // H2D barrier before kernel compute (GB10 DMA quirk).
         self.gpu.synchronize(stream)?;
+        pinned_h2d_guard.armed = false;
 
         // ── PHASE B: stage BatchedAttnMetadata + outer layer loop ──
         let use_mrope = use_mrope.unwrap();
@@ -492,6 +532,4 @@ impl TransformerModel {
     }
 }
 
-// Unit tests for `check_kernel_batched_eligible` live in a sibling
-// file `batch_kernel_tests.rs` (mounted by `prefill_b.rs`) to keep
-// this file under the 500-LoC file-size-cap.
+// Eligibility tests live in sibling `batch_kernel_tests.rs`.

@@ -23,16 +23,16 @@
 //! the correction is LOSSLESS w.r.t. committed output: the target verify
 //! commits its own greedy token regardless of what the drafter proposed.
 //!
-//! ## On-GPU vs host
+//! ## Device-resident static path
 //!
 //! The per-position bias `B` is a dense `[V]` vector (V ≈ 248 K), so an exact
-//! argmax cannot be windowed to a top-k. We compute `B` on-GPU (a `[V, r] @
-//! [r]` GEMV, r = 256 — tiny), D2H just the `[V]` bias, add it to the base
-//! logit row on host, and argmax on host. The base logits are D2H'd once for
-//! the whole block (they don't change); only the per-position bias round-trips.
-//! Cost per block: 1 × (γ·V) base-logit D2H + γ × (V bias GEMV + V D2H +
-//! host argmax). At γ=11, V=248 K that is ~5.5 MB + 11 × ~0.5 MB ≈ 11 MB D2H
-//! and 11 × 248 K host comparisons — negligible next to the drafter forward.
+//! argmax cannot be approximated by a top-k window. Each position now stays on
+//! the producer stream: gather W1[prev], GEMV W2, then run
+//! `argmax_add_bf16(base_row, bias)` over the complete logical target vocab.
+//! The selected u32 is both this row's output and the next row's predecessor.
+//! Only the final gamma u32 IDs cross to the host. The previous implementation
+//! downloaded gamma base-logit rows plus one full-vocab bias per position and
+//! synchronized inside every iteration.
 
 use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
@@ -41,7 +41,7 @@ use super::BlockDiffusionDraftHead;
 use crate::layers::ops;
 
 impl BlockDiffusionDraftHead {
-    /// Re-sample the γ-block drafts LEFT-TO-RIGHT with the DSpark Markov bias.
+    /// Enqueue the gamma-block Markov correction LEFT-TO-RIGHT on `stream`.
     ///
     /// Preconditions:
     ///  * `self.markov` is `Some` (caller gates on this).
@@ -49,23 +49,21 @@ impl BlockDiffusionDraftHead {
     ///    BF16, row-major, exactly as `forward_block` left them (before any
     ///    subsequent kernel overwrites the buffer).
     ///
-    /// `base_drafts` is the plain per-row argmax `forward_block` already
-    /// computed (used only to size the output and as a fallback on the empty
-    /// path). Returns the Markov-corrected drafts, same length.
-    pub(super) fn apply_markov_sequential(
+    /// Writes the corrected token IDs to `self.scratch.draft_tokens_dev`.
+    /// There is deliberately no fallback: resolving/launching this path is a
+    /// requirement for a checkpoint whose Markov head was loaded.
+    pub(super) fn enqueue_markov_sequential(
         &self,
         gpu: &dyn GpuBackend,
         stream: u64,
         last_token: u32,
-        base_drafts: &[u32],
-    ) -> Result<Vec<u32>> {
-        let markov = match self.markov.as_ref() {
-            Some(m) => m,
-            None => return Ok(base_drafts.to_vec()),
-        };
-        let gamma_eff = base_drafts.len();
+        gamma_eff: usize,
+    ) -> Result<()> {
+        let markov = self.markov.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("DSpark Markov device dispatch requested without loaded weights")
+        })?;
         if gamma_eff == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         // The shared lm_head only spans `target_vocab_size` rows even when the
         // drafter's own `vocab_size` is larger, and `forward_block` argmaxes
@@ -78,30 +76,21 @@ impl BlockDiffusionDraftHead {
         let rank = markov.rank as u32;
         let full_vocab = self.vocab_size as u32;
 
-        // D2H the base logit block once (rows don't change between positions).
-        // Sync first so the forward_block kernels have landed.
-        gpu.synchronize(stream)?;
-        let mut base_bytes = vec![0u8; gamma_eff * self.vocab_size * bf16];
-        gpu.copy_d2h(self.scratch.logits, &mut base_bytes)?;
-        let base_logits: Vec<f32> = base_bytes
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-
-        let mut corrected: Vec<u32> = Vec::with_capacity(gamma_eff);
-        let mut prev = last_token;
-        let mut bias_bytes = vec![0u8; self.vocab_size * bf16];
+        // Seed row 0 once. This four-byte H2D completes before the stream
+        // kernels are enqueued; unlike the former implementation it is not
+        // repeated inside the per-position loop.
+        let seed_bytes = last_token.to_le_bytes();
+        gpu.copy_h2d(&seed_bytes, self.scratch.markov_prev_dev)?;
+        let mut prev_token_dev = self.scratch.markov_prev_dev;
         for k in 0..gamma_eff {
             // ── B(prev) = markov_w2 @ markov_w1[prev] ──
             // 1) gather markov_w1[prev] → [rank] BF16 via batched_embed (one
             //    token, hidden_size = rank). W1 is [vocab, rank] so row `prev`
             //    is a contiguous `[rank]` slice — a plain embedding lookup.
-            let prev_le = prev.to_le_bytes();
-            gpu.copy_h2d(&prev_le, self.scratch.markov_prev_dev)?;
             ops::batched_embed(
                 gpu,
                 self.kernels.batched_embed,
-                self.scratch.markov_prev_dev,
+                prev_token_dev,
                 markov.w1.weight,
                 self.scratch.markov_w1_row,
                 1,
@@ -121,42 +110,88 @@ impl BlockDiffusionDraftHead {
                 rank,
                 stream,
             )?;
-            gpu.synchronize(stream)?;
-            gpu.copy_d2h(self.scratch.markov_bias, &mut bias_bytes)?;
 
-            // 3) argmax over U_k + B(prev) on host, ranging over lm_vocab.
-            let row_base = k * self.vocab_size;
-            let mut best_tok = 0u32;
-            let mut best_val = f32::NEG_INFINITY;
-            for v in 0..lm_vocab {
-                let b = bf16_to_f32(u16::from_le_bytes([
-                    bias_bytes[v * 2],
-                    bias_bytes[v * 2 + 1],
-                ]));
-                let corrected_logit = base_logits[row_base + v] + b;
-                if corrected_logit > best_val {
-                    best_val = corrected_logit;
-                    best_tok = v as u32;
-                }
-            }
-            corrected.push(best_tok);
-            prev = best_tok;
+            // 3) Exact argmax over U_k + B(prev) across the logical target
+            // vocab. `scratch.logits` is compact [gamma_eff, lm_vocab] even
+            // though its allocation has padded drafter-vocab capacity.
+            let base_row = self
+                .scratch
+                .logits
+                .offset(compact_logit_row_base(k, lm_vocab) * bf16);
+            let token_out = self.scratch.draft_tokens_dev.offset(k * 4);
+            ops::argmax_add_bf16(
+                gpu,
+                self.kernels.argmax_add,
+                base_row,
+                self.scratch.markov_bias,
+                token_out,
+                lm_vocab as u32,
+                stream,
+            )?;
+            prev_token_dev = token_out;
         }
-        Ok(corrected)
+        Ok(())
     }
 }
 
-/// BF16 (stored as u16 bit pattern) → f32. Truncation form: BF16 is the high
-/// 16 bits of an IEEE-754 f32, so we just shift left by 16. Matches the
-/// `forward_block` dump helper and the drafter's BF16 storage exactly.
+/// Compact LM-head row offset. The allocation may be padded to drafter vocab,
+/// but emitted rows are packed at the logical target-vocabulary stride.
 #[inline]
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
+fn compact_logit_row_base(row: usize, lm_vocab: usize) -> usize {
+    row * lm_vocab
 }
 
 #[cfg(test)]
 mod tests {
-    use super::bf16_to_f32;
+    use super::compact_logit_row_base;
+
+    fn argmax_add_ref(base: &[f32], bias: &[f32], logical_vocab: usize) -> usize {
+        assert!(base.len() >= logical_vocab);
+        assert!(bias.len() >= logical_vocab);
+        let mut best_token = 0usize;
+        let mut best_value = f32::NEG_INFINITY;
+        for token in 0..logical_vocab {
+            let value = base[token] + bias[token];
+            if value > best_value {
+                best_value = value;
+                best_token = token;
+            }
+        }
+        best_token
+    }
+
+    #[test]
+    fn shared_lm_head_rows_use_target_vocab_stride() {
+        // Qwen3.8's DSpark config pads its drafter vocab to 248320, while the
+        // shared target LM head emits only 248077 columns.  Row 1 must begin
+        // immediately after those emitted columns, not after the allocation's
+        // padded capacity.
+        assert_eq!(compact_logit_row_base(1, 248_077), 248_077);
+        assert_ne!(compact_logit_row_base(1, 248_077), 248_320);
+        assert_eq!(compact_logit_row_base(6, 248_077), 1_488_462);
+    }
+
+    #[test]
+    fn device_argmax_contract_keeps_host_tie_break_and_logical_vocab_crop() {
+        // Tokens 1 and 2 tie after addition. The former left-to-right host
+        // scan kept token 1, so the device reduction must use token ID as its
+        // explicit secondary key. The padded drafter-only row is larger but
+        // outside the target LM head's logical vocabulary.
+        let base = [0.0, 2.0, 1.0, 100.0];
+        let bias = [0.0, 0.0, 1.0, 100.0];
+        assert_eq!(argmax_add_ref(&base, &bias, 3), 1);
+        assert_eq!(argmax_add_ref(&base, &bias, 4), 3);
+    }
+
+    #[test]
+    fn markov_module_has_no_full_vocab_host_readback_or_loop_sync() {
+        let source = include_str!("markov.rs");
+        let d2h_call = ["copy_", "d2h("].concat();
+        let sync_call = ["synchro", "nize("].concat();
+        assert!(!source.contains(&d2h_call));
+        assert!(!source.contains(&sync_call));
+        assert!(source.contains("ops::argmax_add_bf16"));
+    }
 
     /// Host-side reference of `VanillaMarkov.sample_block_tokens` (greedy,
     /// temperature=0). Replicates `markov_head.py` exactly on small f32
@@ -194,15 +229,6 @@ mod tests {
             prev = best_tok;
         }
         out
-    }
-
-    #[test]
-    fn bf16_roundtrip_high_bits() {
-        // 1.0 = 0x3F800000 → bf16 0x3F80. 2.0 → 0x4000. -1.0 → 0xBF80.
-        assert_eq!(bf16_to_f32(0x3F80), 1.0);
-        assert_eq!(bf16_to_f32(0x4000), 2.0);
-        assert_eq!(bf16_to_f32(0xBF80), -1.0);
-        assert_eq!(bf16_to_f32(0x0000), 0.0);
     }
 
     #[test]

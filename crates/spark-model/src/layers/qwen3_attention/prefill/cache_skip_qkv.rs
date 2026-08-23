@@ -92,7 +92,7 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         // Per-projection weight bundle. Q has no `q_fp8w_t` shortcut in this
         // path (matches the inline body pre-refactor).
-        let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, label) = match proj {
+        let (fp8w_t, weight_opt, fp8, mut nvfp4_t, dense, label) = match proj {
             SkipProj::Q => (
                 None,
                 self.q_weight.as_ref(),
@@ -118,6 +118,13 @@ impl Qwen3AttentionLayer {
                 "v_proj",
             ),
         };
+
+        // Correctness lever: opt out of the transposed-TC prefill projections
+        // and fall through to the non-transposed M_TILE=64 `w4a16_gemm` path
+        // (same class as the ATLAS_PREFILL_FFN_FAST=0 fix).
+        if !crate::layers::prefill_proj_fast_enabled() {
+            nvfp4_t = None;
+        }
 
         if let Some(fp8t) = fp8w_t {
             ops::w8a16_gemm_t(

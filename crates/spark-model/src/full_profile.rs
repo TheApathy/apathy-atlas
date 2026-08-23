@@ -32,10 +32,43 @@ fn enabled_cached() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_FULL_PROFILE").ok().as_deref() == Some("1"))
 }
 
+/// Runtime override, toggled via SIGUSR1/SIGUSR2 so a live instance can be
+/// profiled without restart. When set, `is_enabled()` returns true even if
+/// `ATLAS_FULL_PROFILE` was unset at startup, and the verify path disables
+/// CUDA graph capture so per-kernel sync is legal.
+static RUNTIME_OVERRIDE: AtomicBool = AtomicBool::new(false);
+
+/// Toggle per-kernel profiling at runtime. `true` enables, `false` disables.
+/// Re-arms the warmup gate so the first N steps after a toggle are not
+/// attributed (graph re-capture / driver re-tiering noise).
+pub fn set_runtime_profile(enabled: bool) {
+    RUNTIME_OVERRIDE.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        // Emit the accumulated per-kernel report before silencing the hot path.
+        dump();
+        table().lock().clear();
+    }
+    // Reset the step/warmup gate so a fresh enable re-runs warmup and a
+    // disable immediately silences the kprof! hot path.
+    STEP.store(0, Ordering::Relaxed);
+    ACTIVE.store(false, Ordering::Relaxed);
+    tracing::info!(
+        "FULL_PROFILE runtime override -> {}",
+        if enabled { "ON" } else { "OFF" }
+    );
+}
+
 /// Public predicate. Inlined into the macro guard.
 #[inline]
 pub fn is_enabled() -> bool {
-    enabled_cached()
+    enabled_cached() || RUNTIME_OVERRIDE.load(Ordering::Relaxed)
+}
+
+/// `ATLAS_PREFILL_PHASE_PROFILE=1` gates the per-phase prefill timing log
+/// (embed / prefix-lookup / blocks / meta / layers / finalize).
+pub fn phase_profile_enabled() -> bool {
+    static PHASE: OnceLock<bool> = OnceLock::new();
+    *PHASE.get_or_init(|| std::env::var("ATLAS_PREFILL_PHASE_PROFILE").ok().as_deref() == Some("1"))
 }
 
 /// Per-kernel accumulator. Keyed by static string label so we can sort the
@@ -101,7 +134,7 @@ pub fn is_active() -> bool {
 /// next request — only counting-shaped prompts that fit in 5 warmup steps
 /// (the prior threshold) ever appeared to work.
 pub fn begin_step() {
-    if !enabled_cached() {
+    if !is_enabled() {
         return;
     }
     let n = STEP.fetch_add(1, Ordering::Relaxed) + 1;

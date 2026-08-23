@@ -52,7 +52,42 @@ impl Qwen3SsmLayer {
             // General batched BA-proj GEMV (grid.y = token). Bit-identical
             // to per-token dense_gemv_bf16. NULL on older PTX bundles.
             dense_gemv_batchn_k: super::super::try_kernel(gpu, "gemv", "dense_gemv_bf16_batchn"),
+            ba_gates_batchn_exact_k: super::super::try_kernel(
+                gpu,
+                "ssm_preprocess",
+                "dense_gemv_ba_gates_batchn",
+            ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_exact_projection_kernels: ops::W4a16ExactLmHeadKernels::new(
+                super::super::try_kernel(gpu, "w4a16_gemv", ops::ExactLmHeadTier::M4.symbol()),
+                super::super::try_kernel(gpu, "w4a16_gemv", ops::ExactLmHeadTier::M8.symbol()),
+                super::super::try_kernel(gpu, "w4a16_gemv", ops::ExactLmHeadTier::M17.symbol()),
+                super::super::try_kernel(gpu, "w4a16_gemv", ops::ExactLmHeadTier::M32.symbol()),
+            )
+            .with_rt2(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    ops::ExactLmHeadTier::M4.symbol_rt2(),
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    ops::ExactLmHeadTier::M8.symbol_rt2(),
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    ops::ExactLmHeadTier::M17.symbol_rt2(),
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    ops::ExactLmHeadTier::M32.symbol_rt2(),
+                ),
+            ),
+            w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            gemv_sw: crate::layers::ops::gemv_sw_enabled(),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
             w4a16_gemv_qkvz_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qkvz")?,
             fused_rms_qkvz_k: super::super::try_kernel(
@@ -90,12 +125,38 @@ impl Qwen3SsmLayer {
                 }
                 h
             },
+            conv1d_l2norm_f32_sequence_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d",
+                "causal_conv1d_update_l2norm_f32_sequence",
+            ),
             gdn_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_decode")?,
             gdn_f32_k: super::super::try_kernel(
                 gpu,
                 "gated_delta_rule",
                 "gated_delta_rule_decode_f32",
             ),
+            gdn_f32_sequence_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule",
+                "gated_delta_rule_decode_f32_sequence",
+            ),
+            gdn_f32_sequence_persistent_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule",
+                "gated_delta_rule_decode_f32_sequence_persistent",
+            ),
+            gdn_f32_sequence_nosnap_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule",
+                "gated_delta_rule_decode_f32_sequence_nosnap",
+            ),
+            gdn_f32_sequence_lazyfinal_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule",
+                "gated_delta_rule_decode_f32_sequence_lazyfinal",
+            ),
+            gdn_lazy_retain: std::sync::OnceLock::new(),
             ba_gates_k: gpu.kernel("ssm_preprocess", "dense_gemv_ba_gates")?,
             residual_add_k: if config.use_fp32_residual() {
                 gpu.kernel("norm", "f32_residual_add")
@@ -112,6 +173,7 @@ impl Qwen3SsmLayer {
             },
             gated_rms_norm_prefill_k: gpu.kernel("norm", "gated_rms_norm_prefill")?,
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w4a16_gemm_pipe_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
@@ -230,11 +292,13 @@ impl Qwen3SsmLayer {
                 gpu.alloc(bytes)?
             },
             ssm_multi_seq_ptr_max: 32,
-            // Fix B: stable heap-allocated host staging buffer for the
+            // Fix B: stable page-locked host staging buffer for the
             // ptr-table H2D upload. Address stays put for the model
             // lifetime — required for CUDA graph capture (the previous
             // `[u64; 64]` stack array was invalid on graph replay).
-            multi_seq_ptr_host: Box::new(std::cell::UnsafeCell::new([0u64; 64])),
+            multi_seq_ptr_host: Box::new(std::cell::UnsafeCell::new(
+                gpu.alloc_host_pinned(64 * std::mem::size_of::<u64>())?,
+            )),
             ba_gates_prefill_k: gpu.kernel("ssm_preprocess", "dense_gemm_ba_gates_prefill")?,
             conv1d_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
             gdn_chunk2_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk2")?,
@@ -244,6 +308,27 @@ impl Qwen3SsmLayer {
             gdn_wy2_k: gpu.kernel("gated_delta_rule_wy", "gated_delta_rule_wy2")?,
             gdn_wy3_k: gpu.kernel("gated_delta_rule_wy3", "gated_delta_rule_wy3")?,
             gdn_wy4_k: gpu.kernel("gated_delta_rule_wy4", "gated_delta_rule_wy4")?,
+            // ATLAS_SSM_H_FP16 twins. try_kernel, not kernel: these are absent
+            // from some targets' PTX and their absence must not break a normal
+            // FP32 launch. The .cu sources name the wy2 twin
+            // `gated_delta_rule_wy_f16` (module `gated_delta_rule_wy_f16`),
+            // mirroring how the FP32 wy2 lives in the `gated_delta_rule_wy`
+            // module above.
+            gdn_wy2_f16_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy_f16",
+                "gated_delta_rule_wy2_f16",
+            ),
+            gdn_wy3_f16_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy3_f16",
+                "gated_delta_rule_wy3_f16",
+            ),
+            gdn_wy4_f16_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy4_f16",
+                "gated_delta_rule_wy4_f16",
+            ),
             // wy17 only present in qwen3.6-35b-a3b's PTX module set; NULL on other targets.
             // decode_batched(K=17) checks for non-NULL before dispatching the fused path.
             gdn_wy17_k: super::super::try_kernel(

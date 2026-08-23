@@ -74,9 +74,11 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::w4a16_gemv(
+            ops::w4a16_decode_gemv(
                 ctx.gpu,
                 self.w4a16_gemv_k,
+                self.w4a16_gemv_sw_k,
+                self.gemv_sw,
                 attn_out,
                 &self.attn.o_proj,
                 o_out,

@@ -34,6 +34,15 @@
 use anyhow::{Result, bail};
 use spark_runtime::gpu::DevicePtr;
 
+/// EP worker opcode for variable-width speculative verification. The frame is
+/// `opcode, k, k bulk-broadcast tokens, accepted_drafts`; the result may be
+/// [`EP_VERIFY_KGAMMA_ABORT`] when rank 0 cannot commit the verify.
+pub const EP_CMD_VERIFY_KGAMMA: u32 = 0xFFFFFFF5;
+
+/// Result sentinel releasing an EP worker from a variable-width verify without
+/// committing any of its over-extended target state.
+pub const EP_VERIFY_KGAMMA_ABORT: u32 = u32::MAX;
+
 use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
 
 pub trait Model: Send + Sync {
@@ -318,6 +327,57 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Exact verify-side token capacity for the installed DFlash proposer.
+    ///
+    /// Includes the bonus/root row. The universal default is `None`; the
+    /// TransformerModel implementation must forward its actual persistent
+    /// parent/state allocation rather than recomputing an environment value.
+    fn dflash_verify_capacity_k(&self) -> Option<usize> {
+        None
+    }
+
+    // ── Speculation arms ────────────────────────────────────────────────
+    //
+    // A build can carry more than one draft proposer: `--dflash --speculative`
+    // installs the external DFlash/DDTree drafter as arm 0 and DEMOTES the
+    // in-checkpoint MTP head to arm 1 instead of dropping it. The scheduler's
+    // throughput gate picks between them per step, because their strengths are
+    // opposite — the external drafter wins on code, the native head on prose.
+    //
+    // The defaults below describe a single-arm model, so implementations that
+    // do not support arms keep working unchanged.
+
+    /// How many proposer arms this model can offer (0, 1 or 2).
+    /// A gate is only worth arming when this is ≥ 2.
+    fn proposer_arm_count(&self) -> usize {
+        if self.has_proposer() { 1 } else { 0 }
+    }
+
+    /// Which proposer arm is currently live.
+    fn proposer_arm(&self) -> u8 {
+        0
+    }
+
+    /// Point the model at a proposer arm; returns the arm actually selected,
+    /// which is 0 when the requested arm does not exist on this build.
+    ///
+    /// MUST be paired with [`Self::swap_proposer_state`] on every live
+    /// sequence whenever the returned arm differs from the previous one —
+    /// each proposer owns a differently-typed per-sequence state, and readers
+    /// downcast `SequenceState::proposer_state` to the type they expect.
+    fn set_proposer_arm(&self, _arm: u8) -> u8 {
+        0
+    }
+
+    /// Exchange a sequence's active and parked proposer states, preserving the
+    /// invariant that `proposer_state` always belongs to the live arm.
+    ///
+    /// A free function on the trait rather than on the model: it touches only
+    /// the sequence, and every implementation would write the same two lines.
+    fn swap_proposer_state(&self, seq: &mut SequenceState) {
+        std::mem::swap(&mut seq.proposer_state, &mut seq.proposer_state_alt);
+    }
+
     /// Check if self-speculative decoding is enabled.
     fn has_self_speculative(&self) -> bool;
 
@@ -514,6 +574,23 @@ pub trait Model: Send + Sync {
         self.decode_verify(tokens, seq, stream)
     }
 
+    /// True while the one-shot C=1 stage comparator still needs a replay.
+    fn k1_stage_diag_requested(&self, _pre_verify_len: usize, _tokens: &[u32]) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Begin/advance/end the ordinary-decode side of the stage comparator.
+    fn k1_stage_diag_begin(&self, _pre_verify_len: usize, _tokens: &[u32]) -> Result<()> {
+        Ok(())
+    }
+    fn k1_stage_diag_finish_serial_row(&self) -> Result<()> {
+        Ok(())
+    }
+    fn k1_stage_diag_finish_serial(&self) -> Result<()> {
+        Ok(())
+    }
+    fn k1_stage_diag_abort(&self) {}
+
     /// DFlash γ-token verification: 1 verified + γ drafts → per-position
     /// argmax. Variable-length γ (vs fixed K=2/3/4) because it's a drafter
     /// config field. CUDA-graph capture keyed by `(slot_idx, tokens.len())`.
@@ -640,6 +717,17 @@ pub trait Model: Send + Sync {
     /// never produce mis-conditioned rows).
     fn dflash_tree_ancestor_attn_exact(&self) -> bool {
         true
+    }
+
+    /// Whether this model can run a non-flat DDTree verify with exact
+    /// attention and recurrent state for every layer.
+    ///
+    /// The scheduler consults this before widening a flat DFlash verify to
+    /// the full tree. Returning false discards the tree payload and preserves
+    /// the ordinary flat verifier, avoiding expensive work whose branch rows
+    /// could not be committed safely. Models must fail closed.
+    fn dflash_tree_verify_capable(&self) -> bool {
+        false
     }
 
     /// DDTree M6: drain the per-seq tree payload stashed by the last propose
@@ -976,5 +1064,19 @@ pub trait Model: Send + Sync {
     /// Make a stream wait for an event (GPU-side sync, CPU does not block).
     fn stream_wait_event(&self, _stream: u64, _event: u64) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dflash_capacity_abi_tests {
+    use super::Model;
+
+    #[test]
+    fn capacity_accessor_is_object_safe() {
+        fn read_capacity(model: &dyn Model) -> Option<usize> {
+            model.dflash_verify_capacity_k()
+        }
+        let accessor: fn(&dyn Model) -> Option<usize> = read_capacity;
+        let _ = accessor;
     }
 }

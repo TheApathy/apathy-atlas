@@ -5,7 +5,7 @@
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
 
@@ -252,6 +252,33 @@ pub trait TransformerLayer: Send + Sync {
     /// `prefill_phase3` instead of the monolithic `prefill`.
     fn is_ssm_layer(&self) -> bool {
         false
+    }
+
+    /// Whether this layer preserves exact DDTree ancestor visibility when
+    /// `ForwardContext::tree_aware_attn` is present.
+    ///
+    /// Non-attention layers return true: they do not consume the paged KV
+    /// cache. Attention implementations must override this and return false
+    /// for any KV dtype whose decode kernel ignores the tree indirection.
+    /// `verify_d.rs` requires every layer to pass before it allows a branch
+    /// commit; this deliberately fails closed as new KV formats are added.
+    fn ddtree_ancestor_attention_exact(&self) -> bool {
+        true
+    }
+
+    /// Per-attention-layer DDTree indirection certificate. Non-attention
+    /// layers return `None`; attention layers report their cache dtype and
+    /// whether the matching tree-aware decode handle is resolved.
+    fn ddtree_attention_certificate(&self) -> Option<(KvCacheDtype, bool)> {
+        None
+    }
+
+    /// Whether this layer can preserve DDTree's convolutional state along a
+    /// non-flat parent chain. Non-SSM layers return true because they have no
+    /// recurrent convolutional state; SSM implementations must fail closed
+    /// when the tree re-root kernel is unavailable.
+    fn ddtree_conv_state_exact(&self) -> bool {
+        true
     }
 
     /// Allocate the transposed MoE expert weights used by the coalesced
@@ -552,6 +579,31 @@ pub trait TransformerLayer: Send + Sync {
     /// return a live handle. See `Qwen3SsmLayer`.
     fn wy17_replay_kernel(&self) -> spark_runtime::gpu::KernelHandle {
         spark_runtime::gpu::KernelHandle(0)
+    }
+
+    /// GDN LAZY-commit (ExactSequence path, `ATLAS_SSM_GDN_LAZY=1`): TRUE when
+    /// a `num_tokens`-wide verify on this layer dispatched the `lazyfinal`
+    /// kernel (no per-token H snapshots; h_state left at step-initial). Pure
+    /// function of num_tokens + process-constant env + kernel handles, so the
+    /// async commit can mirror the dispatch decision exactly (graph-safe, no
+    /// per-step mutable flag). Default false — non-SSM layers.
+    fn gdn_seq_lazy_engaged(&self, _num_tokens: usize) -> bool {
+        false
+    }
+
+    /// The FP32 replay kernel for the lazy ExactSequence commit — the nosnap
+    /// sequence kernel, which re-runs the identical recurrence over the
+    /// retained inputs. Null when unavailable.
+    fn gdn_seq_replay_kernel(&self) -> spark_runtime::gpu::KernelHandle {
+        spark_runtime::gpu::KernelHandle(0)
+    }
+
+    /// Layer-owned retention buffer for the lazy ExactSequence commit:
+    /// [16 rows x qkvz_size] fp32 of this step's post-conv q/k/v(+z), with the
+    /// [16 x 2*nv] fp32 gate/beta block at byte offset 16*qkvz_size*4.
+    /// None until first lazy dispatch allocates it. Default None.
+    fn gdn_seq_lazy_retain(&self) -> Option<spark_runtime::gpu::DevicePtr> {
+        None
     }
 
     /// TRUE when this layer's K=γ GDN dispatch would take the tree-aware

@@ -24,6 +24,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub(crate) mod block_mgmt;
+pub(crate) mod control_engagement;
 pub(crate) mod drop;
 pub(crate) mod early_exit;
 pub(crate) mod env_diag;
@@ -34,7 +35,9 @@ pub(crate) mod impl_a3;
 pub(crate) mod impl_b1;
 pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
+pub(crate) mod k1_stage_diag;
 pub(crate) mod ssm_pool;
+pub mod ssm_pool_geometry;
 pub(crate) mod ssm_snapshot;
 pub(crate) mod trait_impl;
 pub(crate) mod types;

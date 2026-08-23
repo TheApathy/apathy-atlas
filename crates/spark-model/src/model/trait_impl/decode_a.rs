@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -34,6 +34,10 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        // ATLAS_SSM_H_FP16 stage 2: flip this sequence's h-state to FP16 before
+        // any graph capture/replay below. Must be here and not in a layer — see
+        // `ssm_h_to_f16_dispatch`. No-op unless the flag is set.
+        self.ssm_h_to_f16_dispatch(seq)?;
         // Use backend's own stream (non-default, required for CUDA graph capture).
         let stream = self.gpu.default_stream();
         let hidden = self.buffers.hidden_states();
@@ -52,6 +56,18 @@ impl TransformerModel {
 
         // 1. Embedding lookup
         self.embed(token, hidden, stream)?;
+        let hidden_elem_bytes = if self.config.use_fp32_residual() {
+            4
+        } else {
+            2
+        };
+        self.capture_k1_stage(
+            "embed",
+            hidden,
+            1,
+            self.config.hidden_size * hidden_elem_bytes,
+            stream,
+        )?;
 
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
@@ -69,25 +85,27 @@ impl TransformerModel {
         let max_blocks = seq.block_table.len() as u32;
 
         let pos_val = seq.seq_len as u32;
-        self.gpu
-            .copy_h2d_async(&pos_val.to_le_bytes(), meta_base, stream)?;
+        let pos_bytes = pos_val.to_le_bytes();
 
         let block_idx = seq
             .physical_block_for(seq.seq_len / bs)
             .unwrap_or(self.dummy_kv_block);
         let global_slot = (block_idx as i64) * (bs as i64) + ((seq.seq_len % bs) as i64);
-        self.gpu
-            .copy_h2d_async(&global_slot.to_le_bytes(), meta_base.offset(8), stream)?;
+        let slot_bytes = global_slot.to_le_bytes();
 
         let actual_seq_len = (seq.seq_len + 1) as i32;
-        self.gpu
-            .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
+        let seq_len_bytes = actual_seq_len.to_le_bytes();
 
         let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
+        let copies = [
+            HostToDeviceCopy::new(&pos_bytes, meta_base),
+            HostToDeviceCopy::new(&slot_bytes, meta_base.offset(8)),
+            HostToDeviceCopy::new(&seq_len_bytes, meta_base.offset(16)),
+            HostToDeviceCopy::new(bt_bytes, meta_base.offset(256)),
+        ];
+        self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
@@ -129,7 +147,20 @@ impl TransformerModel {
         // Capture isn't a useful win for HSS anyway: per-layer launch overhead
         // is small relative to the per-step disk I/O on the critical path.
         let hss_engaged = kv_cache.config().cache_blocks_per_seq.is_some();
-        let use_graphs = self.comm.is_none() && !self.profile && !suppress_graphs && !hss_engaged;
+        let serial_debug_dump_all =
+            std::env::var("ATLAS_SERIAL_DEBUG_DUMP_ALL").ok().as_deref() == Some("1");
+        let serial_debug_dump = std::env::var("ATLAS_SERIAL_DEBUG_DUMP").is_ok()
+            && (serial_debug_dump_all
+                || std::env::var("ATLAS_SERIAL_DEBUG_SEQ_LEN")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .is_none_or(|wanted| wanted == seq.seq_len));
+        let use_graphs = self.comm.is_none()
+            && !self.profile
+            && !suppress_graphs
+            && !hss_engaged
+            && !serial_debug_dump
+            && !crate::model::k1_stage_diag::enabled();
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -198,6 +229,32 @@ impl TransformerModel {
                 &ctx,
                 stream,
             )?;
+            self.capture_k1_stage(
+                &format!("layer_{i:02}"),
+                hidden,
+                1,
+                self.config.hidden_size * hidden_elem_bytes,
+                stream,
+            )?;
+            // Offline K=gamma parity probe: capture the single-token hidden
+            // at one requested absolute position so it can be diffed against
+            // `ATLAS_KGAMMA_DEBUG_DUMP` row-for-row.  The seq-len selector is
+            // important: without it, the first decode would win the one-shot
+            // filenames and hide the actual divergent position.
+            if serial_debug_dump {
+                let h_bytes = self.config.hidden_size * 2;
+                let path = if serial_debug_dump_all {
+                    format!("/tmp/atlas_serial_seqlen{}_layer{i}.bin", seq.seq_len)
+                } else {
+                    format!("/tmp/atlas_serial_layer{i}.bin")
+                };
+                if !std::path::Path::new(&path).exists() {
+                    let mut buf = vec![0u8; h_bytes];
+                    self.gpu.synchronize(stream)?;
+                    self.gpu.copy_d2h(hidden, &mut buf)?;
+                    std::fs::write(path, buf)?;
+                }
+            }
             // DFlash 5-layer hidden capture (no-op when proposer is not DFlash).
             // Single-token decode: row 0 of `hidden_states()` holds the post-layer
             // activation. Cheap d2d when the layer index matches; otherwise a
@@ -239,9 +296,33 @@ impl TransformerModel {
             eps,
             stream,
         )?;
+        self.capture_k1_stage("final_norm", normed, 1, self.config.hidden_size * 2, stream)?;
+
+        if serial_debug_dump {
+            let h_bytes = self.config.hidden_size * 2;
+            let path = if serial_debug_dump_all {
+                format!("/tmp/atlas_serial_seqlen{}_final_norm.bin", seq.seq_len)
+            } else {
+                "/tmp/atlas_serial_final_norm.bin".to_string()
+            };
+            if !std::path::Path::new(&path).exists() {
+                let mut buf = vec![0u8; h_bytes];
+                self.gpu.synchronize(stream)?;
+                self.gpu.copy_d2h(normed, &mut buf)?;
+                std::fs::write(path, buf)?;
+            }
+        }
 
         // LM head reads from normed directly (no D2D copy needed)
         self.lm_head(normed, stream)?;
+        let logits_elem_bytes = if self.use_fp32_logits { 4 } else { 2 };
+        self.capture_k1_stage(
+            "logits",
+            self.decode_logits_ptr(),
+            1,
+            self.config.vocab_size * logits_elem_bytes,
+            stream,
+        )?;
 
         // Decode-step diagnostic for Gemma-4 degeneration analysis. Only fires
         // when ATLAS_DIAG_GEMMA4=1 (which also disables CUDA graphs upstream,

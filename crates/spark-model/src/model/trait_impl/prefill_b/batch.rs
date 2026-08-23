@@ -120,12 +120,11 @@ impl TransformerModel {
         // Q12 Path B: kernel-batched fast path. Check eligibility upfront
         // (cheap) and, when viable, dispatch to the outer-layer-loop
         // implementation that uses BatchedAttnMetadata + per-layer batched
-        // dispatchers. On Err from the kernel path, fall through to the
-        // per-stream body below. The kernel path bails BEFORE any state
-        // mutation on the structural eligibility check; mid-Phase-A bails
-        // (e.g. proc_count mismatch from differing prefix-cache hits) leave
-        // the streams in a partially-mutated state — we propagate that Err
-        // so the caller can retry single-stream or surface to the user.
+        // dispatchers. Eligibility excludes every first-chunk or inherited
+        // prefix-replay case before lookup, ref acquisition, block allocation,
+        // or model-state mutation. Once the kernel path starts, every error is
+        // propagated: falling through would repeat lookup/allocation against
+        // partially-mutated streams.
         //
         // Runtime kill switch: set `ATLAS_Q12_BATCHED=0` to force-disable
         // the kernel-batched path without rebuilding. Default is enabled
@@ -142,23 +141,7 @@ impl TransformerModel {
                 is_last_chunk = streams[0].is_last_chunk,
                 "Q12 kernel-batched dispatch attempt"
             );
-            match self.prefill_batch_chunk_kernel_batched(streams, stream) {
-                Ok(v) => {
-                    tracing::debug!(target: "atlas::q12", "Q12 kernel-batched succeeded");
-                    return Ok(v);
-                }
-                Err(e) => {
-                    // Structural bails (proc_count/seq_lens_start mismatch,
-                    // unsupported layer feature) are logged at info so the
-                    // first occurrence is visible in production logs without
-                    // requiring debug-level tracing. Subsequent bails are
-                    // still logged but with reduced verbosity in tight loops.
-                    tracing::info!(
-                        target: "atlas::q12",
-                        "Q12 kernel-batched bailed → falling back to per-stream: {e}"
-                    );
-                }
-            }
+            return self.prefill_batch_chunk_kernel_batched(streams, stream);
         } else if !q12_batched_enabled {
             tracing::trace!(
                 target: "atlas::q12",

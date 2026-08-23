@@ -11,6 +11,75 @@
 
 use std::sync::OnceLock;
 
+use anyhow::{Result, bail};
+
+#[inline]
+fn diag_bool_value(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Fail-closed K=1 controls for cross-sequence DFlash target bisection.
+///
+/// Only named diagnostic families are allowed. FFN+layer-norms tests the
+/// partial layer contribution found by C1; adding LM-head serialization tests
+/// the remaining output projection while deliberately leaving final norm wide.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DflashSerialControls {
+    pub ffn: bool,
+    pub layer_norms: bool,
+    pub final_norm: bool,
+    pub lm_head: bool,
+}
+
+impl DflashSerialControls {
+    pub fn current() -> Self {
+        static FFN: OnceLock<bool> = OnceLock::new();
+        static LAYER_NORMS: OnceLock<bool> = OnceLock::new();
+        static FINAL_NORM: OnceLock<bool> = OnceLock::new();
+        static LM_HEAD: OnceLock<bool> = OnceLock::new();
+
+        Self {
+            ffn: *FFN.get_or_init(|| {
+                diag_bool_value(std::env::var("ATLAS_DFLASH_SERIAL_FFN").ok().as_deref())
+            }),
+            layer_norms: *LAYER_NORMS.get_or_init(|| {
+                diag_bool_value(
+                    std::env::var("ATLAS_DFLASH_SERIAL_LAYER_NORMS")
+                        .ok()
+                        .as_deref(),
+                )
+            }),
+            final_norm: *FINAL_NORM.get_or_init(|| {
+                diag_bool_value(
+                    std::env::var("ATLAS_DFLASH_SERIAL_FINAL_NORM")
+                        .ok()
+                        .as_deref(),
+                )
+            }),
+            lm_head: *LM_HEAD.get_or_init(|| {
+                diag_bool_value(std::env::var("ATLAS_DFLASH_SERIAL_LM_HEAD").ok().as_deref())
+            }),
+        }
+    }
+
+    /// Returns the one active family, or `None` with normal defaults.
+    pub fn active_family(self) -> Result<Option<&'static str>> {
+        match (self.ffn, self.layer_norms, self.final_norm, self.lm_head) {
+            (false, false, false, false) => Ok(None),
+            (true, false, false, false) => Ok(Some("ffn")),
+            (false, true, false, false) => Ok(Some("layer_norms")),
+            (true, true, false, false) => Ok(Some("ffn_layer_norms")),
+            (true, true, false, true) => Ok(Some("ffn_layer_norms_lm_head")),
+            (false, false, true, false) => Ok(Some("final_norm")),
+            (false, false, false, true) => Ok(Some("lm_head")),
+            _ => bail!(
+                "DFLASH_K1_BISECT invalid serial-family combination; only \
+                 FFN+LAYER_NORMS and FFN+LAYER_NORMS+LM_HEAD may be combined"
+            ),
+        }
+    }
+}
+
 /// `ATLAS_DUMP_HIDDEN` env var, cached. Returns the path string when set
 /// (non-empty), `None` otherwise. Hot-path callers in `decode_a` /
 /// `prefill_b` previously re-read this on every token.
@@ -106,4 +175,95 @@ pub fn dflash_capture_thinking_enabled() -> bool {
             .ok()
             .is_some_and(|v| v == "1" || v == "true")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DflashSerialControls, diag_bool_value};
+
+    #[test]
+    fn dflash_serial_bool_parser_is_explicit() {
+        assert!(!diag_bool_value(None));
+        assert!(diag_bool_value(Some("1")));
+        assert!(diag_bool_value(Some("true")));
+        assert!(diag_bool_value(Some("TRUE")));
+        assert!(!diag_bool_value(Some("0")));
+        assert!(!diag_bool_value(Some("yes")));
+        assert!(!diag_bool_value(Some(" true ")));
+    }
+
+    #[test]
+    fn dflash_serial_controls_require_one_family_at_most() {
+        assert_eq!(
+            DflashSerialControls::default().active_family().unwrap(),
+            None
+        );
+        assert_eq!(
+            DflashSerialControls {
+                ffn: true,
+                ..Default::default()
+            }
+            .active_family()
+            .unwrap(),
+            Some("ffn")
+        );
+        assert_eq!(
+            DflashSerialControls {
+                layer_norms: true,
+                ..Default::default()
+            }
+            .active_family()
+            .unwrap(),
+            Some("layer_norms")
+        );
+        assert_eq!(
+            DflashSerialControls {
+                ffn: true,
+                layer_norms: true,
+                ..Default::default()
+            }
+            .active_family()
+            .unwrap(),
+            Some("ffn_layer_norms")
+        );
+        assert_eq!(
+            DflashSerialControls {
+                ffn: true,
+                layer_norms: true,
+                lm_head: true,
+                ..Default::default()
+            }
+            .active_family()
+            .unwrap(),
+            Some("ffn_layer_norms_lm_head")
+        );
+        assert_eq!(
+            DflashSerialControls {
+                final_norm: true,
+                ..Default::default()
+            }
+            .active_family()
+            .unwrap(),
+            Some("final_norm")
+        );
+        assert_eq!(
+            DflashSerialControls {
+                lm_head: true,
+                ..Default::default()
+            }
+            .active_family()
+            .unwrap(),
+            Some("lm_head")
+        );
+        assert!(
+            DflashSerialControls {
+                ffn: true,
+                layer_norms: true,
+                final_norm: true,
+                lm_head: false,
+            }
+            .active_family()
+            .is_err()
+        );
+    }
 }

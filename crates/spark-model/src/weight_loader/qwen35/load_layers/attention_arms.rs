@@ -193,19 +193,26 @@ pub(super) fn build_full_attention_nvfp4(
         num_heads * head_dim
     };
     if let Some(ref qw) = q_nvfp4 {
-        let qt = qw.transpose_for_gemm(gpu, q_proj_n, h)?;
-        let kt = k_nvfp4
-            .as_ref()
-            .unwrap()
-            .transpose_for_gemm(gpu, num_kv_heads * head_dim, h)?;
-        let vt = v_nvfp4
-            .as_ref()
-            .unwrap()
-            .transpose_for_gemm(gpu, num_kv_heads * head_dim, h)?;
-        let ot = layer
-            .attn
-            .o_proj
-            .transpose_for_gemm(gpu, h, num_heads * head_dim)?;
+        let qt =
+            qw.transpose_for_gemm_cached(gpu, q_proj_n, h, &format!("L{i}.self_attn.q_proj.t"))?;
+        let kt = k_nvfp4.as_ref().unwrap().transpose_for_gemm_cached(
+            gpu,
+            num_kv_heads * head_dim,
+            h,
+            &format!("L{i}.self_attn.k_proj.t"),
+        )?;
+        let vt = v_nvfp4.as_ref().unwrap().transpose_for_gemm_cached(
+            gpu,
+            num_kv_heads * head_dim,
+            h,
+            &format!("L{i}.self_attn.v_proj.t"),
+        )?;
+        let ot = layer.attn.o_proj.transpose_for_gemm_cached(
+            gpu,
+            h,
+            num_heads * head_dim,
+            &format!("L{i}.self_attn.o_proj.t"),
+        )?;
         layer.set_prefill_weights(Some(qt), Some(kt), Some(vt), Some(ot));
     }
     layer.predequant_for_prefill(gpu, config, stream)?;

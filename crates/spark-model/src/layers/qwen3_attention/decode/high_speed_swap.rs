@@ -188,14 +188,11 @@ impl Qwen3AttentionLayer {
                 | KvCacheDtype::Bf16KTurbo4V
                 | KvCacheDtype::Bf16KTurbo3V
                 | KvCacheDtype::Bf16KTurbo2V => {
-                    // copy_d2h_async_on_stream: orders the D2H after
-                    // WHT+reshape_and_cache on the production stream
-                    // (Turbo8 race fix, 2026-04-28). The async variant
-                    // queues the copy without the per-call sync that
-                    // dominated decode-time HSS overhead. TQ+ added the
-                    // Bf16K{Turbo4,3,2}V asymmetric dtypes — same K-side
+                    // Drain WHT+reshape_and_cache once, then copy K + V via
+                    // the pageable-safe synchronous pair boundary. TQ+ added
+                    // the Bf16K{Turbo4,3,2}V asymmetric dtypes — same K-side
                     // (BF16 raw) → same D2H path.
-                    ctx.gpu.copy_d2h_async_on_stream(
+                    ctx.gpu.copy_d2h_pair_on_stream(
                         spark_runtime::gpu::DevicePtr(k_block_dev),
                         unsafe {
                             std::slice::from_raw_parts_mut(
@@ -203,9 +200,6 @@ impl Qwen3AttentionLayer {
                                 block_floats * 2,
                             )
                         },
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_async_on_stream(
                         spark_runtime::gpu::DevicePtr(v_block_dev),
                         unsafe {
                             std::slice::from_raw_parts_mut(
@@ -215,11 +209,6 @@ impl Qwen3AttentionLayer {
                         },
                         stream,
                     )?;
-                    // Single sync covers both K + V D2H. The BF16 path
-                    // doesn't dequant — host reads `k_host`/`v_host`
-                    // bytes inside `offload_block_on_stream` to build
-                    // per-kv-head stripes. Must sync before that read.
-                    ctx.gpu.synchronize(stream)?;
                 }
                 KvCacheDtype::Fp8
                 | KvCacheDtype::Fp8KTurbo4V
@@ -227,21 +216,13 @@ impl Qwen3AttentionLayer {
                 | KvCacheDtype::Fp8KTurbo2V => {
                     let mut k_raw = vec![0u8; block_floats];
                     let mut v_raw = vec![0u8; block_floats];
-                    ctx.gpu.copy_d2h_async_on_stream(
+                    ctx.gpu.copy_d2h_pair_on_stream(
                         spark_runtime::gpu::DevicePtr(k_block_dev),
                         &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_async_on_stream(
                         spark_runtime::gpu::DevicePtr(v_block_dev),
                         &mut v_raw,
                         stream,
                     )?;
-                    // Single sync covers both K + V D2H. Halves the per-layer
-                    // host-side sync count (was 2 × `copy_d2h_on_stream` →
-                    // 2 syncs). At 62 layers × 2 D2Hs/layer this drops 62
-                    // host syncs/token.
-                    ctx.gpu.synchronize(stream)?;
                     let (k_scale, v_scale) = self.effective_fp8_scales();
                     dequant_fp8_to_bf16(&k_raw, k_scale, &mut k_host);
                     dequant_fp8_to_bf16(&v_raw, v_scale, &mut v_host);
@@ -252,17 +233,13 @@ impl Qwen3AttentionLayer {
                 | KvCacheDtype::Turbo4KTurbo8V => {
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];
-                    ctx.gpu.copy_d2h_async_on_stream(
+                    ctx.gpu.copy_d2h_pair_on_stream(
                         spark_runtime::gpu::DevicePtr(k_block_dev),
                         &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_async_on_stream(
                         spark_runtime::gpu::DevicePtr(v_block_dev),
                         &mut v_raw,
                         stream,
                     )?;
-                    ctx.gpu.synchronize(stream)?;
                     let lut = if layer_dtype == KvCacheDtype::Nvfp4 {
                         &NVFP4_E2M1_LUT
                     } else {
@@ -274,34 +251,26 @@ impl Qwen3AttentionLayer {
                 KvCacheDtype::Turbo3 | KvCacheDtype::Turbo3KTurbo8V | KvCacheDtype::Turbo2 => {
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];
-                    ctx.gpu.copy_d2h_async_on_stream(
+                    ctx.gpu.copy_d2h_pair_on_stream(
                         spark_runtime::gpu::DevicePtr(k_block_dev),
                         &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_async_on_stream(
                         spark_runtime::gpu::DevicePtr(v_block_dev),
                         &mut v_raw,
                         stream,
                     )?;
-                    ctx.gpu.synchronize(stream)?;
                     dequant_turbo3_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
                     dequant_turbo3_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }
                 KvCacheDtype::Turbo8 => {
                     let mut k_raw = vec![0u8; layer_block_bytes];
                     let mut v_raw = vec![0u8; layer_block_bytes];
-                    ctx.gpu.copy_d2h_async_on_stream(
+                    ctx.gpu.copy_d2h_pair_on_stream(
                         spark_runtime::gpu::DevicePtr(k_block_dev),
                         &mut k_raw,
-                        stream,
-                    )?;
-                    ctx.gpu.copy_d2h_async_on_stream(
                         spark_runtime::gpu::DevicePtr(v_block_dev),
                         &mut v_raw,
                         stream,
                     )?;
-                    ctx.gpu.synchronize(stream)?;
                     dequant_turbo8_block_to_bf16(&k_raw, bs_us, nkv_us, hd_us, &mut k_host);
                     dequant_turbo8_block_to_bf16(&v_raw, bs_us, nkv_us, hd_us, &mut v_host);
                 }

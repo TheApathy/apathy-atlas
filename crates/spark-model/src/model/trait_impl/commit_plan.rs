@@ -119,6 +119,11 @@ pub(crate) fn route_max_written_inter_slot(route: GdnVerifyRoute, k: usize) -> O
 /// The graph-safe flat-chain tree_wy injection predicate
 /// (`verify_d.rs`, "CUDA-graph-safe path" block).
 ///
+/// K=4 is deliberately excluded: the exact flat FP32 sequence route supports
+/// that width and must not be disguised as a synthetic tree merely to keep a
+/// graph pointer stable. A real scheduler-stashed DDTree payload still routes
+/// through the tree path because `scheduler_stash_set` is handled separately.
+///
 /// CONTRACT: when this returns true, the verify reroutes the SSM dispatch to
 /// `gated_delta_rule_tree_wy`, which leaves `h_state` stale. The caller MUST
 /// therefore also mark tree mode for the commit (see
@@ -135,7 +140,21 @@ pub(crate) fn flat_tree_wy_injection_applies(
         && use_graphs
         && !scheduler_stash_set
         && parent_ids_capacity > 0
+        && k != 4
         && k == parent_ids_capacity
+}
+
+/// CUDA graph shape discriminator for K-gamma verification.
+///
+/// Each bit corresponds to kernel arguments or an SSM kernel family that can
+/// change the captured graph topology. Flat exact-sequence SSM and genuine
+/// DDTree SSM must never share a graph merely because slot and K are equal.
+pub(crate) const fn verify_graph_shape_key(
+    pack_active: bool,
+    tree_aware_attn_active: bool,
+    ssm_tree_active: bool,
+) -> u32 {
+    pack_active as u32 | ((tree_aware_attn_active as u32) << 1) | ((ssm_tree_active as u32) << 2)
 }
 
 /// The commit-visible "tree mode" flag: TRUE iff the verify that just ran
@@ -351,6 +370,30 @@ mod tests {
         assert!(
             commit_source_is_valid(plan, route, k, k, None),
             "K=10 full-accept commit invalid (plan={plan:?})"
+        );
+    }
+
+    #[test]
+    fn k4_flat_graph_does_not_mask_exact_sequence_as_tree() {
+        assert!(
+            !flat_tree_wy_injection_applies(false, true, false, 4, 4),
+            "flat K4 must remain eligible for exact FP32 sequence recurrence"
+        );
+        assert!(
+            !flat_tree_wy_injection_applies(false, true, true, 4, 4),
+            "a real scheduler tree stash must never be classified as injection"
+        );
+    }
+
+    #[test]
+    fn verify_graph_key_separates_flat_exact_ssm_from_real_tree_ssm() {
+        assert_eq!(verify_graph_shape_key(false, false, false), 0);
+        assert_eq!(verify_graph_shape_key(true, false, false), 1);
+        assert_eq!(verify_graph_shape_key(false, true, false), 2);
+        assert_eq!(verify_graph_shape_key(false, false, true), 4);
+        assert_ne!(
+            verify_graph_shape_key(false, false, false),
+            verify_graph_shape_key(false, false, true)
         );
     }
 

@@ -3,7 +3,7 @@
 //! Patch-embed step: f32 pixels → BF16 → patch_embed GEMM → +pos_embed.
 
 use anyhow::Result;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{GpuBackend, HostToDeviceCopy};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 use super::super::VisionEncoder;
@@ -20,7 +20,7 @@ impl VisionEncoder {
         let n_f32 = p * 1536;
         let f32_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, n_f32 * 4) };
-        gpu.copy_h2d_async(f32_bytes, self.buf_f32, stream)?;
+        gpu.copy_h2d_group_on_stream(&[HostToDeviceCopy::new(f32_bytes, self.buf_f32)], stream)?;
         // f32 → bf16 (result in buf_wide[0..p*1536])
         KernelLaunch::new(gpu, self.k_f32_bf16)
             .grid([div_ceil(n_f32 as u32, 256), 1, 1])

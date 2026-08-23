@@ -184,7 +184,7 @@ impl TransformerModel {
         let scratch_base = self.buffers.scratch().offset(scratch_offset_bytes);
 
         // Host-side pack into pinned buffer at the correct relative offsets.
-        let pinned = stg.ptr;
+        let pinned = stg.buffer.as_mut_ptr();
         unsafe {
             let mut cursor = 0usize;
             // positions
@@ -230,13 +230,13 @@ impl TransformerModel {
             );
             cursor += seq_len_ptrs_aligned;
             assert!(
-                cursor <= stg.bytes,
+                cursor <= stg.buffer.len(),
                 "stage_batched_attn_metadata: pinned overflow {cursor} > {}",
-                stg.bytes
+                stg.buffer.len()
             );
-            let pinned_slice = std::slice::from_raw_parts(pinned, cursor);
+            let pinned_slice = stg.buffer.pinned_slice(cursor)?;
             self.gpu
-                .copy_h2d_async(pinned_slice, scratch_base, stream)?;
+                .copy_h2d_pinned_async(pinned_slice, scratch_base, stream)?;
         }
 
         Ok(BatchedAttnMetadata {

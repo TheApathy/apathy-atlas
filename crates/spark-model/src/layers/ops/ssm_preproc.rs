@@ -283,6 +283,44 @@ pub fn dense_gemv_ba_gates(
         .launch(stream)
 }
 
+/// Exact multi-row fused BA projection + GDN gates.
+///
+/// Each grid.y block executes the ordinary K=1 reduction and transforms for
+/// one row, so no rounded BF16 BA intermediate separates projection from gate
+/// generation.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_gemv_ba_gates_batchn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    ba_weight: &DenseWeight,
+    a_log: DevicePtr,
+    dt_bias: DevicePtr,
+    gate_out: DevicePtr,
+    beta_out: DevicePtr,
+    rows: u32,
+    n: u32,
+    k: u32,
+    vheads_per_group: u32,
+    gate_beta_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 4), rows, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(ba_weight.weight)
+        .arg_ptr(a_log)
+        .arg_ptr(dt_bias)
+        .arg_ptr(gate_out)
+        .arg_ptr(beta_out)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(vheads_per_group)
+        .arg_u32(gate_beta_stride)
+        .launch(stream)
+}
+
 /// Fused BA GEMM + GDN gates for prefill (token-parallel).
 ///
 /// Replaces `dense_gemm(normed, ba_weight) + compute_gdn_gates` in the prefill path.

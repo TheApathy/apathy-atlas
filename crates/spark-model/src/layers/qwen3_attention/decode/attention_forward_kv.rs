@@ -281,9 +281,11 @@ impl Qwen3AttentionLayer {
             }
             _ => {
                 if let Some(nvfp4) = self.k_weight.as_ref().and_then(|w| w.as_nvfp4()) {
-                    ops::w4a16_gemv(
+                    ops::w4a16_decode_gemv(
                         ctx.gpu,
                         self.w4a16_gemv_k,
+                        self.w4a16_gemv_sw_k,
+                        self.gemv_sw,
                         normed,
                         nvfp4,
                         k_out,
@@ -304,9 +306,11 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
                 if let Some(nvfp4) = self.v_weight.as_ref().and_then(|w| w.as_nvfp4()) {
-                    ops::w4a16_gemv(
+                    ops::w4a16_decode_gemv(
                         ctx.gpu,
                         self.w4a16_gemv_k,
+                        self.w4a16_gemv_sw_k,
+                        self.gemv_sw,
                         normed,
                         nvfp4,
                         v_out,

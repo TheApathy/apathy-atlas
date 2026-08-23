@@ -23,6 +23,7 @@ use crate::layers::ops;
 mod attn;
 mod ctx;
 mod ffn;
+mod post_norm;
 mod qkv;
 mod qkv_batched;
 
@@ -42,7 +43,16 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         // Full path (phases 1-7): QKV computed inline, default qkv_output base.
         self.decode_multi_seq_inner_impl(
-            hidden, residual, num_seqs, states, kv_cache, seq_lens, block_tables, ctx, stream, None,
+            hidden,
+            residual,
+            num_seqs,
+            states,
+            kv_cache,
+            seq_lens,
+            block_tables,
+            ctx,
+            stream,
+            None,
         )
     }
 
@@ -118,24 +128,81 @@ impl Qwen3AttentionLayer {
             max_seq_len_host,
             qkv_base_override,
         );
+        let serial = crate::model::env_diag::DflashSerialControls::current();
+        let serial_norms = c.n > 1 && serial.layer_norms;
+
+        // Validate every requested attention control before this layer launches
+        // work. Engagement is counted only inside the selected implementation.
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnPaged,
+            c.n > 1 && ctx.tree_aware_attn.is_none(),
+            "requires the flat-chain multi-sequence paged-attention path",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnOut,
+            c.n > 1
+                && self
+                    .o_weight
+                    .as_ref()
+                    .and_then(|weight| weight.as_fp8())
+                    .is_none()
+                && !self.attn.o_proj.is_null(),
+            "requires the ordinary K1 NVFP4 attention output-projection weight",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnFfn,
+            c.n > 1 && !self.ffn.is_none() && ctx.ffn_defer.is_none(),
+            "requires a local FFN and no deferred cross-sequence FFN",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnPreNorm,
+            c.n > 1 && qkv_base_override.is_none(),
+            "requires inline attention input normalization",
+        )?;
+        crate::model::control_engagement::require(
+            crate::model::control_engagement::ControlPath::AttnPostNorm,
+            c.n > 1 && !self.ffn.is_none(),
+            "requires the attention post-normalization/FFN phase",
+        )?;
 
         // Phases 1-2 (RMS-norm + QKV) are skipped when QKV is precomputed
         // across sequences (the #39 v2 batched-QKV path).
         if qkv_base_override.is_none() {
             // ── Phase 1: RMS norm + residual for N tokens ──
             crate::kprof!(ctx.gpu, stream, "attn_rms_norm_residual", {
-                ops::rms_norm_residual(
-                    ctx.gpu,
-                    self.rms_norm_residual_k,
-                    c.hidden,
-                    &self.input_norm,
-                    c.normed,
-                    c.residual,
-                    c.n as u32,
-                    c.h as u32,
-                    c.eps,
-                    c.stream,
-                )?;
+                if serial_norms {
+                    let residual_elem = if ctx.config.use_fp32_residual() { 4 } else { 2 };
+                    for row in 0..c.n {
+                        ops::rms_norm_residual(
+                            ctx.gpu,
+                            self.rms_norm_residual_k,
+                            c.hidden.offset(row * c.h * residual_elem),
+                            &self.input_norm,
+                            c.normed.offset(row * c.h * c.bf16),
+                            c.residual.offset(row * c.h * residual_elem),
+                            1,
+                            c.h as u32,
+                            c.eps,
+                            c.stream,
+                        )?;
+                    }
+                    crate::model::control_engagement::engage(
+                        crate::model::control_engagement::ControlPath::AttnPreNorm,
+                    )?;
+                } else {
+                    ops::rms_norm_residual(
+                        ctx.gpu,
+                        self.rms_norm_residual_k,
+                        c.hidden,
+                        &self.input_norm,
+                        c.normed,
+                        c.residual,
+                        c.n as u32,
+                        c.h as u32,
+                        c.eps,
+                        c.stream,
+                    )?;
+                }
                 anyhow::Result::<()>::Ok(())
             })?;
 

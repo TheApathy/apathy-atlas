@@ -124,9 +124,11 @@ impl Qwen3SsmLayer {
                         stream,
                     )
                 } else if let Some(ref nvfp4) = self.qkvz_nvfp4 {
-                    ops::w4a16_gemv(
+                    ops::w4a16_decode_gemv(
                         ctx.gpu,
                         self.w4a16_gemv_k,
+                        self.w4a16_gemv_sw_k,
+                        self.gemv_sw,
                         normed,
                         nvfp4,
                         deinterleaved,
@@ -406,9 +408,11 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else {
-            ops::w4a16_gemv(
+            ops::w4a16_decode_gemv(
                 ctx.gpu,
                 self.w4a16_gemv_k,
+                self.w4a16_gemv_sw_k,
+                self.gemv_sw,
                 normed_out,
                 &self.ssm.out_proj,
                 out,

@@ -49,7 +49,7 @@ impl TransformerModel {
             return result;
         }
 
-        let proposer = match &self.proposer {
+        let proposer = match self.active_proposer() {
             Some(p) => p.clone(),
             None => {
                 // Fallback to regular generation
@@ -75,7 +75,7 @@ impl TransformerModel {
     }
 
     pub(super) fn has_proposer_dispatch(&self) -> bool {
-        self.proposer.is_some() || self.self_speculative
+        self.any_proposer() || self.self_speculative
     }
 
     pub(super) fn has_self_speculative_dispatch(&self) -> bool {
@@ -151,7 +151,7 @@ impl TransformerModel {
     }
 
     pub(super) fn read_deferred_draft_token_dispatch(&self) -> Result<u32> {
-        let proposer = match &self.proposer {
+        let proposer = match self.active_proposer() {
             Some(p) => p.as_ref(),
             None => return Ok(0),
         };
@@ -165,7 +165,7 @@ impl TransformerModel {
         &self,
         seq: &mut SequenceState,
     ) -> Result<Option<Vec<u32>>> {
-        let Some(proposer) = self.proposer.as_ref() else {
+        let Some(proposer) = self.active_proposer() else {
             return Ok(None);
         };
         let Some(ref mut state) = seq.proposer_state else {
@@ -180,7 +180,7 @@ impl TransformerModel {
         num_accepted: usize,
         _stream: u64,
     ) -> Result<()> {
-        let proposer = match &self.proposer {
+        let proposer = match self.active_proposer() {
             Some(p) => p.as_ref(),
             None => return Ok(()),
         };

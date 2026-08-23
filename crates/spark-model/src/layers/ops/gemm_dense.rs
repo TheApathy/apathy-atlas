@@ -211,6 +211,36 @@ pub fn w4a16_gemm(
         .launch(stream)
 }
 
+/// W4A16 GEMM via the cp.async double-buffered byte-exact shadow kernel
+/// (`w4a16_gemm_pipe`). Same signature/grid as `w4a16_gemm`; only the kernel
+/// symbol differs. Used by the prefill FFN fallback when
+/// `ATLAS_PREFILL_FFN_PIPE=1` and the pipe kernel is loaded.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W4A16 GEMM with M_TILE=16: small-M specialization for K=γ verify
 /// (MTP K=3 → M=3, DFlash γ=16 → M=16-17).
 ///
@@ -312,7 +342,21 @@ pub fn w4a16_gemm_n64_m32_ldb(
 /// count (80→320 at k_splits=4) and restores occupancy. Partial
 /// products accumulate into an FP32 `workspace` of
 /// `k_splits * M * N * 4` bytes, then `reduce_splitk_f32_to_bf16` sums
-/// the slices and writes BF16 — lossless (FP32 partials).
+/// the slices and writes BF16.
+///
+/// NOT BIT-IDENTICAL to the single-slice kernel. The partials are FP32, so
+/// nothing is rounded to BF16 mid-accumulation — that is what "lossless"
+/// meant here and it is the only thing it meant. It is NOT the same claim as
+/// token-exactness: the single-slice kernel accumulates the whole K-loop
+/// left-to-right into one FP32 register, while split-K restarts the
+/// accumulator at each slice boundary and the reduce sums the slices
+/// afterwards. `((a+b)+c)+d` and `(a+b)+(c+d)` differ in FP32, so the BF16
+/// output can differ by an ULP and the committed token can change. This is a
+/// deliberate re-reference, covered by the REFREEZE note in
+/// `benchmark/arms/atlas-fork.sh` (2026-08-17), which lists "split-K FP32
+/// partials ≠ the serial FMA oracle" among the reasons the reference
+/// completion sha256 was re-established as 12e0c0ad. Any new use of this
+/// kernel on a committed-token path needs the same treatment.
 ///
 /// `ldb` is the B-row stride (== n for tightly-packed T-weights).
 /// Partial grid: (ceil(N/64), ceil(M/32), k_splits)  Block (128,1,1)

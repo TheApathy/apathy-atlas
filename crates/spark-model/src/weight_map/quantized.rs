@@ -39,6 +39,68 @@ impl QuantizedWeight {
         self.weight == DevicePtr::NULL
     }
 
+    /// [`Self::transpose_for_gemm`] with the post-transform buffers served
+    /// from (or recorded into) the on-disk weight cache.
+    ///
+    /// The transpose is a D2H, a scalar byte-wise host loop, and an H2D —
+    /// the single biggest per-layer cost of a cold start. `slot` must be a
+    /// stable, unique name for this tensor across restarts (e.g.
+    /// `"L12.self_attn.q_proj.t"`).
+    ///
+    /// With `ATLAS_WEIGHT_CACHE` unset this is exactly `transpose_for_gemm`.
+    /// `weight_scale_2` and `input_scale` are carried over from `self` rather
+    /// than cached — the transpose copies them unchanged.
+    pub fn transpose_for_gemm_cached(
+        &self,
+        gpu: &dyn GpuBackend,
+        n: usize,
+        k: usize,
+        slot: &str,
+    ) -> Result<QuantizedWeight> {
+        use crate::weight_loader::transform_cache;
+
+        let Some(cache) = transform_cache::get() else {
+            return self.transpose_for_gemm(gpu, n, k);
+        };
+        let (w_len, s_len) = transform_cache::transposed_lens(n, k);
+
+        if let Some(ptrs) = cache.load_parts(slot, gpu, &[w_len, s_len]) {
+            let hit = QuantizedWeight {
+                weight: ptrs[0],
+                weight_scale: ptrs[1],
+                weight_scale_2: self.weight_scale_2,
+                input_scale: self.input_scale,
+            };
+            if !cache.verify_enabled() {
+                return Ok(hit);
+            }
+            let fresh = self.transpose_for_gemm(gpu, n, k)?;
+            let ok = cache.verify_pair(
+                slot,
+                gpu,
+                &[(hit.weight, w_len), (hit.weight_scale, s_len)],
+                &[(fresh.weight, w_len), (fresh.weight_scale, s_len)],
+            );
+            if ok {
+                gpu.free(fresh.weight)?;
+                gpu.free(fresh.weight_scale)?;
+                return Ok(hit);
+            }
+            // Serve the recomputed buffers — never the ones that failed.
+            gpu.free(hit.weight)?;
+            gpu.free(hit.weight_scale)?;
+            return Ok(fresh);
+        }
+
+        let fresh = self.transpose_for_gemm(gpu, n, k)?;
+        cache.store_parts(
+            slot,
+            gpu,
+            &[(fresh.weight, w_len), (fresh.weight_scale, s_len)],
+        );
+        Ok(fresh)
+    }
+
     /// Transpose weight layout from [N, K/2] to [K/2, N] for coalesced GEMM reads.
     ///
     /// Also transposes scale from [N, K/GROUP_SIZE] to [K/GROUP_SIZE, N].

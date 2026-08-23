@@ -1,0 +1,37 @@
+[package]
+name = "rest-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atlas: REST-style retrieval draft store — suffix array over a tokenized code corpus."
+repository.workspace = true
+
+[[bin]]
+name = "rest-store-build"
+path = "src/bin/rest_store_build.rs"
+
+[[bin]]
+name = "rest-store-symbols"
+path = "src/bin/rest_store_symbols.rs"
+
+[[bin]]
+name = "rest-store-eval"
+path = "src/bin/rest_store_eval.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+memmap2 = "0.9"
+rayon = "1.12"
+tracing = "0.1"
+walkdir = "2.5"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# Bins only, but Cargo has no per-target dep table for normal deps.
+clap = { version = "4", features = ["derive"] }
+serde_json = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 
-use super::{BlockDiffusionDraftHead, DflashProposerState};
+use super::{BlockDiffusionDraftHead, DflashProposerState, DraftRowLayout};
 use crate::layer::ForwardContext;
 
 /// Pass-invariant inputs to [`BlockDiffusionDraftHead::run_noise_pass`].
@@ -74,6 +74,10 @@ impl BlockDiffusionDraftHead {
         let bf16 = 2usize;
         let inv_sqrt_d = 1.0f32 / (self.head_dim as f32).sqrt();
         let gpu = ctx.gpu;
+        let row_layout = DraftRowLayout::for_family(self.checkpoint_family, gamma_eff);
+        let noise_rows = row_layout.query_rows;
+        let output_rows = gamma_eff;
+        debug_assert_eq!(eff_ctx + noise_rows, n_attn as usize);
 
         let dump_bf16 = |label: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
             if !debug_dump {
@@ -145,7 +149,7 @@ impl BlockDiffusionDraftHead {
             let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
                 .chain(std::iter::once(last_token as i32))
                 .chain(
-                    (0..gamma_eff)
+                    (0..row_layout.feedback_rows())
                         .map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)),
                 )
                 .collect();
@@ -157,8 +161,10 @@ impl BlockDiffusionDraftHead {
                     &token_ids_host[..token_ids_host.len().min(8)],
                 );
             }
-            let tid_bytes: Vec<u8> =
-                token_ids_host.iter().flat_map(|t| t.to_le_bytes()).collect();
+            let tid_bytes: Vec<u8> = token_ids_host
+                .iter()
+                .flat_map(|t| t.to_le_bytes())
+                .collect();
             gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
         }
         ops::batched_embed(
@@ -194,8 +200,8 @@ impl BlockDiffusionDraftHead {
             .as_deref()
             == Some("1");
         if force_noise_pattern {
-            let mut bytes = Vec::with_capacity(self.gamma * self.hidden_size * 2);
-            for t in 0..self.gamma {
+            let mut bytes = Vec::with_capacity(noise_rows * self.hidden_size * bf16);
+            for t in 0..noise_rows {
                 for j in 0..self.hidden_size {
                     let v =
                         0.001_f32 * ((t + 1) as f32) * ((j + 1) as f32) / (self.hidden_size as f32);
@@ -237,11 +243,11 @@ impl BlockDiffusionDraftHead {
             self.forward_block_layer(layer, &args, ctx, debug_dump, dstate, kprofile)?;
         }
 
-        // ── Step 4: final RMSNorm + LM head on MASK rows only ──
-        // Skip ctx slots [0..eff_ctx] (garbage) AND the bonus row at
-        // slot eff_ctx (untrained for prediction output). Read γ MASK
-        // rows starting at offset `(eff_ctx + 1) * h * bf16`.
-        let noise_byte_offset = (eff_ctx + 1) * self.hidden_size * bf16;
+        // ── Step 4: family-specific final RMSNorm + LM head rows ──
+        // Generic DFlash skips the anchor and reads γ MASK rows. DSpark
+        // starts at the anchor and reads all γ query rows; dropping that
+        // row shifts every proposal one position into the future.
+        let noise_byte_offset = (eff_ctx + row_layout.output_start) * self.hidden_size * bf16;
         let stream_noise = self.scratch.stream_buf.offset(noise_byte_offset);
         let norm_noise = self.scratch.norm_buf.offset(noise_byte_offset);
         ops::rms_norm(
@@ -283,31 +289,42 @@ impl BlockDiffusionDraftHead {
             == Some("1")
             && self.lm_head_shared_t.is_some()
             && self.kernels.w4a16_gemm_t_m32_n64.0 != 0;
-        if let Some(fp8) = self.lm_head_shared_fp8 {
-            ops::fp8_gemm_n128(
-                gpu,
-                self.kernels.fp8_gemm_t,
-                norm_noise,
-                fp8,
-                self.scratch.logits,
-                gamma_eff as u32,
-                lm_vocab,
-                h,
-                stream,
-            )?;
-        } else if lm_head_t_fast {
-            ops::w4a16_gemm_n64_m32_ldb(
-                gpu,
-                self.kernels.w4a16_gemm_t_m32_n64,
-                norm_noise,
-                self.lm_head_shared_t.as_ref().unwrap(),
-                self.scratch.logits,
-                gamma_eff as u32,
-                lm_vocab,
-                h,
-                self.lm_head_shared_t_ldb,
-                stream,
-            )?;
+        // The NVFP4-T fast path must be checked FIRST: when `lm_head_shared_fp8`
+        // is present (the default, ATLAS_DFLASH_LM_HEAD_FP8=1) the fp8 branch
+        // previously shadowed it as an else-if — the NVFP4-T lm_head was built
+        // (~0.26 GB vs the FP8 slice's ~1.24 GB) but never used, so
+        // ATLAS_DFLASH_LM_HEAD_NVFP4=1 silently measured the fp8 path.
+        if lm_head_t_fast {
+            crate::kprof!(gpu, stream, "draft_lm_head_nvfp4_t", {
+                ops::w4a16_gemm_n64_m32_ldb(
+                    gpu,
+                    self.kernels.w4a16_gemm_t_m32_n64,
+                    norm_noise,
+                    self.lm_head_shared_t.as_ref().unwrap(),
+                    self.scratch.logits,
+                    gamma_eff as u32,
+                    lm_vocab,
+                    h,
+                    self.lm_head_shared_t_ldb,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+        } else if let Some(fp8) = self.lm_head_shared_fp8 {
+            crate::kprof!(gpu, stream, "draft_lm_head_fp8", {
+                ops::fp8_gemm_n128(
+                    gpu,
+                    self.kernels.fp8_gemm_t,
+                    norm_noise,
+                    fp8,
+                    self.scratch.logits,
+                    gamma_eff as u32,
+                    lm_vocab,
+                    h,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
         } else {
             ops::dense_gemm(
                 gpu,
@@ -339,7 +356,7 @@ impl BlockDiffusionDraftHead {
             .as_deref()
             == Some("1");
         if dump_all_layers {
-            let norm_bytes = self.gamma * self.hidden_size * bf16;
+            let norm_bytes = output_rows * self.hidden_size * bf16;
             let mut buf = vec![0u8; norm_bytes];
             gpu.synchronize(stream)?;
             gpu.copy_d2h(norm_noise, &mut buf)?;
@@ -350,26 +367,93 @@ impl BlockDiffusionDraftHead {
             }
         }
 
-        // ── Step 5: argmax per row → γ_eff token ids ──
+        // ── Step 5: per-row argmax (generic) OR DFlash 2 candidate-selector
+        // greedy walk (selector present) → γ_eff token ids ──
         let argmax_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
         let lm_stride = self.target_vocab_size.min(self.vocab_size);
-        for i in 0..gamma_eff {
-            let logits_row = self.scratch.logits.offset(i * lm_stride * bf16);
-            let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
-            ops::argmax_bf16(
+        if let Some(sel) = &self.selector {
+            // CandidateSelector.select at T=0 (reference: z-lab/dflash
+            // dflash/model.py): top-k per position, then a sequential greedy
+            // walk scoring each candidate against the predecessor via the
+            // low-rank codebooks — replaces the per-row argmax. The walk is
+            // drafter-only; the target verify still commits its own greedy
+            // token, so this only changes which tokens are *proposed*.
+            let layout = super::forward_block::checked_topk_layout(
+                gamma_eff, self.gamma, lm_stride, sel.top_k,
+            )?;
+            // top-k over the logits rows. sel.top_k == 16 == DDTREE_TOP_K_MAX,
+            // so the [γ, DDTREE_TOP_K_MAX] scratch row strides match the
+            // topk kernel's contiguous [rows, k] layout exactly.
+            ops::topk_bf16(
                 gpu,
-                self.kernels.argmax,
-                logits_row,
-                token_slot,
-                argmax_vocab,
+                self.kernels.topk,
+                self.scratch.logits,
+                self.scratch.topk_tokens_dev,
+                self.scratch.topk_logits_dev,
+                layout.num_rows,
+                layout.vocab,
+                layout.k as u32,
                 stream,
             )?;
+            // hidden = hidden_projection(final_norm(noise)) → [γ, rank].
+            // Reference: `select` applies `hidden_projection` to the
+            // (already final-normed) draft hidden — `norm_noise` here.
+            ops::dense_gemm(
+                gpu,
+                self.kernels.dense_gemm,
+                norm_noise,
+                &sel.hidden_projection,
+                self.scratch.selector_hidden,
+                gamma_eff as u32,
+                sel.rank as u32,
+                h,
+                stream,
+            )?;
+            // Greedy walk seeded at the last verified token (`last_token`, the
+            // bonus/root row's token id): draft_tokens_dev[i] = chosen
+            // candidate at position i.
+            {
+                static SEL_SEEN: std::sync::Once = std::sync::Once::new();
+                SEL_SEEN.call_once(|| {
+                    tracing::info!("DFLASH2_EXEC: selector_walk RAN");
+                });
+            }
+            ops::dflash2_selector_walk(
+                gpu,
+                self.kernels.dflash2_selector_walk,
+                self.scratch.topk_logits_dev,
+                self.scratch.topk_tokens_dev,
+                self.scratch.selector_hidden,
+                sel.predecessor_codebook.weight,
+                sel.successor_codebook.weight,
+                self.scratch.draft_tokens_dev,
+                last_token,
+                gamma_eff as i32,
+                sel.rank as i32,
+                stream,
+            )?;
+        } else {
+            for i in 0..gamma_eff {
+                let logits_row = self.scratch.logits.offset(i * lm_stride * bf16);
+                let token_slot = self.scratch.draft_tokens_dev.offset(i * 4);
+                ops::argmax_bf16(
+                    gpu,
+                    self.kernels.argmax,
+                    logits_row,
+                    token_slot,
+                    argmax_vocab,
+                    stream,
+                )?;
+            }
         }
         if debug_dump {
             dump_bf16("final.logits[noise0]", self.scratch.logits, 10)?;
         }
         if dump_all_layers {
-            let logits_bytes = self.gamma * self.vocab_size * bf16;
+            // The lm-head output is compact with `lm_stride`, which can be
+            // smaller than the drafter checkpoint vocabulary after target
+            // vocab capping. Copy only rows and columns written this pass.
+            let logits_bytes = output_rows * lm_stride * bf16;
             let mut buf = vec![0u8; logits_bytes];
             gpu.synchronize(stream)?;
             gpu.copy_d2h(self.scratch.logits, &mut buf)?;
@@ -381,5 +465,35 @@ impl BlockDiffusionDraftHead {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod debug_row_count_tests {
+    use super::DraftRowLayout;
+    use crate::weight_loader::DrafterCheckpointFamily;
+
+    #[test]
+    fn generic_dflash_keeps_anchor_plus_gamma_masks_and_drops_anchor_output() {
+        let layout = DraftRowLayout::for_family(DrafterCheckpointFamily::Dflash, 15);
+        assert_eq!(layout.query_rows, 16);
+        assert_eq!(layout.output_start, 1);
+        assert_eq!(layout.feedback_rows(), 15);
+    }
+
+    #[test]
+    fn dspark_uses_gamma_total_rows_and_includes_anchor_output() {
+        let layout = DraftRowLayout::for_family(DrafterCheckpointFamily::Dspark, 7);
+        assert_eq!(layout.query_rows, 7);
+        assert_eq!(layout.output_start, 0);
+        assert_eq!(layout.feedback_rows(), 6);
+    }
+
+    #[test]
+    fn dspark_k14_is_one_anchor_plus_thirteen_masks_not_two_blocks() {
+        let layout = DraftRowLayout::for_family(DrafterCheckpointFamily::Dspark, 14);
+        assert_eq!(layout.query_rows, 14);
+        assert_eq!(layout.output_start, 0);
+        assert_eq!(layout.feedback_rows(), 13);
     }
 }

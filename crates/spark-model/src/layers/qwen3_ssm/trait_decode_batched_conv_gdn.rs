@@ -9,7 +9,7 @@
 //! their intermediates, `conv_out_buf`, and `gdn_out_buf`.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 
 use super::{Qwen3SsmLayer, SsmLayerState};
 use crate::layer::ForwardContext;
@@ -520,9 +520,10 @@ impl Qwen3SsmLayer {
                 )?;
                 dump_wy17("output", gdn_out_buf, out_total)?;
                 // Restore h_state from backup so tree_wy gets identical input.
-                ctx.gpu
-                    .copy_h2d_async(&h_backup, ssm_state.h_state, stream)?;
-                ctx.gpu.synchronize(stream)?;
+                ctx.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(&h_backup, ssm_state.h_state)],
+                    stream,
+                )?;
                 tracing::info!("M8A A/B: wy17 dumped to /tmp/wy17_dump_*.bin, h_state restored");
             }
 
@@ -611,7 +612,10 @@ impl Qwen3SsmLayer {
                 );
                 DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        } else if num_tokens == 17 && self.gdn_wy17_k.0 != 0 {
+        } else if num_tokens == 17
+            && self.gdn_wy17_k.0 != 0
+            && std::env::var("ATLAS_DISABLE_WY17").ok().as_deref() != Some("1")
+        {
             // ── K=17 (DFlash γ+1): fused WY-Chunkwise path ──
             for t in 0..(num_tokens as u32) {
                 let qkv_t = deinterleaved.offset(t as usize * qkvz_size * bf16);
@@ -885,7 +889,10 @@ impl Qwen3SsmLayer {
                 WY17_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         } else {
-            // ── K∈{5..16}: chunked path using fused wy4/wy3/wy2 kernels ──
+            // ── K>=5: chunked path using fused wy4/wy3/wy2 kernels ──
+            // K=17 also lands here under the ATLAS_DISABLE_WY17 correctness
+            // escape hatch, allowing its persisted intermediates to be
+            // compared against the dedicated WY17 kernel.
             //
             // The legacy per-token sequential path (`ops::gdn_decode` in a
             // loop) has a confirmed numerical bug that produces NaN at the
@@ -965,10 +972,21 @@ impl Qwen3SsmLayer {
                 let beta_ptr = gate_ptr.offset(nv * fp32);
                 let gdn_out_t = gdn_out_buf.offset(t_done * args.value_dim * bf16);
 
+                // ATLAS_SSM_H_FP16: one decision point for the chunk width.
+                // Under the flag the pool holds FP16, so the FP32 kernel would
+                // read half-width data as floats — refuse rather than fall back.
+                let wy_chunk_k = self.wy_chunk_kernel(chunk);
+                self.require_wy_f16(chunk, wy_chunk_k)?;
+                // Tripwire for a missed conversion hook. Reading an FP32 pool
+                // with an FP16 kernel does not crash — it produces fluent
+                // garbage — so assert the invariant instead of trusting it.
+                if super::ssm_h_fp16_enabled() {
+                    super::ssm_h_fp16::require_h_f16(ssm_state)?;
+                }
                 match chunk {
                     4 => ops::gdn_decode_wy4(
                         ctx.gpu,
-                        self.gdn_wy4_k,
+                        wy_chunk_k,
                         ssm_state.h_state,
                         q_ptr,
                         k_ptr,
@@ -991,7 +1009,7 @@ impl Qwen3SsmLayer {
                     )?,
                     3 => ops::gdn_decode_wy3(
                         ctx.gpu,
-                        self.gdn_wy3_k,
+                        wy_chunk_k,
                         ssm_state.h_state,
                         q_ptr,
                         k_ptr,
@@ -1013,7 +1031,7 @@ impl Qwen3SsmLayer {
                     )?,
                     2 => ops::gdn_decode_wy2(
                         ctx.gpu,
-                        self.gdn_wy2_k,
+                        wy_chunk_k,
                         ssm_state.h_state,
                         q_ptr,
                         k_ptr,
@@ -1064,6 +1082,46 @@ impl Qwen3SsmLayer {
             }
         }
 
+        Ok(())
+    }
+}
+
+impl super::Qwen3SsmLayer {
+    /// Select the chunked-path WY kernel for a chunk of `n` tokens.
+    ///
+    /// Under ATLAS_SSM_H_FP16 the h-state in the pool is FP16, so the FP16 twin
+    /// is the ONLY correct kernel — the FP32 one would read half-width data as
+    /// floats and emit fluent garbage rather than fail. A zero handle is
+    /// returned as zero on purpose; `require_wy_f16` turns that into a hard
+    /// error at the call site instead of a silent fallback.
+    pub(super) fn wy_chunk_kernel(&self, n: usize) -> spark_runtime::gpu::KernelHandle {
+        if super::ssm_h_fp16_enabled() {
+            return match n {
+                4 => self.gdn_wy4_f16_k,
+                3 => self.gdn_wy3_f16_k,
+                _ => self.gdn_wy2_f16_k,
+            };
+        }
+        match n {
+            4 => self.gdn_wy4_k,
+            3 => self.gdn_wy3_k,
+            _ => self.gdn_wy2_k,
+        }
+    }
+
+    /// Refuse to run an FP32 WY kernel over an FP16 pool.
+    pub(super) fn require_wy_f16(
+        &self,
+        n: usize,
+        wy_k: spark_runtime::gpu::KernelHandle,
+    ) -> anyhow::Result<()> {
+        if super::ssm_h_fp16_enabled() && wy_k.0 == 0 {
+            anyhow::bail!(
+                "ATLAS_SSM_H_FP16: no FP16 h-state twin resolved for the chunk width {n}. \
+                 Falling back to the FP32 kernel would read the FP16 pool as floats and \
+                 emit fluent garbage, so this refuses instead. Unset ATLAS_SSM_H_FP16."
+            );
+        }
         Ok(())
     }
 }

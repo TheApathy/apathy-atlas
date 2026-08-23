@@ -53,20 +53,13 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         dense(store, &format!("{prefix}.norm.weight"))
     }
 
-    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight> {
-        // lm_head location varies by quantizer:
-        //   Sehyo: "lm_head.weight"
-        //   Kbenkhaled: "language_model.lm_head.weight"
-        for pattern in &[
-            "lm_head.weight",
-            "language_model.lm_head.weight",
-            "model.lm_head.weight",
-        ] {
-            if store.contains(pattern) {
-                return dense(store, pattern);
-            }
-        }
-        self.load_embedding(store, config)
+    fn load_lm_head(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight> {
+        super::qwen35_mixed_precision::load_lm_head(store, config, gpu)
     }
 
     fn load_mtp_weights(

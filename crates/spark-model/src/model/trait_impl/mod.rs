@@ -8,7 +8,7 @@
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::types::{PinnedMetaStaging, TransformerModel};
@@ -25,12 +25,15 @@ mod decode_a2_piecewise;
 mod decode_b;
 mod decode_b2;
 mod ep_misc;
+mod k1_stage_capture;
 mod meta;
 mod prefill_a;
 mod prefill_b;
 mod prefill_c;
 mod prefill_d;
+mod prefix_hit;
 mod sequence;
+mod sequence_graph_cleanup;
 mod speculative;
 mod verify_a;
 mod verify_b;
@@ -39,6 +42,7 @@ mod verify_c2;
 mod verify_csk;
 mod verify_d;
 mod verify_dflash_batched;
+mod verify_dflash_output;
 
 impl Model for TransformerModel {
     fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
@@ -101,45 +105,15 @@ impl Model for TransformerModel {
         )
     }
 
-    /// Q12 Phase 4b override: try the model-level batched dispatch
-    /// (`prefill_batch_chunk_dispatch`) first; on the not-yet-implemented
-    /// stub failure, fall back to the trait's default per-stream loop.
-    /// This keeps callers correct while the per-layer-batched body is
-    /// staged in subsequent commits.
+    /// Model-level batched prefill. The concrete dispatch owns every safe
+    /// pre-effect sequential fallback; once it begins batched work, errors
+    /// must propagate so a partially-mutated frame is never replayed.
     fn prefill_batch_chunk(
         &self,
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
     ) -> Result<Vec<DevicePtr>> {
-        // Try the concrete dispatch. The Phase 4b stub returns Err for the
-        // "not-yet-implemented" path so we transparently downgrade to the
-        // single-stream-loop default impl. Once Phase 2b/3 land, the
-        // dispatch returns Ok with logits and this fallback becomes dead
-        // code that we can drop.
-        match self.prefill_batch_chunk_dispatch(streams, stream) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // Log at debug — under expected for this stub. Promotes to
-                // info if a real error is encountered (future Phase 4b body).
-                tracing::debug!(
-                    "prefill_batch_chunk_dispatch unavailable, falling back to \
-                     per-stream loop: {e}"
-                );
-                let mut out = Vec::with_capacity(streams.len());
-                for slice in streams.iter_mut() {
-                    let logits = self.prefill_chunk(
-                        slice.prompt_tokens,
-                        slice.seq,
-                        slice.chunk_start,
-                        slice.chunk_len,
-                        slice.is_last_chunk,
-                        stream,
-                    )?;
-                    out.push(logits);
-                }
-                Ok(out)
-            }
-        }
+        self.prefill_batch_chunk_dispatch(streams, stream)
     }
     fn vocab_size(&self) -> usize {
         self.vocab_size_dispatch()
@@ -216,7 +190,21 @@ impl Model for TransformerModel {
         self.has_proposer_dispatch()
     }
     fn proposer_is_dflash(&self) -> bool {
-        self.proposer.as_ref().is_some_and(|p| p.is_dflash())
+        self.active_proposer().is_some_and(|p| p.is_dflash())
+    }
+    fn dflash_verify_capacity_k(&self) -> Option<usize> {
+        self.active_proposer()
+            .filter(|proposer| proposer.is_dflash())
+            .map(|_| self.ddtree_parent_ids_capacity)
+    }
+    fn proposer_arm_count(&self) -> usize {
+        TransformerModel::proposer_arm_count(self)
+    }
+    fn proposer_arm(&self) -> u8 {
+        TransformerModel::proposer_arm(self)
+    }
+    fn set_proposer_arm(&self, arm: u8) -> u8 {
+        TransformerModel::set_proposer_arm(self, arm)
     }
     fn has_self_speculative(&self) -> bool {
         self.has_self_speculative_dispatch()
@@ -295,6 +283,21 @@ impl Model for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream)
     }
+    fn k1_stage_diag_requested(&self, pre_verify_len: usize, tokens: &[u32]) -> Result<bool> {
+        crate::model::k1_stage_diag::requested_at(pre_verify_len, tokens)
+    }
+    fn k1_stage_diag_begin(&self, pre_verify_len: usize, tokens: &[u32]) -> Result<()> {
+        crate::model::k1_stage_diag::begin_serial(pre_verify_len, tokens)
+    }
+    fn k1_stage_diag_finish_serial_row(&self) -> Result<()> {
+        crate::model::k1_stage_diag::finish_serial_row()
+    }
+    fn k1_stage_diag_finish_serial(&self) -> Result<()> {
+        crate::model::k1_stage_diag::finish_serial()
+    }
+    fn k1_stage_diag_abort(&self) {
+        crate::model::k1_stage_diag::abort();
+    }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }
@@ -343,7 +346,7 @@ impl Model for TransformerModel {
         &self,
         seq: &mut SequenceState,
     ) -> Option<crate::layers::DDTreePayload> {
-        let proposer = self.proposer.as_ref()?;
+        let proposer = self.active_proposer()?;
         let state = seq.proposer_state.as_mut()?;
         proposer.take_pending_tree_payload(state.as_mut())
     }
@@ -423,8 +426,13 @@ impl Model for TransformerModel {
             .collect();
         // Write into the persistent buffer (NOT a fresh alloc). The device
         // pointer never changes — CUDA graph replays see the new payload.
-        self.gpu
-            .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)?;
+        self.gpu.copy_h2d_group_on_stream(
+            &[HostToDeviceCopy::new(
+                &bytes,
+                self.ddtree_parent_ids_persistent,
+            )],
+            stream,
+        )?;
         *self.ddtree_parent_ids_dev.lock() = Some(self.ddtree_parent_ids_persistent);
         *self.ddtree_num_tree_tokens.lock() = kernel_parents.len();
         // Stash the host-side mirror so verify_d.rs can derive per-token
@@ -458,10 +466,13 @@ impl Model for TransformerModel {
             // Best-effort restamp. A failed copy here is non-fatal: the next
             // set_ddtree_parent_ids call will overwrite, and the graph-safe
             // path always re-stamps before replay-only invocations.
-            if let Err(e) =
-                self.gpu
-                    .copy_h2d_async(&bytes, self.ddtree_parent_ids_persistent, stream)
-            {
+            if let Err(e) = self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(
+                    &bytes,
+                    self.ddtree_parent_ids_persistent,
+                )],
+                stream,
+            ) {
                 tracing::warn!("clear_ddtree_parent_ids: failed to restamp linear chain: {e:#}");
             }
         }
@@ -492,6 +503,68 @@ impl Model for TransformerModel {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn dflash_tree_verify_capable(&self) -> bool {
+        let tree_metadata_enabled = std::env::var("ATLAS_DDTREE_TREE_AWARE_VERIFY")
+            .ok()
+            .as_deref()
+            == Some("1")
+            && std::env::var("ATLAS_TREE_AWARE_ATTN").ok().as_deref() == Some("1");
+        let tree_conv_enabled = std::env::var("ATLAS_DDTREE_TREE_CONV_EXACT")
+            .ok()
+            .as_deref()
+            == Some("1");
+        // One-shot diagnostic. This predicate is the single gate between a
+        // built tree payload and a widened verify, and when it returns false
+        // the payload is discarded with no indication of WHICH of its four
+        // conjuncts failed — which is why DDTree read as an unexplained no-op
+        // on Qwen3.8 even after the proposer was fixed and was demonstrably
+        // emitting 15-node trees (`DFlash FREE_SLOTS #0: ... nodes=15`).
+        let attn_ok = self
+            .layers
+            .iter()
+            .all(|layer| layer.ddtree_ancestor_attention_exact());
+        let conv_ok = self
+            .layers
+            .iter()
+            .all(|layer| layer.ddtree_conv_state_exact());
+        static CAP_DBG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if CAP_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
+            tracing::info!(
+                "DDTREE_CAPABLE: metadata(TREE_AWARE_VERIFY&&TREE_AWARE_ATTN)={} \
+                 conv_env(TREE_CONV_EXACT)={} all_layers_ancestor_attn_exact={} \
+                 all_layers_conv_state_exact={} -> capable={}",
+                tree_metadata_enabled,
+                tree_conv_enabled,
+                attn_ok,
+                conv_ok,
+                tree_metadata_enabled && tree_conv_enabled && attn_ok && conv_ok
+            );
+            if !attn_ok {
+                let bad: Vec<usize> = self
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| !l.ddtree_ancestor_attention_exact())
+                    .map(|(i, _)| i)
+                    .take(8)
+                    .collect();
+                tracing::info!("DDTREE_CAPABLE: first layers failing ancestor_attn_exact: {bad:?}");
+            }
+            if !conv_ok {
+                let bad: Vec<usize> = self
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| !l.ddtree_conv_state_exact())
+                    .map(|(i, _)| i)
+                    .take(8)
+                    .collect();
+                tracing::info!("DDTREE_CAPABLE: first layers failing conv_state_exact: {bad:?}");
+            }
+        }
+        tree_metadata_enabled && tree_conv_enabled && attn_ok && conv_ok
+    }
+
     fn trim_proposer_state(
         &self,
         seq: &mut SequenceState,
@@ -505,7 +578,7 @@ impl Model for TransformerModel {
     }
 
     fn dflash_arm_propose_overlap(&self) -> Result<()> {
-        let Some(ref proposer) = self.proposer else {
+        let Some(proposer) = self.active_proposer() else {
             return Ok(());
         };
         proposer.arm_propose_overlap(self.gpu.as_ref(), self.gpu.default_stream())

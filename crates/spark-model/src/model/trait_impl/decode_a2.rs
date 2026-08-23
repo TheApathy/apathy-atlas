@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use atlas_core::config::LayerType;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, HostToDeviceCopy};
 
 use super::super::block_mgmt::{ensure_blocks_through_decode, extract_layer_refs};
 use super::super::types::TransformerModel;
@@ -29,6 +29,12 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let n = tokens.len();
         assert_eq!(n, seqs.len(), "tokens.len() must equal seqs.len()");
+
+        // ATLAS_SSM_H_FP16 stage 2: every sequence in the batch, before the
+        // n==1 delegation below and before any graph work.
+        for s in seqs.iter_mut() {
+            self.ssm_h_to_f16_dispatch(s)?;
+        }
 
         // Single-sequence: delegate to decode() which uses CUDA graphs.
         // decode_batch disables graphs for n≥2 (SSM state pointer staleness),
@@ -93,8 +99,8 @@ impl TransformerModel {
                     )?;
                 }
                 // Upload the assembled [n, vocab] batch back to the device.
-                self.gpu.copy_h2d_async(&staged, logits, stream)?;
-                self.gpu.synchronize(stream)?;
+                self.gpu
+                    .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&staged, logits)], stream)?;
                 Ok(())
             })();
             self.suppress_graphs.store(prev_suppress, Ordering::Relaxed);
@@ -287,6 +293,7 @@ impl TransformerModel {
                             conv_state_intermediates: Vec::new(),
                             wy17_kv_retain: None,
                             wy17_gate_retain: None,
+                            h_is_f16: false,
                         }));
                         ssm_idx += 1;
                     } else {

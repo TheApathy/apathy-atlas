@@ -73,3 +73,111 @@ fn test_weight_name_patterns() {
         "model.layers.3.mlp.experts.42.gate_proj.weight"
     );
 }
+
+#[test]
+fn fp8_scale_geometry_accepts_qwen38_per_row_and_native_block_scales() {
+    // Actual Qwen3.8 unsloth compressed-tensors layouts.
+    assert_eq!(
+        fp8_scale_geometry(17_408, 5_120, &[17_408, 1]).unwrap(),
+        (17_408, 1, 1, 5_120)
+    );
+    assert_eq!(
+        fp8_scale_geometry(12_288, 5_120, &[12_288, 1]).unwrap(),
+        (12_288, 1, 1, 5_120)
+    );
+
+    // Native FP8 128x128 grid and a per-tensor scalar remain supported.
+    assert_eq!(
+        fp8_scale_geometry(16_384, 5_120, &[128, 40]).unwrap(),
+        (128, 40, 128, 128)
+    );
+    assert_eq!(
+        fp8_scale_geometry(17_408, 5_120, &[]).unwrap(),
+        (1, 1, 17_408, 5_120)
+    );
+}
+
+#[test]
+fn fp8_scale_geometry_rejects_mismatched_metadata() {
+    let err = fp8_scale_geometry(17_408, 5_120, &[17_407, 1]).unwrap_err();
+    assert!(err.to_string().contains("does not evenly tile"));
+    assert!(fp8_scale_geometry(17_408, 5_120, &[1, 1, 1]).is_err());
+}
+
+#[test]
+fn gpu_fp8_dequant_args_cover_qwen38_and_native_grids() {
+    assert_eq!(
+        fp8_gpu_dequant_args(248_320, 5_120, &[248_320, 1], WeightDtype::FP32).unwrap(),
+        (248_320, 5_120, 1, 5_120, 1, 1)
+    );
+    assert_eq!(
+        fp8_gpu_dequant_args(16_384, 5_120, &[128, 40], WeightDtype::BF16).unwrap(),
+        (16_384, 5_120, 128, 128, 40, 0)
+    );
+    assert_eq!(
+        fp8_gpu_dequant_args(4_096, 5_120, &[], WeightDtype::FP32).unwrap(),
+        (4_096, 5_120, 4_096, 5_120, 1, 1)
+    );
+}
+
+#[test]
+fn gpu_fp8_dequant_args_fail_closed_on_dtype_geometry_and_width() {
+    assert!(fp8_gpu_dequant_args(4_096, 5_120, &[4_096, 1], WeightDtype::UInt8).is_err());
+    assert!(fp8_gpu_dequant_args(4_096, 5_120, &[4_095, 1], WeightDtype::FP32).is_err());
+    assert!(fp8_gpu_dequant_args(usize::MAX, 1, &[1, 1], WeightDtype::FP32).is_err());
+    assert!(fp8_gpu_dequant_args(0, 5_120, &[1, 1], WeightDtype::FP32).is_err());
+}
+
+#[test]
+fn gpu_dequant_bf16_contract_is_truncation_not_round_to_nearest() {
+    // CUDA's __float2bfloat16 would round this to 0x3f81. The CPU reference,
+    // and therefore the GPU cold-load kernel, must truncate to 0x3f80.
+    let value = f32::from_bits(0x3f80_8001);
+    assert_eq!(f32_to_bf16(value), 0x3f80);
+}
+
+#[test]
+fn mixed_precision_fp8_detection_excludes_nvfp4_layouts() {
+    assert!(is_mixed_precision_fp8_weight(
+        Some(WeightDtype::FP8E4M3),
+        false,
+        false,
+        false,
+        true,
+        false,
+    ));
+    assert!(is_mixed_precision_fp8_weight(
+        Some(WeightDtype::FP8E4M3),
+        false,
+        false,
+        false,
+        false,
+        true,
+    ));
+
+    // Compressed-tensors packed and ModelOpt Standard markers win over dtype.
+    assert!(!is_mixed_precision_fp8_weight(
+        Some(WeightDtype::FP8E4M3),
+        true,
+        true,
+        false,
+        true,
+        false,
+    ));
+    assert!(!is_mixed_precision_fp8_weight(
+        Some(WeightDtype::FP8E4M3),
+        false,
+        false,
+        true,
+        true,
+        false,
+    ));
+    assert!(!is_mixed_precision_fp8_weight(
+        Some(WeightDtype::UInt8),
+        false,
+        false,
+        false,
+        true,
+        false,
+    ));
+}

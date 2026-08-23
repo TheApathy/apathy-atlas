@@ -15,17 +15,23 @@
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
 pub mod dflash_loader;
+mod dflash_validation;
+pub mod dspark_confidence;
 mod gemma4;
 mod minimax;
 mod nemotron;
 mod qwen3;
 mod qwen35;
 mod qwen35_dense;
+mod qwen35_mixed_precision;
 mod qwen3_vl;
+pub mod transform_cache;
 
 pub use dflash_loader::{
-    DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, MarkovWeights,
-    load_dflash_weights, store_has_dflash_weights, store_has_markov_head,
+    DflashConfig, DflashConvWeights, DflashLayerWeights, DflashSelectorWeights, DflashSubConfig,
+    DflashWeights, DrafterCheckpointFamily, DsparkConfidenceConfig, DsparkConfidenceWeights,
+    DsparkVerifyMode, MarkovWeights, load_dflash_weights, store_has_dflash_weights,
+    store_has_markov_head,
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
@@ -182,7 +188,12 @@ pub trait ModelWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight>;
-    fn load_lm_head(&self, store: &WeightStore, config: &ModelConfig) -> Result<DenseWeight>;
+    fn load_lm_head(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<DenseWeight>;
 
     /// Load MTP head weights (returns None if no MTP weights in store).
     fn load_mtp_weights(

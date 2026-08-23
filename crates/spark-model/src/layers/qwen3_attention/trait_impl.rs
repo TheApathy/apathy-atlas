@@ -14,6 +14,18 @@ mod decode_inner;
 mod multi_seq;
 mod prefill_inner;
 
+fn ddtree_indirection_supported(
+    dtype: spark_runtime::kv_cache::KvCacheDtype,
+    qwen_bf16_tree_kernel_loaded: bool,
+) -> bool {
+    match dtype {
+        spark_runtime::kv_cache::KvCacheDtype::Fp8
+        | spark_runtime::kv_cache::KvCacheDtype::Nvfp4 => true,
+        spark_runtime::kv_cache::KvCacheDtype::Bf16 => qwen_bf16_tree_kernel_loaded,
+        _ => false,
+    }
+}
+
 /// Debug: read back BF16 GPU tensor and compute L2 norm + first 4 values.
 pub(super) fn diag_norm(
     gpu: &dyn GpuBackend,
@@ -86,6 +98,18 @@ pub(super) fn gemma4_diag_enabled() -> bool {
 }
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn ddtree_ancestor_attention_exact(&self) -> bool {
+        // BF16 certifies only when this exact Qwen target resolved the
+        // dedicated tree ABI. Turbo variants still ignore indirection.
+        ddtree_indirection_supported(self.kv_dtype, self.paged_decode_bf16_qwen_tree_k.0 != 0)
+    }
+
+    fn ddtree_attention_certificate(
+        &self,
+    ) -> Option<(spark_runtime::kv_cache::KvCacheDtype, bool)> {
+        Some((self.kv_dtype, self.ddtree_ancestor_attention_exact()))
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
@@ -269,7 +293,9 @@ impl TransformerLayer for Qwen3AttentionLayer {
         } else {
             2usize
         };
-        let try_kgamma = (total_rows as u32) > 3 && crate::layers::ffn_kgamma_m16_enabled();
+        let try_kgamma = (total_rows as u32) > 3
+            && (crate::layers::ffn_kgamma_m16_enabled()
+                || self.ffn.exact_kgamma_applicable(total_rows as u32));
         let used_kgamma = if try_kgamma {
             let serviced = self
                 .ffn
@@ -397,6 +423,16 @@ impl TransformerLayer for Qwen3AttentionLayer {
 mod tests {
     use super::*;
     use spark_runtime::gpu::mock::MockGpuBackend;
+    use spark_runtime::kv_cache::KvCacheDtype;
+
+    #[test]
+    fn ddtree_indirection_support_fails_closed_for_unwired_kv_dtypes() {
+        assert!(ddtree_indirection_supported(KvCacheDtype::Fp8, false));
+        assert!(ddtree_indirection_supported(KvCacheDtype::Nvfp4, false));
+        assert!(!ddtree_indirection_supported(KvCacheDtype::Bf16, false));
+        assert!(ddtree_indirection_supported(KvCacheDtype::Bf16, true));
+        assert!(!ddtree_indirection_supported(KvCacheDtype::Turbo4, true));
+    }
 
     #[test]
     fn test_alloc_state_returns_empty() {

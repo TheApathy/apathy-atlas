@@ -8,9 +8,91 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
+use super::draft_budget::{DflashDraftBudget, clear_proposal_outputs};
+use super::forward_block::{checked_topk_difference, validate_topk_request};
 use super::{BlockDiffusionDraftHead, DflashProposerState};
 use crate::layer::ForwardContext;
 use crate::speculative::ProposerState;
+
+pub(super) fn parse_ddtree_top_k(
+    atlas_value: std::result::Result<String, std::env::VarError>,
+    legacy_value: std::result::Result<String, std::env::VarError>,
+    vocab: usize,
+) -> Result<usize> {
+    let raw = match atlas_value {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => match legacy_value {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("DDTREE_TOP_K is not valid Unicode")
+            }
+        },
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("ATLAS_DDTREE_TOP_K is not valid Unicode")
+        }
+    };
+    let Some(raw) = raw else {
+        return validate_topk_request(8, vocab);
+    };
+    let k = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("invalid DDTree top-K value {raw:?}"))?;
+    validate_topk_request(k, vocab)
+}
+
+fn retrieval_corroborates_drafter(drafter: &[u32], retrieval: &[u32], min_prefix: usize) -> bool {
+    retrieval.len() > drafter.len()
+        && min_prefix > 0
+        && drafter.len() >= min_prefix
+        && retrieval.len() >= min_prefix
+        && drafter[..min_prefix] == retrieval[..min_prefix]
+}
+
+fn retrieval_lookup(
+    haystack: &[u32],
+    last_token: u32,
+    cfg: &super::retrieval::RetrievalConfig,
+) -> Option<super::retrieval::RetrievalHit> {
+    let key_retrieval = std::env::var("ATLAS_DFLASH_KEY_RETRIEVAL").ok().as_deref() == Some("1");
+    if key_retrieval {
+        let max_distance = std::env::var("ATLAS_DFLASH_KEY_DISTANCE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 2);
+        super::retrieval::retrieve_by_key(haystack, last_token, cfg, max_distance)
+    } else if cfg.sam {
+        super::retrieval::retrieve_longest(haystack, last_token, cfg)
+    } else {
+        super::retrieval::retrieve(haystack, last_token, cfg)
+    }
+}
+
+#[cfg(test)]
+mod corroboration_tests {
+    use super::retrieval_corroborates_drafter;
+
+    #[test]
+    fn requires_a_longer_chain_and_matching_prefix() {
+        assert!(retrieval_corroborates_drafter(
+            &[1, 2, 3, 4, 9, 9],
+            &[1, 2, 3, 4, 5, 6, 7],
+            4,
+        ));
+        assert!(!retrieval_corroborates_drafter(
+            &[1, 2, 3, 4, 9, 9],
+            &[1, 2, 3, 8, 5, 6, 7],
+            4,
+        ));
+        assert!(!retrieval_corroborates_drafter(
+            &[1, 2, 3, 4],
+            &[1, 2, 3, 4],
+            4,
+        ));
+    }
+}
 
 impl BlockDiffusionDraftHead {
     pub(super) fn propose_drafts(
@@ -31,14 +113,42 @@ impl BlockDiffusionDraftHead {
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
 
-        // ATLAS_DFLASH_ASYNC: the placeholder flag describes the drafts the
-        // PREVIOUS launch returned. Whatever this propose returns (echo /
-        // retrieval / recycle / sync forward / a fresh async launch that
-        // re-sets it), the old flag is stale — clear it up front so a
-        // pending-drafts clear that bypassed collect (e.g. the scheduler's
-        // MTP-mode transition) can never cause a later collect to wipe REAL
-        // drafts and degrade the sequence to bootstrap-only.
-        dstate.async_placeholder = false;
+        // Quiesce the single shared scratch before any host-only early return.
+        if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
+            clear_proposal_outputs(dstate);
+            return Err(error);
+        }
+        let budget = DflashDraftBudget::new(
+            num_drafts,
+            super::effective_draft_width(self.gamma),
+            self.physical_verify_k,
+        )?;
+        dstate.draft_budget = Some(budget);
+        // PCTree (ATLAS_PCTREE=1). Resolved per propose so the reason is
+        // visible in the log rather than inferred. On the production
+        // checkpoint this is always `NoScorer` — the drafter carries no
+        // parent-conditioned head — and drafting stays on the chain.
+        match self.pctree_decision() {
+            super::pctree::PcTreeDecision::Disabled => {}
+            super::pctree::PcTreeDecision::NoScorer => {}
+            super::pctree::PcTreeDecision::Engaged(kind, params) => {
+                static PENDING: std::sync::Once = std::sync::Once::new();
+                PENDING.call_once(|| {
+                    tracing::warn!(
+                        "PCTree is applicable on this checkpoint ({kind:?}, nodes={} k={}) \
+                         but the device-side parent-conditioned scorer is not wired yet: \
+                         it needs a batched top-k-over-(base+bias) kernel, which does not \
+                         exist in this tree. Falling back to chain drafting.",
+                        params.nodes,
+                        params.k,
+                    );
+                });
+            }
+        }
+        if budget.flat == 0 {
+            clear_proposal_outputs(dstate);
+            return Ok(Vec::new());
+        }
 
         // ── Phase 2.5b kernel-chain scaffold (commented for next-session
         // fill-in; current path falls through to empty-Vec stub below) ──
@@ -208,8 +318,6 @@ impl BlockDiffusionDraftHead {
         // (`ctx_len=0`) — it was trained with 5×target_hidden ctx, so
         // first-token acceptance will be poor (<<70%). Adding ctx is the
         // next iteration on top of `forward_block`.
-        let _ = num_drafts;
-
         // Append the model's latest single-slot ctx capture into the
         // per-seq accumulator. Skip when `target_hidden_stack` is None
         // (e.g. EP=2 worker rank or the very first call before any
@@ -412,12 +520,7 @@ impl BlockDiffusionDraftHead {
                 // Shape to γ_eff (pad with a trailing repeat / truncate) so
                 // the K=γ_eff+1 verify dispatch — and its CUDA graph — is
                 // identical to the drafter path (same contract as recycle).
-                let echo_gamma_eff = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(self.gamma)
-                    .min(self.gamma)
-                    .max(1);
+                let echo_gamma_eff = budget.flat;
                 let drafts = super::echo::pad_tail_to_gamma(&tail, echo_gamma_eff);
                 dstate.last_num_drafted = drafts.len();
                 dstate.echo_streak += 1;
@@ -443,7 +546,7 @@ impl BlockDiffusionDraftHead {
 
         // ATLAS_DFLASH_PLD=1: prompt-lookup drafting. If the trailing n-gram
         // (ATLAS_PLD_NGRAM, default 3) recurs earlier in the committed
-        // sequence, draft the gamma tokens that followed that occurrence and
+        // sequence, draft the effective trained/capped width that followed it and
         // skip the drafter forward entirely. Highly repetitive text (story
         // names/phrases, code idioms) accepts these at high rates; misses are
         // rejected by the verifier as usual. Draft count stays gamma so the
@@ -461,7 +564,11 @@ impl BlockDiffusionDraftHead {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(5);
-            let need = 16usize;
+            // Host lookup drafting must obey the same trained/runtime width as
+            // the neural block. A block-16 checkpoint has 15 trained draft
+            // rows; the old literal 16 produced a K=17 verify against the
+            // default K=16 target buffers.
+            let need = budget.flat;
             let toks = &dstate.pld_tokens;
             let l = toks.len();
             let mut hit: Option<usize> = None;
@@ -518,11 +625,11 @@ impl BlockDiffusionDraftHead {
         // shrinks the noise block to γ_eff (= DRAFT_CAP clamped to [1, γ]).
         // Proposing γ_eff drafts keeps drafts.len() identical to the drafter
         // path so the K=γ_eff+1 verify dispatch is unchanged regardless of
-        // which source fired. The serve script pins DRAFT_CAP=γ=16 (K=17).
+        // which source fired. A block-16 checkpoint defaults to γ=15 (K=16).
         //
         // ── WIDE RETRIEVAL (ATLAS_DFLASH_RETR_WIDE=<N>, default off) ──
-        // The NEURAL drafter is structurally capped at `self.gamma` (=16, the
-        // drafter's trained block_size / noise-row count). But the retrieval
+        // The NEURAL drafter is structurally capped at `self.gamma` (=15 for a
+        // block-16 checkpoint: one anchor plus 15 trained draft rows). But the retrieval
         // path emits its drafts straight from the context haystack — it can
         // return as many follow-on tokens as it likes, at zero extra propose
         // cost. Because the verify reads all 27B NVFP4 weights ONCE per step
@@ -532,39 +639,24 @@ impl BlockDiffusionDraftHead {
         // verify) instead of only γ_eff.
         //
         // N is clamped to [γ_eff, K_MAX-1] where K_MAX=32 is the tree-WY /
-        // ddtree buffer capacity (parent_ids, SSM intermediates, hidden_save;
-        // all sized by ATLAS_DDTREE_MAX_NODES — which the operator MUST set to
-        // ≥ N+1 for the K=N+1 verify graph to have buffer room). If
-        // ATLAS_DDTREE_MAX_NODES is left at the γ=16 default (17), the widened
-        // verify would OOB those buffers, so we additionally clamp N to the
-        // live ddtree capacity minus one. LOSSLESS either way — retrieval only
+        // ddtree buffer capacity (parent_ids, SSM intermediates, hidden_save).
+        // The head carries the exact model allocation and the immutable outer
+        // budget clamps N to that capacity minus one. LOSSLESS either way — retrieval only
         // decides WHAT to propose; verify commits the target's greedy token.
         const RETR_WIDE_HARD_CAP: usize = 31; // = tree-WY K_MAX(32) - 1 bonus
         let retr_wide: usize = std::env::var("ATLAS_DFLASH_RETR_WIDE")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(0);
-        // The runtime verify-buffer capacity (K), set by ATLAS_DDTREE_MAX_NODES
-        // and clamped to the kernel K_MAX at model init. Reading it here bounds
-        // the widened draft count so we never propose K > buffer capacity.
-        let ddtree_verify_cap: usize = std::env::var("ATLAS_DDTREE_MAX_NODES")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(self.gamma + 1)
-            .clamp(self.gamma + 1, RETR_WIDE_HARD_CAP + 1);
-        let base_gamma_eff = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(self.gamma)
-            .min(self.gamma)
-            .max(1);
+        // The immutable outer budget is the sole verify-capacity authority.
+        let base_gamma_eff = budget.flat;
         // Wide draft count for the RETRIEVAL path only: at least the neural
         // width (so nothing regresses when wide is off / not applicable), at
         // most min(N, K_MAX-1, ddtree_cap-1).
         let retrieval_gamma_eff = if retr_wide > base_gamma_eff {
             retr_wide
                 .min(RETR_WIDE_HARD_CAP)
-                .min(ddtree_verify_cap.saturating_sub(1))
+                .min(budget.tree_nodes)
                 .max(base_gamma_eff)
         } else {
             base_gamma_eff
@@ -583,17 +675,25 @@ impl BlockDiffusionDraftHead {
         // SAM mode — it fires on any real match rather than only the strongest)
         // and the hit is stashed here for the drafter path to fuse below.
         let portfolio_on = std::env::var("ATLAS_DFLASH_PORTFOLIO").ok().as_deref() == Some("1");
+        let corroborate_on = std::env::var("ATLAS_DFLASH_SAM_CORROBORATE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let corroborate_min: usize = std::env::var("ATLAS_DFLASH_SAM_CORROBORATE_MIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4)
+            .max(1);
         // Retrieval branch budget for the portfolio forest: the K-1 verify
-        // capacity minus the drafter's own chain length, so drafter (chain A)
-        // is never truncated. K-1 = ddtree_verify_cap - 1.
-        let portfolio_b_budget = ddtree_verify_cap
-            .saturating_sub(1)
-            .saturating_sub(base_gamma_eff);
+        // outer node budget minus the drafter's own chain length, so drafter
+        // (chain A) is never truncated.
+        let portfolio_b_budget = budget.tree_nodes.saturating_sub(base_gamma_eff);
         // Portfolio's retrieval chain length (chain B). Sized to fit the
         // remaining forest budget; falls back to base_gamma_eff draft count so
         // RetrievalConfig::from_env caps the matcher correctly.
         let portfolio_b_len = portfolio_b_budget.max(1).min(base_gamma_eff);
         let mut portfolio_retrieval_chain: Option<Vec<u32>> = None;
+        let mut corroborated_retrieval_chain: Option<Vec<u32>> = None;
         if portfolio_on
             && let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(portfolio_b_len)
             && dstate.first_propose_done
@@ -602,11 +702,7 @@ impl BlockDiffusionDraftHead {
             // is needed (a wrong retrieval chain costs at most rejected sibling
             // nodes in a verify pass that runs anyway). Fire on any match that
             // clears the (loosened) hybrid_min and fills the B budget.
-            let lookup = if rcfg.sam {
-                super::retrieval::retrieve_longest(&dstate.pld_tokens, last_token, &rcfg)
-            } else {
-                super::retrieval::retrieve(&dstate.pld_tokens, last_token, &rcfg)
-            };
+            let lookup = retrieval_lookup(&dstate.pld_tokens, last_token, &rcfg);
             if let Some(hit) = lookup
                 && hit.match_len >= rcfg.hybrid_min
                 && hit.drafts.len() == portfolio_b_len
@@ -626,10 +722,24 @@ impl BlockDiffusionDraftHead {
                 portfolio_retrieval_chain = Some(hit.drafts);
             }
         }
+        if corroborate_on
+            && !portfolio_on
+            && let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(retrieval_gamma_eff)
+            && dstate.first_propose_done
+        {
+            let lookup = retrieval_lookup(&dstate.pld_tokens, last_token, &rcfg);
+            if let Some(hit) = lookup
+                && hit.match_len >= rcfg.hybrid_min
+                && hit.drafts.len() == retrieval_gamma_eff
+            {
+                corroborated_retrieval_chain = Some(hit.drafts);
+            }
+        }
         // Store for the drafter-path fusion below (after the neural forward).
         let portfolio_active = portfolio_on;
 
         if !portfolio_on
+            && !corroborate_on
             && let Some(rcfg) = super::retrieval::RetrievalConfig::from_env(retrieval_gamma_eff)
             && dstate.first_propose_done
         {
@@ -645,11 +755,17 @@ impl BlockDiffusionDraftHead {
             let adaptive = std::env::var("ATLAS_DFLASH_SAM_ADAPTIVE").ok().as_deref() != Some("0");
             if adaptive {
                 let min_accept: usize = std::env::var("ATLAS_DFLASH_SAM_MIN_ACCEPT")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
                 let misfire_limit: u32 = std::env::var("ATLAS_DFLASH_SAM_MISFIRE_LIMIT")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(3);
                 let cooldown: u32 = std::env::var("ATLAS_DFLASH_SAM_COOLDOWN")
-                    .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(24);
                 if dstate.retr_used_last {
                     if dstate.last_num_accepted < min_accept {
                         dstate.retr_misfire_streak += 1;
@@ -672,10 +788,8 @@ impl BlockDiffusionDraftHead {
             // Suppressed ⇒ None ⇒ falls through to the neural drafter below.
             let lookup = if retr_suppressed {
                 None
-            } else if rcfg.sam {
-                super::retrieval::retrieve_longest(&dstate.pld_tokens, last_token, &rcfg)
             } else {
-                super::retrieval::retrieve(&dstate.pld_tokens, last_token, &rcfg)
+                retrieval_lookup(&dstate.pld_tokens, last_token, &rcfg)
             };
             if let Some(hit) = lookup
                 && hit.match_len >= rcfg.hybrid_min
@@ -685,8 +799,9 @@ impl BlockDiffusionDraftHead {
                     std::sync::atomic::AtomicBool::new(false);
                 if !RETR_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::info!(
-                        "DFlash retrieval: first hit match_len={} draft_count={} haystack_len={} (lmax={} lmin={} hybrid_min={})",
+                        "DFlash retrieval: first hit match_len={} key_distance={} draft_count={} haystack_len={} (lmax={} lmin={} hybrid_min={})",
                         hit.match_len,
+                        hit.key_distance,
                         hit.drafts.len(),
                         dstate.pld_tokens.len(),
                         rcfg.l_max,
@@ -699,6 +814,21 @@ impl BlockDiffusionDraftHead {
                     hit.match_len,
                     hit.drafts.len()
                 );
+                if std::env::var("ATLAS_DFLASH_KEY_RETRIEVAL").ok().as_deref() == Some("1") {
+                    static KEY_HITS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let hits = KEY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if hits == 1 || hits.is_multiple_of(64) {
+                        tracing::info!(
+                            "DFlash key retrieval engagement: hits={} context_tokens={} match_len={} key_distance={} drafts={}",
+                            hits,
+                            dstate.pld_tokens.len(),
+                            hit.match_len,
+                            hit.key_distance,
+                            hit.drafts.len(),
+                        );
+                    }
+                }
                 dstate.last_num_drafted = hit.drafts.len();
                 dstate.first_propose_done = true;
                 // Adaptive gate: mark that retrieval fired so the NEXT propose
@@ -782,12 +912,7 @@ impl BlockDiffusionDraftHead {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1)
         {
-            let recycle_gamma_eff = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(self.gamma)
-                .min(self.gamma)
-                .max(1);
+            let recycle_gamma_eff = budget.flat;
             // Take the stash unconditionally (single-use): a tail is only valid
             // for the immediately-following step whose last_token == the key.
             let valid = dstate.recycle_valid;
@@ -933,27 +1058,47 @@ impl BlockDiffusionDraftHead {
             match self.try_launch_async_propose(
                 last_token,
                 position,
-                base_gamma_eff,
+                budget,
                 ctx,
                 _stream,
                 _grammar_bitmask.is_some(),
                 dstate,
             ) {
                 Ok(Some(placeholder)) => return Ok(placeholder),
-                Ok(None) => self.resolve_async_inflight_impl(ctx.gpu, None)?,
+                Ok(None) => {
+                    if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
+                        clear_proposal_outputs(dstate);
+                        return Err(error);
+                    }
+                }
                 Err(e) => {
-                    tracing::warn!("DFLASH_ASYNC launch failed ({e:#}); sync propose fallback");
-                    self.resolve_async_inflight_impl(ctx.gpu, None)?;
+                    tracing::warn!("DFLASH_ASYNC launch failed ({e:#}); degrading to no-spec");
+                    clear_proposal_outputs(dstate);
+                    return Err(e);
                 }
             }
         }
 
-        let drafts = self
-            .forward_block(last_token, position, ctx, _stream, dstate, false)
-            .map_err(|e| {
-                tracing::warn!("DFlash forward_block failed, falling back to no-spec: {e:#}");
-                e
-            })?;
+        if std::env::var("ATLAS_DFLASH_TPS_ROUTER").ok().as_deref() == Some("1") {
+            dstate.throughput_cycle_started = Some(std::time::Instant::now());
+            dstate.throughput_last_width = budget.flat;
+        }
+        let drafts = match self.forward_block(
+            last_token,
+            position,
+            budget.flat,
+            ctx,
+            _stream,
+            dstate,
+            false,
+        ) {
+            Ok(drafts) => drafts,
+            Err(error) => {
+                tracing::warn!("DFlash forward_block failed, falling back to no-spec: {error:#}");
+                clear_proposal_outputs(dstate);
+                return Err(error);
+            }
+        };
         // Phase 2.5e: K=γ verify path is implemented in model.rs
         // (decode_verify_graphed_kgamma → decode_verify) and dispatched via
         // step_verify_dflash when drafts.len()>=4. The SSM intermediate
@@ -1046,7 +1191,19 @@ impl BlockDiffusionDraftHead {
                     let mut cliff = 0usize;
                     let mut cliff_margin = f32::INFINITY;
                     for r in 1..n - 1 {
-                        let m = topk_logits[2 * r] - topk_logits[2 * r + 1];
+                        let m = match checked_topk_difference(
+                            topk_logits[2 * r],
+                            topk_logits[2 * r + 1],
+                        ) {
+                            Ok(margin) => margin,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "DFlash CATERPILLAR invalid top-2 row {r} ({error:#}); flat chain fallback"
+                                );
+                                dstate.pending_tree_payload = None;
+                                return Ok(drafts);
+                            }
+                        };
                         if m < margin_thresh {
                             cliff = r;
                             cliff_margin = m;
@@ -1132,9 +1289,9 @@ impl BlockDiffusionDraftHead {
         // short re-rooted tail; multiple branches fill the budget shallowest
         // first (EAGLE-2: shallow accept dominates).
         //
-        // The OPERATOR MUST ALSO set ATLAS_DDTREE_MAX_NODES=<K> (K = the free
-        // width, ≤ 32) so the verify-side persistent buffers (parent_ids, SSM
-        // intermediates, hidden_save) are sized for the wider tree; and, to
+        // The verify-side persistent buffers (parent_ids, SSM intermediates,
+        // hidden_save) must have been constructed for the wider tree; the
+        // immutable outer budget enforces their actual capacity. To
         // commit the deep branch tails byte-exactly,
         // ATLAS_DDTREE_TREE_AWARE_VERIFY=1 + ATLAS_TREE_AWARE_ATTN=1 (per-row
         // ancestor KV indirection) + ATLAS_DDTREE_TREE_TOKENS_VERIFY=1 +
@@ -1168,9 +1325,21 @@ impl BlockDiffusionDraftHead {
             match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
                 Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
                     // Per-row top1−top2 margins over the spine rows.
-                    let margins: Vec<f32> = (0..n)
-                        .map(|r| topk_logits[2 * r] - topk_logits[2 * r + 1])
+                    let margins: Result<Vec<f32>> = (0..n)
+                        .map(|r| {
+                            checked_topk_difference(topk_logits[2 * r], topk_logits[2 * r + 1])
+                        })
                         .collect();
+                    let margins = match margins {
+                        Ok(margins) => margins,
+                        Err(error) => {
+                            tracing::warn!(
+                                "DFlash FREE_SLOTS invalid top-2 result ({error:#}); flat chain fallback"
+                            );
+                            dstate.pending_tree_payload = None;
+                            return Ok(drafts);
+                        }
+                    };
                     let cliffs =
                         super::ddtree::pick_free_slot_cliffs(&margins, margin_thresh, free_slots);
                     // Build one FreeSlotBranch per cliff: fork = the drafter's
@@ -1203,8 +1372,8 @@ impl BlockDiffusionDraftHead {
                         dstate.pending_tree_payload = None;
                         return Ok(drafts);
                     }
-                    // Widen the payload to the ddtree verify capacity (K-1 nodes).
-                    let max_nodes = ddtree_verify_cap.saturating_sub(1).max(drafts.len());
+                    // The outer caller and physical capacity jointly bound the tree.
+                    let max_nodes = budget.tree_nodes;
                     let payload =
                         super::ddtree::build_free_slots_payload(&drafts, &branches, max_nodes);
                     static FREE_DBG: std::sync::atomic::AtomicUsize =
@@ -1272,7 +1441,19 @@ impl BlockDiffusionDraftHead {
                     let mut min_margin = f32::INFINITY;
                     if cliff_first {
                         for r in 1..n - 1 {
-                            let m = topk_logits[2 * r] - topk_logits[2 * r + 1];
+                            let m = match checked_topk_difference(
+                                topk_logits[2 * r],
+                                topk_logits[2 * r + 1],
+                            ) {
+                                Ok(margin) => margin,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "DFlash BRANCH invalid top-2 row {r} ({error:#}); flat chain fallback"
+                                    );
+                                    dstate.pending_tree_payload = None;
+                                    return Ok(drafts);
+                                }
+                            };
                             if m < margin_thresh {
                                 cliff = r;
                                 min_margin = m;
@@ -1281,7 +1462,19 @@ impl BlockDiffusionDraftHead {
                         }
                     } else {
                         for r in 1..n - 1 {
-                            let m = topk_logits[2 * r] - topk_logits[2 * r + 1];
+                            let m = match checked_topk_difference(
+                                topk_logits[2 * r],
+                                topk_logits[2 * r + 1],
+                            ) {
+                                Ok(margin) => margin,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "DFlash BRANCH invalid top-2 row {r} ({error:#}); flat chain fallback"
+                                    );
+                                    dstate.pending_tree_payload = None;
+                                    return Ok(drafts);
+                                }
+                            };
                             if m < min_margin {
                                 min_margin = m;
                                 cliff = r;
@@ -1386,6 +1579,30 @@ impl BlockDiffusionDraftHead {
             }
         }
 
+        // Corroborated SAM extension: keep the neural drafter as the quality
+        // oracle, but use a longer retrieval continuation when both sources
+        // independently agree on a configurable prefix. This avoids tree
+        // policy semantics and never widens on an uncorroborated suffix hit.
+        if corroborate_on
+            && let Some(retrieval) = corroborated_retrieval_chain.take()
+            && retrieval_corroborates_drafter(&drafts, &retrieval, corroborate_min)
+        {
+            static CORROBORATE_DBG: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !CORROBORATE_DBG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "DFlash SAM corroborated extension: drafter_len={} retrieval_len={} prefix={}",
+                    drafts.len(),
+                    retrieval.len(),
+                    corroborate_min,
+                );
+            }
+            dstate.pending_tree_payload = None;
+            dstate.last_num_drafted = retrieval.len();
+            dstate.first_propose_done = true;
+            return Ok(retrieval);
+        }
+
         // ── PORTFOLIO fusion (ATLAS_DFLASH_PORTFOLIO=1) ──
         // If a retrieval sibling chain was stashed above, fuse it with the
         // freshly-proposed drafter chain into a 2-root forest payload and
@@ -1399,7 +1616,7 @@ impl BlockDiffusionDraftHead {
         // lossless regardless (greedy oracle rejects any mis-conditioned row).
         if portfolio_active && !drafts.is_empty() {
             if let Some(retr_chain) = portfolio_retrieval_chain.take() {
-                let max_nodes = ddtree_verify_cap.saturating_sub(1).max(drafts.len());
+                let max_nodes = budget.tree_nodes;
                 let payload =
                     super::ddtree::build_portfolio_payload(&drafts, &retr_chain, max_nodes);
                 static PORTF_FUSE_DBG: std::sync::atomic::AtomicBool =
@@ -1519,18 +1736,35 @@ impl BlockDiffusionDraftHead {
             // Match AEON-7 env var naming (DDTREE_*) with an Atlas-prefixed
             // alias (ATLAS_DDTREE_*) for consistency with the rest of the
             // codebase. AEON-7's serve scripts set the unprefixed names.
-            let top_k: usize = std::env::var("ATLAS_DDTREE_TOP_K")
-                .ok()
-                .or_else(|| std::env::var("DDTREE_TOP_K").ok())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8)
-                .clamp(1, super::DDTREE_TOP_K_MAX);
-            let budget: usize = std::env::var("ATLAS_DDTREE_BUDGET")
+            let atlas_top_k = std::env::var("ATLAS_DDTREE_TOP_K");
+            let legacy_top_k = std::env::var("DDTREE_TOP_K");
+            let lm_vocab = self.target_vocab_size.min(self.vocab_size);
+            let top_k = match parse_ddtree_top_k(atlas_top_k, legacy_top_k, lm_vocab) {
+                Ok(k) => k,
+                Err(error) => {
+                    tracing::warn!(
+                        "DDTree invalid requested top-K ({error:#}); emitting flat-chain payload"
+                    );
+                    let n = drafts.len();
+                    let mut parent_indices = Vec::with_capacity(n);
+                    parent_indices.push(-1i32);
+                    for i in 0..n.saturating_sub(1) {
+                        parent_indices.push(i as i32);
+                    }
+                    dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                        tree_token_ids: drafts.clone(),
+                        parent_indices,
+                    });
+                    return Ok(drafts);
+                }
+            };
+            let tree_build_budget: usize = std::env::var("ATLAS_DDTREE_BUDGET")
                 .ok()
                 .or_else(|| std::env::var("DDTREE_BUDGET").ok())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(15)
-                .max(1);
+                .max(1)
+                .min(budget.tree_nodes);
             let min_root_branches: usize = std::env::var("ATLAS_DDTREE_MIN_ROOT_BRANCHES")
                 .ok()
                 .or_else(|| std::env::var("DDTREE_MIN_ROOT_BRANCHES").ok())
@@ -1548,30 +1782,73 @@ impl BlockDiffusionDraftHead {
                     // as a sensible additive path-score for the best-first
                     // tree builder. Real log-softmax would require a vocab-
                     // wide reduction we want to avoid in this hot path.
-                    let mut candidates_by_depth: Vec<Vec<super::ddtree::DraftCandidate>> =
-                        Vec::with_capacity(gamma_eff);
-                    for row in 0..gamma_eff {
-                        let base = row * top_k;
-                        let row_max = topk_logits[base];
-                        let row_cands: Vec<super::ddtree::DraftCandidate> = (0..top_k)
-                            .map(|i| super::ddtree::DraftCandidate {
-                                token_id: topk_tokens[base + i],
-                                logprob: topk_logits[base + i] - row_max,
-                            })
-                            .collect();
-                        candidates_by_depth.push(row_cands);
-                    }
+                    let candidates_by_depth: Result<Vec<Vec<super::ddtree::DraftCandidate>>> = (0
+                        ..gamma_eff)
+                        .map(|row| {
+                            let base = row * top_k;
+                            let row_max = topk_logits[base];
+                            let row_cands: Result<Vec<super::ddtree::DraftCandidate>> = (0..top_k)
+                                .filter(|&i| topk_logits[base + i] > f32::NEG_INFINITY)
+                                .map(|i| {
+                                    Ok(super::ddtree::DraftCandidate {
+                                        token_id: topk_tokens[base + i],
+                                        logprob: checked_topk_difference(
+                                            topk_logits[base + i],
+                                            row_max,
+                                        )?,
+                                    })
+                                })
+                                .collect();
+                            let row_cands = row_cands?;
+                            if row_cands.is_empty() {
+                                anyhow::bail!("DDTree top-K row {row} has no usable candidates");
+                            }
+                            Ok(row_cands)
+                        })
+                        .collect();
+                    let candidates_by_depth = match candidates_by_depth {
+                        Ok(candidates) => candidates,
+                        Err(error) => {
+                            tracing::warn!(
+                                "DDTree top-K normalization failed ({error:#}); emitting flat-chain payload"
+                            );
+                            let n = drafts.len();
+                            let mut parent_indices = Vec::with_capacity(n);
+                            parent_indices.push(-1i32);
+                            for i in 0..n.saturating_sub(1) {
+                                parent_indices.push(i as i32);
+                            }
+                            dstate.pending_tree_payload = Some(super::ddtree::TreePayload {
+                                tree_token_ids: drafts.clone(),
+                                parent_indices,
+                            });
+                            return Ok(drafts);
+                        }
+                    };
 
                     // Root token is irrelevant for the payload (tree_token_ids
                     // skips index 0); pass u32::MAX as a sentinel.
-                    match super::ddtree::build_ddtree(
-                        &candidates_by_depth,
-                        budget,
-                        top_k,
-                        chain_seed,
-                        min_root_branches,
-                        u32::MAX,
-                    ) {
+                    let parent_conditioned = self.checkpoint_family
+                        == crate::weight_loader::DrafterCheckpointFamily::Dspark
+                        && std::env::var("ATLAS_DSPARK_PARENT_TREE").ok().as_deref() == Some("1");
+                    let tree_result = if parent_conditioned {
+                        super::ddtree::build_parent_conditioned_tree(
+                            &candidates_by_depth,
+                            tree_build_budget,
+                            top_k,
+                            u32::MAX,
+                        )
+                    } else {
+                        super::ddtree::build_ddtree(
+                            &candidates_by_depth,
+                            tree_build_budget,
+                            top_k,
+                            chain_seed,
+                            min_root_branches,
+                            u32::MAX,
+                        )
+                    };
+                    match tree_result {
                         Ok(tree) => {
                             let tree_token_ids = tree.token_ids_for_verifier();
                             let parent_indices = tree.parent_indices_for_verifier();
@@ -1581,14 +1858,15 @@ impl BlockDiffusionDraftHead {
                             {
                                 tracing::info!(
                                     "M4B v2 real top-K tree: γ_eff={} k={} budget={} \
-                                     min_root_branches={} chain_seed={} \
+                                     min_root_branches={} chain_seed={} parent_conditioned={} \
                                      → nodes={} parent_indices={:?} \
                                      tokens[..min(8)]={:?}",
                                     gamma_eff,
                                     top_k,
-                                    budget,
+                                    tree_build_budget,
                                     min_root_branches,
                                     chain_seed,
+                                    parent_conditioned,
                                     tree_token_ids.len(),
                                     parent_indices,
                                     &tree_token_ids[..tree_token_ids.len().min(8)],

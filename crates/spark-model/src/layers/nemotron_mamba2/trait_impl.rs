@@ -430,6 +430,7 @@ impl TransformerLayer for NemotronMamba2Layer {
             conv_state_intermediates: Vec::new(),
             wy17_kv_retain: None,
             wy17_gate_retain: None,
+            h_is_f16: false,
         }))
     }
 }

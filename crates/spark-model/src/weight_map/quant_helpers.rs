@@ -21,12 +21,68 @@ pub(super) fn dequant_fp8_bytes_to_bf16(fp8_buf: &[u8], scale: f32) -> Vec<u8> {
         .collect()
 }
 
-/// Dequantize FP8 E4M3 block-scaled weight → BF16.
+/// Resolve a safetensors FP8 scale shape into its logical scale grid and the
+/// number of weight rows/columns covered by each scale element.
+///
+/// Compressed-tensors mixed-precision checkpoints use `[N, 1]` for
+/// per-output-channel scales, while native FP8 checkpoints normally use a
+/// two-dimensional block grid such as `[N/128, K/128]`. Scalar scales are
+/// also accepted for the ModelOpt per-tensor convention.
+pub(super) fn fp8_scale_geometry(
+    n: usize,
+    k: usize,
+    shape: &[usize],
+) -> Result<(usize, usize, usize, usize)> {
+    ensure!(n > 0 && k > 0, "FP8 weight dimensions must be non-zero");
+    let (sn, sk) = match shape {
+        [] => (1, 1),
+        [sn] => (*sn, 1),
+        [sn, sk] => (*sn, *sk),
+        _ => bail!("FP8 scale must be scalar, 1-D, or 2-D; got shape {shape:?}"),
+    };
+    ensure!(sn > 0 && sk > 0, "FP8 scale dimensions must be non-zero");
+    ensure!(
+        n.is_multiple_of(sn) && k.is_multiple_of(sk),
+        "FP8 scale shape {shape:?} does not evenly tile weight shape [{n}, {k}]"
+    );
+    Ok((sn, sk, n / sn, k / sk))
+}
+
+/// Validate and narrow the arguments consumed by the GPU FP8 dequant kernel.
+///
+/// The kernel accepts the same logical scale grids as the CPU reference:
+/// scalar, one-dimensional per-row, two-dimensional per-row (`[N,1]`), and
+/// native block grids. Unsupported dtypes and non-tiling shapes fail before
+/// any allocation or launch.
+pub(super) fn fp8_gpu_dequant_args(
+    n: usize,
+    k: usize,
+    scale_shape: &[usize],
+    scale_dtype: WeightDtype,
+) -> Result<(u32, u32, u32, u32, u32, u32)> {
+    ensure!(
+        scale_dtype == WeightDtype::BF16 || scale_dtype == WeightDtype::FP32,
+        "GPU FP8 dequant scale must be BF16 or FP32, got {scale_dtype:?}"
+    );
+    let (_sn, sk, block_n, block_k) = fp8_scale_geometry(n, k, scale_shape)?;
+    Ok((
+        u32::try_from(n).context("FP8 weight row count exceeds u32")?,
+        u32::try_from(k).context("FP8 weight column count exceeds u32")?,
+        u32::try_from(block_n).context("FP8 scale row block exceeds u32")?,
+        u32::try_from(block_k).context("FP8 scale column block exceeds u32")?,
+        u32::try_from(sk).context("FP8 scale column count exceeds u32")?,
+        u32::from(scale_dtype == WeightDtype::FP32),
+    ))
+}
+
+/// Dequantize FP8 E4M3 block/per-row/per-tensor-scaled weight → BF16.
 ///
 /// Block-scaled FP8 (e.g. `quant_method: "fp8"` with `weight_block_size: [128, 128]`):
 ///   - `{prefix}.weight`: FP8E4M3 tensor of shape `[N, K]`
-///   - `{prefix}.weight_scale_inv`: BF16 tensor of shape `[N/block, K/block]`
-///   - Dequant: `bf16[i,j] = fp8[i,j] * scale_inv[i/block, j/block]`
+///   - `{prefix}.weight_scale_inv`: BF16 tensor of shape `[N/block, K/block]`, or
+///   - `{prefix}.weight_scale`: BF16/FP32 tensor shaped as a block grid,
+///     `[N,1]` per-row scales, or a scalar.
+///   - Dequant: `bf16[i,j] = fp8[i,j] * scale[i/block_n, j/block_k]`
 ///
 /// Returns a BF16 DenseWeight on GPU.
 pub(crate) fn dequant_fp8_blockscaled_to_bf16(
@@ -47,21 +103,101 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
     );
     let n = w.shape[0];
     let k = w.shape[1];
-    let total = n * k;
+    let total = n
+        .checked_mul(k)
+        .context("FP8 weight element count overflows usize")?;
+    let bf16_byte_size = total
+        .checked_mul(2)
+        .context("FP8 dequant BF16 allocation size overflows usize")?;
     let byte_size = w.byte_size();
     tracing::debug!(
         "FP8 blockscaled dequant: {prefix} shape=[{n},{k}] total={total} byte_size={byte_size} ptr={}",
         w.ptr.0,
     );
-
-    // Sync to flush any pending CUDA errors from prior operations
-    gpu.synchronize(gpu.default_stream())?;
-
-    // Download FP8 weight bytes (1 byte per element)
     ensure!(
         total == byte_size,
         "FP8 size mismatch: total={total} byte_size={byte_size}"
     );
+
+    // Native FP8 uses `weight_scale_inv`; compressed-tensors float-quantized
+    // groups use `weight_scale` (notably `[N,1]` in unsloth Qwen3.8). Both
+    // store the direct multiplier consumed by the dequant equation above.
+    let scale_inv_key = format!("{prefix}.weight_scale_inv");
+    let scale_key = format!("{prefix}.weight_scale");
+    let (selected_scale_key, s) = if let Ok(s) = store.get(&scale_inv_key) {
+        (scale_inv_key, s)
+    } else if let Ok(s) = store.get(&scale_key) {
+        (scale_key, s)
+    } else {
+        bail!("FP8 tensor {prefix}: no .weight_scale_inv or .weight_scale found for dequant");
+    };
+    ensure!(
+        s.dtype == WeightDtype::BF16 || s.dtype == WeightDtype::FP32,
+        "Expected BF16 or FP32 for {selected_scale_key}, got {:?}",
+        s.dtype,
+    );
+    let (sn, sk, block_n, block_k) = fp8_scale_geometry(n, k, &s.shape)?;
+    let scale_is_f32 = s.dtype == WeightDtype::FP32;
+
+    // The CUDA kernel consumes the same multiplier grid as the CPU reference.
+    // Qwen3.8's `[N,1]` scale becomes block_n=1, block_k=K, sk=1. Keep the
+    // lookup optional so non-CUDA backends retain the exact CPU behavior, but
+    // fail closed after a successful lookup: a bad launch/sync is not silently
+    // converted into a benchmark-contaminating fallback.
+    let (n_u32, k_u32, block_n_u32, block_k_u32, sk_u32, scale_is_f32_u32) =
+        fp8_gpu_dequant_args(n, k, &s.shape, s.dtype)?;
+    let stream = gpu.default_stream();
+    match gpu.kernel(
+        "dequant_fp8_blockscaled_bf16",
+        "dequant_fp8_blockscaled_bf16",
+    ) {
+        Ok(kernel) => {
+            use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+            let out = gpu.alloc(bf16_byte_size)?;
+            let launched = KernelLaunch::new(gpu, kernel)
+                .grid([div_ceil(k_u32, 64), div_ceil(n_u32, 4), 1])
+                .block([64, 4, 1])
+                .arg_ptr(w.ptr)
+                .arg_ptr(s.ptr)
+                .arg_ptr(out)
+                .arg_u32(n_u32)
+                .arg_u32(k_u32)
+                .arg_u32(block_n_u32)
+                .arg_u32(block_k_u32)
+                .arg_u32(sk_u32)
+                .arg_u32(scale_is_f32_u32)
+                .launch(stream)
+                .and_then(|()| gpu.synchronize(stream));
+            if let Err(error) = launched {
+                let _ = gpu.free(out);
+                return Err(error).with_context(|| {
+                    format!(
+                        "GPU FP8 dequant failed for {prefix}: weight=[{n},{k}] scale={:?}",
+                        s.shape
+                    )
+                });
+            }
+            tracing::debug!(
+                "GPU-dequanted FP8 {prefix}: [{n},{k}] scale=[{sn},{sk}] block=[{block_n},{block_k}] → BF16"
+            );
+            return Ok(DenseWeight { weight: out });
+        }
+        Err(error) => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "GPU FP8 dequant kernel unavailable ({error:#}); using the numerically-identical CPU fallback"
+                );
+            }
+        }
+    }
+
+    // Compatibility fallback for backends without the CUDA module. This is
+    // intentionally after all metadata validation, so malformed layouts never
+    // hide behind the fallback.
+    gpu.synchronize(stream)?;
     let mut fp8_buf = vec![0u8; byte_size];
     gpu.copy_d2h(w.ptr, &mut fp8_buf).with_context(|| {
         let free = gpu.free_memory().unwrap_or(0);
@@ -72,32 +208,18 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
         )
     })?;
 
-    // Download block scale_inv. DeepSeek-V3 / Qwen FP8 ship BF16 here;
-    // MiniMax-M2 ships FP32. Handle both — the subsequent dequant reads
-    // a scalar `f32` scale per (row, col) either way.
-    let s = store.get(&format!("{prefix}.weight_scale_inv"))?;
-    ensure!(
-        s.dtype == WeightDtype::BF16 || s.dtype == WeightDtype::FP32,
-        "Expected BF16 or FP32 for {prefix}.weight_scale_inv, got {:?}",
-        s.dtype,
-    );
-    let sn = s.shape[0];
-    let sk = s.shape[1];
-    let block_n = n / sn;
-    let block_k = k / sk;
-    let scale_is_f32 = s.dtype == WeightDtype::FP32;
     let scale_bytes_per = if scale_is_f32 { 4 } else { 2 };
     let mut scale_buf = vec![0u8; sn * sk * scale_bytes_per];
     gpu.copy_d2h(s.ptr, &mut scale_buf).with_context(|| {
         format!(
-            "D2H failed for {prefix}.weight_scale_inv: ptr={}, size={}",
+            "D2H failed for {selected_scale_key}: ptr={}, size={}",
             s.ptr.0,
             sn * sk * scale_bytes_per
         )
     })?;
 
-    // CPU dequant: bf16_out[i,j] = fp8[i,j] * scale_inv[i/block_n, j/block_k]
-    let mut bf16_out = vec![0u8; total * 2];
+    // CPU dequant: bf16_out[i,j] = fp8[i,j] * scale[i/block_n, j/block_k]
+    let mut bf16_out = vec![0u8; bf16_byte_size];
     for row in 0..n {
         let scale_row = row / block_n;
         for col in 0..k {
@@ -201,10 +323,11 @@ pub(super) fn bf16_bytes_to_f32(bytes: [u8; 2]) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Load a dense weight, auto-detecting FP8 block-scaled vs BF16.
+/// Load a dense weight, auto-detecting FP8 scaled vs BF16.
 ///
-/// If the tensor is FP8E4M3 and a `{name_without_.weight}.weight_scale_inv` key exists,
-/// performs block-scaled dequantization to BF16. Otherwise returns the raw pointer (BF16).
+/// FP8 tensors may use native `weight_scale_inv`, compressed-tensors
+/// `weight_scale [N,1]`, or a scalar `weight_scale`; all are dequantized to
+/// BF16. Non-FP8 tensors retain their existing pointer-alias behavior.
 pub(crate) fn dense_auto(
     store: &WeightStore,
     name: &str,

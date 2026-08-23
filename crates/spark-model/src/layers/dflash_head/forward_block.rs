@@ -6,10 +6,74 @@
 //! 8 drafter layers → final norm/lm_head/argmax → D2H) shares
 //! many locals with no clean extraction boundary.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::{BlockDiffusionDraftHead, DflashProposerState};
 use crate::layer::ForwardContext;
+
+pub(super) fn checked_topk_difference(left: f32, right: f32) -> Result<f32> {
+    if left.is_nan() || right.is_nan() {
+        anyhow::bail!("top-K difference contains NaN");
+    }
+    if left == right {
+        return Ok(0.0);
+    }
+    let difference = left - right;
+    if difference.is_nan() {
+        anyhow::bail!("top-K difference produced NaN");
+    }
+    Ok(difference)
+}
+
+pub(super) fn validate_topk_request(k: usize, vocab: usize) -> Result<usize> {
+    if vocab == 0 {
+        anyhow::bail!("top-K requires vocab > 0");
+    }
+    if vocab > u32::MAX as usize {
+        anyhow::bail!("top-K vocab exceeds u32: {vocab}");
+    }
+    if k == 0 {
+        anyhow::bail!("top-K requires k >= 1");
+    }
+    if k > super::DDTREE_TOP_K_MAX {
+        anyhow::bail!("top-K requires k <= {}, got {k}", super::DDTREE_TOP_K_MAX);
+    }
+    if k > vocab {
+        anyhow::bail!("top-K requires k <= vocab ({vocab}), got {k}");
+    }
+    Ok(k)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct TopkLayout {
+    pub(super) num_rows: u32,
+    pub(super) vocab: u32,
+    pub(super) k: usize,
+    pub(super) bytes: usize,
+}
+
+pub(super) fn checked_topk_layout(
+    num_rows: usize,
+    scratch_rows: usize,
+    vocab: usize,
+    k: usize,
+) -> Result<TopkLayout> {
+    if num_rows > scratch_rows {
+        anyhow::bail!("top-K rows {num_rows} exceed scratch capacity {scratch_rows}");
+    }
+    let k = validate_topk_request(k, vocab)?;
+    let num_rows = u32::try_from(num_rows).context("top-K row count exceeds u32")?;
+    let bytes = (num_rows as usize)
+        .checked_mul(k)
+        .and_then(|elements| elements.checked_mul(4))
+        .context("top-K result byte length overflow")?;
+    Ok(TopkLayout {
+        num_rows,
+        vocab: vocab as u32,
+        k,
+        bytes,
+    })
+}
 
 impl BlockDiffusionDraftHead {
     /// `async_launch` (ATLAS_DFLASH_ASYNC, task #20): when true, every op is
@@ -25,6 +89,7 @@ impl BlockDiffusionDraftHead {
         &self,
         last_token: u32,
         position: usize,
+        gamma_eff: usize,
         ctx: &ForwardContext,
         stream: u64,
         dstate: &mut DflashProposerState,
@@ -32,20 +97,17 @@ impl BlockDiffusionDraftHead {
     ) -> Result<Vec<u32>> {
         use crate::layers::ops;
 
-        let g = self.gamma as u32;
         let h = self.hidden_size as u32;
-        let q_dim = (self.num_q_heads * self.head_dim) as u32;
-        let kv_dim = (self.num_kv_heads * self.head_dim) as u32;
         let bf16 = 2usize;
         let gpu = ctx.gpu;
 
-        // ── Kernel profiler (ATLAS_DFLASH_KERNEL_PROFILE=1) ──
+        // ── Kernel profiler (ATLAS_DFLASH_KERNEL_PROFILE=1 or ATLAS_FULL_PROFILE=1) ──
         // Lightweight per-phase timing using synchronize-and-Instant. Matches
         // `qwen3_ssm/ssm_forward.rs:prof!` pattern. Aggregates per-kernel μs
         // sums across all drafter layers via a thread-local accumulator,
         // logged at the end of forward_block. Adds ~20μs/sync × ~14 syncs/layer
         // when enabled — only use for measurement, not production.
-        let kprofile = std::env::var("ATLAS_DFLASH_KERNEL_PROFILE").ok().as_deref() == Some("1");
+        let kprofile = super::kernel_profile_enabled();
         let t_total = std::time::Instant::now();
         if kprofile {
             gpu.synchronize(stream)?;
@@ -77,64 +139,39 @@ impl BlockDiffusionDraftHead {
         // tokens = 1 bonus (last_token) + γ_eff MASK rows. Drafts read from
         // rows [1..γ_eff+1] → γ_eff drafts.
         //
-        // γ_eff defaults to self.gamma (drafter config) but is capped by
-        // ATLAS_DFLASH_DRAFT_CAP when set. The cap previously only filtered
-        // the returned drafts AFTER the full γ forward — wasting drafter
-        // compute. Now the noise block itself shrinks to γ_eff+1 rows,
-        // cutting drafter forward latency proportionally (DUET/SpecKV-
-        // inspired: don't compute drafts that will be discarded).
-        let cap: usize = std::env::var("ATLAS_DFLASH_DRAFT_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(self.gamma);
-        let gamma_eff = cap.min(self.gamma).max(1);
-        let noise_count = gamma_eff + 1;
+        // `gamma_eff` is resolved exactly once by the outer proposal budget.
+        // Re-reading env/runtime state here could exceed the caller's public
+        // maximum or the verify buffers after an async launch.
+        if gamma_eff == 0 || gamma_eff > self.gamma {
+            anyhow::bail!(
+                "DFlash forward width {gamma_eff} is outside trained capacity 1..={}",
+                self.gamma
+            )
+        }
+        if gamma_eff
+            .checked_add(1)
+            .is_none_or(|verify_k| verify_k > self.physical_verify_k)
+        {
+            anyhow::bail!(
+                "DFlash forward width {gamma_eff} exceeds physical verify K={}",
+                self.physical_verify_k
+            )
+        }
+        let logits_layout = super::logits_layout::LogitsLayout::new(
+            self.gamma,
+            self.target_vocab_size,
+            self.vocab_size,
+        )?;
+        let _active_logits_bytes = logits_layout.active_bytes(gamma_eff)?;
+        let row_layout = super::DraftRowLayout::for_family(self.checkpoint_family, gamma_eff);
+        let noise_count = row_layout.query_rows;
         let n_attn = (eff_ctx + noise_count) as u32;
 
-        // Zero all scratch buffers to eliminate non-determinism from
-        // uninitialized memory (different GPU allocations may contain
-        // stale data from previous operations).
-        let n_attn_usize = n_attn as usize;
-        gpu.memset(
-            self.scratch.stream_buf,
-            0,
-            n_attn_usize * self.hidden_size * bf16,
-        )?;
-        gpu.memset(
-            self.scratch.norm_buf,
-            0,
-            n_attn_usize * self.hidden_size * bf16,
-        )?;
-        gpu.memset(self.scratch.q_buf, 0, n_attn_usize * q_dim as usize * bf16)?;
-        gpu.memset(self.scratch.k_buf, 0, n_attn_usize * kv_dim as usize * bf16)?;
-        gpu.memset(self.scratch.v_buf, 0, n_attn_usize * kv_dim as usize * bf16)?;
-        gpu.memset(
-            self.scratch.attn_out,
-            0,
-            n_attn_usize * q_dim as usize * bf16,
-        )?;
-        gpu.memset(
-            self.scratch.mlp_intermediate,
-            0,
-            n_attn_usize * self.intermediate_size * bf16,
-        )?;
-        gpu.memset(
-            self.scratch.mlp_up,
-            0,
-            n_attn_usize * self.intermediate_size * bf16,
-        )?;
-        gpu.memset(
-            self.scratch.stream_acc,
-            0,
-            n_attn_usize * self.hidden_size * bf16,
-        )?;
-        gpu.memset(
-            self.scratch.fc_proj,
-            0,
-            self.ctx_window * self.hidden_size * bf16,
-        )?;
-        gpu.memset(self.scratch.logits, 0, self.gamma * self.vocab_size * bf16)?;
-        gpu.memset(self.scratch.draft_tokens_dev, 0, n_attn_usize * 4)?;
+        // Scratch buffers are producer-owned. The active ranges are fully
+        // overwritten by the embed, cache-copy/GEMM, attention, LM-head, or
+        // argmax producers below; context rows that must be zero are cleared
+        // immediately after their producer. Clearing the full allocations
+        // here only adds launches and global-memory traffic to every propose.
 
         let target_hidden_dim = self.target_layer_ids.len() * self.target_hidden_size;
         let ctx_slot_bytes = target_hidden_dim * bf16;
@@ -236,6 +273,25 @@ impl BlockDiffusionDraftHead {
                 }
             }
             if zero_late > 0 && eff_ctx > 0 {
+                // NOT converted to memset_async, unlike every other memset in
+                // this file. Two reasons:
+                //
+                //  1. `base` is `dstate.ctx_hidden_acc`, which is written by
+                //     the TARGET model's capture hook (`try_dflash_capture`,
+                //     impl_b3.rs:863) on the target's stream — not by us on
+                //     `stream`. Making this stream-ordered would order it
+                //     against drafter work while leaving it unordered against
+                //     the producer, which is the wrong guarantee to keep. The
+                //     blocking form at least serialises against everything.
+                //  2. ATLAS_DFLASH_ZERO_LATE_LAYERS defaults to 0, so this
+                //     never runs in production and the conversion buys nothing.
+                //
+                // SEPARATE HAZARD if anyone does enable it: this is
+                // `eff_ctx * n_zero` BLOCKING host syncs — at the champion's
+                // ctx_window=4096 with n_zero=2 that is ~8k host round-trips
+                // in one propose step. Batch it (one memset per contiguous
+                // run, or a strided-zero kernel) before using it for anything
+                // beyond a one-off A/B.
                 let n_capture = self.target_layer_ids.len();
                 let n_zero = zero_late.min(n_capture);
                 let h_bytes = self.target_hidden_size * bf16;
@@ -566,7 +622,27 @@ impl BlockDiffusionDraftHead {
             .chain((0..noise_count).map(|i| (position + i) as i32))
             .collect();
         let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
-        gpu.copy_h2d(&pos_bytes, self.scratch.position_ids)?;
+        // kprofile sub-phase marker: end of Step 0 (fc_proj) host enqueue.
+        let t_pre_fc_done = std::time::Instant::now();
+        // Stream-ordered pinned H2D instead of `copy_h2d`: the sync variant
+        // drains `default_stream` (the target verify stream) on every propose
+        // — measured ~8.7 ms of hidden serialization per cycle. The async
+        // copy enqueues after earlier work on `stream`, and `pos_pinned` is
+        // only rewritten by the next propose after this pass has been
+        // synchronized (sync path) or drained (async path), so ordering is
+        // preserved without any host-side wait.
+        let pos_n_bytes = pos_bytes.len();
+        dstate.pos_pinned.as_mut_slice()[..pos_n_bytes].copy_from_slice(&pos_bytes);
+        let pinned = dstate.pos_pinned.pinned_slice(pos_n_bytes)?;
+        // SAFETY: `pinned` borrows the page-locked `pos_pinned` buffer owned by
+        // `dstate`, which outlives this copy because `dstate` is only reused by
+        // the next propose after this pass has been synchronized/drained. The
+        // copy is stream-ordered on `stream`, so the driver reads the pinned
+        // bytes only after preceding work on that stream, never concurrently
+        // with this host-side write.
+        unsafe {
+            gpu.copy_h2d_pinned_async(pinned, self.scratch.position_ids, stream)?;
+        }
         if debug_dump {
             tracing::info!(
                 "DFLASH DUMP positions: eff_ctx={} ctx_total={} position={} pos_ids[0..min(8,n_attn)]={:?}",
@@ -620,13 +696,20 @@ impl BlockDiffusionDraftHead {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1)
             .clamp(1, 8);
+        if self.checkpoint_family == crate::weight_loader::DrafterCheckpointFamily::Dspark
+            && denoise_steps != 1
+        {
+            anyhow::bail!(
+                "DSpark anchor-output layout currently supports exactly one denoise pass"
+            );
+        }
         let denoise_margin: f32 = std::env::var("ATLAS_DFLASH_DENOISE_MARGIN")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
         let denoise_freeze =
             std::env::var("ATLAS_DFLASH_DENOISE_FREEZE").ok().as_deref() != Some("0");
-        let argmax_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
+        let argmax_vocab = self.target_vocab_size.min(self.vocab_size);
         let needed_start = ctx_total.saturating_sub(eff_ctx);
         let pass_args = super::noise_pass::NoisePassArgs {
             last_token,
@@ -655,39 +738,65 @@ impl BlockDiffusionDraftHead {
             // Confidence feedback: top-2 over this pass's logits gives the
             // per-row top1−top2 margin; the argmax tokens are already in
             // draft_tokens_dev. Cost: one topk launch + ~γ·12 bytes D2H.
-            let used_bytes = gamma_eff * 2 * 4;
-            gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
-            gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
+            let top2 = checked_topk_layout(gamma_eff, self.gamma, argmax_vocab, 2)?;
+            let used_bytes = top2.bytes;
+            // Stream-ordered: only consumer is the `topk_bf16` launch on
+            // `stream` immediately below, and the host D2H is gated behind
+            // the `gpu.synchronize(stream)` that follows it.
+            gpu.memset_async(self.scratch.topk_tokens_dev, 0, used_bytes, stream)?;
+            gpu.memset_async(self.scratch.topk_logits_dev, 0, used_bytes, stream)?;
             ops::topk_bf16(
                 gpu,
                 self.kernels.topk,
                 self.scratch.logits,
                 self.scratch.topk_tokens_dev,
                 self.scratch.topk_logits_dev,
-                gamma_eff as u32,
-                argmax_vocab,
-                2,
+                top2.num_rows,
+                top2.vocab,
+                top2.k as u32,
                 stream,
             )?;
             gpu.synchronize(stream)?;
             let mut tok_bytes = vec![0u8; gamma_eff * 4];
             gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut tok_bytes)?;
-            let mut top2_bytes = vec![0u8; used_bytes];
-            gpu.copy_d2h(self.scratch.topk_logits_dev, &mut top2_bytes)?;
+            let mut top2_token_bytes = vec![0u8; used_bytes];
+            let mut top2_logit_bytes = vec![0u8; used_bytes];
+            gpu.copy_d2h(self.scratch.topk_tokens_dev, &mut top2_token_bytes)?;
+            gpu.copy_d2h(self.scratch.topk_logits_dev, &mut top2_logit_bytes)?;
             let pass_tokens: Vec<u32> = tok_bytes
                 .chunks_exact(4)
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            let top2: Vec<f32> = top2_bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
+            let (_, top2) = match Self::decode_topk_bytes(
+                top2_token_bytes,
+                top2_logit_bytes,
+                gamma_eff,
+                self.gamma,
+                top2.k,
+                argmax_vocab,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    tracing::warn!(
+                        "DFlash denoise top-2 output is invalid ({error:#}); degrading to bootstrap"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
             let mut newly_committed = 0usize;
             for i in 0..gamma_eff {
                 if committed[i].is_some() {
                     continue;
                 }
-                let margin = top2[i * 2] - top2[i * 2 + 1];
+                let margin = match checked_topk_difference(top2[i * 2], top2[i * 2 + 1]) {
+                    Ok(margin) => margin,
+                    Err(error) => {
+                        tracing::warn!(
+                            "DFlash denoise top-2 row {i} is invalid ({error:#}); degrading to bootstrap"
+                        );
+                        return Ok(Vec::new());
+                    }
+                };
                 if margin >= denoise_margin {
                     committed[i] = Some(pass_tokens[i]);
                     newly_committed += 1;
@@ -766,6 +875,7 @@ impl BlockDiffusionDraftHead {
             .unwrap_or(0.0);
         let adaptive_gamma =
             std::env::var("ATLAS_DFLASH_ADAPTIVE_GAMMA").ok().as_deref() == Some("1");
+        let tps_router = std::env::var("ATLAS_DFLASH_TPS_ROUTER").ok().as_deref() == Some("1");
         let adaptive_min: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_MIN")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -814,34 +924,58 @@ impl BlockDiffusionDraftHead {
         // logit value per row. Cost: one extra kernel launch over the same
         // logits buffer plus a γ_eff×2×4 byte D2H. Tiny vs the layer chain.
         let margin_top2: Option<Vec<f32>> = if margin_gate > 0.0 {
-            let k_used = 2usize;
-            let used_bytes = gamma_eff * k_used * 4;
-            gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
-            gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
+            let top2 = checked_topk_layout(gamma_eff, self.gamma, argmax_vocab, 2)?;
+            let used_bytes = top2.bytes;
+            // Stream-ordered — same argument as the denoise-pass top-2 above.
+            gpu.memset_async(self.scratch.topk_tokens_dev, 0, used_bytes, stream)?;
+            gpu.memset_async(self.scratch.topk_logits_dev, 0, used_bytes, stream)?;
             ops::topk_bf16(
                 gpu,
                 self.kernels.topk,
                 self.scratch.logits,
                 self.scratch.topk_tokens_dev,
                 self.scratch.topk_logits_dev,
-                gamma_eff as u32,
-                argmax_vocab,
-                k_used as u32,
+                top2.num_rows,
+                top2.vocab,
+                top2.k as u32,
                 stream,
             )?;
             gpu.synchronize(stream)?;
+            let mut token_bytes = vec![0u8; used_bytes];
             let mut logits_bytes = vec![0u8; used_bytes];
+            gpu.copy_d2h(self.scratch.topk_tokens_dev, &mut token_bytes)?;
             gpu.copy_d2h(self.scratch.topk_logits_dev, &mut logits_bytes)?;
-            let logits: Vec<f32> = logits_bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            Some(logits)
+            match Self::decode_topk_bytes(
+                token_bytes,
+                logits_bytes,
+                gamma_eff,
+                self.gamma,
+                top2.k,
+                argmax_vocab,
+            ) {
+                Ok((_, logits)) => Some(logits),
+                Err(error) => {
+                    tracing::warn!(
+                        "DFlash adaptive top-2 output is invalid ({error:#}); degrading to bootstrap"
+                    );
+                    return Ok(Vec::new());
+                }
+            }
         } else {
             None
         };
 
-        // ── Step 6: D2H γ_eff × 4 bytes ──
+        // ── DSpark VanillaMarkov head (auto-on when checkpoint ships it) ──
+        // Keep the full correction chain device-resident: each chosen u32
+        // feeds the next position's W1 gather on this same stream. This must
+        // happen before the only D2H below. A loaded head is fail-closed; a
+        // kernel/launch failure cannot silently substitute plain DFlash.
+        if self.markov.is_some() {
+            self.enqueue_markov_sequential(gpu, stream, last_token, gamma_eff)
+                .context("DSpark device-resident Markov correction")?;
+        }
+
+        // ── Step 6: one final D2H of gamma token IDs ──
         // ATLAS_DFLASH_ASYNC_PROBE=1: split the propose wall into CPU enqueue
         // time (fn entry → here, all kernels launched) vs GPU drain time (the
         // synchronize below). The drain is the part an async second-stream
@@ -853,7 +987,11 @@ impl BlockDiffusionDraftHead {
             0
         };
         let mut host_buf = vec![0u8; gamma_eff * 4];
-        gpu.synchronize(stream)?;
+        // One ordered D2H + trailing sync.  The old pair (`synchronize`
+        // followed by `copy_d2h`) paid two host-blocking stream syncs and the
+        // copy ran on the default stream.  This preserves the same completion
+        // guarantee while coalescing it to one sync on the producer stream.
+        gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, &mut host_buf, stream)?;
         if async_probe {
             tracing::info!(
                 "ASYNC_PROBE propose: enqueue={probe_enqueue_us}μs gpu_total={}μs \
@@ -861,42 +999,10 @@ impl BlockDiffusionDraftHead {
                 t_total.elapsed().as_micros(),
             );
         }
-        gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf)?;
         let mut drafts: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-
-        // ── DSpark VanillaMarkov head (auto-on when the checkpoint ships it) ──
-        // Re-sample the γ-block LEFT-TO-RIGHT with the low-rank bigram bias
-        // B(prev) = markov_w2 @ markov_w1[prev], where position k's chosen
-        // token feeds position k+1's bias (position 0's predecessor is the
-        // verified `last_token` bonus that seeds the block). This
-        // semi-autoregressively repairs the drafter's suffix decay. The base
-        // logit rows are still in `self.scratch.logits` (untouched since the
-        // final lm_head above), so the correction reads them directly. LOSSLESS
-        // w.r.t. committed output — only the proposed tokens change; the target
-        // verify still commits its own greedy token. Disable via
-        // ATLAS_DFLASH_MARKOV=0 (handled at load time → `self.markov` is None).
-        if self.markov.is_some() {
-            match self.apply_markov_sequential(gpu, stream, last_token, &drafts) {
-                Ok(corrected) if corrected.len() == drafts.len() => {
-                    drafts = corrected;
-                    // Keep host_buf consistent for the DUMP_ALL diagnostic below.
-                    for (i, t) in drafts.iter().enumerate() {
-                        host_buf[i * 4..i * 4 + 4].copy_from_slice(&t.to_le_bytes());
-                    }
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        "DFlash Markov: corrected draft count mismatch — keeping base argmax"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("DFlash Markov correction failed ({e:#}); base argmax kept");
-                }
-            }
-        }
 
         // Multi-step denoise: committed rows freeze their commit-time
         // prediction. On the final pass those rows were embedded as REAL
@@ -934,8 +1040,14 @@ impl BlockDiffusionDraftHead {
         // mode — no replacement needed, the position just disappears).
         let adaptive_mode =
             std::env::var("ATLAS_DFLASH_ADAPTIVE_MODE").unwrap_or_else(|_| "mask".to_string());
-        let truncate_mode = adaptive_mode == "truncate";
-        if adaptive_gamma || margin_gate > 0.0 {
+        // The throughput router must change the physical verify shape; masking
+        // would retain the wide verifier cost and defeat its objective.
+        let climbdrop_mode = std::env::var("ATLAS_DFLASH_TPS_ROUTER_MODE")
+            .ok()
+            .as_deref()
+            == Some("climbdrop");
+        let truncate_mode = adaptive_mode == "truncate" || tps_router || climbdrop_mode;
+        if adaptive_gamma || margin_gate > 0.0 || tps_router || climbdrop_mode {
             let mask = self.mask_token_id;
             // Bump the monotonic step counter once per adaptive-engaged call.
             // Used below to decide whether this step is a γ_max reprobe.
@@ -954,6 +1066,38 @@ impl BlockDiffusionDraftHead {
             // Compute the adaptive cutoff (= number of drafts to keep as-is).
             // gamma_eff is the post-cap drafter output size. cutoff <= gamma_eff.
             let mut cutoff = gamma_eff;
+            if climbdrop_mode {
+                // Climb/drop controller (llama.cpp PR #27210 algorithm): the
+                // depth is the controller's current state; clamp to the
+                // physical max. It climbs on consecutive full accepts and
+                // falls back on weighted misses, so no probing is needed.
+                let floor = std::env::var("ATLAS_DFLASH_TPS_ROUTER_FLOOR")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4);
+                let cap = std::env::var("ATLAS_DFLASH_TPS_ROUTER_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(gamma_eff);
+                if dstate.climbdrop_router.score() == 0 || dstate.climbdrop_router.decisions() == 0
+                {
+                    dstate
+                        .climbdrop_router
+                        .reset(cap.min(gamma_eff), floor.min(gamma_eff));
+                }
+                cutoff = dstate.climbdrop_router.choose().min(gamma_eff);
+            } else if tps_router {
+                let widths_env = std::env::var("ATLAS_DFLASH_TPS_ROUTER_WIDTHS").ok();
+                let widths =
+                    super::throughput_router::parse_widths(widths_env.as_deref(), gamma_eff);
+                let probe_interval = std::env::var("ATLAS_DFLASH_TPS_ROUTER_PROBE_INTERVAL")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(16);
+                cutoff = dstate
+                    .throughput_router
+                    .choose(&widths, gamma_eff, probe_interval);
+            }
             if !is_probe_step && adaptive_gamma && dstate.accept_history_count >= 4 {
                 let n = dstate.accept_history_count.min(dstate.accept_history.len());
                 let sum: usize = dstate
@@ -979,21 +1123,41 @@ impl BlockDiffusionDraftHead {
             // low-confidence position (and all subsequent positions, since the
             // chain terminates at the first reject anyway — no point computing
             // attention for tokens we know will be discarded).
+            let mut invalid_margin = false;
             if let Some(ref logits) = margin_top2 {
                 for i in 0..gamma_eff {
                     let base = i * 2;
                     let top1 = logits[base];
                     let top2 = logits[base + 1];
-                    let margin = top1 - top2;
+                    let margin = match checked_topk_difference(top1, top2) {
+                        Ok(margin) => margin,
+                        Err(error) => {
+                            tracing::warn!(
+                                "DFlash adaptive top-2 row {i} is invalid ({error:#}); cutting before row"
+                            );
+                            cutoff = cutoff.min(i);
+                            invalid_margin = true;
+                            break;
+                        }
+                    };
                     if margin < margin_gate {
                         cutoff = cutoff.min(i);
                         break;
                     }
                 }
             }
+            if tps_router || climbdrop_mode {
+                // Attribute the observation to the actual physical width after
+                // all safety/confidence caps, not merely the router's request.
+                dstate.throughput_last_width = cutoff.max(1);
+            }
             if truncate_mode {
                 // Shrink the vector so the scheduler downgrades the verify K.
-                drafts.truncate(cutoff.max(1));
+                drafts.truncate(if invalid_margin {
+                    cutoff
+                } else {
+                    cutoff.max(1)
+                });
             } else {
                 // Mask mode (default): replace positions [cutoff..gamma_eff].
                 for i in cutoff..gamma_eff {
@@ -1039,22 +1203,52 @@ impl BlockDiffusionDraftHead {
                 tracing::info!("DFLASH DUMP_ALL: drafts {drafts:?} → {path}");
             }
         }
-        let _ = g; // suppress unused
         if kprofile {
             gpu.synchronize(stream)?;
             let tail_us = t_tail.elapsed().as_micros();
             let pre_us = t_pre_layers.duration_since(t_total).as_micros()
                 + t_layers.duration_since(t_pre_layers).as_micros();
+            let pre_fc_us = t_pre_fc_done.duration_since(t_pre_layers).as_micros();
+            let pre_pos_us = t_layers.duration_since(t_pre_fc_done).as_micros();
+            let fc_is_nvfp4 = self.fc_nvfp4.is_some();
             let total_us = t_total.elapsed().as_micros();
             let agg = super::kprof_snapshot_layers();
+            // Publish into the ATLAS_FULL_PROFILE table so a single
+            // `ATLAS_FULL_PROFILE=1` run reports drafter kernels alongside the
+            // verify path's, under `draft_*` labels.
+            for (label, us) in agg.labelled() {
+                crate::full_profile::record(label, (us as u64).saturating_mul(1_000));
+            }
+            // The residue is the diagnostic that matters: `layers_us` is the
+            // whole noise pass (embed, 6 layers, final norm, lm_head, argmax)
+            // while the accumulator covers only the layer-internal launches.
+            // Anything large here is propose time that is still unattributed —
+            // report it explicitly rather than leaving it to subtraction.
+            let attributed_us = agg.attributed_us();
+            let unattributed_us = layers_us.saturating_sub(attributed_us);
+            crate::full_profile::record(
+                "draft_unattributed",
+                (unattributed_us as u64).saturating_mul(1_000),
+            );
             tracing::info!(
-                "DFLASH_KP propose: total={:.2}ms pre+steps0-2={:.0}μs layers={:.2}ms tail={:.0}μs \
+                "DFLASH_KP residue: layers={}μs attributed={}μs unattributed={}μs \
+                 (embed + final_norm + lm_head + argmax + any unlabelled launch)",
+                layers_us,
+                attributed_us,
+                unattributed_us,
+            );
+            tracing::info!(
+                "DFLASH_KP propose: total={:.2}ms pre+steps0-2={:.0}μs (fc={:.0}μs nvfp4_fc={}, pos={:.0}μs) layers={:.2}ms tail={:.0}μs \
                  n_attn={} eff_ctx={} γ_eff={} | per-kernel-sum-over-{}-layers (μs): \
                  input_norm={} q_proj={} kv_ctx_copy={} kv_ctx_new={} kv_noise={} \
                  qk_norm={} rope={} cache_write={} prefill_attn={} \
-                 o_proj={} resid1={} post_norm={} gate_up={} silu_mul={} down_proj={} resid2={}",
+                 o_proj={} resid1={} post_norm={} gate_up={} silu_mul={} down_proj={} resid2={} \
+                 conv_prepare={} conv_finish={}",
                 total_us as f32 / 1000.0,
                 pre_us,
+                pre_fc_us,
+                fc_is_nvfp4,
+                pre_pos_us,
                 layers_us as f32 / 1000.0,
                 tail_us,
                 n_attn,
@@ -1077,6 +1271,8 @@ impl BlockDiffusionDraftHead {
                 agg.silu_mul_us,
                 agg.down_proj_us,
                 agg.resid2_us,
+                agg.conv_prepare_us,
+                agg.conv_finish_us,
             );
         }
         Ok(drafts)
@@ -1091,8 +1287,7 @@ impl BlockDiffusionDraftHead {
     /// is sorted by logit descending.
     ///
     /// `gamma_eff` = the number of MASK rows that produced drafts (matches
-    /// `drafts.len()` from forward_block). `k` is clamped to
-    /// `super::DDTREE_TOP_K_MAX`.
+    /// `drafts.len()` from forward_block). Invalid `k` fails without launch.
     #[allow(dead_code)]
     pub(super) fn extract_topk_from_logits(
         &self,
@@ -1101,9 +1296,29 @@ impl BlockDiffusionDraftHead {
         gamma_eff: usize,
         k: usize,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
-        self.enqueue_topk_on_stream(gpu, stream, gamma_eff, k)?;
-        gpu.synchronize(stream)?;
-        self.collect_topk_d2h(gpu, gamma_eff, k)
+        let lm_vocab = self.target_vocab_size.min(self.vocab_size);
+        let layout = checked_topk_layout(gamma_eff, self.gamma, lm_vocab, k)?;
+        self.enqueue_topk_on_stream(gpu, stream, gamma_eff, layout.k)?;
+        let mut tokens_bytes = vec![0u8; layout.bytes];
+        let mut logits_bytes = vec![0u8; layout.bytes];
+        // Drain top-K once, then copy both results through the pageable-safe
+        // synchronous D2H pair boundary. This retains two copies plus one
+        // producer-stream sync without requiring page-locked Vec storage.
+        gpu.copy_d2h_pair_on_stream(
+            self.scratch.topk_tokens_dev,
+            &mut tokens_bytes,
+            self.scratch.topk_logits_dev,
+            &mut logits_bytes,
+            stream,
+        )?;
+        Self::decode_topk_bytes(
+            tokens_bytes,
+            logits_bytes,
+            gamma_eff,
+            self.gamma,
+            layout.k,
+            lm_vocab,
+        )
     }
 
     /// Enqueue the top-K extraction kernel on `stream` without syncing or D2H.
@@ -1117,20 +1332,24 @@ impl BlockDiffusionDraftHead {
         k: usize,
     ) -> Result<()> {
         use crate::layers::ops;
-        let k_used = k.clamp(1, super::DDTREE_TOP_K_MAX);
-        let lm_vocab = self.target_vocab_size.min(self.vocab_size) as u32;
-        let used_bytes = gamma_eff * k_used * 4;
-        gpu.memset(self.scratch.topk_tokens_dev, 0, used_bytes)?;
-        gpu.memset(self.scratch.topk_logits_dev, 0, used_bytes)?;
+        let lm_vocab = self.target_vocab_size.min(self.vocab_size);
+        let layout = checked_topk_layout(gamma_eff, self.gamma, lm_vocab, k)?;
+        // Stream-ordered. This function's contract is already "enqueue on
+        // `stream`, do not sync" — both callers sync before reading
+        // (`extract_topk_from_logits` immediately below; the async propose
+        // path via `collect_async_drafts_impl`'s stream sync), so a blocking
+        // memset here was contradicting the function's own doc comment.
+        gpu.memset_async(self.scratch.topk_tokens_dev, 0, layout.bytes, stream)?;
+        gpu.memset_async(self.scratch.topk_logits_dev, 0, layout.bytes, stream)?;
         ops::topk_bf16(
             gpu,
             self.kernels.topk,
             self.scratch.logits,
             self.scratch.topk_tokens_dev,
             self.scratch.topk_logits_dev,
-            gamma_eff as u32,
-            lm_vocab,
-            k_used as u32,
+            layout.num_rows,
+            layout.vocab,
+            layout.k as u32,
             stream,
         )
     }
@@ -1144,12 +1363,39 @@ impl BlockDiffusionDraftHead {
         gamma_eff: usize,
         k: usize,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
-        let k_used = k.clamp(1, super::DDTREE_TOP_K_MAX);
-        let used_bytes = gamma_eff * k_used * 4;
-        let mut tokens_bytes = vec![0u8; used_bytes];
-        let mut logits_bytes = vec![0u8; used_bytes];
+        let lm_vocab = self.target_vocab_size.min(self.vocab_size);
+        let layout = checked_topk_layout(gamma_eff, self.gamma, lm_vocab, k)?;
+        let mut tokens_bytes = vec![0u8; layout.bytes];
+        let mut logits_bytes = vec![0u8; layout.bytes];
         gpu.copy_d2h(self.scratch.topk_tokens_dev, &mut tokens_bytes)?;
         gpu.copy_d2h(self.scratch.topk_logits_dev, &mut logits_bytes)?;
+        Self::decode_topk_bytes(
+            tokens_bytes,
+            logits_bytes,
+            gamma_eff,
+            self.gamma,
+            layout.k,
+            lm_vocab,
+        )
+    }
+
+    fn decode_topk_bytes(
+        tokens_bytes: Vec<u8>,
+        logits_bytes: Vec<u8>,
+        num_rows: usize,
+        scratch_rows: usize,
+        k: usize,
+        vocab: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let layout = checked_topk_layout(num_rows, scratch_rows, vocab, k)?;
+        let expected_bytes = layout.bytes;
+        if tokens_bytes.len() != expected_bytes || logits_bytes.len() != expected_bytes {
+            anyhow::bail!(
+                "top-K result byte length mismatch: tokens={} logits={} expected={expected_bytes}",
+                tokens_bytes.len(),
+                logits_bytes.len(),
+            );
+        }
         let tokens: Vec<u32> = tokens_bytes
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1158,6 +1404,64 @@ impl BlockDiffusionDraftHead {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+
+        for row in 0..num_rows {
+            let start = row * layout.k;
+            let row_tokens = &tokens[start..start + layout.k];
+            let row_logits = &logits[start..start + layout.k];
+            let marker_tokens = row_tokens
+                .iter()
+                .filter(|&&token| token == u32::MAX)
+                .count();
+            if marker_tokens > 0 {
+                let exact_markers = row_tokens
+                    .iter()
+                    .zip(row_logits)
+                    .filter(|&(token, score)| *token == u32::MAX && score.is_nan())
+                    .count();
+                if marker_tokens == layout.k && exact_markers == layout.k {
+                    anyhow::bail!("top-K row {row} contains invalid marker");
+                }
+                anyhow::bail!("top-K row {row} contains partial marker");
+            }
+            if row_logits.iter().any(|score| score.is_nan()) {
+                anyhow::bail!("top-K row {row} contains NaN");
+            }
+            if !row_logits.iter().any(|score| *score > f32::NEG_INFINITY) {
+                anyhow::bail!("top-K row {row} has no usable score");
+            }
+
+            let mut seen = std::collections::HashSet::with_capacity(layout.k);
+            for column in 0..layout.k {
+                let token = row_tokens[column];
+                let score = row_logits[column];
+                if token >= layout.vocab {
+                    anyhow::bail!(
+                        "top-K row {row} token {token} is out of range for vocab {}",
+                        layout.vocab
+                    );
+                }
+                if !seen.insert(token) {
+                    anyhow::bail!("top-K row {row} contains duplicate token {token}");
+                }
+                if column == 0 {
+                    continue;
+                }
+                let previous_score = row_logits[column - 1];
+                let previous_token = row_tokens[column - 1];
+                if previous_score < score {
+                    anyhow::bail!("top-K row {row} violates score order");
+                }
+                if previous_score == score && previous_token > token {
+                    anyhow::bail!("top-K row {row} violates token order for equal scores");
+                }
+            }
+        }
+
         Ok((tokens, logits))
     }
 }
+
+#[cfg(test)]
+#[path = "topk_contract_tests.rs"]
+mod topk_contract_tests;

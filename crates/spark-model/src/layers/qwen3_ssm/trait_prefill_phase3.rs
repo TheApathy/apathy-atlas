@@ -88,7 +88,10 @@ impl Qwen3SsmLayer {
                     stream,
                 )
             }
-        } else if let Some(ref nvfp4_t) = self.out_proj_nvfp4_t {
+        } else if crate::layers::prefill_proj_fast_enabled() && self.out_proj_nvfp4_t.is_some() {
+            // Correctness lever: fall through to non-transposed M64 when the
+            // prefill-projection transposed-TC gate is off.
+            let nvfp4_t = self.out_proj_nvfp4_t.as_ref().unwrap();
             ops::w4a16_gemm_n128(
                 ctx.gpu,
                 self.w4a16_gemm_t_k,
@@ -101,17 +104,36 @@ impl Qwen3SsmLayer {
                 stream,
             )
         } else {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed_out_buf,
-                &self.ssm.out_proj,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )
+            if crate::layers::prefill_proj_pipe_enabled()
+                && self.w4a16_gemm_pipe_k.0 != 0
+                && (value_dim as u32) % 64 == 0
+            {
+                // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
+                // K = value_dim must be a multiple of the pipe's 64-row stage.
+                ops::w4a16_gemm_pipe(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe_k,
+                    normed_out_buf,
+                    &self.ssm.out_proj,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+            } else {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm_k,
+                    normed_out_buf,
+                    &self.ssm.out_proj,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+            }
         }
         .map_err(|e| anyhow::anyhow!("ssm phase3: out_proj GEMM failed: {e}"))?;
 
@@ -157,6 +179,7 @@ impl Qwen3SsmLayer {
             conv_state_intermediates: Vec::new(),
             wy17_kv_retain: None,
             wy17_gate_retain: None,
+            h_is_f16: false,
         }))
     }
 }

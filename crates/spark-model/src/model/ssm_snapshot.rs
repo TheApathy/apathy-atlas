@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
@@ -54,6 +54,13 @@ pub(crate) struct SsmSnapshotPool {
     pub(super) h_bytes: usize,
     pub(super) conv_bytes: usize,
     pub(super) num_ssm_layers: usize,
+    /// FP16 -> FP32 widener for the snapshot save path (`ATLAS_SSM_H_FP16`).
+    ///
+    /// Snapshots are ALWAYS stored FP32. A decoding slot may hold FP16, and
+    /// `restore` only ever lands in a prefill that reads FP32 — so the widening
+    /// happens here, on save, and every downstream consumer (restore, spill,
+    /// fault-in, tier fingerprint, swap) stays dtype-agnostic.
+    pub(super) h_f16_to_f32_k: KernelHandle,
     /// Maps snapshot_slot_id → session_hash for session-scoped isolation.
     /// When restoring, skip snapshots that belong to a different session.
     pub(super) session_tags: Mutex<std::collections::HashMap<usize, u64>>,
@@ -70,6 +77,84 @@ pub(crate) struct SsmSnapshotPool {
     /// (equals `max_batch_size`). A sequence's SSM-pool `slot_idx` must
     /// be `< decode_max_seqs` to use the decode region.
     pub(super) decode_max_seqs: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SnapshotCapacity {
+    marconi_h_bytes: usize,
+    marconi_conv_bytes: usize,
+    marconi_total_bytes: usize,
+    decode_region_slots: usize,
+    decode_h_bytes: usize,
+    decode_conv_bytes: usize,
+    decode_total_bytes: usize,
+}
+
+fn checked_capacity_mul(left: usize, right: usize, label: &str) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| anyhow!("SSM snapshot capacity overflow: {label} ({left} * {right})"))
+}
+
+fn checked_capacity_add(left: usize, right: usize, label: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| anyhow!("SSM snapshot capacity overflow: {label} ({left} + {right})"))
+}
+
+fn checked_snapshot_capacity(
+    num_slots: usize,
+    h_bytes: usize,
+    conv_bytes: usize,
+    num_ssm_layers: usize,
+    decode_ring_slots: usize,
+    decode_max_seqs: usize,
+) -> Result<SnapshotCapacity> {
+    if num_ssm_layers == 0 {
+        return Ok(SnapshotCapacity::default());
+    }
+    let marconi_enabled = num_slots > 0;
+    let decode_enabled = decode_ring_slots > 0 && decode_max_seqs > 0;
+    if !marconi_enabled && !decode_enabled {
+        return Ok(SnapshotCapacity::default());
+    }
+    if h_bytes == 0 {
+        bail!("SSM snapshot capacity: enabled h bytes must be positive");
+    }
+    if conv_bytes == 0 {
+        bail!("SSM snapshot capacity: enabled conv bytes must be positive");
+    }
+
+    let (marconi_h_bytes, marconi_conv_bytes, marconi_total_bytes) = if marconi_enabled {
+        let h = checked_capacity_mul(num_slots, h_bytes, "Marconi h bytes")?;
+        let conv = checked_capacity_mul(num_slots, conv_bytes, "Marconi conv bytes")?;
+        let per_layer = checked_capacity_add(h, conv, "Marconi per-layer bytes")?;
+        let total = checked_capacity_mul(per_layer, num_ssm_layers, "Marconi total bytes")?;
+        (h, conv, total)
+    } else {
+        (0, 0, 0)
+    };
+
+    let (decode_region_slots, decode_h_bytes, decode_conv_bytes, decode_total_bytes) =
+        if decode_enabled {
+            let region =
+                checked_capacity_mul(decode_max_seqs, decode_ring_slots, "decode region slots")?;
+            let h = checked_capacity_mul(region, h_bytes, "decode h bytes")?;
+            let conv = checked_capacity_mul(region, conv_bytes, "decode conv bytes")?;
+            let per_layer = checked_capacity_add(h, conv, "decode per-layer bytes")?;
+            let total = checked_capacity_mul(per_layer, num_ssm_layers, "decode total bytes")?;
+            (region, h, conv, total)
+        } else {
+            (0, 0, 0, 0)
+        };
+
+    Ok(SnapshotCapacity {
+        marconi_h_bytes,
+        marconi_conv_bytes,
+        marconi_total_bytes,
+        decode_region_slots,
+        decode_h_bytes,
+        decode_conv_bytes,
+        decode_total_bytes,
+    })
 }
 
 impl SsmSnapshotPool {
@@ -101,6 +186,11 @@ impl SsmSnapshotPool {
                 h_bytes,
                 conv_bytes,
                 num_ssm_layers,
+                h_f16_to_f32_k: crate::layers::try_kernel(
+                    gpu,
+                    "ssm_h_dtype",
+                    "ssm_h_state_f16_to_f32",
+                ),
                 session_tags: Mutex::new(std::collections::HashMap::new()),
                 decode_h_snapshots: Vec::new(),
                 decode_conv_snapshots: Vec::new(),
@@ -109,26 +199,32 @@ impl SsmSnapshotPool {
             });
         }
 
+        // Validate the complete geometry before the first allocation. An
+        // overflow must never wrap into a smaller apparently valid buffer.
+        let capacity = checked_snapshot_capacity(
+            num_slots,
+            h_bytes,
+            conv_bytes,
+            num_ssm_layers,
+            decode_ring_slots,
+            decode_max_seqs,
+        )?;
+
         let mut h_snapshots = Vec::new();
         let mut conv_snapshots = Vec::new();
         if marconi_enabled {
             for _ in 0..num_ssm_layers {
-                h_snapshots.push(gpu.alloc(num_slots * h_bytes)?);
-                conv_snapshots.push(gpu.alloc(num_slots * conv_bytes)?);
+                h_snapshots.push(gpu.alloc(capacity.marconi_h_bytes)?);
+                conv_snapshots.push(gpu.alloc(capacity.marconi_conv_bytes)?);
             }
         }
 
         let mut decode_h_snapshots = Vec::new();
         let mut decode_conv_snapshots = Vec::new();
-        let decode_region = if decode_enabled {
-            decode_max_seqs * decode_ring_slots
-        } else {
-            0
-        };
         if decode_enabled {
             for _ in 0..num_ssm_layers {
-                decode_h_snapshots.push(gpu.alloc(decode_region * h_bytes)?);
-                decode_conv_snapshots.push(gpu.alloc(decode_region * conv_bytes)?);
+                decode_h_snapshots.push(gpu.alloc(capacity.decode_h_bytes)?);
+                decode_conv_snapshots.push(gpu.alloc(capacity.decode_conv_bytes)?);
             }
         }
 
@@ -137,8 +233,8 @@ impl SsmSnapshotPool {
         } else {
             Vec::new()
         };
-        let marconi_mb = num_ssm_layers * num_slots * (h_bytes + conv_bytes) / (1024 * 1024);
-        let decode_mb = num_ssm_layers * decode_region * (h_bytes + conv_bytes) / (1024 * 1024);
+        let marconi_mb = capacity.marconi_total_bytes / (1024 * 1024);
+        let decode_mb = capacity.decode_total_bytes / (1024 * 1024);
         tracing::info!(
             "SSM snapshot pool: Marconi {num_slots} slots ({marconi_mb} MB), \
              decode-rollback {decode_ring_slots} slots × {decode_max_seqs} seqs \
@@ -153,6 +249,7 @@ impl SsmSnapshotPool {
             h_bytes,
             conv_bytes,
             num_ssm_layers,
+            h_f16_to_f32_k: KernelHandle(0),
             session_tags: Mutex::new(std::collections::HashMap::new()),
             decode_h_snapshots,
             decode_conv_snapshots,
@@ -254,10 +351,13 @@ impl SsmSnapshotPool {
     /// Save SSM state from active pool slot into a snapshot slot.
     /// Returns `None` if no free snapshot slots are available.
     /// Tags the snapshot with `session_hash` for session-scoped isolation.
+    /// `h_is_f16` is the storage dtype of the SOURCE slot, not of the snapshot.
+    /// Snapshots are always written FP32 (see `h_f16_to_f32_k`).
     pub(super) fn save(
         &self,
         ssm_slot: usize,
         session_hash: u64,
+        h_is_f16: bool,
         main_pool: &SsmStatePool,
         gpu: &dyn GpuBackend,
         stream: u64,
@@ -265,23 +365,47 @@ impl SsmSnapshotPool {
         if !self.is_enabled() {
             return Ok(None);
         }
+        if h_is_f16 && self.h_f16_to_f32_k.0 == 0 {
+            anyhow::bail!(
+                "ATLAS_SSM_H_FP16: cannot widen a decode-produced snapshot — \
+                 ssm_h_dtype::ssm_h_state_f16_to_f32 did not resolve on this target"
+            );
+        }
         let snap_slot = match self.free_slots.lock().pop() {
             Some(s) => s,
             None => return Ok(None),
         };
-        for i in 0..self.num_ssm_layers {
-            gpu.copy_d2d_async(
-                main_pool.h_state(i, ssm_slot),
-                self.h_snapshots[i].offset(snap_slot * self.h_bytes),
-                self.h_bytes,
-                stream,
-            )?;
-            gpu.copy_d2d_async(
-                main_pool.conv_state(i, ssm_slot),
-                self.conv_snapshots[i].offset(snap_slot * self.conv_bytes),
-                self.conv_bytes,
-                stream,
-            )?;
+        let copy_result: Result<()> = (|| {
+            for i in 0..self.num_ssm_layers {
+                let dst = self.h_snapshots[i].offset(snap_slot * self.h_bytes);
+                if h_is_f16 {
+                    // Widen on the way in so the snapshot is FP32 like every
+                    // other one. `n` is the FP32 ELEMENT count of the
+                    // destination, derived from the pool's byte size rather
+                    // than a duplicated shape literal.
+                    crate::layers::ops::ssm_h_state_f16_to_f32(
+                        gpu,
+                        self.h_f16_to_f32_k,
+                        main_pool.h_state(i, ssm_slot),
+                        dst,
+                        (self.h_bytes / 4) as u64,
+                        stream,
+                    )?;
+                } else {
+                    gpu.copy_d2d_async(main_pool.h_state(i, ssm_slot), dst, self.h_bytes, stream)?;
+                }
+                gpu.copy_d2d_async(
+                    main_pool.conv_state(i, ssm_slot),
+                    self.conv_snapshots[i].offset(snap_slot * self.conv_bytes),
+                    self.conv_bytes,
+                    stream,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            self.free(snap_slot);
+            return Err(error);
         }
         if session_hash != 0 {
             self.session_tags.lock().insert(snap_slot, session_hash);
@@ -330,6 +454,9 @@ impl SsmSnapshotPool {
 
     /// Return a snapshot slot to the free list.
     pub(super) fn free(&self, snap_slot: usize) {
+        // A free slot has no owner. Leaving the old tag behind makes a later
+        // untagged/legacy save look as if it belongs to the previous session.
+        self.session_tags.lock().remove(&snap_slot);
         self.free_slots.lock().push(snap_slot);
     }
 
@@ -349,3 +476,40 @@ impl SsmSnapshotPool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freeing_snapshot_clears_session_owner() {
+        let pool = SsmSnapshotPool {
+            h_snapshots: Vec::new(),
+            conv_snapshots: Vec::new(),
+            free_slots: Mutex::new(Vec::new()),
+            num_slots: 1,
+            h_bytes: 0,
+            conv_bytes: 0,
+            num_ssm_layers: 0,
+            h_f16_to_f32_k: KernelHandle(0),
+            session_tags: Mutex::new(HashMap::from([(0, 0xAABB)])),
+            decode_h_snapshots: Vec::new(),
+            decode_conv_snapshots: Vec::new(),
+            decode_ring_slots: 0,
+            decode_max_seqs: 0,
+        };
+
+        pool.free(0);
+
+        assert!(pool.session_tags.lock().is_empty());
+        assert_eq!(*pool.free_slots.lock(), vec![0]);
+    }
+}
+
+#[cfg(test)]
+#[path = "ssm_snapshot_failure_tests.rs"]
+mod failure_tests;
+
+#[cfg(test)]
+#[path = "ssm_snapshot_capacity_tests.rs"]
+mod capacity_tests;

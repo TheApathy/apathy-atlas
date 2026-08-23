@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -89,29 +89,25 @@ impl TransformerModel {
                     let meta_base = self.buffers.scratch().offset(32768);
                     let max_blocks = seq.block_table.len() as u32;
                     let pos_val = pos as u32;
-                    self.gpu
-                        .copy_h2d_async(&pos_val.to_le_bytes(), meta_base, stream)?;
+                    let pos_bytes = pos_val.to_le_bytes();
                     let block_idx = seq
                         .physical_block_for(pos / bs)
                         .unwrap_or(self.dummy_kv_block);
                     let global_slot = (block_idx as i64) * (bs as i64) + ((pos % bs) as i64);
-                    self.gpu.copy_h2d_async(
-                        &global_slot.to_le_bytes(),
-                        meta_base.offset(8),
-                        stream,
-                    )?;
+                    let slot_bytes = global_slot.to_le_bytes();
                     let actual_seq_len = (pos + 1) as i32;
-                    self.gpu.copy_h2d_async(
-                        &actual_seq_len.to_le_bytes(),
-                        meta_base.offset(16),
-                        stream,
-                    )?;
+                    let seq_len_bytes = actual_seq_len.to_le_bytes();
                     let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
                     let bt_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4)
                     };
-                    self.gpu
-                        .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
+                    let copies = [
+                        HostToDeviceCopy::new(&pos_bytes, meta_base),
+                        HostToDeviceCopy::new(&slot_bytes, meta_base.offset(8)),
+                        HostToDeviceCopy::new(&seq_len_bytes, meta_base.offset(16)),
+                        HostToDeviceCopy::new(bt_bytes, meta_base.offset(256)),
+                    ];
+                    self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
                     let attn_metadata = AttnMetadataDev {
                         positions: meta_base,
@@ -136,7 +132,7 @@ impl TransformerModel {
                         tree_aware_attn: None,
                         ssm_multi_seq_ptr_table_override: None,
                         self_spec_sparse_draft: None,
-            ffn_defer: None,
+                        ffn_defer: None,
                     };
 
                     let h_t = hidden.offset(t * h * fp32);
@@ -168,7 +164,7 @@ impl TransformerModel {
                     tree_aware_attn: None,
                     ssm_multi_seq_ptr_table_override: None,
                     self_spec_sparse_draft: None,
-            ffn_defer: None,
+                    ffn_defer: None,
                 };
 
                 layer.decode_batched(
@@ -296,6 +292,19 @@ impl TransformerModel {
         seq: &mut SequenceState,
         num_accepted: usize,
     ) -> Result<()> {
+        // GDN LAZY guard: under ATLAS_SSM_GDN_LAZY the ExactSequence kernel
+        // writes only inter[k-1]; every other slot this function would copy is
+        // GARBAGE. Our serving path commits through commit_verify_state_async
+        // (which replays instead) — reaching this sync rollback under the lazy
+        // flag means an unsupported route is live. Refuse loudly rather than
+        // restore garbage into h_state.
+        if crate::layers::qwen3_ssm::gdn_seq_lazy_enabled() {
+            anyhow::bail!(
+                "rollback_ssm_states: sync SSM rollback is unsupported under \
+                 ATLAS_SSM_GDN_LAZY=1 (sparse intermediates). This serving route \
+                 must commit via commit_verify_state_async."
+            );
+        }
         use crate::layer::SsmLayerState;
 
         let stream = self.gpu.default_stream();

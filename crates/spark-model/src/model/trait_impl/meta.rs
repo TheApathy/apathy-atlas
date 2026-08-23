@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -66,8 +66,10 @@ impl TransformerModel {
             .collect();
         let ptr_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(ptrs.as_ptr() as *const u8, ptrs.len() * 8) };
-        self.gpu
-            .copy_h2d_async(ptr_bytes, self.ssm_norm_ptrs_buf, stream)?;
+        self.gpu.copy_h2d_group_on_stream(
+            &[HostToDeviceCopy::new(ptr_bytes, self.ssm_norm_ptrs_buf)],
+            stream,
+        )?;
 
         let (num_heads, k_dim, v_dim) = self.config.ssm_state_norm_dims();
 
@@ -83,12 +85,150 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Flip this sequence's SSM h-state slots from FP32 to FP16
+    /// (`ATLAS_SSM_H_FP16`, stage 2). No-op unless the flag is set.
+    ///
+    /// TWO THINGS HERE ARE LOAD-BEARING AND BOTH FAIL SILENTLY IF CHANGED.
+    ///
+    /// 1. It must run OUTSIDE CUDA-graph capture. A conversion launched from
+    ///    inside a layer is captured into the graph and replayed on every
+    ///    later step, re-reading already-FP16 state as FP32. That does not
+    ///    crash — an FP32 bit pattern read as two halves is a plausible
+    ///    number — it produces fluent, degenerate output. Hence a method on
+    ///    the model, called at decode entry, never from a layer.
+    ///
+    /// 2. The stream is the BACKEND's, not the caller's. On a caller stream
+    ///    the conversion is unordered against the decode kernels that read the
+    ///    state, and two sequences can interleave through the same scratch.
+    ///    Upstream measured NaN h-states on a concurrency-dependent subset
+    ///    (7/16 at C=16, clean at C<=8).
+    ///
+    /// The conversion is a narrowing compaction and cannot be done in place —
+    /// thread `2i`'s write lands inside thread `i`'s read — so it stages
+    /// through a one-layer scratch and copies back.
+    /// Is this sequence's SSM h-state currently stored FP16?
+    ///
+    /// Read from the sequence's own layer state rather than inferred from the
+    /// env flag: a slot that has only PREFILLED is still FP32 even with
+    /// `ATLAS_SSM_H_FP16=1`, and the snapshot save path must widen only what is
+    /// actually narrow.
+    pub(crate) fn seq_h_is_f16(seq: &SequenceState) -> bool {
+        seq.layer_states.iter().any(|ls| {
+            ls.as_any()
+                .downcast_ref::<SsmLayerState>()
+                .is_some_and(|s| s.h_is_f16)
+        })
+    }
+
+    /// Widen one layer's FP16 h-state into an FP32 scratch buffer.
+    ///
+    /// Returns the scratch pointer, valid until the next call. Callers that
+    /// need the bytes must consume them before widening another layer — the
+    /// disk-swap path does, copying D2H immediately.
+    ///
+    /// Exists so the swap FILE stays FP32 and therefore dtype-agnostic; see the
+    /// call site in `save_sequence_state_dispatch`.
+    pub(crate) fn widen_h_to_f32_scratch(
+        &self,
+        gpu: &dyn GpuBackend,
+        src: DevicePtr,
+    ) -> Result<DevicePtr> {
+        if self.ssm_h_f16_to_f32_kernel.0 == 0 {
+            bail!(
+                "ATLAS_SSM_H_FP16: ssm_h_dtype::ssm_h_state_f16_to_f32 did not resolve on this \
+                 target — refusing to serialize a half-width h-state into an FP32 swap file."
+            );
+        }
+        let h_bytes = self.ssm_pool.h_bytes;
+        let dst = match self.ssm_h_f32_scratch.get() {
+            Some(p) => *p,
+            None => {
+                let p = gpu.alloc(h_bytes)?;
+                let _ = self.ssm_h_f32_scratch.set(p);
+                p
+            }
+        };
+        let stream = gpu.default_stream();
+        crate::layers::ops::ssm_h_state_f16_to_f32(
+            gpu,
+            self.ssm_h_f16_to_f32_kernel,
+            src,
+            dst,
+            (h_bytes / 4) as u64,
+            stream,
+        )?;
+        gpu.synchronize(stream)?;
+        Ok(dst)
+    }
+
+    pub(crate) fn ssm_h_to_f16_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        if !crate::layers::qwen3_ssm::ssm_h_fp16_enabled() || self.ssm_pool.num_ssm_layers == 0 {
+            return Ok(());
+        }
+        let pending = seq.layer_states.iter().any(|ls| {
+            ls.as_any()
+                .downcast_ref::<SsmLayerState>()
+                .is_some_and(|s| !s.h_is_f16)
+        });
+        if !pending {
+            return Ok(());
+        }
+        if self.ssm_h_f32_to_f16_kernel.0 == 0 {
+            bail!(
+                "ATLAS_SSM_H_FP16: ssm_h_dtype::ssm_h_state_f32_to_f16 did not resolve on this \
+                 target — refusing to run FP16 decode kernels over an FP32 pool."
+            );
+        }
+        let stream = self.gpu.default_stream();
+        let h_bytes = self.ssm_pool.h_bytes;
+        let f16_bytes = h_bytes / 2;
+        let scratch = match self.ssm_h_f16_scratch.get() {
+            Some(p) => *p,
+            None => {
+                let p = self.gpu.alloc(f16_bytes)?;
+                let _ = self.ssm_h_f16_scratch.set(p);
+                p
+            }
+        };
+        for ls in seq.layer_states.iter_mut() {
+            let Some(st) = ls.as_any_mut().downcast_mut::<SsmLayerState>() else {
+                continue;
+            };
+            if st.h_is_f16 {
+                continue;
+            }
+            crate::layers::ops::ssm_h_state_f32_to_f16(
+                self.gpu.as_ref(),
+                self.ssm_h_f32_to_f16_kernel,
+                st.h_state,
+                scratch,
+                (h_bytes / 4) as u64,
+                stream,
+            )?;
+            self.gpu
+                .copy_d2d_async(scratch, st.h_state, f16_bytes, stream)?;
+            st.h_is_f16 = true;
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_gpu_to_thread_dispatch(&self) -> Result<()> {
         self.gpu.bind_to_thread()
     }
 
     pub(super) fn alloc_sequence_dispatch(&self) -> Result<SequenceState> {
+        let alloc_t0 = std::time::Instant::now();
+        let mut alloc_ms: Vec<(&str, f64)> = Vec::new();
+        let alloc_on = std::env::var("ATLAS_PREFILL_PHASE_PROFILE").ok().as_deref() == Some("1");
+        macro_rules! alloc_mark {
+            ($name:expr) => {
+                if alloc_on {
+                    alloc_ms.push(($name, alloc_t0.elapsed().as_secs_f64() * 1000.0));
+                }
+            };
+        }
         let slot = self.ssm_pool.claim_slot()?;
+        alloc_mark!("claim_slot");
         // Zero SSM state to prevent stale h_state/conv_state from prior
         // sequences corrupting the recurrent computation during prefill.
         // CRITICAL: use Atlas's own stream (not stream 0) because Atlas's stream
@@ -96,9 +236,13 @@ impl TransformerModel {
         // Using stream 0 would race with the subsequent prefill kernel.
         let stream = self.gpu.default_stream();
         self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
+        alloc_mark!("zero_slot");
         // Ensure zero completes before any prefill kernels touch this slot.
         self.gpu.synchronize(stream)?;
-        let has_mtp = self.proposer.is_some() || self.self_speculative;
+        alloc_mark!("zero_slot_sync");
+        // Capability, not arm selection: the SSM checkpoint/intermediate
+        // buffers must exist if EITHER arm can speculate on this sequence.
+        let has_mtp = self.any_proposer() || self.self_speculative;
 
         // Build layer states: SSM layers point into the pool (fixed addresses),
         // attention layers use their own alloc_state (EmptyLayerState).
@@ -117,6 +261,7 @@ impl TransformerModel {
                     conv_state_intermediates: Vec::new(),
                     wy17_kv_retain: None,
                     wy17_gate_retain: None,
+                    h_is_f16: false,
                 };
 
                 if has_mtp {
@@ -154,13 +299,38 @@ impl TransformerModel {
         // Synchronous reset: memset + stream sync ensures zero is visible
         // before any subsequent kernel reads the state.
         self.ssm_pool.reset_slot(slot, self.gpu.as_ref())?;
+        alloc_mark!("reset_slot");
         // Double-check: explicit sync to guarantee zero is complete
         self.gpu.synchronize(self.gpu.default_stream())?;
+        alloc_mark!("reset_slot_sync");
 
-        // Allocate MTP proposer state (owns its own KV cache block table)
-        let proposer_state = match &self.proposer {
+        // Allocate proposer state (owns its own KV cache block table) for
+        // EVERY installed arm, not just the live one: an arm switch mid-run
+        // moves `proposer_state_alt` into `proposer_state`, and allocating
+        // the second arm's state lazily at that moment would put a device
+        // allocation on the switch path — inside the scheduler's step loop,
+        // where it can fail and where the cost would be misattributed to the
+        // arm being switched TO.
+        //
+        // On single-proposer builds `proposer_alt` is None, so this allocates
+        // exactly what it always did and `state_alt` stays None.
+        let state_primary = match &self.proposer {
             Some(p) => Some(p.alloc_state(self.gpu.as_ref())?),
             None => None,
+        };
+        alloc_mark!("proposer_state");
+        let state_secondary = match &self.proposer_alt {
+            Some(p) => Some(p.alloc_state(self.gpu.as_ref())?),
+            None => None,
+        };
+        alloc_mark!("proposer_state_alt");
+        // Maintain the invariant that `proposer_state` belongs to the LIVE
+        // arm: a sequence admitted while the gate sits on arm 1 must come up
+        // with arm 1's state in the active slot.
+        let (proposer_state, proposer_state_alt) = if self.proposer_arm() == 1 {
+            (state_secondary, state_primary)
+        } else {
+            (state_primary, state_secondary)
         };
 
         // No graph invalidation needed — pool addresses are stable across sequences.
@@ -172,12 +342,27 @@ impl TransformerModel {
         // so the layer-0 offload helper doesn't need to grow a Vec on
         // every sequence's first decode step.
         let num_attn_layers = self.config.num_attention_layers();
+        alloc_mark!("build_state");
+        if alloc_on {
+            let mut joined: Vec<String> = Vec::with_capacity(alloc_ms.len());
+            let mut prev = 0.0f64;
+            for (name, t) in &alloc_ms {
+                joined.push(format!("{name}={:.1}", t - prev));
+                prev = *t;
+            }
+            tracing::info!(
+                "ALLOC_SEQUENCE | total={:.1} | {}",
+                alloc_t0.elapsed().as_secs_f64() * 1000.0,
+                joined.join(" ")
+            );
+        }
         Ok(SequenceState {
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
             layer_states,
             proposer_state,
+            proposer_state_alt,
             slot_idx: slot,
             marconi_skip_to: 0,
             session_hash: 0,

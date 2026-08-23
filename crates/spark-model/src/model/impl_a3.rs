@@ -27,17 +27,6 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
-/// Returns true if the LM-head triple-GEMV fast path is enabled via
-/// `ATLAS_LM_HEAD_BATCH3=1`. Default off for A/B safety until verified.
-fn lm_head_batch3_enabled() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("ATLAS_LM_HEAD_BATCH3")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 /// Verify-side LM-head vocab truncation cap (`ATLAS_TARGET_LMHEAD_VOCAB`).
 ///
 /// The TARGET model's verify `lm_head` GEMV computes logits over the FULL
@@ -60,6 +49,63 @@ pub(super) fn target_lmhead_vocab() -> u32 {
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(0)
     })
+}
+
+/// `ATLAS_LM_HEAD_TC=1` routes the target verify lm_head (M=2..=32) through
+/// the transposed-NVFP4 m32_n64 tensor-core kernel (`w4a16_gemm_t_m32_n64`)
+/// instead of the byte-exact scalar-FMA family. This is the same kernel the
+/// DFlash drafter already uses for its propose head (`draft_lm_head_nvfp4_t`),
+/// so the weight layout and MMA rounding are proven coherent; the target
+/// committed token may differ from the scalar oracle by MMA-vs-FMA rounding
+/// (a re-reference in the same class as `ATLAS_FFN_TC=1`). Default OFF: the
+/// exact scalar path remains the commit authority until this is qualified.
+pub(super) fn lm_head_tc_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var("ATLAS_LM_HEAD_TC").ok().as_deref() == Some("1"))
+}
+
+fn log_lm_head_tc_engagement(rows: u32, vocab: u32, hidden: u32) {
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            target: "atlas::lm_head",
+            route = "tc_m32_n64",
+            rows,
+            vocab,
+            hidden,
+            output_dtype = "bf16",
+            output_layout = "row_major",
+            "LM_HEAD_TC_ENGAGEMENT"
+        );
+    }
+}
+
+fn log_exact_lm_head_engagement(route: ops::ExactLmHeadRoute, rows: u32, vocab: u32, hidden: u32) {
+    static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let tier_bit = match route.tier() {
+        ops::ExactLmHeadTier::M4 => 0,
+        ops::ExactLmHeadTier::M8 => 1,
+        ops::ExactLmHeadTier::M17 => 2,
+        ops::ExactLmHeadTier::M32 => 3,
+    };
+    let route_bit = match route {
+        ops::ExactLmHeadRoute::Exact(_) => tier_bit,
+        ops::ExactLmHeadRoute::SerialK1(_) => tier_bit + 4,
+    };
+    let mask = 1u8 << route_bit;
+    if SEEN.fetch_or(mask, std::sync::atomic::Ordering::Relaxed) & mask == 0 {
+        tracing::info!(
+            target: "atlas::lm_head",
+            route = route.provenance(),
+            tier = route.tier().label(),
+            rows,
+            vocab,
+            hidden,
+            output_dtype = "bf16",
+            output_layout = "row_major",
+            "LM_HEAD_EXACT_ENGAGEMENT"
+        );
+    }
 }
 
 impl TransformerModel {
@@ -177,7 +223,6 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let h = self.config.hidden_size as u32;
-        let v_full = self.config.vocab_size as u32;
         // Verify-side vocab truncation: shrink the logical GEMM/GEMV output
         // dimension (and the matching argmax range in the scheduler) to the
         // first `v` rows. BPE places frequent tokens at low IDs, so reading
@@ -185,35 +230,19 @@ impl TransformerModel {
         // quality risk for `v` large enough to cover normal text.
         // `verify_lmhead_vocab()` returns the full vocab when truncation is
         // disabled (`ATLAS_TARGET_LMHEAD_VOCAB` unset / 0 / ≥ vocab).
-        //
-        // SCOPE: applies to BOTH verify families —
-        //   * small-batch GEMV (num_tokens ≤ 3 — MTP K=2/K=3): the NVFP4
-        //     weight is row-major over vocab, so the first `v` rows are
-        //     contiguous; the kernel simply outputs fewer rows.
-        //   * K=γ DFlash transposed GEMM (num_tokens > 3): the kernel
-        //     `w4a16_gemm_t_m32_n64` separates the physical B-row stride
-        //     (`ldb`) from the logical output width (`N`). The transposed
-        //     weight `lm_head_nvfp4_t` is padded/transposed at FULL vocab, so
-        //     `ldb` MUST stay `v_full`-derived (`v_full_pad` below) to read
-        //     the weight correctly — but passing a truncated logical `N`
-        //     makes the kernel compute/store only the first `N` vocab columns
-        //     (C-store guard `c < N`) and launch `ceil(N/64)` CTAs instead of
-        //     `ceil(v_full/64)`. First-N columns of the transpose are exactly
-        //     the low BPE IDs, so this is a correct truncation, not a
-        //     mis-stride. See `w4a16_gemm.cu::w4a16_gemm_t_m32_n64`.
         let v = self.verify_lmhead_vocab();
-        // Physical B-row stride for the transposed lm_head: ALWAYS the full
-        // 64-padded vocab (the weight was built at full vocab). Never derive
-        // this from the truncated `v`.
-        let v_full_pad = v_full.div_ceil(64) * 64;
         let logits = self.buffers.logits();
-        if num_tokens == 2 {
-            // Double-GEMV: reads weights once, computes 2 outputs.
-            // GEMM M=2 with 64×64 tiles wastes 97% of M-dimension → ~3× slower.
-            if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-                ops::w4a16_gemv_batch2(
+        if let Some(ref nvfp4) = self.lm_head_nvfp4 {
+            anyhow::ensure!(
+                (1..=32).contains(&num_tokens),
+                "NVFP4 speculative LM-head rows must be in 1..=32, got {num_tokens}"
+            );
+            if num_tokens == 1 {
+                // A one-row tail (for example, a chunked diagnostic verify)
+                // stays on the ordinary qualified K1 LM-head path.
+                ops::w4a16_gemv(
                     self.gpu.as_ref(),
-                    self.w4a16_gemv_batch2_kernel,
+                    self.w4a16_gemv_kernel,
                     hidden,
                     nvfp4,
                     logits,
@@ -221,91 +250,88 @@ impl TransformerModel {
                     h,
                     stream,
                 )?;
-            } else {
-                // Dense fallback: 2× GEMV. Stays BF16 even when
-                // use_fp32_logits is on — the FP32 path is decode-only
-                // (single-token `lm_head`); batched-decode/prefill keeps
-                // BF16 because the bug it fixes only manifests at decode
-                // step 1 (first-token argmax tiebreak).
-                ops::dense_gemv(
+            } else if lm_head_tc_enabled()
+                && self.lm_head_nvfp4_t.is_some()
+                && self.w4a16_gemm_t_m32_n64_kernel.0 != 0
+            {
+                // ATLAS_LM_HEAD_TC=1: tensor-core m32_n64 route over the
+                // transposed NVFP4 weight — the same kernel + layout the
+                // DFlash drafter uses for its propose head, so the MMA
+                // rounding and packing are proven coherent. ldb is the
+                // 64-padded vocab stride (== vocab for 248320). Output stays
+                // row-major [M, v]. Re-reference class: ATLAS_FFN_TC=1.
+                let ldb = (self.config.vocab_size.div_ceil(64) * 64) as u32;
+                log_lm_head_tc_engagement(num_tokens, v, h);
+                ops::w4a16_gemm_n64_m32_ldb(
                     self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
+                    self.w4a16_gemm_t_m32_n64_kernel,
                     hidden,
-                    &self.lm_head_weight,
+                    self.lm_head_nvfp4_t.as_ref().expect("checked above"),
                     logits,
+                    num_tokens,
                     v,
                     h,
+                    ldb,
                     stream,
                 )?;
-                ops::dense_gemv(
-                    self.gpu.as_ref(),
-                    self.dense_gemv_kernel,
-                    hidden.offset(h as usize * 2),
-                    &self.lm_head_weight,
-                    logits.offset(v as usize * 2),
-                    v,
-                    h,
-                    stream,
-                )?;
+            } else {
+                let route = self
+                    .w4a16_exact_lm_head_kernels
+                    .route_for_rows(num_tokens)
+                    .expect("NVFP4 M=2..=32 has an exact tier");
+                log_exact_lm_head_engagement(route, num_tokens, v, h);
+                match route {
+                    ops::ExactLmHeadRoute::Exact(_) => {
+                        ops::w4a16_gemv_batch_logits_exact(
+                            self.gpu.as_ref(),
+                            self.w4a16_exact_lm_head_kernels,
+                            hidden,
+                            nvfp4,
+                            logits,
+                            num_tokens,
+                            v,
+                            h,
+                            stream,
+                        )?;
+                    }
+                    ops::ExactLmHeadRoute::SerialK1(_) => {
+                        // Missing exact symbols fail closed to M independent
+                        // ordinary K1 GEMVs. Row-major output uses the logical
+                        // (possibly truncated) vocab as its stride.
+                        for row in 0..num_tokens {
+                            ops::w4a16_gemv(
+                                self.gpu.as_ref(),
+                                self.w4a16_gemv_kernel,
+                                hidden.offset(row as usize * h as usize * 2),
+                                nvfp4,
+                                logits.offset(row as usize * v as usize * 2),
+                                v,
+                                h,
+                                stream,
+                            )?;
+                        }
+                    }
+                }
             }
-        } else if num_tokens == 3
-            && self.lm_head_nvfp4.is_some()
-            && self.w4a16_gemv_batch3_logits_kernel.0 != 0
-            && lm_head_batch3_enabled()
-        {
-            // K=3 verify path: replace the M=3 fallback through `w4a16_gemm`
-            // (M-tile=64 wastes ~95% of M-dim at M=3 → 18.7 ms measured for
-            // 715 MB weight read, 7× off the 2.6 ms bandwidth-bound floor).
-            // The dedicated triple-GEMV reads each weight row once and FMAs
-            // against all 3 input rows simultaneously, matching the M=2
-            // batch GEMV pattern already in use just above.
-            let nvfp4 = self.lm_head_nvfp4.as_ref().expect("checked above");
-            ops::w4a16_gemv_batch3_logits(
+        } else if num_tokens == 2 {
+            // Preserve dense M=2 as two BF16 GEMVs. The FP32 logits path is
+            // decode-only and does not apply to batched verification.
+            ops::dense_gemv(
                 self.gpu.as_ref(),
-                self.w4a16_gemv_batch3_logits_kernel,
+                self.dense_gemv_kernel,
                 hidden,
-                nvfp4,
+                &self.lm_head_weight,
                 logits,
                 v,
                 h,
                 stream,
             )?;
-        } else if num_tokens > 3
-            && num_tokens <= 32
-            && self.lm_head_nvfp4_t.is_some()
-            && self.w4a16_gemm_t_m32_n64_kernel.0 != 0
-        {
-            // K=γ verify: transposed m32_n64 lm_head — single coalesced
-            // weight read vs the plain kernel's strided ~5×-floor access
-            // at M=17 (ATLAS_LM_HEAD_T=1 builds the T-copy at load).
-            let nvfp4_t = self.lm_head_nvfp4_t.as_ref().unwrap();
-            // ldb = 64-padded FULL vocab: transpose_for_gemm built the B-row
-            // stride at full vocab (`v_full_pad`) so cp.async stays 16B-aligned
-            // at the odd 248320 vocab. `v` is the logical output width — it may
-            // be the truncated `ATLAS_TARGET_LMHEAD_VOCAB` cap, which makes the
-            // kernel compute/store only the first `v` columns and launch
-            // ceil(v/64) CTAs, while still reading the weight at the full
-            // physical `v_full_pad` stride.
-            ops::w4a16_gemm_n64_m32_ldb(
+            ops::dense_gemv(
                 self.gpu.as_ref(),
-                self.w4a16_gemm_t_m32_n64_kernel,
-                hidden,
-                nvfp4_t,
-                logits,
-                num_tokens,
-                v,
-                h,
-                v_full_pad,
-                stream,
-            )?;
-        } else if let Some(ref nvfp4) = self.lm_head_nvfp4 {
-            ops::w4a16_gemm(
-                self.gpu.as_ref(),
-                self.w4a16_gemm_kernel,
-                hidden,
-                nvfp4,
-                logits,
-                num_tokens,
+                self.dense_gemv_kernel,
+                hidden.offset(h as usize * 2),
+                &self.lm_head_weight,
+                logits.offset(v as usize * 2),
                 v,
                 h,
                 stream,

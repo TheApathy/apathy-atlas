@@ -25,7 +25,39 @@ use crate::layer::{
 use crate::layers::ops;
 use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
+use crate::traits::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpVerifyKgCommitPlan {
+    num_accepted: usize,
+    total_accepted: usize,
+    drop_tokens: usize,
+}
+
+/// Decode the rank-0 result frame into the worker's sequence-state action.
+/// `k` includes the prefix input, while `num_accepted` counts drafts only.
+fn ep_verify_kgamma_commit_plan(k: usize, result: u32) -> Result<Option<EpVerifyKgCommitPlan>> {
+    if result == EP_VERIFY_KGAMMA_ABORT {
+        return Ok(None);
+    }
+    if k == 0 {
+        bail!("EP K=gamma verify received an empty token frame");
+    }
+    let num_accepted = result as usize;
+    if num_accepted >= k {
+        bail!(
+            "EP K=gamma verify result {num_accepted} exceeds the {} available drafts",
+            k - 1
+        );
+    }
+    let total_accepted = num_accepted + 1;
+    Ok(Some(EpVerifyKgCommitPlan {
+        num_accepted,
+        total_accepted,
+        drop_tokens: k - total_accepted,
+    }))
+}
 
 impl TransformerModel {
     pub(super) fn comm_ref(&self) -> Option<&dyn spark_comm::CommBackend> {
@@ -45,17 +77,6 @@ impl TransformerModel {
             _ => crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID,
         };
         tokens.contains(&pad_id)
-    }
-
-    /// Free pinned host memory on model destruction.
-    pub(super) fn drop_pinned_staging(&self) {
-        // SAFETY: Called from Drop, which runs on the owning thread.
-        let staging = unsafe { &*self.pinned_staging.get() };
-        if !staging.ptr.is_null()
-            && let Err(e) = self.gpu.free_host_pinned(staging.ptr, staging.bytes)
-        {
-            tracing::warn!("Failed to free pinned staging: {e}");
-        }
     }
 
     pub(super) fn ensure_chunked_prefill_meta<'a>(
@@ -204,6 +225,8 @@ impl TransformerModel {
     /// - 0xFFFFFFF2: verify K=2 → next 2 broadcasts = tokens, then accept/reject
     /// - 0xFFFFFFF3: verify K=3 → next 3 broadcasts = tokens, then num_accepted
     /// - 0xFFFFFFF4: verify K=4 → next 4 broadcasts = tokens, then num_accepted
+    /// - 0xFFFFFFF5: verify K=gamma → next broadcast = K, then K bulk tokens,
+    ///   then num_accepted (or abort sentinel)
     /// - 0xFFFFFFFF: shutdown
     pub(super) fn ep_worker_step_impl(&self, seq: &mut SequenceState) -> Result<bool> {
         let cmd = self.ep_broadcast_u32(0)?;
@@ -313,6 +336,48 @@ impl TransformerModel {
                     }
                 }
             }
+            EP_CMD_VERIFY_KGAMMA => {
+                // Variable-width flat-chain verify. Rank 0 is the only
+                // proposer/sampler, but every EP rank must execute the same
+                // target forward in lockstep for the MoE collectives.
+                let k = self.ep_broadcast_u32(0)? as usize;
+                if k == 0 {
+                    bail!("EP K=gamma verify received k=0");
+                }
+                let tokens = self.ep_broadcast_tokens(&vec![0u32; k])?;
+                let pre_verify_len = seq.seq_len;
+                self.sync_secondary()?;
+                self.decode_verify_dflash(&tokens, seq, stream)?;
+
+                let result = self.ep_broadcast_u32(0)?;
+                let Some(plan) = ep_verify_kgamma_commit_plan(k, result)? else {
+                    // Rank 0 could not derive/commit a valid acceptance result.
+                    // The canonical recurrent checkpoint was never changed by
+                    // verify; discard only the over-extended token metadata and
+                    // wait for rank 0's normal free/realloc lifecycle command.
+                    seq.seq_len = pre_verify_len;
+                    seq.tokens.truncate(pre_verify_len);
+                    self.clear_ddtree_parent_ids();
+                    return Ok(true);
+                };
+
+                let target_seq_len = pre_verify_len + plan.total_accepted;
+                if seq.seq_len < target_seq_len || seq.tokens.len() < target_seq_len {
+                    bail!(
+                        "EP K=gamma verify produced short sequence state: seq_len={} tokens={} target={target_seq_len}",
+                        seq.seq_len,
+                        seq.tokens.len()
+                    );
+                }
+                seq.seq_len = target_seq_len;
+                seq.tokens.truncate(target_seq_len);
+                // Use the same arbitrary-K commit implementation as rank 0.
+                // Unlike the legacy fixed-K worker rollback, this consumes the
+                // graph-safe flat-tree route flag and handles lazy WY replay.
+                self.commit_verify_state_async(seq, plan.total_accepted, k)?;
+                self.trim_proposer_state(seq, plan.num_accepted, 0)?;
+                self.clear_ddtree_parent_ids();
+            }
             token => {
                 // Regular decode
                 self.decode(token, seq, stream)?;
@@ -320,5 +385,41 @@ impl TransformerModel {
         }
 
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod ep_verify_kgamma_tests {
+    use super::{EpVerifyKgCommitPlan, ep_verify_kgamma_commit_plan};
+    use crate::traits::EP_VERIFY_KGAMMA_ABORT;
+
+    #[test]
+    fn abort_discards_the_variable_width_verify() {
+        assert_eq!(
+            ep_verify_kgamma_commit_plan(17, EP_VERIFY_KGAMMA_ABORT).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn every_accept_depth_has_symmetric_trim_and_commit_counts() {
+        let k = 5;
+        for num_accepted in 0..k {
+            assert_eq!(
+                ep_verify_kgamma_commit_plan(k, num_accepted as u32).unwrap(),
+                Some(EpVerifyKgCommitPlan {
+                    num_accepted,
+                    total_accepted: num_accepted + 1,
+                    drop_tokens: k - num_accepted - 1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_variable_width_results_fail_closed() {
+        assert!(ep_verify_kgamma_commit_plan(0, 0).is_err());
+        assert!(ep_verify_kgamma_commit_plan(4, 4).is_err());
+        assert!(ep_verify_kgamma_commit_plan(4, 99).is_err());
     }
 }

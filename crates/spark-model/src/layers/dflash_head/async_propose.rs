@@ -51,6 +51,8 @@
 use anyhow::Result;
 use spark_runtime::gpu::GpuBackend;
 
+use super::draft_budget::{DflashDraftBudget, clear_proposal_outputs, finalize_proposal};
+use super::forward_block::checked_topk_difference;
 use super::{BlockDiffusionDraftHead, DflashProposerState};
 
 /// Master gate: `ATLAS_DFLASH_ASYNC=1` (default OFF). Cached.
@@ -132,7 +134,11 @@ impl AsyncEnvEligibility {
             tree_method: flag("ATLAS_DFLASH_BRANCH") || flag("ATLAS_DFLASH_CATERPILLAR"),
             portfolio: flag("ATLAS_DFLASH_PORTFOLIO"),
             cfg_jf: flag("ATLAS_DFLASH_CFG_JF"),
-            kprofile: flag("ATLAS_DFLASH_KERNEL_PROFILE"),
+            // Shared with forward_block: ATLAS_FULL_PROFILE=1 also turns the
+            // propose profiler on, and profiling requires the synchronous path
+            // (async defers the syncs the per-kernel timers depend on), so the
+            // async-eligibility check below must see the same value.
+            kprofile: super::kernel_profile_enabled(),
             debug_dump: flag("ATLAS_DFLASH_DEBUG_DUMP")
                 || flag("ATLAS_DFLASH_DEBUG_DUMP_FULL")
                 || flag("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS"),
@@ -206,7 +212,7 @@ pub struct AsyncDDTreeMeta {
     pub margin_thresh: f32,
     /// Post-cliff continuation tail length (ATLAS_DFLASH_FREE_SLOTS_TAIL).
     pub tail_len: usize,
-    /// max_nodes cap for `build_free_slots_payload` (from ATLAS_DDTREE_MAX_NODES).
+    /// Immutable outer node cap for `build_free_slots_payload`.
     pub max_nodes: usize,
 }
 
@@ -218,8 +224,8 @@ pub struct AsyncInflight {
     /// the sequence's lifetime). Matched at collect so a different sequence
     /// never consumes another's drafts.
     pub owner: usize,
-    /// Number of drafts to D2H from `scratch.draft_tokens_dev` at collect.
-    pub gamma_eff: usize,
+    /// Exact public/trained/physical limits resolved by the launch call.
+    pub budget: DflashDraftBudget,
     /// Stream the drafter kernels were enqueued on.
     pub stream: u64,
     /// When Some, a top-K GPU kernel was also enqueued on `stream` and the
@@ -230,6 +236,16 @@ pub struct AsyncInflight {
 /// Stable identity for a proposer state (Box contents don't move).
 pub fn dstate_id(dstate: &DflashProposerState) -> usize {
     dstate as *const DflashProposerState as usize
+}
+
+fn validate_async_collection(
+    launched: DflashDraftBudget,
+    current: Option<DflashDraftBudget>,
+) -> Result<()> {
+    if current != Some(launched) {
+        anyhow::bail!("DFlash async budget changed before collection")
+    }
+    launched.validate_flat_width(launched.flat)
 }
 
 // ── Telemetry (fire / collect / discard counters, logged periodically) ──
@@ -252,8 +268,9 @@ impl BlockDiffusionDraftHead {
     /// Lazily-created dedicated propose stream (non-blocking). `0` means
     /// creation failed → async permanently disabled for this process.
     fn propose_stream_lazy(&self, gpu: &dyn GpuBackend) -> u64 {
-        *self.async_propose_stream.get_or_init(|| {
-            match (gpu.create_stream(), gpu.create_event()) {
+        *self
+            .async_propose_stream
+            .get_or_init(|| match (gpu.create_stream(), gpu.create_event()) {
                 (Ok(s), Ok(e)) if s != 0 && e != 0 => {
                     self.async_order_event
                         .store(e, std::sync::atomic::Ordering::Release);
@@ -267,8 +284,7 @@ impl BlockDiffusionDraftHead {
                     );
                     0
                 }
-            }
-        })
+            })
     }
 
     /// Resolve (sync + discard) any in-flight async propose. Called before
@@ -314,11 +330,16 @@ impl BlockDiffusionDraftHead {
     pub(crate) fn resolve_async_inflight_impl(
         &self,
         gpu: &dyn GpuBackend,
-        dstate: Option<&mut DflashProposerState>,
+        mut dstate: Option<&mut DflashProposerState>,
     ) -> Result<()> {
         let taken = self.async_inflight.lock().take();
         if let Some(inflight) = taken {
-            gpu.synchronize(inflight.stream)?;
+            if let Err(error) = gpu.synchronize(inflight.stream) {
+                if let Some(ds) = dstate.as_deref_mut() {
+                    clear_proposal_outputs(ds);
+                }
+                return Err(error);
+            }
             ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 "DFLASH_ASYNC: resolved stale in-flight propose (owner={:#x})",
@@ -345,12 +366,13 @@ impl BlockDiffusionDraftHead {
         &self,
         last_token: u32,
         position: usize,
-        gamma_eff: usize,
+        budget: DflashDraftBudget,
         ctx: &crate::layer::ForwardContext,
         default_stream: u64,
         grammar_masked: bool,
         dstate: &mut DflashProposerState,
     ) -> Result<Option<Vec<u32>>> {
+        budget.validate_flat_width(budget.flat)?;
         if !dflash_async_enabled() {
             return Ok(None);
         }
@@ -399,8 +421,20 @@ impl BlockDiffusionDraftHead {
         // returning: no inflight handle exists yet, and the caller's sync
         // fallback would otherwise rewrite the shared scratch while the
         // partially-enqueued kernels are still running.
-        if let Err(e) = self.forward_block(last_token, position, ctx, pstream, dstate, true) {
-            let _ = gpu.synchronize(pstream);
+        if let Err(e) = self.forward_block(
+            last_token,
+            position,
+            budget.flat,
+            ctx,
+            pstream,
+            dstate,
+            true,
+        ) {
+            if let Err(sync_error) = gpu.synchronize(pstream) {
+                anyhow::bail!(
+                    "DFlash async enqueue failed ({e:#}) and stream drain failed ({sync_error:#})"
+                )
+            }
             return Err(e);
         }
 
@@ -409,8 +443,8 @@ impl BlockDiffusionDraftHead {
         // payload without a synchronous stream-sync+D2H during propose.
         // The forward_block logits (scratch.logits) are already enqueued on
         // pstream before this point, so ordering is guaranteed.
-        let ddtree_meta = build_async_ddtree_meta(gamma_eff).and_then(|meta| {
-            match self.enqueue_topk_on_stream(gpu, pstream, gamma_eff, meta.top_k) {
+        let ddtree_meta = build_async_ddtree_meta(budget).and_then(|meta| {
+            match self.enqueue_topk_on_stream(gpu, pstream, budget.flat, meta.top_k) {
                 Ok(()) => Some(meta),
                 Err(e) => {
                     tracing::warn!("DFLASH_ASYNC: top-K enqueue failed ({e:#}); no tree payload");
@@ -421,12 +455,12 @@ impl BlockDiffusionDraftHead {
 
         *self.async_inflight.lock() = Some(AsyncInflight {
             owner: dstate_id(dstate),
-            gamma_eff,
+            budget,
             stream: pstream,
             ddtree: ddtree_meta,
         });
         dstate.async_placeholder = true;
-        dstate.last_num_drafted = gamma_eff;
+        dstate.last_num_drafted = budget.flat;
         dstate.first_propose_done = true;
         dstate.pending_tree_payload = None;
         // cleared above; see mtp_step.rs drain after collect The collect
@@ -437,7 +471,7 @@ impl BlockDiffusionDraftHead {
         // ASYNC+DDTree to never fire tree verify steps).
         ASYNC_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log_telemetry();
-        Ok(Some(placeholder_drafts(gamma_eff, self.mask_token_id)))
+        Ok(Some(placeholder_drafts(budget.flat, self.mask_token_id)))
     }
 
     /// Collect the drafts of a previously-launched async propose for this
@@ -463,12 +497,15 @@ impl BlockDiffusionDraftHead {
             // verify/decode work touches the GPU.
             if let Some(stale) = guard.take() {
                 drop(guard);
-                gpu.synchronize(stale.stream)?;
+                if let Err(error) = gpu.synchronize(stale.stream) {
+                    clear_proposal_outputs(dstate);
+                    return Err(error);
+                }
                 ASYNC_DISCARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if dstate.async_placeholder {
-                dstate.async_placeholder = false;
                 tracing::warn!("DFLASH_ASYNC: orphaned placeholder — degrading to bootstrap");
+                clear_proposal_outputs(dstate);
                 return Ok(Some(Vec::new()));
             }
             return Ok(None);
@@ -477,9 +514,20 @@ impl BlockDiffusionDraftHead {
         drop(guard);
 
         // Single stream sync covers both forward_block and (if present) top-K.
-        gpu.synchronize(inflight.stream)?;
-        let mut host_buf = vec![0u8; inflight.gamma_eff * 4];
-        gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf)?;
+        if let Err(error) = gpu.synchronize(inflight.stream) {
+            clear_proposal_outputs(dstate);
+            return Err(error);
+        }
+        if validate_async_collection(inflight.budget, dstate.draft_budget).is_err() {
+            tracing::warn!("DFLASH_ASYNC: stale or invalid launch budget; degrading to bootstrap");
+            clear_proposal_outputs(dstate);
+            return Ok(Some(Vec::new()));
+        }
+        let mut host_buf = vec![0u8; inflight.budget.flat * 4];
+        if let Err(error) = gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf) {
+            clear_proposal_outputs(dstate);
+            return Err(error);
+        }
         let drafts: Vec<u32> = host_buf
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -488,72 +536,90 @@ impl BlockDiffusionDraftHead {
         // ATLAS_DFLASH_FREE_SLOTS: D2H the top-K and build the tree payload.
         // The stream is already synced above, so `collect_topk_d2h` reads
         // the completed GPU output without an additional sync.
-        if let Some(ref meta) = inflight.ddtree {
-            if drafts.len() >= 3 {
-                match self.collect_topk_d2h(gpu, inflight.gamma_eff, meta.top_k) {
-                    Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * drafts.len() => {
-                        let n = drafts.len();
-                        let margins: Vec<f32> = (0..n)
-                            .map(|r| topk_logits[2 * r] - topk_logits[2 * r + 1])
-                            .collect();
-                        let cliffs = super::ddtree::pick_free_slot_cliffs(
-                            &margins,
-                            meta.margin_thresh,
-                            meta.free_slots,
-                        );
-                        if !cliffs.is_empty() {
-                            let cliff_margins: Vec<f32> =
-                                cliffs.iter().map(|&d| margins[d - 1]).collect();
-                            tracing::debug!(
-                                "DFLASH_ASYNC collect: cliffs={:?} margins={:?} thresh={:.2}",
-                                cliffs,
-                                cliff_margins,
+        if let Some(ref meta) = inflight.ddtree
+            && drafts.len() >= 3
+        {
+            match self.collect_topk_d2h(gpu, inflight.budget.flat, meta.top_k) {
+                Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * drafts.len() => {
+                    let n = drafts.len();
+                    let margins: Result<Vec<f32>> = (0..n)
+                        .map(|r| {
+                            checked_topk_difference(topk_logits[2 * r], topk_logits[2 * r + 1])
+                        })
+                        .collect();
+                    match margins {
+                        Ok(margins) => {
+                            let cliffs = super::ddtree::pick_free_slot_cliffs(
+                                &margins,
                                 meta.margin_thresh,
+                                meta.free_slots,
                             );
+                            if !cliffs.is_empty() {
+                                let cliff_margins: Vec<f32> =
+                                    cliffs.iter().map(|&d| margins[d - 1]).collect();
+                                tracing::debug!(
+                                    "DFLASH_ASYNC collect: cliffs={:?} margins={:?} thresh={:.2}",
+                                    cliffs,
+                                    cliff_margins,
+                                    meta.margin_thresh,
+                                );
+                            }
+                            let branches: Vec<super::ddtree::FreeSlotBranch> = cliffs
+                                .iter()
+                                .filter_map(|&cliff_depth| {
+                                    let row = cliff_depth - 1;
+                                    let fork_token = topk_tokens[2 * row + 1];
+                                    if fork_token == drafts[row] {
+                                        return None;
+                                    }
+                                    let tail: Vec<u32> = drafts[(row + 1).min(n)..]
+                                        .iter()
+                                        .take(meta.tail_len)
+                                        .copied()
+                                        .collect();
+                                    Some(super::ddtree::FreeSlotBranch {
+                                        cliff_depth,
+                                        fork_token,
+                                        tail,
+                                    })
+                                })
+                                .collect();
+                            if !branches.is_empty() {
+                                dstate.pending_tree_payload =
+                                    Some(super::ddtree::build_free_slots_payload(
+                                        &drafts,
+                                        &branches,
+                                        meta.max_nodes,
+                                    ));
+                            }
                         }
-                        let branches: Vec<super::ddtree::FreeSlotBranch> = cliffs
-                            .iter()
-                            .filter_map(|&cliff_depth| {
-                                let row = cliff_depth - 1;
-                                let fork_token = topk_tokens[2 * row + 1];
-                                if fork_token == drafts[row] {
-                                    return None;
-                                }
-                                let tail: Vec<u32> = drafts[(row + 1).min(n)..]
-                                    .iter()
-                                    .take(meta.tail_len)
-                                    .copied()
-                                    .collect();
-                                Some(super::ddtree::FreeSlotBranch { cliff_depth, fork_token, tail })
-                            })
-                            .collect();
-                        if !branches.is_empty() {
-                            dstate.pending_tree_payload = Some(
-                                super::ddtree::build_free_slots_payload(
-                                    &drafts,
-                                    &branches,
-                                    meta.max_nodes,
-                                ),
+                        Err(error) => {
+                            tracing::warn!(
+                                "DFLASH_ASYNC: invalid top-K margins ({error:#}); no tree payload"
                             );
+                            dstate.pending_tree_payload = None;
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("DFLASH_ASYNC: top-K D2H failed ({e:#}); no tree payload");
-                    }
+                }
+                Ok(_) => {
+                    dstate.pending_tree_payload = None;
+                }
+                Err(e) => {
+                    tracing::warn!("DFLASH_ASYNC: top-K D2H failed ({e:#}); no tree payload");
+                    dstate.pending_tree_payload = None;
                 }
             }
         }
 
         dstate.async_placeholder = false;
         ASYNC_COLLECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Some(drafts))
+        Ok(Some(finalize_proposal(dstate, inflight.budget, drafts)))
     }
 }
 
 /// Build `AsyncDDTreeMeta` from env vars when ATLAS_DFLASH_FREE_SLOTS >= 1.
 /// Returns `None` when FREE_SLOTS is 0 or unset (no tree payload needed).
-fn build_async_ddtree_meta(gamma_eff: usize) -> Option<AsyncDDTreeMeta> {
+fn build_async_ddtree_meta(budget: DflashDraftBudget) -> Option<AsyncDDTreeMeta> {
     let free_slots: usize = std::env::var("ATLAS_DFLASH_FREE_SLOTS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -561,11 +627,6 @@ fn build_async_ddtree_meta(gamma_eff: usize) -> Option<AsyncDDTreeMeta> {
     if free_slots == 0 {
         return None;
     }
-    let ddtree_verify_cap: usize = std::env::var("ATLAS_DDTREE_MAX_NODES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let max_nodes = ddtree_verify_cap.saturating_sub(1).max(gamma_eff);
     Some(AsyncDDTreeMeta {
         top_k: 2,
         free_slots,
@@ -577,7 +638,7 @@ fn build_async_ddtree_meta(gamma_eff: usize) -> Option<AsyncDDTreeMeta> {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(4),
-        max_nodes,
+        max_nodes: budget.tree_nodes,
     })
 }
 
@@ -598,6 +659,7 @@ mod tests {
             retrieval: false,
             pld: false,
             recycle: false,
+            deeploop: false,
         }
     }
 
@@ -695,6 +757,19 @@ mod tests {
         ] {
             assert!(!async_launch_eligible(&f, false, false));
         }
+    }
+
+    #[test]
+    fn async_collection_rejects_changed_or_zero_budget() {
+        let launched = DflashDraftBudget::new(4, 15, 16).unwrap();
+        validate_async_collection(launched, Some(launched)).unwrap();
+        assert!(validate_async_collection(launched, None).is_err());
+        assert!(
+            validate_async_collection(launched, Some(DflashDraftBudget::new(3, 15, 16).unwrap()))
+                .is_err()
+        );
+        let zero = DflashDraftBudget::new(0, 15, 16).unwrap();
+        assert!(validate_async_collection(zero, Some(zero)).is_err());
     }
 
     #[test]

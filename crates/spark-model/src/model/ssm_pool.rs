@@ -16,6 +16,7 @@ use super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::ssm_pool_geometry::{SsmPoolGeometryInput, checked_ssm_pool_geometry};
 use super::ssm_snapshot::SsmSnapshotPool;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{
@@ -34,8 +35,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 pub(crate) struct SsmStatePool {
     pub(super) h_state_pools: Vec<DevicePtr>,
     pub(super) conv_state_pools: Vec<DevicePtr>,
-    /// Per-slot K=3 intermediate checkpoint pools (only allocated when has_mtp).
-    /// Layout: `[num_ssm_layers]`, each allocation = max_slots * 3 * h_bytes.
+    /// Per-slot intermediate state pools (only allocated when `has_mtp`).
+    /// Layout: `[num_ssm_layers]`, each allocation is sized by the checked
+    /// dummy-inclusive geometry authority.
     pub(super) h_intermediate_pools: Vec<DevicePtr>,
     pub(super) conv_intermediate_pools: Vec<DevicePtr>,
     /// Per-slot SSM state checkpoint pools (only allocated when has_mtp).
@@ -73,21 +75,18 @@ impl SsmStatePool {
         num_intermediates: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
-        let _d_conv = config.linear_conv_kernel_dim;
-
-        let h_bytes = config.ssm_h_state_bytes();
-        let conv_bytes = config.ssm_conv_state_bytes();
         let num_ssm_layers = config.num_ssm_layers();
-
-        // Reserve one extra slot at index `max_slots` as a dedicated
-        // dummy used by `decode_batch` / `mixed_forward` padding (see
-        // `dummy_slot()` below). Without this, pad positions write to
-        // pool slot indices `n..padded_n` which can collide with
-        // claimed slots if the scheduler invariant ("active sequences
-        // occupy contiguous slots [0..n)") is ever broken — silent SSM
-        // state corruption. Costs `(h_bytes + conv_bytes) *
-        // num_ssm_layers` extra GPU memory (~kilobytes per pool).
-        let total_slots = max_slots + 1;
+        let lazy_commit = crate::layers::wy17_lazy_commit();
+        let geometry = checked_ssm_pool_geometry(SsmPoolGeometryInput::from_config(
+            config,
+            max_slots,
+            has_mtp,
+            num_intermediates,
+            lazy_commit,
+        )?)?;
+        let total_slots = geometry.total_slots;
+        let h_bytes = geometry.h_bytes;
+        let conv_bytes = geometry.conv_bytes;
 
         let mut h_state_pools = Vec::with_capacity(num_ssm_layers);
         let mut conv_state_pools = Vec::with_capacity(num_ssm_layers);
@@ -98,36 +97,15 @@ impl SsmStatePool {
         let mut wy17_kv_retain_pools = Vec::new();
         let mut wy17_gate_retain_pools = Vec::new();
 
-        // WY17 LAZY-commit retention sizing. Retained buffers replicate the
-        // per-verify forward scratch (`conv_out_buf` / `gates_buf`) so the
-        // replay kernel can re-derive a skipped intermediate slot. Layout must
-        // match the wy17 kernel's `K_TOKENS`-strided reads: k/q/v = `[K,
-        // conv_dim]` BF16, gate/beta = `[K, 2*nv]` FP32, where K = the verify
-        // window (= num_intermediates). Only allocated when the lazy-commit
-        // gate is on to avoid the (small) memory cost on the default path.
-        let lazy_commit = crate::layers::wy17_lazy_commit();
-        let nk = config.linear_num_key_heads;
-        let kd = config.linear_key_head_dim;
-        let nv = config.linear_num_value_heads;
-        let vd = config.linear_value_head_dim;
-        let conv_dim = nk * kd * 2 + nv * vd;
-        let k_tokens = num_intermediates; // verify window K = γ+1
-        let kv_retain_bytes = if has_mtp && lazy_commit {
-            k_tokens * conv_dim * 2 // BF16
-        } else {
-            0
-        };
-        let gate_retain_bytes = if has_mtp && lazy_commit {
-            k_tokens * (2 * nv) * 4 // FP32
-        } else {
-            0
-        };
+        let kv_retain_bytes = geometry.kv_retain_bytes;
+        let gate_retain_bytes = geometry.gate_retain_bytes;
 
         // Predict the pool footprint BEFORE allocating any of it.
         //
         // These pools are the single largest allocation Atlas makes on a
         // hybrid-GDN model — larger than the weights. The size is
-        //   num_ssm_layers * total_slots * ni * (h_bytes + conv_bytes)
+        //   num_ssm_layers * total_slots * (ni + base + checkpoint)
+        //       * (h_bytes + conv_bytes), plus optional lazy retention
         // which is linear in BOTH the batch slots and the verify window
         // ni = γ+1. On Qwen3.8-27B (48 GDN layers, γ=16 → ni=33) that measured
         // 5.15 GB *per slot*: 25.2 GB at --max-batch-size 4, and ~85 GB at 16.
@@ -138,17 +116,8 @@ impl SsmStatePool {
         // *global* one: it takes down the host, not just this process
         // (observed 2026-08-14, --max-batch-size 16 → hard reboot).
         {
-            let per_slot = num_ssm_layers
-                * if has_mtp {
-                    num_intermediates * (h_bytes + conv_bytes)
-                        + h_bytes
-                        + conv_bytes
-                        + kv_retain_bytes
-                        + gate_retain_bytes
-                } else {
-                    h_bytes + conv_bytes
-                };
-            let predicted = total_slots.saturating_mul(per_slot);
+            let per_slot = geometry.bytes_per_layer_slot * num_ssm_layers;
+            let predicted = geometry.total_bytes;
             let free = gpu.free_memory().unwrap_or(0);
             tracing::info!(
                 "SSM pool pre-flight: {} layers × {} slots × (ni={}) = {:.1} GB predicted \
@@ -178,67 +147,73 @@ impl SsmStatePool {
         }
 
         for _ in 0..num_ssm_layers {
-            let h_pool = gpu.alloc(total_slots * h_bytes)?;
-            gpu.memset(h_pool, 0, total_slots * h_bytes)?;
+            let h_pool = gpu.alloc(geometry.h_state_allocation_bytes)?;
+            gpu.memset(h_pool, 0, geometry.h_state_allocation_bytes)?;
             h_state_pools.push(h_pool);
 
-            let conv_pool = gpu.alloc(total_slots * conv_bytes)?;
-            gpu.memset(conv_pool, 0, total_slots * conv_bytes)?;
+            let conv_pool = gpu.alloc(geometry.conv_state_allocation_bytes)?;
+            gpu.memset(conv_pool, 0, geometry.conv_state_allocation_bytes)?;
             conv_state_pools.push(conv_pool);
         }
 
         if has_mtp {
             let ni = num_intermediates;
             for _ in 0..num_ssm_layers {
-                let h_inter = gpu.alloc(total_slots * ni * h_bytes)?;
-                gpu.memset(h_inter, 0, total_slots * ni * h_bytes)?;
+                let h_inter = gpu.alloc(geometry.h_intermediate_allocation_bytes)?;
+                gpu.memset(h_inter, 0, geometry.h_intermediate_allocation_bytes)?;
                 h_intermediate_pools.push(h_inter);
 
-                let conv_inter = gpu.alloc(total_slots * ni * conv_bytes)?;
-                gpu.memset(conv_inter, 0, total_slots * ni * conv_bytes)?;
+                let conv_inter = gpu.alloc(geometry.conv_intermediate_allocation_bytes)?;
+                gpu.memset(conv_inter, 0, geometry.conv_intermediate_allocation_bytes)?;
                 conv_intermediate_pools.push(conv_inter);
 
                 // 1 checkpoint per slot per layer
-                let h_ckpt = gpu.alloc(total_slots * h_bytes)?;
-                gpu.memset(h_ckpt, 0, total_slots * h_bytes)?;
+                let h_ckpt = gpu.alloc(geometry.h_state_allocation_bytes)?;
+                gpu.memset(h_ckpt, 0, geometry.h_state_allocation_bytes)?;
                 h_checkpoint_pools.push(h_ckpt);
 
-                let conv_ckpt = gpu.alloc(total_slots * conv_bytes)?;
-                gpu.memset(conv_ckpt, 0, total_slots * conv_bytes)?;
+                let conv_ckpt = gpu.alloc(geometry.conv_state_allocation_bytes)?;
+                gpu.memset(conv_ckpt, 0, geometry.conv_state_allocation_bytes)?;
                 conv_checkpoint_pools.push(conv_ckpt);
 
                 if kv_retain_bytes > 0 {
-                    let kv_ret = gpu.alloc(total_slots * kv_retain_bytes)?;
-                    gpu.memset(kv_ret, 0, total_slots * kv_retain_bytes)?;
+                    let kv_ret = gpu.alloc(geometry.kv_retain_allocation_bytes)?;
+                    gpu.memset(kv_ret, 0, geometry.kv_retain_allocation_bytes)?;
                     wy17_kv_retain_pools.push(kv_ret);
 
-                    let gate_ret = gpu.alloc(total_slots * gate_retain_bytes)?;
-                    gpu.memset(gate_ret, 0, total_slots * gate_retain_bytes)?;
+                    let gate_ret = gpu.alloc(geometry.gate_retain_allocation_bytes)?;
+                    gpu.memset(gate_ret, 0, geometry.gate_retain_allocation_bytes)?;
                     wy17_gate_retain_pools.push(gate_ret);
                 }
             }
 
             if kv_retain_bytes > 0 {
-                let retain_mb =
-                    num_ssm_layers * total_slots * (kv_retain_bytes + gate_retain_bytes)
-                        / (1024 * 1024);
+                let retain_mb = num_ssm_layers
+                    * (geometry.kv_retain_allocation_bytes + geometry.gate_retain_allocation_bytes)
+                    / (1024 * 1024);
                 tracing::info!(
-                    "SSM WY17 LAZY-commit retention pools (K={k_tokens}): {retain_mb} MB"
+                    "SSM WY17 LAZY-commit retention pools (K={num_intermediates}): {retain_mb} MB"
                 );
             }
 
             let mtp_mb = num_ssm_layers
-                * total_slots
-                * (ni * h_bytes + ni * conv_bytes + h_bytes + conv_bytes)
+                * (geometry.h_intermediate_allocation_bytes
+                    + geometry.conv_intermediate_allocation_bytes
+                    + geometry.h_state_allocation_bytes
+                    + geometry.conv_state_allocation_bytes)
                 / (1024 * 1024);
             tracing::info!("SSM MTP pools ({ni} intermediates + checkpoints): {mtp_mb} MB");
         }
 
         // free_slots holds claimable indices only; the dummy at index
         // `max_slots` is permanently reserved.
-        let free_slots: Vec<usize> = (0..max_slots).rev().collect();
+        let free_slots: Vec<usize> = if num_ssm_layers > 0 {
+            (0..max_slots).rev().collect()
+        } else {
+            Vec::new()
+        };
 
-        let total_mb = num_ssm_layers * max_slots * (h_bytes + conv_bytes) / (1024 * 1024);
+        let total_mb = geometry.total_bytes / (1024 * 1024);
         tracing::info!(
             "SSM state pool: {max_slots} slots × {num_ssm_layers} layers = {total_mb} MB",
         );
@@ -256,7 +231,7 @@ impl SsmStatePool {
             gate_retain_bytes,
             h_bytes,
             conv_bytes,
-            max_slots,
+            max_slots: if num_ssm_layers > 0 { max_slots } else { 0 },
             num_ssm_layers,
             has_mtp,
             num_intermediates,
@@ -418,3 +393,7 @@ impl SsmStatePool {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "ssm_pool_capacity_tests.rs"]
+mod capacity_tests;

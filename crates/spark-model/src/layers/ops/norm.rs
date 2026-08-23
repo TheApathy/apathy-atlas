@@ -134,13 +134,53 @@ pub fn rms_norm_qk_batch3(
     eps: f32,
     stream: u64,
 ) -> Result<()> {
+    rms_norm_qk_batched(
+        gpu,
+        kernel,
+        qkv_base,
+        q_weight,
+        k_weight,
+        qkv_stride_bf16,
+        q_dim,
+        k_dim,
+        k_offset_bf16,
+        head_dim,
+        3,
+        eps,
+        stream,
+    )
+}
+
+/// Generalised strided per-head q_norm + k_norm over `num_tokens` tokens in a
+/// single launch. Reuses the `rms_norm_qk_batch3` kernel body verbatim (it
+/// already indexes the token via `blockIdx.y` with no hardcoded count), so the
+/// per-head reduction is bit-identical to both the batch3 path and the
+/// contiguous per-token `rms_norm` calls it replaces.
+///
+/// Grid: (max_heads, num_tokens, 2)  Block: (min(head_dim, 1024), 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_qk_batched(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qkv_base: DevicePtr,
+    q_weight: &DenseWeight,
+    k_weight: &DenseWeight,
+    qkv_stride_bf16: u32,
+    q_dim: u32,
+    k_dim: u32,
+    k_offset_bf16: u32,
+    head_dim: u32,
+    num_tokens: u32,
+    eps: f32,
+    stream: u64,
+) -> Result<()> {
     debug_assert!(head_dim > 0, "head_dim must be > 0");
     debug_assert!(q_dim.is_multiple_of(head_dim) && k_dim.is_multiple_of(head_dim));
     let nq_heads = q_dim / head_dim;
     let nkv_heads = k_dim / head_dim;
     let max_heads = nq_heads.max(nkv_heads);
     KernelLaunch::new(gpu, kernel)
-        .grid([max_heads, 3, 2])
+        .grid([max_heads, num_tokens, 2])
         .block([head_dim.min(1024), 1, 1])
         .arg_ptr(qkv_base)
         .arg_ptr(q_weight.weight)

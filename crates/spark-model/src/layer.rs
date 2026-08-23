@@ -67,6 +67,22 @@ pub struct SsmLayerState {
     /// WY17 LAZY commit retention: full per-verify gate/beta buffer
     /// (`gates_buf` = `[K, 2*num_v_heads]` FP32). Paired with `wy17_kv_retain`.
     pub wy17_gate_retain: Option<DevicePtr>,
+    /// Is the h-state in this slot stored as FP16 rather than FP32?
+    ///
+    /// `ATLAS_SSM_H_FP16` narrows the GDN decode/verify h-state to FP16. The
+    /// pool stays FP32-SIZED (prefill writes FP32 through several kernel
+    /// families); the FP16 state occupies the first half of the same region, so
+    /// allocation, snapshot sizing and every byte-wise copier stay correct
+    /// without knowing the dtype.
+    ///
+    /// The invariant is: a slot holds FP32 while its sequence is PREFILLING and
+    /// FP16 while it is DECODING, and this flag is the single source of truth
+    /// for which. It must be flipped OUTSIDE any CUDA-graph capture region —
+    /// a conversion launched from inside a layer gets captured and then replayed
+    /// on every subsequent step, re-reading already-FP16 state as FP32. That
+    /// fails silently: an FP32 bit pattern read as two halves is a plausible
+    /// number, not a fault.
+    pub h_is_f16: bool,
 }
 
 impl LayerState for SsmLayerState {

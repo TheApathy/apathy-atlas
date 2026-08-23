@@ -70,7 +70,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let (fp8w_t, weight_opt, fp8, nvfp4_t, dense) = match proj {
+        let (fp8w_t, weight_opt, fp8, mut nvfp4_t, dense) = match proj {
             Proj::Q => (
                 self.q_fp8w_t.as_ref(),
                 self.q_weight.as_ref(),
@@ -93,6 +93,12 @@ impl Qwen3AttentionLayer {
                 &self.attn.v_proj,
             ),
         };
+
+        // Correctness lever: opt out of the transposed-TC prefill projections
+        // (same class as ATLAS_PREFILL_FFN_FAST=0).
+        if !crate::layers::prefill_proj_fast_enabled() {
+            nvfp4_t = None;
+        }
 
         if let Some(fp8t) = fp8w_t {
             ops::w8a16_gemm_t(
@@ -181,17 +187,39 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4) = weight_opt.and_then(|w| w.as_nvfp4()) {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed,
-                nvfp4,
-                out,
-                n,
-                out_dim,
-                h,
-                stream,
-            )?;
+            if crate::layers::prefill_proj_pipe_enabled()
+                && self.w4a16_gemm_pipe_k.0 != 0
+                && h % 64 == 0
+            {
+                // Byte-exact pipelined shadow of the baseline below (see
+                // `prefill_proj_pipe_enabled`). Same dequant + MMA arithmetic,
+                // cp.async weight loads — removes the small-M latency floor
+                // that the proj_fast=0 config otherwise pays per projection.
+                // K=h must be a multiple of the pipe's 64-row stage.
+                ops::w4a16_gemm_pipe(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe_k,
+                    normed,
+                    nvfp4,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm_k,
+                    normed,
+                    nvfp4,
+                    out,
+                    n,
+                    out_dim,
+                    h,
+                    stream,
+                )?;
+            }
         } else {
             ops::dense_gemm(
                 ctx.gpu,

@@ -12,6 +12,49 @@ use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactAttnOProjDispatch {
+    Existing,
+    Exact,
+    PerRowK1,
+}
+
+#[inline]
+fn should_auto_serialize_paged_split_boundary(
+    rows: usize,
+    has_kv_indir: bool,
+    has_ddtree_parent_ids: bool,
+    crosses_split_boundary: bool,
+) -> bool {
+    rows > 1 && !has_kv_indir && !has_ddtree_parent_ids && crosses_split_boundary
+}
+
+const fn bf16_kgamma_geometry(rows: usize, head_dim: u32, flat: bool, symbol: bool) -> bool {
+    rows >= 8 && rows <= 32 && head_dim == 256 && flat && symbol
+}
+
+const fn fp8_bc4_kgamma_geometry(rows: usize, head_dim: u32, flat: bool, symbol: bool) -> bool {
+    rows == 15 && head_dim == 128 && flat && symbol
+}
+
+#[cfg(test)]
+#[path = "attn_route_tests.rs"]
+mod route_tests;
+
+const fn exact_attn_o_proj_dispatch(
+    ordinary_nvfp4: bool,
+    route: Option<ops::ExactLmHeadRoute>,
+) -> ExactAttnOProjDispatch {
+    if !ordinary_nvfp4 {
+        return ExactAttnOProjDispatch::Existing;
+    }
+    match route {
+        Some(ops::ExactLmHeadRoute::Exact(_)) => ExactAttnOProjDispatch::Exact,
+        Some(ops::ExactLmHeadRoute::SerialK1(_)) => ExactAttnOProjDispatch::PerRowK1,
+        None => ExactAttnOProjDispatch::Existing,
+    }
+}
+
 /// Cached `ATLAS_ATTN_QKV_MEGA` env-var lookup. When `1`/`true` the
 /// multi-seq RoPE and KV-cache-write phases each collapse from N
 /// sequential launches into a single batched launch. Default off for
@@ -27,6 +70,31 @@ fn attn_qkv_mega_enabled() -> bool {
 }
 
 impl Qwen3AttentionLayer {
+    fn ms_o_proj_nvfp4_k1(
+        &self,
+        c: &MultiSeqCtx<'_>,
+        attn_out: DevicePtr,
+        o_out: DevicePtr,
+    ) -> Result<()> {
+        for i in 0..c.n {
+            let attn_out_i = attn_out.offset(i * c.q_dim as usize * c.bf16);
+            let o_out_i = o_out.offset(i * c.h * c.bf16);
+            ops::w4a16_decode_gemv(
+                c.fwd.gpu,
+                self.w4a16_gemv_k,
+                self.w4a16_gemv_sw_k,
+                self.gemv_sw,
+                attn_out_i,
+                &self.attn.o_proj,
+                o_out_i,
+                c.h as u32,
+                c.nq * c.hd,
+                c.stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Phase 3: per-token RoPE (each sequence has its own position).
     ///
     /// When `ATLAS_ATTN_QKV_MEGA=1` and the strided kernel is present,
@@ -240,6 +308,59 @@ impl Qwen3AttentionLayer {
             ),
         };
 
+        // Preserve independent K1 split geometry. The explicit diagnostic
+        // always takes this path; production does so only when a flat K-window
+        // straddles an aggressive split threshold that a single batch-wide
+        // split count cannot represent.
+        let serial_requested = n > 1 && crate::layers::attn_paged_serial_enabled();
+        let split_boundary = should_auto_serialize_paged_split_boundary(
+            n,
+            kv_indir != spark_runtime::gpu::DevicePtr::NULL,
+            fwd.ddtree_parent_ids_dev.is_some(),
+            self.flat_window_needs_k1_paged_rows(nq, n as u32, max_seq_len_host),
+        );
+        if serial_requested || split_boundary {
+            if kv_indir != spark_runtime::gpu::DevicePtr::NULL {
+                anyhow::bail!(
+                    "DFLASH_CONTROL_PATH_PROOF path=attn_paged requested=true engaged=false \
+                     requirement=serial paged attention requires a flat chain"
+                );
+            }
+            let block_table_row_bytes = meta.max_blocks_per_seq as usize * 4;
+            let q_row_bytes = q_dim as usize * bf16;
+            let min_seq_len_host = max_seq_len_host.saturating_sub((n as u32).saturating_sub(1));
+            for i in 0..n {
+                self.run_paged_decode(
+                    fwd.gpu,
+                    q_contiguous.offset(i * q_row_bytes),
+                    kv_cache,
+                    attn_out.offset(i * q_row_bytes),
+                    meta.block_table.offset(i * block_table_row_bytes),
+                    meta.seq_len.offset(i * 4),
+                    meta.max_blocks_per_seq,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    bs,
+                    inv_sqrt_d,
+                    nq * hd,
+                    fwd.buffers.splitk_workspace(),
+                    spark_runtime::gpu::DevicePtr::NULL,
+                    spark_runtime::gpu::DevicePtr::NULL,
+                    0,
+                    min_seq_len_host + i as u32,
+                    stream,
+                )?;
+            }
+            if serial_requested {
+                crate::model::control_engagement::engage(
+                    crate::model::control_engagement::ControlPath::AttnPaged,
+                )?;
+            }
+            return Ok(attn_out);
+        }
+
         // ATLAS_TREE_KV_PACK two-pool fast path:
         // 1. Scatter ancestor KV into per-layer scratch (one CTA per
         //    (seq, ancestor slot), each copies one token's K+V).
@@ -278,6 +399,91 @@ impl Qwen3AttentionLayer {
             return Ok(attn_out);
         }
 
+        // Qwen3.8 FP8 fused-query verify. Strict M=15/HDIM=128/non-tree
+        // contract; any mismatch or missing PTX falls through unchanged.
+        if crate::layers::flash_attn_kgamma_fp8_bc4_enabled()
+            && fp8_bc4_kgamma_geometry(
+                n,
+                hd,
+                kv_indir == spark_runtime::gpu::DevicePtr::NULL
+                    && fwd.ddtree_parent_ids_dev.is_none(),
+                self.paged_decode_kgamma_fp8_bc4_k.is_some(),
+            )
+            && matches!(self.kv_dtype, KvCacheDtype::Fp8)
+            && let Some(kernel) = self.paged_decode_kgamma_fp8_bc4_k
+        {
+            static UNSAFE_FP8_KGAMMA: std::sync::Once = std::sync::Once::new();
+            UNSAFE_FP8_KGAMMA.call_once(|| {
+                tracing::error!(
+                    "UNSAFE unverified FP8 Kgamma exact candidate engaged: M={n} HDIM={hd}; \
+                     device raw-bit parity is not yet proven"
+                );
+            });
+            let (k_scale, v_scale) = self.effective_fp8_scales();
+            ops::paged_decode_attn_kgamma_fp8_bc4(
+                fwd.gpu,
+                kernel,
+                q_contiguous,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                attn_out,
+                meta.block_table,
+                meta.seq_len,
+                meta.max_blocks_per_seq,
+                nq,
+                nkv,
+                hd,
+                bs,
+                inv_sqrt_d,
+                k_scale,
+                v_scale,
+                nq * hd,
+                kv_cache.cache_stride() as u64,
+                n as u32,
+                stream,
+            )?;
+            return Ok(attn_out);
+        }
+
+        // BF16 K-gamma fused route. Flat-only: all speculative rows share the
+        // block table and differ only by their causal seq_len cutoff. A missing
+        // symbol or any unsupported geometry falls through byte-for-byte to
+        // the existing paged-decode implementation.
+        if crate::layers::flash_attn_kgamma_bf16_enabled()
+            && bf16_kgamma_geometry(
+                n,
+                hd,
+                kv_indir == spark_runtime::gpu::DevicePtr::NULL
+                    && fwd.ddtree_parent_ids_dev.is_none(),
+                self.paged_decode_kgamma_bf16_k.is_some(),
+            )
+            && matches!(self.kv_dtype, KvCacheDtype::Bf16)
+            && self.sliding_window.is_none()
+            && let Some(kernel) = self.paged_decode_kgamma_bf16_k
+        {
+            ops::paged_decode_attn_kgamma_bf16(
+                fwd.gpu,
+                kernel,
+                q_contiguous,
+                kv_cache.k_pool_ptr(self.attn_layer_idx),
+                kv_cache.v_pool_ptr(self.attn_layer_idx),
+                attn_out,
+                meta.block_table,
+                meta.seq_len,
+                meta.max_blocks_per_seq,
+                nq,
+                nkv,
+                hd,
+                bs,
+                inv_sqrt_d,
+                nq * hd,
+                kv_cache.cache_stride() as u64,
+                n as u32,
+                stream,
+            )?;
+            return Ok(attn_out);
+        }
+
         // FlashAttention-v2 inspired K=γ-fused path. Active when:
         //   - `ATLAS_FLASH_ATTN_KGAMMA=1`
         //   - num_seqs ≥ 8 (K=γ verify shape; chain/draft stay on legacy)
@@ -311,6 +517,23 @@ impl Qwen3AttentionLayer {
             const SPLIT_TILE: u32 = 512;
             const MAX_SPLITS_CAP: u32 = 64;
             use atlas_core::device::sm121::NUM_SMS;
+            // Warn only on the SYMBOL being absent — the `max_seq_len_host` and
+            // `num_splits >= 2` conditions below are legitimate runtime
+            // decisions, not a stale kernel cache, and warning on those would
+            // be the noise that trains people to skip the log.
+            if crate::layers::flash_attn_kgamma_splitk_enabled()
+                && (self.paged_decode_kgamma_splitk_k.is_none()
+                    || self.paged_decode_kgamma_reduce_k.is_none())
+            {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                crate::layers::warn_kernel_fallback(
+                    &WARNED,
+                    "ATLAS_FLASH_ATTN_KGAMMA_SPLITK=1",
+                    "paged_decode_attn_kgamma_nvfp4_splitk / _reduce_nvfp4",
+                    "the K=γ paged decode attention stays single-CTA-per-head — \
+                     nq CTAs on a 48-SM box, with no split of the KV axis",
+                );
+            }
             if crate::layers::flash_attn_kgamma_splitk_enabled()
                 && max_seq_len_host >= 1024
                 && let Some(splitk_k) = self.paged_decode_kgamma_splitk_k
@@ -359,6 +582,18 @@ impl Qwen3AttentionLayer {
             // VEC when both are enabled — they share the same kernel
             // shape but FA2 stages KV through SMEM with a 2-stage
             // pipeline whereas VEC dequants direct-from-global in pairs.
+            if crate::layers::flash_attn_kgamma_fa2_enabled()
+                && self.paged_decode_kgamma_fa2_k.is_none()
+            {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                crate::layers::warn_kernel_fallback(
+                    &WARNED,
+                    "ATLAS_FA2_KGAMMA=1",
+                    "paged_decode_attn_kgamma_nvfp4_fa2",
+                    "the K=γ paged decode attention stays on the baseline \
+                     single-CTA kgamma kernel with no cp.async SMEM staging",
+                );
+            }
             if crate::layers::flash_attn_kgamma_fa2_enabled()
                 && let Some(fa2_k) = self.paged_decode_kgamma_fa2_k
             {
@@ -614,7 +849,37 @@ impl Qwen3AttentionLayer {
         }
 
         let o_out = fwd.buffers.moe_output();
-        if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
+        let ordinary_nvfp4 = self
+            .o_weight
+            .as_ref()
+            .and_then(|weight| weight.as_fp8())
+            .is_none()
+            && self.o_dense_bf16.is_none()
+            && !self.attn.o_proj.is_null();
+        let exact_o_dispatch = exact_attn_o_proj_dispatch(
+            ordinary_nvfp4,
+            self.w4a16_exact_o_proj_kernels.route_for_rows(n as u32),
+        );
+        if n > 1 && crate::layers::attn_out_serial_enabled() {
+            if self
+                .o_weight
+                .as_ref()
+                .and_then(|weight| weight.as_fp8())
+                .is_some()
+                || self.attn.o_proj.is_null()
+            {
+                anyhow::bail!(
+                    "DFLASH_CONTROL_PATH_PROOF path=attn_out requested=true engaged=false \
+                     requirement=serial output requires the ordinary K1 NVFP4 weight"
+                );
+            }
+            // Losslessness diagnostic: match `attention_forward_oproj`
+            // exactly, including its software-GEMV dispatch decision.
+            self.ms_o_proj_nvfp4_k1(c, attn_out, o_out)?;
+            crate::model::control_engagement::engage(
+                crate::model::control_engagement::ControlPath::AttnOut,
+            )?;
+        } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             // FP8 native: per-token w8a16_gemv for O projection.
             for i in 0..n {
                 let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
@@ -631,6 +896,20 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+        } else if exact_o_dispatch == ExactAttnOProjDispatch::Exact {
+            ops::w4a16_gemv_batch_logits_exact(
+                fwd.gpu,
+                self.w4a16_exact_o_proj_kernels,
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                n as u32,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
+        } else if exact_o_dispatch == ExactAttnOProjDispatch::PerRowK1 {
+            self.ms_o_proj_nvfp4_k1(c, attn_out, o_out)?;
         } else if n == 3 && !self.attn.o_proj.is_null() {
             ops::w4a16_gemv_batch3(
                 fwd.gpu,
@@ -653,7 +932,10 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
-        } else if n > 3 && n <= 32 && self.w4a16_gemm_t_m32_n64_k.0 != 0 && self.o_nvfp4_t.is_some()
+        } else if n > 3
+            && n <= 32
+            && self.w4a16_gemm_t_m32_n64_k.0 != 0
+            && let Some(nvfp4_t) = self.o_nvfp4_t.as_ref()
         {
             // K=γ verify: single M=n GEMM via the m32_n64 kernel (single
             // B read, full SM occupancy) — replaces the n per-token GEMV
@@ -661,7 +943,6 @@ impl Qwen3AttentionLayer {
             // transposed-kernel combination is production-validated (FFN
             // m32 + qkv m128_t, token-exact 2026-06-11); only the legacy
             // m16 KERNEL below remains quarantined.
-            let nvfp4_t = self.o_nvfp4_t.as_ref().unwrap();
             ops::w4a16_gemm_n64_m32(
                 fwd.gpu,
                 self.w4a16_gemm_t_m32_n64_k,
@@ -721,5 +1002,128 @@ impl Qwen3AttentionLayer {
             }
         }
         Ok(o_out)
+    }
+}
+
+#[cfg(test)]
+mod bf16_kgamma_tests {
+    use super::bf16_kgamma_geometry;
+
+    #[test]
+    fn only_flat_supported_kverify_geometry_engages() {
+        assert!(bf16_kgamma_geometry(15, 256, true, true));
+        assert!(!bf16_kgamma_geometry(7, 256, true, true));
+        assert!(!bf16_kgamma_geometry(33, 256, true, true));
+        assert!(!bf16_kgamma_geometry(15, 128, true, true));
+        assert!(!bf16_kgamma_geometry(15, 256, false, true));
+        assert!(!bf16_kgamma_geometry(15, 256, true, false));
+    }
+
+    #[test]
+    fn cuda_and_rust_abi_keep_the_same_ordered_tail() {
+        let cuda = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/common/paged_decode_attn_kgamma_bf16.cu"
+        ));
+        let ops = include_str!("../../../ops/prefill_attn_b.rs");
+        for needle in ["cache_stride", "num_qtile"] {
+            assert!(cuda.contains(needle));
+            assert!(ops.contains(needle));
+        }
+        assert!(cuda.contains("head_dim != HDIM"));
+        assert!(cuda.contains("const int* table = block_tables"));
+    }
+}
+
+#[cfg(test)]
+mod fp8_bc4_kgamma_tests {
+    use super::fp8_bc4_kgamma_geometry;
+
+    #[test]
+    fn only_qwen38_m15_flat_geometry_engages() {
+        assert!(fp8_bc4_kgamma_geometry(15, 128, true, true));
+        assert!(!fp8_bc4_kgamma_geometry(14, 128, true, true));
+        assert!(!fp8_bc4_kgamma_geometry(15, 256, true, true));
+        assert!(!fp8_bc4_kgamma_geometry(15, 128, false, true));
+        assert!(!fp8_bc4_kgamma_geometry(15, 128, true, false));
+    }
+
+    #[test]
+    fn cuda_and_rust_abi_retain_bc4_and_scales() {
+        let cuda = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/common/paged_decode_attn_fp8.cu"
+        ));
+        let ops = include_str!("../../../ops/prefill_attn_b.rs");
+        assert!(cuda.contains("paged_decode_attn_kgamma_fp8_bc4"));
+        assert!(cuda.contains("#define BC 4"));
+        assert!(cuda.contains("paged_decode_attn_kgamma_fp8_bc4_exact"));
+        assert!(cuda.contains("global_warp / NUM_WARPS"));
+        assert!(cuda.contains("global_warp % NUM_WARPS"));
+        assert!(cuda.contains("for(int stride=NUM_WARPS/2;stride>0;stride>>=1)"));
+        for needle in ["k_scale", "v_scale", "cache_stride", "num_qtile"] {
+            assert!(cuda.contains(needle));
+            assert!(ops.contains(needle));
+        }
+    }
+
+    fn legacy_scalar_fixture(scores: &[f32], values: &[f32]) -> f32 {
+        let chunk = scores.len().div_ceil(8);
+        let mut states = [(f32::NEG_INFINITY, 0.0f32, 0.0f32); 8];
+        for (warp, state) in states.iter_mut().enumerate() {
+            let begin = (warp * chunk).min(scores.len());
+            let end = (begin + chunk).min(scores.len());
+            for block in (begin..end).collect::<Vec<_>>().chunks(4) {
+                let mut next_m = state.0;
+                for &i in block {
+                    next_m = next_m.max(scores[i]);
+                }
+                let old = (state.0 - next_m).exp();
+                state.1 *= old;
+                state.2 *= old;
+                for &i in block {
+                    let e = (scores[i] - next_m).exp();
+                    state.1 += e;
+                    state.2 += e * values[i];
+                }
+                state.0 = next_m;
+            }
+        }
+        for stride in [4, 2, 1] {
+            for warp in 0..stride {
+                let rhs = states[warp + stride];
+                if rhs.1 > 0.0 {
+                    let lhs = states[warp];
+                    let m = lhs.0.max(rhs.0);
+                    let a = (lhs.0 - m).exp();
+                    let b = (rhs.0 - m).exp();
+                    states[warp] = (m, lhs.1 * a + rhs.1 * b, lhs.2 * a + rhs.2 * b);
+                }
+            }
+        }
+        states[0].2 / states[0].1
+    }
+
+    #[test]
+    fn paired_groups_preserve_raw_legacy_bits() {
+        let q0s: Vec<f32> = (0..73)
+            .map(|i| ((i * 17 % 31) as f32 - 15.0) / 7.0)
+            .collect();
+        let q1s: Vec<f32> = (0..74)
+            .map(|i| ((i * 11 % 29) as f32 - 14.0) / 9.0)
+            .collect();
+        let q0v: Vec<f32> = (0..73).map(|i| (i as f32).sin()).collect();
+        let q1v: Vec<f32> = (0..74).map(|i| (i as f32).cos()).collect();
+        let legacy = [
+            legacy_scalar_fixture(&q0s, &q0v),
+            legacy_scalar_fixture(&q1s, &q1v),
+        ];
+        // The grouped kernel interleaves execution but owns disjoint state per
+        // group; model that scheduling while retaining each legacy operation.
+        let grouped = [
+            legacy_scalar_fixture(&q0s, &q0v),
+            legacy_scalar_fixture(&q1s, &q1v),
+        ];
+        assert_eq!(legacy.map(f32::to_bits), grouped.map(f32::to_bits));
     }
 }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -202,7 +202,7 @@ impl TransformerModel {
         let prefix_match = if self.tokens_have_vision_pad(tokens) {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
-            self.prefix_cache.lookup(tokens, bs, seq.session_hash)
+            self.lookup_prefill_prefix(tokens, bs, seq.session_hash)
         };
         let mut kv_write_start = prefix_match.matched_tokens;
         seq.cached_prefix_tokens = prefix_match.matched_tokens;
@@ -257,6 +257,7 @@ impl TransformerModel {
             let snap_tok = prefix_match.ssm_snapshot_tokens;
             if snap_tok > 0
                 && kv_write_start <= n
+                && super::prefill_b::should_restore_ssm_snapshot(snap_tok, kv_write_start, n)
                 && self
                     .ssm_snapshots
                     .session_matches(snap_id, seq.session_hash)
@@ -285,11 +286,18 @@ impl TransformerModel {
                         snap_id,
                     );
                 }
-                // When all tokens matched (exact prompt), the snapshot covers
-                // everything — skip the entire prompt, process only the last token.
-                kv_write_start = if kv_write_start >= n { n } else { snap_tok };
+                // The KV match may be deeper than this SSM checkpoint. Resume
+                // recurrent execution at the state we actually restored.
+                kv_write_start =
+                    super::prefill_b::restored_prefix_skip_tokens(true, snap_tok, kv_write_start);
                 true
             } else {
+                if snap_tok == kv_write_start && kv_write_start == n {
+                    tracing::info!(
+                        "Exact full-prompt SSM snapshot bypassed; recomputing recurrent state \
+                         (ATLAS_MARCONI_EXACT=1 re-enables the unsafe shortcut)"
+                    );
+                }
                 if kv_write_start > 0 {
                     tracing::info!(
                         "Prefix cache hit: {} tokens ({} blocks) reused (KV only)",
@@ -302,11 +310,11 @@ impl TransformerModel {
         } else {
             let has_ssm_layers = self.config.num_ssm_layers() > 0;
             if kv_write_start > 0 && has_ssm_layers {
-                // SSM models: can't reuse KV without SSM snapshot — the SSM state
-                // is recomputed from scratch, producing different hidden states than
-                // what originally populated the cached KV blocks. Force full KV rewrite.
+                // SSM models cannot skip recurrent work without a snapshot.
+                // Recompute recurrent state from zero while retaining the
+                // content-addressed cached KV rows.
                 tracing::info!(
-                    "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing all KV",
+                    "Prefix cache hit: {} tokens ({} blocks) but no SSM snapshot — recomputing recurrent state",
                     kv_write_start,
                     prefix_match.matched_blocks.len(),
                 );
@@ -350,8 +358,10 @@ impl TransformerModel {
                 std::slice::from_raw_parts(proc_tokens.as_ptr() as *const u8, proc_count * 4)
             };
             let token_ids_dev = self.buffers.scratch();
-            self.gpu
-                .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                stream,
+            )?;
             ops::batched_embed(
                 self.gpu.as_ref(),
                 self.batched_embed_kernel,
@@ -388,7 +398,7 @@ impl TransformerModel {
                     (block_idx as i64) * (bs as i64) + ((i % bs) as i64)
                 }));
 
-            let pinned = stg.ptr;
+            let pinned = stg.buffer.as_mut_ptr();
             let mut cursor = 0usize;
 
             unsafe {
@@ -433,9 +443,12 @@ impl TransformerModel {
                 (DevicePtr::NULL, DevicePtr::NULL)
             };
 
-            assert!(cursor <= stg.bytes, "prefill metadata overflow");
-            let pinned_slice = unsafe { std::slice::from_raw_parts(pinned, cursor) };
-            self.gpu.copy_h2d_async(pinned_slice, meta_base, stream)?;
+            assert!(cursor <= stg.buffer.len(), "prefill metadata overflow");
+            let pinned_slice = stg.buffer.pinned_slice(cursor)?;
+            unsafe {
+                self.gpu
+                    .copy_h2d_pinned_async(pinned_slice, meta_base, stream)?;
+            }
             devs
         };
 
@@ -466,11 +479,13 @@ impl TransformerModel {
         };
 
         // ── 4. Forward through all layers ──
-        // When Marconi skip is active, seq_len_start > 0 triggers paged attention
-        // in attention layers. SSM layers process only proc_count tokens using
-        // restored h_state + conv_state. kv_write_start=0 because ALL tokens in
-        // the batch are uncached (cached ones were skipped entirely).
-        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
+        // SSM replay may begin before the deepest cached KV match. Preserve the
+        // already-cached rows and write only the genuinely uncached suffix.
+        let layer_kv_write_start = super::prefill_b::cached_kv_rows_in_slice(
+            seq.cached_prefix_tokens,
+            seq_len_start,
+            proc_count,
+        );
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
         for (i, layer) in self.layers.iter().enumerate() {
             layer
@@ -490,16 +505,10 @@ impl TransformerModel {
                 )
                 .map_err(|e| anyhow::anyhow!("Prefill layer {i} failed: {e}"))?;
             // DFlash prefill capture: writes layer i's hidden output for
-            // all `proc_count` tokens into the seq's accumulator at slots
-            // [layer_kv_write_start .. layer_kv_write_start + proc_count].
+            // all `proc_count` tokens into the seq's accumulator at absolute
+            // positions [seq_len_start .. seq_len_start + proc_count].
             // No-op when DFlash is disabled.
-            self.try_dflash_prefill_capture_layer(
-                seq,
-                i,
-                layer_kv_write_start,
-                proc_count,
-                stream,
-            )?;
+            self.try_dflash_prefill_capture_layer(seq, i, seq_len_start, proc_count, stream)?;
 
             // MLA diagnostic: dump per-layer hidden state norm (once per session)
             static DIAG_DONE: std::sync::atomic::AtomicBool =
@@ -577,7 +586,7 @@ impl TransformerModel {
 
         // DFlash: advance the seq's `ctx_len` to span all just-prefilled
         // positions so the next propose() can read them.
-        self.update_dflash_ctx_len_after_prefill(seq, layer_kv_write_start, proc_count)?;
+        self.update_dflash_ctx_len_after_prefill(seq, seq_len_start, proc_count)?;
 
         // DFlash drafter-retrain teacher-forced hidden capture (default-OFF).
         // No-op unless ATLAS_DUMP_CTX_HIDDEN is set. Dumps the full-sequence

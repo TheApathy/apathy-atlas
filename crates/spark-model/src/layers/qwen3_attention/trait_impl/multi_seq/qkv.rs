@@ -31,9 +31,21 @@ use crate::weight_map::QuantizedWeight;
 /// internally prefers the M-efficient transposed `w4a16_gemm_t_m32_n64`
 /// kernel (single B read, 272 CTAs) over the plain M_TILE=64 `w4a16_gemm`
 /// when the transposed QKV weights are installed — see `use_m32` in
-/// `ms_qkv_batched_plain`. This is the SAFE M-efficient QKV route at M=17
-/// (the `w4a16_gemm_t_m16` + NVFP4-T path is the corruptor; see the
-/// ATLAS_TC_NVFP4_M16_MS_ATTN warning below). Default off for A/B safety.
+/// `ms_qkv_batched_plain`. The path is not lossless on gated Qwen3.8
+/// attention: a locked K=5 oracle first diverged at the first attention
+/// layer and caused deterministic 17-token coding stops. Gated layers
+/// therefore require the explicit unsafe profiling opt-in below. Default off.
+///
+/// REACHABILITY (2026-08-23): on gated ordinary-NVFP4 attention this branch is
+/// dead for n∈4..=17. `ms_phase_qkv` tests `ops::exact_attention_qkv_route`
+/// first, and that returns `Some(..)` for every such width — `ExactM4`/`ExactM17`
+/// when the exact symbols loaded, `SerialK1M4`/`SerialK1M17` when they did not —
+/// so the `else if` chain never reaches here. Qwen3.8-27B sets
+/// `attn_output_gate = true` and carries ordinary NVFP4 q/k/v, so setting
+/// `ATLAS_ATTN_QKV_BATCHED=1` on the DFlash verify widths is a no-op; only
+/// n∈18..=32 (or a non-NVFP4 encoding) can reach it. Pinned by
+/// `gated_nvfp4_never_falls_through_to_the_batched_route`. The `attn_qkv_proj`
+/// cost on this model therefore belongs to `ms_qkv_exact`, not to this path.
 fn attn_qkv_batched_plain_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -43,6 +55,17 @@ fn attn_qkv_batched_plain_enabled() -> bool {
                 .unwrap_or(false)
         };
         on("ATLAS_ATTN_QKV_BATCHED") || on("ATLAS_ATTN_QKV_M16")
+    })
+}
+
+/// Escape hatch for profiling the known-lossy batched QKV path on gated
+/// attention. Never enable this in a correctness or serving profile.
+fn attn_qkv_batched_gated_unsafe_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ATLAS_ATTN_QKV_BATCHED_GATED_UNSAFE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     })
 }
 
@@ -79,28 +102,74 @@ pub(super) fn tc_nvfp4_m16_ms_attn_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_TC_NVFP4_M16_MS_ATTN").ok().as_deref() == Some("1"))
 }
 
+/// Cached `ATLAS_ATTN_QKV_EXACT_STRIDED` env-var lookup. When `1`/`true` the
+/// K1-order exact M4/M17 attention QKV route writes Q/G and K/V directly into
+/// the per-token-strided `qkv_buf` layout instead of staging in contiguous
+/// scratch and scattering with per-row d2d copies. Bit-exact (same bytes to
+/// the same addresses; the exact kernels already deinterleave QG at the
+/// store), it only removes the 3 copy launches per row plus their bandwidth.
+fn attn_qkv_exact_strided_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ATLAS_ATTN_QKV_EXACT_STRIDED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Cached `ATLAS_ATTN_QK_NORM_BATCHED` env-var lookup. When `1`/`true` the
+/// exact M4/M17 attention QKV routes replace their per-row `q_norm`/`k_norm`
+/// pair with a single strided `rms_norm_qk_batch3` launch covering all `n`
+/// tokens.
+///
+/// Bit-exact, not approximately: `rms_norm_qk_batch3` indexes the token via
+/// `blockIdx.y` with no hardcoded count, and its per-head body is the
+/// `rms_norm` body verbatim — same 2-wide BF16 unpack, same `warp_reduce_sum`
+/// plus 32-entry `warp_sums` tree, same `(1 + weight)` scale, same
+/// `blockDim.x`. `ms_qk_norm` launches `rms_norm` with `num_tokens = nq` and
+/// `hidden_size = head_dim`, i.e. one block per head at `blockDim.x =
+/// head_dim`; the batched kernel launches one block per (head, token, q|k) at
+/// the same `blockDim.x`. Identical reduction shape ⇒ identical FP32
+/// association ⇒ identical BF16 bytes.
+///
+/// What it buys: at n=17 the exact route issues `2 * n = 34` norm launches per
+/// full-attention layer. Batching them leaves 1. Default off pending the A/B.
+fn attn_qk_norm_batched_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("ATLAS_ATTN_QK_NORM_BATCHED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 impl Qwen3AttentionLayer {
     pub(super) fn ms_phase_qkv(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
-        let MultiSeqCtx {
-            fwd,
-            n,
-            stream,
-            h,
-            nq,
-            nkv,
-            hd,
-            eps,
-            bf16,
-            q_dim,
-            q_proj_dim,
-            q_proj_bytes,
-            per_seq_qkv,
-            normed,
-            qkv_buf,
-            ..
-        } = *c;
+        let n = c.n;
 
-        if n == 3
+        let ordinary_nvfp4 = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+            && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
+            && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some();
+        let exact_route = ops::exact_attention_qkv_route(
+            n,
+            self.gated,
+            ordinary_nvfp4,
+            self.w4a16_exact_qkv_kernels,
+        );
+
+        if matches!(
+            exact_route,
+            Some(ops::ExactAttentionQkvRoute::ExactM4 | ops::ExactAttentionQkvRoute::ExactM17)
+        ) {
+            self.ms_qkv_exact(c)?;
+        } else if matches!(
+            exact_route,
+            Some(
+                ops::ExactAttentionQkvRoute::SerialK1M4 | ops::ExactAttentionQkvRoute::SerialK1M17
+            )
+        ) {
+            self.ms_qkv_serial(c)?;
+        } else if n == 3
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
@@ -125,50 +194,307 @@ impl Qwen3AttentionLayer {
         } else if n > 3
             && n <= 32
             && attn_qkv_batched_plain_enabled()
+            && (!self.gated || attn_qkv_batched_gated_unsafe_enabled())
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
         {
             self.ms_qkv_batched_plain(c)?;
         } else {
-            for i in 0..n {
-                let normed_i = normed.offset(i * h * bf16);
-                let q_out_i = qkv_buf.offset(i * per_seq_qkv);
-                let k_out_i = q_out_i.offset(q_proj_bytes);
-                let v_out_i = k_out_i.offset((nkv * hd) as usize * bf16);
-
-                self.ms_qkv_seq_q(fwd, normed_i, q_out_i, q_proj_dim, q_dim, nq, hd, h, stream)?;
-                self.ms_qkv_seq_kv(fwd, normed_i, k_out_i, v_out_i, nkv, hd, h, stream)?;
-
-                if !self.attn.q_norm.weight.is_null() {
-                    ops::rms_norm(
-                        fwd.gpu,
-                        self.rms_norm_k,
-                        q_out_i,
-                        &self.attn.q_norm,
-                        q_out_i,
-                        nq,
-                        hd,
-                        eps,
-                        stream,
-                    )?;
-                }
-                if !self.attn.k_norm.weight.is_null() {
-                    ops::rms_norm(
-                        fwd.gpu,
-                        self.rms_norm_k,
-                        k_out_i,
-                        &self.attn.k_norm,
-                        k_out_i,
-                        nkv,
-                        hd,
-                        eps,
-                        stream,
-                    )?;
-                }
-            }
+            self.ms_qkv_serial(c)?;
         }
         Ok(())
+    }
+
+    /// K1-order exact M4/M17 route for gated ordinary-NVFP4 attention. QG is
+    /// deinterleaved at the exact BF16 output store; dual K/V remains row-major.
+    fn ms_qkv_exact(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        if attn_qkv_exact_strided_enabled() {
+            return self.ms_qkv_exact_strided(c);
+        }
+
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            eps,
+            bf16,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        let q_weight = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let k_weight = self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let v_weight = self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let rows = n as u32;
+        let kv_dim = nkv * hd;
+        let kv_bytes = kv_dim as usize * bf16;
+        let q_scratch = fwd.buffers.ssm_qkvz();
+        let k_scratch = fwd.buffers.attn_output();
+        let v_scratch = k_scratch.offset(n * kv_bytes);
+
+        ops::w4a16_gemv_qg_exact(
+            fwd.gpu,
+            self.w4a16_exact_qkv_kernels.qg_for_rows(n),
+            normed,
+            q_weight,
+            q_scratch,
+            rows,
+            q_proj_dim,
+            h as u32,
+            nq,
+            hd,
+            q_proj_dim,
+            stream,
+        )?;
+        ops::w4a16_gemv_dual_kv_exact(
+            fwd.gpu,
+            self.w4a16_exact_qkv_kernels.dual_kv_for_rows(n),
+            normed,
+            k_weight,
+            k_scratch,
+            v_weight,
+            v_scratch,
+            rows,
+            kv_dim,
+            h as u32,
+            kv_dim,
+            stream,
+        )?;
+
+        let batched_norm = self.qk_norm_batched_available();
+        for row in 0..n {
+            let q_out = qkv_buf.offset(row * per_seq_qkv);
+            let k_out = q_out.offset(q_proj_bytes);
+            let v_out = k_out.offset(kv_bytes);
+            fwd.gpu.copy_d2d_async(
+                q_scratch.offset(row * q_proj_bytes),
+                q_out,
+                q_proj_bytes,
+                stream,
+            )?;
+            fwd.gpu
+                .copy_d2d_async(k_scratch.offset(row * kv_bytes), k_out, kv_bytes, stream)?;
+            fwd.gpu
+                .copy_d2d_async(v_scratch.offset(row * kv_bytes), v_out, kv_bytes, stream)?;
+            if !batched_norm {
+                self.ms_qk_norm(fwd, q_out, k_out, nq, nkv, hd, eps, stream)?;
+            }
+        }
+        // The batched norm must follow the scatter: it reads and rewrites the
+        // Q/K slots the copies above fill.
+        if batched_norm {
+            self.ms_qk_norm_rows(c)?;
+        }
+        Ok(())
+    }
+
+    /// Strided variant of [`Self::ms_qkv_exact`]: the exact kernels write Q/G
+    /// and K/V directly into the per-token-strided `qkv_buf`, removing the
+    /// contiguous-scratch + per-row d2d scatter. Arithmetic and byte placement
+    /// are identical to the contiguous path (the exact kernels already
+    /// deinterleave QG at the BF16 output store), so this is bit-exact.
+    fn ms_qkv_exact_strided(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            eps,
+            bf16,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        let q_weight = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let k_weight = self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let v_weight = self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).unwrap();
+        let rows = n as u32;
+        let kv_dim = nkv * hd;
+        let kv_bytes = kv_dim as usize * bf16;
+        debug_assert!(per_seq_qkv % bf16 == 0, "qkv stride must be BF16-aligned");
+        let stride_bf16 = (per_seq_qkv / bf16) as u32;
+
+        // Q writes to qkv_buf[row].Q (offset 0 of each token slot), with Gate
+        // deinterleaved at the store. Out row stride is the full token stride.
+        ops::w4a16_gemv_qg_exact(
+            fwd.gpu,
+            self.w4a16_exact_qkv_kernels.qg_for_rows(n),
+            normed,
+            q_weight,
+            qkv_buf,
+            rows,
+            q_proj_dim,
+            h as u32,
+            nq,
+            hd,
+            stride_bf16,
+            stream,
+        )?;
+
+        // K writes to qkv_buf[row].K, V to qkv_buf[row].V; the base pointers
+        // are pre-offset, the row stride is the full token stride.
+        let k_base = qkv_buf.offset(q_proj_bytes);
+        let v_base = k_base.offset(kv_bytes);
+        ops::w4a16_gemv_dual_kv_exact(
+            fwd.gpu,
+            self.w4a16_exact_qkv_kernels.dual_kv_for_rows(n),
+            normed,
+            k_weight,
+            k_base,
+            v_weight,
+            v_base,
+            rows,
+            kv_dim,
+            h as u32,
+            stride_bf16,
+            stream,
+        )?;
+
+        if self.qk_norm_batched_available() {
+            return self.ms_qk_norm_rows(c);
+        }
+        for row in 0..n {
+            let q_out = qkv_buf.offset(row * per_seq_qkv);
+            let k_out = q_out.offset(q_proj_bytes);
+            self.ms_qk_norm(fwd, q_out, k_out, nq, nkv, hd, eps, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Complete ordinary K1 fallback. Keeping QG and dual-KV together avoids a
+    /// partially exact phase when one selected M17 symbol is unavailable.
+    fn ms_qkv_serial(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            h,
+            nq,
+            nkv,
+            hd,
+            eps,
+            bf16,
+            q_dim,
+            q_proj_dim,
+            q_proj_bytes,
+            per_seq_qkv,
+            normed,
+            qkv_buf,
+            ..
+        } = *c;
+        for row in 0..n {
+            let normed_row = normed.offset(row * h * bf16);
+            let q_out = qkv_buf.offset(row * per_seq_qkv);
+            let k_out = q_out.offset(q_proj_bytes);
+            let v_out = k_out.offset((nkv * hd) as usize * bf16);
+
+            self.ms_qkv_seq_q(fwd, normed_row, q_out, q_proj_dim, q_dim, nq, hd, h, stream)?;
+            self.ms_qkv_seq_kv(fwd, normed_row, k_out, v_out, nkv, hd, h, stream)?;
+            self.ms_qk_norm(fwd, q_out, k_out, nq, nkv, hd, eps, stream)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ms_qk_norm(
+        &self,
+        fwd: &crate::layer::ForwardContext<'_>,
+        q_out: DevicePtr,
+        k_out: DevicePtr,
+        nq: u32,
+        nkv: u32,
+        hd: u32,
+        eps: f32,
+        stream: u64,
+    ) -> Result<()> {
+        if !self.attn.q_norm.weight.is_null() {
+            ops::rms_norm(
+                fwd.gpu,
+                self.rms_norm_k,
+                q_out,
+                &self.attn.q_norm,
+                q_out,
+                nq,
+                hd,
+                eps,
+                stream,
+            )?;
+        }
+        if !self.attn.k_norm.weight.is_null() {
+            ops::rms_norm(
+                fwd.gpu,
+                self.rms_norm_k,
+                k_out,
+                &self.attn.k_norm,
+                k_out,
+                nkv,
+                hd,
+                eps,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Per-head `q_norm` + `k_norm` over all `n` tokens of `qkv_buf`.
+    ///
+    /// Callers gate on [`Self::qk_norm_batched_available`] and keep their
+    /// per-row `ms_qk_norm` loop when it is false. Both norm weights must be
+    /// present: the batched kernel does q and k in one grid and has no way to
+    /// skip one half.
+    fn qk_norm_batched_available(&self) -> bool {
+        attn_qk_norm_batched_enabled()
+            && self.rms_norm_qk_batch3_k.0 != 0
+            && !self.attn.q_norm.weight.is_null()
+            && !self.attn.k_norm.weight.is_null()
+    }
+
+    fn ms_qk_norm_rows(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+        let MultiSeqCtx {
+            fwd,
+            n,
+            stream,
+            nq,
+            nkv,
+            hd,
+            eps,
+            bf16,
+            q_proj_dim,
+            per_seq_qkv,
+            qkv_buf,
+            ..
+        } = *c;
+        debug_assert!(self.qk_norm_batched_available());
+        debug_assert!(per_seq_qkv % bf16 == 0, "qkv stride must be BF16-aligned");
+        ops::rms_norm_qk_batched(
+            fwd.gpu,
+            self.rms_norm_qk_batch3_k,
+            qkv_buf,
+            &self.attn.q_norm,
+            &self.attn.k_norm,
+            (per_seq_qkv / bf16) as u32,
+            nq * hd,
+            nkv * hd,
+            q_proj_dim,
+            hd,
+            n as u32,
+            eps,
+            stream,
+        )
     }
 
     /// n=3 NVFP4 batched path.

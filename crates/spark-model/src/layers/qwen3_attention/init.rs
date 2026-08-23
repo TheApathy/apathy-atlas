@@ -150,6 +150,60 @@ impl Qwen3AttentionLayer {
             },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
+            w4a16_exact_qkv_kernels: crate::layers::ops::W4a16ExactAttentionKernels::new(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_qg_exact_m17",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_dual_kv_exact_m17",
+                ),
+            )
+            .with_m4(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_qg_exact_m4",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_dual_kv_exact_m4",
+                ),
+            ),
+            w4a16_exact_o_proj_kernels: crate::layers::ops::W4a16ExactLmHeadKernels::new(
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m4"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m8"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m17"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m32"),
+            )
+            .with_rt2(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m4",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m8",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m17",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_rt",
+                    "w4a16_gemv_batch_logits_exact_rt2_m32",
+                ),
+            ),
+            w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
+            gemv_sw: crate::layers::ops::gemv_sw_enabled(),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
             w8a16_gemm_k: super::super::try_kernel(gpu, "w8a16_gemm", "w8a16_gemm"),
             w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
@@ -176,6 +230,18 @@ impl Qwen3AttentionLayer {
                 "tq_plus_innerq_apply_k",
             ),
             paged_decode_k: gpu.kernel(decode_mod, decode_fn)?,
+            paged_decode_bf16_qwen_tree_k: if kv_dtype == KvCacheDtype::Bf16
+                && config.model_type == "qwen3_5"
+                && config.head_dim == 256
+            {
+                super::super::try_kernel(
+                    gpu,
+                    "paged_decode_bf16_qwen_tree",
+                    "paged_decode_attn_bf16_qwen_tree",
+                )
+            } else {
+                KernelHandle(0)
+            },
             paged_decode_512_k: match kv_dtype {
                 // Bf16KTurbo3V: no HDIM=512 variant yet — dispatch site checks
                 // `paged_decode_512_k.0 != 0` so leaving handle 0 keeps the
@@ -357,6 +423,37 @@ impl Qwen3AttentionLayer {
                 }
                 _ => None,
             },
+            paged_decode_kgamma_fp8_bc4_k: match kv_dtype {
+                KvCacheDtype::Fp8 if config.head_dim == 128 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_fp8",
+                        "paged_decode_attn_kgamma_fp8_bc4_exact",
+                    );
+                    if h.0 != 0 { Some(h) } else { None }
+                }
+                _ => None,
+            },
+            paged_decode_kgamma_bf16_k: match kv_dtype {
+                KvCacheDtype::Bf16 if config.head_dim == 256 => {
+                    let h = super::super::try_kernel(
+                        gpu,
+                        "paged_decode_kgamma_bf16",
+                        "paged_decode_attn_kgamma_bf16_bc4_exact",
+                    );
+                    if h.0 != 0 {
+                        Some(h)
+                    } else {
+                        let h2 = super::super::try_kernel(
+                            gpu,
+                            "paged_decode_kgamma_bf16",
+                            "paged_decode_attn_kgamma_bf16",
+                        );
+                        if h2.0 != 0 { Some(h2) } else { None }
+                    }
+                }
+                _ => None,
+            },
             // VEC variant of the kgamma kernel: 16 warps/CTA + 2-position
             // dequant batching. Gated by `ATLAS_KGAMMA_VECDEQUANT=1` at the
             // dispatch site. `try_kernel` falls back to None for older PTX
@@ -460,6 +557,7 @@ impl Qwen3AttentionLayer {
             ),
             rms_norm_qk_batch3_k: super::super::try_kernel(gpu, "norm", "rms_norm_qk_batch3"),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
+            w4a16_gemm_pipe_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,

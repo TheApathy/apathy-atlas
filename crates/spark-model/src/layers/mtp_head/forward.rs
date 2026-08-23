@@ -3,7 +3,7 @@
 //! Per-token MTP forward pass.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 
 use super::{MtpHead, MtpProposerState, MtpQuantization, ProjectionWeight};
 use crate::layer::ForwardContext;
@@ -282,7 +282,8 @@ impl MtpHead {
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(state.block_table.as_ptr() as *const u8, bt_len) };
         meta_buf[256..256 + bt_len].copy_from_slice(bt_bytes);
-        ctx.gpu.copy_h2d_async(&meta_buf, meta_base, stream)?;
+        ctx.gpu
+            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&meta_buf, meta_base)], stream)?;
 
         // RoPE
         ops::rope(

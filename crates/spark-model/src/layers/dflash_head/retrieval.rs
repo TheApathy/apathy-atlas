@@ -114,6 +114,9 @@ pub struct RetrievalHit {
     pub drafts: Vec<u32>,
     /// Length of the suffix that matched (for hybrid selection + logging).
     pub match_len: usize,
+    /// Number of non-key token positions that differed. Zero for the legacy
+    /// exact matchers; non-zero only for verifier-key retrieval.
+    pub key_distance: usize,
 }
 
 /// Find the longest-suffix match of `[..haystack, last_token]` earlier in
@@ -170,6 +173,7 @@ pub fn retrieve(haystack: &[u32], last_token: u32, cfg: &RetrievalConfig) -> Opt
                 return Some(RetrievalHit {
                     drafts,
                     match_len: ng,
+                    key_distance: 0,
                 });
             }
             if p == 0 {
@@ -294,6 +298,93 @@ pub fn retrieve_longest(
     Some(RetrievalHit {
         drafts: haystack[cs..cs + need].to_vec(),
         match_len: best_len,
+        key_distance: 0,
+    })
+}
+
+/// Oilbird-inspired verifier-key retrieval prototype.
+///
+/// An exact final token anchors each candidate. The preceding context window
+/// acts as a cheap host-side proxy for a verifier-computed key, with at most
+/// `max_distance` substituted token positions. This recovers repetitive code
+/// after a freshly minted identifier/value makes token-exact SAM miss. The
+/// returned continuation is still only a *draft*: the unchanged target verify
+/// path commits it token-by-token iff it equals the greedy target output.
+///
+/// This deliberately does not claim semantic hidden-state keys yet. It is a
+/// bounded first implementation that tests the central Oilbird hypothesis
+/// without adding a target-hidden D2H transfer to the decode critical path.
+pub fn retrieve_by_key(
+    haystack: &[u32],
+    last_token: u32,
+    cfg: &RetrievalConfig,
+    max_distance: usize,
+) -> Option<RetrievalHit> {
+    let l = haystack.len();
+    let need = cfg.draft_count;
+    if max_distance == 0 {
+        return retrieve_longest(haystack, last_token, cfg);
+    }
+    if l < cfg.l_min || need == 0 {
+        return None;
+    }
+
+    const MAX_CANDIDATES: usize = 256;
+    let max_p = l.checked_sub(need)?;
+    let mut best: Option<(usize, usize, usize)> = None; // (length, distance, follow start)
+    let mut examined = 0usize;
+    let mut p = max_p;
+    loop {
+        if haystack[p] == last_token {
+            let max_len = cfg.l_max.min(p + 1).min(l + 1);
+            let mut distance = 0usize;
+            let mut match_len = 1usize;
+            while match_len < max_len {
+                let live_idx = l - match_len;
+                let cand_idx = p - match_len;
+                if cand_idx >= live_idx {
+                    break;
+                }
+                if haystack[cand_idx] != haystack[live_idx] {
+                    distance += 1;
+                    if distance > max_distance {
+                        break;
+                    }
+                }
+                match_len += 1;
+            }
+            if match_len >= cfg.l_min && distance <= max_distance {
+                let replace = best
+                    .map(|(best_len, best_distance, _)| {
+                        match_len > best_len || (match_len == best_len && distance < best_distance)
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best = Some((match_len, distance, p + 1));
+                }
+                if match_len == cfg.l_max && distance == 0 {
+                    break;
+                }
+            }
+            examined += 1;
+            if examined >= MAX_CANDIDATES {
+                break;
+            }
+        }
+        if p == 0 {
+            break;
+        }
+        p -= 1;
+    }
+
+    let (match_len, key_distance, cs) = best?;
+    if cs + need > l {
+        return None;
+    }
+    Some(RetrievalHit {
+        drafts: haystack[cs..cs + need].to_vec(),
+        match_len,
+        key_distance,
     })
 }
 
@@ -422,6 +513,28 @@ mod tests {
         // last_token = 3 appears at idx2 but the preceding token (8) != 2, so
         // the longest suffix match is length 1 → rejected by l_min=2.
         assert!(retrieve_longest(&haystack, 3, &sam_cfg(2, 16, 2)).is_none());
+    }
+
+    #[test]
+    fn key_retrieval_recovers_one_minted_value_change() {
+        // Earlier: [fn,(,old,),{] -> continuation. Live context has `new` in
+        // the corresponding slot, so exact SAM misses but distance-1 keys hit.
+        let haystack = vec![10, 11, 100, 12, 13, 50, 51, 52, 10, 11, 200, 12];
+        let config = sam_cfg(3, 5, 5);
+        assert!(retrieve_longest(&haystack, 13, &config).is_none());
+        let hit = retrieve_by_key(&haystack, 13, &config, 1).expect("key hit");
+        assert_eq!(hit.drafts, vec![50, 51, 52]);
+        assert_eq!(hit.match_len, 5);
+        assert_eq!(hit.key_distance, 1);
+    }
+
+    #[test]
+    fn key_retrieval_respects_distance_bound() {
+        let haystack = vec![10, 11, 100, 12, 13, 50, 51, 52, 10, 99, 200, 12];
+        let config = sam_cfg(3, 5, 5);
+        assert!(retrieve_by_key(&haystack, 13, &config, 1).is_none());
+        let hit = retrieve_by_key(&haystack, 13, &config, 2).expect("distance two hit");
+        assert_eq!(hit.key_distance, 2);
     }
 
     #[test]

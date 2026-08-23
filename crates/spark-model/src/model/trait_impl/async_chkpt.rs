@@ -289,6 +289,11 @@ impl TransformerModel {
                 // every K≠17 (chunked/fused) verify — replay must not fire
                 // there (task #34 sibling hazard).
                 let lazy_engaged = self.layers[i].wy17_lazy_engaged(k);
+                // GDN LAZY (ExactSequence): pure mirror of the dispatch
+                // decision — same k, same env, same handles (graph-safe).
+                let seq_lazy = self.layers[i].gdn_seq_lazy_engaged(k);
+                let seq_replay_kernel = self.layers[i].gdn_seq_replay_kernel();
+                let seq_retain = self.layers[i].gdn_seq_lazy_retain();
 
                 let ssm = layer_state
                     .as_any_mut()
@@ -314,6 +319,17 @@ impl TransformerModel {
                 let conv_bytes = conv_dim * d_conv * 4;
 
                 if num_accepted == k && !was_tree_mode {
+                    if seq_lazy {
+                        // lazyfinal left h_state at STEP-INITIAL; the true
+                        // post-K state is in inter[k-1] (the one slot the
+                        // lazy kernel writes). Restore it before the
+                        // checkpoint mirror below.
+                        let h_fin =
+                            self.ssm_pool
+                                .h_intermediate(ssm_layer_idx, seq.slot_idx, k - 1);
+                        self.gpu
+                            .copy_d2d_async(h_fin, ssm.h_state, h_bytes, stream)?;
+                    }
                     // Full accept (wy_k path): h_state already holds state-
                     // after-K, which is the canonical post-step state. Mirror
                     // into the checkpoint so a future rollback (if any) has a
@@ -363,6 +379,23 @@ impl TransformerModel {
                         && ssm.wy17_kv_retain.is_some()
                         && ssm.wy17_gate_retain.is_some();
 
+                    if ssm_layer_idx == 0
+                        && std::env::var("ATLAS_SPEC_BOOTSTRAP_TRACE").ok().as_deref() == Some("1")
+                    {
+                        tracing::info!(
+                            "DFLASH_COMMIT_TRACE k={} accepted={} inter_slot={} tree={} lazy_j={} lazy_engaged={} replay_kernel={} retained={} use_replay={}",
+                            k,
+                            num_accepted,
+                            last_inter_slot,
+                            was_tree_mode,
+                            lazy_j,
+                            lazy_engaged,
+                            replay_kernel.0 != 0,
+                            ssm.wy17_kv_retain.is_some() && ssm.wy17_gate_retain.is_some(),
+                            use_replay,
+                        );
+                    }
+
                     if use_replay {
                         // Retained forward inputs (this layer's snapshot).
                         let kv_ret = ssm.wy17_kv_retain.unwrap();
@@ -403,6 +436,64 @@ impl TransformerModel {
                         self.gpu
                             .copy_d2d_async(ssm.h_state, h_ckpt, h_bytes, stream)?;
                         // Conv is always persisted → plain D2D.
+                        self.gpu
+                            .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
+                        self.gpu
+                            .copy_d2d_async(conv_inter, conv_ckpt, conv_bytes, stream)?;
+                    } else if seq_lazy && !was_tree_mode {
+                        // GDN LAZY partial accept: every inter slot except
+                        // [k-1] is garbage (never written). h_state still
+                        // holds the step-initial H — replay the identical
+                        // FP32 recurrence (nosnap kernel) over the first
+                        // `last_inter_slot+1` retained tokens, in place.
+                        // Bit-exact: same kernel arithmetic, same order,
+                        // same inputs.
+                        let Some(retain) = seq_retain else {
+                            bail!(
+                                "GDN lazy commit: retention buffer missing at ssm layer {ssm_layer_idx} \
+                                 (dispatch/commit mismatch — refusing to copy garbage intermediates)"
+                            );
+                        };
+                        if seq_replay_kernel.0 == 0 {
+                            bail!(
+                                "GDN lazy commit: replay kernel missing (dispatch/commit mismatch)"
+                            );
+                        }
+                        let fp32 = 4usize;
+                        let qkvz = self.config.ssm_qkvz_size();
+                        let max_k = crate::layers::qwen3_ssm::GDN_LAZY_MAX_K;
+                        let key_dim = nk * kd;
+                        let gates = retain.offset(max_k * qkvz * fp32);
+                        // Dead output target: inter slot 0 is garbage under
+                        // lazy and comfortably larger than k*qkvz*4.
+                        let out_scratch = self.ssm_pool.h_intermediate(ssm_layer_idx, slot, 0);
+                        crate::layers::ops::gdn_decode_f32_sequence(
+                            self.gpu.as_ref(),
+                            seq_replay_kernel,
+                            ssm.h_state, // in/out: starts at step-initial
+                            retain,
+                            retain.offset(key_dim * fp32),
+                            retain.offset(key_dim * 2 * fp32),
+                            gates,
+                            gates.offset(nv * fp32),
+                            out_scratch,
+                            out_scratch, // h_inter arg: nosnap never writes it
+                            (last_inter_slot + 1) as u32,
+                            nk as u32,
+                            nv as u32,
+                            kd as u32,
+                            vd as u32,
+                            qkvz as u32,
+                            qkvz as u32,
+                            (nv * 2) as u32,
+                            qkvz as u32,
+                            (h_bytes / fp32) as u32,
+                            stream,
+                        )?;
+                        // Mirror reconstructed H into the checkpoint (parity
+                        // with the D2D path), conv is always persisted.
+                        self.gpu
+                            .copy_d2d_async(ssm.h_state, h_ckpt, h_bytes, stream)?;
                         self.gpu
                             .copy_d2d_async(conv_inter, ssm.conv_state, conv_bytes, stream)?;
                         self.gpu

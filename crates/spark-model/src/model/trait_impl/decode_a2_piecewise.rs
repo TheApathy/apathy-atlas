@@ -239,6 +239,7 @@ impl TransformerModel {
                         conv_state_intermediates: Vec::new(),
                         wy17_kv_retain: None,
                         wy17_gate_retain: None,
+                        h_is_f16: false,
                     }));
                     ssm_idx += 1;
                 } else {
@@ -472,7 +473,7 @@ fn clone_ctx<'a>(ctx: &ForwardContext<'a>) -> ForwardContext<'a> {
         tree_aware_attn: None,
         ssm_multi_seq_ptr_table_override: None,
         self_spec_sparse_draft: None,
-            ffn_defer: None,
+        ffn_defer: None,
     }
 }
 

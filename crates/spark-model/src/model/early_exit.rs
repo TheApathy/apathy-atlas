@@ -39,7 +39,7 @@
 
 use anyhow::Result;
 use atlas_core::config::LayerType;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 
 use super::block_mgmt::ensure_blocks_through_decode;
 use super::types::TransformerModel;
@@ -169,25 +169,27 @@ impl TransformerModel {
         let max_blocks = seq.block_table.len() as u32;
 
         let pos_val = seq.seq_len as u32;
-        self.gpu
-            .copy_h2d_async(&pos_val.to_le_bytes(), meta_base, stream)?;
+        let pos_bytes = pos_val.to_le_bytes();
 
         let block_idx = seq
             .physical_block_for(seq.seq_len / bs)
             .unwrap_or(self.dummy_kv_block);
         let global_slot = (block_idx as i64) * (bs as i64) + ((seq.seq_len % bs) as i64);
-        self.gpu
-            .copy_h2d_async(&global_slot.to_le_bytes(), meta_base.offset(8), stream)?;
+        let slot_bytes = global_slot.to_le_bytes();
 
         let actual_seq_len = (seq.seq_len + 1) as i32;
-        self.gpu
-            .copy_h2d_async(&actual_seq_len.to_le_bytes(), meta_base.offset(16), stream)?;
+        let seq_len_bytes = actual_seq_len.to_le_bytes();
 
         let bt_i32: Vec<i32> = seq.block_table.iter().map(|&b| b as i32).collect();
         let bt_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(bt_i32.as_ptr() as *const u8, bt_i32.len() * 4) };
-        self.gpu
-            .copy_h2d_async(bt_bytes, meta_base.offset(256), stream)?;
+        let copies = [
+            HostToDeviceCopy::new(&pos_bytes, meta_base),
+            HostToDeviceCopy::new(&slot_bytes, meta_base.offset(8)),
+            HostToDeviceCopy::new(&seq_len_bytes, meta_base.offset(16)),
+            HostToDeviceCopy::new(bt_bytes, meta_base.offset(256)),
+        ];
+        self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,

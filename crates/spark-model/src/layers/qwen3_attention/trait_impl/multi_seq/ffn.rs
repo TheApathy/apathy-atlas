@@ -22,6 +22,9 @@ impl Qwen3AttentionLayer {
             residual,
             ..
         } = *c;
+        let serial = crate::model::env_diag::DflashSerialControls::current();
+        let force_serial_ffn = n > 1 && serial.ffn;
+        let force_serial_norms = n > 1 && serial.layer_norms;
 
         if self.ffn.is_none() {
             ops::residual_add(
@@ -54,41 +57,17 @@ impl Qwen3AttentionLayer {
         // across every sequence's rows and adds the output back into `hidden`.
         if let Some(defer) = fwd.ffn_defer {
             let normed2_base = fwd.buffers.norm_output();
-            ops::residual_add_rms_norm(
-                fwd.gpu,
-                self.residual_add_rms_norm_k,
-                hidden,
-                o_out,
-                &self.post_attn_norm,
-                normed2_base,
-                residual,
-                n as u32,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.ms_post_norm(c, o_out, normed2_base)?;
             let dst = defer.dst_base.offset(defer.row_offset * h * bf16);
             fwd.gpu
                 .copy_d2d_async(normed2_base, dst, n * h * bf16, stream)?;
             return Ok(());
         }
 
-        let force_seq_ffn = self.mla.is_some();
+        let force_seq_ffn = self.mla.is_some() || force_serial_ffn;
         if n == 3 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
-            ops::residual_add_rms_norm(
-                fwd.gpu,
-                self.residual_add_rms_norm_k,
-                hidden,
-                o_out,
-                &self.post_attn_norm,
-                normed2,
-                residual,
-                3,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.ms_post_norm(c, o_out, normed2)?;
             self.ffn.forward_k3(normed2, fwd, stream)?;
             let moe_out = fwd.buffers.moe_output();
             ops::residual_add(
@@ -101,19 +80,7 @@ impl Qwen3AttentionLayer {
             )?;
         } else if n == 2 && !force_seq_ffn {
             let normed2 = fwd.buffers.norm_output();
-            ops::residual_add_rms_norm(
-                fwd.gpu,
-                self.residual_add_rms_norm_k,
-                hidden,
-                o_out,
-                &self.post_attn_norm,
-                normed2,
-                residual,
-                2,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            self.ms_post_norm(c, o_out, normed2)?;
             self.ffn.forward_k2(normed2, fwd, stream)?;
             let moe_out = fwd.buffers.moe_output();
             ops::residual_add(
@@ -155,7 +122,10 @@ impl Qwen3AttentionLayer {
             // since been resolved upstream; keeping it suppressed the
             // fast kernel on truncated-γ verifies, costing the prose
             // path 15-20 tok/s.
-            let try_kgamma = n > 3 && crate::layers::ffn_kgamma_m16_enabled();
+            let try_kgamma = !force_serial_ffn
+                && n > 3
+                && (crate::layers::ffn_kgamma_m16_enabled()
+                    || self.ffn.exact_kgamma_applicable(n as u32));
             let used_kgamma = if try_kgamma {
                 // 1) Batched residual + norm for all n tokens. The
                 // single-token slice in the fallback loop reads
@@ -164,19 +134,7 @@ impl Qwen3AttentionLayer {
                 // identical to the n=2 / n=3 branches above.
                 let normed2_base = fwd.buffers.norm_output();
                 crate::kprof!(fwd.gpu, stream, "attn_ffn_kgamma_norm", {
-                    ops::residual_add_rms_norm(
-                        fwd.gpu,
-                        self.residual_add_rms_norm_k,
-                        hidden,
-                        o_out,
-                        &self.post_attn_norm,
-                        normed2_base,
-                        residual,
-                        n as u32,
-                        h as u32,
-                        eps,
-                        stream,
-                    )?;
+                    self.ms_post_norm(c, o_out, normed2_base)?;
                     anyhow::Result::<()>::Ok(())
                 })?;
                 // 2) Batched FFN at M=n. Output lands in
@@ -239,6 +197,16 @@ impl Qwen3AttentionLayer {
                     }
                     anyhow::Result::<()>::Ok(())
                 })?;
+                if force_serial_ffn {
+                    crate::model::control_engagement::engage(
+                        crate::model::control_engagement::ControlPath::AttnFfn,
+                    )?;
+                }
+                if force_serial_norms && !try_kgamma {
+                    crate::model::control_engagement::engage(
+                        crate::model::control_engagement::ControlPath::AttnPostNorm,
+                    )?;
+                }
             }
         }
         Ok(())

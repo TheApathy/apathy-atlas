@@ -19,7 +19,7 @@
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 
 use super::super::super::types::TransformerModel;
 use crate::layer::SsmLayerState;
@@ -65,7 +65,8 @@ impl TransformerModel {
         let bytes = unsafe {
             std::slice::from_raw_parts(h_ptrs.as_ptr() as *const u8, n * std::mem::size_of::<u64>())
         };
-        self.gpu.copy_h2d_async(bytes, dst, stream)?;
+        self.gpu
+            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(bytes, dst)], stream)?;
         Ok(dst)
     }
 }

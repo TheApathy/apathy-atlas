@@ -36,7 +36,15 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 /// Debug (not warn) because misses are expected when a model doesn't use a
 /// given feature: e.g. Qwen3-Coder-Next (GDN+attention) never calls MLA
 /// kernels, but the layer builder still probes them. Warning on expected
-/// misses drowned out genuine problems in startup logs.
+/// misses drowned out genuine problems in startup logs. The place a miss
+/// DOES deserve a warning is the dispatch site of a knob the operator
+/// explicitly turned on — see [`warn_kernel_fallback`].
+///
+/// `#[track_caller]` so `kernel_audit` records the LAYER CONSTRUCTOR's
+/// `file:line`, not this wrapper's. Every one of the 167 optional lookups in
+/// this crate funnels through here; without it `--check-kernels` would name a
+/// single line for all of them.
+#[track_caller]
 pub fn try_kernel(gpu: &dyn GpuBackend, module: &str, func: &str) -> KernelHandle {
     match gpu.kernel(module, func) {
         Ok(h) => h,
@@ -45,6 +53,39 @@ pub fn try_kernel(gpu: &dyn GpuBackend, module: &str, func: &str) -> KernelHandl
             KernelHandle(0)
         }
     }
+}
+
+/// Warn ONCE that an explicitly-enabled knob is a no-op because its kernel
+/// symbol did not resolve.
+///
+/// The failure mode this exists for: a knob is gated on
+/// `env == "1" && handle.0 != 0`, the operator sets the env var, the PTX cache
+/// is stale, and the second conjunct quietly turns the whole thing off. The
+/// run then measures the fallback path while the recipe, the logs and the
+/// operator all say the knob is on. Our champion recipe sets 42 such
+/// variables; upstream's LESSON 11 was that six of ten in their published
+/// recipe did nothing.
+///
+/// `latch` must be a `static` at the call site — these are dispatch-path
+/// checks, so an unlatched `warn!` would fire once per layer per token.
+/// `consequence` names the path actually taken, because "kernel missing" on
+/// its own does not tell an operator whether the number they just recorded is
+/// usable.
+pub fn warn_kernel_fallback(
+    latch: &'static std::sync::Once,
+    env_var: &str,
+    symbol: &str,
+    consequence: &str,
+) {
+    latch.call_once(|| {
+        tracing::warn!(
+            "{env_var} is set but the `{symbol}` kernel symbol did not resolve — {consequence}. \
+             The knob is a SILENT NO-OP for this run; any measurement taken from it is a \
+             measurement of the fallback path. Rebuild the kernel cache, and use \
+             `spark serve --check-kernels` to list every unresolved lookup with its dispatch \
+             site."
+        );
+    });
 }
 
 /// Returns true when `ATLAS_TC_NVFP4_M16=1` is set in the process env.
@@ -143,6 +184,50 @@ pub fn ssm_qkvz_splitk() -> u32 {
     })
 }
 
+/// `ATLAS_SSM_PROJ_TC=1` REFREEZE switch: un-shadow the split-K tensor-core
+/// transposed-weight paths for the SSM QKVZ and out projections, which the
+/// bit-exact `ssm_qkvz_exact` / `ssm_out_exact` branches otherwise catch
+/// first for the sequential Qwen3.x layout. The split-K kernels use FP32
+/// partials + `reduce_splitk_f32_to_bf16`, so the reduction order differs
+/// from the serial FMA oracle and token output can change: the reference
+/// completion hash must be re-established after enabling. Default off (the
+/// exact branches keep shadowing the TC paths).
+pub fn ssm_proj_tc_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_PROJ_TC").ok().as_deref() == Some("1"))
+}
+
+/// Diagnostic-only: force every row of the batched SSM QKVZ projection
+/// through the same NVFP4 GEMV used by single-token decode.  This is a
+/// losslessness bisection switch, not a serving optimization.
+pub fn ssm_qkvz_serial_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_QKVZ_SERIAL").ok().as_deref() == Some("1"))
+}
+
+/// Diagnostic-only counterpart for the SSM output projection.  Re-reading
+/// the weight once per verify row is intentionally slow but exactly matches
+/// the single-token NVFP4 GEMV dispatch.
+pub fn ssm_out_serial_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_SERIAL").ok().as_deref() == Some("1"))
+}
+
+/// Diagnostic correctness oracle for the recurrent half of a batched SSM
+/// verify.  It preserves the FP32 conv/GDN contract used by ordinary decode
+/// and processes rows sequentially so recurrent state advances identically.
+pub fn ssm_recurrent_serial_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_RECURRENT_SERIAL").ok().as_deref() == Some("1"))
+}
+
+/// Diagnostic-only: use the fused single-token BA projection and gate
+/// transform for each verify row, matching ordinary decode exactly.
+pub fn ssm_ba_serial_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_BA_SERIAL").ok().as_deref() == Some("1"))
+}
+
 /// Returns true when `ATLAS_SSM_BA_BATCHED=1` is set in the process env.
 ///
 /// Gates the K=3 batched-GEMV path for the SSM BA projection. The
@@ -168,9 +253,15 @@ pub fn ssm_ba_batched_enabled() -> bool {
 /// N=q_proj_dim=12288 already fields 192 CTAs (well-provisioned; split-K is
 /// a no-op there, like FFN gate/up). This factor slices the K axis of the
 /// K and V GEMMs across gridDim.z into an FP32 workspace, then
-/// `reduce_splitk_f32_to_bf16` sums+downcasts — lossless (FP32 partials),
-/// token-exact, mirroring the proven `ffn_down` split-K path. Q stays on
-/// the single-slice kernel. Returns 0 (disabled) when unset/0/1; else the
+/// `reduce_splitk_f32_to_bf16` sums+downcasts. FP32 partials, so nothing
+/// rounds to BF16 mid-accumulation — but that is NOT token-exactness, and
+/// the earlier wording here claiming it was is wrong: slicing K reassociates
+/// the FP32 sum and can move the committed token. See
+/// `ops::w4a16_gemm_n64_m32_splitk`. Q stays on the single-slice kernel.
+///
+/// Note this factor is inert on gated Qwen3.8 anyway: it is read only inside
+/// `ms_qkv_batched_plain`, which `exact_attention_qkv_route` short-circuits
+/// for every n in 4..=17. Returns 0 (disabled) when unset/0/1; else the
 /// parsed factor clamped to [2, 8]. A/B against the single-slice baseline —
 /// the win is only real if the extra CTAs raise effective bandwidth on the
 /// tiny K/V weights.
@@ -183,6 +274,24 @@ pub fn attn_qkv_splitk() -> u32 {
             .map(|v| if v < 2 { 0 } else { v.min(8) })
             .unwrap_or(0)
     })
+}
+
+/// Diagnostic correctness oracle for the attention output projection during
+/// multi-token verify. Process every row with the same NVFP4 decode GEMV
+/// dispatcher as single-token decode, including the software-kernel choice.
+pub fn attn_out_serial_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_ATTN_OUT_SERIAL").ok().as_deref() == Some("1"))
+}
+
+/// Diagnostic correctness oracle for paged attention during multi-token
+/// verification.  Launch each verification row as an independent one-row
+/// paged-decode call so kernel choice, split geometry, and reduction layout
+/// match ordinary decode.  Flat chains only; tree indirection intentionally
+/// stays on the batched implementation.
+pub fn attn_paged_serial_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_ATTN_PAGED_SERIAL").ok().as_deref() == Some("1"))
 }
 
 /// V-dim split factor for the DFlash K=17 `gated_delta_rule_wy17` GDN verify.
@@ -798,6 +907,51 @@ pub fn prefill_ffn_fast_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() != Some("0"))
 }
 
+/// Returns true when the prefill FFN baseline path should use the cp.async
+/// double-buffered byte-exact shadow kernel (`w4a16_gemm_pipe`). Default OFF
+/// (`ATLAS_PREFILL_FFN_PIPE=1` to enable) — the pipe kernel preserves the
+/// baseline's dequant + MMA arithmetic exactly, so the route is bit-exact;
+/// it only changes the load pipeline. When the pipe kernel symbol is missing
+/// (older kernel caches) the dispatch falls back to the baseline silently.
+pub fn prefill_ffn_pipe_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_PIPE").ok().as_deref() == Some("1"))
+}
+
+/// Returns true when the prefill projection non-transposed fallback routes
+/// through the byte-exact pipelined `w4a16_gemm_pipe` instead of the
+/// latency-bound baseline `w4a16_gemm` (`ATLAS_PREFILL_PROJ_PIPE=1`).
+///
+/// With `ATLAS_PREFILL_PROJ_FAST=0` (the champion bit-exact config), the
+/// attention QKV/O and SSM QKVZ/out prefill projections fall to the baseline
+/// non-transposed M_TILE=64 `w4a16_gemm`, which is latency-bound at small M
+/// (~21 GB/s vs the decode kernels' ~190 GB/s). The pipe kernel is a
+/// byte-exact shadow (same dequant arithmetic, same m16n8k16 MMA order, only
+/// the cp.async load pipeline differs), so routing these projections through
+/// it preserves exactness while removing the per-layer latency floor.
+/// Default off; the projection dispatch falls back to the baseline when the
+/// handle is missing.
+pub fn prefill_proj_pipe_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_PROJ_PIPE").ok().as_deref() == Some("1"))
+}
+
+/// Returns true when the attention AND SSM prefill projection transposed-TC
+/// fast paths are enabled. Default ON (opt-out via `ATLAS_PREFILL_PROJ_FAST=0`).
+///
+/// The attention Q/K/V/O and the SSM QKVZ/out PREFILL projections all route
+/// through transposed (`nvfp4_t`) tensor-core GEMMs (`w4a16_gemm_n128*`) by
+/// default — the SAME class of kernel as the FFN prefill fast path that
+/// drifted the prompt hidden state and flipped hard.05/expert.02. Opting out
+/// routes them through the non-transposed M_TILE=64 `w4a16_gemm` instead,
+/// mirroring the FFN fix. This only affects the PREFILL projections; the
+/// transposed weights remain installed for the decode/verify path. Cached via
+/// `OnceLock`.
+pub fn prefill_proj_fast_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_PROJ_FAST").ok().as_deref() != Some("0"))
+}
+
 /// Returns true when `ATLAS_FFN_PREDEQUANT_FP8=1` is set in the process env.
 ///
 /// Gates the dense FFN large-M prefill path's routing through the
@@ -949,6 +1103,7 @@ pub fn dflash_attn_kgamma_enabled() -> bool {
 /// layer:
 ///   1. on `input` (gate/up in, K=hidden=5120) before the dual GEMV
 ///   2. on `gate_out` (down in, K=intermediate=17408) after silu_mul
+///
 /// accumulating per-site below-threshold histograms at {0.5,1,2,5}%×rowmax.
 /// A periodic D2H dump (see `DenseFfnLayer::maybe_dump_sparsity`) prints the
 /// averaged fractions so the operator can read the down_proj-input sparsity —
@@ -1055,6 +1210,35 @@ pub fn parse_sparse_thresh_pct(pct: f32) -> f32 {
 pub fn flash_attn_kgamma_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_FLASH_ATTN_KGAMMA").ok().as_deref() == Some("1"))
+}
+
+/// Quarantined FP8 Kgamma M=15 experiment.
+///
+/// This route is intentionally unreachable from the former public experiment
+/// gate. The replacement preserves the legacy reduction topology statically,
+/// but remains unverified on device. A deliberately alarming developer-only
+/// name permits captured-context diagnosis without accidental promotion.
+pub fn flash_attn_kgamma_fp8_bc4_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_UNSAFE_UNVERIFIED_FP8_KGAMMA_EXACT")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+/// BF16-KV sibling of the flat K-gamma fused attention route. Kept on an
+/// independent gate so mixed-KV models can qualify BF16 and compressed layers
+/// separately and a missing PTX symbol always falls back to the proven path.
+pub fn flash_attn_kgamma_bf16_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_UNSAFE_UNVERIFIED_BF16_KGAMMA_EXACT")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
 }
 
 /// Returns true when `ATLAS_KGAMMA_VECDEQUANT=1` is set in the process env.
@@ -1208,6 +1392,15 @@ impl FfnComponent {
                 Ok(true)
             }
             Self::Moe(_) | Self::None => Ok(false),
+        }
+    }
+
+    /// True when the dense exact-W4 dispatcher owns this row count even if
+    /// the legacy `ATLAS_FFN_KGAMMA_M16` optimization gate is unset.
+    pub fn exact_kgamma_applicable(&self, rows: u32) -> bool {
+        match self {
+            Self::Dense(d) => d.exact_kgamma_applicable(rows),
+            Self::Moe(_) | Self::None => false,
         }
     }
 

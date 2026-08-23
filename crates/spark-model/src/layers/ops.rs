@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/dflash2_conv.rs"]
+mod dflash2_conv;
 #[path = "ops/embeddings.rs"]
 mod embeddings;
 #[path = "ops/fp8_moe.rs"]
@@ -27,6 +29,16 @@ mod gemm_dense;
 mod gemm_quant;
 #[path = "ops/gemm_w3.rs"]
 mod gemm_w3;
+#[path = "ops/gemv_exact_attention.rs"]
+mod gemv_exact_attention;
+#[path = "ops/gemv_exact_ffn.rs"]
+mod gemv_exact_ffn;
+#[path = "ops/gemv_exact_ffn_lowreg_m16.rs"]
+mod gemv_exact_ffn_lowreg_m16;
+#[path = "ops/gemv_exact_lm_head.rs"]
+mod gemv_exact_lm_head;
+#[path = "ops/gemv_sw.rs"]
+mod gemv_sw;
 #[path = "ops/kv_cache.rs"]
 mod kv_cache;
 #[path = "ops/kv_cache_fp8k.rs"]
@@ -47,6 +59,8 @@ mod moe_grouped_b;
 mod moe_prefill;
 #[path = "ops/norm.rs"]
 mod norm;
+#[path = "ops/paged_decode_tree.rs"]
+mod paged_decode_tree;
 #[path = "ops/prefill_attn_a.rs"]
 mod prefill_attn_a;
 #[path = "ops/prefill_attn_b.rs"]
@@ -79,6 +93,7 @@ mod ssm_mamba;
 mod ssm_preproc;
 
 pub use activations::*;
+pub use dflash2_conv::*;
 pub use embeddings::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
@@ -86,6 +101,11 @@ pub use fp8_moe_batch_b::*;
 pub use gemm_dense::*;
 pub use gemm_quant::*;
 pub use gemm_w3::*;
+pub use gemv_exact_attention::*;
+pub use gemv_exact_ffn::*;
+pub use gemv_exact_ffn_lowreg_m16::*;
+pub use gemv_exact_lm_head::*;
+pub use gemv_sw::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;
 pub use kv_cache_turbok::*;
@@ -97,6 +117,7 @@ pub use moe_grouped_a::*;
 pub(crate) use moe_grouped_b::*;
 pub use moe_prefill::*;
 pub use norm::*;
+pub use paged_decode_tree::*;
 pub use prefill_attn_a::*;
 pub use prefill_attn_b::*;
 pub use prefill_attn_batched::*;

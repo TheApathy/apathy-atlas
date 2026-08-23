@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Exact child manifest for the chunked-prefill production surface.
+
+pub(super) const CHILDREN: &[(&str, &str)] = &[
+    (
+        "batch",
+        include_str!("../../src/model/trait_impl/prefill_b/batch.rs"),
+    ),
+    (
+        "batch_kernel",
+        include_str!("../../src/model/trait_impl/prefill_b/batch_kernel.rs"),
+    ),
+    (
+        "batch_kernel_tests",
+        include_str!("../../src/model/trait_impl/prefill_b/batch_kernel_tests.rs"),
+    ),
+    (
+        "batched_layer",
+        include_str!("../../src/model/trait_impl/prefill_b/batched_layer.rs"),
+    ),
+    (
+        "embed_chunk",
+        include_str!("../../src/model/trait_impl/prefill_b/embed_chunk.rs"),
+    ),
+    (
+        "finalize_last",
+        include_str!("../../src/model/trait_impl/prefill_b/finalize_last.rs"),
+    ),
+    (
+        "forward_layers",
+        include_str!("../../src/model/trait_impl/prefill_b/forward_layers.rs"),
+    ),
+    (
+        "h_state_ptrs",
+        include_str!("../../src/model/trait_impl/prefill_b/h_state_ptrs.rs"),
+    ),
+    (
+        "prefix_lookup",
+        include_str!("../../src/model/trait_impl/prefill_b/prefix_lookup.rs"),
+    ),
+    (
+        "proc_range",
+        include_str!("../../src/model/trait_impl/prefill_b/proc_range.rs"),
+    ),
+    (
+        "save_checkpoint",
+        include_str!("../../src/model/trait_impl/prefill_b/save_checkpoint.rs"),
+    ),
+    (
+        "stage_batched",
+        include_str!("../../src/model/trait_impl/prefill_b/stage_batched.rs"),
+    ),
+    (
+        "upload_meta",
+        include_str!("../../src/model/trait_impl/prefill_b/upload_meta.rs"),
+    ),
+    (
+        "upload_paged",
+        include_str!("../../src/model/trait_impl/prefill_b/upload_paged.rs"),
+    ),
+];

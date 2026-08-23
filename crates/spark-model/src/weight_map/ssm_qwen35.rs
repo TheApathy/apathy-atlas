@@ -80,16 +80,22 @@ pub(crate) fn load_ssm_qwen35(
         if is_packed(proj) {
             return dequant_nvfp4_to_bf16(store, &prefix, n, k, gpu);
         }
-        // nvidia/Qwen3.6-27B-NVFP4 stores SSM projections as FP8E4M3 with a
-        // per-tensor scalar `weight_scale` (not NVFP4-packed, not block-scaled).
-        // Calling `dense()` on FP8 data and then passing it to `gpu_concat_rows`
-        // (which assumes BF16 = 2 bytes/elem) causes cuMemcpyDtoDAsync to over-read
-        // the allocation boundary → CUDA_ERROR_INVALID_VALUE. Detect and dequant.
+        // FP8 SSM projections must become BF16 before concat/re-quantize.
+        // Keep the established scalar-scale path, but route compressed-tensors
+        // per-row `[N,1]` scales (and native block grids) through `dense_auto`;
+        // treating the FP8 bytes as BF16 would read beyond the allocation.
         if let Ok(w) = store.get(&format!("{prefix}.weight"))
             && w.dtype == WeightDtype::FP8E4M3
-            && store.contains(&format!("{prefix}.weight_scale"))
         {
-            return dequant_fp8_to_bf16(store, &prefix, gpu);
+            let scalar_weight_scale = store
+                .get(&format!("{prefix}.weight_scale"))
+                .map(|scale| scale.num_elements() == 1)
+                .unwrap_or(false);
+            return if scalar_weight_scale {
+                dequant_fp8_to_bf16(store, &prefix, gpu)
+            } else {
+                dense_auto(store, &format!("{prefix}.weight"), gpu)
+            };
         }
         match variant {
             Nvfp4Variant::Fp8Dequanted => dense_auto(store, &format!("{prefix}.weight"), gpu),

@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 use super::{DflashRaw, ModelTypeMatch, SamplingCat};
 
+// One literal shared with `ModelBehavior::default()`; see the source file.
+include!("src/behavior_defaults.rs");
+
 pub(super) fn parse_kernel_toml(
     kernel_dir: &std::path::Path,
     vendor: &str,
@@ -106,6 +109,9 @@ pub(super) fn parse_sampling_presets(
                     .get("lz_penalty")
                     .and_then(|t| t.as_float())
                     .unwrap_or(0.0) as f32,
+                // Do not unwrap: explicit zero must remain distinguishable
+                // from an absent model-level override.
+                min_p: v.get("min_p").and_then(|t| t.as_float()).map(|p| p as f32),
             },
             None => SamplingCat::default(),
         }
@@ -143,6 +149,7 @@ pub(super) struct ParsedBehavior {
     pub disable_tool_grammar: bool,
     pub rollback_resteer: bool,
     pub rom_head: String,
+    pub preserve_thinking: Option<bool>,
 }
 
 impl Default for ParsedBehavior {
@@ -162,11 +169,12 @@ impl Default for ParsedBehavior {
             confidence_early_stop: true,
             confidence_run_length: 30,
             fuzzy_repeat_tolerance_div: 12,
-            max_inter_tool_prose: 384,
+            max_inter_tool_prose: DEFAULT_MAX_INTER_TOOL_PROSE,
             tscg: false,
             disable_tool_grammar: false,
             rollback_resteer: true,
             rom_head: String::new(),
+            preserve_thinking: None,
         }
     }
 }
@@ -253,7 +261,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.get("max_inter_tool_prose"))
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
-        .unwrap_or(384);
+        .unwrap_or(DEFAULT_MAX_INTER_TOOL_PROSE);
     let tscg = b
         .and_then(|v| v.get("tscg"))
         .and_then(|v| v.as_bool())
@@ -271,6 +279,9 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let preserve_thinking = b
+        .and_then(|v| v.get("preserve_thinking"))
+        .and_then(|v| v.as_bool());
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
@@ -291,6 +302,7 @@ pub(super) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         disable_tool_grammar,
         rollback_resteer,
         rom_head,
+        preserve_thinking,
     }
 }
 

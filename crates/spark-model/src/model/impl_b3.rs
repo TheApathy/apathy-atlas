@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::block_mgmt::{
@@ -36,7 +36,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         grammar_bitmask: Option<&[i32]>,
     ) -> Result<Vec<u32>> {
-        let proposer = match &self.proposer {
+        let proposer = match self.active_proposer() {
             Some(p) => p.as_ref(),
             None => return Ok(Vec::new()),
         };
@@ -170,20 +170,114 @@ impl TransformerModel {
             .map(|w| (w, (self.config.vocab_size.div_ceil(64) * 64) as u32))
     }
 
-    /// Install a DFlash drafter as the active proposer, replacing whatever
-    /// MTP proposer (if any) `TransformerModel::new` built. The target's
-    /// hidden-state capture buffer is already allocated when the config's
-    /// `dflash_capture_layers` is non-empty (factory.rs populates it before
-    /// construction), so this method only swaps the proposer slot.
+    /// Install a DFlash drafter as the PRIMARY proposer (arm 0), DEMOTING
+    /// whatever MTP proposer `TransformerModel::new` built to arm 1 rather
+    /// than dropping it. The target's hidden-state capture buffer is already
+    /// allocated when the config's `dflash_capture_layers` is non-empty
+    /// (factory.rs populates it before construction), so this method only
+    /// arranges the proposer slots.
     ///
-    /// Mutually exclusive with `--speculative` MTP at the CLI level
-    /// (clap `conflicts_with`); this method does not enforce that — the
-    /// caller is expected to have validated the flag combination already.
-    pub fn set_dflash_proposer(&mut self, proposer: std::sync::Arc<dyn DraftProposer>) {
-        if self.proposer.is_some() {
-            tracing::info!("DFlash: replacing existing MTP proposer with BlockDiffusionDraftHead");
+    /// Previously this OVERWROTE `self.proposer`, so the native MTP head was
+    /// built, logged as ENABLED, and immediately deallocated on every
+    /// `--dflash` run. Demoting it costs ~0.78 GB resident at the default
+    /// `--mtp-quantization bf16` (0.42 B params on Qwen3.8-27B) and is what
+    /// lets the scheduler's speculation gate arbitrate between the external
+    /// drafter and the native head at runtime.
+    ///
+    /// The `--dflash` / `--speculative` CLI exclusion that used to make the
+    /// demotion unreachable has been lifted; passing both is now the
+    /// documented way to ask for a two-arm gate. Passing only one still
+    /// yields exactly one proposer and `proposer_alt == None`.
+    pub fn set_dflash_proposer(
+        &mut self,
+        proposer: std::sync::Arc<dyn DraftProposer>,
+    ) -> Result<()> {
+        crate::speculative::validate_dflash_install_capacity(
+            proposer.is_dflash(),
+            proposer.physical_verify_k(),
+            self.ddtree_parent_ids_capacity,
+        )?;
+        if let Some(prev) = self.proposer.take() {
+            tracing::info!(
+                "DFlash: BlockDiffusionDraftHead installed as proposer arm 0; \
+                 existing MTP proposer DEMOTED to arm 1 (gate-selectable)"
+            );
+            self.proposer_alt = Some(prev);
         }
         self.proposer = Some(proposer);
+        self.active_proposer_arm
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The proposer for the arm the speculation gate currently has selected.
+    ///
+    /// Falls back to arm 0 whenever arm 1 is empty, so every single-proposer
+    /// build behaves exactly as it did when `self.proposer` was read directly.
+    pub(super) fn active_proposer(&self) -> Option<&std::sync::Arc<dyn DraftProposer>> {
+        if self
+            .active_proposer_arm
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 1
+            && let Some(alt) = self.proposer_alt.as_ref()
+        {
+            return Some(alt);
+        }
+        self.proposer.as_ref()
+    }
+
+    /// The proposer for the arm that is NOT live — the one whose per-sequence
+    /// state is parked in `SequenceState::proposer_state_alt`.
+    ///
+    /// Pairing matters: `proposer_state` belongs to the ACTIVE arm, so a
+    /// teardown that frees it must do so through `active_proposer`, and free
+    /// `proposer_state_alt` through this one. Pairing by field order instead
+    /// would hand one arm's state to the other arm's allocator whenever the
+    /// gate happened to be sitting on arm 1.
+    pub(super) fn inactive_proposer(&self) -> Option<&std::sync::Arc<dyn DraftProposer>> {
+        if self
+            .active_proposer_arm
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 1
+            && self.proposer_alt.is_some()
+        {
+            self.proposer.as_ref()
+        } else {
+            self.proposer_alt.as_ref()
+        }
+    }
+
+    /// Is ANY proposer installed? The capability question, as distinct from
+    /// "which arm is live" — used by `has_proposer` and by buffer-allocation
+    /// gates that must provision for either arm.
+    pub(super) fn any_proposer(&self) -> bool {
+        self.proposer.is_some() || self.proposer_alt.is_some()
+    }
+
+    /// How many proposer arms this build can offer the gate (0, 1 or 2).
+    pub(super) fn proposer_arm_count(&self) -> usize {
+        self.proposer.iter().count() + self.proposer_alt.iter().count()
+    }
+
+    /// Point the gate at a proposer arm. Returns the arm actually selected,
+    /// which is 0 when the requested arm does not exist on this build.
+    ///
+    /// Callers MUST pair this with `swap_proposer_state` on every live
+    /// sequence — see that method for why.
+    pub(super) fn set_proposer_arm(&self, arm: u8) -> u8 {
+        let effective = if arm == 1 && self.proposer_alt.is_some() {
+            1
+        } else {
+            0
+        };
+        self.active_proposer_arm
+            .store(effective, std::sync::atomic::Ordering::Relaxed);
+        effective
+    }
+
+    pub(super) fn proposer_arm(&self) -> u8 {
+        self.active_proposer_arm
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// DFlash prefill capture: copy `proc_count` tokens × hidden_size BF16
@@ -277,7 +371,7 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         let capacity = self.mtp_lastk_capacity;
-        if capacity == 0 || self.proposer.is_none() {
+        if capacity == 0 || !self.any_proposer() {
             return Ok(());
         }
         if let Some(ref c) = self.comm
@@ -415,7 +509,7 @@ impl TransformerModel {
         if capacity == 0 {
             return Ok(());
         }
-        let proposer = match &self.proposer {
+        let proposer = match self.active_proposer() {
             Some(p) => p.clone(),
             None => return Ok(()),
         };
@@ -465,7 +559,8 @@ impl TransformerModel {
         //     `mtp_lastk_host_filled` upward each chunk).
         // Both cases: the first `filled` rows of the buffer are the live data.
         let src_slice = &seq.mtp_lastk_host_buf[..used_bytes];
-        self.gpu.copy_h2d_async(src_slice, lastk_buf, stream)?;
+        self.gpu
+            .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(src_slice, lastk_buf)], stream)?;
 
         // The captured tokens span `[end_abs - filled + 1 ..= end_abs]`.
         let start_abs = end_abs + 1 - filled;

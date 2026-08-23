@@ -171,6 +171,117 @@ pub fn gdn_decode_f32_multi_seq(
         .launch(stream)
 }
 
+/// Exact flat-chain FP32 GDN recurrence for one multi-row verify window.
+///
+/// The kernel advances rows in order inside each value-head CTA and stores a
+/// complete post-row H snapshot in `h_state_inter`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_sequence(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter: DevicePtr,
+    rows: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gate_beta_stride: u32,
+    output_stride: u32,
+    inter_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, 1, 1])
+        .block([128, 1, 1])
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter)
+        .arg_u32(rows)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(output_stride)
+        .arg_u32(inter_stride)
+        .launch(stream)
+}
+
+/// Register-resident counterpart of [`gdn_decode_f32_sequence`].
+///
+/// Identical FP32 arithmetic order (single-accumulator hk_dot/q_dot, unroll-4,
+/// --fmad=false) but the per-head H column stays in registers for the whole
+/// token loop instead of being re-read from global 3x per token. Bit-exact vs
+/// `gated_delta_rule_decode_f32_sequence` by construction; only the memory
+/// location of the recurrent state changes.
+///
+/// Grid: (num_v_heads, 1, 1)  Block: (128, 1, 1)
+/// Shared: 2 * k_dim * 4 bytes (k + q buffers).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_f32_sequence_persistent(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    h_state_inter: DevicePtr,
+    rows: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gate_beta_stride: u32,
+    output_stride: u32,
+    inter_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_v_heads, 1, 1])
+        .block([128, 1, 1])
+        .shared_mem(2 * k_dim * 4) // k + q buffers
+        .arg_ptr(h_state)
+        .arg_ptr(query)
+        .arg_ptr(key)
+        .arg_ptr(value)
+        .arg_ptr(gate)
+        .arg_ptr(beta)
+        .arg_ptr(output)
+        .arg_ptr(h_state_inter)
+        .arg_u32(rows)
+        .arg_u32(num_k_heads)
+        .arg_u32(num_v_heads)
+        .arg_u32(k_dim)
+        .arg_u32(v_dim)
+        .arg_u32(qk_stride)
+        .arg_u32(v_stride)
+        .arg_u32(gate_beta_stride)
+        .arg_u32(output_stride)
+        .arg_u32(inter_stride)
+        .launch(stream)
+}
+
 /// Gated delta rule prefill (multi-token, sequential SSM update within kernel).
 ///
 /// Processes `seq_len` tokens sequentially per (batch, head) pair.
@@ -486,5 +597,54 @@ pub fn gdn_decode_chunk2(
         .arg_u32(qk_stride)
         .arg_u32(v_stride)
         .arg_u32(gb_stride)
+        .launch(stream)
+}
+
+/// One-shot FP32 -> FP16 conversion of one layer's SSM h-state
+/// (`ATLAS_SSM_H_FP16`). `n` is the FP32 ELEMENT count, derived from the
+/// pool's byte size — never a duplicated shape literal.
+///
+/// Kernel: `ssm_h_state_f32_to_f16(src, dst, n)`. Grid-stride; `src` and `dst`
+/// must not alias (a narrowing compaction in place is a data race).
+pub fn ssm_h_state_f32_to_f16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    n: u64,
+    stream: u64,
+) -> Result<()> {
+    const BLOCK: u32 = 256;
+    let blocks = div_ceil(n as u32, BLOCK).clamp(1, 4096);
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([BLOCK, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u64(n)
+        .launch(stream)
+}
+
+/// One-shot FP16 -> FP32 widening of one layer's SSM h-state
+/// (`ATLAS_SSM_H_FP16`). `n` is the FP32 ELEMENT count of the destination.
+///
+/// Kernel: `ssm_h_state_f16_to_f32(src, dst, n)`. Grid-stride; `src` and `dst`
+/// must not alias.
+pub fn ssm_h_state_f16_to_f32(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    n: u64,
+    stream: u64,
+) -> Result<()> {
+    const BLOCK: u32 = 256;
+    let blocks = div_ceil(n as u32, BLOCK).clamp(1, 4096);
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks, 1, 1])
+        .block([BLOCK, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u64(n)
         .launch(stream)
 }

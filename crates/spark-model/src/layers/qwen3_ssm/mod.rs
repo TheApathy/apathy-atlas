@@ -15,7 +15,7 @@
 //!  10. MoE FFN
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle, PinnedHostBuffer};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use crate::layer::{
@@ -24,6 +24,10 @@ use crate::layer::{
 use crate::layers::FfnComponent;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
+
+mod exact_flat_route;
+pub(crate) mod ssm_h_fp16;
+use exact_flat_route::{ExactFlatSsmRoute, contiguous_intermediate_base, exact_flat_ssm_route};
 
 /// Qwen3-Next SSM/GDN layer (36 of 48 layers).
 ///
@@ -67,7 +71,18 @@ pub struct Qwen3SsmLayer {
     /// Bit-identical to the per-token loop (same kernel body per y-block).
     /// Gated by `ATLAS_SSM_BA_BATCH=1`; NULL handle → per-token loop.
     dense_gemv_batchn_k: KernelHandle,
+    /// Exact multi-row BA projection with inline FP32 gate transforms.
+    ba_gates_batchn_exact_k: KernelHandle,
     w4a16_gemv_k: KernelHandle,
+    /// Exact K1-order multi-row NVFP4 kernels shared by QKVZ and out_proj.
+    /// A missing selected tier fails closed to ordinary row-major K1 GEMVs.
+    w4a16_exact_projection_kernels: ops::W4a16ExactLmHeadKernels,
+    /// Single-warp `w4a16_gemv_sw` — lossless, 8 outputs per 256-thread block
+    /// instead of 4, no cross-warp smem round-trip. `KernelHandle(0)` on a
+    /// miss falls back to the bit-identical 64-thread base GEMV.
+    w4a16_gemv_sw_k: KernelHandle,
+    /// `ATLAS_NO_GEMV_SW != "1"`, cached at construction.
+    gemv_sw: bool,
     w8a16_gemv_k: KernelHandle,
     w4a16_gemv_qkvz_k: KernelHandle,
     /// Fused rms_norm_residual + w4a16_gemv for SSM QKVZ (sequential layout).
@@ -81,8 +96,29 @@ pub struct Qwen3SsmLayer {
     conv1d_k: KernelHandle,
     conv1d_l2norm_k: KernelHandle,
     conv1d_l2norm_f32_k: KernelHandle,
+    /// Exact flat-chain multi-row FP32 conv recurrence + state snapshots.
+    conv1d_l2norm_f32_sequence_k: KernelHandle,
     gdn_k: KernelHandle,
     gdn_f32_k: KernelHandle,
+    /// Exact flat-chain multi-row FP32 GDN recurrence + H snapshots.
+    gdn_f32_sequence_k: KernelHandle,
+    /// Register-resident H variant (identical arithmetic, H cached in regs).
+    gdn_f32_sequence_persistent_k: KernelHandle,
+    /// Speed-probe twin with per-token snapshot writes removed (ATLAS_SSM_GDN_NOSNAP).
+    /// INVALIDATES rollback — measurement only.
+    gdn_f32_sequence_nosnap_k: KernelHandle,
+    /// LAZY-COMMIT variant (`ATLAS_SSM_GDN_LAZY=1`): registers-resident, writes
+    /// NO per-token snapshots (58.6% of the kernel at k=16), writes final H to
+    /// inter[num_tokens-1], and leaves `h_state` holding the step-initial H so
+    /// the commit replay (the nosnap kernel over retained inputs) can
+    /// reconstruct any accepted state bit-exactly. Requires the async commit
+    /// integration in `async_chkpt.rs` — never enable without it.
+    gdn_f32_sequence_lazyfinal_k: KernelHandle,
+    /// Lazy-commit retention: [GDN_LAZY_MAX_K x qkvz] fp32 q/k/v(+z) + the
+    /// gate/beta block at GDN_LAZY_MAX_K*qkvz*4. Copied BEFORE the GDN launch
+    /// (inputs are exactly what the kernel reads — no aliasing question).
+    /// Lazily allocated on first engaged dispatch.
+    gdn_lazy_retain: std::sync::OnceLock<DevicePtr>,
     ba_gates_k: KernelHandle,
     residual_add_k: KernelHandle,
     l2_norm_k: KernelHandle,
@@ -90,6 +126,10 @@ pub struct Qwen3SsmLayer {
     gated_rms_norm_prefill_k: KernelHandle,
     // Kernels — batched verification path (multi-token GEMM)
     w4a16_gemm_k: KernelHandle,
+    /// Byte-exact cp.async pipelined shadow of `w4a16_gemm` (see
+    /// `prefill_proj_pipe_enabled`). Used by the SSM QKVZ + out_proj prefill
+    /// projections at `ATLAS_PREFILL_PROJ_PIPE=1`; handle 0 falls back.
+    w4a16_gemm_pipe_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle, // Transposed B layout [K/2, N] — K_STEP_T=32
     w4a16_gemm_t_k64_k: KernelHandle, // K64 variant: K_STEP_T=64, halves outer loop
     w4a16_gemm_t_m128_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
@@ -171,12 +211,12 @@ pub struct Qwen3SsmLayer {
     /// conv_state_ptrs[c]]` u64 each (each c × 8 bytes), so total
     /// `2 * max_c * 8` bytes. Pre-allocated to avoid per-call alloc.
     ssm_multi_seq_ptr_scratch: DevicePtr,
-    /// Stable heap-allocated HOST staging buffer for the multi-seq ptr
+    /// Stable page-locked HOST staging buffer for the multi-seq ptr
     /// table H2D upload. The pre-Fix-B code used a stack array `[u64;
     /// 64]` as the H2D source — CUDA graph capture recorded that stack
     /// address, and on graph replay the GPU read invalid memory after
-    /// the stack frame was gone. Pinning it on the heap gives a stable
-    /// source address: graph capture records the heap pointer, replay
+    /// the stack frame was gone. Backend-owned pinned storage gives a stable
+    /// source address: graph capture records the pointer, replay
     /// reads the CURRENT contents (which the CPU updates fresh every
     /// step). 64 u64s = 512 bytes, well below MAX_C=32 × 2 = 64 slots.
     ///
@@ -185,7 +225,7 @@ pub struct Qwen3SsmLayer {
     /// touched on one stream at a time (decode_a2.rs serialises layer
     /// dispatch within a verify step), so concurrent mutation is
     /// impossible — even though Rust can't prove it.
-    multi_seq_ptr_host: Box<std::cell::UnsafeCell<[u64; 64]>>,
+    multi_seq_ptr_host: Box<std::cell::UnsafeCell<PinnedHostBuffer>>,
     /// Capacity of the pointer scratch in number of sequences. Acts as
     /// a hard cap on `num_seqs` for the multi-seq kernels (callers fall
     /// back to per-seq loop if `n > ssm_multi_seq_ptr_max`).
@@ -203,6 +243,15 @@ pub struct Qwen3SsmLayer {
     gdn_wy2_k: KernelHandle,
     gdn_wy3_k: KernelHandle,
     gdn_wy4_k: KernelHandle,
+    // ATLAS_SSM_H_FP16 twins of the three chunked-path WY kernels. The chunked
+    // K>=5 route (`pick_chunk`) is what a k=13 verify actually runs — 4+4+3+2 —
+    // so these three cover it. Zero when the PTX lacks the symbol; the call
+    // sites turn that into a hard error rather than a silent FP32 fallback,
+    // because reading an FP16 pool as floats produces fluent garbage, not a
+    // crash.
+    gdn_wy2_f16_k: KernelHandle,
+    gdn_wy3_f16_k: KernelHandle,
+    gdn_wy4_f16_k: KernelHandle,
     /// WY-Chunkwise K=17 GDN verify (DFlash γ+1). Only present in
     /// qwen3.6-35b-a3b's PTX module set; NULL handle for other targets,
     /// in which case decode_batched(K=17) falls through to the sequential
@@ -253,7 +302,7 @@ pub struct Qwen3SsmLayer {
     fp8_gemm_t_m128_k: KernelHandle, // M128: halves B re-reads for out_proj at ISL > 128
 }
 
-// SAFETY: `multi_seq_ptr_host` contains an `UnsafeCell<[u64; 64]>` which
+// SAFETY: `multi_seq_ptr_host` contains an `UnsafeCell<PinnedHostBuffer>` which
 // makes the struct `!Sync` by default. The `TransformerLayer` trait
 // requires `Send + Sync`. The architectural invariant that makes this
 // safe is upheld in `decode_a2.rs`: layer dispatch is serialised within
@@ -265,7 +314,11 @@ unsafe impl Sync for Qwen3SsmLayer {}
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod debug;
+mod exact_projection;
+#[cfg(test)]
+mod exact_projection_tests;
 mod init;
+mod serial_diag;
 mod ssm_forward;
 mod trait_decode;
 mod trait_decode_batched;
@@ -537,8 +590,24 @@ impl TransformerLayer for Qwen3SsmLayer {
         self.gdn_wy17_replay_k
     }
 
+    fn gdn_seq_lazy_engaged(&self, num_tokens: usize) -> bool {
+        self.gdn_seq_lazy_engaged_inner(num_tokens)
+    }
+
+    fn gdn_seq_replay_kernel(&self) -> KernelHandle {
+        self.gdn_f32_sequence_nosnap_k
+    }
+
+    fn gdn_seq_lazy_retain(&self) -> Option<DevicePtr> {
+        self.gdn_lazy_retain.get().copied()
+    }
+
     fn gdn_tree_kernel_loaded(&self) -> bool {
         self.gdn_tree_k.0 != 0
+    }
+
+    fn ddtree_conv_state_exact(&self) -> bool {
+        self.conv1d_tree_reroot_k.0 != 0
     }
 
     fn wy17_lazy_engaged(&self, num_tokens: usize) -> bool {
@@ -598,4 +667,52 @@ mod tests {
         assert!(!h_state.is_null());
         assert!(!conv_state.is_null());
     }
+}
+
+/// `ATLAS_SSM_H_FP16=1` — store the GDN decode/verify h-state as FP16.
+///
+/// The decode scan is pure state traffic: at k=13 it moves 48 layers x 13 tokens
+/// x 2 x 3.15 MB = 3.93 GB per verify, which is the entire measured 16.9 ms of
+/// `ssm_gdn_fp32_seq`. Halving the footprint halves that time. Storage-only
+/// narrowing — every float expression, accumulation order and gate clamp in the
+/// f16 twin kernels is copied from the FP32 parent; only the h round-trip
+/// rounding differs.
+///
+/// OFF by default: it changes generated tokens, so it needs a quality gate.
+/// `ATLAS_SSM_GDN_LAZY=1` — lazy-commit GDN verify (skip per-token H
+/// snapshots; commit reconstructs via FP32 replay). Bit-exact by construction;
+/// dispatch + commit must agree, so both call [`Qwen3SsmLayer::gdn_seq_lazy_engaged`].
+/// Retention rows for the lazy ExactSequence commit. γ+1 = 16 at the serving
+/// γ=15; MTP verifies are smaller. `gdn_seq_lazy_engaged` refuses larger k.
+pub const GDN_LAZY_MAX_K: usize = 16;
+
+impl Qwen3SsmLayer {
+    /// Pure mirror of the lazy ExactSequence dispatch decision — MUST equal
+    /// what `trait_decode_batched.rs` does for the same `num_tokens`, because
+    /// the async commit uses this to decide replay-vs-copy. Everything here is
+    /// process-constant env + kernel handles + num_tokens (graph-safe).
+    pub(super) fn gdn_seq_lazy_engaged_inner(&self, num_tokens: usize) -> bool {
+        gdn_seq_lazy_enabled()
+            && std::env::var("ATLAS_SSM_GDN_NOSNAP").ok().as_deref() != Some("1")
+            && self.gdn_f32_sequence_lazyfinal_k.0 != 0
+            && self.gdn_f32_sequence_nosnap_k.0 != 0
+            && num_tokens <= GDN_LAZY_MAX_K
+            && exact_flat_route::exact_flat_ssm_route(
+                num_tokens,
+                false, // tree handled separately: dispatch via ctx, commit via was_tree_mode
+                self.ba_gates_batchn_exact_k.0 != 0,
+                self.conv1d_l2norm_f32_sequence_k.0 != 0,
+                self.gdn_f32_sequence_k.0 != 0,
+                self.gated_rms_norm_f32_multi_seq_k.0 != 0,
+            ) == exact_flat_route::ExactFlatSsmRoute::ExactSequence
+    }
+}
+
+pub fn gdn_seq_lazy_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_GDN_LAZY").ok().as_deref() == Some("1"))
+}
+
+pub fn ssm_h_fp16_enabled() -> bool {
+    std::env::var("ATLAS_SSM_H_FP16").ok().as_deref() == Some("1")
 }

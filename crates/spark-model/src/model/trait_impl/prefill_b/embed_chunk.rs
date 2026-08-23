@@ -6,6 +6,7 @@
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
 use anyhow::Result;
+use spark_runtime::gpu::HostToDeviceCopy;
 
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
@@ -52,8 +53,10 @@ impl TransformerModel {
                 std::slice::from_raw_parts(chunk_tokens.as_ptr() as *const u8, chunk_len * 4)
             };
             let token_ids_dev = self.buffers.scratch(); // temporary, overwritten by MoE later
-            self.gpu
-                .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                stream,
+            )?;
             ops::batched_embed(
                 self.gpu.as_ref(),
                 self.batched_embed_kernel,

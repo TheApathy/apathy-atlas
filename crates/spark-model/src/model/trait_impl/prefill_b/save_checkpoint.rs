@@ -36,6 +36,7 @@ impl TransformerModel {
         let snap_result = match self.ssm_snapshots.save(
             seq.slot_idx,
             seq.session_hash,
+            Self::seq_h_is_f16(seq),
             &self.ssm_pool,
             self.gpu.as_ref(),
             stream,
@@ -51,6 +52,7 @@ impl TransformerModel {
                         .save(
                             seq.slot_idx,
                             seq.session_hash,
+                            Self::seq_h_is_f16(seq),
                             &self.ssm_pool,
                             self.gpu.as_ref(),
                             stream,

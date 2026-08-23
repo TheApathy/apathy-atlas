@@ -88,6 +88,15 @@ pub(super) fn load_layers(
         quant_format,
     );
 
+    // Fast engine recovery — see `weight_loader::transform_cache`. No-op
+    // unless ATLAS_WEIGHT_CACHE=1.
+    crate::weight_loader::transform_cache::init(
+        store,
+        config,
+        gpu,
+        &format!("qwen35_moe/{weight_format:?}/{variant:?}/{quant_format:?}"),
+    );
+
     // Estimate MoE transpose memory: 3 projections × num_experts × (packed + scale) per layer.
     // Skip transposition if GPU memory is insufficient — fallback grouped GEMM is used instead.
     let skip_moe_transpose = {
@@ -380,6 +389,8 @@ pub(super) fn load_layers(
         attn_idx,
         layers.len() - attn_idx,
     );
+
+    crate::weight_loader::transform_cache::finish();
 
     Ok(layers)
 }

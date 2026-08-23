@@ -9,7 +9,7 @@
 //! reproduces their work directly via the CUDA Driver API:
 //!
 //!   `cuModuleGetGlobal_v2` → device pointer for each symbol
-//!   `cuMemcpyHtoDAsync_v2` / `cuMemcpyDtoHAsync_v2` → push/pull state
+//!   synchronous pageable-safe CUDA copies → push/pull state
 //!
 //! Two-phase operation:
 //!   1. `start()`     — zero counters, set `d_innerq_calibrating = 1`.
@@ -22,7 +22,6 @@
 //! attention dot products unchanged while smoothing K variance across
 //! channels.
 
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -41,6 +40,45 @@ const SYM_CALIBRATING: &str = "_ZN7tq_plus20d_innerq_calibratingE";
 
 // Matches INNERQ_MAX_CHANNELS in tq_plus_innerq.cuh. Head dim = 128 today.
 const MAX_CHANNELS: usize = 128;
+
+fn f32_bytes(values: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no padding and every byte is initialized while the
+    // returned slice cannot outlive the shared source borrow.
+    unsafe {
+        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+fn f32_bytes_mut(values: &mut [f32]) -> &mut [u8] {
+    // SAFETY: every `f32` bit pattern is valid and the exclusive byte view is
+    // bounded by the exclusive source borrow.
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            values.as_mut_ptr().cast::<u8>(),
+            std::mem::size_of_val(values),
+        )
+    }
+}
+
+fn i32_bytes(value: &i32) -> &[u8] {
+    // SAFETY: `i32` has no padding and the byte view shares its source borrow.
+    unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(value).cast::<u8>(),
+            std::mem::size_of::<i32>(),
+        )
+    }
+}
+
+fn i32_bytes_mut(value: &mut i32) -> &mut [u8] {
+    // SAFETY: every `i32` bit pattern is valid and the byte view is exclusive.
+    unsafe {
+        std::slice::from_raw_parts_mut(
+            std::ptr::from_mut(value).cast::<u8>(),
+            std::mem::size_of::<i32>(),
+        )
+    }
+}
 
 pub struct InnerQDriver {
     pub target_tokens: i32,
@@ -87,35 +125,17 @@ impl InnerQDriver {
         let (active_ptr, _) = reg.device_symbol(MODULE, SYM_ACTIVE)?;
         let (calib_ptr, _) = reg.device_symbol(MODULE, SYM_CALIBRATING)?;
 
-        let copy_bytes = sq_bytes.min(std::mem::size_of_val(&zeros_f32));
-        unsafe {
-            reg.copy_h2d_async(
-                sq_ptr,
-                zeros_f32.as_ptr() as *const c_void,
-                copy_bytes,
-                stream,
-            )?;
-            reg.copy_h2d_async(
-                count_ptr,
-                &zero_i32 as *const i32 as *const c_void,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-            reg.copy_h2d_async(
-                active_ptr,
-                &zero_i32 as *const i32 as *const c_void,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-            reg.copy_h2d_async(
-                calib_ptr,
-                &one_i32 as *const i32 as *const c_void,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-        }
-        // Stack locals must live until the copies retire.
-        reg.stream_synchronize(stream)?;
+        let zeros_bytes = f32_bytes(&zeros_f32);
+        let copy_bytes = sq_bytes.min(zeros_bytes.len());
+        reg.copy_h2d_group(
+            &[
+                (sq_ptr, &zeros_bytes[..copy_bytes]),
+                (count_ptr, i32_bytes(&zero_i32)),
+                (active_ptr, i32_bytes(&zero_i32)),
+                (calib_ptr, i32_bytes(&one_i32)),
+            ],
+            stream,
+        )?;
 
         self.calibrating.store(true, Ordering::Release);
         self.finalized.store(false, Ordering::Release);
@@ -146,15 +166,7 @@ impl InnerQDriver {
 
         let (count_ptr, _) = reg.device_symbol(MODULE, SYM_COUNT)?;
         let mut count: i32 = 0;
-        unsafe {
-            reg.copy_d2h_async(
-                &mut count as *mut i32 as *mut c_void,
-                count_ptr,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-        }
-        reg.stream_synchronize(stream)?;
+        reg.copy_d2h(i32_bytes_mut(&mut count), count_ptr, stream)?;
 
         if count < self.target_tokens {
             return Ok(false);
@@ -162,15 +174,7 @@ impl InnerQDriver {
 
         let (sq_ptr, _) = reg.device_symbol(MODULE, SYM_SQ_ACCUM)?;
         let mut sq_accum = [0.0f32; MAX_CHANNELS];
-        unsafe {
-            reg.copy_d2h_async(
-                sq_accum.as_mut_ptr() as *mut c_void,
-                sq_ptr,
-                gs * std::mem::size_of::<f32>(),
-                stream,
-            )?;
-        }
-        reg.stream_synchronize(stream)?;
+        reg.copy_d2h(f32_bytes_mut(&mut sq_accum[..gs]), sq_ptr, stream)?;
 
         // Identity-preserving equalization (mirrors turbo_innerq_finalize in
         // tq_plus_innerq.cu): scale[i] = (mean_rms / rms[i])^strength, clamped
@@ -207,17 +211,10 @@ impl InnerQDriver {
 
         let (calib_ptr, _) = reg.device_symbol(MODULE, SYM_CALIBRATING)?;
         let zero_i32: i32 = 0;
-        unsafe {
-            reg.copy_h2d_async(
-                calib_ptr,
-                &zero_i32 as *const i32 as *const c_void,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-        }
+        let calibration_off = (calib_ptr, i32_bytes(&zero_i32));
 
         if max_ratio < 1.2 && min_ratio > (1.0 / 1.2) {
-            reg.stream_synchronize(stream)?;
+            reg.copy_h2d_group(&[calibration_off], stream)?;
             self.calibrating.store(false, Ordering::Release);
             self.finalized.store(true, Ordering::Release);
             tracing::info!(
@@ -231,35 +228,17 @@ impl InnerQDriver {
         let (scale_inv_ptr, _) = reg.device_symbol(MODULE, SYM_SCALE_INV)?;
         let (active_ptr, _) = reg.device_symbol(MODULE, SYM_ACTIVE)?;
         let one_i32: i32 = 1;
-        let copy_bytes = gs * std::mem::size_of::<f32>();
-        unsafe {
-            reg.copy_h2d_async(
-                scale_ptr,
-                scale.as_ptr() as *const c_void,
-                copy_bytes,
-                stream,
-            )?;
-            reg.copy_h2d_async(
-                scale_inv_ptr,
-                scale_inv.as_ptr() as *const c_void,
-                copy_bytes,
-                stream,
-            )?;
-        }
-        // Order: scale uploads must retire before active flips so any kernel
-        // observing active=1 sees the finalized scales (cuMemcpyAsync within
-        // the same stream is already strict-order, but the active flag is
-        // visible to kernels on OTHER streams once a host-side sync passes).
-        reg.stream_synchronize(stream)?;
-        unsafe {
-            reg.copy_h2d_async(
-                active_ptr,
-                &one_i32 as *const i32 as *const c_void,
-                std::mem::size_of::<i32>(),
-                stream,
-            )?;
-        }
-        reg.stream_synchronize(stream)?;
+        // Ordered synchronous group: scales retire before active flips, so a
+        // kernel on any stream cannot observe active=1 with stale scales.
+        reg.copy_h2d_group(
+            &[
+                calibration_off,
+                (scale_ptr, f32_bytes(&scale[..gs])),
+                (scale_inv_ptr, f32_bytes(&scale_inv[..gs])),
+                (active_ptr, i32_bytes(&one_i32)),
+            ],
+            stream,
+        )?;
 
         self.calibrating.store(false, Ordering::Release);
         self.finalized.store(true, Ordering::Release);

@@ -24,8 +24,8 @@ impl TransformerModel {
         is_last_chunk: bool,
         proc_count: usize,
         effective_seq_len_start: usize,
-        kv_write_start: usize,
-        marconi_skip: bool,
+        _kv_write_start: usize,
+        _marconi_skip: bool,
         meta_base: DevicePtr,
         slot_offset: usize,
         pos_stream_bytes: usize,
@@ -94,7 +94,11 @@ impl TransformerModel {
         // and the decode MoE path, which is ~7x faster per layer than the prefill
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
         let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
-        let layer_kv_write_start = if marconi_skip { 0 } else { kv_write_start };
+        let layer_kv_write_start = super::cached_kv_rows_in_slice(
+            seq.cached_prefix_tokens,
+            effective_seq_len_start,
+            proc_count,
+        );
         let prefill_t0 = if profile_now {
             self.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -146,7 +150,7 @@ impl TransformerModel {
             self.try_dflash_prefill_capture_layer(
                 seq,
                 i,
-                layer_kv_write_start,
+                effective_seq_len_start,
                 proc_count,
                 stream,
             )?;
@@ -238,7 +242,7 @@ impl TransformerModel {
             indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
             let top5: Vec<String> = indexed
                 .iter()
-                .take(5)
+                .take(64)
                 .map(|(i, us)| format!("L{}={:.2}ms", i, *us as f64 / 1000.0))
                 .collect();
             let path_label = if use_decode_path { "decode" } else { "prefill" };

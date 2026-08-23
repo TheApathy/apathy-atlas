@@ -135,7 +135,7 @@ pub(super) fn generate_target_ptx_rs(
         };
         let fmt_cat = |c: &SamplingCat| -> String {
             format!(
-                "SamplingCategory {{ temperature: {:.2}, top_p: {:.2}, top_k: {}, presence_penalty: {:.2}, frequency_penalty: {:.2}, repetition_penalty: {:.2}, dry_multiplier: {:.2}, dry_base: {:.2}, dry_allowed_length: {}, lz_penalty: {:.2} }}",
+                "SamplingCategory {{ temperature: {:.2}, top_p: {:.2}, top_k: {}, presence_penalty: {:.2}, frequency_penalty: {:.2}, repetition_penalty: {:.2}, dry_multiplier: {:.2}, dry_base: {:.2}, dry_allowed_length: {}, lz_penalty: {:.2}, min_p: {} }}",
                 c.temperature,
                 c.top_p,
                 c.top_k,
@@ -146,6 +146,10 @@ pub(super) fn generate_target_ptx_rs(
                 c.dry_base,
                 c.dry_allowed_length,
                 c.lz_penalty,
+                match c.min_p {
+                    Some(value) => format!("Some({value:.4})"),
+                    None => "None".to_string(),
+                },
             )
         };
         g.push_str(&format!(
@@ -178,6 +182,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               disable_tool_grammar: {},\n\
              \x20               rollback_resteer: {},\n\
              \x20               rom_head: \"{}\",\n\
+             \x20               preserve_thinking: {:?},\n\
              \x20           }},\n\
              \x20           model_type_matches: vec![{}],\n\
              \x20           dflash: {},\n\
@@ -206,6 +211,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_disable_tool_grammar,
             target.behavior_rollback_resteer,
             target.behavior_rom_head,
+            target.behavior_preserve_thinking,
             target.model_type_matches.iter().map(|m| {
                 let hs = match m.hidden_size {
                     Some(v) => format!("Some({v})"),

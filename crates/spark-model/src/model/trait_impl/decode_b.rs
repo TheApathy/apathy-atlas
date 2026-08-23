@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::block_mgmt::{
@@ -86,6 +86,12 @@ impl TransformerModel {
             });
         }
 
+        // PREFIX_CACHE_POLICY: BYPASS.
+        // The fused active+prefill route cannot safely splice paired KV+SSM
+        // replay into its fixed stacked-buffer layout: a restored checkpoint
+        // changes the prefill processing range inside the shared layer loop.
+        // It therefore performs no prefix lookup or insertion. Every supplied
+        // prefill row, including every recurrent row, is computed below.
         // ── Fused mixed forward: single layer loop, weights loaded once per layer ──
         //
         // Layout in hidden/residual buffers (contiguous):
@@ -137,8 +143,10 @@ impl TransformerModel {
             };
             // Use norm_output as temporary staging for token IDs (overwritten by first layer)
             let token_ids_dev = self.buffers.norm_output();
-            self.gpu
-                .copy_h2d_async(token_ids_bytes, token_ids_dev, stream)?;
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                stream,
+            )?;
             ops::batched_embed(
                 self.gpu.as_ref(),
                 self.batched_embed_kernel,
@@ -230,7 +238,7 @@ impl TransformerModel {
             stg.positions
                 .extend(proc_start as u32..(proc_start + proc_count) as u32);
 
-            let pinned = stg.ptr;
+            let pinned = stg.buffer.as_mut_ptr();
             let mut cursor = proc_count * 4;
 
             unsafe {
@@ -262,13 +270,15 @@ impl TransformerModel {
             }
 
             assert!(
-                cursor <= stg.bytes,
+                cursor <= stg.buffer.len(),
                 "mixed_forward prefill metadata overflow: {cursor} > {}",
-                stg.bytes
+                stg.buffer.len()
             );
-            let pinned_slice = unsafe { std::slice::from_raw_parts(pinned, cursor) };
-            self.gpu
-                .copy_h2d_async(pinned_slice, prefill_meta_base, stream)?;
+            let pinned_slice = stg.buffer.pinned_slice(cursor)?;
+            unsafe {
+                self.gpu
+                    .copy_h2d_pinned_async(pinned_slice, prefill_meta_base, stream)?;
+            }
         }
 
         if needs_paged {
@@ -276,6 +286,14 @@ impl TransformerModel {
             let upload_start = self
                 .ensure_chunked_prefill_meta(prefill_seq, prefill_tokens.len(), bs)?
                 .uploaded_blocks;
+            let seq_len_val = (proc_start + proc_count) as u32;
+            let seq_len_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &seq_len_val as *const u32 as *const u8,
+                    std::mem::size_of::<u32>(),
+                )
+            };
+            let seq_len_base = prefill_seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
             // Phase 6.3: skip upload in HSS mode (orchestrator bypasses kernel).
             if upload_start < current_blocks && prefill_seq.hss_window_start() == 0 {
                 let new_blocks = &prefill_seq.block_table[upload_start..];
@@ -290,28 +308,25 @@ impl TransformerModel {
                     .as_ref()
                     .unwrap()
                     .block_table;
-                self.gpu.copy_h2d_async(
-                    bt_bytes,
-                    block_table_base.offset(upload_start * std::mem::size_of::<u32>()),
-                    stream,
-                )?;
+                let copies = [
+                    HostToDeviceCopy::new(
+                        bt_bytes,
+                        block_table_base.offset(upload_start * std::mem::size_of::<u32>()),
+                    ),
+                    HostToDeviceCopy::new(seq_len_bytes, seq_len_base),
+                ];
+                self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
                 prefill_seq
                     .chunked_prefill_meta
                     .as_mut()
                     .unwrap()
                     .uploaded_blocks = current_blocks;
+            } else {
+                self.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(seq_len_bytes, seq_len_base)],
+                    stream,
+                )?;
             }
-
-            let seq_len_val = (proc_start + proc_count) as u32;
-            let seq_len_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &seq_len_val as *const u32 as *const u8,
-                    std::mem::size_of::<u32>(),
-                )
-            };
-            let seq_len_base = prefill_seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-            self.gpu
-                .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
 
             let block_table_base = prefill_seq
                 .chunked_prefill_meta
@@ -394,6 +409,7 @@ impl TransformerModel {
                         conv_state_intermediates: Vec::new(),
                         wy17_kv_retain: None,
                         wy17_gate_retain: None,
+                        h_is_f16: false,
                     }));
                     ssm_idx += 1;
                 } else {
@@ -465,7 +481,7 @@ impl TransformerModel {
                 &mut prefill_seq.block_table,
                 &mut prefill_seq.disk_block_ids,
                 &mut prefill_seq.disk_last_offloaded_per_layer,
-                0, // kv_write_start: no prefix cache skip in fused path
+                0, // kv_write_start: cache bypass writes all current rows
                 &prefill_ctx,
                 stream,
             )?;

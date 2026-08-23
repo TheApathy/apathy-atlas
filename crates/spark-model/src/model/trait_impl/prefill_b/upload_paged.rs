@@ -6,7 +6,7 @@
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::super::types::TransformerModel;
@@ -34,6 +34,9 @@ impl TransformerModel {
         // can't be uploaded by absolute index without re-mapping. The
         // orchestrator path bypasses the production paged kernel that
         // reads this metadata, so skip the upload entirely in HSS mode.
+        let seq_len_val = (proc_start + proc_count) as u32;
+        let seq_len_bytes = seq_len_val.to_ne_bytes();
+        let seq_len_base = seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
         if upload_start < current_blocks && seq.hss_window_start() == 0 {
             let new_blocks = &seq.block_table[upload_start..];
             let bt_bytes = unsafe {
@@ -43,24 +46,21 @@ impl TransformerModel {
                 )
             };
             let block_table_base = seq.chunked_prefill_meta.as_ref().unwrap().block_table;
-            self.gpu.copy_h2d_async(
-                bt_bytes,
-                block_table_base.offset(upload_start * std::mem::size_of::<u32>()),
+            let copies = [
+                HostToDeviceCopy::new(
+                    bt_bytes,
+                    block_table_base.offset(upload_start * std::mem::size_of::<u32>()),
+                ),
+                HostToDeviceCopy::new(&seq_len_bytes, seq_len_base),
+            ];
+            self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
+            seq.chunked_prefill_meta.as_mut().unwrap().uploaded_blocks = current_blocks;
+        } else {
+            self.gpu.copy_h2d_group_on_stream(
+                &[HostToDeviceCopy::new(&seq_len_bytes, seq_len_base)],
                 stream,
             )?;
-            seq.chunked_prefill_meta.as_mut().unwrap().uploaded_blocks = current_blocks;
         }
-
-        let seq_len_val = (proc_start + proc_count) as u32;
-        let seq_len_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &seq_len_val as *const u32 as *const u8,
-                std::mem::size_of::<u32>(),
-            )
-        };
-        let seq_len_base = seq.chunked_prefill_meta.as_ref().unwrap().seq_len;
-        self.gpu
-            .copy_h2d_async(seq_len_bytes, seq_len_base, stream)?;
 
         let block_table_base = seq.chunked_prefill_meta.as_ref().unwrap().block_table;
         ops::fill_slots_from_block_table(

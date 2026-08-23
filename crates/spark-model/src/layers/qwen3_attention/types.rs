@@ -137,6 +137,18 @@ pub struct Qwen3AttentionLayer {
     pub(super) rms_norm_f32_in_k: KernelHandle,
     pub(super) dense_gemv_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
+    /// Exact K1-order gated-Q + dual-KV M17 kernels. The pair is atomic:
+    /// either missing handle sends the whole QKV phase to ordinary K1 rows.
+    pub(super) w4a16_exact_qkv_kernels: crate::layers::ops::W4a16ExactAttentionKernels,
+    /// Exact row-major multi-row W4 GEMV used by NVFP4 attention O-proj.
+    /// Missing selected tiers fail closed to independent ordinary K1 rows.
+    pub(super) w4a16_exact_o_proj_kernels: crate::layers::ops::W4a16ExactLmHeadKernels,
+    /// Single-warp `w4a16_gemv_sw` — lossless, 8 outputs per 256-thread block
+    /// instead of 4, no cross-warp smem round-trip. `KernelHandle(0)` on a
+    /// miss falls back to the bit-identical 64-thread base GEMV.
+    pub(super) w4a16_gemv_sw_k: KernelHandle,
+    /// `ATLAS_NO_GEMV_SW != "1"`, cached at construction.
+    pub(super) gemv_sw: bool,
     pub(super) w8a16_gemv_k: KernelHandle,
     pub(super) w8a16_gemm_k: KernelHandle,
     pub(super) w4a16_gemv_dual_k: KernelHandle,
@@ -164,6 +176,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) innerq_apply_q_k: KernelHandle,
     pub(super) innerq_apply_k_k: KernelHandle,
     pub(super) paged_decode_k: KernelHandle,
+    /// Qwen3.8-only BF16 paged decode ABI with graph-stable DDTree ancestor
+    /// indirection. Handle 0 deliberately fails per-layer certification.
+    pub(super) paged_decode_bf16_qwen_tree_k: KernelHandle,
     /// HDIM=512 paged decode kernel for Gemma-4 full-attention layers
     pub(super) paged_decode_512_k: KernelHandle,
     /// MLA absorbed paged decode kernel (HDIM=320).
@@ -222,6 +237,12 @@ pub struct Qwen3AttentionLayer {
     /// cache + HDIM=256 only; `None` for other KV dtypes / head_dims and
     /// when the PTX failed to resolve (older caches).
     pub(super) paged_decode_kgamma_k: Option<KernelHandle>,
+    /// FP8 BC=4-preserving fused-query verify kernel (Qwen3.8 M=15).
+    pub(super) paged_decode_kgamma_fp8_bc4_k: Option<KernelHandle>,
+    /// Flat K-gamma fused paged attention for BF16 KV, HDIM=256.
+    /// Quarantined after deterministic parity failure; the public flag alone
+    /// cannot dispatch this prototype.
+    pub(super) paged_decode_kgamma_bf16_k: Option<KernelHandle>,
     /// VEC variant of `paged_decode_kgamma_k`: 16 warps/CTA + 2-position
     /// dequant batching. Gated by `ATLAS_KGAMMA_VECDEQUANT=1`; falls back to
     /// the baseline kgamma kernel when unavailable or gate is off.
@@ -259,6 +280,13 @@ pub struct Qwen3AttentionLayer {
     pub(super) rms_norm_qk_batch3_k: KernelHandle,
     // Kernels — prefill (GEMM M=N + Flash Attention)
     pub(super) w4a16_gemm_k: KernelHandle,
+    /// Byte-exact cp.async pipelined shadow of `w4a16_gemm` (same dequant
+    /// arithmetic + m16n8k16 MMA order, only the weight-load pipeline differs;
+    /// see `w4a16_gemm_pipe` in the w4a16 kernel set). Used by the prefill
+    /// QKV/O projections when `ATLAS_PREFILL_PROJ_PIPE=1` — the baseline
+    /// kernel is latency-bound at small M (~21 GB/s), the pipe lands near the
+    /// decode kernels' ~190 GB/s. Handle 0 falls back to the baseline.
+    pub(super) w4a16_gemm_pipe_k: KernelHandle,
     pub(super) w4a16_gemm_t_k: KernelHandle,
     pub(super) w4a16_gemm_t_k64_k: KernelHandle,
     pub(super) w4a16_gemm_t_m128_k: KernelHandle,
