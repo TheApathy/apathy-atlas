@@ -24,8 +24,15 @@ roughly 273 GB/s, so it does not transfer to discrete-GPU parts.
 to get a wrong result here:
 
 ```bash
+# nvcc must be ON PATH. cudarc's build script resolves the CUDA version by
+# shelling out to a bare `nvcc --version`; it does NOT consult CUDA_HOME. A
+# clean checkout has no cached build-script output, so this fails there even
+# though it succeeds on a tree that has built before.
+export PATH=/usr/local/cuda/bin:$PATH
+
 touch crates/atlas-kernels/build.rs
-ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 cargo build --release
+ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 \
+  cargo build --release -p spark-server
 ```
 
 Without those two variables the build **silently** defaults to
