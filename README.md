@@ -245,7 +245,7 @@ This is a starting point, not a destination. The plug-and-play design above exis
 
 ## ⚡ Performance
 
-We're not going to spend much real estate on benchmark theatre. The numbers below are what the binary in this repository does on a single NVIDIA GB10, on a short prompt (`"What is the capital of France?"`, `max_tokens ≤ 30`, `temperature = 0.1`), measured end-to-end through the HTTP API. They are reproducible: `scripts/sweep_all_models.sh` is the harness, and the source for every kernel that produced them is in this repository.
+We're not going to spend much real estate on benchmark theatre. The numbers below are what the binary in this repository does on a single NVIDIA GB10, on a short prompt (`"What is the capital of France?"`, `max_tokens ≤ 30`, `temperature = 0.1`), measured end-to-end through the HTTP API. They are re-measurable: `scripts/sweep_all_models.sh` is the harness, and the source for every kernel that produced them is in this repository. (Re-measurable, not bit-reproducible — the build embeds a compile timestamp from a C dependency, so two builds of the same commit from a clean `target/` do not produce identical binaries.)
 
 | Model | Mode | tok/s |
 |---|---|---:|
@@ -432,7 +432,7 @@ For bisecting *which* code path is at fault, two override toggles let you swap t
 |---|---|
 | `ATLAS_FP8_MOE_COALESCED=0` | Forces the FP8 grouped-GEMM v1 kernel (default is v2; v1 has a documented numerical bug for some `(token, expert)` tiles) |
 | `ATLAS_FORCE_NVFP4_MOE=1` | Routes an FP8 model's MoE through the NVFP4 path — useful for cross-validating that the bug is in one specific quant path |
-| `ATLAS_WEIGHT_CACHE=1` | Serves the per-layer transposed NVFP4 weights from a disk cache instead of rebuilding them, cutting the Qwen3.8-27B weight-load phase from ~45–60 s to 17 s. Off by default; costs ~12.7 GiB per model variant and, once enabled, prunes old variants to stay inside a 32 GiB budget (`ATLAS_WEIGHT_CACHE_EVICT=0` opts out). See [`docs/weight-cache.md`](docs/weight-cache.md) |
+| `ATLAS_WEIGHT_CACHE=1` | Serves the per-layer transposed NVFP4 weights from a disk cache instead of rebuilding them, cutting the Qwen3.8-27B weight-load phase from ~45–60 s to 17 s (measured on the host; the container-restart case is not yet verified). Off by default; costs ~12.7 GiB per model variant and, once enabled, prunes old variants to stay inside a 32 GiB budget (`ATLAS_WEIGHT_CACHE_EVICT=0` opts out). See [`docs/weight-cache.md`](docs/weight-cache.md) |
 
 ### How we use these in practice — 3-step workflow
 

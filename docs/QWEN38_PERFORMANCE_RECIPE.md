@@ -192,9 +192,6 @@ The bit-exact path remains available via `ATLAS_FFN_TC=0 ATLAS_SSM_PROJ_TC=0`
 9. **Client-side kills do not cancel server-side generation.** Killing a corpus
    generator leaves its in-flight requests running; a subsequent 5-token probe
    measured 87 s while queued behind them.
-10. **`--block-size` is ignored when `--draft-config-path` is passed.**
-    `train_dflash.py:217` is inside the `else` branch. Put `block_size` in the
-    config, not on the command line, and grep the log for `Draft config: block_size=`.
 
 ---
 
@@ -235,27 +232,35 @@ term is at or near its floor. The open lever is acceptance:
 - for 70: p ≈ 0.92, ~9.2 emitted/cycle
 - champion-class drafter, measured on its own target: p = 0.956
 
-The current drafter learned from a corpus that was 63% off-policy passthrough
-and contained **zero thinking-span text**, while thinking is 80-95% of the
-tokens it drafts at serve time. The retrain in progress fixes exactly that,
-with `block_size 32` to lift the gamma ceiling §2 documents.
+Acceptance is the open lever, and it is a property of the drafter rather than
+the engine — every kernel term above is at or near its bandwidth floor, so no
+serving-side knob moves it. Drafter work is out of tree.
 
 ---
 
 ## 9. Reproducing
 
 ```bash
-# build (the target env is mandatory)
-cd /home/flocka/atlas/src
-ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 cargo build --release -p spark-server
+cd /path/to/apathy-atlas
+
+# build. Both target vars are mandatory, and nvcc must be on PATH: cudarc's
+# build script shells out to a bare `nvcc` and does not consult CUDA_HOME.
+export PATH=/usr/local/cuda/bin:$PATH
+ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 \
+  cargo build --release -p spark-server
 
 # serve (speed profile)
-cd /home/flocka/atlas/qwen38/benchmark && bash arms/atlas-fork.sh
+MODEL_DIR=/path/to/Qwen3.8-27B-NVFP4 DRAFT=/path/to/dflash-drafter \
+  ./bench/qwen38-gb10/serve.sh
 
 # measure
-python3 qwen38/benchmark/weschera_minheap_repro.py \
+python3 bench/qwen38-gb10/weschera_minheap_repro.py \
   --output /tmp/minheap.json --repetitions 5 --max-tokens 400
 ```
+
+`arms/atlas-fork.sh`, referenced elsewhere in this document, is a working file
+on the measurement box and does not ship. `bench/qwen38-gb10/serve.sh` is the
+published equivalent.
 
 Interleave A/B arms rather than running them sequentially — sequential arms on
 this box manufacture phantom deltas. Baseline drift is ~±1 tok/s; treat

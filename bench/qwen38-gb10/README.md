@@ -104,9 +104,15 @@ interleaved in a single session; the spread is run-to-run drift, not two
 distinct configurations.
 
 Decode rate falls with generation length because speculative acceptance falls
-with length (measured 48.2% at 400 tokens, 38.7% at 800, 32.5% at 1500). The
-per-position hazard is flat at 0.87 over 11k cycles, so this is a property of
-the drafter, not a leak or a degradation over the run.
+with length, and the per-position hazard is flat rather than rising — so this is
+a property of the drafter, not a leak or a degradation over the run.
+
+> **Method not recorded — pending re-measurement.** The supporting figures
+> (acceptance 48.2% / 38.7% / 32.5% at 400 / 800 / 1500 tokens, hazard flat at
+> 0.87 over 11k cycles) could not be traced back to a stored measurement
+> artifact. They are left here rather than deleted because the qualitative claim
+> is load-bearing for reading the table above, but do not cite the numbers until
+> they are re-measured. If they do not reproduce they will be removed.
 
 ## Measurement notes
 

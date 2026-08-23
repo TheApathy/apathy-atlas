@@ -22,14 +22,19 @@ parts that did.
 
 ## 1. Scope, and how to read this
 
+This document describes the branch **as of 2026-08-23**. It is a snapshot, and
+the branch moves faster than the snapshot does — the shas below went stale twice
+on the day they were written. Treat the shape as current and the counts as
+historical; `git log` and the commands in §11 are the authority.
+
 | | |
 |---|---|
-| Fork HEAD | `088a6fee` (2026-08-23) |
-| Upstream `main` | `00cf2c41` (2026-08-23) |
+| Snapshot taken | 2026-08-23 |
+| Upstream `main` at the time | `00cf2c41` |
 | Merge base | `ddc7080f` (2026-05-24) |
-| Commits ahead | 296 |
-| Commits behind | 201 |
-| Diff | 594 files, +126,455 / −3,283 |
+| Commits ahead, at the time | ~296 |
+| Commits behind, at the time | ~201 |
+| Diff, at the time | 594 files, +126,455 / −3,283 |
 
 Three caveats govern every number below.
 
@@ -66,7 +71,7 @@ champion's documented acceptance figure. This is written down at
 | CUDA kernels | `kernels/gb10` | 124 | +29,751 / −378 | 67 new kernels, 57 modified |
 | Scheduler + HTTP | `crates/spark-server` | 78 | +7,192 / −315 | Propose/verify loop, API surface |
 | Vendored vLLM reference | `research/` | 112 | +33,381 | Not compiled; port source material |
-| Bench + eval harness | `local/`, `bench/`, `tools/` | 86 | +10,685 | Arms, sweeps, evals, drafter training |
+| Bench + eval harness | `local/`, `bench/`, `tools/` | 86 | +10,685 | Arms, sweeps, evals |
 | Correctness audit log | `tests/SINGLE_GPU_RESULTS.md` | 1 | +4,669 | ~55 independent audit passes |
 | Runtime / storage / core | `crates/spark-{runtime,storage}`, `atlas-{core,kernels}` | 17 | +1,494 / −102 | Buffers, KV sizing, HSS, build |
 | Docs | `docs/turboquant-plus.md` | 1 | +536 | Only tracked doc added |
@@ -285,10 +290,9 @@ fit of `78.74 + 2.996·k` appears in `SPEED-70.md:98` — that was measured on a
 different binary and is superseded.
 
 The remaining gap to 70 tok/s is a single scalar: per-token accept probability
-**p = 0.9011 today, 0.9204 needed** at the current cycle time. And the incumbent
-drafter learned its 0.9011 from a corpus measured at **63.1% verbatim
-passthrough** from upstream datasets rather than target-generated text (1,262 of
-2,000 sampled rows byte-identical to source). That is the open lever.
+**p = 0.9011 today, 0.9204 needed** at the current cycle time. That gap is a
+drafter property, not an engine one — the kernel terms are at their bandwidth
+floor. Drafter work is out of tree.
 
 ---
 
@@ -322,8 +326,9 @@ duplicates between the two targets. That is ~3,000 lines of guaranteed drift.
 
 The Qwen3.8 checkpoint is not uniformly quantized — FP8-E4M3 islands sit beside
 compressed-tensors NVFP4 in the same file — so each projection must be classified
-from its own keys rather than from the checkpoint-wide declaration. Details and
-the audited tensor inventory are in `docs/QWEN38_MIXED_PRECISION.md`. Alongside
+from its own keys rather than from the checkpoint-wide declaration. The tensor
+inventory behind that finding was audited against a local, non-shipped
+checkpoint and is not published. Alongside
 it: a dense MTP head loader for the AEON re-quants, TurboQuant+ weight
 pre-rotation folding S2·H·S1/√d into Q/K/V/O at load time (saves 160 kernel
 launches per token), a W3 sidecar loader, and transposed FFN copies built at load
@@ -561,7 +566,7 @@ have required a GPU run to verify (a benchmark was running).
 Re-run these rather than rewriting from scratch. All are read-only.
 
 ```sh
-cd /home/flocka/atlas/src
+cd /path/to/apathy-atlas
 
 # 1. Re-establish the frame.
 git fetch upstream
@@ -598,16 +603,20 @@ grep -rn 'env::var("ATLAS_' crates/ | grep -v 'Some("1")'   # candidate default-
 git log upstream/main --oneline -25
 ```
 
-Measurement sources to re-read, in priority order:
+Measurement sources to re-read, in priority order. **None of these ship in this
+repository** — they are working files on the measurement box, listed so the
+provenance of the numbers above is nameable rather than anonymous. An outside
+reader cannot follow this list; the published extract is §4 and §7.
 
-1. `/home/flocka/atlas/qwen38/SPEED-70.md` — the primary log. Section 41–49 is
-   the current Era-B progression; §53 is the split-K re-reference correction.
-2. `/home/flocka/atlas/qwen38/benchmark/results/*.json` — raw arm results. Always
-   check `spec_env.draft-model` and `deterministic` before citing a row.
-3. `/home/flocka/atlas/qwen38/analysis/` — per-lane closure documents. The
-   TC-REFREEZE and bandwidth-ledger docs supersede earlier framings and say so.
-4. `/home/flocka/atlas/qwen38/benchmark/arms/atlas-fork.sh` — the champion
-   configuration, with the REFREEZE declaration at lines 54-62.
+1. `SPEED-70.md` — the primary log. Section 41–49 is the current Era-B
+   progression; §53 is the split-K re-reference correction.
+2. `benchmark/results/*.json` — raw arm results. Always check
+   `spec_env.draft-model` and `deterministic` before citing a row.
+3. `analysis/` — per-lane closure documents. The TC-REFREEZE and
+   bandwidth-ledger docs supersede earlier framings and say so.
+4. `benchmark/arms/atlas-fork.sh` — the champion configuration, with the
+   REFREEZE declaration at lines 54-62. The published equivalent is
+   `bench/qwen38-gb10/serve.sh`.
 
 When updating: keep the era label on every number, keep the "no measured effect"
 rows, and keep the refutation bank in §7. The refutations are the most expensive
