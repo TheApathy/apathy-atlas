@@ -235,22 +235,65 @@ def dequant_w3_e4m3(packed, scale_bytes, scale2, n, k):
 
 class SafetensorsReader:
     def __init__(self, path):
-        self.f = open(path, "rb")
-        n = struct.unpack("<Q", self.f.read(8))[0]
-        self.header = json.loads(self.f.read(n))
-        self.base = 8 + n
+        import os
+        self.files = {}
+        self.headers = {}
+        self.bases = {}
+        self.weight_map = {}
+        self.header = {}
+        if os.path.isdir(path):
+            index_path = os.path.join(path, "model.safetensors.index.json")
+            single_path = os.path.join(path, "model.safetensors")
+            if os.path.exists(index_path):
+                with open(index_path, "r") as f:
+                    idx = json.load(f)
+                self.weight_map = idx.get("weight_map", {})
+                self.dir = path
+                self.header = {k: None for k in self.weight_map}
+            elif os.path.exists(single_path):
+                self._load_file(single_path, default=True)
+            else:
+                raise FileNotFoundError(f"No safetensors found in directory: {path}")
+        else:
+            self._load_file(path, default=True)
+
+    def _load_file(self, path, default=False):
+        import os
+        f = open(path, "rb")
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+        base = 8 + n
+        fname = os.path.basename(path)
+        self.files[fname] = f
+        self.headers[fname] = header
+        self.bases[fname] = base
+        if default:
+            self.header = header
+            self.weight_map = {k: fname for k in header}
+        return fname
+
+    def _get_file_and_meta(self, name):
+        import os
+        if name not in self.weight_map:
+            raise KeyError(f"Tensor {name} not found in weights")
+        fname = self.weight_map[name]
+        if fname not in self.files:
+            fpath = os.path.join(self.dir, fname) if hasattr(self, "dir") else fname
+            self._load_file(fpath)
+        return self.files[fname], self.headers[fname][name], self.bases[fname]
 
     def tensor(self, name):
-        m = self.header[name]
+        f, m, base = self._get_file_and_meta(name)
         off = m["data_offsets"]
-        self.f.seek(self.base + off[0])
-        buf = self.f.read(off[1] - off[0])
+        f.seek(base + off[0])
+        buf = f.read(off[1] - off[0])
         return np.frombuffer(buf, dtype=np.uint8).copy(), m["dtype"], m["shape"]
 
     def scalar_f32(self, name):
         raw, dt, _ = self.tensor(name)
         assert dt == "F32", f"{name}: {dt}"
         return float(np.frombuffer(raw.tobytes(), dtype=np.float32)[0])
+
 
 
 def write_safetensors(path, tensors):
@@ -377,7 +420,7 @@ def main():
         emit_golden()
         return
 
-    reader = SafetensorsReader(f"{args.model}/model.safetensors")
+    reader = SafetensorsReader(args.model)
     if args.layers == "all":
         layers = sorted(
             {int(k.split(".layers.")[1].split(".")[0])

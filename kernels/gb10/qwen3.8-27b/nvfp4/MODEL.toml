@@ -25,3 +25,4 @@ mrope_interleaved = true
 mrope_section = [11, 11, 10]
 
 mtp_layers = 1   # native in-checkpoint MTP head (mtp.*)
+

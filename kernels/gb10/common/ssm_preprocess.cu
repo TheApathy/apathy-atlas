@@ -355,6 +355,83 @@ extern "C" __global__ void dense_gemv_ba_gates(
     }
 }
 
+// Exact multi-row counterpart of dense_gemv_ba_gates. Each grid.y block
+// executes the ordinary K=1 reduction and inline FP32 gate transforms for one
+// row; no BF16 BA intermediate is materialized.
+extern "C" __global__ void dense_gemv_ba_gates_batchn(
+    const __nv_bfloat16* __restrict__ A_base,
+    const __nv_bfloat16* __restrict__ B,
+    const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias,
+    float* __restrict__ gate_base,
+    float* __restrict__ beta_base,
+    unsigned int N,
+    unsigned int K,
+    unsigned int vheads_per_group,
+    unsigned int gate_beta_stride
+) {
+    const unsigned int row = blockIdx.y;
+    const __nv_bfloat16* __restrict__ A =
+        A_base + (unsigned long long)row * K;
+    float* __restrict__ gate_out =
+        gate_base + (unsigned long long)row * gate_beta_stride;
+    float* __restrict__ beta_out =
+        beta_base + (unsigned long long)row * gate_beta_stride;
+    const unsigned int threads_per_out = 256 / 4;
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int n = blockIdx.x * 4 + local_out;
+    if (n >= N) return;
+
+    float acc = 0.0f;
+    const unsigned int K_VEC = K / 8;
+    const uint4* A_vec = (const uint4*)A;
+    const uint4* B_vec = (const uint4*)(B + (unsigned long long)n * K);
+    for (unsigned int kv = lane; kv < K_VEC; kv += threads_per_out) {
+        uint4 a_data = A_vec[kv];
+        uint4 b_data = B_vec[kv];
+        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
+        const unsigned int b_raw[4] = {b_data.x, b_data.y, b_data.z, b_data.w};
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            __nv_bfloat16 a_lo, a_hi, b_lo, b_hi;
+            *(unsigned short*)&a_lo = (unsigned short)(a_raw[i] & 0xFFFF);
+            *(unsigned short*)&a_hi = (unsigned short)(a_raw[i] >> 16);
+            *(unsigned short*)&b_lo = (unsigned short)(b_raw[i] & 0xFFFF);
+            *(unsigned short*)&b_hi = (unsigned short)(b_raw[i] >> 16);
+            acc += __bfloat162float(a_lo) * __bfloat162float(b_lo);
+            acc += __bfloat162float(a_hi) * __bfloat162float(b_hi);
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    __shared__ float smem[4 * 2];
+    const unsigned int warp_lane = threadIdx.x % 32;
+    if (warp_lane == 0)
+        smem[local_out * 2 + (lane / 32)] = acc;
+    __syncthreads();
+
+    if (lane == 0) {
+        float result = smem[local_out * 2] + smem[local_out * 2 + 1];
+        unsigned int group_dim_ba = 2 * vheads_per_group;
+        unsigned int within_group = n % group_dim_ba;
+        unsigned int group = n / group_dim_ba;
+        if (within_group < vheads_per_group) {
+            unsigned int vh = group * vheads_per_group + within_group;
+            beta_out[vh] = 1.0f / (1.0f + __expf(-result));
+        } else {
+            unsigned int vh = group * vheads_per_group +
+                              (within_group - vheads_per_group);
+            float A_val = __expf(fminf(A_log[vh], 20.0f));
+            float dt = __logf(1.0f +
+                              __expf(fminf(result + dt_bias[vh], 20.0f)));
+            gate_out[vh] = __expf(-A_val * dt);
+        }
+    }
+}
+
 // ============================================================
 // Fused BA GEMM + GDN gates for prefill (token-parallel)
 // ============================================================

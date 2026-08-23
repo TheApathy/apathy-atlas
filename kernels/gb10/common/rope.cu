@@ -363,3 +363,63 @@ extern "C" __global__ void rope_forward_yarn(
     ptr[d0] = __float2bfloat16(y0);
     ptr[d1] = __float2bfloat16(y1);
 }
+
+// DFlash-compatible YaRN variant. Transformers multiplies both cos and sin by
+// `attention_factor` (derived from the YaRN factor when not explicit). Keep a
+// separate symbol so existing target-model callers retain the legacy ABI.
+extern "C" __global__ void rope_forward_yarn_scaled(
+    __nv_bfloat16* __restrict__ Q,
+    __nv_bfloat16* __restrict__ K,
+    const unsigned int* __restrict__ positions,
+    const unsigned int seq_len,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int rotary_dim,
+    const float* __restrict__ inv_freq,
+    const float theta,
+    const float attention_factor
+) {
+    (void)theta;
+
+    const unsigned int head_idx = blockIdx.x;
+    const unsigned int seq_block = blockIdx.y;
+    const unsigned int batch = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+
+    const bool is_q = (head_idx < num_q_heads);
+    const unsigned int head = is_q ? head_idx : (head_idx - num_q_heads);
+    const unsigned int num_heads = is_q ? num_q_heads : num_kv_heads;
+    if (!is_q && head >= num_kv_heads) return;
+
+    const unsigned int pairs_per_pos = rotary_dim / 2;
+    const unsigned int pos_per_block = 128 / pairs_per_pos;
+    const unsigned int local_pos = tid / pairs_per_pos;
+    const unsigned int pair_idx = tid % pairs_per_pos;
+    const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
+    if (seq_pos >= seq_len) return;
+
+    const unsigned int abs_pos = positions[batch * seq_len + seq_pos];
+    const float angle = (float)abs_pos * inv_freq[pair_idx];
+    const float cos_val = cosf(angle) * attention_factor;
+    const float sin_val = sinf(angle) * attention_factor;
+
+    __nv_bfloat16* ptr;
+    if (is_q) {
+        ptr = Q + batch * seq_len * (num_q_heads * head_dim)
+                + seq_pos * (num_q_heads * head_dim)
+                + head * head_dim;
+    } else {
+        ptr = K + batch * seq_len * (num_kv_heads * head_dim)
+                + seq_pos * (num_kv_heads * head_dim)
+                + head * head_dim;
+    }
+
+    const unsigned int half_rot = rotary_dim / 2;
+    const unsigned int d0 = pair_idx;
+    const unsigned int d1 = pair_idx + half_rot;
+    const float x0 = (float)ptr[d0];
+    const float x1 = (float)ptr[d1];
+    ptr[d0] = __float2bfloat16((x0 * cos_val) - (x1 * sin_val));
+    ptr[d1] = __float2bfloat16((x1 * cos_val) + (x0 * sin_val));
+}

@@ -41,38 +41,23 @@ mtp_layers = 1
 # (Atlas's hybrid-GDN long-context behavior is consistent across 27B variants).
 effective_context = 24576
 
-# Recommended sampling defaults (carried over from Qwen3.5 family).
-#
-# Anti-repetition stack derived from commit 6c69d3f (which LIVE-BISECTED
-# the OpenWebUI "3D chess game" degeneration: thinking-mode
-# presence_penalty=0.0 — copied from the official Qwen3.6-27B card —
-# drops the model into an announce/restart + verbatim-CSS loop on hard
-# code-gen; QwenLM/Qwen3.6 #88/#115/#145).
-#
-# presence_penalty RETUNED 1.5 → 1.0 (2026-05-17, this branch). 6c69d3f
-# used 1.5 on `thinking_coding` WITH XTC and code-routing; THIS branch's
-# build_sampling routes enable_thinking → `thinking_text` (no
-# thinking_coding selection) and has NO XTC port, and Open WebUI sends
-# no sampling params so requests run at the preset default temp=0.6
-# (stochastic, NOT greedy). Swept presence_penalty ∈ {0.3,0.5,0.8,1.0,
-# 1.5} live at temp=0.6 on the chess prompt: 1.5 → premature EOS (574
-# tok, 0 THREE. calls — the flat per-seen-token penalty boosts EOS once
-# common code tokens are exhausted); 0.3 → complete but 3× wasteful
-# announce/restart rewrites; 1.0 → single coherent complete impl
-# (</script></body></html>, 17 THREE. calls, finish=stop, no loop). 1.0
-# is the balance point between premature-termination and restart-spam
-# at temp=0.6. DRY (multi-token phrase) + LZ (n-gram) carry the
-# precision loop-breaking that presence (single-token) can't; the
-# digit-normalized content-loop watchdog is the hard-stop safety net.
-# tools stays 0.0 (grammar-constrained).
+# Qwen3.8 sampling keeps history penalties neutral in every category. The
+# previous Qwen3.6-derived presence/LZ/DRY stack was calibrated only for
+# stochastic prose at temperature 0.6. Atlas applies those processors before
+# the temperature-zero argmax too, where they can demote repeated whitespace
+# tokens and corrupt deterministic code indentation. Repetition=1 and the
+# zero values below make greedy decoding the target model's raw argmax while
+# preserving explicit per-request presence/frequency/repetition overrides.
 [sampling.thinking_text]
 temperature = 0.6
 top_p = 0.95
 top_k = 20
-presence_penalty = 1.0
+min_p = 0.0
+presence_penalty = 0.0
 frequency_penalty = 0.0
-lz_penalty = 0.2
-dry_multiplier = 0.8
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
 dry_base = 1.75
 dry_allowed_length = 2
 
@@ -80,10 +65,12 @@ dry_allowed_length = 2
 temperature = 0.6
 top_p = 0.95
 top_k = 20
-presence_penalty = 1.0
+min_p = 0.0
+presence_penalty = 0.0
 frequency_penalty = 0.0
-lz_penalty = 0.2
-dry_multiplier = 0.8
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
 dry_base = 1.75
 dry_allowed_length = 2
 
@@ -91,10 +78,12 @@ dry_allowed_length = 2
 temperature = 0.7
 top_p = 0.8
 top_k = 20
-presence_penalty = 1.0
+min_p = 0.0
+presence_penalty = 0.0
 frequency_penalty = 0.0
-lz_penalty = 0.2
-dry_multiplier = 0.8
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
 dry_base = 1.75
 dry_allowed_length = 2
 
@@ -102,10 +91,33 @@ dry_allowed_length = 2
 temperature = 0.6
 top_p = 0.95
 top_k = 20
+# Deliberately no min_p override: the model card does not publish a tools
+# preset, so absence preserves the operator/server default for this category.
 presence_penalty = 0.0
 frequency_penalty = 0.0
+repetition_penalty = 1.0
+lz_penalty = 0.0
+dry_multiplier = 0.0
+dry_base = 1.75
+dry_allowed_length = 2
 
 [behavior]
+# Rollback+re-steer SPLICES the sequence when its repetition watchdog fires.
+# Code is inherently repetitive, so it false-positives on exactly the coding
+# workload: AEON run 077c1f4f0b had 7/16 Coding failures as SyntaxErrors whose
+# outputs jump MID-EXPRESSION with budget remaining (`queue.append(n  # Now
+# accumulate` at 1033 of 2048 tokens) — the splice signature. Those splices
+# and the hard-stop truncations share one root: the detectors false-positive
+# on healthy code/reasoning at default sensitivity (observed firing at 56
+# thinking tokens). Re-steer is restored as the only mechanism that can break
+# a REAL loop and still finish the answer; the thresholds below are raised so
+# fires are rare enough that the splice risk is acceptable.
+rollback_resteer = true
+# Thinking-loop: require 12 repeats (default 3) before forcing </think>.
+think_loop_min_repeats = 12
+# Fuzzy content-repeat: tolerate pattern_len/18 mismatches (default /12) —
+# tighter match required before the content-loop watchdog fires.
+fuzzy_repeat_tolerance_div = 18
 # Content-loop watchdog enabled: dense Qwen3.6-27B has a known
 # prose-attractor failure mode (2026-04-26 field reports) and the
 # 2026-05-05 chess-game stress sweep confirmed it loops on long-code
@@ -118,8 +130,20 @@ enable_loop_watchdog = true
 # `<think>\n\n</think>` (thinking-off marker) so reasoning_content is
 # always empty. An explicit per-request enable_thinking=false still wins.
 thinking_default = true
-thinking_in_tools = false
-max_thinking_budget = 512
+# Qwen3.8's measured upstream agentic/tool profile keeps reasoning enabled
+# on tool-armed turns. The checkpoint template injects its effort contract;
+# cutting it to the copied Qwen3.6-era 512-token budget can force-close the
+# plan before tool selection.
+thinking_in_tools = true
+# Deep-think default. Measured 2026-08-22/23 on AEON v4: god_mode/frontier cases
+# burn 33-34k thinking tokens and were force-closed mid-derivation at a 32768 cap;
+# the reference attested run (unsloth/Qwen3.8-27B-NVFP4 on stock vLLM, 147/174)
+# serves with NO thinking cap at --max-model-len 65536. 57344 leaves ~8k for the
+# answer inside a 64k window.
+max_thinking_budget = 57344
+# `preserve_thinking` intentionally unset: Qwen3.8's checkpoint template
+# defaults to preserving historical think wrappers, while older dense-Qwen
+# templates keep their own default.
 default_num_drafts = 1
 
 # Upstream Qwen/Qwen3.6-27B reports `model_type = "qwen3_5"` in config.json.

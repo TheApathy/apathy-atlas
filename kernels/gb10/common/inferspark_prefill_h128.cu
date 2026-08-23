@@ -49,6 +49,8 @@ extern "C" __global__ void inferspark_prefill_h128(
     const __nv_bfloat16* __restrict__ V,
     __nv_bfloat16* __restrict__ O,
     const unsigned int seq_len,
+    const unsigned int query_start,
+    const unsigned int query_len_total,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -65,9 +67,9 @@ extern "C" __global__ void inferspark_prefill_h128(
 
     if (q_head >= num_q_heads) return;
 
-    const unsigned int q_start = q_block * BR;
-    if (q_start >= seq_len) return;
-    const unsigned int q_end = min(q_start + BR, seq_len);
+    const unsigned int q_start = query_start + q_block * BR;
+    if (q_start >= seq_len || q_start >= query_start + query_len_total) return;
+    const unsigned int q_end = min(q_start + BR, min(seq_len, query_start + query_len_total));
     const unsigned int q_len = q_end - q_start;
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
@@ -515,6 +517,8 @@ extern "C" __global__ void inferspark_prefill_h128_64(
     const __nv_bfloat16* __restrict__ V,
     __nv_bfloat16* __restrict__ O,
     const unsigned int seq_len,
+    const unsigned int query_start,
+    const unsigned int query_len_total,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -531,9 +535,9 @@ extern "C" __global__ void inferspark_prefill_h128_64(
 
     if (q_head >= num_q_heads) return;
 
-    const unsigned int q_start = q_block * BR64;
-    if (q_start >= seq_len) return;
-    const unsigned int q_end = min(q_start + BR64, seq_len);
+    const unsigned int q_start = query_start + q_block * BR64;
+    if (q_start >= seq_len || q_start >= query_start + query_len_total) return;
+    const unsigned int q_end = min(q_start + BR64, min(seq_len, query_start + query_len_total));
     const unsigned int q_len = q_end - q_start;
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;

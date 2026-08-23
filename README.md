@@ -432,6 +432,7 @@ For bisecting *which* code path is at fault, two override toggles let you swap t
 |---|---|
 | `ATLAS_FP8_MOE_COALESCED=0` | Forces the FP8 grouped-GEMM v1 kernel (default is v2; v1 has a documented numerical bug for some `(token, expert)` tiles) |
 | `ATLAS_FORCE_NVFP4_MOE=1` | Routes an FP8 model's MoE through the NVFP4 path — useful for cross-validating that the bug is in one specific quant path |
+| `ATLAS_WEIGHT_CACHE=1` | Serves the per-layer transposed NVFP4 weights from a disk cache instead of rebuilding them, cutting the Qwen3.8-27B weight-load phase from ~45–60 s to 17 s. Off by default; costs ~12.7 GiB per model variant and, once enabled, prunes old variants to stay inside a 32 GiB budget (`ATLAS_WEIGHT_CACHE_EVICT=0` opts out). See [`docs/weight-cache.md`](docs/weight-cache.md) |
 
 ### How we use these in practice — 3-step workflow
 

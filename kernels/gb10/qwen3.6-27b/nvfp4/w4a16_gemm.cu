@@ -2046,7 +2046,16 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64(
 // `Cpartial + z*M*N`. A companion `reduce_splitk_f32_to_bf16` sums the
 // SPLITK partials and writes the BF16 output. This multiplies CTA
 // count by SPLITK (80→320 at SPLITK=4) without atomics, restoring full
-// occupancy. Lossless: FP32 partials, exact sum.
+// occupancy.
+//
+// PRECISION: the partials are FP32, so nothing rounds to BF16 mid-
+// accumulation. That is NOT the same as reproducing the single-slice
+// result: this kernel restarts the accumulator at each slice boundary
+// and reduce_splitk_f32_to_bf16 sums the slices afterwards, whereas the
+// base kernel runs one left-to-right FP32 accumulation over all of K.
+// FP32 addition is not associative, so the BF16 output can differ by an
+// ULP. Deliberate re-reference — see the REFREEZE note in
+// benchmark/arms/atlas-fork.sh (2026-08-17).
 //
 // Geometry identical to w4a16_gemm_t_m32_n64 except:
 //   - Grid (ceil(N/64), ceil(M/32), SPLITK)  Block (128,1,1)

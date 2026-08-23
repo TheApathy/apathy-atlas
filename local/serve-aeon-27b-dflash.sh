@@ -275,8 +275,11 @@ export ATLAS_FLASH_ATTN_KGAMMA_SPLITK=${ATLAS_FLASH_ATTN_KGAMMA_SPLITK:-1}
 # 39.2→41.8 (+6.6%), prose 13.5→14.0 (+3.7%); counting md5 == 91a6ff90
 # constitution (replay path exercised, LOSSLESS). Prose (low-accept → more
 # replays) did NOT regress — each replay is one cheap partial kernel. SHIP.
-export ATLAS_WY17_LAZY=${ATLAS_WY17_LAZY:-8}
-export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-1}
+# Lossless default: lazy WY17 replay corrupts the recurrent GDN state after
+# partial speculative accepts.  Keep the unsafe experiment available only as
+# an explicit opt-in so production and benchmark launches are deterministic.
+export ATLAS_WY17_LAZY=${ATLAS_WY17_LAZY:-1}
+export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-0}
 
 # 2026-07-08 (think-spec): speculative decode DURING <think> spans (was hard-
 # bypassed -> plain ~13-25 tok/s on the majority of reasoning tokens). Post-

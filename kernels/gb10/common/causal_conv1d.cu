@@ -471,6 +471,81 @@ extern "C" __global__ void causal_conv1d_update_l2norm_f32(
     }
 }
 
+// Flat-chain multi-row variant of causal_conv1d_update_l2norm_f32. Rows are
+// advanced sequentially inside one CTA and every post-row state is persisted,
+// preserving the ordinary K=1 arithmetic and verify-commit contract.
+extern "C" __global__ void causal_conv1d_update_l2norm_f32_sequence(
+    float* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ new_input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    float* __restrict__ state_inter,
+    unsigned int num_tokens,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int qk_channels,
+    unsigned int head_dim,
+    float l2_eps,
+    unsigned int input_stride,
+    unsigned int output_stride,
+    unsigned int state_stride
+) {
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_start = blockIdx.x * blockDim.x;
+    const bool block_needs_l2 = block_start < qk_channels;
+    const bool valid = ch < dim;
+    __shared__ float warp_sums[8];
+
+    for (unsigned int token = 0; token < num_tokens; token++) {
+        float silu = 0.0f;
+        if (valid) {
+            float* state = conv_state + (unsigned long long)ch * d_conv;
+            for (unsigned int i = 0; i < d_conv - 1; i++)
+                state[i] = state[i + 1];
+            state[d_conv - 1] =
+                (float)new_input[(unsigned long long)token * input_stride + ch];
+            const __nv_bfloat16* w = weight + (unsigned long long)ch * d_conv;
+            float acc = (bias != nullptr) ? bias[ch] : 0.0f;
+            for (unsigned int k = 0; k < d_conv; k++)
+                acc += state[k] * (float)w[k];
+            float sigmoid_acc = 1.0f / (1.0f + __expf(-acc));
+            silu = acc * sigmoid_acc;
+        }
+
+        if (block_needs_l2) {
+            float sq = valid ? silu * silu : 0.0f;
+            const unsigned int warp_id = tid / 32;
+            const unsigned int lane = tid % 32;
+            for (int offset = 16; offset >= 1; offset >>= 1)
+                sq += __shfl_down_sync(0xFFFFFFFF, sq, offset);
+            if (lane == 0) warp_sums[warp_id] = sq;
+            __syncthreads();
+            const unsigned int head_in_block = tid / head_dim;
+            const unsigned int base_warp = head_in_block * (head_dim / 32);
+            if (tid == 0 || tid == head_dim) {
+                float total = warp_sums[base_warp] + warp_sums[base_warp + 1]
+                            + warp_sums[base_warp + 2] + warp_sums[base_warp + 3];
+                warp_sums[base_warp] = rsqrtf(total + l2_eps);
+            }
+            __syncthreads();
+            if (valid) silu *= warp_sums[base_warp];
+        }
+
+        if (valid) {
+            output[(unsigned long long)token * output_stride + ch] = silu;
+            const float* state = conv_state + (unsigned long long)ch * d_conv;
+            float* snapshot = state_inter
+                + (unsigned long long)token * state_stride
+                + (unsigned long long)ch * d_conv;
+            for (unsigned int i = 0; i < d_conv; i++)
+                snapshot[i] = state[i];
+        }
+        __syncthreads();
+    }
+}
+
 // ============================================================
 // TREE-AWARE CONV STATE RE-ROOT (M8A / FREE_SLOTS)
 // ============================================================

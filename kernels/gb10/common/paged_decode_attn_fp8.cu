@@ -33,6 +33,12 @@
 #define NUM_WARPS 8
 #define BC 4
 
+// K-gamma FP8 specialization: Qwen3.8 verify currently uses M=15. Keep the
+// bound explicit so an unsupported verify shape cannot silently index past
+// the register tile.
+#define KGAMMA_FP8_QTILE 15
+#define KGAMMA_FP8_QPER_WARP ((KGAMMA_FP8_QTILE + NUM_WARPS - 1) / NUM_WARPS)
+
 // Unpack 2 BF16 from uint32 → 2 F32 (reused for Q loading)
 __device__ __forceinline__ void unpack2_bf16(unsigned int packed, float& v0, float& v1) {
     v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
@@ -53,6 +59,309 @@ __device__ __forceinline__ void unpack4_fp8(
     v1 = __half2float(__nv_cvt_fp8_to_halfraw(b1, __NV_E4M3)) * dq_scale;
     v2 = __half2float(__nv_cvt_fp8_to_halfraw(b2, __NV_E4M3)) * dq_scale;
     v3 = __half2float(__nv_cvt_fp8_to_halfraw(b3, __NV_E4M3)) * dq_scale;
+}
+
+// Fused-query FP8 paged attention for the deterministic Qwen3.8 K-gamma
+// verify shape. Each warp owns up to two queries and scans their shared KV
+// history once. KV positions remain grouped in BC=4 batches, with the exact
+// max-rescaled online-softmax update used by paged_decode_attn_fp8. Query dot
+// products retain the same XOR warp reduction order.
+//
+// Contract: num_qtile == 15, identical block-table rows, no tree indirection.
+extern "C" __global__ void paged_decode_attn_kgamma_fp8_bc4(
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_fp8_storage_t* __restrict__ K_cache,
+    const __nv_fp8_storage_t* __restrict__ V_cache,
+    __nv_bfloat16* __restrict__ O,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const float k_scale,
+    const float v_scale,
+    const unsigned int q_stride,
+    const unsigned long long cache_stride,
+    const unsigned int num_qtile
+) {
+    const unsigned int q_head = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane_id = tid % WARP_SIZE;
+    if (q_head >= num_q_heads || num_qtile != KGAMMA_FP8_QTILE || head_dim != HDIM) return;
+
+    unsigned int my_q[KGAMMA_FP8_QPER_WARP];
+    unsigned int my_count = 0;
+    #pragma unroll
+    for (int s = 0; s < KGAMMA_FP8_QPER_WARP; ++s) {
+        unsigned int q = warp_id + s * NUM_WARPS;
+        my_q[s] = q;
+        if (q < num_qtile) ++my_count;
+    }
+    if (my_count == 0) return;
+
+    const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
+    const unsigned int kv_head = q_head / gqa_ratio;
+    const unsigned int vec_offset = lane_id * VEC_BF16;
+    const unsigned long long token_stride = (unsigned long long)num_kv_heads * HDIM;
+    const int* block_table = block_tables; // all verify rows are identical
+
+    float q_reg[KGAMMA_FP8_QPER_WARP][VEC_BF16];
+    float out[KGAMMA_FP8_QPER_WARP][VEC_BF16];
+    float m[KGAMMA_FP8_QPER_WARP], l[KGAMMA_FP8_QPER_WARP];
+    unsigned int sl[KGAMMA_FP8_QPER_WARP], max_sl = 0;
+    #pragma unroll
+    for (int s = 0; s < KGAMMA_FP8_QPER_WARP; ++s) {
+        m[s] = -1e30f; l[s] = 0.0f;
+        sl[s] = s < (int)my_count ? (unsigned int)seq_lens[my_q[s]] : 0;
+        max_sl = max(max_sl, sl[s]);
+        #pragma unroll
+        for (int i = 0; i < VEC_BF16; ++i) out[s][i] = 0.0f;
+        if (s < (int)my_count) {
+            const unsigned int* q32 = (const unsigned int*)(Q
+                + (unsigned long long)my_q[s] * q_stride
+                + (unsigned long long)q_head * HDIM + vec_offset);
+            #pragma unroll
+            for (int i = 0; i < VEC_U32; ++i)
+                unpack2_bf16(q32[i], q_reg[s][2*i], q_reg[s][2*i+1]);
+        }
+    }
+
+    unsigned int pos = 0;
+    while (pos < max_sl) {
+        unsigned int logical_block = pos / block_size;
+        unsigned int block_offset = pos % block_size;
+        unsigned int physical_block = (unsigned int)block_table[logical_block];
+        unsigned int count = min(min(BC, block_size - block_offset), max_sl - pos);
+        const __nv_fp8_storage_t* kb = K_cache + (unsigned long long)physical_block * cache_stride
+            + (unsigned long long)block_offset * token_stride + (unsigned long long)kv_head * HDIM;
+        const __nv_fp8_storage_t* vb = V_cache + (unsigned long long)physical_block * cache_stride
+            + (unsigned long long)block_offset * token_stride + (unsigned long long)kv_head * HDIM;
+        unsigned int kp[BC][VEC_U32_FP8], vp[BC][VEC_U32_FP8];
+        #pragma unroll
+        for (int b = 0; b < BC; ++b) {
+            if (b < (int)count) {
+                const unsigned int* k32 = (const unsigned int*)(kb + (unsigned long long)b * token_stride + vec_offset);
+                const unsigned int* v32 = (const unsigned int*)(vb + (unsigned long long)b * token_stride + vec_offset);
+                #pragma unroll
+                for (int i = 0; i < VEC_U32_FP8; ++i) { kp[b][i] = k32[i]; vp[b][i] = v32[i]; }
+            }
+        }
+
+        #pragma unroll
+        for (int s = 0; s < KGAMMA_FP8_QPER_WARP; ++s) {
+            if (s >= (int)my_count) break;
+            float scores[BC];
+            #pragma unroll
+            for (int b = 0; b < BC; ++b) {
+                scores[b] = -1e30f;
+                if (b < (int)count && pos + b < sl[s]) {
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < VEC_U32_FP8; ++i) {
+                        float a,b1,c,d; unpack4_fp8(kp[b][i], k_scale, a,b1,c,d);
+                        dot += q_reg[s][4*i]*a + q_reg[s][4*i+1]*b1 + q_reg[s][4*i+2]*c + q_reg[s][4*i+3]*d;
+                    }
+                    #pragma unroll
+                    for (int off = WARP_SIZE/2; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
+                    scores[b] = dot * inv_sqrt_d;
+                }
+            }
+            float mn = m[s];
+            #pragma unroll
+            for (int b = 0; b < BC; ++b) mn = fmaxf(mn, scores[b]);
+            float eo = __expf(m[s] - mn); l[s] *= eo;
+            #pragma unroll
+            for (int i = 0; i < VEC_BF16; ++i) out[s][i] *= eo;
+            #pragma unroll
+            for (int b = 0; b < BC; ++b) {
+                if (scores[b] <= -1e29f) continue;
+                float en = __expf(scores[b] - mn); l[s] += en;
+                #pragma unroll
+                for (int i = 0; i < VEC_U32_FP8; ++i) {
+                    float a,b1,c,d; unpack4_fp8(vp[b][i], v_scale, a,b1,c,d);
+                    out[s][4*i] += en*a; out[s][4*i+1] += en*b1; out[s][4*i+2] += en*c; out[s][4*i+3] += en*d;
+                }
+            }
+            m[s] = mn;
+        }
+        pos += count;
+    }
+
+    #pragma unroll
+    for (int s = 0; s < KGAMMA_FP8_QPER_WARP; ++s) {
+        if (s >= (int)my_count) break;
+        float il = l[s] > 0.0f ? 1.0f/l[s] : 0.0f;
+        unsigned int* o32 = (unsigned int*)(O + (unsigned long long)my_q[s] * num_q_heads * HDIM
+            + (unsigned long long)q_head * HDIM + vec_offset);
+        #pragma unroll
+        for (int i = 0; i < VEC_U32; ++i) {
+            unsigned int lo = __bfloat16_as_ushort(__float2bfloat16(out[s][2*i]*il));
+            unsigned int hi = __bfloat16_as_ushort(__float2bfloat16(out[s][2*i+1]*il));
+            o32[i] = lo | (hi << 16);
+        }
+    }
+}
+
+// Bit-parity candidate: two queries share one 16-warp CTA, but each query
+// retains the legacy kernel's complete eight-warp reduction topology.
+extern "C" __global__ void paged_decode_attn_kgamma_fp8_bc4_exact(
+    const __nv_bfloat16* __restrict__ Q,
+    const __nv_fp8_storage_t* __restrict__ K_cache,
+    const __nv_fp8_storage_t* __restrict__ V_cache,
+    __nv_bfloat16* __restrict__ O,
+    const int* __restrict__ block_tables,
+    const int* __restrict__ seq_lens,
+    const unsigned int max_blocks_per_seq,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int block_size,
+    const float inv_sqrt_d,
+    const float k_scale,
+    const float v_scale,
+    const unsigned int q_stride,
+    const unsigned long long cache_stride,
+    const unsigned int num_qtile
+) {
+    const unsigned int q_head = blockIdx.x;
+    const unsigned int global_warp = threadIdx.x / WARP_SIZE;
+    const unsigned int lane_id = threadIdx.x % WARP_SIZE;
+    const unsigned int group = global_warp / NUM_WARPS;
+    const unsigned int warp_id = global_warp % NUM_WARPS;
+    const unsigned int query = blockIdx.y * 2 + group;
+    if (q_head >= num_q_heads || num_qtile != 15 || head_dim != HDIM) return;
+    const bool active = query < num_qtile;
+    const unsigned int seq_len = active ? (unsigned int)seq_lens[query] : 0u;
+    const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
+    const unsigned int kv_head = q_head / gqa_ratio;
+    const unsigned int vec_offset = lane_id * VEC_BF16;
+    const unsigned long long token_stride = (unsigned long long)num_kv_heads * HDIM;
+    const int* table = block_tables + (unsigned long long)(active ? query : 0u) * max_blocks_per_seq;
+
+    const unsigned int* q32 = (const unsigned int*)(Q + (unsigned long long)(active ? query : 0u) * q_stride
+        + (unsigned long long)q_head * HDIM + vec_offset);
+    float qr[VEC_BF16];
+    #pragma unroll
+    for (int i=0;i<VEC_U32;i++) unpack2_bf16(q32[i], qr[2*i], qr[2*i+1]);
+
+    // Identical legacy partition for this query's local warp id.
+    unsigned int chunk = (seq_len + NUM_WARPS - 1) / NUM_WARPS;
+    unsigned int begin = min(warp_id * chunk, seq_len);
+    unsigned int end = min(begin + chunk, seq_len);
+    float m = -1e30f, l = 0.0f, out[VEC_BF16];
+    #pragma unroll
+    for (int i=0;i<VEC_BF16;i++) out[i]=0.0f;
+
+    unsigned int pos=begin;
+    while(pos<end) {
+        unsigned int logical=pos/block_size, off=pos%block_size;
+        unsigned int count=min(block_size-off,end-pos);
+        unsigned int physical=(unsigned int)table[logical];
+        const __nv_fp8_storage_t* kb=K_cache+(unsigned long long)physical*cache_stride
+            +(unsigned long long)off*token_stride+(unsigned long long)kv_head*HDIM;
+        const __nv_fp8_storage_t* vb=V_cache+(unsigned long long)physical*cache_stride
+            +(unsigned long long)off*token_stride+(unsigned long long)kv_head*HDIM;
+        unsigned int done=0, aligned=(count/BC)*BC;
+        for(;done<aligned;done+=BC) {
+            unsigned int kp[BC][VEC_U32_FP8],vp[BC][VEC_U32_FP8];
+            #pragma unroll
+            for(int b=0;b<BC;b++) {
+                const unsigned int* k=(const unsigned int*)(kb+(unsigned long long)(done+b)*token_stride+vec_offset);
+                const unsigned int* v=(const unsigned int*)(vb+(unsigned long long)(done+b)*token_stride+vec_offset);
+                #pragma unroll
+                for(int i=0;i<VEC_U32_FP8;i++){kp[b][i]=k[i];vp[b][i]=v[i];}
+            }
+            float scores[BC];
+            #pragma unroll
+            for(int b=0;b<BC;b++) {
+                float dot=0.0f;
+                #pragma unroll
+                for(int i=0;i<VEC_U32_FP8;i++) {
+                    float a,b1,c,d; unpack4_fp8(kp[b][i],k_scale,a,b1,c,d);
+                    dot+=qr[4*i]*a+qr[4*i+1]*b1+qr[4*i+2]*c+qr[4*i+3]*d;
+                }
+                #pragma unroll
+                for(int x=WARP_SIZE/2;x>0;x>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,x);
+                scores[b]=dot*inv_sqrt_d;
+            }
+            float mn=m;
+            #pragma unroll
+            for(int b=0;b<BC;b++)mn=fmaxf(mn,scores[b]);
+            float eo=__expf(m-mn);l*=eo;
+            #pragma unroll
+            for(int i=0;i<VEC_BF16;i++)out[i]*=eo;
+            float ef[BC];
+            #pragma unroll
+            for(int b=0;b<BC;b++){ef[b]=__expf(scores[b]-mn);l+=ef[b];}
+            m=mn;
+            #pragma unroll
+            for(int b=0;b<BC;b++){
+                #pragma unroll
+                for(int i=0;i<VEC_U32_FP8;i++){
+                    float a,b1,c,d;unpack4_fp8(vp[b][i],v_scale,a,b1,c,d);
+                    out[4*i]+=ef[b]*a;out[4*i+1]+=ef[b]*b1;out[4*i+2]+=ef[b]*c;out[4*i+3]+=ef[b]*d;
+                }
+            }
+        }
+        for(;done<count;done++) {
+            const unsigned int* k=(const unsigned int*)(kb+(unsigned long long)done*token_stride+vec_offset);
+            float dot=0.0f;
+            #pragma unroll
+            for(int i=0;i<VEC_U32_FP8;i++){
+                float a,b1,c,d;unpack4_fp8(k[i],k_scale,a,b1,c,d);
+                dot+=qr[4*i]*a+qr[4*i+1]*b1+qr[4*i+2]*c+qr[4*i+3]*d;
+            }
+            #pragma unroll
+            for(int x=WARP_SIZE/2;x>0;x>>=1)dot+=__shfl_xor_sync(0xffffffff,dot,x);
+            float score=dot*inv_sqrt_d,mn=fmaxf(m,score),eo=__expf(m-mn),en=__expf(score-mn);
+            l=l*eo+en;
+            const unsigned int* v=(const unsigned int*)(vb+(unsigned long long)done*token_stride+vec_offset);
+            #pragma unroll
+            for(int i=0;i<VEC_U32_FP8;i++){
+                float a,b1,c,d;unpack4_fp8(v[i],v_scale,a,b1,c,d);
+                out[4*i]=out[4*i]*eo+en*a;out[4*i+1]=out[4*i+1]*eo+en*b1;
+                out[4*i+2]=out[4*i+2]*eo+en*c;out[4*i+3]=out[4*i+3]*eo+en*d;
+            }
+            m=mn;
+        }
+        pos+=count;
+    }
+
+    __shared__ float sm[2][NUM_WARPS],sl[2][NUM_WARPS],so[2][NUM_WARPS][HDIM];
+    if(lane_id==0){sm[group][warp_id]=m;sl[group][warp_id]=l;}
+    #pragma unroll
+    for(int i=0;i<VEC_BF16;i++)so[group][warp_id][vec_offset+i]=out[i];
+    __syncthreads();
+    #pragma unroll
+    for(int stride=NUM_WARPS/2;stride>0;stride>>=1){
+        if(warp_id<(unsigned int)stride){
+            unsigned int other=warp_id+stride;
+            float lw=sl[group][other];
+            if(lw>0.0f){
+                float mw=sm[group][other],my_m=sm[group][warp_id],my_l=sl[group][warp_id];
+                float mn=fmaxf(my_m,mw),sa=__expf(my_m-mn),sb=__expf(mw-mn);
+                sl[group][warp_id]=my_l*sa+lw*sb;sm[group][warp_id]=mn;
+                #pragma unroll
+                for(int i=0;i<VEC_BF16;i++)so[group][warp_id][vec_offset+i]=
+                    so[group][warp_id][vec_offset+i]*sa+so[group][other][vec_offset+i]*sb;
+            }
+        }
+        __syncthreads();
+    }
+    if(active && warp_id==0){
+        float final_l=sl[group][0];
+        float il=final_l>0.0f?1.0f/final_l:0.0f;
+        unsigned int* o=(unsigned int*)(O+(unsigned long long)query*num_q_heads*HDIM+(unsigned long long)q_head*HDIM+vec_offset);
+        #pragma unroll
+        for(int i=0;i<VEC_U32;i++){
+            unsigned int lo=__bfloat16_as_ushort(__float2bfloat16(so[group][0][vec_offset+2*i]*il));
+            unsigned int hi=__bfloat16_as_ushort(__float2bfloat16(so[group][0][vec_offset+2*i+1]*il));o[i]=lo|(hi<<16);
+        }
+    }
 }
 
 // ============================================================================

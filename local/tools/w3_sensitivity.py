@@ -49,7 +49,7 @@ def main():
     ap.add_argument("--down-weight", type=float, default=2.0)
     args = ap.parse_args()
 
-    reader = SafetensorsReader(f"{args.model}/model.safetensors")
+    reader = SafetensorsReader(args.model)
     layers = sorted(
         {int(k.split(".layers.")[1].split(".")[0])
          for k in reader.header if ".mlp.gate_proj.weight" in k})

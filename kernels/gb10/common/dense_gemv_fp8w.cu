@@ -108,12 +108,15 @@ extern "C" __global__ void dense_gemv_fp8w(
     const unsigned int lane = threadIdx.x % threads_per_out;
 
     const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
-    if (n >= N) return;
+    const bool valid = n < N;
+
+    float acc = 0.0f;
+    // Keep the valid-row body textually unchanged: this branch only suppresses
+    // invalid row addresses while preserving its FP32 operation order.
+    if (valid) {
 
     // Load per-row scale once
     const float scale = row_scale[n];
-
-    float acc = 0.0f;
 
     // Vectorized K-reduction: 16 FP8 weights per uint4 load
     const unsigned int K_VEC = K / VEC_SIZE;
@@ -191,6 +194,7 @@ extern "C" __global__ void dense_gemv_fp8w(
 
     // Apply per-row scale after full K accumulation (better precision)
     acc *= scale;
+    }
 
     // Warp shuffle reduction within each group of 64 threads
     const unsigned int warp_lane = threadIdx.x % WARP_SIZE;
@@ -210,7 +214,7 @@ extern "C" __global__ void dense_gemv_fp8w(
     __syncthreads();
 
     // First thread of each output group writes final result
-    if (lane == 0) {
+    if (valid && lane == 0) {
         float result = smem[local_out * 2] + smem[local_out * 2 + 1];
         C[n] = __float2bfloat16(result);
     }

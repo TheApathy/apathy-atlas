@@ -35,8 +35,10 @@ export ATLAS_DFLASH_ATTN_KGAMMA=${ATLAS_DFLASH_ATTN_KGAMMA:-1}
 export ATLAS_ATTN_QKV_SPLITK=${ATLAS_ATTN_QKV_SPLITK:-4}
 export ATLAS_FFN_DOWN_SPLITK=${ATLAS_FFN_DOWN_SPLITK:-4}
 export ATLAS_ATTN_QKV_BATCHED=${ATLAS_ATTN_QKV_BATCHED:-1}
-export ATLAS_WY17_LAZY=${ATLAS_WY17_LAZY:-8}
-export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-1}
+# Lossless default.  Values greater than one plus lazy commit are an
+# experimental replay path and have produced nondeterministic GDN state.
+export ATLAS_WY17_LAZY=${ATLAS_WY17_LAZY:-1}
+export ATLAS_WY17_LAZY_COMMIT=${ATLAS_WY17_LAZY_COMMIT:-0}
 export ATLAS_DISABLE_TREE_WY=${ATLAS_DISABLE_TREE_WY:-1}
 # Keep SAM/tree OFF for the batched path (flat-chain only in v1).
 export ATLAS_DFLASH_SAM=${ATLAS_DFLASH_SAM:-0}
