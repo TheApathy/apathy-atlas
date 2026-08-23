@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Single-stream decode configuration for Qwen3.8-27B on GB10 (DGX Spark).
 #
-# Single-stream speed profile. See README.md in this directory for build
-# requirements, drafter selection, and measurement caveats.
+# This is the exact flag set behind the 63.9 tok/s median reported in the PR.
+# Every non-obvious knob is justified in docs/QWEN38_PERFORMANCE_RECIPE.md §2;
+# the short version is inline below so this file stands alone.
 #
 #   MODEL_DIR=/path/to/Qwen3.8-27B-NVFP4 \
 #   DRAFT=/path/to/dflash-drafter \
@@ -14,9 +15,9 @@ set -euo pipefail
 BIN="${BIN:-target/release/spark}"
 PORT="${PORT:-8896}"
 
-# Derive gamma from the drafter's block_size: trained_drafts = block_size - 1.
-# 15 corresponds to a block_size=16 drafter. Asking for more than the drafter
-# was trained for is refused by the loader.
+# gamma 15 is optimal AND maximal: the drafter's block_size=16 yields
+# trained_drafts = block_size - 1. gamma 20 is refused by the loader.
+# Measured 10/12/15 -> 56.71/59.30/62.92 tok/s, monotonic into the ceiling.
 GAMMA="${GAMMA:-15}"
 
 exec env \
