@@ -1,8 +1,19 @@
 # Qwen3.8-27B single-stream decode on GB10 — reproduction
 
-Reproduces the 63.9 tok/s median single-stream decode result on a DGX Spark
-(GB10). This builds directly on the DFlash2 integration from #648; that PR is
-the baseline this one is measured against.
+Reproduces the **63.9 tok/s** median single-stream decode result for
+Qwen3.8-27B on a DGX Spark (GB10).
+
+```bash
+git clone https://github.com/TheApathy/apathy-atlas.git
+cd apathy-atlas
+git checkout qwen38/gb10-perf-and-packaging
+```
+
+Related work: Avarok-Cybersecurity/atlas#648 integrates DFlash2 for the same
+model on the same hardware and reports 54.5 tok/s. That PR is open and
+unmerged, and this branch does not contain its commits — the two are
+concurrent, independent integrations against the same DFlash2 release. It is
+the most useful external reference point for the numbers below.
 
 ## Hardware and build
 
@@ -34,10 +45,24 @@ immediately before measuring rather than trusting an earlier build.
 - **Target**: `unsloth/Qwen3.8-27B-NVFP4` @ `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108`.
   Upstream super-squashed the repo on 2026-08-15, so older revision hashes
   (including ones cited by earlier submissions) now 404. Pin this revision.
-- **Drafter**: a DFlash-family drafter with `block_size: 16`. `block_size`
-  determines the usable draft width: `trained_drafts = block_size - 1`, so
-  `--dflash-gamma 15` is both optimal and maximal. `--dflash-gamma 20` is
-  refused by the loader.
+- **Drafter**: `drafter-qwen38-v2-epoch4-step24852` — DFlash family, 69 tensors,
+  3.96 GiB BF16, 6 layers, `hidden_size` 5120, `vocab_size` 248320,
+  **`block_size: 16`**. The engine quantises 6 layers x 7 dense + fc to NVFP4 at
+  load; the BF16 sources are retained.
+
+  `block_size` determines the usable draft width: `trained_drafts =
+  block_size - 1`, so `--dflash-gamma 15` is both optimal and maximal, and
+  `--dflash-gamma 20` is refused by the loader. Point a different drafter at
+  this and you must re-derive gamma from *its* `block_size` — the clap default
+  is wrong for any drafter and silently degrades acceptance rather than failing.
+
+  **This drafter is not currently published.** It is a 4 GB local artifact, so
+  the exact 63.9 figure is not reproducible from a clean checkout by an outside
+  party without it; ask and we will publish it. The public
+  [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+  drafter runs in this configuration and is the honest substitute, but it is a
+  different drafter and acceptance — hence tok/s — will differ. Everything else
+  in this harness is exact.
 
 ## Run
 
