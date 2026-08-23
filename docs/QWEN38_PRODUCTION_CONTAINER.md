@@ -48,22 +48,36 @@ file, so nothing about the lineage is lost.
 
 ### Why the binary is pinned, not built
 
-Building from source in the image would be better, and it is not possible today.
+The tree is now committed, so a from-source build has become *meaningful*. It
+has not yet become *justified*, and the binary stays pinned until it is.
 
-The binary that produced the reference number was built from an **uncommitted
-working tree**: 261 modified tracked files and 135 untracked paths on top of
-`e8b00332`, totalling roughly 22,000 inserted lines. No commit reproduces it. An
-in-image `cargo build` at any recorded revision would therefore ship a
-*different engine* under the recorded performance claim — the one failure mode
-this image exists to prevent.
+The binary that produced the reference number was built at 19:20 from a working
+tree that was uncommitted at the time. That tree has since been committed as
+`bedfb478` on `qwen38/gb10-perf-and-packaging` (verified: the commit exists, it
+is `HEAD`, and the working tree is clean). What has **not** been established is
+that this binary is what `bedfb478` produces. Nothing links them but sequence —
+the build predates the commit, and no one has rebuilt and compared.
 
-Two lesser reasons compound it. The repo's own
-`docker/gb10/*/Dockerfile` build stages `COPY vendor/`, and there is no
-`vendor/` directory in this tree, so those Dockerfiles do not build as written.
-And `target/release/spark` is rebuilt continuously with *different kernel
-targets*: at the time of writing it was `03a1dbb9…`, a different binary from the
-pinned `1ce470d6…`. Pinning by path would have shipped whichever build happened
-to be on disk.
+Two signals that look like evidence against correspondence are not, and are
+recorded here so they do not get re-litigated:
+
+- 909 files under `crates/` and `kernels/` carry mtimes later than the binary.
+  That is a bulk touch, not editing: `crates/atlas-embed/src/token.rs` is among
+  them and its last content-changing commit is the original open-source release,
+  with a clean `git status` proving the working copy still matches it.
+- A `git diff e8b00332 bedfb478` does not hash to the working-tree diff recorded
+  before the commit. Expected: the commit range renders the previously-untracked
+  files as new-file diffs, and `git diff HEAD` never showed them at all.
+
+So correspondence is **unproven in both directions**, and only one thing settles
+it: rebuild in-image, extract the binary, run the MinHeap probe at 400 tokens ×5,
+and require the median within drift of 63.96 / 63.77. If it lands low, that is a
+finding about the committed tree, not a reason to relax the gate.
+
+Meanwhile `target/release/spark` is rebuilt continuously with *different kernel
+targets* — at one point during this work it was `03a1dbb9…`, a different binary
+from the pinned `1ce470d6…`. Pinning by path would have shipped whichever build
+happened to be on disk.
 
 So the pin is by **content hash**, enforced three times: `build-local.sh`
 refuses to stage a mismatched binary, the Dockerfile fails the build on it, and
@@ -71,11 +85,14 @@ refuses to stage a mismatched binary, the Dockerfile fails the build on it, and
 string `qwen3.8-27b` is present in the binary, because kernels are compiled per
 target and a binary built for the wrong one fails late and confusingly.
 
-To restore a from-source build: commit the working tree, rebuild with
-`ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 cargo build --release
--p spark-server`, confirm the result still measures at the floor, then replace
-the pinned hash with the new one and add the build stage. Do not add the build
-stage before re-measuring.
+What a build stage now needs: `FROM nvidia/cuda:13.0.0-devel-ubuntu24.04`, copy
+`Cargo.toml Cargo.lock rust-toolchain.toml crates/ kernels/ jinja-templates/`,
+`ENV RUSTUP_TOOLCHAIN=stable` (the `rust-toolchain.toml` pin is 1.85 and a
+transitive dep needs ≥1.88), the three `ATLAS_TARGET_*` variables, then
+`cargo build --release -p spark-server`. It does **not** need `COPY vendor/` —
+that line was stale in all nine `docker/gb10/*` Dockerfiles and has been removed;
+the vendored C++ xgrammar tree was deliberately deleted when the grammar stack
+went pure-Rust.
 
 ---
 
@@ -227,6 +244,7 @@ statement elsewhere on this page is not backed here, treat it as untested.
 | Container resolves `libcuda.so.1` from the host driver | **verified** | `--gpus all` + `ldd`: `libcuda.so.1 => /usr/lib/aarch64-linux-gnu/libcuda.so.1`; in-container `nvidia-smi` reports `NVIDIA GB10, driver 580.126.09` |
 | **`make repro` reaches the 60 tok/s floor** | **NOT VERIFIED** | never executed — see below |
 | **Weight cache survives a container restart and makes the second start fast** | **NOT VERIFIED** | never executed — see below |
+| Pinned binary is what `bedfb478` builds | **NOT VERIFIED** | build predates the commit; only a rebuild + re-measure settles it |
 
 The two unverified rows both need exclusive use of the GPU, and the box has
 been continuously occupied by a long-running corpus generation since this image
