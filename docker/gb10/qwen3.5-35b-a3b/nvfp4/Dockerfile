@@ -23,7 +23,9 @@ WORKDIR /build
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
-COPY vendor/ vendor/
+# No `COPY vendor/`: the vendored C++ xgrammar-rs tree was deliberately deleted
+# when the grammar stack went pure-Rust (see Cargo.toml, `[patch.crates-io]`
+# note). The directory does not exist, so the line broke every build here.
 COPY kernels/ kernels/
 
 ENV ATLAS_TARGET_HW=gb10
