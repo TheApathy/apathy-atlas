@@ -302,35 +302,32 @@ statement elsewhere on this page is not backed here, treat it as untested.
 | `GPU_MEM_UTIL` guard refuses a raise without the override | **verified** | `0.68` → exit 1; with `ATLAS_ALLOW_GPU_MEM_UTIL_RAISE=1` → warns and proceeds |
 | Constructed serve argv matches the measured 63.96 tok/s launch | **verified** | argv and the 62-var `ATLAS_*` set diffed against the recorded run |
 | Container resolves `libcuda.so.1` from the host driver | **verified** | `--gpus all` + `ldd`: `libcuda.so.1 => /usr/lib/aarch64-linux-gnu/libcuda.so.1`; in-container `nvidia-smi` reports `NVIDIA GB10, driver 580.126.09` |
-| **`make repro` reaches the 60 tok/s floor** | **NOT VERIFIED** | never executed — see below |
-| **Weight cache survives a container restart and makes the second start fast** | **NOT VERIFIED** | never executed — see below |
+| Container-served instance clears the 60 tok/s floor | **verified** | from-source image, repo's own `serve.sh` + probe: median **64.05** (64.08/64.04/64.13/64.05/63.83), deterministic, 5/5 completion sha `f3b4b2cedd78…` |
+| Weight cache survives a container restart on a named volume | **verified** | `docker restart`, same volume: `weight cache HIT: 352 slots, 12.74 GiB`, then `352 hits, 0 misses` |
 | Pinned binary is what `bedfb478` builds | **DISPROVEN** | built `bedfb478`: 39,138,920 bytes vs the pin's 39,068,536, a 70,384-byte gap against a 0-byte timestamp noise floor |
 | Build is byte-reproducible | **DISPROVEN** | same commit, clean `target/` → different hash; differs only in an embedded `__DATE__`/`__TIME__` pair |
 | Build is stable when `target/` is shared | **verified** | two operators, 33 min apart, same `target/` → identical sha256 `8568f485…` |
 | A clean build needs `nvcc` on `PATH` | **verified** | clean-`target/` build panicked in `cudarc` 0.19.2 `build.rs:115` on a bare `nvcc --version`; passed once `/usr/local/cuda/bin` was on `PATH` |
 
-The two remaining unverified rows both need exclusive use of the GPU, and the
-box has been continuously occupied by a long-running corpus generation since this
-image was built. Launching a second 22 GB model server alongside it on unified memory
-is the exact condition that previously caused a global OOM and a hard host
-reboot, so neither was attempted.
+Both of those were settled on 2026-08-23, in the first window where the GPU was
+genuinely free. Two details are worth keeping rather than collapsing into "it
+passed":
 
-Specifically:
+- **The from-source image holds the number.** 64.05 median sits inside the band
+  of every other measurement of this configuration — 63.91 warm host, 64.18
+  clean-room host, 63.96 / 63.77 recorded original. More convincing than the
+  rate: the completion hash `f3b4b2cedd78…` is the one the champion
+  configuration has produced since the prefill-exactness refreeze. Same tokens,
+  not merely the same speed.
+- **The weight cache survives a restart, and it does not make the container
+  start fast.** The weight-load *phase* drops 30.9 s → 16.0 s on a cache hit,
+  matching [`weight-cache.md`](weight-cache.md). But end-to-end time-to-health
+  moved only 60 s → 58 s, because CUDA graph capture now dominates startup.
+  Reading "restarts drop to ~17 s" as "the container is ready in 17 s" is wrong
+  by a factor of three. Mount the cache; do not expect a fast-start button.
 
-- The 63.96 / 63.77 and 62.86 / 62.92 reference numbers in section 4 **are**
-  measured — they come from the recorded probe runs. What has not been shown is
-  that *this image* reproduces them. The floor assertion logic itself was tested
-  offline against those recorded probe outputs (63.96 passes a 60 floor; 62.86
-  correctly fails a 65 floor), so the arithmetic and the pass/fail wiring are
-  sound; the end-to-end path through server startup and health-wait is not.
-- The "~17 s warm versus minutes cold" figures come from
-  [`weight-cache.md`](weight-cache.md), where they were measured **directly on
-  the host**. Whether that survives a container restart on a named Docker volume
-  is an extrapolation, not a measurement.
-
-Both are one GPU-free window away from being settled — and since the digest no
-longer carries lineage (see section 1), the first of them is now the **primary**
-gate on this image rather than a secondary check.
+Since the digest no longer carries lineage (section 1), the floor probe is the
+**primary** gate on this image rather than a secondary check.
 
 ---
 
