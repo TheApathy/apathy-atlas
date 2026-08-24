@@ -10,6 +10,16 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+/// Convert Atlas's DFlash verify width (gamma) to proposal-token count.
+///
+/// A speculative verify contains the proposal rows plus one target bonus row,
+/// so a checkpoint with `block_size = 5` draft tokens must be served with
+/// `--dflash-gamma 6`. Keep this conversion shared by model construction and
+/// the scheduler so their scratch geometry cannot drift apart.
+pub(crate) const fn dflash_num_drafts(gamma: usize) -> usize {
+    if gamma > 1 { gamma - 1 } else { 1 }
+}
+
 pub(crate) fn merge_sidecar_quant_config(model_dir: &Path, config: &mut ModelConfig) {
     if config.quantization_config.is_some() {
         return;
@@ -100,5 +110,22 @@ pub(crate) fn apply_model_default_num_drafts(
             );
             args.num_drafts = model_default;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dflash_num_drafts;
+
+    #[test]
+    fn dflash_gamma_is_verify_width_not_draft_count() {
+        assert_eq!(dflash_num_drafts(6), 5);
+        assert_eq!(dflash_num_drafts(16), 15);
+    }
+
+    #[test]
+    fn dflash_gamma_never_requests_zero_drafts() {
+        assert_eq!(dflash_num_drafts(0), 1);
+        assert_eq!(dflash_num_drafts(1), 1);
     }
 }

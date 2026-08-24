@@ -27,8 +27,16 @@ CUDA_HOME=/usr/local/cuda \
 CUDARC_CUDA_VERSION=13000 \
 cargo build --release -p spark-server
 
-GAMMA=5 scripts/exl3-serve.sh k2
+DSPARK_TOKENS=5 scripts/exl3-serve.sh k2
 ```
+
+`DSPARK_TOKENS` counts proposal tokens. Atlas's lower-level
+`--dflash-gamma` counts verify rows, including the target bonus row, so this
+launch maps the checkpoint's five-token block to `--dflash-gamma 6`.
+
+The speculative launcher also enables the byte-exact fused V4 decode and
+compile-time verify GEMV tiers, plus adaptive/low-gear fallback. Callers can
+override any default by passing a later `ENV=VALUE` argument.
 
 Plain serving exposes the checkpoint-native 1M YaRN ceiling with paged-KV
 overcommit. The resident pool is smaller and must be reported from the boot

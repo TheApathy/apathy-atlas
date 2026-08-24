@@ -611,19 +611,20 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
     let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
     let use_ngram_spec = args.ngram_speculative;
-    // For DFlash, force `num_drafts = γ - 1` so the scheduler asks the
-    // proposer for γ tokens (DraftProposer::propose semantics: "up to
-    // num_drafts" → drafts.len() = γ → routes to step_verify_dflash).
+    // Atlas's DFlash gamma is the VERIFY width: proposal rows plus one target
+    // bonus row. A checkpoint with five trained draft rows therefore uses
+    // gamma=6 and asks the proposer for five tokens.
     let num_drafts = if args.dflash {
-        args.dflash_gamma.saturating_sub(1).max(1)
+        serve_phases::dflash_num_drafts(args.dflash_gamma)
     } else {
         args.num_drafts
     };
 
     if args.dflash {
         tracing::info!(
-            "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
+            "DFlash speculative decoding: ENABLED (γ={} verify rows, {} drafts, window={}, drafter installed)",
             args.dflash_gamma,
+            num_drafts,
             if args.dflash_window_size == 0 {
                 "full".to_string()
             } else {

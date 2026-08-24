@@ -20,16 +20,19 @@ tokens per second; they are not synthetic kernel throughput.
 | Profile | Code | Repetition | Quotation | Prose |
 | --- | ---: | ---: | ---: | ---: |
 | Plain K2, BF16 attention | 22.98 | 22.97 | 22.94 | 22.90 |
-| DSpark launcher, warm | 26.91 | 28.40 | 24.73 | 25.87 |
+| DSpark launcher, warm, legacy gamma 5 (four drafts) | 26.91 | 28.40 | 24.73 | 25.87 |
 
 The warm DSpark configuration is a speed profile, not a byte-identical K2
 quality baseline: it enables Atlas's lossy NVFP4 attention-residency path.
 Code, quotation, and prose output hashes differed from the plain profile;
 repetition matched. Quality must be evaluated before promoting that profile.
 
-The embedded five-token DSpark proposer loads and runs, but it is not the
-source of the higher warm result. The online scheduler measured the MTP arm at
-14.6 tok/s versus 24.8 tok/s for serial decode and switched back to serial.
+The embedded five-token DSpark proposer loads and runs, but this measurement
+used the legacy raw `GAMMA=5` launcher spelling, which asks Atlas for four
+drafts because gamma counts the target bonus row. It is retained as historical
+evidence, not as the checkpoint-native five-draft result. The online scheduler
+measured that four-draft MTP arm at 14.6 tok/s versus 24.8 tok/s for serial
+decode and switched back to serial.
 The current result therefore proves the DFlash integration works, while also
 showing that speculation does not yet move the performance frontier.
 

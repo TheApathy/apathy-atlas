@@ -18,8 +18,8 @@ pub(super) use build::{
     validate_head_high_speed_swap,
 };
 pub(super) use config::{
-    apply_model_default_num_drafts, cap_vocab_size_to_tokenizer, load_model_config,
-    merge_sidecar_quant_config, resolve_model_dir,
+    apply_model_default_num_drafts, cap_vocab_size_to_tokenizer, dflash_num_drafts,
+    load_model_config, merge_sidecar_quant_config, resolve_model_dir,
 };
 pub(super) use kv_cache::{
     KvCacheConfig, PrefillBudget, resolve_kv_cache_config, resolve_prefill_budget,

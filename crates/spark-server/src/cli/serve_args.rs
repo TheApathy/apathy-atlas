@@ -163,10 +163,10 @@ pub struct ServeArgs {
     #[arg(long)]
     pub draft_model: Option<String>,
 
-    /// DFlash block size γ (parallel draft tokens per step). Defaults to
-    /// the drafter's `block_size` from `config.json` (16 for the published
-    /// Qwen3.6-DFlash drafters); override only for ablation. Higher γ
-    /// increases per-step verify cost but raises peak speedup.
+    /// DFlash verify width γ: parallel draft tokens plus one target bonus
+    /// row. A drafter trained with `block_size=5` draft tokens uses γ=6;
+    /// a 15-draft checkpoint uses γ=16. Higher γ increases per-step
+    /// verify cost but raises peak speedup.
     #[arg(long, default_value_t = 16)]
     pub dflash_gamma: usize,
 
