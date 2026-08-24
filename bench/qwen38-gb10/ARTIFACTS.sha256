@@ -1,0 +1,26 @@
+# Published artifacts for the GB10 Qwen3.8-27B decode result.
+# Verify what you pulled matches what was measured.
+#
+#   drafter:
+#     hf download onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2 \
+#       --revision 64f3e67ce7531279636964a253763482765789fa --local-dir ./d
+#     sha256sum ./d/model.safetensors
+#
+#   image (digest is the identity; the tag moves):
+#     docker buildx imagetools inspect ghcr.io/theapathy/apathy-atlas:gb10
+#
+# NOTE ON REPRODUCIBILITY: this workspace is cache-stable, not byte-reproducible
+# — a C dependency embeds __DATE__/__TIME__, so the same source builds to a
+# different digest each time. The image digest identifies a BUILD, not a source
+# revision. Verify the engine by measurement (the probe + floor), not by digest.
+
+# drafter — onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2
+# revision 64f3e67ce7531279636964a253763482765789fa
+9d0f620c02dd1d2660644144396a9c3b88042cc5d67baf221718f262c97f4ba2  model.safetensors
+
+# target — unsloth/Qwen3.8-27B-NVFP4
+# revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108
+
+# container — ghcr.io/theapathy/apathy-atlas:gb10
+# digest sha256:e44dd932c439dfb0ad967580148243b217f0849d75c36bac691af09469ae20fc
+# carries SLSA provenance (mode=max) + SBOM
