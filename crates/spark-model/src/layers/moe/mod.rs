@@ -621,7 +621,7 @@ pub struct MoeLayer {
     // path. Used to test whether the kernel choice is the dominant cause
     // of low DFlash drafter acceptance on FP4/FP8 targets.
     pub is_dflash_capture_layer: bool,
-    /// EXL3 trellis (3.0 bpw) routed experts — `Some` only when the loader
+    /// EXL3 trellis (K2/K3, 2.0/3.0 bpw) routed experts — `Some` only when the loader
     /// found `…ffn.experts.{E}.{w}.rank0.trellis` tensors (the reference tp1
     /// checkpoint, `quant_method: "exl3"`). Set post-construction by
     /// `set_exl3_experts`, which also flips `experts_scale_kind` to

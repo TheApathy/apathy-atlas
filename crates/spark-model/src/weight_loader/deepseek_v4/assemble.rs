@@ -8,15 +8,15 @@ use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
 use crate::layer::TransformerLayer;
-use crate::layers::qwen3_attention::{
-    CompressorWeights, HcHeadWeights, HcSiteWeights, HcWeights, MlaWeights, Qwen3AttentionLayer,
-    MAX_VERIFY_ROWS,
-};
 use crate::layers::FfnComponent;
 use crate::layers::MoeLayer;
+use crate::layers::qwen3_attention::{
+    CompressorWeights, HcHeadWeights, HcSiteWeights, HcWeights, MAX_VERIFY_ROWS, MlaWeights,
+    Qwen3AttentionLayer,
+};
 use crate::weight_map::{
-    dense, dense_auto, quantized, quantized_v2, AttentionWeights, DenseWeight, ExpertWeight,
-    MoeWeights, QuantizedWeight,
+    AttentionWeights, DenseWeight, ExpertWeight, MoeWeights, QuantizedWeight, dense, dense_auto,
+    quantized, quantized_v2,
 };
 
 /// Load one MoE expert projection, dispatching by the on-disk format so the V4
@@ -794,12 +794,14 @@ pub(super) fn assemble_moe_subset(
             .with_context(|| format!("{p}: EXL3 expert tables"))?;
         tracing::info!(
             "{p}: EXL3 trellis routed experts — {} experts, gate/up [{}x{}], down [{}x{}] \
-             (3.0 bpw, decode M=1 arm; prefill P1 pending)",
+             (K{}, {}.0 bpw, decode M=1 arm; prefill P1 pending)",
             exl3_experts.len(),
             exl3_experts[0].gate_proj.n,
             exl3_experts[0].gate_proj.k,
             exl3_experts[0].down_proj.n,
             exl3_experts[0].down_proj.k,
+            exl3_experts[0].gate_proj.bits,
+            exl3_experts[0].gate_proj.bits,
         );
     }
     // Tag the SHARED expert format independently (RIDER A1): the native ckpt is

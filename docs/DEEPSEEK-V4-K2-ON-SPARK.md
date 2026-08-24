@@ -30,6 +30,18 @@ cargo build --release -p spark-server
 GAMMA=5 scripts/exl3-serve.sh k2
 ```
 
+Plain serving exposes the checkpoint-native 1M YaRN ceiling with paged-KV
+overcommit. The resident pool is smaller and must be reported from the boot
+log. Speculative serving currently defaults to 131072 because DSpark's target
+capture is an absolute-position BF16 buffer (`3 * max_seq_len * hidden`); at
+1M that buffer alone is 24.576 GB. A windowed capture ring is required before
+claiming speculative 1M.
+
+The speculative launcher enables the existing NVFP4 attention residency
+profile to fit the target, embedded drafter, and useful KV together. That
+transcode is lossy and its output must be quality-gated separately from the
+plain EXL3 baseline.
+
 The loader accepts both the original Atlas `w1/w2/w3.rank0.*` tensor names
 and standard HF `gate_proj/up_proj/down_proj.*` names. Trellis tile width
 selects K2 (`32` I16 words) or K3 (`48` I16 words). The current fused runtime

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! EXL3 trellis (3.0 bpw) routed-expert PREFILL (M>1) — plan §3 "P1".
+//! EXL3 trellis (K2/K3, 2.0/3.0 bpw) routed-expert PREFILL (M>1) — plan §3 "P1".
 //!
 //! The trellis tiles are not per-(k,n) addressable, so the grouped
 //! tensor-core GEMMs cannot read them directly. Bring-up path (option (a)
@@ -40,7 +40,7 @@
 //! the fix. NOT graph-capture-legal (host-driven chunk loop + D2H of
 //! `expert_offsets`) — prefill never captures.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::exl3_decode::Exl3ProjTable;

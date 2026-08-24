@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! EXL3 trellis (3.0 bpw) routed-expert DECODE dispatch (M=1).
+//! EXL3 trellis (K2/K3, 2.0/3.0 bpw) routed-expert DECODE dispatch (M=1).
 //!
 //! Reference tp1 checkpoint (`quant_method: "exl3"`, 216 routed experts/layer).
 //! The routed FFN is THREE launches — fused gate+up over all slots, one flat
@@ -40,7 +40,7 @@
 //! `forward_prefill_exl3.rs`; every legacy NVFP4/E8M0 decode site fails loudly
 //! via the `Exl3Trellis` format tag.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::*;

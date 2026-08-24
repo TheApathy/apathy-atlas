@@ -155,6 +155,7 @@ pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
     gpu: &dyn spark_runtime::gpu::GpuBackend,
+    target_store: &spark_runtime::weights::WeightStore,
 ) -> Result<Option<DrafterState>> {
     use spark_runtime::weights::WeightLoader;
     if !args.dflash {
@@ -176,11 +177,7 @@ pub(crate) fn load_dflash_drafter(
         .as_deref()
         .map(std::path::Path::new)
         .and_then(|p| p.canonicalize().ok())
-        .zip(
-            std::path::Path::new(&drafter_id)
-                .canonicalize()
-                .ok(),
-        )
+        .zip(std::path::Path::new(&drafter_id).canonicalize().ok())
         .is_some_and(|(a, b)| a == b);
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
@@ -215,6 +212,30 @@ pub(crate) fn load_dflash_drafter(
     } else {
         None
     };
+
+    // A shared K2/K3 checkpoint already loaded every embedded `mtp.*`,
+    // Markov, and confidence tensor into the target store. Build a filtered
+    // pointer view instead of allocating the same ~5.5 GiB a second time.
+    // WeightStore is metadata-only, so this neither copies nor double-owns
+    // device memory.
+    if shares_target_dir && is_dspark {
+        let compact_skip = dspark_subset
+            .as_ref()
+            .map(spark_model::weight_loader::deepseek_v4::dspark::compact_draft_skip_fn);
+        let drafter_store = target_store.filtered_view(|name| {
+            is_drafter_tensor(name) && !compact_skip.as_ref().is_some_and(|skip| skip(name))
+        });
+        tracing::info!(
+            "DFlash drafter store: reusing {} target-store tensors ({} bytes, zero-copy){}",
+            drafter_store.len(),
+            drafter_store.total_bytes(),
+            match dspark_subset {
+                Some(ref s) => format!(" (compact draft: {} routed experts)", s.len()),
+                None => String::new(),
+            }
+        );
+        return Ok(Some((drafter_store, drafter_config, dspark_subset)));
+    }
 
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     // Honour the SAME multiplier the target used, instead of falling to the

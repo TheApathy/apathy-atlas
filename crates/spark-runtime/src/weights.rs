@@ -131,6 +131,7 @@ pub(crate) fn f16_to_bf16_bytes(src: &[u8]) -> Vec<u8> {
 }
 
 /// A weight tensor on the GPU.
+#[derive(Clone)]
 pub struct WeightTensor {
     pub ptr: DevicePtr,
     pub shape: Vec<usize>,
@@ -165,6 +166,24 @@ impl WeightStore {
     /// `spark-storage`, which lives in a different crate and so needs this pub).
     pub fn from_map(weights: HashMap<String, WeightTensor>) -> Self {
         Self { weights }
+    }
+
+    /// Create a metadata-only view of tensors selected from this store.
+    ///
+    /// `WeightStore` does not own device allocations; it only maps names to
+    /// device pointers. The returned store therefore aliases the same GPU
+    /// bytes and is valid for as long as the backend allocation arena remains
+    /// alive. This is useful for an embedded drafter whose tensors already
+    /// arrived with the target checkpoint.
+    pub fn filtered_view(&self, keep: impl Fn(&str) -> bool) -> Self {
+        Self {
+            weights: self
+                .weights
+                .iter()
+                .filter(|(name, _)| keep(name))
+                .map(|(name, tensor)| (name.clone(), tensor.clone()))
+                .collect(),
+        }
     }
 
     /// Get a weight tensor by name. Fails fast if not found.
@@ -333,7 +352,9 @@ pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 
 #[cfg(test)]
 mod from_str_tests {
-    use super::WeightDtype;
+    use super::{WeightDtype, WeightStore, WeightTensor};
+    use crate::gpu::DevicePtr;
+    use std::collections::HashMap;
 
     #[test]
     fn from_safetensors_str_matches_disk_mapping() {
@@ -349,6 +370,9 @@ mod from_str_tests {
             ("F8_E4M3", FP8E4M3),
             ("F8_E8M0", FP8E8M0),
             ("I64", Int64),
+            ("I16", Int16), // EXL3 trellis payload
+            ("I32", Int32), // EXL3 codebook selector
+            ("F16", F16),   // EXL3 sign vectors remain native half
         ] {
             assert_eq!(
                 WeightDtype::from_safetensors_str(s).unwrap(),
@@ -356,10 +380,39 @@ mod from_str_tests {
                 "dtype {s}"
             );
         }
-        // F16 is converted to BF16 at disk-load; a store (and therefore a
-        // peer manifest) can never contain it, so the wire mapping rejects it.
-        assert!(WeightDtype::from_safetensors_str("F16").is_err());
         assert!(WeightDtype::from_safetensors_str("bogus").is_err());
+    }
+
+    #[test]
+    fn filtered_view_aliases_only_selected_tensors() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.mtp.weight".to_owned(),
+            WeightTensor {
+                ptr: DevicePtr(0x1234),
+                shape: vec![2, 4],
+                dtype: WeightDtype::BF16,
+            },
+        );
+        weights.insert(
+            "model.layers.0.self_attn.weight".to_owned(),
+            WeightTensor {
+                ptr: DevicePtr(0x5678),
+                shape: vec![4, 4],
+                dtype: WeightDtype::BF16,
+            },
+        );
+
+        let store = WeightStore::from_map(weights);
+        let view = store.filtered_view(|name| name.contains(".mtp."));
+
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.total_bytes(), 16);
+        assert_eq!(
+            view.get("model.layers.0.mtp.weight").unwrap().ptr,
+            DevicePtr(0x1234)
+        );
+        assert!(!view.contains("model.layers.0.self_attn.weight"));
     }
 
     #[test]

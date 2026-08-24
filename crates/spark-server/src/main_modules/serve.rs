@@ -349,7 +349,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             .context("kv-cache kernel preflight failed")?;
         }
     }
-    let dflash_drafter_state = serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref())?;
+    let dflash_drafter_state =
+        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), &store)?;
     // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
     // `lora_states` must outlive build_model (lora_args borrows &l.store) and
     // stays alive until after AppState construction (adapter name clones).
