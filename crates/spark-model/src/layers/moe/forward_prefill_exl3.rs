@@ -40,7 +40,7 @@
 //! the fix. NOT graph-capture-legal (host-driven chunk loop + D2H of
 //! `expert_offsets`) — prefill never captures.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::exl3_decode::Exl3ProjTable;

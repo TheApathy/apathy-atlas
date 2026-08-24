@@ -47,7 +47,7 @@
 //!
 //! Trellis bytes counted for GB/s: N*K*3/8 + (N+K)*2 (payload + suh/svh).
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use half::bf16;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -91,7 +91,11 @@ impl Rng {
     }
     fn sign_f16(&mut self) -> u16 {
         // +1.0 / -1.0 in fp16 — the EXL3 suh/svh are random sign vectors.
-        if self.next() & 1 == 0 { 0x3C00 } else { 0xBC00 }
+        if self.next() & 1 == 0 {
+            0x3C00
+        } else {
+            0xBC00
+        }
     }
 }
 

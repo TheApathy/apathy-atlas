@@ -40,7 +40,7 @@
 //! `forward_prefill_exl3.rs`; every legacy NVFP4/E8M0 decode site fails loudly
 //! via the `Exl3Trellis` format tag.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::*;
