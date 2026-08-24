@@ -19,6 +19,7 @@ EPOCHS="${EPOCHS:-2}"
 MAX_LENGTH="${MAX_LENGTH:-8192}"
 ACCUM="${ACCUMULATION_STEPS:-4}"
 STOP_FLOOR="${VAST_STOP_FLOOR:-4.00}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 need_file() { [[ -s "$1" ]] || die "missing required file: $1"; }
@@ -29,6 +30,7 @@ need_file "$CORPUS"
 need_file "$TARGET/config.json"
 need_file "$TARGET/tokenizer.json"
 need_file "$TARGET/model.safetensors.index.json"
+need_file "$SCRIPT_DIR/validate-deepseek-dflash2-offline.py"
 [[ -d "$HIDDEN" ]] || die "offline hidden directory is absent: $HIDDEN"
 
 python3 - "$CONFIG" "$TARGET" "$HIDDEN" <<'PY'
@@ -62,6 +64,13 @@ if len(hidden) < 128:
     )
 print(f"preflight OK: {len(hidden)} hidden rows")
 PY
+
+python3 "$SCRIPT_DIR/validate-deepseek-dflash2-offline.py" \
+  --specforge-dir "$SF" --draft-config "$CONFIG" \
+  --target-components "$TARGET" --corpus "$CORPUS" \
+  --hidden-dir "$HIDDEN" --cache-dir "$CACHE" \
+  --max-length "$MAX_LENGTH" --min-rows 128 \
+  --chat-template deepseek --is-preformatted
 
 # The patched training driver must auto-detect Atlas's embed.weight/head.weight
 # keys. Refuse an unpatched Qwen-only driver before allocating the GPU.

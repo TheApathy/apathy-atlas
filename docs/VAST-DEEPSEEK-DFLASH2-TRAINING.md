@@ -53,7 +53,20 @@ scripts/export-deepseek-dflash2-components.py \
 The output is about 2 GiB rather than the full serving checkpoint. The Vast
 launcher is `scripts/train-deepseek-dflash2-vast.sh`; it refuses to allocate
 the H200 unless the component shapes, five-capture config, corpus, and at least
-128 keyed hidden rows are present.
+128 keyed hidden rows are present. Its CPU preflight rebuilds SpecForge's exact
+processed dataset and checks every keyed filename, BF16 dtype, and
+`[padded_tokens, 20480]` tensor shape. A raw count of `.pt` files is not enough.
+
+The same gate can be run before uploading anything:
+
+```bash
+SPECFORGE_PAD_TO=8192 scripts/validate-deepseek-dflash2-offline.py \
+  --specforge-dir /home/flocka/engines/SpecForge \
+  --draft-config bench/deepseek-v4/deepseek-v4-dflash2.json \
+  --target-components /home/flocka/models/DeepSeek-V4-DFlash2-target-components \
+  --corpus /path/to/deepseek-corpus.jsonl --hidden-dir /path/to/hidden \
+  --cache-dir /path/to/cache --is-preformatted
+```
 
 The existing small `dspark_dump.bin` is diagnostic evidence, not a training
 corpus. DSpark's three HC-mean captures are also not interchangeable with an

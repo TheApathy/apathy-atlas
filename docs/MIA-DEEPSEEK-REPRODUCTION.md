@@ -28,6 +28,12 @@ bash scripts/mia-deepseek-serve.sh --allow-gpu
 docker logs -f atlas-mia-deepseek-k2
 ```
 
+The full Docker command can be audited without querying or allocating the GPU:
+
+```bash
+bash scripts/mia-deepseek-serve.sh --dry-run
+```
+
 The launcher refuses to remove an existing container and refuses a busy GPU.
 It defaults to one million maximum tokens, NVFP4 DS-MLA KV, five probabilistic
 DSpark proposals, six maximum sequences, and thinking off.
@@ -53,3 +59,6 @@ incorrect repeated-token case are not substitutes for single-stream decode.
 5. Add probabilistic rejection only with an explicit quality comparison.
 6. Train DeepSeek-native DFlash2 after runtime costs are competitive; draft
    quality is not the current primary bottleneck.
+
+The source-level correspondence and implementation boundary are recorded in
+`docs/MIA-ATLAS-PORT-MAP.md`.

@@ -2,8 +2,17 @@
 # Launch the pinned local Mia runtime. This script never stops another GPU job.
 set -euo pipefail
 
-if [[ "${1:-}" != "--allow-gpu" ]]; then
-  echo "usage: $0 --allow-gpu" >&2
+ALLOW_GPU=0
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-gpu) ALLOW_GPU=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
+if [[ "$ALLOW_GPU" != 1 && "$DRY_RUN" != 1 ]]; then
+  echo "usage: $0 --allow-gpu | --dry-run" >&2
   echo "Refusing to allocate the GPU without the explicit flag." >&2
   exit 2
 fi
@@ -21,12 +30,12 @@ shards=$(find "$MODEL" -maxdepth 1 -type f -name '*.safetensors' | wc -l)
 }
 docker image inspect "$IMAGE" >/dev/null
 
-if docker container inspect "$NAME" >/dev/null 2>&1; then
+if [[ "$DRY_RUN" != 1 ]] && docker container inspect "$NAME" >/dev/null 2>&1; then
   echo "container $NAME already exists; remove it explicitly before relaunch" >&2
   exit 1
 fi
 
-if command -v nvidia-smi >/dev/null 2>&1; then
+if [[ "$DRY_RUN" != 1 ]] && command -v nvidia-smi >/dev/null 2>&1; then
   busy=$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true)
   if [[ -n "$busy" && "${MIA_ALLOW_BUSY_GPU:-0}" != 1 ]]; then
     echo "GPU is already in use; Mia was not started:" >&2
@@ -60,6 +69,13 @@ args=(
   -e VLLM_USE_B12X_MOE=1
 )
 [[ -e /dev/infiniband ]] && args+=(--device /dev/infiniband:/dev/infiniband)
+
+if [[ "$DRY_RUN" == 1 ]]; then
+  printf 'docker run -d --name %q ' "$NAME"
+  printf '%q ' "${args[@]}" "$IMAGE"
+  printf '\n'
+  exit 0
+fi
 
 docker run -d --name "$NAME" "${args[@]}" "$IMAGE"
 echo "Mia started as $NAME on port 8888. First compile can take 15-30 minutes."
