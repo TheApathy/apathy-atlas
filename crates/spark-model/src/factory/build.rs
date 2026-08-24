@@ -694,12 +694,12 @@ pub fn build_model(
                 max_seq_len,
                 model.gpu_backend(),
             )?;
-            let (cap_buf, cap_rows) = model.dspark_capture_buf();
+            let (cap_buf, cap_rows, cap_ring) = model.dspark_capture_buf();
             anyhow::ensure!(
                 !cap_buf.is_null(),
                 "DSpark drafter needs the hc-mean capture: set ATLAS_DSPARK_CAPTURE=1"
             );
-            head.set_capture(cap_buf, cap_rows);
+            head.set_capture(cap_buf, cap_rows, cap_ring)?;
             model.set_dflash_proposer(std::sync::Arc::new(head));
             tracing::info!("DSpark block drafter installed as the active proposer");
             return Ok(Box::new(model));

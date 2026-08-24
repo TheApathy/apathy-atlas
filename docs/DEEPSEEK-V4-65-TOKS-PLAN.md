@@ -11,7 +11,7 @@ DeepSeek-specific target path plus useful speculative acceptance.
 | --- | ---: |
 | Atlas plain EXL3 K2 | 22.90-22.98 tok/s |
 | Atlas warm residency profile | 24.73-28.40 tok/s |
-| Mia/vLLM K2 profile | about 65-75 tok/s, workload-dependent |
+| Mia/vLLM K2-v1 controlled short decode | 58.1 tok/s |
 
 The Atlas warm result is not a quality-neutral baseline: its lossy NVFP4
 attention-residency path changed three of four output hashes. The older Atlas
@@ -19,10 +19,21 @@ speculative measurement also used raw gamma 5, which means four proposals in
 Atlas, despite the checkpoint containing a five-token DSpark block. Commit
 `be97db83` corrects the launch contract to five proposals / six verify rows.
 
-The Mia result establishes that the model/checkpoint can cross 65 tok/s on
-Spark-class hardware. It does not establish that DFlash2 weights exist for
-DeepSeek or that Qwen DFlash2 weights can be reused. Mia serves the embedded
-DeepSeek DSpark/MTP path with its own vLLM kernel stack.
+The current public Mia evidence does not establish a general 65 tok/s result.
+K2-v1 reached 58.1 tok/s on its controlled short decode; content medians ranged
+from 23.91 tok/s for creative prose to 53.37 tok/s for code. The 80+ tok/s
+repetition row failed its correctness target, and C6 figures are aggregate
+throughput rather than the single-stream number targeted here. Mia still proves
+that B12X/Trellis small-M MoE kernels plus the native DSpark path can more than
+double Atlas's plain result. It does not establish that DFlash2 weights exist
+for DeepSeek or that Qwen DFlash2 weights can be reused.
+
+The exact upstream commit is reproducible with
+`scripts/build-mia-deepseek-runtime.sh`. The resulting image is GPU-free to
+build. `scripts/mia-deepseek-serve.sh` requires an explicit `--allow-gpu`,
+refuses a busy GPU by default, mounts the audited local K2 checkpoint, and uses
+Mia's one-Spark 1M-context settings. `bench/deepseek-v4/mia_decode_sweep.py`
+records per-content decode medians and output hashes once a GPU window exists.
 
 ## Immediate Atlas lane
 
@@ -83,6 +94,14 @@ the K2 kernel's register footprint. The arithmetic order matches the single-row
 kernel by construction; live byte-parity and timing are still required before
 promotion.
 
+The DSpark hc-mean capture is now a 256-row circular serve history rather than
+`max_seq_len` rows. The checkpoint attends to only 128 capture positions, so
+the 1M-context allocation falls from 24.6 GB to 6 MiB without changing the
+drafter's visible history. Offline `ATLAS_DSPARK_DUMP` remains linear and
+absolute-positioned. The boundary-slot workaround also expires once that
+position leaves the attention window; previously it kept zeroing a reused ring
+slot after 128 generated tokens.
+
 ## Promotion gates
 
 1. Plain baseline is reproducible across at least three warm trials.
@@ -94,6 +113,8 @@ promotion.
    adaptive fallback for the reported headline.
 6. The 65 tok/s claim names prompt length, output length, concurrency, context
    residency, quantization, and acceptance rate.
+7. The circular capture path passes long-context wrap parity on live GPU before
+   the speculative 1M profile is promoted.
 
 Upstream implementation reference:
 <https://github.com/tpurtell/ds4-mia-exl3-k2-1spark>

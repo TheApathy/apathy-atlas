@@ -25,6 +25,7 @@
 
 pub(crate) mod block_mgmt;
 pub(crate) mod drop;
+pub(crate) mod dspark_capture;
 pub(crate) mod impl_a1;
 pub(crate) mod impl_a1_init;
 pub(crate) mod impl_a2;
@@ -52,3 +53,8 @@ pub use types::TransformerModel;
 /// capture the verify path can request: γ spec depth is asserted ≤ 32 in
 /// `verify_d.rs`, and a K=γ verify captures `k ≤ γ` rows at once.
 pub(crate) const DSPARK_STAGE_ROWS: usize = 32;
+
+/// Serve-only hc-mean history. The 0731 DSpark checkpoint attends to 128
+/// positions; the extra verify-width margin lets a wrapped multi-row commit
+/// land without retaining a sequence-length-sized buffer.
+pub(crate) const DSPARK_CAPTURE_RING_ROWS: usize = 256;

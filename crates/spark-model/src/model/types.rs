@@ -195,12 +195,15 @@ pub struct TransformerModel {
     /// the in-server DSpark proposer will use; only the file write is
     /// probe-specific. None when the env var is unset.
     pub(super) dspark_dump: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
-    /// `[num_capture_layers, max_seq_len, hidden] BF16` scratch the hc_mean
-    /// kernel writes into. NULL when dumping is off.
+    /// `[num_capture_layers, dspark_dump_rows, hidden] BF16` scratch the
+    /// hc_mean kernel writes into. NULL when capture is off.
     pub(super) dspark_dump_buf: DevicePtr,
-    /// Row capacity of `dspark_dump_buf` per capture layer (== max_seq_len at
-    /// alloc). Bound for every hc_mean write; 0 when dumping is off.
+    /// Row capacity of `dspark_dump_buf` per capture layer. This is
+    /// `max_seq_len` for dumps and a fixed circular capacity for serving.
     pub(super) dspark_dump_rows: usize,
+    /// True for the bounded serve-only history; false for an offline dump's
+    /// absolute-position buffer.
+    pub(super) dspark_capture_ring: bool,
     /// Layer indices whose post-layer hc-mean is captured for DSpark
     /// (`[40, 41, 42]` for V4-Flash-0731). Empty when dumping is off.
     pub(super) dspark_capture_layers: Vec<usize>,

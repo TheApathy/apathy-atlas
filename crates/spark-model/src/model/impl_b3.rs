@@ -16,6 +16,7 @@ use super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
+use super::dspark_capture::DsparkCaptureLayout;
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
 use super::types::{PinnedMetaStaging, TransformerModel};
@@ -605,6 +606,7 @@ impl TransformerModel {
             return Ok(());
         };
         let h = self.config.hidden_size;
+        let layout = DsparkCaptureLayout::new(self.dspark_dump_rows, self.dspark_capture_ring);
         let (out, n) = if staged {
             let n = num_tokens.min(crate::model::DSPARK_STAGE_ROWS);
             (
@@ -613,18 +615,26 @@ impl TransformerModel {
                 n,
             )
         } else {
-            if start_row >= self.dspark_dump_rows {
-                return Ok(());
+            for span in layout.spans(start_row, num_tokens) {
+                let input = self
+                    .buffers
+                    .hc_streams()
+                    .offset(span.src_row * self.config.hc_mult * h * 2);
+                let out = self
+                    .dspark_dump_buf
+                    .offset((slot * self.dspark_dump_rows + span.dst_row) * h * 2);
+                crate::layers::ops::hc_mean(
+                    self.gpu.as_ref(),
+                    self.hc_mean_k,
+                    input,
+                    out,
+                    span.rows as u32,
+                    h as u32,
+                    self.config.hc_mult as u32,
+                    stream,
+                )?;
             }
-            let n = num_tokens.min(self.dspark_dump_rows - start_row);
-            // Rows live at their SEQUENCE positions, so chunked prefill,
-            // decode, and the K-row verify all accumulate one coherent
-            // [slot, pos, h] history the DSpark proposer seeds its ring from.
-            (
-                self.dspark_dump_buf
-                    .offset((slot * self.dspark_dump_rows + start_row) * h * 2),
-                n,
-            )
+            return Ok(());
         };
         crate::layers::ops::hc_mean(
             self.gpu.as_ref(),
@@ -649,21 +659,27 @@ impl TransformerModel {
         start_row: usize,
         stream: u64,
     ) -> Result<()> {
-        if self.dspark_capture_stage.is_null() || start_row >= self.dspark_dump_rows {
+        if self.dspark_capture_stage.is_null() {
             return Ok(());
         }
         let h = self.config.hidden_size;
-        let n = num_tokens
-            .min(crate::model::DSPARK_STAGE_ROWS)
-            .min(self.dspark_dump_rows - start_row);
+        let n = num_tokens.min(crate::model::DSPARK_STAGE_ROWS);
+        let layout = DsparkCaptureLayout::new(self.dspark_dump_rows, self.dspark_capture_ring);
         for slot in 0..self.dspark_capture_layers.len() {
             let src = self
                 .dspark_capture_stage
                 .offset(slot * crate::model::DSPARK_STAGE_ROWS * h * 2);
-            let dst = self
-                .dspark_dump_buf
-                .offset((slot * self.dspark_dump_rows + start_row) * h * 2);
-            self.gpu.copy_d2d_async(src, dst, n * h * 2, stream)?;
+            for span in layout.spans(start_row, n) {
+                let dst = self
+                    .dspark_dump_buf
+                    .offset((slot * self.dspark_dump_rows + span.dst_row) * h * 2);
+                self.gpu.copy_d2d_async(
+                    src.offset(span.src_row * h * 2),
+                    dst,
+                    span.rows * h * 2,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -724,8 +740,12 @@ impl TransformerModel {
     /// capacity. NULL/0 unless ATLAS_DSPARK_CAPTURE=1 (or the dump probe)
     /// armed the capture at model build. The factory hands this to
     /// `DsparkDraftHead::set_capture` when installing the block drafter.
-    pub fn dspark_capture_buf(&self) -> (DevicePtr, usize) {
-        (self.dspark_dump_buf, self.dspark_dump_rows)
+    pub fn dspark_capture_buf(&self) -> (DevicePtr, usize, bool) {
+        (
+            self.dspark_dump_buf,
+            self.dspark_dump_rows,
+            self.dspark_capture_ring,
+        )
     }
 
     /// 4b inc-3 γ-verify catch-up: advance every compressor layer's compressed

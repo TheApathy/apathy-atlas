@@ -348,20 +348,28 @@ impl TransformerModel {
         // Capture arms with EITHER the probe dump (file I/O) or the pure
         // in-memory mode the DSpark proposer needs (ATLAS_DSPARK_CAPTURE=1).
         let dspark_capture_only = std::env::var("ATLAS_DSPARK_CAPTURE").as_deref() == Ok("1");
-        let (dspark_dump, dspark_dump_buf, dspark_capture_layers, dspark_dump_rows) =
-            match std::env::var("ATLAS_DSPARK_DUMP") {
+        let (
+            dspark_dump,
+            dspark_dump_buf,
+            dspark_capture_layers,
+            dspark_dump_rows,
+            dspark_capture_ring,
+        ) = match std::env::var("ATLAS_DSPARK_DUMP") {
                 _ if dspark_capture_only => {
                     let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
                         .unwrap_or_else(|_| "40,41,42".into())
                         .split(',')
                         .filter_map(|s| s.trim().parse().ok())
                         .collect();
-                    let buf = gpu.alloc(layers.len() * max_seq_len * config.hidden_size * 2)?;
+                    let rows = crate::model::DSPARK_CAPTURE_RING_ROWS;
+                    let buf = gpu.alloc(layers.len() * rows * config.hidden_size * 2)?;
                     tracing::info!(
-                        "ATLAS_DSPARK_CAPTURE=1: hc-mean capture at layers {layers:?}                          ({} MB, no dump file)",
-                        layers.len() * max_seq_len * config.hidden_size * 2 / (1 << 20),
+                        "ATLAS_DSPARK_CAPTURE=1: hc-mean circular history at layers {layers:?} \
+                         ({} rows, {} MB, no dump file)",
+                        rows,
+                        layers.len() * rows * config.hidden_size * 2 / (1 << 20),
                     );
-                    (None, buf, layers, max_seq_len)
+                    (None, buf, layers, rows, true)
                 }
                 Ok(path) if !path.is_empty() => {
                     let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
@@ -382,10 +390,11 @@ impl TransformerModel {
                         buf,
                         layers,
                         max_seq_len,
+                        false,
                     )
                 }
-                _ => (None, DevicePtr::NULL, Vec::new(), 0),
-            };
+                _ => (None, DevicePtr::NULL, Vec::new(), 0, false),
+        };
         // Graph-safe landing pad for the hc-mean capture. The direct write into
         // `dspark_dump_buf` is indexed by `start_row = seq.seq_len`, a host value
         // that grows every step — baking it into a captured graph pins every
@@ -662,6 +671,7 @@ impl TransformerModel {
             dspark_dump,
             dspark_dump_buf,
             dspark_dump_rows,
+            dspark_capture_ring,
             dspark_capture_layers,
             dspark_capture_stage,
             hc_mean_k,

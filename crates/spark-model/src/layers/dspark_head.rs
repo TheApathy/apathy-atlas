@@ -143,6 +143,7 @@ pub struct DsparkDraftHead {
     /// (ATLAS_DSPARK_CAPTURE=1), installed by the factory after model build.
     capture_buf: DevicePtr,
     capture_rows: usize,
+    capture_ring: bool,
 }
 
 impl DsparkDraftHead {
@@ -299,6 +300,7 @@ impl DsparkDraftHead {
             top2_out: gpu.alloc(b * 16)?,
             capture_buf: DevicePtr::NULL,
             capture_rows: 0,
+            capture_ring: false,
             module,
         })
     }
@@ -1390,17 +1392,29 @@ impl crate::speculative::ProposerState for DsparkProposerState {
 impl DsparkDraftHead {
     /// Capture-buffer geometry, installed post-model-build by the factory:
     /// `[num_capture_layers, rows, h]` BF16, rows at sequence positions.
-    pub fn set_capture(&mut self, buf: DevicePtr, rows: usize) {
+    pub fn set_capture(&mut self, buf: DevicePtr, rows: usize, ring: bool) -> Result<()> {
+        anyhow::ensure!(
+            rows >= self.module.params.window,
+            "DSpark capture history has {rows} rows but the drafter window needs {}",
+            self.module.params.window
+        );
         self.capture_buf = buf;
         self.capture_rows = rows;
+        self.capture_ring = ring;
+        Ok(())
     }
 
     fn captures_at(&self, pos: usize) -> [DevicePtr; 3] {
         let h = self.h as usize;
+        let row = if self.capture_ring {
+            pos % self.capture_rows
+        } else {
+            pos
+        };
         [
-            self.capture_buf.offset(pos * h * 2),
-            self.capture_buf.offset((self.capture_rows + pos) * h * 2),
-            self.capture_buf.offset((2 * self.capture_rows + pos) * h * 2),
+            self.capture_buf.offset(row * h * 2),
+            self.capture_buf.offset((self.capture_rows + row) * h * 2),
+            self.capture_buf.offset((2 * self.capture_rows + row) * h * 2),
         ]
     }
 }
@@ -1473,7 +1487,7 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             return Ok(vec![]);
         }
         let p = position - behind;
-        if p >= self.capture_rows {
+        if !self.capture_ring && p >= self.capture_rows {
             return Ok(vec![]);
         }
         let gpu = ctx.gpu;
@@ -1497,7 +1511,12 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         let from = if full_reseed {
             (p + 1).saturating_sub(win)
         } else {
-            (st.last_seeded + 1).max(0) as usize
+            let incremental = (st.last_seeded + 1).max(0) as usize;
+            if self.capture_ring {
+                incremental.max((p + 1).saturating_sub(self.capture_rows))
+            } else {
+                incremental
+            }
         };
         // Boundary fix (task #45, byte-proven): never seed the bootstrap
         // position — its capture is poisoned and this slot must stay zero
@@ -1550,7 +1569,12 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
                     .unwrap_or(0)
             })
         };
-        let p_eff = ((p as i64 + cap_shift).max(0) as usize).min(self.capture_rows - 1);
+        let p_eff_abs = (p as i64 + cap_shift).max(0) as usize;
+        let p_eff = if self.capture_ring {
+            p_eff_abs
+        } else {
+            p_eff_abs.min(self.capture_rows - 1)
+        };
         let (drafts, confs, top2) =
             self.propose_block(gpu, ctx, self.captures_at(p_eff), last_token, p, stream)?;
         // ATLAS_DSPARK_ZERO_SLOT=<abs pos> (task #45 equivalence test): after
@@ -1573,7 +1597,13 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             // boundary, so the memset must follow it. Idempotent afterwards.
             let target = if zs >= 0 {
                 zs
-            } else if boundary_fix {
+            } else if boundary_fix
+                && crate::model::dspark_capture::position_in_window(
+                    st.boundary_pos as usize,
+                    p,
+                    win,
+                )
+            {
                 st.boundary_pos
             } else {
                 -1
@@ -1717,7 +1747,11 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         if self.capture_buf.is_null() {
             return Ok(0);
         }
-        let n = prompt_tokens.len().min(self.capture_rows);
+        let n = if self.capture_ring {
+            prompt_tokens.len()
+        } else {
+            prompt_tokens.len().min(self.capture_rows)
+        };
         // Only the last `window` positions can ever be attended; skipping the
         // rest keeps re-prefill O(window) at long prompts.
         let start = n.saturating_sub(self.module.params.window);

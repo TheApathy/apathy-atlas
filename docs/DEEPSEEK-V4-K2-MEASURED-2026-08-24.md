@@ -46,9 +46,11 @@ showing that speculation does not yet move the performance frontier.
   target load, BF16 mirror release, and zero-copy drafter reuse.
 - The embedded drafter now aliases 9,313 target-store tensors, avoiding a
   duplicate 5,455,341,084-byte allocation.
-- Speculative 1M is not claimed. DSpark capture is currently an absolute BF16
-  buffer (`3 * max_seq_len * hidden`), which is 24,576,000,000 bytes at 1M.
-  It needs a windowed capture ring before the 1M speculative profile is viable.
+- Speculative 1M was not measured in this checkpoint. This branch now replaces
+  the serve-only absolute DSpark BF16 capture with a 256-row circular history,
+  reducing it from 24,576,000,000 bytes at 1M to 6,291,456 bytes. Offline dump
+  capture remains linear. Live long-context wrap parity is still required
+  before claiming the speculative 1M profile.
 
 ## Validation
 
