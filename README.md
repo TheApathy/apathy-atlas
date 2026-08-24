@@ -46,9 +46,19 @@
 ## Serve it now
 
 **Use the repo's serve profile.** It sets the 60 tuning variables the published
-figure depends on. Serving without them runs near the no-speculation floor —
-measured on this same image: **8.8 tok/s bare vs 63.9 with the profile**, a
-7.3x difference. The flags are not optional garnish.
+figure depends on. They are not optional garnish — measured on this same image,
+same weights, same drafter:
+
+| Configuration | tok/s |
+|---|---:|
+| Full profile, speculative decoding on | **63.9** |
+| No speculation, tuned kernels | 13.9 |
+| Speculative decoding on, **no tuning flags** | **8.8** |
+
+Note the last row: speculation *without* the tuned verify path is a **net loss**
+— slower than turning the drafter off entirely. Drafting only pays when the
+verify step it feeds is fast enough to keep up, so a partial configuration is
+worse than either extreme.
 
 ```bash
 git clone -b perf/qwen38-gb10-dflash https://github.com/TheApathy/apathy-atlas.git
