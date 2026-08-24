@@ -45,39 +45,64 @@
 
 ## Serve it now
 
-**Use the repo's serve profile.** It sets the 60 tuning variables the published
-figure depends on. They are not optional garnish — measured on this same image,
-same weights, same drafter:
-
-| Configuration | tok/s |
-|---|---:|
-| Full profile, our drafter `Apathy-…-drafter-v2` (`--dflash-gamma 15`) | **63.9** |
-| Full profile, public `incoai/Qwen3.8-27B-DFlash2` (`--dflash-gamma 7`) | **43.9** |
-| No speculation, tuned kernels | 13.9 |
-| Speculative decoding on, **no tuning flags** | **8.8** |
-
-Note the last row: speculation *without* the tuned verify path is a **net loss**
-— slower than turning the drafter off entirely. Drafting only pays when the
-verify step it feeds is fast enough to keep up, so a partial configuration is
-worse than either extreme.
+Everything below is public — pull the target, the drafter, and the image, then
+serve. No account, no gated weights.
 
 ```bash
+# 1. the target (pin the revision — upstream super-squashed the repo)
+hf download unsloth/Qwen3.8-27B-NVFP4 \
+  --revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108 \
+  --local-dir ./qwen38-target
+
+# 2. the drafter — this is the entire speedup (13.9 tok/s without one)
+hf download onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2 \
+  --local-dir ./qwen38-drafter
+
+# 3. the harness (the serve profile lives here)
 git clone -b perf/qwen38-gb10-dflash https://github.com/TheApathy/apathy-atlas.git
 cd apathy-atlas
 
+# 4. serve
 docker run --rm --gpus all --ipc=host -p 8898:8898 \
-  -v /path/to/Qwen3.8-27B-NVFP4:/model:ro \
-  -v /path/to/dflash-drafter:/drafter:ro \
+  -v "$PWD/../qwen38-target:/model:ro" \
+  -v "$PWD/../qwen38-drafter:/drafter:ro" \
   -v "$PWD/bench/qwen38-gb10:/harness:ro" --entrypoint bash \
   ghcr.io/theapathy/apathy-atlas:gb10 \
   -c 'BIN=/usr/local/bin/spark MODEL_DIR=/model DRAFT=/drafter PORT=8898 \
       bash /harness/serve.sh --bind 0.0.0.0'
 ```
 
+Then, in another shell:
+
+```bash
+python3 bench/qwen38-gb10/weschera_minheap_repro.py \
+  --endpoint http://127.0.0.1:8898/v1/chat/completions \
+  --output /tmp/probe.json --repetitions 5 --max-tokens 400
+```
+
+Expect a median near **63.9 tok/s**, `deterministic: true`, and an identical
+output hash across all five repetitions.
+
+**Use the serve profile, not a bare `serve` invocation.** It sets the 60 tuning
+variables the figure depends on. Measured on this same image, same weights, same
+drafter:
+
+| Configuration | tok/s |
+|---|---:|
+| Full profile, our drafter (`--dflash-gamma 15`) | **63.9** |
+| Full profile, public `incoai/Qwen3.8-27B-DFlash2` (`--dflash-gamma 7`) | 43.9 |
+| No speculation, tuned kernels | 13.9 |
+| Speculative decoding on, **no tuning flags** | **8.8** |
+
+Note the last row: speculation *without* the tuned verify path is a **net loss**
+— slower than turning the drafter off entirely. Drafting only pays when the
+verify step it feeds keeps up, so a partial configuration is worse than either
+extreme.
+
 The image carries the engine only — no weights, no drafter, no credentials.
 `--bind 0.0.0.0` is required in a container: the server defaults to loopback,
 and a loopback bind is unreachable through `-p`. Every variable the profile sets
-is listed in [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md).
+is in [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md).
 
 ## Or build from source
 
