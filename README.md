@@ -51,7 +51,8 @@ same weights, same drafter:
 
 | Configuration | tok/s |
 |---|---:|
-| Full profile, speculative decoding on | **63.9** |
+| Full profile, our drafter (`--dflash-gamma 15`) | **63.9** |
+| Full profile, public `incoai/Qwen3.8-27B-DFlash2` (`--dflash-gamma 7`) | **43.9** |
 | No speculation, tuned kernels | 13.9 |
 | Speculative decoding on, **no tuning flags** | **8.8** |
 
@@ -154,11 +155,17 @@ the reason in [`bench/qwen38-gb10/README.md`](bench/qwen38-gb10/README.md).
 GB10 / DGX Spark (`sm_121f`). The result is bandwidth-bound at ~273 GB/s and
 does not transfer to discrete GPUs. Weights: `unsloth/Qwen3.8-27B-NVFP4` at
 revision `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` — pin it, upstream
-super-squashed the repo and older revisions 404. The drafter used for the
-headline figure is not published; the public
+super-squashed the repo and older revisions 404. **You need a drafter** — it is the entire speedup (13.9 tok/s without one).
+
+The drafter behind the 63.9 figure is not published. The public
 [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
-runs in this configuration but is a different drafter, so acceptance and
-therefore tok/s will differ.
+works and is what you should expect to reproduce: **43.9 tok/s**, measured here,
+deterministic over 5 reps. It is a different drafter family (`DFlash2DraftModel`,
+5 layers) and **caps at `--dflash-gamma 7`** — asking for 15 is refused by the
+loader with an explicit error, so pass `GAMMA=7` to the serve profile.
+
+If you want the 63.9 figure reproduced exactly, ask and we will publish the
+drafter.
 
 ---
 
