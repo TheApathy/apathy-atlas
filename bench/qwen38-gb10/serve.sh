@@ -14,6 +14,13 @@
 #   MODEL_DIR=/path/to/Qwen3.8-27B-NVFP4 \
 #   DRAFT=/path/to/dflash-drafter \
 #   ./bench/qwen38-gb10/serve.sh
+#
+# Extra arguments are forwarded to the binary, which is how you add flags this
+# profile does not set. In a container you MUST add --bind 0.0.0.0: the server
+# defaults to loopback, and a loopback bind inside a container is unreachable
+# through -p port mapping.
+#
+#   ... ./bench/qwen38-gb10/serve.sh --bind 0.0.0.0
 set -euo pipefail
 
 : "${MODEL_DIR:?set MODEL_DIR to the Qwen3.8-27B NVFP4 checkpoint}"
@@ -110,4 +117,5 @@ exec env \
     --request-timeout 300 \
     --disable-confidence-early-stop \
     --disable-simhash-watchdog \
-    --disable-loop-watchdog
+    --disable-loop-watchdog \
+    "$@"
