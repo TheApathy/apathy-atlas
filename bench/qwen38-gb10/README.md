@@ -156,6 +156,37 @@ emitted data, not a fit.
 Every `ATLAS_*` variable the profile sets is listed in [`FLAGS.md`](FLAGS.md),
 with its value and the description from the source that reads it.
 
+## The headline number is workload-specific
+
+**63.9 tok/s is the MinHeap probe, and the MinHeap probe is close to the best
+case.** Speculative decoding pays off in proportion to how predictable the next
+tokens are, so the decode rate is a property of the *workload*, not of the
+engine alone. Measured on the published container, temp 0, 400 tokens,
+thinking off, three repetitions each (spread under 0.1 tok/s):
+
+| Workload | tok/s |
+|---|---:|
+| MinHeap class + complexity (the probe) | 58.5 |
+| Arithmetic word problem with algebra | 50.9 |
+| SQL query + explanation | 35.8 |
+| Rust IPv4 parser | 35.1 |
+| Multi-constraint logic puzzle | 34.4 |
+| Security explanation (JWT `alg:none`) | 24.9 |
+| Open prose, three paragraphs | **18.2** |
+
+Median across these is ~35 tok/s and the spread is 3.2x. Boilerplate-heavy code
+drafts extremely well; open prose barely drafts at all and runs near the
+no-speculation floor.
+
+This is why the probe is a fixed prompt: it is a *comparison* instrument, and
+every figure in this repo and in the upstream PRs it is compared against uses
+the same prompt. It is not a promise about your workload. If you are sizing for
+prose or chat, plan against the low end of that table, not the headline.
+
+(The 58.5 above is the same configuration as the published 63.95; the difference
+is the request protocol — the probe sends `reasoning_effort: none`, this table
+sends `enable_thinking: false`.)
+
 ## Measurement notes
 
 - **Do not A/B sequentially on a warm box.** Step time `S = tokens_per_step /
