@@ -45,37 +45,31 @@
 
 ## Serve it now
 
-Everything below is public — pull the target, the drafter, and the image, then
-serve. No account, no gated weights.
+One command. The image ships the tuned decode profile as defaults, so there are
+no environment variables to set:
 
 ```bash
-# 1. the target (pin the revision — upstream super-squashed the repo)
-hf download unsloth/Qwen3.8-27B-NVFP4 \
-  --revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108 \
-  --local-dir ./qwen38-target
-
-# 2. the drafter — this is the entire speedup (13.9 tok/s without one)
-hf download onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2 \
-  --local-dir ./qwen38-drafter
-
-# 3. the harness (the serve profile lives here)
-git clone -b perf/qwen38-gb10-dflash https://github.com/TheApathy/apathy-atlas.git
-cd apathy-atlas
-
-# 4. serve
 docker run --rm --gpus all --ipc=host -p 8898:8898 \
-  -v "$PWD/../qwen38-target:/model:ro" \
-  -v "$PWD/../qwen38-drafter:/drafter:ro" \
-  -v "$PWD/bench/qwen38-gb10:/harness:ro" --entrypoint bash \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   ghcr.io/theapathy/apathy-atlas:gb10 \
-  -c 'BIN=/usr/local/bin/spark MODEL_DIR=/model DRAFT=/drafter PORT=8898 \
-      bash /harness/serve.sh --bind 0.0.0.0'
+  serve unsloth/Qwen3.8-27B-NVFP4 \
+    --revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108 \
+    --port 8898 --bind 0.0.0.0 --kernel-target qwen3.8-27b \
+    --dflash --draft-model onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2 \
+    --dflash-gamma 15 --dflash-quantization nvfp4 \
+    --max-batch-size 1 --max-num-seqs 1 --max-seq-len 8192 \
+    --kv-cache-dtype bf16 --gpu-memory-utilization 0.55
 ```
 
-Then, in another shell:
+Weights and drafter are pulled from the Hub into the mounted cache on first run
+(~26 GB). Both are public. `--bind 0.0.0.0` is required in a container — the
+server defaults to loopback, which `-p` cannot reach.
+
+Then measure it:
 
 ```bash
-python3 bench/qwen38-gb10/weschera_minheap_repro.py \
+git clone -b perf/qwen38-gb10-dflash https://github.com/TheApathy/apathy-atlas.git
+python3 apathy-atlas/bench/qwen38-gb10/weschera_minheap_repro.py \
   --endpoint http://127.0.0.1:8898/v1/chat/completions \
   --output /tmp/probe.json --repetitions 5 --max-tokens 400
 ```
@@ -83,26 +77,54 @@ python3 bench/qwen38-gb10/weschera_minheap_repro.py \
 Expect a median near **63.9 tok/s**, `deterministic: true`, and an identical
 output hash across all five repetitions.
 
-**Use the serve profile, not a bare `serve` invocation.** It sets the 60 tuning
-variables the figure depends on. Measured on this same image, same weights, same
-drafter:
+### Why the defaults are baked in
+
+The profile is 60 variables and they are not optional. Measured on this image,
+same weights and drafter:
 
 | Configuration | tok/s |
 |---|---:|
-| Full profile, our drafter (`--dflash-gamma 15`) | **63.9** |
-| Full profile, public `incoai/Qwen3.8-27B-DFlash2` (`--dflash-gamma 7`) | 43.9 |
+| Full profile (**the shipped default**) | **63.8** |
+| Partial profile — gamma-derived vars missing | 13.5 |
 | No speculation, tuned kernels | 13.9 |
-| Speculative decoding on, **no tuning flags** | **8.8** |
+| Speculation on, **no tuning at all** | 8.8 |
 
-Note the last row: speculation *without* the tuned verify path is a **net loss**
-— slower than turning the drafter off entirely. Drafting only pays when the
-verify step it feeds keeps up, so a partial configuration is worse than either
-extreme.
+Speculation on an untuned verify path is *slower than no speculation*, and a
+partial profile is no better than turning it off. That is why they ship as
+image defaults rather than as a snippet to copy. Override any of them with
+`-e VAR=value`; every value is documented in
+[`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md).
 
-The image carries the engine only — no weights, no drafter, no credentials.
-`--bind 0.0.0.0` is required in a container: the server defaults to loopback,
-and a loopback bind is unreachable through `-p`. Every variable the profile sets
-is in [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md).
+If you change `--dflash-gamma`, also override `ATLAS_DFLASH_DRAFT_CAP=G` and
+`ATLAS_DDTREE_MAX_NODES=G+1` — they must track it or acceptance collapses
+quietly. The public [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+drafter caps at gamma 7 and measures 43.9 tok/s.
+
+### Pinning and verification
+
+Nothing here has to be trusted on a tag:
+
+```
+image     ghcr.io/theapathy/apathy-atlas:gb10
+          @sha256:e44dd932c439dfb0ad967580148243b217f0849d75c36bac691af09469ae20fc
+          carries SLSA provenance (mode=max) and an SBOM:
+          docker buildx imagetools inspect ghcr.io/theapathy/apathy-atlas:gb10
+
+drafter   onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2
+          revision 64f3e67ce7531279636964a253763482765789fa
+          model.safetensors sha256
+          9d0f620c02dd1d2660644144396a9c3b88042cc5d67baf221718f262c97f4ba2
+          (4,257,372,464 bytes)
+
+target    unsloth/Qwen3.8-27B-NVFP4
+          revision 7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108
+```
+
+Pass `--revision` to pin the drafter too. Note the image **digest** rather than
+the tag is what identifies a build: this workspace is cache-stable but not
+byte-reproducible, so the same source builds to a different digest each time and
+a digest cannot carry lineage — see
+[`docs/QWEN38_PRODUCTION_CONTAINER.md`](docs/QWEN38_PRODUCTION_CONTAINER.md).
 
 ## Or build from source
 
