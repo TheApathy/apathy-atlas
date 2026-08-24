@@ -71,7 +71,7 @@ Quality profile differs in: `MAX_THINKING_BUDGET=57344`,
 | `ATLAS_SSM_GDN_LAZY=1` | skips 15-of-16 discarded snapshot writes | +5.16 tok/s, bit-exact (replays the identical FP32 recurrence on commit) |
 | `ATLAS_SSM_GDN_SEQ_PERSISTENT=1` | keeps H in registers across the block | +1.70 tok/s. Together with lazy commit this cut `ssm_gdn_fp32_seq` from 16.9 to 4.9 ms/step |
 | `ATLAS_ATTN_QKV_FUSED=1` | fuses QKV projection | +0.79 tok/s |
-| `ATLAS_DFLASH_DRAFT_SPLITK=8` | splits K on occupancy-starved drafter GEMMs | +0.98 tok/s net. **Not bit-exact** — see §5 |
+| `ATLAS_DFLASH_DRAFT_SPLITK=8` | splits K on occupancy-starved drafter GEMMs | +1.13 tok/s (64.07 vs 62.94). Reassociates the K loop so bit-exactness is unproven; measured byte-identical on the probe |
 | `ATLAS_WEIGHT_CACHE=1` | caches post-transform weights | Weight-load phase 17 s vs ~45-60 s. See `docs/weight-cache.md` |
 | watchdogs mostly off | see §6 | each was measured killing healthy output |
 
@@ -274,3 +274,62 @@ target, `make repro`. See
 [`QWEN38_PRODUCTION_CONTAINER.md`](QWEN38_PRODUCTION_CONTAINER.md). Use it when
 you want the number reproduced rather than the knobs varied; use the launcher
 above when you are varying knobs.
+
+---
+
+## 12. What decode speed is actually attributable to
+
+Measured 2026-08-24 on the published container, MinHeap probe, 400 tokens.
+Decode rate is one ratio:
+
+    tok/s = emitted_per_cycle / cycle_time
+
+|                  | emitted/cycle | cycle time | tok/s |
+|---|---:|---:|---:|
+| no speculation   | 1.00 | 72.1 ms | 13.9 |
+| γ=7              | 6.06 | 112.3 ms | 54.0 |
+| γ=15             | 8.33 | 129.8 ms | 64.2 |
+
+Speculation multiplies tokens-per-cycle by **8.33** while multiplying cycle cost
+by only **1.80**. That ratio, 4.62x, is the entire speedup. The **numerator is
+the drafter** (acceptance x depth); the **denominator is the engine**. Both are
+required and neither alone gets there.
+
+Isolated A/B contributions to the denominator, same drafter, same probe:
+
+| Change | Δ tok/s |
+|---|---:|
+| GDN lazy commit + persistent-H | **+6.48** (63.80 vs 57.32) |
+| split-K draft head | +1.13 (64.07 vs 62.94) |
+| tensor-core verify flags | **+0.25** (64.10 vs 63.85) — null |
+
+**The tensor-core result corrects an earlier claim in this document.** The TC
+flags were described as load-bearing for speed. They are not: disabling all
+three costs 0.25 tok/s. They remain a numerics re-reference (§5) — that part
+stands — but they are not where the throughput comes from.
+
+### Depth saturates, and more is not better
+
+Solving the measured γ=15 point (8.33 emitted) under a constant-hazard model
+gives per-token acceptance **p ≈ 0.904**. Expected accepted converges to
+`p/(1-p)` = **9.4 tokens**, so draft width beyond ~γ12 buys almost nothing while
+verify cost keeps growing at 1.890 ms/node:
+
+| γ | emitted/cycle | cycle ms | tok/s |
+|---:|---:|---:|---:|
+| 15 | 8.33 | 129.8 | **64.2** |
+| 23 | 9.47 | 151.3 | 62.6 |
+| 31 | 9.98 | 172.8 | **57.7** |
+
+A `block_size: 32` drafter at today's acceptance is a **loss**, not a win.
+Depth only pays if acceptance rises with it:
+
+| p | best γ | tok/s at best γ |
+|---:|---:|---:|
+| 0.904 (today) | 17 | 64.5 |
+| 0.924 | 20 | 74.4 |
+| 0.944 | 24 | 88.5 |
+
+**70 tok/s needs p ≈ 0.924**, about +0.02 over today. That is a corpus and
+training question, not a kernel or draft-width one — and it is why the remaining
+work is drafter work.

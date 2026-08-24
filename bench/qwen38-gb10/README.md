@@ -203,7 +203,10 @@ server-side one.
 - **Do not A/B sequentially on a warm box.** Step time `S = tokens_per_step /
   overall_tok_s`; a sequential A/B produces phantom regressions from thermal and
   cache state. Interleave the arms.
-- `ATLAS_DFLASH_DRAFT_SPLITK=8` is worth +0.98 tok/s but is **not bit-exact** —
+- `ATLAS_DFLASH_DRAFT_SPLITK=8` is worth +1.13 tok/s (measured 64.07 vs 62.94).
+  It reassociates the K loop, so bit-exactness is **not guaranteed** — though on
+  this probe it produced a byte-identical completion either way. Treat it as
+  unproven rather than unsafe, and drop it when validating numerics —
   it changes reduction order in the drafter GEMMs. Everything else in
   `serve.sh` is bit-exact. Drop it if you are validating numerics rather than
   speed.
