@@ -274,7 +274,7 @@ pub fn validate_dflash_pairing(
         )
     })?;
     anyhow::ensure!(
-        sub.mask_token_id as usize < drafter.vocab_size,
+        (sub.mask_token_id as usize) < drafter.vocab_size,
         "DFlash mask_token_id {} is outside vocab_size {}",
         sub.mask_token_id,
         drafter.vocab_size,

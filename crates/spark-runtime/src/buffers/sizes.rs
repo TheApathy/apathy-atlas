@@ -224,11 +224,12 @@ impl BufferSizes {
         // num_tokens*top_k PLUS a shared-expert slice of num_tokens rows carved
         // from the tail → need k_max*top_k >= num_tokens*(top_k+1)), so floor
         // k_max at 20 when DFlash is active (covers K=17 with headroom).
-        // Only inflate when the batched verify (forward_kn) is actually enabled:
-        // the k_max floor grows the expert scratch ~7× and shifts the whole
-        // arena layout, so keep the proven layout unless ATLAS_DFLASH_BATCH_MOE=1.
-        let batch_moe = std::env::var("ATLAS_DFLASH_BATCH_MOE").ok().as_deref() == Some("1");
-        let dflash_k = if batch_moe && !config.dflash_capture_layers.is_empty() {
+        // MLA targets reach the multi-row `forward_verify_rows` path even when
+        // ATLAS_DFLASH_BATCH_MOE is unset. Size from the active DFlash capture
+        // contract rather than that unrelated Qwen/Laguna experiment flag, or
+        // a small max-prefill setting can under-allocate the 16-row DeepSeek
+        // DFlash2 expert buffers.
+        let dflash_k = if !config.dflash_capture_layers.is_empty() {
             20
         } else {
             0

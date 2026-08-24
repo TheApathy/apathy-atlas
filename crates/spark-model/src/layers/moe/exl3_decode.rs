@@ -36,9 +36,9 @@
 //! of `ws`, `group·N/128` ints of `counters`) and the host sizes both for the
 //! widest group count it will ever launch (`2·top_k`, from gate+up).
 //!
-//! NOT yet wired: prefill / wide-verify (M>1) go through
-//! `forward_prefill_exl3.rs`; every legacy NVFP4/E8M0 decode site fails loudly
-//! via the `Exl3Trellis` format tag.
+//! Prefill uses `forward_prefill_exl3.rs`; speculative wide verify uses the
+//! deduplicated m-row ladder in this module. Every legacy NVFP4/E8M0 decode
+//! site fails loudly via the `Exl3Trellis` format tag.
 
 use anyhow::{Context, Result, ensure};
 use spark_runtime::kernel_args::KernelLaunch;
@@ -63,7 +63,15 @@ const EXL3_MAX_TOP_K: u32 = 32;
 /// entry is correct for any `num_tokens <= R`; the host picks the SMALLEST rung
 /// `>= num_tokens` so the accumulator array is never over-provisioned, and
 /// declines past the last rung (a gather wider than MROW silently drops rows).
-const EXL3_MROW_ARMS: [u32; 5] = [1, 2, 4, 6, 8];
+/// EXL3 can serve the full 16-row DFlash2 verify block. Keep this separate
+/// from the MXFP4 `_t` ladder, which is still proven only through MROW=8.
+pub(super) const EXL3_MROW_MAX_ROWS: u32 = 16;
+const EXL3_MROW_ARMS: [u32; 6] = [1, 2, 4, 6, 8, EXL3_MROW_MAX_ROWS];
+
+fn exl3_shared_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_VERIFY_GEMV_V2").as_deref() == Ok("1"))
+}
 
 /// Device pointer tables for one EXL3 projection across all routed experts.
 pub(crate) struct Exl3ProjTable {
@@ -377,7 +385,7 @@ impl MoeLayer {
         // Every group needs its own [N/128] election counters, and every
         // OUTPUT ROW its own [SPLIT_K, N] fp32 partial region, since fused /
         // dedup'd groups run concurrently.
-        let max_rows = super::MOE_VERIFY_MAX_ROWS.min(*EXL3_MROW_ARMS.last().unwrap());
+        let max_rows = *EXL3_MROW_ARMS.last().unwrap();
         let groups = 2 * max_rows * top_k;
         // MUST match what the dispatch launches with, for EVERY arm: the
         // wave-walk in `split_for` can round the split UP, and the partial
@@ -702,9 +710,9 @@ impl MoeLayer {
         {
             return false;
         }
-        // The shared expert rides the per-row NVFP4 chain (see below), which
-        // needs the shared scratch to hold `num_tokens` rows at a stride the
-        // MXFP4 wide verify already provisions (`moe_intermediate_size`).
+        // The shared expert uses either the exact grouped-batch NVFP4 chain or
+        // its exact per-row fallback. Both need the shared scratch to hold
+        // `num_tokens` rows at the MXFP4 verify stride.
         (ctx.config.shared_expert_intermediate_size as u32)
             <= ctx.config.moe_intermediate_size as u32
     }
@@ -727,15 +735,9 @@ impl MoeLayer {
     ///     the K-slice per split is identical,
     ///   * the SwiGLU is the same elementwise `moe_silu_mul` kernel over a
     ///     wider flat extent, and
-    ///   * the shared expert runs the SAME single-row `w4a16_gemv` chain, once
-    ///     per row.
-    ///
-    /// That last point is why the shared half is a per-row loop and not a
-    /// batched GEMM: `w4a16_gemm` has a different accumulation order, and a
-    /// PARTIALLY exact verify chain measured WORSE than either extreme
-    /// (o-proj-only exactness: 2.54 tok/step vs 2.83 for none and 2.92-3.01 for
-    /// full). It costs `4·num_tokens` small launches per layer; batching it
-    /// needs a bit-exact `w4a16_gemv_batchm`, which is the next lever here.
+    ///   * with `ATLAS_VERIFY_GEMV_V2=1`, the shared expert uses the grouped
+    ///     batch kernel whose per-row FMA and reduction order is copied from
+    ///     `w4a16_gemv`; otherwise it uses that single-row kernel directly.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn dispatch_exl3_verify(
         &self,
@@ -846,58 +848,124 @@ impl MoeLayer {
             .arg_u32(st.down.bits)
             .launch(stream)?;
 
-        // ── Shared expert, one row at a time on the SAME single-row NVFP4
-        //    kernels plain decode uses (see the exact-GEMV note above). ──
+        // ── Shared expert. The grouped-batch kernel preserves the exact
+        //    single-row K order while streaming each NVFP4 weight once. ──
         self.shared_experts_scale_kind.expect(
             crate::weight_map::WeightQuantFormat::Nvfp4,
             "EXL3 verify arm computes the shared expert via w4a16_gemv (NVFP4)",
         );
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let sh = &self.weights.shared_expert;
-        for t in 0..num_tokens as usize {
-            let a_row = expert_input.offset(t * h as usize * 2);
-            let g_row = shared_gate_scratch.offset(t * shared_inter as usize * 2);
-            let u_row = shared_up_scratch.offset(t * shared_inter as usize * 2);
-            let o_row = shared_out.offset(t * h as usize * 2);
-            ops::w4a16_gemv(
-                gpu,
-                self.w4a16_gemv,
-                a_row,
+        let exact_batch = exl3_shared_batch_enabled();
+        let batch_kernel = if exact_batch && num_tokens <= 8 {
+            Some((self.w4a16_gemv_grouped_batchm_k, false))
+        } else if exact_batch && num_tokens == 16 {
+            Some((self.w4a16_gemv_grouped_batchm_v2_m16_k, true))
+        } else {
+            None
+        }
+        .filter(|(kernel, _)| kernel.0 != 0);
+        if let Some((kernel, v2)) = batch_kernel {
+            let run = |input: DevicePtr,
+                       weight: &crate::weight_map::QuantizedWeight,
+                       output: DevicePtr,
+                       n: u32,
+                       k: u32,
+                       lda: u32,
+                       ldc: u32|
+             -> Result<()> {
+                if v2 {
+                    ops::w4a16_gemv_grouped_batchm_v2(
+                        gpu, kernel, input, weight, output, num_tokens, n, k, lda, ldc, n, stream,
+                    )
+                } else {
+                    ops::w4a16_gemv_grouped_batchm(
+                        gpu, kernel, input, weight, output, num_tokens, n, k, lda, ldc, n, stream,
+                    )
+                }
+            };
+            run(
+                expert_input,
                 &sh.gate_proj,
-                g_row,
+                shared_gate_scratch,
                 shared_inter,
                 h,
-                stream,
+                h,
+                shared_inter,
             )?;
-            ops::w4a16_gemv(
-                gpu,
-                self.w4a16_gemv,
-                a_row,
+            run(
+                expert_input,
                 &sh.up_proj,
-                u_row,
+                shared_up_scratch,
                 shared_inter,
                 h,
-                stream,
+                h,
+                shared_inter,
             )?;
             ops::moe_silu_mul(
                 gpu,
                 st.silu_mul_noclamp_k,
-                g_row,
-                u_row,
-                g_row,
-                shared_inter,
+                shared_gate_scratch,
+                shared_up_scratch,
+                shared_gate_scratch,
+                num_tokens * shared_inter,
                 stream,
             )?;
-            ops::w4a16_gemv(
-                gpu,
-                self.w4a16_gemv,
-                g_row,
+            run(
+                shared_gate_scratch,
                 &sh.down_proj,
-                o_row,
+                shared_out,
                 h,
                 shared_inter,
-                stream,
+                shared_inter,
+                h,
             )?;
+        } else {
+            for t in 0..num_tokens as usize {
+                let a_row = expert_input.offset(t * h as usize * 2);
+                let g_row = shared_gate_scratch.offset(t * shared_inter as usize * 2);
+                let u_row = shared_up_scratch.offset(t * shared_inter as usize * 2);
+                let o_row = shared_out.offset(t * h as usize * 2);
+                ops::w4a16_gemv(
+                    gpu,
+                    self.w4a16_gemv,
+                    a_row,
+                    &sh.gate_proj,
+                    g_row,
+                    shared_inter,
+                    h,
+                    stream,
+                )?;
+                ops::w4a16_gemv(
+                    gpu,
+                    self.w4a16_gemv,
+                    a_row,
+                    &sh.up_proj,
+                    u_row,
+                    shared_inter,
+                    h,
+                    stream,
+                )?;
+                ops::moe_silu_mul(
+                    gpu,
+                    st.silu_mul_noclamp_k,
+                    g_row,
+                    u_row,
+                    g_row,
+                    shared_inter,
+                    stream,
+                )?;
+                ops::w4a16_gemv(
+                    gpu,
+                    self.w4a16_gemv,
+                    g_row,
+                    &sh.down_proj,
+                    o_row,
+                    h,
+                    shared_inter,
+                    stream,
+                )?;
+            }
         }
         Ok(true)
     }

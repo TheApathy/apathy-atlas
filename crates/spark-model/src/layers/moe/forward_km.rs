@@ -43,7 +43,12 @@ impl MoeLayer {
         // routing. Everything from `router_input` down to the blend is shared,
         // so the branch is only over the expert dispatch itself.
         let is_exl3 = self.exl3.is_some();
-        if n < 2 || n > MOE_VERIFY_MAX_ROWS {
+        let max_rows = if is_exl3 {
+            super::exl3_decode::EXL3_MROW_MAX_ROWS
+        } else {
+            MOE_VERIFY_MAX_ROWS
+        };
+        if n < 2 || n > max_rows {
             // The width cap is a THROUGHPUT CLIFF, not a mere fallback: past
             // `MOE_VERIFY_MAX_ROWS` every row re-streams the whole routed
             // expert set. Measured on DeepSeek-V4-Flash / GB10, verify goes
@@ -51,11 +56,11 @@ impl MoeLayer {
             // row, vs ~16 ms/row inside the cap). Any widening of the drafter
             // (γ > 5) or of the tree (K_t > 6) silently loses far more than it
             // gains until the `_m` kernels are widened, so say so once.
-            if n > MOE_VERIFY_MAX_ROWS {
+            if n > max_rows {
                 static WIDE_ONCE: std::sync::Once = std::sync::Once::new();
                 WIDE_ONCE.call_once(|| {
                     tracing::warn!(
-                        "MoE dedup verify declined: n={n} > MOE_VERIFY_MAX_ROWS={MOE_VERIFY_MAX_ROWS} \
+                        "MoE dedup verify declined: n={n} > max_rows={max_rows} (exl3={is_exl3}) \
                          — falling back to per-row forward_batched, which re-streams every routed \
                          expert once PER ROW (~82ms/row on GB10). Widen the `_m` kernels before \
                          raising the draft width."

@@ -64,9 +64,24 @@ The factory now rejects incompatible pairings before model scratch or KV-cache
 construction. Cross-vocabulary `d2t` remapping is intentionally rejected
 because Atlas detects such tables but does not yet execute the remap.
 
-For a future 16-row drafter, the DeepSeek verify path also needs a measured
-multi-row kernel ladder beyond the current small-row arms. Widening the kernels
-without parity hashes and dispatch proof is not a performance result.
+The EXL3 launcher accepts a separate checkpoint through `DRAFTER=/path` and
+infers the native DFlash2 capture contract. Embedded K2 continues to use
+`DRAFTER_KIND=dspark`; a native DFlash2 launch does not allocate or update the
+unrelated three-row DSpark HC-mean capture buffer.
+
+The branch now compiles an EXL3 MROW=16 target-verify arm and sizes DFlash
+scratch independently of the legacy `ATLAS_DFLASH_BATCH_MOE` experiment flag.
+This removes the previous row-9 cliff where a 16-row drafter fell back to
+re-streaming every routed expert once per row. It is implementation readiness,
+not a performance claim: GPU parity hashes and dispatch proof remain promotion
+gates. The separate MXFP4 `_t` ladder remains capped at its proven eight rows.
+
+With `ATLAS_VERIFY_GEMV_V2=1`, the EXL3 shared expert now uses Atlas's exact
+grouped-batch NVFP4 GEMV at the six-row K2 verify width instead of three GEMVs
+per row. A compile-time M=16 sibling serves the DFlash2 width without inflating
+the K2 kernel's register footprint. The arithmetic order matches the single-row
+kernel by construction; live byte-parity and timing are still required before
+promotion.
 
 ## Promotion gates
 

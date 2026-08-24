@@ -4,6 +4,8 @@
 #
 # Usage:  scripts/exl3-serve.sh <log-name> [extra env assignments...]
 #   MODEL=/models/ds4-k2 DSPARK_TOKENS=5 scripts/exl3-serve.sh k2
+#   MODEL=/models/ds4-k2 DRAFTER=/models/ds4-dflash2 GAMMA=16 \
+#     scripts/exl3-serve.sh dflash2
 #
 # Only ONE server may run at a time (single shared GPU). Stop with
 # scripts/dspark-stop.sh.
@@ -28,6 +30,22 @@ fi
 
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 MODEL="${MODEL:-/home/flocka/models/DeepSeek-V4-Flash-0731-EXL3-K2-calibrated-v1}"
+DRAFTER="${DRAFTER:-$MODEL}"
+# Same-dir checkpoints are the embedded DSpark layout. A separate checkpoint
+# defaults to the native DFlash2 ABI; DRAFTER_KIND remains overrideable for a
+# separately packaged DSpark checkpoint.
+DRAFTER_KIND="${DRAFTER_KIND:-auto}"
+if [ "$DRAFTER_KIND" = auto ]; then
+  if [ "$DRAFTER" = "$MODEL" ]; then
+    DRAFTER_KIND=dspark
+  else
+    DRAFTER_KIND=dflash2
+  fi
+fi
+case "$DRAFTER_KIND" in
+  dspark|dflash2) ;;
+  *) echo "DRAFTER_KIND must be auto, dspark, or dflash2" >&2; exit 2 ;;
+esac
 PORT="${PORT:-8977}"
 if [ -n "${GAMMA:-}" ]; then
   # DSpark's current capture is `[3, max_seq_len, hidden]` BF16. Keep the
@@ -47,11 +65,7 @@ ENV_ARGS=(
   ATLAS_KV_OVERCOMMIT=1
 )
 if [ -n "${GAMMA:-}" ]; then
-  # The embedded DSpark block conditions on the target's HC-mean capture.
-  # Keep this before caller arguments so ATLAS_DSPARK_CAPTURE=0 remains an
-  # explicit diagnostic override.
   ENV_ARGS+=(
-    ATLAS_DSPARK_CAPTURE=1
     ATLAS_V4_ATTN_NVFP4=1
     ATLAS_V4_ATTN_RELEASE_BF16=1
     ATLAS_MOE_MROW_PARTITION=1
@@ -60,16 +74,23 @@ if [ -n "${GAMMA:-}" ]; then
     ATLAS_DFLASH_ADAPTIVE=1
     ATLAS_DFLASH_LOW_GEAR=1
   )
+  if [ "$DRAFTER_KIND" = dspark ]; then
+    # DSpark conditions on the target's HC-mean capture. Native DFlash2 uses
+    # its config-declared target-layer captures and must not pay for this
+    # separate three-row DSpark buffer.
+    ENV_ARGS+=(ATLAS_DSPARK_CAPTURE=1)
+  fi
 fi
 for kv in "$@"; do ENV_ARGS+=("$kv"); done
 
 {
   echo "serve: $REPO/target/release/spark"
   echo "model: $MODEL (DeepSeek-V4 EXL3)"
+  echo "draft: $DRAFTER ($DRAFTER_KIND)"
   echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=fp8 gpu_mem=$GPU_MEMORY_UTILIZATION max_seq=$MAX_SEQ_LEN batch=1"
   echo "env  : ${ENV_ARGS[*]:-<none>}"
   if [ -n "${GAMMA:-}" ]; then
-    echo "spec : embedded DSpark gamma=$GAMMA verify rows, $((GAMMA - 1)) drafts"
+    echo "spec : $DRAFTER_KIND gamma=$GAMMA verify rows, $((GAMMA - 1)) drafts"
   else
     echo "spec : <none>"
   fi
@@ -84,7 +105,7 @@ fi
 # raw verify-width override retained for controlled ablations.
 SPEC=()
 if [ -n "${GAMMA:-}" ]; then
-  SPEC=(--dflash --draft-model "$MODEL" --dflash-gamma "$GAMMA")
+  SPEC=(--dflash --draft-model "$DRAFTER" --dflash-gamma "$GAMMA")
 fi
 
 nohup env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \

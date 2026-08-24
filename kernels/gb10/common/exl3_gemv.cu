@@ -1113,12 +1113,14 @@ EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m2, 2)
 EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m4, 4)
 EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m6, 6)
 EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m8, 8)
+EXL3_MROW_GATE_UP_ENTRY(exl3_gemv_mrow_fused_gate_up_m16, 16)
 
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m1, 1)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m2, 2)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m4, 4)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m6, 6)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m8, 8)
+EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m16, 16)
 
 #undef EXL3_MROW_GATE_UP_ENTRY
 #undef EXL3_MROW_DOWN_ENTRY

@@ -1374,7 +1374,7 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
 
 /// Ladder rungs the host may dispatch (`EXL3_MROW_ARMS` in exl3_decode.rs,
 /// minus the m1 reference rung which GATE8 already covers).
-const MROW_WIDTHS: [usize; 4] = [2, 4, 6, 8];
+const MROW_WIDTHS: [usize; 5] = [2, 4, 6, 8, 16];
 
 #[allow(clippy::too_many_lines)]
 fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {

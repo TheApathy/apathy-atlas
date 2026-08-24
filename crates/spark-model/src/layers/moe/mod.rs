@@ -165,6 +165,11 @@ pub struct MoeLayer {
     pre_expert_norm_k: spark_runtime::gpu::KernelHandle,
     dense_gemv: KernelHandle,
     w4a16_gemv: KernelHandle,
+    /// Exact multi-row NVFP4 shared-expert GEMV. The runtime-M incumbent is
+    /// proven through eight rows; the m16 specialization serves native
+    /// DFlash2 without inflating the K2 kernel's register footprint.
+    w4a16_gemv_grouped_batchm_k: KernelHandle,
+    w4a16_gemv_grouped_batchm_v2_m16_k: KernelHandle,
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
     dense_gemm_pipelined: KernelHandle,

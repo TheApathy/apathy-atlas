@@ -38,6 +38,20 @@ The speculative launcher also enables the byte-exact fused V4 decode and
 compile-time verify GEMV tiers, plus adaptive/low-gear fallback. Callers can
 override any default by passing a later `ENV=VALUE` argument.
 
+A separately trained DeepSeek-native DFlash2 checkpoint uses the same target
+fast paths without allocating DSpark's HC-mean capture buffer:
+
+```bash
+MODEL=/models/deepseek-v4-exl3-k2 \
+DRAFTER=/models/deepseek-v4-dflash2 \
+GAMMA=16 \
+scripts/exl3-serve.sh dflash2
+```
+
+The launcher infers `DRAFTER_KIND=dflash2` when `DRAFTER` differs from
+`MODEL`. Set `DRAFTER_KIND=dspark` explicitly for a separately packaged
+DSpark checkpoint.
+
 Plain serving exposes the checkpoint-native 1M YaRN ceiling with paged-KV
 overcommit. The resident pool is smaller and must be reported from the boot
 log. Speculative serving currently defaults to 131072 because DSpark's target

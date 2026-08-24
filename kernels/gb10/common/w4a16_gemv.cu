@@ -600,6 +600,10 @@ W4A16_GB_V2_ENTRY(4, __launch_bounds__(BLOCK_SIZE, 3))
 W4A16_GB_V2_ENTRY(5, __launch_bounds__(BLOCK_SIZE, 3))
 W4A16_GB_V2_ENTRY(6, __launch_bounds__(BLOCK_SIZE, 3))
 W4A16_GB_V2_ENTRY(8, )
+// Native DeepSeek DFlash2: 15 proposals + one target row. Kept as a
+// compile-time-M specialization so the proven <=8 incumbent does not carry
+// sixteen accumulator rows and lose occupancy on today's K2 path.
+W4A16_GB_V2_ENTRY(16, )
 
 // ============================================================
 // W4A16 GEMV — SINGLE-WARP-PER-OUTPUT variant (lossless, opt-in).
