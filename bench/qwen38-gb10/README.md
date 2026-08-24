@@ -160,32 +160,41 @@ with its value and the description from the source that reads it.
 
 **63.9 tok/s is the MinHeap probe, and the MinHeap probe is close to the best
 case.** Speculative decoding pays off in proportion to how predictable the next
-tokens are, so the decode rate is a property of the *workload*, not of the
-engine alone. Measured on the published container, temp 0, 400 tokens,
-thinking off, three repetitions each (spread under 0.1 tok/s):
+tokens are, so decode rate is a property of the *workload*, not of the engine
+alone. Measured on the published container, temp 0, 400 tokens,
+`reasoning_effort: none`, median of 3:
 
-| Workload | tok/s |
+| Workload | tok/s (server) |
 |---|---:|
-| MinHeap class + complexity (the probe) | 58.5 |
-| Arithmetic word problem with algebra | 50.9 |
-| SQL query + explanation | 35.8 |
-| Rust IPv4 parser | 35.1 |
-| Multi-constraint logic puzzle | 34.4 |
-| Security explanation (JWT `alg:none`) | 24.9 |
-| Open prose, three paragraphs | **18.2** |
+| MinHeap class + complexity (the probe) | **63.9** |
+| Arithmetic word problem with algebra | 55.1 |
+| SQL query + explanation | 37.4 |
+| Rust IPv4 parser | 37.0 |
+| Multi-constraint logic puzzle | 36.1 |
+| Security explanation (JWT `alg:none`) | 25.7 |
+| Open prose, three paragraphs | **19.2** |
 
-Median across these is ~35 tok/s and the spread is 3.2x. Boilerplate-heavy code
+Median across these is ~37 tok/s and the spread is 3.3x. Boilerplate-heavy code
 drafts extremely well; open prose barely drafts at all and runs near the
 no-speculation floor.
 
 This is why the probe is a fixed prompt: it is a *comparison* instrument, and
-every figure in this repo and in the upstream PRs it is compared against uses
+every figure in this repo and in the upstream PRs it is measured against uses
 the same prompt. It is not a promise about your workload. If you are sizing for
-prose or chat, plan against the low end of that table, not the headline.
+prose or chat, plan against the low end of this table, not the headline.
 
-(The 58.5 above is the same configuration as the published 63.95; the difference
-is the request protocol — the probe sends `reasoning_effort: none`, this table
-sends `enable_thinking: false`.)
+### Which rate you are reading
+
+Two figures differ by ~8% and it is worth knowing which is which:
+
+- **`usage.response_token/s`** — the server's own decode counter. This is what
+  the probe reports and what every published number here uses.
+- **client wall-clock** (`completion_tokens / elapsed`) — includes request
+  overhead and time-to-first-token, so it reads lower. On the MinHeap probe:
+  63.9 server vs 58.6 client.
+
+Compare like with like. A client-side number is not a regression against a
+server-side one.
 
 ## Measurement notes
 
