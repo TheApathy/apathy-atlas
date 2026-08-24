@@ -32,6 +32,130 @@
 
 ---
 
+# This branch: Qwen3.8-27B speculative decoding on GB10
+
+> **`perf/qwen38-gb10-dflash`** — a fork branch tuned for one model
+> (Qwen3.8-27B NVFP4) on one machine (DGX Spark / GB10), using DFlash
+> speculative decoding. **63.9 tok/s single-stream**, reproduced from a clean
+> checkout and from the published container, byte-identical to the recorded
+> reference run.
+>
+> This branch is **310 commits ahead of upstream** and is not a drop-in
+> replacement for it — see [`docs/FORK_VS_UPSTREAM.md`](docs/FORK_VS_UPSTREAM.md).
+
+## Serve it now
+
+**Use the repo's serve profile.** It sets the 60 tuning variables the published
+figure depends on. Serving without them runs near the no-speculation floor —
+measured on this same image: **8.8 tok/s bare vs 63.9 with the profile**, a
+7.3x difference. The flags are not optional garnish.
+
+```bash
+git clone -b perf/qwen38-gb10-dflash https://github.com/TheApathy/apathy-atlas.git
+cd apathy-atlas
+
+docker run --rm --gpus all --ipc=host -p 8898:8898 \
+  -v /path/to/Qwen3.8-27B-NVFP4:/model:ro \
+  -v /path/to/dflash-drafter:/drafter:ro \
+  -v "$PWD/bench/qwen38-gb10:/harness:ro" --entrypoint bash \
+  ghcr.io/theapathy/apathy-atlas:gb10 \
+  -c 'BIN=/usr/local/bin/spark MODEL_DIR=/model DRAFT=/drafter PORT=8898 \
+      bash /harness/serve.sh --bind 0.0.0.0'
+```
+
+The image carries the engine only — no weights, no drafter, no credentials.
+`--bind 0.0.0.0` is required in a container: the server defaults to loopback,
+and a loopback bind is unreachable through `-p`. Every variable the profile sets
+is listed in [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md).
+
+## Or build from source
+
+Produces the same result — verified from a clean checkout with a cold build
+cache at **64.2 tok/s**:
+
+```bash
+git clone -b perf/qwen38-gb10-dflash https://github.com/TheApathy/apathy-atlas.git
+cd apathy-atlas
+
+# nvcc must be ON PATH: cudarc's build script shells out to a bare
+# `nvcc --version` and does NOT consult CUDA_HOME. A clean checkout has no
+# cached build-script output, so this fails there even though it succeeds on a
+# tree that has built before.
+export PATH=/usr/local/cuda/bin:$PATH
+
+ATLAS_TARGET_MODEL=qwen3.8-27b ATLAS_TARGET_QUANT=nvfp4 \
+  cargo build --release -p spark-server
+```
+
+Check the build log line — without those two variables the build **silently**
+targets another model and produces a binary that will not serve this one:
+
+```
+atlas-kernels: compiled 151 kernels for target 0 (gb10, qwen3.8-27b, nvfp4)
+```
+
+Then serve with the same profile:
+
+```bash
+MODEL_DIR=/path/to/Qwen3.8-27B-NVFP4 DRAFT=/path/to/dflash-drafter \
+  ./bench/qwen38-gb10/serve.sh
+```
+
+## Test it
+
+```bash
+python3 bench/qwen38-gb10/weschera_minheap_repro.py \
+  --endpoint http://127.0.0.1:8898/v1/chat/completions \
+  --output /tmp/probe.json --repetitions 5 --max-tokens 400
+```
+
+Expect a median near **63.9 tok/s**, `deterministic: true`, and an identical
+output hash across all five repetitions. A differing hash means something in the
+configuration is non-deterministic and the timings should not be trusted.
+
+Measured the same way on three independent paths:
+
+| Path | tok/s |
+|---|---:|
+| Published container, repo profile | 63.95 |
+| Clean checkout, cold build from source | 64.18 |
+| Host, prebuilt binary | 63.91 |
+
+All three produce byte-identical output to the recorded reference run.
+
+**That figure is workload-specific.** The probe is a fixed prompt used for
+comparison; on the same container decode ranges from 63.9 tok/s on
+boilerplate-heavy code down to 19.2 on open prose, median ~37. Full table and
+the reason in [`bench/qwen38-gb10/README.md`](bench/qwen38-gb10/README.md).
+
+## Where things are
+
+| | |
+|---|---|
+| Reproduction harness, flags, caveats | [`bench/qwen38-gb10/`](bench/qwen38-gb10/) |
+| Every serve flag, with values and source descriptions | [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md) |
+| Measurement record and per-flag evidence | [`docs/QWEN38_PERFORMANCE_RECIPE.md`](docs/QWEN38_PERFORMANCE_RECIPE.md) |
+| What this fork changed vs upstream, and what measured null | [`docs/FORK_VS_UPSTREAM.md`](docs/FORK_VS_UPSTREAM.md) |
+| Container image, provenance and verification status | [`docs/QWEN38_PRODUCTION_CONTAINER.md`](docs/QWEN38_PRODUCTION_CONTAINER.md) |
+| Which images build, and which have actually been served | [`docker/docker-guide.md`](docker/docker-guide.md) |
+
+## Requirements
+
+GB10 / DGX Spark (`sm_121f`). The result is bandwidth-bound at ~273 GB/s and
+does not transfer to discrete GPUs. Weights: `unsloth/Qwen3.8-27B-NVFP4` at
+revision `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` — pin it, upstream
+super-squashed the repo and older revisions 404. The drafter used for the
+headline figure is not published; the public
+[`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+runs in this configuration but is a different drafter, so acceptance and
+therefore tok/s will differ.
+
+---
+
+*Everything below is the upstream Atlas README.*
+
+---
+
 ## 📑 Table of Contents
 
 - [🧭 Philosophy](#philosophy)
