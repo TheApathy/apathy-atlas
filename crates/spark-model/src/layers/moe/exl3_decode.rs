@@ -77,13 +77,15 @@ pub(crate) struct Exl3ProjTable {
     pub(crate) n: u32,
     /// Input columns of every matrix in this table.
     pub(crate) k: u32,
+    /// Homogeneous trellis bitrate for this table (K2 or K3).
+    pub(crate) bits: u32,
 }
 
 /// EXL3 decode state hung off `MoeLayer` (None on non-EXL3 checkpoints).
 pub(crate) struct Exl3MoeState {
-    pub(crate) gate: Exl3ProjTable, // checkpoint w1: [h -> inter]
-    pub(crate) up: Exl3ProjTable,   // checkpoint w3: [h -> inter]
-    pub(crate) down: Exl3ProjTable, // checkpoint w2: [inter -> h]
+    pub(crate) gate: Exl3ProjTable,     // checkpoint w1: [h -> inter]
+    pub(crate) up: Exl3ProjTable,       // checkpoint w3: [h -> inter]
+    pub(crate) down: Exl3ProjTable,     // checkpoint w2: [inter -> h]
     gemv_idx_k: KernelHandle,           // bring-up: one launch per (slot, proj)
     gemv_fused_gate_up_k: KernelHandle, // fused: all slots × {gate, up}
     gemv_fused_down_k: KernelHandle,    // fused: all slots
@@ -255,10 +257,12 @@ fn build_proj_table(
     for (i, e) in experts.iter().enumerate() {
         let w = proj(e);
         ensure!(
-            w.n == n && w.k == k,
-            "EXL3 expert {i}: shape [{}, {}] != expert 0 [{n}, {k}]",
+            w.n == n && w.k == k && w.bits == proj(&experts[0]).bits,
+            "EXL3 expert {i}: shape/bits [{}x{}, K{}] != expert 0 [{n}x{k}, K{}]",
             w.n,
-            w.k
+            w.k,
+            w.bits,
+            proj(&experts[0]).bits,
         );
     }
     let ptr_bytes = |f: &dyn Fn(&crate::weight_map::Exl3Weight) -> DevicePtr| -> Vec<u8> {
@@ -278,6 +282,7 @@ fn build_proj_table(
         svh_tab: up(ptr_bytes(&|w| w.svh))?,
         n,
         k,
+        bits: proj(&experts[0]).bits,
     })
 }
 
@@ -325,6 +330,7 @@ fn launch_gemv_idx(
         .arg_ptr(counters)
         .arg_u32(tab.n)
         .arg_u32(tab.k)
+        .arg_u32(tab.bits)
         .launch(stream)
 }
 
@@ -344,6 +350,13 @@ impl MoeLayer {
         let gate = build_proj_table(experts, |e| &e.gate_proj, gpu)?;
         let up = build_proj_table(experts, |e| &e.up_proj, gpu)?;
         let down = build_proj_table(experts, |e| &e.down_proj, gpu)?;
+        ensure!(
+            gate.bits == up.bits && gate.bits == down.bits,
+            "EXL3 fused dispatch requires one bitrate across gate/up/down; got K{}/K{}/K{}",
+            gate.bits,
+            up.bits,
+            down.bits
+        );
         ensure!(
             gate.n <= EXL3_MAX_N && down.n <= EXL3_MAX_N,
             "EXL3 scratch sized for N <= {EXL3_MAX_N}, got gate N={} down N={}",
@@ -372,10 +385,16 @@ impl MoeLayer {
         // undersize the scratch (memory corruption, not a slowdown). Take the
         // max over the m=1 fused group counts (2*top_k / top_k) and the m-row
         // ones (2*max_rows*top_k / max_rows*top_k).
-        let split_gu = exl3_split_for(gate.n, split_override, 2 * top_k)
-            .max(exl3_split_for(gate.n, split_override, groups));
-        let split_dn = exl3_split_for(down.n, split_override, top_k)
-            .max(exl3_split_for(down.n, split_override, max_rows * top_k));
+        let split_gu = exl3_split_for(gate.n, split_override, 2 * top_k).max(exl3_split_for(
+            gate.n,
+            split_override,
+            groups,
+        ));
+        let split_dn = exl3_split_for(down.n, split_override, top_k).max(exl3_split_for(
+            down.n,
+            split_override,
+            max_rows * top_k,
+        ));
         let ws_floats = exl3_ws_floats(gate.n, down.n, top_k, split_gu, split_dn, max_rows);
         let counter_bytes = groups as usize * (EXL3_MAX_N as usize / 128) * 4;
         let ws = gpu.alloc(ws_floats * 4)?;
@@ -469,7 +488,10 @@ impl MoeLayer {
         top_k: u32,
         stream: u64,
     ) -> Result<()> {
-        let st = self.exl3.as_ref().expect("dispatch_exl3_decode without state");
+        let st = self
+            .exl3
+            .as_ref()
+            .expect("dispatch_exl3_decode without state");
         ensure!(
             st.gate.n == inter && st.gate.k == h && st.down.n == h && st.down.k == inter,
             "EXL3 dims mismatch: gate [{}x{}] down [{}x{}] vs h={h} inter={inter}",
@@ -510,6 +532,7 @@ impl MoeLayer {
                 .arg_ptr(st.counters)
                 .arg_u32(inter)
                 .arg_u32(h)
+                .arg_u32(st.gate.bits)
                 .launch(stream)?;
             // (2) ONE flat clamped SwiGLU over all slots: gate/up are
             // contiguous `[top_k, inter]`, the kernel is a pure elementwise
@@ -538,6 +561,7 @@ impl MoeLayer {
                 .arg_ptr(st.counters)
                 .arg_u32(h)
                 .arg_u32(inter)
+                .arg_u32(st.down.bits)
                 .launch(stream)?;
         } else {
             // ── A/B fallback (`ATLAS_EXL3_FUSED=0`): the per-slot bring-up
@@ -548,21 +572,54 @@ impl MoeLayer {
                 let up_row = expert_up_out.offset(slot as usize * inter as usize * 2);
                 let down_row = expert_down_out.offset(slot as usize * h as usize * 2);
                 launch_gemv_idx(
-                    gpu, st.gemv_idx_k, expert_input, &st.gate, indices_dev, slot, gate_row,
-                    st.ws, st.counters, split_gu, stream,
+                    gpu,
+                    st.gemv_idx_k,
+                    expert_input,
+                    &st.gate,
+                    indices_dev,
+                    slot,
+                    gate_row,
+                    st.ws,
+                    st.counters,
+                    split_gu,
+                    stream,
                 )?;
                 launch_gemv_idx(
-                    gpu, st.gemv_idx_k, expert_input, &st.up, indices_dev, slot, up_row,
-                    st.ws, st.counters, split_gu, stream,
+                    gpu,
+                    st.gemv_idx_k,
+                    expert_input,
+                    &st.up,
+                    indices_dev,
+                    slot,
+                    up_row,
+                    st.ws,
+                    st.counters,
+                    split_gu,
+                    stream,
                 )?;
                 // act = clamped_swiglu(gate, up), in place over the gate row
                 // (elementwise same-index read/write — safe).
                 ops::moe_silu_mul(
-                    gpu, st.silu_mul_clamped_k, gate_row, up_row, gate_row, inter, stream,
+                    gpu,
+                    st.silu_mul_clamped_k,
+                    gate_row,
+                    up_row,
+                    gate_row,
+                    inter,
+                    stream,
                 )?;
                 launch_gemv_idx(
-                    gpu, st.gemv_idx_k, gate_row, &st.down, indices_dev, slot, down_row,
-                    st.ws, st.counters, split_dn, stream,
+                    gpu,
+                    st.gemv_idx_k,
+                    gate_row,
+                    &st.down,
+                    indices_dev,
+                    slot,
+                    down_row,
+                    st.ws,
+                    st.counters,
+                    split_dn,
+                    stream,
                 )?;
             }
         }
@@ -637,7 +694,12 @@ impl MoeLayer {
         if st.mrow_arm(num_tokens).is_none() {
             return false;
         }
-        if st.mrow_gate_up_k.iter().chain(&st.mrow_down_k).any(|k| k.0 == 0) {
+        if st
+            .mrow_gate_up_k
+            .iter()
+            .chain(&st.mrow_down_k)
+            .any(|k| k.0 == 0)
+        {
             return false;
         }
         // The shared expert rides the per-row NVFP4 chain (see below), which
@@ -692,7 +754,10 @@ impl MoeLayer {
         num_tokens: u32,
         stream: u64,
     ) -> Result<bool> {
-        let st = self.exl3.as_ref().expect("dispatch_exl3_verify without state");
+        let st = self
+            .exl3
+            .as_ref()
+            .expect("dispatch_exl3_verify without state");
         if !self.exl3_verify_is_batched(ctx, num_tokens) {
             return Ok(false);
         }
@@ -749,6 +814,7 @@ impl MoeLayer {
             .arg_u32(h)
             .arg_u32(top_k)
             .arg_u32(num_tokens)
+            .arg_u32(st.gate.bits)
             .launch(stream)?;
         // (2) ONE flat clamped SwiGLU over every slot of every row — same
         //     kernel, same same-index in-place map, just a wider extent.
@@ -777,6 +843,7 @@ impl MoeLayer {
             .arg_u32(inter)
             .arg_u32(top_k)
             .arg_u32(num_tokens)
+            .arg_u32(st.down.bits)
             .launch(stream)?;
 
         // ── Shared expert, one row at a time on the SAME single-row NVFP4

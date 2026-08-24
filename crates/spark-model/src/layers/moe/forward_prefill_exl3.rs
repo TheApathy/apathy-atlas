@@ -43,8 +43,8 @@
 use anyhow::{Context, Result, ensure};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::*;
 use super::exl3_decode::Exl3ProjTable;
+use super::*;
 
 /// Threads per block of the H128 row kernels (8 warps × one 128-chunk each).
 const H128_BLOCK: u32 = 256;
@@ -55,7 +55,7 @@ const H128_COLS_PER_BLOCK: u32 = 1024;
 fn launch_h128_pre(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
-    a: DevicePtr,                // [num_tokens, k] token-major (or sorted when gather is identity)
+    a: DevicePtr, // [num_tokens, k] token-major (or sorted when gather is identity)
     sorted_token_ids: DevicePtr, // NULL → identity gather (required for in-place)
     sorted_expert_ids: DevicePtr,
     suh_tab: DevicePtr,
@@ -182,6 +182,7 @@ impl MoeLayer {
                     .arg_ptr(pf.scratch)
                     .arg_u32(tab.n)
                     .arg_u32(tab.k)
+                    .arg_u32(tab.bits)
                     .launch(stream)?;
                 // Sub-range grouped GEMM: offsets are absolute rows, so the
                 // chunk's outputs land at their global sorted positions.

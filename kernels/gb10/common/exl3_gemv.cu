@@ -101,13 +101,12 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#define EXL3_BITS 3
-#define EXL3_TILE_U32 24  // 96 B per 16x16 tile
+#define EXL3_MAX_BITS 3
 #define EXL3_MCG_MULT 0xCBAC1FEDu
 #define EXL3_BLOCK 256
 #define EXL3_NSTRIP 128     // output columns per block (8 tiles of 16)
 #define EXL3_STAGE_ROWS 8   // tile-rows per cp.async stage (8*8*96 B = 6 KB = 1 chunk)
-#define EXL3_STAGE_U4 (EXL3_STAGE_ROWS * 8 * 6)  // 16-B copies per stage (384)
+#define EXL3_MAX_STAGE_U4 (EXL3_STAGE_ROWS * 8 * 2 * EXL3_MAX_BITS)
 #define EXL3_STAGES 3        // cp.async ring depth (round 4; see the barrier note below)
 #define EXL3_MAX_XCHUNKS 8   // x' smem superblock: 1024 k as __half2 pairs, 2 KB (refilled per superblock)
 #define EXL3_RSQRT128 0.088388347648f
@@ -148,16 +147,16 @@ struct Exl3LaneGeom {
     int ia, ib, s2;
 };
 
-__device__ __forceinline__ Exl3LaneGeom exl3_lane_geom(int lane) {
+__device__ __forceinline__ Exl3LaneGeom exl3_lane_geom(int lane, int bits) {
     int t = lane * 8;
-    int b1 = (t + 257) * EXL3_BITS;  // end of first window
+    int b1 = (t + 257) * bits;  // end of first window
     int b0 = b1 - 16;                // start of first window
-    int b2 = b1 + 7 * EXL3_BITS;     // end of last window
+    int b2 = b1 + 7 * bits;     // end of last window
     int i0 = b0 >> 5;
     int i2 = (b2 - 1) >> 5;
     Exl3LaneGeom g;
-    g.ia = i0 % EXL3_TILE_U32;
-    g.ib = i2 % EXL3_TILE_U32;
+    g.ia = i0 % (8 * bits);
+    g.ib = i2 % (8 * bits);
     g.s2 = (i2 + 1) * 32 - b2;
     return g;
 }
@@ -179,19 +178,19 @@ __device__ __forceinline__ Exl3LaneGeom exl3_lane_geom(int lane) {
 // funnel shift or by truncate-then-shift.
 __device__ __forceinline__ void exl3_dq8(const unsigned int* __restrict__ tile,
                                          const Exl3LaneGeom g, __half2& d01, __half2& d23,
-                                         __half2& d45, __half2& d67) {
+                                         __half2& d45, __half2& d67, int bits) {
     unsigned int a = tile[g.ia];
     unsigned int b = tile[g.ib];
     unsigned int mlo = __funnelshift_r(b, a, g.s2);  // s2 in {0,8,16,24} < 32
     unsigned int mhi = a >> g.s2;
     unsigned int w7 = mlo;
-    unsigned int w5 = __funnelshift_r(mlo, mhi, 2 * EXL3_BITS);
-    unsigned int w3 = __funnelshift_r(mlo, mhi, 4 * EXL3_BITS);
-    unsigned int w1 = __funnelshift_r(mlo, mhi, 6 * EXL3_BITS);
-    unsigned int w6 = w7 >> EXL3_BITS;
-    unsigned int w4 = w5 >> EXL3_BITS;
-    unsigned int w2 = w3 >> EXL3_BITS;
-    unsigned int w0 = w1 >> EXL3_BITS;
+    unsigned int w5 = __funnelshift_r(mlo, mhi, 2 * bits);
+    unsigned int w3 = __funnelshift_r(mlo, mhi, 4 * bits);
+    unsigned int w1 = __funnelshift_r(mlo, mhi, 6 * bits);
+    unsigned int w6 = w7 >> bits;
+    unsigned int w4 = w5 >> bits;
+    unsigned int w2 = w3 >> bits;
+    unsigned int w0 = w1 >> bits;
     d01 = exl3_decode2(w0 & 0xffff, w1 & 0xffff);
     d23 = exl3_decode2(w2 & 0xffff, w3 & 0xffff);
     d45 = exl3_decode2(w4 & 0xffff, w5 & 0xffff);
@@ -267,15 +266,17 @@ __device__ __forceinline__ void exl3_cp_commit() { asm volatile("cp.async.commit
 // it gains.
 __device__ __forceinline__ void exl3_load_stage(uint4* __restrict__ dst,
                                                 const uint4* __restrict__ trellis_u4, int r0,
-                                                int n_tiles_row, int nb0) {
-    const size_t base = ((size_t)r0 * n_tiles_row + nb0) * 6;
-#pragma unroll
-    for (int i = 0; i < (EXL3_STAGE_U4 + EXL3_BLOCK - 1) / EXL3_BLOCK; ++i) {
+                                                int n_tiles_row, int nb0, int bits) {
+    const int tile_u4 = 2 * bits;
+    const int row_u4 = 8 * tile_u4;
+    const int stage_u4 = EXL3_STAGE_ROWS * row_u4;
+    const size_t base = ((size_t)r0 * n_tiles_row + nb0) * tile_u4;
+    for (int i = 0; i < (EXL3_MAX_STAGE_U4 + EXL3_BLOCK - 1) / EXL3_BLOCK; ++i) {
         int idx = i * EXL3_BLOCK + (int)threadIdx.x;
-        if (idx >= EXL3_STAGE_U4) break;
-        int r = idx / 48;
-        int o = idx - r * 48;
-        exl3_cp_async_16(dst + idx, trellis_u4 + base + (size_t)r * n_tiles_row * 6 + o);
+        if (idx >= stage_u4) break;
+        int r = idx / row_u4;
+        int o = idx - r * row_u4;
+        exl3_cp_async_16(dst + idx, trellis_u4 + base + (size_t)r * n_tiles_row * tile_u4 + o);
     }
     exl3_cp_commit();
 }
@@ -321,7 +322,7 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     __nv_bfloat16* __restrict__ C,               // [N]
     float* __restrict__ ws,                      // [gridDim.y, N]
     int* __restrict__ counters,                  // [N/128]
-    unsigned int N, unsigned int K) {
+    unsigned int N, unsigned int K, unsigned int bits) {
     __shared__ __align__(16) __half2 s_x[EXL3_MAX_XCHUNKS * 64];            // 2 KB
     __shared__ __align__(16) unsigned short s_stage[EXL3_STAGES][EXL3_STAGE_ROWS * 8 * 48];  // 18 KB
     __shared__ float s_y[EXL3_NSTRIP];
@@ -350,10 +351,10 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     // Two stages in flight from the prologue; the third buffer stays free so
     // the steady-state loop can re-arm it BEFORE it computes (see below).
     const uint4* trellis_u4 = (const uint4*)trellis;
-    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, n_tiles_row, nb0);
+    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, n_tiles_row, nb0, bits);
     if (nstages > 1)
         exl3_load_stage((uint4*)s_stage[1], trellis_u4, rows_lo + EXL3_STAGE_ROWS,
-                        n_tiles_row, nb0);
+                        n_tiles_row, nb0, bits);
 
     // ---- Phase 1: x' for the first superblock (up to 1024 k) ----
     {
@@ -371,7 +372,7 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
     // — and therefore the fp32 result — is deterministic for a fixed grid.
     float acc0 = 0.0f;  // n = 16*warp + lane/4       (fp32 across chunks)
     float acc1 = 0.0f;  // n = 16*warp + lane/4 + 8
-    const Exl3LaneGeom g = exl3_lane_geom(lane);
+    const Exl3LaneGeom g = exl3_lane_geom(lane, bits);
     const int xkh = lane & 3;  // half2 (k-pair) index within the 16-k tile row
 
     // ROUND 4 — ONE block barrier per stage, prefetch distance 2.
@@ -414,7 +415,7 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
 
         if (s + 2 < nstages)
             exl3_load_stage((uint4*)s_stage[buf_fre], trellis_u4,
-                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, n_tiles_row, nb0);
+                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, n_tiles_row, nb0, bits);
 
         if (s != 0 && (s & (EXL3_MAX_XCHUNKS - 1)) == 0) {
             // Superblock boundary: refill x' for chunks [c_lo+s, +XCHUNKS).
@@ -438,9 +439,9 @@ __device__ __forceinline__ void exl3_gemv_m1_body(
         __half2 hacc1e = hz, hacc1o = hz;  // acc1, even/odd tile-row
 #pragma unroll
         for (int r = 0; r < EXL3_STAGE_ROWS; ++r) {
-            const unsigned int* tile = stage32 + (r * 8 + warp) * EXL3_TILE_U32;
+            const unsigned int* tile = stage32 + (r * 8 + warp) * (8 * bits);
             __half2 d01, d23, d45, d67;
-            exl3_dq8(tile, g, d01, d23, d45, d67);
+            exl3_dq8(tile, g, d01, d23, d45, d67, bits);
             __half2 xa = xrow[(r << 3)];      // k, k+1
             __half2 xc = xrow[(r << 3) + 4];  // k+8, k+9
             if (r & 1) {
@@ -530,8 +531,8 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1(
     __nv_bfloat16* __restrict__ C,               // [N]
     float* __restrict__ ws,                      // [gridDim.y, N]
     int* __restrict__ counters,                  // [N/128]
-    unsigned int N, unsigned int K) {
-    exl3_gemv_m1_body(A, trellis, suh, svh, C, ws, counters, N, K);
+    unsigned int N, unsigned int K, unsigned int bits) {
+    exl3_gemv_m1_body(A, trellis, suh, svh, C, ws, counters, N, K, bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -556,11 +557,11 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_idx(
     __nv_bfloat16* __restrict__ C,                    // [N]
     float* __restrict__ ws,                           // [gridDim.y, N]
     int* __restrict__ counters,                       // [N/128]
-    unsigned int N, unsigned int K) {
+    unsigned int N, unsigned int K, unsigned int bits) {
     const unsigned int e = indices[slot];
     exl3_gemv_m1_body(A, (const unsigned short*)trellis_tab[e],
                       (const __half*)suh_tab[e], (const __half*)svh_tab[e], C, ws,
-                      counters, N, K);
+                      counters, N, K, bits);
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +620,7 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_g
     __nv_bfloat16* __restrict__ up_out,                     // [top_k, N]
     float* __restrict__ ws,                                 // [gridDim.z, gridDim.y, N]
     int* __restrict__ counters,                             // [gridDim.z, N/128]
-    unsigned int N, unsigned int K) {
+    unsigned int N, unsigned int K, unsigned int bits) {
     const unsigned int group = blockIdx.z;
     const unsigned int slot = group >> 1;
     const unsigned int proj = group & 1u;  // 0 = gate, 1 = up
@@ -631,7 +632,7 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_g
     exl3_gemv_m1_body(A, (const unsigned short*)tt[e], (const __half*)su[e],
                       (const __half*)sv[e], C,
                       ws + (size_t)group * gridDim.y * N, counters + group * (N >> 7), N,
-                      K);
+                      K, bits);
 }
 
 // Fused down over all routed slots. Slot s consumes the SwiGLU activation row
@@ -645,13 +646,13 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_d
     __nv_bfloat16* __restrict__ down_out,                // [top_k, N]
     float* __restrict__ ws,                              // [gridDim.z, gridDim.y, N]
     int* __restrict__ counters,                          // [gridDim.z, N/128]
-    unsigned int N, unsigned int K) {
+    unsigned int N, unsigned int K, unsigned int bits) {
     const unsigned int slot = blockIdx.z;
     const unsigned int e = indices[slot];
     exl3_gemv_m1_body(act + (size_t)slot * K, (const unsigned short*)trellis_tab[e],
                       (const __half*)suh_tab[e], (const __half*)svh_tab[e],
                       down_out + (size_t)slot * N, ws + (size_t)slot * gridDim.y * N,
-                      counters + slot * (N >> 7), N, K);
+                      counters + slot * (N >> 7), N, K, bits);
 }
 
 // ===========================================================================
@@ -802,7 +803,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
     const unsigned int* __restrict__ s_slot,     // shared [MROW] from the gather
     unsigned int M,                              // gathered rows (<= MROW)
     unsigned int ws_row_mul, unsigned int ws_row_add, unsigned int top_k, unsigned int N,
-    unsigned int K) {
+    unsigned int K, unsigned int bits) {
     __shared__ __align__(16) __half2 s_x[MROW * EXL3_M_XCHUNKS * 64];
     __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 12 KB
     __shared__ float s_y[MROW][EXL3_NSTRIP];
@@ -828,10 +829,10 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
     // Kick the trellis pipeline before the x' pass — this is the ONE stream
     // the dedup exists to read once, so it starts first.
     const uint4* trellis_u4 = (const uint4*)trellis;
-    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, n_tiles_row, nb0);
+    exl3_load_stage((uint4*)s_stage[0], trellis_u4, rows_lo, n_tiles_row, nb0, bits);
     if (nstages > 1)
         exl3_load_stage((uint4*)s_stage[1], trellis_u4, rows_lo + EXL3_STAGE_ROWS,
-                        n_tiles_row, nb0);
+                        n_tiles_row, nb0, bits);
 
     // Per-row activation base. Read from smem at the point of use rather than
     // cached in an `A_row[MROW]` register array: it is touched only in the
@@ -861,7 +862,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         acc0[m] = 0.0f;
         acc1[m] = 0.0f;
     }
-    const Exl3LaneGeom g = exl3_lane_geom(lane);
+    const Exl3LaneGeom g = exl3_lane_geom(lane, bits);
     const int xkh = lane & 3;  // half2 (k-pair) index within the 16-k tile row
     // Surplus ladder rows alias x' slice 0 — defined arithmetic, discarded at
     // emit (the twin of the MXFP4 `act_row[m]` slice-0 aliasing).
@@ -907,10 +908,10 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         }
 #pragma unroll
         for (int r = 0; r < EXL3_STAGE_ROWS; ++r) {
-            const unsigned int* tile = stage32 + (r * 8 + warp) * EXL3_TILE_U32;
+            const unsigned int* tile = stage32 + (r * 8 + warp) * (8 * bits);
             __half2 d01, d23, d45, d67;
             // THE WIN: one 96-B tile decoded once, FMA'd into all M rows.
-            exl3_dq8(tile, g, d01, d23, d45, d67);
+            exl3_dq8(tile, g, d01, d23, d45, d67, bits);
 #pragma unroll
             for (int m = 0; m < MROW; ++m) {
                 const __half2* xrow = s_x + xoff[m] + xc;
@@ -948,7 +949,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         __syncthreads();
         if (s + 2 < nstages)
             exl3_load_stage((uint4*)s_stage[s & 1], trellis_u4,
-                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, n_tiles_row, nb0);
+                            rows_lo + (s + 2) * EXL3_STAGE_ROWS, n_tiles_row, nb0, bits);
     }
 
     // ---- Phase 3: reduce + (elected) output Hadamard + svh + store ----
@@ -1054,7 +1055,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         __nv_bfloat16* __restrict__ gate_out,                   /* [num_tokens*top_k, N] */  \
         __nv_bfloat16* __restrict__ up_out,                                                  \
         float* __restrict__ ws, int* __restrict__ counters, unsigned int N, unsigned int K,  \
-        unsigned int top_k, unsigned int num_tokens) {                                       \
+        unsigned int top_k, unsigned int num_tokens, unsigned int bits) {                    \
         const unsigned int total_routed = num_tokens * top_k;                                \
         const unsigned int group = blockIdx.z;                                               \
         const unsigned int y = group >> 1;                                                   \
@@ -1069,7 +1070,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         exl3_gemv_mrow_body<(MROW_), true>(                                                  \
             A, (const unsigned short*)tt[e], (const __half*)su[e], (const __half*)sv[e],     \
             proj ? up_out : gate_out, ws, counters + group * (N >> 7), slots, M, 2u, proj,   \
-            top_k, N, K);                                                                    \
+            top_k, N, K, bits);                                                              \
     }
 
 // Fused down over all routed slots. Slot s consumes the SwiGLU activation row
@@ -1084,7 +1085,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         const unsigned int* __restrict__ indices,                                            \
         __nv_bfloat16* __restrict__ down_out,                   /* [num_tokens*top_k, N] */  \
         float* __restrict__ ws, int* __restrict__ counters, unsigned int N, unsigned int K,  \
-        unsigned int top_k, unsigned int num_tokens) {                                       \
+        unsigned int top_k, unsigned int num_tokens, unsigned int bits) {                    \
         const unsigned int total_routed = num_tokens * top_k;                                \
         const unsigned int y = blockIdx.z;                                                   \
         unsigned int M = 0;                                                                  \
@@ -1094,7 +1095,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         exl3_gemv_mrow_body<(MROW_), false>(                                                 \
             act, (const unsigned short*)trellis_tab[e], (const __half*)suh_tab[e],           \
             (const __half*)svh_tab[e], down_out, ws, counters + y * (N >> 7), slots, M, 1u,  \
-            0u, top_k, N, K);                                                                \
+            0u, top_k, N, K, bits);                                                          \
     }
 
 // The ladder. An MROW=R entry is correct for ANY num_tokens <= R (an expert can
@@ -1133,15 +1134,16 @@ EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m8, 8)
 
 extern "C" __global__ void exl3_dequant_dump(const unsigned short* __restrict__ trellis,
                                              __half* __restrict__ Wout,  // [N, K]
-                                             unsigned int N, unsigned int K) {
+                                             unsigned int N, unsigned int K,
+                                             unsigned int bits) {
     const int nb = blockIdx.x;
     const int kb = blockIdx.y;
     const int lane = threadIdx.x & 31;
     const unsigned int* tile =
-        (const unsigned int*)(trellis + ((size_t)kb * (N >> 4) + nb) * 48);
-    Exl3LaneGeom g = exl3_lane_geom(lane);
+        (const unsigned int*)(trellis + ((size_t)kb * (N >> 4) + nb) * (16 * bits));
+    Exl3LaneGeom g = exl3_lane_geom(lane, bits);
     __half2 d01, d23, d45, d67;
-    exl3_dq8(tile, g, d01, d23, d45, d67);
+    exl3_dq8(tile, g, d01, d23, d45, d67, bits);
     size_t krow = (size_t)kb * 16 + 2 * (lane & 3);
     size_t na = (size_t)nb * 16 + (lane >> 2);
     size_t nc = na + 8;
@@ -1253,7 +1255,7 @@ extern "C" __global__ void exl3_dequant_chunk_bf16(
     const unsigned long long* __restrict__ trellis_tab,  // [num_experts]
     unsigned int e0, unsigned int count,
     __nv_bfloat16* __restrict__ Wout,  // [count, N, K] slot-major scratch
-    unsigned int N, unsigned int K) {
+    unsigned int N, unsigned int K, unsigned int bits) {
     const unsigned int slot = blockIdx.z;
     if (slot >= count) return;
     const int nb = blockIdx.x;
@@ -1261,10 +1263,10 @@ extern "C" __global__ void exl3_dequant_chunk_bf16(
     const int lane = threadIdx.x & 31;
     const unsigned short* trellis = (const unsigned short*)trellis_tab[e0 + slot];
     const unsigned int* tile =
-        (const unsigned int*)(trellis + ((size_t)kb * (N >> 4) + nb) * 48);
-    Exl3LaneGeom g = exl3_lane_geom(lane);
+        (const unsigned int*)(trellis + ((size_t)kb * (N >> 4) + nb) * (16 * bits));
+    Exl3LaneGeom g = exl3_lane_geom(lane, bits);
     __half2 d01, d23, d45, d67;
-    exl3_dq8(tile, g, d01, d23, d45, d67);
+    exl3_dq8(tile, g, d01, d23, d45, d67, bits);
     __nv_bfloat16* W = Wout + (unsigned long long)slot * N * K;
     size_t krow = (size_t)kb * 16 + 2 * (lane & 3);
     size_t na = (size_t)nb * 16 + (lane >> 2);

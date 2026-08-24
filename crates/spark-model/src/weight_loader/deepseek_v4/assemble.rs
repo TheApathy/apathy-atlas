@@ -619,8 +619,18 @@ pub(super) fn assemble_moe_subset(
     }
     // Router gate: a subset needs its `[ckpt_experts, h]` rows gathered down to
     // `[num_experts, h]` so router column `n` scores draft expert `n`.
+    let hf_mlp = if p.starts_with("layers.") {
+        format!("model.{p}.mlp")
+    } else {
+        format!("{p}.mlp")
+    };
+    let gate_key = if store.contains(&format!("{p}.ffn.gate.weight")) {
+        format!("{p}.ffn.gate.weight")
+    } else {
+        format!("{hf_mlp}.gate.weight")
+    };
     let gate = match expert_ids {
-        None => dense(store, &format!("{p}.ffn.gate.weight"))?,
+        None => dense(store, &gate_key)?,
         Some(ids) => gather_gate_rows(store, &format!("{p}.ffn.gate.weight"), ids, gpu)
             .with_context(|| format!("{p}: gathering compact-draft router gate rows"))?,
     };
@@ -655,15 +665,18 @@ pub(super) fn assemble_moe_subset(
     let mut exl3_experts: Vec<crate::weight_map::Exl3ExpertWeight> = Vec::new();
     let mut experts = Vec::with_capacity(config.num_experts);
     for e in 0..config.num_experts {
-        let ep = format!("{p}.ffn.experts.{}", expert_ids.map_or(e, |ids| ids[e]));
+        let ckpt_e = expert_ids.map_or(e, |ids| ids[e]);
+        let ep = format!("{p}.ffn.experts.{ckpt_e}");
         if exl3_detected {
             // EXL3 tiles load as-is (no transpose pass, no NVFP4 tables);
             // the legacy `experts` vec stays null — every dispatch that
             // would read it is fenced by the `Exl3Trellis` format tag.
-            exl3_experts.push(
+            let weight = if store.contains(&format!("{ep}.w1.rank0.trellis")) {
                 crate::weight_map::exl3_expert(store, &ep, gpu)
-                    .with_context(|| format!("DeepSeek-V4 EXL3 expert {e}"))?,
-            );
+            } else {
+                crate::weight_map::exl3_hf_expert(store, &format!("{hf_mlp}.experts.{ckpt_e}"), gpu)
+            };
+            exl3_experts.push(weight.with_context(|| format!("DeepSeek-V4 EXL3 expert {e}"))?);
             experts.push(ExpertWeight::null());
         } else if force_all_experts || config.is_local_expert(e) {
             let gate_proj = load_expert_proj(store, &format!("{ep}.w1"), gpu, qctx)

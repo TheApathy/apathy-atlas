@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! EXL3 trellis-coded (3.0 bpw) expert weight representation + loaders.
+//! EXL3 trellis-coded (2.0/3.0 bpw) expert weight representation + loaders.
 //!
 //! Ground truth is the reference tp1 checkpoint headers
 //! (`/home/flocka/sparkinfer-ref/data/tp1`, `quant_method: "exl3"`): each
@@ -34,7 +34,7 @@ pub const EXL3_MCG_MULT: u32 = 0xCBAC_1FED;
 /// computes `y[N] = W · x[K]` through the Hadamard/sign pipeline).
 #[derive(Debug, Clone, Copy)]
 pub struct Exl3Weight {
-    /// I16 `[K/16, N/16, 48]` trellis payload, device-resident as on disk.
+    /// I16 `[K/16, N/16, 16*bits]` trellis payload, device-resident as on disk.
     pub trellis: DevicePtr,
     /// F16 `[K]` input-side sign vector (native F16 — see loader exemption).
     pub suh: DevicePtr,
@@ -44,6 +44,8 @@ pub struct Exl3Weight {
     pub n: u32,
     /// Input columns.
     pub k: u32,
+    /// Trellis bitrate. K2 uses 32 I16 words/tile; K3 uses 48.
+    pub bits: u32,
 }
 
 /// Per-expert EXL3 triplet in Atlas naming: gate = checkpoint `w1`,
@@ -59,9 +61,22 @@ pub struct Exl3ExpertWeight {
 /// Keyed off the actual tensor, not `quantization_config`, so a mixed tree
 /// (e.g. our own future 144-expert quant) detects per layer.
 pub fn store_has_exl3_experts(store: &WeightStore, layer_prefix: &str) -> bool {
-    store.contains(&format!(
-        "{layer_prefix}.ffn.experts.0.w1.rank0.trellis"
-    ))
+    let hf_prefix = if layer_prefix.starts_with("layers.") {
+        format!("model.{layer_prefix}")
+    } else {
+        layer_prefix.to_string()
+    };
+    store.contains(&format!("{layer_prefix}.ffn.experts.0.w1.rank0.trellis"))
+        || store.contains(&format!("{hf_prefix}.mlp.experts.0.gate_proj.trellis"))
+}
+
+fn exl3_tensor_key(store: &WeightStore, prefix: &str, name: &str) -> String {
+    let ranked = format!("{prefix}.rank0.{name}");
+    if store.contains(&ranked) {
+        ranked
+    } else {
+        format!("{prefix}.{name}")
+    }
 }
 
 /// Load one EXL3 projection (`prefix` = `…ffn.experts.{E}.{w1|w2|w3}`).
@@ -70,24 +85,22 @@ pub fn store_has_exl3_experts(store: &WeightStore, layer_prefix: &str) -> bool {
 /// codebook selector against the compile-time constant, then returns the
 /// device pointers the store already landed (zero-copy — the tiles are
 /// consumed as-is by `exl3_gemv_m1`).
-pub fn exl3_weight(
-    store: &WeightStore,
-    prefix: &str,
-    gpu: &dyn GpuBackend,
-) -> Result<Exl3Weight> {
+pub fn exl3_weight(store: &WeightStore, prefix: &str, gpu: &dyn GpuBackend) -> Result<Exl3Weight> {
+    let trellis_key = exl3_tensor_key(store, prefix, "trellis");
     let trellis = store
-        .get(&format!("{prefix}.rank0.trellis"))
+        .get(&trellis_key)
         .with_context(|| format!("{prefix}: missing EXL3 trellis tensor"))?;
     ensure!(
         trellis.dtype == WeightDtype::Int16,
-        "{prefix}.rank0.trellis: dtype {:?} != I16",
+        "{trellis_key}: dtype {:?} != I16",
         trellis.dtype
     );
     ensure!(
-        trellis.shape.len() == 3 && trellis.shape[2] == 48,
-        "{prefix}.rank0.trellis: shape {:?} != [K/16, N/16, 48]",
+        trellis.shape.len() == 3 && matches!(trellis.shape[2], 32 | 48),
+        "{trellis_key}: shape {:?} is not K2/K3 [K/16, N/16, 32|48]",
         trellis.shape
     );
+    let bits = (trellis.shape[2] / 16) as u32;
     let k = (trellis.shape[0] * 16) as u32;
     let n = (trellis.shape[1] * 16) as u32;
     ensure!(
@@ -95,8 +108,9 @@ pub fn exl3_weight(
         "{prefix}: EXL3 GEMV requires N,K % 128 == 0 (got N={n}, K={k})"
     );
 
+    let suh_key = exl3_tensor_key(store, prefix, "suh");
     let suh = store
-        .get(&format!("{prefix}.rank0.suh"))
+        .get(&suh_key)
         .with_context(|| format!("{prefix}: missing EXL3 suh"))?;
     ensure!(
         suh.dtype == WeightDtype::F16 && suh.num_elements() == k as usize,
@@ -105,8 +119,9 @@ pub fn exl3_weight(
         suh.dtype,
         suh.shape
     );
+    let svh_key = exl3_tensor_key(store, prefix, "svh");
     let svh = store
-        .get(&format!("{prefix}.rank0.svh"))
+        .get(&svh_key)
         .with_context(|| format!("{prefix}: missing EXL3 svh"))?;
     ensure!(
         svh.dtype == WeightDtype::F16 && svh.num_elements() == n as usize,
@@ -117,8 +132,9 @@ pub fn exl3_weight(
 
     // mcg: scalar I32 codebook selector. The kernel hardcodes 0xCBAC1FED
     // (3INST cb=1); any other value means a codebook we do not decode.
+    let mcg_key = exl3_tensor_key(store, prefix, "mcg");
     let mcg = store
-        .get(&format!("{prefix}.rank0.mcg"))
+        .get(&mcg_key)
         .with_context(|| format!("{prefix}: missing EXL3 mcg"))?;
     ensure!(
         mcg.dtype == WeightDtype::Int32,
@@ -140,6 +156,7 @@ pub fn exl3_weight(
         svh: svh.ptr,
         n,
         k,
+        bits,
     })
 }
 
@@ -158,7 +175,9 @@ pub fn exl3_expert(
         gate_proj.n == up_proj.n
             && gate_proj.k == up_proj.k
             && down_proj.k == gate_proj.n
-            && down_proj.n == gate_proj.k,
+            && down_proj.n == gate_proj.k
+            && gate_proj.bits == up_proj.bits
+            && gate_proj.bits == down_proj.bits,
         "{ep}: inconsistent EXL3 expert dims — w1 [{}x{}], w3 [{}x{}], w2 [{}x{}]",
         gate_proj.n,
         gate_proj.k,
@@ -166,6 +185,31 @@ pub fn exl3_expert(
         up_proj.k,
         down_proj.n,
         down_proj.k
+    );
+    Ok(Exl3ExpertWeight {
+        gate_proj,
+        up_proj,
+        down_proj,
+    })
+}
+
+/// Load an expert using Hugging Face projection names.
+pub fn exl3_hf_expert(
+    store: &WeightStore,
+    ep: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<Exl3ExpertWeight> {
+    let gate_proj = exl3_weight(store, &format!("{ep}.gate_proj"), gpu)?;
+    let up_proj = exl3_weight(store, &format!("{ep}.up_proj"), gpu)?;
+    let down_proj = exl3_weight(store, &format!("{ep}.down_proj"), gpu)?;
+    ensure!(
+        gate_proj.n == up_proj.n
+            && gate_proj.k == up_proj.k
+            && down_proj.k == gate_proj.n
+            && down_proj.n == gate_proj.k
+            && gate_proj.bits == up_proj.bits
+            && gate_proj.bits == down_proj.bits,
+        "{ep}: inconsistent EXL3 expert dimensions"
     );
     Ok(Exl3ExpertWeight {
         gate_proj,

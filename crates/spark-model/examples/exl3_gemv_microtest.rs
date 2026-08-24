@@ -192,17 +192,18 @@ fn tile_kn(t: usize) -> (usize, usize) {
 /// [k_in_tile][n_in_tile]. Weight t is the 16-bit window ENDING at bit
 /// (t+257)*3 of the circular 768-bit stream; bit g of the stream lives in
 /// LE-u32 word g/32 at bit position 31 - g%32 (MSB-first within words).
-fn decode_tile(words: &[u16], lut: &[u16; 65536], out: &mut [[u16; 16]; 16]) {
+fn decode_tile(words: &[u16], bits: usize, lut: &[u16; 65536], out: &mut [[u16; 16]; 16]) {
+    let words32 = 8 * bits;
     let mut w32 = [0u32; 24];
-    for (j, w) in w32.iter_mut().enumerate() {
+    for (j, w) in w32.iter_mut().take(words32).enumerate() {
         *w = words[2 * j] as u32 | ((words[2 * j + 1] as u32) << 16);
     }
     let bit = |g: usize| -> u16 {
-        let g = g % 768;
+        let g = g % (256 * bits);
         ((w32[g >> 5] >> (31 - (g & 31))) & 1) as u16
     };
     for t in 0..256 {
-        let b0 = (t + 257) * 3 - 16;
+        let b0 = (t + 257) * bits - 16;
         let mut w16 = 0u16;
         for i in 0..16 {
             w16 = (w16 << 1) | bit(b0 + i);
@@ -318,6 +319,7 @@ fn launch_gemv(
         .arg_ptr(counters)
         .arg_u32(n as u32)
         .arg_u32(k as u32)
+        .arg_u32(3)
         .launch(stream)
 }
 
@@ -336,6 +338,57 @@ fn main() -> Result<()> {
     }
 
     let mut all_ok = true;
+
+    // K2 contract gate: validate the 64-byte tile geometry independently of
+    // the established K3 end-to-end suite below.
+    {
+        let (n, k, bits) = (128usize, 128usize, 2usize);
+        let mut r = Rng(0x4B32_0002);
+        let trellis: Vec<u16> = (0..(n / 16) * (k / 16) * 16 * bits)
+            .map(|_| r.u16())
+            .collect();
+        let mut expected = vec![0u16; n * k];
+        let mut tile = [[0u16; 16]; 16];
+        for kb in 0..k / 16 {
+            for nb in 0..n / 16 {
+                let base = (kb * (n / 16) + nb) * 16 * bits;
+                decode_tile(&trellis[base..base + 16 * bits], bits, &lut, &mut tile);
+                for (ki, row) in tile.iter().enumerate() {
+                    for (ni, value) in row.iter().enumerate() {
+                        expected[(nb * 16 + ni) * k + kb * 16 + ki] = *value;
+                    }
+                }
+            }
+        }
+        let bytes = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
+        let d_t = up(g, &bytes(&trellis))?;
+        let d_w = g.alloc(n * k * 2)?;
+        KernelLaunch::new(g, kh_dump)
+            .grid([(n / 16) as u32, (k / 16) as u32, 1])
+            .block([32, 1, 1])
+            .arg_ptr(d_t)
+            .arg_ptr(d_w)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(bits as u32)
+            .launch(stream)?;
+        g.synchronize(stream)?;
+        let mut got = vec![0u8; n * k * 2];
+        g.copy_d2h(d_w, &mut got)?;
+        let diff = got
+            .chunks_exact(2)
+            .map(|x| u16::from_le_bytes([x[0], x[1]]))
+            .zip(expected)
+            .filter(|(a, b)| *a != *b)
+            .count();
+        eprintln!(
+            "K2 GATE0 dequant bit-exact: diff={diff} {}",
+            if diff == 0 { "PASS" } else { "FAIL" }
+        );
+        all_ok &= diff == 0;
+        g.free(d_t)?;
+        g.free(d_w)?;
+    }
 
     for &(label, n, k) in SHAPES {
         let mut r = Rng(0xE7_1337 ^ ((n as u64) << 20) ^ k as u64);
@@ -358,7 +411,7 @@ fn main() -> Result<()> {
         for kb in 0..tiles_k {
             for nb in 0..tiles_n {
                 let base = (kb * tiles_n + nb) * 48;
-                decode_tile(&trellis_host[base..base + 48], &lut, &mut tile);
+                decode_tile(&trellis_host[base..base + 48], 3, &lut, &mut tile);
                 for (kit, row) in tile.iter().enumerate() {
                     for (nit, bits) in row.iter().enumerate() {
                         w_bits[(nb * 16 + nit) * k + kb * 16 + kit] = *bits;
@@ -415,6 +468,7 @@ fn main() -> Result<()> {
             .arg_ptr(d_w)
             .arg_u32(n as u32)
             .arg_u32(k as u32)
+            .arg_u32(3)
             .launch(stream)?;
         g.synchronize(stream)?;
         let mut w_gpu = vec![0u8; n * k * 2];
@@ -594,8 +648,12 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
     let trellis_h: Vec<Vec<u16>> = (0..ne)
         .map(|_| (0..trellis_words).map(|_| r.u16()).collect())
         .collect();
-    let suh_h: Vec<Vec<u16>> = (0..ne).map(|_| (0..k).map(|_| r.sign_f16()).collect()).collect();
-    let svh_h: Vec<Vec<u16>> = (0..ne).map(|_| (0..n).map(|_| r.sign_f16()).collect()).collect();
+    let suh_h: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..k).map(|_| r.sign_f16()).collect())
+        .collect();
+    let svh_h: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..n).map(|_| r.sign_f16()).collect())
+        .collect();
     let a_h: Vec<u16> = (0..tokens * k)
         .map(|_| bf16::from_f32((r.unit() - 0.5) * 0.5).to_bits())
         .collect();
@@ -613,7 +671,7 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
         for kb in 0..tiles_k {
             for nb in 0..tiles_n {
                 let base = (kb * tiles_n + nb) * 48;
-                decode_tile(&th[base..base + 48], lut, &mut tile);
+                decode_tile(&th[base..base + 48], 3, lut, &mut tile);
                 for (kit, row) in tile.iter().enumerate() {
                     for (nit, bits) in row.iter().enumerate() {
                         wb[(nb * 16 + nit) * k + kb * 16 + kit] = *bits;
@@ -629,15 +687,17 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
     for rr in 0..rows {
         let (tok, e) = (sti[rr] as usize, sei[rr] as usize);
         let x: Vec<f64> = (0..k)
-            .map(|kk| {
-                bf16::from_bits(a_h[tok * k + kk]).to_f64() * f16_to_f64(suh_h[e][kk])
-            })
+            .map(|kk| bf16::from_bits(a_h[tok * k + kk]).to_f64() * f16_to_f64(suh_h[e][kk]))
             .collect();
         let xp = had128(&x);
         let mut y0 = vec![0.0f64; n];
         for (nn, y) in y0.iter_mut().enumerate() {
             let row = &w_bits[e][nn * k..(nn + 1) * k];
-            *y = row.iter().zip(&xp).map(|(&wb, &v)| f16_to_f64(wb) * v).sum();
+            *y = row
+                .iter()
+                .zip(&xp)
+                .map(|(&wb, &v)| f16_to_f64(wb) * v)
+                .sum();
         }
         for (nn, &v) in had128(&y0).iter().enumerate() {
             y_ref[rr * n + nn] = v * f16_to_f64(svh_h[e][nn]);
@@ -647,10 +707,18 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
     // ---- upload ----
     let to_b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     let to_bi = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-    let d_trellis: Vec<DevicePtr> =
-        trellis_h.iter().map(|t| up(g, &to_b(t))).collect::<Result<_>>()?;
-    let d_suh: Vec<DevicePtr> = suh_h.iter().map(|t| up(g, &to_b(t))).collect::<Result<_>>()?;
-    let d_svh: Vec<DevicePtr> = svh_h.iter().map(|t| up(g, &to_b(t))).collect::<Result<_>>()?;
+    let d_trellis: Vec<DevicePtr> = trellis_h
+        .iter()
+        .map(|t| up(g, &to_b(t)))
+        .collect::<Result<_>>()?;
+    let d_suh: Vec<DevicePtr> = suh_h
+        .iter()
+        .map(|t| up(g, &to_b(t)))
+        .collect::<Result<_>>()?;
+    let d_svh: Vec<DevicePtr> = svh_h
+        .iter()
+        .map(|t| up(g, &to_b(t)))
+        .collect::<Result<_>>()?;
     let tab = |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
     let d_trellis_tab = up(g, &tab(&d_trellis))?;
     let d_suh_tab = up(g, &tab(&d_suh))?;
@@ -725,6 +793,7 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
             .arg_ptr(d_scratch)
             .arg_u32(n as u32)
             .arg_u32(k as u32)
+            .arg_u32(3)
             .launch(stream)?;
         g.synchronize(stream)?;
         let mut sc = vec![0u8; cnt * slot_bytes];
@@ -791,10 +860,9 @@ fn prefill_gates(g: &dyn GpuBackend, lut: &[u16; 65536]) -> Result<bool> {
             had128_f32_gpu(&mut buf);
             for (j, &v) in buf.iter().enumerate() {
                 let nn = c * 128 + j;
-                let want = bf16::from_f32(
-                    v * RSQRT128_F32 * half::f16::from_bits(svh_h[e][nn]).to_f32(),
-                )
-                .to_bits();
+                let want =
+                    bf16::from_f32(v * RSQRT128_F32 * half::f16::from_bits(svh_h[e][nn]).to_f32())
+                        .to_bits();
                 let idx = (rr * n + nn) * 2;
                 let got = u16::from_le_bytes([c_post[idx], c_post[idx + 1]]);
                 if got != want {
@@ -899,6 +967,7 @@ fn launch_gemv_idx(
         .arg_ptr(cnt)
         .arg_u32(n as u32)
         .arg_u32(k as u32)
+        .arg_u32(3)
         .launch(stream)
 }
 
@@ -929,7 +998,11 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
     // Distinct routed ids, deliberately NOT slot-ordered: a fused CTA must
     // resolve its expert from indices[slot] on device, not from blockIdx.
     let indices: Vec<u32> = vec![5, 0, 7, 2, 6, 1];
-    assert_eq!(indices.len(), top_k, "GATE8 index list must have top_k entries");
+    assert_eq!(
+        indices.len(),
+        top_k,
+        "GATE8 index list must have top_k entries"
+    );
     assert!(indices.iter().all(|&e| (e as usize) < ne));
 
     let kh_idx = g.kernel("exl3_gemv", "exl3_gemv_m1_idx")?;
@@ -942,27 +1015,26 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
     let mut owned: Vec<DevicePtr> = Vec::new();
 
     // Build the [ne] pointer tables for one projection of shape [n, k].
-    let build =
-        |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
-            let words = (k / 16) * (n / 16) * 48;
-            let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
-            for _ in 0..ne {
-                let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
-                let su: Vec<u16> = (0..k).map(|_| r.sign_f16()).collect();
-                let sv: Vec<u16> = (0..n).map(|_| r.sign_f16()).collect();
-                tp.push(up(g, &to_b(&t))?);
-                sup.push(up(g, &to_b(&su))?);
-                svp.push(up(g, &to_b(&sv))?);
-            }
-            let tab =
-                |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
-            let out = (up(g, &tab(&tp))?, up(g, &tab(&sup))?, up(g, &tab(&svp))?);
-            owned.extend(tp);
-            owned.extend(sup);
-            owned.extend(svp);
-            owned.extend([out.0, out.1, out.2]);
-            Ok(out)
-        };
+    let build = |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
+        let words = (k / 16) * (n / 16) * 48;
+        let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..ne {
+            let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
+            let su: Vec<u16> = (0..k).map(|_| r.sign_f16()).collect();
+            let sv: Vec<u16> = (0..n).map(|_| r.sign_f16()).collect();
+            tp.push(up(g, &to_b(&t))?);
+            sup.push(up(g, &to_b(&su))?);
+            svp.push(up(g, &to_b(&sv))?);
+        }
+        let tab =
+            |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
+        let out = (up(g, &tab(&tp))?, up(g, &tab(&sup))?, up(g, &tab(&svp))?);
+        owned.extend(tp);
+        owned.extend(sup);
+        owned.extend(svp);
+        owned.extend([out.0, out.1, out.2]);
+        Ok(out)
+    };
     let gate_t = build(&mut r, &mut owned, inter, h)?;
     let up_t = build(&mut r, &mut owned, inter, h)?;
     let down_t = build(&mut r, &mut owned, h, inter)?;
@@ -1012,22 +1084,24 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
         let up_row = d_upo.offset(slot as usize * inter * 2);
         let down_row = d_down.offset(slot as usize * h * 2);
         launch_gemv_idx(
-            g, kh_idx, stream, split_gu, d_a, gate_t, d_idx, slot, gate_row, d_ws, d_cnt,
-            inter, h,
+            g, kh_idx, stream, split_gu, d_a, gate_t, d_idx, slot, gate_row, d_ws, d_cnt, inter, h,
         )?;
         launch_gemv_idx(
             g, kh_idx, stream, split_gu, d_a, up_t, d_idx, slot, up_row, d_ws, d_cnt, inter, h,
         )?;
         launch_silu(g, kh_silu, stream, gate_row, up_row, gate_row, inter as u32)?;
         launch_gemv_idx(
-            g, kh_idx, stream, split_dn, gate_row, down_t, d_idx, slot, down_row, d_ws, d_cnt,
-            h, inter,
+            g, kh_idx, stream, split_dn, gate_row, down_t, d_idx, slot, down_row, d_ws, d_cnt, h,
+            inter,
         )?;
         launches_a += 4;
     }
     g.synchronize(stream)?;
-    let (mut a_gate, mut a_up, mut a_down) =
-        (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+    let (mut a_gate, mut a_up, mut a_down) = (
+        vec![0u8; gu_bytes],
+        vec![0u8; gu_bytes],
+        vec![0u8; dn_bytes],
+    );
     g.copy_d2h(d_gate, &mut a_gate)?;
     g.copy_d2h(d_upo, &mut a_up)?;
     g.copy_d2h(d_down, &mut a_down)?;
@@ -1054,8 +1128,17 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
             .arg_ptr(d_cnt)
             .arg_u32(inter as u32)
             .arg_u32(h as u32)
+            .arg_u32(3)
             .launch(stream)?;
-        launch_silu(g, kh_silu, stream, d_gate, d_upo, d_gate, (top_k * inter) as u32)?;
+        launch_silu(
+            g,
+            kh_silu,
+            stream,
+            d_gate,
+            d_upo,
+            d_gate,
+            (top_k * inter) as u32,
+        )?;
         KernelLaunch::new(g, kh_dn)
             .grid([(h / 128) as u32, split_dn, top_k as u32])
             .block([256, 1, 1])
@@ -1069,19 +1152,27 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
             .arg_ptr(d_cnt)
             .arg_u32(h as u32)
             .arg_u32(inter as u32)
+            .arg_u32(3)
             .launch(stream)?;
         g.synchronize(stream)?;
         Ok(3)
     };
     let launches_b = fused(g)?;
-    let (mut b_gate, mut b_up, mut b_down) =
-        (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+    let (mut b_gate, mut b_up, mut b_down) = (
+        vec![0u8; gu_bytes],
+        vec![0u8; gu_bytes],
+        vec![0u8; dn_bytes],
+    );
     g.copy_d2h(d_gate, &mut b_gate)?;
     g.copy_d2h(d_upo, &mut b_up)?;
     g.copy_d2h(d_down, &mut b_down)?;
 
     let diff = |x: &[u8], y: &[u8]| x.iter().zip(y).filter(|(a, b)| a != b).count();
-    let (dg, du, dd) = (diff(&a_gate, &b_gate), diff(&a_up, &b_up), diff(&a_down, &b_down));
+    let (dg, du, dd) = (
+        diff(&a_gate, &b_gate),
+        diff(&a_up, &b_up),
+        diff(&a_down, &b_down),
+    );
     // Guard against "both paths wrote nothing": each path starts from a
     // DIFFERENT poison byte, so an unwritten region cannot compare equal —
     // and the fused result must not still be the poison.
@@ -1096,8 +1187,11 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
     // Relaunch determinism on the fused path (per-group split-K scratch +
     // self-resetting counters must survive back-to-back launches).
     let _ = fused(g)?;
-    let (mut c_gate, mut c_up, mut c_down) =
-        (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+    let (mut c_gate, mut c_up, mut c_down) = (
+        vec![0u8; gu_bytes],
+        vec![0u8; gu_bytes],
+        vec![0u8; dn_bytes],
+    );
     g.copy_d2h(d_gate, &mut c_gate)?;
     g.copy_d2h(d_upo, &mut c_up)?;
     g.copy_d2h(d_down, &mut c_down)?;
@@ -1183,6 +1277,7 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(d_cnt)
                 .arg_u32(inter as u32)
                 .arg_u32(h as u32)
+                .arg_u32(3)
                 .launch(stream)
         };
         let launch_dn = || -> Result<()> {
@@ -1199,6 +1294,7 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(d_cnt)
                 .arg_u32(h as u32)
                 .arg_u32(inter as u32)
+                .arg_u32(3)
                 .launch(stream)
         };
         // Payload = trellis + suh/svh actually streamed by each launch.
@@ -1234,7 +1330,10 @@ fn fused_decode_gate(g: &dyn GpuBackend) -> Result<bool> {
         );
     }
 
-    for p in owned.into_iter().chain([d_a, d_idx, d_gate, d_upo, d_down, d_ws, d_cnt]) {
+    for p in owned
+        .into_iter()
+        .chain([d_a, d_idx, d_gate, d_upo, d_down, d_ws, d_cnt])
+    {
         let _ = g.free(p);
     }
     Ok(g8 && g8b && g8c)
@@ -1287,27 +1386,26 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
     let mut r = Rng(0x9A17_C0DE_2026_0812);
     let mut owned: Vec<DevicePtr> = Vec::new();
 
-    let build =
-        |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
-            let words = (k / 16) * (n / 16) * 48;
-            let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
-            for _ in 0..ne {
-                let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
-                let su: Vec<u16> = (0..k).map(|_| r.sign_f16()).collect();
-                let sv: Vec<u16> = (0..n).map(|_| r.sign_f16()).collect();
-                tp.push(up(g, &to_b(&t))?);
-                sup.push(up(g, &to_b(&su))?);
-                svp.push(up(g, &to_b(&sv))?);
-            }
-            let tab =
-                |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
-            let out = (up(g, &tab(&tp))?, up(g, &tab(&sup))?, up(g, &tab(&svp))?);
-            owned.extend(tp);
-            owned.extend(sup);
-            owned.extend(svp);
-            owned.extend([out.0, out.1, out.2]);
-            Ok(out)
-        };
+    let build = |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
+        let words = (k / 16) * (n / 16) * 48;
+        let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..ne {
+            let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
+            let su: Vec<u16> = (0..k).map(|_| r.sign_f16()).collect();
+            let sv: Vec<u16> = (0..n).map(|_| r.sign_f16()).collect();
+            tp.push(up(g, &to_b(&t))?);
+            sup.push(up(g, &to_b(&su))?);
+            svp.push(up(g, &to_b(&sv))?);
+        }
+        let tab =
+            |ps: &[DevicePtr]| -> Vec<u8> { ps.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
+        let out = (up(g, &tab(&tp))?, up(g, &tab(&sup))?, up(g, &tab(&svp))?);
+        owned.extend(tp);
+        owned.extend(sup);
+        owned.extend(svp);
+        owned.extend([out.0, out.1, out.2]);
+        Ok(out)
+    };
     let gate_t = build(&mut r, &mut owned, inter, h)?;
     let up_t = build(&mut r, &mut owned, inter, h)?;
     let down_t = build(&mut r, &mut owned, h, inter)?;
@@ -1321,18 +1419,27 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         match t {
             0 | 1 => base.to_vec(),
             2 => base.iter().rev().copied().collect(),
-            _ => (0..top_k).map(|s| base[(s + t) % top_k] ^ ((t as u32) & 1)).collect(),
+            _ => (0..top_k)
+                .map(|s| base[(s + t) % top_k] ^ ((t as u32) & 1))
+                .collect(),
         }
     };
     // Sanity: within a row the ids must be distinct (the routing invariant that
     // bounds a leader's gather by num_tokens) and inside [0, ne).
     for t in 0..*MROW_WIDTHS.last().unwrap() {
         let ids = row_ids(t);
-        assert!(ids.iter().all(|&e| (e as usize) < ne), "row {t} id out of range");
+        assert!(
+            ids.iter().all(|&e| (e as usize) < ne),
+            "row {t} id out of range"
+        );
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), top_k, "row {t} must route to top_k DISTINCT experts");
+        assert_eq!(
+            sorted.len(),
+            top_k,
+            "row {t} must route to top_k DISTINCT experts"
+        );
     }
 
     let max_m = *MROW_WIDTHS.last().unwrap();
@@ -1373,7 +1480,13 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         let gu_bytes = total_routed * inter * 2;
         let dn_bytes = total_routed * h * 2;
         let indices: Vec<u32> = (0..m).flat_map(row_ids).collect();
-        let d_idx = up(g, &indices.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;
+        let d_idx = up(
+            g,
+            &indices
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )?;
 
         let kh_gu_m = g.kernel("exl3_gemv", &format!("exl3_gemv_mrow_fused_gate_up_m{m}"))?;
         let kh_dn_m = g.kernel("exl3_gemv", &format!("exl3_gemv_mrow_fused_down_m{m}"))?;
@@ -1402,8 +1515,17 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_u32(h as u32)
                 .arg_u32(top_k as u32)
                 .arg_u32(m as u32)
+                .arg_u32(3)
                 .launch(stream)?;
-            launch_silu(g, kh_silu, stream, d_gate, d_upo, d_gate, (total_routed * inter) as u32)?;
+            launch_silu(
+                g,
+                kh_silu,
+                stream,
+                d_gate,
+                d_upo,
+                d_gate,
+                (total_routed * inter) as u32,
+            )?;
             KernelLaunch::new(g, kh_dn_m)
                 .grid([(h / 128) as u32, split_dn, total_routed as u32])
                 .block([256, 1, 1])
@@ -1419,12 +1541,16 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_u32(inter as u32)
                 .arg_u32(top_k as u32)
                 .arg_u32(m as u32)
+                .arg_u32(3)
                 .launch(stream)?;
             g.synchronize(stream)
         };
         mrow(g)?;
-        let (mut a_gate, mut a_up, mut a_down) =
-            (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+        let (mut a_gate, mut a_up, mut a_down) = (
+            vec![0u8; gu_bytes],
+            vec![0u8; gu_bytes],
+            vec![0u8; dn_bytes],
+        );
         g.copy_d2h(d_gate, &mut a_gate)?;
         g.copy_d2h(d_upo, &mut a_up)?;
         g.copy_d2h(d_down, &mut a_down)?;
@@ -1458,8 +1584,17 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(d_cnt)
                 .arg_u32(inter as u32)
                 .arg_u32(h as u32)
+                .arg_u32(3)
                 .launch(stream)?;
-            launch_silu(g, kh_silu, stream, gate_row, up_row, gate_row, (top_k * inter) as u32)?;
+            launch_silu(
+                g,
+                kh_silu,
+                stream,
+                gate_row,
+                up_row,
+                gate_row,
+                (top_k * inter) as u32,
+            )?;
             KernelLaunch::new(g, kh_dn_1)
                 .grid([(h / 128) as u32, split_dn, top_k as u32])
                 .block([256, 1, 1])
@@ -1473,11 +1608,15 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(d_cnt)
                 .arg_u32(h as u32)
                 .arg_u32(inter as u32)
+                .arg_u32(3)
                 .launch(stream)?;
         }
         g.synchronize(stream)?;
-        let (mut b_gate, mut b_up, mut b_down) =
-            (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+        let (mut b_gate, mut b_up, mut b_down) = (
+            vec![0u8; gu_bytes],
+            vec![0u8; gu_bytes],
+            vec![0u8; dn_bytes],
+        );
         g.copy_d2h(d_gate, &mut b_gate)?;
         g.copy_d2h(d_upo, &mut b_up)?;
         g.copy_d2h(d_down, &mut b_down)?;
@@ -1513,8 +1652,11 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         // Relaunch determinism: per-slot-keyed ws regions + self-resetting
         // counters across many concurrent groups must land the same every time.
         mrow(g)?;
-        let (mut c_gate, mut c_up, mut c_down) =
-            (vec![0u8; gu_bytes], vec![0u8; gu_bytes], vec![0u8; dn_bytes]);
+        let (mut c_gate, mut c_up, mut c_down) = (
+            vec![0u8; gu_bytes],
+            vec![0u8; gu_bytes],
+            vec![0u8; dn_bytes],
+        );
         g.copy_d2h(d_gate, &mut c_gate)?;
         g.copy_d2h(d_upo, &mut c_up)?;
         g.copy_d2h(d_down, &mut c_down)?;
@@ -1546,7 +1688,10 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         let _ = g.free(d_idx);
     }
 
-    for p in owned.into_iter().chain([d_a, d_gate, d_upo, d_down, d_ws, d_cnt]) {
+    for p in owned
+        .into_iter()
+        .chain([d_a, d_gate, d_upo, d_down, d_ws, d_cnt])
+    {
         let _ = g.free(p);
     }
     Ok(ok)
