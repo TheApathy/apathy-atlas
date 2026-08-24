@@ -63,13 +63,15 @@ immediately before measuring rather than trusting an earlier build.
   this and you must re-derive gamma from *its* `block_size` — the clap default
   is wrong for any drafter and silently degrades acceptance rather than failing.
 
-  **This drafter is not currently published.** It is a 4 GB local artifact, so
-  the exact 63.9 figure is not reproducible from a clean checkout by an outside
-  party without it; ask and we will publish it. The public
-  [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
-  drafter runs in this configuration and is the honest substitute, but it is a
-  different drafter and acceptance — hence tok/s — will differ. Everything else
-  in this harness is exact.
+  **Both drafters are published.**
+
+| Drafter | `--dflash-gamma` | tok/s |
+|---|---:|---:|
+| `onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2` (ours) | 15 | 63.9 |
+| `incoai/Qwen3.8-27B-DFlash2` (public, different family) | 7 | 43.9 |
+
+Derive gamma from your drafter's `block_size`; the DFlash2 drafter refuses 15
+and needs `GAMMA=7`. Everything else in this harness is exact.
 
 ## Run
 

@@ -51,7 +51,7 @@ same weights, same drafter:
 
 | Configuration | tok/s |
 |---|---:|
-| Full profile, our drafter (`--dflash-gamma 15`) | **63.9** |
+| Full profile, our drafter `Apathy-…-drafter-v2` (`--dflash-gamma 15`) | **63.9** |
 | Full profile, public `incoai/Qwen3.8-27B-DFlash2` (`--dflash-gamma 7`) | **43.9** |
 | No speculation, tuned kernels | 13.9 |
 | Speculative decoding on, **no tuning flags** | **8.8** |
@@ -157,15 +157,29 @@ does not transfer to discrete GPUs. Weights: `unsloth/Qwen3.8-27B-NVFP4` at
 revision `7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108` — pin it, upstream
 super-squashed the repo and older revisions 404. **You need a drafter** — it is the entire speedup (13.9 tok/s without one).
 
-The drafter behind the 63.9 figure is not published. The public
-[`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
-works and is what you should expect to reproduce: **43.9 tok/s**, measured here,
-deterministic over 5 reps. It is a different drafter family (`DFlash2DraftModel`,
-5 layers) and **caps at `--dflash-gamma 7`** — asking for 15 is refused by the
-loader with an explicit error, so pass `GAMMA=7` to the serve profile.
+Two work with this branch:
 
-If you want the 63.9 figure reproduced exactly, ask and we will publish the
-drafter.
+| Drafter | Gamma | tok/s | Notes |
+|---|---:|---:|---|
+| [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2) | `15` | **63.9** | ours, trained against this target |
+| [`incoai/Qwen3.8-27B-DFlash2`](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2) | `7` | **43.9** | public, different family |
+
+Both measured here on the published image, temp 0, median of 5 deterministic
+repetitions, same prompt.
+
+**Gamma is a property of the drafter, not a preference.** Derive it from the
+checkpoint's `block_size` (`trained_drafts = block_size - 1`). Ours is
+`block_size: 16` so it takes `--dflash-gamma 15`. The public DFlash2 drafter
+caps at 7 and the loader **refuses** 15 with an explicit error rather than
+degrading quietly — pass `GAMMA=7` to the serve profile when using it:
+
+```bash
+  -c 'BIN=/usr/local/bin/spark MODEL_DIR=/model DRAFT=/drafter PORT=8898 GAMMA=7 \
+      bash /harness/serve.sh --bind 0.0.0.0'
+```
+
+Getting gamma wrong in the other direction — leaving a CLI default in place —
+degrades acceptance silently, which is worse.
 
 ---
 
