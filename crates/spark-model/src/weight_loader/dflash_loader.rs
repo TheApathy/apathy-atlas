@@ -218,6 +218,84 @@ pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
     serde_json::from_str(json).context("Parsing DFlash drafter config.json")
 }
 
+/// Validate the checkpoint/runtime ABI before constructing a DFlash head.
+///
+/// Atlas's current DFlash implementation shares the target embedding and LM
+/// head with the drafter. Consequently, a checkpoint trained for another
+/// model family cannot be made compatible by merely changing capture layers:
+/// its hidden width and target vocabulary must also match. Keep this check
+/// ahead of scratch/KV allocation so an accidental Qwen-drafter + DeepSeek
+/// target pairing fails loudly instead of launching shape-incompatible GPU
+/// kernels.
+pub fn validate_dflash_pairing(
+    drafter: &DflashConfig,
+    target_hidden_size: usize,
+    target_vocab_size: usize,
+    target_num_hidden_layers: usize,
+    gamma: Option<usize>,
+) -> Result<()> {
+    anyhow::ensure!(
+        drafter.hidden_size == target_hidden_size,
+        "DFlash drafter hidden_size {} does not match target hidden_size {}; \
+         Atlas shares the target embedding and LM head, so this checkpoint was \
+         trained for a different target architecture",
+        drafter.hidden_size,
+        target_hidden_size,
+    );
+    anyhow::ensure!(
+        drafter.vocab_size == target_vocab_size,
+        "DFlash drafter vocab_size {} does not match target vocab_size {}; \
+         cross-vocabulary DFlash remapping is not implemented",
+        drafter.vocab_size,
+        target_vocab_size,
+    );
+    let draft_vocab_size = drafter.draft_vocab_size.unwrap_or(drafter.vocab_size);
+    anyhow::ensure!(
+        draft_vocab_size == target_vocab_size,
+        "DFlash draft_vocab_size {draft_vocab_size} does not match target vocab_size \
+         {target_vocab_size}; draft-to-target token remapping is not implemented"
+    );
+    anyhow::ensure!(
+        drafter.block_size >= 2,
+        "DFlash block_size {} must include at least one proposal and one target bonus row",
+        drafter.block_size,
+    );
+    let verify_width = gamma.unwrap_or(drafter.block_size);
+    anyhow::ensure!(
+        (2..=drafter.block_size).contains(&verify_width),
+        "DFlash verify width gamma={verify_width} is outside the checkpoint's trained \
+         range 2..={} (block_size)",
+        drafter.block_size,
+    );
+    let sub = drafter.dflash_config.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "DFlash drafter config.json has no `dflash_config`; mask token and target \
+             capture layers are required"
+        )
+    })?;
+    anyhow::ensure!(
+        sub.mask_token_id as usize < drafter.vocab_size,
+        "DFlash mask_token_id {} is outside vocab_size {}",
+        sub.mask_token_id,
+        drafter.vocab_size,
+    );
+    anyhow::ensure!(
+        !sub.target_layer_ids.is_empty(),
+        "DFlash dflash_config.target_layer_ids must not be empty"
+    );
+    for &layer_id in &sub.target_layer_ids {
+        // DFlash records HF output_hidden_states indices: 1 means the output
+        // of target layer 0, and N means the output of layer N-1.
+        anyhow::ensure!(
+            (1..=target_num_hidden_layers).contains(&layer_id),
+            "DFlash target_layer_id {layer_id} is invalid for a target with \
+             {target_num_hidden_layers} layers (expected HF hidden-state index \
+             1..={target_num_hidden_layers})"
+        );
+    }
+    Ok(())
+}
+
 /// Load DFlash drafter weights from a separate [`WeightStore`] pointing at
 /// the drafter checkpoint.
 ///
@@ -557,6 +635,57 @@ fn load_laguna_dflash_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config() -> DflashConfig {
+        DflashConfig {
+            hidden_size: 4096,
+            num_hidden_layers: 4,
+            intermediate_size: 11008,
+            num_attention_heads: 32,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            vocab_size: 129280,
+            draft_vocab_size: None,
+            tie_word_embeddings: false,
+            architectures: vec!["DFlashSpeculator".to_string()],
+            sliding_window: None,
+            block_size: 16,
+            dflash_config: Some(DflashSubConfig {
+                mask_token_id: 129000,
+                target_layer_ids: vec![1, 11, 22, 32, 43],
+                causal: false,
+            }),
+            rope_theta: default_rope_theta(),
+            rope_scaling: None,
+        }
+    }
+
+    #[test]
+    fn deepseek_native_dflash_pairing_is_accepted() {
+        validate_dflash_pairing(&test_config(), 4096, 129280, 43, Some(16)).unwrap();
+    }
+
+    #[test]
+    fn qwen_dflash_pairing_is_rejected_for_deepseek_target() {
+        let mut config = test_config();
+        config.hidden_size = 2048;
+        config.vocab_size = 248320;
+        let error = validate_dflash_pairing(&config, 4096, 129280, 43, Some(16))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different target architecture"), "{error}");
+    }
+
+    #[test]
+    fn dflash_pairing_rejects_untrained_verify_width() {
+        let error = validate_dflash_pairing(&test_config(), 4096, 129280, 43, Some(17))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outside the checkpoint's trained range"),
+            "{error}"
+        );
+    }
 
     /// Smoke-test the DFlash drafter `config.json` parser against the live
     /// `z-lab/Qwen3.6-35B-A3B-DFlash` checkpoint downloaded into the user's

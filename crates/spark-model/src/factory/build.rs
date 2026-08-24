@@ -96,6 +96,22 @@ pub fn build_model(
     // ── Step 1: Select weight loader (only model-specific dispatch) ──
     let loader = loader_for_config(&config)?;
 
+    // Validate the DFlash target/drafter ABI before allocating model scratch
+    // or KV. In particular, the current head shares the target embedding and
+    // LM head; pointing a Qwen DFlash2 checkpoint at DeepSeek would otherwise
+    // reach shape-incompatible GPU kernels.
+    if let Some(ref args) = dflash_args
+        && let Some(ref dcfg) = args.drafter_config
+    {
+        crate::weight_loader::dflash_loader::validate_dflash_pairing(
+            dcfg,
+            config.hidden_size,
+            config.vocab_size,
+            config.num_hidden_layers,
+            args.gamma,
+        )?;
+    }
+
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`
     // snapshot below: the pool allocation then lands in `used_so_far`, so

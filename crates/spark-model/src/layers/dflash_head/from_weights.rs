@@ -4,7 +4,8 @@
 //!
 //! Split out of `dflash_head.rs` for file-size budget. Contains
 //! [`BlockDiffusionDraftHead::from_weights`] (kernel resolution + KV
-//! cache setup) and [`BlockDiffusionDraftHead::validate_against_target`].
+//! cache setup). Target/drafter ABI validation runs in the factory through
+//! `weight_loader::dflash_loader::validate_dflash_pairing` before allocation.
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -959,20 +960,5 @@ impl BlockDiffusionDraftHead {
         }
 
         Ok(head)
-    }
-
-    /// Borrow-validate the drafter dimensions against the target's hidden_size
-    /// at construction time. Mismatch is a hard error — the `fc` projection
-    /// width is baked from `target_hidden_size` and a runtime mismatch would
-    /// produce silent garbage (vLLM's loader hits this same check).
-    pub fn validate_against_target(&self, target_hidden_size: usize) -> Result<()> {
-        if self.target_hidden_size != target_hidden_size {
-            anyhow::bail!(
-                "DFlash drafter target_hidden_size mismatch: drafter expects {}, target is {}",
-                self.target_hidden_size,
-                target_hidden_size
-            );
-        }
-        Ok(())
     }
 }
