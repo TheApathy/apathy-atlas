@@ -29,10 +29,11 @@
 # --kernel-target names a MODEL directory under kernels/<hw>/; passing the
 # hardware name (gb10) is rejected by the loader.
 #
-# STATUS: this image has been built and measured — a container-served instance
-# reaches 64.05 tok/s median on the published decode probe with byte-identical
-# output. The other eight per-model Dockerfiles under docker/gb10/ are untested;
-# see docker/docker-guide.md.
+# STATUS: this image has been built AND SERVED AND MEASURED — a container-served
+# instance reaches 64.05 tok/s median on the published decode probe with
+# byte-identical output. The other eight per-model Dockerfiles under docker/gb10/
+# all build with the correct kernel target, but none has been served.
+# See docker/docker-guide.md.
 
 # ── Build stage ──────────────────────────────────────────────────
 FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS builder

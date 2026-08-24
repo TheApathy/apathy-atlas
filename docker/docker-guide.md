@@ -17,24 +17,42 @@ docker/
 
 ## Which of these images have actually been built
 
-Being explicit, because "we ship a Dockerfile per model" and "we have built one"
-are different claims and only the second is worth anything to you:
+Being explicit, because "we ship a Dockerfile per model", "it builds", and "it
+serves the model" are three different claims and only the third is what you
+actually want:
 
-| Image | Status |
+| Image | Builds | Served and measured |
+|---|---|---|
+| `docker/gb10/Dockerfile` (multi-target) | yes | yes |
+| `docker/gb10/qwen3.8-27b/nvfp4/` | yes | **yes** — 64.05 tok/s median, byte-identical output, see [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) |
+| the other eight per-model Dockerfiles | **yes**, all eight, verified 2026-08-24 | **no** — never served |
+
+All nine per-model images were built on 2026-08-24 and each emitted the correct
+kernel target for its model:
+
+| Dockerfile | kernels compiled |
 |---|---|
-| `docker/gb10/Dockerfile` (multi-target) | built and exercised |
-| `docker/gb10/qwen3.8-27b/nvfp4/` | **built, and measured** — a container-served instance clears the published decode floor at 64.05 tok/s median with byte-identical output. See [`bench/qwen38-gb10/`](../bench/qwen38-gb10/) |
-| the other eight per-model Dockerfiles | **untested** — never built by us |
+| `nemotron-3-nano-30b-a3b` | 145 `(gb10, nemotron-3-nano-30b-a3b, nvfp4)` |
+| `nemotron-super-120b-a12b` | 145 `(gb10, nemotron-super-120b-a12b, nvfp4)` |
+| `qwen3-next-80b-a3b` | 145 `(gb10, qwen3-next-80b-a3b, nvfp4)` |
+| `qwen3-vl-30b-a3b` | 146 `(gb10, qwen3-vl-30b-a3b, nvfp4)` |
+| `qwen3.5-122b-a10b` | 146 `(gb10, qwen3.5-122b-a10b, nvfp4)` |
+| `qwen3.5-27b` | 145 `(gb10, qwen3.5-27b, nvfp4)` |
+| `qwen3.5-35b-a3b` | 145 `(gb10, qwen3.5-35b-a3b, nvfp4)` |
+| `qwen3.6-27b` | 150 `(gb10, qwen3.6-27b, nvfp4)` |
+| `qwen3.8-27b` | 151 `(gb10, qwen3.8-27b, nvfp4)` |
 
-That is not a guess about the untested eight. As of 2026-08-23 all nine per-model
-Dockerfiles carried two independent build-breaking bugs — a `COPY vendor/` of a
-directory deleted when the grammar stack went pure-Rust, and an
-`apt-get install "libnccl2 (>= 2.28)"` using dpkg dependency-field syntax that
-apt rejects outright. Both are now fixed in all nine, and one of the nine has
-since been built and measured. The other eight are *expected* to work and have
-not been demonstrated to.
+That is a real check and not a formality: until 2026-08-23 all nine carried two
+independent build-breaking bugs — a `COPY vendor/` of a directory deleted when
+the grammar stack went pure-Rust, and `apt-get install "libnccl2 (>= 2.28)"`
+using dpkg dependency-field syntax that apt rejects outright. Both are fixed, and
+the builds above are the evidence that they are.
 
-If you build one of the eight and it works, a PR saying so is welcome.
+**What has still not been demonstrated for the eight is that they serve.** None
+has had weights mounted or answered a request; most of those checkpoints are not
+on the machine that built them. A correct kernel-target line proves the build
+selected the right kernels, not that the model loads or decodes. If you serve one
+successfully, a PR saying so — with the model revision you used — is welcome.
 
 ## Prerequisites
 
