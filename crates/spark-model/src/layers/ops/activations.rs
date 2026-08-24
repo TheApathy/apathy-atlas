@@ -110,6 +110,55 @@ pub fn residual_add(
         .launch(stream)
 }
 
+/// Threads per row for [`direction_project`]. Must be a power of two: the
+/// block reduction halves the stride each round.
+const DIRECTION_PROJECT_BLOCK: u32 = 256;
+
+/// Directional projection on the residual stream, in place:
+///
+/// ```text
+/// h' = h - alpha * (h . d_hat) * d_hat
+/// ```
+///
+/// Removes the component of each row that lies along the unit direction
+/// `d_hat`. This is the runtime form of the rank-1 weight edit
+/// `dW = -alpha * d_hat (d_hat^T W)`, so a behavioural modification can ship
+/// as `hidden_size` floats applied at serve time rather than as a
+/// redistributed checkpoint.
+///
+/// `d_hat` MUST be L2-normalised — the kernel does not normalise it, and an
+/// unnormalised direction scales the subtraction by `||d||^2` instead of
+/// `||d||`. Callers should normalise once at load time.
+///
+/// The operation is self-limiting: a row orthogonal to `d_hat` has zero
+/// subtracted and is returned bit-identical.
+///
+/// Kernel: `bf16_direction_project(hidden, d_hat, alpha, hidden_size)`
+/// Grid: (rows, 1, 1)  Block: (256, 1, 1)  Shared: 256 * 4 bytes
+pub fn direction_project(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    hidden: DevicePtr,
+    d_hat: DevicePtr,
+    alpha: f32,
+    rows: u32,
+    hidden_size: u32,
+    stream: u64,
+) -> Result<()> {
+    if rows == 0 || hidden_size == 0 {
+        return Ok(());
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([rows, 1, 1])
+        .block([DIRECTION_PROJECT_BLOCK, 1, 1])
+        .shared_mem(DIRECTION_PROJECT_BLOCK * 4)
+        .arg_ptr(hidden)
+        .arg_ptr(d_hat)
+        .arg_f32(alpha)
+        .arg_u32(hidden_size)
+        .launch(stream)
+}
+
 /// BF16 → FP32 conversion: `dst[i] = (float)src[i]`.
 ///
 /// Kernel: `bf16_to_f32(src, dst, n)`
