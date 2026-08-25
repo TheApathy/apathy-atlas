@@ -51,6 +51,9 @@
 //! picks the identical top-k).
 
 use anyhow::{Result, bail};
+use spark_model::layers::moe::persistent_work::{
+    PersistentWork, WORK_SHARED, WORK_UP, gathered_experts, work_bucket,
+};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
@@ -85,9 +88,6 @@ const MROW_PERSIST: u32 = 6;
 const ITERS: usize = 200;
 const PERSISTENT_BLOCK: u32 = 256;
 const PERSISTENT_TASKS_PER_RECORD: u32 = SPLIT * 4;
-const WORK_COUNT_MASK: u32 = 0x7;
-const WORK_SHARED: u32 = 1 << 8;
-const WORK_UP: u32 = 1 << 9;
 
 struct Rng(u64);
 impl Rng {
@@ -203,65 +203,6 @@ fn build_table(gpu: &dyn GpuBackend, ws: &[Wt]) -> Result<Table> {
     })
 }
 
-/// Host-built, device-consumed work descriptor. Keeping the exact 48-byte
-/// layout here and in CUDA is part of the microtest contract: the persistent
-/// kernels do no pointer-table lookup and no routing scan.
-///
-/// `slots` is sized by `MROW_PERSIST`, NOT `MROW_MAX` — 6 u32 is what makes the
-/// struct 48 bytes, and the CUDA side hard-codes that. Widening the `_m` ladder
-/// to MROW=8 must not silently restride this.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(C, align(16))]
-struct PersistentWork {
-    packed: u64,
-    scale: u64,
-    scale2_bits: u32,
-    meta: u32,
-    slots: [u32; MROW_PERSIST as usize],
-}
-
-impl PersistentWork {
-    fn new(
-        packed: u64,
-        scale: u64,
-        scale2: f32,
-        count: usize,
-        shared: bool,
-        up: bool,
-        gathered: &[u32],
-    ) -> Self {
-        assert!((1..=MROW_PERSIST as usize).contains(&count));
-        assert_eq!(count, gathered.len());
-        let mut slots = [gathered[0]; MROW_PERSIST as usize];
-        slots[..count].copy_from_slice(gathered);
-        Self {
-            packed,
-            scale,
-            scale2_bits: scale2.to_bits(),
-            meta: count as u32
-                | if shared { WORK_SHARED } else { 0 }
-                | if up { WORK_UP } else { 0 },
-            slots,
-        }
-    }
-
-    fn count(self) -> usize {
-        (self.meta & WORK_COUNT_MASK) as usize
-    }
-
-    fn to_bytes(self) -> [u8; 48] {
-        let mut out = [0u8; 48];
-        out[0..8].copy_from_slice(&self.packed.to_le_bytes());
-        out[8..16].copy_from_slice(&self.scale.to_le_bytes());
-        out[16..20].copy_from_slice(&self.scale2_bits.to_le_bytes());
-        out[20..24].copy_from_slice(&self.meta.to_le_bytes());
-        for (i, slot) in self.slots.iter().enumerate() {
-            out[24 + i * 4..28 + i * 4].copy_from_slice(&slot.to_le_bytes());
-        }
-        out
-    }
-}
-
 #[derive(Clone, Copy)]
 enum WorkOrder {
     Leader,
@@ -270,18 +211,6 @@ enum WorkOrder {
 
 fn work_bytes(work: &[PersistentWork]) -> Vec<u8> {
     work.iter().flat_map(|record| record.to_bytes()).collect()
-}
-
-fn gathered_experts(routing: &[Vec<u32>]) -> Vec<(u32, Vec<u32>)> {
-    let mut groups: Vec<(u32, Vec<u32>)> = Vec::new();
-    for (slot, expert) in routing.iter().flatten().copied().enumerate() {
-        if let Some((_, slots)) = groups.iter_mut().find(|(e, _)| *e == expert) {
-            slots.push(slot as u32);
-        } else {
-            groups.push((expert, vec![slot as u32]));
-        }
-    }
-    groups
 }
 
 fn make_work(
@@ -361,16 +290,6 @@ struct PersistentWorkSet {
     down: [Option<DeviceWork>; 4],
     shared_gu: DeviceWork,
     shared_down: DeviceWork,
-}
-
-fn work_bucket(count: usize) -> usize {
-    match count {
-        1 => 0,
-        2 => 1,
-        3 | 4 => 2,
-        5 | 6 => 3,
-        _ => panic!("invalid persistent row count {count}"),
-    }
 }
 
 fn upload_work(gpu: &dyn GpuBackend, records: &[PersistentWork]) -> Result<DeviceWork> {

@@ -94,6 +94,14 @@ the K2 kernel's register footprint. The arithmetic order matches the single-row
 kernel by construction; live byte-parity and timing are still required before
 promotion.
 
+The next verifier experiment's 48-byte persistent expert-major work record is
+now a production module rather than a microbenchmark-local struct. CPU gates
+pin its 16-byte alignment, little-endian round trip, legal metadata bits,
+six-row ceiling, uniform top-k shape, unique experts within each row, and expert
+bounds. The microbenchmark consumes that shared ABI and still compiles. This is
+host-planning readiness only: production dispatch remains disabled until the
+live kernel clears the 213 GB/s microbenchmark floor and exact per-row parity.
+
 The DSpark hc-mean capture is now a 256-row circular serve history rather than
 `max_seq_len` rows. The checkpoint attends to only 128 capture positions, so
 the 1M-context allocation falls from 24.6 GB to 6 MiB without changing the
@@ -115,6 +123,36 @@ slot after 128 generated tokens.
    residency, quantization, and acceptance rate.
 7. The circular capture path passes long-context wrap parity on live GPU before
    the speculative 1M profile is promoted.
+
+The two-phase release harness keeps those gates usable on a single GPU. Run
+`bench/deepseek-v4/dflash_release_gate.py run` once against plain and once
+against DFlash2, using identical `--max-tokens` and `--reps`, then compare the
+JSON files. Comparison requires exact per-prompt output hashes, defaults to a
+65 tok/s decode floor, and requires at least 3.0 committed tokens per verify
+step from an `ATLAS_DSPARK_ACCEPT_LOG=1` server log. It never labels aggregate
+throughput as single-stream decode. Both runs must name the same immutable
+`--model-identity` and separately record their `--implementation-identity`.
+Reasoning deltas participate in both decode timing and output hashing, avoiding
+an inflated result when DeepSeek emits a long reasoning stream before content.
+Acceptance is parsed only from server-log bytes appended during that run, so a
+stale high-acceptance summary cannot promote a candidate. Result files are
+atomic and refuse overwrite unless `--overwrite` is explicit.
+
+## Long context contract
+
+The K2 checkpoint already declares 1,048,576 positions with 16x YaRN from an
+original 65,536-token window. Plain K2 and embedded DSpark therefore default to
+the full 1,048,576-token window (leaving generation room above a 1,000,000-token
+prompt); native DFlash2 remains at 131,072 by default because its
+five-layer context accumulator is not yet windowed.
+
+`bench/deepseek-v4/context_sweep.py --plan-only` validates that config and
+locks exact 8K, 128K, 250K, 512K, and 1M prompt hashes. The live pass places a
+unique retrieval needle near the midpoint, records retrieval success, TTFT,
+decode-only throughput, token counts, and output hashes. A memory-capacity
+claim does not pass the 1M gate without retrieval success. Plan records pin the
+config and tokenizer SHA-256 digests, refuse to overwrite by default, and are
+published atomically; pass `--overwrite` only for an intentional rerun.
 
 Upstream implementation reference:
 <https://github.com/tpurtell/ds4-mia-exl3-k2-1spark>

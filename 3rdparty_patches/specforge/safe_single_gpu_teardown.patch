@@ -1,0 +1,81 @@
+diff --git a/specforge/distributed.py b/specforge/distributed.py
+index fb5e882..f119132 100644
+--- a/specforge/distributed.py
++++ b/specforge/distributed.py
+@@ -3,7 +3,23 @@ from typing import Any, Optional
+
+ import torch
+ import torch.distributed as dist
+-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
++try:
++    from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
++except ImportError:  # single-GPU: sequence parallelism unused (GB10 local finetune)
++    class _SpPgStub:
++        ULYSSES_PG = None
++        RING_PG = None
++
++    PROCESS_GROUP = _SpPgStub()
++
++    def set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, *args, **kwargs):
++        if sp_ulysses_size > 1 or sp_ring_size > 1:
++            raise RuntimeError(
++                "yunchang not installed — sequence parallelism unavailable; "
++                "run with sp_ulysses_size=1 sp_ring_size=1"
++            )
++        # 1x1: no-op; downstream reads PROCESS_GROUP.ULYSSES_PG/RING_PG = None,
++        # which torch.distributed treats as the default group.
+
+ from specforge.utils import print_with_rank
+
+@@ -121,14 +137,44 @@ def init_distributed(
+
+
+ def destroy_distributed():
+-    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
+-    dist.destroy_process_group(_TP_GROUP)
+-    dist.destroy_process_group(_DP_GROUP)
+-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
+-    dist.destroy_process_group(_SP_RING_GROUP)
+-    dist.destroy_process_group(_DRAFT_DP_GROUP)
+-    dist.destroy_process_group(_DRAFT_SP_GROUP)
++    # ATLAS_SAFE_SINGLE_GPU_TEARDOWN: retained in paid-run bundle preflight.
++    """Destroy each non-default process group once, then the world group.
++
++    A one-rank mesh can return the same process-group object for multiple mesh
++    dimensions. Destroying every module global unconditionally therefore tries
++    to destroy an alias twice and turns a successfully saved training run into
++    a failing torchrun job. Keep teardown idempotent and leave the default
++    group until last.
++    """
++    global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP
++    global _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
++
++    if not dist.is_available() or not dist.is_initialized():
++        return
++
++    groups = (
++        _TP_GROUP,
++        _DP_GROUP,
++        _SP_ULYSSES_GROUP,
++        _SP_RING_GROUP,
++        _DRAFT_DP_GROUP,
++        _DRAFT_SP_GROUP,
++    )
++    seen = set()
++    for group in groups:
++        if group is None or group is dist.group.WORLD or id(group) in seen:
++            continue
++        seen.add(id(group))
++        try:
++            dist.destroy_process_group(group)
++        except ValueError:
++            # DeviceMesh may already have destroyed an aliased child group.
++            pass
++
+     dist.destroy_process_group()
++    _TP_GROUP = _DP_GROUP = None
++    _SP_ULYSSES_GROUP = _SP_RING_GROUP = None
++    _DRAFT_DP_GROUP = _DRAFT_SP_GROUP = None
+
+
+ def shard_tensor(

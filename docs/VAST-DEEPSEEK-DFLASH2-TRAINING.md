@@ -5,7 +5,7 @@
 - Vast instance `48572428` is a single H200 NVL with 143,771 MiB VRAM and
   400 GB disk.
 - The retained Qwen max-length retrain completed at
-  `/workspace/out/epoch_2_step_3784`. The final model was saved successfully;
+  `/workspace/out-v7/epoch_2_step_3784`. The final model was saved successfully;
   the nonzero process exit came afterward from duplicate distributed-process
   group destruction.
 - Account credit at preflight was $24.30. The instance costs $3.8444/hour,
@@ -37,10 +37,24 @@ Do not spend H200 compute until all of these exist and pass a one-batch probe:
 2. an explicit DeepSeek draft config accepted by SpecForge;
 3. a sufficiently large offline capture corpus produced by the exact EXL3 K2
    target that will serve with the drafter;
-4. a converter from Atlas capture records to SpecForge offline-hidden records;
+4. conversion of Atlas capture records to SpecForge offline-hidden records;
 5. an export check against Atlas's native DFlash2 pairing validator;
 6. a credit-floor watcher that stops instance 48572428 before the balance is
    exhausted.
+
+Run that watcher from the local control host before launching the paid job:
+
+```bash
+scripts/vast-credit-guard.py 48572428 --floor 4.00 --interval 60 --arm
+```
+
+The watcher is read-only without `--arm`. The training launcher also requires
+`CREDIT_GUARD_CONFIRM=1`, so merely recording `VAST_STOP_FLOOR` cannot be
+mistaken for an active stop guard.
+
+After capture, exercise the entire data/component/checkpoint-source gate without
+allocating CUDA by setting `PREFLIGHT_ONLY=1`. This mode exits immediately before
+the credit-guard confirmation and `torchrun`; invalid values are rejected.
 
 Prepare the compact target component bundle locally with:
 
@@ -56,6 +70,23 @@ the H200 unless the component shapes, five-capture config, corpus, and at least
 128 keyed hidden rows are present. Its CPU preflight rebuilds SpecForge's exact
 processed dataset and checks every keyed filename, BF16 dtype, and
 `[padded_tokens, 20480]` tensor shape. A raw count of `.pt` files is not enough.
+It also refuses a SpecForge snapshot missing the safe single-GPU teardown in
+`3rdparty_patches/specforge/safe_single_gpu_teardown.patch`; without it a fully
+saved run can be reported as failed when aliased process groups are destroyed
+twice.
+
+Before bundling, stream-hash the compact tensor values against the original
+DeepSeek checkpoint without loading either model:
+
+```bash
+scripts/validate-deepseek-dflash2-components.py \
+  /home/flocka/models/DeepSeek-V4-Flash-162B \
+  /home/flocka/models/DeepSeek-V4-DFlash2-target-components \
+  --report /home/flocka/models/DeepSeek-V4-DFlash2-target-components/component-parity.json
+```
+
+The report pins both BF16 value hashes, the tokenizer, and both weight indexes;
+include it through the `target-components` bundle entry.
 
 The same gate can be run before uploading anything:
 
@@ -65,9 +96,115 @@ SPECFORGE_PAD_TO=8192 scripts/validate-deepseek-dflash2-offline.py \
   --draft-config bench/deepseek-v4/deepseek-v4-dflash2.json \
   --target-components /home/flocka/models/DeepSeek-V4-DFlash2-target-components \
   --corpus /path/to/deepseek-corpus.jsonl --hidden-dir /path/to/hidden \
-  --cache-dir /path/to/cache --is-preformatted
+  --cache-dir /path/to/cache --limit 128
 ```
 
 The existing small `dspark_dump.bin` is diagnostic evidence, not a training
 corpus. DSpark's three HC-mean captures are also not interchangeable with an
 arbitrary native DFlash2 capture contract.
+
+## Exact capture recipe
+
+Use a private, plain-target server with five mHC-mean capture layers. Atlas
+model indices `[0,10,21,31,42]` correspond to the configured HF hidden-state
+IDs `[1,11,22,32,43]`. The mHC-aware collapse is required: between DeepSeek
+layers, `hidden_states()` is scratch while the live residual is the four-stream
+FP32 highway.
+
+```bash
+DFLASH_TRAIN_DUMP=/path/to/deepseek-dflash2.dump \
+MAX_SEQ_LEN=8192 MAX_PREFILL_TOKENS=1024 \
+scripts/exl3-serve.sh dflash2-capture
+
+scripts/capture-deepseek-dflash2-offline.py \
+  --specforge-dir /home/flocka/engines/SpecForge \
+  --target-components /home/flocka/models/DeepSeek-V4-DFlash2-target-components \
+  --corpus /path/to/deepseek-corpus.jsonl \
+  --dump /path/to/deepseek-dflash2.dump \
+  --hidden-dir /path/to/hidden --cache-dir /path/to/cache
+```
+
+The driver submits exact integer token IDs to `/v1/completions`, so there is no
+decode/re-tokenize drift. It consumes the flushed dump synchronously, converts
+the layer-major chunks to `[8192, 20480]` BF16, names each tensor with the same
+padded-token MD5 contract as SpecForge, and aborts on interleaved traffic. Run
+with `--limit 1` first, then pass the output through the validator before the
+full selected capture. At 8192 tokens each padded row is 320 MiB; the default
+`TRAIN_ROWS=128` needs about 40 GiB of disk. Capture, validation, and training
+all select the same prefix only *after* SpecForge's deterministic shuffle,
+tokenization, and minimum-loss-token filter. Passing `--limit 128` to capture
+therefore pairs with the launcher's default `TRAIN_ROWS=128`; training against
+the full 24,846-row source would require roughly 7.6 TiB of padded hidden rows
+and is intentionally not the default contract.
+Both CPU tools default to 128; passing `--limit 0` is the explicit, high-disk
+request to process every usable row.
+
+The canonical 24,846-row source corpus is pinned as SHA-256
+`2824835f81288541eaa6a97362cd7e308e6f7f80c001d8a871860506f15f1bde`.
+The paid launcher hashes it before dataset processing and records the digest in
+`run-contract.json`. A deliberate corpus replacement requires setting
+`EXPECTED_CORPUS_SHA256` to its reviewed digest; a content-addressed bundle by
+itself is insufficient because it can faithfully describe the wrong source.
+
+The 2026-08-25 CPU dry-run over the canonical corpus selected 128/128 unique
+rows, with 361–1,736 tokens per row and a 40.00 GiB padded-hidden projection.
+
+At the same audit the Vast volume had only 43 GB free because `/workspace/out`
+and `/workspace/out-v7` retained twelve roughly 20 GB Qwen checkpoints. That is
+not enough for both 40 GiB of hidden rows and a new roughly 20 GB checkpoint.
+`scripts/plan-checkpoint-prune.py /workspace/out /workspace/out-v7 --keep 1`
+produces a JSON-only retention plan; it never deletes. Review and authorize the
+exact candidate paths before reclaiming anything.
+
+Before reserving the capture GPU, append `--dry-run` to audit usable rows,
+duplicates, token bounds, cache identity, and exact padded-hidden disk cost.
+After an interrupted run, start a fresh empty dump server and pass `--resume`;
+completed keyed tensors are mmap shape/dtype checked and skipped before new
+requests are issued.
+
+The default corpus contract is a `conversations` JSONL dataset rendered with
+SpecForge's `deepseek-v3` template, matching this target's
+`<｜User｜>/<｜Assistant｜>` special tokens. For a corpus whose rows contain final
+rendered text, pass `--is-preformatted` to both capture and validation and set
+`IS_PREFORMATTED=1` for the Vast launcher. The launcher records this choice and
+otherwise defaults to `0`; capture and training must never disagree here.
+
+## Checksummed Vast handoff
+
+Build a manifest over the exact dirty SpecForge snapshot and every paid-run
+input immediately before upload. The manifest contains only relative paths,
+sizes, and SHA-256 digests; it does not capture Git credentials or `.git`.
+
+```bash
+scripts/deepseek-dflash2-bundle.py build \
+  --entry SpecForge=/home/flocka/engines/SpecForge \
+  --entry target-components=/home/flocka/models/DeepSeek-V4-DFlash2-target-components \
+  --entry deepseek-v4-dflash2.json=bench/deepseek-v4/deepseek-v4-dflash2.json \
+  --entry corpus.jsonl=/path/to/deepseek-corpus.jsonl \
+  --entry hidden=/path/to/hidden \
+  --entry train-deepseek-dflash2-vast.sh=scripts/train-deepseek-dflash2-vast.sh \
+  --entry validate-deepseek-dflash2-offline.py=scripts/validate-deepseek-dflash2-offline.py \
+  --entry validate-deepseek-dflash2-checkpoint.py=scripts/validate-deepseek-dflash2-checkpoint.py \
+  --entry validate-deepseek-dflash2-components.py=scripts/validate-deepseek-dflash2-components.py \
+  --entry deepseek-dflash2-bundle.py=scripts/deepseek-dflash2-bundle.py \
+  --output /path/to/bundle-manifest.json
+```
+
+Transfer the listed entries into matching names below
+`/workspace/deepseek-dflash2`, excluding SpecForge's `.git`, caches, and
+outputs. Upload the manifest, then verify on Vast before invoking the launcher:
+
+```bash
+python3 /workspace/deepseek-dflash2/deepseek-dflash2-bundle.py verify \
+  --manifest /workspace/deepseek-dflash2/bundle-manifest.json \
+  --root /workspace/deepseek-dflash2
+```
+
+This locks the modified SpecForge training driver as content, rather than
+pretending its upstream commit alone reproduces the paid run.
+
+The final CPU-only refresh on 2026-08-25 verified the remote handoff as 279
+files and 2,217,635,904 bytes. It includes the value-parity report for the
+compact target components and all three preflight validators. Rebuild and
+reverify this manifest after any input changes; those counts are evidence for
+this snapshot, not timeless constants.

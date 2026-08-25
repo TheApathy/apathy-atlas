@@ -13,6 +13,8 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
 
+pub mod persistent_work;
+
 /// Widest speculative verify the dedup'd multi-row `_t` MoE covers in one
 /// launch — the DDTree tree verify (6 spine rows + 2 branch).
 ///

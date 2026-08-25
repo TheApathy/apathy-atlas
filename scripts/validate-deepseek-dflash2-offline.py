@@ -19,7 +19,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=pathlib.Path, required=True)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--min-rows", type=int, default=128)
-    parser.add_argument("--chat-template", default="deepseek")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=128,
+        help="validate the same post-filter deterministic prefix captured for training",
+    )
+    parser.add_argument("--chat-template", default="deepseek-v3")
     parser.add_argument("--is-preformatted", action="store_true")
     parser.add_argument("--num-proc", type=int, default=1)
     return parser.parse_args()
@@ -27,6 +33,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.max_length <= 0 or args.min_rows <= 0 or args.num_proc <= 0:
+        raise RuntimeError("max-length, min-rows, and num-proc must be positive")
+    if args.limit < 0:
+        raise RuntimeError("limit must be non-negative")
     os.environ["SPECFORGE_PAD_TO"] = str(args.max_length)
     sys.path.insert(0, str(args.specforge_dir))
 
@@ -51,8 +61,13 @@ def main() -> None:
     for key in ("embed.weight", "head.weight"):
         shard = args.target_components / index["weight_map"][key]
         with safe_open(shard, framework="pt", device="cpu") as handle:
-            if list(handle.get_slice(key).get_shape()) != [129280, 4096]:
-                raise RuntimeError(f"invalid target component shape for {key}")
+            tensor = handle.get_slice(key)
+            shape = list(tensor.get_shape())
+            dtype = str(tensor.get_dtype())
+            if shape != [129280, 4096] or dtype != "BF16":
+                raise RuntimeError(
+                    f"invalid target component {key}: shape={shape} dtype={dtype}"
+                )
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.target_components, local_files_only=True
@@ -74,6 +89,8 @@ def main() -> None:
         num_proc=args.num_proc,
     )
     dataset = dataset.filter(lambda row: row["loss_mask"].sum() >= 32)
+    if args.limit:
+        dataset = dataset.select(range(min(args.limit, len(dataset))))
     if len(dataset) < args.min_rows:
         raise RuntimeError(
             f"only {len(dataset)} usable corpus rows; need at least {args.min_rows}"
@@ -122,6 +139,11 @@ def main() -> None:
         raise RuntimeError(
             f"{len(missing)}/{len(dataset)} corpus rows lack keyed hidden states; "
             f"first keys: {preview}"
+        )
+    if len(checked) < args.min_rows:
+        raise RuntimeError(
+            f"only {len(checked)} unique keyed hidden rows; need at least "
+            f"{args.min_rows} (corpus rows={len(dataset)})"
         )
     orphan_count = sum(
         1 for path in args.hidden_dir.glob("*.pt") if path.stem not in checked

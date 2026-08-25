@@ -47,13 +47,14 @@ case "$DRAFTER_KIND" in
   *) echo "DRAFTER_KIND must be auto, dspark, or dflash2" >&2; exit 2 ;;
 esac
 PORT="${PORT:-8977}"
-if [ -n "${GAMMA:-}" ]; then
-  # DSpark's current capture is `[3, max_seq_len, hidden]` BF16. Keep the
-  # speculative default resident until that absolute-position buffer becomes
-  # a windowed ring; plain K2 can still expose the checkpoint-native 1M YaRN.
+if [ -n "${GAMMA:-}" ] && [ "$DRAFTER_KIND" = dflash2 ]; then
+  # Native DFlash2 still owns a per-sequence five-layer context accumulator.
+  # Keep its default bounded until that accumulator is windowed.
   DEFAULT_MAX_SEQ_LEN=131072
 else
-  DEFAULT_MAX_SEQ_LEN=1000000
+  # Plain K2 and embedded DSpark both use the checkpoint-native 1M YaRN. The
+  # DSpark history is a fixed 256-row circular buffer, not max-seq-sized.
+  DEFAULT_MAX_SEQ_LEN=1048576
 fi
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-$DEFAULT_MAX_SEQ_LEN}"
 MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1024}"
@@ -64,6 +65,21 @@ ENV_ARGS=(
   ATLAS_EXL3_PREFILL_CHUNK=1
   ATLAS_KV_OVERCOMMIT=1
 )
+# Plain-target training capture. This deliberately reuses the mHC-aware
+# DSpark dump primitive with five DFlash target layers: DeepSeek keeps its
+# residual in four FP32 highway streams between layers, so copying the normal
+# single-stream hidden scratch would record stale data. Keep this server
+# private; the capture driver rejects any interleaved request records.
+if [ -n "${DFLASH_TRAIN_DUMP:-}" ]; then
+  if [ -n "${GAMMA:-}" ]; then
+    echo "DFLASH_TRAIN_DUMP requires a plain target run (unset GAMMA/DSPARK_TOKENS)" >&2
+    exit 2
+  fi
+  ENV_ARGS+=(
+    "ATLAS_DSPARK_DUMP=$DFLASH_TRAIN_DUMP"
+    "ATLAS_DSPARK_CAPTURE_LAYERS=0,10,21,31,42"
+  )
+fi
 if [ -n "${GAMMA:-}" ]; then
   ENV_ARGS+=(
     ATLAS_V4_ATTN_NVFP4=1
