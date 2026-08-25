@@ -1,7 +1,8 @@
 # Qwen3.8-27B single-stream decode on GB10 — reproduction
 
-Reproduces the **63.9 tok/s** median single-stream decode result for
-Qwen3.8-27B on a DGX Spark (GB10).
+Reproduces two measured single-stream decode profiles for Qwen3.8-27B on a
+DGX Spark (GB10): the historical BF16-KV v2 result at **63.9 tok/s**, and the
+full-vocabulary v3/NVFP4-KV Weschera result at **72.17 tok/s**.
 
 ```bash
 git clone https://github.com/TheApathy/apathy-atlas.git
@@ -69,6 +70,7 @@ immediately before measuring rather than trusting an earlier build.
 |---|---:|---:|
 | `onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2` (ours) | 15 | 63.9 |
 | `incoai/Qwen3.8-27B-DFlash2` (public, different family) | 7 | 43.9 |
+| `onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3` (ours) | 15 | 72.17 with the explicit NVFP4-KV profile |
 
 Derive gamma from your drafter's `block_size`; the DFlash2 drafter refuses 15
 and needs `GAMMA=7`. Everything else in this harness is exact.
@@ -86,6 +88,24 @@ python3 bench/qwen38-gb10/weschera_minheap_repro.py \
   --output /tmp/minheap.json \
   --repetitions 5 --max-tokens 400
 ```
+
+For the measured v3/full-vocabulary/NVFP4-KV profile, use the dedicated
+wrapper instead of changing historical defaults:
+
+```bash
+MODEL_DIR=/path/to/the/exact/optimized-qwen-target \
+DRAFT=/path/to/Apathy-Qwen3.8-27B-DFlash-drafter-v3 \
+./bench/qwen38-gb10/serve-v3-72tps.sh
+```
+
+Five measured rates were 70.6411, 72.1877, 72.2574, 72.0858, and 72.1689
+tok/s (median 72.1689). A subsequent unchanged-server ten-run gate measured
+72.3210 median with 0.987% coefficient of variation; all fifteen responses
+shared stable output SHA-256
+`f51d8358ea2a5c63353ca00a29208ae2cccd3039b070043cad514cc4af9761c4`.
+NVFP4 KV changes output versus BF16, so this is a fixed-probe speed result,
+not a quality-equivalence claim. See
+[`docs/QWEN38_WESCHERA_72TPS.md`](../../docs/QWEN38_WESCHERA_72TPS.md).
 
 The probe is single stream, greedy (temp 0), thinking off, and reports a
 median. It also hashes the completion so runs can be compared byte-for-byte;

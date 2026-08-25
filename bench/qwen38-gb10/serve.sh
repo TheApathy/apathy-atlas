@@ -38,6 +38,23 @@ KTARGET="${KTARGET:-qwen3.8-27b}"
 # 15 corresponds to a block_size=16 drafter. Asking for more than the drafter
 # was trained for is refused by the loader.
 GAMMA="${GAMMA:-15}"
+MODEL_NAME="${MODEL_NAME:-qwen38}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bf16}"
+KV_HIGH_PRECISION_LAYERS="${KV_HIGH_PRECISION_LAYERS:-0}"
+MTP_VOCAB="${MTP_VOCAB:-96000}"
+
+case "$KV_CACHE_DTYPE" in
+  bf16|fp8|nvfp4) ;;
+  *) echo "unsupported KV_CACHE_DTYPE: $KV_CACHE_DTYPE" >&2; exit 2 ;;
+esac
+[[ "$KV_HIGH_PRECISION_LAYERS" =~ ^[0-9]+$ ]] || {
+  echo "KV_HIGH_PRECISION_LAYERS must be a non-negative integer" >&2
+  exit 2
+}
+[[ "$MTP_VOCAB" =~ ^[1-9][0-9]*$ ]] || {
+  echo "MTP_VOCAB must be a positive integer" >&2
+  exit 2
+}
 
 exec env \
   ATLAS_FFN_TC=1 \
@@ -98,21 +115,23 @@ exec env \
   ATLAS_DDTREE_TREE_CONV_EXACT=0 \
   ATLAS_TREE_AWARE_ATTN=0 \
   ATLAS_MULTISEQ_GRAPHS=0 \
+  ATLAS_FFN_W3_LAYERS= \
+  ATLAS_FFN_W3_SIDECAR= \
   ATLAS_DFLASH_SPEC_CYCLE_V2=1 \
   ATLAS_WEIGHT_CACHE=1 \
   "$BIN" serve \
     --model-from-path "$MODEL_DIR" \
-    --model-name qwen38 --port "$PORT" \
+    --model-name "$MODEL_NAME" --port "$PORT" \
     --kernel-target "$KTARGET" \
     --gpu-memory-utilization 0.55 \
-    --kv-cache-dtype bf16 \
-    --kv-high-precision-layers 0 \
+    --kv-cache-dtype "$KV_CACHE_DTYPE" \
+    --kv-high-precision-layers "$KV_HIGH_PRECISION_LAYERS" \
     --max-seq-len 8192 \
     --max-batch-size 1 --max-num-seqs 1 \
     --dflash --draft-model "$DRAFT" \
     --dflash-gamma "$GAMMA" \
     --dflash-quantization nvfp4 \
-    --mtp-vocab 96000 \
+    --mtp-vocab "$MTP_VOCAB" \
     --max-thinking-budget 2048 \
     --request-timeout 300 \
     --disable-confidence-early-stop \
