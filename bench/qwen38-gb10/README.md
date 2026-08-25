@@ -2,7 +2,7 @@
 
 Reproduces two measured single-stream decode profiles for Qwen3.8-27B on a
 DGX Spark (GB10): the historical BF16-KV v2 result at **63.9 tok/s**, and the
-full-vocabulary v3/NVFP4-KV Weschera result at **72.17 tok/s**.
+full-vocabulary v3/NVFP4-KV Weschera result at **72.2518 tok/s**.
 
 ```bash
 git clone https://github.com/TheApathy/apathy-atlas.git
@@ -70,7 +70,7 @@ immediately before measuring rather than trusting an earlier build.
 |---|---:|---:|
 | `onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v2` (ours) | 15 | 63.9 |
 | `incoai/Qwen3.8-27B-DFlash2` (public, different family) | 7 | 43.9 |
-| `onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3` (ours) | 15 | 72.17 with the explicit NVFP4-KV profile |
+| `onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3` (ours) | 15 | 72.2518 with the explicit NVFP4-KV profile |
 
 Derive gamma from your drafter's `block_size`; the DFlash2 drafter refuses 15
 and needs `GAMMA=7`. Everything else in this harness is exact.
@@ -103,6 +103,9 @@ tok/s (median 72.1689). A subsequent unchanged-server ten-run gate measured
 72.3210 median with 0.987% coefficient of variation; all fifteen responses
 shared stable output SHA-256
 `f51d8358ea2a5c63353ca00a29208ae2cccd3039b070043cad514cc4af9761c4`.
+A 2026-08-25 requalification after the upstream TUI port measured 72.3670,
+72.4972, 72.2518, 72.2105, and 72.0784 tok/s (median 72.2518), retaining that
+same output hash across all five repetitions.
 NVFP4 KV changes output versus BF16, so this is a fixed-probe speed result,
 not a quality-equivalence claim. See
 [`docs/QWEN38_WESCHERA_72TPS.md`](../../docs/QWEN38_WESCHERA_72TPS.md).

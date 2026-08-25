@@ -8,8 +8,10 @@ grouped by subsystem, with the measured effect where one exists and an explicit
 If you only want the headline: **the fork turned a working dense inference
 engine into a speculative-decoding engine tuned for one machine (GB10) and one
 model family (Qwen3.x-27B). Single-stream decode on the MinHeap probe went from
-~48 tok/s at campaign start to 63.8–64.0 tok/s today, roughly 4× the
-no-speculation floor of 12.9 tok/s. The price is that the fork no longer commits
+~48 tok/s at campaign start to **72.2518 tok/s** on the current promoted
+v3/NVFP4-KV speed profile, roughly 5.6× the no-speculation floor of 12.9 tok/s.
+The older shipped v2/BF16-KV container profile remains 63.8–64.0 tok/s. The
+price is that the fork no longer commits
 the scalar-FMA oracle's tokens: the tensor-core verify path is a deliberate
 re-reference, frozen 2026-08-17 at content hash `12e0c0ad`, and the bit-exact
 path is still reachable but costs 27.2 vs 31.2 tok/s.**

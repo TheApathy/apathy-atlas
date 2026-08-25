@@ -1,6 +1,6 @@
 # Qwen3.8-27B on GB10 — production recipe and measurement record
 
-Status: current as of 2026-08-23. Every number here is measured on this box;
+Status: current as of 2026-08-25. Every number here is measured on this box;
 estimates are labelled as such. Where a lever was tested and found null, it is
 recorded as null — the negative results are the most expensive part of this
 document and the most useful.
@@ -16,11 +16,16 @@ MinHeap" prompt, single stream, greedy, thinking off, median of 5.
 |---|---:|---:|
 | Campaign start (2026-08) | ~48 | — |
 | Historical reference | 51.26 | 41.22 |
-| **Current production** | **63.96 / 63.77** | 43.33 |
+| Shipped v2/BF16-KV container | 63.96 / 63.77 | 45.94 |
 | Same, split-K off | 62.86 / 62.92 | — |
+| **Current promoted v3/NVFP4-KV speed profile** | **72.2518** | — |
 
-Two arms are quoted for the production rows because they were measured
-interleaved in one session; the spread is the run-to-run drift.
+Two arms are quoted for the v2 row because they were measured interleaved in
+one session; the spread is run-to-run drift. The promoted v3 number is the
+2026-08-25 median of 72.3670, 72.4972, 72.2518, 72.2105, and 72.0784 tok/s;
+all five outputs shared SHA-256
+`f51d8358ea2a5c63353ca00a29208ae2cccd3039b070043cad514cc4af9761c4`.
+It uses NVFP4 KV and is a speed profile, not a BF16 quality-equivalence claim.
 
 AEON v4 text suite, best full board (greedy + all serving fixes, 2026-08-23):
 

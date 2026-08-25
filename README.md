@@ -36,9 +36,10 @@
 
 > **`perf/qwen38-gb10-dflash`** — a fork branch tuned for one model
 > (Qwen3.8-27B NVFP4) on one machine (DGX Spark / GB10), using DFlash
-> speculative decoding. **63.9 tok/s single-stream**, reproduced from a clean
-> checkout and from the published container, byte-identical to the recorded
-> reference run.
+> speculative decoding. The current v3/NVFP4-KV speed profile measures
+> **72.2518 tok/s single-stream** on the canonical five-run Weschera probe,
+> with identical output hashes across all repetitions. The published v2/BF16-KV
+> container recipe below remains a separately reproduced 63.9 tok/s profile.
 >
 > This branch is **310 commits ahead of upstream** and is not a drop-in
 > replacement for it — see [`docs/FORK_VS_UPSTREAM.md`](docs/FORK_VS_UPSTREAM.md).
