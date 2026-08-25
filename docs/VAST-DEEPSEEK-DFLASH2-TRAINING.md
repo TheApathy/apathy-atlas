@@ -153,7 +153,7 @@ itself is insufficient because it can faithfully describe the wrong source.
 The 2026-08-25 CPU dry-run over the canonical corpus selected 128/128 unique
 rows, with 361–1,736 tokens per row and a 40.00 GiB padded-hidden projection.
 
-At the same audit the Vast volume had only 43 GB free because `/workspace/out`
+At the final read-only audit the Vast volume had only 42 GB free because `/workspace/out`
 and `/workspace/out-v7` retained twelve roughly 20 GB Qwen checkpoints. That is
 not enough for both 40 GiB of hidden rows and a new roughly 20 GB checkpoint.
 `scripts/plan-checkpoint-prune.py /workspace/out /workspace/out-v7 --keep 1`

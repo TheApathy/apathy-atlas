@@ -47,11 +47,12 @@ inference, capture, or benchmark was started during this hardening pass.
 ## Vast state and storage
 
 At the last read-only check, the instance was reachable and the inherited Qwen
-processes had exited. This does not authorize starting a DeepSeek GPU workload.
-Recheck ownership, free VRAM, credit, disk, and the bundle immediately before a
-paid action.
+processes had exited; no vLLM, torchrun, DFlash trainer, or pair generator was
+running. Vast credit was $144.77 and the volume had 42 GB free. This does not
+authorize starting a DeepSeek GPU workload. Recheck ownership, free VRAM,
+credit, disk, and the bundle immediately before a paid action.
 
-Only about 43 GB was free while twelve old Qwen checkpoints occupied
+Only 42 GB was free at the final check while twelve old Qwen checkpoints occupied
 `/workspace/out` and `/workspace/out-v7`. The non-destructive plan at
 `/workspace/checkpoint-prune-plan.json` identifies 212,869,128,140 bytes of old
 checkpoint candidates while retaining each directory's final step. Nothing was
