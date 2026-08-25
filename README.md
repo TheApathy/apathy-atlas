@@ -80,20 +80,22 @@ output hash across all five repetitions.
 
 ### Why the defaults are baked in
 
-The profile is 60 variables and they are not optional. Measured on this image,
-same weights and drafter:
+The tuned profile variables are not optional. Current branch measurements on
+the same GB10 are:
 
 | Configuration | tok/s |
 |---|---:|
-| Full profile (**the shipped default**) | **63.8** |
+| **Current promoted v3/NVFP4-KV full profile** | **72.2518** |
+| Published v2/BF16-KV container default | 63.8 |
 | Partial profile — gamma-derived vars missing | 13.5 |
 | No speculation, tuned kernels | 13.9 |
 | Speculation on, **no tuning at all** | 8.8 |
 
+The partial/untuned rows were measured with the published v2 container recipe;
+they demonstrate why speculative decoding needs its complete tuned environment.
 Speculation on an untuned verify path is *slower than no speculation*, and a
-partial profile is no better than turning it off. That is why they ship as
-image defaults rather than as a snippet to copy. Override any of them with
-`-e VAR=value`; every value is documented in
+partial profile is no better than turning it off. Override a container default
+with `-e VAR=value`; every value is documented in
 [`bench/qwen38-gb10/FLAGS.md`](bench/qwen38-gb10/FLAGS.md).
 
 If you change `--dflash-gamma`, also override `ATLAS_DFLASH_DRAFT_CAP=G` and
