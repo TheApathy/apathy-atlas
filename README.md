@@ -91,6 +91,16 @@ the same GB10 are:
 | No speculation, tuned kernels | 13.9 |
 | Speculation on, **no tuning at all** | 8.8 |
 
+The 72.2518 row uses the public
+[`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3)
+checkpoint (weights SHA-256
+`c15685d680bd58939689dcb4c344bb325efb75536df16d77c38517ce3df2dd6c`),
+gamma 15, full 248320 vocabulary, and NVFP4 target/drafter/KV. The exact five
+rates were 72.3670, 72.4972, 72.2518, 72.2105, and 72.0784 tok/s, with stable
+output SHA-256
+`f51d8358ea2a5c63353ca00a29208ae2cccd3039b070043cad514cc4af9761c4`.
+See the [full measured identity and reproduction record](docs/QWEN38_WESCHERA_72TPS.md).
+
 The partial/untuned rows were measured with the published v2 container recipe;
 they demonstrate why speculative decoding needs its complete tuned environment.
 Speculation on an untuned verify path is *slower than no speculation*, and a
