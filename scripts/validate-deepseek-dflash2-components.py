@@ -12,6 +12,7 @@ EXPECTED = {
     "embed.weight": [129280, 4096],
     "head.weight": [129280, 4096],
 }
+IDENTICAL_METADATA = ("tokenizer.json", "tokenizer_config.json", "generation_config.json")
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -51,6 +52,44 @@ def atomic_json(path: pathlib.Path, payload: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def validate_metadata(source: pathlib.Path, components: pathlib.Path) -> dict:
+    hashes = {}
+    for name in IDENTICAL_METADATA:
+        source_hash = sha256_file(source / name)
+        component_hash = sha256_file(components / name)
+        if source_hash != component_hash:
+            raise RuntimeError(f"component {name} differs from source")
+        hashes[name] = component_hash
+
+    source_config_hash = sha256_file(source / "config.json")
+    preserved_config = components / "deepseek_target_config.json"
+    if source_config_hash != sha256_file(preserved_config):
+        raise RuntimeError("deepseek_target_config.json differs from source config.json")
+    hashes["deepseek_target_config.json"] = source_config_hash
+
+    component_config_path = components / "config.json"
+    component_config = json.loads(component_config_path.read_text())
+    expected_fields = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "model_type": "qwen3",
+        "hidden_size": 4096,
+        "vocab_size": 129280,
+        "num_hidden_layers": 3,
+        "intermediate_size": 11008,
+        "head_dim": 128,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+    }
+    for key, expected in expected_fields.items():
+        if component_config.get(key) != expected:
+            raise RuntimeError(
+                f"component config {key}={component_config.get(key)!r}, "
+                f"expected {expected!r}"
+            )
+    hashes["config.json"] = sha256_file(component_config_path)
+    return hashes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=pathlib.Path)
@@ -86,16 +125,12 @@ def main() -> None:
             "value_sha256": source_meta[2],
         }
 
-    source_tokenizer = args.source / "tokenizer.json"
-    component_tokenizer = args.components / "tokenizer.json"
-    tokenizer_hash = sha256_file(source_tokenizer)
-    if tokenizer_hash != sha256_file(component_tokenizer):
-        raise RuntimeError("component tokenizer.json differs from source")
+    metadata_hashes = validate_metadata(args.source, args.components)
     report = {
         "format": "atlas-deepseek-dflash2-components-v1",
         "source_index_sha256": sha256_file(source_index_path),
         "component_index_sha256": sha256_file(component_index_path),
-        "tokenizer_sha256": tokenizer_hash,
+        "metadata_sha256": metadata_hashes,
         "tensors": tensors,
         "status": "ok",
     }

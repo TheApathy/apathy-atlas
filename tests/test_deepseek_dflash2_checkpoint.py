@@ -94,6 +94,26 @@ class DeepseekDflash2CheckpointTest(unittest.TestCase):
             shapes = CHECKPOINT.tensor_shapes(root)
         self.assertEqual(set(shapes), {"a", "b"})
 
+    def test_rejects_index_key_or_shard_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            save_file({"a": torch.zeros(1)}, root / "one.safetensors")
+            save_file({"b": torch.zeros(2)}, root / "two.safetensors")
+            index_path = root / "model.safetensors.index.json"
+            index_path.write_text(
+                json.dumps({"weight_map": {"a": "two.safetensors", "b": "one.safetensors"}})
+            )
+            with self.assertRaisesRegex(RuntimeError, "wrong shards"):
+                CHECKPOINT.tensor_shapes(root)
+
+            index_path.write_text(
+                json.dumps(
+                    {"weight_map": {"a": "one.safetensors", "b": "one.safetensors"}}
+                )
+            )
+            with self.assertRaisesRegex(RuntimeError, "keys differ"):
+                CHECKPOINT.tensor_shapes(root)
+
     def test_full_metadata_abi_passes_without_allocating_large_tensors(self):
         report = CHECKPOINT.validate_abi(self.valid_config(), self.valid_shapes())
         self.assertEqual(report["status"], "ok")

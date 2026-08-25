@@ -77,8 +77,39 @@ class DeepseekDflash2BundleTest(unittest.TestCase):
             BUNDLE.build([("component", source)], manifest)
             (target / "component").mkdir()
             (target / "component" / "weights").symlink_to(source / "weights")
-            with self.assertRaisesRegex(RuntimeError, "may not be a symlink"):
+            with self.assertRaisesRegex(RuntimeError, "may not contain a symlink"):
                 BUNDLE.verify(manifest, target)
+
+    def test_rejects_symlinked_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            outside = root / "outside"
+            source.mkdir()
+            target.mkdir()
+            outside.mkdir()
+            (source / "weights").write_bytes(b"abc")
+            (outside / "weights").write_bytes(b"abc")
+            manifest = root / "manifest.json"
+            BUNDLE.build([("component", source)], manifest)
+            (target / "component").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "may not contain a symlink"):
+                BUNDLE.verify(manifest, target)
+
+    def test_failed_atomic_replace_preserves_previous_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "weights").write_bytes(b"abc")
+            manifest = root / "manifest.json"
+            manifest.write_text("previous\n")
+            with mock.patch.object(BUNDLE.os, "replace", side_effect=OSError("full")):
+                with self.assertRaisesRegex(OSError, "full"):
+                    BUNDLE.build([("component", source)], manifest)
+            self.assertEqual(manifest.read_text(), "previous\n")
+            self.assertEqual(list(root.glob(".manifest.json.*.tmp")), [])
 
     def test_rejects_malformed_digest_before_reading_file(self):
         with tempfile.TemporaryDirectory() as tmp:

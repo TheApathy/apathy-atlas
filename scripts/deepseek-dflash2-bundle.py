@@ -4,7 +4,9 @@
 import argparse
 import hashlib
 import json
+import os
 import pathlib
+import tempfile
 
 
 EXCLUDED_PARTS = {".git", "__pycache__", ".pytest_cache", ".ruff_cache"}
@@ -37,10 +39,36 @@ def parse_entry(value: str) -> tuple[str, pathlib.Path]:
     name, raw_path = value.split("=", 1)
     if not name or "/" in name or name in {".", ".."}:
         raise argparse.ArgumentTypeError(f"invalid bundle entry name: {name!r}")
-    path = pathlib.Path(raw_path).resolve()
+    unresolved = pathlib.Path(raw_path).expanduser()
+    if unresolved.is_symlink():
+        raise argparse.ArgumentTypeError(
+            f"bundle entry itself may not be a symlink: {unresolved}"
+        )
+    path = unresolved.resolve()
     if not path.exists():
         raise argparse.ArgumentTypeError(f"bundle entry does not exist: {path}")
     return name, path
+
+
+def write_json_atomic(output: pathlib.Path, payload: dict) -> None:
+    """Replace a manifest only after its complete JSON is durable."""
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=output.parent, prefix=f".{output.name}.", suffix=".tmp", delete=False
+    ) as handle:
+        temporary = pathlib.Path(handle.name)
+        try:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def build(entries: list[tuple[str, pathlib.Path]], output: pathlib.Path) -> None:
@@ -66,11 +94,14 @@ def build(entries: list[tuple[str, pathlib.Path]], output: pathlib.Path) -> None
         "file_count": len(files),
         "total_bytes": total,
     }
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    write_json_atomic(output, payload)
     print(f"bundle manifest OK: files={len(files)} bytes={total} output={output}")
 
 
 def verify(manifest: pathlib.Path, root: pathlib.Path) -> None:
+    if root.is_symlink():
+        raise RuntimeError(f"bundle root may not be a symlink: {root}")
+    root_resolved = root.resolve()
     payload = json.loads(manifest.read_text())
     if payload.get("format") != "atlas-deepseek-dflash2-bundle-v1":
         raise RuntimeError("unsupported bundle manifest format")
@@ -109,9 +140,15 @@ def verify(manifest: pathlib.Path, root: pathlib.Path) -> None:
             raise RuntimeError(f"duplicate bundle path: {normalized}")
         declared_paths.add(normalized)
         declared_total += entry["bytes"]
-        path = root.joinpath(*relative.parts)
-        if path.is_symlink():
-            raise RuntimeError(f"bundle file may not be a symlink: {path}")
+        path = root
+        for part in relative.parts:
+            path = path / part
+            if path.is_symlink():
+                raise RuntimeError(f"bundle path may not contain a symlink: {path}")
+        try:
+            path.resolve().relative_to(root_resolved)
+        except ValueError as exc:
+            raise RuntimeError(f"bundle path escapes root: {path}") from exc
         if not path.is_file():
             raise RuntimeError(f"missing bundle file: {path}")
         if path.stat().st_size != entry["bytes"]:

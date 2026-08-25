@@ -20,14 +20,18 @@ inference, capture, or benchmark was started during this hardening pass.
   and reproduced 128 unique rows at 361–1,736 tokens and 40.00 GiB projected.
 - The compact embedding and LM-head components match their original tensors by
   streaming value hash. The report is shipped as
-  `target-components/component-parity.json`.
+  `target-components/component-parity.json`; it also pins tokenizer and
+  generation metadata, the preserved DeepSeek target config, and the compact
+  Qwen loader config ABI.
 - The launcher rejects corpus drift, missing or malformed BF16 components,
   incomplete hidden tensors, unpatched SpecForge, and incompatible final
   checkpoints. `PREFLIGHT_ONLY=1` exits before credit access or `torchrun`;
   paid execution additionally requires `CREDIT_GUARD_CONFIRM=1`.
-- The pre-capture Vast bundle verifies as 280 files and 2,217,651,951 bytes
+  Final checkpoint validation cross-checks every indexed tensor against its
+  declared shard and records SHA-256 for the config, index, and weight shards.
+- The pre-capture Vast bundle verifies as 280 files and 2,217,658,241 bytes
   beneath `/workspace/deepseek-dflash2`; its manifest SHA-256 is
-  `97f1e5069a389d8a7852c18bc119f14dfbfd1de21e8b15a39d207e6d17e13df9`.
+  `005bcb3c95f3785500f6518cb7bbfcda7683b23de4a358eebcbd1a07e09c1a00`.
   It must be rebuilt with the captured hidden directory before training.
 - The 1M context plan pins config, tokenizer, and prompt hashes and reserves
   generation headroom inside the declared 1,048,576-token YaRN window.

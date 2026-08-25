@@ -209,10 +209,12 @@ This locks the modified SpecForge training driver as content, rather than
 pretending its upstream commit alone reproduces the paid run.
 
 The final pre-capture CPU-only refresh on 2026-08-25 verified the remote
-handoff as 280 files and 2,217,651,951 bytes, with manifest SHA-256
-`97f1e5069a389d8a7852c18bc119f14dfbfd1de21e8b15a39d207e6d17e13df9`.
+handoff as 280 files and 2,217,658,241 bytes, with manifest SHA-256
+`005bcb3c95f3785500f6518cb7bbfcda7683b23de4a358eebcbd1a07e09c1a00`.
 It includes the value-parity report for the
 compact target components and all three preflight validators. Rebuild and
 reverify this manifest after any input changes. Rebuild it with the captured
 `hidden` directory before training; these pre-capture counts are evidence for
 this snapshot, not timeless constants.
+The builder publishes manifests atomically, and verification rejects symlinks
+at every declared path component rather than only checking the final file.
