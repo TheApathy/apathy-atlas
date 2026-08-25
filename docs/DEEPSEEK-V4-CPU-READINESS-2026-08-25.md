@@ -29,9 +29,11 @@ inference, capture, or benchmark was started during this hardening pass.
   paid execution additionally requires `CREDIT_GUARD_CONFIRM=1`.
   Final checkpoint validation cross-checks every indexed tensor against its
   declared shard and records SHA-256 for the config, index, and weight shards.
-- The pre-capture Vast bundle verifies as 280 files and 2,217,658,241 bytes
+  The launcher independently verifies the final bundle, requires at least 128
+  declared hidden tensors, and binds its manifest hash into the run contract.
+- The pre-capture Vast bundle verifies as 280 files and 2,217,662,913 bytes
   beneath `/workspace/deepseek-dflash2`; its manifest SHA-256 is
-  `005bcb3c95f3785500f6518cb7bbfcda7683b23de4a358eebcbd1a07e09c1a00`.
+  `1010ec482619052c561c2abef9ab911b8441d5fd99e65822fb3f6398fded82fe`.
   It must be rebuilt with the captured hidden directory before training.
 - The 1M context plan pins config, tokenizer, and prompt hashes and reserves
   generation headroom inside the declared 1,048,576-token YaRN window.

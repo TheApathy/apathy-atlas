@@ -128,14 +128,16 @@ The two-phase release harness keeps those gates usable on a single GPU. Run
 `bench/deepseek-v4/dflash_release_gate.py run` once against plain and once
 against DFlash2, using identical `--max-tokens` and `--reps`, then compare the
 JSON files. Comparison requires exact per-prompt output hashes, defaults to a
-65 tok/s decode floor, and requires at least 3.0 committed tokens per verify
+65 tok/s median single-run decode floor, rejects identical plain/candidate
+implementation identities, and requires at least 3.0 committed tokens per verify
 step from an `ATLAS_DSPARK_ACCEPT_LOG=1` server log. It never labels aggregate
 throughput as single-stream decode. Both runs must name the same immutable
 `--model-identity` and separately record their `--implementation-identity`.
 Reasoning deltas participate in both decode timing and output hashing, avoiding
 an inflated result when DeepSeek emits a long reasoning stream before content.
 Acceptance is parsed only from server-log bytes appended during that run, so a
-stale high-acceptance summary cannot promote a candidate. Result files are
+stale high-acceptance summary cannot promote a candidate; log truncation or
+rotation during measurement also fails closed. Result files are
 atomic and refuse overwrite unless `--overwrite` is explicit.
 
 ## Long context contract
@@ -152,7 +154,10 @@ unique retrieval needle near the midpoint, records retrieval success, TTFT,
 decode-only throughput, token counts, and output hashes. A memory-capacity
 claim does not pass the 1M gate without retrieval success. Plan records pin the
 config and tokenizer SHA-256 digests, refuse to overwrite by default, and are
-published atomically; pass `--overwrite` only for an intentional rerun.
+published atomically; pass `--overwrite` only for an intentional rerun. Every
+plan/live record requires immutable model and implementation identities, and a
+live run fails if the server's prompt-token count drifts, decode is not
+measurable, or retrieval misses.
 
 Upstream implementation reference:
 <https://github.com/tpurtell/ds4-mia-exl3-k2-1spark>

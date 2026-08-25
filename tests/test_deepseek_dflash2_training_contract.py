@@ -36,6 +36,11 @@ class DeepseekDflash2TrainingContractTest(unittest.TestCase):
         self.assertIn('--max-train-rows "$TRAIN_ROWS"', launcher)
         self.assertIn("2824835f81288541eaa6a97362cd7e308", launcher)
         self.assertIn("corpus SHA-256 mismatch", launcher)
+        self.assertIn('python3 "$BUNDLE_TOOL" verify', launcher)
+        self.assertIn("bundle declares only", launcher)
+        self.assertIn("bundle_manifest_sha256", launcher)
+        self.assertNotIn('assert cfg["', launcher)
+        self.assertIn('[[ "$MAX_LENGTH" == 8192 ]]', launcher)
         self.assertLess(
             launcher.index('if [[ "$PREFLIGHT_ONLY" == 1 ]]'),
             launcher.index("torchrun --standalone"),

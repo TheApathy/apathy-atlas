@@ -98,6 +98,32 @@ class DeepseekDflash2CaptureTest(unittest.TestCase):
             loaded = torch.load(output, weights_only=True)
             self.assertTrue(torch.equal(loaded, tensor))
 
+    def test_manifest_loader_rejects_partial_and_duplicate_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = pathlib.Path(tmp) / "capture-manifest.jsonl"
+            key = "a" * 32
+            manifest.write_text('{"key":"' + key + '"}\n{"key":')
+            with self.assertRaisesRegex(RuntimeError, "line 2"):
+                CAPTURE.load_capture_manifest(manifest)
+
+            manifest.write_text(
+                '{"key":"' + key + '"}\n{"key":"' + key + '"}\n'
+            )
+            with self.assertRaisesRegex(RuntimeError, "duplicate"):
+                CAPTURE.load_capture_manifest(manifest)
+
+    def test_manifest_append_is_fsynced_and_reloadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = pathlib.Path(tmp) / "capture-manifest.jsonl"
+            entry = {"key": "b" * 32, "tokens": 10}
+            with manifest_path.open("w") as manifest:
+                with mock.patch.object(CAPTURE.os, "fsync") as fsync:
+                    CAPTURE.append_manifest_entry(manifest, entry)
+                    fsync.assert_called_once_with(manifest.fileno())
+            self.assertEqual(
+                CAPTURE.load_capture_manifest(manifest_path)["b" * 32], entry
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,8 @@ CORPUS="${TRAIN_CORPUS:-$W/corpus.jsonl}"
 HIDDEN="${OFFLINE_HIDDEN_DIR:-$W/hidden}"
 OUT="${OUTPUT_DIR:-$W/out}"
 CACHE="${CACHE_DIR:-$W/cache}"
+BUNDLE_MANIFEST="${BUNDLE_MANIFEST:-$W/bundle-manifest.json}"
+BUNDLE_TOOL="${BUNDLE_TOOL:-$W/deepseek-dflash2-bundle.py}"
 EPOCHS="${EPOCHS:-2}"
 MAX_LENGTH="${MAX_LENGTH:-8192}"
 ACCUM="${ACCUMULATION_STEPS:-4}"
@@ -36,6 +38,8 @@ need_file "$TARGET/tokenizer.json"
 need_file "$TARGET/model.safetensors.index.json"
 need_file "$SCRIPT_DIR/validate-deepseek-dflash2-offline.py"
 need_file "$SCRIPT_DIR/validate-deepseek-dflash2-checkpoint.py"
+need_file "$BUNDLE_MANIFEST"
+need_file "$BUNDLE_TOOL"
 [[ -d "$HIDDEN" ]] || die "offline hidden directory is absent: $HIDDEN"
 case "$IS_PREFORMATTED" in
   0) FORMAT_ARGS=() ;;
@@ -46,11 +50,38 @@ esac
   || die "PREFLIGHT_ONLY must be 0 or 1"
 [[ "$TRAIN_ROWS" =~ ^[1-9][0-9]*$ ]] || die "TRAIN_ROWS must be a positive integer"
 (( TRAIN_ROWS >= 128 )) || die "TRAIN_ROWS must be at least 128"
+[[ "$EPOCHS" =~ ^[1-9][0-9]*$ ]] || die "EPOCHS must be a positive integer"
+[[ "$ACCUM" =~ ^[1-9][0-9]*$ ]] || die "ACCUMULATION_STEPS must be positive"
+[[ "$MAX_LENGTH" == 8192 ]] || die "MAX_LENGTH must be 8192 for captured-row ABI"
+[[ "$STOP_FLOOR" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || die "VAST_STOP_FLOOR must be a non-negative number"
 [[ "$EXPECTED_CORPUS_SHA256" =~ ^[0-9a-f]{64}$ ]] \
   || die "EXPECTED_CORPUS_SHA256 must be a lowercase SHA-256 digest"
 ACTUAL_CORPUS_SHA256="$(sha256sum "$CORPUS" | awk '{print $1}')"
 [[ "$ACTUAL_CORPUS_SHA256" == "$EXPECTED_CORPUS_SHA256" ]] \
   || die "corpus SHA-256 mismatch: got $ACTUAL_CORPUS_SHA256 expected $EXPECTED_CORPUS_SHA256"
+BUNDLE_SHA256="$(sha256sum "$BUNDLE_MANIFEST" | awk '{print $1}')"
+
+python3 "$BUNDLE_TOOL" verify --manifest "$BUNDLE_MANIFEST" --root "$W"
+python3 - "$BUNDLE_MANIFEST" "$TRAIN_ROWS" <<'PY'
+import json, pathlib, sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+train_rows = int(sys.argv[2])
+hidden = {
+    entry["path"]
+    for entry in manifest.get("files", [])
+    if isinstance(entry, dict)
+    and isinstance(entry.get("path"), str)
+    and entry["path"].startswith("hidden/")
+    and entry["path"].endswith(".pt")
+}
+if len(hidden) < train_rows:
+    raise RuntimeError(
+        f"bundle declares only {len(hidden)} hidden tensors; need {train_rows}"
+    )
+print(f"bundle hidden-state contract OK: {len(hidden)} declared tensors")
+PY
 
 python3 - "$CONFIG" "$TARGET" "$HIDDEN" "$TRAIN_ROWS" <<'PY'
 import json, pathlib, sys
@@ -59,12 +90,21 @@ from safetensors import safe_open
 config_path, target_dir, hidden_dir = map(pathlib.Path, sys.argv[1:4])
 train_rows = int(sys.argv[4])
 cfg = json.loads(config_path.read_text())
-assert cfg["hidden_size"] == 4096
-assert cfg["vocab_size"] == 129280
-assert cfg["num_target_layers"] == 43
-assert cfg["block_size"] == 16
-assert cfg["dflash_config"]["target_layer_ids"] == [1, 11, 22, 32, 43]
-assert cfg["dflash_config"]["mask_token_id"] == 129000
+expected = {
+    "hidden_size": 4096,
+    "vocab_size": 129280,
+    "num_target_layers": 43,
+    "num_hidden_layers": 3,
+    "block_size": 16,
+}
+for key, value in expected.items():
+    if cfg.get(key) != value:
+        raise RuntimeError(f"draft config {key}={cfg.get(key)!r}, expected {value!r}")
+dflash = cfg.get("dflash_config") or {}
+if dflash.get("target_layer_ids") != [1, 11, 22, 32, 43]:
+    raise RuntimeError(f"invalid target_layer_ids: {dflash.get('target_layer_ids')}")
+if dflash.get("mask_token_id") != 129000 or dflash.get("causal") is not False:
+    raise RuntimeError(f"invalid non-causal DFlash contract: {dflash!r}")
 
 index = json.loads((target_dir / "model.safetensors.index.json").read_text())
 weight_map = index["weight_map"]
@@ -107,9 +147,37 @@ grep -q 'ATLAS_SAFE_SINGLE_GPU_TEARDOWN' "$SF/specforge/distributed.py" \
   || die "SpecForge lacks safe single-GPU process-group teardown"
 
 mkdir -p "$OUT" "$CACHE"
-cat > "$OUT/run-contract.json" <<EOF
-{"epochs":$EPOCHS,"max_length":$MAX_LENGTH,"train_rows":$TRAIN_ROWS,"corpus_sha256":"$ACTUAL_CORPUS_SHA256","accumulation_steps":$ACCUM,"is_preformatted":$IS_PREFORMATTED,"stop_floor":$STOP_FLOOR,"target_layers":[1,11,22,32,43],"block_size":16}
-EOF
+python3 - "$OUT/run-contract.json" "$EPOCHS" "$MAX_LENGTH" "$TRAIN_ROWS" \
+  "$ACTUAL_CORPUS_SHA256" "$BUNDLE_SHA256" "$ACCUM" "$IS_PREFORMATTED" \
+  "$STOP_FLOOR" <<'PY'
+import json, os, pathlib, sys, tempfile
+
+output = pathlib.Path(sys.argv[1])
+payload = {
+    "epochs": int(sys.argv[2]),
+    "max_length": int(sys.argv[3]),
+    "train_rows": int(sys.argv[4]),
+    "corpus_sha256": sys.argv[5],
+    "bundle_manifest_sha256": sys.argv[6],
+    "accumulation_steps": int(sys.argv[7]),
+    "is_preformatted": int(sys.argv[8]),
+    "stop_floor": float(sys.argv[9]),
+    "target_layers": [1, 11, 22, 32, 43],
+    "block_size": 16,
+}
+with tempfile.NamedTemporaryFile(
+    mode="w", dir=output.parent, prefix=".run-contract.", delete=False
+) as handle:
+    temporary = pathlib.Path(handle.name)
+    json.dump(payload, handle, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+try:
+    os.replace(temporary, output)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SPECFORGE_PAD_TO="$MAX_LENGTH"

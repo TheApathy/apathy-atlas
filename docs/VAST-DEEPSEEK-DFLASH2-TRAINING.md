@@ -164,7 +164,9 @@ Before reserving the capture GPU, append `--dry-run` to audit usable rows,
 duplicates, token bounds, cache identity, and exact padded-hidden disk cost.
 After an interrupted run, start a fresh empty dump server and pass `--resume`;
 completed keyed tensors are mmap shape/dtype checked and skipped before new
-requests are issued.
+requests are issued. The capture manifest is parsed fail-closed, each durable
+row is fsynced, and resume repairs the specific crash window where a complete
+tensor was published just before its manifest record.
 
 The default corpus contract is a `conversations` JSONL dataset rendered with
 SpecForge's `deepseek-v3` template, matching this target's
@@ -207,10 +209,14 @@ python3 /workspace/deepseek-dflash2/deepseek-dflash2-bundle.py verify \
 
 This locks the modified SpecForge training driver as content, rather than
 pretending its upstream commit alone reproduces the paid run.
+The paid launcher re-runs verification itself, requires at least `TRAIN_ROWS`
+declared `hidden/*.pt` entries, and records the manifest SHA-256 in the atomic
+run contract. The pre-capture manifest therefore cannot authorize training;
+rebuild it with the completed hidden directory first.
 
 The final pre-capture CPU-only refresh on 2026-08-25 verified the remote
-handoff as 280 files and 2,217,658,241 bytes, with manifest SHA-256
-`005bcb3c95f3785500f6518cb7bbfcda7683b23de4a358eebcbd1a07e09c1a00`.
+handoff as 280 files and 2,217,662,913 bytes, with manifest SHA-256
+`1010ec482619052c561c2abef9ab911b8441d5fd99e65822fb3f6398fded82fe`.
 It includes the value-parity report for the
 compact target components and all three preflight validators. Rebuild and
 reverify this manifest after any input changes. Rebuild it with the captured

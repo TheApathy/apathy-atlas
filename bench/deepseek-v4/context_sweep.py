@@ -148,12 +148,37 @@ def stream_once(url: str, model: str, tokens: list[int], max_tokens: int) -> dic
     }
 
 
+def validate_live_runs(context: int, runs: list[dict]) -> list[str]:
+    failures = []
+    for index, run in enumerate(runs):
+        if run["prompt_tokens"] != context:
+            failures.append(
+                f"run {index}: server counted {run['prompt_tokens']} prompt tokens, "
+                f"expected {context}"
+            )
+        if run["completion_tokens"] <= 1 or run["decode_seconds"] <= 0:
+            failures.append(f"run {index}: no measurable decode interval")
+        if not run["retrieval_pass"]:
+            failures.append(f"run {index}: retrieval failed")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer", type=pathlib.Path, required=True)
     parser.add_argument("--config", type=pathlib.Path, required=True)
     parser.add_argument("--url", default="http://127.0.0.1:8977")
     parser.add_argument("--model", default="deepseek-v4-flash-k2")
+    parser.add_argument(
+        "--model-identity",
+        required=True,
+        help="immutable checkpoint revision or content hash",
+    )
+    parser.add_argument(
+        "--implementation-identity",
+        required=True,
+        help="binary plus launch-config identity",
+    )
     parser.add_argument("--contexts", default=",".join(map(str, DEFAULT_CONTEXTS)))
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--reps", type=int, default=1)
@@ -168,6 +193,8 @@ def main() -> None:
 
     if args.output.exists() and not args.overwrite:
         raise RuntimeError(f"refusing to overwrite existing output: {args.output}")
+    if not args.model_identity.strip() or not args.implementation_identity.strip():
+        raise RuntimeError("model and implementation identities must be non-empty")
 
     from transformers import PreTrainedTokenizerFast
 
@@ -205,6 +232,8 @@ def main() -> None:
             }
         )
     result = {
+        "model_identity": args.model_identity,
+        "implementation_identity": args.implementation_identity,
         "inputs": {
             "config_sha256": sha256_file(args.config),
             "tokenizer_sha256": sha256_file(tokenizer_file),
@@ -217,6 +246,7 @@ def main() -> None:
         },
         "plans": plans,
         "cases": {},
+        "status": "planned" if args.plan_only else "pass",
     }
     if not args.plan_only:
         for context in contexts:
@@ -231,12 +261,18 @@ def main() -> None:
                 "all_retrieval_pass": all(run["retrieval_pass"] for run in runs),
                 "runs": runs,
             }
+            failures = validate_live_runs(context, runs)
+            result["cases"][str(context)]["failures"] = failures
+            if failures:
+                result["status"] = "fail"
             print(
                 f"{context}: retrieval={result['cases'][str(context)]['all_retrieval_pass']} "
                 f"decode={result['cases'][str(context)]['median_decode_tok_s']:.2f} tok/s"
             )
     write_json_atomic(args.output, result)
     print(f"wrote {args.output}")
+    if result["status"] == "fail":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

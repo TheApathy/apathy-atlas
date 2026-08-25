@@ -53,6 +53,18 @@ class ContextSweepTests(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text()), {"status": "complete"})
             self.assertEqual(list(output.parent.glob("*.tmp")), [])
 
+    def test_live_validation_rejects_token_drift_and_retrieval_failure(self):
+        run = {
+            "prompt_tokens": 8191,
+            "completion_tokens": 1,
+            "decode_seconds": 0.0,
+            "retrieval_pass": False,
+        }
+        failures = MODULE.validate_live_runs(8192, [run])
+        self.assertTrue(any("expected 8192" in item for item in failures))
+        self.assertTrue(any("no measurable" in item for item in failures))
+        self.assertTrue(any("retrieval failed" in item for item in failures))
+
 
 if __name__ == "__main__":
     unittest.main()

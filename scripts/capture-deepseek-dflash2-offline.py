@@ -149,6 +149,39 @@ def save_tensor_atomic(torch, tensor, output: pathlib.Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def load_capture_manifest(path: pathlib.Path) -> dict[str, dict]:
+    entries = {}
+    if not path.exists():
+        return entries
+    with path.open() as handle:
+        for line_number, line in enumerate(handle, 1):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"invalid capture manifest JSON at line {line_number}"
+                ) from exc
+            key = entry.get("key") if isinstance(entry, dict) else None
+            if (
+                not isinstance(key, str)
+                or len(key) != 32
+                or any(char not in "0123456789abcdef" for char in key)
+            ):
+                raise RuntimeError(
+                    f"invalid capture manifest key at line {line_number}: {key!r}"
+                )
+            if key in entries:
+                raise RuntimeError(f"duplicate capture manifest key: {key}")
+            entries[key] = entry
+    return entries
+
+
+def append_manifest_entry(manifest, entry: dict) -> None:
+    manifest.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    manifest.flush()
+    os.fsync(manifest.fileno())
+
+
 def read_prefill_row(
     dump,
     torch,
@@ -289,7 +322,12 @@ def main() -> None:
     width = len(capture_layers) * 4096
     manifest_path = args.hidden_dir / "capture-manifest.jsonl"
     manifest_mode = "a" if args.resume else "x"
+    manifest_entries = load_capture_manifest(manifest_path) if args.resume else {}
+    manifest_keys = set(manifest_entries)
     created_keys = set()
+    for key in manifest_keys:
+        if not (args.hidden_dir / f"{key}.pt").is_file():
+            raise RuntimeError(f"capture manifest references missing hidden row: {key}")
     with (
         args.dump.open("rb", buffering=0) as dump,
         manifest_path.open(manifest_mode) as manifest,
@@ -311,6 +349,7 @@ def main() -> None:
                 ]
             )
             key = hashlib.md5(padded_ids.numpy().tobytes()).hexdigest()
+            input_sha256 = hashlib.sha256(padded_ids.numpy().tobytes()).hexdigest()
             output = args.hidden_dir / f"{key}.pt"
             if output.exists():
                 if key in created_keys:
@@ -333,6 +372,23 @@ def main() -> None:
                         f"{(args.max_length, width)}"
                     )
                 created_keys.add(key)
+                entry = {
+                    "row": row_index,
+                    "key": key,
+                    "input_ids_sha256": input_sha256,
+                    "tokens": token_count,
+                    "shape": [args.max_length, width],
+                    "capture_layers": capture_layers,
+                }
+                if key in manifest_keys:
+                    if manifest_entries[key] != entry:
+                        raise RuntimeError(
+                            f"capture manifest metadata differs for hidden row: {key}"
+                        )
+                else:
+                    append_manifest_entry(manifest, entry)
+                    manifest_keys.add(key)
+                    manifest_entries[key] = entry
                 print(f"resumed {row_index + 1}/{len(dataset)} {key}")
                 continue
 
@@ -351,12 +407,12 @@ def main() -> None:
             entry = {
                 "row": row_index,
                 "key": key,
+                "input_ids_sha256": input_sha256,
                 "tokens": token_count,
                 "shape": [args.max_length, width],
                 "capture_layers": capture_layers,
             }
-            manifest.write(json.dumps(entry, separators=(",", ":")) + "\n")
-            manifest.flush()
+            append_manifest_entry(manifest, entry)
             created_keys.add(key)
             print(f"captured {row_index + 1}/{len(dataset)} {key} tokens={token_count}")
 

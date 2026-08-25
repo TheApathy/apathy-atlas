@@ -46,6 +46,20 @@ class DflashReleaseGateTests(unittest.TestCase):
             result = MODULE.parse_accept_log(log, offset)
         self.assertEqual(result["committed_tokens_per_step"], 3.5)
 
+    def test_acceptance_parser_rejects_log_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = pathlib.Path(tmp) / "server.log"
+            log.write_text("old\n")
+            stat = log.stat()
+            identity = (stat.st_dev, stat.st_ino)
+            prefix_hash = MODULE.hashlib.sha256(log.read_bytes()).hexdigest()
+            log.unlink()
+            log.write_text(
+                "DSPARK accept: 9.00 tok/step over 1 steps | draft accept 99.0%\n"
+            )
+            with self.assertRaisesRegex(RuntimeError, "replaced|prefix changed"):
+                MODULE.parse_accept_log(log, stat.st_size, identity, prefix_hash)
+
     def test_reasoning_tokens_start_decode_clock_and_are_hashed(self):
         events = [
             b'data: {"choices":[{"delta":{"reasoning_content":"think"}}]}\n',
@@ -84,6 +98,7 @@ class DflashReleaseGateTests(unittest.TestCase):
             "implementation_identity": "plain-build",
             "contract": {"temperature": 0},
             "aggregate_decode_tok_s": 22.0,
+            "median_decode_tok_s": 22.0,
             "cases": case,
         }
         candidate = {
@@ -91,10 +106,39 @@ class DflashReleaseGateTests(unittest.TestCase):
             "model_identity": "checkpoint-b",
             "implementation_identity": "dflash-build",
             "aggregate_decode_tok_s": 70.0,
+            "median_decode_tok_s": 70.0,
             "acceptance": {"committed_tokens_per_step": 4.0},
         }
         report = MODULE.compare_results(baseline, candidate, 65.0, 3.0)
         self.assertIn("model identities differ", report["failures"])
+
+    def test_compare_uses_median_and_requires_distinct_implementation(self):
+        case = {
+            name: {
+                "prompt_sha256": name,
+                "runs": [{"output_sha256": f"{name}-output"}],
+            }
+            for name in MODULE.PROMPTS
+        }
+        baseline = {
+            "model_identity": "checkpoint",
+            "implementation_identity": "same-build",
+            "contract": {"temperature": 0},
+            "aggregate_decode_tok_s": 100.0,
+            "median_decode_tok_s": 20.0,
+            "cases": case,
+        }
+        candidate = {
+            **baseline,
+            "aggregate_decode_tok_s": 100.0,
+            "median_decode_tok_s": 60.0,
+            "acceptance": {"committed_tokens_per_step": 4.0},
+        }
+        report = MODULE.compare_results(baseline, candidate, 65.0, 3.0)
+        self.assertTrue(
+            any("implementation identities are identical" in item for item in report["failures"])
+        )
+        self.assertTrue(any("below 65.00" in item for item in report["failures"]))
 
     def test_atomic_result_writer_publishes_complete_json(self):
         with tempfile.TemporaryDirectory() as tmp:

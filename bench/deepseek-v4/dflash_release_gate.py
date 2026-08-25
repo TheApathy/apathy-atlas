@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import re
+import statistics
 import tempfile
 import time
 import urllib.request
@@ -22,12 +23,26 @@ ACCEPT_RE = re.compile(
 )
 
 
-def parse_accept_log(path: pathlib.Path | None, start_offset: int = 0):
+def parse_accept_log(
+    path: pathlib.Path | None,
+    start_offset: int = 0,
+    expected_identity: tuple[int, int] | None = None,
+    expected_prefix_sha256: str | None = None,
+):
     if path is None:
         return None
+    stat = path.stat()
+    identity = (stat.st_dev, stat.st_ino)
+    if expected_identity is not None and identity != expected_identity:
+        raise RuntimeError(f"server log was replaced during benchmark: {path}")
+    if stat.st_size < start_offset:
+        raise RuntimeError(f"server log shrank during benchmark: {path}")
     with path.open("rb") as handle:
-        if path.stat().st_size >= start_offset:
-            handle.seek(start_offset)
+        if expected_prefix_sha256 is not None:
+            prefix = handle.read(start_offset)
+            if hashlib.sha256(prefix).hexdigest() != expected_prefix_sha256:
+                raise RuntimeError(f"server log prefix changed during benchmark: {path}")
+        handle.seek(start_offset)
         text = handle.read().decode(errors="replace")
     matches = ACCEPT_RE.findall(text)
     if not matches:
@@ -135,7 +150,15 @@ def run(args) -> None:
         raise RuntimeError("model and implementation identities must be non-empty")
     if args.output.exists() and not args.overwrite:
         raise RuntimeError(f"refusing to overwrite existing output: {args.output}")
-    accept_offset = args.server_log.stat().st_size if args.server_log else 0
+    if not args.label.strip():
+        raise RuntimeError("label must be non-empty")
+    accept_stat = args.server_log.stat() if args.server_log else None
+    accept_offset = accept_stat.st_size if accept_stat else 0
+    accept_identity = (accept_stat.st_dev, accept_stat.st_ino) if accept_stat else None
+    accept_prefix_sha256 = None
+    if args.server_log:
+        with args.server_log.open("rb") as handle:
+            accept_prefix_sha256 = hashlib.sha256(handle.read()).hexdigest()
     cases = {}
     for name, prompt in PROMPTS.items():
         runs = [
@@ -161,12 +184,21 @@ def run(args) -> None:
             "reps": args.reps,
         },
         "aggregate_decode_tok_s": decoded_intervals / decode_seconds,
-        "acceptance": parse_accept_log(args.server_log, accept_offset),
+        "median_decode_tok_s": statistics.median(
+            item["decode_tok_s"] for item in all_runs
+        ),
+        "acceptance": parse_accept_log(
+            args.server_log,
+            accept_offset,
+            accept_identity,
+            accept_prefix_sha256,
+        ),
         "cases": cases,
     }
     write_json_atomic(args.output, result)
     print(
-        f"{args.label}: {result['aggregate_decode_tok_s']:.2f} tok/s -> {args.output}"
+        f"{args.label}: median {result['median_decode_tok_s']:.2f} tok/s -> "
+        f"{args.output}"
     )
 
 
@@ -180,6 +212,8 @@ def compare_results(baseline: dict, candidate: dict, min_tok_s: float, min_tok_s
         failures.append("baseline has no implementation_identity")
     if not candidate.get("implementation_identity"):
         failures.append("candidate has no implementation_identity")
+    elif baseline.get("implementation_identity") == candidate["implementation_identity"]:
+        failures.append("baseline and candidate implementation identities are identical")
     if baseline["contract"] != candidate["contract"]:
         failures.append("benchmark contracts differ")
     for name in PROMPTS:
@@ -192,7 +226,7 @@ def compare_results(baseline: dict, candidate: dict, min_tok_s: float, min_tok_s
         right_hashes = [run["output_sha256"] for run in right["runs"]]
         if left_hashes != right_hashes:
             failures.append(f"{name}: output hashes differ")
-    speed = candidate["aggregate_decode_tok_s"]
+    speed = candidate["median_decode_tok_s"]
     if speed < min_tok_s:
         failures.append(f"decode {speed:.2f} tok/s is below {min_tok_s:.2f}")
     acceptance = candidate.get("acceptance")
@@ -207,12 +241,14 @@ def compare_results(baseline: dict, candidate: dict, min_tok_s: float, min_tok_s
     return {
         "status": "pass" if not failures else "fail",
         "failures": failures,
-        "candidate_tok_s": speed,
+        "candidate_median_tok_s": speed,
         "acceptance": acceptance,
     }
 
 
 def compare(args) -> None:
+    if args.min_tok_s <= 0 or args.min_tok_step < 0:
+        raise RuntimeError("min-tok-s must be positive and min-tok-step non-negative")
     baseline = json.loads(args.baseline.read_text())
     candidate = json.loads(args.candidate.read_text())
     report = compare_results(
