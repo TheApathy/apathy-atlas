@@ -50,6 +50,24 @@ server: 72.4800, 72.3395, 72.2242, 72.0106, and 71.5133 tok/s; median
 validation JSON SHA-256 is
 `1617a021965fe03b827b83af41f6e0631793ea7f913d4e741a6b0ae0fc479cc7`.
 
+### Current perf-branch requalification (2026-08-25)
+
+After the upstream TUI port, commit
+`e5c8fedbc1c85cc8e5860ce10951f522479aabc7` was rebuilt and requalified with
+the same target, v3 drafter, gamma 15, full vocabulary, NVFP4 target/drafter/KV,
+8192-token context, and the tracked five-run Weschera harness. The rebuilt
+`spark` binary SHA-256 is
+`c9e45a77f43d27fc25abcc5e37d0403e39aec3958fdceccd904a7acce3a1240e`.
+
+The five rates were 72.3670, 72.4972, 72.2518, 72.2105, and 72.0784 tok/s;
+median **72.2518 tok/s**. All five responses retained stable output SHA-256
+`f51d8358ea2a5c63353ca00a29208ae2cccd3039b070043cad514cc4af9761c4`.
+The local result JSON SHA-256 is
+`4a288d47a5dcbe59f56c7d23d25032b6fdcebf1f1872537ecd4cbbc4acee952e`.
+The performance gate used `--no-tui`, so terminal rendering was not included
+in the timing path; the port therefore passes the canonical plain-server
+regression gate rather than claiming that interactive rendering is free.
+
 Output is deterministic for this fixed probe. Timing is repeatable within
 normal runtime variance, not numerically deterministic. Every response ends at
 the 400-token cap, so the result does not certify task completion.
