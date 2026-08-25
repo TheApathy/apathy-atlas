@@ -9,6 +9,41 @@ import pathlib
 import sys
 
 
+CACHE_CONTRACT_VERSION = "deepseek-dflash2-preprocess-v2"
+
+
+def file_sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def preprocessing_cache_key(
+    corpus: pathlib.Path,
+    target_components: pathlib.Path,
+    preprocessing_source: pathlib.Path,
+    max_length: int,
+    chat_template: str,
+    is_preformatted: bool,
+) -> str:
+    contract = {
+        "version": CACHE_CONTRACT_VERSION,
+        "corpus_sha256": file_sha256(corpus),
+        "tokenizer_sha256": file_sha256(target_components / "tokenizer.json"),
+        "tokenizer_config_sha256": file_sha256(
+            target_components / "tokenizer_config.json"
+        ),
+        "preprocessing_sha256": file_sha256(preprocessing_source),
+        "max_length": max_length,
+        "chat_template": chat_template,
+        "is_preformatted": is_preformatted,
+    }
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--specforge-dir", type=pathlib.Path, required=True)
@@ -73,11 +108,14 @@ def main() -> None:
         args.target_components, local_files_only=True
     )
     raw = load_dataset("json", data_files=str(args.corpus))["train"]
-    cache_contract = (
-        f"{args.corpus}-{args.max_length}-{args.chat_template}-"
-        f"{args.target_components}"
+    cache_key = preprocessing_cache_key(
+        args.corpus,
+        args.target_components,
+        args.specforge_dir / "specforge/data/preprocessing.py",
+        args.max_length,
+        args.chat_template,
+        args.is_preformatted,
     )
-    cache_key = hashlib.md5(cache_contract.encode()).hexdigest()
     dataset = build_eagle3_dataset(
         dataset=raw,
         tokenizer=tokenizer,

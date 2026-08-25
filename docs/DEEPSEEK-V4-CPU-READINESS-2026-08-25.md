@@ -12,6 +12,12 @@ inference, capture, or benchmark was started during this hardening pass.
 - Capture, validation, and training select the same deterministic 128 usable
   rows after shuffle, tokenization, and loss-token filtering. The CPU dry-run
   found 128 unique rows, 361–1,736 tokens, and a 40.00 GiB hidden-tensor cost.
+  Their shared preprocessing cache key hashes corpus and tokenizer contents,
+  preprocessing code, length, template, and formatting mode, so replacing a
+  file in place cannot silently reuse rows from the previous corpus. A fresh
+  128-row CPU dry-run produced cache key
+  `63fc6b90aec0dd60e131910c6ffde02958ca6d3a5afc518760efde817f8fe349`
+  and reproduced 128 unique rows at 361–1,736 tokens and 40.00 GiB projected.
 - The compact embedding and LM-head components match their original tensors by
   streaming value hash. The report is shipped as
   `target-components/component-parity.json`.
@@ -19,8 +25,10 @@ inference, capture, or benchmark was started during this hardening pass.
   incomplete hidden tensors, unpatched SpecForge, and incompatible final
   checkpoints. `PREFLIGHT_ONLY=1` exits before credit access or `torchrun`;
   paid execution additionally requires `CREDIT_GUARD_CONFIRM=1`.
-- The Vast bundle verifies as 279 files and 2,217,635,904 bytes beneath
-  `/workspace/deepseek-dflash2`.
+- The pre-capture Vast bundle verifies as 280 files and 2,217,651,951 bytes
+  beneath `/workspace/deepseek-dflash2`; its manifest SHA-256 is
+  `97f1e5069a389d8a7852c18bc119f14dfbfd1de21e8b15a39d207e6d17e13df9`.
+  It must be rebuilt with the captured hidden directory before training.
 - The 1M context plan pins config, tokenizer, and prompt hashes and reserves
   generation headroom inside the declared 1,048,576-token YaRN window.
 - The release gate separates reasoning and content, hashes exact output, binds

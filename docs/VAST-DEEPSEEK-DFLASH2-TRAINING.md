@@ -138,6 +138,10 @@ the full 24,846-row source would require roughly 7.6 TiB of padded hidden rows
 and is intentionally not the default contract.
 Both CPU tools default to 128; passing `--limit 0` is the explicit, high-disk
 request to process every usable row.
+The processed-dataset cache is content-addressed across capture, validation,
+and training: its key covers corpus bytes, tokenizer files, preprocessing code,
+maximum length, chat template, and preformatted mode. This prevents a repaired
+corpus at the same pathname from inheriting stale cached rows.
 
 The canonical 24,846-row source corpus is pinned as SHA-256
 `2824835f81288541eaa6a97362cd7e308e6f7f80c001d8a871860506f15f1bde`.
@@ -182,6 +186,7 @@ scripts/deepseek-dflash2-bundle.py build \
   --entry deepseek-v4-dflash2.json=bench/deepseek-v4/deepseek-v4-dflash2.json \
   --entry corpus.jsonl=/path/to/deepseek-corpus.jsonl \
   --entry hidden=/path/to/hidden \
+  --entry capture-deepseek-dflash2-offline.py=scripts/capture-deepseek-dflash2-offline.py \
   --entry train-deepseek-dflash2-vast.sh=scripts/train-deepseek-dflash2-vast.sh \
   --entry validate-deepseek-dflash2-offline.py=scripts/validate-deepseek-dflash2-offline.py \
   --entry validate-deepseek-dflash2-checkpoint.py=scripts/validate-deepseek-dflash2-checkpoint.py \
@@ -203,8 +208,11 @@ python3 /workspace/deepseek-dflash2/deepseek-dflash2-bundle.py verify \
 This locks the modified SpecForge training driver as content, rather than
 pretending its upstream commit alone reproduces the paid run.
 
-The final CPU-only refresh on 2026-08-25 verified the remote handoff as 279
-files and 2,217,635,904 bytes. It includes the value-parity report for the
+The final pre-capture CPU-only refresh on 2026-08-25 verified the remote
+handoff as 280 files and 2,217,651,951 bytes, with manifest SHA-256
+`97f1e5069a389d8a7852c18bc119f14dfbfd1de21e8b15a39d207e6d17e13df9`.
+It includes the value-parity report for the
 compact target components and all three preflight validators. Rebuild and
-reverify this manifest after any input changes; those counts are evidence for
+reverify this manifest after any input changes. Rebuild it with the captured
+`hidden` directory before training; these pre-capture counts are evidence for
 this snapshot, not timeless constants.

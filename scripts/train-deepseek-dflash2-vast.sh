@@ -101,6 +101,8 @@ grep -q 'SPECFORGE_TARGET_EMBED_KEY' "$SF/scripts/train_dflash.py" \
   || die "SpecForge driver lacks configurable target component key support"
 grep -q -- '--max-train-rows' "$SF/scripts/train_dflash.py" \
   || die "SpecForge driver lacks deterministic training-row selection"
+grep -q 'deepseek-dflash2-preprocess-v2' "$SF/scripts/train_dflash.py" \
+  || die "SpecForge driver lacks content-addressed preprocessing cache"
 grep -q 'ATLAS_SAFE_SINGLE_GPU_TEARDOWN' "$SF/specforge/distributed.py" \
   || die "SpecForge lacks safe single-GPU process-group teardown"
 

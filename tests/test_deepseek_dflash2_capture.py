@@ -17,6 +17,17 @@ SPEC = importlib.util.spec_from_file_location("dflash2_capture", SCRIPT)
 CAPTURE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(CAPTURE)
+VALIDATOR_SCRIPT = (
+    pathlib.Path(__file__).parents[1]
+    / "scripts"
+    / "validate-deepseek-dflash2-offline.py"
+)
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "dflash2_validator", VALIDATOR_SCRIPT
+)
+VALIDATOR = importlib.util.module_from_spec(VALIDATOR_SPEC)
+assert VALIDATOR_SPEC.loader is not None
+VALIDATOR_SPEC.loader.exec_module(VALIDATOR)
 
 
 def bf16_bytes(value: float, rows: int) -> bytes:
@@ -30,6 +41,29 @@ def record(start: int, rows: int, values: list[float], kind: int = 0) -> bytes:
 
 
 class DeepseekDflash2CaptureTest(unittest.TestCase):
+    def test_cache_key_is_content_addressed_and_shared_with_validator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            corpus = root / "corpus.jsonl"
+            target = root / "target"
+            target.mkdir()
+            tokenizer = target / "tokenizer.json"
+            tokenizer_config = target / "tokenizer_config.json"
+            preprocessing = root / "preprocessing.py"
+            corpus.write_text('{"text":"one"}\n')
+            tokenizer.write_text('{"vocab":{}}\n')
+            tokenizer_config.write_text('{"legacy":false}\n')
+            preprocessing.write_text("def preprocess(): pass\n")
+
+            arguments = (corpus, target, preprocessing, 8192, "deepseek-v3", False)
+            first = CAPTURE.preprocessing_cache_key(*arguments)
+            self.assertEqual(first, VALIDATOR.preprocessing_cache_key(*arguments))
+            self.assertEqual(len(first), 64)
+
+            corpus.write_text('{"text":"two"}\n')
+            second = CAPTURE.preprocessing_cache_key(*arguments)
+            self.assertNotEqual(first, second)
+
     def test_reassembles_chunked_layer_major_dump_as_token_major(self):
         stream = io.BytesIO(
             record(0, 2, [1, 2, 3, 4, 5]) + record(2, 1, [6, 7, 8, 9, 10])

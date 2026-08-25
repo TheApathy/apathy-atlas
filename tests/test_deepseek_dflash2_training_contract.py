@@ -13,6 +13,10 @@ class DeepseekDflash2TrainingContractTest(unittest.TestCase):
             ROOT
             / "3rdparty_patches/specforge/offline_train_row_limit.patch"
         ).read_text()
+        cache_patch = (
+            ROOT
+            / "3rdparty_patches/specforge/content_addressed_preprocess_cache.patch"
+        ).read_text()
         launcher = (ROOT / "scripts/train-deepseek-dflash2-vast.sh").read_text()
 
         self.assertLess(capture.index("dataset = dataset.filter"), capture.index("if args.limit:"))
@@ -21,6 +25,11 @@ class DeepseekDflash2TrainingContractTest(unittest.TestCase):
         )
         self.assertIn("--max-train-rows", trainer_patch)
         self.assertIn("if args.max_train_rows:", trainer_patch)
+        for source in (capture, validator, cache_patch):
+            self.assertIn("deepseek-dflash2-preprocess-v2", source)
+            self.assertIn("corpus_sha256", source)
+            self.assertIn("tokenizer_sha256", source)
+            self.assertIn("preprocessing_sha256", source)
         self.assertIn("default=128", capture)
         self.assertIn("default=128", validator)
         self.assertIn('--limit "$TRAIN_ROWS"', launcher)

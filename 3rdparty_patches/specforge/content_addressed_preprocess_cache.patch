@@ -1,0 +1,57 @@
+diff --git a/scripts/train_dflash.py b/scripts/train_dflash.py
+index 007f77f..592e8a1 100755
+--- a/scripts/train_dflash.py
++++ b/scripts/train_dflash.py
+@@ -3,9 +3,12 @@
+ """DFlash Training Script."""
+
+ import argparse
++import hashlib
++import json
+ import logging
+ import math
+ import os
++import pathlib
+ import shutil
+ import time
+ import warnings
+@@ -193,15 +196,30 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
+
+ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
+     """Build train and eval dataloaders."""
+-    import hashlib
+-
+-    cache_params_string = (
+-        f"{args.train_data_path}-"
+-        f"{args.max_length}-"
+-        f"{args.chat_template}-"
+-        f"{args.target_model_path}"
+-    )
+-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
++    def file_sha256(path):
++        digest = hashlib.sha256()
++        with pathlib.Path(path).open("rb") as handle:
++            while chunk := handle.read(8 << 20):
++                digest.update(chunk)
++        return digest.hexdigest()
++
++    cache_contract = {
++        "version": "deepseek-dflash2-preprocess-v2",
++        "corpus_sha256": file_sha256(args.train_data_path),
++        "tokenizer_sha256": file_sha256(
++            pathlib.Path(args.target_model_path) / "tokenizer.json"
++        ),
++        "tokenizer_config_sha256": file_sha256(
++            pathlib.Path(args.target_model_path) / "tokenizer_config.json"
++        ),
++        "preprocessing_sha256": file_sha256(build_eagle3_dataset.__code__.co_filename),
++        "max_length": args.max_length,
++        "chat_template": args.chat_template,
++        "is_preformatted": args.is_preformatted,
++    }
++    cache_key = hashlib.sha256(
++        json.dumps(cache_contract, sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
+
+     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+     train_eagle3_dataset = build_eagle3_dataset(
