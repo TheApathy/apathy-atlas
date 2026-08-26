@@ -129,6 +129,48 @@ pub struct ModelConfig {
     #[serde(default)]
     pub mtp_num_hidden_layers: usize,
 
+    // ── Qwen4-Exp / Qwen3.8-Flash-Next ──
+    /// Number of parallel gated-residual streams. Qwen4-Exp uses four.
+    #[serde(default = "default_one")]
+    pub hc_count: usize,
+    /// Bottleneck rank used to mix the gated-residual streams.
+    #[serde(default)]
+    pub hc_lowrank: usize,
+    /// One-indexed decoder layers carrying the PLE n-gram injection.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub ple_embed_dim: usize,
+    #[serde(default = "default_conv_kernel")]
+    pub ple_conv_kernel_size: usize,
+    #[serde(default = "default_one")]
+    pub ngram_size: usize,
+    #[serde(default = "default_one")]
+    pub heads_per_ngram: usize,
+    #[serde(default)]
+    pub ngram_vocab_size_base: usize,
+    #[serde(default = "default_one")]
+    pub make_ngram_vocab_size_divisible_by: usize,
+    #[serde(default)]
+    pub seed: u64,
+    #[serde(default)]
+    pub split_ngram_parts: usize,
+    /// Qwen Sparse Attention indexer geometry. All five values are required
+    /// together; zero means the architecture does not use QSA.
+    #[serde(default)]
+    pub indexer_n_heads: usize,
+    #[serde(default)]
+    pub indexer_kv_heads: usize,
+    #[serde(default)]
+    pub indexer_head_dim: usize,
+    #[serde(default)]
+    pub indexer_budget: usize,
+    #[serde(default)]
+    pub indexer_compress_ratio: usize,
+    /// GDN output gate activation (`sigmoid` for Flash-Next).
+    #[serde(default)]
+    pub output_gate_type: String,
+
     // ── Nemotron-H / Mamba-2 ──
     #[serde(default)]
     pub hybrid_override_pattern: String,

@@ -25,6 +25,51 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         .unwrap_or("");
 
     match top_model_type {
+        "qwen4_exp" => {
+            let text_config = raw
+                .get("text_config")
+                .context("qwen4_exp config missing text_config")?;
+            let mut config: ModelConfig = serde_json::from_value(text_config.clone())
+                .context("Failed to parse qwen4_exp text_config")?;
+            config.model_type = top_model_type.to_string();
+            config.nested_config = true;
+            config.attn_gated = true;
+            config.weight_prefix = "model.language_model".to_string();
+            config.vision = parse_vision_config(&raw);
+            config.norm_topk_prob = true;
+
+            if let Some(rope_params) = text_config.get("rope_parameters") {
+                if let Some(theta) = rope_params
+                    .get("rope_theta")
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    config.rope_theta = theta;
+                }
+                if let Some(factor) = rope_params
+                    .get("partial_rotary_factor")
+                    .and_then(serde_json::Value::as_f64)
+                {
+                    config.partial_rotary_factor = factor;
+                }
+                if let Some(ms) = rope_params.get("mrope_section").and_then(|v| v.as_array())
+                    && ms.len() == 3
+                {
+                    config.mrope_section = [
+                        ms[0].as_u64().unwrap_or(0) as usize,
+                        ms[1].as_u64().unwrap_or(0) as usize,
+                        ms[2].as_u64().unwrap_or(0) as usize,
+                    ];
+                }
+                config.mrope_interleaved = rope_params
+                    .get("mrope_interleaved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            }
+
+            validate_qwen4_exp(&config)?;
+            finalize_config(&mut config, &raw)?;
+            Ok(config)
+        }
         "qwen3_vl_moe" | "qwen3_5_moe" | "qwen3_5" => {
             let text_config = raw
                 .get("text_config")
@@ -167,4 +212,50 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             Ok(config)
         }
     }
+}
+
+fn validate_qwen4_exp(config: &ModelConfig) -> Result<()> {
+    if config.hc_count <= 1 {
+        anyhow::bail!("qwen4_exp requires hc_count > 1, got {}", config.hc_count);
+    }
+    if config.hc_lowrank == 0 {
+        anyhow::bail!("qwen4_exp requires hc_lowrank > 0");
+    }
+    let qsa = [
+        config.indexer_n_heads,
+        config.indexer_kv_heads,
+        config.indexer_head_dim,
+        config.indexer_budget,
+        config.indexer_compress_ratio,
+    ];
+    if qsa.contains(&0) {
+        anyhow::bail!("qwen4_exp requires complete non-zero QSA indexer geometry");
+    }
+    if config.indexer_kv_heads != 1 {
+        anyhow::bail!(
+            "qwen4_exp QSA requires indexer_kv_heads=1, got {}",
+            config.indexer_kv_heads
+        );
+    }
+    if !config
+        .indexer_budget
+        .is_multiple_of(config.indexer_compress_ratio)
+    {
+        anyhow::bail!("qwen4_exp indexer_budget must be divisible by indexer_compress_ratio");
+    }
+    if config.ngram_size < 2 || config.heads_per_ngram == 0 {
+        anyhow::bail!("qwen4_exp PLE requires ngram_size >= 2 and heads_per_ngram > 0");
+    }
+    let ngram_heads = (config.ngram_size - 1) * config.heads_per_ngram;
+    if config.ple_embed_dim == 0 || !config.ple_embed_dim.is_multiple_of(ngram_heads) {
+        anyhow::bail!("qwen4_exp ple_embed_dim must be divisible by the n-gram head count");
+    }
+    if config
+        .ple_layer_ids
+        .iter()
+        .any(|&id| id == 0 || id > config.num_hidden_layers)
+    {
+        anyhow::bail!("qwen4_exp ple_layer_ids must be one-indexed decoder layers");
+    }
+    Ok(())
 }

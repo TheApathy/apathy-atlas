@@ -47,6 +47,125 @@ fn test_parse_actual_config() {
 }
 
 #[test]
+fn test_parse_qwen38_flash_next_config() {
+    let json = r#"{
+        "model_type": "qwen4_exp",
+        "image_token_id": 248056,
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 512,
+            "num_experts_per_tok": 10,
+            "moe_intermediate_size": 640,
+            "shared_expert_intermediate_size": 640,
+            "vocab_size": 248320,
+            "eos_token_id": 248044,
+            "layer_types": [
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                "linear_attention", "linear_attention", "linear_attention", "full_attention"
+            ],
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [2],
+            "ple_embed_dim": 2560,
+            "ple_conv_kernel_size": 4,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "ngram_vocab_size_base": 20000000,
+            "make_ngram_vocab_size_divisible_by": 128,
+            "seed": 1234,
+            "split_ngram_parts": 128,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+            "output_gate_type": "sigmoid",
+            "mtp_num_hidden_layers": 1,
+            "rope_parameters": {
+                "rope_theta": 10000000,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10]
+            }
+        },
+        "vision_config": {
+            "depth": 27,
+            "hidden_size": 1152,
+            "num_heads": 16,
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "intermediate_size": 4304,
+            "out_hidden_size": 2560
+        }
+    }"#;
+    let cfg = parse_config(json).expect("official Flash-Next geometry parses");
+    assert_eq!(cfg.model_type, "qwen4_exp");
+    assert_eq!(cfg.weight_prefix, "model.language_model");
+    assert_eq!(cfg.hidden_size, 2560);
+    assert_eq!(cfg.residual_width(), 10_240);
+    assert_eq!(cfg.num_attention_layers(), 12);
+    assert_eq!(cfg.num_ssm_layers(), 36);
+    assert_eq!(cfg.hc_lowrank, 320);
+    assert_eq!(cfg.ple_layer_ids, vec![2]);
+    assert_eq!(cfg.indexer_budget, 2048);
+    assert_eq!(cfg.rotary_dim(), 64);
+    assert_eq!(cfg.mrope_section, [11, 11, 10]);
+    assert!(cfg.mrope_interleaved);
+    assert!(cfg.vision.is_some());
+    assert!(cfg.is_qwen4_exp());
+}
+
+#[test]
+fn test_qwen4_exp_rejects_partial_qsa_geometry() {
+    let json = r#"{
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "hidden_size": 2560,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "layer_types": ["linear_attention"],
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [1],
+            "ple_embed_dim": 2560,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1
+        }
+    }"#;
+    let err = parse_config(json).expect_err("partial QSA geometry must fail closed");
+    assert!(err.to_string().contains("complete non-zero QSA"));
+}
+
+#[test]
 fn test_parse_qwen35_nested_config() {
     let json = r#"{
         "model_type": "qwen3_5_moe",
