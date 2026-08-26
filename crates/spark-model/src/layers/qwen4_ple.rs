@@ -331,6 +331,36 @@ mod runtime {
             self.residual_width() * PLE_CONV_HISTORY * 2
         }
 
+        /// Clear every request-local PLE history buffer for a reused slot.
+        /// PLE state is allocated outside `SsmStatePool`, so the pool's slot
+        /// reset cannot cover it.
+        pub fn zero_slot(&self, slot_idx: usize, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+            ensure!(
+                slot_idx < self.max_batch_size,
+                "PLE slot {slot_idx} out of range"
+            );
+            let stride = self.state_stride_bytes();
+            gpu.memset_async(
+                self.conv_state_dev.offset(slot_idx * stride),
+                0,
+                stride,
+                stream,
+            )?;
+            gpu.memset_async(
+                self.conv_checkpoint_dev.offset(slot_idx * stride),
+                0,
+                stride,
+                stream,
+            )?;
+            gpu.memset_async(
+                self.conv_intermediate_dev
+                    .offset(slot_idx * PLE_MAX_SPEC_ROWS * stride),
+                0,
+                PLE_MAX_SPEC_ROWS * stride,
+                stream,
+            )
+        }
+
         /// Save the canonical PLE convolution history at a speculative boundary.
         pub fn checkpoint(&self, slot_idx: usize, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
             ensure!(

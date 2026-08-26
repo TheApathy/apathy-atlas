@@ -236,6 +236,9 @@ impl TransformerModel {
         // Using stream 0 would race with the subsequent prefill kernel.
         let stream = self.gpu.default_stream();
         self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream)?;
+        if let Some(ple) = &self.qwen4_ple {
+            ple.zero_slot(slot, self.gpu.as_ref(), stream)?;
+        }
         alloc_mark!("zero_slot");
         // Ensure zero completes before any prefill kernels touch this slot.
         self.gpu.synchronize(stream)?;

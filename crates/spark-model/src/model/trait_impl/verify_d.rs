@@ -1178,23 +1178,86 @@ impl TransformerModel {
                     } else {
                         (DevicePtr::NULL, DevicePtr::NULL)
                     };
-                    layer.decode_qwen4_batched(
-                        hidden,
-                        residual,
-                        k,
-                        seq.layer_states[layer_idx].as_mut(),
-                        &mut kv_cache,
-                        seq.seq_len,
-                        &mut seq.block_table,
-                        &mut seq.disk_block_ids,
-                        &mut seq.disk_last_offloaded_per_layer,
-                        h_inter,
-                        conv_inter,
-                        self.ssm_pool.h_bytes,
-                        self.ssm_pool.conv_bytes,
-                        &ctx,
-                        stream,
-                    )?;
+                    // The generic Qwen4 batched layer path first diverges
+                    // from ordinary decode at layer 0 for K=5. Because its
+                    // recurrent intermediates may be committed, even a
+                    // logits-tolerant numeric delta becomes cross-step state
+                    // corruption. Keep the released gamma-4 geometry on the
+                    // lossless row-serial layer path until each batched stage
+                    // has an in-process parity proof.
+                    if k == 5 {
+                        let metadata = ctx.attn_metadata.ok_or_else(|| {
+                            anyhow::anyhow!("Qwen4 K=5 verify requires attention metadata")
+                        })?;
+                        for row in 0..k {
+                            let token_metadata = AttnMetadataDev {
+                                positions: metadata.positions.offset(row * 4),
+                                positions_h: metadata.positions_h.offset(row * 4),
+                                positions_w: metadata.positions_w.offset(row * 4),
+                                slot: metadata.slot.offset(row * 8),
+                                seq_len: metadata.seq_len.offset(row * 4),
+                                block_table: metadata.block_table.offset(row * mb * 4),
+                                num_seqs: 1,
+                                ..metadata
+                            };
+                            let token_ctx = ForwardContext {
+                                attn_metadata: Some(token_metadata),
+                                ..ctx
+                            };
+                            layer.decode(
+                                hidden.offset(row * persistent_width * fp32),
+                                residual.offset(row * persistent_width * fp32),
+                                seq.layer_states[layer_idx].as_mut(),
+                                &mut kv_cache,
+                                seq.seq_len + row,
+                                &mut seq.block_table,
+                                &mut seq.disk_block_ids,
+                                &mut seq.disk_last_offloaded_per_layer,
+                                &token_ctx,
+                                stream,
+                            )?;
+                            if layer_type == LayerType::LinearAttention {
+                                let ssm = seq.layer_states[layer_idx]
+                                    .as_any_mut()
+                                    .downcast_mut::<SsmLayerState>()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Qwen4 K=5 verify expected SSM state at layer {layer_idx}"
+                                        )
+                                    })?;
+                                self.gpu.copy_d2d_async(
+                                    ssm.h_state,
+                                    h_inter.offset(row * self.ssm_pool.h_bytes),
+                                    self.ssm_pool.h_bytes,
+                                    stream,
+                                )?;
+                                self.gpu.copy_d2d_async(
+                                    ssm.conv_state,
+                                    conv_inter.offset(row * self.ssm_pool.conv_bytes),
+                                    self.ssm_pool.conv_bytes,
+                                    stream,
+                                )?;
+                            }
+                        }
+                    } else {
+                        layer.decode_qwen4_batched(
+                            hidden,
+                            residual,
+                            k,
+                            seq.layer_states[layer_idx].as_mut(),
+                            &mut kv_cache,
+                            seq.seq_len,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
+                            h_inter,
+                            conv_inter,
+                            self.ssm_pool.h_bytes,
+                            self.ssm_pool.conv_bytes,
+                            &ctx,
+                            stream,
+                        )?;
+                    }
                     if layer_type == LayerType::LinearAttention {
                         qwen4_ssm_layer_idx += 1;
                     }

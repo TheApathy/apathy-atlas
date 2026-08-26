@@ -66,13 +66,8 @@ impl TransformerModel {
         } else {
             2
         };
-        self.capture_k1_stage(
-            "embed",
-            hidden,
-            1,
-            self.config.hidden_size * hidden_elem_bytes,
-            stream,
-        )?;
+        let persistent_row_bytes = self.config.residual_width() * hidden_elem_bytes;
+        self.capture_k1_stage("embed", hidden, 1, persistent_row_bytes, stream)?;
 
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
@@ -284,7 +279,7 @@ impl TransformerModel {
                 &format!("layer_{i:02}"),
                 hidden,
                 1,
-                self.config.hidden_size * hidden_elem_bytes,
+                persistent_row_bytes,
                 stream,
             )?;
             // Offline K=gamma parity probe: capture the single-token hidden
