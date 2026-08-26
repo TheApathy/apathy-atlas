@@ -37,9 +37,19 @@ only 16 selected rows are staged to the GPU per token.
 
 The first performance probe is Weschera's canonical MinHeap request at C=1,
 temperature zero, reasoning disabled, and 400 output tokens. Target-only Atlas
-measured 38.2542, 38.6784, and 38.3594 tok/s (median 38.3594), with identical
-stable output SHA-256
+with the PLE-boundary segmented CUDA graph measured 41.6410, 42.1010, and
+42.3992 tok/s (median 42.1010), with identical stable output SHA-256
 `f811cdc565dff063074f8bb1d0bb3fd55c8b10f3438c517cf4d59128f23cf790`.
+The pre-graph eager control was 38.3594 tok/s median. Segmented graphs leave
+layer 0 and sparse PLE row I/O/injection eager, then replay layers 1-47 plus
+the terminal mixer and LM head. Set `ATLAS_QWEN4_PLE_SEGMENTED_GRAPHS=0` only
+for an eager diagnostic control.
+
+MiaAI-Lab reports approximately 40 tok/s single-stream and 90 tok/s aggregate
+for SGLang TP2 on two DGX Sparks. Atlas's 42.1010 result exceeds the published
+single-stream number on one Spark under a deterministic output-hash gate; the
+aggregate configurations are not equivalent and are not presented as an
+aggregate win.
 
 CPU prompt-lookup ngram speculation is not enabled by this launcher. Its
 Flash-Next K=2 diagnostic was coherent but non-identical and slower (25.2982
@@ -59,8 +69,12 @@ enable it by default. To reproduce the diagnostic, append:
 --num-drafts 1 --mtp-vocab 248077
 ```
 
-The dense Qwen3.8 v3 and DFlash2 sidecars remain shape-incompatible with
-Flash-Next's four-stream target-hidden contract and fail closed. A standalone
-v3 proposer path and a Flash-Next bridge adapter are under investigation. No
-70/80 tok/s claim is made until a qualified drafter beats the target-only
-control under the same output-hash gate.
+The dense Qwen3.8 V3 sidecar cannot directly share Flash-Next's 2560-wide
+embedding and LM head. An explicit donor bridge was tested with proportional
+capture-depth remapping and a 5120-wide residual slice. Its exact 64-token
+diagnostic reached only 3.3200 tok/s with essentially zero draft acceptance,
+so it is retained as an experimental compatibility probe and is not a
+recommended launch path. DFlash2 remains shape-incompatible and fails closed.
+A trained Flash-Next adapter or native Flash-Next drafter is required for a
+real V3/DFlash2 speedup. No 70/80 tok/s claim is made until a qualified drafter
+beats the target-only control under the same output-hash gate.

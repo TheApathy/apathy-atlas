@@ -24,6 +24,7 @@ mod decode_a2;
 mod decode_a2_piecewise;
 mod decode_b;
 mod decode_b2;
+mod decode_qwen4_ple_graph;
 mod ep_misc;
 mod k1_stage_capture;
 mod meta;

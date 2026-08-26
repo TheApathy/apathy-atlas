@@ -168,6 +168,25 @@ impl TransformerModel {
             && !serial_debug_dump
             && !crate::model::k1_stage_diag::enabled();
 
+        // PLE performs host/NVMe work between layers 0 and 1, so it cannot
+        // live inside a monolithic CUDA graph. The remaining layers are
+        // address-stable for a fixed sequence slot, however. The segmented
+        // path is qualified and default-on; setting the environment variable
+        // to zero retains an explicit eager diagnostic control.
+        let use_qwen4_ple_suffix_graph = self.config.is_qwen4_exp()
+            && self.qwen4_ple.is_some()
+            && self.comm.is_none()
+            && !self.profile
+            && !suppress_graphs
+            && !hss_engaged
+            && !serial_debug_dump
+            && !crate::model::k1_stage_diag::enabled()
+            && !self.any_proposer()
+            && std::env::var("ATLAS_QWEN4_PLE_SEGMENTED_GRAPHS")
+                .ok()
+                .as_deref()
+                != Some("0");
+
         let ctx = ForwardContext {
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -182,6 +201,18 @@ impl TransformerModel {
             self_spec_sparse_draft: None,
             ffn_defer: None,
         };
+
+        if use_qwen4_ple_suffix_graph {
+            return self.decode_qwen4_ple_suffix_graph(
+                token,
+                hidden,
+                residual,
+                seq,
+                &mut kv_cache,
+                &ctx,
+                stream,
+            );
+        }
 
         // Profile mode: use per-layer sync decode for timing breakdown.
         if self.profile && self.qwen4_ple.is_none() {
