@@ -5,6 +5,7 @@
 use crate::gpu::{DevicePtr, GpuBackend};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Advise the OS to evict a file's pages from the page cache.
@@ -183,6 +184,11 @@ pub struct SafetensorsLoader {
     /// hybrid linear-attention model false-OOMs a plain one. Zero means
     /// "unknown / nothing extra", which is the pre-existing behaviour.
     pub construction_overhead_bytes: usize,
+    /// Optional exact tensor-name allowlist. When present, every tensor not
+    /// named here is skipped before OOM estimation and allocation. This is
+    /// used for small compatibility sidecars sourced from a full checkpoint
+    /// (for example a DFlash donor embedding + LM head).
+    pub tensor_allowlist: Option<HashSet<String>>,
 }
 
 impl Default for SafetensorsLoader {
@@ -200,6 +206,7 @@ impl SafetensorsLoader {
             num_experts: 0,
             peak_memory_multiplier: None,
             construction_overhead_bytes: 0,
+            tensor_allowlist: None,
         }
     }
 
@@ -211,6 +218,7 @@ impl SafetensorsLoader {
             num_experts,
             peak_memory_multiplier: None,
             construction_overhead_bytes: 0,
+            tensor_allowlist: None,
         }
     }
 
@@ -218,6 +226,13 @@ impl SafetensorsLoader {
     /// Skips `*.experts.{E}.*` tensors where E is not in local range.
     /// MTP head experts are never skipped (small, fully replicated).
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if self
+            .tensor_allowlist
+            .as_ref()
+            .is_some_and(|allow| !allow.contains(name))
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }

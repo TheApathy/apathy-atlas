@@ -326,3 +326,50 @@ pub(crate) fn load_dflash_drafter(
     );
     Ok(Some((drafter_store, drafter_config)))
 }
+
+/// Selectively load the dense-target tensors that an external DFlash
+/// checkpoint omitted because they were shared during training.
+pub(crate) fn load_dflash_donor(
+    args: &cli::ServeArgs,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+) -> Result<Option<spark_runtime::weights::WeightStore>> {
+    use spark_runtime::weights::WeightLoader;
+    let Some(donor_id) = args.dflash_donor_model.as_ref() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        args.dflash,
+        "--dflash-donor-model requires --dflash and an explicit --draft-model"
+    );
+    let donor_dir = crate::model_resolver::resolve_model_dir(donor_id, args.cache_dir.as_deref())
+        .context("Failed to resolve DFlash donor checkpoint")?;
+    let allow = [
+        "model.language_model.embed_tokens.weight",
+        "model.embed_tokens.weight",
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "model.lm_head.weight",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let mut loader = spark_runtime::weights::SafetensorsLoader::new();
+    loader.peak_memory_multiplier = Some(1.0);
+    loader.tensor_allowlist = Some(allow);
+    let donor = loader
+        .load(&donor_dir, gpu, 0)
+        .context("Failed to selectively load DFlash donor embedding/lm_head")?;
+    anyhow::ensure!(
+        donor.len() == 2,
+        "DFlash donor must expose exactly one embedding and one lm_head tensor; selectively loaded {} tensors: {:?}",
+        donor.len(),
+        donor.names().collect::<Vec<_>>(),
+    );
+    tracing::info!(
+        "DFlash donor: selectively loaded {} tensors / {} bytes from {}",
+        donor.len(),
+        donor.total_bytes(),
+        donor_dir.display(),
+    );
+    Ok(Some(donor))
+}

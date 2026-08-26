@@ -331,6 +331,11 @@ pub struct TransformerModel {
     /// Layer indices to capture for DFlash. Empty when DFlash is disabled.
     /// Sourced from drafter's `dflash_config.target_layer_ids` at model build.
     pub(super) dflash_capture_layers: Vec<usize>,
+    /// Width and source offset for each captured DFlash slice. Ordinary
+    /// targets use the entire residual row; compatibility bridges may expose
+    /// a narrower explicit slice.
+    pub(super) dflash_capture_width: usize,
+    pub(super) dflash_capture_offset: usize,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for

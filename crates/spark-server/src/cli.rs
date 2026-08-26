@@ -133,6 +133,13 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f64,
 
+    /// CUDA runtime headroom reserved when speculative decoding is enabled.
+    /// The conservative default protects ordinary checkpoints from transient
+    /// conversion/scratch allocations. Memory-tight unified-memory systems
+    /// may lower this after all draft weights are already materialized.
+    #[arg(long, default_value_t = 4096)]
+    pub speculative_cuda_headroom_mb: usize,
+
     /// Maximum concurrent sequences.
     #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,
@@ -269,6 +276,13 @@ pub struct ServeArgs {
     /// through from the target's MODEL.toml `[dflash].draft_model` field.
     #[arg(long)]
     pub draft_model: Option<String>,
+
+    /// Dense target checkpoint that donated the embedding and LM head used
+    /// when training a DFlash drafter. Required for the experimental
+    /// Qwen3.8-Flash-Next bridge because Flash-Next is 2560-wide while the
+    /// existing v3 drafter shares 5120-wide dense-target tensors.
+    #[arg(long)]
+    pub dflash_donor_model: Option<String>,
 
     /// DFlash/DSpark draft count γ (parallel speculative tokens per step).
     /// Width semantics are checkpoint-family specific: legacy DFlash counts

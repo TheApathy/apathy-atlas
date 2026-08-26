@@ -11,6 +11,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
+use spark_runtime::weights::WeightDtype;
 use spark_runtime::weights::WeightStore;
 
 use super::DflashBuildArgs;
@@ -21,6 +22,58 @@ use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 use crate::weight_map::quantize_to_nvfp4;
+
+fn remap_capture_depths(
+    ids: &[usize],
+    source_layers: usize,
+    target_layers: usize,
+) -> Result<Vec<usize>> {
+    anyhow::ensure!(
+        source_layers > 1 && target_layers > 1,
+        "invalid DFlash capture-depth bridge {source_layers}->{target_layers}"
+    );
+    let source_last = source_layers - 1;
+    let target_last = target_layers - 1;
+    ids.iter()
+        .map(|&id| {
+            anyhow::ensure!(
+                id < source_layers,
+                "DFlash capture layer {id} is outside donor depth {source_layers}"
+            );
+            Ok((id * target_last + source_last / 2) / source_last)
+        })
+        .collect()
+}
+
+fn donor_tensor<'a>(
+    store: &'a WeightStore,
+    candidates: &[&str],
+    expected_shape: &[usize],
+    role: &str,
+) -> Result<&'a spark_runtime::weights::WeightTensor> {
+    let matches: Vec<_> = candidates
+        .iter()
+        .filter_map(|name| store.get(name).ok().map(|tensor| (*name, tensor)))
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "DFlash donor must contain exactly one {role}; found {:?}",
+        matches.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+    );
+    let (name, tensor) = matches[0];
+    anyhow::ensure!(
+        tensor.dtype == WeightDtype::BF16,
+        "DFlash donor tensor {name} must be BF16, got {:?}",
+        tensor.dtype
+    );
+    anyhow::ensure!(
+        tensor.shape == expected_shape,
+        "DFlash donor tensor {name} has shape {:?}; expected {:?}",
+        tensor.shape,
+        expected_shape
+    );
+    Ok(tensor)
+}
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -108,11 +161,46 @@ pub fn build_model(
                  nonzero value for A/B testing that claim and nothing else."
             );
         }
-        config.dflash_capture_layers = sub
+        let raw_with_offset: Vec<_> = sub
             .target_layer_ids
             .iter()
             .map(|&id| (id as i64 + offset).max(0) as usize)
             .collect();
+        if config.is_qwen4_exp() {
+            anyhow::ensure!(
+                args.donor_store.is_some(),
+                "Qwen3.8-Flash-Next cannot share its 2560-wide embedding/lm_head with a dense DFlash drafter; pass --dflash-donor-model <dense-Qwen3.8-checkpoint> to enable the explicit compatibility bridge"
+            );
+            let source_layers = args.drafter_config.num_target_layers;
+            anyhow::ensure!(
+                source_layers > 1,
+                "Qwen4 DFlash bridge requires drafter config num_target_layers"
+            );
+            config.dflash_capture_layers =
+                remap_capture_depths(&raw_with_offset, source_layers, config.num_hidden_layers)?;
+            config.dflash_capture_width = args.drafter_config.hidden_size;
+            config.dflash_capture_offset = 0;
+            anyhow::ensure!(
+                config.dflash_capture_width <= config.residual_width(),
+                "dense DFlash bridge width {} exceeds Flash-Next residual width {}",
+                config.dflash_capture_width,
+                config.residual_width(),
+            );
+            tracing::warn!(
+                "EXPERIMENTAL Qwen4->dense-DFlash bridge: capture depths {:?}->{:?}; exposing BF16 residual slice [{}..{}) of {}. Target verification remains authoritative; qualification is required before production use.",
+                raw_with_offset,
+                config.dflash_capture_layers,
+                config.dflash_capture_offset,
+                config.dflash_capture_offset + config.dflash_capture_width,
+                config.residual_width(),
+            );
+        } else {
+            anyhow::ensure!(
+                args.donor_store.is_none(),
+                "--dflash-donor-model is only valid for an explicit Qwen3.8-Flash-Next bridge"
+            );
+            config.dflash_capture_layers = raw_with_offset;
+        }
         tracing::info!(
             "DFlash: target layer capture indices = {:?} (offset={offset} from raw {:?})",
             config.dflash_capture_layers,
@@ -197,35 +285,38 @@ pub fn build_model(
         Some(q)
     };
 
-    let qwen4_mtp_proposer: Option<Arc<dyn crate::speculative::DraftProposer>> =
-        if use_speculative && config.is_qwen4_exp() && store.contains("mtp.fc_embedding.weight") {
-            let mtp_config = crate::weight_loader::qwen4_mtp_config(&config);
-            let mtp_layer = crate::weight_loader::load_qwen4_mtp_layer(
-                store,
-                &config,
-                gpu.as_ref(),
-                KvCacheDtype::Bf16,
-            )?;
-            let mtp_final_mixer = loader
-                .load_qwen4_final_mixer(store, &mtp_config, gpu.as_ref())?
-                .context("Qwen4 MTP checkpoint is missing its final hyperconnection mixer")?;
-            let shared_lm_head =
-                lm_head_nvfp4.context("Qwen4 native MTP requires the target NVFP4 LM head")?;
-            Some(Arc::new(crate::layers::Qwen4MtpHead::new(
-                store,
-                &config,
-                mtp_layer,
-                mtp_final_mixer,
-                embed,
-                shared_lm_head,
-                gpu.as_ref(),
-                mtp_vocab_size,
-                max_seq_len,
-                max_batch_size,
-            )?))
-        } else {
-            None
-        };
+    let qwen4_mtp_proposer: Option<Arc<dyn crate::speculative::DraftProposer>> = if use_speculative
+        && config.is_qwen4_exp()
+        && store.contains("mtp.fc_embedding.weight")
+        && store.contains("mtp.layers.0.mlp.experts.0.gate_proj.weight")
+    {
+        let mtp_config = crate::weight_loader::qwen4_mtp_config(&config);
+        let mtp_layer = crate::weight_loader::load_qwen4_mtp_layer(
+            store,
+            &config,
+            gpu.as_ref(),
+            KvCacheDtype::Bf16,
+        )?;
+        let mtp_final_mixer = loader
+            .load_qwen4_final_mixer(store, &mtp_config, gpu.as_ref())?
+            .context("Qwen4 MTP checkpoint is missing its final hyperconnection mixer")?;
+        let shared_lm_head =
+            lm_head_nvfp4.context("Qwen4 native MTP requires the target NVFP4 LM head")?;
+        Some(Arc::new(crate::layers::Qwen4MtpHead::new(
+            store,
+            &config,
+            mtp_layer,
+            mtp_final_mixer,
+            embed,
+            shared_lm_head,
+            gpu.as_ref(),
+            mtp_vocab_size,
+            max_seq_len,
+            max_batch_size,
+        )?))
+    } else {
+        None
+    };
 
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
@@ -448,12 +539,40 @@ pub fn build_model(
     // Capture pointers for any post-construction sharing (DFlash drafter
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
     // so this clones the device pointer cheaply.
-    let target_embed_for_dflash = embed.weight;
-    let target_lm_head_for_dflash = lm_head.weight;
+    let (target_embed_for_dflash, target_lm_head_for_dflash) = if let Some(args) =
+        dflash_args.as_ref()
+        && let Some(donor) = args.donor_store
+    {
+        let hidden = args.drafter_config.hidden_size;
+        let vocab = args.drafter_config.vocab_size;
+        let embed = donor_tensor(
+            donor,
+            &[
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "embed_tokens.weight",
+            ],
+            &[vocab, hidden],
+            "embedding",
+        )?;
+        let lm_head = donor_tensor(
+            donor,
+            &["lm_head.weight", "model.lm_head.weight"],
+            &[vocab, hidden],
+            "lm_head",
+        )?;
+        (embed.ptr, lm_head.ptr)
+    } else {
+        (embed.weight, lm_head.weight)
+    };
     // DFlash trains against the target model's exposed intermediate states.
     // Qwen4 exposes the full four-stream hyperconnection row (4H); ordinary
     // targets have residual_width()==hidden_size, preserving their ABI.
-    let target_hidden_for_dflash = config.residual_width();
+    let target_hidden_for_dflash = if config.dflash_capture_width > 0 {
+        config.dflash_capture_width
+    } else {
+        config.residual_width()
+    };
     // Honor --mtp-vocab for the DFlash drafter lm_head, mirroring the MTP
     // head: drafts only need argmax over the high-frequency vocab prefix,
     // and the full 248k-row lm_head GEMM at M=γ+1 dominates the propose
@@ -531,7 +650,9 @@ pub fn build_model(
         // drafter's propose lm_head fast path (gated at the call site by
         // ATLAS_DFLASH_LM_HEAD_NVFP4=1). Same device allocation — the
         // drafter reads the --mtp-vocab column prefix via ldb.
-        if let Some((t, ldb)) = model.dflash_lm_head_t() {
+        if args.donor_store.is_none()
+            && let Some((t, ldb)) = model.dflash_lm_head_t()
+        {
             head.lm_head_shared_t = Some(t);
             head.lm_head_shared_t_ldb = ldb;
         }
@@ -540,4 +661,21 @@ pub fn build_model(
     }
 
     Ok(Box::new(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remap_capture_depths;
+
+    #[test]
+    fn remaps_dense_qwen38_capture_depths_to_flash_next() {
+        let mapped =
+            remap_capture_depths(&[1, 10, 18, 27, 35, 44, 52, 61], 64, 48).expect("valid bridge");
+        assert_eq!(mapped, [1, 7, 13, 20, 26, 33, 39, 46]);
+    }
+
+    #[test]
+    fn rejects_capture_outside_donor_depth() {
+        assert!(remap_capture_depths(&[64], 64, 48).is_err());
+    }
 }

@@ -388,8 +388,19 @@ fn startup(
     } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
     let dflash_drafter_state =
         serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?;
+    let dflash_donor_state = serve_phases::load_dflash_donor(&args, gpu.as_ref())?;
     if let Some((_, drafter_config)) = dflash_drafter_state.as_ref() {
         args.dflash_gamma = Some(drafter_config.resolve_draft_count(args.dflash_gamma)?);
+    }
+    if config.is_qwen4_exp()
+        && dflash_donor_state.is_some()
+        && !matches!(args.dflash_gamma, Some(1 | 2))
+    {
+        anyhow::bail!(
+            "the experimental Qwen4-to-dense-V3 bridge supports only --dflash-gamma 1 or 2 \
+             (physical verifier K=2 or K=3); got {:?}",
+            args.dflash_gamma
+        );
     }
     let dflash_quantization = match args.dflash_quantization.as_str() {
         "bf16" => spark_model::layers::DflashQuantization::Bf16,
@@ -407,6 +418,7 @@ fn startup(
             .as_ref()
             .map(|(s, c)| spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
+                donor_store: dflash_donor_state.as_ref(),
                 drafter_config: c.clone(),
                 gamma: args.dflash_gamma,
                 dspark_verify_mode,

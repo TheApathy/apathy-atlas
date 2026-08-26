@@ -113,6 +113,8 @@ impl ModelConfig {
             mtp_transformer_layers: 0,
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
+            dflash_capture_width: 0,
+            dflash_capture_offset: 0,
             ple_offload_manifest: None,
         }
     }

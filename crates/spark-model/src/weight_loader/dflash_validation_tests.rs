@@ -27,6 +27,7 @@ fn config() -> DflashConfig {
         architectures: vec!["DFlashDraftModel".into()],
         hidden_size: 8,
         num_hidden_layers: 2,
+        num_target_layers: 64,
         intermediate_size: 16,
         num_attention_heads: 2,
         num_key_value_heads: 1,

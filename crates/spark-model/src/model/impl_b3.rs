@@ -330,7 +330,8 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
-        let h = self.config.residual_width();
+        let h = self.dflash_capture_width;
+        let source_stride = self.config.residual_width();
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
@@ -341,7 +342,7 @@ impl TransformerModel {
             if abs_pos >= max_ctx {
                 break; // accumulator full; drop later positions
             }
-            let src = src_base.offset(t * h * bf16);
+            let src = src_base.offset((t * source_stride + self.dflash_capture_offset) * bf16);
             let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
             self.gpu
                 .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
@@ -688,7 +689,7 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let h = self.config.residual_width();
+        let h = self.dflash_capture_width;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
 
@@ -905,14 +906,17 @@ impl TransformerModel {
             Some(s) => s,
             None => return Ok(()),
         };
-        let h = self.config.residual_width();
+        let h = self.dflash_capture_width;
         let bf16 = 2usize;
         debug_assert!(
             !self.config.use_fp32_residual(),
             "DFlash hidden capture currently assumes BF16 residual; FP32-residual models need a separate downcast path"
         );
         let n_capture = self.dflash_capture_layers.len();
-        let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
+        let src = self
+            .buffers
+            .hidden_states()
+            .offset((token_idx * self.config.residual_width() + self.dflash_capture_offset) * bf16);
         // [token_idx, slot, hidden] BF16 layout. Per-token stride =
         // n_capture * h * bf16; per-slot stride = h * bf16.
         let dst_off = token_idx * n_capture * h * bf16 + slot * h * bf16;
@@ -986,7 +990,7 @@ impl TransformerModel {
             return Ok(());
         }
 
-        let h = self.config.residual_width();
+        let h = self.dflash_capture_width;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let bytes_per_slot = h * bf16;

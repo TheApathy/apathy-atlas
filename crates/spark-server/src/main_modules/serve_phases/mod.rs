@@ -65,7 +65,9 @@ pub(super) use runtime::{
 pub(super) use sampling_audit::log_sampling_presets;
 pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
-pub(super) use weights::{auto_detect_weight_prefix, load_dflash_drafter, load_weight_store};
+pub(super) use weights::{
+    auto_detect_weight_prefix, load_dflash_donor, load_dflash_drafter, load_weight_store,
+};
 
 #[cfg(test)]
 mod speculative_width_tests {

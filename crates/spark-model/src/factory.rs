@@ -30,6 +30,7 @@ use crate::weight_loader::{
 /// target before constructing [`crate::layers::BlockDiffusionDraftHead`].
 pub struct DflashBuildArgs<'a> {
     pub drafter_store: &'a WeightStore,
+    pub donor_store: Option<&'a WeightStore>,
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub dspark_verify_mode: DsparkVerifyMode,

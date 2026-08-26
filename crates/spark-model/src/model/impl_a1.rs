@@ -746,6 +746,19 @@ impl TransformerModel {
             );
             dflash_capture_layers = layers;
         }
+        let dflash_capture_width = if config.dflash_capture_width == 0 {
+            config.residual_width()
+        } else {
+            config.dflash_capture_width
+        };
+        let dflash_capture_offset = config.dflash_capture_offset;
+        anyhow::ensure!(
+            dflash_capture_offset.saturating_add(dflash_capture_width) <= config.residual_width(),
+            "DFlash capture slice offset={} width={} exceeds target residual width {}",
+            dflash_capture_offset,
+            dflash_capture_width,
+            config.residual_width(),
+        );
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
         } else {
@@ -755,7 +768,7 @@ impl TransformerModel {
             // `try_dflash_capture(token_idx=0..T)`. Track the real flat/tree
             // capacities instead of hardcoding a historical width.
             let k_max = dflash_kgamma.max(ddtree_cap);
-            Some(gpu.alloc(k_max * n * config.residual_width() * 2)?)
+            Some(gpu.alloc(k_max * n * dflash_capture_width * 2)?)
         };
 
         // EP command buffer for token broadcast (4 bytes, u32)
@@ -1040,6 +1053,8 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_batched_ffn_input: parking_lot::Mutex::new(None),
             dflash_capture_layers,
+            dflash_capture_width,
+            dflash_capture_offset,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
             verify4_graph: Mutex::new(std::collections::HashMap::new()),

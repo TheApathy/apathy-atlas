@@ -96,9 +96,12 @@ fn checked_reserve_totals(
     Ok((inference_reserve, total_reserve))
 }
 
-fn speculative_cuda_headroom(speculative_drafts: Option<usize>) -> usize {
+fn speculative_cuda_headroom(
+    speculative_drafts: Option<usize>,
+    configured_headroom_mb: usize,
+) -> usize {
     match speculative_drafts {
-        Some(_) => 4 * 1024 * 1024 * 1024,
+        Some(_) => configured_headroom_mb.saturating_mul(1024 * 1024),
         None => 512 * 1024 * 1024,
     }
 }
@@ -122,7 +125,8 @@ pub(crate) fn preflight_reserve(
         requested_ddtree_capacity,
     )?;
     let spec_tokens_pre = speculative_geometry.num_intermediates.max(1);
-    let cuda_headroom = speculative_cuda_headroom(speculative_drafts);
+    let cuda_headroom =
+        speculative_cuda_headroom(speculative_drafts, args.speculative_cuda_headroom_mb);
     let decode_ring_slots = if num_ssm_layers > 0 {
         (atlas_kernels::ROLLBACK_RESTEER_CAP as usize)
             .checked_add(1)
@@ -435,12 +439,15 @@ mod dflash_preflight_shape_tests {
 
     #[test]
     fn dflash_block16_reserves_for_fifteen_drafts() {
-        assert_eq!(speculative_cuda_headroom(Some(15)), 4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            speculative_cuda_headroom(Some(15), 4096),
+            4 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
     fn plain_decode_keeps_the_small_reserve() {
-        assert_eq!(speculative_cuda_headroom(None), 512 * 1024 * 1024);
+        assert_eq!(speculative_cuda_headroom(None, 4096), 512 * 1024 * 1024);
     }
 }
 

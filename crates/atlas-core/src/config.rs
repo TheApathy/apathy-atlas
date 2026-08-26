@@ -367,6 +367,14 @@ pub struct ModelConfig {
     /// is what the drafter's `fc` projection expects.
     #[serde(default)]
     pub dflash_capture_layers: Vec<usize>,
+    /// Runtime-only width copied from each target residual row into the
+    /// DFlash capture stack. Zero means the ordinary full residual width.
+    #[serde(skip)]
+    pub dflash_capture_width: usize,
+    /// Runtime-only BF16 element offset into each residual row. Used by the
+    /// explicit Flash-Next -> dense-DFlash compatibility bridge.
+    #[serde(skip)]
+    pub dflash_capture_offset: usize,
 
     /// Runtime-only manifest for a sparse Qwen4 PLE backing store. The
     /// server discovers `ple-offload/manifest.json` beside the checkpoint;
