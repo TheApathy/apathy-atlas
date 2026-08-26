@@ -141,6 +141,20 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // Keep the prior K=2 verifier as an explicit diagnostic oracle. The
+        // production Qwen4 path below now owns K=2 and K=3 with batched MoE.
+        if self.config.is_qwen4_exp()
+            && k == 2
+            && std::env::var("ATLAS_QWEN4_VERIFY_LEGACY_K2")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            let pair = [tokens[0], tokens[1]];
+            return Ok(self
+                .decode_verify_graphed_dispatch(&pair, seq, _stream)?
+                .to_vec());
+        }
 
         // ATLAS_SSM_H_FP16 stage 2. This entry point does NOT exist upstream —
         // the speculative verify is ours — and it is the one that matters most
@@ -151,6 +165,7 @@ impl TransformerModel {
         self.ssm_h_to_f16_dispatch(seq)?;
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
+        let persistent_width = self.config.residual_width();
         let bf16 = 2usize;
         let fp32 = if self.config.use_fp32_residual() {
             4usize
@@ -286,11 +301,15 @@ impl TransformerModel {
                 } else {
                     tokens[t]
                 };
-                self.embed(src_token, hidden.offset(t * h * fp32), stream)?;
+                self.embed(
+                    src_token,
+                    hidden.offset(t * persistent_width * fp32),
+                    stream,
+                )?;
             }
             anyhow::Result::<()>::Ok(())
         })?;
-        self.capture_k1_stage("embed", hidden, k, h * fp32, stream)?;
+        self.capture_k1_stage("embed", hidden, k, persistent_width * fp32, stream)?;
 
         // 1b. Allocate KV blocks for all K positions
         let bs = kv_cache.block_size();
@@ -820,7 +839,12 @@ impl TransformerModel {
             && !layer_resolution_probe_enabled()
             && serial_family.is_none()
             && !crate::model::k1_stage_diag::enabled()
-            && !controlled_verify;
+            && !controlled_verify
+            // Qwen4 PLE performs host-backed sparse row fetches and the
+            // four-stream layer traversal carries row-specific inject
+            // scratch. Keep this path eager until a graph-safe batched PLE
+            // fetch exists.
+            && !self.config.is_qwen4_exp();
 
         // M8A: upload DDTree parent_ids (when stashed) so the GDN dispatch
         // can fire the tree-aware kernel. Stash lives on the model so we
@@ -1108,6 +1132,7 @@ impl TransformerModel {
                 self.gpu.begin_capture(stream)?;
             }
 
+            let mut qwen4_ssm_layer_idx = 0usize;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
 
@@ -1122,7 +1147,57 @@ impl TransformerModel {
                     continue;
                 }
 
-                if layer_type == LayerType::FullAttention {
+                if self.config.is_qwen4_exp() {
+                    if layer_idx == 1
+                        && let Some(ple) = &self.qwen4_ple
+                    {
+                        for (row, &token) in tokens.iter().enumerate() {
+                            let mut prior = seq.tokens.clone();
+                            prior.extend_from_slice(&tokens[..row]);
+                            ple.forward_token(
+                                token,
+                                &prior,
+                                hidden.offset(row * persistent_width * fp32),
+                                seq.slot_idx,
+                                false,
+                                self.gpu.as_ref(),
+                                stream,
+                            )?;
+                            ple.save_intermediate(seq.slot_idx, row, self.gpu.as_ref(), stream)?;
+                        }
+                    }
+
+                    let (h_inter, conv_inter) = if layer_type == LayerType::LinearAttention {
+                        (
+                            self.ssm_pool
+                                .h_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
+                            self.ssm_pool
+                                .conv_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
+                        )
+                    } else {
+                        (DevicePtr::NULL, DevicePtr::NULL)
+                    };
+                    layer.decode_qwen4_batched(
+                        hidden,
+                        residual,
+                        k,
+                        seq.layer_states[layer_idx].as_mut(),
+                        &mut kv_cache,
+                        seq.seq_len,
+                        &mut seq.block_table,
+                        &mut seq.disk_block_ids,
+                        &mut seq.disk_last_offloaded_per_layer,
+                        h_inter,
+                        conv_inter,
+                        self.ssm_pool.h_bytes,
+                        self.ssm_pool.conv_bytes,
+                        &ctx,
+                        stream,
+                    )?;
+                    if layer_type == LayerType::LinearAttention {
+                        qwen4_ssm_layer_idx += 1;
+                    }
+                } else if layer_type == LayerType::FullAttention {
                     if hss_engaged {
                         // HSS path: decode_multi_seq's paged-decode kernel
                         // reads K/V from HBM only, missing the long-context
@@ -1183,7 +1258,7 @@ impl TransformerModel {
                     &format!("layer_{layer_idx:02}"),
                     hidden,
                     k,
-                    h * fp32,
+                    persistent_width * fp32,
                     stream,
                 )?;
                 // DFlash hidden capture for ctx conditioning. Save ALL k
@@ -1227,7 +1302,31 @@ impl TransformerModel {
             }
 
             let normed = self.buffers.norm_output();
-            if serial.final_norm {
+            if self.config.is_qwen4_exp() {
+                let saved_row0 = self.buffers.attn_output();
+                for t in 0..k {
+                    let row_offset = t * persistent_width * fp32;
+                    self.qwen4_final_hidden(
+                        hidden.offset(row_offset),
+                        residual.offset(row_offset),
+                        stream,
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("qwen4_exp verify missing final mixer"))?;
+                    if t == 0 {
+                        self.gpu
+                            .copy_d2d_async(normed, saved_row0, h * bf16, stream)?;
+                    } else {
+                        self.gpu.copy_d2d_async(
+                            normed,
+                            normed.offset(t * h * bf16),
+                            h * bf16,
+                            stream,
+                        )?;
+                    }
+                }
+                self.gpu
+                    .copy_d2d_async(saved_row0, normed, h * bf16, stream)?;
+            } else if serial.final_norm {
                 self.dflash_k1_final_norm(hidden, k, stream)?;
             } else {
                 crate::kprof!(self.gpu.as_ref(), stream, "final_norm", {

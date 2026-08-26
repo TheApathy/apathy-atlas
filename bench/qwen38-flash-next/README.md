@@ -46,9 +46,21 @@ Flash-Next K=2 diagnostic was coherent but non-identical and slower (25.2982
 tok/s median), so Atlas rejects it by default. The production PLE NVMe plus
 system-memory ngram cache remains enabled; these are separate mechanisms.
 
-The dense Qwen3.8 v3 and DFlash2 drafters are shape-incompatible with
-Flash-Next's 48 layers and four-stream residual width and must not be loaded.
-The pinned Inferact sidecar has the correct native Flash-Next MTP architecture,
-but its proposer runtime is not yet qualified. No >70 tok/s claim is made
-until native MTP or a Flash-Next-specific DFlash2 checkpoint passes the same
-output-hash gate.
+The pinned Inferact native-MTP sidecar now passes the same output-hash gate.
+K=2 verification uses exact multi-row hyperconnection projections and fused
+MoE, producing the target-only stable SHA-256 above at 36.3819 tok/s in the
+first 400-token run. This is up from the initial exact native-MTP result of
+33.9389 tok/s, but still below target-only, so the production launcher does not
+enable it by default. To reproduce the diagnostic, append:
+
+```bash
+--speculative \
+--mtp-from-path /path/to/Qwen3.8-Flash-Next-Inferact-MTP \
+--num-drafts 1 --mtp-vocab 248077
+```
+
+The dense Qwen3.8 v3 and DFlash2 sidecars remain shape-incompatible with
+Flash-Next's four-stream target-hidden contract and fail closed. A standalone
+v3 proposer path and a Flash-Next bridge adapter are under investigation. No
+70/80 tok/s claim is made until a qualified drafter beats the target-only
+control under the same output-hash gate.

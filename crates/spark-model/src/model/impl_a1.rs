@@ -44,6 +44,7 @@ impl TransformerModel {
         kv_cache: PagedKvCache,
         mtp_weights: Vec<MtpWeights>,
         mtp_dense_weights: Option<crate::weight_map::MtpDenseWeights>,
+        qwen4_mtp_proposer: Option<Arc<dyn DraftProposer>>,
         gpu: Box<dyn GpuBackend>,
         max_seq_len: usize,
         max_batch_size: usize,
@@ -196,6 +197,7 @@ impl TransformerModel {
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && lm_head_nvfp4.is_some())
             || (use_speculative && mtp_dense_weights.is_some() && lm_head_nvfp4.is_some())
+            || qwen4_mtp_proposer.is_some()
             || dflash_enabled;
         let requested_ddtree_capacity = std::env::var("ATLAS_DDTREE_MAX_NODES")
             .ok()
@@ -602,18 +604,20 @@ impl TransformerModel {
         };
 
         // Build MTP proposer (extracted to keep `new` under the file cap).
-        let proposer: Option<Arc<dyn DraftProposer>> = super::impl_a1_init::build_mtp_proposer(
-            use_speculative,
-            mtp_weights,
-            mtp_dense_weights,
-            embed_tokens,
-            lm_head_nvfp4,
-            &config,
-            gpu.as_ref(),
-            mtp_quant,
-            mtp_vocab_size,
-            max_seq_len,
-        );
+        let proposer: Option<Arc<dyn DraftProposer>> = qwen4_mtp_proposer.or_else(|| {
+            super::impl_a1_init::build_mtp_proposer(
+                use_speculative,
+                mtp_weights,
+                mtp_dense_weights,
+                embed_tokens,
+                lm_head_nvfp4,
+                &config,
+                gpu.as_ref(),
+                mtp_quant,
+                mtp_vocab_size,
+                max_seq_len,
+            )
+        });
 
         if self_speculative {
             let num_ssm = config.num_ssm_layers();
@@ -625,8 +629,14 @@ impl TransformerModel {
             );
         }
 
-        // MTP hidden state save buffer (1 × hidden_size FP32)
-        let mtp_hidden_save = gpu.alloc(config.hidden_size * 4)?;
+        // Qwen4 MTP consumes the pre-final four-stream row in BF16; legacy
+        // MTP consumes one hidden stream and may use FP32 residuals.
+        let mtp_hidden_bytes = if config.is_qwen4_exp() {
+            config.residual_width() * 2
+        } else {
+            config.hidden_size * 4
+        };
+        let mtp_hidden_save = gpu.alloc(mtp_hidden_bytes)?;
 
         // Last-K prompt-tail target hidden capture buffer for MTP prefill.
         // Gated by ATLAS_MTP_LASTK_PREFILL=N (N>0 enables, default 0 disabled).
@@ -634,14 +644,19 @@ impl TransformerModel {
         let mtp_lastk_capacity: usize = std::env::var("ATLAS_MTP_LASTK_PREFILL")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or(if config.is_qwen4_exp() { 64 } else { 0 });
         let mtp_lastk_buf = if mtp_lastk_capacity > 0 && proposer.is_some() {
+            let row_bytes = if config.is_qwen4_exp() {
+                config.residual_width() * 2
+            } else {
+                config.hidden_size * 4
+            };
             tracing::info!(
                 "MTP last-K prefill: ENABLED (K={mtp_lastk_capacity} tokens, \
                  {} KiB hidden capture buffer)",
-                mtp_lastk_capacity * config.hidden_size * 4 / 1024,
+                mtp_lastk_capacity * row_bytes / 1024,
             );
-            Some(gpu.alloc(mtp_lastk_capacity * config.hidden_size * 4)?)
+            Some(gpu.alloc(mtp_lastk_capacity * row_bytes)?)
         } else {
             None
         };

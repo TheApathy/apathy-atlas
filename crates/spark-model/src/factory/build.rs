@@ -3,7 +3,9 @@
 //! `build_model` — entry point that wires up the configured loader,
 //! buffers, KV cache, and (optional) DFlash drafter into a `TransformerModel`.
 
-use anyhow::Result;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
@@ -194,6 +196,36 @@ pub fn build_model(
         tracing::info!("LM head quantized to NVFP4 (vocab={})", config.vocab_size);
         Some(q)
     };
+
+    let qwen4_mtp_proposer: Option<Arc<dyn crate::speculative::DraftProposer>> =
+        if use_speculative && config.is_qwen4_exp() && store.contains("mtp.fc_embedding.weight") {
+            let mtp_config = crate::weight_loader::qwen4_mtp_config(&config);
+            let mtp_layer = crate::weight_loader::load_qwen4_mtp_layer(
+                store,
+                &config,
+                gpu.as_ref(),
+                KvCacheDtype::Bf16,
+            )?;
+            let mtp_final_mixer = loader
+                .load_qwen4_final_mixer(store, &mtp_config, gpu.as_ref())?
+                .context("Qwen4 MTP checkpoint is missing its final hyperconnection mixer")?;
+            let shared_lm_head =
+                lm_head_nvfp4.context("Qwen4 native MTP requires the target NVFP4 LM head")?;
+            Some(Arc::new(crate::layers::Qwen4MtpHead::new(
+                store,
+                &config,
+                mtp_layer,
+                mtp_final_mixer,
+                embed,
+                shared_lm_head,
+                gpu.as_ref(),
+                mtp_vocab_size,
+                max_seq_len,
+                max_batch_size,
+            )?))
+        } else {
+            None
+        };
 
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
@@ -447,6 +479,7 @@ pub fn build_model(
         kv_cache,
         mtp_weights,
         mtp_dense_weights,
+        qwen4_mtp_proposer,
         gpu,
         max_seq_len,
         max_batch_size,

@@ -179,7 +179,7 @@ pub(super) fn load_layers(
                 absmax_k,
                 quantize_k,
                 stream,
-                &format!("qwen4.layers.{i}.moe_gate.nvfp4"),
+                &format!("{lp}.moe_gate.nvfp4"),
             )?
         } else {
             quantize_to_nvfp4(

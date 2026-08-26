@@ -202,6 +202,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub speculative: bool,
 
+    /// Supplemental Flash-Next native-MTP checkpoint. Indexed sidecars may
+    /// reference absent base-model shards; Atlas loads only `mtp.*` tensors.
+    #[arg(long, value_name = "PATH")]
+    pub mtp_from_path: Option<std::path::PathBuf>,
+
     /// Enable self-speculative decoding: draft via layer-skipping (no MTP weights needed).
     /// Skips SSM layers during drafting for cheap predictions, then verifies with full model.
     #[arg(long, default_value_t = false)]

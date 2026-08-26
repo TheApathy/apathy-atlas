@@ -16,6 +16,31 @@ use crate::weight_map::{
 
 pub struct Qwen35WeightLoader;
 
+pub(crate) fn qwen4_mtp_config(target: &ModelConfig) -> ModelConfig {
+    let mut config = target.clone();
+    config.num_hidden_layers = 1;
+    config.layer_types = vec![atlas_core::config::LayerType::FullAttention];
+    config.full_attention_interval = 1;
+    config.weight_prefix = "mtp".to_string();
+    config.dflash_capture_layers.clear();
+    config.vision = None;
+    config
+}
+
+pub(crate) fn load_qwen4_mtp_layer(
+    store: &WeightStore,
+    target: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    kv_dtype: KvCacheDtype,
+) -> Result<Box<dyn TransformerLayer>> {
+    let config = qwen4_mtp_config(target);
+    let mut layers =
+        load_layers::load_layers(&Qwen35WeightLoader, store, &config, gpu, &[kv_dtype])?;
+    crate::weight_loader::transform_cache::finish();
+    anyhow::ensure!(layers.len() == 1, "Qwen4 MTP must load exactly one layer");
+    Ok(layers.remove(0))
+}
+
 impl ModelWeightLoader for Qwen35WeightLoader {
     fn supports_tp(&self) -> bool {
         // FullAttention layers are TP-sharded across all 3 quant paths

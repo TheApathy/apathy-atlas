@@ -146,6 +146,43 @@ impl TransformerLayer for Qwen3AttentionLayer {
         )
     }
 
+    fn decode_qwen4_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        h_intermediate: DevicePtr,
+        conv_intermediate: DevicePtr,
+        h_intermediate_stride: usize,
+        conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_qwen4_batched_inner(
+            hidden,
+            residual,
+            num_tokens,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            h_intermediate,
+            conv_intermediate,
+            h_intermediate_stride,
+            conv_intermediate_stride,
+            ctx,
+            stream,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,

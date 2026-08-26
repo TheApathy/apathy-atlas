@@ -257,7 +257,7 @@ fn startup(
     }
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
     tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
-    let store = serve_phases::load_weight_store(
+    let mut store = serve_phases::load_weight_store(
         &args,
         &config,
         &model_dir,
@@ -266,6 +266,36 @@ fn startup(
         ep_size,
         oom_reserve_bytes,
     )?;
+
+    if let Some(mtp_dir) = &args.mtp_from_path {
+        use spark_runtime::weights::WeightLoader;
+        anyhow::ensure!(args.speculative, "--mtp-from-path requires --speculative");
+        anyhow::ensure!(
+            config.is_qwen4_exp(),
+            "--mtp-from-path currently supports only qwen4_exp"
+        );
+        let expert_prefixes =
+            (0..config.num_experts).map(|expert| format!("mtp.layers.0.mlp.experts.{expert}."));
+        let mut loader = spark_runtime::fast_weights::FastSafetensorsLoader::new()
+            .with_name_prefixes(expert_prefixes);
+        loader.peak_memory_multiplier = Some(1.15);
+        let mtp_store = loader
+            .load(mtp_dir, gpu.as_ref(), oom_reserve_bytes)
+            .with_context(|| format!("Failed to load MTP sidecar {}", mtp_dir.display()))?;
+        spark_model::weight_loader::qwen4_mtp::validate_qwen4_mtp_expert_store(&mtp_store, &config)
+            .context("Qwen4 MTP expert sidecar schema validation failed")?;
+        let count = mtp_store.len();
+        let bytes = mtp_store.total_bytes();
+        store.merge_disjoint(mtp_store)?;
+        spark_model::weight_loader::qwen4_mtp::validate_qwen4_mtp_store(&store, &config)
+            .context("Merged Qwen4 MTP schema validation failed")?;
+        tracing::info!(
+            tensors = count,
+            gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            path = %mtp_dir.display(),
+            "Qwen4 native MTP sidecar loaded and schema-validated"
+        );
+    }
 
     // 3b. Auto-detect weight key prefix for nested models.
     serve_phases::auto_detect_weight_prefix(&store, &mut config);

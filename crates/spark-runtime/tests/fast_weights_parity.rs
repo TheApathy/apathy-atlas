@@ -101,6 +101,49 @@ fn fast_loader_with_direct_io_if_supported() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+#[test]
+fn prefix_filter_skips_unrelated_missing_index_shards() {
+    let tmp = tempdir_like();
+    let header = serde_json::json!({
+        "mtp.a": { "dtype": "BF16", "shape": [2], "data_offsets": [0, 4] },
+    });
+    let header_bytes = serde_json::to_vec(&header).unwrap();
+    let mut shard = std::fs::File::create(tmp.join("mtp.safetensors")).unwrap();
+    shard
+        .write_all(&(header_bytes.len() as u64).to_le_bytes())
+        .unwrap();
+    shard.write_all(&header_bytes).unwrap();
+    shard.write_all(&[1, 2, 3, 4]).unwrap();
+    shard.sync_all().unwrap();
+    let index = serde_json::json!({
+        "weight_map": {
+            "mtp.a": "mtp.safetensors",
+            "model.base": "missing-base.safetensors"
+        }
+    });
+    std::fs::write(
+        tmp.join("model.safetensors.index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+
+    let gpu = MockGpuBackend::new();
+    let mut loader = FastSafetensorsLoader::new().with_name_prefixes(["mtp.".to_string()]);
+    loader.try_direct_io = false;
+    let store = loader
+        .load(&tmp, &gpu, 0)
+        .expect("prefix-filtered sidecar load");
+    assert_eq!(store.len(), 1);
+    assert!(store.contains("mtp.a"));
+    assert!(!store.contains("model.base"));
+    assert_eq!(
+        gpu.read_alloc(store.get("mtp.a").unwrap().ptr).unwrap(),
+        [1, 2, 3, 4]
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
 /// Creates a unique temp directory without pulling in the tempfile crate.
 fn tempdir_like() -> std::path::PathBuf {
     let pid = std::process::id();

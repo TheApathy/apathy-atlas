@@ -53,6 +53,31 @@ pub trait TransformerLayer: Send + Sync {
         stream: u64,
     ) -> Result<()>;
 
+    /// Qwen4 speculative verify: run `num_tokens` four-stream rows through
+    /// this layer while batching the MoE sublayer. Architectures without
+    /// Qwen4 hyperconnections fail closed.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_qwen4_batched(
+        &self,
+        _hidden: DevicePtr,
+        _residual: DevicePtr,
+        _num_tokens: usize,
+        _state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        _seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        _h_intermediate: DevicePtr,
+        _conv_intermediate: DevicePtr,
+        _h_intermediate_stride: usize,
+        _conv_intermediate_stride: usize,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("layer does not support batched Qwen4 verify")
+    }
+
     /// Prefill N tokens through this layer using GEMM-batched projections.
     ///
     /// Used during prompt processing: reads weight matrices once for all N

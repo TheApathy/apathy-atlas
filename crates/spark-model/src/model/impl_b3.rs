@@ -382,13 +382,16 @@ impl TransformerModel {
         if proc_count == 0 {
             return Ok(());
         }
-        let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
+        let row_bytes = if self.config.is_qwen4_exp() {
+            self.config.residual_width() * 2
         } else {
-            2usize
+            let element_bytes = if self.config.use_fp32_residual() {
+                4
+            } else {
+                2
+            };
+            self.config.hidden_size * element_bytes
         };
-        let row_bytes = h * fp32;
         let ring_capacity_bytes = capacity * row_bytes;
 
         // Lazy-size the host ring buffer.
@@ -537,13 +540,16 @@ impl TransformerModel {
             return Ok(());
         }
         let end_abs = seq.mtp_lastk_end_abs;
-        let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
+        let row_bytes = if self.config.is_qwen4_exp() {
+            self.config.residual_width() * 2
         } else {
-            2usize
+            let element_bytes = if self.config.use_fp32_residual() {
+                4
+            } else {
+                2
+            };
+            self.config.hidden_size * element_bytes
         };
-        let row_bytes = h * fp32;
         let used_bytes = filled * row_bytes;
 
         // The `filled` rows in the host ring occupy

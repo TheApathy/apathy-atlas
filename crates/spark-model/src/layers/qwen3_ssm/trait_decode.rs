@@ -5,6 +5,120 @@
 use super::*;
 
 impl Qwen3SsmLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_qwen4_batched_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        _seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        h_intermediate: DevicePtr,
+        conv_intermediate: DevicePtr,
+        h_intermediate_stride: usize,
+        conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (attn_hyper, mlp_hyper) = match (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper) {
+            (Some(attn), Some(mlp)) => (attn, mlp),
+            _ => anyhow::bail!("Qwen4 batched verify requested without hyperconnections"),
+        };
+        let h = ctx.config.hidden_size;
+        let row_bytes = ctx.config.residual_width() * 2;
+        let core_bytes = h * 2;
+        let eps = ctx.config.rms_norm_eps as f32;
+
+        // Batch the four-stream projection weights, then retain exact causal
+        // ordering in the recurrent GDN core.
+        let mixed_attn = attn_hyper.prepare_batched(
+            hidden,
+            residual,
+            num_tokens,
+            ctx.buffers,
+            ctx.gpu,
+            eps,
+            stream,
+        )?;
+        // The attention/recurrent projection stacks may consume split-K
+        // workspace internally. MoE gate logits are idle until the later FFN.
+        let attn_inputs = ctx.buffers.gate_logits();
+        anyhow::ensure!(
+            num_tokens * core_bytes <= ctx.buffers.sizes().gate_logits,
+            "Qwen4 batched recurrent input staging exceeds gate-logit workspace"
+        );
+        ctx.gpu
+            .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
+        let ssm_state = state
+            .as_any_mut()
+            .downcast_mut::<SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+        for row in 0..num_tokens {
+            let hidden_row = hidden.offset(row * row_bytes);
+            let residual_row = residual.offset(row * row_bytes);
+            let ssm_out = self.ssm_forward(
+                attn_inputs.offset(row * core_bytes),
+                ssm_state,
+                ctx,
+                stream,
+                false,
+            )?;
+            attn_hyper.inject_decode(
+                hidden_row,
+                ssm_out,
+                attn_hyper.saved_inject(residual_row),
+                ctx.gpu,
+                stream,
+            )?;
+            if !h_intermediate.is_null() {
+                ctx.gpu.copy_d2d_async(
+                    ssm_state.h_state,
+                    h_intermediate.offset(row * h_intermediate_stride),
+                    h_intermediate_stride,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    ssm_state.conv_state,
+                    conv_intermediate.offset(row * conv_intermediate_stride),
+                    conv_intermediate_stride,
+                    stream,
+                )?;
+            }
+        }
+
+        let ffn_inputs = mlp_hyper.prepare_batched(
+            hidden,
+            residual,
+            num_tokens,
+            ctx.buffers,
+            ctx.gpu,
+            eps,
+            stream,
+        )?;
+        match num_tokens {
+            2 => self.ffn.forward_k2(ffn_inputs, ctx, stream)?,
+            3 => self.ffn.forward_k3(ffn_inputs, ctx, stream)?,
+            n => self.ffn.forward_batched(ffn_inputs, n, ctx, stream)?,
+        }
+        let ffn_output = ctx.buffers.moe_output();
+        for row in 0..num_tokens {
+            let hidden_row = hidden.offset(row * row_bytes);
+            let residual_row = residual.offset(row * row_bytes);
+            mlp_hyper.inject_decode(
+                hidden_row,
+                ffn_output.offset(row * core_bytes),
+                mlp_hyper.saved_inject(residual_row),
+                ctx.gpu,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn decode_inner(
         &self,
         hidden: DevicePtr,

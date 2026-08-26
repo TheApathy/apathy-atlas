@@ -527,6 +527,9 @@ impl TransformerModel {
             }
         }
 
+        if let Some(ple) = &self.qwen4_ple {
+            ple.rollback_and_checkpoint(seq.slot_idx, num_accepted, self.gpu.as_ref(), stream)?;
+        }
         self.gpu.record_event(self.secondary_event, stream)?;
         if let Some(t0) = t_probe {
             let enqueue_us = t0.elapsed().as_micros();

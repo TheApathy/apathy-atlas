@@ -36,6 +36,87 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    /// Exact token-major oracle for Qwen4's four-stream K=2 verification.
+    /// Qwen4 decode-local scratch is not row-disjoint, so both tokens must
+    /// traverse the complete model one at a time.
+    fn decode_verify_qwen4_token_major(
+        &self,
+        tokens: &[u32; 2],
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<[u32; 2]> {
+        let row_bytes = self.config.residual_width() * 2;
+        let hidden = self.buffers.hidden_states();
+
+        let logits0 = self.decode_dispatch(tokens[0], seq, stream)?;
+        let token0 = self.argmax_on_device(logits0, stream)?;
+        let logits_row_bytes = self.config.vocab_size * if self.use_fp32_logits { 4 } else { 2 };
+        let mut logits0_host = vec![0u8; logits_row_bytes];
+        self.gpu.copy_d2h(logits0, &mut logits0_host)?;
+        self.gpu
+            .copy_d2d_async(hidden, self.mtp_hidden_save, row_bytes, stream)?;
+
+        let mut ssm_layer_idx = 0usize;
+        for (layer_idx, layer_state) in seq.layer_states.iter_mut().enumerate() {
+            if self.config.layer_type(layer_idx) != LayerType::LinearAttention {
+                continue;
+            }
+            let ssm = layer_state
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "qwen4_exp token-major verify expected SSM state at layer {layer_idx}"
+                    )
+                })?;
+            self.gpu.copy_d2d_async(
+                ssm.h_state,
+                self.ssm_pool.h_intermediate(ssm_layer_idx, seq.slot_idx, 0),
+                self.ssm_pool.h_bytes,
+                stream,
+            )?;
+            self.gpu.copy_d2d_async(
+                ssm.conv_state,
+                self.ssm_pool
+                    .conv_intermediate(ssm_layer_idx, seq.slot_idx, 0),
+                self.ssm_pool.conv_bytes,
+                stream,
+            )?;
+            ssm_layer_idx += 1;
+        }
+        if let Some(ple) = &self.qwen4_ple {
+            ple.save_intermediate(seq.slot_idx, 0, self.gpu.as_ref(), stream)?;
+        }
+
+        let logits1 = self.decode_dispatch(tokens[1], seq, stream)?;
+        let token1 = self.argmax_on_device(logits1, stream)?;
+        let mut logits1_host = vec![0u8; logits_row_bytes];
+        self.gpu.copy_d2h(logits1, &mut logits1_host)?;
+        // The policy verifier consumes the resident conventional [K, vocab]
+        // layout after target verification. Ordinary decode writes row zero,
+        // so reconstruct both rows explicitly for the exact sampler walk.
+        let logits_base = self.decode_logits_ptr();
+        self.gpu.copy_h2d_group_on_stream(
+            &[
+                HostToDeviceCopy::new(&logits0_host, logits_base),
+                HostToDeviceCopy::new(&logits1_host, logits_base.offset(logits_row_bytes)),
+            ],
+            stream,
+        )?;
+        if let Some(ple) = &self.qwen4_ple {
+            ple.save_intermediate(seq.slot_idx, 1, self.gpu.as_ref(), stream)?;
+        }
+
+        // Restore the conventional verify layout [row0, row1] for
+        // save_hidden_for_mtp(accepted_row).
+        self.gpu
+            .copy_d2d_async(hidden, hidden.offset(row_bytes), row_bytes, stream)?;
+        self.gpu
+            .copy_d2d_async(self.mtp_hidden_save, hidden, row_bytes, stream)?;
+
+        Ok([token0, token1])
+    }
+
     pub(super) fn decode_verify_graphed_dispatch(
         &self,
         tokens: &[u32; 2],
@@ -58,6 +139,14 @@ impl TransformerModel {
         // BEFORE the kernel runs. The kernel mutates the scratch; the
         // canonical is preserved across verify until commit.
         self.pre_verify_copy_async(seq)?;
+
+        let qwen4_token_major_oracle = std::env::var("ATLAS_QWEN4_VERIFY_TOKEN_MAJOR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if self.config.is_qwen4_exp() && qwen4_token_major_oracle {
+            return self.decode_verify_qwen4_token_major(tokens, seq, stream);
+        }
 
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -280,14 +369,11 @@ impl TransformerModel {
                                 self.gpu.as_ref(),
                                 stream,
                             )?;
-                            if row == 0 {
-                                ple.save_intermediate(
-                                    seq.slot_idx,
-                                    row,
-                                    self.gpu.as_ref(),
-                                    stream,
-                                )?;
-                            }
+                            // PLE commit uses the accepted-row index even on
+                            // a full K=2 accept. Preserve both rows: saving
+                            // only row zero makes a 2/2 accept restore stale
+                            // slot one on the next speculative cycle.
+                            ple.save_intermediate(seq.slot_idx, row, self.gpu.as_ref(), stream)?;
                         }
 
                         let token_metadata = AttnMetadataDev {
@@ -316,6 +402,20 @@ impl TransformerModel {
                             &token_ctx,
                             stream,
                         )?;
+
+                        if std::env::var("ATLAS_QWEN4_VERIFY_DUMP").ok().as_deref() == Some("1") {
+                            self.gpu.synchronize(stream)?;
+                            let mut buf = vec![0u8; persistent_row_bytes];
+                            self.gpu
+                                .copy_d2h(hidden.offset(row * persistent_row_bytes), &mut buf)?;
+                            std::fs::write(
+                                format!(
+                                    "/tmp/atlas_qwen4_k2_seqlen{}_row{row}_layer{layer_idx}.bin",
+                                    seq.seq_len
+                                ),
+                                buf,
+                            )?;
+                        }
 
                         if row == 0 && layer_type == LayerType::LinearAttention {
                             let ssm = seq.layer_states[layer_idx]

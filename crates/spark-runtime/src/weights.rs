@@ -131,6 +131,21 @@ impl WeightStore {
         self.weights.values().map(|w| w.byte_size()).sum()
     }
 
+    /// Merge a separately loaded, disjoint sidecar store without copying GPU
+    /// allocations. Duplicate names are rejected so a supplemental checkpoint
+    /// cannot silently replace target weights.
+    pub fn merge_disjoint(&mut self, other: Self) -> Result<()> {
+        if let Some(name) = other
+            .weights
+            .keys()
+            .find(|name| self.weights.contains_key(*name))
+        {
+            bail!("Weight sidecar duplicates target tensor '{name}'");
+        }
+        self.weights.extend(other.weights);
+        Ok(())
+    }
+
     /// Check if any tensor has FP8 dtype.
     pub fn has_fp8_weights(&self) -> bool {
         self.weights

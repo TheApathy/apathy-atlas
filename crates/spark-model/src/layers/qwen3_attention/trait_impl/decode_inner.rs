@@ -14,6 +14,123 @@ use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
 
 impl Qwen3AttentionLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_qwen4_batched_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        _h_intermediate: DevicePtr,
+        _conv_intermediate: DevicePtr,
+        _h_intermediate_stride: usize,
+        _conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (attn_hyper, mlp_hyper) = match (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper) {
+            (Some(attn), Some(mlp)) => (attn, mlp),
+            _ => anyhow::bail!("Qwen4 batched verify requested without hyperconnections"),
+        };
+        let metadata = ctx
+            .attn_metadata
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 batched attention requires metadata"))?;
+        let h = ctx.config.hidden_size;
+        let row_bytes = ctx.config.residual_width() * 2;
+        let core_bytes = h * 2;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let mb = metadata.max_blocks_per_seq as usize;
+
+        // Batch the four-stream projection weights. KV writes and attention
+        // remain token ordered to preserve exact causal semantics.
+        let mixed_attn = attn_hyper.prepare_batched(
+            hidden,
+            residual,
+            num_tokens,
+            ctx.buffers,
+            ctx.gpu,
+            eps,
+            stream,
+        )?;
+        // `attention_forward_oproj` reuses norm_output, so preserve every
+        // mixed row before the first token's attention core clobbers it.
+        let attn_inputs = ctx.buffers.gate_logits();
+        anyhow::ensure!(
+            num_tokens * core_bytes <= ctx.buffers.sizes().gate_logits,
+            "Qwen4 batched attention input staging exceeds gate-logit workspace"
+        );
+        ctx.gpu
+            .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
+        for row in 0..num_tokens {
+            let hidden_row = hidden.offset(row * row_bytes);
+            let residual_row = residual.offset(row * row_bytes);
+            let token_metadata = crate::layer::AttnMetadataDev {
+                positions: metadata.positions.offset(row * 4),
+                positions_h: metadata.positions_h.offset(row * 4),
+                positions_w: metadata.positions_w.offset(row * 4),
+                slot: metadata.slot.offset(row * 8),
+                seq_len: metadata.seq_len.offset(row * 4),
+                block_table: metadata.block_table.offset(row * mb * 4),
+                num_seqs: 1,
+                ..metadata
+            };
+            let token_ctx = ForwardContext {
+                attn_metadata: Some(token_metadata),
+                ..*ctx
+            };
+            let attn_out = self.attention_forward(
+                attn_inputs.offset(row * core_bytes),
+                seq_len + row,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                kv_cache,
+                &token_ctx,
+                stream,
+            )?;
+            attn_hyper.inject_decode(
+                hidden_row,
+                attn_out,
+                attn_hyper.saved_inject(residual_row),
+                ctx.gpu,
+                stream,
+            )?;
+        }
+
+        let ffn_inputs = mlp_hyper.prepare_batched(
+            hidden,
+            residual,
+            num_tokens,
+            ctx.buffers,
+            ctx.gpu,
+            eps,
+            stream,
+        )?;
+        match num_tokens {
+            2 => self.ffn.forward_k2(ffn_inputs, ctx, stream)?,
+            3 => self.ffn.forward_k3(ffn_inputs, ctx, stream)?,
+            n => self.ffn.forward_batched(ffn_inputs, n, ctx, stream)?,
+        }
+        let ffn_output = ctx.buffers.moe_output();
+        for row in 0..num_tokens {
+            let hidden_row = hidden.offset(row * row_bytes);
+            let residual_row = residual.offset(row * row_bytes);
+            mlp_hyper.inject_decode(
+                hidden_row,
+                ffn_output.offset(row * core_bytes),
+                mlp_hyper.saved_inject(residual_row),
+                ctx.gpu,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn decode_inner(
         &self,
         hidden: DevicePtr,

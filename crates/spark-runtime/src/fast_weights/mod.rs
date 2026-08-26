@@ -56,6 +56,9 @@ pub struct FastSafetensorsLoader {
     /// above ~5k tensors/shard; O_DIRECT wins below. Set to [`usize::MAX`]
     /// to disable.
     pub direct_io_tensor_cap: usize,
+    /// Optional tensor-name prefixes. When non-empty, indexed checkpoints
+    /// load only matching tensors and skip unrelated/missing shard files.
+    pub name_prefixes: Vec<String>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -79,6 +82,7 @@ impl FastSafetensorsLoader {
             construction_overhead_bytes: 0,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
+            name_prefixes: Vec::new(),
         }
     }
 
@@ -91,10 +95,24 @@ impl FastSafetensorsLoader {
             construction_overhead_bytes: 0,
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
+            name_prefixes: Vec::new(),
         }
     }
 
+    pub fn with_name_prefixes(mut self, prefixes: impl IntoIterator<Item = String>) -> Self {
+        self.name_prefixes = prefixes.into_iter().collect();
+        self
+    }
+
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if !self.name_prefixes.is_empty()
+            && !self
+                .name_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }
@@ -126,8 +144,29 @@ impl WeightLoader for FastSafetensorsLoader {
         let skip_fn = |name: &str| self.should_skip_tensor(name);
 
         // Resolve shard list (sharded index, single file, or unindexed shards).
-        let (shard_files, tensor_to_shard): (Vec<PathBuf>, Option<HashMap<String, String>>) =
-            resolve_shards(model_dir)?;
+        let (mut shard_files, mut tensor_to_shard): (
+            Vec<PathBuf>,
+            Option<HashMap<String, String>>,
+        ) = resolve_shards(model_dir)?;
+        if !self.name_prefixes.is_empty() {
+            let Some(ref mut map) = tensor_to_shard else {
+                bail!("Prefix-filtered fast loading requires a safetensors index");
+            };
+            map.retain(|name, _| !self.should_skip_tensor(name));
+            let wanted_shards: std::collections::HashSet<&str> =
+                map.values().map(String::as_str).collect();
+            shard_files.retain(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| wanted_shards.contains(name))
+            });
+            if map.is_empty() || shard_files.is_empty() {
+                bail!(
+                    "No tensors matched fast-loader prefixes {:?}",
+                    self.name_prefixes
+                );
+            }
+        }
 
         // Pre-flight OOM estimate (identical to SafetensorsLoader).
         {

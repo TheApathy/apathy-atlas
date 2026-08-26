@@ -13,6 +13,7 @@ pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
 pub mod qwen4_hyper;
+pub mod qwen4_mtp;
 pub mod qwen4_ple;
 pub mod vision_encoder;
 
@@ -27,6 +28,7 @@ pub use nemotron_moe::NemotronMoeLayer;
 pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
 pub use qwen4_hyper::Qwen4HyperConnection;
+pub use qwen4_mtp::Qwen4MtpHead;
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 pub use qwen4_ple::Qwen4PleLayer;
 pub use qwen4_ple::{PleRowSelection, QWEN4_PLE_HEADS, Qwen4PleHasher};
