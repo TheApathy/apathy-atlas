@@ -114,7 +114,7 @@ impl Qwen3AttentionLayer {
         match num_tokens {
             2 => self.ffn.forward_k2(ffn_inputs, ctx, stream)?,
             3 => self.ffn.forward_k3(ffn_inputs, ctx, stream)?,
-            n => self.ffn.forward_batched(ffn_inputs, n, ctx, stream)?,
+            n => self.ffn.forward_prefill(ffn_inputs, n, ctx, stream)?,
         }
         let ffn_output = ctx.buffers.moe_output();
         for row in 0..num_tokens {

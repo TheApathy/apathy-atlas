@@ -101,6 +101,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 32768)]
     pub max_seq_len: usize,
 
+    /// Enable Qwen4 QSA beyond 2048 tokens. The initial exact path requires
+    /// C=1 and BF16 KV; unsupported combinations fail startup.
+    #[arg(long, default_value_t = false)]
+    pub qwen4_qsa: bool,
+
     /// KV cache block size (tokens per block).
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,

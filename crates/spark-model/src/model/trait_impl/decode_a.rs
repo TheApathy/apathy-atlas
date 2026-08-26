@@ -34,9 +34,9 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
-        if self.config.is_qwen4_exp() && seq.seq_len >= 2048 {
+        if self.config.is_qwen4_exp() && seq.seq_len >= 2048 && !self.config.qwen4_qsa {
             anyhow::bail!(
-                "Qwen4 QSA indexer is not installed: exact full-attention fallback is limited to 2048 tokens"
+                "Qwen4 QSA is disabled: exact full-attention fallback is limited to 2048 tokens"
             );
         }
         // ATLAS_SSM_H_FP16 stage 2: flip this sequence's h-state to FP16 before

@@ -17,6 +17,10 @@ impl Qwen3AttentionLayer {
         self.qwen4_mlp_hyper = Some(mlp);
     }
 
+    pub fn set_qwen4_qsa(&mut self, qsa: crate::layers::Qwen4QsaIndexer) {
+        self.qwen4_qsa = Some(qsa);
+    }
+
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.
     pub fn set_mla_weights(&mut self, mla: MlaWeights) {

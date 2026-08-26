@@ -244,6 +244,78 @@ extern "C" __global__ void qwen4_hc_inject(
     hyper[token * r + i] = __float2bfloat16(old + add * scale);
 }
 
+// Preserve the per-token injection scales in the dead tail of each normalized
+// hyper row. This avoids thousands of tiny D2D copies during long prefill.
+extern "C" __global__ void qwen4_hc_save_inject(
+    __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ inject,
+    unsigned int hidden_size,
+    unsigned int hc_count,
+    unsigned int num_tokens) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = num_tokens * hc_count;
+    if (i >= total) return;
+    const unsigned int token = i / hc_count;
+    const unsigned int stream_id = i - token * hc_count;
+    const unsigned int r = hidden_size * hc_count;
+    residual[token * r + (r - hc_count) + stream_id] = inject[i];
+}
+
+// Batched injection reading the scales saved by qwen4_hc_save_inject.
+extern "C" __global__ void qwen4_hc_inject_saved(
+    __nv_bfloat16* __restrict__ hyper,
+    const __nv_bfloat16* __restrict__ core,
+    const __nv_bfloat16* __restrict__ residual,
+    unsigned int hidden_size,
+    unsigned int hc_count) {
+    const unsigned int token = blockIdx.x;
+    const unsigned int i = blockIdx.y * blockDim.x + threadIdx.x;
+    const unsigned int r = hidden_size * hc_count;
+    if (i >= r) return;
+    const unsigned int stream_id = i / hidden_size;
+    const unsigned int h = i - stream_id * hidden_size;
+    const float old = __bfloat162float(hyper[token * r + i]);
+    const float add = __bfloat162float(core[token * hidden_size + h]);
+    const float scale = __bfloat162float(
+        residual[token * r + (r - hc_count) + stream_id]);
+    hyper[token * r + i] = __float2bfloat16(old + add * scale);
+}
+
+// Stage/pack exact small-M mixed rows through the otherwise-dead first H
+// elements of each residual row. This permits an arbitrary-length prefill to
+// use byte-exact M<=32 projections while presenting a contiguous [M,H] input
+// to the tuned attention/SSM cores.
+extern "C" __global__ void qwen4_hc_stage_mixed(
+    const __nv_bfloat16* __restrict__ mixed,
+    __nv_bfloat16* __restrict__ residual,
+    unsigned int token_start,
+    unsigned int num_tokens,
+    unsigned int hidden_size,
+    unsigned int hc_count) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = num_tokens * hidden_size;
+    if (i >= total) return;
+    const unsigned int token = i / hidden_size;
+    const unsigned int h = i - token * hidden_size;
+    const unsigned int r = hidden_size * hc_count;
+    residual[(token_start + token) * r + h] = mixed[i];
+}
+
+extern "C" __global__ void qwen4_hc_pack_mixed(
+    const __nv_bfloat16* __restrict__ residual,
+    __nv_bfloat16* __restrict__ mixed,
+    unsigned int num_tokens,
+    unsigned int hidden_size,
+    unsigned int hc_count) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = num_tokens * hidden_size;
+    if (i >= total) return;
+    const unsigned int token = i / hidden_size;
+    const unsigned int h = i - token * hidden_size;
+    const unsigned int r = hidden_size * hc_count;
+    mixed[i] = residual[token * r + h];
+}
+
 extern "C" __global__ void qwen4_hc_expand_embedding(
     const __nv_bfloat16* __restrict__ input,
     __nv_bfloat16* __restrict__ output,

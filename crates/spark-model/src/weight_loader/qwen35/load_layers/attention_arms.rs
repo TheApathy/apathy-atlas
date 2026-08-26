@@ -197,6 +197,24 @@ pub(super) fn build_full_attention_nvfp4(
         config,
     )?;
 
+    if config.is_qwen4_exp() && config.qwen4_qsa {
+        anyhow::ensure!(
+            config.indexer_n_heads == 4
+                && config.indexer_kv_heads == 1
+                && config.indexer_head_dim == 128
+                && config.indexer_budget == 2048
+                && config.indexer_compress_ratio == 4,
+            "unsupported Qwen4 QSA geometry"
+        );
+        layer.set_qwen4_qsa(crate::layers::Qwen4QsaIndexer::new(
+            dense(store, &format!("{p}.indexer.index_qk_proj.weight"))?,
+            dense(store, &format!("{p}.indexer.q_layernorm.weight"))?,
+            dense(store, &format!("{p}.indexer.k_layernorm.weight"))?,
+            gpu,
+            config,
+        )?);
+    }
+
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;

@@ -65,6 +65,7 @@ impl ModelConfig {
             indexer_head_dim: 0,
             indexer_budget: 0,
             indexer_compress_ratio: 0,
+            qwen4_qsa: false,
             output_gate_type: String::new(),
             weight_prefix: String::new(),
             ep_rank: 0,

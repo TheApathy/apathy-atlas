@@ -309,6 +309,25 @@ impl Qwen3AttentionLayer {
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block (to rope portions only).
             // Skip the shared RoPE to avoid double-rotation.
+        } else if !self.qwen4_yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.qwen4_yarn_inv_freq,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                self.qwen4_yarn_attention_factor,
+                stream,
+            )?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
             // Gemma-4 full-attention: proportional RoPE with rotation pairs
             // (i, i + head_dim/2) for i < rope_angles. rotary_dim_override
@@ -386,6 +405,28 @@ impl Qwen3AttentionLayer {
             stream,
             ctx.graph_capture,
         )?;
+
+        // QSA's indexer consumes the same hyperconnection-mixed attention
+        // input as the QKV projection. It must run for every prefix token so
+        // the compressed side cache is complete before position 2048 switches
+        // from dense fallback to sparse attention.
+        let qsa_indices = if let Some(qsa) = self.qwen4_qsa.as_ref() {
+            Some(qsa.update_and_select(
+                normed,
+                seq_len,
+                seq_len + 1,
+                kv_cache,
+                meta,
+                h,
+                eps,
+                ctx.config.rope_theta as f32,
+                ctx.config.rotary_dim() as u32,
+                ctx.gpu,
+                stream,
+            )?)
+        } else {
+            None
+        };
 
         // Turbo KV cache: apply WHT to Q before paged decode.
         // KV cache stores WHT(K) and WHT(V). By Parseval's theorem,
@@ -478,6 +519,25 @@ impl Qwen3AttentionLayer {
                 )
             })
             .expect("local installed checked in high_speed_swap_engaged")?;
+        } else if seq_len >= 2048 {
+            let qsa = self
+                .qwen4_qsa
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Qwen4 context beyond 2048 requires QSA"))?;
+            qsa.sparse_attention_bf16(
+                q_out,
+                qsa_indices.expect("QSA index update ran above"),
+                attn_out,
+                kv_cache,
+                meta,
+                self.attn_layer_idx,
+                nq,
+                nkv,
+                hd,
+                inv_sqrt_d,
+                ctx.gpu,
+                stream,
+            )?;
         } else {
             // Single-sequence decode path: tree-aware indirection is only
             // active in K=γ verify (decode_multi_seq path), so always pass

@@ -102,6 +102,33 @@ fn startup(
     // 1. Load model config (supports HF config.json and Mistral params.json)
     spark_runtime::progress::phase(2, "config");
     let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
+    config.qwen4_qsa = args.qwen4_qsa;
+    if args.qwen4_qsa && !config.is_qwen4_exp() {
+        anyhow::bail!("--qwen4-qsa requires a qwen4_exp checkpoint");
+    }
+    if config.is_qwen4_exp() && args.max_seq_len > 2048 && !args.qwen4_qsa {
+        anyhow::bail!(
+            "Qwen4 contexts above 2048 require --qwen4-qsa; dense fallback is intentionally capped"
+        );
+    }
+    if args.qwen4_qsa && (args.max_batch_size != 1 || args.kv_cache_dtype != "bf16") {
+        anyhow::bail!(
+            "the Qwen4 QSA correctness path currently requires --max-batch-size 1 --kv-cache-dtype bf16"
+        );
+    }
+    if config.is_qwen4_exp() && args.max_seq_len > config.max_position_embeddings {
+        let factor = (args.max_seq_len as f32 / config.max_position_embeddings as f32).ceil();
+        config.yarn_factor = factor;
+        config.yarn_beta_fast = 32.0;
+        config.yarn_beta_slow = 1.0;
+        config.yarn_original_max_position_embeddings = config.max_position_embeddings;
+        tracing::info!(
+            factor,
+            original_context = config.max_position_embeddings,
+            requested_context = args.max_seq_len,
+            "Qwen4 static YaRN long-context profile enabled"
+        );
+    }
 
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.

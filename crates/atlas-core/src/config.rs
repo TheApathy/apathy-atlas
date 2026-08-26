@@ -167,6 +167,9 @@ pub struct ModelConfig {
     pub indexer_budget: usize,
     #[serde(default)]
     pub indexer_compress_ratio: usize,
+    /// Runtime-only activation of QSA long-context execution.
+    #[serde(skip)]
+    pub qwen4_qsa: bool,
     /// GDN output gate activation (`sigmoid` for Flash-Next).
     #[serde(default)]
     pub output_gate_type: String,

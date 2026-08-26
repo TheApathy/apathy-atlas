@@ -15,6 +15,7 @@ pub mod qwen3_ssm;
 pub mod qwen4_hyper;
 pub mod qwen4_mtp;
 pub mod qwen4_ple;
+pub mod qwen4_qsa;
 pub mod vision_encoder;
 
 pub use dense_ffn::{DenseFfnLayer, FfnActivation};
@@ -32,6 +33,7 @@ pub use qwen4_mtp::Qwen4MtpHead;
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 pub use qwen4_ple::Qwen4PleLayer;
 pub use qwen4_ple::{PleRowSelection, QWEN4_PLE_HEADS, Qwen4PleHasher};
+pub use qwen4_qsa::Qwen4QsaIndexer;
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
 
 use crate::layer::ForwardContext;

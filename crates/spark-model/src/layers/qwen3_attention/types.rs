@@ -7,7 +7,7 @@ use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 
 use crate::layers::fp8_calibration::Fp8KvCalibration;
-use crate::layers::{FfnComponent, Qwen4HyperConnection};
+use crate::layers::{FfnComponent, Qwen4HyperConnection, Qwen4QsaIndexer};
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
 
 /// MLA (Multi-head Latent Attention) weight components for 2-step decode.
@@ -69,6 +69,9 @@ pub struct Qwen3AttentionLayer {
     /// four-stream mixers around attention and the FFN.
     pub(super) qwen4_attn_hyper: Option<Qwen4HyperConnection>,
     pub(super) qwen4_mlp_hyper: Option<Qwen4HyperConnection>,
+    /// Qwen sparse-attention index branch. Present only when explicitly
+    /// enabled for long-context Qwen4 serving.
+    pub(super) qwen4_qsa: Option<Qwen4QsaIndexer>,
     pub(super) attn_layer_idx: usize,
     /// Whether Q projection includes an output gate (Q+Gate interleaved).
     /// When true, q_proj output is 2× q_dim; attn output is gated by sigmoid.
@@ -165,6 +168,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) rope_strided_b3_k: KernelHandle,
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
+    pub(super) rope_yarn_scaled_k: KernelHandle,
+    pub(super) qwen4_yarn_inv_freq: DevicePtr,
+    pub(super) qwen4_yarn_attention_factor: f32,
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
     pub(super) rope_proportional_k: KernelHandle,
     pub(super) reshape_cache_k: KernelHandle,

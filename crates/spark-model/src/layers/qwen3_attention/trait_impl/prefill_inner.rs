@@ -5,7 +5,7 @@
 //! to [`Qwen3AttentionLayer::prefill_inner`].
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
+use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
@@ -40,53 +40,103 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let n = num_tokens as u32;
 
-        // Correctness-first Flash-Next bring-up: the hyperconnection core is
-        // decode-native. Serialize prompt rows through the exact same path
-        // until the batched four-stream GEMMs are qualified.
+        // Qwen4 prefill: full-prompt hyper GEMMs + the existing batched
+        // attention/MoE path. QSA side-cache updates remain token ordered so
+        // their compression groups match decode exactly.
         if self.qwen4_attn_hyper.is_some() {
             if batched_meta.is_some() {
                 anyhow::bail!("qwen4_exp batched multi-sequence prefill is not yet supported");
             }
-            let row_bytes = ctx.config.residual_width() * 2;
             let base_meta = ctx
                 .attn_metadata
-                .ok_or_else(|| anyhow::anyhow!("qwen4_exp serialized prefill requires metadata"))?;
+                .ok_or_else(|| anyhow::anyhow!("qwen4_exp prefill requires metadata"))?;
             anyhow::ensure!(
                 base_meta.block_table != DevicePtr::NULL && base_meta.seq_len != DevicePtr::NULL,
-                "qwen4_exp serialized prefill requires paged block-table and sequence-length metadata"
+                "qwen4_exp prefill requires paged block-table and sequence-length metadata"
             );
-            for t in 0..num_tokens {
-                let seq_len = (seq_len_start + t + 1) as u32;
-                let seq_len_bytes = seq_len.to_ne_bytes();
-                ctx.gpu.copy_h2d_group_on_stream(
-                    &[HostToDeviceCopy::new(&seq_len_bytes, base_meta.seq_len)],
-                    stream,
-                )?;
-                let token_meta = crate::layer::AttnMetadataDev {
-                    positions: base_meta.positions.offset(t * 4),
-                    positions_h: base_meta.positions_h.offset(t * 4),
-                    positions_w: base_meta.positions_w.offset(t * 4),
-                    slot: base_meta.slot.offset(t * 8),
-                    seq_len: base_meta.seq_len,
-                    ..base_meta
-                };
-                let token_ctx = crate::layer::ForwardContext {
-                    attn_metadata: Some(token_meta),
-                    ..*ctx
-                };
-                self.decode_inner(
-                    hidden.offset(t * row_bytes),
-                    residual.offset(t * row_bytes),
-                    _state,
+            let (attn_hyper, mlp_hyper) = (
+                self.qwen4_attn_hyper.as_ref().unwrap(),
+                self.qwen4_mlp_hyper.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("qwen4_exp attention layer missing MLP hyperconnection")
+                })?,
+            );
+            let mixed_attn = attn_hyper.prepare_prefill_exact(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?;
+            if let Some(qsa) = self.qwen4_qsa.as_ref() {
+                for t in 0..num_tokens {
+                    let token_meta = crate::layer::AttnMetadataDev {
+                        positions: base_meta.positions.offset(t * 4),
+                        positions_h: base_meta.positions_h.offset(t * 4),
+                        positions_w: base_meta.positions_w.offset(t * 4),
+                        slot: base_meta.slot.offset(t * 8),
+                        ..base_meta
+                    };
+                    qsa.update_and_select(
+                        mixed_attn.offset(t * h * 2),
+                        seq_len_start + t,
+                        seq_len_start + t + 1,
+                        kv_cache,
+                        token_meta,
+                        h as u32,
+                        eps,
+                        ctx.config.rope_theta as f32,
+                        ctx.config.rotary_dim() as u32,
+                        ctx.gpu,
+                        stream,
+                    )?;
+                }
+            }
+            let attn_out = if seq_len_start == 0 {
+                self.prefill_attention_with_cache_skip(
+                    mixed_attn,
+                    num_tokens,
+                    kv_write_start,
                     kv_cache,
-                    seq_len_start + t,
+                    ctx,
+                    stream,
+                )?
+            } else {
+                self.prefill_attention_paged(
+                    mixed_attn,
+                    num_tokens,
+                    seq_len_start,
+                    kv_cache,
                     block_table,
                     disk_block_ids,
                     disk_last_offloaded_per_layer,
-                    &token_ctx,
+                    None,
+                    ctx,
                     stream,
-                )?;
-            }
+                )?
+            };
+            attn_hyper
+                .inject_saved_batched(hidden, attn_out, residual, num_tokens, ctx.gpu, stream)?;
+            let ffn_inputs = mlp_hyper.prepare_prefill_exact(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?;
+            self.ffn
+                .forward_prefill(ffn_inputs, num_tokens, ctx, stream)?;
+            mlp_hyper.inject_saved_batched(
+                hidden,
+                ctx.buffers.moe_output(),
+                residual,
+                num_tokens,
+                ctx.gpu,
+                stream,
+            )?;
             return Ok(());
         }
 

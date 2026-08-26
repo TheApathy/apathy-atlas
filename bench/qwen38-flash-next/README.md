@@ -28,8 +28,9 @@ MODEL_DIR=/path/to/Qwen3.8-Flash-Next-NVFP4-Offload \
   ./bench/qwen38-flash-next/serve.sh
 ```
 
-The default 2048-token limit is the currently qualified exact-QSA ceiling; it
-is a context cap, not model pruning. `PLE_CACHE_MB` controls the bounded
+The launcher keeps a conservative 2048-token default; it is a context cap, not
+model pruning. `--qwen4-qsa` enables the physical side cache and removes that
+guard for long-context qualification. `PLE_CACHE_MB` controls the bounded
 system-memory hot-page tier (default 512 MiB). Cold rows remain on NVMe and
 only 16 selected rows are staged to the GPU per token.
 
@@ -78,3 +79,24 @@ recommended launch path. DFlash2 remains shape-incompatible and fails closed.
 A trained Flash-Next adapter or native Flash-Next drafter is required for a
 real V3/DFlash2 speedup. No 70/80 tok/s claim is made until a qualified drafter
 beats the target-only control under the same output-hash gate.
+
+## Long-context and prefill qualification
+
+The QSA cache is keyed by physical main-KV pages and sized from the physical
+cache geometry, not the first request's logical block table. This matters for
+servers that receive a short request before a long one: the short request can
+no longer permanently cap QSA capacity. A server-counted 2050-token prompt
+crossed the old 2048 boundary with all twelve QSA side caches active.
+The first one-CTA-per-head sparse kernel decoded that boundary at 16.5 tok/s;
+an eight-way token split with log-sum-exp reduction improved it to 30.8-33.1
+tok/s. Numbered-fact retrieval at this boundary did not return the requested
+key, so 2050 is an execution milestone, not yet a semantic context claim.
+
+Qwen4 prefill now batches the twelve full-attention cores and uses exact
+three-row hyperconnection/recurrent/MoE tiles for the 36 linear-attention
+layers. On a 1543-token repeated-text stress prompt, coherent greedy output
+improved from 28.99 s TTFT with fully serialized recurrent prefill to 22.95 s,
+or about 67.2 prompt tok/s. `ATLAS_QWEN4_SSM_PREFILL_TILE=1` restores the
+serialized diagnostic; values above three are experimental because the
+grouped recurrent path failed the coherence gate. The fully grouped path
+reached about 345 prompt tok/s but produced corrupt output and is rejected.

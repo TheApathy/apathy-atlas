@@ -27,24 +27,69 @@ impl Qwen3SsmLayer {
         let bf16 = 2usize;
         let fp32 = 4usize;
 
-        if self.qwen4_attn_hyper.is_some() {
+        // Qualification switch used to bisect Qwen4 recurrent prefill from
+        // full-attention prefill without changing either implementation.
+        if self.qwen4_attn_hyper.is_some()
+            && std::env::var("ATLAS_QWEN4_SSM_PREFILL_BATCH")
+                .ok()
+                .as_deref()
+                != Some("1")
+        {
             let row_bytes = ctx.config.residual_width() * 2;
-            for t in 0..num_tokens {
-                self.decode_inner(
-                    hidden.offset(t * row_bytes),
-                    residual.offset(t * row_bytes),
-                    state,
-                    _kv_cache,
-                    _seq_len_start + t,
-                    _block_table,
-                    _disk_block_ids,
-                    _disk_last_offloaded_per_layer,
-                    ctx,
-                    stream,
-                )?;
+            // K=3 stays on the exact hyper/QKVZ/MoE families already
+            // qualified by speculative verification. K>=4 enters grouped
+            // prefill math and remains explicit opt-in; set the tile to 1 for
+            // the fully serialized diagnostic baseline.
+            let tile = std::env::var("ATLAS_QWEN4_SSM_PREFILL_TILE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| (2..=32).contains(&v))
+                .unwrap_or(3);
+            let mut t = 0;
+            while t < num_tokens {
+                let width = (num_tokens - t).min(tile);
+                if width == 1 {
+                    self.decode_inner(
+                        hidden.offset(t * row_bytes),
+                        residual.offset(t * row_bytes),
+                        state,
+                        _kv_cache,
+                        _seq_len_start + t,
+                        _block_table,
+                        _disk_block_ids,
+                        _disk_last_offloaded_per_layer,
+                        ctx,
+                        stream,
+                    )?;
+                } else {
+                    self.decode_qwen4_batched_inner(
+                        hidden.offset(t * row_bytes),
+                        residual.offset(t * row_bytes),
+                        width,
+                        state,
+                        _kv_cache,
+                        _seq_len_start + t,
+                        _block_table,
+                        _disk_block_ids,
+                        _disk_last_offloaded_per_layer,
+                        DevicePtr::NULL,
+                        DevicePtr::NULL,
+                        0,
+                        0,
+                        ctx,
+                        stream,
+                    )?;
+                }
+                t += width;
             }
             return Ok(());
         }
+
+        let qwen4_hyper = match (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper) {
+            (Some(attn), Some(mlp)) => Some((attn, mlp)),
+            (None, None) => None,
+            _ => anyhow::bail!("incomplete Qwen4 SSM hyperconnection pair"),
+        };
 
         let ssm_state = state
             .as_any_mut()
@@ -89,20 +134,33 @@ impl Qwen3SsmLayer {
                 .map_err(|e| anyhow::anyhow!("SSM prefill ENTRY: stream broken (k={k}): {e}"))?;
         }
 
-        // ── 1. RMS norm + residual for N tokens ──
-        let normed = ctx.buffers.norm_output();
-        ops::rms_norm_residual(
-            ctx.gpu,
-            self.rms_norm_residual_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            residual,
-            k,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        // ── 1. Input preparation for N tokens ──
+        let normed = if let Some((attn_hyper, _)) = qwen4_hyper {
+            attn_hyper.prepare_prefill_exact(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?
+        } else {
+            let normed = ctx.buffers.norm_output();
+            ops::rms_norm_residual(
+                ctx.gpu,
+                self.rms_norm_residual_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                residual,
+                k,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            normed
+        };
         if k > 4096 {
             ctx.gpu
                 .synchronize(stream)
@@ -506,33 +564,60 @@ impl Qwen3SsmLayer {
             None
         };
 
-        // ── 11. Batched residual + post-norm + MoE ──
-        // residual_add_rms_norm already supports num_tokens via grid.x
-        ops::residual_add_rms_norm(
-            ctx.gpu,
-            self.residual_add_rms_norm_k,
-            hidden,
-            out_proj_buf,
-            &self.post_attn_norm,
-            ctx.buffers.norm_output(),
-            residual,
-            num_tokens as u32,
-            h as u32,
-            eps,
-            stream,
-        )?;
-        // Batched MoE: 5 kernel launches for all N tokens
-        self.ffn
-            .forward_prefill(ctx.buffers.norm_output(), num_tokens, ctx, stream)?;
-        // Batch residual_add: moe_output[N*H] → hidden[N*H]
-        ops::residual_add(
-            ctx.gpu,
-            self.residual_add_k,
-            hidden,
-            ctx.buffers.moe_output(),
-            (num_tokens * h) as u32,
-            stream,
-        )?;
+        // ── 11. Batched residual/hyper injection + MoE ──
+        if let Some((attn_hyper, mlp_hyper)) = qwen4_hyper {
+            attn_hyper.inject_saved_batched(
+                hidden,
+                out_proj_buf,
+                residual,
+                num_tokens,
+                ctx.gpu,
+                stream,
+            )?;
+            let ffn_inputs = mlp_hyper.prepare_prefill_exact(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?;
+            self.ffn
+                .forward_prefill(ffn_inputs, num_tokens, ctx, stream)?;
+            mlp_hyper.inject_saved_batched(
+                hidden,
+                ctx.buffers.moe_output(),
+                residual,
+                num_tokens,
+                ctx.gpu,
+                stream,
+            )?;
+        } else {
+            ops::residual_add_rms_norm(
+                ctx.gpu,
+                self.residual_add_rms_norm_k,
+                hidden,
+                out_proj_buf,
+                &self.post_attn_norm,
+                ctx.buffers.norm_output(),
+                residual,
+                num_tokens as u32,
+                h as u32,
+                eps,
+                stream,
+            )?;
+            self.ffn
+                .forward_prefill(ctx.buffers.norm_output(), num_tokens, ctx, stream)?;
+            ops::residual_add(
+                ctx.gpu,
+                self.residual_add_k,
+                hidden,
+                ctx.buffers.moe_output(),
+                (num_tokens * h) as u32,
+                stream,
+            )?;
+        }
 
         prof!("moe_ffn", t0);
 

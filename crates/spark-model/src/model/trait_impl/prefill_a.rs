@@ -156,9 +156,12 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
-        if self.config.is_qwen4_exp() && seq.seq_len.saturating_add(n) > 2048 {
+        if self.config.is_qwen4_exp()
+            && seq.seq_len.saturating_add(n) > 2048
+            && !self.config.qwen4_qsa
+        {
             anyhow::bail!(
-                "Qwen4 QSA indexer is not installed: exact full-attention fallback is limited to 2048 tokens"
+                "Qwen4 QSA is disabled: exact full-attention fallback is limited to 2048 tokens"
             );
         }
         if n <= 1 {
