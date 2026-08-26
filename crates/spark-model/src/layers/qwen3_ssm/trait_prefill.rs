@@ -44,7 +44,7 @@ impl Qwen3SsmLayer {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&v| (2..=32).contains(&v))
-                .unwrap_or(3);
+                .unwrap_or(1);
             let mut t = 0;
             while t < num_tokens {
                 let width = (num_tokens - t).min(tile);

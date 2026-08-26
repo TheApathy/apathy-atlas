@@ -92,11 +92,11 @@ an eight-way token split with log-sum-exp reduction improved it to 30.8-33.1
 tok/s. Numbered-fact retrieval at this boundary did not return the requested
 key, so 2050 is an execution milestone, not yet a semantic context claim.
 
-Qwen4 prefill now batches the twelve full-attention cores and uses exact
+Experimental Qwen4 prefill can batch the twelve full-attention cores and use
 three-row hyperconnection/recurrent/MoE tiles for the 36 linear-attention
-layers. On a 1543-token repeated-text stress prompt, coherent greedy output
-improved from 28.99 s TTFT with fully serialized recurrent prefill to 22.95 s,
-or about 67.2 prompt tok/s. `ATLAS_QWEN4_SSM_PREFILL_TILE=1` restores the
-serialized diagnostic; values above three are experimental because the
-grouped recurrent path failed the coherence gate. The fully grouped path
-reached about 345 prompt tok/s but produced corrupt output and is rejected.
+layers. On a 1543-token repeated-text stress prompt this reached about 67.2
+prompt tok/s; the fully grouped path reached about 345 prompt tok/s. Neither is
+qualified: the canonical MinHeap prompt changed its stable output hash and
+hallucinated unrelated context. Production therefore remains serialized by
+default. `ATLAS_QWEN4_ATTN_PREFILL_BATCH=1` and
+`ATLAS_QWEN4_SSM_PREFILL_TILE=3` are diagnostic opt-ins only.

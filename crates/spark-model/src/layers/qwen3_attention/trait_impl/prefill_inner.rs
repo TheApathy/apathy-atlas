@@ -5,7 +5,7 @@
 //! to [`Qwen3AttentionLayer::prefill_inner`].
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
@@ -60,6 +60,46 @@ impl Qwen3AttentionLayer {
                     anyhow::anyhow!("qwen4_exp attention layer missing MLP hyperconnection")
                 })?,
             );
+            if std::env::var("ATLAS_QWEN4_ATTN_PREFILL_BATCH")
+                .ok()
+                .as_deref()
+                != Some("1")
+            {
+                let row_bytes = ctx.config.residual_width() * 2;
+                for t in 0..num_tokens {
+                    let seq_len = (seq_len_start + t + 1) as u32;
+                    let seq_len_bytes = seq_len.to_ne_bytes();
+                    ctx.gpu.copy_h2d_group_on_stream(
+                        &[HostToDeviceCopy::new(&seq_len_bytes, base_meta.seq_len)],
+                        stream,
+                    )?;
+                    let token_meta = crate::layer::AttnMetadataDev {
+                        positions: base_meta.positions.offset(t * 4),
+                        positions_h: base_meta.positions_h.offset(t * 4),
+                        positions_w: base_meta.positions_w.offset(t * 4),
+                        slot: base_meta.slot.offset(t * 8),
+                        seq_len: base_meta.seq_len,
+                        ..base_meta
+                    };
+                    let token_ctx = crate::layer::ForwardContext {
+                        attn_metadata: Some(token_meta),
+                        ..*ctx
+                    };
+                    self.decode_inner(
+                        hidden.offset(t * row_bytes),
+                        residual.offset(t * row_bytes),
+                        _state,
+                        kv_cache,
+                        seq_len_start + t,
+                        block_table,
+                        disk_block_ids,
+                        disk_last_offloaded_per_layer,
+                        &token_ctx,
+                        stream,
+                    )?;
+                }
+                return Ok(());
+            }
             let mixed_attn = attn_hyper.prepare_prefill_exact(
                 hidden,
                 residual,
