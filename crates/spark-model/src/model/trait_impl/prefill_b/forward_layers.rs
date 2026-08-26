@@ -59,6 +59,7 @@ impl TransformerModel {
             (meta_base, meta_base)
         };
         let attn_metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h: positions_h_dev,
             positions_w: positions_w_dev,

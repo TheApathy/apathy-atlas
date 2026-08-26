@@ -109,7 +109,9 @@ impl Qwen3AttentionLayer {
                 eps,
                 stream,
             )?;
-            if let Some(qsa) = self.qwen4_qsa.as_ref() {
+            if base_meta.qwen4_qsa_required
+                && let Some(qsa) = self.qwen4_qsa.as_ref()
+            {
                 for t in 0..num_tokens {
                     let token_meta = crate::layer::AttnMetadataDev {
                         positions: base_meta.positions.offset(t * 4),

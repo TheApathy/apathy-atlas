@@ -233,6 +233,7 @@ impl TransformerModel {
             .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(pack, meta_base)], stream)?;
 
         let metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h: meta_base,
             positions_w: meta_base,

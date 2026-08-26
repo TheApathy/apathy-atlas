@@ -38,6 +38,7 @@ fn seq_state(tokens: &[u32]) -> SequenceState {
         tokens: tokens.to_vec(),
         block_table: Vec::new(),
         seq_len: tokens.len(),
+        qwen4_qsa_required: false,
         layer_states: Vec::new(),
         proposer_state: None,
         proposer_state_alt: None,

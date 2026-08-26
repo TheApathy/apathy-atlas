@@ -249,6 +249,7 @@ impl Qwen4MtpHead {
         ctx.gpu
             .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&packed, meta_base)], stream)?;
         let metadata = AttnMetadataDev {
+            qwen4_qsa_required: false,
             positions: meta_base,
             positions_h: meta_base,
             positions_w: meta_base,

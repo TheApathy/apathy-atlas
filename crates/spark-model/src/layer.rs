@@ -106,6 +106,11 @@ impl LayerState for SsmLayerState {
 /// - block_table: `[N * max_blocks_per_seq]` i32 (row-major)
 #[derive(Clone, Copy)]
 pub struct AttnMetadataDev {
+    /// Host-side request policy: maintain/use Qwen4 QSA side indexes.
+    /// This is deliberately carried alongside the device pointers so every
+    /// attention layer sees the same immutable decision during prefill,
+    /// decode, and speculative verification.
+    pub qwen4_qsa_required: bool,
     /// Position values: `[N]` u32 at this device address. For multi-modal
     /// MRoPE this is the temporal (T) stream; callers set
     /// `positions_h`/`positions_w` to distinct buffers only when the token

@@ -410,7 +410,9 @@ impl Qwen3AttentionLayer {
         // input as the QKV projection. It must run for every prefix token so
         // the compressed side cache is complete before position 2048 switches
         // from dense fallback to sparse attention.
-        let qsa_indices = if let Some(qsa) = self.qwen4_qsa.as_ref() {
+        let qsa_indices = if meta.qwen4_qsa_required
+            && let Some(qsa) = self.qwen4_qsa.as_ref()
+        {
             Some(qsa.update_and_select(
                 normed,
                 seq_len,

@@ -153,6 +153,7 @@ impl Model for MockModel {
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
+            qwen4_qsa_required: false,
             layer_states: Vec::new(),
             proposer_state: None,
             proposer_state_alt: None,

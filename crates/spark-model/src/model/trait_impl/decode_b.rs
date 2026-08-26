@@ -356,6 +356,7 @@ impl TransformerModel {
         };
 
         let prefill_metadata = AttnMetadataDev {
+            qwen4_qsa_required: prefill_seq.qwen4_qsa_required,
             positions: prefill_meta_base,
             positions_h: prefill_meta_base,
             positions_w: prefill_meta_base,

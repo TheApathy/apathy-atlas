@@ -110,6 +110,7 @@ impl TransformerModel {
                     self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
                     let attn_metadata = AttnMetadataDev {
+                        qwen4_qsa_required: seq.qwen4_qsa_required,
                         positions: meta_base,
                         positions_h: meta_base,
                         positions_w: meta_base,

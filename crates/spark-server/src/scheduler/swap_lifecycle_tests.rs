@@ -13,6 +13,7 @@ fn seq_state() -> SequenceState {
         tokens: vec![3, 5, 8],
         block_table: vec![13, 21],
         seq_len: 3,
+        qwen4_qsa_required: false,
         layer_states: Vec::new(),
         proposer_state: None,
         proposer_state_alt: None,

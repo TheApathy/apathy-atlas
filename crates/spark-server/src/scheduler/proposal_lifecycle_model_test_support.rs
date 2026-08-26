@@ -16,6 +16,7 @@ pub(super) fn seq_state() -> SequenceState {
         tokens: Vec::new(),
         block_table: Vec::new(),
         seq_len: 9,
+        qwen4_qsa_required: false,
         layer_states: Vec::new(),
         proposer_state: None,
         proposer_state_alt: None,
