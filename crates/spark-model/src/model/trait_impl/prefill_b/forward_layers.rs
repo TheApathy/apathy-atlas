@@ -17,6 +17,7 @@ use crate::traits::SequenceState;
 impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
+        tokens: &[u32],
         seq: &mut SequenceState,
         kv_cache: &mut PagedKvCache,
         chunk_start: usize,
@@ -107,6 +108,27 @@ impl TransformerModel {
         };
         let mut layer_times: Vec<u128> = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
+            if i == 1
+                && let Some(ple) = &self.qwen4_ple
+            {
+                let row_bytes = self.config.residual_width() * 2;
+                let mut prior = tokens[..effective_seq_len_start.min(tokens.len())].to_vec();
+                let end = effective_seq_len_start
+                    .saturating_add(proc_count)
+                    .min(tokens.len());
+                for (row, &token) in tokens[effective_seq_len_start..end].iter().enumerate() {
+                    ple.forward_token(
+                        token,
+                        &prior,
+                        hidden.offset(row * row_bytes),
+                        seq.slot_idx,
+                        effective_seq_len_start == 0 && row == 0,
+                        self.gpu.as_ref(),
+                        stream,
+                    )?;
+                    prior.push(token);
+                }
+            }
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
                 Some(std::time::Instant::now())

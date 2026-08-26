@@ -119,6 +119,7 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             "F32" => WeightDtype::FP32,
             "BF16" => WeightDtype::BF16,
             "U8" => WeightDtype::UInt8,
+            "I64" => WeightDtype::Int64,
             "F8_E4M3" => WeightDtype::FP8E4M3,
             other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
         };

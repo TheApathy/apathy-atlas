@@ -284,7 +284,11 @@ impl TransformerModel {
 
         // For two-phase, we process the full uncached range — attention layers see
         // the full sequence from proc_start. If proc_start > 0, use paged attention.
-        let needs_paged = proc_start > 0;
+        // Qwen4 currently serializes its four-stream prompt rows through the
+        // exact decode path, so even chunk zero requires paged block-table and
+        // sequence-length metadata. Ordinary chunk-zero prefill continues to
+        // use contiguous flash attention and does not pay this setup cost.
+        let needs_paged = proc_start > 0 || self.config.is_qwen4_exp();
 
         {
             // SAFETY: Single-threaded scheduler access.

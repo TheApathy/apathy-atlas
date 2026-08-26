@@ -21,12 +21,40 @@ impl Qwen3SsmLayer {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let debug = tracing::enabled!(tracing::Level::DEBUG);
-        let trace = false;
+        // Stage-level synchronization is intentionally opt-in: it pinpoints
+        // the producer of an asynchronous CUDA fault without imposing a
+        // permanent decode synchronization tax.
+        let trace = std::env::var("ATLAS_SSM_TRACE").ok().as_deref() == Some("1");
 
         let ssm_state = state
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()
             .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+
+        if let (Some(attn_hyper), Some(mlp_hyper)) = (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper)
+        {
+            let (mixed, inject) =
+                attn_hyper.prepare_decode(hidden, residual, ctx.buffers, ctx.gpu, eps, stream)?;
+            let ssm_out = self.ssm_forward(mixed, ssm_state, ctx, stream, trace)?;
+            attn_hyper.inject_decode(
+                hidden,
+                ssm_out,
+                inject.expect("Qwen4 decoder mixer has injection weights"),
+                ctx.gpu,
+                stream,
+            )?;
+            let (mixed, inject) =
+                mlp_hyper.prepare_decode(hidden, residual, ctx.buffers, ctx.gpu, eps, stream)?;
+            let moe_out = self.ffn.forward(mixed, ctx, stream)?;
+            mlp_hyper.inject_decode(
+                hidden,
+                moe_out,
+                inject.expect("Qwen4 decoder mixer has injection weights"),
+                ctx.gpu,
+                stream,
+            )?;
+            return Ok(());
+        }
 
         let normed = ctx.buffers.norm_output();
         // Fused path requires: env opt-in, kernel handle present, sequential QKVZ +

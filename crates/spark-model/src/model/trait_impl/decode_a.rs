@@ -34,6 +34,11 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        if self.config.is_qwen4_exp() && seq.seq_len >= 2048 {
+            anyhow::bail!(
+                "Qwen4 QSA indexer is not installed: exact full-attention fallback is limited to 2048 tokens"
+            );
+        }
         // ATLAS_SSM_H_FP16 stage 2: flip this sequence's h-state to FP16 before
         // any graph capture/replay below. Must be here and not in a layer — see
         // `ssm_h_to_f16_dispatch`. No-op unless the flag is set.
@@ -159,6 +164,7 @@ impl TransformerModel {
             && !self.profile
             && !suppress_graphs
             && !hss_engaged
+            && self.qwen4_ple.is_none()
             && !serial_debug_dump
             && !crate::model::k1_stage_diag::enabled();
 
@@ -178,7 +184,7 @@ impl TransformerModel {
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.
-        if self.profile {
+        if self.profile && self.qwen4_ple.is_none() {
             return self.decode_profiled(token, hidden, residual, seq, &mut kv_cache, &ctx, stream);
         }
 
@@ -217,6 +223,19 @@ impl TransformerModel {
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
+            if i == 1
+                && let Some(ple) = &self.qwen4_ple
+            {
+                ple.forward_token(
+                    token,
+                    &seq.tokens,
+                    hidden,
+                    seq.slot_idx,
+                    seq.seq_len == 0,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
+            }
             layer.decode(
                 hidden,
                 residual,
@@ -285,17 +304,19 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         let h = self.config.hidden_size as u32;
         let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        if self.qwen4_final_hidden(hidden, residual, stream)?.is_none() {
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                hidden,
+                &self.final_norm,
+                normed,
+                1,
+                h,
+                eps,
+                stream,
+            )?;
+        }
         self.capture_k1_stage("final_norm", normed, 1, self.config.hidden_size * 2, stream)?;
 
         if serial_debug_dump {

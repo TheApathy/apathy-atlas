@@ -156,6 +156,11 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        if self.config.is_qwen4_exp() && seq.seq_len.saturating_add(n) > 2048 {
+            anyhow::bail!(
+                "Qwen4 QSA indexer is not installed: exact full-attention fallback is limited to 2048 tokens"
+            );
+        }
         if n <= 1 {
             // Single token: use decode path (CUDA graph optimized)
             for &token in tokens {
@@ -199,7 +204,7 @@ impl TransformerModel {
 
         // ── 1. Prefix cache lookup (BEFORE embedding — Marconi may skip tokens) ──
         let bs = kv_cache.block_size();
-        let prefix_match = if self.tokens_have_vision_pad(tokens) {
+        let prefix_match = if self.config.is_qwen4_exp() || self.tokens_have_vision_pad(tokens) {
             spark_runtime::prefix_cache::PrefixMatch::empty()
         } else {
             self.lookup_prefill_prefix(tokens, bs, seq.session_hash)
@@ -354,25 +359,32 @@ impl TransformerModel {
 
         // ── 2. Embed tokens → [proc_count, H] contiguous ──
         {
-            let token_ids_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(proc_tokens.as_ptr() as *const u8, proc_count * 4)
-            };
-            let token_ids_dev = self.buffers.scratch();
-            self.gpu.copy_h2d_group_on_stream(
-                &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
-                stream,
-            )?;
-            ops::batched_embed(
-                self.gpu.as_ref(),
-                self.batched_embed_kernel,
-                token_ids_dev,
-                self.embed_tokens.weight,
-                hidden,
-                proc_count as u32,
-                h as u32,
-                stream,
-            )?;
-            self.scale_embeddings(hidden, proc_count, stream)?;
+            if self.config.is_qwen4_exp() {
+                let row_bytes = self.config.residual_width() * 2;
+                for (row, &token) in proc_tokens.iter().enumerate() {
+                    self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                }
+            } else {
+                let token_ids_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(proc_tokens.as_ptr() as *const u8, proc_count * 4)
+                };
+                let token_ids_dev = self.buffers.scratch();
+                self.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(token_ids_bytes, token_ids_dev)],
+                    stream,
+                )?;
+                ops::batched_embed(
+                    self.gpu.as_ref(),
+                    self.batched_embed_kernel,
+                    token_ids_dev,
+                    self.embed_tokens.weight,
+                    hidden,
+                    proc_count as u32,
+                    h as u32,
+                    stream,
+                )?;
+                self.scale_embeddings(hidden, proc_count, stream)?;
+            }
         }
 
         // ── 3. Upload attention metadata via pinned staging (one H2D copy) ──
@@ -418,7 +430,7 @@ impl TransformerModel {
             }
             cursor += proc_count * 8;
 
-            let devs = if marconi_skip {
+            let devs = if marconi_skip || self.config.is_qwen4_exp() {
                 let bt_start = (cursor + 3) & !3;
                 let bt_len = seq.block_table.len() * 4;
                 unsafe {
@@ -429,15 +441,29 @@ impl TransformerModel {
                     );
                 }
                 let sl_start = (bt_start + bt_len + 3) & !3;
-                let seq_len_val = n as u32;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &seq_len_val as *const u32 as *const u8,
-                        pinned.add(sl_start),
-                        4,
-                    );
+                if self.config.is_qwen4_exp() {
+                    for t in 0..proc_count {
+                        let seq_len_val = (seq_len_start + t + 1) as u32;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                &seq_len_val as *const u32 as *const u8,
+                                pinned.add(sl_start + t * 4),
+                                4,
+                            );
+                        }
+                    }
+                    cursor = sl_start + proc_count * 4;
+                } else {
+                    let seq_len_val = n as u32;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            &seq_len_val as *const u32 as *const u8,
+                            pinned.add(sl_start),
+                            4,
+                        );
+                    }
+                    cursor = sl_start + 4;
                 }
-                cursor = sl_start + 4;
                 (meta_base.offset(bt_start), meta_base.offset(sl_start))
             } else {
                 (DevicePtr::NULL, DevicePtr::NULL)
@@ -488,6 +514,25 @@ impl TransformerModel {
         );
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
         for (i, layer) in self.layers.iter().enumerate() {
+            if i == 1
+                && let Some(ple) = &self.qwen4_ple
+            {
+                let row_bytes = self.config.residual_width() * 2;
+                let mut prior = seq.tokens.clone();
+                prior.extend_from_slice(&tokens[..seq_len_start.min(tokens.len())]);
+                for (row, &token) in proc_tokens.iter().enumerate() {
+                    ple.forward_token(
+                        token,
+                        &prior,
+                        hidden.offset(row * row_bytes),
+                        seq.slot_idx,
+                        seq_len_start == 0 && row == 0,
+                        self.gpu.as_ref(),
+                        stream,
+                    )?;
+                    prior.push(token);
+                }
+            }
             layer
                 .prefill(
                     hidden,
@@ -559,20 +604,27 @@ impl TransformerModel {
         }
 
         // ── 5. Final norm on LAST token only ──
-        let last_hidden = hidden.offset((proc_count - 1) * h * fp32);
+        let persistent_width = self.config.residual_width();
+        let last_hidden = hidden.offset((proc_count - 1) * persistent_width * fp32);
+        let last_residual = residual.offset((proc_count - 1) * persistent_width * fp32);
         let normed = self.buffers.norm_output();
         let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            last_hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if self
+            .qwen4_final_hidden(last_hidden, last_residual, stream)?
+            .is_none()
+        {
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                last_hidden,
+                &self.final_norm,
+                normed,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
 
         // ── 6. LM head on last token → logits ──
         self.lm_head(normed, stream)?;

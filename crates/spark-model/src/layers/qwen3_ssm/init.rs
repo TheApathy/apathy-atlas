@@ -28,6 +28,8 @@ impl Qwen3SsmLayer {
             ssm,
             post_attn_norm,
             ffn,
+            qwen4_attn_hyper: None,
+            qwen4_mlp_hyper: None,
             qkvz_nvfp4,
             qkvz_nvfp4_t: None,
             out_proj_nvfp4_t: None,
@@ -41,8 +43,16 @@ impl Qwen3SsmLayer {
             } else {
                 gpu.kernel("norm", "rms_norm_residual")?
             },
-            gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
-            gated_rms_norm_f32_k: super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input"),
+            gated_rms_norm_k: if config.output_gate_type == "sigmoid" {
+                gpu.kernel("qwen4_hyper", "qwen4_gated_rms_norm_sigmoid")?
+            } else {
+                gpu.kernel("norm", "gated_rms_norm")?
+            },
+            gated_rms_norm_f32_k: if config.output_gate_type == "sigmoid" {
+                super::super::try_kernel(gpu, "qwen4_hyper", "qwen4_gated_rms_norm_sigmoid_f32")
+            } else {
+                super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input")
+            },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             // Optional K=3 batched BA-proj GEMV. Built into the common
             // nvfp4/dense_gemv_bf16.cu so every target picks it up, but
@@ -474,6 +484,15 @@ impl Qwen3SsmLayer {
         // Set Fp8Weight for decode GEMV (w8a16_gemv, needs per-row scale)
         self.qkvz_fp8w = qkvz;
         self.out_proj_fp8w = out_proj;
+    }
+
+    pub fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) {
+        self.qwen4_attn_hyper = Some(attn);
+        self.qwen4_mlp_hyper = Some(mlp);
     }
 
     /// Set raw FP8 DevicePtrs for the prefill GEMM path ONLY (no decode GEMV

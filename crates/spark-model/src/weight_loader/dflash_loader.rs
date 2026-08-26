@@ -507,6 +507,8 @@ pub struct DflashWeights {
     /// `[draft_hidden, len(target_layer_ids) * target_hidden]`.
     /// Qwen3.6-35B-A3B-DFlash: `[2048, 10240]`.
     pub fc: DenseWeight,
+    /// Serialized FC geometry retained for fail-closed target pairing.
+    pub fc_shape: [usize; 2],
     /// `[draft_hidden]` — RMSNorm applied to the projected target context
     /// before mixing with token embeddings.
     pub hidden_norm: DenseWeight,
@@ -714,8 +716,15 @@ pub fn load_dflash_weights(
         return Ok(None);
     };
 
-    let fc = dense(drafter_store, &format!("{prefix}fc.weight"))
-        .context("DFlash drafter: load fc.weight")?;
+    let fc_name = format!("{prefix}fc.weight");
+    let fc_tensor = drafter_store.get(&fc_name)?;
+    anyhow::ensure!(
+        fc_tensor.shape.len() == 2,
+        "DFlash drafter fc.weight must be rank 2, got {:?}",
+        fc_tensor.shape
+    );
+    let fc_shape = [fc_tensor.shape[0], fc_tensor.shape[1]];
+    let fc = dense(drafter_store, &fc_name).context("DFlash drafter: load fc.weight")?;
     let hidden_norm = dense(drafter_store, &format!("{prefix}hidden_norm.weight"))
         .context("DFlash drafter: load hidden_norm.weight")?;
     let norm = dense(drafter_store, &format!("{prefix}norm.weight"))
@@ -957,6 +966,7 @@ pub fn load_dflash_weights(
     Ok(Some(DflashWeights {
         config: drafter_config.clone(),
         fc,
+        fc_shape,
         hidden_norm,
         norm,
         layers,

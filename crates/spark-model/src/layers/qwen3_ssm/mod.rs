@@ -21,8 +21,8 @@ use spark_runtime::kv_cache::PagedKvCache;
 use crate::layer::{
     ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
-use crate::layers::FfnComponent;
 use crate::layers::ops;
+use crate::layers::{FfnComponent, Qwen4HyperConnection};
 use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
 
 mod exact_flat_route;
@@ -40,6 +40,8 @@ pub struct Qwen3SsmLayer {
     ssm: SsmWeights,
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
+    qwen4_attn_hyper: Option<Qwen4HyperConnection>,
+    qwen4_mlp_hyper: Option<Qwen4HyperConnection>,
     // NVFP4-quantized QKVZ weight (quarters bandwidth vs BF16)
     qkvz_nvfp4: Option<QuantizedWeight>,
     // Transposed [K/2, N] copy for coalesced w4a16_gemm reads (prefill)
@@ -356,6 +358,15 @@ pub(crate) fn ssm_profile_record(ns: u64) {
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──
 impl TransformerLayer for Qwen3SsmLayer {
+    fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) -> Result<()> {
+        Qwen3SsmLayer::set_qwen4_hyperconnections(self, attn, mlp);
+        Ok(())
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,

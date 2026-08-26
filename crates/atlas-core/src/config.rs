@@ -367,6 +367,12 @@ pub struct ModelConfig {
     /// is what the drafter's `fc` projection expects.
     #[serde(default)]
     pub dflash_capture_layers: Vec<usize>,
+
+    /// Runtime-only manifest for a sparse Qwen4 PLE backing store. The
+    /// server discovers `ple-offload/manifest.json` beside the checkpoint;
+    /// it is never read from or written to Hugging Face config.json.
+    #[serde(skip)]
+    pub ple_offload_manifest: Option<String>,
 }
 
 /// Advertised weight-quantization layout, as declared in the HF

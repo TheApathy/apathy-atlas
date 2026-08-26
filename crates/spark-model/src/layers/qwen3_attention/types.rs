@@ -6,8 +6,8 @@
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 
-use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
+use crate::layers::{FfnComponent, Qwen4HyperConnection};
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
 
 /// MLA (Multi-head Latent Attention) weight components for 2-step decode.
@@ -65,6 +65,10 @@ pub struct Qwen3AttentionLayer {
     pub(crate) attn: AttentionWeights,
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
+    /// Qwen4-Exp replaces the ordinary residual additions with gated
+    /// four-stream mixers around attention and the FFN.
+    pub(super) qwen4_attn_hyper: Option<Qwen4HyperConnection>,
+    pub(super) qwen4_mlp_hyper: Option<Qwen4HyperConnection>,
     pub(super) attn_layer_idx: usize,
     /// Whether Q projection includes an output gate (Q+Gate interleaved).
     /// When true, q_proj output is 2× q_dim; attn output is gated by sigmoid.

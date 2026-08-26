@@ -10,7 +10,9 @@ use spark_runtime::weights::WeightStore;
 
 use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
-use crate::weight_map::{DenseWeight, MtpWeights, dense, detect_nvfp4_variant, load_mtp};
+use crate::weight_map::{
+    DenseWeight, MtpWeights, dense, dense_auto, detect_nvfp4_variant, load_mtp,
+};
 
 pub struct Qwen35WeightLoader;
 
@@ -50,6 +52,16 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         _gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
         let prefix = &config.weight_prefix;
+        if config.is_qwen4_exp() {
+            // Qwen4 has no terminal RMSNorm; the model-level hyperconnection
+            // mixer is installed separately. Return a real tensor to satisfy
+            // the architecture-neutral constructor without allocating a
+            // dummy. Forward must not apply it.
+            return dense(
+                store,
+                &format!("{prefix}.hyper_connection_mixer.hc_norm.weight"),
+            );
+        }
         dense(store, &format!("{prefix}.norm.weight"))
     }
 
@@ -60,6 +72,55 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
         super::qwen35_mixed_precision::load_lm_head(store, config, gpu)
+    }
+
+    fn load_qwen4_final_mixer(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::Qwen4HyperConnection>> {
+        if !config.is_qwen4_exp() {
+            return Ok(None);
+        }
+        let p = format!("{}.hyper_connection_mixer", config.weight_prefix);
+        let norm = dense(store, &format!("{p}.hc_norm.weight"))?;
+        let down_dense = dense_auto(store, &format!("{p}.input_mix_weight_down.weight"), gpu)?;
+        let up_dense = dense_auto(store, &format!("{p}.input_mix_weight_up.weight"), gpu)?;
+        let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
+        let quantize = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let stream = gpu.default_stream();
+        let r = config.residual_width();
+        let down = crate::weight_map::quantize_to_nvfp4_cached(
+            &down_dense,
+            config.hc_lowrank,
+            r,
+            gpu,
+            absmax,
+            quantize,
+            stream,
+            "qwen4.final_mixer.down.nvfp4",
+        )?;
+        let up = crate::weight_map::quantize_to_nvfp4_cached(
+            &up_dense,
+            r,
+            config.hc_lowrank,
+            gpu,
+            absmax,
+            quantize,
+            stream,
+            "qwen4.final_mixer.up.nvfp4",
+        )?;
+        Ok(Some(crate::layers::Qwen4HyperConnection::new(
+            norm,
+            down,
+            up,
+            None,
+            config.hidden_size,
+            config.hc_count,
+            config.hc_lowrank,
+            gpu,
+        )?))
     }
 
     fn load_mtp_weights(

@@ -163,6 +163,9 @@ pub struct TransformerModel {
     pub tree_kv_pack_active: bool,
     pub(super) embed_tokens: DenseWeight,
     pub(super) final_norm: DenseWeight,
+    pub(super) qwen4_final_mixer: Option<crate::layers::Qwen4HyperConnection>,
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub(super) qwen4_ple: Option<crate::layers::Qwen4PleLayer>,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// Transposed NVFP4 lm_head shared with the DFlash drafter propose path.

@@ -193,6 +193,24 @@ pub(crate) fn load_moe_qwen35(
     };
 
     let load_expert = |prefix: &str| -> Result<ExpertWeight> {
+        // Quantization recipes may exclude the shared expert while keeping the
+        // routed experts in the checkpoint's native format.  Flash-Next NVFP4
+        // does exactly that, so the model-wide variant is not sufficient to
+        // choose the loader here.  Inspect the projection itself and perform
+        // the established load-time BF16 -> NVFP4 transform when necessary.
+        let weight_is_bf16 = |projection: &str| -> bool {
+            store
+                .get(&format!("{prefix}.{projection}.weight"))
+                .map(|weight| weight.dtype == WeightDtype::BF16)
+                .unwrap_or(false)
+        };
+        if weight_is_bf16("gate_proj") && weight_is_bf16("up_proj") && weight_is_bf16("down_proj") {
+            return Ok(ExpertWeight {
+                gate_proj: load_bf16_then_nvfp4(&format!("{prefix}.gate_proj"), inter, h)?,
+                up_proj: load_bf16_then_nvfp4(&format!("{prefix}.up_proj"), inter, h)?,
+                down_proj: load_bf16_then_nvfp4(&format!("{prefix}.down_proj"), h, inter)?,
+            });
+        }
         match variant {
             Nvfp4Variant::Bf16Raw => Ok(ExpertWeight {
                 gate_proj: load_bf16_then_nvfp4(&format!("{prefix}.gate_proj"), inter, h)?,

@@ -86,7 +86,6 @@ impl Qwen3AttentionLayer {
             };
             return self.attention_forward_mla(kv_cache, ctx, &args);
         }
-
         if self.gated {
             // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
             if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {

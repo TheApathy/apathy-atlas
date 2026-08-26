@@ -226,6 +226,16 @@ fn startup(
 
     // 3. Load model weights
     spark_runtime::progress::phase(5, "weight load");
+    if config.is_qwen4_exp() {
+        let manifest = model_dir.join("ple-offload/manifest.json");
+        if manifest.is_file() {
+            config.ple_offload_manifest = Some(manifest.to_string_lossy().into_owned());
+            tracing::info!(
+                "Qwen4 PLE: discovered sparse offload manifest {}",
+                manifest.display()
+            );
+        }
+    }
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
     tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
     let store = serve_phases::load_weight_store(

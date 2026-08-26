@@ -29,6 +29,40 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
+        if let (Some(attn_hyper), Some(mlp_hyper)) = (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper)
+        {
+            let (mixed, inject) =
+                attn_hyper.prepare_decode(hidden, residual, ctx.buffers, ctx.gpu, eps, stream)?;
+            let attn_out = self.attention_forward(
+                mixed,
+                seq_len,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                kv_cache,
+                ctx,
+                stream,
+            )?;
+            attn_hyper.inject_decode(
+                hidden,
+                attn_out,
+                inject.expect("Qwen4 decoder mixer has injection weights"),
+                ctx.gpu,
+                stream,
+            )?;
+
+            let (mixed, inject) =
+                mlp_hyper.prepare_decode(hidden, residual, ctx.buffers, ctx.gpu, eps, stream)?;
+            let moe_out = self.ffn.forward(mixed, ctx, stream)?;
+            mlp_hyper.inject_decode(
+                hidden,
+                moe_out,
+                inject.expect("Qwen4 decoder mixer has injection weights"),
+                ctx.gpu,
+                stream,
+            )?;
+            return Ok(());
+        }
         // Disable diagnostics during CUDA graph capture — diag_norm does d2h
         // copy + sync which invalidates stream capture (status 901).
         let gemma4_diag =

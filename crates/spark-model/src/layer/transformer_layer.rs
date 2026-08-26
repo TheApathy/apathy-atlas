@@ -10,6 +10,16 @@ use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
 
 pub trait TransformerLayer: Send + Sync {
+    /// Install Qwen4-Exp gated-residual mixers after the ordinary core layer
+    /// has been assembled. Other architectures fail closed by default.
+    fn set_qwen4_hyperconnections(
+        &mut self,
+        _attn: crate::layers::Qwen4HyperConnection,
+        _mlp: crate::layers::Qwen4HyperConnection,
+    ) -> Result<()> {
+        anyhow::bail!("layer does not support Qwen4 hyperconnections")
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments

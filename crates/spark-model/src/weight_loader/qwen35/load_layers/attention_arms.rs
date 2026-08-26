@@ -9,7 +9,7 @@ use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, Qwen3AttentionLayer};
@@ -38,6 +38,20 @@ pub(super) fn build_full_attention_nvfp4(
     ffn: FfnComponent,
 ) -> Result<Box<dyn TransformerLayer>> {
     let p = format!("{lp}.self_attn");
+    // Quantization recipes can exclude attention while quantizing the routed
+    // experts. Flash-Next NVFP4 is such a mixed checkpoint, so select the
+    // attention arm from the projection itself rather than the model-wide
+    // variant inferred from expert tensors.
+    let variant = store
+        .get(&format!("{p}.q_proj.weight"))
+        .map(|weight| {
+            if weight.dtype == WeightDtype::BF16 {
+                Nvfp4Variant::Bf16Raw
+            } else {
+                variant
+            }
+        })
+        .unwrap_or(variant);
     let tp_rank = config.tp_rank;
     let tp_size = config.tp_world_size.max(1);
     let i = layer_idx;

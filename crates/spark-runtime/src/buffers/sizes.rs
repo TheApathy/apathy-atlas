@@ -45,6 +45,10 @@ impl BufferSizes {
         let bf16 = 2;
         let m = max_batch_tokens;
         let h = config.hidden_size;
+        // Qwen4-Exp carries hc_count parallel residual streams between
+        // blocks. Core attention/GDN/MoE tensors remain hidden_size wide;
+        // only the persistent hidden/residual pair uses the expanded width.
+        let residual_width = config.residual_width();
 
         // Q projection output: gated models produce [Q, gate] (2× nq*hd),
         // ungated models (VL) produce only [Q] (nq*hd).
@@ -88,7 +92,12 @@ impl BufferSizes {
         let bt_offset = (slot_end + 3) & !3;
         let bt_end = bt_offset + max_blocks * 4;
         let sl_offset = (bt_end + 3) & !3;
-        let prefill_meta = sl_offset + 4;
+        // Qwen4's correctness-first serialized prefill consumes the decode
+        // attention path one row at a time, so it needs one cumulative
+        // sequence length per prompt row. Other prefill implementations only
+        // need the final scalar length.
+        let seq_lens_bytes = if config.is_qwen4_exp() { m * 4 } else { 4 };
+        let prefill_meta = sl_offset + seq_lens_bytes;
         // Block table metadata: max(batch_size=8, K=4 verify, K=γ DFlash verify)
         // rows × max_blocks × 4 bytes. DFlash γ-block verify uses up to γ+1=17
         // rows (γ=16 for Qwen3.6-DFlash), so size for the worst case.
@@ -125,6 +134,12 @@ impl BufferSizes {
         // Mamba-2 d_inner may exceed hidden_size; norm_output and attn_output must fit.
         let mamba2_d_inner = config.mamba2_d_inner();
         let max_dim = h.max(mamba2_d_inner);
+        // Gated-delta layers can be wider than full attention. Qwen4-Exp, for
+        // example, has 48 value heads x 128 = 6144 elements while its full
+        // attention output is only 16 x 256 = 4096. `attn_output` is the BF16
+        // GDN output scratch in both decode and prefill, so size it for the
+        // widest producer rather than assuming attention is the maximum.
+        let linear_value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
 
         // Split-K decode workspace: stores partials [o[head_dim], m, l] per
         // (seq, q_head, split). Indexed as
@@ -171,12 +186,13 @@ impl BufferSizes {
         let residual_elem = if config.use_fp32_residual() { 4 } else { bf16 };
 
         Self {
-            hidden_states: m * h * residual_elem,
-            residual: m * h * residual_elem,
+            hidden_states: m * residual_width * residual_elem,
+            residual: m * residual_width * residual_elem,
             norm_output: m * max_dim * bf16,
             qkv_output: m * qkv_dim * bf16,
             attn_output: (m * config.num_attention_heads * config.head_dim * bf16)
                 .max(m * mamba2_d_inner * bf16)
+                .max(m * linear_value_dim * bf16)
                 // MLA absorbed: attention output is [M, nq, mla_cache_dim=kv_lora+rope]
                 .max(if config.kv_lora_rank > 0 {
                     m * config.num_attention_heads

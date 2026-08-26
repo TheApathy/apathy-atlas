@@ -12,6 +12,8 @@ pub mod nemotron_moe;
 pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4_hyper;
+pub mod qwen4_ple;
 pub mod vision_encoder;
 
 pub use dense_ffn::{DenseFfnLayer, FfnActivation};
@@ -24,6 +26,10 @@ pub use nemotron_mamba2::NemotronMamba2Layer;
 pub use nemotron_moe::NemotronMoeLayer;
 pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
+pub use qwen4_hyper::Qwen4HyperConnection;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+pub use qwen4_ple::Qwen4PleLayer;
+pub use qwen4_ple::{PleRowSelection, QWEN4_PLE_HEADS, Qwen4PleHasher};
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
 
 use crate::layer::ForwardContext;

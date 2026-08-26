@@ -304,6 +304,7 @@ unsafe impl Sync for TreeKvPack {}
 ///
 /// Provides access to GPU, buffers, and config without coupling
 /// layer implementations to the model struct.
+#[derive(Clone, Copy)]
 pub struct ForwardContext<'a> {
     /// Pre-allocated scratch buffers.
     pub buffers: &'a BufferArena,

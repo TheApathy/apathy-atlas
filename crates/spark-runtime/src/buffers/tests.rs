@@ -57,6 +57,19 @@ fn test_buffer_sizes_scale_with_batch() {
     assert_eq!(s128.logits, 16 * cfg.vocab_size * 4);
 }
 
+#[test]
+fn qwen4_exp_expands_only_the_persistent_residual_buffers() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.hidden_size = 2560;
+    cfg.hc_count = 4;
+    let sizes = BufferSizes::from_config(&cfg, 3, 4096, 16);
+
+    assert_eq!(sizes.hidden_states, 3 * 4 * 2560 * 2);
+    assert_eq!(sizes.residual, 3 * 4 * 2560 * 2);
+    assert_eq!(sizes.norm_output, 3 * 2560 * 2);
+    assert_eq!(sizes.moe_output, 3 * 2560 * 2);
+}
+
 /// `ssm_qkvz` is the Q staging buffer for the multi-seq attention QKV routes,
 /// at the full gated projection width. On Qwen3.8-27B that width (2*24*256 =
 /// 12288) happens to equal `ssm_qkvz_size()`, so the fit was a coincidence of

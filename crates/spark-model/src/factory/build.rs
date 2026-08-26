@@ -133,6 +133,13 @@ pub fn build_model(
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(store, &config)?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
+    let qwen4_final_mixer = loader.load_qwen4_final_mixer(store, &config, gpu.as_ref())?;
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    let qwen4_ple =
+        crate::layers::Qwen4PleLayer::load(store, &config, gpu.as_ref(), max_batch_size)?;
+    if config.is_qwen4_exp() {
+        crate::weight_loader::transform_cache::finish();
+    }
     let lm_head = loader.load_lm_head(store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
     // Probe dense MTP path for non-MoE models (Qwen3.5/3.6 27B family,
@@ -411,7 +418,10 @@ pub fn build_model(
     // so this clones the device pointer cheaply.
     let target_embed_for_dflash = embed.weight;
     let target_lm_head_for_dflash = lm_head.weight;
-    let target_hidden_for_dflash = config.hidden_size;
+    // DFlash trains against the target model's exposed intermediate states.
+    // Qwen4 exposes the full four-stream hyperconnection row (4H); ordinary
+    // targets have residual_width()==hidden_size, preserving their ABI.
+    let target_hidden_for_dflash = config.residual_width();
     // Honor --mtp-vocab for the DFlash drafter lm_head, mirroring the MTP
     // head: drafts only need argmax over the high-frequency vocab prefix,
     // and the full 248k-row lm_head GEMM at M=γ+1 dominates the propose
@@ -427,6 +437,9 @@ pub fn build_model(
         config,
         embed,
         final_norm,
+        qwen4_final_mixer,
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        qwen4_ple,
         lm_head,
         lm_head_nvfp4,
         layers,

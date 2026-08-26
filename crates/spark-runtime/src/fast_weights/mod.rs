@@ -172,8 +172,15 @@ impl WeightLoader for FastSafetensorsLoader {
             }
         }
 
-        // Load each shard. Loaded tensors filtered by EP rules upstream.
-        let mut weights: HashMap<String, WeightTensor> = HashMap::new();
+        // Load each shard. Reserve from the index up front: Flash-Next has
+        // roughly 300k expert tensors, and growing the map at the ~200k
+        // boundary while 50+ GiB of UVM is resident can turn a sub-second
+        // rehash into minutes of unified-memory pressure.
+        let expected_tensors = tensor_to_shard.as_ref().map_or(0, HashMap::len);
+        let mut weights: HashMap<String, WeightTensor> = HashMap::with_capacity(expected_tensors);
+        if expected_tensors > 0 {
+            tracing::info!("Fast loader: reserved weight index for {expected_tensors} tensors");
+        }
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;

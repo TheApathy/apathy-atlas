@@ -330,7 +330,7 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
-        let h = self.config.hidden_size;
+        let h = self.config.residual_width();
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
@@ -682,7 +682,7 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let h = self.config.hidden_size;
+        let h = self.config.residual_width();
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
 
@@ -899,7 +899,7 @@ impl TransformerModel {
             Some(s) => s,
             None => return Ok(()),
         };
-        let h = self.config.hidden_size;
+        let h = self.config.residual_width();
         let bf16 = 2usize;
         debug_assert!(
             !self.config.use_fp32_residual(),
@@ -980,7 +980,7 @@ impl TransformerModel {
             return Ok(());
         }
 
-        let h = self.config.hidden_size;
+        let h = self.config.residual_width();
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let bytes_per_slot = h * bf16;

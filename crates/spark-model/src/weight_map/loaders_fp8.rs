@@ -143,6 +143,97 @@ pub(crate) fn quantize_to_nvfp4(
     })
 }
 
+/// Content-keyed variant of [`quantize_to_nvfp4`] used by Qwen4 runtime
+/// transforms. It caches the packed payload, group scales, and scalar scale2
+/// together; a cache hit therefore skips both the global-absmax pass and the
+/// quantization kernel without weakening the cache's provenance contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantize_to_nvfp4_cached(
+    bf16_weight: &DenseWeight,
+    n: usize,
+    k: usize,
+    gpu: &dyn GpuBackend,
+    absmax_kernel: spark_runtime::gpu::KernelHandle,
+    quantize_kernel: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+    slot: &str,
+) -> Result<QuantizedWeight> {
+    use crate::weight_loader::transform_cache;
+
+    let Some(cache) = transform_cache::get() else {
+        return quantize_to_nvfp4(
+            bf16_weight,
+            n,
+            k,
+            gpu,
+            absmax_kernel,
+            quantize_kernel,
+            stream,
+        );
+    };
+    let lens = [n * k / 2, n * k / 16, 4];
+    if let Some(parts) = cache.load_parts(slot, gpu, &lens) {
+        let mut scale_bytes = [0u8; 4];
+        gpu.copy_d2h(parts[2], &mut scale_bytes)?;
+        let hit = QuantizedWeight {
+            weight: parts[0],
+            weight_scale: parts[1],
+            weight_scale_2: f32::from_le_bytes(scale_bytes),
+            input_scale: DevicePtr::NULL,
+        };
+        gpu.free(parts[2])?;
+        if !cache.verify_enabled() {
+            return Ok(hit);
+        }
+        let fresh = quantize_to_nvfp4(
+            bf16_weight,
+            n,
+            k,
+            gpu,
+            absmax_kernel,
+            quantize_kernel,
+            stream,
+        )?;
+        let valid = cache.verify_pair(
+            slot,
+            gpu,
+            &[(hit.weight, lens[0]), (hit.weight_scale, lens[1])],
+            &[(fresh.weight, lens[0]), (fresh.weight_scale, lens[1])],
+        ) && fresh.weight_scale_2.to_bits() == hit.weight_scale_2.to_bits();
+        if valid {
+            gpu.free(fresh.weight)?;
+            gpu.free(fresh.weight_scale)?;
+            return Ok(hit);
+        }
+        gpu.free(hit.weight)?;
+        gpu.free(hit.weight_scale)?;
+        return Ok(fresh);
+    }
+
+    let fresh = quantize_to_nvfp4(
+        bf16_weight,
+        n,
+        k,
+        gpu,
+        absmax_kernel,
+        quantize_kernel,
+        stream,
+    )?;
+    let scale_dev = gpu.alloc(4)?;
+    gpu.copy_h2d(&fresh.weight_scale_2.to_le_bytes(), scale_dev)?;
+    cache.store_parts(
+        slot,
+        gpu,
+        &[
+            (fresh.weight, lens[0]),
+            (fresh.weight_scale, lens[1]),
+            (scale_dev, lens[2]),
+        ],
+    );
+    gpu.free(scale_dev)?;
+    Ok(fresh)
+}
+
 /// Load attention weights for a full_attention layer.
 pub(crate) fn load_attention(
     store: &WeightStore,

@@ -49,7 +49,7 @@ mod evict;
 /// Bump on ANY change to the on-disk layout, to the set of fingerprint
 /// inputs, or to the meaning of a slot key. Existing caches then fail the
 /// key check and are rewritten rather than silently reused.
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+pub const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Parts are padded to this boundary inside the blob so each mmap slice
 /// handed to `copy_h2d` starts aligned.

@@ -258,6 +258,7 @@ impl TransformerModel {
 
         // ── Phase 4: forward through all layers ──
         self.prefill_b_forward_layers(
+            tokens,
             seq,
             &mut kv_cache,
             chunk_start,

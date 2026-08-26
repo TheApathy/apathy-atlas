@@ -117,8 +117,6 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        let _ = target_hidden_size;
-
         let num_layers = weights.config.num_hidden_layers;
         let hidden_size = weights.config.hidden_size;
         let intermediate_size = weights.config.intermediate_size;
@@ -126,6 +124,18 @@ impl BlockDiffusionDraftHead {
         let num_kv_heads = weights.config.num_key_value_heads;
         let head_dim = weights.config.head_dim;
         let vocab_size = weights.config.vocab_size;
+        let expected_fc_shape = [
+            hidden_size,
+            target_layer_ids.len().saturating_mul(target_hidden_size),
+        ];
+        anyhow::ensure!(
+            weights.fc_shape == expected_fc_shape,
+            "DFlash drafter fc.weight shape {:?} is incompatible with target intermediate width {} and {} capture layers; expected {:?}",
+            weights.fc_shape,
+            target_hidden_size,
+            target_layer_ids.len(),
+            expected_fc_shape,
+        );
         weights.config.validate_verify_mode(verify_mode)?;
         let checkpoint_family = weights.config.checkpoint_family()?;
         let block_size = weights.config.resolved_block_size();

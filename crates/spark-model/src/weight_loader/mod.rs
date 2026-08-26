@@ -188,6 +188,17 @@ pub trait ModelWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight>;
+
+    /// Optional terminal Qwen4 hyperconnection mixer. Conventional models
+    /// return `None` and use `final_norm` as before.
+    fn load_qwen4_final_mixer(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::Qwen4HyperConnection>> {
+        Ok(None)
+    }
     fn load_lm_head(
         &self,
         store: &WeightStore,

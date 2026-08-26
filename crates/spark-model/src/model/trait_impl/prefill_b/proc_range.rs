@@ -50,6 +50,14 @@ impl TransformerModel {
                     // Need to process at least the last token for logits.
                     // Re-embed just the last token into hidden[0].
                     let last_tok = tokens[chunk_start + chunk_len - 1];
+                    if self.config.is_qwen4_exp() {
+                        self.embed(last_tok, hidden, stream)?;
+                        return Ok(ProcRange::Compute {
+                            proc_start: chunk_start + chunk_len - 1,
+                            proc_count: 1,
+                            effective_seq_len_start: chunk_start + chunk_len - 1,
+                        });
+                    }
                     let last_tok_bytes: &[u8] = unsafe {
                         std::slice::from_raw_parts(&last_tok as *const u32 as *const u8, 4)
                     };
@@ -81,6 +89,20 @@ impl TransformerModel {
                 // Re-embed only uncached portion
                 let uncached_start = chunk_start + skip_in_chunk;
                 let uncached_count = chunk_len - skip_in_chunk;
+                if self.config.is_qwen4_exp() {
+                    let row_bytes = self.config.residual_width() * 2;
+                    for (row, &token) in tokens[uncached_start..uncached_start + uncached_count]
+                        .iter()
+                        .enumerate()
+                    {
+                        self.embed(token, hidden.offset(row * row_bytes), stream)?;
+                    }
+                    return Ok(ProcRange::Compute {
+                        proc_start: uncached_start,
+                        proc_count: uncached_count,
+                        effective_seq_len_start: uncached_start,
+                    });
+                }
                 let uncached_tokens = &tokens[uncached_start..uncached_start + uncached_count];
                 let token_ids_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(

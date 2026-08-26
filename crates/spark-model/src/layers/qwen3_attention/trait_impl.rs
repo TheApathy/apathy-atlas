@@ -98,6 +98,15 @@ pub(super) fn gemma4_diag_enabled() -> bool {
 }
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) -> Result<()> {
+        Qwen3AttentionLayer::set_qwen4_hyperconnections(self, attn, mlp);
+        Ok(())
+    }
+
     fn ddtree_ancestor_attention_exact(&self) -> bool {
         // BF16 certifies only when this exact Qwen target resolved the
         // dedicated tree ABI. Turbo variants still ignore indirection.

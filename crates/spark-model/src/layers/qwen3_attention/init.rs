@@ -99,6 +99,8 @@ impl Qwen3AttentionLayer {
             attn,
             post_attn_norm,
             ffn,
+            qwen4_attn_hyper: None,
+            qwen4_mlp_hyper: None,
             attn_layer_idx,
             gated,
             mrope_interleaved,

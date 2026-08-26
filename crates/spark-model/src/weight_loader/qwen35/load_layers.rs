@@ -13,11 +13,11 @@ use spark_runtime::weights::WeightStore;
 
 use super::super::{ModelWeightLoader, QuantFormat, WeightFormat};
 use crate::layer::TransformerLayer;
-use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer};
+use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer, Qwen4HyperConnection};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_fp8_block_scaled};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense, detect_nvfp4_variant,
-    load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_moe_qwen35,
+    AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense, dense_auto,
+    detect_nvfp4_variant, load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_moe_qwen35,
     load_moe_qwen35_fp8_experts, quantize_to_nvfp4,
 };
 
@@ -124,8 +124,19 @@ pub(super) fn load_layers(
 
     for (i, lt) in layer_types.iter().enumerate() {
         let lp = config.layer_prefix(i);
-        let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
-        let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
+        let (input_norm, post_attn_norm) = if config.is_qwen4_exp() {
+            // These fields are unused once the hyperconnection path is
+            // installed, but the shared Qwen3 core constructors require a
+            // DenseWeight. Alias a real offset-RMS tensor rather than inventing
+            // an allocation.
+            let norm = dense(store, &format!("{lp}.attn_hyper_connection.hc_norm.weight"))?;
+            (norm, norm)
+        } else {
+            (
+                dense(store, &format!("{lp}.input_layernorm.weight"))?,
+                dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
+            )
+        };
 
         // When native_fp8, skip NVFP4 routed experts — FP8 fused batch1/2/3
         // kernels handle all MoE dispatch including MTP verify.
@@ -159,15 +170,28 @@ pub(super) fn load_layers(
             stream,
             skip_nvfp4_experts,
         )?;
-        let gate_nvfp4 = quantize_to_nvfp4(
-            &moe_weights.gate,
-            config.num_experts,
-            h,
-            gpu,
-            absmax_k,
-            quantize_k,
-            stream,
-        )?;
+        let gate_nvfp4 = if config.is_qwen4_exp() {
+            crate::weight_map::quantize_to_nvfp4_cached(
+                &moe_weights.gate,
+                config.num_experts,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+                &format!("qwen4.layers.{i}.moe_gate.nvfp4"),
+            )?
+        } else {
+            quantize_to_nvfp4(
+                &moe_weights.gate,
+                config.num_experts,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?
+        };
         let mut moe_layer = MoeLayer::new(
             moe_weights,
             config.num_experts,
@@ -377,6 +401,33 @@ pub(super) fn load_layers(
             LayerType::Moe => unreachable!("Qwen3.5 has no standalone MoE layers"),
         }
 
+        if config.is_qwen4_exp() {
+            let attn_hyper = load_qwen4_hyper(
+                store,
+                &format!("{lp}.attn_hyper_connection"),
+                true,
+                config,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?;
+            let mlp_hyper = load_qwen4_hyper(
+                store,
+                &format!("{lp}.mlp_hyper_connection"),
+                true,
+                config,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?;
+            layers
+                .last_mut()
+                .expect("layer was just pushed")
+                .set_qwen4_hyperconnections(attn_hyper, mlp_hyper)?;
+        }
+
         if (i + 1) % 10 == 0 || i < 5 {
             let free_gb = gpu.free_memory()? as f64 / (1024.0 * 1024.0 * 1024.0);
             tracing::info!("Loaded layers 0..{} — {free_gb:.1} GB free", i + 1);
@@ -391,7 +442,79 @@ pub(super) fn load_layers(
         layers.len() - attn_idx,
     );
 
-    crate::weight_loader::transform_cache::finish();
+    // Qwen4 still has model-level hyperconnection and PLE projections after
+    // the layer vector is built. Keep the writer open so those transforms
+    // participate in the same provenance-locked artifact.
+    if !config.is_qwen4_exp() {
+        crate::weight_loader::transform_cache::finish();
+    }
 
     Ok(layers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_qwen4_hyper(
+    store: &WeightStore,
+    prefix: &str,
+    with_injection: bool,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    absmax_k: spark_runtime::gpu::KernelHandle,
+    quantize_k: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+) -> Result<Qwen4HyperConnection> {
+    let r = config.residual_width();
+    let rank = config.hc_lowrank;
+    let norm = dense(store, &format!("{prefix}.hc_norm.weight"))?;
+    let down_dense = dense_auto(
+        store,
+        &format!("{prefix}.input_mix_weight_down.weight"),
+        gpu,
+    )?;
+    let up_dense = dense_auto(store, &format!("{prefix}.input_mix_weight_up.weight"), gpu)?;
+    let down = crate::weight_map::quantize_to_nvfp4_cached(
+        &down_dense,
+        rank,
+        r,
+        gpu,
+        absmax_k,
+        quantize_k,
+        stream,
+        &format!("{prefix}.down.nvfp4"),
+    )?;
+    let up = crate::weight_map::quantize_to_nvfp4_cached(
+        &up_dense,
+        r,
+        rank,
+        gpu,
+        absmax_k,
+        quantize_k,
+        stream,
+        &format!("{prefix}.up.nvfp4"),
+    )?;
+    let inject = if with_injection {
+        let dense = dense_auto(store, &format!("{prefix}.block_inject_weight.weight"), gpu)?;
+        Some(crate::weight_map::quantize_to_nvfp4_cached(
+            &dense,
+            config.hc_count,
+            r,
+            gpu,
+            absmax_k,
+            quantize_k,
+            stream,
+            &format!("{prefix}.inject.nvfp4"),
+        )?)
+    } else {
+        None
+    };
+    Qwen4HyperConnection::new(
+        norm,
+        down,
+        up,
+        inject,
+        config.hidden_size,
+        config.hc_count,
+        rank,
+        gpu,
+    )
 }

@@ -5,7 +5,7 @@
 //! to [`Qwen3AttentionLayer::prefill_inner`].
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
+use spark_runtime::gpu::{DevicePtr, HostToDeviceCopy};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::Qwen3AttentionLayer;
@@ -39,6 +39,56 @@ impl Qwen3AttentionLayer {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let n = num_tokens as u32;
+
+        // Correctness-first Flash-Next bring-up: the hyperconnection core is
+        // decode-native. Serialize prompt rows through the exact same path
+        // until the batched four-stream GEMMs are qualified.
+        if self.qwen4_attn_hyper.is_some() {
+            if batched_meta.is_some() {
+                anyhow::bail!("qwen4_exp batched multi-sequence prefill is not yet supported");
+            }
+            let row_bytes = ctx.config.residual_width() * 2;
+            let base_meta = ctx
+                .attn_metadata
+                .ok_or_else(|| anyhow::anyhow!("qwen4_exp serialized prefill requires metadata"))?;
+            anyhow::ensure!(
+                base_meta.block_table != DevicePtr::NULL && base_meta.seq_len != DevicePtr::NULL,
+                "qwen4_exp serialized prefill requires paged block-table and sequence-length metadata"
+            );
+            for t in 0..num_tokens {
+                let seq_len = (seq_len_start + t + 1) as u32;
+                let seq_len_bytes = seq_len.to_ne_bytes();
+                ctx.gpu.copy_h2d_group_on_stream(
+                    &[HostToDeviceCopy::new(&seq_len_bytes, base_meta.seq_len)],
+                    stream,
+                )?;
+                let token_meta = crate::layer::AttnMetadataDev {
+                    positions: base_meta.positions.offset(t * 4),
+                    positions_h: base_meta.positions_h.offset(t * 4),
+                    positions_w: base_meta.positions_w.offset(t * 4),
+                    slot: base_meta.slot.offset(t * 8),
+                    seq_len: base_meta.seq_len,
+                    ..base_meta
+                };
+                let token_ctx = crate::layer::ForwardContext {
+                    attn_metadata: Some(token_meta),
+                    ..*ctx
+                };
+                self.decode_inner(
+                    hidden.offset(t * row_bytes),
+                    residual.offset(t * row_bytes),
+                    _state,
+                    kv_cache,
+                    seq_len_start + t,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    &token_ctx,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
 
         // ── 1. RMS norm + residual for N tokens ──
         let normed = ctx.buffers.norm_output();

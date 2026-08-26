@@ -24,9 +24,11 @@ pub use sizes::BufferSizes;
 /// only touch k_max slots during decode, so the extra pages don't affect
 /// decode bandwidth on unified memory.
 pub struct BufferArena {
-    /// Hidden states: [M, hidden_size] in BF16.
+    /// Persistent hidden states: [M, residual_width] in BF16 (or FP32 for
+    /// models that request it). `residual_width == hidden_size` except for
+    /// multi-stream hyperconnection architectures such as Qwen4-Exp.
     hidden_states: DevicePtr,
-    /// Residual stream: [M, hidden_size] in BF16.
+    /// Residual scratch: [M, residual_width], matching `hidden_states`.
     residual: DevicePtr,
     /// Post-norm output: [M, hidden_size] in BF16.
     norm_output: DevicePtr,

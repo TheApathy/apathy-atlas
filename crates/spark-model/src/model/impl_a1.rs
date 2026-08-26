@@ -33,6 +33,10 @@ impl TransformerModel {
         config: ModelConfig,
         embed_tokens: DenseWeight,
         final_norm: DenseWeight,
+        qwen4_final_mixer: Option<crate::layers::Qwen4HyperConnection>,
+        #[cfg(all(feature = "cuda", target_os = "linux"))] qwen4_ple: Option<
+            crate::layers::Qwen4PleLayer,
+        >,
         lm_head_weight: DenseWeight,
         lm_head_nvfp4: Option<QuantizedWeight>,
         layers: Vec<Box<dyn TransformerLayer>>,
@@ -736,7 +740,7 @@ impl TransformerModel {
             // `try_dflash_capture(token_idx=0..T)`. Track the real flat/tree
             // capacities instead of hardcoding a historical width.
             let k_max = dflash_kgamma.max(ddtree_cap);
-            Some(gpu.alloc(k_max * n * config.hidden_size * 2)?)
+            Some(gpu.alloc(k_max * n * config.residual_width() * 2)?)
         };
 
         // EP command buffer for token broadcast (4 bytes, u32)
@@ -961,6 +965,9 @@ impl TransformerModel {
             tree_kv_pack_active,
             embed_tokens,
             final_norm,
+            qwen4_final_mixer,
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            qwen4_ple,
             lm_head_weight,
             lm_head_nvfp4,
             lm_head_nvfp4_t,

@@ -66,20 +66,30 @@ impl TransformerModel {
 
         // ── 6. Final norm on LAST token only ──
         let last_token_offset = hidden_stream_offset_tokens + proc_count - 1;
-        let last_hidden = hidden.offset(last_token_offset * h * fp32);
+        let persistent_width = self.config.residual_width();
+        let last_hidden = hidden.offset(last_token_offset * persistent_width * fp32);
+        let last_residual = self
+            .buffers
+            .residual()
+            .offset(last_token_offset * persistent_width * fp32);
         let normed = self.buffers.norm_output();
         let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            last_hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if self
+            .qwen4_final_hidden(last_hidden, last_residual, stream)?
+            .is_none()
+        {
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                last_hidden,
+                &self.final_norm,
+                normed,
+                1,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
 
         // Diagnostic: post-norm hidden state
         if (chunk_start + chunk_len) > 16384 || crate::model::env_diag::diag_gemma4_enabled() {

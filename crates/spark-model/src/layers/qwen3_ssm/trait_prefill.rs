@@ -27,6 +27,25 @@ impl Qwen3SsmLayer {
         let bf16 = 2usize;
         let fp32 = 4usize;
 
+        if self.qwen4_attn_hyper.is_some() {
+            let row_bytes = ctx.config.residual_width() * 2;
+            for t in 0..num_tokens {
+                self.decode_inner(
+                    hidden.offset(t * row_bytes),
+                    residual.offset(t * row_bytes),
+                    state,
+                    _kv_cache,
+                    _seq_len_start + t,
+                    _block_table,
+                    _disk_block_ids,
+                    _disk_last_offloaded_per_layer,
+                    ctx,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+
         let ssm_state = state
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()

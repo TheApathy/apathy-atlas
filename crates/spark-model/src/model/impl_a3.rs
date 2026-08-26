@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::block_mgmt::{
@@ -109,10 +110,40 @@ fn log_exact_lm_head_engagement(route: ops::ExactLmHeadRoute, rows: u32, vocab: 
 }
 
 impl TransformerModel {
+    /// Collapse Qwen4's four persistent streams to the core hidden width.
+    /// Conventional architectures retain their terminal RMSNorm path at the
+    /// call site.
+    pub(super) fn qwen4_final_hidden(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        let Some(mixer) = &self.qwen4_final_mixer else {
+            return Ok(None);
+        };
+        let (mixed, inject) = mixer.prepare_decode(
+            hidden,
+            residual,
+            &self.buffers,
+            self.gpu.as_ref(),
+            self.config.rms_norm_eps as f32,
+            stream,
+        )?;
+        debug_assert!(inject.is_none());
+        Ok(Some(mixed))
+    }
+
     pub(super) fn embed(&self, token: u32, output: DevicePtr, stream: u64) -> Result<()> {
         let h = self.config.hidden_size;
         let row_bytes = h * 2; // BF16 embedding row
         let src = self.embed_tokens.weight.offset(token as usize * row_bytes);
+        if self.config.is_qwen4_exp() {
+            let scratch = self.buffers.norm_output();
+            self.gpu.copy_d2d_async(src, scratch, row_bytes, stream)?;
+            self.expand_qwen4_embedding(scratch, output, stream)?;
+            return Ok(());
+        }
         if self.bf16_to_f32_kernel.0 != 0 {
             // FP32 residual: embed BF16 to scratch, convert to FP32 output.
             // The scratch buffer is norm_output which is BF16 regardless of
@@ -133,6 +164,27 @@ impl TransformerModel {
             // Scale embeddings (Gemma-4: sqrt(hidden_size))
             self.scale_embeddings(output, 1, stream)
         }
+    }
+
+    /// Expand one BF16 `[hidden_size]` embedding into Qwen4's
+    /// `[hc_count, hidden_size]` residual-stream layout.
+    pub(super) fn expand_qwen4_embedding(
+        &self,
+        input: DevicePtr,
+        output: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        let kernel = self
+            .gpu
+            .kernel("qwen4_hyper", "qwen4_hc_expand_embedding")?;
+        KernelLaunch::new(self.gpu.as_ref(), kernel)
+            .grid([1, div_ceil(self.config.residual_width() as u32, 256), 1])
+            .block([256, 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(output)
+            .arg_u32(self.config.hidden_size as u32)
+            .arg_u32(self.config.hc_count as u32)
+            .launch(stream)
     }
 
     /// Scale in-place embeddings by config.embed_scale. Picks the kernel

@@ -8,6 +8,15 @@ use crate::layers::FfnComponent;
 use crate::weight_map::DenseWeight;
 
 impl Qwen3AttentionLayer {
+    pub fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) {
+        self.qwen4_attn_hyper = Some(attn);
+        self.qwen4_mlp_hyper = Some(mlp);
+    }
+
     /// Set MLA weights for 2-step latent decode. When set, decode uses
     /// latent→norm→expand instead of single-step GEMV.
     pub fn set_mla_weights(&mut self, mla: MlaWeights) {
