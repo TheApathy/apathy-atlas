@@ -1,0 +1,32 @@
+{
+  "schema": "atlas-rejected-benchmark-v1",
+  "status": "rejected",
+  "reason": "Flash-Next K=2 serial verifier was coherent but not output-identical and regressed throughput",
+  "commit_under_test": "50777d87+qwen4-k2-working-tree",
+  "model": "qwen3.8-flash-next",
+  "checkpoint": "/home/flocka/models/Qwen3.8-Flash-Next-NVFP4-Offload",
+  "mode": "ngram-k2-cpu-proposer",
+  "unsafe_override_required": "ATLAS_QWEN4_NGRAM_UNSAFE=1",
+  "request": {
+    "prompt_sha256": "202498f2a136366a7320e9fd95255de1d1ae999ea9c41301903728e6f02759f2",
+    "max_tokens": 400,
+    "temperature": 0.0,
+    "reasoning_effort": "none",
+    "concurrency": 1,
+    "repetitions": 3
+  },
+  "server_response_tokens_per_second": [
+    25.2981619589234,
+    27.62774371908776,
+    25.1700113161324
+  ],
+  "median_server_response_tokens_per_second": 25.2981619589234,
+  "stable_output_sha256": [
+    "e607c6e610a40223e8adcfe8b1df8ef0a2f5502e545f2ed308f6ce2a22d3441a",
+    "90798369018deb89979acbb2763bc61293450bec5ac1060a4fc38008e8e0c6b6",
+    "e607c6e610a40223e8adcfe8b1df8ef0a2f5502e545f2ed308f6ce2a22d3441a"
+  ],
+  "target_only_control_median_tokens_per_second": 38.359398413646346,
+  "target_only_control_stable_output_sha256": "f811cdc565dff063074f8bb1d0bb3fd55c8b10f3438c517cf4d59128f23cf790",
+  "release_decision": "fail-closed"
+}

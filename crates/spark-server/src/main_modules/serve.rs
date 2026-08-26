@@ -30,6 +30,10 @@ type Prepared = (
     u16,
 );
 
+fn qwen4_ngram_requires_unsafe(ngram_speculative: bool, is_qwen4: bool) -> bool {
+    ngram_speculative && is_qwen4
+}
+
 /// Bring the engine up, then serve.
 ///
 /// Startup — weight load, KV allocation, kernel audit, graph capture — is ~50s of
@@ -180,6 +184,21 @@ fn startup(
 
     // Apply MODEL.toml [behavior].default_num_drafts unless user passed --num-drafts.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
+
+    // The inherited K=2 verifier is single-stream. Flash-Next needs a
+    // four-stream + PLE-aware verifier and currently falls back to two exact
+    // serial rows. That path is coherent, but the Weschera qualification gate
+    // showed non-identical hashes and a net throughput regression. Refuse to
+    // advertise it as lossless speculation until the native batched verifier
+    // is qualified. The override is deliberately diagnostic-only.
+    if qwen4_ngram_requires_unsafe(args.ngram_speculative, config.is_qwen4_exp())
+        && std::env::var("ATLAS_QWEN4_NGRAM_UNSAFE").ok().as_deref() != Some("1")
+    {
+        anyhow::bail!(
+            "--ngram-speculative is not yet losslessly qualified for qwen4_exp; \
+             use target-only serving, or set ATLAS_QWEN4_NGRAM_UNSAFE=1 for diagnostic runs"
+        );
+    }
 
     let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
 
@@ -737,6 +756,18 @@ fn startup(
 
     // 9-11. Router + HTTP server run on the async side; hand them the pieces.
     Ok(Some((state, model_ready, args.bind, args.port)))
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    use super::qwen4_ngram_requires_unsafe;
+
+    #[test]
+    fn flash_next_ngram_is_fail_closed() {
+        assert!(qwen4_ngram_requires_unsafe(true, true));
+        assert!(!qwen4_ngram_requires_unsafe(false, true));
+        assert!(!qwen4_ngram_requires_unsafe(true, false));
+    }
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an

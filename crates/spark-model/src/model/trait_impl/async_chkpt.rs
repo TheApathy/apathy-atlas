@@ -69,6 +69,9 @@ impl TransformerModel {
                 )?;
             }
         }
+        if let Some(ple) = &self.qwen4_ple {
+            ple.checkpoint(seq.slot_idx, self.gpu.as_ref(), stream)?;
+        }
         // Record event so default stream can wait (GPU-side, no CPU block).
         self.gpu.record_event(self.secondary_event, stream)?;
         Ok(())
@@ -138,6 +141,9 @@ impl TransformerModel {
                 ssm_layer_idx += 1;
             }
         }
+        if let Some(ple) = &self.qwen4_ple {
+            ple.rollback_and_checkpoint(seq.slot_idx, num_accepted, self.gpu.as_ref(), stream)?;
+        }
         // Record event so default stream can wait (GPU-side, no CPU block).
         self.gpu.record_event(self.secondary_event, stream)?;
         Ok(())
@@ -184,6 +190,9 @@ impl TransformerModel {
                 self.gpu
                     .copy_d2d_async(conv_ckpt, ssm.conv_state, conv_bytes, stream)?;
             }
+        }
+        if let Some(ple) = &self.qwen4_ple {
+            ple.restore_checkpoint(seq.slot_idx, self.gpu.as_ref(), stream)?;
         }
         Ok(())
     }

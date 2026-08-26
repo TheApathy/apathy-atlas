@@ -98,6 +98,7 @@ mod runtime {
     const PLE_EMBED: usize = 2560;
     const PLE_RECORD_BYTES: usize = 90;
     const PLE_CONV_HISTORY: usize = 9;
+    const PLE_MAX_SPEC_ROWS: usize = 32;
 
     /// Atlas-native sparse PLE runtime. Only the 16 selected NVFP4 rows are
     /// staged per token; the 320M-row table remains in the O_DIRECT sidecar.
@@ -116,6 +117,8 @@ mod runtime {
         key_dev: DevicePtr,
         value_dev: DevicePtr,
         conv_state_dev: DevicePtr,
+        conv_checkpoint_dev: DevicePtr,
+        conv_intermediate_dev: DevicePtr,
         dequant_k: KernelHandle,
         fuse_k: KernelHandle,
         dense_gemv_k: KernelHandle,
@@ -212,6 +215,9 @@ mod runtime {
                 key_dev: gpu.alloc(residual * 2)?,
                 value_dev: gpu.alloc(PLE_EMBED * 2)?,
                 conv_state_dev: gpu.alloc(max_batch_size * residual * PLE_CONV_HISTORY * 2)?,
+                conv_checkpoint_dev: gpu.alloc(max_batch_size * residual * PLE_CONV_HISTORY * 2)?,
+                conv_intermediate_dev: gpu
+                    .alloc(max_batch_size * PLE_MAX_SPEC_ROWS * residual * PLE_CONV_HISTORY * 2)?,
                 dequant_k: gpu.kernel("qwen4_hyper", "qwen4_ple_dequant_rows")?,
                 fuse_k: gpu.kernel("qwen4_hyper", "qwen4_ple_fuse_decode")?,
                 dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
@@ -224,6 +230,16 @@ mod runtime {
                 layer.conv_state_dev,
                 0,
                 max_batch_size * residual * PLE_CONV_HISTORY * 2,
+            )?;
+            gpu.memset(
+                layer.conv_checkpoint_dev,
+                0,
+                max_batch_size * residual * PLE_CONV_HISTORY * 2,
+            )?;
+            gpu.memset(
+                layer.conv_intermediate_dev,
+                0,
+                max_batch_size * PLE_MAX_SPEC_ROWS * residual * PLE_CONV_HISTORY * 2,
             )?;
             tracing::info!(manifest, cache_mb, "Qwen4 PLE sparse NVFP4 offload enabled");
             Ok(Some(layer))
@@ -311,16 +327,116 @@ mod runtime {
             self.hidden_size * self.hc_count
         }
 
+        fn state_stride_bytes(&self) -> usize {
+            self.residual_width() * PLE_CONV_HISTORY * 2
+        }
+
+        /// Save the canonical PLE convolution history at a speculative boundary.
+        pub fn checkpoint(&self, slot_idx: usize, gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
+            ensure!(
+                slot_idx < self.max_batch_size,
+                "PLE slot {slot_idx} out of range"
+            );
+            let stride = self.state_stride_bytes();
+            gpu.copy_d2d_async(
+                self.conv_state_dev.offset(slot_idx * stride),
+                self.conv_checkpoint_dev.offset(slot_idx * stride),
+                stride,
+                stream,
+            )
+        }
+
+        /// Preserve the state after one verify row for partial acceptance.
+        pub fn save_intermediate(
+            &self,
+            slot_idx: usize,
+            row: usize,
+            gpu: &dyn GpuBackend,
+            stream: u64,
+        ) -> Result<()> {
+            ensure!(
+                slot_idx < self.max_batch_size,
+                "PLE slot {slot_idx} out of range"
+            );
+            ensure!(
+                row < PLE_MAX_SPEC_ROWS,
+                "PLE speculative row {row} exceeds {PLE_MAX_SPEC_ROWS}"
+            );
+            let stride = self.state_stride_bytes();
+            gpu.copy_d2d_async(
+                self.conv_state_dev.offset(slot_idx * stride),
+                self.conv_intermediate_dev
+                    .offset((slot_idx * PLE_MAX_SPEC_ROWS + row) * stride),
+                stride,
+                stream,
+            )
+        }
+
+        /// Restore the pre-verify state before a verify replay.
+        pub fn restore_checkpoint(
+            &self,
+            slot_idx: usize,
+            gpu: &dyn GpuBackend,
+            stream: u64,
+        ) -> Result<()> {
+            ensure!(
+                slot_idx < self.max_batch_size,
+                "PLE slot {slot_idx} out of range"
+            );
+            let stride = self.state_stride_bytes();
+            gpu.copy_d2d_async(
+                self.conv_checkpoint_dev.offset(slot_idx * stride),
+                self.conv_state_dev.offset(slot_idx * stride),
+                stride,
+                stream,
+            )
+        }
+
+        /// Commit a partial rollback and make it the next checkpoint.
+        pub fn rollback_and_checkpoint(
+            &self,
+            slot_idx: usize,
+            num_accepted: usize,
+            gpu: &dyn GpuBackend,
+            stream: u64,
+        ) -> Result<()> {
+            ensure!(
+                slot_idx < self.max_batch_size,
+                "PLE slot {slot_idx} out of range"
+            );
+            ensure!(
+                num_accepted <= PLE_MAX_SPEC_ROWS,
+                "Qwen4 PLE rollback accepts at most {PLE_MAX_SPEC_ROWS} rows, got {num_accepted}"
+            );
+            let stride = self.state_stride_bytes();
+            let src = if num_accepted == 0 {
+                self.conv_checkpoint_dev.offset(slot_idx * stride)
+            } else {
+                self.conv_intermediate_dev
+                    .offset((slot_idx * PLE_MAX_SPEC_ROWS + num_accepted - 1) * stride)
+            };
+            let live = self.conv_state_dev.offset(slot_idx * stride);
+            gpu.copy_d2d_async(src, live, stride, stream)?;
+            gpu.copy_d2d_async(
+                live,
+                self.conv_checkpoint_dev.offset(slot_idx * stride),
+                stride,
+                stream,
+            )
+        }
+
         pub fn owned_device_buffers(&self) -> [DevicePtr; 2] {
             [self.records_dev, self.scales_dev]
         }
 
-        pub fn scratch_device_buffers(&self) -> [DevicePtr; 4] {
+        pub fn scratch_device_buffers(&self) -> [DevicePtr; 6] {
             [
                 self.embedding_dev,
                 self.key_dev,
                 self.value_dev,
                 self.conv_state_dev,
+                self.conv_checkpoint_dev,
+                self.conv_intermediate_dev,
             ]
         }
     }
