@@ -320,6 +320,7 @@ mod exact_projection;
 #[cfg(test)]
 mod exact_projection_tests;
 mod init;
+mod qwen4_k5_ssm;
 mod serial_diag;
 mod ssm_forward;
 mod trait_decode;

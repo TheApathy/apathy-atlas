@@ -36,6 +36,8 @@ impl Qwen3SsmLayer {
             num_tokens == 5 && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
         let exact_hyper_k5 =
             hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_HYPER").ok().as_deref() != Some("1");
+        let batch_ssm_k5 =
+            hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_SSM").ok().as_deref() == Some("1");
 
         // Batch the four-stream projection weights, then retain exact causal
         // ordering in the recurrent GDN core.
@@ -80,36 +82,51 @@ impl Qwen3SsmLayer {
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()
             .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
-        for row in 0..num_tokens {
-            let hidden_row = hidden.offset(row * row_bytes);
-            let residual_row = residual.offset(row * row_bytes);
-            let ssm_out = self.ssm_forward(
-                attn_inputs.offset(row * core_bytes),
+        if batch_ssm_k5 {
+            let ssm_out = self.ssm_forward_qwen4_k5_exact(
+                attn_inputs,
                 ssm_state,
+                h_intermediate,
+                conv_intermediate,
+                h_intermediate_stride,
+                conv_intermediate_stride,
                 ctx,
                 stream,
-                false,
             )?;
-            attn_hyper.inject_decode(
-                hidden_row,
-                ssm_out,
-                attn_hyper.saved_inject(residual_row),
-                ctx.gpu,
-                stream,
-            )?;
-            if !h_intermediate.is_null() {
-                ctx.gpu.copy_d2d_async(
-                    ssm_state.h_state,
-                    h_intermediate.offset(row * h_intermediate_stride),
-                    h_intermediate_stride,
+            attn_hyper
+                .inject_saved_batched(hidden, ssm_out, residual, num_tokens, ctx.gpu, stream)?;
+        } else {
+            for row in 0..num_tokens {
+                let hidden_row = hidden.offset(row * row_bytes);
+                let residual_row = residual.offset(row * row_bytes);
+                let ssm_out = self.ssm_forward(
+                    attn_inputs.offset(row * core_bytes),
+                    ssm_state,
+                    ctx,
+                    stream,
+                    false,
+                )?;
+                attn_hyper.inject_decode(
+                    hidden_row,
+                    ssm_out,
+                    attn_hyper.saved_inject(residual_row),
+                    ctx.gpu,
                     stream,
                 )?;
-                ctx.gpu.copy_d2d_async(
-                    ssm_state.conv_state,
-                    conv_intermediate.offset(row * conv_intermediate_stride),
-                    conv_intermediate_stride,
-                    stream,
-                )?;
+                if !h_intermediate.is_null() {
+                    ctx.gpu.copy_d2d_async(
+                        ssm_state.h_state,
+                        h_intermediate.offset(row * h_intermediate_stride),
+                        h_intermediate_stride,
+                        stream,
+                    )?;
+                    ctx.gpu.copy_d2d_async(
+                        ssm_state.conv_state,
+                        conv_intermediate.offset(row * conv_intermediate_stride),
+                        conv_intermediate_stride,
+                        stream,
+                    )?;
+                }
             }
         }
 
