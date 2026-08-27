@@ -23,7 +23,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<Option<(DevicePtr, usize)>> {
-        if rows != 5
+        if !matches!(rows, 5 | 9)
             || std::env::var("ATLAS_QWEN4_K5_BATCH_ATTN_QKV")
                 .ok()
                 .as_deref()
@@ -32,28 +32,28 @@ impl Qwen3AttentionLayer {
             return Ok(None);
         }
 
-        ensure!(self.gated, "Qwen4 exact K5 QKV requires gated attention");
+        ensure!(self.gated, "Qwen4 exact QKV requires gated attention");
         ensure!(
             self.attn.q_norm_full.is_none()
                 && self.attn.k_norm_full.is_none()
                 && self.v_norm_weight.is_none(),
-            "Qwen4 exact K5 QKV requires per-head Q/K norms and no V norm"
+            "Qwen4 exact QKV requires per-head Q/K norms and no V norm"
         );
         let q_weight = self
             .q_weight
             .as_ref()
             .and_then(|weight| weight.as_nvfp4())
-            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact K5 Q requires ordinary NVFP4"))?;
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact Q requires ordinary NVFP4"))?;
         let k_weight = self
             .k_weight
             .as_ref()
             .and_then(|weight| weight.as_nvfp4())
-            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact K5 K requires ordinary NVFP4"))?;
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact K requires ordinary NVFP4"))?;
         let v_weight = self
             .v_weight
             .as_ref()
             .and_then(|weight| weight.as_nvfp4())
-            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact K5 V requires ordinary NVFP4"))?;
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact V requires ordinary NVFP4"))?;
 
         let h = ctx.config.hidden_size as u32;
         let nq = self
@@ -72,14 +72,14 @@ impl Qwen3AttentionLayer {
         let qkv = ctx.buffers.qkv_output();
         ensure!(
             rows * row_bytes <= ctx.buffers.sizes().qkv_output,
-            "Qwen4 exact K5 QKV staging exceeds QKV arena"
+            "Qwen4 exact QKV staging exceeds QKV arena"
         );
         let row_stride_bf16 = (row_bytes / 2) as u32;
         let qg_kernel = self.w4a16_exact_qkv_kernels.qg_for_rows(rows);
         let dual_kv_kernel = self.w4a16_exact_qkv_kernels.dual_kv_for_rows(rows);
         ensure!(
             qg_kernel.0 != 0 && dual_kv_kernel.0 != 0,
-            "Qwen4 exact K5 QKV kernels are unavailable"
+            "Qwen4 exact QKV kernels are unavailable"
         );
 
         ops::w4a16_gemv_qg_exact(

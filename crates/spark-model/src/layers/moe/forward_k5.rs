@@ -6,23 +6,37 @@ use super::*;
 
 impl MoeLayer {
     pub fn forward_k5(&self, input: DevicePtr, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        self.forward_qwen4_exact(input, 5, ctx, stream)
+    }
+
+    pub fn forward_qwen4_exact(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(rows, 5 | 9),
+            "Qwen4 exact MoE requires 5 or 9 rows"
+        );
         anyhow::ensure!(
             ctx.comm.is_none_or(|comm| comm.world_size() == 1),
-            "K=5 NVFP4 MoE does not support expert parallelism"
+            "Qwen4 exact NVFP4 MoE does not support expert parallelism"
         );
         let nvfp4 = self
             .gate_nvfp4
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("K=5 MoE requires an NVFP4 router"))?;
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact MoE requires an NVFP4 router"))?;
         let h = ctx.config.hidden_size as u32;
         let inter = ctx.config.moe_intermediate_size as u32;
         let num_experts = ctx.config.num_experts as u32;
         let top_k = ctx.config.num_experts_per_tok as u32;
-        let router_in = self.router_input(input, 5, h, ctx, stream)?;
+        let router_in = self.router_input(input, rows as u32, h, ctx, stream)?;
         let gate_logits = ctx.buffers.gate_logits();
 
         // Preserve ordinary K=1 lane ownership and BF16 rounding exactly.
-        for row in 0..5usize {
+        for row in 0..rows {
             ops::w4a16_gemv(
                 ctx.gpu,
                 self.w4a16_gemv,
@@ -36,7 +50,7 @@ impl MoeLayer {
         }
 
         let indices_dev = ctx.buffers.scratch();
-        let weights_dev = indices_dev.offset(5 * top_k as usize * 4);
+        let weights_dev = indices_dev.offset(rows * top_k as usize * 4);
         if let Some(bias) = self.correction_bias_dev {
             ops::moe_topk_sigmoid_batched(
                 ctx.gpu,
@@ -49,7 +63,7 @@ impl MoeLayer {
                 top_k,
                 ctx.config.norm_topk_prob,
                 1.0,
-                5,
+                rows as u32,
                 stream,
             )?;
         } else {
@@ -62,7 +76,7 @@ impl MoeLayer {
                 num_experts,
                 top_k,
                 ctx.config.norm_topk_prob,
-                5,
+                rows as u32,
                 stream,
             )?;
         }
@@ -97,7 +111,7 @@ impl MoeLayer {
             inter,
             h,
             top_k,
-            5,
+            rows as u32,
             stream,
         )?;
         ops::moe_expert_silu_down_shared_batch3(
@@ -117,7 +131,7 @@ impl MoeLayer {
             h,
             inter,
             top_k,
-            5,
+            rows as u32,
             stream,
         )?;
         ops::moe_weighted_sum_blend_batch3(
@@ -132,7 +146,7 @@ impl MoeLayer {
             h,
             top_k,
             h,
-            5,
+            rows as u32,
             stream,
         )
     }

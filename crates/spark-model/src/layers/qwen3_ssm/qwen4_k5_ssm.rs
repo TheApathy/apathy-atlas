@@ -9,6 +9,7 @@ impl Qwen3SsmLayer {
     pub(super) fn ssm_forward_qwen4_k5_exact(
         &self,
         input: DevicePtr,
+        rows: usize,
         state: &mut SsmLayerState,
         h_intermediate: DevicePtr,
         conv_intermediate: DevicePtr,
@@ -17,7 +18,6 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
-        const ROWS: usize = 5;
         const BF16: usize = 2;
         const FP32: usize = 4;
         let h = ctx.config.hidden_size;
@@ -36,19 +36,26 @@ impl Qwen3SsmLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let batch_conv = std::env::var("ATLAS_QWEN4_K5_BATCH_CONV").ok().as_deref() == Some("1");
         let batch_gdn = std::env::var("ATLAS_QWEN4_K5_BATCH_GDN").ok().as_deref() == Some("1");
-        anyhow::ensure!(self.sequential_qkvz, "Qwen4 K5 requires sequential QKVZ");
+        anyhow::ensure!(
+            matches!(rows, 5 | 9),
+            "Qwen4 exact SSM requires 5 or 9 rows"
+        );
+        anyhow::ensure!(
+            self.sequential_qkvz,
+            "Qwen4 exact SSM requires sequential QKVZ"
+        );
         let qkvz = self
             .qkvz_nvfp4
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Qwen4 K5 requires NVFP4 QKVZ"))?;
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 exact SSM requires NVFP4 QKVZ"))?;
         anyhow::ensure!(
             !h_intermediate.is_null() && !conv_intermediate.is_null(),
-            "Qwen4 K5 exact SSM requires recurrent intermediates"
+            "Qwen4 exact SSM requires recurrent intermediates"
         );
         anyhow::ensure!(
             h_intermediate_stride == self.h_state_bytes
                 && conv_intermediate_stride == self.conv_state_bytes,
-            "Qwen4 K5 recurrent intermediate stride mismatch"
+            "Qwen4 exact SSM recurrent intermediate stride mismatch"
         );
         anyhow::ensure!(
             self.ba_gates_batchn_exact_k.0 != 0
@@ -57,7 +64,7 @@ impl Qwen3SsmLayer {
                 && self.gated_rms_norm_f32_k.0 != 0
                 && (!batch_conv || self.conv1d_l2norm_f32_sequence_k.0 != 0)
                 && (!batch_gdn || self.gdn_f32_sequence_k.0 != 0),
-            "Qwen4 K5 exact SSM kernels are incomplete"
+            "Qwen4 exact SSM kernels are incomplete"
         );
 
         let deinterleaved = ctx.buffers.ssm_deinterleaved();
@@ -66,7 +73,7 @@ impl Qwen3SsmLayer {
             input,
             qkvz,
             deinterleaved,
-            ROWS as u32,
+            rows as u32,
             qkvz_size as u32,
             h as u32,
             stream,
@@ -82,7 +89,7 @@ impl Qwen3SsmLayer {
             self.ssm.dt_bias.weight,
             gates,
             gates.offset(nv * FP32),
-            ROWS as u32,
+            rows as u32,
             ba_size as u32,
             h as u32,
             vpg as u32,
@@ -103,7 +110,7 @@ impl Qwen3SsmLayer {
                 &self.ssm.conv1d,
                 conv_rows,
                 conv_intermediate,
-                ROWS as u32,
+                rows as u32,
                 conv_dim as u32,
                 d_conv as u32,
                 qk_ch,
@@ -115,7 +122,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else {
-            for row in 0..ROWS {
+            for row in 0..rows {
                 let qkvz_row = deinterleaved.offset(row * qkvz_size * BF16);
                 ops::conv1d_update_l2norm(
                     ctx.gpu,
@@ -154,7 +161,7 @@ impl Qwen3SsmLayer {
                 gates.offset(nv * FP32),
                 gdn_rows,
                 h_intermediate,
-                ROWS as u32,
+                rows as u32,
                 nk as u32,
                 nv as u32,
                 kd as u32,
@@ -167,7 +174,7 @@ impl Qwen3SsmLayer {
                 stream,
             )?;
         } else {
-            for row in 0..ROWS {
+            for row in 0..rows {
                 let gates_row = gates.offset(row * nv * 2 * FP32);
                 let conv_row = conv_rows.offset(row * qkvz_size * FP32);
                 let gdn_row = gdn_rows.offset(row * qkvz_size * FP32);
@@ -198,7 +205,7 @@ impl Qwen3SsmLayer {
         }
 
         let normed = ctx.buffers.ssm_qkvz();
-        for row in 0..ROWS {
+        for row in 0..rows {
             let qkvz_row = deinterleaved.offset(row * qkvz_size * BF16);
             let gdn_row = gdn_rows.offset(row * qkvz_size * FP32);
             ops::gated_rms_norm(
@@ -223,7 +230,7 @@ impl Qwen3SsmLayer {
             normed,
             &self.ssm.out_proj,
             output,
-            ROWS as u32,
+            rows as u32,
             h as u32,
             value_dim as u32,
             stream,

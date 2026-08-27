@@ -1410,6 +1410,31 @@ impl FfnComponent {
         Ok(())
     }
 
+    /// Exact Qwen4 speculative FFN for the qualified five- and nine-row
+    /// verifier tiles. Native MoE kernels are row-count parameterized; the
+    /// legacy split fallback remains limited to five rows.
+    pub fn forward_qwen4_exact_rows(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(rows, 5 | 9),
+            "Qwen4 exact FFN requires 5 or 9 rows"
+        );
+        if std::env::var("ATLAS_QWEN4_K5_NATIVE_MOE").ok().as_deref() == Some("1")
+            && let Self::Moe(moe) = self
+        {
+            return moe.forward_qwen4_exact(input, rows, ctx, stream);
+        }
+        if rows == 5 {
+            return self.forward_k5_split(input, ctx, stream);
+        }
+        self.forward_prefill(input, rows, ctx, stream)
+    }
+
     /// K=γ verify batched FFN. Returns `true` when the call was serviced
     /// by the batched path (output in `ctx.buffers.moe_output()`), `false`
     /// when the caller must fall back to the per-token `forward()` loop.
