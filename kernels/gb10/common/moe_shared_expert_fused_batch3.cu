@@ -117,7 +117,7 @@ extern "C" __global__ void moe_expert_gate_up_shared_batch3(
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
-    const unsigned int K8 = K / 8;
+    const unsigned int K16 = K / 16;
 
     __shared__ float s_lut[16];
     if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT_BATCH3[threadIdx.x];
@@ -125,28 +125,30 @@ extern "C" __global__ void moe_expert_gate_up_shared_batch3(
 
     float acc1 = 0.0f, acc2 = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
-        uint4 a_data = ((const uint4*)A_token)[k8];
-        const unsigned int a_raw[4] = {a_data.x, a_data.y, a_data.z, a_data.w};
-        const unsigned int base_k = k8 * 8;
+    for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+        const unsigned int base_k = k16 * 16;
+        uint4 a_lo = ((const uint4*)A_token)[k16 * 2];
+        uint4 a_hi = ((const uint4*)A_token)[k16 * 2 + 1];
+        const unsigned int a_raw[8] = {a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                                       a_hi.x, a_hi.y, a_hi.z, a_hi.w};
 
-        unsigned int packed4_1 = *(const unsigned int*)(B_packed + (unsigned long long)n1 * half_K + k8 * 4);
+        unsigned long long packed8_1 = *(const unsigned long long*)(B_packed + (unsigned long long)n1 * half_K + k16 * 8);
         unsigned int sg = base_k / GROUP_SIZE;
         unsigned char sb1 = B_scale[(unsigned long long)n1 * num_groups + sg];
         __nv_fp8_e4m3 fp8_1; *(unsigned char*)&fp8_1 = sb1;
         float sc1 = (float)fp8_1 * s2;
 
-        unsigned int packed4_2 = have_n2 ?
-            *(const unsigned int*)(B_packed + (unsigned long long)n2 * half_K + k8 * 4) : 0;
+        unsigned long long packed8_2 = have_n2 ?
+            *(const unsigned long long*)(B_packed + (unsigned long long)n2 * half_K + k16 * 8) : 0;
         unsigned char sb2 = have_n2 ? B_scale[(unsigned long long)n2 * num_groups + sg] : 0;
         __nv_fp8_e4m3 fp8_2; *(unsigned char*)&fp8_2 = sb2;
         float sc2 = have_n2 ? (float)fp8_2 * s2 : 0.0f;
 
         #pragma unroll
-        for (int b = 0; b < 4; b++) {
-            unsigned char bv1 = (packed4_1 >> (b * 8)) & 0xFF;
+        for (int b = 0; b < 8; b++) {
+            unsigned char bv1 = (unsigned char)(packed8_1 >> (b * 8));
             float w1l = s_lut[bv1 & 0xF] * sc1, w1h = s_lut[bv1 >> 4] * sc1;
-            unsigned char bv2 = (packed4_2 >> (b * 8)) & 0xFF;
+            unsigned char bv2 = (unsigned char)(packed8_2 >> (b * 8));
             float w2l = s_lut[bv2 & 0xF] * sc2, w2h = s_lut[bv2 >> 4] * sc2;
             __nv_bfloat16 al, ah;
             *(unsigned short*)&al = (unsigned short)(a_raw[b] & 0xFFFF);
@@ -243,7 +245,7 @@ extern "C" __global__ void moe_expert_silu_down_shared_batch3(
 
     const unsigned int half_K = K / 2;
     const unsigned int num_groups = K / GROUP_SIZE;
-    const unsigned int K8 = K / 8;
+    const unsigned int K16 = K / 16;
 
     __shared__ float s_lut[16];
     // Dynamic: K floats, sized by the launcher (issue #85 -- the old
@@ -265,29 +267,29 @@ extern "C" __global__ void moe_expert_silu_down_shared_batch3(
     // Phase 2: GEMV reading precomputed activation from shared memory
     float acc1 = 0.0f, acc2 = 0.0f;
 
-    for (unsigned int k8 = lane; k8 < K8; k8 += threads_per_out) {
-        const unsigned int base_k = k8 * 8;
+    for (unsigned int k16 = lane; k16 < K16; k16 += threads_per_out) {
+        const unsigned int base_k = k16 * 16;
 
-        unsigned int packed4_1 = *(const unsigned int*)(B_packed + (unsigned long long)n1 * half_K + k8 * 4);
+        unsigned long long packed8_1 = *(const unsigned long long*)(B_packed + (unsigned long long)n1 * half_K + k16 * 8);
         unsigned int sg = base_k / GROUP_SIZE;
         unsigned char sb1 = B_scale[(unsigned long long)n1 * num_groups + sg];
         __nv_fp8_e4m3 fp8_1; *(unsigned char*)&fp8_1 = sb1;
         float sc1 = (float)fp8_1 * s2;
 
-        unsigned int packed4_2 = have_n2 ?
-            *(const unsigned int*)(B_packed + (unsigned long long)n2 * half_K + k8 * 4) : 0;
+        unsigned long long packed8_2 = have_n2 ?
+            *(const unsigned long long*)(B_packed + (unsigned long long)n2 * half_K + k16 * 8) : 0;
         unsigned char sb2 = have_n2 ? B_scale[(unsigned long long)n2 * num_groups + sg] : 0;
         __nv_fp8_e4m3 fp8_2; *(unsigned char*)&fp8_2 = sb2;
         float sc2 = have_n2 ? (float)fp8_2 * s2 : 0.0f;
 
         #pragma unroll
-        for (int b = 0; b < 4; b++) {
+        for (int b = 0; b < 8; b++) {
             float al = s_act[base_k + b * 2];
             float ah = s_act[base_k + b * 2 + 1];
 
-            unsigned char bv1 = (packed4_1 >> (b * 8)) & 0xFF;
+            unsigned char bv1 = (unsigned char)(packed8_1 >> (b * 8));
             float w1l = s_lut[bv1 & 0xF] * sc1, w1h = s_lut[bv1 >> 4] * sc1;
-            unsigned char bv2 = (packed4_2 >> (b * 8)) & 0xFF;
+            unsigned char bv2 = (unsigned char)(packed8_2 >> (b * 8));
             float w2l = s_lut[bv2 & 0xF] * sc2, w2h = s_lut[bv2 >> 4] * sc2;
 
             acc1 += al * w1l + ah * w1h;

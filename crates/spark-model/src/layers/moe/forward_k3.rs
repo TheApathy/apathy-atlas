@@ -25,16 +25,31 @@ impl MoeLayer {
         // 1. Gate GEMV batch3: reads gate weight once for 3 tokens
         let gate_logits = ctx.buffers.gate_logits();
         if let Some(ref nvfp4) = self.gate_nvfp4 {
-            ops::w4a16_gemv_batch3(
-                ctx.gpu,
-                self.w4a16_gemv_batch3,
-                router_in,
-                nvfp4,
-                gate_logits,
-                num_experts,
-                h,
-                stream,
-            )?;
+            if std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1") {
+                for row in 0..3usize {
+                    ops::w4a16_gemv(
+                        ctx.gpu,
+                        self.w4a16_gemv,
+                        router_in.offset(row * h as usize * 2),
+                        nvfp4,
+                        gate_logits.offset(row * num_experts as usize * 2),
+                        num_experts,
+                        h,
+                        stream,
+                    )?;
+                }
+            } else {
+                ops::w4a16_gemv_batch3(
+                    ctx.gpu,
+                    self.w4a16_gemv_batch3,
+                    router_in,
+                    nvfp4,
+                    gate_logits,
+                    num_experts,
+                    h,
+                    stream,
+                )?;
+            }
         } else {
             ops::dense_gemm(
                 ctx.gpu,

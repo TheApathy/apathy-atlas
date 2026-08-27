@@ -45,18 +45,13 @@ impl Qwen3AttentionLayer {
         let core_bytes = h * 2;
         let eps = ctx.config.rms_norm_eps as f32;
         let mb = metadata.max_blocks_per_seq as usize;
+        let hybrid_k5 =
+            num_tokens == 5 && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
+        let exact_hyper_k5 =
+            hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_HYPER").ok().as_deref() != Some("1");
 
         // Batch the four-stream projection weights. KV writes and attention
         // remain token ordered to preserve exact causal semantics.
-        let mixed_attn = attn_hyper.prepare_batched(
-            hidden,
-            residual,
-            num_tokens,
-            ctx.buffers,
-            ctx.gpu,
-            eps,
-            stream,
-        )?;
         // `attention_forward_oproj` reuses norm_output, so preserve every
         // mixed row before the first token's attention core clobbers it.
         let attn_inputs = ctx.buffers.gate_logits();
@@ -64,8 +59,36 @@ impl Qwen3AttentionLayer {
             num_tokens * core_bytes <= ctx.buffers.sizes().gate_logits,
             "Qwen4 batched attention input staging exceeds gate-logit workspace"
         );
-        ctx.gpu
-            .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
+        if exact_hyper_k5 {
+            for row in 0..num_tokens {
+                let (mixed, _) = attn_hyper.prepare_decode(
+                    hidden.offset(row * row_bytes),
+                    residual.offset(row * row_bytes),
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    mixed,
+                    attn_inputs.offset(row * core_bytes),
+                    core_bytes,
+                    stream,
+                )?;
+            }
+        } else {
+            let mixed_attn = attn_hyper.prepare_batched(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?;
+            ctx.gpu
+                .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
+        }
         for row in 0..num_tokens {
             let hidden_row = hidden.offset(row * row_bytes);
             let residual_row = residual.offset(row * row_bytes);
@@ -102,31 +125,66 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        let ffn_inputs = mlp_hyper.prepare_batched(
-            hidden,
-            residual,
-            num_tokens,
-            ctx.buffers,
-            ctx.gpu,
-            eps,
-            stream,
-        )?;
+        let ffn_inputs = if exact_hyper_k5 {
+            let staging = ctx
+                .buffers
+                .qkv_output()
+                .offset(ctx.config.residual_width() * 2);
+            anyhow::ensure!(
+                ctx.config.residual_width() * 2 + num_tokens * core_bytes
+                    <= ctx.buffers.sizes().qkv_output,
+                "Qwen4 K=5 exact MLP staging exceeds QKV arena"
+            );
+            for row in 0..num_tokens {
+                let (mixed, _) = mlp_hyper.prepare_decode(
+                    hidden.offset(row * row_bytes),
+                    residual.offset(row * row_bytes),
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    mixed,
+                    staging.offset(row * core_bytes),
+                    core_bytes,
+                    stream,
+                )?;
+            }
+            staging
+        } else {
+            mlp_hyper.prepare_batched(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?
+        };
         match num_tokens {
             2 => self.ffn.forward_k2(ffn_inputs, ctx, stream)?,
             3 => self.ffn.forward_k3(ffn_inputs, ctx, stream)?,
+            5 if hybrid_k5 => self.ffn.forward_k5_split(ffn_inputs, ctx, stream)?,
             n => self.ffn.forward_prefill(ffn_inputs, n, ctx, stream)?,
         }
         let ffn_output = ctx.buffers.moe_output();
-        for row in 0..num_tokens {
-            let hidden_row = hidden.offset(row * row_bytes);
-            let residual_row = residual.offset(row * row_bytes);
-            mlp_hyper.inject_decode(
-                hidden_row,
-                ffn_output.offset(row * core_bytes),
-                mlp_hyper.saved_inject(residual_row),
-                ctx.gpu,
-                stream,
-            )?;
+        if hybrid_k5 {
+            mlp_hyper
+                .inject_saved_batched(hidden, ffn_output, residual, num_tokens, ctx.gpu, stream)?;
+        } else {
+            for row in 0..num_tokens {
+                let hidden_row = hidden.offset(row * row_bytes);
+                let residual_row = residual.offset(row * row_bytes);
+                mlp_hyper.inject_decode(
+                    hidden_row,
+                    ffn_output.offset(row * core_bytes),
+                    mlp_hyper.saved_inject(residual_row),
+                    ctx.gpu,
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }

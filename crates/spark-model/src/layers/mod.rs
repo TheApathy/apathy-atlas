@@ -1382,6 +1382,29 @@ impl FfnComponent {
         }
     }
 
+    /// Compose the decode-qualified K=3 and K=2 kernels for a five-row
+    /// verifier tile. The input rows are dead after their group has run, so
+    /// they temporarily preserve the first three outputs without allocating
+    /// another arena.
+    pub fn forward_k5_split(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let row_bytes = ctx.config.hidden_size * 2;
+        self.forward_k3(input, ctx, stream)?;
+        let output = ctx.buffers.moe_output();
+        ctx.gpu
+            .copy_d2d_async(output, input, 3 * row_bytes, stream)?;
+        self.forward_k2(input.offset(3 * row_bytes), ctx, stream)?;
+        ctx.gpu
+            .copy_d2d_async(output, output.offset(3 * row_bytes), 2 * row_bytes, stream)?;
+        ctx.gpu
+            .copy_d2d_async(input, output, 3 * row_bytes, stream)?;
+        Ok(())
+    }
+
     /// K=γ verify batched FFN. Returns `true` when the call was serviced
     /// by the batched path (output in `ctx.buffers.moe_output()`), `false`
     /// when the caller must fall back to the per-token `forward()` loop.

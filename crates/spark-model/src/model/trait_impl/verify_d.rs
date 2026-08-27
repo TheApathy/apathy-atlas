@@ -1185,7 +1185,9 @@ impl TransformerModel {
                     // corruption. Keep the released gamma-4 geometry on the
                     // lossless row-serial layer path until each batched stage
                     // has an in-process parity proof.
-                    if k == 5 {
+                    let qwen4_k5_hybrid = k == 5
+                        && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
+                    if k == 5 && !qwen4_k5_hybrid {
                         let metadata = ctx.attn_metadata.ok_or_else(|| {
                             anyhow::anyhow!("Qwen4 K=5 verify requires attention metadata")
                         })?;
