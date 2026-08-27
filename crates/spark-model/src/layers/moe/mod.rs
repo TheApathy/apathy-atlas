@@ -272,6 +272,7 @@ mod forward_ep;
 mod forward_k2;
 mod forward_k3;
 mod forward_k3_fused;
+mod forward_k5;
 mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_fp8;

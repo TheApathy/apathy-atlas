@@ -182,6 +182,7 @@ impl MoeLayer {
                 h,
                 top_k,
                 h,
+                3,
                 stream,
             )?;
         } else if self.use_t_layout_for_decode() {
@@ -300,6 +301,7 @@ impl MoeLayer {
                 inter,
                 h,
                 top_k,
+                3,
                 stream,
             )?;
             ops::moe_expert_silu_down_shared_batch3(
@@ -319,6 +321,7 @@ impl MoeLayer {
                 h,
                 inter,
                 top_k,
+                3,
                 stream,
             )?;
             // EP fix: after silu_down, expert_gate_out is free — use as zero buffer
@@ -341,6 +344,7 @@ impl MoeLayer {
                 h,
                 top_k,
                 h,
+                3,
                 stream,
             )?;
         }

@@ -1392,6 +1392,11 @@ impl FfnComponent {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if std::env::var("ATLAS_QWEN4_K5_NATIVE_MOE").ok().as_deref() == Some("1")
+            && let Self::Moe(moe) = self
+        {
+            return moe.forward_k5(input, ctx, stream);
+        }
         let row_bytes = ctx.config.hidden_size * 2;
         self.forward_k3(input, ctx, stream)?;
         let output = ctx.buffers.moe_output();

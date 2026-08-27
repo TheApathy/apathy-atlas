@@ -51,9 +51,10 @@ extern "C" __global__ void moe_expert_gate_up_shared_batch3(
     const unsigned char* __restrict__ sh_up_scale,
     float sh_up_s2,
     __nv_bfloat16* __restrict__ sh_up_out,     // [3, inter] BF16
-    unsigned int N, unsigned int K, unsigned int top_k
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int num_tokens
 ) {
-    const unsigned int total_routed = 3 * top_k;
+    const unsigned int total_routed = num_tokens * top_k;
     const unsigned int y = blockIdx.y;
     const unsigned int proj = blockIdx.z;
     const bool is_shared = (y >= total_routed);
@@ -190,9 +191,10 @@ extern "C" __global__ void moe_expert_silu_down_shared_batch3(
     const unsigned char* __restrict__ sh_down_scale,
     float sh_down_s2,
     __nv_bfloat16* __restrict__ sh_down_out,       // [3, H] BF16
-    unsigned int N, unsigned int K, unsigned int top_k
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int num_tokens
 ) {
-    const unsigned int total_routed = 3 * top_k;
+    const unsigned int total_routed = num_tokens * top_k;
     const unsigned int y = blockIdx.y;
     const bool is_shared = (y >= total_routed);
 
