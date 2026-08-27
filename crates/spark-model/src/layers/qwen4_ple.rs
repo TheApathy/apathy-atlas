@@ -105,6 +105,8 @@ mod runtime {
     pub struct Qwen4PleLayer {
         hasher: Qwen4PleHasher,
         reader: Mutex<PleOffloadReader>,
+        scratch_submit: Mutex<()>,
+        scratch_event: u64,
         key_proj: DenseWeight,
         value_proj: DenseWeight,
         norm_key: DenseWeight,
@@ -203,6 +205,8 @@ mod runtime {
             let layer = Self {
                 hasher,
                 reader: Mutex::new(reader),
+                scratch_submit: Mutex::new(()),
+                scratch_event: gpu.create_event()?,
                 key_proj,
                 value_proj,
                 norm_key: dense(store, &format!("{prefix}.norm_key.weight"))?,
@@ -261,6 +265,11 @@ mod runtime {
                 slot_idx < self.max_batch_size,
                 "PLE slot {slot_idx} out of range"
             );
+            // records/scales/embedding/key/value are shared staging buffers.
+            // Serialize host enqueue order and chain their GPU use across
+            // streams; a warm host-page hit can otherwise overtake unfinished
+            // work that cold O_DIRECT latency happened to hide.
+            let _submit = self.scratch_submit.lock();
             let selections = self.hasher.select_decode(current_token, prior_tokens);
             let request: Vec<_> = selections.iter().map(|s| (s.shard, s.row)).collect();
             let rows = self.reader.lock().read_rows(&request)?;
@@ -271,6 +280,7 @@ mod runtime {
                 records[start..start + PLE_RECORD_BYTES].copy_from_slice(&row.record);
                 scales[head * 4..head * 4 + 4].copy_from_slice(&row.scale2.to_le_bytes());
             }
+            gpu.stream_wait_event(stream, self.scratch_event)?;
             gpu.copy_h2d_group_on_stream(
                 &[
                     HostToDeviceCopy::new(&records, self.records_dev),
@@ -320,11 +330,16 @@ mod runtime {
                 .arg_u32(self.hidden_size as u32)
                 .arg_f32(self.eps)
                 .arg_u32(u32::from(reset_state))
-                .launch(stream)
+                .launch(stream)?;
+            gpu.record_event(self.scratch_event, stream)
         }
 
         pub fn residual_width(&self) -> usize {
             self.hidden_size * self.hc_count
+        }
+
+        pub fn destroy_scratch_event(&self, gpu: &dyn GpuBackend) -> Result<()> {
+            gpu.destroy_event(self.scratch_event)
         }
 
         fn state_stride_bytes(&self) -> usize {

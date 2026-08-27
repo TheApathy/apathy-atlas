@@ -108,6 +108,12 @@ impl Drop for TransformerModel {
             self.verify_kgamma_graph.get_mut(),
         );
 
+        if let Some(ple) = &self.qwen4_ple
+            && let Err(error) = ple.destroy_scratch_event(self.gpu.as_ref())
+        {
+            tracing::error!("TransformerModel::drop: destroy PLE scratch event failed: {error:#}");
+        }
+
         if self.secondary_event != 0
             && let Err(error) = self.gpu.destroy_event(self.secondary_event)
         {
