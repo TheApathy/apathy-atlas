@@ -89,7 +89,7 @@ mod runtime {
     use spark_runtime::gpu::{DevicePtr, GpuBackend, HostToDeviceCopy, KernelHandle};
     use spark_runtime::kernel_args::KernelLaunch;
     use spark_runtime::weights::{WeightDtype, WeightStore};
-    use spark_storage::ple_offload::PleOffloadReader;
+    use spark_storage::ple_offload::{PleIoMode, PleOffloadReader};
     use std::path::Path;
 
     use crate::layers::ops;
@@ -195,12 +195,23 @@ mod runtime {
             // introducing a second, unsupported quantization pass.
             let key_proj = dense(store, &format!("{prefix}.key_proj.weight"))?;
             let value_proj = dense(store, &format!("{prefix}.value_proj.weight"))?;
+            let page_cache = std::env::var("ATLAS_PLE_PAGE_CACHE").ok().as_deref() == Some("1");
+            let io_mode = if page_cache {
+                PleIoMode::PageCache
+            } else {
+                PleIoMode::Direct
+            };
             let cache_mb = std::env::var("ATLAS_PLE_CACHE_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(512);
-            let reader = PleOffloadReader::open(Path::new(manifest), 32, cache_mb * 1024 * 1024)
-                .with_context(|| format!("open Qwen4 PLE offload manifest {manifest}"))?;
+                .unwrap_or(if page_cache { 0 } else { 512 });
+            let reader = PleOffloadReader::open_with_mode(
+                Path::new(manifest),
+                32,
+                cache_mb * 1024 * 1024,
+                io_mode,
+            )
+            .with_context(|| format!("open Qwen4 PLE offload manifest {manifest}"))?;
             let residual = config.residual_width();
             let layer = Self {
                 hasher,
@@ -245,7 +256,12 @@ mod runtime {
                 0,
                 max_batch_size * PLE_MAX_SPEC_ROWS * residual * PLE_CONV_HISTORY * 2,
             )?;
-            tracing::info!(manifest, cache_mb, "Qwen4 PLE sparse NVFP4 offload enabled");
+            tracing::info!(
+                manifest,
+                cache_mb,
+                ?io_mode,
+                "Qwen4 PLE sparse NVFP4 offload enabled"
+            );
             Ok(Some(layer))
         }
 

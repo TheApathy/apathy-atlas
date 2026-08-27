@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Sparse O_DIRECT reader for Qwen3.8-Flash-Next PLE n-gram rows.
+//! Sparse direct-I/O or page-cache reader for Qwen3.8-Flash-Next PLE n-gram rows.
 //!
 //! The table has 320M rows but inference selects only 16 rows per token.
 //! Sidecars page-pack 91 NVFP4 records into 8 KiB, so every selected row is
@@ -87,6 +87,17 @@ struct Shard {
     scale2: f32,
 }
 
+/// Storage policy for sparse PLE pages.
+///
+/// `Direct` avoids displacing unified-memory model state. `PageCache` uses
+/// ordinary buffered I/O so Linux can retain useful PLE pages in evictable
+/// system RAM without a second permanently-owned Atlas allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PleIoMode {
+    Direct,
+    PageCache,
+}
+
 /// One packed PLE row: 80 E2M1 bytes, 10 E4M3 group scales, and its global scale.
 #[derive(Clone, Debug)]
 pub struct PleNvfp4Row {
@@ -113,6 +124,15 @@ struct CachedPage {
 
 impl PleOffloadReader {
     pub fn open(manifest_path: &Path, queue_depth: usize, cache_bytes: usize) -> Result<Self> {
+        Self::open_with_mode(manifest_path, queue_depth, cache_bytes, PleIoMode::Direct)
+    }
+
+    pub fn open_with_mode(
+        manifest_path: &Path,
+        queue_depth: usize,
+        cache_bytes: usize,
+        io_mode: PleIoMode,
+    ) -> Result<Self> {
         ensure!(
             queue_depth >= 16,
             "PLE offload queue depth must be at least 16"
@@ -176,8 +196,8 @@ impl PleOffloadReader {
                 "PLE shard {expected} byte count mismatch"
             );
             let path = base.join(entry.file);
-            let file =
-                open_direct(&path).with_context(|| format!("open PLE shard {}", path.display()))?;
+            let file = open_shard(&path, io_mode)
+                .with_context(|| format!("open PLE shard {} ({io_mode:?})", path.display()))?;
             ensure!(
                 file.metadata()?.len() as usize == entry.bytes,
                 "PLE shard {expected} file size mismatch"
@@ -380,11 +400,48 @@ fn open_direct(path: &Path) -> std::io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "linux")]
+fn open_page_cache(path: &Path) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Sparse 8 KiB lookups are random. Avoid pulling adjacent PLE pages that
+    // were not selected by the n-gram hash; pages actually read remain
+    // reclaimable in the normal Linux file cache.
+    let advise = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_RANDOM) };
+    if advise != 0 {
+        unsafe { libc::close(fd) };
+        return Err(std::io::Error::from_raw_os_error(advise));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn open_shard(path: &Path, mode: PleIoMode) -> std::io::Result<File> {
+    match mode {
+        PleIoMode::Direct => open_direct(path),
+        PleIoMode::PageCache => open_page_cache(path),
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn open_direct(_path: &Path) -> std::io::Result<File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "PLE O_DIRECT offload requires Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_shard(_path: &Path, _mode: PleIoMode) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "PLE offload requires Linux io_uring",
     ))
 }
 
@@ -405,5 +462,28 @@ mod tests {
             let slot = row % EXPECTED_RECORDS_PER_PAGE;
             assert!((slot + 1) * EXPECTED_RECORD_BYTES <= EXPECTED_PAGE_BYTES);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_cache_mode_opens_without_direct_io() {
+        use std::os::fd::AsRawFd;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "atlas-ple-page-cache-{}-{nonce}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [0xA5; EXPECTED_PAGE_BYTES]).expect("write temporary PLE page");
+        let file = open_shard(&path, PleIoMode::PageCache).expect("open buffered PLE page");
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        assert_eq!(flags & libc::O_DIRECT, 0, "page-cache fd retained O_DIRECT");
+        drop(file);
+        std::fs::remove_file(path).expect("remove temporary PLE page");
     }
 }

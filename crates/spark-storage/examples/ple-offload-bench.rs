@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, ensure};
 use rand::{Rng, SeedableRng, rngs::StdRng};
-use spark_storage::ple_offload::PleOffloadReader;
+use spark_storage::ple_offload::{PleIoMode, PleOffloadReader};
 use std::path::Path;
 use std::time::Instant;
 
@@ -16,14 +16,20 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     ensure!(
         args.len() >= 2,
-        "usage: ple-offload-bench MANIFEST [iterations=1000] [cache_mb=0]"
+        "usage: ple-offload-bench MANIFEST [iterations=1000] [cache_mb=0] [direct|page-cache]"
     );
     let iterations = args.get(2).map_or(Ok(1000), |value| value.parse())?;
     let cache_mb: usize = args.get(3).map_or(Ok(0), |value| value.parse())?;
-    let mut reader = PleOffloadReader::open(
+    let io_mode = match args.get(4).map(String::as_str).unwrap_or("direct") {
+        "direct" => PleIoMode::Direct,
+        "page-cache" => PleIoMode::PageCache,
+        value => anyhow::bail!("unknown PLE I/O mode {value:?}"),
+    };
+    let mut reader = PleOffloadReader::open_with_mode(
         Path::new(&args[1]),
         16,
         cache_mb.saturating_mul(1024 * 1024),
+        io_mode,
     )
     .context("open PLE offload reader")?;
     let mut rng = StdRng::seed_from_u64(0x38F1_A5A5);
@@ -43,7 +49,7 @@ fn main() -> Result<()> {
     samples.sort_unstable();
     let mean = samples.iter().sum::<u128>() as f64 / samples.len() as f64;
     println!(
-        "PLE sparse batch: iterations={iterations} rows/batch=16 cache={cache_mb}MiB \
+        "PLE sparse batch: iterations={iterations} rows/batch=16 mode={io_mode:?} cache={cache_mb}MiB \
          mean={mean:.1}us p50={}us p95={}us p99={}us ceiling_p50={:.0} tok/s checksum={checksum}",
         percentile(&samples, 50),
         percentile(&samples, 95),
