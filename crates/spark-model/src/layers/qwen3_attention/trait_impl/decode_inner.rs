@@ -89,6 +89,7 @@ impl Qwen3AttentionLayer {
             ctx.gpu
                 .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
         }
+        let exact_qkv = self.qwen4_k5_project_qkv_exact(attn_inputs, num_tokens, ctx, stream)?;
         for row in 0..num_tokens {
             let hidden_row = hidden.offset(row * row_bytes);
             let residual_row = residual.offset(row * row_bytes);
@@ -106,16 +107,31 @@ impl Qwen3AttentionLayer {
                 attn_metadata: Some(token_metadata),
                 ..*ctx
             };
-            let attn_out = self.attention_forward(
-                attn_inputs.offset(row * core_bytes),
-                seq_len + row,
-                block_table,
-                disk_block_ids,
-                disk_last_offloaded_per_layer,
-                kv_cache,
-                &token_ctx,
-                stream,
-            )?;
+            let attn_input = attn_inputs.offset(row * core_bytes);
+            let attn_out = if let Some((qkv, qkv_row_bytes)) = exact_qkv {
+                self.attention_forward_preprojected(
+                    attn_input,
+                    qkv.offset(row * qkv_row_bytes),
+                    seq_len + row,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    kv_cache,
+                    &token_ctx,
+                    stream,
+                )?
+            } else {
+                self.attention_forward(
+                    attn_input,
+                    seq_len + row,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    kv_cache,
+                    &token_ctx,
+                    stream,
+                )?
+            };
             attn_hyper.inject_decode(
                 hidden_row,
                 attn_out,

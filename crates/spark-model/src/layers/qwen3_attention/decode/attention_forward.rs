@@ -28,6 +28,58 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            None,
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_forward_impl(
+        &self,
+        normed: DevicePtr,
+        preprojected_qkv: Option<DevicePtr>,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
         let h = ctx.config.hidden_size as u32;
         // Per-layer dimension overrides for heterogeneous models (Gemma-4)
         let nq = self
@@ -59,7 +111,7 @@ impl Qwen3AttentionLayer {
         );
 
         // Q/K/V projections into separate regions of qkv_output (GEMV for M=1)
-        let q_out = ctx.buffers.qkv_output();
+        let q_out = preprojected_qkv.unwrap_or_else(|| ctx.buffers.qkv_output());
         let q_dim = nq * hd; // actual Q dimension
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim }; // gated: Q + gate
         let q_proj_bytes = q_proj_dim as usize * 2;
@@ -86,7 +138,7 @@ impl Qwen3AttentionLayer {
             };
             return self.attention_forward_mla(kv_cache, ctx, &args);
         }
-        if self.gated {
+        if preprojected_qkv.is_none() && self.gated {
             // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
             if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 // FP8 native: w8a16_gemv + separate deinterleave (no fused QG variant yet)
@@ -146,7 +198,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
-        } else {
+        } else if preprojected_qkv.is_none() {
             // Ungated: Q projection only (no gate)
             if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(
@@ -188,7 +240,7 @@ impl Qwen3AttentionLayer {
         }
 
         // DIAG: dump normed input and Q output for L0
-        if self.attn_layer_idx == 0 && ctx.profile {
+        if preprojected_qkv.is_none() && self.attn_layer_idx == 0 && ctx.profile {
             ctx.gpu.synchronize(stream)?;
             let mut input_buf = vec![0u8; 16]; // first 8 BF16 values
             ctx.gpu.copy_d2h(normed, &mut input_buf)?;
@@ -215,95 +267,93 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        // K+V output after Q projection region
-        let k_out = q_out.offset(q_proj_bytes);
-        let v_out = k_out.offset((nkv * hd) as usize * 2);
+        if preprojected_qkv.is_none() {
+            self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
 
-        self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
+            // Q/K RMS norms — three mutually-exclusive paths:
+            //  1. MiniMax M2 style: RMSNorm over full projected hidden
+            //     `[nq*hd]` per token, single learned weight of that shape.
+            //     Reached only for MiniMax — every other loader leaves
+            //     `q_norm_full` as `None` (see `AttentionWeights`).
+            //  2. Qwen3-family per-head: rows=nq, cols=hd.
+            //  3. Nemotron-H standalone attn: both weights NULL, skip.
+            //
+            // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
+            // This codepath never runs for Mistral/DeepSeek-style MLA
+            // models — they early-return in the MLA branch above.
+            if let Some(ref q_norm_full) = self.attn.q_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    q_out,
+                    q_norm_full,
+                    q_out,
+                    1,
+                    nq * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    q_out,
+                    &self.attn.q_norm,
+                    q_out,
+                    nq,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    k_norm_full,
+                    k_out,
+                    1,
+                    nkv * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    &self.attn.k_norm,
+                    k_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
 
-        // Q/K RMS norms — three mutually-exclusive paths:
-        //  1. MiniMax M2 style: RMSNorm over full projected hidden
-        //     `[nq*hd]` per token, single learned weight of that shape.
-        //     Reached only for MiniMax — every other loader leaves
-        //     `q_norm_full` as `None` (see `AttentionWeights`).
-        //  2. Qwen3-family per-head: rows=nq, cols=hd.
-        //  3. Nemotron-H standalone attn: both weights NULL, skip.
-        //
-        // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
-        // This codepath never runs for Mistral/DeepSeek-style MLA
-        // models — they early-return in the MLA branch above.
-        if let Some(ref q_norm_full) = self.attn.q_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                q_out,
-                q_norm_full,
-                q_out,
-                1,
-                nq * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.q_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                q_out,
-                &self.attn.q_norm,
-                q_out,
-                nq,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
-        if let Some(ref k_norm_full) = self.attn.k_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_out,
-                k_norm_full,
-                k_out,
-                1,
-                nkv * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_out,
-                &self.attn.k_norm,
-                k_out,
-                nkv,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
-
-        // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
-        // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
-        // `value_states = self.v_norm(value_states)` with
-        // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
-        // K=V mode. For full-attention K=V layers, v_out holds raw K (V
-        // GEMV against aliased K weights). For sliding layers, v_out holds
-        // V projection output. Either way, normalize in place. V does NOT
-        // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
-        // the absolute formula `out = x * rms * weight`.
-        if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                v_out,
-                v_norm_w,
-                v_out,
-                nkv,
-                hd,
-                eps,
-                stream,
-            )?;
+            // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
+            // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
+            // `value_states = self.v_norm(value_states)` with
+            // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
+            // K=V mode. For full-attention K=V layers, v_out holds raw K (V
+            // GEMV against aliased K weights). For sliding layers, v_out holds
+            // V projection output. Either way, normalize in place. V does NOT
+            // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
+            // the absolute formula `out = x * rms * weight`.
+            if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    v_out,
+                    v_norm_w,
+                    v_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
         }
 
         if self.mla.is_some() {
