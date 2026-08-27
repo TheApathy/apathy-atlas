@@ -201,10 +201,15 @@ mod runtime {
             } else {
                 PleIoMode::Direct
             };
+            // Flash-Next already leaves only a few GiB of unified-memory
+            // headroom on one Spark. Keep the private cache available as an
+            // explicit opt-in, but do not duplicate sparse PLE rows by
+            // default; a 10-request Weschera gate found no decode benefit and
+            // the extra pressure could stall later requests.
             let cache_mb = std::env::var("ATLAS_PLE_CACHE_MB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(if page_cache { 0 } else { 512 });
+                .unwrap_or(0);
             let reader = PleOffloadReader::open_with_mode(
                 Path::new(manifest),
                 32,
