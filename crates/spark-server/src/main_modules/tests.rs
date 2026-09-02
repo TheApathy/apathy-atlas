@@ -5,6 +5,9 @@ use clap::Parser;
 use crate::cli::{Cli, Command};
 use crate::main_modules::build_layer_kv_dtypes;
 
+#[path = "serve_phases/target_store_test_sha256.rs"]
+mod target_store_test_sha256;
+
 #[test]
 fn test_cli_parse_positional_model() {
     let cli = Cli::try_parse_from([
@@ -243,4 +246,38 @@ fn test_cli_default_kv_high_precision_layers() {
             assert_eq!(args.kv_high_precision_layers, "0");
         }
     }
+}
+
+fn target_store_error_reexport_contract(source: &str) -> bool {
+    const REEXPORT: &str = "pub(super) use target_store::{LoadedTargetStore, TargetStoreLoadError, TargetStoreLoadPlan};";
+    const SOURCE_SHA256: &str = "428e815dc95d28582dd45572e10aa485fa91dd0e16ecef7417005802c5ac66ae";
+    target_store_test_sha256::hex(target_store_test_sha256::digest(source.as_bytes()))
+        == SOURCE_SHA256
+        && source.matches(REEXPORT).count() == 1
+}
+
+#[test]
+fn target_store_error_is_parent_nameable_and_matchable() {
+    use crate::main_modules::serve_phases::TargetStoreLoadError;
+    use spark_runtime::weights::gguf::GgufDeviceLoadError;
+
+    fn cleanup_owner(error: TargetStoreLoadError) -> Option<GgufDeviceLoadError> {
+        match error {
+            TargetStoreLoadError::Admission(_) => None,
+            TargetStoreLoadError::Device(owner) => Some(owner),
+        }
+    }
+
+    let _: fn(TargetStoreLoadError) -> Option<GgufDeviceLoadError> = cleanup_owner;
+    const SOURCE: &str = include_str!("serve_phases/mod.rs");
+    assert!(target_store_error_reexport_contract(SOURCE));
+    let without_error = SOURCE.replacen(", TargetStoreLoadError", "", 1);
+    assert!(!target_store_error_reexport_contract(&without_error));
+    let conditional = SOURCE.replacen(
+        "pub(super) use target_store::{LoadedTargetStore, TargetStoreLoadError, TargetStoreLoadPlan};",
+        "#[cfg(test)]\npub(super) use target_store::{LoadedTargetStore, TargetStoreLoadError, TargetStoreLoadPlan};",
+        1,
+    );
+    assert_ne!(conditional, SOURCE);
+    assert!(!target_store_error_reexport_contract(&conditional));
 }

@@ -21,6 +21,7 @@ mod decode_logits_step;
 mod decode_step;
 mod emit_step;
 mod fast_greedy;
+mod glm53_dflash2_admission;
 mod helpers;
 mod lifecycle;
 mod logit_dump;

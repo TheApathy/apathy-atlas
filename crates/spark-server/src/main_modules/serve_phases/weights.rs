@@ -140,8 +140,11 @@ pub(crate) fn load_dflash_drafter(
                 drafter_dir.display()
             )
         })?;
+    // Architecture discrimination must precede the permissive legacy parser:
+    // GLM DFlash2 carries additional selector/convolution tensors which the
+    // legacy `DflashConfig` would otherwise silently ignore.
     let drafter_config =
-        spark_model::weight_loader::dflash_loader::parse_dflash_config(&drafter_config_json)?;
+        spark_model::weight_loader::parse_dflash_drafter_config(&drafter_config_json)?;
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
     let drafter_store = loader
@@ -152,6 +155,8 @@ pub(crate) fn load_dflash_drafter(
         drafter_store.len(),
         drafter_store.total_bytes()
     );
+    drafter_config.validate_store(&drafter_store)?;
+    let drafter_config = drafter_config.into_legacy_runtime()?;
     Ok(Some((drafter_store, drafter_config)))
 }
 

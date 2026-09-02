@@ -110,6 +110,7 @@ impl ModelConfig {
             rotary_dim: 0,
             dflash_capture_layers: Vec::new(),
             adapter_max_rank: 0,
+            glm5_next: None,
         }
     }
 }

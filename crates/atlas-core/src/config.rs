@@ -399,6 +399,10 @@ pub struct ModelConfig {
     /// `*lora_rank` collision (`config.rs:182-207`).
     #[serde(default)]
     pub adapter_max_rank: usize,
+
+    /// GLM-5-Next-only KDA, sparse indexer, FFN schedule, and stop-token ABI.
+    #[serde(skip)]
+    pub glm5_next: Option<Glm5NextConfig>,
 }
 
 /// Advertised weight-quantization layout, as declared in the HF
@@ -474,6 +478,17 @@ impl VisionConfig {
     }
 }
 
+impl ModelConfig {
+    /// Complete model-defined generation stop set.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        self.glm5_next
+            .as_ref()
+            .map(|config| config.eos_token_ids.clone())
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| vec![self.eos_token_id])
+    }
+}
+
 pub(crate) fn default_one() -> usize {
     1
 }
@@ -495,18 +510,21 @@ pub(crate) fn default_conv_kernel() -> usize {
 
 mod dispatch;
 mod factory;
+mod glm5_next;
 mod methods;
 mod parsers;
 #[cfg(test)]
 mod tests;
 
 pub use dispatch::parse_config;
+pub use glm5_next::{Glm5NextConfig, Glm5NextIndexerType, Glm5NextMlpType};
 pub use parsers::{
     PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_mistral_params,
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_minimax_m2, parse_step3p7, parse_vision_config,
+    parse_deepseek_v4, parse_gemma4_params, parse_glm5_next, parse_minimax_m2, parse_step3p7,
+    parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {

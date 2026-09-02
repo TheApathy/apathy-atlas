@@ -43,6 +43,9 @@ pub(crate) mod ssm_tier;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
 
+// Dormant, fail-closed GLM-5.3 target ownership/admission foundation.
+pub mod glm53;
+
 // Served NLLB-200 / M2M-100 encoder-decoder model (CUDA/GB10 serving path).
 #[cfg(feature = "cuda")]
 pub mod nllb;

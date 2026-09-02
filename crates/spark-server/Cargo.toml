@@ -90,6 +90,9 @@ lazy_static = "1"
 tower-http = { version = "0.7", features = ["catch-panic", "cors"] }
 
 [dev-dependencies]
+# Unit tests consume `spark_runtime::gpu::mock`, which is exported only by
+# spark-runtime's non-production `test-utils` feature.
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
 tempfile = "3"
 
 [lints]

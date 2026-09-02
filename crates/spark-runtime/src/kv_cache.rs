@@ -439,7 +439,10 @@ pub struct PagedKvCache {
     config: KvCacheConfig,
 }
 
+mod glm53_dsa;
 mod paged_impl;
+pub use glm53_dsa::*;
+
 #[cfg(test)]
 mod tests;
 

@@ -275,6 +275,7 @@ pub fn parse_expert_index(name: &str) -> Option<usize> {
 }
 
 pub mod adapter;
+pub mod gguf;
 mod loader;
 pub mod mlx_int8;
 pub(crate) use loader::estimate_load_bytes;

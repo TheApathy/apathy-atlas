@@ -12,35 +12,35 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+fn parse_eos_tokens(value: &serde_json::Value) -> Option<Vec<u32>> {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| value.as_u64().and_then(|id| u32::try_from(id).ok()))
+            .collect::<Option<Vec<_>>>()
+            .filter(|ids| !ids.is_empty()),
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .map(|id| vec![id]),
+        _ => None,
+    }
+}
+
 pub(crate) fn load_eos_tokens(model_dir: &Path, config: &ModelConfig) -> Vec<u32> {
+    let fallback = || config.stop_token_ids();
     let gen_config_path = model_dir.join("generation_config.json");
     if let Ok(gen_json) = std::fs::read_to_string(&gen_config_path) {
-        if let Ok(gen_cfg) = serde_json::from_str::<serde_json::Value>(&gen_json) {
-            return match gen_cfg.get("eos_token_id") {
-                Some(serde_json::Value::Array(arr)) => {
-                    let ids: Vec<u32> = arr
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as u32))
-                        .collect();
-                    if !ids.is_empty() {
-                        tracing::info!("EOS tokens (from generation_config.json): {:?}", ids);
-                        ids
-                    } else {
-                        vec![config.eos_token_id]
-                    }
-                }
-                Some(serde_json::Value::Number(n)) => {
-                    let id = n.as_u64().unwrap_or(0) as u32;
-                    tracing::info!("EOS token (from generation_config.json): {}", id);
-                    vec![id]
-                }
-                _ => vec![config.eos_token_id],
-            };
+        if let Ok(gen_cfg) = serde_json::from_str::<serde_json::Value>(&gen_json)
+            && let Some(ids) = gen_cfg.get("eos_token_id").and_then(parse_eos_tokens)
+        {
+            tracing::info!("EOS tokens (from generation_config.json): {:?}", ids);
+            return ids;
         }
-        return vec![config.eos_token_id];
+        return fallback();
     }
-    tracing::info!("EOS token (from config.json): {}", config.eos_token_id);
-    vec![config.eos_token_id]
+    tracing::info!("EOS tokens (from config.json): {:?}", fallback());
+    fallback()
 }
 
 pub(crate) struct SamplingDefaults {
@@ -324,4 +324,30 @@ pub(crate) fn resolve_tool_call_parser(
         }
     }
     Ok(tool_call_format.map(|f| std::sync::Arc::from(f.into_parser())))
+}
+
+#[cfg(test)]
+mod eos_tests {
+    use super::parse_eos_tokens;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_complete_arrays_and_scalars() {
+        assert_eq!(parse_eos_tokens(&json!([3, 5, 8])), Some(vec![3, 5, 8]));
+        assert_eq!(parse_eos_tokens(&json!(13)), Some(vec![13]));
+    }
+
+    #[test]
+    fn malformed_or_lossy_values_require_model_fallback() {
+        for value in [
+            json!([]),
+            json!([3, "5"]),
+            json!([3, 4_294_967_296u64]),
+            json!(-1),
+            json!(4_294_967_296u64),
+            json!(null),
+        ] {
+            assert_eq!(parse_eos_tokens(&value), None, "{value}");
+        }
+    }
 }

@@ -9,6 +9,7 @@ mod config;
 mod kv_cache;
 mod preflight;
 mod runtime;
+mod target_store;
 mod tokenizer_runtime;
 mod topology;
 mod weights;
@@ -31,6 +32,8 @@ pub(super) use runtime::{
     SamplingDefaults, load_eos_tokens, load_sampling_defaults, log_behavior_audit,
     log_response_store_audit, open_dump_writer, resolve_model_name, resolve_tool_call_parser,
 };
+#[allow(unused_imports)] // Staged for the typed GLM target constructor.
+pub(super) use target_store::{LoadedTargetStore, TargetStoreLoadError, TargetStoreLoadPlan};
 pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
 pub(super) use weights::{

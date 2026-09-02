@@ -132,3 +132,6 @@ bench/fp8_dgx2_drift/harness/oc
 # LoRA MVP: large fp32 reference deltas (regenerate via scripts/reference_deltas.py in seconds)
 test_data/lora-holo-tiny*/reference_deltas.safetensors
 adapters35/
+
+# GLM-5.3 bring-up walk dumps (relative ATLAS_GLM53_DUMP_DIR wrote these into the repo root)
+/p[0-9]*/

@@ -4,6 +4,7 @@
 
 pub(crate) mod app_state;
 pub(crate) mod byte_count;
+pub(crate) mod glm53_gguf_resolver;
 pub(crate) mod kv_dtypes;
 pub(crate) mod middleware;
 pub(crate) mod promotion;

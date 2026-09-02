@@ -5,6 +5,11 @@ pub mod dense_ffn;
 pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
+pub mod glm53_dflash2_head;
+pub mod glm53_dflash2_proposer;
+pub mod glm53_dsa_t1_transaction;
+mod glm53_moe_serial;
+mod glm53_target_schedule;
 pub mod moe;
 pub mod mtp_head;
 pub mod mtp_multi;
@@ -19,6 +24,14 @@ pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
 pub use dflash_head::{
     BlockDiffusionDraftHead, DflashLayer, DflashProposerState, DflashQuantization,
+};
+pub use glm53_dflash2_head::{
+    Glm53Dflash2RuntimeGeometry, Glm53Dflash2ScratchPlan, Glm53Dflash2ScratchRegion,
+};
+pub use glm53_moe_serial::{Glm53SerialMoeBuffers, Glm53SerialMoeKernels, Glm53SerialMoeReceipt};
+pub use glm53_target_schedule::{
+    Glm53TargetAttentionKind, Glm53TargetEvent, Glm53TargetFfnKind, Glm53TargetGeometry,
+    Glm53TargetSchedule, Glm53TargetWorkspace, Glm53TargetWorkspaceRegion,
 };
 pub use moe::MoeLayer;
 pub use mtp_head::{MtpHead, MtpQuantization, mtp_drafter_prefill_enabled};

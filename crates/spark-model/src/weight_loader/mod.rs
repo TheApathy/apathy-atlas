@@ -15,8 +15,14 @@
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
 pub(crate) mod deepseek_v4;
+mod dflash_admission;
 pub mod dflash_loader;
 mod gemma4;
+mod glm53_catalog;
+mod glm53_context;
+mod glm53_dflash2;
+mod glm53_gguf;
+mod glm53_prefill;
 mod minimax;
 mod nemotron;
 mod nllb;
@@ -27,11 +33,35 @@ mod qwen3_vl;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
+pub use dflash_admission::{DflashDrafterConfig, parse_dflash_drafter_config};
 pub use dflash_loader::{
     DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
     store_has_dflash_weights,
 };
 pub use gemma4::Gemma4WeightLoader;
+pub use glm53_catalog::{
+    Glm53AttentionKind, Glm53AttentionWeights, Glm53DenseFfnWeights, Glm53DsaWeights, Glm53FfnKind,
+    Glm53FfnWeights, Glm53GgufCatalog, Glm53HyperBranchWeights, Glm53HyperWeights, Glm53KdaWeights,
+    Glm53LayerDescriptor, Glm53LayerNorms, Glm53MoeWeights, Glm53NextnWeights,
+    Glm53TargetLayerWeights,
+};
+pub use glm53_context::{
+    GLM53_DENSE_KV_CACHE_STREAMS, GLM53_DSA_LAYERS, GLM53_KDA_LAYERS, GLM53_MAX_CONTEXT_TOKENS,
+    Glm53ContextAdmission, Glm53ContextDtype, Glm53ContextPlan, Glm53ContextRegion,
+    Glm53DsaStorage,
+};
+pub use glm53_dflash2::{
+    GLM53_DFLASH2_PAYLOAD_BYTES, GLM53_DFLASH2_TENSOR_COUNT, Glm53Dflash2CandidateSelectorWeights,
+    Glm53Dflash2Config, Glm53Dflash2ConvWeights, Glm53Dflash2LayerWeights, Glm53Dflash2SubConfig,
+    Glm53Dflash2Weights, load_glm53_dflash2_weights, parse_glm53_dflash2_config,
+    validate_glm53_dflash2_store,
+};
+pub use glm53_gguf::{Glm53GgufExperts, Glm53GgufF32, Glm53GgufMatrix, Glm53GgufMatrixBank};
+pub use glm53_prefill::{
+    GLM53_PREFILL_BLOCK_TOKENS, GLM53_PREFILL_MAX_CHUNK_TOKENS, GLM53_PREFILL_MAX_CHUNKS,
+    GLM53_PREFILL_MAX_GRID_Y, Glm53PrefillChunk, Glm53PrefillContracts, Glm53PrefillIndexState,
+    Glm53PrefillSchedule,
+};
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
 pub use nllb::NllbWeightLoader;
@@ -40,6 +70,10 @@ pub use qwen3_vl::Qwen3VLWeightLoader;
 pub use qwen35::Qwen35WeightLoader;
 pub use qwen35_dense::Qwen35DenseWeightLoader;
 pub use step3p7::Step3p7WeightLoader;
+
+#[cfg(test)]
+#[path = "glm53_gguf_tests.rs"]
+mod glm53_gguf_tests;
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
