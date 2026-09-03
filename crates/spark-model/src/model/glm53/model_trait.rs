@@ -8,6 +8,12 @@
 //! batching against a model that silently ignored it, which is the
 //! fluent-wrong-output failure this port keeps guarding against.
 //!
+//! The engine serves one sequence AT A TIME, not one sequence per process:
+//! `prefill` resets the carried state, so consecutive requests are independent.
+//! Concurrent ones are not -- `decode_batch` still refuses more than one
+//! sequence, and the scheduler must not interleave two live sequences through
+//! this model.
+//!
 //! What is deliberately a no-op rather than a refusal:
 //!
 //! * `checkpoint_ssm_states` / `rollback_ssm_states` — this path never
@@ -28,6 +34,15 @@ const ONLY_SLOT: usize = 0;
 
 impl Model for Glm53Model {
     fn prefill(&self, tokens: &[u32], seq: &mut SequenceState, stream: u64) -> Result<DevicePtr> {
+        // PREFILL IS THE SEQUENCE BOUNDARY, and it is the only one this engine
+        // has. Every request starts here -- `prefill_chunk` refuses anything
+        // but a single whole-prompt chunk and delegates -- while `decode`
+        // continues an existing sequence and must not reset anything.
+        //
+        // Hooking it here rather than in the walk is deliberate: the walk
+        // cannot tell a new sequence from a continuation, which is exactly how
+        // request 3 came to resume request 1 mid-sentence.
+        self.reset_sequence()?;
         let logits = self.prefill_tokens(tokens, stream)?;
         seq.tokens = tokens.to_vec();
         seq.seq_len = tokens.len();

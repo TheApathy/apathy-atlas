@@ -92,10 +92,20 @@ enum Glm53Embedding {
     Q5(GgmlQ5EmbeddingKernel),
 }
 
-/// Mutable per-walk state. One sequence only; batching is not wired.
+/// Mutable per-walk state. One sequence AT A TIME; batching is not wired.
+///
+/// `position` is not per-request unless something resets it. It was not, and
+/// the result was cross-request contamination on a live server: request 3
+/// answered its own prompt and then resumed request 1 mid-sentence, because
+/// every carried region -- the KDA conv shift-register, the KDA recurrent
+/// state, the DSA pools and latent cache -- continued the earlier sequence.
+/// `Glm53Model::reset_sequence` is what makes this per-request; see there.
 struct Glm53WalkState {
     position: u32,
     nonce: u64,
+    /// Walks since the last sequence boundary. Zero means the carried state is
+    /// at its construction values and a fresh sequence may start.
+    walks_since_boundary: u64,
 }
 
 pub struct Glm53Model {
@@ -256,6 +266,7 @@ impl Glm53Model {
             plan,
             state: Mutex::new(Glm53WalkState {
                 position: 0,
+                walks_since_boundary: 0,
                 nonce: 1,
             }),
         })
@@ -589,22 +600,128 @@ impl Glm53Model {
         Ok(())
     }
 
+    /// Return the model to its construction state so the NEXT request is a
+    /// fresh sequence.
+    ///
+    /// WHAT THIS FIXES, observed on a live server: three unrelated prompts in
+    /// one process. Request 2 produced correct Python and then trailed into
+    /// "...to famous historical figures like Napoleon". Request 3 answered
+    /// "391" and then continued ", cheese, and fashion. The Eiffel Tower is
+    /// located in Paris" -- resuming request 1's sentence, which had ended
+    /// "France is known for its cuisine, wine,". Nothing zeroed `position`, so
+    /// it advanced monotonically for the life of the process and every carried
+    /// region went with it.
+    ///
+    /// No parity test could have caught it: every dump runs one sequence in a
+    /// fresh process. Single-token parity hid the conv carry the same way.
+    ///
+    /// THE REGIONS ARE DERIVED FROM THE PLAN, NOT ENUMERATED. Enumerating them
+    /// is how a reset misses one and leaves a subtler version of this bug. The
+    /// arena is zeroed WHOLE at construction, so the faithful reset is the same
+    /// memset -- except for `mhc_expanded_f32`, which is a load-time
+    /// precomputation from the weights and not sequence state. So this zeroes
+    /// everything on either side of it and ASSERTS that it is the only gap; a
+    /// future layout that moves another load-time region out of the zeroed span
+    /// trips the assert instead of silently surviving the reset.
+    ///
+    /// Synchronous, not stream-ordered: this is a boundary between requests,
+    /// the caller is not mid-pipeline, and a reset that raced the previous
+    /// sequence's tail kernels would restore exactly the state it is clearing.
+    pub fn reset_sequence(&self) -> Result<()> {
+        let plan = &self.plan;
+        let mhc = plan.mhc_expanded_f32;
+        let carried_end = plan.context.total_bytes;
+        let after = plan.t1_transaction.offset_bytes;
+        // The mHC block is the ONLY thing between the two zeroed spans.
+        ensure!(
+            carried_end <= mhc.offset_bytes
+                && mhc.offset_bytes + mhc.allocation_bytes == after
+                && after < plan.known_bytes,
+            "GLM sequence reset cannot derive its spans: the arena layout is              context[0, {carried_end}) mhc[{}, {}) t1[{after}, ..) known={}.              The reset zeroes everything except mhc, so mhc must be the single              gap between the two spans.",
+            mhc.offset_bytes,
+            mhc.offset_bytes + mhc.allocation_bytes,
+            plan.known_bytes
+        );
+        self.gpu.memset(
+            self.arena,
+            0,
+            usize::try_from(carried_end).context("GLM reset carried span")?,
+        )?;
+        self.gpu.memset(
+            DevicePtr(self.arena.0 + after),
+            0,
+            usize::try_from(plan.known_bytes - after).context("GLM reset tail span")?,
+        )?;
+        // The scratch allocation stages the recurrence and is zeroed at
+        // construction for the same reason the arena is.
+        self.gpu.memset(
+            self.scratch_allocation,
+            0,
+            usize::try_from(Glm53WalkScratch::required_bytes())
+                .context("GLM reset scratch span")?
+                + 256,
+        )?;
+        let mut state = self.state.lock().unwrap();
+        state.position = 0;
+        state.walks_since_boundary = 0;
+        // The nonce stays MONOTONIC across the boundary. It exists to make a
+        // stale transaction detectable, so restarting it would make a carried
+        // record from the previous sequence look current.
+        Ok(())
+    }
+
+    /// A fresh sequence must actually START fresh, verified rather than assumed.
+    ///
+    /// `reset_sequence` being CALLED is not the same as the state being clear:
+    /// a memset that failed, a region the layout moved out of the zeroed spans,
+    /// or a caller that reset the wrong model would all leave `position` at 0
+    /// with live carried state, which is the contamination bug wearing a
+    /// correct-looking position counter.
+    ///
+    /// So this reads back the transaction metadata that gates the whole carry
+    /// protocol -- `published_ends` and `logical_lengths` for the KDA conv
+    /// layers -- and requires them zero. It is a few hundred bytes, not 12 GB:
+    /// the check is EXACT for the metadata and does not certify every byte of
+    /// the latent cache. It is placed where it can fire, which is more than the
+    /// comment it replaces did.
+    fn ensure_sequence_boundary(&self, walks_since_boundary: u64) -> Result<()> {
+        sequence_boundary_is_clean(walks_since_boundary)?;
+        let mut word = [0u8; 4];
+        for (ordinal, conv) in self.kda_conv.iter().enumerate() {
+            for (name, buffer) in [
+                ("published_ends", conv.published_ends_u32),
+                ("logical_lengths", conv.logical_lengths_u32),
+            ] {
+                self.gpu.copy_d2h(buffer.ptr, &mut word)?;
+                let value = u32::from_le_bytes(word);
+                ensure!(
+                    value == 0,
+                    "GLM sequence boundary is not clean: KDA layer {ordinal}                      {name} is {value}, expected 0 at position 0. The reset did                      not reach this region."
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn walk(&self, token: u32, stream: u64) -> Result<DevicePtr> {
         super::walk_timing::walk(|| self.walk_inner(token, stream))
     }
 
     fn walk_inner(&self, token: u32, stream: u64) -> Result<DevicePtr> {
-        let (position, nonce) = {
+        let (position, nonce, walks_since_boundary) = {
             let mut state = self.state.lock().unwrap();
             let position = state.position;
             state.nonce = state.nonce.wrapping_add(1).max(1);
-            (position, state.nonce)
+            (position, state.nonce, state.walks_since_boundary)
         };
         ensure!(
             position < self.capacity,
             "GLM sequence position {position} reached capacity {}",
             self.capacity
         );
+        if position == 0 {
+            self.ensure_sequence_boundary(walks_since_boundary)?;
+        }
 
         let workspace = Glm53BoundWorkspaceRef::bind(self)?;
         self.embed(token, workspace.collapsed, stream)?;
@@ -690,7 +807,11 @@ impl Glm53Model {
 
         self.commit_probe(position)?;
 
-        self.state.lock().unwrap().position = position + 1;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.position = position + 1;
+            state.walks_since_boundary += 1;
+        }
         super::walk_timing::report();
         Ok(self.logits)
     }
@@ -855,6 +976,25 @@ impl Glm53BoundWorkspaceRef {
     }
 }
 
+/// The structural half of the sequence-boundary check, split out so it can be
+/// pinned without a device.
+///
+/// The other half reads the transaction metadata back off the GPU. This half
+/// is the one that catches the reported bug: a request that begins while a
+/// previous sequence's walks are still counted has not been reset, whatever
+/// the position counter says.
+fn sequence_boundary_is_clean(walks_since_boundary: u64) -> Result<()> {
+    ensure!(
+        walks_since_boundary == 0,
+        "GLM walk is at position 0 after {walks_since_boundary} walks with no \
+         sequence reset. The carried state (KDA conv, KDA recurrent, DSA \
+         pools and latent cache) still holds the previous request, so this \
+         sequence would continue it -- observed live as request 3 answering \
+         its own prompt and then resuming request 1 mid-sentence. Call \
+         Glm53Model::reset_sequence at the start of every request."
+    );
+    Ok(())
+}
 #[cfg(test)]
 #[path = "target_model_tests.rs"]
 mod tests;

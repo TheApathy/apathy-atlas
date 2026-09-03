@@ -8,6 +8,7 @@ pub mod fp8_calibration;
 pub mod glm53_dflash2_head;
 pub mod glm53_dflash2_proposer;
 pub mod glm53_dsa_t1_transaction;
+mod glm53_moe_grouped;
 mod glm53_moe_serial;
 mod glm53_target_schedule;
 pub mod moe;
@@ -27,6 +28,9 @@ pub use dflash_head::{
 };
 pub use glm53_dflash2_head::{
     Glm53Dflash2RuntimeGeometry, Glm53Dflash2ScratchPlan, Glm53Dflash2ScratchRegion,
+};
+pub use glm53_moe_grouped::{
+    Glm53GroupedBank, Glm53GroupedMoeKernels, Glm53GroupedMoePlan, Glm53MoePath,
 };
 pub use glm53_moe_serial::{Glm53SerialMoeBuffers, Glm53SerialMoeKernels, Glm53SerialMoeReceipt};
 pub use glm53_target_schedule::{

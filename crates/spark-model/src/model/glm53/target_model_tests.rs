@@ -230,3 +230,135 @@ fn generates_real_text_on_real_hardware() {
     eprintln!("GENERATED_IDS = {out:?}");
     assert!(out.iter().all(|t| *t < 154_880));
 }
+
+/// The reset's two spans must cover every carried byte, with `mhc_expanded_f32`
+/// the ONLY thing they skip.
+///
+/// `reset_sequence` derives its spans from the plan rather than enumerating
+/// regions, because an enumerated reset that misses one region reproduces the
+/// cross-request contamination in a subtler form: the second request would look
+/// correct for a while and then inherit whatever was left. This pins the
+/// property that derivation depends on.
+///
+/// The excluded region is excluded for a reason that is not "it is later in the
+/// arena": `mhc_expanded_f32` is a load-time precomputation from the weights,
+/// not sequence state, and zeroing it would silently destroy the mHC
+/// combination matrices for every subsequent request.
+#[test]
+fn the_sequence_reset_spans_cover_everything_except_the_load_time_mhc_block() {
+    for positions in [4_096u32, 65_536, 262_144] {
+        let plan = Glm53ArenaPlan::for_context(positions).unwrap();
+        let carried_end = plan.context.total_bytes;
+        let mhc = plan.mhc_expanded_f32;
+        let after = plan.t1_transaction.offset_bytes;
+
+        // The precondition reset_sequence enforces.
+        assert!(carried_end <= mhc.offset_bytes, "{positions}");
+        assert_eq!(mhc.offset_bytes + mhc.allocation_bytes, after, "{positions}");
+        assert!(after < plan.known_bytes, "{positions}");
+
+        // Coverage: the ONLY unzeroed bytes are mhc's and the alignment padding
+        // ahead of it.
+        let zeroed = carried_end + (plan.known_bytes - after);
+        let skipped = plan.known_bytes - zeroed;
+        assert_eq!(skipped, mhc.offset_bytes - carried_end + mhc.allocation_bytes);
+        assert!(
+            skipped < mhc.allocation_bytes + 256,
+            "{positions}: {skipped} bytes skipped for a {} byte mhc block, so \
+             something other than mhc and its alignment padding is being kept",
+            mhc.allocation_bytes
+        );
+
+        // Every carried region the walk binds lives inside the first span.
+        assert!(plan.context.dsa_latent.offset_bytes < carried_end, "{positions}");
+        assert!(plan.context.kda_conv_f32.offset_bytes < carried_end, "{positions}");
+    }
+}
+
+/// The sequence-boundary guard FIRES, and names the fix.
+///
+/// This is the guard for the cross-request contamination found on a live
+/// server: three unrelated prompts in one process, where request 2 trailed into
+/// "...famous historical figures like Napoleon" and request 3 answered "391"
+/// and then continued request 1's sentence about French cuisine. Nothing reset
+/// `position`, so it advanced for the life of the process and every carried
+/// region went with it.
+#[test]
+fn the_sequence_boundary_guard_fires_on_an_unreset_model() {
+    // A model at its construction state, or freshly reset, may start.
+    assert!(sequence_boundary_is_clean(0).is_ok());
+
+    // One walk is enough: after any walk, position 0 means a missed reset.
+    for walks in [1u64, 5, 28, u64::MAX] {
+        let error = sequence_boundary_is_clean(walks).unwrap_err().to_string();
+        assert!(error.contains("sequence reset"), "{error}");
+        assert!(error.contains("reset_sequence"), "{walks}: {error}");
+        assert!(error.contains(&walks.to_string()), "{walks}: {error}");
+    }
+}
+
+/// NO TWO DISTINCT PER-LAYER QUANTITIES MAY SHARE A BYTE.
+///
+/// The T1 metadata regions are indexed by hand at a dozen call sites with
+/// expressions like `(KDA_ORDINALS + ordinal) * 4`, and `buffer()` bounds-checks
+/// nothing but address overflow. That is the same shape as the four `/KPOOL`
+/// sites meaning three different things: an arithmetic slip aliases two live
+/// quantities onto one word and produces fluent, wrong output.
+///
+/// This walks the ACTUAL bindings rather than restating the offsets, so it
+/// catches a slip at the site that made it.
+///
+/// It also guards a real hazard. In the `published_ends_u32` region (45 slots)
+/// the KDA conv layers take 0..33, the DSA `query_positions_u32` takes 34..44,
+/// and the DSA `published_ends_u32` takes 45..55 -- past the payload, inside the
+/// region's 256-byte alignment padding. Nothing is corrupted today, but
+/// "correcting" the DSA published-ends index to `(KDA_ORDINALS + ordinal)`
+/// would land it exactly on `query_positions_u32`, which the walk writes with
+/// `position` every token while latent-append writes `position + 1`. That is a
+/// live off-by-one on all eleven DSA layers, and this test is what refuses it.
+#[test]
+fn no_two_per_layer_state_bindings_overlap() {
+    const BASE: DevicePtr = DevicePtr(0x2000_0000_0000);
+    let plan = Glm53ArenaPlan::for_context(65_536).unwrap();
+    let (kda_states, kda_conv, dsa_cache) = Glm53Model::bind_state(&plan, BASE).unwrap();
+
+    let mut spans: Vec<(String, u64, u64)> = Vec::new();
+    for (ordinal, conv) in kda_conv.iter().enumerate() {
+        for (name, b) in [
+            ("published_ends", conv.published_ends_u32),
+            ("published_nonces", conv.published_nonces_u64),
+            ("logical_lengths", conv.logical_lengths_u32),
+            ("persistent", conv.persistent_state_f32),
+            ("staged", conv.staged_state_f32),
+        ] {
+            spans.push((format!("kda{ordinal}.{name}"), b.ptr.0, b.ptr.0 + b.bytes as u64));
+        }
+    }
+    for (ordinal, dsa) in dsa_cache.iter().enumerate() {
+        for (name, b) in [
+            ("sequence_lengths", dsa.sequence_lengths_u32),
+            ("query_positions", dsa.query_positions_u32),
+            ("published_ends", dsa.published_ends_u32),
+            ("published_nonces", dsa.published_nonces_u64),
+            ("query_validity", dsa.query_validity_u8),
+            ("out_tail_validity", dsa.out_tail_validity_u8),
+            ("prior_tail_validity", dsa.prior_tail_validity_u8),
+        ] {
+            spans.push((format!("dsa{ordinal}.{name}"), b.ptr.0, b.ptr.0 + b.bytes as u64));
+        }
+    }
+    assert!(!kda_states.is_empty());
+
+    spans.sort_by_key(|(_, start, _)| *start);
+    for pair in spans.windows(2) {
+        let (left_name, left_start, left_end) = &pair[0];
+        let (right_name, right_start, _) = &pair[1];
+        assert!(
+            left_end <= right_start,
+            "GLM per-layer state bindings OVERLAP: {left_name} is [{left_start:#x}, \
+             {left_end:#x}) and {right_name} starts at {right_start:#x}. Two live \
+             quantities share a word; one of them is being silently overwritten \
+             every token."
+        );
+    }
+}

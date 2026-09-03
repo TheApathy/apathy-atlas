@@ -47,7 +47,7 @@ mod gemm_fp4;
 mod gemm_fp8_prefill;
 #[path = "ops/gemm_quant.rs"]
 mod gemm_quant;
-mod ggml_iq_mmq;
+pub(crate) mod ggml_iq_mmq;
 mod ggml_q4_embedding;
 mod ggml_q5_embedding;
 mod ggml_q6_embedding;

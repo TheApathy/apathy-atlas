@@ -106,7 +106,7 @@ impl GgmlIqMmqPlan {
         })
     }
 
-    fn weight_row_stride(self) -> u32 {
+    pub(crate) fn weight_row_stride(self) -> u32 {
         self.inner / layout(self.kind).expect("validated plan type").0 as u32
     }
 }
@@ -208,7 +208,7 @@ fn layout(kind: GgmlType) -> Result<(usize, usize, u32)> {
     })
 }
 
-fn kernel_names(kind: GgmlType) -> Result<(&'static str, &'static str, &'static str)> {
+pub(crate) fn kernel_names(kind: GgmlType) -> Result<(&'static str, &'static str, &'static str)> {
     let d4 = "atlas_q8_1_quantize_d4_bf16";
     let ds4 = "atlas_q8_1_quantize_ds4_bf16";
     Ok(match kind {
