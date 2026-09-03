@@ -44,9 +44,59 @@ pub(crate) struct Glm53WalkDump {
 impl Glm53WalkDump {
     const ENV: &'static str = "ATLAS_GLM53_DUMP_DIR";
 
+    /// Read the dump root, and NEVER let it stay relative.
+    ///
+    /// A relative `ATLAS_GLM53_DUMP_DIR` resolves against whatever the process
+    /// happened to be launched from, which is not the directory the person who
+    /// set it was standing in. That put 12 GB of `p0/`..`p27/` in the repo root
+    /// three separate times in one session, and each time the first symptom
+    /// was a confusing `git status`, not a dump that failed.
     pub(crate) fn from_env() -> Self {
-        Self {
-            dir: std::env::var_os(Self::ENV).map(std::path::PathBuf::from),
+        let Some(raw) = std::env::var_os(Self::ENV) else {
+            return Self { dir: None };
+        };
+        let (dir, note) = Self::resolve(std::path::PathBuf::from(raw), std::env::current_dir().ok());
+        eprintln!("GLM dump: {}", note);
+        Self { dir: Some(dir) }
+    }
+
+    /// The resolution itself, pure so it can be pinned without touching the
+    /// process environment.
+    ///
+    /// The note is emitted for an ABSOLUTE setting too. The point is that no
+    /// run leaves you guessing where its dumps went, and a message that only
+    /// appears in the surprising case is one nobody learns to read.
+    fn resolve(
+        raw: std::path::PathBuf,
+        working_directory: Option<std::path::PathBuf>,
+    ) -> (std::path::PathBuf, String) {
+        if raw.is_absolute() {
+            let note = format!("{} = {}", Self::ENV, raw.display());
+            return (raw, note);
+        }
+        match working_directory {
+            Some(cwd) => {
+                let resolved = cwd.join(&raw);
+                let note = format!(
+                    "{} is RELATIVE ({}); resolved against the process working \
+                     directory to {}",
+                    Self::ENV,
+                    raw.display(),
+                    resolved.display()
+                );
+                (resolved, note)
+            }
+            // Loud and unresolved rather than quietly relative: a dump in an
+            // unknown directory is the failure this exists to prevent.
+            None => {
+                let note = format!(
+                    "{} is RELATIVE ({}) and the working directory is unreadable; \
+                     dumps will land somewhere UNKNOWN",
+                    Self::ENV,
+                    raw.display()
+                );
+                (raw, note)
+            }
         }
     }
 
@@ -131,7 +181,49 @@ impl Glm53WalkDump {
 
 #[cfg(test)]
 mod tests {
-    use super::Glm53DumpDtype;
+    use super::{Glm53DumpDtype, Glm53WalkDump};
+    use std::path::PathBuf;
+
+    /// A relative dump root must never survive as relative.
+    ///
+    /// This is the fix for a concrete, repeated incident: a relative
+    /// `ATLAS_GLM53_DUMP_DIR` resolved against the process working directory
+    /// and dropped 12 GB of `p0/`..`p27/` into the repo root three times in one
+    /// session. The instrument is the resolution itself, not the env read, so
+    /// the pin does not have to mutate the process environment to fire.
+    #[test]
+    fn a_relative_dump_root_is_resolved_and_always_announced() {
+        let cwd = Some(PathBuf::from("/var/tmp/atlas-bringup-logs"));
+
+        let (dir, note) = Glm53WalkDump::resolve(PathBuf::from("dump_dsafix"), cwd.clone());
+        assert_eq!(dir, PathBuf::from("/var/tmp/atlas-bringup-logs/dump_dsafix"));
+        assert!(dir.is_absolute());
+        assert!(note.contains("is RELATIVE"), "{note}");
+        assert!(note.contains("/var/tmp/atlas-bringup-logs/dump_dsafix"), "{note}");
+
+        // `./x` and `../x` are relative too -- the check is is_absolute, not a
+        // leading-slash or leading-dot test.
+        for sneaky in ["./dump", "../dump", "a/b/c"] {
+            let (dir, note) = Glm53WalkDump::resolve(PathBuf::from(sneaky), cwd.clone());
+            assert!(dir.is_absolute(), "{sneaky} stayed relative as {}", dir.display());
+            assert!(note.contains("is RELATIVE"), "{sneaky}: {note}");
+        }
+
+        // An absolute root passes through untouched, and is STILL announced --
+        // a warning that only prints in the surprising case is one nobody
+        // learns to read.
+        let absolute = PathBuf::from("/var/tmp/atlas-bringup-logs/dump_poolfix");
+        let (dir, note) = Glm53WalkDump::resolve(absolute.clone(), cwd);
+        assert_eq!(dir, absolute);
+        assert!(!note.contains("is RELATIVE"), "{note}");
+        assert!(note.contains("/var/tmp/atlas-bringup-logs/dump_poolfix"), "{note}");
+
+        // No working directory: unresolved, but LOUD rather than silently
+        // relative. Dumps landing somewhere unknown is the failure being cured.
+        let (dir, note) = Glm53WalkDump::resolve(PathBuf::from("dump"), None);
+        assert_eq!(dir, PathBuf::from("dump"));
+        assert!(note.contains("UNKNOWN"), "{note}");
+    }
 
     /// Pins the dump file extensions.
     ///

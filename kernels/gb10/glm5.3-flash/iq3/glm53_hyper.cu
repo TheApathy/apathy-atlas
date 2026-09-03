@@ -19,6 +19,25 @@
 #define GLM53_MIX 24U
 #define GLM53_THREADS 256U
 
+// SINGLE-VARIABLE A/B (see GLM53_F32_MHC_STREAMS in
+// crates/spark-model/src/layers/glm53_target_schedule.rs).
+//
+// `round_to_bf16` is 0 for the shipping build and 1 only for the deliberate
+// regression. It gates the PRECISION carried across a layer boundary and
+// nothing else: the buffer stays f32, so widened_hc, the arena, the capture
+// slots and every extent test are untouched, and the ONLY thing that changes
+// is whether a stream value survives the layer at f32 or bf16.
+//
+// It is applied at the two sites that WRITE a stream and nowhere else. In
+// particular the fold below still spends exactly ONE rounding on
+// `placement + mixed`; restoring the old three-rounding form here would fold a
+// separate landed fix back in and reconfound the very measurement this exists
+// to make.
+__device__ __forceinline__ float glm53_stream_store(float value,
+                                                    unsigned int round_to_bf16) {
+    return round_to_bf16 ? __bfloat162float(__float2bfloat16(value)) : value;
+}
+
 __device__ __forceinline__ float glm53_block_sum(float *values, unsigned int tid) {
     for (unsigned int stride = GLM53_THREADS / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
@@ -33,7 +52,8 @@ extern "C" __global__ void __launch_bounds__(GLM53_THREADS, 1)
 atlas_glm53_hc_expand(
         const __nv_bfloat16 * __restrict__ hidden,
         float * __restrict__ streams,
-        unsigned int hidden_size, unsigned int hc) {
+        unsigned int hidden_size, unsigned int hc,
+        unsigned int round_to_bf16) {
     if (hidden_size != GLM53_HIDDEN || hc != GLM53_HC) {
         return;
     }
@@ -45,7 +65,8 @@ atlas_glm53_hc_expand(
         const float value = __bfloat162float(hidden[hidden_base + column]);
         #pragma unroll
         for (unsigned int stream = 0; stream < GLM53_HC; ++stream) {
-            streams[stream_base + (unsigned long long) stream * hidden_size + column] = value;
+            streams[stream_base + (unsigned long long) stream * hidden_size + column] =
+                glm53_stream_store(value, round_to_bf16);
         }
     }
 }
@@ -217,7 +238,8 @@ atlas_glm53_hc_post(
         const __nv_bfloat16 * __restrict__ post,
         const __nv_bfloat16 * __restrict__ combination,
         float * output,
-        unsigned int hidden_size, unsigned int hc) {
+        unsigned int hidden_size, unsigned int hc,
+        unsigned int round_to_bf16) {
     if (hidden_size != GLM53_HIDDEN || hc != GLM53_HC) {
         return;
     }
@@ -255,7 +277,7 @@ atlas_glm53_hc_post(
                     mixed);
             }
             output[stream_base + (unsigned long long) target * hidden_size + column] =
-                placement + mixed;
+                glm53_stream_store(placement + mixed, round_to_bf16);
         }
     }
 }

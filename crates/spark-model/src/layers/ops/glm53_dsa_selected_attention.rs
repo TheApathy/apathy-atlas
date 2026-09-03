@@ -236,8 +236,10 @@ fn validate_buffers(
             2,
         ),
     ];
-    let mut ranges = [(0u64, 0u64); 7];
-    for (slot, (name, buffer, expected, alignment)) in named.iter().copied().enumerate() {
+    // Sized from the table it mirrors, never a literal: a hand-written
+    // length silently goes out of bounds the moment the table grows.
+    let mut ranges = Vec::with_capacity(named.len());
+    for (name, buffer, expected, alignment) in named.iter().copied() {
         if buffer.bytes != expected
             || buffer.ptr == DevicePtr::NULL
             || buffer.ptr.0 % alignment != 0
@@ -246,14 +248,14 @@ fn validate_buffers(
                 "GLM DSA selected-attention {name} buffer has invalid pointer, alignment, or extent"
             );
         }
-        ranges[slot] = (
+        ranges.push((
             buffer.ptr.0,
             buffer
                 .ptr
                 .0
                 .checked_add(u64::try_from(expected)?)
                 .with_context(|| format!("GLM DSA selected-attention {name} address overflow"))?,
-        );
+        ));
     }
     for left in 0..ranges.len() {
         for right in left + 1..ranges.len() {

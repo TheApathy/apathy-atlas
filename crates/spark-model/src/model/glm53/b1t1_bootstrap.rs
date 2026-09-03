@@ -25,6 +25,10 @@ const HIDDEN: u32 = 4_096;
 const HC: u32 = 4;
 const SINKHORN_ITERS: u32 = 20;
 const KERNEL_LAUNCHES: u32 = 2;
+/// Number of device buffers the bootstrap validates and fingerprints. The
+/// `named` table in `validate_buffers` is annotated with this length, so a
+/// buffer added there without widening the fingerprint fails to compile.
+const BUFFER_COUNT: usize = 4;
 static NEXT_OWNER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +105,7 @@ pub(crate) struct Glm53B1T1BootstrapReceipt {
     transaction_nonce: u64,
     token_id: u32,
     stream: u64,
-    buffer_ranges: [(u64, u64); 4],
+    buffer_ranges: [(u64, u64); BUFFER_COUNT],
     stage: Glm53B1T1BootstrapStage,
     kernel_launches: u32,
 }
@@ -131,7 +135,7 @@ impl Glm53B1T1BootstrapReceipt {
         self.kernel_launches
     }
 
-    pub(crate) const fn buffer_ranges(&self) -> [(u64, u64); 4] {
+    pub(crate) const fn buffer_ranges(&self) -> [(u64, u64); BUFFER_COUNT] {
         self.buffer_ranges
     }
 }
@@ -141,7 +145,7 @@ struct ActiveBootstrap {
     transaction_nonce: u64,
     token_id: u32,
     stream: u64,
-    buffer_ranges: [(u64, u64); 4],
+    buffer_ranges: [(u64, u64); BUFFER_COUNT],
 }
 
 /// Borrowed, preloaded kernel wrappers. Their allocation and module ownership
@@ -260,8 +264,8 @@ impl<'a> Glm53B1T1BootstrapKernels<'a> {
 fn validate_buffers(
     plan: Glm53B1T1BootstrapPlan,
     buffers: Glm53B1T1BootstrapBuffers,
-) -> Result<[(u64, u64); 4]> {
-    let named = [
+) -> Result<[(u64, u64); BUFFER_COUNT]> {
+    let named: [_; BUFFER_COUNT] = [
         (
             "Q5_K source",
             buffers.source_q5_k,
@@ -287,7 +291,7 @@ fn validate_buffers(
             2,
         ),
     ];
-    let mut ranges = [(0u64, 0u64); 4];
+    let mut ranges = [(0u64, 0u64); BUFFER_COUNT];
     for (slot, (name, buffer, expected, alignment)) in named.iter().copied().enumerate() {
         if buffer.ptr == DevicePtr::NULL
             || buffer.bytes != expected

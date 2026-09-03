@@ -65,6 +65,12 @@ const Q_RANK: u32 = 1_536;
 const INDEX_DIM: u32 = 128;
 const INDEX_HEADS: u32 = 32;
 const KPOOL: u32 = 4;
+
+/// Positive build provenance for the completing-pool publish order. Grep the
+/// artifact you are about to execute for this exact string; never infer the
+/// build from the ABSENCE of a marker, which LLVM is free to delete.
+#[used]
+static ATLAS_GLM53_DSA_POOL_PUBLISH_MARKER: &str = "ATLAS_GLM53_DSA_POOL_PUBLISH=pre-score";
 const INDEX_TOPK: u32 = 2_048;
 const SELECTED: u32 = 2_051;
 /// The absolute position space every DSA op is compiled against. Distinct from
@@ -459,6 +465,57 @@ impl Glm53DsaAttentionKernels {
         )?;
         launches += 1;
 
+        // PUBLISH THE COMPLETING POOL BEFORE SCORE/TOPK.
+        //
+        // The pool op writes a completed pool to per-step SCRATCH
+        // (`buffers.pool_keys_bf16`); score and top-k read the CACHE
+        // (`cache.pool_keys_bf16`). Publishing this at the END of the step made
+        // the pool completing during THIS step invisible to this step's
+        // selector, and the raw tail could not cover it either: the tail holds
+        // at most KPOOL-1 tokens and at q = KPOOL-1 (mod KPOOL) the completing
+        // group is full. Both routes missed, so at q = 7, 11, 15, ... the model
+        // attended to a sequence with a KPOOL-1-token HOLE in it -- measured
+        // directly in dump_dsafix layer 3: p7 selected [0,1,2,3] and nothing
+        // else, with 4, 5 and 6 absent from selected_indices entirely.
+        //
+        // Publishing here makes `usable_pools()` = (q+1)/KPOOL sound. The two
+        // must move together: the (q+1)/KPOOL count on its own points the
+        // scorer at an unwritten cache row, which is the stale-row failure the
+        // causality guard below exists to catch and which measured p3 at 3.16%
+        // -> 44.98%.
+        //
+        // The TAIL advance stays at the end of the step, unmoved: it is a
+        // cross-position carry and its ordering comment there is correct.
+        if pool_plan.complete_pools > 0 {
+            // The pool covering positions 4k..4k+3 completes at 4k+3, so
+            // its row is position / 4.
+            let pool_row = u64::from(geometry.position / KPOOL);
+            let key_bytes = u64::from(INDEX_DIM) * 2;
+            let key_offset = pool_row
+                .checked_mul(key_bytes)
+                .context("GLM DSA pool key row overflow")?;
+            ensure!(
+                key_offset + key_bytes <= cache.pool_keys_bf16.bytes as u64,
+                "GLM DSA pool row {pool_row} is outside the persistent pool region"
+            );
+            gpu.copy_d2d_async(
+                buffers.pool_keys_bf16.ptr,
+                DevicePtr(cache.pool_keys_bf16.ptr.0 + key_offset),
+                usize::try_from(key_bytes)?,
+                stream,
+            )?;
+            ensure!(
+                pool_row < cache.pool_validity_u8.bytes as u64,
+                "GLM DSA pool validity row {pool_row} is outside its region"
+            );
+            gpu.copy_d2d_async(
+                buffers.pool_validity_u8.ptr,
+                DevicePtr(cache.pool_validity_u8.ptr.0 + pool_row),
+                1,
+                stream,
+            )?;
+        }
+
         // Indexer query and the per-head score weights.
         self.linear(
             gpu,
@@ -495,10 +552,12 @@ impl Glm53DsaAttentionKernels {
 
         // Score every pool, then take the top-512 and expand to token indices.
         //
-        // A pool only completes every `kpool` positions, so the first four
-        // tokens of ANY sequence have zero complete pools — and both the score
-        // and top-k ops require `pools >= 1`. There is nothing to select from
-        // yet: every visible token is still in the raw tail. The selector's
+        // A pool only completes every `kpool` positions, so the first KPOOL-1
+        // tokens of ANY sequence (q = 0, 1, 2) have zero complete pools — and
+        // both the score and top-k ops require `pools >= 1`. There is nothing
+        // to select from yet: every visible token is still in the raw tail.
+        // Position 3 is NOT in this set: it completes pool 0, which is
+        // published above and scored here. The selector's
         // output for that case is exactly "the causally visible prefix", which
         // is written directly rather than asking the ops for a top-k over an
         // empty pool set.
@@ -507,7 +566,10 @@ impl Glm53DsaAttentionKernels {
         // model: pool k spans 4k..4k+3 and is usable only once its last token
         // has arrived. The highest usable pool is `pools - 1`, whose final
         // token sits at KPOOL*pools - 1, so that must not exceed the query
-        // position. Scoring a pool whose tail has not arrived reads stale rows
+        // position. At q ≡ KPOOL-1 this is an equality: the pool completing on
+        // this step is usable precisely because its last token IS the query,
+        // and its row was published above before this point.
+        // Scoring a pool whose tail has not arrived reads stale rows
         // and produces fluent, wrong output rather than an error -- which is
         // exactly how the previous off-by-one survived, silently and for the
         // life of the model.
@@ -518,6 +580,39 @@ impl Glm53DsaAttentionKernels {
             KPOOL * pools - 1,
             geometry.position
         );
+        // THE COVERAGE INVARIANT, enforced rather than assumed: every position
+        // 0..=q must be accounted for exactly once, either by a published pool
+        // or by a slot in the raw tail. Pooled coverage ends at KPOOL*pools - 1,
+        // so the tail must hold the remainder.
+        //
+        // With pools = (q+1)/KPOOL the occupancy is (q+1) - KPOOL*pools, which
+        // is exactly (q+1) mod KPOOL and therefore never exceeds KPOOL-1 =
+        // GLM53_DSA_TAIL_CAPACITY. It reaches zero at q ≡ KPOOL-1 (mod KPOOL),
+        // where the completing group is fully pooled instead.
+        //
+        // Under the OLD pools = q/KPOOL this same expression demanded KPOOL
+        // slots at q ≡ KPOOL-1, which is what made a capacity of KPOOL look
+        // necessary. Raising the capacity would have been a divergence from
+        // the reference; the pool count was the wrong half.
+        {
+            let pooled_coverage = KPOOL * pools;
+            let tail_occupancy = geometry.position + 1 - pooled_coverage;
+            ensure!(
+                pooled_coverage + tail_occupancy == geometry.position + 1,
+                "GLM DSA coverage invariant violated: {pooled_coverage} pooled + \
+                 {tail_occupancy} tail != {} positions",
+                geometry.position + 1
+            );
+            ensure!(
+                tail_occupancy <= spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY,
+                "GLM DSA raw tail must hold {tail_occupancy} tokens at position {} \
+                 ({pooled_coverage} covered by {pools} published pools) but capacity \
+                 is {}. The tail is short exactly when position = KPOOL-1 (mod KPOOL), \
+                 where the completing group is full and not yet published.",
+                geometry.position,
+                spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY
+            );
+        }
         if pools == 0 {
             let visible = usize::try_from(geometry.position)?
                 .checked_add(1)
@@ -797,7 +892,11 @@ impl Glm53DsaAttentionKernels {
             // tail is what the next token starts from") and the walk stream is
             // CU_STREAM_NON_BLOCKING, so plain copy_d2d would read the tail the
             // attention kernel has not finished writing.
-            let tail_bytes = usize::try_from(3u64 * u64::from(INDEX_DIM) * 2)?;
+            let tail_bytes = usize::try_from(
+                u64::from(spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY)
+                    * u64::from(INDEX_DIM)
+                    * 2,
+            )?;
             gpu.copy_d2d_async(
                 buffers.tail_keys_bf16.ptr,
                 cache.prior_tail_keys_bf16.ptr,
@@ -816,35 +915,6 @@ impl Glm53DsaAttentionKernels {
                 3,
                 stream,
             )?;
-            if pool_plan.complete_pools > 0 {
-                // The pool covering positions 4k..4k+3 completes at 4k+3, so
-                // its row is position / 4.
-                let pool_row = u64::from(geometry.position / KPOOL);
-                let key_bytes = u64::from(INDEX_DIM) * 2;
-                let key_offset = pool_row
-                    .checked_mul(key_bytes)
-                    .context("GLM DSA pool key row overflow")?;
-                ensure!(
-                    key_offset + key_bytes <= cache.pool_keys_bf16.bytes as u64,
-                    "GLM DSA pool row {pool_row} is outside the persistent pool region"
-                );
-                gpu.copy_d2d_async(
-                    buffers.pool_keys_bf16.ptr,
-                    DevicePtr(cache.pool_keys_bf16.ptr.0 + key_offset),
-                    usize::try_from(key_bytes)?,
-                    stream,
-                )?;
-                ensure!(
-                    pool_row < cache.pool_validity_u8.bytes as u64,
-                    "GLM DSA pool validity row {pool_row} is outside its region"
-                );
-                gpu.copy_d2d_async(
-                    buffers.pool_validity_u8.ptr,
-                    DevicePtr(cache.pool_validity_u8.ptr.0 + pool_row),
-                    1,
-                    stream,
-                )?;
-            }
         }
 
         Ok(launches)
@@ -918,14 +988,34 @@ impl Glm53DsaLayerGeometry {
     /// diverge by the chunk size the moment the walk batches. Conflating them
     /// is how the off-by-one below survived.
     ///
-    /// Pool k spans positions 4k..4k+3 and becomes usable only once its LAST
-    /// token has arrived, i.e. 4k+3 <= q. Solving for the count gives
-    /// floor((q+1)/KPOOL). The previous `q / KPOOL` was low by exactly one
-    /// whenever q ≡ 3 (mod KPOOL) -- it dropped the pool that had just
-    /// completed, which is the four most recent pooled tokens. That produced a
-    /// clean period-4 error: peaks at p7/p11/p15/... and NOT at p3, because at
-    /// p3 the undercount is 1->0 and the `pools == 0` fallback below writes the
-    /// visible prefix directly and is correct.
+    /// Pool k spans positions 4k..4k+3 and is complete once position 4k+3 has
+    /// arrived, so at query position q the count of complete pools is
+    /// (q + 1) / KPOOL -- INCLUDING the pool that completes on this very step.
+    ///
+    /// That count is only sound because the walk now publishes the completing
+    /// pool row into the cache BEFORE score/topk (see the publish site in
+    /// `run_layer`). The two are a single change and neither is correct alone:
+    ///
+    ///  - `(q + 1) / KPOOL` with the publish still at the end of the step
+    ///    points the scorer at a cache row that has not been written. Measured:
+    ///    p3 went from 3.16% to 44.98%.
+    ///  - `q / KPOOL` with the publish moved forward silently DROPS the
+    ///    completing pool at q ≡ KPOOL-1 (mod KPOOL). The raw tail cannot
+    ///    cover it: the tail holds positions [KPOOL*pools, q], which is at most
+    ///    KPOOL-1 entries only under this formula. Measured in dump_dsafix
+    ///    layer 3: p7 selected [0,1,2,3] with 4, 5, 6 absent entirely.
+    ///
+    /// The coverage arithmetic that falls out is exact and is enforced at the
+    /// call site: tail occupancy = (q + 1) - KPOOL*pools ∈ [0, KPOOL-1], which
+    /// is precisely GLM53_DSA_TAIL_CAPACITY. The reference model in
+    /// `glm53_dsa_topk_tests.rs` covers q = 7 as pools {0,1} plus a 3-slot
+    /// tail plus the current position via query metadata, and agrees.
+    ///
+    /// Distinct from `Glm53DsaPoolPlan::complete_pools_to_write`, which is
+    /// INCREMENTAL -- how many pools THIS step completes. The two were once
+    /// both called some form of "complete pools", are nearly equal at
+    /// chunk_tokens=1, and diverge by the chunk size the moment the walk
+    /// batches.
     pub fn usable_pools(self) -> u32 {
         (self.position + 1) / KPOOL
     }

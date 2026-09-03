@@ -46,6 +46,10 @@ use super::arena::{GLM53_T1_TRANSIENT_BYTES, GLM53_T1_WORKSPACE_BYTES};
 
 const ALIGNMENT: u64 = 256;
 
+/// One DSA layer's raw index tail: TAIL_CAPACITY rows of INDEX_DIM bf16.
+const DSA_TAIL_BYTES: u64 =
+    spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as u64 * 128 * 2;
+
 /// Cumulative offsets of each table inside the concatenated `bound[..]`.
 ///
 /// Derived, never written by hand. `bind` maps the chained tables positionally,
@@ -141,8 +145,11 @@ const DSA_SCRATCH: [(&str, u64); 20] = [
     ("dsa_unabsorbed_bf16", 32_768),
     ("dsa_pool_keys_bf16", 256),
     ("dsa_pool_validity_u8", 256),
-    ("dsa_tail_keys_bf16", 768),
-    ("dsa_tail_gates_bf16", 768),
+    // Derived from the single tail-capacity definition, not the old literal 768
+    // (= 3 x INDEX_DIM x 2). A hardcoded size here would stay short while the
+    // constant moved, which is the whole failure this change is fixing.
+    ("dsa_tail_keys_bf16", DSA_TAIL_BYTES),
+    ("dsa_tail_gates_bf16", DSA_TAIL_BYTES),
     // attn_output has a 16,384-long inner: (16384 / 128) * 144.
     ("dsa_q8_activation", 18_432),
 ];

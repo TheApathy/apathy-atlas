@@ -16,7 +16,7 @@ mod test_source_sha256;
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 const DEVICE_SOURCE: &str = include_str!("gguf/device.rs");
 const DEVICE_SOURCE_SHA256: &str =
-    "0172086c80ca151af244200549c3b3d4961dbc9669ad5bb7e19fdeaecda67444";
+    "330732f88aef8a74bb9e0fc2c215980b68ca6fbc12aced9415cfe65683c57bda";
 const SHA256_SOURCE: &str = include_str!("gguf/sha256.rs");
 const SHA256_SOURCE_SHA256: &str =
     "bca28dccb9f28c30455190a9b9582ba0fb3b86430f9a3b76f193fb3db57c058a";

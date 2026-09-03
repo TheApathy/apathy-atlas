@@ -9,6 +9,9 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::weights::gguf::GgufDeviceTensor;
 
 use super::*;
+
+const TAIL_CAP: usize =
+    spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as usize;
 use crate::layers::ops::GgmlIqMmqPlan;
 use crate::model::glm53::walk_scratch::Glm53WalkScratch;
 use crate::weight_loader::{Glm53GgufF32, Glm53GgufMatrixBank};
@@ -129,6 +132,8 @@ fn matrix_tensor(c: &mut u64, dims: &[u64], kind: GgmlType) -> GgufDeviceTensor 
         dimensions: dims.to_vec(),
         ggml_type: kind,
         byte_len: per,
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(kind, &dims, per)
+            .expect("test tensor slack"),
     }
 }
 
@@ -141,6 +146,8 @@ fn f32_tensor(c: &mut u64, dims: &[u64]) -> GgufDeviceTensor {
         dimensions: dims.to_vec(),
         ggml_type: GgmlType::F32,
         byte_len: (elements * 4) as usize,
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(GgmlType::F32, dims, (elements * 4) as usize)
+            .expect("test tensor slack"),
     }
 }
 
@@ -180,10 +187,12 @@ fn cache(gpu: &dyn GpuBackend, position: u32) -> Glm53DsaCacheSlots {
         latent_overlay_bf16: at(512 * 2),
         pool_keys_bf16: at(pools.max(1) * 128 * 2),
         pool_validity_u8: at(pools.max(1)),
-        prior_tail_keys_bf16: at(3 * 128 * 2),
-        prior_tail_gates_bf16: at(3 * 128 * 2),
-        prior_tail_validity_u8: at(3),
-        out_tail_validity_u8: at(3),
+        // Sized from the constant, not a literal: a test that hardcodes the old
+        // capacity would keep passing while the real buffers were short.
+        prior_tail_keys_bf16: at(TAIL_CAP * 128 * 2),
+        prior_tail_gates_bf16: at(TAIL_CAP * 128 * 2),
+        prior_tail_validity_u8: at(TAIL_CAP),
+        out_tail_validity_u8: at(TAIL_CAP),
         sequence_lengths_u32: at(4),
         query_positions_u32: at(4),
         query_validity_u8: at(1),
@@ -381,14 +390,26 @@ fn geometry_rejects_a_zero_nonce_and_an_out_of_range_position() {
     assert_eq!(ok.usable_pools(), 1_024);
 }
 
-/// The pool count must follow the causality rule `4k+3 <= q`, so the usable
-/// count is floor((q+1)/KPOOL).
+/// `usable_pools` counts PUBLISHED pools, which is floor(q / KPOOL).
 ///
-/// The pre-existing pin used position 4096, which is 0 mod 4 -- the one residue
-/// where the old `q / KPOOL` and the correct `(q+1) / KPOOL` AGREE. It could
-/// never have caught this. These cases walk every residue.
+/// The completing pool IS counted at the step that completes it, because the
+/// walk now publishes its row into the cache before score/topk. Counting it
+/// while publishing at the END of the step reads an unwritten row -- measured,
+/// that took p3 from 3.16% to 44.98% -- so the count and the publish position
+/// are one change and this test pins the count half of it.
+///
+/// Not counting it is the defect that produced the period-4 peaks: the raw
+/// tail cannot cover the completing group either, so at q = 7, 11, 15, ...
+/// three positions were absent from selected_indices altogether. Observed in
+/// dump_dsafix layer 3: p7 selected [0,1,2,3] and nothing more.
+///
+/// The coverage arithmetic that follows is exact: tail occupancy is
+/// (q+1) - KPOOL*pools = (q+1) mod KPOOL, whose maximum is KPOOL-1. That is
+/// GLM53_DSA_TAIL_CAPACITY, and it agrees with the reference model in
+/// `glm53_dsa_topk_tests.rs`, which covers q = 7 as pools {0,1} plus a
+/// three-slot tail plus the current position via query metadata.
 #[test]
-fn usable_pool_count_follows_the_causality_rule_at_every_residue() {
+fn usable_pools_counts_published_pools_and_the_tail_covers_the_remainder() {
     let at = |position: u32| Glm53DsaLayerGeometry {
         position,
         capacity: CAPACITY,
@@ -396,31 +417,44 @@ fn usable_pool_count_follows_the_causality_rule_at_every_residue() {
     }
     .usable_pools();
 
-    // q ≡ 3 (mod 4) is where the old arithmetic was low by one: the pool that
-    // just completed was dropped, losing the four most recent pooled tokens.
-    assert_eq!(at(3), 1, "p3 completes pool 0 (positions 0..3)");
-    assert_eq!(at(7), 2, "p7 completes pool 1");
-    assert_eq!(at(11), 3);
-    assert_eq!(at(27), 7);
-
-    // The other three residues are unchanged by the fix.
+    // Published-pool count: the pool completing at q IS counted at q, because
+    // its row is published before score/topk.
     assert_eq!(at(0), 0);
+    assert_eq!(at(2), 0, "no pool is complete before p3");
+    assert_eq!(at(3), 1, "pool 0 completes AT p3 and is published before scoring");
     assert_eq!(at(4), 1);
-    assert_eq!(at(5), 1);
-    assert_eq!(at(6), 1);
+    assert_eq!(at(7), 2, "pool 1 covers 4..7 and completes AT p7");
+    assert_eq!(at(8), 2);
+    assert_eq!(at(27), 7, "pool 6 covers 24..27 and completes AT p27");
 
-    // Every usable pool's last token must have arrived, at every position.
-    for position in 0..64u32 {
-        let pools = at(position);
-        assert!(
-            pools == 0 || 4 * pools - 1 <= position,
-            "pool {} at position {position} has not received its last token",
-            pools - 1
-        );
-        // And it must be maximal: the next pool must NOT yet be usable.
-        assert!(
-            4 * (pools + 1) - 1 > position,
-            "pool {pools} is usable at position {position} but was not counted"
+    // The period-4 positions, stated as the coverage they must produce. These
+    // are the six that measured 44-63%: at each, the completing pool is the
+    // ONLY route by which its group reaches selection.
+    for position in [7u32, 11, 15, 19, 23, 27] {
+        assert_eq!(
+            4 * at(position),
+            position + 1,
+            "p{position} must be fully pooled with an empty tail"
         );
     }
+
+    // The coverage requirement the tail capacity must satisfy, at every
+    // position: pooled + tail == q+1, and tail never exceeds capacity.
+    let capacity = spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY;
+    let mut worst = 0;
+    for position in 0..64u32 {
+        let pools = at(position);
+        let pooled = 4 * pools;
+        let tail = position + 1 - pooled;
+        assert_eq!(pooled + tail, position + 1, "coverage gap at {position}");
+        worst = worst.max(tail);
+        assert!(
+            tail <= capacity,
+            "position {position} needs {tail} tail slots, capacity is {capacity}"
+        );
+    }
+    // The bound is TIGHT: some position really does need all KPOOL-1 slots, so
+    // the capacity is exactly right rather than merely sufficient.
+    assert_eq!(worst, capacity, "tail capacity must be exactly the worst case");
+    assert_eq!(capacity, 3, "the reference model carries three tail slots");
 }

@@ -529,6 +529,66 @@ impl Glm53Model {
     }
 
     /// Run the whole 234-event walk for one token.
+    /// OBSERVE the conv commit chain, rather than deriving it from reading.
+    ///
+    /// `commit_conv` is justified by a chain nobody has ever watched run:
+    /// `atlas_glm53_kda_conv_finalize` publishes only when
+    /// `logical_lengths == start_position`, and `logical_lengths` is advanced
+    /// only by the commit kernel, so the protocol bootstraps correctly ONLY if
+    /// commit runs every token from position 0. Everything speculative decode
+    /// will be built on rests on that, and it has been read, not measured.
+    ///
+    /// Enabled by `ATLAS_GLM53_COMMIT_PROBE=1`. It runs AFTER the walk's final
+    /// synchronize, so the copies it issues add a readback but never a barrier
+    /// the walk did not already pay for -- and when the variable is unset it
+    /// costs one `OnceLock` read per token.
+    ///
+    /// What to look for: `end` and `len` must BOTH equal position+1 after the
+    /// token at `position`, on all 34 KDA layers, with no layer lagging. A
+    /// layer stuck at 0 means finalize declined; a layer stuck at 1 means it
+    /// published once and the commit never advanced the length after.
+    fn commit_probe(&self, position: u32) -> Result<()> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var("ATLAS_GLM53_COMMIT_PROBE").is_ok_and(|value| value == "1")
+        }) {
+            return Ok(());
+        }
+        let expected = position + 1;
+        let mut word = [0u8; 4];
+        let mut lagging = Vec::new();
+        let mut first = None;
+        for (ordinal, conv) in self.kda_conv.iter().enumerate() {
+            self.gpu.copy_d2h(conv.published_ends_u32.ptr, &mut word)?;
+            let end = u32::from_le_bytes(word);
+            self.gpu.copy_d2h(conv.logical_lengths_u32.ptr, &mut word)?;
+            let length = u32::from_le_bytes(word);
+            if first.is_none() {
+                first = Some((end, length));
+            }
+            if end != expected || length != expected {
+                lagging.push(format!("L{ordinal}(end={end},len={length})"));
+            }
+        }
+        let (end, length) = first.unwrap_or((0, 0));
+        if lagging.is_empty() {
+            eprintln!(
+                "GLM commit probe p{position}: end={end} len={length} on all {} KDA \
+                 layers, expected {expected}: ADVANCING",
+                self.kda_conv.len()
+            );
+        } else {
+            eprintln!(
+                "GLM commit probe p{position}: expected end=len={expected}, {} of {} \
+                 layers disagree: {}",
+                lagging.len(),
+                self.kda_conv.len(),
+                lagging.join(" ")
+            );
+        }
+        Ok(())
+    }
+
     fn walk(&self, token: u32, stream: u64) -> Result<DevicePtr> {
         super::walk_timing::walk(|| self.walk_inner(token, stream))
     }
@@ -627,6 +687,8 @@ impl Glm53Model {
         // A lower bound on real kernel execution, and the term that separates
         // sync-bound from launch-bound.
         super::walk_timing::blocked_final(|| self.gpu.synchronize(stream))?;
+
+        self.commit_probe(position)?;
 
         self.state.lock().unwrap().position = position + 1;
         super::walk_timing::report();

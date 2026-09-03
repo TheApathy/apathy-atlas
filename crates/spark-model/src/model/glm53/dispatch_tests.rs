@@ -9,6 +9,9 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::*;
+
+const TAIL_CAP: usize =
+    spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as usize;
 use crate::layers::{Glm53TargetFfnKind, Glm53TargetGeometry, Glm53TargetSchedule};
 use crate::model::glm53::arena::Glm53ArenaPlan;
 use crate::model::glm53::t1_state_transaction::Glm53T1StateLayout;
@@ -138,6 +141,8 @@ fn fake_tensor(cursor: &mut u64, dims: &[u64], kind: GgmlType) -> GgufDeviceTens
         dimensions: dims.to_vec(),
         ggml_type: kind,
         byte_len,
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(kind, &dims, byte_len)
+            .expect("test tensor slack"),
     }
 }
 
@@ -196,6 +201,8 @@ fn f32_tensor_at(c: &mut u64, dims: &[u64]) -> GgufDeviceTensor {
         dimensions: dims.to_vec(),
         ggml_type: GgmlType::F32,
         byte_len: (elements * 4) as usize,
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(GgmlType::F32, dims, (elements * 4) as usize)
+            .expect("test tensor slack"),
     }
 }
 
@@ -307,10 +314,11 @@ fn attention_binding(gpu: &dyn GpuBackend) -> Glm53AttentionBinding {
                 latent_overlay_bf16: at(512 * 2),
                 pool_keys_bf16: at(pools * 128 * 2),
                 pool_validity_u8: at(pools),
-                prior_tail_keys_bf16: at(3 * 128 * 2),
-                prior_tail_gates_bf16: at(3 * 128 * 2),
-                prior_tail_validity_u8: at(3),
-                out_tail_validity_u8: at(3),
+                // Sized from the constant, never a literal.
+                prior_tail_keys_bf16: at(TAIL_CAP * 128 * 2),
+                prior_tail_gates_bf16: at(TAIL_CAP * 128 * 2),
+                prior_tail_validity_u8: at(TAIL_CAP),
+                out_tail_validity_u8: at(TAIL_CAP),
                 sequence_lengths_u32: at(4),
                 query_positions_u32: at(4),
                 query_validity_u8: at(1),

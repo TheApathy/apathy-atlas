@@ -12,7 +12,8 @@ use super::GgmlIqBuffer;
 
 const INDEX_DIM: u32 = 128;
 const KPOOL: u32 = 4;
-const TAIL_CAPACITY: u32 = KPOOL - 1;
+/// Derived from the single definition in spark-runtime, never restated.
+const TAIL_CAPACITY: u32 = spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY;
 const MAX_TOKENS: u32 = 65_520;
 const MAX_POSITIONS: u32 = 1_048_576;
 const THREADS: u32 = INDEX_DIM;

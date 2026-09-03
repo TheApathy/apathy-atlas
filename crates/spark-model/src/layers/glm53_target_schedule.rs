@@ -14,6 +14,46 @@ const BF16_BYTES: u32 = 2;
 /// its input error ~1.3x/layer, so the two bf16 roundings a layer spent there
 /// dominated the divergence. `hidden_a`/`hidden_b`/`collapsed` stay BF16.
 const STREAM_BYTES: u32 = 4;
+
+/// DELIBERATE-REGRESSION GATE for the f32 mHC streams change.
+///
+/// Flip to `false` to carry the mHC residual streams across a layer boundary at
+/// BF16 precision, which is the pre-fix behaviour this change replaced.
+///
+/// It gates PRECISION, not storage width. `STREAM_BYTES` stays 4 on both sides:
+/// the buffer, the arena, the capture slots and every extent test are identical
+/// in both builds, and the single variable that moves is whether a stream value
+/// survives the layer at f32 or bf16. A storage-width A/B was considered and
+/// rejected -- the four `atlas_glm53_hc_*` kernels are typed `float *`, so
+/// halving `STREAM_BYTES` alone yields a half-length buffer written by f32
+/// stores, i.e. corruption, measuring nothing.
+///
+/// The regression side MUST keep the one-rounding fold in `atlas_glm53_hc_post`.
+/// Restoring the old three-rounding `placement`/`mixed` form would fold a
+/// separate landed fix back in and reconfound exactly the measurement this gate
+/// exists to make.
+///
+/// This exists because the f32-streams change was credited with a correctness
+/// win that in fact belonged to the MMQ activation padding, and it has never
+/// been isolated. Leave this `true` outside the A/B.
+pub const GLM53_F32_MHC_STREAMS: bool = true;
+
+/// Value passed to the two stream-writing kernels: 1 asks them to round.
+pub(crate) const GLM53_STREAM_ROUND_TO_BF16: u32 = !GLM53_F32_MHC_STREAMS as u32;
+
+/// Build-identity marker, force-emitted so `strings` can POSITIVELY name which
+/// side of the gate a binary was built on.
+///
+/// Same reasoning as `ATLAS_MMQ_BUILD_MARKER`: an absence-of-string check is
+/// not evidence, because the optimiser deletes short literals along with the
+/// branches that reference them, and a regression binary would then look
+/// identical to one where the marker was merely renamed.
+#[used]
+static ATLAS_MHC_STREAM_BUILD_MARKER: &str = if GLM53_F32_MHC_STREAMS {
+    "ATLAS_MHC_STREAMS=f32"
+} else {
+    "ATLAS_MHC_STREAMS=bf16-DELIBERATE-REGRESSION"
+};
 const MAX_CHUNK_TOKENS: u32 = 65_520;
 const HIDDEN_SIZE: u32 = 4_096;
 const HC_STREAMS: u32 = 4;
@@ -390,6 +430,20 @@ mod tests {
         let schedule = Glm53TargetSchedule::new(Glm53TargetGeometry::exact(65_520)).unwrap();
         assert_eq!(schedule.workspace.hidden_a.payload_bytes, 536_739_840);
         assert_eq!(schedule.workspace.widened_hc.payload_bytes, 4_293_918_720);
+        // MOVED WITH THE GATE, not deleted. GLM53_F32_MHC_STREAMS gates
+        // PRECISION, so every extent here is INVARIANT across the A/B: the
+        // regression build must produce byte-identical workspace geometry.
+        // Asserted on both sides so a future storage-WIDTH experiment cannot
+        // quietly reuse this gate and slip a second variable into the walk.
+        assert_eq!(
+            schedule.workspace.widened_hc.payload_bytes,
+            u64::from(schedule.workspace.geometry.chunk_tokens)
+                * u64::from(HC_STREAMS)
+                * u64::from(HIDDEN_SIZE)
+                * 4,
+            "mHC stream storage is f32 on BOTH sides of GLM53_F32_MHC_STREAMS"
+        );
+        assert_eq!(STREAM_BYTES, 4);
         assert_eq!(schedule.workspace.hyper_post.payload_bytes, 524_160);
         assert_eq!(schedule.workspace.hyper_comb.payload_bytes, 2_096_640);
         assert_eq!(schedule.workspace.arena_bytes, 5_906_759_168);
@@ -417,6 +471,17 @@ mod tests {
             |geometry: &mut Glm53TargetGeometry| geometry.target_layers = 44,
             |geometry: &mut Glm53TargetGeometry| geometry.stream_element_bytes = 2,
         ];
+        // MOVED WITH THE GATE, not deleted. The `stream_element_bytes = 2`
+        // mutation above stays a forgery on BOTH sides of
+        // GLM53_F32_MHC_STREAMS: the regression build carries bf16 PRECISION
+        // through a buffer that is still f32, so a geometry claiming 2-byte
+        // streams is wrong either way. Pinned explicitly rather than left
+        // implicit, so a future storage-WIDTH experiment has to confront this
+        // assertion instead of quietly reusing the gate.
+        Glm53TargetGeometry::exact(8)
+            .validate()
+            .expect("the exact geometry is valid on both sides of the gate");
+        assert_eq!(Glm53TargetGeometry::exact(8).stream_element_bytes, 4);
         for mutate in mutations {
             let mut geometry = Glm53TargetGeometry::exact(8);
             mutate(&mut geometry);
@@ -425,6 +490,29 @@ mod tests {
         let mut schedule = Glm53TargetSchedule::new(Glm53TargetGeometry::exact(8)).unwrap();
         schedule.workspace.widened_hc.payload_bytes *= 2;
         assert!(schedule.validate().is_err());
+    }
+
+    /// The one thing the gate is allowed to move.
+    ///
+    /// `GLM53_STREAM_ROUND_TO_BF16` is what reaches `atlas_glm53_hc_expand` and
+    /// `atlas_glm53_hc_post`; it must be 0 in the shipping build and 1 only in
+    /// the deliberate regression, and the marker must name the same side.
+    #[test]
+    fn stream_precision_gate_drives_the_kernel_flag_and_the_build_marker() {
+        assert_eq!(
+            GLM53_STREAM_ROUND_TO_BF16,
+            u32::from(!GLM53_F32_MHC_STREAMS)
+        );
+        if GLM53_F32_MHC_STREAMS {
+            assert_eq!(GLM53_STREAM_ROUND_TO_BF16, 0);
+            assert_eq!(ATLAS_MHC_STREAM_BUILD_MARKER, "ATLAS_MHC_STREAMS=f32");
+        } else {
+            assert_eq!(GLM53_STREAM_ROUND_TO_BF16, 1);
+            assert_eq!(
+                ATLAS_MHC_STREAM_BUILD_MARKER,
+                "ATLAS_MHC_STREAMS=bf16-DELIBERATE-REGRESSION"
+            );
+        }
     }
 
     #[test]

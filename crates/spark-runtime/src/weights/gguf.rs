@@ -40,6 +40,13 @@ pub enum GgmlType {
     BF16,
 }
 
+/// K advanced by ONE iteration of the MMQ tile loop (`MMQ_ITER_K` in
+/// `kernels/gb10/qwen3.6-27b/nvfp4/q4k_vendor/mmq.cuh`).
+///
+/// Single owner: `spark_model`'s copy is bound to this one rather than spelled
+/// again, so the two cannot drift.
+pub const MMQ_ITER_K: u64 = 256;
+
 impl GgmlType {
     pub(super) fn from_raw(raw: u32) -> Result<Self> {
         Ok(match raw {
@@ -107,6 +114,41 @@ impl GgmlType {
 
     pub(super) fn block_size(self) -> u64 {
         self.layout().0
+    }
+
+    /// Bytes an MMQ weight tensor must own PAST its last row, on top of
+    /// [`Self::byte_len`].
+    ///
+    /// `load_tiles_*` consumes a whole [`MMQ_ITER_K`] of K per tile iteration
+    /// and the loop is never sliced, so a row whose K is not a multiple of
+    /// `MMQ_ITER_K` has its final iteration read on past the row end. For every
+    /// row but the last that lands in the next row; for the LAST row it lands
+    /// past the allocation, and each GLM-5.3 tensor is its own `gpu.alloc`.
+    ///
+    /// The overrun is indexed by BLOCK, not by row, so `need_check` -- which
+    /// clamps only the row index `i` -- does not bound it. Concretely
+    /// `load_tiles_q8_0` reads `bxi[0]` and `bxi[MMQ_TILE_NE_K/QI8_0]` with
+    /// `kbx` running to 3, i.e. blocks 0..=7 of a row that holds 4 at K=128.
+    ///
+    /// Host-side activation padding makes the overread contribute exactly zero
+    /// to the result, but it does not stop the read. This is the fix that does.
+    ///
+    /// Zero for every type whose block already spans `MMQ_ITER_K` (all the
+    /// K-quants and IQ types) and for unquantized types, which never reach the
+    /// MMQ path: across GLM-5.3 it is nonzero on the two K=128 Q8_0 low-rank
+    /// gate projections and nowhere else.
+    pub fn mmq_weight_tail_slack_bytes(self, k: u64) -> Result<u64> {
+        let (block, bytes) = self.layout();
+        if block <= 1 || block >= MMQ_ITER_K || k == 0 || !k.is_multiple_of(block) {
+            return Ok(0);
+        }
+        let blocks_per_row = k / block;
+        let blocks_per_iter = MMQ_ITER_K / block;
+        blocks_per_row
+            .checked_next_multiple_of(blocks_per_iter)
+            .and_then(|padded| padded.checked_sub(blocks_per_row))
+            .and_then(|slack_blocks| slack_blocks.checked_mul(bytes))
+            .context("GGUF MMQ weight tail slack overflow")
     }
 
     pub(super) fn byte_len(self, elements: u64) -> Result<u64> {
@@ -205,6 +247,7 @@ pub use decode::read_gguf_header;
 pub use device::{
     GgufDeviceLoadError, GgufDeviceStore, GgufDeviceStoreFreeError, GgufDeviceTensor,
     load_glm53_iq3_store, load_glm53_iq3_tensor, load_glm53_store, load_glm53_tensor,
+    mmq_tensor_alloc_bytes,
 };
 pub use glm53::{
     GLM53_GGUF_REVISION, GLM53_GGUF_VOCAB_SIZE, Glm53GgufSummary, Glm53Iq3Summary, Glm53QuantProfile, open_glm53_files,

@@ -5,6 +5,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
 use super::GgmlIqBuffer;
+use crate::layers::glm53_target_schedule::GLM53_STREAM_ROUND_TO_BF16;
 
 const HIDDEN: u32 = 4096;
 const HC: u32 = 4;
@@ -141,6 +142,7 @@ impl Glm53HyperKernels {
             .arg_ptr(streams_f32.ptr)
             .arg_u32(HIDDEN)
             .arg_u32(HC)
+            .arg_u32(GLM53_STREAM_ROUND_TO_BF16)
             .launch(stream)
     }
 
@@ -215,6 +217,7 @@ impl Glm53HyperKernels {
             .arg_ptr(buffers.output_streams_f32.ptr)
             .arg_u32(HIDDEN)
             .arg_u32(HC)
+            .arg_u32(GLM53_STREAM_ROUND_TO_BF16)
             .launch(stream)
     }
 

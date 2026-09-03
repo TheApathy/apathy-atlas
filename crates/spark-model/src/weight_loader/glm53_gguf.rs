@@ -14,6 +14,37 @@ use spark_runtime::weights::gguf::{GgmlType, GgufDeviceTensor};
 
 use crate::layers::ops::{GgmlIqBuffer, GgmlIqMmqPlan};
 
+/// ENFORCED: the device allocation behind an MMQ weight must extend past its
+/// last row by the tail slack the tile loop reads.
+///
+/// `load_tiles_*` consumes a whole `MMQ_ITER_K` of K per iteration and clamps
+/// only the ROW index, so a matrix whose K is short of that has its last row
+/// read on past the payload -- and each GLM-5.3 tensor is its own `gpu.alloc`,
+/// so that is past the allocation, not into a neighbour. `load_glm53_tensor`
+/// allocates the slack; this refuses to build a view over an allocation that
+/// did not. Activation padding makes the overread contribute zero, but a check
+/// that only holds while a SEPARATE gate is on is not a check.
+fn require_mmq_tail_slack(
+    what: &str,
+    kind: GgmlType,
+    inner: u32,
+    payload_bytes: usize,
+    alloc_bytes: usize,
+) -> Result<()> {
+    let slack = usize::try_from(kind.mmq_weight_tail_slack_bytes(u64::from(inner))?)?;
+    let required = payload_bytes
+        .checked_add(slack)
+        .context("GLM GGUF MMQ tail slack overflow")?;
+    if alloc_bytes < required {
+        bail!(
+            "{what} at K={inner} is allocated {alloc_bytes} bytes but the MMQ tile loop reads \
+             {required} ({payload_bytes} payload + {slack} tail slack); the loader did not \
+             reserve the slack"
+        );
+    }
+    Ok(())
+}
+
 /// One `[K, N]` GGUF tensor ready for the dense IQ-MMQ primitive.
 pub struct Glm53GgufMatrix {
     buffer: GgmlIqBuffer,
@@ -43,13 +74,21 @@ impl Glm53GgufMatrix {
             u32::try_from(tensor.dimensions[0]).context("GLM GGUF matrix K exceeds kernel ABI")?;
         let columns =
             u32::try_from(tensor.dimensions[1]).context("GLM GGUF matrix N exceeds kernel ABI")?;
-        Self::from_parts(
+        let matrix = Self::from_parts(
             tensor.ptr,
             tensor.byte_len,
             tensor.ggml_type,
             inner,
             columns,
-        )
+        )?;
+        require_mmq_tail_slack(
+            "GLM GGUF matrix",
+            tensor.ggml_type,
+            inner,
+            matrix.buffer.bytes,
+            tensor.alloc_bytes,
+        )?;
+        Ok(matrix)
     }
 
     fn from_parts(
@@ -148,6 +187,13 @@ impl Glm53GgufExperts {
             bail!("GLM GGUF experts require at least one expert");
         }
         let expert_bytes = GgmlIqMmqPlan::new(tensor.ggml_type, 1, columns, inner)?.weight_bytes;
+        require_mmq_tail_slack(
+            "GLM GGUF expert bank",
+            tensor.ggml_type,
+            inner,
+            tensor.byte_len,
+            tensor.alloc_bytes,
+        )?;
         let total_bytes = expert_bytes
             .checked_mul(usize::try_from(experts)?)
             .context("GLM GGUF packed expert byte count overflow")?;

@@ -199,7 +199,7 @@ fn generation_exhaustion_retains_the_owned_live_slot() {
 }
 
 const SOURCE: &str = include_str!("glm53_dsa.rs");
-const SOURCE_SHA256: &str = "b291a719db2aaf0bfdaadeec89d9b7d06b634a8eece216805b61fb15e2552c40";
+const SOURCE_SHA256: &str = "23c65d811f2158041f87d59a9e7090af14d9fc406b244294c5465f7e5f68695a";
 
 const ENTRY: &str = r#"    fn entry(&self, handle: Glm53DsaSequenceHandle) -> Result<&Slot> {
         if handle.device_identity != self.device_identity {

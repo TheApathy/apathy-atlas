@@ -11,7 +11,7 @@ use super::{
 mod debug_source_sha256;
 
 const RAW_SOURCE: &str = include_str!("glm53_gguf.rs");
-const RAW_SOURCE_SHA256: &str = "486af64bca1c8b5e2e1c1b8aa33bf6bfcedca24be06523255fc21338b8cabfbe";
+const RAW_SOURCE_SHA256: &str = "45fb89514148b811ebd9c2f70c8a398c803b9a972dbe0f5b3a07d38b1f7c95b8";
 
 fn derive_is_not_copy(source: &str, declaration: &str) -> bool {
     let end = source.find(declaration).unwrap();
@@ -331,6 +331,79 @@ fn tensor(ptr: u64, dimensions: &[u64], ggml_type: GgmlType, byte_len: usize) ->
         dimensions: dimensions.to_vec(),
         ggml_type,
         byte_len,
+        // Derived exactly as the loader derives it. Hardcoding a number here
+        // would defeat the point of tracking the slack separately.
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(
+            ggml_type, dimensions, byte_len,
+        )
+        .expect("test tensor slack"),
+    }
+}
+
+/// The MMQ tail-slack guard must FIRE, not merely exist.
+///
+/// A K=128 Q8_0 matrix is the shape whose last row the tile loop reads past
+/// (4 blocks, 136 bytes). Handed an allocation that covers only the payload --
+/// i.e. a loader that forgot the slack -- building the view must fail. This is
+/// the test that breaks if someone removes the slack term from
+/// `mmq_tensor_alloc_bytes`, which is exactly how it was verified.
+#[test]
+fn short_k_mmq_weight_without_tail_slack_is_refused() {
+    let payload = 8192 * 4 * 34;
+
+    // FIRST, and independent of the loader: the guard's own behaviour. This
+    // `starved` tensor sets alloc_bytes by hand, so it exercises
+    // `require_mmq_tail_slack` whether or not the loader is correct.
+    let starved = GgufDeviceTensor {
+        alloc_bytes: payload,
+        ..tensor(0x2000, &[128, 8192], GgmlType::Q8_0, payload)
+    };
+    let error = Glm53GgufMatrix::new(&starved)
+        .expect_err("an allocation without tail slack must be refused")
+        .to_string();
+    assert!(
+        error.contains("tail slack"),
+        "guard must name the slack it is missing, got: {error}"
+    );
+
+    // THEN the loader's contribution. `tensor` derives alloc_bytes exactly as
+    // `load_glm53_tensor` does, so if the loader's slack term is removed this
+    // view stops building -- and it fails with the guard's message, which is
+    // how the guard was proven to fire.
+    let honest = tensor(0x2000, &[128, 8192], GgmlType::Q8_0, payload);
+    Glm53GgufMatrix::new(&honest)
+        .expect("a loader-derived allocation must satisfy the guard it feeds");
+    assert_eq!(
+        honest.alloc_bytes - honest.byte_len,
+        136,
+        "K=128 Q8_0 must reserve 4 blocks of tail slack"
+    );
+}
+
+/// The slack rule itself, at the boundaries that decide it.
+///
+/// Nonzero only where the block is narrower than MMQ_ITER_K AND K does not
+/// already fill a whole tile iteration. Computed over the real UD-IQ2_XXS
+/// checkpoint this is 68 tensors -- `ssm_f_b` and `ssm_g_b` on each of 34
+/// layers, 136 B apiece -- and zero on the other 1344.
+#[test]
+fn mmq_tail_slack_is_nonzero_only_for_short_k_block32_weights() {
+    for (kind, k, expected) in [
+        (GgmlType::Q8_0, 128, 136),
+        (GgmlType::Q8_0, 384, 136),
+        (GgmlType::Q8_0, 256, 0),
+        (GgmlType::Q8_0, 4096, 0),
+        (GgmlType::Q5_K, 4096, 0),
+        (GgmlType::IQ2_XXS, 4096, 0),
+        (GgmlType::IQ3_S, 512, 0),
+        (GgmlType::F32, 64, 0),
+        (GgmlType::BF16, 128, 0),
+    ] {
+        assert_eq!(
+            kind.mmq_weight_tail_slack_bytes(k).unwrap(),
+            expected,
+            "{kind:?} at K={k}"
+        );
     }
 }
 

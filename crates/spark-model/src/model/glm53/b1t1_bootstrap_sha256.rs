@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-const CANONICAL: &str = "57b8a74e10b34b734df3ce6f770f459c421a204ca6bef2005620f62060964bf6";
+const CANONICAL: &str = "e85d6a9cba63289590f55a96b2ea18e722381ce11087b38548667c03af75d1ab";
 const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];

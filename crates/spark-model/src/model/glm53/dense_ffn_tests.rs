@@ -105,6 +105,8 @@ fn tensor(cursor: &mut u64, dims: &[u64], kind: GgmlType) -> GgufDeviceTensor {
         dimensions: dims.to_vec(),
         ggml_type: kind,
         byte_len: plan.weight_bytes,
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(kind, &dims, plan.weight_bytes)
+            .expect("test tensor slack"),
     }
 }
 

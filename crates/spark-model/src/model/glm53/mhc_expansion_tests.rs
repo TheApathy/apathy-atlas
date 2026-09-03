@@ -98,6 +98,12 @@ fn function_tensor(address: u64) -> GgufDeviceTensor {
         dimensions: vec![16384, 24],
         ggml_type: GgmlType::Q8_0,
         byte_len: 16384 * 24 / 32 * 34_usize,
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(
+            GgmlType::Q8_0,
+            &[16384, 24],
+            16384 * 24 / 32 * 34_usize,
+        )
+        .expect("test tensor slack"),
     }
 }
 
@@ -107,6 +113,14 @@ fn f32_tensor(address: u64, elements: u64) -> GgufDeviceTensor {
         dimensions: vec![elements],
         ggml_type: GgmlType::F32,
         byte_len: (elements * 4) as usize,
+        // Rank-1 F32: never an MMQ weight, so the slack is zero -- routed
+        // through the loader's own helper rather than hardcoding 0.
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(
+            GgmlType::F32,
+            &[elements],
+            (elements * 4) as usize,
+        )
+        .expect("F32 fixture slack"),
     }
 }
 

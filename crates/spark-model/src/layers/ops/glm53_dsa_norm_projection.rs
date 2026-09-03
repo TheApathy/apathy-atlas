@@ -214,8 +214,12 @@ fn validate_buffers(
         ("bias", buffers.bias_f32, plan.bias_bytes, 4),
         ("output", buffers.output_bf16, plan.output_bytes, 2),
     ];
-    let mut ranges = [(0u64, 0u64); 4];
-    for (slot, (name, buffer, expected, alignment)) in named.iter().copied().enumerate() {
+    // Sized from the table it mirrors, never a literal: a hand-written
+    // length silently goes out of bounds the moment the table grows. Only
+    // present buffers are pushed, so the overlap scan no longer has to
+    // recognise an absent one by an empty-range sentinel.
+    let mut ranges = Vec::with_capacity(named.len());
+    for (name, buffer, expected, alignment) in named.iter().copied() {
         if buffer.bytes != expected
             || (expected == 0 && buffer.ptr != DevicePtr::NULL)
             || (expected != 0 && (buffer.ptr == DevicePtr::NULL || buffer.ptr.0 % alignment != 0))
@@ -228,18 +232,12 @@ fn validate_buffers(
                 .0
                 .checked_add(u64::try_from(expected)?)
                 .with_context(|| format!("GLM DSA norm/projection {name} address overflow"))?;
-            ranges[slot] = (buffer.ptr.0, end);
+            ranges.push((buffer.ptr.0, end));
         }
     }
     for left in 0..ranges.len() {
-        if ranges[left].0 == ranges[left].1 {
-            continue;
-        }
         for right in left + 1..ranges.len() {
-            if ranges[right].0 != ranges[right].1
-                && ranges[left].0 < ranges[right].1
-                && ranges[right].0 < ranges[left].1
-            {
+            if ranges[left].0 < ranges[right].1 && ranges[right].0 < ranges[left].1 {
                 bail!("GLM DSA norm/projection device buffers overlap");
             }
         }

@@ -17,7 +17,28 @@ pub const GLM53_DSA_KPOOL: u32 = 4;
 pub const GLM53_DSA_RUNTIME_KERNEL_IMPLEMENTED: bool = false;
 const MAX_POSITIONS: usize = GLM53_DSA_MAX_POSITIONS as usize;
 const POOL_CAPACITY: usize = MAX_POSITIONS / GLM53_DSA_KPOOL as usize;
-const TAIL_CAPACITY: usize = GLM53_DSA_KPOOL as usize - 1;
+/// Slots the raw index tail must hold. THE definition -- every other site
+/// derives from this one rather than restating `KPOOL - 1`.
+///
+/// It is KPOOL-1, and the derivation is exact. A pool completes once its last
+/// position has arrived and the walk publishes that pool's row into the cache
+/// BEFORE score/topk, so the count of pools visible to the scorer at position
+/// q is `(q + 1) / KPOOL` and pooled coverage ends at KPOOL*pools - 1. The
+/// tail carries the remainder, `(q + 1) - KPOOL*pools = (q + 1) mod KPOOL`,
+/// whose maximum is KPOOL-1. The current position itself never needs a tail
+/// slot: it enters selection through the query metadata and the causal mask.
+///
+/// A capacity of KPOOL looks necessary under the OLD pool count `q / KPOOL`,
+/// which excluded the pool completing on this very step and left its group
+/// with nowhere to live. Raising the capacity would have papered over that and
+/// diverged from the reference: GLM5Next carries three tail slots, pinned here
+/// as `OUTPUT_WIDTH = INDEX_TOPK + KPOOL - 1 = 2051` and in the reference model
+/// at `glm53_dsa_topk_tests.rs`, which covers q = 7 as pools {0,1} plus a
+/// three-slot tail plus the current position. The pool count was the wrong
+/// half, not this constant.
+pub const GLM53_DSA_TAIL_CAPACITY: u32 = GLM53_DSA_KPOOL - 1;
+
+const TAIL_CAPACITY: usize = GLM53_DSA_TAIL_CAPACITY as usize;
 const REGION_ALIGNMENT: usize = 256;
 static NEXT_DEVICE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 

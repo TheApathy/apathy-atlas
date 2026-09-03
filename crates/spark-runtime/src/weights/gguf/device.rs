@@ -16,7 +16,53 @@ pub struct GgufDeviceTensor {
     pub ptr: DevicePtr,
     pub dimensions: Vec<u64>,
     pub ggml_type: GgmlType,
+    /// Logical payload: the exact GGUF byte length, and the extent every
+    /// consumer's shape check compares against.
     pub byte_len: usize,
+    /// What was actually handed to `gpu.alloc`, which is `byte_len` plus the
+    /// MMQ tail slack from [`mmq_tensor_alloc_bytes`]. Recorded rather than
+    /// re-derived: a derived value could not catch a loader that forgot the
+    /// slack, which is the whole point of tracking it. Residency accounting
+    /// sums THIS, never `byte_len` -- an allocation that grows without
+    /// preflight seeing it is how a GB10 host gets killed.
+    ///
+    /// SETTING THIS IN A TEST FIXTURE: derive it, never write a literal --
+    ///
+    ///     alloc_bytes: mmq_tensor_alloc_bytes(kind, dims, byte_len)?
+    ///
+    /// A fixture that hardcodes `byte_len` (or a number that happens to match
+    /// today) silently stops modelling the allocation the loader really makes,
+    /// and `require_mmq_tail_slack` in spark-model then either fires on a
+    /// correct loader or, worse, passes on a broken one. Deriving it also means
+    /// the fixture keeps telling the truth if the tensor's dtype or K changes.
+    /// Adding this field to a fixture is per-site work: the surrounding helpers
+    /// name their locals differently (`kind` vs `ggml_type`, `dims` vs
+    /// `dimensions`, and payloads called `per`, `plan.weight_bytes` or
+    /// `(elements * 4) as usize`), so a find/replace across call sites does not
+    /// compile at any of them.
+    pub alloc_bytes: usize,
+}
+
+/// Bytes to allocate for one GGUF tensor: its payload plus the MMQ tail slack
+/// its shape requires.
+///
+/// The slack rule is [`GgmlType::mmq_weight_tail_slack_bytes`]; K is the first
+/// GGUF dimension. Only rank-2 tensors can reach the MMQ weight path, so
+/// nothing else is widened.
+pub fn mmq_tensor_alloc_bytes(
+    ggml_type: GgmlType,
+    dimensions: &[u64],
+    byte_len: usize,
+) -> anyhow::Result<usize> {
+    let slack = match dimensions {
+        // K is the first GGUF dimension for both a [K, N] matrix and a packed
+        // [K, N, E] expert bank, whose LAST expert overreads past the pack.
+        [k, _] | [k, _, _] => ggml_type.mmq_weight_tail_slack_bytes(*k)?,
+        _ => 0,
+    };
+    byte_len
+        .checked_add(usize::try_from(slack)?)
+        .context("GGUF tensor allocation size overflow")
 }
 
 /// Complete admitted GGUF directory resident as raw device tensors.
@@ -24,6 +70,7 @@ pub struct GgufDeviceTensor {
 pub struct GgufDeviceStore {
     tensors: BTreeMap<String, GgufDeviceTensor>,
     total_bytes: usize,
+    allocated_bytes: usize,
 }
 
 /// A store teardown that retains every allocation whose free failed.
@@ -184,9 +231,11 @@ impl fmt::Display for GgufDeviceStoreFreeError {
 impl GgufDeviceStore {
     fn one(name: String, tensor: GgufDeviceTensor) -> Self {
         let total_bytes = tensor.byte_len;
+        let allocated_bytes = tensor.alloc_bytes;
         Self {
             tensors: BTreeMap::from([(name, tensor)]),
             total_bytes,
+            allocated_bytes,
         }
     }
 
@@ -206,8 +255,18 @@ impl GgufDeviceStore {
         self.tensors.is_empty()
     }
 
+    /// Sum of the tensors' LOGICAL payloads. This is the figure the admitted
+    /// checkpoint pins and `load_glm53_store` compares for equality, so it must
+    /// never absorb the MMQ tail slack -- use [`Self::allocated_bytes`] for
+    /// anything that asks how much device memory is actually held.
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    /// Sum of what was actually handed to `gpu.alloc`: payload plus MMQ tail
+    /// slack. This, not [`Self::total_bytes`], is the residency figure.
+    pub fn allocated_bytes(&self) -> usize {
+        self.allocated_bytes
     }
 
     /// Attempt every free. Successful allocations are removed; failed ones
@@ -234,6 +293,10 @@ impl GgufDeviceStore {
                         .total_bytes
                         .checked_sub(released.byte_len)
                         .expect("device-store byte accounting must remain valid");
+                    self.allocated_bytes = self
+                        .allocated_bytes
+                        .checked_sub(released.alloc_bytes)
+                        .expect("device-store allocation accounting must remain valid");
                 }
                 Err(error) => {
                     failed_tensors += 1;
@@ -269,7 +332,13 @@ pub fn load_glm53_tensor(
             "admitted GGUF tensor has an empty payload"
         )));
     }
-    let ptr = gpu.alloc(byte_len).map_err(GgufDeviceLoadError::new)?;
+    // The MMQ tile loop reads a whole MMQ_ITER_K of K past a short row, so the
+    // allocation -- not just the copy -- has to cover it. The copy below still
+    // writes exactly `byte_len`; the slack is never read for its contents, only
+    // multiplied by zero-padded activations.
+    let alloc_bytes = mmq_tensor_alloc_bytes(info.ggml_type, &info.dimensions, byte_len)
+        .map_err(GgufDeviceLoadError::new)?;
+    let ptr = gpu.alloc(alloc_bytes).map_err(GgufDeviceLoadError::new)?;
     let mut scratch = vec![0u8; byte_len.min(COPY_CHUNK_BYTES)];
     let copied = files.stream_tensor(name, &mut scratch, |offset, bytes| {
         let offset = usize::try_from(offset).context("GGUF device offset overflow")?;
@@ -285,6 +354,7 @@ pub fn load_glm53_tensor(
             dimensions: info.dimensions,
             ggml_type: info.ggml_type,
             byte_len,
+            alloc_bytes,
         };
         return Err(attach_cleanup(
             GgufDeviceLoadError::new(copy_error),
@@ -297,6 +367,7 @@ pub fn load_glm53_tensor(
         dimensions: info.dimensions,
         ggml_type: info.ggml_type,
         byte_len,
+        alloc_bytes,
     })
 }
 
@@ -308,8 +379,29 @@ pub fn load_glm53_store(
 ) -> std::result::Result<GgufDeviceStore, GgufDeviceLoadError> {
     let expected = usize::try_from(files.summary().tensor_bytes)
         .context("admitted GGUF payload is too large to address")?;
+    // Preflight must ask for what will actually be ALLOCATED, not what the
+    // checkpoint's payload weighs: every MMQ weight whose K is short of
+    // MMQ_ITER_K is allocated with tail slack. Small on GLM-5.3, but an
+    // allocation that grows without preflight seeing it is exactly how this
+    // host gets killed.
+    let slack: usize = files
+        .tensor_names()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|name| {
+            let info = &files
+                .tensor(name)
+                .context("admitted tensor vanished between summary and preflight")?
+                .info;
+            let byte_len =
+                usize::try_from(info.byte_len).context("GGUF tensor is too large to address")?;
+            Ok(mmq_tensor_alloc_bytes(info.ggml_type, &info.dimensions, byte_len)? - byte_len)
+        })
+        .sum::<anyhow::Result<usize>>()?;
     let required = expected
-        .checked_add(reserve_bytes)
+        .checked_add(slack)
+        .and_then(|payload| payload.checked_add(reserve_bytes))
         .context("GGUF payload plus reserve overflows address space")?;
     let free = gpu.free_memory()?;
     if required > free {
@@ -359,6 +451,7 @@ pub fn load_glm53_store(
         ));
     }
     Ok(GgufDeviceStore {
+        allocated_bytes: tensors.values().map(|tensor| tensor.alloc_bytes).sum(),
         tensors,
         total_bytes,
     })
@@ -401,6 +494,7 @@ fn rollback_error(
     attach_cleanup(
         error,
         GgufDeviceStore {
+            allocated_bytes: tensors.values().map(|tensor| tensor.alloc_bytes).sum(),
             tensors,
             total_bytes,
         },
