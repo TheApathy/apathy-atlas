@@ -362,3 +362,39 @@ fn no_two_per_layer_state_bindings_overlap() {
         );
     }
 }
+
+/// A SECOND CONCURRENT SEQUENCE IS REFUSED, and the slot is reusable after
+/// release.
+///
+/// `reset_sequence` makes SEQUENTIAL requests independent. It does nothing for
+/// CONCURRENT ones: the arena is planned for batch 1 and there is a single
+/// position counter behind one mutex, so two live sequences would interleave
+/// into the same state with no error at all. Both halves are needed -- the
+/// reset alone leaves concurrency corrupting silently, the refusal alone leaves
+/// the cross-request contamination unfixed.
+///
+/// This pins the counter without a device; `claim_sequence` touches no GPU.
+#[test]
+fn a_second_concurrent_sequence_is_refused_and_the_slot_is_reusable() {
+    let live = std::sync::atomic::AtomicUsize::new(0);
+    let held = || live.load(std::sync::atomic::Ordering::Acquire);
+
+    assert!(claim_only_sequence_slot(&live).is_ok(), "the first sequence must be admitted");
+    let refusal = claim_only_sequence_slot(&live).unwrap_err().to_string();
+    assert!(refusal.contains("ONE sequence at a time"), "{refusal}");
+    assert!(refusal.contains("batch 1"), "{refusal}");
+    // The failed claim must not leak its speculative increment, or one refusal
+    // poisons the slot for the life of the process.
+    assert_eq!(held(), 1);
+
+    release_only_sequence_slot(&live);
+    assert_eq!(held(), 0);
+    assert!(claim_only_sequence_slot(&live).is_ok(), "the slot must be reusable");
+
+    release_only_sequence_slot(&live);
+    // Release at zero SATURATES rather than wrapping to usize::MAX, which would
+    // refuse every subsequent request forever.
+    release_only_sequence_slot(&live);
+    assert_eq!(held(), 0);
+    assert!(claim_only_sequence_slot(&live).is_ok());
+}

@@ -11,7 +11,7 @@ use super::{
 mod debug_source_sha256;
 
 const RAW_SOURCE: &str = include_str!("glm53_gguf.rs");
-const RAW_SOURCE_SHA256: &str = "45fb89514148b811ebd9c2f70c8a398c803b9a972dbe0f5b3a07d38b1f7c95b8";
+const RAW_SOURCE_SHA256: &str = "dbd3cbbed0d5c32c94a2968c65221cc525f30b69bf09489cb884b24092d234fc";
 
 fn derive_is_not_copy(source: &str, declaration: &str) -> bool {
     let end = source.find(declaration).unwrap();

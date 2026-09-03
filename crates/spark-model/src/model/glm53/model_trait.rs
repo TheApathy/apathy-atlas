@@ -107,6 +107,11 @@ impl Model for Glm53Model {
     }
 
     fn alloc_sequence(&self) -> Result<SequenceState> {
+        // Claimed HERE and released in `free_sequence`, so a second concurrent
+        // sequence is refused before it can touch any state. `prefill` is the
+        // wrong place: sequential requests both prefill, and claiming there
+        // would refuse the working case.
+        self.claim_sequence()?;
         Ok(SequenceState {
             adapter_id: 0,
             adapter_slot: -1,
@@ -164,8 +169,10 @@ impl Model for Glm53Model {
     }
 
     fn free_sequence(&self, _seq: &mut SequenceState) -> Result<()> {
-        // The one sequence's state lives in the arena for the model's lifetime;
-        // there is no per-sequence allocation to release.
+        // No per-sequence ALLOCATION to release -- the state lives in the arena
+        // for the model's lifetime -- but the single sequence slot claimed in
+        // `alloc_sequence` is released here so the next request can have it.
+        self.release_sequence();
         Ok(())
     }
 

@@ -60,6 +60,7 @@ const DSA_TAIL_BYTES: u64 =
 const KDA_OFFSET: usize = MOE_SCRATCH.len() + DENSE_SCRATCH.len();
 const DSA_OFFSET: usize = KDA_OFFSET + KDA_SCRATCH.len();
 const ROUTER_DIAG_OFFSET: usize = DSA_OFFSET + DSA_SCRATCH.len();
+const GROUPED_MOE_OFFSET: usize = ROUTER_DIAG_OFFSET + ROUTER_DIAG_SCRATCH.len();
 
 // Documents the invariant and fails the build loudly if anyone reintroduces a
 // literal, or grows a table without noticing what it shifts.
@@ -68,6 +69,8 @@ const _: () = {
     assert!(DSA_OFFSET == 32);
     assert!(ROUTER_DIAG_OFFSET == 52);
     assert!(ROUTER_DIAG_OFFSET + ROUTER_DIAG_SCRATCH.len() == 54);
+    assert!(GROUPED_MOE_OFFSET == 54);
+    assert!(GROUPED_MOE_OFFSET + GROUPED_MOE_SCRATCH.len() == 58);
 };
 
 /// Exact extents `Glm53SerialMoeKernels::execute` requires, in placement order.
@@ -160,6 +163,30 @@ const DSA_SCRATCH: [(&str, u64); 20] = [
 /// onto `bound[..]`, so adding these anywhere earlier would silently rebind
 /// every slot after them -- route_ids_u32 included -- to the wrong buffer.
 /// Appending is what keeps the existing indices meaning what they say.
+/// Extents the GROUPED MoE path needs, chained LAST so that adding them shifts
+/// no existing `bound[]` index.
+///
+/// Appending to MOE_SCRATCH instead would move DENSE, KDA, DSA and the router
+/// diagnostics by four slots each, silently rebinding every one of them to a
+/// neighbour. That is the failure the derived offsets above exist to prevent,
+/// and a new table is how you avoid it rather than merely detect it.
+///
+/// The serial seam sizes gate/up/swiglu for ONE expert and reuses them per
+/// slot; the grouped path runs all TOP_K at once and needs TOP_K of each.
+/// EXPERT_INTERMEDIATE is 2048, so 8 * 2048 * 2 = 32,768 bytes apiece.
+///
+/// The down projection is the one that is NOT shared: each slot consumes its
+/// own swiglu row, so its quantized activation is TOP_K blocks back to back.
+/// Down's inner extent is EXPERT_INTERMEDIATE, and the MMQ activation formula
+/// this file already uses for the dense path is (inner / 128) * 144, giving
+/// (2048 / 128) * 144 = 2,304 per block and 8 * 2,304 = 18,432.
+const GROUPED_MOE_SCRATCH: [(&str, u64); 4] = [
+    ("grouped_gate_bf16", 32_768),
+    ("grouped_up_bf16", 32_768),
+    ("grouped_swiglu_bf16", 32_768),
+    ("grouped_down_q8", 18_432),
+];
+
 const ROUTER_DIAG_SCRATCH: [(&str, u64); 2] = [
     ("router_probs_f32", 1_152),
     ("router_biased_f32", 1_152),
@@ -183,6 +210,10 @@ pub struct Glm53WalkScratch {
     expert_gate_bf16: GgmlIqBuffer,
     expert_up_bf16: GgmlIqBuffer,
     expert_swiglu_bf16: GgmlIqBuffer,
+    grouped_gate_bf16: GgmlIqBuffer,
+    grouped_up_bf16: GgmlIqBuffer,
+    grouped_swiglu_bf16: GgmlIqBuffer,
+    grouped_down_q8: GgmlIqBuffer,
     routed_bf16: GgmlIqBuffer,
     shared_gate_bf16: GgmlIqBuffer,
     shared_up_bf16: GgmlIqBuffer,
@@ -290,6 +321,7 @@ impl Glm53WalkScratch {
             .chain(KDA_SCRATCH.iter())
             .chain(DSA_SCRATCH.iter())
             .chain(ROUTER_DIAG_SCRATCH.iter())
+            .chain(GROUPED_MOE_SCRATCH.iter())
             .copied()
         {
             let offset = align_up(cursor);
@@ -319,6 +351,10 @@ impl Glm53WalkScratch {
             expert_gate_bf16: bound[4],
             expert_up_bf16: bound[5],
             expert_swiglu_bf16: bound[6],
+            grouped_gate_bf16: bound[GROUPED_MOE_OFFSET],
+            grouped_up_bf16: bound[GROUPED_MOE_OFFSET + 1],
+            grouped_swiglu_bf16: bound[GROUPED_MOE_OFFSET + 2],
+            grouped_down_q8: bound[GROUPED_MOE_OFFSET + 3],
             routed_bf16: bound[7],
             shared_gate_bf16: bound[8],
             shared_up_bf16: bound[9],
@@ -447,6 +483,7 @@ impl Glm53WalkScratch {
             .chain(KDA_SCRATCH.iter())
             .chain(DSA_SCRATCH.iter())
             .chain(ROUTER_DIAG_SCRATCH.iter())
+            .chain(GROUPED_MOE_SCRATCH.iter())
         {
             cursor = align_up(cursor) + bytes;
         }

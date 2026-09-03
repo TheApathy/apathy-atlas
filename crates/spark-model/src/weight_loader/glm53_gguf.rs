@@ -246,6 +246,32 @@ impl Glm53GgufExperts {
         )
     }
 
+    /// The bank as the grouped MoE kernel addresses it: the whole packed
+    /// extent as a device BUFFER, plus the geometry a uniform stride implies.
+    ///
+    /// A `GgmlIqBuffer` rather than a bare `DevicePtr` deliberately. This file
+    /// is under a source contract precisely to stop raw device addresses
+    /// leaking out of it, and handing back the sanctioned wrapper keeps base
+    /// and extent as one consistent pair instead of two arguments that can
+    /// disagree. `pub(crate)`, matching `Glm53GgufMatrix::buffer`.
+    ///
+    /// The grouped type is NOT constructed here: its uniform-stride guard
+    /// belongs at the launch site, where a future layout change has to pass it
+    /// again rather than inherit a blessing granted once at load.
+    pub(crate) fn grouped_parts(&self) -> (GgmlIqBuffer, GgmlType, u32, u32, u32, usize) {
+        (
+            GgmlIqBuffer {
+                ptr: self.base,
+                bytes: self.total_bytes,
+            },
+            self.kind,
+            self.inner,
+            self.columns,
+            self.experts,
+            self.expert_bytes,
+        )
+    }
+
     pub fn len(&self) -> u32 {
         self.experts
     }

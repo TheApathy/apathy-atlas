@@ -127,6 +127,16 @@ pub struct Glm53Model {
     capacity: u32,
     plan: Glm53ArenaPlan,
     state: Mutex<Glm53WalkState>,
+    /// Sequences the scheduler currently holds against this model.
+    ///
+    /// The arena is planned for batch 1: `Glm53ArenaPlan::for_context` sizes
+    /// every region for ONE sequence and there is a single `Glm53WalkState`
+    /// behind one mutex, so two concurrent sequences would interleave one
+    /// position counter with no error at all. `reset_sequence` fixes
+    /// SEQUENTIAL reuse; this refuses CONCURRENT use. Shipping either alone
+    /// leaves a hole: the reset without this leaves concurrency corrupting
+    /// silently, this without the reset leaves the contamination unfixed.
+    live_sequences: std::sync::atomic::AtomicUsize,
 }
 
 impl Glm53Model {
@@ -264,6 +274,7 @@ impl Glm53Model {
             token_ids,
             capacity: positions,
             plan,
+            live_sequences: std::sync::atomic::AtomicUsize::new(0),
             state: Mutex::new(Glm53WalkState {
                 position: 0,
                 walks_since_boundary: 0,
@@ -598,6 +609,25 @@ impl Glm53Model {
             );
         }
         Ok(())
+    }
+
+    /// Claim the single sequence slot, or refuse.
+    ///
+    /// One-model-per-sequence is not the alternative: the arena is multi-GB on
+    /// top of resident weights, so the scheduler cannot hold N of them on this
+    /// box. Refusing is the honest answer.
+    ///
+    /// A leaked claim produces a LOUD refusal rather than silent interleaving,
+    /// which is the correct direction to fail in: the released state is one
+    /// sequence's worth and there is no way to tell two apart once they have
+    /// both advanced the same counter.
+    pub fn claim_sequence(&self) -> Result<()> {
+        claim_only_sequence_slot(&self.live_sequences)
+    }
+
+    /// Release the sequence slot. Saturating at zero rather than wrapping.
+    pub fn release_sequence(&self) {
+        release_only_sequence_slot(&self.live_sequences);
     }
 
     /// Return the model to its construction state so the NEXT request is a
@@ -974,6 +1004,33 @@ impl Glm53BoundWorkspaceRef {
             inner,
         })
     }
+}
+
+/// Claim the single sequence slot, or refuse. Free so it can be pinned without
+/// a device; the model method is a one-line forward to it.
+fn claim_only_sequence_slot(live: &std::sync::atomic::AtomicUsize) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let held = live.fetch_add(1, Ordering::AcqRel);
+    if held != 0 {
+        // Undo the speculative increment, or one refusal poisons the slot for
+        // the life of the process.
+        live.fetch_sub(1, Ordering::AcqRel);
+        bail!(
+            "GLM-5.3 serves ONE sequence at a time and {held} is already live. The \
+             arena is planned for batch 1 -- every region is sized for one sequence \
+             and there is a single position counter -- so admitting a second would \
+             interleave both into the same state with no error. Sequential requests \
+             are fine; each resets the carried state."
+        );
+    }
+    Ok(())
+}
+
+/// Saturating at zero, not wrapping: a wrap to usize::MAX would refuse every
+/// subsequent request forever.
+fn release_only_sequence_slot(live: &std::sync::atomic::AtomicUsize) {
+    use std::sync::atomic::Ordering;
+    let _ = live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| held.checked_sub(1));
 }
 
 /// The structural half of the sequence-boundary check, split out so it can be

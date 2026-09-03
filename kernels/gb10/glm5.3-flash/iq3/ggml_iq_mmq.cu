@@ -140,7 +140,19 @@ static __device__ __forceinline__ void atlas_ggml_iq_grouped_tile(
         __nv_bfloat16 * __restrict__ output,
         const int output_rows, const int batch_rows, const int inner,
         const int weight_row_stride, const int activation_cols,
-        const int output_row_stride) {
+        const int output_row_stride,
+        // Ints of activation between one (row, slot) pair and the next.
+        //
+        // ZERO means every pair reads the SAME activation, which is right for
+        // the gate and up projections: all top_k experts consume the identical
+        // token hidden state. The DOWN projection is not like that -- each slot
+        // consumes its OWN swiglu output -- and without this stride the grouped
+        // path could not express it. That matters more than it sounds: down
+        // staying serial means the host still needs the route ids to compute
+        // `base + id*expert_bytes`, which means the 3.91 ms drain survives and
+        // the entire point of the grouped kernel is lost. Two of three matmuls
+        // is not two thirds of the win, it is none of it.
+        const int activation_pair_stride) {
     const int pair = blockIdx.z;
     const int slot = pair % top_k;
     const int row  = pair / top_k;
@@ -161,8 +173,11 @@ static __device__ __forceinline__ void atlas_ggml_iq_grouped_tile(
     __nv_bfloat16 * __restrict__ out_slice =
         output + (size_t) pair * (size_t) output_rows;
 
+    const int * __restrict__ act_slice =
+        activations + (size_t) pair * (size_t) activation_pair_stride;
+
     atlas_ggml_iq_tile<type, mmq_x, need_check>(
-        weights, activations, out_slice, output_rows, batch_rows, inner,
+        weights, act_slice, out_slice, output_rows, batch_rows, inner,
         weight_row_stride, activation_cols, output_row_stride);
 }
 
@@ -173,11 +188,12 @@ atlas_##tag##_moe_grouped_nc(                                                   
         const int * route_ids, int top_k, int experts,                           \
         const int * activations, __nv_bfloat16 * output,                         \
         int output_rows, int batch_rows, int inner, int weight_row_stride,       \
-        int activation_cols, int output_row_stride) {                            \
+        int activation_cols, int output_row_stride,                              \
+        int activation_pair_stride) {                            \
     atlas_ggml_iq_grouped_tile<type, 128, false>(                  \
         expert_base, expert_bytes, route_ids, top_k, experts, activations,        \
         output, output_rows, batch_rows, inner, weight_row_stride,                \
-        activation_cols, output_row_stride);                                      \
+        activation_cols, output_row_stride, activation_pair_stride);              \
 }                                                                                 \
 extern "C" __global__ void __launch_bounds__(256, 1)                            \
 atlas_##tag##_moe_grouped_wc(                                                    \
@@ -185,11 +201,12 @@ atlas_##tag##_moe_grouped_wc(                                                   
         const int * route_ids, int top_k, int experts,                           \
         const int * activations, __nv_bfloat16 * output,                         \
         int output_rows, int batch_rows, int inner, int weight_row_stride,       \
-        int activation_cols, int output_row_stride) {                            \
+        int activation_cols, int output_row_stride,                              \
+        int activation_pair_stride) {                            \
     atlas_ggml_iq_grouped_tile<type, 128, true>(                   \
         expert_base, expert_bytes, route_ids, top_k, experts, activations,        \
         output, output_rows, batch_rows, inner, weight_row_stride,                \
-        activation_cols, output_row_stride);                                      \
+        activation_cols, output_row_stride, activation_pair_stride);              \
 }
 
 ATLAS_DEFINE_GROUPED_MOE_MMQ(q2_k, GGML_TYPE_Q2_K)

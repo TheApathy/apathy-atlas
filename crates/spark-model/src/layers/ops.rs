@@ -212,3 +212,7 @@ pub use ssm_gdn_batched::*;
 pub use ssm_mamba::*;
 pub use ssm_preproc::*;
 pub use ssm_ssd::*;
+
+#[cfg(test)]
+#[path = "ops/kernel_call_site_tests.rs"]
+mod kernel_call_site_tests;
