@@ -32,7 +32,10 @@ pub use glm53_dflash2_head::{
 pub use glm53_moe_grouped::{
     Glm53GroupedBank, Glm53GroupedMoeKernels, Glm53GroupedMoePlan, Glm53MoePath,
 };
-pub use glm53_moe_serial::{Glm53SerialMoeBuffers, Glm53SerialMoeKernels, Glm53SerialMoeReceipt};
+pub use glm53_moe_serial::{
+    Glm53GroupedMoeReceipt, Glm53GroupedMoeScratch, Glm53SerialMoeBuffers,
+    Glm53SerialMoeKernels, Glm53SerialMoeReceipt,
+};
 pub use glm53_target_schedule::{
     Glm53TargetAttentionKind, Glm53TargetEvent, Glm53TargetFfnKind, Glm53TargetGeometry,
     Glm53TargetSchedule, Glm53TargetWorkspace, Glm53TargetWorkspaceRegion,

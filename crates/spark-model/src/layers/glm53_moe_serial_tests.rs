@@ -417,7 +417,11 @@ fn valid_routes_preserve_slot_order_and_exact_effect_count() {
 fn pointer_bearing_weights_are_borrowed_through_execution() {
     let source = include_str!("glm53_moe_serial.rs");
     let borrowed = |source: &str| {
-        source.matches("weights: &Glm53MoeWeights").count() == 3
+        // 5, not 3: `execute_grouped` and `shared_and_reduce` were added and
+        // BOTH borrow, which is the property this guards. The count is exact so
+        // that the mutation below -- flipping one to by-value -- fails it; a
+        // >= would let a moved parameter hide behind the others.
+        source.matches("weights: &Glm53MoeWeights").count() == 5
             && source.matches("matrix: &Glm53GgufMatrix").count() == 2
             && source.matches("bank: &Glm53GgufMatrixBank").count() == 2
             && source.contains("self.linear(\n                gpu,\n                &gate,")

@@ -31,12 +31,6 @@ const DORMANT: &[(&str, &str)] = &[
          rejects. Wired when speculation makes rejection possible.",
     ),
     (
-        "Glm53GroupedMoeKernels",
-        "grouped MoE over (rows, top_k). Deliberately unreachable until it is \
-         proven bit-exact against the serial seam at rows=1; ATLAS_GLM53_MOE \
-         defaults to serial-reference. Comes off when the gate is wired.",
-    ),
-    (
         "Glm53Dflash2AttentionKernels",
         "DFlash2 drafter is not wired; the proposer and head have no call sites either",
     ),

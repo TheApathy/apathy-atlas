@@ -60,6 +60,27 @@ pub struct Glm53SerialMoeReceipt {
     pub kernel_launches: u32,
 }
 
+/// The four buffers the grouped path needs that the serial seam does not:
+/// TOP_K-wide gate, up and swiglu, plus one quantized activation block per
+/// (row, slot) pair for the down projection.
+#[derive(Debug, Clone, Copy)]
+pub struct Glm53GroupedMoeScratch {
+    pub gate_bf16: GgmlIqBuffer,
+    pub up_bf16: GgmlIqBuffer,
+    pub swiglu_bf16: GgmlIqBuffer,
+    pub down_q8: GgmlIqBuffer,
+}
+
+/// What the grouped path cost. `d2h_copies` and `mandatory_stream_syncs` are
+/// ZERO by construction and that is the whole point: the serial seam's are 1
+/// and 1 per MoE layer, 42 per token, 3.91 ms each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Glm53GroupedMoeReceipt {
+    pub d2h_copies: u32,
+    pub mandatory_stream_syncs: u32,
+    pub kernel_launches: u32,
+}
+
 pub struct Glm53SerialMoeKernels {
     q2_k: GgmlIqMmqKernels,
     q3_k: GgmlIqMmqKernels,
@@ -74,6 +95,10 @@ pub struct Glm53SerialMoeKernels {
     iq3_s: GgmlIqMmqKernels,
     iq4_xs: GgmlIqMmqKernels,
     activations: Glm53ActivationKernels,
+    /// The grouped kernels, loaded ALONGSIDE the serial ones rather than
+    /// instead of them. One struct, two methods, so the A/B is on one binary
+    /// and a regression localises in a single run.
+    grouped: Vec<(GgmlType, super::glm53_moe_grouped::Glm53GroupedMoeKernels)>,
 }
 
 impl Glm53SerialMoeKernels {
@@ -93,6 +118,29 @@ impl Glm53SerialMoeKernels {
             iq3_s: GgmlIqMmqKernels::load(gpu, GgmlType::IQ3_S)?,
             iq4_xs: GgmlIqMmqKernels::load(gpu, GgmlType::IQ4_XS)?,
             activations: Glm53ActivationKernels::load(gpu)?,
+            // Only the eleven types the grouped kernel is DEFINED for. Q3_K has
+            // no grouped definition, so a Q3_K bank falls to the serial path by
+            // failing to resolve here rather than by resolving a symbol that was
+            // never emitted.
+            grouped: [
+                GgmlType::Q2_K,
+                GgmlType::Q4_K,
+                GgmlType::Q5_K,
+                GgmlType::Q6_K,
+                GgmlType::Q8_0,
+                GgmlType::IQ2_XXS,
+                GgmlType::IQ2_XS,
+                GgmlType::IQ2_S,
+                GgmlType::IQ3_XXS,
+                GgmlType::IQ3_S,
+                GgmlType::IQ4_XS,
+            ]
+            .into_iter()
+            .map(|kind| {
+                super::glm53_moe_grouped::Glm53GroupedMoeKernels::load(gpu, kind)
+                    .map(|kernels| (kind, kernels))
+            })
+            .collect::<Result<Vec<_>>>()?,
         })
     }
 
@@ -162,6 +210,30 @@ impl Glm53SerialMoeKernels {
             )?;
         }
 
+        self.shared_and_reduce(gpu, weights, buffers, plans, stream)?;
+        Ok(Glm53SerialMoeReceipt {
+            route_ids,
+            d2h_copies: GLM53_SERIAL_MOE_D2H_COPIES,
+            mandatory_stream_syncs: GLM53_SERIAL_MOE_MANDATORY_STREAM_SYNCS,
+            kernel_launches: GLM53_SERIAL_MOE_KERNEL_LAUNCHES,
+        })
+    }
+
+    /// The shared expert and the weighted reduce.
+    ///
+    /// Extracted so the serial and grouped paths CALL the same code rather than
+    /// each carrying a copy. Neither step ever depended on a route id, so this
+    /// is the part of the MoE that is identical between them by construction
+    /// instead of by inspection -- which is what makes a bit-exactness failure
+    /// point at the expert matmuls rather than anywhere in the layer.
+    fn shared_and_reduce(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+        plans: SerialPlans,
+        stream: u64,
+    ) -> Result<u32> {
         self.linear(
             gpu,
             &weights.shared_gate,
@@ -211,12 +283,142 @@ impl Glm53SerialMoeKernels {
             },
             stream,
         )?;
-        Ok(Glm53SerialMoeReceipt {
-            route_ids,
-            d2h_copies: GLM53_SERIAL_MOE_D2H_COPIES,
-            mandatory_stream_syncs: GLM53_SERIAL_MOE_MANDATORY_STREAM_SYNCS,
-            kernel_launches: GLM53_SERIAL_MOE_KERNEL_LAUNCHES,
+        Ok(0)
+    }
+
+    /// The GROUPED path: the same MoE, with no host round trip.
+    ///
+    /// The serial seam above reads the eight route ids to the HOST
+    /// (cuMemcpyDtoHAsync_v2 + cuStreamSynchronize, a full pipeline drain) to
+    /// compute `base + id*expert_bytes` on the CPU, 42 times per token at
+    /// 3.91 ms each -- 91.5% of decode wall time, to move 32 bytes. Here the
+    /// route ids stay on the device and the kernel does the multiply-add
+    /// itself, so nothing has to synchronize to learn them.
+    ///
+    /// All THREE expert matmuls are grouped. Down is the one that matters: if
+    /// it stayed serial the host would still need the ids to address the bank
+    /// and the drain would survive intact, so two of three is not two thirds of
+    /// the win, it is none of it. Gate and up share one activation per row; down
+    /// takes one per (row, slot) pair, which is why the plan carries an
+    /// activation mode.
+    ///
+    /// The shared expert and the reduce are UNCHANGED from the serial path --
+    /// they never depended on a route id.
+    pub fn execute_grouped(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53MoeWeights,
+        buffers: Glm53SerialMoeBuffers,
+        grouped: Glm53GroupedMoeScratch,
+        stream: u64,
+    ) -> Result<Glm53GroupedMoeReceipt> {
+        use super::glm53_moe_grouped::{
+            Glm53GroupedActivations, Glm53GroupedBank, Glm53GroupedMoePlan,
+        };
+
+        let plans = self.preflight(weights, buffers)?;
+        let gate_bank = Glm53GroupedBank::from_bank(&weights.gate_experts)?;
+        let up_bank = Glm53GroupedBank::from_bank(&weights.up_experts)?;
+        let down_bank = Glm53GroupedBank::from_bank(&weights.down_experts)?;
+
+        let mut launches = 0u32;
+        // Gate and up: one activation per row, shared by all top_k experts.
+        for (bank, output) in [
+            (gate_bank, grouped.gate_bf16),
+            (up_bank, grouped.up_bf16),
+        ] {
+            let plan = Glm53GroupedMoePlan::new(bank, 1, TOP_K)?;
+            self.grouped_kernels(bank.kind)?.launch(
+                gpu,
+                plan,
+                buffers.input_bf16.ptr,
+                buffers.route_ids_u32,
+                GgmlIqBuffer {
+                    ptr: buffers.q8_activation.ptr,
+                    bytes: plan.activation_bytes,
+                },
+                GgmlIqBuffer {
+                    ptr: output.ptr,
+                    bytes: plan.output_bytes,
+                },
+                stream,
+            )?;
+            launches += 2;
+        }
+
+        // One SwiGLU launch for all TOP_K slots; the plan already takes rows.
+        self.activations.swiglu(
+            gpu,
+            Glm53SwigluPlan::new(TOP_K, EXPERT_INTERMEDIATE)?,
+            Glm53SwigluBuffers {
+                gate_bf16: grouped.gate_bf16,
+                up_bf16: grouped.up_bf16,
+                output_bf16: grouped.swiglu_bf16,
+            },
+            stream,
+        )?;
+        launches += 1;
+
+        // Down: each slot consumes its OWN swiglu row, so the quantize runs at
+        // rows = pairs and the tiles stride by pair. Two plans over one buffer,
+        // which `with_activations` has already checked describe the same bytes.
+        let down = Glm53GroupedMoePlan::with_activations(
+            down_bank,
+            1,
+            TOP_K,
+            Glm53GroupedActivations::PerPair,
+        )?;
+        let down_kernels = self.grouped_kernels(down_bank.kind)?;
+        down_kernels.quantize(
+            gpu,
+            down.quantize_plan()?,
+            grouped.swiglu_bf16.ptr,
+            GgmlIqBuffer {
+                ptr: grouped.down_q8.ptr,
+                bytes: down.activation_bytes,
+            },
+            stream,
+        )?;
+        down_kernels.launch_tiles(
+            gpu,
+            down,
+            buffers.route_ids_u32,
+            GgmlIqBuffer {
+                ptr: grouped.down_q8.ptr,
+                bytes: down.activation_bytes,
+            },
+            GgmlIqBuffer {
+                ptr: buffers.routed_bf16.ptr,
+                bytes: down.output_bytes,
+            },
+            stream,
+        )?;
+        launches += 2;
+
+        // Shared expert and reduce: byte-identical to the serial path.
+        launches += self.shared_and_reduce(gpu, weights, buffers, plans, stream)?;
+
+        Ok(Glm53GroupedMoeReceipt {
+            d2h_copies: 0,
+            mandatory_stream_syncs: 0,
+            kernel_launches: launches,
         })
+    }
+
+    fn grouped_kernels(
+        &self,
+        kind: GgmlType,
+    ) -> Result<&super::glm53_moe_grouped::Glm53GroupedMoeKernels> {
+        self.grouped
+            .iter()
+            .find(|(loaded, _)| *loaded == kind)
+            .map(|(_, kernels)| kernels)
+            .with_context(|| {
+                format!(
+                    "GLM grouped MoE has no kernel for {kind:?}; run this bank on \
+                     ATLAS_GLM53_MOE=serial-reference"
+                )
+            })
     }
 
     fn linear(

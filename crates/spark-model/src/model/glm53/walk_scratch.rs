@@ -393,6 +393,16 @@ impl Glm53WalkScratch {
         }
     }
 
+    /// The four extra buffers the grouped MoE path needs.
+    pub fn grouped_moe_scratch(&self) -> crate::layers::Glm53GroupedMoeScratch {
+        crate::layers::Glm53GroupedMoeScratch {
+            gate_bf16: self.grouped_gate_bf16,
+            up_bf16: self.grouped_up_bf16,
+            swiglu_bf16: self.grouped_swiglu_bf16,
+            down_q8: self.grouped_down_q8,
+        }
+    }
+
     /// The router's scratch: expert logits plus the decoded route.
     pub fn router_scratch(&self) -> (GgmlIqBuffer, GgmlIqBuffer, GgmlIqBuffer) {
         (

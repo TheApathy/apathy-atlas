@@ -147,8 +147,10 @@ pub struct Glm53GroupedMoePlan {
     /// differs. Sharing one plan is what makes the grouping legal.
     pub tile: GgmlIqMmqPlan,
     pub activations: Glm53GroupedActivations,
-    /// Ints of activation between consecutive pairs; zero when shared.
-    pub activation_pair_stride: u32,
+    /// One quantized activation block, in i32 words.
+    pub activation_block_ints: u32,
+    /// Blocks in the activation buffer: `rows` when shared, `pairs` per-slot.
+    pub activation_blocks: u32,
     pub activation_bytes: usize,
     pub output_bytes: usize,
     pub route_bytes: usize,
@@ -196,7 +198,11 @@ impl Glm53GroupedMoePlan {
             u64::from(pairs) <= ABI_MAX,
             "GLM grouped MoE {pairs} pairs exceed the grid ABI"
         );
-        let tile = GgmlIqMmqPlan::new(bank.kind, rows, bank.columns, bank.inner)?;
+        // THE TILE IS ALWAYS ONE ROW. `pair` already enumerates (row, slot) and
+        // each pair writes its own `columns`-wide output slice, so a tile with
+        // batch_rows > 1 would compute `rows` output rows into a one-row slice
+        // and overlap its neighbours. `rows` multiplies PAIRS, never the tile.
+        let tile = GgmlIqMmqPlan::new(bank.kind, 1, bank.columns, bank.inner)?;
         let output_bytes = tile
             .output_bytes
             .checked_mul(usize::try_from(top_k)?)
@@ -204,49 +210,49 @@ impl Glm53GroupedMoePlan {
         let route_bytes = usize::try_from(pairs)?
             .checked_mul(4)
             .context("GLM grouped MoE route byte count overflow")?;
-        // The quantized activation block is `activation_bytes` of i32 words.
-        // A per-pair layout holds one such block per pair, back to back.
-        let words = u32::try_from(tile.activation_bytes / 4)
-            .context("GLM grouped MoE activation stride exceeds the kernel ABI")?;
-        let (activation_pair_stride, activation_bytes) = match activations {
-            Glm53GroupedActivations::Shared => (0, tile.activation_bytes),
-            Glm53GroupedActivations::PerPair => (
-                words,
-                tile.activation_bytes
-                    .checked_mul(usize::try_from(pairs)?)
-                    .context("GLM grouped MoE per-pair activation overflow")?,
-            ),
-        };
-        // THE LAYOUT-AGREEMENT CHECK. The quantize that fills a per-pair buffer
-        // runs at `rows = pairs`; the tile that reads it runs at `rows` per
-        // pair. Two plans over one buffer, and a disagreement between them is
-        // SILENT -- it yields plausible wrong numbers rather than an error,
-        // which is the class of bug this project has paid for four times.
-        //
-        // `GgmlIqMmqPlan` lays activations out as `rows` contiguous blocks of
-        // `inner_padded / Q8_BLOCK_VALUES`, exactly linear in rows with no
-        // cross-row padding, so the two descriptions CAN agree. This asserts
-        // that they do, by deriving the quantize plan from the same geometry
-        // rather than trusting the arithmetic above.
-        if activations == Glm53GroupedActivations::PerPair {
-            let quantize = GgmlIqMmqPlan::new(bank.kind, pairs, bank.columns, bank.inner)?;
-            ensure!(
-                quantize.activation_bytes == activation_bytes
-                    && quantize.inner_padded == tile.inner_padded,
-                "GLM grouped MoE per-pair layout disagreement: the quantize at \
-                 rows={pairs} produces {} bytes with K padded to {}, the tile \
-                 addresses {activation_bytes} bytes with K padded to {}. The two \
-                 must describe the same buffer.",
-                quantize.activation_bytes,
-                quantize.inner_padded,
-                tile.inner_padded
-            );
-        }
+        // The quantized activation block is `activation_bytes` of i32 words --
+        // one row's worth, since the tile is one row.
         ensure!(
             tile.activation_bytes.is_multiple_of(4),
             "GLM grouped MoE activation block is {} bytes, not a whole number of \
-             i32 words; a per-pair stride cannot address it",
+             i32 words; it cannot be addressed as a stride",
             tile.activation_bytes
+        );
+        let block_ints = u32::try_from(tile.activation_bytes / 4)
+            .context("GLM grouped MoE activation block exceeds the kernel ABI")?;
+        // Shared indexes by ROW (all top_k experts of a row share one block);
+        // PerPair indexes by PAIR. The buffer holds exactly as many blocks as
+        // there are distinct indices.
+        let blocks = match activations {
+            Glm53GroupedActivations::Shared => rows,
+            Glm53GroupedActivations::PerPair => pairs,
+        };
+        let activation_bytes = tile
+            .activation_bytes
+            .checked_mul(usize::try_from(blocks)?)
+            .context("GLM grouped MoE activation buffer overflow")?;
+
+        // THE LAYOUT-AGREEMENT CHECK. The quantize that fills this buffer runs
+        // at `rows = blocks`; the tile that reads it runs one row per pair. Two
+        // plans over one buffer, and a disagreement between them is SILENT --
+        // it yields plausible wrong numbers rather than an error, which is the
+        // class of bug this project has paid for four times.
+        //
+        // `GgmlIqMmqPlan` lays activations out as `rows` contiguous blocks with
+        // no cross-row padding, so the two descriptions CAN agree. This asserts
+        // that they do, by deriving the quantize plan from the same geometry
+        // rather than trusting the arithmetic above.
+        let quantize = GgmlIqMmqPlan::new(bank.kind, blocks, bank.columns, bank.inner)?;
+        ensure!(
+            quantize.activation_bytes == activation_bytes
+                && quantize.inner_padded == tile.inner_padded,
+            "GLM grouped MoE activation layout disagreement: the quantize at \
+             rows={blocks} produces {} bytes with K padded to {}, the tiles \
+             address {activation_bytes} bytes with K padded to {}. The two must \
+             describe the same buffer.",
+            quantize.activation_bytes,
+            quantize.inner_padded,
+            tile.inner_padded
         );
         Ok(Self {
             bank,
@@ -255,7 +261,8 @@ impl Glm53GroupedMoePlan {
             pairs,
             tile,
             activations,
-            activation_pair_stride,
+            activation_block_ints: block_ints,
+            activation_blocks: blocks,
             activation_bytes,
             output_bytes,
             route_bytes,
@@ -269,10 +276,12 @@ impl Glm53GroupedMoePlan {
     /// row count than the one `with_activations` verified.
     pub fn quantize_plan(self) -> Result<GgmlIqMmqPlan> {
         match self.activations {
-            Glm53GroupedActivations::Shared => Ok(self.tile),
-            Glm53GroupedActivations::PerPair => {
-                GgmlIqMmqPlan::new(self.bank.kind, self.pairs, self.bank.columns, self.bank.inner)
-            }
+            _ => GgmlIqMmqPlan::new(
+                self.bank.kind,
+                self.activation_blocks,
+                self.bank.columns,
+                self.bank.inner,
+            ),
         }
     }
 }
@@ -293,6 +302,38 @@ impl Glm53GroupedMoeKernels {
             grouped_wc: gpu.kernel("ggml_iq_mmq", &format!("atlas_{tag}_moe_grouped_wc"))?,
             quantize: gpu.kernel("ggml_iq_mmq", quantize_name(kind)?)?,
         })
+    }
+
+    /// The quantize pass alone, for a caller filling a per-pair buffer.
+    pub fn quantize(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: GgmlIqMmqPlan,
+        input_bf16: DevicePtr,
+        activations: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            activations.bytes == plan.activation_bytes,
+            "GLM grouped MoE quantize: buffer is {} bytes, the rows={} plan needs {}",
+            activations.bytes,
+            plan.rows,
+            plan.activation_bytes
+        );
+        KernelLaunch::new(gpu, self.quantize)
+            .grid([
+                plan.rows,
+                div_ceil(plan.inner_padded, 4 * QUANTIZE_THREADS),
+                1,
+            ])
+            .block([QUANTIZE_THREADS, 1, 1])
+            .arg_ptr(input_bf16)
+            .arg_ptr(activations.ptr)
+            .arg_u64(u64::from(plan.inner))
+            .arg_u64(u64::from(plan.inner))
+            .arg_u64(u64::from(plan.inner_padded))
+            .arg_u32(plan.rows)
+            .launch(stream)
     }
 
     /// Quantize the activations ONCE, then run every (row, slot) tile.
@@ -407,7 +448,8 @@ impl Glm53GroupedMoeKernels {
             .arg_u32(tile.weight_row_stride())
             .arg_u32(tile.rows)
             .arg_u32(tile.columns)
-            .arg_u32(plan.activation_pair_stride)
+            .arg_u32(plan.activation_block_ints)
+            .arg_u32(u32::from(plan.activations == Glm53GroupedActivations::PerPair))
             .launch(stream)
     }
 }

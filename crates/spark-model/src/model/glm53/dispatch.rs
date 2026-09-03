@@ -62,7 +62,8 @@ use crate::layers::ops::{
     Glm53RouterBuffers, Glm53RouterKernels, Glm53RouterPlan,
 };
 use crate::layers::{
-    Glm53SerialMoeKernels, Glm53TargetAttentionKind, Glm53TargetEvent, Glm53TargetFfnKind,
+    Glm53MoePath, Glm53SerialMoeKernels, Glm53TargetAttentionKind, Glm53TargetEvent,
+    Glm53TargetFfnKind,
 };
 use crate::weight_loader::{
     Glm53AttentionWeights, Glm53FfnWeights, Glm53GgufMatrix, Glm53HyperWeights, Glm53LayerNorms,
@@ -196,6 +197,11 @@ pub struct Glm53Dispatcher<'w> {
     layers: Vec<Glm53LayerHyperOperands>,
     output_norm: GgmlIqBuffer,
     moe: Glm53SerialMoeKernels,
+    /// Which MoE path this walk takes. Read once at construction rather than
+    /// per layer: 42 of 45 layers are MoE, so an env read in the hot path would
+    /// be 42 lookups a token, and a value that could change mid-token would
+    /// make a measurement unattributable.
+    moe_path: Glm53MoePath,
     dense: Glm53DenseFfnKernels,
     router: Glm53RouterKernels,
     scratch: Glm53WalkScratch,
@@ -294,6 +300,7 @@ impl<'w> Glm53Dispatcher<'w> {
             layers,
             output_norm,
             moe: Glm53SerialMoeKernels::load(gpu)?,
+            moe_path: Glm53MoePath::from_env()?,
             dense: Glm53DenseFfnKernels::load(gpu)?,
             router: Glm53RouterKernels::load(gpu)?,
             scratch,
@@ -554,16 +561,29 @@ impl<'w> Glm53Dispatcher<'w> {
                 // Reads the normalized block input written by the FFN-side
                 // hc_pre + ffn_norm, writes the block output PostFfn folds back
                 // into the streams.
-                let result = self
-                    .moe
-                    .execute(
-                        gpu,
-                        moe,
-                        self.scratch
-                            .moe_buffers(self.bound.collapsed, self.bound.hidden_b),
-                        stream,
-                    )
-                    .map(|_receipt| ());
+                // ATLAS_GLM53_MOE selects the path. `serial-reference` is the
+                // default and is PERMANENT: it is the only thing the grouped
+                // kernel can be checked against bit-exactly, and it makes an
+                // A/B an env flip on one binary rather than two builds.
+                let moe_buffers = self
+                    .scratch
+                    .moe_buffers(self.bound.collapsed, self.bound.hidden_b);
+                let result = match self.moe_path {
+                    Glm53MoePath::SerialReference => self
+                        .moe
+                        .execute(gpu, moe, moe_buffers, stream)
+                        .map(|_receipt| ()),
+                    Glm53MoePath::Grouped => self
+                        .moe
+                        .execute_grouped(
+                            gpu,
+                            moe,
+                            moe_buffers,
+                            self.scratch.grouped_moe_scratch(),
+                            stream,
+                        )
+                        .map(|_receipt| ()),
+                };
                 {
                     // Bring-up diagnostic (ATLAS_GLM53_DUMP_DIR): MoE routing.
                     // 42 of 45 layers are MoE, so wrong routing is fluent-but-

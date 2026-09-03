@@ -99,9 +99,10 @@ fn the_plan_groups_over_rows_and_slots_and_bounds_both() {
     let verify = Glm53GroupedMoePlan::new(bank, 16, TOP_K).unwrap();
     assert_eq!(verify.pairs, 128, "16 rows by top_k, the speculative shape");
     assert_eq!(verify.route_bytes, 128 * 4);
-    // Rows enter the MMQ tile, not the pair index: the activation buffer grows
-    // with rows while the per-pair output slice does not.
-    assert!(verify.tile.activation_bytes > decode.tile.activation_bytes);
+    // Rows multiply PAIRS, never the tile: the tile stays one row and the
+    // output grows because there are more pairs.
+    assert_eq!(verify.tile.rows, 1);
+    assert_eq!(verify.tile.activation_bytes, decode.tile.activation_bytes);
 
     assert!(Glm53GroupedMoePlan::new(bank, 0, TOP_K).is_err());
     assert!(Glm53GroupedMoePlan::new(bank, 1, 0).is_err());
@@ -173,7 +174,8 @@ fn per_pair_activations_are_expressible_and_shared_is_still_the_default() {
 
     let shared = Glm53GroupedMoePlan::new(bank, 1, TOP_K).unwrap();
     assert_eq!(shared.activations, Glm53GroupedActivations::Shared);
-    assert_eq!(shared.activation_pair_stride, 0, "shared pairs must not stride");
+    // Shared indexes by ROW: one block for the single row, reused by all slots.
+    assert_eq!(shared.activation_blocks, 1);
     assert_eq!(shared.activation_bytes, shared.tile.activation_bytes);
 
     let down = Glm53GroupedMoePlan::with_activations(
@@ -184,7 +186,8 @@ fn per_pair_activations_are_expressible_and_shared_is_still_the_default() {
     )
     .unwrap();
     // One quantized block per pair, back to back, addressed in i32 words.
-    assert_eq!(down.activation_pair_stride as usize * 4, down.tile.activation_bytes);
+    assert_eq!(down.activation_block_ints as usize * 4, down.tile.activation_bytes);
+    assert_eq!(down.activation_blocks, down.pairs);
     assert_eq!(down.activation_bytes, down.tile.activation_bytes * down.pairs as usize);
     assert_eq!(down.pairs, TOP_K);
 
@@ -197,7 +200,17 @@ fn per_pair_activations_are_expressible_and_shared_is_still_the_default() {
     )
     .unwrap();
     assert_eq!(verify.pairs, 128);
+    assert_eq!(verify.activation_blocks, 128);
     assert_eq!(verify.activation_bytes, verify.tile.activation_bytes * 128);
+
+    // AND THE ROWS>1 TRAP THIS CAUGHT: at rows>1 a SHARED plan holds one block
+    // per ROW, not one per pair, because `pair` already enumerates rows. A flat
+    // per-pair stride would have handed row 1's experts row 8's activations.
+    // At rows == 1 both forms give index 0 and neither can be wrong.
+    let shared_batch = Glm53GroupedMoePlan::new(bank, 16, TOP_K).unwrap();
+    assert_eq!(shared_batch.pairs, 128);
+    assert_eq!(shared_batch.activation_blocks, 16, "one block per row, not per pair");
+    assert_eq!(shared_batch.tile.rows, 1, "the tile is always one row per pair");
 }
 
 /// The quantize plan and the tile's per-pair addressing describe ONE buffer.
@@ -214,7 +227,7 @@ fn the_quantize_plan_and_the_per_pair_tile_describe_the_same_buffer() {
             .unwrap();
     let quantize = down.quantize_plan().unwrap();
 
-    assert_eq!(quantize.rows, down.pairs, "quantize must cover every pair");
+    assert_eq!(quantize.rows, down.activation_blocks, "quantize must cover every block");
     assert_eq!(quantize.activation_bytes, down.activation_bytes);
     assert_eq!(quantize.inner_padded, down.tile.inner_padded);
     // Exactly linear in rows, so pair p starts at p * stride and the stride is
@@ -223,10 +236,10 @@ fn the_quantize_plan_and_the_per_pair_tile_describe_the_same_buffer() {
         quantize.activation_bytes,
         down.tile.activation_bytes * down.pairs as usize
     );
-    assert_eq!(down.activation_pair_stride as usize * 4, down.tile.activation_bytes);
+    assert_eq!(down.activation_block_ints as usize * 4, down.tile.activation_bytes);
 
-    // A shared plan quantizes one block and hands the same one to every pair.
+    // A shared plan quantizes one block per row and hands it to every slot.
     let shared = Glm53GroupedMoePlan::new(bank, 1, TOP_K).unwrap();
-    assert_eq!(shared.quantize_plan().unwrap().rows, shared.tile.rows);
-    assert_eq!(shared.activation_pair_stride, 0);
+    assert_eq!(shared.quantize_plan().unwrap().rows, shared.activation_blocks);
+    assert_eq!(shared.activation_blocks, 1);
 }
