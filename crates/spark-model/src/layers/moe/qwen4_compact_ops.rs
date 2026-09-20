@@ -174,12 +174,6 @@ impl MoeLayer {
         )?;
         }
         gemm(gate, down_table, ctx.buffers.expert_down_out(), 2560, 640)?;
-        // Env-gated oracle capture (ATLAS_QWEN4_ORACLE_DUMP). Records the exact
-        // arguments and results of ONE compact-MoE dispatch so the GEMM can be
-        // replayed standalone. Off by default; costs nothing when unset.
-        self.oracle_capture_compact(
-            input, offsets, sorted_ids, rows, gate_table, up_table, down_table, ctx, stream,
-        )?;
         // PLANNED=1 is not a completion marker: the ordered D2H drains every
         // GEMM first. Only then can unchanged status admit unpermute/blend/HC.
         // Every planner/GEMM failure (including still PENDING) propagates.
