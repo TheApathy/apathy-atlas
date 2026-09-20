@@ -13,6 +13,7 @@ pub(super) fn mk_msg(role: &str, text: &str) -> crate::openai::IncomingMessage {
         content: crate::openai::ParsedContent {
             text: text.to_string(),
             images: Vec::new(),
+            image_text_offsets: Vec::new(),
         },
         tool_calls: None,
         tool_call_id: None,
@@ -26,6 +27,7 @@ pub(super) fn mk_tool_msg(call_id: &str, text: &str) -> crate::openai::IncomingM
         content: crate::openai::ParsedContent {
             text: text.to_string(),
             images: Vec::new(),
+            image_text_offsets: Vec::new(),
         },
         tool_calls: None,
         tool_call_id: Some(call_id.to_string()),

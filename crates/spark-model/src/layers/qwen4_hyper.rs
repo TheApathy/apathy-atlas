@@ -10,6 +10,11 @@ use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+mod prefill_exact_admission;
+mod prefill_exact_check;
+mod prefill_exact_plan;
+mod prefill_tile;
+
 pub struct Qwen4HyperConnection {
     pub norm: DenseWeight,
     pub down: QuantizedWeight,
@@ -376,7 +381,7 @@ impl Qwen4HyperConnection {
         eps: f32,
         stream: u64,
     ) -> Result<DevicePtr> {
-        anyhow::ensure!(num_tokens > 0, "empty Qwen4 exact prefill");
+        self.validate_prefill_exact(hyper, residual, num_tokens, buffers, eps)?;
         let r = self.residual_width();
         let mut start = 0;
         while start < num_tokens {
@@ -411,6 +416,7 @@ impl Qwen4HyperConnection {
             .arg_u32(self.hidden_size as u32)
             .arg_u32(self.hc_count as u32)
             .launch(stream)?;
+        self.check_prefill_exact(hyper, residual, num_tokens, buffers, gpu, eps, stream)?;
         Ok(mixed)
     }
 

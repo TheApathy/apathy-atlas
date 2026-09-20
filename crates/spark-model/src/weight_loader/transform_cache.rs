@@ -33,11 +33,12 @@
 //! `rename`, so a blob torn by a crash or a failed load has no index and is
 //! simply ignored on the next start.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use parking_lot::Mutex;
+use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightStore, WeightTensor};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -49,7 +50,7 @@ mod evict;
 /// Bump on ANY change to the on-disk layout, to the set of fingerprint
 /// inputs, or to the meaning of a slot key. Existing caches then fail the
 /// key check and are rewritten rather than silently reused.
-pub const CACHE_FORMAT_VERSION: u32 = 2;
+pub const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// Parts are padded to this boundary inside the blob so each mmap slice
 /// handed to `copy_h2d` starts aligned.
@@ -76,14 +77,14 @@ const TRANSFORM_ENV_KEYS: &[&str] = &[
     "TQ_PLUS_WEIGHT_ROTATION",
 ];
 
-/// Tensors sampled for the content fingerprint, and bytes read from the
-/// start of each. Two checkpoints with identical names/shapes/dtypes (an
-/// abliterated re-quant vs the official one, say) differ only in content, so
-/// shape metadata alone is not a safe key. Sampling is a heuristic, not a
-/// full content hash: it is sized to separate checkpoints that differ
-/// broadly, which is what swapping a model variant does.
+/// Generic transforms retain the legacy bounded store sample. Official packed
+/// MTP slots additionally bind the exact SHA256 receipt of every byte in both
+/// source banks before a hit is possible; this sample is not their provenance.
 const CONTENT_SAMPLE_TENSORS: usize = 24;
 const CONTENT_SAMPLE_BYTES: usize = 2048;
+
+/// Bound peak host memory while establishing exact packed-MTP provenance.
+const CONTENT_DIGEST_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bytes compared per part under `ATLAS_WEIGHT_CACHE_VERIFY=1`.
 const VERIFY_WINDOW: usize = 4096;
@@ -151,6 +152,97 @@ impl Fingerprint {
     }
 }
 
+fn hex_digest(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Cryptographic digest over every source byte.
+#[cfg(test)]
+pub(crate) fn exact_content_digest(bytes: &[u8]) -> Result<String> {
+    Ok(hex_digest(digest(&SHA256, bytes).as_ref()))
+}
+
+/// Exact digest of an immutable device allocation, memoized by its live
+/// address and extent. WeightStore allocations remain live and immutable for
+/// model construction, so the two official packed-MTP banks are each scanned
+/// once rather than once per expert slice. Copy failure is fatal: an
+/// incomplete identity must never be allowed to hit a cache slot.
+pub(crate) fn exact_device_content_digest(
+    gpu: &dyn GpuBackend,
+    ptr: DevicePtr,
+    byte_len: usize,
+) -> Result<String> {
+    static DIGESTS: OnceLock<Mutex<HashMap<(u64, usize), String>>> = OnceLock::new();
+    ensure!(
+        !ptr.is_null(),
+        "exact content digest source pointer is null"
+    );
+    ensure!(byte_len > 0, "exact content digest source is empty");
+    ensure!(
+        ptr.0.checked_add(byte_len as u64).is_some(),
+        "exact content digest source address overflows"
+    );
+    let digests = DIGESTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(digest) = digests.lock().get(&(ptr.0, byte_len)).cloned() {
+        return Ok(digest);
+    }
+    let mut host = vec![0u8; CONTENT_DIGEST_CHUNK_BYTES.min(byte_len)];
+    let mut receipt = Vec::with_capacity(
+        32 + byte_len
+            .div_ceil(CONTENT_DIGEST_CHUNK_BYTES)
+            .saturating_mul(32),
+    );
+    receipt.extend_from_slice(b"exact-device-content.v1");
+    receipt.extend_from_slice(&(byte_len as u64).to_le_bytes());
+    let mut offset = 0usize;
+    while offset < byte_len {
+        let take = host.len().min(byte_len - offset);
+        gpu.copy_d2h(ptr.offset(offset), &mut host[..take])
+            .with_context(|| format!("hash exact device bytes {offset}..{}", offset + take))?;
+        receipt.extend_from_slice(digest(&SHA256, &host[..take]).as_ref());
+        offset += take;
+    }
+    let digest = hex_digest(digest(&SHA256, &receipt).as_ref());
+    digests.lock().insert((ptr.0, byte_len), digest.clone());
+    Ok(digest)
+}
+
+/// Exact transform implementation plus output-relevant backend/device class.
+/// The backend receipt covers the exact PTX bytes loaded into its registry;
+/// SM topology and memory class prevent cross-device reuse.
+pub(crate) fn packed_mtp_transform_identity(gpu: &dyn GpuBackend) -> Result<String> {
+    let implementation = gpu
+        .transform_cache_identity()
+        .context("GPU backend has no exact transform-cache implementation identity")?;
+    let sm_count = gpu
+        .sm_count()
+        .context("packed MTP cache requires an exact device SM count")?;
+    let total_memory = gpu
+        .total_memory()
+        .context("packed MTP cache requires exact device memory identity")?;
+    Ok(format!(
+        "target_os={};target_arch={};device_sms={sm_count};device_memory={total_memory};{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        implementation,
+    ))
+}
+
+pub(crate) fn bind_packed_mtp_slot_provenance(
+    slot: String,
+    source: &WeightTensor,
+    gpu: &dyn GpuBackend,
+) -> Result<String> {
+    // The packed schema's 1,536 slices partition these two immutable source
+    // tensors. Bind the whole tensor so every source byte is covered once,
+    // while the geometric slot still selects one exact slice and role.
+    let source_digest = exact_device_content_digest(gpu, source.ptr, source.byte_size())?;
+    Ok(format!(
+        "{slot};source_content_digest={source_digest};{}",
+        packed_mtp_transform_identity(gpu)?,
+    ))
+}
+
 /// Hash the fields of [`atlas_core::config::ModelConfig`] that any weight
 /// transform depends on. Listed explicitly rather than derived from `Serialize`
 /// (the struct has no `Serialize` impl) — adding a config field that changes a
@@ -194,6 +286,11 @@ pub fn hash_build_and_env(fp: &mut Fingerprint) {
         fp.write_str(key);
         fp.write_str(&std::env::var(key).unwrap_or_default());
     }
+}
+
+fn hash_construction_mode(fp: &mut Fingerprint, use_speculative: bool) {
+    fp.write_str("construction-mode.v1")
+        .write(&[use_speculative as u8]);
 }
 
 /// Hash tensor names, dtypes and shapes, plus a bounded content sample so
@@ -244,6 +341,7 @@ pub fn compute_fingerprint(
 ) -> String {
     let mut fp = Fingerprint::new();
     hash_build_and_env(&mut fp);
+    hash_construction_mode(&mut fp, construction_mode());
     fp.write_str("variant");
     fp.write_str(variant_tag);
     hash_model_config(&mut fp, config);
@@ -599,9 +697,34 @@ fn write_index(dir: &std::path::Path, index: &CacheIndex) -> Result<()> {
 // ─────────────────────────── process-wide handle ───────────────────────────
 
 static CACHE: OnceLock<Option<TransformCache>> = OnceLock::new();
+static CONSTRUCTION_MODE: OnceLock<bool> = OnceLock::new();
 
 fn env_flag(key: &str) -> bool {
     std::env::var(key).ok().as_deref() == Some("1")
+}
+
+fn construction_mode() -> bool {
+    CONSTRUCTION_MODE.get().copied().unwrap_or(false)
+}
+
+/// Bind cache publication to model construction mode before the loader calls
+/// [`init`]. A target-only Qwen4 generation and a speculative generation can
+/// therefore never open the same read-only index. No state is installed while
+/// the cache feature is disabled.
+pub fn configure_construction_mode(use_speculative: bool) -> Result<()> {
+    if !env_flag("ATLAS_WEIGHT_CACHE") {
+        return Ok(());
+    }
+    if let Some(&configured) = CONSTRUCTION_MODE.get() {
+        ensure!(
+            configured == use_speculative,
+            "weight cache construction mode changed within one process"
+        );
+        return Ok(());
+    }
+    CONSTRUCTION_MODE
+        .set(use_speculative)
+        .map_err(|_| anyhow::anyhow!("weight cache construction mode raced initialization"))
 }
 
 fn cache_root() -> PathBuf {
@@ -758,6 +881,49 @@ mod tests {
             b.finish_hex(),
             "u32 and usize widths differ"
         );
+    }
+
+    #[test]
+    fn exact_content_digest_observes_first_byte_after_legacy_sample() {
+        let original = vec![0x5au8; CONTENT_SAMPLE_BYTES + 1];
+        let mut hostile = original.clone();
+        hostile[CONTENT_SAMPLE_BYTES] ^= 1;
+        assert_eq!(
+            &original[..CONTENT_SAMPLE_BYTES],
+            &hostile[..CONTENT_SAMPLE_BYTES],
+            "the legacy 2 KiB prefix cannot distinguish this mutation"
+        );
+        assert_ne!(
+            exact_content_digest(&original).unwrap(),
+            exact_content_digest(&hostile).unwrap(),
+            "exact source identity must cover byte offset 2048"
+        );
+    }
+
+    #[test]
+    fn exact_content_digest_matches_sha256_standard_vectors() {
+        assert_eq!(
+            exact_content_digest(b"").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            exact_content_digest(b"abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn construction_mode_separates_no_spec_then_spec_generations() {
+        let digest = |use_speculative| {
+            let mut fp = Fingerprint::new();
+            hash_construction_mode(&mut fp, use_speculative);
+            fp.finish_hex()
+        };
+        let target_only = digest(false);
+        let speculative = digest(true);
+        assert_ne!(target_only, speculative);
+        assert_eq!(target_only, digest(false));
+        assert_eq!(speculative, digest(true));
     }
 
     #[test]

@@ -40,10 +40,12 @@ fn test_buffer_arena_alloc() {
 
     assert!(!arena.hidden_states().is_null());
     assert!(!arena.logits().is_null());
+    assert!(!arena.moe_worklist().is_null());
+    assert!(!arena.moe_worklist_total().is_null());
     assert_eq!(arena.max_batch_tokens(), 128);
-    // 18 allocations for 18 buffers (12 data + 1 scratch + 3 expert + 2 splitk).
-    // Bump from 17 reflects an added split-K accumulator buffer.
-    assert_eq!(gpu.alloc_count(), 18);
+    // 20 allocations: the previous 18 plus persistent compact-MoE work-list
+    // storage and its device-written item count.
+    assert_eq!(gpu.alloc_count(), 20);
 }
 
 #[test]

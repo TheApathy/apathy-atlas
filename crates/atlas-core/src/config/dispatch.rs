@@ -25,13 +25,27 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
         .unwrap_or("");
 
     match top_model_type {
-        "qwen4_exp" => {
+        "qwen4_exp" | "qwen3_8_flash_next" => {
             let text_config = raw
                 .get("text_config")
                 .context("qwen4_exp config missing text_config")?;
+            if top_model_type == "qwen3_8_flash_next" {
+                let nested_model_type = text_config
+                    .get("model_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if nested_model_type != "qwen3_8_flash_next_text" {
+                    anyhow::bail!(
+                        "qwen3_8_flash_next requires text_config.model_type=qwen3_8_flash_next_text, got {nested_model_type:?}"
+                    );
+                }
+            }
             let mut config: ModelConfig = serde_json::from_value(text_config.clone())
                 .context("Failed to parse qwen4_exp text_config")?;
-            config.model_type = top_model_type.to_string();
+            // Atlas implements this architecture under its canonical Qwen4
+            // experimental target. Canonicalize only after the exact Mia
+            // top/nested alias pair has passed the validation above.
+            config.model_type = "qwen4_exp".to_string();
             config.nested_config = true;
             config.attn_gated = true;
             config.weight_prefix = "model.language_model".to_string();

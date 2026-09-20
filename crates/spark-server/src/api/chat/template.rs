@@ -11,7 +11,7 @@ use axum::response::Response;
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::openai::ChatCompletionRequest;
+use crate::openai::{ChatCompletionRequest, ParsedContent};
 use crate::tool_parser;
 
 use super::super::compact::{compact_messages, openai_error_response, truncate_to_fit};
@@ -54,6 +54,14 @@ pub(super) fn render_template(
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
+    let image_count: usize = messages.iter().map(|m| m.image_count).sum();
+    let has_images = image_count != 0;
+    if image_count != image_pad_counts.len() || image_pad_counts.contains(&0) {
+        return Err(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "Image markers and preprocessed images must have matching nonzero counts".into(),
+        ));
+    }
 
     // Build JSON messages with structured tool_calls for Jinja.
     let stripper_tools: &[tool_parser::ToolDefinition] = req.tools.as_deref().unwrap_or(&[]);
@@ -69,25 +77,19 @@ pub(super) fn render_template(
             } else {
                 m.content.clone()
             };
-            let content_val = if m.image_count > 0 {
-                let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.image_count + 1);
-                for _ in 0..m.image_count {
-                    items.push(serde_json::json!({"type": "image"}));
-                }
-                if !m.content.is_empty() {
-                    items.push(serde_json::json!({"type": "text", "text": m.content}));
-                }
-                serde_json::Value::Array(items)
-            } else {
-                serde_json::Value::String(effective_content)
-            };
+            let content_val = ParsedContent::marker_json(
+                &effective_content,
+                m.image_count,
+                &m.image_text_offsets,
+            )?;
             let mut msg = serde_json::json!({"role": m.role, "content": content_val});
             if let Some(ref tcs) = m.tool_calls {
                 msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
             }
-            msg
+            Ok::<_, String>(msg)
         })
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(|e| openai_error_response(StatusCode::BAD_REQUEST, e))?;
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
@@ -111,7 +113,8 @@ pub(super) fn render_template(
         .auto_compact_threshold
         .map(|t| t > 0.0)
         .unwrap_or(false);
-    let json_messages = if auto_compact_active && json_messages.len() > 4 {
+    // Pixel ownership is request-wide: do not drop/rewrite image-bearing history.
+    let json_messages = if !has_images && auto_compact_active && json_messages.len() > 4 {
         let trial_tokens = state
             .tokenizer
             .apply_chat_template_openai_with_options(
@@ -167,7 +170,7 @@ pub(super) fn render_template(
     // dominant term — the champion serves 768) and, if the prompt won't fit,
     // drop the OLDEST turns and re-render — bounded, never an infinite loop.
     // Opt out with ATLAS_CTX_OVERFLOW_TRUNCATE=0 to restore strict 400-on-overflow.
-    if ctx_overflow_truncate_enabled() {
+    if !has_images && ctx_overflow_truncate_enabled() {
         let output_reserve = (state.behavior.max_thinking_budget as usize).saturating_add(256);
         let fit_budget = state.max_seq_len.saturating_sub(output_reserve).max(1);
         if prompt_tokens.len() >= fit_budget {
@@ -204,6 +207,21 @@ pub(super) fn render_template(
         }
     }
 
+    // Refuse templates that omit/duplicate images, before expansion can hide the mismatch.
+    if has_images {
+        let pad = state.tokenizer.image_pad_token_id().ok_or_else(|| {
+            openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "Tokenizer lacks an image marker token".into(),
+            )
+        })?;
+        if prompt_tokens.iter().filter(|&&id| id == pad).count() != image_count {
+            return Err(openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "Chat template did not preserve exactly one marker per image".into(),
+            ));
+        }
+    }
     // Expand image pads when needed.
     let prompt_tokens = if image_pad_counts.iter().any(|&c| c > 1) {
         state

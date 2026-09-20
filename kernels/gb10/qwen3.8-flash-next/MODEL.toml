@@ -1,8 +1,8 @@
 [model]
 name = "qwen3.8-flash-next"
 hf_id = "Qwen/Qwen3.8-Flash-Next"
-params = "80B+51B PLE"
-active_params = "3B"
+params = "125B+51B PLE"
+active_params = "6B"
 architecture = "Qwen4-Exp Hyperconnection + QSA + GDN + MoE + sparse PLE"
 
 layers_total = 48
@@ -10,9 +10,9 @@ layers_full_attention = 12
 layers_linear_attention = 36
 hidden_dim = 2560
 head_dim = 256
-q_heads = 16
+q_heads = 24
 kv_heads = 2
-v_heads = 32
+v_heads = 48
 experts = 512
 experts_per_token = 10
 vocab_size = 248320

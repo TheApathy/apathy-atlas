@@ -234,6 +234,25 @@ impl Qwen3AttentionLayer {
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
             // Skip shared RoPE to avoid double-rotation.
+        } else if !self.qwen4_yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_contiguous,
+                k_contiguous,
+                meta.positions,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.qwen4_yarn_inv_freq,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                self.qwen4_yarn_attention_factor,
+                stream,
+            )?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
             let rope_angles = self
                 .rotary_dim_override

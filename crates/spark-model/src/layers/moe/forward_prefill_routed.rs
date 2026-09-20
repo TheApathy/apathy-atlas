@@ -61,7 +61,33 @@ impl MoeLayer {
         //
         // Mirrors the FP8 path (see forward_prefill_fp8.rs).
         let avg_per_expert = (num_tokens * top_k as usize).div_ceil(ne);
-        let max_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        let mut max_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        // Diagnostic bridge for the GPU compact-worklist implementation:
+        // the correctness-first upper bound above launches
+        // num_experts*ceil(N*top_k/64) row tiles even though nearly all of
+        // them immediately exit. On 512-expert Flash-Next this is millions
+        // of empty CTAs per layer. Read the already-built 2 KiB offset table
+        // to prove the exact-grid ceiling before replacing this host sync
+        // with a device-generated compact tile list.
+        if std::env::var("ATLAS_MOE_EXACT_PREFILL_GRID")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            ctx.gpu.synchronize(stream)?;
+            let mut bytes = vec![0u8; (ne + 1) * 4];
+            ctx.gpu.copy_d2h(expert_offsets, &mut bytes)?;
+            let offsets: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let max_rows = offsets
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]))
+                .max()
+                .unwrap_or(0);
+            max_m_tiles = max_rows.div_ceil(64).max(1);
+        }
         super::dump::dump_expert_load(
             ctx.gpu,
             stream,
@@ -96,8 +122,86 @@ impl MoeLayer {
             ctx.gpu
                 .memset_async(ctx.buffers.expert_down_out(), 0, down_bytes, stream)?;
         }
+        if self.qwen4_compact.is_some() {
+            anyhow::ensure!(
+                n as usize == num_tokens
+                    && h == 2560
+                    && inter == 640
+                    && num_experts == 512
+                    && ne == 512
+                    && top_k == 10,
+                "Qwen4 compact routed dispatch geometry mismatch"
+            );
+            self.run_qwen4_compact(
+                expert_input,
+                expert_offsets,
+                sorted_token_ids,
+                num_tokens,
+                ctx,
+                stream,
+            )?;
+            prof_step!("grouped_compact_checked");
+            return Ok(());
+        }
         if max_m_tiles > 0 {
-            if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
+            if self.nvfp4_moe_worklist {
+                anyhow::ensure!(
+                    h.is_multiple_of(64) && inter.is_multiple_of(64),
+                    "NVFP4 compact work-list K64 kernels require H/intermediate divisible by 64 (H={h}, intermediate={inter})"
+                );
+                let (gp, up) = match (&self.gate_ptrs_t, &self.up_ptrs_t) {
+                    (Some(gp), Some(up)) => (gp, up),
+                    _ => anyhow::bail!(
+                        "ATLAS_NVFP4_MOE_WORKLIST=1 requires transposed gate/up expert pointer tables"
+                    ),
+                };
+                let n_tiles = (2 * inter).div_ceil(ops::NVFP4_WORKLIST_N_TILE);
+                let max_tiles = ops::nvfp4_worklist_capacity_items(
+                    total_expanded as usize,
+                    ne,
+                    n_tiles,
+                    ops::NVFP4_WORKLIST_GATE_UP_M_TILE,
+                )?;
+                anyhow::ensure!(
+                    max_tiles as usize * 2 * std::mem::size_of::<u32>()
+                        <= ctx.buffers.sizes().moe_worklist,
+                    "NVFP4 gate/up work-list bound exceeds persistent arena allocation"
+                );
+                ops::moe_w4a16_build_tile_worklist(
+                    ctx.gpu,
+                    self.moe_build_nvfp4_worklist_k,
+                    expert_offsets,
+                    gp.packed_ptrs,
+                    ctx.buffers.moe_worklist(),
+                    ctx.buffers.moe_worklist_total(),
+                    num_experts,
+                    n_tiles,
+                    ops::NVFP4_WORKLIST_GATE_UP_M_TILE,
+                    stream,
+                )?;
+                ops::moe_w4a16_fused_gate_up_k64_worklist(
+                    ctx.gpu,
+                    self.moe_fused_gate_up_t_k64_worklist_k,
+                    expert_input,
+                    gp.packed_ptrs,
+                    gp.scale_ptrs,
+                    gp.scale2_vals,
+                    up.packed_ptrs,
+                    up.scale_ptrs,
+                    up.scale2_vals,
+                    expert_gate_out,
+                    expert_up_out,
+                    expert_offsets,
+                    sorted_token_ids,
+                    num_experts,
+                    inter,
+                    h,
+                    ctx.buffers.moe_worklist(),
+                    ctx.buffers.moe_worklist_total(),
+                    max_tiles,
+                    stream,
+                )?;
+            } else if let (Some(gp), Some(up)) = (&self.gate_ptrs_t, &self.up_ptrs_t) {
                 // Block D #3 dispatch: M=128 path needs the env var on AND
                 // the kernel actually loaded (try_kernel returns 0 on
                 // models that don't ship it). max_m_tiles_m128 = ceil(...
@@ -198,7 +302,59 @@ impl MoeLayer {
                 total_expanded * inter,
                 stream,
             )?;
-            if let Some(dp) = &self.down_ptrs_t {
+            if self.nvfp4_moe_worklist {
+                let dp = self.down_ptrs_t.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ATLAS_NVFP4_MOE_WORKLIST=1 requires a transposed down expert pointer table"
+                    )
+                })?;
+                let n_tiles = h.div_ceil(ops::NVFP4_WORKLIST_N_TILE);
+                let max_tiles = ops::nvfp4_worklist_capacity_items(
+                    total_expanded as usize,
+                    ne,
+                    n_tiles,
+                    ops::NVFP4_WORKLIST_DOWN_M_TILE,
+                )?;
+                anyhow::ensure!(
+                    max_tiles as usize * 2 * std::mem::size_of::<u32>()
+                        <= ctx.buffers.sizes().moe_worklist,
+                    "NVFP4 down work-list bound exceeds persistent arena allocation"
+                );
+                ops::moe_w4a16_build_tile_worklist(
+                    ctx.gpu,
+                    self.moe_build_nvfp4_worklist_k,
+                    expert_offsets,
+                    dp.packed_ptrs,
+                    ctx.buffers.moe_worklist(),
+                    ctx.buffers.moe_worklist_total(),
+                    num_experts,
+                    n_tiles,
+                    ops::NVFP4_WORKLIST_DOWN_M_TILE,
+                    stream,
+                )?;
+                ops::moe_w4a16_grouped_gemm_ptrtable_k64_worklist(
+                    ctx.gpu,
+                    self.moe_grouped_gemm_t_k64_worklist_k,
+                    expert_gate_out,
+                    dp.packed_ptrs,
+                    dp.scale_ptrs,
+                    dp.scale2_vals,
+                    expert_down_out,
+                    expert_offsets,
+                    DevicePtr(0),
+                    num_experts,
+                    h,
+                    inter,
+                    ctx.buffers.moe_worklist(),
+                    ctx.buffers.moe_worklist_total(),
+                    max_tiles,
+                    stream,
+                )?;
+                static WORKLIST_ENGAGED: std::sync::Once = std::sync::Once::new();
+                WORKLIST_ENGAGED.call_once(|| {
+                    tracing::info!("ENGAGED ATLAS_NVFP4_MOE_WORKLIST: compact-m64-gate-up-down");
+                });
+            } else if let Some(dp) = &self.down_ptrs_t {
                 ops::moe_w4a16_grouped_gemm_ptrtable_n128(
                     ctx.gpu,
                     self.moe_grouped_gemm_t_k64,

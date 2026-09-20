@@ -24,7 +24,27 @@ pub struct BufferSizes {
     pub expert_gate_out: usize,
     pub expert_up_out: usize,
     pub expert_down_out: usize,
+    /// Compact NVFP4 MoE tile work-list: two u32 words per item.
+    pub moe_worklist: usize,
+    /// Device-written compact work-list length (one i32).
+    pub moe_worklist_total: usize,
     pub splitk_workspace: usize,
+}
+
+const NVFP4_WORKLIST_N_TILE: usize = 128;
+const NVFP4_WORKLIST_GATE_UP_M_TILE: usize = 64;
+const NVFP4_WORKLIST_DOWN_M_TILE: usize = 64;
+
+fn nvfp4_worklist_capacity_items(
+    total_expanded: usize,
+    num_experts: usize,
+    n_tiles: usize,
+    m_tile: usize,
+) -> usize {
+    // One expert may receive every row; spreading rows across experts adds at
+    // most one partial M tile per expert. The extra item mirrors the proven
+    // FP8 work-list bound and keeps the allocation conservative at boundaries.
+    (total_expanded.div_ceil(m_tile) + num_experts + 1) * n_tiles
 }
 
 impl BufferSizes {
@@ -124,6 +144,34 @@ impl BufferSizes {
         } else {
             k_max * h * bf16
         };
+
+        // Persistent compact work-list used by the default-off ordinary-NVFP4
+        // prefill route. Gate+up and down use the parent's compilable M64 K64
+        // kernels over fused 2*intermediate N and hidden-size N respectively.
+        // A single arena allocation is reused sequentially for both builders
+        // on the compute stream.
+        let moe_worklist = if config.num_experts > 0 {
+            let total_expanded = m * top_k;
+            let gate_up_n_tiles =
+                (2 * config.moe_intermediate_size).div_ceil(NVFP4_WORKLIST_N_TILE);
+            let down_n_tiles = h.div_ceil(NVFP4_WORKLIST_N_TILE);
+            let gate_up_items = nvfp4_worklist_capacity_items(
+                total_expanded,
+                config.num_experts,
+                gate_up_n_tiles,
+                NVFP4_WORKLIST_GATE_UP_M_TILE,
+            );
+            let down_items = nvfp4_worklist_capacity_items(
+                total_expanded,
+                config.num_experts,
+                down_n_tiles,
+                NVFP4_WORKLIST_DOWN_M_TILE,
+            );
+            gate_up_items.max(down_items) * 2 * std::mem::size_of::<u32>()
+        } else {
+            256
+        };
+        let moe_worklist_total = std::mem::size_of::<i32>();
 
         // Logits: only last token used during prefill. Cap at 32 tokens
         // (sufficient for decode=1, batched_decode=8, spec_verify≤5,
@@ -269,6 +317,8 @@ impl BufferSizes {
             expert_gate_out,
             expert_up_out,
             expert_down_out,
+            moe_worklist,
+            moe_worklist_total,
             splitk_workspace,
         }
     }
@@ -292,6 +342,25 @@ impl BufferSizes {
             + self.expert_gate_out
             + self.expert_up_out
             + self.expert_down_out
+            + self.moe_worklist
+            + self.moe_worklist_total
             + self.splitk_workspace
+    }
+}
+
+#[cfg(test)]
+mod worklist_tests {
+    use super::nvfp4_worklist_capacity_items;
+
+    #[test]
+    fn flash_next_16k_capacity_matches_gate_up_and_down_geometry() {
+        let total_expanded = 16_000 * 10;
+        let experts = 512;
+        let gate_up_items = nvfp4_worklist_capacity_items(total_expanded, experts, 10, 64);
+        let down_items = nvfp4_worklist_capacity_items(total_expanded, experts, 20, 64);
+
+        assert_eq!(gate_up_items * 8, 241_040);
+        assert_eq!(down_items * 8, 482_080);
+        assert!(down_items > gate_up_items);
     }
 }

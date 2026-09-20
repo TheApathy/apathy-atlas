@@ -22,6 +22,9 @@
 //! - `sampling_setup` — preset / penalty / stop-token / grammar /
 //!                      timeout / logprobs resolution
 
+mod image_admission;
+#[cfg(test)]
+mod image_admission_tests;
 mod loop_detect;
 mod msg_entry;
 pub(super) mod repair_json;
@@ -92,6 +95,22 @@ pub(crate) async fn chat_completions_inner(
     if let Err(resp) = super::chat_phases::validate_input(&req) {
         return resp;
     }
+    for message in &req.messages {
+        if let Err(error) = message.content.validate_order() {
+            return openai_error_response(StatusCode::BAD_REQUEST, error);
+        }
+    }
+    let image_count = req.messages.iter().fold(0usize, |count, m| {
+        count.saturating_add(m.content.images.len())
+    });
+    if let Err(error) = image_admission::validate(
+        image_count,
+        state.vision_config.is_some(),
+        state.max_batch_size,
+        state.yarn_context,
+    ) {
+        return openai_error_response(StatusCode::BAD_REQUEST, error.into());
+    }
     let f23_metrics = super::chat_phases::apply_failure_guards(&mut req);
     let _ = f23_metrics; // kept available for downstream consumers
 
@@ -108,7 +127,9 @@ pub(crate) async fn chat_completions_inner(
         let tool_choice = req.tool_choice.as_ref().unwrap_or(&default_choice);
         let tool_prompt = parser.system_prompt(req.tools.as_deref().unwrap_or(&[]), tool_choice);
         if let Some(first) = req.messages.first_mut().filter(|m| m.role == "system") {
-            first.content.text = format!("{}\n\n{}", tool_prompt, first.content.text);
+            if let Err(e) = first.content.prepend_text(&format!("{tool_prompt}\n\n")) {
+                return super::compact::openai_error_response(StatusCode::BAD_REQUEST, e);
+            }
         } else {
             req.messages.insert(
                 0,
@@ -167,7 +188,9 @@ pub(crate) async fn chat_completions_inner(
         let mask = crate::observation_mask::compute_masking(&bodies, 2);
         let mut masked_count = 0usize;
         for (i, replacement) in mask.into_iter().enumerate() {
-            if let Some(new_body) = replacement {
+            if let Some(new_body) = replacement
+                && messages[i].image_count == 0
+            {
                 messages[i].content = new_body;
                 masked_count += 1;
             }

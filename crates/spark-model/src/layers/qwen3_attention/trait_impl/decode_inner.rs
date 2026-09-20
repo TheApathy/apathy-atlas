@@ -12,6 +12,7 @@ use super::super::Qwen3AttentionLayer;
 use super::{diag_norm, diag_norm_f32, gemma4_diag_enabled};
 use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
+use crate::layers::qwen3_attention::{Qwen4K5DeviceAttentionPlan, Qwen4K5DeviceAttentionTopology};
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
@@ -40,6 +41,12 @@ impl Qwen3AttentionLayer {
         let metadata = ctx
             .attn_metadata
             .ok_or_else(|| anyhow::anyhow!("Qwen4 batched attention requires metadata"))?;
+        let device_attention_plan =
+            Qwen4K5DeviceAttentionPlan::from_host(ctx.config, num_tokens, seq_len, metadata)?;
+        if let Some(plan) = device_attention_plan {
+            let _topology: Qwen4K5DeviceAttentionTopology = plan.topology();
+            self.prepare_qwen4_k5_device_attention(plan, kv_cache, metadata, ctx)?;
+        }
         let h = ctx.config.hidden_size;
         let row_bytes = ctx.config.residual_width() * 2;
         let core_bytes = h * 2;
@@ -89,6 +96,9 @@ impl Qwen3AttentionLayer {
             ctx.gpu
                 .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
         }
+        // The projection helper retains the legacy exact K5/K9 path and may
+        // independently admit exact K16 for gamma-15 verification. Attention
+        // and KV writes below stay row-ordered in either case.
         let exact_qkv = self.qwen4_k5_project_qkv_exact(attn_inputs, num_tokens, ctx, stream)?;
         for row in 0..num_tokens {
             let hidden_row = hidden.offset(row * row_bytes);
@@ -108,7 +118,22 @@ impl Qwen3AttentionLayer {
                 ..*ctx
             };
             let attn_input = attn_inputs.offset(row * core_bytes);
-            let attn_out = if let Some((qkv, qkv_row_bytes)) = exact_qkv {
+            let attn_out = if let Some(plan) = device_attention_plan {
+                let (qkv, qkv_row_bytes) = exact_qkv.ok_or_else(|| {
+                    anyhow::anyhow!("ATLAS_QWEN4_K5_DEVICE_ATTN_GRAPH lost exact K5 QKV admission")
+                })?;
+                self.attention_forward_preprojected_device(
+                    attn_input,
+                    qkv.offset(row * qkv_row_bytes),
+                    plan.row(row)?,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    kv_cache,
+                    &token_ctx,
+                    stream,
+                )?
+            } else if let Some((qkv, qkv_row_bytes)) = exact_qkv {
                 self.attention_forward_preprojected(
                     attn_input,
                     qkv.offset(row * qkv_row_bytes),

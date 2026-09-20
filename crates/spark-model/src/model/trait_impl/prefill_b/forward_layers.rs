@@ -96,6 +96,11 @@ impl TransformerModel {
         // and the decode MoE path, which is ~7x faster per layer than the prefill
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
         let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
+        let prefill_receipt = if use_decode_path {
+            None
+        } else {
+            crate::model::qwen4_prefill_engagement::begin(&self.config, proc_count)?
+        };
         let layer_kv_write_start = super::cached_kv_rows_in_slice(
             seq.cached_prefix_tokens,
             effective_seq_len_start,
@@ -113,22 +118,56 @@ impl TransformerModel {
                 && let Some(ple) = &self.qwen4_ple
             {
                 let row_bytes = self.config.residual_width() * 2;
-                let mut prior = tokens[..effective_seq_len_start.min(tokens.len())].to_vec();
                 let end = effective_seq_len_start
                     .saturating_add(proc_count)
                     .min(tokens.len());
-                for (row, &token) in tokens[effective_seq_len_start..end].iter().enumerate() {
-                    ple.forward_token(
-                        token,
-                        &prior,
-                        hidden.offset(row * row_bytes),
+                let prior = &tokens[..effective_seq_len_start.min(tokens.len())];
+                let current = &tokens[effective_seq_len_start..end];
+                anyhow::ensure!(
+                    current.len() == proc_count,
+                    "Qwen4 PLE chunk extent {} != proc_count {proc_count}",
+                    current.len()
+                );
+                if std::env::var("ATLAS_QWEN4_PLE_PREFILL_BATCH")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    ple.forward_prefill(
+                        current,
+                        prior,
+                        hidden,
                         seq.slot_idx,
-                        effective_seq_len_start == 0 && row == 0,
+                        effective_seq_len_start == 0,
                         self.gpu.as_ref(),
                         stream,
                     )?;
-                    prior.push(token);
+                } else {
+                    let mut history = prior.to_vec();
+                    for (row, &token) in current.iter().enumerate() {
+                        ple.forward_token(
+                            token,
+                            &history,
+                            hidden.offset(row * row_bytes),
+                            seq.slot_idx,
+                            effective_seq_len_start == 0 && row == 0,
+                            self.gpu.as_ref(),
+                            stream,
+                        )?;
+                        history.push(token);
+                    }
                 }
+                ple.capture_post_prefill_parity(
+                    hidden,
+                    tokens,
+                    prior,
+                    current,
+                    effective_seq_len_start,
+                    seq.slot_idx,
+                    effective_seq_len_start == 0,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
             }
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
@@ -277,6 +316,9 @@ impl TransformerModel {
                 total_us as f64 / 1000.0,
                 top5.join(", "),
             );
+        }
+        if let Some(receipt) = prefill_receipt {
+            receipt.finish()?;
         }
         Ok(())
     }

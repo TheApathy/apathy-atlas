@@ -9,7 +9,27 @@ use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
 
+/// One shared Qwen4 routed-expert transpose arena. Projection order is
+/// gate/up/down; pointer-table arrays address the corresponding arena slices.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeStreamTransposeScratch {
+    pub(crate) packed: [DevicePtr; 3],
+    pub(crate) scale: [DevicePtr; 3],
+    pub(crate) packed_tables: [DevicePtr; 3],
+    pub(crate) scale_tables: [DevicePtr; 3],
+}
+
 pub trait TransformerLayer: Send + Sync {
+    /// Preflight the optional exact Qwen4 M16 attention path before request state changes.
+    fn preflight_qwen4_attn16(
+        &self,
+        _kv_cache: &PagedKvCache,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Install Qwen4-Exp gated-residual mixers after the ordinary core layer
     /// has been assembled. Other architectures fail closed by default.
     fn set_qwen4_hyperconnections(
@@ -358,6 +378,11 @@ pub trait TransformerLayer: Send + Sync {
         _scale_ptrs_t: DevicePtr,
     ) {
     }
+
+    /// Wire the shared complete gate/up/down streaming-transpose arena.
+    /// Originals remain authoritative for decode; prefill overwrites this
+    /// scratch immediately before each layer consumes it.
+    fn set_moe_stream_transpose_scratch(&mut self, _scratch: MoeStreamTransposeScratch) {}
 
     /// Phase 8a unified-layout MoE transpose: build persistent transposed
     /// gate/up/down for all experts and free the untransposed copies.

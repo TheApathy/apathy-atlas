@@ -219,4 +219,32 @@ DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT_RT(
 DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT_RT(
     w4a16_gemv_batch_logits_exact_rt2_m32, 32, 2)
 
+extern "C" __global__ void w4a16_gemv_batch_logits_exact_rt2_m32_grid(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K)
+{
+    const unsigned int row_start = blockIdx.y * 32u;
+    if (row_start >= M) return;
+    const unsigned int tile_rows = min(32u, M - row_start);
+    __shared__ float s_lut[16];
+    __shared__ float smem[32 * N_PER_BLOCK * 2 * 2];
+    w4a16_gemv_batch_logits_exact_rt_body<32, 2>(
+        A + (unsigned long long)row_start * K,
+        B_packed,
+        B_scale,
+        scale2,
+        C + (unsigned long long)row_start * N,
+        tile_rows,
+        N,
+        K,
+        s_lut,
+        smem);
+}
+
 #undef DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT_RT

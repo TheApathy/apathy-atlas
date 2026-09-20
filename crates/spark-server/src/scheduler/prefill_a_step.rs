@@ -143,9 +143,8 @@ pub fn start_chunked_prefill(
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
-        }
+        // Empty input invalidates the prior request's published images.
+        model.prepare_vision_embed(&image_pixels)?;
 
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do

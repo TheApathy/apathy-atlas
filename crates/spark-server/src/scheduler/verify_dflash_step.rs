@@ -7,6 +7,8 @@ use super::*;
 
 #[path = "verify_dflash_capacity.rs"]
 pub(super) mod dflash_capacity;
+#[path = "verify_dflash_k16_fixture.rs"]
+mod k16_acceptance_fixture;
 
 /// ATLAS_DFLASH_BRANCH_AUDIT=1 cross-step stash: session_hash →
 /// `(expected_argmax_after_fork, fork_token)` recorded on a step whose
@@ -67,6 +69,7 @@ struct SerialOracleReplay {
     verified: Vec<u32>,
     logits_rows: Vec<Vec<u8>>,
     logits_format: VerifyLogitsFormat,
+    k16_commit_parity: bool,
 }
 
 fn serial_oracle_requested(model: &dyn Model, a: &ActiveSeq) -> bool {
@@ -193,6 +196,7 @@ fn collect_serial_oracle(
     let pre_verify_len = seq.seq_len;
     let pre_verify_tokens = seq.tokens.len();
     let capture_stages = model.k1_stage_diag_requested(pre_verify_len, tokens)?;
+    let k16_commit_parity = model.k16_commit_parity_requested(pre_verify_len, tokens)?;
     if trajectory_selector_matches(pre_verify_len, tokens)? {
         if pre_verify_tokens != pre_verify_len {
             anyhow::bail!(
@@ -244,6 +248,7 @@ fn collect_serial_oracle(
             verified,
             logits_rows,
             logits_format,
+            k16_commit_parity,
         })
     })();
 
@@ -347,6 +352,47 @@ pub fn step_verify_dflash(
         );
         a.pending_tree_payload = None;
     }
+
+    // Qualification-only target-chain fixture. It is strictly selector-bound,
+    // reconstructs the greedy chain with ordinary K1 decode, then restores the
+    // exact pre-verify state before substituting a same-width flat draft frame.
+    let neutral_greedy = !think.enabled
+        && !a.inside_thinking
+        && !a.think_ended
+        && !a.think_just_ended
+        && !a.require_tool_call
+        && !a.suppress_tool_call
+        && !a.inside_tool_body
+        && a.output_tokens.len() >= a.min_tokens
+        && !content_policy_required(a, think);
+    let fixture_last_token = a.last_token;
+    let fixture_draft_len = drafts.len();
+    let fixture_flat_frame = a.pending_tree_payload.is_none();
+    let fixture_c1_diagnostic = spec_cycle.qualification_c1_active();
+    let prepared_fixture = match k16_acceptance_fixture::prepare(
+        model,
+        &mut a.seq,
+        fixture_last_token,
+        fixture_draft_len,
+        num_drafts,
+        fixture_flat_frame,
+        fixture_c1_diagnostic,
+        neutral_greedy,
+    ) {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            tracing::error!("K16 acceptance fixture rejected the step: {error:#}");
+            a.pending_drafts.clear();
+            a.pending_tree_payload = None;
+            a.finished = true;
+            return;
+        }
+    };
+    let (mut acceptance_fixture, forced_drafts) = match prepared_fixture {
+        Some(prepared) => (Some(prepared.frame), Some(prepared.drafts)),
+        None => (None, None),
+    };
+    let drafts = forced_drafts.as_deref().unwrap_or(drafts);
 
     // tokens = [last_verified, draft_0, draft_1, ..., draft_{γ-1}]
     //
@@ -514,6 +560,23 @@ pub fn step_verify_dflash(
     }
 
     let spec_phase = spec_cycle.setup(spec_phase);
+    // Arm only the already-selected one-shot fixture, after its serial replay
+    // has restored this exact frame and immediately before production verify.
+    // The guard aborts both receipts on every early-return path.
+    let mut fixture_evidence = if acceptance_fixture.is_some() {
+        match k16_acceptance_fixture::EvidenceGuard::begin(model, a.seq.seq_len, &tokens) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::error!("K16 acceptance fixture evidence arm failed: {error:#}");
+                model.k16_fixture_evidence_abort();
+                model.clear_ddtree_parent_ids();
+                a.finished = true;
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let t_verify = Instant::now();
     let mut verified = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
@@ -581,6 +644,15 @@ pub fn step_verify_dflash(
     };
     if think_masked > 0 {
         tracing::debug!("think mask: verified patched {think_masked} position(s) this step");
+    }
+    if let Some(fixture) = acceptance_fixture.as_mut()
+        && let Err(error) = fixture.observe(drafts, &verified, serial_oracle.is_some())
+    {
+        tracing::error!("K16 acceptance fixture target-chain mismatch: {error:#}");
+        model.k1_stage_diag_abort();
+        model.clear_ddtree_parent_ids();
+        a.finished = true;
+        return;
     }
     // Note: clear_ddtree_parent_ids is deferred until AFTER
     // commit_verify_state_async so the commit knows tree mode was active
@@ -982,6 +1054,25 @@ pub fn step_verify_dflash(
         (n, None)
     };
 
+    // Per-position acceptance diagnostics (ATLAS_MTP_ACCEPT_LOG=1, inert
+    // otherwise). Draft slot i compares against verified[i] — the target's
+    // argmax row for that slot, the same equality `exact_accept_prefix` uses.
+    // Logged after acceptance is derived so `num_accepted` is the final,
+    // policy/grammar/tree-adjusted count. seq_len is the pre-verify length
+    // (the verifier has over-extended it by tokens.len() at this point).
+    record_accept(
+        if model.proposer_is_dflash() {
+            "dflash"
+        } else {
+            "mtp"
+        },
+        a.seq.seq_len.saturating_sub(tokens.len()),
+        num_drafts,
+        drafts,
+        &verified,
+        num_accepted,
+    );
+
     // Release the EP worker immediately after rank 0 derives acceptance. A
     // policy/D2H failure cannot commit a valid prefix, so send the abort
     // sentinel; otherwise the worker mirrors seq trim + recurrent checkpoint
@@ -1223,29 +1314,72 @@ pub fn step_verify_dflash(
                 batch_argmax == serial_argmax,
             );
         }
-        a.seq.seq_len = pre_verify_len;
-        a.seq.tokens.truncate(pre_verify_len);
-        let mut result = model.pre_verify_copy_async(&mut a.seq);
-        if result.is_ok() {
-            for &token in tokens.iter().take(total_accepted) {
-                match model.decode(token, &mut a.seq, 0) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        result = Err(e);
-                        break;
+        if oracle.k16_commit_parity {
+            (|| {
+                // Full accept is the one real-commit branch that consumes the
+                // verifier's live H/conv state instead of an intermediate.
+                // Preserve that exact live image before the serial replay.
+                let wide_live = if total_accepted == k_verify {
+                    Some(model.k16_commit_parity_capture_live(&a.seq)?)
+                } else {
+                    None
+                };
+
+                // Build exactly the serial K1 state selected by acceptance,
+                // capture it once, then restore the real commit's required
+                // pre-state (partial) or verifier live state (full).
+                a.seq.seq_len = pre_verify_len;
+                a.seq.tokens.truncate(pre_verify_len);
+                model.pre_verify_copy_async(&mut a.seq)?;
+                for &token in tokens.iter().take(total_accepted) {
+                    model.decode(token, &mut a.seq, 0)?;
+                }
+                let expected = model.k16_commit_parity_capture_live(&a.seq)?;
+                model.pre_verify_copy_async(&mut a.seq)?;
+                if let Some(ref wide) = wide_live {
+                    model.k16_commit_parity_restore_live(&a.seq, wide)?;
+                }
+                model.k16_commit_parity_drain_default()?;
+
+                // Execute the production flat-chain K16 commit itself.  The
+                // comparison hook waits for its owned event before reading
+                // any live/checkpoint bytes.
+                model.commit_verify_state_async(&mut a.seq, total_accepted, k_verify)?;
+                model.k16_commit_parity_compare_committed(
+                    &a.seq,
+                    &expected,
+                    pre_verify_len,
+                    &tokens,
+                    total_accepted,
+                    k_verify,
+                    last_inter_slot,
+                )
+            })()
+        } else {
+            a.seq.seq_len = pre_verify_len;
+            a.seq.tokens.truncate(pre_verify_len);
+            let mut result = model.pre_verify_copy_async(&mut a.seq);
+            if result.is_ok() {
+                for &token in tokens.iter().take(total_accepted) {
+                    match model.decode(token, &mut a.seq, 0) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
                     }
                 }
             }
+            if result.is_ok() {
+                tracing::info!(
+                    "DFLASH_SERIAL_COMMIT rebuilt={} seq_len={} pre_verify_len={}",
+                    total_accepted,
+                    a.seq.seq_len,
+                    pre_verify_len,
+                );
+            }
+            result
         }
-        if result.is_ok() {
-            tracing::info!(
-                "DFLASH_SERIAL_COMMIT rebuilt={} seq_len={} pre_verify_len={}",
-                total_accepted,
-                a.seq.seq_len,
-                pre_verify_len,
-            );
-        }
-        result
     } else if tree_last_inter_slot.is_some() {
         model.commit_verify_state_async_with_slot(
             &mut a.seq,
@@ -1263,6 +1397,20 @@ pub fn step_verify_dflash(
         model.clear_ddtree_parent_ids();
         a.finished = true;
         return;
+    }
+    if let Some(fixture) = acceptance_fixture.as_ref() {
+        let Some(evidence) = fixture_evidence.take() else {
+            tracing::error!("K16 acceptance fixture lacks its armed evidence guard");
+            model.clear_ddtree_parent_ids();
+            a.finished = true;
+            return;
+        };
+        if let Err(error) = fixture.finish(evidence, num_accepted, pre_verify_len, &tokens) {
+            tracing::error!("K16 acceptance fixture commit receipt failed: {error:#}");
+            model.clear_ddtree_parent_ids();
+            a.finished = true;
+            return;
+        }
     }
     // M8A: now safe to clear — commit has finished reading the tree-mode flag.
     model.clear_ddtree_parent_ids();

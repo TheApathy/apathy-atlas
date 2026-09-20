@@ -125,15 +125,25 @@ impl BlockDiffusionDraftHead {
         let force_ctx_used: Option<usize> = std::env::var("ATLAS_DFLASH_DEBUG_CTX_USED")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
-        let (ctx_base_ptr, ctx_total, eff_ctx) = if dstate.ctx_len > 0 && !force_no_ctx {
-            let n = dstate.ctx_len;
+        let ring = dstate.ctx_ring_state()?;
+        anyhow::ensure!(
+            position == ring.absolute_len,
+            "DFlash proposal position {position} does not match target-hidden absolute cursor {}",
+            ring.absolute_len,
+        );
+        let (ctx_base_ptr, ctx_total, eff_ctx) = if ring.resident_len > 0 && !force_no_ctx {
+            let n = ring.resident_len;
             let eff = match force_ctx_used {
                 Some(forced) => forced.min(n).min(self.ctx_window),
                 None => n.min(self.ctx_window),
             };
-            (Some(dstate.ctx_hidden_acc), n, eff)
+            (
+                (eff > 0).then_some(dstate.ctx_hidden_acc),
+                ring.absolute_len,
+                eff,
+            )
         } else {
-            (None, 0, 0)
+            (None, ring.absolute_len, 0)
         };
         // Noise block layout (vLLM PR #40898 alignment): (γ_eff+1) query
         // tokens = 1 bonus (last_token) + γ_eff MASK rows. Drafts read from
@@ -204,8 +214,10 @@ impl BlockDiffusionDraftHead {
         // then per-row RMSNorm through `self.hidden_norm`. Results land
         // contiguously in `scratch.fc_proj` shaped `[eff_ctx, hidden]`.
         if let Some(base) = ctx_base_ptr {
-            // Walk the LAST `eff_ctx` slots of the accumulator.
-            let start_slot = ctx_total.saturating_sub(eff_ctx);
+            let needed_start = ctx_total
+                .checked_sub(eff_ctx)
+                .ok_or_else(|| anyhow::anyhow!("DFlash resident tail underflowed"))?;
+            let ctx_gather = ring.plan_gather(needed_start, eff_ctx)?;
             // ATLAS_DFLASH_ZERO_LATE_LAYERS=N zeros out the LAST N capture
             // layer slots per ctx position before the fc projection. This
             // is a workaround for SSM kernel numerical drift that
@@ -252,10 +264,16 @@ impl BlockDiffusionDraftHead {
                 let needed = eff_ctx * ctx_slot_bytes;
                 match std::fs::read(&p) {
                     Ok(hf_bytes) if hf_bytes.len() >= needed => {
-                        gpu.copy_h2d(
-                            &hf_bytes[..needed],
-                            base.offset(start_slot * ctx_slot_bytes),
-                        )?;
+                        for span in ctx_gather.spans() {
+                            let src_start = span.dst_slot * ctx_slot_bytes;
+                            let byte_count = span.slot_count * ctx_slot_bytes;
+                            gpu.copy_h2d(
+                                &hf_bytes[src_start..src_start + byte_count],
+                                base.offset(span.src_slot * ctx_slot_bytes),
+                            )?;
+                        }
+                        dstate.cache_fc_start = needed_start;
+                        dstate.cache_fc_end = needed_start;
                         if debug_dump {
                             tracing::info!(
                                 "DFLASH HF_OVERRIDE: loaded {} bytes from {}",
@@ -296,13 +314,17 @@ impl BlockDiffusionDraftHead {
                 let n_zero = zero_late.min(n_capture);
                 let h_bytes = self.target_hidden_size * bf16;
                 for slot_i in 0..eff_ctx {
-                    let slot_base = base.offset((start_slot + slot_i) * ctx_slot_bytes);
+                    let absolute_position = needed_start + slot_i;
+                    let physical_slot = ring.slot_for(absolute_position)?;
+                    let slot_base = base.offset(physical_slot * ctx_slot_bytes);
                     // Zero the LAST n_zero layer slices (indices n_capture-n_zero .. n_capture)
                     for layer_i in (n_capture - n_zero)..n_capture {
                         let layer_ptr = slot_base.offset(layer_i * h_bytes);
                         gpu.memset(layer_ptr, 0, h_bytes)?;
                     }
                 }
+                dstate.cache_fc_start = needed_start;
+                dstate.cache_fc_end = needed_start;
                 if debug_dump {
                     tracing::info!(
                         "DFLASH ZERO_LATE: zeroed last {} of {} capture layers across {} ctx slots",
@@ -335,13 +357,17 @@ impl BlockDiffusionDraftHead {
                         bytes.extend_from_slice(&bf16_bits.to_le_bytes());
                     }
                 }
-                gpu.copy_h2d(&bytes, base.offset(start_slot * ctx_slot_bytes))?;
+                let physical_slot = ring.slot_for(needed_start)?;
+                gpu.copy_h2d(&bytes, base.offset(physical_slot * ctx_slot_bytes))?;
+                dstate.cache_fc_start = needed_start;
+                dstate.cache_fc_end = needed_start;
             }
             // Dump the FIRST ctx slot's input target_hidden_stack (first 10 floats).
             if eff_ctx > 0 {
+                let physical_slot = ring.slot_for(needed_start)?;
                 dump_bf16(
                     "step0.input.target_hidden_stack[0]",
-                    base.offset(start_slot * ctx_slot_bytes),
+                    base.offset(physical_slot * ctx_slot_bytes),
                     10,
                 )?;
             }
@@ -372,7 +398,14 @@ impl BlockDiffusionDraftHead {
                 let n_bytes = eff_ctx * ctx_slot_bytes;
                 let mut buf = vec![0u8; n_bytes];
                 gpu.synchronize(stream)?;
-                gpu.copy_d2h(base.offset(start_slot * ctx_slot_bytes), &mut buf)?;
+                for span in ctx_gather.spans() {
+                    let dst_start = span.dst_slot * ctx_slot_bytes;
+                    let byte_count = span.slot_count * ctx_slot_bytes;
+                    gpu.copy_d2h(
+                        base.offset(span.src_slot * ctx_slot_bytes),
+                        &mut buf[dst_start..dst_start + byte_count],
+                    )?;
+                }
                 if let Err(e) = std::fs::write("/tmp/atlas_target_hidden.bin", &buf) {
                     tracing::warn!("DFLASH DUMP_FULL: target_hidden write failed: {e}");
                 } else {
@@ -407,11 +440,23 @@ impl BlockDiffusionDraftHead {
                 FULL_DUMP_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             // Persistent fc_proj cache: copy old positions, compute new ones.
-            let needed_start = ctx_total.saturating_sub(eff_ctx);
-            let old_fc_end = needed_start
-                .saturating_add(eff_ctx)
-                .min(dstate.cache_fc_end)
-                .max(needed_start);
+            let resident_start = ring.resident_start();
+            let mut resident_cache_start = dstate.cache_fc_start.max(resident_start);
+            let mut resident_cache_end = dstate.cache_fc_end.min(ring.absolute_len);
+            if resident_cache_start > resident_cache_end
+                || resident_cache_end - resident_cache_start > self.ctx_window
+            {
+                resident_cache_start = needed_start;
+                resident_cache_end = needed_start;
+            }
+            dstate.cache_fc_start = resident_cache_start;
+            dstate.cache_fc_end = resident_cache_end;
+            let old_fc_end =
+                if resident_cache_start <= needed_start && resident_cache_end >= needed_start {
+                    (needed_start + eff_ctx).min(resident_cache_end)
+                } else {
+                    needed_start
+                };
             let old_fc_count = old_fc_end.saturating_sub(needed_start);
             let new_fc_count = eff_ctx.saturating_sub(old_fc_count);
             // PERF (2026-05-19): demoted from tracing::info! — fired on every
@@ -480,22 +525,25 @@ impl BlockDiffusionDraftHead {
                     && self.fc_nvfp4.is_some();
                 if batched_nvfp4 {
                     let fc_q = self.fc_nvfp4.as_ref().unwrap();
-                    let src = base.offset(old_fc_end * ctx_slot_bytes);
-                    let dst = self
-                        .scratch
-                        .fc_proj
-                        .offset(old_fc_count * self.hidden_size * bf16);
-                    ops::w4a16_gemm(
-                        gpu,
-                        self.kernels.w4a16_gemm,
-                        src,
-                        fc_q,
-                        dst,
-                        new_fc_count as u32,
-                        h,
-                        target_hidden_dim as u32,
-                        stream,
-                    )?;
+                    let new_gather = ring.plan_gather(old_fc_end, new_fc_count)?;
+                    for span in new_gather.spans() {
+                        let src = base.offset(span.src_slot * ctx_slot_bytes);
+                        let dst = self
+                            .scratch
+                            .fc_proj
+                            .offset((old_fc_count + span.dst_slot) * self.hidden_size * bf16);
+                        ops::w4a16_gemm(
+                            gpu,
+                            self.kernels.w4a16_gemm,
+                            src,
+                            fc_q,
+                            dst,
+                            span.slot_count as u32,
+                            h,
+                            target_hidden_dim as u32,
+                            stream,
+                        )?;
+                    }
                 }
                 // Per-position fallback: fc_layernorm path (per-slice RMSNorm)
                 // and the dense (non-NVFP4) path. Skipped entirely when the
@@ -505,7 +553,8 @@ impl BlockDiffusionDraftHead {
                         break;
                     }
                     let abs_pos = old_fc_end + i;
-                    let raw_slot = base.offset(abs_pos * ctx_slot_bytes);
+                    let physical_slot = ring.slot_for(abs_pos)?;
+                    let raw_slot = base.offset(physical_slot * ctx_slot_bytes);
                     // Per-layer FC-norm: copy each of the n_capture target-layer
                     // slices [target_hidden_size] into fc_norm_in, unit-variance
                     // RMS-normalized independently, then feed the normalized
@@ -710,7 +759,9 @@ impl BlockDiffusionDraftHead {
         let denoise_freeze =
             std::env::var("ATLAS_DFLASH_DENOISE_FREEZE").ok().as_deref() != Some("0");
         let argmax_vocab = self.target_vocab_size.min(self.vocab_size);
-        let needed_start = ctx_total.saturating_sub(eff_ctx);
+        let needed_start = ctx_total
+            .checked_sub(eff_ctx)
+            .ok_or_else(|| anyhow::anyhow!("DFlash attention tail underflowed"))?;
         let pass_args = super::noise_pass::NoisePassArgs {
             last_token,
             eff_ctx,

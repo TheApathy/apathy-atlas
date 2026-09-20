@@ -24,7 +24,10 @@ impl TransformerModel {
     ) -> Result<(usize, bool)> {
         let bs = kv_cache.block_size();
         if chunk_start == 0 {
-            let mut prefix_match = if self.tokens_have_vision_pad(tokens) {
+            let mut prefix_match = if self.tokens_have_vision_pad(tokens)
+                || (self.config.is_qwen4_exp()
+                    && crate::layers::qwen4_prefill_moe::attn16::selected()?)
+            {
                 spark_runtime::prefix_cache::PrefixMatch::empty()
             } else {
                 self.lookup_prefill_prefix(tokens, bs, seq.session_hash)

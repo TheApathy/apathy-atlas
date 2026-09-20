@@ -11,6 +11,7 @@ use self::config::{Dimensions, validate_config};
 use super::dflash_loader::DflashConfig;
 
 mod config;
+mod native_flash_next;
 
 #[derive(Clone, Copy)]
 struct TensorMetadata<'a> {
@@ -40,7 +41,21 @@ pub(super) fn validate_dflash_store(
     store: &WeightStore,
     config: &DflashConfig,
 ) -> Result<Option<&'static str>> {
+    // WeightStore exposes only GPU pointers plus structural metadata. This
+    // proves BF16 dtype, exact names/shapes/count, and parameter cardinality;
+    // it cannot prove numerical finiteness. Native promotion must separately
+    // carry the pre-upload safetensor finiteness receipt.
     validate_dflash_metadata(store, config)
+}
+
+pub(super) fn validate_native_flash_next_config(config: &DflashConfig) -> Result<()> {
+    native_flash_next::validate_config_if_candidate(config)
+}
+
+pub(super) fn native_flash_next_finiteness_manifest(
+    config: &DflashConfig,
+) -> Result<Option<std::collections::BTreeMap<String, Vec<usize>>>> {
+    native_flash_next::finiteness_manifest_if_candidate(config)
 }
 
 fn validate_dflash_metadata(
@@ -68,6 +83,7 @@ fn validate_dflash_metadata(
     validate_required_tensors(source, prefix, config, dimensions)?;
     validate_markov_tensors(source, prefix, config)?;
     validate_confidence_tensors(source, prefix, config)?;
+    native_flash_next::validate_store_if_candidate(source, prefix, config)?;
     Ok(Some(prefix))
 }
 
@@ -267,6 +283,10 @@ fn validate_confidence_tensors(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dflash_validation/native_flash_next_tests.rs"]
+mod native_flash_next_tests;
 
 #[cfg(test)]
 #[path = "dflash_validation_tests.rs"]

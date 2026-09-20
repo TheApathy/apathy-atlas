@@ -299,6 +299,78 @@ impl Model for TransformerModel {
     fn k1_stage_diag_abort(&self) {
         crate::model::k1_stage_diag::abort();
     }
+    fn k16_fixture_evidence_begin(&self, pre_verify_len: usize, tokens: &[u32]) -> Result<()> {
+        crate::model::k1_stage_diag::arm_fixture_receipt(pre_verify_len, tokens)?;
+        if let Err(error) = crate::model::k16_route_receipt::begin(pre_verify_len, tokens) {
+            crate::model::k1_stage_diag::abort();
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn k16_fixture_evidence_finish(&self, pre_verify_len: usize, tokens: &[u32]) -> Result<()> {
+        let routes = crate::model::k16_route_receipt::take_exact(pre_verify_len, tokens)?;
+        let stages = crate::model::k1_stage_diag::take_fixture_report(pre_verify_len, tokens)?;
+        tracing::info!(
+            run_id = stages.manifest.run_id.as_str(),
+            verify_step = stages.manifest.verify_step,
+            pre_verify_len,
+            inputs = ?tokens,
+            route_pre_verify_len = routes.pre_verify_len,
+            route_inputs = ?routes.tokens,
+            stages = stages.stages,
+            terminal_stage = stages.terminal_stage.as_str(),
+            logits_compared = stages.logits_compared,
+            batched_entries = routes.batched_entries,
+            qkv_layers = routes.qkv_layers,
+            ssm_layers = routes.ssm_layers,
+            "DFLASH_K16_FIXTURE_EVIDENCE exact_stage_and_route_match"
+        );
+        Ok(())
+    }
+    fn k16_fixture_evidence_abort(&self) {
+        crate::model::k16_route_receipt::abort();
+        crate::model::k1_stage_diag::abort();
+    }
+    fn k16_commit_parity_requested(&self, pre_verify_len: usize, tokens: &[u32]) -> Result<bool> {
+        crate::model::k16_commit_parity::requested_at(self, pre_verify_len, tokens)
+    }
+    fn k16_commit_parity_capture_live(
+        &self,
+        seq: &SequenceState,
+    ) -> Result<crate::model::k16_commit_parity::CanonicalStateSnapshot> {
+        crate::model::k16_commit_parity::capture_live(self, seq)
+    }
+    fn k16_commit_parity_restore_live(
+        &self,
+        seq: &SequenceState,
+        snapshot: &crate::model::k16_commit_parity::CanonicalStateSnapshot,
+    ) -> Result<()> {
+        crate::model::k16_commit_parity::restore_live(self, seq, snapshot)
+    }
+    fn k16_commit_parity_drain_default(&self) -> Result<()> {
+        crate::model::k16_commit_parity::drain_default(self)
+    }
+    fn k16_commit_parity_compare_committed(
+        &self,
+        seq: &SequenceState,
+        expected: &crate::model::k16_commit_parity::CanonicalStateSnapshot,
+        pre_verify_len: usize,
+        tokens: &[u32],
+        total_accepted: usize,
+        k: usize,
+        last_inter_slot: usize,
+    ) -> Result<()> {
+        crate::model::k16_commit_parity::compare_committed(
+            self,
+            seq,
+            expected,
+            pre_verify_len,
+            tokens,
+            total_accepted,
+            k,
+            last_inter_slot,
+        )
+    }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
     }

@@ -18,6 +18,9 @@ pub struct AppState {
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     pub max_seq_len: usize,
+    /// Effective scheduler concurrency, used for image ownership admission.
+    pub max_batch_size: usize,
+    pub yarn_context: bool,
     pub request_tx: mpsc::Sender<InferenceRequest>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,

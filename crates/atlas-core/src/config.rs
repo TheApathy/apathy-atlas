@@ -18,6 +18,19 @@ pub enum LayerType {
     Moe,
 }
 
+/// Runtime transform applied to target hidden states before DFlash capture.
+///
+/// This is never read from a checkpoint config: the target/drafter pairing
+/// selects it only after both configurations have been validated together.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DflashCaptureMode {
+    /// Copy a contiguous slice from the target residual row.
+    #[default]
+    ResidualSlice,
+    /// Collapse a Qwen4 four-stream residual with its terminal hyper mixer.
+    Qwen4HyperProjected,
+}
+
 /// Model configuration parsed from HuggingFace config.json.
 ///
 /// Single source of truth for model dimensions. All kernel launch
@@ -378,6 +391,9 @@ pub struct ModelConfig {
     /// explicit Flash-Next -> dense-DFlash compatibility bridge.
     #[serde(skip)]
     pub dflash_capture_offset: usize,
+    /// Runtime-only transform selected for target hidden-state capture.
+    #[serde(skip)]
+    pub dflash_capture_mode: DflashCaptureMode,
 
     /// Runtime-only manifest for a sparse Qwen4 PLE backing store. The
     /// server discovers `ple-offload/manifest.json` beside the checkpoint;
@@ -407,6 +423,23 @@ pub struct ModelConfig {
 /// `ignore_modules` holds the already-expanded list of module-path
 /// patterns that should be loaded as dense BF16 rather than quantized.
 /// Patterns use HF glob semantics (`*` matches any non-`.` sub-path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOptWeightFormat {
+    /// NVIDIA FP4 E2M1 payload with one scale per 16 weights.
+    Nvfp4,
+    /// OCP MXFP8 payload with one E8M0 scale per 32 weights.
+    Mxfp8,
+}
+
+/// One entry from ModelOpt's `MIXED_PRECISION.config_groups` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOptQuantizationGroup {
+    pub name: String,
+    pub weight_format: ModelOptWeightFormat,
+    pub group_size: usize,
+    pub targets: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QuantizationConfig {
     /// Raw `quant_method` string from the config. Stable values:
@@ -423,6 +456,22 @@ pub struct QuantizationConfig {
     /// tensors). Example entries: `"lm_head"`,
     /// `"model.layers.*.self_attn*"`.
     pub ignore_modules: Vec<String>,
+    /// Typed ModelOpt mixed-precision groups. Empty for uniform formats.
+    pub config_groups: Vec<ModelOptQuantizationGroup>,
+}
+
+impl QuantizationConfig {
+    /// Exact ModelOpt precision assigned to a module prefix.
+    ///
+    /// Mixed checkpoints such as Mia Flash-Next enumerate concrete module
+    /// names. Ambiguous overlaps were rejected while parsing, so lookup has a
+    /// single deterministic answer.
+    pub fn modelopt_weight_format_for(&self, module_path: &str) -> Option<ModelOptWeightFormat> {
+        self.config_groups
+            .iter()
+            .find(|group| group.targets.iter().any(|target| target == module_path))
+            .map(|group| group.weight_format)
+    }
 }
 
 /// Vision encoder configuration for Qwen3-VL models.
@@ -486,12 +535,14 @@ mod parsers;
 mod tests;
 
 pub use dispatch::parse_config;
-pub(crate) use parsers::{parse_gemma4_params, parse_minimax_m2, parse_vision_config};
+pub(crate) use parsers::{
+    parse_gemma4_params, parse_minimax_m2, parse_quantization_config_checked, parse_vision_config,
+};
 pub use parsers::{parse_mistral_params, parse_quantization_config};
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
     if config.quantization_config.is_none() {
-        config.quantization_config = parse_quantization_config(raw);
+        config.quantization_config = parse_quantization_config_checked(raw)?;
     }
     validate_config(config)
 }

@@ -15,6 +15,7 @@ pub mod qwen3_ssm;
 pub mod qwen4_hyper;
 pub mod qwen4_mtp;
 pub mod qwen4_ple;
+pub(crate) mod qwen4_prefill_moe;
 pub mod qwen4_qsa;
 pub mod vision_encoder;
 

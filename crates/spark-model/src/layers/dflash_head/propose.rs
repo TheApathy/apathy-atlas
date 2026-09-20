@@ -297,9 +297,8 @@ impl BlockDiffusionDraftHead {
         // Append the model's latest single-slot ctx capture into the
         // per-seq accumulator. Skip when `target_hidden_stack` is None
         // (e.g. EP=2 worker rank or the very first call before any
-        // capture has fired). Capping at `max_ctx_len` to keep within
-        // allocated bounds — drafter quality plateaus past a few hundred
-        // ctx positions anyway.
+        // capture has fired). Absolute positions are checked against
+        // `max_ctx_len`; only the latest bounded ring remains resident.
         //
         // ATLAS_DFLASH_DEBUG_NO_DECODE_APPEND=1 disables the post-decode
         // append. The captured target_hidden_stack is the K-1 token of
@@ -336,10 +335,7 @@ impl BlockDiffusionDraftHead {
         // align. On subsequent proposes, the existing logic
         // (last_num_accepted+1 slots) keeps ctx_len in lockstep with
         // seq.seq_len.
-        if !skip_decode_append
-            && let Some(base) = target_hidden_stack
-            && dstate.ctx_len < dstate.max_ctx_len
-        {
+        if !skip_decode_append && let Some(base) = target_hidden_stack {
             // Append the new tokens' hidden states from the previous
             // verify step.
             //
@@ -371,7 +367,10 @@ impl BlockDiffusionDraftHead {
             // So src_idx 0..N+1 is correct and matches sequence order.
             // The bonus's hidden is NOT needed in ctx — bonus appears
             // as the first noise embedding (Q-side input).
-            let num_append = dstate.last_num_accepted + 1;
+            let num_append = dstate
+                .last_num_accepted
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("DFlash accepted-row count overflowed"))?;
             // FIX 1 (ATLAS_DFLASH_TREE_COMMIT): when the previous verify
             // committed a tree-fork tail, the accepted hiddens are scattered
             // across `dflash_hidden_save`, NOT the contiguous 0..num_append.
@@ -392,6 +391,19 @@ impl BlockDiffusionDraftHead {
                 rows.extend_from_slice(&dstate.last_accepted_compact);
                 rows
             };
+            anyhow::ensure!(
+                src_rows.len() == num_append,
+                "DFlash sparse accepted-row map has {} rows; expected {num_append}",
+                src_rows.len(),
+            );
+            anyhow::ensure!(
+                num_append <= self.physical_verify_k
+                    && src_rows
+                        .iter()
+                        .all(|source_row| *source_row < self.physical_verify_k),
+                "DFlash accepted-row source exceeds physical verify K={}: {src_rows:?}",
+                self.physical_verify_k,
+            );
             // dflash_hidden_save rows hold the hiddens of the
             // tokens at absolute positions (position - num_append)..position.
             // Write each row at its ABSOLUTE slot rather than appending at
@@ -401,16 +413,14 @@ impl BlockDiffusionDraftHead {
             // constant d=+2 ctx misalignment on prose that collapsed accept
             // from 1.38 to 0.31 per block (probe_states_ab.py, 2026-06-12).
             // A skipped step now costs one stale slot, not a permanent shift.
-            let first_pos = position.saturating_sub(num_append);
-            if dstate.ctx_len != first_pos {
-                tracing::warn!(
-                    "DFlash ctx drift: ctx_len={} expected {} (position={}, num_append={}) — realigning by absolute slot",
-                    dstate.ctx_len,
-                    first_pos,
-                    position,
-                    num_append,
-                );
-            }
+            let first_pos = position.checked_sub(num_append).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DFlash append underflow: position={position}, num_append={num_append}"
+                )
+            })?;
+            let append = dstate
+                .ctx_ring_state()?
+                .plan_append_at(first_pos, num_append)?;
             tracing::info!(
                 "DFlash propose append: last_num_accepted={} num_append={} first_pos={} ctx_len_before={}",
                 dstate.last_num_accepted,
@@ -419,21 +429,18 @@ impl BlockDiffusionDraftHead {
                 dstate.ctx_len,
             );
             for i in 0..num_append {
-                let slot = first_pos + i;
-                if slot >= dstate.max_ctx_len {
-                    break; // accumulator full; drop later positions
-                }
                 // Source verify-capture row: contiguous `i` on the flat path,
                 // else the sparse fork path's compact slot (src_rows[i]).
-                let src_row = src_rows.get(i).copied().unwrap_or(i);
+                let src_row = src_rows[i];
                 let src = base.offset(src_row * dstate.ctx_slot_bytes);
-                let dst = dstate.ctx_hidden_acc.offset(slot * dstate.ctx_slot_bytes);
+                let dst_slot = append.write.physical_slot_for(i)?;
+                let dst = dstate
+                    .ctx_hidden_acc
+                    .offset(dst_slot * dstate.ctx_slot_bytes);
                 ctx.gpu
                     .copy_d2d_async(src, dst, dstate.ctx_slot_bytes, _stream)?;
             }
-            dstate.ctx_len = dstate
-                .ctx_len
-                .max((first_pos + num_append).min(dstate.max_ctx_len));
+            dstate.apply_ctx_ring_state(append.next)?;
         }
 
         // ── ATLAS_DFLASH_ECHO=1: echo-drafting / Jacobi salvage (default off) ──

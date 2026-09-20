@@ -12,6 +12,9 @@ use crate::weight_map::QuantizedWeight;
 #[path = "gemv_exact_lm_head/route.rs"]
 mod route;
 pub use route::*;
+#[path = "gemv_exact_lm_head/grid32.rs"]
+mod grid32;
+pub use grid32::*;
 
 pub const W4A16_EXACT_LM_HEAD_OUTS_PER_BLOCK: u32 = 4;
 
@@ -43,6 +46,7 @@ pub struct W4a16ExactLmHeadKernels {
     rt2_m8: KernelHandle,
     rt2_m17: KernelHandle,
     rt2_m32: KernelHandle,
+    rt2_m32_grid: KernelHandle,
 }
 
 impl W4a16ExactLmHeadKernels {
@@ -61,6 +65,7 @@ impl W4a16ExactLmHeadKernels {
             rt2_m8: KernelHandle(0),
             rt2_m17: KernelHandle(0),
             rt2_m32: KernelHandle(0),
+            rt2_m32_grid: KernelHandle(0),
         }
     }
 
@@ -88,6 +93,15 @@ impl W4a16ExactLmHeadKernels {
             ExactLmHeadTier::M17 => self.rt2_m17,
             ExactLmHeadTier::M32 => self.rt2_m32,
         }
+    }
+
+    pub const fn with_rt2_m32_grid(mut self, kernel: KernelHandle) -> Self {
+        self.rt2_m32_grid = kernel;
+        self
+    }
+
+    pub const fn rt2_m32_grid(self) -> KernelHandle {
+        self.rt2_m32_grid
     }
 
     pub const fn for_tier(self, tier: ExactLmHeadTier) -> KernelHandle {

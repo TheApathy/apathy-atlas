@@ -535,12 +535,17 @@ extern "C" __global__ void causal_conv1d_update_l2norm_f32_sequence(
 
         if (valid) {
             output[(unsigned long long)token * output_stride + ch] = silu;
-            const float* state = conv_state + (unsigned long long)ch * d_conv;
-            float* snapshot = state_inter
-                + (unsigned long long)token * state_stride
-                + (unsigned long long)ch * d_conv;
-            for (unsigned int i = 0; i < d_conv; i++)
-                snapshot[i] = state[i];
+            // Verification passes a snapshot arena for rollback. Prompt
+            // prefill never rolls back individual input tokens, so it passes
+            // nullptr and avoids num_tokens * dim * d_conv redundant stores.
+            if (state_inter != nullptr) {
+                const float* state = conv_state + (unsigned long long)ch * d_conv;
+                float* snapshot = state_inter
+                    + (unsigned long long)token * state_stride
+                    + (unsigned long long)ch * d_conv;
+                for (unsigned int i = 0; i < d_conv; i++)
+                    snapshot[i] = state[i];
+            }
         }
         __syncthreads();
     }

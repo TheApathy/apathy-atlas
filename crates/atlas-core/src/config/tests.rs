@@ -166,6 +166,84 @@ fn test_qwen4_exp_rejects_partial_qsa_geometry() {
 }
 
 #[test]
+fn test_parse_mia_qwen38_flash_next_alias_and_mixed_precision() {
+    let json = r#"{
+        "model_type": "qwen3_8_flash_next",
+        "text_config": {
+            "model_type": "qwen3_8_flash_next_text",
+            "hidden_size": 2560,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "layer_types": ["linear_attention"],
+            "hc_count": 4,
+            "hc_lowrank": 320,
+            "ple_layer_ids": [1],
+            "ple_embed_dim": 2560,
+            "ngram_size": 3,
+            "heads_per_ngram": 8,
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4
+        },
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "config_groups": {
+                "experts": {
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 4,
+                        "group_size": 16,
+                        "dynamic": false
+                    },
+                    "targets": ["re:.*mlp.experts.*"]
+                },
+                "attention": {
+                    "weights": {
+                        "type": "float",
+                        "num_bits": 8,
+                        "group_size": 32,
+                        "dynamic": false
+                    },
+                    "targets": ["re:.*self_attn.*"]
+                }
+            }
+        }
+    }"#;
+
+    let cfg = parse_config(json).expect("pinned Mia architecture aliases must parse");
+    assert_eq!(cfg.model_type, "qwen4_exp");
+    assert!(cfg.is_qwen4_exp());
+    let qc = cfg
+        .quantization_config
+        .expect("mixed config must be retained");
+    assert_eq!(qc.config_groups.len(), 2);
+    assert!(
+        qc.config_groups
+            .iter()
+            .any(|group| group.weight_format == ModelOptWeightFormat::Mxfp8)
+    );
+}
+
+#[test]
+fn test_qwen38_flash_next_alias_rejects_wrong_nested_type() {
+    let json = r#"{
+        "model_type": "qwen3_8_flash_next",
+        "text_config": { "model_type": "qwen4_exp_text" }
+    }"#;
+    let err = parse_config(json).expect_err("alias must validate its nested architecture");
+    assert!(err.to_string().contains("qwen3_8_flash_next_text"));
+}
+
+#[test]
 fn test_parse_qwen35_nested_config() {
     let json = r#"{
         "model_type": "qwen3_5_moe",

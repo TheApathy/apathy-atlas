@@ -47,6 +47,7 @@ half = "2"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 parking_lot = { workspace = true }
+ring = { workspace = true }
 # Non-optional (was `optional = true`, metal-example only):
 # `weight_loader::transform_cache` mmaps the post-transform blob on every
 # start when ATLAS_WEIGHT_CACHE=1, so it is needed by the library itself.

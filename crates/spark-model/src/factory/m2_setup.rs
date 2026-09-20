@@ -8,14 +8,33 @@ use spark_runtime::gpu::GpuBackend;
 
 use crate::layer::TransformerLayer;
 
-/// Pre-flight memory audit + MoE-transpose pass for MiniMax-M2 unified /
-/// hybrid layout modes.
+/// Pre-flight memory audit + MoE-transpose pass for unified / hybrid layout
+/// modes.
+///
+/// Originally MiniMax-M2 only. Also admits Qwen4-exp (Qwen3.8-Flash-Next),
+/// which has the identical problem and could never solve it inline: the
+/// qwen35 loader sizes a full second copy of every expert's gate/up/down
+/// (`load_layers.rs`, 63.3 GB for Flash-Next) during *layer construction*,
+/// finds ~16 GB free, and permanently falls back to the grouped GEMM — so
+/// prefill pays a per-token weight read and lands at ~40 tok/s, statistically
+/// identical to decode. It is not tunable: the shortfall is ~46 GB.
+///
+/// Two things make this hook the right place. It runs POST-load, where more
+/// memory is free than during layer construction; and the unified pass frees
+/// each untransposed copy as it goes, so it is memory-NEUTRAL rather than
+/// needing the 63.3 GB up front. `use_t_layout_for_{prefill,decode}` and the
+/// transpose entry points are already model-agnostic — only this gate was
+/// MiniMax-specific.
+///
+/// Cost model note: `per_expert_one` below is `inter * hidden * 9/16`, the
+/// same packed+scale arithmetic the qwen35 loader uses, so the two agree on
+/// what "full" costs.
 pub(super) fn maybe_run_minimax_m2_moe_transpose(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     layers: &mut [Box<dyn TransformerLayer>],
 ) -> Result<()> {
-    if config.model_type != "minimax_m2" {
+    if config.model_type != "minimax_m2" && !config.is_qwen4_exp() {
         return Ok(());
     }
     let unified_layout = std::env::var("ATLAS_UNIFIED_MOE_LAYOUT")

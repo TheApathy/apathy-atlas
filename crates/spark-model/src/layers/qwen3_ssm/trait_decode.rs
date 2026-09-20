@@ -2,7 +2,13 @@
 
 //! TransformerLayer::decode (single-token).
 
+use super::qwen4_k5_ssm::{
+    Qwen4ExactSsmRowsRoute, qwen4_exact_ssm_rows_route, qwen4_k16_batched_verify_requested,
+    qwen4_k16_exact_requested,
+};
 use super::*;
+
+static QWEN4_K16_SSM_EXACT_ENGAGED: std::sync::Once = std::sync::Once::new();
 
 impl Qwen3SsmLayer {
     #[allow(clippy::too_many_arguments)]
@@ -36,11 +42,50 @@ impl Qwen3SsmLayer {
             && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
         let exact_hyper_k5 =
             hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_HYPER").ok().as_deref() != Some("1");
-        let batch_ssm_k5 =
+        let legacy_batch_ssm =
             hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_SSM").ok().as_deref() == Some("1");
+        let k16_requested = qwen4_k16_batched_verify_requested()?;
+        let k16_exact_requested = qwen4_k16_exact_requested()?;
+        anyhow::ensure!(
+            h_intermediate.is_null() == conv_intermediate.is_null(),
+            "Qwen4 batched SSM requires both recurrent intermediate pointers or neither"
+        );
+        let has_recurrent_intermediates = !h_intermediate.is_null();
+        if has_recurrent_intermediates {
+            anyhow::ensure!(
+                h_intermediate_stride == self.h_state_bytes
+                    && conv_intermediate_stride == self.conv_state_bytes,
+                "Qwen4 batched SSM recurrent intermediate stride mismatch"
+            );
+        }
+        let exact_ssm_route = qwen4_exact_ssm_rows_route(
+            num_tokens,
+            hybrid_k5,
+            legacy_batch_ssm,
+            k16_requested,
+            k16_exact_requested,
+            has_recurrent_intermediates,
+        );
+        let ssm_state = state
+            .as_any_mut()
+            .downcast_mut::<SsmLayerState>()
+            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
+        if let Some(route) = exact_ssm_route {
+            self.preflight_qwen4_exact_ssm_rows(
+                route,
+                num_tokens,
+                ssm_state,
+                h_intermediate,
+                conv_intermediate,
+                h_intermediate_stride,
+                conv_intermediate_stride,
+                ctx,
+            )?;
+        }
 
         // Batch the four-stream projection weights, then retain exact causal
-        // ordering in the recurrent GDN core.
+        // ordering in the recurrent GDN core. Native K16 forces the ordered
+        // sequence conv/GDN kernels and writes every post-row checkpoint.
         // The attention/recurrent projection stacks may consume split-K
         // workspace internally. MoE gate logits are idle until the later FFN.
         let attn_inputs = ctx.buffers.gate_logits();
@@ -66,24 +111,33 @@ impl Qwen3SsmLayer {
                 )?;
             }
         } else {
-            let mixed_attn = attn_hyper.prepare_batched(
-                hidden,
-                residual,
-                num_tokens,
-                ctx.buffers,
-                ctx.gpu,
-                eps,
-                stream,
-            )?;
+            let mixed_attn = if num_tokens <= 32 {
+                attn_hyper.prepare_batched(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?
+            } else {
+                attn_hyper.prepare_prefill_exact(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?
+            };
             ctx.gpu
                 .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
         }
-        let ssm_state = state
-            .as_any_mut()
-            .downcast_mut::<SsmLayerState>()
-            .ok_or_else(|| anyhow::anyhow!("Expected SsmLayerState"))?;
-        if batch_ssm_k5 {
-            let ssm_out = self.ssm_forward_qwen4_k5_exact(
+        if let Some(route) = exact_ssm_route {
+            let ssm_out = self.ssm_forward_qwen4_exact_rows(
+                route,
                 attn_inputs,
                 num_tokens,
                 ssm_state,
@@ -94,6 +148,14 @@ impl Qwen3SsmLayer {
                 ctx,
                 stream,
             )?;
+            if route == Qwen4ExactSsmRowsRoute::NativeK16 {
+                crate::model::k16_route_receipt::mark_ssm_layer()?;
+                QWEN4_K16_SSM_EXACT_ENGAGED.call_once(|| {
+                    tracing::info!(
+                        "ENGAGED ATLAS_QWEN4_K16_EXACT: ssm_exact_m16_projection_conv_gdn_sequence_enqueued"
+                    );
+                });
+            }
             attn_hyper
                 .inject_saved_batched(hidden, ssm_out, residual, num_tokens, ctx.gpu, stream)?;
         } else {
@@ -158,8 +220,18 @@ impl Qwen3SsmLayer {
                 )?;
             }
             staging
-        } else {
+        } else if num_tokens <= 32 {
             mlp_hyper.prepare_batched(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?
+        } else {
+            mlp_hyper.prepare_prefill_exact(
                 hidden,
                 residual,
                 num_tokens,

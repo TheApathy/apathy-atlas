@@ -591,6 +591,51 @@ pub trait Model: Send + Sync {
     }
     fn k1_stage_diag_abort(&self) {}
 
+    /// Arm/query the qualification-only native-K16 stage and route receipts.
+    /// Backends are fail-closed unless they implement the exact Qwen4 frame.
+    fn k16_fixture_evidence_begin(&self, _pre_verify_len: usize, _tokens: &[u32]) -> Result<()> {
+        bail!("K16 fixture evidence is unsupported by this model backend")
+    }
+    fn k16_fixture_evidence_finish(&self, _pre_verify_len: usize, _tokens: &[u32]) -> Result<()> {
+        bail!("K16 fixture evidence is unsupported by this model backend")
+    }
+    fn k16_fixture_evidence_abort(&self) {}
+
+    /// One-shot native-Qwen4 K16 committed recurrent-state diagnostic.
+    /// Defaults remain inert for every backend that does not explicitly
+    /// implement the exact Qwen4 state contract.
+    fn k16_commit_parity_requested(&self, _pre_verify_len: usize, _tokens: &[u32]) -> Result<bool> {
+        Ok(false)
+    }
+    fn k16_commit_parity_capture_live(
+        &self,
+        _seq: &SequenceState,
+    ) -> Result<crate::model::k16_commit_parity::CanonicalStateSnapshot> {
+        bail!("K16 commit parity is unsupported by this model backend")
+    }
+    fn k16_commit_parity_restore_live(
+        &self,
+        _seq: &SequenceState,
+        _snapshot: &crate::model::k16_commit_parity::CanonicalStateSnapshot,
+    ) -> Result<()> {
+        bail!("K16 commit parity is unsupported by this model backend")
+    }
+    fn k16_commit_parity_drain_default(&self) -> Result<()> {
+        bail!("K16 commit parity is unsupported by this model backend")
+    }
+    fn k16_commit_parity_compare_committed(
+        &self,
+        _seq: &SequenceState,
+        _expected: &crate::model::k16_commit_parity::CanonicalStateSnapshot,
+        _pre_verify_len: usize,
+        _tokens: &[u32],
+        _total_accepted: usize,
+        _k: usize,
+        _last_inter_slot: usize,
+    ) -> Result<()> {
+        bail!("K16 commit parity is unsupported by this model backend")
+    }
+
     /// DFlash γ-token verification: 1 verified + γ drafts → per-position
     /// argmax. Variable-length γ (vs fixed K=2/3/4) because it's a drafter
     /// config field. CUDA-graph capture keyed by `(slot_idx, tokens.len())`.

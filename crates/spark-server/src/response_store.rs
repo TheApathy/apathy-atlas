@@ -150,36 +150,13 @@ fn now_unix() -> u64 {
 /// that serves inbound requests. Avoids deriving `Serialize` on the
 /// request-side types (which would couple our on-disk shape to the
 /// parse-time representation).
-fn messages_to_disk_json(msgs: &[IncomingMessage]) -> serde_json::Value {
-    serde_json::Value::Array(
+fn messages_to_disk_json(msgs: &[IncomingMessage]) -> Result<serde_json::Value, String> {
+    Ok(serde_json::Value::Array(
         msgs.iter()
             .map(|m| {
                 let mut obj = serde_json::Map::new();
                 obj.insert("role".into(), serde_json::Value::String(m.role.clone()));
-                if m.content.images.is_empty() {
-                    obj.insert(
-                        "content".into(),
-                        serde_json::Value::String(m.content.text.clone()),
-                    );
-                } else {
-                    // Multi-part content: text + images as data-uri
-                    // image_url parts. Mirrors the OpenAI chat content
-                    // array shape so replay deserializes cleanly.
-                    let mut parts: Vec<serde_json::Value> = Vec::new();
-                    if !m.content.text.is_empty() {
-                        parts.push(serde_json::json!({
-                            "type": "text",
-                            "text": m.content.text,
-                        }));
-                    }
-                    for img in &m.content.images {
-                        parts.push(serde_json::json!({
-                            "type": "image_url",
-                            "image_url": { "url": img },
-                        }));
-                    }
-                    obj.insert("content".into(), serde_json::Value::Array(parts));
-                }
+                obj.insert("content".into(), m.content.chat_json()?);
                 if let Some(tc) = &m.tool_calls
                     && let Ok(v) = serde_json::to_value(tc)
                 {
@@ -191,20 +168,30 @@ fn messages_to_disk_json(msgs: &[IncomingMessage]) -> serde_json::Value {
                 if let Some(n) = &m.name {
                     obj.insert("name".into(), serde_json::Value::String(n.clone()));
                 }
-                serde_json::Value::Object(obj)
+                Ok(serde_json::Value::Object(obj))
             })
-            .collect(),
-    )
+            .collect::<Result<_, String>>()?,
+    ))
 }
 
 impl StoreBackend for FilesystemBackend {
     fn persist(&self, entry: &StoredEntry) {
+        let messages = match messages_to_disk_json(&entry.messages) {
+            Ok(messages) => messages,
+            Err(e) => {
+                tracing::warn!(
+                    "response_store: invalid message content for {}: {e}",
+                    entry.id
+                );
+                return;
+            }
+        };
         let disk = DiskEntry {
             id: entry.id.clone(),
             kind: entry.kind,
             model: entry.model.clone(),
             created_at: entry.created_at,
-            messages: messages_to_disk_json(&entry.messages),
+            messages,
             body: entry.body.clone(),
             persisted_at_unix: now_unix(),
         };
@@ -323,3 +310,6 @@ mod store_impl;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ordered_tests;

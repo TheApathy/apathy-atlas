@@ -32,6 +32,31 @@ extern "C" __global__ void qwen4_ple_dequant_rows(
     output[i] = __float2bfloat16(value);
 }
 
+// Whole-prompt variant. Records and scale2 values are token-major, then
+// head-major; output is a row-major [M, 2560] BF16 activation matrix.
+extern "C" __global__ void qwen4_ple_dequant_prefill(
+    const unsigned char* __restrict__ records,
+    const float* __restrict__ scale2,
+    __nv_bfloat16* __restrict__ output,
+    unsigned int num_tokens) {
+    const unsigned int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = num_tokens * 2560u;
+    if (linear >= total) return;
+    const unsigned int token = linear / 2560u;
+    const unsigned int embedding_dim = linear - token * 2560u;
+    const unsigned int head = embedding_dim / 160u;
+    const unsigned int dim = embedding_dim - head * 160u;
+    const unsigned int record_index = token * 16u + head;
+    const unsigned char* record = records + record_index * 90u;
+    const unsigned char packed = record[dim >> 1];
+    const unsigned int code = (dim & 1u) ? (packed >> 4) : (packed & 0x0fu);
+    __nv_fp8_e4m3 fp8_scale;
+    *(unsigned char*)&fp8_scale = record[80u + dim / 16u];
+    const float value = QWEN4_E2M1_LUT[code] * (float)fp8_scale
+                      * scale2[record_index];
+    output[linear] = __float2bfloat16(value);
+}
+
 __device__ __forceinline__ float warp_sum(float v);
 
 // Complete one-token PLE join. The projection GEMVs are dispatched through
@@ -147,6 +172,184 @@ extern "C" __global__ void qwen4_ple_fuse_decode(
         }
         state[8] = __float2bfloat16(x);
         hyper[i] = __float2bfloat16(__bfloat162float(hyper[i]) + gv + c);
+    }
+}
+
+// Compute every token/stream PLE gate and normalized short-conv input in
+// parallel. `key` is [M,4H], `value` is [M,H], and all other row-major
+// matrices are [M,4H]. The recurrent depthwise convolution is a second pass.
+extern "C" __global__ void qwen4_ple_prepare_prefill(
+    const __nv_bfloat16* __restrict__ hyper,
+    const __nv_bfloat16* __restrict__ key,
+    const __nv_bfloat16* __restrict__ value,
+    const __nv_bfloat16* __restrict__ norm_key,
+    const __nv_bfloat16* __restrict__ norm_query,
+    const __nv_bfloat16* __restrict__ norm_conv,
+    float* __restrict__ gated_value,
+    float* __restrict__ conv_input,
+    unsigned int num_tokens,
+    unsigned int hidden_size,
+    float eps) {
+    const unsigned int token = blockIdx.x;
+    const unsigned int stream_id = blockIdx.y;
+    if (token >= num_tokens || stream_id >= 4u) return;
+    const unsigned long long residual_width = (unsigned long long)hidden_size * 4ull;
+    const unsigned long long base = (unsigned long long)token * residual_width
+                                  + (unsigned long long)stream_id * hidden_size;
+    const unsigned int weight_base = stream_id * hidden_size;
+    float q2 = 0.0f, k2 = 0.0f;
+    for (unsigned int h = threadIdx.x; h < hidden_size; h += blockDim.x) {
+        const float q = __bfloat162float(hyper[base + h]);
+        const float k = __bfloat162float(key[base + h]);
+        q2 += q * q;
+        k2 += k * k;
+    }
+    q2 = warp_sum(q2);
+    k2 = warp_sum(k2);
+    __shared__ float q_parts[32], k_parts[32], shared[4];
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        q_parts[warp] = q2;
+        k_parts[warp] = k2;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned int warps = (blockDim.x + 31u) / 32u;
+        float q = lane < warps ? q_parts[lane] : 0.0f;
+        float k = lane < warps ? k_parts[lane] : 0.0f;
+        q = warp_sum(q);
+        k = warp_sum(k);
+        if (lane == 0) {
+            shared[0] = rsqrtf(q / hidden_size + eps);
+            shared[1] = rsqrtf(k / hidden_size + eps);
+        }
+    }
+    __syncthreads();
+
+    float dot = 0.0f;
+    for (unsigned int h = threadIdx.x; h < hidden_size; h += blockDim.x) {
+        const unsigned int i = weight_base + h;
+        const float q = __bfloat162float(hyper[base + h]) * shared[0]
+                      * (1.0f + __bfloat162float(norm_query[i]));
+        const float k = __bfloat162float(key[base + h]) * shared[1]
+                      * (1.0f + __bfloat162float(norm_key[i]));
+        dot += q * k;
+    }
+    dot = warp_sum(dot);
+    if (lane == 0) q_parts[warp] = dot;
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned int warps = (blockDim.x + 31u) / 32u;
+        float sum = lane < warps ? q_parts[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) {
+            sum /= sqrtf((float)hidden_size);
+            const float root = copysignf(sqrtf(fmaxf(fabsf(sum), 1.0e-6f)), sum);
+            shared[2] = 1.0f / (1.0f + expf(-root));
+        }
+    }
+    __syncthreads();
+
+    float gv2 = 0.0f;
+    const unsigned long long value_base = (unsigned long long)token * hidden_size;
+    for (unsigned int h = threadIdx.x; h < hidden_size; h += blockDim.x) {
+        const float gv = shared[2] * __bfloat162float(value[value_base + h]);
+        gv2 += gv * gv;
+    }
+    gv2 = warp_sum(gv2);
+    if (lane == 0) q_parts[warp] = gv2;
+    __syncthreads();
+    if (warp == 0) {
+        const unsigned int warps = (blockDim.x + 31u) / 32u;
+        float sum = lane < warps ? q_parts[lane] : 0.0f;
+        sum = warp_sum(sum);
+        if (lane == 0) shared[3] = rsqrtf(sum / hidden_size + eps);
+    }
+    __syncthreads();
+    for (unsigned int h = threadIdx.x; h < hidden_size; h += blockDim.x) {
+        const unsigned int i = weight_base + h;
+        const float gv = shared[2] * __bfloat162float(value[value_base + h]);
+        gated_value[base + h] = gv;
+        conv_input[base + h] =
+            gv * shared[3] * (1.0f + __bfloat162float(norm_conv[i]));
+    }
+}
+
+__device__ __forceinline__ float qwen4_ple_history_bf16(float value) {
+    return __bfloat162float(__float2bfloat16(value));
+}
+
+// The PLE convolution stores normalized inputs rather than convolution
+// outputs, so all prompt tokens can be evaluated independently from the
+// immutable entry history plus the prepared chunk matrix.
+extern "C" __global__ void qwen4_ple_conv_inject_prefill(
+    __nv_bfloat16* __restrict__ hyper,
+    const float* __restrict__ gated_value,
+    const float* __restrict__ conv_input,
+    const __nv_bfloat16* __restrict__ conv_weight,
+    const __nv_bfloat16* __restrict__ entry_state,
+    unsigned int num_tokens,
+    unsigned int hidden_size,
+    unsigned int reset_state) {
+    const unsigned int token = blockIdx.x;
+    const unsigned int stream_id = blockIdx.y;
+    const unsigned int h = blockIdx.z * blockDim.x + threadIdx.x;
+    if (token >= num_tokens || stream_id >= 4u || h >= hidden_size) return;
+    const unsigned long long residual_width = (unsigned long long)hidden_size * 4ull;
+    const unsigned int i = stream_id * hidden_size + h;
+    const unsigned long long out = (unsigned long long)token * residual_width + i;
+    const __nv_bfloat16* state = entry_state + i * 9u;
+    const float s0 = token >= 9u
+        ? qwen4_ple_history_bf16(
+            conv_input[(unsigned long long)(token - 9u) * residual_width + i])
+        : (reset_state ? 0.0f : __bfloat162float(state[token]));
+    const float s3 = token >= 6u
+        ? qwen4_ple_history_bf16(
+            conv_input[(unsigned long long)(token - 6u) * residual_width + i])
+        : (reset_state ? 0.0f : __bfloat162float(state[token + 3u]));
+    const float s6 = token >= 3u
+        ? qwen4_ple_history_bf16(
+            conv_input[(unsigned long long)(token - 3u) * residual_width + i])
+        : (reset_state ? 0.0f : __bfloat162float(state[token + 6u]));
+    const float x = conv_input[out];
+    const __nv_bfloat16* weight = conv_weight + i * 4u;
+    float c = s0 * __bfloat162float(weight[0])
+            + s3 * __bfloat162float(weight[1])
+            + s6 * __bfloat162float(weight[2])
+            + x  * __bfloat162float(weight[3]);
+    c = c / (1.0f + expf(-c));
+    hyper[out] = __float2bfloat16(
+        __bfloat162float(hyper[out]) + gated_value[out] + c);
+}
+
+// Commit the last nine prepared inputs after every parallel consumer has
+// finished. One thread owns one residual channel and snapshots old history
+// before overwriting it, which also handles chunks shorter than nine tokens.
+extern "C" __global__ void qwen4_ple_commit_prefill_state(
+    const float* __restrict__ conv_input,
+    __nv_bfloat16* __restrict__ state,
+    unsigned int num_tokens,
+    unsigned int residual_width,
+    unsigned int reset_state) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= residual_width || num_tokens == 0u) return;
+    __nv_bfloat16 old[9];
+    #pragma unroll
+    for (unsigned int j = 0; j < 9u; ++j) old[j] = state[i * 9u + j];
+    #pragma unroll
+    for (unsigned int j = 0; j < 9u; ++j) {
+        const long long source_token = (long long)num_tokens - 9ll + (long long)j;
+        __nv_bfloat16 next;
+        if (source_token >= 0) {
+            next = __float2bfloat16(
+                conv_input[(unsigned long long)source_token * residual_width + i]);
+        } else if (reset_state) {
+            next = __float2bfloat16(0.0f);
+        } else {
+            next = old[num_tokens + j];
+        }
+        state[i * 9u + j] = next;
     }
 }
 
@@ -384,3 +587,5 @@ extern "C" __global__ void qwen4_gated_rms_norm_sigmoid_f32(
     (void)group_size;
     qwen4_gated_rms_sigmoid_body(input, gate, weight, output, hidden_size, eps, gate_stride);
 }
+
+#include "qwen4_sigmoid_multi_seq.cuh"

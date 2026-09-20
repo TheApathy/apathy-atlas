@@ -7,6 +7,7 @@ mod manifest;
 use manifest::CHILDREN;
 
 const ROOT: &str = include_str!("../src/model/trait_impl/prefill_b.rs");
+const DIRECT_FINALIZE: &str = include_str!("../src/model/trait_impl/prefill_d.rs");
 const PREFIX_SEAM: &str = include_str!("../src/model/trait_impl/prefix_hit.rs");
 const MIXED: &str = include_str!("../src/model/trait_impl/decode_b.rs");
 const MODEL_TRAIT: &str = include_str!("../src/model/trait_impl/mod.rs");
@@ -128,6 +129,74 @@ fn validate_paired_contract(
     Ok(())
 }
 
+fn validate_marconi_save_elision(
+    direct_finalize: &str,
+    chunk_finalize: &str,
+    checkpoint: &str,
+) -> Result<(), String> {
+    const PRIMARY_SAVE: &str = "letsnap_result=matchself.ssm_snapshots.save(";
+    const LEAF_GUARD: &str = "ifself.prefix_cache.is_active()&&self.ssm_snapshots.is_enabled(){letsnap_result=matchself.ssm_snapshots.save(";
+    const CHECKPOINT_GUARD: &str = "ifself.ssm_checkpoint_interval==0||!self.prefix_cache.is_active()||!self.ssm_snapshots.is_enabled(){returnOk(());}";
+
+    for (route, source, expected_saves) in [
+        ("direct finalize", compact(direct_finalize), 2),
+        ("chunk finalize", compact(chunk_finalize), 1),
+    ] {
+        let primary_saves = source.matches(PRIMARY_SAVE).count();
+        if primary_saves != expected_saves {
+            return Err(format!(
+                "{route} primary Marconi save count drift: expected={expected_saves} actual={primary_saves}"
+            ));
+        }
+        let guarded_saves = source.matches(LEAF_GUARD).count();
+        if guarded_saves != primary_saves {
+            return Err(format!(
+                "{route} admits a Marconi save while prefix caching is inactive"
+            ));
+        }
+    }
+
+    let checkpoint = compact(checkpoint);
+    if checkpoint.matches(PRIMARY_SAVE).count() != 1 {
+        return Err("intermediate Marconi save count drift".into());
+    }
+    let guard = checkpoint.find(CHECKPOINT_GUARD).ok_or_else(|| {
+        "intermediate Marconi save lacks the inactive-prefix early return".to_string()
+    })?;
+    let save = checkpoint
+        .find(PRIMARY_SAVE)
+        .ok_or_else(|| "intermediate Marconi save disappeared".to_string())?;
+    if guard >= save {
+        return Err("intermediate inactive-prefix guard follows its Marconi save".into());
+    }
+    Ok(())
+}
+
+fn replace_nth(source: &str, needle: &str, replacement: &str, nth: usize) -> String {
+    let start = source
+        .match_indices(needle)
+        .nth(nth)
+        .map(|(start, _)| start)
+        .unwrap_or_else(|| panic!("missing mutation target {needle:?} occurrence {nth}"));
+    let mut mutated = String::with_capacity(source.len() - needle.len() + replacement.len());
+    mutated.push_str(&source[..start]);
+    mutated.push_str(replacement);
+    mutated.push_str(&source[start + needle.len()..]);
+    mutated
+}
+
+fn leaf_save_admitted(prefix_cache_active: bool, snapshots_enabled: bool) -> bool {
+    prefix_cache_active && snapshots_enabled
+}
+
+fn checkpoint_returns_early(
+    checkpoint_interval: usize,
+    prefix_cache_active: bool,
+    snapshots_enabled: bool,
+) -> bool {
+    checkpoint_interval == 0 || !prefix_cache_active || !snapshots_enabled
+}
+
 fn validate_mixed_bypass(source: &str) -> Result<(), String> {
     let fused = source
         .split_once("PREFIX_CACHE_POLICY: BYPASS")
@@ -170,6 +239,12 @@ fn manifest_and_every_production_entry_are_complete() {
     validate_paired_contract(
         PREFIX_SEAM,
         child("prefix_lookup"),
+        child("finalize_last"),
+        child("save_checkpoint"),
+    )
+    .unwrap();
+    validate_marconi_save_elision(
+        DIRECT_FINALIZE,
         child("finalize_last"),
         child("save_checkpoint"),
     )
@@ -247,4 +322,69 @@ fn raw_lookup_session_ref_and_mixed_cache_mutations_are_rejected() {
         "PREFIX_CACHE_POLICY: BYPASS\nself.lookup_prefill_prefix(tokens, bs, session_hash);",
     );
     assert!(validate_mixed_bypass(&injected).is_err());
+}
+
+#[test]
+fn inactive_prefix_cache_cannot_reach_any_marconi_save() {
+    for occurrence in 0..2 {
+        let mutated = replace_nth(
+            DIRECT_FINALIZE,
+            "self.prefix_cache.is_active()",
+            "true",
+            occurrence,
+        );
+        assert!(
+            validate_marconi_save_elision(
+                &mutated,
+                child("finalize_last"),
+                child("save_checkpoint")
+            )
+            .is_err(),
+            "accepted removal of direct-finalize active-prefix guard {occurrence}"
+        );
+    }
+
+    let chunk_mutated = replace_nth(
+        child("finalize_last"),
+        "self.prefix_cache.is_active()",
+        "true",
+        0,
+    );
+    assert!(
+        validate_marconi_save_elision(DIRECT_FINALIZE, &chunk_mutated, child("save_checkpoint"))
+            .is_err(),
+        "accepted removal of chunk-finalize active-prefix guard"
+    );
+
+    let checkpoint_mutated = replace_nth(
+        child("save_checkpoint"),
+        "!self.prefix_cache.is_active()",
+        "false",
+        0,
+    );
+    assert!(
+        validate_marconi_save_elision(DIRECT_FINALIZE, child("finalize_last"), &checkpoint_mutated)
+            .is_err(),
+        "accepted removal of intermediate active-prefix guard"
+    );
+}
+
+#[test]
+fn active_prefix_cache_preserves_prior_save_admission() {
+    for snapshots_enabled in [false, true] {
+        let prior_leaf_admission = snapshots_enabled;
+        let guarded_leaf_admission = leaf_save_admitted(true, snapshots_enabled);
+        assert_eq!(guarded_leaf_admission, prior_leaf_admission);
+
+        for checkpoint_interval in [0, 1, 128] {
+            let prior_checkpoint_return = checkpoint_interval == 0 || !snapshots_enabled;
+            let guarded_checkpoint_return =
+                checkpoint_returns_early(checkpoint_interval, true, snapshots_enabled);
+            assert_eq!(guarded_checkpoint_return, prior_checkpoint_return);
+        }
+    }
+
+    assert!(!leaf_save_admitted(false, true));
+    assert!(checkpoint_returns_early(0, false, true));
+    assert!(checkpoint_returns_early(1, false, true));
 }

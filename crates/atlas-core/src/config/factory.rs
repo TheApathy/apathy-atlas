@@ -116,6 +116,7 @@ impl ModelConfig {
             dflash_capture_layers: Vec::new(),
             dflash_capture_width: 0,
             dflash_capture_offset: 0,
+            dflash_capture_mode: super::DflashCaptureMode::ResidualSlice,
             ple_offload_manifest: None,
         }
     }

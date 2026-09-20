@@ -314,6 +314,23 @@ pub(crate) fn load_dflash_drafter(
     // Validate the requested planner before mapping the multi-GB drafter.
     // Dynamic modes must never degrade silently to static verify-all.
     drafter_config.validate_verify_mode(verify_mode)?;
+    if let Some(manifest) =
+        spark_model::weight_loader::dflash_loader::native_flash_next_finiteness_manifest(
+            &drafter_config,
+        )?
+    {
+        let receipt =
+            spark_runtime::weights::attest_exact_bf16_safetensors(&drafter_dir, &manifest)
+                .context("Native Flash-Next V3 pre-upload BF16 receipt failed")?;
+        tracing::info!(
+            file = %receipt.file_name,
+            bytes = receipt.file_bytes,
+            sha256 = %receipt.file_sha256,
+            tensors = receipt.tensor_count,
+            elements = receipt.element_count,
+            "Native Flash-Next V3 BF16 finiteness receipt PASS"
+        );
+    }
     let mut loader = spark_runtime::weights::SafetensorsLoader::new();
     loader.peak_memory_multiplier = None;
     let drafter_store = loader

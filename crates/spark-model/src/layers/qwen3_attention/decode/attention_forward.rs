@@ -15,6 +15,7 @@ use spark_runtime::kv_dequant::{
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
+use crate::layers::qwen3_attention::{Qwen4DeviceAttentionRoute, Qwen4DeviceAttentionRow};
 
 impl Qwen3AttentionLayer {
     pub(in super::super) fn attention_forward(
@@ -31,7 +32,9 @@ impl Qwen3AttentionLayer {
         self.attention_forward_impl(
             normed,
             None,
-            seq_len,
+            Some(seq_len),
+            None,
+            false,
             block_table,
             disk_block_ids,
             disk_last_offloaded_per_layer,
@@ -57,7 +60,68 @@ impl Qwen3AttentionLayer {
         self.attention_forward_impl(
             normed,
             Some(qkv_row),
-            seq_len,
+            Some(seq_len),
+            None,
+            false,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    /// Run the ordinary token-ordered attention/QSA/KV/gate core but leave
+    /// its H-wide result unprojected so an exact multi-row O projection can
+    /// be scheduled by the admitted prefill caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_raw(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            Some(seq_len),
+            None,
+            true,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_device(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        device_row: Qwen4DeviceAttentionRow,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            None,
+            Some(device_row),
+            false,
             block_table,
             disk_block_ids,
             disk_last_offloaded_per_layer,
@@ -72,7 +136,9 @@ impl Qwen3AttentionLayer {
         &self,
         normed: DevicePtr,
         preprojected_qkv: Option<DevicePtr>,
-        seq_len: usize,
+        host_seq_len: Option<usize>,
+        device_row: Option<Qwen4DeviceAttentionRow>,
+        defer_oproj: bool,
         block_table: &mut Vec<u32>,
         disk_block_ids: &mut Vec<u32>,
         disk_last_offloaded_per_layer: &mut Vec<u32>,
@@ -80,6 +146,14 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        anyhow::ensure!(
+            host_seq_len.is_some() != device_row.is_some(),
+            "attention requires exactly one host or device-metadata route"
+        );
+        anyhow::ensure!(
+            !defer_oproj || preprojected_qkv.is_some(),
+            "deferred O projection requires preprojected QKV"
+        );
         let h = ctx.config.hidden_size as u32;
         // Per-layer dimension overrides for heterogeneous models (Gemma-4)
         let nq = self
@@ -97,18 +171,20 @@ impl Qwen3AttentionLayer {
         // which handles HSS sliding-window eviction before this layer-internal
         // entry point. Defensive alloc here is incompatible with rolling-window
         // semantics (no access to disk_block_ids).
-        let blocks_needed = (seq_len / bs) + 1;
-        let expected_window_size = match kv_cache.config().cache_blocks_per_seq {
-            Some(cap) => blocks_needed.min(cap as usize),
-            None => blocks_needed,
-        };
-        debug_assert!(
-            block_table.len() >= expected_window_size,
-            "Qwen3AttentionLayer::decode entered with under-allocated block_table \
-             ({}/{} blocks) — caller must call ensure_blocks_through_decode",
-            block_table.len(),
-            expected_window_size,
-        );
+        if let Some(seq_len) = host_seq_len {
+            let blocks_needed = (seq_len / bs) + 1;
+            let expected_window_size = match kv_cache.config().cache_blocks_per_seq {
+                Some(cap) => blocks_needed.min(cap as usize),
+                None => blocks_needed,
+            };
+            debug_assert!(
+                block_table.len() >= expected_window_size,
+                "Qwen3AttentionLayer::decode entered with under-allocated block_table \
+                 ({}/{} blocks) — caller must call ensure_blocks_through_decode",
+                block_table.len(),
+                expected_window_size,
+            );
+        }
 
         // Q/K/V projections into separate regions of qkv_output (GEMV for M=1)
         let q_out = preprojected_qkv.unwrap_or_else(|| ctx.buffers.qkv_output());
@@ -463,19 +539,35 @@ impl Qwen3AttentionLayer {
         let qsa_indices = if meta.qwen4_qsa_required
             && let Some(qsa) = self.qwen4_qsa.as_ref()
         {
-            Some(qsa.update_and_select(
-                normed,
-                seq_len,
-                seq_len + 1,
-                kv_cache,
-                meta,
-                h,
-                eps,
-                ctx.config.rope_theta as f32,
-                ctx.config.rotary_dim() as u32,
-                ctx.gpu,
-                stream,
-            )?)
+            Some(if let Some(row) = device_row {
+                qsa.update_and_select_device(
+                    normed,
+                    row,
+                    kv_cache,
+                    meta,
+                    h,
+                    eps,
+                    ctx.config.rope_theta as f32,
+                    ctx.config.rotary_dim() as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            } else {
+                let seq_len = host_seq_len.expect("host QSA route checked above");
+                qsa.update_and_select(
+                    normed,
+                    seq_len,
+                    seq_len + 1,
+                    kv_cache,
+                    meta,
+                    h,
+                    eps,
+                    ctx.config.rope_theta as f32,
+                    ctx.config.rotary_dim() as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            })
         } else {
             None
         };
@@ -542,6 +634,10 @@ impl Qwen3AttentionLayer {
         // so the streaming kernel sees a self-consistent WHT-domain attention
         // and the bookend kernels recover real-V.
         let use_orchestrator = self.high_speed_swap_engaged(kv_cache);
+        anyhow::ensure!(
+            device_row.is_none() || !use_orchestrator,
+            "device-metadata attention cannot enter high-speed-swap dispatch"
+        );
 
         if use_orchestrator {
             // Phase 6.3: per-layer K/V offload to disk. The alloc-time
@@ -571,7 +667,11 @@ impl Qwen3AttentionLayer {
                 )
             })
             .expect("local installed checked in high_speed_swap_engaged")?;
-        } else if seq_len >= 2048 {
+        } else if matches!(
+            device_row.map(|row| row.route),
+            Some(Qwen4DeviceAttentionRoute::SparseQsa)
+        ) || host_seq_len.is_some_and(|seq_len| seq_len >= 2048)
+        {
             let qsa = self
                 .qwen4_qsa
                 .as_ref()
@@ -591,6 +691,22 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
+            let max_seq_len_host = if let Some(row) = device_row {
+                anyhow::ensure!(
+                    matches!(
+                        row.route,
+                        Qwen4DeviceAttentionRoute::DensePaged { num_splits: 2 }
+                    ),
+                    "invalid device-metadata dense-paged topology"
+                );
+                0
+            } else {
+                host_seq_len
+                    .expect("host dense-paged route checked above")
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("attention sequence length overflow"))?
+                    as u32
+            };
             // Single-sequence decode path: tree-aware indirection is only
             // active in K=γ verify (decode_multi_seq path), so always pass
             // null here.
@@ -613,10 +729,9 @@ impl Qwen3AttentionLayer {
                 spark_runtime::gpu::DevicePtr::NULL,
                 spark_runtime::gpu::DevicePtr::NULL,
                 0,
-                // Host-side seq_len for KV split heuristic. +1 accounts for the
-                // about-to-be-attended token (matches the value uploaded as
-                // device-side `seq_lens`).
-                (seq_len + 1) as u32,
+                // The device-metadata route seals legacy two-way split-K and
+                // therefore has no frame-varying host scalar in the launch.
+                max_seq_len_host,
                 stream,
             )?;
         }
@@ -657,9 +772,11 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        // O projection ── (extracted to attention_forward_oproj.rs)
-        let o_out = self.attention_forward_oproj(attn_out, nq, hd, h, ctx, stream)?;
-
-        Ok(o_out)
+        if defer_oproj {
+            Ok(attn_out)
+        } else {
+            // O projection ── (extracted to attention_forward_oproj.rs)
+            self.attention_forward_oproj(attn_out, nq, hd, h, ctx, stream)
+        }
     }
 }

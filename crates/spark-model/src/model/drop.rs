@@ -47,6 +47,17 @@ fn destroy_graph_cache<K>(
     }
 }
 
+impl TransformerModel {
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub(crate) fn initialize_qwen4_ple_prefill(&mut self, max_tokens: usize) -> Result<()> {
+        let Self { qwen4_ple, gpu, .. } = self;
+        if let Some(ple) = qwen4_ple.as_mut() {
+            ple.initialize_prefill(gpu.as_ref(), max_tokens)?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for TransformerModel {
     fn drop(&mut self) {
         // Every pinned-host source must remain allocated and immutable until
@@ -108,10 +119,15 @@ impl Drop for TransformerModel {
             self.verify_kgamma_graph.get_mut(),
         );
 
+        if let Err(error) = self.vision_embeddings.get_mut().release(self.gpu.as_ref()) {
+            tracing::error!("TransformerModel::drop: vision aggregate release failed: {error:#}");
+            std::process::abort();
+        }
+
         if let Some(ple) = &self.qwen4_ple
-            && let Err(error) = ple.destroy_scratch_event(self.gpu.as_ref())
+            && let Err(error) = ple.destroy_owned_resources(self.gpu.as_ref())
         {
-            tracing::error!("TransformerModel::drop: destroy PLE scratch event failed: {error:#}");
+            tracing::error!("TransformerModel::drop: destroy PLE resources failed: {error:#}");
         }
 
         if self.secondary_event != 0

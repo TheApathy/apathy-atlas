@@ -58,6 +58,21 @@ pub fn step_verify_k4(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
         3
     };
 
+    // Per-position acceptance diagnostics (ATLAS_MTP_ACCEPT_LOG=1, inert
+    // otherwise). Draft slots 0..=2 compare against verified[0..=2].
+    record_accept(
+        if model.proposer_is_dflash() {
+            "dflash"
+        } else {
+            "mtp"
+        },
+        a.seq.seq_len,
+        num_drafts,
+        drafts,
+        &[v0, v1, v2],
+        num_accepted,
+    );
+
     // Extract logprobs from verify logits buffer (K=4 positions) when requested.
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
         extract_verify_logprobs(model, &[v0, v1, v2, v3], top_logprobs)

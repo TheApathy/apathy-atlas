@@ -39,114 +39,7 @@ impl TransformerModel {
         &self,
         images: &[(Vec<f32>, usize, usize)],
     ) -> Result<()> {
-        let ve = match &self.vision_encoder {
-            Some(ve) => ve,
-            None => return Ok(()),
-        };
-        let stream = self.gpu.default_stream();
-
-        // Single-entry vision cache. ON by default (2026-05-08 v2).
-        //
-        // Strategy: keep a dedicated GPU buffer (`vision_cache_buf`)
-        // that holds a snapshot of `ve.buf_out` after the previous
-        // ViT forward, plus a u64 fingerprint of the (grid + pixel
-        // bytes) that produced it. Cache HIT path:
-        //   1. Stream-sync to ensure the previous encode's writes are
-        //      visible (and that no in-flight LLM read overlaps).
-        //   2. D2D copy `vision_cache_buf` → `ve.buf_out` so the
-        //      splice in prefill_c reads the right features.
-        //   3. Restore the cached grids + patch count.
-        //
-        // Why the snapshot copy: `ve.buf_out` is shared scratch; later
-        // calls (e.g. an MTP head asking for vision again, or a stale
-        // pointer from a prior request) could overwrite it. A
-        // dedicated buffer pair makes the cache invariant explicit.
-        // Set ATLAS_VISION_CACHE=0 to disable.
-        let cache_on = std::env::var("ATLAS_VISION_CACHE")
-            .ok()
-            .map(|s| s != "0" && s != "false")
-            .unwrap_or(true);
-        let fp = if cache_on {
-            vision_fingerprint(images)
-        } else {
-            0
-        };
-        if cache_on && fp != 0 {
-            let last = self
-                .vision_cache_fp
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if fp == last {
-                let cached = self.vision_cache_grids.lock().clone();
-                let cache_buf = *self.vision_cache_buf.lock();
-                let cache_bytes = self
-                    .vision_cache_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if !cached.is_empty()
-                    && cached.len() == images.len()
-                    && cache_buf.0 != 0
-                    && cache_bytes > 0
-                {
-                    self.gpu.synchronize(stream)?;
-                    self.gpu
-                        .copy_d2d_async(cache_buf, ve.buf_out, cache_bytes, stream)?;
-                    self.gpu.synchronize(stream)?;
-                    let total: usize = cached.iter().map(|(h, w)| h * w).sum();
-                    *self.vision_embed_patches.lock() = total;
-                    *self.vision_image_grids.lock() = cached;
-                    tracing::info!(
-                        "Vision encoder: {} patches (CACHE HIT, restored {:.1} MB from cache)",
-                        total,
-                        cache_bytes as f64 / 1_048_576.0
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        let mut total_patches = 0usize;
-        let mut post_merge_grids: Vec<(usize, usize)> = Vec::with_capacity(images.len());
-        let sms = ve.spatial_merge_size.max(1);
-        for (pixels, grid_h, grid_w) in images {
-            let p = ve.forward(pixels, *grid_h, *grid_w, self.gpu.as_ref(), stream)?;
-            total_patches += p;
-            post_merge_grids.push((grid_h / sms, grid_w / sms));
-        }
-        *self.vision_embed_patches.lock() = total_patches;
-        *self.vision_image_grids.lock() = post_merge_grids.clone();
-
-        if cache_on && fp != 0 && total_patches > 0 {
-            // Snapshot ve.buf_out into the cache buffer. Allocate (or
-            // grow) on first use / size change.
-            // Buf_out layout per forward.rs: rows
-            // [0 .. (1 + n_deepstack) * merged_p) × out_hidden_size.
-            // We only cache the FIRST merger output (rows 0..merged_p)
-            // because that's all the splice consumes. Compute exact
-            // bytes from total_patches × out_hidden_size × 2 (BF16).
-            let needed_bytes = total_patches * ve.out_hidden_size * 2;
-            let have_bytes = self
-                .vision_cache_bytes
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let mut buf_guard = self.vision_cache_buf.lock();
-            if have_bytes < needed_bytes {
-                if buf_guard.0 != 0 {
-                    let _ = self.gpu.free(*buf_guard);
-                }
-                *buf_guard = self.gpu.alloc(needed_bytes)?;
-                self.vision_cache_bytes
-                    .store(needed_bytes, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.gpu.synchronize(stream)?;
-            self.gpu
-                .copy_d2d_async(ve.buf_out, *buf_guard, needed_bytes, stream)?;
-            self.gpu.synchronize(stream)?;
-            drop(buf_guard);
-
-            *self.vision_cache_grids.lock() = post_merge_grids;
-            self.vision_cache_fp
-                .store(fp, std::sync::atomic::Ordering::Relaxed);
-        }
-        tracing::info!("Vision encoder: {} patches encoded", total_patches);
-        Ok(())
+        self.prepare_vision_aggregate(images)
     }
 
     pub(super) fn prefill_dispatch(
@@ -156,6 +49,28 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        self.validate_vision_prompt(tokens, 0, n)?;
+        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
+            let high_speed_swap = self.kv_cache.lock().config().cache_blocks_per_seq.is_some();
+            crate::layers::qwen4_prefill_moe::attn16::admit_surface(
+                self.vision_prompt_present(tokens),
+                seq.seq_len,
+                0,
+                n,
+                n,
+                high_speed_swap,
+            )?;
+        }
+        if self.config.mrope_interleaved && self.vision_prompt_present(tokens) {
+            return self.prefill_chunk(tokens, seq, 0, n, true, stream);
+        }
+        crate::layers::qwen4_prefill_moe::admit_request(&self.config, n, seq.seq_len)?;
+        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
+            let kv_cache = self.kv_cache.lock();
+            for layer in &self.layers {
+                layer.preflight_qwen4_attn16(&kv_cache, self.gpu.as_ref(), stream)?;
+            }
+        }
         if self.config.is_qwen4_exp()
             && seq.seq_len.saturating_add(n) > 2048
             && !self.config.qwen4_qsa
@@ -390,6 +305,8 @@ impl TransformerModel {
             }
         }
 
+        self.splice_vision_embeddings(tokens, seq_len_start, proc_count, hidden, stream)?;
+
         // ── 3. Upload attention metadata via pinned staging (one H2D copy) ──
         let moe_scratch_bytes = proc_count * self.config.num_experts_per_tok * 4 * 2;
         let meta_offset = (moe_scratch_bytes + 7) & !7;
@@ -517,6 +434,8 @@ impl TransformerModel {
             proc_count,
         );
         let diag_prefill = self.profile && proc_count > 1; // Only with --profile
+        let prefill_receipt =
+            crate::model::qwen4_prefill_engagement::begin(&self.config, proc_count)?;
         for (i, layer) in self.layers.iter().enumerate() {
             if i == 1
                 && let Some(ple) = &self.qwen4_ple
@@ -524,18 +443,46 @@ impl TransformerModel {
                 let row_bytes = self.config.residual_width() * 2;
                 let mut prior = seq.tokens.clone();
                 prior.extend_from_slice(&tokens[..seq_len_start.min(tokens.len())]);
-                for (row, &token) in proc_tokens.iter().enumerate() {
-                    ple.forward_token(
-                        token,
+                let parity_prior = prior.clone();
+                if std::env::var("ATLAS_QWEN4_PLE_PREFILL_BATCH")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    ple.forward_prefill(
+                        proc_tokens,
                         &prior,
-                        hidden.offset(row * row_bytes),
+                        hidden,
                         seq.slot_idx,
-                        seq_len_start == 0 && row == 0,
+                        seq_len_start == 0,
                         self.gpu.as_ref(),
                         stream,
                     )?;
-                    prior.push(token);
+                } else {
+                    for (row, &token) in proc_tokens.iter().enumerate() {
+                        ple.forward_token(
+                            token,
+                            &prior,
+                            hidden.offset(row * row_bytes),
+                            seq.slot_idx,
+                            seq_len_start == 0 && row == 0,
+                            self.gpu.as_ref(),
+                            stream,
+                        )?;
+                        prior.push(token);
+                    }
                 }
+                ple.capture_post_prefill_parity(
+                    hidden,
+                    tokens,
+                    &parity_prior,
+                    proc_tokens,
+                    seq_len_start,
+                    seq.slot_idx,
+                    seq_len_start == 0,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
             }
             layer
                 .prefill(
@@ -607,6 +554,10 @@ impl TransformerModel {
             }
         }
 
+        if let Some(receipt) = prefill_receipt {
+            receipt.finish()?;
+        }
+
         // ── 5. Final norm on LAST token only ──
         let persistent_width = self.config.residual_width();
         let last_hidden = hidden.offset((proc_count - 1) * persistent_width * fp32);
@@ -651,41 +602,4 @@ impl TransformerModel {
 
         Ok(self.decode_logits_ptr())
     }
-}
-
-/// FNV-1a hash over the (grid + raw pixel f32 bytes) of all images in
-/// a request. Used by the single-entry vision cache to skip ViT
-/// forward when the same images appear back-to-back. Returns 0 for an
-/// empty image list (cache always misses on 0).
-fn vision_fingerprint(images: &[(Vec<f32>, usize, usize)]) -> u64 {
-    if images.is_empty() {
-        return 0;
-    }
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x100_0000_01b3;
-    let mut h: u64 = FNV_OFFSET;
-    let mix = |h: &mut u64, b: u8| {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(FNV_PRIME);
-    };
-    for (pixels, gh, gw) in images {
-        for &b in (*gh as u32).to_le_bytes().iter() {
-            mix(&mut h, b);
-        }
-        for &b in (*gw as u32).to_le_bytes().iter() {
-            mix(&mut h, b);
-        }
-        // Hash a sparse subset of the pixel f32 stream — every 64th
-        // element. Full hash on a 1024×1024 image is ~3 MB; sparse
-        // hash is <50 KB and still distinguishes distinct images
-        // (collisions are astronomically rare for natural pixel data).
-        for chunk in pixels.chunks(64) {
-            if let Some(&v) = chunk.first() {
-                for &b in v.to_le_bytes().iter() {
-                    mix(&mut h, b);
-                }
-            }
-        }
-    }
-    if h == 0 { 1 } else { h }
 }

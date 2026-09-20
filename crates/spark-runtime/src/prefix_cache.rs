@@ -196,9 +196,11 @@ pub trait PrefixCache: Send + Sync {
     /// in `PrefixMatch::ssm_snapshot` so the caller can restore SSM state.
     /// `session_hash` tags the snapshot for session-scoped isolation.
     /// `matched_tokens` has the same semantics as in `insert`.
-    /// Returns `(displaced_snapshot_id, newly_acquired_disk_ids)`. The
-    /// disk-ref obligation matches `insert`: caller `inc_disk_ref`s each
-    /// returned ID.
+    /// Returns `(snapshot_id_to_release, newly_acquired_disk_ids)`. When the
+    /// implementation retains `snapshot_id`, the first item is any displaced
+    /// snapshot; when it does not retain it, the first item is `snapshot_id`
+    /// itself. The caller must release every returned snapshot ID. The disk-ref
+    /// obligation matches `insert`: caller `inc_disk_ref`s each returned ID.
     #[allow(clippy::too_many_arguments)]
     fn insert_with_snapshot(
         &self,
@@ -217,7 +219,9 @@ pub trait PrefixCache: Send + Sync {
     /// `block_table` contains the physical block indices for those tokens.
     /// `session_hash` tags the snapshot for session-scoped isolation.
     /// `matched_tokens` has the same semantics as in `insert`.
-    /// Returns the displaced snapshot ID if an existing entry was overwritten.
+    /// Returns a snapshot ID the caller must release: an existing displaced
+    /// snapshot when this insert is retained, or `snapshot_id` itself when the
+    /// implementation does not retain snapshots.
     #[allow(clippy::too_many_arguments)]
     fn insert_intermediate_snapshot(
         &self,
@@ -293,11 +297,11 @@ impl PrefixCache for NoPrefixCaching {
         _block_table: &[u32],
         _disk_block_ids: &[u32],
         _block_size: usize,
-        _snapshot_id: usize,
+        snapshot_id: usize,
         _session_hash: u64,
         _matched_tokens: usize,
     ) -> (Option<usize>, Vec<u32>) {
-        (None, Vec::new())
+        (Some(snapshot_id), Vec::new())
     }
 
     fn insert_intermediate_snapshot(
@@ -306,11 +310,11 @@ impl PrefixCache for NoPrefixCaching {
         _block_table: &[u32],
         _disk_block_ids: &[u32],
         _block_size: usize,
-        _snapshot_id: usize,
+        snapshot_id: usize,
         _session_hash: u64,
         _matched_tokens: usize,
     ) -> Option<usize> {
-        None
+        Some(snapshot_id)
     }
 
     fn release(&self, _tokens: &[u32], _block_size: usize) {}
@@ -366,5 +370,53 @@ mod tests {
         assert_eq!(cache.snapshot_count(), 0);
 
         assert_eq!(cache.stats(), (0, 0));
+    }
+
+    #[test]
+    fn test_no_prefix_caching_returns_every_snapshot_slot() {
+        let cache = NoPrefixCaching;
+        let tokens = [1, 2, 3, 4];
+        let blocks = [7];
+        let mut available_slots = vec![41];
+
+        for iteration in 0..64 {
+            let snapshot_id = available_slots
+                .pop()
+                .expect("no-prefix inserts must not exhaust snapshot slots");
+            let returned = if iteration % 2 == 0 {
+                let (returned, acquired) =
+                    cache.insert_with_snapshot(&tokens, &blocks, &[], 4, snapshot_id, 0, 0);
+                assert!(acquired.is_empty());
+                returned
+            } else {
+                cache.insert_intermediate_snapshot(&tokens, &blocks, &[], 4, snapshot_id, 0, 0)
+            };
+            available_slots.push(returned.expect("inactive cache must return the supplied slot"));
+
+            assert_eq!(available_slots, [41]);
+            assert_eq!(cache.snapshot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn test_active_prefix_cache_keeps_snapshot_ownership_contract() {
+        let cache = crate::radix_tree::RadixTree::new();
+        let tokens: Vec<u32> = (0..16).collect();
+
+        let (returned, acquired) = cache.insert_with_snapshot(&tokens, &[7], &[], 16, 5, 0, 0);
+        assert!(returned.is_none());
+        assert!(acquired.is_empty());
+        assert_eq!(cache.snapshot_count(), 1);
+
+        let (returned, acquired) = cache.insert_with_snapshot(&tokens, &[7], &[], 16, 8, 0, 0);
+        assert_eq!(returned, Some(5));
+        assert!(acquired.is_empty());
+        assert_eq!(cache.snapshot_count(), 1);
+
+        assert_eq!(
+            cache.insert_intermediate_snapshot(&tokens, &[7], &[], 16, 13, 0, 0),
+            Some(8)
+        );
+        assert_eq!(cache.snapshot_count(), 1);
     }
 }

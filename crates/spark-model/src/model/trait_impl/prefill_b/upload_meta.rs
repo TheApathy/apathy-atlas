@@ -81,8 +81,8 @@ impl TransformerModel {
         &self,
         tokens: &[u32],
         seq: &mut SequenceState,
-        chunk_start: usize,
-        chunk_len: usize,
+        _chunk_start: usize,
+        _chunk_len: usize,
         proc_start: usize,
         proc_count: usize,
         effective_seq_len_start: usize,
@@ -135,45 +135,12 @@ impl TransformerModel {
             if use_mrope {
                 stg.positions_h.clear();
                 stg.positions_w.clear();
-                let grids = self.vision_image_grids.lock().clone();
-                let pad_id = self
-                    .config
-                    .vision
-                    .as_ref()
-                    .map(|v| v.image_pad_token_id)
-                    .filter(|v| *v != 0)
-                    .unwrap_or(crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID);
-                let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-                let have_vision = !grids.is_empty() && chunk_tokens.contains(&pad_id);
-
-                if have_vision {
-                    stg.positions.clear();
-                    let mut current_pos: u32 = proc_start as u32;
-                    let mut img_idx = 0usize;
-                    let mut i = 0usize;
-                    while i < chunk_tokens.len() {
-                        if chunk_tokens[i] == pad_id && img_idx < grids.len() {
-                            let (gh, gw) = grids[img_idx];
-                            let run_len = gh * gw;
-                            let base = current_pos;
-                            for k in 0..run_len {
-                                let row = (k / gw.max(1)) as u32;
-                                let col = (k % gw.max(1)) as u32;
-                                stg.positions.push(base);
-                                stg.positions_h.push(base + row);
-                                stg.positions_w.push(base + col);
-                            }
-                            current_pos += gh.max(gw) as u32;
-                            i += run_len;
-                            img_idx += 1;
-                        } else {
-                            stg.positions.push(current_pos);
-                            stg.positions_h.push(current_pos);
-                            stg.positions_w.push(current_pos);
-                            current_pos += 1;
-                            i += 1;
-                        }
-                    }
+                if let Some([positions_t, positions_h, positions_w]) =
+                    self.vision_positions(tokens, proc_start, proc_count)?
+                {
+                    stg.positions = positions_t;
+                    stg.positions_h = positions_h;
+                    stg.positions_w = positions_w;
                 } else {
                     stg.positions_h.extend_from_slice(&stg.positions);
                     stg.positions_w.extend_from_slice(&stg.positions);

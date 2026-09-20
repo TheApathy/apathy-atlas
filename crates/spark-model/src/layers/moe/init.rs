@@ -4,6 +4,18 @@
 
 use super::*;
 
+fn strict_binary_env(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) => anyhow::bail!("{name} must be exactly 0 or 1, got {value:?}"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} must contain valid UTF-8 and be exactly 0 or 1")
+        }
+    }
+}
+
 impl MoeLayer {
     pub fn new(
         weights: MoeWeights,
@@ -21,6 +33,7 @@ impl MoeLayer {
             config.num_experts_per_tok,
             num_experts,
         );
+        let qwen4_compact = qwen4_prefill_compact::load(gpu, config)?;
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
@@ -31,6 +44,35 @@ impl MoeLayer {
         // `moe_topk_sigmoid` kernel's bias arg.
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
+
+        let nvfp4_moe_worklist = strict_binary_env("ATLAS_NVFP4_MOE_WORKLIST")?;
+        if nvfp4_moe_worklist {
+            anyhow::ensure!(
+                !strict_binary_env("ATLAS_MOE_EXACT_PREFILL_GRID")?,
+                "ATLAS_NVFP4_MOE_WORKLIST=1 conflicts with diagnostic ATLAS_MOE_EXACT_PREFILL_GRID=1"
+            );
+            anyhow::ensure!(
+                !strict_binary_env("ATLAS_NVFP4_GATE_UP_M128")?,
+                "ATLAS_NVFP4_MOE_WORKLIST=1 uses the compilable M64 parent and rejects unavailable ATLAS_NVFP4_GATE_UP_M128=1"
+            );
+        }
+        let moe_build_nvfp4_worklist_k =
+            super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a16_build_tile_worklist");
+        let moe_fused_gate_up_t_k64_worklist_k =
+            super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a16_fused_gate_up_t_k64_worklist");
+        let moe_grouped_gemm_t_k64_worklist_k = super::super::try_kernel(
+            gpu,
+            "moe_w4a16",
+            "moe_w4a16_grouped_gemm_ptrtable_t_k64_worklist",
+        );
+        if nvfp4_moe_worklist {
+            anyhow::ensure!(
+                moe_build_nvfp4_worklist_k.0 != 0
+                    && moe_fused_gate_up_t_k64_worklist_k.0 != 0
+                    && moe_grouped_gemm_t_k64_worklist_k.0 != 0,
+                "ATLAS_NVFP4_MOE_WORKLIST=1 requires the complete moe_w4a16 compact-worklist kernel bundle"
+            );
+        }
 
         let _ = num_experts;
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
@@ -87,6 +129,11 @@ impl MoeLayer {
                 "moe_w4a16",
                 "moe_w4a16_fused_gate_up_t_k64_m128",
             ),
+            nvfp4_moe_worklist,
+            qwen4_compact,
+            moe_build_nvfp4_worklist_k,
+            moe_fused_gate_up_t_k64_worklist_k,
+            moe_grouped_gemm_t_k64_worklist_k,
             moe_fp8_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_fp8_grouped_gemm_ptrtable_t")?,
             moe_fp8_grouped_gemm_k: super::super::try_kernel(
                 gpu,
@@ -130,6 +177,7 @@ impl MoeLayer {
             down_ptrs_t: None,
             down_t_scratch_packed: None,
             down_t_scratch_scale: None,
+            stream_t_scratch: None,
             moe_transpose_u8_batched_k: gpu
                 .kernel("moe_transpose_batched", "moe_transpose_u8_batched")?,
             // ── Phase 8a transposed-layout decode kernels ──

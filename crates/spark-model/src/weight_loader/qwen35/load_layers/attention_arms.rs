@@ -15,8 +15,9 @@ use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, Qwen3AttentionLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, dense, dense_auto, load_kv_scales,
-    quantize_to_nvfp4, quantized_auto,
+    AttentionWeights, DenseWeight, Nvfp4Variant, dense, dense_auto,
+    dense_modelopt_mixed_or_fp8_or_bf16, load_kv_scales, quantize_to_nvfp4,
+    quantized_modelopt_mixed,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -73,7 +74,18 @@ pub(super) fn build_full_attention_nvfp4(
                               full_k: usize,
                               kind: TpShardKind|
              -> Result<crate::weight_map::QuantizedWeight> {
-                let src = quantized_auto(store, &format!("{p}.{name}"), gpu, variant)?;
+                let src = quantized_modelopt_mixed(
+                    store,
+                    &format!("{p}.{name}"),
+                    full_n,
+                    full_k,
+                    config,
+                    variant,
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
+                )?;
                 if tp_size == 1 {
                     return Ok(src);
                 }
@@ -207,7 +219,12 @@ pub(super) fn build_full_attention_nvfp4(
             "unsupported Qwen4 QSA geometry"
         );
         layer.set_qwen4_qsa(crate::layers::Qwen4QsaIndexer::new(
-            dense(store, &format!("{p}.indexer.index_qk_proj.weight"))?,
+            dense_modelopt_mixed_or_fp8_or_bf16(
+                store,
+                &format!("{p}.indexer.index_qk_proj"),
+                config,
+                gpu,
+            )?,
             dense(store, &format!("{p}.indexer.q_layernorm.weight"))?,
             dense(store, &format!("{p}.indexer.k_layernorm.weight"))?,
             gpu,

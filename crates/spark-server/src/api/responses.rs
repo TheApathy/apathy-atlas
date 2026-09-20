@@ -115,11 +115,24 @@ pub async fn responses_endpoint(
     let conversation_prefix: Vec<crate::openai::IncomingMessage> = match &conversation_id {
         None => Vec::new(),
         Some(cid) => match state.conversation_store.get(cid) {
-            Some(snap) => snap
-                .items
-                .iter()
-                .filter_map(conversation_item_to_message)
-                .collect(),
+            Some(snap) => {
+                let mut messages = Vec::new();
+                for item in &snap.items {
+                    match crate::openai::IncomingMessage::try_from_responses_input_item(item) {
+                        Ok(Some(message)) => messages.push(message),
+                        Ok(None) => {} // Opaque reasoning is intentionally not replayed.
+                        Err(e) => {
+                            return openai_error_response_with_param(
+                                StatusCode::BAD_REQUEST,
+                                format!("Invalid conversation item: {e}"),
+                                Some("conversation"),
+                                None,
+                            );
+                        }
+                    }
+                }
+                messages
+            }
             None => {
                 return openai_error_response_with_param(
                     StatusCode::NOT_FOUND,

@@ -38,7 +38,21 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
             );
         }
     };
+    if state.yarn_context && req.contains_image() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Static-YaRN long context is currently text-only; image requests require persistent MRoPE position deltas (unsupported_multimodal_context)".to_string(),
+        );
+    }
 
+    if let Err(error) = req.validate_images() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.into(),
+        );
+    }
     tracing::info!(
         "Anthropic request: max_tokens={}, thinking={:?}, tools={}, model={}, stream={}",
         req.max_tokens,
@@ -188,7 +202,18 @@ pub async fn count_tokens(
             );
         }
     };
+    if state.yarn_context && req.contains_image() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Static-YaRN long context is currently text-only; image requests require persistent MRoPE position deltas (unsupported_multimodal_context)".to_string(),
+        );
+    }
 
+    if req.contains_image() {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error",
+            "This endpoint does not yet count expanded image tokens (unsupported_multimodal_token_count)".into());
+    }
     let tools_active =
         state.tool_call_parser.is_some() && req.tools.as_ref().is_some_and(|t| !t.is_empty());
     let enable_thinking = if state.disable_thinking {

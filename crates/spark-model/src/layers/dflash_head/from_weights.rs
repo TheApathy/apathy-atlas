@@ -19,6 +19,9 @@ use crate::weight_loader::{
 };
 use crate::weight_map::{DenseWeight, quantize_to_nvfp4};
 
+#[path = "dflash_context_window.rs"]
+mod dflash_context_window;
+
 /// Resolve the two Qwen config dialects (`rope_scaling` and Transformers 5's
 /// `rope_parameters`) into the exact frequency table and amplitude multiplier
 /// consumed by the DFlash kernel.
@@ -138,6 +141,33 @@ impl BlockDiffusionDraftHead {
         );
         weights.config.validate_verify_mode(verify_mode)?;
         let checkpoint_family = weights.config.checkpoint_family()?;
+        let native_flash_next = dflash_context_window::is_native_flash_next(
+            &weights.config.architectures,
+            weights.config.model_type.as_deref(),
+            hidden_size,
+            intermediate_size,
+            num_layers,
+            weights.config.num_target_layers,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size,
+            &target_layer_ids,
+        );
+        // Resolve and reject an invalid runtime context contract before any
+        // backend kernel lookup or device allocation has an observable effect.
+        let ctx_window = dflash_context_window::resolve_context_window(
+            window_size,
+            max_seq_len,
+            native_flash_next,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        tracing::info!(
+            "DFlash resident context window = {} (absolute max_seq_len={}, native_flash_next={})",
+            ctx_window,
+            max_seq_len,
+            native_flash_next,
+        );
         let block_size = weights.config.resolved_block_size();
         let gamma_val = weights.config.resolve_draft_count(gamma)?;
         super::draft_budget::DflashDraftBudget::validate_head(gamma_val, physical_verify_k)?;
@@ -292,26 +322,9 @@ impl BlockDiffusionDraftHead {
         // logits + argmax tail still operates on γ rows (offset past ctx).
         let bf16 = 2usize;
         let g = gamma_val;
-        // Phase 2.5n: ctx_window controls how many captured target positions
-        // the drafter attends to per step. The drafter was trained over the
-        // FULL captured prefix (paper §A.1), but capping at γ=16 cripples it
-        // on prompts past a tiny window — Atlas's 6-10% acceptance vs the
-        // paper's 70% is dominated by this cap. Default raised to 512;
-        // ATLAS_DFLASH_CTX_WINDOW overrides at construction time.
-        //
-        // Memory cost: attention scratch scales linearly with `n_attn = γ + cw`.
-        // Logits are separate and compact: only configured draft rows by the
-        // shared target/drafter vocabulary prefix.
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(512);
-        tracing::info!(
-            "DFlash ctx_window = {} (set ATLAS_DFLASH_CTX_WINDOW to override; \
-             drafter trained on full captured prefix — larger is better, \
-             scratch grows linearly)",
-            ctx_window
-        );
+        // The startup-resolved value controls scratch, cache, and runtime
+        // attention. Native Flash-Next keeps this 4096-token tail resident
+        // even when absolute positions extend to 1M.
         let kv_dim = num_kv_heads * head_dim;
         let circular_kv_bytes = ctx_window * kv_dim * bf16 * 2 * num_layers;
         let circular_fc_bytes = ctx_window * hidden_size * bf16;
@@ -521,29 +534,22 @@ impl BlockDiffusionDraftHead {
                 // `full_attention` — so the heuristic makes every layer causal,
                 // which is the opposite of how it was trained.
                 //
-                // Gated so the champion path is provably untouched:
-                //   unset / 0  -> historical `layer_types` behaviour
-                //   1          -> honour the checkpoint's own declaration
-                // Only the explicit `Some(false)` case changes anything, so no
-                // drafter lacking the field can be affected either way.
-                let honour_is_causal = std::env::var("ATLAS_DFLASH_HONOR_IS_CAUSAL")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
-                if honour_is_causal && weights.config.is_causal == Some(false) {
+                // An explicit checkpoint declaration is authoritative. Only
+                // `Some(false)` changes the legacy layer-type heuristic, so a
+                // checkpoint that omits the field keeps historical behavior.
+                if weights.config.is_causal == Some(false) {
                     let was_causal = causals.iter().filter(|c| **c).count();
-                    causals.iter_mut().for_each(|c| *c = false);
+                    causals.iter_mut().for_each(|causal| *causal = false);
                     tracing::info!(
-                        "ATLAS_DFLASH_HONOR_IS_CAUSAL=1 and the drafter config \
-                         declares is_causal=false: forcing all {num_layers} \
-                         drafter layers non-causal (was {was_causal} causal). SWA \
-                         windows are unchanged."
+                        "DFlash checkpoint declares is_causal=false: forcing all \
+                         {num_layers} drafter layers non-causal (was {was_causal} \
+                         causal); per-layer SWA windows are unchanged"
                     );
                 }
                 tracing::info!(
-                    "DFlash per-layer SWA: {sliding_count}/{num_layers} layers \
-                     use sliding_window={sw} causal=true (causal+SWA); \
-                     full layers causal=false (bidirectional)"
+                    "DFlash per-layer SWA: {sliding_count}/{num_layers} layers use \
+                     sliding_window={sw}, causal={causals:?}, checkpoint is_causal={:?}",
+                    weights.config.is_causal,
                 );
                 (windows, causals)
             }

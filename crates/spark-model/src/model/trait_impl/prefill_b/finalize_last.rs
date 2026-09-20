@@ -174,7 +174,7 @@ impl TransformerModel {
         }
 
         // ── 8. Insert into prefix cache + Marconi snapshot ──
-        if self.ssm_snapshots.is_enabled() {
+        if self.prefix_cache.is_active() && self.ssm_snapshots.is_enabled() {
             let snap_result = match self.ssm_snapshots.save(
                 seq.slot_idx,
                 seq.session_hash,

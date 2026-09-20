@@ -95,7 +95,12 @@ impl Qwen3SsmLayer {
                     "w4a16_gemv_rt",
                     ops::ExactLmHeadTier::M32.symbol_rt2(),
                 ),
-            ),
+            )
+            .with_rt2_m32_grid(super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_rt",
+                "w4a16_gemv_batch_logits_exact_rt2_m32_grid",
+            )),
             w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             gemv_sw: crate::layers::ops::gemv_sw_enabled(),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
@@ -222,6 +227,11 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy64_prefill",
                 "gated_delta_rule_prefill_wy64",
             ),
+            gdn_prefill_wy32_warp_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy32_warp",
+                "gated_delta_rule_prefill_wy32_warp",
+            ),
             // ── Q12 Phase 2b: batched GDN kernel handles ──
             gdn_prefill_wy32_batched_k: super::super::try_kernel(
                 gpu,
@@ -282,11 +292,19 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_f32_multi_seq",
                 "gated_delta_rule_decode_f32_multi_seq",
             ),
-            gated_rms_norm_f32_multi_seq_k: super::super::try_kernel(
-                gpu,
-                "gated_rms_norm_f32_multi_seq",
-                "gated_rms_norm_f32_multi_seq",
-            ),
+            gated_rms_norm_f32_multi_seq_k: if config.output_gate_type == "sigmoid" {
+                super::super::try_kernel(
+                    gpu,
+                    "qwen4_hyper",
+                    "qwen4_gated_rms_norm_sigmoid_f32_multi_seq",
+                )
+            } else {
+                super::super::try_kernel(
+                    gpu,
+                    "gated_rms_norm_f32_multi_seq",
+                    "gated_rms_norm_f32_multi_seq",
+                )
+            },
             conv1d_l2norm_chunk3_k: super::super::try_kernel(
                 gpu,
                 "causal_conv1d_chunk3_l2norm",

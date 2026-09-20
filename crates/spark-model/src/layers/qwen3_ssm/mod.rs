@@ -168,6 +168,8 @@ pub struct Qwen3SsmLayer {
     /// WY32 chunked prefill: processes 32 tokens per WY iteration with H in
     /// shared memory. ~30x faster than per-token for 14k+ sequences.
     gdn_prefill_wy32_k: KernelHandle,
+    /// Flash-Next WY32 variant with four warp-parallel FP32 reductions.
+    gdn_prefill_wy32_warp_k: KernelHandle,
     // ── Q12 Phase 2b: same-chunk-len batched GDN prefill kernels ──
     // Each takes `float* const* h_state_ptrs` plus stacked QKV/gate/beta/output.
     // Used by `Qwen3SsmLayer::prefill_batched` when N≥2 streams have matching
@@ -321,6 +323,13 @@ mod exact_projection;
 mod exact_projection_tests;
 mod init;
 mod qwen4_k5_ssm;
+mod qwen4_prefill_check;
+mod qwen4_prefill_check_raw;
+pub(crate) mod qwen4_prefill_exact;
+mod qwen4_prefill_exact_forward;
+mod qwen4_prefill_exact_plan;
+pub(crate) mod qwen4_prefill_gemm;
+mod qwen4_prefill_moe;
 mod serial_diag;
 mod ssm_forward;
 mod trait_decode;
@@ -365,6 +374,73 @@ impl TransformerLayer for Qwen3SsmLayer {
         mlp: crate::layers::Qwen4HyperConnection,
     ) -> Result<()> {
         Qwen3SsmLayer::set_qwen4_hyperconnections(self, attn, mlp);
+        Ok(())
+    }
+
+    // ── MoE transpose hooks ──
+    //
+    // These were previously left to the trait's default `Ok(())`, which is a
+    // SILENT no-op. Only `Qwen3AttentionLayer` implemented them, so on
+    // Qwen3.8-Flash-Next — 36 SSM layers and 12 full-attention layers — a
+    // whole-model transpose pass actually transposed 12 of 48 layers and
+    // reported success. The two visible symptoms: `ATLAS_NVFP4_MOE_WORKLIST=1`
+    // failed at "Prefill chunk layer 0 ... requires transposed gate/up expert
+    // pointer tables" (layer 0 is an SSM layer), and `ATLAS_UNIFIED_MOE_LAYOUT=1`
+    // measured as a pure loss because it switched decode to the `_t` kernels
+    // while three quarters of the layers had no `_t` weights to use.
+    //
+    // Unlike the attention layer there is no `moe_ffn` here; the SSM layer owns
+    // exactly one FFN.
+    fn transpose_moe_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_gate_up_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_gate_up_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn set_moe_stream_transpose_scratch(
+        &mut self,
+        scratch: crate::layer::MoeStreamTransposeScratch,
+    ) {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.set_moe_stream_transpose_scratch(scratch);
+        }
+    }
+
+    fn transpose_moe_for_prefill_unified(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_unified(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_for_prefill_hybrid(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_hybrid(gpu, config)?;
+        }
         Ok(())
     }
 

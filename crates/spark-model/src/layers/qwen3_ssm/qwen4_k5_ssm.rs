@@ -1,13 +1,209 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Exact five-row Qwen4 SSM projection batching with serial recurrence.
+//! Exact small-row Qwen4 SSM projection batching with serial recurrence.
 
 use super::*;
 
+pub(super) const QWEN4_K16_BATCHED_VERIFY_ENV: &str = "ATLAS_QWEN4_K16_BATCHED_VERIFY";
+pub(super) const QWEN4_K16_EXACT_ENV: &str = "ATLAS_QWEN4_K16_EXACT";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Qwen4ExactSsmRowsRoute {
+    LegacyK5OrK9,
+    NativeK16,
+}
+
+impl Qwen4ExactSsmRowsRoute {
+    fn admits(self, rows: usize) -> bool {
+        match self {
+            Self::LegacyK5OrK9 => matches!(rows, 5 | 9),
+            Self::NativeK16 => rows == 16,
+        }
+    }
+
+    fn force_sequence_kernels(self) -> bool {
+        self == Self::NativeK16
+    }
+}
+
+fn parse_exact_bool_env_value(name: &str, value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => {
+            anyhow::bail!("{name} must be exactly 0 or 1, got {other:?}")
+        }
+    }
+}
+
+fn exact_bool_env(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => parse_exact_bool_env_value(name, Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_exact_bool_env_value(name, None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} must be valid UTF-8 and exactly 0 or 1")
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn parse_qwen4_k16_batched_verify(value: Option<&str>) -> Result<bool> {
+    parse_exact_bool_env_value(QWEN4_K16_BATCHED_VERIFY_ENV, value)
+}
+
+#[cfg(test)]
+pub(super) fn parse_qwen4_k16_exact(value: Option<&str>) -> Result<bool> {
+    parse_exact_bool_env_value(QWEN4_K16_EXACT_ENV, value)
+}
+
+pub(super) fn qwen4_k16_batched_verify_requested() -> Result<bool> {
+    exact_bool_env(QWEN4_K16_BATCHED_VERIFY_ENV)
+}
+
+pub(super) fn qwen4_k16_exact_requested() -> Result<bool> {
+    exact_bool_env(QWEN4_K16_EXACT_ENV)
+}
+
+pub(super) fn qwen4_exact_ssm_rows_route(
+    rows: usize,
+    legacy_hybrid: bool,
+    legacy_batch_ssm: bool,
+    k16_requested: bool,
+    k16_exact_requested: bool,
+    has_recurrent_intermediates: bool,
+) -> Option<Qwen4ExactSsmRowsRoute> {
+    if rows == 16 && k16_requested && k16_exact_requested && has_recurrent_intermediates {
+        Some(Qwen4ExactSsmRowsRoute::NativeK16)
+    } else if matches!(rows, 5 | 9) && legacy_hybrid && legacy_batch_ssm {
+        Some(Qwen4ExactSsmRowsRoute::LegacyK5OrK9)
+    } else {
+        None
+    }
+}
+
+fn checked_row_bytes(rows: usize, width: usize, element_bytes: usize, name: &str) -> Result<usize> {
+    rows.checked_mul(width)
+        .and_then(|elements| elements.checked_mul(element_bytes))
+        .ok_or_else(|| anyhow::anyhow!("Qwen4 exact SSM {name} extent overflow"))
+}
+
 impl Qwen3SsmLayer {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn ssm_forward_qwen4_k5_exact(
+    pub(super) fn preflight_qwen4_exact_ssm_rows(
         &self,
+        route: Qwen4ExactSsmRowsRoute,
+        rows: usize,
+        state: &SsmLayerState,
+        h_intermediate: DevicePtr,
+        conv_intermediate: DevicePtr,
+        h_intermediate_stride: usize,
+        conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        const BF16: usize = 2;
+        const FP32: usize = 4;
+        anyhow::ensure!(
+            route.admits(rows),
+            "Qwen4 exact SSM route does not admit {rows} rows"
+        );
+
+        let h = ctx.config.hidden_size;
+        let nk = ctx.config.linear_num_key_heads;
+        let kd = ctx.config.linear_key_head_dim;
+        let nv = ctx.config.linear_num_value_heads;
+        let vd = ctx.config.linear_value_head_dim;
+        let qkvz_size = ctx.config.ssm_qkvz_size();
+        let ba_size = ctx.config.ssm_ba_size();
+        let d_conv = ctx.config.linear_conv_kernel_dim;
+        if route == Qwen4ExactSsmRowsRoute::NativeK16 {
+            anyhow::ensure!(
+                ctx.config.is_qwen4_exp()
+                    && h == 2_560
+                    && ctx.config.residual_width() == 10_240
+                    && nk == 16
+                    && kd == 128
+                    && nv == 48
+                    && vd == 128
+                    && d_conv == 4
+                    && qkvz_size == 16_384
+                    && ba_size == 96,
+                "Qwen4 native K16 SSM requires exact Flash-Next recurrent geometry"
+            );
+        }
+        anyhow::ensure!(
+            nk > 0 && nv.is_multiple_of(nk),
+            "Qwen4 exact SSM requires integral value-head grouping"
+        );
+        anyhow::ensure!(
+            self.sequential_qkvz,
+            "Qwen4 exact SSM requires sequential QKVZ"
+        );
+        anyhow::ensure!(
+            self.qkvz_nvfp4.is_some(),
+            "Qwen4 exact SSM requires NVFP4 QKVZ"
+        );
+        anyhow::ensure!(
+            !state.h_is_f16 && !state.h_state.is_null() && !state.conv_state.is_null(),
+            "Qwen4 exact SSM requires FP32 live recurrent state"
+        );
+        anyhow::ensure!(
+            !h_intermediate.is_null() && !conv_intermediate.is_null(),
+            "Qwen4 exact SSM requires recurrent intermediates"
+        );
+        anyhow::ensure!(
+            h_intermediate != state.h_state && conv_intermediate != state.conv_state,
+            "Qwen4 exact SSM live and checkpoint state must not alias"
+        );
+        anyhow::ensure!(
+            h_intermediate_stride == self.h_state_bytes
+                && conv_intermediate_stride == self.conv_state_bytes
+                && h_intermediate_stride.is_multiple_of(FP32)
+                && conv_intermediate_stride.is_multiple_of(FP32),
+            "Qwen4 exact SSM recurrent intermediate stride mismatch"
+        );
+
+        let batch_conv = route.force_sequence_kernels()
+            || std::env::var("ATLAS_QWEN4_K5_BATCH_CONV").ok().as_deref() == Some("1");
+        let batch_gdn = route.force_sequence_kernels()
+            || std::env::var("ATLAS_QWEN4_K5_BATCH_GDN").ok().as_deref() == Some("1");
+        anyhow::ensure!(
+            self.ba_gates_batchn_exact_k.0 != 0
+                && self.conv1d_l2norm_f32_k.0 != 0
+                && self.gdn_f32_k.0 != 0
+                && self.gated_rms_norm_f32_k.0 != 0
+                && (!batch_conv || self.conv1d_l2norm_f32_sequence_k.0 != 0)
+                && (!batch_gdn || self.gdn_f32_sequence_k.0 != 0),
+            "Qwen4 exact SSM kernels are incomplete"
+        );
+
+        let sizes = ctx.buffers.sizes();
+        anyhow::ensure!(
+            checked_row_bytes(rows, qkvz_size, BF16, "deinterleaved")? <= sizes.ssm_deinterleaved,
+            "Qwen4 exact SSM deinterleaved staging exceeds its arena"
+        );
+        anyhow::ensure!(
+            checked_row_bytes(rows, nv * 2, FP32, "gate")? <= sizes.ssm_gates,
+            "Qwen4 exact SSM gate staging exceeds its arena"
+        );
+        anyhow::ensure!(
+            checked_row_bytes(rows, qkvz_size, FP32, "conv/GDN")? <= sizes.ssm_conv_out_f32,
+            "Qwen4 exact SSM conv/GDN staging exceeds its arena"
+        );
+        anyhow::ensure!(
+            checked_row_bytes(rows, nv * vd, BF16, "normalization")? <= sizes.ssm_qkvz,
+            "Qwen4 exact SSM normalization staging exceeds its arena"
+        );
+        anyhow::ensure!(
+            checked_row_bytes(rows, h, BF16, "output")? <= sizes.moe_output,
+            "Qwen4 exact SSM output staging exceeds its arena"
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ssm_forward_qwen4_exact_rows(
+        &self,
+        route: Qwen4ExactSsmRowsRoute,
         input: DevicePtr,
         rows: usize,
         state: &mut SsmLayerState,
@@ -34,11 +230,13 @@ impl Qwen3SsmLayer {
         let d_conv = ctx.config.linear_conv_kernel_dim;
         let qk_ch = (key_dim * 2) as u32;
         let eps = ctx.config.rms_norm_eps as f32;
-        let batch_conv = std::env::var("ATLAS_QWEN4_K5_BATCH_CONV").ok().as_deref() == Some("1");
-        let batch_gdn = std::env::var("ATLAS_QWEN4_K5_BATCH_GDN").ok().as_deref() == Some("1");
+        let batch_conv = route.force_sequence_kernels()
+            || std::env::var("ATLAS_QWEN4_K5_BATCH_CONV").ok().as_deref() == Some("1");
+        let batch_gdn = route.force_sequence_kernels()
+            || std::env::var("ATLAS_QWEN4_K5_BATCH_GDN").ok().as_deref() == Some("1");
         anyhow::ensure!(
-            matches!(rows, 5 | 9),
-            "Qwen4 exact SSM requires 5 or 9 rows"
+            route.admits(rows),
+            "Qwen4 exact SSM route does not admit {rows} rows"
         );
         anyhow::ensure!(
             self.sequential_qkvz,
@@ -237,4 +435,9 @@ impl Qwen3SsmLayer {
         )?;
         Ok(output)
     }
+}
+
+#[cfg(test)]
+mod qwen4_k16_ssm_tests {
+    include!("qwen4_k16_ssm_tests.rs");
 }

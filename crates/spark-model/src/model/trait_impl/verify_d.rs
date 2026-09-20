@@ -130,6 +130,85 @@ fn verify_skip_layer(idx: usize) -> bool {
     .contains(&idx)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen4VerifyLayerRoute {
+    RowSerialOracle,
+    QualifiedBatched,
+    ExperimentalK16Batched,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Qwen4VerifyRouteIdentity {
+    target_is_qwen4: bool,
+    native_dflash_pairing: bool,
+    active_proposer_is_dflash: bool,
+    active_proposer_physical_k: Option<usize>,
+}
+
+const QWEN4_K16_BATCHED_VERIFY_ENV: &str = "ATLAS_QWEN4_K16_BATCHED_VERIFY";
+const QWEN4_K16_BATCHED_VERIFY_GRAPH_BIT: u32 = 1 << 3;
+
+fn parse_exact_bool_env_value(name: &str, value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => bail!("{name} must be exactly 0 or 1, got {other:?}"),
+    }
+}
+
+fn exact_bool_env(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => parse_exact_bool_env_value(name, Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_exact_bool_env_value(name, None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{name} must be valid UTF-8 and exactly 0 or 1")
+        }
+    }
+}
+
+/// Select the Qwen4 target-layer implementation for a physical verify width.
+///
+/// K=2 and K=3 have end-to-end parity evidence. K=5 may use its separately
+/// qualified hybrid only behind the existing explicit opt-in. Exact native
+/// DFlash K16 may enter the unqualified batched path only behind its separate
+/// research flag. Every other width fails closed to ordinary single-token
+/// decode until that exact shape has stage and committed-state parity proof.
+fn qwen4_verify_layer_route(
+    identity: Qwen4VerifyRouteIdentity,
+    frame_k: usize,
+    k5_hybrid_enabled: bool,
+    k16_batched_requested: bool,
+) -> std::result::Result<Option<Qwen4VerifyLayerRoute>, &'static str> {
+    if k16_batched_requested {
+        if !identity.target_is_qwen4 {
+            return Err("ATLAS_QWEN4_K16_BATCHED_VERIFY requires a Qwen4 target");
+        }
+        if !identity.native_dflash_pairing {
+            return Err(
+                "ATLAS_QWEN4_K16_BATCHED_VERIFY requires the exact native Qwen4 DFlash pairing",
+            );
+        }
+        if !identity.active_proposer_is_dflash {
+            return Err(
+                "ATLAS_QWEN4_K16_BATCHED_VERIFY requires the native DFlash proposer to be active",
+            );
+        }
+        if identity.active_proposer_physical_k != Some(16) {
+            return Err("ATLAS_QWEN4_K16_BATCHED_VERIFY requires DFlash physical verify K=16");
+        }
+    }
+    if !identity.target_is_qwen4 {
+        return Ok(None);
+    }
+    let route = match frame_k {
+        2 | 3 => Qwen4VerifyLayerRoute::QualifiedBatched,
+        5 if k5_hybrid_enabled => Qwen4VerifyLayerRoute::QualifiedBatched,
+        16 if k16_batched_requested => Qwen4VerifyLayerRoute::ExperimentalK16Batched,
+        _ => Qwen4VerifyLayerRoute::RowSerialOracle,
+    };
+    Ok(Some(route))
+}
+
 impl TransformerModel {
     pub(super) fn decode_verify_graphed_kgamma_dispatch(
         &self,
@@ -140,6 +219,54 @@ impl TransformerModel {
         let k = tokens.len();
         if k == 0 {
             return Ok(Vec::new());
+        }
+        // Freeze the experimental route before the first frame effect. The
+        // runtime-only capture mode is set only after exact native Qwen4
+        // target/drafter pairing validation; repeat the target geometry here
+        // so a forged or partially-constructed config cannot enter the path.
+        let k16_batched_requested = exact_bool_env(QWEN4_K16_BATCHED_VERIFY_ENV)?;
+        let active_proposer = self.active_proposer();
+        let active_proposer_is_dflash = active_proposer.is_some_and(|p| p.is_dflash());
+        let active_proposer_physical_k = active_proposer.and_then(|p| {
+            if p.is_dflash() {
+                p.physical_verify_k()
+            } else {
+                None
+            }
+        });
+        let native_dflash_pairing = self.config.is_qwen4_exp()
+            && self.config.hidden_size == 2_560
+            && self.config.residual_width() == 10_240
+            && super::super::k16_commit_parity::is_qwen38_flash_next_target_vocab(
+                self.config.vocab_size,
+            )
+            && self.config.num_hidden_layers == 48
+            && self.dflash_capture_width == 2_560
+            && self.dflash_capture_offset == 0
+            && self.dflash_capture_layers.as_slice() == [1, 7, 13, 20, 26, 33, 39, 46]
+            && self.dflash_capture_mode
+                == atlas_core::config::DflashCaptureMode::Qwen4HyperProjected;
+        let k5_hybrid_enabled = std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
+        let qwen4_layer_route = qwen4_verify_layer_route(
+            Qwen4VerifyRouteIdentity {
+                target_is_qwen4: self.config.is_qwen4_exp(),
+                native_dflash_pairing,
+                active_proposer_is_dflash,
+                active_proposer_physical_k,
+            },
+            k,
+            k5_hybrid_enabled,
+            k16_batched_requested,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if qwen4_layer_route == Some(Qwen4VerifyLayerRoute::ExperimentalK16Batched) {
+            crate::model::k16_route_receipt::mark_batched_entry(seq.seq_len, tokens)?;
+            static K16_BATCHED_ENGAGED: std::sync::Once = std::sync::Once::new();
+            K16_BATCHED_ENGAGED.call_once(|| {
+                tracing::warn!(
+                    "ENGAGED ATLAS_QWEN4_K16_BATCHED_VERIFY: native_qwen4_dflash_physical_k16"
+                );
+            });
         }
         // Keep the prior K=2 verifier as an explicit diagnostic oracle. The
         // production Qwen4 path below now owns K=2 and K=3 with batched MoE.
@@ -155,7 +282,6 @@ impl TransformerModel {
                 .decode_verify_graphed_dispatch(&pair, seq, _stream)?
                 .to_vec());
         }
-
         // ATLAS_SSM_H_FP16 stage 2. This entry point does NOT exist upstream —
         // the speculative verify is ours — and it is the one that matters most
         // here, because the WY kernels it dispatches are the h-state readers and
@@ -1084,11 +1210,18 @@ impl TransformerModel {
         // Bit 2: a real/synthetic SSM tree parent pointer is active. Flat K4
         // uses exact FP32 sequence recurrence, whereas a genuine DDTree K4
         // uses the tree kernel family; those graph topologies cannot alias.
-        let pack_key = super::commit_plan::verify_graph_shape_key(
-            ctx.tree_aware_attn.and_then(|t| t.pack).is_some(),
-            ctx.tree_aware_attn.is_some(),
-            ctx.ddtree_parent_ids_dev.is_some(),
-        );
+        // Bit 3: the experimental native Qwen4 K16 batched layer path. It has
+        // a different launch topology from the released row-serial oracle.
+        let pack_key =
+            super::commit_plan::verify_graph_shape_key(
+                ctx.tree_aware_attn.and_then(|t| t.pack).is_some(),
+                ctx.tree_aware_attn.is_some(),
+                ctx.ddtree_parent_ids_dev.is_some(),
+            ) | if qwen4_layer_route == Some(Qwen4VerifyLayerRoute::ExperimentalK16Batched) {
+                QWEN4_K16_BATCHED_VERIFY_GRAPH_BIT
+            } else {
+                0
+            };
         let cache_key = (seq.slot_idx, k, pack_key);
         let cached_for_slot = graph_cache
             .as_ref()
@@ -1178,18 +1311,21 @@ impl TransformerModel {
                     } else {
                         (DevicePtr::NULL, DevicePtr::NULL)
                     };
-                    // The generic Qwen4 batched layer path first diverges
-                    // from ordinary decode at layer 0 for K=5. Because its
-                    // recurrent intermediates may be committed, even a
-                    // logits-tolerant numeric delta becomes cross-step state
-                    // corruption. Keep the released gamma-4 geometry on the
-                    // lossless row-serial layer path until each batched stage
-                    // has an in-process parity proof.
-                    let qwen4_k5_hybrid = k == 5
-                        && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
-                    if k == 5 && !qwen4_k5_hybrid {
+                    // A batched route with no proof for this exact physical K
+                    // can corrupt recurrent state even when its logits happen
+                    // to agree. Keep gamma15/K16 and shortened, unqualified
+                    // widths on ordinary row-serial decode. K=2/K=3, the
+                    // separately qualified K=5 hybrid, and the explicit
+                    // research-only K16 selector may enter
+                    // `decode_qwen4_batched`.
+                    let verify_route = qwen4_layer_route.ok_or_else(|| {
+                        anyhow::anyhow!("Qwen4 verify layer route was not resolved (K={k})")
+                    })?;
+                    if verify_route == Qwen4VerifyLayerRoute::RowSerialOracle {
                         let metadata = ctx.attn_metadata.ok_or_else(|| {
-                            anyhow::anyhow!("Qwen4 K=5 verify requires attention metadata")
+                            anyhow::anyhow!(
+                                "Qwen4 row-serial verify requires attention metadata (K={k})"
+                            )
                         })?;
                         for row in 0..k {
                             let token_metadata = AttnMetadataDev {
@@ -1224,7 +1360,8 @@ impl TransformerModel {
                                     .downcast_mut::<SsmLayerState>()
                                     .ok_or_else(|| {
                                         anyhow::anyhow!(
-                                            "Qwen4 K=5 verify expected SSM state at layer {layer_idx}"
+                                            "Qwen4 row-serial verify expected SSM state at layer \
+                                             {layer_idx} (K={k})"
                                         )
                                     })?;
                                 self.gpu.copy_d2d_async(
@@ -1770,5 +1907,194 @@ impl TransformerModel {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod qwen4_verify_route_tests {
+    use super::{
+        QWEN4_K16_BATCHED_VERIFY_ENV, QWEN4_K16_BATCHED_VERIFY_GRAPH_BIT, Qwen4VerifyLayerRoute,
+        Qwen4VerifyRouteIdentity, parse_exact_bool_env_value, qwen4_verify_layer_route,
+    };
+
+    const NATIVE_K16: Qwen4VerifyRouteIdentity = Qwen4VerifyRouteIdentity {
+        target_is_qwen4: true,
+        native_dflash_pairing: true,
+        active_proposer_is_dflash: true,
+        active_proposer_physical_k: Some(16),
+    };
+
+    fn route(
+        frame_k: usize,
+        k5_hybrid_enabled: bool,
+        k16_batched_requested: bool,
+    ) -> Qwen4VerifyLayerRoute {
+        qwen4_verify_layer_route(
+            NATIVE_K16,
+            frame_k,
+            k5_hybrid_enabled,
+            k16_batched_requested,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn gamma15_physical_k16_defaults_to_row_serial_oracle() {
+        let gamma = 15usize;
+        let physical_k = gamma + 1;
+
+        assert_eq!(physical_k, 16);
+        assert_eq!(
+            route(physical_k, false, false),
+            Qwen4VerifyLayerRoute::RowSerialOracle
+        );
+        assert_eq!(
+            route(physical_k, true, false),
+            Qwen4VerifyLayerRoute::RowSerialOracle,
+            "the K5 opt-in must not widen to K16"
+        );
+    }
+
+    #[test]
+    fn exact_native_gamma15_k16_can_select_experimental_batching() {
+        assert_eq!(
+            route(16, false, true),
+            Qwen4VerifyLayerRoute::ExperimentalK16Batched
+        );
+        assert_eq!(
+            QWEN4_K16_BATCHED_VERIFY_GRAPH_BIT & 0b111,
+            0,
+            "the K16 route bit must not alias existing graph-shape bits"
+        );
+    }
+
+    #[test]
+    fn shortened_width_dispatch_table_does_not_leak_k16_opt_in() {
+        let expected = [
+            (1, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (2, Qwen4VerifyLayerRoute::QualifiedBatched),
+            (3, Qwen4VerifyLayerRoute::QualifiedBatched),
+            (4, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (5, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (6, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (7, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (8, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (9, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (10, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (11, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (12, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (13, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (14, Qwen4VerifyLayerRoute::RowSerialOracle),
+            (15, Qwen4VerifyLayerRoute::RowSerialOracle),
+        ];
+
+        for (physical_k, route) in expected {
+            assert_eq!(
+                self::route(physical_k, false, false),
+                route,
+                "unexpected Qwen4 route for shortened physical K={physical_k}"
+            );
+            for k5_hybrid_enabled in [false, true] {
+                assert_eq!(
+                    self::route(physical_k, k5_hybrid_enabled, true),
+                    self::route(physical_k, k5_hybrid_enabled, false),
+                    "K16 opt-in leaked to shortened frame K={physical_k} with K5 hybrid={k5_hybrid_enabled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn k5_hybrid_opt_in_is_shape_exact() {
+        assert_eq!(
+            route(5, true, false),
+            Qwen4VerifyLayerRoute::QualifiedBatched
+        );
+        for physical_k in [1, 4, 6, 15, 16, 17] {
+            assert_eq!(
+                route(physical_k, true, false),
+                Qwen4VerifyLayerRoute::RowSerialOracle,
+                "K5 opt-in leaked to physical K={physical_k}"
+            );
+        }
+    }
+
+    #[test]
+    fn k16_request_rejects_every_wrong_runtime_identity() {
+        let invalid = [
+            Qwen4VerifyRouteIdentity {
+                target_is_qwen4: false,
+                ..NATIVE_K16
+            },
+            Qwen4VerifyRouteIdentity {
+                native_dflash_pairing: false,
+                ..NATIVE_K16
+            },
+            Qwen4VerifyRouteIdentity {
+                active_proposer_is_dflash: false,
+                ..NATIVE_K16
+            },
+            Qwen4VerifyRouteIdentity {
+                active_proposer_physical_k: None,
+                ..NATIVE_K16
+            },
+            Qwen4VerifyRouteIdentity {
+                active_proposer_physical_k: Some(5),
+                ..NATIVE_K16
+            },
+            Qwen4VerifyRouteIdentity {
+                active_proposer_physical_k: Some(17),
+                ..NATIVE_K16
+            },
+        ];
+
+        for identity in invalid {
+            assert!(
+                qwen4_verify_layer_route(identity, 16, false, true).is_err(),
+                "invalid identity unexpectedly admitted: {identity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_flag_does_not_create_generic_or_dense_routes() {
+        let generic = Qwen4VerifyRouteIdentity {
+            target_is_qwen4: false,
+            native_dflash_pairing: false,
+            active_proposer_is_dflash: false,
+            active_proposer_physical_k: None,
+        };
+        for frame_k in 1..=17 {
+            assert_eq!(
+                qwen4_verify_layer_route(generic, frame_k, false, false).unwrap(),
+                None
+            );
+        }
+
+        let dense_donor_qwen4 = Qwen4VerifyRouteIdentity {
+            target_is_qwen4: true,
+            native_dflash_pairing: false,
+            active_proposer_is_dflash: true,
+            active_proposer_physical_k: Some(16),
+        };
+        assert_eq!(
+            qwen4_verify_layer_route(dense_donor_qwen4, 16, false, false).unwrap(),
+            Some(Qwen4VerifyLayerRoute::RowSerialOracle)
+        );
+        assert!(qwen4_verify_layer_route(dense_donor_qwen4, 16, false, true).is_err());
+    }
+
+    #[test]
+    fn k16_flag_parser_is_exact() {
+        assert!(!parse_exact_bool_env_value(QWEN4_K16_BATCHED_VERIFY_ENV, None).unwrap());
+        assert!(!parse_exact_bool_env_value(QWEN4_K16_BATCHED_VERIFY_ENV, Some("0")).unwrap());
+        assert!(parse_exact_bool_env_value(QWEN4_K16_BATCHED_VERIFY_ENV, Some("1")).unwrap());
+        for invalid in ["", "true", "01", " 1", "1 ", "2", "-1"] {
+            assert!(
+                parse_exact_bool_env_value(QWEN4_K16_BATCHED_VERIFY_ENV, Some(invalid)).is_err(),
+                "invalid flag value accepted: {invalid:?}"
+            );
+        }
     }
 }

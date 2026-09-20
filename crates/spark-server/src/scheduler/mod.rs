@@ -36,6 +36,7 @@ mod repetition;
 mod rollback;
 mod sample_step;
 pub mod snapshot;
+mod spec_accept_log;
 mod spec_policy_accept;
 mod spec_step;
 mod spec_timing;
@@ -50,6 +51,8 @@ mod verify_dflash_step;
 mod verify_k2_step;
 mod verify_k3_step;
 mod verify_k4_step;
+#[cfg(test)]
+mod vision_request_reset_tests;
 
 pub use cfg_jump_forward::{
     build_delim_table, build_forced_ids, cfg_jf_enabled, set_delim_table, set_forced_ids,
@@ -80,6 +83,7 @@ use prefill_b_step::*;
 use repetition::*;
 use rollback::{RollbackOutcome, rollback_to_boundary};
 use sample_step::*;
+use spec_accept_log::*;
 use spec_policy_accept::*;
 use spec_step::*;
 use ssm_decode_ring::SsmDecodeRing;

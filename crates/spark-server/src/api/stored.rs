@@ -80,6 +80,7 @@ pub(super) fn extract_assistant_incoming_message(
         content: crate::openai::ParsedContent {
             text,
             images: Vec::new(),
+            image_text_offsets: Vec::new(),
         },
         tool_calls,
         tool_call_id: None,
@@ -200,33 +201,28 @@ pub async fn list_response_input_items(
         msgs.pop();
     }
 
-    let mut items: Vec<serde_json::Value> = msgs
+    let items: Result<Vec<serde_json::Value>, String> = msgs
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let content = if m.content.images.is_empty() {
-                serde_json::json!([{ "type": "input_text", "text": m.content.text }])
-            } else {
-                let mut parts: Vec<serde_json::Value> = Vec::new();
-                if !m.content.text.is_empty() {
-                    parts.push(serde_json::json!({ "type": "input_text", "text": m.content.text }));
-                }
-                for img in &m.content.images {
-                    parts.push(serde_json::json!({
-                        "type": "input_image",
-                        "image_url": img,
-                    }));
-                }
-                serde_json::Value::Array(parts)
-            };
-            serde_json::json!({
+            let content = m.content.responses_json()?;
+            Ok(serde_json::json!({
                 "id": format!("item_{id}_{i}"),
                 "type": "message",
                 "role": m.role,
                 "content": content,
-            })
+            }))
         })
         .collect();
+    let mut items = match items {
+        Ok(items) => items,
+        Err(e) => {
+            return openai_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Stored message content is invalid: {e}"),
+            );
+        }
+    };
 
     let order = q.get("order").map(|s| s.as_str()).unwrap_or("asc");
     if order == "desc" {

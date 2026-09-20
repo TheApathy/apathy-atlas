@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
-use crate::main_modules::serve_phases;
+use crate::main_modules::{serve_phases, serve_shutdown};
 use crate::tokenizer::ChatTokenizer;
 use crate::{
     cli, conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
@@ -28,6 +28,7 @@ type Prepared = (
     Arc<std::sync::atomic::AtomicBool>,
     String,
     u16,
+    std::thread::JoinHandle<()>,
 );
 
 fn qwen4_ngram_requires_unsafe(ngram_speculative: bool, is_qwen4: bool) -> bool {
@@ -52,12 +53,17 @@ pub(crate) async fn serve(
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
 ) -> Result<()> {
     // Signal listeners belong on the runtime, not inside the blocking section.
-    let Some((state, model_ready, bind, port)) =
+    let Some((state, model_ready, bind, port, scheduler_thread)) =
         tokio::task::spawn_blocking(move || startup(args, tui_progress)).await??
     else {
         return Ok(()); // EP worker: no router on this rank
     };
-    crate::main_modules::serve_router::build_and_serve(state, model_ready, &bind, port).await
+    let serve_result =
+        crate::main_modules::serve_router::build_and_serve(state, model_ready, &bind, port).await;
+    let scheduler_join =
+        tokio::task::spawn_blocking(move || serve_shutdown::join_scheduler(scheduler_thread)).await;
+
+    serve_shutdown::resolve_serve_result(serve_result, scheduler_join)
 }
 
 fn startup(
@@ -111,9 +117,11 @@ fn startup(
             "Qwen4 contexts above 2048 require --qwen4-qsa; dense fallback is intentionally capped"
         );
     }
-    if args.qwen4_qsa && (args.max_batch_size != 1 || args.kv_cache_dtype != "bf16") {
+    if args.qwen4_qsa
+        && (args.max_batch_size != 1 || !matches!(args.kv_cache_dtype.as_str(), "bf16" | "nvfp4"))
+    {
         anyhow::bail!(
-            "the Qwen4 QSA correctness path currently requires --max-batch-size 1 --kv-cache-dtype bf16"
+            "the Qwen4 QSA path requires --max-batch-size 1 and --kv-cache-dtype bf16 or nvfp4"
         );
     }
     if config.is_qwen4_exp() && args.max_seq_len > config.max_position_embeddings {
@@ -715,35 +723,6 @@ fn startup(
         .unwrap_or(ptx_set.behavior.max_thinking_budget);
     // Moved into the scheduler thread; `None` leaves the gate disarmed.
     let scheduler_mtp_gate = args.mtp_gate.clone();
-    std::thread::spawn(move || {
-        scheduler::run(
-            scheduler_model,
-            request_rx,
-            scheduler_eos,
-            max_batch_size,
-            use_speculative,
-            num_drafts,
-            policy,
-            max_prefill_tokens,
-            max_batch_tokens,
-            use_self_spec,
-            use_ngram_spec,
-            swap_space_gb,
-            high_speed_swap_cfg,
-            block_size,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            reflection_suppress_ids,
-            grammar_engine,
-            adaptive_sampling,
-            session_manager,
-            scheduler_spontaneous_think_budget,
-            scheduler_mtp_gate,
-        );
-    });
 
     // Tool call parser resolution: CLI > MODEL.toml > defaults table.
     let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
@@ -760,6 +739,8 @@ fn startup(
         tokenizer,
         model_name,
         max_seq_len: args.max_seq_len,
+        max_batch_size,
+        yarn_context: config.yarn_factor > 0.0,
         request_tx,
         vision_config: config.vision.clone(),
         default_temperature,
@@ -823,20 +804,47 @@ fn startup(
         tracing::info!("runtime profile toggle armed: SIGUSR1=enable SIGUSR2=disable");
     }
 
+    // Spawn only after every fallible startup operation above has succeeded.
+    // From this point the returned JoinHandle is owned by `serve` until the
+    // HTTP request sender closes and the scheduler has dropped the model.
+    let scheduler_thread = std::thread::spawn(move || {
+        scheduler::run(
+            scheduler_model,
+            request_rx,
+            scheduler_eos,
+            max_batch_size,
+            use_speculative,
+            num_drafts,
+            policy,
+            max_prefill_tokens,
+            max_batch_tokens,
+            use_self_spec,
+            use_ngram_spec,
+            swap_space_gb,
+            high_speed_swap_cfg,
+            block_size,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            reflection_suppress_ids,
+            grammar_engine,
+            adaptive_sampling,
+            session_manager,
+            scheduler_spontaneous_think_budget,
+            scheduler_mtp_gate,
+        );
+    });
+
     // 9-11. Router + HTTP server run on the async side; hand them the pieces.
-    Ok(Some((state, model_ready, args.bind, args.port)))
-}
-
-#[cfg(test)]
-mod qualification_tests {
-    use super::qwen4_ngram_requires_unsafe;
-
-    #[test]
-    fn flash_next_ngram_is_fail_closed() {
-        assert!(qwen4_ngram_requires_unsafe(true, true));
-        assert!(!qwen4_ngram_requires_unsafe(false, true));
-        assert!(!qwen4_ngram_requires_unsafe(true, false));
-    }
+    Ok(Some((
+        state,
+        model_ready,
+        args.bind,
+        args.port,
+        scheduler_thread,
+    )))
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an
@@ -876,4 +884,16 @@ fn build_auth_config(args: &cli::ServeArgs) -> Result<Option<Arc<crate::auth::Au
         if cfg.token_count() == 1 { "" } else { "s" },
     );
     Ok(Some(Arc::new(cfg)))
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    use super::qwen4_ngram_requires_unsafe;
+
+    #[test]
+    fn flash_next_ngram_is_fail_closed() {
+        assert!(qwen4_ngram_requires_unsafe(true, true));
+        assert!(!qwen4_ngram_requires_unsafe(false, true));
+        assert!(!qwen4_ngram_requires_unsafe(true, false));
+    }
 }

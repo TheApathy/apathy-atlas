@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::ops::Range;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
@@ -120,6 +121,18 @@ pub struct PleOffloadReader {
 struct CachedPage {
     bytes: Box<[u8; EXPECTED_PAGE_BYTES]>,
     generation: u64,
+}
+
+fn selection_batch_ranges(total: usize, queue_depth: usize) -> Result<Vec<Range<usize>>> {
+    ensure!(queue_depth > 0, "PLE selection queue depth is zero");
+    let mut ranges = Vec::with_capacity(total.div_ceil(queue_depth));
+    let mut start = 0;
+    while start < total {
+        let end = start.saturating_add(queue_depth).min(total);
+        ranges.push(start..end);
+        start = end;
+    }
+    Ok(ranges)
 }
 
 impl PleOffloadReader {
@@ -350,6 +363,25 @@ impl PleOffloadReader {
             .collect()
     }
 
+    /// Read an arbitrarily long ordered selection in queue-depth-bounded
+    /// windows. This keeps callers from maintaining a second batch-size
+    /// constant that can underfill the registered io_uring queue.
+    pub fn read_rows_windowed(
+        &mut self,
+        selections: &[(usize, usize)],
+    ) -> Result<Vec<PleNvfp4Row>> {
+        ensure!(!selections.is_empty(), "PLE offload selection is empty");
+        let mut rows = Vec::with_capacity(selections.len());
+        for range in selection_batch_ranges(selections.len(), self.queue_depth)? {
+            rows.extend(self.read_rows(&selections[range])?);
+        }
+        ensure!(
+            rows.len() == selections.len(),
+            "PLE windowed read extent mismatch"
+        );
+        Ok(rows)
+    }
+
     fn cache_page_ref(&mut self, key: (usize, usize), source: AlignedPageRef) {
         if self.cache_capacity_pages == 0 {
             return;
@@ -454,6 +486,28 @@ fn raw_fd(file: &File) -> RawFd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_windows_cover_prefill_once_in_order() {
+        let windows = selection_batch_ranges(32_768, 256).expect("valid PLE window plan");
+        assert_eq!(windows.len(), 128);
+        assert_eq!(windows.first(), Some(&(0..256)));
+        assert_eq!(windows.last(), Some(&(32_512..32_768)));
+        assert!(windows.iter().all(|window| window.len() <= 256));
+        assert!(windows.windows(2).all(|pair| pair[0].end == pair[1].start));
+    }
+
+    #[test]
+    fn selection_windows_keep_partial_tail_and_reject_zero_depth() {
+        let windows = selection_batch_ranges(513, 256).expect("valid PLE tail plan");
+        assert_eq!(windows, [0..256, 256..512, 512..513]);
+        assert!(selection_batch_ranges(1, 0).is_err());
+        assert!(
+            selection_batch_ranges(0, 256)
+                .expect("empty PLE plan")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn page_packing_has_no_cross_page_rows() {

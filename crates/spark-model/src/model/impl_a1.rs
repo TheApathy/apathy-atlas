@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
+use atlas_core::config::{DflashCaptureMode, LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
@@ -759,6 +759,19 @@ impl TransformerModel {
             dflash_capture_width,
             config.residual_width(),
         );
+        let dflash_capture_mode = config.dflash_capture_mode;
+        if dflash_capture_mode == DflashCaptureMode::Qwen4HyperProjected {
+            anyhow::ensure!(
+                config.is_qwen4_exp()
+                    && dflash_capture_width == config.hidden_size
+                    && dflash_capture_offset == 0,
+                "projected DFlash capture requires a Qwen4 target with H-wide, zero-offset output"
+            );
+            anyhow::ensure!(
+                qwen4_final_mixer.is_some(),
+                "projected DFlash capture requires the target Qwen4 terminal hyperconnection mixer"
+            );
+        }
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
         } else {
@@ -1055,6 +1068,7 @@ impl TransformerModel {
             dflash_capture_layers,
             dflash_capture_width,
             dflash_capture_offset,
+            dflash_capture_mode,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
             verify4_graph: Mutex::new(std::collections::HashMap::new()),
@@ -1067,12 +1081,10 @@ impl TransformerModel {
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
             vision_encoder,
-            vision_embed_patches: Mutex::new(0),
-            vision_image_grids: Mutex::new(Vec::new()),
-            vision_cache_fp: std::sync::atomic::AtomicU64::new(0),
-            vision_cache_grids: Mutex::new(Vec::new()),
-            vision_cache_buf: Mutex::new(spark_runtime::gpu::DevicePtr::NULL),
-            vision_cache_bytes: std::sync::atomic::AtomicUsize::new(0),
+            vision_embeddings: Mutex::new(super::vision_embeddings::VisionEmbeddingState::new(
+                max_seq_len,
+                max_batch_size,
+            )),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,

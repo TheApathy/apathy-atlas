@@ -17,6 +17,12 @@ use crate::layer::AttnMetadataDev;
 use crate::layers::ops;
 use crate::weight_map::DenseWeight;
 
+mod device;
+mod position_contract;
+mod prefill_exact;
+
+use position_contract::{prefill_index_batch_is_safe, valid_physical_query};
+
 const INDEX_HEADS: u32 = 4;
 const INDEX_DIM: u32 = 128;
 const INDEX_WIDTH: u32 = 640;
@@ -88,6 +94,8 @@ pub struct Qwen4QsaIndexer {
     q_norm: DenseWeight,
     k_norm: DenseWeight,
     dense_gemv: KernelHandle,
+    dense_gemv_batchn: KernelHandle,
+    dense_gemm: KernelHandle,
     rms_norm: KernelHandle,
     rope: KernelHandle,
     rope_yarn_scaled: KernelHandle,
@@ -95,14 +103,31 @@ pub struct Qwen4QsaIndexer {
     yarn_attention_factor: f32,
     stage_pool: KernelHandle,
     store_compressed: KernelHandle,
+    stage_prefill_raw: KernelHandle,
+    pool_prefill: KernelHandle,
+    store_prefill_compressed: KernelHandle,
     score: KernelHandle,
     select_expand: KernelHandle,
+    score_device: KernelHandle,
+    select_expand_device: KernelHandle,
     sparse_attention_bf16_partial: KernelHandle,
+    sparse_attention_nvfp4_partial: KernelHandle,
     sparse_attention_bf16_reduce: KernelHandle,
     cache: OnceLock<QsaCache>,
 }
 
 impl Qwen4QsaIndexer {
+    pub(crate) fn validate_prefill_index_batch(
+        num_tokens: usize,
+        seq_len_start: usize,
+    ) -> Result<()> {
+        ensure!(
+            prefill_index_batch_is_safe(num_tokens, seq_len_start),
+            "ATLAS_QWEN4_QSA_PREFILL_GEMM requires 1..4 rows within one physical compression group; wider or crossing batches can overwrite live QSA raw rows"
+        );
+        Ok(())
+    }
+
     pub fn new(
         index_qk_proj: DenseWeight,
         q_norm: DenseWeight,
@@ -120,6 +145,8 @@ impl Qwen4QsaIndexer {
             q_norm,
             k_norm,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv_batchn: crate::layers::try_kernel(gpu, "gemv", "dense_gemv_bf16_batchn"),
+            dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             rms_norm: gpu.kernel("norm", "rms_norm")?,
             rope: gpu.kernel("rope", "rope_forward")?,
             rope_yarn_scaled: gpu.kernel("rope", "rope_forward_yarn_scaled")?,
@@ -131,22 +158,33 @@ impl Qwen4QsaIndexer {
             },
             stage_pool: gpu.kernel("qwen4_qsa", "qwen4_qsa_stage_pool")?,
             store_compressed: gpu.kernel("qwen4_qsa", "qwen4_qsa_store_compressed")?,
+            stage_prefill_raw: gpu.kernel("qwen4_qsa", "qwen4_qsa_stage_prefill_raw")?,
+            pool_prefill: gpu.kernel("qwen4_qsa", "qwen4_qsa_pool_prefill")?,
+            store_prefill_compressed: gpu
+                .kernel("qwen4_qsa", "qwen4_qsa_store_prefill_compressed")?,
             score: gpu.kernel("qwen4_qsa", "qwen4_qsa_score")?,
             select_expand: gpu.kernel("qwen4_qsa", "qwen4_qsa_select_expand")?,
+            score_device: crate::layers::try_kernel(
+                gpu,
+                "qwen4_qsa",
+                "qwen4_qsa_score_device_meta",
+            ),
+            select_expand_device: crate::layers::try_kernel(
+                gpu,
+                "qwen4_qsa",
+                "qwen4_qsa_select_expand_device_meta",
+            ),
             sparse_attention_bf16_partial: gpu
                 .kernel("qwen4_qsa", "qwen4_qsa_sparse_attention_bf16_partial")?,
+            sparse_attention_nvfp4_partial: gpu
+                .kernel("qwen4_qsa", "qwen4_qsa_sparse_attention_nvfp4_partial")?,
             sparse_attention_bf16_reduce: gpu
                 .kernel("qwen4_qsa", "qwen4_qsa_sparse_attention_bf16_reduce")?,
             cache: OnceLock::new(),
         })
     }
 
-    fn cache<'a>(
-        &'a self,
-        gpu: &dyn GpuBackend,
-        kv_cache: &PagedKvCache,
-        _meta: AttnMetadataDev,
-    ) -> Result<&'a QsaCache> {
+    fn cache<'a>(&'a self, gpu: &dyn GpuBackend, kv_cache: &PagedKvCache) -> Result<&'a QsaCache> {
         if let Some(cache) = self.cache.get() {
             ensure!(
                 cache.num_main_blocks == kv_cache.num_blocks()
@@ -226,8 +264,11 @@ impl Qwen4QsaIndexer {
             meta.num_seqs == 1,
             "QSA correctness path currently supports C=1"
         );
-        ensure!(position < sequence_length, "invalid QSA position/length");
-        let cache = self.cache(gpu, kv_cache, meta)?;
+        ensure!(
+            valid_physical_query(position, sequence_length),
+            "QSA requires the current physical query position and nonzero u32 sequence length"
+        );
+        let cache = self.cache(gpu, kv_cache)?;
         let visible_groups = sequence_length / COMPRESS_RATIO;
         ensure!(
             visible_groups <= cache.max_compressed_groups,
@@ -331,11 +372,144 @@ impl Qwen4QsaIndexer {
         Ok(cache.token_indices)
     }
 
+    /// Build the persistent QSA key-index history for a whole prefill chunk.
+    ///
+    /// Dense prefill does not consume the four query-index heads or selected
+    /// token list. Projecting only the fifth (key) head with one GEMM avoids
+    /// the per-token GEMV/norm/RoPE/select launch train while preserving the
+    /// exact physical-page ownership used by decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_prefill_index(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: usize,
+        seq_len_start: usize,
+        raw_keys: DevicePtr,
+        pooled_keys: DevicePtr,
+        first_positions: DevicePtr,
+        kv_cache: &PagedKvCache,
+        meta: AttnMetadataDev,
+        hidden_size: u32,
+        eps: f32,
+        rope_theta: f32,
+        rotary_dim: u32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(num_tokens > 0, "empty QSA prefill index update");
+        ensure!(meta.num_seqs == 1, "QSA prefill index requires C=1");
+        Self::validate_prefill_index_batch(num_tokens, seq_len_start)?;
+        let cache = self.cache(gpu, kv_cache)?;
+        let final_len = seq_len_start
+            .checked_add(num_tokens)
+            .ok_or_else(|| anyhow::anyhow!("QSA prefill length overflow"))?;
+        ensure!(
+            final_len / COMPRESS_RATIO <= cache.max_compressed_groups,
+            "QSA prefill context exceeds side-cache capacity"
+        );
+
+        // index_qk_proj is [4 query heads | 1 key head, hidden_size].
+        let key_weight = DenseWeight {
+            weight: self
+                .index_qk_proj
+                .weight
+                .offset(INDEX_HEADS as usize * INDEX_DIM as usize * hidden_size as usize * 2),
+        };
+        ops::dense_gemm(
+            gpu,
+            self.dense_gemm,
+            hidden,
+            &key_weight,
+            raw_keys,
+            num_tokens as u32,
+            INDEX_DIM,
+            hidden_size,
+            stream,
+        )?;
+        KernelLaunch::new(gpu, self.stage_prefill_raw)
+            .grid([num_tokens as u32, 1, 1])
+            .block([INDEX_DIM, 1, 1])
+            .arg_ptr(raw_keys)
+            .arg_ptr(cache.raw_ring)
+            .arg_ptr(meta.slot)
+            .arg_ptr(meta.positions)
+            .arg_u32(num_tokens as u32)
+            .arg_u32(cache.block_size as u32)
+            .launch(stream)?;
+
+        let first_endpoint =
+            (COMPRESS_RATIO - 1 + COMPRESS_RATIO - seq_len_start % COMPRESS_RATIO) % COMPRESS_RATIO;
+        if first_endpoint >= num_tokens {
+            return Ok(());
+        }
+        let num_groups = 1 + (num_tokens - 1 - first_endpoint) / COMPRESS_RATIO;
+        KernelLaunch::new(gpu, self.pool_prefill)
+            .grid([num_groups as u32, 1, 1])
+            .block([INDEX_DIM, 1, 1])
+            .arg_ptr(cache.raw_ring)
+            .arg_ptr(pooled_keys)
+            .arg_ptr(first_positions)
+            .arg_ptr(meta.slot)
+            .arg_ptr(meta.positions)
+            .arg_u32(first_endpoint as u32)
+            .arg_u32(num_groups as u32)
+            .arg_u32(cache.block_size as u32)
+            .launch(stream)?;
+        ops::rms_norm(
+            gpu,
+            self.rms_norm,
+            pooled_keys,
+            &self.k_norm,
+            pooled_keys,
+            num_groups as u32,
+            INDEX_DIM,
+            eps,
+            stream,
+        )?;
+        self.apply_rope_n(
+            pooled_keys,
+            first_positions,
+            num_groups,
+            1,
+            rotary_dim,
+            rope_theta,
+            gpu,
+            stream,
+        )?;
+        KernelLaunch::new(gpu, self.store_prefill_compressed)
+            .grid([num_groups as u32, 1, 1])
+            .block([INDEX_DIM, 1, 1])
+            .arg_ptr(pooled_keys)
+            .arg_ptr(cache.compressed_keys)
+            .arg_ptr(meta.slot)
+            .arg_u32(first_endpoint as u32)
+            .arg_u32(num_groups as u32)
+            .arg_u32(cache.block_size as u32)
+            .launch(stream)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn apply_rope(
         &self,
         tensor: DevicePtr,
         positions: DevicePtr,
+        heads: u32,
+        rotary_dim: u32,
+        rope_theta: f32,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        self.apply_rope_n(
+            tensor, positions, 1, heads, rotary_dim, rope_theta, gpu, stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_rope_n(
+        &self,
+        tensor: DevicePtr,
+        positions: DevicePtr,
+        num_tokens: usize,
         heads: u32,
         rotary_dim: u32,
         rope_theta: f32,
@@ -349,7 +523,7 @@ impl Qwen4QsaIndexer {
                 tensor,
                 DevicePtr::NULL,
                 positions,
-                1,
+                num_tokens as u32,
                 heads,
                 0,
                 INDEX_DIM,
@@ -364,7 +538,7 @@ impl Qwen4QsaIndexer {
                 tensor,
                 DevicePtr::NULL,
                 positions,
-                1,
+                num_tokens as u32,
                 heads,
                 0,
                 INDEX_DIM,
@@ -393,23 +567,25 @@ impl Qwen4QsaIndexer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        let kv_dtype = kv_cache.dtype_for_layer(attn_layer_idx);
         ensure!(
-            kv_cache.dtype_for_layer(attn_layer_idx) == KvCacheDtype::Bf16,
-            "QSA exact path currently requires BF16 main KV cache"
+            matches!(kv_dtype, KvCacheDtype::Bf16 | KvCacheDtype::Nvfp4),
+            "QSA supports BF16 or NVFP4 main KV cache, got {kv_dtype}"
         );
         ensure!(head_dim == 256, "released Qwen4 QSA expects head_dim=256");
         ensure!(
             num_query_heads as usize == QUERY_HEADS,
             "released Qwen4 QSA expects {QUERY_HEADS} query heads"
         );
-        let cache = self.cache(gpu, kv_cache, meta)?;
+        let cache = self.cache(gpu, kv_cache)?;
         let k_stride = kv_cache.k_block_stride_bytes_for_layer(attn_layer_idx);
         let v_stride = kv_cache.v_block_stride_bytes_for_layer(attn_layer_idx);
-        ensure!(
-            k_stride % 2 == 0 && v_stride % 2 == 0,
-            "invalid BF16 KV stride"
-        );
-        KernelLaunch::new(gpu, self.sparse_attention_bf16_partial)
+        let partial_kernel = match kv_dtype {
+            KvCacheDtype::Bf16 => self.sparse_attention_bf16_partial,
+            KvCacheDtype::Nvfp4 => self.sparse_attention_nvfp4_partial,
+            _ => unreachable!("dtype checked above"),
+        };
+        let mut launch = KernelLaunch::new(gpu, partial_kernel)
             .grid([num_query_heads, SPARSE_SPLITS as u32, 1])
             .block([head_dim, 1, 1])
             .arg_ptr(query)
@@ -420,8 +596,20 @@ impl Qwen4QsaIndexer {
             .arg_ptr(cache.sparse_partial_output)
             .arg_ptr(cache.sparse_partial_max)
             .arg_ptr(cache.sparse_partial_sum)
-            .arg_u64((k_stride / 2) as u64)
-            .arg_u64((v_stride / 2) as u64)
+            .arg_u64(if kv_dtype == KvCacheDtype::Bf16 {
+                (k_stride / 2) as u64
+            } else {
+                k_stride as u64
+            })
+            .arg_u64(if kv_dtype == KvCacheDtype::Bf16 {
+                (v_stride / 2) as u64
+            } else {
+                v_stride as u64
+            });
+        if kv_dtype == KvCacheDtype::Nvfp4 {
+            launch = launch.arg_u64(kv_cache.nvfp4_data_bytes() as u64);
+        }
+        launch
             .arg_u32(kv_cache.block_size() as u32)
             .arg_u32(num_query_heads)
             .arg_u32(num_kv_heads)

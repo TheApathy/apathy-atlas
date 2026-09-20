@@ -25,6 +25,7 @@ impl TensorMetadataSource for FakeStore {
 fn config() -> DflashConfig {
     DflashConfig {
         architectures: vec!["DFlashDraftModel".into()],
+        model_type: None,
         hidden_size: 8,
         num_hidden_layers: 2,
         num_target_layers: 64,
@@ -36,6 +37,7 @@ fn config() -> DflashConfig {
         draft_vocab_size: None,
         tie_word_embeddings: false,
         block_size: 4,
+        root_block_size_explicit: true,
         dflash_config: Some(DflashSubConfig {
             mask_token_id: 31,
             target_layer_ids: vec![0, 1, 2],
@@ -48,6 +50,8 @@ fn config() -> DflashConfig {
             conv_group_size: 0,
             selector_rank: 0,
             selector_top_k: 0,
+            selector_vocab_size: None,
+            unknown_fields: Default::default(),
         }),
         layer_types: None,
         sliding_window: None,

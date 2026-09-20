@@ -15,7 +15,7 @@ mod forward_prefill_routed;
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
-use crate::layer::ForwardContext;
+use crate::layer::{ForwardContext, MoeStreamTransposeScratch};
 use crate::layers::ops;
 use crate::weight_map::{ExpertWeight, Fp8ExpertWeight, Fp8Weight, MoeWeights, QuantizedWeight};
 
@@ -132,6 +132,9 @@ pub struct MoeLayer {
     /// transpose (FP8 experts, etc.).
     down_t_scratch_packed: Option<DevicePtr>,
     down_t_scratch_scale: Option<DevicePtr>,
+    /// Complete gate/up/down scratch for exact per-layer Qwen4 prefill
+    /// transposition. Unlike unified layout, original weights stay resident.
+    stream_t_scratch: Option<MoeStreamTransposeScratch>,
     /// Kernel handle for the batched per-expert uint8 transpose.
     moe_transpose_u8_batched_k: KernelHandle,
     // ── Phase 8a transposed-layout decode kernels (unified-layout MoE).
@@ -197,6 +200,15 @@ pub struct MoeLayer {
     /// `KernelHandle(0)` on models that don't ship the kernel; dispatch
     /// gates on `nvfp4_gate_up_m128` AND handle non-zero.
     moe_fused_gate_up_t_k64_m128: KernelHandle,
+    /// Default-off same-stream compact ordinary-NVFP4 prefill route.
+    nvfp4_moe_worklist: bool,
+    /// F8-only original-layout compact planner/GEMM; absent by default.
+    qwen4_compact: Option<qwen4_prefill_compact::Kernels>,
+    /// Device builder plus compact M64 gate/up and down kernels. All
+    /// three are an atomic capability bundle when the route is requested.
+    moe_build_nvfp4_worklist_k: KernelHandle,
+    moe_fused_gate_up_t_k64_worklist_k: KernelHandle,
+    moe_grouped_gemm_t_k64_worklist_k: KernelHandle,
     moe_fp8_grouped_gemm_t: KernelHandle,
     w4a16_gemm_t: KernelHandle,
     bf16_to_fp8_k: KernelHandle,
@@ -281,6 +293,13 @@ mod helpers_a;
 mod helpers_b;
 mod helpers_c;
 mod init;
+mod qwen4_compact_check;
+mod qwen4_compact_compare;
+mod qwen4_compact_contract;
+mod qwen4_compact_ops;
+mod qwen4_prefill_admission;
+pub(crate) mod qwen4_prefill_compact;
+mod qwen4_stream_t;
 
 /// Build a device-side pointer table from pre-transposed QuantizedWeight vec.
 fn build_ptr_table_from_qw(

@@ -12,6 +12,7 @@ use super::super::Qwen3AttentionLayer;
 use super::diag_norm;
 use crate::layer::{BatchedAttnMetadata, ForwardContext, LayerState};
 use crate::layers::ops;
+use crate::layers::qwen4_qsa::Qwen4QsaIndexer;
 
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
@@ -40,10 +41,45 @@ impl Qwen3AttentionLayer {
         let eps = ctx.config.rms_norm_eps as f32;
         let n = num_tokens as u32;
 
+        // Reject unsafe optional index batching before this attention layer
+        // prepares hyperconnection buffers or changes its cache/state.
+        if self.qwen4_attn_hyper.is_some()
+            && self.qwen4_qsa.is_some()
+            && ctx
+                .attn_metadata
+                .is_some_and(|meta| meta.qwen4_qsa_required)
+            && std::env::var("ATLAS_QWEN4_ATTN_PREFILL_BATCH")
+                .ok()
+                .as_deref()
+                == Some("1")
+            && std::env::var("ATLAS_QWEN4_QSA_PREFILL_GEMM")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            Qwen4QsaIndexer::validate_prefill_index_batch(num_tokens, seq_len_start)?;
+        }
+
+        if crate::layers::qwen4_prefill_moe::selected()? && num_tokens > 1 {
+            return self.prefill_moe_only(
+                hidden,
+                residual,
+                num_tokens,
+                kv_cache,
+                seq_len_start,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                batched_meta,
+                ctx,
+                stream,
+            );
+        }
+
         // Qwen4 prefill: full-prompt hyper GEMMs + the existing batched
         // attention/MoE path. QSA side-cache updates remain token ordered so
         // their compression groups match decode exactly.
-        if self.qwen4_attn_hyper.is_some() {
+        if let Some(attn_hyper) = self.qwen4_attn_hyper.as_ref() {
             if batched_meta.is_some() {
                 anyhow::bail!("qwen4_exp batched multi-sequence prefill is not yet supported");
             }
@@ -54,12 +90,9 @@ impl Qwen3AttentionLayer {
                 base_meta.block_table != DevicePtr::NULL && base_meta.seq_len != DevicePtr::NULL,
                 "qwen4_exp prefill requires paged block-table and sequence-length metadata"
             );
-            let (attn_hyper, mlp_hyper) = (
-                self.qwen4_attn_hyper.as_ref().unwrap(),
-                self.qwen4_mlp_hyper.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("qwen4_exp attention layer missing MLP hyperconnection")
-                })?,
-            );
+            let mlp_hyper = self.qwen4_mlp_hyper.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("qwen4_exp attention layer missing MLP hyperconnection")
+            })?;
             if std::env::var("ATLAS_QWEN4_ATTN_PREFILL_BATCH")
                 .ok()
                 .as_deref()
@@ -100,32 +133,60 @@ impl Qwen3AttentionLayer {
                 }
                 return Ok(());
             }
-            let mixed_attn = attn_hyper.prepare_prefill_exact(
-                hidden,
-                residual,
-                num_tokens,
-                ctx.buffers,
-                ctx.gpu,
-                eps,
-                stream,
-            )?;
+            let mixed_attn = if std::env::var("ATLAS_QWEN4_HYPER_PREFILL_GEMM")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                attn_hyper.prepare_prefill(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?
+            } else {
+                attn_hyper.prepare_prefill_exact(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?
+            };
             if base_meta.qwen4_qsa_required
                 && let Some(qsa) = self.qwen4_qsa.as_ref()
             {
-                for t in 0..num_tokens {
-                    let token_meta = crate::layer::AttnMetadataDev {
-                        positions: base_meta.positions.offset(t * 4),
-                        positions_h: base_meta.positions_h.offset(t * 4),
-                        positions_w: base_meta.positions_w.offset(t * 4),
-                        slot: base_meta.slot.offset(t * 8),
-                        ..base_meta
-                    };
-                    qsa.update_and_select(
-                        mixed_attn.offset(t * h * 2),
-                        seq_len_start + t,
-                        seq_len_start + t + 1,
+                if std::env::var("ATLAS_QWEN4_QSA_PREFILL_GEMM")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    let raw_keys = ctx.buffers.ssm_qkvz();
+                    let pooled_keys = ctx.buffers.qkv_output();
+                    let max_groups = num_tokens.div_ceil(4);
+                    let first_positions = pooled_keys.offset(max_groups * 128 * 2);
+                    anyhow::ensure!(
+                        num_tokens * 128 * 2 <= ctx.buffers.sizes().ssm_qkvz,
+                        "QSA raw-key prefill scratch exceeds SSM QKVZ arena"
+                    );
+                    anyhow::ensure!(
+                        max_groups * (128 * 2 + 4) <= ctx.buffers.sizes().qkv_output,
+                        "QSA pooled-key prefill scratch exceeds QKV arena"
+                    );
+                    qsa.update_prefill_index(
+                        mixed_attn,
+                        num_tokens,
+                        seq_len_start,
+                        raw_keys,
+                        pooled_keys,
+                        first_positions,
                         kv_cache,
-                        token_meta,
+                        base_meta,
                         h as u32,
                         eps,
                         ctx.config.rope_theta as f32,
@@ -133,6 +194,29 @@ impl Qwen3AttentionLayer {
                         ctx.gpu,
                         stream,
                     )?;
+                } else {
+                    for t in 0..num_tokens {
+                        let token_meta = crate::layer::AttnMetadataDev {
+                            positions: base_meta.positions.offset(t * 4),
+                            positions_h: base_meta.positions_h.offset(t * 4),
+                            positions_w: base_meta.positions_w.offset(t * 4),
+                            slot: base_meta.slot.offset(t * 8),
+                            ..base_meta
+                        };
+                        qsa.update_and_select(
+                            mixed_attn.offset(t * h * 2),
+                            seq_len_start + t,
+                            seq_len_start + t + 1,
+                            kv_cache,
+                            token_meta,
+                            h as u32,
+                            eps,
+                            ctx.config.rope_theta as f32,
+                            ctx.config.rotary_dim() as u32,
+                            ctx.gpu,
+                            stream,
+                        )?;
+                    }
                 }
             }
             let attn_out = if seq_len_start == 0 {
@@ -160,15 +244,31 @@ impl Qwen3AttentionLayer {
             };
             attn_hyper
                 .inject_saved_batched(hidden, attn_out, residual, num_tokens, ctx.gpu, stream)?;
-            let ffn_inputs = mlp_hyper.prepare_prefill_exact(
-                hidden,
-                residual,
-                num_tokens,
-                ctx.buffers,
-                ctx.gpu,
-                eps,
-                stream,
-            )?;
+            let ffn_inputs = if std::env::var("ATLAS_QWEN4_HYPER_PREFILL_GEMM")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                mlp_hyper.prepare_prefill(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?
+            } else {
+                mlp_hyper.prepare_prefill_exact(
+                    hidden,
+                    residual,
+                    num_tokens,
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?
+            };
             self.ffn
                 .forward_prefill(ffn_inputs, num_tokens, ctx, stream)?;
             mlp_hyper.inject_saved_batched(
@@ -178,6 +278,10 @@ impl Qwen3AttentionLayer {
                 num_tokens,
                 ctx.gpu,
                 stream,
+            )?;
+            crate::model::qwen4_prefill_engagement::engage(
+                crate::model::qwen4_prefill_engagement::PrefillPath::Attention,
+                num_tokens,
             )?;
             return Ok(());
         }
