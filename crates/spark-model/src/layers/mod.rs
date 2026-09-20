@@ -1168,6 +1168,103 @@ pub fn prefill_proj_pipe_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_PROJ_PIPE").ok().as_deref() == Some("1"))
 }
 
+/// Returns true when `ATLAS_PREFILL_PROJ_PIPE_M128=1`: route the exact
+/// original-layout attention Q/K/V/O prefill projections through
+/// `w4a16_gemm_pipe_m128n128`, a byte-exact 128x128-tile shadow of
+/// `w4a16_gemm` (same dequant arithmetic, same m16n8k16 BF16 MMA and K order;
+/// only the CTA tiling, ldmatrix fragment loads and cp.async pipeline
+/// differ). Eligible when N % 128 == 0 and K % 32 == 0; an explicitly
+/// requested eligible route with a missing kernel symbol fails closed.
+pub fn prefill_proj_pipe_m128_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_PREFILL_PROJ_PIPE_M128").ok().as_deref() == Some("1")
+    })
+}
+
+/// `ATLAS_GDN_PREFILL_GATECACHE_V2=1`: use the exact v2 shadow of the WY32
+/// gate-cache GDN prefill kernel (requires GATECACHE=1; fails closed if the
+/// v2 symbol is missing).
+pub fn gdn_prefill_gatecache_v2_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_GDN_PREFILL_GATECACHE_V2").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_SSM_RESET_ASYNC=1`: per-request SSM slot reset uses stream-ordered,
+/// per-region memsets + one sync instead of ~2000 synchronous memsets.
+pub fn ssm_reset_async_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_RESET_ASYNC").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_DFLASH_CAPTURE_STRIDED=1`: DFlash prefill hidden capture uses one
+/// strided-copy kernel per captured layer instead of one D2D copy per row.
+pub fn dflash_capture_strided_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_CAPTURE_STRIDED").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_PREFILL_FP8_W8=1`: route the FP8-MMA transposed prefill GEMMs
+/// (`w4a16_gemm_t[_m128]`, `fp8_gemm_t[_m128]`) through their bit-identical
+/// 8-warp 128x128 shadows (`*_m128n128_w8`) when N % 128 == 0, K % 32 == 0
+/// and M > 128. Fails closed when the symbols are missing.
+pub fn prefill_fp8_w8_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FP8_W8").ok().as_deref() == Some("1"))
+}
+
+/// Pure selector for the 8-warp FP8 shadows.
+pub(crate) const fn prefill_fp8_w8_route(requested: bool, m: u32, n: u32, k: u32, has_kernel: bool) -> PrefillProjectionPipeRoute {
+    if !requested {
+        return PrefillProjectionPipeRoute::Disabled;
+    }
+    if m <= 128 || n == 0 || !n.is_multiple_of(128) || k == 0 || !k.is_multiple_of(32) {
+        return PrefillProjectionPipeRoute::Ineligible;
+    }
+    if has_kernel { PrefillProjectionPipeRoute::Complete } else { PrefillProjectionPipeRoute::Missing }
+}
+
+/// `ATLAS_SSM_OUT_PREFILL_M128=1`: SSM out-projection prefill uses the
+/// `w4a16_gemm_t_m128` shadow of `w4a16_gemm_t` (bit-identical, fewer B re-reads).
+pub fn ssm_out_prefill_m128_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_OUT_PREFILL_M128").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_FLASHINFER_FFN_TACTIC=<gateup>,<down>`: diagnostic override of the
+/// FlashInfer FFN CUTLASS tactics (0..5) for timing sweeps. Not exact-preserving
+/// in general (a different tactic may reduce in a different order).
+pub fn flashinfer_ffn_tactic_override() -> Option<(usize, usize)> {
+    static GATE: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        let v = std::env::var("ATLAS_FLASHINFER_FFN_TACTIC").ok()?;
+        let mut it = v.split(',').map(|x| x.trim().parse::<usize>().ok());
+        let a = it.next()??;
+        let b = it.next()??;
+        (a < 6 && b < 6).then_some((a, b))
+    })
+}
+
+/// Pure selector for the 128x128 exact projection shadow.
+pub(crate) const fn prefill_projection_pipe_m128_route(
+    requested: bool,
+    n: u32,
+    reduction: u32,
+    has_kernel: bool,
+) -> PrefillProjectionPipeRoute {
+    if !requested {
+        return PrefillProjectionPipeRoute::Disabled;
+    }
+    if n == 0 || !n.is_multiple_of(128) || reduction == 0 || !reduction.is_multiple_of(32) {
+        return PrefillProjectionPipeRoute::Ineligible;
+    }
+    if has_kernel {
+        PrefillProjectionPipeRoute::Complete
+    } else {
+        PrefillProjectionPipeRoute::Missing
+    }
+}
+
 /// Pure selector for an original-layout NVFP4 prefill projection.
 ///
 /// Keeping `Missing` distinct from `Ineligible` prevents a stale kernel cache

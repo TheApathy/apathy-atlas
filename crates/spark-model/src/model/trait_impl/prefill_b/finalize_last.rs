@@ -64,6 +64,25 @@ impl TransformerModel {
         let hidden = self.buffers.hidden_states();
         let bs = kv_cache.block_size();
 
+        // Numerics gate: dump the whole residual stream of this chunk
+        // (`proc_count` rows x hidden, pre-final-norm, native residual dtype)
+        // when ATLAS_PREFILL_HIDDEN_DUMP=<dir>. Diagnostic only.
+        if let Ok(dir) = std::env::var("ATLAS_PREFILL_HIDDEN_DUMP")
+            && !dir.is_empty()
+        {
+            self.gpu.synchronize(stream)?;
+            let bytes_len = proc_count * h * fp32;
+            let mut buf = vec![0u8; bytes_len];
+            self.gpu
+                .copy_d2h(hidden.offset(hidden_stream_offset_tokens * h * fp32), &mut buf)?;
+            std::fs::create_dir_all(&dir).ok();
+            let name = format!(
+                "hidden_start{chunk_start}_rows{proc_count}_h{h}_elem{fp32}.bin"
+            );
+            std::fs::write(std::path::Path::new(&dir).join(&name), &buf).ok();
+            tracing::info!("ATLAS_PREFILL_HIDDEN_DUMP: wrote {name} ({bytes_len} bytes)");
+        }
+
         // ── 6. Final norm on LAST token only ──
         let last_token_offset = hidden_stream_offset_tokens + proc_count - 1;
         let last_hidden = hidden.offset(last_token_offset * h * fp32);

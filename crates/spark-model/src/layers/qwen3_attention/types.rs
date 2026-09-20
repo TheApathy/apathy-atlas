@@ -302,6 +302,12 @@ pub struct Qwen3AttentionLayer {
     /// kernel is latency-bound at small M (~21 GB/s), the pipe lands near the
     /// decode kernels' ~190 GB/s. Handle 0 falls back to the baseline.
     pub(super) w4a16_gemm_pipe_k: KernelHandle,
+    /// Byte-exact 128x128-tile shadow of `w4a16_gemm` for large-M prefill
+    /// (`ATLAS_PREFILL_PROJ_PIPE_M128=1`). Handle 0 = not in this bundle.
+    pub(super) w4a16_gemm_pipe_m128n128_k: KernelHandle,
+    /// 8-warp 128x128 bit-identical shadows of the FP8-MMA transposed GEMMs.
+    pub(super) w4a16_gemm_t_w8_k: KernelHandle,
+    pub(super) fp8_gemm_t_w8_k: KernelHandle,
     /// Exact dual original-layout pipe kernel. The opt-in large-M prefill path
     /// uses it to project K and V from one A load while preserving two BF16
     /// outputs. Missing symbols fail the explicit route closed.

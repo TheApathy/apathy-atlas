@@ -967,6 +967,11 @@ impl TransformerModel {
             layers,
             buffers,
             kv_cache: Mutex::new(kv_cache),
+            strided_copy_rows_kernel: crate::layers::try_kernel(
+                gpu.as_ref(),
+                "strided_copy_rows",
+                "strided_copy_rows_16",
+            ),
             gpu,
             rms_norm_kernel,
             bf16_to_f32_kernel,

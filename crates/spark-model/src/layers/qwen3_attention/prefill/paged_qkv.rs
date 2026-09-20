@@ -21,17 +21,6 @@ pub(super) enum Proj {
     V,
 }
 
-fn log_prefill_projection_pipe_once(proj: Proj) {
-    static Q: std::sync::Once = std::sync::Once::new();
-    static K: std::sync::Once = std::sync::Once::new();
-    static V: std::sync::Once = std::sync::Once::new();
-    let (once, name) = match proj {
-        Proj::Q => (&Q, "attention_q"),
-        Proj::K => (&K, "attention_k"),
-        Proj::V => (&V, "attention_v"),
-    };
-    once.call_once(|| tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE: {name}"));
-}
 
 pub(super) fn use_prefill_kv_dual(
     requested: bool,
@@ -268,50 +257,16 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4) = weight_opt.and_then(|w| w.as_nvfp4()) {
-            match crate::layers::prefill_projection_pipe_route(
-                crate::layers::prefill_proj_pipe_enabled(),
-                h,
-                self.w4a16_gemm_pipe_k.0 != 0,
-            ) {
-                crate::layers::PrefillProjectionPipeRoute::Complete => {
-                    log_prefill_projection_pipe_once(proj);
-                    // Byte-exact pipelined shadow of the baseline below (see
-                    // `prefill_proj_pipe_enabled`). Same dequant + MMA arithmetic,
-                    // cp.async weight loads — removes the small-M latency floor
-                    // that the proj_fast=0 config otherwise pays per projection.
-                    // K=h must be a multiple of the pipe's 64-row stage.
-                    ops::w4a16_gemm_pipe(
-                        ctx.gpu,
-                        self.w4a16_gemm_pipe_k,
-                        normed,
-                        nvfp4,
-                        out,
-                        n,
-                        out_dim,
-                        h,
-                        stream,
-                    )?;
-                }
-                crate::layers::PrefillProjectionPipeRoute::Missing => {
-                    anyhow::bail!(
-                        "ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe for an eligible attention Q/K/V projection"
-                    );
-                }
-                crate::layers::PrefillProjectionPipeRoute::Disabled
-                | crate::layers::PrefillProjectionPipeRoute::Ineligible => {
-                    ops::w4a16_gemm(
-                        ctx.gpu,
-                        self.w4a16_gemm_k,
-                        normed,
-                        nvfp4,
-                        out,
-                        n,
-                        out_dim,
-                        h,
-                        stream,
-                    )?;
-                }
-            }
+            let label = match proj {
+                Proj::Q => "attention_q",
+                Proj::K => "attention_k",
+                Proj::V => "attention_v",
+            };
+            // Exact original-layout route (baseline / pipe / pipe_m128n128 are
+            // bit-identical; selected by ATLAS_PREFILL_PROJ_PIPE[_M128]).
+            self.exact_prefill_projection(
+                ctx.gpu, label, normed, nvfp4, out, n, out_dim, h, stream,
+            )?;
         } else {
             ops::dense_gemm(
                 ctx.gpu,

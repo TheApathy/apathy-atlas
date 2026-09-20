@@ -358,6 +358,42 @@ impl TransformerModel {
         let capture_bytes = h
             .checked_mul(bf16)
             .ok_or_else(|| anyhow::anyhow!("DFlash capture byte size overflow"))?;
+        if crate::layers::dflash_capture_strided_enabled() && self.strided_copy_rows_kernel.0 != 0 {
+            // Same bytes to the same destinations as the per-row loop below;
+            // the ring wraps at `ctx_capacity`, so split into contiguous runs.
+            let mut t = 0usize;
+            while t < proc_count {
+                let abs_pos = chunk_start + t;
+                if abs_pos >= max_ctx {
+                    break;
+                }
+                let ring_pos = abs_pos % dstate.ctx_capacity;
+                let run = (proc_count - t)
+                    .min(dstate.ctx_capacity - ring_pos)
+                    .min(max_ctx - abs_pos);
+                let dst_offset =
+                    crate::layers::dflash_head::ring_window::accumulator_capture_offset(
+                        abs_pos,
+                        slot_idx,
+                        dstate.ctx_capacity,
+                        dstate.ctx_slot_bytes,
+                        capture_bytes,
+                    )?;
+                crate::layers::ops::strided_copy_rows(
+                    self.gpu.as_ref(),
+                    self.strided_copy_rows_kernel,
+                    src_base.offset(t * capture_bytes),
+                    acc_base.offset(dst_offset),
+                    run as u32,
+                    capture_bytes as u32,
+                    capture_bytes as u64,
+                    dstate.ctx_slot_bytes as u64,
+                    stream,
+                )?;
+                t += run;
+            }
+            return Ok(());
+        }
         for t in 0..proc_count {
             let abs_pos = chunk_start
                 .checked_add(t)

@@ -326,6 +326,37 @@ impl SsmStatePool {
     }
 
     pub(super) fn reset_slot(&self, slot: usize, gpu: &dyn GpuBackend) -> Result<()> {
+        if crate::layers::ssm_reset_async_enabled() {
+            // Same bytes zeroed, but as stream-ordered memsets (one per pool
+            // region per layer; the per-slot intermediates are contiguous) plus
+            // a single synchronize, instead of ~2000 synchronous cuMemsetD8
+            // calls (~60 ms of host-issue latency per request at 48 layers).
+            let stream = gpu.default_stream();
+            for i in 0..self.num_ssm_layers {
+                gpu.memset_async(self.h_state(i, slot), 0, self.h_bytes, stream)?;
+                gpu.memset_async(self.conv_state(i, slot), 0, self.conv_bytes, stream)?;
+                if self.has_mtp {
+                    if self.num_intermediates > 0 {
+                        gpu.memset_async(
+                            self.h_intermediate(i, slot, 0),
+                            0,
+                            self.h_bytes * self.num_intermediates,
+                            stream,
+                        )?;
+                        gpu.memset_async(
+                            self.conv_intermediate(i, slot, 0),
+                            0,
+                            self.conv_bytes * self.num_intermediates,
+                            stream,
+                        )?;
+                    }
+                    gpu.memset_async(self.h_checkpoint(i, slot), 0, self.h_bytes, stream)?;
+                    gpu.memset_async(self.conv_checkpoint(i, slot), 0, self.conv_bytes, stream)?;
+                }
+            }
+            gpu.synchronize(stream)?;
+            return Ok(());
+        }
         for i in 0..self.num_ssm_layers {
             gpu.memset(self.h_state(i, slot), 0, self.h_bytes)?;
             gpu.memset(self.conv_state(i, slot), 0, self.conv_bytes)?;

@@ -142,21 +142,9 @@ impl Qwen3SsmLayer {
             })?;
         } else if let Some(ref nvfp4_t) = self.qkvz_nvfp4_t {
             if k > 128 {
-                ops::w4a16_gemm_n128_m128(
-                    ctx.gpu,
-                    self.w4a16_gemm_t_m128_k,
-                    normed,
-                    nvfp4_t,
-                    proj_dst,
-                    k,
-                    qkvz_size as u32,
-                    h as u32,
-                    stream,
-                )
+                self.qkvz_prefill_m128_dispatch(ctx, normed, nvfp4_t, proj_dst, k, qkvz_size as u32, h as u32, stream)
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "ssm prefill: QKVZ m128 GEMM failed (M={k}, N={qkvz_size}): {e}"
-                    )
+                    anyhow::anyhow!("ssm prefill: QKVZ m128 GEMM failed (M={k}, N={qkvz_size}): {e}")
                 })?;
             } else {
                 ops::w4a16_gemm_n128(
@@ -352,12 +340,22 @@ impl Qwen3SsmLayer {
             gdn_c143.launch(ctx.gpu)?;
         } else if gatecache {
             __gdn_path = "wy32_gatecache";
-            let smem = super::trait_prefill_gdn::wy32_dynamic_smem_bytes(kd, vd, true)
+            let smem_v1 = super::trait_prefill_gdn::wy32_dynamic_smem_bytes(kd, vd, true)
                 .ok_or_else(|| anyhow::anyhow!("WY32 gate-cache shared-memory size overflow"))?;
+            let smem_v2 = super::trait_prefill_gdn::wy32_gatecache_v2_dynamic_smem_bytes(kd, vd)
+                .ok_or_else(|| anyhow::anyhow!("WY32 gate-cache v2 shared-memory size overflow"))?;
+            let (gatecache_k, smem, _) = super::trait_prefill_gdn::gatecache_kernel_choice(
+                crate::layers::gdn_prefill_gatecache_v2_enabled(),
+                self.gdn_prefill_wy32_gatecache_k,
+                self.gdn_prefill_wy32_gatecache_v2_k,
+                smem_v1,
+                smem_v2,
+            )
+            .map_err(anyhow::Error::msg)?;
             super::trait_prefill_gdn::log_wy32_gatecache_engaged(k);
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,
-                self.gdn_prefill_wy32_gatecache_k,
+                gatecache_k,
                 ssm_state.h_state,
                 q_ptr,
                 k_ptr,

@@ -184,6 +184,8 @@ pub struct TransformerModel {
     pub(super) pinned_staging: std::cell::UnsafeCell<PinnedMetaStaging>,
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
+    /// Byte-exact strided row copy (`strided_copy_rows_16`); 0 when absent.
+    pub(super) strided_copy_rows_kernel: KernelHandle,
     pub(super) bf16_to_f32_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
     /// FP32-output variant of dense_gemv_bf16. Used by the LM head when

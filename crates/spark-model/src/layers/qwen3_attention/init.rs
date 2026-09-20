@@ -615,10 +615,17 @@ impl Qwen3AttentionLayer {
             rms_norm_qk_batch3_k: super::super::try_kernel(gpu, "norm", "rms_norm_qk_batch3"),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_pipe_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
+            w4a16_gemm_pipe_m128n128_k: super::super::try_kernel(
+                gpu,
+                "w4a16",
+                "w4a16_gemm_pipe_m128n128",
+            ),
             w4a16_gemm_pipe_dual_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe_dual"),
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128n128_w8"),
+            fp8_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128n128_w8"),
             w4a16_gemm_t_m32_n64_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m32_n64"),
             w4a16_gemm_t_m32_n64_splitk_k: super::super::try_kernel(
                 gpu,

@@ -4150,3 +4150,474 @@ extern "C" __global__ void w4a16_gemm_t_m32_n64_gateup_silu_pipe_k64(
 #undef K_STEP_K64
 #undef A_PAD_K64
 #undef BP_PAD_K64
+
+// ═══════════════════════════════════════════════════════════════════
+// w4a16_gemm_pipe_m128n128 — byte-exact large-M shadow of w4a16_gemm.
+//
+// Same numerics contract as w4a16_gemm_pipe: original-layout NVFP4
+// weights, per-element dequant ((E2M1_LUT[nib] * (float)fp8) * scale2)
+// rounded to BF16, BF16 x BF16 m16n8k16 MMA with FP32 accumulate, K
+// consumed in ascending 16-wide steps for every output element. Only the
+// tiling changes: 128x128 CTA tile, 8 warps (4 along M x 2 along N, each
+// 32x64), ldmatrix fragment loads, cp.async double-buffered A/B_packed,
+// and a [n][k] BF16 dequant layout so the col-major B fragment is one
+// ldmatrix. Each weight byte is dequantized M/128 times instead of M/64,
+// and each A row is re-read N/128 times instead of N/64.
+//
+// Requirements (caller checks): K % 32 == 0, N % 128 == 0, any M.
+// Grid: (N/128, ceil(M/128), 1)  Block: (256, 1, 1)
+// SMEM: A 2x128x40x2 = 20480 B, Bp 2x128x16 = 4096 B, Bs 2x128x2 = 512 B,
+//       B 2x128x40x2 = 20480 B, LUT 64 B  -> ~45.6 KB static.
+// ═══════════════════════════════════════════════════════════════════
+
+#define MM_M 128
+#define MM_N 128
+#define MM_K 32
+#define MM_PAD 8           // (32+8)*2 = 80 B rows, 16-byte aligned
+#define MM_STRIDE (MM_K + MM_PAD)
+#define MM_THREADS 256
+
+__device__ __forceinline__ void ldmatrix_x4(unsigned int& r0, unsigned int& r1,
+                                            unsigned int& r2, unsigned int& r3,
+                                            const void* smem_ptr) {
+    unsigned int addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+
+extern "C" __global__ void __launch_bounds__(MM_THREADS, 2)
+w4a16_gemm_pipe_m128n128(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,   // [N, K/2]
+    const unsigned char* __restrict__ B_scale,    // [N, K/16]
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * MM_M;
+    const unsigned int cta_n = blockIdx.x * MM_N;
+    if (cta_m >= M) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid >> 5;
+    const unsigned int lane = tid & 31;
+    const unsigned int warp_m = (warp_id & 3) * 32;   // 4 warps along M
+    const unsigned int warp_n = (warp_id >> 2) * 64;  // 2 warps along N
+    const unsigned int group_id = lane >> 2;
+    const unsigned int tid4 = lane & 3;
+
+    __shared__ __align__(16) __nv_bfloat16 smem_A[2][MM_M][MM_STRIDE];
+    __shared__ __align__(16) unsigned char smem_Bp[2][MM_N][16];
+    __shared__ unsigned char smem_Bs[2][MM_N][2];
+    __shared__ __align__(16) __nv_bfloat16 smem_B[2][MM_N][MM_STRIDE];  // [n][k]
+    __shared__ float smem_LUT[16];
+
+    float acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; acc[i][j][2] = 0.f; acc[i][j][3] = 0.f;
+        }
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+
+    if (tid < 16) smem_LUT[tid] = E2M1_LUT[tid];
+    __syncthreads();
+
+    // A: 128 rows x 4 chunks(16 B) = 512 chunks, 2 per thread.
+    // Bp: 128 rows x 1 chunk, threads 0..127. Bs: plain 2-byte loads, threads 128..255.
+    #define MM_ISSUE(buf, kk) do {                                                    \
+        _Pragma("unroll")                                                             \
+        for (int p = 0; p < 2; p++) {                                                 \
+            unsigned int c = tid + p * MM_THREADS;                                    \
+            unsigned int row = c >> 2;                                                \
+            unsigned int col8 = (c & 3) << 3;                                         \
+            unsigned int gr = cta_m + row;                                            \
+            cp_async_pred_16(&smem_A[(buf)][row][col8],                               \
+                &A[(unsigned long long)gr * K + (kk) + col8], (gr < M) && ((kk) < K)); \
+        }                                                                             \
+        if (tid < MM_N) {                                                             \
+            unsigned int gn = cta_n + tid;                                            \
+            cp_async_pred_16(&smem_Bp[(buf)][tid][0],                                 \
+                &B_packed[(unsigned long long)gn * half_K + ((kk) >> 1)], ((kk) < K)); \
+        } else {                                                                      \
+            unsigned int n = tid - MM_N;                                              \
+            unsigned int gn = cta_n + n;                                              \
+            unsigned int sg = (kk) / GROUP_SIZE;                                      \
+            _Pragma("unroll")                                                         \
+            for (int g = 0; g < 2; g++) {                                             \
+                unsigned char s = ((kk) + g * GROUP_SIZE < K)                          \
+                    ? B_scale[(unsigned long long)gn * num_groups + sg + g] : 0;      \
+                smem_Bs[(buf)][n][g] = s;                                             \
+            }                                                                         \
+        }                                                                             \
+        cp_async_commit();                                                            \
+    } while (0)
+
+    // Dequant: thread -> (n = tid>>1, k-half = tid&1): 16 consecutive K values,
+    // one scale group. Parent arithmetic: ((LUT[nib] * (float)fp8) * scale2) -> BF16.
+    #define MM_DEQUANT(buf) do {                                                      \
+        unsigned int n = tid >> 1;                                                    \
+        unsigned int kh = tid & 1;                                                    \
+        const unsigned char* pb = &smem_Bp[(buf)][n][kh * 8];                         \
+        unsigned char sb = smem_Bs[(buf)][n][kh];                                     \
+        __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;                                \
+        float fs = (float)fp8;                                                        \
+        __nv_bfloat16* dst = &smem_B[(buf)][n][kh * 16];                              \
+        _Pragma("unroll")                                                             \
+        for (int i = 0; i < 8; i++) {                                                 \
+            unsigned char packed = pb[i];                                             \
+            dst[2 * i]     = __float2bfloat16(smem_LUT[packed & 0xF] * fs * scale2);   \
+            dst[2 * i + 1] = __float2bfloat16(smem_LUT[packed >> 4] * fs * scale2);    \
+        }                                                                             \
+    } while (0)
+
+    MM_ISSUE(0, 0);
+    unsigned int cur = 0, nxt = 1;
+    for (unsigned int k_base = 0; k_base < K; k_base += MM_K) {
+        MM_ISSUE(nxt, k_base + MM_K);
+        cp_async_wait_group<1>();
+        __syncthreads();
+        MM_DEQUANT(cur);
+        __syncthreads();
+
+        // ldmatrix lane addressing.
+        //   A (x4, 16x16 frag): lanes 0-15 -> rows 0..15 @k0, lanes 16-31 -> rows 0..15 @k0+8
+        //   B (x4, two 8-col n-frags): lanes 0-7 rows n0..7 @k0, 8-15 @k0+8,
+        //                              16-23 rows n0+8..15 @k0, 24-31 @k0+8
+        const unsigned int a_row = lane & 15;
+        const unsigned int a_koff = (lane >> 4) * 8;
+        const unsigned int b_row = (lane & 7) + ((lane >> 4) * 8);
+        const unsigned int b_koff = ((lane >> 3) & 1) * 8;
+        #pragma unroll
+        for (int kh = 0; kh < 2; kh++) {
+            const unsigned int k0 = kh * 16;
+            unsigned int a[2][4];
+            #pragma unroll
+            for (int mf = 0; mf < 2; mf++) {
+                ldmatrix_x4(a[mf][0], a[mf][1], a[mf][2], a[mf][3],
+                    &smem_A[cur][warp_m + mf * 16 + a_row][k0 + a_koff]);
+            }
+            #pragma unroll
+            for (int np = 0; np < 4; np++) {
+                unsigned int b0, b1, b2, b3;
+                ldmatrix_x4(b0, b1, b2, b3,
+                    &smem_B[cur][warp_n + np * 16 + b_row][k0 + b_koff]);
+                #pragma unroll
+                for (int mf = 0; mf < 2; mf++) {
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        :"=f"(acc[mf][2*np][0]),"=f"(acc[mf][2*np][1]),"=f"(acc[mf][2*np][2]),"=f"(acc[mf][2*np][3])
+                        :"r"(a[mf][0]),"r"(a[mf][1]),"r"(a[mf][2]),"r"(a[mf][3]),"r"(b0),"r"(b1),
+                         "f"(acc[mf][2*np][0]),"f"(acc[mf][2*np][1]),"f"(acc[mf][2*np][2]),"f"(acc[mf][2*np][3]));
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                        :"=f"(acc[mf][2*np+1][0]),"=f"(acc[mf][2*np+1][1]),"=f"(acc[mf][2*np+1][2]),"=f"(acc[mf][2*np+1][3])
+                        :"r"(a[mf][0]),"r"(a[mf][1]),"r"(a[mf][2]),"r"(a[mf][3]),"r"(b2),"r"(b3),
+                         "f"(acc[mf][2*np+1][0]),"f"(acc[mf][2*np+1][1]),"f"(acc[mf][2*np+1][2]),"f"(acc[mf][2*np+1][3]));
+                }
+            }
+        }
+        __syncthreads();
+        unsigned int t = cur; cur = nxt; nxt = t;
+    }
+
+    // Epilogue: identical rounding/store as w4a16_gemm.
+    #pragma unroll
+    for (int mf = 0; mf < 2; mf++) {
+        #pragma unroll
+        for (int nf = 0; nf < 8; nf++) {
+            unsigned int c0 = cta_n + warp_n + nf * 8 + tid4 * 2;
+            unsigned int c1 = c0 + 1;
+            unsigned int r0 = cta_m + warp_m + mf * 16 + group_id;
+            unsigned int r1 = r0 + 8;
+            if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(acc[mf][nf][0]);
+            if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(acc[mf][nf][1]);
+            if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(acc[mf][nf][2]);
+            if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(acc[mf][nf][3]);
+        }
+    }
+    #undef MM_ISSUE
+    #undef MM_DEQUANT
+}
+#undef MM_M
+#undef MM_N
+#undef MM_K
+#undef MM_PAD
+#undef MM_STRIDE
+#undef MM_THREADS
+
+// ═══════════════════════════════════════════════════════════════════
+// 128x128-tile, 8-warp shadows of the FP8-MMA transposed GEMMs.
+//
+//   w4a16_gemm_t_m128n128_w8  <->  w4a16_gemm_t / w4a16_gemm_t_m128
+//   fp8_gemm_t_m128n128_w8    <->  fp8_gemm_t   / fp8_gemm_t_m128
+//
+// Bit-identical per output element: the same DEQUANT_T dequant (FP4 * fp8
+// scale * scale2 -> cvt.rn.satfinite.e4m3x2), the same bf16x4_to_e4m3x4
+// activation conversion, the same m16n8k32.e4m3.e4m3.f32 MMA consumed in
+// ascending 32-wide K steps, and the same BF16 epilogue rounding. Only the
+// CTA tile (128 rows x 128 cols, 8 warps of 32x64) and per-thread work
+// assignment change; each B tile is now shared by 128 rows instead of 64
+// (t) or 128 rows with 4 warps (m128).
+// Grid: (N/128, ceil(M/128), 1)  Block: (256, 1, 1). Requires N % 128 == 0,
+// K % 32 == 0.
+// ═══════════════════════════════════════════════════════════════════
+#define W8_M 128
+#define W8_N 128
+#define W8_THREADS 256
+
+extern "C" __global__ void __launch_bounds__(W8_THREADS, 2)
+w4a16_gemm_t_m128n128_w8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,   // [K/2, N] transposed
+    const unsigned char* __restrict__ B_scale,    // [K/16, N] transposed
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * W8_N;
+    const unsigned int cta_m = blockIdx.y * W8_M;
+    if (cta_m >= M) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid >> 5;
+    const unsigned int lane_id = tid & 31;
+    const unsigned int warp_m = (warp_id & 3) * 32;
+    const unsigned int warp_n = (warp_id >> 2) * 64;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid4 = lane_id & 3;
+
+    __shared__ __align__(16) __nv_bfloat16 smem_A[2][W8_M][K_STEP_T + PAD_T];     // 20480 B
+    __shared__ __align__(16) unsigned char smem_Bp[2][K_STEP_T / 2][W8_N + BP_PAD]; //  4608 B
+    __shared__ __align__(16) unsigned char smem_Bs[2][K_STEP_T / GROUP_SIZE][W8_N + BP_PAD]; // 576 B
+    __shared__ __align__(16) unsigned char smem_B_fp8[W8_N][K_STEP_T];              //  4096 B
+    __shared__ float smem_LUT[16];
+    if (tid < 16) smem_LUT[tid] = E2M1_LUT[tid];
+
+    float acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) { acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; acc[i][j][2] = 0.f; acc[i][j][3] = 0.f; }
+
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    // A: 128 rows x 4 x 16B chunks = 512 chunks, 2 per thread. B: as w4a16_gemm_t (threads 0..127).
+    #define W8_LOADS(buf, kb) do { \
+        _Pragma("unroll") \
+        for (int p = 0; p < 2; p++) { \
+            unsigned int c = tid + p * W8_THREADS; \
+            unsigned int row = c >> 2; \
+            unsigned int a_col = (c & 3) << 3; \
+            unsigned int gr = cta_m + row; \
+            unsigned int gc = (kb) + a_col; \
+            cp_async_pred_16(&smem_A[(buf)][row][a_col], \
+                &A[(unsigned long long)gr * K + gc], (gr < M) && (gc + 7 < K)); \
+        } \
+        if (tid < 128) { \
+            unsigned int kp  = tid >> 3; \
+            unsigned int ns  = (tid & 7) << 4; \
+            unsigned int gke = (kb) + (kp << 1); \
+            unsigned int gns = cta_n + ns; \
+            cp_async_pred_16(&smem_Bp[(buf)][kp][ns], \
+                &B_packed[(unsigned long long)(gke >> 1) * N + gns], \
+                (gke + 1 <= K) && (gns + 15 < N)); \
+            if (kp < K_STEP_T / GROUP_SIZE) { \
+                unsigned int sg = (kb) / GROUP_SIZE + kp; \
+                cp_async_pred_16(&smem_Bs[(buf)][kp][ns], \
+                    &B_scale[(unsigned long long)sg * N + gns], (gns + 15 < N)); \
+            } \
+        } \
+    } while (0)
+
+    // Dequant: thread -> column n = tid>>1, k-half = tid&1 (parent's exact
+    // per-element arithmetic, split across two threads per column).
+    #define W8_DEQUANT(buf) do { \
+        unsigned int my_n = tid >> 1; \
+        unsigned int half = tid & 1; \
+        unsigned char sb = smem_Bs[(buf)][half][my_n]; \
+        __nv_fp8_e4m3 f; *(unsigned char*)&f = sb; \
+        float sv = (float)f * scale2; \
+        _Pragma("unroll") \
+        for (int i = 0; i < 8; i++) { \
+            int kp = half * 8 + i; \
+            unsigned char packed = smem_Bp[(buf)][kp][my_n]; \
+            float lo = smem_LUT[packed & 0xF] * sv; \
+            float hi = smem_LUT[packed >> 4]  * sv; \
+            unsigned short fp8_pair; \
+            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(fp8_pair) : "f"(hi), "f"(lo)); \
+            *(unsigned short*)&smem_B_fp8[my_n][kp * 2] = fp8_pair; \
+        } \
+    } while (0)
+
+    #define W8_COMPUTE(a_buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(a_buf)]; \
+        unsigned int a[2][4]; \
+        _Pragma("unroll") \
+        for (int mf = 0; mf < 2; mf++) { \
+            unsigned int fr0 = warp_m + mf * 16 + group_id, fr1 = fr0 + 8; \
+            a[mf][0] = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid4 * 4]); \
+            a[mf][1] = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid4 * 4]); \
+            a[mf][2] = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid4 * 4]); \
+            a[mf][3] = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid4 * 4]); \
+        } \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 8; nt++) { \
+            unsigned int nc = warp_n + nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B_fp8[nc][4 * tid4]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B_fp8[nc][16 + 4 * tid4]; \
+            _Pragma("unroll") \
+            for (int mf = 0; mf < 2; mf++) { \
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    :"=f"(acc[mf][nt][0]),"=f"(acc[mf][nt][1]),"=f"(acc[mf][nt][2]),"=f"(acc[mf][nt][3]) \
+                    :"r"(a[mf][0]),"r"(a[mf][1]),"r"(a[mf][2]),"r"(a[mf][3]),"r"(b0),"r"(b1), \
+                     "f"(acc[mf][nt][0]),"f"(acc[mf][nt][1]),"f"(acc[mf][nt][2]),"f"(acc[mf][nt][3])); \
+            } \
+        } \
+    } while (0)
+
+    W8_LOADS(0, 0);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+    W8_DEQUANT(0);
+    __syncthreads();
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        W8_LOADS(nxt, k_base);
+        cp_async_commit();
+        W8_COMPUTE(cur);
+        cp_async_wait_all();
+        __syncthreads();
+        W8_DEQUANT(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    W8_COMPUTE(cur);
+    #undef W8_LOADS
+    #undef W8_DEQUANT
+    #undef W8_COMPUTE
+
+    #pragma unroll
+    for (int mf = 0; mf < 2; mf++)
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            unsigned int c0 = cta_n + warp_n + nt * 8 + tid4 * 2, c1 = c0 + 1;
+            unsigned int r0 = cta_m + warp_m + mf * 16 + group_id, r1 = r0 + 8;
+            if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(acc[mf][nt][0]);
+            if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(acc[mf][nt][1]);
+            if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(acc[mf][nt][2]);
+            if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(acc[mf][nt][3]);
+        }
+}
+
+extern "C" __global__ void __launch_bounds__(W8_THREADS, 2)
+fp8_gemm_t_m128n128_w8(
+    const __nv_bfloat16* __restrict__ A,       // [M, K] BF16
+    const unsigned char* __restrict__ B_fp8,   // [N, K] FP8 E4M3
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * W8_N;
+    const unsigned int cta_m = blockIdx.y * W8_M;
+    if (cta_m >= M) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid >> 5;
+    const unsigned int lane_id = tid & 31;
+    const unsigned int warp_m = (warp_id & 3) * 32;
+    const unsigned int warp_n = (warp_id >> 2) * 64;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid4 = lane_id & 3;
+
+    __shared__ __align__(16) __nv_bfloat16 smem_A[2][W8_M][K_STEP_T + PAD_T];  // 20480 B
+    __shared__ __align__(16) unsigned char smem_B[2][W8_N][K_STEP_T];            //  8192 B
+
+    float acc[2][8][4];
+    #pragma unroll
+    for (int i = 0; i < 2; i++)
+        #pragma unroll
+        for (int j = 0; j < 8; j++) { acc[i][j][0] = 0.f; acc[i][j][1] = 0.f; acc[i][j][2] = 0.f; acc[i][j][3] = 0.f; }
+    const unsigned int a_stride = K_STEP_T + PAD_T;
+
+    #define F8_LOADS(buf, kb) do { \
+        _Pragma("unroll") \
+        for (int p = 0; p < 2; p++) { \
+            unsigned int c = tid + p * W8_THREADS; \
+            unsigned int row = c >> 2; \
+            unsigned int a_col = (c & 3) << 3; \
+            unsigned int gr = cta_m + row; \
+            unsigned int gc = (kb) + a_col; \
+            cp_async_pred_16(&smem_A[(buf)][row][a_col], \
+                &A[(unsigned long long)gr * K + gc], (gr < M) && (gc + 7 < K)); \
+        } \
+        { \
+            unsigned int my_n = tid >> 1; \
+            unsigned int half = tid & 1; \
+            unsigned int gn = cta_n + my_n; \
+            bool valid = (gn < N) && ((kb) + 31 < K); \
+            cp_async_pred_16(&smem_B[(buf)][my_n][half * 16], \
+                &B_fp8[(unsigned long long)gn * K + (kb) + half * 16], valid); \
+        } \
+    } while (0)
+
+    #define F8_COMPUTE(buf) do { \
+        const unsigned short* sA = (const unsigned short*)smem_A[(buf)]; \
+        unsigned int a[2][4]; \
+        _Pragma("unroll") \
+        for (int mf = 0; mf < 2; mf++) { \
+            unsigned int fr0 = warp_m + mf * 16 + group_id, fr1 = fr0 + 8; \
+            a[mf][0] = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + tid4 * 4]); \
+            a[mf][1] = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + tid4 * 4]); \
+            a[mf][2] = bf16x4_to_e4m3x4(&sA[fr0 * a_stride + 16 + tid4 * 4]); \
+            a[mf][3] = bf16x4_to_e4m3x4(&sA[fr1 * a_stride + 16 + tid4 * 4]); \
+        } \
+        _Pragma("unroll") \
+        for (int nt = 0; nt < 8; nt++) { \
+            unsigned int nc = warp_n + nt * 8 + group_id; \
+            unsigned int b0 = *(const unsigned int*)&smem_B[(buf)][nc][4 * tid4]; \
+            unsigned int b1 = *(const unsigned int*)&smem_B[(buf)][nc][16 + 4 * tid4]; \
+            _Pragma("unroll") \
+            for (int mf = 0; mf < 2; mf++) { \
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 " \
+                    "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};" \
+                    :"=f"(acc[mf][nt][0]),"=f"(acc[mf][nt][1]),"=f"(acc[mf][nt][2]),"=f"(acc[mf][nt][3]) \
+                    :"r"(a[mf][0]),"r"(a[mf][1]),"r"(a[mf][2]),"r"(a[mf][3]),"r"(b0),"r"(b1), \
+                     "f"(acc[mf][nt][0]),"f"(acc[mf][nt][1]),"f"(acc[mf][nt][2]),"f"(acc[mf][nt][3])); \
+            } \
+        } \
+    } while (0)
+
+    F8_LOADS(0, 0);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+    int cur = 0;
+    for (unsigned int k_base = K_STEP_T; k_base < K; k_base += K_STEP_T) {
+        int nxt = 1 - cur;
+        F8_LOADS(nxt, k_base);
+        cp_async_commit();
+        F8_COMPUTE(cur);
+        cp_async_wait_all();
+        __syncthreads();
+        cur = nxt;
+    }
+    F8_COMPUTE(cur);
+    #undef F8_LOADS
+    #undef F8_COMPUTE
+
+    #pragma unroll
+    for (int mf = 0; mf < 2; mf++)
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            unsigned int c0 = cta_n + warp_n + nt * 8 + tid4 * 2, c1 = c0 + 1;
+            unsigned int r0 = cta_m + warp_m + mf * 16 + group_id, r1 = r0 + 8;
+            if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(acc[mf][nt][0]);
+            if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(acc[mf][nt][1]);
+            if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(acc[mf][nt][2]);
+            if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(acc[mf][nt][3]);
+        }
+}
+#undef W8_M
+#undef W8_N
+#undef W8_THREADS

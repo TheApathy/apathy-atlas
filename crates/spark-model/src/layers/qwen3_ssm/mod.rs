@@ -259,7 +259,10 @@ pub struct Qwen3SsmLayer {
     w4a16_gemm_pipe_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle, // Transposed B layout [K/2, N] — K_STEP_T=32
     w4a16_gemm_t_k64_k: KernelHandle, // K64 variant: K_STEP_T=64, halves outer loop
-    w4a16_gemm_t_m128_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
+    w4a16_gemm_t_m128_k: KernelHandle,
+    /// 8-warp 128x128 bit-identical shadows (ATLAS_PREFILL_FP8_W8=1); 0 when absent.
+    w4a16_gemm_t_w8_k: KernelHandle,
+    fp8_gemm_t_w8_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
     /// M16 variant: 1 CTA row × 4 warps × 32-N each (K=γ verify, M≤32).
     /// Gated by `ATLAS_TC_NVFP4_M16=1` env var. KernelHandle(0) if not compiled
     /// for this target (qwen3.6-27b NVFP4 shadow only as of 2026-05-19).
@@ -296,6 +299,8 @@ pub struct Qwen3SsmLayer {
     /// ABI-identical WY32 shadow that caches the thread-invariant gate-product
     /// triangle. Default off until live output-hash and TTFT qualification.
     gdn_prefill_wy32_gatecache_k: KernelHandle,
+    /// Exact v2 shadow of the gate-cache kernel (ATLAS_GDN_PREFILL_GATECACHE_V2=1).
+    gdn_prefill_wy32_gatecache_v2_k: KernelHandle,
     // ── Q12 Phase 2b: same-chunk-len batched GDN prefill kernels ──
     // Each takes `float* const* h_state_ptrs` plus stacked QKV/gate/beta/output.
     // Used by `Qwen3SsmLayer::prefill_batched` when N≥2 streams have matching

@@ -241,6 +241,122 @@ pub fn w4a16_gemm_pipe(
         .launch(stream)
 }
 
+/// `w4a16_gemm_t_m128n128_w8`: 8-warp 128x128 bit-identical shadow of
+/// `w4a16_gemm_t` (transposed NVFP4 weights, FP8 MMA). N % 128, K % 32.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_t_w8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(n.is_multiple_of(128) && k.is_multiple_of(32) && m > 0, "w4a16_gemm_t_w8 shape (M={m} N={n} K={k})");
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// `fp8_gemm_t_m128n128_w8`: 8-warp 128x128 bit-identical shadow of
+/// `fp8_gemm_t` (pre-dequantized FP8 [N,K] weights). N % 128, K % 32.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_t_w8(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(n.is_multiple_of(128) && k.is_multiple_of(32) && m > 0, "fp8_gemm_t_w8 shape (M={m} N={n} K={k})");
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight_fp8)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Byte-exact strided row copy (`strided_copy_rows_16`). Base pointers, strides
+/// and `row_bytes` must be multiples of 16.
+pub fn strided_copy_rows(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    rows: u32,
+    row_bytes: u32,
+    src_stride: u64,
+    dst_stride: u64,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(row_bytes.is_multiple_of(16) && src_stride.is_multiple_of(16) && dst_stride.is_multiple_of(16)
+        && src.0.is_multiple_of(16) && dst.0.is_multiple_of(16), "strided_copy_rows requires 16-byte alignment");
+    if rows == 0 { return Ok(()); }
+    let chunks = row_bytes / 16;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(chunks, 256).min(4), rows, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(rows)
+        .arg_u32(row_bytes)
+        .arg_u64(src_stride)
+        .arg_u64(dst_stride)
+        .launch(stream)
+}
+
+/// Byte-exact 128x128-tile shadow of `w4a16_gemm` (`w4a16_gemm_pipe_m128n128`).
+/// Grid: (N/128, ceil(M/128), 1)  Block: (256, 1, 1). Caller guarantees
+/// N % 128 == 0 and K % 32 == 0.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe_m128n128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(n.is_multiple_of(128) && k.is_multiple_of(32) && m > 0,
+        "w4a16_gemm_pipe_m128n128 requires N % 128 == 0 and K % 32 == 0 (M={m} N={n} K={k})");
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
 /// W4A16 up projection with a fused SiLU(gate) * up epilogue.
 ///
 /// The CUDA kernel retains the exact `w4a16_gemm_pipe` accumulation and BF16

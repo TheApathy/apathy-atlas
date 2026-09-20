@@ -12,6 +12,68 @@ use super::types::Qwen3AttentionLayer;
 use crate::weight_map::{Fp8Weight, QuantWeight, QuantizedWeight};
 
 impl Qwen3AttentionLayer {
+    /// Exact original-layout NVFP4 prefill projection. Prefers the 128x128
+    /// byte-exact shadow (`ATLAS_PREFILL_PROJ_PIPE_M128=1`), then the 64x64
+    /// pipe shadow (`ATLAS_PREFILL_PROJ_PIPE=1`), then the baseline
+    /// `w4a16_gemm`. All three produce bit-identical output; only speed differs.
+    /// An explicitly requested eligible route with a missing symbol fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exact_prefill_projection(
+        &self,
+        gpu: &dyn GpuBackend,
+        label: &'static str,
+        input: DevicePtr,
+        weight: &crate::weight_map::QuantizedWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        use crate::layers::PrefillProjectionPipeRoute as Route;
+        match crate::layers::prefill_projection_pipe_m128_route(
+            crate::layers::prefill_proj_pipe_m128_enabled(),
+            n,
+            k,
+            self.w4a16_gemm_pipe_m128n128_k.0 != 0,
+        ) {
+            Route::Complete => {
+                static SEEN: std::sync::Once = std::sync::Once::new();
+                SEEN.call_once(|| {
+                    tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE_M128: {label} (first) M={m} N={n} K={k}");
+                });
+                return crate::layers::ops::w4a16_gemm_pipe_m128n128(
+                    gpu, self.w4a16_gemm_pipe_m128n128_k, input, weight, output, m, n, k, stream,
+                );
+            }
+            Route::Missing => anyhow::bail!(
+                "ATLAS_PREFILL_PROJ_PIPE_M128=1 requires w4a16_gemm_pipe_m128n128 for {label}"
+            ),
+            Route::Disabled | Route::Ineligible => {}
+        }
+        match crate::layers::prefill_projection_pipe_route(
+            crate::layers::prefill_proj_pipe_enabled(),
+            k,
+            self.w4a16_gemm_pipe_k.0 != 0,
+        ) {
+            Route::Complete => {
+                static SEEN_PIPE: std::sync::Once = std::sync::Once::new();
+                SEEN_PIPE.call_once(|| {
+                    tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE: {label} (first)");
+                });
+                crate::layers::ops::w4a16_gemm_pipe(
+                    gpu, self.w4a16_gemm_pipe_k, input, weight, output, m, n, k, stream,
+                )
+            }
+            Route::Missing => anyhow::bail!(
+                "ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe for {label}"
+            ),
+            Route::Disabled | Route::Ineligible => crate::layers::ops::w4a16_gemm(
+                gpu, self.w4a16_gemm_k, input, weight, output, m, n, k, stream,
+            ),
+        }
+    }
+
     /// Dispatch the M=128 W4A16 prefill GEMM. Routes to the v2 shadow
     /// kernel when available (MiniMax-only), otherwise to the v1 kernel.
     /// Args mirror [`crate::layers::ops::w4a16_gemm_n128_m128`].
@@ -40,6 +102,22 @@ impl Qwen3AttentionLayer {
                     _ => 0, // auto (prefer v2)
                 },
             );
+        {
+            use crate::layers::PrefillProjectionPipeRoute as Route;
+            match crate::layers::prefill_fp8_w8_route(
+                crate::layers::prefill_fp8_w8_enabled(), m, n, k, self.w4a16_gemm_t_w8_k.0 != 0,
+            ) {
+                Route::Complete => {
+                    static SEEN: std::sync::Once = std::sync::Once::new();
+                    SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_PREFILL_FP8_W8: attention w4a16_t M={m} N={n} K={k}"));
+                    return crate::layers::ops::w4a16_gemm_t_w8(
+                        gpu, self.w4a16_gemm_t_w8_k, input, weight, output, m, n, k, stream,
+                    );
+                }
+                Route::Missing => anyhow::bail!("ATLAS_PREFILL_FP8_W8=1 requires w4a16_gemm_t_m128n128_w8 (attention)"),
+                Route::Disabled | Route::Ineligible => {}
+            }
+        }
         if v == 3 && self.w4a16_gemm_t_m128_v3_k.0 != 0 {
             crate::layers::ops::w4a16_gemm_n128_m128_v3(
                 gpu,

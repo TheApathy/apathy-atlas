@@ -260,16 +260,10 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4) = weight_opt.and_then(|w| w.as_nvfp4()) {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed,
-                nvfp4,
-                out,
-                n,
-                out_dim,
-                h,
-                stream,
+            // Exact original-layout route (baseline / pipe / pipe_m128n128 are
+            // bit-identical; selected by ATLAS_PREFILL_PROJ_PIPE[_M128]).
+            self.exact_prefill_projection(
+                ctx.gpu, label, normed, nvfp4, out, n, out_dim, h, stream,
             )
             .map_err(|e| {
                 anyhow::anyhow!("{label} w4a16_gemm failed: m={n} n={out_dim} k={h}: {e}")

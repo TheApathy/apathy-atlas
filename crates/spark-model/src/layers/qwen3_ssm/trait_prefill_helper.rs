@@ -394,6 +394,36 @@ impl Qwen3SsmLayer {
         Ok(())
     }
 
+    /// QKVZ large-M projection: the 8-warp shadow when requested/eligible,
+    /// else the parent `w4a16_gemm_t_m128`. Bit-identical either way.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn qkvz_prefill_m128_dispatch(
+        &self,
+        ctx: &ForwardContext,
+        normed: DevicePtr,
+        nvfp4_t: &crate::weight_map::QuantizedWeight,
+        proj_dst: DevicePtr,
+        k: u32,
+        n: u32,
+        h: u32,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::layers::PrefillProjectionPipeRoute as Route;
+        match crate::layers::prefill_fp8_w8_route(
+            crate::layers::prefill_fp8_w8_enabled(), k, n, h, self.w4a16_gemm_t_w8_k.0 != 0,
+        ) {
+            Route::Complete => {
+                static SEEN: std::sync::Once = std::sync::Once::new();
+                SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_PREFILL_FP8_W8: ssm_qkvz M={k} N={n} K={h}"));
+                ops::w4a16_gemm_t_w8(ctx.gpu, self.w4a16_gemm_t_w8_k, normed, nvfp4_t, proj_dst, k, n, h, stream)
+            }
+            Route::Missing => anyhow::bail!("ATLAS_PREFILL_FP8_W8=1 requires w4a16_gemm_t_m128n128_w8 (ssm_qkvz)"),
+            Route::Disabled | Route::Ineligible => ops::w4a16_gemm_n128_m128(
+                ctx.gpu, self.w4a16_gemm_t_m128_k, normed, nvfp4_t, proj_dst, k, n, h, stream,
+            ),
+        }
+    }
+
     pub(super) fn prefill_out_proj_dispatch(
         &self,
         ctx: &ForwardContext,
@@ -417,6 +447,19 @@ impl Qwen3SsmLayer {
                 stream,
             )
         } else if let Some(fp8) = self.out_proj_fp8 {
+            use crate::layers::PrefillProjectionPipeRoute as Route;
+            match crate::layers::prefill_fp8_w8_route(
+                crate::layers::prefill_fp8_w8_enabled(), k, h as u32, value_dim as u32, self.fp8_gemm_t_w8_k.0 != 0,
+            ) {
+                Route::Complete => {
+                    static SEEN: std::sync::Once = std::sync::Once::new();
+                    SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_PREFILL_FP8_W8: ssm_out M={k}"));
+                    return ops::fp8_gemm_t_w8(ctx.gpu, self.fp8_gemm_t_w8_k, normed_out_buf, fp8, out_proj_buf, k, h as u32, value_dim as u32, stream)
+                        .map_err(|e| anyhow::anyhow!("ssm prefill: out_proj w8 GEMM failed: {e}"));
+                }
+                Route::Missing => anyhow::bail!("ATLAS_PREFILL_FP8_W8=1 requires fp8_gemm_t_m128n128_w8 (ssm_out)"),
+                Route::Disabled | Route::Ineligible => {}
+            }
             if k > 128 {
                 ops::fp8_gemm_n128_m128(
                     ctx.gpu,
@@ -443,6 +486,26 @@ impl Qwen3SsmLayer {
                 )
             }
         } else if let Some(ref nvfp4_t) = self.out_proj_nvfp4_t {
+            // ATLAS_SSM_OUT_PREFILL_M128=1: w4a16_gemm_t_m128 is the same dequant
+            // (FP4 -> e4m3) and the same m16n8k32 e4m3 MMA K-order per output
+            // element as w4a16_gemm_t; it only halves weight re-reads (2 M chunks
+            // per CTA). Bit-identical output, measured in bench/gemm_test.
+            if k > 128 && crate::layers::ssm_out_prefill_m128_enabled() {
+                static SEEN: std::sync::Once = std::sync::Once::new();
+                SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_SSM_OUT_PREFILL_M128: ssm_out M={k}"));
+                return ops::w4a16_gemm_n128_m128(
+                    ctx.gpu,
+                    self.w4a16_gemm_t_m128_k,
+                    normed_out_buf,
+                    nvfp4_t,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )
+                .map_err(|e| anyhow::anyhow!("ssm prefill: out_proj m128 GEMM failed: {e}"));
+            }
             ops::w4a16_gemm_n128(
                 ctx.gpu,
                 self.w4a16_gemm_t_k,

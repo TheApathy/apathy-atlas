@@ -250,6 +250,8 @@ impl Qwen3SsmLayer {
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128n128_w8"),
+            fp8_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128n128_w8"),
             // Optional small-M variant (qwen3.6-27b only). Use try_kernel so
             // generic builds without the kernel still link cleanly.
             w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
@@ -289,6 +291,11 @@ impl Qwen3SsmLayer {
                 gpu,
                 "gated_delta_rule_wy32_gatecache",
                 "gated_delta_rule_prefill_wy32_gatecache",
+            ),
+            gdn_prefill_wy32_gatecache_v2_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy32_gatecache_v2",
+                "gated_delta_rule_prefill_wy32_gatecache_v2",
             ),
             // ── Q12 Phase 2b: batched GDN kernel handles ──
             gdn_prefill_wy32_batched_k: super::super::try_kernel(
