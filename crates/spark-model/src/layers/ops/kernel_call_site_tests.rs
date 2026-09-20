@@ -111,16 +111,42 @@ fn every_kernel_has_a_non_test_call_site_or_a_declared_reason() {
 
     let mut unwired = Vec::new();
     for kernel in &kernels {
-        let declaring = format!("{}", kernel);
+        let declaring = format!("pub struct {kernel}");
+        // Some modules expose the kernel through a free `pub fn` launcher
+        // instead of an inherent method, so the caller never names the type.
+        // That IS a call site -- but only when the launcher really reaches the
+        // kernel, i.e. the declaring module uses the type outside its tests.
+        let mut launchers: Vec<String> = Vec::new();
+        for (name, source) in &files {
+            if !source.contains(&declaring) {
+                continue;
+            }
+            let non_test = source.split("#[cfg(test)]").next().unwrap_or("");
+            if !non_test.contains(&format!("{kernel}::")) {
+                continue;
+            }
+            let stem = name.trim_end_matches(".rs");
+            for line in non_test.lines() {
+                if let Some(rest) = line.strip_prefix("pub fn ") {
+                    let ident: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    launchers.push(format!("{stem}::{ident}("));
+                }
+            }
+        }
         let has_caller = files.iter().any(|(name, source)| {
             if name.contains("_tests") {
                 return false;
             }
             // Its own module declares it; that is not a call site.
-            if source.contains(&format!("pub struct {declaring}")) {
+            if source.contains(&declaring) {
                 return false;
             }
-            source.contains(&format!("{kernel}::")) || source.contains(&format!("{kernel} "))
+            source.contains(&format!("{kernel}::"))
+                || source.contains(&format!("{kernel} "))
+                || launchers.iter().any(|call| source.contains(call))
         });
         if !has_caller {
             unwired.push(kernel.clone());

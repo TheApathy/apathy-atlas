@@ -236,6 +236,12 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../kernels/gb10/glm5.3-flash/iq3/glm53_kda_rr_columns.cu"
     ));
+    /// The exl3 overlay `#include`s the iq3 file above and adds the prefetch
+    /// and narrow-column variants.
+    const RR_COLUMNS_EXL3_CUDA_SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../kernels/gb10/glm5.3-flash/exl3/glm53_kda_rr_columns.cu"
+    ));
 
     fn original_tree(mut values: [f32; 128]) -> f32 {
         let mut stride = 64;
@@ -330,21 +336,54 @@ mod tests {
 
     #[test]
     fn register_resident_c8_is_default_on_with_exact_rollback() {
+        // `ATLAS_GLM53_KDA_RR_COLUMNS` is the register-resident selector: it is
+        // default ON, "0" is the exact rollback to the non-register-resident
+        // kernel, and "1"/"4"/"2" choose the columns-per-warp group. Anything
+        // else is still a hard error -- in particular "8", which looks like it
+        // ought to name the default group but never has.
         assert!(parse_rr_c8_enabled(None).unwrap());
         assert!(parse_rr_c8_enabled(Some("1")).unwrap());
+        assert!(parse_rr_c8_enabled(Some("4")).unwrap());
+        assert!(parse_rr_c8_enabled(Some("2")).unwrap());
         assert!(!parse_rr_c8_enabled(Some("0")).unwrap());
-        for invalid in ["", "2", "4", "8", "01", " 1", "1 "] {
+        for invalid in ["", "3", "8", "16", "01", "04", " 1", "1 ", "true"] {
             assert!(
                 parse_rr_c8_enabled(Some(invalid)).is_err(),
                 "accepted {invalid:?}"
             );
         }
+
+        // Default (absent, or the historical "1") is still the 8-column kernel,
+        // and the rollback value never selects a narrow variant.
+        assert_eq!(rr_columns(None), (8, "atlas_glm53_kda_prefill_rr_c8"));
+        assert_eq!(rr_columns(Some("1")), (8, "atlas_glm53_kda_prefill_rr_c8"));
+        assert_eq!(rr_columns(Some("0")), (8, "atlas_glm53_kda_prefill_rr_c8"));
+        assert_eq!(rr_columns(Some("4")), (4, "atlas_glm53_kda_prefill_rr_c4"));
+        assert_eq!(rr_columns(Some("2")), (2, "atlas_glm53_kda_prefill_rr_c2"));
+
+        // The base file still carries only the 8-column kernel; the narrow
+        // groups and the ATLAS_GLM53_KDA_RR_PREFETCH=1|2 variants live in the
+        // exl3 overlay, which includes it.
         assert!(RR_COLUMNS_CUDA_SOURCE.contains("atlas_glm53_kda_prefill_rr_c8"));
         assert!(!RR_COLUMNS_CUDA_SOURCE.contains("prefill_rr_c2"));
         assert!(!RR_COLUMNS_CUDA_SOURCE.contains("prefill_rr_c4"));
+        assert!(RR_COLUMNS_EXL3_CUDA_SOURCE.contains("iq3/glm53_kda_rr_columns.cu"));
+        assert!(RR_COLUMNS_EXL3_CUDA_SOURCE.contains("atlas_glm53_kda_prefill_rr_c4"));
+        assert!(RR_COLUMNS_EXL3_CUDA_SOURCE.contains("atlas_glm53_kda_prefill_rr_c2"));
+        assert!(RR_COLUMNS_EXL3_CUDA_SOURCE.contains("atlas_glm53_kda_prefill_rr_c8_pf"));
+        assert!(RR_COLUMNS_EXL3_CUDA_SOURCE.contains("atlas_glm53_kda_prefill_rr_c8_pf2"));
         assert_eq!(HEAD_DIM % (4 * 8), 0);
+        assert_eq!(HEAD_DIM % (4 * 4), 0);
+        assert_eq!(HEAD_DIM % (4 * 2), 0);
         assert!(RR_COLUMNS_CUDA_SOURCE.contains("first_column"));
         assert!(RR_COLUMNS_CUDA_SOURCE.contains("__shfl_down_sync"));
+
+        // Prefetch is a separate, default-off lever: with it absent the symbol
+        // is whatever the columns selector chose.
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/layers/ops/glm53_kda_prefill.rs"));
+        assert!(source.contains("Ok(\"1\") => \"atlas_glm53_kda_prefill_rr_c8_pf\","));
+        assert!(source.contains("Ok(\"2\") => \"atlas_glm53_kda_prefill_rr_c8_pf2\","));
+        assert!(source.contains("_ => columns_symbol,"));
     }
 
     #[test]
