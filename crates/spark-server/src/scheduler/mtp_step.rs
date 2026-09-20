@@ -4,6 +4,14 @@
 
 use super::*;
 
+#[path = "mtp_verify_route.rs"]
+mod mtp_verify_route;
+use mtp_verify_route::uses_dflash_gamma;
+
+#[cfg(test)]
+#[path = "mtp_bootstrap_route_tests.rs"]
+mod mtp_bootstrap_route_tests;
+
 /// MTP-aware step: bootstrap sequences without drafts, then verify via CUDA graph.
 /// Supports K=2 (num_drafts=1) and K=3 (num_drafts=2).
 ///
@@ -19,7 +27,21 @@ pub fn step_mtp(
     num_drafts: usize,
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
+    adaptive_sampling: bool,
+    code_fence_token: Option<u32>,
 ) {
+    if model.requires_verify_policy() {
+        super::glm53_policy_driver::step(
+            model,
+            active,
+            num_drafts,
+            verify_ctx,
+            dflash_verify_raw_argmax,
+            adaptive_sampling,
+            code_fence_token,
+        );
+        return;
+    }
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
     for (i, a) in active.iter().enumerate() {
@@ -72,7 +94,19 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
-                    if eff >= 3 && init.len() >= 3 {
+                    // The trained GLM DFlash2 block returns seven drafts.
+                    // Bootstrap must not silently verify only three of them
+                    // through K4 while later blocks use the gamma transaction.
+                    if uses_dflash_gamma(init.len()) {
+                        step_verify_dflash(
+                            model,
+                            a,
+                            &init,
+                            num_drafts,
+                            verify_ctx,
+                            dflash_verify_raw_argmax,
+                        );
+                    } else if eff >= 3 && init.len() >= 3 {
                         step_verify_k4(
                             model,
                             a,
@@ -305,7 +339,7 @@ pub fn step_mtp(
         // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
         // MTP keeps using the existing graphed paths; this dispatch is purely
         // additive.
-        if drafts.len() >= 4 {
+        if uses_dflash_gamma(drafts.len()) {
             step_verify_dflash(
                 model,
                 a,

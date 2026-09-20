@@ -32,7 +32,7 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use atlas_core::registry::{AtlasRegistry, RawCudaFunc, cuda_error_text};
 use cudarc::driver::LaunchConfig;
 
@@ -191,6 +191,53 @@ impl GpuBackend for AtlasCudaBackend {
                 .launch_on_stream(raw_func, cfg, stream, params)
                 .map_err(|e| anyhow::anyhow!("Kernel launch failed: {e}"))
         }
+    }
+
+    #[cfg(not(atlas_scale))]
+    fn launch_cooperative(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        let status = unsafe {
+            super::cuLaunchCooperativeKernel(
+                func.0 as *mut c_void,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_mem,
+                stream,
+                params.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            bail!(
+                "cuLaunchCooperativeKernel failed: {}",
+                cuda_error_text(status)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(atlas_scale))]
+    fn set_kernel_max_dynamic_shared_memory(&self, func: KernelHandle, bytes: u32) -> Result<()> {
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8.
+        let value = i32::try_from(bytes).context("dynamic shared-memory size exceeds i32")?;
+        let status = unsafe { super::cuFuncSetAttribute(func.0 as *mut c_void, 8, value) };
+        if status != 0 {
+            bail!(
+                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) failed: {}",
+                cuda_error_text(status)
+            );
+        }
+        Ok(())
     }
 
     fn stream_is_capturing(&self, stream: u64) -> bool {

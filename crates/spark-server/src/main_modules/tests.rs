@@ -250,7 +250,7 @@ fn test_cli_default_kv_high_precision_layers() {
 
 fn target_store_error_reexport_contract(source: &str) -> bool {
     const REEXPORT: &str = "pub(super) use target_store::{LoadedTargetStore, TargetStoreLoadError, TargetStoreLoadPlan};";
-    const SOURCE_SHA256: &str = "428e815dc95d28582dd45572e10aa485fa91dd0e16ecef7417005802c5ac66ae";
+    const SOURCE_SHA256: &str = "e70092ca6b06e4a90e532f46fb10c7d97442b2b9ea16e57c2c75249f54c4d290";
     target_store_test_sha256::hex(target_store_test_sha256::digest(source.as_bytes()))
         == SOURCE_SHA256
         && source.matches(REEXPORT).count() == 1

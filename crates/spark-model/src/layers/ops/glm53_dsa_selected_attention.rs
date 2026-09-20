@@ -9,16 +9,16 @@
 //! applies `256^-0.5`, casts FP32 softmax probabilities to BF16, and emits the
 //! BF16 weighted rank-512 latent consumed by the per-head `v_b` bank.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::GgmlIqBuffer;
+use super::{GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer};
 
 const HEADS: u32 = 64;
 const LATENT: u32 = 512;
 const SELECTED: u32 = 2_051;
-const MAX_QUERIES: u32 = 8;
+const MAX_QUERIES: u32 = GLM53_EXL3_MAX_WIDE_ROWS as u32;
 const MAX_POSITIONS: u32 = 1_048_576;
 const THREADS: u32 = 256;
 const MAX_GRID_YZ: u64 = 65_535;
@@ -61,7 +61,7 @@ impl Glm53DsaSelectedAttentionPlan {
         storage: Glm53DsaSelectedStorage,
     ) -> Result<Self> {
         if batch == 0 || !(1..=MAX_QUERIES).contains(&queries) {
-            bail!("GLM DSA selected attention requires batch>0 and Q in 1..=8");
+            bail!("GLM DSA selected attention requires batch>0 and Q in 1..={MAX_QUERIES}");
         }
         if !(1..=MAX_POSITIONS).contains(&kv_capacity)
             || heads != HEADS
@@ -148,8 +148,16 @@ pub struct Glm53DsaSelectedAttentionBuffers {
     pub output_weighted_latent_bf16: GgmlIqBuffer,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Glm53DsaHeadTransposeBuffers {
+    pub input_bf16: GgmlIqBuffer,
+    pub output_bf16: GgmlIqBuffer,
+}
+
 pub struct Glm53DsaSelectedAttentionKernel {
     attention: KernelHandle,
+    dense_causal: KernelHandle,
+    transpose_heads: KernelHandle,
 }
 
 impl Glm53DsaSelectedAttentionKernel {
@@ -159,7 +167,60 @@ impl Glm53DsaSelectedAttentionKernel {
                 "glm53_dsa_selected_attention",
                 "atlas_glm53_dsa_selected_attention_bf16",
             )?,
+            dense_causal: gpu.kernel(
+                "glm53_dsa_selected_attention",
+                "atlas_glm53_dsa_dense_causal_bf16",
+            )?,
+            transpose_heads: gpu.kernel(
+                "glm53_dsa_selected_attention",
+                "atlas_glm53_dsa_transpose_heads_bf16",
+            )?,
         })
+    }
+
+    /// Dense causal rank-512 attention for the selector's proven full-coverage
+    /// prefix. The caller retains responsibility for admitting only the
+    /// layer-major `sequence_length <= SELECTED` region.
+    pub fn launch_dense_causal(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53DsaSelectedAttentionPlan,
+        buffers: Glm53DsaSelectedAttentionBuffers,
+        query_offset: u32,
+        sequence_length: u32,
+        stream: u64,
+    ) -> Result<()> {
+        plan.validate()?;
+        validate_buffers(plan, buffers)?;
+        ensure!(
+            plan.batch == 1
+                && plan.queries > 1
+                && sequence_length <= SELECTED
+                && query_offset
+                    .checked_add(plan.queries)
+                    .is_some_and(|end| end == sequence_length),
+            "GLM DSA dense causal attention requires B1, Q>1 and an exact <=2051 prefix"
+        );
+        KernelLaunch::new(gpu, self.dense_causal)
+            .grid([HEADS, plan.queries.div_ceil(32), 1])
+            .block([THREADS, 1, 1])
+            .shared_mem(101_120)
+            .arg_ptr(buffers.absorbed_query_bf16.ptr)
+            .arg_ptr(buffers.latent_cache_bf16.ptr)
+            .arg_ptr(buffers.latent_cache_bf16.ptr)
+            .arg_ptr(buffers.output_weighted_latent_bf16.ptr)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_u32(plan.queries)
+            .arg_u32(sequence_length)
+            .arg_u32(query_offset)
+            .arg_u32(HEADS)
+            .arg_u32(1)
+            .arg_u32(LATENT)
+            .arg_u32(1)
+            .arg_u32(0)
+            .arg_u32(1)
+            .arg_f32(0.0625)
+            .launch(stream)
     }
 
     pub fn launch(
@@ -184,6 +245,48 @@ impl Glm53DsaSelectedAttentionKernel {
             .arg_u32(plan.batch)
             .arg_u32(plan.queries)
             .arg_u32(plan.kv_capacity)
+            .launch(stream)
+    }
+
+    pub fn transpose_heads(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        width: u32,
+        to_head_major: bool,
+        buffers: Glm53DsaHeadTransposeBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        if !(1..=u32::try_from(GLM53_EXL3_MAX_WIDE_ROWS)?).contains(&rows)
+            || !matches!(width, 256 | 512)
+        {
+            bail!(
+                "GLM DSA head transpose requires rows 1..={GLM53_EXL3_MAX_WIDE_ROWS} and width 256 or 512"
+            );
+        }
+        let bytes = usize::try_from(rows)?
+            .checked_mul(HEADS as usize * width as usize * 2)
+            .context("GLM DSA head transpose extent overflow")?;
+        for (name, buffer) in [
+            ("head transpose input", buffers.input_bf16),
+            ("head transpose output", buffers.output_bf16),
+        ] {
+            if buffer.ptr == DevicePtr::NULL || buffer.bytes != bytes {
+                bail!("GLM DSA {name} buffer is null or has the wrong extent");
+            }
+        }
+        if buffers.input_bf16.ptr == buffers.output_bf16.ptr {
+            bail!("GLM DSA head transpose cannot run in place");
+        }
+        let elements = u32::try_from(bytes / 2)?;
+        KernelLaunch::new(gpu, self.transpose_heads)
+            .grid([elements.div_ceil(THREADS), 1, 1])
+            .block([THREADS, 1, 1])
+            .arg_ptr(buffers.input_bf16.ptr)
+            .arg_ptr(buffers.output_bf16.ptr)
+            .arg_u32(rows)
+            .arg_u32(width)
+            .arg_u32(u32::from(to_head_major))
             .launch(stream)
     }
 }

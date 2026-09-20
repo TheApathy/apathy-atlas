@@ -23,12 +23,13 @@ fn runtime_allocation_is_the_arena_plus_scratch_plus_logits() {
         total,
         GLM53_KNOWN_ARENA_BYTES + Glm53WalkScratch::required_bytes() + 154_880 * 2 + 4
     );
-    // Weights plus runtime must still clear a 119 GiB box with headroom.
+    // Weights plus the explicit max-M2048 prompt scratch must still clear a
+    // 119 GiB box with at least five GiB of headroom.
     let weights = crate::model::glm53::arena::GLM53_IQ2_XXS_TENSOR_BYTES;
     let resident = weights + total;
     assert!(
-        resident < 110 * (1u64 << 30),
-        "IQ2_XXS resident total {resident} exceeds 110 GiB"
+        resident < 114 * (1u64 << 30),
+        "IQ2_XXS resident total {resident} leaves less than five GiB on a 119 GiB box"
     );
 }
 
@@ -254,14 +255,21 @@ fn the_sequence_reset_spans_cover_everything_except_the_load_time_mhc_block() {
 
         // The precondition reset_sequence enforces.
         assert!(carried_end <= mhc.offset_bytes, "{positions}");
-        assert_eq!(mhc.offset_bytes + mhc.allocation_bytes, after, "{positions}");
+        assert_eq!(
+            mhc.offset_bytes + mhc.allocation_bytes,
+            after,
+            "{positions}"
+        );
         assert!(after < plan.known_bytes, "{positions}");
 
         // Coverage: the ONLY unzeroed bytes are mhc's and the alignment padding
         // ahead of it.
         let zeroed = carried_end + (plan.known_bytes - after);
         let skipped = plan.known_bytes - zeroed;
-        assert_eq!(skipped, mhc.offset_bytes - carried_end + mhc.allocation_bytes);
+        assert_eq!(
+            skipped,
+            mhc.offset_bytes - carried_end + mhc.allocation_bytes
+        );
         assert!(
             skipped < mhc.allocation_bytes + 256,
             "{positions}: {skipped} bytes skipped for a {} byte mhc block, so \
@@ -270,8 +278,14 @@ fn the_sequence_reset_spans_cover_everything_except_the_load_time_mhc_block() {
         );
 
         // Every carried region the walk binds lives inside the first span.
-        assert!(plan.context.dsa_latent.offset_bytes < carried_end, "{positions}");
-        assert!(plan.context.kda_conv_f32.offset_bytes < carried_end, "{positions}");
+        assert!(
+            plan.context.dsa_latent.offset_bytes < carried_end,
+            "{positions}"
+        );
+        assert!(
+            plan.context.kda_conv_f32.offset_bytes < carried_end,
+            "{positions}"
+        );
     }
 }
 
@@ -331,7 +345,11 @@ fn no_two_per_layer_state_bindings_overlap() {
             ("persistent", conv.persistent_state_f32),
             ("staged", conv.staged_state_f32),
         ] {
-            spans.push((format!("kda{ordinal}.{name}"), b.ptr.0, b.ptr.0 + b.bytes as u64));
+            spans.push((
+                format!("kda{ordinal}.{name}"),
+                b.ptr.0,
+                b.ptr.0 + b.bytes as u64,
+            ));
         }
     }
     for (ordinal, dsa) in dsa_cache.iter().enumerate() {
@@ -344,7 +362,11 @@ fn no_two_per_layer_state_bindings_overlap() {
             ("out_tail_validity", dsa.out_tail_validity_u8),
             ("prior_tail_validity", dsa.prior_tail_validity_u8),
         ] {
-            spans.push((format!("dsa{ordinal}.{name}"), b.ptr.0, b.ptr.0 + b.bytes as u64));
+            spans.push((
+                format!("dsa{ordinal}.{name}"),
+                b.ptr.0,
+                b.ptr.0 + b.bytes as u64,
+            ));
         }
     }
     assert!(!kda_states.is_empty());
@@ -379,7 +401,10 @@ fn a_second_concurrent_sequence_is_refused_and_the_slot_is_reusable() {
     let live = std::sync::atomic::AtomicUsize::new(0);
     let held = || live.load(std::sync::atomic::Ordering::Acquire);
 
-    assert!(claim_only_sequence_slot(&live).is_ok(), "the first sequence must be admitted");
+    assert!(
+        claim_only_sequence_slot(&live).is_ok(),
+        "the first sequence must be admitted"
+    );
     let refusal = claim_only_sequence_slot(&live).unwrap_err().to_string();
     assert!(refusal.contains("ONE sequence at a time"), "{refusal}");
     assert!(refusal.contains("batch 1"), "{refusal}");
@@ -389,7 +414,10 @@ fn a_second_concurrent_sequence_is_refused_and_the_slot_is_reusable() {
 
     release_only_sequence_slot(&live);
     assert_eq!(held(), 0);
-    assert!(claim_only_sequence_slot(&live).is_ok(), "the slot must be reusable");
+    assert!(
+        claim_only_sequence_slot(&live).is_ok(),
+        "the slot must be reusable"
+    );
 
     release_only_sequence_slot(&live);
     // Release at zero SATURATES rather than wrapping to usize::MAX, which would

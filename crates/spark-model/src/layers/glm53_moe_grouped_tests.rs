@@ -13,8 +13,18 @@ fn buf(bytes: usize) -> GgmlIqBuffer {
 }
 
 fn bank(kind: GgmlType, inner: u32, columns: u32) -> Glm53GroupedBank {
-    let per = GgmlIqMmqPlan::new(kind, 1, columns, inner).unwrap().weight_bytes;
-    Glm53GroupedBank::new(buf(per * EXPERTS as usize), kind, inner, columns, EXPERTS, per).unwrap()
+    let per = GgmlIqMmqPlan::new(kind, 1, columns, inner)
+        .unwrap()
+        .weight_bytes;
+    Glm53GroupedBank::new(
+        buf(per * EXPERTS as usize),
+        kind,
+        inner,
+        columns,
+        EXPERTS,
+        per,
+    )
+    .unwrap()
 }
 
 /// The uniform-stride guard, PROVEN TO FIRE rather than merely present.
@@ -65,13 +75,19 @@ fn the_uniform_stride_guard_rejects_every_non_uniform_bank() {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("not densely packed"), "{total_bytes}: {error}");
+        assert!(
+            error.contains("not densely packed"),
+            "{total_bytes}: {error}"
+        );
     }
 
     // Degenerate geometry and a null base fail closed.
     assert!(
         Glm53GroupedBank::new(
-            GgmlIqBuffer { ptr: DevicePtr::NULL, bytes: total },
+            GgmlIqBuffer {
+                ptr: DevicePtr::NULL,
+                bytes: total
+            },
             kind,
             HIDDEN,
             EXPERT_INTERMEDIATE,
@@ -94,7 +110,10 @@ fn the_plan_groups_over_rows_and_slots_and_bounds_both() {
     let decode = Glm53GroupedMoePlan::new(bank, 1, TOP_K).unwrap();
     assert_eq!(decode.pairs, 8, "decode is one row by top_k");
     assert_eq!(decode.route_bytes, 8 * 4);
-    assert_eq!(decode.output_bytes, decode.tile.output_bytes * TOP_K as usize);
+    assert_eq!(
+        decode.output_bytes,
+        decode.tile.output_bytes * TOP_K as usize
+    );
 
     let verify = Glm53GroupedMoePlan::new(bank, 16, TOP_K).unwrap();
     assert_eq!(verify.pairs, 128, "16 rows by top_k, the speculative shape");
@@ -121,8 +140,19 @@ fn the_moe_gate_defaults_to_the_reference_and_rejects_anything_else() {
         Glm53MoePath::parse("serial-reference").unwrap(),
         Glm53MoePath::SerialReference
     );
-    assert_eq!(Glm53MoePath::parse("grouped").unwrap(), Glm53MoePath::Grouped);
-    for typo in ["", "Grouped", "group", "serial", "serial_reference", "1", "on"] {
+    assert_eq!(
+        Glm53MoePath::parse("grouped").unwrap(),
+        Glm53MoePath::Grouped
+    );
+    for typo in [
+        "",
+        "Grouped",
+        "group",
+        "serial",
+        "serial_reference",
+        "1",
+        "on",
+    ] {
         let error = Glm53MoePath::parse(typo).unwrap_err().to_string();
         assert!(error.contains(Glm53MoePath::ENV), "{typo}: {error}");
     }
@@ -178,27 +208,25 @@ fn per_pair_activations_are_expressible_and_shared_is_still_the_default() {
     assert_eq!(shared.activation_blocks, 1);
     assert_eq!(shared.activation_bytes, shared.tile.activation_bytes);
 
-    let down = Glm53GroupedMoePlan::with_activations(
-        bank,
-        1,
-        TOP_K,
-        Glm53GroupedActivations::PerPair,
-    )
-    .unwrap();
+    let down =
+        Glm53GroupedMoePlan::with_activations(bank, 1, TOP_K, Glm53GroupedActivations::PerPair)
+            .unwrap();
     // One quantized block per pair, back to back, addressed in i32 words.
-    assert_eq!(down.activation_block_ints as usize * 4, down.tile.activation_bytes);
+    assert_eq!(
+        down.activation_block_ints as usize * 4,
+        down.tile.activation_bytes
+    );
     assert_eq!(down.activation_blocks, down.pairs);
-    assert_eq!(down.activation_bytes, down.tile.activation_bytes * down.pairs as usize);
+    assert_eq!(
+        down.activation_bytes,
+        down.tile.activation_bytes * down.pairs as usize
+    );
     assert_eq!(down.pairs, TOP_K);
 
     // Rows multiply pairs in both modes, so speculative verify strides too.
-    let verify = Glm53GroupedMoePlan::with_activations(
-        bank,
-        16,
-        TOP_K,
-        Glm53GroupedActivations::PerPair,
-    )
-    .unwrap();
+    let verify =
+        Glm53GroupedMoePlan::with_activations(bank, 16, TOP_K, Glm53GroupedActivations::PerPair)
+            .unwrap();
     assert_eq!(verify.pairs, 128);
     assert_eq!(verify.activation_blocks, 128);
     assert_eq!(verify.activation_bytes, verify.tile.activation_bytes * 128);
@@ -209,8 +237,14 @@ fn per_pair_activations_are_expressible_and_shared_is_still_the_default() {
     // At rows == 1 both forms give index 0 and neither can be wrong.
     let shared_batch = Glm53GroupedMoePlan::new(bank, 16, TOP_K).unwrap();
     assert_eq!(shared_batch.pairs, 128);
-    assert_eq!(shared_batch.activation_blocks, 16, "one block per row, not per pair");
-    assert_eq!(shared_batch.tile.rows, 1, "the tile is always one row per pair");
+    assert_eq!(
+        shared_batch.activation_blocks, 16,
+        "one block per row, not per pair"
+    );
+    assert_eq!(
+        shared_batch.tile.rows, 1,
+        "the tile is always one row per pair"
+    );
 }
 
 /// The quantize plan and the tile's per-pair addressing describe ONE buffer.
@@ -227,19 +261,32 @@ fn the_quantize_plan_and_the_per_pair_tile_describe_the_same_buffer() {
             .unwrap();
     let quantize = down.quantize_plan().unwrap();
 
-    assert_eq!(quantize.rows, down.activation_blocks, "quantize must cover every block");
-    assert_eq!(quantize.activation_bytes, down.activation_bytes);
+    // ONE ROW. A per-pair buffer is filled by `activation_blocks` separate
+    // launches of this plan, never by one multi-row quantize: the MMQ q8_1
+    // layout for rows > 1 is TILED, so row p is not at p * per_row_bytes.
+    // Equal extents are not equal layouts, and the size check that used to sit
+    // here passed while the data was scrambled.
+    assert_eq!(quantize.rows, 1, "the quantize plan must be a single row");
+    assert_eq!(quantize.activation_bytes, down.tile.activation_bytes);
     assert_eq!(quantize.inner_padded, down.tile.inner_padded);
-    // Exactly linear in rows, so pair p starts at p * stride and the stride is
-    // one whole quantized block.
-    assert_eq!(
-        quantize.activation_bytes,
-        down.tile.activation_bytes * down.pairs as usize
+    // Blocks are laid end to end because each is written by its own launch.
+    for block in 0..down.activation_blocks {
+        assert_eq!(
+            down.activation_block_offset(block).unwrap(),
+            block as u64 * down.tile.activation_bytes as u64
+        );
+    }
+    assert!(
+        down.activation_block_offset(down.activation_blocks)
+            .is_err()
     );
-    assert_eq!(down.activation_block_ints as usize * 4, down.tile.activation_bytes);
+    assert_eq!(
+        down.activation_block_ints as usize * 4,
+        down.tile.activation_bytes
+    );
 
-    // A shared plan quantizes one block per row and hands it to every slot.
+    // A shared plan holds one block per row and hands it to every slot.
     let shared = Glm53GroupedMoePlan::new(bank, 1, TOP_K).unwrap();
-    assert_eq!(shared.quantize_plan().unwrap().rows, shared.activation_blocks);
+    assert_eq!(shared.quantize_plan().unwrap().rows, 1);
     assert_eq!(shared.activation_blocks, 1);
 }

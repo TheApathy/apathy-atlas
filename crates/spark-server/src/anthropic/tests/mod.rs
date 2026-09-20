@@ -13,4 +13,6 @@
 // mod types_convert;
 
 mod ir_carry;
+mod ordered_vision;
+mod tool_choice_admission;
 mod translator_stream;

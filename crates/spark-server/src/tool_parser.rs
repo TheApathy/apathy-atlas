@@ -100,7 +100,11 @@ pub struct FunctionDefinition {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "request_admission::parameters",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub parameters: Option<serde_json::Value>,
 }
 
@@ -293,8 +297,10 @@ pub trait ToolCallParser: Send + Sync {
     /// - `None`        — this parser doesn't support constrained decoding
     ///                   (currently only `MistralNativeParser`).
     /// - `Some(Ok(g))` — compiled grammar; runtime applies it.
-    /// - `Some(Err(_))` — compile failed; runtime logs and skips
-    ///                    constraint (model can still emit unconstrained).
+    /// - `Some(Err(_))` — compile failed; runtime rejects the request before
+    ///                    sequence allocation rather than removing constraints.
+    /// A deliberate `None` opt-out is allowed only for optional/auto tools;
+    /// required or specifically selected tool requests fail closed.
     fn compile_tool_grammar(
         &self,
         _engine: &mut GrammarEngine,
@@ -356,6 +362,7 @@ impl std::fmt::Display for dyn ToolCallParser {
 /// Maps CLI `--tool-call-parser` string to a concrete parser.
 #[derive(Debug, Clone, Copy)]
 pub enum ToolCallFormat {
+    GlmXml,
     Hermes,
     Qwen3Coder,
     Qwen3Xml,
@@ -369,6 +376,7 @@ impl std::str::FromStr for ToolCallFormat {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "glm_xml" => Ok(Self::GlmXml),
             "hermes" => Ok(Self::Hermes),
             "qwen3_coder" => Ok(Self::Qwen3Coder),
             "qwen3_xml" => Ok(Self::Qwen3Xml),
@@ -377,7 +385,7 @@ impl std::str::FromStr for ToolCallFormat {
             "minimax_xml" => Ok(Self::MinimaxXml),
             "bare_json" => Ok(Self::BareJson),
             other => Err(format!(
-                "Unknown tool call parser '{other}'. Supported: hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, bare_json",
+                "Unknown tool call parser '{other}'. Supported: glm_xml, hermes, qwen3_coder, qwen3_xml, gemma4, mistral, minimax_xml, bare_json",
             )),
         }
     }
@@ -387,6 +395,7 @@ impl ToolCallFormat {
     /// Create a boxed parser implementation for this format.
     pub fn into_parser(self) -> Box<dyn ToolCallParser> {
         match self {
+            Self::GlmXml => Box::new(GlmXmlParser),
             Self::Hermes => Box::new(HermesParser),
             Self::Qwen3Coder => Box::new(Qwen3CoderParser),
             Self::Qwen3Xml => Box::new(Qwen3XmlParser),
@@ -413,6 +422,7 @@ impl ToolCallFormat {
     /// F66 (2026-04-29): canonical name used in CLI flags and logs.
     pub fn name(self) -> &'static str {
         match self {
+            Self::GlmXml => "glm_xml",
             Self::Hermes => "hermes",
             Self::Qwen3Coder => "qwen3_coder",
             Self::Qwen3Xml => "qwen3_xml",
@@ -430,11 +440,15 @@ impl ToolCallFormat {
 mod bare_json;
 mod fuzzy_match;
 mod gemma4;
+mod glm_xml;
+mod glm_xml_scan;
+mod glm_xml_stream;
 mod helpers_a;
 mod helpers_b;
 mod hermes;
 mod minimax_xml;
 mod mistral;
+pub(crate) mod native_publication;
 mod parse_dispatch;
 mod parse_single_a;
 mod parse_single_b;
@@ -443,6 +457,7 @@ mod pipeline;
 mod pipeline_helpers;
 mod qwen3_coder;
 mod qwen3_xml;
+pub(crate) mod request_admission;
 mod streaming;
 mod streaming_emit;
 mod streaming_impl;
@@ -451,6 +466,7 @@ pub(crate) mod validation;
 
 pub use bare_json::*;
 pub use gemma4::*;
+pub use glm_xml::GlmXmlParser;
 use helpers_a::*;
 use helpers_b::*;
 pub use hermes::*;

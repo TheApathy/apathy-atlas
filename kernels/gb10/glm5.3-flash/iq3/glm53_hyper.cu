@@ -110,25 +110,28 @@ atlas_glm53_hc_pre(
     }
     __syncthreads();
 
-    #pragma unroll
-    for (unsigned int output = 0; output < GLM53_MIX; ++output) {
+    // Eight warps evaluate the 24 mixing projections concurrently (three per
+    // warp). The former block-wide loop serialized all 24 dots and paid 24
+    // shared-memory reduction/barrier chains per token.
+    const unsigned int lane = tid & 31U;
+    const unsigned int warp = tid >> 5U;
+    for (unsigned int output = warp; output < GLM53_MIX; output += 8U) {
         const unsigned long long function_base =
             (unsigned long long) output * flat_size;
         float sum = 0.0f;
-        for (unsigned int index = tid; index < flat_size; index += GLM53_THREADS) {
+        for (unsigned int index = lane; index < flat_size; index += 32U) {
             sum = fmaf(
                 function[function_base + index],
                 streams[stream_base + index],
                 sum);
         }
-        reduction[tid] = sum;
-        __syncthreads();
-        const float dot = glm53_block_sum(reduction, tid);
-        if (tid == 0) {
-            mixed[output] = dot * inverse_rms;
-        }
-        __syncthreads();
+        #pragma unroll
+        for (unsigned int offset = 16U; offset > 0U; offset >>= 1U)
+            sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        if (lane == 0U)
+            mixed[output] = sum * inverse_rms;
     }
+    __syncthreads();
 
     if (tid == 0) {
         #pragma unroll

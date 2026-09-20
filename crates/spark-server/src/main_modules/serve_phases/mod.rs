@@ -6,6 +6,7 @@
 
 mod build;
 mod config;
+mod glm_dflash_prefix;
 mod kv_cache;
 mod preflight;
 mod runtime;
@@ -22,6 +23,7 @@ pub(super) use config::{
     apply_model_default_num_drafts, cap_vocab_size_to_tokenizer, load_model_config,
     merge_sidecar_quant_config, resolve_model_dir,
 };
+pub(super) use glm_dflash_prefix::resolve_glm_dflash_max_drafts;
 pub(super) use kv_cache::{
     KvCacheConfig, PrefillBudget, resolve_kv_cache_config, resolve_prefill_budget,
 };
@@ -38,4 +40,5 @@ pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
 pub(super) use weights::{
     auto_detect_weight_prefix, load_dflash_drafter, load_lora_adapters, load_weight_store,
+    resolve_dflash_drafter_dir,
 };

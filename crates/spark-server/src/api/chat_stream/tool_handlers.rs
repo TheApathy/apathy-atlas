@@ -73,26 +73,50 @@ pub(super) fn handle_complete_tool_call(
             token_ids: state.take_ids_if(ctx.req_return_token_ids),
         });
     }
-    tool_parser::backfill_required_params(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
-    if ctx.wants_typed_arguments {
-        tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
-    }
-    if let Some(ref cwd) = ctx.cwd_for_normalize {
-        tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
-    }
-    // Typed severity (was a fragile `contains("non-empty")` sniff): soft =
-    // MissingParam (2026-07-03 ST-collapse class) + EmptyRequired (2026-05-25
-    // disposition) pass through; Hard bails.
-    let validation = tool_parser::assess_tool_call(tc, &ctx.tool_defs_for_backfill).map_err(|i| {
-        (
-            matches!(
-                i,
-                tool_parser::ToolCallIssue::MissingParam(_)
-                    | tool_parser::ToolCallIssue::EmptyRequired(_)
-            ),
-            i.into_message(),
-        )
-    });
+    let validation = if ctx
+        .state
+        .tool_call_parser
+        .as_ref()
+        .is_some_and(|p| p.name() == "glm_xml")
+    {
+        // The grammar carries the request's exact allowed set (Specific may
+        // narrow it). Never recover that restriction from the all-tools list.
+        let validated = match &ctx.grammar_spec {
+            Some(crate::api::GrammarSpec::ToolCall { tools, parser, .. })
+                if parser.name() == "glm_xml" =>
+            {
+                tool_parser::native_publication::validate_call(tc, tools)
+            }
+            _ => Err("native GLM publication is missing its exact tool grammar binding".into()),
+        };
+        validated
+            .map(|validated| {
+                *tc = validated;
+            })
+            .map_err(|error| (false, error))
+    } else {
+        tool_parser::backfill_required_params(
+            std::slice::from_mut(tc),
+            &ctx.tool_defs_for_backfill,
+        );
+        if ctx.wants_typed_arguments {
+            tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+        }
+        if let Some(ref cwd) = ctx.cwd_for_normalize {
+            tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
+        }
+        // Preserve the legacy soft MissingParam/EmptyRequired disposition.
+        tool_parser::assess_tool_call(tc, &ctx.tool_defs_for_backfill).map_err(|i| {
+            (
+                matches!(
+                    i,
+                    tool_parser::ToolCallIssue::MissingParam(_)
+                        | tool_parser::ToolCallIssue::EmptyRequired(_)
+                ),
+                i.into_message(),
+            )
+        })
+    };
     let is_soft = validation.as_ref().err().is_some_and(|(soft, _)| *soft);
     if let Err((_, e)) = &validation
         && !is_soft

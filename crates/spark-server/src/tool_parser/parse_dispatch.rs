@@ -37,11 +37,7 @@ pub(super) fn contain_unterminated_call_tail(rest: &str) -> &str {
 pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
     // Strip <think>...</think> before parsing tool calls (matches vLLM behavior).
     // Tool calls inside thinking blocks are model deliberation, not real invocations.
-    let text = if let Some(think_end) = text.find("</think>") {
-        &text[think_end + 8..]
-    } else {
-        text
-    };
+    let text = glm_xml_scan::after_thinking(text);
     // MiniMax uses `<minimax:tool_call>` as the outer wrapper (different
     // tag from Qwen's `<tool_call>`). Normalize both wrappers to the
     // same outer form so the scanning loop below doesn't need
@@ -62,11 +58,7 @@ pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
         || text.contains("<minimax:_call>")
         || text.contains("</minimax:_call>")
     {
-        owned_normalized = text
-            .replace("<minimax:tool_call>", "<tool_call>")
-            .replace("</minimax:tool_call>", "</tool_call>")
-            .replace("<minimax:_call>", "<tool_call>")
-            .replace("</minimax:_call>", "</tool_call>");
+        owned_normalized = glm_xml_scan::normalize_minimax(text);
         owned_normalized.as_str()
     } else {
         text
@@ -75,43 +67,7 @@ pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
     let mut content_parts = Vec::new();
     let mut rest = text;
     let mut idx = 0u32;
-
-    // Returns the byte offset of the next `</tool_call>` close that is NOT
-    // inside a `<parameter=...>...</parameter>` block. Qwen3-Coder tool
-    // arguments may contain a literal `</tool_call>` substring inside a
-    // string-typed parameter value; the bare `find` would terminate the
-    // call body early and corrupt the parsed args. We scan with a
-    // parameter-depth counter and only accept a close at depth 0.
-    fn find_unescaped_tool_call_close(buf: &str) -> Option<usize> {
-        let bytes = buf.as_bytes();
-        let mut i = 0;
-        let mut depth: i32 = 0;
-        while i < bytes.len() {
-            // Look at a candidate position: try to match `</tool_call>`,
-            // `<parameter=`, or `</parameter>` starting at byte i.
-            if buf[i..].starts_with("</tool_call>") && depth == 0 {
-                return Some(i);
-            }
-            if buf[i..].starts_with("<parameter=") {
-                depth += 1;
-                i += "<parameter=".len();
-                continue;
-            }
-            if buf[i..].starts_with("</parameter>") {
-                if depth > 0 {
-                    depth -= 1;
-                }
-                i += "</parameter>".len();
-                continue;
-            }
-            // Advance one UTF-8 character. Fall back to one byte if the
-            // boundary isn't found (defensive — bytes here are ASCII for
-            // the markers, but parameter values can be UTF-8).
-            let step = buf[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            i += step;
-        }
-        None
-    }
+    let mut native_seen = false;
 
     loop {
         match rest.find("<tool_call>") {
@@ -121,7 +77,22 @@ pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
                     content_parts.push(before.to_string());
                 }
                 rest = &rest[start + 11..];
-                match find_unescaped_tool_call_close(rest) {
+                if glm_xml_scan::native_prefix(rest) {
+                    native_seen = true;
+                    if let Some(end) = glm_xml_scan::native_close(rest) {
+                        if let Some(call) = glm_xml::parse_body(&rest[..end]) {
+                            calls.push(call);
+                            idx += 1;
+                        } else {
+                            content_parts.push(format!("<tool_call>{}</tool_call>", &rest[..end]));
+                        }
+                        rest = &rest[end + glm_xml_scan::CLOSE.len()..];
+                        continue;
+                    }
+                    content_parts.push(format!("<tool_call>{rest}"));
+                    break; // Never salvage an unclosed native envelope.
+                }
+                match glm_xml_scan::legacy_close(rest) {
                     Some(end) => {
                         if let Some(tc) = parse_one_call(rest[..end].trim(), idx) {
                             calls.push(tc);
@@ -165,6 +136,12 @@ pub fn parse_tool_calls(text: &str) -> (Option<String>, Vec<ToolCall>) {
                 break;
             }
         }
+    }
+    if native_seen {
+        // Native values and malformed native envelopes are not input to any
+        // foreign-format salvage pass, even when zero valid calls were found.
+        let content = (!content_parts.is_empty()).then(|| content_parts.join("\n"));
+        return (content, calls);
     }
     // Fallback 00: Gemma-4 bare `fn_name{key:val,...}` at text start (no
     // wrapper). The gemma4.jinja tool-steering prefix injects

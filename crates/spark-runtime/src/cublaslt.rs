@@ -15,6 +15,11 @@ use std::sync::OnceLock;
 // re-exported so `spark_runtime::cublaslt::fp8_gemm_*` paths are unchanged.
 mod fp8;
 pub use fp8::{fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_rowwise};
+mod diagnostic;
+mod diagnostic_contract;
+pub use diagnostic::Bf16GemmReceipt;
+use diagnostic_contract::HeuristicResult;
+pub use diagnostic_contract::ReductionPolicy;
 
 #[allow(non_camel_case_types)]
 type cublasLtHandle_t = *mut c_void;
@@ -161,6 +166,70 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    bf16_gemm(act, weight, out, m, n, k, stream, true)
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[K,N]`, all BF16.
+pub fn bf16_gemm_act_weight(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    bf16_gemm(act, weight, out, m, n, k, stream, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bf16_gemm(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    weight_is_nk: bool,
+) -> Result<()> {
+    bf16_gemm_impl(act, weight, out, m, n, k, stream, weight_is_nk, None).map(|_| ())
+}
+
+/// Same projection core with explicit experimental reduction selection and a
+/// receipt for its actual heuristic. Caller owns buffers and completion, and
+/// must serialize use of the process-global workspace just as in production.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_diagnostic(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    policy: ReductionPolicy,
+) -> Result<Bf16GemmReceipt> {
+    anyhow::ensure!(
+        act != 0 && weight != 0 && out != 0 && m > 0 && n > 0 && k > 0,
+        "invalid diagnostic GEMM pointers/dimensions"
+    );
+    bf16_gemm_impl(act, weight, out, m, n, k, stream, true, Some(policy))?
+        .ok_or_else(|| anyhow::anyhow!("missing explicit GEMM receipt"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bf16_gemm_impl(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    weight_is_nk: bool,
+    policy: Option<ReductionPolicy>,
+) -> Result<Option<Bf16GemmReceipt>> {
     let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -168,7 +237,11 @@ pub fn bf16_gemm_act_weight_t(
             cublasLtMatmulDescCreate(&mut desc, CUBLAS_COMPUTE_32F, CUDA_R_32F),
             "DescCreate",
         )?;
-        let ta = CUBLAS_OP_T;
+        let ta = if weight_is_nk {
+            CUBLAS_OP_T
+        } else {
+            CUBLAS_OP_N
+        };
         let tb = CUBLAS_OP_N;
         chk(
             cublasLtMatmulDescSetAttribute(
@@ -194,8 +267,13 @@ pub fn bf16_gemm_act_weight_t(
         let mut la: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let (weight_rows, weight_cols, weight_ld) = if weight_is_nk {
+            (k as u64, n as u64, k as i64)
+        } else {
+            (n as u64, k as u64, n as i64)
+        };
         chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, weight_rows, weight_cols, weight_ld),
             "LayoutA",
         )?;
         chk(
@@ -218,54 +296,63 @@ pub fn bf16_gemm_act_weight_t(
             ),
             "PrefWorkspace",
         )?;
-        // cublasLtMatmulHeuristicResult_t = { algo[64B], workspaceSize, state,
-        // wavesCount, reserved[4] } ≈ 96B; algo at offset 0. 128B for margin.
-        let mut result = [0u8; 128];
-        let mut returned: i32 = 0;
-        chk(
-            cublasLtMatmulAlgoGetHeuristic(
+        // Always retain the original first-heuristic control. Only the explicit
+        // diagnostic API supplies a policy or asks for algorithm attributes.
+        let operation = (|| -> Result<Option<Bf16GemmReceipt>> {
+            if let Some(policy) = policy {
+                diagnostic::configure(pref, policy)?;
+            }
+            let mut result = HeuristicResult::default();
+            let mut returned: i32 = 0;
+            chk(
+                cublasLtMatmulAlgoGetHeuristic(
+                    ctx.handle,
+                    desc,
+                    la,
+                    lb,
+                    ld_,
+                    ld_,
+                    pref,
+                    1,
+                    (&mut result as *mut HeuristicResult).cast(),
+                    &mut returned,
+                ),
+                "AlgoGetHeuristic",
+            )?;
+            result
+                .admit(returned, ctx.ws_size)
+                .map_err(anyhow::Error::msg)?;
+            let receipt = policy
+                .map(|policy| diagnostic::receipt(&result, policy, [m, n, k], ctx.ws_size))
+                .transpose()?;
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+            let status = cublasLtMatmul(
                 ctx.handle,
                 desc,
+                &alpha as *const f32 as *const c_void,
+                weight as *const c_void,
                 la,
+                act as *const c_void,
                 lb,
+                &beta as *const f32 as *const c_void,
+                out as *const c_void,
                 ld_,
+                out as *mut c_void,
                 ld_,
-                pref,
-                1,
-                result.as_mut_ptr() as *mut c_void,
-                &mut returned,
-            ),
-            "AlgoGetHeuristic",
-        )?;
-        if returned < 1 {
-            bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
-        }
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-        let status = cublasLtMatmul(
-            ctx.handle,
-            desc,
-            &alpha as *const f32 as *const c_void,
-            weight as *const c_void,
-            la,
-            act as *const c_void,
-            lb,
-            &beta as *const f32 as *const c_void,
-            out as *const c_void,
-            ld_,
-            out as *mut c_void,
-            ld_,
-            result.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
-            ctx.ws_size,
-            stream as *mut c_void,
-        );
+                result.algo.as_ptr().cast(),
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            );
+            chk(status, "Matmul")?;
+            Ok(receipt)
+        })();
         cublasLtMatmulPreferenceDestroy(pref);
         cublasLtMatrixLayoutDestroy(la);
         cublasLtMatrixLayoutDestroy(lb);
         cublasLtMatrixLayoutDestroy(ld_);
         cublasLtMatmulDescDestroy(desc);
-        chk(status, "Matmul")?;
+        operation
     }
-    Ok(())
 }

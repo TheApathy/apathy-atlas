@@ -192,17 +192,21 @@ pub(super) async fn translate_chat_response_to_responses(
     // Conversation append: new user items + assistant reply.
     if let Some((conv_store, conv_id)) = conversation {
         let prior = conv_store.get(&conv_id).map(|s| s.items.len()).unwrap_or(0);
-        let mut batch: Vec<serde_json::Value> = input_messages
+        let mut batch: Vec<serde_json::Value> = match input_messages
             .iter()
             .skip(prior)
             .map(|m| {
-                serde_json::json!({
+                Ok(serde_json::json!({
                     "type": "message",
                     "role": m.role,
-                    "content": [{"type": "input_text", "text": m.content.text}],
-                })
+                    "content": m.content.responses_json()?,
+                }))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>() {
+                Ok(items) => items,
+                Err(error) => return openai_error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+            };
+
         let assistant_text = chat
             .choices
             .first()

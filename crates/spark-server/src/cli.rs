@@ -4,6 +4,8 @@
 
 use clap::Parser;
 
+#[cfg(test)]
+mod glm_dflash_prefix_tests;
 mod serve_args;
 mod validate;
 pub use serve_args::ServeArgs;

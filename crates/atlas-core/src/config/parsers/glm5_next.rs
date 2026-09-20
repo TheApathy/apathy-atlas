@@ -8,9 +8,10 @@ use serde_json::Value;
 use super::super::{
     Glm5NextConfig, Glm5NextIndexerType, Glm5NextMlpType, LayerType, ModelConfig, finalize_config,
 };
+use super::parse_vision_config;
 
 mod validation;
-use validation::{require_geometry, validate_fp8_config};
+use validation::{GlmQuantization, require_geometry, validate_quantization_config};
 
 fn required<'a>(raw: &'a Value, key: &str) -> Result<&'a Value> {
     raw.get(key)
@@ -88,7 +89,7 @@ fn parse_eos_ids(text: &Value) -> Result<Vec<u32>> {
 }
 
 pub(crate) fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
-    let has_fp8 = validate_fp8_config(raw)?;
+    let quantization = validate_quantization_config(raw)?;
     let text = required(raw, "text_config")?;
     if required_str(text, "model_type")? != "glm5_next_text" {
         bail!("glm5_next text_config.model_type must be glm5_next_text");
@@ -191,15 +192,45 @@ pub(crate) fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
         required_bool(text, "mhc")?,
     )?;
     config.glm5_next = Some(glm);
+    config.vision = parse_vision_config(raw);
+    if let Some(vision) = &config.vision {
+        let exact = vision.model_type == "glm5_next_vision"
+            && vision.depth == 24
+            && vision.hidden_size == 1024
+            && vision.num_heads == 16
+            && vision.patch_size == 14
+            && vision.temporal_patch_size == 2
+            && vision.spatial_merge_size == 2
+            && vision.intermediate_size == 4096
+            && vision.out_hidden_size == 4096
+            && vision.in_channels == 3
+            && vision.image_size == 448
+            && vision.projection_intermediate_size == 10240
+            && (vision.rms_norm_eps - 1e-5).abs() < f64::EPSILON
+            && vision.swiglu_limit == Some(10.0)
+            && vision.deepstack_visual_indexes.is_empty()
+            && vision.image_pad_token_id == 154854
+            && vision.video_pad_token_id == 154855;
+        if !exact {
+            bail!("unsupported glm5_next vision geometry");
+        }
+    }
     finalize_config(&mut config, raw)?;
-    if has_fp8 && config.quantization_config.is_none() {
-        bail!("glm5_next FP8 quantization metadata was not preserved");
+    if quantization != GlmQuantization::None && config.quantization_config.is_none() {
+        bail!("glm5_next quantization metadata was not preserved");
     }
     if let Some(quant) = &mut config.quantization_config {
-        if quant.quant_method != "fp8" {
+        let expected = match quantization {
+            GlmQuantization::None => {
+                bail!("glm5_next parsed quantization metadata without a validated source")
+            }
+            GlmQuantization::Fp8 => "fp8",
+            GlmQuantization::Exl3 => "exl3",
+        };
+        if quant.quant_method != expected {
             bail!(
-                "unsupported glm5_next quantization method {}",
-                quant.quant_method
+                "glm5_next quantization method changed during parsing: expected {expected}, got {}",
+                quant.quant_method,
             );
         }
         let aliases: Vec<_> = quant

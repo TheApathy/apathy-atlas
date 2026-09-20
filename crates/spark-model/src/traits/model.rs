@@ -390,6 +390,34 @@ pub trait Model: Send + Sync {
         stream: u64,
     ) -> Result<Vec<u32>>;
 
+    /// This model must choose request-policy tokens before persistent commit.
+    /// Schedulers must route all speculative widths (and ordinary replay)
+    /// through the policy-aware entry when this capability is true.
+    fn requires_verify_policy(&self) -> bool {
+        false
+    }
+
+    fn bind_verify_policy_request(
+        &self,
+        _tokens: &[u32],
+        _seq: &SequenceState,
+        _stream: u64,
+    ) -> Result<crate::model::glm53::verify_policy_binding::BoundVerifyRequest> {
+        anyhow::bail!("model does not support bound policy verification")
+    }
+
+    fn decode_verify_with_policy(
+        &self,
+        _request: crate::model::glm53::verify_policy_binding::BoundVerifyRequest,
+        _policy: &mut dyn crate::model::glm53::verify_policy_transaction::VerifyPolicy,
+    ) -> Result<crate::model::glm53::verify_policy_transaction::VerifyOutcome> {
+        anyhow::bail!("model does not support policy-before-commit verification")
+    }
+
+    /// Publication failure follows an irreversible device commit. The active
+    /// sequence must not be reused without a successful model reset.
+    fn poison_verify_policy(&self, _stream: u64) {}
+
     /// Checkpoint SSM states before speculative verification.
     fn checkpoint_ssm_states(&self, seq: &mut SequenceState) -> Result<()>;
 

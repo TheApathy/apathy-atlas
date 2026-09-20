@@ -12,8 +12,12 @@ use image::{DynamicImage, ImageFormat};
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
-const MEAN: [f32; 3] = [0.5, 0.5, 0.5];
-const STD: [f32; 3] = [0.5, 0.5, 0.5];
+const SIGLIP_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
+const SIGLIP_STD: [f32; 3] = [0.5, 0.5, 0.5];
+
+/// CLIP normalization shipped in GLM-5.3-Flash's pinned processor_config.json.
+const GLM53_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+const GLM53_STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
 
 /// Maximum allowed image dimension in pixels (longer side).
 const MAX_DIM: u32 = 1280;
@@ -49,6 +53,7 @@ fn target_size_with_max_pixels(
     orig_h: u32,
     orig_w: u32,
     grid_unit: u32,
+    min_pixels: Option<usize>,
     max_pixels: Option<usize>,
 ) -> (u32, u32) {
     let dim_scale = (MAX_DIM as f32) / (orig_h.max(orig_w) as f32);
@@ -56,7 +61,11 @@ fn target_size_with_max_pixels(
         .filter(|&p| p > 0)
         .map(|p| ((p as f32) / ((orig_h as f32) * (orig_w as f32))).sqrt())
         .unwrap_or(1.0);
-    let scale = dim_scale.min(pixel_scale).min(1.0); // never upscale
+    let min_scale = min_pixels
+        .filter(|&p| p > 0)
+        .map(|p| ((p as f32) / ((orig_h as f32) * (orig_w as f32))).sqrt())
+        .unwrap_or(0.0);
+    let scale = dim_scale.min(pixel_scale).max(min_scale);
     let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
     let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
     (target_h, target_w)
@@ -82,12 +91,21 @@ pub fn preprocess_image_with_max_pixels(
     vcfg: &VisionConfig,
     max_pixels: Option<usize>,
 ) -> Result<(Vec<f32>, usize, usize)> {
+    let (mean, std) = if vcfg.model_type == "glm5_next_vision" {
+        (GLM53_MEAN, GLM53_STD)
+    } else {
+        (SIGLIP_MEAN, SIGLIP_STD)
+    };
     let img = decode_image(data_uri)?;
     let img = img.to_rgb8();
     let (orig_w, orig_h) = (img.width(), img.height());
 
     let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
+    // The pinned GLM processor guarantees at least 16 post-merge image tokens.
+    // One token spans a 2x2 block of 14x14 patches, hence 16 * 28 * 28 pixels.
+    // Qwen retains Atlas's historical no-upscale behavior.
+    let min_pixels = (vcfg.model_type == "glm5_next_vision").then_some(16 * 28 * 28);
+    let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, min_pixels, max_pixels);
 
     // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
     // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
@@ -106,7 +124,18 @@ pub fn preprocess_image_with_max_pixels(
     // Layout: [P, C, T, Hp, Wp] → stored as [P, C*T*Hp*Wp] in row-major order.
     for ph in 0..grid_h {
         for pw in 0..grid_w {
-            let patch_idx = ph * grid_w + pw;
+            // GLM consumes every spatial 2x2 block as four consecutive rows:
+            // the post tower `view(-1, 2, 2, hidden)` feeds its stride-2
+            // downsample directly. Qwen's encoder performs an explicit spatial
+            // gather later and therefore keeps ordinary row-major patch order.
+            let patch_idx = if vcfg.model_type == "glm5_next_vision" {
+                let sms = vcfg.spatial_merge_size;
+                ((ph / sms) * (grid_w / sms) + (pw / sms)) * sms * sms
+                    + (ph % sms) * sms
+                    + (pw % sms)
+            } else {
+                ph * grid_w + pw
+            };
             for c in 0..3usize {
                 for t in 0..tp {
                     for py in 0..ps {
@@ -115,7 +144,7 @@ pub fn preprocess_image_with_max_pixels(
                             let pixel_x = pw * ps + px;
                             let raw =
                                 img.get_pixel(pixel_x as u32, pixel_y as u32)[c] as f32 / 255.0;
-                            let norm = (raw - MEAN[c]) / STD[c];
+                            let norm = (raw - mean[c]) / std[c];
                             // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
                             let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
                             pixels[patch_idx * patch_dim + off] = norm;
@@ -145,7 +174,7 @@ mod tests {
     #[test]
     fn test_target_size_no_upscale() {
         // Small image: grid_unit=32, no upscale needed.
-        let (h, w) = target_size_with_max_pixels(100, 150, 32, None);
+        let (h, w) = target_size_with_max_pixels(100, 150, 32, None, None);
         assert!(h <= 1280 && w <= 1280);
         assert_eq!(h % 32, 0);
         assert_eq!(w % 32, 0);
@@ -154,7 +183,7 @@ mod tests {
     #[test]
     fn test_target_size_downscale() {
         // Large image: should be downscaled.
-        let (h, w) = target_size_with_max_pixels(2000, 3000, 32, None);
+        let (h, w) = target_size_with_max_pixels(2000, 3000, 32, None, None);
         assert!(h.max(w) <= 1280);
         assert_eq!(h % 32, 0);
         assert_eq!(w % 32, 0);
@@ -162,8 +191,15 @@ mod tests {
 
     #[test]
     fn test_target_size_max_pixels() {
-        let (h, w) = target_size_with_max_pixels(1254, 1254, 32, Some(512 * 512));
+        let (h, w) = target_size_with_max_pixels(1254, 1254, 32, None, Some(512 * 512));
         assert_eq!((h, w), (512, 512));
+    }
+
+    #[test]
+    fn glm53_minimum_canvas_is_sixteen_merged_tokens() {
+        let (h, w) = target_size_with_max_pixels(20, 20, 28, Some(16 * 28 * 28), None);
+        assert_eq!((h, w), (112, 112));
+        assert_eq!((h / 14) * (w / 14) / 4, 16);
     }
 
     #[test]
@@ -191,5 +227,12 @@ mod tests {
     fn test_image_pad_count_non_divisible_floors() {
         // Integer division truncates: 65/2 = 32 (not 33).
         assert_eq!(image_pad_count(65, 64, 2), 32 * 32);
+    }
+
+    #[test]
+    fn glm53_uses_checkpoint_clip_normalization() {
+        assert_eq!(GLM53_MEAN, [0.481_454_66, 0.457_827_5, 0.408_210_73]);
+        assert_eq!(GLM53_STD, [0.268_629_55, 0.261_302_6, 0.275_777_1]);
+        assert_ne!(GLM53_MEAN, SIGLIP_MEAN);
     }
 }

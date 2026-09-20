@@ -21,6 +21,10 @@ use super::compact::openai_error_response;
 use super::inference_impl::{extract_thinking, strip_stop_sequences};
 use super::inference_types::{GrammarSpec, InferenceRequest};
 
+#[cfg(test)]
+#[path = "glm_tool_publication_blocking_tests.rs"]
+mod glm_tool_publication_blocking_tests;
+
 pub(super) struct BlockingPathArgs {
     pub state: Arc<AppState>,
     pub req: crate::ir::ChatRequest,
@@ -353,18 +357,30 @@ fn build_choice_message(
         tool_calls_i.extend(parsed_tool_calls);
         if !tool_calls_i.is_empty() {
             let tools_ref = req.tools.clone();
-            tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
-            if state
+            let validated = if state
                 .tool_call_parser
                 .as_ref()
-                .is_some_and(|p| p.wants_typed_arguments())
+                .is_some_and(|p| p.name() == "glm_xml")
             {
-                tool_parser::coerce_all(&mut tool_calls_i, &tools_ref);
-            }
-            if let Some(cwd) = cwd_hint {
-                tool_parser::normalize_paths(&mut tool_calls_i, cwd);
-            }
-            let validated = tool_parser::validate_tool_calls(tool_calls_i, &tools_ref);
+                tool_parser::native_publication::validate_calls(
+                    tool_calls_i,
+                    &tools_ref,
+                    req.tool_choice.as_ref(),
+                )
+            } else {
+                tool_parser::backfill_required_params(&mut tool_calls_i, &tools_ref);
+                if state
+                    .tool_call_parser
+                    .as_ref()
+                    .is_some_and(|p| p.wants_typed_arguments())
+                {
+                    tool_parser::coerce_all(&mut tool_calls_i, &tools_ref);
+                }
+                if let Some(cwd) = cwd_hint {
+                    tool_parser::normalize_paths(&mut tool_calls_i, cwd);
+                }
+                tool_parser::validate_tool_calls(tool_calls_i, &tools_ref)
+            };
             if !validated.errors.is_empty() {
                 for err in &validated.errors {
                     tracing::warn!("Tool call validation error: {err}");
@@ -395,6 +411,23 @@ fn build_choice_message(
                 c.trim().to_string()
             });
             msg_content = content;
+            if state
+                .tool_call_parser
+                .as_ref()
+                .is_some_and(|p| p.name() == "glm_xml")
+                && !validated.errors.is_empty()
+            {
+                // Match streaming's explicit rejection feedback. Never turn
+                // invalid native calls into an unexplained empty response.
+                let feedback = format!(
+                    "[atlas] Tool call rejected: {}",
+                    validated.errors.join("; ")
+                );
+                msg_content = Some(match msg_content {
+                    Some(text) if !text.is_empty() => format!("{text}\n{feedback}"),
+                    _ => feedback,
+                });
+            }
             if !validated.valid.is_empty() {
                 for tc in &validated.valid {
                     let p: String = tc.function.arguments.chars().take(120).collect();

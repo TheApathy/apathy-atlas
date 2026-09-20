@@ -58,7 +58,9 @@ const MAX_CHUNK_TOKENS: u32 = 65_520;
 const HIDDEN_SIZE: u32 = 4_096;
 const HC_STREAMS: u32 = 4;
 const TARGET_LAYERS: u32 = 45;
-const CAPTURE_LAYERS: [u32; 5] = [5, 14, 24, 33, 42];
+// DFlash config publishes one-based auxiliary-layer IDs [5,14,24,33,42].
+// The target walk is zero-based, matching the reference's `idx + 1` test.
+const CAPTURE_LAYERS: [u32; 5] = [4, 13, 23, 32, 41];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glm53TargetAttentionKind {
@@ -413,7 +415,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(captures, [(5, 0), (14, 1), (24, 2), (33, 3), (42, 4)]);
+        assert_eq!(captures, [(4, 0), (13, 1), (23, 2), (32, 3), (41, 4)]);
         assert_eq!(
             &schedule.events()[231..],
             &[

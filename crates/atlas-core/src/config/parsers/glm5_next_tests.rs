@@ -5,6 +5,24 @@ use crate::config::{Glm5NextIndexerType, Glm5NextMlpType, LayerType, parse_confi
 const GLM53_CONFIG: &str = r#"{
   "model_type": "glm5_next",
   "architectures": ["Glm5NextForConditionalGeneration"],
+  "image_token_id": 154854,
+  "video_token_id": 154855,
+  "vision_config": {
+    "model_type": "glm5_next_vision",
+    "depth": 24,
+    "hidden_size": 1024,
+    "num_heads": 16,
+    "patch_size": 14,
+    "temporal_patch_size": 2,
+    "spatial_merge_size": 2,
+    "intermediate_size": 4096,
+    "out_hidden_size": 4096,
+    "in_channels": 3,
+    "image_size": 448,
+    "projection_intermediate_size": 10240,
+    "rms_norm_eps": 0.00001,
+    "swiglu_limit": 10.0
+  },
   "text_config": {
     "model_type": "glm5_next_text",
     "hidden_size": 4096,
@@ -110,10 +128,19 @@ fn parses_minimal_official_glm53_flash_contract() {
     assert_eq!(cfg.num_mtp_modules, 1);
     assert_eq!(cfg.eos_token_id, 154820);
     assert_eq!(cfg.stop_token_ids(), [154820, 154827, 154829]);
-    assert!(
-        cfg.vision.is_none(),
-        "initial GLM target is explicitly text-only"
-    );
+    let vision = cfg.vision.as_ref().expect("official GLM vision contract");
+    assert_eq!(vision.model_type, "glm5_next_vision");
+    assert_eq!(vision.depth, 24);
+    assert_eq!(vision.hidden_size, 1024);
+    assert_eq!(vision.num_heads, 16);
+    assert_eq!(vision.patch_size, 14);
+    assert_eq!(vision.temporal_patch_size, 2);
+    assert_eq!(vision.spatial_merge_size, 2);
+    assert_eq!(vision.intermediate_size, 4096);
+    assert_eq!(vision.out_hidden_size, 4096);
+    assert_eq!(vision.projection_intermediate_size, 10240);
+    assert_eq!(vision.image_pad_token_id, 154854);
+    assert_eq!(vision.video_pad_token_id, 154855);
     let quant = cfg.quantization_config.as_ref().unwrap();
     assert_eq!(quant.quant_method, "fp8");
     assert_eq!(quant.format, "e4m3");
@@ -138,11 +165,96 @@ fn parses_minimal_official_glm53_flash_contract() {
     assert_eq!(glm.linear_lower_bound, -5.0);
 }
 
+fn exl3_config() -> serde_json::Value {
+    let mut raw: serde_json::Value = serde_json::from_str(GLM53_CONFIG).unwrap();
+    raw["quantization_config"] = serde_json::json!({
+        "quant_method": "exl3",
+        "version": "1.4.4",
+        "bits": 2.05,
+        "head_bits": 5,
+        "calibration": {"rows": 250, "cols": 2048},
+        "out_scales": "always",
+        "codebook": "mul1",
+        "modules_to_not_convert": ["model.embed_tokens", "lm_head"],
+        "original_quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": ["model.embed_tokens", "lm_head"]
+        }
+    });
+    raw
+}
+
+#[test]
+fn admits_only_the_pinned_glm53_exl3_quantization_contract() {
+    let raw = exl3_config();
+    let config = parse_config(&raw.to_string()).unwrap();
+    let quant = config.quantization_config.unwrap();
+    assert_eq!(quant.quant_method, "exl3");
+    assert!(
+        quant
+            .ignore_modules
+            .contains(&"model.language_model.embed_tokens".to_string())
+    );
+
+    for (pointer, replacement, needle) in [
+        (
+            "/quantization_config/version",
+            serde_json::json!("1.4.3"),
+            "version",
+        ),
+        ("/quantization_config/bits", serde_json::json!(2.1), "bits"),
+        (
+            "/quantization_config/head_bits",
+            serde_json::json!(4),
+            "head_bits",
+        ),
+        (
+            "/quantization_config/calibration/rows",
+            serde_json::json!(249),
+            "calibration",
+        ),
+        (
+            "/quantization_config/original_quantization_config/fmt",
+            serde_json::json!("e5m2"),
+            "original_quantization_config.fmt",
+        ),
+    ] {
+        let mut mutated = exl3_config();
+        *mutated.pointer_mut(pointer).unwrap() = replacement;
+        let error = parse_config(&mutated.to_string()).unwrap_err();
+        assert!(format!("{error:#}").contains(needle), "{error:#}");
+    }
+}
+
 #[test]
 fn rejects_incompatible_kpool_geometry() {
     let json = GLM53_CONFIG.replace("\"index_topk\": 2048", "\"index_topk\": 2047");
     let err = parse_config(&json).unwrap_err().to_string();
     assert!(err.contains("index_topk"), "{err}");
+}
+
+#[test]
+fn rejects_incompatible_vision_geometry() {
+    for (from, to) in [
+        ("\"depth\": 24", "\"depth\": 23"),
+        ("\"patch_size\": 14", "\"patch_size\": 16"),
+        (
+            "\"projection_intermediate_size\": 10240",
+            "\"projection_intermediate_size\": 4096",
+        ),
+        ("\"image_token_id\": 154854", "\"image_token_id\": 154853"),
+    ] {
+        let mutated = GLM53_CONFIG.replace(from, to);
+        assert_ne!(mutated, GLM53_CONFIG, "mutation pattern must exist: {from}");
+        let err = parse_config(&mutated).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported glm5_next vision geometry"),
+            "{err:#}"
+        );
+    }
 }
 
 #[test]

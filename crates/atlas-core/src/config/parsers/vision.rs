@@ -33,7 +33,17 @@ pub(crate) fn parse_vision_config(raw: &serde_json::Value) -> Option<VisionConfi
         .and_then(serde_json::Value::as_u64)
         .or_else(|| vc.get("image_token_id").and_then(serde_json::Value::as_u64))
         .unwrap_or(0) as u32;
+    let video_pad_token_id = raw
+        .get("video_token_id")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| vc.get("video_token_id").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0) as u32;
     Some(VisionConfig {
+        model_type: vc
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         depth: get_usize("depth"),
         hidden_size: get_usize("hidden_size"),
         num_heads: get_usize("num_heads"),
@@ -42,7 +52,19 @@ pub(crate) fn parse_vision_config(raw: &serde_json::Value) -> Option<VisionConfi
         spatial_merge_size: get_usize("spatial_merge_size"),
         intermediate_size: get_usize("intermediate_size"),
         out_hidden_size: get_usize("out_hidden_size"),
+        in_channels: get_usize("in_channels"),
+        image_size: get_usize("image_size"),
+        projection_intermediate_size: get_usize("projection_intermediate_size"),
+        rms_norm_eps: vc
+            .get("rms_norm_eps")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0),
+        swiglu_limit: vc
+            .get("swiglu_limit")
+            .and_then(serde_json::Value::as_f64)
+            .map(|value| value as f32),
         deepstack_visual_indexes,
         image_pad_token_id,
+        video_pad_token_id,
     })
 }

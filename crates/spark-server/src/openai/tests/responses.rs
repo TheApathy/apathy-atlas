@@ -164,18 +164,10 @@ fn responses_function_call_output_string_unchanged() {
 }
 
 #[test]
-fn responses_function_call_output_opaque_array_stringified() {
-    // Out-of-spec array (no recognizable parts) keeps the historical
-    // stringified-JSON behavior instead of silently emptying the result.
-    let opaque = serde_json::json!([{"weather": "sunny", "temp_c": 21}]);
-    let item = serde_json::json!({
-        "type": "function_call_output",
-        "call_id": "call_3",
-        "output": opaque.clone()
-    });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
-    assert_eq!(m.content.text, opaque.to_string());
-    assert!(m.content.images.is_empty());
+fn responses_function_call_output_malformed_parts_are_rejected() {
+    let item = serde_json::json!({"type":"function_call_output", "call_id":"call_3",
+        "output":[{"weather":"sunny","temp_c":21}]});
+    assert!(IncomingMessage::try_from_responses_input_item(&item).is_err());
 }
 
 #[test]

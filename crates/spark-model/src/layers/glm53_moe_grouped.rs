@@ -232,28 +232,29 @@ impl Glm53GroupedMoePlan {
             .checked_mul(usize::try_from(blocks)?)
             .context("GLM grouped MoE activation buffer overflow")?;
 
-        // THE LAYOUT-AGREEMENT CHECK. The quantize that fills this buffer runs
-        // at `rows = blocks`; the tile that reads it runs one row per pair. Two
-        // plans over one buffer, and a disagreement between them is SILENT --
-        // it yields plausible wrong numbers rather than an error, which is the
-        // class of bug this project has paid for four times.
+        // WHY PER-PAIR IS N INDEPENDENT SINGLE-ROW QUANTIZES, NOT ONE
+        // MULTI-ROW QUANTIZE SLICED UP.
         //
-        // `GgmlIqMmqPlan` lays activations out as `rows` contiguous blocks with
-        // no cross-row padding, so the two descriptions CAN agree. This asserts
-        // that they do, by deriving the quantize plan from the same geometry
-        // rather than trusting the arithmetic above.
-        let quantize = GgmlIqMmqPlan::new(bank.kind, blocks, bank.columns, bank.inner)?;
-        ensure!(
-            quantize.activation_bytes == activation_bytes
-                && quantize.inner_padded == tile.inner_padded,
-            "GLM grouped MoE activation layout disagreement: the quantize at \
-             rows={blocks} produces {} bytes with K padded to {}, the tiles \
-             address {activation_bytes} bytes with K padded to {}. The two must \
-             describe the same buffer.",
-            quantize.activation_bytes,
-            quantize.inner_padded,
-            tile.inner_padded
-        );
+        // The MMQ q8_1 activation layout for rows > 1 is TILED, not
+        // row-contiguous: `atlas_ggml_iq_tile` advances by
+        // `batch_tile * mmq_x * sizeof(block_q8_1_mmq)/sizeof(int)`, a FIXED
+        // per-tile stride, so a multi-row batch interleaves its rows by K-block
+        // rather than laying them end to end. Row p is NOT at
+        // `p * per_row_bytes`, and slicing one multi-row quantize into per-pair
+        // blocks reads scrambled data.
+        //
+        // That cost a bit-exactness failure: `routed` differed in 99.92% of its
+        // elements from index 0 with uncorrelated values -- the signature of
+        // reading the wrong bytes, not of a numerics difference.
+        //
+        // THE CHECK THAT MISSED IT compared the multi-row plan's
+        // `activation_bytes` and `inner_padded` against the per-pair extent and
+        // they MATCHED, because `activation_bytes` is `rows * per_row` under
+        // either layout. EQUAL EXTENTS ARE NOT EQUAL LAYOUTS. So there is no
+        // size assertion here any more: each block gets its OWN rows=1 quantize
+        // into its own region, which is byte-for-byte what the serial path
+        // produces and what the tile consumes -- correct by construction rather
+        // than by assertion.
         Ok(Self {
             bank,
             rows,
@@ -271,18 +272,24 @@ impl Glm53GroupedMoePlan {
 }
 
 impl Glm53GroupedMoePlan {
-    /// The plan the caller must use for the quantize that fills a per-pair
-    /// activation buffer. Derived here so the caller cannot pick a different
-    /// row count than the one `with_activations` verified.
+    /// The plan for ONE activation block. ALWAYS a single row.
+    ///
+    /// A per-pair buffer is filled by `activation_blocks` separate launches of
+    /// this plan, each into its own region -- never by one multi-row quantize,
+    /// whose tiled layout does not match per-pair addressing.
     pub fn quantize_plan(self) -> Result<GgmlIqMmqPlan> {
-        match self.activations {
-            _ => GgmlIqMmqPlan::new(
-                self.bank.kind,
-                self.activation_blocks,
-                self.bank.columns,
-                self.bank.inner,
-            ),
-        }
+        Ok(self.tile)
+    }
+
+    /// Byte offset of one activation block within the buffer.
+    pub fn activation_block_offset(self, block: u32) -> Result<u64> {
+        ensure!(
+            block < self.activation_blocks,
+            "GLM grouped MoE activation block {block} is outside the {} this plan \
+             describes",
+            self.activation_blocks
+        );
+        Ok(u64::from(block) * u64::try_from(self.tile.activation_bytes)?)
     }
 }
 
@@ -449,7 +456,9 @@ impl Glm53GroupedMoeKernels {
             .arg_u32(tile.rows)
             .arg_u32(tile.columns)
             .arg_u32(plan.activation_block_ints)
-            .arg_u32(u32::from(plan.activations == Glm53GroupedActivations::PerPair))
+            .arg_u32(u32::from(
+                plan.activations == Glm53GroupedActivations::PerPair,
+            ))
             .launch(stream)
     }
 }

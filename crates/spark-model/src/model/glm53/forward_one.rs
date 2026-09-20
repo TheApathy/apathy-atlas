@@ -15,7 +15,9 @@ pub const GLM53_KDA_LAYERS: usize = 34;
 pub const GLM53_DSA_LAYERS: usize = 11;
 pub const GLM53_DENSE_LAYERS: usize = 3;
 pub const GLM53_MOE_LAYERS: usize = 42;
-pub const GLM53_CAPTURE_LAYERS: [u32; 5] = [5, 14, 24, 33, 42];
+/// Zero-based target layers corresponding to DFlash's one-based IDs
+/// `[5, 14, 24, 33, 42]`.
+pub const GLM53_CAPTURE_LAYERS: [u32; 5] = [4, 13, 23, 32, 41];
 
 /// A validated schedule only. It does not launch a kernel or mutate sequence
 /// state, and therefore is not an `impl Model` execution path.

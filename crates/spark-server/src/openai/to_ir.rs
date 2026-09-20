@@ -10,25 +10,12 @@
 
 use super::{ChatCompletionRequest, IncomingMessage, ResponseFormat};
 use crate::ir;
-use crate::ir::message::{ContentPart, ImageData, ImageSource, Message, Reasoning, Role, ToolCall};
+use crate::ir::message::{Message, Reasoning, Role, ToolCall};
 
 impl From<&IncomingMessage> for Message {
     fn from(m: &IncomingMessage) -> Self {
-        // Images first (matching the template's historical `[image*N,
-        // text]` content-array shape), then a single text part. The
-        // original wire interleaving was already flattened away by
-        // `ParsedContent`, and `build_msg_entries`/the template read
-        // `text()` and `image_count()` independently, so part order here
-        // does not affect rendering.
-        let mut content: Vec<ContentPart> = Vec::new();
-        for img in &m.content.images {
-            content.push(ContentPart::Image(ImageSource {
-                data: ImageData::from_uri(img.clone()),
-            }));
-        }
-        if !m.content.text.is_empty() {
-            content.push(ContentPart::Text(m.content.text.clone()));
-        }
+        // Every production adapter validates DTO order before this infallible edge.
+        let content = m.content.ordered_ir_parts().expect("validated message image order");
 
         // Tool calls: parse the wire `arguments` string into structured
         // JSON exactly as the historical path did
@@ -187,6 +174,7 @@ mod tests {
         let mut m = msg("user");
         m.content.text = "see".into();
         m.content.images = vec!["data:image/png;base64,AAA".into()];
+        m.content.image_text_offsets = vec![0];
         let ir: Message = (&m).into();
         // Images first (matches the template's [image*N, text] order), then text.
         assert_eq!(
@@ -211,6 +199,7 @@ mod tests {
             "https://example.com/cat.png".into(),
             "data:image/png;base64,AAA".into(),
         ];
+        m.content.image_text_offsets = vec![0, 0];
         let ir: Message = (&m).into();
         assert_eq!(
             ir.content,

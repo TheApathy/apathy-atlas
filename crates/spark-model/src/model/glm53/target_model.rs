@@ -283,7 +283,7 @@ impl Glm53Model {
         })
     }
 
-    fn bind_state(
+    pub(super) fn bind_state(
         plan: &Glm53ArenaPlan,
         arena: DevicePtr,
     ) -> Result<(
@@ -467,14 +467,14 @@ impl Glm53Model {
             // the walk stream is CU_STREAM_NON_BLOCKING, so a plain copy_d2d
             // issues on the default stream and does NOT wait for it -- it would
             // publish the buffer's PREVIOUS contents as the committed state.
-            self.gpu.copy_d2d_async(
-                staged.ptr,
-                state.persistent().ptr,
-                staged.bytes,
-                stream,
-            )?;
+            self.gpu
+                .copy_d2d_async(staged.ptr, state.persistent().ptr, staged.bytes, stream)?;
         }
-        self.commit_conv(stream, GLM53_WALK_STAGED_QUERIES, GLM53_WALK_ACCEPTED_QUERIES)?;
+        self.commit_conv(
+            stream,
+            GLM53_WALK_STAGED_QUERIES,
+            GLM53_WALK_ACCEPTED_QUERIES,
+        )?;
         Ok(())
     }
 
@@ -805,27 +805,51 @@ impl Glm53Model {
                 &[
                     ("collapsed", workspace.inner.collapsed, Glm53DumpDtype::Bf16),
                     // The mHC residual streams are F32 as of the streams change.
-                    ("widened_hc", workspace.inner.widened_hc, Glm53DumpDtype::F32),
+                    (
+                        "widened_hc",
+                        workspace.inner.widened_hc,
+                        Glm53DumpDtype::F32,
+                    ),
                     ("hidden_a", workspace.inner.hidden_a, Glm53DumpDtype::Bf16),
                     ("hidden_b", workspace.inner.hidden_b, Glm53DumpDtype::Bf16),
                     // KDA intermediates, so a divergence lands on one stage
                     // rather than on "the recurrence". Each has a named
                     // counterpart in the llama.cpp reference dump.
-                    ("kda_q_conv", self.scratch.kda_buffers().q_conv_bf16, Glm53DumpDtype::Bf16),
-                    ("kda_k_conv", self.scratch.kda_buffers().k_conv_bf16, Glm53DumpDtype::Bf16),
-                    ("kda_v_conv", self.scratch.kda_buffers().v_conv_bf16, Glm53DumpDtype::Bf16),
+                    (
+                        "kda_q_conv",
+                        self.scratch.kda_buffers().q_conv_bf16,
+                        Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "kda_k_conv",
+                        self.scratch.kda_buffers().k_conv_bf16,
+                        Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "kda_v_conv",
+                        self.scratch.kda_buffers().v_conv_bf16,
+                        Glm53DumpDtype::Bf16,
+                    ),
                     (
                         "kda_log_decay",
                         self.scratch.kda_buffers().log_decay_f32,
                         Glm53DumpDtype::F32,
                     ),
-                    ("kda_beta", self.scratch.kda_buffers().beta_bf16, Glm53DumpDtype::Bf16),
+                    (
+                        "kda_beta",
+                        self.scratch.kda_buffers().beta_bf16,
+                        Glm53DumpDtype::Bf16,
+                    ),
                     (
                         "kda_recurrent_out",
                         self.scratch.kda_buffers().recurrent_out_bf16,
                         Glm53DumpDtype::Bf16,
                     ),
-                    ("kda_gated", self.scratch.kda_buffers().gated_bf16, Glm53DumpDtype::Bf16),
+                    (
+                        "kda_gated",
+                        self.scratch.kda_buffers().gated_bf16,
+                        Glm53DumpDtype::Bf16,
+                    ),
                 ],
             )?;
         }
@@ -1030,7 +1054,9 @@ fn claim_only_sequence_slot(live: &std::sync::atomic::AtomicUsize) -> Result<()>
 /// subsequent request forever.
 fn release_only_sequence_slot(live: &std::sync::atomic::AtomicUsize) {
     use std::sync::atomic::Ordering;
-    let _ = live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| held.checked_sub(1));
+    let _ = live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+        held.checked_sub(1)
+    });
 }
 
 /// The structural half of the sequence-boundary check, split out so it can be
@@ -1058,9 +1084,7 @@ mod tests;
 
 #[cfg(test)]
 mod conv_commit_tests {
-    use super::{
-        GLM53_WALK_ACCEPTED_QUERIES, GLM53_WALK_STAGED_QUERIES, Glm53Model,
-    };
+    use super::{GLM53_WALK_ACCEPTED_QUERIES, GLM53_WALK_STAGED_QUERIES, Glm53Model};
 
     /// The direct conv commit is only correct under full acceptance, and the
     /// guard must FIRE rather than merely be documented -- a precondition that

@@ -27,11 +27,14 @@ pub(crate) struct MsgEntry {
     /// Structured tool_calls for the Jinja template (arguments
     /// pre-parsed to dicts).
     pub(super) tool_calls: Option<Vec<serde_json::Value>>,
+    /// Preserve the caller's association with a historical tool invocation.
+    pub(super) tool_call_id: Option<String>,
     /// Number of image content parts on this message. When > 0
     /// the json_messages builder emits a structured content array
     /// so the Jinja template can render
     /// `<|vision_start|><|image_pad|><|vision_end|>` markers.
     pub(super) image_count: usize,
+    pub(super) image_text_offsets: Vec<usize>,
     /// Historical reasoning trace from a prior assistant turn (the
     /// `<think>...</think>` body). Forwarded from `IncomingMessage`
     /// and passed to the Jinja template so the template can
@@ -117,16 +120,7 @@ pub(super) fn build_msg_entries(
     // itself (via its own `ns.last_query_index` computation) and the
     // injection here was the source of empty-think poisoning. Removed.
     for m in input.iter() {
-        let mut text = m.text();
-        // F6: a failed tool result (Anthropic `is_error`, carried as
-        // `Message::tool_error`) gets an explicit ASCII marker — chat-tuned
-        // models have no structural error concept and otherwise hallucinate
-        // success over error text. Rendered here (not in the adapters) so
-        // every surface gets identical prompt bytes, and applied before the
-        // error-hint scan below so hints see the final text.
-        if m.tool_error {
-            text = format!("[tool error]\n{text}");
-        }
+        let (text, image_text_offsets) = super::ordered_content::flatten(m, None);
 
         // Preserve structured tool_calls for the Jinja template.
         // Always extract from assistant messages — past turns may
@@ -171,7 +165,9 @@ pub(super) fn build_msg_entries(
             let mut text = text;
             // P1-6 (2026-07-09): record the pre-hint original at the
             // index this entry is about to occupy.
-            tool_result_originals.push((messages.len(), text.clone()));
+            if m.image_count() == 0 {
+                tool_result_originals.push((messages.len(), text.clone()));
+            }
             if crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
                 crate::hint_injector::inject_hints(&mut text, consecutive_tool_errors);
@@ -182,7 +178,9 @@ pub(super) fn build_msg_entries(
                 role: "tool".into(),
                 content: text,
                 tool_calls: None,
+                tool_call_id: m.tool_call_id.clone(),
                 image_count: m.image_count(),
+                image_text_offsets,
                 reasoning_content: None,
             });
             collect_message_images(m, &mut all_images, &mut image_pad_counts)?;
@@ -215,7 +213,9 @@ pub(super) fn build_msg_entries(
             role,
             content: text,
             tool_calls: tool_calls_json,
+            tool_call_id: m.tool_call_id.clone(),
             image_count,
+            image_text_offsets,
             // F1: forward reasoning_content for assistant messages only.
             // Wave 3: when strip_reasoning=true, drop it for ALL turns,
             // forcing the template back to the pre-F1 "clean content
@@ -292,10 +292,9 @@ pub(super) fn build_msg_entries(
     // such a message as absent so a degenerate client prompt can't poison
     // generation. Conservative — only an empty body or a single short
     // bare `Label:` line qualifies; any substantive prompt is untouched.
-    if messages
-        .first()
-        .is_some_and(|m| m.role == "system" && is_vacuous_system_content(&m.content))
-    {
+    if messages.first().is_some_and(|m| {
+        m.role == "system" && m.image_count == 0 && is_vacuous_system_content(&m.content)
+    }) {
         let removed = messages.remove(0);
         tracing::info!(
             dropped = %removed.content.trim(),

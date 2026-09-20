@@ -6,6 +6,9 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 
 use super::*;
 
+#[path = "glm53_dsa_topk_visibility_tests.rs"]
+mod visibility;
+
 fn reference(
     scores: &[f32],
     pool_valid: &[bool],
@@ -150,15 +153,15 @@ fn rolling_network(scores: &[f32], valid: &[bool]) -> Vec<u32> {
 
 #[test]
 fn plan_pins_exact_1m_geometry_and_extents() {
-    let plan = Glm53DsaTopkPlan::new(1, 8, 262_144, 1_048_576, 2_048, 4, true).unwrap();
-    assert_eq!((plan.grid_y, plan.grid_z), (8, 1));
-    assert_eq!(plan.score_bytes, 8_388_608);
+    let plan = Glm53DsaTopkPlan::new(1, MAX_QUERIES, 262_144, 1_048_576, 2_048, 4, true).unwrap();
+    assert_eq!((plan.grid_y, plan.grid_z), (2_048, 1));
+    assert_eq!(plan.score_bytes, 2_147_483_648);
     assert_eq!(plan.pool_validity_bytes, 262_144);
     assert_eq!(plan.sequence_length_bytes, 4);
-    assert_eq!(plan.query_position_bytes, 32);
-    assert_eq!(plan.query_validity_bytes, 8);
+    assert_eq!(plan.query_position_bytes, 8_192);
+    assert_eq!(plan.query_validity_bytes, 2_048);
     assert_eq!(plan.tail_validity_bytes, 3);
-    assert_eq!(plan.output_bytes, 65_632);
+    assert_eq!(plan.output_bytes, 16_801_792);
     assert_eq!((SELECTED_POOLS, OUTPUT_WIDTH), (512, 2_051));
     assert_eq!(
         Glm53DsaTopkPlan::new(70_000, 1, 1, 4, 2_048, 4, true)
@@ -169,7 +172,7 @@ fn plan_pins_exact_1m_geometry_and_extents() {
     for bad in [
         Glm53DsaTopkPlan::new(0, 1, 1, 4, 2_048, 4, true),
         Glm53DsaTopkPlan::new(1, 0, 1, 4, 2_048, 4, true),
-        Glm53DsaTopkPlan::new(1, 9, 1, 4, 2_048, 4, true),
+        Glm53DsaTopkPlan::new(1, MAX_QUERIES + 1, 1, 4, 2_048, 4, true),
         Glm53DsaTopkPlan::new(1, 1, 0, 4, 2_048, 4, true),
         Glm53DsaTopkPlan::new(1, 1, 2, 4, 2_048, 4, true),
         Glm53DsaTopkPlan::new(1, 1, 262_145, 1_048_576, 2_048, 4, true),
@@ -177,7 +180,7 @@ fn plan_pins_exact_1m_geometry_and_extents() {
         Glm53DsaTopkPlan::new(1, 1, 1, 1_048_577, 2_048, 4, true),
         Glm53DsaTopkPlan::new(1, 1, 1, 4, 2_047, 4, true),
         Glm53DsaTopkPlan::new(1, 1, 1, 4, 2_048, 4, false),
-        Glm53DsaTopkPlan::new(u32::MAX, 8, 1, 4, 2_048, 4, true),
+        Glm53DsaTopkPlan::new(u32::MAX, MAX_QUERIES, 1, 4, 2_048, 4, true),
     ] {
         assert!(bad.is_err());
     }
@@ -311,6 +314,7 @@ fn cuda_contract(source: &str) -> bool {
     CUDA_SEAMS
         .iter()
         .all(|seam| source.matches(seam).count() == 1)
+        && source.contains("#define GLM53_DSA_MAX_QUERIES 2048U")
         && source.contains("const float * __restrict__ scores")
         && !source.contains("scores[row * pool_count + pool] =")
 }

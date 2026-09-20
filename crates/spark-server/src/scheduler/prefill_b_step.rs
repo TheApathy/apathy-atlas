@@ -67,7 +67,6 @@ pub fn prefill_request(
     let req_top_logprobs = req.top_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -102,6 +101,18 @@ pub fn prefill_request(
         ),
     };
 
+    let mut grammar_state = match compile_grammar_state(
+        grammar_engine,
+        &grammar_spec,
+        eos_tokens,
+        req_require_tool_call,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            send_error_to_sink(&mut sink, &error.to_string());
+            return Err(error);
+        }
+    };
     let request_start = Instant::now();
     tracing::info!(
         "Prefilling: {} prompt tokens, max_tokens={max_tokens}",
@@ -169,6 +180,7 @@ pub fn prefill_request(
             min_tokens: req_min_tokens,
             eos_tokens: eos_tokens.to_vec(),
             finished: true,
+            terminal_error: None,
             guard_stop: None,
             param_close_pending: 0,
             sink,
@@ -245,9 +257,8 @@ pub fn prefill_request(
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
-        }
+        // Empty input invalidates the previous request's images.
+        model.prepare_vision_embed(&image_pixels)?;
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
@@ -359,6 +370,7 @@ pub fn prefill_request(
             min_tokens: req_min_tokens,
             eos_tokens: eos_tokens.to_vec(),
             finished: true,
+            terminal_error: None,
             guard_stop: None,
             param_close_pending: 0,
             sink,
@@ -441,6 +453,7 @@ pub fn prefill_request(
         min_tokens: req_min_tokens,
         eos_tokens: eos_tokens.to_vec(),
         finished: false,
+        terminal_error: None,
         guard_stop: None,
         param_close_pending: 0,
         sink,

@@ -11,6 +11,7 @@
 //! well-formed boundary and re-steer (`rollback_to_boundary`) instead
 //! of hard-stopping the response.
 
+use super::ordinary_transition::OrdinaryEffects;
 use super::*;
 
 /// Slow-path diagnostic: when `detect_content_token_loop` returns
@@ -60,10 +61,9 @@ fn describe_content_token_loop(tokens: &[u32]) -> Option<(usize, usize)> {
 /// generation budget, advances content counters, and runs the
 /// content-loop + inter-tool-prose watchdogs.
 ///
-/// `model` is needed by the Phase-C boundary rollback so it can restore
-/// SSM recurrent state on hybrid models (see
-/// [`super::rollback::rollback_to_boundary`]).
-pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
+/// Persistent rollback is injected. Live decode uses the original model
+/// effect; speculative policy can request a restored ordinary replay.
+pub fn handle_content_token(a: &mut ActiveSeq, effects: &mut dyn OrdinaryEffects) -> Result<()> {
     a.consume_generation_budget();
     a.content_started = true;
     a.content_tokens = a.content_tokens.saturating_add(1);
@@ -147,7 +147,7 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
         // = CONTENT_LOOP_PERIOD_MAX so the rollback always escapes
         // the detected period. Falls back to the legacy hard stop
         // when disabled / capped / no boundary found.
-        match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model) {
+        match effects.rollback(a, CONTENT_LOOP_PERIOD_MAX)? {
             RollbackOutcome::RolledBack { dropped } => {
                 tracing::warn!(
                     content_tokens = a.content_tokens,
@@ -201,7 +201,7 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
             // constrained tool-call decoder stays valid.
             // `min_keep` = CONTENT_LOOP_PERIOD_MAX drops a full
             // run-on sentence of stalled prose.
-            match rollback_to_boundary(a, CONTENT_LOOP_PERIOD_MAX, model) {
+            match effects.rollback(a, CONTENT_LOOP_PERIOD_MAX)? {
                 RollbackOutcome::RolledBack { dropped } => {
                     tracing::warn!(
                         max = max_prose,
@@ -222,4 +222,5 @@ pub fn handle_content_token(a: &mut ActiveSeq, model: &dyn Model) {
             }
         }
     }
+    Ok(())
 }

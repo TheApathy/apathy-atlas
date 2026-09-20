@@ -18,17 +18,47 @@ mod arena;
 mod arena_owner;
 mod b1t1_bootstrap;
 mod capture_slots;
+mod cublaslt_prewarm;
+mod ffn_graph;
+mod ffn_graph_runtime;
 mod dense_ffn;
 mod device_completion;
+mod dflash2_probe_capture;
+mod dflash2_probe_contract;
+mod dflash2_runtime;
+pub use dflash2_probe_capture::{ProbeCapture, ProbeFrame, ProbeIo};
+pub use dflash2_probe_contract::{Dflash2ProbeMode, ProbeLayout, ProbeStage};
 mod dispatch;
 mod dsa_attention;
+mod dsa_dense_indexer;
+mod dsa_verify_plan;
+mod dsa_verify_transaction;
 mod executor;
 mod kda_attention;
 mod kda_recurrent_commit;
 mod model_trait;
+mod model_trait_exl3;
+mod ordered_capture;
+mod owned_verify_readback;
+mod partial_replay;
+mod phase_timing;
+mod phase_timing_wrappers;
+mod prefill_capture_ingest;
+mod prefill_capture_owner;
+mod prefill_capture_plan;
+mod prefill_exl3;
+mod prefill_input_exl3;
+mod prefill_owner_exl3;
+mod state_probe_frame;
+mod state_read_plan;
+pub use state_probe_frame::StateProbeStamp;
 mod t1_state_transaction;
 mod target_model;
+mod target_model_exl3;
+pub mod verify_policy_binding;
+pub mod verify_policy_transaction;
 mod workspace_binding;
+pub use dflash2_runtime::{Glm53Dflash2ProbeObserver, Glm53Dflash2Runtime};
 pub use dispatch::Glm53Dispatcher;
 pub use executor::{Glm53Executor, Glm53ExecutorReadiness, Seam};
 pub use workspace_binding::Glm53BoundWorkspace;
@@ -38,8 +68,8 @@ mod kernels;
 mod mhc_expansion;
 mod model_impl;
 mod walk_dump;
-pub(crate) mod walk_timing;
 mod walk_scratch;
+pub(crate) mod walk_timing;
 
 pub use arena::{
     GLM53_FULL_1M_PERSISTENT_BYTES, GLM53_KNOWN_ARENA_BYTES, GLM53_MHC_EXPANDED_F32_BYTES,
@@ -54,6 +84,8 @@ pub use kernels::{GLM53_REQUIRED_CAPABILITIES, Glm53KernelAdmission, Glm53Runtim
 pub use mhc_expansion::{GLM53_MHC_FUNCTION_F32_BYTES, Glm53HyperBranch, Glm53MhcExpanded};
 pub use model_impl::{Glm53ModelPhase, Glm53TargetModelRequest, reject_unwired_phase};
 pub use target_model::{GLM53_BRINGUP_ENV, Glm53Model};
+pub use target_model_exl3::Glm53Exl3Model;
+pub use target_model_exl3::{Glm53StateProbe, StateProbeDescriptor, StateProbeRegion};
 
 /// Fully owned but currently unreachable admitted object. Construction performs
 /// only CPU validation; the capability gate fails before this value can exist.
@@ -241,3 +273,13 @@ mod tests {
         assert_eq!(GLM53_FULL_1M_PERSISTENT_BYTES, 12_864_209_664);
     }
 }
+
+#[cfg(test)]
+mod prefill_capture_tile_tests;
+#[cfg(test)]
+mod prefill_mixed_exl3_wiring_tests;
+
+#[cfg(test)]
+mod dsa_dense_indexer_tests;
+#[cfg(test)]
+mod dsa_dense_indexer_wiring_tests;

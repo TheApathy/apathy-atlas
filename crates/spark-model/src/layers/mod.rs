@@ -33,8 +33,8 @@ pub use glm53_moe_grouped::{
     Glm53GroupedBank, Glm53GroupedMoeKernels, Glm53GroupedMoePlan, Glm53MoePath,
 };
 pub use glm53_moe_serial::{
-    Glm53GroupedMoeReceipt, Glm53GroupedMoeScratch, Glm53SerialMoeBuffers,
-    Glm53SerialMoeKernels, Glm53SerialMoeReceipt,
+    Glm53GroupedMoeReceipt, Glm53GroupedMoeScratch, Glm53SerialMoeBuffers, Glm53SerialMoeKernels,
+    Glm53SerialMoeReceipt,
 };
 pub use glm53_target_schedule::{
     Glm53TargetAttentionKind, Glm53TargetEvent, Glm53TargetFfnKind, Glm53TargetGeometry,
@@ -47,6 +47,9 @@ pub use nemotron_moe::NemotronMoeLayer;
 pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
+mod glm53_vision_exl3;
+mod glm53_vision_timing;
+pub use glm53_vision_exl3::{Glm53VisionOutput, forward_glm53_exl3_image};
 
 use crate::layer::ForwardContext;
 use anyhow::Result;

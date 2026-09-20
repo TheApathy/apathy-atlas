@@ -10,12 +10,39 @@
 #define GLM53_DSA_LATENT 512U
 #define GLM53_DSA_SELECTED 2051U
 #define GLM53_DSA_SORT_WIDTH 4096U
-#define GLM53_DSA_MAX_QUERIES 8U
+#define GLM53_DSA_MAX_QUERIES 2048U
 #define GLM53_DSA_MAX_POSITIONS 1048576U
 #define GLM53_DSA_THREADS 256U
 #define GLM53_DSA_MAX_GRID_YZ 65535ULL
 #define GLM53_DSA_INVALID 0xffffffffU
 #define GLM53_DSA_INV_SQRT_QK 0.0625f
+
+extern "C" __global__ void __launch_bounds__(GLM53_DSA_THREADS, 1)
+atlas_glm53_dsa_transpose_heads_bf16(
+        const __nv_bfloat16 * __restrict__ input,
+        __nv_bfloat16 * __restrict__ output,
+        unsigned int rows, unsigned int width,
+        unsigned int to_head_major) {
+    if (input == nullptr || output == nullptr || rows == 0U ||
+        rows > GLM53_DSA_MAX_QUERIES ||
+        (width != 256U && width != 512U) || to_head_major > 1U) return;
+    const unsigned long long values =
+        (unsigned long long)rows * GLM53_DSA_HEADS * width;
+    unsigned long long index =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long stride =
+        (unsigned long long)gridDim.x * blockDim.x;
+    for (; index < values; index += stride) {
+        const unsigned long long column = index % width;
+        const unsigned long long pair = index / width;
+        const unsigned long long row = pair / GLM53_DSA_HEADS;
+        const unsigned long long head = pair % GLM53_DSA_HEADS;
+        const unsigned long long head_major =
+            (head * rows + row) * width + column;
+        if (to_head_major != 0U) output[head_major] = input[index];
+        else output[index] = input[head_major];
+    }
+}
 
 extern "C" __global__ void __launch_bounds__(GLM53_DSA_THREADS, 1)
 atlas_glm53_dsa_selected_attention_bf16(
@@ -207,3 +234,37 @@ atlas_glm53_dsa_selected_attention_bf16(
     output_weighted_latent[output_base + lane + GLM53_DSA_THREADS] =
         __float2bfloat16_rn(second_sum);
 }
+
+// Before the selector becomes sparse, its top-512 pools cover the entire
+// causal prefix (2048 pooled tokens plus the three raw-tail slots). Reuse the
+// shipping GB10 HDIM=512 FlashAttention compute for that exact dense region:
+// latent K and V are the same contiguous rank-512 cache, shared by all 64
+// query heads. The common kernel tiles 32 query rows and 32 latent rows, so K/V
+// are reused from shared memory instead of reread once per row and head.
+#define LOAD_KV_TILE_512(cache, bt, smem_ptr, kv_s, kv_l, kvh, t, stride) \
+    do { \
+        (void)(bt); \
+        (void)(kvh); \
+        const unsigned int _cpr = HDIM_512 / 8U; \
+        for (unsigned int _i = (t); _i < TILE_CHUNKS_512; _i += (stride)) { \
+            const unsigned int _row = _i / _cpr; \
+            const unsigned int _col = (_i % _cpr) * 8U; \
+            const unsigned int _pos = (kv_s) + _row; \
+            if (_pos < (kv_l)) { \
+                const void* _gm = (const void*)((cache) + \
+                    (unsigned long long)_pos * HDIM_512 + _col); \
+                atlas_cp16(&(smem_ptr)[_row * HDIM_512 + _col], _gm); \
+            } else { \
+                *((uint4*)&(smem_ptr)[_row * HDIM_512 + _col]) = \
+                    make_uint4(0U, 0U, 0U, 0U); \
+            } \
+        } \
+    } while (0)
+
+#define KERNEL_NAME atlas_glm53_dsa_dense_causal_bf16
+#define K_CACHE_TYPE const __nv_bfloat16* __restrict__
+#define V_CACHE_TYPE const __nv_bfloat16* __restrict__
+#define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d
+#define KERNEL_PREAMBLE /* contiguous one-KV-head latent cache */
+
+#include "../../common/prefill_paged_compute_512.cuh"

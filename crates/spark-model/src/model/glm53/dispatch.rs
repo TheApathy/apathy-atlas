@@ -18,7 +18,7 @@
 //! * `FinalNormF32`  — `output_norm` over the collapsed hidden state
 //! * `Ffn` (MoE)     — router + 8 routed experts + shared expert, serially
 //! * `Ffn` (dense)   — gate/up/SwiGLU/down over a 12,288-wide intermediate
-//! * `CaptureWidenedMhc` — post-layer stream state into a DFlash2 arena slot
+//! * `CaptureWidenedMhc` — contract post-layer mHC into a DFlash2 BF16 slot
 //! * `Attention` (KDA) — conv, forget gate, recurrence, gated norm, projection
 //! * `Attention` (DSA) — absorbed MLA with the k-pool indexer and top-k select
 //! * `LmHeadF32`   — `output.weight` over the normalized hidden state
@@ -54,20 +54,22 @@
 //! coefficients are already in the workspace before any FFN work begins. The
 //! composed order is asserted against the sequence above in `dispatch_tests`.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::GpuBackend;
 
 use crate::layers::ops::{
-    GgmlIqBuffer, Glm53HyperKernels, Glm53HyperPlan, Glm53HyperPostBuffers, Glm53HyperPreBuffers,
-    Glm53RouterBuffers, Glm53RouterKernels, Glm53RouterPlan,
+    GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer, Glm53Exl3Projection, Glm53HyperKernels, Glm53HyperPlan,
+    Glm53HyperPostBuffers, Glm53HyperPreBuffers, Glm53RouterBuffers, Glm53RouterKernels,
+    Glm53RouterPlan, glm53_layer_major_prefill_active,
 };
 use crate::layers::{
     Glm53MoePath, Glm53SerialMoeKernels, Glm53TargetAttentionKind, Glm53TargetEvent,
     Glm53TargetFfnKind,
 };
 use crate::weight_loader::{
-    Glm53AttentionWeights, Glm53FfnWeights, Glm53GgufMatrix, Glm53HyperWeights, Glm53LayerNorms,
-    Glm53TargetLayerWeights,
+    Glm53AttentionWeights, Glm53Exl3AttentionWeights, Glm53Exl3FfnWeights, Glm53Exl3HyperWeights,
+    Glm53Exl3Linear, Glm53Exl3NativeDtype, Glm53Exl3TargetLayerWeights, Glm53FfnWeights,
+    Glm53GgufMatrix, Glm53HyperWeights, Glm53LayerNorms, Glm53TargetLayerWeights,
 };
 
 use super::capture_slots::Glm53CaptureSlots;
@@ -79,12 +81,50 @@ use super::mhc_expansion::{Glm53HyperBranch, Glm53MhcExpanded};
 use super::walk_scratch::Glm53WalkScratch;
 use super::workspace_binding::Glm53BoundWorkspace;
 
+#[path = "dispatch_prefill_capture.rs"]
+mod prefill_capture;
+
 /// Layers carrying mHC connections.
 const LAYERS: usize = 45;
 /// Gated-delta-net layers.
 const KDA_LAYERS: usize = 34;
 /// Sparse-latent layers, at `layer % 4 == 3`.
 const DSA_LAYERS: usize = 11;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Glm53Exl3LmHeadSlice {
+    rows: u32,
+    input_row: u32,
+    output_row: u32,
+}
+
+fn glm53_exl3_lm_head_slice(
+    rows: u32,
+    layer_major: bool,
+    selector: Option<&str>,
+) -> Result<Glm53Exl3LmHeadSlice> {
+    ensure!(rows != 0, "GLM EXL3 lm_head needs at least one row");
+    let last_row = match selector {
+        None | Some("1") => layer_major && rows > 1,
+        Some("0") => false,
+        Some(other) => {
+            bail!("ATLAS_GLM53_EXL3_LAST_ROW_HEAD must be `0` or `1`, got `{other}`")
+        }
+    };
+    if last_row {
+        Ok(Glm53Exl3LmHeadSlice {
+            rows: 1,
+            input_row: rows - 1,
+            output_row: rows - 1,
+        })
+    } else {
+        Ok(Glm53Exl3LmHeadSlice {
+            rows,
+            input_row: 0,
+            output_row: 0,
+        })
+    }
+}
 
 /// Per-layer attention resources for one walk.
 ///
@@ -183,6 +223,53 @@ impl Glm53LayerHyperOperands {
             ffn_norm: f32_buffer(norms.ffn.ptr(), norms.ffn.bytes()),
         })
     }
+
+    pub fn resolve_exl3(
+        layer: usize,
+        hyper: &Glm53Exl3HyperWeights,
+        norms: &crate::weight_loader::Glm53Exl3NormWeights,
+    ) -> Result<Self> {
+        let native = |name: &str,
+                      tensor: &crate::weight_loader::Glm53Exl3NativeTensor,
+                      elements: usize|
+         -> Result<GgmlIqBuffer> {
+            ensure!(
+                tensor.dtype() == Glm53Exl3NativeDtype::F32
+                    && tensor.bytes() == elements * size_of::<f32>(),
+                "GLM EXL3 layer {layer} {name} dtype/extent drift"
+            );
+            Ok(f32_buffer(tensor.ptr(), tensor.bytes()))
+        };
+        Ok(Self {
+            attn_function: native(
+                "hc function (attn)",
+                &hyper.attention.function,
+                BASE_ELEMENTS * 4 * HIDDEN,
+            )?,
+            attn_base: native("hc base (attn)", &hyper.attention.base, BASE_ELEMENTS)?,
+            attn_scale: native("hc scale (attn)", &hyper.attention.scale, SCALE_ELEMENTS)?,
+            attn_norm: native("attn_norm", &norms.attention, HIDDEN)?,
+            ffn_function: native(
+                "hc function (ffn)",
+                &hyper.ffn.function,
+                BASE_ELEMENTS * 4 * HIDDEN,
+            )?,
+            ffn_base: native("hc base (ffn)", &hyper.ffn.base, BASE_ELEMENTS)?,
+            ffn_scale: native("hc scale (ffn)", &hyper.ffn.scale, SCALE_ELEMENTS)?,
+            ffn_norm: native("ffn_norm", &norms.ffn, HIDDEN)?,
+        })
+    }
+}
+
+enum Glm53DispatchCatalog<'w> {
+    Gguf {
+        layers: &'w [Glm53TargetLayerWeights],
+        lm_head: &'w Glm53GgufMatrix,
+    },
+    Exl3 {
+        layers: &'w [Glm53Exl3TargetLayerWeights],
+        lm_head: &'w Glm53Exl3Linear,
+    },
 }
 
 /// Kernels and operands for one walk.
@@ -202,15 +289,16 @@ pub struct Glm53Dispatcher<'w> {
     /// be 42 lookups a token, and a value that could change mid-token would
     /// make a measurement unattributable.
     moe_path: Glm53MoePath,
+    exl3_fused_moe: bool,
+    exl3_moe_tables: Option<&'w [Option<crate::layers::ops::Glm53Exl3MoePointerTables>]>,
     dense: Glm53DenseFfnKernels,
     router: Glm53RouterKernels,
     scratch: Glm53WalkScratch,
     captures: Glm53CaptureSlots,
-    catalog: &'w [Glm53TargetLayerWeights],
+    catalog: Glm53DispatchCatalog<'w>,
     kda: Glm53KdaAttentionKernels,
     dsa: Glm53DsaAttentionKernels,
     attention: Glm53AttentionBinding,
-    lm_head: &'w Glm53GgufMatrix,
     logits: GgmlIqBuffer,
 }
 
@@ -301,15 +389,120 @@ impl<'w> Glm53Dispatcher<'w> {
             output_norm,
             moe: Glm53SerialMoeKernels::load(gpu)?,
             moe_path: Glm53MoePath::from_env()?,
+            exl3_fused_moe: false,
+            exl3_moe_tables: None,
             dense: Glm53DenseFfnKernels::load(gpu)?,
             router: Glm53RouterKernels::load(gpu)?,
             scratch,
             captures,
-            catalog,
+            catalog: Glm53DispatchCatalog::Gguf {
+                layers: catalog,
+                lm_head,
+            },
             kda: Glm53KdaAttentionKernels::load(gpu)?,
             dsa: Glm53DsaAttentionKernels::load(gpu)?,
             attention,
-            lm_head,
+            logits,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_exl3(
+        gpu: &dyn GpuBackend,
+        tokens: u32,
+        bound: Glm53BoundWorkspace,
+        layers: Vec<Glm53LayerHyperOperands>,
+        output_norm: GgmlIqBuffer,
+        scratch: Glm53WalkScratch,
+        captures: Glm53CaptureSlots,
+        catalog: &'w [Glm53Exl3TargetLayerWeights],
+        moe_tables: &'w [Option<crate::layers::ops::Glm53Exl3MoePointerTables>],
+        attention: Glm53AttentionBinding,
+        lm_head: &'w Glm53Exl3Linear,
+        logits: GgmlIqBuffer,
+    ) -> Result<Self> {
+        ensure!(
+            layers.len() == LAYERS,
+            "GLM EXL3 dispatch needs {LAYERS} mHC layers"
+        );
+        ensure!(
+            catalog.len() == LAYERS,
+            "GLM EXL3 dispatch needs {LAYERS} target layers"
+        );
+        ensure!(
+            moe_tables.len() == LAYERS,
+            "GLM EXL3 dispatch needs {LAYERS} MoE pointer-table slots"
+        );
+        for (index, layer) in catalog.iter().enumerate() {
+            ensure!(
+                (index % 4 == 3) == matches!(layer.attention, Glm53Exl3AttentionWeights::Dsa(_)),
+                "GLM EXL3 layer {index} attention topology drift"
+            );
+            ensure!(
+                (index < 3) == matches!(layer.ffn, Glm53Exl3FfnWeights::Dense(_)),
+                "GLM EXL3 layer {index} FFN topology drift"
+            );
+            ensure!(
+                (index >= 3) == moe_tables[index].is_some(),
+                "GLM EXL3 layer {index} MoE pointer-table topology drift"
+            );
+        }
+        ensure!(
+            attention.kda_states.len() == KDA_LAYERS && attention.kda_conv.len() == KDA_LAYERS,
+            "GLM EXL3 dispatch needs {KDA_LAYERS} KDA state/conv slots"
+        );
+        ensure!(
+            attention.dsa_cache.len() == DSA_LAYERS,
+            "GLM EXL3 dispatch needs {DSA_LAYERS} DSA cache slots"
+        );
+        let mut ordinals: Vec<usize> = attention.kda_states.iter().map(|s| s.ordinal()).collect();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        ensure!(
+            ordinals.len() == KDA_LAYERS,
+            "GLM EXL3 KDA state ordinals overlap"
+        );
+        attention.geometry.validate()?;
+        let max_rows = if glm53_layer_major_prefill_active() {
+            u32::try_from(GLM53_EXL3_MAX_WIDE_ROWS)?
+        } else {
+            8
+        };
+        ensure!(
+            (1..=max_rows).contains(&tokens),
+            "GLM EXL3 dispatch admits 1..={max_rows} target rows in this scope"
+        );
+        let head_plan =
+            crate::layers::ops::Glm53Exl3Projection::Compressed(lm_head).plan(tokens)?;
+        ensure!(
+            head_plan.input == HIDDEN as u32 && logits.bytes >= head_plan.output_bytes,
+            "GLM EXL3 head/logits geometry drift"
+        );
+        let route_policy = scratch.exl3_route_policy();
+        let moe_mode = std::env::var_os("ATLAS_GLM53_EXL3_MOE");
+        route_policy.validate_moe_mode(moe_mode.as_deref())?;
+        let exl3_fused_moe = moe_mode.as_deref() != Some(std::ffi::OsStr::new("serial-reference"));
+        Ok(Self {
+            hyper: Glm53HyperKernels::load(gpu)?,
+            plan: Glm53HyperPlan::new(tokens, 4096, 4, 20)?,
+            bound,
+            layers,
+            output_norm,
+            moe: Glm53SerialMoeKernels::load_exl3_with_route_policy(gpu, route_policy)?,
+            moe_path: Glm53MoePath::SerialReference,
+            exl3_fused_moe,
+            exl3_moe_tables: Some(moe_tables),
+            dense: Glm53DenseFfnKernels::load(gpu)?,
+            router: Glm53RouterKernels::load(gpu)?,
+            scratch,
+            captures,
+            catalog: Glm53DispatchCatalog::Exl3 {
+                layers: catalog,
+                lm_head,
+            },
+            kda: Glm53KdaAttentionKernels::load(gpu)?,
+            dsa: Glm53DsaAttentionKernels::load(gpu)?,
+            attention,
             logits,
         })
     }
@@ -363,8 +556,16 @@ impl<'w> Glm53Dispatcher<'w> {
                 self.attention.geometry.position,
                 &format!("hc{call:03}"),
                 &[
-                    ("comb", self.bound.hyper_comb, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("post", self.bound.hyper_post, super::walk_dump::Glm53DumpDtype::Bf16),
+                    (
+                        "comb",
+                        self.bound.hyper_comb,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "post",
+                        self.bound.hyper_post,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
                 ],
             )?;
         }
@@ -473,26 +674,59 @@ impl<'w> Glm53Dispatcher<'w> {
                 let ordinal = kda_ordinal(index).ok_or_else(|| {
                     anyhow::anyhow!("GLM dispatch: layer {layer} is not a KDA layer")
                 })?;
-                let Some(Glm53AttentionWeights::Kda(weights)) =
-                    self.catalog.get(index).map(|l| &l.attention)
-                else {
-                    bail!("GLM dispatch: layer {layer} is scheduled KDA but holds DSA weights")
-                };
-                self.kda
-                    .stage(
-                        gpu,
-                        weights,
-                        self.bound.collapsed,
-                        self.scratch.kda_buffers(),
-                        &self.attention.kda_states[ordinal],
-                        self.attention.kda_conv[ordinal],
-                        self.attention.geometry.position,
-                        self.attention.geometry.capacity,
-                        self.attention.geometry.nonce,
-                        self.bound.hidden_a,
-                        stream,
-                    )
-                    .map(|_launches| ())
+                match &self.catalog {
+                    Glm53DispatchCatalog::Gguf { layers, .. } => {
+                        let Some(Glm53AttentionWeights::Kda(weights)) =
+                            layers.get(index).map(|l| &l.attention)
+                        else {
+                            bail!(
+                                "GLM dispatch: layer {layer} is scheduled KDA but holds DSA weights"
+                            )
+                        };
+                        self.kda
+                            .stage(
+                                gpu,
+                                weights,
+                                self.bound.collapsed,
+                                self.scratch.kda_buffers(),
+                                &self.attention.kda_states[ordinal],
+                                self.attention.kda_conv[ordinal],
+                                self.attention.geometry.position,
+                                self.attention.geometry.capacity,
+                                self.attention.geometry.nonce,
+                                self.bound.hidden_a,
+                                stream,
+                            )
+                            .map(|_| ())
+                    }
+                    Glm53DispatchCatalog::Exl3 { layers, .. } => {
+                        let Some(Glm53Exl3AttentionWeights::Kda(weights)) =
+                            layers.get(index).map(|l| &l.attention)
+                        else {
+                            bail!(
+                                "GLM EXL3 dispatch: layer {layer} is scheduled KDA but holds DSA weights"
+                            )
+                        };
+                        self.kda
+                            .stage_exl3_rows(
+                                gpu,
+                                self.plan.tokens,
+                                weights,
+                                self.bound.collapsed,
+                                self.scratch.kda_buffers_rows(self.plan.tokens)?,
+                                self.scratch
+                                    .exl3_projection_scratch_rows(self.plan.tokens)?,
+                                &self.attention.kda_states[ordinal],
+                                self.attention.kda_conv[ordinal],
+                                self.attention.geometry.position,
+                                self.attention.geometry.capacity,
+                                self.attention.geometry.nonce,
+                                self.bound.hidden_a,
+                                stream,
+                            )
+                            .map(|_| ())
+                    }
+                }
             }
             Glm53TargetEvent::Attention {
                 layer,
@@ -502,54 +736,103 @@ impl<'w> Glm53Dispatcher<'w> {
                 let ordinal = dsa_ordinal(index).ok_or_else(|| {
                     anyhow::anyhow!("GLM dispatch: layer {layer} is not a DSA layer")
                 })?;
-                let Some(Glm53AttentionWeights::Dsa(weights)) =
-                    self.catalog.get(index).map(|l| &l.attention)
-                else {
-                    bail!("GLM dispatch: layer {layer} is scheduled DSA but holds KDA weights")
-                };
-                self.dsa
-                    .stage(
-                        gpu,
-                        weights,
-                        self.bound.collapsed,
-                        self.scratch.dsa_buffers(),
-                        self.attention.dsa_cache[ordinal],
-                        self.attention.geometry,
-                        self.bound.hidden_a,
-                        stream,
-                    )
-                    .map(|_launches| ())
+                match &self.catalog {
+                    Glm53DispatchCatalog::Gguf { layers, .. } => {
+                        let Some(Glm53AttentionWeights::Dsa(weights)) =
+                            layers.get(index).map(|l| &l.attention)
+                        else {
+                            bail!(
+                                "GLM dispatch: layer {layer} is scheduled DSA but holds KDA weights"
+                            )
+                        };
+                        self.dsa
+                            .stage(
+                                gpu,
+                                weights,
+                                self.bound.collapsed,
+                                self.scratch.dsa_buffers(),
+                                self.attention.dsa_cache[ordinal],
+                                self.attention.geometry,
+                                self.bound.hidden_a,
+                                stream,
+                            )
+                            .map(|_| ())
+                    }
+                    Glm53DispatchCatalog::Exl3 { layers, .. } => {
+                        let Some(Glm53Exl3AttentionWeights::Dsa(weights)) =
+                            layers.get(index).map(|l| &l.attention)
+                        else {
+                            bail!(
+                                "GLM EXL3 dispatch: layer {layer} is scheduled DSA but holds KDA weights"
+                            )
+                        };
+                        self.dsa
+                            .stage_exl3_rows(
+                                gpu,
+                                self.plan.tokens,
+                                weights,
+                                self.bound.collapsed,
+                                self.scratch.dsa_buffers_rows(self.plan.tokens)?,
+                                self.scratch
+                                    .exl3_projection_scratch_rows(self.plan.tokens)?,
+                                self.attention.dsa_cache[ordinal],
+                                self.attention.geometry,
+                                self.bound.hidden_a,
+                                stream,
+                            )
+                            .map(|_| ())
+                    }
+                }
             }
             Glm53TargetEvent::Ffn {
                 layer,
                 kind: Glm53TargetFfnKind::Moe,
             } => {
                 let index = usize::try_from(*layer)?;
-                let weights = self.catalog.get(index).ok_or_else(|| {
-                    anyhow::anyhow!("GLM dispatch: layer {layer} has no catalog weights")
-                })?;
-                let Glm53FfnWeights::Moe(moe) = &weights.ffn else {
-                    bail!("GLM dispatch: layer {layer} is scheduled MoE but holds dense weights")
+                let (router_weight, router_bias) = match &self.catalog {
+                    Glm53DispatchCatalog::Gguf { layers, .. } => {
+                        let Some(Glm53FfnWeights::Moe(moe)) = layers.get(index).map(|w| &w.ffn)
+                        else {
+                            bail!(
+                                "GLM dispatch: layer {layer} is scheduled MoE but holds dense weights"
+                            )
+                        };
+                        (
+                            f32_buffer(moe.router.ptr(), moe.router.bytes()),
+                            f32_buffer(moe.expert_bias.ptr(), moe.expert_bias.bytes()),
+                        )
+                    }
+                    Glm53DispatchCatalog::Exl3 { layers, .. } => {
+                        let Some(Glm53Exl3FfnWeights::Moe(moe)) = layers.get(index).map(|w| &w.ffn)
+                        else {
+                            bail!(
+                                "GLM EXL3 dispatch: layer {layer} is scheduled MoE but holds dense weights"
+                            )
+                        };
+                        (
+                            f32_buffer(moe.router.ptr(), moe.router.bytes()),
+                            f32_buffer(moe.expert_bias.ptr(), moe.expert_bias.bytes()),
+                        )
+                    }
                 };
                 // The serial executor READS its routed expert ids back from
                 // device memory; it never computes them. The router has to run
                 // first or the layer dispatches to whatever ids happen to be in
                 // the buffer — eight arbitrary experts, fluently wrong.
-                let (logits, indices, route_weights) = self.scratch.router_scratch();
-                let (router_probs, router_biased) = self.scratch.router_scores();
+                let exl3_rows = match self.catalog {
+                    Glm53DispatchCatalog::Exl3 { .. } => self.plan.tokens,
+                    Glm53DispatchCatalog::Gguf { .. } => 1,
+                };
+                let (logits, indices, route_weights) =
+                    self.scratch.router_scratch_rows(exl3_rows)?;
+                let (router_probs, router_biased) = self.scratch.router_scores_rows(exl3_rows)?;
                 self.router.launch(
                     gpu,
-                    Glm53RouterPlan::new(1, 4096, 288, 8)?,
+                    Glm53RouterPlan::new(exl3_rows, 4096, 288, 8)?,
                     Glm53RouterBuffers {
                         input_bf16: self.bound.collapsed,
-                        router_f32: GgmlIqBuffer {
-                            ptr: moe.router.ptr(),
-                            bytes: moe.router.bytes(),
-                        },
-                        bias_f32: GgmlIqBuffer {
-                            ptr: moe.expert_bias.ptr(),
-                            bytes: moe.expert_bias.bytes(),
-                        },
+                        router_f32: router_weight,
+                        bias_f32: router_bias,
                         logits_f32: logits,
                         indices_u32: indices,
                         weights_f32: route_weights,
@@ -565,24 +848,70 @@ impl<'w> Glm53Dispatcher<'w> {
                 // default and is PERMANENT: it is the only thing the grouped
                 // kernel can be checked against bit-exactly, and it makes an
                 // A/B an env flip on one binary rather than two builds.
-                let moe_buffers = self
-                    .scratch
-                    .moe_buffers(self.bound.collapsed, self.bound.hidden_b);
-                let result = match self.moe_path {
-                    Glm53MoePath::SerialReference => self
-                        .moe
-                        .execute(gpu, moe, moe_buffers, stream)
-                        .map(|_receipt| ()),
-                    Glm53MoePath::Grouped => self
-                        .moe
-                        .execute_grouped(
-                            gpu,
-                            moe,
-                            moe_buffers,
-                            self.scratch.grouped_moe_scratch(),
-                            stream,
-                        )
-                        .map(|_receipt| ()),
+                let moe_buffers = self.scratch.moe_buffers_rows(
+                    exl3_rows,
+                    self.bound.collapsed,
+                    self.bound.hidden_b,
+                )?;
+                let result = match &self.catalog {
+                    Glm53DispatchCatalog::Gguf { layers, .. } => {
+                        let Some(Glm53FfnWeights::Moe(moe)) = layers.get(index).map(|w| &w.ffn)
+                        else {
+                            unreachable!()
+                        };
+                        match self.moe_path {
+                            Glm53MoePath::SerialReference => {
+                                self.moe.execute(gpu, moe, moe_buffers, stream).map(|_| ())
+                            }
+                            Glm53MoePath::Grouped => self
+                                .moe
+                                .execute_grouped(
+                                    gpu,
+                                    moe,
+                                    moe_buffers,
+                                    self.scratch.grouped_moe_scratch(),
+                                    stream,
+                                )
+                                .map(|_| ()),
+                        }
+                    }
+                    Glm53DispatchCatalog::Exl3 { layers, .. } => {
+                        let Some(Glm53Exl3FfnWeights::Moe(moe)) = layers.get(index).map(|w| &w.ffn)
+                        else {
+                            unreachable!()
+                        };
+                        if self.exl3_fused_moe {
+                            let tables = self
+                                .exl3_moe_tables
+                                .and_then(|tables| tables.get(index))
+                                .and_then(|tables| *tables)
+                                .context("GLM EXL3 fused MoE pointer table missing")?;
+                            self.moe
+                                .execute_exl3_fused_rows(
+                                    gpu,
+                                    exl3_rows,
+                                    moe,
+                                    moe_buffers,
+                                    self.scratch.exl3_projection_scratch_rows(exl3_rows)?,
+                                    self.scratch.exl3_moe_scratch(),
+                                    tables,
+                                    stream,
+                                )
+                                .map(|_| ())
+                        } else if exl3_rows == 1 {
+                            self.moe
+                                .execute_exl3(
+                                    gpu,
+                                    moe,
+                                    moe_buffers,
+                                    self.scratch.exl3_projection_scratch(),
+                                    stream,
+                                )
+                                .map(|_| ())
+                        } else {
+                            bail!("GLM EXL3 wide MoE requires the fused device-routed path")
+                        }
+                    }
                 };
                 {
                     // Bring-up diagnostic (ATLAS_GLM53_DUMP_DIR): MoE routing.
@@ -598,7 +927,11 @@ impl<'w> Glm53Dispatcher<'w> {
                         self.attention.geometry.position,
                         &format!("moe-layer{layer}"),
                         &[
-                            ("route_ids_u32", b.route_ids_u32, super::walk_dump::Glm53DumpDtype::U32),
+                            (
+                                "route_ids_u32",
+                                b.route_ids_u32,
+                                super::walk_dump::Glm53DumpDtype::U32,
+                            ),
                             // Full 288-expert score vectors, one named file
                             // each. Names mirror llama's ffn_moe_probs /
                             // ffn_moe_probs_biased so the two engines' files
@@ -607,15 +940,43 @@ impl<'w> Glm53Dispatcher<'w> {
                             // every consumer know a stride, and a stride
                             // mistake is silent -- it yields plausible numbers
                             // that are simply the wrong ranking.
-                            ("route_scores_logits", logits, super::walk_dump::Glm53DumpDtype::F32),
-                            ("route_scores_prebias", router_probs, super::walk_dump::Glm53DumpDtype::F32),
+                            (
+                                "route_scores_logits",
+                                logits,
+                                super::walk_dump::Glm53DumpDtype::F32,
+                            ),
+                            (
+                                "route_scores_prebias",
+                                router_probs,
+                                super::walk_dump::Glm53DumpDtype::F32,
+                            ),
                             // The score selection actually ranks on. Sort this
                             // to get Atlas's own 8th-vs-9th margin.
-                            ("route_scores_biased", router_biased, super::walk_dump::Glm53DumpDtype::F32),
-                            ("routed", b.routed_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                            ("shared", b.shared_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                            ("route_weights_f32", b.route_weights_f32, super::walk_dump::Glm53DumpDtype::F32),
-                            ("out", self.bound.hidden_b, super::walk_dump::Glm53DumpDtype::Bf16),
+                            (
+                                "route_scores_biased",
+                                router_biased,
+                                super::walk_dump::Glm53DumpDtype::F32,
+                            ),
+                            (
+                                "routed",
+                                b.routed_bf16,
+                                super::walk_dump::Glm53DumpDtype::Bf16,
+                            ),
+                            (
+                                "shared",
+                                b.shared_bf16,
+                                super::walk_dump::Glm53DumpDtype::Bf16,
+                            ),
+                            (
+                                "route_weights_f32",
+                                b.route_weights_f32,
+                                super::walk_dump::Glm53DumpDtype::F32,
+                            ),
+                            (
+                                "out",
+                                self.bound.hidden_b,
+                                super::walk_dump::Glm53DumpDtype::Bf16,
+                            ),
                         ],
                     )?;
                 }
@@ -626,40 +987,124 @@ impl<'w> Glm53Dispatcher<'w> {
                 kind: Glm53TargetFfnKind::Dense,
             } => {
                 let index = usize::try_from(*layer)?;
-                let weights = self.catalog.get(index).ok_or_else(|| {
-                    anyhow::anyhow!("GLM dispatch: layer {layer} has no catalog weights")
-                })?;
-                let Glm53FfnWeights::Dense(dense) = &weights.ffn else {
-                    bail!("GLM dispatch: layer {layer} is scheduled dense but holds MoE weights")
-                };
-                self.dense
-                    .execute(
-                        gpu,
-                        dense,
-                        self.bound.collapsed,
-                        self.scratch.dense_buffers(),
-                        self.bound.hidden_b,
-                        stream,
-                    )
-                    .map(|_launches| ())
+                match &self.catalog {
+                    Glm53DispatchCatalog::Gguf { layers, .. } => {
+                        let Some(Glm53FfnWeights::Dense(dense)) = layers.get(index).map(|w| &w.ffn)
+                        else {
+                            bail!(
+                                "GLM dispatch: layer {layer} is scheduled dense but holds MoE weights"
+                            )
+                        };
+                        self.dense
+                            .execute(
+                                gpu,
+                                dense,
+                                self.bound.collapsed,
+                                self.scratch.dense_buffers(),
+                                self.bound.hidden_b,
+                                stream,
+                            )
+                            .map(|_| ())
+                    }
+                    Glm53DispatchCatalog::Exl3 { layers, .. } => {
+                        let Some(Glm53Exl3FfnWeights::Dense(dense)) =
+                            layers.get(index).map(|w| &w.ffn)
+                        else {
+                            bail!(
+                                "GLM EXL3 dispatch: layer {layer} is scheduled dense but holds MoE weights"
+                            )
+                        };
+                        self.dense
+                            .execute_exl3_rows(
+                                gpu,
+                                self.plan.tokens,
+                                dense,
+                                self.bound.collapsed,
+                                self.scratch.dense_buffers_rows(self.plan.tokens)?,
+                                self.scratch
+                                    .exl3_projection_scratch_rows(self.plan.tokens)?,
+                                self.bound.hidden_b,
+                                stream,
+                            )
+                            .map(|_| ())
+                    }
+                }
             }
             Glm53TargetEvent::CaptureWidenedMhc { layer, slot } => {
-                self.captures
-                    .capture(gpu, *layer, *slot, self.bound.widened_hc, stream)
+                if glm53_layer_major_prefill_active() {
+                    return Ok(());
+                }
+                let destination =
+                    self.captures
+                        .contracted_slot_rows(*layer, *slot, self.plan.tokens)?;
+                self.hyper
+                    .mean(gpu, self.plan, self.bound.widened_hc, destination, stream)
             }
             // The head reads the collapsed hidden state that FinalNormF32 just
             // normalized in place.
-            Glm53TargetEvent::LmHeadF32 => self.dense.project(
-                gpu,
-                self.lm_head,
-                self.bound.collapsed,
-                self.scratch.dense_buffers().q8_activation,
-                GgmlIqBuffer {
-                    ptr: self.logits.ptr,
-                    bytes: self.lm_head.plan(1)?.output_bytes,
-                },
-                stream,
-            ),
+            Glm53TargetEvent::LmHeadF32 => match &self.catalog {
+                Glm53DispatchCatalog::Gguf { lm_head, .. } => self.dense.project(
+                    gpu,
+                    lm_head,
+                    self.bound.collapsed,
+                    self.scratch.dense_buffers().q8_activation,
+                    GgmlIqBuffer {
+                        ptr: self.logits.ptr,
+                        bytes: lm_head.plan(1)?.output_bytes,
+                    },
+                    stream,
+                ),
+                Glm53DispatchCatalog::Exl3 { lm_head, .. } => {
+                    let selector = match std::env::var("ATLAS_GLM53_EXL3_LAST_ROW_HEAD") {
+                        Ok(value) => Some(value),
+                        Err(std::env::VarError::NotPresent) => None,
+                        Err(std::env::VarError::NotUnicode(_)) => {
+                            bail!("ATLAS_GLM53_EXL3_LAST_ROW_HEAD is not valid UTF-8")
+                        }
+                    };
+                    let slice = glm53_exl3_lm_head_slice(
+                        self.plan.tokens,
+                        glm53_layer_major_prefill_active(),
+                        selector.as_deref(),
+                    )?;
+                    let projection = Glm53Exl3Projection::Compressed(lm_head);
+                    let plan = projection.plan(slice.rows)?;
+                    let input_offset = usize::try_from(slice.input_row)?
+                        .checked_mul(plan.input_bytes)
+                        .context("GLM EXL3 lm_head input offset overflow")?;
+                    let output_row_bytes = projection.plan(1)?.output_bytes;
+                    let output_offset = usize::try_from(slice.output_row)?
+                        .checked_mul(output_row_bytes)
+                        .context("GLM EXL3 lm_head output offset overflow")?;
+                    ensure!(
+                        input_offset
+                            .checked_add(plan.input_bytes)
+                            .is_some_and(|end| end <= self.bound.collapsed.bytes),
+                        "GLM EXL3 lm_head input slice exceeds collapsed rows"
+                    );
+                    ensure!(
+                        output_offset
+                            .checked_add(plan.output_bytes)
+                            .is_some_and(|end| end <= self.logits.bytes),
+                        "GLM EXL3 lm_head output slice exceeds logits rows"
+                    );
+                    self.dense.project_exl3_rows(
+                        gpu,
+                        slice.rows,
+                        lm_head,
+                        GgmlIqBuffer {
+                            ptr: self.bound.collapsed.ptr.offset(input_offset),
+                            bytes: plan.input_bytes,
+                        },
+                        self.scratch.exl3_projection_scratch_rows(slice.rows)?,
+                        GgmlIqBuffer {
+                            ptr: self.logits.ptr.offset(output_offset),
+                            bytes: plan.output_bytes,
+                        },
+                        stream,
+                    )
+                }
+            },
         }
     }
 

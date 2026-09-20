@@ -152,8 +152,12 @@ fn fake_tensor(cursor: &mut u64, dimensions: &[u64], kind: GgmlType) -> GgufDevi
         dimensions: dimensions.to_vec(),
         ggml_type: kind,
         byte_len,
-        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(kind, &dimensions, byte_len)
-            .expect("test tensor slack"),
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(
+            kind,
+            &dimensions,
+            byte_len,
+        )
+        .expect("test tensor slack"),
     }
 }
 

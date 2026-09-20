@@ -250,8 +250,9 @@ pub use device::{
     mmq_tensor_alloc_bytes,
 };
 pub use glm53::{
-    GLM53_GGUF_REVISION, GLM53_GGUF_VOCAB_SIZE, Glm53GgufSummary, Glm53Iq3Summary, Glm53QuantProfile, open_glm53_files,
-    open_glm53_iq3_files, validate_glm53_files, validate_glm53_iq3_files,
+    GLM53_GGUF_REVISION, GLM53_GGUF_VOCAB_SIZE, Glm53GgufSummary, Glm53Iq3Summary,
+    Glm53QuantProfile, open_glm53_files, open_glm53_iq3_files, validate_glm53_files,
+    validate_glm53_iq3_files,
 };
 pub use payload::{Glm53GgufFiles, Glm53Iq3Files};
 pub use shards::{GgufDirectory, GgufShardRef, LocatedTensor, assemble_split_shards};

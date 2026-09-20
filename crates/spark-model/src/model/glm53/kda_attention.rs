@@ -38,12 +38,17 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::gguf::GgmlType;
 
 use crate::layers::ops::{
-    GgmlIqBuffer, GgmlIqMmqKernels, Glm53KdaBetaBuffers, Glm53KdaBetaPlan, Glm53KdaConvBuffers,
-    Glm53KdaConvKernel, Glm53KdaConvPlan, Glm53KdaDecodeBuffers, Glm53KdaDecodeKernel,
-    Glm53KdaDecodePlan, Glm53KdaForgetBuffers, Glm53KdaForgetPlan, Glm53KdaKernels,
-    Glm53KdaNormBuffers, Glm53KdaNormPlan,
+    GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer, GgmlIqMmqKernels, Glm53Exl3Buffer, Glm53Exl3Projection,
+    Glm53Exl3ProjectionBuffers, Glm53Exl3ProjectionScratch, Glm53KdaBetaBuffers, Glm53KdaBetaPlan,
+    Glm53KdaConvBuffers, Glm53KdaConvKernel, Glm53KdaConvPlan, Glm53KdaDecodeBuffers,
+    Glm53KdaDecodeKernel, Glm53KdaDecodePlan, Glm53KdaForgetBuffers, Glm53KdaForgetPlan,
+    Glm53KdaKernels, Glm53KdaNormBuffers, Glm53KdaNormPlan, Glm53KdaPrefillBuffers,
+    Glm53KdaPrefillKernel, Glm53KdaPrefillPlan, Glm53KdaQkvBuffers,
+    glm53_exact_wide_prefill_active, glm53_layer_major_prefill_active,
 };
-use crate::weight_loader::{Glm53GgufMatrix, Glm53KdaWeights};
+use crate::weight_loader::{
+    Glm53Exl3KdaWeights, Glm53Exl3NativeDtype, Glm53GgufMatrix, Glm53KdaWeights,
+};
 
 use super::kda_state_binding::Glm53KdaScratchState;
 use super::walk_scratch::Glm53KdaScratchBuffers;
@@ -58,6 +63,11 @@ const CONV_KERNEL: u32 = 4;
 /// Nine matmuls at two kernels each, the two-kernel conv stage, and the forget
 /// gate, beta, recurrence and gated norm.
 pub const GLM53_KDA_KERNEL_LAUNCHES: u32 = 9 * 2 + 2 + 4;
+
+/// Combined EXL3 QKV and output each use three launches, the five native BF16
+/// projections use cuBLASLt once each, followed by conv and four elementwise
+/// stages.
+pub const GLM53_EXL3_KDA_KERNEL_LAUNCHES: u32 = 2 * 3 + 5 + 2 + 4;
 
 /// The transactional convolution state for one layer.
 ///
@@ -90,6 +100,7 @@ pub struct Glm53KdaAttentionKernels {
     kda: Glm53KdaKernels,
     conv: Glm53KdaConvKernel,
     decode: Glm53KdaDecodeKernel,
+    prefill: Glm53KdaPrefillKernel,
 }
 
 impl Glm53KdaAttentionKernels {
@@ -110,6 +121,7 @@ impl Glm53KdaAttentionKernels {
             kda: Glm53KdaKernels::load(gpu)?,
             conv: Glm53KdaConvKernel::load(gpu)?,
             decode: Glm53KdaDecodeKernel::load(gpu)?,
+            prefill: Glm53KdaPrefillKernel::load(gpu)?,
         })
     }
 
@@ -163,6 +175,42 @@ impl Glm53KdaAttentionKernels {
 
     fn f32_buffer(ptr: DevicePtr, bytes: usize) -> GgmlIqBuffer {
         GgmlIqBuffer { ptr, bytes }
+    }
+
+    fn linear_exl3(
+        &self,
+        gpu: &dyn GpuBackend,
+        projection: Glm53Exl3Projection<'_>,
+        input: GgmlIqBuffer,
+        output: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        stream: u64,
+    ) -> Result<()> {
+        self.linear_exl3_rows(gpu, 1, projection, input, output, scratch, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_exl3_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        projection: Glm53Exl3Projection<'_>,
+        input: GgmlIqBuffer,
+        output: GgmlIqBuffer,
+        scratch: Glm53Exl3ProjectionScratch,
+        stream: u64,
+    ) -> Result<()> {
+        let plan = projection.plan(rows)?;
+        projection.launch(
+            gpu,
+            plan,
+            Glm53Exl3ProjectionBuffers {
+                input_bf16: exl3_buffer(input),
+                output_bf16: exl3_buffer(output),
+                scratch,
+            },
+            stream,
+        )
     }
 
     /// Stage one KDA layer.
@@ -324,13 +372,41 @@ impl Glm53KdaAttentionKernels {
                 position,
                 &format!("kda-layer{layer}"),
                 &[
-                    ("q_conv", buffers.q_conv_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("k_conv", buffers.k_conv_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("v_conv", buffers.v_conv_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("log_decay_f32", buffers.log_decay_f32, super::walk_dump::Glm53DumpDtype::F32),
-                    ("beta", buffers.beta_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("state_f32", state.buffer(), super::walk_dump::Glm53DumpDtype::F32),
-                    ("recurrent_out", buffers.recurrent_out_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
+                    (
+                        "q_conv",
+                        buffers.q_conv_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "k_conv",
+                        buffers.k_conv_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "v_conv",
+                        buffers.v_conv_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "log_decay_f32",
+                        buffers.log_decay_f32,
+                        super::walk_dump::Glm53DumpDtype::F32,
+                    ),
+                    (
+                        "beta",
+                        buffers.beta_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "state_f32",
+                        state.buffer(),
+                        super::walk_dump::Glm53DumpDtype::F32,
+                    ),
+                    (
+                        "recurrent_out",
+                        buffers.recurrent_out_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
                 ],
             )?;
         }
@@ -389,15 +465,423 @@ impl Glm53KdaAttentionKernels {
                 position,
                 &format!("kdaout-layer{layer}"),
                 &[
-                    ("g_a", buffers.g_a_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("g_b", buffers.g_b_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
-                    ("gated", buffers.gated_bf16, super::walk_dump::Glm53DumpDtype::Bf16),
+                    (
+                        "g_a",
+                        buffers.g_a_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "g_b",
+                        buffers.g_b_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
+                    (
+                        "gated",
+                        buffers.gated_bf16,
+                        super::walk_dump::Glm53DumpDtype::Bf16,
+                    ),
                     ("out", output, super::walk_dump::Glm53DumpDtype::Bf16),
                 ],
             )?;
         }
 
         Ok(GLM53_KDA_KERNEL_LAUNCHES)
+    }
+
+    /// Stage one KDA layer from the pinned EXL3 target checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_exl3(
+        &self,
+        gpu: &dyn GpuBackend,
+        weights: &Glm53Exl3KdaWeights,
+        input: GgmlIqBuffer,
+        buffers: Glm53KdaScratchBuffers,
+        projection_scratch: Glm53Exl3ProjectionScratch,
+        state: &Glm53KdaScratchState,
+        conv: Glm53KdaConvSlots,
+        position: u32,
+        capacity: u32,
+        nonce: u64,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<u32> {
+        self.stage_exl3_rows(
+            gpu,
+            1,
+            weights,
+            input,
+            buffers,
+            projection_scratch,
+            state,
+            conv,
+            position,
+            capacity,
+            nonce,
+            output,
+            stream,
+        )
+    }
+
+    /// Stage a causal EXL3 verifier chunk in one layer-major pass. The
+    /// recurrence mutates only the staged state and publishes the chunk end;
+    /// callers decide later whether that state is accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_exl3_rows(
+        &self,
+        gpu: &dyn GpuBackend,
+        rows: u32,
+        weights: &Glm53Exl3KdaWeights,
+        input: GgmlIqBuffer,
+        buffers: Glm53KdaScratchBuffers,
+        projection_scratch: Glm53Exl3ProjectionScratch,
+        state: &Glm53KdaScratchState,
+        conv: Glm53KdaConvSlots,
+        position: u32,
+        capacity: u32,
+        nonce: u64,
+        output: GgmlIqBuffer,
+        stream: u64,
+    ) -> Result<u32> {
+        let max_rows = if glm53_layer_major_prefill_active() {
+            u32::try_from(GLM53_EXL3_MAX_WIDE_ROWS)?
+        } else {
+            8
+        };
+        ensure!(
+            (1..=max_rows).contains(&rows),
+            "GLM EXL3 KDA rows must be 1..={max_rows}"
+        );
+        self.validate_exl3_shapes(weights)?;
+        state.prime(gpu, stream)?;
+
+        let qkv = buffers.combined_qkv_bf16;
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::Compressed(&weights.qkv),
+            input,
+            qkv,
+            projection_scratch,
+            stream,
+        )?;
+        if rows > 1 {
+            self.kda.split_qkv(
+                gpu,
+                rows,
+                Glm53KdaQkvBuffers {
+                    combined_bf16: qkv,
+                    query_bf16: buffers.q_proj_bf16,
+                    key_bf16: buffers.k_proj_bf16,
+                    value_bf16: buffers.v_proj_bf16,
+                },
+                stream,
+            )?;
+        }
+
+        let conv_weights = split_conv(&weights.conv)?;
+        let exact_wide = rows > 1 && glm53_exact_wide_prefill_active();
+        let batch_exact_carry = exact_wide
+            && std::env::var("ATLAS_GLM53_EXACT_WIDE_KDA_BATCH_COPY").as_deref() == Ok("1");
+        if exact_wide && !batch_exact_carry {
+            let slice = |buffer: GgmlIqBuffer, row: usize| -> Result<GgmlIqBuffer> {
+                ensure!(
+                    buffer.bytes == rows as usize * 16_384,
+                    "GLM exact-wide-prefill KDA conv buffer extent drift"
+                );
+                Ok(GgmlIqBuffer {
+                    ptr: buffer.ptr.offset(row * 16_384),
+                    bytes: 16_384,
+                })
+            };
+            for row in 0..rows as usize {
+                let row_position = position
+                    .checked_add(u32::try_from(row)?)
+                    .context("GLM exact-wide-prefill KDA conv position overflow")?;
+                self.conv.launch_stage(
+                    gpu,
+                    Glm53KdaConvPlan::new(
+                        1,
+                        1,
+                        capacity,
+                        row_position,
+                        row_position + 1,
+                        HEADS,
+                        HEAD_DIM,
+                        CONV_KERNEL,
+                        nonce,
+                    )?,
+                    Glm53KdaConvBuffers {
+                        q_input_bf16: slice(buffers.q_proj_bf16, row)?,
+                        k_input_bf16: slice(buffers.k_proj_bf16, row)?,
+                        v_input_bf16: slice(buffers.v_proj_bf16, row)?,
+                        q_weight_f32: conv_weights[0],
+                        k_weight_f32: conv_weights[1],
+                        v_weight_f32: conv_weights[2],
+                        persistent_state_f32: conv.persistent_state_f32,
+                        staged_state_f32: conv.staged_state_f32,
+                        q_output_bf16: slice(buffers.q_conv_bf16, row)?,
+                        k_output_bf16: slice(buffers.k_conv_bf16, row)?,
+                        v_output_bf16: slice(buffers.v_conv_bf16, row)?,
+                        published_ends_u32: conv.published_ends_u32,
+                        published_nonces_u64: conv.published_nonces_u64,
+                        logical_lengths_u32: conv.logical_lengths_u32,
+                    },
+                    stream,
+                )?;
+                gpu.copy_d2d_async(
+                    conv.staged_state_f32.ptr,
+                    conv.persistent_state_f32.ptr,
+                    conv.staged_state_f32.bytes,
+                    stream,
+                )?;
+            }
+        } else {
+            self.conv.launch_stage(
+                gpu,
+                Glm53KdaConvPlan::new(
+                    1,
+                    rows,
+                    capacity,
+                    position,
+                    position
+                        .checked_add(rows)
+                        .context("GLM KDA conv position overflow")?,
+                    HEADS,
+                    HEAD_DIM,
+                    CONV_KERNEL,
+                    nonce,
+                )?,
+                Glm53KdaConvBuffers {
+                    q_input_bf16: buffers.q_proj_bf16,
+                    k_input_bf16: buffers.k_proj_bf16,
+                    v_input_bf16: buffers.v_proj_bf16,
+                    q_weight_f32: conv_weights[0],
+                    k_weight_f32: conv_weights[1],
+                    v_weight_f32: conv_weights[2],
+                    persistent_state_f32: conv.persistent_state_f32,
+                    staged_state_f32: conv.staged_state_f32,
+                    q_output_bf16: buffers.q_conv_bf16,
+                    k_output_bf16: buffers.k_conv_bf16,
+                    v_output_bf16: buffers.v_conv_bf16,
+                    published_ends_u32: conv.published_ends_u32,
+                    published_nonces_u64: conv.published_nonces_u64,
+                    logical_lengths_u32: conv.logical_lengths_u32,
+                },
+                stream,
+            )?;
+            if batch_exact_carry {
+                gpu.copy_d2d_async(
+                    conv.staged_state_f32.ptr,
+                    conv.persistent_state_f32.ptr,
+                    conv.staged_state_f32.bytes,
+                    stream,
+                )?;
+            }
+        }
+
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::NativeBf16(&weights.f_a),
+            input,
+            buffers.f_a_bf16,
+            projection_scratch,
+            stream,
+        )?;
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::NativeBf16(&weights.f_b),
+            buffers.f_a_bf16,
+            buffers.f_b_bf16,
+            projection_scratch,
+            stream,
+        )?;
+        self.kda.forget_gate(
+            gpu,
+            Glm53KdaForgetPlan::new(rows, HEADS, HEAD_DIM)?,
+            Glm53KdaForgetBuffers {
+                projected_bf16: buffers.f_b_bf16,
+                dt_bias_f32: native_buffer(&weights.dt_bias),
+                a_log_f32: native_buffer(&weights.a_log),
+                output_f32: buffers.log_decay_f32,
+            },
+            stream,
+        )?;
+
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::NativeBf16(&weights.beta),
+            input,
+            buffers.beta_proj_bf16,
+            projection_scratch,
+            stream,
+        )?;
+        self.kda.beta(
+            gpu,
+            Glm53KdaBetaPlan::new(rows, HEADS)?,
+            Glm53KdaBetaBuffers {
+                projected_bf16: buffers.beta_proj_bf16,
+                output_bf16: buffers.beta_bf16,
+            },
+            stream,
+        )?;
+
+        if rows == 1 {
+            self.decode.launch(
+                gpu,
+                Glm53KdaDecodePlan::new(1, HEADS, HEAD_DIM, HEAD_DIM)?,
+                Glm53KdaDecodeBuffers {
+                    state_f32: state.buffer(),
+                    query_bf16: buffers.q_conv_bf16,
+                    key_bf16: buffers.k_conv_bf16,
+                    value_bf16: buffers.v_conv_bf16,
+                    log_decay_f32: buffers.log_decay_f32,
+                    beta_bf16: buffers.beta_bf16,
+                    output_bf16: buffers.recurrent_out_bf16,
+                },
+                stream,
+            )?;
+        } else {
+            let prefill_plan = Glm53KdaPrefillPlan::new(1, rows, HEADS, HEAD_DIM, HEAD_DIM)?;
+            let prefill_buffers = Glm53KdaPrefillBuffers {
+                state_f32: state.buffer(),
+                query_bf16: buffers.q_conv_bf16,
+                key_bf16: buffers.k_conv_bf16,
+                value_bf16: buffers.v_conv_bf16,
+                log_decay_f32: buffers.log_decay_f32,
+                beta_bf16: buffers.beta_bf16,
+                output_bf16: buffers.recurrent_out_bf16,
+            };
+            if rows > 8 && glm53_layer_major_prefill_active() {
+                self.prefill.launch_register_resident(
+                    gpu,
+                    prefill_plan,
+                    prefill_buffers,
+                    stream,
+                )?;
+            } else {
+                self.prefill
+                    .launch(gpu, prefill_plan, prefill_buffers, stream)?;
+            }
+        }
+
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::NativeBf16(&weights.g_a),
+            input,
+            buffers.g_a_bf16,
+            projection_scratch,
+            stream,
+        )?;
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::NativeBf16(&weights.g_b),
+            buffers.g_a_bf16,
+            buffers.g_b_bf16,
+            projection_scratch,
+            stream,
+        )?;
+        self.kda.gated_norm(
+            gpu,
+            Glm53KdaNormPlan::new(rows, HEADS, HEAD_DIM)?,
+            Glm53KdaNormBuffers {
+                input_bf16: buffers.recurrent_out_bf16,
+                weight_f32: native_buffer(&weights.norm),
+                gate_bf16: buffers.g_b_bf16,
+                output_bf16: buffers.gated_bf16,
+            },
+            stream,
+        )?;
+        self.linear_exl3_rows(
+            gpu,
+            rows,
+            Glm53Exl3Projection::Compressed(&weights.output),
+            buffers.gated_bf16,
+            output,
+            projection_scratch,
+            stream,
+        )?;
+        Ok(GLM53_EXL3_KDA_KERNEL_LAUNCHES)
+    }
+
+    fn validate_exl3_shapes(&self, weights: &Glm53Exl3KdaWeights) -> Result<()> {
+        for (name, matrix, inner, columns) in [
+            ("qkv", &weights.qkv, HIDDEN, 3 * QKV_DIM),
+            ("output", &weights.output, QKV_DIM, HIDDEN),
+        ] {
+            ensure!(
+                matrix.size_k() == inner && matrix.size_n() == columns,
+                "GLM EXL3 KDA {name} is [{}, {}], expected [{inner}, {columns}]",
+                matrix.size_k(),
+                matrix.size_n()
+            );
+        }
+        for (name, tensor, shape, dtype) in [
+            (
+                "a_log",
+                &weights.a_log,
+                &[HEADS as u64][..],
+                Glm53Exl3NativeDtype::F32,
+            ),
+            (
+                "beta",
+                &weights.beta,
+                &[HEADS as u64, HIDDEN as u64][..],
+                Glm53Exl3NativeDtype::Bf16,
+            ),
+            (
+                "conv",
+                &weights.conv,
+                &[(3 * QKV_DIM) as u64, 1, CONV_KERNEL as u64][..],
+                Glm53Exl3NativeDtype::F32,
+            ),
+            (
+                "dt_bias",
+                &weights.dt_bias,
+                &[QKV_DIM as u64][..],
+                Glm53Exl3NativeDtype::F32,
+            ),
+            (
+                "f_a",
+                &weights.f_a,
+                &[LOW_RANK as u64, HIDDEN as u64][..],
+                Glm53Exl3NativeDtype::Bf16,
+            ),
+            (
+                "f_b",
+                &weights.f_b,
+                &[QKV_DIM as u64, LOW_RANK as u64][..],
+                Glm53Exl3NativeDtype::Bf16,
+            ),
+            (
+                "g_a",
+                &weights.g_a,
+                &[LOW_RANK as u64, HIDDEN as u64][..],
+                Glm53Exl3NativeDtype::Bf16,
+            ),
+            (
+                "g_b",
+                &weights.g_b,
+                &[QKV_DIM as u64, LOW_RANK as u64][..],
+                Glm53Exl3NativeDtype::Bf16,
+            ),
+            (
+                "norm",
+                &weights.norm,
+                &[HEAD_DIM as u64][..],
+                Glm53Exl3NativeDtype::F32,
+            ),
+        ] {
+            ensure!(
+                tensor.dtype() == dtype && tensor.shape() == shape,
+                "GLM EXL3 KDA {name} dtype/shape drift"
+            );
+        }
+        Ok(())
     }
 
     /// Every projection's shape is pinned rather than inferred: a checkpoint
@@ -434,6 +918,37 @@ impl Glm53KdaAttentionKernels {
         }
         Ok(())
     }
+}
+
+fn exl3_buffer(buffer: GgmlIqBuffer) -> Glm53Exl3Buffer {
+    Glm53Exl3Buffer {
+        ptr: buffer.ptr,
+        bytes: buffer.bytes,
+    }
+}
+
+fn native_buffer(tensor: &crate::weight_loader::Glm53Exl3NativeTensor) -> GgmlIqBuffer {
+    GgmlIqBuffer {
+        ptr: tensor.ptr(),
+        bytes: tensor.bytes(),
+    }
+}
+
+fn split_conv(tensor: &crate::weight_loader::Glm53Exl3NativeTensor) -> Result<[GgmlIqBuffer; 3]> {
+    ensure!(
+        tensor.dtype() == Glm53Exl3NativeDtype::F32
+            && tensor.shape() == [(3 * QKV_DIM) as u64, 1, CONV_KERNEL as u64],
+        "GLM EXL3 KDA combined conv dtype/shape drift"
+    );
+    let bytes = QKV_DIM as usize * CONV_KERNEL as usize * size_of::<f32>();
+    ensure!(
+        tensor.bytes() == 3 * bytes,
+        "GLM EXL3 KDA conv extent drift"
+    );
+    Ok(std::array::from_fn(|index| GgmlIqBuffer {
+        ptr: DevicePtr(tensor.ptr().0 + (index * bytes) as u64),
+        bytes,
+    }))
 }
 
 #[cfg(test)]

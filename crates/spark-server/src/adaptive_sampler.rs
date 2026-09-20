@@ -28,6 +28,7 @@ pub enum GenerationZone {
 }
 
 /// Per-sequence adaptive sampling state machine.
+#[derive(Clone)]
 pub struct AdaptiveSamplingState {
     /// Current generation zone.
     pub zone: GenerationZone,

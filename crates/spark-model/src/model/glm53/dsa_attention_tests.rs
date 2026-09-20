@@ -10,8 +10,55 @@ use spark_runtime::weights::gguf::GgufDeviceTensor;
 
 use super::*;
 
-const TAIL_CAP: usize =
-    spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as usize;
+const EXL3_ABSORB_CUDA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../kernels/gb10/glm5.3-flash/exl3/glm53_exl3_dsa_absorb.cu"
+));
+const DSA_HOST_SOURCE: &str = include_str!("dsa_attention.rs");
+
+#[path = "dsa_tail_visibility_tests.rs"]
+mod tail_visibility;
+
+#[test]
+fn exl3_absorption_tiles_every_m2048_row() {
+    assert!(EXL3_ABSORB_CUDA.contains("const unsigned row_base = blockIdx.z * ROW_TILE;"));
+    assert!(EXL3_ABSORB_CUDA.contains("const unsigned global_row = row_base + row;"));
+    assert!(EXL3_ABSORB_CUDA.contains("const unsigned out_row0 = row_base + group;"));
+}
+
+#[test]
+fn layer_major_uses_one_causal_wide_stage_while_exact_wide_stays_tokenwise() {
+    let layer_major = DSA_HOST_SOURCE
+        .find("if rows > 1 && layer_major {")
+        .expect("layer-major DSA branch");
+    let exact_wide = DSA_HOST_SOURCE[layer_major..]
+        .find("if rows > 1 && exact_wide {")
+        .map(|offset| layer_major + offset)
+        .expect("legacy exact-wide DSA branch");
+    let batched = &DSA_HOST_SOURCE[layer_major..exact_wide];
+    assert!(batched.contains("self.precompute_wide_exl3_rows("));
+    assert!(batched.contains(".checked_add(self.stage_inner("));
+    assert!(!batched.contains("for row in"));
+
+    let legacy = &DSA_HOST_SOURCE[exact_wide..];
+    assert!(legacy.contains("for row in 0..rows as usize"));
+}
+
+#[test]
+fn dense_causal_attention_is_limited_to_layer_major_full_selector_coverage() {
+    let compact: String = DSA_HOST_SOURCE
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(compact.contains(
+        "letdense_full_coverage=dense_full_coverage(rows,geometry.position,geometry.capacity,glm53_layer_major_prefill_active(),)?;"
+    ));
+    assert!(DSA_HOST_SOURCE.contains("if dense_full_coverage {"));
+    assert!(DSA_HOST_SOURCE.contains("self.selected.launch_dense_causal("));
+    assert!(DSA_HOST_SOURCE.contains("self.selected\n                .launch(gpu, selected_plan"));
+}
+
+const TAIL_CAP: usize = spark_runtime::kv_cache::GLM53_DSA_TAIL_CAPACITY as usize;
 use crate::layers::ops::GgmlIqMmqPlan;
 use crate::model::glm53::walk_scratch::Glm53WalkScratch;
 use crate::weight_loader::{Glm53GgufF32, Glm53GgufMatrixBank};
@@ -23,6 +70,7 @@ struct TraceGpu {
     symbols: Mutex<HashMap<u64, String>>,
     next: Mutex<u64>,
     launched: Mutex<Vec<(String, u64, u64, u64)>>,
+    tail_visibility: tail_visibility::Recorder,
 }
 
 impl TraceGpu {
@@ -32,6 +80,7 @@ impl TraceGpu {
             symbols: Mutex::new(HashMap::new()),
             next: Mutex::new(1),
             launched: Mutex::new(Vec::new()),
+            tail_visibility: tail_visibility::Recorder::default(),
         }
     }
     fn launches(&self) -> Vec<(String, u64, u64, u64)> {
@@ -94,7 +143,8 @@ impl GpuBackend for TraceGpu {
         self.launched
             .lock()
             .unwrap()
-            .push((name, read(0), read(1), read(2)));
+            .push((name.clone(), read(0), read(1), read(2)));
+        self.tail_visibility.record(&name, params, _st);
         Ok(())
     }
     fn synchronize(&self, _s: u64) -> Result<()> {
@@ -146,8 +196,12 @@ fn f32_tensor(c: &mut u64, dims: &[u64]) -> GgufDeviceTensor {
         dimensions: dims.to_vec(),
         ggml_type: GgmlType::F32,
         byte_len: (elements * 4) as usize,
-        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(GgmlType::F32, dims, (elements * 4) as usize)
-            .expect("test tensor slack"),
+        alloc_bytes: spark_runtime::weights::gguf::mmq_tensor_alloc_bytes(
+            GgmlType::F32,
+            dims,
+            (elements * 4) as usize,
+        )
+        .expect("test tensor slack"),
     }
 }
 
@@ -390,6 +444,41 @@ fn geometry_rejects_a_zero_nonce_and_an_out_of_range_position() {
     assert_eq!(ok.usable_pools(), 1_024);
 }
 
+#[test]
+fn exact_wide_precompute_row_slices_are_disjoint_and_exact() {
+    let whole = GgmlIqBuffer {
+        ptr: DevicePtr(0x12_0000),
+        bytes: 4 * 3_072,
+    };
+    let rows = (0..4)
+        .map(|row| {
+            Glm53DsaAttentionKernels::exact_row_slice(whole, 4, row, 3_072, "query")
+                .expect("valid exact row")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows[0].ptr, whole.ptr);
+    assert_eq!(rows[3].ptr, whole.ptr.offset(3 * 3_072));
+    assert!(rows.iter().all(|row| row.bytes == 3_072));
+    assert!(
+        Glm53DsaAttentionKernels::exact_row_slice(whole, 4, 4, 3_072, "query").is_err(),
+        "an out-of-range row must fail"
+    );
+    assert!(
+        Glm53DsaAttentionKernels::exact_row_slice(
+            GgmlIqBuffer {
+                bytes: whole.bytes - 2,
+                ..whole
+            },
+            4,
+            0,
+            3_072,
+            "query",
+        )
+        .is_err(),
+        "a prefix buffer must not masquerade as the exact wide slab"
+    );
+}
+
 /// `usable_pools` counts PUBLISHED pools, which is floor(q / KPOOL).
 ///
 /// The completing pool IS counted at the step that completes it, because the
@@ -410,18 +499,24 @@ fn geometry_rejects_a_zero_nonce_and_an_out_of_range_position() {
 /// three-slot tail plus the current position via query metadata.
 #[test]
 fn usable_pools_counts_published_pools_and_the_tail_covers_the_remainder() {
-    let at = |position: u32| Glm53DsaLayerGeometry {
-        position,
-        capacity: CAPACITY,
-        nonce: 1,
-    }
-    .usable_pools();
+    let at = |position: u32| {
+        Glm53DsaLayerGeometry {
+            position,
+            capacity: CAPACITY,
+            nonce: 1,
+        }
+        .usable_pools()
+    };
 
     // Published-pool count: the pool completing at q IS counted at q, because
     // its row is published before score/topk.
     assert_eq!(at(0), 0);
     assert_eq!(at(2), 0, "no pool is complete before p3");
-    assert_eq!(at(3), 1, "pool 0 completes AT p3 and is published before scoring");
+    assert_eq!(
+        at(3),
+        1,
+        "pool 0 completes AT p3 and is published before scoring"
+    );
     assert_eq!(at(4), 1);
     assert_eq!(at(7), 2, "pool 1 covers 4..7 and completes AT p7");
     assert_eq!(at(8), 2);
@@ -455,6 +550,9 @@ fn usable_pools_counts_published_pools_and_the_tail_covers_the_remainder() {
     }
     // The bound is TIGHT: some position really does need all KPOOL-1 slots, so
     // the capacity is exactly right rather than merely sufficient.
-    assert_eq!(worst, capacity, "tail capacity must be exactly the worst case");
+    assert_eq!(
+        worst, capacity,
+        "tail capacity must be exactly the worst case"
+    );
     assert_eq!(capacity, 3, "the reference model carries three tail slots");
 }

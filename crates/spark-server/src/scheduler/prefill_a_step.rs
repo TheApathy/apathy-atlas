@@ -82,7 +82,6 @@ pub fn start_chunked_prefill(
     let req_prompt_logprobs = req.prompt_logprobs();
     let req_timeout_at = req.timeout_at();
     let grammar_spec = req.take_grammar_spec();
-    let mut grammar_state = compile_grammar_state(grammar_engine, &grammar_spec, eos_tokens);
     let (prompt_tokens, max_tokens, mut sink, image_pixels, temperature, cancel_flag) = match req {
         InferenceRequest::Streaming {
             prompt_tokens,
@@ -117,6 +116,18 @@ pub fn start_chunked_prefill(
         ),
     };
 
+    let mut grammar_state = match compile_grammar_state(
+        grammar_engine,
+        &grammar_spec,
+        eos_tokens,
+        req_require_tool_call,
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            send_error_to_sink(&mut sink, &error.to_string());
+            return Err(error);
+        }
+    };
     let request_start = Instant::now();
     let total = prompt_tokens.len();
     let chunk_len = total.min(max_prefill_tokens);
@@ -192,6 +203,7 @@ pub fn start_chunked_prefill(
             min_tokens: req_min_tokens,
             eos_tokens: eos_tokens.to_vec(),
             finished: true,
+            terminal_error: None,
             guard_stop: None,
             param_close_pending: 0,
             sink,
@@ -338,7 +350,7 @@ pub fn start_chunked_prefill(
         // Skipped when the images were already batch-encoded by the co-dispatch
         // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
         // for the whole tick; here we only set the per-stream slice base below.
-        if vision_slice.is_none() && !image_pixels.is_empty() {
+        if vision_slice.is_none() {
             model.prepare_vision_embed(&image_pixels)?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
@@ -349,8 +361,10 @@ pub fn start_chunked_prefill(
             // request's image embeddings — lag-by-one cross-image contamination
             // (and torn reads / illegal access under interleaved load). Make
             // prefill_stream wait for the encode to complete before injecting.
-            model.record_event(prefill_event, model.default_stream())?;
-            model.stream_wait_event(prefill_stream, prefill_event)?;
+            if !image_pixels.is_empty() {
+                model.record_event(prefill_event, model.default_stream())?;
+                model.stream_wait_event(prefill_stream, prefill_event)?;
+            }
         }
 
         // EP: broadcast chunk 0 tokens to worker.
@@ -527,6 +541,7 @@ pub fn start_chunked_prefill(
                 min_tokens: req_min_tokens,
                 eos_tokens: eos_tokens.to_vec(),
                 finished: true,
+                terminal_error: None,
                 guard_stop: None,
                 param_close_pending: 0,
                 sink,
@@ -612,6 +627,7 @@ pub fn start_chunked_prefill(
                 min_tokens: req_min_tokens,
                 eos_tokens: eos_tokens.to_vec(),
                 finished: false,
+                terminal_error: None,
                 guard_stop: None,
                 param_close_pending: 0,
                 sink,

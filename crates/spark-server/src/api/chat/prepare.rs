@@ -50,6 +50,15 @@ pub(crate) fn prepare_chat_prompt(
     state: &Arc<AppState>,
     req: &mut ChatRequest,
 ) -> Result<PreparedChat, Response> {
+    crate::tool_parser::request_admission::capability(
+        &req.tools,
+        req.tool_choice.as_ref(),
+        state.tool_call_parser.as_deref(),
+        state.behavior.disable_tool_grammar,
+    )
+    .map_err(|message| {
+        super::super::compact::openai_error_response(axum::http::StatusCode::BAD_REQUEST, message)
+    })?;
     // Tool-active gating.
     let tools_active = state.tool_call_parser.is_some()
         && !req.tools.is_empty()

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
 //! Test-only helpers and per-area test sub-modules.
+
+mod glm_native_tokenizer;
+mod glm_tool_contract_grammar;
+mod glm_tool_prefix_contract;
 
 use super::*;
 use crate::tool_parser::ToolDefinition;

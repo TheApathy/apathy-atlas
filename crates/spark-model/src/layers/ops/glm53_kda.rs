@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 
-use super::GgmlIqBuffer;
+use super::{GLM53_EXL3_MAX_WIDE_ROWS, GgmlIqBuffer};
 
 const HEADS: u32 = 64;
 const HEAD_DIM: u32 = 128;
@@ -145,10 +145,19 @@ pub struct Glm53KdaBetaBuffers {
     pub output_bf16: GgmlIqBuffer,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Glm53KdaQkvBuffers {
+    pub combined_bf16: GgmlIqBuffer,
+    pub query_bf16: GgmlIqBuffer,
+    pub key_bf16: GgmlIqBuffer,
+    pub value_bf16: GgmlIqBuffer,
+}
+
 pub struct Glm53KdaKernels {
     forget_gate: KernelHandle,
     beta: KernelHandle,
     gated_norm: KernelHandle,
+    split_qkv: KernelHandle,
 }
 
 impl Glm53KdaKernels {
@@ -157,6 +166,7 @@ impl Glm53KdaKernels {
             forget_gate: gpu.kernel("glm53_kda", "atlas_glm53_kda_forget_gate")?,
             beta: gpu.kernel("glm53_kda", "atlas_glm53_kda_beta_sigmoid")?,
             gated_norm: gpu.kernel("glm53_kda", "atlas_glm53_kda_gated_rms_norm")?,
+            split_qkv: gpu.kernel("glm53_kda", "atlas_glm53_kda_split_qkv")?,
         })
     }
 
@@ -188,6 +198,38 @@ impl Glm53KdaKernels {
             .arg_u32(HEADS)
             .arg_u32(HEAD_DIM)
             .arg_f32(GATE_LOWER_BOUND)
+            .launch(stream)
+    }
+
+    pub fn split_qkv(
+        &self,
+        gpu: &dyn GpuBackend,
+        tokens: u32,
+        buffers: Glm53KdaQkvBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        if !(1..=u32::try_from(GLM53_EXL3_MAX_WIDE_ROWS)?).contains(&tokens) {
+            bail!("GLM KDA QKV split requires 1..={GLM53_EXL3_MAX_WIDE_ROWS} tokens");
+        }
+        let plane_bytes = usize::try_from(tokens)?
+            .checked_mul(QKV_DIM as usize * 2)
+            .context("GLM KDA QKV split extent overflow")?;
+        validate_set(&[
+            ("combined QKV", buffers.combined_bf16, 3 * plane_bytes),
+            ("query QKV", buffers.query_bf16, plane_bytes),
+            ("key QKV", buffers.key_bf16, plane_bytes),
+            ("value QKV", buffers.value_bf16, plane_bytes),
+        ])?;
+        let elements = u32::try_from(plane_bytes / 2)?;
+        let blocks = elements.div_ceil(ELEMENT_THREADS);
+        KernelLaunch::new(gpu, self.split_qkv)
+            .grid([blocks, 1, 1])
+            .block([ELEMENT_THREADS, 1, 1])
+            .arg_ptr(buffers.combined_bf16.ptr)
+            .arg_ptr(buffers.query_bf16.ptr)
+            .arg_ptr(buffers.key_bf16.ptr)
+            .arg_ptr(buffers.value_bf16.ptr)
+            .arg_u32(tokens)
             .launch(stream)
     }
 
@@ -399,5 +441,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(gpu.launch_count(), 3);
+    }
+
+    #[test]
+    fn qkv_split_admits_m2048_and_rejects_m2049_before_enqueue() {
+        let gpu = MockGpuBackend::new();
+        let kernels = Glm53KdaKernels::load(&gpu).unwrap();
+        let rows = GLM53_EXL3_MAX_WIDE_ROWS as u32;
+        let plane_bytes = rows as usize * QKV_DIM as usize * 2;
+        let at = |ptr, bytes| GgmlIqBuffer {
+            ptr: DevicePtr(ptr),
+            bytes,
+        };
+        kernels
+            .split_qkv(
+                &gpu,
+                rows,
+                Glm53KdaQkvBuffers {
+                    combined_bf16: at(0x1000_0000, 3 * plane_bytes),
+                    query_bf16: at(0x2000_0000, plane_bytes),
+                    key_bf16: at(0x3000_0000, plane_bytes),
+                    value_bf16: at(0x4000_0000, plane_bytes),
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(gpu.launch_count(), 1);
+        assert!(
+            kernels
+                .split_qkv(
+                    &gpu,
+                    rows + 1,
+                    Glm53KdaQkvBuffers {
+                        combined_bf16: at(0x1000_0000, 3 * plane_bytes),
+                        query_bf16: at(0x2000_0000, plane_bytes),
+                        key_bf16: at(0x3000_0000, plane_bytes),
+                        value_bf16: at(0x4000_0000, plane_bytes),
+                    },
+                    0,
+                )
+                .is_err()
+        );
+        assert_eq!(gpu.launch_count(), 1);
     }
 }

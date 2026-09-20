@@ -117,6 +117,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_HW");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_MODEL");
     println!("cargo:rerun-if-env-changed=ATLAS_TARGET_QUANT");
+    println!("cargo:rerun-if-env-changed=ATLAS_EXLLAMAV3_SOURCE");
     // ATLAS_EXTRA_NVCC_FLAGS — global nvcc-flag override read by
     // `build_target::NvidiaTarget::compile`. Used for kernel bisection
     // tests (e.g. `-DATLAS_FAST_SOFTMAX_EXP=1` to flip the softmax
@@ -908,6 +909,9 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 }
                 module_overrides.extend(m);
             }
+            if hw == "gb10" && model == "glm5.3-flash" && quant == "exl3" {
+                extra_flags.extend(pinned_exllamav3_flags());
+            }
 
             // Parse sampling presets, behavior, and model_types from MODEL.toml
             let (s_tt, s_tc, s_nt, s_tools) = parse_sampling_presets(&model_dir);
@@ -964,6 +968,94 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
     // Sort by (model, quant) for deterministic ordering
     targets.sort_by(|a, b| (&a.model, &a.quant).cmp(&(&b.model, &b.quant)));
     targets
+}
+
+/// Admit the exact ExLlamaV3 source used by the published one-Spark recipe.
+///
+/// Atlas intentionally does not fall back to a system installation or a
+/// floating checkout: EXL3's packed layout and generated symbol ABI are tied
+/// to this revision. The thin model compunits include the admitted sources.
+fn pinned_exllamav3_flags() -> Vec<String> {
+    const REVISION: &str = "e648f1a131365aae15920073e761a3fa5a527654";
+    const LICENSE_SHA256: &str = "27a32b6263fcd96c79d3beeecf221c4366780bdf15ad51986f48650bd7369bff";
+
+    let checkout = PathBuf::from(env::var("ATLAS_EXLLAMAV3_SOURCE").unwrap_or_else(|_| {
+        panic!(
+            "GLM-5.3-Flash EXL3 requires ATLAS_EXLLAMAV3_SOURCE pointing to clean revision {REVISION}"
+        )
+    }))
+    .canonicalize()
+    .unwrap_or_else(|e| panic!("cannot resolve ATLAS_EXLLAMAV3_SOURCE: {e}"));
+
+    let git_output = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot inspect pinned ExLlamaV3 checkout: {e}"));
+        assert!(
+            output.status.success(),
+            "git inspection failed for {}: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8(output.stdout)
+            .expect("git output is not UTF-8")
+            .trim()
+            .to_owned()
+    };
+    let head = git_output(&["rev-parse", "HEAD"]);
+    assert_eq!(head, REVISION, "unapproved ExLlamaV3 revision");
+    let dirty = git_output(&["status", "--porcelain", "--untracked-files=no"]);
+    assert!(dirty.is_empty(), "pinned ExLlamaV3 checkout is dirty");
+
+    let license = checkout.join("LICENSE");
+    let digest = std::process::Command::new("sha256sum")
+        .arg(&license)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot hash {}: {e}", license.display()));
+    assert!(
+        digest.status.success(),
+        "sha256sum failed for ExLlamaV3 LICENSE"
+    );
+    let digest = String::from_utf8(digest.stdout)
+        .expect("sha256sum output is not UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("sha256sum returned no digest")
+        .to_owned();
+    assert_eq!(digest, LICENSE_SHA256, "unapproved ExLlamaV3 license bytes");
+
+    let extension = checkout.join("exllamav3/exllamav3_ext");
+    for bits in [2, 3, 4, 5] {
+        let compunit = extension.join(format!("quant/comp_units/exl3_comp_unit_{bits}_cb2.cu"));
+        assert!(
+            compunit.is_file(),
+            "pinned ExLlamaV3 extension source is missing: {}",
+            compunit.display()
+        );
+    }
+    let moe_compunit = extension.join("quant/comp_units/exl3_moe_inst_k2_cb2.cu");
+    assert!(
+        moe_compunit.is_file(),
+        "pinned ExLlamaV3 MoE source is missing: {}",
+        moe_compunit.display()
+    );
+    let gemv_kernel = extension.join("quant/exl3_gemv_kernel.cuh");
+    assert!(
+        gemv_kernel.is_file(),
+        "pinned ExLlamaV3 GEMV source is missing: {}",
+        gemv_kernel.display()
+    );
+    println!("cargo:rerun-if-changed={}", license.display());
+    println!("cargo:rerun-if-changed={}", extension.display());
+    vec![
+        "-std=c++17".to_owned(),
+        format!("-I{}", extension.display()),
+        "-Xcudafe".to_owned(),
+        "--diag_suppress=20012".to_owned(),
+    ]
 }
 
 /// List subdirectory names (not files) in a directory, sorted.

@@ -10,11 +10,12 @@
 
 __device__ __forceinline__ bool glm53_dflash2_capture_pair(
         unsigned int post_layer, unsigned int slot) {
-    return (post_layer == 5U && slot == 0U) ||
-        (post_layer == 14U && slot == 1U) ||
-        (post_layer == 24U && slot == 2U) ||
-        (post_layer == 33U && slot == 3U) ||
-        (post_layer == 42U && slot == 4U);
+    // Config IDs are one-based; the Atlas walk passes zero-based layer indices.
+    return (post_layer == 4U && slot == 0U) ||
+        (post_layer == 13U && slot == 1U) ||
+        (post_layer == 23U && slot == 2U) ||
+        (post_layer == 32U && slot == 3U) ||
+        (post_layer == 41U && slot == 4U);
 }
 
 extern "C" __global__ void __launch_bounds__(GLM53_DFLASH2_THREADS, 1)
@@ -47,5 +48,35 @@ atlas_glm53_dflash2_capture_mean(
                     (unsigned long long) stream * GLM53_DFLASH2_HIDDEN + column]);
         }
         captures[output_base + column] = __float2bfloat16_rn(sum * 0.25f);
+    }
+}
+
+// Reorder one checked slot-major capture tile into token-major/tap-major FC input.
+extern "C" __global__ void __launch_bounds__(GLM53_DFLASH2_THREADS, 1)
+atlas_glm53_dflash2_gather_capture_tile(
+        const __nv_bfloat16 * __restrict__ captures,
+        __nv_bfloat16 * __restrict__ staging,
+        unsigned int first_row, unsigned int rows,
+        unsigned int slot_stride_elements) {
+    if (captures == nullptr || staging == nullptr || rows == 0U || rows > 128U ||
+        first_row > 0xffffffffU - rows ||
+        slot_stride_elements % GLM53_DFLASH2_HIDDEN != 0U ||
+        first_row + rows > slot_stride_elements / GLM53_DFLASH2_HIDDEN) {
+        return;
+    }
+    const unsigned int elements =
+        rows * GLM53_DFLASH2_CAPTURES * GLM53_DFLASH2_HIDDEN;
+    for (unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+         index < elements; index += blockDim.x * gridDim.x) {
+        const unsigned int column = index % GLM53_DFLASH2_HIDDEN;
+        const unsigned int token_tap = index / GLM53_DFLASH2_HIDDEN;
+        const unsigned int slot = token_tap % GLM53_DFLASH2_CAPTURES;
+        const unsigned int row = token_tap / GLM53_DFLASH2_CAPTURES;
+        const unsigned int output =
+            (row * GLM53_DFLASH2_CAPTURES + slot) * GLM53_DFLASH2_HIDDEN + column;
+        const unsigned long long input =
+            (unsigned long long) slot * slot_stride_elements +
+            (unsigned long long) (first_row + row) * GLM53_DFLASH2_HIDDEN + column;
+        staging[output] = captures[input];
     }
 }

@@ -95,7 +95,13 @@ pub(crate) fn report() {
     let m = BLOCKED_MOE_NS.load(Ordering::Relaxed);
     let f = BLOCKED_FINAL_NS.load(Ordering::Relaxed);
     let residual = w.saturating_sub(m).saturating_sub(f);
-    let pct = |x: u64| if w == 0 { 0.0 } else { 100.0 * x as f64 / w as f64 };
+    let pct = |x: u64| {
+        if w == 0 {
+            0.0
+        } else {
+            100.0 * x as f64 / w as f64
+        }
+    };
     let per = |x: u64| x as f64 / walks as f64 / 1.0e6;
     eprintln!(
         "GLM53_WALK_TIMING walks={walks} \
