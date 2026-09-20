@@ -19,6 +19,123 @@ enum ExactAttnOProjDispatch {
     PerRowK1,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttnGateBatchRoute {
+    Disabled,
+    Ineligible,
+    Complete,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttnOProjM17AStageRoute {
+    Disabled,
+    Ineligible,
+    Complete,
+    Missing,
+    Conflict,
+}
+
+/// Atomic production decision for the ABI-separated activation-staged O
+/// projection. A requested eligible route never silently falls through: a
+/// stale/missing symbol or an independently requested projection override is
+/// reported before gate/output buffers are mutated.
+const fn attn_o_proj_m17_astage_route(
+    requested: bool,
+    ordinary_nvfp4: bool,
+    gated: bool,
+    rows: usize,
+    has_kernel: bool,
+    rt2_requested: bool,
+    serial_override: bool,
+) -> AttnOProjM17AStageRoute {
+    if !requested {
+        return AttnOProjM17AStageRoute::Disabled;
+    }
+    if !ordinary_nvfp4 || !gated || rows < 9 || rows > 17 {
+        return AttnOProjM17AStageRoute::Ineligible;
+    }
+    if rt2_requested || serial_override {
+        return AttnOProjM17AStageRoute::Conflict;
+    }
+    if has_kernel {
+        AttnOProjM17AStageRoute::Complete
+    } else {
+        AttnOProjM17AStageRoute::Missing
+    }
+}
+
+fn parse_attn_o_proj_m17_astage(value: Option<&str>) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_ATTN_O_PROJ_EXACT_M17_ASTAGE must be exactly 0 or 1"),
+    }
+}
+
+fn attn_o_proj_m17_astage_requested() -> Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(
+        || match std::env::var("ATLAS_ATTN_O_PROJ_EXACT_M17_ASTAGE") {
+            Ok(value) => parse_attn_o_proj_m17_astage(Some(value.as_str())),
+            Err(std::env::VarError::NotPresent) => parse_attn_o_proj_m17_astage(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err("ATLAS_ATTN_O_PROJ_EXACT_M17_ASTAGE must be valid UTF-8 and exactly 0 or 1")
+            }
+        },
+    ))
+    .map_err(anyhow::Error::msg)
+}
+
+const fn attn_gate_batch_route(
+    requested: bool,
+    gated: bool,
+    rows: usize,
+    dim: u32,
+    gate_stride: u32,
+    has_kernel: bool,
+) -> AttnGateBatchRoute {
+    if !requested {
+        return AttnGateBatchRoute::Disabled;
+    }
+    if !gated
+        || rows < 5
+        || rows > 17
+        || dim == 0
+        || gate_stride < dim
+        || (rows as u64) * (dim as u64) > u32::MAX as u64
+    {
+        return AttnGateBatchRoute::Ineligible;
+    }
+    if has_kernel {
+        AttnGateBatchRoute::Complete
+    } else {
+        AttnGateBatchRoute::Missing
+    }
+}
+
+fn parse_attn_gate_batched(value: Option<&str>) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_ATTN_GATE_BATCHED must be exactly 0 or 1"),
+    }
+}
+
+fn attn_gate_batched_requested() -> Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(|| match std::env::var("ATLAS_ATTN_GATE_BATCHED") {
+        Ok(value) => parse_attn_gate_batched(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_attn_gate_batched(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_ATTN_GATE_BATCHED must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
 #[inline]
 fn should_auto_serialize_paged_split_boundary(
     rows: usize,
@@ -60,7 +177,7 @@ const fn exact_attn_o_proj_dispatch(
 /// sequential launches into a single batched launch. Default off for
 /// A/B safety. Bit-identical to the sequential path when the
 /// strided RoPE kernel is present.
-fn attn_qkv_mega_enabled() -> bool {
+pub(super) fn attn_qkv_mega_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
         std::env::var("ATLAS_ATTN_QKV_MEGA")
@@ -116,8 +233,16 @@ impl Qwen3AttentionLayer {
             ..
         } = *c;
 
+        let mega_requested = attn_qkv_mega_enabled();
+        if mega_requested && self.yarn.is_some() {
+            anyhow::bail!(
+                "ATLAS_ATTN_QKV_MEGA=1 is incompatible with YaRN; \
+                 the strided kernel has no scaling ABI"
+            );
+        }
+
         // Mega path: batched RoPE in one launch.
-        if attn_qkv_mega_enabled() && self.rope_strided_b3_k.0 != 0 {
+        if mega_requested && self.rope_strided_b3_k.0 != 0 {
             debug_assert!(per_seq_qkv % bf16 == 0, "qkv stride must be BF16-aligned");
             debug_assert!(
                 q_proj_bytes % bf16 == 0,
@@ -149,22 +274,42 @@ impl Qwen3AttentionLayer {
             let q_out_i = qkv_buf.offset(i * per_seq_qkv);
             let k_out_i = q_out_i.offset(q_proj_bytes);
             let pos_i = meta.positions.offset(i * 4); // u32 per position
-            ops::rope(
-                fwd.gpu,
-                self.rope_k,
-                q_out_i,
-                k_out_i,
-                pos_i,
-                1,
-                nq,
-                nkv,
-                hd,
-                self.rotary_dim_override
-                    .unwrap_or(fwd.config.rotary_dim() as u32),
-                self.rope_theta_override
-                    .unwrap_or(fwd.config.rope_theta as f32),
-                stream,
-            )?;
+            if self.mrope_interleaved {
+                self.apply_mrope(
+                    fwd.gpu,
+                    q_out_i,
+                    k_out_i,
+                    pos_i,
+                    meta.positions_h.offset(i * 4),
+                    meta.positions_w.offset(i * 4),
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(fwd.config.rotary_dim() as u32),
+                    self.rope_theta_override
+                        .unwrap_or(fwd.config.rope_theta as f32),
+                    stream,
+                )?;
+            } else {
+                ops::rope(
+                    fwd.gpu,
+                    self.rope_k,
+                    q_out_i,
+                    k_out_i,
+                    pos_i,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    self.rotary_dim_override
+                        .unwrap_or(fwd.config.rotary_dim() as u32),
+                    self.rope_theta_override
+                        .unwrap_or(fwd.config.rope_theta as f32),
+                    stream,
+                )?;
+            }
         }
         Ok(())
     }
@@ -832,23 +977,10 @@ impl Qwen3AttentionLayer {
             qkv_buf,
             ..
         } = *c;
-        if self.gated {
-            for i in 0..n {
-                let gate_i = qkv_buf.offset(i * per_seq_qkv + q_dim as usize * bf16);
-                let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
-                ops::sigmoid_gate_mul(
-                    fwd.gpu,
-                    self.sigmoid_gate_mul_k,
-                    attn_out_i,
-                    gate_i,
-                    attn_out_i,
-                    q_dim,
-                    stream,
-                )?;
-            }
-        }
 
-        let o_out = fwd.buffers.moe_output();
+        // Resolve the experimental projection before the gate mutates
+        // `attn_out`. A requested stale symbol or incompatible projection
+        // override therefore fails without a partial O-phase effect.
         let ordinary_nvfp4 = self
             .o_weight
             .as_ref()
@@ -856,11 +988,92 @@ impl Qwen3AttentionLayer {
             .is_none()
             && self.o_dense_bf16.is_none()
             && !self.attn.o_proj.is_null();
+        let serial_o_proj = n > 1 && crate::layers::attn_out_serial_enabled();
+        let o_proj_m17_astage_route = attn_o_proj_m17_astage_route(
+            attn_o_proj_m17_astage_requested()?,
+            ordinary_nvfp4,
+            self.gated,
+            n,
+            self.w4a16_exact_o_proj_kernels.m17_astage_present(),
+            ops::w4a16_gemv_rt2_enabled(),
+            serial_o_proj,
+        );
+        match o_proj_m17_astage_route {
+            AttnOProjM17AStageRoute::Missing => anyhow::bail!(
+                "ATLAS_ATTN_O_PROJ_EXACT_M17_ASTAGE=1 requires \
+                 w4a16_gemv_batch_logits_exact_m17_astage for eligible gated ordinary-NVFP4 M=9..17"
+            ),
+            AttnOProjM17AStageRoute::Conflict => anyhow::bail!(
+                "ATLAS_ATTN_O_PROJ_EXACT_M17_ASTAGE=1 conflicts with \
+                 ATLAS_W4A16_GEMV_RT2=1 or the serial attention-O control"
+            ),
+            AttnOProjM17AStageRoute::Disabled
+            | AttnOProjM17AStageRoute::Ineligible
+            | AttnOProjM17AStageRoute::Complete => {}
+        }
+
+        if self.gated {
+            let gate_stride = if per_seq_qkv.is_multiple_of(bf16) {
+                u32::try_from(per_seq_qkv / bf16).unwrap_or(0)
+            } else {
+                0
+            };
+            match attn_gate_batch_route(
+                attn_gate_batched_requested()?,
+                self.gated,
+                n,
+                q_dim,
+                gate_stride,
+                self.sigmoid_gate_mul_batched_k.0 != 0,
+            ) {
+                AttnGateBatchRoute::Complete => {
+                    static BATCHED_GATE: std::sync::Once = std::sync::Once::new();
+                    BATCHED_GATE.call_once(|| {
+                        tracing::info!(
+                            "ENGAGED ATLAS_ATTN_GATE_BATCHED: multi_seq M={n} dim={q_dim} stride={gate_stride}"
+                        );
+                    });
+                    ops::sigmoid_gate_mul_batched(
+                        fwd.gpu,
+                        self.sigmoid_gate_mul_batched_k,
+                        attn_out,
+                        qkv_buf.offset(q_dim as usize * bf16),
+                        attn_out,
+                        q_dim,
+                        gate_stride,
+                        n as u32,
+                        stream,
+                    )?;
+                }
+                AttnGateBatchRoute::Missing => {
+                    anyhow::bail!(
+                        "ATLAS_ATTN_GATE_BATCHED=1 requires sigmoid_gate_mul_batched for eligible gated M=5..17"
+                    );
+                }
+                AttnGateBatchRoute::Disabled | AttnGateBatchRoute::Ineligible => {
+                    for i in 0..n {
+                        let gate_i = qkv_buf.offset(i * per_seq_qkv + q_dim as usize * bf16);
+                        let attn_out_i = attn_out.offset(i * q_dim as usize * bf16);
+                        ops::sigmoid_gate_mul(
+                            fwd.gpu,
+                            self.sigmoid_gate_mul_k,
+                            attn_out_i,
+                            gate_i,
+                            attn_out_i,
+                            q_dim,
+                            stream,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let o_out = fwd.buffers.moe_output();
         let exact_o_dispatch = exact_attn_o_proj_dispatch(
             ordinary_nvfp4,
             self.w4a16_exact_o_proj_kernels.route_for_rows(n as u32),
         );
-        if n > 1 && crate::layers::attn_out_serial_enabled() {
+        if serial_o_proj {
             if self
                 .o_weight
                 .as_ref()
@@ -879,6 +1092,25 @@ impl Qwen3AttentionLayer {
             crate::model::control_engagement::engage(
                 crate::model::control_engagement::ControlPath::AttnOut,
             )?;
+        } else if o_proj_m17_astage_route == AttnOProjM17AStageRoute::Complete {
+            ops::w4a16_gemv_batch_logits_exact_m17_astage(
+                fwd.gpu,
+                self.w4a16_exact_o_proj_kernels.m17_astage(),
+                attn_out,
+                &self.attn.o_proj,
+                o_out,
+                n as u32,
+                h as u32,
+                nq * hd,
+                stream,
+            )?;
+            static O_PROJ_M17_ASTAGE: std::sync::Once = std::sync::Once::new();
+            O_PROJ_M17_ASTAGE.call_once(|| {
+                tracing::info!(
+                    "ENGAGED ATLAS_ATTN_O_PROJ_EXACT_M17_ASTAGE: multi_seq M={n} N={h} K={}",
+                    nq * hd
+                );
+            });
         } else if let Some(o_fp8) = self.o_weight.as_ref().and_then(|w| w.as_fp8()) {
             // FP8 native: per-token w8a16_gemv for O projection.
             for i in 0..n {

@@ -370,6 +370,96 @@ pub fn conv1d_update_prefill(
         .launch(stream)
 }
 
+/// Exact [`conv1d_update_prefill`] shadow with projected-Z persistence fused
+/// into the same per-channel token loop.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_update_prefill_zcopy(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state: DevicePtr,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    bias: DevicePtr,
+    output: DevicePtr,
+    z_input: DevicePtr,
+    z_output: DevicePtr,
+    d_inner: u32,
+    d_conv: u32,
+    seq_len: u32,
+    input_stride: u32,
+    output_stride: u32,
+    z_dim: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(d_inner, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(conv_state)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(bias)
+        .arg_ptr(output)
+        .arg_ptr(z_input)
+        .arg_ptr(z_output)
+        .arg_u32(d_inner)
+        .arg_u32(d_conv)
+        .arg_u32(seq_len)
+        .arg_u32(input_stride)
+        .arg_u32(output_stride)
+        .arg_u32(z_dim)
+        .launch(stream)
+}
+
+/// Exact two-phase prefill shadow that additionally folds the standalone Q/K
+/// L2-normalization launch into the sequential conv token loop.
+///
+/// The kernel is deliberately restricted to 128-wide heads. It materializes
+/// the conv+SiLU result as BF16 in shared memory and duplicates
+/// `l2_norm_bf16`'s packed-pair reduction and BF16 output conversion.
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_update_prefill_l2norm_zcopy(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    conv_state: DevicePtr,
+    input: DevicePtr,
+    weight: &DenseWeight,
+    bias: DevicePtr,
+    output: DevicePtr,
+    z_input: DevicePtr,
+    z_output: DevicePtr,
+    d_inner: u32,
+    d_conv: u32,
+    seq_len: u32,
+    input_stride: u32,
+    output_stride: u32,
+    z_dim: u32,
+    qk_channels: u32,
+    head_dim: u32,
+    l2_eps: f32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(d_inner, head_dim), 1, 1])
+        .block([head_dim, 1, 1])
+        .arg_ptr(conv_state)
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(bias)
+        .arg_ptr(output)
+        .arg_ptr(z_input)
+        .arg_ptr(z_output)
+        .arg_u32(d_inner)
+        .arg_u32(d_conv)
+        .arg_u32(seq_len)
+        .arg_u32(input_stride)
+        .arg_u32(output_stride)
+        .arg_u32(z_dim)
+        .arg_u32(qk_channels)
+        .arg_u32(head_dim)
+        .arg_f32(l2_eps)
+        .launch(stream)
+}
+
 /// Mamba-2 SSM prefill: sequential recurrence across `seq_len` tokens in a single kernel.
 ///
 /// Same algorithm as decode but loops over tokens, avoiding per-token launch overhead.

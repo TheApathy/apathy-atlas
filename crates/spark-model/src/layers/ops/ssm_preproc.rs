@@ -139,6 +139,54 @@ pub fn deinterleave_qg_split_qnorm(
         .launch(stream)
 }
 
+/// Exact Qwen3.8 C=1 prefill fusion for Q/G deinterleave, Q/K RMSNorm, and
+/// interleaved MRoPE. The kernel retains the parents' explicit BF16 boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen38_prefill_qknorm_rope(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    qg_data: DevicePtr,
+    q_out: DevicePtr,
+    k_data: DevicePtr,
+    q_norm_weight: DevicePtr,
+    k_norm_weight: DevicePtr,
+    pos_t: DevicePtr,
+    pos_h: DevicePtr,
+    pos_w: DevicePtr,
+    num_tokens: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    qg_stride: u32,
+    rotary_dim: u32,
+    eps: f32,
+    theta: f32,
+    stream: u64,
+) -> Result<()> {
+    let shared_bytes = num_q_heads * head_dim * 2 * 2;
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_tokens, 1, 1])
+        .block([256, 1, 1])
+        .shared_mem(shared_bytes)
+        .arg_ptr(qg_data)
+        .arg_ptr(q_out)
+        .arg_ptr(k_data)
+        .arg_ptr(q_norm_weight)
+        .arg_ptr(k_norm_weight)
+        .arg_ptr(pos_t)
+        .arg_ptr(pos_h)
+        .arg_ptr(pos_w)
+        .arg_u32(num_tokens)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(qg_stride)
+        .arg_u32(rotary_dim)
+        .arg_f32(eps)
+        .arg_f32(theta)
+        .launch(stream)
+}
+
 /// Batched sigmoid gate multiply across multiple tokens.
 ///
 /// Replaces per-token [`sigmoid_gate_mul`] launches with a single kernel.

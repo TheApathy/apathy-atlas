@@ -4,6 +4,77 @@
 
 use super::*;
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn flashinfer_scale_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn build_flashinfer_ssm_projection(
+    gpu: &dyn GpuBackend,
+    label: &str,
+    weight: &QuantizedWeight,
+    n: usize,
+    k: usize,
+) -> Result<FlashinferSsmProjection> {
+    use crate::weight_map::cutlass_scale_layout::{
+        NVFP4_GROUP_SIZE, deinterleave_nvfp4_scales_128x4, interleave_nvfp4_scales_128x4,
+    };
+    use anyhow::Context as _;
+
+    ensure!(
+        !weight.weight.is_null() && weight.weight.0.is_multiple_of(16),
+        "FlashInfer SSM {label} packed weight is null or misaligned"
+    );
+    ensure!(
+        !weight.weight_scale.is_null(),
+        "FlashInfer SSM {label} logical weight scales are null"
+    );
+    ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(NVFP4_GROUP_SIZE),
+        "FlashInfer SSM {label} has invalid N/K geometry"
+    );
+    ensure!(
+        weight.weight_scale_2.is_finite() && weight.weight_scale_2 > 0.0,
+        "FlashInfer SSM {label} weight_scale_2 must be finite and positive"
+    );
+
+    let groups = k / NVFP4_GROUP_SIZE;
+    let scale_len = n
+        .checked_mul(groups)
+        .context("FlashInfer SSM logical weight-scale length overflow")?;
+    let mut logical_scales = vec![0_u8; scale_len];
+    gpu.copy_d2h(weight.weight_scale, &mut logical_scales)
+        .with_context(|| format!("read FlashInfer SSM {label} logical weight scales"))?;
+    let physical_scales =
+        interleave_nvfp4_scales_128x4(&logical_scales, &[n, groups], NVFP4_GROUP_SIZE)?;
+    ensure!(
+        deinterleave_nvfp4_scales_128x4(&physical_scales, &[n, groups], NVFP4_GROUP_SIZE,)?
+            == logical_scales,
+        "FlashInfer SSM {label} physical weight scales failed exact round trip"
+    );
+
+    let weight_scales_128x4 = gpu
+        .alloc(physical_scales.len())
+        .with_context(|| format!("allocate FlashInfer SSM {label} physical weight scales"))?;
+    if let Err(error) = gpu.copy_h2d(&physical_scales, weight_scales_128x4) {
+        let _ = gpu.free(weight_scales_128x4);
+        return Err(error)
+            .with_context(|| format!("upload FlashInfer SSM {label} physical weight scales"));
+    }
+
+    Ok(FlashinferSsmProjection {
+        weight: weight.weight,
+        weight_scales_128x4,
+        weight_scales_hash: flashinfer_scale_fingerprint(&physical_scales),
+        weight_scale_2: weight.weight_scale_2,
+        n,
+        k,
+    })
+}
+
 impl Qwen3SsmLayer {
     pub fn new(
         input_norm: DenseWeight,
@@ -32,6 +103,8 @@ impl Qwen3SsmLayer {
             qkvz_nvfp4_t: None,
             out_proj_nvfp4_t: None,
             out_proj_dense: None,
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            flashinfer_ssm_prefill: None,
             qkvz_fp8w: None,
             out_proj_fp8w: None,
             sequential_qkvz: false,
@@ -212,6 +285,11 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy64_prefill",
                 "gated_delta_rule_prefill_wy64",
             ),
+            gdn_prefill_wy32_gatecache_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy32_gatecache",
+                "gated_delta_rule_prefill_wy32_gatecache",
+            ),
             // ── Q12 Phase 2b: batched GDN kernel handles ──
             gdn_prefill_wy32_batched_k: super::super::try_kernel(
                 gpu,
@@ -301,6 +379,16 @@ impl Qwen3SsmLayer {
             )),
             ba_gates_prefill_k: gpu.kernel("ssm_preprocess", "dense_gemm_ba_gates_prefill")?,
             conv1d_prefill_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_prefill")?,
+            conv1d_prefill_zcopy_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d",
+                "causal_conv1d_update_prefill_zcopy",
+            ),
+            conv1d_prefill_l2norm_zcopy_k: super::super::try_kernel(
+                gpu,
+                "causal_conv1d",
+                "causal_conv1d_update_prefill_l2norm_zcopy",
+            ),
             gdn_chunk2_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk2")?,
             conv1d_chunk2_k: gpu.kernel("causal_conv1d", "causal_conv1d_update_chunk2")?,
             gdn_chunk3_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_chunk3")?,
@@ -474,6 +562,135 @@ impl Qwen3SsmLayer {
         // Set Fp8Weight for decode GEMV (w8a16_gemv, needs per-row scale)
         self.qkvz_fp8w = qkvz;
         self.out_proj_fp8w = out_proj;
+    }
+
+    /// Build the exact runtime-generated NVFP4 weight operands for the
+    /// default-off FlashInfer SSM prefill route. This must be called by the
+    /// loader after all SSM requantization is complete. The layer is updated
+    /// only after both projections and all four zero-workspace tactics pass.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub fn prepare_flashinfer_ssm_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        layer: usize,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        use anyhow::Context as _;
+        use ops::flashinfer_sm121::{FlashInferSm121, FlashInferSm121Shape};
+
+        ensure!(
+            crate::layers::prefill_ssm_flashinfer_enabled()?,
+            "prepare_flashinfer_ssm_prefill called while its route is disabled"
+        );
+        ensure!(
+            self.flashinfer_ssm_prefill.is_none(),
+            "FlashInfer SSM prefill operands were already prepared"
+        );
+        let value_dim = config
+            .linear_num_value_heads
+            .checked_mul(config.linear_value_head_dim)
+            .context("FlashInfer SSM value dimension overflow")?;
+        ensure!(
+            qwen38_ssm_flashinfer_geometry(
+                2_079,
+                config.hidden_size,
+                config.ssm_qkvz_size(),
+                value_dim,
+            ),
+            "FlashInfer SSM route requires exact Qwen3.8 H={QWEN38_FLASHINFER_HIDDEN}, QKVZ={QWEN38_FLASHINFER_SSM_QKVZ}, value={QWEN38_FLASHINFER_SSM_VALUE}"
+        );
+        ensure!(
+            self.sequential_qkvz,
+            "FlashInfer SSM route requires the Qwen3.8 sequential QKVZ layout"
+        );
+        ensure!(
+            self.out_proj_dense.is_none(),
+            "FlashInfer SSM route requires runtime-generated NVFP4 output weights"
+        );
+        let qkvz_weight = self
+            .qkvz_nvfp4
+            .as_ref()
+            .context("FlashInfer SSM route requires the original-layout QKVZ weight")?;
+
+        let library_path = std::env::var_os("ATLAS_FLASHINFER_SM121_LIB").ok_or_else(|| {
+            anyhow::anyhow!("ATLAS_PREFILL_SSM_FLASHINFER=1 requires ATLAS_FLASHINFER_SM121_LIB")
+        })?;
+        let library = FlashInferSm121::open_with_sha256(
+            std::path::Path::new(&library_path),
+            QUALIFIED_FLASHINFER_SM121_SHA256,
+        )?;
+        let dynamic_scale_kernels = ops::nvfp4_dynamic_scale::Nvfp4DynamicScaleKernels::load(gpu)?;
+
+        // Freeze every tactic/workspace result before allocating or retaining
+        // either weight-scale view. Runtime uses this same sealed library.
+        let preparation_stream = gpu.default_stream();
+        for rows in [2_079, 8_192] {
+            let (qkvz_tactic, output_tactic) = qwen38_ssm_flashinfer_tactics(rows)
+                .context("missing qualified FlashInfer SSM tactic")?;
+            for (tactic, n, k) in [
+                (
+                    qkvz_tactic,
+                    QWEN38_FLASHINFER_SSM_QKVZ,
+                    QWEN38_FLASHINFER_HIDDEN,
+                ),
+                (
+                    output_tactic,
+                    QWEN38_FLASHINFER_HIDDEN,
+                    QWEN38_FLASHINFER_SSM_VALUE,
+                ),
+            ] {
+                let shape = FlashInferSm121Shape::new(tactic, rows, n, k, 1)?;
+                let prepared =
+                    library.prepare_borrowed_zero_workspace(gpu, shape, preparation_stream)?;
+                ensure!(
+                    prepared.shape() == shape && prepared.stream() == preparation_stream,
+                    "FlashInfer SSM preparation changed its frozen shape or stream"
+                );
+            }
+        }
+
+        let qkvz = build_flashinfer_ssm_projection(
+            gpu,
+            "qkvz",
+            qkvz_weight,
+            QWEN38_FLASHINFER_SSM_QKVZ,
+            QWEN38_FLASHINFER_HIDDEN,
+        )?;
+        let output = match build_flashinfer_ssm_projection(
+            gpu,
+            "output",
+            &self.ssm.out_proj,
+            QWEN38_FLASHINFER_HIDDEN,
+            QWEN38_FLASHINFER_SSM_VALUE,
+        ) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = gpu.free(qkvz.weight_scales_128x4);
+                return Err(error);
+            }
+        };
+
+        let (library_device, library_inode) = library.file_identity();
+        tracing::info!(
+            layer,
+            library = %library.path().display(),
+            library_sha256 = %library.sha256_hex(),
+            library_device,
+            library_inode,
+            qkvz_weight = format_args!("{:#x}", qkvz.weight.0),
+            output_weight = format_args!("{:#x}", output.weight.0),
+            qkvz_scale_hash = format_args!("{:016x}", qkvz.weight_scales_hash),
+            output_scale_hash = format_args!("{:016x}", output.weight_scales_hash),
+            "admitted FlashInfer SM121 SSM prefill operands"
+        );
+        self.flashinfer_ssm_prefill = Some(FlashinferSsmPrefill {
+            layer,
+            library,
+            dynamic_scale_kernels,
+            qkvz,
+            output,
+        });
+        Ok(())
     }
 
     /// Set raw FP8 DevicePtrs for the prefill GEMM path ONLY (no decode GEMV

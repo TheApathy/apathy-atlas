@@ -1,0 +1,8 @@
+ATLAS_FI_FP4_0 {
+  global:
+    atlas_fi_nvfp4_sm121_workspace_size;
+    atlas_fi_nvfp4_sm121_bf16;
+    atlas_fi_nvfp4_sm121_last_error;
+  local:
+    *;
+};

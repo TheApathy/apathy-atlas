@@ -36,10 +36,11 @@
 
 > **`perf/qwen38-gb10-dflash`** — a fork branch tuned for one model
 > (Qwen3.8-27B NVFP4) on one machine (DGX Spark / GB10), using DFlash
-> speculative decoding. The current v3/NVFP4-KV speed profile measures
-> **72.2518 tok/s single-stream** on the canonical five-run Weschera probe,
-> with identical output hashes across all repetitions. The published v2/BF16-KV
-> container recipe below remains a separately reproduced 63.9 tok/s profile.
+> speculative decoding. The highest qualified Spark result is the published
+> v2/BF16-KV profile at **63.9 tok/s single-stream** on the canonical Weschera
+> probe. The corrected-ABI v3/NVFP4-KV control currently measures 58.012 tok/s.
+> A historical 72.2518 tok/s v3 receipt is quarantined because its launcher and
+> loaded attention PTX disagreed (13 host arguments versus 11 device arguments).
 >
 > This branch is **310 commits ahead of upstream** and is not a drop-in
 > replacement for it — see [`docs/FORK_VS_UPSTREAM.md`](docs/FORK_VS_UPSTREAM.md).
@@ -85,13 +86,14 @@ the same GB10 are:
 
 | Configuration | tok/s |
 |---|---:|
-| **Current promoted v3/NVFP4-KV full profile** | **72.2518** |
-| Published v2/BF16-KV container default | 63.8 |
+| **Published v2/BF16-KV container default (qualified champion)** | **63.9** |
+| Current v3/NVFP4-KV corrected-ABI control | 58.012 |
+| Historical v3/NVFP4-KV mismatched-ABI receipt (invalid) | ~~72.2518~~ |
 | Partial profile — gamma-derived vars missing | 13.5 |
 | No speculation, tuned kernels | 13.9 |
 | Speculation on, **no tuning at all** | 8.8 |
 
-The 72.2518 row uses the public
+The quarantined 72.2518 row used the public
 [`onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3`](https://huggingface.co/onewhosighs/Apathy-Qwen3.8-27B-DFlash-drafter-v3)
 checkpoint (weights SHA-256
 `c15685d680bd58939689dcb4c344bb325efb75536df16d77c38517ce3df2dd6c`),
@@ -99,7 +101,10 @@ gamma 15, full 248320 vocabulary, and NVFP4 target/drafter/KV. The exact five
 rates were 72.3670, 72.4972, 72.2518, 72.2105, and 72.0784 tok/s, with stable
 output SHA-256
 `f51d8358ea2a5c63353ca00a29208ae2cccd3039b070043cad514cc4af9761c4`.
-See the [full measured identity and reproduction record](docs/QWEN38_WESCHERA_72TPS.md).
+Those deterministic outputs do not repair the attention launch ABI mismatch,
+so the receipt grants no performance authority. See the
+[current corrected-tree benchmark record](bench/qwen38-gb10/README.md) and the
+[historical receipt](docs/QWEN38_WESCHERA_72TPS.md).
 
 The partial/untuned rows were measured with the published v2 container recipe;
 they demonstrate why speculative decoding needs its complete tuned environment.

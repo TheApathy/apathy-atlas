@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::chat_stream::chat_completions_stream;
+use super::responses_context_guard::{response_input_contains_image, response_items_contain_image};
 use super::responses_stream::responses_endpoint_stream;
 use super::responses_translate::{
     build_responses_usage, emit, find_frame_end, translate_chat_response_to_responses,
@@ -73,6 +74,15 @@ pub async fn responses_endpoint(
             );
         }
     };
+    if state.yarn_context && response_input_contains_image(&r.input) {
+        return openai_error_response_with_param(
+            StatusCode::BAD_REQUEST,
+            "Static-YaRN long context is currently text-only; image requests require persistent MRoPE position deltas"
+                .to_string(),
+            Some("input"),
+            Some("unsupported_multimodal_context"),
+        );
+    }
     let metadata = r.metadata.clone();
     let store_flag = r.store.unwrap_or(true); // Responses API defaults to store=true.
     let streaming = r.stream;
@@ -115,11 +125,29 @@ pub async fn responses_endpoint(
     let conversation_prefix: Vec<crate::openai::IncomingMessage> = match &conversation_id {
         None => Vec::new(),
         Some(cid) => match state.conversation_store.get(cid) {
-            Some(snap) => snap
-                .items
-                .iter()
-                .filter_map(conversation_item_to_message)
-                .collect(),
+            Some(snap) => {
+                if state.yarn_context && response_items_contain_image(&snap.items) {
+                    return openai_error_response_with_param(
+                        StatusCode::BAD_REQUEST,
+                        "Static-YaRN long context is currently text-only; the conversation contains image input that requires persistent MRoPE position deltas"
+                            .to_string(),
+                        Some("conversation"),
+                        Some("unsupported_multimodal_context"),
+                    );
+                }
+                let mut messages = Vec::new();
+                for item in &snap.items {
+                    match crate::openai::IncomingMessage::try_from_responses_input_item(item) {
+                        Ok(Some(message)) => messages.push(message),
+                        Ok(None) => {} // Opaque reasoning is intentionally not replayed.
+                        Err(e) => return openai_error_response_with_param(
+                            StatusCode::BAD_REQUEST, format!("Invalid conversation item: {e}"),
+                            Some("conversation"), None,
+                        ),
+                    }
+                }
+                messages
+            }
             None => {
                 return openai_error_response_with_param(
                     StatusCode::NOT_FOUND,

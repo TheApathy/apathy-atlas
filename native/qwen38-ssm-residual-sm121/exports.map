@@ -1,0 +1,11 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+ATLAS_QWEN38_SSM_RESIDUAL_0 {
+  global:
+    atlas_qwen38_ssm_residual_bf16;
+    atlas_qwen38_ssm_add_bf16;
+    atlas_qwen38_ssm_pending_receipt;
+    atlas_qwen38_ssm_stream_synchronize;
+    atlas_qwen38_ssm_residual_last_error;
+  local:
+    *;
+};

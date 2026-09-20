@@ -110,6 +110,50 @@ pub fn prefill_attention_64(
         .launch(stream)
 }
 
+/// Exact Qwen3.8 chunk-0 BR64 attention with the following sigmoid gate folded
+/// into the final store. The CUDA shadow explicitly rounds attention through
+/// BF16 before evaluating the parent gate expression.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_64_gate_fused(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k: DevicePtr,
+    v: DevicePtr,
+    output: DevicePtr,
+    gate: DevicePtr,
+    seq_len: u32,
+    batch: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    inv_sqrt_d: f32,
+    causal: bool,
+    sliding_window: u32,
+    gate_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(seq_len, 64), batch])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(v)
+        .arg_ptr(output)
+        .arg_u32(seq_len)
+        .arg_u32(0)
+        .arg_u32(seq_len)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(if causal { 1 } else { 0 })
+        .arg_u32(sliding_window)
+        .arg_ptr(gate)
+        .arg_u32(gate_stride)
+        .launch(stream)
+}
+
 /// Flash Attention over a contiguous subset of query rows and the complete
 /// contiguous K/V sequence. The kernel and reduction order are identical to
 /// [`prefill_attention`]; only CTAs whose outputs are outside the requested

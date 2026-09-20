@@ -176,71 +176,7 @@ pub(super) fn anthropic_to_chat_request_json(req: &MessagesRequest) -> serde_jso
                 messages.push(serde_json::json!({"role": role, "content": s}));
             }
             AnthropicContent::Blocks(blocks) => {
-                let mut text_parts: Vec<String> = Vec::new();
-                let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-                let mut tool_results: Vec<(String, String)> = Vec::new();
-                for b in blocks {
-                    match b {
-                        ContentBlock::Text { text } => text_parts.push(text.clone()),
-                        ContentBlock::ToolUse { id, name, input } => {
-                            tool_calls.push(serde_json::json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": input.to_string(),
-                                },
-                            }));
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                        } => {
-                            let text = content.as_ref().map(|c| c.to_text()).unwrap_or_default();
-                            // F6 (2026-04-26): when Anthropic's
-                            // is_error flag is set, prepend an
-                            // explicit `[tool error]\n` marker so the
-                            // model has a structural signal that the
-                            // tool call failed. Without this, the
-                            // model has hallucinated success after
-                            // `Exit code 127\ncargo: command not
-                            // found` (observed in dump fix26 seq 27).
-                            let prefixed = if is_error.unwrap_or(false) {
-                                format!("[tool error]\n{text}")
-                            } else {
-                                text
-                            };
-                            tool_results.push((tool_use_id.clone(), prefixed));
-                        }
-                        ContentBlock::Thinking { .. } | ContentBlock::Unknown => {}
-                    }
-                }
-                let text_content = text_parts.join("");
-                if role == "assistant" {
-                    let mut msg = serde_json::json!({
-                        "role": "assistant",
-                        "content": text_content,
-                    });
-                    if !tool_calls.is_empty() {
-                        msg["tool_calls"] = serde_json::Value::Array(tool_calls);
-                    }
-                    messages.push(msg);
-                } else {
-                    if !text_content.is_empty() {
-                        messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": text_content,
-                        }));
-                    }
-                    for (tool_use_id, text) in tool_results {
-                        messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": text,
-                        }));
-                    }
-                }
+                messages.extend(super::block_messages::translate_blocks(role, blocks));
             }
         }
     }

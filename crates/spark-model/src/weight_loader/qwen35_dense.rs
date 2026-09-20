@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -8,13 +8,20 @@ use spark_runtime::weights::WeightStore;
 
 use super::{ModelWeightLoader, WeightFormat};
 use crate::layer::TransformerLayer;
-use crate::layers::{DenseFfnLayer, FfnComponent, Qwen3AttentionLayer, Qwen3SsmLayer};
+use crate::layers::{Qwen3AttentionLayer, Qwen3SsmLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
     AttentionWeights, DenseWeight, MtpWeights, Nvfp4Variant, QuantizeCtx, SsmWeights, dense,
-    dense_auto, detect_nvfp4_variant, gpu_concat_rows, interleave_ba, load_dense_ffn,
-    load_kv_scales, load_ssm_qwen35, quantize_to_nvfp4, quantized_any,
+    dense_auto, detect_nvfp4_variant, gpu_concat_rows, interleave_ba, load_kv_scales,
+    load_ssm_qwen35, quantize_to_nvfp4, quantized_any,
 };
+
+#[path = "qwen35_dense/ffn.rs"]
+mod ffn;
+
+#[cfg(test)]
+#[path = "qwen35_dense/w3_integration_tests.rs"]
+mod w3_integration_tests;
 
 pub struct Qwen35DenseWeightLoader;
 
@@ -52,10 +59,47 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
 
         let variant = detect_nvfp4_variant(store, config);
         let weight_format = WeightFormat::detect(store, config);
+        let flashinfer_ffn_requested = crate::layers::prefill_ffn_flashinfer_enabled()?;
+        let flashinfer_attn_proj_requested = crate::layers::prefill_proj_flashinfer_enabled()?;
+        let flashinfer_ssm_proj_requested = crate::layers::prefill_ssm_flashinfer_enabled()?;
+        ensure!(
+            !flashinfer_ffn_requested || variant == Nvfp4Variant::Standard,
+            "ATLAS_PREFILL_FFN_FLASHINFER=1 requires a Standard ModelOpt NVFP4 checkpoint"
+        );
+        ensure!(
+            !flashinfer_attn_proj_requested || variant == Nvfp4Variant::Standard,
+            "ATLAS_PREFILL_PROJ_FLASHINFER=1 requires a Standard ModelOpt NVFP4 checkpoint"
+        );
+        ensure!(
+            !flashinfer_ssm_proj_requested || variant == Nvfp4Variant::Standard,
+            "ATLAS_PREFILL_SSM_FLASHINFER=1 requires a Standard ModelOpt NVFP4 checkpoint"
+        );
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        ensure!(
+            !flashinfer_attn_proj_requested,
+            "ATLAS_PREFILL_PROJ_FLASHINFER=1 requires a Linux CUDA build"
+        );
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        ensure!(
+            !flashinfer_ssm_proj_requested,
+            "ATLAS_PREFILL_SSM_FLASHINFER=1 requires a Linux CUDA build"
+        );
         tracing::info!(
             "Weight format: {:?}, NVFP4 variant: {:?}",
             weight_format,
             variant
+        );
+
+        let mut w3_session = ffn::prepare_w3_session(config, gpu)?;
+        let ffn_context = ffn::DenseFfnLoadContext::new(
+            store,
+            config,
+            gpu,
+            variant,
+            absmax_k,
+            quantize_k,
+            stream,
+            flashinfer_ffn_requested,
         );
 
         // Fast engine recovery: serve the per-layer transposed NVFP4 copies
@@ -74,114 +118,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
             let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
 
-            // Dense FFN instead of MoE
-            let ffn_weights = load_dense_ffn(
-                store, &lp, gpu, variant, absmax_k, quantize_k, stream, config,
-            )?;
-            let mut ffn_layer = DenseFfnLayer::new(ffn_weights, gpu)?;
-            // ATLAS_FFN_M16_TRANSPOSED=1: build transposed (nvfp4_t) copies
-            // of the three FFN projections so `forward_kgamma` can route
-            // through the M_TILE=16 `w4a16_gemm_n128_m16` kernel (near-zero
-            // MMA accumulator waste at M ≤ 32) instead of the M_TILE=64
-            // `w4a16_gemm` fallback (which discards ~73% of writes at M=17).
-            // Matches the SSM `qkvz_nvfp4_t` / `out_proj_nvfp4_t` pattern at
-            // lines 232/244 below, and the DFlash drafter pattern in
-            // dflash_head/from_weights.rs:472-483. Skipped on non-NVFP4
-            // FFN paths (BF16/FP8-LUT) — the transposed kernel only
-            // accepts QuantizedWeight.
-            //
-            // Memory cost: ~equivalent to the original packed FFN weights,
-            // and retained for the process lifetime. One projection at
-            // qwen3.8-27b (intermediate=17408, hidden=5120) is
-            // 17408·5120·9/16 = 47.8 MiB packed+scale, so ~143 MiB per
-            // layer × 64 layers = ~9.0 GiB total. (The previous figure
-            // here — "~150 MB total, 64 layers × 3 × ~780 KB packed" —
-            // was the *per-layer* cost mislabelled as the total, off by
-            // ~64×. It is charged to the load pre-flight by
-            // spark-server's `construction_overhead_bytes`.)
-            // Load-time cost: 3 H↔D round-trips per layer (~89 MB each),
-            // ~few hundred ms total across 64 layers via host transpose.
-            if crate::layers::ffn_m16_transposed_enabled() {
-                let inter = config.intermediate_size;
-                // gate: [intermediate, hidden]; up: [intermediate, hidden];
-                // down: [hidden, intermediate]. transpose_for_gemm(_, n, k):
-                let gate_t = ffn_layer.weights.gate_proj.transpose_for_gemm_cached(
-                    gpu,
-                    inter,
-                    h,
-                    &format!("L{i}.mlp.gate_proj.t"),
-                )?;
-                let up_t = ffn_layer.weights.up_proj.transpose_for_gemm_cached(
-                    gpu,
-                    inter,
-                    h,
-                    &format!("L{i}.mlp.up_proj.t"),
-                )?;
-                let down_t = ffn_layer.weights.down_proj.transpose_for_gemm_cached(
-                    gpu,
-                    h,
-                    inter,
-                    &format!("L{i}.mlp.down_proj.t"),
-                )?;
-                ffn_layer.set_transposed_weights(gate_t, up_t, down_t);
-                // Eagerly allocate the split-K FP32 workspace at load time
-                // (illegal during CUDA graph capture). Sized for the largest
-                // output dim used by any split-K projection: down_proj is
-                // N=hidden, gate/up (ATLAS_FFN_GATEUP_SPLITK) is N=intermediate.
-                // Pass max so one workspace serves both. No-op when neither
-                // split-K env is set or the split-K kernels are missing.
-                ffn_layer.alloc_splitk_workspace(gpu, h.max(inter) as u32)?;
-                if i == 0 {
-                    tracing::info!(
-                        "Dense FFN M_TILE=16 transposed-weight path enabled \
-                         (ATLAS_FFN_M16_TRANSPOSED=1): \
-                         transposed gate/up/down per layer for w4a16_gemm_n128_m16"
-                    );
-                }
-            }
-            // ATLAS_FFN_PREDEQUANT_FP8=1: pre-dequant the (non-transposed)
-            // NVFP4 FFN weights to FP8 [N, K] for the `fp8_gemm_t_m128`
-            // prefill fast path. Allocates ~270 MB per layer (gate+up+down)
-            // → ~17 GB total at Qwen3.6-27B's 64 layers. Worth it when the
-            // 5-20% per-GEMM speedup × 64 layers × 3 GEMMs beats the memory
-            // budget impact. Mirrors `predequant_for_prefill` for attention.
-            if crate::layers::prefill_ffn_fp8_enabled() {
-                let inter = config.intermediate_size;
-                ffn_layer.predequant_for_prefill(gpu, h, inter, stream)?;
-                if i == 0 {
-                    tracing::info!(
-                        "Dense FFN FP8 predequant prefill path enabled \
-                         (ATLAS_FFN_PREDEQUANT_FP8=1): \
-                         pre-dequanted gate/up/down per layer for fp8_gemm_t_m128"
-                    );
-                }
-            }
-            // W3 mixed-precision FFN (ATLAS_FFN_W3_LAYERS + ATLAS_FFN_W3_SIDECAR):
-            // for the named layers, install 3-bit sidecar FFN weights (25% fewer
-            // bytes on the bandwidth wall). Fail-open — maybe_load_w3_ffn returns
-            // None (stays W4) on any miss. ABBA-gated, NOT md5 (W3 changes the
-            // weights by construction, so output is not byte-identical).
-            if let Some(w3) = crate::weight_map::w3_sidecar::maybe_load_w3_ffn(
-                i,
-                &lp,
-                gpu,
-                h,
-                config.intermediate_size,
-            )? {
-                let gemv = crate::layers::dense_ffn::DenseFfnWeights {
-                    gate_proj: w3.gate,
-                    up_proj: w3.up,
-                    down_proj: w3.down,
-                };
-                let gemm_t = crate::layers::dense_ffn::DenseFfnWeights {
-                    gate_proj: w3.gate_t,
-                    up_proj: w3.up_t,
-                    down_proj: w3.down_t,
-                };
-                ffn_layer.set_w3_weights(gemv, gemm_t);
-                tracing::info!("W3 FFN active on layer {i} (3-bit gate/up/down from sidecar)");
-            }
-            let ffn = FfnComponent::Dense(ffn_layer);
+            let ffn = ffn_context.load(i, &lp, &mut w3_session)?;
 
             match lt {
                 LayerType::FullAttention => {
@@ -360,6 +297,11 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         layer.alloc_qkv_splitk_workspace(gpu, (num_kv_heads * head_dim) as u32)?;
                     }
 
+                    #[cfg(all(feature = "cuda", target_os = "linux"))]
+                    if flashinfer_attn_proj_requested {
+                        layer.prepare_flashinfer_projection_prefill(gpu, i, variant, config)?;
+                    }
+
                     layers.push(Box::new(layer));
                     attn_idx += 1;
                 }
@@ -450,6 +392,10 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
                         gpu,
                     )?;
                     layer.predequant_for_prefill(gpu, config, stream)?;
+                    #[cfg(all(feature = "cuda", target_os = "linux"))]
+                    if flashinfer_ssm_proj_requested {
+                        layer.prepare_flashinfer_ssm_prefill(gpu, i, config)?;
+                    }
                     layers.push(Box::new(layer));
                 }
                 LayerType::Moe => unreachable!("Qwen3.5 dense has no standalone MoE layers"),
@@ -468,6 +414,7 @@ impl ModelWeightLoader for Qwen35DenseWeightLoader {
             layers.len() - attn_idx,
         );
 
+        ffn::finish_w3_session(w3_session)?;
         super::transform_cache::finish();
 
         Ok(layers)

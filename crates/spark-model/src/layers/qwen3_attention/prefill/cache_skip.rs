@@ -10,6 +10,12 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+use super::{
+    Qwen38PrefillAttnGateRoute, Qwen38QkNormRopeRoute, mark_qwen38_prefill_attn_gate_engaged,
+    mark_qwen38_qknorm_rope_cache_skip_engaged, qwen38_prefill_attn_gate_requested,
+    qwen38_prefill_attn_gate_route, qwen38_qknorm_rope_requested, qwen38_qknorm_rope_route,
+};
+
 impl Qwen3AttentionLayer {
     /// Prefill attention with optional KV cache write skip for prefix caching.
     ///
@@ -41,6 +47,44 @@ impl Qwen3AttentionLayer {
         let q_dim = (nq * hd) as usize;
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim };
         let kv_dim = (nkv * hd) as usize;
+        let meta = ctx
+            .attn_metadata
+            .expect("attention prefill requires metadata");
+        let exact_qwen38_dense = ctx.config.model_type == "qwen3_5"
+            && ctx.config.num_experts == 0
+            && ctx.config.hidden_size == 5120
+            && ctx.config.tp_world_size.max(1) == 1
+            && ctx.config.mrope_section == [11, 11, 10];
+        let qknorm_rope_requested = qwen38_qknorm_rope_requested()?;
+        if self.yarn.is_some() && qknorm_rope_requested {
+            anyhow::bail!(
+                "ATLAS_PREFILL_QKNORM_ROPE=1 is incompatible with YaRN; \
+                 use rope_forward_mrope_interleaved_yarn"
+            );
+        }
+        // Parse and validate the complete route before Q/K/V projection or KV
+        // cache mutation. An explicit malformed request or stale bundle must
+        // be transactional: it cannot leave a partially populated cache.
+        let gate_fused_route = qwen38_prefill_attn_gate_route(
+            qwen38_prefill_attn_gate_requested()?,
+            exact_qwen38_dense,
+            meta.num_seqs == 1,
+            self.mla.is_none(),
+            self.gated,
+            n,
+            nq,
+            nkv,
+            hd,
+            q_proj_dim as u32,
+            self.prefill_attn_64_k.0 != 0,
+            self.sigmoid_gate_mul_batched_k.0 != 0,
+            self.prefill_attn_64_gate_fused_k.0 != 0,
+        );
+        if gate_fused_route == Qwen38PrefillAttnGateRoute::Missing {
+            anyhow::bail!(
+                "ATLAS_PREFILL_ATTN_GATE_FUSED=1 requires the BR64 parent, batched gate parent, and inferspark_prefill_64_gate_fused"
+            );
+        }
 
         // Pre-declare output buffers (used by both MLA and standard paths)
         let _qg_out = ctx.buffers.qkv_output();
@@ -113,88 +157,159 @@ impl Qwen3AttentionLayer {
         let k_contiguous = ctx.buffers.ssm_qkvz();
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let q_contiguous = ctx.buffers.ssm_deinterleaved();
-        if self.gated && !self.attn.q_norm.weight.is_null() {
-            // Fused deinterleave + Q norm: eliminates Q global memory round-trip
-            ops::deinterleave_qg_split_qnorm(
-                ctx.gpu,
-                self.deinterleave_qg_split_qnorm_k,
-                qg_out,
-                q_contiguous,
-                self.attn.q_norm.weight,
-                n,
-                nq,
-                hd,
-                q_proj_dim as u32,
-                eps,
-                stream,
-            )?;
-        } else if self.gated {
-            ops::deinterleave_qg_split(
-                ctx.gpu,
-                self.deinterleave_qg_split_k,
-                qg_out,
-                q_contiguous,
-                n,
-                nq,
-                hd,
-                q_proj_dim as u32,
-                stream,
-            )?;
-        } else {
-            ctx.gpu
-                .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
-                .map_err(|e| anyhow::anyhow!("Q copy d2d failed: {e}"))?;
-            if let Some(ref q_norm_full) = self.attn.q_norm_full {
-                ops::rms_norm(
+        let rotary_dim = self
+            .rotary_dim_override
+            .unwrap_or(ctx.config.rotary_dim() as u32);
+        let rope_theta = self
+            .rope_theta_override
+            .unwrap_or(ctx.config.rope_theta as f32);
+        let qknorm_rope_route = qwen38_qknorm_rope_route(
+            qknorm_rope_requested,
+            exact_qwen38_dense && self.yarn.is_none(),
+            meta.num_seqs == 1,
+            self.mla.is_none(),
+            self.gated,
+            !self.attn.q_norm.weight.is_null(),
+            !self.attn.k_norm.weight.is_null(),
+            self.attn.q_norm_full.is_none() && self.attn.k_norm_full.is_none(),
+            self.v_norm_weight.is_none(),
+            self.mrope_interleaved,
+            self.rope_proportional,
+            n,
+            nq,
+            nkv,
+            hd,
+            q_proj_dim as u32,
+            rotary_dim,
+            rope_theta.is_finite() && rope_theta > 0.0,
+            self.rope_k.0 != 0,
+            self.qwen38_prefill_qknorm_rope_k.0 != 0,
+        );
+        let qknorm_rope_fused = match qknorm_rope_route {
+            Qwen38QkNormRopeRoute::Complete => {
+                // This path's parent uses ordinary scalar RoPE. Passing the
+                // same position buffer for T/H/W preserves those exact bytes.
+                ops::qwen38_prefill_qknorm_rope(
                     ctx.gpu,
-                    self.rms_norm_k,
+                    self.qwen38_prefill_qknorm_rope_k,
+                    qg_out,
                     q_contiguous,
-                    q_norm_full,
-                    q_contiguous,
+                    k_contiguous,
+                    self.attn.q_norm.weight,
+                    self.attn.k_norm.weight,
+                    meta.positions,
+                    meta.positions,
+                    meta.positions,
                     n,
-                    nq * hd,
+                    nq,
+                    nkv,
+                    hd,
+                    q_proj_dim as u32,
+                    rotary_dim,
+                    eps,
+                    rope_theta,
+                    stream,
+                )?;
+                mark_qwen38_qknorm_rope_cache_skip_engaged();
+                true
+            }
+            Qwen38QkNormRopeRoute::Missing => {
+                anyhow::bail!(
+                    "ATLAS_PREFILL_QKNORM_ROPE=1 selected eligible Qwen3.8 cache-skip prefill, \
+                     but the scalar-RoPE parent or qwen38_prefill_qknorm_rope is missing; \
+                     rebuild the kernel bundle before measuring"
+                )
+            }
+            Qwen38QkNormRopeRoute::Disabled | Qwen38QkNormRopeRoute::Ineligible => false,
+        };
+        if !qknorm_rope_fused {
+            if self.gated && !self.attn.q_norm.weight.is_null() {
+                // Fused deinterleave + Q norm: eliminates Q global memory round-trip
+                ops::deinterleave_qg_split_qnorm(
+                    ctx.gpu,
+                    self.deinterleave_qg_split_qnorm_k,
+                    qg_out,
+                    q_contiguous,
+                    self.attn.q_norm.weight,
+                    n,
+                    nq,
+                    hd,
+                    q_proj_dim as u32,
                     eps,
                     stream,
                 )?;
-            } else if !self.attn.q_norm.weight.is_null() {
+            } else if self.gated {
+                ops::deinterleave_qg_split(
+                    ctx.gpu,
+                    self.deinterleave_qg_split_k,
+                    qg_out,
+                    q_contiguous,
+                    n,
+                    nq,
+                    hd,
+                    q_proj_dim as u32,
+                    stream,
+                )?;
+            } else {
+                ctx.gpu
+                    .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)
+                    .map_err(|e| anyhow::anyhow!("Q copy d2d failed: {e}"))?;
+                if let Some(ref q_norm_full) = self.attn.q_norm_full {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_k,
+                        q_contiguous,
+                        q_norm_full,
+                        q_contiguous,
+                        n,
+                        nq * hd,
+                        eps,
+                        stream,
+                    )?;
+                } else if !self.attn.q_norm.weight.is_null() {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_k,
+                        q_contiguous,
+                        &self.attn.q_norm,
+                        q_contiguous,
+                        nq * n,
+                        hd,
+                        eps,
+                        stream,
+                    )?;
+                }
+            }
+        }
+        if !qknorm_rope_fused {
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
                 ops::rms_norm(
                     ctx.gpu,
                     self.rms_norm_k,
-                    q_contiguous,
-                    &self.attn.q_norm,
-                    q_contiguous,
-                    nq * n,
+                    k_contiguous,
+                    k_norm_full,
+                    k_contiguous,
+                    n,
+                    nkv * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_contiguous,
+                    &self.attn.k_norm,
+                    k_contiguous,
+                    nkv * n,
                     hd,
                     eps,
                     stream,
-                )?;
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("k_norm rms_norm failed: nkv={nkv} n={n} hd={hd}: {e}")
+                })?;
             }
-        }
-        if let Some(ref k_norm_full) = self.attn.k_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_contiguous,
-                k_norm_full,
-                k_contiguous,
-                n,
-                nkv * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_contiguous,
-                &self.attn.k_norm,
-                k_contiguous,
-                nkv * n,
-                hd,
-                eps,
-                stream,
-            )
-            .map_err(|e| anyhow::anyhow!("k_norm rms_norm failed: nkv={nkv} n={n} hd={hd}: {e}"))?;
         }
 
         // Gemma-4 v_norm — applied at EVERY layer in HF reference
@@ -228,10 +343,10 @@ impl Qwen3AttentionLayer {
         };
 
         // ── 6. RoPE for N tokens ──
-        let meta = ctx
-            .attn_metadata
-            .expect("attention prefill requires metadata");
-        if self.mla.is_some() {
+        if qknorm_rope_fused {
+            // Q/K normalization and scalar RoPE already completed in the
+            // exact C=1 fusion above.
+        } else if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
             // Skip shared RoPE to avoid double-rotation.
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
@@ -254,6 +369,24 @@ impl Qwen3AttentionLayer {
                 stream,
             )
             .map_err(|e| anyhow::anyhow!("rope_proportional failed: {e}"))?;
+        } else if self.mrope_interleaved {
+            self.apply_mrope(
+                ctx.gpu,
+                q_contiguous,
+                k_contiguous,
+                meta.positions,
+                meta.positions_h,
+                meta.positions_w,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                stream,
+            )?;
         } else {
             ops::rope(
                 ctx.gpu,
@@ -350,52 +483,96 @@ impl Qwen3AttentionLayer {
         // ── 8. Flash Attention on contiguous Q/K/V (BR=64 for long sequences) ──
         let attn_out = ctx.buffers.attn_output();
         let inv_sqrt_d = self.effective_attn_scale(hd);
-        if hd > 256 && self.prefill_attn_512_k.0 != 0 {
-            // HDIM=512: use scalar reference kernel (BR=16, correct for any head_dim)
-            // Full-attention layers (this path) always pass sliding_window=0.
-            ops::prefill_attention(
-                ctx.gpu,
-                self.prefill_attn_512_k,
-                q_contiguous,
-                k_contiguous,
-                v_contiguous,
-                attn_out,
-                n,
-                1,
-                nq,
-                nkv,
-                hd,
-                inv_sqrt_d,
-                true,
-                0,
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("prefill_512 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
-            })?;
-        } else {
-            ops::prefill_attention_64(
-                ctx.gpu,
-                self.prefill_attn_64_k,
-                q_contiguous,
-                k_contiguous,
-                v_contiguous,
-                attn_out,
-                n,
-                1,
-                nq,
-                nkv,
-                hd,
-                inv_sqrt_d,
-                true,
-                self.sliding_window.unwrap_or(0),
-                stream,
-            )
-            .map_err(|e| {
-                anyhow::anyhow!("flash_attn_64 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
-            })?;
+        let gate_base = qg_out.offset(q_dim * bf16);
+        let gate_fused = match gate_fused_route {
+            Qwen38PrefillAttnGateRoute::Complete => {
+                ops::prefill_attention_64_gate_fused(
+                    ctx.gpu,
+                    self.prefill_attn_64_gate_fused_k,
+                    q_contiguous,
+                    k_contiguous,
+                    v_contiguous,
+                    attn_out,
+                    gate_base,
+                    n,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    inv_sqrt_d,
+                    true,
+                    self.sliding_window.unwrap_or(0),
+                    q_proj_dim as u32,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "fused flash_attn_64+gate failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}"
+                    )
+                })?;
+                mark_qwen38_prefill_attn_gate_engaged();
+                true
+            }
+            Qwen38PrefillAttnGateRoute::Missing => unreachable!(
+                "missing fused attention dependencies were rejected before cache mutation"
+            ),
+            Qwen38PrefillAttnGateRoute::Disabled | Qwen38PrefillAttnGateRoute::Ineligible => false,
+        };
+        if !gate_fused {
+            if hd > 256 && self.prefill_attn_512_k.0 != 0 {
+                // HDIM=512: use scalar reference kernel (BR=16, correct for any head_dim)
+                // Full-attention layers (this path) always pass sliding_window=0.
+                ops::prefill_attention(
+                    ctx.gpu,
+                    self.prefill_attn_512_k,
+                    q_contiguous,
+                    k_contiguous,
+                    v_contiguous,
+                    attn_out,
+                    n,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    inv_sqrt_d,
+                    true,
+                    0,
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("prefill_512 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
+                })?;
+            } else {
+                ops::prefill_attention_64(
+                    ctx.gpu,
+                    self.prefill_attn_64_k,
+                    q_contiguous,
+                    k_contiguous,
+                    v_contiguous,
+                    attn_out,
+                    n,
+                    1,
+                    nq,
+                    nkv,
+                    hd,
+                    inv_sqrt_d,
+                    true,
+                    self.sliding_window.unwrap_or(0),
+                    stream,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("flash_attn_64 failed: n={n} nq={nq} nkv={nkv} hd={hd}: {e}")
+                })?;
+            }
         }
-        aprof!("flash_attn_64", t0);
+        aprof!(
+            if gate_fused {
+                "flash_attn_64+sigmoid_gate"
+            } else {
+                "flash_attn_64"
+            },
+            t0
+        );
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
             Some(std::time::Instant::now())
@@ -404,8 +581,7 @@ impl Qwen3AttentionLayer {
         };
 
         // ── 9. Sigmoid gate × attn_out (gated only) — single batched kernel ──
-        if self.gated {
-            let gate_base = qg_out.offset(q_dim * bf16);
+        if self.gated && !gate_fused {
             ops::sigmoid_gate_mul_batched(
                 ctx.gpu,
                 self.sigmoid_gate_mul_batched_k,
@@ -418,13 +594,15 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
-        aprof!("sigmoid_gate", t0);
-        t0 = if ctx.profile {
-            ctx.gpu.synchronize(stream)?;
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        if !gate_fused {
+            aprof!("sigmoid_gate", t0);
+            t0 = if ctx.profile {
+                ctx.gpu.synchronize(stream)?;
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+        }
 
         // ── 10. O projection GEMM ── (extracted to paged_oproj.rs)
         let o_out = self.prefill_attention_paged_oproj(attn_out, n, h, nq, hd, ctx, stream)?;

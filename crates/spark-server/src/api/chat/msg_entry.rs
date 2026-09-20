@@ -32,6 +32,8 @@ pub(super) struct MsgEntry {
     /// so the Jinja template can render
     /// `<|vision_start|><|image_pad|><|vision_end|>` markers.
     pub(super) image_count: usize,
+    /// Ordered UTF-8 byte positions in content, one per image marker.
+    pub(super) image_text_offsets: Vec<usize>,
 }
 
 /// Outputs of [`build_msg_entries`]. Bundled as a struct because
@@ -65,7 +67,10 @@ pub(super) fn build_msg_entries(
         .unwrap_or(req.messages.len().saturating_sub(1));
 
     for (msg_idx, m) in req.messages.iter().enumerate() {
-        let mut text = m.content.text.clone();
+        let mut content = m.content.clone();
+        content.validate_order().map_err(|e| {
+            openai_error_response(StatusCode::BAD_REQUEST, format!("Invalid message content: {e}"))
+        })?;
 
         // Historical assistant messages after the last user query
         // get an empty think block to match training format.
@@ -77,8 +82,11 @@ pub(super) fn build_msg_entries(
             && msg_idx > last_query_index
             && !thinking_suppressed
         {
-            text = format!("<think>\n\n</think>\n\n{text}");
+            content.prepend_text("<think>\n\n</think>\n\n").map_err(|e| {
+                openai_error_response(StatusCode::BAD_REQUEST, e)
+            })?;
         }
+        let mut text = content.text;
 
         // Preserve structured tool_calls for the Jinja template.
         // Always extract from assistant messages — past turns may
@@ -120,13 +128,6 @@ pub(super) fn build_msg_entries(
             } else {
                 consecutive_tool_errors = 0;
             }
-            messages.push(MsgEntry {
-                role: "tool".into(),
-                content: text,
-                tool_calls: None,
-                image_count: 0,
-            });
-            continue;
         }
 
         let image_count = m.content.images.len();
@@ -135,6 +136,7 @@ pub(super) fn build_msg_entries(
             content: text,
             tool_calls: tool_calls_json,
             image_count,
+            image_text_offsets: content.image_text_offsets,
         });
         if !m.content.images.is_empty() {
             for img_uri in &m.content.images {
@@ -187,7 +189,7 @@ pub(super) fn build_msg_entries(
     // bare `Label:` line qualifies; any substantive prompt is untouched.
     if messages
         .first()
-        .is_some_and(|m| m.role == "system" && is_vacuous_system_content(&m.content))
+        .is_some_and(|m| m.role == "system" && m.image_count == 0 && is_vacuous_system_content(&m.content))
     {
         let removed = messages.remove(0);
         tracing::info!(
@@ -198,9 +200,11 @@ pub(super) fn build_msg_entries(
 
     // Preprocess images if a vision config is available.
     let mut image_pixels: Vec<(Vec<f32>, usize, usize)> = Vec::new();
-    if !all_images.is_empty()
-        && let Some(vcfg) = &state.vision_config
-    {
+    if !all_images.is_empty() {
+        let Some(vcfg) = &state.vision_config else {
+            return Err(openai_error_response(StatusCode::BAD_REQUEST,
+                "Image input requires a vision-capable model".into()));
+        };
         for (idx, uri) in all_images.iter().enumerate() {
             match spark_model::vision_preprocess::preprocess_image(uri, vcfg) {
                 Ok((pixels, grid_h, grid_w)) => {
@@ -220,9 +224,6 @@ pub(super) fn build_msg_entries(
             }
         }
     }
-    // If no vision_config (text-only model), image_pad_counts stays
-    // 0 and images are silently dropped on the encoder side.
-
     Ok(BuildOut {
         messages,
         cwd_hint,

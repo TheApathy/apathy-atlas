@@ -103,6 +103,58 @@ fn startup(
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
 
+    let context_extension = super::context_extension::apply_context_extension(
+        &mut config,
+        args.max_seq_len,
+        args.rope_theta_override,
+        args.rope_yarn_factor,
+    )?;
+    let context_admission = super::context_extension::validate_context_extension_runtime(
+        context_extension,
+        super::context_extension::ContextRuntimeMode {
+            speculative: args.speculative,
+            dflash: args.dflash,
+            self_speculative: args.self_speculative,
+            ngram_speculative: args.ngram_speculative,
+            high_speed_swap: args.high_speed_swap,
+            hss_cache_blocks_per_seq: args.high_speed_swap_cache_blocks_per_seq,
+            block_size: args.block_size,
+            max_batch_size: args.max_batch_size,
+            max_seq_len: args.max_seq_len,
+            config_capacity: config.max_position_embeddings,
+        },
+    )?;
+    if let Some(extension) = context_extension {
+        match extension {
+            super::context_extension::ContextExtension::Yarn {
+                native_tokens,
+                requested_tokens,
+                factor,
+                original_tokens,
+                attention_factor,
+            } => tracing::warn!(
+                "static YaRN context extension: native={} requested={} factor={} \
+                 original={} attention_factor={}; capacity enabled, retrieval qualification required",
+                native_tokens,
+                requested_tokens,
+                factor,
+                original_tokens,
+                attention_factor,
+            ),
+            super::context_extension::ContextExtension::Theta {
+                native_tokens,
+                requested_tokens,
+                rope_theta,
+            } => tracing::warn!(
+                "EXPERIMENTAL theta context extension: native={} requested={} rope_theta={}; \
+                 capacity is enabled but long-context quality is not qualified",
+                native_tokens,
+                requested_tokens,
+                rope_theta,
+            ),
+        }
+    }
+
     if let Some(ref qc) = config.quantization_config {
         tracing::info!(
             "Quantization config: method={:?}, algo={:?}, format={:?}, {} module(s) in ignore list",
@@ -325,7 +377,7 @@ fn startup(
         effective_kv_dtype_str: _,
         kv_dtype,
         layer_dtypes,
-        hss_cache_blocks_per_seq,
+        hss_cache_blocks_per_seq: _,
     } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
     let dflash_drafter_state =
         serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?;
@@ -361,13 +413,13 @@ fn startup(
     let model = serve_phases::build_model(
         &args,
         &config,
+        context_admission,
         &store,
         gpu,
         max_batch_tokens,
         kv_dtype,
         inference_reserve,
         layer_dtypes,
-        hss_cache_blocks_per_seq,
         prefix_cache,
         comm,
         dflash_args,
@@ -662,6 +714,8 @@ fn startup(
         tokenizer,
         model_name,
         max_seq_len: args.max_seq_len,
+        yarn_context: config.yarn_factor > 0.0,
+        max_batch_size,
         request_tx,
         vision_config: config.vision.clone(),
         default_temperature,

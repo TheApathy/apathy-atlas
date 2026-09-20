@@ -7,6 +7,8 @@
 //! Anthropic format. Supports both streaming (SSE) and non-streaming.
 
 mod convert;
+mod block_messages;
+mod image_content;
 mod handlers;
 mod handlers_stream;
 mod helpers;

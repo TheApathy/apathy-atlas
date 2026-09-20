@@ -20,6 +20,7 @@ mod decode_logits_seq;
 mod decode_logits_step;
 mod decode_step;
 mod emit_step;
+mod exact_greedy_admission;
 mod helpers;
 mod lifecycle;
 mod logprobs;
@@ -30,6 +31,8 @@ mod phase_continue_prefills;
 mod phase_promote_prefills;
 mod phase_start_prefills;
 mod prefill_a_step;
+#[cfg(test)]
+mod vision_request_reset_tests;
 mod prefill_b_step;
 mod proposal_lifecycle;
 mod repetition;

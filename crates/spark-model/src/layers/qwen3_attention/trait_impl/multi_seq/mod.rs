@@ -105,6 +105,7 @@ impl Qwen3AttentionLayer {
         stream: u64,
         qkv_base_override: Option<DevicePtr>,
     ) -> Result<()> {
+        self.validate_yarn_multi_seq_controls()?;
         let _ = states; // Attention layers use EmptyLayerState — no per-seq state.
         let bs = kv_cache.block_size() as u32;
         // Max host-side seq_len drives the split-K KV partition. Safe upper
@@ -258,6 +259,16 @@ impl Qwen3AttentionLayer {
             anyhow::Result::<()>::Ok(())
         })?;
 
+        Ok(())
+    }
+
+    fn validate_yarn_multi_seq_controls(&self) -> Result<()> {
+        if self.yarn.is_some() && attn::attn_qkv_mega_enabled() {
+            anyhow::bail!(
+                "ATLAS_ATTN_QKV_MEGA=1 is incompatible with YaRN; \
+                 the strided kernel has no scaling ABI"
+            );
+        }
         Ok(())
     }
 }

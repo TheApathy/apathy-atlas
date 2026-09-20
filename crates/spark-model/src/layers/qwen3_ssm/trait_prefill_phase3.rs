@@ -24,14 +24,29 @@ impl Qwen3SsmLayer {
         let nv = ctx.config.linear_num_value_heads;
         let vd = ctx.config.linear_value_head_dim;
         let value_dim = nv * vd;
+        let qkvz_size = ctx.config.ssm_qkvz_size();
+
+        // Output buffer: reuse ssm_qkvz (same as monolithic prefill).
+        let normed_out_buf = ctx.buffers.ssm_qkvz();
+        let out_proj_buf = ctx.buffers.moe_output();
+        let flashinfer_ssm = self.preflight_flashinfer_ssm_prefill(
+            ctx,
+            num_tokens,
+            h,
+            qkvz_size,
+            value_dim,
+            ctx.buffers.norm_output(),
+            ctx.buffers.ssm_deinterleaved(),
+            normed_out_buf,
+            out_proj_buf,
+            stream,
+        )?;
 
         // ── 9. Gated RMS norm (batched: all chunk tokens × heads) ──
         // Read GDN output and Z from full-sequence buffers at token_offset.
         let gdn_out_chunk = gdn_bufs.output.offset(token_offset * value_dim * bf16);
         let z_chunk = gdn_bufs.z.offset(token_offset * value_dim * bf16);
 
-        // Output buffer: reuse ssm_qkvz (same as monolithic prefill)
-        let normed_out_buf = ctx.buffers.ssm_qkvz();
         ops::gated_rms_norm_prefill(
             ctx.gpu,
             self.gated_rms_norm_prefill_k,
@@ -48,9 +63,14 @@ impl Qwen3SsmLayer {
             stream,
         )?;
 
-        // ── 10. Output projection GEMM: [N, 4096] × [4096, 2048] → [N, 2048] ──
-        let out_proj_buf = ctx.buffers.moe_output();
-        if let Some(ref dense_out) = self.out_proj_dense {
+        // ── 10. Output projection GEMM: Qwen3.8 [M,6144] × [5120,6144]ᵀ ──
+        if flashinfer_ssm {
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            self.launch_flashinfer_ssm_output(ctx, k, normed_out_buf, out_proj_buf, stream)?;
+            #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+            unreachable!("non-CUDA FlashInfer SSM route passed preflight");
+            Ok(())
+        } else if let Some(ref dense_out) = self.out_proj_dense {
             ops::dense_gemm(
                 ctx.gpu,
                 self.dense_gemm_k,
@@ -106,35 +126,49 @@ impl Qwen3SsmLayer {
                 value_dim as u32,
                 stream,
             )
-        } else if crate::layers::prefill_proj_pipe_enabled()
-            && self.w4a16_gemm_pipe_k.0 != 0
-            && (value_dim as u32).is_multiple_of(64)
-        {
-            // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
-            // K = value_dim must be a multiple of the pipe's 64-row stage.
-            ops::w4a16_gemm_pipe(
-                ctx.gpu,
-                self.w4a16_gemm_pipe_k,
-                normed_out_buf,
-                &self.ssm.out_proj,
-                out_proj_buf,
-                k,
-                h as u32,
-                value_dim as u32,
-                stream,
-            )
         } else {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                normed_out_buf,
-                &self.ssm.out_proj,
-                out_proj_buf,
-                k,
-                h as u32,
+            match crate::layers::prefill_projection_pipe_route(
+                crate::layers::prefill_proj_pipe_enabled(),
                 value_dim as u32,
-                stream,
-            )
+                self.w4a16_gemm_pipe_k.0 != 0,
+            ) {
+                crate::layers::PrefillProjectionPipeRoute::Complete => {
+                    static OUT_PIPE: std::sync::Once = std::sync::Once::new();
+                    OUT_PIPE.call_once(|| {
+                        tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE: ssm_out");
+                    });
+                    // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
+                    // K = value_dim must be a multiple of the pipe's 64-row stage.
+                    ops::w4a16_gemm_pipe(
+                        ctx.gpu,
+                        self.w4a16_gemm_pipe_k,
+                        normed_out_buf,
+                        &self.ssm.out_proj,
+                        out_proj_buf,
+                        k,
+                        h as u32,
+                        value_dim as u32,
+                        stream,
+                    )
+                }
+                crate::layers::PrefillProjectionPipeRoute::Missing => {
+                    anyhow::bail!(
+                        "ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe for an eligible SSM output projection"
+                    );
+                }
+                crate::layers::PrefillProjectionPipeRoute::Disabled
+                | crate::layers::PrefillProjectionPipeRoute::Ineligible => ops::w4a16_gemm(
+                    ctx.gpu,
+                    self.w4a16_gemm_k,
+                    normed_out_buf,
+                    &self.ssm.out_proj,
+                    out_proj_buf,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                ),
+            }
         }
         .map_err(|e| anyhow::anyhow!("ssm phase3: out_proj GEMM failed: {e}"))?;
 

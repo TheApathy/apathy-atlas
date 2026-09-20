@@ -28,6 +28,9 @@ pub(super) struct NoisePassArgs {
     pub needed_start: usize,
     pub stream: u64,
     pub debug_dump: bool,
+    pub force_noise_pattern: bool,
+    pub lm_head_nvfp4: bool,
+    pub dump_all_layers: bool,
     pub kprofile: bool,
 }
 
@@ -65,6 +68,9 @@ impl BlockDiffusionDraftHead {
             needed_start,
             stream,
             debug_dump,
+            force_noise_pattern,
+            lm_head_nvfp4,
+            dump_all_layers,
             kprofile,
         } = *a;
         let h = self.hidden_size as u32;
@@ -146,14 +152,22 @@ impl BlockDiffusionDraftHead {
                 stream,
             )?;
         } else {
-            let token_ids_host: Vec<i32> = std::iter::repeat_n(0i32, eff_ctx)
-                .chain(std::iter::once(last_token as i32))
-                .chain(
-                    (0..row_layout.feedback_rows())
-                        .map(|i| committed[i].map(|t| t as i32).unwrap_or(mask_id as i32)),
-                )
-                .collect();
+            let token_bytes = super::proposal_inputs::encode_noise_token_ids(
+                dstate.token_ids_pinned.as_mut_slice(),
+                eff_ctx,
+                last_token,
+                row_layout.feedback_rows(),
+                committed,
+                mask_id,
+            )?;
             if debug_dump {
+                let token_ids_host: Vec<u32> = std::iter::repeat_n(0u32, eff_ctx)
+                    .chain(std::iter::once(last_token))
+                    .chain(
+                        (0..row_layout.feedback_rows())
+                            .map(|i| committed.get(i).copied().flatten().unwrap_or(mask_id)),
+                    )
+                    .collect();
                 tracing::info!(
                     "DFLASH DUMP token_ids_host: mask={} eff_ctx={} ids[0..8]={:?}",
                     self.mask_token_id,
@@ -161,11 +175,13 @@ impl BlockDiffusionDraftHead {
                     &token_ids_host[..token_ids_host.len().min(8)],
                 );
             }
-            let tid_bytes: Vec<u8> = token_ids_host
-                .iter()
-                .flat_map(|t| t.to_le_bytes())
-                .collect();
-            gpu.copy_h2d(&tid_bytes, self.scratch.draft_tokens_dev)?;
+            let pinned = dstate.token_ids_pinned.pinned_slice(token_bytes)?;
+            // SAFETY: token_ids_pinned is page-locked, owned by dstate, and
+            // separate from the concurrently pending position-id upload. The
+            // state is not reused until this proposal stream drains.
+            unsafe {
+                gpu.copy_h2d_pinned_async(pinned, self.scratch.draft_tokens_dev, stream)?;
+            }
         }
         ops::batched_embed(
             gpu,
@@ -195,10 +211,6 @@ impl BlockDiffusionDraftHead {
         // [eff_ctx..n_attn) with a deterministic pattern matching the
         // PyTorch reference. Lets us compare layer-0 q/k/v post-projection
         // when both Atlas and PyTorch see identical input.
-        let force_noise_pattern = std::env::var("ATLAS_DFLASH_DEBUG_FORCE_NOISE_PATTERN")
-            .ok()
-            .as_deref()
-            == Some("1");
         if force_noise_pattern {
             let mut bytes = Vec::with_capacity(noise_rows * self.hidden_size * bf16);
             for t in 0..noise_rows {
@@ -285,8 +297,7 @@ impl BlockDiffusionDraftHead {
         // logit fidelity where the NVFP4 slice's E2M1 measured accepted
         // 5.88→5.36 and lost more than the bandwidth bought. The 1/s
         // compensation lives in `self.norm`, so these logits are true-scale.
-        let lm_head_t_fast = std::env::var("ATLAS_DFLASH_LM_HEAD_NVFP4").ok().as_deref()
-            == Some("1")
+        let lm_head_t_fast = lm_head_nvfp4
             && self.lm_head_shared_t.is_some()
             && self.kernels.w4a16_gemm_t_m32_n64.0 != 0;
         // The NVFP4-T fast path must be checked FIRST: when `lm_head_shared_fp8`
@@ -351,10 +362,6 @@ impl BlockDiffusionDraftHead {
         }
 
         // ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS=1: final norm/logits dumps.
-        let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
-            .ok()
-            .as_deref()
-            == Some("1");
         if dump_all_layers {
             let norm_bytes = output_rows * self.hidden_size * bf16;
             let mut buf = vec![0u8; norm_bytes];

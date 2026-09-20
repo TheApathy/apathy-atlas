@@ -94,6 +94,18 @@ impl Qwen3AttentionLayer {
         let (reshape_mod, reshape_fn, decode_mod, decode_fn) =
             super::init_kernel_dispatch::kernel_modules_for_dtype(kv_dtype, config.head_dim);
         let mrope_interleaved = config.mrope_interleaved;
+        let yarn = super::yarn::YarnRopeParams::from_config(config)?;
+        if yarn.is_some() && config.model_type == "qwen3_5" {
+            anyhow::ensure!(
+                mrope_interleaved && config.mrope_section == [11, 11, 10],
+                "Qwen3.8 YaRN requires interleaved MRoPE section [11, 11, 10]"
+            );
+            anyhow::ensure!(
+                config.rotary_dim() == 64,
+                "Qwen3.8 YaRN requires rotary_dim=64, got {}",
+                config.rotary_dim()
+            );
+        }
         Ok(Self {
             input_norm,
             attn,
@@ -102,6 +114,7 @@ impl Qwen3AttentionLayer {
             attn_layer_idx,
             gated,
             mrope_interleaved,
+            yarn,
             kv_dtype,
             head_dim_override: None,
             num_q_heads_override: None,
@@ -135,6 +148,8 @@ impl Qwen3AttentionLayer {
             k_fp8w_t: None,
             v_fp8w_t: None,
             o_fp8w_t: None,
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            flashinfer_projection_prefill: None,
             w8a16_gemm_t_k: super::super::try_kernel(gpu, "w8a16_gemm_t", "w8a16_gemm_t"),
             rms_norm_k: gpu.kernel("norm", "rms_norm")?,
             rms_norm_residual_k: if config.use_fp32_residual() {
@@ -173,7 +188,32 @@ impl Qwen3AttentionLayer {
                     "w4a16_gemv_exact_attention",
                     "w4a16_gemv_dual_kv_exact_m4",
                 ),
+            )
+            .with_m32(
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_qg_exact_m32",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "w4a16_gemv_exact_attention",
+                    "w4a16_gemv_dual_kv_exact_m32",
+                ),
             ),
+            w4a16_exact_qkv_m17_astage_kernels:
+                crate::layers::ops::W4a16ExactAttentionM17AStageKernels::new(
+                    super::super::try_kernel(
+                        gpu,
+                        "w4a16_gemv_exact_attention",
+                        "w4a16_gemv_qg_exact_m17_astage",
+                    ),
+                    super::super::try_kernel(
+                        gpu,
+                        "w4a16_gemv_exact_attention",
+                        "w4a16_gemv_dual_kv_exact_m17_astage",
+                    ),
+                ),
             w4a16_exact_o_proj_kernels: crate::layers::ops::W4a16ExactLmHeadKernels::new(
                 super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m4"),
                 super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch_logits_exact_m8"),
@@ -201,7 +241,12 @@ impl Qwen3AttentionLayer {
                     "w4a16_gemv_rt",
                     "w4a16_gemv_batch_logits_exact_rt2_m32",
                 ),
-            ),
+            )
+            .with_m17_astage(super::super::try_kernel(
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch_logits_exact_m17_astage",
+            )),
             w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             gemv_sw: crate::layers::ops::gemv_sw_enabled(),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
@@ -213,6 +258,18 @@ impl Qwen3AttentionLayer {
                 "rope_mrope_interleaved",
                 "rope_forward_mrope_interleaved",
             ),
+            rope_mrope_interleaved_yarn_k: if yarn.is_some() && mrope_interleaved {
+                gpu.kernel(
+                    "rope_mrope_interleaved",
+                    "rope_forward_mrope_interleaved_yarn",
+                )?
+            } else {
+                super::super::try_kernel(
+                    gpu,
+                    "rope_mrope_interleaved",
+                    "rope_forward_mrope_interleaved_yarn",
+                )
+            },
             rope_strided_b3_k: super::super::try_kernel(gpu, "rope", "rope_forward_strided_b3"),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
@@ -558,6 +615,7 @@ impl Qwen3AttentionLayer {
             rms_norm_qk_batch3_k: super::super::try_kernel(gpu, "norm", "rms_norm_qk_batch3"),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_pipe_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
+            w4a16_gemm_pipe_dual_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe_dual"),
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
@@ -594,6 +652,11 @@ impl Qwen3AttentionLayer {
                 "inferspark_prefill_paged_512",
             ),
             prefill_attn_64_k: gpu.kernel("inferspark_prefill", "inferspark_prefill_64")?,
+            prefill_attn_64_gate_fused_k: super::super::try_kernel(
+                gpu,
+                "inferspark_prefill_gate_fused",
+                "inferspark_prefill_64_gate_fused",
+            ),
             prefill_attn_128_k: super::super::try_kernel(
                 gpu,
                 "inferspark_prefill_128",
@@ -619,6 +682,11 @@ impl Qwen3AttentionLayer {
                 .kernel("prefill_paged_fp8", "inferspark_prefill_paged_fp8_64")?,
             prefill_attn_paged_nvfp4_64_k: gpu
                 .kernel("prefill_paged_nvfp4", "inferspark_prefill_paged_nvfp4_64")?,
+            prefill_attn_paged_nvfp4_128_k: super::super::try_kernel(
+                gpu,
+                "prefill_paged_nvfp4",
+                "inferspark_prefill_paged_nvfp4_128",
+            ),
             prefill_attn_paged_turbo2_64_k: super::super::try_kernel(
                 gpu,
                 "prefill_paged_turbo2",
@@ -725,6 +793,11 @@ impl Qwen3AttentionLayer {
             deinterleave_qg_split_k: gpu.kernel("ssm_preprocess", "deinterleave_qg_split")?,
             deinterleave_qg_split_qnorm_k: gpu
                 .kernel("ssm_preprocess", "deinterleave_qg_split_qnorm")?,
+            qwen38_prefill_qknorm_rope_k: super::super::try_kernel(
+                gpu,
+                "qwen38_prefill_qknorm_rope",
+                "qwen38_prefill_qknorm_rope",
+            ),
             sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
             q_fp8: None,
             k_fp8: None,

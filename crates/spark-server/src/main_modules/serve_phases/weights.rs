@@ -65,11 +65,50 @@ pub(crate) struct ConstructionOverhead {
     pub(crate) ffn_transposed: usize,
     /// Transposed NVFP4 q/k/v/o copies on full-attention layers.
     pub(crate) attn_transposed: usize,
+    /// FlashInfer/CUTLASS 128x4 copies of gate/up/down FP8 block scales.
+    /// Packed checkpoint weights are reused in place; only scale bytes and
+    /// three alpha FP32 scalars are retained per dense layer.
+    pub(crate) ffn_flashinfer_scales: usize,
+    /// Additional retained merged gate/up operands. This is the packed-weight
+    /// delta relative to the former separate gate/up FlashInfer preparation;
+    /// its physical scales and shared alpha replace bytes already counted in
+    /// `ffn_flashinfer_scales`.
+    pub(crate) ffn_flashinfer_merged_gate_up: usize,
+    /// Per-layer activation arena retained after the first maximum-size
+    /// FlashInfer FFN prefill: packed E2M1 values, padded 128x4 E4M3 scales,
+    /// and one FP32 scalar at exact M8192/K=intermediate.
+    pub(crate) ffn_flashinfer_scratch: usize,
 }
 
 impl ConstructionOverhead {
     pub(crate) fn total(&self) -> usize {
-        self.ssm + self.ffn_transposed + self.attn_transposed
+        self.ssm
+            + self.ffn_transposed
+            + self.attn_transposed
+            + self.ffn_flashinfer_scales
+            + self.ffn_flashinfer_merged_gate_up
+            + self.ffn_flashinfer_scratch
+    }
+}
+
+fn flashinfer_merged_gate_up_overhead_bytes(num_hidden_layers: usize) -> usize {
+    spark_model::weight_map::flashinfer_ffn_admission::qwen38_merged_gate_up_additional_bytes()
+        * num_hidden_layers
+}
+
+#[cfg(test)]
+mod construction_overhead_tests {
+    use super::{ConstructionOverhead, flashinfer_merged_gate_up_overhead_bytes};
+
+    #[test]
+    fn merged_gate_up_charge_uses_the_admission_ssot() {
+        assert_eq!(flashinfer_merged_gate_up_overhead_bytes(1), 89_128_956);
+        assert_eq!(flashinfer_merged_gate_up_overhead_bytes(64), 5_704_253_184);
+        let overhead = ConstructionOverhead {
+            ffn_flashinfer_merged_gate_up: flashinfer_merged_gate_up_overhead_bytes(64),
+            ..ConstructionOverhead::default()
+        };
+        assert_eq!(overhead.total(), 5_704_253_184);
     }
 }
 
@@ -167,10 +206,35 @@ pub(crate) fn construction_overhead_bytes(config: &ModelConfig) -> ConstructionO
         per_layer * config.num_attention_layers()
     };
 
+    let (ffn_flashinfer_scales, ffn_flashinfer_merged_gate_up, ffn_flashinfer_scratch) =
+        if config.num_experts == 0
+            && spark_model::layers::prefill_ffn_flashinfer_enabled().unwrap_or(false)
+        {
+            let inter = config.intermediate_size;
+            let per_layer = inter * h / NVFP4_GROUP // gate physical scales
+                + inter * h / NVFP4_GROUP // up physical scales
+                + h * inter / NVFP4_GROUP // down physical scales
+                + 3 * std::mem::size_of::<f32>(); // three alpha scalars
+            let max_m = 8_192usize;
+            let scratch_per_layer = max_m * inter / 2 // packed E2M1 activation
+                + max_m * inter / NVFP4_GROUP // padded 128x4 scales; M already 128-aligned
+                + std::mem::size_of::<f32>(); // legacy absmax allocation retained by the arena
+            (
+                per_layer * config.num_hidden_layers,
+                flashinfer_merged_gate_up_overhead_bytes(config.num_hidden_layers),
+                scratch_per_layer * config.num_hidden_layers,
+            )
+        } else {
+            (0, 0, 0)
+        };
+
     ConstructionOverhead {
         ssm: per_ssm_layer * ssm_layers,
         ffn_transposed,
         attn_transposed,
+        ffn_flashinfer_scales,
+        ffn_flashinfer_merged_gate_up,
+        ffn_flashinfer_scratch,
     }
 }
 
@@ -196,13 +260,16 @@ pub(crate) fn load_weight_store(
         tracing::info!(
             "Model-construction overhead estimate: {:.2} GB retained after the weight \
              store loads — SSM linear-attn {:.2} GB ({} layers), dense-FFN transposes \
-             {:.2} GB, attention transposes {:.2} GB ({} layers). Charged to the load \
+             {:.2} GB, FlashInfer FFN scales {:.2} GB, merged gate/up {:.2} GB, FlashInfer FFN activation scratch {:.2} GB, attention transposes {:.2} GB ({} layers). Charged to the load \
              pre-flight on top of the {:.2}x on-disk ratio. Excludes lm_head / MTP / \
              ViT / DFlash drafter.",
             gib(overhead.total()),
             gib(overhead.ssm),
             config.num_ssm_layers(),
             gib(overhead.ffn_transposed),
+            gib(overhead.ffn_flashinfer_scales),
+            gib(overhead.ffn_flashinfer_merged_gate_up),
+            gib(overhead.ffn_flashinfer_scratch),
             gib(overhead.attn_transposed),
             config.num_attention_layers(),
             mult.unwrap_or(1.0),

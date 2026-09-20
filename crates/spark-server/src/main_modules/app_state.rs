@@ -18,6 +18,12 @@ pub struct AppState {
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     pub max_seq_len: usize,
+    /// Effective scheduler concurrency; image features are currently C1-only.
+    pub max_batch_size: usize,
+    /// True when static YaRN scaling is active. Until persistent multimodal
+    /// position deltas are implemented, request admission uses this to keep
+    /// the extended context text-only.
+    pub yarn_context: bool,
     pub request_tx: mpsc::Sender<InferenceRequest>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,

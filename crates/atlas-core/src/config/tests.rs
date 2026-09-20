@@ -236,6 +236,7 @@ fn test_kbenkhaled_qwen35_27b_dense_mrope_no_rewrite() {
             "num_key_value_heads": 4,
             "head_dim": 256,
             "intermediate_size": 17408,
+            "rope_theta": 10000000,
             "partial_rotary_factor": 0.25,
             "linear_num_key_heads": 16,
             "linear_key_head_dim": 128,
@@ -262,6 +263,99 @@ fn test_kbenkhaled_qwen35_27b_dense_mrope_no_rewrite() {
     // MRoPE flags still parsed so the kernel uses the right rope path.
     assert!(cfg.mrope_interleaved);
     assert_eq!(cfg.mrope_section, [11, 11, 10]);
+}
+
+#[test]
+fn test_qwen38_dense_static_yarn_1m_recipe() {
+    let json = r#"{
+        "model_type": "qwen3_5",
+        "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "intermediate_size": 17408,
+            "partial_rotary_factor": 0.25,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144,
+            "rope_parameters": {
+                "rope_theta": 10000000,
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 262144,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "attention_factor": 1.138629436111989,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10]
+            }
+        }
+    }"#;
+    let cfg = parse_config(json).unwrap();
+    assert_eq!(cfg.model_type, "qwen3_5");
+    assert_eq!(cfg.rope_theta, 10_000_000.0);
+    assert_eq!(cfg.partial_rotary_factor, 0.25);
+    assert_eq!(cfg.yarn_factor, 4.0);
+    assert_eq!(cfg.yarn_beta_fast, 32.0);
+    assert_eq!(cfg.yarn_beta_slow, 1.0);
+    assert_eq!(cfg.yarn_original_max_position_embeddings, 262_144);
+    assert!(cfg.mrope_interleaved);
+    assert_eq!(cfg.mrope_section, [11, 11, 10]);
+
+    for (from, to) in [
+        ("\"rope_type\": \"yarn\"", "\"rope_type\": \"linear\""),
+        ("\"factor\": 4.0", "\"factor\": 2.0"),
+        (
+            "\"original_max_position_embeddings\": 262144",
+            "\"original_max_position_embeddings\": 0",
+        ),
+        ("\"beta_fast\": 32.0", "\"beta_fast\": 1.0"),
+        (
+            "\"attention_factor\": 1.138629436111989",
+            "\"attention_factor\": 1.0",
+        ),
+        (
+            "\"mrope_interleaved\": true",
+            "\"mrope_interleaved\": false",
+        ),
+        (
+            "\"mrope_section\": [11, 11, 10]",
+            "\"mrope_section\": [12, 10, 10]",
+        ),
+    ] {
+        assert!(
+            parse_config(&json.replace(from, to)).is_err(),
+            "accepted mutation {to}"
+        );
+    }
+}
+
+#[test]
+fn test_qwen_yarn_requires_factor_and_origin() {
+    let missing_factor = r#"{
+        "model_type":"qwen3_5",
+        "text_config":{"hidden_size":5120,"rope_parameters":{"rope_type":"yarn"}}
+    }"#;
+    assert!(parse_config(missing_factor).is_err());
+
+    let non_object = r#"{
+        "model_type":"qwen3_5",
+        "text_config":{"hidden_size":5120,"rope_parameters":"yarn"}
+    }"#;
+    assert!(parse_config(non_object).is_err());
+
+    let conflicting_theta = r#"{
+        "model_type":"qwen3_5",
+        "text_config":{
+            "hidden_size":5120,
+            "rope_theta":5000000,
+            "rope_parameters":{"rope_type":"default","rope_theta":10000000}
+        }
+    }"#;
+    assert!(parse_config(conflicting_theta).is_err());
 }
 
 #[test]

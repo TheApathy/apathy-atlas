@@ -4,6 +4,28 @@
 
 use atlas_core::config::ModelConfig;
 
+pub(super) fn qwen38_flashinfer_merged_output_bytes(
+    config: &ModelConfig,
+    max_batch_tokens: usize,
+    requested: bool,
+) -> usize {
+    let exact_qwen38_dense = config.model_type == "qwen3_5"
+        && config.num_experts == 0
+        && config.hidden_size == 5_120
+        && config.intermediate_size == 17_408
+        && config.tp_world_size.max(1) == 1;
+    if requested && exact_qwen38_dense {
+        max_batch_tokens
+            .min(8_192)
+            .checked_mul(2 * config.intermediate_size)
+            .and_then(|elements| elements.checked_mul(2))
+            .expect("Qwen3.8 merged gate/up arena extent overflow")
+            .max(256)
+    } else {
+        256
+    }
+}
+
 /// Byte sizes of each buffer, derived from ModelConfig.
 #[derive(Debug, Clone)]
 pub struct BufferSizes {
@@ -20,6 +42,9 @@ pub struct BufferSizes {
     pub ssm_deinterleaved: usize,
     pub ssm_gates: usize,
     pub ssm_conv_out_f32: usize,
+    /// Shared row-major BF16 `[M, 2 * intermediate]` result for the exact
+    /// Qwen3.8 merged gate/up FlashInfer prefill route.
+    pub ffn_gate_up_bf16: usize,
     pub scratch: usize,
     pub expert_gate_out: usize,
     pub expert_up_out: usize,
@@ -170,6 +195,19 @@ impl BufferSizes {
         // FP32 prevents BF16 truncation across 48 layers but costs 2x bandwidth.
         let residual_elem = if config.use_fp32_residual() { 4 } else { bf16 };
 
+        // FlashInfer emits merged gate/up as one row-major [M, 34816]
+        // result, while Atlas keeps two disjoint [M, 17408] destinations.
+        // No existing shared arena is large enough: the closest Qwen3.8 SSM
+        // arena is M*16384*4 = M*65536 bytes, 6.25% below M*69632. Allocate
+        // one model-wide arena (never one per layer), and cap it at the
+        // largest admitted row count because larger/tail shapes cannot route.
+        // Only the exact opt-in string allocates it; malformed values fail in
+        // the authoritative model selector and receive only the sentinel.
+        let flashinfer_ffn_requested =
+            std::env::var_os("ATLAS_PREFILL_FFN_FLASHINFER").is_some_and(|value| value == "1");
+        let ffn_gate_up_bf16 =
+            qwen38_flashinfer_merged_output_bytes(config, m, flashinfer_ffn_requested);
+
         Self {
             hidden_states: m * h * residual_elem,
             residual: m * h * residual_elem,
@@ -249,6 +287,7 @@ impl BufferSizes {
                     0
                 })
                 .max(256),
+            ffn_gate_up_bf16,
             scratch,
             expert_gate_out,
             expert_up_out,
@@ -272,6 +311,7 @@ impl BufferSizes {
             + self.ssm_deinterleaved
             + self.ssm_gates
             + self.ssm_conv_out_f32
+            + self.ffn_gate_up_bf16
             + self.scratch
             + self.expert_gate_out
             + self.expert_up_out

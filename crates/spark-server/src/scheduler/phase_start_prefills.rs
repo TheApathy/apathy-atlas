@@ -10,6 +10,10 @@ use super::*;
 use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
+fn initial_prefill_chunk_budget(max_prefill_tokens: usize, max_batch_tokens: usize) -> usize {
+    max_prefill_tokens.min(max_batch_tokens)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
     model: &dyn Model,
@@ -31,14 +35,11 @@ pub(super) fn start_new_requests(
 ) {
     for req in new_reqs {
         if chunked {
-            // When no active sequences are decoding, process as much of the
-            // prompt as buffers allow — avoids per-token paged decode fallback
-            // in chunk 2+. Capped at max_batch_tokens (buffer capacity).
-            let budget = if active.is_empty() && prefilling.is_empty() {
-                max_batch_tokens
-            } else {
-                max_prefill_tokens
-            };
+            // The arena includes extra decode-slot capacity, but that capacity
+            // is not part of the explicit prefill ceiling. In particular, an
+            // 8192-token kernel qualification must never become an 8193-token
+            // launch merely because max_batch_size is one.
+            let budget = initial_prefill_chunk_budget(max_prefill_tokens, max_batch_tokens);
             match start_chunked_prefill(
                 think_end_token,
                 think_start_token,
@@ -121,5 +122,16 @@ fn handle_prefill_start_error(model: &dyn Model, e: &anyhow::Error, active: &mut
         send_error(model, &mut victim, "Preempted: server resource pressure");
     } else {
         tracing::error!("Prefill start error: {err_msg}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_prefill_chunk_budget;
+
+    #[test]
+    fn initial_prefill_never_consumes_decode_slot_capacity() {
+        assert_eq!(initial_prefill_chunk_budget(8_192, 8_193), 8_192);
+        assert_eq!(initial_prefill_chunk_budget(2_048, 8_193), 2_048);
     }
 }

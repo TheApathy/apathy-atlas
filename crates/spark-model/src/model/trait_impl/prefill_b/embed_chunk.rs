@@ -37,12 +37,8 @@ impl TransformerModel {
         hidden_dst: spark_runtime::gpu::DevicePtr,
         stream: u64,
     ) -> Result<()> {
+        self.validate_vision_prompt(tokens, chunk_start, chunk_len)?;
         let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
-        } else {
-            2usize
-        };
 
         // ── 1. Embed chunk tokens → [chunk_len, H] contiguous at hidden_dst ──
         // Upload token IDs to device and do a single batched embed kernel launch
@@ -110,34 +106,7 @@ impl TransformerModel {
             }
         }
 
-        // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
-        // Vision embeddings are pre-computed by prepare_vision_embed() and stored in
-        // the VisionEncoder's buf_out buffer ([total_patches, out_hidden_size] BF16).
-        {
-            let pending = *self.vision_embed_patches.lock();
-            if pending > 0
-                && let Some(ve) = &self.vision_encoder
-            {
-                let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-                let pad_id = self
-                    .config
-                    .vision
-                    .as_ref()
-                    .map(|v| v.image_pad_token_id)
-                    .filter(|v| *v != 0)
-                    .unwrap_or(crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID);
-                let mut img_idx = 0usize; // index into buf_out rows
-                for (i, &tok) in chunk_tokens.iter().enumerate() {
-                    if tok == pad_id {
-                        let src = ve.buf_out.offset(img_idx * ve.out_hidden_size * 2);
-                        let dst = hidden_dst.offset(i * h * fp32);
-                        self.gpu
-                            .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
-                        img_idx += 1;
-                    }
-                }
-            }
-        }
+        self.splice_vision_embeddings(tokens, chunk_start, chunk_len, hidden_dst, stream)?;
 
         Ok(())
     }

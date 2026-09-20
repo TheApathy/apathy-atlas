@@ -62,6 +62,41 @@ fn wide_verify_hidden_save(
     }
 }
 
+/// ECHO may reuse a target tail only when both pieces of proposer state that
+/// condition the next frame were refreshed successfully. This gate does not
+/// change the ordinary DFlash recovery policy; it only suppresses the
+/// optional ECHO shortcut when that policy continued after an error.
+const fn echo_state_ready(hidden_saved: bool, proposer_trimmed: bool) -> bool {
+    hidden_saved && proposer_trimmed
+}
+
+fn dispatch_echo_stash<F>(
+    enabled: bool,
+    state_ready: bool,
+    route_eligible: bool,
+    verified: &[u32],
+    num_accepted: usize,
+    mut stash: F,
+) -> Result<()>
+where
+    F: FnMut(&[u32], usize) -> Result<()>,
+{
+    if !enabled {
+        return Ok(());
+    }
+    if state_ready && route_eligible {
+        stash(verified, num_accepted)
+    } else {
+        // Empty is below EchoConfig's enforced min_tail >= 1 and therefore
+        // invalidates a pre-existing one-step stash.
+        stash(&[], 0)
+    }
+}
+
+const fn suppress_reproposal(grammar_skip: bool, echo_dispatch_failed: bool) -> bool {
+    grammar_skip || echo_dispatch_failed
+}
+
 #[derive(Debug)]
 struct SerialOracleReplay {
     verified: Vec<u32>,
@@ -1317,6 +1352,7 @@ pub fn step_verify_dflash(
             }
             WideVerifyHiddenSave::NativeMtpRow(row) => model.save_hidden_for_mtp(row, 0),
         };
+    let dflash_hidden_saved = save_hidden_result.is_ok();
     if let Err(e) = save_hidden_result {
         tracing::error!("save hidden after wide verify: {e:#}");
         // Native MTP consumes this buffer immediately. Its established K=2/3/4
@@ -1332,9 +1368,13 @@ pub fn step_verify_dflash(
 
     let spec_phase = spec_cycle.post_commit_enqueue(spec_phase);
     let t_trim = Instant::now();
-    if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
-        tracing::error!("trim_proposer_state: {e:#}");
-    }
+    let dflash_proposer_trimmed = match model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!("trim_proposer_state: {e:#}");
+            false
+        }
+    };
     // FIX 1: stamp the sparse accepted path onto the proposer (AFTER
     // trim/after_verify, which clears it) so the next propose's ctx-hidden
     // append reads the scattered fork-capture rows, not the contiguous
@@ -1380,23 +1420,32 @@ pub fn step_verify_dflash(
     // The min-accept floor / min-tail gates live in dflash_stash_echo.
     // LOSSLESS: only changes what is PROPOSED next step, never what is
     // committed — same oracle contract as recycle above.
-    if spark_model::layers::dflash_head::echo::EchoConfig::enabled()
-        && a.pending_tree_payload.is_none()
+    let echo_state_ready = echo_state_ready(dflash_hidden_saved, dflash_proposer_trimmed);
+    let echo_route_eligible = a.pending_tree_payload.is_none()
         && !dflash_tree_method_active()
         && !dflash_portfolio_active()
         && thinking_accept.is_none()
         && content_accept.is_none()
-        && grammar_accept.is_none()
-        && let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token)
-    {
-        tracing::warn!("dflash_stash_echo: {e:#}");
+        && grammar_accept.is_none();
+    let echo_result = dispatch_echo_stash(
+        spark_model::layers::dflash_head::echo::EchoConfig::enabled(),
+        echo_state_ready,
+        echo_route_eligible,
+        &verified,
+        num_accepted,
+        |tokens, accepted| model.dflash_stash_echo(&mut a.seq, tokens, accepted, a.last_token),
+    );
+    let echo_dispatch_failed = echo_result.is_err();
+    if let Err(e) = echo_result {
+        tracing::warn!("dflash_stash_echo failed; suppressing immediate reproposal: {e:#}");
     }
 
     // Re-propose for next step — unless the stage-1 grammar gate fires
     // (grammar now constrains output, e.g. this verify emitted the token
     // that opened a tool-call body): leave `pending_drafts` empty so the
     // next step runs the grammar-enforced bootstrap decode.
-    let skip_propose = dflash_grammar_skip_propose(model, a);
+    let skip_propose =
+        suppress_reproposal(dflash_grammar_skip_propose(model, a), echo_dispatch_failed);
     let _mtp_grammar_mask = if skip_propose {
         None
     } else {
@@ -2227,7 +2276,8 @@ fn masked_argmax_bf16(bytes: &[u8], bitmask: &[i32], vocab: usize) -> Option<u32
 mod wide_verify_hidden_save_tests {
     use super::{
         WideVerifyHiddenSave, canonical_u32_csv, canonical_u32_csv_text, canonical_usize,
-        ep_kgamma_result, exact_accept_prefix, selected_verified, trajectory_selector_values_match,
+        dispatch_echo_stash, echo_state_ready, ep_kgamma_result, exact_accept_prefix,
+        selected_verified, suppress_reproposal, trajectory_selector_values_match,
         wide_verify_hidden_save,
     };
     use spark_model::traits::EP_VERIFY_KGAMMA_ABORT;
@@ -2271,6 +2321,142 @@ mod wide_verify_hidden_save_tests {
             wide_verify_hidden_save(false, 99, 2, Some(7)),
             WideVerifyHiddenSave::NativeMtpRow(7)
         );
+    }
+
+    #[test]
+    fn echo_requires_both_hidden_save_and_proposer_trim_success() {
+        assert!(echo_state_ready(true, true));
+        assert!(!echo_state_ready(false, true));
+        assert!(!echo_state_ready(true, false));
+        assert!(!echo_state_ready(false, false));
+    }
+
+    #[test]
+    fn echo_dispatch_clears_preseeded_stash_on_each_state_failure() {
+        for (hidden_saved, proposer_trimmed) in [(false, true), (true, false), (false, false)] {
+            let mut stored = vec![91, 92, 93];
+            let mut calls = 0;
+            dispatch_echo_stash(
+                true,
+                echo_state_ready(hidden_saved, proposer_trimmed),
+                true,
+                &[1, 2, 3],
+                1,
+                |tokens, accepted| {
+                    calls += 1;
+                    assert_eq!(accepted, 0);
+                    stored.clear();
+                    stored.extend_from_slice(tokens);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert!(stored.is_empty());
+        }
+    }
+
+    #[test]
+    fn echo_dispatch_is_once_only_for_success_policy_clear_and_disabled() {
+        let verified = [10, 11, 12, 13];
+        let mut calls = Vec::new();
+        dispatch_echo_stash(true, true, true, &verified, 2, |tokens, accepted| {
+            calls.push((tokens.to_vec(), accepted));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, [(verified.to_vec(), 2)]);
+
+        calls.clear();
+        dispatch_echo_stash(true, true, false, &verified, 2, |tokens, accepted| {
+            calls.push((tokens.to_vec(), accepted));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, [(Vec::new(), 0)]);
+
+        calls.clear();
+        dispatch_echo_stash(false, false, false, &verified, 2, |tokens, accepted| {
+            calls.push((tokens.to_vec(), accepted));
+            Ok(())
+        })
+        .unwrap();
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn echo_callback_error_suppresses_reproposal() {
+        let result = dispatch_echo_stash(true, false, false, &[10, 11, 12], 1, |_, _| {
+            anyhow::bail!("hostile stale-stash clear failure")
+        });
+        assert!(result.is_err());
+        assert!(suppress_reproposal(false, result.is_err()));
+        assert!(suppress_reproposal(true, false));
+        assert!(!suppress_reproposal(false, false));
+    }
+
+    #[test]
+    fn echo_failure_gate_precedes_reproposal_and_preserves_native_return() {
+        let source = include_str!("verify_dflash_step.rs");
+        let hidden = source.find("let dflash_hidden_saved =").unwrap();
+        let trim = source[hidden..]
+            .find("let dflash_proposer_trimmed =")
+            .map(|offset| hidden + offset)
+            .unwrap();
+        let dispatch = source[trim..]
+            .find("let echo_result = dispatch_echo_stash(")
+            .map(|offset| trim + offset)
+            .unwrap();
+        let echo_error = source[dispatch..]
+            .find("let echo_dispatch_failed =")
+            .map(|offset| dispatch + offset)
+            .unwrap();
+        let repropose = source[echo_error..]
+            .find("let skip_propose =")
+            .map(|offset| echo_error + offset)
+            .unwrap();
+        let retrieval = source[repropose..]
+            .find("let retrieved = if skip_propose || skip_repropose_diag")
+            .map(|offset| repropose + offset)
+            .unwrap();
+        let should_propose = source[retrieval..]
+            .find("let should_propose =")
+            .map(|offset| retrieval + offset)
+            .unwrap();
+        let lifecycle = source[should_propose..]
+            .find("proposal_lifecycle::propose_and_install_with(")
+            .map(|offset| should_propose + offset)
+            .unwrap();
+        assert!(
+            hidden < trim
+                && trim < dispatch
+                && dispatch < echo_error
+                && echo_error < repropose
+                && repropose < retrieval
+                && retrieval < should_propose
+                && should_propose < lifecycle
+        );
+        assert!(source[repropose..].starts_with("let skip_propose ="));
+        let scheduling = &source[repropose..lifecycle];
+        assert!(scheduling.contains("suppress_reproposal("));
+        let compact: String = scheduling.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains(
+            "suppress_reproposal(dflash_grammar_skip_propose(model,a),echo_dispatch_failed)"
+        ));
+        assert!(scheduling.contains("if skip_propose || skip_repropose_diag"));
+        assert!(scheduling.contains(
+            "let should_propose = !skip_propose && !skip_repropose_diag && retrieved.is_none();"
+        ));
+        let lifecycle_end = source[lifecycle..]
+            .find("|a, propose_result|")
+            .map(|offset| lifecycle + offset)
+            .unwrap();
+        let lifecycle_call = &source[lifecycle..lifecycle_end];
+        assert!(lifecycle_call.contains("should_propose,"));
+        assert!(!lifecycle_call.contains("true,"));
+        let native_failure = &source[hidden..trim];
+        assert!(native_failure.contains("if !proposer_is_dflash"));
+        assert!(native_failure.contains("return;"));
     }
 
     #[test]

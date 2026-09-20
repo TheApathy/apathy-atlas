@@ -446,6 +446,17 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
                 a.force_end_thinking = true;
                 tracing::info!("Thinking budget exhausted ({budget} tokens), forcing </think>");
             }
+            if !a.force_end_thinking
+                && im_start_hard_stop().is_some_and(|im_start| {
+                    detect_chatml_thinking_cycle(&a.output_tokens, None, im_start)
+                })
+            {
+                a.force_end_thinking = true;
+                tracing::warn!(
+                    thinking_tokens = a.thinking_tokens,
+                    "ChatML control-token cycle detected during speculative thinking; forcing </think>"
+                );
+            }
         }
     } else {
         a.remaining -= 1;

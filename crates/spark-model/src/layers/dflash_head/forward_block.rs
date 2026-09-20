@@ -108,6 +108,9 @@ impl BlockDiffusionDraftHead {
         // logged at the end of forward_block. Adds ~20μs/sync × ~14 syncs/layer
         // when enabled — only use for measurement, not production.
         let kprofile = super::kernel_profile_enabled();
+        let policy = self
+            .proposal_policy
+            .get_or_init(super::proposal_policy::ProposalPolicy::from_env);
         let t_total = std::time::Instant::now();
         if kprofile {
             gpu.synchronize(stream)?;
@@ -121,15 +124,13 @@ impl BlockDiffusionDraftHead {
         // context, distant history adds noise to attention.
         // ATLAS_DFLASH_DEBUG_CTX_OFF=1 disables ctx entirely (eff_ctx=0)
         // for A/B testing whether the drafter actually responds to ctx.
-        let force_no_ctx = std::env::var("ATLAS_DFLASH_DEBUG_CTX_OFF").ok().as_deref() == Some("1");
-        let force_ctx_used: Option<usize> = std::env::var("ATLAS_DFLASH_DEBUG_CTX_USED")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok());
+        let force_no_ctx = policy.force_no_ctx;
+        let force_ctx_used = policy.force_ctx_used;
         let (ctx_base_ptr, ctx_total, eff_ctx) = if dstate.ctx_len > 0 && !force_no_ctx {
             let n = dstate.ctx_len;
             let eff = match force_ctx_used {
-                Some(forced) => forced.min(n).min(self.ctx_window),
-                None => n.min(self.ctx_window),
+                Some(forced) => forced.min(n).min(self.ctx_window).min(dstate.ctx_capacity),
+                None => n.min(self.ctx_window).min(dstate.ctx_capacity),
             };
             (Some(dstate.ctx_hidden_acc), n, eff)
         } else {
@@ -179,7 +180,7 @@ impl BlockDiffusionDraftHead {
         // Debug dump gated by env var: prints first 10 BF16 floats of key
         // intermediates so a Python reference run on the same checkpoint
         // can be compared element-wise. Use ATLAS_DFLASH_DEBUG_DUMP=1.
-        let debug_dump = std::env::var("ATLAS_DFLASH_DEBUG_DUMP").ok().as_deref() == Some("1");
+        let debug_dump = policy.debug_dump;
         let dump_bf16 = |label: &str, ptr: spark_runtime::gpu::DevicePtr, n: usize| -> Result<()> {
             if !debug_dump {
                 return Ok(());
@@ -215,10 +216,7 @@ impl BlockDiffusionDraftHead {
             // Zeroing zeros out the corresponding fc input rows so the
             // drafter only conditions on the cleaner early-layer captures.
             // Effective drafter input dim drops from 5*hidden to (5-N)*hidden.
-            let zero_late = std::env::var("ATLAS_DFLASH_ZERO_LATE_LAYERS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
+            let zero_late = policy.zero_late;
             // ATLAS_DFLASH_HF_OVERRIDE=<path>            — load from file
             // (manual one-prompt test).  We use atlas_tokens.json's prompt
             // for both Atlas and the prior `hf_capture.py` run.
@@ -247,15 +245,26 @@ impl BlockDiffusionDraftHead {
             //   path — flip the bench to use it for end-to-end accept
             //   rate measurement.
             if eff_ctx > 0
-                && let Ok(p) = std::env::var("ATLAS_DFLASH_HF_OVERRIDE")
+                && let Some(p) = policy.hf_override.as_deref()
             {
                 let needed = eff_ctx * ctx_slot_bytes;
-                match std::fs::read(&p) {
+                match std::fs::read(p) {
                     Ok(hf_bytes) if hf_bytes.len() >= needed => {
-                        gpu.copy_h2d(
-                            &hf_bytes[..needed],
-                            base.offset(start_slot * ctx_slot_bytes),
+                        let plan = super::ring_window::plan_ring_copy(
+                            start_slot,
+                            ctx_total,
+                            dstate.ctx_capacity,
+                            start_slot,
+                            ctx_total,
                         )?;
+                        for span in plan.spans() {
+                            let byte_start = span.dst_slot * ctx_slot_bytes;
+                            let byte_end = byte_start + span.slot_count * ctx_slot_bytes;
+                            gpu.copy_h2d(
+                                &hf_bytes[byte_start..byte_end],
+                                base.offset(span.src_slot * ctx_slot_bytes),
+                            )?;
+                        }
                         if debug_dump {
                             tracing::info!(
                                 "DFLASH HF_OVERRIDE: loaded {} bytes from {}",
@@ -296,7 +305,8 @@ impl BlockDiffusionDraftHead {
                 let n_zero = zero_late.min(n_capture);
                 let h_bytes = self.target_hidden_size * bf16;
                 for slot_i in 0..eff_ctx {
-                    let slot_base = base.offset((start_slot + slot_i) * ctx_slot_bytes);
+                    let physical_slot = (start_slot + slot_i) % dstate.ctx_capacity;
+                    let slot_base = base.offset(physical_slot * ctx_slot_bytes);
                     // Zero the LAST n_zero layer slices (indices n_capture-n_zero .. n_capture)
                     for layer_i in (n_capture - n_zero)..n_capture {
                         let layer_ptr = slot_base.offset(layer_i * h_bytes);
@@ -318,10 +328,7 @@ impl BlockDiffusionDraftHead {
             // comparable intermediates. Pattern: row i, col j contains
             // `0.01 * (i+1) * (j+1) / target_hidden` BF16. Mirrors
             // `dflash_pytorch_reference.py:make_input_target_hidden_stack`.
-            let force_pattern = std::env::var("ATLAS_DFLASH_DEBUG_FORCE_PATTERN")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let force_pattern = policy.force_pattern;
             if force_pattern && eff_ctx > 0 {
                 let n_rows = self.target_layer_ids.len();
                 let n_cols = self.target_hidden_size;
@@ -335,13 +342,14 @@ impl BlockDiffusionDraftHead {
                         bytes.extend_from_slice(&bf16_bits.to_le_bytes());
                     }
                 }
-                gpu.copy_h2d(&bytes, base.offset(start_slot * ctx_slot_bytes))?;
+                let physical_slot = start_slot % dstate.ctx_capacity;
+                gpu.copy_h2d(&bytes, base.offset(physical_slot * ctx_slot_bytes))?;
             }
             // Dump the FIRST ctx slot's input target_hidden_stack (first 10 floats).
             if eff_ctx > 0 {
                 dump_bf16(
                     "step0.input.target_hidden_stack[0]",
-                    base.offset(start_slot * ctx_slot_bytes),
+                    base.offset((start_slot % dstate.ctx_capacity) * ctx_slot_bytes),
                     10,
                 )?;
             }
@@ -355,16 +363,9 @@ impl BlockDiffusionDraftHead {
                 std::sync::atomic::AtomicBool::new(false);
             if eff_ctx > 0
                 && !FULL_DUMP_DONE.load(std::sync::atomic::Ordering::Relaxed)
-                && std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                && policy.debug_dump_full
                 // Mirror the tokens-dump gate: defer until position >= N.
-                && position
-                    >= std::env::var("ATLAS_DFLASH_DUMP_MIN_POS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(0)
+                && position >= policy.dump_min_pos
             {
                 // Dump ALL eff_ctx slots — needed to reproduce the
                 // multi-token ctx in PyTorch reference. Layout:
@@ -372,7 +373,21 @@ impl BlockDiffusionDraftHead {
                 let n_bytes = eff_ctx * ctx_slot_bytes;
                 let mut buf = vec![0u8; n_bytes];
                 gpu.synchronize(stream)?;
-                gpu.copy_d2h(base.offset(start_slot * ctx_slot_bytes), &mut buf)?;
+                let plan = super::ring_window::plan_ring_copy(
+                    start_slot,
+                    ctx_total,
+                    dstate.ctx_capacity,
+                    start_slot,
+                    ctx_total,
+                )?;
+                for span in plan.spans() {
+                    let byte_start = span.dst_slot * ctx_slot_bytes;
+                    let byte_end = byte_start + span.slot_count * ctx_slot_bytes;
+                    gpu.copy_d2h(
+                        base.offset(span.src_slot * ctx_slot_bytes),
+                        &mut buf[byte_start..byte_end],
+                    )?;
+                }
                 if let Err(e) = std::fs::write("/tmp/atlas_target_hidden.bin", &buf) {
                     tracing::warn!("DFLASH DUMP_FULL: target_hidden write failed: {e}");
                 } else {
@@ -458,8 +473,7 @@ impl BlockDiffusionDraftHead {
             // OOD caveat: self.fc was TRAINED on UN-normalized concat, so this
             // is out-of-distribution and may help or hurt — measured A/B.
             // Variant (a): plain unit-variance (no learned norm weight).
-            let fc_layernorm =
-                std::env::var("ATLAS_DFLASH_FC_LAYERNORM").ok().as_deref() == Some("1");
+            let fc_layernorm = policy.fc_layernorm;
             if new_fc_count > 0 {
                 // Batched fast path (task #64): when NOT applying per-slice
                 // FC-norm, every new context position reads a contiguous
@@ -480,22 +494,73 @@ impl BlockDiffusionDraftHead {
                     && self.fc_nvfp4.is_some();
                 if batched_nvfp4 {
                     let fc_q = self.fc_nvfp4.as_ref().unwrap();
-                    let src = base.offset(old_fc_end * ctx_slot_bytes);
-                    let dst = self
-                        .scratch
-                        .fc_proj
-                        .offset(old_fc_count * self.hidden_size * bf16);
-                    ops::w4a16_gemm(
-                        gpu,
-                        self.kernels.w4a16_gemm,
-                        src,
-                        fc_q,
-                        dst,
-                        new_fc_count as u32,
-                        h,
-                        target_hidden_dim as u32,
-                        stream,
+                    let valid_start = ctx_total.saturating_sub(dstate.ctx_capacity);
+                    let new_fc_end = old_fc_end
+                        .checked_add(new_fc_count)
+                        .ok_or_else(|| anyhow::anyhow!("DFlash new FC context range overflow"))?;
+                    let plan = super::ring_window::plan_ring_copy(
+                        valid_start,
+                        ctx_total,
+                        dstate.ctx_capacity,
+                        old_fc_end,
+                        new_fc_end,
                     )?;
+                    let mut projected = 0usize;
+                    for span in plan.spans() {
+                        let src = base.offset(span.src_slot * ctx_slot_bytes);
+                        let dst = self
+                            .scratch
+                            .fc_proj
+                            .offset((old_fc_count + span.dst_slot) * self.hidden_size * bf16);
+                        if super::proposal_policy::use_prefill_pipe(
+                            policy.prefill_pipe,
+                            self.kernels.w4a16_gemm_pipe.0 != 0,
+                            span.slot_count,
+                            target_hidden_dim,
+                        )
+                        .map_err(anyhow::Error::msg)?
+                        {
+                            static FC_PIPE_SEEN: std::sync::Once = std::sync::Once::new();
+                            FC_PIPE_SEEN.call_once(|| {
+                                tracing::info!(
+                                    "DFLASH_PREFILL_PIPE engaged for V3 FC context ingestion: \
+                                     M={}, N={}, K={}",
+                                    span.slot_count,
+                                    h,
+                                    target_hidden_dim,
+                                );
+                            });
+                            ops::w4a16_gemm_pipe(
+                                gpu,
+                                self.kernels.w4a16_gemm_pipe,
+                                src,
+                                fc_q,
+                                dst,
+                                span.slot_count as u32,
+                                h,
+                                target_hidden_dim as u32,
+                                stream,
+                            )?;
+                        } else {
+                            ops::w4a16_gemm(
+                                gpu,
+                                self.kernels.w4a16_gemm,
+                                src,
+                                fc_q,
+                                dst,
+                                span.slot_count as u32,
+                                h,
+                                target_hidden_dim as u32,
+                                stream,
+                            )?;
+                        }
+                        projected += span.slot_count;
+                    }
+                    if projected != new_fc_count {
+                        anyhow::bail!(
+                            "DFlash FC projection range retained {projected} of {new_fc_count} slots"
+                        );
+                    }
                 }
                 // Per-position fallback: fc_layernorm path (per-slice RMSNorm)
                 // and the dense (non-NVFP4) path. Skipped entirely when the
@@ -505,7 +570,8 @@ impl BlockDiffusionDraftHead {
                         break;
                     }
                     let abs_pos = old_fc_end + i;
-                    let raw_slot = base.offset(abs_pos * ctx_slot_bytes);
+                    let physical_slot = abs_pos % dstate.ctx_capacity;
+                    let raw_slot = base.offset(physical_slot * ctx_slot_bytes);
                     // Per-layer FC-norm: copy each of the n_capture target-layer
                     // slices [target_hidden_size] into fc_norm_in, unit-variance
                     // RMS-normalized independently, then feed the normalized
@@ -616,12 +682,6 @@ impl BlockDiffusionDraftHead {
         // Layout: [ctx_pos_0, ..., ctx_pos_{eff_ctx-1}, seq_pos, ..., seq_pos+γ-1].
         // ctx_pos_i = position - eff_ctx + i — the absolute target indices
         // of the captured positions in chronological order.
-        let ctx_start = position.saturating_sub(eff_ctx);
-        let pos_host: Vec<i32> = (0..eff_ctx)
-            .map(|i| (ctx_start + i) as i32)
-            .chain((0..noise_count).map(|i| (position + i) as i32))
-            .collect();
-        let pos_bytes: Vec<u8> = pos_host.iter().flat_map(|p| p.to_le_bytes()).collect();
         // kprofile sub-phase marker: end of Step 0 (fc_proj) host enqueue.
         let t_pre_fc_done = std::time::Instant::now();
         // Stream-ordered pinned H2D instead of `copy_h2d`: the sync variant
@@ -631,8 +691,12 @@ impl BlockDiffusionDraftHead {
         // only rewritten by the next propose after this pass has been
         // synchronized (sync path) or drained (async path), so ordering is
         // preserved without any host-side wait.
-        let pos_n_bytes = pos_bytes.len();
-        dstate.pos_pinned.as_mut_slice()[..pos_n_bytes].copy_from_slice(&pos_bytes);
+        let pos_n_bytes = super::proposal_inputs::encode_position_ids(
+            dstate.pos_pinned.as_mut_slice(),
+            position,
+            eff_ctx,
+            noise_count,
+        )?;
         let pinned = dstate.pos_pinned.pinned_slice(pos_n_bytes)?;
         // SAFETY: `pinned` borrows the page-locked `pos_pinned` buffer owned by
         // `dstate`, which outlives this copy because `dstate` is only reused by
@@ -644,12 +708,18 @@ impl BlockDiffusionDraftHead {
             gpu.copy_h2d_pinned_async(pinned, self.scratch.position_ids, stream)?;
         }
         if debug_dump {
+            let ctx_start = position.saturating_sub(eff_ctx);
+            let pos_preview: Vec<usize> = (0..eff_ctx)
+                .map(|i| ctx_start + i)
+                .chain((0..noise_count).map(|i| position + i))
+                .take(8)
+                .collect();
             tracing::info!(
                 "DFLASH DUMP positions: eff_ctx={} ctx_total={} position={} pos_ids[0..min(8,n_attn)]={:?}",
                 eff_ctx,
                 ctx_total,
                 position,
-                &pos_host[..pos_host.len().min(8)]
+                pos_preview
             );
         }
 
@@ -687,15 +757,8 @@ impl BlockDiffusionDraftHead {
         // Measure acceptance A/B before enabling in production.
         //
         // ATLAS_DFLASH_MASK_OVERRIDE: env var override for the mask token ID.
-        let mask_id = std::env::var("ATLAS_DFLASH_MASK_OVERRIDE")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(self.mask_token_id);
-        let denoise_steps: usize = std::env::var("ATLAS_DFLASH_DENOISE_STEPS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
-            .clamp(1, 8);
+        let mask_id = policy.mask_override.unwrap_or(self.mask_token_id);
+        let denoise_steps = policy.denoise_steps;
         if self.checkpoint_family == crate::weight_loader::DrafterCheckpointFamily::Dspark
             && denoise_steps != 1
         {
@@ -703,12 +766,8 @@ impl BlockDiffusionDraftHead {
                 "DSpark anchor-output layout currently supports exactly one denoise pass"
             );
         }
-        let denoise_margin: f32 = std::env::var("ATLAS_DFLASH_DENOISE_MARGIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0);
-        let denoise_freeze =
-            std::env::var("ATLAS_DFLASH_DENOISE_FREEZE").ok().as_deref() != Some("0");
+        let denoise_margin = policy.denoise_margin;
+        let denoise_freeze = policy.denoise_freeze;
         let argmax_vocab = self.target_vocab_size.min(self.vocab_size);
         let needed_start = ctx_total.saturating_sub(eff_ctx);
         let pass_args = super::noise_pass::NoisePassArgs {
@@ -720,9 +779,19 @@ impl BlockDiffusionDraftHead {
             needed_start,
             stream,
             debug_dump,
+            force_noise_pattern: policy.force_noise_pattern,
+            lm_head_nvfp4: policy.lm_head_nvfp4,
+            dump_all_layers: policy.dump_all_layers,
             kprofile,
         };
-        let mut committed: Vec<Option<u32>> = vec![None; gamma_eff];
+        // A single pass feeds all masks and never consumes committed rows.
+        // Keep that production default allocation-free; multi-pass denoise
+        // still owns explicit per-row feedback state.
+        let mut committed: Vec<Option<u32>> = if denoise_steps == 1 {
+            Vec::new()
+        } else {
+            vec![None; gamma_eff]
+        };
         let t_layers = std::time::Instant::now();
         for pass in 0..denoise_steps {
             self.run_noise_pass(&pass_args, &committed, pass, ctx, dstate)?;
@@ -833,10 +902,7 @@ impl BlockDiffusionDraftHead {
         }
 
         let t_tail = std::time::Instant::now();
-        let dump_all_layers = std::env::var("ATLAS_DFLASH_DEBUG_DUMP_ALL_LAYERS")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let dump_all_layers = policy.dump_all_layers;
 
         // ── Step 5b: optional logit-margin gate (top-1 vs top-2) ──
         //
@@ -869,21 +935,11 @@ impl BlockDiffusionDraftHead {
         // ATLAS_DFLASH_ADAPTIVE_SLACK=<usize>  (default 2)
         //   Added to the rolling mean accept count to give the drafter a
         //   little headroom past its recent average — accept rate is bursty.
-        let margin_gate: f32 = std::env::var("ATLAS_DFLASH_MARGIN_GATE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let adaptive_gamma =
-            std::env::var("ATLAS_DFLASH_ADAPTIVE_GAMMA").ok().as_deref() == Some("1");
-        let tps_router = std::env::var("ATLAS_DFLASH_TPS_ROUTER").ok().as_deref() == Some("1");
-        let adaptive_min: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_MIN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
-        let adaptive_slack: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_SLACK")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+        let margin_gate = policy.margin_gate;
+        let adaptive_gamma = policy.adaptive_gamma;
+        let tps_router = policy.tps_router;
+        let adaptive_min = policy.adaptive_min;
+        let adaptive_slack = policy.adaptive_slack;
         // ATLAS_DFLASH_ADAPTIVE_MAX=<usize> caps the adaptive cutoff so the
         // K=γ verify graph never fires when its wall-time exceeds the
         // throughput benefit. K=γ=16 verify on GB10 is ~2.8s/call vs
@@ -892,10 +948,7 @@ impl BlockDiffusionDraftHead {
         // below the K=4 path. ADAPTIVE_MAX=4 hard-caps cutoff so the
         // scheduler always lands on a faster verify graph. Default 0 =
         // unbounded (legacy behavior, allows up to gamma_eff).
-        let adaptive_max: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let adaptive_max = policy.adaptive_max;
         // ATLAS_DFLASH_ADAPTIVE_PROBE_INTERVAL=<usize> (default 0 = off)
         //   Every N adaptive-engaged steps, force cutoff = gamma_eff
         //   (= no truncation, no masking from adaptive shrink) so the
@@ -915,10 +968,7 @@ impl BlockDiffusionDraftHead {
         //   to measure ceiling, not to be capped by one. Margin-gate
         //   cuts still apply (those are per-step confidence signals
         //   independent of history).
-        let adaptive_probe_interval: usize = std::env::var("ATLAS_DFLASH_ADAPTIVE_PROBE_INTERVAL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let adaptive_probe_interval = policy.adaptive_probe_interval;
 
         // Run top-2 if the margin gate is active, so we have the second-best
         // logit value per row. Cost: one extra kernel launch over the same
@@ -986,12 +1036,15 @@ impl BlockDiffusionDraftHead {
         } else {
             0
         };
-        let mut host_buf = vec![0u8; gamma_eff * 4];
+        let host_bytes = gamma_eff
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("DFlash draft output byte count overflow"))?;
+        let host_buf = &mut dstate.draft_output_pinned.as_mut_slice()[..host_bytes];
         // One ordered D2H + trailing sync.  The old pair (`synchronize`
         // followed by `copy_d2h`) paid two host-blocking stream syncs and the
         // copy ran on the default stream.  This preserves the same completion
         // guarantee while coalescing it to one sync on the producer stream.
-        gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, &mut host_buf, stream)?;
+        gpu.copy_d2h_on_stream(self.scratch.draft_tokens_dev, host_buf, stream)?;
         if async_probe {
             tracing::info!(
                 "ASYNC_PROBE propose: enqueue={probe_enqueue_us}μs gpu_total={}μs \
@@ -999,10 +1052,7 @@ impl BlockDiffusionDraftHead {
                 t_total.elapsed().as_micros(),
             );
         }
-        let mut drafts: Vec<u32> = host_buf
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut drafts = super::proposal_inputs::decode_token_ids(host_buf, gamma_eff)?;
 
         // Multi-step denoise: committed rows freeze their commit-time
         // prediction. On the final pass those rows were embedded as REAL
@@ -1038,15 +1088,15 @@ impl BlockDiffusionDraftHead {
         // mismatch the target's argmax → accept-prefix terminates at the
         // first replacement (mask mode), or the truncation point (truncate
         // mode — no replacement needed, the position just disappears).
-        let adaptive_mode =
-            std::env::var("ATLAS_DFLASH_ADAPTIVE_MODE").unwrap_or_else(|_| "mask".to_string());
         // The throughput router must change the physical verify shape; masking
         // would retain the wide verifier cost and defeat its objective.
-        let climbdrop_mode = std::env::var("ATLAS_DFLASH_TPS_ROUTER_MODE")
-            .ok()
-            .as_deref()
-            == Some("climbdrop");
-        let truncate_mode = adaptive_mode == "truncate" || tps_router || climbdrop_mode;
+        let adaptive_mode = if policy.truncate_mode {
+            "truncate"
+        } else {
+            "mask"
+        };
+        let climbdrop_mode = policy.climbdrop_mode;
+        let truncate_mode = policy.truncate_mode || tps_router || climbdrop_mode;
         if adaptive_gamma || margin_gate > 0.0 || tps_router || climbdrop_mode {
             let mask = self.mask_token_id;
             // Bump the monotonic step counter once per adaptive-engaged call.
@@ -1071,14 +1121,8 @@ impl BlockDiffusionDraftHead {
                 // depth is the controller's current state; clamp to the
                 // physical max. It climbs on consecutive full accepts and
                 // falls back on weighted misses, so no probing is needed.
-                let floor = std::env::var("ATLAS_DFLASH_TPS_ROUTER_FLOOR")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(4);
-                let cap = std::env::var("ATLAS_DFLASH_TPS_ROUTER_MAX")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(gamma_eff);
+                let floor = policy.climbdrop_floor;
+                let cap = policy.climbdrop_cap.unwrap_or(gamma_eff);
                 if dstate.climbdrop_router.score() == 0 || dstate.climbdrop_router.decisions() == 0
                 {
                     dstate
@@ -1087,13 +1131,11 @@ impl BlockDiffusionDraftHead {
                 }
                 cutoff = dstate.climbdrop_router.choose().min(gamma_eff);
             } else if tps_router {
-                let widths_env = std::env::var("ATLAS_DFLASH_TPS_ROUTER_WIDTHS").ok();
-                let widths =
-                    super::throughput_router::parse_widths(widths_env.as_deref(), gamma_eff);
-                let probe_interval = std::env::var("ATLAS_DFLASH_TPS_ROUTER_PROBE_INTERVAL")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(16);
+                let widths = super::throughput_router::parse_widths(
+                    policy.router_widths.as_deref(),
+                    gamma_eff,
+                );
+                let probe_interval = policy.router_probe_interval;
                 cutoff = dstate
                     .throughput_router
                     .choose(&widths, gamma_eff, probe_interval);
@@ -1180,12 +1222,7 @@ impl BlockDiffusionDraftHead {
         // captured target_hidden. Static guard mirrors the input dump.
         static DRAFTS_DUMP_DONE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        if !DRAFTS_DUMP_DONE.load(std::sync::atomic::Ordering::Relaxed)
-            && std::env::var("ATLAS_DFLASH_DEBUG_DUMP_FULL")
-                .ok()
-                .as_deref()
-                == Some("1")
-        {
+        if !DRAFTS_DUMP_DONE.load(std::sync::atomic::Ordering::Relaxed) && policy.debug_dump_full {
             tracing::info!(
                 "DFLASH DUMP_FULL drafts (γ={}, last_token={}, position={}, eff_ctx={}): {:?}",
                 self.gamma,

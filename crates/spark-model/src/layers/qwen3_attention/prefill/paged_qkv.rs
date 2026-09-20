@@ -14,10 +14,48 @@ use crate::layers::ops;
 
 /// Identifies which projection (Q/K/V) — selects the correct weight bank
 /// from `Qwen3AttentionLayer`.
+#[derive(Clone, Copy)]
 pub(super) enum Proj {
     Q,
     K,
     V,
+}
+
+fn log_prefill_projection_pipe_once(proj: Proj) {
+    static Q: std::sync::Once = std::sync::Once::new();
+    static K: std::sync::Once = std::sync::Once::new();
+    static V: std::sync::Once = std::sync::Once::new();
+    let (once, name) = match proj {
+        Proj::Q => (&Q, "attention_q"),
+        Proj::K => (&K, "attention_k"),
+        Proj::V => (&V, "attention_v"),
+    };
+    once.call_once(|| tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE: {name}"));
+}
+
+pub(super) fn use_prefill_kv_dual(
+    requested: bool,
+    has_kernel: bool,
+    n: u32,
+    h: u32,
+    original_layout: bool,
+    compatible_weights: bool,
+) -> Result<bool, &'static str> {
+    if !requested || n <= 32 || !h.is_multiple_of(64) {
+        return Ok(false);
+    }
+    if !original_layout {
+        return Err("ATLAS_PREFILL_KV_DUAL=1 requires ATLAS_PREFILL_PROJ_FAST=0");
+    }
+    if !compatible_weights {
+        return Err(
+            "ATLAS_PREFILL_KV_DUAL=1 requires compatible original-layout NVFP4 K/V weights",
+        );
+    }
+    if !has_kernel {
+        return Err("ATLAS_PREFILL_KV_DUAL=1 requires w4a16_gemm_pipe_dual");
+    }
+    Ok(true)
 }
 
 impl Qwen3AttentionLayer {
@@ -38,6 +76,33 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if self.try_flashinfer_projection_qgkv(normed, n, h, q_proj_dim, kv_dim, ctx, stream)? {
+            return Ok(());
+        }
+
+        let k_contiguous = ctx.buffers.ssm_qkvz();
+        let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+        let k_nvfp4 = self.k_weight.as_ref().and_then(|weight| weight.as_nvfp4());
+        let v_nvfp4 = self.v_weight.as_ref().and_then(|weight| weight.as_nvfp4());
+        let compatible_weights = k_nvfp4.is_some()
+            && v_nvfp4.is_some()
+            && self.k_fp8w_t.is_none()
+            && self.v_fp8w_t.is_none()
+            && self.k_fp8.is_none()
+            && self.v_fp8.is_none();
+        let dual_kv = use_prefill_kv_dual(
+            crate::layers::prefill_kv_dual_enabled(),
+            self.w4a16_gemm_pipe_dual_k.0 != 0,
+            n,
+            h,
+            !crate::layers::prefill_proj_fast_enabled(),
+            compatible_weights,
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        // Select before Q so an eligible explicit request cannot partially run
+        // the parent Q/K/V sequence and then fail or silently fall back.
         let qg_out = ctx.buffers.qkv_output();
         self.prefill_one_proj(
             Proj::Q,
@@ -50,10 +115,26 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
 
-        let k_contiguous = ctx.buffers.ssm_qkvz();
+        if dual_kv {
+            ops::w4a16_gemm_pipe_dual(
+                ctx.gpu,
+                self.w4a16_gemm_pipe_dual_k,
+                normed,
+                k_nvfp4.unwrap(),
+                v_nvfp4.unwrap(),
+                k_contiguous,
+                v_contiguous,
+                false,
+                n,
+                nkv * hd,
+                h,
+                stream,
+            )?;
+            super::mark_prefill_kv_dual_paged_engaged();
+            return Ok(());
+        }
         self.prefill_one_proj(Proj::K, normed, k_contiguous, n, nkv * hd, h, ctx, stream)?;
 
-        let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         self.prefill_one_proj(Proj::V, normed, v_contiguous, n, nkv * hd, h, ctx, stream)?;
         Ok(())
     }
@@ -187,38 +268,49 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(nvfp4) = weight_opt.and_then(|w| w.as_nvfp4()) {
-            if crate::layers::prefill_proj_pipe_enabled()
-                && self.w4a16_gemm_pipe_k.0 != 0
-                && h.is_multiple_of(64)
-            {
-                // Byte-exact pipelined shadow of the baseline below (see
-                // `prefill_proj_pipe_enabled`). Same dequant + MMA arithmetic,
-                // cp.async weight loads — removes the small-M latency floor
-                // that the proj_fast=0 config otherwise pays per projection.
-                // K=h must be a multiple of the pipe's 64-row stage.
-                ops::w4a16_gemm_pipe(
-                    ctx.gpu,
-                    self.w4a16_gemm_pipe_k,
-                    normed,
-                    nvfp4,
-                    out,
-                    n,
-                    out_dim,
-                    h,
-                    stream,
-                )?;
-            } else {
-                ops::w4a16_gemm(
-                    ctx.gpu,
-                    self.w4a16_gemm_k,
-                    normed,
-                    nvfp4,
-                    out,
-                    n,
-                    out_dim,
-                    h,
-                    stream,
-                )?;
+            match crate::layers::prefill_projection_pipe_route(
+                crate::layers::prefill_proj_pipe_enabled(),
+                h,
+                self.w4a16_gemm_pipe_k.0 != 0,
+            ) {
+                crate::layers::PrefillProjectionPipeRoute::Complete => {
+                    log_prefill_projection_pipe_once(proj);
+                    // Byte-exact pipelined shadow of the baseline below (see
+                    // `prefill_proj_pipe_enabled`). Same dequant + MMA arithmetic,
+                    // cp.async weight loads — removes the small-M latency floor
+                    // that the proj_fast=0 config otherwise pays per projection.
+                    // K=h must be a multiple of the pipe's 64-row stage.
+                    ops::w4a16_gemm_pipe(
+                        ctx.gpu,
+                        self.w4a16_gemm_pipe_k,
+                        normed,
+                        nvfp4,
+                        out,
+                        n,
+                        out_dim,
+                        h,
+                        stream,
+                    )?;
+                }
+                crate::layers::PrefillProjectionPipeRoute::Missing => {
+                    anyhow::bail!(
+                        "ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe for an eligible attention Q/K/V projection"
+                    );
+                }
+                crate::layers::PrefillProjectionPipeRoute::Disabled
+                | crate::layers::PrefillProjectionPipeRoute::Ineligible => {
+                    ops::w4a16_gemm(
+                        ctx.gpu,
+                        self.w4a16_gemm_k,
+                        normed,
+                        nvfp4,
+                        out,
+                        n,
+                        out_dim,
+                        h,
+                        stream,
+                    )?;
+                }
             }
         } else {
             ops::dense_gemm(

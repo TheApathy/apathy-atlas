@@ -88,6 +88,9 @@ impl BlockDiffusionDraftHead {
             .as_any_mut()
             .downcast_mut::<DflashProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        let policy = self
+            .proposal_policy
+            .get_or_init(super::proposal_policy::ProposalPolicy::from_env);
 
         // Quiesce the single shared scratch before any host-only early return.
         if let Err(error) = self.resolve_async_inflight_impl(ctx.gpu, Some(dstate)) {
@@ -309,10 +312,7 @@ impl BlockDiffusionDraftHead {
         // hiddens to the accumulator poisons the ctx for subsequent
         // propose() calls. Setting this flag uses ONLY prefill captures
         // — clean ctx isolation for diagnosing real-traffic acceptance.
-        let skip_decode_append = std::env::var("ATLAS_DFLASH_DEBUG_NO_DECODE_APPEND")
-            .ok()
-            .as_deref()
-            == Some("1");
+        let skip_decode_append = policy.skip_decode_append;
         // Drop the `first_propose_done` gate. The previous logic skipped
         // the append on the very first propose call, assuming
         // dflash_hidden_save was uninitialized. But after a regular
@@ -384,14 +384,6 @@ impl BlockDiffusionDraftHead {
             // capture (kernel slot 0 == compact 0, unaffected); rows
             // 1..num_append follow the accepted (kernel-frame) rows. Empty
             // path → contiguous (default / flat / DFS-off).
-            let src_rows: Vec<usize> = if dstate.last_accepted_compact.is_empty() {
-                (0..num_append).collect()
-            } else {
-                let mut rows = Vec::with_capacity(num_append);
-                rows.push(0);
-                rows.extend_from_slice(&dstate.last_accepted_compact);
-                rows
-            };
             // dflash_hidden_save rows hold the hiddens of the
             // tokens at absolute positions (position - num_append)..position.
             // Write each row at its ABSOLUTE slot rather than appending at
@@ -425,9 +417,20 @@ impl BlockDiffusionDraftHead {
                 }
                 // Source verify-capture row: contiguous `i` on the flat path,
                 // else the sparse fork path's compact slot (src_rows[i]).
-                let src_row = src_rows.get(i).copied().unwrap_or(i);
+                let src_row = if dstate.last_accepted_compact.is_empty() || i == 0 {
+                    i
+                } else {
+                    dstate
+                        .last_accepted_compact
+                        .get(i - 1)
+                        .copied()
+                        .unwrap_or(i)
+                };
                 let src = base.offset(src_row * dstate.ctx_slot_bytes);
-                let dst = dstate.ctx_hidden_acc.offset(slot * dstate.ctx_slot_bytes);
+                let physical_slot = slot % dstate.ctx_capacity;
+                let dst = dstate
+                    .ctx_hidden_acc
+                    .offset(physical_slot * dstate.ctx_slot_bytes);
                 ctx.gpu
                     .copy_d2d_async(src, dst, dstate.ctx_slot_bytes, _stream)?;
             }
@@ -532,14 +535,8 @@ impl BlockDiffusionDraftHead {
         // fire in the weak-drafter regime (previous step accepted <=1, never
         // true on coding/counting at 8-16 accepts) and require a long suffix
         // match (8 down to ATLAS_PLD_NGRAM, default 5; longest wins).
-        if std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
-            && dstate.first_propose_done
-            && dstate.last_num_accepted <= 1
-        {
-            let ng_min: usize = std::env::var("ATLAS_PLD_NGRAM")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5);
+        if policy.pld && dstate.first_propose_done && dstate.last_num_accepted <= 1 {
+            let ng_min = policy.pld_ngram;
             // Host lookup drafting must obey the same trained/runtime width as
             // the neural block. A block-16 checkpoint has 15 trained draft
             // rows; the old literal 16 produced a K=17 verify against the
@@ -620,10 +617,7 @@ impl BlockDiffusionDraftHead {
         // budget clamps N to that capacity minus one. LOSSLESS either way — retrieval only
         // decides WHAT to propose; verify commits the target's greedy token.
         const RETR_WIDE_HARD_CAP: usize = 31; // = tree-WY K_MAX(32) - 1 bonus
-        let retr_wide: usize = std::env::var("ATLAS_DFLASH_RETR_WIDE")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0);
+        let retr_wide = policy.retr_wide;
         // The immutable outer budget is the sole verify-capacity authority.
         let base_gamma_eff = budget.flat;
         // Wide draft count for the RETRIEVAL path only: at least the neural
@@ -650,16 +644,9 @@ impl BlockDiffusionDraftHead {
         // `ATLAS_RETRIEVAL_HYBRID_MIN` still applies but defaults to l_min in
         // SAM mode — it fires on any real match rather than only the strongest)
         // and the hit is stashed here for the drafter path to fuse below.
-        let portfolio_on = std::env::var("ATLAS_DFLASH_PORTFOLIO").ok().as_deref() == Some("1");
-        let corroborate_on = std::env::var("ATLAS_DFLASH_SAM_CORROBORATE")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let corroborate_min: usize = std::env::var("ATLAS_DFLASH_SAM_CORROBORATE_MIN")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(4)
-            .max(1);
+        let portfolio_on = policy.portfolio;
+        let corroborate_on = policy.corroborate;
+        let corroborate_min = policy.corroborate_min;
         // Retrieval branch budget for the portfolio forest: the K-1 verify
         // outer node budget minus the drafter's own chain length, so drafter
         // (chain A) is never truncated.
@@ -880,13 +867,9 @@ impl BlockDiffusionDraftHead {
         // cleared on the drafter path below.
         if dstate.recycle_last_offered {
             dstate.recycle_last_offered = false;
-        } else if std::env::var("ATLAS_DFLASH_RECYCLE").ok().as_deref() == Some("1")
+        } else if policy.recycle
             && dstate.first_propose_done
-            && dstate.last_num_accepted
-                <= std::env::var("ATLAS_DFLASH_RECYCLE_MAX_ACCEPT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1)
+            && dstate.last_num_accepted <= policy.recycle_max_accept
         {
             let recycle_gamma_eff = budget.flat;
             // Take the stash unconditionally (single-use): a tail is only valid
@@ -967,20 +950,9 @@ impl BlockDiffusionDraftHead {
         //   ATLAS_DFLASH_FALLBACK_COOLDOWN=<n> plain-decode steps to stay
         //                                      suppressed before the next probe.
         //                                      Default 8.
-        if std::env::var("ATLAS_DFLASH_ACCEPT_FALLBACK")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            let thresh: usize = std::env::var("ATLAS_DFLASH_FALLBACK_THRESH")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6);
-            let cooldown: usize = std::env::var("ATLAS_DFLASH_FALLBACK_COOLDOWN")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8)
-                .max(1);
+        if policy.accept_fallback {
+            let thresh = policy.fallback_thresh;
+            let cooldown = policy.fallback_cooldown;
             // Already in a suppression window: stay on plain decode, count down.
             if dstate.fallback_suppressed_remaining > 0 {
                 dstate.fallback_suppressed_remaining -= 1;
@@ -1055,7 +1027,7 @@ impl BlockDiffusionDraftHead {
             }
         }
 
-        if std::env::var("ATLAS_DFLASH_TPS_ROUTER").ok().as_deref() == Some("1") {
+        if policy.tps_router {
             dstate.throughput_cycle_started = Some(std::time::Instant::now());
             dstate.throughput_last_width = budget.flat;
         }
@@ -1151,13 +1123,9 @@ impl BlockDiffusionDraftHead {
         // the depth-RoPE tree-aware verify path. So this builds a one-fork
         // depth-contiguous caterpillar per block and relies on the lossless
         // greedy oracle (verify commits only draft == target argmax) for safety.
-        let caterpillar_enabled =
-            std::env::var("ATLAS_DFLASH_CATERPILLAR").ok().as_deref() == Some("1");
+        let caterpillar_enabled = policy.caterpillar;
         if caterpillar_enabled && drafts.len() >= 3 {
-            let margin_thresh: f32 = std::env::var("ATLAS_DFLASH_BRANCH_MARGIN")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2.0);
+            let margin_thresh = policy.branch_margin;
             let n = drafts.len();
             match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
                 Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
@@ -1281,22 +1249,13 @@ impl BlockDiffusionDraftHead {
         //
         // N = the number of sibling branches to place (each ≈ 1 + tail_len
         // extra nodes). The builder self-limits to the ddtree capacity.
-        let free_slots: usize = std::env::var("ATLAS_DFLASH_FREE_SLOTS")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0);
+        let free_slots = policy.free_slots;
         if free_slots >= 1 && drafts.len() >= 3 {
-            let margin_thresh: f32 = std::env::var("ATLAS_DFLASH_BRANCH_MARGIN")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2.0);
+            let margin_thresh = policy.branch_margin;
             // Per-branch tail length (post-cliff continuation carried on the
             // sibling). 0 = bare 1-node fork leaves. Default 4 — enough of the
             // predictable post-cliff structure (indentation/closers) to re-accept.
-            let tail_len: usize = std::env::var("ATLAS_DFLASH_FREE_SLOTS_TAIL")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .unwrap_or(4);
+            let tail_len = policy.free_slots_tail;
             let n = drafts.len();
             match self.extract_topk_from_logits(ctx.gpu, _stream, n, 2) {
                 Ok((topk_tokens, topk_logits)) if topk_logits.len() >= 2 * n => {
@@ -1385,14 +1344,11 @@ impl BlockDiffusionDraftHead {
             }
         }
 
-        let branch_enabled = std::env::var("ATLAS_DFLASH_BRANCH").ok().as_deref() == Some("1");
+        let branch_enabled = policy.branch;
         if branch_enabled && drafts.len() >= 3 {
             // Margin threshold in raw-BF16-logit units (top tokens are O(10-30),
             // so a margin below ~2-4 means the drafter is genuinely unsure).
-            let margin_thresh: f32 = std::env::var("ATLAS_DFLASH_BRANCH_MARGIN")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2.0);
+            let margin_thresh = policy.branch_margin;
             let n = drafts.len();
             // Extract per-row top-2 (token + logit), sorted descending. Row i
             // holds [top1_logit, top2_logit] at indices 2i, 2i+1 and the
@@ -1628,13 +1584,13 @@ impl BlockDiffusionDraftHead {
         //
         // Activated by setting ATLAS_DFLASH_METHOD=ddtree at startup
         // (mirrors the --dflash-method=ddtree CLI flag wired in M1).
-        let ddtree_active = std::env::var("ATLAS_DFLASH_METHOD").ok().as_deref() == Some("ddtree");
+        let ddtree_active = policy.ddtree;
         // ATLAS_DDTREE_NONFLAT=1 enables the experimental non-flat root-sibling
         // topology that exercises the M8A tree kernel. Default OFF because the
         // first-pass tree kernel isn't bit-equivalent to wy17 — flat-chain
         // tokens drift numerically and drafter accept collapses. Re-enable
         // after task #45 (Python-ref bit-diff + reduction-order fix).
-        let nonflat_enabled = std::env::var("ATLAS_DDTREE_NONFLAT").ok().as_deref() == Some("1");
+        let nonflat_enabled = policy.ddtree_nonflat;
         static PAYLOAD_DBG_DONE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !PAYLOAD_DBG_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1649,7 +1605,7 @@ impl BlockDiffusionDraftHead {
         // mode so requires_tree_kernel returns false → wy17 path fires → no
         // numerical drift vs baseline. Validates that the drift cascade isolation
         // diagnosis from m8a_diff.py is correct.
-        let chain_only = std::env::var("ATLAS_DDTREE_CHAIN_ONLY").ok().as_deref() == Some("1");
+        let chain_only = policy.ddtree_chain_only;
         if chain_only && ddtree_active && !drafts.is_empty() {
             let n = drafts.len();
             let mut parent_indices = Vec::with_capacity(n);

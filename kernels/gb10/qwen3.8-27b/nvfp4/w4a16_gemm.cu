@@ -325,6 +325,726 @@ extern "C" __global__ void w4a16_gemm_pipe(
     }
 }
 
+// Fused epilogue shadow for the dense Qwen3.8 prefill FFN up projection.
+// The GEMM body is intentionally identical to w4a16_gemm_pipe. Its FP32
+// accumulator is rounded to BF16 and converted back to FP32 before SiLU,
+// preserving the separate up-GEMM -> BF16 buffer -> moe_silu_mul contract.
+// `gate_in_out` is deliberately one in-place pointer rather than two
+// `__restrict__` pointers: every element is read before its matching output is
+// written, and no thread reads another thread's element.
+extern "C" __global__ void w4a16_gemm_pipe_silu_mul(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ gate_in_out,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * M_TILE;
+    const unsigned int cta_n = blockIdx.x * N_TILE_SM;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_P + PAD_P];
+    __shared__ unsigned char smem_Bp[2][N_TILE_SM][BP_P_STRIDE];
+    __shared__ unsigned char smem_Bs[2][N_TILE_SM][2];
+    __shared__ __nv_bfloat16 smem_B[2][K_STEP_P][N_TILE_SM + PAD];
+    __shared__ float smem_LUT[16];
+
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int a_stride = K_STEP_P + PAD_P;
+    const unsigned int b_stride = N_TILE_SM + PAD;
+
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    #define ISSUE_FUSED_EPILOGUE(buf, kk) do {                                     \
+        _Pragma("unroll")                                                          \
+        for (int p = 0; p < A_P_CHUNKS; p++) {                                    \
+            unsigned int c = threadIdx.x * A_P_CHUNKS + p;                        \
+            unsigned int row = c / (K_STEP_P / 8);                                \
+            unsigned int col8 = (c % (K_STEP_P / 8)) << 3;                        \
+            unsigned int gr = cta_m + row;                                        \
+            cp_async_pred_16(&smem_A[(buf)][row][col8],                           \
+                &A[gr * K + (kk) + col8], ((gr) < M) && ((kk) < K));              \
+        }                                                                          \
+        if (threadIdx.x < 64) {                                                    \
+            unsigned int gn = cta_n + threadIdx.x;                                \
+            cp_async_pred_16(&smem_Bp[(buf)][threadIdx.x][0],                     \
+                &B_packed[(unsigned long long)gn * half_K + ((kk) >> 1)],         \
+                ((gn) < N) && ((kk) < K));                                        \
+            unsigned int sg = (kk) / GROUP_SIZE;                                  \
+            _Pragma("unroll")                                                      \
+            for (int g = 0; g < 2; g++) {                                         \
+                unsigned char s = ((gn) < N && (kk) + g * GROUP_SIZE < K)         \
+                    ? B_scale[(unsigned long long)gn * num_groups + sg + g] : 0;  \
+                smem_Bs[(buf)][threadIdx.x][g] = s;                               \
+            }                                                                      \
+        }                                                                          \
+        cp_async_commit();                                                         \
+    } while(0)
+
+    #define DEQUANT_FUSED_EPILOGUE(buf, kk) do {                                   \
+        _Pragma("unroll")                                                          \
+        for (unsigned int i = 0; i < (K_STEP_P * N_TILE_SM / 128); i++) {         \
+            unsigned int idx = threadIdx.x * (K_STEP_P * N_TILE_SM / 128) + i;    \
+            unsigned int k = idx / N_TILE_SM;                                     \
+            unsigned int n = idx % N_TILE_SM;                                     \
+            unsigned char packed = smem_Bp[(buf)][n][k >> 1];                     \
+            unsigned int nibble = ((kk) + k) & 1 ? (packed >> 4) : (packed & 0xF);\
+            unsigned char sb = smem_Bs[(buf)][n][k / GROUP_SIZE];                 \
+            __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;                        \
+            smem_B[(buf)][k][n] = __float2bfloat16(                              \
+                smem_LUT[nibble] * (float)fp8 * scale2);                           \
+        }                                                                          \
+    } while(0)
+
+    ISSUE_FUSED_EPILOGUE(0, 0);
+    unsigned int cur = 0, nxt = 1;
+    for (unsigned int k_base = 0; k_base < K; k_base += K_STEP_P) {
+        ISSUE_FUSED_EPILOGUE(nxt, k_base + K_STEP_P);
+        cp_async_wait_group<1>();
+        __syncthreads();
+        DEQUANT_FUSED_EPILOGUE(cur, k_base);
+        __syncthreads();
+
+        const unsigned short* sA = (const unsigned short*)smem_A[cur];
+        const unsigned short* sB = (const unsigned short*)smem_B[cur];
+        unsigned int fr0 = warp_m_offset + group_id;
+        unsigned int fr1 = fr0 + 8;
+        #pragma unroll
+        for (int kh = 0; kh < 2; kh++) {
+            unsigned int fc0 = tid * 2 + kh * 16;
+            unsigned int fc1 = fc0 + 8;
+            unsigned int a0 = *(const unsigned int*)&sA[fr0 * a_stride + fc0];
+            unsigned int a1 = *(const unsigned int*)&sA[fr1 * a_stride + fc0];
+            unsigned int a2 = *(const unsigned int*)&sA[fr0 * a_stride + fc1];
+            unsigned int a3 = *(const unsigned int*)&sA[fr1 * a_stride + fc1];
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                unsigned int nc = nt * 8 + group_id;
+                unsigned int k0 = tid * 2 + kh * 16, k1 = k0 + 8;
+                unsigned int b0 = ((unsigned int)sB[(k0+1)*b_stride+nc]<<16)
+                    | (unsigned int)sB[k0*b_stride+nc];
+                unsigned int b1 = ((unsigned int)sB[(k1+1)*b_stride+nc]<<16)
+                    | (unsigned int)sB[k1*b_stride+nc];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"
+                    :"=f"(acc[nt][0]),"=f"(acc[nt][1]),"=f"(acc[nt][2]),"=f"(acc[nt][3])
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
+                     "f"(acc[nt][0]),"f"(acc[nt][1]),"f"(acc[nt][2]),"f"(acc[nt][3]));
+            }
+        }
+        __syncthreads();
+        unsigned int t = cur; cur = nxt; nxt = t;
+    }
+
+    #define STORE_SILU_MUL(row, col, value) do {                                  \
+        if ((row) < M && (col) < N) {                                             \
+            unsigned long long out_idx = (unsigned long long)(row) * N + (col);   \
+            __nv_bfloat16 up_bf16 = __float2bfloat16(value);                      \
+            float g = __bfloat162float(gate_in_out[out_idx]);                      \
+            float u = __bfloat162float(up_bf16);                                   \
+            float sigmoid_g = 1.0f / (1.0f + __expf(-g));                         \
+            gate_in_out[out_idx] = __float2bfloat16(g * sigmoid_g * u);            \
+        }                                                                          \
+    } while(0)
+
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        unsigned int c0 = cta_n + nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        STORE_SILU_MUL(r0, c0, acc[nt][0]);
+        STORE_SILU_MUL(r0, c1, acc[nt][1]);
+        STORE_SILU_MUL(r1, c0, acc[nt][2]);
+        STORE_SILU_MUL(r1, c1, acc[nt][3]);
+    }
+
+    #undef STORE_SILU_MUL
+    #undef DEQUANT_FUSED_EPILOGUE
+    #undef ISSUE_FUSED_EPILOGUE
+}
+
+// Exact dual large-M projection. Each side retains the w4a16_gemm_pipe
+// dequantization and MMA order. `fuse_silu=0` writes two independent BF16
+// outputs (attention K/V); `fuse_silu=1` rounds both through BF16 and writes
+// only SiLU(first)*second to C0 (FFN gate/up). A and the LUT are loaded once.
+extern "C" __global__ void w4a16_gemm_pipe_dual(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ gate_scale,
+    const float gate_scale2,
+    const unsigned char* __restrict__ up_packed,
+    const unsigned char* __restrict__ up_scale,
+    const float up_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* C1,
+    unsigned int fuse_silu,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * M_TILE;
+    const unsigned int cta_n = blockIdx.x * N_TILE_SM;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A[2][M_TILE][K_STEP_P + PAD_P];
+    __shared__ unsigned char smem_gate_p[2][N_TILE_SM][BP_P_STRIDE];
+    __shared__ unsigned char smem_up_p[2][N_TILE_SM][BP_P_STRIDE];
+    __shared__ unsigned char smem_gate_s[2][N_TILE_SM][2];
+    __shared__ unsigned char smem_up_s[2][N_TILE_SM][2];
+    __shared__ __nv_bfloat16 smem_B[2][K_STEP_P][N_TILE_SM + PAD];
+    __shared__ float smem_LUT[16];
+
+    float gate_acc[8][4];
+    float up_acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        gate_acc[i][0] = 0.0f; gate_acc[i][1] = 0.0f;
+        gate_acc[i][2] = 0.0f; gate_acc[i][3] = 0.0f;
+        up_acc[i][0] = 0.0f; up_acc[i][1] = 0.0f;
+        up_acc[i][2] = 0.0f; up_acc[i][3] = 0.0f;
+    }
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int a_stride = K_STEP_P + PAD_P;
+    const unsigned int b_stride = N_TILE_SM + PAD;
+    if (threadIdx.x < 16) smem_LUT[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    #define ISSUE_GATEUP(buf, kk) do {                                            \
+        _Pragma("unroll")                                                         \
+        for (int p = 0; p < A_P_CHUNKS; p++) {                                   \
+            unsigned int c = threadIdx.x * A_P_CHUNKS + p;                       \
+            unsigned int row = c / (K_STEP_P / 8);                               \
+            unsigned int col8 = (c % (K_STEP_P / 8)) << 3;                       \
+            unsigned int gr = cta_m + row;                                       \
+            cp_async_pred_16(&smem_A[(buf)][row][col8],                           \
+                &A[gr * K + (kk) + col8], ((gr) < M) && ((kk) < K));             \
+        }                                                                         \
+        if (threadIdx.x < 64) {                                                   \
+            unsigned int gn = cta_n + threadIdx.x;                               \
+            cp_async_pred_16(&smem_gate_p[(buf)][threadIdx.x][0],                \
+                &gate_packed[(unsigned long long)gn * half_K + ((kk) >> 1)],     \
+                ((gn) < N) && ((kk) < K));                                       \
+            cp_async_pred_16(&smem_up_p[(buf)][threadIdx.x][0],                  \
+                &up_packed[(unsigned long long)gn * half_K + ((kk) >> 1)],       \
+                ((gn) < N) && ((kk) < K));                                       \
+            unsigned int sg = (kk) / GROUP_SIZE;                                 \
+            _Pragma("unroll")                                                     \
+            for (int g = 0; g < 2; g++) {                                        \
+                bool valid = (gn) < N && (kk) + g * GROUP_SIZE < K;              \
+                smem_gate_s[(buf)][threadIdx.x][g] = valid                        \
+                    ? gate_scale[(unsigned long long)gn * num_groups + sg + g] : 0;\
+                smem_up_s[(buf)][threadIdx.x][g] = valid                          \
+                    ? up_scale[(unsigned long long)gn * num_groups + sg + g] : 0; \
+            }                                                                     \
+        }                                                                         \
+        cp_async_commit();                                                        \
+    } while(0)
+
+    #define DEQUANT_GATEUP(buf, kk, packed_smem, scale_smem, scale_2) do {         \
+        _Pragma("unroll")                                                         \
+        for (unsigned int i = 0; i < (K_STEP_P * N_TILE_SM / 128); i++) {        \
+            unsigned int idx = threadIdx.x * (K_STEP_P * N_TILE_SM / 128) + i;   \
+            unsigned int k = idx / N_TILE_SM;                                    \
+            unsigned int n = idx % N_TILE_SM;                                    \
+            unsigned char packed = (packed_smem)[(buf)][n][k >> 1];              \
+            unsigned int nibble = ((kk) + k) & 1 ? (packed >> 4) : (packed & 0xF);\
+            unsigned char sb = (scale_smem)[(buf)][n][k / GROUP_SIZE];           \
+            __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;                       \
+            smem_B[(buf)][k][n] = __float2bfloat16(                              \
+                smem_LUT[nibble] * (float)fp8 * (scale_2));                       \
+        }                                                                         \
+    } while(0)
+
+    #define MMA_GATEUP(accum, buf) do {                                           \
+        const unsigned short* sA = (const unsigned short*)smem_A[(buf)];          \
+        const unsigned short* sB = (const unsigned short*)smem_B[(buf)];          \
+        unsigned int fr0 = warp_m_offset + group_id;                              \
+        unsigned int fr1 = fr0 + 8;                                               \
+        _Pragma("unroll")                                                         \
+        for (int kh = 0; kh < 2; kh++) {                                          \
+            unsigned int fc0 = tid * 2 + kh * 16;                                \
+            unsigned int fc1 = fc0 + 8;                                           \
+            unsigned int a0 = *(const unsigned int*)&sA[fr0*a_stride+fc0];        \
+            unsigned int a1 = *(const unsigned int*)&sA[fr1*a_stride+fc0];        \
+            unsigned int a2 = *(const unsigned int*)&sA[fr0*a_stride+fc1];        \
+            unsigned int a3 = *(const unsigned int*)&sA[fr1*a_stride+fc1];        \
+            _Pragma("unroll")                                                     \
+            for (int nt = 0; nt < 8; nt++) {                                     \
+                unsigned int nc = nt * 8 + group_id;                             \
+                unsigned int k0 = tid * 2 + kh * 16, k1 = k0 + 8;                \
+                unsigned int b0 = ((unsigned int)sB[(k0+1)*b_stride+nc]<<16)     \
+                    | (unsigned int)sB[k0*b_stride+nc];                           \
+                unsigned int b1 = ((unsigned int)sB[(k1+1)*b_stride+nc]<<16)     \
+                    | (unsigned int)sB[k1*b_stride+nc];                           \
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"\
+                    :"=f"((accum)[nt][0]),"=f"((accum)[nt][1]),                 \
+                     "=f"((accum)[nt][2]),"=f"((accum)[nt][3])                  \
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),       \
+                     "f"((accum)[nt][0]),"f"((accum)[nt][1]),                   \
+                     "f"((accum)[nt][2]),"f"((accum)[nt][3]));                  \
+            }                                                                     \
+        }                                                                         \
+    } while(0)
+
+    ISSUE_GATEUP(0, 0);
+    unsigned int cur = 0, nxt = 1;
+    for (unsigned int k_base = 0; k_base < K; k_base += K_STEP_P) {
+        ISSUE_GATEUP(nxt, k_base + K_STEP_P);
+        cp_async_wait_group<1>();
+        __syncthreads();
+        DEQUANT_GATEUP(cur, k_base, smem_gate_p, smem_gate_s, gate_scale2);
+        __syncthreads();
+        MMA_GATEUP(gate_acc, cur);
+        __syncthreads();
+        DEQUANT_GATEUP(cur, k_base, smem_up_p, smem_up_s, up_scale2);
+        __syncthreads();
+        MMA_GATEUP(up_acc, cur);
+        __syncthreads();
+        unsigned int t = cur; cur = nxt; nxt = t;
+    }
+
+    #define STORE_GATEUP(row, col, gate_value, up_value) do {                     \
+        if ((row) < M && (col) < N) {                                             \
+            unsigned long long out_idx = (unsigned long long)(row) * N + (col);   \
+            float g = __bfloat162float(__float2bfloat16(gate_value));             \
+            float u = __bfloat162float(__float2bfloat16(up_value));               \
+            if (fuse_silu != 0) {                                                 \
+                float sigmoid_g = 1.0f / (1.0f + __expf(-g));                     \
+                C0[out_idx] = __float2bfloat16(g * sigmoid_g * u);                \
+            } else {                                                              \
+                C0[out_idx] = __float2bfloat16(g);                                \
+                C1[out_idx] = __float2bfloat16(u);                                \
+            }                                                                     \
+        }                                                                          \
+    } while(0)
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+        unsigned int c0 = cta_n + nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        STORE_GATEUP(r0, c0, gate_acc[nt][0], up_acc[nt][0]);
+        STORE_GATEUP(r0, c1, gate_acc[nt][1], up_acc[nt][1]);
+        STORE_GATEUP(r1, c0, gate_acc[nt][2], up_acc[nt][2]);
+        STORE_GATEUP(r1, c1, gate_acc[nt][3], up_acc[nt][3]);
+    }
+
+    #undef STORE_GATEUP
+    #undef MMA_GATEUP
+    #undef DEQUANT_GATEUP
+    #undef ISSUE_GATEUP
+}
+
+// Eight-warp dual-projection shadow. Warps 0-3 own the first projection and
+// warps 4-7 own the second, so each lane retains one 8x4 accumulator instead
+// of both parent accumulator sets. A and the E2M1 LUT are still staged once;
+// packed/scaled weights and dequantized BF16 B tiles remain independent.
+//
+// This symbol is intentionally not routed. Its launch contract is identical
+// to w4a16_gemm_pipe_dual except that the block must contain 256 threads.
+extern "C" __global__ __launch_bounds__(256, 1) void w4a16_gemm_pipe_dual_warp8(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ gate_scale,
+    const float gate_scale2,
+    const unsigned char* __restrict__ up_packed,
+    const unsigned char* __restrict__ up_scale,
+    const float up_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* C1,
+    unsigned int fuse_silu,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * M_TILE;
+    const unsigned int cta_n = blockIdx.x * N_TILE_SM;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int side = warp_id >> 2;
+    const unsigned int local_warp = warp_id & 3;
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int warp_m_offset = local_warp * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A8[2][M_TILE][K_STEP_P + PAD_P];
+    __shared__ unsigned char smem_p8[2][2][N_TILE_SM][BP_P_STRIDE];
+    __shared__ unsigned char smem_s8[2][2][N_TILE_SM][2];
+    __shared__ __nv_bfloat16 smem_B8[2][2][K_STEP_P][N_TILE_SM + PAD];
+    // Fused-SiLU mode publishes only rounded gate values. Up remains in the
+    // owning warp's registers, preserving both parent BF16 boundaries.
+    __shared__ __nv_bfloat16 smem_gate_epilogue[M_TILE][N_TILE_SM];
+    __shared__ float smem_LUT8[16];
+
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int a_stride = K_STEP_P + PAD_P;
+    const unsigned int b_stride = N_TILE_SM + PAD;
+    if (threadIdx.x < 16) smem_LUT8[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    #define ISSUE_GATEUP8(buf, kk) do {                                             \
+        unsigned int c = threadIdx.x;                                               \
+        unsigned int row = c / (K_STEP_P / 8);                                     \
+        unsigned int col8 = (c % (K_STEP_P / 8)) << 3;                             \
+        unsigned int gr = cta_m + row;                                              \
+        cp_async_pred_16(&smem_A8[(buf)][row][col8],                                \
+            &A[gr * K + (kk) + col8], ((gr) < M) && ((kk) < K));                   \
+        if (threadIdx.x < 128) {                                                    \
+            unsigned int load_side = threadIdx.x >> 6;                             \
+            unsigned int load_n = threadIdx.x & 63;                                \
+            unsigned int gn = cta_n + load_n;                                      \
+            const unsigned char* packed_base = load_side == 0                      \
+                ? gate_packed : up_packed;                                          \
+            const unsigned char* scale_base = load_side == 0                       \
+                ? gate_scale : up_scale;                                            \
+            cp_async_pred_16(&smem_p8[(buf)][load_side][load_n][0],                \
+                &packed_base[(unsigned long long)gn * half_K + ((kk) >> 1)],        \
+                ((gn) < N) && ((kk) < K));                                         \
+            unsigned int sg = (kk) / GROUP_SIZE;                                   \
+            _Pragma("unroll")                                                      \
+            for (int g = 0; g < 2; g++) {                                          \
+                bool valid = (gn) < N && (kk) + g * GROUP_SIZE < K;                \
+                smem_s8[(buf)][load_side][load_n][g] = valid                       \
+                    ? scale_base[(unsigned long long)gn * num_groups + sg + g] : 0;\
+            }                                                                       \
+        }                                                                           \
+        cp_async_commit();                                                          \
+    } while(0)
+
+    #define DEQUANT_GATEUP8(buf, kk) do {                                           \
+        _Pragma("unroll")                                                          \
+        for (unsigned int i = 0; i <                                               \
+                (2 * K_STEP_P * N_TILE_SM / 256); i++) {                           \
+            unsigned int idx = threadIdx.x *                                       \
+                (2 * K_STEP_P * N_TILE_SM / 256) + i;                              \
+            unsigned int dequant_side = idx / (K_STEP_P * N_TILE_SM);              \
+            unsigned int side_idx = idx % (K_STEP_P * N_TILE_SM);                  \
+            unsigned int k = side_idx / N_TILE_SM;                                 \
+            unsigned int n = side_idx % N_TILE_SM;                                 \
+            unsigned char packed = smem_p8[(buf)][dequant_side][n][k >> 1];        \
+            unsigned int nibble = ((kk) + k) & 1                                  \
+                ? (packed >> 4) : (packed & 0xF);                                  \
+            unsigned char sb = smem_s8[(buf)][dequant_side][n]                    \
+                [k / GROUP_SIZE];                                                   \
+            __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;                         \
+            float scale_2 = dequant_side == 0 ? gate_scale2 : up_scale2;           \
+            smem_B8[(buf)][dequant_side][k][n] = __float2bfloat16(                 \
+                smem_LUT8[nibble] * (float)fp8 * scale_2);                         \
+        }                                                                           \
+    } while(0)
+
+    #define MMA_GATEUP8(buf) do {                                                   \
+        const unsigned short* sA = (const unsigned short*)smem_A8[(buf)];          \
+        const unsigned short* sB = (const unsigned short*)smem_B8[(buf)][side];    \
+        unsigned int fr0 = warp_m_offset + group_id;                               \
+        unsigned int fr1 = fr0 + 8;                                                 \
+        _Pragma("unroll")                                                          \
+        for (int kh = 0; kh < 2; kh++) {                                           \
+            unsigned int fc0 = tid * 2 + kh * 16;                                  \
+            unsigned int fc1 = fc0 + 8;                                             \
+            unsigned int a0 = *(const unsigned int*)&sA[fr0*a_stride+fc0];         \
+            unsigned int a1 = *(const unsigned int*)&sA[fr1*a_stride+fc0];         \
+            unsigned int a2 = *(const unsigned int*)&sA[fr0*a_stride+fc1];         \
+            unsigned int a3 = *(const unsigned int*)&sA[fr1*a_stride+fc1];         \
+            _Pragma("unroll")                                                      \
+            for (int nt = 0; nt < 8; nt++) {                                       \
+                unsigned int nc = nt * 8 + group_id;                               \
+                unsigned int k0 = tid * 2 + kh * 16, k1 = k0 + 8;                 \
+                unsigned int b0 = ((unsigned int)sB[(k0+1)*b_stride+nc]<<16)      \
+                    | (unsigned int)sB[k0*b_stride+nc];                             \
+                unsigned int b1 = ((unsigned int)sB[(k1+1)*b_stride+nc]<<16)      \
+                    | (unsigned int)sB[k1*b_stride+nc];                             \
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"\
+                    :"=f"(acc[nt][0]),"=f"(acc[nt][1]),                         \
+                     "=f"(acc[nt][2]),"=f"(acc[nt][3])                          \
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),   \
+                     "f"(acc[nt][0]),"f"(acc[nt][1]),                           \
+                     "f"(acc[nt][2]),"f"(acc[nt][3]));                          \
+            }                                                                       \
+        }                                                                           \
+    } while(0)
+
+    ISSUE_GATEUP8(0, 0);
+    unsigned int cur = 0, nxt = 1;
+    for (unsigned int k_base = 0; k_base < K; k_base += K_STEP_P) {
+        ISSUE_GATEUP8(nxt, k_base + K_STEP_P);
+        cp_async_wait_group<1>();
+        __syncthreads();
+        DEQUANT_GATEUP8(cur, k_base);
+        __syncthreads();
+        MMA_GATEUP8(cur);
+        __syncthreads();
+        unsigned int t = cur; cur = nxt; nxt = t;
+    }
+
+    if (fuse_silu != 0) {
+        if (side == 0) {
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                unsigned int c0 = nt*8 + tid*2;
+                unsigned int c1 = c0 + 1;
+                unsigned int r0 = warp_m_offset + group_id;
+                unsigned int r1 = r0 + 8;
+                smem_gate_epilogue[r0][c0] = __float2bfloat16(acc[nt][0]);
+                smem_gate_epilogue[r0][c1] = __float2bfloat16(acc[nt][1]);
+                smem_gate_epilogue[r1][c0] = __float2bfloat16(acc[nt][2]);
+                smem_gate_epilogue[r1][c1] = __float2bfloat16(acc[nt][3]);
+            }
+        }
+        __syncthreads();
+        if (side == 1) {
+            #define STORE_SILU8(row, col, value) do {                               \
+                unsigned int gr = cta_m + (row);                                   \
+                unsigned int gc = cta_n + (col);                                   \
+                if (gr < M && gc < N) {                                            \
+                    unsigned long long out_idx = (unsigned long long)gr * N + gc;  \
+                    float g = __bfloat162float(smem_gate_epilogue[(row)][(col)]);   \
+                    float u = __bfloat162float(__float2bfloat16(value));            \
+                    float sigmoid_g = 1.0f / (1.0f + __expf(-g));                  \
+                    C0[out_idx] = __float2bfloat16(g * sigmoid_g * u);              \
+                }                                                                   \
+            } while(0)
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                unsigned int c0 = nt*8 + tid*2;
+                unsigned int c1 = c0 + 1;
+                unsigned int r0 = warp_m_offset + group_id;
+                unsigned int r1 = r0 + 8;
+                STORE_SILU8(r0, c0, acc[nt][0]);
+                STORE_SILU8(r0, c1, acc[nt][1]);
+                STORE_SILU8(r1, c0, acc[nt][2]);
+                STORE_SILU8(r1, c1, acc[nt][3]);
+            }
+            #undef STORE_SILU8
+        }
+    } else {
+        __nv_bfloat16* output = side == 0 ? C0 : C1;
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            unsigned int c0 = cta_n + nt*8 + tid*2;
+            unsigned int c1 = c0 + 1;
+            unsigned int r0 = cta_m + warp_m_offset + group_id;
+            unsigned int r1 = r0 + 8;
+            if (r0 < M && c0 < N) output[(unsigned long long)r0*N+c0] = __float2bfloat16(acc[nt][0]);
+            if (r0 < M && c1 < N) output[(unsigned long long)r0*N+c1] = __float2bfloat16(acc[nt][1]);
+            if (r1 < M && c0 < N) output[(unsigned long long)r1*N+c0] = __float2bfloat16(acc[nt][2]);
+            if (r1 < M && c1 < N) output[(unsigned long long)r1*N+c1] = __float2bfloat16(acc[nt][3]);
+        }
+    }
+
+    #undef MMA_GATEUP8
+    #undef DEQUANT_GATEUP8
+    #undef ISSUE_GATEUP8
+}
+
+// Four-warp N32 dual-projection shadow. Halving the N tile halves each
+// projection's live accumulator footprint while retaining one shared A stage
+// for gate and up. The symbol is intentionally unrouted and requires a
+// 128-thread block; grid.x must be ceil(N/32).
+#define N_TILE_DUAL32 32
+extern "C" __global__ __launch_bounds__(128, 4) void w4a16_gemm_pipe_dual_n32(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ gate_packed,
+    const unsigned char* __restrict__ gate_scale,
+    const float gate_scale2,
+    const unsigned char* __restrict__ up_packed,
+    const unsigned char* __restrict__ up_scale,
+    const float up_scale2,
+    __nv_bfloat16* __restrict__ C0,
+    __nv_bfloat16* C1,
+    unsigned int fuse_silu,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_m = blockIdx.y * M_TILE;
+    const unsigned int cta_n = blockIdx.x * N_TILE_DUAL32;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x & 31;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ __nv_bfloat16 smem_A32[2][M_TILE][K_STEP_P + PAD_P];
+    __shared__ unsigned char smem_p32[2][2][N_TILE_DUAL32][BP_P_STRIDE];
+    __shared__ unsigned char smem_s32[2][2][N_TILE_DUAL32][2];
+    __shared__ __nv_bfloat16 smem_B32[2][2][K_STEP_P][N_TILE_DUAL32 + PAD];
+    __shared__ float smem_LUT32[16];
+
+    float gate_acc[4][4];
+    float up_acc[4][4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        gate_acc[i][0] = 0.0f; gate_acc[i][1] = 0.0f;
+        gate_acc[i][2] = 0.0f; gate_acc[i][3] = 0.0f;
+        up_acc[i][0] = 0.0f; up_acc[i][1] = 0.0f;
+        up_acc[i][2] = 0.0f; up_acc[i][3] = 0.0f;
+    }
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int a_stride = K_STEP_P + PAD_P;
+    const unsigned int b_stride = N_TILE_DUAL32 + PAD;
+    if (threadIdx.x < 16) smem_LUT32[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    #define ISSUE_GATEUP32(buf, kk) do {                                            \
+        _Pragma("unroll")                                                          \
+        for (int p = 0; p < A_P_CHUNKS; p++) {                                    \
+            unsigned int c = threadIdx.x * A_P_CHUNKS + p;                        \
+            unsigned int row = c / (K_STEP_P / 8);                                \
+            unsigned int col8 = (c % (K_STEP_P / 8)) << 3;                        \
+            unsigned int gr = cta_m + row;                                         \
+            cp_async_pred_16(&smem_A32[(buf)][row][col8],                          \
+                &A[gr * K + (kk) + col8], ((gr) < M) && ((kk) < K));              \
+        }                                                                           \
+        if (threadIdx.x < 64) {                                                     \
+            unsigned int load_side = threadIdx.x >> 5;                            \
+            unsigned int load_n = threadIdx.x & 31;                               \
+            unsigned int gn = cta_n + load_n;                                      \
+            const unsigned char* packed_base = load_side == 0                     \
+                ? gate_packed : up_packed;                                          \
+            const unsigned char* scale_base = load_side == 0                      \
+                ? gate_scale : up_scale;                                            \
+            cp_async_pred_16(&smem_p32[(buf)][load_side][load_n][0],              \
+                &packed_base[(unsigned long long)gn * half_K + ((kk) >> 1)],        \
+                ((gn) < N) && ((kk) < K));                                         \
+            unsigned int sg = (kk) / GROUP_SIZE;                                   \
+            _Pragma("unroll")                                                      \
+            for (int g = 0; g < 2; g++) {                                          \
+                bool valid = (gn) < N && (kk) + g * GROUP_SIZE < K;                \
+                smem_s32[(buf)][load_side][load_n][g] = valid                     \
+                    ? scale_base[(unsigned long long)gn * num_groups + sg + g] : 0;\
+            }                                                                       \
+        }                                                                           \
+        cp_async_commit();                                                          \
+    } while(0)
+
+    #define DEQUANT_GATEUP32(buf, kk) do {                                          \
+        _Pragma("unroll")                                                          \
+        for (unsigned int i = 0; i <                                               \
+                (2 * K_STEP_P * N_TILE_DUAL32 / 128); i++) {                       \
+            unsigned int idx = threadIdx.x *                                       \
+                (2 * K_STEP_P * N_TILE_DUAL32 / 128) + i;                          \
+            unsigned int dequant_side = idx / (K_STEP_P * N_TILE_DUAL32);          \
+            unsigned int side_idx = idx % (K_STEP_P * N_TILE_DUAL32);              \
+            unsigned int k = side_idx / N_TILE_DUAL32;                             \
+            unsigned int n = side_idx % N_TILE_DUAL32;                             \
+            unsigned char packed = smem_p32[(buf)][dequant_side][n][k >> 1];       \
+            unsigned int nibble = ((kk) + k) & 1                                  \
+                ? (packed >> 4) : (packed & 0xF);                                  \
+            unsigned char sb = smem_s32[(buf)][dequant_side][n]                   \
+                [k / GROUP_SIZE];                                                   \
+            __nv_fp8_e4m3 fp8; *(unsigned char*)&fp8 = sb;                         \
+            float scale_2 = dequant_side == 0 ? gate_scale2 : up_scale2;           \
+            smem_B32[(buf)][dequant_side][k][n] = __float2bfloat16(                \
+                smem_LUT32[nibble] * (float)fp8 * scale_2);                        \
+        }                                                                           \
+    } while(0)
+
+    #define MMA_GATEUP32(accum, buf, mma_side) do {                                 \
+        const unsigned short* sA = (const unsigned short*)smem_A32[(buf)];         \
+        const unsigned short* sB =                                                  \
+            (const unsigned short*)smem_B32[(buf)][(mma_side)];                    \
+        unsigned int fr0 = warp_m_offset + group_id;                               \
+        unsigned int fr1 = fr0 + 8;                                                 \
+        _Pragma("unroll")                                                          \
+        for (int kh = 0; kh < 2; kh++) {                                           \
+            unsigned int fc0 = tid * 2 + kh * 16;                                  \
+            unsigned int fc1 = fc0 + 8;                                             \
+            unsigned int a0 = *(const unsigned int*)&sA[fr0*a_stride+fc0];         \
+            unsigned int a1 = *(const unsigned int*)&sA[fr1*a_stride+fc0];         \
+            unsigned int a2 = *(const unsigned int*)&sA[fr0*a_stride+fc1];         \
+            unsigned int a3 = *(const unsigned int*)&sA[fr1*a_stride+fc1];         \
+            _Pragma("unroll")                                                      \
+            for (int nt = 0; nt < 4; nt++) {                                       \
+                unsigned int nc = nt * 8 + group_id;                               \
+                unsigned int k0 = tid * 2 + kh * 16, k1 = k0 + 8;                 \
+                unsigned int b0 = ((unsigned int)sB[(k0+1)*b_stride+nc]<<16)      \
+                    | (unsigned int)sB[k0*b_stride+nc];                             \
+                unsigned int b1 = ((unsigned int)sB[(k1+1)*b_stride+nc]<<16)      \
+                    | (unsigned int)sB[k1*b_stride+nc];                             \
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};"\
+                    :"=f"((accum)[nt][0]),"=f"((accum)[nt][1]),                 \
+                     "=f"((accum)[nt][2]),"=f"((accum)[nt][3])                  \
+                    :"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),   \
+                     "f"((accum)[nt][0]),"f"((accum)[nt][1]),                   \
+                     "f"((accum)[nt][2]),"f"((accum)[nt][3]));                  \
+            }                                                                       \
+        }                                                                           \
+    } while(0)
+
+    ISSUE_GATEUP32(0, 0);
+    unsigned int cur = 0, nxt = 1;
+    for (unsigned int k_base = 0; k_base < K; k_base += K_STEP_P) {
+        ISSUE_GATEUP32(nxt, k_base + K_STEP_P);
+        cp_async_wait_group<1>();
+        __syncthreads();
+        DEQUANT_GATEUP32(cur, k_base);
+        __syncthreads();
+        MMA_GATEUP32(gate_acc, cur, 0);
+        MMA_GATEUP32(up_acc, cur, 1);
+        __syncthreads();
+        unsigned int t = cur; cur = nxt; nxt = t;
+    }
+
+    #define STORE_DUAL32(row, col, gate_value, up_value) do {                       \
+        unsigned int gr = cta_m + (row);                                           \
+        unsigned int gc = cta_n + (col);                                           \
+        if (gr < M && gc < N) {                                                    \
+            unsigned long long out_idx = (unsigned long long)gr * N + gc;          \
+            float g = __bfloat162float(__float2bfloat16(gate_value));              \
+            float u = __bfloat162float(__float2bfloat16(up_value));                \
+            if (fuse_silu != 0) {                                                  \
+                float sigmoid_g = 1.0f / (1.0f + __expf(-g));                     \
+                C0[out_idx] = __float2bfloat16(g * sigmoid_g * u);                 \
+            } else {                                                               \
+                C0[out_idx] = __float2bfloat16(g);                                 \
+                C1[out_idx] = __float2bfloat16(u);                                 \
+            }                                                                      \
+        }                                                                          \
+    } while(0)
+    #pragma unroll
+    for (int nt = 0; nt < 4; nt++) {
+        unsigned int c0 = nt*8 + tid*2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        STORE_DUAL32(r0, c0, gate_acc[nt][0], up_acc[nt][0]);
+        STORE_DUAL32(r0, c1, gate_acc[nt][1], up_acc[nt][1]);
+        STORE_DUAL32(r1, c0, gate_acc[nt][2], up_acc[nt][2]);
+        STORE_DUAL32(r1, c1, gate_acc[nt][3], up_acc[nt][3]);
+    }
+
+    #undef STORE_DUAL32
+    #undef MMA_GATEUP32
+    #undef DEQUANT_GATEUP32
+    #undef ISSUE_GATEUP32
+}
+#undef N_TILE_DUAL32
+
 // ═══════════════════════════════════════════════════════════════════
 // FP8-MMA transposed dense GEMM.
 //

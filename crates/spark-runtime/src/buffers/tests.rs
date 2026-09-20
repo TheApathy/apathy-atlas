@@ -41,9 +41,9 @@ fn test_buffer_arena_alloc() {
     assert!(!arena.hidden_states().is_null());
     assert!(!arena.logits().is_null());
     assert_eq!(arena.max_batch_tokens(), 128);
-    // 18 allocations for 18 buffers (12 data + 1 scratch + 3 expert + 2 splitk).
-    // Bump from 17 reflects an added split-K accumulator buffer.
-    assert_eq!(gpu.alloc_count(), 18);
+    // 19 allocations for 19 buffers (13 data + 1 scratch + 3 expert + 2 splitk).
+    // The merged gate/up allocation is a sentinel while its route is off.
+    assert_eq!(gpu.alloc_count(), 19);
 }
 
 #[test]
@@ -82,4 +82,39 @@ fn ssm_qkvz_covers_gated_attention_q_staging() {
             "m={m}: ssm_qkvz < K+V staging"
         );
     }
+}
+
+#[test]
+fn merged_flashinfer_ffn_arena_is_exact_shared_and_capped() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.model_type = "qwen3_5".to_string();
+    cfg.num_experts = 0;
+    cfg.hidden_size = 5_120;
+    cfg.intermediate_size = 17_408;
+    cfg.tp_world_size = 1;
+
+    assert_eq!(
+        super::sizes::qwen38_flashinfer_merged_output_bytes(&cfg, 2_079, true),
+        144_764_928
+    );
+    assert_eq!(
+        super::sizes::qwen38_flashinfer_merged_output_bytes(&cfg, 8_192, true),
+        570_425_344
+    );
+    assert_eq!(
+        super::sizes::qwen38_flashinfer_merged_output_bytes(&cfg, 32_800, true),
+        570_425_344,
+        "only admitted M<=8192 needs the shared arena"
+    );
+    assert_eq!(
+        super::sizes::qwen38_flashinfer_merged_output_bytes(&cfg, 8_192, false),
+        256
+    );
+
+    cfg.intermediate_size -= 1;
+    assert_eq!(
+        super::sizes::qwen38_flashinfer_merged_output_bytes(&cfg, 8_192, true),
+        256,
+        "non-Qwen3.8 geometry must not pay the opt-in arena cost"
+    );
 }

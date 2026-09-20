@@ -53,6 +53,8 @@ pub struct BufferArena {
     /// Without this, ~7 bits of precision are lost every token, causing
     /// coherence degradation after 8k+ tokens.
     ssm_conv_out_f32: DevicePtr,
+    /// Shared exact-Qwen3.8 FlashInfer merged gate/up output in BF16.
+    ffn_gate_up_bf16: DevicePtr,
     /// Scratch space for kernel metadata (positions, slot_mapping, block_tables).
     scratch: DevicePtr,
     /// Expert gate projection output: [k2 * top_k, moe_intermediate_size] BF16.
@@ -93,6 +95,7 @@ impl BufferArena {
         let ssm_deinterleaved = gpu.alloc(sizes.ssm_deinterleaved)?;
         let ssm_gates = gpu.alloc(sizes.ssm_gates)?;
         let ssm_conv_out_f32 = gpu.alloc(sizes.ssm_conv_out_f32)?;
+        let ffn_gate_up_bf16 = gpu.alloc(sizes.ffn_gate_up_bf16)?;
         let scratch = gpu.alloc(sizes.scratch)?;
         let expert_gate_out = gpu.alloc(sizes.expert_gate_out)?;
         let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
@@ -122,6 +125,7 @@ impl BufferArena {
             ssm_deinterleaved,
             ssm_gates,
             ssm_conv_out_f32,
+            ffn_gate_up_bf16,
             scratch,
             expert_gate_out,
             expert_up_out,
@@ -173,6 +177,10 @@ impl BufferArena {
     /// FP32 conv1d output for SSM recurrent path (prevents BF16 precision drift).
     pub fn ssm_conv_out_f32(&self) -> DevicePtr {
         self.ssm_conv_out_f32
+    }
+    /// Shared row-major BF16 output for exact merged gate/up prefill.
+    pub fn ffn_gate_up_bf16(&self) -> DevicePtr {
+        self.ffn_gate_up_bf16
     }
     /// Scratch buffer for MoE routing + kernel metadata uploads.
     pub fn scratch(&self) -> DevicePtr {
@@ -252,6 +260,12 @@ impl BufferArena {
             self.ssm_conv_out_f32,
             0,
             self.sizes.ssm_conv_out_f32,
+            stream,
+        )?;
+        gpu.memset_async(
+            self.ffn_gate_up_bf16,
+            0,
+            self.sizes.ffn_gate_up_bf16,
             stream,
         )?;
         gpu.memset_async(

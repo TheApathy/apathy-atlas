@@ -187,6 +187,18 @@ pub struct DflashKernels {
     /// projections under NVFP4. BF16 build leaves this set to the same
     /// handle as `dense_gemm` and never dispatches to it.
     pub w4a16_gemm: KernelHandle,
+    /// Byte-exact cp.async-pipelined shadow of `w4a16_gemm`. V3 uses this
+    /// only for large-M prompt-context ingestion when
+    /// `ATLAS_DFLASH_PREFILL_PIPE=1`; small-M decode remains on the dedicated
+    /// transposed gamma kernels. Optional for the default-off policy; an
+    /// explicit bulk-prefill request fails closed when an older kernel cache
+    /// lacks the symbol, instead of silently benchmarking the baseline.
+    pub w4a16_gemm_pipe: KernelHandle,
+    /// Shared-input dual-output shadow of `w4a16_gemm_pipe`. During V3 bulk
+    /// context ingestion it projects K and V in one launch while retaining
+    /// the same two independent BF16 cache buffers. The explicit prefill gate
+    /// fails closed when this optional symbol is absent.
+    pub w4a16_gemm_pipe_dual: KernelHandle,
     /// NVFP4 W4A16 GEMM M_TILE=16 specialization (`w4a16_gemm_t_m16`) —
     /// requires transposed `nvfp4_t` weight layout. Only used by the
     /// drafter FFN when `ATLAS_DFLASH_FFN_KGAMMA=1`. Resolved via
@@ -449,19 +461,20 @@ pub struct DflashProposerState {
     /// Immutable limits from the most recent outer `propose` call.
     pub draft_budget: Option<draft_budget::DflashDraftBudget>,
     /// Multi-token accumulator for captured target hidden states. Layout:
-    /// `[max_ctx_len, 5 * target_hidden]` BF16 packed. The scheduler appends
-    /// the model's `dflash_hidden_save` (latest decoded position's 5 hiddens)
-    /// into slot `ctx_len` after each successful verify. `propose()` reads
-    /// the full populated prefix and projects all positions through `fc`
-    /// at forward time. Sized for `max_seq_len` total positions; not
-    /// circular — fail-fast if exceeded (drafter can't handle longer
-    /// context than allocated).
+    /// `[ctx_capacity, 5 * target_hidden]` BF16 packed as a circular buffer.
+    /// Absolute logical position `p` resides in physical slot
+    /// `p % ctx_capacity`; only the latest `ctx_capacity` positions are valid.
     pub ctx_hidden_acc: DevicePtr,
-    /// Number of populated slots in `ctx_hidden_acc`. Capped at `max_ctx_len`.
+    /// Absolute logical end of the populated range. Capped at `max_ctx_len`;
+    /// the number of physically retained slots is at most `ctx_capacity`.
     pub ctx_len: usize,
-    /// Allocation cap for `ctx_hidden_acc` (in slot count). Mirrors the
-    /// `max_seq_len` build arg so we can clamp without re-fetching it.
+    /// Logical context ceiling. Mirrors the `max_seq_len` build argument.
     pub max_ctx_len: usize,
+    /// Physical slot count allocated for `ctx_hidden_acc`. This is bounded by
+    /// the drafter's local context window rather than the model's full context.
+    pub ctx_capacity: usize,
+    /// Exact allocation size used by the accumulator pool.
+    pub ctx_alloc_bytes: usize,
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
@@ -499,6 +512,13 @@ pub struct DflashProposerState {
     /// (measured ~8.7 ms of hidden serialization per cycle). Sized for
     /// `(ctx_window + γ + 1) * 4` bytes.
     pub pos_pinned: PinnedHostBuffer,
+    /// Separate page-locked mirror for `[context zeros, anchor, noise]` token
+    /// IDs. It cannot alias `pos_pinned`: both asynchronous H2D copies may be
+    /// pending concurrently on the proposal stream.
+    pub token_ids_pinned: PinnedHostBuffer,
+    /// Page-locked D2H staging for final draft IDs. Shared by synchronous and
+    /// async collection only after the owning proposal stream has completed.
+    pub draft_output_pinned: PinnedHostBuffer,
 
     // ── Adaptive retrieval gate (ATLAS_DFLASH_SAM auto-disable) ──
     /// Whether the PREVIOUS propose pre-empted the neural drafter with a
@@ -865,6 +885,10 @@ pub struct BlockDiffusionDraftHead {
     /// (degraded quality, ablation only).
     pub ctx_window: usize,
 
+    /// Process-environment proposal controls, frozen on first use. Runtime
+    /// profiler signals are intentionally separate and remain dynamic.
+    proposal_policy: std::sync::OnceLock<proposal_policy::ProposalPolicy>,
+
     // Quantization mode (BF16 only for Phase 1).
     pub quant: DflashQuantization,
 
@@ -913,42 +937,25 @@ impl BlockDiffusionDraftHead {
         slot_bytes: usize,
         stream: u64,
     ) -> Result<()> {
-        let copy_start = needed_start.max(cache_start);
-        let copy_end = needed_end.min(cache_end);
-        if copy_start >= copy_end {
-            return Ok(());
-        }
-        // Find first wrap point in [copy_start..copy_end).
-        let first_wrap = ((copy_start / window) + 1) * window;
-        if first_wrap >= copy_end {
-            // Entirely within one ring segment — single copy.
-            let src_offset = (copy_start % window) * slot_bytes;
-            let dst_offset = (copy_start - needed_start) * slot_bytes;
-            let count = copy_end - copy_start;
+        let plan =
+            ring_window::plan_ring_copy(cache_start, cache_end, window, needed_start, needed_end)?;
+        for span in plan.spans() {
+            let src_offset = span
+                .src_slot
+                .checked_mul(slot_bytes)
+                .ok_or_else(|| anyhow::anyhow!("DFlash ring source byte offset overflow"))?;
+            let dst_offset = span
+                .dst_slot
+                .checked_mul(slot_bytes)
+                .ok_or_else(|| anyhow::anyhow!("DFlash ring destination byte offset overflow"))?;
+            let bytes = span
+                .slot_count
+                .checked_mul(slot_bytes)
+                .ok_or_else(|| anyhow::anyhow!("DFlash ring copy byte count overflow"))?;
             gpu.copy_d2d_async(
                 cache.offset(src_offset),
                 dst.offset(dst_offset),
-                count * slot_bytes,
-                stream,
-            )?;
-        } else {
-            // Wraps around — two copies.
-            let count1 = first_wrap - copy_start;
-            let src1 = (copy_start % window) * slot_bytes;
-            let dst1 = (copy_start - needed_start) * slot_bytes;
-            gpu.copy_d2d_async(
-                cache.offset(src1),
-                dst.offset(dst1),
-                count1 * slot_bytes,
-                stream,
-            )?;
-            let count2 = copy_end - first_wrap;
-            let src2 = 0usize;
-            let dst2 = (first_wrap - needed_start) * slot_bytes;
-            gpu.copy_d2d_async(
-                cache.offset(src2),
-                dst.offset(dst2),
-                count2 * slot_bytes,
+                bytes,
                 stream,
             )?;
         }
@@ -1036,8 +1043,11 @@ mod logits_layout;
 mod markov;
 mod noise_pass;
 mod pctree;
+mod proposal_inputs;
+mod proposal_policy;
 mod propose;
 pub mod retrieval;
+pub(crate) mod ring_window;
 mod throughput_router;
 
 // Re-export DDTree payload so the scheduler can carry it as Option<DDTreePayload>
@@ -1162,14 +1172,20 @@ impl DraftProposer for BlockDiffusionDraftHead {
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        // Per-seq ctx accumulator: `[max_seq_len, 5 * target_hidden] BF16`.
-        // Sized once, re-used across the seq's lifetime; reset on
-        // `free_state`. At max_seq_len=16384 and 5×2048 BF16: 320 MB per
-        // seq — tolerable on a single Spark with max_batch_size=1; for
-        // higher batch we may want to reduce to a smaller working window.
+        // The drafter attends only its latest `ctx_window` target captures, so
+        // retaining all `max_seq_len` captures is wasteful and makes a 1M
+        // context request allocate tens of GiB. Keep absolute logical
+        // positions in state while storing only the latest local window.
         let bf16 = 2usize;
-        let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
-        let total = self.max_seq_len * ctx_slot_bytes;
+        let ctx_layout = ring_window::plan_accumulator_layout(
+            self.max_seq_len,
+            self.ctx_window,
+            self.target_layer_ids.len(),
+            self.target_hidden_size,
+        )?;
+        let ctx_slot_bytes = ctx_layout.slot_bytes;
+        let ctx_capacity = ctx_layout.capacity;
+        let total = ctx_layout.allocation_bytes;
         let alloc_t0 = std::time::Instant::now();
         // Reuse a pooled buffer when one is idle (see `ctx_acc_pool`): a
         // fresh cuMemAlloc of this size page-faults ~200-950 ms per request
@@ -1209,6 +1225,12 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // Page-locked host buffer sized for the max position-id layout
         // (`ctx_window` context positions + up to γ+1 noise rows).
         let pos_pinned = gpu.alloc_host_pinned((self.ctx_window + self.gamma + 1) * 4)?;
+        let token_ids_pinned = gpu.alloc_host_pinned((self.ctx_window + self.gamma + 1) * 4)?;
+        let draft_output_bytes = self
+            .gamma
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("DFlash draft output staging size overflow"))?;
+        let draft_output_pinned = gpu.alloc_host_pinned(draft_output_bytes)?;
 
         Ok(Box::new(DflashProposerState {
             last_num_drafted: 0,
@@ -1216,6 +1238,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
             ctx_hidden_acc,
             ctx_len: 0,
             max_ctx_len: self.max_seq_len,
+            ctx_capacity,
+            ctx_alloc_bytes: total,
             ctx_slot_bytes,
             last_capture_idx: 0,
             last_num_accepted: 0,
@@ -1223,6 +1247,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
             pld_tokens: Vec::new(),
             first_propose_done: false,
             pos_pinned,
+            token_ids_pinned,
+            draft_output_pinned,
             retr_used_last: false,
             retr_misfire_streak: 0,
             retr_cooldown: 0,

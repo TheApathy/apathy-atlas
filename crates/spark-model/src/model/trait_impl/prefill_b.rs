@@ -120,6 +120,7 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let total = tokens.len();
+        self.validate_vision_prompt(tokens, chunk_start, chunk_len)?;
         assert!(
             chunk_start + chunk_len <= total,
             "chunk_start({chunk_start}) + chunk_len({chunk_len}) > total({total})"

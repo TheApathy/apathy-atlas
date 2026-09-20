@@ -97,6 +97,12 @@ pub const THINK_LOOP_MIN_REPEATS: usize = 3;
 /// prefixes that separate them.
 pub const THINK_LOOP_SCAN_WINDOW: usize = 160;
 
+/// A ChatML role opener is never valid reasoning content. Four occurrences
+/// in a short thinking tail identify the control-token attractor without
+/// applying the broad phrase-loop heuristic to ordinary prose or code.
+pub const CHATML_THINK_CYCLE_WINDOW: usize = 32;
+pub const CHATML_THINK_CYCLE_MIN_OPENERS: usize = 4;
+
 /// Content-phase loop detection. Catches the post-`</think>` agentic
 /// degeneration mode where the model emits the same sentence over
 /// and over (observed 2026-04-26 against Claude Code: "I see I've
@@ -411,6 +417,22 @@ pub fn detect_thinking_token_loop(tokens: &[u32]) -> bool {
         wp.think_loop_min_repeats,
         wp.think_loop_scan_window,
     )
+}
+
+/// Detect a repeated `<|im_start|>` attractor inside a thinking span.
+///
+/// `current` supports the serial sampler, which runs thinking policy before
+/// pushing the sampled token. Speculative emission passes `None` because its
+/// current token is already present in `tokens`.
+pub fn detect_chatml_thinking_cycle(tokens: &[u32], current: Option<u32>, im_start: u32) -> bool {
+    let retained = CHATML_THINK_CYCLE_WINDOW.saturating_sub(usize::from(current.is_some()));
+    let prior = tokens
+        .iter()
+        .rev()
+        .take(retained)
+        .filter(|&&tok| tok == im_start)
+        .count();
+    prior + usize::from(current == Some(im_start)) >= CHATML_THINK_CYCLE_MIN_OPENERS
 }
 
 /// Content-phase analogue of [`detect_thinking_token_loop`] — fires

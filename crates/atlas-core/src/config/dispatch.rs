@@ -8,10 +8,11 @@
 
 use anyhow::{Context, Result};
 
+use super::parsers::parse_qwen_rope_parameters;
 use super::{
-    LayerType, ModelConfig, default_conv_kernel, default_partial_rotary, default_rms_eps,
-    default_rope_theta, finalize_config, parse_gemma4_params, parse_minimax_m2,
-    parse_mistral_params, parse_quantization_config, parse_vision_config, validate_config,
+    LayerType, ModelConfig, default_conv_kernel, default_rms_eps, finalize_config,
+    parse_gemma4_params, parse_minimax_m2, parse_mistral_params, parse_quantization_config,
+    parse_vision_config, validate_config,
 };
 
 pub fn parse_config(json: &str) -> Result<ModelConfig> {
@@ -49,24 +50,7 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0) as usize;
             }
-            // rope_theta and partial_rotary_factor from nested rope_parameters
-            if let Some(rope_params) = text_config.get("rope_parameters") {
-                if config.rope_theta == default_rope_theta()
-                    && let Some(theta) = rope_params
-                        .get("rope_theta")
-                        .and_then(serde_json::Value::as_f64)
-                {
-                    config.rope_theta = theta;
-                }
-                // FP8 checkpoints store partial_rotary_factor inside rope_parameters
-                if config.partial_rotary_factor == default_partial_rotary()
-                    && let Some(prf) = rope_params
-                        .get("partial_rotary_factor")
-                        .and_then(serde_json::Value::as_f64)
-                {
-                    config.partial_rotary_factor = prf;
-                }
-            }
+            parse_qwen_rope_parameters(&mut config, text_config, top_model_type)?;
             // Qwen3.5 MoE unconditionally normalizes top-K expert weights
             // (hardcoded in HF's Qwen3_5MoeTopKRouter, no config toggle).
             config.norm_topk_prob = true;
@@ -94,28 +78,6 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             // the Qwen35 MoE weight loader would fail looking for mlp.gate.
             // The qwen3.5-27b kernel target handles MRoPE at runtime via the
             // mrope_interleaved / mrope_section flags.
-            if let Some(rope_params) = text_config.get("rope_parameters") {
-                if let Some(ms) = rope_params.get("mrope_section").and_then(|v| v.as_array())
-                    && ms.len() == 3
-                {
-                    config.mrope_section = [
-                        ms[0].as_u64().unwrap_or(0) as usize,
-                        ms[1].as_u64().unwrap_or(0) as usize,
-                        ms[2].as_u64().unwrap_or(0) as usize,
-                    ];
-                }
-                config.mrope_interleaved = rope_params
-                    .get("mrope_interleaved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let is_moe = top_model_type == "qwen3_5_moe" || top_model_type == "qwen3_vl_moe";
-                if is_moe
-                    && config.mrope_interleaved
-                    && config.mrope_section.iter().sum::<usize>() > 0
-                {
-                    config.model_type = "qwen3_6_moe".to_string();
-                }
-            }
             finalize_config(&mut config, &raw)?;
             Ok(config)
         }

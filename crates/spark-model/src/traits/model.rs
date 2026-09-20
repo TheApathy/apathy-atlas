@@ -327,6 +327,14 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Token authority required by the currently active proposer. Generic
+    /// models and all existing serving-policy proposers retain the default;
+    /// an exact-authority scheduler must query this value rather than infer it
+    /// from the proposer kind or runtime flags.
+    fn proposer_target_token_authority(&self) -> crate::speculative::TargetTokenAuthority {
+        crate::speculative::TargetTokenAuthority::ServingPolicy
+    }
+
     /// Exact verify-side token capacity for the installed DFlash proposer.
     ///
     /// Includes the bonus/root row. The universal default is `None`; the

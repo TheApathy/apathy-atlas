@@ -233,6 +233,198 @@ extern "C" __global__ void causal_conv1d_update_prefill(
     }
 }
 
+// Exact prefill shadow with fused Z persistence for the two-phase SSM path.
+// The conv state, weights, arithmetic, SiLU, output conversion, and final
+// state write are identical to causal_conv1d_update_prefill above. QKV and
+// gate/beta can therefore write directly to their full-sequence destinations;
+// the first z_dim channel threads copy the projected Z value for the same token
+// inside the already-sequential loop, eliminating a separate per-row copy path.
+extern "C" __global__ void causal_conv1d_update_prefill_zcopy(
+    float* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ z_input,
+    __nv_bfloat16* __restrict__ z_output,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int seq_len,
+    unsigned int input_stride,
+    unsigned int output_stride,
+    unsigned int z_dim
+) {
+    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+
+    float* state = conv_state + ch * d_conv;
+    const __nv_bfloat16* w = weight + ch * d_conv;
+    const float b_val = (bias != nullptr) ? bias[ch] : 0.0f;
+
+    float w_reg[4];
+    for (unsigned int k = 0; k < d_conv && k < 4; k++) {
+        w_reg[k] = (float)w[k];
+    }
+
+    float s[4];
+    for (unsigned int k = 0; k < d_conv && k < 4; k++) {
+        s[k] = state[k];
+    }
+
+    for (unsigned int t = 0; t < seq_len; t++) {
+        float new_val = (float)input[(unsigned long long)t * input_stride + ch];
+
+        s[0] = s[1]; s[1] = s[2]; s[2] = s[3]; s[3] = new_val;
+
+        float acc = b_val + s[0]*w_reg[0] + s[1]*w_reg[1] + s[2]*w_reg[2] + s[3]*w_reg[3];
+
+        float sigmoid_acc = 1.0f / (1.0f + __expf(-acc));
+        output[(unsigned long long)t * output_stride + ch] = __float2bfloat16(acc * sigmoid_acc);
+        if (ch < z_dim) {
+            z_output[(unsigned long long)t * z_dim + ch] =
+                z_input[(unsigned long long)t * input_stride + ch];
+        }
+    }
+
+    for (unsigned int k = 0; k < d_conv && k < 4; k++) {
+        state[k] = s[k];
+    }
+}
+
+// Exact two-phase prefill shadow: causal conv + projected-Z persistence +
+// Q/K L2 normalization. Unlike causal_conv1d_update_l2norm (decode), this
+// preserves the standalone prefill contract exactly:
+//   1. conv+SiLU is rounded to BF16,
+//   2. the BF16 pairs are accumulated with l2_norm_bf16's 128-thread tree,
+//   3. normalized pairs are rounded back to BF16 with the same packing order.
+// One 128-thread CTA owns one complete Q/K head (or one 128-channel V slab)
+// and advances all tokens sequentially, which is required by conv_state.
+//
+// Required host contract: d_conv=4, head_dim=128, dim%128=0,
+// qk_channels%128=0.
+// Grid: (dim / 128, 1, 1), Block: (128, 1, 1).
+__device__ __forceinline__ void conv_l2_unpack_bf16x2(
+    unsigned int packed, float& v0, float& v1
+) {
+    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
+    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+}
+
+__device__ __forceinline__ unsigned int conv_l2_pack_bf16x2(float v0, float v1) {
+    unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
+    unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+    return lo | (hi << 16);
+}
+
+__device__ __forceinline__ float conv_l2_warp_reduce_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xFFFFFFFF, value, offset);
+    }
+    return value;
+}
+
+extern "C" __global__ void causal_conv1d_update_prefill_l2norm_zcopy(
+    float* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ input,
+    const __nv_bfloat16* __restrict__ weight,
+    const float* __restrict__ bias,
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ z_input,
+    __nv_bfloat16* __restrict__ z_output,
+    unsigned int dim,
+    unsigned int d_conv,
+    unsigned int seq_len,
+    unsigned int input_stride,
+    unsigned int output_stride,
+    unsigned int z_dim,
+    unsigned int qk_channels,
+    unsigned int head_dim,
+    float l2_eps
+) {
+    if (d_conv != 4 || head_dim != 128 || blockDim.x != 128 || (dim & 127) != 0 ||
+        (qk_channels & 127) != 0) {
+        return;
+    }
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int head_start = blockIdx.x * head_dim;
+    const unsigned int ch = head_start + tid;
+    const bool normalize = head_start < qk_channels;
+
+    float* state = conv_state + (unsigned long long)ch * d_conv;
+    const __nv_bfloat16* w = weight + (unsigned long long)ch * d_conv;
+    const float b_val = (bias != nullptr) ? bias[ch] : 0.0f;
+
+    float w_reg[4];
+    float s[4];
+    for (unsigned int k = 0; k < d_conv && k < 4; k++) {
+        w_reg[k] = (float)w[k];
+        s[k] = state[k];
+    }
+
+    __shared__ __nv_bfloat16 rounded[128];
+    __shared__ float warp_sums[4];
+
+    for (unsigned int token = 0; token < seq_len; token++) {
+        float new_val = (float)input[(unsigned long long)token * input_stride + ch];
+        s[0] = s[1]; s[1] = s[2]; s[2] = s[3]; s[3] = new_val;
+
+        float acc = b_val + s[0]*w_reg[0] + s[1]*w_reg[1]
+            + s[2]*w_reg[2] + s[3]*w_reg[3];
+        float sigmoid_acc = 1.0f / (1.0f + __expf(-acc));
+        __nv_bfloat16 silu_bf16 = __float2bfloat16(acc * sigmoid_acc);
+
+        if (ch < z_dim) {
+            z_output[(unsigned long long)token * z_dim + ch] =
+                z_input[(unsigned long long)token * input_stride + ch];
+        }
+
+        if (normalize) {
+            rounded[tid] = silu_bf16;
+            __syncthreads();
+
+            float sum_sq = 0.0f;
+            if (tid < 64) {
+                float v0, v1;
+                unsigned int packed = ((const unsigned int*)rounded)[tid];
+                conv_l2_unpack_bf16x2(packed, v0, v1);
+                sum_sq += v0 * v0 + v1 * v1;
+            }
+            sum_sq = conv_l2_warp_reduce_sum(sum_sq);
+
+            const unsigned int warp_id = tid / 32;
+            const unsigned int lane_id = tid % 32;
+            if (lane_id == 0) warp_sums[warp_id] = sum_sq;
+            __syncthreads();
+
+            if (warp_id == 0) {
+                float value = lane_id < 4 ? warp_sums[lane_id] : 0.0f;
+                value = conv_l2_warp_reduce_sum(value);
+                if (lane_id == 0) warp_sums[0] = value;
+            }
+            __syncthreads();
+
+            const float inv_norm = rsqrtf(warp_sums[0] + l2_eps);
+            if (tid < 64) {
+                float v0, v1;
+                unsigned int packed = ((const unsigned int*)rounded)[tid];
+                conv_l2_unpack_bf16x2(packed, v0, v1);
+                unsigned int* out32 = (unsigned int*)(
+                    output + (unsigned long long)token * output_stride + head_start
+                );
+                out32[tid] = conv_l2_pack_bf16x2(v0 * inv_norm, v1 * inv_norm);
+            }
+            __syncthreads();
+        } else {
+            output[(unsigned long long)token * output_stride + ch] = silu_bf16;
+        }
+    }
+
+    for (unsigned int k = 0; k < d_conv && k < 4; k++) {
+        state[k] = s[k];
+    }
+}
+
 // ============================================================
 // CHUNK2: Fused 2-token conv1d update + SiLU
 // ============================================================

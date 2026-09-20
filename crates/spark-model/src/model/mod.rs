@@ -41,5 +41,6 @@ pub mod ssm_pool_geometry;
 pub(crate) mod ssm_snapshot;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
+pub(crate) mod vision_embeddings;
 
 pub use types::TransformerModel;

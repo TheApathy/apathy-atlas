@@ -907,15 +907,246 @@ pub fn prefill_ffn_fast_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_FAST").ok().as_deref() != Some("0"))
 }
 
+/// Enables the repository-native FlashInfer/CUTLASS W4A4 dense-FFN prefill
+/// route on SM121.
+///
+/// The route is deliberately opt-in until the full 2K/8K/32K qualification
+/// ladder passes.  An explicit request is fail-closed: malformed values are
+/// rejected instead of being treated as disabled, and construction must later
+/// prove the native library, exact ModelOpt scale receipts, directly
+/// interleaved activation quantizer, and every layer's static operands before
+/// the first projection launches.
+pub(crate) fn parse_prefill_ffn_flashinfer(
+    value: Option<&str>,
+) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_PREFILL_FFN_FLASHINFER must be exactly 0 or 1"),
+    }
+}
+
+pub fn prefill_ffn_flashinfer_enabled() -> anyhow::Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(|| match std::env::var("ATLAS_PREFILL_FFN_FLASHINFER") {
+        Ok(value) => parse_prefill_ffn_flashinfer(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_prefill_ffn_flashinfer(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_PREFILL_FFN_FLASHINFER must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
+/// Strict, default-off admission switch for the Qwen3.8 attention prefill
+/// projection route. An explicit malformed value is an error so a requested
+/// FlashInfer run cannot silently measure the parent path.
+pub(crate) fn parse_prefill_proj_flashinfer(
+    value: Option<&str>,
+) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_PREFILL_PROJ_FLASHINFER must be exactly 0 or 1"),
+    }
+}
+
+pub fn prefill_proj_flashinfer_enabled() -> anyhow::Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(|| match std::env::var("ATLAS_PREFILL_PROJ_FLASHINFER") {
+        Ok(value) => parse_prefill_proj_flashinfer(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_prefill_proj_flashinfer(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_PREFILL_PROJ_FLASHINFER must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
+/// Strict, default-off admission switch for the Qwen3.8 SSM prefill
+/// projection family. This is deliberately distinct from the attention
+/// switch: SSM QKVZ and output require their own atomic qualification and
+/// must never be pulled into an attention-only performance experiment.
+pub(crate) fn parse_prefill_ssm_flashinfer(
+    value: Option<&str>,
+) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_PREFILL_SSM_FLASHINFER must be exactly 0 or 1"),
+    }
+}
+
+pub fn prefill_ssm_flashinfer_enabled() -> anyhow::Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(|| match std::env::var("ATLAS_PREFILL_SSM_FLASHINFER") {
+        Ok(value) => parse_prefill_ssm_flashinfer(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_prefill_ssm_flashinfer(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_PREFILL_SSM_FLASHINFER must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod prefill_ffn_flashinfer_flag_tests {
+    use super::parse_prefill_ffn_flashinfer;
+
+    #[test]
+    fn accepts_only_absent_zero_or_one() {
+        assert_eq!(parse_prefill_ffn_flashinfer(None), Ok(false));
+        assert_eq!(parse_prefill_ffn_flashinfer(Some("0")), Ok(false));
+        assert_eq!(parse_prefill_ffn_flashinfer(Some("1")), Ok(true));
+        for invalid in ["", "true", "false", "2", "01", " 1"] {
+            assert!(parse_prefill_ffn_flashinfer(Some(invalid)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefill_proj_flashinfer_flag_tests {
+    use super::parse_prefill_proj_flashinfer;
+
+    #[test]
+    fn accepts_only_absent_zero_or_one() {
+        assert_eq!(parse_prefill_proj_flashinfer(None), Ok(false));
+        assert_eq!(parse_prefill_proj_flashinfer(Some("0")), Ok(false));
+        assert_eq!(parse_prefill_proj_flashinfer(Some("1")), Ok(true));
+        for invalid in ["", "true", "false", "2", "01", " 1"] {
+            assert!(parse_prefill_proj_flashinfer(Some(invalid)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefill_ssm_flashinfer_flag_tests {
+    use super::parse_prefill_ssm_flashinfer;
+
+    #[test]
+    fn accepts_only_absent_zero_or_one() {
+        assert_eq!(parse_prefill_ssm_flashinfer(None), Ok(false));
+        assert_eq!(parse_prefill_ssm_flashinfer(Some("0")), Ok(false));
+        assert_eq!(parse_prefill_ssm_flashinfer(Some("1")), Ok(true));
+        for invalid in ["", "true", "false", "2", "01", " 1"] {
+            assert!(parse_prefill_ssm_flashinfer(Some(invalid)).is_err());
+        }
+    }
+}
+
 /// Returns true when the prefill FFN baseline path should use the cp.async
 /// double-buffered byte-exact shadow kernel (`w4a16_gemm_pipe`). Default OFF
 /// (`ATLAS_PREFILL_FFN_PIPE=1` to enable) — the pipe kernel preserves the
 /// baseline's dequant + MMA arithmetic exactly, so the route is bit-exact;
-/// it only changes the load pipeline. When the pipe kernel symbol is missing
-/// (older kernel caches) the dispatch falls back to the baseline silently.
+/// it only changes the load pipeline. When explicitly requested for an
+/// eligible shape, a missing pipe symbol fails before the gate projection so
+/// a stale kernel cache cannot silently contaminate a measured run.
 pub fn prefill_ffn_pipe_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_FFN_PIPE").ok().as_deref() == Some("1"))
+}
+
+/// Enables the Qwen3.8 large-M prefill up-projection fused epilogue.
+///
+/// This candidate is intentionally separate from `ATLAS_FFN_FUSED_GATEUP`,
+/// which controls the transposed small-M verify kernel. The prefill candidate
+/// keeps the byte-exact original-layout pipe GEMM and its BF16 up-projection
+/// round trip, but folds the following SiLU(gate)*up operation into its
+/// epilogue. Default off until Weschera hash and TTFT qualification.
+pub fn prefill_ffn_fused_epilogue_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_PREFILL_FFN_FUSED_EPILOGUE")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
+/// Enables the full Qwen3.8 large-M gate+up+SiLU prefill fusion.
+///
+/// This stricter candidate supersedes the up-only fused epilogue when both
+/// flags are set. Default off until exact-output and TTFT qualification.
+pub(crate) fn parse_prefill_ffn_dual_fused(
+    value: Option<&str>,
+) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_PREFILL_FFN_DUAL_FUSED must be exactly 0 or 1"),
+    }
+}
+
+pub fn prefill_ffn_dual_fused_enabled() -> anyhow::Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(|| match std::env::var("ATLAS_PREFILL_FFN_DUAL_FUSED") {
+        Ok(value) => parse_prefill_ffn_dual_fused(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_prefill_ffn_dual_fused(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_PREFILL_FFN_DUAL_FUSED must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod prefill_ffn_dual_fused_flag_tests {
+    use super::parse_prefill_ffn_dual_fused;
+
+    #[test]
+    fn accepts_only_absent_zero_or_one() {
+        assert_eq!(parse_prefill_ffn_dual_fused(None), Ok(false));
+        assert_eq!(parse_prefill_ffn_dual_fused(Some("0")), Ok(false));
+        assert_eq!(parse_prefill_ffn_dual_fused(Some("1")), Ok(true));
+        for invalid in ["", "true", "false", "2", "01", " 1"] {
+            assert!(parse_prefill_ffn_dual_fused(Some(invalid)).is_err());
+        }
+    }
+}
+
+/// Enables the exact large-M attention K/V dual-projection pipe candidate.
+/// Default off until output-hash and multi-length TTFT qualification.
+pub fn prefill_kv_dual_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_KV_DUAL").ok().as_deref() == Some("1"))
+}
+
+/// Enables the vectorized two-phase SSM prefill input packer.
+///
+/// QKV and gate/beta write directly to their full-sequence destinations, while
+/// the exact conv-prefill shadow copies Z inside its existing per-channel token
+/// loop. Default off for general backends; the measured Qwen3.8 launcher opts in
+/// and fails closed if its kernel bundle is stale.
+pub fn ssm_prefill_pack_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_PREFILL_PACK").ok().as_deref() == Some("1"))
+}
+
+/// Enables the exact two-phase SSM prefill conv+L2 fusion candidate.
+///
+/// This is deliberately separate from `ATLAS_SSM_PREFILL_PACK`: the latter is
+/// promoted because it only changes destinations, while this kernel must pass
+/// a live output-hash and TTFT gate despite reproducing the BF16 materialized
+/// value and reduction tree in shared memory. Default off.
+pub fn ssm_prefill_conv_l2_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_PREFILL_CONV_L2").ok().as_deref() == Some("1"))
+}
+
+/// Enables the exact C=1 WY32 gate-product cache candidate.
+///
+/// The current WY32 path is retained as the default. This shadow only moves
+/// thread-invariant FP32 gate products into the unused half of the existing
+/// shared matrix. It also batches the parent's four exact warp partials for
+/// all 496 K-dot pairs, collapsing 1,488 pair-local CTA barriers to two
+/// chunk-wide barriers. It must pass live output-hash and TTFT qualification.
+pub fn gdn_prefill_gatecache_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_GDN_PREFILL_GATECACHE").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when the prefill projection non-transposed fallback routes
@@ -929,11 +1160,71 @@ pub fn prefill_ffn_pipe_enabled() -> bool {
 /// byte-exact shadow (same dequant arithmetic, same m16n8k16 MMA order, only
 /// the cp.async load pipeline differs), so routing these projections through
 /// it preserves exactness while removing the per-layer latency floor.
-/// Default off; the projection dispatch falls back to the baseline when the
-/// handle is missing.
+/// Default off. An explicitly requested, geometrically eligible original-layout
+/// route fails before projection when the pipe symbol is missing; disabled or
+/// incompatible routes retain the baseline.
 pub fn prefill_proj_pipe_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_PREFILL_PROJ_PIPE").ok().as_deref() == Some("1"))
+}
+
+/// Pure selector for an original-layout NVFP4 prefill projection.
+///
+/// Keeping `Missing` distinct from `Ineligible` prevents a stale kernel cache
+/// from silently turning an explicitly measured pipe route into the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefillProjectionPipeRoute {
+    Disabled,
+    Ineligible,
+    Complete,
+    Missing,
+}
+
+pub(crate) const fn prefill_projection_pipe_route(
+    requested: bool,
+    reduction: u32,
+    has_kernel: bool,
+) -> PrefillProjectionPipeRoute {
+    if !requested {
+        return PrefillProjectionPipeRoute::Disabled;
+    }
+    if reduction == 0 || !reduction.is_multiple_of(64) {
+        return PrefillProjectionPipeRoute::Ineligible;
+    }
+    if has_kernel {
+        PrefillProjectionPipeRoute::Complete
+    } else {
+        PrefillProjectionPipeRoute::Missing
+    }
+}
+
+#[cfg(test)]
+mod prefill_projection_pipe_route_tests {
+    use super::{PrefillProjectionPipeRoute as Route, prefill_projection_pipe_route};
+
+    #[test]
+    fn distinguishes_disabled_ineligible_complete_and_missing() {
+        assert_eq!(
+            prefill_projection_pipe_route(false, 5120, false),
+            Route::Disabled
+        );
+        assert_eq!(
+            prefill_projection_pipe_route(true, 0, false),
+            Route::Ineligible
+        );
+        assert_eq!(
+            prefill_projection_pipe_route(true, 5119, false),
+            Route::Ineligible
+        );
+        assert_eq!(
+            prefill_projection_pipe_route(true, 5120, true),
+            Route::Complete
+        );
+        assert_eq!(
+            prefill_projection_pipe_route(true, 5120, false),
+            Route::Missing
+        );
+    }
 }
 
 /// Returns true when the attention AND SSM prefill projection transposed-TC
@@ -1005,6 +1296,55 @@ pub fn prefill_ffn_e2m1_enabled() -> bool {
 pub fn prefill_ffn_e2m1_down_only_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_E2M1_GEMM_DOWN_ONLY").ok().as_deref() == Some("1"))
+}
+
+/// Selects the K-major M=128 native W4A4 prefill kernel.
+///
+/// `ATLAS_E2M1_KMAJOR=1` is an implementation refinement of the default-off
+/// full/down-only W4A4 experiments, not a standalone quantization mode. It
+/// consumes the already-retained `QuantizedWeight::transpose_for_gemm`
+/// buffers (`[K/2,N]` packed values and `[K/16,N]` scales), stages one weight
+/// tile for 128 prompt rows, and preserves the parent W4A4 OMMA/epilogue
+/// arithmetic. This addresses the row-major kernel's measured wide gate/up
+/// weight-bandwidth regression. The prefill dispatch fails closed when an
+/// eligible explicit request lacks the transformed weights or kernel symbol.
+///
+/// Default off pending canonical Weschera parity and multi-length TTFT timing.
+pub fn prefill_ffn_e2m1_kmajor_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_E2M1_KMAJOR").ok().as_deref() == Some("1"))
+}
+
+/// Selects the sixteen-warp K-major M=256 long-prefill shadow.
+///
+/// `ATLAS_E2M1_KMAJOR_M256=1` refines `ATLAS_E2M1_KMAJOR=1`; it never
+/// enables W4A4 or transformed weights by itself. The 512-thread kernel keeps
+/// the M128 path's sixteen resident warps per SM while sharing one K-major
+/// weight tile across 256 rows. Dispatch starts at M=2048 so the smaller down
+/// projection still exposes enough CTAs to fill all GB10 SMs. Shorter inputs
+/// retain the M128 K-major kernel.
+///
+/// Default off pending bitwise M128 parity and 2K/8K/32K timing.
+pub fn prefill_ffn_e2m1_kmajor_m256_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_E2M1_KMAJOR_M256").ok().as_deref() == Some("1"))
+}
+
+/// Fuse the SwiGLU activation boundary into down-input NVFP4 quantization.
+///
+/// `ATLAS_E2M1_SILU_QUANT=1` is valid only with a full or down-only W4A4
+/// prefill route plus `ATLAS_E2M1_STATIC_SCALE=1`. The fused kernel computes
+/// SiLU(gate)*up, rounds through BF16 exactly where the standalone activation
+/// kernel writes its output, then quantizes those rounded values directly to
+/// packed E2M1 and E4M3 group scales. This removes the temporary BF16 down
+/// input's global write/read and one launch while retaining the existing W4A4
+/// arithmetic contract. Eligible explicit requests fail closed on non-SiLU
+/// models or stale kernel caches.
+///
+/// Default off pending canonical Weschera quality and multi-length TTFT gates.
+pub fn prefill_ffn_e2m1_silu_quant_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_E2M1_SILU_QUANT").ok().as_deref() == Some("1"))
 }
 
 /// Returns true when `ATLAS_FFN_M128_V2=1` is set in the process env.

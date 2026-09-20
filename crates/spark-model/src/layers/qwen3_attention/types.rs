@@ -10,6 +10,8 @@ use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
 
+use super::yarn::YarnRopeParams;
+
 /// MLA (Multi-head Latent Attention) weight components for 2-step decode.
 ///
 /// Instead of a single Q GEMV: `input × Q_expanded → Q[n_heads*hd]`,
@@ -73,6 +75,10 @@ pub struct Qwen3AttentionLayer {
     /// Whether this layer should apply MRoPE-interleaved instead of scalar
     /// RoPE. Set when `config.mrope_interleaved = true` (Qwen3.6).
     pub(crate) mrope_interleaved: bool,
+    /// Static YaRN parameters resolved once from the model contract.
+    /// Qwen3.8 uses these with the interleaved-MRoPE kernel; `None` keeps
+    /// the native 262K RoPE path byte-for-byte unchanged.
+    pub(crate) yarn: Option<YarnRopeParams>,
     /// Per-layer dimension overrides for heterogeneous models (Gemma-4).
     pub(crate) head_dim_override: Option<usize>,
     pub(crate) num_q_heads_override: Option<usize>,
@@ -129,6 +135,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) k_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) v_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
     pub(super) o_fp8w_t: Option<crate::weight_map::Fp8WeightTransposed>,
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub(super) flashinfer_projection_prefill:
+        Option<super::prefill::flashinfer_projection::FlashinferAttentionProjectionPrefill>,
     pub(super) w8a16_gemm_t_k: KernelHandle,
     // Kernels — decode (GEMV M=1)
     pub(super) rms_norm_k: KernelHandle,
@@ -140,6 +149,10 @@ pub struct Qwen3AttentionLayer {
     /// Exact K1-order gated-Q + dual-KV M17 kernels. The pair is atomic:
     /// either missing handle sends the whole QKV phase to ordinary K1 rows.
     pub(super) w4a16_exact_qkv_kernels: crate::layers::ops::W4a16ExactAttentionKernels,
+    /// Default-off, ABI-separate M17 activation-staging QG + dual-KV pair.
+    /// Both handles must exist before the experimental route can engage.
+    pub(super) w4a16_exact_qkv_m17_astage_kernels:
+        crate::layers::ops::W4a16ExactAttentionM17AStageKernels,
     /// Exact row-major multi-row W4 GEMV used by NVFP4 attention O-proj.
     /// Missing selected tiers fail closed to independent ordinary K1 rows.
     pub(super) w4a16_exact_o_proj_kernels: crate::layers::ops::W4a16ExactLmHeadKernels,
@@ -155,6 +168,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) rope_k: KernelHandle,
     /// MRoPE-interleaved kernel.
     pub(super) rope_mrope_interleaved_k: KernelHandle,
+    /// MRoPE-interleaved kernel with HF-compatible static YaRN frequencies.
+    pub(super) rope_mrope_interleaved_yarn_k: KernelHandle,
     /// Batched per-token-strided RoPE for multi-seq K=3 path
     /// (`ATLAS_ATTN_QKV_MEGA=1`). Optional — `try_kernel` so older builds
     /// without the kernel still load.
@@ -287,6 +302,10 @@ pub struct Qwen3AttentionLayer {
     /// kernel is latency-bound at small M (~21 GB/s), the pipe lands near the
     /// decode kernels' ~190 GB/s. Handle 0 falls back to the baseline.
     pub(super) w4a16_gemm_pipe_k: KernelHandle,
+    /// Exact dual original-layout pipe kernel. The opt-in large-M prefill path
+    /// uses it to project K and V from one A load while preserving two BF16
+    /// outputs. Missing symbols fail the explicit route closed.
+    pub(super) w4a16_gemm_pipe_dual_k: KernelHandle,
     pub(super) w4a16_gemm_t_k: KernelHandle,
     pub(super) w4a16_gemm_t_k64_k: KernelHandle,
     pub(super) w4a16_gemm_t_m128_k: KernelHandle,
@@ -319,6 +338,8 @@ pub struct Qwen3AttentionLayer {
     /// HDIM=512 paged prefill (BF16 KV) for Gemma-4 chunked long-context prefill
     pub(super) prefill_attn_paged_512_k: KernelHandle,
     pub(super) prefill_attn_64_k: KernelHandle,
+    /// Default-off exact chunk-0 BR64 attention + sigmoid-gate epilogue.
+    pub(super) prefill_attn_64_gate_fused_k: KernelHandle,
     /// HDIM=128 contiguous prefill — BR=32 (MLA unabsorbed prefill, head_dim=128)
     pub(super) prefill_attn_128_k: KernelHandle,
     /// HDIM=128 contiguous prefill — BR=64 (MLA unabsorbed prefill, seq_len>=256)
@@ -331,6 +352,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) prefill_attn_paged_64_k: KernelHandle,
     pub(super) prefill_attn_paged_fp8_64_k: KernelHandle,
     pub(super) prefill_attn_paged_nvfp4_64_k: KernelHandle,
+    /// Default-off NVFP4 HDIM=256 BR=128 exact shadow (512 threads).
+    pub(super) prefill_attn_paged_nvfp4_128_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo2_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo3_64_k: KernelHandle,
     pub(super) prefill_attn_paged_turbo4_64_k: KernelHandle,
@@ -366,6 +389,8 @@ pub struct Qwen3AttentionLayer {
     // Batched prefill kernels
     pub(super) deinterleave_qg_split_k: KernelHandle,
     pub(super) deinterleave_qg_split_qnorm_k: KernelHandle,
+    /// Exact Qwen3.8 C=1 prefill Q/G + Q/K norm + interleaved-MRoPE fusion.
+    pub(super) qwen38_prefill_qknorm_rope_k: KernelHandle,
     pub(super) sigmoid_gate_mul_batched_k: KernelHandle,
     // Pre-dequanted FP8 weights for zero-overhead prefill GEMMs
     pub(super) q_fp8: Option<DevicePtr>,

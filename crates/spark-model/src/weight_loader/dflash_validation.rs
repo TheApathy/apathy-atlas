@@ -11,6 +11,7 @@ use self::config::{Dimensions, validate_config};
 use super::dflash_loader::DflashConfig;
 
 mod config;
+mod qwen38_dflash2;
 
 #[derive(Clone, Copy)]
 struct TensorMetadata<'a> {
@@ -63,9 +64,14 @@ fn validate_dflash_metadata(
         (false, false) => return Ok(None),
     };
 
-    let dimensions = validate_config(config)?;
+    let strict_qwen38_dflash2 =
+        config::declares_qwen38_dflash2(config) || qwen38_dflash2::has_tensor_signature(source);
+    let dimensions = validate_config(config, strict_qwen38_dflash2)?;
     validate_layer_indices(source, prefix, config.num_hidden_layers)?;
     validate_required_tensors(source, prefix, config, dimensions)?;
+    if strict_qwen38_dflash2 {
+        qwen38_dflash2::validate_official_tensors(source, prefix, config, dimensions)?;
+    }
     validate_markov_tensors(source, prefix, config)?;
     validate_confidence_tensors(source, prefix, config)?;
     Ok(Some(prefix))
@@ -271,3 +277,7 @@ fn validate_confidence_tensors(
 #[cfg(test)]
 #[path = "dflash_validation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dflash_validation/qwen38_dflash2_tests.rs"]
+mod qwen38_dflash2_tests;

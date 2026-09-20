@@ -363,6 +363,193 @@ DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT(
 #undef DEFINE_W4A16_GEMV_BATCH_LOGITS_EXACT
 
 // ============================================================
+// W4A16 exact M17 GEMV with CTA-cooperative activation staging.
+// ============================================================
+//
+// ABI-separated, default-unrouted twin of
+// `w4a16_gemv_batch_logits_exact_m17`.  The parent assigns four independent
+// 64-thread groups to four output rows.  Those groups request the same BF16 A
+// tile four times.  This twin publishes each 64-K16 (1024-column) A wave once
+// to shared memory, then lets all four groups consume the identical raw BF16
+// words.  Weight loads and every arithmetic boundary remain parent-exact:
+//
+//   * k16 = wave*64 + lane, preserving ordinary K1 ownership;
+//   * b=0..7 low then high FP32 updates;
+//   * the five-step warp shuffle tree and ordered two-warp add;
+//   * one final FP32-to-BF16 conversion per output element.
+//
+// Both barriers in the wave loop are block-unconditional.  Invalid N-tail
+// groups participate in publication and overwrite protection but form no
+// weight/output addresses.  Partial final waves publish/read only valid K16
+// chunks.  Shared footprint at MAX_M=17 is 34,816 B of raw A plus 64 B LUT and
+// 544 B reduction storage = 35,424 B.
+
+static constexpr unsigned int ASTAGE_K16_PER_WAVE = 64u;
+static constexpr unsigned int ASTAGE_U4_PER_K16 = 2u;
+static constexpr unsigned int ASTAGE_U4_PER_ROW =
+    ASTAGE_K16_PER_WAVE * ASTAGE_U4_PER_K16;
+
+__device__ __forceinline__ void w4a16_gemv_batch_logits_exact_m17_astage_body(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    float* s_lut,
+    float* smem,
+    uint4* s_a)
+{
+    constexpr unsigned int MAX_M = 17u;
+    const unsigned int threads_per_out = BLOCK_SIZE / N_PER_BLOCK;  // 64
+    const unsigned int local_out = threadIdx.x / threads_per_out;
+    const unsigned int lane = threadIdx.x % threads_per_out;
+    const unsigned int warp_lane = lane % WARP_SIZE;
+    const unsigned int warp_idx = lane / WARP_SIZE;
+    const unsigned int n = blockIdx.x * N_PER_BLOCK + local_out;
+    const bool rows_valid = M > 0 && M <= MAX_M;
+    const bool valid = rows_valid && n < N;
+
+    if (threadIdx.x < 16) s_lut[threadIdx.x] = E2M1_LUT[threadIdx.x];
+    __syncthreads();
+
+    float acc[MAX_M];
+    #pragma unroll
+    for (int row = 0; row < (int)MAX_M; ++row) acc[row] = 0.0f;
+
+    const unsigned int half_K = K / 2;
+    const unsigned int num_groups = K / GROUP_SIZE;
+    const unsigned int K16 = K / 16;
+
+    for (unsigned int wave = 0; wave < K16; wave += ASTAGE_K16_PER_WAVE) {
+        const unsigned int wave_k16 =
+            min(ASTAGE_K16_PER_WAVE, K16 - wave);
+
+        // Publish raw BF16 words only.  The fixed row stride makes every
+        // consumer's shared address independent of a partial final wave.
+        for (unsigned int slot = threadIdx.x;
+             slot < MAX_M * ASTAGE_U4_PER_ROW;
+             slot += BLOCK_SIZE) {
+            const unsigned int row = slot / ASTAGE_U4_PER_ROW;
+            const unsigned int row_slot = slot % ASTAGE_U4_PER_ROW;
+            const unsigned int local_k16 = row_slot / ASTAGE_U4_PER_K16;
+            const unsigned int half = row_slot % ASTAGE_U4_PER_K16;
+            if (rows_valid && row < M && local_k16 < wave_k16) {
+                const uint4* __restrict__ A_row =
+                    (const uint4*)(A + (unsigned long long)row * K);
+                s_a[slot] =
+                    A_row[(wave + local_k16) * ASTAGE_U4_PER_K16 + half];
+            }
+        }
+        __syncthreads();  // publication: unconditional for every CTA thread
+
+        if (valid && lane < wave_k16) {
+            const unsigned int k16 = wave + lane;
+            const unsigned int base_k = k16 * 16;
+            const unsigned long long weight_row =
+                (unsigned long long)n * half_K;
+            const unsigned long long scale_row =
+                (unsigned long long)n * num_groups;
+            const unsigned long long packed8 =
+                *(const unsigned long long*)(B_packed + weight_row + k16 * 8);
+
+            const unsigned int scale_group = base_k / GROUP_SIZE;
+            const unsigned char scale_byte = B_scale[scale_row + scale_group];
+            __nv_fp8_e4m3 fp8;
+            *(unsigned char*)&fp8 = scale_byte;
+            const float scale = (float)fp8 * scale2;
+
+            float w_lo[8];
+            float w_hi[8];
+            #pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const unsigned char byte_val =
+                    (unsigned char)(packed8 >> (b * 8));
+                w_lo[b] = s_lut[byte_val & 0xF] * scale;
+                w_hi[b] = s_lut[byte_val >> 4] * scale;
+            }
+
+            #pragma unroll
+            for (int row = 0; row < (int)MAX_M; ++row) {
+                if ((unsigned int)row < M) {
+                    const unsigned int a_base =
+                        (unsigned int)row * ASTAGE_U4_PER_ROW
+                        + lane * ASTAGE_U4_PER_K16;
+                    const uint4 a_lo = s_a[a_base];
+                    const uint4 a_hi = s_a[a_base + 1];
+                    const unsigned int a_raw[8] = {
+                        a_lo.x, a_lo.y, a_lo.z, a_lo.w,
+                        a_hi.x, a_hi.y, a_hi.z, a_hi.w
+                    };
+
+                    #pragma unroll
+                    for (int b = 0; b < 8; ++b) {
+                        __nv_bfloat16 a_lo_bf, a_hi_bf;
+                        *(unsigned short*)&a_lo_bf =
+                            (unsigned short)(a_raw[b] & 0xFFFF);
+                        *(unsigned short*)&a_hi_bf =
+                            (unsigned short)(a_raw[b] >> 16);
+                        acc[row] += __bfloat162float(a_lo_bf) * w_lo[b];
+                        acc[row] += __bfloat162float(a_hi_bf) * w_hi[b];
+                    }
+                }
+            }
+        }
+
+        // No CTA may overwrite the shared A wave while another output group
+        // is still consuming it.  N-tail groups participate as well.
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int row = 0; row < (int)MAX_M; ++row) {
+        if ((unsigned int)row < M) {
+            #pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                acc[row] += __shfl_down_sync(0xFFFFFFFF, acc[row], offset);
+            }
+            if (warp_lane == 0) {
+                smem[(row * N_PER_BLOCK + local_out) * 2 + warp_idx] =
+                    acc[row];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (valid && lane == 0) {
+        #pragma unroll
+        for (int row = 0; row < (int)MAX_M; ++row) {
+            if ((unsigned int)row < M) {
+                const unsigned int base =
+                    (row * N_PER_BLOCK + local_out) * 2;
+                C[(unsigned long long)row * N + n] =
+                    __float2bfloat16(smem[base] + smem[base + 1]);
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void w4a16_gemv_batch_logits_exact_m17_astage(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ B_packed,
+    const unsigned char* __restrict__ B_scale,
+    const float scale2,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K)
+{
+    __shared__ float s_lut[16];
+    __shared__ float smem[17 * N_PER_BLOCK * 2];
+    __shared__ __align__(16) uint4 s_a[17 * ASTAGE_U4_PER_ROW];
+    w4a16_gemv_batch_logits_exact_m17_astage_body(
+        A, B_packed, B_scale, scale2, C, M, N, K, s_lut, smem, s_a);
+}
+
+// ============================================================
 // W4A16 GEMV — SINGLE-WARP-PER-OUTPUT variant (lossless; default ON,
 // kill with ATLAS_NO_GEMV_SW=1).
 //

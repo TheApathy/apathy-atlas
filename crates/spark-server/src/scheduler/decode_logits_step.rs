@@ -278,6 +278,21 @@ pub fn process_decode_logits(
                     a.force_end_thinking = true;
                     tracing::info!("Thinking budget exhausted ({budget} tokens), forcing </think>");
                 }
+                // Structural control-token attractor. Unlike the broad
+                // phrase-loop watchdog, this remains enabled for quality
+                // profiles: repeated ChatML role openers are never valid
+                // reasoning content, while prose/code repetition can be.
+                if !a.force_end_thinking
+                    && im_start_hard_stop().is_some_and(|im_start| {
+                        detect_chatml_thinking_cycle(&a.output_tokens, Some(tok), im_start)
+                    })
+                {
+                    a.force_end_thinking = true;
+                    tracing::warn!(
+                        thinking_tokens = a.thinking_tokens,
+                        "ChatML control-token cycle detected during thinking; forcing </think>"
+                    );
+                }
                 // Token-level fence-loop detection. Catches the Qwen3.5-35B
                 // phrase attractor (`Running:\`\`\`bash cmd\`\`\`Executing:…`
                 // cycling) within ~24-60 tokens of the loop starting,

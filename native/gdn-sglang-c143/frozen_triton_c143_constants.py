@@ -1,0 +1,217 @@
+"""Frozen constants for the CPU-only Triton c143 oracle gate."""
+
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_MANIFEST = HERE / "frozen_triton_c143_manifest.json"
+EXPECTED_MANIFEST_SHA256 = (
+    "ecfa82b3f09651619953b8181f3e60bd613748d5e051cc2ee6c43d5874c61661"
+)
+UINT64_MAX = (1 << 64) - 1
+SUPPORTED_M = (2_079, 8_192)
+WORKSPACE_ALIGNMENT = 256
+POINTER_ALIGNMENT = 16
+
+EXPECTED_GEOMETRY = {
+    "batch": 1,
+    "key_heads": 16,
+    "value_heads": 48,
+    "key_dim": 128,
+    "value_dim": 128,
+    "chunk": 64,
+    "q_width_bf16": 2_048,
+    "k_width_bf16": 2_048,
+    "v_width_bf16": 6_144,
+    "atlas_qkv_row_stride_bf16": 10_240,
+    "atlas_qkv_offsets_bf16": [0, 2_048, 4_096],
+    "atlas_gate_beta_row_stride_f32": 96,
+    "atlas_gate_beta_offsets_f32": [0, 48],
+    "atlas_state_layout": "H,K,V",
+    "triton_state_layout": "N,H,V,K",
+    "pointer_alignment": POINTER_ALIGNMENT,
+    "workspace_alignment": WORKSPACE_ALIGNMENT,
+}
+
+EXPECTED_SEQUENCE = [
+    "adapter_qkv_split",
+    "adapter_alpha_log_beta_split",
+    "adapter_state_hkv_to_hvk",
+    "memset_A_zero",
+    "memset_output_zero",
+    "chunk_local_cumsum_scalar_kernel",
+    "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+    "recompute_w_u_fwd_kernel",
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+    "chunk_fwd_kernel_o",
+    "adapter_state_hvk_to_hkv",
+    "completion_marker",
+]
+
+KERNEL_CONTRACTS = {
+    "cumsum": {
+        "dir": "N5Z6QMT3PX3KZXYSAYX75DRABTDASWQXND3DY4AYHY5IWVNAUSRQ",
+        "function": "chunk_local_cumsum_scalar_kernel",
+        "semantic": [
+            "g_log_f32",
+            "g_cumsum_f32",
+            "cu_seqlens_i32",
+            "chunk_indices_i32",
+            "T_i32",
+        ],
+        "driver": ["u64", "u64", "u64", "u64", "u32", "u64", "u64"],
+        "grid": ["NT", 48, 1],
+        "block": [256, 1, 1],
+        "shared": 8,
+        "registers": 18,
+        "stages": 3,
+        "warps": 8,
+    },
+    "kkt_bc16_solve": {
+        "dir": "5PWPRAGLSBHYVO54HQIWYJGDRDVYXWKSFIEJBI5ZAPTL55BVE5NQ",
+        "function": "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+        "semantic": [
+            "k_bf16",
+            "g_cumsum_f32",
+            "beta_f32",
+            "A_bf16",
+            "cu_seqlens_i32",
+            "chunk_indices_i32",
+            "T_i32",
+        ],
+        "driver": [
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u32",
+            "u64",
+            "u64",
+        ],
+        "grid": ["NT", 48, 1],
+        "block": [32, 1, 1],
+        "shared": 7_168,
+        "registers": 246,
+        "stages": 3,
+        "warps": 1,
+    },
+    "recompute_w_u": {
+        "dir": "CWPIHJJSBWG2DJ6LH3ZV3IDYTL2P6G64V6I4Y6NL55TILJM5S3DA",
+        "function": "recompute_w_u_fwd_kernel",
+        "semantic": [
+            "k_bf16",
+            "v_bf16",
+            "beta_f32",
+            "w_bf16",
+            "u_bf16",
+            "A_bf16",
+            "g_cumsum_f32",
+            "cu_seqlens_i32",
+            "chunk_indices_i32",
+            "T_i32",
+        ],
+        "driver": [
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u32",
+            "u64",
+            "u64",
+        ],
+        "grid": ["NT", 48, 1],
+        "block": [128, 1, 1],
+        "shared": 28_672,
+        "registers": 167,
+        "stages": 3,
+        "warps": 4,
+    },
+    "chunk_recurrence_state": {
+        "dir": "Q6BG3XVEHV2GEILZO5FGGEKKN2HU3PX44NLAPUIEBZEUO6RKX5WQ",
+        "function": "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+        "semantic": [
+            "k_bf16",
+            "u_bf16",
+            "w_bf16",
+            "v_new_bf16",
+            "g_cumsum_f32",
+            "h_bf16",
+            "initial_state_hvk_f32",
+            "state_index_i32",
+            "stride_init_state_i32",
+            "cu_seqlens_i32",
+            "chunk_offsets_i64",
+            "T_i32",
+        ],
+        "driver": [
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u32",
+            "u64",
+            "u64",
+            "u32",
+            "u64",
+            "u64",
+        ],
+        "grid": [4, 48, 1],
+        "block": [128, 1, 1],
+        "shared": 41_220,
+        "registers": 168,
+        "stages": 2,
+        "warps": 4,
+    },
+    "output": {
+        "dir": "KTFBEMQNV7CPTR5VWT4OH2W5U4AWJVLJ2QV3CEDL433KBK2JBWNA",
+        "function": "chunk_fwd_kernel_o",
+        "semantic": [
+            "q_bf16",
+            "k_bf16",
+            "v_new_bf16",
+            "h_bf16",
+            "g_cumsum_f32",
+            "output_bf16",
+            "cu_seqlens_i32",
+            "chunk_indices_i32",
+            "scale_f32",
+            "T_i32",
+        ],
+        "driver": [
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "u64",
+            "f32",
+            "u32",
+            "u64",
+            "u64",
+        ],
+        "grid": [2, "NT", 48],
+        "block": [128, 1, 1],
+        "shared": 18_432,
+        "registers": 150,
+        "stages": 2,
+        "warps": 4,
+    },
+}
+
+STAGE_NAMES = "adapter_qkv_split adapter_alpha_log_beta_split adapter_state_hkv_to_hvk memset_A_zero memset_output_zero g_cumsum A w u h v_new output adapter_state_hvk_to_hkv".split()
+FINITE_NAMES = "g_cumsum A w u h v_new output state_hkv".split()
+IMMUTABLE_NAMES = "atlas_qkv_bf16 atlas_gate_beta_f32 cu_seqlens_i32 state_index_i32 chunk_indices_i32 chunk_offsets_i64".split()
+CANARY_REGIONS = "atlas_qkv_bf16 atlas_gate_beta_f32 atlas_state_hkv_f32 output_bf16 workspace".split()
+ADAPTER_CHECKS = "q_split_bytes_exact k_split_bytes_exact v_split_bytes_exact beta_split_bytes_exact log_gate_formula_exact state_in_transpose_exact state_out_transpose_exact metadata_values_exact A_zero_before_kkt output_zero_before_output_kernel same_nondefault_stream all_extents_nonalias workspace_padding_unchanged".split()

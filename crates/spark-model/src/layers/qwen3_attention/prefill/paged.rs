@@ -10,6 +10,11 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::{BatchedAttnMetadata, ForwardContext};
 use crate::layers::ops;
 
+use super::{
+    Qwen38QkNormRopeRoute, mark_qwen38_qknorm_rope_paged_engaged, qwen38_qknorm_rope_requested,
+    qwen38_qknorm_rope_route,
+};
+
 impl Qwen3AttentionLayer {
     pub(in crate::layers::qwen3_attention) fn prefill_attention_paged(
         &self,
@@ -45,6 +50,13 @@ impl Qwen3AttentionLayer {
         let q_dim = (nq * hd) as usize;
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim };
         let kv_dim = (nkv * hd) as usize;
+        let qknorm_rope_requested = qwen38_qknorm_rope_requested()?;
+        if self.yarn.is_some() && qknorm_rope_requested {
+            anyhow::bail!(
+                "ATLAS_PREFILL_QKNORM_ROPE=1 is incompatible with YaRN; \
+                 use rope_forward_mrope_interleaved_yarn"
+            );
+        }
 
         // Q12 Path B: batched mode does not support MLA layers (separate
         // KV layout). Caller must gate this out at the outer dispatch.
@@ -93,111 +105,187 @@ impl Qwen3AttentionLayer {
         let k_contiguous = ctx.buffers.ssm_qkvz();
         let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         let q_contiguous = ctx.buffers.ssm_deinterleaved();
-        if self.gated && !self.attn.q_norm.weight.is_null() {
-            // Fused deinterleave + Q norm: eliminates Q global memory round-trip
-            ops::deinterleave_qg_split_qnorm(
-                ctx.gpu,
-                self.deinterleave_qg_split_qnorm_k,
-                qg_out,
-                q_contiguous,
-                self.attn.q_norm.weight,
-                n,
-                nq,
-                hd,
-                q_proj_dim as u32,
-                eps,
-                stream,
-            )?;
-        } else if self.gated {
-            ops::deinterleave_qg_split(
-                ctx.gpu,
-                self.deinterleave_qg_split_k,
-                qg_out,
-                q_contiguous,
-                n,
-                nq,
-                hd,
-                q_proj_dim as u32,
-                stream,
-            )?;
-        } else if let Some(mla_ref) = self.mla.as_ref() {
-            // MLA: swap Q from [nope|rope] to [rope|nope] per head so RoPE rotates correct dims
-            let mla_nope_sz = mla_ref.nope;
-            let mla_rope_sz = mla_ref.rope;
-            for t in 0..num_tokens {
-                for head_idx in 0..nq as usize {
-                    let src = qg_out.offset((t * q_dim + head_idx * hd as usize) * bf16);
-                    let dst = q_contiguous.offset((t * q_dim + head_idx * hd as usize) * bf16);
-                    ctx.gpu.copy_d2d_async(
-                        src.offset(mla_nope_sz * bf16),
-                        dst,
-                        mla_rope_sz * bf16,
+        let rotary_dim = self
+            .rotary_dim_override
+            .unwrap_or(ctx.config.rotary_dim() as u32);
+        let rope_theta = self
+            .rope_theta_override
+            .unwrap_or(ctx.config.rope_theta as f32);
+        let exact_qwen38_dense = ctx.config.model_type == "qwen3_5"
+            && ctx.config.num_experts == 0
+            && ctx.config.hidden_size == 5120
+            && ctx.config.tp_world_size.max(1) == 1
+            && ctx.config.mrope_section == [11, 11, 10];
+        let qknorm_rope_route = qwen38_qknorm_rope_route(
+            qknorm_rope_requested,
+            exact_qwen38_dense && self.yarn.is_none(),
+            batched_meta.is_none()
+                && ctx
+                    .attn_metadata
+                    .is_some_and(|metadata| metadata.num_seqs == 1),
+            self.mla.is_none(),
+            self.gated,
+            !self.attn.q_norm.weight.is_null(),
+            !self.attn.k_norm.weight.is_null(),
+            self.attn.q_norm_full.is_none() && self.attn.k_norm_full.is_none(),
+            self.v_norm_weight.is_none(),
+            self.mrope_interleaved,
+            self.rope_proportional,
+            n,
+            nq,
+            nkv,
+            hd,
+            q_proj_dim as u32,
+            rotary_dim,
+            rope_theta.is_finite() && rope_theta > 0.0,
+            self.rope_mrope_interleaved_k.0 != 0,
+            self.qwen38_prefill_qknorm_rope_k.0 != 0,
+        );
+        let qknorm_rope_fused = match qknorm_rope_route {
+            Qwen38QkNormRopeRoute::Complete => {
+                let fused_meta = ctx.attn_metadata.expect("selector requires C=1 metadata");
+                ops::qwen38_prefill_qknorm_rope(
+                    ctx.gpu,
+                    self.qwen38_prefill_qknorm_rope_k,
+                    qg_out,
+                    q_contiguous,
+                    k_contiguous,
+                    self.attn.q_norm.weight,
+                    self.attn.k_norm.weight,
+                    fused_meta.positions,
+                    fused_meta.positions_h,
+                    fused_meta.positions_w,
+                    n,
+                    nq,
+                    nkv,
+                    hd,
+                    q_proj_dim as u32,
+                    rotary_dim,
+                    eps,
+                    rope_theta,
+                    stream,
+                )?;
+                mark_qwen38_qknorm_rope_paged_engaged();
+                true
+            }
+            Qwen38QkNormRopeRoute::Missing => {
+                anyhow::bail!(
+                    "ATLAS_PREFILL_QKNORM_ROPE=1 selected eligible Qwen3.8 prefill, \
+                     but qwen38_prefill_qknorm_rope is missing; rebuild the kernel \
+                     bundle before measuring"
+                )
+            }
+            Qwen38QkNormRopeRoute::Disabled | Qwen38QkNormRopeRoute::Ineligible => false,
+        };
+        if !qknorm_rope_fused {
+            if self.gated && !self.attn.q_norm.weight.is_null() {
+                // Fused deinterleave + Q norm: eliminates Q global memory round-trip
+                ops::deinterleave_qg_split_qnorm(
+                    ctx.gpu,
+                    self.deinterleave_qg_split_qnorm_k,
+                    qg_out,
+                    q_contiguous,
+                    self.attn.q_norm.weight,
+                    n,
+                    nq,
+                    hd,
+                    q_proj_dim as u32,
+                    eps,
+                    stream,
+                )?;
+            } else if self.gated {
+                ops::deinterleave_qg_split(
+                    ctx.gpu,
+                    self.deinterleave_qg_split_k,
+                    qg_out,
+                    q_contiguous,
+                    n,
+                    nq,
+                    hd,
+                    q_proj_dim as u32,
+                    stream,
+                )?;
+            } else if let Some(mla_ref) = self.mla.as_ref() {
+                // MLA: swap Q from [nope|rope] to [rope|nope] per head so RoPE rotates correct dims
+                let mla_nope_sz = mla_ref.nope;
+                let mla_rope_sz = mla_ref.rope;
+                for t in 0..num_tokens {
+                    for head_idx in 0..nq as usize {
+                        let src = qg_out.offset((t * q_dim + head_idx * hd as usize) * bf16);
+                        let dst = q_contiguous.offset((t * q_dim + head_idx * hd as usize) * bf16);
+                        ctx.gpu.copy_d2d_async(
+                            src.offset(mla_nope_sz * bf16),
+                            dst,
+                            mla_rope_sz * bf16,
+                            stream,
+                        )?;
+                        ctx.gpu.copy_d2d_async(
+                            src,
+                            dst.offset(mla_rope_sz * bf16),
+                            mla_nope_sz * bf16,
+                            stream,
+                        )?;
+                    }
+                }
+            } else {
+                ctx.gpu
+                    .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)?;
+                if let Some(ref q_norm_full) = self.attn.q_norm_full {
+                    // MiniMax: single RMS over full `[nq*hd]` per token
+                    // (rows=n, cols=nq*hd). Mistral/DeepSeek MLA models
+                    // never reach this branch — they early-return above.
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_k,
+                        q_contiguous,
+                        q_norm_full,
+                        q_contiguous,
+                        n,
+                        nq * hd,
+                        eps,
                         stream,
                     )?;
-                    ctx.gpu.copy_d2d_async(
-                        src,
-                        dst.offset(mla_rope_sz * bf16),
-                        mla_nope_sz * bf16,
+                } else if !self.attn.q_norm.weight.is_null() {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_k,
+                        q_contiguous,
+                        &self.attn.q_norm,
+                        q_contiguous,
+                        nq * n,
+                        hd,
+                        eps,
                         stream,
                     )?;
                 }
             }
-        } else {
-            ctx.gpu
-                .copy_d2d_async(qg_out, q_contiguous, num_tokens * q_dim * bf16, stream)?;
-            if let Some(ref q_norm_full) = self.attn.q_norm_full {
-                // MiniMax: single RMS over full `[nq*hd]` per token
-                // (rows=n, cols=nq*hd). Mistral/DeepSeek MLA models
-                // never reach this branch — they early-return above.
+        }
+        if !qknorm_rope_fused {
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
                 ops::rms_norm(
                     ctx.gpu,
                     self.rms_norm_k,
-                    q_contiguous,
-                    q_norm_full,
-                    q_contiguous,
+                    k_contiguous,
+                    k_norm_full,
+                    k_contiguous,
                     n,
-                    nq * hd,
+                    nkv * hd,
                     eps,
                     stream,
                 )?;
-            } else if !self.attn.q_norm.weight.is_null() {
+            } else if !self.attn.k_norm.weight.is_null() {
                 ops::rms_norm(
                     ctx.gpu,
                     self.rms_norm_k,
-                    q_contiguous,
-                    &self.attn.q_norm,
-                    q_contiguous,
-                    nq * n,
+                    k_contiguous,
+                    &self.attn.k_norm,
+                    k_contiguous,
+                    nkv * n,
                     hd,
                     eps,
                     stream,
                 )?;
             }
-        }
-        if let Some(ref k_norm_full) = self.attn.k_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_contiguous,
-                k_norm_full,
-                k_contiguous,
-                n,
-                nkv * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_contiguous,
-                &self.attn.k_norm,
-                k_contiguous,
-                nkv * n,
-                hd,
-                eps,
-                stream,
-            )?;
         }
 
         // Gemma-4 v_norm — applied at EVERY layer in HF reference
@@ -256,7 +344,10 @@ impl Qwen3AttentionLayer {
             .map(|m| m.slot_stacked)
             .or(meta_for_single.map(|m| m.slot))
             .unwrap();
-        if self.mla.is_some() {
+        if qknorm_rope_fused {
+            // Q/K normalization and interleaved MRoPE already completed in
+            // the exact C=1 fusion above.
+        } else if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block to rope portions only.
         } else if let Some(ref mla) = self.mla {
             // unreachable but keeps the else chain valid
@@ -313,10 +404,9 @@ impl Qwen3AttentionLayer {
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,
             )?;
-        } else if self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0 {
-            ops::rope_mrope_interleaved(
+        } else if self.mrope_interleaved {
+            self.apply_mrope(
                 ctx.gpu,
-                self.rope_mrope_interleaved_k,
                 q_contiguous,
                 k_contiguous,
                 bmeta_positions,

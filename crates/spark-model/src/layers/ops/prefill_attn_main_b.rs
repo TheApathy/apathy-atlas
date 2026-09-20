@@ -347,6 +347,58 @@ pub fn prefill_attention_paged_nvfp4_64(
         .launch(stream)
 }
 
+/// Paged prefill Flash Attention — NVFP4 KV cache, BR=128 (512 threads).
+///
+/// The candidate has the exact BR=64 kernel ABI. It uses 95,808 bytes of
+/// dynamic shared memory for Q, aliased K/V, FP16 P, online m/l, and the E2M1
+/// LUT. The runtime automatically opts kernels requesting more than 48 KiB
+/// into the device's larger per-block dynamic-shared limit.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_attention_paged_nvfp4_128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_table: DevicePtr,
+    q_len: u32,
+    kv_len: u32,
+    q_offset: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    cache_block_size: u32,
+    sliding_window: u32,
+    inv_sqrt_d: f32,
+    block_stride_bytes: u64,
+    data_section_bytes: u64,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads, div_ceil(q_len, 128), 1])
+        .block([512, 1, 1])
+        .shared_mem(95_808)
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_table)
+        .arg_u32(q_len)
+        .arg_u32(kv_len)
+        .arg_u32(q_offset)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(cache_block_size)
+        .arg_u32(sliding_window)
+        .arg_u32(1u32)
+        .arg_f32(inv_sqrt_d)
+        .arg_u64(block_stride_bytes)
+        .arg_u64(data_section_bytes)
+        .launch(stream)
+}
+
 /// Paged prefill (BR=64) for Bf16K + Turbo3V asymmetric KV cache.
 ///
 /// Reads K as BF16 (NHD contiguous) and V as 3-bit Lloyd-Max packed bytes
