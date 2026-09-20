@@ -23,6 +23,9 @@ pub const GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES: usize =
 pub const GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES: usize =
     GLM53_EXL3_MAX_WIDE_ROWS * GLM53_EXL3_MAX_OUTPUT_F16_BYTES;
 pub const GLM53_EXL3_LOCK_BYTES: usize = 1024 * 1024 * size_of::<i32>();
+/// Largest compressed projection reconstructed in the prompt scope: the KDA
+/// qkv `[4096, 24576]` F16 matrix. `lm_head` never qualifies (last-row slice).
+pub const GLM53_EXL3_RECONSTRUCT_MAX_BYTES: usize = 4_096 * 24_576 * 2;
 
 thread_local! {
     static EXACT_WIDE_PREFILL_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -104,6 +107,11 @@ pub struct Glm53Exl3ProjectionScratch {
     pub output_f16: Glm53Exl3Buffer,
     pub locks_i32: Glm53Exl3Buffer,
     pub input_hadamard_f16: Glm53Exl3Buffer,
+    /// Original-basis F16 weight staging for the prompt-scope reconstruct
+    /// path; NULL/0 outside the max-M2048 layout.
+    pub reconstruct_f16: Glm53Exl3Buffer,
+    /// Second staging slot (reconstruct/GEMM overlap); NULL/0 outside the prompt scope.
+    pub reconstruct_f16_b: Glm53Exl3Buffer,
 }
 
 #[derive(Clone, Copy)]
@@ -202,6 +210,13 @@ impl Glm53Exl3Projection<'_> {
         match self {
             Self::Compressed(linear) => {
                 let scratch = exact_scratch(plan, buffers.scratch)?;
+                if super::glm53_exl3_reconstruct::reconstruct_prefill_rows(plan.rows)?
+                    && super::glm53_exl3_reconstruct::launch_reconstructed(
+                        gpu, linear, plan, buffers, scratch, stream,
+                    )?
+                {
+                    return Ok(());
+                }
                 let prepared = if exact_wide_row_exact {
                     linear.prepare_bf16_row_exact(gpu, plan.rows)?
                 } else {
@@ -280,6 +295,8 @@ fn exact_scratch(
             scratch.input_hadamard_f16,
             plan.input_bytes,
         )?,
+        reconstruct_f16: scratch.reconstruct_f16,
+        reconstruct_f16_b: scratch.reconstruct_f16_b,
     })
 }
 
@@ -369,6 +386,8 @@ mod tests {
             output_f16: buffer(2, GLM53_EXL3_MAX_OUTPUT_F16_BYTES),
             locks_i32: buffer(3, GLM53_EXL3_LOCK_BYTES),
             input_hadamard_f16: buffer(4, GLM53_EXL3_MAX_INPUT_F16_BYTES),
+            reconstruct_f16: buffer(5, GLM53_EXL3_RECONSTRUCT_MAX_BYTES),
+            reconstruct_f16_b: buffer(6, GLM53_EXL3_RECONSTRUCT_MAX_BYTES),
         };
         let exact = exact_scratch(plan, scratch).unwrap();
         assert_eq!(exact.input_f16.bytes, plan.input_bytes);

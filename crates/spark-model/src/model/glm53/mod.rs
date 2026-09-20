@@ -38,6 +38,7 @@ mod kda_attention;
 mod kda_recurrent_commit;
 mod model_trait;
 mod model_trait_exl3;
+pub(crate) mod oracle_dump;
 mod ordered_capture;
 mod owned_verify_readback;
 mod partial_replay;

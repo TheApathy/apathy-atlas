@@ -33,6 +33,7 @@
 //! never letting a rejected step touch persistent state; see
 //! [`Glm53KdaScratchState::prime`].
 
+use crate::model::glm53::oracle_dump::t;
 use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::gguf::GgmlType;
@@ -754,6 +755,30 @@ impl Glm53KdaAttentionKernels {
                 beta_bf16: buffers.beta_bf16,
                 output_bf16: buffers.recurrent_out_bf16,
             };
+            // Kernel oracle: the recurrence overwrites `state_f32` in place, so
+            // the pre-state must be captured BEFORE the launch and the
+            // post-state after it.
+            crate::model::glm53::oracle_dump::dump_site(
+                gpu,
+                stream,
+                "kda_recurrence_in",
+                &[
+                    t("state_pre", prefill_buffers.state_f32.ptr, prefill_plan.state_bytes, "f32", &[64, 128, 128]),
+                    t("query", prefill_buffers.query_bf16.ptr, prefill_plan.vector_bytes, "bf16", &[rows as usize, 64, 128]),
+                    t("key", prefill_buffers.key_bf16.ptr, prefill_plan.vector_bytes, "bf16", &[rows as usize, 64, 128]),
+                    t("value", prefill_buffers.value_bf16.ptr, prefill_plan.vector_bytes, "bf16", &[rows as usize, 64, 128]),
+                    t("log_decay", prefill_buffers.log_decay_f32.ptr, prefill_plan.decay_bytes, "f32", &[rows as usize, 64, 128]),
+                    t("beta", prefill_buffers.beta_bf16.ptr, prefill_plan.beta_bytes, "bf16", &[rows as usize, 64]),
+                ],
+                &[
+                    ("batch", "1".into()),
+                    ("tokens", rows.to_string()),
+                    ("heads", "64".into()),
+                    ("key_dim", "128".into()),
+                    ("value_dim", "128".into()),
+                    ("l2_epsilon", "1.0e-6".into()),
+                ],
+            )?;
             if rows > 8 && glm53_layer_major_prefill_active() {
                 self.prefill.launch_register_resident(
                     gpu,
@@ -765,6 +790,16 @@ impl Glm53KdaAttentionKernels {
                 self.prefill
                     .launch(gpu, prefill_plan, prefill_buffers, stream)?;
             }
+            crate::model::glm53::oracle_dump::dump_site(
+                gpu,
+                stream,
+                "kda_recurrence_out",
+                &[
+                    t("output", prefill_buffers.output_bf16.ptr, prefill_plan.vector_bytes, "bf16", &[rows as usize, 64, 128]),
+                    t("state_post", prefill_buffers.state_f32.ptr, prefill_plan.state_bytes, "f32", &[64, 128, 128]),
+                ],
+                &[("tokens", rows.to_string())],
+            )?;
         }
 
         self.linear_exl3_rows(

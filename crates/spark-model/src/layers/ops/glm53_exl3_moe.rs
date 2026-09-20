@@ -26,6 +26,9 @@ const STAGED_CHUNK_ROWS: u32 = 16;
 const STAGED_BLOCK_THREADS: u32 = 256;
 const STAGED_BASE_MODULE: &str = "glm53_exl3_moe_staged_k16";
 const STAGED_GEMM_MODULE: &str = "glm53_exl3_moe_staged_n256_f1";
+/// 64-row-chunk staged GEMMs (prompt scope): one trellis decode per 64 rows.
+const STAGED_M64_MODULE: &str = "glm53_exl3_moe_staged_m64";
+const CHUNK_ROWS_ENV: &str = "ATLAS_GLM53_EXL3_MOE_CHUNK_ROWS";
 const STAGED_TILE_N: u32 = 256;
 const STAGED_SHARED_MEMORY_BYTES: u32 = 20_992;
 const FUSED_MOE_KERNEL_LAUNCHES: u32 = 2;
@@ -148,6 +151,10 @@ pub struct Glm53Exl3MoeKernels {
 
 struct Glm53Exl3StagedMoeKernels {
     private: bool,
+    /// Output tile width of the staged GEMM kernels (grid.x = N / tile_n).
+    tile_n: u32,
+    /// Dynamic shared bytes for the staged GEMM launches.
+    shared_bytes: u32,
     build_chunks: KernelHandle,
     gather: KernelHandle,
     gate_up: KernelHandle,
@@ -184,9 +191,29 @@ impl Glm53Exl3MoeKernels {
             std::env::var_os("ATLAS_GLM53_EXL3_MOE_STAGED_VARIANT").is_none(),
             "ATLAS_GLM53_EXL3_MOE_STAGED_VARIANT was experimental and is no longer admitted"
         );
+        // (kernel suffix, output tile N, m16 sub-tiles, k16 blocks per stage);
+        // None = k16 donor kernels.
+        let chunk_variant: Option<(&'static str, u32, u32, u32)> = match std::env::var(CHUNK_ROWS_ENV) {
+            Ok(value) if value == "16" => None,
+            Ok(value) if value == "64" => Some(("m64", 256, 4, 1)),
+            Ok(value) if value == "128" => Some(("m128", 128, 8, 1)),
+            Ok(value) if value == "64k2" => Some(("m64k2", 256, 4, 2)),
+            Ok(value) if value == "128w" => Some(("m128w", 256, 8, 1)),
+            Ok(value) if value == "128wk2" => Some(("m128wk2", 256, 8, 2)),
+            Ok(value) if value == "64k3" => Some(("m64k3", 256, 4, 3)),
+            Ok(value) if value == "64k4" => Some(("m64k4", 256, 4, 4)),
+            Ok(other) => bail!("{CHUNK_ROWS_ENV} must be 16, 64, 128, 64k2, 64k3, 64k4, 128w or 128wk2, got {other:?}"),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context(CHUNK_ROWS_ENV),
+        };
+        let chunk_rows_64 = chunk_variant.is_some();
         let staged = staged_enabled
             .then(|| {
                 let private = route_policy.prefill_enabled();
+                ensure!(
+                    !chunk_rows_64 || private,
+                    "{CHUNK_ROWS_ENV}=64 requires the private prefill route policy"
+                );
                 let (module, names) = if private {
                     (
                         "glm53_exl3_moe_staged_private",
@@ -208,14 +235,42 @@ impl Glm53Exl3MoeKernels {
                         ],
                     )
                 };
-                let gate_up =
-                    gpu.kernel(STAGED_GEMM_MODULE, "atlas_glm53_exl3_staged_gate_up_k16")?;
-                let down = gpu.kernel(STAGED_GEMM_MODULE, "atlas_glm53_exl3_staged_down_k16")?;
-                gpu.set_kernel_max_dynamic_shared_memory(gate_up, STAGED_SHARED_MEMORY_BYTES)?;
-                gpu.set_kernel_max_dynamic_shared_memory(down, STAGED_SHARED_MEMORY_BYTES)?;
+                let (gate_up, down, build_chunks, tile_n, shared_bytes) =
+                    if let Some((suffix, tile_n, msub, ksub)) = chunk_variant {
+                        // 3 cp.async stages of (A: 16*msub x 16*ksub halves, B: tile_n/16 x 32*ksub uint16)
+                        let stage = 16 * msub * 16 * ksub * 2 + (tile_n / 16) * 32 * ksub * 2;
+                        (
+                            gpu.kernel(
+                                STAGED_M64_MODULE,
+                                &format!("atlas_glm53_exl3_staged_gate_up_{suffix}"),
+                            )?,
+                            gpu.kernel(
+                                STAGED_M64_MODULE,
+                                &format!("atlas_glm53_exl3_staged_down_{suffix}"),
+                            )?,
+                            gpu.kernel(
+                                STAGED_M64_MODULE,
+                                &format!("atlas_glm53_exl3_build_chunks_private_{suffix}"),
+                            )?,
+                            tile_n,
+                            (3 * stage).max(STAGED_SHARED_MEMORY_BYTES),
+                        )
+                    } else {
+                        (
+                            gpu.kernel(STAGED_GEMM_MODULE, "atlas_glm53_exl3_staged_gate_up_k16")?,
+                            gpu.kernel(STAGED_GEMM_MODULE, "atlas_glm53_exl3_staged_down_k16")?,
+                            gpu.kernel(module, names[0])?,
+                            STAGED_TILE_N,
+                            STAGED_SHARED_MEMORY_BYTES,
+                        )
+                    };
+                gpu.set_kernel_max_dynamic_shared_memory(gate_up, shared_bytes)?;
+                gpu.set_kernel_max_dynamic_shared_memory(down, shared_bytes)?;
                 Ok::<_, anyhow::Error>(Glm53Exl3StagedMoeKernels {
                     private,
-                    build_chunks: gpu.kernel(module, names[0])?,
+                    build_chunks,
+                    tile_n,
+                    shared_bytes,
                     gather: gpu.kernel(module, names[1])?,
                     gate_up,
                     activate: gpu.kernel(module, names[2])?,

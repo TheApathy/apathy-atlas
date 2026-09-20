@@ -50,7 +50,10 @@ fn all_bindings(s: &Glm53WalkScratch) -> Vec<GgmlIqBuffer> {
     b.extend(s.exl3_wide_kda);
     b.extend(s.exl3_wide_dsa);
     b.extend(s.exl3_moe_staged);
-    assert_eq!(b.len(), 138);
+    // Appended prompt-scope staging (reconstruct weight, f32 scratch): constant
+    // extents after the policy-sized slot 137.
+    b.extend(s.exl3_reconstruct);
+    assert_eq!(b.len(), 141);
     b
 }
 
@@ -64,7 +67,11 @@ fn disabled_prefill_preserves_every_legacy_binding_and_allocated_byte() {
     let old = Glm53WalkScratch::bind(DevicePtr(BASE), required).unwrap();
     let old_bindings = all_bindings(&old);
     assert_eq!(old_bindings[137].bytes as u64, MIB);
-    assert_eq!(old_bindings[137].ptr.0 + MIB, BASE + required);
+    assert_eq!(old_bindings[137].ptr.0 + MIB, old_bindings[138].ptr.0);
+    assert_eq!(
+        old_bindings[140].ptr.0 + old_bindings[140].bytes as u64,
+        BASE + required
+    );
     for p in [policy("0", "0"), policy("1", "0")] {
         assert_eq!(
             Glm53WalkScratch::required_bytes_with_route_policy(p),
@@ -101,7 +108,19 @@ fn selected_prefill_grows_only_the_final_slot_by_exactly_255_mib() {
     }
     assert_eq!(new_bindings[137].ptr, old_bindings[137].ptr);
     assert_eq!(new_bindings[137].bytes as u64, 256 * MIB);
-    assert_eq!(new_bindings[137].ptr.0 + 256 * MIB, BASE + required);
+    assert_eq!(new_bindings[137].ptr.0 + 256 * MIB, new_bindings[138].ptr.0);
+    for index in 138..141 {
+        assert_eq!(new_bindings[index].bytes, old_bindings[index].bytes, "slot {index}");
+        assert_eq!(
+            new_bindings[index].ptr.0,
+            old_bindings[index].ptr.0 + 255 * MIB,
+            "slot {index}"
+        );
+    }
+    assert_eq!(
+        new_bindings[140].ptr.0 + new_bindings[140].bytes as u64,
+        BASE + required
+    );
     assert_eq!(got.exl3_route_policy(), p);
     let selected = got.exl3_moe_scratch().route_private_f32;
     assert_eq!((selected.ptr.0, selected.bytes), span(new_bindings[137]));

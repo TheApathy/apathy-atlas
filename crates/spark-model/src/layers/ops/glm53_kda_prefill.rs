@@ -80,19 +80,28 @@ pub struct Glm53KdaPrefillKernel {
     register_resident: KernelHandle,
     register_resident_c8: KernelHandle,
     register_resident_c8_enabled: bool,
+    register_resident_columns: u32,
 }
 
 impl Glm53KdaPrefillKernel {
     pub fn load(gpu: &dyn GpuBackend) -> Result<Self> {
-        let register_resident_c8_enabled =
-            parse_rr_c8_enabled(std::env::var("ATLAS_GLM53_KDA_RR_COLUMNS").ok().as_deref())?;
+        let columns_env = std::env::var("ATLAS_GLM53_KDA_RR_COLUMNS").ok();
+        let register_resident_c8_enabled = parse_rr_c8_enabled(columns_env.as_deref())?;
+        let (register_resident_columns, columns_symbol) = rr_columns(columns_env.as_deref());
         Ok(Self {
             prefill: gpu.kernel("glm53_kda", "atlas_glm53_kda_prefill")?,
             register_resident: gpu
                 .kernel("glm53_kda", "atlas_glm53_kda_prefill_register_resident")?,
-            register_resident_c8: gpu
-                .kernel("glm53_kda_rr_columns", "atlas_glm53_kda_prefill_rr_c8")?,
+            register_resident_c8: gpu.kernel(
+                "glm53_kda_rr_columns",
+                match std::env::var("ATLAS_GLM53_KDA_RR_PREFETCH").as_deref() {
+                    Ok("1") => "atlas_glm53_kda_prefill_rr_c8_pf",
+                    Ok("2") => "atlas_glm53_kda_prefill_rr_c8_pf2",
+                    _ => columns_symbol,
+                },
+            )?,
             register_resident_c8_enabled,
+            register_resident_columns,
         })
     }
 
@@ -135,7 +144,7 @@ impl Glm53KdaPrefillKernel {
         }
         validate_buffers(plan, buffers)?;
         let (kernel, columns) = if self.register_resident_c8_enabled {
-            (self.register_resident_c8, 8)
+            (self.register_resident_c8, self.register_resident_columns)
         } else {
             (self.register_resident, 1)
         };
@@ -161,11 +170,21 @@ impl Glm53KdaPrefillKernel {
 
 fn parse_rr_c8_enabled(value: Option<&str>) -> Result<bool> {
     match value {
-        None | Some("1") => Ok(true),
+        None | Some("1") | Some("4") | Some("2") => Ok(true),
         Some("0") => Ok(false),
         Some(value) => {
-            bail!("ATLAS_GLM53_KDA_RR_COLUMNS must be absent or exactly 0 or 1; got {value:?}")
+            bail!("ATLAS_GLM53_KDA_RR_COLUMNS must be absent or exactly 0, 1, 4 or 2; got {value:?}")
         }
+    }
+}
+
+/// Columns per warp of the register-resident kernel selected by
+/// `ATLAS_GLM53_KDA_RR_COLUMNS` (8 default; 4 / 2 = narrower groups, more warps).
+fn rr_columns(value: Option<&str>) -> (u32, &'static str) {
+    match value {
+        Some("4") => (4, "atlas_glm53_kda_prefill_rr_c4"),
+        Some("2") => (2, "atlas_glm53_kda_prefill_rr_c2"),
+        _ => (8, "atlas_glm53_kda_prefill_rr_c8"),
     }
 }
 

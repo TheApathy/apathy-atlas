@@ -408,7 +408,62 @@ impl Glm53SerialMoeKernels {
             stream,
         )?;
         let fused_kernel_launches = fused.kernel_launches(rows);
+        // Kernel oracle: the staged MoE for one layer. The routing tables are
+        // captured BEFORE the launch (pack_routes rewrites them in place) and
+        // the staged/output tensors after it. NOTE: layers 3..=44 run inside a
+        // CUDA graph, where a D2H copy is illegal -- capture needs
+        // ATLAS_GLM53_FFN_GRAPHS=0.
+        crate::model::glm53::oracle_dump::dump_site(
+            gpu,
+            stream,
+            "moe_in",
+            &[
+                crate::model::glm53::oracle_dump::t(
+                    "input_bf16", buffers.input_bf16.ptr,
+                    rows as usize * HIDDEN as usize * 2, "bf16",
+                    &[rows as usize, HIDDEN as usize]),
+                crate::model::glm53::oracle_dump::t(
+                    "input_f16", input_f16.ptr, plan.input_f16_bytes, "f16",
+                    &[rows as usize, HIDDEN as usize]),
+                crate::model::glm53::oracle_dump::t(
+                    "route_ids", buffers.route_ids_u32.ptr,
+                    plan.route_ids_u32_bytes, "u32", &[rows as usize, 8]),
+                crate::model::glm53::oracle_dump::t(
+                    "route_weights", buffers.route_weights_f32.ptr,
+                    plan.route_weights_f32_bytes, "f32", &[rows as usize, 8]),
+            ],
+            &[
+                ("rows", rows.to_string()),
+                ("hidden", HIDDEN.to_string()),
+                ("intermediate", "2048".into()),
+                ("experts", "288".into()),
+                ("top_k", "8".into()),
+                ("bits", "2".into()),
+                ("codebook", "2".into()),
+            ],
+        )?;
         fused.launch(gpu, plan, exact, stream)?;
+        crate::model::glm53::oracle_dump::dump_site(
+            gpu,
+            stream,
+            "moe_out",
+            &[
+                crate::model::glm53::oracle_dump::t(
+                    "expert_count", exact.expert_count_i64.ptr,
+                    plan.expert_count_i64_bytes, "i64", &[288]),
+                crate::model::glm53::oracle_dump::t(
+                    "token_sorted", exact.token_sorted_i64.ptr,
+                    plan.token_sorted_i64_bytes, "i64", &[rows as usize * 8]),
+                crate::model::glm53::oracle_dump::t(
+                    "weight_sorted", exact.weight_sorted_f16.ptr,
+                    plan.weight_sorted_f16_bytes, "f16", &[rows as usize * 8]),
+                crate::model::glm53::oracle_dump::t(
+                    "output_f32", exact.output_f32.ptr,
+                    plan.output_f32_bytes, "f32",
+                    &[rows as usize, HIDDEN as usize]),
+            ],
+            &[("rows", rows.to_string())],
+        )?;
         self.exl3_expert_rows(
             gpu,
             rows,

@@ -31,6 +31,7 @@ type cublasLtMatrixLayout_t = *mut c_void;
 type cublasLtMatmulPreference_t = *mut c_void;
 
 const CUDA_R_16BF: i32 = 14;
+const CUDA_R_16F: i32 = 2;
 const CUDA_R_32F: i32 = 0;
 const CUDA_R_8F_E4M3: i32 = 28;
 const CUBLAS_COMPUTE_32F: i32 = 68;
@@ -46,6 +47,20 @@ const SCALE_MODE_OUTER_VEC_32F: i32 = 3;
 const SCALE_MODE_VEC128_32F: i32 = 4;
 const SCALE_MODE_BLK128X128_32F: i32 = 5;
 const PREF_MAX_WORKSPACE_BYTES: u32 = 1;
+const LAYOUT_BATCH_COUNT: u32 = 5;
+const LAYOUT_STRIDED_BATCH_OFFSET: u32 = 6;
+
+/// Strided batch description for `bf16_gemm_batched`: element strides.
+#[derive(Clone, Copy, Debug)]
+pub struct StridedBatch {
+    pub count: i32,
+    pub stride_act: i64,
+    pub stride_weight: i64,
+    pub stride_out: i64,
+    /// Row stride (elements) of `act` / `out`; 0 = dense (K / N).
+    pub ld_act: i64,
+    pub ld_out: i64,
+}
 
 unsafe extern "C" {
     fn cublasLtCreate(handle: *mut cublasLtHandle_t) -> i32;
@@ -69,6 +84,12 @@ unsafe extern "C" {
         ld: i64,
     ) -> i32;
     fn cublasLtMatrixLayoutDestroy(layout: cublasLtMatrixLayout_t) -> i32;
+    fn cublasLtMatrixLayoutSetAttribute(
+        layout: cublasLtMatrixLayout_t,
+        attr: u32,
+        buf: *const c_void,
+        size: usize,
+    ) -> i32;
     fn cublasLtMatmulPreferenceCreate(pref: *mut cublasLtMatmulPreference_t) -> i32;
     fn cublasLtMatmulPreferenceSetAttribute(
         pref: cublasLtMatmulPreference_t,
@@ -193,7 +214,54 @@ fn bf16_gemm(
     stream: u64,
     weight_is_nk: bool,
 ) -> Result<()> {
-    bf16_gemm_impl(act, weight, out, m, n, k, stream, weight_is_nk, None).map(|_| ())
+    bf16_gemm_impl(act, weight, out, m, n, k, stream, weight_is_nk, None, CUDA_R_16BF).map(|_| ())
+}
+
+/// Strided-batched row-major BF16 GEMM: per batch `out = act @ weight[K,N]` (or
+/// `@ weight[N,K]ᵀ` when `weight_is_nk`). Used by the GLM DSA absorption banks
+/// (64 heads).
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_batched(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    weight_is_nk: bool,
+    batch: StridedBatch,
+    stream: u64,
+) -> Result<()> {
+    gemm_impl_batched(act, weight, out, m, n, k, stream, weight_is_nk, None, CUDA_R_16BF, Some(batch))
+        .map(|_| ())
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ`, all F32 (full fp32, no TF32).
+/// Used by the GLM prompt-scope router logits and mHC mixing projections.
+pub fn f32_gemm_act_weight_t(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    bf16_gemm_impl(act, weight, out, m, n, k, stream, true, None, CUDA_R_32F).map(|_| ())
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[K,N]`, all F16 (fp32 accumulate).
+/// Used by the GLM EXL3 reconstructed-weight prefill projections.
+pub fn f16_gemm_act_weight(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    bf16_gemm_impl(act, weight, out, m, n, k, stream, false, None, CUDA_R_16F).map(|_| ())
 }
 
 /// Same projection core with explicit experimental reduction selection and a
@@ -214,7 +282,7 @@ pub fn bf16_gemm_act_weight_t_diagnostic(
         act != 0 && weight != 0 && out != 0 && m > 0 && n > 0 && k > 0,
         "invalid diagnostic GEMM pointers/dimensions"
     );
-    bf16_gemm_impl(act, weight, out, m, n, k, stream, true, Some(policy))?
+    bf16_gemm_impl(act, weight, out, m, n, k, stream, true, Some(policy), CUDA_R_16BF)?
         .ok_or_else(|| anyhow::anyhow!("missing explicit GEMM receipt"))
 }
 
@@ -229,6 +297,24 @@ fn bf16_gemm_impl(
     stream: u64,
     weight_is_nk: bool,
     policy: Option<ReductionPolicy>,
+    dtype: i32,
+) -> Result<Option<Bf16GemmReceipt>> {
+    gemm_impl_batched(act, weight, out, m, n, k, stream, weight_is_nk, policy, dtype, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_impl_batched(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+    weight_is_nk: bool,
+    policy: Option<ReductionPolicy>,
+    dtype: i32,
+    batch: Option<StridedBatch>,
 ) -> Result<Option<Bf16GemmReceipt>> {
     let ctx = ctx()?;
     unsafe {
@@ -273,17 +359,51 @@ fn bf16_gemm_impl(
             (n as u64, k as u64, n as i64)
         };
         chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, weight_rows, weight_cols, weight_ld),
+            cublasLtMatrixLayoutCreate(&mut la, dtype, weight_rows, weight_cols, weight_ld),
             "LayoutA",
         )?;
+        let ld_act = match batch {
+            Some(b) if b.ld_act > 0 => b.ld_act,
+            _ => k as i64,
+        };
+        let ld_out = match batch {
+            Some(b) if b.ld_out > 0 => b.ld_out,
+            _ => n as i64,
+        };
         chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut lb, dtype, k as u64, m as u64, ld_act),
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, dtype, n as u64, m as u64, ld_out),
             "LayoutD",
         )?;
+        if let Some(batch) = batch {
+            for (layout, stride) in [
+                (la, batch.stride_weight),
+                (lb, batch.stride_act),
+                (ld_, batch.stride_out),
+            ] {
+                chk(
+                    cublasLtMatrixLayoutSetAttribute(
+                        layout,
+                        LAYOUT_BATCH_COUNT,
+                        &batch.count as *const i32 as *const c_void,
+                        4,
+                    ),
+                    "LayoutBatchCount",
+                )?;
+                chk(
+                    cublasLtMatrixLayoutSetAttribute(
+                        layout,
+                        LAYOUT_STRIDED_BATCH_OFFSET,
+                        &stride as *const i64 as *const c_void,
+                        8,
+                    ),
+                    "LayoutBatchStride",
+                )?;
+            }
+        }
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
         chk(cublasLtMatmulPreferenceCreate(&mut pref), "PrefCreate")?;
         let ws_size = ctx.ws_size;

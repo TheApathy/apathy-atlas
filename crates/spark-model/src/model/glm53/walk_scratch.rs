@@ -41,7 +41,7 @@ use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 use crate::layers::Glm53SerialMoeBuffers;
-use crate::layers::ops::{
+use crate::layers::ops::{GLM53_EXL3_RECONSTRUCT_MAX_BYTES, 
     GLM53_EXL3_LOCK_BYTES, GLM53_EXL3_MAX_INPUT_F16_BYTES, GLM53_EXL3_MAX_OUTPUT_F16_BYTES,
     GLM53_EXL3_MAX_WIDE_INPUT_F16_BYTES, GLM53_EXL3_MAX_WIDE_OUTPUT_F16_BYTES,
     GLM53_EXL3_MAX_WIDE_ROWS, GLM53_EXL3_MOE_LOCK_BYTES, GgmlIqBuffer, Glm53Exl3Buffer,
@@ -80,6 +80,7 @@ const EXL3_WIDE_KDA_OFFSET: usize =
     EXL3_WIDE_ROUTER_MOE_OFFSET + EXL3_WIDE_ROUTER_MOE_SCRATCH.len();
 const EXL3_WIDE_DSA_OFFSET: usize = EXL3_WIDE_KDA_OFFSET + EXL3_WIDE_KDA_SCRATCH.len();
 const EXL3_MOE_STAGED_OFFSET: usize = EXL3_WIDE_DSA_OFFSET + EXL3_WIDE_DSA_SCRATCH.len();
+const EXL3_RECONSTRUCT_OFFSET: usize = EXL3_MOE_STAGED_OFFSET + EXL3_MOE_STAGED_SCRATCH.len();
 
 // Documents the invariant and fails the build loudly if anyone reintroduces a
 // literal, or grows a table without noticing what it shifts.
@@ -104,7 +105,24 @@ const _: () = {
     assert!(EXL3_WIDE_DSA_OFFSET + EXL3_WIDE_DSA_SCRATCH.len() == 132);
     assert!(EXL3_MOE_STAGED_OFFSET == 132);
     assert!(EXL3_MOE_STAGED_OFFSET + EXL3_MOE_STAGED_SCRATCH.len() == 138);
+    assert!(EXL3_RECONSTRUCT_OFFSET == 138);
 };
+
+/// Prompt-scope original-basis F16 weight staging (appended; nothing moves).
+const EXL3_RECONSTRUCT_SCRATCH: [(&str, u64); 3] = [
+    (
+        "exl3_reconstruct_weight_f16",
+        GLM53_EXL3_RECONSTRUCT_MAX_BYTES as u64,
+    ),
+    // Prompt-scope F32 activation staging (router logits GEMM input; mHC
+    // mixing GEMM output): 2048 x 4096 f32.
+    ("exl3_prompt_f32_scratch", MAX_WIDE_ROWS_U64 * 4_096 * 4),
+    // Second reconstruct staging slot so reconstruct(i+1) can overlap GEMM(i).
+    (
+        "exl3_reconstruct_weight_f16_b",
+        GLM53_EXL3_RECONSTRUCT_MAX_BYTES as u64,
+    ),
+];
 
 /// Exact extents `Glm53SerialMoeKernels::execute` requires, in placement order.
 /// Names match the op's buffer struct so a mismatch is greppable.
@@ -441,6 +459,7 @@ pub struct Glm53WalkScratch {
     exl3_wide_kda: [GgmlIqBuffer; 17],
     exl3_wide_dsa: [GgmlIqBuffer; 26],
     exl3_moe_staged: [GgmlIqBuffer; 6],
+    exl3_reconstruct: [GgmlIqBuffer; 3],
 }
 
 /// The KDA attention working buffers for one layer.
@@ -525,6 +544,7 @@ fn layout(policy: Glm53Exl3RoutePolicy) -> impl Iterator<Item = (&'static str, u
         .chain(EXL3_WIDE_KDA_SCRATCH.iter())
         .chain(EXL3_WIDE_DSA_SCRATCH.iter())
         .chain(EXL3_MOE_STAGED_SCRATCH.iter())
+        .chain(EXL3_RECONSTRUCT_SCRATCH.iter())
         .copied()
         .enumerate()
         .map(move |(index, (name, bytes))| {
@@ -631,6 +651,7 @@ impl Glm53WalkScratch {
             exl3_wide_kda: core::array::from_fn(|index| bound[EXL3_WIDE_KDA_OFFSET + index]),
             exl3_wide_dsa: core::array::from_fn(|index| bound[EXL3_WIDE_DSA_OFFSET + index]),
             exl3_moe_staged: core::array::from_fn(|index| bound[EXL3_MOE_STAGED_OFFSET + index]),
+            exl3_reconstruct: core::array::from_fn(|index| bound[EXL3_RECONSTRUCT_OFFSET + index]),
         })
     }
 
@@ -761,7 +782,21 @@ impl Glm53WalkScratch {
             output_f16: buffer(self.exl3[1]),
             locks_i32: buffer(self.exl3[2]),
             input_hadamard_f16: buffer(self.exl3[3]),
+            reconstruct_f16: Glm53Exl3Buffer {
+                ptr: DevicePtr::NULL,
+                bytes: 0,
+            },
+            reconstruct_f16_b: Glm53Exl3Buffer {
+                ptr: DevicePtr::NULL,
+                bytes: 0,
+            },
         }
+    }
+
+    /// Prompt-scope F32 staging (see `EXL3_RECONSTRUCT_SCRATCH`); transient
+    /// within one launch sequence, never carried across events.
+    pub fn prompt_f32_scratch(&self) -> GgmlIqBuffer {
+        self.exl3_reconstruct[1]
     }
 
     /// Select the immutable T1 layout or the appended max-M2048 layout.
@@ -782,6 +817,8 @@ impl Glm53WalkScratch {
             output_f16: buffer(self.exl3_wide[1]),
             locks_i32: buffer(self.exl3_wide[2]),
             input_hadamard_f16: buffer(self.exl3_wide[3]),
+            reconstruct_f16: buffer(self.exl3_reconstruct[0]),
+            reconstruct_f16_b: buffer(self.exl3_reconstruct[2]),
         })
     }
 

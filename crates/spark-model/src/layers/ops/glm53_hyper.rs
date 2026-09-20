@@ -93,6 +93,8 @@ pub struct Glm53HyperPreBuffers {
     pub collapsed_bf16: GgmlIqBuffer,
     pub post_bf16: GgmlIqBuffer,
     pub comb_bf16: GgmlIqBuffer,
+    /// Prompt-scope F32 staging for the hoisted mixing GEMM (NULL outside it).
+    pub mixed_f32: GgmlIqBuffer,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +164,9 @@ impl Glm53HyperKernels {
             ("post", buffers.post_bf16, plan.post_bytes),
             ("comb", buffers.comb_bf16, plan.comb_bytes),
         ])?;
+        if hc_pre_gemm_active(plan.tokens)? && !buffers.mixed_f32.ptr.is_null() {
+            return self.pre_gemm(gpu, plan, buffers, stream);
+        }
         KernelLaunch::new(gpu, self.pre)
             .grid([plan.tokens, 1, 1])
             .block([THREADS, 1, 1])
@@ -207,6 +212,24 @@ impl Glm53HyperKernels {
             bail!("GLM mHC in-place output extent mismatch");
         }
         validate_set(&checked)?;
+        if hc_post_prompt_active(plan.tokens)? {
+            // Same fold, same fmaf order, same single rounding; 2D grid + float4
+            // so the memory-bound fold is not pinned to one block per SM.
+            let kernel = gpu.kernel("glm53_prompt_glue", "atlas_glm53_hc_post_prompt")?;
+            return KernelLaunch::new(gpu, kernel)
+                .grid([HIDDEN / (THREADS * 4), plan.tokens, 1])
+                .block([THREADS, 1, 1])
+                .arg_ptr(buffers.block_output_bf16.ptr)
+                .arg_ptr(buffers.residual_streams_f32.ptr)
+                .arg_ptr(buffers.post_bf16.ptr)
+                .arg_ptr(buffers.comb_bf16.ptr)
+                .arg_ptr(buffers.output_streams_f32.ptr)
+                .arg_u32(HIDDEN)
+                .arg_u32(HC)
+                .arg_u32(plan.tokens)
+                .arg_u32(GLM53_STREAM_ROUND_TO_BF16)
+                .launch(stream);
+        }
         KernelLaunch::new(gpu, self.post)
             .grid([plan.tokens, 1, 1])
             .block([THREADS, 1, 1])
@@ -297,6 +320,135 @@ fn validate_set(named: &[(&str, GgmlIqBuffer, usize)]) -> Result<()> {
     Ok(())
 }
 
+
+/// `ATLAS_GLM53_HC_PRE_GEMM=1`: prompt-scope mHC pre with the 24 mixing dots
+/// hoisted into one cuBLASLt f32 GEMM `[tokens,16384] x [24,16384]^T`.
+/// 0 = off, 1 = cuBLASLt f32 GEMM, 2 = fused mix+rms kernel (4 tokens/block).
+fn hc_pre_mode() -> Result<u8> {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<std::result::Result<u8, String>> = OnceLock::new();
+    MODE.get_or_init(|| match std::env::var("ATLAS_GLM53_HC_PRE_GEMM") {
+        Ok(v) if v == "1" => Ok(1),
+        Ok(v) if v == "2" => Ok(2),
+        Ok(v) if v == "0" => Ok(0),
+        Ok(other) => Err(format!("ATLAS_GLM53_HC_PRE_GEMM must be 0, 1 or 2, got {other:?}")),
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(format!("ATLAS_GLM53_HC_PRE_GEMM: {e}")),
+    })
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
+
+/// `ATLAS_GLM53_HC_POST_PROMPT=1`: prompt-scope mHC output fold on a 2D grid
+/// with float4 column vectors. Arithmetic is identical to `atlas_glm53_hc_post`
+/// (bit-exact); only the block decomposition and occupancy change.
+fn hc_post_prompt_active(tokens: u32) -> Result<bool> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    let on = ON
+        .get_or_init(|| match std::env::var("ATLAS_GLM53_HC_POST_PROMPT") {
+            Ok(v) if v == "1" => Ok(true),
+            Ok(v) if v == "0" => Ok(false),
+            Ok(other) => Err(format!(
+                "ATLAS_GLM53_HC_POST_PROMPT must be 0 or 1, got {other:?}"
+            )),
+            Err(std::env::VarError::NotPresent) => Ok(false),
+            Err(e) => Err(format!("ATLAS_GLM53_HC_POST_PROMPT: {e}")),
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)?;
+    // HIDDEN must tile evenly into THREADS*4 columns per block.
+    Ok(on
+        && tokens >= 144
+        && HIDDEN % (THREADS * 4) == 0
+        && super::glm53_layer_major_prefill_active())
+}
+
+fn hc_pre_gemm_active(tokens: u32) -> Result<bool> {
+    Ok(hc_pre_mode()? != 0 && tokens >= 144 && super::glm53_layer_major_prefill_active())
+}
+
+impl Glm53HyperKernels {
+    fn pre_gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53HyperPlan,
+        buffers: Glm53HyperPreBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        let mixed_bytes = usize::try_from(plan.tokens)? * MIX as usize * 4;
+        anyhow::ensure!(
+            buffers.mixed_f32.bytes >= mixed_bytes,
+            "GLM hc_pre mixed scratch too small"
+        );
+        if hc_pre_mode()? == 2 {
+            // mixed_raw [tokens,24] f32 then inv_rms [tokens] f32 in the same scratch.
+            let inv_rms = buffers.mixed_f32.ptr.offset(mixed_bytes);
+            anyhow::ensure!(
+                buffers.mixed_f32.bytes >= mixed_bytes + usize::try_from(plan.tokens)? * 4,
+                "GLM hc_mix scratch too small"
+            );
+            let mix = gpu.kernel("glm53_prompt_glue", "atlas_glm53_hc_mix_rms")?;
+            KernelLaunch::new(gpu, mix)
+                .grid([plan.tokens.div_ceil(4), 1, 1])
+                .block([THREADS, 1, 1])
+                .arg_ptr(buffers.streams_f32.ptr)
+                .arg_ptr(buffers.function_f32.ptr)
+                .arg_ptr(buffers.mixed_f32.ptr)
+                .arg_ptr(inv_rms)
+                .arg_u32(plan.tokens)
+                .arg_u32(HIDDEN)
+                .arg_u32(HC)
+                .arg_f32(NORM_EPS)
+                .launch(stream)?;
+            let kernel = gpu.kernel("glm53_prompt_glue", "atlas_glm53_hc_pre_mixed2")?;
+            return KernelLaunch::new(gpu, kernel)
+                .grid([plan.tokens, 1, 1])
+                .block([THREADS, 1, 1])
+                .arg_ptr(buffers.streams_f32.ptr)
+                .arg_ptr(buffers.mixed_f32.ptr)
+                .arg_ptr(inv_rms)
+                .arg_ptr(buffers.scale_f32.ptr)
+                .arg_ptr(buffers.base_f32.ptr)
+                .arg_ptr(buffers.collapsed_bf16.ptr)
+                .arg_ptr(buffers.post_bf16.ptr)
+                .arg_ptr(buffers.comb_bf16.ptr)
+                .arg_u32(HIDDEN)
+                .arg_u32(HC)
+                .arg_u32(SINKHORN_ITERS)
+                .arg_f32(NORM_EPS)
+                .arg_f32(HC_EPS)
+                .launch(stream);
+        }
+        spark_runtime::cublaslt::f32_gemm_act_weight_t(
+            buffers.streams_f32.ptr.0,
+            buffers.function_f32.ptr.0,
+            buffers.mixed_f32.ptr.0,
+            plan.tokens,
+            MIX,
+            HC * HIDDEN,
+            stream,
+        )?;
+        let kernel = gpu.kernel("glm53_prompt_glue", "atlas_glm53_hc_pre_mixed")?;
+        KernelLaunch::new(gpu, kernel)
+            .grid([plan.tokens, 1, 1])
+            .block([THREADS, 1, 1])
+            .arg_ptr(buffers.streams_f32.ptr)
+            .arg_ptr(buffers.mixed_f32.ptr)
+            .arg_ptr(buffers.scale_f32.ptr)
+            .arg_ptr(buffers.base_f32.ptr)
+            .arg_ptr(buffers.collapsed_bf16.ptr)
+            .arg_ptr(buffers.post_bf16.ptr)
+            .arg_ptr(buffers.comb_bf16.ptr)
+            .arg_u32(HIDDEN)
+            .arg_u32(HC)
+            .arg_u32(SINKHORN_ITERS)
+            .arg_f32(NORM_EPS)
+            .arg_f32(HC_EPS)
+            .launch(stream)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +490,7 @@ mod tests {
                     &gpu,
                     plan,
                     Glm53HyperPreBuffers {
+                        mixed_f32: GgmlIqBuffer { ptr: DevicePtr::NULL, bytes: 0 },
                         streams_f32: streams,
                         function_f32: function,
                         base_f32: base,
@@ -357,6 +510,7 @@ mod tests {
                 &gpu,
                 plan,
                 Glm53HyperPreBuffers {
+                    mixed_f32: GgmlIqBuffer { ptr: DevicePtr::NULL, bytes: 0 },
                     streams_f32: streams,
                     function_f32: function,
                     base_f32: base,

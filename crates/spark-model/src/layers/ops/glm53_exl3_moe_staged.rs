@@ -48,9 +48,9 @@ impl Glm53Exl3MoeKernels {
         }
         gather.launch(stream)?;
         KernelLaunch::new(gpu, staged.gate_up)
-            .grid([INTERMEDIATE / STAGED_TILE_N, plan.max_chunks, 2])
+            .grid([INTERMEDIATE / staged.tile_n, plan.max_chunks, 2])
             .block([STAGED_BLOCK_THREADS, 1, 1])
-            .shared_mem(STAGED_SHARED_MEMORY_BYTES)
+            .shared_mem(staged.shared_bytes)
             .arg_ptr(buffers.temp_state_g_f16.ptr)
             .arg_ptr(buffers.temp_state_u_f16.ptr)
             .arg_ptr(buffers.temp_intermediate_g_f16.ptr)
@@ -81,9 +81,9 @@ impl Glm53Exl3MoeKernels {
         }
         activate.launch(stream)?;
         KernelLaunch::new(gpu, staged.down)
-            .grid([HIDDEN / STAGED_TILE_N, plan.max_chunks, 1])
+            .grid([HIDDEN / staged.tile_n, plan.max_chunks, 1])
             .block([STAGED_BLOCK_THREADS, 1, 1])
-            .shared_mem(STAGED_SHARED_MEMORY_BYTES)
+            .shared_mem(staged.shared_bytes)
             .arg_ptr(buffers.temp_intermediate_g_f16.ptr)
             .arg_ptr(buffers.temp_state_g_f16.ptr)
             .arg_ptr(p.down_trellis.ptr)

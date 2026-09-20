@@ -537,6 +537,14 @@ impl<'w> Glm53Dispatcher<'w> {
                 collapsed_bf16: self.bound.collapsed,
                 post_bf16: self.bound.hyper_post,
                 comb_bf16: self.bound.hyper_comb,
+                mixed_f32: if self.plan.tokens > 1 {
+                    self.scratch.prompt_f32_scratch()
+                } else {
+                    GgmlIqBuffer {
+                        ptr: spark_runtime::gpu::DevicePtr::NULL,
+                        bytes: 0,
+                    }
+                },
             },
             stream,
         )?;
@@ -838,6 +846,14 @@ impl<'w> Glm53Dispatcher<'w> {
                         weights_f32: route_weights,
                         probs_f32: router_probs,
                         biased_f32: router_biased,
+                        scratch_f32: if exl3_rows > 1 {
+                            self.scratch.prompt_f32_scratch()
+                        } else {
+                            GgmlIqBuffer {
+                                ptr: spark_runtime::gpu::DevicePtr::NULL,
+                                bytes: 0,
+                            }
+                        },
                     },
                     stream,
                 )?;

@@ -321,6 +321,7 @@ impl Glm53DsaAttentionKernels {
 
     fn absorb_exl3_bank(
         &self,
+        // (see `dsa_absorb_gemm_active` below for the batched cuBLASLt opt-in)
         gpu: &dyn GpuBackend,
         key_bank: bool,
         rows: u32,
@@ -344,6 +345,29 @@ impl Glm53DsaAttentionKernels {
                 && output.bytes >= rows as usize * HEADS as usize * output_dim as usize * 2,
             "GLM EXL3 DSA bank buffer extent drift"
         );
+        if dsa_absorb_gemm_active(rows)? {
+            // Per head: key  C[rows,512] = A[rows,256] @ K_b[256,512]
+            //           value C[rows,256] = A[rows,512] @ V_b[256,512]^T
+            // Head strides: input rows*input_dim, weight 2*256*512, output rows*output_dim.
+            return spark_runtime::cublaslt::bf16_gemm_batched(
+                input.ptr.0,
+                weight.0,
+                output.ptr.0,
+                rows,
+                output_dim,
+                input_dim,
+                !key_bank,
+                spark_runtime::cublaslt::StridedBatch {
+                    count: i32::try_from(HEADS)?,
+                    stride_act: i64::from(rows) * i64::from(input_dim),
+                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
+                    stride_out: i64::from(rows) * i64::from(output_dim),
+                    ld_act: 0,
+                    ld_out: 0,
+                },
+                stream,
+            );
+        }
         KernelLaunch::new(gpu, kernel)
             .grid([HEADS, output_dim.div_ceil(32), rows.div_ceil(16)])
             .block([128, 1, 1])
@@ -622,6 +646,37 @@ impl Glm53DsaAttentionKernels {
             Some(projection_scratch),
             stream,
         )?;
+        if dsa_absorb_gemm_active(rows)? {
+            // Token-major in/out directly: per head A = q_b + head*256 (ld 64*256),
+            // C = absorbed_q + head*512 (ld 64*512). No transposes.
+            let weight = weights_ref
+                .exl3_absorption_bank(true)?
+                .context("GLM EXL3 DSA key absorption bank is missing")?;
+            ensure!(
+                buffers.q_b_bf16.bytes >= rows as usize * HEADS as usize * HEAD_DIM as usize * 2
+                    && buffers.absorbed_q_bf16.bytes
+                        >= rows as usize * HEADS as usize * LATENT as usize * 2,
+                "GLM EXL3 DSA strided key bank extent drift"
+            );
+            spark_runtime::cublaslt::bf16_gemm_batched(
+                buffers.q_b_bf16.ptr.0,
+                weight.0,
+                buffers.absorbed_q_bf16.ptr.0,
+                rows,
+                LATENT,
+                HEAD_DIM,
+                false,
+                spark_runtime::cublaslt::StridedBatch {
+                    count: i32::try_from(HEADS)?,
+                    stride_act: i64::from(HEAD_DIM),
+                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
+                    stride_out: i64::from(LATENT),
+                    ld_act: i64::from(HEADS) * i64::from(HEAD_DIM),
+                    ld_out: i64::from(HEADS) * i64::from(LATENT),
+                },
+                stream,
+            )?;
+        } else {
         self.selected.transpose_heads(
             gpu,
             rows,
@@ -655,6 +710,7 @@ impl Glm53DsaAttentionKernels {
             },
             stream,
         )?;
+        }
 
         if layer_major {
             self.linear_dsa_rows(
@@ -1762,6 +1818,34 @@ impl Glm53DsaAttentionKernels {
             query_validity_u8: query_validity,
             output_weighted_latent_bf16: buffers.weighted_latent_bf16,
         };
+        // Kernel oracle: the dense-causal attention for one layer. `q_offset`,
+        // `kv_len` and `inv_sqrt_d` go in the manifest because the kernel takes
+        // them as scalars and 0.0625 is 256^-0.5, NOT 512^-0.5.
+        crate::model::glm53::oracle_dump::dump_site(
+            gpu,
+            stream,
+            "dsa_dense_causal_in",
+            &[
+                crate::model::glm53::oracle_dump::t(
+                    "absorbed_q", buffers.absorbed_q_bf16.ptr,
+                    rows as usize * 64 * LATENT as usize * 2, "bf16",
+                    &[rows as usize, 64, LATENT as usize]),
+                crate::model::glm53::oracle_dump::t(
+                    "latent_kv", cache.latent_cache_bf16.ptr,
+                    sequence_length as usize * LATENT as usize * 2, "bf16",
+                    &[sequence_length as usize, LATENT as usize]),
+            ],
+            &[
+                ("q_len", rows.to_string()),
+                ("kv_len", sequence_length.to_string()),
+                ("q_offset", geometry.position.to_string()),
+                ("num_q_heads", "64".into()),
+                ("num_kv_heads", "1".into()),
+                ("head_dim", LATENT.to_string()),
+                ("causal_mask_enabled", "1".into()),
+                ("inv_sqrt_d", "0.0625".into()),
+            ],
+        )?;
         if dense_full_coverage {
             self.selected.launch_dense_causal(
                 gpu,
@@ -1775,6 +1859,16 @@ impl Glm53DsaAttentionKernels {
             self.selected
                 .launch(gpu, selected_plan, selected_buffers, stream)?;
         }
+        crate::model::glm53::oracle_dump::dump_site(
+            gpu,
+            stream,
+            "dsa_dense_causal_out",
+            &[crate::model::glm53::oracle_dump::t(
+                "weighted_latent", buffers.weighted_latent_bf16.ptr,
+                rows as usize * 64 * LATENT as usize * 2, "bf16",
+                &[rows as usize, 64, LATENT as usize])],
+            &[("q_len", rows.to_string())],
+        )?;
         launches += 1;
         {
             // Bring-up diagnostic (ATLAS_GLM53_DUMP_DIR): DSA intermediates, so a
@@ -1844,6 +1938,39 @@ impl Glm53DsaAttentionKernels {
         }
 
         // Un-absorb W_vb, one head at a time, then project out.
+        if dsa_absorb_gemm_active(rows)? {
+            // Token-major strided batch: A = weighted_latent + head*512 (ld 64*512),
+            // C = unabsorbed + head*256 (ld 64*256); V_b is [N=256, K=512] per head.
+            let weight = weights
+                .exl3_absorption_bank(false)?
+                .context("GLM EXL3 DSA value absorption bank is missing")?;
+            ensure!(
+                buffers.weighted_latent_bf16.bytes
+                    >= rows as usize * HEADS as usize * LATENT as usize * 2
+                    && buffers.unabsorbed_bf16.bytes
+                        >= rows as usize * HEADS as usize * HEAD_DIM as usize * 2,
+                "GLM EXL3 DSA strided value bank extent drift"
+            );
+            spark_runtime::cublaslt::bf16_gemm_batched(
+                buffers.weighted_latent_bf16.ptr.0,
+                weight.0,
+                buffers.unabsorbed_bf16.ptr.0,
+                rows,
+                HEAD_DIM,
+                LATENT,
+                true,
+                spark_runtime::cublaslt::StridedBatch {
+                    count: i32::try_from(HEADS)?,
+                    stride_act: i64::from(LATENT),
+                    stride_weight: 2 * i64::from(HEAD_DIM) * i64::from(LATENT),
+                    stride_out: i64::from(HEAD_DIM),
+                    ld_act: i64::from(HEADS) * i64::from(LATENT),
+                    ld_out: i64::from(HEADS) * i64::from(HEAD_DIM),
+                },
+                stream,
+            )?;
+            launches += 1;
+        } else {
         if rows > 1 {
             self.selected.transpose_heads(
                 gpu,
@@ -1907,6 +2034,7 @@ impl Glm53DsaAttentionKernels {
                 },
                 stream,
             )?;
+        }
         }
         self.linear_dsa_rows(
             gpu,
@@ -2193,3 +2321,23 @@ impl Glm53DsaLayerGeometry {
 #[cfg(test)]
 #[path = "dsa_attention_tests.rs"]
 mod tests;
+
+/// `ATLAS_GLM53_DSA_ABSORB_GEMM=1`: prompt-scope DSA K/V absorption banks as one
+/// strided-batched cuBLASLt BF16 GEMM over the 64 heads instead of the 16x32-tile
+/// MMA kernel (5.4 ms per launch at 2047 rows). Same bf16-in/f32-acc math,
+/// different summation order.
+fn dsa_absorb_gemm_active(rows: u32) -> Result<bool> {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    let enabled = ENABLED
+        .get_or_init(|| match std::env::var("ATLAS_GLM53_DSA_ABSORB_GEMM") {
+            Ok(v) if v == "1" => Ok(true),
+            Ok(v) if v == "0" => Ok(false),
+            Ok(other) => Err(format!("ATLAS_GLM53_DSA_ABSORB_GEMM must be 0 or 1, got {other:?}")),
+            Err(std::env::VarError::NotPresent) => Ok(false),
+            Err(e) => Err(format!("ATLAS_GLM53_DSA_ABSORB_GEMM: {e}")),
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)?;
+    Ok(enabled && rows >= 144 && glm53_layer_major_prefill_active())
+}

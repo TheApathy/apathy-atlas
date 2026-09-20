@@ -78,6 +78,8 @@ pub struct Glm53RouterBuffers {
     pub probs_f32: GgmlIqBuffer,
     /// sigmoid(logits) + `exp_probs_b` — the score selection actually ranks on.
     pub biased_f32: GgmlIqBuffer,
+    /// Prompt-scope F32 staging for the cuBLASLt logits GEMM (NULL outside it).
+    pub scratch_f32: GgmlIqBuffer,
 }
 
 pub struct Glm53RouterKernels {
@@ -120,6 +122,10 @@ impl Glm53RouterKernels {
         stream: u64,
     ) -> Result<()> {
         validate_buffers(plan, buffers)?;
+        if router_gemm_active(plan.tokens)? && !buffers.scratch_f32.ptr.is_null() {
+            self.launch_logits_gemm(gpu, plan, buffers, stream)?;
+            return self.launch_topk(gpu, plan, buffers, stream);
+        }
         let tokens_per_block = select_logits_tokens_per_block(self.logits_mode, plan.tokens);
         let (logits, logits_blocks) = match tokens_per_block {
             1 => (self.logits, plan.logits_blocks),
@@ -147,6 +153,16 @@ impl Glm53RouterKernels {
             .arg_u32(plan.hidden)
             .arg_u32(plan.experts)
             .launch(stream)?;
+        self.launch_topk(gpu, plan, buffers, stream)
+    }
+
+    fn launch_topk(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53RouterPlan,
+        buffers: Glm53RouterBuffers,
+        stream: u64,
+    ) -> Result<()> {
         KernelLaunch::new(gpu, self.topk)
             .grid([plan.tokens, 1, 1])
             .block([THREADS, 1, 1])
@@ -161,6 +177,59 @@ impl Glm53RouterKernels {
             .arg_u32(plan.top_k)
             .arg_f32(2.5)
             .launch(stream)
+    }
+}
+
+/// `ATLAS_GLM53_ROUTER_GEMM=1`: prompt-scope router logits through cuBLASLt
+/// f32 (input cast bf16->f32 into the prompt scratch). Same math, fp32 sums in
+/// a different order; the top-k kernel is unchanged.
+fn router_gemm_active(tokens: u32) -> Result<bool> {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    let enabled = ENABLED
+        .get_or_init(|| match std::env::var("ATLAS_GLM53_ROUTER_GEMM") {
+            Ok(v) if v == "1" => Ok(true),
+            Ok(v) if v == "0" => Ok(false),
+            Ok(other) => Err(format!("ATLAS_GLM53_ROUTER_GEMM must be 0 or 1, got {other:?}")),
+            Err(std::env::VarError::NotPresent) => Ok(false),
+            Err(e) => Err(format!("ATLAS_GLM53_ROUTER_GEMM: {e}")),
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)?;
+    Ok(enabled && tokens >= 144 && crate::layers::ops::glm53_layer_major_prefill_active())
+}
+
+impl Glm53RouterKernels {
+    fn launch_logits_gemm(
+        &self,
+        gpu: &dyn GpuBackend,
+        plan: Glm53RouterPlan,
+        buffers: Glm53RouterBuffers,
+        stream: u64,
+    ) -> Result<()> {
+        let elements = plan.tokens * plan.hidden;
+        let f32_bytes = usize::try_from(elements)? * 4;
+        anyhow::ensure!(
+            buffers.scratch_f32.bytes >= f32_bytes,
+            "GLM router f32 scratch too small"
+        );
+        let cast = gpu.kernel("glm53_prompt_glue", "atlas_glm53_prompt_bf16_to_f32")?;
+        KernelLaunch::new(gpu, cast)
+            .grid([elements.div_ceil(256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(buffers.input_bf16.ptr)
+            .arg_ptr(buffers.scratch_f32.ptr)
+            .arg_u32(elements)
+            .launch(stream)?;
+        spark_runtime::cublaslt::f32_gemm_act_weight_t(
+            buffers.scratch_f32.ptr.0,
+            buffers.router_f32.ptr.0,
+            buffers.logits_f32.ptr.0,
+            plan.tokens,
+            plan.experts,
+            plan.hidden,
+            stream,
+        )
     }
 }
 
@@ -325,6 +394,7 @@ mod tests {
             bytes,
         };
         let valid = Glm53RouterBuffers {
+            scratch_f32: GgmlIqBuffer { ptr: DevicePtr::NULL, bytes: 0 },
             input_bf16: buffer(0x10_0000, plan.input_bytes),
             router_f32: buffer(0x20_0000, plan.router_bytes),
             bias_f32: buffer(0x70_0000, plan.bias_bytes),
@@ -340,6 +410,7 @@ mod tests {
                     &gpu,
                     plan,
                     Glm53RouterBuffers {
+                        scratch_f32: GgmlIqBuffer { ptr: DevicePtr::NULL, bytes: 0 },
                         logits_f32: buffer(valid.router_f32.ptr.0, plan.logits_bytes),
                         ..valid
                     },
