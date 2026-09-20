@@ -173,7 +173,7 @@ struct TunedPlan {
 unsafe impl Send for TunedPlan {}
 unsafe impl Sync for TunedPlan {}
 
-type PlanShape = (u32, u32, u32);
+type PlanShape = (u32, u32, u32, u32);
 type PlanCache = std::collections::HashMap<PlanShape, &'static TunedPlan>;
 
 static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
@@ -184,9 +184,9 @@ static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
 /// another stream is mid graph-capture), and cache the winner. The naive
 /// heuristic[0] pick left the K=8 verify o_proj at 113 GB/s (~24 CTAs on 48
 /// SMs, no split-K) — tuning recovers the split-K/tile choice per shape.
-fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
+fn tuned_plan(m: u32, n: u32, k: u32, ldc: u32) -> Result<&'static TunedPlan> {
     let plans = PLANS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(p) = plans.lock().unwrap().get(&(m, n, k)) {
+    if let Some(p) = plans.lock().unwrap().get(&(m, n, k, ldc)) {
         return Ok(p);
     }
     let ctx = ctx()?;
@@ -228,7 +228,7 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, ldc as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -283,7 +283,7 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             "tuneAllocA",
         )?;
         chk(
-            cuMemAlloc_v2(&mut dd, m as usize * n as usize * 2),
+            cuMemAlloc_v2(&mut dd, m as usize * ldc as usize * 2),
             "tuneAllocD",
         )?;
         cuMemsetD8_v2(dw, 0, n as usize * k as usize * 2);
@@ -361,7 +361,7 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             ld: ld_ as usize,
             algo: results[best].algo,
         }));
-        plans.lock().unwrap().insert((m, n, k), plan);
+        plans.lock().unwrap().insert((m, n, k, ldc), plan);
         Ok(plan)
     }
 }
@@ -377,9 +377,27 @@ pub fn bf16_gemm_act_weight_t_tuned(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let plan = tuned_plan(m, n, k)?;
+    bf16_gemm_act_weight_t_tuned_ex(act, weight, out, m, n, k, n, 1.0, stream)
+}
+
+/// Tuned variant with explicit output stride and alpha (plans cached per (m,n,k,ldc)).
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_tuned_ex(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldc: u32,
+    alpha: f32,
+    stream: u64,
+) -> Result<()> {
+    if ldc < n {
+        bail!("cuBLASLt: ldc {ldc} < n {n}");
+    }
+    let plan = tuned_plan(m, n, k, ldc)?;
     let ctx = ctx()?;
-    let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
     unsafe {
         chk(
@@ -418,6 +436,26 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    bf16_gemm_act_weight_t_ldc(act, weight, out, m, n, k, n, 1.0, stream)
+}
+
+/// [`bf16_gemm_act_weight_t`] with an explicit output row stride `ldc >= n`
+/// (elements), so a projection can land inside a wider interleaved row.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_ldc(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldc: u32,
+    alpha: f32,
+    stream: u64,
+) -> Result<()> {
+    if ldc < n {
+        bail!("cuBLASLt: ldc {ldc} < n {n}");
+    }
     let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -460,7 +498,7 @@ pub fn bf16_gemm_act_weight_t(
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, ldc as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -497,7 +535,7 @@ pub fn bf16_gemm_act_weight_t(
         if returned < 1 {
             bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
         }
-        let alpha: f32 = 1.0;
+        let alpha: f32 = alpha;
         let beta: f32 = 0.0;
         let status = cublasLtMatmul(
             ctx.handle,

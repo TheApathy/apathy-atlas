@@ -114,7 +114,7 @@ impl MoeLayer {
         let gemm = |a: DevicePtr, table: &ExpertPtrTable, c: DevicePtr, n: u32, k: u32| {
             KernelLaunch::new(ctx.gpu, kernels.gemm)
                 .grid([abi::GRID, 1, 1])
-                .block([128, 1, 1])
+                .block([kernels.block, 1, 1])
                 .arg_ptr(a)
                 .arg_ptr(table.packed_ptrs)
                 .arg_ptr(table.scale_ptrs)
@@ -131,6 +131,31 @@ impl MoeLayer {
         };
         let gate = ctx.buffers.expert_gate_out();
         let up = ctx.buffers.expert_up_out();
+        if let Some(gateup) = kernels.gateup {
+            ensure!(!check, "fused gate/up rejects the compact CHECK path");
+            // One A tile feeds both accumulators; the epilogue applies the
+            // shipping silu*up on the BF16-rounded values and writes the
+            // activated result into the gate buffer (what silu_mul produced).
+            KernelLaunch::new(ctx.gpu, gateup)
+                .grid([abi::GRID, 1, 1])
+                .block([128, 1, 1])
+                .arg_ptr(input)
+                .arg_ptr(gate_table.packed_ptrs)
+                .arg_ptr(gate_table.scale_ptrs)
+                .arg_ptr(gate_table.scale2_vals)
+                .arg_ptr(gate)
+                .arg_ptr(up_table.packed_ptrs)
+                .arg_ptr(up_table.scale_ptrs)
+                .arg_ptr(up_table.scale2_vals)
+                .arg_ptr(offsets)
+                .arg_ptr(sorted_ids)
+                .arg_ptr(contract)
+                .arg_ptr(workspace)
+                .arg_ptr(status)
+                .arg_u32(640)
+                .arg_u32(2560)
+                .launch(stream)?;
+        } else {
         gemm(input, gate_table, gate, 640, 2560)?;
         gemm(input, up_table, up, 640, 2560)?;
         if check {
@@ -147,7 +172,14 @@ impl MoeLayer {
             (rows * 10 * 640) as u32,
             stream,
         )?;
+        }
         gemm(gate, down_table, ctx.buffers.expert_down_out(), 2560, 640)?;
+        // Env-gated oracle capture (ATLAS_QWEN4_ORACLE_DUMP). Records the exact
+        // arguments and results of ONE compact-MoE dispatch so the GEMM can be
+        // replayed standalone. Off by default; costs nothing when unset.
+        self.oracle_capture_compact(
+            input, offsets, sorted_ids, rows, gate_table, up_table, down_table, ctx, stream,
+        )?;
         // PLANNED=1 is not a completion marker: the ordered D2H drains every
         // GEMM first. Only then can unchanged status admit unpermute/blend/HC.
         // Every planner/GEMM failure (including still PENDING) propagates.

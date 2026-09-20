@@ -5,7 +5,7 @@
 #![allow(unused_imports)]
 
 use anyhow::Result;
-use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 use spark_runtime::kv_dequant::{
     NVFP4_E2M1_LUT, TURBO4_LUT, dequant_4bit_block_to_bf16, dequant_fp8_to_bf16,
@@ -141,6 +141,23 @@ fn compute_num_splits(num_q_heads: u32, num_seqs: u32, max_seq_len_host: u32) ->
         max_seq_len_host,
         paged_decode_splitk_enabled(),
     )
+}
+
+const GQA4_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_ATTN_GQA";
+
+fn gqa4_selected() -> bool {
+    static SEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEL.get_or_init(|| std::env::var(GQA4_SELECTOR).ok().as_deref() == Some("1"))
+}
+
+fn gqa4_kernel(gpu: &dyn GpuBackend) -> Result<KernelHandle> {
+    static K: std::sync::OnceLock<Result<KernelHandle, String>> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        gpu.kernel("paged_decode_attn_gqa4", "paged_decode_attn_gqa4")
+            .map_err(|e| e.to_string())
+    })
+    .clone()
+    .map_err(|e| anyhow::anyhow!("{GQA4_SELECTOR}: kernel unavailable: {e}"))
 }
 
 impl Qwen3AttentionLayer {
@@ -632,6 +649,40 @@ impl Qwen3AttentionLayer {
                 // Gemma-4 sliding layers attend only to the last `window_size`
                 // KV positions; full layers (and all non-Gemma-4 models) pass 0.
                 let sliding = self.sliding_window.unwrap_or(0);
+                // Default-off GQA-fused twin (ATLAS_QWEN4_PREFILL_ATTN_GQA=1):
+                // bit-identical per-head math, K/V loads shared by 4 heads.
+                if num_seqs > 1
+                    && sliding == 0
+                    && head_dim == 256
+                    && num_q_heads.is_multiple_of(4)
+                    && (num_q_heads / num_kv_heads).is_multiple_of(4)
+                    && gqa4_selected()
+                {
+                    let kernel = gqa4_kernel(gpu)?;
+                    static LOGGED: std::sync::Once = std::sync::Once::new();
+                    LOGGED.call_once(|| {
+                        tracing::info!("ATTN_PREFILL_GQA4_ENGAGED selector={GQA4_SELECTOR} rows={num_seqs}");
+                    });
+                    return ops::paged_decode_attn_bf16_gqa4(
+                        gpu,
+                        kernel,
+                        q,
+                        kv_cache.k_pool_ptr(self.attn_layer_idx),
+                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        output,
+                        block_table,
+                        seq_lens,
+                        max_blocks_per_seq,
+                        num_seqs,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        block_size,
+                        inv_sqrt_d,
+                        q_stride,
+                        stream,
+                    );
+                }
                 ops::paged_decode_attn_bf16(
                     gpu,
                     kernel,

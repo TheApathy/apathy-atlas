@@ -112,7 +112,12 @@ impl MoeLayer {
         // through unpermute_reduce as spurious contributions. Previously
         // guarded by `ctx.comm.is_some()` (EP only), now unconditional.
         // Mirrors the FP8 path fix (commit 34626d3).
-        {
+        // The compact V2 path writes every expanded row of every buffer it
+        // reads back (gate/up for all sorted slots, down for all slots), so
+        // the 157 MB/layer of zeroing is dead work there.
+        let skip_memset = self.qwen4_compact.is_some_and(|k| k.streamed == false)
+            && super::qwen4_prefill_compact::v2_level().unwrap_or(0) > 0;
+        if !skip_memset {
             let gate_bytes = total_expanded as usize * inter as usize * 2;
             let up_bytes = gate_bytes;
             let down_bytes = total_expanded as usize * h as usize * 2;

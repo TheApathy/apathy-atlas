@@ -12,6 +12,7 @@ pub mod nemotron_moe;
 pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4_fast_proj;
 pub mod qwen4_hyper;
 pub mod qwen4_mtp;
 pub mod qwen4_ple;

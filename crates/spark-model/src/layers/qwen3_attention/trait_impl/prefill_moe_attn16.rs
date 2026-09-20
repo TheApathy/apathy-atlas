@@ -102,7 +102,31 @@ impl Qwen3AttentionLayer {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("attention16 requires QSA"))?;
             qsa.validate_exact_group4()?;
-            for group in 0..rows / 4 {
+            static TILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let tile_sel = *TILE.get_or_init(|| std::env::var("ATLAS_QWEN4_PREFILL_QSA_TILE").ok().as_deref() == Some("1"));
+            if tile_sel {
+                let tile_meta = AttnMetadataDev {
+                    positions: metadata.positions.offset(tile_start * 4),
+                    positions_h: metadata.positions_h.offset(tile_start * 4),
+                    positions_w: metadata.positions_w.offset(tile_start * 4),
+                    slot: metadata.slot.offset(tile_start * 8),
+                    ..metadata
+                };
+                qsa.update_prefill_exact_tile(
+                    packed_inputs,
+                    tile_start,
+                    rows,
+                    kv_cache,
+                    tile_meta,
+                    h as u32,
+                    ctx.config.rms_norm_eps as f32,
+                    ctx.config.rope_theta as f32,
+                    ctx.config.rotary_dim() as u32,
+                    ctx.gpu,
+                    stream,
+                )?;
+            }
+            for group in 0..if tile_sel { 0 } else { rows / 4 } {
                 let row = tile_start + group * 4;
                 let group_meta = AttnMetadataDev {
                     positions: metadata.positions.offset(row * 4),

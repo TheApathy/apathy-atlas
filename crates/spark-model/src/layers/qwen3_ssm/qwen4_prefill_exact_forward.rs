@@ -5,6 +5,35 @@ use super::qwen4_prefill_exact_plan::{Plan, grid32_partition};
 use super::qwen4_prefill_gemm::Projection;
 use super::*;
 
+const GDN_LAZYFINAL_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_GDN_LAZYFINAL";
+
+const CONV_PARALLEL_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_CONV_PARALLEL";
+
+fn conv_parallel_selected() -> bool {
+    static SEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEL.get_or_init(|| std::env::var(CONV_PARALLEL_SELECTOR).ok().as_deref() == Some("1"))
+}
+
+fn conv_parallel_kernels(gpu: &dyn GpuBackend) -> Result<(KernelHandle, KernelHandle)> {
+    static K: std::sync::OnceLock<Result<(KernelHandle, KernelHandle), String>> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let a = gpu
+            .kernel("causal_conv1d_prefill_parallel", "causal_conv1d_update_l2norm_f32_prefill_parallel")
+            .map_err(|e| e.to_string())?;
+        let b = gpu
+            .kernel("causal_conv1d_prefill_parallel", "causal_conv1d_prefill_state_commit")
+            .map_err(|e| e.to_string())?;
+        Ok((a, b))
+    })
+    .clone()
+    .map_err(|e| anyhow::anyhow!("{CONV_PARALLEL_SELECTOR}: kernel unavailable: {e}"))
+}
+
+fn gdn_lazyfinal_selected() -> bool {
+    static SEL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEL.get_or_init(|| matches!(std::env::var(GDN_LAZYFINAL_SELECTOR).ok().as_deref(), Some("1") | Some("2")))
+}
+
 impl Qwen3SsmLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prefill_qwen4_ssm_exact(
@@ -28,7 +57,26 @@ impl Qwen3SsmLayer {
         let input =
             attn.prepare_prefill_exact(hidden, residual, rows, ctx.buffers, ctx.gpu, eps, stream)?;
         let deinterleaved = ctx.buffers.ssm_deinterleaved();
-        if projection_mode.uses_gemm(Projection::Qkvz) {
+        let fast = crate::layers::qwen4_fast_proj::selection()?;
+        if fast.ssm {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "SSM_PREFILL_FAST_ENGAGED selector={} rows={rows} projection=dequant_cublaslt_bf16_non_bit_exact",
+                    crate::layers::qwen4_fast_proj::SELECTOR
+                );
+            });
+            crate::layers::qwen4_fast_proj::dequant_gemm(
+                ctx.gpu,
+                input,
+                self.qkvz_nvfp4.as_ref().expect("admitted NVFP4 QKVZ"),
+                deinterleaved,
+                rows,
+                Plan::QKVZ,
+                Plan::H,
+                stream,
+            )?;
+        } else if projection_mode.uses_gemm(Projection::Qkvz) {
             self.project_prefill_gemm(Projection::Qkvz, input, deinterleaved, rows, ctx, stream)?;
         } else {
             self.project_prefill_exact_tiles(
@@ -63,6 +111,9 @@ impl Qwen3SsmLayer {
         // Each FP32 row holds [Q|K|V|GDN output]. Conv and H state are disjoint;
         // preserve token order inside both kernels, without verify snapshots.
         let conv_rows = ctx.buffers.ssm_conv_out_f32();
+        if conv_parallel_selected() {
+            self.conv_prefill_parallel(state.conv_state, deinterleaved, conv_rows, rows, ctx, stream)?;
+        } else {
         ops::conv1d_update_l2norm_f32_sequence(
             ctx.gpu,
             self.conv1d_l2norm_f32_sequence_k,
@@ -82,10 +133,39 @@ impl Qwen3SsmLayer {
             0,
             stream,
         )?;
+        }
         let gdn_rows = conv_rows.offset(Plan::CONV_DIM * 4);
+        // Default-off: the register-resident lazy-commit twin of the nosnap
+        // kernel (identical arithmetic order, no per-token snapshot writes,
+        // H kept in registers instead of 2 global passes per token).
+        let gdn_kernel = if gdn_lazyfinal_selected() {
+            static K: std::sync::OnceLock<Result<KernelHandle, String>> = std::sync::OnceLock::new();
+            let k = K
+                .get_or_init(|| {
+                    ctx.gpu
+                        .kernel(
+                            "gated_delta_rule_prefill_regfinal",
+                            if std::env::var(GDN_LAZYFINAL_SELECTOR).ok().as_deref() == Some("2") {
+                                "gated_delta_rule_prefill_f32_sequence_regfinal_pf"
+                            } else {
+                                "gated_delta_rule_prefill_f32_sequence_regfinal"
+                            },
+                        )
+                        .map_err(|e| e.to_string())
+                })
+                .clone()
+                .map_err(|e| anyhow::anyhow!("{GDN_LAZYFINAL_SELECTOR}: kernel unavailable: {e}"))?;
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!("SSM_PREFILL_GDN_REGFINAL_ENGAGED selector={GDN_LAZYFINAL_SELECTOR} rows={rows}");
+            });
+            k
+        } else {
+            self.gdn_f32_sequence_nosnap_k
+        };
         ops::gdn_decode_f32_sequence(
             ctx.gpu,
-            self.gdn_f32_sequence_nosnap_k,
+            gdn_kernel,
             state.h_state,
             conv_rows,
             conv_rows.offset(Plan::KEY_DIM * 4),
@@ -124,7 +204,18 @@ impl Qwen3SsmLayer {
             stream,
         )?;
         let output = ctx.buffers.moe_output();
-        if projection_mode.uses_gemm(Projection::Output) {
+        if fast.ssm {
+            crate::layers::qwen4_fast_proj::dequant_gemm(
+                ctx.gpu,
+                normed,
+                &self.ssm.out_proj,
+                output,
+                rows,
+                Plan::H,
+                Plan::VALUE_DIM,
+                stream,
+            )?;
+        } else if projection_mode.uses_gemm(Projection::Output) {
             self.project_prefill_gemm(Projection::Output, normed, output, rows, ctx, stream)?;
         } else {
             self.project_prefill_exact_tiles(
@@ -143,6 +234,51 @@ impl Qwen3SsmLayer {
             check.verify(self, hidden, residual, rows, state, ctx, stream)?;
         }
         Ok(())
+    }
+
+    /// Token-parallel exact conv1d (+ per-head L2) and shift-register commit.
+    fn conv_prefill_parallel(
+        &self,
+        conv_state: DevicePtr,
+        input: DevicePtr,
+        output: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+        let (conv_k, commit_k) = conv_parallel_kernels(ctx.gpu)?;
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            tracing::info!("SSM_PREFILL_CONV_PARALLEL_ENGAGED selector={CONV_PARALLEL_SELECTOR} rows={rows}");
+        });
+        KernelLaunch::new(ctx.gpu, conv_k)
+            .grid([div_ceil(Plan::CONV_DIM as u32, 256), rows as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(conv_state)
+            .arg_ptr(input)
+            .arg_ptr(self.ssm.conv1d.weight)
+            .arg_ptr(DevicePtr::NULL)
+            .arg_ptr(output)
+            .arg_u32(rows as u32)
+            .arg_u32(Plan::CONV_DIM as u32)
+            .arg_u32(4)
+            .arg_u32((Plan::KEY_DIM * 2) as u32)
+            .arg_u32(128)
+            .arg_f32(1e-6)
+            .arg_u32(Plan::QKVZ as u32)
+            .arg_u32(Plan::QKVZ as u32)
+            .launch(stream)?;
+        KernelLaunch::new(ctx.gpu, commit_k)
+            .grid([div_ceil(Plan::CONV_DIM as u32, 256), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(conv_state)
+            .arg_ptr(input)
+            .arg_u32(rows as u32)
+            .arg_u32(Plan::CONV_DIM as u32)
+            .arg_u32(4)
+            .arg_u32(Plan::QKVZ as u32)
+            .launch(stream)
     }
 
     #[allow(clippy::too_many_arguments)]

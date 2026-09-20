@@ -2,7 +2,7 @@
 
 //! Default-off F8-only original-layout BF16-MMA compact scheduling.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{GpuBackend, KernelHandle};
 
@@ -14,6 +14,21 @@ pub(crate) const CHECK_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_COMPACT_CHECK";
 pub(crate) const K32_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_COMPACT_K32";
 pub(crate) const TRANSPOSED_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_COMPACT_T";
 pub(crate) const STREAM_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_STREAM_T";
+pub(crate) const V2_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_COMPACT_V2";
+
+/// 0 = shipping kernel, 1 = pipelined v2 (64x64), 2 = v3 (64x128, 256 threads),
+/// 3 = v3 down + fused gate/up/silu (64x64, 128 threads).
+pub(crate) fn v2_level() -> Result<u32> {
+    match std::env::var(V2_SELECTOR) {
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Ok(v) if v == "0" => Ok(0),
+        Ok(v) if v == "1" => Ok(1),
+        Ok(v) if v == "2" => Ok(2),
+        Ok(v) if v == "3" => Ok(3),
+        Ok(v) => bail!("{V2_SELECTOR} must be absent, 0, 1, 2 or 3; got {v:?}"),
+        Err(e) => Err(e).with_context(|| format!("invalid {V2_SELECTOR}")),
+    }
+}
 
 fn flag(name: &str) -> Result<bool> {
     let value = match std::env::var(name) {
@@ -137,6 +152,8 @@ pub(crate) fn admit_request(config: &ModelConfig, rows: usize, start: usize) -> 
 pub(super) struct Kernels {
     pub plan: KernelHandle,
     pub gemm: KernelHandle,
+    pub block: u32,
+    pub gateup: Option<KernelHandle>,
     pub step_k: u32,
     pub transposed: bool,
     pub streamed: bool,
@@ -191,9 +208,27 @@ pub(super) fn load(gpu: &dyn GpuBackend, config: &ModelConfig) -> Result<Option<
         ),
         _ => unreachable!("validated compact layout and STEP_K"),
     };
+    // Default-off V2 GEMM (same ABI/plan/workspace, pipelined kernel body).
+    let v2 = transposed && step_k == 32 && v2_level()? > 0;
+    let (plan_handle, gemm_handle, block, gateup) = if v2 {
+        let name = if v2_level()? >= 2 { "qwen4_moe_compact_t_gemm_k32_v3" } else { "qwen4_moe_compact_t_gemm_k32_v2" };
+        let gemm = gpu.kernel("qwen4_moe_compact_t_k32_v2", name)?;
+        let plan = gpu.kernel("qwen4_moe_compact_t_k32_v2", "qwen4_moe_compact_t_plan_k32_v2")?;
+        let gateup = if v2_level()? >= 3 {
+            Some(gpu.kernel("qwen4_moe_compact_t_k32_v2", "qwen4_moe_compact_t_gemm_gateup_k32")?)
+        } else {
+            None
+        };
+        tracing::info!("MOE_PREFILL_COMPACT_V2_SELECTED selector={V2_SELECTOR} kernel={name} fused_gateup={}", gateup.is_some());
+        (plan, gemm, if v2_level()? >= 2 { 256 } else { 128 }, gateup)
+    } else {
+        (gpu.kernel(module, plan)?, gpu.kernel(module, gemm)?, 128, None)
+    };
     let kernels = Some(Kernels {
-        plan: gpu.kernel(module, plan)?,
-        gemm: gpu.kernel(module, gemm)?,
+        plan: plan_handle,
+        gemm: gemm_handle,
+        block,
+        gateup,
         step_k,
         transposed,
         streamed,

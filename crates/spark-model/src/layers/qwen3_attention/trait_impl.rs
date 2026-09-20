@@ -12,6 +12,7 @@ use crate::layers::FfnComponent;
 
 mod decode_inner;
 mod multi_seq;
+mod prefill_fast_attn;
 mod prefill_inner;
 mod prefill_moe_admit;
 mod prefill_moe_attn16;

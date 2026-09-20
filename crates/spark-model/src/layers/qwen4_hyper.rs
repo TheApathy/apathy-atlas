@@ -13,6 +13,7 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 mod prefill_exact_admission;
 mod prefill_exact_check;
 mod prefill_exact_plan;
+mod prefill_fast;
 mod prefill_tile;
 
 pub struct Qwen4HyperConnection {
@@ -382,6 +383,9 @@ impl Qwen4HyperConnection {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.validate_prefill_exact(hyper, residual, num_tokens, buffers, eps)?;
+        if crate::layers::qwen4_fast_proj::selection()?.hc {
+            return self.prepare_prefill_fast(hyper, residual, num_tokens, buffers, gpu, eps, stream);
+        }
         let r = self.residual_width();
         let mut start = 0;
         while start < num_tokens {

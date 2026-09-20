@@ -66,6 +66,38 @@ impl Qwen3AttentionLayer {
             None
         };
         let attn32 = exact_attn16 && qwen4_prefill_moe::attn16::core32_selected()?;
+        if crate::layers::qwen4_fast_proj::selection()?.attn {
+            anyhow::ensure!(
+                exact_hyper && exact_qkv16 && exact_o16 && exact_attn16,
+                "{} attn requires HC_EXACT, ATTN_QKV16, ATTN_O16 and ATTN_CORE16",
+                crate::layers::qwen4_fast_proj::SELECTOR
+            );
+            self.prefill_moe_only_fast_attn(
+                attn_hyper,
+                hidden,
+                residual,
+                num_tokens,
+                packed_inputs,
+                raw_outputs,
+                core_bytes,
+                attn_width,
+                attn_row_bytes,
+                block_table,
+                kv_cache,
+                attn16_device,
+                attn32,
+                ctx,
+                stream,
+            )?;
+            qwen4_prefill_moe::finish(
+                mlp_hyper, &self.ffn, hidden, residual, num_tokens, ctx, stream,
+            )?;
+            crate::model::qwen4_prefill_engagement::engage(
+                crate::model::qwen4_prefill_engagement::PrefillPath::Attention,
+                num_tokens,
+            )?;
+            return Ok(());
+        }
         let mut tile_start = 0;
         while tile_start < num_tokens {
             let tile_rows = if attn32 && num_tokens - tile_start >= 32 {

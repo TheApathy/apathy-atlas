@@ -266,11 +266,14 @@ impl TransformerModel {
                 && !dir.is_empty()
             {
                 self.gpu.synchronize(stream)?;
-                let last_start = (proc_count - 1) * h;
+                // Rows of the residual stream are residual_width() wide (4*h for
+                // the Qwen4 hyperconnection models); dump the whole last row.
+                let rw = self.config.residual_width();
+                let last_start = (proc_count - 1) * rw;
                 let (vals, _) = if self.config.use_fp32_residual() {
-                    self.readback_f32(hidden.offset(last_start * fp32), h)?
+                    self.readback_f32(hidden.offset(last_start * fp32), rw)?
                 } else {
-                    self.readback_bf16(hidden.offset(last_start * fp32), h)?
+                    self.readback_bf16(hidden.offset(last_start * fp32), rw)?
                 };
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::create_dir_all(&dir).ok();
