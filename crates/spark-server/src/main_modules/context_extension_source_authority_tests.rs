@@ -13,7 +13,13 @@ const RUNTIME_SHA256: &str = "5a074f17f89325cf75b8cc2553d1253680e243b622324ccfcd
 const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b365770c07d0804b6bfa6";
 // Reviewed delta: publish effective max_batch_size for early C1 image admission.
 // Removing that single AppState initializer field reproduces the prior hash.
-const SERVE_SHA256: &str = "4d80d111db05a7ab1329309cccd27217e03b6268f9e25c42a70bf4d85b1ab24a";
+// Re-pinned 2026-09-21 for the TUI port. The ONLY change to serve.rs is the
+// `tui::start(..)` call site gaining a third argument (the dashboard's
+// optional ModelHost, passed as `None`) plus the comment explaining it.
+// Diffed before re-pinning: no context-extension path, admission rule or
+// phase ordering moved. The point of this hash is that somebody LOOKS when
+// it breaks — updating it without the diff is how it becomes a rubber stamp.
+const SERVE_SHA256: &str = "2fc2a19424e6723109b77f0f82c517263a01581292569156b1480a31e388743d";
 const SERVE_PHASES_SHA256: &str =
     "e3e84d068c761ff43ad49a04c67d3cd37a8107f99110c919bd016832219c9f1e";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";

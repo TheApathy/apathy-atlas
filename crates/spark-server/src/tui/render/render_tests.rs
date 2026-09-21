@@ -17,7 +17,7 @@ use crate::tui::app::{App, Section};
 
 pub(super) fn app() -> App {
     use clap::Parser;
-    let mut app = App::new(crate::cli::ServeArgs::parse_from([
+    let app = App::new(crate::cli::ServeArgs::parse_from([
         "spark",
         "nvidia/Qwen3.6-27B-NVFP4",
     ]));

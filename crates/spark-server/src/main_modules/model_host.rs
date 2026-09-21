@@ -153,10 +153,13 @@ impl ModelHost {
     /// `Vec` and `PathBuf` — and the chat path called it on EVERY request to
     /// read two booleans. The clone cost more than the decision.
     pub fn auto_swap_enabled(&self) -> bool {
-        self.args
-            .read()
-            .as_ref()
-            .is_some_and(super::auto_swap::enabled)
+        // Always false in this tree: request-triggered swapping needs
+        // `main_modules::auto_swap` and `model_swap`, neither of which was
+        // ported (see the launch toast in `tui::lib_state`). Returning false
+        // is the SAME answer upstream gives when the flag is unset, so every
+        // caller already handles it — this is the feature being absent, not a
+        // stub that could be mistaken for it being off by choice.
+        false
     }
 
     /// Install the dashboard's run-handle channel. Called once, at boot.

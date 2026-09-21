@@ -2,6 +2,11 @@
 
 //! CLI argument parsing.
 
+/// The closed value sets of the enumerated string flags. Mounted here so the
+/// picker reads them as `cli::flag_values`, matching upstream's path.
+#[path = "cli_flag_values.rs"]
+pub(crate) mod flag_values;
+
 use clap::Parser;
 
 /// The crate version, exposed under a name the dashboard can reference.

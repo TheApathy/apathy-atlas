@@ -134,13 +134,15 @@ pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
         tint: BadgeTint::Model,
     });
     out.push(Badge {
+        // Two shape differences from upstream, both real rather than cosmetic:
+        // our `kv_cache_dtype` is a `String` with a clap default of "fp8", not an
+        // `Option` resolved later against MODEL.toml — so it is always concrete
+        // here and "auto" is never the honest label. And this engine has no
+        // `lm_head_dtype` arg at all, so the badge drops that field rather than
+        // printing a placeholder for a knob nobody can set.
         text: format!(
-            "kv {} · lm {} · mtp {}",
-            // Pre-resolution args: an omitted --kv-cache-dtype is decided
-            // later against MODEL.toml, so "auto" is the honest label here.
-            a.kv_cache_dtype.as_deref().unwrap_or("auto"),
-            a.lm_head_dtype,
-            a.mtp_quantization
+            "kv {} · mtp {}",
+            a.kv_cache_dtype, a.mtp_quantization
         ),
         tint: BadgeTint::Quant,
     });
@@ -154,12 +156,10 @@ pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
         });
     } else if a.speculative || a.self_speculative || a.ngram_speculative {
         out.push(Badge {
-            // Pre-resolution args: an omitted --num-drafts is decided later
-            // against MODEL.toml, so the verify width is not yet known.
-            text: match a.num_drafts {
-                Some(n) => format!("MTP k={}", n + 1),
-                None => "MTP k=auto".to_string(),
-            },
+            // `num_drafts` is a plain `usize` here (clap default 1), not an
+            // `Option` resolved later, so the verify width is always known and
+            // there is no "auto" case to render.
+            text: format!("MTP k={}", a.num_drafts + 1),
             tint: BadgeTint::Quant,
         });
     } else {
@@ -193,13 +193,16 @@ pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
     // operator reads "no prefix cache" and cannot tell a deliberate KAT
     // regime from a flag nobody set. This is the banner someone looks at when
     // a score moves, so the regime that moved it has to be on it.
-    if a.hermetic {
+    // No `--hermetic` flag on this engine: the KAT/hermetic regime is an
+    // upstream serve mode we did not port, so there is no state to badge.
+    if false {
         out.push(Badge {
             text: "HERMETIC · KAT".to_string(),
             tint: BadgeTint::Quant,
         });
     }
-    if a.prefix_caching_enabled() {
+    // Ours is a plain bool field, not a resolved accessor.
+    if a.enable_prefix_caching {
         out.push(Badge {
             text: format!(
                 "prefix-cache · ssm {}@{}",

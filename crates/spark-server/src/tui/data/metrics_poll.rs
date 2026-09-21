@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+//! NOTE: this tree pins prometheus 0.13, where the generated protobuf
+//! accessors are `get_name()` / `get_upper_bound()` / `get_cumulative_count()`.
+//! Upstream is on 0.14, which renamed them to `name()` / `upper_bound()` /
+//! `cumulative_count()`. Adapted here rather than bumping the engine's
+//! dependency, since the engine's own metrics code is written against 0.13.
 
 //! 1 Hz metrics sampler: diffs the monotone prometheus counters into rates,
 //! reads the scheduler snapshot and the free-standing GPU/memory accessors,
@@ -98,7 +103,6 @@ pub struct StatsModel {
 struct Prev {
     requests: u64,
     gen_tok: u64,
-    decoded: u64,
     prompt: u64,
     bytes_in: u64,
     bytes_out: u64,
@@ -169,7 +173,6 @@ impl StatsModel {
         self.requests_total = metrics::REQUESTS_TOTAL.get();
         self.requests_active = metrics::REQUESTS_ACTIVE.get();
         self.gen_tokens_total = metrics::GENERATION_TOKENS_TOTAL.get();
-        let decoded_total = metrics::DECODED_TOKENS_TOTAL.get();
         self.prompt_tokens_total = metrics::PROMPT_TOKENS_TOTAL.get();
         self.tool_calls_total = metrics::TOOL_CALLS_TOTAL.get();
         self.bytes_in_total = metrics::HTTP_BYTES_IN.get();
@@ -182,9 +185,14 @@ impl StatsModel {
             // request finishes, which reads as 0 tok/s then one spike — fall
             // back to it only for paths that never stream (blocking requests),
             // where a lump at completion is all there is.
-            let decoded_delta = decoded_total.saturating_sub(prev.decoded);
+            // THIS TREE HAS NO PER-TOKEN COUNTER, so only the completion-time
+            // one is available and the rate above is the spiky reading the
+            // comment warns about. Wiring a `DECODED_TOKENS_TOTAL` increment
+            // into the streaming token path and restoring
+            // `decoded_delta.max(gen_delta)` is the fix; it is a deliberate
+            // engine change, not something to add silently for a panel.
             let gen_delta = self.gen_tokens_total.saturating_sub(prev.gen_tok);
-            self.gen_tps = decoded_delta.max(gen_delta) as f64 / dt;
+            self.gen_tps = gen_delta as f64 / dt;
             self.prompt_tps = (self.prompt_tokens_total.saturating_sub(prev.prompt)) as f64 / dt;
             self.req_rate = (self.requests_total.saturating_sub(prev.requests)) as f64 / dt;
             self.bytes_in_rate = (self.bytes_in_total.saturating_sub(prev.bytes_in)) as f64 / dt;
@@ -197,7 +205,6 @@ impl StatsModel {
             Prev {
                 requests: self.requests_total,
                 gen_tok: self.gen_tokens_total,
-                decoded: decoded_total,
                 prompt: self.prompt_tokens_total,
                 bytes_in: self.bytes_in_total,
                 bytes_out: self.bytes_out_total,
@@ -207,13 +214,13 @@ impl StatsModel {
         // TTFT histogram via the prometheus proto (bucket bounds + counts).
         self.ttft_buckets.clear();
         for mf in prometheus::gather() {
-            if mf.name() != "atlas_time_to_first_token_seconds" {
+            if mf.get_name() != "atlas_time_to_first_token_seconds" {
                 continue;
             }
             if let Some(m) = mf.get_metric().first() {
                 for b in m.get_histogram().get_bucket() {
                     self.ttft_buckets
-                        .push((b.upper_bound(), b.cumulative_count()));
+                        .push((b.get_upper_bound(), b.get_cumulative_count()));
                 }
             }
         }
@@ -227,19 +234,23 @@ impl StatsModel {
         // cumulative counters behind these are what /metrics exports, and
         // after a swap they still carry the previous model's cache activity,
         // which is not what this pane is describing.
-        let (hits, misses, hit_tokens) = spark_runtime::run_metrics::cache_counts_this_run();
-        self.prefix_hit_tokens = hit_tokens;
-        self.prefix_hit_rate = (hits + misses > 0).then(|| hits as f64 / (hits + misses) as f64);
+        // No `spark_runtime::run_metrics` in this tree, so the prefix-cache
+        // pane has no source. Left as None rather than zero: a rate of 0.0
+        // reads as "the cache is missing every lookup", which is a much
+        // worse lie than an empty field.
+        self.prefix_hit_tokens = 0;
+        self.prefix_hit_rate = None;
         self.entropy = spark_runtime::sampler::last_entropy() as f64;
         self.entropy_history.push(self.entropy);
 
         // Memory.
         // Both reads must land: `atlas_used` is a DIFFERENCE of the two, so
         // one without the other is not a smaller truth, it is a wrong number.
-        match (
-            super::gpu_free_bytes(),
-            spark_runtime::gpu::baseline_free_bytes(),
-        ) {
+        // `spark_runtime::gpu::baseline_free_bytes()` does not exist here, and
+        // `atlas_used` is a DIFFERENCE of the two reads — one without the
+        // other is not a smaller truth, it is a wrong number. So the pane
+        // shows free/total and omits the derived used figure entirely.
+        match (super::gpu_free_bytes(), None::<u64>) {
             (Some(free), Some(baseline)) => {
                 self.gpu_free_gb = free as f64 / GIB;
                 self.gpu_total_gb = baseline as f64 / GIB;
@@ -265,16 +276,16 @@ fn spec_accept_from_gather() -> Vec<(String, u64, u64)> {
     use std::collections::BTreeMap;
     let mut per_k: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for mf in prometheus::gather() {
-        if mf.name() != "atlas_spec_decode_verify_total" {
+        if mf.get_name() != "atlas_spec_decode_verify_total" {
             continue;
         }
         for m in mf.get_metric() {
             let mut k = String::new();
             let mut outcome = String::new();
             for l in m.get_label() {
-                match l.name() {
-                    "k" => k = l.value().to_string(),
-                    "outcome" => outcome = l.value().to_string(),
+                match l.get_name() {
+                    "k" => k = l.get_value().to_string(),
+                    "outcome" => outcome = l.get_value().to_string(),
                     _ => {}
                 }
             }

@@ -151,7 +151,12 @@ pub struct RunHandles {
 pub fn start(
     args: crate::cli::ServeArgs,
     progress_rx: std::sync::mpsc::Receiver<capture_layer::ProgressEvent>,
-    host: std::sync::Arc<crate::main_modules::model_host::ModelHost>,
+    // OPTIONAL because nothing in this tree constructs a `ModelHost` yet:
+    // it arrived with the port and the paths that would build one (model
+    // swap, library launch) are the ones deliberately not ported. `App`
+    // already types this field as `Option`, so the dashboard handles `None`
+    // throughout — the Library tab shows its launch toast instead.
+    host: Option<std::sync::Arc<crate::main_modules::model_host::ModelHost>>,
 ) -> std::sync::mpsc::Sender<RunHandles> {
     let (levers_tx, levers_rx) = std::sync::mpsc::channel::<RunHandles>();
     let runtime = tokio::runtime::Handle::current();
@@ -173,15 +178,13 @@ pub fn start(
     match std::thread::Builder::new()
         .name("atlas-tui".into())
         .spawn(move || {
-            let port = args.port;
-            let model = args
-                .model_name
-                .clone()
-                .or_else(|| args.model.clone())
-                .unwrap_or_default();
-            let cache_dir = args.cache_dir.clone();
+            // Upstream bound `port`, `model` and `cache_dir` here for the
+            // library/launch surface, which is not ported. `App::new` takes the
+            // args wholesale, so nothing else read them — dropped rather than
+            // underscore-prefixed, since an unused binding invites someone to
+            // wire it back up to a consumer that does not exist.
             let mut app = app::App::new(args);
-            app.host = Some(host);
+            app.host = host;
             app.chat.set_runtime(runtime.clone());
             events::run(app, progress_rx, levers_rx);
         }) {
@@ -257,4 +260,21 @@ mod tests {
         // exactly the property the benchmark rigs rely on.
         assert!(plain_mode(false));
     }
+}
+
+/// Is the dashboard the sole owner of this terminal right now?
+///
+/// Read on hot paths — the byte-count middleware checks it once per request and
+/// the scheduler once per step — so it is a `Relaxed` load of an atomic that
+/// `start` and `plain_mode` set exactly once at boot. Plain and benchmark runs
+/// pay one branch and never take the snapshot mutex.
+pub fn is_active() -> bool {
+    init::TUI_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Claim or release the terminal. Called once from `main`, before anything can
+/// write, so that the "who owns stdout" question has a single answer from the
+/// first line of output onward.
+pub fn set_active(active: bool) {
+    init::TUI_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
 }

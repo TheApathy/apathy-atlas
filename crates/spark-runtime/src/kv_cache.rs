@@ -112,26 +112,63 @@ pub enum KvCacheDtype {
     Fp8KTurbo2V,
 }
 
+impl KvCacheDtype {
+    /// Every dtype the `--kv-cache-dtype` parser accepts, in declaration order.
+    ///
+    /// The Library tab offers this as the field's option set, so it is the ONE
+    /// place that must stay in step with the enum — a variant added without a
+    /// row here is a dtype the parser takes and the UI cannot offer.
+    ///
+    /// Includes `Turbo2` deliberately, even though its decode kernel is not
+    /// ported and it produces garbage at runtime: hiding an accepted option
+    /// from the UI conceals the gap instead of closing it, and the variant's
+    /// own doc comment is where that warning belongs.
+    pub const ALL: [KvCacheDtype; 16] = [
+        KvCacheDtype::Bf16,
+        KvCacheDtype::Fp8,
+        KvCacheDtype::Nvfp4,
+        KvCacheDtype::Turbo4,
+        KvCacheDtype::Turbo3,
+        KvCacheDtype::Turbo2,
+        KvCacheDtype::Turbo8,
+        KvCacheDtype::Turbo4KTurbo3V,
+        KvCacheDtype::Turbo4KTurbo8V,
+        KvCacheDtype::Turbo3KTurbo8V,
+        KvCacheDtype::Bf16KTurbo4V,
+        KvCacheDtype::Bf16KTurbo3V,
+        KvCacheDtype::Fp8KTurbo4V,
+        KvCacheDtype::Fp8KTurbo3V,
+        KvCacheDtype::Bf16KTurbo2V,
+        KvCacheDtype::Fp8KTurbo2V,
+    ];
+
+    /// The spelling `--kv-cache-dtype` accepts and `Display` prints.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            KvCacheDtype::Bf16 => "bf16",
+            KvCacheDtype::Fp8 => "fp8",
+            KvCacheDtype::Nvfp4 => "nvfp4",
+            KvCacheDtype::Turbo4 => "turbo4",
+            KvCacheDtype::Turbo3 => "turbo3",
+            KvCacheDtype::Turbo2 => "turbo2",
+            KvCacheDtype::Turbo8 => "turbo8",
+            KvCacheDtype::Turbo4KTurbo3V => "turbo4k_turbo3v",
+            KvCacheDtype::Turbo4KTurbo8V => "turbo4k_turbo8v",
+            KvCacheDtype::Turbo3KTurbo8V => "turbo3k_turbo8v",
+            KvCacheDtype::Bf16KTurbo4V => "bf16k_turbo4v",
+            KvCacheDtype::Bf16KTurbo3V => "bf16k_turbo3v",
+            KvCacheDtype::Fp8KTurbo4V => "fp8k_turbo4v",
+            KvCacheDtype::Fp8KTurbo3V => "fp8k_turbo3v",
+            KvCacheDtype::Bf16KTurbo2V => "bf16k_turbo2v",
+            KvCacheDtype::Fp8KTurbo2V => "fp8k_turbo2v",
+        }
+    }
+}
+
 impl std::fmt::Display for KvCacheDtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            KvCacheDtype::Bf16 => write!(f, "bf16"),
-            KvCacheDtype::Fp8 => write!(f, "fp8"),
-            KvCacheDtype::Nvfp4 => write!(f, "nvfp4"),
-            KvCacheDtype::Turbo4 => write!(f, "turbo4"),
-            KvCacheDtype::Turbo3 => write!(f, "turbo3"),
-            KvCacheDtype::Turbo2 => write!(f, "turbo2"),
-            KvCacheDtype::Turbo8 => write!(f, "turbo8"),
-            KvCacheDtype::Turbo4KTurbo3V => write!(f, "turbo4k_turbo3v"),
-            KvCacheDtype::Turbo4KTurbo8V => write!(f, "turbo4k_turbo8v"),
-            KvCacheDtype::Turbo3KTurbo8V => write!(f, "turbo3k_turbo8v"),
-            KvCacheDtype::Bf16KTurbo4V => write!(f, "bf16k_turbo4v"),
-            KvCacheDtype::Bf16KTurbo3V => write!(f, "bf16k_turbo3v"),
-            KvCacheDtype::Fp8KTurbo4V => write!(f, "fp8k_turbo4v"),
-            KvCacheDtype::Fp8KTurbo3V => write!(f, "fp8k_turbo3v"),
-            KvCacheDtype::Bf16KTurbo2V => write!(f, "bf16k_turbo2v"),
-            KvCacheDtype::Fp8KTurbo2V => write!(f, "fp8k_turbo2v"),
-        }
+        // Delegates so the spelling lives in exactly one match.
+        f.write_str(self.name())
     }
 }
 

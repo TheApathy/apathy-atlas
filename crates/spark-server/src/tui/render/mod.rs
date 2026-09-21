@@ -170,7 +170,7 @@ fn draw_selection(f: &mut Frame, app: &App) {
 /// not ported (it needs the `avarok-plugin` framework), so the ring is drawn in
 /// its idle state — the geometry is kept because the layout depends on it, and
 /// a future in-tree bench or load indicator can drive it again.
-fn draw_glow_ring(f: &mut Frame, app: &App, area: Rect) -> Rect {
+fn draw_glow_ring(f: &mut Frame, _app: &App, area: Rect) -> Rect {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::border(false));

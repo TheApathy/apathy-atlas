@@ -59,37 +59,20 @@ fn the_chip_strip_describes_the_running_config_not_the_boot_argv() {
     );
 }
 
-#[test]
-fn the_chip_strip_asserts_nothing_about_a_model_that_is_not_loaded() {
-    // With nothing serving, every chip except the address is a clap default
-    // dressed up as a running configuration — the strip read "kv fp8" for a
-    // process that had loaded no KV cache at all.
-    use clap::Parser as _;
-    let args = crate::cli::ServeArgs::parse_from(["spark"]);
-    let text: String = crate::tui::logo::badges(&args, true)
-        .iter()
-        .map(|b| b.text.clone())
-        .collect::<Vec<_>>()
-        .join(" ");
+// REMOVED: describes a state this engine cannot enter.
+//
+// Upstream allows `spark serve` with NO model — the dashboard is the front
+// door and you pick a recipe from the Library tab. Our `ServeArgs` marks the
+// MODEL positional `required_unless_present = "model_from_path"`, so one of
+// the two must always be given and there is no awaiting-model state. clap
+// EXITS THE PROCESS on the missing argument, which aborted the whole test
+// binary rather than failing one test.
+//
+// Restore this WITH the model-less serve path, which is the same commit that
+// wires `LibState::launch` — until a recipe can be started from the
+// dashboard, a server with no model has nothing it could ever load.
+// (was: the header chip strip with nothing serving)
 
-    for claim in ["kv ", "lm ", "mtp ", "batch ", "ctx ", "sched ", "<model>"] {
-        assert!(
-            !text.contains(claim),
-            "awaiting strip must not claim {claim:?}: {text}"
-        );
-    }
-    // The listener really is up — it binds before any model loads — so the
-    // address is the one thing it may still assert, and it must stay: it is
-    // what a user needs to point a client at.
-    assert!(
-        text.contains(&format!(":{}", args.port)),
-        "the bound port is true with no model: {text}"
-    );
-    assert!(
-        text.contains("Library"),
-        "and it says how to fix it: {text}"
-    );
-}
 
 #[test]
 fn the_header_mini_strip_does_not_claim_a_kv_dtype_with_no_model() {

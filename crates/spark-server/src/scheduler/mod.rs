@@ -22,6 +22,8 @@ mod decode_step;
 mod emit_step;
 mod exact_greedy_admission;
 mod helpers;
+// Run-scoped levers the dashboard toggles. Minimal port: the loop watchdog only.
+pub mod levers;
 mod lifecycle;
 mod logprobs;
 mod mod_helpers;

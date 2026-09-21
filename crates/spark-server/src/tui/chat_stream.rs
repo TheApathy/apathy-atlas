@@ -238,7 +238,7 @@ fn nonempty(v: &serde_json::Value) -> Option<String> {
 /// across chunks leaves a size line inside the span, `serde_json` rejects it,
 /// this returns `None`, and the caller shows the bare status line. The operator
 /// sees a less detailed error, never a wrong one.
-fn error_message_from_body(raw: &[u8]) -> Option<String> {
+pub(crate) fn error_message_from_body(raw: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(raw);
     let start = text.find('{')?;
     let end = text.rfind('}')?;

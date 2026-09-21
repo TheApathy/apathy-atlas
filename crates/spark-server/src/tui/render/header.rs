@@ -223,9 +223,10 @@ pub(crate) fn header_line(app: &App) -> String {
     format!(
         "{} · kv {} · :{} ",
         live_model_name(app),
-        // An omitted --kv-cache-dtype resolves against MODEL.toml at load
-        // time; the args argv cannot know the outcome, so label it "auto".
-        a.kv_cache_dtype.as_deref().unwrap_or("auto"),
+        // Ours is a `String` with a clap default of "fp8", not an `Option`
+        // resolved later against MODEL.toml, so it is always concrete and
+        // there is no "auto" case to label.
+        a.kv_cache_dtype,
         a.port
     )
 }

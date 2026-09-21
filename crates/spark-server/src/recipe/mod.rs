@@ -229,10 +229,19 @@ impl Recipe {
         let argv = self.argv_edited(overrides, removed)?;
         let cli = crate::cli::Cli::try_parse_from(&argv)
             .with_context(|| format!("{}: recipe produced an invalid command line", self.id))?;
-        let crate::cli::Command::Serve(args) = cli.command else {
-            bail!("{}: recipe did not produce a serve command", self.id);
-        };
-        crate::cli::validate_serve_args(&args).map_err(|e| anyhow::anyhow!("{}: {e}", self.id))?;
+        // IRREFUTABLE on this engine: `cli::Command` has exactly one variant,
+        // so there is no "not a serve command" case to bail on. Upstream's
+        // `else` arm guards a multi-command CLI; keeping it here is a compile
+        // error, and keeping a `match` with an unreachable arm would just hide
+        // the same fact. If a second subcommand is ever added, this line stops
+        // compiling and the guard comes back with it.
+        let crate::cli::Command::Serve(args) = cli.command;
+        // No `cli::validate_serve_args` on this engine: upstream validates the
+        // parsed argv a second time for cross-flag constraints clap cannot
+        // express. Clap's own parse above is the only validation here, so a
+        // recipe with an internally inconsistent flag pair is caught at serve
+        // time rather than at recipe load. Worth closing when that validator
+        // is ported; not worth inventing a second, different rule set now.
         Ok(args)
     }
 }

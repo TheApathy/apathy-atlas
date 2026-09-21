@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Terminal is digit '5', not '6': cutting the Benchmarks section moved every
+// section below Library up one. These presses encode the sidebar position, so
+// they move with it — `section_tests::the_navigable_row_count_is_what_the
+// _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
+// two that fail if code and tests ever disagree about the order again.
+
 
 //! Scrolling, from the keyboard and from the wheel.
 //!
@@ -141,8 +147,8 @@ fn a_growing_log_does_not_yank_a_reader_who_scrolled_up() {
 #[test]
 fn typing_while_scrolled_back_does_not_yank_the_chat_transcript() {
     let mut a = app();
-    press(&mut a, '6');
-    press(&mut a, '6');
+    press(&mut a, '5');
+    press(&mut a, '5');
     press(&mut a, 'i');
     a.chat_scroll_max.set(10); // the keys clamp now, like the wheel
     tap(&mut a, KeyCode::PageUp);
@@ -208,7 +214,7 @@ fn sections_with_nothing_to_scroll_ignore_the_wheel_without_panicking() {
 #[test]
 fn scrolling_does_not_disturb_focus_or_the_section() {
     let mut a = app();
-    press(&mut a, '6');
+    press(&mut a, '5');
     press(&mut a, 'i');
     a.log_scroll_max.set(10);
     a.scroll(-3);
@@ -249,8 +255,8 @@ fn capital_g_and_end_jump_the_kernel_table_to_its_last_row() {
 #[test]
 fn chat_g_and_home_jump_to_the_oldest_row_in_both_focus_states() {
     let mut a = app();
-    press(&mut a, '6');
-    press(&mut a, '6'); // Terminal ▸ Chat, content focus
+    press(&mut a, '5');
+    press(&mut a, '5'); // Terminal ▸ Chat, content focus
     a.chat_scroll_max.set(40);
     press(&mut a, 'g');
     assert_eq!(a.chat.scroll, Some(40), "content-focus g parks at the top");
@@ -268,8 +274,8 @@ fn chat_g_and_home_jump_to_the_oldest_row_in_both_focus_states() {
 #[test]
 fn an_empty_chat_ignores_the_jump_rather_than_banking_it() {
     let mut a = app();
-    press(&mut a, '6');
-    press(&mut a, '6');
+    press(&mut a, '5');
+    press(&mut a, '5');
     press(&mut a, 'g');
     assert_eq!(a.chat.scroll, None, "nothing above the fold to park at");
 }
@@ -309,8 +315,8 @@ fn help_scroll_keys_move_the_key_list_and_anything_else_closes_it() {
 #[test]
 fn the_chat_keys_clamp_against_the_same_ceiling_as_the_wheel() {
     let mut a = app();
-    press(&mut a, '6');
-    press(&mut a, '6');
+    press(&mut a, '5');
+    press(&mut a, '5');
     press(&mut a, 'i');
     a.chat_scroll_max.set(3);
     tap(&mut a, KeyCode::PageUp);

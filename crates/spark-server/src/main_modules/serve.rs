@@ -76,7 +76,12 @@ fn startup(
     if let Some(progress_rx) = tui_progress
         && args.rank == 0
     {
-        crate::tui::start(args.clone(), progress_rx);
+        // `None`, NOT `ModelHost::empty()`. An empty host is constructible,
+        // but nothing on this path ever installs the loaded model into it, so
+        // it would answer "no model loaded" for the whole life of a server
+        // that is serving one. `None` says the dashboard has no host to ask;
+        // an empty host would say the wrong thing confidently.
+        crate::tui::start(args.clone(), progress_rx, None);
     }
 
     // Parse before model resolution/weight loading. Recognized dynamic values

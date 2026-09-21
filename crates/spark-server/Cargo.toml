@@ -81,6 +81,11 @@ rest-store = { path = "../rest-store" }
 prometheus = { version = "0.13", default-features = false }
 lazy_static = "1"
 tower-http = { version = "0.6", features = ["catch-panic", "cors"] }
+# Ported with the upstream TUI (commit f3a0cd9f8): the Library tab's recipe
+# fetcher and the issue reporter use a blocking HTTP client, and model_download
+# base64-encodes credentials. Versions match upstream's spark-server manifest.
+ureq = { version = "3", features = ["json"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

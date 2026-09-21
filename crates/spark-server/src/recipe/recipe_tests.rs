@@ -174,8 +174,12 @@ fn a_setting_the_recipe_does_not_list_can_be_added() {
         ("fp8_kv_calibration_tokens".to_string(), "512".to_string()),
     ]);
     let args = r.serve_args(&overrides).expect("validates");
-    assert_eq!(args.kv_cache_dtype.as_deref(), Some("fp8"));
-    assert_eq!(args.fp8_kv_calibration_tokens, Some(512));
+    // Both are plain values on this engine, not `Option`s resolved later:
+    // `kv_cache_dtype` is a `String` (clap default "fp8") and
+    // `fp8_kv_calibration_tokens` a `usize`. The override still has to land,
+    // which is what this test is for — only the shape of the assert changes.
+    assert_eq!(args.kv_cache_dtype, "fp8");
+    assert_eq!(args.fp8_kv_calibration_tokens, 512);
 }
 
 /// A key that maps to NO flag is refused here rather than dropped.
@@ -266,63 +270,15 @@ fn the_commit_date_fallback_resolves_against_the_real_repo() {
     assert!(d.starts_with("20"), "{d}");
 }
 
-/// ★ EVERY vendored recipe must still be servable under `--hermetic`.
-///
-/// This is the guard that was missing, and its absence cost a build and five
-/// legs. `--hermetic` refuses to sit beside a flag it closes — deliberately,
-/// so a record cannot name a regime the server ignored. But a RECIPE can set
-/// one of those flags itself, and `serve_args` renders recipe defaults into the
-/// command line, so the gate's own recipe produced
-/// `--hermetic --enable-prefix-caching` and validation refused it. The regime
-/// was unusable through the only path that self-starts, and every unit test
-/// passed.
-///
-/// `serve_args` validates internally, so rendering is the whole check. It runs
-/// over all recipes rather than the one that broke: the next recipe to turn on
-/// a key hermetic closes should fail HERE, offline, in milliseconds.
-#[test]
-fn every_recipe_can_be_served_hermetically() {
-    // Only `runtime: atlas` recipes can be served from here AT ALL — a
-    // non-atlas one is refused before any flag is looked at, which is a
-    // different rule and not the one under test. Filtering rather than
-    // asserting past it, because the count check below then still has to hold
-    // on what remains.
-    let recipes: Vec<Recipe> = all().into_iter().filter(|r| r.is_atlas()).collect();
-    // Vacuity: a sweep over nothing proves nothing.
-    assert!(
-        recipes.len() > 5,
-        "only {} recipes found — the sweep is not reading the fixtures",
-        recipes.len()
-    );
-    // And POWER: at least one recipe must actually set a key `--hermetic`
-    // closes, or this test would pass even with the expansion removed and
-    // would be measuring nothing. This is the condition that broke.
-    let closed: Vec<&str> = crate::cli::hermetic::CLOSED_KEYS
-        .iter()
-        .map(|(k, _)| *k)
-        .collect();
-    let conflicting = recipes
-        .iter()
-        .filter(|r| {
-            let argv = r.argv(&Default::default()).unwrap_or_default().join(" ");
-            closed
-                .iter()
-                .any(|k| argv.contains(&format!("--{}", k.replace('_', "-"))))
-        })
-        .count();
-    assert!(
-        conflicting > 0,
-        "no fixture recipe sets any of {closed:?}, so this test cannot see the \
-         failure it exists for — add such a fixture rather than deleting this"
-    );
+// REMOVED: `every_recipe_can_be_served_hermetically`.
+//
+// This engine has no `--hermetic` flag and no `cli::hermetic` module, so the
+// test had nothing to exercise. It is deleted rather than ignored because an
+// #[ignore]d test for an absent feature reads as a known failure someone
+// should fix, when the truth is that the feature was never ported.
+//
+// Its guarantee is worth restoring WITH the flag: every vendored recipe must
+// still be servable under --hermetic, and the original test carried a power
+// check (at least one fixture must set a key --hermetic closes) so it could
+// not pass vacuously. Port that power check along with it.
 
-    let overrides = crate::cli::hermetic::expand(
-        [("hermetic".to_string(), "true".to_string())]
-            .into_iter()
-            .collect(),
-    );
-    for r in &recipes {
-        r.serve_args(&overrides)
-            .unwrap_or_else(|e| panic!("{} cannot be served hermetically: {e:#}", r.id));
-    }
-}

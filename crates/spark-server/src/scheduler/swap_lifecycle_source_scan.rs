@@ -162,8 +162,15 @@ pub(super) fn victim_selector(source: &str) -> Option<String> {
     const END: &str = "// ── Start new requests ──";
     // Reviewed against 73d9ca52: scalar dashboard reporting and two module
     // declarations only; swap/grammar ownership paths remain byte-identical.
-    const SOURCE_LEN: usize = 42_533;
-    const SOURCE_FNV1A: u64 = 0xdfd4902a39703566;
+    //
+    // Re-pinned 2026-09-21 for the TUI port: ONE module declaration added
+    // (`pub mod levers;` plus its comment, placed alphabetically). Diffed
+    // before re-pinning — the swap-out block, the victim selector and every
+    // `grammar_state` path are byte-identical; nothing this scan reasons about
+    // moved. Re-pinning without that diff would turn the guard into a rubber
+    // stamp, which is the one way this test can fail silently.
+    const SOURCE_LEN: usize = 42_631;
+    const SOURCE_FNV1A: u64 = 0x3253f9107edb5f20;
     if source.matches(START).count() != 1 || source.matches(END).count() != 1 {
         return None;
     }

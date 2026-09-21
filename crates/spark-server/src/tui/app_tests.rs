@@ -96,8 +96,9 @@ fn the_watchdog_command_toggles_the_running_run_not_a_process_global() {
     let levers = std::sync::Arc::new(crate::scheduler::levers::SchedLevers::from_env());
     let other = std::sync::Arc::new(crate::scheduler::levers::SchedLevers::from_env());
     app.run = Some(crate::tui::RunHandles {
+        // No `snapshot` handle: RULING B keeps the process-global
+        // `scheduler::snapshot` and does not carry a per-instance cell.
         levers: levers.clone(),
-        snapshot: std::sync::Arc::new(crate::scheduler::snapshot::SnapshotCell::default()),
     });
 
     crate::tui::commands::execute("/watchdog on", &mut app);

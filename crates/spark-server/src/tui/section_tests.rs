@@ -97,6 +97,9 @@ fn the_navigable_row_count_is_what_the_sidebar_draws() {
     // count `⇥` steps through. Three hardcoded copies of this is how `⇥` came
     // to skip past rows the sidebar was drawing.
     let rows: usize = Section::ALL.iter().map(|s| s.subs().len().max(1)).sum();
-    assert_eq!(rows, 3 + 4 * 2, "3 plain sections and 4 with a pair each");
+    // Was `3 + 4 * 2` when Benchmarks existed: it carried a pair of
+    // subsections, so cutting it removed two rows. Now Stats, Network and
+    // Library are plain; Main, Terminal and Help each carry a pair.
+    assert_eq!(rows, 3 + 3 * 2, "3 plain sections and 3 with a pair each");
 }
 

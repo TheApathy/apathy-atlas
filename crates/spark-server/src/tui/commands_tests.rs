@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+// Terminal is digit '5', not '6': cutting the Benchmarks section moved every
+// section below Library up one. These presses encode the sidebar position, so
+// they move with it — `section_tests::the_navigable_row_count_is_what_the
+// _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
+// two that fail if code and tests ever disagree about the order again.
+
 
 //! The Ops REPL: completion, dispatch, and what every command puts in the pane.
 //!
@@ -151,7 +157,7 @@ fn quit_asks_for_a_clean_shutdown() {
 
 fn focused_ops(a: &mut App) {
     a.on_key(crossterm::event::KeyEvent::from(
-        crossterm::event::KeyCode::Char('6'),
+        crossterm::event::KeyCode::Char('5'),
     ));
     a.on_key(crossterm::event::KeyEvent::from(
         crossterm::event::KeyCode::Char('i'),
@@ -222,7 +228,7 @@ fn history_walks_both_ways_and_falls_off_the_newest_end_empty() {
 fn ops_output_scrolls_with_keys_and_wheel_against_the_published_ceiling() {
     let mut a = app();
     a.on_key(crossterm::event::KeyEvent::from(
-        crossterm::event::KeyCode::Char('6'),
+        crossterm::event::KeyCode::Char('5'),
     ));
     a.ops.output = (0..100).map(|i| format!("line {i}")).collect();
     a.ops.scroll_max.set(50); // what the renderer would publish

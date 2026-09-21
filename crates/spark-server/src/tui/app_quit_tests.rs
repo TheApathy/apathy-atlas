@@ -36,13 +36,17 @@ fn q_asks_first_while_the_boot_load_is_still_running() {
     assert!(!a.confirm_quit);
 }
 
-/// `spark serve` with no model has nothing loading: the Library boot must
-/// not inherit the loading guard, or an idle dashboard costs a confirmation
-/// that protects nothing.
-#[test]
-fn an_awaiting_model_boot_quits_without_the_loading_prompt() {
-    let mut a = App::new(clap::Parser::parse_from(["spark"]));
-    assert!(a.work_in_flight().is_none());
-    press(&mut a, 'q');
-    assert!(a.should_quit);
-}
+// REMOVED: describes a state this engine cannot enter.
+//
+// Upstream allows `spark serve` with NO model — the dashboard is the front
+// door and you pick a recipe from the Library tab. Our `ServeArgs` marks the
+// MODEL positional `required_unless_present = "model_from_path"`, so one of
+// the two must always be given and there is no awaiting-model state. clap
+// EXITS THE PROCESS on the missing argument, which aborted the whole test
+// binary rather than failing one test.
+//
+// Restore this WITH the model-less serve path, which is the same commit that
+// wires `LibState::launch` — until a recipe can be started from the
+// dashboard, a server with no model has nothing it could ever load.
+// (was: an_awaiting_model_boot_quits_without_the_loading_prompt)
+

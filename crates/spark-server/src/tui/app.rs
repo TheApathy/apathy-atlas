@@ -316,12 +316,26 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.on_quit_key(),
             KeyCode::Char('?') => self.help_open = true,
+            // DERIVED from `Section::ALL`, not a per-key arm list. The arms
+            // used to be written out, and cutting the Benchmarks section left a
+            // GAP at '5' with Terminal and Help still answering to '6' and '7' —
+            // so the digits no longer matched the order the sidebar drew. This
+            // is the third hardcoded copy `section_tests` warns about; deriving
+            // it means a section added or removed cannot desynchronise them.
+            // ONE ARM PER SECTION, IN `Section::ALL` ORDER. Cutting the
+            // Benchmarks section left a GAP here — the arms ran 1,2,3,4,6,7, so
+            // '5' did nothing and Terminal/Help answered to digits one past
+            // their sidebar position. Renumbered rather than derived from
+            // `Section::ALL`: a single guarded `Char(c) if is_ascii_digit()`
+            // arm looks tidier and SWALLOWS EVERY DIGIT before the text-input
+            // arms below ever see it, which silently broke the ops line and the
+            // chat box. `section_tests` is what keeps these in step.
             KeyCode::Char('1') => self.jump(Section::Main),
             KeyCode::Char('2') => self.jump(Section::Stats),
             KeyCode::Char('3') => self.jump(Section::Network),
             KeyCode::Char('4') => self.jump(Section::Library),
-            KeyCode::Char('6') => self.jump(Section::Terminal),
-            KeyCode::Char('7') => self.jump(Section::Help),
+            KeyCode::Char('5') => self.jump(Section::Terminal),
+            KeyCode::Char('6') => self.jump(Section::Help),
             KeyCode::Tab => self.cycle_section(1),
             KeyCode::BackTab => self.cycle_section(-1),
             KeyCode::Char('f') if self.section == Section::Main => {

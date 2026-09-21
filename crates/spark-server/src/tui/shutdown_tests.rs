@@ -170,9 +170,21 @@ fn a_gauge_below_zero_still_drains() {
 #[test]
 fn the_gauge_the_drain_reads_is_the_one_requests_move() {
     let _serial = DRAIN.lock();
+    // Upstream moves this gauge through an RAII `ActiveRequestGuard` so a
+    // request cannot leak a count on an early return. This engine still does it
+    // by hand: ONE `inc()` in `api::chat` against SIX `dec()` sites across
+    // chat_blocking, chat_stream_dispatch, handle_error and handle_done. That
+    // asymmetry is exactly the leak the guard exists to prevent, and porting it
+    // is a worthwhile change to those seven call sites — not something to slip
+    // in while making the dashboard compile, because a missed site
+    // double-decrements and the drain then waits on a negative gauge.
+    //
+    // The assumption under test is unchanged: the gauge `drain_in_flight` reads
+    // is the one requests actually move. Pinned here against the mechanism this
+    // tree uses.
     let before = crate::metrics::REQUESTS_ACTIVE.get();
-    let guard = crate::metrics::ActiveRequestGuard::new();
+    crate::metrics::REQUESTS_ACTIVE.inc();
     assert_eq!(crate::metrics::REQUESTS_ACTIVE.get(), before + 1);
-    drop(guard);
+    crate::metrics::REQUESTS_ACTIVE.dec();
     assert_eq!(crate::metrics::REQUESTS_ACTIVE.get(), before);
 }

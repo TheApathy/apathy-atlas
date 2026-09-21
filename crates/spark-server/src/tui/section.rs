@@ -19,7 +19,7 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 6] = [
         Section::Main,
         Section::Stats,
         Section::Network,

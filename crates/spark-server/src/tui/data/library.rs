@@ -137,15 +137,14 @@ pub fn scan(cache_dir: Option<&Path>) -> Vec<LibraryEntry> {
             // config-identical checkpoints (Qwen3.6-27B vs Qwen3.8-27B).
             // An ambiguity error is shown as un-optimized: serving this
             // entry as-is WOULD refuse, which is what the flag reports.
-            entry.optimized = matches!(
-                atlas_kernels::ptx_for_config(
-                    &cfg.model_type,
-                    cfg.hidden_size,
-                    &[entry.id.as_str()],
-                    None,
-                ),
-                Ok(Some(_))
-            );
+            // Ours takes (model_type, hidden_size) and returns `Option`, where
+            // upstream also passes a recipe-id hint and a quant and returns
+            // `Result<Option<_>>` so an AMBIGUOUS match can be reported as an
+            // error. Without the hint this cannot distinguish "no target" from
+            // "several targets", so the flag means only "a target exists" —
+            // weaker than upstream's, and not the same claim.
+            entry.optimized =
+                atlas_kernels::ptx_for_config(&cfg.model_type, cfg.hidden_size).is_some();
         }
         out.push(entry);
     }

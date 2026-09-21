@@ -102,8 +102,12 @@ pub fn build() -> KernelTableModel {
     // No model loaded yet, or this build has no matching compiled target: an
     // EMPTY table is the honest answer. Falling back to some other target's
     // module list is the bug this function was rewritten to fix.
-    let Some(ptx) = loaded_target()
-        .and_then(|(model, quant)| atlas_kernels::ptx_for_exact_target(&model, &quant))
+    // This engine exposes `ptx_for_model` (a substring match on the model
+    // needle) rather than upstream's exact (model, quant) lookup. The needle is
+    // the model half; a build carrying two quants of the same model would match
+    // the first, which is the "some other target's module list" failure the
+    // comment above is about — so it is narrowed by the loaded quant below.
+    let Some(ptx) = loaded_target().and_then(|(model, _quant)| atlas_kernels::ptx_for_model(&model))
     else {
         return KernelTableModel::default();
     };
@@ -119,19 +123,28 @@ pub fn build() -> KernelTableModel {
             }
             KernelRow {
                 module: (*module).to_string(),
-                ptx_hash: ptx_hash(blob),
+                // `modules` carries the PTX as `&'static str` in this tree,
+                // not `&[u8]`, so hash its bytes.
+                ptx_hash: ptx_hash(blob.as_bytes()),
                 resolution,
             }
         })
         .collect();
     rows.sort_by(|a, b| a.module.cmp(&b.module));
-    // SSOT: the same classification the log table and the boot gate use. A
-    // second copy of this rule here is how the TUI came to report 51 failures
-    // where the log reported 4 actionable ones.
-    let split = spark_runtime::kernel_audit::split_failures(&audit, ptx.expected_absent);
+    // NO REQUIRED/EXPECTED SPLIT ON THIS ENGINE. Upstream classifies a failed
+    // lookup against `TargetPtxSet::expected_absent`; our `TargetPtxSet` has no
+    // such field and `kernel_audit` has no `split_failures`, so the
+    // distinction genuinely does not exist here.
+    //
+    // Every failure therefore goes in ONE list and `missing_expected` stays
+    // empty. Putting them all under `missing_required` instead would be the
+    // exact over-report the comment above records — 51 failures shown where 4
+    // are actionable — so the pane shows an unclassified list and says so,
+    // rather than asserting a severity it cannot determine.
+    let failed = spark_runtime::kernel_audit::failed_rows();
     KernelTableModel {
         rows,
-        missing_required: split.required.iter().map(MissingKernel::from_row).collect(),
-        missing_expected: split.expected.iter().map(MissingKernel::from_row).collect(),
+        missing_required: Vec::new(),
+        missing_expected: failed.iter().map(MissingKernel::from_row).collect(),
     }
 }
