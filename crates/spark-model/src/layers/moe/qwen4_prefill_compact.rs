@@ -17,7 +17,9 @@ pub(crate) const STREAM_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_STREAM_T";
 pub(crate) const V2_SELECTOR: &str = "ATLAS_QWEN4_PREFILL_MOE_COMPACT_V2";
 
 /// 0 = shipping kernel, 1 = pipelined v2 (64x64), 2 = v3 (64x128, 256 threads),
-/// 3 = v3 down + fused gate/up/silu (64x64, 128 threads).
+/// 3 = v3 down + fused gate/up/silu (64x64, 128 threads),
+/// 4 = v4 (v3 tile, single-buffered sBf: 3 CTAs/SM = 24 warps, bit-exact with v3),
+/// 5 = v5 (v2 tile, single-buffered sBf: 4 CTAs/SM = 16 warps, bit-exact with v2).
 pub(crate) fn v2_level() -> Result<u32> {
     match std::env::var(V2_SELECTOR) {
         Err(std::env::VarError::NotPresent) => Ok(0),
@@ -25,7 +27,9 @@ pub(crate) fn v2_level() -> Result<u32> {
         Ok(v) if v == "1" => Ok(1),
         Ok(v) if v == "2" => Ok(2),
         Ok(v) if v == "3" => Ok(3),
-        Ok(v) => bail!("{V2_SELECTOR} must be absent, 0, 1, 2 or 3; got {v:?}"),
+        Ok(v) if v == "4" => Ok(4),
+        Ok(v) if v == "5" => Ok(5),
+        Ok(v) => bail!("{V2_SELECTOR} must be absent, 0, 1, 2, 3, 4 or 5; got {v:?}"),
         Err(e) => Err(e).with_context(|| format!("invalid {V2_SELECTOR}")),
     }
 }
@@ -211,16 +215,24 @@ pub(super) fn load(gpu: &dyn GpuBackend, config: &ModelConfig) -> Result<Option<
     // Default-off V2 GEMM (same ABI/plan/workspace, pipelined kernel body).
     let v2 = transposed && step_k == 32 && v2_level()? > 0;
     let (plan_handle, gemm_handle, block, gateup) = if v2 {
-        let name = if v2_level()? >= 2 { "qwen4_moe_compact_t_gemm_k32_v3" } else { "qwen4_moe_compact_t_gemm_k32_v2" };
+        let level = v2_level()?;
+        let name = match level {
+            5 => "qwen4_moe_compact_t_gemm_k32_v5",
+            4 => "qwen4_moe_compact_t_gemm_k32_v4",
+            2 | 3 => "qwen4_moe_compact_t_gemm_k32_v3",
+            _ => "qwen4_moe_compact_t_gemm_k32_v2",
+        };
+        // 256-thread CTAs only for the 64x128 tile (v3/v4); v2 and v5 are 64x64/128.
+        let block = if matches!(level, 2 | 3 | 4) { 256 } else { 128 };
         let gemm = gpu.kernel("qwen4_moe_compact_t_k32_v2", name)?;
         let plan = gpu.kernel("qwen4_moe_compact_t_k32_v2", "qwen4_moe_compact_t_plan_k32_v2")?;
-        let gateup = if v2_level()? >= 3 {
+        let gateup = if level == 3 {
             Some(gpu.kernel("qwen4_moe_compact_t_k32_v2", "qwen4_moe_compact_t_gemm_gateup_k32")?)
         } else {
             None
         };
         tracing::info!("MOE_PREFILL_COMPACT_V2_SELECTED selector={V2_SELECTOR} kernel={name} fused_gateup={}", gateup.is_some());
-        (plan, gemm, if v2_level()? >= 2 { 256 } else { 128 }, gateup)
+        (plan, gemm, block, gateup)
     } else {
         (gpu.kernel(module, plan)?, gpu.kernel(module, gemm)?, 128, None)
     };

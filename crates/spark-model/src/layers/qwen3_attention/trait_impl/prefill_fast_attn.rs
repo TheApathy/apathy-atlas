@@ -13,7 +13,7 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::super::Qwen3AttentionLayer;
 use super::prefill_moe_attn16_device::DeviceKernels;
 use crate::layer::ForwardContext;
-use crate::layers::{Qwen4HyperConnection, qwen4_fast_proj, qwen4_prefill_moe};
+use crate::layers::{Qwen4HyperConnection, ops, qwen4_fast_proj, qwen4_flash_attn, qwen4_prefill_moe};
 
 impl Qwen3AttentionLayer {
     /// Projects all `rows` packed inputs into `qkv_output` rows of
@@ -106,6 +106,10 @@ impl Qwen3AttentionLayer {
         );
         let (qkv, qkv_row_bytes) =
             self.qwen4_fast_project_qkv_all(packed_inputs, num_tokens, ctx, stream)?;
+        // Flash core: the per-tile loop still runs QSA, MRoPE and the KV-cache
+        // write (every row's K/V must be resident before any row attends), but
+        // the attention core and gate are deferred to one full-prefill launch.
+        let flash = qwen4_flash_attn::selected() && self.prefill_attn_k.0 != 0;
         let mut tile_start = 0;
         while tile_start < num_tokens {
             let tile_rows = if attn32 && num_tokens - tile_start >= 32 { 32 } else { 16 };
@@ -121,8 +125,43 @@ impl Qwen3AttentionLayer {
                 ctx,
                 stream,
                 attn16_device,
+                flash,
             )?;
             tile_start += tile_rows;
+        }
+        if flash {
+            let nq = ctx.config.num_attention_heads;
+            let nkv = ctx.config.num_key_value_heads;
+            let hd = ctx.config.head_dim;
+            let q_dim = nq * hd;
+            let row_stride = qkv_row_bytes / 2;
+            qwen4_flash_attn::run(
+                ctx.gpu,
+                self.prefill_attn_k,
+                qkv,
+                row_stride,
+                q_dim * 2,
+                q_dim * 2 + nkv * hd,
+                raw_outputs,
+                attn_row_bytes / 2,
+                num_tokens,
+                nq,
+                nkv,
+                hd,
+                self.effective_attn_scale(hd as u32),
+                stream,
+            )?;
+            ops::sigmoid_gate_mul_batched(
+                ctx.gpu,
+                self.sigmoid_gate_mul_batched_k,
+                raw_outputs,
+                qkv.offset(q_dim * 2),
+                raw_outputs,
+                q_dim as u32,
+                row_stride as u32,
+                num_tokens as u32,
+                stream,
+            )?;
         }
         // O projection for every row lands in norm_output (the packed inputs
         // are no longer needed), then one batched saved-scale injection.

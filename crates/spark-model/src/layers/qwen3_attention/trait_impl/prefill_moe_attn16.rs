@@ -51,6 +51,10 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
         device: Option<DeviceKernels>,
+        // When true the tile performs QSA, MRoPE and the KV-cache write only;
+        // the attention core and the output gate are run once over every row by
+        // the Flash-Attention path instead (ATLAS_QWEN4_PREFILL_ATTN_FLASH).
+        skip_core: bool,
     ) -> Result<()> {
         ensure!(
             rows == 16 || rows == 32,
@@ -203,6 +207,9 @@ impl Qwen3AttentionLayer {
             rows as u32,
             stream,
         )?;
+        if skip_core {
+            return Ok(());
+        }
         self.run_paged_decode(
             ctx.gpu,
             qkv,

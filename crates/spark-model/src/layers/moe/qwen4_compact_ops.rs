@@ -174,6 +174,12 @@ impl MoeLayer {
         )?;
         }
         gemm(gate, down_table, ctx.buffers.expert_down_out(), 2560, 640)?;
+        // Env-gated oracle capture (ATLAS_QWEN4_ORACLE_DUMP). Records the exact
+        // arguments and results of ONE compact-MoE dispatch so the GEMM can be
+        // replayed standalone. Off by default; costs nothing when unset.
+        self.oracle_capture_compact(
+            input, offsets, sorted_ids, rows, gate_table, up_table, down_table, ctx, stream,
+        )?;
         // PLANNED=1 is not a completion marker: the ordered D2H drains every
         // GEMM first. Only then can unchanged status admit unpermute/blend/HC.
         // Every planner/GEMM failure (including still PENDING) propagates.
@@ -199,6 +205,97 @@ impl MoeLayer {
         if check {
             self.check_compact_down(offsets, rows, ctx, stream)?;
         }
+        Ok(())
+    }
+
+    /// Record one compact-MoE dispatch to `ATLAS_QWEN4_ORACLE_DUMP` (no-op when
+    /// the variable is unset or this tag was already captured).
+    ///
+    /// Everything a standalone replay needs is written: the gathered BF16
+    /// activation tile, the routing metadata and planner arena, the three expert
+    /// pointer tables WITH the per-expert NVFP4 weight blobs they address, and
+    /// the three result buffers.
+    #[allow(clippy::too_many_arguments)]
+    fn oracle_capture_compact(
+        &self,
+        input: DevicePtr,
+        offsets: DevicePtr,
+        sorted_ids: DevicePtr,
+        rows: usize,
+        gate_table: &ExpertPtrTable,
+        up_table: &ExpertPtrTable,
+        down_table: &ExpertPtrTable,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        use crate::layers::qwen4_oracle::Sink;
+        let Some(mut sink) = Sink::open("moe_compact") else {
+            return Ok(());
+        };
+        ctx.gpu.synchronize(stream)?;
+        let experts = ctx.config.num_experts;
+        let expanded = rows * 10;
+        sink.scalar("rows", rows);
+        sink.scalar("top_k", 10);
+        sink.scalar("num_experts", experts);
+        sink.scalar("hidden", 2560);
+        sink.scalar("inter", 640);
+        sink.scalar("grid", abi::GRID);
+        // Inputs: activations and the routing/plan metadata.
+        sink.buf(ctx.gpu, "input_bf16", input, rows * 2560 * 2)?;
+        sink.buf(ctx.gpu, "offsets_u32", offsets, 513 * 4)?;
+        sink.buf(ctx.gpu, "sorted_ids_u32", sorted_ids, expanded * 4)?;
+        sink.buf(
+            ctx.gpu,
+            "contract",
+            ctx.buffers.moe_worklist().offset(abi::WORKSPACE_BYTES),
+            abi::ARENA_BYTES - abi::WORKSPACE_BYTES,
+        )?;
+        sink.buf(
+            ctx.gpu,
+            "workspace",
+            ctx.buffers.moe_worklist(),
+            abi::WORKSPACE_BYTES,
+        )?;
+        // Expert weights, followed through each pointer table. gate/up are
+        // [640 x 2560] and down is [2560 x 640]; both pack to K*N/2 bytes with
+        // one e4m3 scale byte per 16 elements.
+        for (name, table, n, k) in [
+            ("gate", gate_table, 640usize, 2560usize),
+            ("up", up_table, 640, 2560),
+            ("down", down_table, 2560, 640),
+        ] {
+            let packed = sink.read_ptr_table(ctx.gpu, table.packed_ptrs, experts)?;
+            let scales = sink.read_ptr_table(ctx.gpu, table.scale_ptrs, experts)?;
+            sink.blobs(ctx.gpu, &format!("{name}_packed"), &packed, n * k / 2)?;
+            sink.blobs(ctx.gpu, &format!("{name}_scale"), &scales, n * k / 16)?;
+            sink.buf(
+                ctx.gpu,
+                &format!("{name}_scale2_f32"),
+                table.scale2_vals,
+                experts * 4,
+            )?;
+        }
+        // Results, after all three GEMMs have completed.
+        sink.buf(
+            ctx.gpu,
+            "out_gate_activated_bf16",
+            ctx.buffers.expert_gate_out(),
+            expanded * 640 * 2,
+        )?;
+        sink.buf(
+            ctx.gpu,
+            "out_up_bf16",
+            ctx.buffers.expert_up_out(),
+            expanded * 640 * 2,
+        )?;
+        sink.buf(
+            ctx.gpu,
+            "out_down_bf16",
+            ctx.buffers.expert_down_out(),
+            expanded * 2560 * 2,
+        )?;
+        sink.finish();
         Ok(())
     }
 }

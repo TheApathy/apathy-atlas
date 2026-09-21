@@ -663,12 +663,14 @@ impl Qwen3AttentionLayer {
                     LOGGED.call_once(|| {
                         tracing::info!("ATTN_PREFILL_GQA4_ENGAGED selector={GQA4_SELECTOR} rows={num_seqs}");
                     });
-                    return ops::paged_decode_attn_bf16_gqa4(
+                    let k_pool = kv_cache.k_pool_ptr(self.attn_layer_idx);
+                    let v_pool = kv_cache.v_pool_ptr(self.attn_layer_idx);
+                    let result = ops::paged_decode_attn_bf16_gqa4(
                         gpu,
                         kernel,
                         q,
-                        kv_cache.k_pool_ptr(self.attn_layer_idx),
-                        kv_cache.v_pool_ptr(self.attn_layer_idx),
+                        k_pool,
+                        v_pool,
                         output,
                         block_table,
                         seq_lens,
@@ -682,6 +684,48 @@ impl Qwen3AttentionLayer {
                         q_stride,
                         stream,
                     );
+                    // Env-gated oracle capture (ATLAS_QWEN4_ORACLE_DUMP): one
+                    // recording of the attention core's arguments and result.
+                    // Off by default; nothing runs when the variable is unset.
+                    if result.is_ok()
+                        && let Some(mut sink) =
+                            crate::layers::qwen4_oracle::Sink::open("attn_core_gqa4")
+                    {
+                        gpu.synchronize(stream)?;
+                        let kv_elems = max_blocks_per_seq as usize
+                            * block_size as usize
+                            * num_kv_heads as usize
+                            * head_dim as usize;
+                        sink.scalar("num_seqs", num_seqs);
+                        sink.scalar("num_q_heads", num_q_heads);
+                        sink.scalar("num_kv_heads", num_kv_heads);
+                        sink.scalar("head_dim", head_dim);
+                        sink.scalar("block_size", block_size);
+                        sink.scalar("max_blocks_per_seq", max_blocks_per_seq);
+                        sink.scalar("q_stride", q_stride);
+                        sink.scalar("inv_sqrt_d", format!("{inv_sqrt_d:e}"));
+                        sink.buf(gpu, "q_bf16", q, num_seqs as usize * q_stride as usize * 2)?;
+                        sink.buf(gpu, "k_pool_bf16", k_pool, kv_elems * 2)?;
+                        sink.buf(gpu, "v_pool_bf16", v_pool, kv_elems * 2)?;
+                        sink.buf(
+                            gpu,
+                            "block_table_u32",
+                            block_table,
+                            num_seqs as usize * max_blocks_per_seq as usize * 4,
+                        )?;
+                        sink.buf(gpu, "seq_lens_u32", seq_lens, num_seqs as usize * 4)?;
+                        sink.buf(
+                            gpu,
+                            "out_bf16",
+                            output,
+                            num_seqs as usize
+                                * num_q_heads as usize
+                                * head_dim as usize
+                                * 2,
+                        )?;
+                        sink.finish();
+                    }
+                    return result;
                 }
                 ops::paged_decode_attn_bf16(
                     gpu,

@@ -146,6 +146,7 @@ impl Qwen3AttentionLayer {
                     ctx,
                     stream,
                     attn16_device,
+                    false,
                 )?;
                 true
             } else {
