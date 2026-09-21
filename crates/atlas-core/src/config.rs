@@ -112,6 +112,9 @@ pub struct ModelConfig {
     pub max_position_embeddings: usize,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    /// Declared DeepSeek base theta, retained separately from compressed YaRN.
+    #[serde(skip)]
+    pub deepseek_main_rope_theta: Option<f64>,
 
     // ── Normalization ──
     #[serde(default = "default_rms_eps")]
@@ -254,6 +257,9 @@ pub struct ModelConfig {
     /// Length equals num_hidden_layers. Empty = all layers full attention.
     #[serde(default)]
     pub compress_ratios: Vec<usize>,
+    /// Native V4-Flash indexer metadata. Admission is not attention support.
+    #[serde(skip)]
+    pub deepseek_v4_indexer: Option<DeepSeekV4IndexerConfig>,
     /// Number of hash-based attention layers (DeepSeek-V4 HCA). 0 = none.
     #[serde(default)]
     pub num_hash_layers: usize,
@@ -292,6 +298,10 @@ pub struct ModelConfig {
     /// None for text-only models.
     #[serde(skip)]
     pub vision: Option<VisionConfig>,
+
+    /// Flat DeepSeek Vision-Exp contract; not a Qwen vision tower.
+    #[serde(skip)]
+    pub deepseek_vision: Option<DeepSeekVisionConfig>,
 
     /// Advertised quantization format + algorithm + per-module ignore list.
     /// Populated from `config.json::quantization_config` or a sibling
@@ -507,6 +517,20 @@ pub(crate) fn default_conv_kernel() -> usize {
     4
 }
 
+mod deepseek_v4_indexer;
+pub use deepseek_v4_indexer::DeepSeekV4IndexerConfig;
+mod deepseek_v41_pack;
+pub use deepseek_v41_pack::{
+    ExpertPack, MIN_PACKED_KEEP, PACK_EXPERTS, ROUTED_EXPERTS, SERVED_PACKED_KEEP,
+};
+mod deepseek_vision;
+pub use deepseek_vision::DeepSeekVisionConfig;
+mod deepseek_vision_layout;
+pub use deepseek_vision_layout::{
+    ImageBlock, ImageTokenType, build_deepseek_image_block, deepseek_image_block_len,
+};
+mod deepseek_vision_tokens;
+pub use deepseek_vision_tokens::{DeepSeekImageSpan, validate_deepseek_image_tokens};
 mod dispatch;
 mod factory;
 mod methods;
@@ -520,8 +544,8 @@ pub use parsers::{
     parse_peft_adapter_config, parse_quantization_config,
 };
 pub(crate) use parsers::{
-    parse_deepseek_v4, parse_gemma4_params, parse_laguna, parse_minimax_m2, parse_step3p7,
-    parse_vision_config,
+    parse_deepseek_v4, parse_deepseek_v41, parse_gemma4_params, parse_laguna, parse_minimax_m2,
+    parse_step3p7, parse_vision_config,
 };
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
