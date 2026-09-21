@@ -309,11 +309,6 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy32_gatecache_v2",
                 "gated_delta_rule_prefill_wy32_gatecache_v2",
             ),
-            gdn_prefill_wy32_gatecache_ksplit_k: super::super::try_kernel(
-                gpu,
-                "gated_delta_rule_wy32_gatecache_ksplit",
-                "gated_delta_rule_prefill_wy32_gatecache_ksplit",
-            ),
             // ── Q12 Phase 2b: batched GDN kernel handles ──
             gdn_prefill_wy32_batched_k: super::super::try_kernel(
                 gpu,

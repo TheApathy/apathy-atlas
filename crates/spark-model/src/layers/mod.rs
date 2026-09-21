@@ -1190,22 +1190,6 @@ pub fn gdn_prefill_gatecache_v2_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_GDN_PREFILL_GATECACHE_V2").ok().as_deref() == Some("1"))
 }
 
-/// `ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1`: use the K-split (R3) variant of the
-/// WY32 gate-cache GDN prefill kernel -- 512 threads as 4 j-groups x 128 V
-/// columns, state register-resident (requires GATECACHE=1; fails closed if the
-/// symbol is missing).
-///
-/// NOT BIT-EXACT. The two dot products over j are reassociated: each j-group
-/// sums its own 32 terms and the four partials fold in ascending group order,
-/// instead of one sequential FP32 sum over j = 0..127. Harness receipts
-/// (bench/gdn/gdn_r3.txt): 0.0198% of output words differ, 95% of those by
-/// 1 ulp, output relative L2 3.2e-05, state relative L2 4.4e-08.
-pub fn gdn_prefill_gatecache_ksplit_enabled() -> bool {
-    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_GDN_PREFILL_GATECACHE_KSPLIT").ok().as_deref() == Some("1")
-    })
-}
 
 /// `ATLAS_SSM_RESET_ASYNC=1`: per-request SSM slot reset uses stream-ordered,
 /// per-region memsets + one sync instead of ~2000 synchronous memsets.

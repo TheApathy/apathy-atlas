@@ -313,11 +313,6 @@ pub struct Qwen3SsmLayer {
     dequant_nvfp4_to_e4m3_k: KernelHandle,
     /// Exact v2 shadow of the gate-cache kernel (ATLAS_GDN_PREFILL_GATECACHE_V2=1).
     gdn_prefill_wy32_gatecache_v2_k: KernelHandle,
-    /// K-split (R3) variant of the gate-cache kernel
-    /// (ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1). Same argument list and same
-    /// shared-memory footprint as v1, but launched with 512 threads. NOT
-    /// bit-exact -- reassociates the j-sums. Null on targets without it.
-    gdn_prefill_wy32_gatecache_ksplit_k: KernelHandle,
     // ── Q12 Phase 2b: same-chunk-len batched GDN prefill kernels ──
     // Each takes `float* const* h_state_ptrs` plus stacked QKV/gate/beta/output.
     // Used by `Qwen3SsmLayer::prefill_batched` when N≥2 streams have matching

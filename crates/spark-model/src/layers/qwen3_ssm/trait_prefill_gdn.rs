@@ -114,40 +114,6 @@ pub(super) fn gatecache_kernel_choice(
     Ok((v2, smem_v2, true))
 }
 
-/// Layers the K-split choice ON TOP of [`gatecache_kernel_choice`].
-///
-/// Deliberately a separate entry point: widening `gatecache_kernel_choice`'s tuple
-/// would touch its other caller (`trait_prefill.rs:347`), which discards the third
-/// element and has nothing to do with the K-split.
-///
-/// The K-split takes the SAME argument list and the SAME dynamic shared memory as
-/// v1 (95,232 B at kd=vd=128 -- the R3 receipts record no smem change), so the only
-/// thing that differs at the launch site is the block width: 512 instead of 128.
-///
-/// Fails closed: requesting it without the symbol is an error, never a silent
-/// fallback to the bit-exact kernel. A silent fallback here would be the exact
-/// "partial application that looks like success" failure this model has already hit
-/// on the shared-scratch out-projection path.
-pub(super) fn gatecache_ksplit_choice(
-    ksplit_requested: bool,
-    base: (spark_runtime::gpu::KernelHandle, u32, bool),
-    ksplit: spark_runtime::gpu::KernelHandle,
-) -> Result<(spark_runtime::gpu::KernelHandle, u32, u32), &'static str> {
-    let (k, smem, is_v2) = base;
-    if !ksplit_requested {
-        return Ok((k, smem, crate::layers::ops::GDN_PREFILL_BLOCK_X));
-    }
-    if is_v2 {
-        return Err("ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1 is incompatible with GATECACHE_V2=1");
-    }
-    if ksplit.0 == 0 {
-        return Err(
-            "ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1 requires gated_delta_rule_prefill_wy32_gatecache_ksplit",
-        );
-    }
-    Ok((ksplit, smem, 512))
-}
-
 /// Public dumper used from the server shutdown / bench script if needed.
 #[allow(dead_code)]
 pub fn dump_gdn_profile() {
@@ -272,20 +238,6 @@ impl Qwen3SsmLayer {
                 static V2_SEEN: std::sync::Once = std::sync::Once::new();
                 V2_SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_GDN_PREFILL_GATECACHE_V2: M={total} smem={wy32_gatecache_smem}"));
             }
-            let (gatecache_k, wy32_gatecache_smem, gdn_block_x) = gatecache_ksplit_choice(
-                crate::layers::gdn_prefill_gatecache_ksplit_enabled(),
-                (gatecache_k, wy32_gatecache_smem, is_v2),
-                self.gdn_prefill_wy32_gatecache_ksplit_k,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
-            if gdn_block_x != ops::GDN_PREFILL_BLOCK_X {
-                static KS_SEEN: std::sync::Once = std::sync::Once::new();
-                KS_SEEN.call_once(|| {
-                    tracing::info!(
-                        "ENGAGED ATLAS_GDN_PREFILL_GATECACHE_KSPLIT: M={total} smem={wy32_gatecache_smem} block_x={gdn_block_x} (NOT bit-exact)"
-                    );
-                });
-            }
             ops::gdn_prefill_persistent_smem_blocked(
                 ctx.gpu,
                 gatecache_k,
@@ -306,7 +258,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 wy32_gatecache_smem,
-                gdn_block_x,
+                ops::GDN_PREFILL_BLOCK_X,
                 stream,
             )?;
         } else if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {
