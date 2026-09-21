@@ -11,7 +11,7 @@
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use atlas_core::config::VisionConfig;
+use atlas_core::config::{DeepSeekVisionConfig, VisionConfig};
 
 use crate::ir::{ContentPart, ImageData, Message, Role};
 
@@ -32,6 +32,7 @@ pub(crate) struct MsgEntry {
     /// so the Jinja template can render
     /// `<|vision_start|><|image_pad|><|vision_end|>` markers.
     pub(super) image_count: usize,
+    pub(super) image_text_offsets: Vec<usize>,
     /// Historical reasoning trace from a prior assistant turn (the
     /// `<think>...</think>` body). Forwarded from `IncomingMessage`
     /// and passed to the Jinja template so the template can
@@ -91,6 +92,7 @@ fn collect_message_images(
 #[allow(clippy::result_large_err)]
 pub(super) fn build_msg_entries(
     vision_config: Option<&VisionConfig>,
+    deepseek_vision_config: Option<&DeepSeekVisionConfig>,
     vision_max_pixels: Option<usize>,
     input: &[Message],
     tools_active: bool,
@@ -118,16 +120,10 @@ pub(super) fn build_msg_entries(
     // itself (via its own `ns.last_query_index` computation) and the
     // injection here was the source of empty-think poisoning. Removed.
     for m in input.iter() {
-        let mut text = m.text();
-        // F6: a failed tool result (Anthropic `is_error`, carried as
-        // `Message::tool_error`) gets an explicit ASCII marker — chat-tuned
-        // models have no structural error concept and otherwise hallucinate
-        // success over error text. Rendered here (not in the adapters) so
-        // every surface gets identical prompt bytes, and applied before the
-        // error-hint scan below so hints see the final text.
-        if m.tool_error {
-            text = format!("[tool error]\n{text}");
-        }
+        let (text, image_text_offsets) = super::ordered_content::flatten(
+            m,
+            deepseek_vision_config.map(|_| crate::deepseek_vision_preprocess::IMAGE_PLACEHOLDER),
+        );
 
         // Preserve structured tool_calls for the Jinja template.
         // Always extract from assistant messages — past turns may
@@ -172,7 +168,9 @@ pub(super) fn build_msg_entries(
             let mut text = text;
             // P1-6 (2026-07-09): record the pre-hint original at the
             // index this entry is about to occupy.
-            tool_result_originals.push((messages.len(), text.clone()));
+            if m.image_count() == 0 {
+                tool_result_originals.push((messages.len(), text.clone()));
+            }
             if crate::hint_injector::looks_like_error(&text) {
                 consecutive_tool_errors += 1;
                 crate::hint_injector::inject_hints(&mut text, consecutive_tool_errors);
@@ -183,14 +181,23 @@ pub(super) fn build_msg_entries(
                 role: "tool".into(),
                 content: text,
                 tool_calls: None,
-                image_count: m.image_count(),
+                image_count: if deepseek_vision_config.is_some() {
+                    0
+                } else {
+                    m.image_count()
+                },
+                image_text_offsets,
                 reasoning_content: None,
             });
             collect_message_images(m, &mut all_images, &mut image_pad_counts)?;
             continue;
         }
 
-        let image_count = m.image_count();
+        let image_count = if deepseek_vision_config.is_some() {
+            0
+        } else {
+            m.image_count()
+        };
         // Wave 3 (2026-05-26): `ATLAS_STRIP_REASONING_HISTORY=1` drops
         // historical reasoning_content entirely. Matches MLC commit
         // d75d64e (Apr 2026) `strip_reasoning_in_history` for qwen3,
@@ -217,6 +224,7 @@ pub(super) fn build_msg_entries(
             content: text,
             tool_calls: tool_calls_json,
             image_count,
+            image_text_offsets,
             // F1: forward reasoning_content for assistant messages only.
             // Wave 3: when strip_reasoning=true, drop it for ALL turns,
             // forcing the template back to the pre-F1 "clean content
@@ -296,10 +304,9 @@ pub(super) fn build_msg_entries(
     // such a message as absent so a degenerate client prompt can't poison
     // generation. Conservative — only an empty body or a single short
     // bare `Label:` line qualifies; any substantive prompt is untouched.
-    if messages
-        .first()
-        .is_some_and(|m| m.role == "system" && is_vacuous_system_content(&m.content))
-    {
+    if messages.first().is_some_and(|m| {
+        m.role == "system" && m.image_count == 0 && is_vacuous_system_content(&m.content)
+    }) {
         let removed = messages.remove(0);
         tracing::info!(
             dropped = %removed.content.trim(),
@@ -312,7 +319,17 @@ pub(super) fn build_msg_entries(
     // (issue #165) instead of silently dropping the user's input with a
     // 200 — the old text-only behavior lost images without any signal.
     let mut image_pixels: Vec<(Vec<f32>, usize, usize)> = Vec::new();
-    if !all_images.is_empty() {
+    if !all_images.is_empty() && deepseek_vision_config.is_some() {
+        let config = deepseek_vision_config.expect("checked above");
+        image_pixels = crate::deepseek_vision_preprocess::preprocess_images(&all_images, config)
+            .map_err(|error| {
+                openai_error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("DeepSeek image decode error: {error}"),
+                )
+            })?;
+        image_pad_counts.fill(1);
+    } else if !all_images.is_empty() {
         let Some(vcfg) = vision_config else {
             return Err(openai_error_response(
                 StatusCode::BAD_REQUEST,

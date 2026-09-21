@@ -94,13 +94,14 @@ the K2 kernel's register footprint. The arithmetic order matches the single-row
 kernel by construction; live byte-parity and timing are still required before
 promotion.
 
-The next verifier experiment's 48-byte persistent expert-major work record is
-now a production module rather than a microbenchmark-local struct. CPU gates
-pin its 16-byte alignment, little-endian round trip, legal metadata bits,
-six-row ceiling, uniform top-k shape, unique experts within each row, and expert
-bounds. The microbenchmark consumes that shared ABI and still compiles. This is
-host-planning readiness only: production dispatch remains disabled until the
-live kernel clears the 213 GB/s microbenchmark floor and exact per-row parity.
+The unified-MoE microbenchmark's legacy 48-byte persistent expert-major record
+is a shared module rather than a microbenchmark-local struct. Separately,
+`ATLAS_EXL3_VERIFY_WORKLIST=1` host-wires the current 32-byte
+`{expert,count,slots[6]}` ABI to a same-stream device builder and fixed 96-CTA
+EXL3 consumers. CPU gates pin both layouts and validate exact-K2/top-6/M6 route
+shape and uniqueness. The 32-byte arm remains opt-in until live exact per-row
+parity, occupancy, and same-boot timing pass; the 213 GB/s floor belongs only
+to the older unified-MoE microbenchmark.
 
 The DSpark hc-mean capture is now a 256-row circular serve history rather than
 `max_seq_len` rows. The checkpoint attends to only 128 capture positions, so
@@ -131,14 +132,29 @@ JSON files. Comparison requires exact per-prompt output hashes, defaults to a
 65 tok/s median single-run decode floor, rejects identical plain/candidate
 implementation identities, and requires at least 3.0 committed tokens per verify
 step from an `ATLAS_DSPARK_ACCEPT_LOG=1` server log. It never labels aggregate
-throughput as single-stream decode. Both runs must name the same immutable
-`--model-identity` and separately record their `--implementation-identity`.
+throughput as single-stream decode. Each run must pass its launcher-created
+`--receipt <log>.receipt.json`; planned receipts and free-form identity labels
+are rejected. The harness derives the checkpoint fingerprint, implementation
+manifest, activation receipt, GPU identity, and host boot ID from that active
+receipt, then revalidates the same binding before publishing the result.
+Comparison requires the same checkpoint, GPU, and Linux boot, but distinct
+implementation manifests. A shared boot is only a pairing cohort: it does not
+prove that separate server/model loads selected the same autotune state, so
+promotion still requires repeated paired trials.
+The result embeds the exact final active receipt; offline comparison validates
+its internal digests and recomputes every derived provenance field. This detects
+accidental or partial artifact drift, but is integrity consistency rather than
+cryptographic attestation against coordinated fabrication. Non-finite metrics,
+redirected HTTP responses, and ambiguous loopback listeners fail closed.
 Reasoning deltas participate in both decode timing and output hashing, avoiding
 an inflated result when DeepSeek emits a long reasoning stream before content.
+Each paired run must also have the same exact positive `completion_tokens` and
+terminal `finish_reason`; malformed, duplicate, or missing stream terminals and
+content after a terminal event fail closed.
 Acceptance is parsed only from server-log bytes appended during that run, so a
 stale high-acceptance summary cannot promote a candidate; log truncation or
-rotation during measurement also fails closed. Result files are
-atomic and refuse overwrite unless `--overwrite` is explicit.
+rotation during measurement also fails closed. Result files use exclusive atomic
+publication and refuse overwrite unless `--overwrite` is explicit.
 
 ## Long context contract
 

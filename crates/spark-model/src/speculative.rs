@@ -94,6 +94,12 @@ pub trait DraftProposer: Send + Sync {
         Ok(0)
     }
 
+    /// Requires generic verification, including target capture and rollback,
+    /// even when the proposal chain has fewer than four tokens.
+    fn requires_full_target_verify(&self) -> bool {
+        false
+    }
+
     /// Propose up to `num_drafts` tokens autoregressively.
     ///
     /// # Arguments

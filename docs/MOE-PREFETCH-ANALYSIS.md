@@ -280,11 +280,17 @@ scripts/dsflash-serve-bench.sh routelog - \
 # 2) drive ≥300 decode tokens on a ≥450-token prompt, four workloads
 #    (prose / code / repeat / quote — repeat-only overstates locality badly,
 #     since repeated text re-routes to the same experts by construction).
-python3 scripts/decode_ab_probe.py routelog 8977 1
+ATLAS_BENCH_RECEIPT=serve-routelog.log.receipt.json \
+  python3 scripts/decode_ab_probe.py routelog 8977 5 1
 
 # 3) read the summary
 grep 'moe-route-log' serve-routelog.log | tail -60
 ```
+
+The active receipt binds the live PID, listening port, executable, argv,
+selected environment, checkpoint, and model endpoint. The probe records engine
+mode from request-scoped scheduler counters; the route log remains diagnostic
+until its request window is bound independently.
 
 **Sanity gates before believing anything:**
 

@@ -93,6 +93,10 @@ name = "gdn_cdh_vblock_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "vision_hc_bf16_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "gemv_fp4_vs_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
 
@@ -230,6 +234,14 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "exl3_gemv_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "exl3_fused_blend_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "exl3_dual_pre_microtest"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

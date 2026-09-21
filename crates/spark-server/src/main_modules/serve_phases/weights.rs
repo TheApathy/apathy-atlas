@@ -10,6 +10,8 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+mod identity;
+
 pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     // Manual override for checkpoints whose peak/on-disk ratio the format
     // heuristics below misjudge (e.g. bring-up of a new quant format).
@@ -156,6 +158,7 @@ pub(crate) fn load_dflash_drafter(
     ptx_set: &atlas_kernels::TargetPtxSet,
     gpu: &dyn spark_runtime::gpu::GpuBackend,
     target_store: &spark_runtime::weights::WeightStore,
+    target_dir: &Path,
 ) -> Result<Option<DrafterState>> {
     use spark_runtime::weights::WeightLoader;
     if !args.dflash {
@@ -170,18 +173,12 @@ pub(crate) fn load_dflash_drafter(
              or use a target whose MODEL.toml has a [dflash] section",
         )?;
     tracing::info!("DFlash: resolving drafter '{drafter_id}'");
-    // Does the drafter live in the target's own directory? Compare canonical
-    // paths so a trailing slash or a symlink cannot defeat it.
-    let shares_target_dir = args
-        .model
-        .as_deref()
-        .map(std::path::Path::new)
-        .and_then(|p| p.canonicalize().ok())
-        .zip(std::path::Path::new(&drafter_id).canonicalize().ok())
-        .is_some_and(|(a, b)| a == b);
     let drafter_dir =
         crate::model_resolver::resolve_model_dir(&drafter_id, args.cache_dir.as_deref())
             .context("Failed to resolve DFlash drafter checkpoint")?;
+    // Use resolved directories for both CLI forms and HF cache paths. Looking
+    // only at args.model misses --model-from-path and duplicates the target.
+    let shares_target_dir = identity::same_checkpoint(target_dir, &drafter_dir)?;
     // DSpark block drafter (docs/dspark_port.md): the official 0731 drafter
     // shards carry no drafter config.json; the `mtp.0.main_proj.weight`
     // tensor in the safetensors index is the marker. `None` config tells the

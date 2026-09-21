@@ -89,6 +89,43 @@ fn refresh_probe_opens_after_interval_and_returns() {
 }
 
 #[test]
+fn serial_refresh_probe_announces_its_entry_exactly_once() {
+    let mut g = MtpGate::new(1);
+    assert!(!g.take_serial_probe_start());
+    run_mtp_until_probe(&mut g, 2, ms(50));
+    assert!(g.take_serial_probe_start());
+    assert!(!g.take_serial_probe_start());
+    assert_eq!(g.next_step(), GateStep::MeasureDecode);
+    g.record_decode(ms(40));
+    assert!(!g.take_serial_probe_start());
+}
+
+#[test]
+fn scheduler_discards_the_complete_pending_chain_before_serial_probe() {
+    let scheduler = include_str!("../mod.rs");
+    let seam = scheduler
+        .split("if gate.take_serial_probe_start()")
+        .nth(1)
+        .expect("serial probe cleanup gate")
+        .split("match gate.next_step()")
+        .next()
+        .unwrap();
+    assert!(seam.contains("reset_mtp_pending_chain"));
+    let reset = scheduler
+        .split("fn reset_mtp_pending_chain")
+        .nth(1)
+        .unwrap()
+        .split("/// Run the scheduler")
+        .next()
+        .unwrap();
+    assert!(reset.contains("dflash_collect_async_drafts"));
+    assert!(reset.contains("pending_drafts.clear()"));
+    assert!(reset.contains("pending_block_fork = None"));
+    assert!(reset.contains("pending_tree_payload = None"));
+    assert!(reset.contains("sync_secondary"));
+}
+
+#[test]
 fn switches_to_serial_when_clearly_faster_with_dwell() {
     let mut g = MtpGate::new(1);
     // MTP delivers 2 tok / 100ms = 20 tok/s.

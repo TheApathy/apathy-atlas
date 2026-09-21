@@ -45,6 +45,13 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let n = tokens.len();
         if n <= 1 {
+            anyhow::ensure!(
+                self.config.deepseek_vision.is_none()
+                    || tokens
+                        .iter()
+                        .all(|&token| (token as usize) < self.config.vocab_size),
+                "An image sentinel cannot use single-token decode"
+            );
             // Single token: use decode path (CUDA graph optimized)
             for &token in tokens {
                 self.decode(token, seq, stream)?;
@@ -239,7 +246,7 @@ impl TransformerModel {
         };
 
         // ── 2. Embed tokens → [proc_count, H] contiguous ──
-        {
+        if !self.embed_deepseek_chunk(proc_tokens, 0, proc_count, hidden, stream)? {
             let token_ids_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(proc_tokens.as_ptr() as *const u8, proc_count * 4)
             };

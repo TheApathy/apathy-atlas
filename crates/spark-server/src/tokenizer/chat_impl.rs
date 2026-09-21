@@ -66,8 +66,7 @@ impl ChatTokenizer {
                 super::jinja_helpers::load_override_template(model_type, repo_root)
             {
                 override_tmpl
-            } else if let Some(config_tmpl) =
-                super::jinja_helpers::load_config_template(model_dir)?
+            } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)?
             {
                 config_tmpl
             } else {
@@ -115,11 +114,7 @@ impl ChatTokenizer {
     /// splits on, so a vocab with only `<think>` cannot separate reasoning from
     /// answer and is not usefully "thinking-capable" here.
     pub fn has_think_markers(&self) -> bool {
-        let single = |s: &str| {
-            self.encode(s)
-                .ok()
-                .is_some_and(|ids| ids.len() == 1)
-        };
+        let single = |s: &str| self.encode(s).ok().is_some_and(|ids| ids.len() == 1);
         single("<think>") && single("</think>")
     }
 
@@ -211,6 +206,7 @@ impl ChatTokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
         disable_tool_steering: bool,
+        tool_call_reminder_min_bytes: Option<usize>,
     ) -> Result<Vec<u32>> {
         let tmpl = self
             .jinja_env
@@ -228,7 +224,7 @@ impl ChatTokenizer {
         // Mistral, Hermes) typically wrap with `tojson` and don't
         // depend on `.items()`, so the parsed dict round-trips fine.
         let messages_for_render = normalize_tool_call_arguments(messages);
-        let messages_val = minijinja::Value::from_serialize(&messages_for_render);
+        let messages_val = minijinja::Value::from_serialize(messages_for_render.as_ref());
         let tools_val = tools.map(minijinja::Value::from_serialize);
 
         // Diagnostic "continue final message" mode: when the LAST message is an
@@ -261,6 +257,8 @@ impl ChatTokenizer {
             enable_thinking => enable_thinking,
             reasoning_effort => reasoning_effort,
             disable_tool_steering => disable_tool_steering,
+            tool_call_reminder => tool_call_reminder_min_bytes.is_some(),
+            tool_call_reminder_min_bytes => tool_call_reminder_min_bytes.unwrap_or(usize::MAX),
             add_vision_id => false,
         };
 
@@ -302,6 +300,7 @@ impl ChatTokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: bool,
         disable_tool_steering: bool,
+        tool_call_reminder_min_bytes: Option<usize>,
     ) -> Result<Vec<u32>> {
         if let Some(ref env) = self.openai_jinja_env {
             let tmpl = env
@@ -311,7 +310,7 @@ impl ChatTokenizer {
             // apply_chat_template_jinja above for the failure mode
             // (`map has no method named items` on the second turn).
             let messages_for_render = normalize_tool_call_arguments(messages);
-            let messages_val = minijinja::Value::from_serialize(&messages_for_render);
+            let messages_val = minijinja::Value::from_serialize(messages_for_render.as_ref());
             let tools_val = tools.map(minijinja::Value::from_serialize);
             let reasoning_effort: minijinja::Value = if enable_thinking {
                 "high".into()
@@ -325,6 +324,8 @@ impl ChatTokenizer {
                 enable_thinking => enable_thinking,
                 reasoning_effort => reasoning_effort,
                 disable_tool_steering => disable_tool_steering,
+                tool_call_reminder => tool_call_reminder_min_bytes.is_some(),
+                tool_call_reminder_min_bytes => tool_call_reminder_min_bytes.unwrap_or(usize::MAX),
                 add_vision_id => false,
             };
             let rendered = tmpl
@@ -332,7 +333,13 @@ impl ChatTokenizer {
                 .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;
             self.encode(&rendered)
         } else {
-            self.apply_chat_template_jinja(messages, tools, enable_thinking, disable_tool_steering)
+            self.apply_chat_template_jinja(
+                messages,
+                tools,
+                enable_thinking,
+                disable_tool_steering,
+                tool_call_reminder_min_bytes,
+            )
         }
     }
 
@@ -354,7 +361,7 @@ impl ChatTokenizer {
             })
             .collect();
 
-        self.apply_chat_template_jinja(&json_messages, None, enable_thinking, false)
+        self.apply_chat_template_jinja(&json_messages, None, enable_thinking, false, None)
     }
 
     pub fn eos_token_id(&self) -> u32 {

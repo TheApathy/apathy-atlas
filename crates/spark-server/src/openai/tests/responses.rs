@@ -164,18 +164,10 @@ fn responses_function_call_output_string_unchanged() {
 }
 
 #[test]
-fn responses_function_call_output_opaque_array_stringified() {
-    // Out-of-spec array (no recognizable parts) keeps the historical
-    // stringified-JSON behavior instead of silently emptying the result.
-    let opaque = serde_json::json!([{"weather": "sunny", "temp_c": 21}]);
-    let item = serde_json::json!({
-        "type": "function_call_output",
-        "call_id": "call_3",
-        "output": opaque.clone()
-    });
-    let m = IncomingMessage::from_responses_input_item(&item).expect("tool message");
-    assert_eq!(m.content.text, opaque.to_string());
-    assert!(m.content.images.is_empty());
+fn responses_function_call_output_malformed_parts_are_rejected() {
+    let item = serde_json::json!({"type":"function_call_output", "call_id":"call_3",
+        "output":[{"weather":"sunny","temp_c":21}]});
+    assert!(IncomingMessage::try_from_responses_input_item(&item).is_err());
 }
 
 #[test]
@@ -192,4 +184,29 @@ fn responses_in_progress_event_name() {
         },
     };
     assert_eq!(responses_event_name(&ev), "response.in_progress");
+}
+
+#[test]
+fn responses_structured_text_format_is_refused_instead_of_ignored() {
+    for format in [
+        serde_json::json!({"type": "json_object"}),
+        serde_json::json!({"type": "json_schema", "schema": {"type": "object"}}),
+    ] {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "input": "ping",
+            "text": {"format": format},
+        }))
+        .unwrap();
+        let err = lower_responses_to_chat(req, |_| None).unwrap_err();
+        assert!(err.message().contains("text.format"));
+    }
+
+    let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "input": "ping",
+        "text": {"format": {"type": "text"}, "verbosity": "low"},
+    }))
+    .unwrap();
+    assert!(lower_responses_to_chat(req, |_| None).is_ok());
 }

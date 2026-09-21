@@ -28,6 +28,8 @@ pub struct DsmlV4Parser;
 
 /// The DSML namespace token, with fullwidth bars as the checkpoint emits.
 pub const DSML: &str = "\u{ff5c}DSML\u{ff5c}";
+/// Live BPE-frayed namespace spelling with the leading fullwidth bar omitted.
+pub const DSML_SHORT: &str = "DSML\u{ff5c}";
 
 impl ToolCallParser for DsmlV4Parser {
     fn name(&self) -> &str {
@@ -116,7 +118,7 @@ impl ToolCallParser for DsmlV4Parser {
 /// the DSML namespace token actually appears. Drops the `string="..."`
 /// attribute — schema-driven coercion types the values downstream.
 pub(super) fn normalize_dsml(text: &str) -> Option<String> {
-    if !text.contains(DSML) {
+    if !text.contains(DSML) && !text.contains(DSML_SHORT) {
         return None;
     }
     // DSML packs MULTIPLE `<invoke>` blocks inside one `tool_calls`
@@ -127,14 +129,27 @@ pub(super) fn normalize_dsml(text: &str) -> Option<String> {
     let s = text
         .replace(&format!("<{DSML}tool_calls>"), "")
         .replace(&format!("</{DSML}tool_calls>"), "")
+        .replace(&format!("<{DSML_SHORT}tool_calls>"), "")
+        .replace(&format!("</{DSML_SHORT}tool_calls>"), "")
         .replace(&format!("<{DSML}_calls>"), "")
         .replace(&format!("</{DSML}_calls>"), "")
-        .replace(&format!("<{DSML}invoke "), "<tool_call><invoke ")
-        .replace(&format!("</{DSML}invoke>"), "</invoke></tool_call>")
+        .replace("<tool_calls>", "")
+        .replace("</tool_calls>", "")
+        .replace(&format!("<{DSML}invoke "), "<invoke ")
+        .replace(&format!("</{DSML}invoke>"), "</invoke>")
+        .replace(&format!("<{DSML_SHORT}invoke "), "<invoke ")
+        .replace(&format!("</{DSML_SHORT}invoke>"), "</invoke>")
         .replace(&format!("<{DSML}parameter "), "<parameter ")
         .replace(&format!("</{DSML}parameter>"), "</parameter>")
+        .replace(&format!("<{DSML_SHORT}parameter "), "<parameter ")
+        .replace(&format!("</{DSML_SHORT}parameter>"), "</parameter>")
         .replace(" string=\"true\">", ">")
-        .replace(" string=\"false\">", ">");
+        .replace(" string=\"false\">", ">")
+        // Every normalized invoke is an independent call. Applying this
+        // after all three spelling variants collapse to plain XML also
+        // handles mixed open/close spellings without style inference.
+        .replace("<invoke ", "<tool_call><invoke ")
+        .replace("</invoke>", "</invoke></tool_call>");
     Some(s)
 }
 
@@ -144,13 +159,43 @@ pub(super) fn normalize_dsml(text: &str) -> Option<String> {
 /// replace and stay buffered — `safe_emit_len`'s DSML prefixes keep them
 /// from leaking as content until the rest arrives. Idempotent: the rewrite
 /// consumes every DSML token it matches.
-pub(super) fn rewrite_dsml_in_buffer(buf: &mut String) {
-    if !buf.contains(DSML) {
+pub(super) fn rewrite_dsml_in_buffer(buf: &mut String, dsml_mode: bool, inside_tag: bool) {
+    if !dsml_mode {
         return;
     }
-    if let Some(s) = normalize_dsml(buf) {
-        *buf = s;
+    let invoke_open = if inside_tag {
+        "<invoke "
+    } else {
+        "<tool_call><invoke "
+    };
+    let initial = if inside_tag {
+        buf.clone()
+    } else {
+        buf.replace("<invoke ", "<tool_call><invoke ")
+    };
+    let mut s = initial
+        .replace(&format!("<{DSML}tool_calls>"), "")
+        .replace(&format!("</{DSML}tool_calls>"), "")
+        .replace(&format!("<{DSML_SHORT}tool_calls>"), "")
+        .replace(&format!("</{DSML_SHORT}tool_calls>"), "")
+        .replace(&format!("<{DSML}_calls>"), "")
+        .replace(&format!("</{DSML}_calls>"), "")
+        .replace("<tool_calls>", "")
+        .replace("</tool_calls>", "")
+        .replace(&format!("<{DSML}invoke "), invoke_open)
+        .replace(&format!("<{DSML_SHORT}invoke "), invoke_open)
+        .replace(&format!("</{DSML}invoke>"), "</invoke></tool_call>")
+        .replace(&format!("</{DSML_SHORT}invoke>"), "</invoke></tool_call>")
+        .replace(&format!("<{DSML}parameter "), "<parameter ")
+        .replace(&format!("</{DSML}parameter>"), "</parameter>")
+        .replace(&format!("<{DSML_SHORT}parameter "), "<parameter ")
+        .replace(&format!("</{DSML_SHORT}parameter>"), "</parameter>")
+        .replace(" string=\"true\">", ">")
+        .replace(" string=\"false\">", ">");
+    if inside_tag {
+        s = s.replace("</invoke>", "</invoke></tool_call>");
     }
+    *buf = s;
 }
 
 #[cfg(test)]
@@ -172,8 +217,7 @@ mod dsml_tests {
         let (content, calls) = parse_tool_calls(&text);
         assert_eq!(calls.len(), 1, "expected one call, got {calls:?}");
         assert_eq!(calls[0].function.name, "get_weather");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["city"], "Berlin");
         assert!(
             args["days"] == 3 || args["days"] == "3",
@@ -199,6 +243,45 @@ mod dsml_tests {
         assert_eq!(calls[0].function.name, "a");
         assert_eq!(calls[1].function.name, "b");
     }
+
+    #[test]
+    fn dsml_elements_accept_mixed_spellings_independently() {
+        let dsml_invoke_xml_parameter = format!(
+            "<{DSML}tool_calls>\n\
+             <{DSML}invoke name=\"bash\">\n\
+             <parameter name=\"command\" string=\"true\">submit</parameter>\n\
+             </{DSML}invoke>\n\
+             </{DSML}tool_calls>"
+        );
+        let (_content, calls) = parse_tool_calls(&dsml_invoke_xml_parameter);
+        assert_eq!(calls.len(), 1, "DSML invoke + XML parameter: {calls:?}");
+        assert_eq!(calls[0].function.name, "bash");
+        assert!(calls[0].function.arguments.contains("submit"));
+
+        let xml_invoke_dsml_parameter = format!(
+            "<{DSML}tool_calls>\n\
+             <invoke name=\"bash\">\n\
+             <{DSML}parameter name=\"command\" string=\"true\">ls -la</parameter>\n\
+             </invoke>\n\
+             </{DSML}tool_calls>"
+        );
+        let (_content, calls) = parse_tool_calls(&xml_invoke_dsml_parameter);
+        assert_eq!(calls.len(), 1, "XML invoke + DSML parameter: {calls:?}");
+        assert_eq!(calls[0].function.name, "bash");
+        assert!(calls[0].function.arguments.contains("ls -la"));
+
+        let short_invoke_mixed_parameter = format!(
+            "<{DSML}tool_calls>\n\
+             <{DSML_SHORT}invoke name=\"bash\">\n\
+             <parameter name=\"command\" string=\"true\">cargo test</{DSML_SHORT}parameter>\n\
+             </invoke>\n\
+             </{DSML}tool_calls>"
+        );
+        let (_content, calls) = parse_tool_calls(&short_invoke_mixed_parameter);
+        assert_eq!(calls.len(), 1, "short invoke + mixed parameter: {calls:?}");
+        assert_eq!(calls[0].function.name, "bash");
+        assert!(calls[0].function.arguments.contains("cargo test"));
+    }
 }
 
 #[cfg(test)]
@@ -218,7 +301,11 @@ mod dsml_bpe_tests {
              </{DSML}_calls>"
         );
         let (_c, calls) = parse_tool_calls(&text);
-        assert_eq!(calls.len(), 1, "broken envelope should still parse: {calls:?}");
+        assert_eq!(
+            calls.len(),
+            1,
+            "broken envelope should still parse: {calls:?}"
+        );
         assert_eq!(calls[0].function.name, "get_weather");
     }
 }
@@ -268,5 +355,21 @@ mod dsml_stream_tests {
             !content.contains("DSML"),
             "DSML markup leaked into content: {content:?}"
         );
+    }
+
+    #[test]
+    fn mixed_short_dsml_streams_across_element_boundaries() {
+        let chunks = [
+            "<DSML｜tool_calls>\n",
+            "<DSML｜invoke name=\"bash\">\n",
+            "<parameter name=\"command\" string=\"true\">cargo test",
+            "</DSML｜parameter>\n",
+            "</invoke>\n",
+            "</DSML｜tool_calls>",
+        ];
+        let mut det = StreamingToolDetector::new();
+        let (content, calls) = collect(&mut det, &chunks);
+        assert!(calls.iter().any(|n| n == "bash"), "calls={calls:?}");
+        assert!(!content.contains("DSML"), "markup leaked: {content:?}");
     }
 }

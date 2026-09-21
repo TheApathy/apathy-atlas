@@ -23,6 +23,7 @@ pub fn bf16_gemm_act_weight_t(
     unreachable!("cutlass::bf16_gemm_act_weight_t is cuda-only (not built for metal)")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn nvfp4_gemm_bf16_act_weight_t(
     _act: u64,
     _weight_packed_t: u64,
@@ -96,6 +97,7 @@ pub fn nvfp4_grouped_down_dev(
     unreachable!("cutlass::nvfp4_grouped_down_dev is cuda-only (not built for metal)")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn nvfp4_grouped_down(
     _a: u64,
     _packed_ptrs: &[u64],
@@ -126,6 +128,7 @@ pub fn pack_weight_sfb(
     _scale_out: u64,
     _n: u32,
     _k: u32,
+    _src_n_major: bool,
     _stream: u64,
 ) -> Result<()> {
     unreachable!("cutlass::pack_weight_sfb is cuda-only (not built for metal)")

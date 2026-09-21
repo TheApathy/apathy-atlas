@@ -133,6 +133,7 @@ fn render_holo_template(messages: &[serde_json::Value], enable_thinking: bool) -
 
 #[test]
 fn normalize_tool_call_arguments_parses_string_to_dict() {
+    use std::borrow::Cow;
     // The shape opencode sends back on the second turn: assistant
     // message with tool_calls whose function.arguments is a JSON
     // string. F76: must round-trip into a dict for MiniMax's
@@ -150,6 +151,7 @@ fn normalize_tool_call_arguments_parses_string_to_dict() {
         }]
     })];
     let normalized = normalize_tool_call_arguments(&messages);
+    assert!(matches!(normalized, Cow::Owned(_)));
     let args = &normalized[0]["tool_calls"][0]["function"]["arguments"];
     assert!(args.is_object(), "expected dict, got {args:?}");
     assert_eq!(args["command"], "mkdir -p /tmp/x");
@@ -158,11 +160,13 @@ fn normalize_tool_call_arguments_parses_string_to_dict() {
 
 #[test]
 fn normalize_tool_call_arguments_leaves_non_tool_messages_alone() {
+    use std::borrow::Cow;
     let messages = vec![
         json!({"role": "user", "content": "hi"}),
         json!({"role": "assistant", "content": "hello"}),
     ];
     let normalized = normalize_tool_call_arguments(&messages);
+    assert!(matches!(normalized, Cow::Borrowed(_)));
     assert_eq!(normalized, messages);
 }
 
@@ -199,6 +203,7 @@ fn render_holo_template_autocloses_think_before_tool_call() {
 
 #[test]
 fn normalize_tool_call_arguments_passes_through_already_dict() {
+    use std::borrow::Cow;
     // Some clients send args pre-parsed as a dict — must not double-encode.
     let messages = vec![json!({
         "role": "assistant",
@@ -207,6 +212,7 @@ fn normalize_tool_call_arguments_passes_through_already_dict() {
         }]
     })];
     let normalized = normalize_tool_call_arguments(&messages);
+    assert!(matches!(normalized, Cow::Borrowed(_)));
     assert_eq!(
         normalized[0]["tool_calls"][0]["function"]["arguments"]["command"],
         "ls"
@@ -336,6 +342,7 @@ fn render_minimax_openai_template_omits_think_prompt_with_tools_when_disabled() 
 
 #[test]
 fn normalize_tool_call_arguments_invalid_json_string_left_alone() {
+    use std::borrow::Cow;
     // If args is a string but not valid JSON, leave as-is so the
     // template either coerces via tojson or the operator sees the
     // original error.
@@ -346,6 +353,7 @@ fn normalize_tool_call_arguments_invalid_json_string_left_alone() {
         }]
     })];
     let normalized = normalize_tool_call_arguments(&messages);
+    assert!(matches!(normalized, Cow::Borrowed(_)));
     assert_eq!(
         normalized[0]["tool_calls"][0]["function"]["arguments"],
         "not valid json {"

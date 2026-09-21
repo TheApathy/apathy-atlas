@@ -13,43 +13,42 @@ use tokenizers::Tokenizer;
 /// OpenAI's wire format (JSON-encoded string) into the JSON value the
 /// model's chat template expects. MiniMax M2.7's template iterates
 /// `tool_call.function.arguments.items()` which crashes on a string.
-/// We rebuild the message list with parsed arguments where present,
-/// leaving every other field untouched. Returns a fresh Vec rather
-/// than mutating the caller's slice.
-fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+/// We rebuild the message list only when a string argument parses,
+/// leaving every other field untouched. The common no-conversion path
+/// borrows the caller's slice and performs no deep clone.
+fn normalize_tool_call_arguments(
+    messages: &[serde_json::Value],
+) -> std::borrow::Cow<'_, [serde_json::Value]> {
     let mut total_parsed = 0usize;
     let mut total_seen = 0usize;
-    let out: Vec<_> = messages
-        .iter()
-        .map(|msg| {
-            let mut msg = msg.clone();
-            let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
-                return msg;
+    let mut out = std::borrow::Cow::Borrowed(messages);
+    for (message_idx, message) in messages.iter().enumerate() {
+        let Some(tool_calls) = message.get("tool_calls").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for (tool_call_idx, tool_call) in tool_calls.iter().enumerate() {
+            let Some(args) = tool_call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+            else {
+                continue;
             };
-            for tc in tool_calls.iter_mut() {
-                let Some(function) = tc.get_mut("function") else {
-                    continue;
-                };
-                let Some(args) = function.get_mut("arguments") else {
-                    continue;
-                };
-                total_seen += 1;
-                let parsed_owned = if let Some(s) = args.as_str() {
-                    serde_json::from_str::<serde_json::Value>(s).ok()
-                } else {
-                    None
-                };
-                if let Some(parsed) = parsed_owned {
-                    *args = parsed;
-                    total_parsed += 1;
-                }
-                // If parse fails or args wasn't a string, leave as-is —
-                // template may handle via tojson, or surface the
-                // original error for the operator.
+            total_seen += 1;
+            if let Some(parsed) = args
+                .as_str()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                && let Some(target) =
+                    out.to_mut()[message_idx]["tool_calls"][tool_call_idx]["function"]
+                        .get_mut("arguments")
+            {
+                *target = parsed;
+                total_parsed += 1;
             }
-            msg
-        })
-        .collect();
+            // If parse fails or args wasn't a string, leave as-is —
+            // template may handle via tojson, or surface the
+            // original error for the operator.
+        }
+    }
     if total_seen > 0 {
         tracing::debug!(
             "F76 normalize: {}/{} tool_call arguments parsed string→dict",

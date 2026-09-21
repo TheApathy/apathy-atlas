@@ -11,6 +11,9 @@ use super::*;
 pub struct StreamingToolDetector {
     pub(super) buffer: String,
     pub(super) inside_tag: bool,
+    /// A DSML namespace tag was observed in this response. Keeps mixed plain
+    /// XML elements on the DSML normalization path across chunk boundaries.
+    pub(super) dsml_mode: bool,
     pub(super) call_counter: u32,
     /// Track if any tool calls were emitted during process() to prevent
     /// flush() from re-emitting them (causes duplicate arguments in stream).

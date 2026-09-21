@@ -5,7 +5,8 @@
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
-use spark_runtime::kv_cache::PagedKvCache;
+use spark_runtime::kernel_args::KernelLaunch;
+use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
@@ -23,6 +24,93 @@ use crate::layers::ops;
 fn v4_prefill_tc2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_TC2").as_deref() != Ok("0"))
+}
+
+fn v4_prefill_tc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_TC").as_deref() != Ok("0"))
+}
+
+/// Default-off exact-N=2410 TC2 data-movement experiment. The literal `1` is
+/// the only enabling value; every other value preserves the incumbent TC2.
+fn v4_prefill_tc2_warp0_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_TC2_WARP0").as_deref() == Ok("1"))
+}
+
+// BEGIN V4 prefill K/V alias gate
+/// Default-off experiment: omit the redundant pre-RoPE K-to-V scratch copy.
+fn v4_prefill_kv_alias_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_KV_ALIAS").as_deref() == Ok("1"))
+}
+// END V4 prefill K/V alias gate
+
+/// Both production prefill kernels are one atomic, strict default-off arm.
+fn v4_prefill_qb_rope_cache_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_QB_ROPE_CACHE_FUSED").as_deref() == Ok("1"))
+}
+
+/// Exact-shape Q-B normalization + forward-RoPE arm. Unlike the joint cache
+/// experiment, this arm never reads cache scales and never writes cache pages.
+fn v4_prefill_qb_rope_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_QB_ROPE_FUSED").as_deref() == Ok("1"))
+}
+
+/// Exact-shape, inverse-only in-place RoPE experiment. It remains independent
+/// from projection residency: both retained-BF16 cuBLASLt and FP8 wo_a consume
+/// the same materialized BF16 `attn_out` after this operation.
+fn v4_prefill_inverse_rope_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_V4_PREFILL_INVERSE_ROPE_FUSED").as_deref() == Ok("1"))
+}
+
+// BEGIN V4 max-arm strict gate
+/// Qualification-only fail-closed mode. Normal serving keeps the established
+/// per-arm fallbacks unless the literal `1` is present.
+fn v4_prefill_max_require_arms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_PREFILL_MAX_REQUIRE_ARMS").as_deref() == Ok("1"))
+}
+// END V4 max-arm strict gate
+
+fn require_v4_prefill_max_arm(arm: &str, requested: bool, engaged: bool) -> Result<()> {
+    if v4_prefill_max_require_arms() && requested {
+        anyhow::ensure!(
+            engaged,
+            "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requires requested V4 arm {arm} to engage; refusing incumbent fallback"
+        );
+    }
+    Ok(())
+}
+
+static V4_TC2_WARP0_ENGAGED_LOGGED: std::sync::Once = std::sync::Once::new();
+static V4_QB_ROPE_ENGAGED_LOGGED: std::sync::Once = std::sync::Once::new();
+static V4_KV_ALIAS_ENGAGED_LOGGED: std::sync::Once = std::sync::Once::new();
+static V4_INVERSE_ROPE_ENGAGED_LOGGED: std::sync::Once = std::sync::Once::new();
+
+fn log_v4_prefill_max_arm_engaged(
+    logged: &'static std::sync::Once,
+    arm: &str,
+    layer: usize,
+    n: u32,
+    nq: u32,
+    nkv: u32,
+    hd_mla: u32,
+) {
+    logged.call_once(|| {
+        tracing::info!(
+            "V4_PREFILL_MAX_ARM_ENGAGED arm={} layer={} n={} nq={} nkv={} hd_mla={}",
+            arm,
+            layer,
+            n,
+            nq,
+            nkv,
+            hd_mla
+        );
+    });
 }
 
 impl Qwen3AttentionLayer {
@@ -58,7 +146,52 @@ impl Qwen3AttentionLayer {
         let o_lora = mla.o_lora_rank as u32;
         let mla_cache_dim = kv_lora + rope;
         let hd_mla = nope + rope;
+        // Initial-chunk image spans are validated before GPU upload. Refuse
+        // missing visibility support rather than silently serving text-only
+        // causal attention for an actual Vision checkpoint.
+        let vision_tokens = if ctx.config.deepseek_vision.is_some() {
+            anyhow::ensure!(
+                n > 0
+                    && nq == 64
+                    && nkv == 1
+                    && hd_mla == 512
+                    && self.deepseek_vision_prefill_attn_k.0 != 0,
+                "DeepSeek Vision prefill requires its 64-head/512-dim TC2 kernel"
+            );
+            let ids = ctx.token_ids.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "DeepSeek Vision prefill requires validated initial-chunk token IDs"
+                )
+            })?;
+            let vocab = u32::try_from(ctx.config.vocab_size)?;
+            anyhow::ensure!(
+                !ids.is_null() && vocab > 0 && vocab.checked_add(5).is_some(),
+                "Invalid DeepSeek Vision prefill token operand"
+            );
+            Some((ids, vocab))
+        } else {
+            None
+        };
         let use_tc = self.dense_gemm_tc_k.0 != 0;
+        let v4_prefill_tc2_warp0_requested = v4_prefill_tc2_warp0_enabled();
+        let use_v4_prefill_tc2_warp0 = v4_prefill_tc2_warp0_requested
+            && vision_tokens.is_none()
+            && v4_prefill_tc2_enabled()
+            && ctx.config.model_type == "deepseek_v4"
+            && self.v4_prefill_attn_compressed_tc2_warp0_k.0 != 0
+            && v4_prefill_tc_enabled()
+            && self.prefill_attn_compressed_tc_k.0 != 0
+            && n == 2410
+            && nq == 64
+            && nkv == 1
+            && hd_mla == 512;
+        // BEGIN V4 max-arm TC2 warp0 contract
+        require_v4_prefill_max_arm(
+            "tc2_warp0",
+            v4_prefill_tc2_warp0_requested,
+            use_v4_prefill_tc2_warp0,
+        )?;
+        // END V4 max-arm TC2 warp0 contract
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
         let diag_this = diag_all; // probing is opt-in (ATLAS_DIAG_V4_ALL_LAYERS=1): each probe syncs + reads D2H, real tok/s + TTFT cost
@@ -130,9 +263,7 @@ impl Qwen3AttentionLayer {
         // between bucket totals and standalone kernel times.
         let stage_syncs = {
             static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *E.get_or_init(|| {
-                std::env::var("ATLAS_V4_STAGE_SYNCS").as_deref() != Ok("0")
-            })
+            *E.get_or_init(|| std::env::var("ATLAS_V4_STAGE_SYNCS").as_deref() != Ok("0"))
         };
         // ── 1. Q latent → norm → expand ──
         // wq_a keeps a BF16 mirror, so v4_project_prefill's BF16-first
@@ -170,10 +301,7 @@ impl Qwen3AttentionLayer {
             };
         if wqa_cublas || wqa_w8a8 {
             // cuBLASLt / FP8-native MMA arm took it.
-        } else if let Some(wqa8) = mla
-            .wq_a_fp8
-            .filter(|_| self.w8a16_gemm_pipelined_k.0 != 0)
-        {
+        } else if let Some(wqa8) = mla.wq_a_fp8.filter(|_| self.w8a16_gemm_pipelined_k.0 != 0) {
             ops::w8a16_gemm_pipelined(
                 ctx.gpu,
                 self.w8a16_gemm_pipelined_k,
@@ -265,50 +393,259 @@ impl Qwen3AttentionLayer {
                 .map_err(|e| anyhow::anyhow!("V4 attn: q_full gemm sync failed: {e}"))?;
         }
         aprof!("1b_wq_b");
+
+        // Decide both q_b/RoPE arms before q_b_norm. The scale-independent arm
+        // owns only normalization and forward Q/K RoPE; the joint experiment
+        // additionally owns the later cache write. Either decision must decline
+        // before the incumbent normalization mutates q_full.
+        let q_dim = nq * hd_mla;
+        let kv_dim = nkv * hd_mla;
+        let fused_nq = nq;
+        let k_out = q_full.offset((n * q_dim) as usize * 2);
+        let fused_k_full = k_out;
+        let v_out = k_out.offset((n * kv_dim) as usize * 2);
+        let kv_latent = ctx.buffers.expert_gate_out();
+        let norm_unit_w = ctx.buffers.norm_unit_w();
+        let rope_inv_freq = if mla.compressor.is_none() {
+            mla.main_inv_freq
+        } else {
+            mla.yarn_inv_freq
+        };
+        let rope_mscale = if mla.compressor.is_none() {
+            1.0f32
+        } else {
+            super::super::helpers::yarn_rope_mscale(ctx.config)
+        };
+        let (cache_k_scale, cache_v_scale) = self.effective_fp8_scales();
+        let cache_num_blocks = u32::try_from(kv_cache.num_blocks()).unwrap_or(0);
+        let cache_stride = kv_cache.cache_stride();
+        let cache_k_pool = kv_cache.k_pool_ptr(self.attn_layer_idx);
+        let cache_v_pool = kv_cache.v_pool_ptr(self.attn_layer_idx);
+        let cache_dims = kv_cache.config().dims_for_layer(self.attn_layer_idx);
+        let q_bytes = u64::from(n) * u64::from(q_dim) * 2;
+        let k_bytes = u64::from(n) * u64::from(kv_dim) * 2;
+        let k_rope_tmp_bytes = u64::from(n) * u64::from(rope) * 2;
+        let kv_latent_bytes = u64::from(n) * u64::from(kv_lora) * 2;
+        let norm_unit_bytes = u64::from(hd_mla) * 2;
+        let position_bytes = u64::from(n) * 4;
+        let inv_freq_bytes = u64::from(rope / 2) * 4;
+        let slot_bytes = u64::from(n) * 8;
+        let cache_pool_bytes = u64::try_from(cache_stride)
+            .ok()
+            .and_then(|stride| stride.checked_mul(u64::from(cache_num_blocks)));
+        let packed_qk_layout = q_full.0.checked_add(q_bytes) == Some(k_out.0);
+        let ranges_do_not_overlap = |left: (DevicePtr, u64), right: (DevicePtr, u64)| -> bool {
+            left.0
+                .0
+                .checked_add(left.1)
+                .zip(right.0.0.checked_add(right.1))
+                .is_some_and(|(left_end, right_end)| left_end <= right.0.0 || right_end <= left.0.0)
+        };
+
+        // BEGIN V4 Q-B forward RoPE eligibility
+        let qb_rope_pointers_nonzero = [
+            q_full,
+            k_out,
+            q_latent,
+            norm_unit_w,
+            meta.positions,
+            rope_inv_freq,
+        ]
+        .into_iter()
+        .all(|pointer| !pointer.is_null());
+        let qb_rope_pointers_aligned = q_full.0 & 3 == 0
+            && k_out.0 & 3 == 0
+            && q_latent.0 & 3 == 0
+            && norm_unit_w.0 & 3 == 0
+            && meta.positions.0 & 3 == 0
+            && rope_inv_freq.0 & 3 == 0;
+        let qb_rope_buffers_disjoint = {
+            let outputs = [
+                (q_full, q_bytes),
+                (k_out, k_bytes),
+                (q_latent, k_rope_tmp_bytes),
+            ];
+            let inputs = [
+                (norm_unit_w, norm_unit_bytes),
+                (meta.positions, position_bytes),
+                (rope_inv_freq, inv_freq_bytes),
+            ];
+            outputs.iter().enumerate().all(|(index, &left)| {
+                outputs[index + 1..]
+                    .iter()
+                    .all(|&right| ranges_do_not_overlap(left, right))
+                    && inputs
+                        .iter()
+                        .all(|&input| ranges_do_not_overlap(left, input))
+            })
+        };
+        let v4_prefill_qb_rope_fused_requested = v4_prefill_qb_rope_fused_enabled();
+        let use_v4_prefill_qb_rope_fused = v4_prefill_qb_rope_fused_requested
+            && ctx.config.model_type == "deepseek_v4"
+            && self.v4_prefill_qb_norm_rope_fused_k.0 != 0
+            && self.mla_q_rope_extract_batched_k.0 != 0
+            && n == 2410
+            && nq == 64
+            && nkv == 1
+            && hd_mla == 512
+            && nope == 448
+            && rope == 64
+            && !ctx.graph_capture
+            && !diag_this
+            && !ctx.profile
+            && eps.is_finite()
+            && eps > 0.0
+            && rope_mscale.is_finite()
+            && rope_mscale > 0.0
+            && packed_qk_layout
+            && qb_rope_pointers_nonzero
+            && qb_rope_pointers_aligned
+            && qb_rope_buffers_disjoint;
+        // BEGIN V4 max-arm Q-B forward RoPE contract
+        require_v4_prefill_max_arm(
+            "qb_rope_fused",
+            v4_prefill_qb_rope_fused_requested,
+            use_v4_prefill_qb_rope_fused,
+        )?;
+        // END V4 max-arm Q-B forward RoPE contract
+        // END V4 Q-B forward RoPE eligibility
+
+        let pointers_nonzero = [
+            q_full,
+            k_out,
+            kv_latent,
+            norm_unit_w,
+            meta.positions,
+            meta.slot,
+            rope_inv_freq,
+            cache_k_pool,
+            cache_v_pool,
+        ]
+        .into_iter()
+        .all(|pointer| !pointer.is_null());
+        let pointers_aligned = q_full.0 & 3 == 0
+            && k_out.0 & 3 == 0
+            && kv_latent.0 & 3 == 0
+            && norm_unit_w.0 & 3 == 0
+            && meta.positions.0 & 3 == 0
+            && rope_inv_freq.0 & 3 == 0
+            && meta.slot.0 & 7 == 0
+            && cache_k_pool.0 & 1 == 0
+            && cache_v_pool.0 & 1 == 0;
+        let buffers_disjoint = cache_pool_bytes.is_some_and(|pool_bytes| {
+            let outputs = [
+                (q_full, q_bytes),
+                (k_out, k_bytes),
+                (cache_k_pool, pool_bytes),
+                (cache_v_pool, pool_bytes),
+            ];
+            let inputs = [
+                (kv_latent, kv_latent_bytes),
+                (norm_unit_w, norm_unit_bytes),
+                (meta.positions, position_bytes),
+                (rope_inv_freq, inv_freq_bytes),
+                (meta.slot, slot_bytes),
+            ];
+            outputs.iter().enumerate().all(|(index, &left)| {
+                outputs[index + 1..]
+                    .iter()
+                    .all(|&right| ranges_do_not_overlap(left, right))
+                    && inputs
+                        .iter()
+                        .all(|&input| ranges_do_not_overlap(left, input))
+            })
+        });
+        let v4_qb_rope_cache_fused_requested = v4_prefill_qb_rope_cache_fused_enabled();
+        let use_v4_qb_rope_cache_fused = v4_qb_rope_cache_fused_requested
+            && ctx.config.model_type == "deepseek_v4"
+            && self.v4_prefill_qb_norm_rope_fused_k.0 != 0
+            && self.v4_prefill_cache_kfull_fp8_fused_k.0 != 0
+            && n == 2410
+            && nq == 64
+            && nkv == 1
+            && hd_mla == 512
+            && nope == 448
+            && rope == 64
+            && kv_lora == 512
+            && mla_cache_dim == 576
+            && self.kv_dtype == KvCacheDtype::Fp8
+            && kv_cache.dtype_for_layer(self.attn_layer_idx) == KvCacheDtype::Fp8
+            && cache_dims == (1, 576)
+            && kv_cache.block_size() == 16
+            && cache_stride == 16 * 576
+            && kv_cache.k_block_stride_bytes_for_layer(self.attn_layer_idx) == 16 * 576
+            && kv_cache.v_block_stride_bytes_for_layer(self.attn_layer_idx) == 16 * 576
+            && cache_num_blocks != 0
+            && self.fp8_calibration.is_none()
+            && !ctx.graph_capture
+            && !diag_this
+            && !ctx.profile
+            && eps.is_finite()
+            && eps > 0.0
+            && rope_mscale.is_finite()
+            && cache_k_scale.is_finite()
+            && cache_k_scale > 0.0
+            && cache_v_scale.is_finite()
+            && cache_v_scale > 0.0
+            && packed_qk_layout
+            && pointers_nonzero
+            && pointers_aligned
+            && buffers_disjoint;
+        if v4_qb_rope_cache_fused_requested {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "V4 joint prefill q_b/RoPE/cache fused eligibility: {}",
+                    use_v4_qb_rope_cache_fused
+                );
+            });
+        }
+
         // q_b_norm: per-head unweighted RMSNorm over head_dim (DeepSeek-V4),
         // each of the n*nq head vectors renormalized to unit RMS before rope.
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            q_full,
-            &crate::weight_map::DenseWeight {
-                weight: ctx.buffers.norm_unit_w(),
-            },
-            q_full,
-            n * nq,
-            hd_mla,
-            eps,
-            stream,
-        )?;
-        if diag_this {
-            super::super::trait_impl::diag_norm(
+        let use_v4_qb_rope_kernel = use_v4_qb_rope_cache_fused || use_v4_prefill_qb_rope_fused;
+        // BEGIN V4 Q-B norm incumbent fallback
+        if !use_v4_qb_rope_kernel {
+            ops::rms_norm(
                 ctx.gpu,
+                self.rms_norm_k,
                 q_full,
-                (nq * hd_mla) as usize,
+                &crate::weight_map::DenseWeight {
+                    weight: ctx.buffers.norm_unit_w(),
+                },
+                q_full,
+                n * nq,
+                hd_mla,
+                eps,
                 stream,
-                &format!(
-                    "V4-prefill L{} Q after q_b_norm token0",
-                    self.attn_layer_idx
-                ),
-            );
-            let q_last_off = ((n - 1) * nq * hd_mla * 2) as usize;
-            super::super::trait_impl::diag_norm(
-                ctx.gpu,
-                q_full.offset(q_last_off),
-                (nq * hd_mla) as usize,
-                stream,
-                &format!("V4-prefill L{} Q after q_b_norm last", self.attn_layer_idx),
-            );
+            )?;
+            if diag_this {
+                super::super::trait_impl::diag_norm(
+                    ctx.gpu,
+                    q_full,
+                    (nq * hd_mla) as usize,
+                    stream,
+                    &format!(
+                        "V4-prefill L{} Q after q_b_norm token0",
+                        self.attn_layer_idx
+                    ),
+                );
+                let q_last_off = ((n - 1) * nq * hd_mla * 2) as usize;
+                super::super::trait_impl::diag_norm(
+                    ctx.gpu,
+                    q_full.offset(q_last_off),
+                    (nq * hd_mla) as usize,
+                    stream,
+                    &format!("V4-prefill L{} Q after q_b_norm last", self.attn_layer_idx),
+                );
+            }
         }
+        // END V4 Q-B norm incumbent fallback
 
         aprof!("1_q_latent_expand");
         // ── 2. Direct KV projection (V4-Flash: K=V, no absorption) ──
         // Layout in qkv_output: [Q | K | V]  (mirrors decode path)
-        let q_dim = nq * hd_mla;
-        let kv_dim = nkv * hd_mla;
-        let k_out = q_full.offset((n * q_dim) as usize * 2);
-        let v_out = k_out.offset((n * kv_dim) as usize * 2);
-        let kv_latent = ctx.buffers.expert_gate_out(); // Capture latent for cache assembly
+        // Capture latent for cache assembly.
         // NOTE: dense_gemm_tc produces NON-DETERMINISTIC NaN for the wkv projection
         // here (varying token position across identical runs) — a latent TC-kernel
         // bug exposed once the upstream norms were corrected. Use the scalar
@@ -433,6 +770,22 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )?;
+        // BEGIN V4 prefill K/V alias decision
+        // Every core-attention arm below already passes `k_out` as both raw K
+        // and raw V. Therefore `v_out` has no consumer after the immediate
+        // diagnostic, and this copy is redundant. Keep graph capture and the
+        // diagnostic path byte-for-byte on the old topology; restrict the
+        // experiment to the exact V4 single-KV-head 512-BF16 layout.
+        let kv_alias_requested = v4_prefill_kv_alias_enabled();
+        let kv_alias = kv_alias_requested
+            && nkv == 1
+            && kv_lora == 512
+            && hd_mla == 512
+            && !ctx.graph_capture
+            && !diag_this;
+        // BEGIN V4 max-arm K/V alias contract
+        require_v4_prefill_max_arm("kv_alias", kv_alias_requested, kv_alias)?;
+        // END V4 max-arm K/V alias contract
         // Copy kv_latent → k_out (for attention computation)
         ctx.gpu
             .copy_d2d_async(kv_latent, k_out, n as usize * kv_lora as usize * 2, stream)?;
@@ -456,9 +809,24 @@ impl Qwen3AttentionLayer {
                 &format!("V4-prefill L{} K after proj", self.attn_layer_idx),
             );
         }
-        // Copy K → V (V4-Flash: K and V share the same projection output)
-        ctx.gpu
-            .copy_d2d_async(k_out, v_out, (n * kv_dim) as usize * 2, stream)?;
+        // Copy K → V fallback. At N=2410 this moves 2,467,840 payload bytes,
+        // or 4,935,680 logical bytes/layer including the read and write. The
+        // opt-in avoids 212,234,240 logical bytes/pass and 43 D2D enqueues/pass.
+        if kv_alias {
+            log_v4_prefill_max_arm_engaged(
+                &V4_KV_ALIAS_ENGAGED_LOGGED,
+                "kv_alias",
+                self.attn_layer_idx,
+                n,
+                nq,
+                nkv,
+                hd_mla,
+            );
+        }
+        if !kv_alias {
+            ctx.gpu
+                .copy_d2d_async(k_out, v_out, (n * kv_dim) as usize * 2, stream)?;
+        }
         if diag_this {
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
@@ -468,92 +836,154 @@ impl Qwen3AttentionLayer {
                 &format!("V4-prefill L{} V after copy", self.attn_layer_idx),
             );
         }
+        // END V4 prefill K/V alias decision
 
         aprof!("2_kv_proj");
         // ── 3. RoPE on Q and K (V is NOT RoPE'd) ──
         // V4-Flash: rope dims are at offset `nope` per head (matching MLA layout),
         // not at the beginning. Extract → RoPE → writeback.
-        let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
-        let k_rope_tmp = q_latent; // reuse after wq_b is done
-        ops::mla_q_rope_extract_batched(
-            ctx.gpu,
-            self.mla_q_rope_extract_batched_k,
-            q_full,
-            q_rope_tmp,
-            n,
-            nq,
-            hd_mla,
-            nope,
-            rope,
-            nq * hd_mla,
-            stream,
-        )?;
-        ops::mla_q_rope_extract_batched(
-            ctx.gpu,
-            self.mla_q_rope_extract_batched_k,
-            k_out,
-            k_rope_tmp,
-            n,
-            nkv,
-            hd_mla,
-            nope,
-            rope,
-            nkv * hd_mla,
-            stream,
-        )?;
-        ops::rope_yarn(
-            ctx.gpu,
-            // DeepSeek-V4 INTERLEAVED RoPE (rope_interleave=True): adjacent pairs
-            // (2i, 2i+1), matching the HF reference. See attention_forward_v4.rs.
-            self.rope_yarn_interleaved_k,
-            q_rope_tmp,
-            k_rope_tmp,
-            meta.positions,
-            n,
-            nq,
-            nkv,
-            rope,
-            rope,
-            // Sliding layers (compressor==None) = reference "main" rope: plain
-            // θ=10000, mscale=1 (no yarn). CSA/HCA keep the θ=160000 yarn table.
-            if mla.compressor.is_none() {
-                mla.main_inv_freq
+        let fallback_k_rope_tmp = if use_v4_qb_rope_kernel {
+            // BEGIN V4 Q-B forward RoPE dispatch
+            // BEGIN V4 joint q_b/RoPE dispatch
+            KernelLaunch::new(ctx.gpu, self.v4_prefill_qb_norm_rope_fused_k)
+                .grid([n, fused_nq, 1])
+                .block([512, 1, 1])
+                .arg_ptr(q_full)
+                .arg_ptr(fused_k_full)
+                .arg_ptr(norm_unit_w)
+                .arg_ptr(meta.positions)
+                .arg_ptr(rope_inv_freq)
+                .arg_u32(n)
+                .arg_u32(fused_nq)
+                .arg_u32(nkv)
+                .arg_u32(hd_mla)
+                .arg_u32(nope)
+                .arg_u32(rope)
+                .arg_f32(eps)
+                .arg_f32(rope_mscale)
+                .launch(stream)?;
+            // END V4 joint q_b/RoPE dispatch
+            let k_rope_tmp = if use_v4_qb_rope_cache_fused {
+                None
             } else {
-                mla.yarn_inv_freq
-            },
-            if mla.compressor.is_none() {
-                1.0f32
-            } else {
-                super::super::helpers::yarn_rope_mscale(ctx.config)
-            },
-            stream,
-        )?;
-        ops::mla_q_rope_writeback_batched(
-            ctx.gpu,
-            self.mla_q_rope_writeback_batched_k,
-            q_rope_tmp,
-            q_full,
-            n,
-            nq,
-            hd_mla,
-            nope,
-            rope,
-            nq * hd_mla,
-            stream,
-        )?;
-        ops::mla_q_rope_writeback_batched(
-            ctx.gpu,
-            self.mla_q_rope_writeback_batched_k,
-            k_rope_tmp,
-            k_out,
-            n,
-            nkv,
-            hd_mla,
-            nope,
-            rope,
-            nkv * hd_mla,
-            stream,
-        )?;
+                // The scale-independent arm keeps the incumbent cache writer.
+                // Re-extract only K's 64-wide rotated tail for its contiguous
+                // cache-assembly ABI; Q never materializes a RoPE scratch row.
+                let k_rope_tmp = q_latent;
+                ops::mla_q_rope_extract_batched(
+                    ctx.gpu,
+                    self.mla_q_rope_extract_batched_k,
+                    k_out,
+                    k_rope_tmp,
+                    n,
+                    nkv,
+                    hd_mla,
+                    nope,
+                    rope,
+                    nkv * hd_mla,
+                    stream,
+                )?;
+                Some(k_rope_tmp)
+            };
+            if use_v4_prefill_qb_rope_fused {
+                log_v4_prefill_max_arm_engaged(
+                    &V4_QB_ROPE_ENGAGED_LOGGED,
+                    "qb_rope_fused",
+                    self.attn_layer_idx,
+                    n,
+                    nq,
+                    nkv,
+                    hd_mla,
+                );
+            }
+            // END V4 Q-B forward RoPE dispatch
+            k_rope_tmp
+        } else {
+            // BEGIN V4 forward RoPE incumbent fallback
+            let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
+            let k_rope_tmp = q_latent; // reuse after wq_b is done
+            ops::mla_q_rope_extract_batched(
+                ctx.gpu,
+                self.mla_q_rope_extract_batched_k,
+                q_full,
+                q_rope_tmp,
+                n,
+                nq,
+                hd_mla,
+                nope,
+                rope,
+                nq * hd_mla,
+                stream,
+            )?;
+            ops::mla_q_rope_extract_batched(
+                ctx.gpu,
+                self.mla_q_rope_extract_batched_k,
+                k_out,
+                k_rope_tmp,
+                n,
+                nkv,
+                hd_mla,
+                nope,
+                rope,
+                nkv * hd_mla,
+                stream,
+            )?;
+            ops::rope_yarn(
+                ctx.gpu,
+                // DeepSeek-V4 INTERLEAVED RoPE (rope_interleave=True): adjacent pairs
+                // (2i, 2i+1), matching the HF reference. See attention_forward_v4.rs.
+                self.rope_yarn_interleaved_k,
+                q_rope_tmp,
+                k_rope_tmp,
+                meta.positions,
+                n,
+                nq,
+                nkv,
+                rope,
+                rope,
+                // Sliding layers (compressor==None) = reference "main" rope: plain
+                // θ=10000, mscale=1 (no yarn). CSA/HCA keep the θ=160000 yarn table.
+                if mla.compressor.is_none() {
+                    mla.main_inv_freq
+                } else {
+                    mla.yarn_inv_freq
+                },
+                if mla.compressor.is_none() {
+                    1.0f32
+                } else {
+                    super::super::helpers::yarn_rope_mscale(ctx.config)
+                },
+                stream,
+            )?;
+            ops::mla_q_rope_writeback_batched(
+                ctx.gpu,
+                self.mla_q_rope_writeback_batched_k,
+                q_rope_tmp,
+                q_full,
+                n,
+                nq,
+                hd_mla,
+                nope,
+                rope,
+                nq * hd_mla,
+                stream,
+            )?;
+            ops::mla_q_rope_writeback_batched(
+                ctx.gpu,
+                self.mla_q_rope_writeback_batched_k,
+                k_rope_tmp,
+                k_out,
+                n,
+                nkv,
+                hd_mla,
+                nope,
+                rope,
+                nkv * hd_mla,
+                stream,
+            )?;
+            // END V4 forward RoPE incumbent fallback
+            Some(k_rope_tmp)
+        };
         ctx.gpu
             .synchronize(stream)
             .map_err(|e| anyhow::anyhow!("V4 attn: rope_yarn sync failed: {e}"))?;
@@ -598,7 +1028,6 @@ impl Qwen3AttentionLayer {
         // windowed KV] + per-head sink (DeepSeek Sparse Attention). For short prompts
         // the indexer is a no-op so only the compressor concat matters. Full-attention
         // (layers 0-1) and HCA-short layers fall back to plain prefill attention.
-        use spark_runtime::kernel_args::KernelLaunch;
         let attn_out = ctx.buffers.attn_output();
         // DeepSeek-V4 sliding-window (port item 1): the RAW attention arm is windowed to
         // the last V4_WINDOW keys on EVERY layer (config sliding_window=128). Distant
@@ -617,18 +1046,19 @@ impl Qwen3AttentionLayer {
         // e.g. ratio-128 HCA layers with a short prompt) therefore skips the store
         // and inherits a prior request's value, causing decode to attend a stale
         // compressed block from earlier traffic. Store this sequence's own block
-        // count (0 when sub-ratio) up front so requests never leak across each other.
-        if let Some(c) = mla.compressor.as_ref() {
-            let prefill_blocks = n / c.ratio as u32;
+        // count as zero up front so requests never leak across each other. A
+        // non-zero count is published only after its pool bytes are enqueued.
+        if mla.compressor.is_some() {
             self.v4_comp_pool_filled
-                .store(prefill_blocks, std::sync::atomic::Ordering::Relaxed);
+                .store(0, std::sync::atomic::Ordering::Relaxed);
             // Mirror to the device word the graphed decode/verify kernels read
             // (on-stream so it lands before the first decode/verify of this req).
             if !self.v4_comp_count_dev.is_null() {
                 ctx.gpu
-                    .memset_u32_async(self.v4_comp_count_dev, prefill_blocks, 1, stream)?;
+                    .memset_u32_async(self.v4_comp_count_dev, 0, 1, stream)?;
             }
         }
+        let mut compressed_pool_write = None;
         let csa = match mla.compressor {
             Some(c) if self.csa_compress_k.0 != 0 && (n / c.ratio as u32) > 0 => Some(c),
             _ => None,
@@ -682,7 +1112,9 @@ impl Qwen3AttentionLayer {
                 stream,
                 "V4 comp wkv",
             ) {
-                gemm(ctx.gpu, gk, normed, &comp.wkv, kv_comp, n, proj_dim, h, stream)?;
+                gemm(
+                    ctx.gpu, gk, normed, &comp.wkv, kv_comp, n, proj_dim, h, stream,
+                )?;
             }
             if !super::v4_fp8_proj::try_v4_cublas_prefill(
                 normed,
@@ -784,41 +1216,16 @@ impl Qwen3AttentionLayer {
                 hd_mla,
                 stream,
             )?;
-            // ── 4b increment-1: persist prefill's compressed blocks (FP8) ──
-            // comp_k is now final (rope'd, bf16). Quantize the n_win blocks to
-            // FP8-E4M3 into the layer's persistent flat pool (blocks [0, n_win))
-            // so decode reads raw + compressed arms at ONE dtype/scale (single
-            // online softmax). Was ephemeral scratch (moe_output), discarded.
-            // No serve behavior change yet — written, not yet read by decode.
-            // V4 fp8-KV uses static k_scale=1.0 (fp8_calibration off) → the raw
-            // arm's write (reshape_and_cache_fp8, scale 1.0) is a plain e4m3 cast,
-            // which bf16_to_fp8 matches exactly. If V4 ever calibrates (scale!=1.0)
-            // this needs a scale-aware cast — guarded below.
-            let (k_scale, _v_scale) = self.effective_fp8_scales();
-            debug_assert!(
-                (k_scale - 1.0).abs() < 1e-6,
-                "V4 compressed-pool persist assumes k_scale=1.0 (got {k_scale}); add scale-aware cast"
-            );
+            // Defer persistence until after the raw KV write. That write owns the
+            // first-observe calibration freeze; quantizing here would use the
+            // constructor's provisional scale and publish incompatible pool bytes.
             let n_elems = (n_win * hd_mla) as usize; // hd_mla=576 even → even (bf16_to_fp8 req.)
             debug_assert!(
                 (n_win as usize) <= comp.pool_blocks,
                 "V4 compressed pool overflow: n_win={n_win} > pool_blocks={}",
                 comp.pool_blocks
             );
-            ops::bf16_to_fp8(
-                ctx.gpu,
-                self.bf16_to_fp8_k,
-                comp_k,
-                comp.pool,
-                n_elems as u32,
-                stream,
-            )?;
-            // Record how many compressed blocks prefill wrote → decode's compressed
-            // arm attends exactly [0, n_win). inc-2: single-shot prefill, blocks at
-            // pool offset 0, no decode-time append. (Chunked prefill would need an
-            // offset + accumulate — an inc-3 concern alongside decode-append.)
-            self.v4_comp_pool_filled
-                .store(n_win, std::sync::atomic::Ordering::Relaxed);
+            compressed_pool_write = Some((comp_k, comp.pool, n_elems as u32, n_win));
             // Split of the old 4_core_attention bucket: everything above —
             // the two dense_gemm compressor projections, csa_compress, norm,
             // rope, pool copies — is the compressor; the kernel below is the
@@ -830,15 +1237,16 @@ impl Qwen3AttentionLayer {
             // vs scalar, 7.12 -> 1.85 ms/call at S=896. head_dim must be 512
             // (compile-time layout); ATLAS_V4_PREFILL_TC=0 opts back into the
             // scalar kernel.
-            let use_tc = {
-                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *ON.get_or_init(|| {
-                    std::env::var("ATLAS_V4_PREFILL_TC").as_deref() != Ok("0")
-                })
-            } && self.prefill_attn_compressed_tc_k.0 != 0
-                && hd_mla == 512;
+            let use_tc = vision_tokens.is_some()
+                || (v4_prefill_tc_enabled()
+                    && self.prefill_attn_compressed_tc_k.0 != 0
+                    && hd_mla == 512);
             // tc2 when opted in and present; otherwise the shipping tc.
-            let tc_k = if v4_prefill_tc2_enabled() && self.prefill_attn_compressed_tc2_k.0 != 0 {
+            let tc_k = if vision_tokens.is_some() {
+                self.deepseek_vision_prefill_attn_k
+            } else if use_v4_prefill_tc2_warp0 {
+                self.v4_prefill_attn_compressed_tc2_warp0_k
+            } else if v4_prefill_tc2_enabled() && self.prefill_attn_compressed_tc2_k.0 != 0 {
                 self.prefill_attn_compressed_tc2_k
             } else {
                 self.prefill_attn_compressed_tc_k
@@ -859,7 +1267,7 @@ impl Qwen3AttentionLayer {
             } else {
                 self.prefill_attn_compressed_k
             };
-            KernelLaunch::new(ctx.gpu, attn_k)
+            let launch = KernelLaunch::new(ctx.gpu, attn_k)
                 .grid([nq, n.div_ceil(16), 1])
                 .block([128, 1, 1])
                 .arg_ptr(q_full)
@@ -877,8 +1285,24 @@ impl Qwen3AttentionLayer {
                 .arg_u32(n_win)
                 .arg_u32(ratio)
                 .arg_u32(V4_WINDOW)
-                .arg_f32(1.0f32 / (hd_mla as f32).sqrt())
-                .launch(stream)?;
+                .arg_f32(1.0f32 / (hd_mla as f32).sqrt());
+            let launch = if let Some((token_ids, vocab)) = vision_tokens {
+                launch.arg_ptr(token_ids).arg_u32(vocab)
+            } else {
+                launch
+            };
+            launch.launch(stream)?;
+            if use_tc && use_v4_prefill_tc2_warp0 {
+                log_v4_prefill_max_arm_engaged(
+                    &V4_TC2_WARP0_ENGAGED_LOGGED,
+                    "tc2_warp0",
+                    self.attn_layer_idx,
+                    n,
+                    nq,
+                    nkv,
+                    hd_mla,
+                );
+            }
             aprof!("4b_attn_kernel");
             true
         } else {
@@ -915,12 +1339,8 @@ impl Qwen3AttentionLayer {
             // residue; the two engines only disagreed because their warmups
             // differ. Zeroing makes the unwritten region deterministic and
             // path-independent, so the γ-replay is bit-exact with plain.
-            ctx.gpu.memset_u32_async(
-                comp.ring,
-                0,
-                (cratio as usize * hbytes) / 4,
-                stream,
-            )?;
+            ctx.gpu
+                .memset_u32_async(comp.ring, 0, (cratio as usize * hbytes) / 4, stream)?;
             // Discard any unrolled γ-verify speculation from a PREVIOUS request
             // (one that ended mid-verify, e.g. on a tree win or an early
             // return). Without this, `v4_compress_speculate`'s self-heal would
@@ -977,21 +1397,21 @@ impl Qwen3AttentionLayer {
             // windowed-causal raw arm (same V4_WINDOW), no compressed arm,
             // per-head sink in the denominator, V==K aliasing.
             // ATLAS_V4_PREFILL_TC=0 opts back into the 512 kernel.
-            let use_tc_dense = {
-                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *ON.get_or_init(|| {
-                    std::env::var("ATLAS_V4_PREFILL_TC").as_deref() != Ok("0")
-                })
-            } && self.prefill_attn_compressed_tc_k.0 != 0
-                && hd_mla == 512;
-            let tc_dense_k =
-                if v4_prefill_tc2_enabled() && self.prefill_attn_compressed_tc2_k.0 != 0 {
-                    self.prefill_attn_compressed_tc2_k
-                } else {
-                    self.prefill_attn_compressed_tc_k
-                };
+            let use_tc_dense = vision_tokens.is_some()
+                || (v4_prefill_tc_enabled()
+                    && self.prefill_attn_compressed_tc_k.0 != 0
+                    && hd_mla == 512);
+            let tc_dense_k = if vision_tokens.is_some() {
+                self.deepseek_vision_prefill_attn_k
+            } else if use_v4_prefill_tc2_warp0 {
+                self.v4_prefill_attn_compressed_tc2_warp0_k
+            } else if v4_prefill_tc2_enabled() && self.prefill_attn_compressed_tc2_k.0 != 0 {
+                self.prefill_attn_compressed_tc2_k
+            } else {
+                self.prefill_attn_compressed_tc_k
+            };
             if use_tc_dense {
-                KernelLaunch::new(ctx.gpu, tc_dense_k)
+                let launch = KernelLaunch::new(ctx.gpu, tc_dense_k)
                     .grid([nq, n.div_ceil(16), 1])
                     .block([128, 1, 1])
                     .arg_ptr(q_full)
@@ -1008,8 +1428,24 @@ impl Qwen3AttentionLayer {
                     .arg_u32(0) // n_comp = 0: compressed arm entirely skipped
                     .arg_u32(1) // ratio: irrelevant at n_comp=0; nonzero for div
                     .arg_u32(V4_WINDOW)
-                    .arg_f32(1.0f32 / (hd_mla as f32).sqrt())
-                    .launch(stream)?;
+                    .arg_f32(1.0f32 / (hd_mla as f32).sqrt());
+                let launch = if let Some((token_ids, vocab)) = vision_tokens {
+                    launch.arg_ptr(token_ids).arg_u32(vocab)
+                } else {
+                    launch
+                };
+                launch.launch(stream)?;
+                if use_v4_prefill_tc2_warp0 {
+                    log_v4_prefill_max_arm_engaged(
+                        &V4_TC2_WARP0_ENGAGED_LOGGED,
+                        "tc2_warp0",
+                        self.attn_layer_idx,
+                        n,
+                        nq,
+                        nkv,
+                        hd_mla,
+                    );
+                }
             } else {
                 ops::prefill_attention_512_sink(
                     ctx.gpu,
@@ -1029,9 +1465,7 @@ impl Qwen3AttentionLayer {
                     mla.attn_sink,
                     stream,
                 )
-                .map_err(|e| {
-                    anyhow::anyhow!("V4 attn: prefill_attention_512_sink failed: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("V4 attn: prefill_attention_512_sink failed: {e}"))?;
             }
         }
         if stage_syncs {
@@ -1043,7 +1477,89 @@ impl Qwen3AttentionLayer {
         aprof!("4d_dense_fallback");
         // DeepSeek-V4 eq.26: de-rotate the attention output by each query position
         // (inverse interleaved YaRN RoPE on the trailing rope dims) before o_proj.
-        {
+        // Decide the strict exact-shape arm before either path mutates attn_out.
+        let inverse_output_bytes = u64::from(n)
+            .checked_mul(u64::from(nq))
+            .and_then(|elements| elements.checked_mul(u64::from(hd_mla)))
+            .and_then(|elements| elements.checked_mul(2));
+        let inverse_position_bytes = u64::from(n).checked_mul(4);
+        let inverse_frequency_bytes = u64::from(rope / 2).checked_mul(4);
+        let inverse_pointers_nonzero =
+            !attn_out.is_null() && !meta.positions.is_null() && !rope_inv_freq.is_null();
+        let inverse_pointers_aligned =
+            attn_out.0 & 3 == 0 && meta.positions.0 & 3 == 0 && rope_inv_freq.0 & 3 == 0;
+        let inverse_buffers_disjoint = inverse_output_bytes
+            .zip(inverse_position_bytes)
+            .zip(inverse_frequency_bytes)
+            .is_some_and(|((output_bytes, position_bytes), frequency_bytes)| {
+                ranges_do_not_overlap((attn_out, output_bytes), (meta.positions, position_bytes))
+                    && ranges_do_not_overlap(
+                        (attn_out, output_bytes),
+                        (rope_inv_freq, frequency_bytes),
+                    )
+            });
+        let inverse_rope_requested = v4_prefill_inverse_rope_fused_enabled();
+        let use_v4_prefill_inverse_rope_fused = inverse_rope_requested
+            && ctx.config.model_type == "deepseek_v4"
+            && self.v4_prefill_rope_fused_inverse_k.0 != 0
+            && n == 2410
+            && nq == 64
+            && nkv == 1
+            && hd_mla == 512
+            && nope == 448
+            && rope == 64
+            && !ctx.graph_capture
+            && !diag_this
+            && !ctx.profile
+            && rope_mscale.is_finite()
+            && rope_mscale > 0.0
+            && inverse_pointers_nonzero
+            && inverse_pointers_aligned
+            && inverse_buffers_disjoint;
+        // BEGIN V4 max-arm inverse RoPE contract
+        require_v4_prefill_max_arm(
+            "inverse_rope",
+            inverse_rope_requested,
+            use_v4_prefill_inverse_rope_fused,
+        )?;
+        // END V4 max-arm inverse RoPE contract
+        if inverse_rope_requested {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "V4 prefill inverse-only RoPE fused eligibility: {}",
+                    use_v4_prefill_inverse_rope_fused
+                );
+            });
+        }
+        if use_v4_prefill_inverse_rope_fused {
+            // BEGIN V4 inverse-only RoPE dispatch
+            KernelLaunch::new(ctx.gpu, self.v4_prefill_rope_fused_inverse_k)
+                .grid([n, nq, 1])
+                .block([32, 1, 1])
+                .arg_ptr(attn_out)
+                .arg_ptr(meta.positions)
+                .arg_ptr(rope_inv_freq)
+                .arg_u32(n)
+                .arg_u32(nq)
+                .arg_u32(0)
+                .arg_u32(hd_mla)
+                .arg_u32(nope)
+                .arg_u32(rope)
+                .arg_f32(rope_mscale)
+                .launch(stream)?;
+            // END V4 inverse-only RoPE dispatch
+            log_v4_prefill_max_arm_engaged(
+                &V4_INVERSE_ROPE_ENGAGED_LOGGED,
+                "inverse_rope",
+                self.attn_layer_idx,
+                n,
+                nq,
+                nkv,
+                hd_mla,
+            );
+        } else {
+            // BEGIN V4 inverse-only RoPE fallback
             let o_rope_tmp = ctx.buffers.ssm_conv_out_f32();
             ops::mla_q_rope_extract_batched(
                 ctx.gpu,
@@ -1096,6 +1612,7 @@ impl Qwen3AttentionLayer {
                 nq * hd_mla,
                 stream,
             )?;
+            // END V4 inverse-only RoPE fallback
         }
         if diag_this {
             super::super::trait_impl::diag_norm(
@@ -1119,39 +1636,105 @@ impl Qwen3AttentionLayer {
         // ── 5. Assemble KV cache (V4-Flash: requires latent+rope assembly) ──
         // NOTE: k_out is 512-dim (complete K), but cache needs 576-dim (512 latent + 64 rope).
         // We need to extract the latent portion (first 512 dims), reassemble with rope, then write.
-        let k_cache_assembled = ctx.buffers.expert_up_out();
-        let v_cache_assembled = ctx.buffers.expert_down_out();
-        ops::mla_cache_assemble_batched(
-            ctx.gpu,
-            self.mla_cache_assemble_batched_k,
-            kv_latent,  // 512-dim latent (reused from step 2)
-            k_rope_tmp, // 64-dim RoPE from K (reused from step 3)
-            k_cache_assembled,
-            v_cache_assembled,
-            n,
-            kv_lora,
-            rope,
-            mla_cache_dim,
-            stream,
-        )?;
-        self.write_kv_cache(
-            ctx.gpu,
-            k_cache_assembled,
-            v_cache_assembled,
-            kv_cache,
-            meta.slot,
-            n,
-            1,
-            mla_cache_dim,
-            kv_cache.block_size() as u32,
-            mla_cache_dim,
-            mla_cache_dim,
-            stream,
-            ctx.graph_capture,
-        )?;
+        if use_v4_qb_rope_cache_fused {
+            // BEGIN V4 joint direct-cache dispatch
+            KernelLaunch::new(ctx.gpu, self.v4_prefill_cache_kfull_fp8_fused_k)
+                .grid([n, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(kv_latent)
+                .arg_ptr(fused_k_full)
+                .arg_ptr(cache_k_pool)
+                .arg_ptr(cache_v_pool)
+                .arg_ptr(meta.slot)
+                .arg_u32(n)
+                .arg_u32(cache_num_blocks)
+                .arg_u32(kv_cache.block_size() as u32)
+                .arg_f32(cache_k_scale)
+                .arg_f32(cache_v_scale)
+                .arg_u64(cache_stride as u64)
+                .launch(stream)?;
+            // END V4 joint direct-cache dispatch
+        } else {
+            let k_rope_tmp =
+                fallback_k_rope_tmp.expect("incumbent V4 cache assembly requires extracted K RoPE");
+            let k_cache_assembled = ctx.buffers.expert_up_out();
+            let v_cache_assembled = ctx.buffers.expert_down_out();
+            ops::mla_cache_assemble_batched(
+                ctx.gpu,
+                self.mla_cache_assemble_batched_k,
+                kv_latent,  // 512-dim latent (reused from step 2)
+                k_rope_tmp, // 64-dim RoPE from K (reused from step 3)
+                k_cache_assembled,
+                v_cache_assembled,
+                n,
+                kv_lora,
+                rope,
+                mla_cache_dim,
+                stream,
+            )?;
+            self.write_kv_cache(
+                ctx.gpu,
+                k_cache_assembled,
+                v_cache_assembled,
+                kv_cache,
+                meta.slot,
+                n,
+                1,
+                mla_cache_dim,
+                kv_cache.block_size() as u32,
+                mla_cache_dim,
+                mla_cache_dim,
+                stream,
+                ctx.graph_capture,
+            )?;
+        }
         ctx.gpu
             .synchronize(stream)
             .map_err(|e| anyhow::anyhow!("V4 attn: write_kv_cache sync failed: {e}"))?;
+
+        if let Some((comp_k, comp_pool, n_elems, n_win)) = compressed_pool_write {
+            // BEGIN V4 scale-consistent compressed-pool write
+            // The incumbent raw-cache write above freezes online calibration
+            // before this read. Static and calibrated scales therefore share one
+            // quantize/dequantize basis across raw K and compressed K.
+            let (k_scale, _v_scale) = self.effective_fp8_scales();
+            anyhow::ensure!(
+                k_scale.is_finite() && k_scale > 0.0,
+                "V4 compressed-pool FP8 scale must be finite and positive, got {k_scale}"
+            );
+            if k_scale == 1.0 {
+                ops::bf16_to_fp8(
+                    ctx.gpu,
+                    self.bf16_to_fp8_k,
+                    comp_k,
+                    comp_pool,
+                    n_elems,
+                    stream,
+                )?;
+            } else {
+                anyhow::ensure!(
+                    self.bf16_to_fp8_scaled_k.0 != 0,
+                    "V4 compressed-pool scale {k_scale} requires bf16_to_fp8_scaled"
+                );
+                ops::bf16_to_fp8_scaled(
+                    ctx.gpu,
+                    self.bf16_to_fp8_scaled_k,
+                    comp_k,
+                    comp_pool,
+                    n_elems,
+                    k_scale,
+                    stream,
+                )?;
+            }
+            // Publish only after the scale-consistent conversion is enqueued.
+            self.v4_comp_pool_filled
+                .store(n_win, std::sync::atomic::Ordering::Relaxed);
+            if !self.v4_comp_count_dev.is_null() {
+                ctx.gpu
+                    .memset_u32_async(self.v4_comp_count_dev, n_win, 1, stream)?;
+            }
+            // END V4 scale-consistent compressed-pool write
+        }
 
         aprof!("5_kv_cache_assemble");
         // ── 6. Grouped low-rank O projection (block-diagonal wo_a → wo_b) ──

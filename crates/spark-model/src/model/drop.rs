@@ -29,6 +29,7 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl Drop for TransformerModel {
     fn drop(&mut self) {
+        self.release_deepseek_vision();
         self.drop_pinned_staging();
     }
 }

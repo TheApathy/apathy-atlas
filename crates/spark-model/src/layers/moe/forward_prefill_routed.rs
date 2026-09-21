@@ -125,6 +125,7 @@ impl MoeLayer {
                 inter,
                 num_experts,
                 n * top_k,
+                top_k,
                 ctx,
                 stream,
             );

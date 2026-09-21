@@ -9,12 +9,9 @@
 // instead of text conventions.
 
 use crate::ir;
-use crate::ir::message::{ImageSource, Reasoning, ToolCall};
-use crate::ir::{ContentPart, ImageData, Message, Role, ThinkingDirective};
+use crate::ir::{ContentPart, Message, Role, ThinkingDirective};
 
-use super::types::{
-    AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ToolResultContent,
-};
+use super::types::{AnthropicContent, MessagesRequest, SystemContent};
 
 impl From<MessagesRequest> for ir::ChatRequest {
     /// Lower the parsed Anthropic wire request into the
@@ -24,13 +21,12 @@ impl From<MessagesRequest> for ir::ChatRequest {
     /// byte-for-byte at the rendered-prompt level):
     /// * `system` (string or `text` blocks, `x-anthropic-*` billing
     ///   blocks filtered) → one leading System message when non-empty.
-    /// * assistant blocks → ONE assistant message: `[image*, text]`
+    /// * assistant blocks → ONE assistant message with ordered content
     ///   parts, `tool_use` → structured tool_calls (arguments stay
     ///   parsed JSON), `thinking` blocks → first-class reasoning
     ///   (joined with `\n`).
-    /// * user blocks → an optional user message (`[image*, text]`,
-    ///   only when text/images exist) followed by one Tool message per
-    ///   `tool_result` in block order. `is_error` travels as
+    /// * user blocks retain text/image/tool-result order, splitting at
+    ///   each tool result. `is_error` travels as
     ///   `Message::tool_error` — the `[tool error]\n` marker is
     ///   rendered by the shared pipeline (`msg_entry`), not baked into
     ///   the text here.
@@ -82,109 +78,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
                     });
                 }
                 AnthropicContent::Blocks(blocks) => {
-                    let mut text_parts: Vec<String> = Vec::new();
-                    let mut images: Vec<String> = Vec::new();
-                    let mut reasoning_parts: Vec<String> = Vec::new();
-                    let mut tool_calls: Vec<ToolCall> = Vec::new();
-                    // (tool_use_id, text, images, is_error)
-                    let mut tool_results: Vec<(String, String, Vec<String>, bool)> = Vec::new();
-                    for b in blocks {
-                        match b {
-                            ContentBlock::Text { text } => text_parts.push(text),
-                            ContentBlock::Image { source } => {
-                                if let Some(uri) = source.maybe_get_image_uri() {
-                                    images.push(uri);
-                                }
-                            }
-                            ContentBlock::ToolUse { id, name, input } => {
-                                // `input` is already structured JSON — no
-                                // stringify/re-parse roundtrip.
-                                tool_calls.push(ToolCall {
-                                    id,
-                                    name,
-                                    arguments: input,
-                                });
-                            }
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => {
-                                let text =
-                                    content.as_ref().map(|c| c.to_text()).unwrap_or_default();
-                                // Carry images embedded in a tool result
-                                // (e.g. a screenshot the tool returned) so
-                                // they reach the vision encoder (issue #165).
-                                let tr_images: Vec<String> = match content {
-                                    Some(ToolResultContent::Blocks(inner)) => inner
-                                        .iter()
-                                        .filter_map(|ib| match ib {
-                                            ContentBlock::Image { source } => {
-                                                source.maybe_get_image_uri()
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect(),
-                                    _ => Vec::new(),
-                                };
-                                tool_results.push((
-                                    tool_use_id,
-                                    text,
-                                    tr_images,
-                                    is_error.unwrap_or(false),
-                                ));
-                            }
-                            ContentBlock::Thinking { thinking } => {
-                                if let Some(t) = thinking
-                                    && !t.is_empty()
-                                {
-                                    reasoning_parts.push(t);
-                                }
-                            }
-                            ContentBlock::Unknown => {}
-                        }
-                    }
-                    let text_content = text_parts.join("");
-                    if role == Role::Assistant {
-                        messages.push(Message {
-                            role: Role::Assistant,
-                            content: parts_from(&images, &text_content),
-                            tool_calls,
-                            tool_call_id: None,
-                            name: None,
-                            reasoning: if reasoning_parts.is_empty() {
-                                None
-                            } else {
-                                Some(Reasoning {
-                                    text: reasoning_parts.join("\n"),
-                                })
-                            },
-                            tool_error: false,
-                        });
-                    } else {
-                        if !text_content.is_empty() || !images.is_empty() {
-                            messages.push(Message {
-                                role: Role::User,
-                                content: parts_from(&images, &text_content),
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                name: None,
-                                reasoning: None,
-                                tool_error: false,
-                            });
-                        }
-                        for (tool_use_id, text, tr_images, is_error) in tool_results {
-                            messages.push(Message {
-                                role: Role::Tool,
-                                content: parts_from(&tr_images, &text),
-                                tool_calls: Vec::new(),
-                                tool_call_id: Some(tool_use_id),
-                                name: None,
-                                reasoning: None,
-                                tool_error: is_error,
-                            });
-                        }
-                    }
+                    messages.extend(super::ordered_blocks::lower(role, blocks));
                 }
             }
         }
@@ -240,20 +134,4 @@ impl From<MessagesRequest> for ir::ChatRequest {
             return_token_ids: false,
         }
     }
-}
-
-/// `[image*, text]` content parts — image order preserved, single
-/// joined text part last, omitted when empty. Matches the OpenAI
-/// adapter's shape so the template sees one canonical layout.
-fn parts_from(images: &[String], text: &str) -> Vec<ContentPart> {
-    let mut content: Vec<ContentPart> = Vec::with_capacity(images.len() + 1);
-    for uri in images {
-        content.push(ContentPart::Image(ImageSource {
-            data: ImageData::from_uri(uri.clone()),
-        }));
-    }
-    if !text.is_empty() {
-        content.push(ContentPart::Text(text.to_string()));
-    }
-    content
 }

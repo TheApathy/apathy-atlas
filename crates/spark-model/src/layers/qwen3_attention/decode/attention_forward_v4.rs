@@ -231,7 +231,11 @@ impl Qwen3AttentionLayer {
                     q_out,
                     q_dim as usize,
                     stream,
-                    &format!("V4-decode L{} Q after q_b_norm obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                    &format!(
+                        "V4-decode L{} Q after q_b_norm obj={:x}",
+                        self.attn_layer_idx,
+                        (self as *const _ as usize >> 4) & 0xffff
+                    ),
                 );
             }
 
@@ -296,14 +300,22 @@ impl Qwen3AttentionLayer {
                     k_out,
                     kv_dim as usize,
                     stream,
-                    &format!("V4-decode L{} K after proj obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                    &format!(
+                        "V4-decode L{} K after proj obj={:x}",
+                        self.attn_layer_idx,
+                        (self as *const _ as usize >> 4) & 0xffff
+                    ),
                 );
                 super::super::trait_impl::diag_norm(
                     ctx.gpu,
                     v_out,
                     kv_dim as usize,
                     stream,
-                    &format!("V4-decode L{} V after copy obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                    &format!(
+                        "V4-decode L{} V after copy obj={:x}",
+                        self.attn_layer_idx,
+                        (self as *const _ as usize >> 4) & 0xffff
+                    ),
                 );
             }
         } // end !skip_qkv (Steps 1-2)
@@ -363,94 +375,94 @@ impl Qwen3AttentionLayer {
                 )
             })?;
         } else {
-        let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
-        let k_rope_tmp = q_latent; // reuse after wq_b is done
-        prof!("rope_extract", {
-            ops::mla_q_rope_extract_batched(
-                ctx.gpu,
-                self.mla_q_rope_extract_batched_k,
-                q_out,
-                q_rope_tmp,
-                1,
-                nq,
-                hd,
-                mla.nope as u32,
-                mla_rope,
-                nq * hd,
-                stream,
-            )
-        })?;
-        // Extract K's rope channels too (MQA: 1 kv head, stride hd). The decode
-        // path previously skipped this — `k_rope_tmp` (= reused q_latent) held
-        // stale data, so `rope_yarn` rotated garbage and the cached keys got
-        // near-zero positional signal → attention degenerates after a few decode
-        // tokens. Mirrors the prefill K extract (cache_skip_v4.rs:304).
-        prof!("k_rope_extract", {
-            ops::mla_q_rope_extract_batched(
-                ctx.gpu,
-                self.mla_q_rope_extract_batched_k,
-                k_out,
-                k_rope_tmp,
-                1,
-                1,
-                hd,
-                mla.nope as u32,
-                mla_rope,
-                hd,
-                stream,
-            )
-        })?;
-        prof!("rope", {
-            ops::rope_yarn(
-                ctx.gpu,
-                // DeepSeek-V4 uses INTERLEAVED RoPE (rope_interleave=True): adjacent
-                // channel pairs (2i, 2i+1), matching the HF reference's rotate_half
-                // over cos.repeat_interleave(2). The non-interleaved (NeoX, i/i+half)
-                // kernel scrambles positions -> incoherent output.
-                self.rope_yarn_interleaved_k,
-                q_rope_tmp,
-                k_rope_tmp,
-                meta.positions,
-                1,
-                nq,
-                1,
-                mla_rope,
-                mla_rope,
-                rope_inv_freq,
-                rope_mscale,
-                stream,
-            )
-        })?;
-        prof!("rope_writeback", {
-            ops::mla_q_rope_writeback_batched(
-                ctx.gpu,
-                self.mla_q_rope_writeback_batched_k,
-                q_rope_tmp,
-                q_out,
-                1,
-                nq,
-                hd,
-                mla.nope as u32,
-                mla_rope,
-                nq * hd,
-                stream,
-            )
-        })?;
-        prof!("k_rope_writeback", {
-            ops::mla_q_rope_writeback_batched(
-                ctx.gpu,
-                self.mla_q_rope_writeback_batched_k,
-                k_rope_tmp,
-                k_out,
-                1,
-                1,
-                hd,
-                mla.nope as u32,
-                mla_rope,
-                hd,
-                stream,
-            )
-        })?;
+            let q_rope_tmp = ctx.buffers.ssm_conv_out_f32();
+            let k_rope_tmp = q_latent; // reuse after wq_b is done
+            prof!("rope_extract", {
+                ops::mla_q_rope_extract_batched(
+                    ctx.gpu,
+                    self.mla_q_rope_extract_batched_k,
+                    q_out,
+                    q_rope_tmp,
+                    1,
+                    nq,
+                    hd,
+                    mla.nope as u32,
+                    mla_rope,
+                    nq * hd,
+                    stream,
+                )
+            })?;
+            // Extract K's rope channels too (MQA: 1 kv head, stride hd). The decode
+            // path previously skipped this — `k_rope_tmp` (= reused q_latent) held
+            // stale data, so `rope_yarn` rotated garbage and the cached keys got
+            // near-zero positional signal → attention degenerates after a few decode
+            // tokens. Mirrors the prefill K extract (cache_skip_v4.rs:304).
+            prof!("k_rope_extract", {
+                ops::mla_q_rope_extract_batched(
+                    ctx.gpu,
+                    self.mla_q_rope_extract_batched_k,
+                    k_out,
+                    k_rope_tmp,
+                    1,
+                    1,
+                    hd,
+                    mla.nope as u32,
+                    mla_rope,
+                    hd,
+                    stream,
+                )
+            })?;
+            prof!("rope", {
+                ops::rope_yarn(
+                    ctx.gpu,
+                    // DeepSeek-V4 uses INTERLEAVED RoPE (rope_interleave=True): adjacent
+                    // channel pairs (2i, 2i+1), matching the HF reference's rotate_half
+                    // over cos.repeat_interleave(2). The non-interleaved (NeoX, i/i+half)
+                    // kernel scrambles positions -> incoherent output.
+                    self.rope_yarn_interleaved_k,
+                    q_rope_tmp,
+                    k_rope_tmp,
+                    meta.positions,
+                    1,
+                    nq,
+                    1,
+                    mla_rope,
+                    mla_rope,
+                    rope_inv_freq,
+                    rope_mscale,
+                    stream,
+                )
+            })?;
+            prof!("rope_writeback", {
+                ops::mla_q_rope_writeback_batched(
+                    ctx.gpu,
+                    self.mla_q_rope_writeback_batched_k,
+                    q_rope_tmp,
+                    q_out,
+                    1,
+                    nq,
+                    hd,
+                    mla.nope as u32,
+                    mla_rope,
+                    nq * hd,
+                    stream,
+                )
+            })?;
+            prof!("k_rope_writeback", {
+                ops::mla_q_rope_writeback_batched(
+                    ctx.gpu,
+                    self.mla_q_rope_writeback_batched_k,
+                    k_rope_tmp,
+                    k_out,
+                    1,
+                    1,
+                    hd,
+                    mla.nope as u32,
+                    mla_rope,
+                    hd,
+                    stream,
+                )
+            })?;
         } // end !fused_glue rope chain
         if diag_this {
             super::super::trait_impl::diag_norm(
@@ -458,21 +470,33 @@ impl Qwen3AttentionLayer {
                 k_out,
                 kv_dim as usize,
                 stream,
-                &format!("V4-decode L{} K after RoPE obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                &format!(
+                    "V4-decode L{} K after RoPE obj={:x}",
+                    self.attn_layer_idx,
+                    (self as *const _ as usize >> 4) & 0xffff
+                ),
             );
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
                 k_out.offset(mla.nope * 2),
                 (kv_dim - mla.nope as u32) as usize,
                 stream,
-                &format!("V4-decode L{} K rope after RoPE obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                &format!(
+                    "V4-decode L{} K rope after RoPE obj={:x}",
+                    self.attn_layer_idx,
+                    (self as *const _ as usize >> 4) & 0xffff
+                ),
             );
             super::super::trait_impl::diag_norm(
                 ctx.gpu,
                 q_out.offset(mla.nope * 2),
                 (hd - mla.nope as u32) as usize,
                 stream,
-                &format!("V4-decode L{} Q rope after RoPE obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                &format!(
+                    "V4-decode L{} Q rope after RoPE obj={:x}",
+                    self.attn_layer_idx,
+                    (self as *const _ as usize >> 4) & 0xffff
+                ),
             );
         }
 
@@ -577,7 +601,11 @@ impl Qwen3AttentionLayer {
                 attn_out,
                 (nq * hd) as usize,
                 stream,
-                &format!("V4-decode L{} attn_out obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                &format!(
+                    "V4-decode L{} attn_out obj={:x}",
+                    self.attn_layer_idx,
+                    (self as *const _ as usize >> 4) & 0xffff
+                ),
             );
         }
 
@@ -662,7 +690,11 @@ impl Qwen3AttentionLayer {
                 attn_out,
                 (nq * hd) as usize,
                 stream,
-                &format!("V4-decode L{} attn_out derot obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                &format!(
+                    "V4-decode L{} attn_out derot obj={:x}",
+                    self.attn_layer_idx,
+                    (self as *const _ as usize >> 4) & 0xffff
+                ),
             );
         }
 
@@ -689,11 +721,10 @@ impl Qwen3AttentionLayer {
         // back into the 8-launch path for A/B.
         let use_grouped_woa = {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                std::env::var("ATLAS_V4_WOA_GROUPED").as_deref() != Ok("0")
-            })
+            *ON.get_or_init(|| std::env::var("ATLAS_V4_WOA_GROUPED").as_deref() != Ok("0"))
         };
-        if use_grouped_woa && self.w4a16_gemv_grouped_k.0 != 0
+        if use_grouped_woa
+            && self.w4a16_gemv_grouped_k.0 != 0
             && let Some(ref woa4) = mla.wo_a_nvfp4
         {
             prof!("wo_a_grouped", {
@@ -710,79 +741,79 @@ impl Qwen3AttentionLayer {
                 )
             })?;
         } else {
-        prof!("wo_a_grouped", {
-            for g in 0..o_groups {
-                let in_g = attn_out.offset((g * group_in) as usize * 2);
-                let out_g = o_latent.offset((g * o_lora) as usize * 2);
-                if let Some(ref woa4) = mla.wo_a_nvfp4 {
-                    // NVFP4 per group: packed rows [g*o_lora ..) at 0.5 B/elem,
-                    // block scales [N, K/16] row-major (1 B/scale), shared
-                    // per-tensor scale2 (quantized as ONE tensor).
-                    let sub = crate::weight_map::QuantizedWeight {
-                        weight: woa4
-                            .weight
-                            .offset((g as usize) * (o_lora as usize) * (group_in as usize) / 2),
-                        weight_scale: woa4
-                            .weight_scale
-                            .offset((g as usize) * (o_lora as usize) * (group_in as usize / 16)),
-                        weight_scale_2: woa4.weight_scale_2,
-                        input_scale: woa4.input_scale,
-                        weight_scale_2_vec: if woa4.weight_scale_2_vec.is_null() {
-                            woa4.weight_scale_2_vec
-                        } else {
-                            woa4.weight_scale_2_vec
-                                .offset((g as usize) * (o_lora as usize) * 4)
-                        },
-                    };
-                    ops::w4a16_gemv(
-                        ctx.gpu,
-                        self.w4a16_gemv_k,
-                        in_g,
-                        &sub,
-                        out_g,
-                        o_lora,
-                        group_in,
-                        stream,
-                    )?;
-                } else if let Some(ref woa_fp8) = mla.wo_a_fp8 {
-                    // Native block-scaled FP8 per group (block-diagonal):
-                    // weight rows [g*o_lora:(g+1)*o_lora] (fp8, 1 byte/elem) and the
-                    // matching [o_lora/128, group_in/128] block-scale sub-tile.
-                    let w_off = (g as usize) * (o_lora as usize) * (group_in as usize); // fp8 bytes
-                    let s_off =
-                        (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4; // FP32 block-scale bytes
-                    ops::w8a16_gemv(
-                        ctx.gpu,
-                        self.w8a16_gemv_k,
-                        in_g,
-                        woa_fp8.weight.offset(w_off),
-                        woa_fp8.row_scale.offset(s_off),
-                        out_g,
-                        o_lora,
-                        group_in,
-                        stream,
-                    )?;
-                } else {
-                    let w_g = crate::weight_map::DenseWeight {
-                        weight: mla
-                            .wo_a
-                            .weight
-                            .offset((g as usize) * (o_lora as usize) * (group_in as usize) * 2),
-                    };
-                    ops::dense_gemv(
-                        ctx.gpu,
-                        self.dense_gemv_k,
-                        in_g,
-                        &w_g,
-                        out_g,
-                        o_lora,
-                        group_in,
-                        stream,
-                    )?;
+            prof!("wo_a_grouped", {
+                for g in 0..o_groups {
+                    let in_g = attn_out.offset((g * group_in) as usize * 2);
+                    let out_g = o_latent.offset((g * o_lora) as usize * 2);
+                    if let Some(ref woa4) = mla.wo_a_nvfp4 {
+                        // NVFP4 per group: packed rows [g*o_lora ..) at 0.5 B/elem,
+                        // block scales [N, K/16] row-major (1 B/scale), shared
+                        // per-tensor scale2 (quantized as ONE tensor).
+                        let sub = crate::weight_map::QuantizedWeight {
+                            weight: woa4
+                                .weight
+                                .offset((g as usize) * (o_lora as usize) * (group_in as usize) / 2),
+                            weight_scale: woa4.weight_scale.offset(
+                                (g as usize) * (o_lora as usize) * (group_in as usize / 16),
+                            ),
+                            weight_scale_2: woa4.weight_scale_2,
+                            input_scale: woa4.input_scale,
+                            weight_scale_2_vec: if woa4.weight_scale_2_vec.is_null() {
+                                woa4.weight_scale_2_vec
+                            } else {
+                                woa4.weight_scale_2_vec
+                                    .offset((g as usize) * (o_lora as usize) * 4)
+                            },
+                        };
+                        ops::w4a16_gemv(
+                            ctx.gpu,
+                            self.w4a16_gemv_k,
+                            in_g,
+                            &sub,
+                            out_g,
+                            o_lora,
+                            group_in,
+                            stream,
+                        )?;
+                    } else if let Some(ref woa_fp8) = mla.wo_a_fp8 {
+                        // Native block-scaled FP8 per group (block-diagonal):
+                        // weight rows [g*o_lora:(g+1)*o_lora] (fp8, 1 byte/elem) and the
+                        // matching [o_lora/128, group_in/128] block-scale sub-tile.
+                        let w_off = (g as usize) * (o_lora as usize) * (group_in as usize); // fp8 bytes
+                        let s_off =
+                            (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4; // FP32 block-scale bytes
+                        ops::w8a16_gemv(
+                            ctx.gpu,
+                            self.w8a16_gemv_k,
+                            in_g,
+                            woa_fp8.weight.offset(w_off),
+                            woa_fp8.row_scale.offset(s_off),
+                            out_g,
+                            o_lora,
+                            group_in,
+                            stream,
+                        )?;
+                    } else {
+                        let w_g = crate::weight_map::DenseWeight {
+                            weight: mla
+                                .wo_a
+                                .weight
+                                .offset((g as usize) * (o_lora as usize) * (group_in as usize) * 2),
+                        };
+                        ops::dense_gemv(
+                            ctx.gpu,
+                            self.dense_gemv_k,
+                            in_g,
+                            &w_g,
+                            out_g,
+                            o_lora,
+                            group_in,
+                            stream,
+                        )?;
+                    }
                 }
-            }
-            Ok::<(), anyhow::Error>(())
-        })?;
+                Ok::<(), anyhow::Error>(())
+            })?;
         } // use_grouped_woa
         prof!("wo_b", {
             if let Some(ref wob4) = mla.wo_b_nvfp4 {
@@ -827,7 +858,11 @@ impl Qwen3AttentionLayer {
                 o_out,
                 h as usize,
                 stream,
-                &format!("V4-decode L{} o_out obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                &format!(
+                    "V4-decode L{} o_out obj={:x}",
+                    self.attn_layer_idx,
+                    (self as *const _ as usize >> 4) & 0xffff
+                ),
             );
         }
 
@@ -927,14 +962,21 @@ impl Qwen3AttentionLayer {
                                 comp_in,
                                 half,
                                 stream,
-                                &format!("V4-comp L{} in-prevwin w={w} pos={pos} obj={:x}", self.attn_layer_idx, (self as *const _ as usize >> 4) & 0xffff),
+                                &format!(
+                                    "V4-comp L{} in-prevwin w={w} pos={pos} obj={:x}",
+                                    self.attn_layer_idx,
+                                    (self as *const _ as usize >> 4) & 0xffff
+                                ),
                             );
                             super::super::trait_impl::diag_norm(
                                 ctx.gpu,
                                 comp_in.offset(half * 2),
                                 half,
                                 stream,
-                                &format!("V4-comp L{} in-ring w={w} pos={pos}", self.attn_layer_idx),
+                                &format!(
+                                    "V4-comp L{} in-ring w={w} pos={pos}",
+                                    self.attn_layer_idx
+                                ),
                             );
                         } else {
                             super::super::trait_impl::diag_norm(
@@ -942,7 +984,10 @@ impl Qwen3AttentionLayer {
                                 comp_in,
                                 t_rows as usize * h as usize,
                                 stream,
-                                &format!("V4-comp L{} in-ring w={w} pos={pos}", self.attn_layer_idx),
+                                &format!(
+                                    "V4-comp L{} in-ring w={w} pos={pos}",
+                                    self.attn_layer_idx
+                                ),
                             );
                         }
                         super::super::trait_impl::diag_norm(
@@ -1085,16 +1130,39 @@ impl Qwen3AttentionLayer {
                         hd_mla,
                         stream,
                     )?;
-                    // Quantize the rope'd block into pool[w] (FP8, 1 byte/elem,
-                    // k_scale=1.0 → plain e4m3 cast, matches the raw KV arm).
-                    ops::bf16_to_fp8(
-                        ctx.gpu,
-                        self.bf16_to_fp8_k,
-                        comp_k,
-                        comp.pool.offset(w as usize * hd_mla as usize),
-                        hd_mla,
-                        stream,
-                    )?;
+                    // Quantize with the same dequant scale as the raw K cache.
+                    // Raw KV is written earlier in this decode step, so a first
+                    // online-calibration observation is already frozen here.
+                    let (k_scale, _v_scale) = self.effective_fp8_scales();
+                    anyhow::ensure!(
+                        k_scale.is_finite() && k_scale > 0.0,
+                        "V4 compressed-pool FP8 scale must be finite and positive, got {k_scale}"
+                    );
+                    let pool_dst = comp.pool.offset(w as usize * hd_mla as usize);
+                    if k_scale == 1.0 {
+                        ops::bf16_to_fp8(
+                            ctx.gpu,
+                            self.bf16_to_fp8_k,
+                            comp_k,
+                            pool_dst,
+                            hd_mla,
+                            stream,
+                        )?;
+                    } else {
+                        anyhow::ensure!(
+                            self.bf16_to_fp8_scaled_k.0 != 0,
+                            "V4 compressed-pool scale {k_scale} requires bf16_to_fp8_scaled"
+                        );
+                        ops::bf16_to_fp8_scaled(
+                            ctx.gpu,
+                            self.bf16_to_fp8_scaled_k,
+                            comp_k,
+                            pool_dst,
+                            hd_mla,
+                            k_scale,
+                            stream,
+                        )?;
+                    }
                     // Task #45: hash the just-written pool block. This append
                     // is SHARED between plain decode and the γ-speculate
                     // replay, so byte-equal hashes here at the same (w, pos)
@@ -1128,10 +1196,7 @@ impl Qwen3AttentionLayer {
                     if self.attn_layer_idx == 0
                         && std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok()
                     {
-                        tracing::info!(
-                            "DSPARK APPEND: layer0 pos={pos} → pool_filled={}",
-                            w + 1
-                        );
+                        tracing::info!("DSPARK APPEND: layer0 pos={pos} → pool_filled={}", w + 1);
                     }
                     // CSA: this window becomes the next window's Ca source.
                     if comp.is_csa {
@@ -1175,15 +1240,30 @@ impl Qwen3AttentionLayer {
         }
         let hb = ctx.config.hidden_size * 2;
         let diag = std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok();
-        if diag && self.mla.as_ref().and_then(|m| m.compressor.as_ref()).is_some() {
+        if diag
+            && self
+                .mla
+                .as_ref()
+                .and_then(|m| m.compressor.as_ref())
+                .is_some()
+        {
             // Log the first compressor layer only, every step, to watch the pool grow.
-            static FIRST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
-            let _ = FIRST.compare_exchange(usize::MAX, self.attn_layer_idx, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
+            static FIRST: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(usize::MAX);
+            let _ = FIRST.compare_exchange(
+                usize::MAX,
+                self.attn_layer_idx,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if FIRST.load(std::sync::atomic::Ordering::Relaxed) == self.attn_layer_idx {
                 tracing::info!(
                     "DSPARK CATCHUP L{}: pre_len={} committed={} pool_before={}",
-                    self.attn_layer_idx, pre_len, num_committed,
-                    self.v4_comp_pool_filled.load(std::sync::atomic::Ordering::Relaxed),
+                    self.attn_layer_idx,
+                    pre_len,
+                    num_committed,
+                    self.v4_comp_pool_filled
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 );
             }
         }
@@ -1330,11 +1410,7 @@ impl Qwen3AttentionLayer {
         // lands INSIDE the committed range, where "invisible garbage" does
         // not apply. hd_mla = nope + rope FP8 bytes per block.
         {
-            let hd_mla = self
-                .mla
-                .as_ref()
-                .map(|m| m.nope + m.rope)
-                .unwrap_or(576);
+            let hd_mla = self.mla.as_ref().map(|m| m.nope + m.rope).unwrap_or(576);
             let mut w_lo = u32::MAX;
             let mut w_hi = 0u32;
             for r in 0..n_rows {
@@ -1408,11 +1484,7 @@ impl Qwen3AttentionLayer {
     /// one replay implementation instead of two.
     ///
     /// Idempotent: `spec_rows` is swapped to 0, so a second call is a no-op.
-    pub(crate) fn v4_compress_restore(
-        &self,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
+    pub(crate) fn v4_compress_restore(&self, ctx: &ForwardContext, stream: u64) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let rows = self.spec_rows.swap(0, Relaxed) as usize;
         if rows == 0 {
@@ -1443,11 +1515,7 @@ impl Qwen3AttentionLayer {
         // overlap rewrite of block w-1 included).
         let w_lo = self.spec_pool_w_lo.swap(u32::MAX, Relaxed);
         if w_lo != u32::MAX && !comp.pool_snap.is_null() {
-            let hd_mla = self
-                .mla
-                .as_ref()
-                .map(|m| m.nope + m.rope)
-                .unwrap_or(576);
+            let hd_mla = self.mla.as_ref().map(|m| m.nope + m.rope).unwrap_or(576);
             let w_hi = self.spec_pool_w_hi.load(Relaxed);
             for (i, w) in (w_lo..=w_hi).enumerate() {
                 ctx.gpu.copy_d2d_async(

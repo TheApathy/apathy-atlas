@@ -58,11 +58,13 @@ pub struct DeepSeekV41WeightLoader;
 fn cb3_residency_unimplemented(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "DeepSeek-V4.1 {what} is not implemented: the engine can parse the config, resolve \
-         the 384 -> 154 -> 124 expert mapping, and READ CB3 expert bytes, but it cannot yet \
-         make them resident or decode them. Missing: (1) CB3 3-bit decode kernels -- none \
-         exist in kernels/; (2) GPU residency for the 83 GB K154 expert pack. This is a \
-         deliberate hard stop, NOT a fallback to the deepseek_v4 loader, whose experts are \
-         EXL3 and would decode V4.1's CB3 bytes into plausible garbage."
+         the 384 -> 154 -> 124 expert mapping, READ CB3 expert bytes, and DECODE them \
+         (kernels/gb10/deepseek-v4.1/cb3/cb3_decode.cuh, 256/256 vectors bit-exact against \
+         an independent reference), but it cannot yet make the pack resident. Missing: GPU \
+         residency for the 83 GB K154 expert pack, and the MoE GEMM that consumes the \
+         decoded e2m1 tiles. This is a deliberate hard stop, NOT a fallback to the \
+         deepseek_v4 loader, whose experts are EXL3 and would decode V4.1's CB3 bytes into \
+         plausible garbage."
     )
 }
 

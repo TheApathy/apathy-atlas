@@ -13,7 +13,10 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8ExpertWeight, MoeWeights, QuantizedWeight};
 
+mod native_shared_fp8;
+mod native_shared_verify;
 pub mod persistent_work;
+pub(crate) mod vision_l0_dump;
 
 /// Widest speculative verify the dedup'd multi-row `_t` MoE covers in one
 /// launch — the DDTree tree verify (6 spine rows + 2 branch).
@@ -168,10 +171,11 @@ pub struct MoeLayer {
     dense_gemv: KernelHandle,
     w4a16_gemv: KernelHandle,
     /// Exact multi-row NVFP4 shared-expert GEMV. The runtime-M incumbent is
-    /// proven through eight rows; the m16 specialization serves native
-    /// DFlash2 without inflating the K2 kernel's register footprint.
+    /// proven through eight rows; compile-time-M V2 entries cover the common
+    /// verify widths plus native DFlash2 without inflating other kernels.
     w4a16_gemv_grouped_batchm_k: KernelHandle,
-    w4a16_gemv_grouped_batchm_v2_m16_k: KernelHandle,
+    /// V2 entries in `[m4, m5, m6, m8, m16]` order.
+    w4a16_gemv_grouped_batchm_v2_k: [KernelHandle; 5],
     w4a16_gemm: KernelHandle,
     dense_gemm: KernelHandle,
     dense_gemm_pipelined: KernelHandle,
@@ -407,6 +411,8 @@ pub struct MoeLayer {
     /// here is the SSOT that this layer routes via the static hash table
     /// instead of the learned gate's top-K.
     tid2eid_dev: Option<DevicePtr>,
+    /// Present only for actual DeepSeek Vision weights, including MTP layers.
+    deepseek_visual_routing: Option<visual_routing::DeepSeekVisualRouting>,
     moe_expert_gate_up_shared_batch2_t_k: KernelHandle,
     moe_expert_silu_down_shared_batch2_t_k: KernelHandle,
     // Native-MXFP4 (E8M0 per-32 routed scales, NVFP4 shared) flavor of the
@@ -599,6 +605,7 @@ pub struct MoeLayer {
     // Checkpoint-native BF16 shared expert. Independent of routed-expert
     // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
     bf16_shared_expert: Option<Bf16SharedExpert>,
+    native_shared_fp8: Option<native_shared_fp8::NativeFp8SharedExpert>,
     // FP8-E4M3 row-scaled mirror of `bf16_shared_expert`, built at load time
     // under ATLAS_TARGET_SHARED_FP8=1. Consumed ONLY by the M=1 decode GEMVs
     // in `run_bf16_shared_expert`; every multi-token/prefill path keeps the
@@ -962,6 +969,8 @@ mod forward_phase;
 mod forward_prefill;
 mod forward_prefill_bf16;
 mod forward_prefill_exl3;
+mod forward_prefill_exl3_tail;
+mod forward_prefill_exl3_w2a8;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_routed;
@@ -976,4 +985,5 @@ mod mod_tests;
 mod ptr_table_build;
 mod route_locality;
 mod union_stats;
+mod visual_routing;
 pub(crate) use ptr_table_build::*;

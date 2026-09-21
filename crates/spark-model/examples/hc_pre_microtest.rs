@@ -13,7 +13,10 @@ use spark_runtime::kernel_args::KernelLaunch;
 
 // T overridable at argv[1] (decode audit runs T=1).
 fn t_tokens() -> usize {
-    std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(2410)
+    std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2410)
 }
 const HC: usize = 4;
 const H: usize = 4096;
@@ -216,7 +219,10 @@ fn main() -> Result<()> {
         na += a[i] * a[i];
         nb += b[i] * b[i];
     }
-    println!("  split-vs-hc_pre y cosine: {:.7}", dot / (na.sqrt() * nb.sqrt()));
+    println!(
+        "  split-vs-hc_pre y cosine: {:.7}",
+        dot / (na.sqrt() * nb.sqrt())
+    );
     let t_split = time(&launch_split)?;
     println!("hc_pre_split t_dyn={t_dyn}: {t_split:.3} ms/call");
 
@@ -260,13 +266,22 @@ fn main() -> Result<()> {
         dot2 += a[i] * b2[i];
         nb2 += b2[i] * b2[i];
     }
-    println!("  tiled-vs-hc_pre y cosine: {:.7}", dot2 / (na.sqrt() * nb2.sqrt()));
+    println!(
+        "  tiled-vs-hc_pre y cosine: {:.7}",
+        dot2 / (na.sqrt() * nb2.sqrt())
+    );
     let t_tiled = time(&launch_tiled)?;
     println!("hc_pre TILED t_dyn={t_dyn}: {t_tiled:.3} ms/call");
 
     let t_pre = time(&launch_pre)?;
     let t_post = time(&launch_post)?;
-    println!("hc_pre  t_dyn={t_dyn}: {t_pre:.3} ms/call  (x2 calls/layer x43 = {:.0} ms/pass)", t_pre * 86.0);
-    println!("hc_post t_dyn={t_dyn}: {t_post:.3} ms/call (x2 calls/layer x43 = {:.0} ms/pass)", t_post * 86.0);
+    println!(
+        "hc_pre  t_dyn={t_dyn}: {t_pre:.3} ms/call  (x2 calls/layer x43 = {:.0} ms/pass)",
+        t_pre * 86.0
+    );
+    println!(
+        "hc_post t_dyn={t_dyn}: {t_post:.3} ms/call (x2 calls/layer x43 = {:.0} ms/pass)",
+        t_post * 86.0
+    );
     Ok(())
 }

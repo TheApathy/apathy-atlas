@@ -50,6 +50,7 @@ pub fn bf16_gemm_act_weight_t_strided(
     unreachable!("cublaslt::bf16_gemm_act_weight_t_strided is cuda-only (not built for metal)")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_rowwise(
     _act_fp8: u64,
     _act_scale: u64,
@@ -64,6 +65,7 @@ pub fn fp8_gemm_act_weight_t_rowwise(
     unreachable!("cublaslt::fp8_gemm_act_weight_t_rowwise is cuda-only (not built for metal)")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_blkscaled(
     _act_fp8: u64,
     _act_scale: u64,

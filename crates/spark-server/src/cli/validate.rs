@@ -98,12 +98,25 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
         ));
     }
 
+    if let Some(threshold) = args.auto_compact
+        && (!threshold.is_finite() || threshold <= 0.0 || threshold > 1.0)
+    {
+        v.push(Violation::new(
+            format!("--auto-compact {threshold} is outside (0.0, 1.0]."),
+            "the threshold is a finite fraction of max_seq_len; zero, negative, NaN, and values above one cannot express that fraction.",
+            "use a finite fraction in (0.0, 1.0], e.g. --auto-compact=0.75, or omit the flag to disable compaction.",
+        ));
+    }
+
     // ── FP8 KV calibration only applies to an FP8 KV cache (issue #288 example). ──
-    if args.fp8_kv_calibration_tokens > 0 && args.kv_cache_dtype != "fp8" {
+    if let Some(tokens) = args.fp8_kv_calibration_tokens
+        && tokens > 0
+        && args.kv_cache_dtype != "fp8"
+    {
         v.push(Violation::new(
             format!(
                 "--fp8-kv-calibration-tokens {} has no effect with --kv-cache-dtype {}.",
-                args.fp8_kv_calibration_tokens, args.kv_cache_dtype
+                tokens, args.kv_cache_dtype
             ),
             "online FP8 KV-scale calibration only feeds an FP8 KV cache; with a \
              bf16/nvfp4 cache the calibrated scales are never read.",
@@ -288,7 +301,58 @@ mod tests {
 
     #[test]
     fn defaults_are_valid() {
-        assert!(validate_serve_args(&parse(&[])).is_ok());
+        let args = parse(&[]);
+        assert!(validate_serve_args(&args).is_ok());
+        assert!(!args.ds4_tool_call_reminder);
+        assert_eq!(args.ds4_tool_call_reminder_min_bytes, 98_304);
+        assert!(!args.ds4_tool_slip_resample);
+        assert!(args.ds4_tool_slip_dump.is_none());
+    }
+
+    #[test]
+    fn ds4_tool_call_reminder_is_explicit_and_tunable() {
+        let args = parse(&[
+            "--ds4-tool-call-reminder",
+            "--ds4-tool-call-reminder-min-bytes",
+            "0",
+        ]);
+        assert!(args.ds4_tool_call_reminder);
+        assert_eq!(args.ds4_tool_call_reminder_min_bytes, 0);
+    }
+
+    #[test]
+    fn ds4_tool_slip_resample_is_explicit() {
+        assert!(parse(&["--ds4-tool-slip-resample"]).ds4_tool_slip_resample);
+    }
+
+    #[test]
+    fn ds4_tool_slip_dump_accepts_auto_or_explicit_path() {
+        assert_eq!(
+            parse(&["--ds4-tool-slip-dump"])
+                .ds4_tool_slip_dump
+                .as_deref(),
+            Some("<auto>")
+        );
+        assert_eq!(
+            parse(&["--ds4-tool-slip-dump", "/tmp/slips.jsonl"])
+                .ds4_tool_slip_dump
+                .as_deref(),
+            Some("/tmp/slips.jsonl")
+        );
+    }
+
+    #[test]
+    fn auto_compact_threshold_must_be_a_finite_fraction() {
+        assert!(validate_serve_args(&parse(&["--auto-compact=0.75"])).is_ok());
+        for invalid_arg in [
+            "--auto-compact=0",
+            "--auto-compact=-0.1",
+            "--auto-compact=1.1",
+            "--auto-compact=NaN",
+        ] {
+            let err = validate_serve_args(&parse(&[invalid_arg])).unwrap_err();
+            assert!(err.contains("--auto-compact"), "{invalid_arg}: {err}");
+        }
     }
 
     #[test]
@@ -311,6 +375,19 @@ mod tests {
                 "256",
             ]))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn fp8_calibration_distinguishes_omitted_from_explicit_zero() {
+        assert_eq!(parse(&[]).fp8_kv_calibration_tokens, None);
+        assert_eq!(
+            parse(&["--fp8-kv-calibration-tokens", "0"]).fp8_kv_calibration_tokens,
+            Some(0)
+        );
+        assert_eq!(
+            parse(&["--fp8-kv-calibration-tokens", "256"]).fp8_kv_calibration_tokens,
+            Some(256)
         );
     }
 

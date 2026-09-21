@@ -86,7 +86,8 @@ scripts/dsflash-serve-bench.sh gatehist - \
 
 # drive it: prose + code + repeat + quote, the same four workloads the decode
 # probe uses, so the distribution belongs to the workloads we quote tok/s on
-python3 scripts/decode_ab_probe.py gatehist 8977 1
+ATLAS_BENCH_RECEIPT=serve-gatehist.log.receipt.json \
+  python3 scripts/decode_ab_probe.py gatehist 8977 5 1
 
 python3 scripts/moe_gate_hist.py /tmp/gate_hist.jsonl            # aggregate
 python3 scripts/moe_gate_hist.py /tmp/gate_hist.jsonl --by-layer # per layer
@@ -225,12 +226,20 @@ Sweep **0.01 / 0.02 / 0.05 / 0.10**, plain decode, one variable at a time:
 ```bash
 for T in 0.01 0.02 0.05 0.10; do
   scripts/dsflash-serve-bench.sh atk$T - ATLAS_MOE_ADAPTIVE_TOPK=$T
-  python3 scripts/decode_ab_probe.py atk$T 8977 2     # run twice; first is warmup
+  ATLAS_BENCH_RECEIPT=serve-atk$T.log.receipt.json \
+    python3 scripts/decode_ab_probe.py atk$T 8977 5 1
 done
 # baseline arm, same sitting, same binary:
 scripts/dsflash-serve-bench.sh atk-off -
-python3 scripts/decode_ab_probe.py atk-off 8977 2
+ATLAS_BENCH_RECEIPT=serve-atk-off.log.receipt.json \
+  python3 scripts/decode_ab_probe.py atk-off 8977 5 1
 ```
+
+These active receipts bind source/binary/checkpoint inputs plus the live PID,
+port, argv, selected environment, and model endpoint. The probe still reports
+the request-scoped `usage.atlas_engine` classification and partitions medians
+when modes differ. An `UNVERIFIED` row or a mixed-class aggregate is not a
+publishable speculative/serial result.
 
 ### Decision rule
 
@@ -260,7 +269,8 @@ there is no "close enough" on a lever that deletes computation.
    read will notice. **Any misquote is an immediate reject**, regardless of every
    other number.
 4. **`decode_ab_probe.py` hashes.** Two checks, and they are not the obvious one:
-   * **Determinism:** two runs of the *same* arm must produce *identical* hashes
+   * **Determinism:** all five measured runs of the *same* arm must produce
+     *identical* hashes
      on all four workloads. A differing hash is a non-determinism bug in the
      prune, not a quality cost — stop and fix it.
    * **Non-inertness:** the arm's hashes must *differ* from the `atk-off`

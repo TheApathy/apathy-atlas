@@ -12,7 +12,8 @@
 > | [`ds4-flash`](../../tree/ds4-flash) | DeepSeek-V4-Flash-162B + DSpark drafter | `scripts/dsflash-serve-bench.sh` | `git diff main..ds4-flash` |
 >
 > **`ds4-flash`** (this branch, if you're reading it there) serves
-> DeepSeek-V4-Flash-162B on ONE DGX Spark (GB10): **905 tok/s prefill,
+> DeepSeek-V4-Flash-162B on ONE DGX Spark (GB10): **1,062 tok/s prefill
+> (historical n=20 median with the cuBLASLt arm),
 > ~22 tok/s plain decode, 22–33 tok/s speculative**, quality-gated at
 > 90/100 on every commit. Start with
 > [docs/REPRODUCE-PREFILL.md](docs/REPRODUCE-PREFILL.md) (deterministic

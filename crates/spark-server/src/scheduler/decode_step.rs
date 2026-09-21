@@ -78,6 +78,9 @@ pub fn step_decode_only(
             return;
         }
     };
+    for a in active.iter_mut() {
+        crate::scheduler::adaptive_spec::record_serial_token(a);
+    }
 
     // Ctx-holes fix (ATLAS_DFLASH_SERIAL_APPEND=1): think-gated stretches
     // route HERE (mod.rs sends `inside_thinking` seqs to step_decode_only,

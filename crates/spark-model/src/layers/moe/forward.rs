@@ -153,7 +153,17 @@ impl MoeLayer {
             })?;
 
             prof!("topk", {
-                if let Some(tid2eid) = self.tid2eid_dev {
+                if self.route_deepseek_visual(
+                    ctx,
+                    gate_logits,
+                    indices_dev,
+                    weights_dev,
+                    0,
+                    1,
+                    stream,
+                )? {
+                    Ok(())
+                } else if let Some(tid2eid) = self.tid2eid_dev {
                     // DeepSeek-V4 hash routing (hash_moe layer): expert SELECTION
                     // is the static `tid2eid[token_id]` table; the learned gate
                     // still supplies the sqrtsoftplus scores that weight them.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod deepseek_v4_mtp;
+pub mod deepseek_vision;
 pub mod dense_ffn;
 pub mod dflash_head;
 pub mod dspark_head;
@@ -14,6 +15,7 @@ pub mod nemotron_moe;
 pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub(crate) mod vision_capture_files;
 pub mod vision_encoder;
 
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
@@ -259,6 +261,23 @@ impl FfnComponent {
             Self::None => {
                 let _ = (input, num_tokens);
                 Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn forward_prefill_observed(
+        &self,
+        input: DevicePtr,
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+        capture: Option<&mut moe::vision_l0_dump::MoeCapture>,
+    ) -> Result<()> {
+        match self {
+            Self::Moe(m) => m.forward_prefill_observed(input, num_tokens, ctx, stream, capture),
+            _ => {
+                anyhow::ensure!(capture.is_none(), "MoE capture requires an MoE FFN");
+                self.forward_prefill(input, num_tokens, ctx, stream)
             }
         }
     }

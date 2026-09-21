@@ -5,6 +5,7 @@
 // was renamed to `parse_minimax_xml_calls_all`. File left on disk; update
 // the call sites and un-comment.
 // mod group_a;
+mod dsml_typed_contract;
 mod group_b;
 mod group_c;
 mod group_d;

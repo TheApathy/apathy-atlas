@@ -49,7 +49,8 @@ impl Qwen3AttentionLayer {
         // host (see `MultiSeqCtx::verify_base_pos`). `seq_lens` is the only
         // host-side view of it that reaches this path — everything else the
         // attention consumes is the pre-uploaded device `attn_metadata`.
-        c.verify_base_pos = if crate::layers::qwen3_attention::DFLASH_VERIFY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        c.verify_base_pos = if crate::layers::qwen3_attention::DFLASH_VERIFY_ACTIVE
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
             ctx::verify_base_pos_of(seq_lens, num_seqs)
         } else {

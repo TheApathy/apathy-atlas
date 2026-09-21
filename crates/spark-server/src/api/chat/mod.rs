@@ -23,8 +23,12 @@
 //!                      timeout / logprobs resolution
 
 pub(crate) mod echo;
+mod image_admission;
+#[cfg(test)]
+mod image_admission_tests;
 mod loop_detect;
 mod msg_entry;
+mod ordered_content;
 pub(crate) mod prepare;
 mod sampling_setup;
 mod template;
@@ -60,12 +64,12 @@ pub(crate) fn test_build_msg_entries(
     input: &[crate::ir::Message],
     tools_active: bool,
 ) -> Result<Vec<msg_entry::MsgEntry>, axum::response::Response> {
-    msg_entry::build_msg_entries(None, None, input, tools_active, false).map(|o| o.messages)
+    msg_entry::build_msg_entries(None, None, None, input, tools_active, false).map(|o| o.messages)
 }
 
 #[cfg(test)]
 pub(crate) fn test_build_json_messages(entries: &[msg_entry::MsgEntry]) -> Vec<serde_json::Value> {
-    template::build_json_messages(entries)
+    template::build_json_messages(entries).expect("valid test entries")
 }
 
 use super::compact::openai_error_response;
@@ -104,6 +108,9 @@ pub async fn chat_completions(
 
     // Wire → IR at the edge: echo-only fields peel off beside the
     // envelope; everything downstream reads only the IR.
+    if let Err(error) = req.validate_content_order() {
+        return openai_error_response(StatusCode::BAD_REQUEST, error);
+    }
     let echo = ResponseEcho::from(&req);
     match chat_completions_inner(state.clone(), req_ctx, req.into(), dump_seq).await {
         ChatOutcome::Blocking(ir) => {
@@ -137,6 +144,21 @@ pub(crate) async fn chat_completions_inner(
         // reaching a dispatch handler.
         crate::metrics::REQUESTS_ACTIVE.dec();
         return ChatOutcome::Http(resp);
+    }
+    let image_count = req
+        .messages
+        .iter()
+        .fold(0usize, |n, m| n.saturating_add(m.image_count()));
+    if let Err(error) = image_admission::validate(
+        image_count,
+        state.vision_config.is_some() || state.deepseek_vision_config.is_some(),
+        state.max_batch_size,
+        state.yarn_context,
+    )
+    .and_then(|()| image_admission::validate_choices(image_count, req.n))
+    {
+        crate::metrics::REQUESTS_ACTIVE.dec();
+        return ChatOutcome::Http(openai_error_response(StatusCode::BAD_REQUEST, error.into()));
     }
 
     // Tool-parser behavioral system prompt REMOVED again (2026-05-25 PM).

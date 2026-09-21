@@ -98,19 +98,17 @@ impl Message {
         }
     }
 
-    /// Prepend `prefix` to the first text part (appending a new text
-    /// part when none exists — matching the canonical `[image*, text]`
-    /// part order). The flattened `text()` output equals
+    /// Prepend `prefix` to the first part if it is text, or insert a
+    /// new leading text part before images. The flattened `text()` output equals
     /// `prefix + old_text()` either way. Used for system-prompt
     /// injection.
     pub fn prepend_text(&mut self, prefix: &str) {
-        for part in &mut self.content {
-            if let ContentPart::Text(t) = part {
-                *t = format!("{prefix}{t}");
-                return;
-            }
+        if let Some(ContentPart::Text(t)) = self.content.first_mut() {
+            t.insert_str(0, prefix);
+        } else {
+            self.content
+                .insert(0, ContentPart::Text(prefix.to_string()));
         }
-        self.content.push(ContentPart::Text(prefix.to_string()));
     }
 
     /// Concatenate the text parts in order (images skipped). Mirrors the

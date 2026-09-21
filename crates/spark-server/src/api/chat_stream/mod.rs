@@ -211,6 +211,8 @@ pub(crate) async fn run_chat_stream(
         model: model_name.clone(),
         id: chunk_id.clone(),
         prompt_len,
+        session_hash,
+        seed,
         enable_thinking,
         tool_defs_for_backfill: tool_defs,
         cwd_for_normalize: cwd_hint,
@@ -233,11 +235,17 @@ pub(crate) async fn run_chat_stream(
         timeout_at,
     };
 
+    let capture_tool_parser_input = state.ds4_tool_slip_dump_writer.is_some()
+        && state
+            .tool_call_parser
+            .as_ref()
+            .is_some_and(|parser| parser.name() == "dsml_v4");
     let mut stream_state = StreamState::new(
         tools_active,
         enable_thinking,
         cancel_flag.clone(),
         ctx.tool_defs_for_backfill.clone(),
+        capture_tool_parser_input,
     );
 
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {
@@ -261,6 +269,7 @@ pub(crate) async fn run_chat_stream(
                 reasoning_tokens,
                 cached_prompt_tokens,
                 guard_stop,
+                engine,
             } => {
                 stream_state.guard_stop = guard_stop;
                 handle_done::handle_done(
@@ -272,6 +281,7 @@ pub(crate) async fn run_chat_stream(
                     decode_time_ms,
                     reasoning_tokens,
                     cached_prompt_tokens,
+                    engine,
                 )
             }
             StreamEvent::Error(msg) => handle_error::handle_error(&ctx, msg),

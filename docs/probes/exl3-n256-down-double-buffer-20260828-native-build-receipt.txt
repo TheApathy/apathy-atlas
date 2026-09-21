@@ -1,0 +1,120 @@
+receipt_format=atlas-w2a8-n256-down-double-buffer-composed-ab-v1
+min_n256_down_double_buffer_speedup=1.01
+min_n256_down_double_buffer_speedup_binary64=1.01
+internal_composed_speed_gate=parity-only
+internal_composed_speedup_report_reference=1.01
+geometry=tokens2410_rows14460_topk6_experts256_hidden4096_intermediate2048
+timing_route=checkpoint-like-synthetic-v1
+packed_e4m3=enabled_both_arms
+fixed_n256_route_guard=0
+fixed_fused_gu_n128_double_buffer=1
+generated_n256_wrapper_sha256=25af91151891674b1f636254baa3f5dccfca6b1f81215e000ed70ce6dfd6a711
+only_ab_compile_factor=W2A8_N256_DOWN_DOUBLE_BUFFER_CANDIDATE
+variant incumbent compile_define=-DW2A8_N256_DOWN_DOUBLE_BUFFER_CANDIDATE=0
+variant candidate compile_define=-DW2A8_N256_DOWN_DOUBLE_BUFFER_CANDIDATE=1
+git_commit=a40ed27e0d2f00c03e7536bd4df84e18642d6b71
+git_status_sha256=e2f433a678b05f959f20016db6def788946f4ca24aab38bbf5bb5e93396f47bc
+source_sha256 kernels/gb10/experiments/exl3_w2a8_composed_n128_n256_probe.cu 9d2f8b57a8ae399e37c53fd6c7641a45b5c4c43c3f13e8ff824670c3f9de638f
+source_sha256 kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_h128_emit.cu 94750b1f657670db64f8267a69de35163ea68665fd5fd303975931a41d2156ab
+source_sha256 kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_k2_gu.cu 36a7840e8d7ca784d180b7e40e79c348f81a823c15eb95953bc95844878605d8
+source_sha256 kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_k2_down.cu 17f872b73783ace6c2175ac08b03024dda7fc3305d33dcca4fb8d9e552b75ed3
+source_sha256 kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_fused_gu_down_emit_n128.cu 1f72dd6560f6a89433366332abe05ba8c708874cb6b69986e953ce3bff3e46bc
+source_sha256 kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_n256_k2_down.cu 42c0aa8fb5eb47dc3a456fab4df02016aae1b3b5123ffdc4fa32a3b62b2ba5e0
+source_sha256 kernels/gb10/experiments/exl3_w2a8_h128_emit.cu 4791e51e4b07a322fbdb1e6842243274eca1286a3dba3d579d8cf28ffcea3542
+source_sha256 kernels/gb10/experiments/exl3_w2a8_grouped_prefill.cu 640550757a254e308e4503697036a00aa3ff394b3261aeb782f15fa34c178094
+source_sha256 kernels/gb10/experiments/exl3_w2a8_fused_gu_down_emit_n128.cu 56074f1a8ed6d552f218331c3f87af7fce3c074b417643b87ad65f7e758edf25
+source_sha256 kernels/gb10/experiments/exl3_w2a8_grouped_prefill_n256.cu 1f495eafa632332040a71f4d8f3b3a1b9b7dee8e2b9f255e86d1fcac9b7ae646
+source_sha256 kernels/gb10/common/exl3_gemv.cu e7bbd6d189e6a89e32a3d686b2a6f737c44b11ea96e0a5f939e768953b90d51d
+source_sha256 kernels/gb10/common/moe_batched_blend.cuh 9103c340ebbcd0d62040b712b9771c3a6f5ae95ad0a2d007c73681ae6a8175e9
+source_sha256 crates/spark-model/src/layers/moe/forward_prefill_exl3_w2a8.rs cec06a0cb575b731f6575682d2c5a4d0a4538d53c0db869d5adcc31fe6a1c32c
+source_sha256 crates/spark-model/src/layers/moe/forward_prefill.rs 0013a45a8673a081ea5a0a5b80226831e6b237c463f1785ee2d82e60b260c625
+source_sha256 crates/spark-model/src/layers/moe/forward_prefill_exl3.rs c5bd7686665b585e7cd0ba476fce8693192bd30240dc7e0c7c29f70db0d7e613
+source_sha256 crates/spark-model/src/layers/moe/forward_prefill_exl3_tail.rs dcce90edd6c66cc1f779e426ca12e40ff29432145964e6acddaaa8176040a08e
+source_sha256 crates/spark-model/src/layers/moe/forward_prefill_phase.rs e09a1fecf7891f533ec092c18a3d3ad6024dd6d75378be72bfdc184127f00ca3
+source_sha256 crates/spark-model/src/layers/moe/exl3_decode.rs c7be56ddd29b5b8285dc88a2d9b4048fde6939db3a71c6bcbced2608cbc37a03
+source_sha256 kernels/gb10/deepseek-v4-flash/nvfp4/KERNEL.toml 62f5bc236766f9ab949267150dac1069d119bb0b87b56de2c97ed71c3177c08e
+source_sha256 crates/spark-model/tests/exl3_w2a8_n256_down_double_buffer_model.rs 906d52c159a50ae71c9c00d8efc7db14c884e0b77cea216160caf99043b150af
+source_sha256 scripts/check-exl3-prefill-w2a8-n256-down-double-buffer-sass.sh 9d28095f2046c6f38fc413ed0305b628cf2ee96717f1830e7336ff3aea1fd383
+source_sha256 scripts/check-exl3-prefill-w2a8-n256-down-double-buffer-ab-probe-build.sh e7d11648102604f7aac108daef8c1d91ddc550b65be26e04e9f396bdf645604a
+nvcc_path=/usr/local/cuda-13.0/bin/nvcc
+nvcc_version=Build cuda_13.0.r13.0/compiler.36424714_0
+nvcc_binary_sha256=fbb111f057786ddd10ba723d993cc7dd43abf978b6baa32fedd3c9d806dc79e1
+cuobjdump_path=/usr/local/cuda-13.0/bin/cuobjdump
+cuobjdump_version=Build cuda_13.0.r13.0/compiler.36400806_0
+cuobjdump_binary_sha256=b73eed3404e7a2f73f4c5dc30b895876ca42d26be58011b7a1029a4542f011c2
+host_cxx_path=/usr/bin/aarch64-linux-gnu-g++-13
+host_cxx_version=g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+host_cxx_binary_sha256=fc02363794280f404c6ca6f5da1c8fe469be902e9de140d35d8573bb3393f53b
+timeout_path=/usr/bin/timeout
+timeout_version=timeout (GNU coreutils) 9.4
+timeout_binary_sha256=2db30bc57746c940a0643581cd5e2671e505442bea16164143f0ea8ff4e36453
+n256_experiment_wrapper=fixed_N4096_K2048_symbol_packed1_route_guard0_receipt_bound_selector_direct_component_include
+compile_command_template=<nvcc> -ccbin <host_cxx> -std=c++17 -O3 --fmad=false -arch=sm_121a -Xptxas=-v -DW2A8_PACKED_E4M3_CANDIDATE=1 -DW2A8_N256_SINGLE_WARP_ROUTE_GUARD_CANDIDATE=0 -DW2A8_FUSED_GU_N128_DOUBLE_BUFFER_CANDIDATE=1 -DW2A8_N256_DOWN_DOUBLE_BUFFER_CANDIDATE=<0|1> -DW2A8_COMPOSED_PROBE_ENFORCE_SPEEDUP=0 <receipt-bound macros> <harness> <five production-shape wrappers including generated N256> -o <binary>
+sass_command_template=<cuobjdump> --dump-sass --function <target-symbol> <binary>
+resource_command_template=<cuobjdump> --dump-resource-usage <binary>
+extract_command_template=<cuobjdump> --extract-elf all <binary>
+pair_id=e7ec013f3b1072802e001012b54810e8b3a587c7a5ed72aba199058b69f6bd50
+compile_command incumbent /usr/local/cuda/bin/nvcc -ccbin /usr/bin/g++ -std=c++17 -O3 --fmad=false -arch=sm_121a -Xptxas=-v -DW2A8_PACKED_E4M3_CANDIDATE=1 -DW2A8_N256_SINGLE_WARP_ROUTE_GUARD_CANDIDATE=0 -DW2A8_FUSED_GU_N128_DOUBLE_BUFFER_CANDIDATE=1 -DW2A8_N256_DOWN_DOUBLE_BUFFER_CANDIDATE=0 -DW2A8_COMPOSED_PROBE_ENFORCE_SPEEDUP=0 '-DW2A8_COMPOSED_PROBE_BUILD_ID="e7ec013f3b1072802e001012b54810e8b3a587c7a5ed72aba199058b69f6bd50"' -DW2A8_COMPOSED_PROBE_MIN_SPEEDUP=1.01 '-DW2A8_COMPOSED_PROBE_MIN_SPEEDUP_TEXT="1.01"' /home/flocka/atlas/apathy-deepseek/kernels/gb10/experiments/exl3_w2a8_composed_n128_n256_probe.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_h128_emit.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_k2_gu.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_k2_down.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_fused_gu_down_emit_n128.cu /tmp/atlas-exl3-n256-down-double-buffer-ab-20260828-01/n256-down-experiment-wrapper.cu -o /tmp/atlas-exl3-n256-down-double-buffer-ab-20260828-01/exl3-w2a8-n256-down-double-buffer-incumbent
+compile_command_sha256 incumbent 5c386525040cd24080625136254b7786371259bab3b8c5472d09e85686bed958
+binary_sha256 incumbent a7422b7c847c22415243d5e6bd191f84680d66f741178bebd9318f6db3dcaaf3
+compile_command candidate /usr/local/cuda/bin/nvcc -ccbin /usr/bin/g++ -std=c++17 -O3 --fmad=false -arch=sm_121a -Xptxas=-v -DW2A8_PACKED_E4M3_CANDIDATE=1 -DW2A8_N256_SINGLE_WARP_ROUTE_GUARD_CANDIDATE=0 -DW2A8_FUSED_GU_N128_DOUBLE_BUFFER_CANDIDATE=1 -DW2A8_N256_DOWN_DOUBLE_BUFFER_CANDIDATE=1 -DW2A8_COMPOSED_PROBE_ENFORCE_SPEEDUP=0 '-DW2A8_COMPOSED_PROBE_BUILD_ID="e7ec013f3b1072802e001012b54810e8b3a587c7a5ed72aba199058b69f6bd50"' -DW2A8_COMPOSED_PROBE_MIN_SPEEDUP=1.01 '-DW2A8_COMPOSED_PROBE_MIN_SPEEDUP_TEXT="1.01"' /home/flocka/atlas/apathy-deepseek/kernels/gb10/experiments/exl3_w2a8_composed_n128_n256_probe.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_h128_emit.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_k2_gu.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_grouped_prefill_k2_down.cu /home/flocka/atlas/apathy-deepseek/kernels/gb10/deepseek-v4-flash/nvfp4/exl3_w2a8_fused_gu_down_emit_n128.cu /tmp/atlas-exl3-n256-down-double-buffer-ab-20260828-01/n256-down-experiment-wrapper.cu -o /tmp/atlas-exl3-n256-down-double-buffer-ab-20260828-01/exl3-w2a8-n256-down-double-buffer-candidate
+compile_command_sha256 candidate 8a99b82590017a33a5c212778151482d1937109e63f112bdd0b29c579e98fa95
+binary_sha256 candidate 22f206faa3824f019ac86c8a62e36bde4208be6cc0fd64444bfc9e0c9d3c3b9a
+artifact_sha256 build-manifest.txt e7ec013f3b1072802e001012b54810e8b3a587c7a5ed72aba199058b69f6bd50
+artifact_sha256 n256-down-experiment-wrapper.cu 25af91151891674b1f636254baa3f5dccfca6b1f81215e000ed70ce6dfd6a711
+artifact_sha256 exl3-w2a8-n256-down-double-buffer-incumbent a7422b7c847c22415243d5e6bd191f84680d66f741178bebd9318f6db3dcaaf3
+artifact_sha256 incumbent.ptxas d86176d68971c1bfc8f15ab374f30c88d9b6e90484d4414b777629cf4fdb9953
+resource_sha256 incumbent.resources 2f6e54a4ad4e1972938aad3cb6cd6352e8a3138f9f0fc96c1de9729aa9809cb2
+artifact_sha256 incumbent.resources 2f6e54a4ad4e1972938aad3cb6cd6352e8a3138f9f0fc96c1de9729aa9809cb2
+sass_sha256 incumbent.exl3_w2a8_fused_gu_down_emit_n128.sass 75647751e9393e67b9f6d85a1bbac9577daccfe7dc24c74171b467fecc63c541
+artifact_sha256 incumbent.exl3_w2a8_fused_gu_down_emit_n128.sass 75647751e9393e67b9f6d85a1bbac9577daccfe7dc24c74171b467fecc63c541
+sass_sha256 incumbent.exl3_w2a8_grouped_prefill_n256_k2_down.sass 5e0df956bebf52c8041229cb8fdace5706471ec88f41a5ba924b85addb32920d
+artifact_sha256 incumbent.exl3_w2a8_grouped_prefill_n256_k2_down.sass 5e0df956bebf52c8041229cb8fdace5706471ec88f41a5ba924b85addb32920d
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.1.sm_121a.cubin 561e8845e880aa63075b20a7b94e0af5747d709b909ae426c12f011a67f75c01
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.1.sm_121a.cubin 561e8845e880aa63075b20a7b94e0af5747d709b909ae426c12f011a67f75c01
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.2.sm_121a.cubin 91b725774e34b16f0c6bb4bbd13ad5aefa8f87f97f343c3dee6091e4ae9613c5
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.2.sm_121a.cubin 91b725774e34b16f0c6bb4bbd13ad5aefa8f87f97f343c3dee6091e4ae9613c5
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.3.sm_121a.cubin 0623e32d1d1d633612b1ff04874c16a2c22b1024d8afe581e54dec2d49cc847d
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.3.sm_121a.cubin 0623e32d1d1d633612b1ff04874c16a2c22b1024d8afe581e54dec2d49cc847d
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.4.sm_121a.cubin a3e598274174b855b922784dae561aec5fbd68bb83b105c6b4997f7d5bca6b2d
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.4.sm_121a.cubin a3e598274174b855b922784dae561aec5fbd68bb83b105c6b4997f7d5bca6b2d
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.5.sm_121a.cubin ea247715e675203e9f5bf68154ba3de01f5d624e99c2e6e6d874f43797192416
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.5.sm_121a.cubin ea247715e675203e9f5bf68154ba3de01f5d624e99c2e6e6d874f43797192416
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.6.sm_121a.cubin 9e7b4ce66afa2a0ffacdae40acb6b3aecba53e11035422983adf67382688a5bb
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.6.sm_121a.cubin 9e7b4ce66afa2a0ffacdae40acb6b3aecba53e11035422983adf67382688a5bb
+cubin_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.7.sm_121a.cubin c9de554b750390bb06577dac9548382edfc471bbf7a24ae4d4956fd1575e7cdb
+artifact_sha256 incumbent.cubins/exl3-w2a8-n256-down-double-buffer-incumbent.7.sm_121a.cubin c9de554b750390bb06577dac9548382edfc471bbf7a24ae4d4956fd1575e7cdb
+artifact_sha256 exl3-w2a8-n256-down-double-buffer-candidate 22f206faa3824f019ac86c8a62e36bde4208be6cc0fd64444bfc9e0c9d3c3b9a
+artifact_sha256 candidate.ptxas 1f29d18cca1501c58bf6cfd6d672d4819271a8243c8ded6f318986921f8e5aca
+resource_sha256 candidate.resources 5078b260863d34915a27292e267c867557041e9f9e77ba451e8259dbf7826e04
+artifact_sha256 candidate.resources 5078b260863d34915a27292e267c867557041e9f9e77ba451e8259dbf7826e04
+sass_sha256 candidate.exl3_w2a8_fused_gu_down_emit_n128.sass 75647751e9393e67b9f6d85a1bbac9577daccfe7dc24c74171b467fecc63c541
+artifact_sha256 candidate.exl3_w2a8_fused_gu_down_emit_n128.sass 75647751e9393e67b9f6d85a1bbac9577daccfe7dc24c74171b467fecc63c541
+sass_sha256 candidate.exl3_w2a8_grouped_prefill_n256_k2_down.sass 5c5d7fa01d38dd9d976a7fc6da590384f236e7f6a2cf780788023bc73d37aaaa
+artifact_sha256 candidate.exl3_w2a8_grouped_prefill_n256_k2_down.sass 5c5d7fa01d38dd9d976a7fc6da590384f236e7f6a2cf780788023bc73d37aaaa
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.1.sm_121a.cubin 561e8845e880aa63075b20a7b94e0af5747d709b909ae426c12f011a67f75c01
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.1.sm_121a.cubin 561e8845e880aa63075b20a7b94e0af5747d709b909ae426c12f011a67f75c01
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.2.sm_121a.cubin 91b725774e34b16f0c6bb4bbd13ad5aefa8f87f97f343c3dee6091e4ae9613c5
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.2.sm_121a.cubin 91b725774e34b16f0c6bb4bbd13ad5aefa8f87f97f343c3dee6091e4ae9613c5
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.3.sm_121a.cubin 0623e32d1d1d633612b1ff04874c16a2c22b1024d8afe581e54dec2d49cc847d
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.3.sm_121a.cubin 0623e32d1d1d633612b1ff04874c16a2c22b1024d8afe581e54dec2d49cc847d
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.4.sm_121a.cubin a3e598274174b855b922784dae561aec5fbd68bb83b105c6b4997f7d5bca6b2d
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.4.sm_121a.cubin a3e598274174b855b922784dae561aec5fbd68bb83b105c6b4997f7d5bca6b2d
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.5.sm_121a.cubin ea247715e675203e9f5bf68154ba3de01f5d624e99c2e6e6d874f43797192416
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.5.sm_121a.cubin ea247715e675203e9f5bf68154ba3de01f5d624e99c2e6e6d874f43797192416
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.6.sm_121a.cubin 9e7b4ce66afa2a0ffacdae40acb6b3aecba53e11035422983adf67382688a5bb
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.6.sm_121a.cubin 9e7b4ce66afa2a0ffacdae40acb6b3aecba53e11035422983adf67382688a5bb
+cubin_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.7.sm_121a.cubin f652a2f92a9be720c93a32ac2ea8f4b3c14a6fcf7b3731321434c7cc53cfb895
+artifact_sha256 candidate.cubins/exl3-w2a8-n256-down-double-buffer-candidate.7.sm_121a.cubin f652a2f92a9be720c93a32ac2ea8f4b3c14a6fcf7b3731321434c7cc53cfb895
+resource_census variant=incumbent symbol=exl3_w2a8_fused_gu_down_emit_n128 REG:128 STACK:0 SHARED:48128 LOCAL:0 spills=0
+sass_census variant=incumbent symbol=exl3_w2a8_fused_gu_down_emit_n128 instructions=2752 e4m3_f16=32 e4m3_f32=4 barriers=7 qmma=32 bf16_rounds=52 fp8_converts=36 swiglu_exp=4 fma=166 shfl=193 fadd=116 fmul=128 ffma=166 hadd2=44 hmul2=32 ldgsts=8 ldgdepbar=4 depbar_waits=4 zfill=2
+resource_census variant=incumbent symbol=exl3_w2a8_grouped_prefill_n256_k2_down REG:97 STACK:0 SHARED:10240 LOCAL:0 spills=0
+sass_census variant=incumbent symbol=exl3_w2a8_grouped_prefill_n256_k2_down instructions=856 e4m3_f16=16 e4m3_f32=0 barriers=3 qmma=16 bf16_rounds=32 fp8_converts=16 swiglu_exp=0 fma=0 shfl=16 fadd=32 fmul=40 ffma=0 hadd2=16 hmul2=16 ldgsts=0 ldgdepbar=0 depbar_waits=0 zfill=0
+resource_census variant=candidate symbol=exl3_w2a8_fused_gu_down_emit_n128 REG:128 STACK:0 SHARED:48128 LOCAL:0 spills=0
+sass_census variant=candidate symbol=exl3_w2a8_fused_gu_down_emit_n128 instructions=2752 e4m3_f16=32 e4m3_f32=4 barriers=7 qmma=32 bf16_rounds=52 fp8_converts=36 swiglu_exp=4 fma=166 shfl=193 fadd=116 fmul=128 ffma=166 hadd2=44 hmul2=32 ldgsts=8 ldgdepbar=4 depbar_waits=4 zfill=2
+resource_census variant=candidate symbol=exl3_w2a8_grouped_prefill_n256_k2_down REG:102 STACK:0 SHARED:19456 LOCAL:0 spills=0
+sass_census variant=candidate symbol=exl3_w2a8_grouped_prefill_n256_k2_down instructions=896 e4m3_f16=16 e4m3_f32=0 barriers=3 qmma=16 bf16_rounds=32 fp8_converts=16 swiglu_exp=0 fma=0 shfl=16 fadd=32 fmul=40 ffma=0 hadd2=16 hmul2=16 ldgsts=2 ldgdepbar=2 depbar_waits=2 zfill=1
+ab_delta symbol=exl3_w2a8_fused_gu_down_emit_n128 instructions=0 registers=0 shared=0 barriers=0
+ab_delta symbol=exl3_w2a8_grouped_prefill_n256_k2_down instructions=40 registers=5 shared=9216 barriers=0
+cubin_comparison total=7 equal=6 different=1
+n256_down_double_buffer_sass=PASS packed_e4m3_both=PASS fixed_route_guard0=PASS fixed_fused_n128_double_buffer1=PASS unchanged_n128_sass=PASS changed_n256_sass=PASS async_order=PASS arithmetic_census=exact stack=0 local=0 spills=0 atomics=0

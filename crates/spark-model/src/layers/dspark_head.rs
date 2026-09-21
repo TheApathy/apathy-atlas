@@ -25,6 +25,10 @@ use crate::layers::ops;
 use crate::weight_loader::deepseek_v4::dspark::DsparkDrafterModule;
 use crate::weight_map::DenseWeight;
 
+mod input_plan;
+mod rope_table;
+use input_plan::DraftInputPlan;
+
 /// Geometry constants fixed by the V4-Flash drafter checkpoint. Asserted at
 /// build from the target config where they overlap.
 const HEADS: u32 = 64;
@@ -78,6 +82,10 @@ pub struct DsparkDraftHead {
     /// `KernelHandle(0)` when the `w4a16` module is absent — the per-row
     /// GEMV loop is kept as the fallback.
     k_gemm_smallm: KernelHandle,
+    /// Exact BF16 small-M LM-head kernel for checkpoints without an FP8 head.
+    /// It streams the shared vocabulary matrix once for all draft rows while
+    /// retaining the independent GEMV accumulation order for every row.
+    k_lmhead_bf16_batchm: KernelHandle,
     k_rms: KernelHandle, // rms_norm_vanilla — HF-exact weights
     k_residual_add: KernelHandle,
     k_hc_expand: KernelHandle,
@@ -160,35 +168,31 @@ impl DsparkDraftHead {
     ) -> Result<Self> {
         let h = target_config.hidden_size as u32;
         let hc_mult = target_config.hc_mult as u32;
-        let vocab = target_config.vocab_size as u32;
+        let vocab = u32::try_from(target_config.vocab_size)
+            .context("DSpark vocabulary exceeds the token-ID ABI")?;
         anyhow::ensure!(h == 4096 && hc_mult > 0, "unexpected V4-Flash geometry");
         anyhow::ensure!(
             lm_head_bf16.is_some() || lm_head_fp8.is_some(),
             "DSpark head needs a shared lm_head"
         );
-        let block = module.params.block_size as u32;
+        // Validate the fixed noise token and block extent before allocating or
+        // constructing any device state. The committed token is checked per call.
+        DraftInputPlan::new(
+            module.params.block_size,
+            module.params.noise_token_id,
+            module.params.noise_token_id,
+            vocab,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let block = u32::try_from(module.params.block_size)?;
         let win = module.params.window;
         let mr = module.params.markov_rank;
         let mut drafter_config = target_config.clone();
         drafter_config.num_experts = drafter_num_experts;
 
-        // Rope table: interleaved-pair (cos, sin) per (pos, j). Plain theta —
-        // the reference disables YaRN for pure sliding-window attention.
-        let theta = if target_config.rope_theta > 0.0 {
-            target_config.rope_theta
-        } else {
-            10000.0
-        };
-        let half = (ROPE_DIM / 2) as usize;
-        let mut tab = vec![0f32; max_seq_len * half * 2];
-        for pos in 0..max_seq_len {
-            for j in 0..half {
-                let freq = 1.0f64 / (theta as f64).powf(2.0 * j as f64 / ROPE_DIM as f64);
-                let ang = pos as f64 * freq;
-                tab[(pos * half + j) * 2] = ang.cos() as f32;
-                tab[(pos * half + j) * 2 + 1] = ang.sin() as f32;
-            }
-        }
+        // Pure sliding-window RoPE uses the declared base, never compressed YaRN.
+        let tab = rope_table::build_rope_table(target_config, max_seq_len, ROPE_DIM as usize)
+            .map_err(anyhow::Error::msg)?;
         let freqs = gpu.alloc(tab.len() * 4)?;
         // SAFETY: `tab` is a live Vec<f32>; the byte view covers exactly its
         // allocation for the duration of the copy.
@@ -233,11 +237,7 @@ impl DsparkDraftHead {
             k_qkv_gemv: if std::env::var("ATLAS_DSPARK_QKV_GEMV").as_deref() == Ok("0") {
                 spark_runtime::gpu::KernelHandle(0)
             } else {
-                crate::layers::try_kernel(
-                    gpu,
-                    "dense_gemv_bf16_batchm",
-                    "dense_gemv_bf16_batchm",
-                )
+                crate::layers::try_kernel(gpu, "dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
             },
             k_oproj_gemv: if std::env::var("ATLAS_DSPARK_OPROJ_GEMV").as_deref() == Ok("0") {
                 spark_runtime::gpu::KernelHandle(0)
@@ -256,6 +256,11 @@ impl DsparkDraftHead {
             } else {
                 crate::layers::try_kernel(gpu, "w4a16", "fp8_gemm_t_row_scaled_mtile8")
             },
+            k_lmhead_bf16_batchm: crate::layers::try_kernel(
+                gpu,
+                "dense_gemv_bf16_batchm",
+                "dense_gemv_bf16_batchm",
+            ),
             k_rms: gpu.kernel("rms_norm_vanilla", "rms_norm_vanilla")?,
             k_residual_add: gpu.kernel("residual_add", "bf16_residual_add")?,
             k_hc_expand: gpu.kernel("hyper_connection", "hc_expand")?,
@@ -528,6 +533,20 @@ impl DsparkDraftHead {
         pos: usize,
         stream: u64,
     ) -> Result<(Vec<u32>, Vec<f32>, Vec<u32>)> {
+        let input = DraftInputPlan::new(
+            self.module.params.block_size,
+            committed,
+            self.module.params.noise_token_id,
+            self.vocab,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            input.token_ids().len() == self.block as usize,
+            "DSpark block width changed after device allocation"
+        );
+        // tok_dev has B+1 u32 slots. No Markov operation reuses it until all
+        // stage MoEs finish. Blocking upload retains the host bytes until copied.
+        gpu.copy_h2d(input.bytes(), self.tok_dev)?;
         if Self::debug_enabled() {
             eprintln!("DSPARK_DBG ==PROPOSE pos={pos} committed={committed}==");
         }
@@ -587,11 +606,7 @@ impl DsparkDraftHead {
                 if Self::propose_prof_enabled() {
                     let _ = gpu.synchronize(stream);
                     if let Some(t) = _pp_t {
-                        tracing::info!(
-                            "  PROPOSE [{}]: {}us",
-                            $label,
-                            t.elapsed().as_micros()
-                        );
+                        tracing::info!("  PROPOSE [{}]: {}us", $label, t.elapsed().as_micros());
                     }
                     _pp_t = Some(std::time::Instant::now());
                 }
@@ -602,7 +617,6 @@ impl DsparkDraftHead {
         let h = self.h;
         let hu = h as usize;
         let hc = self.hc_mult;
-        let noise = self.module.params.noise_token_id;
         // One block per 256 hidden lanes (16 at H=4096), matching the plain
         // decode path (`decode_inner.rs:521`). `hc_post` is a grid-stride loop
         // over the hidden dim (`hyper_connection.cu:637`) whose iterations are
@@ -614,8 +628,8 @@ impl DsparkDraftHead {
         let post_shards = h.div_ceil(256);
 
         // Block rows: [committed, noise×(b-1)] embedded from the shared table.
-        for r in 0..b as usize {
-            let tok = if r == 0 { committed } else { noise } as usize;
+        for (r, &token) in input.token_ids().iter().enumerate() {
+            let tok = token as usize;
             gpu.copy_d2d_async(
                 self.embed.weight.offset(tok * hu * 2),
                 self.x5.offset(r * hu * 2),
@@ -639,7 +653,9 @@ impl DsparkDraftHead {
             comm: None,
             graph_capture: false,
             gdn_exact_replay: false,
-            token_ids: None,
+            // These are the same committed/noise text IDs as the embedding,
+            // never the target prompt's image sentinels or stale token scratch.
+            token_ids: Some(self.tok_dev),
             routed_lora_layers: None,
             midchunk_capture: None,
         };
@@ -704,8 +720,8 @@ impl DsparkDraftHead {
                     gpu,
                     self.k_qkv_gemv,
                     self.n5,
-                &stage.wq_a,
-                self.q_lora5,
+                    &stage.wq_a,
+                    self.q_lora5,
                     b,
                     Q_LORA,
                     h,
@@ -714,17 +730,17 @@ impl DsparkDraftHead {
                     stream,
                 )?;
             } else {
-            ops::dense_gemm(
-                gpu,
-                self.k_gemm,
-                self.n5,
-                &stage.wq_a,
-                self.q_lora5,
-                b,
-                Q_LORA,
-                h,
-                stream,
-            )?;
+                ops::dense_gemm(
+                    gpu,
+                    self.k_gemm,
+                    self.n5,
+                    &stage.wq_a,
+                    self.q_lora5,
+                    b,
+                    Q_LORA,
+                    h,
+                    stream,
+                )?;
             }
             ops::rms_norm(
                 gpu,
@@ -742,8 +758,8 @@ impl DsparkDraftHead {
                     gpu,
                     self.k_qkv_gemv,
                     self.q_lora5,
-                &stage.wq_b,
-                self.q5,
+                    &stage.wq_b,
+                    self.q5,
                     b,
                     HEADS * HEAD_DIM,
                     Q_LORA,
@@ -752,17 +768,17 @@ impl DsparkDraftHead {
                     stream,
                 )?;
             } else {
-            ops::dense_gemm(
-                gpu,
-                self.k_gemm,
-                self.q_lora5,
-                &stage.wq_b,
-                self.q5,
-                b,
-                HEADS * HEAD_DIM,
-                Q_LORA,
-                stream,
-            )?;
+                ops::dense_gemm(
+                    gpu,
+                    self.k_gemm,
+                    self.q_lora5,
+                    &stage.wq_b,
+                    self.q5,
+                    b,
+                    HEADS * HEAD_DIM,
+                    Q_LORA,
+                    stream,
+                )?;
             }
             let ones = DenseWeight {
                 weight: self.ones_hd,
@@ -793,8 +809,8 @@ impl DsparkDraftHead {
                     gpu,
                     self.k_qkv_gemv,
                     self.n5,
-                &stage.wkv,
-                self.kv5,
+                    &stage.wkv,
+                    self.kv5,
                     b,
                     HEAD_DIM,
                     h,
@@ -803,17 +819,17 @@ impl DsparkDraftHead {
                     stream,
                 )?;
             } else {
-            ops::dense_gemm(
-                gpu,
-                self.k_gemm,
-                self.n5,
-                &stage.wkv,
-                self.kv5,
-                b,
-                HEAD_DIM,
-                h,
-                stream,
-            )?;
+                ops::dense_gemm(
+                    gpu,
+                    self.k_gemm,
+                    self.n5,
+                    &stage.wkv,
+                    self.kv5,
+                    b,
+                    HEAD_DIM,
+                    h,
+                    stream,
+                )?;
             }
             ops::rms_norm(
                 gpu,
@@ -852,7 +868,13 @@ impl DsparkDraftHead {
                         );
                     }
                 }
-                self.dbg(gpu, &format!("s{s}.sink"), stage.attn_sink.weight, HEADS as usize, stream);
+                self.dbg(
+                    gpu,
+                    &format!("s{s}.sink"),
+                    stage.attn_sink.weight,
+                    HEADS as usize,
+                    stream,
+                );
             }
             pprof!("b_qkv_proj");
             // Windowed bidirectional attention + MLA output de-rotation.
@@ -927,55 +949,55 @@ impl DsparkDraftHead {
                     stream,
                 )?;
             } else {
-            for g in 0..O_GROUPS as usize {
-                // gather: o5 rows are row_o-strided; group g is a group_in-wide
-                // column slice → contiguous [b, group_in] in ogrp.
-                gpu.copy_d2d_2d_async(
-                    self.o5.offset(g * group_in * 2),
-                    row_o * 2,
-                    self.ogrp,
-                    group_in * 2,
-                    group_in * 2,
-                    b as usize,
-                    stream,
-                )?;
-                let wg = DenseWeight {
-                    weight: stage.wo_a.weight.offset(g * O_LORA as usize * group_in * 2),
-                };
+                for g in 0..O_GROUPS as usize {
+                    // gather: o5 rows are row_o-strided; group g is a group_in-wide
+                    // column slice → contiguous [b, group_in] in ogrp.
+                    gpu.copy_d2d_2d_async(
+                        self.o5.offset(g * group_in * 2),
+                        row_o * 2,
+                        self.ogrp,
+                        group_in * 2,
+                        group_in * 2,
+                        b as usize,
+                        stream,
+                    )?;
+                    let wg = DenseWeight {
+                        weight: stage.wo_a.weight.offset(g * O_LORA as usize * group_in * 2),
+                    };
+                    ops::dense_gemm(
+                        gpu,
+                        self.k_gemm,
+                        self.ogrp,
+                        &wg,
+                        self.ogrp_out,
+                        b,
+                        O_LORA,
+                        group_in as u32,
+                        stream,
+                    )?;
+                    // scatter: contiguous [b, O_LORA] back into the g-th slot of
+                    // each o_lora5 row (row stride O_GROUPS*O_LORA).
+                    gpu.copy_d2d_2d_async(
+                        self.ogrp_out,
+                        O_LORA as usize * 2,
+                        self.o_lora5.offset(g * O_LORA as usize * 2),
+                        (O_GROUPS * O_LORA) as usize * 2,
+                        O_LORA as usize * 2,
+                        b as usize,
+                        stream,
+                    )?;
+                }
                 ops::dense_gemm(
                     gpu,
                     self.k_gemm,
-                    self.ogrp,
-                    &wg,
-                    self.ogrp_out,
+                    self.o_lora5,
+                    &stage.wo_b,
+                    self.attn5,
                     b,
-                    O_LORA,
-                    group_in as u32,
+                    h,
+                    O_GROUPS * O_LORA,
                     stream,
                 )?;
-                // scatter: contiguous [b, O_LORA] back into the g-th slot of
-                // each o_lora5 row (row stride O_GROUPS*O_LORA).
-                gpu.copy_d2d_2d_async(
-                    self.ogrp_out,
-                    O_LORA as usize * 2,
-                    self.o_lora5.offset(g * O_LORA as usize * 2),
-                    (O_GROUPS * O_LORA) as usize * 2,
-                    O_LORA as usize * 2,
-                    b as usize,
-                    stream,
-                )?;
-            }
-            ops::dense_gemm(
-                gpu,
-                self.k_gemm,
-                self.o_lora5,
-                &stage.wo_b,
-                self.attn5,
-                b,
-                h,
-                O_GROUPS * O_LORA,
-                stream,
-            )?;
             }
             self.dbg(gpu, &format!("s{s}.attn5.r0"), self.attn5, hu, stream);
             pprof!("d_o_proj");
@@ -1091,29 +1113,10 @@ impl DsparkDraftHead {
         // accumulation order differs from the GEMV's, so the drafted tokens
         // can differ in the rare near-tie; served text does not, because
         // verify only accepts a draft that matches the target's own argmax.
-        let lmhead_batched = self.k_gemm_smallm.0 != 0
-            && b <= 8
-            && h.is_multiple_of(32)
-            && {
-                static LB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *LB.get_or_init(|| {
-                    std::env::var("ATLAS_DSPARK_LMHEAD_BATCH").as_deref() != Ok("0")
-                })
-            };
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::info!(
-                    "DSpark lm_head: batched={} (kernel={:#x} b={} h={} fp8={} bf16={})",
-                    lmhead_batched && self.lm_head_fp8.is_some(),
-                    self.k_gemm_smallm.0,
-                    b,
-                    h,
-                    self.lm_head_fp8.is_some(),
-                    self.lm_head_bf16.is_some(),
-                );
-            });
-        }
+        let lmhead_batched = self.k_gemm_smallm.0 != 0 && b <= 8 && h.is_multiple_of(32) && {
+            static LB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *LB.get_or_init(|| std::env::var("ATLAS_DSPARK_LMHEAD_BATCH").as_deref() != Ok("0"))
+        };
         // ATLAS_DSPARK_LMHEAD_BF16=1 (task #45 A/B, MEASURED NO-OP): forces the
         // engine probe's BF16 lm_head instead of the FP8 mirror. Tested
         // 2026-08-06: accepted 1.02 == FP8 baseline, output hash identical,
@@ -1121,13 +1124,35 @@ impl DsparkDraftHead {
         // collapse (the near-tie flip hypothesis is disproven). Default OFF.
         let force_bf16 = self.lm_head_bf16.is_some() && {
             static FB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *FB.get_or_init(|| {
-                std::env::var("ATLAS_DSPARK_LMHEAD_BF16").as_deref() == Ok("1")
-            })
+            *FB.get_or_init(|| std::env::var("ATLAS_DSPARK_LMHEAD_BF16").as_deref() == Ok("1"))
         };
-        let fp8_head = if force_bf16 { None } else { self.lm_head_fp8.as_ref() };
-        match (fp8_head, lmhead_batched) {
-            (Some(fp8), true) => ops::fp8_gemm_row_scaled_smallm(
+        let fp8_head = if force_bf16 {
+            None
+        } else {
+            self.lm_head_fp8.as_ref()
+        };
+        let bf16_head_batched = fp8_head.is_none()
+            && self.lm_head_bf16.is_some()
+            && self.k_lmhead_bf16_batchm.0 != 0
+            && b >= 2
+            && b <= ops::DENSE_GEMV_BATCHM_MAX_M;
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    "DSpark lm_head: batched={} (fp8_kernel={:#x} bf16_kernel={:#x} b={} h={} fp8={} bf16={})",
+                    (lmhead_batched && fp8_head.is_some()) || bf16_head_batched,
+                    self.k_gemm_smallm.0,
+                    self.k_lmhead_bf16_batchm.0,
+                    b,
+                    h,
+                    fp8_head.is_some(),
+                    self.lm_head_bf16.is_some(),
+                );
+            });
+        }
+        match (fp8_head, lmhead_batched, bf16_head_batched) {
+            (Some(fp8), true, _) => ops::fp8_gemm_row_scaled_smallm(
                 gpu,
                 self.k_gemm_smallm,
                 self.f5,
@@ -1136,6 +1161,19 @@ impl DsparkDraftHead {
                 b,
                 self.vocab,
                 h,
+                stream,
+            )?,
+            (None, _, true) => ops::dense_gemv_batchm(
+                gpu,
+                self.k_lmhead_bf16_batchm,
+                self.f5,
+                self.lm_head_bf16.as_ref().unwrap(),
+                self.logits5,
+                b,
+                self.vocab,
+                h,
+                h,
+                self.vocab,
                 stream,
             )?,
             _ => {
@@ -1154,7 +1192,16 @@ impl DsparkDraftHead {
                             stream,
                         )?;
                     } else if let Some(ref bf) = self.lm_head_bf16 {
-                        ops::dense_gemv(gpu, self.k_gemv, row_in, bf, row_out, self.vocab, h, stream)?;
+                        ops::dense_gemv(
+                            gpu,
+                            self.k_gemv,
+                            row_in,
+                            bf,
+                            row_out,
+                            self.vocab,
+                            h,
+                            stream,
+                        )?;
                     }
                 }
             }
@@ -1392,7 +1439,22 @@ impl crate::speculative::ProposerState for DsparkProposerState {
 impl DsparkDraftHead {
     /// Capture-buffer geometry, installed post-model-build by the factory:
     /// `[num_capture_layers, rows, h]` BF16, rows at sequence positions.
-    pub fn set_capture(&mut self, buf: DevicePtr, rows: usize, ring: bool) -> Result<()> {
+    pub fn set_capture(
+        &mut self,
+        buf: DevicePtr,
+        rows: usize,
+        ring: bool,
+        layers: &[usize],
+    ) -> Result<()> {
+        use crate::weight_loader::deepseek_v4::dspark::capture_plan::validate_capture_layers;
+        validate_capture_layers(layers, self.drafter_config.num_hidden_layers)
+            .map_err(anyhow::Error::msg)?;
+        validate_capture_layers(
+            &self.module.params.target_layer_ids,
+            self.drafter_config.num_hidden_layers,
+        )
+        .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(!buf.is_null(), "DSpark capture buffer is missing");
         anyhow::ensure!(
             rows >= self.module.params.window,
             "DSpark capture history has {rows} rows but the drafter window needs {}",
@@ -1414,12 +1476,17 @@ impl DsparkDraftHead {
         [
             self.capture_buf.offset(row * h * 2),
             self.capture_buf.offset((self.capture_rows + row) * h * 2),
-            self.capture_buf.offset((2 * self.capture_rows + row) * h * 2),
+            self.capture_buf
+                .offset((2 * self.capture_rows + row) * h * 2),
         ]
     }
 }
 
 impl crate::speculative::DraftProposer for DsparkDraftHead {
+    fn requires_full_target_verify(&self) -> bool {
+        true
+    }
+
     fn alloc_state(
         &self,
         _gpu: &dyn GpuBackend,
@@ -1505,8 +1572,8 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         // window the drafter attends over. A full reseed from the committed
         // capture buffer makes the live ring match the clean engine-probe ring.
         static FULL_RESEED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let full_reseed =
-            *FULL_RESEED.get_or_init(|| std::env::var("ATLAS_DSPARK_FULL_RESEED").as_deref() == Ok("1"));
+        let full_reseed = *FULL_RESEED
+            .get_or_init(|| std::env::var("ATLAS_DSPARK_FULL_RESEED").as_deref() == Ok("1"));
         let win = self.module.params.window;
         let from = if full_reseed {
             (p + 1).saturating_sub(win)
@@ -1524,9 +1591,7 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         // restores the old behavior for A/B.
         let boundary_fix = st.boundary_pos >= 0 && {
             static BF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *BF.get_or_init(|| {
-                std::env::var("ATLAS_DSPARK_BOUNDARY_FIX").as_deref() != Ok("0")
-            })
+            *BF.get_or_init(|| std::env::var("ATLAS_DSPARK_BOUNDARY_FIX").as_deref() != Ok("0"))
         };
         for q in from..p {
             if boundary_fix && q as i64 == st.boundary_pos {
@@ -1547,7 +1612,11 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             for (i, c) in caps.iter().enumerate() {
                 gpu.copy_d2h(*c, &mut host[i * h * 2..(i + 1) * h * 2])?;
             }
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 let _ = f.write_all(&(p as u32).to_le_bytes());
                 let _ = f.write_all(&(last_token).to_le_bytes());
                 let _ = f.write_all(&host);
@@ -1622,7 +1691,8 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         // the SAME committed captures — the first divergence at byte-exact
         // inputs pinpoints the propose_block execution-context bug.
         static DRAFT_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DRAFT_LOG.get_or_init(|| std::env::var("ATLAS_DSPARK_DRAFT_LOG").as_deref() == Ok("1")) {
+        if *DRAFT_LOG.get_or_init(|| std::env::var("ATLAS_DSPARK_DRAFT_LOG").as_deref() == Ok("1"))
+        {
             tracing::info!("DRAFTLOG pos={p} last_token={last_token} drafts={drafts:?}");
         }
         st.last_seeded = p as i64;
@@ -1661,8 +1731,8 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
             // COW block table, or the per-layer branch re-seed — not a
             // modelling difference. Mirrors ATLAS_DFLASH_TREE_DEGEN.
             static DEGEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let degen =
-                *DEGEN.get_or_init(|| std::env::var("ATLAS_DSPARK_TREE_DEGEN").as_deref() == Ok("1"));
+            let degen = *DEGEN
+                .get_or_init(|| std::env::var("ATLAS_DSPARK_TREE_DEGEN").as_deref() == Ok("1"));
             let (max_branches, tail_cfg, margin_gate) = tree_shape();
             let mut cliffs: Vec<(usize, u32, f32)> = Vec::new();
             // Draft `di` came from logits row `di` (no row-0 drop here — the
@@ -1720,10 +1790,7 @@ impl crate::speculative::DraftProposer for DsparkDraftHead {
         // steps) — a mechanical cap on acceptance regardless of capture
         // fidelity. Re-seeding is idempotent (pure copy from the capture
         // buffer), so rewinding a couple of rows extra is harmless.
-        if let Some(st) = state
-            .as_any_mut()
-            .downcast_mut::<DsparkProposerState>()
-        {
+        if let Some(st) = state.as_any_mut().downcast_mut::<DsparkProposerState>() {
             let rewind = self.block as i64 + 2;
             st.last_seeded = (st.last_seeded - rewind).max(-1);
         }

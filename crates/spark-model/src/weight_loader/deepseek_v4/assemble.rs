@@ -19,6 +19,9 @@ use crate::weight_map::{
     quantized, quantized_v2,
 };
 
+#[path = "vision_moe.rs"]
+mod vision_moe;
+
 /// Load one MoE expert projection, dispatching by the on-disk format so the V4
 /// loader handles every DeepSeek-V4-Flash checkpoint variant. The nvidia
 /// checkpoint is heterogeneous — routed experts are NVFP4 but shared experts are
@@ -398,6 +401,34 @@ pub fn assemble_layer(
             return None;
         }
         let (n_rows, k_cols) = (shape[0], shape[1]);
+        // HEADROOM FLOOR. This transcode runs AFTER the fast-load preflight has
+        // already approved the budget, so nothing above it accounts for the
+        // extra NVFP4 copy (plus the BF16 intermediates that stay resident
+        // unless ATLAS_V4_ATTN_RELEASE_BF16=1). On GB10 unified memory an
+        // over-allocation does not return an error — it takes the host down,
+        // which is exactly what happened on 2026-09-02 at layer ~35 of 43. The
+        // graceful "keeping FP8" fallback below can only help if it fires
+        // BEFORE the cliff, so refuse the transcode while free memory is under
+        // the floor rather than letting `gpu.alloc` discover it.
+        const TRANSCODE_HEADROOM_FLOOR_BYTES: usize = 8 * 1024 * 1024 * 1024;
+        match gpu.free_memory() {
+            Ok(free) if free < TRANSCODE_HEADROOM_FLOOR_BYTES => {
+                tracing::warn!(
+                    "{lp}.attn.{suffix}: skipping NVFP4 transcode — only {:.2} GB free, floor is {} GB; \
+                     keeping FP8 (set ATLAS_V4_ATTN_RELEASE_BF16=1 or lower GPU_MEM to recover headroom)",
+                    free as f64 / 1e9,
+                    TRANSCODE_HEADROOM_FLOOR_BYTES / (1024 * 1024 * 1024)
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{lp}.attn.{suffix}: cannot read free memory ({e:#}); skipping NVFP4 transcode"
+                );
+                return None;
+            }
+            Ok(_) => {}
+        }
         match crate::weight_map::quantize_to_nvfp4(
             bf16,
             n_rows,
@@ -555,6 +586,7 @@ pub fn assemble_layer(
         config.hc_mult
     );
 
+    layer.set_vision_hc_bf16(config, gpu)?;
     Ok(Box::new(layer))
 }
 
@@ -736,7 +768,17 @@ pub(super) fn assemble_moe_subset(
     // buffer gives `topk(sigmoid(logits) + 0)` with correct weight
     // normalization. (Falling back to softmax selects right experts but
     // wrong blend weights → degraded output.)
-    let correction_bias = load_correction_bias(store, &lp, config.num_experts, gpu, expert_ids)?;
+    let correction_bias = if config.deepseek_vision.is_some() {
+        anyhow::ensure!(
+            expert_ids.is_none(),
+            "DeepSeek Vision does not support compact expert subsets"
+        );
+        Some(DenseWeight {
+            weight: vision_moe::load_bias(store, &lp, "bias", config.num_experts, gpu)?,
+        })
+    } else {
+        load_correction_bias(store, &lp, config.num_experts, gpu, expert_ids)?
+    };
 
     let moe_weights = MoeWeights {
         gate,
@@ -753,6 +795,16 @@ pub(super) fn assemble_moe_subset(
     // that weight the selected experts. `Some(table)` here is the SSOT marking
     // this as a hash-routed layer.
     let tid2eid_dev = if layer_idx < config.num_hash_layers {
+        if config.deepseek_vision.is_some() {
+            vision_moe::validate_hash_table(
+                store,
+                &lp,
+                config.vocab_size,
+                config.num_experts_per_tok,
+                config.num_experts,
+                gpu,
+            )?;
+        }
         let t = store
             .get(&format!("{lp}.ffn.gate.tid2eid"))
             .with_context(|| {
@@ -781,6 +833,14 @@ pub(super) fn assemble_moe_subset(
         gpu,
         config,
     )?;
+    if config.deepseek_vision.is_some() {
+        let bias_vl = vision_moe::load_bias(store, &lp, "bias_vl", config.num_experts, gpu)?;
+        moe.set_deepseek_visual_routing(bias_vl, config, gpu)?;
+    }
+    // Tag the shared expert before optional format-specific conversion. The
+    // predequant kernel requires NVFP4 E4M3 group scales; interpreting native
+    // E8M0 scales through it would silently corrupt every shared weight.
+    moe.shared_experts_scale_kind = detect_shared_scale_kind(store, p);
     // Tag routed-expert quant format so the Phase-K E8M0 MoE-GEMM variants
     // dispatch on native MXFP4 (transcode-free) vs the standard NVFP4 kernels.
     moe.experts_scale_kind =
@@ -803,11 +863,36 @@ pub(super) fn assemble_moe_subset(
             exl3_experts[0].gate_proj.bits,
             exl3_experts[0].gate_proj.bits,
         );
+        super::native_shared_fp8::install(&mut moe, store, p, config, exl3_detected, gpu)?;
+        if std::env::var("ATLAS_EXL3_SHARED_PREFILL_FP8").as_deref() == Ok("1") {
+            moe.shared_experts_scale_kind.expect(
+                crate::weight_map::WeightQuantFormat::Nvfp4,
+                "ATLAS_EXL3_SHARED_PREFILL_FP8 requires an NVFP4 shared expert",
+            );
+            let bytes = moe
+                .predequant_shared_for_prefill(gpu, config, qctx.stream)
+                .with_context(|| format!("{p}: EXL3 shared-expert FP8 predequant"))?;
+            anyhow::ensure!(
+                bytes > 0,
+                "{p}: ATLAS_EXL3_SHARED_PREFILL_FP8=1 requested but no eligible \
+                 NVFP4 shared expert was converted"
+            );
+            static ANNOUNCE: std::sync::Once = std::sync::Once::new();
+            ANNOUNCE.call_once(|| {
+                tracing::info!(
+                    "ATLAS_EXL3_SHARED_PREFILL_FP8=1: numerics-changing shared-expert \
+                     FP8 prefill arm ARMED ({:.1} MiB persistent per MoE layer)",
+                    bytes as f64 / (1024.0 * 1024.0)
+                );
+            });
+        }
+    } else {
+        // Explicit opt-in on a non-EXL3 checkpoint must not disappear silently.
+        super::native_shared_fp8::install(&mut moe, store, p, config, false, gpu)?;
     }
-    // Tag the SHARED expert format independently (RIDER A1): the native ckpt is
+    // The SHARED expert format is tagged independently (RIDER A1): the native ckpt is
     // heterogeneous — routed E8M0-MXFP4, shared FP8→NVFP4. The dual-format decode
     // kernel asserts shared==Nvfp4; a different shared format fires the `expect`.
-    moe.shared_experts_scale_kind = detect_shared_scale_kind(store, p);
     Ok(moe)
 }
 

@@ -134,6 +134,7 @@ pub fn step_verify_k4(
     } else {
         3
     };
+    crate::scheduler::adaptive_spec::record_speculative_step(a);
 
     // Extract logprobs from verify logits buffer (K=4 positions) when requested.
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {

@@ -670,8 +670,10 @@ pub fn detect_content_token_loop_with(
 /// Allocates only the ≤ `CONTENT_LOOP_SCAN_WINDOW` tail copy; the full
 /// history is never normalized. FP mitigation: stricter
 /// `CONTENT_LOOP_NORM_MIN_REPEATS`, and the matched period must contain
-/// BOTH a sentinel (numeric) and a non-sentinel (structural) token —
-/// pure-number columns and pure-prose loops are left to the exact path.
+/// BOTH a sentinel (numeric) and at least three distinct non-sentinel
+/// (structural) tokens. Requiring structural diversity keeps simple
+/// `1, 2, 3, ...` lists from looking like a normalized degeneration while
+/// retaining multi-token templates such as `- B(<n>) = <value>\n`.
 pub fn detect_content_token_loop_normalized(tokens: &[u32], mask: &[bool]) -> bool {
     detect_content_token_loop_normalized_with(tokens, mask, None)
 }
@@ -830,8 +832,21 @@ fn detect_token_loop_with_period(
         }
         let window = &tokens[n - pattern_len..];
         let has_numeric = window.contains(&NUMERIC_SENTINEL);
-        let has_structural = window.iter().any(|&t| t != NUMERIC_SENTINEL);
-        if !(has_numeric && has_structural) {
+        let Some(first_structural) = window.iter().copied().find(|&t| t != NUMERIC_SENTINEL)
+        else {
+            continue;
+        };
+        let Some(second_structural) = window
+            .iter()
+            .copied()
+            .find(|&t| t != NUMERIC_SENTINEL && t != first_structural)
+        else {
+            continue;
+        };
+        let has_structural_diversity = window.iter().any(|&t| {
+            t != NUMERIC_SENTINEL && t != first_structural && t != second_structural
+        });
+        if !(has_numeric && has_structural_diversity) {
             continue;
         }
         if has_repeating_pattern_anchored(tokens, pattern_len, min_repeats) {

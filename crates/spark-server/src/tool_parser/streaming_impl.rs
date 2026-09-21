@@ -19,6 +19,7 @@ impl StreamingToolDetector {
         Self {
             buffer: String::new(),
             inside_tag: false,
+            dsml_mode: false,
             call_counter: 0,
             emitted_tool_calls: false,
             current_tc_name: None,
@@ -38,6 +39,7 @@ impl StreamingToolDetector {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.inside_tag = false;
+        self.dsml_mode = false;
         self.reset_call_state();
     }
 
@@ -58,10 +60,12 @@ impl StreamingToolDetector {
     pub fn process(&mut self, new_text: &str) -> Vec<DetectorOutput> {
         let mut outputs = Vec::new();
         self.buffer.push_str(new_text);
+        self.dsml_mode |= self.buffer.contains(super::dsml_v4::DSML)
+            || self.buffer.contains(super::dsml_v4::DSML_SHORT);
         // DeepSeek-V4 DSML: rewrite complete DSML tags to the canonical
         // shapes before scanning (one <tool_call> per <invoke>). Partial
         // straddling tokens stay buffered via safe_emit_len's DSML prefixes.
-        super::dsml_v4::rewrite_dsml_in_buffer(&mut self.buffer);
+        super::dsml_v4::rewrite_dsml_in_buffer(&mut self.buffer, self.dsml_mode, self.inside_tag);
         loop {
             if self.inside_tag {
                 // Check for closing tag. Recognised forms:
@@ -490,6 +494,10 @@ impl StreamingToolDetector {
         const DSML_PARAM: &str = "<\u{ff5c}DSML\u{ff5c}parameter ";
         const DSML_TC_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
         const DSML_BROKEN_CLOSE: &str = "</\u{ff5c}DSML\u{ff5c}_calls>";
+        const DSML_SHORT_TC: &str = "<DSML\u{ff5c}tool_calls>";
+        const DSML_SHORT_INVOKE: &str = "<DSML\u{ff5c}invoke ";
+        const DSML_SHORT_PARAM: &str = "<DSML\u{ff5c}parameter ";
+        const DSML_SHORT_TC_CLOSE: &str = "</DSML\u{ff5c}tool_calls>";
         for tag in [
             b"<tool_call>" as &[u8],
             b"<|tool_call>",
@@ -504,6 +512,10 @@ impl StreamingToolDetector {
             DSML_PARAM.as_bytes(),
             DSML_TC_CLOSE.as_bytes(),
             DSML_BROKEN_CLOSE.as_bytes(),
+            DSML_SHORT_TC.as_bytes(),
+            DSML_SHORT_INVOKE.as_bytes(),
+            DSML_SHORT_PARAM.as_bytes(),
+            DSML_SHORT_TC_CLOSE.as_bytes(),
         ] {
             for i in (buf.len().saturating_sub(tag.len() - 1))..buf.len() {
                 if tag.starts_with(&buf[i..]) {

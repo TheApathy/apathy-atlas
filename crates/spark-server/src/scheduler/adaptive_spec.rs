@@ -56,6 +56,11 @@ pub(crate) struct AdaptState {
     /// slow spec steps every cycle. Reset by a token-count probe or by an
     /// engagement that survives a full window.
     lg_fail_streak: u32,
+    /// Request-scoped path evidence. These counters are observability only;
+    /// they never participate in the adaptive decision.
+    engine_speculative_steps: u64,
+    engine_serial_tokens: u64,
+    engine_low_gear_steps: u64,
 }
 
 const WINDOW: usize = 12;
@@ -124,6 +129,7 @@ fn lg_reengage_mean() -> f32 {
 /// instead of after the re-probe backstop. Only meaningful while suspended;
 /// the window resets on every suspend/resume transition.
 pub(crate) fn record_low_gear(a: &mut ActiveSeq, n_ok: usize) {
+    a.spec_adapt.engine_low_gear_steps = a.spec_adapt.engine_low_gear_steps.saturating_add(1);
     if !enabled() || lg_reengage_mean() <= 0.0 {
         return;
     }
@@ -197,8 +203,16 @@ fn note_step(st: &mut AdaptState, spec: bool) {
         // Guard against scheduler gaps (a queued request, a swap) polluting
         // the estimate: anything over 2 s is not a step.
         if ms > 0.0 && ms < 2000.0 {
-            let slot = if spec { &mut st.ewma_spec_ms } else { &mut st.ewma_serial_ms };
-            *slot = if *slot == 0.0 { ms } else { *slot + EWMA_ALPHA * (ms - *slot) };
+            let slot = if spec {
+                &mut st.ewma_spec_ms
+            } else {
+                &mut st.ewma_serial_ms
+            };
+            *slot = if *slot == 0.0 {
+                ms
+            } else {
+                *slot + EWMA_ALPHA * (ms - *slot)
+            };
         }
     }
     st.last_step_at = Some(now);
@@ -207,6 +221,7 @@ fn note_step(st: &mut AdaptState, spec: bool) {
 /// Record one K=γ verify step's accept count; may trip suspension.
 /// Call after `num_accepted` is known (verify_dflash_step).
 pub(crate) fn record_verify(a: &mut ActiveSeq, num_accepted: usize) {
+    record_speculative_step(a);
     if !enabled() {
         return;
     }
@@ -304,11 +319,31 @@ pub(crate) fn eagle_fix_enabled() -> bool {
 
 /// Count a serially-decoded token toward the re-probe interval.
 pub(crate) fn tick_serial(a: &mut ActiveSeq) {
+    record_serial_token(a);
     if enabled() && a.spec_adapt.suspended {
         // Time the serial step too — `break_even()` is the ratio of these two
         // EWMAs, so without this half the policy has no denominator and falls
         // back to the stale constant.
         note_step(&mut a.spec_adapt, false);
         a.spec_adapt.serial_tokens = a.spec_adapt.serial_tokens.saturating_add(1);
+    }
+}
+
+/// Record a token emitted by the ordinary decode path.
+pub(crate) fn record_serial_token(a: &mut ActiveSeq) {
+    a.spec_adapt.engine_serial_tokens = a.spec_adapt.engine_serial_tokens.saturating_add(1);
+}
+
+/// Record one speculative verification without changing adaptive policy.
+pub(crate) fn record_speculative_step(a: &mut ActiveSeq) {
+    a.spec_adapt.engine_speculative_steps = a.spec_adapt.engine_speculative_steps.saturating_add(1);
+}
+
+/// Return immutable request-scoped engine evidence for the API usage block.
+pub(crate) fn engine_usage(a: &ActiveSeq) -> crate::ir::EngineUsage {
+    crate::ir::EngineUsage {
+        speculative_steps: a.spec_adapt.engine_speculative_steps,
+        serial_tokens: a.spec_adapt.engine_serial_tokens,
+        low_gear_steps: a.spec_adapt.engine_low_gear_steps,
     }
 }

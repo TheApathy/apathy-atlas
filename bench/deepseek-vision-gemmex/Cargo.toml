@@ -1,0 +1,22 @@
+[package]
+name = "deepseek-vision-gemmex"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace]
+
+[[test]]
+name = "contract"
+path = "tests/contract.rs"
+
+[[test]]
+name = "protocol"
+path = "tests/protocol.rs"
+
+[dependencies]
+anyhow = "=1.0.103"
+libloading = "=0.8.9"
+serde_json = { version = "=1.0.150", features = ["float_roundtrip"] }
+deepseek-vision-p1 = { path = "../deepseek-vision-p1" }

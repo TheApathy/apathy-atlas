@@ -58,7 +58,9 @@ fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
 
 /// E4M3 bytes for weights, avoiding NaN encodings (top exponent).
 fn gen_fp8(rng: &mut Rng, n: usize) -> Vec<u8> {
-    (0..n).map(|_| (rng.next_u64() & 0x7F) as u8 % 0x76).collect()
+    (0..n)
+        .map(|_| (rng.next_u64() & 0x7F) as u8 % 0x76)
+        .collect()
 }
 
 /// CPU E4M3 decode (bias 7, 3 mantissa bits; subnormals at exp=0). The
@@ -181,7 +183,11 @@ fn main() -> Result<()> {
 
         let time = |a8: bool| -> Result<f64> {
             for _ in 0..3 {
-                if a8 { launch_a8(c8_d)?; } else { launch_a16(c16_d)?; }
+                if a8 {
+                    launch_a8(c8_d)?;
+                } else {
+                    launch_a16(c16_d)?;
+                }
             }
             gpu.synchronize(stream)?;
             let (mut e0, mut e1) = (0u64, 0u64);
@@ -191,7 +197,11 @@ fn main() -> Result<()> {
                 cuEventRecord(e0, stream);
             }
             for _ in 0..ITERS {
-                if a8 { launch_a8(c8_d)?; } else { launch_a16(c16_d)?; }
+                if a8 {
+                    launch_a8(c8_d)?;
+                } else {
+                    launch_a16(c16_d)?;
+                }
             }
             unsafe { cuEventRecord(e1, stream) };
             gpu.synchronize(stream)?;

@@ -302,13 +302,34 @@ impl ChatCompletionRequest {
     /// Request-body priority (highest to lowest):
     /// 1. `thinking.budget_tokens` (Anthropic) — explicit budget
     /// 2. `thinking_token_budget` (vLLM PR) — explicit budget
-    /// 3. `reasoning.effort` (OpenAI) — mapped to budget
+    /// 3. `reasoning.effort`, then top-level `reasoning_effort` (OpenAI) — mapped to budget
     /// 4. `chat_template_kwargs` (vLLM stable) — enable/disable + optional budget
     /// 5. `enable_thinking` (Atlas legacy) — boolean
     ///
     /// No channel present → [`ThinkingDirective::Unspecified`] (the old
     /// `thinking_explicitly_requested() == false`).
     pub fn client_thinking_directive(&self) -> ThinkingDirective {
+        // Qualitative client tiers are reduced to token budgets here. Model
+        // templates receive only the resulting on/off state, so DeepSeek-V4
+        // never sees a native tier preamble from an OpenAI compatibility field.
+        let effort_directive = |effort: &str| {
+            let budget = match effort {
+                "none" => 0,
+                "minimal" => 64,
+                "low" => 128,
+                "medium" => 256,
+                "high" => 512,
+                "xhigh" | "max" => 1024,
+                _ => DEFAULT_THINKING_BUDGET,
+            };
+            if budget > 0 {
+                ThinkingDirective::On {
+                    budget: Some(budget),
+                }
+            } else {
+                ThinkingDirective::Off
+            }
+        };
         // 1. Anthropic: thinking.budget_tokens / thinking.type
         if let Some(ref tc) = self.thinking {
             if let Some(ref t) = tc.thinking_type
@@ -345,22 +366,10 @@ impl ChatCompletionRequest {
         if let Some(ref rc) = self.reasoning
             && let Some(ref effort) = rc.effort
         {
-            let budget = match effort.as_str() {
-                "none" => 0,
-                "minimal" => 64,
-                "low" => 128,
-                "medium" => 256,
-                "high" => 512,
-                "xhigh" | "max" => 1024,
-                _ => DEFAULT_THINKING_BUDGET,
-            };
-            return if budget > 0 {
-                ThinkingDirective::On {
-                    budget: Some(budget),
-                }
-            } else {
-                ThinkingDirective::Off
-            };
+            return effort_directive(effort);
+        }
+        if let Some(ref effort) = self.reasoning_effort {
+            return effort_directive(effort);
         }
 
         // 4. vLLM stable: chat_template_kwargs

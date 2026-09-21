@@ -237,9 +237,7 @@ impl Qwen3AttentionLayer {
                         comp_count_ptr.is_null(),
                     );
                 }
-                if self.attn_layer_idx == 2
-                    && std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok()
-                {
+                if self.attn_layer_idx == 2 && std::env::var("ATLAS_DSPARK_CATCHUP_DIAG").is_ok() {
                     static N: std::sync::atomic::AtomicUsize =
                         std::sync::atomic::AtomicUsize::new(0);
                     let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -266,12 +264,9 @@ impl Qwen3AttentionLayer {
                 // harness for confirming bit-exactness empirically).
                 let kernel = {
                     static NO_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                    let no_fuse = *NO_FUSE.get_or_init(|| {
-                        std::env::var("ATLAS_MLA_NO_V_FUSE").as_deref() == Ok("1")
-                    });
-                    if !no_fuse
-                        && k_scale == v_scale
-                        && self.mla_paged_decode_fp8_kvalias_k.0 != 0
+                    let no_fuse = *NO_FUSE
+                        .get_or_init(|| std::env::var("ATLAS_MLA_NO_V_FUSE").as_deref() == Ok("1"));
+                    if !no_fuse && k_scale == v_scale && self.mla_paged_decode_fp8_kvalias_k.0 != 0
                     {
                         self.mla_paged_decode_fp8_kvalias_k
                     } else {

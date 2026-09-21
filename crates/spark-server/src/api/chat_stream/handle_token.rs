@@ -452,6 +452,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
 
     // Fork: detector-active vs pure-content path.
     if state.detector.is_some() {
+        if let Some(input) = state.tool_parser_input.as_mut() {
+            input.push_str(&delta);
+        }
         // Drain the detector outputs into a local Vec so we can drop
         // the &mut borrow on `state.detector` before the helpers below
         // (which take other &mut state fields) run.

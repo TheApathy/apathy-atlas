@@ -66,6 +66,9 @@ pub struct TransformerModel {
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
+    /// Exact small-M BF16 GEMV used by the DeepSeek Vision verifier's
+    /// unquantized LM head. A zero handle preserves the dense-GEMM fallback.
+    pub(super) dense_gemv_batchm_kernel: KernelHandle,
     /// FP32-output variant of dense_gemv_bf16. Used by the LM head when
     /// `use_fp32_logits` is true, so the FP32 accumulator is preserved across
     /// the BF16-storage rounding boundary that flips greedy argmax tiebreaks
@@ -296,6 +299,7 @@ pub struct TransformerModel {
     pub(super) last_mtp_hidden_idx: std::sync::atomic::AtomicUsize,
     /// Optional vision encoder for VL models (Qwen3-VL).
     pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
+    pub(super) deepseek_vision: Option<super::deepseek_vision::DeepSeekVisionState>,
     /// Number of patches encoded by the last prepare_vision_embed() call.
     /// 0 means no vision embeddings pending.
     pub(super) vision_embed_patches: Mutex<usize>,

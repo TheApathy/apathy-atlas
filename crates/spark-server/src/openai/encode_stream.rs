@@ -10,7 +10,9 @@ use axum::response::sse::Event;
 
 use crate::ir::StreamDelta;
 
-use super::{ChatCompletionChunk, CompletionTokensDetails, PromptTokensDetails, Usage};
+use super::{
+    ChatCompletionChunk, CompletionTokensDetails, PromptTokensDetails, Usage, atlas_engine_usage,
+};
 
 /// Encode one neutral delta into its OpenAI SSE event(s).
 ///
@@ -135,6 +137,7 @@ fn wire_usage(u: &crate::ir::Usage) -> Usage {
         }),
         time_to_first_token_ms: u.time_to_first_token_ms,
         response_tokens_per_second: u.response_tokens_per_second,
+        atlas_engine: atlas_engine_usage(u.engine),
     }
 }
 
@@ -285,6 +288,7 @@ mod tests {
             reasoning_tokens: 3,
             time_to_first_token_ms: 12.5,
             response_tokens_per_second: 40.0,
+            engine: None,
         };
         let d = StreamDelta::Finish {
             reason: FinishReason::Stop,

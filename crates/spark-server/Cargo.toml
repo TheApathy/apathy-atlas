@@ -36,6 +36,8 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 # `default-features = false` on path-deps so the metal feature actually

@@ -8,6 +8,7 @@ const EXL3: &str = include_str!("../src/layers/moe/exl3_decode.rs");
 const EXL3_KERNEL: &str = include_str!("../../../kernels/gb10/common/exl3_gemv.cu");
 const BUFFER_SIZES: &str = include_str!("../../spark-runtime/src/buffers/sizes.rs");
 const EXL3_DISPATCH: &str = include_str!("../src/layers/moe/exl3_decode.rs");
+const MOE_INIT: &str = include_str!("../src/layers/moe/init.rs");
 const W4A16: &str = include_str!("../../../kernels/gb10/common/w4a16_gemv.cu");
 
 #[test]
@@ -54,9 +55,22 @@ fn deepseek_exl3_has_full_dflash2_verify_width() {
 
 #[test]
 fn exl3_shared_expert_batches_exact_gemv_for_k2_and_dflash2() {
-    assert!(W4A16.contains("W4A16_GB_V2_ENTRY(16,"));
+    for width in [4, 5, 6, 8, 16] {
+        let symbol = format!("w4a16_gemv_grouped_batchm_v2_m{width}");
+        let entry = format!("W4A16_GB_V2_ENTRY({width},");
+        assert!(W4A16.contains(&entry), "missing kernel entry {entry}");
+        assert!(MOE_INIT.contains(&symbol), "EXL3 does not resolve {symbol}");
+    }
+    assert!(EXL3_DISPATCH.contains("h % 32 == 0 && shared_inter % 32 == 0"));
     assert!(EXL3_DISPATCH.contains("num_tokens <= 8"));
-    assert!(EXL3_DISPATCH.contains("num_tokens == 16"));
+    for (width, slot) in [(4, 0), (5, 1), (6, 2), (8, 3), (16, 4)] {
+        assert!(
+            EXL3_DISPATCH.contains(&format!(
+                "{width} => self.w4a16_gemv_grouped_batchm_v2_k[{slot}]"
+            )),
+            "EXL3 does not select V2 slot {slot} for M={width}"
+        );
+    }
     assert!(EXL3_DISPATCH.contains("w4a16_gemv_grouped_batchm_v2"));
     assert!(EXL3_DISPATCH.contains("num_tokens * shared_inter"));
 }

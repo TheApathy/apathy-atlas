@@ -294,7 +294,9 @@ fn main() -> Result<()> {
 
     let time_kernel = |h: spark_runtime::gpu::KernelHandle| -> Result<f64> {
         for _ in 0..5 {
-            launch(&gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, window, ratio, stream)?;
+            launch(
+                &gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, window, ratio, stream,
+            )?;
         }
         gpu.synchronize(stream)?;
         let (mut e0, mut e1) = (0u64, 0u64);
@@ -304,7 +306,9 @@ fn main() -> Result<()> {
             cuEventRecord(e0, stream);
         }
         for _ in 0..ITERS {
-            launch(&gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, window, ratio, stream)?;
+            launch(
+                &gpu, h, qd, kd, kd, kcd, kcd, sd, od, s, n_comp, window, ratio, stream,
+            )?;
         }
         unsafe { cuEventRecord(e1, stream) };
         gpu.synchronize(stream)?;

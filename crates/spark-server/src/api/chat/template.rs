@@ -24,6 +24,35 @@ pub(super) struct TemplateOut {
     pub(super) thinking_budget: Option<u32>,
 }
 
+fn select_ds4_tool_call_reminder(
+    tools_active: bool,
+    parser_name: Option<&str>,
+    configured_min_bytes: Option<usize>,
+) -> Option<usize> {
+    (tools_active && parser_name == Some("dsml_v4"))
+        .then_some(configured_min_bytes)
+        .flatten()
+}
+
+/// Decide whether an auto-compaction trial can be reused as the final prompt.
+/// Below the configured threshold, the trial is already the exact tokenization
+/// we need; retaining it avoids a second full Jinja render and tokenizer pass.
+fn apply_auto_compact_trial(
+    json_messages: Vec<serde_json::Value>,
+    trial_tokens: Option<Vec<u32>>,
+    max_seq_len: usize,
+    threshold: f32,
+) -> (Vec<serde_json::Value>, Option<Vec<u32>>) {
+    match trial_tokens {
+        Some(tokens) if tokens.len() > (max_seq_len as f32 * threshold) as usize => {
+            let compacted = compact_messages(&json_messages, tokens.len(), max_seq_len);
+            (compacted, None)
+        }
+        Some(tokens) => (json_messages, Some(tokens)),
+        None => (json_messages, None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::result_large_err)]
 pub(super) fn render_template(
@@ -37,9 +66,22 @@ pub(super) fn render_template(
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
+    let tool_call_reminder_min_bytes = select_ds4_tool_call_reminder(
+        tools_active,
+        state.tool_call_parser.as_ref().map(|parser| parser.name()),
+        state.ds4_tool_call_reminder_min_bytes,
+    );
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let json_messages = build_json_messages(messages);
+    let has_images = !image_pad_counts.is_empty();
+    if image_pad_counts.contains(&0) {
+        return Err(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid zero image pad count".into(),
+        ));
+    }
+    let json_messages = build_json_messages(messages)
+        .map_err(|e| openai_error_response(StatusCode::BAD_REQUEST, e))?;
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
@@ -60,11 +102,11 @@ pub(super) fn render_template(
 
     // Progressive auto-compact (DISABLED BY DEFAULT 2026-04-25 —
     // see project_no_auto_compaction memory feedback).
-    let auto_compact_active = state
+    let (json_messages, pretokenized_prompt) = if let Some(threshold) = state
         .auto_compact_threshold
-        .map(|t| t > 0.0)
-        .unwrap_or(false);
-    let json_messages = if auto_compact_active && json_messages.len() > 4 {
+        .filter(|threshold| *threshold > 0.0)
+        .filter(|_| !has_images && json_messages.len() > 4)
+    {
         let trial_tokens = state
             .tokenizer
             .apply_chat_template_openai(
@@ -72,24 +114,23 @@ pub(super) fn render_template(
                 jinja_tools.as_deref(),
                 template_thinking,
                 state.behavior.disable_tool_steering,
+                tool_call_reminder_min_bytes,
             )
-            .map(|t| t.len())
-            .unwrap_or(0);
-        if trial_tokens > (state.max_seq_len as f32 * 0.70) as usize {
-            compact_messages(&json_messages, trial_tokens, state.max_seq_len)
-        } else {
-            json_messages
-        }
+            .ok();
+        apply_auto_compact_trial(json_messages, trial_tokens, state.max_seq_len, threshold)
     } else {
-        json_messages
+        (json_messages, None)
     };
 
-    let prompt_tokens = match state.tokenizer.apply_chat_template_openai(
-        &json_messages,
-        jinja_tools.as_deref(),
-        template_thinking,
-        state.behavior.disable_tool_steering,
-    ) {
+    let prompt_tokens = match pretokenized_prompt.map(Ok).unwrap_or_else(|| {
+        state.tokenizer.apply_chat_template_openai(
+            &json_messages,
+            jinja_tools.as_deref(),
+            template_thinking,
+            state.behavior.disable_tool_steering,
+            tool_call_reminder_min_bytes,
+        )
+    }) {
         Ok(t) => t,
         Err(e) => {
             return Err(openai_error_response(
@@ -142,28 +183,21 @@ pub(super) fn render_template(
 /// [`MsgEntry`] vec. Pure (no tokenizer/state) so it can be
 /// characterization-tested directly:
 ///   * `image_count == 0` → `content` is a plain string,
-///   * `image_count > 0`  → `content` is `[{type:image} * N, {type:text}]`
+///   * `image_count > 0`  → `content` is an ordered text/image marker array
 ///     (text part omitted when empty),
 ///   * `tool_calls` / `reasoning_content` attached when present.
 ///
 /// Roles arrive canonical (`developer` → `system` normalization happens
 /// at MsgEntry build time).
-pub(super) fn build_json_messages(messages: &[MsgEntry]) -> Vec<serde_json::Value> {
+pub(super) fn build_json_messages(messages: &[MsgEntry]) -> Result<Vec<serde_json::Value>, String> {
     messages
         .iter()
         .map(|m| {
-            let content_val = if m.image_count > 0 {
-                let mut items: Vec<serde_json::Value> = Vec::with_capacity(m.image_count + 1);
-                for _ in 0..m.image_count {
-                    items.push(serde_json::json!({"type": "image"}));
-                }
-                if !m.content.is_empty() {
-                    items.push(serde_json::json!({"type": "text", "text": m.content}));
-                }
-                serde_json::Value::Array(items)
-            } else {
-                serde_json::Value::String(m.content.clone())
-            };
+            let content_val = crate::openai::ParsedContent::marker_json(
+                &m.content,
+                m.image_count,
+                &m.image_text_offsets,
+            )?;
             // `developer` → `system` normalization happens upstream at
             // MsgEntry build time (msg_entry.rs), so the role arrives
             // canonical here.
@@ -181,7 +215,7 @@ pub(super) fn build_json_messages(messages: &[MsgEntry]) -> Vec<serde_json::Valu
             if let Some(ref rc) = m.reasoning_content {
                 msg["reasoning_content"] = serde_json::Value::String(rc.clone());
             }
-            msg
+            Ok(msg)
         })
         .collect()
 }
@@ -189,7 +223,9 @@ pub(super) fn build_json_messages(messages: &[MsgEntry]) -> Vec<serde_json::Valu
 #[cfg(test)]
 mod json_message_tests {
     use super::MsgEntry;
+    use super::apply_auto_compact_trial;
     use super::build_json_messages;
+    use super::select_ds4_tool_call_reminder;
 
     fn entry(role: &str, content: &str, image_count: usize) -> MsgEntry {
         MsgEntry {
@@ -197,8 +233,32 @@ mod json_message_tests {
             content: content.to_string(),
             tool_calls: None,
             image_count,
+            image_text_offsets: vec![0; image_count],
             reasoning_content: None,
         }
+    }
+
+    #[test]
+    fn auto_compact_reuses_trial_tokens_and_honors_configured_threshold() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "system"}),
+            serde_json::json!({"role": "user", "content": "one"}),
+            serde_json::json!({"role": "assistant", "content": "two"}),
+            serde_json::json!({"role": "user", "content": "three"}),
+            serde_json::json!({"role": "assistant", "content": "four"}),
+        ];
+        let trial = vec![7; 72];
+
+        let (unchanged, cached) =
+            apply_auto_compact_trial(messages.clone(), Some(trial.clone()), 100, 0.75);
+        assert_eq!(unchanged, messages);
+        assert_eq!(cached, Some(trial));
+
+        let (_compacted, cached) = apply_auto_compact_trial(messages, Some(vec![7; 72]), 100, 0.70);
+        assert!(
+            cached.is_none(),
+            "compacted prompts must be tokenized again"
+        );
     }
 
     /// PROMPT-STABILITY GATE. Characterization golden for the full
@@ -256,10 +316,10 @@ mod json_message_tests {
             text_msg(Role::User, "thanks"),
         ];
 
-        let out = super::super::msg_entry::build_msg_entries(None, None, &msgs, true, false)
+        let out = super::super::msg_entry::build_msg_entries(None, None, None, &msgs, true, false)
             .expect("fixture builds");
         assert_eq!(out.cwd_hint.as_deref(), Some("/tmp/proj"));
-        let json = build_json_messages(&out.messages);
+        let json = build_json_messages(&out.messages).unwrap();
 
         let expected = serde_json::json!([
             {
@@ -290,7 +350,7 @@ mod json_message_tests {
 
     #[test]
     fn plain_text_message_serializes_to_string_content() {
-        let out = build_json_messages(&[entry("user", "hi", 0)]);
+        let out = build_json_messages(&[entry("user", "hi", 0)]).unwrap();
         assert_eq!(
             out,
             vec![serde_json::json!({"role": "user", "content": "hi"})]
@@ -299,7 +359,7 @@ mod json_message_tests {
 
     #[test]
     fn images_expand_to_structured_content_array_with_text_last() {
-        let out = build_json_messages(&[entry("user", "look", 2)]);
+        let out = build_json_messages(&[entry("user", "look", 2)]).unwrap();
         assert_eq!(
             out,
             vec![serde_json::json!({
@@ -315,7 +375,7 @@ mod json_message_tests {
 
     #[test]
     fn empty_text_with_images_omits_text_part() {
-        let out = build_json_messages(&[entry("user", "", 1)]);
+        let out = build_json_messages(&[entry("user", "", 1)]).unwrap();
         assert_eq!(
             out,
             vec![serde_json::json!({"role": "user", "content": [{"type": "image"}]})]
@@ -327,7 +387,7 @@ mod json_message_tests {
         let mut e = entry("assistant", "", 0);
         e.tool_calls = Some(vec![serde_json::json!({"id": "c1"})]);
         e.reasoning_content = Some("because".to_string());
-        let out = build_json_messages(&[e]);
+        let out = build_json_messages(&[e]).unwrap();
         assert_eq!(
             out,
             vec![serde_json::json!({
@@ -336,6 +396,28 @@ mod json_message_tests {
                 "tool_calls": [{"id": "c1"}],
                 "reasoning_content": "because"
             })]
+        );
+    }
+
+    #[test]
+    fn ds4_reminder_request_routing_requires_tools_dsml_and_opt_in() {
+        let configured = Some(98_304);
+        assert_eq!(
+            select_ds4_tool_call_reminder(true, Some("dsml_v4"), configured),
+            configured
+        );
+        assert_eq!(
+            select_ds4_tool_call_reminder(false, Some("dsml_v4"), configured),
+            None
+        );
+        assert_eq!(
+            select_ds4_tool_call_reminder(true, Some("hermes"), configured),
+            None
+        );
+        assert_eq!(select_ds4_tool_call_reminder(true, None, configured), None);
+        assert_eq!(
+            select_ds4_tool_call_reminder(true, Some("dsml_v4"), None),
+            None
         );
     }
 }

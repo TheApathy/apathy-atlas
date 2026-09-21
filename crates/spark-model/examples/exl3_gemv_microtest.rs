@@ -31,6 +31,13 @@
 //!   7. FULL PREFILL PATH (pre → chunked dequant + sub-range
 //!      `moe_bf16_grouped_gemm` → post) COSINE >= 0.999 vs the f64 full-
 //!      pipeline reference at M=64 (per-row expert routing, gathered A).
+//!   P2. DIRECT GROUPED PREFILL == P1, BYTE-IDENTICAL for K2 and K3 at
+//!      1/63/64/65/129 routed rows per expert. Different poison bytes ensure
+//!      unwritten output cannot compare equal.
+//!   P2-POST. FUSED H128-POST + SWIGLU + DOWN H128-PRE == the four-kernel
+//!      composition, BYTE-IDENTICAL with distinct per-expert sign vectors.
+//!   P2-TAIL. FUSED DOWN H128-POST + INDEXED UNPERMUTE == the two-kernel
+//!      composition, BYTE-IDENTICAL with nontrivial routing and weights.
 //!
 //! Fused decode-dispatch gate (the launch collapse in `exl3_decode.rs`):
 //!   8. FUSED == PER-SLOT, BYTE-IDENTICAL. The same synthetic experts and
@@ -47,7 +54,7 @@
 //!
 //! Trellis bytes counted for GB/s: N*K*3/8 + (N+K)*2 (payload + suh/svh).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use half::bf16;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -91,11 +98,7 @@ impl Rng {
     }
     fn sign_f16(&mut self) -> u16 {
         // +1.0 / -1.0 in fp16 — the EXL3 suh/svh are random sign vectors.
-        if self.next() & 1 == 0 {
-            0x3C00
-        } else {
-            0xBC00
-        }
+        if self.next() & 1 == 0 { 0x3C00 } else { 0xBC00 }
     }
 }
 
@@ -608,18 +611,613 @@ fn main() -> Result<()> {
     }
 
     all_ok &= prefill_gates(g, &lut)?;
+    all_ok &= direct_prefill_parity_gate(g)?;
+    all_ok &= fused_post_silu_gate(g)?;
+    all_ok &= fused_post_unpermute_gate(g)?;
     all_ok &= fused_decode_gate(g)?;
     all_ok &= mrow_verify_gate(g)?;
 
     eprintln!(
         "EXL3 GEMV GATE (bit-exact dequant + cos>={PASS_COS} + determinism + P1 prefill \
-         + fused decode byte-identity + m-row verify byte-identity): {}",
+         + P2 direct/post byte-identity + fused decode byte-identity + m-row verify byte-identity): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {
         std::process::exit(1);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fused final down-post + indexed unpermute parity. The legacy composition
+// materializes rotated BF16 rows before weighting; the fused kernel must keep
+// that rounding boundary and the top-k accumulation order exactly.
+// ---------------------------------------------------------------------------
+
+fn fused_post_unpermute_gate(g: &dyn GpuBackend) -> Result<bool> {
+    let stream = 0u64;
+    let (tokens, topk, rows, h, ne) = (3usize, 4usize, 12usize, 256usize, 5usize);
+    let sorted_ids = [4i32, 1, 3, 0, 2, 4, 1, 0, 3, 2, 1, 4];
+    let token_to_perm = [3i32, 8, 1, 10, 0, 11, 5, 2, 9, 4, 7, 6];
+    let weights = [
+        0.11f32, 0.29, 0.37, 0.23, 0.41, 0.07, 0.31, 0.21, 0.19, 0.17, 0.47, 0.17,
+    ];
+    let ints = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let floats = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let d_sorted_ids = up(g, &ints(&sorted_ids))?;
+    let d_token_to_perm = up(g, &ints(&token_to_perm))?;
+    let d_weights = up(g, &floats(&weights))?;
+
+    let mut rng = Rng(0x7A11_D518_2026_0827);
+    let svh: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..h).map(|_| rng.sign_f16()).collect())
+        .collect();
+    let bf16_bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let d_svh: Vec<DevicePtr> = svh
+        .iter()
+        .map(|v| up(g, &bf16_bytes(v)))
+        .collect::<Result<_>>()?;
+    let svh_tab: Vec<u8> = d_svh.iter().flat_map(|p| p.0.to_le_bytes()).collect();
+    let d_svh_tab = up(g, &svh_tab)?;
+    let raw: Vec<u16> = (0..rows * h)
+        .map(|_| bf16::from_f32((rng.unit() - 0.5) * 20.0).to_bits())
+        .collect();
+    let raw_b = bf16_bytes(&raw);
+    let d_composed_rows = up(g, &raw_b)?;
+    let d_fused_rows = up(g, &raw_b)?;
+    let out_bytes = tokens * h * 2;
+    let d_composed_out = g.alloc(out_bytes)?;
+    let d_fused_out = g.alloc(out_bytes)?;
+    g.memset(d_composed_out, 0xA5, out_bytes)?;
+    g.memset(d_fused_out, 0x5A, out_bytes)?;
+
+    let kh_post = g.kernel("exl3_gemv", "exl3_h128_post_rows")?;
+    let kh_unpermute = g.kernel("moe", "moe_unpermute_reduce_indexed")?;
+    let kh_fused = g.kernel("exl3_gemv", "exl3_h128_post_unpermute_rows")?;
+    KernelLaunch::new(g, kh_post)
+        .grid([rows as u32, (h as u32).div_ceil(1024), 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_composed_rows)
+        .arg_ptr(d_sorted_ids)
+        .arg_ptr(d_svh_tab)
+        .arg_u32(h as u32)
+        .launch(stream)?;
+    KernelLaunch::new(g, kh_unpermute)
+        .grid([tokens as u32, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_composed_rows)
+        .arg_ptr(d_composed_out)
+        .arg_ptr(d_token_to_perm)
+        .arg_ptr(d_weights)
+        .arg_u32(h as u32)
+        .arg_u32(tokens as u32)
+        .arg_u32(topk as u32)
+        .launch(stream)?;
+    KernelLaunch::new(g, kh_fused)
+        .grid([tokens as u32, (h as u32).div_ceil(1024), 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_fused_rows)
+        .arg_ptr(d_fused_out)
+        .arg_ptr(d_token_to_perm)
+        .arg_ptr(d_weights)
+        .arg_ptr(d_sorted_ids)
+        .arg_ptr(d_svh_tab)
+        .arg_u32(h as u32)
+        .arg_u32(tokens as u32)
+        .arg_u32(topk as u32)
+        .launch(stream)?;
+    g.synchronize(stream)?;
+
+    let mut composed = vec![0u8; out_bytes];
+    let mut fused = vec![0u8; out_bytes];
+    g.copy_d2h(d_composed_out, &mut composed)?;
+    g.copy_d2h(d_fused_out, &mut fused)?;
+    let diff = composed.iter().zip(&fused).filter(|(a, b)| a != b).count();
+    let nontrivial = composed.iter().any(|&x| x != 0xA5) && fused.iter().any(|&x| x != 0x5A);
+    let pass = diff == 0 && nontrivial;
+    eprintln!(
+        "P2 TAIL post-unpermute fused==composed: diff={diff}/{out_bytes} \
+         tokens={tokens} topk={topk} nontrivial={nontrivial} {}",
+        if pass { "PASS" } else { "FAIL" }
+    );
+
+    for p in d_svh.into_iter().chain([
+        d_sorted_ids,
+        d_token_to_perm,
+        d_weights,
+        d_svh_tab,
+        d_composed_rows,
+        d_fused_rows,
+        d_composed_out,
+        d_fused_out,
+    ]) {
+        let _ = g.free(p);
+    }
+    Ok(pass)
+}
+
+// ---------------------------------------------------------------------------
+// Fused P2 post+SwiGLU gate: compare the new single pass with the exact
+// post(gate/up) + moe_silu_mul + down pre-rotation composition it replaces.
+// ---------------------------------------------------------------------------
+
+const FUSED_POST_GUARD_BYTES: usize = 256;
+
+struct FusedPostGuard {
+    base: DevicePtr,
+    data: DevicePtr,
+    data_bytes: usize,
+}
+
+fn fused_post_guarded_up(g: &dyn GpuBackend, data: &[u8]) -> Result<FusedPostGuard> {
+    let total = data.len() + 2 * FUSED_POST_GUARD_BYTES;
+    let base = g.alloc(total)?;
+    g.memset(base, 0xA5, FUSED_POST_GUARD_BYTES)?;
+    let data_ptr = DevicePtr(base.0 + FUSED_POST_GUARD_BYTES as u64);
+    g.copy_h2d(data, data_ptr)?;
+    let suffix = DevicePtr(data_ptr.0 + data.len() as u64);
+    g.memset(suffix, 0x5A, FUSED_POST_GUARD_BYTES)?;
+    Ok(FusedPostGuard {
+        base,
+        data: data_ptr,
+        data_bytes: data.len(),
+    })
+}
+
+fn fused_post_canary_ok(g: &dyn GpuBackend, guarded: &FusedPostGuard) -> Result<bool> {
+    let mut prefix = vec![0u8; FUSED_POST_GUARD_BYTES];
+    let mut suffix = vec![0u8; FUSED_POST_GUARD_BYTES];
+    g.copy_d2h(guarded.base, &mut prefix)?;
+    g.copy_d2h(
+        DevicePtr(guarded.data.0 + guarded.data_bytes as u64),
+        &mut suffix,
+    )?;
+    Ok(prefix.iter().all(|&byte| byte == 0xA5) && suffix.iter().all(|&byte| byte == 0x5A))
+}
+
+fn fused_post_silu_case(
+    g: &dyn GpuBackend,
+    label: &str,
+    tokens: usize,
+    topk: usize,
+    n: usize,
+    ne: usize,
+    seed: u64,
+) -> Result<bool> {
+    let stream = 0u64;
+    let rows = tokens * topk;
+    let ids: Vec<i32> = (0..rows)
+        .map(|row| ((row * 131 + row / 7) % ne) as i32)
+        .collect();
+    let ids_b: Vec<u8> = ids.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let d_ids = up(g, &ids_b)?;
+    let mut rng = Rng(seed);
+    let gate_svh: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..n).map(|_| rng.sign_f16()).collect())
+        .collect();
+    let up_svh: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..n).map(|_| rng.sign_f16()).collect())
+        .collect();
+    let down_suh: Vec<Vec<u16>> = (0..ne)
+        .map(|_| (0..n).map(|_| rng.sign_f16()).collect())
+        .collect();
+    let bytes = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let d_gate_svh: Vec<DevicePtr> = gate_svh
+        .iter()
+        .map(|v| up(g, &bytes(v)))
+        .collect::<Result<_>>()?;
+    let d_up_svh: Vec<DevicePtr> = up_svh
+        .iter()
+        .map(|v| up(g, &bytes(v)))
+        .collect::<Result<_>>()?;
+    let d_down_suh: Vec<DevicePtr> = down_suh
+        .iter()
+        .map(|v| up(g, &bytes(v)))
+        .collect::<Result<_>>()?;
+    let ptrs = |v: &[DevicePtr]| -> Vec<u8> { v.iter().flat_map(|p| p.0.to_le_bytes()).collect() };
+    let d_gate_svh_tab = up(g, &ptrs(&d_gate_svh))?;
+    let d_up_svh_tab = up(g, &ptrs(&d_up_svh))?;
+    let d_down_suh_tab = up(g, &ptrs(&d_down_suh))?;
+
+    // Wide raw GEMM-like values exercise both clamp edges after H128.
+    let gate_h: Vec<u16> = (0..rows * n)
+        .map(|_| bf16::from_f32((rng.unit() - 0.5) * 40.0).to_bits())
+        .collect();
+    let up_h: Vec<u16> = (0..rows * n)
+        .map(|_| bf16::from_f32((rng.unit() - 0.5) * 40.0).to_bits())
+        .collect();
+    let gate_b = bytes(&gate_h);
+    let up_b = bytes(&up_h);
+    let d_comp_gate = fused_post_guarded_up(g, &gate_b)?;
+    let d_comp_up = fused_post_guarded_up(g, &up_b)?;
+    let d_fused_gate = fused_post_guarded_up(g, &gate_b)?;
+    let d_fused_up = fused_post_guarded_up(g, &up_b)?;
+    let kh_post = g.kernel("exl3_gemv", "exl3_h128_post_rows")?;
+    let kh_pre = g.kernel("exl3_gemv", "exl3_h128_pre_rows")?;
+    let kh_fused = g.kernel("exl3_gemv", "exl3_h128_post_silu_pre_rows")?;
+    let kh_silu = g.kernel("moe_silu_mul", "moe_silu_mul")?;
+
+    for (buf, tab) in [
+        (d_comp_gate.data, d_gate_svh_tab),
+        (d_comp_up.data, d_up_svh_tab),
+    ] {
+        KernelLaunch::new(g, kh_post)
+            .grid([rows as u32, (n as u32).div_ceil(1024), 1])
+            .block([256, 1, 1])
+            .arg_ptr(buf)
+            .arg_ptr(d_ids)
+            .arg_ptr(tab)
+            .arg_u32(n as u32)
+            .launch(stream)?;
+    }
+    KernelLaunch::new(g, kh_silu)
+        .grid([((rows * n) as u32).div_ceil(256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_comp_gate.data)
+        .arg_ptr(d_comp_up.data)
+        .arg_ptr(d_comp_gate.data)
+        .arg_u32((rows * n) as u32)
+        .launch(stream)?;
+    KernelLaunch::new(g, kh_pre)
+        .grid([rows as u32, (n as u32).div_ceil(1024), 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_comp_gate.data)
+        .arg_ptr(DevicePtr(0))
+        .arg_ptr(d_ids)
+        .arg_ptr(d_down_suh_tab)
+        .arg_ptr(d_comp_gate.data)
+        .arg_u32(n as u32)
+        .launch(stream)?;
+    KernelLaunch::new(g, kh_fused)
+        .grid([rows as u32, (n as u32).div_ceil(1024), 1])
+        .block([256, 1, 1])
+        .arg_ptr(d_fused_gate.data)
+        .arg_ptr(d_fused_up.data)
+        .arg_ptr(d_ids)
+        .arg_ptr(d_gate_svh_tab)
+        .arg_ptr(d_up_svh_tab)
+        .arg_ptr(d_down_suh_tab)
+        .arg_u32(n as u32)
+        .launch(stream)?;
+    g.synchronize(stream)?;
+
+    let mut composed = vec![0u8; rows * n * 2];
+    let mut fused = vec![0u8; rows * n * 2];
+    g.copy_d2h(d_comp_gate.data, &mut composed)?;
+    g.copy_d2h(d_fused_gate.data, &mut fused)?;
+    let diff = composed.iter().zip(&fused).filter(|(a, b)| a != b).count();
+    let nontrivial = composed != gate_b;
+    let canary_ok = [&d_comp_gate, &d_comp_up, &d_fused_gate, &d_fused_up]
+        .into_iter()
+        .try_fold(true, |ok, guarded| {
+            Ok::<_, anyhow::Error>(ok && fused_post_canary_ok(g, guarded)?)
+        })?;
+    let pass = diff == 0 && nontrivial && canary_ok;
+    eprintln!(
+        "P2 POST {label} fused==composed byte-identical: tokens={tokens} topk={topk} \
+         experts={ne} rows={rows} n={n} diff={diff}/{} nontrivial={nontrivial} \
+         canary={}: {}",
+        composed.len(),
+        if canary_ok { "clean" } else { "CORRUPT" },
+        if pass { "PASS" } else { "FAIL" }
+    );
+
+    for p in d_gate_svh
+        .into_iter()
+        .chain(d_up_svh)
+        .chain(d_down_suh)
+        .chain([d_ids, d_gate_svh_tab, d_up_svh_tab, d_down_suh_tab])
+    {
+        let _ = g.free(p);
+    }
+    for guarded in [d_comp_gate, d_comp_up, d_fused_gate, d_fused_up] {
+        let _ = g.free(guarded.base);
+    }
+    Ok(pass)
+}
+
+fn fused_post_silu_gate(g: &dyn GpuBackend) -> Result<bool> {
+    let small = fused_post_silu_case(g, "hostile-small", 5, 1, 256, 3, 0xF05E_D518_2026_0827)?;
+    let production = fused_post_silu_case(
+        g,
+        "production-n2048-topk6-e256",
+        2048,
+        6,
+        2048,
+        256,
+        0xF05E_D518_2026_0908,
+    )?;
+    Ok(small && production)
+}
+
+// ---------------------------------------------------------------------------
+// P2 direct grouped-prefill parity: compare the global-BF16 P1 composition
+// with direct trellis-to-fragment P2. The compact N=64, K=128 shape preserves
+// the production tile geometry while covering both encodings and M64 edges.
+// This is compiled offline but intentionally runs only in the GPU microtest.
+// ---------------------------------------------------------------------------
+
+fn direct_prefill_parity_gate(g: &dyn GpuBackend) -> Result<bool> {
+    let stream = 0u64;
+    let counts = [1usize, 63, 64, 65, 129];
+    let ne = counts.len();
+    let (n, k) = (64usize, 128usize);
+    let rows: usize = counts.iter().sum();
+    let mut offsets = Vec::with_capacity(ne + 1);
+    offsets.push(0i32);
+    for count in counts {
+        offsets.push(offsets.last().copied().unwrap() + count as i32);
+    }
+    let offsets_b: Vec<u8> = offsets.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let d_offsets = up(g, &offsets_b)?;
+    let mut rng = Rng(0xD1EC_7F11_2026_0827);
+    let a: Vec<u16> = (0..rows * k)
+        .map(|_| bf16::from_f32((rng.unit() - 0.5) * 0.5).to_bits())
+        .collect();
+    let a_b: Vec<u8> = a.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let d_a = up(g, &a_b)?;
+    let out_bytes = rows * n * 2;
+    let d_p1 = g.alloc(out_bytes)?;
+    let d_p2 = g.alloc(out_bytes)?;
+    let kh_dq = g.kernel("exl3_gemv", "exl3_dequant_chunk_bf16")?;
+    let kh_gemm = g.kernel("moe_bf16_grouped_gemm", "moe_bf16_grouped_gemm")?;
+    let kh_direct = g.kernel("exl3_grouped_prefill", "exl3_grouped_prefill")?;
+    let kh_direct_k2 = g.kernel("exl3_grouped_prefill_k2", "exl3_grouped_prefill_k2")?;
+    let kh_direct_k64 = g.kernel("exl3_grouped_prefill_k64", "exl3_grouped_prefill_k64")?;
+    let kh_direct_k64_k2 =
+        g.kernel("exl3_grouped_prefill_k64_k2", "exl3_grouped_prefill_k64_k2")?;
+    let kh_direct_m128 = g.kernel("exl3_grouped_prefill_m128", "exl3_grouped_prefill_m128")?;
+    let max_m_tiles = counts.into_iter().max().unwrap().div_ceil(64) as u32;
+    let max_m128_tiles = counts.into_iter().max().unwrap().div_ceil(128) as u32;
+    let mut ok = true;
+
+    for bits in [2usize, 3] {
+        let words_per_expert = (k / 16) * (n / 16) * (16 * bits);
+        let trellis_h: Vec<Vec<u16>> = (0..ne)
+            .map(|_| (0..words_per_expert).map(|_| rng.u16()).collect())
+            .collect();
+        let trellis_b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let d_trellis: Vec<DevicePtr> = trellis_h
+            .iter()
+            .map(|v| up(g, &trellis_b(v)))
+            .collect::<Result<_>>()?;
+        let ptr_tab: Vec<u8> = d_trellis.iter().flat_map(|p| p.0.to_le_bytes()).collect();
+        let d_trellis_tab = up(g, &ptr_tab)?;
+        let slot_bytes = n * k * 2;
+        let d_scratch = g.alloc(ne * slot_bytes)?;
+        let slot_tab: Vec<u8> = (0..ne)
+            .flat_map(|e| (d_scratch.0 + (e * slot_bytes) as u64).to_le_bytes())
+            .collect();
+        let d_slot_tab = up(g, &slot_tab)?;
+
+        g.memset(d_p1, 0xA5, out_bytes)?;
+        g.memset(d_p2, 0x5A, out_bytes)?;
+        KernelLaunch::new(g, kh_dq)
+            .grid([(n / 16) as u32, (k / 16) as u32, ne as u32])
+            .block([32, 1, 1])
+            .arg_ptr(d_trellis_tab)
+            .arg_u32(0)
+            .arg_u32(ne as u32)
+            .arg_ptr(d_scratch)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(bits as u32)
+            .launch(stream)?;
+        KernelLaunch::new(g, kh_gemm)
+            .grid([(n / 64) as u32, max_m_tiles, ne as u32])
+            .block([128, 1, 1])
+            .arg_ptr(d_a)
+            .arg_ptr(d_slot_tab)
+            .arg_ptr(d_p1)
+            .arg_ptr(d_offsets)
+            .arg_ptr(DevicePtr(0))
+            .arg_u32(ne as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .launch(stream)?;
+        KernelLaunch::new(g, kh_direct)
+            .grid([(n / 64) as u32, max_m_tiles, ne as u32])
+            .block([128, 1, 1])
+            .arg_ptr(d_a)
+            .arg_ptr(d_trellis_tab)
+            .arg_ptr(d_p2)
+            .arg_ptr(d_offsets)
+            .arg_ptr(DevicePtr(0))
+            .arg_u32(ne as u32)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(bits as u32)
+            .arg_u32(0)
+            .launch(stream)?;
+        g.synchronize(stream)?;
+
+        let mut p1 = vec![0u8; out_bytes];
+        let mut p2 = vec![0u8; out_bytes];
+        g.copy_d2h(d_p1, &mut p1)?;
+        g.copy_d2h(d_p2, &mut p2)?;
+        let diff = p1.iter().zip(&p2).filter(|(a, b)| a != b).count();
+        let nontrivial = p1.iter().any(|&x| x != 0xA5) && p2.iter().any(|&x| x != 0x5A);
+        let pass = diff == 0 && nontrivial;
+        ok &= pass;
+        eprintln!(
+            "P2 PREFILL K{bits} direct==P1: diff={diff}/{out_bytes} \
+             rows=1/63/64/65/129 nontrivial={nontrivial} {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+
+        // Cover both the deliberately undersubscribed grid-stride mapping and
+        // production's one-CTA-per-strip compact grid.
+        for (label, grid, sentinel) in [
+            ("persistent-strided", [7, 1, 1], 0x3C),
+            ("persistent-full", [(ne * (n / 64)) as u32, 1, 1], 0x2C),
+        ] {
+            g.memset(d_p2, sentinel, out_bytes)?;
+            KernelLaunch::new(g, kh_direct)
+                .grid(grid)
+                .block([128, 1, 1])
+                .arg_ptr(d_a)
+                .arg_ptr(d_trellis_tab)
+                .arg_ptr(d_p2)
+                .arg_ptr(d_offsets)
+                .arg_ptr(DevicePtr(0))
+                .arg_u32(ne as u32)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .arg_u32(bits as u32)
+                .arg_u32(1)
+                .launch(stream)?;
+            g.synchronize(stream)?;
+            g.copy_d2h(d_p2, &mut p2)?;
+            let persistent_diff = p1.iter().zip(&p2).filter(|(a, b)| a != b).count();
+            let persistent_nontrivial = p2.iter().any(|&x| x != sentinel);
+            let persistent_pass = persistent_diff == 0 && persistent_nontrivial;
+            ok &= persistent_pass;
+            eprintln!(
+                "P2 PREFILL K{bits} {label}==P1: diff={persistent_diff}/{out_bytes} \
+                 ctas={} rows=1/63/64/65/129 nontrivial={persistent_nontrivial} {}",
+                grid[0],
+                if persistent_pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        for (label, grid, persistent_mode) in [
+            ("k64-exact", [(n / 64) as u32, max_m_tiles, ne as u32], 0),
+            ("k64-persistent-strided", [7, 1, 1], 1),
+            ("k64-persistent-full", [(ne * (n / 64)) as u32, 1, 1], 1),
+        ] {
+            g.memset(d_p2, 0x4D, out_bytes)?;
+            KernelLaunch::new(g, kh_direct_k64)
+                .grid(grid)
+                .block([128, 1, 1])
+                .arg_ptr(d_a)
+                .arg_ptr(d_trellis_tab)
+                .arg_ptr(d_p2)
+                .arg_ptr(d_offsets)
+                .arg_ptr(DevicePtr(0))
+                .arg_u32(ne as u32)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .arg_u32(bits as u32)
+                .arg_u32(persistent_mode)
+                .launch(stream)?;
+            g.synchronize(stream)?;
+            g.copy_d2h(d_p2, &mut p2)?;
+            let k64_diff = p1.iter().zip(&p2).filter(|(a, b)| a != b).count();
+            let k64_nontrivial = p2.iter().any(|&x| x != 0x4D);
+            let k64_pass = k64_diff == 0 && k64_nontrivial;
+            ok &= k64_pass;
+            eprintln!(
+                "P2 PREFILL K{bits} {label}==P1: diff={k64_diff}/{out_bytes} \
+                 rows=1/63/64/65/129 nontrivial={k64_nontrivial} {}",
+                if k64_pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        if bits == 2 {
+            for (label, kernel, grid, persistent_mode) in [
+                (
+                    "k2-fixed-exact",
+                    kh_direct_k2,
+                    [(n / 64) as u32, max_m_tiles, ne as u32],
+                    0,
+                ),
+                (
+                    "k2-fixed-persistent-full",
+                    kh_direct_k2,
+                    [(ne * (n / 64)) as u32, 1, 1],
+                    1,
+                ),
+                (
+                    "k64-k2-fixed-exact",
+                    kh_direct_k64_k2,
+                    [(n / 64) as u32, max_m_tiles, ne as u32],
+                    0,
+                ),
+                (
+                    "k64-k2-fixed-persistent-full",
+                    kh_direct_k64_k2,
+                    [(ne * (n / 64)) as u32, 1, 1],
+                    1,
+                ),
+            ] {
+                g.memset(d_p2, 0x6B, out_bytes)?;
+                KernelLaunch::new(g, kernel)
+                    .grid(grid)
+                    .block([128, 1, 1])
+                    .arg_ptr(d_a)
+                    .arg_ptr(d_trellis_tab)
+                    .arg_ptr(d_p2)
+                    .arg_ptr(d_offsets)
+                    .arg_ptr(DevicePtr(0))
+                    .arg_u32(ne as u32)
+                    .arg_u32(n as u32)
+                    .arg_u32(k as u32)
+                    .arg_u32(bits as u32)
+                    .arg_u32(persistent_mode)
+                    .launch(stream)?;
+                g.synchronize(stream)?;
+                g.copy_d2h(d_p2, &mut p2)?;
+                let fixed_diff = p1.iter().zip(&p2).filter(|(a, b)| a != b).count();
+                let fixed_nontrivial = p2.iter().any(|&x| x != 0x6B);
+                let fixed_pass = fixed_diff == 0 && fixed_nontrivial;
+                ok &= fixed_pass;
+                eprintln!(
+                    "P2 PREFILL {label}==P1: diff={fixed_diff}/{out_bytes} \
+                     rows=1/63/64/65/129 nontrivial={fixed_nontrivial} {}",
+                    if fixed_pass { "PASS" } else { "FAIL" }
+                );
+            }
+        }
+
+        for (label, grid, persistent_mode) in [
+            (
+                "m128-exact",
+                [(n / 64) as u32, max_m128_tiles, ne as u32],
+                0,
+            ),
+            ("m128-persistent", [7, 1, 1], 1),
+            ("m128-persistent-full", [(ne * (n / 64)) as u32, 1, 1], 1),
+        ] {
+            g.memset(d_p2, 0xC3, out_bytes)?;
+            KernelLaunch::new(g, kh_direct_m128)
+                .grid(grid)
+                .block([256, 1, 1])
+                .arg_ptr(d_a)
+                .arg_ptr(d_trellis_tab)
+                .arg_ptr(d_p2)
+                .arg_ptr(d_offsets)
+                .arg_ptr(DevicePtr(0))
+                .arg_u32(ne as u32)
+                .arg_u32(n as u32)
+                .arg_u32(k as u32)
+                .arg_u32(bits as u32)
+                .arg_u32(persistent_mode)
+                .launch(stream)?;
+            g.synchronize(stream)?;
+            g.copy_d2h(d_p2, &mut p2)?;
+            let m128_diff = p1.iter().zip(&p2).filter(|(a, b)| a != b).count();
+            let m128_nontrivial = p2.iter().any(|&x| x != 0xC3);
+            let m128_pass = m128_diff == 0 && m128_nontrivial;
+            ok &= m128_pass;
+            eprintln!(
+                "P2 PREFILL K{bits} {label}==P1: diff={m128_diff}/{out_bytes} \
+                 rows=1/63/64/65/129 nontrivial={m128_nontrivial} {}",
+                if m128_pass { "PASS" } else { "FAIL" }
+            );
+        }
+
+        for p in d_trellis
+            .into_iter()
+            .chain([d_trellis_tab, d_scratch, d_slot_tab])
+        {
+            let _ = g.free(p);
+        }
+    }
+
+    for p in [d_offsets, d_a, d_p1, d_p2] {
+        let _ = g.free(p);
+    }
+    Ok(ok)
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,12 +1976,35 @@ const MROW_WIDTHS: [usize; 5] = [2, 4, 6, 8, 16];
 
 #[allow(clippy::too_many_lines)]
 fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
+    let mut ok = true;
+    for (module, bits, quant_label) in [("exl3_gemv", 3usize, "K3"), ("exl3_gemv_k2", 2usize, "K2")]
+    {
+        // Each quant lane allocates, validates, and frees its synthetic expert
+        // tables before the next lane starts, so K2 does not double peak VRAM.
+        ok &= mrow_verify_quant_gate(g, module, bits, quant_label)?;
+    }
+    Ok(ok)
+}
+
+#[allow(clippy::too_many_lines)]
+fn mrow_verify_quant_gate(
+    g: &dyn GpuBackend,
+    module: &str,
+    bits: usize,
+    quant_label: &str,
+) -> Result<bool> {
     let stream = 0u64;
     let (h, inter) = (4096usize, 2048usize);
     let (top_k, ne) = (FUSED_TOP_K, FUSED_NE);
 
-    let kh_gu_1 = g.kernel("exl3_gemv", "exl3_gemv_m1_fused_gate_up")?;
-    let kh_dn_1 = g.kernel("exl3_gemv", "exl3_gemv_m1_fused_down")?;
+    let kh_gu_1 = g.kernel(module, "exl3_gemv_m1_fused_gate_up")?;
+    let kh_dn_1 = g.kernel(module, "exl3_gemv_m1_fused_down")?;
+    let kh_work_build_m6 = g.kernel(module, "exl3_build_m6_worklist")?;
+    let kh_work_gu_m6 = g.kernel(module, "exl3_gemv_mrow_persistent_gate_up_m6")?;
+    let kh_work_dn_m6 = g.kernel(module, "exl3_gemv_mrow_persistent_down_m6")?;
+    let kh_work_build_m16 = g.kernel(module, "exl3_build_m16_worklist")?;
+    let kh_work_gu_m16 = g.kernel(module, "exl3_gemv_mrow_persistent_gate_up_m16")?;
+    let kh_work_dn_m16 = g.kernel(module, "exl3_gemv_mrow_persistent_down_m16")?;
     let kh_silu = g.kernel("moe_silu_mul", "moe_silu_mul")?;
 
     let to_b = |v: &[u16]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
@@ -1391,7 +2012,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
     let mut owned: Vec<DevicePtr> = Vec::new();
 
     let build = |r: &mut Rng, owned: &mut Vec<DevicePtr>, n: usize, k: usize| -> Result<ProjTabs> {
-        let words = (k / 16) * (n / 16) * 48;
+        let words = (k / 16) * (n / 16) * (16 * bits);
         let (mut tp, mut sup, mut svp) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..ne {
             let t: Vec<u16> = (0..words).map(|_| r.u16()).collect();
@@ -1477,6 +2098,10 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
     let d_ws = g.alloc(ws_floats * 4)?;
     let d_cnt = g.alloc(cnt_ints * 4)?;
     g.memset(d_cnt, 0, cnt_ints * 4)?;
+    // One allocation serves both exact ABIs. M6 still uses capacity 36 and a
+    // 32-byte record stride; M16 uses capacity 96 and an 80-byte stride.
+    let d_worklist = g.alloc(96 * 80)?;
+    let d_work_state = g.alloc(16)?;
 
     let mut ok = true;
     for &m in &MROW_WIDTHS {
@@ -1492,8 +2117,8 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .collect::<Vec<u8>>(),
         )?;
 
-        let kh_gu_m = g.kernel("exl3_gemv", &format!("exl3_gemv_mrow_fused_gate_up_m{m}"))?;
-        let kh_dn_m = g.kernel("exl3_gemv", &format!("exl3_gemv_mrow_fused_down_m{m}"))?;
+        let kh_gu_m = g.kernel(module, &format!("exl3_gemv_mrow_fused_gate_up_m{m}"))?;
+        let kh_dn_m = g.kernel(module, &format!("exl3_gemv_mrow_fused_down_m{m}"))?;
 
         // ---- Path A: the m-row dedup'd dispatch (3 launches for ALL rows) ----
         let mrow = |g: &dyn GpuBackend| -> Result<()> {
@@ -1519,7 +2144,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_u32(h as u32)
                 .arg_u32(top_k as u32)
                 .arg_u32(m as u32)
-                .arg_u32(3)
+                .arg_u32(bits as u32)
                 .launch(stream)?;
             launch_silu(
                 g,
@@ -1545,7 +2170,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_u32(inter as u32)
                 .arg_u32(top_k as u32)
                 .arg_u32(m as u32)
-                .arg_u32(3)
+                .arg_u32(bits as u32)
                 .launch(stream)?;
             g.synchronize(stream)
         };
@@ -1588,7 +2213,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(d_cnt)
                 .arg_u32(inter as u32)
                 .arg_u32(h as u32)
-                .arg_u32(3)
+                .arg_u32(bits as u32)
                 .launch(stream)?;
             launch_silu(
                 g,
@@ -1612,7 +2237,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(d_cnt)
                 .arg_u32(h as u32)
                 .arg_u32(inter as u32)
-                .arg_u32(3)
+                .arg_u32(bits as u32)
                 .launch(stream)?;
         }
         g.synchronize(stream)?;
@@ -1647,7 +2272,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         let g9 = bad.is_empty() && nontrivial;
         ok &= g9;
         eprintln!(
-            "MROW GATE9 m={m}: every row byte-identical to the m=1 fused path \
+            "MROW GATE9 {quant_label} m={m}: every row byte-identical to the m=1 fused path \
              (rows={m} slots={total_routed}, drifted rows={bad:?}, \
              gate={dg:?} up={du:?} down={dd:?}, nontrivial={nontrivial})  {}",
             if g9 { "PASS" } else { "FAIL" }
@@ -1667,11 +2292,207 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         let g9b = c_gate == a_gate && c_up == a_up && c_down == a_down;
         ok &= g9b;
         eprintln!(
-            "MROW GATE9b m={m}: relaunch byte-identical \
+            "MROW GATE9b {quant_label} m={m}: relaunch byte-identical \
              (split={split_gu}/{split_dn}, {} concurrent gate+up groups): {}",
             2 * total_routed,
             if g9b { "PASS" } else { "FAIL" }
         );
+
+        if m == 6 || m == 16 {
+            let (kh_work_build, kh_work_gu, kh_work_dn, work_capacity, work_label) = if m == 6 {
+                (kh_work_build_m6, kh_work_gu_m6, kh_work_dn_m6, 36u32, "M6")
+            } else {
+                (
+                    kh_work_build_m16,
+                    kh_work_gu_m16,
+                    kh_work_dn_m16,
+                    96u32,
+                    "M16",
+                )
+            };
+            let persistent = |g: &dyn GpuBackend, route: DevicePtr, poison: u8| -> Result<()> {
+                g.memset(d_gate, poison, gu_bytes)?;
+                g.memset(d_upo, poison, gu_bytes)?;
+                g.memset(d_down, poison, dn_bytes)?;
+                KernelLaunch::new(g, kh_work_build)
+                    .grid([1, 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(route)
+                    .arg_ptr(d_worklist)
+                    .arg_ptr(d_work_state)
+                    .arg_u32(m as u32)
+                    .arg_u32(top_k as u32)
+                    .arg_u32(ne as u32)
+                    .arg_u32(work_capacity)
+                    .launch(stream)?;
+                KernelLaunch::new(g, kh_work_gu)
+                    .grid([96, 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(d_a)
+                    .arg_ptr(gate_t.0)
+                    .arg_ptr(gate_t.1)
+                    .arg_ptr(gate_t.2)
+                    .arg_ptr(up_t.0)
+                    .arg_ptr(up_t.1)
+                    .arg_ptr(up_t.2)
+                    .arg_ptr(d_worklist)
+                    .arg_ptr(d_work_state)
+                    .arg_ptr(d_gate)
+                    .arg_ptr(d_upo)
+                    .arg_ptr(d_ws)
+                    .arg_ptr(d_cnt)
+                    .arg_u32(inter as u32)
+                    .arg_u32(h as u32)
+                    .arg_u32(top_k as u32)
+                    .arg_u32(split_gu)
+                    .arg_u32(bits as u32)
+                    .launch(stream)?;
+                launch_silu(
+                    g,
+                    kh_silu,
+                    stream,
+                    d_gate,
+                    d_upo,
+                    d_gate,
+                    (total_routed * inter) as u32,
+                )?;
+                KernelLaunch::new(g, kh_work_dn)
+                    .grid([96, 1, 1])
+                    .block([256, 1, 1])
+                    .arg_ptr(d_gate)
+                    .arg_ptr(down_t.0)
+                    .arg_ptr(down_t.1)
+                    .arg_ptr(down_t.2)
+                    .arg_ptr(d_worklist)
+                    .arg_ptr(d_work_state)
+                    .arg_ptr(d_down)
+                    .arg_ptr(d_ws)
+                    .arg_ptr(d_cnt)
+                    .arg_u32(h as u32)
+                    .arg_u32(inter as u32)
+                    .arg_u32(top_k as u32)
+                    .arg_u32(split_dn)
+                    .arg_u32(bits as u32)
+                    .launch(stream)?;
+                g.synchronize(stream)
+            };
+
+            persistent(g, d_idx, 0x3C)?;
+            let (mut p_gate, mut p_up, mut p_down) = (
+                vec![0u8; gu_bytes],
+                vec![0u8; gu_bytes],
+                vec![0u8; dn_bytes],
+            );
+            g.copy_d2h(d_gate, &mut p_gate)?;
+            g.copy_d2h(d_upo, &mut p_up)?;
+            g.copy_d2h(d_down, &mut p_down)?;
+            let mut state = [0u8; 16];
+            g.copy_d2h(d_work_state, &mut state)?;
+            let valid_work_count = u32::from_le_bytes(state[0..4].try_into().unwrap());
+            let valid_work_status = u32::from_le_bytes(state[4..8].try_into().unwrap());
+            let compact_ok = p_gate == a_gate
+                && p_up == a_up
+                && p_down == a_down
+                && valid_work_count > 0
+                && valid_work_count <= work_capacity
+                && valid_work_status == 0
+                && p_gate.iter().any(|&byte| byte != 0x3C)
+                && p_down.iter().any(|&byte| byte != 0x3C);
+            ok &= compact_ok;
+
+            persistent(g, d_idx, 0xC3)?;
+            let (mut p2_gate, mut p2_up, mut p2_down) = (
+                vec![0u8; gu_bytes],
+                vec![0u8; gu_bytes],
+                vec![0u8; dn_bytes],
+            );
+            g.copy_d2h(d_gate, &mut p2_gate)?;
+            g.copy_d2h(d_upo, &mut p2_up)?;
+            g.copy_d2h(d_down, &mut p2_down)?;
+            let compact_replay = p2_gate == p_gate && p2_up == p_up && p2_down == p_down;
+            ok &= compact_replay;
+
+            // A duplicate in the final row used to let the first leader cross
+            // the record boundary before the builder reached that row. Both
+            // exact-width builders must reject before emission, and both
+            // consumers must zero every routed output rather than blend stale
+            // scratch.
+            let mut malformed = indices.clone();
+            let final_row = (m - 1) * top_k;
+            malformed[final_row + 1] = malformed[final_row];
+            let d_malformed = up(
+                g,
+                &malformed
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )?;
+            persistent(g, d_malformed, 0xA5)?;
+            let (mut bad_gate, mut bad_up, mut bad_down) = (
+                vec![0u8; gu_bytes],
+                vec![0u8; gu_bytes],
+                vec![0u8; dn_bytes],
+            );
+            g.copy_d2h(d_gate, &mut bad_gate)?;
+            g.copy_d2h(d_upo, &mut bad_up)?;
+            g.copy_d2h(d_down, &mut bad_down)?;
+            g.copy_d2h(d_work_state, &mut state)?;
+            let work_count = u32::from_le_bytes(state[0..4].try_into().unwrap());
+            let work_status = u32::from_le_bytes(state[4..8].try_into().unwrap());
+            let malformed_zeroed = work_count == 0
+                && work_status == 3
+                && bad_gate.iter().all(|&byte| byte == 0)
+                && bad_up.iter().all(|&byte| byte == 0)
+                && bad_down.iter().all(|&byte| byte == 0);
+            ok &= malformed_zeroed;
+            let _ = g.free(d_malformed);
+
+            // The last routed id is outside the pointer tables. This must be
+            // rejected by the complete-route validation before any record is
+            // consumed, with the same full-output zeroing guarantee.
+            let mut out_of_range = indices.clone();
+            out_of_range[final_row + top_k - 1] = ne as u32;
+            let d_out_of_range = up(
+                g,
+                &out_of_range
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )?;
+            persistent(g, d_out_of_range, 0x5A)?;
+            let (mut range_gate, mut range_up, mut range_down) = (
+                vec![0u8; gu_bytes],
+                vec![0u8; gu_bytes],
+                vec![0u8; dn_bytes],
+            );
+            g.copy_d2h(d_gate, &mut range_gate)?;
+            g.copy_d2h(d_upo, &mut range_up)?;
+            g.copy_d2h(d_down, &mut range_down)?;
+            g.copy_d2h(d_work_state, &mut state)?;
+            let range_count = u32::from_le_bytes(state[0..4].try_into().unwrap());
+            let range_status = u32::from_le_bytes(state[4..8].try_into().unwrap());
+            let out_of_range_zeroed = range_count == 0
+                && range_status == 2
+                && range_gate.iter().all(|&byte| byte == 0)
+                && range_up.iter().all(|&byte| byte == 0)
+                && range_down.iter().all(|&byte| byte == 0);
+            ok &= out_of_range_zeroed;
+            let _ = g.free(d_out_of_range);
+            eprintln!(
+                "MROW GATE9d {quant_label} compact {work_label}: valid_count={valid_work_count} \
+                 valid_status={valid_work_status} invalid_count={work_count} \
+                 invalid_status={work_status} \
+                 range_count={range_count} range_status={range_status} \
+                 byte-identical={compact_ok} replay={compact_replay} \
+                 malformed_zeroed={malformed_zeroed} \
+                 out_of_range_zeroed={out_of_range_zeroed} {}",
+                if compact_ok && compact_replay && malformed_zeroed && out_of_range_zeroed {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
+            );
+        }
 
         // Launch-count assertion: this is the whole point of the change. The
         // per-row fallback runs the WHOLE routed expert set once per row; the
@@ -1683,7 +2504,7 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
             v.len()
         };
         eprintln!(
-            "MROW GATE9c m={m}: launches {} -> 3, expert-trellis reads {total_routed} -> \
+            "MROW GATE9c {quant_label} m={m}: launches {} -> 3, expert-trellis reads {total_routed} -> \
              {distinct} ({:.2}x fewer bytes on the union)",
             3 * m,
             total_routed as f64 / distinct as f64
@@ -1692,10 +2513,16 @@ fn mrow_verify_gate(g: &dyn GpuBackend) -> Result<bool> {
         let _ = g.free(d_idx);
     }
 
-    for p in owned
-        .into_iter()
-        .chain([d_a, d_gate, d_upo, d_down, d_ws, d_cnt])
-    {
+    for p in owned.into_iter().chain([
+        d_a,
+        d_gate,
+        d_upo,
+        d_down,
+        d_ws,
+        d_cnt,
+        d_worklist,
+        d_work_state,
+    ]) {
         let _ = g.free(p);
     }
     Ok(ok)

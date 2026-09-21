@@ -34,6 +34,7 @@ mod prefill_weights;
 mod trait_impl;
 mod types;
 mod types_weights;
+pub mod vision_hc_bf16;
 
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;

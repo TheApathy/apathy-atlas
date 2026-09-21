@@ -94,6 +94,25 @@ fn reasoning_effort_channel() {
 }
 
 #[test]
+fn top_level_reasoning_effort_uses_the_same_prefix_free_budget_mapping() {
+    let mut b = base_body();
+    b["reasoning_effort"] = serde_json::json!("high");
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: Some(512) }
+    );
+
+    // The structured field is more specific and wins when both are sent.
+    let mut b = base_body();
+    b["reasoning"] = serde_json::json!({"effort": "low"});
+    b["reasoning_effort"] = serde_json::json!("high");
+    assert_eq!(
+        chat_req(b).client_thinking_directive(),
+        ThinkingDirective::On { budget: Some(128) }
+    );
+}
+
+#[test]
 fn chat_template_kwargs_channel() {
     // Struct still parses as a request-body wire field.
     let kw: ChatTemplateKwargs =

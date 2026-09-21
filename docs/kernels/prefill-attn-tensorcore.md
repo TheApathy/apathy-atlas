@@ -351,6 +351,34 @@ alone** reduce the partials and broadcast `eo`/`P` would take that to ~10 KB
 is cheap at 3 CTAs/SM because the other blocks fill the idle warps. That is
 also the precondition that makes BR=32 affordable.
 
+The isolated warp-0 candidate now has an offline promotion package. It keeps
+the production TC2 ABI and exact BF16 probability seam, but has only warp 0
+reduce and broadcast the tile softmax. The SM121a gate reports 2,408
+instructions, 142 registers, 23,552 B shared memory, 32 `LDSM`, 64 `HMMA`,
+44 `MUFU.EX2`, eight barriers, and zero stack, local memory, or spills. The
+comparison incumbent reports 1,832 instructions, 158 registers, and 22,016 B
+shared memory. These are static compiler facts, not a speed result.
+
+```bash
+ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 cargo test -p spark-model \
+  --test v4_prefill_attn_tc2_warp0_model \
+  --test v4_prefill_attn_tc2_warp0_probe_model
+bash scripts/check-v4-prefill-attn-tc2-warp0-sass.sh
+V4_TC2_WARP0_PROBE_OUTPUT_DIR=/tmp/atlas-v4-tc2-warp0-probe \
+  bash scripts/check-v4-prefill-attn-tc2-warp0-probe-build.sh 1.01
+/tmp/atlas-v4-tc2-warp0-probe/run-v4-tc2-warp0-probe.sh
+```
+
+The generated zero-argument runner separately compares the exact CSA and dense
+production shapes under ABBA timing, requires exact incumbent/candidate output
+bytes across nine alias/tail/window/sink cases, verifies all input payloads and
+redzones, and executes 36 malformed no-write canaries. Its 2026-08-27 GB10 run
+missed the pre-registered 1.01 admission threshold, so the max profile excludes
+it and retains TC2. The same kernel remains registered for DeepSeek V4 and is reachable only
+under the strict default-off `ATLAS_V4_PREFILL_TC2_WARP0=1` flag at the exact
+`(N=2410,nq=64,nkv=1,hd=512)` shape; all misses retain the incumbent TC2/TC
+fallback. It therefore remains unqualified for promotion or a tok/s claim.
+
 ## Validating round 2
 
 ```
@@ -358,7 +386,14 @@ cargo run --release -p spark-model --example prefill_attn_tc_microtest \
     --features cuda,gpu-examples -- 7C21 2176 128 4     # CSA
 cargo run --release -p spark-model --example prefill_attn_tc_microtest \
     --features cuda,gpu-examples -- 7C21 2176 0   128   # HCA, full causal
+bash scripts/check-v4-prefill-attn-tc2-sass.sh
 ```
+
+The offline SM121a gate reports 1,728 static instructions, 167 registers,
+20,992 B ptxas static shared memory (22,016 B from `cuobjdump`), 64 HMMA,
+16 `LDSM.16.M88.4`, 16 `LDSM.16.MT88.4`, 24 `MUFU.EX2`, eight `BAR.SYNC`,
+and zero spills or local memory. These are compile/SASS facts, not a new timing
+result.
 
 The microtest gates all three kernels. Because tc2 is a data-movement-only
 rewrite — same MMA operand *values*, same sSp summation order, same softmax
@@ -369,6 +404,6 @@ NOT aliased (which drives the V re-stage path), crossed with CSA and HCA.
 A tc2-vs-tc failure therefore points at an ldmatrix fragment mapping, not at
 numerics.
 
-In the engine, `ATLAS_V4_PREFILL_TC2=1` swaps tc2 in at both call sites
-(compressor and full-attention); unset keeps tc; `ATLAS_V4_PREFILL_TC=0`
+In the engine, tc2 is the default at both call sites (compressor and full
+attention); `ATLAS_V4_PREFILL_TC2=0` restores tc. `ATLAS_V4_PREFILL_TC=0`
 still falls all the way back to the scalar kernel.

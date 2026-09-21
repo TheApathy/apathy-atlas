@@ -4,7 +4,7 @@
 
 #![allow(unused_imports)]
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
@@ -599,10 +599,15 @@ pub fn per_token_group_quant_fp8(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    const FP8_GROUP_K: u32 = 128;
+    ensure!(
+        k.is_multiple_of(FP8_GROUP_K),
+        "per-token FP8 quantization requires K divisible by {FP8_GROUP_K}, got {k}"
+    );
     // Grid: (M, K/128, 1). Putting M on grid X (max 2^31-1) avoids the
     // 65535 limit on grid Y for large MoE total_expanded counts.
     KernelLaunch::new(gpu, kernel)
-        .grid([m, k / 128, 1])
+        .grid([m, k / FP8_GROUP_K, 1])
         .block([128, 1, 1])
         .arg_ptr(input_bf16)
         .arg_ptr(output_fp8)

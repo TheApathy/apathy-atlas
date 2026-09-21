@@ -148,6 +148,9 @@ pub(super) struct StreamState {
     pub(super) reasoning_xml_leak_detected: bool,
     /// Streaming tool-call detector (`Some` iff `tools_active`).
     pub(super) detector: Option<tool_parser::StreamingToolDetector>,
+    /// Exact concatenation of chunks handed to the streaming tool parser.
+    /// Allocated only for DSML requests when selective slip dumping is on.
+    pub(super) tool_parser_input: Option<String>,
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
@@ -182,6 +185,7 @@ impl StreamState {
         enable_thinking: bool,
         cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         tool_defs: Vec<tool_parser::ToolDefinition>,
+        capture_tool_parser_input: bool,
     ) -> Self {
         Self {
             all_toks: Vec::new(),
@@ -224,6 +228,7 @@ impl StreamState {
             } else {
                 None
             },
+            tool_parser_input: capture_tool_parser_input.then(String::new),
             thinking_done: !enable_thinking,
             buffered_tool_chunks: HashMap::new(),
             pending_retry: None,

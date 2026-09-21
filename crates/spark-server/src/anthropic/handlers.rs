@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 
@@ -26,7 +25,24 @@ use super::types::*;
 /// made here.
 pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
     // 1. Parse the Anthropic request.
-    let req: MessagesRequest = match serde_json::from_slice(&body) {
+    let raw: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid request JSON: {e}"),
+            );
+        }
+    };
+    if let Some(field) = unsupported_structured_output_field(&raw) {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("{field} is not supported; Atlas would otherwise return unconstrained text"),
+        );
+    }
+    let req: MessagesRequest = match serde_json::from_value(raw) {
         Ok(r) => r,
         Err(e) => {
             return anthropic_error(
@@ -37,6 +53,13 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
         }
     };
 
+    if let Err(error) = req.validate_images() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.into(),
+        );
+    }
     tracing::info!(
         "Anthropic request: max_tokens={}, thinking={:?}, tools={}, model={}, stream={}",
         req.max_tokens,
@@ -138,11 +161,25 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
 /// POST /v1/messages/count_tokens — returns input token count.
 ///
 /// Claude Code calls this to validate the model and estimate token usage.
-pub async fn count_tokens(
-    State(state): State<Arc<AppState>>,
-    req: Result<Json<MessagesRequest>, JsonRejection>,
-) -> Response {
-    let Json(req) = match req {
+pub async fn count_tokens(State(state): State<Arc<AppState>>, body: axum::body::Bytes) -> Response {
+    let raw: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return anthropic_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid request JSON: {e}"),
+            );
+        }
+    };
+    if let Some(field) = unsupported_structured_output_field(&raw) {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("{field} is not supported; Atlas would otherwise return unconstrained text"),
+        );
+    }
+    let req: MessagesRequest = match serde_json::from_value(raw) {
         Ok(r) => r,
         Err(e) => {
             return anthropic_error(
@@ -153,6 +190,18 @@ pub async fn count_tokens(
         }
     };
 
+    if let Err(error) = req.validate_images() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.into(),
+        );
+    }
+    if req.contains_image() {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error",
+            "This endpoint does not yet count expanded image tokens (unsupported_multimodal_token_count)".into());
+    }
+
     // Count against the EXACT prompt the serving path renders: same
     // adapter (the IR `From` impl), same tool-prompt injection / hint /
     // cwd / thinking resolution / Jinja variant (prepare_chat_prompt). The
@@ -161,13 +210,7 @@ pub async fn count_tokens(
     // rendered through the non-openai Jinja variant, so counts drifted
     // from real usage.
     let mut ir_req = crate::ir::ChatRequest::from(req);
-    // Counting must not require the vision encoder: strip image parts
-    // (they contributed 0 tokens in the old count too — pad expansion
-    // needs real pixel grids, which a count endpoint can't produce).
-    for m in &mut ir_req.messages {
-        m.content
-            .retain(|p| !matches!(p, crate::ir::ContentPart::Image(_)));
-    }
+
     let prepared = match crate::api::chat::prepare::prepare_chat_prompt(&state, &mut ir_req) {
         Ok(p) => p,
         Err(resp) => return openai_error_to_anthropic(resp).await,
@@ -177,6 +220,20 @@ pub async fn count_tokens(
         "input_tokens": prepared.prompt_tokens.len()
     });
     Json(body).into_response()
+}
+
+fn unsupported_structured_output_field(body: &serde_json::Value) -> Option<&'static str> {
+    if body.get("output_format").is_some_and(|v| !v.is_null()) {
+        return Some("output_format");
+    }
+    if body
+        .get("output_config")
+        .and_then(|v| v.get("format"))
+        .is_some_and(|v| !v.is_null())
+    {
+        return Some("output_config.format");
+    }
+    None
 }
 
 /// Re-shape an OpenAI-envelope error `Response` (produced by the shared
@@ -201,4 +258,31 @@ async fn openai_error_to_anthropic(resp: Response) -> Response {
         "api_error"
     };
     anthropic_error(parts.status, error_type, message)
+}
+
+#[cfg(test)]
+mod structured_output_tests {
+    use super::unsupported_structured_output_field;
+
+    #[test]
+    fn unsupported_anthropic_formats_are_detected_without_rejecting_plain_requests() {
+        assert_eq!(
+            unsupported_structured_output_field(&serde_json::json!({
+                "output_format": {"type": "json_schema"}
+            })),
+            Some("output_format")
+        );
+        assert_eq!(
+            unsupported_structured_output_field(&serde_json::json!({
+                "output_config": {"format": {"type": "json_schema"}}
+            })),
+            Some("output_config.format")
+        );
+        assert_eq!(
+            unsupported_structured_output_field(&serde_json::json!({
+                "output_config": {"effort": "high"}
+            })),
+            None
+        );
+    }
 }

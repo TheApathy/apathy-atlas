@@ -18,6 +18,9 @@ impl TransformerModel {
         &self,
         images: &[(Vec<f32>, usize, usize)],
     ) -> Result<()> {
+        if self.config.deepseek_vision.is_some() {
+            return self.prepare_deepseek_images(images);
+        }
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
             None => return Ok(()),
@@ -67,6 +70,10 @@ impl TransformerModel {
         &self,
         per_request: &[Vec<(Vec<f32>, usize, usize)>],
     ) -> Result<Vec<(usize, usize, usize, usize)>> {
+        anyhow::ensure!(
+            self.config.deepseek_vision.is_none(),
+            "DeepSeek Vision cross-request image co-dispatch is not supported"
+        );
         let ve = match &self.vision_encoder {
             Some(ve) => ve,
             None => return Ok(Vec::new()),

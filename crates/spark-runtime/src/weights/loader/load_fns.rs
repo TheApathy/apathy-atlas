@@ -114,16 +114,15 @@ pub(super) fn load_sharded(
             // F16 — the exl3_gemv kernels read them as `__half*`, and the
             // F16→BF16→F16 round-trip would truncate mantissa bits 8..10.
             let converted: Vec<u8>;
-            let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16
-                && !exl3_keep_f16(name)
-            {
-                converted = f16_to_bf16_bytes(view.data());
-                (&converted, WeightDtype::BF16)
-            } else if view.dtype() == safetensors::Dtype::F16 {
-                (view.data(), WeightDtype::F16)
-            } else {
-                (view.data(), WeightDtype::from_safetensors(view.dtype())?)
-            };
+            let (data, dtype): (&[u8], _) =
+                if view.dtype() == safetensors::Dtype::F16 && !exl3_keep_f16(name) {
+                    converted = f16_to_bf16_bytes(view.data());
+                    (&converted, WeightDtype::BF16)
+                } else if view.dtype() == safetensors::Dtype::F16 {
+                    (view.data(), WeightDtype::F16)
+                } else {
+                    (view.data(), WeightDtype::from_safetensors(view.dtype())?)
+                };
 
             // Try GPU alloc first; if OOM, fall back to managed (UVM) memory.
             // On GB10 unified memory, managed alloc uses Linux swap for overflow.
@@ -206,16 +205,15 @@ pub(super) fn load_single(
         // F16: convert to BF16 at load — see load_sharded above (same EXL3
         // sign-vector exemption).
         let converted: Vec<u8>;
-        let (data, dtype): (&[u8], _) = if view.dtype() == safetensors::Dtype::F16
-            && !exl3_keep_f16(&name)
-        {
-            converted = f16_to_bf16_bytes(view.data());
-            (&converted, WeightDtype::BF16)
-        } else if view.dtype() == safetensors::Dtype::F16 {
-            (view.data(), WeightDtype::F16)
-        } else {
-            (view.data(), WeightDtype::from_safetensors(view.dtype())?)
-        };
+        let (data, dtype): (&[u8], _) =
+            if view.dtype() == safetensors::Dtype::F16 && !exl3_keep_f16(&name) {
+                converted = f16_to_bf16_bytes(view.data());
+                (&converted, WeightDtype::BF16)
+            } else if view.dtype() == safetensors::Dtype::F16 {
+                (view.data(), WeightDtype::F16)
+            } else {
+                (view.data(), WeightDtype::from_safetensors(view.dtype())?)
+            };
 
         let ptr = gpu.alloc(data.len())?;
         gpu.copy_h2d(data, ptr)?;

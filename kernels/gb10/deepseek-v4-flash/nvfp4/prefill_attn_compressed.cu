@@ -393,10 +393,12 @@ extern "C" __global__ void prefill_attn_compressed_tc(
     unsigned int qa[8][4];
     {
         const unsigned int col_base = warp * 128u + t * 2u;
-        const __nv_bfloat16* Qr0 =
-            Q + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim;
-        const __nv_bfloat16* Qr1 =
-            Q + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim;
+        const __nv_bfloat16* Qr0 = v0
+            ? Q + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
+        const __nv_bfloat16* Qr1 = v1
+            ? Q + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
         #pragma unroll
         for (int s = 0; s < 8; s++) {
             const unsigned int c0 = col_base + (unsigned int)s * 16u;
@@ -625,10 +627,12 @@ extern "C" __global__ void prefill_attn_compressed_tc(
     {
         const float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f;
         const float il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
-        __nv_bfloat16* O0 =
-            O + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim;
-        __nv_bfloat16* O1 =
-            O + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim;
+        __nv_bfloat16* O0 = v0
+            ? O + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
+        __nv_bfloat16* O1 = v1
+            ? O + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
         #pragma unroll
         for (int nt = 0; nt < 16; nt++) {
             const unsigned int c = warp * 128u + (unsigned int)nt * 8u + t * 2u;
@@ -800,9 +804,23 @@ extern "C" __global__ void prefill_attn_compressed_tc2(
     const unsigned int ratio,
     const unsigned int sliding_window,
     const float inv_sqrt_d
+#ifdef ATLAS_DEEPSEEK_VISION_TC2
+    , const unsigned int* __restrict__ token_ids,
+    const unsigned int vocab_size
+#endif
 ) {
     __shared__ __align__(16) __nv_bfloat16 sKV[TC2_KT * TC2_KVPAD];
     __shared__ __align__(16) float4 sSp[BR * TC2_SPPAD];
+
+    const unsigned int required_q_blocks =
+        seq_len / BR + ((seq_len % BR) != 0u);
+    if (blockDim.x != 128u || blockDim.y != 1u || blockDim.z != 1u ||
+        gridDim.x != num_q_heads || gridDim.y != required_q_blocks ||
+        gridDim.z != 1u || num_kv_heads == 0u ||
+        num_q_heads % num_kv_heads != 0u || ratio == 0u ||
+        Q == nullptr || K == nullptr || V == nullptr || Kc == nullptr ||
+        Vc == nullptr || O == nullptr)
+        return;
 
     const unsigned int q_head = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
@@ -830,12 +848,36 @@ extern "C" __global__ void prefill_attn_compressed_tc2(
     const unsigned int r0 = g, r1 = g + 8;
     const unsigned int qrow0 = q_first + r0, qrow1 = q_first + r1;
     const bool v0 = qrow0 < seq_len, v1 = qrow1 < seq_len;
+#ifdef ATLAS_DEEPSEEK_VISION_TC2
+    __shared__ unsigned int vision_lo[BR], vision_hi[BR];
+    if (token_ids == nullptr || sliding_window != 128u || vocab_size == 0u ||
+        vocab_size > 0xfffffffau) {
+        asm volatile("trap;");
+        return;
+    }
+    // Each query row computes its bounds once, outside all attention tiles.
+    if (tid_x < BR) {
+        const unsigned int row = q_first + tid_x;
+        vision_lo[tid_x] = seq_len;
+        vision_hi[tid_x] = 0u;
+        if (row < seq_len && !deepseek_vision_raw_bounds(
+                token_ids, seq_len, vocab_size, row, sliding_window,
+                vision_lo[tid_x], vision_hi[tid_x])) {
+            asm volatile("trap;");
+            return;
+        }
+    }
+    __syncthreads();
+    const unsigned int kvs0 = vision_lo[r0], kvl0 = vision_hi[r0];
+    const unsigned int kvs1 = vision_lo[r1], kvl1 = vision_hi[r1];
+#else
     const unsigned int kvs0 =
         (sliding_window > 0u && qrow0 + 1u > sliding_window) ? (qrow0 + 1u - sliding_window) : 0u;
     const unsigned int kvl0 = qrow0 + 1u;
     const unsigned int kvs1 =
         (sliding_window > 0u && qrow1 + 1u > sliding_window) ? (qrow1 + 1u - sliding_window) : 0u;
     const unsigned int kvl1 = qrow1 + 1u;
+#endif
     unsigned int cvis0 = (qrow0 + 1u) / ratio; if (cvis0 > n_comp) cvis0 = n_comp;
     unsigned int cvis1 = (qrow1 + 1u) / ratio; if (cvis1 > n_comp) cvis1 = n_comp;
 
@@ -854,10 +896,12 @@ extern "C" __global__ void prefill_attn_compressed_tc2(
     unsigned int qa[8][4];
     {
         const unsigned int col_base = warp * 128u + t * 2u;
-        const __nv_bfloat16* Qr0 =
-            Q + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim;
-        const __nv_bfloat16* Qr1 =
-            Q + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim;
+        const __nv_bfloat16* Qr0 = v0
+            ? Q + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
+        const __nv_bfloat16* Qr1 = v1
+            ? Q + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
         #pragma unroll
         for (int s = 0; s < 8; s++) {
             const unsigned int c0 = col_base + (unsigned int)s * 16u;
@@ -1048,10 +1092,18 @@ extern "C" __global__ void prefill_attn_compressed_tc2(
 
     // ── raw arm: block-union sliding-window causal tiles ──
     {
+#ifdef ATLAS_DEEPSEEK_VISION_TC2
+        unsigned int union_lo = seq_len, union_hi = 0u;
+        for (unsigned int row = 0u; row < q_last_excl - q_first; ++row) {
+            if (vision_lo[row] < union_lo) union_lo = vision_lo[row];
+            if (vision_hi[row] > union_hi) union_hi = vision_hi[row];
+        }
+#else
         unsigned int union_lo = 0u;
         if (sliding_window > 0u && q_first + 1u > sliding_window)
             union_lo = q_first + 1u - sliding_window;
         const unsigned int union_hi = q_last_excl;
+#endif
         for (unsigned int base = union_lo; base < union_hi; base += TC2_KT) {
             unsigned int count = union_hi - base;
             if (count > TC2_KT) count = TC2_KT;
@@ -1093,10 +1145,12 @@ extern "C" __global__ void prefill_attn_compressed_tc2(
     {
         const float il0 = (l0 > 0.0f) ? (1.0f / l0) : 0.0f;
         const float il1 = (l1 > 0.0f) ? (1.0f / l1) : 0.0f;
-        __nv_bfloat16* O0 =
-            O + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim;
-        __nv_bfloat16* O1 =
-            O + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim;
+        __nv_bfloat16* O0 = v0
+            ? O + (size_t)qrow0 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
+        __nv_bfloat16* O1 = v1
+            ? O + (size_t)qrow1 * q_stride + (size_t)q_head * head_dim
+            : nullptr;
         #pragma unroll
         for (int nt = 0; nt < 16; nt++) {
             const unsigned int c = warp * 128u + (unsigned int)nt * 8u + t * 2u;

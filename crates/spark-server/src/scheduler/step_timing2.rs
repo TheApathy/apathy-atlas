@@ -123,7 +123,10 @@ pub(crate) fn record(phase: Phase2, since: Instant) {
     if !enabled() {
         return;
     }
-    add(phase, u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX));
+    add(
+        phase,
+        u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX),
+    );
 }
 
 /// RAII step scope: created at `step_verify_dflash` entry; `Drop` closes the
@@ -185,7 +188,10 @@ pub(crate) fn mark(phase: Phase2) {
     let now = Instant::now();
     let mut c = CLOCK.lock();
     if let Some(lm) = c.last_mark.replace(now) {
-        add(phase, u64::try_from((now - lm).as_micros()).unwrap_or(u64::MAX));
+        add(
+            phase,
+            u64::try_from((now - lm).as_micros()).unwrap_or(u64::MAX),
+        );
     }
 }
 
@@ -210,8 +216,9 @@ fn summarize() {
     let in_step: u64 = (Phase2::Pre as usize..=Phase2::Propose as usize)
         .map(|i| sums[i])
         .sum();
-    let other_ms =
-        sums[Phase2::StepTotal as usize].saturating_sub(in_step) as f64 / 1000.0 / SUMMARY_PERIOD as f64;
+    let other_ms = sums[Phase2::StepTotal as usize].saturating_sub(in_step) as f64
+        / 1000.0
+        / SUMMARY_PERIOD as f64;
     let wall_ms = (sums[Phase2::StepTotal as usize] + sums[Phase2::LoopGap as usize]) as f64
         / 1000.0
         / SUMMARY_PERIOD as f64;
@@ -221,7 +228,11 @@ fn summarize() {
     // stitched from two differently-windowed logs.
     let committed = COMMITTED_TOKS.swap(0, Ordering::Relaxed) as f64;
     let tok_step = committed / SUMMARY_PERIOD as f64;
-    let spec_tok_s = if wall_ms > 0.0 { tok_step * 1000.0 / wall_ms } else { 0.0 };
+    let spec_tok_s = if wall_ms > 0.0 {
+        tok_step * 1000.0 / wall_ms
+    } else {
+        0.0
+    };
     tracing::info!(
         "DFLASH STEP_TIMING2 [{SUMMARY_PERIOD} steps]:{line} other={other_ms:.2}ms \
          wall={wall_ms:.2}ms/step tok_step={tok_step:.2} spec_tok_s={spec_tok_s:.1}"

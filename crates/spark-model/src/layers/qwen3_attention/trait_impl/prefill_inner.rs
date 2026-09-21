@@ -13,6 +13,11 @@ use super::diag_norm;
 use crate::layer::{BatchedAttnMetadata, ForwardContext, LayerState};
 use crate::layers::ops;
 
+#[path = "prefill_hc_rms.rs"]
+mod prefill_hc_rms;
+#[path = "vision_l0_dump.rs"]
+mod vision_l0_dump;
+
 impl Qwen3AttentionLayer {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prefill_inner(
@@ -496,9 +501,71 @@ impl Qwen3AttentionLayer {
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
+        let normed = ctx.buffers.norm_output();
+        let mix_scratch = ctx.buffers.expert_up_out();
         let diag_all =
             std::env::var("ATLAS_DIAG_V4_ALL_LAYERS").is_ok_and(|v| v == "1" || v == "true");
         let diag_this = diag_all; // probing is opt-in (ATLAS_DIAG_V4_ALL_LAYERS=1): each probe syncs + reads D2H, real tok/s + TTFT cost
+
+        use vision_l0_dump::{Capture, Stage};
+        let mut capture = Capture::begin(
+            self.attn_layer_idx,
+            num_tokens,
+            seq_len_start,
+            kv_write_start,
+            batched_meta.is_some(),
+            ctx,
+            stream,
+        )?;
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::Embed, ctx.gpu, hidden, stream)?;
+        }
+
+        // Qualification planning is read-only and precedes hc_expand or any
+        // site output. Strict max mode therefore cannot discover a declined
+        // arm after partially mutating this layer.
+        let use_hc_rms_attn = self.plan_v4_hc_pre_finish_rms_fused(
+            &hc.attn,
+            &self.input_norm,
+            hc_streams,
+            hidden,
+            normed,
+            post,
+            comb,
+            mix_scratch,
+            num_tokens,
+            h,
+            hc.hc_mult,
+            hc.sinkhorn_iters,
+            eps,
+            hc.hc_eps,
+            diag_this,
+            batched_meta,
+            ctx,
+        )?;
+        let use_hc_rms_ffn = if !self.ffn.is_none() {
+            self.plan_v4_hc_pre_finish_rms_fused(
+                &hc.ffn,
+                &self.post_attn_norm,
+                hc_streams,
+                hidden,
+                normed,
+                post,
+                comb,
+                mix_scratch,
+                num_tokens,
+                h,
+                hc.hc_mult,
+                hc.sinkhorn_iters,
+                eps,
+                hc.hc_eps,
+                diag_this,
+                batched_meta,
+                ctx,
+            )?
+        } else {
+            false
+        };
 
         // Layer-glue attribution (the ~800 ms/pass the bucket waterfall could
         // not name): hc_expand/hc_pre/hc_post + norms between the attention
@@ -540,16 +607,38 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::HcExpanded, ctx.gpu, hc_streams, stream)?;
+        }
 
         // ── Attention sublayer ──
         // Token-tiled hc_pre at prefill width (2.39 vs 3.99 ms/call at T=2410,
         // y cosine 1.0000000): both operands stream ~once. mix scratch is the
         // idle MoE up buffer — consumed within this call pair. ATLAS_HC_TILED=0
         // opts back into the one-block-per-token hc_pre.
-        if {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("ATLAS_HC_TILED").as_deref() != Ok("0"))
-        } && self.hc_pre_mix_tiled_k.0 != 0
+        if use_hc_rms_attn {
+            self.launch_v4_hc_pre_finish_rms_fused(
+                &hc.attn,
+                &self.input_norm,
+                hc_streams,
+                hidden,
+                normed,
+                post,
+                comb,
+                mix_scratch,
+                n,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                eps,
+                "attention",
+                ctx,
+                stream,
+            )?;
+        } else if prefill_hc_rms::hc_tiled_enabled()
+            && self.hc_pre_mix_tiled_k.0 != 0
             && self.hc_pre_finish_k.0 != 0
             && n >= 64
             && h == 4096
@@ -566,7 +655,7 @@ impl Qwen3AttentionLayer {
                 hidden,
                 post,
                 comb,
-                ctx.buffers.expert_up_out(),
+                mix_scratch,
                 n,
                 h as u32,
                 hc_mult,
@@ -576,24 +665,29 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.attn.hc_fn,
-            hc.attn.hc_scale,
-            hc.attn.hc_base,
-            hidden,
-            post,
-            comb,
-            n,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+            ops::hc_pre(
+                ctx.gpu,
+                self.hc_pre_k,
+                hc_streams,
+                hc.attn.hc_fn,
+                hc.attn.hc_scale,
+                hc.attn.hc_base,
+                hidden,
+                post,
+                comb,
+                n,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                stream,
+            )?;
+        }
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::HcPreAttn, ctx.gpu, hidden, stream)?;
+            capture.stage(Stage::PostAttn, ctx.gpu, post, stream)?;
+            capture.stage(Stage::CombAttn, ctx.gpu, comb, stream)?;
         }
         if diag_this {
             super::diag_norm(
@@ -619,19 +713,23 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        let normed = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if !use_hc_rms_attn {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         hprof!("hc0_pre_attn");
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::NormAttn, ctx.gpu, normed, stream)?;
+        }
 
         if batched_meta.is_some() && seq_len_start == 0 {
             anyhow::bail!(
@@ -664,6 +762,10 @@ impl Qwen3AttentionLayer {
                 stream,
             )?
         };
+
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::AttentionOut, ctx.gpu, attn_out, stream)?;
+        }
 
         if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
@@ -760,6 +862,9 @@ impl Qwen3AttentionLayer {
             hc_mult,
             stream,
         )?;
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::HcPostAttn, ctx.gpu, hc_streams, stream)?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,
@@ -785,10 +890,29 @@ impl Qwen3AttentionLayer {
         // y cosine 1.0000000): both operands stream ~once. mix scratch is the
         // idle MoE up buffer — consumed within this call pair. ATLAS_HC_TILED=0
         // opts back into the one-block-per-token hc_pre.
-        if {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var("ATLAS_HC_TILED").as_deref() != Ok("0"))
-        } && self.hc_pre_mix_tiled_k.0 != 0
+        if use_hc_rms_ffn {
+            self.launch_v4_hc_pre_finish_rms_fused(
+                &hc.ffn,
+                &self.post_attn_norm,
+                hc_streams,
+                hidden,
+                normed,
+                post,
+                comb,
+                mix_scratch,
+                n,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                eps,
+                "ffn",
+                ctx,
+                stream,
+            )?;
+        } else if prefill_hc_rms::hc_tiled_enabled()
+            && self.hc_pre_mix_tiled_k.0 != 0
             && self.hc_pre_finish_k.0 != 0
             && n >= 64
             && h == 4096
@@ -805,7 +929,7 @@ impl Qwen3AttentionLayer {
                 hidden,
                 post,
                 comb,
-                ctx.buffers.expert_up_out(),
+                mix_scratch,
                 n,
                 h as u32,
                 hc_mult,
@@ -815,24 +939,29 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-        ops::hc_pre(
-            ctx.gpu,
-            self.hc_pre_k,
-            hc_streams,
-            hc.ffn.hc_fn,
-            hc.ffn.hc_scale,
-            hc.ffn.hc_base,
-            hidden,
-            post,
-            comb,
-            n,
-            h as u32,
-            hc_mult,
-            hc.sinkhorn_iters as u32,
-            eps,
-            hc.hc_eps,
-            stream,
-        )?;
+            ops::hc_pre(
+                ctx.gpu,
+                self.hc_pre_k,
+                hc_streams,
+                hc.ffn.hc_fn,
+                hc.ffn.hc_scale,
+                hc.ffn.hc_base,
+                hidden,
+                post,
+                comb,
+                n,
+                h as u32,
+                hc_mult,
+                hc.sinkhorn_iters as u32,
+                eps,
+                hc.hc_eps,
+                stream,
+            )?;
+        }
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::HcPreFfn, ctx.gpu, hidden, stream)?;
+            capture.stage(Stage::PostFfn, ctx.gpu, post, stream)?;
+            capture.stage(Stage::CombFfn, ctx.gpu, comb, stream)?;
         }
         if diag_this {
             super::diag_norm(
@@ -858,25 +987,50 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        let normed2 = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.post_attn_norm,
-            normed2,
-            n,
-            h as u32,
-            eps,
+        let normed2 = normed;
+        if !use_hc_rms_ffn {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.post_attn_norm,
+                normed2,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
+        hprof!("hc1_mid");
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::NormFfn, ctx.gpu, normed2, stream)?;
+        }
+
+        use crate::layers::moe::vision_l0_dump::{MoeCapture, Stage as MoeStage};
+        let mut moe_capture = MoeCapture::begin(
+            self.attn_layer_idx,
+            num_tokens,
+            seq_len_start,
+            kv_write_start,
+            batched_meta.is_some(),
+            ctx,
             stream,
         )?;
-        hprof!("hc1_mid");
-
+        if let Some(capture) = &mut moe_capture {
+            capture.stage(MoeStage::FfnInput, ctx.gpu, normed2, stream)?;
+        }
         self.ffn
-            .forward_prefill(normed2, num_tokens, ctx, stream)
+            .forward_prefill_observed(normed2, num_tokens, ctx, stream, moe_capture.as_mut())
             .map_err(|e| anyhow::anyhow!("ffn.forward_prefill (HC) failed: {e}"))?;
+        if let Some(capture) = moe_capture {
+            capture.finish()?;
+        }
 
         let dense_out = ctx.buffers.moe_output();
+
+        if let Some(capture) = &mut capture {
+            capture.stage(Stage::MoeOut, ctx.gpu, dense_out, stream)?;
+        }
 
         if let Some(ref post_norm) = self.post_ffn_out_norm {
             ops::rms_norm(
@@ -907,6 +1061,10 @@ impl Qwen3AttentionLayer {
             stream,
         )?;
         hprof!("hc2_post_ffn");
+        if let Some(mut capture) = capture {
+            capture.stage(Stage::HcPostFfn, ctx.gpu, hc_streams, stream)?;
+            capture.finish()?;
+        }
         if diag_this {
             super::diag_norm(
                 ctx.gpu,

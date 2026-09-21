@@ -9,6 +9,8 @@
 mod handlers;
 mod handlers_stream;
 mod helpers;
+mod image_validation;
+mod ordered_blocks;
 mod to_ir;
 mod translate;
 mod translator;

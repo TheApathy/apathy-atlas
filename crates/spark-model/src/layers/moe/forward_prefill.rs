@@ -2,43 +2,23 @@
 
 //! MoeLayer::forward_prefill.
 
+use super::vision_l0_dump::{MoeCapture, Stage};
 use super::*;
 
 impl MoeLayer {
-    /// N-token prefill via grouped GEMM: sort-by-expert → tensor-core GEMM per expert.
-    ///
-    /// Each expert's weight matrix is loaded once (not per-token), cutting LPDDR5X
-    /// reads from ~6 GB (GEMV) to ~150 MB (grouped GEMM) at N=1024.
-    ///
-    /// Pipeline: gate → topK → sort → grouped gate/up GEMM → SiLU → grouped down GEMM
-    ///           → unpermute + weighted reduce → shared expert blend.
-    /// Shared expert uses checkpoint-native BF16 when installed, otherwise W4A16.
     #[allow(unused_assignments)]
-    pub fn forward_prefill(
+    pub(crate) fn forward_prefill_observed(
         &self,
-        input: DevicePtr, // [num_tokens, H] BF16 — normed MoE input
+        input: DevicePtr,
         num_tokens: usize,
         ctx: &ForwardContext,
         stream: u64,
+        mut capture: Option<&mut MoeCapture>,
     ) -> Result<()> {
-        // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
-        // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
-        // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill
-        // pipeline launches additional kernels that are null on the HIP module
-        // set → cuLaunchKernel hipErrorInvalidHandle at layer 0 for any prefill
-        // chunk >64 tokens. forward_batched is the correct, complete per-token
-        // path (its kernels are all bit-exact-verified on HIP) — route there for
-        // ALL token counts on atlas_hip. SCALE keeps grouped (its symlinked
-        // grouped GEMM is real via PTX-recompile); NVIDIA byte-unchanged.
-        //
-        // EXCEPTION: the FP8 routed grouped GEMM (moe_fp8_grouped_gemm) has now
-        // been ported to HIP WMMA (kernels/strix-hip/common/moe_fp8_grouped_gemm.cu
-        // — weight-stationary per-expert, register-prefetch double-buffered, two-
-        // level FP32 block-scale accumulation matching the GB10/oracle numerics),
-        // so long FP8 prefills (>64 tokens) take the grouped path on atlas_hip too
-        // — amortizing the ~50 GB/layer per-token weight re-streaming of
-        // forward_batched. The BF16-dequant grouped GEMM is NOT ported (its
-        // strix-hip kernel is still absent), so its branch stays HIP-batched.
+        if let Some(capture) = capture.as_deref_mut() {
+            capture.validate_moe(self)?;
+        }
+        // HIP dispatch rationale is preserved with the public wrapper in forward_prefill_phase.rs.
         let hip_force_batched = cfg!(atlas_hip);
         // FP8 grouped path is HIP-ready (kernel ported); do not force-batch it.
         let hip_force_batched_fp8 = false;
@@ -152,6 +132,7 @@ impl MoeLayer {
                 stream,
                 use_overlap,
                 ctx,
+                capture.as_deref_mut(),
             )?;
         }
         prof_step!("shared_expert");
@@ -221,7 +202,9 @@ impl MoeLayer {
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch;
         let weights_dev = scratch.offset(total_expanded as usize * 4);
-        if let Some(tid2eid) = self.tid2eid_dev {
+        if self.route_deepseek_visual(ctx, gate_logits, indices_dev, weights_dev, 0, n, stream)? {
+            // Mixed-token routing completed before any hash-table lookup.
+        } else if let Some(tid2eid) = self.tid2eid_dev {
             // DeepSeek-V4 hash routing (hash_moe layer): static
             // `tid2eid[token_id]` selection, sqrtsoftplus-weighted.
             let token_ids = ctx.token_ids.ok_or_else(|| {
@@ -364,27 +347,66 @@ impl MoeLayer {
         )?;
         let expert_down_out = ctx.buffers.expert_down_out();
 
-        // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
+        // 7-8. Unpermute + weighted reduce, then optionally blend the shared
+        // expert. The exact EXL3 H4096 opt-in combines both launches while
+        // preserving the routed BF16 materialization boundary numerically.
         let output = ctx.buffers.moe_output();
-        ops::moe_unpermute_reduce_indexed(
-            ctx.gpu,
-            self.moe_unpermute_reduce,
-            expert_down_out,
-            output,
-            token_to_perm,
-            weights_dev,
-            h,
-            n,
-            top_k,
-            stream,
-        )?;
+        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        let shared_down_out = ctx.buffers.attn_output();
+        let can_fuse_blend = has_shared
+            && !is_ep_prefill
+            && !use_overlap
+            && !ctx.graph_capture
+            && !super::dump::enabled();
+        let fused_blend_done = can_fuse_blend
+            && self.try_exl3_fused_post_unpermute_blend(
+                expert_down_out,
+                output,
+                token_to_perm,
+                weights_dev,
+                sorted_expert_ids,
+                shared_down_out,
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                n,
+                top_k,
+                ctx,
+                stream,
+            )?;
+
+        if !fused_blend_done
+            && !self.try_exl3_fused_post_unpermute(
+                expert_down_out,
+                output,
+                token_to_perm,
+                weights_dev,
+                sorted_expert_ids,
+                h,
+                n,
+                top_k,
+                ctx,
+                stream,
+            )?
+        {
+            ops::moe_unpermute_reduce_indexed(
+                ctx.gpu,
+                self.moe_unpermute_reduce,
+                expert_down_out,
+                output,
+                token_to_perm,
+                weights_dev,
+                h,
+                n,
+                top_k,
+                stream,
+            )?;
+        }
 
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
         // EP fix: defer shared expert blend until AFTER all-reduce to avoid doubling.
-        let is_ep_prefill = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-        if has_shared && !is_ep_prefill {
-            let shared_down_out = ctx.buffers.attn_output();
+        if has_shared && !is_ep_prefill && !fused_blend_done {
             if use_overlap {
                 ctx.gpu.stream_wait_event(stream, self.event_b)?;
             }
@@ -398,6 +420,10 @@ impl MoeLayer {
                 n,
                 h,
             )?;
+            if let Some(capture) = capture.as_deref_mut() {
+                capture.stage(Stage::SharedAfterRouted, ctx.gpu, shared_down_out, stream)?;
+                capture.stage(Stage::RoutedOnly, ctx.gpu, output, stream)?;
+            }
             ops::moe_batched_blend(
                 ctx.gpu,
                 self.moe_batched_blend,
@@ -409,6 +435,9 @@ impl MoeLayer {
                 n,
                 stream,
             )?;
+            if let Some(capture) = capture.as_deref_mut() {
+                capture.stage(Stage::MoeBlended, ctx.gpu, output, stream)?;
+            }
         }
         super::dump::dump_moe_out(ctx.gpu, stream, output, n, h)?;
         prof_step!("unpermute_blend");

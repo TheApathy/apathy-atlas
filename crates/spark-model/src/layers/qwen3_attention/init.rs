@@ -179,6 +179,11 @@ impl Qwen3AttentionLayer {
                 "hyper_connection",
                 "hc_pre_mix_tiled",
             ),
+            v4_hc_pre_finish_rms_fused_k: super::super::try_kernel(
+                gpu,
+                "v4_hc_pre_finish_rms_fused",
+                "v4_hc_pre_finish_rms_fused",
+            ),
             hc_pre_fused_k: super::super::try_kernel(gpu, "hyper_connection", "hc_pre_fused"),
             hc_post_k: super::super::try_kernel(gpu, "hyper_connection", "hc_post"),
             hc_expand_k: super::super::try_kernel(gpu, "hyper_connection", "hc_expand"),
@@ -237,11 +242,7 @@ impl Qwen3AttentionLayer {
                 "dense_gemv_bf16_batchm",
             ),
             w4a16_gemv_k: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
-            w4a16_gemv_grouped_k: super::super::try_kernel(
-                gpu,
-                "w4a16_gemv",
-                "w4a16_gemv_grouped",
-            ),
+            w4a16_gemv_grouped_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_grouped"),
             w4a16_gemv_grouped_batchm_k: super::super::try_kernel(
                 gpu,
                 "w4a16_gemv",
@@ -486,6 +487,21 @@ impl Qwen3AttentionLayer {
                 "mla_absorbed",
                 "v4_decode_cache_fused_fp8",
             ),
+            v4_prefill_qb_norm_rope_fused_k: super::super::try_kernel(
+                gpu,
+                "v4_prefill_qb_norm_rope_fused",
+                "v4_prefill_qb_norm_rope_fused",
+            ),
+            v4_prefill_cache_kfull_fp8_fused_k: super::super::try_kernel(
+                gpu,
+                "v4_prefill_cache_kfull_fp8_fused",
+                "v4_prefill_cache_kfull_fp8_fused",
+            ),
+            v4_prefill_rope_fused_inverse_k: super::super::try_kernel(
+                gpu,
+                "v4_prefill_rope_fused_inverse",
+                "v4_prefill_rope_fused_inverse",
+            ),
             prefill_attn_mla320_k: super::super::try_kernel(
                 gpu,
                 "mla_prefill_attn",
@@ -624,6 +640,16 @@ impl Qwen3AttentionLayer {
                 gpu,
                 "prefill_attn_compressed",
                 "prefill_attn_compressed_tc2",
+            ),
+            v4_prefill_attn_compressed_tc2_warp0_k: super::super::try_kernel(
+                gpu,
+                "v4_prefill_attn_compressed_tc2_warp0",
+                "v4_prefill_attn_compressed_tc2_warp0",
+            ),
+            deepseek_vision_prefill_attn_k: super::super::try_kernel(
+                gpu,
+                "deepseek_vision_prefill_attn",
+                "deepseek_vision_prefill_attn",
             ),
             v4_comp_pool_filled: std::sync::atomic::AtomicU32::new(0),
             // Device mirror of the above; allocated (compressor layers only) by
@@ -787,6 +813,7 @@ impl Qwen3AttentionLayer {
             o_fp8: None,
             fp8_gemm_k: gpu.kernel("w4a16", "fp8_gemm_t")?,
             bf16_to_fp8_k: gpu.kernel("w4a16", "bf16_to_fp8")?,
+            bf16_to_fp8_scaled_k: super::super::try_kernel(gpu, "w4a16", "bf16_to_fp8_scaled"),
             fp8_fp8_gemm_k: gpu.kernel("w4a16", "fp8_fp8_gemm_t")?,
             fp8_gemm_t_m128_k: gpu.kernel("w4a16", "fp8_gemm_t_m128")?,
             fp8_fp8_gemm_t_m128_k: gpu.kernel("w4a16", "fp8_fp8_gemm_t_m128")?,

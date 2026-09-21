@@ -2,7 +2,7 @@
 
 //! Prefill-budget + KV-cache dtype resolution.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use atlas_core::config::ModelConfig;
 
@@ -169,6 +169,21 @@ pub(crate) struct KvCacheConfig {
     pub(crate) hss_cache_blocks_per_seq: Option<u32>,
 }
 
+fn require_safe_fp8_kv_scale_source(
+    calibration_tokens: usize,
+    fp8_kv_scale_count: usize,
+) -> Result<()> {
+    if calibration_tokens == 0 && fp8_kv_scale_count == 0 {
+        bail!(
+            "FP8 KV cache has neither online calibration nor checkpoint scales; refusing to use \
+             the uncalibrated 1.0 scale because it clips activations and destroys dynamic range. \
+             Enable --fp8-kv-calibration-tokens with a positive value, use a checkpoint with \
+             static k_scale/v_scale tensors, or select --kv-cache-dtype nvfp4/bf16."
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_kv_cache_config(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -210,6 +225,7 @@ pub(crate) fn resolve_kv_cache_config(
     };
     let kv_dtype: spark_runtime::kv_cache::KvCacheDtype = effective_kv_dtype_str.parse()?;
     if kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8 {
+        require_safe_fp8_kv_scale_source(config.fp8_kv_calibration_tokens, fp8_kv_scale_count)?;
         let has_ckpt_scales = fp8_kv_scale_count > 0;
         if config.fp8_kv_calibration_tokens > 0 {
             if has_ckpt_scales {
@@ -225,7 +241,7 @@ pub(crate) fn resolve_kv_cache_config(
                 tracing::info!(
                     "FP8 KV cache with online calibration (checkpoint ships no k/v scales): \
                      freezing per-tensor scales on the first observed tokens.{}",
-                    if args.fp8_kv_calibration_tokens == 0 {
+                    if args.fp8_kv_calibration_tokens.is_none() {
                         " (auto-enabled from MODEL.toml)"
                     } else {
                         ""
@@ -240,13 +256,6 @@ pub(crate) fn resolve_kv_cache_config(
                 "FP8 KV cache using {} per-layer k_scale/v_scale tensors from the checkpoint — \
                  no calibration needed.",
                 fp8_kv_scale_count,
-            );
-        } else {
-            tracing::warn!(
-                "FP8 KV cache selected but the checkpoint ships NO k_scale/v_scale tensors \
-                 (defaulting to 1.0, which silently clips BF16 into E4M3 range [-448, 448] and \
-                 destroys dynamic range). Enable --fp8-kv-calibration-tokens 256 for online \
-                 calibration, or use --kv-cache-dtype nvfp4/bf16."
             );
         }
     }
@@ -290,6 +299,7 @@ pub(crate) fn resolve_kv_cache_config(
         kv_hp_layers,
         spark_runtime::kv_cache::KvCacheDtype::Bf16,
     );
+    spark_model::factory::vision_kv::validate_deepseek_vision_kv(config, kv_dtype, &layer_dtypes)?;
     let hss_cache_blocks_per_seq = if args.high_speed_swap {
         Some(args.high_speed_swap_cache_blocks_per_seq)
     } else {
@@ -301,4 +311,29 @@ pub(crate) fn resolve_kv_cache_config(
         layer_dtypes,
         hss_cache_blocks_per_seq,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_safe_fp8_kv_scale_source;
+
+    #[test]
+    fn fp8_without_calibration_or_checkpoint_scales_is_rejected() {
+        let error = require_safe_fp8_kv_scale_source(0, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("FP8 KV cache has neither online calibration nor checkpoint scales")
+        );
+    }
+
+    #[test]
+    fn fp8_online_calibration_is_an_accepted_scale_source() {
+        require_safe_fp8_kv_scale_source(256, 0).unwrap();
+    }
+
+    #[test]
+    fn fp8_checkpoint_scales_are_an_accepted_scale_source() {
+        require_safe_fp8_kv_scale_source(0, 61).unwrap();
+    }
 }

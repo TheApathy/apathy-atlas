@@ -546,6 +546,33 @@ extern "C" __global__ void bf16_to_fp8(
     *(unsigned short*)&dst[idx] = fp8_pair;
 }
 
+// Scale-aware sibling for persistent FP8 stores whose readers dequantize with
+// one per-tensor scale. Keeping this separate preserves every existing scale-1
+// activation-conversion call site and its exact instruction stream.
+extern "C" __global__ void bf16_to_fp8_scaled(
+    const __nv_bfloat16* __restrict__ src,
+    unsigned char* __restrict__ dst,
+    unsigned int total_elements,
+    float scale
+) {
+    unsigned int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (idx >= total_elements) return;
+
+    const float inv_scale = 1.0f / scale;
+    unsigned int p = *(const unsigned int*)&src[idx];
+    unsigned short bf0 = (unsigned short)(p & 0xFFFFu);
+    unsigned short bf1 = (unsigned short)(p >> 16);
+    float f0, f1;
+    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f0) : "h"(bf0));
+    asm volatile("cvt.f32.bf16 %0, %1;" : "=f"(f1) : "h"(bf1));
+    f0 *= inv_scale;
+    f1 *= inv_scale;
+    unsigned short fp8_pair;
+    asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+                 : "=h"(fp8_pair) : "f"(f1), "f"(f0));
+    *(unsigned short*)&dst[idx] = fp8_pair;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // FP8×FP8 GEMM: A [M, K] FP8 E4M3 × B [N, K] FP8 E4M3 → C [M, N] BF16
 //

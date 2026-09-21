@@ -1297,7 +1297,11 @@ fn main() -> Result<()> {
             "  GATE 2 PASS: partitioned gate m1u+{dup} / down multiplicity buckets == \
              {tokens}x _v2s4, worst rel {worst:.2e} \
              (bound {REL_MAX:.2e}){exact}",
-            dup = if tokens as u32 > MROW_M6 { "m8d" } else { "m6d" },
+            dup = if tokens as u32 > MROW_M6 {
+                "m8d"
+            } else {
+                "m6d"
+            },
             exact = if exact { ", bit-identical" } else { "" }
         );
     }
@@ -1337,7 +1341,9 @@ fn main() -> Result<()> {
             }
         }
         if bad > 0 {
-            bail!("GATE V2 FAILED: _m{mrow}v4s4 is not bit-identical to _m{mrow}v2s4 ({bad} elems)");
+            bail!(
+                "GATE V2 FAILED: _m{mrow}v4s4 is not bit-identical to _m{mrow}v2s4 ({bad} elems)"
+            );
         }
         println!("  GATE V2 PASS: _m{mrow}v4s4 == _m{mrow}v2s4, bit-identical (all 6 outputs)");
     } else if !v2_available {

@@ -615,20 +615,26 @@ impl TransformerModel {
                 n,
             )
         } else {
-            for span in layout.spans(start_row, num_tokens) {
-                let input = self
-                    .buffers
-                    .hc_streams()
-                    .offset(span.src_row * self.config.hc_mult * h * 2);
-                let out = self
-                    .dspark_dump_buf
-                    .offset((slot * self.dspark_dump_rows + span.dst_row) * h * 2);
+            let addresses = layout
+                .addresses(
+                    start_row,
+                    num_tokens,
+                    slot,
+                    self.dspark_capture_layers.len(),
+                    self.buffers.max_batch_tokens(),
+                    h,
+                    self.config.hc_mult,
+                )
+                .map_err(anyhow::Error::msg)?;
+            for address in addresses {
+                let input = self.buffers.hc_streams().offset(address.source_offset);
+                let out = self.dspark_dump_buf.offset(address.destination_offset);
                 crate::layers::ops::hc_mean(
                     self.gpu.as_ref(),
                     self.hc_mean_k,
                     input,
                     out,
-                    span.rows as u32,
+                    address.rows,
                     h as u32,
                     self.config.hc_mult as u32,
                     stream,
@@ -724,9 +730,9 @@ impl TransformerModel {
         }
         let mut host = vec![0u8; n * h * 2];
         for slot in 0..nl {
-            let src = self
-                .dspark_dump_buf
-                .offset((slot * self.dspark_dump_rows + start_pos.min(self.dspark_dump_rows)) * h * 2);
+            let src = self.dspark_dump_buf.offset(
+                (slot * self.dspark_dump_rows + start_pos.min(self.dspark_dump_rows)) * h * 2,
+            );
             self.gpu.copy_d2h(src, &mut host)?;
             w.write_all(&host)?;
         }
@@ -740,11 +746,12 @@ impl TransformerModel {
     /// capacity. NULL/0 unless ATLAS_DSPARK_CAPTURE=1 (or the dump probe)
     /// armed the capture at model build. The factory hands this to
     /// `DsparkDraftHead::set_capture` when installing the block drafter.
-    pub fn dspark_capture_buf(&self) -> (DevicePtr, usize, bool) {
+    pub fn dspark_capture_buf(&self) -> (DevicePtr, usize, bool, &[usize]) {
         (
             self.dspark_dump_buf,
             self.dspark_dump_rows,
             self.dspark_capture_ring,
+            &self.dspark_capture_layers,
         )
     }
 

@@ -326,6 +326,8 @@ pub struct InferenceResponse {
     /// i+1. Empty unless requested. The handler prepends the null entry
     /// for the first prompt token (no preceding context).
     pub prompt_logprobs: Vec<TokenLogprobs>,
+    /// Request-scoped scheduler-path evidence for benchmark classification.
+    pub engine: crate::ir::EngineUsage,
 }
 
 /// Events sent during streaming generation.
@@ -350,6 +352,8 @@ pub enum StreamEvent {
         /// "fuzzy_repetition"), if any — dump/observability only, never
         /// part of the OpenAI wire format.
         guard_stop: Option<&'static str>,
+        /// Request-scoped scheduler-path evidence for benchmark classification.
+        engine: crate::ir::EngineUsage,
     },
     Error(String),
 }

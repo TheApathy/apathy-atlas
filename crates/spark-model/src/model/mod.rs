@@ -24,6 +24,7 @@
 #![allow(unused_imports, dead_code)]
 
 pub(crate) mod block_mgmt;
+mod deepseek_vision;
 pub(crate) mod drop;
 pub(crate) mod dspark_capture;
 pub(crate) mod impl_a1;

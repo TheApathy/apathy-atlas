@@ -49,6 +49,9 @@ pub struct AppState {
     /// authoritative active slot.
     pub active_adapter: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub max_seq_len: usize,
+    /// Effective scheduler concurrency, used for image ownership admission.
+    pub max_batch_size: usize,
+    pub yarn_context: bool,
     pub request_tx: mpsc::Sender<InferenceRequest>,
     /// LoRA adapter-rotation control channel (`POST /v1/lora/active`). `None`
     /// when no adapter is loaded. Carries `(adapter_name, ack)` to the
@@ -56,6 +59,12 @@ pub struct AppState {
     pub rotation_tx: Option<mpsc::Sender<crate::scheduler::LoraRotation>>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,
+    /// Dedicated Vision-Exp architecture; never interpreted as Qwen vision.
+    pub deepseek_vision_config: Option<atlas_core::config::DeepSeekVisionConfig>,
+    /// Physical text embedding vocabulary; virtual image sentinels start here.
+    pub deepseek_vision_vocab: Option<u32>,
+    /// Conservative initial-chunk budget for complete image visibility.
+    pub initial_prefill_tokens: usize,
     /// Optional vLLM-style image area cap applied before vision patching.
     pub vision_max_pixels: Option<usize>,
     /// Default sampling temperature from generation_config.json.
@@ -73,6 +82,13 @@ pub struct AppState {
     /// be cloned into per-request `GrammarSpec::ToolCall { parser, … }`
     /// for symmetric grammar dispatch via the trait.
     pub tool_call_parser: Option<std::sync::Arc<dyn tool_parser::ToolCallParser>>,
+    /// DeepSeek-V4 rendered-prefix gate for the opt-in tool protocol reminder.
+    /// `None` keeps every prompt byte-identical to the pre-feature behavior.
+    pub ds4_tool_call_reminder_min_bytes: Option<usize>,
+    /// Opt-in one-shot retry for DeepSeek-V4 tool-call slips.
+    pub ds4_tool_slip_resample: bool,
+    /// Selective DeepSeek-V4 slip recorder; separate from the all-request dump.
+    pub ds4_tool_slip_dump_writer: Option<request_dumper::DumpHandle>,
     /// Reasoning parser for thinking block detection. None = no thinking support.
     pub reasoning_parser: Option<Box<dyn reasoning_parser::ReasoningParser>>,
     /// Token ID for end-of-thinking — used to split thinking from content in blocking path.

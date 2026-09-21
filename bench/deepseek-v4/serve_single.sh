@@ -15,6 +15,8 @@
 #   MODEL_DIR=/path/to/checkpoint bash bench/deepseek-v4/serve_single.sh
 #
 set -uo pipefail
+# Host-safety: refuse to load on top of another model (two ~95 GB loads crashed the host twice on 2026-09-02).
+/var/tmp/atlas-bringup-logs/gpu_preflight.sh 100 || exit 75
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 
@@ -50,13 +52,22 @@ LM_HEAD_DTYPE="${LM_HEAD_DTYPE:-fp8}"
 # 18.0 -> 21.0 tok/s, gated 2026-08-02 (GSM8K 12/12, longgen 0 regressions vs
 # the BF16 baseline). ATLAS_V4_ATTN_NVFP4=0 restores the FP8 mirrors.
 export ATLAS_V4_ATTN_NVFP4="${ATLAS_V4_ATTN_NVFP4:-1}"
+# Release the BF16 intermediates after the NVFP4 transcode. The loader keeps
+# them resident by default ("the FP8 mirrors stay resident"); the DSpark serve
+# script measured this flag freeing 8.06 GiB. It is the single cheapest OOM
+# margin available and costs nothing on the single-token decode path.
+export ATLAS_V4_ATTN_RELEASE_BF16="${ATLAS_V4_ATTN_RELEASE_BF16:-1}"
 
 MODEL_DIR="${MODEL_DIR:-/home/flocka/models/DeepSeek-V4-Flash-162B}"
 BIN="${DS4_BIN:-$REPO/target/release/spark}"
 PORT="${PORT:-8899}"
 HOST="${HOST:-127.0.0.1}"
 KV_DTYPE="${KV_DTYPE:-fp8}"                       # fp8 REQUIRED for coherence
-GPU_MEM="${GPU_MEM:-0.94}"                        # 0.94*119 ~= 112 GB budget
+# 0.94 (~112 GB) took the host down on 2026-09-02: the ATLAS_V4_ATTN_NVFP4
+# transcode allocates ~0.5 GB/layer AFTER the loader's preflight, and GB10
+# unified memory kills the host on over-allocation instead of erroring.
+# 0.86 leaves ~16 GB for that plus KV/graphs. Raise deliberately, not by default.
+GPU_MEM="${GPU_MEM:-0.86}"
 # 12288 (not 16384): the NVFP4 attention mirrors (~2.2 GB) + the BF16
 # prefill fallbacks squeeze the KV pool at gpu_mem 0.94-0.96; 16384 no longer
 # boots. Freeing the BF16 fallbacks (switch prefill to the FP8 GEMMs) is the

@@ -69,6 +69,7 @@ pub(super) async fn run_blocking(
     let mut sum_reasoning = 0usize;
     let mut last_ttft = 0.0f64;
     let mut last_tps = 0.0f64;
+    let mut engine = crate::ir::EngineUsage::default();
 
     for (prompt_i, prompt_tokens) in prompts.iter().enumerate() {
         for n_i in 0..n {
@@ -187,6 +188,7 @@ pub(super) async fn run_blocking(
             sum_completion += response.output_tokens.len();
             sum_cached += response.cached_prompt_tokens as usize;
             sum_reasoning += response.reasoning_tokens as usize;
+            engine.merge(response.engine);
             last_ttft = response.time_to_first_token_ms;
             last_tps = if response.decode_time_ms > 0.0 {
                 (response.output_tokens.len().saturating_sub(1)) as f64
@@ -220,6 +222,7 @@ pub(super) async fn run_blocking(
         }),
         time_to_first_token_ms: last_ttft,
         response_tokens_per_second: last_tps,
+        atlas_engine: crate::openai::atlas_engine_usage(Some(engine)),
     };
 
     Json(CompletionResponse::from_choices(

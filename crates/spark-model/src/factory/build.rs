@@ -60,6 +60,41 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    let vision_dspark_candidate = super::vision_speculation_loaded::validate(
+        &config,
+        store,
+        dflash_args.as_ref(),
+        super::vision_speculation::factory_legacy_speculation(
+            use_speculative,
+            self_speculative,
+            dflash_args.is_some(),
+        ),
+        hss_cache_blocks_per_seq.is_some(),
+        max_batch_tokens,
+        lora_args.is_some(),
+    )?;
+    super::vision_admission::validate_deepseek_vision_execution(
+        config.deepseek_vision.is_some(),
+        (!use_speculative && !self_speculative && dflash_args.is_none()) || vision_dspark_candidate,
+        comm.is_none() && config.ep_world_size <= 1 && config.tp_world_size <= 1,
+        max_batch_size,
+        prefix_cache.is_active(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    crate::weight_loader::deepseek_v4::dspark::capture_plan::capture_layers_from_env(
+        config.num_hidden_layers,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let vision_hc_bf16 =
+        crate::layers::qwen3_attention::vision_hc_bf16::VisionHcBf16::from_env(&config)?;
+    vision_hc_bf16.validate_execution(
+        max_batch_size,
+        comm.is_none() && config.ep_world_size <= 1 && config.tp_world_size <= 1,
+        !use_speculative && !self_speculative && dflash_args.is_none(),
+    )?;
+    vision_hc_bf16.validate_kernel(gpu.as_ref())?;
+    super::vision_kv::validate_deepseek_vision_kv(&config, kv_dtype, &layer_dtypes)?;
+
     // NLLB / M2M-100 is an encoder-decoder model that cannot be represented by
     // the decoder-only TransformerModel stack. Serve it with the dedicated
     // `NllbGpuModel`, which reads its weights from the standard `store` — this
@@ -239,6 +274,31 @@ pub fn build_model(
         );
     }
     let vision_encoder = loader.load_vision_encoder(store, &config, gpu.as_ref())?;
+    let deepseek_vision_encoder = if let Some(vision) = &config.deepseek_vision {
+        anyhow::ensure!(
+            !prefix_cache.is_active(),
+            "DeepSeek Vision currently requires prefix caching disabled"
+        );
+        anyhow::ensure!(
+            max_batch_size == 1 && config.ep_world_size <= 1 && config.tp_world_size <= 1,
+            "DeepSeek Vision currently requires single-GPU C1"
+        );
+        anyhow::ensure!(
+            (!use_speculative && !self_speculative && dflash_args.is_none())
+                || vision_dspark_candidate,
+            "DeepSeek Vision speculative decoding is not yet qualified; use target-only"
+        );
+        Some(
+            crate::weight_loader::deepseek_v4::vision::load_vision_encoder(
+                store,
+                vision,
+                config.hidden_size,
+                gpu.as_ref(),
+            )?,
+        )
+    } else {
+        None
+    };
 
     // If the checkpoint's `quantization_config.ignore_modules` lists MTP
     // (e.g. Sehyo/Qwen3.5-35B-A3B-NVFP4 ignores `mtp.*`), the MTP weights
@@ -626,6 +686,10 @@ pub fn build_model(
         ssm_checkpoint_interval,
     )?;
 
+    if let Some(encoder) = deepseek_vision_encoder {
+        model.install_deepseek_vision(encoder);
+    }
+
     // ── Step 6b: DeepSeek-V4 MTP proposer (optional, post-construction) ──
     //
     // Built here (not inside `new()`, which only knows the Qwen-shaped
@@ -694,12 +758,12 @@ pub fn build_model(
                 max_seq_len,
                 model.gpu_backend(),
             )?;
-            let (cap_buf, cap_rows, cap_ring) = model.dspark_capture_buf();
+            let (cap_buf, cap_rows, cap_ring, cap_layers) = model.dspark_capture_buf();
             anyhow::ensure!(
                 !cap_buf.is_null(),
                 "DSpark drafter needs the hc-mean capture: set ATLAS_DSPARK_CAPTURE=1"
             );
-            head.set_capture(cap_buf, cap_rows, cap_ring)?;
+            head.set_capture(cap_buf, cap_rows, cap_ring, cap_layers)?;
             model.set_dflash_proposer(std::sync::Arc::new(head));
             tracing::info!("DSpark block drafter installed as the active proposer");
             return Ok(Box::new(model));

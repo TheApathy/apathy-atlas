@@ -68,6 +68,26 @@ pub fn fp8_gemm_n128(
             .arg_u32(k)
             .launch(stream);
     }
+    fp8_gemm_n128_bf16_input(gpu, kernel, input, b_fp8, output, m, n, k, stream)
+}
+
+/// Pre-dequanted FP8-weight GEMM with BF16 input and exactly one launch.
+///
+/// This is the arithmetic-isolation arm for quality-gated experiments which
+/// must not inherit [`fp8_gemm_n128`]'s default BF16-to-FP8 activation pass.
+/// Grid: `(ceil(N/128), ceil(M/64), 1)`, block: `(128, 1, 1)`.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_n128_bf16_input(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    b_fp8: DevicePtr,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, 128), div_ceil(m, 64), 1])
         .block([128, 1, 1])
@@ -205,6 +225,28 @@ pub fn bf16_to_fp8(
         .arg_ptr(src)
         .arg_ptr(dst)
         .arg_u32(total_elements)
+        .launch(stream)
+}
+
+/// Convert BF16 values to FP8 E4M3 using one positive dequantization scale.
+/// Quantization stores `fp8 = bf16 / scale`, matching FP8 KV-cache writes.
+pub fn bf16_to_fp8_scaled(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    src: DevicePtr,
+    dst: DevicePtr,
+    total_elements: u32,
+    scale: f32,
+    stream: u64,
+) -> Result<()> {
+    let threads_needed = total_elements / 2;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(threads_needed, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(src)
+        .arg_ptr(dst)
+        .arg_u32(total_elements)
+        .arg_f32(scale)
         .launch(stream)
 }
 

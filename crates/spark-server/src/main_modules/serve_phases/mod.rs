@@ -11,7 +11,12 @@ mod preflight;
 mod runtime;
 mod tokenizer_runtime;
 mod topology;
+mod vision_context;
+mod vision_dspark;
 mod weights;
+
+pub(super) use vision_context::text_only_yarn_context;
+pub(super) use vision_dspark::validate_request as validate_vision_dspark_request;
 
 pub(super) use build::{
     build_high_speed_swap_config, build_model, build_prefix_cache, maybe_run_ep_worker,
@@ -29,7 +34,8 @@ pub(super) use preflight::{
 };
 pub(super) use runtime::{
     SamplingDefaults, load_eos_tokens, load_sampling_defaults, log_behavior_audit,
-    log_response_store_audit, open_dump_writer, resolve_model_name, resolve_tool_call_parser,
+    log_response_store_audit, open_dump_writer, open_tool_slip_dump_writer, resolve_model_name,
+    resolve_tool_call_parser,
 };
 pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};

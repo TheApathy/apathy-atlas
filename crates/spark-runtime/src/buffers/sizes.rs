@@ -243,7 +243,16 @@ impl BufferSizes {
             k_max * config.intermediate_size
         };
         let expert_gate_out = expert_inter * bf16;
-        let expert_up_out = expert_inter * bf16;
+        // The opt-in DeepSeek-V4 EXL3 dual pre-rotation keeps gate's H4096
+        // rows in expert_down_out and up's H4096 rows here until the up GEMM.
+        // Freeze this capacity from the model shape, not the runtime env flag,
+        // so allocation and dispatch cannot drift after model construction.
+        let exl3_rotated_up = if config.model_type == "deepseek_v4" {
+            k_max * top_k * h
+        } else {
+            0
+        };
+        let expert_up_out = expert_inter.max(exl3_rotated_up) * bf16;
         // Routed expert down output: [k_max * top_k, moe_input_size].
         // For LatentMoE (Super 120B), routed experts output in latent space.
         let moe_out_dim = config.moe_input_size();

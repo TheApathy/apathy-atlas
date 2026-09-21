@@ -43,6 +43,9 @@
 use anyhow::{Context, Result, ensure};
 use spark_runtime::kernel_args::KernelLaunch;
 
+use super::persistent_work::{
+    EXL3_M16_MAX_ROWS, EXL3_M16_WORK_CAPACITY, EXL3_M16_WORK_RECORD_BYTES,
+};
 use super::*;
 use crate::weight_map::Exl3ExpertWeight;
 
@@ -58,6 +61,13 @@ const EXL3_MAX_N: u32 = 4096;
 /// `2·top_k` group count against a pathological config before it can silently
 /// overrun `ws`/`counters`.
 const EXL3_MAX_TOP_K: u32 = 32;
+const EXL3_PERSISTENT_ROWS: [u32; 2] = [6, EXL3_M16_MAX_ROWS as u32];
+const EXL3_PERSISTENT_TOP_K: u32 = 6;
+const EXL3_PERSISTENT_WORK_CAPACITIES: [u32; 2] =
+    [6 * EXL3_PERSISTENT_TOP_K, EXL3_M16_WORK_CAPACITY as u32];
+const EXL3_PERSISTENT_WORK_BYTES: usize = EXL3_M16_WORK_CAPACITY * EXL3_M16_WORK_RECORD_BYTES;
+const EXL3_PERSISTENT_STATE_BYTES: usize = 16;
+const EXL3_PERSISTENT_CTAS: u32 = 96;
 
 /// Compiled `exl3_gemv_mrow_fused_*` ladder rungs, ascending. An `MROW = R`
 /// entry is correct for any `num_tokens <= R`; the host picks the SMALLEST rung
@@ -102,6 +112,13 @@ pub(crate) struct Exl3MoeState {
     mrow_gate_up_k: [KernelHandle; EXL3_MROW_ARMS.len()],
     /// `exl3_gemv_mrow_fused_down_m{1,2,4,6,8}`.
     mrow_down_k: [KernelHandle; EXL3_MROW_ARMS.len()],
+    persistent_verify: bool,
+    persistent_worklist: DevicePtr,
+    persistent_state: DevicePtr,
+    persistent_build_k: [KernelHandle; EXL3_PERSISTENT_ROWS.len()],
+    persistent_gate_up_k: [KernelHandle; EXL3_PERSISTENT_ROWS.len()],
+    persistent_down_k: [KernelHandle; EXL3_PERSISTENT_ROWS.len()],
+    num_experts: u32,
     silu_mul_clamped_k: KernelHandle, // routed: DeepSeek-V4 swiglu_limit=10
     silu_mul_noclamp_k: KernelHandle, // shared expert: unclamped
     /// f32 split-K partial scratch. The M=1 fused pair addresses it as
@@ -127,6 +144,18 @@ pub(crate) struct Exl3MoeState {
     pub(crate) prefill: Exl3PrefillState,
 }
 
+impl Exl3MoeState {
+    fn persistent_verify_enabled(&self, num_tokens: u32) -> bool {
+        self.persistent_verify && EXL3_PERSISTENT_ROWS.contains(&num_tokens)
+    }
+
+    fn persistent_arm(&self, num_tokens: u32) -> Option<usize> {
+        EXL3_PERSISTENT_ROWS
+            .iter()
+            .position(|&rows| rows == num_tokens)
+    }
+}
+
 /// P1 prefill (M>1) state: fixed-size expert-chunk scratch ring for the
 /// dequant-to-BF16 path feeding `moe_bf16_grouped_gemm` (plan §3 "P1").
 ///
@@ -138,16 +167,78 @@ pub(crate) struct Exl3MoeState {
 /// chunk_len` (offsets are absolute rows, so sub-range launches read and
 /// write the correct global rows).
 pub(crate) struct Exl3PrefillState {
-    /// BF16 `[chunk, n·k]` slot-major dequant scratch.
+    /// Mode is frozen at model load so allocation and dispatch cannot drift.
+    pub(crate) direct: bool,
+    pub(crate) direct_m128: bool,
+    pub(crate) direct_k64: bool,
+    pub(crate) direct_n128: bool,
+    pub(crate) direct_n256: bool,
+    pub(crate) fixed_k2: bool,
+    /// Exact DeepSeek-V4 K2 persistent shapes use projection-specific kernels.
+    pub(crate) fixed_shape: bool,
+    pub(crate) persistent: bool,
+    pub(crate) fused_post: bool,
+    /// Opt-in exact H4096 gate/up pre-rotation sharing one expanded input read.
+    pub(crate) dual_pre: bool,
+    /// Explicit request for the exact DeepSeek K2 W2A8 prefill chain.
+    pub(crate) w2a8_requested: bool,
+    /// Fail closed for the exact N=2410 max-prefill receipt instead of
+    /// silently selecting any subordinate fallback arm.
+    pub(crate) prefill_max_require_arms: bool,
+    /// Subordinate opt-in for the fused N128 gate/up-to-down-A8 stage.
+    pub(crate) w2a8_fused_gu_down_requested: bool,
+    pub(crate) w2a8_pre_dual_emit_k: KernelHandle,
+    pub(crate) w2a8_post_silu_pre_emit_k: KernelHandle,
+    pub(crate) w2a8_grouped_gu_k: KernelHandle,
+    pub(crate) w2a8_grouped_down_k: KernelHandle,
+    pub(crate) w2a8_fused_gu_down_emit_n128_k: KernelHandle,
+    /// Exact-2410 subordinate rung widening the fused gate/up stage to N256.
+    pub(crate) w2a8_fused_gu_down_n256_requested: bool,
+    pub(crate) w2a8_fused_gu_down_emit_n256_k: KernelHandle,
+    /// Independent subordinate opt-in for the exact N256 down projection.
+    pub(crate) w2a8_n256_down_requested: bool,
+    pub(crate) w2a8_grouped_n256_down_k: KernelHandle,
+    pub(crate) fused_unpermute: bool,
+    /// Exact DeepSeek-V4 K2 H4096 uses the fixed post-unpermute kernel.
+    pub(crate) hrow_fixed_shape: bool,
+    /// Opt-in exact H4096 routed-unpermute + shared-expert blend tail.
+    pub(crate) fused_blend: bool,
+    /// Preserve the literal request separately from shape eligibility so the
+    /// strict max-profile contract can report a declined combined tail.
+    pub(crate) fused_blend_requested: bool,
+    /// BF16 `[chunk, n·k]` slot-major dequant scratch; null in direct mode.
     pub(crate) scratch: DevicePtr,
-    /// `[chunk]` u64 device table → the scratch slots (static across chunks).
+    /// `[chunk]` u64 device table → scratch slots; null in direct mode.
     pub(crate) slot_tab: DevicePtr,
     /// Experts dequanted per chunk (`ATLAS_EXL3_PREFILL_CHUNK`, default 8
     /// → 8 × 16.8 MB = 134 MB scratch at the V4 expert shapes).
     pub(crate) chunk: u32,
     pub(crate) dequant_chunk_k: KernelHandle,
     pub(crate) h128_pre_k: KernelHandle,
+    pub(crate) h128_pre_dual_h4096_k: KernelHandle,
     pub(crate) h128_post_k: KernelHandle,
+    pub(crate) h128_post_silu_pre_k: KernelHandle,
+    pub(crate) h128_post_unpermute_k: KernelHandle,
+    pub(crate) h128_post_unpermute_h4096_k: KernelHandle,
+    pub(crate) h128_post_unpermute_blend_h4096_k: KernelHandle,
+    /// Direct trellis -> BF16 register fragments -> tensor-core grouped GEMM (P2).
+    pub(crate) grouped_direct_k: KernelHandle,
+    pub(crate) grouped_direct_k2_k: KernelHandle,
+    pub(crate) grouped_direct_k64_k: KernelHandle,
+    pub(crate) grouped_direct_k64_k2_k: KernelHandle,
+    pub(crate) grouped_direct_k2_gu_k: KernelHandle,
+    pub(crate) grouped_direct_k2_down_k: KernelHandle,
+    pub(crate) grouped_direct_k64_k2_gu_k: KernelHandle,
+    pub(crate) grouped_direct_k64_k2_down_k: KernelHandle,
+    pub(crate) grouped_direct_k64_n128_k2_gu_k: KernelHandle,
+    pub(crate) grouped_direct_k64_n128_k2_down_k: KernelHandle,
+    pub(crate) grouped_direct_k64_n256_k2_gu_k: KernelHandle,
+    pub(crate) grouped_direct_k64_n256_k2_down_k: KernelHandle,
+    pub(crate) grouped_direct_m128_k: KernelHandle,
+}
+
+const fn exl3_dual_pre_enabled(fixed_shape: bool, fused_post: bool, requested: bool) -> bool {
+    fixed_shape && fused_post && requested
 }
 
 impl Exl3MoeState {
@@ -298,14 +389,33 @@ fn build_proj_table(
 /// (`prefix` + the rung's MROW).
 fn mrow_handles(
     gpu: &dyn GpuBackend,
+    module: &str,
     prefix: &str,
 ) -> Result<[KernelHandle; EXL3_MROW_ARMS.len()]> {
     let mut out = [KernelHandle(0); EXL3_MROW_ARMS.len()];
     for (slot, &mrow) in out.iter_mut().zip(EXL3_MROW_ARMS.iter()) {
         let name = format!("{prefix}{mrow}");
         *slot = gpu
-            .kernel("exl3_gemv", &name)
+            .kernel(module, &name)
             .with_context(|| format!("EXL3 wide verify needs the {name} kernel"))?;
+    }
+    Ok(out)
+}
+
+/// Resolve one exact-width persistent worklist family for M6 and M16.  These
+/// are equality arms rather than ladder rungs because their wire records have
+/// different strides and fixed slot counts.
+fn persistent_handles(
+    gpu: &dyn GpuBackend,
+    module: &str,
+    prefix: &str,
+) -> Result<[KernelHandle; EXL3_PERSISTENT_ROWS.len()]> {
+    let mut out = [KernelHandle(0); EXL3_PERSISTENT_ROWS.len()];
+    for (slot, &rows) in out.iter_mut().zip(EXL3_PERSISTENT_ROWS.iter()) {
+        let name = format!("{prefix}{rows}");
+        *slot = gpu
+            .kernel(module, &name)
+            .with_context(|| format!("EXL3 persistent verify needs the {name} kernel"))?;
     }
     Ok(out)
 }
@@ -375,6 +485,12 @@ impl MoeLayer {
             top_k > 0 && top_k <= EXL3_MAX_TOP_K,
             "EXL3 decode scratch sized for top_k in 1..={EXL3_MAX_TOP_K}, got {top_k}"
         );
+        let decode_module =
+            if gate.bits == 2 && std::env::var("ATLAS_EXL3_FIXED_K2").as_deref() != Ok("0") {
+                "exl3_gemv_k2"
+            } else {
+                "exl3_gemv"
+            };
         let split_override = std::env::var("ATLAS_EXL3_SPLIT")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -414,6 +530,56 @@ impl MoeLayer {
         // unchanged — a duplicate slot's group returns before the atomic.)
         gpu.memset(counters, 0, counter_bytes)?;
 
+        // Experimental compact M6/M16 verify: a one-CTA device builder emits
+        // one record per distinct routed expert, then fixed 96-CTA kernels
+        // consume the exact same logical (row, N-strip, split) work as the
+        // corresponding m-row arm. Keep the default path unchanged until GB10
+        // byte-parity and timing qualify these exact DeepSeek K2/top-6 shapes.
+        let persistent_verify = std::env::var("ATLAS_EXL3_VERIFY_WORKLIST").as_deref() == Ok("1");
+        let persistent_shape = gate.bits == 2
+            && up.bits == 2
+            && down.bits == 2
+            && top_k == EXL3_PERSISTENT_TOP_K
+            && gate.n == 2048
+            && gate.k == 4096
+            && up.n == 2048
+            && up.k == 4096
+            && down.n == 4096
+            && down.k == 2048;
+        ensure!(
+            !persistent_verify || persistent_shape,
+            "ATLAS_EXL3_VERIFY_WORKLIST=1 requires exact DeepSeek K2 shapes and top_k=6"
+        );
+        let (
+            persistent_worklist,
+            persistent_state,
+            persistent_build_k,
+            persistent_gate_up_k,
+            persistent_down_k,
+        ) = if persistent_verify {
+            let build = persistent_handles(gpu, decode_module, "exl3_build_m")?;
+            let gate_up =
+                persistent_handles(gpu, decode_module, "exl3_gemv_mrow_persistent_gate_up_m")?;
+            let down = persistent_handles(gpu, decode_module, "exl3_gemv_mrow_persistent_down_m")?;
+            let worklist = gpu.alloc(EXL3_PERSISTENT_WORK_BYTES)?;
+            let state = match gpu.alloc(EXL3_PERSISTENT_STATE_BYTES) {
+                Ok(state) => state,
+                Err(error) => {
+                    let _ = gpu.free(worklist);
+                    return Err(error);
+                }
+            };
+            (worklist, state, build, gate_up, down)
+        } else {
+            (
+                DevicePtr(0),
+                DevicePtr(0),
+                [KernelHandle(0); EXL3_PERSISTENT_ROWS.len()],
+                [KernelHandle(0); EXL3_PERSISTENT_ROWS.len()],
+                [KernelHandle(0); EXL3_PERSISTENT_ROWS.len()],
+            )
+        };
+
         // ── P1 prefill scratch (see Exl3PrefillState) ──
         // One slot size serves gate/up/down: all three are inter×h elements.
         ensure!(
@@ -429,26 +595,287 @@ impl MoeLayer {
             down.n,
             down.k
         );
-        let chunk = std::env::var("ATLAS_EXL3_PREFILL_CHUNK")
+        let direct = std::env::var("ATLAS_EXL3_PREFILL_DIRECT").as_deref() == Ok("1");
+        let direct_m128 = direct && std::env::var("ATLAS_EXL3_PREFILL_M128").as_deref() == Ok("1");
+        let direct_k64 = direct && std::env::var("ATLAS_EXL3_PREFILL_K64").as_deref() == Ok("1");
+        let fixed_k2 = direct && std::env::var("ATLAS_EXL3_PREFILL_FIXED_K2").as_deref() != Ok("0");
+        ensure!(
+            !(direct_m128 && direct_k64),
+            "ATLAS_EXL3_PREFILL_M128 and ATLAS_EXL3_PREFILL_K64 are separate experimental arms"
+        );
+        let persistent =
+            direct && std::env::var("ATLAS_EXL3_PREFILL_PERSISTENT").as_deref() != Ok("0");
+        let fixed_shape = direct
+            && persistent
+            && !direct_m128
+            && fixed_k2
+            && gate.bits == 2
+            && up.bits == 2
+            && down.bits == 2
+            && gate.n == 2048
+            && gate.k == 4096
+            && up.n == 2048
+            && up.k == 4096
+            && down.n == 4096
+            && down.k == 2048
+            && std::env::var("ATLAS_EXL3_PREFILL_FIXED_SHAPE").as_deref() != Ok("0");
+        let direct_n128 = fixed_shape
+            && direct_k64
+            && std::env::var("ATLAS_EXL3_PREFILL_N128").as_deref() == Ok("1");
+        let direct_n256 = fixed_shape
+            && direct_k64
+            && std::env::var("ATLAS_EXL3_PREFILL_N256").as_deref() == Ok("1");
+        ensure!(
+            !(direct_n128 && direct_n256),
+            "ATLAS_EXL3_PREFILL_N128 and ATLAS_EXL3_PREFILL_N256 are separate experimental arms"
+        );
+        let fused_post = std::env::var("ATLAS_EXL3_PREFILL_FUSED_POST").as_deref() == Ok("1");
+        let dual_pre = exl3_dual_pre_enabled(
+            fixed_shape,
+            fused_post,
+            std::env::var("ATLAS_EXL3_PREFILL_DUAL_PRE").as_deref() == Ok("1"),
+        );
+        let fused_unpermute =
+            std::env::var("ATLAS_EXL3_PREFILL_FUSED_UNPERMUTE").as_deref() == Ok("1");
+        let hrow_fixed_shape = fused_unpermute
+            && gate.bits == 2
+            && up.bits == 2
+            && down.bits == 2
+            && gate.n == 2048
+            && gate.k == 4096
+            && up.n == 2048
+            && up.k == 4096
+            && down.n == 4096
+            && down.k == 2048
+            && std::env::var("ATLAS_EXL3_HROW_FIXED_SHAPE").as_deref() != Ok("0");
+        let fused_blend_requested =
+            std::env::var("ATLAS_EXL3_PREFILL_FUSED_BLEND").as_deref() == Ok("1");
+        let fused_blend = fixed_shape && hrow_fixed_shape && fused_blend_requested;
+        let w2a8_requested = std::env::var("ATLAS_EXL3_PREFILL_W2A8").as_deref() == Ok("1");
+        let prefill_max_require_arms =
+            std::env::var("ATLAS_PREFILL_MAX_REQUIRE_ARMS").as_deref() == Ok("1");
+        let (
+            w2a8_pre_dual_emit_k,
+            w2a8_post_silu_pre_emit_k,
+            w2a8_grouped_gu_k,
+            w2a8_grouped_down_k,
+        ) = if w2a8_requested {
+            (
+                super::super::try_kernel(
+                    gpu,
+                    "exl3_w2a8_h128_emit",
+                    "exl3_w2a8_h128_pre_dual_emit_h4096",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "exl3_w2a8_h128_emit",
+                    "exl3_w2a8_h128_post_silu_pre_emit_h2048",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "exl3_w2a8_grouped_prefill_k2_gu",
+                    "exl3_w2a8_grouped_prefill_k2_gu",
+                ),
+                super::super::try_kernel(
+                    gpu,
+                    "exl3_w2a8_grouped_prefill_k2_down",
+                    "exl3_w2a8_grouped_prefill_k2_down",
+                ),
+            )
+        } else {
+            (
+                KernelHandle(0),
+                KernelHandle(0),
+                KernelHandle(0),
+                KernelHandle(0),
+            )
+        };
+        let w2a8_fused_gu_down_requested = w2a8_requested
+            && std::env::var("ATLAS_EXL3_PREFILL_W2A8_FUSED_GU_DOWN").as_deref() == Ok("1");
+        let w2a8_fused_gu_down_emit_n128_k = if w2a8_fused_gu_down_requested {
+            super::super::try_kernel(
+                gpu,
+                "exl3_w2a8_fused_gu_down_emit_n128",
+                "exl3_w2a8_fused_gu_down_emit_n128",
+            )
+        } else {
+            KernelHandle(0)
+        };
+        let w2a8_fused_gu_down_n256_requested = w2a8_fused_gu_down_requested
+            && std::env::var("ATLAS_EXL3_PREFILL_W2A8_FUSED_GU_DOWN_N256").as_deref() == Ok("1");
+        let w2a8_fused_gu_down_emit_n256_k = if w2a8_fused_gu_down_n256_requested {
+            super::super::try_kernel(
+                gpu,
+                "exl3_w2a8_fused_gu_down_emit_n256",
+                "exl3_w2a8_fused_gu_down_emit_n256",
+            )
+        } else {
+            KernelHandle(0)
+        };
+        let w2a8_n256_down_requested = w2a8_requested
+            && std::env::var("ATLAS_EXL3_PREFILL_W2A8_N256_DOWN").as_deref() == Ok("1");
+        let w2a8_grouped_n256_down_k = if w2a8_n256_down_requested {
+            super::super::try_kernel(
+                gpu,
+                "exl3_w2a8_grouped_prefill_n256_k2_down",
+                "exl3_w2a8_grouped_prefill_n256_k2_down",
+            )
+        } else {
+            KernelHandle(0)
+        };
+        if prefill_max_require_arms {
+            ensure!(
+                w2a8_requested,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requires ATLAS_EXL3_PREFILL_W2A8=1"
+            );
+            ensure!(
+                direct
+                    && persistent
+                    && fixed_shape
+                    && fixed_k2
+                    && !direct_m128
+                    && !direct_n128
+                    && !direct_n256
+                    && dual_pre
+                    && fused_post,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requires the exact direct persistent K2 W2A8 prerequisites"
+            );
+            ensure!(
+                w2a8_pre_dual_emit_k.0 != 0
+                    && w2a8_post_silu_pre_emit_k.0 != 0
+                    && w2a8_grouped_gu_k.0 != 0
+                    && w2a8_grouped_down_k.0 != 0,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 cannot load the base W2A8 kernels"
+            );
+            ensure!(
+                w2a8_fused_gu_down_requested && w2a8_fused_gu_down_emit_n128_k.0 != 0,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requires the fused GU N128 arm"
+            );
+            ensure!(
+                !w2a8_fused_gu_down_n256_requested,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 rejects the native-losing fused GU N256 arm"
+            );
+            ensure!(
+                w2a8_n256_down_requested && w2a8_grouped_n256_down_k.0 != 0,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requires the N256 down arm"
+            );
+            ensure!(
+                !fused_unpermute || hrow_fixed_shape,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requested fused unpermute tail is not exact-H4096 eligible"
+            );
+            ensure!(
+                !fused_blend_requested || fused_blend,
+                "ATLAS_PREFILL_MAX_REQUIRE_ARMS=1 requested fused blend tail is not exact-H4096 eligible"
+            );
+        }
+        let configured_chunk = std::env::var("ATLAS_EXL3_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&c| c > 0)
             .unwrap_or(8)
             .min(experts.len() as u32);
         let slot_bytes = gate.n as usize * gate.k as usize * 2;
-        let scratch = gpu.alloc(chunk as usize * slot_bytes)?;
-        let slot_ptr_bytes: Vec<u8> = (0..chunk as usize)
-            .flat_map(|z| (scratch.0 + (z * slot_bytes) as u64).to_le_bytes())
-            .collect();
-        let slot_tab = gpu.alloc(slot_ptr_bytes.len())?;
-        gpu.copy_h2d(&slot_ptr_bytes, slot_tab)?;
+        let (scratch, slot_tab, chunk) = if direct {
+            (DevicePtr(0), DevicePtr(0), 0)
+        } else {
+            let scratch = gpu.alloc(configured_chunk as usize * slot_bytes)?;
+            let slot_ptr_bytes: Vec<u8> = (0..configured_chunk as usize)
+                .flat_map(|z| (scratch.0 + (z * slot_bytes) as u64).to_le_bytes())
+                .collect();
+            let slot_tab = gpu.alloc(slot_ptr_bytes.len())?;
+            gpu.copy_h2d(&slot_ptr_bytes, slot_tab)?;
+            (scratch, slot_tab, configured_chunk)
+        };
+        // Do not expand the required kernel-module ABI for a default-off
+        // experiment. Older bundles can keep using the incumbent/N128 paths;
+        // the N256 symbols become mandatory only when explicitly selected.
+        let (grouped_direct_k64_n256_k2_gu_k, grouped_direct_k64_n256_k2_down_k) = if direct_n256 {
+            (
+                gpu.kernel(
+                    "exl3_grouped_prefill_k64_n256_k2_gu",
+                    "exl3_grouped_prefill_k64_n256_k2_gu",
+                )?,
+                gpu.kernel(
+                    "exl3_grouped_prefill_k64_n256_k2_down",
+                    "exl3_grouped_prefill_k64_n256_k2_down",
+                )?,
+            )
+        } else {
+            (KernelHandle(0), KernelHandle(0))
+        };
         let prefill = Exl3PrefillState {
+            direct,
+            direct_m128,
+            direct_k64,
+            direct_n128,
+            direct_n256,
+            fixed_k2,
+            fixed_shape,
+            persistent,
+            fused_post,
+            dual_pre,
+            w2a8_requested,
+            prefill_max_require_arms,
+            w2a8_fused_gu_down_requested,
+            w2a8_pre_dual_emit_k,
+            w2a8_post_silu_pre_emit_k,
+            w2a8_grouped_gu_k,
+            w2a8_grouped_down_k,
+            w2a8_fused_gu_down_emit_n128_k,
+            w2a8_fused_gu_down_n256_requested,
+            w2a8_fused_gu_down_emit_n256_k,
+            w2a8_n256_down_requested,
+            w2a8_grouped_n256_down_k,
+            fused_unpermute,
+            hrow_fixed_shape,
+            fused_blend,
+            fused_blend_requested,
             scratch,
             slot_tab,
             chunk,
             dequant_chunk_k: gpu.kernel("exl3_gemv", "exl3_dequant_chunk_bf16")?,
             h128_pre_k: gpu.kernel("exl3_gemv", "exl3_h128_pre_rows")?,
+            h128_pre_dual_h4096_k: gpu.kernel("exl3_gemv_k2", "exl3_h128_pre_dual_rows_h4096")?,
             h128_post_k: gpu.kernel("exl3_gemv", "exl3_h128_post_rows")?,
+            h128_post_silu_pre_k: gpu.kernel("exl3_gemv", "exl3_h128_post_silu_pre_rows")?,
+            h128_post_unpermute_k: gpu.kernel("exl3_gemv", "exl3_h128_post_unpermute_rows")?,
+            h128_post_unpermute_h4096_k: gpu
+                .kernel("exl3_gemv_k2", "exl3_h128_post_unpermute_rows_h4096")?,
+            h128_post_unpermute_blend_h4096_k: gpu
+                .kernel("exl3_gemv_k2", "exl3_h128_post_unpermute_blend_h4096")?,
+            grouped_direct_k: gpu.kernel("exl3_grouped_prefill", "exl3_grouped_prefill")?,
+            grouped_direct_k2_k: gpu
+                .kernel("exl3_grouped_prefill_k2", "exl3_grouped_prefill_k2")?,
+            grouped_direct_k64_k: gpu
+                .kernel("exl3_grouped_prefill_k64", "exl3_grouped_prefill_k64")?,
+            grouped_direct_k64_k2_k: gpu
+                .kernel("exl3_grouped_prefill_k64_k2", "exl3_grouped_prefill_k64_k2")?,
+            grouped_direct_k2_gu_k: gpu
+                .kernel("exl3_grouped_prefill_k2_gu", "exl3_grouped_prefill_k2_gu")?,
+            grouped_direct_k2_down_k: gpu.kernel(
+                "exl3_grouped_prefill_k2_down",
+                "exl3_grouped_prefill_k2_down",
+            )?,
+            grouped_direct_k64_k2_gu_k: gpu.kernel(
+                "exl3_grouped_prefill_k64_k2_gu",
+                "exl3_grouped_prefill_k64_k2_gu",
+            )?,
+            grouped_direct_k64_k2_down_k: gpu.kernel(
+                "exl3_grouped_prefill_k64_k2_down",
+                "exl3_grouped_prefill_k64_k2_down",
+            )?,
+            grouped_direct_k64_n128_k2_gu_k: gpu.kernel(
+                "exl3_grouped_prefill_k64_n128_k2_gu",
+                "exl3_grouped_prefill_k64_n128_k2_gu",
+            )?,
+            grouped_direct_k64_n128_k2_down_k: gpu.kernel(
+                "exl3_grouped_prefill_k64_n128_k2_down",
+                "exl3_grouped_prefill_k64_n128_k2_down",
+            )?,
+            grouped_direct_k64_n256_k2_gu_k,
+            grouped_direct_k64_n256_k2_down_k,
+            grouped_direct_m128_k: gpu
+                .kernel("exl3_grouped_prefill_m128", "exl3_grouped_prefill_m128")?,
         };
 
         self.exl3 = Some(Exl3MoeState {
@@ -456,12 +883,19 @@ impl MoeLayer {
             up,
             down,
             gemv_idx_k: gpu
-                .kernel("exl3_gemv", "exl3_gemv_m1_idx")
+                .kernel(decode_module, "exl3_gemv_m1_idx")
                 .context("EXL3 checkpoint needs the exl3_gemv kernel module")?,
-            gemv_fused_gate_up_k: gpu.kernel("exl3_gemv", "exl3_gemv_m1_fused_gate_up")?,
-            gemv_fused_down_k: gpu.kernel("exl3_gemv", "exl3_gemv_m1_fused_down")?,
-            mrow_gate_up_k: mrow_handles(gpu, "exl3_gemv_mrow_fused_gate_up_m")?,
-            mrow_down_k: mrow_handles(gpu, "exl3_gemv_mrow_fused_down_m")?,
+            gemv_fused_gate_up_k: gpu.kernel(decode_module, "exl3_gemv_m1_fused_gate_up")?,
+            gemv_fused_down_k: gpu.kernel(decode_module, "exl3_gemv_m1_fused_down")?,
+            mrow_gate_up_k: mrow_handles(gpu, decode_module, "exl3_gemv_mrow_fused_gate_up_m")?,
+            mrow_down_k: mrow_handles(gpu, decode_module, "exl3_gemv_mrow_fused_down_m")?,
+            persistent_verify,
+            persistent_worklist,
+            persistent_state,
+            persistent_build_k,
+            persistent_gate_up_k,
+            persistent_down_k,
+            num_experts: experts.len() as u32,
             silu_mul_clamped_k: gpu.kernel("moe_silu_mul", "moe_silu_mul")?,
             silu_mul_noclamp_k: gpu.kernel("moe_silu_mul", "silu_mul_noclamp")?,
             ws,
@@ -632,6 +1066,20 @@ impl MoeLayer {
             }
         }
 
+        if self.run_native_fp8_shared_expert(
+            expert_input,
+            1,
+            h,
+            ctx.config.shared_expert_intermediate_size as u32,
+            shared_gate_scratch,
+            shared_up_scratch,
+            shared_out,
+            ctx,
+            stream,
+        )? {
+            return Ok(());
+        }
+
         // ── Shared expert: FP8-block-scaled on disk → NVFP4 at load (the
         // heterogeneous-checkpoint arm of `load_expert_proj`). UNCLAMPED
         // SwiGLU (DeepseekV4MLP — see moe_shared_expert_fused.cu).
@@ -717,8 +1165,101 @@ impl MoeLayer {
             <= ctx.config.moe_intermediate_size as u32
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_exl3_persistent_verify(
+        &self,
+        gpu: &dyn GpuBackend,
+        st: &Exl3MoeState,
+        expert_input: DevicePtr,
+        expert_gate_out: DevicePtr,
+        expert_up_out: DevicePtr,
+        expert_down_out: DevicePtr,
+        indices_dev: DevicePtr,
+        h: u32,
+        inter: u32,
+        top_k: u32,
+        num_tokens: u32,
+        split_gu: u32,
+        split_dn: u32,
+        stream: u64,
+    ) -> Result<()> {
+        let arm = st
+            .persistent_arm(num_tokens)
+            .context("EXL3 persistent verify requires exactly 6 or 16 rows")?;
+        ensure!(
+            st.persistent_verify_enabled(num_tokens)
+                && top_k == EXL3_PERSISTENT_TOP_K
+                && st.persistent_build_k[arm].0 != 0
+                && st.persistent_gate_up_k[arm].0 != 0
+                && st.persistent_down_k[arm].0 != 0
+                && st.persistent_worklist.0 != 0
+                && st.persistent_state.0 != 0,
+            "EXL3 persistent verify called without an eligible initialized M6/M16 worklist"
+        );
+        KernelLaunch::new(gpu, st.persistent_build_k[arm])
+            .grid([1, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(indices_dev)
+            .arg_ptr(st.persistent_worklist)
+            .arg_ptr(st.persistent_state)
+            .arg_u32(num_tokens)
+            .arg_u32(top_k)
+            .arg_u32(st.num_experts)
+            .arg_u32(EXL3_PERSISTENT_WORK_CAPACITIES[arm])
+            .launch(stream)?;
+        KernelLaunch::new(gpu, st.persistent_gate_up_k[arm])
+            .grid([EXL3_PERSISTENT_CTAS, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(expert_input)
+            .arg_ptr(st.gate.trellis_tab)
+            .arg_ptr(st.gate.suh_tab)
+            .arg_ptr(st.gate.svh_tab)
+            .arg_ptr(st.up.trellis_tab)
+            .arg_ptr(st.up.suh_tab)
+            .arg_ptr(st.up.svh_tab)
+            .arg_ptr(st.persistent_worklist)
+            .arg_ptr(st.persistent_state)
+            .arg_ptr(expert_gate_out)
+            .arg_ptr(expert_up_out)
+            .arg_ptr(st.ws)
+            .arg_ptr(st.counters)
+            .arg_u32(inter)
+            .arg_u32(h)
+            .arg_u32(top_k)
+            .arg_u32(split_gu)
+            .arg_u32(st.gate.bits)
+            .launch(stream)?;
+        ops::moe_silu_mul(
+            gpu,
+            st.silu_mul_clamped_k,
+            expert_gate_out,
+            expert_up_out,
+            expert_gate_out,
+            num_tokens * top_k * inter,
+            stream,
+        )?;
+        KernelLaunch::new(gpu, st.persistent_down_k[arm])
+            .grid([EXL3_PERSISTENT_CTAS, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(expert_gate_out)
+            .arg_ptr(st.down.trellis_tab)
+            .arg_ptr(st.down.suh_tab)
+            .arg_ptr(st.down.svh_tab)
+            .arg_ptr(st.persistent_worklist)
+            .arg_ptr(st.persistent_state)
+            .arg_ptr(expert_down_out)
+            .arg_ptr(st.ws)
+            .arg_ptr(st.counters)
+            .arg_u32(h)
+            .arg_u32(inter)
+            .arg_u32(top_k)
+            .arg_u32(split_dn)
+            .arg_u32(st.down.bits)
+            .launch(stream)
+    }
+
     /// `num_tokens`-row speculative-verify expert FFN over EXL3 routed experts
-    /// + NVFP4 shared expert, through the dedup'd m-row kernels.
+    /// + NVFP4 or native FP8 shared expert, through the dedup'd m-row kernels.
     ///
     /// Output layout is EXACTLY what `dispatch_splitk_m_t` leaves behind —
     /// routed slots flat in `expert_{gate,up,down}_out`, one shared row per
@@ -793,60 +1334,95 @@ impl MoeLayer {
             2 * total_routed
         );
 
-        // (1) gate+up over every routed slot of every row: grid.z = 2·slots,
-        //     z = 2·slot + proj. Duplicate expert ids exit at the leader
-        //     election, so each distinct expert's trellis is streamed ONCE for
-        //     the whole verify block.
-        KernelLaunch::new(gpu, st.mrow_gate_up_k[arm])
-            .grid([inter / 128, split_gu, 2 * total_routed])
-            .block([256, 1, 1])
-            .arg_ptr(expert_input)
-            .arg_ptr(st.gate.trellis_tab)
-            .arg_ptr(st.gate.suh_tab)
-            .arg_ptr(st.gate.svh_tab)
-            .arg_ptr(st.up.trellis_tab)
-            .arg_ptr(st.up.suh_tab)
-            .arg_ptr(st.up.svh_tab)
-            .arg_ptr(indices_dev)
-            .arg_ptr(expert_gate_out)
-            .arg_ptr(expert_up_out)
-            .arg_ptr(st.ws)
-            .arg_ptr(st.counters)
-            .arg_u32(inter)
-            .arg_u32(h)
-            .arg_u32(top_k)
-            .arg_u32(num_tokens)
-            .arg_u32(st.gate.bits)
-            .launch(stream)?;
-        // (2) ONE flat clamped SwiGLU over every slot of every row — same
-        //     kernel, same same-index in-place map, just a wider extent.
-        ops::moe_silu_mul(
-            gpu,
-            st.silu_mul_clamped_k,
-            expert_gate_out,
-            expert_up_out,
-            expert_gate_out,
-            total_routed * inter,
+        if st.persistent_verify_enabled(num_tokens) {
+            self.dispatch_exl3_persistent_verify(
+                gpu,
+                st,
+                expert_input,
+                expert_gate_out,
+                expert_up_out,
+                expert_down_out,
+                indices_dev,
+                h,
+                inter,
+                top_k,
+                num_tokens,
+                split_gu,
+                split_dn,
+                stream,
+            )?;
+        } else {
+            // (1) gate+up over every routed slot of every row: grid.z = 2·slots,
+            //     z = 2·slot + proj. Duplicate expert ids exit at the leader
+            //     election, so each distinct expert's trellis is streamed ONCE for
+            //     the whole verify block.
+            KernelLaunch::new(gpu, st.mrow_gate_up_k[arm])
+                .grid([inter / 128, split_gu, 2 * total_routed])
+                .block([256, 1, 1])
+                .arg_ptr(expert_input)
+                .arg_ptr(st.gate.trellis_tab)
+                .arg_ptr(st.gate.suh_tab)
+                .arg_ptr(st.gate.svh_tab)
+                .arg_ptr(st.up.trellis_tab)
+                .arg_ptr(st.up.suh_tab)
+                .arg_ptr(st.up.svh_tab)
+                .arg_ptr(indices_dev)
+                .arg_ptr(expert_gate_out)
+                .arg_ptr(expert_up_out)
+                .arg_ptr(st.ws)
+                .arg_ptr(st.counters)
+                .arg_u32(inter)
+                .arg_u32(h)
+                .arg_u32(top_k)
+                .arg_u32(num_tokens)
+                .arg_u32(st.gate.bits)
+                .launch(stream)?;
+            // (2) ONE flat clamped SwiGLU over every slot of every row — same
+            //     kernel, same same-index in-place map, just a wider extent.
+            ops::moe_silu_mul(
+                gpu,
+                st.silu_mul_clamped_k,
+                expert_gate_out,
+                expert_up_out,
+                expert_gate_out,
+                total_routed * inter,
+                stream,
+            )?;
+            // (3) down over every routed slot: grid.z = slots, A row = act + slot·inter.
+            KernelLaunch::new(gpu, st.mrow_down_k[arm])
+                .grid([h / 128, split_dn, total_routed])
+                .block([256, 1, 1])
+                .arg_ptr(expert_gate_out)
+                .arg_ptr(st.down.trellis_tab)
+                .arg_ptr(st.down.suh_tab)
+                .arg_ptr(st.down.svh_tab)
+                .arg_ptr(indices_dev)
+                .arg_ptr(expert_down_out)
+                .arg_ptr(st.ws)
+                .arg_ptr(st.counters)
+                .arg_u32(h)
+                .arg_u32(inter)
+                .arg_u32(top_k)
+                .arg_u32(num_tokens)
+                .arg_u32(st.down.bits)
+                .launch(stream)?;
+        }
+
+        // Actual Vision keeps checkpoint-native FP8 shared weights and clamp10.
+        // Reuse serial GEMVs per row before entering the legacy NVFP4 chain.
+        if self.run_native_fp8_shared_verify(
+            expert_input,
+            num_tokens,
+            h,
+            ctx.config.shared_expert_intermediate_size as u32,
+            shared_gate_scratch,
+            shared_up_scratch,
+            shared_out,
+            ctx,
             stream,
-        )?;
-        // (3) down over every routed slot: grid.z = slots, A row = act + slot·inter.
-        KernelLaunch::new(gpu, st.mrow_down_k[arm])
-            .grid([h / 128, split_dn, total_routed])
-            .block([256, 1, 1])
-            .arg_ptr(expert_gate_out)
-            .arg_ptr(st.down.trellis_tab)
-            .arg_ptr(st.down.suh_tab)
-            .arg_ptr(st.down.svh_tab)
-            .arg_ptr(indices_dev)
-            .arg_ptr(expert_down_out)
-            .arg_ptr(st.ws)
-            .arg_ptr(st.counters)
-            .arg_u32(h)
-            .arg_u32(inter)
-            .arg_u32(top_k)
-            .arg_u32(num_tokens)
-            .arg_u32(st.down.bits)
-            .launch(stream)?;
+        )? {
+            return Ok(true);
+        }
 
         // ── Shared expert. The grouped-batch kernel preserves the exact
         //    single-row K order while streaming each NVFP4 weight once. ──
@@ -857,10 +1433,22 @@ impl MoeLayer {
         let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
         let sh = &self.weights.shared_expert;
         let exact_batch = exl3_shared_batch_enabled();
-        let batch_kernel = if exact_batch && num_tokens <= 8 {
+        let v2_kernel = if h % 32 == 0 && shared_inter % 32 == 0 {
+            match num_tokens {
+                4 => self.w4a16_gemv_grouped_batchm_v2_k[0],
+                5 => self.w4a16_gemv_grouped_batchm_v2_k[1],
+                6 => self.w4a16_gemv_grouped_batchm_v2_k[2],
+                8 => self.w4a16_gemv_grouped_batchm_v2_k[3],
+                16 => self.w4a16_gemv_grouped_batchm_v2_k[4],
+                _ => KernelHandle(0),
+            }
+        } else {
+            KernelHandle(0)
+        };
+        let batch_kernel = if exact_batch && v2_kernel.0 != 0 {
+            Some((v2_kernel, true))
+        } else if exact_batch && num_tokens <= 8 {
             Some((self.w4a16_gemv_grouped_batchm_k, false))
-        } else if exact_batch && num_tokens == 16 {
-            Some((self.w4a16_gemv_grouped_batchm_v2_m16_k, true))
         } else {
             None
         }

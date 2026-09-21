@@ -16,6 +16,7 @@ pub fn load_all_layers(
     gpu: &dyn GpuBackend,
     layer_kv_dtypes: &[KvCacheDtype],
 ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+    super::indexer::admit_indexer_weights(store, config)?;
     let n = config.num_hidden_layers;
     tracing::info!(
         "DeepSeek-V4 load_layers: num_layers={}, hc_mult={}, hc_sinkhorn_iters={}, hc_eps={}",

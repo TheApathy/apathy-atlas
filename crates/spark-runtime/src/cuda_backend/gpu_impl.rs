@@ -40,10 +40,9 @@ use super::{
     AtlasCudaBackend, cuCtxSetCurrent, cuEventCreate, cuEventDestroy_v2, cuEventRecord,
     cuEventSynchronize, cuGraphDestroy, cuGraphExecDestroy, cuGraphLaunch, cuMemAlloc_v2,
     cuMemAllocHost_v2, cuMemAllocManaged, cuMemFree_v2, cuMemFreeHost, cuMemGetInfo_v2,
-    cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2, cuMemsetD32Async,
-    cuMemsetD8Async,
-    cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture, cuStreamSynchronize,
-    cuStreamWaitEvent,
+    cuMemcpyDtoDAsync_v2, cuMemcpyDtoHAsync_v2, cuMemcpyHtoDAsync_v2, cuMemsetD8Async,
+    cuMemsetD32Async, cuStreamBeginCapture, cuStreamCreate, cuStreamEndCapture,
+    cuStreamSynchronize, cuStreamWaitEvent,
 };
 use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, KernelHandle};
 
@@ -71,7 +70,7 @@ fn d2h_trace_tick() {
             std::backtrace::Backtrace::force_capture()
         );
     }
-    if n % 10_000 == 0 {
+    if n.is_multiple_of(10_000) {
         tracing::warn!("ATLAS_D2H_TRACE: {n} D2H copies so far (each forces a stream sync)");
     }
 }

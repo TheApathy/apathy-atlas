@@ -107,6 +107,13 @@ pub async fn completions(
             );
         }
     };
+    if req.response_format.as_ref().is_some_and(|v| !v.is_null()) {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "response_format is not supported on /v1/completions; use /v1/chat/completions"
+                .to_string(),
+        );
+    }
     let prompts = match resolve_prompts(&state, &req.prompt) {
         Ok(t) => t,
         Err((status, msg)) => return openai_error_response(status, msg),
@@ -115,6 +122,16 @@ pub async fn completions(
         return openai_error_response(StatusCode::BAD_REQUEST, "Empty prompt".to_string());
     }
     for prompt_tokens in &prompts {
+        if let Err(error) = crate::deepseek_vision_preprocess::reject_unprepared_tokens(
+            prompt_tokens,
+            state
+                .tokenizer
+                .inner()
+                .token_to_id(crate::deepseek_vision_preprocess::IMAGE_PLACEHOLDER),
+            state.deepseek_vision_vocab,
+        ) {
+            return openai_error_response(StatusCode::BAD_REQUEST, error.to_string());
+        }
         let prompt_len = prompt_tokens.len();
         if prompt_len >= state.max_seq_len {
             return openai_error_response(
@@ -422,6 +439,7 @@ pub(super) async fn completions_stream(
                 reasoning_tokens,
                 cached_prompt_tokens,
                 guard_stop: _,
+                engine,
             } => {
                 let tps = if decode_time_ms > 0.0 {
                     completion_tokens.saturating_sub(1) as f64 / (decode_time_ms / 1000.0)
@@ -444,6 +462,7 @@ pub(super) async fn completions_stream(
                     }),
                     time_to_first_token_ms,
                     response_tokens_per_second: tps,
+                    atlas_engine: crate::openai::atlas_engine_usage(Some(engine)),
                 };
                 if include_usage {
                     // Chat parity: finish chunk without usage, then a

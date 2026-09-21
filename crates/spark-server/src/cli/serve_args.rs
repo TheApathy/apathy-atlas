@@ -121,6 +121,29 @@ pub struct ServeArgs {
     #[arg(long)]
     pub disable_tool_grammar: Option<bool>,
 
+    /// Add a protocol reminder to DeepSeek-V4 tool results once their rendered
+    /// conversation prefix crosses `--ds4-tool-call-reminder-min-bytes`.
+    /// Default-off until the intervention is qualified on Atlas; enabling it
+    /// changes benchmark prompts and must be disclosed with results.
+    #[arg(long, default_value_t = false)]
+    pub ds4_tool_call_reminder: bool,
+
+    /// Rendered-prefix depth gate for `--ds4-tool-call-reminder`.
+    #[arg(long, default_value_t = 98_304)]
+    pub ds4_tool_call_reminder_min_bytes: usize,
+
+    /// Retry one DeepSeek-V4 non-streaming tools-armed generation when it
+    /// settles at `stop` without a valid tool call. Default-off because this
+    /// changes sampling and benchmark behavior.
+    #[arg(long, default_value_t = false)]
+    pub ds4_tool_slip_resample: bool,
+
+    /// Append only DeepSeek-V4 tool-call slips to a forensic JSONL file.
+    /// Records the exact generated pre-parse text, finish/parse verdict, lane,
+    /// attempt, prompt identity, and seed. With no value, uses a temp file.
+    #[arg(long, num_args = 0..=1, default_missing_value = "<auto>", value_name = "PATH")]
+    pub ds4_tool_slip_dump: Option<String>,
+
     /// Default chat template kwargs applied when the client sends no
     /// thinking parameters (no `reasoning.effort`, `chat_template_kwargs`,
     /// or `enable_thinking` in the request body). A JSON object with
@@ -436,10 +459,12 @@ pub struct ServeArgs {
     /// During the first N tokens, tracks max |K| and max |V| values across
     /// all attention layers. After N tokens, computes per-tensor scales as
     /// max/448 (mapping the observed range to FP8 E4M3 [-448, 448]).
-    /// 0 = disabled (use static scales from checkpoint, or uncalibrated 1.0).
+    /// Explicit 0 disables calibration and requires usable static checkpoint
+    /// scales; startup fails closed when neither source exists. Omitting the
+    /// option keeps the MODEL.toml default.
     /// Only applies when --kv-cache-dtype is fp8.
-    #[arg(long, default_value_t = 0)]
-    pub fp8_kv_calibration_tokens: usize,
+    #[arg(long)]
+    pub fp8_kv_calibration_tokens: Option<usize>,
 
     /// Path to a warmup prompt file (JSON messages or plain text).
     /// At startup, the server tokenizes and prefills this prompt, inserting the

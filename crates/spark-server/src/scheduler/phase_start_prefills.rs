@@ -49,8 +49,7 @@ pub(super) fn start_new_requests(
         std::env::var("ATLAS_PREFILL_CODISPATCH")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
-    })
-        && chunked
+    }) && chunked
         && new_reqs.len() >= 2
         && active.is_empty()
         && prefilling.is_empty()

@@ -55,8 +55,9 @@ fn user_image_block_is_carried() {
         vec![&ImageData::Base64("data:image/png;base64,AAA".into())]
     );
     assert_eq!(text_of(&user.content), "what is this?");
-    // Canonical part order: images first, then the joined text.
-    assert!(matches!(user.content[0], ContentPart::Image(_)));
+    // Original wire order is retained: text before its image.
+    assert!(matches!(user.content[0], ContentPart::Text(_)));
+    assert!(matches!(user.content[1], ContentPart::Image(_)));
 }
 
 #[test]
@@ -336,6 +337,7 @@ fn ir_response(choice: crate::ir::Choice) -> crate::ir::ChatResponse {
             reasoning_tokens: 2,
             time_to_first_token_ms: 0.0,
             response_tokens_per_second: 0.0,
+            engine: None,
         },
     }
 }

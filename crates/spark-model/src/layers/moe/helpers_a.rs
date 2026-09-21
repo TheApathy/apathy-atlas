@@ -56,6 +56,9 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         include_down: bool,
     ) -> Result<()> {
+        if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Exl3Trellis {
+            return Ok(());
+        }
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;
@@ -263,6 +266,9 @@ impl MoeLayer {
         config: &atlas_core::config::ModelConfig,
         keep_originals: bool,
     ) -> Result<()> {
+        if self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Exl3Trellis {
+            return Ok(());
+        }
         let h = config.hidden_size;
         let inter = config.moe_intermediate_size;
         let shared_inter = config.shared_expert_intermediate_size;

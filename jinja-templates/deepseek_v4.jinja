@@ -12,6 +12,13 @@
 {%- set user_token = "<｜User｜>" -%}
 {%- set assistant_token = "<｜Assistant｜>" -%}
 {%- set dsml_token = "｜DSML｜" -%}
+{%- set tool_call_reminder_text = "[Reminder: respond with exactly one tool call in the required format. Plain-text replies are not accepted by this harness.]" -%}
+{#- Track the already-rendered conversation prefix. The reminder decision is
+    per result, so extending a conversation never retroactively rewrites an
+    earlier tool result and invalidate its warm KV prefix. The server leaves
+    tool_call_reminder false unless the DSML-v4 parser is active and the
+    explicit Atlas opt-in is enabled. -#}
+{%- set ns = namespace(rendered_bytes=0) -%}
 
 {%- if not messages %}
     {{- raise_exception('No messages provided.') }}
@@ -24,8 +31,8 @@
         {%- for item in content %}
             {%- if 'text' in item %}
                 {{- item.text }}
-            {%- elif 'image' in item or 'image_url' in item %}
-                {{- '[Image]' }}
+            {%- elif 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {{- '<｜deepseek_image｜>' }}
             {%- else %}
                 {{- raise_exception('Unexpected item type in content.') }}
             {%- endif %}
@@ -80,13 +87,17 @@
     {%- if message.role == "system" %}
         {%- if first_message %}
             {{- bos_token }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + bos_token|utf8_len -%}
         {%- endif %}
         {{- content }}
+        {%- set ns.rendered_bytes = ns.rendered_bytes + content|utf8_len -%}
     {%- elif message.role == "user" %}
         {%- if first_message %}
             {{- bos_token }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + bos_token|utf8_len -%}
         {%- endif %}
         {{- user_token + content + assistant_token }}
+        {%- set ns.rendered_bytes = ns.rendered_bytes + user_token|utf8_len + content|utf8_len + assistant_token|utf8_len -%}
     {%- elif message.role == "assistant" %}
         {%- set reasoning_content = '' -%}
         {%- if message.reasoning_content is string %}
@@ -95,12 +106,17 @@
         {%- set reasoning_content = reasoning_content | trim -%}
         {%- if reasoning_content %}
             {{- thinking_start_token + reasoning_content + thinking_end_token }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + thinking_start_token|utf8_len + reasoning_content|utf8_len + thinking_end_token|utf8_len -%}
         {%- endif %}
         {{- content }}
+        {%- set ns.rendered_bytes = ns.rendered_bytes + content|utf8_len -%}
         {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
-            {{- render_tool_calls(message.tool_calls) }}
+            {%- set rendered_tool_calls = render_tool_calls(message.tool_calls) -%}
+            {{- rendered_tool_calls }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + rendered_tool_calls|utf8_len -%}
         {%- endif %}
         {{- eos_token }}
+        {%- set ns.rendered_bytes = ns.rendered_bytes + eos_token|utf8_len -%}
     {%- elif message.role == "tool" %}
         {#- The checkpoint has no `tool` role: merge_tool_messages() folds
             tool results into a USER turn as <tool_result> blocks joined by
@@ -109,14 +125,25 @@
         {%- if not loop.previtem or loop.previtem.role != "tool" %}
             {%- if first_message %}
                 {{- bos_token }}
+                {%- set ns.rendered_bytes = ns.rendered_bytes + bos_token|utf8_len -%}
             {%- endif %}
             {{- user_token }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + user_token|utf8_len -%}
         {%- else %}
             {{- '\n\n' }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + 2 -%}
         {%- endif %}
-        {{- '<tool_result>' + content + '</tool_result>' }}
+        {{- '<tool_result>' + content }}
+        {%- set ns.rendered_bytes = ns.rendered_bytes + '<tool_result>'|utf8_len + content|utf8_len -%}
+        {%- if tool_call_reminder is defined and tool_call_reminder and tool_call_reminder_min_bytes is defined and ns.rendered_bytes >= tool_call_reminder_min_bytes %}
+            {{- '\n\n' + tool_call_reminder_text }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + 2 + tool_call_reminder_text|utf8_len -%}
+        {%- endif %}
+        {{- '</tool_result>' }}
+        {%- set ns.rendered_bytes = ns.rendered_bytes + '</tool_result>'|utf8_len -%}
         {%- if loop.last or loop.nextitem.role != "tool" %}
             {{- assistant_token }}
+            {%- set ns.rendered_bytes = ns.rendered_bytes + assistant_token|utf8_len -%}
         {%- endif %}
     {%- else %}
         {{- raise_exception('Unexpected message role.') }}

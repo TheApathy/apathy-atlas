@@ -42,6 +42,12 @@ mod verify_d_tree_graph;
 mod verify_fused;
 
 impl Model for TransformerModel {
+    fn requires_full_speculative_verify(&self) -> bool {
+        self.proposer
+            .as_ref()
+            .is_some_and(|proposer| proposer.requires_full_target_verify())
+    }
+
     fn prepare_vision_embed(&self, images: &[(Vec<f32>, usize, usize)]) -> Result<()> {
         self.prepare_vision_embed_dispatch(images)
     }

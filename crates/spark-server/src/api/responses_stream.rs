@@ -57,6 +57,9 @@ pub(super) async fn responses_endpoint_stream(
     chat_req.stream = true;
     chat_req.stream_options = None;
 
+    if let Err(error) = chat_req.validate_content_order() {
+        return openai_error_response(StatusCode::BAD_REQUEST, error);
+    }
     let model = chat_req.model.clone();
     let input_messages = chat_req.messages.clone();
     let state_arc = state.0.clone();
@@ -70,17 +73,21 @@ pub(super) async fn responses_endpoint_stream(
             .get(cid)
             .map(|s| s.items.len())
             .unwrap_or(0);
-        input_messages
+        match input_messages
             .iter()
             .skip(prior)
             .map(|m| {
-                serde_json::json!({
+                Ok(serde_json::json!({
                     "type": "message",
                     "role": m.role,
-                    "content": [{"type": "input_text", "text": m.content.text}],
-                })
+                    "content": m.content.responses_json()?,
+                }))
             })
-            .collect()
+            .collect::<Result<Vec<_>, String>>()
+        {
+            Ok(items) => items,
+            Err(error) => return openai_error_response(StatusCode::BAD_REQUEST, error),
+        }
     } else {
         Vec::new()
     };

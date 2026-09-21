@@ -166,6 +166,10 @@ pub struct MtpGate {
     observed_depth: usize,
     measured_at_depth: usize,
     fresh: Option<GateDecision>,
+    /// One-shot scheduler handoff when an Mtp-mode window opens a temporary
+    /// serial baseline probe. The pending speculative chain must be drained
+    /// before the first serial token changes sequence state.
+    serial_probe_start: bool,
 }
 
 impl MtpGate {
@@ -192,6 +196,7 @@ impl MtpGate {
             observed_depth: 0,
             measured_at_depth: 0,
             fresh: None,
+            serial_probe_start: false,
         }
     }
 
@@ -223,6 +228,12 @@ impl MtpGate {
     /// One-shot handoff of a fresh mode switch for scheduler bookkeeping.
     pub fn take_fresh_decision(&mut self) -> Option<GateDecision> {
         self.fresh.take()
+    }
+
+    /// True exactly once when an Mtp-mode refresh enters a temporary Serial
+    /// probe. Permanent Mtp→Serial transitions use `take_fresh_decision`.
+    pub fn take_serial_probe_start(&mut self) -> bool {
+        std::mem::take(&mut self.serial_probe_start)
     }
 
     /// Which step type the scheduler should run next.
@@ -307,6 +318,7 @@ impl MtpGate {
             self.probe_windows_left = self.probe_windows_left.saturating_sub(1);
             if self.probe_windows_left == 0 {
                 self.probing = false;
+                self.serial_probe_start = false;
                 self.arbitrate();
                 self.tokens_since_event = 0;
             }
@@ -317,6 +329,7 @@ impl MtpGate {
         if self.tokens_since_event >= self.event_interval() {
             self.probing = true;
             self.probe_windows_left = 1;
+            self.serial_probe_start = self.mode == Mode::Mtp;
             return;
         }
         self.arbitrate();

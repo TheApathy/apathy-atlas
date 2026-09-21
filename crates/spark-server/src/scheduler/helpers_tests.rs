@@ -273,6 +273,21 @@ fn norm_rejects_3item_list_and_pure_columns() {
 }
 
 #[test]
+fn norm_rejects_simple_monotonic_numeric_list() {
+    let mask = numeric_mask();
+    let mut tokens: Vec<u32> = (900u32..990).collect();
+    for value in 100u32..=124 {
+        // DeepSeek's tokenizer emits each `N, ` item as a numeric token,
+        // comma token, then standalone-space token.
+        tokens.extend([value, 1, 2]);
+    }
+    assert!(
+        !detect_content_token_loop_normalized(&tokens, &mask),
+        "one numeric field plus comma/space delimiters is a list, not a structured loop"
+    );
+}
+
+#[test]
 fn exact_prose_loop_still_caught_regression() {
     // Byte-identical period x4, no mask: the EXACT detector must
     // still fire — guards that detect_token_loop_with_period's

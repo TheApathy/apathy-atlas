@@ -22,7 +22,7 @@
 //!
 //! Decode-format detail lives in `docs/kernels/exl3-gemv.md`.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 

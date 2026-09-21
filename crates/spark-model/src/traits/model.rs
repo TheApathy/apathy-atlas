@@ -55,6 +55,12 @@ pub struct BeamReq {
 }
 
 pub trait Model: Send + Sync {
+    /// The installed drafter needs generic verification even for one proposal:
+    /// specialized MTP paths do not capture/restore its target-side state.
+    fn requires_full_speculative_verify(&self) -> bool {
+        false
+    }
+
     /// True when this model implements run-to-completion beam search
     /// ([`Self::generate_beam_batch`]). Default `false` — only encoder-decoder
     /// translation models (NLLB) override it.

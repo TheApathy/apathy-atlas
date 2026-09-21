@@ -580,8 +580,10 @@ STILL OPEN:
   4·top_k+4 → 3+4 launches/layer, bit-identical (GATE8). A silu-in-GEMV
   rider is no longer worth it — the SwiGLU is now ONE flat elementwise
   launch per layer over `[top_k, inter]`.
-- Prefill P2 (plan §3): grouped trellis GEMM decoding straight to MMA
-  fragments, to recover the P1 dequant traffic below.
+- ~~Prefill P2 first rung~~ LANDED, GPU-unvalidated: the env-gated
+  `exl3_grouped_prefill` decodes one trellis tile per warp directly into BF16
+  register fragments and feeds the M64 tensor-core MMA body. It removes both
+  global BF16 weight materialization and shared decoded-weight staging (§9).
 
 ## 7. P1 prefill cost arithmetic (honest, supersedes the plan's estimate)
 
@@ -682,12 +684,19 @@ This is guaranteed structurally, not statistically:
    m=1) cannot move them either.
 
 The chain AROUND the GEMV is held exact the same way: the SwiGLU is the same
-elementwise `moe_silu_mul` over a wider flat extent, and the shared expert runs
-the SAME single-row `w4a16_gemv` chain once per row rather than a batched
-`w4a16_gemm` (different accumulation order ⇒ partial exactness ⇒ the law). That
-costs `4*num_tokens` small NVFP4 launches per layer — ~24 at γ=6, ~1000 per
-step across 43 layers, ~3 ms against a ~110 ms verify step. Batching it needs a
-bit-exact `w4a16_gemv_batchm`; that is the next lever here, not a shortcut.
+elementwise `moe_silu_mul` over a wider flat extent. With
+`ATLAS_VERIFY_GEMV_V2=1`, the shared expert uses a grouped-batch kernel whose
+per-row FMA and reduction order is copied from single-row `w4a16_gemv`; it
+streams each NVFP4 weight once and reduces `4*num_tokens` launches to three
+GEMVs plus one flat SwiGLU. Compile-time V2 entries cover M=4/5/6/8/16; other
+widths through eight use the exact runtime-M incumbent. Missing symbols or
+ineligible dimensions retain the per-row exact fallback.
+
+The no-GPU SASS gate reports the M6 V2 entry at 904 instructions, 80 registers,
+three branches, and zero spills versus 1,232 instructions, 76 registers, and 31
+branches for the runtime-M incumbent. Its FFMA/FADD/shuffle counts scale exactly
+six-to-eight with the number of compiled rows. This is arithmetic-order and
+compiler-resource evidence, not a device-time or tok/s result.
 
 ### 8.4 Launch and occupancy budget
 
@@ -698,8 +707,9 @@ Per MoE layer at `num_tokens = 6`, `top_k = 8`:
 | routed gate+up | 6 | 1 |
 | routed SwiGLU | 6 | 1 |
 | routed down | 6 | 1 |
-| shared (NVFP4) | 24 | 24 |
-| **total** | **42** | **27** |
+| shared (NVFP4), per-row fallback | 24 | 24 |
+| shared (NVFP4), exact batch enabled | 24 | 4 |
+| **total, exact batch enabled** | **42** | **7** |
 
 and, far more importantly, the routed trellis stream drops from
 `num_tokens * top_k` expert reads to `|union|` — the measured DSpark union is
@@ -726,12 +736,46 @@ claims (m=1 gate+up / down, m-row gate+up / down) using the ACTUAL splits
 rather than `EXL3_MAX_SPLIT`. At the V4 shapes the binding term is the m-row
 gate+up, 2·64·6·2048 f32 = 6.3 MB/layer (was 3.1 MB).
 
-### 8.5 What is NOT done
+### 8.5 Fixed-K2 decode and SM121-loadable M16
+
+The serving checkpoint's K2 routed projections now resolve decode and m-row
+handles from `exl3_gemv_k2`. That module includes the same source with
+`EXL3_FIXED_BITS=2`: every entry rejects a mismatched runtime bitrate, then
+passes the literal K2 width into the inlined lane geometry, trellis staging,
+and decoder. K3 remains on the generic module;
+`ATLAS_EXL3_FIXED_K2=0` is the exact generic fallback.
+
+Side-by-side `sm_121` cubins, with zero stack/local/spills throughout:
+
+| arm | complete SASS instructions, generic → K2 | registers, generic → K2 |
+|---|---:|---:|
+| fused gate+up M1 | 1,800 → 1,520 (-15.6%) | 64 → 63 |
+| fused down M1 | 1,784 → 1,520 (-14.8%) | 63 → 63 |
+| m-row gate+up M2 / M6 | 2,840 → 2,576 / 6,224 → 5,976 | 88 → 88 / 107 → 104 |
+| m-row down M2 / M6 | 2,744 → 2,488 / 5,992 → 5,704 | 86 → 80 / 107 → 104 |
+| m-row gate+up M16 | 14,664 → 14,416 | 128 → 128 |
+| m-row down M16 | 13,984 → 13,736 | 128 → 128 |
+
+This cubin gate also caught a pre-existing M16 failure hidden by the normal PTX
+build: its eight-chunk x' superblock requested `0xd848` bytes of static shared
+memory, above ptxas's `0xc000` SM121 limit. M16 alone now uses a four-chunk
+storage window. The identical 128-k chunks are computed and accumulated in the
+same order, with one refill after chunk four; only scratch residency changes.
+Both M16 entries now assemble at 40,008 B shared memory, 128 registers, and
+zero stack/local/spills. The smaller rungs retain their eight-chunk window.
+
+These are compiler and loadability facts, not device timings. Before default
+performance claims, byte-compare generic K2 and fixed K2 for M1 and every
+selected m-row rung, including an M16 case whose split owns more than four
+128-k chunks.
+
+### 8.6 What is NOT done
 
 - **Never run on a GPU.** GATE9 is the acceptance test; run it first.
-- The shared expert is `4*num_tokens` launches (see §8.3). A bit-exact
-  `w4a16_gemv_batchm` would take it to 4.
-- `EXL3_MROW_ARMS` tops out at 8 (= `MOE_DECODE_MAX_ROWS`). Past that
+- The current m-row grid still launches against every routed slot; duplicate
+  leaders exit only after CTA creation, route staging, and leader election. A
+  compact device worklist is the next structural verify lever.
+- `EXL3_MROW_ARMS` tops out at 16 (the DFlash2 verify width). Past that
   `verify_ffn_is_batched` declines, `forward_km` returns false, and
   `forward_batched` hard-errors on EXL3 — the loud pre-existing failure, kept
   deliberately over silently-wrong output. Widen the ladder before widening the
@@ -742,3 +786,755 @@ gate+up, 2·64·6·2048 f32 = 6.3 MB/layer (was 3.1 MB).
 - `forward_k2` (the n==2 fused K=2 path) still has no EXL3 arm;
   `k2_verify_ffn_is_batched` therefore stays `_t`-only and EXL3 n==2 batches
   through `forward_km` instead.
+
+## 9. P2 grouped prefill first rung — direct trellis to tensor cores
+
+`kernels/gb10/common/exl3_grouped_prefill.cu` is an opt-in replacement for
+P1's global BF16 dequant scratch. Set `ATLAS_EXL3_PREFILL_DIRECT=1` to select
+it; unset remains the P1 baseline until the GPU gates below pass.
+
+Direct mode is frozen at model load, omits P1's roughly 134 MB decoded-weight
+scratch allocation, and uses a full compact grid by default: one CTA per exact
+`(expert, N64 strip)`. Each CTA reads that expert's device offsets once, then
+walks only its live M tiles. The kernel retains grid-stride support for the
+undersubscribed parity case, but production exposes every strip to the hardware
+scheduler. This removes the per-layer
+offsets D2H and stream synchronization without either a heuristic expert-load
+cap or the old rectangular mostly-empty M-tile universe. Set
+`ATLAS_EXL3_PREFILL_PERSISTENT=0` only to retain the exact 3-D grid as a parity
+fallback.
+
+`ATLAS_EXL3_PREFILL_FUSED_POST=1` additionally replaces the separate gate
+H128-post, up H128-post, SwiGLU, and down H128-pre kernels with
+`exl3_h128_post_silu_pre_rows`. The fused kernel explicitly rounds both
+rotated operands to BF16 before clamping/activation, then rounds the SwiGLU
+result to BF16 before applying the down rotation. Those are the legacy
+store/load barriers. At 2,410 tokens and the current top-6 config, it reduces
+these four passes from nine BF16 buffer transactions to three: about 533 MB to
+178 MB per MoE layer, or 15.3 GB across 43 layers. That is traffic arithmetic,
+not an end-to-end timing claim.
+
+`ATLAS_EXL3_PREFILL_FUSED_UNPERMUTE=1` replaces the final down H128-post and
+indexed weighted unpermute with `exl3_h128_post_unpermute_rows`. One warp owns
+one token/128-column chunk, visits slots in the legacy top-k order, explicitly
+rounds each rotated expert value to BF16, then weights and accumulates it. At
+the same geometry this avoids materializing the rotated routed output: roughly
+355 MB becomes 118 MB per layer, saving another 10.2 GB across 43 layers.
+Together the two tail fusions remove about 25.5 GB of activation traffic per
+prefill pass. These values exclude unchanged final-output writes.
+
+For the exact K2 `H=4096` shape, fused unpermute automatically selects
+`exl3_h128_post_unpermute_rows_h4096`; set
+`ATLAS_EXL3_HROW_FIXED_SHAPE=0` for the generic fallback. The entry point
+shares one force-inlined arithmetic body with the generic kernel, keeps top-k
+as the same runtime-ordered loop, and rejects any nonexact H, grid, or block
+shape. On SM121 its numeric body is 168 instructions rather than the generic
+176 and uses 36 rather than 39 registers. The fail-closed block-shape entry
+guard brings the complete fixed function to 184 static instructions without
+changing that 36-register footprint, BF16/Hadamard/load/store/accumulation
+counts, or zero shared/stack/local/spill memory. This is compiler evidence; it
+does not replace byte parity or CUDA-event timing.
+
+`ATLAS_EXL3_PREFILL_M128=1` selects a separately compiled 256-thread direct
+kernel. Warp pairs share one cooperatively staged trellis strip: warps 0–3
+produce rows 0–63 and warps 4–7 produce rows 64–127.
+On a tail of at most 64 rows, the upper four warps skip decode, MMA, and stores
+while still reaching every CTA barrier. Consequently M128 executes the same
+`ceil(rows/64)*64` padded MMA rows as M64. Its remaining tradeoff is a
+256-thread block and different occupancy/scheduling. The current serving
+checkpoint is 256 experts/top-6: a balanced 2,410-token prompt gives 56–57
+rows/expert, so M128 does not even reduce the tile count versus M64 and remains
+an opt-in skew experiment. Only a real histogram and same-boot timing can
+select this rung.
+
+`ATLAS_EXL3_PREFILL_K64=1` selects a separate M64 kernel that stages four
+consecutive K16 activation/trellis slices before synchronization. It executes
+the four decode/MMA slices in the original K order, so FP32 accumulation order
+is unchanged, but pays two stage barriers per K64 instead of eight. Across one
+gate/up/down routed tile at the current K=4,096/4,096/2,048 shapes, that is 320
+dynamic stage barriers instead of 1,280. K64 is mutually exclusive with M128;
+both remain opt-in until device parity and timing pass.
+
+The K64 modules additionally use SM121 asynchronous global-to-shared copies.
+Activation rows keep the load-bearing `+2` BF16 bank-dispersion pad, so their
+shared addresses are only four-byte aligned: four `cp.async.ca` words replace
+the register-mediated 16-byte load/store. Naturally aligned trellis vectors use
+one 16-byte `cp.async.cg`. One commit/wait covers both streams before the same
+CTA barrier and the MMA sequence is untouched. On the fixed-K2 cubin this
+replaces the static 6 LDG + 12 STS mix with 4 LDG + 4 STS + 8 LDGSTS and one
+dependency barrier; function text shrinks from 784 to 736 16-byte SASS slots
+while staying at 64 registers, 10,496 B ELF shared memory, 32 HMMA, and zero
+stack/local/spills. The generic K64 cubin also assembles with 63 registers.
+
+The same experiment reduced K16 text from 512 to 488 slots but raised its
+register count from 56 to 64, so it was rejected there. The shipping K16 module
+remains exactly 512 slots / 56 registers. This selection is compiler evidence,
+not a device-timing claim; the P2 byte-parity and same-boot K16/K64 CUDA-event
+gates below remain mandatory.
+
+A two-buffer K64 `cp.async` pipeline was also kept out of production. Its
+sentinel-stage form can preserve K/HMMA order and safely barrier asynchronous
+copies plus synchronous tail zero-fill, but static text grew from 640 to 664
+instructions and ptxas shared memory doubled from 9,472 to 18,944 B. On a
+100-KiB SM that changes the shared-memory ceiling from nine to five resident
+CTAs. Only GPU parity, sync/race checking, and occupancy-timed A/B evidence
+could justify that latency-hiding trade, so the single-buffer arm remains.
+
+All direct variants stage logical BF16x8 activation vectors. K16/M128 use one
+aligned `uint4` global load followed by four 32-bit stores into the padded
+shared row; K64 uses the four asynchronous words described above. Current K
+dimensions, K-stage bases, and vector source columns are 16-byte aligned. Both
+forms are bitwise copies and leave arithmetic unchanged.
+
+The serving checkpoint's K2 projections automatically use fixed-bit decoder
+cubins inside direct mode. `ATLAS_EXL3_PREFILL_FIXED_K2=0` restores the generic
+K2/K3 decoder for A/B and fallback; K3 projections always remain generic. The
+fixed kernels keep the same trellis word order and reject a mismatched runtime
+bit width. On SM121, fixed K2 reduces the complete K16 cubin from 592 to 512
+SASS instructions and 64 to 56 registers; K64 drops from 880 to 784
+instructions and reduces declared shared memory from 9,984 B to 9,472 B. All
+four cubins have zero stack, spills, and local memory. These are compiler
+effects, not device timings.
+
+For the checkpoint-proven K2 projection shapes, persistent mode also selects
+fixed `N/K` entry points: gate/up use `2048x4096`, and down uses `4096x2048`.
+The kernels reject mismatched runtime dimensions, bitrate, or persistence;
+`ATLAS_EXL3_PREFILL_FIXED_SHAPE=0` restores the shape-generic fixed-K2 arm.
+On SM121, fixing the shape reduces K16 from 512 to 424 SASS instructions
+(-17.2%) at the same 56 registers and 2,560 B ptxas shared memory. K64 falls
+from 736 to 656 instructions (-10.9%) and from 64 to 56 registers at the same
+9,472 B shared memory. Both gate/up and down compile identically, retain the
+same 8/32 HMMA counts and copy mix, and use zero stack/local/spill memory.
+This is static compiler evidence; GPU byte parity and timing remain required.
+
+Those four fixed-shape entries also compile the production direct-mode row
+mapping as identity. The host already passes a null `sorted_token_ids`; the
+specialized kernels reject any non-null pointer, while every generic entry
+retains the optional gather. K16 consequently shrinks again from 424 to 384
+instructions (-9.4%) at the same 56-register/2,560-B resource footprint. K64
+stays at 656 instructions and 56 registers but removes the sorted-index global
+load. Executed activation copies, HMMAs, barriers, shared memory, and arithmetic
+order are unchanged. This remains compiler evidence pending the GPU gates.
+
+Finally, the fixed entries require the exact production one-CTA-per-strip
+1-D grid and compile out the generic undersubscribed grid-stride loop. Runtime
+guards check both auxiliary grid dimensions and the full
+`num_experts*(N/64)` extent; host sizing uses checked multiplication. N-tile
+counts are compile-time power-of-two constants, so the strip maps to its
+expert and N64 tile with a shift and mask. K16 shrinks from 384 to 376
+instructions and 56 to 55 registers; K64 shrinks from 656 to 640 instructions
+at the same 56 registers. Both retain their shared-memory footprints, copy and
+HMMA counts, barriers, and zero stack/local/spill use. The generic fixed-K2
+modules preserve grid-stride support for undersubscribed parity and opt-out.
+
+A full compiler-visible fixed-128-thread experiment (C++ runtime block guard,
+constant load stride, and fixed M-warp mapping) was rejected. It reduced K16
+from 376 to 344 instructions and K64 from 640 to 624, but raised registers to
+64 from 55/56. Bisection retained `__launch_bounds__(128)` and the existing
+runtime mapping. A uniform inline-PTX entry guard now rejects any non-128x1x1
+block without exposing the fixed size to ptxas: registers remain 55/56 and the
+steady loops are unchanged. The guard adds 16 static slots to K16 and eight to
+the final K64 body. Generic and M128 kernels carry neither the fixed launch
+bound nor this exact-block ABI guard.
+
+K64 fixed-shape entries additionally pack each adjacent BF16 output pair with
+two independent round-to-nearest conversions and one aligned 32-bit store.
+Every pair starts on an even BF16 column and stays within its N2048/N4096 row;
+the two M-tail row guards remain independent. Combined with launch bounds this
+reduces K64 from 640 to 600 instructions, replaces 32 scalar 16-bit stores with
+16 pair stores, and cuts BF16 conversion instructions from 48 to 32 at the
+same 56 registers, shared memory, HMMAs, copies, barriers, and zero spills.
+K16 keeps scalar stores because its packed candidate raised registers 55→56.
+
+The K64 fixed-K2 decoder also simplifies its three shifted 18-bit windows.
+After the first funnel shift, K2 consumes only `lo` bits 4..21, 8..25, and
+12..29, so `lo >> 4/8/12` is exactly equivalent to funneling in a high word.
+An all-lane CPU oracle covers deterministic edge and seeded random words. The
+change reduces the unguarded K64 body from 600 to 592 instructions and its hot
+loop from 413 to 409 (256 fewer dynamic instructions per M tile at K=4,096).
+With the fail-closed entry guard, the complete function is 600 instructions at
+the same 56 registers and unchanged HMMAs, async copies, dependencies,
+barriers, stores, shared memory, and zero spills. K16 retains generic windows
+because its candidate raised registers 55→56; its guarded complete function
+is 376 instructions / 55 registers.
+
+`ATLAS_EXL3_PREFILL_N128=1` adds an exact K64/K2 M64xN128 rung for the
+DeepSeek gate/up/down shapes. Eight column warps share the same staged M64
+activation tile instead of four, so the N2048 projections use 16 rather than
+32 strips per expert and N4096 uses 32 rather than 64. Across three routed
+projections this halves the exact outer grid from 32,768 to 16,384 CTAs per
+layer while preserving the number and order of HMMAs and trellis-tile reads.
+At 2,410 tokens and top-6, it removes 5.69 GB/layer of logical BF16 activation
+loads (244.5 GB across 43 layers); these are instruction-level bytes and may
+hit cache, not a claim of equivalent DRAM traffic or elapsed-time savings.
+
+Both N128 shapes assemble for SM121a at 600 static instructions, 62 registers,
+10,496 B ptxas shared memory, one barrier, and zero stack/local/spills. The N64
+comparison is 600 instructions, 56 registers, and 9,472 B ptxas shared memory.
+A CPU owner model proves every M64xN128 output element is written exactly once,
+and the host enables this rung only on the exact persistent fixed-shape K64/K2 path.
+The increased block width and register footprint make same-boot N64/N128 byte
+parity and CUDA-event timing mandatory before promotion.
+
+```bash
+ATLAS_TARGET_MODEL=deepseek-v4-flash cargo run --release -p spark-model \
+  --example exl3_prefill_n128_microtest --features cuda,gpu-examples
+```
+
+The harness uses both production matrix shapes and 1/63/64/65/129 rows per
+expert, compares generic N64, exact N64, exact N128, and exact N256 output
+bytes, poisons every destination independently, verifies that wrong N128/N256
+block sizes leave the poison untouched, and then prints same-boot CUDA-event
+timings.
+
+`ATLAS_EXL3_PREFILL_N256=1` is the next exact K64/K2 rung. Sixteen column
+warps in one 512-thread CTA share the same staged M64 activation tile while
+retaining each warp's existing 16-column accumulator and K order. Relative to
+N128, this halves the exact outer grid from 16,384 to 8,192 CTAs per layer and
+removes 2,842,951,680 logical activation bytes/layer, or 122,246,922,240 bytes
+(113.85 GiB) across 43 layers at 2,410 tokens/top-6. Trellis reads, HMMAs,
+output stores, and accumulation order are unchanged.
+
+Both N256 wrappers assemble for SM121a at 62 registers, 12,544 B ptxas shared
+memory, 32 static HMMAs, one barrier, and zero stack/local/spills/atomics. The
+raw register arithmetic (`2*512*62`) is below 64 K, but allocation granularity
+and the one-argument launch bound do not prove two resident CTAs. A GB10
+occupancy query and device timing remain promotion gates. The CPU owner model
+covers every M64xN256 output element once and the host keeps N256 mutually
+exclusive with the N128 experiment.
+
+The traffic-only upper bound is still insufficient for the 2,000 tok/s goal:
+charging every saved byte to 273 GB/s removes at most about 0.448 s from the
+historical 2.66-second TTFT, or roughly 1,089 prefill tok/s. Cache reuse makes
+the actual gain smaller. N256 is therefore a meaningful measurement rung, not
+a claim that the target is reached.
+
+```bash
+bash scripts/check-exl3-prefill-n256-sass.sh
+```
+
+The next numeric candidate is W2A8, not a wider exact tile. The isolated
+`kernels/gb10/experiments/exl3_w2a8_grouped_prefill.cu` component keeps EXL3
+trellis weights compressed, pairs two decoded K16 fragments into one native
+E4M3 K32 MMA, and retains FP32 accumulators. It consumes sorted post-H128 A8
+from the existing per-token/per-K128 quantization contract. For every K128
+group, `a_scale[row,group]=max(maxabs/448,1e-12)`; after decoded weights are
+scaled by 16, that group's FP32 inner accumulator is folded into the outer
+accumulator with `a_scale/16`, before the existing BF16 output boundary. The
+component now has a default-off, model-specific serving integration behind
+`ATLAS_EXL3_PREFILL_W2A8=1`. It is eligible only for the exact DeepSeek K2
+gate/up `(2048,4096)` and down `(4096,2048)` shapes with top-6 routing, TP1,
+no communicator or EP, direct persistent fixed-shape prefill, the fixed-K2
+dual-pre/fused-post chain, no M128/N128/N256 selector, all four CUDA handles,
+no graph capture, and sufficient checked arena
+capacity. Any W2A8 mismatch retains the incumbent path before the first W2A8
+write; EXL3 graph capture keeps its pre-existing fail-closed rejection. Once
+the five-launch same-stream chain starts, errors propagate instead of entering
+the incumbent alias schedule. Its raw down BF16 result receives the existing
+H128/SVH post unless fused post-unpermute owns that boundary. The compact
+A8/scales reuse the expert output
+arenas; the token-major `fp8_act` buffer is not used. The CPU prerequisite
+exhaustively enumerates all 65,536 codebook windows: 10,746 finite binary16
+values in
+`[-3.94921875, 3.94921875]`; an exact power-of-two weight scale of 16 avoids
+E4M3 saturation and loss of nonzero codebook values. It also proves the
+M64xK32 A, K32xN16 B, and M64xN64 accumulator fragment bijections. In
+particular, the incumbent BF16-K16 lane fragments are not already a native FP8
+B fragment: an intra-quad shuffle/repack must produce four consecutive K bytes
+per `b0`/`b1` register. The component implements that mapping with two direct
+index shuffles per packed pair; the CPU model pins the byte order independently.
+A compact M3xK256xN8 projection oracle crosses two K128 scale groups, includes
+an all-signed-zero floor group, and bounds the mathematical W2A8 result against
+the BF16 incumbent at cosine above 0.99 and normalized RMSE below 0.15. That is
+an offline operator-model check, not native-MMA parity.
+
+```bash
+ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 cargo test -p spark-model \
+  --test exl3_w2a8_numeric_model --test exl3_w2a8_component_model \
+  --test exl3_w2a8_dispatch_model --test exl3_w2a8_emitter_probe_model
+bash scripts/check-exl3-prefill-w2a8-sass.sh
+bash scripts/check-exl3-prefill-w2a8-probe-build.sh
+bash scripts/check-exl3-prefill-w2a8-emitter-probe-build.sh
+```
+
+Both exact GU `(N=2048,K=4096)` and down `(N=4096,K=2048)` instantiations
+compile for SM121a at 103 registers, 7,168 B cuobjdump shared memory, one
+ptxas barrier slot, and zero stack/local/spills. The retained K64-stage body
+contains 16 static E4M3 K32 QMMA sites, 16 `SHFL.IDX` sites, and 16 native
+saturating E4M3 conversion sites; it executes twice per K128 scale group.
+These are compile/resource facts, not numeric or timing evidence. Raw register
+arithmetic caps residency at four 128-thread CTAs on a 64K-register SM, and
+allocation granularity can lower that, so a GB10 occupancy query remains a gate.
+
+The adjacent producer source
+`kernels/gb10/experiments/exl3_w2a8_h128_emit.cu` removes the producer-side
+BF16 sidecar without skipping its numeric boundary. Its dual H4096 entry
+rounds and re-expands each gate/up H128 result as BF16, then emits row-major
+E4M3 plus one FP32 scale per K128. Its H2048 entry preserves the gate/up
+post-H128 and SwiGLU BF16 boundaries before down H128 and quantization. The
+reduction remaps each warp's four values per lane into the standalone
+quantizer's four contiguous 32-value trees, including the same ordered `fmaxf`
+fold. SM121a compilation reports 36 registers for the dual entry and 40 for
+the down entry, 5,120 B cuobjdump shared memory (4,096 B ptxas static shared)
+for both, and zero stack, local memory, spills, atomics, or BF16 global stores.
+The component tests pin checked sidecar layouts at expanded-row counts 6,144,
+6,150, and 14,460, plus arithmetic overflow rejection. These remain static
+component facts: model-specific wrappers make the emitters available only to
+the explicit serving opt-in, and native numeric, occupancy, quality, and
+end-to-end timing gates are still required before promotion.
+
+The standalone emitter admission harness compares the dual-H4096 candidate to
+the fixed dual BF16 transform plus the standard quantizer, and the down-H2048
+candidate to the incumbent fused post/SwiGLU/pre transform plus that quantizer.
+FP8 data and FP32 scales must match byte-for-byte for nonidentity and null
+identity routing across row boundaries 1/31/32/33/63/64/65/129. It also checks
+two output poisons, inactive tails, guard regions, and each malformed grid,
+block, row, and fixed-width launch independently. Build and retain the
+provenance-bound runner with:
+
+```bash
+W2A8_EMITTER_PROBE_OUTPUT_DIR=/tmp/atlas-w2a8-emitter-probe \
+  bash scripts/check-exl3-prefill-w2a8-emitter-probe-build.sh
+/tmp/atlas-w2a8-emitter-probe/run-emitter-probe.sh
+```
+
+The receipt binds the harness, emitter, incumbent EXL3 source, quantizer,
+build script, tools, repository state, host binary, and extracted cubins. An
+offline compile does not satisfy native parity; the strict generated runner
+must finish on GB10 with zero mismatches and clean guards.
+
+The isolated
+`kernels/gb10/experiments/exl3_w2a8_grouped_prefill_n128.cu` component is the
+next W2A8 strip-width experiment. It doubles the N64 component to an exact
+M64xN128, 256-thread/eight-warp CTA while retaining the K128 scale groups,
+two K64 stages, native E4M3 K32 MMA, FP32 accumulation, and final BF16
+boundary. It is compile-only: no production registry, environment selector,
+serving dispatch, or fallback can reach it. At 2,410 tokens, top-6 routing,
+and 43 layers, the CPU work model halves the logical activation rereads from
+the N64 component, removing 122,246,922,240 bytes (113.85 GiB) and 704,512
+CTAs across gate, up, and down. Those are structural counts, not a cache,
+latency, or throughput prediction.
+
+```bash
+ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 cargo test -p spark-model \
+  --test exl3_w2a8_n128_model
+bash scripts/check-exl3-prefill-w2a8-n128-sass.sh
+```
+
+Both production-shape instantiations assemble for SM121a at 1,016 static
+instructions, 96 registers, 8,192 B resource shared memory, one barrier, and
+zero stack/local/spills/atomics. The trellis-stage regression proves the 128
+cooperative `uint4` loads are a bijection over the four K16 rows by 32 N128
+words and that all 512 scalar words consumed by the eight warps are initialized
+exactly once. GB10 numeric parity, occupancy, component timing, and end-to-end
+timing remain required before any serving integration.
+
+The isolated
+`kernels/gb10/experiments/exl3_w2a8_fused_gu_down_emit_n128.cu` component
+tests a different N128 lever: collapse the two gate/up consumers and the
+post-H128/SwiGLU/down-pre A8 producer into one exact-shape CTA. This is an
+Atlas-specific implementation of the conceptual mega-fusion precedent in
+Entrpi/ds4 commit `da027a1`; Atlas retains EXL3 trellis decode, explicit BF16
+round/re-expand boundaries, and its standalone per-K128 A8 reduction order.
+Each 256-thread CTA owns one expert/N128 tile and loops M64 rows. Gate and up
+are computed sequentially into two 64x128 BF16 shared tiles; the dead GEMM
+staging storage is then reused by the down-A8 reduction. The component emits
+the down GEMM's A8 input and FP32 scales, not the final down projection.
+
+```bash
+ATLAS_SKIP_BUILD=1 CUDARC_CUDA_VERSION=13000 cargo test -p spark-model \
+  --test exl3_w2a8_fused_gu_down_emit_n128_model
+bash scripts/check-exl3-prefill-w2a8-fused-gu-n128-sass.sh
+bash scripts/check-exl3-prefill-w2a8-fused-gu-n128-probe-build.sh
+```
+
+The exact SM121a entry assembles at 3,344 static instructions and 128
+registers/thread (32,768 nominal registers/block). ptxas reports 39,936 B
+static shared memory; `cuobjdump --dump-resource-usage` reports 40,960 B,
+including its additional 1 KiB accounting. Stack, local memory, spills, and
+atomics are all zero. The source/SASS gate also pins 32 E4M3 QMMA, 52 BF16
+conversion, 36 saturating E4M3 conversion, 4 `MUFU.EX2`, 166 FFMA, 193
+shuffle, and 7 `BAR.SYNC` sites. At 2,410 tokens/top-6 it structurally replaces
+three launches with one and removes 236,912,640 logical BF16 gate/up
+write-plus-read bytes per layer: 86 launches and 10,187,243,520 bytes
+(9.488 GiB) across 43 layers. These are compile-only resource and structure
+facts, not measured traffic or time. There is no serving symbol registration
+or dispatch, native parity, occupancy result, timing result, or throughput
+claim; all remain promotion gates.
+
+Build an immutable GB10 runner and supply its only admission threshold
+explicitly:
+
+```bash
+W2A8_FUSED_GU_PROBE_OUTPUT_DIR=/tmp/atlas-w2a8-fused-gu-probe \
+  bash scripts/check-exl3-prefill-w2a8-fused-gu-n128-probe-build.sh
+/tmp/atlas-w2a8-fused-gu-probe/run-fused-gu-n128-probe.sh 1.01
+```
+
+The probe byte-compares all 14,460 expanded rows and their K128 scales across
+256 experts, in addition to eight row-boundary cases, one empty-expert case,
+dual output poisons, and 15 malformed geometries. Timing is same-process ABBA
+over a balanced synthetic 256-expert histogram; it is not the checkpoint's
+real routing histogram or an end-to-end result. `1.01` is an explicit
+admission threshold, not a measured speedup or throughput claim.
+
+The isolated
+`kernels/gb10/experiments/exl3_w2a8_grouped_prefill_n256.cu` component extends
+the same mapping to M64xN256 with 512 threads and sixteen N16-owning warps. The
+first 256 threads bijectively stage the 256 activation `uint4` vectors and the
+four-by-64 trellis `uint4` vectors; each warp consumes one disjoint 16-word
+trellis fragment and writes one N16 strip. Relative to N128, this halves the
+outer grid from 16,384 to 8,192 CTAs/layer and halves logical A8 activation
+rereads. At 2,410 tokens/top-6 that structural difference is 1,421,475,840
+bytes/layer, 61,123,461,120 bytes (56.92 GiB) and 352,256 CTAs across 43 layers.
+These are logical instruction-level counts, not DRAM, latency, or throughput
+predictions.
+
+```bash
+bash scripts/check-exl3-prefill-w2a8-n256-sass.sh
+```
+
+Both exact GU/down N256 instantiations compile for SM121a at 1,024 static
+instructions, 100 registers/thread, 51,200 nominal and 53,248
+allocation-granularity-rounded registers/block, 10,240 B cuobjdump shared
+memory (9,216 B ptxas static shared), one barrier slot, and zero
+stack/local/spills. Each retains 16 static E4M3 QMMA, 16 `SHFL.IDX`, and 16
+saturating E4M3 conversion sites. This establishes static resource feasibility
+only: N256 has no serving wrapper or registry entry, and no GB10 numeric,
+occupancy, timing, or throughput result.
+
+The standalone promotion probe independently compiles both production shapes
+at N64, N128, and N256 and emits six provenance-bound binaries. On GB10, persist them
+and pass
+explicit, review-approved numeric thresholds (the harness intentionally has no
+defaults):
+
+```bash
+W2A8_PROBE_OUTPUT_DIR=/tmp/atlas-w2a8-probes \
+  bash scripts/check-exl3-prefill-w2a8-probe-build.sh
+/tmp/atlas-w2a8-probes/run-gu-pair-probe.sh \
+  <min_cosine> <max_abs_error> <min_end_to_end_speedup>
+/tmp/atlas-w2a8-probes/run-down-pair-probe.sh \
+  <min_cosine> <max_abs_error> <min_end_to_end_speedup>
+/tmp/atlas-w2a8-probes/run-gu-three-width-probe.sh \
+  <min_cosine> <max_abs_error> <min_end_to_end_speedup>
+/tmp/atlas-w2a8-probes/run-down-three-width-probe.sh \
+  <min_cosine> <max_abs_error> <min_end_to_end_speedup>
+```
+
+Each process compares the BF16 incumbent and W2A8 component at
+M=1/63/64/65/127/128/129 plus four-expert cases with leading/internal and
+trailing empty experts. Distinct per-K128 magnitudes and zero groups exercise
+scale indexing. Prefix/suffix and inactive-tail guards, two different output
+poisons, and wrong block/grid/N/bits/persistence launches detect partial writes
+or escaped guards. PASS requires finite numeric metrics and a review-selected
+minimum speedup for A8 quantization plus W2A8, averaged in baseline/candidate/
+candidate/baseline order; kernel-only and quantization times remain diagnostics.
+The paired runners execute the receipted N64 and N128 binaries sequentially,
+write exclusive synthetic-output dumps in a private temporary directory, and
+require the concatenated BF16 bytes to compare exactly. They also fail unless
+all nine W2A8 output hashes plus the input and trellis identities match.
+Individual `run-{gu,down}-n{64,128,256}-probe.sh` runners remain
+available for isolated timing; `run-{gu,down}-probe.sh` aliases N64 for existing
+workflows.
+The existing pair runners remain supported and are not replaced by the
+compile-only N256 component. The generated
+`run-{gu,down}-three-width-probe.sh` sequences receipted N64, N128, and N256
+binaries with the same inputs and explicit thresholds, then requires all nine
+hashes, input/trellis identities, and raw BF16 dumps to match exactly across
+the three widths before admitting any timing comparison. Until it runs
+successfully on GB10, N256 has no runtime or throughput evidence.
+The probe prints the accepted thresholds, device/driver/runtime, deterministic
+input/trellis/output hashes, FP8 saturation/floor-scale counts, and all times.
+The build receipt binds source, named build tools, flags, commit/status, exact
+host-binary hashes, and stable
+extracted cubins for all six variants. Host hashes bind the binaries actually
+run; extracted cubins
+provide the reproducible device-code identity because nvcc embeds unstable
+temporary names in the host ELF. It also hashes the build script, records exact
+GU/down compile commands, and embeds the manifest-derived build ID in each probe.
+The generated runners verify the receipt and binary hashes before launch, then
+print both identities; the probe prints the same build ID in its runtime log. A
+nonempty retained-output directory is rejected instead of overwritten. The
+standard `NVCC_PREPEND_FLAGS` and `NVCC_APPEND_FLAGS` injection paths are
+also rejected because they would make the recorded command incomplete. Every
+source, named tool, commit, and status digest is revalidated after GU/down
+compilation and before emitting a receipt or runner. These
+component times still do not substitute for five-run end-to-end TTFT.
+
+W2A8 intentionally changes operand precision and K32 reduction. It requires a
+native-RNE conversion dump, tagged fragment and one-hot MMA dumps, activation
+saturation telemetry, CPU-quantized projection comparisons, layer-logit/top-k
+agreement, quality gates, occupancy, and same-boot timing before promotion.
+The current host wiring is experimental and default-off; those gates remain
+prerequisites for promotion or a default change.
+Even an ideal 2x reduction
+of the historical ~1.25-second MoE bucket saves at most ~0.625 seconds, still
+short of the 1.455-second reduction required by the rounded 2.66-second baseline
+for 2,000 tok/s.
+
+`ATLAS_EXL3_PREFILL_DUAL_PRE=1` adds an exact H4096 gate/up pre-rotation
+entry. It widens each gathered BF16 activation lane once, then calls the same
+multiply, H128, and BF16-rounding body twice with independent gate and up SUH
+tables. The host uses this only with the persistent fixed-shape K2 path and
+`ATLAS_EXL3_PREFILL_FUSED_POST=1`; all other paths retain the two legacy
+launches. The entry rejects any K other than 4096 or grid/block other than
+`[rows,4,1]` / `[256,1,1]`.
+
+The safe alias schedule writes gate's rotated H4096 rows into
+`expert_down_out` and up's into `expert_up_out`. Gate consumes its rotation
+first; up then reads its distinct rotation while writing H2048 projected rows
+over the now-dead gate rotation. The fused post consumes that result before
+the down projection reuses `expert_down_out`. Dispatch checks the full
+`rows*4096*2` capacity with checked arithmetic.
+
+At N=2,410/top-6, this removes one launch and one 118,456,320-byte
+(112.969-MiB) logical input read per layer: 43 launches and 5,093,621,760
+bytes (4.744 GiB) across 43 layers. DeepSeek-V4 buffer sizing reserves the
+second H4096 rotation even while execution is opt-in, adding 59,228,160 bytes
+(56.484 MiB) at N=2,410 and at most 96 MiB for a 4,096-token arena relative
+to the former H2048 buffer. Residency must therefore be checked even before
+promotion.
+
+The dual-only writer packs each naturally aligned adjacent BF16 pair into one
+32-bit store. Both values still receive independent round-to-nearest BF16
+conversion in their original lane order; the generic fallback retains its
+scalar stores. With CUDA 13.0.88 for SM121a, the dual entry assembles at 224 SASS
+instructions and 33 registers versus 144 instructions and 19 registers for
+one single entry (288 instructions across two launches). Both have zero
+shared/local/stack/spill memory and no barriers. It issues four packed stores
+versus eight scalar stores across two legacy launches while preserving 48
+FFMAs, 40 shuffles, and 12 multiplies. This is compiler evidence,
+not device timing or a TTFT/tok/s claim.
+
+```bash
+bash scripts/check-exl3-dual-pre-sass.sh
+```
+
+The offline checker recompiles SM121a, validates the symbol/resource ceilings,
+load/store and arithmetic instruction counts, and prints the cubin SHA-256.
+
+```bash
+ATLAS_TARGET_MODEL=deepseek-v4-flash cargo run --release -p spark-model \
+  --example exl3_dual_pre_microtest --features cuda,gpu-examples
+```
+
+That GPU promotion gate byte-compares the two-launch oracle with the dual
+entry at N=1/17/65/256/2,410, checks the NULL identity gather, uses distinct
+signs and poison values, guards outputs with canaries, exercises every K/grid/
+block guard, and only then reports 31-sample ABBA CUDA-event timing. It
+compiles offline but has not been run on a GPU in this worktree.
+
+`ATLAS_EXL3_PREFILL_FUSED_BLEND=1` adds a separate exact DeepSeek-V4 tail
+which combines fixed-H4096 down-post/unpermute with the shared-expert blend.
+One 256-thread CTA owns a token: its eight warps first reproduce the existing
+gate dot/reduction, then each warp processes four H128 chunks. The standalone
+and combined kernels include one common helper for the gate reduction and
+final blend. The combined kernel also calls the same ordered top-k/Hadamard
+body as the existing unpermute entry and explicitly retains both BF16
+materialization boundaries.
+
+The host enables this arm only for the exact persistent fixed-shape K2 path,
+top-6 routing, a present shared expert, non-EP execution, no graph capture,
+overlap disabled, and dumps disabled. Every mismatch retains the existing
+unpermute followed by `moe_batched_blend`; EP still blends only after its
+all-reduce. The environment variable is opt-in until hardware parity and
+timing promote it.
+
+At N=2,410 the structural saving is one launch and one 18.828-MiB routed BF16
+write plus one 18.828-MiB reread per layer: 39,485,440 logical bytes/layer,
+or 1,697,873,920 bytes (1.581 GiB) across 43 layers. These are eliminated
+instruction-level bytes, not measured DRAM traffic or a TTFT/tok/s claim.
+The SM121a fused entry assembles at 40 registers, 32 B ptxas shared memory,
+and zero stack/local/spills. The pre-existing standalone blend now uses the
+same helper and assembles at 15 registers, 32 B shared memory, and zero
+stack/local/spills with CUDA 13.0.88. A compiler-opaque block guard makes its
+shared-scratch precondition fail closed without changing that register count.
+
+```bash
+ATLAS_TARGET_MODEL=deepseek-v4-flash cargo run --release -p spark-model \
+  --example exl3_fused_blend_microtest --features cuda,gpu-examples
+```
+
+That bounded gate byte-compares the legacy two-launch chain against the fused
+entry at N=1/17/65/256/2,410, with a real gate and the legacy NULL-gate=1
+semantics. It builds a stable expert-sorted top-6 inverse map over all 256
+experts, guards both outputs with canaries, checks wrong H/top-k/grid/block
+fail-closed behavior, and only then reports 31-sample ABBA CUDA-event timing.
+Its 2026-08-27 GB10 run failed byte parity at the first gated N=1 case, so the
+exact max profile forces this arm off and retains fused unpermute plus the
+incumbent shared-expert blend.
+
+The host-histogram fallback grid is expert-major
+`(N/64, ceil(max_rows/M_TILE), num_experts)`. Persistent mode instead has
+`num_experts*(N/64)` compact CTAs and loops over
+`ceil(expert_rows/M_TILE)` inside the assigned CTA. For each M tile, one CTA:
+
+1. stages one sorted `64x16` BF16 activation tile;
+2. reads one contiguous four-tile EXL3 strip (`256 B` at K2, `384 B` at K3);
+3. assigns one `16x16` trellis tile to each warp and decodes it directly into
+   BF16 B-fragment registers using the same window extraction, 3INST
+   operation, FP16 result and FP16-to-BF16 rounding as P1;
+4. reuses that fragment across eight `m16n8k16` FP32-accumulating MMAs and
+   stores the same sorted output layout as `moe_bf16_grouped_gemm`.
+
+This preserves P1's surrounding H128 rotations and eliminates both the BF16
+global scratch write and its grouped-GEMM reread. At the 2,410-token geometry,
+the routed expert stream is approximately the resident trellis payload times
+`ceil(rows_per_expert/64)` (one pass in the balanced 256-expert/top-6 model;
+skew can add tiles), rather than P1's decoded-weight scratch traffic. This is a
+traffic model, not a speed claim.
+
+Offline gates currently passed:
+
+- CPU tile-order bijection: all 256 `(k,n)` positions covered exactly once;
+- CPU warp/accumulator model: every cell of the `64x64` output tile has one
+  owner and each warp consumes only its assigned 16-column trellis fragment;
+- CPU expert-offset model: every sorted routed row covered exactly once,
+  including empty experts and 64-row boundaries;
+- CPU BF16x8 staging model covers every activation element exactly once and
+  proves 16-byte alignment at K=2,048/4,096 for K16/K64 stages;
+- the targeted Rust/source models pass and the GB10 kernel set compiles;
+- CPU expert-strip model covers every live M/N tile once. At current config
+  dimensions (256 experts, top-6, H=4,096, MoE intermediate=2,048), it replaces
+  7,405,568 M64 rectangular slots per modeled layer (3,702,784 for M128) with
+  32,768 exact outer strips. Gate/up each launch 8,192 CTAs (171 waves on 48
+  SMs) and down launches 16,384 (342 waves), instead of 96 CTAs serially walking
+  85 or 171 strips apiece. The counts are scheduler arithmetic, not timing;
+- persistent M64 `sm_121` cubin: 64 registers, 2,688 B declared kernel shared
+  memory, zero stack, zero spills, eight BF16 HMMA instructions per K tile,
+  and no local load/store or atomic instructions;
+- K64-stage M64 `sm_121` cubin: 64 registers, 9,984 B declared kernel shared
+  memory, zero stack/spills/local memory/atomics. Its generated body contains
+  32 static HMMA instructions per four-slice stage versus eight in K16;
+- fixed-K2 K16/K64 cubins preserve the CPU trellis-layout model and have
+  explicit generic fallback plus GPU-gated byte-parity cases;
+- hybrid M128 `sm_121` cubin: 64 registers, 4,992 B declared shared memory,
+  zero stack/spills; its CPU ownership model covers every `128x64` output cell
+  once and proves tail masking matches M64 padded-MMA work;
+- fused post/SwiGLU/down-pre `sm_121` entry: 39 registers, no shared/local
+  memory, barriers, stack, or spills; its CPU model proves both intermediate
+  BF16 boundaries are load-bearing;
+- fused down-post/unpermute `sm_121` entry: 39 registers, no shared/local
+  memory, barriers, stack, spills, or atomics; CPU models cover warp ownership,
+  post BF16 rounding, and top-k accumulation order.
+- exact H4096 shared-tail entry: 40 registers, 32 B shared memory, zero
+  stack/local/spills; CPU/source models cover its one-CTA ownership, ordered
+  top-k body, two BF16 barriers, common gate tree, opt-in host fallback, and
+  43-launch/1.581-GiB logical-traffic model.
+- exact dual H4096 pre entry: 33 registers and zero shared/local/stack/spill
+  memory; CPU/source models cover independent transforms, single input loads,
+  exact geometry, checked capacity, safe alias lifetime, its GPU promotion
+  harness, and the 43-launch/4.744-GiB logical-traffic model.
+- exact shared-expert V2 M6 entry: 904 instructions, 80 registers, three
+  branches, and zero spills versus 1,232/76/31 for the runtime-M incumbent;
+  `scripts/check-exl3-shared-v2-sass.sh` proves equal per-row
+  FFMA/FADD/shuffle counts and resolves every M=4/5/6/8/16 entry.
+
+### Shared-expert load-time FP8 A/B
+
+`ATLAS_EXL3_SHARED_PREFILL_FP8=1` predequants only the three NVFP4 shared-expert
+matrices to persistent E4M3 at model load. The routed EXL3 weights and router
+gate remain unchanged. Its dedicated launcher retains BF16 activations and one
+`fp8_gemm_t` launch per projection rather than inheriting the default LDMAB
+activation-quantization launch, so the experiment changes one precision arm.
+Missing/wrong-format shared weights fail closed, partial mirror construction is
+freed before returning an error, and the original NVFP4 weights remain the
+default fallback.
+
+At H=4,096/shared-intermediate=2,048 the mirrors cost 25,165,824 bytes per MoE
+layer, or 1,082,130,432 bytes (1.008 GiB) across 43 layers. At N=2,410, the
+38 M64 tiles otherwise revisit 41,120,956,416 FP4 values across those layers.
+This is operation-count and allocation arithmetic, not DRAM traffic or time.
+The existing historical waterfall bounds the whole shared-expert opportunity
+far below the 1.455-second reduction needed from the rounded 2.66-second
+baseline for 2,000 tok/s.
+
+Unlike the exact routed fusions, this arm is not byte-identical: the current
+baseline uses BF16 MMA while the arm stores E4M3 weights and uses FP8 MMA. GPU
+promotion therefore requires memory-residency proof; baseline-versus-arm
+cosine/logit checks at M=1/63/64/65/2,410 for both production shapes; full
+output hashes and tool/prose quality; then five fresh zero-cache TTFT samples.
+
+### M6/M16 device-built verify worklists
+
+`ATLAS_EXL3_VERIFY_WORKLIST=1` is an experimental exact-K2/top-6 decode arm
+for exactly 6 or 16 verify rows. A one-CTA same-stream builder compacts the
+routed slots into one record per distinct expert. M6 retains its original
+32-byte `{expert,count,slots[6]}` ABI and 36-record capacity. M16 uses a
+separate 80-byte `{expert,count,slots[16],reserved[2]}` ABI and 96-record
+capacity, with the reserved tail required to be zero. A single maximum-sized
+7,680-byte allocation serves either exact-width arm without changing the M6
+stride. Every other row count stays on the incumbent ladder.
+
+Fixed 96-CTA gate/up and down kernels grid-stride the compact logical work and
+call the same exact-width trellis/Hadamard/split-combine body as the incumbent.
+For either width, if `U` is the union of routed experts, the compact path runs
+`192U` gate/up and `96U` down body tasks. M16 therefore removes
+`288*(96-U)` logical tasks per layer versus its 27,648-task incumbent. Full
+overlap (`U=6`) removes 25,920 tasks per layer; no overlap (`U=96`) removes
+none. This is scheduling arithmetic, not device timing or a decode tok/s
+claim. The corresponding M6 hash case still removes 8,640 tasks per layer.
+
+The CPU oracle checks both exact wire layouts, canonical M16 padding, strict
+decoding, full-overlap and no-overlap routes, 512 M6 plus 128 M16 adversarial
+routes, once-only coverage of all 36/96 slots, capacity failures, late
+duplicate/out-of-range rejection, and the full 0..capacity task/counter
+bijection for every split from 1 through 12. The CUDA builders validate the
+complete route before emitting any record and bound every slot write.
+
+SM121a compilation reports the M16 builder at 20 registers and no shared
+memory. Both M16 persistent consumers use 128 registers and 37,972 B shared,
+versus 128 registers and 40,020 B shared for their incumbent M16 twins. All
+five M16 entries have zero stack, local memory, and spills. The retained M6
+measurements remain 18 registers for the builder, 109/104 registers and
+28,708 B shared for gate/up and down, and zero stack/local/spills. These are
+compile-time resource gates; actual GB10 occupancy and timing remain device
+promotion gates.
+
+```bash
+bash scripts/check-exl3-persistent-worklist-sass.sh
+CUDARC_CUDA_VERSION=13000 cargo test -p spark-model \
+  --test exl3_persistent_worklist_model
+```
+
+Malformed input records a nonzero device status; without a device-to-host
+synchronization or dynamic fallback, each consumer deterministically zeros all
+36 or 96 routed output rows instead of blending stale scratch. This does not
+surface a host request error: the shared expert still contributes, so the
+contract is memory/stale-output containment rather than full request-failure
+propagation. The layer-local worklist, counter, and split scratch are safe only
+under the server's current single-scheduler/same-stream contract; future
+overlapping execution needs per-stream scratch or an explicit lease. Promotion
+still requires M6 and M16 malformed-route canaries, duplicate-heavy/no-overlap/
+full-overlap byte parity, repeated graph replay to expose stale split counters,
+and CUDA-event timing. Until those GPU gates pass, the environment flag must
+remain off.
+
+Required GPU gates before defaulting or quoting tok/s:
+
+1. run the compiled `exl3_gemv_microtest` P2 gate, which byte-compares generic
+   and fixed-K2 K16/K64 exact-grid, undersubscribed grid-stride, and full
+   compact-grid output with P1 on K2/K3 synthetic trellis at
+   1/63/64/65/129 rows per expert; the harness is present but has not been
+   executed on hardware;
+2. run its fused-post/pre gate, which byte-compares the one-pass result with
+   the legacy post+post+SwiGLU+pre composition using distinct per-expert sign
+   vectors;
+3. run its fused-tail gate, which byte-compares down-post/unpermute against the
+   legacy composition with a nontrivial reverse map and top-k weights;
+4. run `exl3_fused_blend_microtest` for gated/NULL-gate production and short-
+   tail byte parity, fail-closed guards, and legacy-vs-fused CUDA-event timing;
+5. run `exl3_dual_pre_microtest` for sorted and identity-gather byte parity,
+   output canaries, every exact-geometry guard, and two-launch-vs-dual timing;
+6. byte-compare both exact and persistent M128 against P1 at the existing
+   K2/K3 row-boundary cases, then time M64 versus M128 at the real histogram;
+7. real-checkpoint layer parity and full logits/output-hash parity;
+8. same-boot P1/P2 and K16/K64 CUDA-event timing at the production expert
+   histogram;
+9. five-run median TTFT plus the mandatory tool/prose quality gates, including
+   memory residency with the enlarged DeepSeek-V4 expert arena.
+
+The next optimization rung is deliberately deferred until the parity and
+timing gates identify a measured bottleneck; offline resource counts alone do
+not establish that this kernel moves end-to-end TTFT.

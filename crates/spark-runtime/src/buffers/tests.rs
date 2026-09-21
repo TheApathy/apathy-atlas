@@ -14,6 +14,40 @@ fn mixed_dense_moe_sizes_for_widest_ffn() {
     assert_eq!(sizes.expert_gate_out, 4 * 12_288 * 2);
     assert_eq!(sizes.expert_up_out, 4 * 12_288 * 2);
 }
+
+#[test]
+fn deepseek_v4_reserves_full_hidden_rows_for_dual_exl3_rotation() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.model_type = "deepseek_v4".to_string();
+    cfg.hidden_size = 4096;
+    cfg.num_experts = 256;
+    cfg.num_experts_per_tok = 6;
+    cfg.moe_intermediate_size = 2048;
+    cfg.intermediate_size = 2048;
+    cfg.dflash_capture_layers.clear();
+
+    let sizes = BufferSizes::from_config(&cfg, 4, 4096, 16);
+    assert_eq!(sizes.expert_up_out, 4 * 6 * 4096 * 2);
+
+    let production = BufferSizes::from_config(&cfg, 2410, 4096, 16);
+    let routed_rows = 2410 * 6;
+    assert_eq!(production.expert_gate_out, routed_rows * 2048 * 2);
+    assert_eq!(production.expert_up_out, routed_rows * 4096 * 2);
+    assert_eq!(production.expert_down_out, routed_rows * 4096 * 2);
+    assert_eq!(
+        production.expert_up_out - production.expert_gate_out,
+        59_228_160
+    );
+
+    cfg.dflash_capture_layers = vec![0];
+    let dflash_floor = BufferSizes::from_config(&cfg, 4, 4096, 16);
+    assert_eq!(dflash_floor.expert_up_out, 20 * 6 * 4096 * 2);
+
+    cfg.model_type = "qwen3_next".to_string();
+    cfg.dflash_capture_layers.clear();
+    let non_target = BufferSizes::from_config(&cfg, 2410, 4096, 16);
+    assert_eq!(non_target.expert_up_out, non_target.expert_gate_out);
+}
 use crate::gpu::mock::MockGpuBackend;
 
 #[test]

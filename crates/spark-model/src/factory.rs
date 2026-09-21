@@ -12,10 +12,10 @@ use spark_runtime::weights::WeightStore;
 
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::{
-    DeepSeekV41WeightLoader, DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
-    MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
-    Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader,
-    Step3p7WeightLoader,
+    DeepSeekV4WeightLoader, DeepSeekV41WeightLoader, DflashConfig, Gemma4WeightLoader,
+    LagunaWeightLoader, MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader,
+    NllbWeightLoader, Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader,
+    Qwen35WeightLoader, Step3p7WeightLoader,
 };
 
 /// DFlash speculative-decoding build arguments. `None` for non-DFlash runs;
@@ -137,6 +137,10 @@ mod build;
 pub mod kv_cap;
 mod lm_head_setup;
 mod m2_setup;
+pub mod vision_admission;
+pub mod vision_kv;
+pub mod vision_speculation;
+mod vision_speculation_loaded;
 
 pub use build::build_model;
 

@@ -28,10 +28,8 @@ pub struct Qwen3AttentionLayer {
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
     pub(super) attn_layer_idx: usize,
-    /// Startup-static LoRA adapter overlay for the K/V/O projections (v0;
-    /// q_proj excluded — gated Q+gate interleave). Installed
-    /// post-construction via `set_lora_weights`; `None` = base-only.
-    /// M0: stored only — the compute-path reads land in M1.
+    /// Startup-static K/V/O LoRA overlay; q_proj is excluded due to Q+gate
+    /// interleave. Installed by `set_lora_weights`; `None` is base-only.
     pub(super) lora: Option<crate::layers::ops::lora_delta::LoraAttnWeights>,
     /// Whether Q projection includes an output gate (Q+Gate interleaved).
     /// When true, q_proj output is 2× q_dim; attn output is gated by sigmoid.
@@ -97,14 +95,9 @@ pub struct Qwen3AttentionLayer {
     /// NVFP4 path (`attn.o_proj`). Used by Gemma-4 dense which honors
     /// Nvidia ModelOpt's official ignore list.
     pub(super) o_dense_bf16: Option<DenseWeight>,
-    // ── FP8-E4M3 row-scaled MIRROR copies of the BF16 attention projections
-    // (ATLAS_TARGET_ATTN_FP8_MIRROR=1; Laguna ships attention unquantized).
-    // Built once at load time from the BF16 source weights and consumed ONLY
-    // by the decode/verify GEMV/GEMM dispatch sites — prefill stays BF16
-    // (cuBLASLt). `None` (the default) keeps every path byte-identical to
-    // the BF16 baseline. Halves attention weight-read bandwidth on the hot
-    // decode/verify path (qkv 20.3ms + oproj 22.6ms of a 112ms verify step
-    // is pure BF16 weight bandwidth).
+    // FP8-E4M3 row-scaled mirrors, built from BF16 when
+    // ATLAS_TARGET_ATTN_FP8_MIRROR=1. Decode/verify only; prefill stays BF16.
+    // `None` preserves the byte-identical BF16 baseline.
     pub(super) q_fp8_mirror: Option<Fp8DenseWeight>,
     pub(super) k_fp8_mirror: Option<Fp8DenseWeight>,
     pub(super) v_fp8_mirror: Option<Fp8DenseWeight>,
@@ -118,14 +111,10 @@ pub struct Qwen3AttentionLayer {
     /// Single-warp M_TILE=16 sibling (`w4a16::fp8_gemm_t_row_scaled_m16`)
     /// used when M ≤ 16; 0-handle on miss (falls back to the M64 tile).
     pub(super) fp8_gemm_row_scaled_m16_k: KernelHandle,
-    /// Weight-read-bound M ≤ 8 sibling (`w4a16::fp8_gemm_t_row_scaled_mtile8`,
-    /// N_TILE=64, 4-stage cp.async ring) for the verify projections;
-    /// 0-handle on miss (falls back to the _m16/M64 tiles).
+    /// M≤8 N_TILE=64 verify sibling; 0 falls back to _m16/M64.
     pub(super) fp8_gemm_row_scaled_mtile8_k: KernelHandle,
-    /// N_TILE=32 sibling (`w4a16::fp8_gemm_t_row_scaled_mtile8_n32`) for the
-    /// small-N/large-K mirror shapes (o_proj: N=3072, K=6144/9216) where the
-    /// N_TILE=64 grid is only 48 CTAs = 1 CTA/SM; 0-handle on miss (falls
-    /// back to the N_TILE=64 mtile8 kernel). Bit-identical accumulation.
+    /// Bit-identical N_TILE=32 sibling for small-N/large-K; 0 falls back to
+    /// the N_TILE=64 mtile8 kernel.
     pub(super) fp8_gemm_row_scaled_mtile8_n32_k: KernelHandle,
     // ── MLA (Multi-head Latent Attention) — 2-step decode ──
     pub(crate) mla: Option<MlaWeights>,
@@ -140,10 +129,11 @@ pub struct Qwen3AttentionLayer {
     /// split of `hc_pre` (NULL when the kernel module predates the split).
     pub(super) hc_pre_mix_k: KernelHandle,
     pub(super) hc_pre_finish_k: KernelHandle,
-    /// Prefill-width tiled mix (`hc_pre_mix_tiled`): both operands read
-    /// ~once (fn per 32-token tile, x once). 2.39 vs 3.99 ms at T=2410,
-    /// y cosine 1.0000000 vs hc_pre. 0 on miss.
+    /// Prefill-width tiled `hc_pre_mix`; 0 falls back to the incumbent.
     pub(super) hc_pre_mix_tiled_k: KernelHandle,
+    /// Exact DeepSeek-V4 N=2410 fused `hc_pre_finish` + vanilla RMSNorm.
+    /// Strict default-off; 0 preserves the incumbent two-launch finish/norm.
+    pub(super) v4_hc_pre_finish_rms_fused_k: KernelHandle,
     /// Single-launch multi-block decode hc_pre (ATLAS_V4_DECODE_FUSED=1):
     /// row-parallel mix + last-block finish, T==1 only. Zero when absent.
     pub(super) hc_pre_fused_k: KernelHandle,
@@ -189,35 +179,19 @@ pub struct Qwen3AttentionLayer {
     /// Gemma-4 FP32-input rms_norm (absolute formula).
     pub(super) rms_norm_f32_in_k: KernelHandle,
     pub(super) dense_gemv_k: KernelHandle,
-    /// Small-M sibling of `dense_gemv_k` (`dense_gemv_bf16_batchm`); 0 if the
-    /// target has no such kernel. Used for the DFlash verify head-gate
-    /// projection, where M = gamma+1 is far too small to fill the prefill
-    /// tensor-core GEMM's 16x64 tile.
+    /// Small-M DFlash verify head-gate GEMV; 0 when unavailable.
     pub(super) dense_gemv_batchm_k: KernelHandle,
     pub(super) w4a16_gemv_k: KernelHandle,
-    /// One-launch block-diagonal wo_a (`w4a16_gemv_grouped`): replaces the
-    /// 8-per-layer per-group launches. Bit-identical per row; measured
-    /// 153 -> 194 GB/s at the wo_a shape (grouped microtest, 2026-08-09).
-    /// 0 if the target has no such kernel — dispatch falls back per group.
+    /// One-launch, row-bit-identical block-diagonal wo_a; 0 falls back per group.
     pub(super) w4a16_gemv_grouped_k: KernelHandle,
-    /// Batched (M<=8) sibling of `w4a16_gemv_grouped` whose PER-ROW math is
-    /// byte-identical to single-row `w4a16_gemv` — the ATLAS_OPROJ_EXACT
-    /// semantics at batch speed (3.07x the per-row cost in the grouped
-    /// microtest). Serves BOTH verify o-projection phases: wo_a with
-    /// rows_per_group=o_lora, wo_b with rows_per_group=N (single group).
-    /// 0 when absent — verify falls back to the `_ld` kernels (K-order
-    /// drift documented at the OPROJ_EXACT comment in multi_seq/mla.rs).
+    /// M≤8 grouped GEMV with single-row-bit-identical ATLAS_OPROJ_EXACT math;
+    /// serves wo_a and wo_b. 0 falls back to `_ld` (different K order).
     pub(super) w4a16_gemv_grouped_batchm_k: KernelHandle,
-    /// V2 data-movement rework of `w4a16_gemv_grouped_batchm`
-    /// (ATLAS_VERIFY_GEMV_V2=1, default OFF): compile-time M entries
-    /// [m4, m5, m6, m8], SASS-verified bit-identical per row (same FFMA
-    /// sequence; only load widths / addressing / guards changed). Requires
-    /// K % 32 == 0 — dispatch falls back to the incumbent otherwise.
+    /// Default-off V2 [m4,m5,m6,m8], SASS-verified row-bit-identical;
+    /// requires K%32==0 and otherwise falls back.
     pub(super) w4a16_gemv_grouped_batchm_v2_k: [KernelHandle; 4],
-    /// FP8 sibling of the exact batched GEMV (`w8a16_gemv_batchm_exact`,
-    /// M<=8, strided): per-row byte-identical to single-row `w8a16_gemv`.
-    /// With the w4 exact kernel this makes EVERY verify GEMV projection
-    /// single-row-order under ATLAS_VERIFY_EXACT_GEMV=1. 0 on miss.
+    /// M≤8 FP8 GEMV, row-bit-identical to single-row under
+    /// ATLAS_VERIFY_EXACT_GEMV=1; 0 on miss.
     pub(super) w8a16_gemv_batchm_exact_k: KernelHandle,
     /// V2 of `w8a16_gemv_batchm_exact` (ATLAS_VERIFY_GEMV_V2=1): same
     /// [m4, m5, m6, m8] compile-time-M scheme, same bit-identity proof.
@@ -322,6 +296,13 @@ pub struct Qwen3AttentionLayer {
     /// model's `mla_absorbed` module doesn't ship them (non-V4 targets).
     pub(super) v4_decode_rope_fused_k: KernelHandle,
     pub(super) v4_decode_cache_fused_fp8_k: KernelHandle,
+    /// Default-off, jointly dispatched V4 prefill q_b/RoPE and direct FP8
+    /// cache writers. Zero when either production module is unavailable.
+    pub(super) v4_prefill_qb_norm_rope_fused_k: KernelHandle,
+    pub(super) v4_prefill_cache_kfull_fp8_fused_k: KernelHandle,
+    /// Default-off exact-shape V4 prefill inverse RoPE. This materializes the
+    /// same BF16 attention output consumed by retained-BF16 cuBLASLt wo_a.
+    pub(super) v4_prefill_rope_fused_inverse_k: KernelHandle,
     /// MLA absorbed prefill flash attention (HDIM=320, GQA 32:1)
     pub(super) prefill_attn_mla320_k: KernelHandle,
     /// Grouped GEMM for MLA Q absorption + V extraction.
@@ -393,6 +374,11 @@ pub struct Qwen3AttentionLayer {
     /// where tc gets 2). OPT-IN while it is being A/B'd on hardware:
     /// `ATLAS_V4_PREFILL_TC2=1`. 0 on miss.
     pub(super) prefill_attn_compressed_tc2_k: KernelHandle,
+    /// Actual Vision initial-chunk raw visibility; absent on other targets.
+    pub(super) deepseek_vision_prefill_attn_k: KernelHandle,
+    /// Exact-N=2410 TC2 sibling with warp-0-owned tile softmax broadcasts.
+    /// Strict opt-in via `ATLAS_V4_PREFILL_TC2_WARP0=1`; 0 on miss.
+    pub(super) v4_prefill_attn_compressed_tc2_warp0_k: KernelHandle,
     /// 4b: # compressed blocks prefill wrote to `mla.compressor.pool` for the
     /// active sequence (= prefill_len / ratio). Decode's compressed arm attends
     /// blocks `[0, this)`. AtomicU32 for interior mutability under prefill's
@@ -511,6 +497,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) fp8_gemm_k: KernelHandle,
     // FP8×FP8 GEMM
     pub(super) bf16_to_fp8_k: KernelHandle,
+    /// Scale-aware contiguous conversion used by V4's persistent compressed pool.
+    /// Zero on targets whose w4a16 module does not ship the optional sibling.
+    pub(super) bf16_to_fp8_scaled_k: KernelHandle,
     pub(super) fp8_fp8_gemm_k: KernelHandle,
     // M128 variants
     pub(super) fp8_gemm_t_m128_k: KernelHandle,

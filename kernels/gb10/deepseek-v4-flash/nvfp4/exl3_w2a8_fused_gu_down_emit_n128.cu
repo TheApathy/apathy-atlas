@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// DeepSeek-V4 exact K2 fused gate/up-to-down-A8 N128 wrapper.
+
+#define W2A8_FIXED_N 2048
+#define W2A8_FIXED_K 4096
+#define W2A8_KERNEL_NAME exl3_w2a8_fused_gu_down_emit_n128
+#ifdef W2A8_PACKED_E4M3_CANDIDATE
+#undef W2A8_PACKED_E4M3_CANDIDATE
+#endif
+#define W2A8_PACKED_E4M3_CANDIDATE 1
+#ifdef W2A8_FUSED_GU_N128_DOUBLE_BUFFER_CANDIDATE
+#undef W2A8_FUSED_GU_N128_DOUBLE_BUFFER_CANDIDATE
+#endif
+#define W2A8_FUSED_GU_N128_DOUBLE_BUFFER_CANDIDATE 1
+#ifdef W2A8_FUSED_GU_N128_CONTINUOUS_RING_CANDIDATE
+#undef W2A8_FUSED_GU_N128_CONTINUOUS_RING_CANDIDATE
+#endif
+#define W2A8_FUSED_GU_N128_CONTINUOUS_RING_CANDIDATE 1
+#include "../../experiments/exl3_w2a8_fused_gu_down_emit_n128.cu"

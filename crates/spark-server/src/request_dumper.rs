@@ -91,6 +91,41 @@ impl DumpHandle {
         self.write_entry("response", endpoint, seq, body, Some(is_stream));
     }
 
+    /// Write one selective DeepSeek-V4 tool-protocol slip record. The
+    /// generated text is the exact string handed to the parser, not a
+    /// re-serialization of the response envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dump_tool_slip(
+        &self,
+        lane: &str,
+        generated_text: &str,
+        finish_reason: &str,
+        attempt: usize,
+        prompt_len: usize,
+        session_hash: u64,
+        seed: Option<u64>,
+    ) {
+        let seq = self.next_seq();
+        let body = serde_json::json!({
+            "lane": lane,
+            "parser": "dsml_v4",
+            "parse_verdict": "no_valid_tool_calls",
+            "generated_text": generated_text,
+            "finish_reason": finish_reason,
+            "attempt": attempt,
+            "prompt_len": prompt_len,
+            "session_hash": format!("{session_hash:#x}"),
+            "seed": seed,
+        });
+        self.write_entry(
+            "tool_slip",
+            "/v1/chat/completions",
+            seq,
+            &body,
+            Some(lane == "streaming"),
+        );
+    }
+
     fn write_entry<T: serde::Serialize>(
         &self,
         kind: &str,
@@ -181,12 +216,16 @@ fn iso8601_now() -> String {
 /// (from clap's `default_missing_value`) maps to a timestamped file
 /// under `$TMPDIR`; anything else is treated as an explicit path.
 pub fn resolve_path(arg: &str) -> std::path::PathBuf {
+    resolve_path_with_prefix(arg, "atlas-dump")
+}
+
+pub fn resolve_path_with_prefix(arg: &str, prefix: &str) -> std::path::PathBuf {
     if arg == "<auto>" {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        std::env::temp_dir().join(format!("atlas-dump-{ts}.jsonl"))
+        std::env::temp_dir().join(format!("{prefix}-{ts}.jsonl"))
     } else {
         std::path::PathBuf::from(arg)
     }
@@ -212,6 +251,18 @@ mod tests {
     fn resolve_explicit_is_verbatim() {
         let p = resolve_path("/tmp/my-dump.jsonl");
         assert_eq!(p, std::path::PathBuf::from("/tmp/my-dump.jsonl"));
+    }
+
+    #[test]
+    fn resolve_tool_slip_auto_uses_distinct_prefix() {
+        let p = resolve_path_with_prefix("<auto>", "atlas-ds4-tool-slip");
+        assert!(p.starts_with(std::env::temp_dir()));
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("atlas-ds4-tool-slip-")
+        );
     }
 
     #[test]
@@ -244,6 +295,44 @@ mod tests {
         assert_eq!(a["seq"], b["seq"], "request and response share seq");
         assert_eq!(a["body"]["model"], "test");
         assert_eq!(b["body"]["ok"], true);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn dump_tool_slip_preserves_exact_parser_input() {
+        let tmp = std::env::temp_dir().join(format!(
+            "atlas-ds4-tool-slip-test-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let h = DumpHandle::open(tmp.clone()).expect("open");
+        h.dump_tool_slip(
+            "blocking",
+            "plain text instead of DSML\n",
+            "stop",
+            0,
+            98_304,
+            0x1234,
+            Some(7),
+        );
+
+        drop(h);
+        let contents = std::fs::read_to_string(&tmp).unwrap();
+        let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(record["kind"], "tool_slip");
+        assert_eq!(record["body"]["parser"], "dsml_v4");
+        assert_eq!(record["body"]["lane"], "blocking");
+        assert_eq!(record["stream"], false);
+        assert_eq!(record["body"]["parse_verdict"], "no_valid_tool_calls");
+        assert_eq!(
+            record["body"]["generated_text"],
+            "plain text instead of DSML\n"
+        );
+        assert_eq!(record["body"]["session_hash"], "0x1234");
+        assert_eq!(record["body"]["seed"], 7);
         let _ = std::fs::remove_file(&tmp);
     }
 

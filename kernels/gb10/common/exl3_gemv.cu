@@ -100,6 +100,26 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "moe_batched_blend.cuh"
+
+#ifndef EXL3_FIXED_BITS
+#define EXL3_FIXED_BITS 0
+#endif
+#ifndef EXL3_HROW_DSV4_FIXED
+#define EXL3_HROW_DSV4_FIXED 0
+#endif
+static_assert(EXL3_HROW_DSV4_FIXED == 0 || EXL3_HROW_DSV4_FIXED == 1,
+              "EXL3 fixed H-row mode must be boolean");
+#if EXL3_FIXED_BITS
+static_assert(EXL3_FIXED_BITS == 2 || EXL3_FIXED_BITS == 3,
+              "EXL3 fixed bitrate must be K2 or K3");
+#define EXL3_REQUIRE_BITS(bits_) \
+    do { if ((bits_) != EXL3_FIXED_BITS) return; } while (0)
+#define EXL3_BIT_WIDTH(bits_) EXL3_FIXED_BITS
+#else
+#define EXL3_REQUIRE_BITS(bits_) do { } while (0)
+#define EXL3_BIT_WIDTH(bits_) (bits_)
+#endif
 
 #define EXL3_MAX_BITS 3
 #define EXL3_MCG_MULT 0xCBAC1FEDu
@@ -532,7 +552,9 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1(
     float* __restrict__ ws,                      // [gridDim.y, N]
     int* __restrict__ counters,                  // [N/128]
     unsigned int N, unsigned int K, unsigned int bits) {
-    exl3_gemv_m1_body(A, trellis, suh, svh, C, ws, counters, N, K, bits);
+    EXL3_REQUIRE_BITS(bits);
+    exl3_gemv_m1_body(
+        A, trellis, suh, svh, C, ws, counters, N, K, EXL3_BIT_WIDTH(bits));
 }
 
 // ---------------------------------------------------------------------------
@@ -558,10 +580,11 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_idx(
     float* __restrict__ ws,                           // [gridDim.y, N]
     int* __restrict__ counters,                       // [N/128]
     unsigned int N, unsigned int K, unsigned int bits) {
+    EXL3_REQUIRE_BITS(bits);
     const unsigned int e = indices[slot];
     exl3_gemv_m1_body(A, (const unsigned short*)trellis_tab[e],
                       (const __half*)suh_tab[e], (const __half*)svh_tab[e], C, ws,
-                      counters, N, K, bits);
+                      counters, N, K, EXL3_BIT_WIDTH(bits));
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +644,7 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_g
     float* __restrict__ ws,                                 // [gridDim.z, gridDim.y, N]
     int* __restrict__ counters,                             // [gridDim.z, N/128]
     unsigned int N, unsigned int K, unsigned int bits) {
+    EXL3_REQUIRE_BITS(bits);
     const unsigned int group = blockIdx.z;
     const unsigned int slot = group >> 1;
     const unsigned int proj = group & 1u;  // 0 = gate, 1 = up
@@ -632,7 +656,7 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_g
     exl3_gemv_m1_body(A, (const unsigned short*)tt[e], (const __half*)su[e],
                       (const __half*)sv[e], C,
                       ws + (size_t)group * gridDim.y * N, counters + group * (N >> 7), N,
-                      K, bits);
+                      K, EXL3_BIT_WIDTH(bits));
 }
 
 // Fused down over all routed slots. Slot s consumes the SwiGLU activation row
@@ -647,12 +671,13 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_d
     float* __restrict__ ws,                              // [gridDim.z, gridDim.y, N]
     int* __restrict__ counters,                          // [gridDim.z, N/128]
     unsigned int N, unsigned int K, unsigned int bits) {
+    EXL3_REQUIRE_BITS(bits);
     const unsigned int slot = blockIdx.z;
     const unsigned int e = indices[slot];
     exl3_gemv_m1_body(act + (size_t)slot * K, (const unsigned short*)trellis_tab[e],
                       (const __half*)suh_tab[e], (const __half*)svh_tab[e],
                       down_out + (size_t)slot * N, ws + (size_t)slot * gridDim.y * N,
-                      counters + slot * (N >> 7), N, K, bits);
+                      counters + slot * (N >> 7), N, K, EXL3_BIT_WIDTH(bits));
 }
 
 // ===========================================================================
@@ -726,9 +751,14 @@ extern "C" __global__ void __launch_bounds__(EXL3_BLOCK, 4) exl3_gemv_m1_fused_d
 // superblock in ONE fully-occupied iteration per row. Smaller than the m=1
 // kernel's 16 purely to keep MROW slices affordable in smem (MROW=6 -> 12 KB
 // x' + 12 KB stage + 3 KB s_y ~ 27 KB, 3 CTAs/SM on GB10's 100 KB). It is a
-// power of two, which the `s & (EXL3_M_XCHUNKS - 1)` refill/index arithmetic
-// requires, and it is numerically inert (see the law above).
+// power of two, which the refill/index arithmetic requires, and it is
+// numerically inert (see the law above). MROW=16 uses four chunks: eight would
+// require 55,368 B of static shared memory after the inlined routing gather,
+// above SM121's 48 KiB per-block static limit. With four, ptxas reports
+// 40,008 B; it merely adds a storage refill after the fourth 128-k chunk, and
+// arithmetic order is unchanged.
 #define EXL3_M_XCHUNKS 8
+#define EXL3_M16_XCHUNKS 4
 
 // Leader election + slot gather. Algorithmic twin of `mrow_gather_slots` in
 // moe_shared_expert_fused_t.cu, minus the shared-expert block-set (EXL3
@@ -802,20 +832,21 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
     int* __restrict__ counters,                  // pre-offset by launch group
     const unsigned int* __restrict__ s_slot,     // shared [MROW] from the gather
     unsigned int M,                              // gathered rows (<= MROW)
+    unsigned int n_block, unsigned int split, unsigned int splits,
     unsigned int ws_row_mul, unsigned int ws_row_add, unsigned int top_k, unsigned int N,
     unsigned int K, unsigned int bits) {
-    __shared__ __align__(16) __half2 s_x[MROW * EXL3_M_XCHUNKS * 64];
+    constexpr int XCHUNKS = MROW == 16 ? EXL3_M16_XCHUNKS : EXL3_M_XCHUNKS;
+    __shared__ __align__(16) __half2 s_x[MROW * XCHUNKS * 64];
     __shared__ __align__(16) unsigned short s_stage[2][EXL3_STAGE_ROWS * 8 * 48];  // 12 KB
     __shared__ float s_y[MROW][EXL3_NSTRIP];
     __shared__ int s_elect;
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int n0 = blockIdx.x * EXL3_NSTRIP;
+    const int n0 = n_block * EXL3_NSTRIP;
     const int nb0 = n0 >> 4;  // first tile-column of the strip
     const int n_tiles_row = N >> 4;
-    const int S = gridDim.y;
-    const int split = blockIdx.y;
+    const int S = splits;
 
     // 128-aligned K-slice for this split — IDENTICAL formula and identical S
     // to exl3_gemv_m1_body, which is half the exact-GEMV argument.
@@ -823,7 +854,6 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
     const int c_lo = (int)(((long long)chunks_total * split) / S);
     const int c_hi = (int)(((long long)chunks_total * (split + 1)) / S);
     const int rows_lo = c_lo * 8;
-    const int rows_hi = c_hi * 8;
     const int nstages = c_hi - c_lo;
 
     // Kick the trellis pipeline before the x' pass — this is the ONE stream
@@ -843,12 +873,12 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
 
     // ---- Phase 1: x' for the first superblock, one slice per gathered row ----
     {
-        int sb1 = c_lo + EXL3_M_XCHUNKS;
+        int sb1 = c_lo + XCHUNKS;
         if (sb1 > c_hi) sb1 = c_hi;
 #pragma unroll
         for (int m = 0; m < MROW; ++m) {
             if (m >= (int)M) break;
-            exl3_input_pass(EXL3_M_AROW(m), suh, s_x + m * (EXL3_M_XCHUNKS * 64), c_lo, sb1,
+            exl3_input_pass(EXL3_M_AROW(m), suh, s_x + m * (XCHUNKS * 64), c_lo, sb1,
                             warp, lane);
         }
     }
@@ -869,21 +899,21 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
     int xoff[MROW];
 #pragma unroll
     for (int m = 0; m < MROW; ++m)
-        xoff[m] = ((m < (int)M) ? m : 0) * (EXL3_M_XCHUNKS * 64);
+        xoff[m] = ((m < (int)M) ? m : 0) * (XCHUNKS * 64);
 
     for (int s = 0; s < nstages; ++s) {
-        if (s != 0 && (s & (EXL3_M_XCHUNKS - 1)) == 0) {
+        if (s != 0 && (s & (XCHUNKS - 1)) == 0) {
             // Superblock boundary: refill every row's x' for chunks
-            // [c_lo+s, +EXL3_M_XCHUNKS). The previous iteration's trailing
+            // [c_lo+s, +XCHUNKS). The previous iteration's trailing
             // __syncthreads() ordered all reads of the old superblock before
             // this overwrite; the two in-flight cp.async stages are unaffected.
             int sb0 = c_lo + s;
-            int sb1 = sb0 + EXL3_M_XCHUNKS;
+            int sb1 = sb0 + XCHUNKS;
             if (sb1 > c_hi) sb1 = c_hi;
 #pragma unroll
             for (int m = 0; m < MROW; ++m) {
                 if (m >= (int)M) break;
-                exl3_input_pass(EXL3_M_AROW(m), suh, s_x + m * (EXL3_M_XCHUNKS * 64), sb0,
+                exl3_input_pass(EXL3_M_AROW(m), suh, s_x + m * (XCHUNKS * 64), sb0,
                                 sb1, warp, lane);
             }
             __syncthreads();
@@ -895,7 +925,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         __syncthreads();
 
         const unsigned int* stage32 = (const unsigned int*)s_stage[s & 1];
-        const int xc = ((s & (EXL3_M_XCHUNKS - 1)) << 6) + xkh;
+        const int xc = ((s & (XCHUNKS - 1)) << 6) + xkh;
 
         const __half2 hz = __float2half2_rn(0.0f);
         __half2 hacc0e[MROW], hacc0o[MROW], hacc1e[MROW], hacc1o[MROW];
@@ -989,7 +1019,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         __threadfence();
         __syncthreads();
         if (threadIdx.x == 0) {
-            int prev = atomicAdd(&counters[blockIdx.x], 1);
+            int prev = atomicAdd(&counters[n_block], 1);
             s_elect = (prev == S - 1) ? 1 : 0;
         }
         __syncthreads();
@@ -1006,7 +1036,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
                 s_y[m][threadIdx.x] = sum;
             }
         }
-        if (threadIdx.x == 0) counters[blockIdx.x] = 0;  // re-arm for next launch
+        if (threadIdx.x == 0) counters[n_block] = 0;  // re-arm for next logical strip
         __syncthreads();
     }
 
@@ -1056,6 +1086,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         __nv_bfloat16* __restrict__ up_out,                                                  \
         float* __restrict__ ws, int* __restrict__ counters, unsigned int N, unsigned int K,  \
         unsigned int top_k, unsigned int num_tokens, unsigned int bits) {                    \
+        EXL3_REQUIRE_BITS(bits);                                                              \
         const unsigned int total_routed = num_tokens * top_k;                                \
         const unsigned int group = blockIdx.z;                                               \
         const unsigned int y = group >> 1;                                                   \
@@ -1069,8 +1100,8 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         const unsigned long long* sv = proj ? up_svh_tab : gate_svh_tab;                     \
         exl3_gemv_mrow_body<(MROW_), true>(                                                  \
             A, (const unsigned short*)tt[e], (const __half*)su[e], (const __half*)sv[e],     \
-            proj ? up_out : gate_out, ws, counters + group * (N >> 7), slots, M, 2u, proj,   \
-            top_k, N, K, bits);                                                              \
+            proj ? up_out : gate_out, ws, counters + group * (N >> 7), slots, M,             \
+            blockIdx.x, blockIdx.y, gridDim.y, 2u, proj, top_k, N, K, EXL3_BIT_WIDTH(bits)); \
     }
 
 // Fused down over all routed slots. Slot s consumes the SwiGLU activation row
@@ -1086,6 +1117,7 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         __nv_bfloat16* __restrict__ down_out,                   /* [num_tokens*top_k, N] */  \
         float* __restrict__ ws, int* __restrict__ counters, unsigned int N, unsigned int K,  \
         unsigned int top_k, unsigned int num_tokens, unsigned int bits) {                    \
+        EXL3_REQUIRE_BITS(bits);                                                              \
         const unsigned int total_routed = num_tokens * top_k;                                \
         const unsigned int y = blockIdx.z;                                                   \
         unsigned int M = 0;                                                                  \
@@ -1094,8 +1126,8 @@ __device__ __forceinline__ void exl3_gemv_mrow_body(
         const unsigned int e = indices[y];                                                   \
         exl3_gemv_mrow_body<(MROW_), false>(                                                 \
             act, (const unsigned short*)trellis_tab[e], (const __half*)suh_tab[e],           \
-            (const __half*)svh_tab[e], down_out, ws, counters + y * (N >> 7), slots, M, 1u,  \
-            0u, top_k, N, K, bits);                                                          \
+            (const __half*)svh_tab[e], down_out, ws, counters + y * (N >> 7), slots, M,      \
+            blockIdx.x, blockIdx.y, gridDim.y, 1u, 0u, top_k, N, K, EXL3_BIT_WIDTH(bits));   \
     }
 
 // The ladder. An MROW=R entry is correct for ANY num_tokens <= R (an expert can
@@ -1121,6 +1153,462 @@ EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m4, 4)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m6, 6)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m8, 8)
 EXL3_MROW_DOWN_ENTRY(exl3_gemv_mrow_fused_down_m16, 16)
+
+// ---------------------------------------------------------------------------
+// Device-built persistent M6 worklist (experimental production opt-in).
+//
+// The regular m-row grid launches one z-group per routed slot and lets each
+// duplicate stage + scan the route before exiting. This builder emits one
+// 32-byte item per distinct expert. The fixed 96-CTA consumers grid-stride
+// logical (work, projection, split, N-strip) tasks and invoke the exact same
+// m-row body. No host sync or device->host count copy is required.
+// ---------------------------------------------------------------------------
+
+struct __align__(16) Exl3PersistentM6Work {
+    unsigned int expert;
+    unsigned int count;
+    unsigned int slots[6];
+};
+static_assert(sizeof(Exl3PersistentM6Work) == 32,
+              "EXL3 persistent work record must be 32 bytes");
+
+struct __align__(16) Exl3PersistentM6State {
+    unsigned int count;
+    unsigned int status;
+    unsigned int reserved0;
+    unsigned int reserved1;
+};
+static_assert(sizeof(Exl3PersistentM6State) == 16,
+              "EXL3 persistent state must be 16 bytes");
+
+enum Exl3PersistentStatus : unsigned int {
+    EXL3_PERSIST_OK = 0,
+    EXL3_PERSIST_BAD_SHAPE = 1,
+    EXL3_PERSIST_BAD_EXPERT = 2,
+    EXL3_PERSIST_DUPLICATE_ROW_EXPERT = 3,
+    EXL3_PERSIST_CAPACITY = 4,
+};
+
+// One serial lane is intentional: the route has at most 6*32 entries. For the
+// accepted M6/top-6/capacity>=36 shape, deterministic first-seen ordering
+// matches `persistent_work::try_exl3_worklist`. The host oracle additionally
+// models smaller capacities, which this fixed-shape device entry rejects.
+// Same-stream launch ordering publishes records and zeroed queues to consumers.
+extern "C" __global__ void exl3_build_m6_worklist(
+    const unsigned int* __restrict__ indices,
+    Exl3PersistentM6Work* __restrict__ worklist,
+    Exl3PersistentM6State* __restrict__ state,
+    unsigned int num_tokens, unsigned int top_k,
+    unsigned int num_experts, unsigned int capacity) {
+    if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+        threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0) return;
+    state->count = 0;
+    state->status = EXL3_PERSIST_OK;
+    state->reserved0 = 0;
+    state->reserved1 = 0;
+    if (gridDim.x != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+        blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        num_tokens != 6 || top_k != 6 || capacity < 36) {
+        state->status = EXL3_PERSIST_BAD_SHAPE;
+        return;
+    }
+
+    const unsigned int total = num_tokens * top_k;
+    // Validate the complete route before writing any record. A late duplicate
+    // can otherwise make an early leader gather seven occurrences and cross
+    // the fixed slots[6] record boundary before the duplicate row is visited.
+    for (unsigned int y = 0; y < total; ++y) {
+        const unsigned int expert = indices[y];
+        if (expert >= num_experts) {
+            state->status = EXL3_PERSIST_BAD_EXPERT;
+            return;
+        }
+        const unsigned int row_begin = (y / top_k) * top_k;
+        for (unsigned int prior = row_begin; prior < y; ++prior) {
+            if (indices[prior] == expert) {
+                state->status = EXL3_PERSIST_DUPLICATE_ROW_EXPERT;
+                return;
+            }
+        }
+    }
+
+    unsigned int emitted = 0;
+    for (unsigned int y = 0; y < total; ++y) {
+        const unsigned int expert = indices[y];
+        bool leader = true;
+        for (unsigned int prior = 0; prior < y; ++prior) {
+            if (indices[prior] == expert) {
+                leader = false;
+                break;
+            }
+        }
+        if (!leader) continue;
+        if (emitted >= capacity) {
+            state->status = EXL3_PERSIST_CAPACITY;
+            return;
+        }
+
+        Exl3PersistentM6Work& work = worklist[emitted];
+        work.expert = expert;
+        unsigned int count = 0;
+        for (unsigned int slot = y; slot < total; ++slot) {
+            if (indices[slot] != expert) continue;
+            if (count == 6) {
+                state->count = 0;
+                state->status = EXL3_PERSIST_DUPLICATE_ROW_EXPERT;
+                return;
+            }
+            work.slots[count++] = slot;
+        }
+        work.count = count;
+        for (unsigned int row = count; row < 6; ++row) work.slots[row] = work.slots[0];
+        ++emitted;
+    }
+    state->count = emitted;
+}
+
+template <unsigned int WIDTH>
+__device__ __forceinline__ void exl3_zero_m6_routed(__nv_bfloat16* out) {
+    const unsigned int thread_linear =
+        threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+    const unsigned int threads_per_block = blockDim.x * blockDim.y * blockDim.z;
+    const unsigned int block_linear =
+        blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const unsigned int total_blocks = gridDim.x * gridDim.y * gridDim.z;
+    const size_t first = (size_t)block_linear * threads_per_block + thread_linear;
+    const size_t stride = (size_t)total_blocks * threads_per_block;
+    for (size_t index = first; index < 36u * WIDTH; index += stride) {
+        out[index] = __float2bfloat16(0.0f);
+    }
+}
+
+extern "C" __global__ void EXL3_MROW_LB exl3_gemv_mrow_persistent_gate_up_m6(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_trellis_tab,
+    const unsigned long long* __restrict__ gate_suh_tab,
+    const unsigned long long* __restrict__ gate_svh_tab,
+    const unsigned long long* __restrict__ up_trellis_tab,
+    const unsigned long long* __restrict__ up_suh_tab,
+    const unsigned long long* __restrict__ up_svh_tab,
+    const Exl3PersistentM6Work* __restrict__ worklist,
+    Exl3PersistentM6State* __restrict__ state,
+    __nv_bfloat16* __restrict__ gate_out,
+    __nv_bfloat16* __restrict__ up_out,
+    float* __restrict__ ws, int* __restrict__ counters,
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int splits, unsigned int bits) {
+    bool bits_valid = bits == 2 || bits == 3;
+#if EXL3_FIXED_BITS
+    bits_valid = bits == EXL3_FIXED_BITS;
+#endif
+    const bool launch_valid =
+        gridDim.x == 96 && gridDim.y == 1 && gridDim.z == 1 &&
+        blockDim.x == 256 && blockDim.y == 1 && blockDim.z == 1 &&
+        blockIdx.y == 0 && blockIdx.z == 0 && N == 2048 && K == 4096 &&
+        top_k == 6 && splits != 0 && splits <= 12 && bits_valid;
+    const bool state_valid = state->status == EXL3_PERSIST_OK &&
+                             state->count != 0 && state->count <= 36;
+    if (!launch_valid || !state_valid) {
+        exl3_zero_m6_routed<2048>(gate_out);
+        exl3_zero_m6_routed<2048>(up_out);
+        return;
+    }
+    __shared__ Exl3PersistentM6Work work;
+    const unsigned int n_blocks = N >> 7;
+    const unsigned int total_tasks = state->count * 2u * splits * n_blocks;
+    if (total_tasks == 0) return;
+
+    for (unsigned int logical = blockIdx.x; logical < total_tasks; logical += gridDim.x) {
+        unsigned int q = logical;
+        const unsigned int n_block = q % n_blocks;
+        q /= n_blocks;
+        const unsigned int split = q % splits;
+        q /= splits;
+        const unsigned int proj = q & 1u;
+        const unsigned int work_index = q >> 1;
+        if (threadIdx.x < 8) ((unsigned int*)&work)[threadIdx.x] =
+            ((const unsigned int*)&worklist[work_index])[threadIdx.x];
+        __syncthreads();
+
+        const unsigned int e = work.expert;
+        const unsigned int group = 2u * work_index + proj;
+        const unsigned long long* tt = proj ? up_trellis_tab : gate_trellis_tab;
+        const unsigned long long* su = proj ? up_suh_tab : gate_suh_tab;
+        const unsigned long long* sv = proj ? up_svh_tab : gate_svh_tab;
+        exl3_gemv_mrow_body<6, true>(
+            A, (const unsigned short*)tt[e], (const __half*)su[e], (const __half*)sv[e],
+            proj ? up_out : gate_out, ws, counters + group * n_blocks,
+            work.slots, work.count, n_block, split, splits, 2u, proj,
+            top_k, N, K, EXL3_BIT_WIDTH(bits));
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void EXL3_MROW_LB exl3_gemv_mrow_persistent_down_m6(
+    const __nv_bfloat16* __restrict__ act,
+    const unsigned long long* __restrict__ trellis_tab,
+    const unsigned long long* __restrict__ suh_tab,
+    const unsigned long long* __restrict__ svh_tab,
+    const Exl3PersistentM6Work* __restrict__ worklist,
+    Exl3PersistentM6State* __restrict__ state,
+    __nv_bfloat16* __restrict__ down_out,
+    float* __restrict__ ws, int* __restrict__ counters,
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int splits, unsigned int bits) {
+    bool bits_valid = bits == 2 || bits == 3;
+#if EXL3_FIXED_BITS
+    bits_valid = bits == EXL3_FIXED_BITS;
+#endif
+    const bool launch_valid =
+        gridDim.x == 96 && gridDim.y == 1 && gridDim.z == 1 &&
+        blockDim.x == 256 && blockDim.y == 1 && blockDim.z == 1 &&
+        blockIdx.y == 0 && blockIdx.z == 0 && N == 4096 && K == 2048 &&
+        top_k == 6 && splits != 0 && splits <= 12 && bits_valid;
+    const bool state_valid = state->status == EXL3_PERSIST_OK &&
+                             state->count != 0 && state->count <= 36;
+    if (!launch_valid || !state_valid) {
+        exl3_zero_m6_routed<4096>(down_out);
+        return;
+    }
+    __shared__ Exl3PersistentM6Work work;
+    const unsigned int n_blocks = N >> 7;
+    const unsigned int total_tasks = state->count * splits * n_blocks;
+    if (total_tasks == 0) return;
+
+    for (unsigned int logical = blockIdx.x; logical < total_tasks; logical += gridDim.x) {
+        unsigned int q = logical;
+        const unsigned int n_block = q % n_blocks;
+        q /= n_blocks;
+        const unsigned int split = q % splits;
+        const unsigned int work_index = q / splits;
+        if (threadIdx.x < 8) ((unsigned int*)&work)[threadIdx.x] =
+            ((const unsigned int*)&worklist[work_index])[threadIdx.x];
+        __syncthreads();
+
+        const unsigned int e = work.expert;
+        exl3_gemv_mrow_body<6, false>(
+            act, (const unsigned short*)trellis_tab[e], (const __half*)suh_tab[e],
+            (const __half*)svh_tab[e], down_out, ws, counters + work_index * n_blocks,
+            work.slots, work.count, n_block, split, splits, 1u, 0u,
+            top_k, N, K, EXL3_BIT_WIDTH(bits));
+        __syncthreads();
+    }
+}
+
+// The M16 record is intentionally a distinct ABI.  Keeping the M6 entry
+// points and 32-byte stride unchanged lets previously qualified M6 captures
+// remain valid while the DFlash2 16-row arm uses the wider slot vector.
+struct __align__(16) Exl3PersistentM16Work {
+    unsigned int expert;
+    unsigned int count;
+    unsigned int slots[16];
+    unsigned int reserved[2];
+};
+static_assert(sizeof(Exl3PersistentM16Work) == 80,
+              "EXL3 M16 persistent work record must be 80 bytes");
+
+extern "C" __global__ void exl3_build_m16_worklist(
+    const unsigned int* __restrict__ indices,
+    Exl3PersistentM16Work* __restrict__ worklist,
+    Exl3PersistentM6State* __restrict__ state,
+    unsigned int num_tokens, unsigned int top_k,
+    unsigned int num_experts, unsigned int capacity) {
+    if (blockIdx.x != 0 || blockIdx.y != 0 || blockIdx.z != 0 ||
+        threadIdx.x != 0 || threadIdx.y != 0 || threadIdx.z != 0) return;
+    state->count = 0;
+    state->status = EXL3_PERSIST_OK;
+    state->reserved0 = 0;
+    state->reserved1 = 0;
+    if (gridDim.x != 1 || gridDim.y != 1 || gridDim.z != 1 ||
+        blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        num_tokens != 16 || top_k != 6 || capacity < 96) {
+        state->status = EXL3_PERSIST_BAD_SHAPE;
+        return;
+    }
+
+    const unsigned int total = num_tokens * top_k;
+    // Validate the complete route before writing any record.  In particular,
+    // reject a duplicate in the final row before an earlier leader could
+    // overrun slots[16].
+    for (unsigned int y = 0; y < total; ++y) {
+        const unsigned int expert = indices[y];
+        if (expert >= num_experts) {
+            state->status = EXL3_PERSIST_BAD_EXPERT;
+            return;
+        }
+        const unsigned int row_begin = (y / top_k) * top_k;
+        for (unsigned int prior = row_begin; prior < y; ++prior) {
+            if (indices[prior] == expert) {
+                state->status = EXL3_PERSIST_DUPLICATE_ROW_EXPERT;
+                return;
+            }
+        }
+    }
+
+    unsigned int emitted = 0;
+    for (unsigned int y = 0; y < total; ++y) {
+        const unsigned int expert = indices[y];
+        bool leader = true;
+        for (unsigned int prior = 0; prior < y; ++prior) {
+            if (indices[prior] == expert) {
+                leader = false;
+                break;
+            }
+        }
+        if (!leader) continue;
+        if (emitted >= capacity) {
+            state->status = EXL3_PERSIST_CAPACITY;
+            return;
+        }
+
+        Exl3PersistentM16Work& work = worklist[emitted];
+        work.expert = expert;
+        unsigned int count = 0;
+        for (unsigned int slot = y; slot < total; ++slot) {
+            if (indices[slot] != expert) continue;
+            if (count == 16) {
+                state->count = 0;
+                state->status = EXL3_PERSIST_DUPLICATE_ROW_EXPERT;
+                return;
+            }
+            work.slots[count++] = slot;
+        }
+        work.count = count;
+        for (unsigned int row = count; row < 16; ++row) work.slots[row] = work.slots[0];
+        work.reserved[0] = 0;
+        work.reserved[1] = 0;
+        ++emitted;
+    }
+    state->count = emitted;
+}
+
+template <unsigned int ROWS, unsigned int WIDTH>
+__device__ __forceinline__ void exl3_zero_routed(__nv_bfloat16* out) {
+    const unsigned int thread_linear =
+        threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z);
+    const unsigned int threads_per_block = blockDim.x * blockDim.y * blockDim.z;
+    const unsigned int block_linear =
+        blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const unsigned int total_blocks = gridDim.x * gridDim.y * gridDim.z;
+    const size_t first = (size_t)block_linear * threads_per_block + thread_linear;
+    const size_t stride = (size_t)total_blocks * threads_per_block;
+    for (size_t index = first; index < (size_t)(ROWS * 6u) * WIDTH; index += stride) {
+        out[index] = __float2bfloat16(0.0f);
+    }
+}
+
+extern "C" __global__ void EXL3_MROW_LB exl3_gemv_mrow_persistent_gate_up_m16(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned long long* __restrict__ gate_trellis_tab,
+    const unsigned long long* __restrict__ gate_suh_tab,
+    const unsigned long long* __restrict__ gate_svh_tab,
+    const unsigned long long* __restrict__ up_trellis_tab,
+    const unsigned long long* __restrict__ up_suh_tab,
+    const unsigned long long* __restrict__ up_svh_tab,
+    const Exl3PersistentM16Work* __restrict__ worklist,
+    Exl3PersistentM6State* __restrict__ state,
+    __nv_bfloat16* __restrict__ gate_out,
+    __nv_bfloat16* __restrict__ up_out,
+    float* __restrict__ ws, int* __restrict__ counters,
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int splits, unsigned int bits) {
+    bool bits_valid = bits == 2 || bits == 3;
+#if EXL3_FIXED_BITS
+    bits_valid = bits == EXL3_FIXED_BITS;
+#endif
+    const bool launch_valid =
+        gridDim.x == 96 && gridDim.y == 1 && gridDim.z == 1 &&
+        blockDim.x == 256 && blockDim.y == 1 && blockDim.z == 1 &&
+        blockIdx.y == 0 && blockIdx.z == 0 && N == 2048 && K == 4096 &&
+        top_k == 6 && splits != 0 && splits <= 12 && bits_valid;
+    const bool state_valid = state->status == EXL3_PERSIST_OK &&
+                             state->count != 0 && state->count <= 96;
+    if (!launch_valid || !state_valid) {
+        exl3_zero_routed<16, 2048>(gate_out);
+        exl3_zero_routed<16, 2048>(up_out);
+        return;
+    }
+    __shared__ Exl3PersistentM16Work work;
+    const unsigned int n_blocks = N >> 7;
+    const unsigned int total_tasks = state->count * 2u * splits * n_blocks;
+    if (total_tasks == 0) return;
+
+    for (unsigned int logical = blockIdx.x; logical < total_tasks; logical += gridDim.x) {
+        unsigned int q = logical;
+        const unsigned int n_block = q % n_blocks;
+        q /= n_blocks;
+        const unsigned int split = q % splits;
+        q /= splits;
+        const unsigned int proj = q & 1u;
+        const unsigned int work_index = q >> 1;
+        if (threadIdx.x < 20) ((unsigned int*)&work)[threadIdx.x] =
+            ((const unsigned int*)&worklist[work_index])[threadIdx.x];
+        __syncthreads();
+
+        const unsigned int e = work.expert;
+        const unsigned int group = 2u * work_index + proj;
+        const unsigned long long* tt = proj ? up_trellis_tab : gate_trellis_tab;
+        const unsigned long long* su = proj ? up_suh_tab : gate_suh_tab;
+        const unsigned long long* sv = proj ? up_svh_tab : gate_svh_tab;
+        exl3_gemv_mrow_body<16, true>(
+            A, (const unsigned short*)tt[e], (const __half*)su[e], (const __half*)sv[e],
+            proj ? up_out : gate_out, ws, counters + group * n_blocks,
+            work.slots, work.count, n_block, split, splits, 2u, proj,
+            top_k, N, K, EXL3_BIT_WIDTH(bits));
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void EXL3_MROW_LB exl3_gemv_mrow_persistent_down_m16(
+    const __nv_bfloat16* __restrict__ act,
+    const unsigned long long* __restrict__ trellis_tab,
+    const unsigned long long* __restrict__ suh_tab,
+    const unsigned long long* __restrict__ svh_tab,
+    const Exl3PersistentM16Work* __restrict__ worklist,
+    Exl3PersistentM6State* __restrict__ state,
+    __nv_bfloat16* __restrict__ down_out,
+    float* __restrict__ ws, int* __restrict__ counters,
+    unsigned int N, unsigned int K, unsigned int top_k,
+    unsigned int splits, unsigned int bits) {
+    bool bits_valid = bits == 2 || bits == 3;
+#if EXL3_FIXED_BITS
+    bits_valid = bits == EXL3_FIXED_BITS;
+#endif
+    const bool launch_valid =
+        gridDim.x == 96 && gridDim.y == 1 && gridDim.z == 1 &&
+        blockDim.x == 256 && blockDim.y == 1 && blockDim.z == 1 &&
+        blockIdx.y == 0 && blockIdx.z == 0 && N == 4096 && K == 2048 &&
+        top_k == 6 && splits != 0 && splits <= 12 && bits_valid;
+    const bool state_valid = state->status == EXL3_PERSIST_OK &&
+                             state->count != 0 && state->count <= 96;
+    if (!launch_valid || !state_valid) {
+        exl3_zero_routed<16, 4096>(down_out);
+        return;
+    }
+    __shared__ Exl3PersistentM16Work work;
+    const unsigned int n_blocks = N >> 7;
+    const unsigned int total_tasks = state->count * splits * n_blocks;
+    if (total_tasks == 0) return;
+
+    for (unsigned int logical = blockIdx.x; logical < total_tasks; logical += gridDim.x) {
+        unsigned int q = logical;
+        const unsigned int n_block = q % n_blocks;
+        q /= n_blocks;
+        const unsigned int split = q % splits;
+        const unsigned int work_index = q / splits;
+        if (threadIdx.x < 20) ((unsigned int*)&work)[threadIdx.x] =
+            ((const unsigned int*)&worklist[work_index])[threadIdx.x];
+        __syncthreads();
+
+        const unsigned int e = work.expert;
+        exl3_gemv_mrow_body<16, false>(
+            act, (const unsigned short*)trellis_tab[e], (const __half*)suh_tab[e],
+            (const __half*)svh_tab[e], down_out, ws, counters + work_index * n_blocks,
+            work.slots, work.count, n_block, split, splits, 1u, 0u,
+            top_k, N, K, EXL3_BIT_WIDTH(bits));
+        __syncthreads();
+    }
+}
 
 #undef EXL3_MROW_GATE_UP_ENTRY
 #undef EXL3_MROW_DOWN_ENTRY
@@ -1183,6 +1671,44 @@ extern "C" __global__ void exl3_dequant_dump(const unsigned short* __restrict__ 
 
 #define EXL3_HROW_WARPS 8  // 128-chunks per 256-thread block
 
+__device__ __forceinline__ void exl3_h128_pre_values4(
+    float a0, float a1, float a2, float a3,
+    const __half* __restrict__ suh, unsigned int lane,
+    float& h0, float& h1, float& h2, float& h3) {
+    h0 = a0 * __half2float(suh[4 * lane + 0]);
+    h1 = a1 * __half2float(suh[4 * lane + 1]);
+    h2 = a2 * __half2float(suh[4 * lane + 2]);
+    h3 = a3 * __half2float(suh[4 * lane + 3]);
+    exl3_had128(h0, h1, h2, h3, lane);
+}
+
+__device__ __forceinline__ void exl3_h128_pre_transform4(
+    float a0, float a1, float a2, float a3,
+    const __half* __restrict__ suh, unsigned int lane,
+    __nv_bfloat16* __restrict__ out) {
+    float h0, h1, h2, h3;
+    exl3_h128_pre_values4(a0, a1, a2, a3, suh, lane, h0, h1, h2, h3);
+    out[0] = __float2bfloat16(h0 * EXL3_RSQRT128);
+    out[1] = __float2bfloat16(h1 * EXL3_RSQRT128);
+    out[2] = __float2bfloat16(h2 * EXL3_RSQRT128);
+    out[3] = __float2bfloat16(h3 * EXL3_RSQRT128);
+}
+
+#if EXL3_HROW_DSV4_FIXED
+__device__ __forceinline__ void exl3_h128_pre_transform4_packed(
+    float a0, float a1, float a2, float a3,
+    const __half* __restrict__ suh, unsigned int lane,
+    __nv_bfloat16* __restrict__ out) {
+    float h0, h1, h2, h3;
+    exl3_h128_pre_values4(a0, a1, a2, a3, suh, lane, h0, h1, h2, h3);
+    __nv_bfloat162* packed = reinterpret_cast<__nv_bfloat162*>(out);
+    packed[0] = __floats2bfloat162_rn(
+        h0 * EXL3_RSQRT128, h1 * EXL3_RSQRT128);
+    packed[1] = __floats2bfloat162_rn(
+        h2 * EXL3_RSQRT128, h3 * EXL3_RSQRT128);
+}
+#endif
+
 // x' rows for the grouped GEMM: Aout[row] = H128(suh_e ⊙ A[token]) / sqrt(128).
 //   row    = blockIdx.y (expanded sorted-layout row)
 //   token  = sorted_token_ids[row] (NULL → identity: token = row)
@@ -1207,16 +1733,55 @@ extern "C" __global__ void exl3_h128_pre_rows(
     const long long tok = sorted_token_ids ? (long long)sorted_token_ids[row] : (long long)row;
     const __nv_bfloat16* a = A + (unsigned long long)tok * K + chunk * 128 + 4 * lane;
     __nv_bfloat16* o = Aout + (unsigned long long)row * K + chunk * 128 + 4 * lane;
-    float h0 = __bfloat162float(a[0]) * __half2float(suh[4 * lane + 0]);
-    float h1 = __bfloat162float(a[1]) * __half2float(suh[4 * lane + 1]);
-    float h2 = __bfloat162float(a[2]) * __half2float(suh[4 * lane + 2]);
-    float h3 = __bfloat162float(a[3]) * __half2float(suh[4 * lane + 3]);
-    exl3_had128(h0, h1, h2, h3, lane);
-    o[0] = __float2bfloat16(h0 * EXL3_RSQRT128);
-    o[1] = __float2bfloat16(h1 * EXL3_RSQRT128);
-    o[2] = __float2bfloat16(h2 * EXL3_RSQRT128);
-    o[3] = __float2bfloat16(h3 * EXL3_RSQRT128);
+    exl3_h128_pre_transform4(
+        __bfloat162float(a[0]), __bfloat162float(a[1]),
+        __bfloat162float(a[2]), __bfloat162float(a[3]), suh, lane, o);
 }
+
+#if EXL3_HROW_DSV4_FIXED
+// Exact DeepSeek-V4 gate/up pre-rotation. Both projections read the same
+// expanded token row, so keep that BF16 input in registers and apply the two
+// independent expert sign tables before writing distinct sorted-layout rows.
+extern "C" __global__ void exl3_h128_pre_dual_rows_h4096(
+    const __nv_bfloat16* __restrict__ A,             // [num_tokens, 4096]
+    const int* __restrict__ sorted_token_ids,        // [rows] or NULL
+    const int* __restrict__ sorted_expert_ids,       // [rows]
+    const unsigned long long* __restrict__ gate_suh_tab,
+    const unsigned long long* __restrict__ up_suh_tab,
+    __nv_bfloat16* __restrict__ gate_out,            // [rows, 4096]
+    __nv_bfloat16* __restrict__ up_out,              // [rows, 4096]
+    unsigned int K, unsigned int rows) {
+    if (K != 4096) return;
+    asm volatile(
+        "{ .reg .pred p; .reg .u32 n;\n\t"
+        "mov.u32 n, %ntid.x; setp.ne.u32 p, n, 256; @p exit;\n\t"
+        "mov.u32 n, %ntid.y; setp.ne.u32 p, n, 1; @p exit;\n\t"
+        "mov.u32 n, %ntid.z; setp.ne.u32 p, n, 1; @p exit; }");
+    if (gridDim.x != rows || gridDim.y != 4 || gridDim.z != 1) return;
+
+    const unsigned int row = blockIdx.x;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int chunk = blockIdx.y * EXL3_HROW_WARPS + warp;
+    const int expert = sorted_expert_ids[row];
+    const long long token = sorted_token_ids
+        ? (long long)sorted_token_ids[row] : (long long)row;
+    const __nv_bfloat16* a = A + (unsigned long long)token * 4096
+        + chunk * 128 + 4 * lane;
+    const float a0 = __bfloat162float(a[0]);
+    const float a1 = __bfloat162float(a[1]);
+    const float a2 = __bfloat162float(a[2]);
+    const float a3 = __bfloat162float(a[3]);
+    const __half* gate_suh = (const __half*)gate_suh_tab[expert] + chunk * 128;
+    const __half* up_suh = (const __half*)up_suh_tab[expert] + chunk * 128;
+    __nv_bfloat16* gate_o = gate_out + (unsigned long long)row * 4096
+        + chunk * 128 + 4 * lane;
+    __nv_bfloat16* up_o = up_out + (unsigned long long)row * 4096
+        + chunk * 128 + 4 * lane;
+    exl3_h128_pre_transform4_packed(a0, a1, a2, a3, gate_suh, lane, gate_o);
+    exl3_h128_pre_transform4_packed(a0, a1, a2, a3, up_suh, lane, up_o);
+}
+#endif
 
 // Output pass, IN PLACE over the sorted-layout GEMM result:
 //   Y[row] = svh_e ⊙ H128(Y[row]) / sqrt(128),  e = sorted_expert_ids[row].
@@ -1244,6 +1809,253 @@ extern "C" __global__ void exl3_h128_post_rows(
     y[2] = __float2bfloat16(h2 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 2]));
     y[3] = __float2bfloat16(h3 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 3]));
 }
+
+// Fused gate/up output rotations, routed DeepSeek SwiGLU, and down input
+// rotation. Explicit register BF16 barriers preserve the legacy stores after
+// each post-rotation and after SwiGLU, making this byte-identical to
+// post(gate) + post(up) + moe_silu_mul + pre(down) while removing their
+// intermediate global writes and rereads.
+#define EXL3_SWIGLU_LIMIT 10.0f
+extern "C" __global__ void exl3_h128_post_silu_pre_rows(
+    __nv_bfloat16* __restrict__ gate,               // [rows, N], output in place
+    const __nv_bfloat16* __restrict__ up,            // [rows, N]
+    const int* __restrict__ sorted_expert_ids,       // [rows]
+    const unsigned long long* __restrict__ gate_svh_tab,
+    const unsigned long long* __restrict__ up_svh_tab,
+    const unsigned long long* __restrict__ down_suh_tab,
+    unsigned int N) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int chunk = blockIdx.y * EXL3_HROW_WARPS + warp;
+    if (chunk * 128 >= N) return;
+    const int e = sorted_expert_ids[row];
+    const __half* gate_svh = (const __half*)gate_svh_tab[e] + chunk * 128;
+    const __half* up_svh = (const __half*)up_svh_tab[e] + chunk * 128;
+    const __half* down_suh = (const __half*)down_suh_tab[e] + chunk * 128;
+    __nv_bfloat16* g = gate + (unsigned long long)row * N + chunk * 128 + 4 * lane;
+    const __nv_bfloat16* u = up + (unsigned long long)row * N + chunk * 128 + 4 * lane;
+
+    float g0 = __bfloat162float(g[0]);
+    float g1 = __bfloat162float(g[1]);
+    float g2 = __bfloat162float(g[2]);
+    float g3 = __bfloat162float(g[3]);
+    float u0 = __bfloat162float(u[0]);
+    float u1 = __bfloat162float(u[1]);
+    float u2 = __bfloat162float(u[2]);
+    float u3 = __bfloat162float(u[3]);
+    exl3_had128(g0, g1, g2, g3, lane);
+    exl3_had128(u0, u1, u2, u3, lane);
+
+    // Preserve the legacy post-kernel stores followed by silu-kernel loads.
+    g0 = __bfloat162float(__float2bfloat16(
+        g0 * EXL3_RSQRT128 * __half2float(gate_svh[4 * lane + 0])));
+    g1 = __bfloat162float(__float2bfloat16(
+        g1 * EXL3_RSQRT128 * __half2float(gate_svh[4 * lane + 1])));
+    g2 = __bfloat162float(__float2bfloat16(
+        g2 * EXL3_RSQRT128 * __half2float(gate_svh[4 * lane + 2])));
+    g3 = __bfloat162float(__float2bfloat16(
+        g3 * EXL3_RSQRT128 * __half2float(gate_svh[4 * lane + 3])));
+    u0 = __bfloat162float(__float2bfloat16(
+        u0 * EXL3_RSQRT128 * __half2float(up_svh[4 * lane + 0])));
+    u1 = __bfloat162float(__float2bfloat16(
+        u1 * EXL3_RSQRT128 * __half2float(up_svh[4 * lane + 1])));
+    u2 = __bfloat162float(__float2bfloat16(
+        u2 * EXL3_RSQRT128 * __half2float(up_svh[4 * lane + 2])));
+    u3 = __bfloat162float(__float2bfloat16(
+        u3 * EXL3_RSQRT128 * __half2float(up_svh[4 * lane + 3])));
+
+    g0 = fminf(g0, EXL3_SWIGLU_LIMIT);
+    g1 = fminf(g1, EXL3_SWIGLU_LIMIT);
+    g2 = fminf(g2, EXL3_SWIGLU_LIMIT);
+    g3 = fminf(g3, EXL3_SWIGLU_LIMIT);
+    u0 = fminf(fmaxf(u0, -EXL3_SWIGLU_LIMIT), EXL3_SWIGLU_LIMIT);
+    u1 = fminf(fmaxf(u1, -EXL3_SWIGLU_LIMIT), EXL3_SWIGLU_LIMIT);
+    u2 = fminf(fmaxf(u2, -EXL3_SWIGLU_LIMIT), EXL3_SWIGLU_LIMIT);
+    u3 = fminf(fmaxf(u3, -EXL3_SWIGLU_LIMIT), EXL3_SWIGLU_LIMIT);
+    // The BF16 values are the exact legacy moe_silu_mul outputs consumed by
+    // exl3_h128_pre_rows. Re-expand only after rounding, then apply down suh.
+    const __nv_bfloat16 a0 =
+        __float2bfloat16(g0 * (1.0f / (1.0f + __expf(-g0))) * u0);
+    const __nv_bfloat16 a1 =
+        __float2bfloat16(g1 * (1.0f / (1.0f + __expf(-g1))) * u1);
+    const __nv_bfloat16 a2 =
+        __float2bfloat16(g2 * (1.0f / (1.0f + __expf(-g2))) * u2);
+    const __nv_bfloat16 a3 =
+        __float2bfloat16(g3 * (1.0f / (1.0f + __expf(-g3))) * u3);
+    float d0 = __bfloat162float(a0) * __half2float(down_suh[4 * lane + 0]);
+    float d1 = __bfloat162float(a1) * __half2float(down_suh[4 * lane + 1]);
+    float d2 = __bfloat162float(a2) * __half2float(down_suh[4 * lane + 2]);
+    float d3 = __bfloat162float(a3) * __half2float(down_suh[4 * lane + 3]);
+    exl3_had128(d0, d1, d2, d3, lane);
+    g[0] = __float2bfloat16(d0 * EXL3_RSQRT128);
+    g[1] = __float2bfloat16(d1 * EXL3_RSQRT128);
+    g[2] = __float2bfloat16(d2 * EXL3_RSQRT128);
+    g[3] = __float2bfloat16(d3 * EXL3_RSQRT128);
+}
+
+// Fuse the final down H128/svh pass with indexed weighted unpermute. One warp
+// owns one 128-column chunk of one original token and visits routed slots in
+// the same top-k order as moe_unpermute_reduce_indexed. Each rotated expert
+// value is explicitly rounded to BF16 before weighting, preserving the legacy
+// post-kernel store followed by the unpermute-kernel load.
+template <unsigned int FIXED_H>
+__device__ __forceinline__ void exl3_h128_post_unpermute_chunk(
+    const __nv_bfloat16* __restrict__ expert_output,  // [rows, H], raw down GEMM
+    const int* __restrict__ token_to_perm,            // [num_tokens, topk]
+    const float* __restrict__ topk_weights,           // [num_tokens, topk]
+    const int* __restrict__ sorted_expert_ids,        // [rows]
+    const unsigned long long* __restrict__ svh_tab,   // [num_experts] -> F16 [H]
+    unsigned int token, unsigned int chunk, unsigned int lane,
+    unsigned int H, unsigned int topk,
+    float& a0, float& a1, float& a2, float& a3) {
+    const unsigned int h_extent = FIXED_H ? FIXED_H : H;
+
+    a0 = 0.0f;
+    a1 = 0.0f;
+    a2 = 0.0f;
+    a3 = 0.0f;
+    for (unsigned int k = 0; k < topk; ++k) {
+        const unsigned int slot = token * topk + k;
+        const int perm_row = token_to_perm[slot];
+        const float weight = topk_weights[slot];
+        const int e = sorted_expert_ids[perm_row];
+        const __half* svh = (const __half*)svh_tab[e] + chunk * 128;
+        const __nv_bfloat16* y = expert_output +
+            (unsigned long long)perm_row * h_extent + chunk * 128 + 4 * lane;
+        float h0 = __bfloat162float(y[0]);
+        float h1 = __bfloat162float(y[1]);
+        float h2 = __bfloat162float(y[2]);
+        float h3 = __bfloat162float(y[3]);
+        exl3_had128(h0, h1, h2, h3, lane);
+        h0 = __bfloat162float(__float2bfloat16(
+            h0 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 0])));
+        h1 = __bfloat162float(__float2bfloat16(
+            h1 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 1])));
+        h2 = __bfloat162float(__float2bfloat16(
+            h2 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 2])));
+        h3 = __bfloat162float(__float2bfloat16(
+            h3 * EXL3_RSQRT128 * __half2float(svh[4 * lane + 3])));
+        a0 += weight * h0;
+        a1 += weight * h1;
+        a2 += weight * h2;
+        a3 += weight * h3;
+    }
+}
+
+template <unsigned int FIXED_H>
+__device__ __forceinline__ void exl3_h128_post_unpermute_rows_body(
+    const __nv_bfloat16* __restrict__ expert_output,  // [rows, H], raw down GEMM
+    __nv_bfloat16* __restrict__ output,               // [num_tokens, H]
+    const int* __restrict__ token_to_perm,            // [num_tokens, topk]
+    const float* __restrict__ topk_weights,           // [num_tokens, topk]
+    const int* __restrict__ sorted_expert_ids,        // [rows]
+    const unsigned long long* __restrict__ svh_tab,   // [num_experts] -> F16 [H]
+    unsigned int H, unsigned int num_tokens, unsigned int topk) {
+    const unsigned int token = blockIdx.x;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const unsigned int chunk = blockIdx.y * EXL3_HROW_WARPS + warp;
+    if (FIXED_H == 0 && (token >= num_tokens || chunk * 128 >= H)) return;
+    const unsigned int h_extent = FIXED_H ? FIXED_H : H;
+    float a0, a1, a2, a3;
+    exl3_h128_post_unpermute_chunk<FIXED_H>(
+        expert_output, token_to_perm, topk_weights, sorted_expert_ids, svh_tab,
+        token, chunk, lane, H, topk, a0, a1, a2, a3);
+    __nv_bfloat16* out = output +
+        (unsigned long long)token * h_extent + chunk * 128 + 4 * lane;
+    out[0] = __float2bfloat16(a0);
+    out[1] = __float2bfloat16(a1);
+    out[2] = __float2bfloat16(a2);
+    out[3] = __float2bfloat16(a3);
+}
+
+extern "C" __global__ void exl3_h128_post_unpermute_rows(
+    const __nv_bfloat16* __restrict__ expert_output,  // [rows, H], raw down GEMM
+    __nv_bfloat16* __restrict__ output,               // [num_tokens, H]
+    const int* __restrict__ token_to_perm,            // [num_tokens, topk]
+    const float* __restrict__ topk_weights,           // [num_tokens, topk]
+    const int* __restrict__ sorted_expert_ids,        // [rows]
+    const unsigned long long* __restrict__ svh_tab,   // [num_experts] -> F16 [H]
+    unsigned int H, unsigned int num_tokens, unsigned int topk) {
+    exl3_h128_post_unpermute_rows_body<0>(
+        expert_output, output, token_to_perm, topk_weights,
+        sorted_expert_ids, svh_tab, H, num_tokens, topk);
+}
+
+#if EXL3_HROW_DSV4_FIXED
+extern "C" __global__ void exl3_h128_post_unpermute_rows_h4096(
+    const __nv_bfloat16* __restrict__ expert_output,  // [rows, H], raw down GEMM
+    __nv_bfloat16* __restrict__ output,               // [num_tokens, H]
+    const int* __restrict__ token_to_perm,            // [num_tokens, topk]
+    const float* __restrict__ topk_weights,           // [num_tokens, topk]
+    const int* __restrict__ sorted_expert_ids,        // [rows]
+    const unsigned long long* __restrict__ svh_tab,   // [num_experts] -> F16 [H]
+    unsigned int H, unsigned int num_tokens, unsigned int topk) {
+    if (H != 4096) return;
+    asm volatile(
+        "{ .reg .pred p; .reg .u32 n;\n\t"
+        "mov.u32 n, %ntid.x; setp.ne.u32 p, n, 256; @p exit;\n\t"
+        "mov.u32 n, %ntid.y; setp.ne.u32 p, n, 1; @p exit;\n\t"
+        "mov.u32 n, %ntid.z; setp.ne.u32 p, n, 1; @p exit; }");
+    if (gridDim.x != num_tokens || gridDim.y != 4 || gridDim.z != 1) return;
+    exl3_h128_post_unpermute_rows_body<4096>(
+        expert_output, output, token_to_perm, topk_weights,
+        sorted_expert_ids, svh_tab, H, num_tokens, topk);
+}
+
+// Exact DeepSeek-V4 shared-expert tail. One CTA owns one token so its eight
+// warps can first reproduce the standalone gate reduction, then cover all 32
+// H128 chunks without materializing/reloading the routed BF16 row.
+extern "C" __global__ void exl3_h128_post_unpermute_blend_h4096(
+    const __nv_bfloat16* __restrict__ expert_output,  // [rows, 4096], raw down GEMM
+    __nv_bfloat16* __restrict__ output,               // [num_tokens, 4096]
+    const int* __restrict__ token_to_perm,            // [num_tokens, topk]
+    const float* __restrict__ topk_weights,           // [num_tokens, topk]
+    const int* __restrict__ sorted_expert_ids,        // [rows]
+    const unsigned long long* __restrict__ svh_tab,   // [num_experts] -> F16 [4096]
+    const __nv_bfloat16* __restrict__ shared_out,     // [num_tokens, 4096]
+    const __nv_bfloat16* __restrict__ normed,         // [num_tokens, 4096]
+    const __nv_bfloat16* __restrict__ gate_weight,    // [4096], nullable
+    unsigned int H, unsigned int num_tokens, unsigned int topk) {
+    if (H != 4096 || topk != 6) return;
+    asm volatile(
+        "{ .reg .pred p; .reg .u32 n;\n\t"
+        "mov.u32 n, %ntid.x; setp.ne.u32 p, n, 256; @p exit;\n\t"
+        "mov.u32 n, %ntid.y; setp.ne.u32 p, n, 1; @p exit;\n\t"
+        "mov.u32 n, %ntid.z; setp.ne.u32 p, n, 1; @p exit; }");
+    if (gridDim.x != num_tokens || gridDim.y != 1 || gridDim.z != 1) return;
+
+    __shared__ float gate_partials[8];
+    const unsigned int token = blockIdx.x;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31;
+    const __nv_bfloat16* my_normed = normed + (unsigned long long)token * 4096;
+    const float gate_scalar = atlas_moe_shared_gate_scalar_256(
+        my_normed, gate_weight, 4096, gate_partials);
+
+    for (unsigned int chunk = warp; chunk < 32; chunk += 8) {
+        float a0, a1, a2, a3;
+        exl3_h128_post_unpermute_chunk<4096>(
+            expert_output, token_to_perm, topk_weights, sorted_expert_ids, svh_tab,
+            token, chunk, lane, H, topk, a0, a1, a2, a3);
+        const unsigned long long base =
+            (unsigned long long)token * 4096 + chunk * 128 + 4 * lane;
+        const float routed0 = atlas_round_bf16_to_f32(a0);
+        const float routed1 = atlas_round_bf16_to_f32(a1);
+        const float routed2 = atlas_round_bf16_to_f32(a2);
+        const float routed3 = atlas_round_bf16_to_f32(a3);
+        output[base + 0] = atlas_moe_blend_from_routed_bf16(
+            routed0, shared_out[base + 0], gate_scalar);
+        output[base + 1] = atlas_moe_blend_from_routed_bf16(
+            routed1, shared_out[base + 1], gate_scalar);
+        output[base + 2] = atlas_moe_blend_from_routed_bf16(
+            routed2, shared_out[base + 2], gate_scalar);
+        output[base + 3] = atlas_moe_blend_from_routed_bf16(
+            routed3, shared_out[base + 3], gate_scalar);
+    }
+}
+#endif
 
 // Chunked scratch dequant for the grouped BF16 prefill GEMM: decode experts
 // [e0, e0+count) into slot-major BF16 scratch (slot z = expert e0+z at

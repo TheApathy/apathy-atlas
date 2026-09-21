@@ -74,6 +74,7 @@ pub(crate) fn prepare_chat_prompt(
         image_pad_counts,
     } = msg_entry::build_msg_entries(
         state.vision_config.as_ref(),
+        state.deepseek_vision_config.as_ref(),
         state.vision_max_pixels,
         &req.messages,
         tools_active,
@@ -110,6 +111,43 @@ pub(crate) fn prepare_chat_prompt(
         thinking_budget,
         tools_active,
     )?;
+
+    let prompt_tokens = if let Some(config) = state.deepseek_vision_config.as_ref() {
+        let lowered = (|| -> anyhow::Result<Vec<u32>> {
+            let placeholder = state
+                .tokenizer
+                .inner()
+                .token_to_id(crate::deepseek_vision_preprocess::IMAGE_PLACEHOLDER)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("DeepSeek image placeholder is missing from tokenizer")
+                })?;
+            let vocab = state
+                .deepseek_vision_vocab
+                .ok_or_else(|| anyhow::anyhow!("DeepSeek image vocabulary is unavailable"))?;
+            let grids = image_pixels
+                .iter()
+                .map(|(_, gh, gw)| (*gh, *gw))
+                .collect::<Vec<_>>();
+            crate::deepseek_vision_preprocess::expand_image_placeholders(
+                &prompt_tokens,
+                placeholder,
+                &grids,
+                config,
+                vocab,
+                state.max_seq_len,
+                req.max_tokens,
+                state.initial_prefill_tokens,
+            )
+        })();
+        lowered.map_err(|error| {
+            super::super::compact::openai_error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("DeepSeek image prompt error: {error}"),
+            )
+        })?
+    } else {
+        prompt_tokens
+    };
 
     Ok(PreparedChat {
         tools_active,

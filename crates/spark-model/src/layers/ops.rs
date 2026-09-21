@@ -13,6 +13,8 @@
 
 #[path = "ops/activations.rs"]
 mod activations;
+#[path = "ops/deepseek_visual_route.rs"]
+mod deepseek_visual_route;
 #[path = "ops/dispatch_helpers.rs"]
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
@@ -106,6 +108,7 @@ mod ssm_preproc;
 mod ssm_ssd;
 
 pub use activations::*;
+pub use deepseek_visual_route::*;
 pub use dispatch_helpers::*;
 pub use dispatch_proj::*;
 pub use embeddings::*;

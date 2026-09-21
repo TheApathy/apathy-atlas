@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Wire contract for the DeepSeek six-row persistent expert-major worklist.
+//! Wire contracts for DeepSeek persistent expert-major worklists.
 //!
-//! The GPU kernels consume this 48-byte record directly. Keeping construction,
-//! bucketing, and byte serialization here prevents the microbenchmark and the
-//! forthcoming device builder from silently adopting different layouts.
+//! The unified-MoE microbenchmark consumes the legacy 48-byte [`PersistentWork`]
+//! record. The host-wired EXL3 device builder and consumers instead share the
+//! compact 32-byte [`Exl3PersistentWork`] ABI. Keeping both layouts here makes
+//! that distinction explicit and prevents either experiment from silently
+//! changing its wire format.
 
 pub const PERSISTENT_MAX_ROWS: usize = 6;
 pub const PERSISTENT_RECORD_BYTES: usize = 48;
+pub const EXL3_WORK_RECORD_BYTES: usize = 32;
+pub const EXL3_M16_MAX_ROWS: usize = 16;
+pub const EXL3_M16_WORK_CAPACITY: usize = 96;
+pub const EXL3_M16_WORK_RECORD_BYTES: usize = 80;
 pub const WORK_COUNT_MASK: u32 = 0x7;
 pub const WORK_SHARED: u32 = 1 << 8;
 pub const WORK_UP: u32 = 1 << 9;
@@ -21,6 +27,7 @@ pub enum PersistentWorkError {
         slots: usize,
     },
     InvalidMeta(u32),
+    InvalidPadding,
     InvalidRowCount(usize),
     InvalidTopK {
         row: usize,
@@ -36,6 +43,145 @@ pub enum PersistentWorkError {
         expert: u32,
         num_experts: u32,
     },
+    CapacityExceeded {
+        required: usize,
+        capacity: usize,
+    },
+}
+
+/// Device work item for the EXL3 M6 persistent verify kernels.
+///
+/// Unlike [`PersistentWork`], the EXL3 consumer resolves trellis/sign pointers
+/// from the existing expert tables. The compact item therefore needs only the
+/// expert id and the flat routed slots gathered for that expert.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+pub struct Exl3PersistentWork {
+    pub expert: u32,
+    pub count: u32,
+    pub slots: [u32; PERSISTENT_MAX_ROWS],
+}
+
+impl Exl3PersistentWork {
+    pub fn new(expert: u32, gathered: &[u32]) -> Self {
+        Self::try_new(expert, gathered).expect("valid EXL3 persistent work record")
+    }
+
+    pub fn try_new(expert: u32, gathered: &[u32]) -> Result<Self, PersistentWorkError> {
+        if !(1..=PERSISTENT_MAX_ROWS).contains(&gathered.len()) {
+            return Err(PersistentWorkError::InvalidCount(gathered.len()));
+        }
+        let mut slots = [gathered[0]; PERSISTENT_MAX_ROWS];
+        slots[..gathered.len()].copy_from_slice(gathered);
+        Ok(Self {
+            expert,
+            count: gathered.len() as u32,
+            slots,
+        })
+    }
+
+    pub fn active_slots(&self) -> &[u32] {
+        &self.slots[..self.count as usize]
+    }
+
+    pub fn to_bytes(self) -> [u8; EXL3_WORK_RECORD_BYTES] {
+        let mut out = [0u8; EXL3_WORK_RECORD_BYTES];
+        out[0..4].copy_from_slice(&self.expert.to_le_bytes());
+        out[4..8].copy_from_slice(&self.count.to_le_bytes());
+        for (index, slot) in self.slots.iter().enumerate() {
+            out[8 + index * 4..12 + index * 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: [u8; EXL3_WORK_RECORD_BYTES]) -> Result<Self, PersistentWorkError> {
+        let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if !(1..=PERSISTENT_MAX_ROWS).contains(&count) {
+            return Err(PersistentWorkError::InvalidCount(count));
+        }
+        let mut slots = [0; PERSISTENT_MAX_ROWS];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            *slot = u32::from_le_bytes(bytes[8 + index * 4..12 + index * 4].try_into().unwrap());
+        }
+        Ok(Self {
+            expert: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            count: count as u32,
+            slots,
+        })
+    }
+}
+
+/// Device work item for the exact EXL3 M16 persistent verify kernels.
+///
+/// This is deliberately a separate ABI from [`Exl3PersistentWork`]: widening
+/// the M6 record would silently break the existing CUDA consumer. The final
+/// two words make the 16-byte alignment padding explicit and serializable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+pub struct Exl3PersistentM16Work {
+    pub expert: u32,
+    pub count: u32,
+    pub slots: [u32; EXL3_M16_MAX_ROWS],
+    reserved: [u32; 2],
+}
+
+impl Exl3PersistentM16Work {
+    pub fn new(expert: u32, gathered: &[u32]) -> Self {
+        Self::try_new(expert, gathered).expect("valid EXL3 M16 persistent work record")
+    }
+
+    pub fn try_new(expert: u32, gathered: &[u32]) -> Result<Self, PersistentWorkError> {
+        if !(1..=EXL3_M16_MAX_ROWS).contains(&gathered.len()) {
+            return Err(PersistentWorkError::InvalidCount(gathered.len()));
+        }
+        let mut slots = [gathered[0]; EXL3_M16_MAX_ROWS];
+        slots[..gathered.len()].copy_from_slice(gathered);
+        Ok(Self {
+            expert,
+            count: gathered.len() as u32,
+            slots,
+            reserved: [0; 2],
+        })
+    }
+
+    pub fn active_slots(&self) -> &[u32] {
+        &self.slots[..self.count as usize]
+    }
+
+    pub fn to_bytes(self) -> [u8; EXL3_M16_WORK_RECORD_BYTES] {
+        let mut out = [0u8; EXL3_M16_WORK_RECORD_BYTES];
+        out[0..4].copy_from_slice(&self.expert.to_le_bytes());
+        out[4..8].copy_from_slice(&self.count.to_le_bytes());
+        for (index, slot) in self.slots.iter().enumerate() {
+            out[8 + index * 4..12 + index * 4].copy_from_slice(&slot.to_le_bytes());
+        }
+        for (index, value) in self.reserved.iter().enumerate() {
+            out[72 + index * 4..76 + index * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(
+        bytes: [u8; EXL3_M16_WORK_RECORD_BYTES],
+    ) -> Result<Self, PersistentWorkError> {
+        let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if !(1..=EXL3_M16_MAX_ROWS).contains(&count) {
+            return Err(PersistentWorkError::InvalidCount(count));
+        }
+        if bytes[72..80] != [0; 8] {
+            return Err(PersistentWorkError::InvalidPadding);
+        }
+        let mut slots = [0; EXL3_M16_MAX_ROWS];
+        for (index, slot) in slots.iter_mut().enumerate() {
+            *slot = u32::from_le_bytes(bytes[8 + index * 4..12 + index * 4].try_into().unwrap());
+        }
+        Ok(Self {
+            expert: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            count: count as u32,
+            slots,
+            reserved: [0; 2],
+        })
+    }
 }
 
 impl std::fmt::Display for PersistentWorkError {
@@ -161,7 +307,16 @@ pub fn try_gathered_experts(
     top_k: usize,
     num_experts: u32,
 ) -> Result<Vec<(u32, Vec<u32>)>, PersistentWorkError> {
-    if !(1..=PERSISTENT_MAX_ROWS).contains(&routing.len()) {
+    try_gathered_experts_bounded(routing, top_k, num_experts, PERSISTENT_MAX_ROWS)
+}
+
+fn try_gathered_experts_bounded(
+    routing: &[Vec<u32>],
+    top_k: usize,
+    num_experts: u32,
+    max_rows: usize,
+) -> Result<Vec<(u32, Vec<u32>)>, PersistentWorkError> {
+    if !(1..=max_rows).contains(&routing.len()) {
         return Err(PersistentWorkError::InvalidRowCount(routing.len()));
     }
     if top_k == 0 {
@@ -203,6 +358,47 @@ pub fn try_gathered_experts(
         }
     }
     Ok(groups)
+}
+
+/// CPU oracle for the device-side EXL3 worklist builder.
+pub fn try_exl3_worklist(
+    routing: &[Vec<u32>],
+    top_k: usize,
+    num_experts: u32,
+    capacity: usize,
+) -> Result<Vec<Exl3PersistentWork>, PersistentWorkError> {
+    let groups = try_gathered_experts(routing, top_k, num_experts)?;
+    if groups.len() > capacity {
+        return Err(PersistentWorkError::CapacityExceeded {
+            required: groups.len(),
+            capacity,
+        });
+    }
+    groups
+        .into_iter()
+        .map(|(expert, slots)| Exl3PersistentWork::try_new(expert, &slots))
+        .collect()
+}
+
+/// CPU oracle for the exact M16/top-6 device worklist builder.
+pub fn try_exl3_worklist_m16(
+    routing: &[Vec<u32>],
+    top_k: usize,
+    num_experts: u32,
+    capacity: usize,
+) -> Result<Vec<Exl3PersistentM16Work>, PersistentWorkError> {
+    let groups = try_gathered_experts_bounded(routing, top_k, num_experts, EXL3_M16_MAX_ROWS)?;
+    let capacity = capacity.min(EXL3_M16_WORK_CAPACITY);
+    if groups.len() > capacity {
+        return Err(PersistentWorkError::CapacityExceeded {
+            required: groups.len(),
+            capacity,
+        });
+    }
+    groups
+        .into_iter()
+        .map(|(expert, slots)| Exl3PersistentM16Work::try_new(expert, &slots))
+        .collect()
 }
 
 #[cfg(test)]

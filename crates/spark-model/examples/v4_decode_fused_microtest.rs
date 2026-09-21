@@ -325,7 +325,17 @@ fn main() -> Result<()> {
         g.memset_async(v_pool_b, 0, pool_bytes, stream)?;
 
         fused_rope(
-            g, k_fused_rope, q_b, k_b, pos_buf, NQ, 1, inv_freq, cfg.mscale, false, stream,
+            g,
+            k_fused_rope,
+            q_b,
+            k_b,
+            pos_buf,
+            NQ,
+            1,
+            inv_freq,
+            cfg.mscale,
+            false,
+            stream,
         )?;
         KernelLaunch::new(g, k_fused_cache)
             .grid([1, 1, 1])
@@ -349,7 +359,11 @@ fn main() -> Result<()> {
             let diff = x.iter().zip(y).filter(|(a, b)| a != b).count();
             println!(
                 "  {label}: {} ({diff} byte diffs / {})",
-                if diff == 0 { "BYTE-IDENTICAL" } else { "MISMATCH" },
+                if diff == 0 {
+                    "BYTE-IDENTICAL"
+                } else {
+                    "MISMATCH"
+                },
                 x.len()
             );
             usize::from(diff != 0)
@@ -385,7 +399,17 @@ fn main() -> Result<()> {
         )?;
         rope_writeback(g, k_writeback, o_tmp, o_a, NQ, NQ * HD, stream)?;
         fused_rope(
-            g, k_fused_rope, o_b, o_b, pos_buf, NQ, 0, inv_freq, cfg.mscale, true, stream,
+            g,
+            k_fused_rope,
+            o_b,
+            o_b,
+            pos_buf,
+            NQ,
+            0,
+            inv_freq,
+            cfg.mscale,
+            true,
+            stream,
         )?;
         g.synchronize(stream)?;
         failures += gate(
@@ -439,7 +463,17 @@ fn main() -> Result<()> {
         let t1 = std::time::Instant::now();
         for _ in 0..ITERS {
             fused_rope(
-                g, k_fused_rope, q_b, k_b, pos_buf, NQ, 1, inv_freq, cfg.mscale, false, stream,
+                g,
+                k_fused_rope,
+                q_b,
+                k_b,
+                pos_buf,
+                NQ,
+                1,
+                inv_freq,
+                cfg.mscale,
+                false,
+                stream,
             )?;
             KernelLaunch::new(g, k_fused_cache)
                 .grid([1, 1, 1])
@@ -482,9 +516,7 @@ fn main() -> Result<()> {
         let k_hc_fused = match m("hyper_connection", "hc_pre_fused") {
             Ok(k) => k,
             Err(_) => {
-                println!(
-                    "  SKIPPED: hc_pre_fused absent in this tree (hc split path covers it)"
-                );
+                println!("  SKIPPED: hc_pre_fused absent in this tree (hc split path covers it)");
                 println!("PASS: all gates byte-identical (tier 1 proven at this shape)");
                 return Ok(());
             }
@@ -556,7 +588,11 @@ fn main() -> Result<()> {
             let diff = x.iter().zip(y).filter(|(a, b)| a != b).count();
             println!(
                 "  {label}: {} ({diff} byte diffs / {})",
-                if diff == 0 { "BYTE-IDENTICAL" } else { "MISMATCH" },
+                if diff == 0 {
+                    "BYTE-IDENTICAL"
+                } else {
+                    "MISMATCH"
+                },
                 x.len()
             );
             usize::from(diff != 0)

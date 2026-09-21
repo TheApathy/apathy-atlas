@@ -807,14 +807,47 @@ called at `crates/spark-model/src/model/impl_b3.rs:607`.
 **Traffic**: 64 KiB FP32 read + 8 KiB BF16 written = **72 KB → 0.26 µs**. Launch-bound.
 No weights, so the single-block shape costs nothing here.
 
+## Compile-only eight-head MLA decode experiment
+
+`kernels/gb10/experiments/mla_paged_decode_fp8_heads8.cu` is an isolated
+DeepSeek-V4 checkpoint for the first item below. It is not in a kernel registry
+and no serving dispatch references either entry point. One 256-thread CTA owns
+eight Q heads, one warp per head, while the CTA stages four 512-wide FP8 KV rows
+once. The generic entry stages V after scoring; the `_kvalias` entry reuses K
+only when the K/V scales are bit-identical. Exact guards require 64 Q heads,
+one KV head, Q=512, cache=576, block=16, window=128, grid.x=8, and block.x=256.
+
+Raw rows remap the 64 rope values at cache dimensions 512..575 onto query and
+output dimensions 448..511. Compressed rows stay contiguous and rope-free at
+512 bytes, matching the production compressed arm. Both arms use one common
+four-row maximum before deferred V accumulation; a CPU regression with
+strongly rising logits catches the stale-factor error that an evolving
+per-row maximum would introduce.
+
+The SM121a gate reports 104 registers for the generic entry and 92 for the
+K=V alias, 8,192 B static shared memory, and zero stack, local memory, spills,
+or atomics. At 4K context with a 128-token raw window and ratio-4 compressed
+pool, current per-head K reads are `128*576 + 1024*512 = 598,016` bytes per
+layer. Sharing each staged row across eight heads reduces the corresponding
+64-head/43-layer logical read total from about 1.53 GiB/token to 196 MiB/token.
+That is traffic arithmetic only, not measured DRAM traffic or tok/s.
+
+[Entrpi/ds4 v0.6.5](https://github.com/Entrpi/ds4/blob/v0.6.5/CHANGELOG.md)
+documents the structural precedent: its indexed attention head grouping moved
+a 12K measurement from 42.6 to 37.7 ms/token. Atlas has different cache layout,
+softmax order, and serving ABI, so promotion here still requires numeric tests
+across the raw/compressed boundary and attention sinks, full output hashes and
+cosine checks, then occupancy and timing on GB10. Compile-only qualification
+does not authorize host wiring.
+
 ---
 
 ## Appendix — what to fix first, concretely
 
-1. **Head-tile `mla_paged_decode_fp8`.** Change `blockIdx.x` from `q_head` to `q_head_group`,
-   hold `q_reg[HT][16]`, `m[HT]`, `l[HT]`, `o_reg[HT][16]`. Drop the V load (K==V). With the V
-   array gone, `HT = 8` fits in ~150 registers. DRAM demand for the attention arms drops
-   **16×** (8× from head tiling, 2× from K==V).
+1. **Head-tile `mla_paged_decode_fp8`.** The compile-only heads8 checkpoint above now maps
+   one warp to each head and stages K/V once per eight-head CTA. The alias entry compiles at
+   92 registers. Production already has K=V aliasing, so the incremental structural reduction
+   is **8×** for cache reads; numeric and device gates still block host dispatch.
 2. **M-tile the same kernel** for the verify widths: add an `M` dimension (`grid.z` or an inner
    loop) so the γ=2/γ=6 verify loads each K/V row once for all M rows, replacing the M separate
    launches at `multi_seq/mla.rs:498-522`.

@@ -61,6 +61,11 @@ impl TransformerModel {
         ssm_cache_slots: usize,
         ssm_checkpoint_interval: usize,
     ) -> Result<Self> {
+        let planned_dspark_capture_layers =
+            crate::weight_loader::deepseek_v4::dspark::capture_plan::capture_layers_from_env(
+                config.num_hidden_layers,
+            )
+            .map_err(anyhow::Error::msg)?;
         // `rms_norm_kernel` normalizes exactly one weight: `final_norm` (a
         // checkpoint tensor). Models that ship HF-vanilla norm weights load it
         // exactly and must use the vanilla kernel.
@@ -70,6 +75,11 @@ impl TransformerModel {
             gpu.kernel("norm", "rms_norm")?
         };
         let dense_gemv_kernel = gpu.kernel("gemv", "dense_gemv_bf16")?;
+        let dense_gemv_batchm_kernel = crate::layers::try_kernel(
+            gpu.as_ref(),
+            "dense_gemv_bf16_batchm",
+            "dense_gemv_bf16_batchm",
+        );
         // FP32-output dense GEMV — the FP32 logits path required an FP32
         // residual stream, which no longer exists, so this stays
         // KernelHandle(0) and the BF16 path is always taken.
@@ -355,45 +365,45 @@ impl TransformerModel {
             dspark_dump_rows,
             dspark_capture_ring,
         ) = match std::env::var("ATLAS_DSPARK_DUMP") {
-                _ if dspark_capture_only => {
-                    let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
-                        .unwrap_or_else(|_| "40,41,42".into())
-                        .split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
-                    let rows = crate::model::DSPARK_CAPTURE_RING_ROWS;
-                    let buf = gpu.alloc(layers.len() * rows * config.hidden_size * 2)?;
-                    tracing::info!(
-                        "ATLAS_DSPARK_CAPTURE=1: hc-mean circular history at layers {layers:?} \
+            _ if dspark_capture_only => {
+                let layers = planned_dspark_capture_layers
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DSpark capture mode changed during construction")
+                    })?
+                    .to_vec();
+                let rows = crate::model::DSPARK_CAPTURE_RING_ROWS;
+                let buf = gpu.alloc(layers.len() * rows * config.hidden_size * 2)?;
+                tracing::info!(
+                    "ATLAS_DSPARK_CAPTURE=1: hc-mean circular history at layers {layers:?} \
                          ({} rows, {} MB, no dump file)",
-                        rows,
-                        layers.len() * rows * config.hidden_size * 2 / (1 << 20),
-                    );
-                    (None, buf, layers, rows, true)
-                }
-                Ok(path) if !path.is_empty() => {
-                    let layers: Vec<usize> = std::env::var("ATLAS_DSPARK_CAPTURE_LAYERS")
-                        .unwrap_or_else(|_| "40,41,42".into())
-                        .split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
-                    let file = std::fs::File::create(&path)
-                        .map_err(|e| anyhow::anyhow!("ATLAS_DSPARK_DUMP: creating {path}: {e}"))?;
-                    let buf = gpu.alloc(layers.len() * max_seq_len * config.hidden_size * 2)?;
-                    tracing::info!(
-                        "ATLAS_DSPARK_DUMP={path}: capturing hc-mean at layers {layers:?} \
+                    rows,
+                    layers.len() * rows * config.hidden_size * 2 / (1 << 20),
+                );
+                (None, buf, layers, rows, true)
+            }
+            Ok(path) if !path.is_empty() => {
+                let layers = planned_dspark_capture_layers
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("DSpark capture mode changed during construction")
+                    })?
+                    .to_vec();
+                let file = std::fs::File::create(&path)
+                    .map_err(|e| anyhow::anyhow!("ATLAS_DSPARK_DUMP: creating {path}: {e}"))?;
+                let buf = gpu.alloc(layers.len() * max_seq_len * config.hidden_size * 2)?;
+                tracing::info!(
+                    "ATLAS_DSPARK_DUMP={path}: capturing hc-mean at layers {layers:?} \
                          ({} MB scratch)",
-                        layers.len() * max_seq_len * config.hidden_size * 2 / (1 << 20),
-                    );
-                    (
-                        Some(Mutex::new(std::io::BufWriter::new(file))),
-                        buf,
-                        layers,
-                        max_seq_len,
-                        false,
-                    )
-                }
-                _ => (None, DevicePtr::NULL, Vec::new(), 0, false),
+                    layers.len() * max_seq_len * config.hidden_size * 2 / (1 << 20),
+                );
+                (
+                    Some(Mutex::new(std::io::BufWriter::new(file))),
+                    buf,
+                    layers,
+                    max_seq_len,
+                    false,
+                )
+            }
+            _ => (None, DevicePtr::NULL, Vec::new(), 0, false),
         };
         // Graph-safe landing pad for the hc-mean capture. The direct write into
         // `dspark_dump_buf` is indexed by `start_row = seq.seq_len`, a host value
@@ -616,6 +626,7 @@ impl TransformerModel {
             gpu,
             rms_norm_kernel,
             dense_gemv_kernel,
+            dense_gemv_batchm_kernel,
             dense_gemv_fp32out_kernel,
             w4a16_gemv_kernel,
             w4a16_gemv_logits_kernel,
@@ -694,6 +705,7 @@ impl TransformerModel {
             self_speculative,
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
             vision_encoder,
+            deepseek_vision: None,
             vision_embed_patches: Mutex::new(0),
             vision_image_grids: Mutex::new(Vec::new()),
             vision_row_base: Mutex::new(0),

@@ -116,6 +116,29 @@ pub(crate) fn open_dump_writer(args: &cli::ServeArgs) -> Option<crate::request_d
     }
 }
 
+pub(crate) fn open_tool_slip_dump_writer(
+    args: &cli::ServeArgs,
+) -> Option<crate::request_dumper::DumpHandle> {
+    use crate::request_dumper;
+    let arg = args.ds4_tool_slip_dump.as_deref()?;
+    let path = request_dumper::resolve_path_with_prefix(arg, "atlas-ds4-tool-slip");
+    match request_dumper::DumpHandle::open(path) {
+        Ok(h) => {
+            tracing::info!(
+                path = %h.path().display(),
+                "DeepSeek-V4 tool-slip dump enabled (JSONL append)"
+            );
+            Some(h)
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to open --ds4-tool-slip-dump target: {e}. Slip dumping is disabled."
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn log_response_store_audit(
     response_store: &crate::response_store::ResponseStore,
     rate_limiter: &crate::rate_limiter::RateLimiter,

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# One-command, plain DeepSeek-V4 K2 candidate for the N=2410 prefill gate.
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# Profiling, diagnostics, calibration overrides, and speculation change the
+# topology or make exact-shape fusion arms decline. Keep this profile plain and
+# auditable. The checkpoint's MODEL.toml owns FP8 KV calibration: it ships no
+# usable static K/V scales, so an inherited explicit zero is unsafe. Keep the
+# list data-driven so PRINT_CONFIG_ONLY can expose exactly what was scrubbed.
+scrubbed_env=(
+  GAMMA DSPARK_TOKENS DRAFTER
+  ATLAS_PROFILE ATLAS_DIAG_V4_ALL_LAYERS ATLAS_OP_DUMP
+  ATLAS_DUMP_EXPERT_IDS DFLASH_TRAIN_DUMP
+  ATLAS_EXL3_SHARED_PREFILL_FP8 ATLAS_V4_PROJ_FP8MMA ATLAS_V4_PREFILL_HC_RMS_FUSED
+  ATLAS_FP8_KV_EMA_RECAL ATLAS_FP8_KV_HEADROOM
+  FP8_KV_CALIBRATION_TOKENS ATLAS_V4_PREFILL_QB_ROPE_CACHE_FUSED
+  ATLAS_V4_PREFILL_QB_ROPE_FUSED ATLAS_V4_PREFILL_TC2_WARP0
+  ATLAS_DEBUG_SYNC_KERNELS ATLAS_PREFILL_HOST_TIMING ATLAS_V4_STAGE_SYNCS
+  ATLAS_MOE_PREFILL_ZERO
+  ATLAS_DUMP_EMBED CUDA_LAUNCH_BLOCKING
+  ATLAS_EXL3_FIXED_K2 ATLAS_EXL3_SPLIT ATLAS_EXL3_VERIFY_WORKLIST ATLAS_EXL3_FUSED
+  ATLAS_PREFILL_MAX_REQUIRE_ARMS ATLAS_EXL3_PREFILL_W2A8_FUSED_GU_DOWN_N256
+  ATLAS_EXL3_PREFILL_FUSED_BLEND
+  ATLAS_MAX_BATCH_TOKENS ATLAS_KV_EXTERNAL_RESERVE_GB ATLAS_PEAK_MEM_MULT
+)
+unset "${scrubbed_env[@]}"
+
+export REPO=$repo_root
+export MODEL=/home/flocka/models/DeepSeek-V4-Flash-0731-EXL3-K2-calibrated-v1
+export ATLAS_KV_OVERCOMMIT=0
+export MAX_SEQ_LEN=4096
+export MAX_PREFILL_TOKENS=4096
+export GPU_MEMORY_UTILIZATION=0.96
+export OOM_GUARD=2048
+
+profile=(
+  ATLAS_PREFILL_MAX_REQUIRE_ARMS=1
+  ATLAS_V4_PREFILL_CUBLASLT=1
+  ATLAS_V4_ATTN_RELEASE_BF16=0
+  ATLAS_V4_PREFILL_HC_RMS_FUSED=1
+  ATLAS_V4_ATTN_NVFP4=0
+  ATLAS_V4_PREFILL_TC=1
+  ATLAS_V4_PREFILL_TC2=1
+  ATLAS_V4_PREFILL_TC2_WARP0=0
+  ATLAS_V4_PREFILL_QB_ROPE_FUSED=0
+  ATLAS_V4_COMP_GEMM_TC=1
+  ATLAS_V4_KV_PIPELINED=1
+  ATLAS_V4_WOA_INPLACE=1
+  ATLAS_HC_TILED=1
+  ATLAS_V4_PREFILL_KV_ALIAS=1
+  ATLAS_V4_PREFILL_INVERSE_ROPE_FUSED=1
+  ATLAS_EXL3_PREFILL_DIRECT=1
+  ATLAS_EXL3_PREFILL_PERSISTENT=1
+  ATLAS_EXL3_PREFILL_FIXED_K2=1
+  ATLAS_EXL3_PREFILL_FIXED_SHAPE=1
+  ATLAS_EXL3_PREFILL_FUSED_POST=1
+  ATLAS_EXL3_PREFILL_DUAL_PRE=1
+  ATLAS_EXL3_PREFILL_W2A8=1
+  ATLAS_EXL3_PREFILL_W2A8_FUSED_GU_DOWN=1
+  ATLAS_EXL3_PREFILL_W2A8_FUSED_GU_DOWN_N256=0
+  ATLAS_EXL3_PREFILL_W2A8_N256_DOWN=1
+  ATLAS_EXL3_PREFILL_FUSED_UNPERMUTE=1
+  ATLAS_EXL3_HROW_FIXED_SHAPE=1
+  ATLAS_EXL3_PREFILL_FUSED_BLEND=0
+  ATLAS_MOE_SHARED_K64=4
+  ATLAS_EXL3_PREFILL_M128=0
+  ATLAS_EXL3_PREFILL_K64=0
+  ATLAS_EXL3_PREFILL_N128=0
+  ATLAS_EXL3_PREFILL_N256=0
+)
+
+if [ "${PRINT_CONFIG_ONLY:-0}" = 1 ]; then
+  printf 'scrub: %s\n' "${scrubbed_env[*]}"
+fi
+
+if [ "${PRINT_CONFIG_ONLY:-0}" != 1 ]; then
+  python3 "$repo_root/scripts/check-exl3-prefill-max-model.py"
+  "$repo_root/scripts/build-exl3-prefill-max.sh" --verify-only
+fi
+
+# Trailing assignments are intentional A/B overrides and are logged after the
+# profile, so the last value wins visibly in `env`.
+exec "$repo_root/scripts/exl3-serve.sh" "${PREFILL_LOG_NAME:-prefill-max}" \
+  "${profile[@]}" "$@"

@@ -29,6 +29,10 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
     pub(super) fn embed(&self, token: u32, output: DevicePtr, stream: u64) -> Result<()> {
+        anyhow::ensure!(
+            self.config.deepseek_vision.is_none() || (token as usize) < self.config.vocab_size,
+            "DeepSeek image sentinel requires prepared initial-chunk embedding"
+        );
         let h = self.config.hidden_size;
         let row_bytes = h * 2; // BF16 embedding row
         let src = self.embed_tokens.weight.offset(token as usize * row_bytes);
@@ -185,6 +189,29 @@ impl TransformerModel {
                     )?;
                 }
             }
+        } else if self.config.deepseek_vision.is_some()
+            && num_tokens >= 2
+            && num_tokens <= ops::DENSE_GEMV_BATCHM_MAX_M
+            && self.dense_gemv_batchm_kernel.0 != 0
+        {
+            // The native Vision checkpoint retains a BF16 LM head. Small-M
+            // tensor-core GEMM wastes most of its M tile, while independent
+            // GEMVs reread the 1 GiB head once per verify row. This kernel
+            // streams the weight once and retains each serial row's exact
+            // accumulation order (qualified for packed and padded M=2..6).
+            ops::dense_gemv_batchm(
+                self.gpu.as_ref(),
+                self.dense_gemv_batchm_kernel,
+                hidden,
+                &self.lm_head_weight,
+                logits,
+                num_tokens,
+                v,
+                h,
+                h,
+                v,
+                stream,
+            )?;
         } else if num_tokens == 2 {
             // Double-GEMV: reads weights once, computes 2 outputs.
             // GEMM M=2 with 64×64 tiles wastes 97% of M-dimension → ~3× slower.

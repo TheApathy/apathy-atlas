@@ -16,6 +16,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
     } else {
         "length"
     };
+    let engine = crate::scheduler::adaptive_spec::engine_usage(a);
     match &mut a.sink {
         ResponseSink::Streaming(tx) => {
             let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
@@ -29,6 +30,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
                 reasoning_tokens: a.thinking_tokens,
                 cached_prompt_tokens: a.cached_prompt_tokens,
                 guard_stop: a.guard_stop,
+                engine,
             }) {
                 tracing::warn!(
                     "finish_sequence: streaming Done send failed (receiver dropped): {e}"
@@ -56,6 +58,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq) {
                                 top: p.top,
                             })
                             .collect(),
+                        engine,
                     }))
                     .is_err()
                 {

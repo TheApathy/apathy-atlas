@@ -209,6 +209,9 @@ impl TransformerModel {
         // load-time-fixed). Folded in as one more suppressor.
         let lora_eager = self.lora.is_some() && crate::lora::lora_eager_env();
         let use_graphs = (self.comm.is_none() || ep_graphs || gdn_graphs)
+            // Vision's V4 compressed-history append requires eager per-token
+            // execution. Graph replay skips that host-side pipeline entirely.
+            && self.config.deepseek_vision.is_none()
             && !self.profile
             && !self
                 .suppress_graphs

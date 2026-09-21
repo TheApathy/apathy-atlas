@@ -315,19 +315,39 @@ impl QuantizedWeight {
         k: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        let fp8_buf = gpu.alloc(n * k)?;
-        crate::layers::ops::predequant_nvfp4_to_fp8(
+        ensure!(
+            k.is_multiple_of(2),
+            "NVFP4 predequant requires even K, got {k}"
+        );
+        let fp8_bytes = n
+            .checked_mul(k)
+            .context("NVFP4 predequant byte size overflow")?;
+        let packed_values = n
+            .checked_mul(k / 2)
+            .context("NVFP4 predequant packed size overflow")?;
+        ensure!(
+            packed_values <= u32::MAX as usize,
+            "NVFP4 predequant grid exceeds u32 indexing: {packed_values} packed values"
+        );
+        let n_u32 = u32::try_from(n).context("NVFP4 predequant N exceeds u32")?;
+        let k_u32 = u32::try_from(k).context("NVFP4 predequant K exceeds u32")?;
+        let fp8_buf = gpu.alloc(fp8_bytes)?;
+        let result = crate::layers::ops::predequant_nvfp4_to_fp8(
             gpu,
             predequant_kernel,
             self.weight,
             self.weight_scale,
             self.weight_scale_2,
             fp8_buf,
-            n as u32,
-            k as u32,
+            n_u32,
+            k_u32,
             stream,
-        )?;
-        gpu.synchronize(stream)?;
+        )
+        .and_then(|()| gpu.synchronize(stream));
+        if let Err(error) = result {
+            let _ = gpu.free(fp8_buf);
+            return Err(error);
+        }
         Ok(fp8_buf)
     }
 }

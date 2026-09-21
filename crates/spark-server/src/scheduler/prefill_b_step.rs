@@ -247,9 +247,8 @@ pub fn prefill_request(
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
-        }
+        // Empty input invalidates the previous request's images.
+        model.prepare_vision_embed(&image_pixels)?;
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;

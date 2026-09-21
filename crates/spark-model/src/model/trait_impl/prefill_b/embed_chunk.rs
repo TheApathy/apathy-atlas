@@ -36,6 +36,9 @@ impl TransformerModel {
         hidden_dst: spark_runtime::gpu::DevicePtr,
         stream: u64,
     ) -> Result<()> {
+        if self.embed_deepseek_chunk(tokens, chunk_start, chunk_len, hidden_dst, stream)? {
+            return Ok(());
+        }
         let h = self.config.hidden_size;
         // BF16 residual is the shipping config (2 bytes/element).
         let elem_bytes = 2usize;

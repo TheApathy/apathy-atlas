@@ -12,7 +12,8 @@ use crate::AppState;
 
 use super::{
     ChatChoice, ChatCompletionResponse, ChatMessage, ChoiceLogprobs, CompletionTokensDetails,
-    PromptTokensDetails, TokenLogprobInfo, TopLogprob, Usage, merged_annotations,
+    PromptTokensDetails, TokenLogprobInfo, TopLogprob, Usage, atlas_engine_usage,
+    merged_annotations,
 };
 
 /// Serialize the response IR for the `/v1/chat/completions` surface.
@@ -38,6 +39,7 @@ pub(crate) fn encode_chat_response(
         }),
         time_to_first_token_ms: ir.usage.time_to_first_token_ms,
         response_tokens_per_second: ir.usage.response_tokens_per_second,
+        atlas_engine: atlas_engine_usage(ir.usage.engine),
     };
 
     let choices: Vec<ChatChoice> = ir

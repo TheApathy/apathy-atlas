@@ -42,6 +42,28 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
 
     // 1. Load model config (supports HF config.json and Mistral params.json)
     let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
+    let vision_dspark_candidate =
+        serve_phases::validate_vision_dspark_request(&args, &model_dir, &config, &config_json)?;
+    spark_model::factory::vision_admission::validate_deepseek_vision_execution(
+        config.deepseek_vision.is_some(),
+        (!args.speculative && !args.self_speculative && !args.ngram_speculative && !args.dflash)
+            || vision_dspark_candidate,
+        args.world_size == 1 && args.tp_size == 1 && args.ep_size == 1,
+        args.max_batch_size.max(args.max_num_seqs),
+        args.enable_prefix_caching,
+    )
+    .map_err(anyhow::Error::msg)?;
+    spark_model::weight_loader::deepseek_v4::dspark::capture_plan::capture_layers_from_env(
+        config.num_hidden_layers,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let vision_hc_bf16 =
+        spark_model::layers::qwen3_attention::vision_hc_bf16::VisionHcBf16::from_env(&config)?;
+    vision_hc_bf16.validate_execution(
+        args.max_batch_size.max(args.max_num_seqs),
+        args.world_size == 1 && args.tp_size == 1 && args.ep_size == 1,
+        !args.speculative && !args.self_speculative && !args.ngram_speculative && !args.dflash,
+    )?;
 
     // CLI `--lm-head-dtype` override (replaces ATLAS_LMHEAD_BF16). Validate eagerly (PCND).
     // Sets both `lm_head_bf16_override` (skip/keep-quantized signal consumed by
@@ -66,6 +88,20 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     };
     config.lm_head_bf16_override = lm_head_bf16_override;
     config.lm_head_fp8 = lm_head_fp8;
+    if config.deepseek_vision.is_some() {
+        anyhow::ensure!(
+            args.vision_max_pixels == 0,
+            "DeepSeek Vision uses its checkpoint token budget; --vision-max-pixels is currently unsupported"
+        );
+        anyhow::ensure!(
+            args.max_num_seqs == 1 && args.max_batch_size == 1,
+            "DeepSeek Vision currently requires --max-num-seqs 1 --max-batch-size 1"
+        );
+        anyhow::ensure!(
+            !args.enable_prefix_caching,
+            "DeepSeek Vision requires prefix caching disabled until image bytes participate in cache identity"
+        );
+    }
 
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.
@@ -110,6 +146,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             )
         })?;
     let sampling_presets = ptx_set.sampling;
+    spark_model::factory::vision_kv::validate_deepseek_vision_kv_request(
+        &config,
+        &args.kv_cache_dtype,
+        ptx_set.behavior.default_kv_dtype,
+        &args.kv_high_precision_layers,
+    )?;
 
     // QV1 (2026-05-26): kernel ↔ model quant compatibility validation.
     //
@@ -170,6 +212,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
     let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
+    vision_hc_bf16.validate_kernel(gpu.as_ref())?;
 
     // ── Pre-load reserve preflight ──
     let serve_phases::ReservePreflight {
@@ -205,11 +248,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         ep_rank,
     } = serve_phases::resolve_topology(&args, &mut config)?;
     // FP8 KV calibration: CLI flag overrides MODEL.toml default.
-    config.fp8_kv_calibration_tokens = if args.fp8_kv_calibration_tokens > 0 {
-        args.fp8_kv_calibration_tokens
-    } else {
-        ptx_set.behavior.fp8_kv_calibration_tokens
-    };
+    config.fp8_kv_calibration_tokens = args
+        .fp8_kv_calibration_tokens
+        .unwrap_or(ptx_set.behavior.fp8_kv_calibration_tokens);
 
     // 3. Load model weights
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
@@ -350,7 +391,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         }
     }
     let dflash_drafter_state =
-        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), &store)?;
+        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), &store, &model_dir)?;
     // LoRA adapters: resolve + load BEFORE `gpu` is moved into build_model.
     // `lora_states` must outlive build_model (lora_args borrows &l.store) and
     // stays alive until after AppState construction (adapter name clones).
@@ -762,6 +803,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     let conversation_store = conversation_store::ConversationStore::from_env();
     serve_phases::log_response_store_audit(&response_store, &rate_limiter);
     let dump_writer = serve_phases::open_dump_writer(&args);
+    let ds4_tool_slip_dump_writer = serve_phases::open_tool_slip_dump_writer(&args);
     let auth = build_auth_config(&args)?;
     let vision_max_pixels = resolve_vision_max_pixels(&args)?;
     if let Some(max_pixels) = vision_max_pixels {
@@ -899,6 +941,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             lora_states.first().map(|l| l.name.clone()),
         )),
         max_seq_len: args.max_seq_len,
+        max_batch_size,
+        yarn_context: serve_phases::text_only_yarn_context(&config, args.max_seq_len),
         request_tx,
         rotation_tx: if lora_states.is_empty() {
             None
@@ -906,6 +950,14 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             Some(rotation_tx)
         },
         vision_config: config.vision.clone(),
+        deepseek_vision_config: config.deepseek_vision.clone(),
+        deepseek_vision_vocab: config
+            .deepseek_vision
+            .as_ref()
+            .map(|_| u32::try_from(config.vocab_size))
+            .transpose()
+            .context("DeepSeek vocabulary exceeds u32")?,
+        initial_prefill_tokens: prefill_budget,
         vision_max_pixels,
         default_temperature,
         default_top_k,
@@ -913,6 +965,11 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         default_top_n_sigma,
         default_min_p,
         tool_call_parser,
+        ds4_tool_call_reminder_min_bytes: args
+            .ds4_tool_call_reminder
+            .then_some(args.ds4_tool_call_reminder_min_bytes),
+        ds4_tool_slip_resample: args.ds4_tool_slip_resample,
+        ds4_tool_slip_dump_writer,
         reasoning_parser: reasoning_parser_box,
         think_end_token_id: think_end_token,
         think_start_token_id: think_start_token,

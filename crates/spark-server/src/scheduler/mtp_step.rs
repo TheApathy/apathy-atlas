@@ -4,6 +4,9 @@
 
 use super::*;
 
+mod verify_dispatch;
+mod verify_plan;
+
 /// Smallest `drafts.len()` that routes to `step_verify_dflash` (default 4).
 ///
 /// Lowering this is the only way to measure K=3/K=4 on the DFlash verify path
@@ -48,8 +51,7 @@ pub fn step_mtp(
             // read blocks the scheduler thread until the async drafter
             // launch (spec-adopt / DFLASH_ASYNC) finishes its GPU tail —
             // per-step host time that neither STEP_TIMING bucket sees.
-            let t_collect = crate::scheduler::step_timing2::enabled()
-                .then(std::time::Instant::now);
+            let t_collect = crate::scheduler::step_timing2::enabled().then(std::time::Instant::now);
             match model.dflash_collect_async_drafts(&mut a.seq) {
                 Ok(Some(drafts)) => a.pending_drafts = drafts,
                 Ok(None) => {}
@@ -119,58 +121,16 @@ pub fn step_mtp(
                 _gmask.as_deref(),
             ) {
                 Ok(init) if !init.is_empty() => {
-                    // ── Task 1 DIAG (ATLAS_DFLASH_DIAG=1): the FIRST propose of
-                    // a fresh seq routes here (Phase A bootstrap), NOT through
-                    // the >=4 dflash dispatch — it always goes to k2/k3/k4 and
-                    // `continue`s. step_verify_dflash only fires on LATER
-                    // iterations (Phase B) once k4's re-propose set pending_drafts.
-                    // If init.len()<4 here the k4 re-propose likely also yields
-                    // <4 → dflash never reached. Log the count + branch.
-                    if crate::scheduler::verify_pipeline_helper::dflash_diag_enabled() {
-                        let branch = if eff >= 3 && init.len() >= 3 {
-                            "k4"
-                        } else if eff >= 2 && init.len() >= 2 {
-                            "k3"
-                        } else {
-                            "k2"
-                        };
-                        tracing::info!(
-                            "DFLASH DIAG scheduler Phase-A bootstrap: init.len()={} eff={} \
-                             → branch={} (bootstrap NEVER routes to dflash; k4 re-propose \
-                             must yield >=4 for Phase-B dflash to fire next iter)",
-                            init.len(),
-                            eff,
-                            branch,
-                        );
-                    }
-                    if eff >= 3 && init.len() >= 3 {
-                        step_verify_k4(
-                            model,
-                            a,
-                            &init,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    } else if eff >= 2 && init.len() >= 2 {
-                        step_verify_k3(
-                            model,
-                            a,
-                            &init,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    } else {
-                        step_verify_k2(
-                            model,
-                            a,
-                            &init,
-                            num_drafts,
-                            verify_ctx,
-                            dflash_verify_raw_argmax,
-                        );
-                    }
+                    verify_dispatch::dispatch(
+                        model,
+                        a,
+                        &init,
+                        eff,
+                        num_drafts,
+                        verify_ctx,
+                        dflash_verify_raw_argmax,
+                        true,
+                    );
                     continue;
                 }
                 Ok(_) => {
@@ -199,6 +159,7 @@ pub fn step_mtp(
         if dflash_verify_raw_argmax
             && !crate::scheduler::verify_pipeline_helper::dflash_seam_serial_enabled()
             && a.grammar_state.is_none()
+            && !model.requires_full_speculative_verify()
             && crate::scheduler::adaptive_spec::is_suspended(a)
             && crate::scheduler::low_gear::step_low_gear(
                 model,
@@ -435,83 +396,16 @@ pub fn step_mtp(
             }
         }
 
-        // ── Task 1 DIAG (ATLAS_DFLASH_DIAG=1): the drafts.len() the Phase-B
-        // verify dispatch sees, and which branch it takes. This is THE gate
-        // for step_verify_dflash firing (needs len>=4). If this logs a branch
-        // other than "dflash", propose is returning <4 for Laguna.
-        if crate::scheduler::verify_pipeline_helper::dflash_diag_enabled() {
-            let branch = if drafts.len() >= dflash_dispatch_min() {
-                "dflash (K=γ)"
-            } else if num_drafts >= 3 && drafts.len() >= 3 {
-                "k4"
-            } else if num_drafts >= 2 && drafts.len() >= 2 {
-                "k3"
-            } else {
-                "k2"
-            };
-            tracing::info!(
-                "DFLASH DIAG scheduler Phase-B verify dispatch: drafts.len()={} num_drafts={} \
-                 → branch={} (step_verify_dflash fires iff len>={})",
-                drafts.len(),
-                num_drafts,
-                branch,
-                dflash_dispatch_min(),
-            );
-        }
-
-        // DFlash γ-block drafters return ≥4 drafts per step (γ=16 typical).
-        // The K=2/3/4 graphed paths are MTP-shaped and don't generalize past
-        // K=4 cleanly, so γ-block verify routes through `step_verify_dflash`.
-        // MTP keeps using the existing graphed paths; this dispatch is purely
-        // additive.
-        //
-        // The `>= 4` floor is why `--dflash-gamma 4` measured 9.3 tok/s and
-        // gamma 3 measured 13.2 while gamma 5 measured 26.6: gamma G yields
-        // num_drafts = G-1, so G <= 4 never reaches step_verify_dflash at all
-        // and drops onto the MTP-shaped k4/k3 paths (no STEP_TIMING lines are
-        // emitted there — that is the cheapest way to tell which path ran).
-        // `step_verify_dflash` itself is generic in `drafts.len()`; nothing
-        // below hard-codes K. ATLAS_DFLASH_DISPATCH_MIN lowers the floor so
-        // the small-K economics can actually be measured — pair it with
-        // ATLAS_MOE_BATCH_MIN_N=4 or the batched MoE still won't engage at
-        // K=4. See laguna-expert-union-curve for why small K might win.
-        if drafts.len() >= dflash_dispatch_min() {
-            step_verify_dflash(
-                model,
-                a,
-                &drafts,
-                num_drafts,
-                verify_ctx,
-                dflash_verify_raw_argmax,
-            );
-        } else if num_drafts >= 3 && drafts.len() >= 3 {
-            step_verify_k4(
-                model,
-                a,
-                &drafts,
-                num_drafts,
-                verify_ctx,
-                dflash_verify_raw_argmax,
-            );
-        } else if num_drafts >= 2 && drafts.len() >= 2 {
-            step_verify_k3(
-                model,
-                a,
-                &drafts,
-                num_drafts,
-                verify_ctx,
-                dflash_verify_raw_argmax,
-            );
-        } else {
-            step_verify_k2(
-                model,
-                a,
-                &drafts,
-                num_drafts,
-                verify_ctx,
-                dflash_verify_raw_argmax,
-            );
-        }
+        verify_dispatch::dispatch(
+            model,
+            a,
+            &drafts,
+            num_drafts,
+            num_drafts,
+            verify_ctx,
+            dflash_verify_raw_argmax,
+            false,
+        );
     }
 }
 

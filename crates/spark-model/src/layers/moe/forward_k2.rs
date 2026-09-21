@@ -116,7 +116,9 @@ impl MoeLayer {
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch; // [2*top_k] u32
         let weights_dev = scratch.offset(2 * top_k as usize * 4); // [2*top_k] f32
-        if let Some(bias) = self.correction_bias_dev {
+        if self.route_deepseek_visual(ctx, gate_logits, indices_dev, weights_dev, 0, 2, stream)? {
+            // Vision/hash routing is complete; do not use text-only top-K.
+        } else if let Some(bias) = self.correction_bias_dev {
             // DeepSeek-V4 scores experts with sqrt(softplus(.)); sigmoid otherwise
             // (MiniMax/DeepSeek-V3). Must match the prefill/single-token paths or
             // decode routing diverges from prefill.

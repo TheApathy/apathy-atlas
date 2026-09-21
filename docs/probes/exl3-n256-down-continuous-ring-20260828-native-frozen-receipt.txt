@@ -1,0 +1,26 @@
+schema=atlas.exl3.n256-down-continuous-ring.frozen-pair.v1
+created_utc=2026-08-28T03:45:52Z
+pair_id=9bbe7368cea895ed14cee3502e78e8e67bc8c4cea8423bfbea46057aaa985fff
+directory_path=/tmp/atlas-exl3-n256-down-continuous-ring-ab-20260828-02
+directory_dev=66306
+directory_inode=56140069
+directory_nlink=4
+directory_final_mode=0555
+artifact=run-n256-down-continuous-ring-ab.sh sha256=07d4918e8df39fd8384735d77a9db8b5cfca59f58f9d69cc4eefe44311bfff13 dev=66306 inode=56140099 nlink=1 mode=0555 size=8386 mtime=1787888711
+artifact=build-receipt.txt sha256=20c679c1c1bef556df067ccc8091a5d1f1fc0cc59dcef9e9110b6a950d267a30 dev=66306 inode=56140098 nlink=1 mode=0444 size=17478 mtime=1787888711
+artifact=exl3-w2a8-n256-down-continuous-ring-incumbent sha256=9a25729018e21e8c273919f517b020882ab6aafd19e0b65d71310e394ea8eaca dev=66306 inode=56140073 nlink=1 mode=0555 size=5142560 mtime=1787888689
+artifact=exl3-w2a8-n256-down-continuous-ring-candidate sha256=1e1b734c3e576b6b0ec6472ae3a6885f0b9c9c382ad71e33418787585a0f4bcd dev=66306 inode=56140086 nlink=1 mode=0555 size=5142560 mtime=1787888710
+builder_sha256=a6cc0be1bc71a143599a94e34911cd85675f1a991da3a704a84611b65ba4d1a3
+builder_test_sha256=9d4fe9257a731b59689f3cb9dc58a895cbac8b4ba0a1b0c6c6c15f4eda374386
+receipt_incumbent_command_matches=1
+receipt_candidate_command_matches=1
+receipt_runtime_device_identity_matches=1
+only_ab_factor=W2A8_N256_DOWN_CONTINUOUS_RING_CANDIDATE
+incumbent_selector=0
+candidate_selector=1
+fixed_packed_e4m3=1
+fixed_fused_gu_n128_double_buffer=1
+fixed_fused_gu_n128_continuous_ring=1
+fixed_n256_down_double_buffer=1
+fixed_n256_route_guard=0
+native_execution=not_yet_run

@@ -38,6 +38,10 @@ pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environm
     env.add_filter("split_last", |s: String, sep: String| -> String {
         s.rsplit(&sep).next().unwrap_or("").to_string()
     });
+    // Jinja's built-in `length` counts Unicode scalar values. Prompt depth
+    // gates are defined in rendered UTF-8 bytes, matching the tokenizer input
+    // and cache prefix, so expose an explicit byte-counting filter.
+    env.add_filter("utf8_len", |s: String| -> usize { s.len() });
 
     // F76 (2026-04-29): bridge Python-style `.items()` / `.keys()` /
     // `.values()` methods on Maps to the corresponding minijinja
@@ -362,18 +366,19 @@ fn resolve_jinja_includes(template: &str, model_dir: &Path) -> String {
             .trim_start_matches('-')
             .trim_end_matches('-')
             .trim();
-        if body.starts_with("include") {
-            if let Some(fname) = first_quoted(body) {
-                // Only allow a bare filename in the model dir (no path escapes).
-                if !fname.contains('/') && !fname.contains("..") {
-                    if let Ok(contents) = std::fs::read_to_string(model_dir.join(&fname)) {
-                        result.push_str(&template[cursor..open]);
-                        result.push_str(&contents);
-                        tracing::info!("Inlined Jinja include '{fname}' ({} chars)", contents.len());
-                        cursor = close;
-                        continue;
-                    }
-                }
+        if body.starts_with("include")
+            && let Some(fname) = first_quoted(body)
+        {
+            // Only allow a bare filename in the model dir (no path escapes).
+            if !fname.contains('/')
+                && !fname.contains("..")
+                && let Ok(contents) = std::fs::read_to_string(model_dir.join(&fname))
+            {
+                result.push_str(&template[cursor..open]);
+                result.push_str(&contents);
+                tracing::info!("Inlined Jinja include '{fname}' ({} chars)", contents.len());
+                cursor = close;
+                continue;
             }
         }
         // Not a resolvable include — emit the tag verbatim and continue.

@@ -204,7 +204,9 @@ impl MoeLayer {
         let scratch = ctx.buffers.scratch();
         let indices_dev = scratch; // [num_tokens*top_k] u32
         let weights_dev = scratch.offset(num_tokens * top_k as usize * 4); // f32
-        if let Some(bias) = self.correction_bias_dev {
+        if self.route_deepseek_visual(ctx, gate_logits, indices_dev, weights_dev, 0, n, stream)? {
+            // Vision/hash routing is complete; do not use text-only top-K.
+        } else if let Some(bias) = self.correction_bias_dev {
             if ctx.config.scoring_func == "sqrtsoftplus" {
                 for t in 0..num_tokens {
                     ops::moe_topk_sqrtsoftplus(

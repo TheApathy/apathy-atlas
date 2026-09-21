@@ -16,7 +16,6 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<()> {
         let h = config.hidden_size;
-        let shared_inter = config.shared_expert_intermediate_size;
         let num_experts = config.num_experts;
         let predequant_k = gpu.kernel("w4a16", "predequant_nvfp4_to_fp8")?;
 
@@ -26,36 +25,80 @@ impl MoeLayer {
                 Some(nvfp4.predequant_to_fp8(gpu, predequant_k, num_experts, h, stream)?);
         }
 
+        self.predequant_shared_for_prefill_with_kernel(gpu, config, stream, predequant_k)?;
+        Ok(())
+    }
+
+    /// Build only the three NVFP4 shared-expert FP8 mirrors.
+    ///
+    /// DeepSeek EXL3 uses this as an explicit, numerics-changing prefill A/B:
+    /// the current W4A16 baseline accumulates BF16 MMA, while the mirror path
+    /// uses FP8 weights and FP8 MMA. Keeping this separate from
+    /// [`Self::predequant_for_prefill`] prevents the router-gate precision from
+    /// changing in the same experiment. Returns persistent bytes allocated.
+    pub fn predequant_shared_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        stream: u64,
+    ) -> Result<usize> {
+        let predequant_k = gpu.kernel("w4a16", "predequant_nvfp4_to_fp8")?;
+        self.predequant_shared_for_prefill_with_kernel(gpu, config, stream, predequant_k)
+    }
+
+    fn predequant_shared_for_prefill_with_kernel(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+        stream: u64,
+        predequant_k: KernelHandle,
+    ) -> Result<usize> {
+        let h = config.hidden_size;
+        let shared_inter = config.shared_expert_intermediate_size;
+
         // A checkpoint-native BF16 shared expert is the authoritative copy.
         // Do not manufacture an FP8 prefill variant with different numerics.
-        if self.bf16_shared_expert.is_none()
-            && !self.weights.shared_expert.gate_proj.is_null()
-            && shared_inter > 0
+        if self.bf16_shared_expert.is_some()
+            || self.weights.shared_expert.gate_proj.is_null()
+            || shared_inter == 0
         {
-            self.shared_gate_fp8 = Some(self.weights.shared_expert.gate_proj.predequant_to_fp8(
-                gpu,
-                predequant_k,
-                shared_inter,
-                h,
-                stream,
-            )?);
-            self.shared_up_fp8 = Some(self.weights.shared_expert.up_proj.predequant_to_fp8(
-                gpu,
-                predequant_k,
-                shared_inter,
-                h,
-                stream,
-            )?);
-            self.shared_down_fp8 = Some(self.weights.shared_expert.down_proj.predequant_to_fp8(
-                gpu,
-                predequant_k,
-                h,
-                shared_inter,
-                stream,
-            )?);
+            return Ok(0);
         }
+        anyhow::ensure!(
+            self.shared_gate_fp8.is_none()
+                && self.shared_up_fp8.is_none()
+                && self.shared_down_fp8.is_none(),
+            "shared-expert FP8 mirrors are already or only partially initialized"
+        );
+        let bytes = h
+            .checked_mul(shared_inter)
+            .and_then(|elements| elements.checked_mul(3))
+            .ok_or_else(|| anyhow::anyhow!("shared-expert FP8 mirror byte size overflow"))?;
 
-        Ok(())
+        let specs = [
+            (&self.weights.shared_expert.gate_proj, shared_inter, h),
+            (&self.weights.shared_expert.up_proj, shared_inter, h),
+            (&self.weights.shared_expert.down_proj, h, shared_inter),
+        ];
+        let mut built = Vec::with_capacity(specs.len());
+        for (weight, n, k) in specs {
+            match weight.predequant_to_fp8(gpu, predequant_k, n, k, stream) {
+                Ok(ptr) => built.push(ptr),
+                Err(error) => {
+                    for ptr in built {
+                        let _ = gpu.free(ptr);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let down = built.pop().expect("down mirror");
+        let up = built.pop().expect("up mirror");
+        let gate = built.pop().expect("gate mirror");
+        self.shared_gate_fp8 = Some(gate);
+        self.shared_up_fp8 = Some(up);
+        self.shared_down_fp8 = Some(down);
+        Ok(bytes)
     }
 
     /// Set FP8 expert weights for native FP8 dispatch.

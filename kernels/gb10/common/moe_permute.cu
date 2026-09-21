@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <assert.h>   // device-side assert() for the work-list packing guard
+#include "moe_batched_blend.cuh"
 
 // Atlas MoE token permutation kernels.
 //
@@ -132,60 +133,30 @@ extern "C" __global__ void moe_batched_blend(
     unsigned int num_tokens
 ) {
     __shared__ float s_dot_partial[8]; // one per warp (256/32=8)
+    asm volatile(
+        "{ .reg .pred p; .reg .u32 n;\n\t"
+        "mov.u32 n, %ntid.x; setp.ne.u32 p, n, 256; @p exit;\n\t"
+        "mov.u32 n, %ntid.y; setp.ne.u32 p, n, 1; @p exit;\n\t"
+        "mov.u32 n, %ntid.z; setp.ne.u32 p, n, 1; @p exit; }");
 
     unsigned int token = blockIdx.x;
     if (token >= num_tokens) return;
 
     unsigned int tid = threadIdx.x;
-    unsigned int warp_id = tid / 32;
-    unsigned int lane = tid % 32;
 
     const __nv_bfloat16* my_normed = normed + token * hidden_size;
     const __nv_bfloat16* my_shared = shared_out + token * hidden_size;
     __nv_bfloat16* my_output = output + token * hidden_size;
 
-    // Phase 1: dot product normed[token] . gate_weight
-    // NULL gate_weight = no gate modulation → sigmoid=1.0 (always include shared expert)
-    float local_dot = 0.0f;
-    if (gate_weight != 0) {
-        for (unsigned int i = tid; i < hidden_size; i += blockDim.x) {
-            float n = __bfloat162float(my_normed[i]);
-            float g = __bfloat162float(gate_weight[i]);
-            local_dot += n * g;
-        }
-    }
-
-    // Warp-level sum
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        local_dot += __shfl_down_sync(0xFFFFFFFF, local_dot, offset);
-    }
-    if (lane == 0) s_dot_partial[warp_id] = local_dot;
-    __syncthreads();
-
-    // Cross-warp sum (thread 0)
-    float gate_scalar;
-    if (tid == 0) {
-        if (gate_weight == 0) {
-            // No gate: always include shared expert at full weight
-            gate_scalar = 1.0f;
-        } else {
-            float total = 0.0f;
-            for (unsigned int w = 0; w < blockDim.x / 32; w++) {
-                total += s_dot_partial[w];
-            }
-            gate_scalar = 1.0f / (1.0f + __expf(-total));
-        }
-        s_dot_partial[0] = gate_scalar;
-    }
-    __syncthreads();
-    gate_scalar = s_dot_partial[0];
+    // NULL gate_weight means full shared-expert weight. Keep this reduction
+    // byte-identical with the EXL3 fused tail through the common helper.
+    const float gate_scalar = atlas_moe_shared_gate_scalar_256(
+        my_normed, gate_weight, hidden_size, s_dot_partial);
 
     // Phase 2: output[i] += gate_scalar * shared_out[i]
     for (unsigned int i = tid; i < hidden_size; i += blockDim.x) {
-        float o = __bfloat162float(my_output[i]);
-        float s = __bfloat162float(my_shared[i]);
-        my_output[i] = __float2bfloat16(o + gate_scalar * s);
+        my_output[i] = atlas_moe_blend_from_routed_bf16(
+            __bfloat162float(my_output[i]), my_shared[i], gate_scalar);
     }
 }
 

@@ -40,6 +40,11 @@ impl TransformerModel {
     /// image. Skip cache lookup AND insert whenever any `image_pad`
     /// token is present in the prefill window.
     pub(super) fn tokens_have_vision_pad(&self, tokens: &[u32]) -> bool {
+        if self.config.deepseek_vision.is_some() {
+            return tokens
+                .iter()
+                .any(|&token| token as usize >= self.config.vocab_size);
+        }
         let pad_id = match self.config.vision.as_ref().map(|v| v.image_pad_token_id) {
             Some(id) if id != 0 => id,
             _ => crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID,

@@ -66,11 +66,13 @@ impl MoeLayer {
                 "w4a16_gemv",
                 "w4a16_gemv_grouped_batchm",
             ),
-            w4a16_gemv_grouped_batchm_v2_m16_k: super::super::try_kernel(
-                gpu,
-                "w4a16_gemv",
-                "w4a16_gemv_grouped_batchm_v2_m16",
-            ),
+            w4a16_gemv_grouped_batchm_v2_k: [
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_grouped_batchm_v2_m4"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_grouped_batchm_v2_m5"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_grouped_batchm_v2_m6"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_grouped_batchm_v2_m8"),
+                super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_grouped_batchm_v2_m16"),
+            ],
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
             dense_gemm_pipelined: super::super::try_kernel(
@@ -689,6 +691,7 @@ impl MoeLayer {
                 "moe_hash_route_batched",
             ),
             tid2eid_dev,
+            deepseek_visual_routing: None,
             moe_expert_gate_up_shared_batch2_t_k: gpu.kernel(
                 "moe_shared_expert_fused_batch2_t",
                 "moe_expert_gate_up_shared_batch2_t",
@@ -844,6 +847,7 @@ impl MoeLayer {
             bf16_up_weight_ptrs: None,
             bf16_down_weight_ptrs: None,
             bf16_shared_expert: None,
+            native_shared_fp8: None,
             // Built later by `build_shared_fp8_mirror` (ATLAS_TARGET_SHARED_FP8=1),
             // after the BF16 shared expert has been installed by the loader.
             fp8_shared_expert_mirror: None,

@@ -49,9 +49,9 @@ fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
 /// block=256 — they differ only in the weight/scale argument list.
 #[derive(Clone, Copy)]
 enum Conv {
-    DenseBf16,  // (A, B_bf16, C, N, K)                weight bytes = N*K*2
-    Fp8Row,     // (A, B_fp8, row_scale_f32, C, N, K)  weight bytes = N*K
-    W4a16,      // (A, B_pack, B_scale, scale2, C, N, K) bytes = N*K/2 + N*K/16
+    DenseBf16, // (A, B_bf16, C, N, K)                weight bytes = N*K*2
+    Fp8Row,    // (A, B_fp8, row_scale_f32, C, N, K)  weight bytes = N*K
+    W4a16,     // (A, B_pack, B_scale, scale2, C, N, K) bytes = N*K/2 + N*K/16
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,12 +74,7 @@ fn launch(
         .arg_ptr(b);
     match conv {
         Conv::DenseBf16 => l.arg_ptr(c).arg_u32(n).arg_u32(k).launch(stream),
-        Conv::Fp8Row => l
-            .arg_ptr(s)
-            .arg_ptr(c)
-            .arg_u32(n)
-            .arg_u32(k)
-            .launch(stream),
+        Conv::Fp8Row => l.arg_ptr(s).arg_ptr(c).arg_u32(n).arg_u32(k).launch(stream),
         Conv::W4a16 => l
             .arg_ptr(s)
             .arg_f32(1.0)
@@ -141,20 +136,36 @@ fn main() -> Result<()> {
         let s_p = upload(gpu, &s)?;
         let c_p = gpu.alloc(n * 2)?;
         let rot = (AGG_BYTES / wb).clamp(2, 64);
-        let b_ps: Vec<DevicePtr> = (0..rot)
-            .map(|_| upload(gpu, &b))
-            .collect::<Result<_>>()?;
+        let b_ps: Vec<DevicePtr> = (0..rot).map(|_| upload(gpu, &b)).collect::<Result<_>>()?;
 
         for i in 0..(2 * rot as u32) {
             launch(
-                gpu, conv, h, a_p, b_ps[i as usize % rot], s_p, c_p, n as u32, k as u32, stream,
+                gpu,
+                conv,
+                h,
+                a_p,
+                b_ps[i as usize % rot],
+                s_p,
+                c_p,
+                n as u32,
+                k as u32,
+                stream,
             )?;
         }
         gpu.synchronize(stream)?;
         let t0 = std::time::Instant::now();
         for i in 0..ITERS {
             launch(
-                gpu, conv, h, a_p, b_ps[i as usize % rot], s_p, c_p, n as u32, k as u32, stream,
+                gpu,
+                conv,
+                h,
+                a_p,
+                b_ps[i as usize % rot],
+                s_p,
+                c_p,
+                n as u32,
+                k as u32,
+                stream,
             )?;
         }
         gpu.synchronize(stream)?;

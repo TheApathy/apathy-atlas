@@ -197,8 +197,8 @@ impl Qwen3AttentionLayer {
         ops::mla_cache_assemble_batched(
             ctx.gpu,
             self.mla_cache_assemble_batched_k,
-            v_batch,     // latent K (pre-writeback copy)
-            k_rope_tmp,  // rotated K rope
+            v_batch,    // latent K (pre-writeback copy)
+            k_rope_tmp, // rotated K rope
             k_cache_assembled,
             v_cache_assembled,
             n,

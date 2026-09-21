@@ -145,10 +145,7 @@ impl Qwen3AttentionLayer {
             if let Some(m) = ctx.attn_metadata.as_ref() {
                 c.seq_slot = m.seq_slot;
             }
-            c.tree = Some(TreeSplit {
-                spine_rows,
-                reseed,
-            });
+            c.tree = Some(TreeSplit { spine_rows, reseed });
             self.decode_multi_seq_inner_hc(c, kv_cache, ctx, stream)?;
             return Ok(true);
         }

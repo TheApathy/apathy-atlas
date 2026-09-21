@@ -82,7 +82,10 @@ fn main() -> Result<()> {
         ("kv_proj  ", 2410, 512, 4096),
     ];
 
-    println!("{:<10} {:>14} {:>22} {:>10}", "shape", "pipelined", "cuBLASLt bf16", "cosine");
+    println!(
+        "{:<10} {:>14} {:>22} {:>10}",
+        "shape", "pipelined", "cuBLASLt bf16", "cosine"
+    );
     for &(tag, m, n, k) in shapes {
         let mut rng = Rng(0xB1A5 ^ ((m * 31 + n * 7 + k) as u64));
         let a = upload(gpu, &bf16s(&mut rng, m * k))?;
@@ -93,7 +96,9 @@ fn main() -> Result<()> {
 
         // correctness pass
         spark_model_ops_dense_gemm_bf16_pipelined(gpu, pipelined, a, &w, c1, m, n, k, stream)?;
-        spark_runtime::cublaslt::bf16_gemm_act_weight_t(a.0, b.0, c2.0, m as u32, n as u32, k as u32, stream)?;
+        spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+            a.0, b.0, c2.0, m as u32, n as u32, k as u32, stream,
+        )?;
         gpu.synchronize(stream)?;
         let r1 = read_f64(gpu, c1, m * n)?;
         let r2 = read_f64(gpu, c2, m * n)?;
@@ -103,24 +108,32 @@ fn main() -> Result<()> {
         let flop = 2.0 * m as f64 * n as f64 * k as f64;
         let t_pipe = {
             for _ in 0..3 {
-                spark_model_ops_dense_gemm_bf16_pipelined(gpu, pipelined, a, &w, c1, m, n, k, stream)?;
+                spark_model_ops_dense_gemm_bf16_pipelined(
+                    gpu, pipelined, a, &w, c1, m, n, k, stream,
+                )?;
             }
             gpu.synchronize(stream)?;
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                spark_model_ops_dense_gemm_bf16_pipelined(gpu, pipelined, a, &w, c1, m, n, k, stream)?;
+                spark_model_ops_dense_gemm_bf16_pipelined(
+                    gpu, pipelined, a, &w, c1, m, n, k, stream,
+                )?;
             }
             gpu.synchronize(stream)?;
             t0.elapsed().as_secs_f64() / ITERS as f64
         };
         let t_lt = {
             for _ in 0..3 {
-                spark_runtime::cublaslt::bf16_gemm_act_weight_t(a.0, b.0, c2.0, m as u32, n as u32, k as u32, stream)?;
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                    a.0, b.0, c2.0, m as u32, n as u32, k as u32, stream,
+                )?;
             }
             gpu.synchronize(stream)?;
             let t0 = std::time::Instant::now();
             for _ in 0..ITERS {
-                spark_runtime::cublaslt::bf16_gemm_act_weight_t(a.0, b.0, c2.0, m as u32, n as u32, k as u32, stream)?;
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                    a.0, b.0, c2.0, m as u32, n as u32, k as u32, stream,
+                )?;
             }
             gpu.synchronize(stream)?;
             t0.elapsed().as_secs_f64() / ITERS as f64
@@ -172,7 +185,15 @@ fn main() -> Result<()> {
                 k as u32,
                 stream,
             )?;
-            gpu.copy_d2d_2d_async(a_full.offset(g * k * 2), lda * 2, a_pack, k * 2, k * 2, m, stream)?;
+            gpu.copy_d2d_2d_async(
+                a_full.offset(g * k * 2),
+                lda * 2,
+                a_pack,
+                k * 2,
+                k * 2,
+                m,
+                stream,
+            )?;
             spark_model_ops_dense_gemm_bf16_pipelined(
                 gpu,
                 pipelined,
@@ -184,7 +205,15 @@ fn main() -> Result<()> {
                 k,
                 stream,
             )?;
-            gpu.copy_d2d_2d_async(c_full.offset(g * n * 2), ldc * 2, c_slice, n * 2, n * 2, m, stream)?;
+            gpu.copy_d2d_2d_async(
+                c_full.offset(g * n * 2),
+                ldc * 2,
+                c_slice,
+                n * 2,
+                n * 2,
+                m,
+                stream,
+            )?;
             gpu.synchronize(stream)?;
             let oracle = read_f64(gpu, c_pack, m * n)?;
             let strided = read_f64(gpu, c_slice, m * n)?;
@@ -328,4 +357,3 @@ fn spark_model_ops_dense_gemm_bf16_pipelined(
         .arg_u32(k as u32)
         .launch(stream)
 }
-

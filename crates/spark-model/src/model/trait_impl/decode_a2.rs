@@ -28,6 +28,10 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let n = tokens.len();
+        anyhow::ensure!(
+            self.config.deepseek_vision.is_none() || n <= 1,
+            "DeepSeek Vision batch decoding currently requires C1"
+        );
         assert_eq!(n, seqs.len(), "tokens.len() must equal seqs.len()");
 
         // Single-sequence: delegate to decode() which uses CUDA graphs.

@@ -55,6 +55,54 @@ pub struct Usage {
     /// Decode throughput in tokens per second.
     #[serde(rename = "response_token/s")]
     pub response_tokens_per_second: f64,
+    /// Atlas request-scoped scheduler-path evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atlas_engine: Option<AtlasEngineUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AtlasEngineUsage {
+    pub classification: &'static str,
+    pub speculative_steps: u64,
+    pub serial_tokens: u64,
+    pub low_gear_steps: u64,
+}
+
+impl From<crate::ir::EngineUsage> for AtlasEngineUsage {
+    fn from(value: crate::ir::EngineUsage) -> Self {
+        let classification = if value.low_gear_steps > 0 && value.speculative_steps > 0 {
+            "LOW_GEAR_MIXED"
+        } else if value.low_gear_steps > 0 {
+            "LOW_GEAR"
+        } else if value.speculative_steps > 0 && value.serial_tokens > 0 {
+            "MIXED"
+        } else if value.speculative_steps > 0 {
+            "SPECULATIVE"
+        } else if value.serial_tokens > 0 {
+            "SERIAL"
+        } else {
+            "UNVERIFIED"
+        };
+        Self {
+            classification,
+            speculative_steps: value.speculative_steps,
+            serial_tokens: value.serial_tokens,
+            low_gear_steps: value.low_gear_steps,
+        }
+    }
+}
+
+pub(crate) fn atlas_engine_usage(
+    engine: Option<crate::ir::EngineUsage>,
+) -> Option<AtlasEngineUsage> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED
+        .get_or_init(|| std::env::var("ATLAS_BENCH_ENGINE_USAGE").ok().as_deref() == Some("1"))
+    {
+        engine.map(Into::into)
+    } else {
+        None
+    }
 }
 
 /// Prompt-token breakdown (OpenAI-compatible `prompt_tokens_details`).

@@ -35,6 +35,8 @@ use crate::layers::MoeLayer;
 use crate::layers::qwen3_attention::{HcHeadWeights, HcSiteWeights};
 use crate::weight_map::{DenseWeight, dense_auto};
 
+pub mod capture_plan;
+
 /// DSpark hyper-parameters. The 0731 checkpoint does not repeat these in the
 /// drafter shards, so the caller parses them from the checkpoint's
 /// `config.json` (`dspark_block_size` etc.); [`DsparkParams::V4_FLASH_0731`]
@@ -60,7 +62,7 @@ impl DsparkParams {
         block_size: 5,
         noise_token_id: 128799,
         markov_rank: 256,
-        target_layer_ids: vec![40, 41, 42],
+        target_layer_ids: capture_plan::CAPTURE_LAYERS.to_vec(),
         window: 128,
     };
 }
@@ -241,6 +243,11 @@ pub fn load_dspark_drafter(
     gpu: &dyn GpuBackend,
     subset: Option<&super::dspark_reap::DraftExpertSubset>,
 ) -> Result<DsparkDrafterModule> {
+    capture_plan::validate_capture_layers(
+        &params.target_layer_ids,
+        target_config.num_hidden_layers,
+    )
+    .map_err(anyhow::Error::msg)?;
     if !store_is_dspark(store) {
         bail!("drafter store has no mtp.0.main_proj.weight — not a DSpark checkpoint");
     }
@@ -284,6 +291,10 @@ pub fn load_dspark_drafter(
     if n_stages == 0 {
         bail!("DSpark drafter store has main_proj but no mtp.0.attn_norm.weight");
     }
+    anyhow::ensure!(
+        n_stages == capture_plan::CAPTURE_LAYERS.len(),
+        "DSpark supports exactly three drafter stages; checkpoint has {n_stages}"
+    );
 
     let qctx = crate::weight_map::QuantizeCtx {
         absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,

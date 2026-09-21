@@ -61,9 +61,23 @@ MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1024}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.99}"
 LOG="${LOG:-$REPO/serve-$NAME.log}"
 
+FP8_CALIB_ARGS=()
+if [[ ${FP8_KV_CALIBRATION_TOKENS+x} == x ]]; then
+  case "$FP8_KV_CALIBRATION_TOKENS" in
+    ''|*[!0-9]*)
+      echo "FP8_KV_CALIBRATION_TOKENS must be a non-negative integer" >&2
+      exit 2
+      ;;
+  esac
+  FP8_CALIB_ARGS=(--fp8-kv-calibration-tokens "$FP8_KV_CALIBRATION_TOKENS")
+  FP8_CALIB_LABEL=$FP8_KV_CALIBRATION_TOKENS
+else
+  FP8_CALIB_LABEL=model-default
+fi
+
 ENV_ARGS=(
   ATLAS_EXL3_PREFILL_CHUNK=1
-  ATLAS_KV_OVERCOMMIT=1
+  "ATLAS_KV_OVERCOMMIT=${ATLAS_KV_OVERCOMMIT:-1}"
 )
 # Plain-target training capture. This deliberately reuses the mHC-aware
 # DSpark dump primitive with five DFlash target layers: DeepSeek keeps its
@@ -103,7 +117,7 @@ for kv in "$@"; do ENV_ARGS+=("$kv"); done
   echo "serve: $REPO/target/release/spark"
   echo "model: $MODEL (DeepSeek-V4 EXL3)"
   echo "draft: $DRAFTER ($DRAFTER_KIND)"
-  echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=fp8 gpu_mem=$GPU_MEMORY_UTILIZATION max_seq=$MAX_SEQ_LEN batch=1"
+  echo "port : 127.0.0.1:$PORT  kv=fp8 lm_head=fp8 gpu_mem=$GPU_MEMORY_UTILIZATION max_seq=$MAX_SEQ_LEN max_prefill=$MAX_PREFILL_TOKENS fp8_kv_calibration=$FP8_CALIB_LABEL batch=1"
   echo "env  : ${ENV_ARGS[*]:-<none>}"
   if [ -n "${GAMMA:-}" ]; then
     echo "spec : $DRAFTER_KIND gamma=$GAMMA verify rows, $((GAMMA - 1)) drafts"
@@ -133,6 +147,7 @@ nohup env "${ENV_ARGS[@]}" "$REPO/target/release/spark" serve "$MODEL" \
   --max-num-seqs 1 \
   --max-batch-size 1 \
   --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
+  "${FP8_CALIB_ARGS[@]}" \
   --oom-guard-mb "${OOM_GUARD:-512}" \
   "${SPEC[@]}" >>"$LOG" 2>&1 &
 

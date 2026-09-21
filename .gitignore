@@ -248,6 +248,8 @@ adapters35/
 # differ every run and must never gate a reproduction. Curated results that
 # back a claim live in docs/probes/ and are tracked there explicitly.
 serve-*.log
+serve-*.log.planned.receipt.json
+serve-*.log.receipt.json
 serve-*.out.json
 probe-*.json
 nograph-extra.json

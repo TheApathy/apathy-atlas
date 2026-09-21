@@ -9,8 +9,7 @@ use super::*;
 /// process, matching every other cached gate in this scheduler).
 fn dflash_step_timing_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED
-        .get_or_init(|| std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1"))
+    *CACHED.get_or_init(|| std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1"))
 }
 
 /// `ATLAS_DFLASH_FORK_DEGEN=1` (cached once; see S3a gate below).
@@ -288,8 +287,7 @@ pub fn step_verify_dflash(
         if i < vb.len() {
             b_bonus = Some(vb[i]);
         }
-        static FORKWIN_DBG: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
+        static FORKWIN_DBG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = FORKWIN_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 8 || n % 64 == 0 {
             tracing::info!(
@@ -314,8 +312,7 @@ pub fn step_verify_dflash(
     {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         // depth buckets 0,1,2,3+: [deaths, top2 hits, margin_milli sum]
-        static DEATHS: [AtomicU64; 4] =
-            [const { AtomicU64::new(0) }; 4];
+        static DEATHS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         static HITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         static MARGIN_MILLI: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
         let d = num_accepted;
@@ -346,7 +343,11 @@ pub fn step_verify_dflash(
                     };
                     tracing::info!(
                         "TREE_M0 top2-hit-at-death: {} | {} | {} | {} (total deaths {})",
-                        row(0), row(1), row(2), row(3), total
+                        row(0),
+                        row(1),
+                        row(2),
+                        row(3),
+                        total
                     );
                 }
             }
@@ -401,9 +402,12 @@ pub fn step_verify_dflash(
     // from plain greedy decode — the drafter's correct proposals then get
     // rejected. Replays the append from each layer's captured verify normed-x.
     // Eager only (verify runs under ATLAS_DEBUG_NO_GRAPH=1); ignores the rare
-    // block-fork committed_extra. Non-fatal on error — the next step recovers.
+    // block-fork committed_extra. A failed restore leaves invalid attention
+    // state; never emit tokens or propose again from that state.
     if let Err(e) = model.dspark_compress_catchup(pre_verify_len, num_accepted + 1, 0) {
         tracing::error!("dspark_compress_catchup: {e:#}");
+        a.finished = true;
+        return;
     }
     // ATLAS_DSPARK_DUMP diagnostic (task #45): emit the ONLINE γ-verify-generated
     // hc-mean captures as kind=1 records so the engine probe can replay them and
@@ -472,9 +476,7 @@ pub fn step_verify_dflash(
             && tree_frame_rows.is_none()
             && a.grammar_state.is_none()
             && !crate::scheduler::adaptive_spec::is_suspended(a);
-        if !spec_adopt
-            && let Err(e) = model.dflash_spec_discard(&mut a.seq)
-        {
+        if !spec_adopt && let Err(e) = model.dflash_spec_discard(&mut a.seq) {
             tracing::error!("dflash_spec_discard: {e:#}");
         }
     }
@@ -568,13 +570,11 @@ pub fn step_verify_dflash(
     // walk already disproved. (Tree WINS return before this point anyway.)
     if tree_frame_rows.is_none() {
         // Recycle: the drafter's discarded tail drafts[num_accepted+1..].
-        if let Err(e) = model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token)
-        {
+        if let Err(e) = model.dflash_stash_recycle(&mut a.seq, drafts, num_accepted, a.last_token) {
             tracing::warn!("dflash_stash_recycle: {e:#}");
         }
         // Echo: the target's own argmaxes verified[num_accepted+1..].
-        if let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token)
-        {
+        if let Err(e) = model.dflash_stash_echo(&mut a.seq, &verified, num_accepted, a.last_token) {
             tracing::warn!("dflash_stash_echo: {e:#}");
         }
     }
@@ -903,7 +903,14 @@ fn commit_tree_win(
             .iter()
             .enumerate()
             .filter(|(_, c)| c.load(Relaxed) > 0)
-            .map(|(d, c)| format!("d{}{}:{}", d, if d == 7 { "+" } else { "" }, c.load(Relaxed)))
+            .map(|(d, c)| {
+                format!(
+                    "d{}{}:{}",
+                    d,
+                    if d == 7 { "+" } else { "" },
+                    c.load(Relaxed)
+                )
+            })
             .collect();
         tracing::info!(
             "DFLASH_TREE WIN #{wins}: branch={} fork_depth={fork_depth} path={n_path} \

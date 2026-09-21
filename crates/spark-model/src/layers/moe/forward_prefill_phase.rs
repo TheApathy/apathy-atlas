@@ -37,6 +37,43 @@ pub(super) enum SharedPrefillArm {
 }
 
 impl MoeLayer {
+    // Native-HIP (gfx1151) has NO ported grouped-GEMM MoE path:
+    // moe_fp8_grouped_gemm is a compile stub (kernels/strix-hip/.../
+    // moe_fp8_grouped_gemm.cu writes nothing) and the grouped prefill
+    // pipeline launches additional kernels that are null on the HIP module
+    // set → cuLaunchKernel hipErrorInvalidHandle at layer 0 for any prefill
+    // chunk >64 tokens. forward_batched is the correct, complete per-token
+    // path (its kernels are all bit-exact-verified on HIP) — route there for
+    // ALL token counts on atlas_hip. SCALE keeps grouped (its symlinked
+    // grouped GEMM is real via PTX-recompile); NVIDIA byte-unchanged.
+    //
+    // EXCEPTION: the FP8 routed grouped GEMM (moe_fp8_grouped_gemm) has now
+    // been ported to HIP WMMA (kernels/strix-hip/common/moe_fp8_grouped_gemm.cu
+    // — weight-stationary per-expert, register-prefetch double-buffered, two-
+    // level FP32 block-scale accumulation matching the GB10/oracle numerics),
+    // so long FP8 prefills (>64 tokens) take the grouped path on atlas_hip too
+    // — amortizing the ~50 GB/layer per-token weight re-streaming of
+    // forward_batched. The BF16-dequant grouped GEMM is NOT ported (its
+    // strix-hip kernel is still absent), so its branch stays HIP-batched.
+    /// N-token prefill via grouped GEMM: sort-by-expert → tensor-core GEMM per expert.
+    ///
+    /// Each expert's weight matrix is loaded once (not per-token), cutting LPDDR5X
+    /// reads from ~6 GB (GEMV) to ~150 MB (grouped GEMM) at N=1024.
+    ///
+    /// Pipeline: gate → topK → sort → grouped gate/up GEMM → SiLU → grouped down GEMM
+    ///           → unpermute + weighted reduce → shared expert blend.
+    /// Shared expert uses checkpoint-native BF16 when installed, otherwise W4A16.
+    #[allow(unused_assignments)]
+    pub fn forward_prefill(
+        &self,
+        input: DevicePtr, // [num_tokens, H] BF16 — normed MoE input
+        num_tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.forward_prefill_observed(input, num_tokens, ctx, stream, None)
+    }
+
     /// Resolve the shared-expert prefill GEMM arm from `ATLAS_MOE_SHARED_K64`.
     ///
     /// `unset`/`0` → K32 (unchanged behaviour, the default), `1` → K64,
@@ -157,6 +194,47 @@ impl MoeLayer {
 }
 
 impl MoeLayer {
+    #[allow(clippy::too_many_arguments)]
+    fn shared_fp8_prefill_gemm(
+        &self,
+        input: DevicePtr,
+        weight: DevicePtr,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+        ctx: &ForwardContext,
+    ) -> Result<()> {
+        if self.exl3.is_some() {
+            // Isolate predequant + FP8 MMA: keep BF16 activations and one
+            // launch instead of inheriting the default LDMAB quantizer.
+            ops::fp8_gemm_n128_bf16_input(
+                ctx.gpu,
+                self.fp8_gemm_k,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+        } else {
+            ops::fp8_gemm_n128(
+                ctx.gpu,
+                self.fp8_gemm_k,
+                input,
+                weight,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )
+        }
+    }
+
     /// Shared-expert path of the prefill pipeline (gate + up GEMM → SiLU →
     /// down GEMM). Runs sequentially on the supplied `aux` stream when
     /// `use_overlap == false`; otherwise issues an event so the routed
@@ -176,6 +254,7 @@ impl MoeLayer {
         stream: u64,
         use_overlap: bool,
         ctx: &ForwardContext,
+        capture: Option<&mut super::vision_l0_dump::MoeCapture>,
     ) -> Result<()> {
         if shared_inter == 0 {
             return Ok(());
@@ -189,6 +268,23 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        if self.run_native_fp8_shared_expert_observed(
+            input,
+            n,
+            h,
+            shared_inter,
+            shared_gate_out,
+            shared_up_out,
+            shared_down_out,
+            ctx,
+            aux,
+            capture,
+        )? {
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         if self.run_bf16_shared_expert(
             input,
             n,
@@ -208,9 +304,7 @@ impl MoeLayer {
 
         // Shared gate + up GEMM on aux stream
         if let (Some(sg_fp8), Some(su_fp8)) = (self.shared_gate_fp8, self.shared_up_fp8) {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.shared_fp8_prefill_gemm(
                 input,
                 sg_fp8,
                 shared_gate_out,
@@ -218,10 +312,9 @@ impl MoeLayer {
                 shared_inter,
                 h,
                 aux,
+                ctx,
             )?;
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.shared_fp8_prefill_gemm(
                 input,
                 su_fp8,
                 shared_up_out,
@@ -229,6 +322,7 @@ impl MoeLayer {
                 shared_inter,
                 h,
                 aux,
+                ctx,
             )?;
         } else if let (Some(sg), Some(su), Some(_sd)) =
             (&self.shared_gate_t, &self.shared_up_t, &self.shared_down_t)
@@ -274,9 +368,7 @@ impl MoeLayer {
             aux,
         )?;
         if let Some(sd_fp8) = self.shared_down_fp8 {
-            ops::fp8_gemm_n128(
-                ctx.gpu,
-                self.fp8_gemm_k,
+            self.shared_fp8_prefill_gemm(
                 shared_gate_out,
                 sd_fp8,
                 shared_down_out,
@@ -284,6 +376,7 @@ impl MoeLayer {
                 h,
                 shared_inter,
                 aux,
+                ctx,
             )?;
         } else if let Some(sd) = &self.shared_down_t {
             self.shared_prefill_gemm(

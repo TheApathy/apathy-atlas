@@ -340,7 +340,7 @@ pub fn start_chunked_prefill(
         // Skipped when the images were already batch-encoded by the co-dispatch
         // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
         // for the whole tick; here we only set the per-stream slice base below.
-        if vision_slice.is_none() && !image_pixels.is_empty() {
+        if vision_slice.is_none() {
             model.prepare_vision_embed(&image_pixels)?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
@@ -351,8 +351,10 @@ pub fn start_chunked_prefill(
             // request's image embeddings — lag-by-one cross-image contamination
             // (and torn reads / illegal access under interleaved load). Make
             // prefill_stream wait for the encode to complete before injecting.
-            model.record_event(prefill_event, model.default_stream())?;
-            model.stream_wait_event(prefill_stream, prefill_event)?;
+            if !image_pixels.is_empty() {
+                model.record_event(prefill_event, model.default_stream())?;
+                model.stream_wait_event(prefill_stream, prefill_event)?;
+            }
         }
 
         // EP: broadcast chunk 0 tokens to worker.

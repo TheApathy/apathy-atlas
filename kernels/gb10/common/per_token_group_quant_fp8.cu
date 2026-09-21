@@ -50,10 +50,13 @@ extern "C" __global__ void per_token_group_quant_fp8(
     const unsigned int k_start = kg * FP8_GROUP_K;
     const unsigned int tid = threadIdx.x;
 
-    // 1. Load one element per thread, compute abs.
+    // 1. Load one element per thread and keep it live across the reduction.
+    // Reusing the register below avoids a second BF16 global-memory read.
+    float my_value = 0.0f;
     float my_abs = 0.0f;
     if (tid < FP8_GROUP_K && k_start + tid < K) {
-        my_abs = fabsf(__bfloat162float(A[m * K + k_start + tid]));
+        my_value = __bfloat162float(A[m * K + k_start + tid]);
+        my_abs = fabsf(my_value);
     }
 
     // 2. Reduce max over 128 threads (4 warps).
@@ -83,7 +86,7 @@ extern "C" __global__ void per_token_group_quant_fp8(
 
     // 3. Quantize each element to FP8 E4M3.
     if (tid < FP8_GROUP_K && k_start + tid < K) {
-        float v = __bfloat162float(A[m * K + k_start + tid]) / smem_scale;
+        float v = my_value / smem_scale;
         // Saturating clamp + E4M3 round-to-nearest.
         v = fmaxf(fminf(v, FP8_E4M3_MAX), -FP8_E4M3_MAX);
 #if defined(__SCALE__) || defined(__HIP_PLATFORM_AMD__)

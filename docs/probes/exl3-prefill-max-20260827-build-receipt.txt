@@ -1,0 +1,7 @@
+schema atlas-prefill-max-build-v1
+target_hw gb10
+target_model deepseek-v4-flash
+target_quant nvfp4
+git_commit a40ed27e0d2f00c03e7536bd4df84e18642d6b71
+source_sha256 a5862ba056e8201172cf8a267f5b8987dcfd73270ba5d9d99efb32983e703670
+binary_sha256 1b51de59ab530f14a51d8c2799371cdf72513989a14ccee328e0113554bfb246

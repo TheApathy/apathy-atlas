@@ -5,6 +5,17 @@
 use crate::openai::*;
 
 #[test]
+fn legacy_completions_preserves_response_format_for_handler_refusal() {
+    let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "test",
+        "prompt": "hi",
+        "response_format": {"type": "json_object"}
+    }))
+    .unwrap();
+    assert_eq!(req.response_format.unwrap()["type"], "json_object");
+}
+
+#[test]
 fn completion_request_echo_logprobs_n_deser() {
     let req: CompletionRequest = serde_json::from_value(serde_json::json!({
         "model": "test",
@@ -73,6 +84,7 @@ fn completion_response_carries_system_fingerprint_and_optional_logprobs() {
         completion_tokens_details: None,
         time_to_first_token_ms: 0.0,
         response_tokens_per_second: 0.0,
+        atlas_engine: None,
     };
     let resp = CompletionResponse::new("m", "hi".into(), usage, "stop");
     let v = serde_json::to_value(&resp).expect("serialize");

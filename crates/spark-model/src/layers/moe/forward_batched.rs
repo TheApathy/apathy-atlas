@@ -132,7 +132,9 @@ impl MoeLayer {
             let indices_dev = scratch;
             let weights_dev = scratch.offset(top_k as usize * 4);
 
-            if let Some(tid2eid) = self.tid2eid_dev {
+            if self.route_deepseek_visual(ctx, gate_t, indices_dev, weights_dev, t, 1, stream)? {
+                // Mixed-token routing completed before any hash-table lookup.
+            } else if let Some(tid2eid) = self.tid2eid_dev {
                 // DeepSeek-V4 hash routing: expert selection is static
                 // `tid2eid[token_id]`; the learned gate weights the selection.
                 // token IDs are uploaded [num_tokens] u32 in the SAME order as

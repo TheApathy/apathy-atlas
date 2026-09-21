@@ -12,6 +12,11 @@ use crate::api::inference_types::RepetitionDetectionParams;
 #[allow(dead_code)]
 pub struct CompletionRequest {
     pub model: String,
+    /// Legacy completions has no constrained-decoding implementation. Keep
+    /// the raw field so the handler can reject it instead of silently
+    /// serving unconstrained text.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
     /// M2 per-request LoRA routing: optional resident adapter NAME to apply to
     /// this request (independent of `model`). Unset = defer to installed active
     /// (byte-identical to today); unknown = 400. See `ChatCompletionRequest`.

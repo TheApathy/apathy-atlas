@@ -6,19 +6,23 @@
 //! The 2026-07-04 small-M routing (`dense_ffn::w4a16_prefill_gemm`,
 //! `wide_verify_gemm`) put `w4a16_gemm_t` and — for the first time in
 //! production — `w4a16_gemm_t_k64` on the verify hot path. This oracle runs
-//! all transposed kernels against the base `w4a16_gemm` (battle-tested,
-//! months in production) on IDENTICAL random NVFP4 data:
+//! all transposed kernels plus the experimental pre-dequantized FP8 path
+//! against the base `w4a16_gemm` (battle-tested, months in production) on
+//! IDENTICAL random NVFP4 data:
 //!
 //!   C_base = A · dequant(B)        (base, non-transposed [N, K/2] layout)
 //!   C_t    = A · dequant(B_t)      (w4a16_gemm_t,      transposed [K/2, N])
 //!   C_k64  = A · dequant(B_t)      (w4a16_gemm_t_k64)
 //!   C_m128 = A · dequant(B_t)      (w4a16_gemm_t_m128)
+//!   C_fp8  = A · predequant_fp8(B) (fp8_gemm_t, BF16 A)
 //!
 //! B_t is built by the SAME byte-transpose as `QuantizedWeight::
 //! transpose_for_gemm`, so a mismatch here is a KERNEL bug, not a layout bug.
-//! GATE per kernel: cosine vs base ≥ 0.999 AND max |Δ| within BF16
-//! reorder noise. A real defect (wrong scale index, dropped K-step, bad
-//! fragment) collapses cosine to ~0.
+//! The exact transposed kernels gate on cosine vs base ≥ 0.999 and bit identity
+//! with `w4a16_gemm_t`. The numerics-changing FP8 arm gates only on cosine ≥
+//! 0.999; end-to-end logit/output/tool parity is still required before enabling
+//! that path. A real defect (wrong scale index, dropped K-step, bad fragment)
+//! collapses cosine to ~0.
 //!
 //!   cargo run -p spark-model --release --example w4a16_parity_microtest \
 //!       --features cuda,gpu-examples
@@ -34,6 +38,7 @@
 
 use anyhow::Result;
 use half::bf16;
+use spark_model::layers::ops;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
@@ -139,6 +144,8 @@ fn main() -> Result<()> {
     let g: &dyn GpuBackend = &g0;
 
     let base_k = g.kernel("w4a16", "w4a16_gemm")?;
+    let predequant_k = g.kernel("w4a16", "predequant_nvfp4_to_fp8")?;
+    let fp8_k = g.kernel("w4a16", "fp8_gemm_t")?;
     // (name, handle, grid geometry as fn of (n, k... unused), uses transposed B)
     let t_kernels: Vec<(&str, KernelHandle)> = [
         ("w4a16_gemm_t       ", "w4a16_gemm_t"),
@@ -192,6 +199,8 @@ fn main() -> Result<()> {
         let bst = up(g, &bst_host)?;
         let c_base = g.alloc(m * n * 2)?;
         let c_test = g.alloc(m * n * 2)?;
+        let b_fp8 = g.alloc(n * k)?;
+        let c_fp8 = g.alloc(m * n * 2)?;
 
         // Base reference: grid (N/64, M/64).
         launch(
@@ -258,15 +267,39 @@ fn main() -> Result<()> {
                 }
             );
         }
+
+        // Experimental shared-expert arm: isolate the effect of converting the
+        // weight mirror to E4M3. Keep A in BF16 so this does not inherit the
+        // default `fp8_gemm_n128` activation quantizer.
+        ops::predequant_nvfp4_to_fp8(g, predequant_k, b, bs, 0.01, b_fp8, n as u32, k as u32, 0)?;
+        ops::fp8_gemm_n128_bf16_input(g, fp8_k, a, b_fp8, c_fp8, m as u32, n as u32, k as u32, 0)?;
+        g.synchronize(0)?;
+        let fp8_out = dn_bf16(g, c_fp8, m * n)?;
+        let fp8_cos = cos(&fp8_out, &base_out);
+        let fp8_max_d = fp8_out
+            .iter()
+            .zip(&base_out)
+            .fold(0f32, |acc, (x, y)| acc.max((x - y).abs()));
+        let fp8_ok = fp8_cos >= PASS_COS;
+        all_ok &= fp8_ok;
+        eprintln!(
+            "{label}  predequant_fp8      cos={fp8_cos:.7}  max|Δ|={fp8_max_d:.5}  {}",
+            if fp8_ok {
+                "PASS (kernel-level; end-to-end parity still required)"
+            } else {
+                "FAIL ← FP8 mirror disagrees with W4A16 base"
+            }
+        );
+
         eprintln!();
-        for p in [a, b, bs, bt, bst, c_base, c_test] {
+        for p in [a, b, bs, bt, bst, c_base, c_test, b_fp8, c_fp8] {
             let _ = g.free(p);
         }
     }
 
     eprintln!(
-        "W4A16 parity GATE (cos≥{PASS_COS} vs base AND bit-identical to \
-         w4a16_gemm_t): {}",
+        "W4A16 parity GATE (exact arms: cos≥{PASS_COS} and bit-identical to \
+         w4a16_gemm_t; FP8 arm: cos≥{PASS_COS}): {}",
         if all_ok { "PASS" } else { "FAIL" }
     );
     if !all_ok {

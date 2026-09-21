@@ -77,6 +77,26 @@ pub struct Usage {
     /// Atlas perf extensions; encoders may ignore.
     pub time_to_first_token_ms: f64,
     pub response_tokens_per_second: f64,
+    /// Request-scoped scheduler evidence for benchmark classification.
+    pub engine: Option<EngineUsage>,
+}
+
+/// Counts observed on this request's actual scheduler path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EngineUsage {
+    pub speculative_steps: u64,
+    pub serial_tokens: u64,
+    pub low_gear_steps: u64,
+}
+
+impl EngineUsage {
+    pub fn merge(&mut self, other: Self) {
+        self.speculative_steps = self
+            .speculative_steps
+            .saturating_add(other.speculative_steps);
+        self.serial_tokens = self.serial_tokens.saturating_add(other.serial_tokens);
+        self.low_gear_steps = self.low_gear_steps.saturating_add(other.low_gear_steps);
+    }
 }
 
 /// Why generation stopped. `Other` preserves unknown engine reasons

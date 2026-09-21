@@ -36,9 +36,30 @@ fn with_token_ids_stamps_first_choice() {
         completion_tokens_details: None,
         time_to_first_token_ms: 0.0,
         response_tokens_per_second: 0.0,
+        atlas_engine: None,
     };
     let chunk = ChatCompletionChunk::usage_only_chunk("m", "id", usage).with_token_ids(vec![1, 2]);
     assert!(chunk.choices.is_empty());
+}
+
+#[test]
+fn atlas_engine_usage_classifies_request_scoped_scheduler_counts() {
+    let cases = [
+        (0, 0, 0, "UNVERIFIED"),
+        (0, 5, 0, "SERIAL"),
+        (4, 0, 0, "SPECULATIVE"),
+        (4, 2, 0, "MIXED"),
+        (0, 5, 2, "LOW_GEAR"),
+        (4, 5, 2, "LOW_GEAR_MIXED"),
+    ];
+    for (speculative_steps, serial_tokens, low_gear_steps, expected) in cases {
+        let usage = crate::openai::AtlasEngineUsage::from(crate::ir::EngineUsage {
+            speculative_steps,
+            serial_tokens,
+            low_gear_steps,
+        });
+        assert_eq!(usage.classification, expected);
+    }
 }
 
 // ── reasoning wire format: exactly one field ────────────────────────

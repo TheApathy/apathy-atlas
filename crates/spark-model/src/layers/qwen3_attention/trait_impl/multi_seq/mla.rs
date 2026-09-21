@@ -91,7 +91,12 @@ impl Qwen3AttentionLayer {
             // The FP8 pair is the floor — the NVFP4 mirrors are an
             // optimization the caller gates on separately.
             if n <= max_m && w8.0 != 0 && w8_ld.0 != 0 {
-                return Some(BatchGemv { w8, w8_ld, w4, w4_ld });
+                return Some(BatchGemv {
+                    w8,
+                    w8_ld,
+                    w4,
+                    w4_ld,
+                });
             }
         }
         None
@@ -115,7 +120,11 @@ impl Qwen3AttentionLayer {
         let o_groups = c.fwd.config.o_groups.max(1) as u32;
         let latent_dim = o_groups * mla.o_lora_rank as u32;
         let row = |elems: u32| n * elems as usize * c.bf16;
-        let need = row(q_dim) * 2 + row(kv_dim) * 2 + row(q_lora) + row(latent_dim);
+        let need = self.ms_mla_v4_comp_scratch_prefix(c)
+            + row(q_dim) * 2
+            + row(kv_dim) * 2
+            + row(q_lora)
+            + row(latent_dim);
         // ATLAS_MLA_NO_BATCH=1: force the per-row fallback, for A/B testing
         // whether the batched-GEMV projections perturb verify argmax vs the
         // single-row decode path (greedy-losslessness check).
@@ -133,6 +142,57 @@ impl Qwen3AttentionLayer {
             && mla.wo_b_fp8.is_some()
             && c.fwd.buffers.expert_up_out_bytes() >= need;
         (ok, need)
+    }
+
+    /// Bytes at the front of `expert_up_out` that an interleaved compressor
+    /// append may overwrite. The V4 append uses that buffer for its dense
+    /// compressor projection, while the batched MLA route normally starts its
+    /// Q/K workspace at the same address. Keep the two regions disjoint for a
+    /// contiguous gamma verify; ordinary co-batches do not advance one shared
+    /// compressor frontier and therefore need no reservation.
+    fn ms_mla_v4_comp_scratch_prefix(&self, c: &MultiSeqCtx<'_>) -> usize {
+        if !self.ms_mla_v4_verify_crosses_comp_boundary(c) {
+            return 0;
+        }
+        self.mla
+            .as_ref()
+            .and_then(|m| m.compressor.as_ref())
+            .map(|comp| {
+                let rows = if comp.is_csa {
+                    comp.ratio.saturating_mul(2)
+                } else {
+                    comp.ratio
+                };
+                rows.saturating_mul(comp.proj_dim).saturating_mul(c.bf16)
+            })
+            .unwrap_or(0)
+    }
+
+    /// A compressed block can affect this verify only when one of its rows
+    /// closes a compression window. Between boundaries the current pool is
+    /// already complete for every row; defer ring maintenance to post-accept
+    /// catch-up so rejected rows never needlessly touch speculative state.
+    fn ms_mla_v4_verify_crosses_comp_boundary(&self, c: &MultiSeqCtx<'_>) -> bool {
+        let Some(base) = c.verify_base_pos else {
+            return false;
+        };
+        let Some(comp) = self.mla.as_ref().and_then(|m| m.compressor.as_ref()) else {
+            return false;
+        };
+        comp.ratio > 0 && (base + c.n) / comp.ratio != base / comp.ratio
+    }
+
+    /// End (exclusive) of the maximal row group that observes one immutable
+    /// compressed-pool version. A boundary row starts the next version, so it
+    /// belongs to the group after the split; when `lo` itself is a boundary,
+    /// search begins at `lo + 1` and that row remains in the current group.
+    fn ms_mla_v4_comp_group_end(base: usize, lo: usize, n: usize, ratio: usize) -> usize {
+        debug_assert!(lo < n && ratio > 0);
+        let mut hi = lo + 1;
+        while hi < n && !(base + hi + 1).is_multiple_of(ratio) {
+            hi += 1;
+        }
+        hi
     }
 
     /// Whether this layer can serve a DDTree tree-verify row batch.
@@ -248,8 +308,7 @@ impl Qwen3AttentionLayer {
                 // appends itself (args.pos above) — the speculate must then
                 // only SNAPSHOT the frontiers so the post-accept restore can
                 // rewind; appending here too would double-append.
-                let appends = self.ms_mla_v4_batch_ok(c).0;
-                self.v4_compress_speculate(c.fwd, base, rows, eps, appends, stream)?;
+                self.v4_compress_speculate(c.fwd, base, rows, eps, false, stream)?;
             }
         }
 
@@ -460,7 +519,9 @@ impl Qwen3AttentionLayer {
                     // plain greedy). Per-row `pos` makes the append↔attention
                     // ordering identical to plain; the post-accept
                     // restore+catchup still rewinds rejected rows' appends.
-                    pos: c.verify_base_pos.map(|b| (b + i) as u32),
+                    pos: self
+                        .ms_mla_v4_verify_crosses_comp_boundary(c)
+                        .then(|| (c.verify_base_pos.unwrap() + i) as u32),
                     skip_qkv: false,
                     attn_dest: None,
                 };
@@ -473,7 +534,8 @@ impl Qwen3AttentionLayer {
         // `batch_ok` above already proved a pair covers `n`.
         let gemv = gemv.expect("batch_ok implies a batched-GEMV pair for n");
 
-        let scratch = c.fwd.buffers.expert_up_out();
+        let comp_prefix = self.ms_mla_v4_comp_scratch_prefix(c);
+        let scratch = c.fwd.buffers.expert_up_out().offset(comp_prefix);
         let q_batch = scratch; //                                  [n, q_dim]
         let attn_batch = q_batch.offset(row(q_dim)); //            [n, q_dim]
         let kv_batch = attn_batch.offset(row(q_dim)); //           [n, kv_dim]
@@ -530,9 +592,7 @@ impl Qwen3AttentionLayer {
         // `=0` restores the drifted _ld/batchm kernels for A/B.
         let verify_exact_gemv = {
             static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *E.get_or_init(|| {
-                std::env::var("ATLAS_VERIFY_EXACT_GEMV").as_deref() != Ok("0")
-            })
+            *E.get_or_init(|| std::env::var("ATLAS_VERIFY_EXACT_GEMV").as_deref() != Ok("0"))
         } && self.w8a16_gemv_batchm_exact_k.0 != 0
             && self.w4a16_gemv_grouped_batchm_k.0 != 0
             && n <= 8;
@@ -585,18 +645,18 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else {
-        ops::w8a16_gemv_batch4(
-            gpu,
-            gemv.w8,
-            c.normed,
-            wqa.weight,
-            wqa.row_scale,
-            ql_batch,
-            n as u32,
-            q_lora,
-            h,
-            stream,
-        )?;
+            ops::w8a16_gemv_batch4(
+                gpu,
+                gemv.w8,
+                c.normed,
+                wqa.weight,
+                wqa.row_scale,
+                ql_batch,
+                n as u32,
+                q_lora,
+                h,
+                stream,
+            )?;
         }
         ops::rms_norm(
             gpu,
@@ -619,18 +679,8 @@ impl Qwen3AttentionLayer {
             // single-row K order.
             if v2_w4.0 != 0 && q_lora.is_multiple_of(32) {
                 ops::w4a16_gemv_grouped_batchm_v2(
-                    gpu,
-                    v2_w4,
-                    ql_batch,
-                    wqb4,
-                    q_batch,
-                    n as u32,
-                    q_dim,
-                    q_lora,
-                    q_lora,
-                    q_dim,
-                    q_dim,
-                    stream,
+                    gpu, v2_w4, ql_batch, wqb4, q_batch, n as u32, q_dim, q_lora, q_lora, q_dim,
+                    q_dim, stream,
                 )?;
             } else {
                 ops::w4a16_gemv_grouped_batchm(
@@ -650,30 +700,39 @@ impl Qwen3AttentionLayer {
             }
         } else if nv4_ok && let Some(ref wqb4) = mla.wq_b_nvfp4 {
             ops::w4a16_gemv_batchm(
-                gpu,
-                gemv.w4,
-                ql_batch,
-                wqb4,
-                q_batch,
-                n as u32,
-                q_dim,
-                q_lora,
-                stream,
+                gpu, gemv.w4, ql_batch, wqb4, q_batch, n as u32, q_dim, q_lora, stream,
             )?;
         } else {
             let wqb = mla.wq_b_fp8.as_ref().unwrap();
-            ops::w8a16_gemv_batch4(
-                gpu,
-                gemv.w8,
-                ql_batch,
-                wqb.weight,
-                wqb.row_scale,
-                q_batch,
-                n as u32,
-                q_dim,
-                q_lora,
-                stream,
-            )?;
+            if verify_exact_gemv {
+                ops::w8a16_gemv_batchm_exact(
+                    gpu,
+                    self.w8a16_gemv_batchm_exact_k,
+                    ql_batch,
+                    wqb.weight,
+                    wqb.row_scale,
+                    q_batch,
+                    n as u32,
+                    q_dim,
+                    q_lora,
+                    q_lora,
+                    q_dim,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemv_batch4(
+                    gpu,
+                    gemv.w8,
+                    ql_batch,
+                    wqb.weight,
+                    wqb.row_scale,
+                    q_batch,
+                    n as u32,
+                    q_dim,
+                    q_lora,
+                    stream,
+                )?;
+            }
         }
         // q_b_norm: per-head unweighted RMSNorm (see attention_forward_v4).
         ops::rms_norm(
@@ -732,18 +791,18 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else {
-        ops::w8a16_gemv_batch4(
-            gpu,
-            gemv.w8,
-            c.normed,
-            wkv.weight,
-            wkv.row_scale,
-            kv_batch,
-            n as u32,
-            kv_dim,
-            h,
-            stream,
-        )?;
+            ops::w8a16_gemv_batch4(
+                gpu,
+                gemv.w8,
+                c.normed,
+                wkv.weight,
+                wkv.row_scale,
+                kv_batch,
+                n as u32,
+                kv_dim,
+                h,
+                stream,
+            )?;
         }
         ops::rms_norm(
             gpu,
@@ -821,7 +880,14 @@ impl Qwen3AttentionLayer {
             //
             // ATLAS_MLA_ATTN_BATCH=0 restores the per-row launches (the kernel
             // change is a no-op at num_seqs=1, so that leg is unaffected).
-            let attn_batched = {
+            // A compressor pool has one mutable frontier. Advancing all gamma
+            // rows before one batched attention launch is not causal for CSA:
+            // a later boundary rewrites the overlap block that an earlier row
+            // must still read in its previous form. Keep Q/K and raw cache
+            // preparation batched, but append and consume compressed state one
+            // row at a time, exactly like plain decode.
+            let interleave_comp = self.ms_mla_v4_verify_crosses_comp_boundary(c);
+            let attn_batched = !interleave_comp && {
                 static AB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 *AB.get_or_init(|| std::env::var("ATLAS_MLA_ATTN_BATCH").as_deref() != Ok("0"))
             };
@@ -844,6 +910,52 @@ impl Qwen3AttentionLayer {
                     c.fwd.buffers.splitk_workspace(),
                     stream,
                 )?;
+            } else if interleave_comp {
+                let base = c
+                    .verify_base_pos
+                    .expect("interleaved compressor is verify-only");
+                let ratio = mla
+                    .compressor
+                    .as_ref()
+                    .expect("interleaved compressor has weights")
+                    .ratio;
+                let mut lo = 0usize;
+                while lo < n {
+                    let hi = Self::ms_mla_v4_comp_group_end(base, lo, n, ratio);
+                    // Fill every ring row in order. At most the first row of
+                    // this group closes a window; after that append, the pool
+                    // remains immutable until `hi`, so one batched attention
+                    // launch is causal for all rows in [lo, hi).
+                    for i in lo..hi {
+                        self.v4_compress_append(
+                            c.fwd,
+                            c.normed.offset(i * c.h * bf16),
+                            (base + i) as u32,
+                            eps,
+                            stream,
+                        )?;
+                    }
+                    self.run_paged_decode(
+                        gpu,
+                        q_batch.offset(lo * q_dim as usize * bf16),
+                        kv_cache,
+                        attn_batch.offset(lo * q_dim as usize * bf16),
+                        meta.block_table
+                            .offset(lo * meta.max_blocks_per_seq as usize * 4),
+                        meta.seq_len.offset(lo * 4),
+                        meta.max_blocks_per_seq,
+                        (hi - lo) as u32,
+                        nq,
+                        c.nkv,
+                        hd,
+                        bs as u32,
+                        inv_sqrt_d,
+                        q_dim,
+                        c.fwd.buffers.splitk_workspace(),
+                        stream,
+                    )?;
+                    lo = hi;
+                }
             } else {
                 for i in 0..n {
                     self.run_paged_decode(
@@ -906,7 +1018,9 @@ impl Qwen3AttentionLayer {
                     eps,
                     bs,
                     stream,
-                    pos: None,
+                    pos: self
+                        .ms_mla_v4_verify_crosses_comp_boundary(c)
+                        .then(|| (c.verify_base_pos.unwrap() + i) as u32),
                     skip_qkv: true,
                     attn_dest: Some(attn_batch.offset(i * q_dim as usize * bf16)),
                 };
@@ -974,15 +1088,16 @@ impl Qwen3AttentionLayer {
                             weight: woa4
                                 .weight
                                 .offset((g as usize) * (o_lora as usize) * (group_in as usize) / 2),
-                            weight_scale: woa4
-                                .weight_scale
-                                .offset((g as usize) * (o_lora as usize) * (group_in as usize / 16)),
+                            weight_scale: woa4.weight_scale.offset(
+                                (g as usize) * (o_lora as usize) * (group_in as usize / 16),
+                            ),
                             weight_scale_2: woa4.weight_scale_2,
                             input_scale: woa4.input_scale,
                             weight_scale_2_vec: if woa4.weight_scale_2_vec.is_null() {
                                 woa4.weight_scale_2_vec
                             } else {
-                                woa4.weight_scale_2_vec.offset((g as usize) * (o_lora as usize) * 4)
+                                woa4.weight_scale_2_vec
+                                    .offset((g as usize) * (o_lora as usize) * 4)
                             },
                         };
                         ops::w4a16_gemv(
@@ -1057,9 +1172,7 @@ impl Qwen3AttentionLayer {
         // capture-chain experiments (pair it with a bit-exact MoE leg).
         let oproj_batch_exact = {
             static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *E.get_or_init(|| {
-                std::env::var("ATLAS_OPROJ_BATCH_EXACT").as_deref() == Ok("1")
-            })
+            *E.get_or_init(|| std::env::var("ATLAS_OPROJ_BATCH_EXACT").as_deref() == Ok("1"))
         } || verify_exact_gemv;
         if oproj_batch_exact
             && self.w4a16_gemv_grouped_batchm_k.0 != 0
@@ -1069,18 +1182,8 @@ impl Qwen3AttentionLayer {
             // wo_a: block-diagonal, rows_per_group = o_lora.
             if v2_w4.0 != 0 && group_in.is_multiple_of(32) {
                 ops::w4a16_gemv_grouped_batchm_v2(
-                    gpu,
-                    v2_w4,
-                    attn_batch,
-                    woa4,
-                    ol_batch,
-                    n as u32,
-                    latent_dim,
-                    group_in,
-                    q_dim,
-                    latent_dim,
-                    o_lora,
-                    stream,
+                    gpu, v2_w4, attn_batch, woa4, ol_batch, n as u32, latent_dim, group_in, q_dim,
+                    latent_dim, o_lora, stream,
                 )?;
             } else {
                 ops::w4a16_gemv_grouped_batchm(
@@ -1102,17 +1205,7 @@ impl Qwen3AttentionLayer {
             // (rows_per_group = N ⇒ every row reads A cols [0..K)).
             if v2_w4.0 != 0 && latent_dim.is_multiple_of(32) {
                 ops::w4a16_gemv_grouped_batchm_v2(
-                    gpu,
-                    v2_w4,
-                    ol_batch,
-                    wob4,
-                    o_out,
-                    n as u32,
-                    h,
-                    latent_dim,
-                    latent_dim,
-                    h,
-                    h,
+                    gpu, v2_w4, ol_batch, wob4, o_out, n as u32, h, latent_dim, latent_dim, h, h,
                     stream,
                 )?;
             } else {
@@ -1161,48 +1254,74 @@ impl Qwen3AttentionLayer {
             for g in 0..o_groups {
                 let w_off = (g as usize) * (o_lora as usize) * (group_in as usize);
                 let s_off = (g as usize) * (o_lora as usize / 128) * (group_in as usize / 128) * 4;
-                ops::w8a16_gemv_batch4_ld(
-                    gpu,
-                    gemv.w8_ld,
-                    attn_batch.offset(g as usize * group_in as usize * bf16),
-                    woa.weight.offset(w_off),
-                    woa.row_scale.offset(s_off),
-                    ol_batch.offset(g as usize * o_lora as usize * bf16),
-                    n as u32,
-                    o_lora,
-                    group_in,
-                    q_dim,
-                    latent_dim,
-                    stream,
-                )?;
+                if verify_exact_gemv {
+                    ops::w8a16_gemv_batchm_exact(
+                        gpu,
+                        self.w8a16_gemv_batchm_exact_k,
+                        attn_batch.offset(g as usize * group_in as usize * bf16),
+                        woa.weight.offset(w_off),
+                        woa.row_scale.offset(s_off),
+                        ol_batch.offset(g as usize * o_lora as usize * bf16),
+                        n as u32,
+                        o_lora,
+                        group_in,
+                        q_dim,
+                        latent_dim,
+                        stream,
+                    )?;
+                } else {
+                    ops::w8a16_gemv_batch4_ld(
+                        gpu,
+                        gemv.w8_ld,
+                        attn_batch.offset(g as usize * group_in as usize * bf16),
+                        woa.weight.offset(w_off),
+                        woa.row_scale.offset(s_off),
+                        ol_batch.offset(g as usize * o_lora as usize * bf16),
+                        n as u32,
+                        o_lora,
+                        group_in,
+                        q_dim,
+                        latent_dim,
+                        stream,
+                    )?;
+                }
             }
         }
         if nv4_ok && let Some(ref wob4) = mla.wo_b_nvfp4 {
             ops::w4a16_gemv_batchm(
-                gpu,
-                gemv.w4,
-                ol_batch,
-                wob4,
-                o_out,
-                n as u32,
-                h,
-                latent_dim,
-                stream,
+                gpu, gemv.w4, ol_batch, wob4, o_out, n as u32, h, latent_dim, stream,
             )?;
         } else {
             let wob = mla.wo_b_fp8.as_ref().unwrap();
-            ops::w8a16_gemv_batch4(
-                gpu,
-                gemv.w8,
-                ol_batch,
-                wob.weight,
-                wob.row_scale,
-                o_out,
-                n as u32,
-                h,
-                latent_dim,
-                stream,
-            )?;
+            if verify_exact_gemv {
+                ops::w8a16_gemv_batchm_exact(
+                    gpu,
+                    self.w8a16_gemv_batchm_exact_k,
+                    ol_batch,
+                    wob.weight,
+                    wob.row_scale,
+                    o_out,
+                    n as u32,
+                    h,
+                    latent_dim,
+                    latent_dim,
+                    h,
+                    stream,
+                )?;
+            } else {
+                ops::w8a16_gemv_batch4(
+                    gpu,
+                    gemv.w8,
+                    ol_batch,
+                    wob.weight,
+                    wob.row_scale,
+                    o_out,
+                    n as u32,
+                    h,
+                    latent_dim,
+                    stream,
+                )?;
+            }
         }
         mark("C_oproj", &mut t_phase)?;
         Ok(o_out)
@@ -1586,5 +1705,33 @@ impl Qwen3AttentionLayer {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compressed_attention_group_tests {
+    use super::Qwen3AttentionLayer;
+
+    fn ends(base: usize, n: usize, ratio: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut lo = 0;
+        while lo < n {
+            lo = Qwen3AttentionLayer::ms_mla_v4_comp_group_end(base, lo, n, ratio);
+            out.push(lo);
+        }
+        out
+    }
+
+    #[test]
+    fn groups_split_immediately_before_each_future_boundary_row() {
+        assert_eq!(ends(2047, 6, 4), vec![4, 6]);
+        assert_eq!(ends(2048, 6, 4), vec![3, 6]);
+        assert_eq!(ends(2046, 6, 4), vec![1, 5, 6]);
+    }
+
+    #[test]
+    fn a_boundary_at_row_zero_keeps_the_whole_hca_tail_batched() {
+        assert_eq!(ends(2047, 6, 128), vec![6]);
+        assert_eq!(ends(2046, 6, 128), vec![1, 6]);
     }
 }

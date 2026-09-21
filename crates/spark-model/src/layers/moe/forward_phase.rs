@@ -84,8 +84,8 @@ impl MoeLayer {
         if std::env::var("ATLAS_MOE_SPLITK").as_deref() == Ok("0") {
             return None;
         }
-        let base_finalize_ok = self.moe_gate_up_partial_finalize_k.0 != 0
-            && self.moe_down_partial_finalize_k.0 != 0;
+        let base_finalize_ok =
+            self.moe_gate_up_partial_finalize_k.0 != 0 && self.moe_down_partial_finalize_k.0 != 0;
         if !base_finalize_ok {
             return None;
         }

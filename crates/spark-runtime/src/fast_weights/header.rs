@@ -128,9 +128,7 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             // `.rank0.svh`), which the exl3_gemv kernels read as `__half*`;
             // converting those truncates mantissa bits 8-10. Mirrors the same
             // exemption in weights.rs (the slow loader).
-            "F16" if name.ends_with(".suh") || name.ends_with(".svh") => {
-                (WeightDtype::F16, false)
-            }
+            "F16" if name.ends_with(".suh") || name.ends_with(".svh") => (WeightDtype::F16, false),
             "F16" => (WeightDtype::BF16, true),
             "U8" => (WeightDtype::UInt8, false),
             // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP

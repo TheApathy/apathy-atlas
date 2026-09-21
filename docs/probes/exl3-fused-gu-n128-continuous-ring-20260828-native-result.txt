@@ -1,0 +1,24 @@
+receipt_sha256=b9a5bc28b00b5ae7e5feb1b8a332d1deecbecbb34b7434b507223d295c523bc5
+pair_id=3ac4b2b4ff9b2a4cd9e2a84cf5f2ae6be5480ec5b25787967749ce8f7279986d
+order=incumbent,candidate,candidate,incumbent timed=composed-chain
+ring_selectors=incumbent:0,candidate:1 packed_e4m3=1,1 fused_double_buffer=1,1 n256_down_double_buffer=1,1 n256_route_guard=0,0
+device_uuid=02254e145bc0ac76a972f7ac7550bd85 driver=13000 runtime=13000
+incumbent_candidate_ms=18.6459599,18.60744 candidate_candidate_ms=17.969368,17.5204
+continuous_ring_speedup=1.049694094928995 threshold=1.01 abba_samples=4
+candidate_throughput_over_incumbent=1.049694094928995 threshold=1.01
+input_hash=045af8f0e4830092 output_hash=d8157a923c73319d variant_outputs=exact
+intermediate_fp8=exact intermediate_scale=exact redzones=clean inputs=immutable
+raw_bf16=exact final_bf16=exact production_alias=exact malformed_cases=16 all_offsets=validated
+resource_census variant=incumbent symbol=exl3_w2a8_fused_gu_down_emit_n128 REG:128 STACK:0 SHARED:48128 LOCAL:0 spills=0
+sass_census variant=incumbent symbol=exl3_w2a8_fused_gu_down_emit_n128 instructions=2752 e4m3_f16=32 e4m3_f32=4 barriers=7 qmma=32 bf16_rounds=52 fp8_converts=36 swiglu_exp=4 fma=166 shfl=193 fadd=116 fmul=128 ffma=166 hadd2=44 hmul2=32 ldgsts=8 ldgdepbar=4 depbar_waits=4 zfill=2
+resource_census variant=incumbent symbol=exl3_w2a8_grouped_prefill_n256_k2_down REG:102 STACK:0 SHARED:19456 LOCAL:0 spills=0
+sass_census variant=incumbent symbol=exl3_w2a8_grouped_prefill_n256_k2_down instructions=896 e4m3_f16=16 e4m3_f32=0 barriers=3 qmma=16 bf16_rounds=32 fp8_converts=16 swiglu_exp=0 fma=0 shfl=16 fadd=32 fmul=40 ffma=0 hadd2=16 hmul2=16 ldgsts=2 ldgdepbar=2 depbar_waits=2 zfill=1
+resource_census variant=candidate symbol=exl3_w2a8_fused_gu_down_emit_n128 REG:128 STACK:0 SHARED:48128 LOCAL:0 spills=0
+sass_census variant=candidate symbol=exl3_w2a8_fused_gu_down_emit_n128 instructions=2784 e4m3_f16=32 e4m3_f32=4 barriers=7 qmma=32 bf16_rounds=52 fp8_converts=36 swiglu_exp=4 fma=166 shfl=193 fadd=116 fmul=128 ffma=166 hadd2=44 hmul2=32 ldgsts=8 ldgdepbar=4 depbar_waits=4 zfill=4
+resource_census variant=candidate symbol=exl3_w2a8_grouped_prefill_n256_k2_down REG:102 STACK:0 SHARED:19456 LOCAL:0 spills=0
+sass_census variant=candidate symbol=exl3_w2a8_grouped_prefill_n256_k2_down instructions=896 e4m3_f16=16 e4m3_f32=0 barriers=3 qmma=16 bf16_rounds=32 fp8_converts=16 swiglu_exp=0 fma=0 shfl=16 fadd=32 fmul=40 ffma=0 hadd2=16 hmul2=16 ldgsts=2 ldgdepbar=2 depbar_waits=2 zfill=1
+ab_delta symbol=exl3_w2a8_fused_gu_down_emit_n128 instructions=32 registers=0 shared=0 barriers=0
+ab_delta symbol=exl3_w2a8_grouped_prefill_n256_k2_down instructions=0 registers=0 shared=0 barriers=0
+cubin_comparison total=7 equal=6 different=1
+continuous_ring_sass=PASS packed_e4m3_both=PASS fixed_fused_double_buffer_both=PASS fixed_n256_down_double_buffer_both=PASS fixed_n256_route_guard_both=PASS changed_n128_sass=PASS unchanged_n256_sass=PASS async_order=PASS arithmetic_census=exact stack=0 local=0 spills=0 atomics=0
+result=PASS

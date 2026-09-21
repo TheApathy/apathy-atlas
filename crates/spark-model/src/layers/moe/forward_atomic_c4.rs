@@ -82,7 +82,9 @@ impl MoeLayer {
         );
         let routed_accum = scratch.offset(accum_off);
 
-        if let Some(bias) = self.correction_bias_dev {
+        if self.route_deepseek_visual(ctx, gate_logits, indices_dev, weights_dev, 0, n, stream)? {
+            // Vision/hash routing is complete; do not use text-only top-K.
+        } else if let Some(bias) = self.correction_bias_dev {
             ops::moe_topk_sigmoid_batched(
                 ctx.gpu,
                 self.moe_topk_sigmoid_batched_k,

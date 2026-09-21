@@ -115,6 +115,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
     let mut last_decode_time_ms = 0.0f64;
     let mut total_reasoning_tokens = 0u32;
     let mut total_cached_prompt_tokens = 0u32;
+    let mut engine = ir::EngineUsage::default();
 
     // Arc-wrap the prompt tokens ONCE. Per-choice scheduler requests
     // and the Tier 5c retry path all share the same Arc — no Vec<u32>
@@ -122,111 +123,160 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
     let prompt_tokens = std::sync::Arc::new(prompt_tokens);
 
     for choice_idx in 0..n {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let request = InferenceRequest::Blocking {
-            prompt_tokens: prompt_tokens.clone(),
-            session_hash,
-            adapter_slot,
-            src_lang_id,
-            tgt_lang_id,
-            num_beams,
-            length_penalty,
-            early_stopping,
-            image_pixels: if choice_idx == 0 {
-                image_pixels.clone()
-            } else {
-                Vec::new()
-            },
-            max_tokens,
-            min_tokens: req.min_tokens,
-            temperature,
-            top_k,
-            top_p,
-            top_n_sigma,
-            min_p,
-            repetition_penalty,
-            presence_penalty,
-            frequency_penalty,
-            dry_multiplier,
-            dry_base,
-            dry_allowed_length,
-            lz_penalty,
-            logit_bias: logit_bias.clone(),
-            stop_tokens: stop_tokens.clone(),
-            enable_thinking,
-            thinking_budget,
-            repetition_detection: req.repetition_detection,
-            require_tool_call: tool_choice_required,
-            tools_present: tools_active,
-            suppress_tool_call,
-            disable_mtp: false,
-            grammar_spec: grammar_spec.clone(),
-            seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
-            top_logprobs,
-            prompt_logprobs: None,
-            echo: false,
-            timeout_at,
-            response_tx: tx,
-        };
+        let mut attempt = 0usize;
+        loop {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let request = InferenceRequest::Blocking {
+                prompt_tokens: prompt_tokens.clone(),
+                session_hash,
+                adapter_slot,
+                src_lang_id,
+                tgt_lang_id,
+                num_beams,
+                length_penalty,
+                early_stopping,
+                image_pixels: if choice_idx == 0 {
+                    image_pixels.clone()
+                } else {
+                    Vec::new()
+                },
+                max_tokens,
+                min_tokens: req.min_tokens,
+                temperature,
+                top_k,
+                top_p,
+                top_n_sigma,
+                min_p,
+                repetition_penalty,
+                presence_penalty,
+                frequency_penalty,
+                dry_multiplier,
+                dry_base,
+                dry_allowed_length,
+                lz_penalty,
+                logit_bias: logit_bias.clone(),
+                stop_tokens: stop_tokens.clone(),
+                enable_thinking,
+                thinking_budget,
+                repetition_detection: req.repetition_detection,
+                require_tool_call: tool_choice_required,
+                tools_present: tools_active,
+                suppress_tool_call,
+                disable_mtp: false,
+                grammar_spec: grammar_spec.clone(),
+                seed: req.seed.map(|s| {
+                    s.wrapping_add(choice_idx as u64)
+                        .wrapping_add(attempt as u64)
+                }),
+                top_logprobs,
+                prompt_logprobs: None,
+                echo: false,
+                timeout_at,
+                response_tx: tx,
+            };
 
-        if state.request_tx.send(request).await.is_err() {
-            crate::metrics::REQUESTS_ACTIVE.dec();
-            return super::chat::ChatOutcome::Http(openai_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Scheduler queue full".to_string(),
-            ));
-        }
-
-        let response = match rx.await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
+            if state.request_tx.send(request).await.is_err() {
                 crate::metrics::REQUESTS_ACTIVE.dec();
                 return super::chat::ChatOutcome::Http(openai_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Inference error: {e}"),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Scheduler queue full".to_string(),
                 ));
             }
-            Err(_) => {
-                crate::metrics::REQUESTS_ACTIVE.dec();
-                return super::chat::ChatOutcome::Http(openai_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Inference cancelled".to_string(),
-                ));
-            }
-        };
 
-        if choice_idx == 0 {
-            first_ttft = response.time_to_first_token_ms;
+            let response = match rx.await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    crate::metrics::REQUESTS_ACTIVE.dec();
+                    return super::chat::ChatOutcome::Http(openai_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Inference error: {e}"),
+                    ));
+                }
+                Err(_) => {
+                    crate::metrics::REQUESTS_ACTIVE.dec();
+                    return super::chat::ChatOutcome::Http(openai_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Inference cancelled".to_string(),
+                    ));
+                }
+            };
+
+            let num_completion = response.output_tokens.len();
+
+            let (reasoning_content_i, output_text_i) =
+                decode_response_text(&state, &response, enable_thinking);
+            let (output_text_i, matched_stop) =
+                super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
+            let forensic_output = state
+                .ds4_tool_slip_dump_writer
+                .as_ref()
+                .map(|_| output_text_i.clone());
+
+            let mut choice = build_choice_message(
+                &state,
+                &req,
+                &response,
+                reasoning_content_i,
+                output_text_i,
+                tools_active,
+                cwd_hint.as_deref(),
+                choice_idx,
+            )
+            .await;
+            choice.index = choice_idx;
+            choice.matched_stop = matched_stop;
+            choice.logprobs = build_logprobs(&state, &response);
+
+            let parser_name = state.tool_call_parser.as_ref().map(|p| p.name());
+            let is_tool_slip = is_ds4_tool_slip(
+                tools_active,
+                parser_name,
+                response.finish_reason.as_str(),
+                choice.tool_calls.len(),
+            );
+            if is_tool_slip
+                && let (Some(dump), Some(generated_text)) = (
+                    state.ds4_tool_slip_dump_writer.as_ref(),
+                    forensic_output.as_deref(),
+                )
+            {
+                let seed = req.seed.map(|s| {
+                    s.wrapping_add(choice_idx as u64)
+                        .wrapping_add(attempt as u64)
+                });
+                dump.dump_tool_slip(
+                    "blocking",
+                    generated_text,
+                    response.finish_reason.as_str(),
+                    attempt,
+                    prompt_len,
+                    session_hash,
+                    seed,
+                );
+            }
+            if should_resample_tool_slip(state.ds4_tool_slip_resample, attempt, is_tool_slip) {
+                tracing::warn!(
+                    choice = choice_idx,
+                    "DeepSeek-V4 tool-call slip: retrying one non-streaming generation"
+                );
+                attempt += 1;
+                continue;
+            }
+
+            if choice_idx == 0 {
+                first_ttft = response.time_to_first_token_ms;
+            }
+            last_decode_time_ms = response.decode_time_ms;
+            total_completion_tokens += num_completion;
+            total_reasoning_tokens += response.reasoning_tokens;
+            // cached_prompt_tokens is a per-request prefix-cache hit count; for
+            // n>1 we only charge once (same prompt reused).
+            total_cached_prompt_tokens =
+                total_cached_prompt_tokens.max(response.cached_prompt_tokens);
+            engine.merge(response.engine);
+            all_choices.push(choice);
+            break;
         }
-        last_decode_time_ms = response.decode_time_ms;
-
-        let num_completion = response.output_tokens.len();
-        total_completion_tokens += num_completion;
-        total_reasoning_tokens += response.reasoning_tokens;
-        // cached_prompt_tokens is a per-request prefix-cache hit count; for
-        // n>1 we only charge once (same prompt reused).
-        total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
-
-        let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking);
-        let (output_text_i, matched_stop) =
-            super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
-
-        let mut choice = build_choice_message(
-            &state,
-            &req,
-            &response,
-            reasoning_content_i,
-            output_text_i,
-            tools_active,
-            cwd_hint.as_deref(),
-            choice_idx,
-        )
-        .await;
-        choice.index = choice_idx;
-        choice.matched_stop = matched_stop;
-        choice.logprobs = build_logprobs(&state, &response);
-        all_choices.push(choice);
     }
 
     finalize_response(
@@ -239,7 +289,41 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         total_reasoning_tokens,
         total_cached_prompt_tokens,
         prompt_len,
+        engine,
     )
+}
+
+fn should_resample_tool_slip(enabled: bool, attempt: usize, is_tool_slip: bool) -> bool {
+    enabled && attempt == 0 && is_tool_slip
+}
+
+fn is_ds4_tool_slip(
+    tools_active: bool,
+    parser_name: Option<&str>,
+    finish_reason: &str,
+    tool_call_count: usize,
+) -> bool {
+    tools_active
+        && parser_name == Some("dsml_v4")
+        && finish_reason == "stop"
+        && tool_call_count == 0
+}
+
+#[cfg(test)]
+mod tool_slip_resample_tests {
+    use super::{is_ds4_tool_slip, should_resample_tool_slip};
+
+    #[test]
+    fn retry_is_one_shot_and_only_for_dsml_stop_without_calls() {
+        let slip = is_ds4_tool_slip(true, Some("dsml_v4"), "stop", 0);
+        assert!(slip);
+        assert!(should_resample_tool_slip(true, 0, slip));
+        assert!(!should_resample_tool_slip(true, 1, slip));
+        assert!(!should_resample_tool_slip(false, 0, slip));
+        assert!(!is_ds4_tool_slip(true, Some("dsml_v4"), "length", 0));
+        assert!(!is_ds4_tool_slip(true, Some("dsml_v4"), "stop", 1));
+        assert!(!is_ds4_tool_slip(true, Some("hermes"), "stop", 0));
+    }
 }
 
 /// Decode `(reasoning_content, output_text)` from the scheduler's
@@ -568,6 +652,7 @@ fn finalize_response(
     total_reasoning_tokens: u32,
     total_cached_prompt_tokens: u32,
     prompt_len: usize,
+    engine: ir::EngineUsage,
 ) -> super::chat::ChatOutcome {
     let tokens_per_second = if last_decode_time_ms > 0.0 && total_completion_tokens > 0 {
         (total_completion_tokens.saturating_sub(1)) as f64 / (last_decode_time_ms / 1000.0)
@@ -581,6 +666,7 @@ fn finalize_response(
         reasoning_tokens: total_reasoning_tokens as usize,
         time_to_first_token_ms: first_ttft,
         response_tokens_per_second: tokens_per_second,
+        engine: Some(engine),
     };
 
     crate::metrics::REQUESTS_ACTIVE.dec();

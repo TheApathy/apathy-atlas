@@ -31,6 +31,18 @@ pub fn lower_responses_to_chat(
     r: ResponsesRequest,
     resolve_prior: impl FnOnce(&str) -> Option<Vec<IncomingMessage>>,
 ) -> Result<ChatCompletionRequest, LowerResponsesError> {
+    if let Some(format) = r.text.as_ref().and_then(|text| text.get("format")) {
+        let format_type = format
+            .get("type")
+            .and_then(|v| v.as_str())
+            .or_else(|| format.as_str());
+        if !format.is_null() && format_type != Some("text") {
+            return Err(LowerResponsesError::BadRequest(format!(
+                "Responses text.format={} is not supported; use plain text or /v1/chat/completions response_format for constrained JSON",
+                format_type.unwrap_or("unknown")
+            )));
+        }
+    }
     let mut messages: Vec<IncomingMessage> = Vec::new();
 
     // Prior-turn transcript (when resuming a conversation).
@@ -58,7 +70,9 @@ pub fn lower_responses_to_chat(
         }
         serde_json::Value::Array(items) => {
             for it in items {
-                if let Some(m) = IncomingMessage::from_responses_input_item(it) {
+                if let Some(m) = IncomingMessage::try_from_responses_input_item(it)
+                    .map_err(LowerResponsesError::BadRequest)?
+                {
                     messages.push(m);
                 }
             }

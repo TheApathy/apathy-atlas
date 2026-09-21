@@ -82,11 +82,24 @@ pub async fn responses_endpoint(
     let conversation_prefix: Vec<crate::openai::IncomingMessage> = match &conversation_id {
         None => Vec::new(),
         Some(cid) => match state.conversation_store.get(cid) {
-            Some(snap) => snap
-                .items
-                .iter()
-                .filter_map(crate::openai::IncomingMessage::from_conversation_item)
-                .collect(),
+            Some(snap) => {
+                let mut messages = Vec::new();
+                for item in &snap.items {
+                    match crate::openai::IncomingMessage::try_from_responses_input_item(item) {
+                        Ok(Some(message)) => messages.push(message),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return openai_error_response_with_param(
+                                StatusCode::BAD_REQUEST,
+                                format!("Invalid conversation item: {error}"),
+                                Some("conversation"),
+                                None,
+                            );
+                        }
+                    }
+                }
+                messages
+            }
             None => {
                 return openai_error_response_with_param(
                     StatusCode::NOT_FOUND,
@@ -131,6 +144,9 @@ pub async fn responses_endpoint(
         chat_req.messages = combined;
     }
 
+    if let Err(error) = chat_req.validate_content_order() {
+        return openai_error_response(StatusCode::BAD_REQUEST, error);
+    }
     if streaming {
         return responses_endpoint_stream(state, chat_req, metadata, store_flag, conversation_id)
             .await;

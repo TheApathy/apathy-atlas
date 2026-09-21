@@ -417,7 +417,9 @@ impl MoeLayer {
             let gate_t = gate_logits.offset(t * num_experts as usize * 2);
             let idx_t = indices_dev.offset(t * top_k as usize * 4);
             let wgt_t = weights_dev.offset(t * top_k as usize * 4);
-            if let Some(tid2eid) = self.tid2eid_dev {
+            if self.route_deepseek_visual(ctx, gate_t, idx_t, wgt_t, t, 1, stream)? {
+                // Mixed-token routing completed before any hash-table lookup.
+            } else if let Some(tid2eid) = self.tid2eid_dev {
                 // DeepSeek-V4 hash routing: expert selection is static
                 // `tid2eid[token_id]`; the learned gate only weights it. The
                 // verify paths upload the K tokens in this same row order.

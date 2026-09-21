@@ -27,6 +27,7 @@ pub(super) fn handle_done(
     decode_time_ms: f64,
     reasoning_tokens: u32,
     cached_prompt_tokens: u32,
+    engine: crate::ir::EngineUsage,
 ) -> DeltaVec {
     let mut deltas: DeltaVec = Vec::new();
 
@@ -48,6 +49,9 @@ pub(super) fn handle_done(
         state.stop_string_emitted_len = state.accumulated_content.len();
         if !tail.is_empty() {
             if let Some(det) = state.detector.as_mut() {
+                if let Some(input) = state.tool_parser_input.as_mut() {
+                    input.push_str(&tail);
+                }
                 let outputs = det.process(&tail);
                 for output in outputs {
                     match output {
@@ -184,6 +188,7 @@ pub(super) fn handle_done(
         reasoning_tokens: reasoning_tokens as usize,
         time_to_first_token_ms,
         response_tokens_per_second: tps,
+        engine: Some(engine),
     };
 
     let fr = if state.tool_loop_capped {
@@ -204,6 +209,29 @@ pub(super) fn handle_done(
     } else {
         finish_reason.as_str()
     };
+    let has_tool_calls =
+        state.detector.as_ref().is_some_and(|d| d.has_tool_calls()) || state.salvaged_tool_call;
+    let parser_name = ctx
+        .state
+        .tool_call_parser
+        .as_ref()
+        .map(|parser| parser.name());
+    if is_ds4_stream_tool_slip(parser_name, fr, has_tool_calls)
+        && let (Some(dump), Some(generated_text)) = (
+            ctx.state.ds4_tool_slip_dump_writer.as_ref(),
+            state.tool_parser_input.as_deref(),
+        )
+    {
+        dump.dump_tool_slip(
+            "streaming",
+            generated_text,
+            fr,
+            0,
+            ctx.prompt_len,
+            ctx.session_hash,
+            ctx.seed,
+        );
+    }
 
     // Refusal classification.
     let refusal_signal = if state.detector.as_ref().is_none_or(|d| !d.has_tool_calls()) {
@@ -247,7 +275,6 @@ pub(super) fn handle_done(
     // the dump keeps the OpenAI wire-usage shape (same numbers the
     // encoder derives for the terminal chunk).
     if let (Some(seq), Some(dump)) = (ctx.dump_seq, ctx.state.dump_writer.as_ref()) {
-        let has_tool_calls = state.detector.as_ref().is_some_and(|d| d.has_tool_calls());
         let usage_for_dump = crate::openai::Usage {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
@@ -264,6 +291,7 @@ pub(super) fn handle_done(
             }),
             time_to_first_token_ms: usage.time_to_first_token_ms,
             response_tokens_per_second: usage.response_tokens_per_second,
+            atlas_engine: crate::openai::atlas_engine_usage(usage.engine),
         };
         let body = serde_json::json!({
             "id": ctx.id,
@@ -284,4 +312,26 @@ pub(super) fn handle_done(
     }
 
     deltas
+}
+
+fn is_ds4_stream_tool_slip(
+    parser_name: Option<&str>,
+    finish_reason: &str,
+    has_tool_calls: bool,
+) -> bool {
+    parser_name == Some("dsml_v4") && finish_reason == "stop" && !has_tool_calls
+}
+
+#[cfg(test)]
+mod ds4_tool_slip_tests {
+    use super::is_ds4_stream_tool_slip;
+
+    #[test]
+    fn only_natural_dsml_stop_without_calls_is_a_streaming_slip() {
+        assert!(is_ds4_stream_tool_slip(Some("dsml_v4"), "stop", false));
+        assert!(!is_ds4_stream_tool_slip(Some("dsml_v4"), "stop", true));
+        assert!(!is_ds4_stream_tool_slip(Some("dsml_v4"), "length", false));
+        assert!(!is_ds4_stream_tool_slip(Some("hermes"), "stop", false));
+        assert!(!is_ds4_stream_tool_slip(None, "stop", false));
+    }
 }

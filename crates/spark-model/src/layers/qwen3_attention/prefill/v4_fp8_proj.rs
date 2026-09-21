@@ -382,9 +382,7 @@ impl Qwen3AttentionLayer {
         // ATLAS_V4_WOA_INPLACE=0 restores the gather/scatter path.
         let inplace = {
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| {
-                std::env::var("ATLAS_V4_WOA_INPLACE").as_deref() != Ok("0")
-            })
+            *ON.get_or_init(|| std::env::var("ATLAS_V4_WOA_INPLACE").as_deref() != Ok("0"))
         } && ((fp8.is_some() && self.w8a16_gemm_pipelined_ld_k.0 != 0)
             || (bf16 && self.dense_gemm_pipelined_ld_k.0 != 0));
         if inplace {
@@ -521,7 +519,9 @@ impl Qwen3AttentionLayer {
             )?;
             let dense_group = DenseWeight {
                 weight: if bf16 {
-                    mla.wo_a.weight.offset(group as usize * weight_group_bytes * BF16_BYTES)
+                    mla.wo_a
+                        .weight
+                        .offset(group as usize * weight_group_bytes * BF16_BYTES)
                 } else {
                     DevicePtr::NULL
                 },

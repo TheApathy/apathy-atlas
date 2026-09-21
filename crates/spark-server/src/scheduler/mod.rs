@@ -42,8 +42,8 @@ mod repetition;
 mod rollback;
 mod sample_step;
 mod spec_step;
-pub(crate) mod step_timing2;
 mod ssm_decode_ring;
+pub(crate) mod step_timing2;
 mod types;
 mod verify_dflash_step;
 mod verify_k2_step;
@@ -167,6 +167,38 @@ pub type LoraRotation = (
     LoraCommand,
     tokio::sync::oneshot::Sender<Result<LoraAck, String>>,
 );
+
+/// Quiesce every proposer-side artifact before a serial token advances the
+/// target sequence. In particular, an async placeholder cannot simply be
+/// dropped: its second-stream launch must first be collected/drained so a
+/// later MTP bootstrap cannot observe stale shared scratch.
+fn reset_mtp_pending_chain(model: &dyn Model, active: &mut [ActiveSeq], reason: &str) {
+    for a in active.iter_mut() {
+        if !a.pending_drafts.is_empty()
+            && let Err(e) = model.dflash_collect_async_drafts(&mut a.seq)
+        {
+            tracing::error!("{reason} collect_async_drafts: {e:#}");
+        }
+        if model.dflash_spec_pending(&mut a.seq)
+            && let Err(e) = model.dflash_spec_discard(&mut a.seq)
+        {
+            tracing::error!("{reason} spec_discard: {e:#}");
+        }
+        a.pending_drafts.clear();
+        a.pending_block_fork = None;
+        a.pending_tree_payload = None;
+        a.seq.tree_payload = None;
+        if let Err(e) = model.dflash_adopt_fork_blocks(&mut a.seq, false) {
+            tracing::error!("{reason} free fork blocks: {e:#}");
+        }
+        if let Err(e) = model.dflash_adopt_tree_branch(&mut a.seq, None) {
+            tracing::error!("{reason} free tree blocks: {e:#}");
+        }
+    }
+    if let Err(e) = model.sync_secondary() {
+        tracing::error!("{reason} sync_secondary: {e:#}");
+    }
+}
 
 /// Run the scheduler loop on the current thread.
 #[allow(clippy::too_many_arguments)]
@@ -431,25 +463,25 @@ pub fn run(
         let lt_t_preq = loop_trace.then(std::time::Instant::now);
         // ── Start new requests ──
         if !new_reqs.is_empty() {
-        start_new_requests(
-            &*model,
-            new_reqs,
-            chunked,
-            always_mixed,
-            max_prefill_tokens,
-            max_batch_tokens,
-            &eos_tokens,
-            prefill_stream,
-            prefill_event,
-            &mut grammar_engine,
-            spontaneous_think_budget,
-            think_end_token,
-            think_start_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            &mut active,
-            &mut prefilling,
-        );
+            start_new_requests(
+                &*model,
+                new_reqs,
+                chunked,
+                always_mixed,
+                max_prefill_tokens,
+                max_batch_tokens,
+                &eos_tokens,
+                prefill_stream,
+                prefill_event,
+                &mut grammar_engine,
+                spontaneous_think_budget,
+                think_end_token,
+                think_start_token,
+                tool_call_start_token,
+                tool_call_end_token,
+                &mut active,
+                &mut prefilling,
+            );
         }
 
         let lt_t_mid = loop_trace.then(std::time::Instant::now);
@@ -566,6 +598,9 @@ pub fn run(
                 if let Some(gate) = mtp_gate.as_mut() {
                     gate.maybe_remeasure(active[0].seq.seq_len);
                     gate.note_depth(active[0].seq.seq_len);
+                    if gate.take_serial_probe_start() {
+                        reset_mtp_pending_chain(&*model, &mut active, "mtp-gate→serial-probe");
+                    }
                     match gate.next_step() {
                         mtp_gate::GateStep::MeasureDecode => {
                             let t0 = std::time::Instant::now();
@@ -613,12 +648,7 @@ pub fn run(
                     // Serial->Mtp needs nothing (the next MTP step
                     // bootstraps from empty pending_drafts).
                     if gate.take_fresh_decision() == Some(mtp_gate::GateDecision::DisableMtp) {
-                        for a in active.iter_mut() {
-                            a.pending_drafts.clear();
-                        }
-                        if let Err(e) = model.sync_secondary() {
-                            tracing::error!("mtp-gate→decode sync_secondary: {e:#}");
-                        }
+                        reset_mtp_pending_chain(&*model, &mut active, "mtp-gate→decode");
                     }
                 } else {
                     // Gate bypassed (ATLAS_MTP_GATE_FORCE=1): plain MTP.
@@ -633,16 +663,7 @@ pub fn run(
             } else {
                 // Batch decode (no MTP). Clear stale drafts when transitioning out of MTP mode.
                 if use_mtp {
-                    for a in active.iter_mut() {
-                        a.pending_drafts.clear();
-                    }
-                    // MTP→decode-only transition: the last verify commit's
-                    // live-state restore runs async on the secondary stream;
-                    // order it before this decode reads h_state/conv_state
-                    // (GPU-side event wait, zero CPU cost).
-                    if let Err(e) = model.sync_secondary() {
-                        tracing::error!("mtp→decode sync_secondary: {e:#}");
-                    }
+                    reset_mtp_pending_chain(&*model, &mut active, "mtp→decode");
                 }
                 step_decode_only(
                     &*model,

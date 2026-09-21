@@ -146,6 +146,7 @@ pub fn step_verify_k2(
         )
     };
     let accepted = drafts[0] == v0;
+    crate::scheduler::adaptive_spec::record_speculative_step(a);
 
     // Extract logprobs from verify logits buffer (K=2 positions) when requested.
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {

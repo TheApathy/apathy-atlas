@@ -399,10 +399,16 @@ fn main() -> Result<()> {
     gpu.copy_d2h(cb_ref, &mut rr)?;
     gpu.copy_d2h(cb_bat, &mut rbat)?;
     if rr != rbat {
-        let first = rr.iter().zip(rbat.iter()).position(|(x, y)| x != y).unwrap_or(0);
+        let first = rr
+            .iter()
+            .zip(rbat.iter())
+            .position(|(x, y)| x != y)
+            .unwrap_or(0);
         bail!("GATE 3 FAIL: grouped_batchm != per-row single-row (first diff byte {first})");
     }
-    println!("  GATE 3 PASS: w4a16_gemv_grouped_batchm (M={M}) == per-row single-row, bit-identical");
+    println!(
+        "  GATE 3 PASS: w4a16_gemv_grouped_batchm (M={M}) == per-row single-row, bit-identical"
+    );
 
     // Timing: batched grouped vs M x 8-launch per-group (shipping OPROJ_EXACT
     // cost) and vs the amortization ideal.
@@ -614,10 +620,18 @@ fn main() -> Result<()> {
         bail!("GATE 5: dead w8 reference output");
     }
     if r8r != r8x {
-        let first = r8r.iter().zip(r8x.iter()).position(|(x, y)| x != y).unwrap_or(0);
-        bail!("GATE 5 FAIL: w8a16_gemv_batchm_exact != per-row w8a16_gemv (first diff byte {first})");
+        let first = r8r
+            .iter()
+            .zip(r8x.iter())
+            .position(|(x, y)| x != y)
+            .unwrap_or(0);
+        bail!(
+            "GATE 5 FAIL: w8a16_gemv_batchm_exact != per-row w8a16_gemv (first diff byte {first})"
+        );
     }
-    println!("  GATE 5 PASS: w8a16_gemv_batchm_exact (M=6) == per-row single-row, bit-identical ({nz8} nonzero)");
+    println!(
+        "  GATE 5 PASS: w8a16_gemv_batchm_exact (M=6) == per-row single-row, bit-identical ({nz8} nonzero)"
+    );
 
     // ── Gate 6: ATLAS_VERIFY_GEMV_V2 kernels — byte-identity vs the
     //    runtime-M incumbents at n ∈ {4,5,6,8}, then cold-weight GB/s at
@@ -735,7 +749,11 @@ fn main() -> Result<()> {
             gpu.copy_d2h(a, &mut ra)?;
             gpu.copy_d2h(b, &mut rb)?;
             if ra != rb {
-                let first = ra.iter().zip(rb.iter()).position(|(x, y)| x != y).unwrap_or(0);
+                let first = ra
+                    .iter()
+                    .zip(rb.iter())
+                    .position(|(x, y)| x != y)
+                    .unwrap_or(0);
                 bail!("GATE 6 FAIL: {what} v2_m{m} != incumbent (first diff byte {first})");
             }
             Ok(())
