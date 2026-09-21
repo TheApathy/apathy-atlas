@@ -303,6 +303,12 @@ impl ExpertPack {
         self.bytes_per_expert
     }
 
+    /// Experts PRESENT IN THE PACK on disk (154), which is the extent of every shard
+    /// tensor. Distinct from [`Self::packed_keep`], the subset actually made resident.
+    pub fn pack_experts(&self) -> usize {
+        self.layers.first().map_or(0, |layer| layer.slots.len())
+    }
+
     /// Resolve a 384-space routed expert id to its slot in `layer`'s shard.
     ///
     /// PERFORMANCE NOTE FOR WHOEVER MOVES THIS: it is a linear scan over <= 154 ids, which
