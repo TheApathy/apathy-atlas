@@ -193,16 +193,34 @@ impl Glm53Exl3MoeKernels {
         );
         // (kernel suffix, output tile N, m16 sub-tiles, k16 blocks per stage);
         // None = k16 donor kernels.
-        let chunk_variant: Option<(&'static str, u32, u32, u32)> = match std::env::var(CHUNK_ROWS_ENV) {
+        // (symbol suffix, TILE_N, MSUB, KSUB, SH_STAGES)
+        let chunk_variant: Option<(&'static str, u32, u32, u32, u32)> = match std::env::var(CHUNK_ROWS_ENV) {
             Ok(value) if value == "16" => None,
-            Ok(value) if value == "64" => Some(("m64", 256, 4, 1)),
-            Ok(value) if value == "128" => Some(("m128", 128, 8, 1)),
-            Ok(value) if value == "64k2" => Some(("m64k2", 256, 4, 2)),
-            Ok(value) if value == "128w" => Some(("m128w", 256, 8, 1)),
-            Ok(value) if value == "128wk2" => Some(("m128wk2", 256, 8, 2)),
-            Ok(value) if value == "64k3" => Some(("m64k3", 256, 4, 3)),
-            Ok(value) if value == "64k4" => Some(("m64k4", 256, 4, 4)),
-            Ok(other) => bail!("{CHUNK_ROWS_ENV} must be 16, 64, 128, 64k2, 64k3, 64k4, 128w or 128wk2, got {other:?}"),
+            Ok(value) if value == "64" => Some(("m64", 256, 4, 1, 3)),
+            Ok(value) if value == "128" => Some(("m128", 128, 8, 1, 3)),
+            Ok(value) if value == "64k2" => Some(("m64k2", 256, 4, 2, 3)),
+            Ok(value) if value == "128w" => Some(("m128w", 256, 8, 1, 3)),
+            Ok(value) if value == "128wk2" => Some(("m128wk2", 256, 8, 2, 3)),
+            Ok(value) if value == "64k3" => Some(("m64k3", 256, 4, 3, 3)),
+            Ok(value) if value == "64k4" => Some(("m64k4", 256, 4, 4, 3)),
+            // 4 cp.async stages instead of 3; same 64k2 tiling otherwise.
+            Ok(value) if value == "64k2s4" => Some(("m64k2s4", 256, 4, 2, 4)),
+            // Deeper cp.async pipelines on the same shape. Registers pin residency
+            // at 2 CTAs/SM, so shared memory is free: stages 6 = 73,728 B/SM and
+            // stages 8 = 98,304 B/SM of the 102,400 B budget. No byte counts change.
+            Ok(value) if value == "64k2s6" => Some(("m64k2s6", 256, 4, 2, 6)),
+            Ok(value) if value == "64k2s8" => Some(("m64k2s8", 256, 4, 2, 8)),
+            // Single-barrier (late-issue) loop: `issue_load` moves to the bottom
+            // of the K-tile body, removing the trailing __syncthreads. Verified in
+            // SASS: 1 BAR.SYNC in the loop body vs 2 for every other variant, i.e.
+            // 256 -> 128 barriers per gate_up CTA. Loads, MMA order and output are
+            // unchanged, so these are bit-identical to 64k2 / 64k2s8.
+            Ok(value) if value == "64k2li" => Some(("m64k2li", 256, 4, 2, 3)),
+            Ok(value) if value == "64k2s8li" => Some(("m64k2s8li", 256, 4, 2, 8)),
+            // Wider N tile: halves the per-N-tile re-read of each chunk's A rows.
+            Ok(value) if value == "64n512" => Some(("m64n512", 512, 4, 1, 3)),
+            Ok(value) if value == "64n512k2" => Some(("m64n512k2", 512, 4, 2, 3)),
+            Ok(other) => bail!("{CHUNK_ROWS_ENV} must be 16, 64, 128, 64k2, 64k3, 64k4, 64k2s4, 64k2s6, 64k2s8, 64k2li, 64k2s8li, 64n512, 64n512k2, 128w or 128wk2, got {other:?}"),
             Err(std::env::VarError::NotPresent) => None,
             Err(error) => return Err(error).context(CHUNK_ROWS_ENV),
         };
@@ -236,8 +254,9 @@ impl Glm53Exl3MoeKernels {
                     )
                 };
                 let (gate_up, down, build_chunks, tile_n, shared_bytes) =
-                    if let Some((suffix, tile_n, msub, ksub)) = chunk_variant {
-                        // 3 cp.async stages of (A: 16*msub x 16*ksub halves, B: tile_n/16 x 32*ksub uint16)
+                    if let Some((suffix, tile_n, msub, ksub, stages)) = chunk_variant {
+                        // `stages` cp.async stages of
+                        // (A: 16*msub x 16*ksub halves, B: tile_n/16 x 32*ksub uint16)
                         let stage = 16 * msub * 16 * ksub * 2 + (tile_n / 16) * 32 * ksub * 2;
                         (
                             gpu.kernel(
@@ -253,7 +272,7 @@ impl Glm53Exl3MoeKernels {
                                 &format!("atlas_glm53_exl3_build_chunks_private_{suffix}"),
                             )?,
                             tile_n,
-                            (3 * stage).max(STAGED_SHARED_MEMORY_BYTES),
+                            (stages * stage).max(STAGED_SHARED_MEMORY_BYTES),
                         )
                     } else {
                         (

@@ -20,15 +20,15 @@ use spark_runtime::kernel_args::KernelLaunch;
 
 use super::GgmlIqBuffer;
 
-const STREAMS: u32 = 3;
+pub(crate) const STREAMS: u32 = 3;
 const HEADS: u32 = 64;
 const HEAD_DIM: u32 = 128;
-const CHANNELS: u32 = HEADS * HEAD_DIM;
+pub(crate) const CHANNELS: u32 = HEADS * HEAD_DIM;
 const KERNEL: u32 = 4;
 const MAX_QUERIES: u32 = 65_520;
 const MAX_POSITIONS: u32 = 1_048_576;
 const MAX_BATCH: u32 = 65_535;
-const THREADS: u32 = 256;
+pub(crate) const THREADS: u32 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Glm53KdaConvPlan {
@@ -150,7 +150,7 @@ pub struct Glm53KdaConvBuffers {
 
 pub struct Glm53KdaConvKernel {
     stage: KernelHandle,
-    finalize: KernelHandle,
+    pub(crate) finalize: KernelHandle,
     commit: KernelHandle,
 }
 
@@ -246,7 +246,7 @@ impl Glm53KdaConvKernel {
     }
 }
 
-fn validate_buffers(plan: Glm53KdaConvPlan, buffers: Glm53KdaConvBuffers) -> Result<()> {
+pub(crate) fn validate_buffers(plan: Glm53KdaConvPlan, buffers: Glm53KdaConvBuffers) -> Result<()> {
     let named = [
         ("q input", buffers.q_input_bf16, plan.stream_bytes, 2),
         ("k input", buffers.k_input_bf16, plan.stream_bytes, 2),

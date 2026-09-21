@@ -449,8 +449,10 @@ impl Glm53SerialMoeKernels {
             "moe_out",
             &[
                 crate::model::glm53::oracle_dump::t(
+                    // 289, not 288: the pack kernel writes an exclusive prefix
+                    // sum with a trailing total (plan.expert_count_i64_bytes = 2312).
                     "expert_count", exact.expert_count_i64.ptr,
-                    plan.expert_count_i64_bytes, "i64", &[288]),
+                    plan.expert_count_i64_bytes, "i64", &[289]),
                 crate::model::glm53::oracle_dump::t(
                     "token_sorted", exact.token_sorted_i64.ptr,
                     plan.token_sorted_i64_bytes, "i64", &[rows as usize * 8]),

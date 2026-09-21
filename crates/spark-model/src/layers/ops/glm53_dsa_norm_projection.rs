@@ -189,18 +189,7 @@ impl Glm53DsaNormProjectionKernels {
                     .arg_f32(f32::from_bits(plan.epsilon_bits))
             }
             Glm53DsaNormProjectionKind::F32IndexProjection => {
-                // Same serial f32 fmaf chain, weight staged through shared
-                // memory so the 32 lanes load consecutive columns instead of
-                // striding 16 KB apart. Bit-identical.
-                let kernel = if index_projection_tiled()? && plan.rows >= 144 {
-                    gpu.kernel(
-                        "glm53_prompt_glue",
-                        "atlas_glm53_dsa_index_projection_tiled",
-                    )?
-                } else {
-                    self.index_projection
-                };
-                KernelLaunch::new(gpu, kernel)
+                KernelLaunch::new(gpu, self.index_projection)
                     .grid([plan.rows, 1, 1])
                     .block([plan.threads, 1, 1])
                     .arg_ptr(buffers.input_bf16.ptr)
@@ -213,24 +202,6 @@ impl Glm53DsaNormProjectionKernels {
         };
         launch.launch(stream)
     }
-}
-
-/// `ATLAS_GLM53_DSA_INDEX_PROJ_TILED=1`: shared-memory-staged indexer head
-/// projection for the prompt scope. Bit-identical to the donor kernel.
-fn index_projection_tiled() -> Result<bool> {
-    use std::sync::OnceLock;
-    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
-    ON.get_or_init(|| match std::env::var("ATLAS_GLM53_DSA_INDEX_PROJ_TILED") {
-        Ok(v) if v == "1" => Ok(true),
-        Ok(v) if v == "0" => Ok(false),
-        Ok(other) => Err(format!(
-            "ATLAS_GLM53_DSA_INDEX_PROJ_TILED must be 0 or 1, got {other:?}"
-        )),
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Err(e) => Err(format!("ATLAS_GLM53_DSA_INDEX_PROJ_TILED: {e}")),
-    })
-    .clone()
-    .map_err(anyhow::Error::msg)
 }
 
 fn validate_buffers(

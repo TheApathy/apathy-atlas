@@ -292,6 +292,31 @@ pub fn launch_reconstructed(
         gpu.record_event(ov.recon_done[slot], ov.side_stream)?;
         gpu.stream_wait_event(stream, ov.recon_done[slot])?;
     }
+    // Numerics oracle for the FP8-reconstruct question: capture ONE reconstructed
+    // dense weight exactly as it leaves the reconstruct kernel, so the e4m3
+    // round-trip error can be measured offline against this bf16/f16 baseline
+    // instead of argued from the format. Fires once per process; free when unset.
+    crate::model::glm53::oracle_dump::dump_site(
+        gpu,
+        recon_stream,
+        "reconstruct_weight",
+        &[crate::model::glm53::oracle_dump::t(
+            "weight",
+            staging.ptr,
+            weight_bytes,
+            match dtype {
+                StagingDtype::F16 => "f16",
+                StagingDtype::Bf16 => "bf16",
+            },
+            &[usize::try_from(k)?, usize::try_from(n)?],
+        )],
+        &[
+            ("k", k.to_string()),
+            ("n", n.to_string()),
+            ("bits", linear.bits().to_string()),
+            ("staging_dtype", format!("\"{:?}\"", dtype)),
+        ],
+    )?;
     match dtype {
         StagingDtype::F16 => {
             spark_runtime::cublaslt::f16_gemm_act_weight(

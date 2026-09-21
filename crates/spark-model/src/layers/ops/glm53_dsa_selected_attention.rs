@@ -201,10 +201,26 @@ impl Glm53DsaSelectedAttentionKernel {
                     .is_some_and(|end| end == sequence_length),
             "GLM DSA dense causal attention requires B1, Q>1 and an exact <=2051 prefix"
         );
-        KernelLaunch::new(gpu, self.dense_causal)
+        // `ATLAS_GLM53_DSA_DENSE_FAST=1`: the GLM-private dense-causal kernel.
+        // V and K are the same latent pointer (see the two `.arg_ptr` lines
+        // below), so it keeps ONE KV tile instead of two and spends the freed
+        // shared memory on a padded row stride that breaks the donor's 8-way
+        // bank conflict. Bit-identical; see glm53_dsa_dense_causal_fast.cu.
+        let (kernel, shared) = if dense_fast()? {
+            (
+                gpu.kernel(
+                    "glm53_dsa_dense_causal_fast",
+                    "atlas_glm53_dsa_dense_causal_fast_bf16",
+                )?,
+                69_376,
+            )
+        } else {
+            (self.dense_causal, 101_120)
+        };
+        KernelLaunch::new(gpu, kernel)
             .grid([HEADS, plan.queries.div_ceil(32), 1])
             .block([THREADS, 1, 1])
-            .shared_mem(101_120)
+            .shared_mem(shared)
             .arg_ptr(buffers.absorbed_query_bf16.ptr)
             .arg_ptr(buffers.latent_cache_bf16.ptr)
             .arg_ptr(buffers.latent_cache_bf16.ptr)
@@ -289,6 +305,24 @@ impl Glm53DsaSelectedAttentionKernel {
             .arg_u32(u32::from(to_head_major))
             .launch(stream)
     }
+}
+
+/// `ATLAS_GLM53_DSA_DENSE_FAST=1`: single-KV-tile, bank-conflict-free
+/// dense-causal DSA attention. Bit-identical to the donor kernel.
+fn dense_fast() -> Result<bool> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ON.get_or_init(|| match std::env::var("ATLAS_GLM53_DSA_DENSE_FAST") {
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(other) => Err(format!(
+            "ATLAS_GLM53_DSA_DENSE_FAST must be 0 or 1, got {other:?}"
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(format!("ATLAS_GLM53_DSA_DENSE_FAST: {e}")),
+    })
+    .clone()
+    .map_err(anyhow::Error::msg)
 }
 
 fn validate_buffers(

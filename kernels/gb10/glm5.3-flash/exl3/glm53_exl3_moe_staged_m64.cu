@@ -26,13 +26,15 @@ constexpr int THREADS = 256;
 constexpr int TILE_K = 16;
 constexpr int BITS = 2;
 constexpr int CB = 2;
-constexpr int SH_STAGES = 3;
+// Default cp.async pipeline depth; overridable per instantiation (see STAGES).
+constexpr int SH_STAGES_DEFAULT = 3;
 constexpr int BLOCK_N_UINT16 = 256 / 16 * BITS;                        // 32
 
 // C[size_m, size_n] (f16, row-major) tile column blockIdx.x of width TILE_N =
 // A[size_m, size_k] (f16) x trellis B. gridDim.x must be size_n / TILE_N.
 // MSUB m16 sub-tiles per CTA; sub-tiles past size_m are skipped entirely.
-template <int MSUB, int TILE_N, int KSUB>
+template <int MSUB, int TILE_N, int KSUB, int SH_STAGES = SH_STAGES_DEFAULT,
+          bool LATE_ISSUE = false>
 __device__ __forceinline__ void gemm_inner_mx
 (
     const half* __restrict__ A,
@@ -131,7 +133,14 @@ __device__ __forceinline__ void gemm_inner_mx
 
     for (int tile = 0; tile < tiles_k; ++tile)
     {
-        issue_load(tile + SH_STAGES - 1);
+        // LATE_ISSUE moves this to the BOTTOM of the body, which removes the
+        // trailing __syncthreads: the issue then targets stage
+        // (tile+SH_STAGES-1)%SH_STAGES, a different buffer from the tile%SH_STAGES
+        // this CTA is reading, so it needs no barrier of its own, and the NEXT
+        // iteration's leading barrier already orders it against the following read.
+        // One barrier per K-tile instead of two. No change to loads or MMA order.
+        if (!LATE_ISSUE)
+            issue_load(tile + SH_STAGES - 1);
         cp_async_wait<SH_STAGES - 2>();
         __syncthreads();
 
@@ -172,7 +181,10 @@ __device__ __forceinline__ void gemm_inner_mx
                     ptx_mma_m16n8k16(frag_a[m], frag_b[n], frag_c[m][n]);
             }
         }
-        __syncthreads();
+        if (LATE_ISSUE)
+            issue_load(tile + SH_STAGES - 1);
+        else
+            __syncthreads();
     }
 
     // Row-major F16 write-out (donor `write_sum_gl`, c_fp32 = false)
@@ -287,7 +299,7 @@ __device__ __forceinline__ void atlas_glm53_exl3_build_chunks_private_mx(
     }
 }
 
-#define ATLAS_MX_KERNELS(SUFFIX, MSUB, TILE_N, KSUB, MINB) \
+#define ATLAS_MX_KERNELS_L(SUFFIX, MSUB, TILE_N, KSUB, MINB, STAGES, LATE) \
 extern "C" __global__ void atlas_glm53_exl3_build_chunks_private_##SUFFIX( \
     const int64_t* __restrict__ expert_count, uint32_t* __restrict__ pair_expert, \
     uint32_t* __restrict__ chunk_expert, uint32_t* __restrict__ chunk_start, \
@@ -320,7 +332,7 @@ void atlas_glm53_exl3_staged_gate_up_##SUFFIX( \
     half* output = (projection == 0 ? intermediate_g : intermediate_u) + \
                    static_cast<uint64_t>(start) * intermediate_dim; \
     const uint16_t* trellis = (projection == 0 ? gate_trellis : up_trellis)[expert]; \
-    atlas_m64::gemm_inner_mx<MSUB, TILE_N, KSUB>(input, trellis, output, rows, hidden_dim, intermediate_dim); \
+    atlas_m64::gemm_inner_mx<MSUB, TILE_N, KSUB, STAGES, LATE>(input, trellis, output, rows, hidden_dim, intermediate_dim); \
 } \
 extern "C" __global__ __launch_bounds__(256, MINB) \
 void atlas_glm53_exl3_staged_down_##SUFFIX( \
@@ -337,10 +349,17 @@ void atlas_glm53_exl3_staged_down_##SUFFIX( \
     const uint32_t start = chunk_start[chunk]; \
     const int rows = static_cast<int>(chunk_rows[chunk]); \
     if (rows <= 0 || rows > 16 * MSUB) return; \
-    atlas_m64::gemm_inner_mx<MSUB, TILE_N, KSUB>( \
+    atlas_m64::gemm_inner_mx<MSUB, TILE_N, KSUB, STAGES, LATE>( \
         intermediate + static_cast<uint64_t>(start) * 2048, down_trellis[expert], \
         state + static_cast<uint64_t>(start) * 4096, rows, 2048, 4096); \
 }
+
+// Back-compat: the historical 6-arg form is the early-issue (two-barrier) path.
+#define ATLAS_MX_KERNELS_S(SUFFIX, MSUB, TILE_N, KSUB, MINB, STAGES) \
+    ATLAS_MX_KERNELS_L(SUFFIX, MSUB, TILE_N, KSUB, MINB, STAGES, false)
+
+#define ATLAS_MX_KERNELS(SUFFIX, MSUB, TILE_N, KSUB, MINB) \
+    ATLAS_MX_KERNELS_S(SUFFIX, MSUB, TILE_N, KSUB, MINB, 3)
 
 ATLAS_MX_KERNELS(m64, 4, 256, 1, 2)
 ATLAS_MX_KERNELS(m128, 8, 128, 1, 2)
@@ -356,3 +375,42 @@ ATLAS_MX_KERNELS(m128wk2, 8, 256, 2, 1)
 // both well inside the 228 KB SM budget at MINB=2.
 ATLAS_MX_KERNELS(m64k3, 4, 256, 3, 2)
 ATLAS_MX_KERNELS(m64k4, 4, 256, 4, 2)
+// Deeper cp.async pipeline on the winning 64k2 shape: 4 stages instead of 3, to
+// hide more of the trellis decode latency. Shared = 4 * 6144 = 24,576 B.
+ATLAS_MX_KERNELS_S(m64k2s4, 4, 256, 2, 2, 4)
+// Deeper still on the same shape. The m64k2 stage is 6,144 B and registers -- not
+// shared memory -- already pin residency at 2 CTAs/SM (119/120 regs, 0 spills), so
+// shared memory is the one resource being left unused: 2 x 3 x 6,144 = 36,864 B of
+// the SM's 102,400 B. Stage depth therefore costs NOTHING in occupancy up to 8:
+//   stages 3 -> 36,864 B/SM (36%)   [shipped]
+//   stages 4 -> 49,152 B/SM (48%)   m64k2s4
+//   stages 6 -> 73,728 B/SM (72%)   m64k2s6
+//   stages 8 -> 98,304 B/SM (96%)   m64k2s8  <- the limit
+// Per-block dynamic shared is 49,152 B at stages 8, under the 101,376 B opt-in cap.
+// NOTE the budget in the m64k3/m64k4 comment above says "228 KB SM budget": that is
+// HOPPER. GB10 is 102,400 B/SM and 101,376 B max dynamic per block. Anything sized
+// against 228 KB will fail to launch.
+// These change NO byte counts and NO MMA order -- only how far ahead the cp.async
+// pipeline runs (`cp_async_wait<SH_STAGES-2>` keeps SH_STAGES-1 loads in flight
+// instead of 2). Bit-identical to m64k2 by construction.
+ATLAS_MX_KERNELS_S(m64k2s6, 4, 256, 2, 2, 6)
+ATLAS_MX_KERNELS_S(m64k2s8, 4, 256, 2, 2, 8)
+// Wider N tile. Each CTA owns one N-tile of one 64-row chunk, and re-reads that
+// chunk's A rows from global for EVERY N tile: with TILE_N=256 the gate_up grid
+// is 2048/256 = 8 tiles and the down grid 4096/256 = 16, so a 64x4096 A tile is
+// read 8x and a 64x2048 one 16x. At ~500 live chunks x 42 layers that is the
+// dominant traffic term. TILE_N=512 halves both.
+// FRAGS_N_PER_WARP = 2*(512/16)/8 = 8 (even, >=2, so the N-tile assert holds);
+// shared per stage = 64*32*2 + 32*32*2*2 = 8192 B, 24,576 B for 3 stages.
+ATLAS_MX_KERNELS(m64n512, 4, 512, 1, 2)
+ATLAS_MX_KERNELS(m64n512k2, 4, 512, 2, 2)
+
+// Single-barrier (late-issue) variants: `issue_load` moves to the bottom of the
+// K-tile body, removing the trailing __syncthreads. 256 barriers per gate_up CTA
+// become 128. Loads, MMA order and output are UNCHANGED -- bit-identical to the
+// corresponding early-issue variant. Instantiated at stage depth 3 (directly
+// comparable to the live m64k2) and at 8 (combined with the deepest pipeline,
+// since late issue shortens the prefetch distance by one compute phase and extra
+// stages are what give that back).
+ATLAS_MX_KERNELS_L(m64k2li,   4, 256, 2, 2, 3, true)
+ATLAS_MX_KERNELS_L(m64k2s8li, 4, 256, 2, 2, 8, true)

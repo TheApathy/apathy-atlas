@@ -275,18 +275,9 @@ fn host_contract(source: &str) -> bool {
         )
         && exact_launch(
             projection,
-            "KernelLaunch::new(gpu,kernel).grid([plan.rows,1,1]).block([plan.threads,1,1]).arg_ptr(buffers.input_bf16.ptr).arg_ptr(buffers.weight_f32.ptr).arg_ptr(buffers.output_bf16.ptr).arg_u32(plan.rows).arg_u32(plan.input_width).arg_u32(plan.output_width)",
+            "KernelLaunch::new(gpu,self.index_projection).grid([plan.rows,1,1]).block([plan.threads,1,1]).arg_ptr(buffers.input_bf16.ptr).arg_ptr(buffers.weight_f32.ptr).arg_ptr(buffers.output_bf16.ptr).arg_u32(plan.rows).arg_u32(plan.input_width).arg_u32(plan.output_width)",
             6,
         )
-        // The projection arm no longer names its kernel inline: the
-        // `ATLAS_GLM53_DSA_INDEX_PROJ_TILED` lever picks between the donor
-        // kernel and the shared-memory-staged one. Same ABI either way, so the
-        // pin moves to the selection: exactly one alternative, the donor as the
-        // default/else arm, and no second launch built from it.
-        && compact(projection).contains("}else{self.index_projection};")
-        && compact(projection).matches("gpu.kernel(").count() == 1
-        && compact(projection)
-            .contains("gpu.kernel(\"glm53_prompt_glue\",\"atlas_glm53_dsa_index_projection_tiled\",)?")
 }
 
 fn cuda_contract(source: &str) -> bool {
@@ -379,17 +370,11 @@ fn source_contract_rejects_full_host_abi_swaps_and_duplicates() {
         ),
         (
             "KernelLaunch::new(gpu, self.layer_norm)",
-            "KernelLaunch::new(gpu, kernel)",
-        ),
-        // The tiled lever must not be able to swap in another kind's kernel,
-        // and the donor must stay the default arm.
-        (
-            "} else {\n                    self.index_projection\n                };",
-            "} else {\n                    self.layer_norm\n                };",
+            "KernelLaunch::new(gpu, self.index_projection)",
         ),
         (
-            "\"atlas_glm53_dsa_index_projection_tiled\",",
-            "\"atlas_glm53_dsa_biased_layer_norm_bf16\",",
+            "KernelLaunch::new(gpu, self.index_projection)",
+            "KernelLaunch::new(gpu, self.layer_norm)",
         ),
     ] {
         assert!(!host_contract(&mutation(HOST, from, to)));
@@ -402,9 +387,7 @@ fn source_contract_rejects_full_host_abi_swaps_and_duplicates() {
     assert!(!host_contract(&rms_pointer_swap));
     for (kernel, indentation) in [
         ("self.layer_norm", "                    "),
-        // The projection arm launches through the `kernel` binding the tiled
-        // lever selects, not the field directly.
-        ("kernel", "                    "),
+        ("self.index_projection", "                    "),
     ] {
         let from = format!(
             "KernelLaunch::new(gpu, {kernel})\n{indentation}.grid([plan.rows, 1, 1])\n{indentation}.block([plan.threads, 1, 1])"

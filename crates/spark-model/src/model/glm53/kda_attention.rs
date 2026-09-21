@@ -34,6 +34,25 @@
 //! [`Glm53KdaScratchState::prime`].
 
 use crate::model::glm53::oracle_dump::t;
+
+/// `ATLAS_GLM53_KDA_CONV_FUSED=1`: feed the KDA conv stage the EXL3 combined
+/// `[tokens][3][8192]` projection directly, so `atlas_glm53_kda_split_qkv` does
+/// not have to materialise three dense planes first. Bit-identical.
+fn glm53_kda_conv_fused() -> anyhow::Result<bool> {
+    use std::sync::OnceLock;
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ON.get_or_init(|| match std::env::var("ATLAS_GLM53_KDA_CONV_FUSED") {
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(other) => Err(format!(
+            "ATLAS_GLM53_KDA_CONV_FUSED must be 0 or 1, got {other:?}"
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(format!("ATLAS_GLM53_KDA_CONV_FUSED: {e}")),
+    })
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
 use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::gguf::GgmlType;
@@ -565,7 +584,10 @@ impl Glm53KdaAttentionKernels {
             projection_scratch,
             stream,
         )?;
-        if rows > 1 {
+        let conv_fused = rows > 1
+            && glm53_kda_conv_fused()?
+            && glm53_layer_major_prefill_active();
+        if rows > 1 && !conv_fused {
             self.kda.split_qkv(
                 gpu,
                 rows,
@@ -629,6 +651,49 @@ impl Glm53KdaAttentionKernels {
                     },
                     stream,
                 )?;
+                gpu.copy_d2d_async(
+                    conv.staged_state_f32.ptr,
+                    conv.persistent_state_f32.ptr,
+                    conv.staged_state_f32.bytes,
+                    stream,
+                )?;
+            }
+        } else if conv_fused {
+            self.conv.launch_stage_combined(
+                gpu,
+                Glm53KdaConvPlan::new(
+                    1,
+                    rows,
+                    capacity,
+                    position,
+                    position
+                        .checked_add(rows)
+                        .context("GLM KDA conv position overflow")?,
+                    HEADS,
+                    HEAD_DIM,
+                    CONV_KERNEL,
+                    nonce,
+                )?,
+                qkv,
+                Glm53KdaConvBuffers {
+                    q_input_bf16: buffers.q_proj_bf16,
+                    k_input_bf16: buffers.k_proj_bf16,
+                    v_input_bf16: buffers.v_proj_bf16,
+                    q_weight_f32: conv_weights[0],
+                    k_weight_f32: conv_weights[1],
+                    v_weight_f32: conv_weights[2],
+                    persistent_state_f32: conv.persistent_state_f32,
+                    staged_state_f32: conv.staged_state_f32,
+                    q_output_bf16: buffers.q_conv_bf16,
+                    k_output_bf16: buffers.k_conv_bf16,
+                    v_output_bf16: buffers.v_conv_bf16,
+                    published_ends_u32: conv.published_ends_u32,
+                    published_nonces_u64: conv.published_nonces_u64,
+                    logical_lengths_u32: conv.logical_lengths_u32,
+                },
+                stream,
+            )?;
+            if batch_exact_carry {
                 gpu.copy_d2d_async(
                     conv.staged_state_f32.ptr,
                     conv.persistent_state_f32.ptr,

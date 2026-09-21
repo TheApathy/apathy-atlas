@@ -78,6 +78,7 @@ pub use glm53_exl3_route_policy::Glm53Exl3RoutePolicy;
 mod glm53_hyper;
 mod glm53_kda;
 mod glm53_kda_conv;
+mod glm53_kda_conv_fused;
 mod glm53_kda_decode;
 mod glm53_kda_prefill;
 mod glm53_router;
