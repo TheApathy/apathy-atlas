@@ -1,45 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Server initialization and runtime: phases 0-11 of the Atlas startup sequence.
+//! Process-scoped startup: the parts of bringing a server up that happen ONCE,
+//! however many models the process goes on to serve.
 //!
-//! Refactor wave-4f extracted the bulk of each phase to `serve_phases.rs`
-//! (resolve_topology, preflight_reserve, load_weight_store,
-//! resolve_kv_cache_config, resolve_tokenizer_runtime, init_nccl_comm,
-//! maybe_run_ep_worker, build_model, etc.) — `serve` now reads as a
-//! straight call sequence rather than 1.8 KLOC of inline wiring.
+//! The model-dependent remainder — config, weights, KV cache, tokenizer,
+//! scheduler, `AppState` — lives in `serve_load::load_model`, which this calls
+//! and which a swap calls again. The line between them is not cosmetic: it is
+//! the difference between "load another model" and "install a second set of
+//! signal handlers, start a second dashboard thread, and spawn a second OOM
+//! watchdog", which is what the fused version would have done.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::mpsc;
 
-use crate::api::InferenceRequest;
-use crate::main_modules::AppState;
-use crate::main_modules::serve_phases;
-use crate::tokenizer::ChatTokenizer;
-use crate::{cli, scheduler, scheduling_policy, session_manager};
-
-/// What the blocking startup hands to the async tail.
-///
-/// The last element is the SCHEDULER'S JOIN HANDLE. It used to be dropped at
-/// the `thread::spawn` that created it, which is fine for a process that only
-/// ever runs one model and exits — and is the third of the three things a
-/// model swap needs, because the outgoing scheduler cannot be torn down
-/// without it. Carried rather than stored in a static so its single owner is
-/// visible in the type.
-type Prepared = (
-    Arc<AppState>,
-    Arc<std::sync::atomic::AtomicBool>,
-    String,
-    u16,
-    SchedulerHandle,
-);
-
-/// The scheduler thread's join handle, kept so a future swap can join the
-/// outgoing scheduler instead of leaking it.
-///
-/// `Option` because the EP worker ranks never spawn one.
-pub(crate) type SchedulerHandle = Option<std::thread::JoinHandle<()>>;
+use crate::cli;
+use crate::main_modules::model_host::ModelHost;
+use crate::main_modules::serve_load::{self, Prepared};
 
 /// Bring the engine up, then serve.
 ///
@@ -58,24 +35,58 @@ pub(crate) async fn serve(
     args: cli::ServeArgs,
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
 ) -> Result<()> {
-    // Signal listeners belong on the runtime, not inside the blocking section.
-    let Some((state, model_ready, bind, port, scheduler)) =
-        tokio::task::spawn_blocking(move || startup(args, tui_progress)).await??
+    // ONE host for the process lifetime, built HERE rather than inside startup
+    // — and built before the load, so the dashboard can hold it while the first
+    // model is still reading shards, and so a swap has somewhere to publish to.
+    //
+    // Constructed on the runtime deliberately: `ModelHost::empty` captures
+    // `Handle::try_current()`, and a swap driven from the TUI's plain thread
+    // has no runtime in scope. Without a handle captured here, the first
+    // Library launch panics with "there is no reactor running" — after the
+    // outgoing model has already been released.
+    let host = Arc::new(ModelHost::empty());
+    // Recorded BEFORE `args` moves into startup: the first swap restores to
+    // this if its load fails, and without it the first swap is the one swap
+    // with no safety net.
+    host.set_args(args.clone());
+    // Process-scoped, and in force from the moment the listener is up —
+    // including while a swap has no model loaded. Whether a request is
+    // authorised must not depend on whether a model happens to be resident,
+    // and a recipe's argv must never be able to drop `--require-auth`.
+    let auth = build_auth_config(&args)?;
+    host.set_auth(auth.clone());
+    // Likewise process-scoped: these three outlive every model. Built once,
+    // here, so a swap can only ever carry them forward.
+    let carried = serve_load::Carried::from_env()
+        .map_err(|e| anyhow::anyhow!("process-scoped state: {e}"))?;
+    host.set_process(carried.clone());
+
+    let Some(prepared) =
+        tokio::task::spawn_blocking(move || startup(args, tui_progress, carried, auth)).await??
     else {
         return Ok(()); // EP worker: no router on this rank
     };
-    // HELD, not dropped. Dropping a `JoinHandle` detaches the thread, which is
-    // harmless for a process that runs one model and exits — and makes a swap
-    // impossible, because the outgoing scheduler can then never be joined.
-    // Named `_scheduler` rather than `_`: `let _ = handle` drops it
-    // immediately, which is the bug this is fixing.
-    let _scheduler = scheduler;
-    crate::main_modules::serve_router::build_and_serve(state, model_ready, &bind, port).await
+
+    // Into the HOST, not into a local. The router reads the current model
+    // through the host on every request, which is what lets a swap change what
+    // is served without rebuilding the router or moving the socket.
+    host.publish(prepared.state);
+    // The first load's scheduler belongs to the host too. Dropping a
+    // `JoinHandle` detaches the thread, which is harmless for a process that
+    // runs one model and exits — and makes a swap impossible, because the
+    // outgoing scheduler can then never be joined, and without that join
+    // teardown races live kernels.
+    host.set_scheduler(prepared.scheduler);
+    crate::main_modules::serve_router::build_and_serve(host, &prepared.bind, prepared.port).await
 }
 
+/// The once-per-process half. Everything here is either global state or a
+/// thread that outlives every model; nothing here is re-run by a swap.
 fn startup(
-    mut args: cli::ServeArgs,
+    args: cli::ServeArgs,
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
+    carried: serve_load::Carried,
+    auth: Option<Arc<crate::auth::AuthConfig>>,
 ) -> Result<Option<Prepared>> {
     tracing::info!("Atlas Spark starting...");
     tracing::info!("Licensed under AGPL-3.0-only — see /LICENSE in this container");
@@ -99,699 +110,14 @@ fn startup(
     if let Some(progress_rx) = tui_progress
         && args.rank == 0
     {
-        // `None`, NOT `ModelHost::empty()`. An empty host is constructible,
-        // but nothing on this path ever installs the loaded model into it, so
-        // it would answer "no model loaded" for the whole life of a server
-        // that is serving one. `None` says the dashboard has no host to ask;
-        // an empty host would say the wrong thing confidently.
+        // Still `None`, and deliberately. Handing the dashboard the host is
+        // what lets the Library START a model, and that path needs
+        // `model_swap`, which is not ported — so passing it here would change
+        // what the Library tab does without giving it anything to do it with.
+        // The host now exists and the router reads through it; wiring the
+        // dashboard to it belongs with the swap.
         crate::tui::start(args.clone(), progress_rx, None);
     }
-
-    // Parse before model resolution/weight loading. Recognized dynamic values
-    // are rejected against the resolved drafter family below; unknown values
-    // are always an immediate user error rather than a fallback.
-    let dspark_verify_mode = args
-        .dspark_verify_mode
-        .parse::<spark_model::weight_loader::DsparkVerifyMode>()
-        .context("Invalid --dspark-verify-mode")?;
-
-    // 0. Resolve model directory from HF ID or path
-    spark_runtime::progress::phase(1, "model resolve");
-    let model_dir = serve_phases::resolve_model_dir(&args)?;
-
-    tracing::info!("Port: {}", args.port);
-
-    tracing::info!("SSM decode dtype: f32 (full precision)");
-
-    // 1. Load model config (supports HF config.json and Mistral params.json)
-    spark_runtime::progress::phase(2, "config");
-    let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
-
-    // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
-    // whose TOP LEVEL is already the quantization block.
-    serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
-
-    let context_extension = super::context_extension::apply_context_extension(
-        &mut config,
-        args.max_seq_len,
-        args.rope_theta_override,
-        args.rope_yarn_factor,
-    )?;
-    let context_admission = super::context_extension::validate_context_extension_runtime(
-        context_extension,
-        super::context_extension::ContextRuntimeMode {
-            speculative: args.speculative,
-            dflash: args.dflash,
-            self_speculative: args.self_speculative,
-            ngram_speculative: args.ngram_speculative,
-            high_speed_swap: args.high_speed_swap,
-            hss_cache_blocks_per_seq: args.high_speed_swap_cache_blocks_per_seq,
-            block_size: args.block_size,
-            max_batch_size: args.max_batch_size,
-            max_seq_len: args.max_seq_len,
-            config_capacity: config.max_position_embeddings,
-        },
-    )?;
-    if let Some(extension) = context_extension {
-        match extension {
-            super::context_extension::ContextExtension::Yarn {
-                native_tokens,
-                requested_tokens,
-                factor,
-                original_tokens,
-                attention_factor,
-            } => tracing::warn!(
-                "static YaRN context extension: native={} requested={} factor={} \
-                 original={} attention_factor={}; capacity enabled, retrieval qualification required",
-                native_tokens,
-                requested_tokens,
-                factor,
-                original_tokens,
-                attention_factor,
-            ),
-            super::context_extension::ContextExtension::Theta {
-                native_tokens,
-                requested_tokens,
-                rope_theta,
-            } => tracing::warn!(
-                "EXPERIMENTAL theta context extension: native={} requested={} rope_theta={}; \
-                 capacity is enabled but long-context quality is not qualified",
-                native_tokens,
-                requested_tokens,
-                rope_theta,
-            ),
-        }
-    }
-
-    if let Some(ref qc) = config.quantization_config {
-        tracing::info!(
-            "Quantization config: method={:?}, algo={:?}, format={:?}, {} module(s) in ignore list",
-            qc.quant_method,
-            qc.quant_algo,
-            qc.format,
-            qc.ignore_modules.len(),
-        );
-    }
-
-    tracing::info!(
-        "Model config: {} layers, {} attention, {} SSM, {} experts, rope_theta={}, head_dim={}, rotary_dim={}",
-        config.num_hidden_layers,
-        config.num_attention_layers(),
-        config.num_ssm_layers(),
-        config.num_experts,
-        config.rope_theta,
-        config.head_dim,
-        config.rotary_dim(),
-    );
-
-    // 2. Select kernel target and initialize GPU backend
-    spark_runtime::progress::phase(3, "gpu init");
-    //
-    // Default dispatch: each kernel target declares which (model_type,
-    // hidden_size) pairs it supports via [[model_types]] in MODEL.toml.
-    // Exact hidden_size matches win over wildcards.
-    //
-    // CLI override: `--kernel-target <NAME>` forces a specific target
-    // dir, useful for abliterated/heretic checkpoints whose tuned
-    // MODEL.toml defaults would otherwise be shadowed by the canonical
-    // target with the same `(model_type, hidden_size)` tuple.
-    let ptx_set = if let Some(ref forced) = args.kernel_target {
-        // Exact name match first, then substring fallback. Exact-first
-        // is important for abliterated targets whose names are
-        // supersets of the canonical (e.g. `qwen3.6-35b-a3b-abl`
-        // contains `qwen3.6-35b-a3b`).
-        atlas_kernels::available_targets()
-            .into_iter()
-            .find(|t| t.target.model == *forced)
-            .or_else(|| atlas_kernels::ptx_for_model(forced))
-            .with_context(|| {
-                format!(
-                    "--kernel-target '{}' did not match any compiled kernel target. \
-                     Available targets: {:?}",
-                    forced,
-                    atlas_kernels::available_targets()
-                        .iter()
-                        .map(|t| &t.target.model)
-                        .collect::<Vec<_>>(),
-                )
-            })?
-    } else {
-        atlas_kernels::ptx_for_config(&config.model_type, config.hidden_size).with_context(
-            || {
-                format!(
-                    "No compiled kernel target matches model_type '{}' / hidden_size={}. \
-                     Available targets: {:?}",
-                    config.model_type,
-                    config.hidden_size,
-                    atlas_kernels::available_targets()
-                        .iter()
-                        .map(|t| &t.target.model)
-                        .collect::<Vec<_>>(),
-                )
-            },
-        )?
-    };
-    let sampling_presets = ptx_set.sampling;
-    tracing::info!(
-        "Selected kernel target: {} ({} modules)",
-        ptx_set.target,
-        ptx_set.modules.len(),
-    );
-
-    // Apply MODEL.toml [behavior].default_num_drafts unless user passed --num-drafts.
-    serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
-
-    let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
-
-    // ── Pre-load reserve preflight ──
-    let serve_phases::ReservePreflight {
-        inference_reserve,
-        buffer_arena_bytes,
-        gdn_two_phase_bytes,
-        ssm_prefill_chunk,
-        max_batch_tokens_pre,
-    } = serve_phases::preflight_reserve(&args, &config, free_mem)?;
-    let total_reserve = inference_reserve + buffer_arena_bytes;
-
-    // 2a-2. OOM watchdog: background async task that polls GPU memory every 2s.
-    // On GB10 unified memory, GPU OOM = system freeze, so we exit(1) early.
-    // Threshold: 2 GB (enough to detect runaway allocation before system locks up).
-    //
-    // CUDA-only: Apple Silicon UMA already exposes `currentAllocatedSize`
-    // and the OS handles memory pressure via Metal's working-set policy,
-    // so the dedicated watchdog isn't needed.
-    #[cfg(feature = "cuda")]
-    let _oom_watchdog = spark_runtime::cuda_backend::spawn_oom_watchdog(
-        2048, // 2 GB threshold
-        std::time::Duration::from_secs(2),
-    );
-    #[cfg(feature = "cuda")]
-    tracing::info!("OOM watchdog started (threshold: 2 GB, interval: 2s)");
-
-    // 2b. Resolve TP / EP topology and set on model config.
-    spark_runtime::progress::phase(4, "topology");
-    let serve_phases::Topology {
-        world_size,
-        tp_size: _tp_size,
-        ep_size,
-        tp_rank: _tp_rank,
-        ep_rank,
-    } = serve_phases::resolve_topology(&args, &mut config)?;
-    // FP8 KV calibration: CLI flag overrides MODEL.toml default.
-    config.fp8_kv_calibration_tokens = if args.fp8_kv_calibration_tokens > 0 {
-        args.fp8_kv_calibration_tokens
-    } else {
-        ptx_set.behavior.fp8_kv_calibration_tokens
-    };
-
-    // 3. Load model weights
-    spark_runtime::progress::phase(5, "weight load");
-    let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
-    tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
-    let store = serve_phases::load_weight_store(
-        &args,
-        &config,
-        &model_dir,
-        gpu.as_ref(),
-        ep_rank,
-        ep_size,
-        oom_reserve_bytes,
-    )?;
-
-    // 3b. Auto-detect weight key prefix for nested models.
-    serve_phases::auto_detect_weight_prefix(&store, &mut config);
-
-    // Pre-flight weight-store / config consistency check. Runs before
-    // NCCL init so a mis-matched checkpoint (wrong expert count, MiniMax
-    // + MTP tensors + `--speculative`, missing embedding, etc.) aborts
-    // this rank with a readable error BEFORE rank 1 ever connects or
-    // `ncclCommInitRank` is called. Several community re-quants of
-    // MiniMax M2.7 hang on NCCL init today because the actual mismatch
-    // only surfaces later inside `build_model`; this check surfaces it
-    // up-front.
-    spark_model::preflight::preflight(&store, &config, args.speculative)
-        .context("Checkpoint pre-flight check failed")?;
-
-    // Resolve and log the QuantFormat dispatch decision now so a silent
-    // fallback is visible in the server log (and not just in the
-    // detection code path mid-load). The returned trait object is
-    // currently only consulted via `detect_nvfp4_variant`; explicit
-    // use at each load site is a follow-up migration.
-    let quant_format = spark_model::quant_format::detect_quant_format(&config, &store);
-    tracing::info!(
-        "Quantization format: {} (base variant {:?}), ignored globs = {}",
-        quant_format.name(),
-        quant_format.base_variant(),
-        match &config.quantization_config {
-            Some(qc) => qc.ignore_modules.len(),
-            None => 0,
-        },
-    );
-
-    // 4. Post-load OOM check + audit log.
-    serve_phases::post_load_memory_audit(
-        &args,
-        &config,
-        gpu.as_ref(),
-        store.total_bytes(),
-        free_mem,
-        inference_reserve,
-        total_reserve,
-        gdn_two_phase_bytes,
-        max_batch_tokens_pre,
-    )?;
-
-    // 5. Build model via factory.
-    spark_runtime::progress::phase(6, "kv cache");
-    let serve_phases::PrefillBudget {
-        prefill_budget,
-        max_batch_tokens,
-        spec_tokens: _spec_tokens,
-    } = serve_phases::resolve_prefill_budget(&args, ssm_prefill_chunk);
-    // `--mtp-gate` accepts a closed set. There is no `cli/validate.rs` enum
-    // layer in this fork, so reject a typo here rather than let
-    // `--mtp-gate always` silently mean "no gate" and quietly invalidate a
-    // benchmark arm.
-    const MTP_GATES: &[&str] = &["auto", "force", "dflash", "mtp"];
-    if let Some(gate) = args.mtp_gate.as_deref()
-        && !MTP_GATES.contains(&gate)
-    {
-        anyhow::bail!(
-            "--mtp-gate {gate}: unknown value (expected one of {MTP_GATES:?}). \
-             Omit the flag to run with no gate."
-        );
-    }
-    if args.mtp_gate.is_some() && !(args.speculative || args.dflash) {
-        anyhow::bail!(
-            "--mtp-gate needs speculation: pass --dflash and/or --speculative, \
-             or omit --mtp-gate."
-        );
-    }
-    if args.dflash && args.enable_prefix_caching {
-        tracing::warn!(
-            "dflash: --enable-prefix-caching has a community-reported correctness regression on SM12.x with DFlash; outputs may be wrong on multi-turn cache hits. Run a greedy diff-test against a non-DFlash baseline before relying on outputs."
-        );
-    }
-    let prefix_cache = serve_phases::build_prefix_cache(&args);
-    let comm = serve_phases::init_nccl_comm(&args, gpu.as_ref(), world_size)?;
-    if args.profile {
-        // SAFETY: called before any threads are spawned.
-        unsafe {
-            std::env::set_var("ATLAS_PROFILE", "1");
-        }
-    }
-    serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
-    let serve_phases::KvCacheConfig {
-        effective_kv_dtype_str: _,
-        kv_dtype,
-        layer_dtypes,
-        hss_cache_blocks_per_seq: _,
-    } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
-    let dflash_drafter_state =
-        serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?;
-    if let Some((_, drafter_config)) = dflash_drafter_state.as_ref() {
-        args.dflash_gamma = Some(drafter_config.resolve_draft_count(args.dflash_gamma)?);
-    }
-    let dflash_quantization = match args.dflash_quantization.as_str() {
-        "bf16" => spark_model::layers::DflashQuantization::Bf16,
-        "nvfp4" => spark_model::layers::DflashQuantization::Nvfp4,
-        other => {
-            tracing::warn!(
-                "Unknown --dflash-quantization value `{other}` — defaulting to bf16. \
-                 Accepted: `bf16`, `nvfp4`."
-            );
-            spark_model::layers::DflashQuantization::Bf16
-        }
-    };
-    let dflash_args =
-        dflash_drafter_state
-            .as_ref()
-            .map(|(s, c)| spark_model::factory::DflashBuildArgs {
-                drafter_store: s,
-                drafter_config: c.clone(),
-                gamma: args.dflash_gamma,
-                dspark_verify_mode,
-                window_size: if args.dflash_window_size > 0 {
-                    Some(args.dflash_window_size)
-                } else {
-                    None
-                },
-                quantization: dflash_quantization,
-            });
-    let model = serve_phases::build_model(
-        &args,
-        &config,
-        context_admission,
-        &store,
-        gpu,
-        max_batch_tokens,
-        kv_dtype,
-        inference_reserve,
-        layer_dtypes,
-        prefix_cache,
-        comm,
-        dflash_args,
-    )?;
-
-    // `--check-kernels`: every kernel lookup is eager and lives in a layer
-    // constructor on the `build_model` path above, so the audit is complete
-    // exactly here — and a check that ran any earlier would resolve a
-    // DIFFERENT set than a real serve. Prints the report and exits with the
-    // unresolved count; never returns. The scheduler is not started and no
-    // port is bound.
-    if args.check_kernels {
-        serve_phases::check_and_exit(&ptx_set);
-    }
-    spark_runtime::progress::phase(7, "kernel audit");
-
-    // Phase 6.3 — HSS config built early so the EP worker can install it.
-    let early_high_speed_swap_cfg = serve_phases::build_high_speed_swap_config(&args)?;
-
-    // EP worker: rank > 0 enters command loop, returns when head exits.
-    let mut model_opt = Some(model);
-    if serve_phases::maybe_run_ep_worker(&args, &mut model_opt, &early_high_speed_swap_cfg)? {
-        // An EP worker (rank > 0) never serves HTTP: it ran its command loop and
-        // the head has exited. `None` = nothing for the async tail to do.
-        return Ok(None);
-    }
-    let model = model_opt.expect("head retains model on rank 0");
-
-    // TQ+ InnerQ: opt-in via `TURBO_INNERQ=N` (N = calibration token count).
-    // Once enabled, the kernel-side apply pass starts accumulating K² stats
-    // and the scheduler polls `maybe_finalize` per prefill chunk; once N
-    // tokens have flowed through, scales activate and stay live for the
-    // process lifetime. CUDA-only: the driver talks to the CUDA Driver API
-    // directly via `atlas_core::registry`, which doesn't exist on metal.
-    #[cfg(feature = "cuda")]
-    if let Some(driver) = spark_model::layers::qwen3_attention::InnerQDriver::from_env() {
-        match driver.start() {
-            Ok(()) => {
-                let _ = spark_model::layers::qwen3_attention::INNERQ.set(driver);
-            }
-            Err(e) => {
-                tracing::warn!("InnerQ calibration disabled: start() failed: {e:#}");
-            }
-        }
-    }
-
-    // Build EOS token list from generation_config.json (authoritative) or config.json fallback
-    let mut eos_tokens = serve_phases::load_eos_tokens(&model_dir, &config);
-
-    // Read default sampling parameters from generation_config.json.
-    let serve_phases::SamplingDefaults {
-        temperature: default_temperature,
-        top_k: default_top_k,
-        top_p: default_top_p,
-        top_n_sigma: default_top_n_sigma,
-        min_p: default_min_p,
-    } = serve_phases::load_sampling_defaults(&model_dir, &args, &sampling_presets.non_thinking);
-    serve_phases::log_sampling_presets(&sampling_presets, default_min_p);
-
-    // 6. Load tokenizer
-    spark_runtime::progress::phase(8, "tokenizer");
-    // Thinking support is derived from model capabilities, not hardcoded model names.
-    // Models with SSM layers or Qwen3.5-style architecture support <think> tokens.
-    // The --enable-thinking flag controls OPEN-ENDED vs CLOSED thinking.
-    let caps = config.capabilities();
-    let supports_thinking = caps.supports_thinking;
-    let tokenizer = ChatTokenizer::from_model_dir(
-        &model_dir,
-        eos_tokens[0],
-        supports_thinking,
-        &config.model_type,
-        Some(std::path::Path::new(".")), // repo root for override templates
-    )?;
-
-    // REST retrieval draft store (ATLAS_REST_STORE). Validated against the
-    // tokenizer just loaded; a fingerprint mismatch aborts startup.
-    serve_phases::init_rest_store(&model_dir)?;
-
-    // Tokenizer-derived runtime: vocab cap, reasoning parser, think tokens,
-    // im_start hard-stop, reflection suppression, tool-call open/close tokens,
-    // and the XGrammar engine.
-    let serve_phases::TokenizerRuntime {
-        reasoning_parser_box,
-        think_end_token,
-        think_start_token,
-        code_fence_token,
-        reflection_suppress_ids,
-        tool_call_start_token,
-        tool_call_end_token,
-        grammar_engine,
-    } = serve_phases::resolve_tokenizer_runtime(
-        &args,
-        &mut config,
-        &tokenizer,
-        &mut eos_tokens,
-        supports_thinking,
-    );
-
-    // 7. Create scheduler channel + spawn scheduler
-    spark_runtime::progress::phase(9, "scheduler");
-    let (request_tx, request_rx) = mpsc::channel::<InferenceRequest>(args.max_num_seqs);
-
-    let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
-
-    let scheduler_model = model;
-    let scheduler_eos = eos_tokens;
-    // EP: force batch_size=1 (worker protocol is single-sequence).
-    // MTP speculative decoding IS supported with EP via verify broadcast protocol.
-    let max_batch_size = if world_size > 1 {
-        tracing::info!("EP active: forcing max_batch_size=1");
-        1
-    } else {
-        args.max_batch_size
-    };
-    // `use_speculative` gates the scheduler's `step_mtp` path which already
-    // dispatches both MTP and DFlash proposers via the shared `DraftProposer`
-    // trait + the `drafts.len() ≥ 4` ladder route to `step_verify_dflash`
-    // (scheduler.rs:3013). So `--dflash` enables `use_speculative` too.
-    let use_speculative = (args.speculative || args.dflash) && scheduler_model.has_proposer();
-    let use_self_spec = args.self_speculative && scheduler_model.has_self_speculative();
-    let use_ngram_spec = args.ngram_speculative;
-    // `DraftProposer::propose` defines `num_drafts` as the actual maximum
-    // number of speculative tokens, not verify width K. DFlash currently owns
-    // its configured block width internally, but keep the scheduler value in
-    // the same unit for early-exit and future proposer implementations.
-    let num_drafts = if args.dflash {
-        args.dflash_gamma.unwrap_or(15).max(1)
-    } else {
-        args.num_drafts
-    };
-
-    if args.dflash {
-        tracing::info!(
-            "DFlash speculative decoding: ENABLED (γ={}, window={}, drafter installed)",
-            args.dflash_gamma.unwrap_or(15),
-            if args.dflash_window_size == 0 {
-                "full".to_string()
-            } else {
-                args.dflash_window_size.to_string()
-            }
-        );
-    } else if use_ngram_spec {
-        tracing::info!("N-gram speculative decoding: ENABLED (K=2 verify, CPU proposer)");
-    } else if use_self_spec {
-        tracing::info!(
-            "Self-speculative decoding: ENABLED ({num_drafts} drafts/step, layer-skipping)"
-        );
-    } else if use_speculative {
-        tracing::info!("Speculative decoding: ENABLED ({num_drafts} drafts/step)");
-        // Loud warnings for known-degenerate gate combinations so users
-        // don't enable them by accident expecting concurrency wins.
-        if spark_model::layers::mtp_k3_batch_cseq_enabled() {
-            tracing::warn!(
-                "ATLAS_MTP_K3_BATCH_CSEQ=1 is set. The c-batched K=3 verify \
-                 path is documented as ~600-1300 ms per K-step at c=2-3 \
-                 (vs ~85 ms single-seq graphed). Without the multi-seq \
-                 CUDA-graph unblocker (also see ATLAS_SSM_MULTI_SEQ_GRAPH), \
-                 enabling this dramatically REDUCES throughput at \
-                 concurrency. Recommend leaving unset until the indirection \
-                 table fix lands upstream."
-            );
-        }
-        if spark_model::layers::mtp_k2_batch_cseq_enabled() {
-            tracing::warn!(
-                "ATLAS_MTP_K2_BATCH_CSEQ=1 is set (K=2 sibling of the \
-                 c-batched K=3 verify path). Same caveat applies — \
-                 reduces throughput at concurrency until graph capture \
-                 lands. Leave unset for production."
-            );
-        }
-    } else if scheduler_model.has_proposer() {
-        tracing::info!(
-            "MTP proposer available but speculative decoding disabled (use --speculative to enable)"
-        );
-    }
-
-    // ── Multi-seq SSM gate status notes ──
-    // ATLAS_SSM_MULTI_SEQ_BATCHED is still un-wired (batched-projections
-    // path scoped but not landed — would replace the per-seq QKVZ/BA/
-    // out_proj launches with M=n batched GEMVs). Setting it is a no-op.
-    // ATLAS_SSM_MULTI_SEQ_KERNEL is now LIVE: routes conv1d_update_l2norm
-    // + gdn_decode through the FP32 multi-seq variants, collapsing those
-    // two per-seq launches into one each at num_seqs ≥ 2. Wired in
-    // layers/qwen3_ssm/trait_decode_multi_seq.rs.
-    if spark_model::layers::ssm_multi_seq_batched_enabled() {
-        tracing::warn!(
-            "ATLAS_SSM_MULTI_SEQ_BATCHED=1 is set, but the batched-projections \
-             multi-seq SSM decode path is NOT YET IMPLEMENTED in \
-             decode_multi_seq_inner — the per-seq projection loop runs \
-             regardless. Setting this env var is currently a no-op. \
-             Tracking: layers/qwen3_ssm/trait_decode_multi_seq.rs:129 \
-             (the 7-step loop that would be replaced by M=n batched GEMVs)."
-        );
-    }
-    if spark_model::layers::ssm_multi_seq_kernel_enabled() {
-        tracing::info!(
-            "ATLAS_SSM_MULTI_SEQ_KERNEL=1 is set. The multi-seq SSM \
-             state-advance kernels (conv1d_update_l2norm_f32_multi_seq, \
-             gdn_decode_f32_multi_seq) will be dispatched at num_seqs ≥ 2 \
-             during multi-seq decode, collapsing 2 per-seq launches per \
-             SSM layer per token to 1 each. Saves ~96 launches per token \
-             at num_seqs=4 × 48 SSM layers."
-        );
-    }
-
-    let policy: Box<dyn scheduling_policy::SchedulingPolicy> = match args.scheduling_policy.as_str()
-    {
-        "fifo" => {
-            tracing::info!("Scheduling policy: FIFO");
-            Box::new(scheduling_policy::FifoPolicy)
-        }
-        "slai" => {
-            tracing::info!(
-                "Scheduling policy: SLAI (TBT deadline={}ms)",
-                args.tbt_deadline_ms,
-            );
-            Box::new(scheduling_policy::SlaiPolicy::new(args.tbt_deadline_ms))
-        }
-        other => anyhow::bail!(
-            "Unknown scheduling policy '{}'. Supported: fifo, slai",
-            other,
-        ),
-    };
-
-    // Use prefill_budget (which accounts for SSM no-chunking override) instead of raw CLI arg.
-    let max_prefill_tokens = prefill_budget;
-    let swap_space_gb = args.swap_space_gb;
-    let block_size = args.block_size;
-
-    // ── --high-speed-swap config validation (PCND: required-when-set) ──
-    let high_speed_swap_cfg = serve_phases::validate_head_high_speed_swap(
-        &args,
-        &early_high_speed_swap_cfg,
-        swap_space_gb,
-    )?;
-
-    let adaptive_sampling = args.adaptive_sampling;
-    let session_manager = session_manager::SessionSsmManager::new(600); // 10 min TTL
-    // Spontaneous-thinking budget: when the model emits `<think>` without
-    // the request having explicitly enabled thinking, this caps how many
-    // thinking tokens are allowed before `</think>` is force-emitted. CLI
-    // override beats MODEL.toml. Used by the scheduler in place of a
-    // previous hard-coded 512 fallback so MODEL.toml can right-size the
-    // cap per architecture.
-    let scheduler_spontaneous_think_budget = args
-        .max_thinking_budget
-        .unwrap_or(ptx_set.behavior.max_thinking_budget);
-    // Moved into the scheduler thread; `None` leaves the gate disarmed.
-    let scheduler_mtp_gate = args.mtp_gate.clone();
-    let scheduler_handle = std::thread::spawn(move || {
-        scheduler::run(
-            scheduler_model,
-            request_rx,
-            scheduler_eos,
-            max_batch_size,
-            use_speculative,
-            num_drafts,
-            policy,
-            max_prefill_tokens,
-            max_batch_tokens,
-            use_self_spec,
-            use_ngram_spec,
-            swap_space_gb,
-            high_speed_swap_cfg,
-            block_size,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            reflection_suppress_ids,
-            grammar_engine,
-            adaptive_sampling,
-            session_manager,
-            scheduler_spontaneous_think_budget,
-            scheduler_mtp_gate,
-        );
-    });
-
-    // Tool call parser resolution: CLI > MODEL.toml > defaults table.
-    let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
-
-    // 8. Build app state
-    let model_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // Built as ONE `Carried` rather than three loose values. These three
-    // outlive any model: a swap that rebuilt them would silently drop stored
-    // conversations and responses and reset every rate-limit bucket — no
-    // error, just a user noticing their history is gone. Constructing them
-    // together makes carrying them the only way to load a second model,
-    // because the compiler asks for the struct rather than the pieces.
-    let carried = super::serve_load::Carried::from_env()
-        .map_err(|e| anyhow::anyhow!("process-scoped state: {e}"))?;
-    let response_store = carried.response_store.clone();
-    let rate_limiter = carried.rate_limiter.clone();
-    let conversation_store = carried.conversation_store.clone();
-    serve_phases::log_response_store_audit(&response_store, &rate_limiter);
-    let dump_writer = serve_phases::open_dump_writer(&args);
-    let auth = build_auth_config(&args)?;
-    let state = Arc::new(AppState {
-        tokenizer,
-        model_name,
-        max_seq_len: args.max_seq_len,
-        yarn_context: config.yarn_factor > 0.0,
-        max_batch_size,
-        request_tx,
-        vision_config: config.vision.clone(),
-        default_temperature,
-        default_top_k,
-        default_top_p,
-        default_top_n_sigma,
-        default_min_p,
-        tool_call_parser,
-        reasoning_parser: reasoning_parser_box,
-        think_end_token_id: think_end_token,
-        think_start_token_id: think_start_token,
-        tool_max_tokens: args.tool_max_tokens,
-        sampling_presets,
-        tool_call_start_token_id: tool_call_start_token,
-        auto_compact_threshold: args.auto_compact,
-        model_ready: model_ready.clone(),
-        request_timeout: args.request_timeout,
-        // Behavior and effective_context from MODEL.toml, embedded at build time.
-        effective_context: 0, // TODO: embed effective_context in TargetPtxSet
-        behavior: {
-            let mut b = ptx_set.behavior.clone();
-            if let Some(cli_budget) = args.max_thinking_budget {
-                b.max_thinking_budget = cli_budget;
-            }
-            b
-        },
-        disable_thinking: args.disable_thinking,
-        disable_simhash_watchdog: args.disable_simhash_watchdog,
-        default_chat_template_kwargs: args
-            .default_chat_template_kwargs
-            .as_ref()
-            .and_then(|s| crate::openai::ChatTemplateKwargs::from_json(s)),
-        response_store,
-        rate_limiter,
-        conversation_store,
-        dump_writer,
-        auth,
-    });
-
-    serve_phases::log_behavior_audit(&args, &ptx_set);
 
     // Runtime per-kernel profiling toggle. SIGUSR1 enables `ATLAS_FULL_PROFILE`
     // behavior on the live instance (disables CUDA graph capture + activates
@@ -815,20 +141,15 @@ fn startup(
         tracing::info!("runtime profile toggle armed: SIGUSR1=enable SIGUSR2=disable");
     }
 
-    // 9-11. Router + HTTP server run on the async side; hand them the pieces.
-    Ok(Some((
-        state,
-        model_ready,
-        args.bind,
-        args.port,
-        Some(scheduler_handle),
-    )))
+    // Everything above is process-scoped. Everything below is the model, and
+    // this call is the one a swap will run again.
+    serve_load::load_model(args, carried, auth)
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an
 /// optional `AuthConfig`. Validates at startup so misconfigurations fail
 /// loudly instead of letting an unauthenticated server run silently.
-fn build_auth_config(args: &cli::ServeArgs) -> Result<Option<Arc<crate::auth::AuthConfig>>> {
+pub(super) fn build_auth_config(args: &cli::ServeArgs) -> Result<Option<Arc<crate::auth::AuthConfig>>> {
     if !args.require_auth {
         if args.auth_tokens_file.is_some() || args.auth_token.is_some() {
             tracing::warn!(

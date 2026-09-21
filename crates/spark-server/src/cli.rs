@@ -92,7 +92,7 @@ pub enum Command {
 }
 
 /// Arguments for the `serve` subcommand.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, PartialEq)]
 pub struct ServeArgs {
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
     /// or a local directory path containing config.json.

@@ -5,11 +5,22 @@ use std::fmt::Write as _;
 const CONTEXT: &str = include_str!("context_extension.rs");
 const RUNTIME: &str = include_str!("context_extension_runtime.rs");
 const ADMISSION: &str = include_str!("context_extension_admission.rs");
-const SERVE: &str = include_str!("serve.rs");
+const SERVE_LOAD: &str = include_str!("serve_load.rs");
 const SERVE_PHASES: &str = include_str!("serve_phases/mod.rs");
 const BUILD: &str = include_str!("serve_phases/build.rs");
 const CONTEXT_SHA256: &str = "d3a53b93ed3ccf1ab30c344549676877b268eb55bc12f8d98e72186f5892f1b4";
-const RUNTIME_SHA256: &str = "5a074f17f89325cf75b8cc2553d1253680e243b622324ccfcd6f7cbf1b3587dd";
+// RUNTIME moved only because of its `serve_integration_tests` module, which
+// now reads BOTH halves of the split: `SERVE_LOAD` (`serve_load.rs`) where the
+// guard must be, and `PROLOGUE` (`serve.rs`) where it must not. That module
+// gained two tests — one asserting the guard appears exactly once across the
+// two files, and a positive control feeding the rule a duplicated, a moved, an
+// absent and a hoisted-validator case so it is a check somebody has watched
+// FAIL rather than one that has only ever passed.
+//
+// The validator itself — `validate_context_extension_runtime` and every
+// `ensure!` in it — is untouched; the four hashes that did NOT move
+// (CONTEXT, ADMISSION, SERVE_PHASES, BUILD) are the evidence.
+const RUNTIME_SHA256: &str = "739521710b2af0942426ed07bfbaa6d7991659d803777a553d167fe4202c6e4c";
 const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b365770c07d0804b6bfa6";
 // Reviewed delta: publish effective max_batch_size for early C1 image admission.
 // Removing that single AppState initializer field reproduces the prior hash.
@@ -19,6 +30,25 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // Diffed before re-pinning: no context-extension path, admission rule or
 // phase ordering moved. The point of this hash is that somebody LOOKS when
 // it breaks — updating it without the diff is how it becomes a rubber stamp.
+// Re-pinned 2026-09-21 (THIRD time) for the model-host indirection. `serve.rs` was
+// SPLIT: the once-per-process prologue (banner, signal listeners, dashboard
+// thread, OOM watchdog, profiling toggle) stayed there, and everything
+// model-dependent — the whole context-extension path included — moved verbatim
+// into `serve_load::load_model`, which is the function a swap re-runs. So this
+// constant now reads `serve_load.rs`; pointed at `serve.rs` it would pass
+// vacuously against a file with no guard in it.
+//
+// Diffed before re-pinning, and this time MACHINE-checked rather than eyeballed:
+// the guard block (`let context_extension =` .. `if let Some(extension) =`) is
+// BYTE-IDENTICAL before and after the move, and it still precedes both
+// `phase(3, "gpu init")` and `init_gpu_backend` in the file it now lives in,
+// each appearing exactly once. The deltas inside `load_model` are elsewhere:
+// `Carried` and the auth policy became PARAMETERS instead of being rebuilt per
+// load (rebuilding them on a second load drops stored conversations and can
+// drop --require-auth), and `model_ready` is set here rather than in the
+// router, because the router is built once and a later load cannot rebuild it.
+// No admission rule and no phase ordering moved.
+//
 // Re-pinned 2026-09-21 (second time) for the engine-side gap fixes. The
 // serve.rs changes are: the three process-scoped stores now come from one
 // `Carried`; the scheduler thread's JoinHandle is bound and held instead of
@@ -27,7 +57,7 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // admission rule or phase ordering moved, which a `grep -c` over the diff
 // confirms at zero. This hash exists so somebody LOOKS when it breaks;
 // updating it without the diff is how it becomes a rubber stamp.
-const SERVE_SHA256: &str = "9c6193c18b6b5e14f6cfa6bf4db249c112d6e7af0c83d59bfa26ce82c3aca92c";
+const SERVE_LOAD_SHA256: &str = "c766de4bbe6f7fa4b269eb24bbc87b7252f59a68f8bface3109b26f773ad6fe0";
 const SERVE_PHASES_SHA256: &str =
     "e3e84d068c761ff43ad49a04c67d3cd37a8107f99110c919bd016832219c9f1e";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
@@ -145,7 +175,7 @@ fn sha256_padding_boundaries_and_production_sources_are_exact() {
     assert_eq!(sha256_hex(CONTEXT.as_bytes()), CONTEXT_SHA256);
     assert_eq!(sha256_hex(RUNTIME.as_bytes()), RUNTIME_SHA256);
     assert_eq!(sha256_hex(ADMISSION.as_bytes()), ADMISSION_SHA256);
-    assert_eq!(sha256_hex(SERVE.as_bytes()), SERVE_SHA256);
+    assert_eq!(sha256_hex(SERVE_LOAD.as_bytes()), SERVE_LOAD_SHA256);
     assert_eq!(sha256_hex(SERVE_PHASES.as_bytes()), SERVE_PHASES_SHA256);
     assert_eq!(sha256_hex(BUILD.as_bytes()), BUILD_SHA256);
 }
@@ -171,7 +201,7 @@ fn consumer_and_opaque_receipt_reject_omission_forgery_and_external_drift() {
             "    build_high_speed_swap_config, build_model, build_prefix_cache, maybe_run_ep_worker,",
             "    build_high_speed_swap_config, build_prefix_cache, maybe_run_ep_worker,",
         ),
-        (SERVE, SERVE_SHA256, "        context_admission,\n", ""),
+        (SERVE_LOAD, SERVE_LOAD_SHA256, "        context_admission,\n", ""),
         (
             ADMISSION,
             ADMISSION_SHA256,
@@ -241,8 +271,8 @@ fn full_source_authority_rejects_post_validation_and_cfg_split_drift() {
         "    config.max_position_embeddings = 1_048_576;\n",
         "    args.max_batch_size = 8;\n",
     ] {
-        let mutant = mutate_once(SERVE, seam, &format!("{insertion}{seam}"));
-        assert_ne!(sha256_hex(mutant.as_bytes()), SERVE_SHA256);
+        let mutant = mutate_once(SERVE_LOAD, seam, &format!("{insertion}{seam}"));
+        assert_ne!(sha256_hex(mutant.as_bytes()), SERVE_LOAD_SHA256);
     }
     let validator_body = "    let extended = match extension {";
     let mutant = mutate_once(

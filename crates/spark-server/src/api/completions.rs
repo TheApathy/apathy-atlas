@@ -2,6 +2,7 @@
 
 #![allow(unused_imports, dead_code)]
 
+use crate::main_modules::model_host::CurrentModel;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -168,7 +169,7 @@ fn validate_completion_input(req: &CompletionRequest) -> Result<(), Response> {
 }
 
 pub async fn completions(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     req: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
     let Json(req) = match req {
@@ -555,7 +556,7 @@ pub(super) async fn completions_stream(
 }
 
 /// GET /v1/models
-pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
+pub async fn list_models(CurrentModel(state): CurrentModel) -> Json<ModelListResponse> {
     Json(ModelListResponse {
         object: "list".to_string(),
         data: vec![ModelInfo {
@@ -569,7 +570,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRe
 
 /// GET /v1/models/{model_id} — retrieve a single model (OpenAI SDK `client.models.retrieve()`).
 pub async fn get_model(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path(model_id): axum::extract::Path<String>,
 ) -> Response {
     if model_id == state.model_name {

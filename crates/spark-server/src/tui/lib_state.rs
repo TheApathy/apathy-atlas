@@ -349,26 +349,35 @@ impl LibState {
 
     /// Start the selected recipe, replacing whatever is running.
     ///
-    /// NOT PORTED IN THIS COMMIT — deliberately, and this is the seam.
+    /// STILL NOT PORTED — but the seam has moved, and what is left is now one
+    /// thing rather than three.
     ///
-    /// Upstream builds `spark serve` argv from the recipe and hands it to
-    /// `main_modules::model_swap::swap`, IN PROCESS. That path needs three
-    /// things this engine does not expose yet: `model_swap` itself, a
-    /// `Carried` so a swap preserves the response and conversation stores
-    /// rather than silently dropping them, and a `startup()` that RETURNS the
-    /// scheduler `JoinHandle` so the outgoing scheduler can be torn down. Our
-    /// `startup` spawns it and drops the handle.
+    /// Upstream builds `spark serve` argv from the recipe (which
+    /// `Recipe::serve_args_edited` already does here) and hands it to
+    /// `main_modules::model_swap::swap`, IN PROCESS. That used to need three
+    /// things this engine did not expose: a `Carried` so a swap preserves the
+    /// response and conversation stores rather than silently dropping them, a
+    /// `startup()` that RETURNS the scheduler `JoinHandle` so the outgoing
+    /// scheduler can be joined rather than detached, and a router that can SEE
+    /// a model published after boot — without the last one a swap would publish
+    /// into a `ModelHost` no request ever reads, and every handler would keep
+    /// serving weights the swap had already freed.
     ///
-    /// Everything ELSE in the Library tab — browsing, recipe cards, config
-    /// editing, download, freshness — works without any of that, which is why
-    /// the split is here and not further up. The UI path is live and ends in
-    /// this toast rather than being hidden, so the seam is visible to whoever
-    /// picks up the launch commit.
+    /// All three now exist: `serve_load::{Carried, load_model}`, the handle on
+    /// `ModelHost`, and a router stated on the host with every handler
+    /// resolving its model per request through `CurrentModel`. What is missing
+    /// is `model_swap::swap` itself — the ordered teardown (clear the host,
+    /// drop the state that owns `request_tx`, JOIN the scheduler, then load)
+    /// whose failure modes are a stranded GPU allocation and a half-swapped
+    /// state. That is a live-server operation, so it lands on its own.
+    ///
+    /// The UI path stays live and ends in this toast rather than being hidden,
+    /// so the seam is visible to whoever picks up the launch commit.
     pub fn launch(&mut self) -> Result<(), String> {
         let recipe = self.config_recipe().ok_or("no recipe selected")?;
         Err(format!(
-            "starting {} from the dashboard is not wired up yet — \
-             run `spark serve` for now",
+            "starting {} from the dashboard needs model_swap, which is not \
+             ported yet — run `spark serve` for now",
             recipe.model
         ))
     }

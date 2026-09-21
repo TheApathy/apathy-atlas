@@ -2,6 +2,7 @@
 
 #![allow(unused_imports, dead_code)]
 
+use crate::main_modules::model_host::CurrentModel;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{BytesRejection, JsonRejection};
 use axum::extract::{FromRequest, State};
@@ -121,7 +122,7 @@ async fn parse_optional_create_conversation_request(
 /// POST /v1/conversations — create a conversation with optional
 /// initial items + metadata.
 pub async fn create_conversation(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -164,7 +165,7 @@ pub async fn create_conversation(
 
 /// GET /v1/conversations/{id}
 pub async fn get_conversation(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     match state.conversation_store.get(&id) {
@@ -180,7 +181,7 @@ pub async fn get_conversation(
 
 /// POST /v1/conversations/{id} — update metadata.
 pub async fn update_conversation(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path(id): axum::extract::Path<String>,
     req: Result<Json<UpdateConversationRequest>, JsonRejection>,
 ) -> Response {
@@ -206,7 +207,7 @@ pub async fn update_conversation(
 
 /// DELETE /v1/conversations/{id}
 pub async fn delete_conversation(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     if state.conversation_store.delete(&id) {
@@ -228,7 +229,7 @@ pub async fn delete_conversation(
 
 /// POST /v1/conversations/{id}/items — append items (≤20/call).
 pub async fn add_conversation_items(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path(id): axum::extract::Path<String>,
     req: Result<Json<AddItemsRequest>, JsonRejection>,
 ) -> Response {
@@ -272,7 +273,7 @@ pub async fn add_conversation_items(
 /// GET /v1/conversations/{id}/items — list items with `limit` + `order`
 /// query parameters (OpenAI spec: default 20, max 100, order=asc).
 pub async fn list_conversation_items(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -319,7 +320,7 @@ pub async fn list_conversation_items(
 
 /// GET /v1/conversations/{id}/items/{item_id}
 pub async fn get_conversation_item(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path((id, item_id)): axum::extract::Path<(String, String)>,
 ) -> Response {
     let Some(snap) = state.conversation_store.get(&id) else {
@@ -345,7 +346,7 @@ pub async fn get_conversation_item(
 
 /// DELETE /v1/conversations/{id}/items/{item_id}
 pub async fn delete_conversation_item(
-    State(state): State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     axum::extract::Path((id, item_id)): axum::extract::Path<(String, String)>,
 ) -> Response {
     if state.conversation_store.remove_item(&id, &item_id) {

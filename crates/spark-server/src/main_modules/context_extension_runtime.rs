@@ -114,8 +114,21 @@ pub(crate) fn validate_context_extension_runtime(
 
 #[cfg(test)]
 mod serve_integration_tests {
-    const SERVE: &str = include_str!("serve.rs");
+    // TWO files, because `serve.rs` split into two and the guard went with
+    // only one of them. The once-per-process prologue stayed in `serve.rs`;
+    // everything model-dependent, this guard included, became
+    // `serve_load::load_model`, which is the function a model swap re-runs.
+    //
+    // `SERVE_LOAD` is where the guard must BE, and `PROLOGUE` is where it must
+    // NOT be. Reading only `serve.rs` would now pass vacuously against a file
+    // containing no guard at all — a check that cannot fail — and reading only
+    // `serve_load.rs` would miss a SECOND guard appearing in the prologue. The
+    // guard block itself is byte-identical to the one this test has always
+    // read; only the file around it changed.
+    const SERVE_LOAD: &str = include_str!("serve_load.rs");
+    const PROLOGUE: &str = include_str!("serve.rs");
     const START: &str = "    let context_extension =";
+    const VALIDATOR_CALL: &str = "validate_context_extension_runtime(";
     const END: &str = "    if let Some(extension) = context_extension {";
     const PHASE3: &str = "spark_runtime::progress::phase(3, \"gpu init\");";
     const GPU_INIT: &str =
@@ -157,13 +170,116 @@ let context_extension=super::context_extension::apply_context_extension(
     }
 
     fn mutate_once(from: &str, to: &str) -> String {
-        assert_eq!(SERVE.matches(from).count(), 1, "ambiguous hostile: {from}");
-        SERVE.replacen(from, to, 1)
+        assert_eq!(
+            SERVE_LOAD.matches(from).count(),
+            1,
+            "ambiguous hostile: {from}"
+        );
+        SERVE_LOAD.replacen(from, to, 1)
     }
 
     #[test]
     fn serve_context_guard_is_exact_and_pre_gpu() {
-        assert!(guard_is_exact_and_pre_gpu(SERVE));
+        assert!(guard_is_exact_and_pre_gpu(SERVE_LOAD));
+    }
+
+    /// Does the guard appear exactly once, in the per-model half and not the
+    /// prologue?
+    ///
+    /// A FUNCTION over two strings rather than an assertion over the two
+    /// `include_str!`s directly, so the rule can be handed inputs that must
+    /// make it say false. An assertion that only ever sees the real files is
+    /// an assertion nobody has watched fail, and a check that cannot fail is
+    /// not evidence — see `the_duplication_check_can_actually_fail`.
+    fn guard_appears_exactly_once(prologue: &str, per_model: &str) -> bool {
+        prologue.matches(START).count() == 0
+            && prologue.matches(VALIDATOR_CALL).count() == 0
+            && per_model.matches(START).count() + prologue.matches(START).count() == 1
+    }
+
+    /// The guard exists exactly once, and not in the process prologue.
+    ///
+    /// `guard_is_exact_and_pre_gpu` proves the guard is correct where it
+    /// lives. It cannot prove there is not a SECOND one. A context-extension
+    /// guard that runs twice — once per process and again per load — is
+    /// exactly what a later refactor reintroduces while "restoring" something,
+    /// and the existing check would sail straight through it: the copy in
+    /// `serve_load.rs` would still be exact and still be pre-GPU.
+    ///
+    /// Counted ACROSS both files rather than asserted as absence from one, so
+    /// that a guard MOVED back into the prologue fails as loudly as a guard
+    /// DUPLICATED into it. The `args`/`config` the prologue holds are the ones
+    /// `load_model` is about to be handed, so a prologue copy would mutate
+    /// `config.rope_*` and `max_position_embeddings` before the real guard
+    /// ever validated them — the receipt would then describe a config that had
+    /// already been extended once, which is the one thing this module exists
+    /// to make impossible.
+    #[test]
+    fn the_guard_exists_exactly_once_and_never_in_the_process_prologue() {
+        assert_eq!(
+            PROLOGUE.matches(START).count(),
+            0,
+            "the context-extension guard is in serve.rs, which runs ONCE per \
+             process. It belongs in serve_load::load_model, which runs per \
+             model — a per-process guard extends the config of the first model \
+             and of no other."
+        );
+        assert_eq!(
+            PROLOGUE.matches(VALIDATOR_CALL).count(),
+            0,
+            "validate_context_extension_runtime is called from serve.rs. Its \
+             receipt binds the RESOLVED per-model config, so a call from the \
+             prologue mints one against a config no model was built from."
+        );
+        assert!(guard_appears_exactly_once(PROLOGUE, SERVE_LOAD));
+    }
+
+    /// The positive control for the check above.
+    ///
+    /// Written because tonight produced four separate findings about checks
+    /// that could not fail, and a duplication check that has only ever been
+    /// run against a tree with no duplicate in it is a fifth waiting to
+    /// happen. Each case below is a way the guard actually goes wrong, and the
+    /// rule must reject every one of them.
+    #[test]
+    fn the_duplication_check_can_actually_fail() {
+        let guard = &SERVE_LOAD[SERVE_LOAD.find(START).unwrap()..][..START.len() + 64];
+        let clean_prologue = "fn startup() { tracing::info!(\"banner\"); }";
+
+        // The real shape, as a baseline: this is the only case that passes.
+        assert!(guard_appears_exactly_once(clean_prologue, SERVE_LOAD));
+
+        // DUPLICATED into the prologue — the case the original check missed
+        // entirely, because the per-model copy is still exact and pre-GPU.
+        assert!(
+            !guard_appears_exactly_once(&format!("{clean_prologue}\n{guard}"), SERVE_LOAD),
+            "a guard in BOTH halves must be rejected"
+        );
+
+        // MOVED back to the prologue: per-process, so it extends the first
+        // model's config and no other model's.
+        assert!(
+            !guard_appears_exactly_once(&format!("{clean_prologue}\n{guard}"), clean_prologue),
+            "a guard only in the prologue must be rejected"
+        );
+
+        // GONE from both — the vacuous pass this whole restructure exists to
+        // prevent.
+        assert!(
+            !guard_appears_exactly_once(clean_prologue, clean_prologue),
+            "no guard at all must be rejected, not silently accepted"
+        );
+
+        // The validator CALL hoisted to the prologue while the extension
+        // itself stays put: a receipt minted against a config no model was
+        // built from.
+        assert!(
+            !guard_appears_exactly_once(
+                &format!("{clean_prologue}\nlet _ = {VALIDATOR_CALL});"),
+                SERVE_LOAD
+            ),
+            "a validator call in the prologue must be rejected"
+        );
     }
 
     #[test]
@@ -212,19 +328,19 @@ let context_extension=super::context_extension::apply_context_extension(
 
     #[test]
     fn serve_context_guard_rejects_missing_and_post_gpu_admission() {
-        let validator = SERVE
+        let validator = SERVE_LOAD
             .find(
                 "    let context_admission = super::context_extension::validate_context_extension_runtime(",
             )
             .unwrap();
-        let validator_end = SERVE[validator..].find(END).unwrap() + validator;
-        let missing = format!("{}{}", &SERVE[..validator], &SERVE[validator_end..]);
+        let validator_end = SERVE_LOAD[validator..].find(END).unwrap() + validator;
+        let missing = format!("{}{}", &SERVE_LOAD[..validator], &SERVE_LOAD[validator_end..]);
         assert!(!guard_is_exact_and_pre_gpu(&missing));
 
-        let start = SERVE.find(START).unwrap();
-        let end = SERVE[start..].find("    if let Some(ref qc)").unwrap() + start;
-        let chunk = &SERVE[start..end];
-        let without = SERVE.replacen(chunk, "", 1);
+        let start = SERVE_LOAD.find(START).unwrap();
+        let end = SERVE_LOAD[start..].find("    if let Some(ref qc)").unwrap() + start;
+        let chunk = &SERVE_LOAD[start..end];
+        let without = SERVE_LOAD.replacen(chunk, "", 1);
         let moved = without.replacen(GPU_INIT, &format!("{GPU_INIT}{chunk}"), 1);
         assert!(!guard_is_exact_and_pre_gpu(&moved));
     }

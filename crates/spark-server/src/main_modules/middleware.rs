@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::main_modules::AppState;
 use crate::{openai, rate_limiter};
 
 /// OpenAI-compatible observability headers. Injects on every `/v1/*`
@@ -74,12 +73,18 @@ pub(crate) async fn openai_observability_middleware(
 /// surface "missing_api_key" / "invalid_api_key" the same way they do
 /// against `api.openai.com`.
 pub(crate) async fn require_auth_middleware(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    // From the HOST, not from `AppState`. Read off the model, the policy
+    // ceases to exist whenever no model is loaded — so every `/v1/*` request
+    // during a swap would sail past the gate. Whether a request is authorised
+    // cannot depend on whether a model happens to be resident.
+    axum::extract::State(host): axum::extract::State<
+        Arc<crate::main_modules::model_host::ModelHost>,
+    >,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Some(auth_cfg) = state.auth.as_ref() else {
+    let Some(auth_cfg) = host.auth() else {
         return next.run(req).await;
     };
     let path = req.uri().path();
@@ -134,7 +139,14 @@ pub(crate) async fn require_auth_middleware(
 /// `openai_observability_middleware`. When the limiter is disabled, this
 /// middleware is a pass-through (the observability stubs stand).
 pub(crate) async fn rate_limit_middleware(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    // Also from the HOST, and for the same reason as `require_auth_middleware`:
+    // read off the model, the limiter does not exist during a swap and every
+    // request in that window bypasses it entirely. It is also the SAME `Arc`
+    // the model's `AppState` holds, so handler-side `refund_tokens` credits the
+    // bucket this middleware debited.
+    axum::extract::State(host): axum::extract::State<
+        Arc<crate::main_modules::model_host::ModelHost>,
+    >,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -143,7 +155,12 @@ pub(crate) async fn rate_limit_middleware(
 
     // Only apply to /v1/* routes — health/metrics/tokenize stay open.
     let is_v1 = req.uri().path().starts_with("/v1/");
-    if !is_v1 || !state.rate_limiter.config().is_enabled() {
+    let Some(limiter) = host.rate_limiter() else {
+        // Installed before the listener binds, so unreachable in a running
+        // server; passing through rather than 500-ing if that ever changes.
+        return next.run(req).await;
+    };
+    if !is_v1 || !limiter.config().is_enabled() {
         return next.run(req).await;
     }
 
@@ -161,9 +178,15 @@ pub(crate) async fn rate_limit_middleware(
     // for streaming paths (handlers call `refund_tokens` with the actual
     // usage). This over-counts for small requests but prevents a single
     // client from consuming the whole TPM budget in one burst.
-    let estimated = state.max_seq_len as u64;
+    //
+    // `max_seq_len` belongs to the MODEL, and during a swap there is none. A
+    // request arriving then cannot consume tokens from a model that is not
+    // there — it is about to be rejected with 503 by `CurrentModel` — so the
+    // ceiling is 0 and it is charged a request but no tokens. Skipping the
+    // limiter entirely in that window would make a swap a free pass.
+    let estimated = host.current().map_or(0, |s| s.max_seq_len) as u64;
 
-    let decision = state.rate_limiter.admit(&identity, estimated);
+    let decision = limiter.admit(&identity, estimated);
     if !decision.allowed {
         let (param, code) = match decision.denied_by {
             Some(rate_limiter::DenialReason::Requests) => ("requests", "rate_limit_exceeded"),

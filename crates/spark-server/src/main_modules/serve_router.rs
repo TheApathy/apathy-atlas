@@ -12,17 +12,28 @@ use axum::routing::{get, post};
 
 use crate::anthropic;
 use crate::api;
-use crate::main_modules::AppState;
 use crate::main_modules::middleware::{
     openai_observability_middleware, rate_limit_middleware, require_auth_middleware,
 };
 
+/// Build the router once and serve on it for the process lifetime.
+///
+/// Stated on the `ModelHost`, NOT on an `Arc<AppState>`. The distinction is the
+/// whole reason a swap can work: with a state baked in here, `host.publish` of
+/// a new model would change nothing a request can see, and every handler would
+/// keep serving the `AppState` captured at boot — whose scheduler the swap has
+/// joined and whose weights it has freed. Each handler resolves the current
+/// model per request through `CurrentModel` instead, and a request that has
+/// already resolved one keeps it and finishes against the model it started on.
 pub(crate) async fn build_and_serve(
-    state: Arc<AppState>,
-    model_ready: Arc<std::sync::atomic::AtomicBool>,
+    host: Arc<crate::main_modules::model_host::ModelHost>,
     bind: &str,
     port: u16,
 ) -> Result<()> {
+    // The socket is bound for the process lifetime and a swap cannot move it,
+    // so record where it lands: a recipe naming a different port would
+    // otherwise serve on the old one with nothing saying so.
+    host.set_bound(bind.to_string(), port);
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([
@@ -117,11 +128,11 @@ pub(crate) async fn build_and_serve(
                 .unwrap_or(32 * 1024 * 1024),
         ))
         .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            host.clone(),
             rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            host.clone(),
             require_auth_middleware,
         ))
         .layer(axum::middleware::from_fn(openai_observability_middleware))
@@ -130,10 +141,20 @@ pub(crate) async fn build_and_serve(
         ))
         .layer(cors)
         .layer(catch_panic)
-        .with_state(state);
+        // `host.clone()`, not a move: a layer that captured the only handle
+        // would keep it alive for the router's lifetime, and the same mistake
+        // made against `Arc<AppState>` is what wedges a swap — a state bound
+        // into a layer never reaches a strong count of 1, so the drain window
+        // expires, the scheduler never learns to stop, and the join never
+        // returns. The host is process-scoped and is meant to be held; the
+        // model it hands out is not.
+        .with_state(host.clone());
 
-    // Model loaded, scheduler running — mark as ready.
-    model_ready.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Readiness is asserted by `serve_load::load_model`, at the moment the
+    // model and its scheduler are actually up. It used to be set here, which
+    // was right exactly once: the router is built once at boot and a swap
+    // never rebuilds it, so a flag set here would stay true across a swap that
+    // FAILED and false for one that succeeded.
 
     let addr = format!("{bind}:{port}");
     if bind == "0.0.0.0" {

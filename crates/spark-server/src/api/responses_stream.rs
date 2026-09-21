@@ -2,6 +2,7 @@
 
 #![allow(unused_imports, dead_code)]
 
+use crate::main_modules::model_host::CurrentModel;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -59,7 +60,7 @@ use super::inference_types::*;
 use super::sanitizer::*;
 
 pub(super) async fn responses_endpoint_stream(
-    state: State<Arc<AppState>>,
+    CurrentModel(state): CurrentModel,
     mut chat_req: ChatCompletionRequest,
     metadata: Option<std::collections::HashMap<String, String>>,
     store_flag: bool,
@@ -76,11 +77,11 @@ pub(super) async fn responses_endpoint_stream(
 
     let model = chat_req.model.clone();
     let input_messages = chat_req.messages.clone();
-    let state_arc = state.0.clone();
+    let state_arc = state.clone();
 
     // Run the chat-completions streaming handler (re-using the full
     // pipeline: scheduler, tool detection, thinking, logprobs, ...).
-    let chat_resp = chat_completions_inner(state.0, None, chat_req, None).await;
+    let chat_resp = chat_completions_inner(state, None, chat_req, None).await;
     let (parts, body) = chat_resp.into_parts();
     if !parts.status.is_success() {
         return Response::from_parts(parts, body);
