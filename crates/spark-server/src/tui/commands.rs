@@ -21,6 +21,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/gpu", "GPU + host memory"),
     ("/cache", "prefix-cache hit statistics"),
     ("/watchdog on|off", "toggle the loop watchdog"),
+    (
+        "/watchdog on|off",
+        "arm or disarm the loop watchdog on the LIVE run",
+    ),
     ("/detach", "leave the TUI, keep serving with plain logs"),
     ("/quit", "clean shutdown (drain in-flight, then exit)"),
 ];

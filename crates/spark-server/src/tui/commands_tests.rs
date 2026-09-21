@@ -286,3 +286,37 @@ fn the_output_buffer_is_capped_oldest_first() {
         "the oldest lines are what went"
     );
 }
+
+/// Every implemented command must be discoverable from `/help`.
+///
+/// `/watchdog` was implemented and absent from `COMMANDS` for the whole port:
+/// it worked, and the only way to learn it existed was to read the source.
+/// A dispatch arm with no help entry is a feature that ships invisible.
+#[test]
+fn every_dispatched_command_appears_in_the_help_list() {
+    let src = include_str!("commands.rs");
+    let listed: Vec<String> = super::COMMANDS
+        .iter()
+        // "/watchdog on|off" is listed with its argument grammar; compare the verb.
+        .map(|(name, _)| name.split_whitespace().next().unwrap_or(name).to_string())
+        .collect();
+
+    let mut missing = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        // The dispatch arms, e.g. `"/status" => {`
+        if let Some(rest) = t.strip_prefix('"')
+            && let Some(verb) = rest.split('"').next()
+            && verb.starts_with('/')
+            && t.contains("=>")
+            && !listed.iter().any(|l| l == verb)
+        {
+            missing.push(verb.to_string());
+        }
+    }
+    assert!(missing.is_empty(), "dispatched but not in /help: {missing:?}");
+    assert!(
+        listed.iter().any(|l| l == "/watchdog"),
+        "and the check can actually see /watchdog: {listed:?}"
+    );
+}
