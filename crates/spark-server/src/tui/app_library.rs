@@ -156,11 +156,11 @@ impl App {
     /// progress model first is what makes the SECOND load render as a load —
     /// without it every phase is still `Done` from the first one.
     pub(super) fn launch_selected_recipe(&mut self) {
-        if self.host.is_none() {
+        let Some(host) = self.host.clone() else {
             self.toast("no server attached to this dashboard".to_string(), true);
             return;
-        }
-        match self.lib.launch() {
+        };
+        match self.lib.launch(&host) {
             Ok(()) => {
                 self.progress.reset();
                 // A load is now genuinely in flight, so the checklist is

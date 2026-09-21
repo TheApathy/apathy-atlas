@@ -62,7 +62,11 @@ pub(crate) async fn serve(
     host.set_process(carried.clone());
 
     let Some(prepared) =
-        tokio::task::spawn_blocking(move || startup(args, tui_progress, carried, auth)).await??
+        tokio::task::spawn_blocking({
+            let host = host.clone();
+            move || startup(args, tui_progress, carried, auth, host)
+        })
+        .await??
     else {
         return Ok(()); // EP worker: no router on this rank
     };
@@ -87,6 +91,7 @@ fn startup(
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
     carried: serve_load::Carried,
     auth: Option<Arc<crate::auth::AuthConfig>>,
+    host: Arc<ModelHost>,
 ) -> Result<Option<Prepared>> {
     tracing::info!("Atlas Spark starting...");
     tracing::info!("Licensed under AGPL-3.0-only — see /LICENSE in this container");
@@ -107,16 +112,17 @@ fn startup(
     // the load, not a blank screen. Everything it reads is process-global
     // (log ring, progress channel, metrics, scheduler snapshot) plus this
     // args snapshot for the badge chips. Head node only.
+    let mut tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>> = None;
     if let Some(progress_rx) = tui_progress
         && args.rank == 0
     {
-        // Still `None`, and deliberately. Handing the dashboard the host is
-        // what lets the Library START a model, and that path needs
-        // `model_swap`, which is not ported — so passing it here would change
-        // what the Library tab does without giving it anything to do it with.
-        // The host now exists and the router reads through it; wiring the
-        // dashboard to it belongs with the swap.
-        crate::tui::start(args.clone(), progress_rx, None);
+        // The host, not `None`: this is what lets the Library START a model.
+        // The sender it returns goes straight back into the host, so every
+        // later load — the first one below included — republishes its levers
+        // to the pane that samples them.
+        let tx = crate::tui::start(args.clone(), progress_rx, Some(host.clone()));
+        host.set_tui_handles(tx.clone());
+        tui_handles_tx = Some(tx);
     }
 
     // Runtime per-kernel profiling toggle. SIGUSR1 enables `ATLAS_FULL_PROFILE`
@@ -143,7 +149,7 @@ fn startup(
 
     // Everything above is process-scoped. Everything below is the model, and
     // this call is the one a swap will run again.
-    serve_load::load_model(args, carried, auth)
+    serve_load::load_model(args, tui_handles_tx, carried, auth)
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an

@@ -373,13 +373,36 @@ impl LibState {
     ///
     /// The UI path stays live and ends in this toast rather than being hidden,
     /// so the seam is visible to whoever picks up the launch commit.
-    pub fn launch(&mut self) -> Result<(), String> {
+    pub fn launch(
+        &mut self,
+        host: &std::sync::Arc<crate::main_modules::model_host::ModelHost>,
+    ) -> Result<(), String> {
         let recipe = self.config_recipe().ok_or("no recipe selected")?;
-        Err(format!(
-            "starting {} from the dashboard needs model_swap, which is not \
-             ported yet — run `spark serve` for now",
-            recipe.model
-        ))
+        // Built and VALIDATED on this thread, before anything is spawned. A
+        // recipe that cannot produce a legal command line is a form error the
+        // user can fix, and it must read as one — not as a load that starts,
+        // tears the running model down, and then discovers the same thing.
+        let args = recipe
+            .serve_args_edited(&self.overrides, &self.removed)
+            .map_err(|e| problem_line(&format!("{e:#}")))?;
+
+        let host = host.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("atlas-swap".into())
+            .spawn(move || {
+                // Send, do not log-and-forget: the dashboard owns this
+                // terminal, so a `tracing::error` here is a line in the log
+                // pane the user may never scroll to, while the load pill sits
+                // on LOADING forever. Dropping the sender on success is what
+                // `poll_launch` reads as "it worked".
+                if let Err(e) = crate::main_modules::model_swap::swap(&host, args) {
+                    let _ = tx.send(format!("{e:#}"));
+                }
+            })
+            .map_err(|e| format!("could not start the loader thread: {e}"))?;
+        self.launch_result = Some(rx);
+        Ok(())
     }
 
     /// A launch's loader thread is still out — its result channel has not

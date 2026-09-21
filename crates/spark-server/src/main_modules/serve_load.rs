@@ -76,7 +76,6 @@ impl Carried {
     /// it from the host, so there is no window in which they could be rebuilt
     /// by mistake. `load_model` already takes a `Carried` by value, so the
     /// compiler will ask the swap for one.
-    #[allow(dead_code)]
     pub fn from_previous(previous: &AppState) -> Self {
         Self {
             response_store: previous.response_store.clone(),
@@ -119,14 +118,18 @@ pub(crate) struct Prepared {
 /// recipe's argv silently drops `--require-auth` from a server that was started
 /// with it.
 ///
-/// Upstream also threads the dashboard's `RunHandles` sender through here, so
-/// each load republishes the levers the Stats pane samples. That is not wired
-/// in this tree — nothing publishes `RunHandles` at all today, and
-/// `scheduler::run` takes no levers argument (the loop watchdog is gated by the
-/// process-global `scheduler::set_enable_loop_watchdog`). It belongs with the
-/// swap, which is the thing that makes republishing necessary.
+/// `tui_handles_tx` is the dashboard's `RunHandles` sender, threaded through so
+/// each load republishes the levers the Stats pane samples. It matters because
+/// of the swap: after one, the dashboard would otherwise still hold the
+/// levers of a scheduler that has been joined.
+///
+/// CAVEAT, unchanged by this wiring: `scheduler::run` takes no levers argument
+/// in this tree — the loop watchdog is gated by the process-global
+/// `scheduler::set_enable_loop_watchdog` — so a published lever is correct to
+/// READ but toggling it does not reach the scheduler. That is a separate wire.
 pub(crate) fn load_model(
     mut args: cli::ServeArgs,
+    tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>>,
     carried: Carried,
     auth: Option<Arc<crate::auth::AuthConfig>>,
 ) -> Result<Option<Prepared>> {
@@ -749,6 +752,15 @@ pub(crate) fn load_model(
             scheduler_mtp_gate,
         );
     });
+
+    // Republish the levers for THIS run, beside the spawn that created the
+    // scheduler they describe. A send failure means the dashboard thread is
+    // gone, which is not a load failure — the server runs headless from here.
+    if let Some(tx) = tui_handles_tx {
+        let levers: crate::tui::RunLevers =
+            Arc::new(crate::scheduler::levers::SchedLevers::from_env());
+        let _ = tx.send(crate::tui::RunHandles { levers });
+    }
 
     // Tool call parser resolution: CLI > MODEL.toml > defaults table.
     let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;

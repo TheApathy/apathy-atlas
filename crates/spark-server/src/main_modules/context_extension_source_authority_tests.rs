@@ -57,7 +57,27 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // admission rule or phase ordering moved, which a `grep -c` over the diff
 // confirms at zero. This hash exists so somebody LOOKS when it breaks;
 // updating it without the diff is how it becomes a rubber stamp.
-const SERVE_LOAD_SHA256: &str = "c766de4bbe6f7fa4b269eb24bbc87b7252f59a68f8bface3109b26f773ad6fe0";
+// Re-pinned 2026-09-21 (FOURTH time) for the model-swap re-land. `load_model`
+// regains the `tui_handles_tx` parameter it was given up front, and republishes
+// `RunHandles { levers }` immediately after the scheduler spawn — required, not
+// optional: `model_swap::swap` calls this function with four arguments, so
+// without the parameter the swap does not compile. The only other delta is the
+// `#[allow(dead_code)]` dropped from `Carried::from_previous`, whose caller the
+// swap now is.
+//
+// MACHINE-checked before re-pinning, not eyeballed:
+//   * the guard block (`let context_extension =` .. `if let Some(extension) =`)
+//     is byte-identical to HEAD — sha256 7a0a651b640cc9a5785fb766425f2df6
+//     458b237081964b51be8d8e604ccf5a33 on both sides;
+//   * `let context_extension =`, `phase(3, "gpu init")` and `init_gpu_backend`
+//     each appear exactly once, and the guard (L160) still precedes both
+//     (L234, L290);
+//   * `git diff -U0` over this file matches ZERO lines against
+//     admission|max_seq_len|context_extension|ensure!.
+// No admission rule and no phase ordering moved. This hash exists so somebody
+// LOOKS when it breaks; updating it without the diff is how it becomes a
+// rubber stamp.
+const SERVE_LOAD_SHA256: &str = "f88c17367f80ef17f4ea4536f285bf560220fd8a5ee57564f561f76f80877255";
 const SERVE_PHASES_SHA256: &str =
     "e3e84d068c761ff43ad49a04c67d3cd37a8107f99110c919bd016832219c9f1e";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
