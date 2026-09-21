@@ -399,3 +399,32 @@ fn a_fresh_store_uses_the_current_cache_dir() {
     let dir = Dir::new("cache-neither");
     assert_eq!(cache_dir(&dir.0), dir.0.join(CACHE));
 }
+
+/// FORK: the recipe index repo is ONE constant with ONE env override.
+mod repo_override {
+    use crate::recipe::fetch::resolve_repo;
+
+    /// POSITIVE: an override is honoured, and trimmed — a trailing newline from
+    /// `ATLAS_RECIPES_REPO=$(cat file)` would otherwise build a URL with a
+    /// newline in the path.
+    #[test]
+    fn an_override_is_used_and_trimmed() {
+        assert_eq!(resolve_repo(Some("  me/my-recipes \n".into())), "me/my-recipes");
+    }
+
+    /// A SET-BUT-EMPTY override falls back rather than building
+    /// `https://api.github.com/repos//git/trees/...`, which 404s in a way that
+    /// reads as "no recipes exist" instead of "the variable is wrong".
+    #[test]
+    fn a_set_but_empty_override_falls_back_instead_of_building_an_empty_path() {
+        assert_eq!(resolve_repo(Some("   ".into())), resolve_repo(None));
+        assert!(!resolve_repo(Some(String::new())).is_empty());
+    }
+
+    /// The default still points at upstream's public index, deliberately: an
+    /// empty Library tab is a worse first impression than upstream content.
+    #[test]
+    fn the_default_is_upstreams_public_index() {
+        assert_eq!(resolve_repo(None), "Avarok-Cybersecurity/atlas-recipes");
+    }
+}

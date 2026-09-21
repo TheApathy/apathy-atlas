@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Serving recipes from `Avarok-Cybersecurity/atlas-recipes`.
+//! Serving recipes from the index named by `fetch::repo()` — upstream's
+//! public `Avarok-Cybersecurity/atlas-recipes` unless `ATLAS_RECIPES_REPO`
+//! overrides it. See that function for why the default is upstream's.
 //!
 //! A recipe is a validated `spark serve` configuration for one checkpoint: the
 //! model id, the flags, and the measured rationale for them. This module reads

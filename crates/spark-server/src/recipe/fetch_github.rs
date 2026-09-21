@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::Recipe;
-use super::fetch::{AGENT, INDEX, Index, REPO, TIMEOUT, cache_dir, unix_now};
+use super::fetch::{AGENT, INDEX, Index, TIMEOUT, cache_dir, repo, unix_now};
 
 /// How many recipe bodies to fetch at once.
 ///
@@ -26,7 +26,7 @@ const FETCH_WIDTH: usize = 8;
 pub(super) fn try_refresh(root: &Path, cancel: &AtomicBool) -> Result<Index> {
     let (tree_sha, paths) = list_recipe_paths()?;
     if paths.is_empty() {
-        bail!("{REPO}@{tree_sha} lists no recipes/**/*.yaml");
+        bail!("{}@{tree_sha} lists no recipes/**/*.yaml", repo());
     }
     // Fetched concurrently. Serially, each of the ~25 files paid its own TCP
     // and TLS handshake — the agent below now reuses the connection, and this
@@ -44,7 +44,8 @@ pub(super) fn try_refresh(root: &Path, cancel: &AtomicBool) -> Result<Index> {
                     }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = paths.get(i) else { return };
-                    let url = format!("https://raw.githubusercontent.com/{REPO}/{tree_sha}/{path}");
+                    let url =
+                        format!("https://raw.githubusercontent.com/{}/{tree_sha}/{path}", repo());
                     match get(&url) {
                         Ok(body) => out.lock().push((recipe_id(path), body)),
                         // One unreachable file must not cost the other 24; it
@@ -65,7 +66,8 @@ pub(super) fn try_refresh(root: &Path, cancel: &AtomicBool) -> Result<Index> {
         // untouched. Returning `Ok` with no recipes would have replaced a good
         // cache with an empty one BEFORE the caller could refuse it.
         bail!(
-            "{REPO}@{tree_sha} listed {} recipe file(s) but none could be fetched",
+            "{}@{tree_sha} listed {} recipe file(s) but none could be fetched",
+            repo(),
             paths.len()
         );
     }
@@ -132,7 +134,8 @@ pub(super) fn recipe_id(path: &str) -> String {
 /// One API call: the tree sha and every `recipes/**/*.yaml` under it.
 fn list_recipe_paths() -> Result<(String, Vec<String>)> {
     let body = get(&format!(
-        "https://api.github.com/repos/{REPO}/git/trees/main?recursive=1"
+        "https://api.github.com/repos/{}/git/trees/main?recursive=1",
+        repo()
     ))
     .context("listing the recipe tree")?;
     let doc: serde_json::Value =
@@ -145,7 +148,7 @@ fn list_recipe_paths() -> Result<(String, Vec<String>)> {
     // `truncated` means GitHub cut the listing short; a partial Library that
     // looks complete is worse than an error.
     if doc.get("truncated").and_then(|t| t.as_bool()) == Some(true) {
-        bail!("GitHub truncated the tree listing for {REPO}");
+        bail!("GitHub truncated the tree listing for {}", repo());
     }
     let entries = doc
         .get("tree")
@@ -219,7 +222,8 @@ pub(super) fn commit_date(id: &str) -> Result<String> {
     // `per_page=1` — we want the most recent commit touching this path, not its
     // history. GitHub orders newest first.
     let body = get(&format!(
-        "https://api.github.com/repos/{REPO}/commits?path=recipes/{id}.yaml&per_page=1"
+        "https://api.github.com/repos/{}/commits?path=recipes/{id}.yaml&per_page=1",
+        repo()
     ))
     .with_context(|| format!("dating recipe {id}"))?;
     let doc: serde_json::Value =

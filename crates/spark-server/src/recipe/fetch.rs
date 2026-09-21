@@ -52,9 +52,48 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::Recipe;
 use super::fetch_github::{self, try_refresh};
 
-pub(super) const REPO: &str = "Avarok-Cybersecurity/atlas-recipes";
+/// The GitHub repo the recipe index is fetched from.
+///
+/// THE ONE PLACE THIS IS NAMED. Kept pointing at upstream on purpose: it is a
+/// public, read-only index that works today, and an empty Library tab is a
+/// worse first impression than content sourced from upstream. When we publish
+/// our own index this is a one-line change, which is the whole reason it is a
+/// constant and not six format strings.
+///
+/// NOT a config surface: one constant, one env override, no UI.
+const DEFAULT_REPO: &str = "Avarok-Cybersecurity/atlas-recipes";
+
+/// `ATLAS_RECIPES_REPO` (owner/name), else [`DEFAULT_REPO`].
+///
+/// A set-but-empty override falls back rather than building
+/// `https://api.github.com/repos//git/trees/...`, which would 404 in a way
+/// that reads as "no recipes" instead of "you set the variable wrong".
+pub(super) fn repo() -> &'static str {
+    static REPO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REPO.get_or_init(|| resolve_repo(std::env::var("ATLAS_RECIPES_REPO").ok()))
+        .as_str()
+}
+
+/// [`repo`] over an explicit input, so the rule can be tested.
+///
+/// Pure over the ENVIRONMENT for the same reason `atlas_home::resolve_from` is:
+/// `set_var` is unsafe and process-global, and a test that mutated it could
+/// race another test's read.
+pub(super) fn resolve_repo(env: Option<String>) -> String {
+    match env {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => DEFAULT_REPO.to_string(),
+    }
+}
 pub(super) const CACHE: &str = "atlas-recipes";
-/// The cache directory this held before the ATLAS to AVAROK rename.
+/// The cache directory this held before upstream's ATLAS-to-AVAROK rename.
+///
+/// NOTE: upstream already set this to the SAME string as `CACHE`, so the
+/// `!current.exists() && root.join(LEGACY_CACHE).is_dir()` fallback in
+/// `cache_dir` can never fire. Left as-is — it is harmless dead logic and
+/// upstream's to fix — but it is not the migration path it reads as. The
+/// migration that DOES matter for this fork is the HOME ROOT, handled in
+/// `atlas_home` (~/.atlas, falling back to ~/.avarok).
 ///
 /// Every box that synced before the rename already has its index here, and
 /// reading only the new name would present a populated machine as an empty
@@ -134,8 +173,8 @@ impl Index {
             "This machine has no route to github.com. Set HTTPS_PROXY to a host \
              that does — recipes are then fetched through it — or copy the \
              cached index (~/.atlas/atlas-recipes/index.json, or \
-             ~/.atlas/atlas-recipes/index.json on a box that predates the \
-             rename) from a machine that can reach it."
+             ~/.avarok/atlas-recipes/index.json on a box that has run an \
+             upstream build) from a machine that can reach it."
         } else if lowered.contains("403") || lowered.contains("rate") {
             "GitHub is rate-limiting this IP. The listing costs one API call per \
              refresh; the cached recipes below are still usable."
