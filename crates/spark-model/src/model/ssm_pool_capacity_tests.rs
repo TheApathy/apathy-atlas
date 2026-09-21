@@ -74,8 +74,21 @@ fn flat_tree_and_lazy_shapes_use_the_exact_shared_formula() {
     assert_eq!(flat.ddtree_capacity, 16);
     assert_eq!(flat.num_intermediates, 17);
 
+    // A REQUESTED wide DDTree no longer inflates the intermediate pool.
+    //
+    // `ddtree_capacity` still becomes 31 — the tree's own budget is unchanged —
+    // but `num_intermediates` stays at the flat 17, because `draft_budget`
+    // caps `tree_nodes` at `flat` unless `ATLAS_DDTREE_UNCAP=1`, so no node can
+    // ever be placed in the extra slots. Sizing for them bought rows nothing
+    // could write.
+    //
+    // NOTE the default case above is UNAFFECTED: with no explicit capacity,
+    // `ddtree_capacity` defaults to `num_drafts + 1`, so the tree term equals
+    // the flat term and gating it changes nothing. This fix only bites where
+    // the capacity was explicitly raised — which is the shipped configuration.
     let wide = checked_ssm_speculative_geometry(true, true, 15, Some(31)).unwrap();
-    assert_eq!(wide.num_intermediates, 32);
+    assert_eq!(wide.ddtree_capacity, 31, "the tree's own budget is untouched");
+    assert_eq!(wide.num_intermediates, 17, "but the pool is not sized for it");
 
     let mut flat_input = input();
     flat_input.has_mtp = true;
@@ -85,12 +98,14 @@ fn flat_tree_and_lazy_shapes_use_the_exact_shared_formula() {
         4104
     );
 
+    // Same bytes as flat now, which is the whole point: the wide request costs
+    // nothing until the tree can use it.
     let mut wide_input = input();
     wide_input.has_mtp = true;
     wide_input.num_intermediates = wide.num_intermediates;
     assert_eq!(
         checked_ssm_pool_geometry(wide_input).unwrap().total_bytes,
-        7344
+        4104
     );
 
     let mut lazy = input();
@@ -247,4 +262,23 @@ fn raw_gdn_wrap_to_four_rejects_before_allocation() {
     };
     assert!(error.to_string().contains("GDN h FP32 bytes"), "{error:#}");
     assert_eq!(gpu.alloc_count(), 0);
+}
+
+/// The gate is real in BOTH directions: with `ATLAS_DDTREE_UNCAP=1` the pool
+/// pays for the wide tree again, because the tree can then actually place
+/// nodes in those slots.
+///
+/// Without this arm the fix above would pass while having silently removed the
+/// capability rather than gated it — the same test would be green if the tree
+/// term had simply been deleted.
+#[test]
+fn uncapping_the_tree_restores_the_intermediates_it_needs() {
+    // SAFETY: single-threaded test; the var is read by the call below.
+    unsafe { std::env::set_var("ATLAS_DDTREE_UNCAP", "1") };
+    let wide = checked_ssm_speculative_geometry(true, true, 15, Some(31)).unwrap();
+    unsafe { std::env::remove_var("ATLAS_DDTREE_UNCAP") };
+    assert_eq!(
+        wide.num_intermediates, 32,
+        "uncapped, the pool is sized for the tree again"
+    );
 }
