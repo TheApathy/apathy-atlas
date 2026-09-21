@@ -11,6 +11,8 @@
 //! layers down.
 //!
 //! ## What IS implemented and tested
+//! - Embedding, final norm and lm_head, which load TODAY. V4.1's bare key names are the
+//!   first spellings the V4 dense probes try, verified against the shipped index.
 //! - [`v41_key`], the weight-key join, which is not the usual one (see below).
 //! - The expert mapping, in [`atlas_core::config::ExpertPack`].
 //! - Reading CB3 expert payload, in `spark_runtime::weights::deepseek_v41_pack`.
@@ -26,6 +28,7 @@ use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 
+use super::deepseek_v4::DeepSeekV4WeightLoader;
 use super::{DenseWeight, ModelWeightLoader, MtpWeights, WeightStore};
 use crate::layer::TransformerLayer;
 use spark_runtime::kv_cache::KvCacheDtype;
@@ -81,31 +84,48 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         bail!(cb3_residency_unimplemented("layer loading"))
     }
 
+    // ---------------------------------------------------------------------------------
+    // The DENSE tensors genuinely work, and are delegated rather than reimplemented.
+    //
+    // This was initially written as three more hard stops. That was WRONG, and checking
+    // rather than assuming is what found it: the V4 loader already PROBES several spellings
+    // and the first one it tries in each case is V4.1's. Verified against the shipped index:
+    // `embed.weight`, `norm.weight` and `head.weight` are all PRESENT, while `lm_head.weight`
+    // and `model.embed_tokens.weight` are absent. So V4.1's non-expert weights load today.
+    //
+    // Delegating is safe here in a way that delegating `load_layers` is NOT: these paths
+    // read plain dense tensors by name and contain no EXL3 assumption. The quantised expert
+    // path is the only place the two releases actually diverge.
+    // ---------------------------------------------------------------------------------
+
     fn load_embedding(
         &self,
-        _store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        bail!(cb3_residency_unimplemented("embedding loading"))
+        DeepSeekV4WeightLoader.load_embedding(store, config, gpu)
     }
 
     fn load_final_norm(
         &self,
-        _store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        bail!(cb3_residency_unimplemented("final norm loading"))
+        // V4.1 ships VANILLA norm weights (scale = weight), established by reading the
+        // tensors -- see `crate::model_type_ships_vanilla_norm_weights`, which now lists
+        // deepseek_v41. So the V4 path, which loads them exactly, is correct here.
+        DeepSeekV4WeightLoader.load_final_norm(store, config, gpu)
     }
 
     fn load_lm_head(
         &self,
-        _store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        bail!(cb3_residency_unimplemented("lm_head loading"))
+        DeepSeekV4WeightLoader.load_lm_head(store, config, gpu)
     }
 
     fn load_mtp_weights(
@@ -181,6 +201,30 @@ mod tests {
             !map.contains_key("model.embed.weight"),
             "V4.1 must not carry the 0731 `model.` prefix"
         );
+
+        // PINS THE DELEGATION. load_embedding / load_final_norm / load_lm_head delegate to
+        // the V4 loader because it PROBES several spellings and V4.1's happen to be the ones
+        // that hit. That is a real coupling, so assert both halves: the names V4.1 uses are
+        // present, and the alternatives those probes would otherwise fall through to are
+        // absent. If a future checkpoint renames these, this fails here rather than
+        // surfacing as a missing-tensor error deep in the loader.
+        for present in ["embed.weight", "norm.weight", "head.weight"] {
+            assert!(map.contains_key(present), "{present} must be present");
+        }
+        for absent in [
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+            "model.norm.weight",
+            "final_norm.weight",
+            "output.weight",
+        ] {
+            assert!(
+                !map.contains_key(absent),
+                "{absent} is absent in V4.1; if it appears, the V4 probe ORDER decides which \
+                 tensor wins and the delegation must be re-examined"
+            );
+        }
     }
 
     /// The dispatch must hand V4.1 its OWN loader, not the 0731 one.
