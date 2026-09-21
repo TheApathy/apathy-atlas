@@ -13,7 +13,10 @@
 //! `slot * bytes_per_expert` lands mid-`s1`; see [`atlas_core::config::Cb3Tensor`].
 //!
 //! ## No GPU, and no CB3 kernel
-//! This reads and validates bytes. It does not decode CB3, and nothing in-tree can yet:
+//! This reads and validates bytes. It does not decode CB3 — `kernels/gb10/deepseek-v4.1/
+//! cb3/cb3_decode.cuh` now does, bit-exact against an independent reference, so the old
+//! "nothing in-tree can" is no longer true. What is still missing is RESIDENCY for the
+//! 83 GB pack and the MoE GEMM that consumes the decoded e2m1 tiles:
 //! the weights it returns are still packed. Upload and decode belong to the loader, which
 //! needs kernels that do not exist.
 
