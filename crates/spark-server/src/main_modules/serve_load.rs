@@ -55,9 +55,11 @@ impl Carried {
 
     /// A swap: take them from the model being replaced.
     ///
-    /// Unused while this tree has no swap path, and kept because it is the
-    /// half of the contract that makes the other half meaningful — the point
-    /// of `Carried` is that the second model gets THESE instances, not new ones.
+    /// A swap: take them from the model being replaced.
+    ///
+    /// Unused until `model_swap` lands, and kept because it is the half of the
+    /// contract that makes the other half meaningful — the point of `Carried`
+    /// is that the second model gets THESE instances, not new ones.
     #[allow(dead_code)]
     pub fn from_previous(previous: &AppState) -> Self {
         Self {

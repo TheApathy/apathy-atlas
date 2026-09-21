@@ -179,7 +179,10 @@ impl StoreBackend for FilesystemBackend {
         let messages = match messages_to_disk_json(&entry.messages) {
             Ok(messages) => messages,
             Err(e) => {
-                tracing::warn!("response_store: invalid message content for {}: {e}", entry.id);
+                tracing::warn!(
+                    "response_store: invalid message content for {}: {e}",
+                    entry.id
+                );
                 return;
             }
         };

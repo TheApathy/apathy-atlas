@@ -96,11 +96,17 @@ pub fn read_lock(lock_path: &Path, proc_locks: &str) -> (Option<u32>, Vec<u32>) 
         };
         let is_waiter = rest.trim_start().starts_with("->");
         let fields: Vec<&str> = rest.split_whitespace().collect();
-        let Some(inode_field) = fields.iter().find(|f| f.contains(':') && f.contains('.') == false)
+        let Some(inode_field) = fields
+            .iter()
+            .find(|f| f.contains(':') && f.contains('.') == false)
         else {
             continue;
         };
-        let Some(found) = inode_field.rsplit(':').next().and_then(|i| i.parse::<u64>().ok()) else {
+        let Some(found) = inode_field
+            .rsplit(':')
+            .next()
+            .and_then(|i| i.parse::<u64>().ok())
+        else {
             continue;
         };
         if found != ino {

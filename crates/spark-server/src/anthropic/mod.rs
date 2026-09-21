@@ -6,12 +6,12 @@
 //! reuses the existing scheduler pipeline, and converts the response back to
 //! Anthropic format. Supports both streaming (SSE) and non-streaming.
 
-mod convert;
 mod block_messages;
-mod image_content;
+mod convert;
 mod handlers;
 mod handlers_stream;
 mod helpers;
+mod image_content;
 mod translate;
 mod translator;
 mod types;

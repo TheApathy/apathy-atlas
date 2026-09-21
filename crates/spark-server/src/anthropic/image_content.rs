@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::types::{AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ToolResultContent};
+use super::types::{
+    AnthropicContent, ContentBlock, MessagesRequest, SystemContent, ToolResultContent,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -46,7 +48,8 @@ impl ImageSource {
 impl MessagesRequest {
     pub(super) fn validate_images(&self) -> Result<(), &'static str> {
         if matches!(&self.system, Some(SystemContent::Blocks(blocks))
-            if blocks.iter().any(|block| block.block_type == "image")) {
+            if blocks.iter().any(|block| block.block_type == "image"))
+        {
             return Err("Anthropic system images are not supported");
         }
         for message in &self.messages {

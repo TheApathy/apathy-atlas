@@ -279,9 +279,7 @@ pub fn scan_report_for(cache_dir: Option<&Path>, listed: usize) -> String {
         }
         extra = format!("  ·  ATLAS_MODEL_DIRS: {found} with config.json, {passed} without");
     }
-    format!(
-        "{root}: {listed} listed · {hf} cache entries, {skipped} not HF-cache layout{extra}"
-    )
+    format!("{root}: {listed} listed · {hf} cache entries, {skipped} not HF-cache layout{extra}")
 }
 
 /// Human size. Delegates so the Library card and the download line that
@@ -342,10 +340,18 @@ mod plain_root_tests {
         unsafe { std::env::remove_var("ATLAS_MODEL_DIRS") };
 
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
-        assert!(ids.contains(&"MyModel-NVFP4"), "the model dir is listed: {ids:?}");
-        assert!(!ids.contains(&"not-a-model"), "a dir with no config is not a model: {ids:?}");
+        assert!(
+            ids.contains(&"MyModel-NVFP4"),
+            "the model dir is listed: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"not-a-model"),
+            "a dir with no config is not a model: {ids:?}"
+        );
         assert_eq!(
-            out.iter().find(|e| e.id == "MyModel-NVFP4").map(|e| e.layers),
+            out.iter()
+                .find(|e| e.id == "MyModel-NVFP4")
+                .map(|e| e.layers),
             Some(4),
             "and its config was actually parsed, not just its name taken"
         );
@@ -374,7 +380,12 @@ mod real_box_scan {
         println!("{}", super::scan_report_for(None, all.len()));
         println!("total listed: {}", all.len());
         for e in all.iter().take(6) {
-            println!("  {:<58} {:>9}  {}", e.id, super::human_size(e.size_bytes), e.model_type);
+            println!(
+                "  {:<58} {:>9}  {}",
+                e.id,
+                super::human_size(e.size_bytes),
+                e.model_type
+            );
         }
     }
 }

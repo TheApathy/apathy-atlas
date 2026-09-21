@@ -134,7 +134,8 @@ fn system_images_are_rejected_not_silently_flattened() {
     let req: MessagesRequest = serde_json::from_value(json!({
         "model":"test", "max_tokens":1, "system":[image("RED")],
         "messages":[{"role":"user","content":"Inspect"}]
-    })).unwrap();
+    }))
+    .unwrap();
     assert!(req.contains_image());
     assert!(req.validate_images().is_err());
 }

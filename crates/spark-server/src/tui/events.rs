@@ -188,8 +188,7 @@ pub fn run(
             }
             // Run history: lazily too, and re-read after a run persists a frame
             // (`load_history` is a no-op until something invalidates it).
-            if work.load_history {
-            }
+            if work.load_history {}
             // Unconditional: work started elsewhere must still
             // resolve if the user navigates away, or the run is stranded on a
             // check nobody is draining.

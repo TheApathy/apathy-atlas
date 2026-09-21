@@ -5,7 +5,6 @@
 // _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
 // two that fail if code and tests ever disagree about the order again.
 
-
 //! Scrolling, from the keyboard and from the wheel.
 //!
 //! `app_tests.rs` covers the wheel's ceilings; these cases are the ones the

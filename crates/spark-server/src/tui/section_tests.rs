@@ -104,4 +104,3 @@ fn the_navigable_row_count_is_what_the_sidebar_draws() {
     // Main, Benchmarks, Terminal and Help each carry a pair.
     assert_eq!(rows, 3 + 4 * 2, "3 plain sections and 4 with a pair each");
 }
-

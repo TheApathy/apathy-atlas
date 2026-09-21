@@ -73,7 +73,6 @@ fn the_chip_strip_describes_the_running_config_not_the_boot_argv() {
 // dashboard, a server with no model has nothing it could ever load.
 // (was: the header chip strip with nothing serving)
 
-
 #[test]
 fn the_header_mini_strip_does_not_claim_a_kv_dtype_with_no_model() {
     // This is the line the report was actually about — the top-right corner

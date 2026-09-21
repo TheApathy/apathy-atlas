@@ -44,8 +44,10 @@ pub(super) fn try_refresh(root: &Path, cancel: &AtomicBool) -> Result<Index> {
                     }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(path) = paths.get(i) else { return };
-                    let url =
-                        format!("https://raw.githubusercontent.com/{}/{tree_sha}/{path}", repo());
+                    let url = format!(
+                        "https://raw.githubusercontent.com/{}/{tree_sha}/{path}",
+                        repo()
+                    );
                     match get(&url) {
                         Ok(body) => out.lock().push((recipe_id(path), body)),
                         // One unreachable file must not cost the other 24; it

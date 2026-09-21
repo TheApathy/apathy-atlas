@@ -409,7 +409,10 @@ mod repo_override {
     /// newline in the path.
     #[test]
     fn an_override_is_used_and_trimmed() {
-        assert_eq!(resolve_repo(Some("  me/my-recipes \n".into())), "me/my-recipes");
+        assert_eq!(
+            resolve_repo(Some("  me/my-recipes \n".into())),
+            "me/my-recipes"
+        );
     }
 
     /// A SET-BUT-EMPTY override falls back rather than building

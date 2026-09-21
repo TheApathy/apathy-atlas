@@ -49,4 +49,3 @@ fn q_asks_first_while_the_boot_load_is_still_running() {
 // wires `LibState::launch` — until a recipe can be started from the
 // dashboard, a server with no model has nothing it could ever load.
 // (was: an_awaiting_model_boot_quits_without_the_loading_prompt)
-

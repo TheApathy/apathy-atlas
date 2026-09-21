@@ -259,4 +259,3 @@ fn the_wave_returns_to_where_it_started_every_three_steps() {
 // the banner, and the prefix-cache chip must disappear when hermetic closes
 // that channel — a badge advertising a channel the mode shut is worse than
 // no badge.
-

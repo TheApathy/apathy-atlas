@@ -238,7 +238,6 @@ fn the_library_leaves_nothing_behind_when_it_fills_in() {
     assert!(out.contains("MODELS ─ 1"), "the new title is drawn:\n{out}");
 }
 
-
 #[test]
 fn the_clear_chat_prompt_names_what_it_will_discard() {
     use crate::tui::app::TermSub;

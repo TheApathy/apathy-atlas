@@ -140,10 +140,7 @@ pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
         // here and "auto" is never the honest label. And this engine has no
         // `lm_head_dtype` arg at all, so the badge drops that field rather than
         // printing a placeholder for a knob nobody can set.
-        text: format!(
-            "kv {} · mtp {}",
-            a.kv_cache_dtype, a.mtp_quantization
-        ),
+        text: format!("kv {} · mtp {}", a.kv_cache_dtype, a.mtp_quantization),
         tint: BadgeTint::Quant,
     });
     if a.dflash {

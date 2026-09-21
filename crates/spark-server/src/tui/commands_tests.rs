@@ -5,7 +5,6 @@
 // _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
 // two that fail if code and tests ever disagree about the order again.
 
-
 //! The Ops REPL: completion, dispatch, and what every command puts in the pane.
 //!
 //! `/gpu` is deliberately absent — it queries the device, and these run on
@@ -314,7 +313,10 @@ fn every_dispatched_command_appears_in_the_help_list() {
             missing.push(verb.to_string());
         }
     }
-    assert!(missing.is_empty(), "dispatched but not in /help: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "dispatched but not in /help: {missing:?}"
+    );
     assert!(
         listed.iter().any(|l| l == "/watchdog"),
         "and the check can actually see /watchdog: {listed:?}"

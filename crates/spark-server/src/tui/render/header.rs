@@ -122,7 +122,6 @@ pub(crate) fn download_chip(app: &App, width: u16) -> Option<Vec<Span<'static>>>
     Some(out)
 }
 
-
 pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, tall: bool) {
     // Chevron wave only during loading (motion restraint).
     //

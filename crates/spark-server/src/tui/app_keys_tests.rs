@@ -5,7 +5,6 @@
 // _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
 // two that fail if code and tests ever disagree about the order again.
 
-
 //! Every global binding, driven through the real reducer.
 //!
 //! Synthetic `KeyEvent`s go into [`App::on_key`] and the assertions are on the

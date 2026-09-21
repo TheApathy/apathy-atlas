@@ -676,3 +676,67 @@ mod tests {
         assert_eq!(ptr.offset(256).0, 0x1100);
     }
 }
+
+/// Free device memory as it was BEFORE this process loaded anything.
+///
+/// The dashboard's "atlas used" is `baseline - free`, and that subtraction is
+/// the whole reason this has to be captured rather than computed: free memory
+/// alone cannot distinguish weights this process loaded from memory another
+/// process is holding. A figure derived from one reading is not a smaller
+/// truth than one derived from two — it is a different quantity wearing the
+/// same label.
+///
+/// `OnceLock`, so the FIRST caller fixes it. `capture_baseline` is called from
+/// serve start-up before any allocation; if something reads it earlier the
+/// value is still a true pre-load reading, just taken slightly sooner.
+static BASELINE_FREE_BYTES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+/// Record the pre-load free-memory reading. Idempotent: later calls are
+/// ignored, because a "baseline" taken after the weights are resident would
+/// silently turn `baseline - free` into approximately zero.
+pub fn capture_baseline() {
+    let _ = BASELINE_FREE_BYTES.get_or_init(|| {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda_backend::cuda_free_memory_bytes()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    });
+}
+
+/// The captured baseline, or `None` if it was never taken or the query failed.
+///
+/// `None` rather than a fallback to the current free figure: that would make
+/// `baseline - free` read as 0 bytes used, which is a confident wrong answer
+/// where an absent one is honest.
+pub fn baseline_free_bytes() -> Option<usize> {
+    BASELINE_FREE_BYTES.get().copied().flatten()
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    #[test]
+    fn the_baseline_is_fixed_by_the_first_capture_and_never_moves() {
+        super::capture_baseline();
+        let first = super::baseline_free_bytes();
+        // A second capture must NOT overwrite: taken after a load it would be
+        // post-allocation, and `baseline - free` would collapse to ~0.
+        super::capture_baseline();
+        assert_eq!(super::baseline_free_bytes(), first, "capture is idempotent");
+    }
+
+    #[test]
+    fn an_uncaptured_baseline_is_none_not_a_guess() {
+        // Whatever the state, the accessor never invents a number; on a box
+        // with no CUDA it stays None rather than falling back to free memory,
+        // which would render "0 bytes used" on a loaded server.
+        let v = super::baseline_free_bytes();
+        assert!(
+            v.is_none() || v.is_some_and(|b| b > 0),
+            "never a fabricated zero"
+        );
+    }
+}

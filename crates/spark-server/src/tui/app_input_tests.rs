@@ -5,7 +5,6 @@
 // _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
 // two that fail if code and tests ever disagree about the order again.
 
-
 //! Text entry, driven through [`App::on_key`] rather than the buffers directly.
 //!
 //! Which buffer owns a keystroke is the whole job of this module, so every case

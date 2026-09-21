@@ -22,10 +22,10 @@
 //! - `sampling_setup` — preset / penalty / stop-token / grammar /
 //!                      timeout / logprobs resolution
 
-mod loop_detect;
 mod image_admission;
 #[cfg(test)]
 mod image_admission_tests;
+mod loop_detect;
 mod msg_entry;
 pub(super) mod repair_json;
 mod sampling_setup;
@@ -89,7 +89,9 @@ pub(crate) async fn chat_completions_inner(
     dump_seq: Option<u64>,
 ) -> Response {
     crate::metrics::REQUESTS_TOTAL.inc();
-    crate::metrics::REQUESTS_ACTIVE.inc();
+    // Guarded, not a bare `inc()`: the ten early returns below all end the
+    // request, and every one of them used to leak a count.
+    let active = crate::metrics::ActiveRequestGuard::new();
 
     // ── Input validation + cross-turn F-feature guards ──
     if let Err(resp) = super::chat_phases::validate_input(&req) {
@@ -104,7 +106,10 @@ pub(crate) async fn chat_completions_inner(
         count.saturating_add(m.content.images.len())
     });
     if let Err(error) = image_admission::validate(
-        image_count, state.vision_config.is_some(), state.max_batch_size, state.yarn_context,
+        image_count,
+        state.vision_config.is_some(),
+        state.max_batch_size,
+        state.yarn_context,
     ) {
         return openai_error_response(StatusCode::BAD_REQUEST, error.into());
     }
@@ -305,6 +310,8 @@ pub(crate) async fn chat_completions_inner(
 
     // ── Phase 7: dispatch streaming or blocking ─────────────────
     if req.stream {
+        // The streaming path owns the decrement from here.
+        active.release();
         return super::chat_stream_dispatch::dispatch_streaming(
             state,
             &req,
@@ -341,6 +348,8 @@ pub(crate) async fn chat_completions_inner(
         .await;
     }
 
+    // As does the blocking path.
+    active.release();
     super::chat_blocking::run_blocking_path(super::chat_blocking::BlockingPathArgs {
         state,
         req,

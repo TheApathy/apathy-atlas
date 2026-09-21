@@ -17,18 +17,29 @@ use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
 use crate::main_modules::serve_phases;
 use crate::tokenizer::ChatTokenizer;
-use crate::{
-    cli, conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
-    session_manager,
-};
+use crate::{cli, scheduler, scheduling_policy, session_manager};
 
 /// What the blocking startup hands to the async tail.
+///
+/// The last element is the SCHEDULER'S JOIN HANDLE. It used to be dropped at
+/// the `thread::spawn` that created it, which is fine for a process that only
+/// ever runs one model and exits — and is the third of the three things a
+/// model swap needs, because the outgoing scheduler cannot be torn down
+/// without it. Carried rather than stored in a static so its single owner is
+/// visible in the type.
 type Prepared = (
     Arc<AppState>,
     Arc<std::sync::atomic::AtomicBool>,
     String,
     u16,
+    SchedulerHandle,
 );
+
+/// The scheduler thread's join handle, kept so a future swap can join the
+/// outgoing scheduler instead of leaking it.
+///
+/// `Option` because the EP worker ranks never spawn one.
+pub(crate) type SchedulerHandle = Option<std::thread::JoinHandle<()>>;
 
 /// Bring the engine up, then serve.
 ///
@@ -48,11 +59,17 @@ pub(crate) async fn serve(
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
 ) -> Result<()> {
     // Signal listeners belong on the runtime, not inside the blocking section.
-    let Some((state, model_ready, bind, port)) =
+    let Some((state, model_ready, bind, port, scheduler)) =
         tokio::task::spawn_blocking(move || startup(args, tui_progress)).await??
     else {
         return Ok(()); // EP worker: no router on this rank
     };
+    // HELD, not dropped. Dropping a `JoinHandle` detaches the thread, which is
+    // harmless for a process that runs one model and exits — and makes a swap
+    // impossible, because the outgoing scheduler can then never be joined.
+    // Named `_scheduler` rather than `_`: `let _ = handle` drops it
+    // immediately, which is the bug this is fixing.
+    let _scheduler = scheduler;
     crate::main_modules::serve_router::build_and_serve(state, model_ready, &bind, port).await
 }
 
@@ -63,6 +80,12 @@ fn startup(
     tracing::info!("Atlas Spark starting...");
     tracing::info!("Licensed under AGPL-3.0-only — see /LICENSE in this container");
     spark_runtime::progress::phase(0, "banner");
+
+    // BEFORE any allocation: the dashboard reports "atlas used" as
+    // `baseline - free`, and a baseline taken after the weights are
+    // resident collapses that difference to ~0. Idempotent, so an earlier
+    // reader cannot spoil it.
+    spark_runtime::gpu::capture_baseline();
 
     // Clean shutdown: SIGINT/SIGTERM now request a drain-and-exit instead of
     // killing the process mid-write. In TUI mode Ctrl+C additionally arrives
@@ -674,7 +697,7 @@ fn startup(
         .unwrap_or(ptx_set.behavior.max_thinking_budget);
     // Moved into the scheduler thread; `None` leaves the gate disarmed.
     let scheduler_mtp_gate = args.mtp_gate.clone();
-    std::thread::spawn(move || {
+    let scheduler_handle = std::thread::spawn(move || {
         scheduler::run(
             scheduler_model,
             request_rx,
@@ -709,9 +732,17 @@ fn startup(
 
     // 8. Build app state
     let model_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let response_store = response_store::ResponseStore::from_env();
-    let rate_limiter = rate_limiter::RateLimiter::from_env();
-    let conversation_store = conversation_store::ConversationStore::from_env();
+    // Built as ONE `Carried` rather than three loose values. These three
+    // outlive any model: a swap that rebuilt them would silently drop stored
+    // conversations and responses and reset every rate-limit bucket — no
+    // error, just a user noticing their history is gone. Constructing them
+    // together makes carrying them the only way to load a second model,
+    // because the compiler asks for the struct rather than the pieces.
+    let carried = super::serve_load::Carried::from_env()
+        .map_err(|e| anyhow::anyhow!("process-scoped state: {e}"))?;
+    let response_store = carried.response_store.clone();
+    let rate_limiter = carried.rate_limiter.clone();
+    let conversation_store = carried.conversation_store.clone();
     serve_phases::log_response_store_audit(&response_store, &rate_limiter);
     let dump_writer = serve_phases::open_dump_writer(&args);
     let auth = build_auth_config(&args)?;
@@ -785,7 +816,13 @@ fn startup(
     }
 
     // 9-11. Router + HTTP server run on the async side; hand them the pieces.
-    Ok(Some((state, model_ready, args.bind, args.port)))
+    Ok(Some((
+        state,
+        model_ready,
+        args.bind,
+        args.port,
+        Some(scheduler_handle),
+    )))
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an

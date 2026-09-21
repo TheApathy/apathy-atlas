@@ -3,12 +3,12 @@
 //! Frame layout: sticky header (logo + status), sidebar, per-section content,
 //! sticky footer, toasts, help overlay. Pure `App` → `Frame`.
 
+mod bench_tab;
 mod chat_lines;
 mod header;
 mod help_tab;
 mod hints;
 mod library;
-mod bench_tab;
 mod main_tab;
 mod main_tab_kernels;
 mod network_tab;

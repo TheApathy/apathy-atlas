@@ -147,10 +147,7 @@ fn an_override_replaces_rather_than_appends() {
 #[test]
 fn an_unknown_override_is_refused_by_the_clap_round_trip() {
     let all = all();
-    let r = all
-        .iter()
-        .find(|r| r.is_atlas())
-        .expect("an avarok recipe");
+    let r = all.iter().find(|r| r.is_atlas()).expect("an avarok recipe");
     let overrides = BTreeMap::from([("nonsense".to_string(), "1".to_string())]);
     let err = format!("{:#}", r.serve_args(&overrides).expect_err("refused"));
     assert!(err.contains("nonsense"), "names the bad key: {err}");
@@ -281,4 +278,3 @@ fn the_commit_date_fallback_resolves_against_the_real_repo() {
 // still be servable under --hermetic, and the original test carried a power
 // check (at least one fixture must set a key --hermetic closes) so it could
 // not pass vacuously. Port that power check along with it.
-

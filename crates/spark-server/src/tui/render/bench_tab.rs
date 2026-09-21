@@ -19,10 +19,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
-use crate::tui::theme;
 use crate::tui::app::App;
-use crate::tui::data::bench;
 use crate::tui::app::BenchSub;
+use crate::tui::data::bench;
+use crate::tui::theme;
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     match app.bench_sub {
@@ -49,7 +49,11 @@ fn draw_box(f: &mut Frame, area: Rect) {
         Line::from(Span::styled(
             verdict,
             Style::default()
-                .fg(if blocked { theme::ERROR.color() } else { theme::GREEN.color() })
+                .fg(if blocked {
+                    theme::ERROR.color()
+                } else {
+                    theme::GREEN.color()
+                })
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -174,7 +178,10 @@ fn draw_runs(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("  {:<22} {:>6} {:>11} {:>10} {:>10}", "arm", "trials", "median tok/s", "min", "max"),
+        format!(
+            "  {:<22} {:>6} {:>11} {:>10} {:>10}",
+            "arm", "trials", "median tok/s", "min", "max"
+        ),
         theme::dim(),
     )));
     for a in arms.iter().take(area.height.saturating_sub(6) as usize) {

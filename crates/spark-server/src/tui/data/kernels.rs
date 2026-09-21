@@ -107,7 +107,8 @@ pub fn build() -> KernelTableModel {
     // the model half; a build carrying two quants of the same model would match
     // the first, which is the "some other target's module list" failure the
     // comment above is about — so it is narrowed by the loaded quant below.
-    let Some(ptx) = loaded_target().and_then(|(model, _quant)| atlas_kernels::ptx_for_model(&model))
+    let Some(ptx) =
+        loaded_target().and_then(|(model, _quant)| atlas_kernels::ptx_for_model(&model))
     else {
         return KernelTableModel::default();
     };
@@ -131,10 +132,13 @@ pub fn build() -> KernelTableModel {
         })
         .collect();
     rows.sort_by(|a, b| a.module.cmp(&b.module));
-    // NO REQUIRED/EXPECTED SPLIT ON THIS ENGINE. Upstream classifies a failed
-    // lookup against `TargetPtxSet::expected_absent`; our `TargetPtxSet` has no
-    // such field and `kernel_audit` has no `split_failures`, so the
-    // distinction genuinely does not exist here.
+    // NO REQUIRED/EXPECTED SPLIT ON THIS ENGINE, and the blocker is DATA, not
+    // code. `kernel_audit`'s own report says the same thing in the same words:
+    // "Without a MODEL.toml [expected_absent] declaration this report cannot
+    // tell the two apart." Building the mechanism without the per-model triage
+    // that populates it would leave `expected_absent` empty, put every failure
+    // back under "required", and reproduce the exact over-report below — so
+    // this pane says what the log says, and the two cannot disagree.
     //
     // Every failure therefore goes in ONE list and `missing_expected` stays
     // empty. Putting them all under `missing_required` instead would be the

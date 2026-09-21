@@ -32,7 +32,8 @@ pub struct MessagesRequest {
 impl MessagesRequest {
     pub(super) fn contains_image(&self) -> bool {
         if matches!(&self.system, Some(SystemContent::Blocks(blocks))
-            if blocks.iter().any(|block| block.block_type == "image")) {
+            if blocks.iter().any(|block| block.block_type == "image"))
+        {
             return true;
         }
         self.messages.iter().any(|message| match &message.content {

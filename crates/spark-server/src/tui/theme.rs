@@ -253,7 +253,6 @@ pub fn glow(tick: u64) -> Color {
     )
 }
 
-
 /// Braille spinner frames (1 rev/s at the 10 Hz tick).
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 

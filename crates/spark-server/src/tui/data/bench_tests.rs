@@ -78,7 +78,11 @@ fn the_verdict_names_every_blocker_not_just_the_first() {
         mem_available_mib: 100 * 1024,
         builders: 0,
     };
-    assert!(clear.verdict().starts_with("box is clear"), "{}", clear.verdict());
+    assert!(
+        clear.verdict().starts_with("box is clear"),
+        "{}",
+        clear.verdict()
+    );
 }
 
 #[test]

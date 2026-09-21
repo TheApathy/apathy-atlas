@@ -34,7 +34,11 @@ impl App {
                 }
             }
             Section::Benchmarks => {
-                self.bench_sub = if i == 0 { BenchSub::Box } else { BenchSub::Runs }
+                self.bench_sub = if i == 0 {
+                    BenchSub::Box
+                } else {
+                    BenchSub::Runs
+                }
             }
             Section::Terminal => self.term_sub = if i == 0 { TermSub::Ops } else { TermSub::Chat },
             Section::Help => {

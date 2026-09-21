@@ -47,7 +47,11 @@ pub async fn messages(State(state): State<Arc<AppState>>, body: axum::body::Byte
     }
 
     if let Err(error) = req.validate_images() {
-        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", error.into());
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            error.into(),
+        );
     }
     tracing::info!(
         "Anthropic request: max_tokens={}, thinking={:?}, tools={}, model={}, stream={}",

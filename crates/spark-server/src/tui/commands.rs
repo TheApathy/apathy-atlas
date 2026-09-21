@@ -220,11 +220,9 @@ fn cmd_kernels(app: &mut App, filter: &str) {
 fn cmd_gpu(app: &mut App) {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let free = super::data::gpu_free_bytes().map(|b| b as f64 / GIB);
-    // No `spark_runtime::gpu::baseline_free_bytes()` in this engine, so the
-    // pre-load baseline is unknown and `atlas used = baseline - free` cannot be
-    // computed. Reported as 0.0, which the formatter below renders as an
-    // absent baseline rather than a claim that the GPU was empty at boot.
-    let baseline = 0.0_f64;
+    let baseline = spark_runtime::gpu::baseline_free_bytes()
+        .map(|b| b as f64 / GIB)
+        .unwrap_or(0.0);
     match free {
         Some(f) => {
             app.ops.output.push(format!(

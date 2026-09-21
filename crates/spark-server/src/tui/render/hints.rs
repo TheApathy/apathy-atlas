@@ -90,4 +90,3 @@ pub(super) fn help_hints(app: &App) -> &'static str {
         ReportPhase::Failed { .. } => "s retry · Esc back",
     }
 }
-

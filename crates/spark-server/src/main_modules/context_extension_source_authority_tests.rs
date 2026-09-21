@@ -19,7 +19,15 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // Diffed before re-pinning: no context-extension path, admission rule or
 // phase ordering moved. The point of this hash is that somebody LOOKS when
 // it breaks — updating it without the diff is how it becomes a rubber stamp.
-const SERVE_SHA256: &str = "2fc2a19424e6723109b77f0f82c517263a01581292569156b1480a31e388743d";
+// Re-pinned 2026-09-21 (second time) for the engine-side gap fixes. The
+// serve.rs changes are: the three process-scoped stores now come from one
+// `Carried`; the scheduler thread's JoinHandle is bound and held instead of
+// dropped at the spawn; `gpu::capture_baseline()` runs at the banner, before
+// any allocation. Diffed before re-pinning — NO context-extension path,
+// admission rule or phase ordering moved, which a `grep -c` over the diff
+// confirms at zero. This hash exists so somebody LOOKS when it breaks;
+// updating it without the diff is how it becomes a rubber stamp.
+const SERVE_SHA256: &str = "9c6193c18b6b5e14f6cfa6bf4db249c112d6e7af0c83d59bfa26ce82c3aca92c";
 const SERVE_PHASES_SHA256: &str =
     "e3e84d068c761ff43ad49a04c67d3cd37a8107f99110c919bd016832219c9f1e";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";

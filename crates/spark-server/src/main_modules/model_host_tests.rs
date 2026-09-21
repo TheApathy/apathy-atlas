@@ -125,7 +125,6 @@ fn the_rate_limiter_survives_having_no_model() {
 // the flags: its point is that deny wins — `--no-auto-swap` beats
 // `--auto-swap` — and that the answer comes without cloning ~100 fields.
 
-
 #[test]
 fn the_dashboard_channel_survives_for_later_loads() {
     // The Stats pane samples the run handles every tick and Ops toggles levers

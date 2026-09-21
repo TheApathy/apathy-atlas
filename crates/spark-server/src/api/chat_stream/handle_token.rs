@@ -26,6 +26,9 @@ type SseVec = Vec<Result<Event, std::convert::Infallible>>;
 /// Process one token. Returns the SSE events to forward to the
 /// client (empty `Vec` is valid).
 pub(super) fn handle_token(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> SseVec {
+    // Counted HERE, as it is produced, so the dashboard's tok/s is a live
+    // rate rather than one spike at completion.
+    crate::metrics::DECODED_TOKENS_TOTAL.inc();
     let mut sse_events: SseVec = Vec::new();
     state.all_toks.push(tok);
     // One push per call == one sampled token == one increment of

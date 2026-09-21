@@ -10,8 +10,8 @@ pub(crate) mod middleware;
 pub(crate) mod model_host;
 // Process-scoped state carried across a model swap. Minimal port: the `Carried`
 // struct only, not upstream's 1350-line loader. See the module docs.
-pub(crate) mod serve_load;
 pub(crate) mod serve;
+pub(crate) mod serve_load;
 pub(crate) mod serve_phases;
 mod serve_router;
 

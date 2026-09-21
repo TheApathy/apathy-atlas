@@ -133,7 +133,10 @@ pub fn prepend_reminder_to_system(
 ) {
     // Optional notices may replace existing ranges; leave image-bearing system
     // content intact rather than invalidating its ordered pixel ownership.
-    if messages.first().is_some_and(|m| m.role == "system" && !m.content.images.is_empty()) {
+    if messages
+        .first()
+        .is_some_and(|m| m.role == "system" && !m.content.images.is_empty())
+    {
         return;
     }
     let trimmed = reminder.trim_matches(|c: char| c == '\n' || c == ' ');
@@ -287,7 +290,10 @@ pub fn f29_inject_environment_facts(
     );
 
     // Optional idempotent rewrites must not move/delete embedded image positions.
-    if messages.first().is_some_and(|m| m.role == "system" && !m.content.images.is_empty()) {
+    if messages
+        .first()
+        .is_some_and(|m| m.role == "system" && !m.content.images.is_empty())
+    {
         return;
     }
     // Locate or synthesise system message at position 0.
