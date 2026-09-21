@@ -69,7 +69,7 @@ impl NativeKind {
     }
 }
 
-fn looks_like_native_config(config: &DflashConfig) -> bool {
+pub(super) fn looks_like_native_config(config: &DflashConfig) -> bool {
     // A two-of-three quorum catches any one-field mutation of the native
     // identity without claiming every future 48-layer or H=2560 drafter.
     let target_depth = config.num_target_layers == TARGET_LAYERS;

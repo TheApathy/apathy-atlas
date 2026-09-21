@@ -186,14 +186,6 @@ impl Qwen3SsmLayer {
             None
         };
 
-        // Diagnostic: sync at entry to catch prior-layer errors
-        if k > 4096 {
-            tracing::info!("SSM prefill ENTRY: k={k} h={h}");
-            ctx.gpu
-                .synchronize(stream)
-                .map_err(|e| anyhow::anyhow!("SSM prefill ENTRY: stream broken (k={k}): {e}"))?;
-        }
-
         // ── 1. Input preparation for N tokens ──
         let hyper_gemm = std::env::var("ATLAS_QWEN4_HYPER_PREFILL_GEMM")
             .ok()
@@ -237,12 +229,6 @@ impl Qwen3SsmLayer {
             )?;
             normed
         };
-        if k > 4096 {
-            ctx.gpu
-                .synchronize(stream)
-                .map_err(|e| anyhow::anyhow!("SSM prefill: SYNC after rms_norm (k={k}): {e}"))?;
-        }
-
         prof!("rms_norm_residual", t0);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;

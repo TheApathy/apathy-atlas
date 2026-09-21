@@ -79,8 +79,24 @@ fn validate_dflash_metadata(
         (false, false) => return Ok(None),
     };
 
-    let strict_qwen38_dflash2 =
-        config::declares_qwen38_dflash2(config) || qwen38_dflash2::has_tensor_signature(source);
+    // THE SPECIFIC DISCRIMINATOR WINS OVER THE BROAD ONE.
+    //
+    // Flash-Next's DFlash2 also declares `DFlash2DraftModel` and sets the same
+    // conv/selector geometry fields, so `declares_qwen38_dflash2` — which is an
+    // OR over exactly those two signals — matches it too. Strict admission then
+    // demanded 5120/17408/5 of a drafter that is 2560-wide by design, and
+    // refused a checkpoint it was never written to judge.
+    //
+    // `looks_like_native_config` is the careful one: a two-of-three quorum over
+    // target depth, draft geometry and capture taps, documented as deliberately
+    // not claiming "every future 48-layer or H=2560 drafter". Where it claims a
+    // config, the Qwen3.8 geometry check must stand down — that path has its
+    // own validator (`validate_native_flash_next_config`).
+    //
+    // This narrows neither check; it makes them mutually exclusive.
+    let strict_qwen38_dflash2 = !native_flash_next::looks_like_native_config(config)
+        && (config::declares_qwen38_dflash2(config)
+            || qwen38_dflash2::has_tensor_signature(source));
     let dimensions = validate_config(config, strict_qwen38_dflash2)?;
     validate_layer_indices(source, prefix, config.num_hidden_layers)?;
     validate_required_tensors(source, prefix, config, dimensions)?;

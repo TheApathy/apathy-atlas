@@ -2,7 +2,10 @@
 
 use anyhow::{Result, bail};
 use spark_model::layers::ops;
-use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelLaunch};
+// `KernelLaunch` is in `kernel_args`, not `gpu` — the example imported it
+// from the wrong module and has never compiled.
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
+use spark_runtime::kernel_args::KernelLaunch;
 
 use super::{K, Kernels, Plan, SCALE2};
 

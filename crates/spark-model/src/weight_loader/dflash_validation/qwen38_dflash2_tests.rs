@@ -35,6 +35,17 @@ fn official_config() -> DflashConfig {
         draft_vocab_size: None,
         tie_word_embeddings: false,
         block_size: 16,
+        // Three fields theirs' side added to `DflashConfig`; HEAD's literal
+        // predates them. Values chosen to MATCH THIS FIXTURE, not invented:
+        //   root_block_size_explicit — `parse_dflash_config` sets it true when
+        //     the JSON carries a root `block_size`, and this literal sets 16.
+        //   num_target_layers — the sub-config's `target_layer_ids` has 5.
+        //   model_type — `Option`, absent from the original JSON this mirrors.
+        // Nothing in this file asserts on any of the three, so they affect
+        // only whether the struct is constructible.
+        root_block_size_explicit: true,
+        num_target_layers: 5,
+        model_type: None,
         dflash_config: Some(DflashSubConfig {
             block_size: Some(8),
             mask_token_id: 248070,
