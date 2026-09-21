@@ -23,7 +23,9 @@ pub struct LibraryEntry {
     pub heads: usize,
     pub experts: usize,
     pub context: usize,
-    /// A compiled kernel target matches this model's (model_type, hidden).
+    /// A compiled kernel target resolves UNAMBIGUOUSLY for this model's
+    /// (model_type, hidden) + HF id. False also when targets exist but the
+    /// tie-break fails — serving the entry as-is would refuse.
     pub optimized: bool,
 }
 
@@ -73,10 +75,37 @@ pub fn scan(cache_dir: Option<&Path>) -> Vec<LibraryEntry> {
         else {
             continue;
         };
-        let has_weights = crate::model_resolver::snapshot_has_weights(&snap);
+        // "Ready" has to mean "the loader would accept this", not "some file
+        // that looks like weights is present". Two ways it can differ, both
+        // reachable the moment downloads exist:
+        //   * `snapshot_has_weights` counts `model.safetensors.index.json`,
+        //     which is small and lands FIRST — so a download that has barely
+        //     started reads as complete;
+        //   * a download that never finished has no `refs/main`, which is what
+        //     the resolver actually keys on.
+        let has_shard = std::fs::read_dir(&snap)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".safetensors"))
+                })
+            })
+            .unwrap_or(false);
+        let published = e.path().join("refs/main").exists();
+        let has_weights = has_shard && published;
         let mut entry = LibraryEntry {
             id,
-            size_bytes: dir_size(&e.path().join("blobs")),
+            // `blobs/` is where huggingface-cli puts the real bytes, with
+            // snapshots/ as symlinks into it — so `len()` of a snapshot entry
+            // would measure the link, not the model. Avarok's own downloader
+            // writes the files directly into snapshots/ and has no blobs/ at
+            // all, which reported every model it fetched as 0 MB. Measure
+            // whichever layout this model actually uses.
+            size_bytes: match dir_size(&e.path().join("blobs")) {
+                0 => dir_size(&snap),
+                n => n,
+            },
             snapshot_dir: snap.clone(),
             has_weights,
             model_type: "?".into(),
@@ -104,8 +133,19 @@ pub fn scan(cache_dir: Option<&Path>) -> Vec<LibraryEntry> {
                     q.quant_algo.to_lowercase()
                 };
             }
-            entry.optimized =
-                atlas_kernels::ptx_for_config(&cfg.model_type, cfg.hidden_size).is_some();
+            // The HF id is the reference the tie-break matches against for
+            // config-identical checkpoints (Qwen3.6-27B vs Qwen3.8-27B).
+            // An ambiguity error is shown as un-optimized: serving this
+            // entry as-is WOULD refuse, which is what the flag reports.
+            entry.optimized = matches!(
+                atlas_kernels::ptx_for_config(
+                    &cfg.model_type,
+                    cfg.hidden_size,
+                    &[entry.id.as_str()],
+                    None,
+                ),
+                Ok(Some(_))
+            );
         }
         out.push(entry);
     }
@@ -113,13 +153,31 @@ pub fn scan(cache_dir: Option<&Path>) -> Vec<LibraryEntry> {
     out
 }
 
-/// Human size, GiB with one decimal above 1 GiB.
+/// Human size. Delegates so the Library card and the download line that
+/// replaces it cannot disagree about how big the same file is.
 pub fn human_size(bytes: u64) -> String {
-    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let g = bytes as f64 / GIB;
-    if g >= 1.0 {
-        format!("{g:.1} GB")
-    } else {
-        format!("{} MB", bytes / (1024 * 1024))
-    }
+    crate::tui::format::bytes(bytes)
+}
+
+/// Run [`scan`] on its own thread, delivering the result over a channel.
+///
+/// The scan recursively `read_dir`s every `models--*/blobs`, which on a cache
+/// holding a few dozen multi-gigabyte checkpoints is tens of milliseconds to
+/// seconds with a cold page cache — and it was running on the render thread.
+/// It also needs to be re-runnable now, because a finished download must
+/// appear without restarting the dashboard.
+///
+/// Same shape as `recipe::fetch::refresh_in_background`, and the same rule:
+/// the render thread only ever `try_recv`s.
+pub fn scan_in_background(
+    cache_dir: Option<&Path>,
+) -> std::sync::mpsc::Receiver<Vec<LibraryEntry>> {
+    let owned = cache_dir.map(|p| p.to_path_buf());
+    // An empty list is what `scan` itself returns for an unreadable cache, so
+    // it is also the honest answer when the scanner cannot start.
+    crate::tui::worker::spawn(
+        "atlas-libscan",
+        move || scan(owned.as_deref()),
+        |_| Vec::new(),
+    )
 }

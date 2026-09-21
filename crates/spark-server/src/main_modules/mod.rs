@@ -7,6 +7,7 @@ pub(crate) mod byte_count;
 mod context_extension;
 pub(crate) mod kv_dtypes;
 pub(crate) mod middleware;
+pub(crate) mod model_host;
 pub(crate) mod serve;
 pub(crate) mod serve_phases;
 mod serve_router;

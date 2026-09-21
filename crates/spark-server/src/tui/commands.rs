@@ -40,11 +40,14 @@ pub fn complete(input: &str) -> Option<&'static str> {
 /// is routed to the Chat tab's engine instead.
 pub fn execute(line: &str, app: &mut App) {
     let line = line.trim();
+    // Enter means "show me the result": a reader parked in scrollback would
+    // otherwise miss the output of the command they just ran.
+    app.ops.scroll_up = 0;
     app.ops.output.push(format!("❯ {line}"));
     if !line.starts_with('/') {
         app.ops
             .output
-            .push("(bare text goes to the Chat tab — press 5 twice)".into());
+            .push("(bare text goes to the Chat tab — press 6 twice)".into());
         return;
     }
     let mut parts = line.splitn(2, ' ');
@@ -61,17 +64,28 @@ pub fn execute(line: &str, app: &mut App) {
         "/kernels" => cmd_kernels(app, arg),
         "/gpu" => cmd_gpu(app),
         "/cache" => cmd_cache(app),
-        "/watchdog" => match arg {
-            "on" => {
-                crate::scheduler::set_enable_loop_watchdog(true);
-                app.ops.output.push("loop watchdog: ON".into());
+        "/watchdog" => {
+            let on = match arg {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    app.ops.output.push("usage: /watchdog on|off".into());
+                    return;
+                }
+            };
+            match app.run.as_ref().map(|r| &r.levers) {
+                Some(l) => {
+                    l.set_loop_watchdog(on);
+                    app.ops
+                        .output
+                        .push(format!("loop watchdog: {}", if on { "ON" } else { "OFF" }));
+                }
+                None => app
+                    .ops
+                    .output
+                    .push("loop watchdog: no run yet — the scheduler has not started".into()),
             }
-            "off" => {
-                crate::scheduler::set_enable_loop_watchdog(false);
-                app.ops.output.push("loop watchdog: OFF".into());
-            }
-            _ => app.ops.output.push("usage: /watchdog on|off".into()),
-        },
+        }
         "/detach" => app.detach = true,
         "/quit" => {
             super::shutdown::request("/quit");
@@ -81,6 +95,16 @@ pub fn execute(line: &str, app: &mut App) {
             .ops
             .output
             .push(format!("unknown command {other} — /help")),
+    }
+    // Cap the scrollback like every other buffer in the tree (log ring CAP
+    // 10_000, bench LOG_CAPACITY 500): /metrics alone adds 40+ lines per
+    // call, and this was the one buffer with no limit — a slow leak on a
+    // dashboard that serves for days. One choke point, because every append
+    // happens inside this call.
+    const OUTPUT_CAP: usize = 1_000;
+    if app.ops.output.len() > OUTPUT_CAP {
+        let excess = app.ops.output.len() - OUTPUT_CAP;
+        app.ops.output.drain(..excess);
     }
 }
 
@@ -96,8 +120,10 @@ fn cmd_status(app: &mut App) {
                 s.kv_blocks_free, s.kv_blocks_total, s.ssm_slots_used, s.ssm_slots_total
             ));
             app.ops.output.push(format!(
-                "  mtp {:?} · delivered {:.1} tok/s · {} steps",
-                s.mtp_mode, s.delivered_tps, s.steps_total
+                "  mtp {} · delivered {:.1} tok/s · {} steps",
+                crate::tui::format::mtp_mode_label(s.mtp_mode),
+                s.delivered_tps,
+                s.steps_total
             ));
         }
         None => app
@@ -117,7 +143,7 @@ fn cmd_status(app: &mut App) {
 fn cmd_metrics(app: &mut App, filter: &str) {
     let mut n = 0;
     for mf in prometheus::gather() {
-        if !filter.is_empty() && !mf.get_name().contains(filter) {
+        if !filter.is_empty() && !mf.name().contains(filter) {
             continue;
         }
         let kind = mf.get_field_type();
@@ -133,7 +159,7 @@ fn cmd_metrics(app: &mut App, filter: &str) {
             let labels: Vec<String> = m
                 .get_label()
                 .iter()
-                .map(|l| format!("{}={}", l.get_name(), l.get_value()))
+                .map(|l| format!("{}={}", l.name(), l.value()))
                 .collect();
             let suffix = if labels.is_empty() {
                 String::new()
@@ -142,7 +168,7 @@ fn cmd_metrics(app: &mut App, filter: &str) {
             };
             app.ops
                 .output
-                .push(format!("  {}{suffix} = {v}", mf.get_name()));
+                .push(format!("  {}{suffix} = {v}", mf.name()));
             n += 1;
             if n >= 40 {
                 app.ops
@@ -160,16 +186,20 @@ fn cmd_metrics(app: &mut App, filter: &str) {
 fn cmd_kernels(app: &mut App, filter: &str) {
     let rows = spark_runtime::kernel_audit::audit_rows();
     let mut n = 0;
-    for row in rows {
-        if !filter.is_empty() && !row.module.contains(filter) && !row.func.contains(filter) {
+    for r in rows {
+        let (m, f, ok) = (&r.module, &r.func, r.loaded);
+        if !filter.is_empty() && !m.contains(filter) && !f.contains(filter) {
             continue;
         }
-        app.ops.output.push(format!(
-            "  {} {}::{}",
-            if row.loaded { "✓" } else { "✗" },
-            row.module,
-            row.func
-        ));
+        // A failed lookup without its dispatch site is a name, not a work item.
+        let site = if ok {
+            String::new()
+        } else {
+            format!("  at {}:{}", r.site.file(), r.site.line())
+        };
+        app.ops
+            .output
+            .push(format!("  {} {m}::{f}{site}", if ok { "✓" } else { "✗" }));
         n += 1;
         if n >= 40 {
             app.ops
@@ -186,14 +216,14 @@ fn cmd_kernels(app: &mut App, filter: &str) {
 fn cmd_gpu(app: &mut App) {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let free = super::data::gpu_free_bytes().map(|b| b as f64 / GIB);
-    let total = super::data::gpu_memory_bytes()
-        .map(|(_, total)| total as f64 / GIB)
+    let baseline = spark_runtime::gpu::baseline_free_bytes()
+        .map(|b| b as f64 / GIB)
         .unwrap_or(0.0);
     match free {
         Some(f) => {
             app.ops.output.push(format!(
-                "  gpu free {f:.1} GB · total {total:.1} GB · atlas ≈ {:.1} GB",
-                (total - f).max(0.0)
+                "  gpu free {f:.1} GB · baseline {baseline:.1} GB · atlas ≈ {:.1} GB",
+                (baseline - f).max(0.0)
             ));
         }
         None => app.ops.output.push("  gpu memory query unavailable".into()),
@@ -225,3 +255,9 @@ mod tests {
         assert_eq!(complete("hello"), None); // not a slash command
     }
 }
+
+// The dispatch cases live in their own mount; the completion case above stays
+// beside the function it describes.
+#[cfg(test)]
+#[path = "commands_tests.rs"]
+mod line_tests;

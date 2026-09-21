@@ -3,6 +3,12 @@
 //! CLI argument parsing.
 
 use clap::Parser;
+
+/// The crate version, exposed under a name the dashboard can reference.
+///
+/// Upstream calls this `AVAROK_VERSION`; this engine is Atlas, and the TUI's
+/// help tab and issue reporter both read it.
+pub const ATLAS_VERSION: &str = env!("CARGO_PKG_VERSION");
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]

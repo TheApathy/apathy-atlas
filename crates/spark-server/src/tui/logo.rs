@@ -102,8 +102,28 @@ pub enum BadgeTint {
 
 /// Derive the header badge chips from ServeArgs — the "significant CLI flags"
 /// strip on the Main tab. Order is display order; chips wrap.
-pub fn badges(a: &crate::cli::ServeArgs) -> Vec<Badge> {
+///
+/// `awaiting_model` is the load-bearing argument. Every chip below except the
+/// address describes a *loaded model*, but they are all read from `ServeArgs`,
+/// which is fully populated by clap defaults whether or not anything is
+/// serving. On a no-model boot that produced a strip reading `<model>`,
+/// `kv fp8`, `batch 8`, `ctx 32k` — a confident description of a configuration
+/// that is not running. The listener, by contrast, really is up: it binds
+/// before any model loads. So when awaiting we emit the state and the way out,
+/// plus the address, and assert nothing else.
+pub fn badges(a: &crate::cli::ServeArgs, awaiting_model: bool) -> Vec<Badge> {
     let mut out = Vec::new();
+    if awaiting_model {
+        out.push(Badge {
+            text: "no model · press 4 for Library".into(),
+            tint: BadgeTint::Neutral,
+        });
+        out.push(Badge {
+            text: format!(":{}", a.port),
+            tint: BadgeTint::Neutral,
+        });
+        return out;
+    }
     let model = a
         .model_name
         .clone()
@@ -114,20 +134,32 @@ pub fn badges(a: &crate::cli::ServeArgs) -> Vec<Badge> {
         tint: BadgeTint::Model,
     });
     out.push(Badge {
-        text: format!("kv {} · mtp {}", a.kv_cache_dtype, a.mtp_quantization),
+        text: format!(
+            "kv {} · lm {} · mtp {}",
+            // Pre-resolution args: an omitted --kv-cache-dtype is decided
+            // later against MODEL.toml, so "auto" is the honest label here.
+            a.kv_cache_dtype.as_deref().unwrap_or("auto"),
+            a.lm_head_dtype,
+            a.mtp_quantization
+        ),
         tint: BadgeTint::Quant,
     });
     if a.dflash {
         out.push(Badge {
             text: match a.dflash_gamma {
-                Some(gamma) => format!("DFlash γ={gamma}"),
+                Some(g) => format!("DFlash γ={g}"),
                 None => "DFlash γ=auto".to_string(),
             },
             tint: BadgeTint::Quant,
         });
     } else if a.speculative || a.self_speculative || a.ngram_speculative {
         out.push(Badge {
-            text: format!("MTP k={}", a.num_drafts + 1),
+            // Pre-resolution args: an omitted --num-drafts is decided later
+            // against MODEL.toml, so the verify width is not yet known.
+            text: match a.num_drafts {
+                Some(n) => format!("MTP k={}", n + 1),
+                None => "MTP k=auto".to_string(),
+            },
             tint: BadgeTint::Quant,
         });
     } else {
@@ -156,7 +188,18 @@ pub fn badges(a: &crate::cli::ServeArgs) -> Vec<Badge> {
         text: format!("sched {}", a.scheduling_policy),
         tint: BadgeTint::Neutral,
     });
-    if a.enable_prefix_caching {
+    // NAMED, not merely reflected. Under `--hermetic` the prefix-cache chip
+    // below simply disappears, and an absent chip does not say WHY — an
+    // operator reads "no prefix cache" and cannot tell a deliberate KAT
+    // regime from a flag nobody set. This is the banner someone looks at when
+    // a score moves, so the regime that moved it has to be on it.
+    if a.hermetic {
+        out.push(Badge {
+            text: "HERMETIC · KAT".to_string(),
+            tint: BadgeTint::Quant,
+        });
+    }
+    if a.prefix_caching_enabled() {
         out.push(Badge {
             text: format!(
                 "prefix-cache · ssm {}@{}",
@@ -179,6 +222,10 @@ fn human_tokens(n: usize) -> String {
         n.to_string()
     }
 }
+
+#[cfg(test)]
+#[path = "logo_tests.rs"]
+mod more_tests;
 
 #[cfg(test)]
 mod tests {

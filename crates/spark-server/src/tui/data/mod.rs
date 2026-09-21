@@ -4,6 +4,7 @@
 //! state (prometheus counters, scheduler snapshot, kernel audit, HF cache).
 //! Nothing here touches the scheduler thread's locals.
 
+pub mod catalogue;
 pub mod kernels;
 pub mod library;
 pub mod metrics_poll;
@@ -15,14 +16,9 @@ pub mod metrics_poll;
 /// two call sites, no cfg, and the macOS CI job could not compile the crate.
 /// One gated accessor means the next caller cannot repeat that.
 pub fn gpu_free_bytes() -> Option<usize> {
-    gpu_memory_bytes().map(|(free, _)| free)
-}
-
-/// Free and total GPU memory in bytes.
-pub fn gpu_memory_bytes() -> Option<(usize, usize)> {
     #[cfg(feature = "cuda")]
     {
-        spark_runtime::cuda_backend::cuda_memory_bytes()
+        spark_runtime::cuda_backend::cuda_free_memory_bytes()
     }
     #[cfg(not(feature = "cuda"))]
     {

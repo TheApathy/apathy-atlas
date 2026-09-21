@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::metrics;
-use crate::scheduler::snapshot::{self, SchedulerSnapshot};
+use crate::scheduler::snapshot::SchedulerSnapshot;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -74,6 +74,15 @@ pub struct StatsModel {
     // Spec decode accept per K: (k_label, accepted, total).
     pub spec_accept: Vec<(String, u64, u64)>,
     // Memory.
+    /// True once a real device reading has been taken.
+    ///
+    /// ★ The three figures below are plain `f64` and default to 0.0, so on a
+    /// box with no GPU or no NVML they render as `avarok 0.0 GB · free 0.0`
+    /// with a 0 % gauge — a MEASUREMENT OF ZERO rather than "unavailable".
+    /// This file already gets that right for TTFT (an `Option` that renders as
+    /// `—`); the GPU tile did not. Nothing else on this dashboard fabricates a
+    /// number, which is why the fabricated one stood out.
+    pub gpu_known: bool,
     pub gpu_free_gb: f64,
     pub gpu_total_gb: f64,
     pub atlas_used_gb: f64,
@@ -89,6 +98,7 @@ pub struct StatsModel {
 struct Prev {
     requests: u64,
     gen_tok: u64,
+    decoded: u64,
     prompt: u64,
     bytes_in: u64,
     bytes_out: u64,
@@ -120,6 +130,7 @@ impl Default for StatsModel {
             prefix_hit_tokens: 0,
             entropy: 0.0,
             spec_accept: Vec::new(),
+            gpu_known: false,
             gpu_free_gb: 0.0,
             gpu_total_gb: 0.0,
             atlas_used_gb: 0.0,
@@ -148,11 +159,17 @@ fn hist_percentile(buckets: &TtftBuckets, p: f64) -> Option<f64> {
 
 impl StatsModel {
     /// Take one sample. Call at ~1 Hz from the TUI event loop.
-    pub fn sample(&mut self) {
+    // `run` is retained in the signature but unused since the scheduler
+    // snapshot moved to the process-global reader (ruling B). Kept rather than
+    // removed because the LAUNCH commit gives it a use again — it is how the
+    // poller will learn a swap happened — and churning every call site twice
+    // is worse than one underscore.
+    pub fn sample(&mut self, _run: Option<&crate::tui::RunHandles>) {
         let now = Instant::now();
         self.requests_total = metrics::REQUESTS_TOTAL.get();
         self.requests_active = metrics::REQUESTS_ACTIVE.get();
         self.gen_tokens_total = metrics::GENERATION_TOKENS_TOTAL.get();
+        let decoded_total = metrics::DECODED_TOKENS_TOTAL.get();
         self.prompt_tokens_total = metrics::PROMPT_TOKENS_TOTAL.get();
         self.tool_calls_total = metrics::TOOL_CALLS_TOTAL.get();
         self.bytes_in_total = metrics::HTTP_BYTES_IN.get();
@@ -160,7 +177,14 @@ impl StatsModel {
 
         if let Some((t0, prev)) = self.last_sample {
             let dt = now.duration_since(t0).as_secs_f64().max(0.05);
-            self.gen_tps = (self.gen_tokens_total.saturating_sub(prev.gen_tok)) as f64 / dt;
+            // Prefer the per-token counter: it advances DURING generation, so
+            // this is a live rate. `GENERATION_TOKENS_TOTAL` only moves when a
+            // request finishes, which reads as 0 tok/s then one spike — fall
+            // back to it only for paths that never stream (blocking requests),
+            // where a lump at completion is all there is.
+            let decoded_delta = decoded_total.saturating_sub(prev.decoded);
+            let gen_delta = self.gen_tokens_total.saturating_sub(prev.gen_tok);
+            self.gen_tps = decoded_delta.max(gen_delta) as f64 / dt;
             self.prompt_tps = (self.prompt_tokens_total.saturating_sub(prev.prompt)) as f64 / dt;
             self.req_rate = (self.requests_total.saturating_sub(prev.requests)) as f64 / dt;
             self.bytes_in_rate = (self.bytes_in_total.saturating_sub(prev.bytes_in)) as f64 / dt;
@@ -173,6 +197,7 @@ impl StatsModel {
             Prev {
                 requests: self.requests_total,
                 gen_tok: self.gen_tokens_total,
+                decoded: decoded_total,
                 prompt: self.prompt_tokens_total,
                 bytes_in: self.bytes_in_total,
                 bytes_out: self.bytes_out_total,
@@ -182,13 +207,13 @@ impl StatsModel {
         // TTFT histogram via the prometheus proto (bucket bounds + counts).
         self.ttft_buckets.clear();
         for mf in prometheus::gather() {
-            if mf.get_name() != "atlas_time_to_first_token_seconds" {
+            if mf.name() != "atlas_time_to_first_token_seconds" {
                 continue;
             }
             if let Some(m) = mf.get_metric().first() {
                 for b in m.get_histogram().get_bucket() {
                     self.ttft_buckets
-                        .push((b.get_upper_bound(), b.get_cumulative_count()));
+                        .push((b.upper_bound(), b.cumulative_count()));
                 }
             }
         }
@@ -198,21 +223,30 @@ impl StatsModel {
         // Spec-decode accept per K from the labeled counter vec.
         self.spec_accept = spec_accept_from_gather();
 
-        // Prefix cache + sampler globals.
-        let hits = spark_runtime::prefix_cache::cache_hit_count();
-        let misses = spark_runtime::prefix_cache::cache_miss_count();
-        self.prefix_hit_tokens = spark_runtime::prefix_cache::cache_hit_tokens_total();
+        // Prefix cache + sampler globals. Scoped to the CURRENT model: the
+        // cumulative counters behind these are what /metrics exports, and
+        // after a swap they still carry the previous model's cache activity,
+        // which is not what this pane is describing.
+        let (hits, misses, hit_tokens) = spark_runtime::run_metrics::cache_counts_this_run();
+        self.prefix_hit_tokens = hit_tokens;
         self.prefix_hit_rate = (hits + misses > 0).then(|| hits as f64 / (hits + misses) as f64);
         self.entropy = spark_runtime::sampler::last_entropy() as f64;
         self.entropy_history.push(self.entropy);
 
         // Memory.
-        if let Some(free) = super::gpu_free_bytes() {
-            self.gpu_free_gb = free as f64 / GIB;
-        }
-        if let Some((_, total)) = super::gpu_memory_bytes() {
-            self.gpu_total_gb = total as f64 / GIB;
-            self.atlas_used_gb = (self.gpu_total_gb - self.gpu_free_gb).max(0.0);
+        // Both reads must land: `atlas_used` is a DIFFERENCE of the two, so
+        // one without the other is not a smaller truth, it is a wrong number.
+        match (
+            super::gpu_free_bytes(),
+            spark_runtime::gpu::baseline_free_bytes(),
+        ) {
+            (Some(free), Some(baseline)) => {
+                self.gpu_free_gb = free as f64 / GIB;
+                self.gpu_total_gb = baseline as f64 / GIB;
+                self.atlas_used_gb = (self.gpu_total_gb - self.gpu_free_gb).max(0.0);
+                self.gpu_known = true;
+            }
+            _ => self.gpu_known = false,
         }
         if let Some((avail, total)) = host_mem_gb() {
             self.host_avail_gb = avail;
@@ -220,7 +254,7 @@ impl StatsModel {
         }
 
         // Scheduler snapshot.
-        self.sched = snapshot::read();
+        self.sched = crate::scheduler::snapshot::read();
         if let Some(s) = self.sched {
             self.queue_history.push(s.pending_len as f64);
         }
@@ -231,16 +265,16 @@ fn spec_accept_from_gather() -> Vec<(String, u64, u64)> {
     use std::collections::BTreeMap;
     let mut per_k: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for mf in prometheus::gather() {
-        if mf.get_name() != "atlas_spec_decode_verify_total" {
+        if mf.name() != "atlas_spec_decode_verify_total" {
             continue;
         }
         for m in mf.get_metric() {
             let mut k = String::new();
             let mut outcome = String::new();
             for l in m.get_label() {
-                match l.get_name() {
-                    "k" => k = l.get_value().to_string(),
-                    "outcome" => outcome = l.get_value().to_string(),
+                match l.name() {
+                    "k" => k = l.value().to_string(),
+                    "outcome" => outcome = l.value().to_string(),
                     _ => {}
                 }
             }
