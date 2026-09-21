@@ -56,13 +56,35 @@ pub fn ships_vanilla_norm_weights(config: &atlas_core::config::ModelConfig) -> b
 /// The dispatch predicate itself, on the bare `model_type`, so it is unit-testable
 /// without constructing a full `ModelConfig`.
 pub fn model_type_ships_vanilla_norm_weights(model_type: &str) -> bool {
-    matches!(model_type, "deepseek_v4" | "laguna")
+    // "deepseek_v41" is listed on EVIDENCE, not on family resemblance to deepseek_v4.
+    // Read from the shipped checkpoint: `attn.q_norm.weight` means +0.958 / +0.959 / +0.825
+    // at layers 0 / 20 / 39, i.e. centred on 1.0 — the vanilla fingerprint. Under a
+    // (w - 1) offset convention those same tensors would denote scales near 1.96, and the
+    // small norms (attn_norm ~ +0.02, all strictly positive) would have to be stored near
+    // -0.98. No tensor sampled is negative beyond a 0.1% tail. So V4.1 stores w directly.
+    matches!(model_type, "deepseek_v4" | "deepseek_v41" | "laguna")
 }
 
 #[cfg(test)]
 mod norm_convention_tests {
     use super::model_type_ships_vanilla_norm_weights as vanilla;
     use half::bf16;
+
+    /// DeepSeek-V4.1-Flash-Next ships vanilla norm weights, established by READING the
+    /// checkpoint rather than by assuming it inherits 0731's convention.
+    ///
+    /// Evidence (`model.safetensors.index.json` + raw BF16 reads):
+    ///   `layers.{0,20,39}.attn.q_norm.weight` mean `+0.958 / +0.959 / +0.825` — centred on
+    ///   1.0, which is what a stored-`w` scale looks like. Under a stored-`(w-1)` convention
+    ///   those denote scales near 1.96, and `attn_norm` (mean `+0.020`, min `+0.010`, 0%
+    ///   negative) would have to be stored near `-0.98`. Nothing sampled is negative beyond
+    ///   a 0.1% tail on the final `norm.weight`.
+    #[test]
+    fn deepseek_v41_ships_vanilla_norm_weights() {
+        assert!(vanilla("deepseek_v41"));
+        // And the convention is still per-model, not "anything deepseek".
+        assert!(!vanilla("deepseek_v41_text"));
+    }
 
     /// Only DeepSeek-V4 takes the vanilla path. Every other family keeps the
     /// offset-from-1 convention it was loaded and validated under.
