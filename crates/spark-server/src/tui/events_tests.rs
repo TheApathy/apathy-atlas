@@ -54,15 +54,13 @@ fn at(a: &App) -> String {
 #[test]
 fn clicking_a_sidebar_section_row_selects_that_section() {
     // Rows under the tall header, with Main active and drawing two subsections:
-    // Main, ├Overview, └Kernels, Stats, Network, Library, Terminal.
-    // Benchmarks sat between Library and Terminal upstream; with that section
-    // cut, every row below Library moves UP one. The indices are the point of
-    // this test, so they are re-derived rather than left as upstream had them.
+    // Main, ├Overview, └Kernels, Stats, Network, Library, Benchmarks, Terminal.
     for (row, expected) in [
         (6, "Stats"),
         (7, "Network"),
         (8, "Library"),
-        (9, "Terminal/Ops"),
+        (9, "Benchmarks/Box"),
+        (10, "Terminal/Ops"),
     ] {
         let mut a = app();
         click(&mut a, 2, row, WIDE);
@@ -96,20 +94,13 @@ fn clicking_a_subsection_row_selects_that_subsection() {
 fn the_rows_below_shift_with_whichever_section_is_expanded() {
     // The subsections move with the selection, so the arithmetic has to be
     // re-derived from the ACTIVE section rather than assumed about Main.
-    // Y COORDINATES RE-DERIVED FOR THE BENCH CUT, by measuring what each row
-    // actually resolves to rather than by arithmetic: the sidebar EXPANDS the
-    // active section, so the offsets differ between "Main active" and
-    // "Terminal active" and cannot be read off the section list alone.
-    // Upstream's (10, 10, 9, 6) becomes (9, 9, 8, 6) — Benchmarks sat directly
-    // above Terminal, so only the Terminal rows move, and `Library` above it
-    // is unshifted, which is exactly what the last assertion is here to prove.
     let mut a = app();
-    click(&mut a, 2, 9, WIDE); // Terminal, now the expanded one
+    click(&mut a, 2, 10, WIDE); // Terminal, now the expanded one
     assert_eq!(at(&a), "Terminal/Ops");
     // Its rows are now the last two, and every section above is unshifted.
-    click(&mut a, 2, 9, WIDE);
+    click(&mut a, 2, 10, WIDE);
     assert_eq!(at(&a), "Terminal/Chat", "└ Chat");
-    click(&mut a, 2, 8, WIDE);
+    click(&mut a, 2, 9, WIDE);
     assert_eq!(at(&a), "Terminal/Ops", "├ Ops");
     click(&mut a, 2, 6, WIDE);
     assert_eq!(at(&a), "Library");
@@ -122,7 +113,8 @@ fn a_narrow_sidebar_draws_no_subsections_and_offsets_nothing() {
         (2, "Stats"),
         (3, "Network"),
         (4, "Library"),
-        (5, "Terminal/Ops"),
+        (5, "Benchmarks/Box"),
+        (6, "Terminal/Ops"),
     ] {
         let mut a = app();
         click(&mut a, 1, row, NARROW);

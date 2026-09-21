@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Terminal is digit '5', not '6': cutting the Benchmarks section moved every
-// section below Library up one. These presses encode the sidebar position, so
+// Terminal is digit '6': Benchmarks is back at '5', so the sidebar order
+// matches upstream's again. These presses encode the sidebar position, so
 // they move with it — `section_tests::the_navigable_row_count_is_what_the
 // _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
 // two that fail if code and tests ever disagree about the order again.
@@ -41,7 +41,7 @@ fn type_str(a: &mut App, s: &str) {
 /// Terminal ▸ Ops with the input line focused.
 fn ops() -> App {
     let mut a = app();
-    press(&mut a, '5');
+    press(&mut a, '6');
     press(&mut a, 'i');
     a
 }
@@ -49,8 +49,8 @@ fn ops() -> App {
 /// Terminal ▸ Chat with the input line focused.
 fn chat_input() -> App {
     let mut a = app();
-    press(&mut a, '5');
-    press(&mut a, '5');
+    press(&mut a, '6');
+    press(&mut a, '6');
     press(&mut a, 'i');
     a
 }
@@ -58,8 +58,8 @@ fn chat_input() -> App {
 /// Terminal ▸ Chat with the transcript focused.
 fn chat_content() -> App {
     let mut a = app();
-    press(&mut a, '5');
-    press(&mut a, '5');
+    press(&mut a, '6');
+    press(&mut a, '6');
     a
 }
 
@@ -387,8 +387,8 @@ fn the_thinking_state_survives_leaving_and_re_entering_the_section() {
     chord(&mut a, 't', KeyModifiers::CONTROL);
     tap(&mut a, KeyCode::Esc);
     press(&mut a, '1');
-    press(&mut a, '5');
-    press(&mut a, '5');
+    press(&mut a, '6');
+    press(&mut a, '6');
     assert_eq!(a.chat.think_req, ThinkingRequest::Off);
     assert_eq!(on_the_wire(&a), Some(false));
 }

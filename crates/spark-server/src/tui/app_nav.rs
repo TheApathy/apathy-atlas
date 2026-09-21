@@ -8,7 +8,7 @@
 //! what does landing on it set" — and the answer must agree with what
 //! `render::draw_sidebar` draws and what `events::sidebar_row` hit-tests.
 
-use super::app::{App, Focus, MainSub, TermSub};
+use super::app::{App, BenchSub, Focus, MainSub, TermSub};
 use super::help_state::HelpSub;
 use super::section::Section;
 
@@ -17,6 +17,7 @@ impl App {
     pub fn sub_index(&self, s: Section) -> usize {
         match s {
             Section::Main => (self.main_sub == MainSub::Kernels) as usize,
+            Section::Benchmarks => (self.bench_sub == BenchSub::Runs) as usize,
             Section::Terminal => (self.term_sub == TermSub::Chat) as usize,
             Section::Help => (self.help.sub == HelpSub::Report) as usize,
             _ => 0,
@@ -31,6 +32,9 @@ impl App {
                 } else {
                     MainSub::Kernels
                 }
+            }
+            Section::Benchmarks => {
+                self.bench_sub = if i == 0 { BenchSub::Box } else { BenchSub::Runs }
             }
             Section::Terminal => self.term_sub = if i == 0 { TermSub::Ops } else { TermSub::Chat },
             Section::Help => {

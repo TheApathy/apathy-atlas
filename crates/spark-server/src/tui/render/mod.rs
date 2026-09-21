@@ -8,6 +8,7 @@ mod header;
 mod help_tab;
 mod hints;
 mod library;
+mod bench_tab;
 mod main_tab;
 mod main_tab_kernels;
 mod network_tab;
@@ -117,6 +118,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Section::Stats => stats_tab::draw(f, app, content),
         Section::Network => network_tab::draw(f, app, content),
         Section::Library => library::draw(f, app, content),
+        Section::Benchmarks => bench_tab::draw(f, app, content),
         Section::Terminal => terminal_tab::draw(f, app, content),
         Section::Help => help_tab::draw(f, app, content),
     }
@@ -275,6 +277,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         // an advertised key with zero effect. The detail pane is always drawn.
         Section::Network => "←/→ node · ⇥ cycle · 1-7 jump · ? help",
         Section::Library => hints::library_hints(app),
+        Section::Benchmarks => "⇥ Box↔Runs · 1-7 jump · ? help · q quit",
         // `/detach` named here and nowhere else on screen: it is the only way
         // out that leaves the server running, and this is the tab it is typed
         // into. Without it the only exit a user could find was `q`, which

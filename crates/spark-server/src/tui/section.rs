@@ -14,16 +14,20 @@ pub enum Section {
     Stats,
     Network,
     Library,
+    /// Box readiness + what the harnesses recorded. NATIVE, not upstream's
+    /// plugin-backed tab — see `tui::data::bench`.
+    Benchmarks,
     Terminal,
     Help,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 7] = [
         Section::Main,
         Section::Stats,
         Section::Network,
         Section::Library,
+        Section::Benchmarks,
         Section::Terminal,
         Section::Help,
     ];
@@ -33,6 +37,7 @@ impl Section {
             Section::Stats => "Stats",
             Section::Network => "Network",
             Section::Library => "Library",
+            Section::Benchmarks => "Benchmarks",
             Section::Terminal => "Terminal",
             Section::Help => "Help",
         }
@@ -43,6 +48,7 @@ impl Section {
             Section::Stats => "∿",
             Section::Network => "⬡",
             Section::Library => "▤",
+            Section::Benchmarks => "▰",
             Section::Terminal => "❯",
             Section::Help => "✚",
         }
@@ -54,6 +60,7 @@ impl Section {
     pub fn subs(self) -> &'static [&'static str] {
         match self {
             Section::Main => &["Overview", "Kernels"],
+            Section::Benchmarks => &["Box", "Runs"],
             Section::Terminal => &["Ops", "Chat"],
             Section::Help => &["Guide", "Report Issue"],
             Section::Stats | Section::Network | Section::Library => &[],

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// Terminal is digit '5', not '6': cutting the Benchmarks section moved every
-// section below Library up one. These presses encode the sidebar position, so
+// Terminal is digit '6': Benchmarks is back at '5', so the sidebar order
+// matches upstream's again. These presses encode the sidebar position, so
 // they move with it — `section_tests::the_navigable_row_count_is_what_the
 // _sidebar_draws` and `app::tests::digit_keys_match_the_sidebar_order` are the
 // two that fail if code and tests ever disagree about the order again.
@@ -79,6 +79,8 @@ fn tab_walks_every_sidebar_row_in_order_and_wraps_home() {
             "Stats",
             "Network",
             "Library",
+            "Benchmarks/Box",
+            "Benchmarks/Runs",
             "Terminal/Ops",
             "Terminal/Chat",
             "Help/Guide",
@@ -102,16 +104,13 @@ fn shift_tab_walks_the_same_rows_backwards() {
         "Help/Guide",
         "Terminal/Chat",
         "Terminal/Ops",
+        "Benchmarks/Runs",
     ] {
         tap(&mut a, KeyCode::BackTab);
         assert_eq!(at(&a), expected);
     }
-    // Re-derived for the bench cut. Upstream's loop above ended one row
-    // further back, on `Benchmarks/History`, so a forward ⇥ from there landed
-    // on `Terminal/Ops`. With that row gone the loop ends ON `Terminal/Ops`,
-    // and ⇥ undoes the last ⇧⇥ by stepping forward to `Terminal/Chat`.
     tap(&mut a, KeyCode::Tab);
-    assert_eq!(at(&a), "Terminal/Chat", "and ⇥ undoes ⇧⇥");
+    assert_eq!(at(&a), "Terminal/Ops", "and ⇥ undoes ⇧⇥");
 }
 
 #[test]
@@ -180,7 +179,7 @@ fn ctrl_c_quits_even_while_a_text_field_owns_the_keyboard() {
     // every buffer — including the ones that would otherwise type a `c`.
     // (`shutdown::request` latches a process global; that is the point of it.)
     let mut a = app();
-    press(&mut a, '5');
+    press(&mut a, '6');
     press(&mut a, 'i');
     assert_eq!(focus_of(&a), 2, "the ops input has focus");
     chord(&mut a, 'c', KeyModifiers::CONTROL);
@@ -196,7 +195,7 @@ fn q_quits_only_when_no_text_field_owns_the_keyboard() {
     assert!(a.should_quit);
 
     let mut a = app();
-    press(&mut a, '5');
+    press(&mut a, '6');
     press(&mut a, 'i');
     press(&mut a, 'q');
     assert!(!a.should_quit, "a `q` in an input line is a letter");
@@ -236,7 +235,7 @@ fn f_opens_the_log_filter_on_main_and_nowhere_else() {
     assert!(!a.log_filter_editing);
     assert_eq!(a.log_filter, "");
 
-    for section in ['2', '3', '5'] {
+    for section in ['2', '3', '6'] {
         let mut a = app();
         press(&mut a, section);
         press(&mut a, 'f');
@@ -259,7 +258,7 @@ fn the_filter_is_editable_on_the_kernels_subsection_too() {
 #[test]
 fn entering_and_leaving_the_terminal_input_is_reversible() {
     let mut a = app();
-    press(&mut a, '5');
+    press(&mut a, '6');
     assert_eq!(focus_of(&a), 1);
     press(&mut a, 'i');
     assert_eq!(focus_of(&a), 2);
@@ -276,7 +275,7 @@ fn entering_and_leaving_the_terminal_input_is_reversible() {
 #[test]
 fn leaving_the_terminal_by_section_key_does_not_strand_the_focus() {
     let mut a = app();
-    press(&mut a, '5');
+    press(&mut a, '6');
     press(&mut a, 'i');
     a.on_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     // The digit is text while the input has focus, so the section key cannot

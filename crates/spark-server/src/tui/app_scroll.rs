@@ -36,6 +36,10 @@ impl App {
     /// can never disagree about position.
     pub fn scroll(&mut self, rows: i32) {
         match self.section {
+            // Read-only: the pane fits its area, so there is nothing to scroll.
+            // An arm that silently did nothing would be indistinguishable from
+            // a scroll that is broken, so it is named.
+            Section::Benchmarks => {}
             Section::Main => match self.main_sub {
                 // The log pane counts BACKWARDS from the newest line, so a
                 // wheel-up (negative rows) has to increase the offset.

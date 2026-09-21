@@ -28,6 +28,14 @@ pub enum TermSub {
     Chat,
 }
 
+/// The Benchmarks pane's two halves: may I measure now, and what did the last
+/// runs say?
+#[derive(Clone, Copy, PartialEq)]
+pub enum BenchSub {
+    Box,
+    Runs,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Focus {
     Sidebar,
@@ -57,6 +65,7 @@ pub struct App {
     pub section: Section,
     pub main_sub: MainSub,
     pub term_sub: TermSub,
+    pub bench_sub: BenchSub,
     pub focus: Focus,
     pub progress: ProgressModel,
     pub stats: StatsModel,
@@ -170,6 +179,7 @@ impl App {
             main_sub: MainSub::Overview,
             run: None,
             term_sub: TermSub::Ops,
+            bench_sub: BenchSub::Box,
             focus: Focus::Content,
             progress: ProgressModel::default(),
             stats: StatsModel::default(),
@@ -334,8 +344,9 @@ impl App {
             KeyCode::Char('2') => self.jump(Section::Stats),
             KeyCode::Char('3') => self.jump(Section::Network),
             KeyCode::Char('4') => self.jump(Section::Library),
-            KeyCode::Char('5') => self.jump(Section::Terminal),
-            KeyCode::Char('6') => self.jump(Section::Help),
+            KeyCode::Char('5') => self.jump(Section::Benchmarks),
+            KeyCode::Char('6') => self.jump(Section::Terminal),
+            KeyCode::Char('7') => self.jump(Section::Help),
             KeyCode::Tab => self.cycle_section(1),
             KeyCode::BackTab => self.cycle_section(-1),
             KeyCode::Char('f') if self.section == Section::Main => {
@@ -413,6 +424,9 @@ impl App {
             }
             // Chat owns its own keys in `app_input`, where the input-focused
             // half of the same map already lives.
+            // Read-only pane: no scroll state of its own, so the shared
+            // nav keys are all it needs.
+            Section::Benchmarks => {}
             Section::Terminal if self.term_sub == TermSub::Chat => self.on_chat_content_key(key),
             // Ops scrolls its own output. It used to fall through to the
             // empty arm below while the Terminal footer said "↑/↓ scroll".

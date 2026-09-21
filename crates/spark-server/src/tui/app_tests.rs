@@ -24,6 +24,8 @@ fn nav_rows_include_subsections_in_sidebar_order() {
             "Stats",
             "Network",
             "Library",
+            "Benchmarks/Box",
+            "Benchmarks/Runs",
             "Terminal/Ops",
             "Terminal/Chat",
             "Help/Guide",

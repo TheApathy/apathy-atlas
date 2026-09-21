@@ -37,11 +37,7 @@ fn the_sidebar_spells_out_its_sections_only_when_there_is_room_for_the_words() {
         "the icon rail has no room for a label:\n{narrow:#?}"
     );
     assert!(
-        // `▰` was BENCHMARKS' icon and went with the section. The specimen
-        // above is Network, so the icon checked here is Network's — the label
-        // assertion was substituted when bench was cut and this one was not,
-        // which left the test asserting a glyph no section draws any more.
-        narrow.iter().any(|r| r.contains('⬡')),
+        narrow.iter().any(|r| r.contains('▰')),
         "but the icon is still there:\n{narrow:#?}"
     );
 }
