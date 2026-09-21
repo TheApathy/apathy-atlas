@@ -137,10 +137,6 @@ mod build;
 pub mod kv_cap;
 mod lm_head_setup;
 mod m2_setup;
-pub mod vision_admission;
-pub mod vision_kv;
-pub mod vision_speculation;
-mod vision_speculation_loaded;
 
 pub use build::build_model;
 
