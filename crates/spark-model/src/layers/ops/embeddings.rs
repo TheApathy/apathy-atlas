@@ -142,6 +142,93 @@ pub fn rope_mrope_interleaved(
         .launch(stream)
 }
 
+/// Interleaved MRoPE with HF-compatible static YaRN frequency interpolation.
+///
+/// This is a distinct ABI so native-context builds cannot accidentally pass a
+/// theta-only argument list to a scaling-aware kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_mrope_interleaved_yarn(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k: DevicePtr,
+    pos_t: DevicePtr,
+    pos_h: DevicePtr,
+    pos_w: DevicePtr,
+    seq_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    theta: f32,
+    factor: f32,
+    correction_low: f32,
+    correction_high: f32,
+    attention_factor: f32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        rotary_dim > 0
+            && rotary_dim.is_multiple_of(2)
+            && rotary_dim <= head_dim
+            && rotary_dim <= 256,
+        "rope_mrope_interleaved_yarn requires even 0 < rotary_dim <= min(head_dim, 256)"
+    );
+    anyhow::ensure!(seq_len > 0, "rope_mrope_interleaved_yarn: seq_len=0");
+    anyhow::ensure!(
+        num_q_heads > 0 && num_kv_heads > 0,
+        "rope_mrope_interleaved_yarn requires positive Q and KV head counts"
+    );
+    let total_heads = num_q_heads
+        .checked_add(num_kv_heads)
+        .filter(|&heads| heads <= 65_535)
+        .ok_or_else(|| anyhow::anyhow!("rope_mrope_interleaved_yarn grid.y head-count overflow"))?;
+    anyhow::ensure!(
+        !q.is_null() && !k.is_null() && !pos_t.is_null() && !pos_h.is_null() && !pos_w.is_null(),
+        "rope_mrope_interleaved_yarn received a null required pointer"
+    );
+    anyhow::ensure!(factor.is_finite() && factor > 1.0, "invalid YaRN factor");
+    anyhow::ensure!(theta.is_finite() && theta > 1.0, "invalid YaRN theta");
+    let half_rot = rotary_dim / 2;
+    anyhow::ensure!(
+        correction_low.is_finite()
+            && correction_high.is_finite()
+            && correction_low >= 0.0
+            && correction_high >= correction_low
+            && correction_high <= (half_rot - 1) as f32,
+        "invalid YaRN correction range"
+    );
+    anyhow::ensure!(
+        attention_factor.is_finite() && attention_factor > 0.0,
+        "invalid YaRN attention factor"
+    );
+    let pos_per_block = (128 / half_rot).max(1);
+    let seq_blocks = div_ceil(seq_len, pos_per_block);
+    anyhow::ensure!(
+        seq_blocks <= i32::MAX as u32,
+        "rope_mrope_interleaved_yarn grid.x sequence extent overflow"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([seq_blocks, total_heads, 1])
+        .block([128, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k)
+        .arg_ptr(pos_t)
+        .arg_ptr(pos_h)
+        .arg_ptr(pos_w)
+        .arg_u32(seq_len)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(rotary_dim)
+        .arg_f32(theta)
+        .arg_f32(factor)
+        .arg_f32(correction_low)
+        .arg_f32(correction_high)
+        .arg_f32(attention_factor)
+        .launch(stream)
+}
+
 /// Batched per-token-strided RoPE for the multi-sequence K=3 verify path.
 ///
 /// Replaces N back-to-back `rope_forward` launches (each with `seq_len=1`)

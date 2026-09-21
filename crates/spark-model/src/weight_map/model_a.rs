@@ -106,16 +106,106 @@ pub(crate) fn quantized(
     gpu: &dyn GpuBackend,
 ) -> Result<QuantizedWeight> {
     let input_scale_key = format!("{prefix}.input_scale");
+    let input_scale = if store.contains(&input_scale_key) {
+        let tensor = store.get(&input_scale_key)?;
+        validate_modelopt_input_scale(&input_scale_key, tensor.dtype, &tensor.shape)?;
+        tensor.ptr
+    } else {
+        DevicePtr::NULL
+    };
     Ok(QuantizedWeight {
         weight: ptr(store, &format!("{prefix}.weight"))?,
         weight_scale: ptr(store, &format!("{prefix}.weight_scale"))?,
         weight_scale_2: scalar_f32(store, &format!("{prefix}.weight_scale_2"), gpu)?,
-        input_scale: if store.contains(&input_scale_key) {
-            ptr(store, &input_scale_key)?
-        } else {
-            DevicePtr::NULL
-        },
+        input_scale,
     })
+}
+
+/// Load a ModelOpt NVFP4 projection while retaining the caller's exact
+/// logical geometry as an admission boundary.
+///
+/// The ordinary pointer-only helper predates consumers whose native ABI reads
+/// the complete packed and scale matrices directly.  Such consumers must not
+/// infer allocation lengths from configuration after accepting a merely
+/// one-element scalar, so this path validates every checkpoint tensor rank,
+/// dtype, and extent before exposing its pointers.
+pub(crate) fn quantized_modelopt_with_shape(
+    store: &WeightStore,
+    prefix: &str,
+    n: usize,
+    k: usize,
+    gpu: &dyn GpuBackend,
+) -> Result<QuantizedWeight> {
+    ensure!(n > 0, "ModelOpt NVFP4 output dimension must be non-zero");
+    ensure!(
+        k > 0 && k.is_multiple_of(16),
+        "ModelOpt NVFP4 input dimension must be a positive multiple of 16"
+    );
+
+    let weight_name = format!("{prefix}.weight");
+    let weight = store.get(&weight_name)?;
+    ensure!(
+        weight.dtype == WeightDtype::UInt8,
+        "Expected packed UInt8 ModelOpt weight for {weight_name}, got {:?}",
+        weight.dtype
+    );
+    ensure!(
+        weight.shape.as_slice() == [n, k / 2],
+        "Expected ModelOpt weight {weight_name} shape [{n}, {}], got {:?}",
+        k / 2,
+        weight.shape
+    );
+
+    let scale_name = format!("{prefix}.weight_scale");
+    let weight_scale = store.get(&scale_name)?;
+    ensure!(
+        weight_scale.dtype == WeightDtype::FP8E4M3,
+        "Expected FP8 E4M3 ModelOpt block scales for {scale_name}, got {:?}",
+        weight_scale.dtype
+    );
+    ensure!(
+        weight_scale.shape.as_slice() == [n, k / 16],
+        "Expected ModelOpt scale {scale_name} shape [{n}, {}], got {:?}",
+        k / 16,
+        weight_scale.shape
+    );
+
+    let scale2_name = format!("{prefix}.weight_scale_2");
+    let scale2 = store.get(&scale2_name)?;
+    ensure!(
+        scale2.dtype == WeightDtype::FP32 && scale2.shape.is_empty(),
+        "Expected rank-0 FP32 ModelOpt second-level scale for {scale2_name}, got {:?} {:?}",
+        scale2.dtype,
+        scale2.shape
+    );
+
+    let input_scale_name = format!("{prefix}.input_scale");
+    let input_scale = if store.contains(&input_scale_name) {
+        let tensor = store.get(&input_scale_name)?;
+        validate_modelopt_input_scale(&input_scale_name, tensor.dtype, &tensor.shape)?;
+        tensor.ptr
+    } else {
+        DevicePtr::NULL
+    };
+
+    Ok(QuantizedWeight {
+        weight: weight.ptr,
+        weight_scale: weight_scale.ptr,
+        weight_scale_2: scalar_f32(store, &scale2_name, gpu)?,
+        input_scale,
+    })
+}
+
+fn validate_modelopt_input_scale(name: &str, dtype: WeightDtype, shape: &[usize]) -> Result<()> {
+    ensure!(
+        dtype == WeightDtype::FP32,
+        "Expected FP32 ModelOpt input scale for {name}, got {dtype:?}"
+    );
+    ensure!(
+        shape.is_empty(),
+        "Expected rank-0 ModelOpt input scale for {name}, got shape {shape:?}"
+    );
+    Ok(())
 }
 
 pub(crate) fn dense(store: &WeightStore, name: &str) -> Result<DenseWeight> {
@@ -320,4 +410,33 @@ pub(crate) fn dequant_fp8_to_bf16_into(
     let bf16_buf = dequant_fp8_bytes_to_bf16(&fp8_buf, scale);
     gpu.copy_h2d(&bf16_buf, dest)?;
     Ok(DenseWeight { weight: dest })
+}
+
+#[cfg(test)]
+mod modelopt_input_scale_tests {
+    use super::validate_modelopt_input_scale;
+    use spark_runtime::weights::WeightDtype;
+
+    #[test]
+    fn requires_one_fp32_modelopt_input_scale() {
+        assert!(
+            validate_modelopt_input_scale("projection.input_scale", WeightDtype::FP32, &[]).is_ok()
+        );
+        assert!(
+            validate_modelopt_input_scale("projection.input_scale", WeightDtype::BF16, &[])
+                .is_err()
+        );
+        assert!(
+            validate_modelopt_input_scale("projection.input_scale", WeightDtype::FP32, &[0])
+                .is_err()
+        );
+        assert!(
+            validate_modelopt_input_scale("projection.input_scale", WeightDtype::FP32, &[1])
+                .is_err()
+        );
+        assert!(
+            validate_modelopt_input_scale("projection.input_scale", WeightDtype::FP32, &[1, 1])
+                .is_err()
+        );
+    }
 }

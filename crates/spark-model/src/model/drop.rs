@@ -108,6 +108,11 @@ impl Drop for TransformerModel {
             self.verify_kgamma_graph.get_mut(),
         );
 
+        if let Err(error) = self.vision_embeddings.get_mut().release(self.gpu.as_ref()) {
+            tracing::error!("TransformerModel::drop: vision aggregate release failed: {error:#}");
+            std::process::abort();
+        }
+
         if self.secondary_event != 0
             && let Err(error) = self.gpu.destroy_event(self.secondary_event)
         {

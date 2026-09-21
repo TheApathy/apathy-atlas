@@ -296,6 +296,7 @@ pub(super) async fn finalize_responses_stream(
                 content: crate::openai::ParsedContent {
                     text: transcript_text.clone(),
                     images: Vec::new(),
+                    image_text_offsets: Vec::new(),
                 },
                 tool_calls: if stored_tool_calls.is_empty() {
                     None

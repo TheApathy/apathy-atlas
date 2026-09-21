@@ -88,6 +88,14 @@ impl TransformerModel {
         if n == 0 {
             return Ok(Vec::new());
         }
+        anyhow::ensure!(
+            n == 1
+                || streams
+                    .iter()
+                    .all(|s| !self.vision_prompt_present(s.prompt_tokens)
+                        && s.seq.rotary_positions.is_identity()),
+            "image prefill batching requires the C1 canonical path"
+        );
         if n == 1 {
             // Fast path: N=1 has no batching to do. Delegate to the
             // single-stream dispatch and skip the per-stream-loop bookkeeping.

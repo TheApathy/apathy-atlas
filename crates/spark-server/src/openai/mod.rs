@@ -4,6 +4,12 @@
 
 mod annotations;
 mod chat_message;
+#[cfg(test)]
+mod ordered_content_tests;
+#[cfg(test)]
+mod parsed_content_tests;
+#[cfg(test)]
+mod ordered_content_wiring_tests;
 mod chat_request;
 mod chat_response;
 mod completions;

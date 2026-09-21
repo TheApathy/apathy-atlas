@@ -187,6 +187,7 @@ pub fn f31_inject_hard_refusal(
         content: crate::openai::ParsedContent {
             text: body,
             images: Vec::new(),
+            image_text_offsets: Vec::new(),
         },
         tool_calls: None,
         tool_call_id: Some(tool_call_id),

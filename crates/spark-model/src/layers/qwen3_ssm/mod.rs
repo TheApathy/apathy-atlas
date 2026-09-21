@@ -14,7 +14,7 @@
 //!   9. Output projection [value_dim → hidden_size]
 //!  10. MoE FFN
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle, PinnedHostBuffer};
 use spark_runtime::kv_cache::PagedKvCache;
 
@@ -25,7 +25,129 @@ use crate::layers::FfnComponent;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
 
+const QWEN38_FLASHINFER_HIDDEN: usize = 5_120;
+const QWEN38_FLASHINFER_SSM_QKVZ: usize = 16_384;
+const QWEN38_FLASHINFER_SSM_VALUE: usize = 6_144;
+const QUALIFIED_FLASHINFER_SM121_SHA256: [u8; 32] = [
+    0xa0, 0x07, 0xa8, 0x25, 0x66, 0xca, 0x3d, 0x31, 0x15, 0xc8, 0xcc, 0x0e, 0x73, 0xe2, 0xbb, 0xfc,
+    0x0b, 0xd1, 0xc7, 0x6b, 0x63, 0x42, 0x31, 0x3f, 0xba, 0x7e, 0xe5, 0x48, 0x3e, 0x49, 0xc0, 0x20,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SsmFlashinferPrefillRoute {
+    Disabled,
+    Ineligible,
+    Missing,
+    Complete,
+}
+
+const fn ssm_flashinfer_prefill_route(
+    requested: bool,
+    exact_geometry: bool,
+    nvfp4_active: bool,
+    prepared: bool,
+) -> SsmFlashinferPrefillRoute {
+    if !requested {
+        SsmFlashinferPrefillRoute::Disabled
+    } else if !exact_geometry || !nvfp4_active {
+        SsmFlashinferPrefillRoute::Ineligible
+    } else if !prepared {
+        SsmFlashinferPrefillRoute::Missing
+    } else {
+        SsmFlashinferPrefillRoute::Complete
+    }
+}
+
+const fn qwen38_ssm_flashinfer_geometry(
+    rows: usize,
+    hidden: usize,
+    qkvz: usize,
+    value: usize,
+) -> bool {
+    matches!(rows, 2_079 | 8_192)
+        && hidden == QWEN38_FLASHINFER_HIDDEN
+        && qkvz == QWEN38_FLASHINFER_SSM_QKVZ
+        && value == QWEN38_FLASHINFER_SSM_VALUE
+}
+
+const fn qwen38_ssm_flashinfer_tactics(rows: usize) -> Option<(u8, u8)> {
+    match rows {
+        2_079 => Some((4, 2)),
+        8_192 => Some((2, 2)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SsmFlashinferScratchLayout {
+    packed_offset: usize,
+    scales_offset: usize,
+    global_max_offset: usize,
+    scale2_offset: usize,
+    status_offset: usize,
+    alpha_offset: usize,
+    total_bytes: usize,
+}
+
+fn ssm_flashinfer_scratch_layout(
+    plan: ops::nvfp4_dynamic_scale::Nvfp4DynamicScalePlan,
+    capacity: usize,
+) -> Result<SsmFlashinferScratchLayout> {
+    let align16 = |value: usize| -> Result<usize> {
+        value
+            .checked_add(15)
+            .map(|next| next & !15)
+            .ok_or_else(|| anyhow::anyhow!("FlashInfer SSM scratch alignment overflow"))
+    };
+    let packed_offset = 0;
+    let scales_offset = align16(plan.packed_bytes)?;
+    let global_max_offset = align16(
+        scales_offset
+            .checked_add(plan.physical_scale_bytes)
+            .ok_or_else(|| anyhow::anyhow!("FlashInfer SSM scale scratch overflow"))?,
+    )?;
+    let scale2_offset = global_max_offset + 4;
+    let status_offset = scale2_offset + 4;
+    let alpha_offset = status_offset + 4;
+    let total_bytes = alpha_offset + 4;
+    ensure!(
+        total_bytes <= capacity,
+        "FlashInfer SSM activation scratch requires {total_bytes} bytes, arena has {capacity}"
+    );
+    Ok(SsmFlashinferScratchLayout {
+        packed_offset,
+        scales_offset,
+        global_max_offset,
+        scale2_offset,
+        status_offset,
+        alpha_offset,
+        total_bytes,
+    })
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+struct FlashinferSsmProjection {
+    weight: DevicePtr,
+    weight_scales_128x4: DevicePtr,
+    weight_scales_hash: u64,
+    weight_scale_2: f32,
+    n: usize,
+    k: usize,
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+struct FlashinferSsmPrefill {
+    layer: usize,
+    library: ops::flashinfer_sm121::FlashInferSm121,
+    dynamic_scale_kernels: ops::nvfp4_dynamic_scale::Nvfp4DynamicScaleKernels,
+    qkvz: FlashinferSsmProjection,
+    output: FlashinferSsmProjection,
+}
+
 mod exact_flat_route;
+mod gdn_c143_prefill;
+#[cfg(test)]
+mod gdn_c143_prefill_tests;
 pub(crate) mod ssm_h_fp16;
 use exact_flat_route::{ExactFlatSsmRoute, contiguous_intermediate_base, exact_flat_ssm_route};
 
@@ -48,6 +170,10 @@ pub struct Qwen3SsmLayer {
     out_proj_nvfp4_t: Option<QuantizedWeight>,
     // BF16 out_proj for models where SSM weights are not pre-quantized
     pub out_proj_dense: Option<DenseWeight>,
+    /// Default-off FlashInfer SM121 projection operands. Construction is
+    /// explicit and atomic; runtime never derives weight layouts or scalars.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    flashinfer_ssm_prefill: Option<FlashinferSsmPrefill>,
     // FP8 E4M3 checkpoint weights for native FP8 serving (w8a16_gemv LUT kernel)
     qkvz_fp8w: Option<Fp8Weight>,
     out_proj_fp8w: Option<Fp8Weight>,
@@ -128,7 +254,8 @@ pub struct Qwen3SsmLayer {
     w4a16_gemm_k: KernelHandle,
     /// Byte-exact cp.async pipelined shadow of `w4a16_gemm` (see
     /// `prefill_proj_pipe_enabled`). Used by the SSM QKVZ + out_proj prefill
-    /// projections at `ATLAS_PREFILL_PROJ_PIPE=1`; handle 0 falls back.
+    /// projections at `ATLAS_PREFILL_PROJ_PIPE=1`; an eligible explicit
+    /// request fails before projection when this handle is 0.
     w4a16_gemm_pipe_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle, // Transposed B layout [K/2, N] — K_STEP_T=32
     w4a16_gemm_t_k64_k: KernelHandle, // K64 variant: K_STEP_T=64, halves outer loop
@@ -166,6 +293,9 @@ pub struct Qwen3SsmLayer {
     /// WY32 chunked prefill: processes 32 tokens per WY iteration with H in
     /// shared memory. ~30x faster than per-token for 14k+ sequences.
     gdn_prefill_wy32_k: KernelHandle,
+    /// ABI-identical WY32 shadow that caches the thread-invariant gate-product
+    /// triangle. Default off until live output-hash and TTFT qualification.
+    gdn_prefill_wy32_gatecache_k: KernelHandle,
     // ── Q12 Phase 2b: same-chunk-len batched GDN prefill kernels ──
     // Each takes `float* const* h_state_ptrs` plus stacked QKV/gate/beta/output.
     // Used by `Qwen3SsmLayer::prefill_batched` when N≥2 streams have matching
@@ -233,6 +363,15 @@ pub struct Qwen3SsmLayer {
     ba_gates_prefill_k: KernelHandle,
     // Kernels — prefill (multi-token sequential)
     conv1d_prefill_k: KernelHandle,
+    /// Exact conv1d-prefill shadow that also copies the projected Z channel
+    /// beside the existing per-channel token loop. The measured direct-output
+    /// route fails closed if the optional symbol is missing.
+    conv1d_prefill_zcopy_k: KernelHandle,
+    /// Default-off exact extension of `conv1d_prefill_zcopy_k` that retains
+    /// the BF16 conv round trip and standalone L2 reduction tree in one
+    /// 128-thread head CTA. An explicit eligible request fails closed when an
+    /// older kernel bundle lacks the symbol.
+    conv1d_prefill_l2norm_zcopy_k: KernelHandle,
     // Kernels — fused chunk2 path (2-token verification)
     gdn_chunk2_k: KernelHandle,
     conv1d_chunk2_k: KernelHandle,
@@ -317,7 +456,15 @@ mod debug;
 mod exact_projection;
 #[cfg(test)]
 mod exact_projection_tests;
+#[cfg(test)]
+mod flashinfer_prefill_tests;
 mod init;
+#[cfg(test)]
+mod prefill_gdn_gatecache_tests;
+#[cfg(test)]
+mod prefill_pack_tests;
+#[cfg(test)]
+mod prefill_sync_contract_tests;
 mod serial_diag;
 mod ssm_forward;
 mod trait_decode;

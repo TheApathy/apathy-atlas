@@ -5,22 +5,32 @@
 //! Forward: gate = gate_proj(x), up = up_proj(x), out = down_proj(SiLU(gate) * up)
 //! 2 fused kernel launches per decode token (dual GEMV + SiLU-fused down GEMV).
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
-use std::sync::Mutex;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+use std::sync::{Mutex, MutexGuard};
 
 use crate::layer::ForwardContext;
 use crate::layers::ffn_dual_tuned_enabled;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+const QUALIFIED_FLASHINFER_SM121_SHA256: [u8; 32] = [
+    0xa0, 0x07, 0xa8, 0x25, 0x66, 0xca, 0x3d, 0x31, 0x15, 0xc8, 0xcc, 0x0e, 0x73, 0xe2, 0xbb, 0xfc,
+    0x0b, 0xd1, 0xc7, 0x6b, 0x63, 0x42, 0x31, 0x3f, 0xba, 0x7e, 0xe5, 0x48, 0x3e, 0x49, 0xc0, 0x20,
+];
+
 /// Scratch buffers for the inline BF16 → NVFP4 activation prequant
-/// (W4A4 `nvfp4_nvfp4_gemm` fast path). Lazily allocated on first prefill
-/// call, then resized in-place if M or K grows.
+/// (W4A4 `nvfp4_nvfp4_gemm` fast path). The exact FlashInfer route
+/// preallocates its maximum admitted shape during model construction; other
+/// routes allocate on first prefill and resize in-place if M or K grows.
 ///
 /// Sizes (per row M, per col K):
 ///   - `a_packed`: M × K/2 bytes (E2M1 nibbles)
-///   - `a_scale`:  M × K/16 bytes (FP8 E4M3 per-group scales)
+///   - `a_scale`:  ceil(M/128)×128 × K/16 bytes (FP8 E4M3 scales; the
+///     ordinary Atlas layout uses the logical prefix while the optional
+///     CUTLASS route uses the full padded 128x4 layout)
 ///   - `a_max`:    4 bytes (FP32 per-tensor absmax scratch)
 ///
 /// One arena per `DenseFfnLayer` (= per transformer layer). Reused across
@@ -34,6 +44,583 @@ struct E2m1Scratch {
     cap_m: usize,
     /// Current column capacity (K) the buffers can hold (full K, not K/2).
     cap_k: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct E2m1ScratchLayout {
+    cap_m: usize,
+    cap_k: usize,
+    packed_bytes: usize,
+    scale_bytes: usize,
+    max_bytes: usize,
+}
+
+fn e2m1_scratch_layout(m: usize, k: usize) -> Result<E2m1ScratchLayout> {
+    ensure!(m > 0, "W4A4 activation scratch requires M > 0");
+    ensure!(
+        k >= 16 && k.is_multiple_of(16),
+        "W4A4 activation scratch requires K >= 16 and K % 16 == 0; got {k}"
+    );
+    let cap_m = m.max(128);
+    let cap_k = k;
+    let elements = cap_m
+        .checked_mul(cap_k)
+        .context("W4A4 activation scratch size overflow")?;
+    let packed_bytes = elements / 2;
+    let scale_rows = cap_m
+        .div_ceil(128)
+        .checked_mul(128)
+        .context("W4A4 activation scratch row-padding overflow")?;
+    let scale_bytes = scale_rows
+        .checked_mul(cap_k)
+        .context("W4A4 padded activation-scale scratch size overflow")?
+        / 16;
+    Ok(E2m1ScratchLayout {
+        cap_m,
+        cap_k,
+        packed_bytes,
+        scale_bytes,
+        max_bytes: std::mem::size_of::<f32>(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct E2m1CheckpointScales {
+    /// SGLang's merged gate/up linear takes the maximum of the checkpoint's
+    /// logical-partition scales before quantizing their shared input.
+    gate_up: f32,
+    down: f32,
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+struct FlashinferFfnProjection {
+    weight: DevicePtr,
+    weight_scales_128x4: DevicePtr,
+    weight_scales_hash: u64,
+    alpha_f32: DevicePtr,
+    input_scale_bits: u32,
+    alpha_bits: u32,
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+struct FlashinferMergedGateUp {
+    layer: usize,
+    weight: DevicePtr,
+    weight_scales_128x4: DevicePtr,
+    weight_hash: u64,
+    weight_scales_hash: u64,
+    alpha_f32: DevicePtr,
+    input_scale_bits: u32,
+    alpha_bits: u32,
+    source_gate_weight: DevicePtr,
+    source_up_weight: DevicePtr,
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+struct FlashinferFfnPrefill {
+    layer: usize,
+    library: ops::flashinfer_sm121::FlashInferSm121,
+    merged_gate_up: FlashinferMergedGateUp,
+    down: FlashinferFfnProjection,
+    quantize_atlas_128x4_k: KernelHandle,
+    quantize_merged_silu_atlas_128x4_k: KernelHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlashinferFfnPrefillRoute {
+    Disabled,
+    Ineligible,
+    Missing,
+    Complete,
+}
+
+/// `m_qualified` is supplied by the caller rather than matched inline so the
+/// extended ladder (`ATLAS_FLASHINFER_FFN_EXTRA_M=1`) shares one source of truth
+/// with `qwen38_ffn_launch_candidate`; the frozen pair stays the default.
+const fn flashinfer_ffn_prefill_route(
+    requested: bool,
+    exact_qwen38_dense: bool,
+    m_qualified: bool,
+    prepared: bool,
+) -> FlashinferFfnPrefillRoute {
+    if !requested {
+        FlashinferFfnPrefillRoute::Disabled
+    } else if !exact_qwen38_dense || !m_qualified {
+        FlashinferFfnPrefillRoute::Ineligible
+    } else if !prepared {
+        FlashinferFfnPrefillRoute::Missing
+    } else {
+        FlashinferFfnPrefillRoute::Complete
+    }
+}
+
+const fn e2m1_kmajor_projection_shape(m: u32, n: u32, k: u32) -> bool {
+    m >= 128 && n.is_multiple_of(128) && k.is_multiple_of(64)
+}
+
+const E2M1_KMAJOR_M256_MIN_M: u32 = 2048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum E2m1KmajorKernel {
+    M128,
+    M256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum E2m1Scope {
+    Full,
+    DownOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum E2m1PrefillRoute {
+    Disabled,
+    Ineligible,
+    Complete(E2m1Scope),
+    Missing(E2m1Scope),
+}
+
+const fn e2m1_prefill_route(
+    full_requested: bool,
+    down_requested: bool,
+    shape_eligible: bool,
+    full_ready: bool,
+    down_ready: bool,
+) -> E2m1PrefillRoute {
+    let scope = if full_requested {
+        E2m1Scope::Full
+    } else if down_requested {
+        E2m1Scope::DownOnly
+    } else {
+        return E2m1PrefillRoute::Disabled;
+    };
+    if !shape_eligible {
+        return E2m1PrefillRoute::Ineligible;
+    }
+    match scope {
+        E2m1Scope::Full if full_ready => E2m1PrefillRoute::Complete(scope),
+        E2m1Scope::DownOnly if down_ready => E2m1PrefillRoute::Complete(scope),
+        E2m1Scope::Full | E2m1Scope::DownOnly => E2m1PrefillRoute::Missing(scope),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum E2m1SelectedKernel {
+    RowMajorM64,
+    KmajorM128,
+    KmajorM256,
+}
+
+const fn e2m1_selected_kernel(kmajor: bool, m256_requested: bool, m: u32) -> E2m1SelectedKernel {
+    if !kmajor {
+        E2m1SelectedKernel::RowMajorM64
+    } else if matches!(
+        e2m1_kmajor_kernel(m, m256_requested),
+        E2m1KmajorKernel::M256
+    ) {
+        E2m1SelectedKernel::KmajorM256
+    } else {
+        E2m1SelectedKernel::KmajorM128
+    }
+}
+
+const fn e2m1_kmajor_kernel(m: u32, m256_requested: bool) -> E2m1KmajorKernel {
+    if m256_requested && m >= E2M1_KMAJOR_M256_MIN_M {
+        E2m1KmajorKernel::M256
+    } else {
+        E2m1KmajorKernel::M128
+    }
+}
+
+fn validated_e2m1_checkpoint_scales(gate: f32, up: f32, down: f32) -> Result<E2m1CheckpointScales> {
+    for (name, value) in [("gate", gate), ("up", up), ("down", down)] {
+        ensure!(
+            value.is_finite() && value > 0.0,
+            "ATLAS_E2M1_STATIC_SCALE requires a finite positive {name} input_scale; got {value}"
+        );
+    }
+    Ok(E2m1CheckpointScales {
+        gate_up: gate.max(up),
+        down,
+    })
+}
+
+fn read_e2m1_input_scale(gpu: &dyn GpuBackend, ptr: DevicePtr, projection: &str) -> Result<f32> {
+    ensure!(
+        ptr != DevicePtr::NULL,
+        "ATLAS_E2M1_STATIC_SCALE requires {projection}.input_scale in the checkpoint"
+    );
+    let mut bytes = [0u8; 4];
+    gpu.copy_d2h(ptr, &mut bytes)
+        .with_context(|| format!("read {projection}.input_scale for ATLAS_E2M1_STATIC_SCALE"))?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn flashinfer_scale_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn ensure_flashinfer_ffn_disjoint(
+    left: DevicePtr,
+    left_len: usize,
+    right: DevicePtr,
+    right_len: usize,
+) -> Result<()> {
+    let left_end = left
+        .0
+        .checked_add(u64::try_from(left_len).context("left FFN pointer extent exceeds u64")?)
+        .context("left FFN pointer range overflow")?;
+    let right_end = right
+        .0
+        .checked_add(u64::try_from(right_len).context("right FFN pointer extent exceeds u64")?)
+        .context("right FFN pointer range overflow")?;
+    ensure!(
+        left_end <= right.0 || right_end <= left.0,
+        "FlashInfer FFN buffers overlap"
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn flashinfer_ffn_extent(rows: usize, cols: usize, element_bytes: usize) -> Result<usize> {
+    rows.checked_mul(cols)
+        .and_then(|elements| elements.checked_mul(element_bytes))
+        .context("FlashInfer FFN buffer extent overflow")
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn flashinfer_ffn_activation_scale_extent(rows: usize, cols: usize) -> Result<usize> {
+    use crate::weight_map::cutlass_scale_layout::{CUTLASS_SCALE_ROW_TILE, NVFP4_GROUP_SIZE};
+
+    ensure!(
+        rows > 0,
+        "FlashInfer FFN activation-scale extent requires rows > 0"
+    );
+    ensure!(
+        cols >= NVFP4_GROUP_SIZE && cols.is_multiple_of(NVFP4_GROUP_SIZE),
+        "FlashInfer FFN activation-scale extent requires cols divisible by {NVFP4_GROUP_SIZE}"
+    );
+    let padded_rows = rows
+        .checked_add(CUTLASS_SCALE_ROW_TILE - 1)
+        .context("FlashInfer FFN activation-scale row padding overflow")?
+        / CUTLASS_SCALE_ROW_TILE;
+    let padded_rows = padded_rows
+        .checked_mul(CUTLASS_SCALE_ROW_TILE)
+        .context("FlashInfer FFN padded activation-scale rows overflow")?;
+    flashinfer_ffn_extent(padded_rows, cols / NVFP4_GROUP_SIZE, 1)
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn read_flashinfer_ffn_checkpoint_projection(
+    gpu: &dyn GpuBackend,
+    layer: usize,
+    projection: crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection,
+    weight: &QuantizedWeight,
+    n: usize,
+    k: usize,
+) -> Result<(
+    Vec<u8>,
+    Vec<u8>,
+    crate::weight_map::modelopt_scale_admission::AdmittedModeloptScale,
+)> {
+    use crate::weight_map::cutlass_scale_layout::NVFP4_GROUP_SIZE;
+    use crate::weight_map::modelopt_scale_admission::{
+        ModeloptScaleProjection, ModeloptScaleSource, admit_modelopt_checkpoint_scale,
+    };
+    use spark_runtime::weights::WeightDtype;
+
+    ensure!(
+        !weight.weight.is_null() && !weight.weight_scale.is_null() && !weight.input_scale.is_null(),
+        "FlashInfer FFN {projection:?} requires original non-NULL ModelOpt operands"
+    );
+    ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(NVFP4_GROUP_SIZE),
+        "FlashInfer FFN {projection:?} has invalid N/K geometry"
+    );
+    let packed_len = n
+        .checked_mul(k / 2)
+        .context("FlashInfer FFN packed-weight length overflow")?;
+    let scale_len = n
+        .checked_mul(k / NVFP4_GROUP_SIZE)
+        .context("FlashInfer FFN weight-scale length overflow")?;
+    let mut packed = vec![0_u8; packed_len];
+    let mut logical_scales = vec![0_u8; scale_len];
+    let mut input_scale_bytes = [0_u8; 4];
+    gpu.copy_d2h(weight.weight, &mut packed)
+        .with_context(|| format!("read ModelOpt FFN {projection:?} packed weight"))?;
+    gpu.copy_d2h(weight.weight_scale, &mut logical_scales)
+        .with_context(|| format!("read ModelOpt FFN {projection:?} block scales"))?;
+    gpu.copy_d2h(weight.input_scale, &mut input_scale_bytes)
+        .with_context(|| format!("read ModelOpt FFN {projection:?} input scale"))?;
+    let modelopt_projection = match projection {
+        crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection::Gate => {
+            ModeloptScaleProjection::FfnGate
+        }
+        crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection::Up => {
+            ModeloptScaleProjection::FfnUp
+        }
+        crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection::Down => {
+            ModeloptScaleProjection::FfnDown
+        }
+    };
+    let input_scale = admit_modelopt_checkpoint_scale(
+        ModeloptScaleSource {
+            layer,
+            projection: modelopt_projection,
+        },
+        WeightDtype::FP32,
+        &[],
+        weight.input_scale,
+        input_scale_bytes,
+    )?;
+    Ok((packed, logical_scales, input_scale))
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn build_flashinfer_merged_gate_up(
+    gpu: &dyn GpuBackend,
+    layer: usize,
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+) -> Result<FlashinferMergedGateUp> {
+    use crate::weight_map::flashinfer_ffn_admission::{
+        QWEN38_HIDDEN, QWEN38_INTERMEDIATE, Qwen38FfnCheckpointProjection, Qwen38FfnProjection,
+        Qwen38FfnSource, admit_qwen38_merged_gate_up,
+    };
+
+    let (gate_packed, gate_scales, gate_input_scale) = read_flashinfer_ffn_checkpoint_projection(
+        gpu,
+        layer,
+        Qwen38FfnProjection::Gate,
+        gate,
+        QWEN38_INTERMEDIATE,
+        QWEN38_HIDDEN,
+    )?;
+    let (up_packed, up_scales, up_input_scale) = read_flashinfer_ffn_checkpoint_projection(
+        gpu,
+        layer,
+        Qwen38FfnProjection::Up,
+        up,
+        QWEN38_INTERMEDIATE,
+        QWEN38_HIDDEN,
+    )?;
+    let admitted = admit_qwen38_merged_gate_up(
+        layer,
+        Qwen38FfnCheckpointProjection {
+            source: Qwen38FfnSource {
+                layer,
+                projection: Qwen38FfnProjection::Gate,
+            },
+            packed_weight: &gate_packed,
+            logical_weight_scales: &gate_scales,
+            input_scale: gate_input_scale,
+            weight_scale_2_le_bytes: gate.weight_scale_2.to_le_bytes(),
+        },
+        Qwen38FfnCheckpointProjection {
+            source: Qwen38FfnSource {
+                layer,
+                projection: Qwen38FfnProjection::Up,
+            },
+            packed_weight: &up_packed,
+            logical_weight_scales: &up_scales,
+            input_scale: up_input_scale,
+            weight_scale_2_le_bytes: up.weight_scale_2.to_le_bytes(),
+        },
+    )?;
+
+    let merged_weight = gpu.alloc(admitted.packed_weight().len())?;
+    gpu.copy_h2d(admitted.packed_weight(), merged_weight)
+        .context("upload immutable merged FFN gate/up packed weight")?;
+    let merged_scales = gpu.alloc(admitted.physical_weight_scales().len())?;
+    gpu.copy_h2d(admitted.physical_weight_scales(), merged_scales)
+        .context("upload immutable merged FFN gate/up physical scales")?;
+    let alpha_f32 = gpu.alloc(std::mem::size_of::<f32>())?;
+    gpu.copy_h2d(&admitted.shared_alpha_bits().to_le_bytes(), alpha_f32)
+        .context("upload immutable merged FFN gate/up alpha")?;
+
+    Ok(FlashinferMergedGateUp {
+        layer,
+        weight: merged_weight,
+        weight_scales_128x4: merged_scales,
+        weight_hash: flashinfer_scale_fingerprint(admitted.packed_weight()),
+        weight_scales_hash: flashinfer_scale_fingerprint(admitted.physical_weight_scales()),
+        alpha_f32,
+        input_scale_bits: admitted.input_scales()[0].value_bits(),
+        alpha_bits: admitted.shared_alpha_bits(),
+        source_gate_weight: gate.weight,
+        source_up_weight: up.weight,
+    })
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn build_flashinfer_ffn_projection(
+    gpu: &dyn GpuBackend,
+    layer: usize,
+    projection: crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection,
+    weight: &QuantizedWeight,
+    n: usize,
+    k: usize,
+) -> Result<FlashinferFfnProjection> {
+    use crate::weight_map::cutlass_scale_layout::{
+        NVFP4_GROUP_SIZE, deinterleave_nvfp4_scales_128x4, interleave_nvfp4_scales_128x4,
+    };
+    use crate::weight_map::modelopt_scale_admission::{
+        ModeloptScaleProjection, ModeloptScaleSource, admit_modelopt_checkpoint_scale,
+    };
+    use spark_runtime::weights::WeightDtype;
+
+    ensure!(
+        !weight.weight.is_null(),
+        "FlashInfer FFN packed weight is null"
+    );
+    ensure!(
+        !weight.weight_scale.is_null(),
+        "FlashInfer FFN block-scale pointer is null"
+    );
+    ensure!(
+        !weight.input_scale.is_null(),
+        "FlashInfer FFN input-scale pointer is null"
+    );
+    ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(NVFP4_GROUP_SIZE),
+        "FlashInfer FFN projection has invalid N/K geometry"
+    );
+
+    let groups = k / NVFP4_GROUP_SIZE;
+    let scale_len = n
+        .checked_mul(groups)
+        .context("FlashInfer FFN weight-scale length overflow")?;
+    let mut logical_scales = vec![0_u8; scale_len];
+    gpu.copy_d2h(weight.weight_scale, &mut logical_scales)
+        .context("read ModelOpt FFN block scales for CUTLASS interleave")?;
+    let physical_scales =
+        interleave_nvfp4_scales_128x4(&logical_scales, &[n, groups], NVFP4_GROUP_SIZE)?;
+    ensure!(
+        deinterleave_nvfp4_scales_128x4(&physical_scales, &[n, groups], NVFP4_GROUP_SIZE,)?
+            == logical_scales,
+        "FlashInfer FFN physical block scales failed exact round trip"
+    );
+
+    let mut input_scale_bytes = [0_u8; 4];
+    gpu.copy_d2h(weight.input_scale, &mut input_scale_bytes)
+        .context("read ModelOpt FFN input scale")?;
+    let modelopt_projection = match projection {
+        crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection::Gate => {
+            ModeloptScaleProjection::FfnGate
+        }
+        crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection::Up => {
+            ModeloptScaleProjection::FfnUp
+        }
+        crate::weight_map::flashinfer_ffn_admission::Qwen38FfnProjection::Down => {
+            ModeloptScaleProjection::FfnDown
+        }
+    };
+    let input_scale = admit_modelopt_checkpoint_scale(
+        ModeloptScaleSource {
+            layer,
+            projection: modelopt_projection,
+        },
+        WeightDtype::FP32,
+        &[],
+        weight.input_scale,
+        input_scale_bytes,
+    )?;
+    ensure!(
+        weight.weight_scale_2.is_finite() && weight.weight_scale_2 > 0.0,
+        "FlashInfer FFN weight_scale_2 must be finite and positive"
+    );
+    let alpha = input_scale.value() * weight.weight_scale_2;
+    ensure!(
+        alpha.is_finite() && alpha > 0.0,
+        "FlashInfer FFN alpha must be finite and positive"
+    );
+
+    let weight_scales_128x4 = gpu.alloc(physical_scales.len())?;
+    gpu.copy_h2d(&physical_scales, weight_scales_128x4)
+        .context("upload FlashInfer FFN physical block scales")?;
+    let alpha_f32 = gpu.alloc(std::mem::size_of::<f32>())?;
+    gpu.copy_h2d(&alpha.to_le_bytes(), alpha_f32)
+        .context("upload FlashInfer FFN alpha")?;
+
+    Ok(FlashinferFfnProjection {
+        weight: weight.weight,
+        weight_scales_128x4,
+        weight_scales_hash: flashinfer_scale_fingerprint(&physical_scales),
+        alpha_f32,
+        input_scale_bits: input_scale.value_bits(),
+        alpha_bits: alpha.to_bits(),
+    })
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn log_flashinfer_ffn_success(
+    layer: usize,
+    operation: crate::weight_map::flashinfer_ffn_admission::Qwen38FfnOperation,
+    m: usize,
+) {
+    use crate::weight_map::flashinfer_ffn_admission::{
+        Qwen38FfnOperation, select_qwen38_ffn_launch,
+    };
+
+    static RECEIPTS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let (family_offset, family) = match operation {
+        Qwen38FfnOperation::MergedGateUp => (0, "ffn_merged_gate_up"),
+        Qwen38FfnOperation::Down => (2, "ffn_down"),
+        Qwen38FfnOperation::Gate | Qwen38FfnOperation::Up => {
+            unreachable!("production FFN route does not launch separate gate/up")
+        }
+    };
+    let bit = 1_u8 << (family_offset + usize::from(m == 8_192));
+    if RECEIPTS.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    let plan = select_qwen38_ffn_launch(operation, m)
+        .expect("a successful FFN route already selected an exact frozen plan");
+    tracing::info!(
+        layer,
+        m,
+        tactic = plan.tactic,
+        family,
+        "routed Qwen3.8 dense FFN prefill through FlashInfer SM121"
+    );
+    eprintln!(
+        "ATLAS_PREFILL_FFN_FLASHINFER ENGAGED family={family} layer={layer} M={m} tactic={}",
+        plan.tactic
+    );
+}
+
+fn load_e2m1_checkpoint_scales(
+    weights: &DenseFfnWeights,
+    gpu: &dyn GpuBackend,
+) -> Result<Option<E2m1CheckpointScales>> {
+    let flashinfer_requested = crate::layers::prefill_ffn_flashinfer_enabled()?;
+    let requested = flashinfer_requested
+        || std::env::var("ATLAS_E2M1_STATIC_SCALE").ok().as_deref() == Some("1");
+    if !requested {
+        return Ok(None);
+    }
+    let full_w4a4 = std::env::var("ATLAS_E2M1_GEMM").ok().as_deref() == Some("1");
+    let down_w4a4 = std::env::var("ATLAS_E2M1_GEMM_DOWN_ONLY").ok().as_deref() == Some("1");
+    ensure!(
+        full_w4a4 || down_w4a4 || flashinfer_requested,
+        "ATLAS_E2M1_STATIC_SCALE=1 requires an active W4A4 or FlashInfer FFN route"
+    );
+
+    let scales = validated_e2m1_checkpoint_scales(
+        read_e2m1_input_scale(gpu, weights.gate_proj.input_scale, "gate_proj")?,
+        read_e2m1_input_scale(gpu, weights.up_proj.input_scale, "up_proj")?,
+        read_e2m1_input_scale(gpu, weights.down_proj.input_scale, "down_proj")?,
+    )?;
+    tracing::info!(
+        gate_up_input_scale = scales.gate_up,
+        down_input_scale = scales.down,
+        "enabled checkpoint-static W4A4 activation scales"
+    );
+    Ok(Some(scales))
 }
 
 pub struct DenseFfnWeights {
@@ -55,10 +642,159 @@ pub struct DenseFfnWeightsBf16 {
 }
 
 /// Activation function for gated FFN (SiLU for Qwen/Llama, GELU for Gemma-4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FfnActivation {
     SiLU,
     GeLU,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct E2m1RouteProof {
+    scope: E2m1Scope,
+    kernel: E2m1SelectedKernel,
+    checkpoint_static: bool,
+    fused_silu_input: bool,
+    activation: FfnActivation,
+    m: u32,
+    h: u32,
+    inter: u32,
+}
+
+fn log_e2m1_route_once(proof: E2m1RouteProof) {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<E2m1RouteProof>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.insert(proof) {
+        return;
+    }
+    let scope = match proof.scope {
+        E2m1Scope::Full => "full",
+        E2m1Scope::DownOnly => "down-only",
+    };
+    let gate_up = match proof.scope {
+        E2m1Scope::Full => "e2m1",
+        E2m1Scope::DownOnly => "w4a16-m128",
+    };
+    let kernel = match proof.kernel {
+        E2m1SelectedKernel::RowMajorM64 => "row-major-m64",
+        E2m1SelectedKernel::KmajorM128 => "kmajor-m128",
+        E2m1SelectedKernel::KmajorM256 => "kmajor-m256",
+    };
+    let activation_scale = if proof.checkpoint_static {
+        "checkpoint-static"
+    } else {
+        "dynamic-absmax"
+    };
+    let down_input = if proof.fused_silu_input {
+        "fused-silu-nvfp4"
+    } else {
+        "separate-bf16-silu"
+    };
+    let activation = match proof.activation {
+        FfnActivation::SiLU => "silu",
+        FfnActivation::GeLU => "gelu",
+    };
+    tracing::info!(
+        "ENGAGED ATLAS_E2M1_PREFILL: scope={scope} gate_up={gate_up} \
+         e2m1_kernel={kernel} activation_scale={activation_scale} \
+         down_input={down_input} activation={activation} M={} H={} intermediate={}",
+        proof.m,
+        proof.h,
+        proof.inter,
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillFfnFastRoute {
+    Disabled,
+    Ineligible,
+    Complete,
+    Missing,
+}
+
+const fn prefill_ffn_fast_route(
+    requested: bool,
+    shape_eligible: bool,
+    weights_ready: bool,
+    m16_kernel_ready: bool,
+    m128_kernel_ready: bool,
+) -> PrefillFfnFastRoute {
+    if !requested {
+        return PrefillFfnFastRoute::Disabled;
+    }
+    if !shape_eligible {
+        return PrefillFfnFastRoute::Ineligible;
+    }
+    if weights_ready && m16_kernel_ready && m128_kernel_ready {
+        PrefillFfnFastRoute::Complete
+    } else {
+        PrefillFfnFastRoute::Missing
+    }
+}
+
+fn log_prefill_ffn_fast_route_once(m: u32, h: u32, inter: u32) {
+    static FAST: std::sync::Once = std::sync::Once::new();
+    FAST.call_once(|| {
+        tracing::info!(
+            "ENGAGED ATLAS_PREFILL_FFN_FAST: approximate transposed M128 route complete M={m} H={h} intermediate={inter}"
+        );
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillFusedEpilogueRoute {
+    Disabled,
+    Ineligible,
+    Complete,
+    Missing,
+}
+
+fn prefill_fused_epilogue_route(
+    requested: bool,
+    parent_pipe_ready: bool,
+    has_kernel: bool,
+    activation: FfnActivation,
+    m: u32,
+    h: u32,
+    inter: u32,
+) -> PrefillFusedEpilogueRoute {
+    if !requested {
+        return PrefillFusedEpilogueRoute::Disabled;
+    }
+    if activation != FfnActivation::SiLU
+        || m <= 32
+        || !h.is_multiple_of(64)
+        || !inter.is_multiple_of(64)
+    {
+        return PrefillFusedEpilogueRoute::Ineligible;
+    }
+    if parent_pipe_ready && has_kernel {
+        PrefillFusedEpilogueRoute::Complete
+    } else {
+        PrefillFusedEpilogueRoute::Missing
+    }
+}
+
+fn log_prefill_pipe_route_once() {
+    static PIPE: std::sync::Once = std::sync::Once::new();
+    PIPE.call_once(|| {
+        tracing::info!("ENGAGED ATLAS_PREFILL_FFN_PIPE: ordinary exact pipe route");
+    });
+}
+
+fn log_prefill_up_fused_route_once() {
+    static UP_FUSED: std::sync::Once = std::sync::Once::new();
+    UP_FUSED.call_once(|| {
+        tracing::info!("ENGAGED ATLAS_PREFILL_FFN_FUSED_EPILOGUE: exact up-only fusion");
+    });
+}
+
+fn log_prefill_dual_fused_route_once() {
+    static DUAL_FUSED: std::sync::Once = std::sync::Once::new();
+    DUAL_FUSED.call_once(|| {
+        tracing::info!("ENGAGED ATLAS_PREFILL_FFN_DUAL_FUSED: exact gate/up fusion");
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +823,10 @@ const fn exact_ffn_auto_kgamma_applicable(rows: u32, exact_w4_silu_eligible: boo
         exact_ffn_dispatch(rows, exact_w4_silu_eligible, false),
         ExactFfnDispatch::PerRowK1
     )
+}
+
+const fn w3_kgamma_applicable(rows: u32, activation_silu: bool, prepared: bool) -> bool {
+    rows > 1 && rows <= 32 && activation_silu && prepared
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -249,6 +989,15 @@ pub struct DenseFfnLayer {
     /// pipeline differs. Loaded via `try_kernel`; handle 0 disables the
     /// `ATLAS_PREFILL_FFN_PIPE` route silently.
     w4a16_gemm_pipe: KernelHandle,
+    /// Exact up-projection + SiLU(gate) epilogue variant used only by the
+    /// opt-in large-M prefill pipe route. It preserves the BF16 up round trip
+    /// while avoiding the full up activation buffer and standalone SiLU
+    /// launch. Missing symbol keeps the existing three-stage route.
+    w4a16_gemm_pipe_silu_mul: KernelHandle,
+    /// Exact large-M gate+up+SiLU fusion. Both projection accumulators retain
+    /// their BF16 materialization boundary, but A is loaded once and neither
+    /// intermediate activation is written to global memory.
+    w4a16_gemm_pipe_dual: KernelHandle,
     /// SiLU(gate)*up or GELU(gate)*up depending on activation.
     act_mul: KernelHandle,
     /// BF16 dense MLP weights — when `Some`, all forward paths use the
@@ -379,17 +1128,47 @@ pub struct DenseFfnLayer {
     /// (`nvfp4_cutlass::nvfp4_nvfp4_gemm_t_m64`). Loaded via `try_kernel`
     /// — handle 0 silently disables the `ATLAS_E2M1_GEMM` fast path.
     nvfp4_gemm_k: KernelHandle,
+    /// K-major M=128 W4A4 shadow consuming `transpose_for_gemm` buffers.
+    /// Handle 0 makes an eligible explicit `ATLAS_E2M1_KMAJOR=1` request
+    /// fail closed; the ordinary row-major W4A4 route is otherwise unchanged.
+    nvfp4_gemm_kmajor_m128_k: KernelHandle,
+    /// Sixteen-warp M=256 K-major long-prefill shadow. An eligible explicit
+    /// `ATLAS_E2M1_KMAJOR_M256=1` request fails closed when this is absent;
+    /// M128 remains the K-major fallback below the M256 saturation threshold.
+    nvfp4_gemm_kmajor_m256_k: KernelHandle,
     /// `quantize_nvfp4::nvfp4_global_absmax` — per-tensor absmax scan
     /// used to derive the activation `scale2` for the W4A4 path.
     nvfp4_absmax_k: KernelHandle,
     /// `quantize_nvfp4::quantize_bf16_to_nvfp4` — per-row E2M1 quantizer
     /// used to convert BF16 activations to the W4A4 GEMM input layout.
     nvfp4_quantize_k: KernelHandle,
-    /// Lazily allocated scratch arena for the W4A4 fast path. Holds the
-    /// packed activation nibbles + per-group FP8 scales + absmax scratch.
-    /// Resized in-place if M or K grows. `Mutex` because `forward_prefill`
-    /// takes `&self`.
+    /// Fused SiLU(gate)*up -> NVFP4 down-input quantizer. Handle 0 makes an
+    /// eligible explicit `ATLAS_E2M1_SILU_QUANT=1` request fail closed.
+    nvfp4_silu_quantize_k: KernelHandle,
+    /// Scratch arena for the W4A4 fast path. Holds packed activation nibbles,
+    /// per-group FP8 scales, and absmax scratch. FlashInfer preparation
+    /// allocates its maximum admitted shape at construction; other routes
+    /// allocate lazily and resize if M or K grows. `Mutex` because
+    /// `forward_prefill` takes `&self`.
     e2m1_scratch: Mutex<Option<E2m1Scratch>>,
+    /// Serializes every full launch group that uses `e2m1_scratch` and binds
+    /// it to one CUDA stream. The kernels are asynchronous, so allocation-only
+    /// locking is insufficient: a later caller on another stream could
+    /// overwrite or free operands still in flight. Reuse on the same stream is
+    /// safe because CUDA preserves enqueue order.
+    e2m1_use_stream: Mutex<Option<u64>>,
+    /// Optional ModelOpt calibration scales read once during layer
+    /// construction. `ATLAS_E2M1_STATIC_SCALE=1` uses these with the existing
+    /// on-device quantizer, eliminating runtime absmax scans and host syncs.
+    /// This is a different activation-quantization contract from dynamic
+    /// absmax and remains default-off pending output-quality qualification.
+    e2m1_checkpoint_scales: Option<E2m1CheckpointScales>,
+    /// Exact Atlas-quantization / FlashInfer-GEMM prefill route. Constructed
+    /// only by the Qwen3.8 loader after every original checkpoint operand,
+    /// scalar, physical 128x4 scale copy, native symbol and zero-workspace
+    /// tactic has passed admission. Default-unrouted on every other build.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    flashinfer_ffn_prefill: Option<FlashinferFfnPrefill>,
     /// `ffn_sparsity_measure` — TEAL-style activation-sparsity observer for
     /// the sparsity-drafted self-speculation feasibility gate
     /// (`ATLAS_MEASURE_FFN_SPARSITY=1`). Loaded via `try_kernel`; handle 0
@@ -499,6 +1278,7 @@ impl DenseFfnLayer {
         //   `dense_gemv_bf16 = "gemv"`, `dense_gemm_bf16 = "gemm"`.
         let dense_gemv_bf16_k = super::try_kernel(gpu, "gemv", "dense_gemv_bf16");
         let dense_gemm_bf16_k = super::try_kernel(gpu, "gemm", "dense_gemm_bf16");
+        let e2m1_checkpoint_scales = load_e2m1_checkpoint_scales(&weights, gpu)?;
 
         Ok(Self {
             weights,
@@ -586,6 +1366,8 @@ impl DenseFfnLayer {
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_pipe: super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
+            w4a16_gemm_pipe_silu_mul: super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe_silu_mul"),
+            w4a16_gemm_pipe_dual: super::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe_dual"),
             act_mul,
             bf16_weights: None,
             dense_gemv_bf16_k,
@@ -652,9 +1434,28 @@ impl DenseFfnLayer {
             // them here so the dispatch site can launch without plumbing
             // them through the forward context.
             nvfp4_gemm_k: super::try_kernel(gpu, "nvfp4_cutlass", "nvfp4_nvfp4_gemm_t_m64"),
+            nvfp4_gemm_kmajor_m128_k: super::try_kernel(
+                gpu,
+                "nvfp4_cutlass",
+                "nvfp4_nvfp4_gemm_kmajor_m128",
+            ),
+            nvfp4_gemm_kmajor_m256_k: super::try_kernel(
+                gpu,
+                "nvfp4_cutlass",
+                "nvfp4_nvfp4_gemm_kmajor_m256",
+            ),
             nvfp4_absmax_k: super::try_kernel(gpu, "quantize_nvfp4", "nvfp4_global_absmax"),
             nvfp4_quantize_k: super::try_kernel(gpu, "quantize_nvfp4", "quantize_bf16_to_nvfp4"),
+            nvfp4_silu_quantize_k: super::try_kernel(
+                gpu,
+                "quantize_nvfp4",
+                "quantize_silu_mul_bf16_to_nvfp4",
+            ),
             e2m1_scratch: Mutex::new(None),
+            e2m1_use_stream: Mutex::new(None),
+            e2m1_checkpoint_scales,
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            flashinfer_ffn_prefill: None,
             // Sparsity-drafted self-speculation kernels (default-off features).
             // The .cu files live in kernels/gb10/common/ and register under
             // their file-stem module names. try_kernel → handle 0 disables the
@@ -695,7 +1496,21 @@ impl DenseFfnLayer {
     /// choose between the W4A4 fast path and the existing fp8/v2/m128
     /// fallbacks.
     pub fn has_e2m1_ffn(&self) -> bool {
-        self.nvfp4_gemm_k.0 != 0 && self.nvfp4_absmax_k.0 != 0 && self.nvfp4_quantize_k.0 != 0
+        self.nvfp4_gemm_k.0 != 0
+            && self.nvfp4_quantize_k.0 != 0
+            && (self.e2m1_checkpoint_scales.is_some() || self.nvfp4_absmax_k.0 != 0)
+    }
+
+    /// Whether the K-major W4A4 implementation has every runtime component
+    /// other than the per-layer transformed weights (installed after `new`).
+    fn has_e2m1_kmajor_runtime(&self) -> bool {
+        self.nvfp4_gemm_kmajor_m128_k.0 != 0
+            && self.nvfp4_quantize_k.0 != 0
+            && (self.e2m1_checkpoint_scales.is_some() || self.nvfp4_absmax_k.0 != 0)
+    }
+
+    fn has_e2m1_kmajor_m256_runtime(&self) -> bool {
+        self.nvfp4_gemm_kmajor_m256_k.0 != 0 && self.has_e2m1_kmajor_runtime()
     }
 
     /// Ensure the W4A4 activation scratch arena has capacity for `m` rows
@@ -708,9 +1523,10 @@ impl DenseFfnLayer {
         m: usize,
         k: usize,
     ) -> Result<(DevicePtr, DevicePtr, DevicePtr)> {
+        let layout = e2m1_scratch_layout(m, k)?;
         let mut slot = self.e2m1_scratch.lock().unwrap();
         let needs_realloc = match slot.as_ref() {
-            Some(s) => s.cap_m < m || s.cap_k < k,
+            Some(s) => s.cap_m < layout.cap_m || s.cap_k < layout.cap_k,
             None => true,
         };
         if needs_realloc {
@@ -720,67 +1536,75 @@ impl DenseFfnLayer {
                 let _ = gpu.free(prev.a_scale);
                 let _ = gpu.free(prev.a_max);
             }
-            // Round capacity up so small M growth doesn't trigger a
-            // realloc every chunk.
-            let cap_m = m.max(128);
-            let cap_k = k;
-            let a_packed = gpu.alloc(cap_m * cap_k / 2)?;
-            let a_scale = gpu.alloc(cap_m * cap_k / 16)?;
-            let a_max = gpu.alloc(4)?;
+            let a_packed = gpu.alloc(layout.packed_bytes)?;
+            let a_scale = gpu.alloc(layout.scale_bytes)?;
+            let a_max = gpu.alloc(layout.max_bytes)?;
             *slot = Some(E2m1Scratch {
                 a_packed,
                 a_scale,
                 a_max,
-                cap_m,
-                cap_k,
+                cap_m: layout.cap_m,
+                cap_k: layout.cap_k,
             });
         }
         let s = slot.as_ref().unwrap();
         Ok((s.a_packed, s.a_scale, s.a_max))
     }
 
-    /// Run the W4A4 fast path for one FFN projection: prequant BF16 input
-    /// to NVFP4, then dispatch `nvfp4_nvfp4_gemm`.
+    fn lock_e2m1_use(&self, stream: u64) -> Result<MutexGuard<'_, Option<u64>>> {
+        let mut admitted_stream = self
+            .e2m1_use_stream
+            .lock()
+            .map_err(|_| anyhow::anyhow!("W4A4 activation scratch stream-binding lock poisoned"))?;
+        match *admitted_stream {
+            Some(existing) => ensure!(
+                existing == stream,
+                "W4A4 activation scratch is bound to CUDA stream {existing:#x}; rejected concurrent/reordered use on {stream:#x}"
+            ),
+            None => *admitted_stream = Some(stream),
+        }
+        Ok(admitted_stream)
+    }
+
+    /// Quantize one BF16 activation matrix for the W4A4 path.
     ///
-    /// `weight` is the standard `[N, K/2]` row-major NVFP4 weight (NOT
-    /// the transposed `nvfp4_t` layout) — the kernel reads B in the
-    /// HuggingFace layout, matching `self.weights.gate_proj` etc.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_e2m1_proj(
+    /// The returned packed values and scales remain owned by this layer's
+    /// scratch arena. Callers may issue multiple same-stream GEMMs from them
+    /// before preparing a different input. Gate and up share the same BF16
+    /// input, so preparing once avoids a duplicate absmax scan, host readback,
+    /// stream synchronization, and quantization launch without changing any
+    /// quantized byte or GEMM arithmetic.
+    fn prepare_e2m1_input(
         &self,
         ctx: &ForwardContext,
         input: DevicePtr,
-        weight: &QuantizedWeight,
-        output: DevicePtr,
         m: u32,
-        n: u32,
         k: u32,
+        checkpoint_scale2: Option<f32>,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<(DevicePtr, DevicePtr, f32)> {
         let (a_packed, a_scale, a_max) =
             self.ensure_e2m1_scratch(ctx.gpu, m as usize, k as usize)?;
 
-        // Phase 1: per-tensor absmax over the BF16 [M, K] activation.
-        // Caller-side memset to zero matches `quantize_to_nvfp4` (see
-        // weight_map/loaders_fp8.rs:87).
-        ctx.gpu.memset_async(a_max, 0, 4, stream)?;
-        ops::nvfp4_global_absmax(ctx.gpu, self.nvfp4_absmax_k, input, a_max, m * k, stream)?;
-
-        // Phase 2: read absmax back, derive scale2.
-        // We have to synchronize: scale2 is a kernel ARGUMENT (FP32 by-
-        // value), not a device pointer, so we can't defer the D2H copy.
-        // This adds 1 sync per GEMM (3 per FFN, 192 per Qwen3.6-27B
-        // forward). For a 4K prefill the sync cost is dominated by the
-        // GEMM itself; profile will show whether this needs to become a
-        // device-resident scale2 + a kernel signature change.
-        ctx.gpu.synchronize(stream)?;
-        let mut bytes = [0u8; 4];
-        ctx.gpu.copy_d2h(a_max, &mut bytes)?;
-        let global_max = f32::from_le_bytes(bytes);
-        let a_scale2 = if global_max > 0.0 {
-            global_max / (6.0 * 448.0)
+        let a_scale2 = if let Some(scale2) = checkpoint_scale2 {
+            // ModelOpt calibrated this scalar offline and stored it as
+            // `.input_scale`. It was read once during layer construction, so
+            // the unchanged on-device quantizer can launch immediately.
+            scale2
         } else {
-            1.0
+            // Dynamic fallback: scan BF16 [M,K], drain the stream, and derive
+            // a per-request scale. This remains the default W4A4 contract.
+            ctx.gpu.memset_async(a_max, 0, 4, stream)?;
+            ops::nvfp4_global_absmax(ctx.gpu, self.nvfp4_absmax_k, input, a_max, m * k, stream)?;
+            ctx.gpu.synchronize(stream)?;
+            let mut bytes = [0u8; 4];
+            ctx.gpu.copy_d2h(a_max, &mut bytes)?;
+            let global_max = f32::from_le_bytes(bytes);
+            if global_max > 0.0 {
+                global_max / (6.0 * 448.0)
+            } else {
+                1.0
+            }
         };
 
         // Phase 3: per-row E2M1 quantization of the activation. Writes
@@ -797,23 +1621,146 @@ impl DenseFfnLayer {
             stream,
         )?;
 
-        // Phase 4: native W4A4 tensor-core GEMM.
-        let scale2_ab = a_scale2 * weight.weight_scale_2;
-        ops::nvfp4_nvfp4_gemm(
+        Ok((a_packed, a_scale, a_scale2))
+    }
+
+    /// Materialize the SwiGLU down input directly in NVFP4 scratch.
+    ///
+    /// The CUDA kernel rounds each SiLU(gate)*up value through BF16 before
+    /// deriving group scales and nibbles, matching the standalone activation
+    /// kernel's numerical boundary without writing the temporary BF16 matrix.
+    fn prepare_e2m1_silu_input(
+        &self,
+        ctx: &ForwardContext,
+        gate: DevicePtr,
+        up: DevicePtr,
+        m: u32,
+        k: u32,
+        checkpoint_scale2: f32,
+        stream: u64,
+    ) -> Result<(DevicePtr, DevicePtr, f32)> {
+        let (a_packed, a_scale, _) = self.ensure_e2m1_scratch(ctx.gpu, m as usize, k as usize)?;
+        ops::quantize_silu_mul_bf16_to_nvfp4(
             ctx.gpu,
-            self.nvfp4_gemm_k,
+            self.nvfp4_silu_quantize_k,
+            gate,
+            up,
             a_packed,
             a_scale,
-            weight.weight,
-            weight.weight_scale,
-            scale2_ab,
+            checkpoint_scale2,
+            m,
+            k,
+            stream,
+        )?;
+        Ok((a_packed, a_scale, checkpoint_scale2))
+    }
+
+    /// Dispatch one native W4A4 GEMM from an already prepared activation.
+    ///
+    /// `weight` is either the standard `[N, K/2]` row-major NVFP4 weight or,
+    /// when `kmajor_m128` is true, the existing `[K/2,N]` / `[K/16,N]`
+    /// transformed pair. Both kernels retain the same native block-scaled
+    /// OMMA and BF16 epilogue order.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_e2m1_prepared(
+        &self,
+        ctx: &ForwardContext,
+        a_packed: DevicePtr,
+        a_scale: DevicePtr,
+        a_scale2: f32,
+        weight: &QuantizedWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        kmajor_m128: bool,
+        stream: u64,
+    ) -> Result<()> {
+        let scale2_ab = a_scale2 * weight.weight_scale_2;
+        if kmajor_m128 {
+            if e2m1_kmajor_kernel(m, crate::layers::prefill_ffn_e2m1_kmajor_m256_enabled())
+                == E2m1KmajorKernel::M256
+            {
+                ops::nvfp4_nvfp4_gemm_kmajor_m256(
+                    ctx.gpu,
+                    self.nvfp4_gemm_kmajor_m256_k,
+                    a_packed,
+                    a_scale,
+                    weight.weight,
+                    weight.weight_scale,
+                    scale2_ab,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )?;
+            } else {
+                ops::nvfp4_nvfp4_gemm_kmajor_m128(
+                    ctx.gpu,
+                    self.nvfp4_gemm_kmajor_m128_k,
+                    a_packed,
+                    a_scale,
+                    weight.weight,
+                    weight.weight_scale,
+                    scale2_ab,
+                    output,
+                    m,
+                    n,
+                    k,
+                    stream,
+                )?;
+            }
+        } else {
+            ops::nvfp4_nvfp4_gemm(
+                ctx.gpu,
+                self.nvfp4_gemm_k,
+                a_packed,
+                a_scale,
+                weight.weight,
+                weight.weight_scale,
+                scale2_ab,
+                output,
+                m,
+                n,
+                k,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Run the W4A4 fast path for one FFN projection: prequant BF16 input
+    /// to NVFP4, then dispatch `nvfp4_nvfp4_gemm`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_e2m1_proj(
+        &self,
+        ctx: &ForwardContext,
+        input: DevicePtr,
+        weight: &QuantizedWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        checkpoint_scale2: Option<f32>,
+        kmajor_m128: bool,
+        stream: u64,
+    ) -> Result<()> {
+        let (a_packed, a_scale, a_scale2) =
+            self.prepare_e2m1_input(ctx, input, m, k, checkpoint_scale2, stream)?;
+        self.forward_e2m1_prepared(
+            ctx,
+            a_packed,
+            a_scale,
+            a_scale2,
+            weight,
             output,
             m,
             n,
             k,
+            kmajor_m128,
             stream,
-        )?;
-        Ok(())
+        )
     }
 
     /// Install transposed (`nvfp4_t` layout) FFN projection weights for
@@ -832,6 +1779,372 @@ impl DenseFfnLayer {
         self.gate_proj_t = Some(gate_proj_t);
         self.up_proj_t = Some(up_proj_t);
         self.down_proj_t = Some(down_proj_t);
+    }
+
+    /// Build the exact, default-off FlashInfer FFN prefill operands for one
+    /// Qwen3.8 layer. Gate and up are copied once into an immutable merged
+    /// gate-then-up operand; down retains the original checkpoint allocation.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub fn prepare_flashinfer_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        layer: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> Result<()> {
+        use crate::weight_map::flashinfer_ffn_admission::{
+            QWEN38_HIDDEN, QWEN38_INTERMEDIATE, Qwen38FfnOperation, Qwen38FfnProjection,
+            qwen38_ffn_launch_candidate, qwen38_merged_gate_up_retained_bytes,
+        };
+        use ops::flashinfer_sm121::{FlashInferSm121, FlashInferSm121Shape};
+
+        ensure!(
+            crate::layers::prefill_ffn_flashinfer_enabled()?,
+            "prepare_flashinfer_prefill called while its route is disabled"
+        );
+        ensure!(
+            self.flashinfer_ffn_prefill.is_none(),
+            "FlashInfer FFN operands are already prepared"
+        );
+        ensure!(
+            hidden == QWEN38_HIDDEN && intermediate == QWEN38_INTERMEDIATE,
+            "FlashInfer FFN route requires Qwen3.8 H={QWEN38_HIDDEN} I={QWEN38_INTERMEDIATE}; got H={hidden} I={intermediate}"
+        );
+        ensure!(
+            self.activation == FfnActivation::SiLU,
+            "FlashInfer FFN route requires a SiLU-gated dense FFN"
+        );
+        ensure!(
+            self.e2m1_checkpoint_scales.is_some(),
+            "FlashInfer FFN route requires admitted checkpoint-static activation scales"
+        );
+
+        let library_path = std::env::var_os("ATLAS_FLASHINFER_SM121_LIB").ok_or_else(|| {
+            anyhow::anyhow!("ATLAS_PREFILL_FFN_FLASHINFER=1 requires ATLAS_FLASHINFER_SM121_LIB")
+        })?;
+        let library = FlashInferSm121::open_with_sha256(
+            std::path::Path::new(&library_path),
+            QUALIFIED_FLASHINFER_SM121_SHA256,
+        )?;
+        let quantize_atlas_128x4_k = gpu.kernel(
+            "quantize_bf16_to_nvfp4_cutlass",
+            "quantize_bf16_to_nvfp4_atlas_128x4",
+        )?;
+        let quantize_merged_silu_atlas_128x4_k = gpu.kernel(
+            "quantize_nvfp4",
+            "quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4",
+        )?;
+        ensure!(
+            quantize_atlas_128x4_k.0 != 0 && quantize_merged_silu_atlas_128x4_k.0 != 0,
+            "FlashInfer FFN preparation resolved a NULL required kernel"
+        );
+
+        // Freeze the exact zero-workspace tactics before retaining any route.
+        // Querying at construction catches a mismatched native library rather
+        // than discovering it after some layer projections have run.
+        let stream = gpu.default_stream();
+        for (operation, m) in [
+            (Qwen38FfnOperation::MergedGateUp, 2_079),
+            (Qwen38FfnOperation::Down, 2_079),
+            (Qwen38FfnOperation::MergedGateUp, 8_192),
+            (Qwen38FfnOperation::Down, 8_192),
+        ] {
+            let plan = qwen38_ffn_launch_candidate(operation, m)?;
+            ensure!(
+                plan.performance_qualified && plan.workspace_bytes == 0,
+                "FlashInfer FFN launch is not fully qualified: {operation:?} M={m}"
+            );
+            let shape = FlashInferSm121Shape::new(
+                u8::try_from(plan.tactic).context("FlashInfer tactic exceeds u8")?,
+                plan.m,
+                plan.n,
+                plan.k,
+                1,
+            )?;
+            let prepared = library.prepare_borrowed_zero_workspace(gpu, shape, stream)?;
+            ensure!(
+                prepared.shape() == shape,
+                "FlashInfer FFN preparation changed its frozen shape"
+            );
+        }
+
+        // This exact allocation is already charged by the server's model-load
+        // preflight. Materialize it now so the first measured M=2079 request
+        // cannot pay 64 lazy allocations (or discover an OOM after serving has
+        // started). The runtime route reuses this fixed-address maximum shape.
+        let scratch_layout = e2m1_scratch_layout(8_192, intermediate)?;
+        let (scratch_packed, scratch_scales, scratch_max) =
+            self.ensure_e2m1_scratch(gpu, scratch_layout.cap_m, scratch_layout.cap_k)?;
+        for pointer in [scratch_packed, scratch_scales, scratch_max] {
+            ensure!(
+                !pointer.is_null() && pointer.0.is_multiple_of(16),
+                "FlashInfer FFN construction scratch is NULL or misaligned"
+            );
+        }
+        {
+            let retained = self.e2m1_scratch.lock().unwrap();
+            let retained = retained
+                .as_ref()
+                .context("FlashInfer FFN construction scratch was not retained")?;
+            ensure!(
+                retained.cap_m == scratch_layout.cap_m && retained.cap_k == scratch_layout.cap_k,
+                "FlashInfer FFN construction scratch retained the wrong capacity"
+            );
+        }
+
+        let merged_gate_up = build_flashinfer_merged_gate_up(
+            gpu,
+            layer,
+            &self.weights.gate_proj,
+            &self.weights.up_proj,
+        )?;
+        let down = build_flashinfer_ffn_projection(
+            gpu,
+            layer,
+            Qwen38FfnProjection::Down,
+            &self.weights.down_proj,
+            hidden,
+            intermediate,
+        )?;
+
+        let (library_device, library_inode) = library.file_identity();
+        tracing::info!(
+            layer,
+            library = %library.path().display(),
+            library_sha256 = %library.sha256_hex(),
+            library_device,
+            library_inode,
+            merged_gate_up_weight = format_args!("{:#x}", merged_gate_up.weight.0),
+            down_weight = format_args!("{:#x}", down.weight.0),
+            merged_gate_up_weight_hash = format_args!("{:016x}", merged_gate_up.weight_hash),
+            merged_gate_up_scale_hash = format_args!("{:016x}", merged_gate_up.weight_scales_hash),
+            down_scale_hash = format_args!("{:016x}", down.weight_scales_hash),
+            merged_gate_up_alpha_bits = format_args!("{:08x}", merged_gate_up.alpha_bits),
+            down_alpha_bits = format_args!("{:08x}", down.alpha_bits),
+            merged_gate_up_retained_bytes = qwen38_merged_gate_up_retained_bytes(),
+            scratch_cap_m = scratch_layout.cap_m,
+            scratch_cap_k = scratch_layout.cap_k,
+            scratch_packed_bytes = scratch_layout.packed_bytes,
+            scratch_scale_bytes = scratch_layout.scale_bytes,
+            "admitted FlashInfer SM121 FFN prefill operands"
+        );
+        self.flashinfer_ffn_prefill = Some(FlashinferFfnPrefill {
+            layer,
+            library,
+            merged_gate_up,
+            down,
+            quantize_atlas_128x4_k,
+            quantize_merged_silu_atlas_128x4_k,
+        });
+        Ok(())
+    }
+
+    /// Try the fully-admitted FlashInfer FFN route for an exact qualified
+    /// chunk size. Other rows (notably a final short prefill tail) retain the
+    /// existing Atlas path unchanged.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    fn try_forward_flashinfer_prefill(
+        &self,
+        input: DevicePtr,
+        m: u32,
+        h: u32,
+        inter: u32,
+        gate_out: DevicePtr,
+        up_out: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        use crate::weight_map::flashinfer_ffn_admission::{
+            QWEN38_HIDDEN, QWEN38_INTERMEDIATE, Qwen38FfnOperation, select_qwen38_ffn_launch,
+        };
+        use ops::flashinfer_sm121::{FlashInferSm121Buffers, FlashInferSm121Shape};
+
+        let requested = crate::layers::prefill_ffn_flashinfer_enabled()?;
+        let exact_qwen38_dense = ctx.config.model_type == "qwen3_5"
+            && ctx.config.num_experts == 0
+            && h as usize == QWEN38_HIDDEN
+            && inter as usize == QWEN38_INTERMEDIATE
+            && ctx.config.tp_world_size.max(1) == 1;
+        let m_qualified = matches!(m, 2_079 | 8_192)
+            || crate::weight_map::flashinfer_ffn_admission::qwen38_ffn_launch_candidate(
+                Qwen38FfnOperation::MergedGateUp,
+                m as usize,
+            )
+            .is_ok();
+        match flashinfer_ffn_prefill_route(
+            requested,
+            exact_qwen38_dense,
+            m_qualified,
+            self.flashinfer_ffn_prefill.is_some(),
+        ) {
+            FlashinferFfnPrefillRoute::Disabled | FlashinferFfnPrefillRoute::Ineligible => {
+                return Ok(false);
+            }
+            FlashinferFfnPrefillRoute::Missing => anyhow::bail!(
+                "ATLAS_PREFILL_FFN_FLASHINFER=1 requires prepared merged FFN operands for exact M={m}"
+            ),
+            FlashinferFfnPrefillRoute::Complete => {}
+        }
+        let route = self.flashinfer_ffn_prefill.as_ref().unwrap();
+        ensure!(
+            route.merged_gate_up.layer == route.layer
+                && route.merged_gate_up.source_gate_weight == self.weights.gate_proj.weight
+                && route.merged_gate_up.source_up_weight == self.weights.up_proj.weight
+                && route.down.weight == self.weights.down_proj.weight,
+            "FlashInfer FFN checkpoint operand identity changed after preparation"
+        );
+
+        let merged_plan = select_qwen38_ffn_launch(Qwen38FfnOperation::MergedGateUp, m as usize)?;
+        let down_plan = select_qwen38_ffn_launch(Qwen38FfnOperation::Down, m as usize)?;
+        ensure!(
+            merged_plan.workspace_bytes == 0 && down_plan.workspace_bytes == 0,
+            "FlashInfer FFN runtime selected a nonzero-workspace plan"
+        );
+
+        let rows = m as usize;
+        let input_bytes = flashinfer_ffn_extent(rows, QWEN38_HIDDEN, 2)?;
+        let projection_bytes = flashinfer_ffn_extent(rows, QWEN38_INTERMEDIATE, 2)?;
+        let merged_bytes = flashinfer_ffn_extent(rows, 2 * QWEN38_INTERMEDIATE, 2)?;
+        let output_bytes = flashinfer_ffn_extent(rows, QWEN38_HIDDEN, 2)?;
+        let activation_fp4_bytes = flashinfer_ffn_extent(rows, QWEN38_INTERMEDIATE, 1)? / 2;
+        let activation_scale_bytes =
+            flashinfer_ffn_activation_scale_extent(rows, QWEN38_INTERMEDIATE)?;
+        ensure!(
+            ctx.buffers.sizes().ffn_gate_up_bf16 >= merged_bytes,
+            "merged FlashInfer FFN output arena is undersized"
+        );
+        ensure!(
+            ctx.buffers.sizes().expert_gate_out >= projection_bytes
+                && ctx.buffers.sizes().expert_up_out >= projection_bytes
+                && ctx.buffers.sizes().moe_output >= output_bytes,
+            "FlashInfer FFN destination arena is undersized"
+        );
+
+        let merged_out = ctx.buffers.ffn_gate_up_bf16();
+        let output = ctx.buffers.moe_output();
+        for pointer in [input, merged_out, gate_out, up_out, output] {
+            ensure!(
+                !pointer.is_null() && pointer.0.is_multiple_of(16),
+                "FlashInfer FFN input/output pointer is NULL or misaligned"
+            );
+        }
+        ensure_flashinfer_ffn_disjoint(input, input_bytes, merged_out, merged_bytes)?;
+        ensure_flashinfer_ffn_disjoint(input, input_bytes, gate_out, projection_bytes)?;
+        ensure_flashinfer_ffn_disjoint(input, input_bytes, up_out, projection_bytes)?;
+        ensure_flashinfer_ffn_disjoint(input, input_bytes, output, output_bytes)?;
+        ensure_flashinfer_ffn_disjoint(merged_out, merged_bytes, gate_out, projection_bytes)?;
+        ensure_flashinfer_ffn_disjoint(merged_out, merged_bytes, up_out, projection_bytes)?;
+        ensure_flashinfer_ffn_disjoint(merged_out, merged_bytes, output, output_bytes)?;
+        ensure_flashinfer_ffn_disjoint(gate_out, projection_bytes, up_out, projection_bytes)?;
+        ensure_flashinfer_ffn_disjoint(gate_out, projection_bytes, output, output_bytes)?;
+        ensure_flashinfer_ffn_disjoint(up_out, projection_bytes, output, output_bytes)?;
+
+        let merged_shape = FlashInferSm121Shape::new(
+            u8::try_from(merged_plan.tactic).context("FlashInfer tactic exceeds u8")?,
+            merged_plan.m,
+            merged_plan.n,
+            merged_plan.k,
+            1,
+        )?;
+        let down_shape = FlashInferSm121Shape::new(
+            u8::try_from(down_plan.tactic).context("FlashInfer tactic exceeds u8")?,
+            down_plan.m,
+            down_plan.n,
+            down_plan.k,
+            1,
+        )?;
+        let mut merged_launch =
+            route
+                .library
+                .prepare_borrowed_zero_workspace(ctx.gpu, merged_shape, stream)?;
+        let mut down_launch = route
+            .library
+            .prepare_borrowed_zero_workspace(ctx.gpu, down_shape, stream)?;
+
+        // Allocate once at the larger down-projection K so no asynchronous
+        // activation operand can be freed while it is still in flight. All
+        // route shapes, symbols, destinations and native plans are already
+        // preflighted before the first quantization/device output effect.
+        let _scratch_use = self.lock_e2m1_use(stream)?;
+        let (activation_fp4, activation_scales, _) =
+            self.ensure_e2m1_scratch(ctx.gpu, m as usize, inter as usize)?;
+        for pointer in [activation_fp4, activation_scales] {
+            ensure!(
+                !pointer.is_null() && pointer.0.is_multiple_of(16),
+                "FlashInfer FFN activation scratch is NULL or misaligned"
+            );
+        }
+        ensure_flashinfer_ffn_disjoint(
+            activation_fp4,
+            activation_fp4_bytes,
+            activation_scales,
+            activation_scale_bytes,
+        )?;
+        for (pointer, bytes) in [
+            (input, input_bytes),
+            (merged_out, merged_bytes),
+            (gate_out, projection_bytes),
+            (up_out, projection_bytes),
+            (output, output_bytes),
+        ] {
+            ensure_flashinfer_ffn_disjoint(activation_fp4, activation_fp4_bytes, pointer, bytes)?;
+            ensure_flashinfer_ffn_disjoint(
+                activation_scales,
+                activation_scale_bytes,
+                pointer,
+                bytes,
+            )?;
+        }
+
+        ops::quantize_bf16_to_nvfp4_atlas_128x4(
+            ctx.gpu,
+            route.quantize_atlas_128x4_k,
+            input,
+            activation_fp4,
+            activation_scales,
+            f32::from_bits(route.merged_gate_up.input_scale_bits),
+            m,
+            h,
+            stream,
+        )?;
+        merged_launch.launch_eager(
+            FlashInferSm121Buffers {
+                output_bf16: merged_out,
+                activation_fp4,
+                weight_fp4: route.merged_gate_up.weight,
+                activation_scales,
+                weight_scales: route.merged_gate_up.weight_scales_128x4,
+                global_scale_f32: route.merged_gate_up.alpha_f32,
+            },
+            stream,
+        )?;
+        ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+            ctx.gpu,
+            route.quantize_merged_silu_atlas_128x4_k,
+            merged_out,
+            activation_fp4,
+            activation_scales,
+            f32::from_bits(route.down.input_scale_bits),
+            m,
+            inter,
+            stream,
+        )?;
+
+        down_launch.launch_eager(
+            FlashInferSm121Buffers {
+                output_bf16: output,
+                activation_fp4,
+                weight_fp4: route.down.weight,
+                activation_scales,
+                weight_scales: route.down.weight_scales_128x4,
+                global_scale_f32: route.down.alpha_f32,
+            },
+            stream,
+        )?;
+
+        log_flashinfer_ffn_success(route.layer, Qwen38FfnOperation::MergedGateUp, merged_plan.m);
+        log_flashinfer_ffn_success(route.layer, Qwen38FfnOperation::Down, down_plan.m);
+        Ok(true)
     }
 
     /// Install W3 (3-bit) FFN weights for this layer — GEMV-layout copies
@@ -858,7 +2171,9 @@ impl DenseFfnLayer {
 
     /// Whether the W3 K=γ verify GEMM path is fully wired.
     fn has_w3_gemm(&self) -> bool {
-        self.w3_weights_t.is_some() && self.w3a16_gemm_t_m32_n64_k.0 != 0
+        self.w3_weights_t.is_some()
+            && self.w3a16_gemm_t_m32_n64_k.0 != 0
+            && self.activation == FfnActivation::SiLU
     }
 
     /// Whether ANY W3 routing is active on this layer (loader log helper).
@@ -2102,6 +3417,79 @@ impl DenseFfnLayer {
             ExactFfnDispatch::Existing => {}
         }
 
+        if w3_kgamma_applicable(
+            n,
+            self.activation == FfnActivation::SiLU,
+            self.has_w3_gemm(),
+        ) {
+            let w3 = self
+                .w3_weights_t
+                .as_ref()
+                .context("W3 K-gamma route selected without transposed weights")?;
+            crate::kprof!(ctx.gpu, stream, "ffn_gate_w3_kgamma", {
+                ops::w3a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w3a16_gemm_t_m32_n64_k,
+                    input,
+                    &w3.gate_proj,
+                    gate_out,
+                    n,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+            crate::kprof!(ctx.gpu, stream, "ffn_up_w3_kgamma", {
+                ops::w3a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w3a16_gemm_t_m32_n64_k,
+                    input,
+                    &w3.up_proj,
+                    up_out,
+                    n,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+            crate::kprof!(ctx.gpu, stream, "ffn_silu_mul_w3_kgamma", {
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    n * inter,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+            let output = ctx.buffers.moe_output();
+            crate::kprof!(ctx.gpu, stream, "ffn_down_w3_kgamma", {
+                ops::w3a16_gemm_n64_m32(
+                    ctx.gpu,
+                    self.w3a16_gemm_t_m32_n64_k,
+                    gate_out,
+                    &w3.down_proj,
+                    output,
+                    n,
+                    h,
+                    inter,
+                    stream,
+                )?;
+                anyhow::Result::<()>::Ok(())
+            })?;
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "ENGAGED W3 FFN K-gamma: approximate ghost/quality-gated target route"
+                );
+            });
+            return Ok(());
+        }
+
         // Route through M_TILE=16 + transposed weights when:
         //   - ATLAS_FFN_M16_TRANSPOSED=1 OR ATLAS_TC_NVFP4_M16=1
         //   - the loader installed transposed copies of all 3 FFN projections
@@ -2608,6 +3996,11 @@ impl DenseFfnLayer {
             return Ok(());
         }
 
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if self.try_forward_flashinfer_prefill(input, m, h, inter, gate_out, up_out, ctx, stream)? {
+            return Ok(());
+        }
+
         // Large-M W4A4 native NVFP4×NVFP4 fast path: route through the
         // CUTLASS-style `nvfp4_nvfp4_gemm_t_m64` kernel (native E2M1
         // tensor-core MMA) when:
@@ -2621,10 +4014,80 @@ impl DenseFfnLayer {
         // Theoretical 2× MFU lift over `w4a16_gemm_t_m128` (BF16×NVFP4)
         // since we eliminate the inner-loop dequant AND halve activation
         // DRAM traffic (0.5 B/elt vs 2 B/elt BF16). Takes precedence
-        // over the fp8/v2/m128 paths when active. Falls back silently
-        // when the gate is off or kernels are missing.
-        let e2m1_fast_path =
-            m >= 128 && crate::layers::prefill_ffn_e2m1_enabled() && self.has_e2m1_ffn();
+        // over the fp8/v2/m128 paths when active. Disabled or geometrically
+        // ineligible requests retain those fallbacks; eligible incomplete
+        // requests fail before projection.
+        let e2m1_full_requested = crate::layers::prefill_ffn_e2m1_enabled();
+        let e2m1_down_requested = crate::layers::prefill_ffn_e2m1_down_only_enabled();
+        let e2m1_kmajor_requested = crate::layers::prefill_ffn_e2m1_kmajor_enabled();
+        let e2m1_kmajor_m256_requested = crate::layers::prefill_ffn_e2m1_kmajor_m256_enabled();
+        let e2m1_silu_quant_requested = crate::layers::prefill_ffn_e2m1_silu_quant_enabled();
+        if m >= 128 && e2m1_silu_quant_requested {
+            ensure!(
+                e2m1_full_requested || e2m1_down_requested,
+                "ATLAS_E2M1_SILU_QUANT=1 requires ATLAS_E2M1_GEMM=1 or ATLAS_E2M1_GEMM_DOWN_ONLY=1"
+            );
+            ensure!(
+                self.e2m1_checkpoint_scales.is_some(),
+                "ATLAS_E2M1_SILU_QUANT=1 requires ATLAS_E2M1_STATIC_SCALE=1 and valid checkpoint input scales"
+            );
+            ensure!(
+                self.activation == FfnActivation::SiLU,
+                "ATLAS_E2M1_SILU_QUANT=1 is valid only for SiLU-gated FFNs"
+            );
+            ensure!(
+                self.nvfp4_silu_quantize_k.0 != 0,
+                "ATLAS_E2M1_SILU_QUANT=1 requires quantize_silu_mul_bf16_to_nvfp4 in the quantize_nvfp4 module"
+            );
+        }
+        if m >= 128 && e2m1_kmajor_requested {
+            ensure!(
+                e2m1_full_requested || e2m1_down_requested,
+                "ATLAS_E2M1_KMAJOR=1 requires ATLAS_E2M1_GEMM=1 or ATLAS_E2M1_GEMM_DOWN_ONLY=1"
+            );
+            ensure!(
+                self.has_e2m1_kmajor_runtime(),
+                "ATLAS_E2M1_KMAJOR=1 requires nvfp4_nvfp4_gemm_kmajor_m128 plus the activation quantizer"
+            );
+            ensure!(
+                self.has_transposed_ffn(),
+                "ATLAS_E2M1_KMAJOR=1 requires transformed gate/up/down weights (ATLAS_FFN_M16_TRANSPOSED=1)"
+            );
+            ensure!(
+                e2m1_kmajor_projection_shape(m, inter, h)
+                    && e2m1_kmajor_projection_shape(m, h, inter),
+                "ATLAS_E2M1_KMAJOR=1 requires M>=128, N divisible by 128, and K divisible by 64 for every FFN projection; got M={m} hidden={h} intermediate={inter}"
+            );
+        }
+        if e2m1_kmajor_m256_requested {
+            ensure!(
+                e2m1_kmajor_requested,
+                "ATLAS_E2M1_KMAJOR_M256=1 requires ATLAS_E2M1_KMAJOR=1"
+            );
+            if m >= E2M1_KMAJOR_M256_MIN_M {
+                ensure!(
+                    self.has_e2m1_kmajor_m256_runtime(),
+                    "ATLAS_E2M1_KMAJOR_M256=1 requires nvfp4_nvfp4_gemm_kmajor_m256 plus the M128 K-major runtime"
+                );
+            }
+        }
+        let kmajor_geometry_ready =
+            e2m1_kmajor_projection_shape(m, inter, h) && e2m1_kmajor_projection_shape(m, h, inter);
+        let selected_kernel =
+            e2m1_selected_kernel(e2m1_kmajor_requested, e2m1_kmajor_m256_requested, m);
+        let e2m1_runtime_ready = if e2m1_kmajor_requested {
+            self.has_e2m1_kmajor_runtime()
+                && self.has_transposed_ffn()
+                && kmajor_geometry_ready
+                && (selected_kernel != E2m1SelectedKernel::KmajorM256
+                    || self.has_e2m1_kmajor_m256_runtime())
+        } else {
+            self.has_e2m1_ffn()
+        };
+        let silu_quant_ready = !e2m1_silu_quant_requested
+            || (self.e2m1_checkpoint_scales.is_some()
+                && self.activation == FfnActivation::SiLU
+                && self.nvfp4_silu_quantize_k.0 != 0);
 
         // Per-shape E2M1 dispatch: gate/up stay on `w4a16_gemm_t_m128`,
         // down_proj routes through native E2M1 hardware MMA. Per the
@@ -2634,12 +4097,43 @@ impl DenseFfnLayer {
         // 1.31× faster via E2M1 MMA — net ~30% down savings with no
         // gate/up regression. Mutually exclusive with the all-three
         // `e2m1_fast_path`.
-        let e2m1_down_only_path = !e2m1_fast_path
-            && m >= 128
-            && crate::layers::prefill_ffn_e2m1_down_only_enabled()
-            && self.has_e2m1_ffn()
-            && self.has_transposed_ffn()
-            && self.w4a16_gemm_t_m128.0 != 0;
+        let e2m1_route = e2m1_prefill_route(
+            e2m1_full_requested,
+            e2m1_down_requested,
+            m >= 128,
+            e2m1_runtime_ready && silu_quant_ready,
+            e2m1_runtime_ready
+                && silu_quant_ready
+                && self.has_transposed_ffn()
+                && self.w4a16_gemm_t_m128.0 != 0,
+        );
+        let (e2m1_fast_path, e2m1_down_only_path) = match e2m1_route {
+            E2m1PrefillRoute::Complete(E2m1Scope::Full) => (true, false),
+            E2m1PrefillRoute::Complete(E2m1Scope::DownOnly) => (false, true),
+            E2m1PrefillRoute::Missing(E2m1Scope::Full) => {
+                bail!(
+                    "ATLAS_E2M1_GEMM=1 requires the complete selected W4A4 runtime before gate projection"
+                );
+            }
+            E2m1PrefillRoute::Missing(E2m1Scope::DownOnly) => {
+                bail!(
+                    "ATLAS_E2M1_GEMM_DOWN_ONLY=1 requires the complete selected W4A4 runtime plus transformed W4A16 M128 gate/up before gate projection"
+                );
+            }
+            E2m1PrefillRoute::Disabled | E2m1PrefillRoute::Ineligible => (false, false),
+        };
+        if let E2m1PrefillRoute::Complete(scope) = e2m1_route {
+            log_e2m1_route_once(E2m1RouteProof {
+                scope,
+                kernel: selected_kernel,
+                checkpoint_static: self.e2m1_checkpoint_scales.is_some(),
+                fused_silu_input: e2m1_silu_quant_requested,
+                activation: self.activation,
+                m,
+                h,
+                inter,
+            });
+        }
 
         // Large-M FP8 predequant fast path: route through the
         // `fp8_gemm_t_m128` kernel (BF16 A × pre-dequanted FP8 B) when:
@@ -2694,16 +4188,28 @@ impl DenseFfnLayer {
         //     128-row CTAs the same way the M_TILE=64 path wastes 64-row
         //     CTAs at M < 64)
         // Mirrors the attention `w4a16_gemm_m128_dispatch` pattern in
-        // `qwen3_attention/prefill_weights.rs:14`. Falls back to the
-        // standard M_TILE=64 `w4a16_gemm` when any condition fails.
-        let fast_path = !e2m1_fast_path
-            && !e2m1_down_only_path
-            && !fp8_fast_path
-            && !v2_fast_path
-            && m >= 128
-            && crate::layers::prefill_ffn_fast_enabled()
-            && self.has_transposed_ffn()
-            && self.w4a16_gemm_t_m128.0 != 0;
+        // `qwen3_attention/prefill_weights.rs:14`. Disabled or ineligible
+        // requests retain the lower-priority route. An eligible explicit
+        // request fails closed when any required weight/kernel is absent so
+        // a stale bundle cannot be mislabeled as a FAST benchmark.
+        let fast_shape_eligible =
+            !e2m1_fast_path && !e2m1_down_only_path && !fp8_fast_path && !v2_fast_path && m >= 128;
+        let fast_route = prefill_ffn_fast_route(
+            crate::layers::prefill_ffn_fast_enabled(),
+            fast_shape_eligible,
+            self.gate_proj_t.is_some() && self.up_proj_t.is_some() && self.down_proj_t.is_some(),
+            self.w4a16_gemm_t_m16.0 != 0,
+            self.w4a16_gemm_t_m128.0 != 0,
+        );
+        let fast_path = match fast_route {
+            PrefillFfnFastRoute::Complete => true,
+            PrefillFfnFastRoute::Missing => {
+                bail!(
+                    "ATLAS_PREFILL_FFN_FAST=1 requires transformed gate/up/down weights plus w4a16_gemm_t_m16 and w4a16_gemm_t_m128 before gate projection"
+                );
+            }
+            PrefillFfnFastRoute::Disabled | PrefillFfnFastRoute::Ineligible => false,
+        };
 
         // One-shot info log on first prefill so the bench harness can
         // verify which path is firing. The atomic ensures we log once
@@ -2717,6 +4223,8 @@ impl DenseFfnLayer {
             let has_t = self.has_transposed_ffn();
             let has_fp8 = self.has_fp8_ffn();
             let has_e2m1 = self.has_e2m1_ffn();
+            let has_e2m1_kmajor = self.has_e2m1_kmajor_runtime();
+            let has_e2m1_kmajor_m256 = self.has_e2m1_kmajor_m256_runtime();
             let m128_ok = self.w4a16_gemm_t_m128.0 != 0;
             let m128_v2_ok = self.w4a16_gemm_t_m128_v2.0 != 0;
             let fp8_m128_ok = self.fp8_gemm_t_m128_k.0 != 0;
@@ -2728,6 +4236,7 @@ impl DenseFfnLayer {
             let e2m1_gate_on = std::env::var("ATLAS_E2M1_GEMM").ok().as_deref() == Some("1");
             let e2m1_down_only_gate_on =
                 std::env::var("ATLAS_E2M1_GEMM_DOWN_ONLY").ok().as_deref() == Some("1");
+            let e2m1_static_scale_on = self.e2m1_checkpoint_scales.is_some();
             tracing::info!(
                 m,
                 inter,
@@ -2749,6 +4258,12 @@ impl DenseFfnLayer {
                 v2_gate = v2_gate_on,
                 e2m1_gate = e2m1_gate_on,
                 e2m1_down_only_gate = e2m1_down_only_gate_on,
+                e2m1_static_scale = e2m1_static_scale_on,
+                e2m1_kmajor_requested,
+                e2m1_kmajor_m256_requested,
+                e2m1_silu_quant_requested,
+                has_e2m1_kmajor,
+                has_e2m1_kmajor_m256,
                 "dense_ffn forward_prefill dispatch (one-shot)"
             );
             eprintln!(
@@ -2762,6 +4277,12 @@ impl DenseFfnLayer {
                  m128_v2_kernel={m128_v2_ok} m128_kernel={m128_ok} \
                  e2m1_gate=ATLAS_E2M1_GEMM={e2m1_gate_on} \
                  e2m1_down_only_gate=ATLAS_E2M1_GEMM_DOWN_ONLY={e2m1_down_only_gate_on} \
+                 e2m1_static_scale=ATLAS_E2M1_STATIC_SCALE={e2m1_static_scale_on} \
+                 e2m1_kmajor=ATLAS_E2M1_KMAJOR={e2m1_kmajor_requested} \
+                 e2m1_kmajor_m256=ATLAS_E2M1_KMAJOR_M256={e2m1_kmajor_m256_requested} \
+                 e2m1_silu_quant=ATLAS_E2M1_SILU_QUANT={e2m1_silu_quant_requested} \
+                 e2m1_kmajor_kernel={has_e2m1_kmajor} \
+                 e2m1_kmajor_m256_kernel={has_e2m1_kmajor_m256} \
                  gate=ATLAS_PREFILL_FFN_FAST={gate_on} \
                  fp8_gate=ATLAS_FFN_PREDEQUANT_FP8={fp8_gate_on} \
                  v2_gate=ATLAS_FFN_M128_V2={v2_gate_on}"
@@ -2769,60 +4290,109 @@ impl DenseFfnLayer {
         }
 
         if e2m1_fast_path {
+            let _scratch_use = self.lock_e2m1_use(stream)?;
             // Native W4A4 NVFP4×NVFP4 dispatch: prequant activations to
             // NVFP4 in-place, then issue the CUTLASS-style E2M1×E2M1 MMA
             // GEMM. Uses the standard `[N, K/2]` HuggingFace weight
             // layout (NOT the `nvfp4_t` transposed layout) — matches the
             // kernel's coalesced gmem read pattern.
             //
-            // gate_proj: [M, H] BF16 → [M, inter] BF16
-            self.forward_e2m1_proj(
+            // gate_proj and up_proj share the exact same [M, H] BF16 input.
+            // Prepare it once: the old path repeated an identical global
+            // absmax, D2H synchronization/readback, and quantization before
+            // each projection even though both consumed identical bytes.
+            let gate_up_scale = self.e2m1_checkpoint_scales.map(|scales| scales.gate_up);
+            let gate_weight = if e2m1_kmajor_requested {
+                self.gate_proj_t.as_ref().unwrap()
+            } else {
+                &self.weights.gate_proj
+            };
+            let up_weight = if e2m1_kmajor_requested {
+                self.up_proj_t.as_ref().unwrap()
+            } else {
+                &self.weights.up_proj
+            };
+            let down_weight = if e2m1_kmajor_requested {
+                self.down_proj_t.as_ref().unwrap()
+            } else {
+                &self.weights.down_proj
+            };
+            let (a_packed, a_scale, a_scale2) =
+                self.prepare_e2m1_input(ctx, input, m, h, gate_up_scale, stream)?;
+            self.forward_e2m1_prepared(
                 ctx,
-                input,
-                &self.weights.gate_proj,
+                a_packed,
+                a_scale,
+                a_scale2,
+                gate_weight,
                 gate_out,
                 m,
                 inter,
                 h,
+                e2m1_kmajor_requested,
                 stream,
             )?;
-            // up_proj: [M, H] BF16 → [M, inter] BF16
-            self.forward_e2m1_proj(
+            self.forward_e2m1_prepared(
                 ctx,
-                input,
-                &self.weights.up_proj,
+                a_packed,
+                a_scale,
+                a_scale2,
+                up_weight,
                 up_out,
                 m,
                 inter,
                 h,
-                stream,
-            )?;
-            // SiLU/GELU(gate) * up for all M tokens
-            ops::silu_mul(
-                ctx.gpu,
-                self.act_mul,
-                gate_out,
-                up_out,
-                gate_out,
-                m * inter,
+                e2m1_kmajor_requested,
                 stream,
             )?;
             // down_proj: [M, inter] BF16 → [M, H] BF16
             let output = ctx.buffers.moe_output();
-            self.forward_e2m1_proj(
-                ctx,
-                gate_out,
-                &self.weights.down_proj,
-                output,
-                m,
-                h,
-                inter,
-                stream,
-            )?;
+            if e2m1_silu_quant_requested {
+                let down_scale = self.e2m1_checkpoint_scales.unwrap().down;
+                let (a_packed, a_scale, a_scale2) = self
+                    .prepare_e2m1_silu_input(ctx, gate_out, up_out, m, inter, down_scale, stream)?;
+                self.forward_e2m1_prepared(
+                    ctx,
+                    a_packed,
+                    a_scale,
+                    a_scale2,
+                    down_weight,
+                    output,
+                    m,
+                    h,
+                    inter,
+                    e2m1_kmajor_requested,
+                    stream,
+                )?;
+            } else {
+                // SiLU/GELU(gate) * up for all M tokens
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    m * inter,
+                    stream,
+                )?;
+                self.forward_e2m1_proj(
+                    ctx,
+                    gate_out,
+                    down_weight,
+                    output,
+                    m,
+                    h,
+                    inter,
+                    self.e2m1_checkpoint_scales.map(|scales| scales.down),
+                    e2m1_kmajor_requested,
+                    stream,
+                )?;
+            }
             return Ok(());
         }
 
         if e2m1_down_only_path {
+            let _scratch_use = self.lock_e2m1_use(stream)?;
             // gate/up stay on the w4a16 m128 fast path; only down_proj
             // routes through E2M1 hardware MMA. Matches the shape table
             // documented at `prefill_ffn_e2m1_down_only_enabled` — net
@@ -2852,26 +4422,52 @@ impl DenseFfnLayer {
                 h,
                 stream,
             )?;
-            ops::silu_mul(
-                ctx.gpu,
-                self.act_mul,
-                gate_out,
-                up_out,
-                gate_out,
-                m * inter,
-                stream,
-            )?;
             let output = ctx.buffers.moe_output();
-            self.forward_e2m1_proj(
-                ctx,
-                gate_out,
-                &self.weights.down_proj,
-                output,
-                m,
-                h,
-                inter,
-                stream,
-            )?;
+            let down_weight = if e2m1_kmajor_requested {
+                self.down_proj_t.as_ref().unwrap()
+            } else {
+                &self.weights.down_proj
+            };
+            if e2m1_silu_quant_requested {
+                let down_scale = self.e2m1_checkpoint_scales.unwrap().down;
+                let (a_packed, a_scale, a_scale2) = self
+                    .prepare_e2m1_silu_input(ctx, gate_out, up_out, m, inter, down_scale, stream)?;
+                self.forward_e2m1_prepared(
+                    ctx,
+                    a_packed,
+                    a_scale,
+                    a_scale2,
+                    down_weight,
+                    output,
+                    m,
+                    h,
+                    inter,
+                    e2m1_kmajor_requested,
+                    stream,
+                )?;
+            } else {
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    m * inter,
+                    stream,
+                )?;
+                self.forward_e2m1_proj(
+                    ctx,
+                    gate_out,
+                    down_weight,
+                    output,
+                    m,
+                    h,
+                    inter,
+                    self.e2m1_checkpoint_scales.map(|scales| scales.down),
+                    e2m1_kmajor_requested,
+                    stream,
+                )?;
+            }
             return Ok(());
         }
 
@@ -3033,6 +4629,7 @@ impl DenseFfnLayer {
                 inter,
                 stream,
             )?;
+            log_prefill_ffn_fast_route_once(m, h, inter);
             return Ok(());
         }
 
@@ -3043,48 +4640,126 @@ impl DenseFfnLayer {
         // pipeline differs. Small-M prefills pay a latency-bound fixed cost
         // per layer on the baseline kernel (~8ms/layer at M=18); the pipe
         // kernel overlaps the stream and should land near the ~190 GB/s the
-        // verify-path kernels achieve. Default off; handle 0 falls back.
+        // verify-path kernels achieve. Default off; an eligible explicit
+        // request with handle 0 fails before launching the gate projection.
         // `w4a16_gemm_pipe` is byte-exact ONLY when the K reduction is a
         // multiple of its 64-row stage; a partial final stage would load past
         // the row's packed-weight boundary and silently corrupt output. The
         // FFN shapes (h=5120, inter=17408) satisfy this, but guard explicitly
         // so any future topology change falls back to the exact baseline.
-        if crate::layers::prefill_ffn_pipe_enabled()
-            && self.w4a16_gemm_pipe.0 != 0
-            && h.is_multiple_of(64)
-            && inter.is_multiple_of(64)
-        {
-            ops::w4a16_gemm_pipe(
-                ctx.gpu,
-                self.w4a16_gemm_pipe,
-                input,
-                &self.weights.gate_proj,
-                gate_out,
+        let pipe_requested = crate::layers::prefill_ffn_pipe_enabled();
+        let pipe_shape_eligible = h.is_multiple_of(64) && inter.is_multiple_of(64);
+        if pipe_requested && pipe_shape_eligible && self.w4a16_gemm_pipe.0 == 0 {
+            bail!(
+                "ATLAS_PREFILL_FFN_PIPE requested for an eligible shape but w4a16_gemm_pipe is missing"
+            );
+        }
+        let pipe_ready = pipe_requested && pipe_shape_eligible && self.w4a16_gemm_pipe.0 != 0;
+        let dual_route = prefill_fused_epilogue_route(
+            crate::layers::prefill_ffn_dual_fused_enabled()?,
+            pipe_ready,
+            self.w4a16_gemm_pipe_dual.0 != 0,
+            self.activation,
+            m,
+            h,
+            inter,
+        );
+        if dual_route == PrefillFusedEpilogueRoute::Missing {
+            bail!(
+                "ATLAS_PREFILL_FFN_DUAL_FUSED requested for an eligible shape but its parent pipe or dual kernel is missing"
+            );
+        }
+        let dual_fused = dual_route == PrefillFusedEpilogueRoute::Complete;
+        let fused_route = if dual_fused {
+            // Dual is authoritative when both explicit candidate flags are set.
+            PrefillFusedEpilogueRoute::Disabled
+        } else {
+            prefill_fused_epilogue_route(
+                crate::layers::prefill_ffn_fused_epilogue_enabled(),
+                pipe_ready,
+                self.w4a16_gemm_pipe_silu_mul.0 != 0,
+                self.activation,
                 m,
-                inter,
                 h,
-                stream,
-            )?;
-            ops::w4a16_gemm_pipe(
-                ctx.gpu,
-                self.w4a16_gemm_pipe,
-                input,
-                &self.weights.up_proj,
-                up_out,
-                m,
                 inter,
-                h,
-                stream,
-            )?;
-            ops::silu_mul(
-                ctx.gpu,
-                self.act_mul,
-                gate_out,
-                up_out,
-                gate_out,
-                m * inter,
-                stream,
-            )?;
+            )
+        };
+        if fused_route == PrefillFusedEpilogueRoute::Missing {
+            bail!(
+                "ATLAS_PREFILL_FFN_FUSED_EPILOGUE requested for an eligible shape but its parent pipe or fused kernel is missing"
+            );
+        }
+        let fused_epilogue = fused_route == PrefillFusedEpilogueRoute::Complete;
+
+        if pipe_ready {
+            if !dual_fused && fused_epilogue {
+                log_prefill_up_fused_route_once();
+            } else if !dual_fused {
+                log_prefill_pipe_route_once();
+            }
+            if dual_fused {
+                ops::w4a16_gemm_pipe_dual(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe_dual,
+                    input,
+                    &self.weights.gate_proj,
+                    &self.weights.up_proj,
+                    gate_out,
+                    DevicePtr::NULL,
+                    true,
+                    m,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                log_prefill_dual_fused_route_once();
+            } else {
+                ops::w4a16_gemm_pipe(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe,
+                    input,
+                    &self.weights.gate_proj,
+                    gate_out,
+                    m,
+                    inter,
+                    h,
+                    stream,
+                )?;
+            }
+            if !dual_fused && fused_epilogue {
+                ops::w4a16_gemm_pipe_silu_mul(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe_silu_mul,
+                    input,
+                    &self.weights.up_proj,
+                    gate_out,
+                    m,
+                    inter,
+                    h,
+                    stream,
+                )?;
+            } else if !dual_fused {
+                ops::w4a16_gemm_pipe(
+                    ctx.gpu,
+                    self.w4a16_gemm_pipe,
+                    input,
+                    &self.weights.up_proj,
+                    up_out,
+                    m,
+                    inter,
+                    h,
+                    stream,
+                )?;
+                ops::silu_mul(
+                    ctx.gpu,
+                    self.act_mul,
+                    gate_out,
+                    up_out,
+                    gate_out,
+                    m * inter,
+                    stream,
+                )?;
+            }
             let output = ctx.buffers.moe_output();
             ops::w4a16_gemm_pipe(
                 ctx.gpu,
@@ -3170,3 +4845,1045 @@ impl DenseFfnLayer {
 #[cfg(test)]
 #[path = "dense_ffn/exact_route_tests.rs"]
 mod exact_route_tests;
+
+#[cfg(test)]
+#[path = "dense_ffn/w3_route_tests.rs"]
+mod w3_route_tests;
+
+#[cfg(test)]
+mod flashinfer_merged_ffn_tests {
+    use super::{
+        FlashinferFfnPrefillRoute as Route, e2m1_scratch_layout, flashinfer_ffn_prefill_route,
+    };
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    use super::{
+        ensure_flashinfer_ffn_disjoint, flashinfer_ffn_activation_scale_extent,
+        flashinfer_ffn_extent,
+    };
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    use spark_runtime::gpu::{DevicePtr, KernelHandle, mock::MockGpuBackend};
+
+    #[test]
+    fn explicit_route_is_exact_and_missing_is_fail_closed() {
+        // `m_qualified` is now supplied by the caller (see the fn doc): the
+        // frozen pair 2079/8192 qualifies, 2080 does not.
+        let q = |m: u32| matches!(m, 2_079 | 8_192);
+        assert_eq!(
+            flashinfer_ffn_prefill_route(false, true, q(2_079), false),
+            Route::Disabled
+        );
+        assert_eq!(
+            flashinfer_ffn_prefill_route(true, false, q(2_079), true),
+            Route::Ineligible
+        );
+        assert_eq!(
+            flashinfer_ffn_prefill_route(true, true, q(2_080), false),
+            Route::Ineligible
+        );
+        for m in [2_079u32, 8_192] {
+            assert_eq!(
+                flashinfer_ffn_prefill_route(true, true, q(m), false),
+                Route::Missing
+            );
+            assert_eq!(
+                flashinfer_ffn_prefill_route(true, true, q(m), true),
+                Route::Complete
+            );
+        }
+    }
+
+    /// The extended ladder must stay OFF by default: with the env unset, an M
+    /// that is only in `QWEN38_FFN_EXTRA_M` must still be rejected, so default
+    /// behaviour is bit-for-bit the frozen table.
+    #[test]
+    fn extended_m_ladder_is_off_unless_requested() {
+        use crate::weight_map::flashinfer_ffn_admission::{
+            Qwen38FfnOperation, qwen38_ffn_extra_m_enabled, qwen38_ffn_launch_candidate,
+        };
+        if qwen38_ffn_extra_m_enabled() {
+            return; // caller opted in; the negative assertion does not apply
+        }
+        for m in [1_024usize, 2_048, 4_096, 6_144, 7_168, 8_187] {
+            assert!(
+                qwen38_ffn_launch_candidate(Qwen38FfnOperation::MergedGateUp, m).is_err(),
+                "M={m} must be unqualified while ATLAS_FLASHINFER_FFN_EXTRA_M is unset"
+            );
+        }
+    }
+
+    #[test]
+    fn construction_scratch_layout_matches_the_charged_maximum() {
+        let layout = e2m1_scratch_layout(8_192, 17_408).unwrap();
+        assert_eq!(layout.cap_m, 8_192);
+        assert_eq!(layout.cap_k, 17_408);
+        assert_eq!(layout.packed_bytes, 71_303_168);
+        assert_eq!(layout.scale_bytes, 8_912_896);
+        assert_eq!(layout.max_bytes, 4);
+        assert_eq!(
+            layout.packed_bytes + layout.scale_bytes + layout.max_bytes,
+            80_216_068
+        );
+        assert!(e2m1_scratch_layout(usize::MAX, 17_408).is_err());
+        assert!(e2m1_scratch_layout(8_192, usize::MAX - 15).is_err());
+    }
+
+    #[test]
+    fn production_order_preflights_then_merges_directly_quantizes_and_completes_down() {
+        let source = include_str!("dense_ffn.rs");
+        let start = source
+            .find("fn try_forward_flashinfer_prefill(")
+            .expect("FlashInfer FFN runtime route");
+        let end = source[start..]
+            .find("/// Install W3")
+            .map(|offset| start + offset)
+            .expect("FlashInfer FFN runtime boundary");
+        let body = &source[start..end];
+
+        let missing = body.find("FlashinferFfnPrefillRoute::Missing").unwrap();
+        let down_preflight = body.find("let mut down_launch").unwrap();
+        let scratch_guard = body.find("self.lock_e2m1_use(stream)").unwrap();
+        let physical_scale_extent = body
+            .find("flashinfer_ffn_activation_scale_extent(rows, QWEN38_INTERMEDIATE)")
+            .unwrap();
+        let quantize = body
+            .find("ops::quantize_bf16_to_nvfp4_atlas_128x4(")
+            .unwrap();
+        let merged = body.find("merged_launch.launch_eager(").unwrap();
+        let direct_silu_quantize = body
+            .find("ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(")
+            .unwrap();
+        let down = body.find("down_launch.launch_eager(").unwrap();
+        let receipt = body.find("log_flashinfer_ffn_success(").unwrap();
+        assert!(
+            missing < physical_scale_extent
+                && physical_scale_extent < down_preflight
+                && down_preflight < scratch_guard
+                && scratch_guard < quantize
+        );
+        assert!(quantize < merged && merged < direct_silu_quantize && direct_silu_quantize < down);
+        assert!(down < receipt);
+        assert!(!body.contains("ops::silu_mul("));
+        assert!(!body.contains("KernelLaunch::new(ctx.gpu, route.split_gate_up_k)"));
+        assert!(!body.contains("ops::quantize_silu_mul_bf16_to_nvfp4_atlas_128x4("));
+        assert!(body.contains("f32::from_bits(route.down.input_scale_bits)"));
+        assert!(body.contains("ctx.buffers.sizes().ffn_gate_up_bf16 >= merged_bytes"));
+        assert!(body.contains("ctx.buffers.ffn_gate_up_bf16()"));
+        assert!(!body.contains("Qwen38FfnOperation::Gate, m as usize"));
+        assert!(!body.contains("Qwen38FfnOperation::Up, m as usize"));
+        assert!(!body.contains("route.stream"));
+        assert!(body.contains("prepare_borrowed_zero_workspace(ctx.gpu, merged_shape, stream)"));
+        assert!(body.contains("prepare_borrowed_zero_workspace(ctx.gpu, down_shape, stream)"));
+    }
+
+    #[test]
+    fn construction_stream_is_preflight_only_and_runtime_owns_launch_stream() {
+        let source = include_str!("dense_ffn.rs");
+        let struct_start = source.find("struct FlashinferFfnPrefill {").unwrap();
+        let struct_end = source[struct_start..]
+            .find("\n}")
+            .map(|offset| struct_start + offset)
+            .unwrap();
+        assert!(!source[struct_start..struct_end].contains("stream: u64"));
+
+        let prepare_start = source.find("pub fn prepare_flashinfer_prefill(").unwrap();
+        let runtime_start = source.find("fn try_forward_flashinfer_prefill(").unwrap();
+        let prepare = &source[prepare_start..runtime_start];
+        assert!(prepare.contains("let stream = gpu.default_stream();"));
+        assert!(!prepare.contains("stream,\n        });"));
+
+        let runtime_end = source[runtime_start..]
+            .find("/// Install W3")
+            .map(|offset| runtime_start + offset)
+            .unwrap();
+        let runtime = &source[runtime_start..runtime_end];
+        assert!(!runtime.contains("stream == route.stream"));
+        assert!(runtime.contains("self.lock_e2m1_use(stream)"));
+
+        let lock_start = source.find("fn lock_e2m1_use(").unwrap();
+        let lock_end = source[lock_start..]
+            .find("/// Quantize one BF16 activation matrix")
+            .map(|offset| lock_start + offset)
+            .unwrap();
+        let lock = &source[lock_start..lock_end];
+        assert!(lock.contains(".e2m1_use_stream"));
+        assert!(lock.contains(".lock()"));
+        assert!(lock.contains(".map_err("));
+        assert!(!lock.contains(".unwrap()"));
+    }
+
+    #[test]
+    fn split_kernel_is_exact_row_major_gate_then_up() {
+        let cuda = include_str!("../../../../kernels/gb10/common/flashinfer_projection_split.cu");
+        let start = cuda
+            .find("void flashinfer_projection_split_ffn_gate_up(")
+            .expect("merged FFN split kernel");
+        let body = &cuda[start..];
+        assert!(body.contains("constexpr uint32_t INTERMEDIATE = 17408"));
+        assert!(body.contains("constexpr uint32_t TOTAL = 2 * INTERMEDIATE"));
+        assert!(body.contains("merged + row * TOTAL"));
+        assert!(body.contains("gate_dst[vector] = src[vector]"));
+        assert!(body.contains("up_dst[vector] = src[VECTORS + vector]"));
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn physical_activation_scale_extent_is_exact_for_qualified_rows() {
+        assert_eq!(
+            flashinfer_ffn_activation_scale_extent(2_079, 17_408).unwrap(),
+            2_367_488
+        );
+        assert_eq!(
+            flashinfer_ffn_activation_scale_extent(8_192, 17_408).unwrap(),
+            8_912_896
+        );
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn physical_activation_scale_extent_rejects_padding_overflow() {
+        assert!(flashinfer_ffn_activation_scale_extent(usize::MAX, 17_408).is_err());
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn physical_tail_overlap_is_rejected_before_launch() {
+        let rows = 2_079;
+        let cols = 17_408;
+        let logical_bytes = flashinfer_ffn_extent(rows, cols / 16, 1).unwrap();
+        let physical_bytes = flashinfer_ffn_activation_scale_extent(rows, cols).unwrap();
+        assert_eq!(physical_bytes - logical_bytes, 105_536);
+
+        let scales = DevicePtr(0x1_0000);
+        let destination = DevicePtr(scales.0 + u64::try_from(logical_bytes).unwrap());
+        assert!(
+            ensure_flashinfer_ffn_disjoint(scales, logical_bytes, destination, 16).is_ok(),
+            "the hostile destination begins exactly after the logical prefix"
+        );
+        assert!(
+            ensure_flashinfer_ffn_disjoint(scales, physical_bytes, destination, 16).is_err(),
+            "the padded physical tail must reject the same destination before launch"
+        );
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn fused_physical_wrapper_accepts_exact_rows_and_rejects_hostile_inputs_before_launch() {
+        let gpu = MockGpuBackend::new();
+        let gate = DevicePtr(0x0010_0000);
+        let up = DevicePtr(0x1000_0000);
+        let packed = DevicePtr(0x2000_0000);
+        let scales = DevicePtr(0x3000_0000);
+        for rows in [2_079, 8_192] {
+            super::ops::quantize_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                &gpu,
+                KernelHandle(0x55),
+                gate,
+                up,
+                packed,
+                scales,
+                0.25,
+                rows,
+                17_408,
+                0x77,
+            )
+            .unwrap();
+        }
+        assert_eq!(gpu.launch_count(), 2);
+
+        for (kernel, gate, up, packed, scales, scale2, rows, cols) in [
+            (
+                KernelHandle(0),
+                gate,
+                up,
+                packed,
+                scales,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                DevicePtr::NULL,
+                up,
+                packed,
+                scales,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                gate,
+                DevicePtr::NULL,
+                packed,
+                scales,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                gate,
+                up,
+                DevicePtr::NULL,
+                scales,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                gate,
+                up,
+                packed,
+                DevicePtr::NULL,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                gate,
+                up,
+                packed,
+                scales,
+                f32::NAN,
+                2_079,
+                17_408,
+            ),
+            (KernelHandle(1), gate, up, packed, scales, 0.25, 0, 17_408),
+            (KernelHandle(1), gate, up, packed, scales, 0.25, 2_079, 16),
+            (
+                KernelHandle(1),
+                gate,
+                up,
+                packed,
+                scales,
+                0.25,
+                u32::MAX,
+                17_408,
+            ),
+        ] {
+            assert!(
+                super::ops::quantize_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                    &gpu, kernel, gate, up, packed, scales, scale2, rows, cols, 0x77,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(gpu.launch_count(), 2);
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn direct_merged_wrapper_is_abi_separate_and_fails_before_launch() {
+        let gpu = MockGpuBackend::new();
+        let merged = DevicePtr(0x0010_0000);
+        let packed = DevicePtr(0x2000_0000);
+        let scales = DevicePtr(0x3000_0000);
+        for rows in [2_079, 8_192] {
+            super::ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                &gpu,
+                KernelHandle(0x66),
+                merged,
+                packed,
+                scales,
+                0.25,
+                rows,
+                17_408,
+                0x77,
+            )
+            .unwrap();
+        }
+        assert_eq!(gpu.launch_count(), 2);
+
+        for (kernel, merged, packed, scales, scale2, rows, cols) in [
+            (KernelHandle(0), merged, packed, scales, 0.25, 2_079, 17_408),
+            (
+                KernelHandle(1),
+                DevicePtr::NULL,
+                packed,
+                scales,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                merged,
+                DevicePtr::NULL,
+                scales,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                merged,
+                packed,
+                DevicePtr::NULL,
+                0.25,
+                2_079,
+                17_408,
+            ),
+            (
+                KernelHandle(1),
+                merged,
+                packed,
+                scales,
+                f32::NAN,
+                2_079,
+                17_408,
+            ),
+            (KernelHandle(1), merged, packed, scales, 0.25, 0, 17_408),
+            (KernelHandle(1), merged, packed, scales, 0.25, 2_079, 16),
+            (
+                KernelHandle(1),
+                merged,
+                packed,
+                scales,
+                0.25,
+                u32::MAX,
+                17_408,
+            ),
+        ] {
+            assert!(
+                super::ops::quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+                    &gpu, kernel, merged, packed, scales, scale2, rows, cols, 0x77,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(gpu.launch_count(), 2);
+    }
+
+    #[test]
+    fn fused_physical_symbol_layout_abi_handle_and_receipt_are_source_bound() {
+        let cuda = include_str!("../../../../kernels/gb10/common/quantize_bf16_to_nvfp4.cu");
+        let logical = cuda
+            .find("void quantize_silu_mul_bf16_to_nvfp4(")
+            .expect("existing logical W4A4 fused symbol");
+        let physical = cuda
+            .find("void quantize_silu_mul_bf16_to_nvfp4_atlas_128x4(")
+            .expect("ABI-separated physical fused symbol");
+        assert!(logical < physical);
+        let physical_body = &cuda[physical..];
+        assert!(physical_body.contains("((N + 127u) / 128u) * 128u"));
+        assert!(physical_body.contains("if (row >= N)"));
+        assert!(physical_body.contains("silu_scale_offset_128x4(row, group, num_groups)] = 0"));
+        assert!(physical_body.contains("silu_mul_bf16_round(gate, up"));
+        assert!(physical_body.contains("float_to_fp8_e4m3(fp8_float)"));
+        assert!(physical_body.contains("quantize_e2m1(v0)"));
+
+        let direct = cuda
+            .find("void quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(")
+            .expect("ABI-separated direct merged physical symbol");
+        assert!(physical < direct);
+        let direct_body = &cuda[direct..];
+        assert!(direct_body.contains("static_cast<unsigned long long>(row) * (2ull * K)"));
+        assert!(direct_body.contains("const __nv_bfloat16* up = gate + K"));
+        assert!(direct_body.contains("float rounded[GROUP_SIZE]"));
+        assert_eq!(
+            direct_body.matches("silu_mul_bf16_round(gate, up").count(),
+            1
+        );
+        assert!(direct_body.contains("rounded[i] = value"));
+        assert!(direct_body.contains("quantize_e2m1(rounded[i] * inv_eff)"));
+        assert!(direct_body.contains("silu_scale_offset_128x4(row, group, num_groups)] = 0"));
+
+        let wrapper_source = include_str!("ops/gemm_dense.rs");
+        let wrapper_start = wrapper_source
+            .find("pub fn quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(")
+            .expect("direct merged physical Rust wrapper");
+        let wrapper_end = wrapper_source[wrapper_start..]
+            .find("/// Native NVFP4")
+            .map(|offset| wrapper_start + offset)
+            .expect("physical fused Rust wrapper boundary");
+        let wrapper = &wrapper_source[wrapper_start..wrapper_end];
+        let merged = wrapper.find(".arg_ptr(merged_gate_up)").unwrap();
+        let packed = wrapper.find(".arg_ptr(packed_out)").unwrap();
+        let scales = wrapper.find(".arg_ptr(scale_out)").unwrap();
+        let scale2 = wrapper.find(".arg_f32(scale2)").unwrap();
+        let rows = wrapper.find(".arg_u32(rows)").unwrap();
+        let cols = wrapper.find(".arg_u32(cols)").unwrap();
+        assert!(merged < packed && packed < scales && scales < scale2);
+        assert!(scale2 < rows && rows < cols);
+        assert!(wrapper.contains("cols >= 64 && cols.is_multiple_of(64)"));
+        assert!(wrapper.contains(".checked_add(127)"));
+        assert!(wrapper.contains(".grid([padded_rows.min(96), 1, 1])"));
+
+        let source = include_str!("dense_ffn.rs");
+        let prepare_start = source.find("pub fn prepare_flashinfer_prefill(").unwrap();
+        let prepare_end = source[prepare_start..]
+            .find("fn try_forward_flashinfer_prefill(")
+            .map(|offset| prepare_start + offset)
+            .unwrap();
+        let prepare = &source[prepare_start..prepare_end];
+        let symbol = prepare
+            .find("\"quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4\"")
+            .unwrap();
+        let nonzero = prepare
+            .find("quantize_merged_silu_atlas_128x4_k.0 != 0")
+            .unwrap();
+        let plan_freeze = prepare.find("for (operation, m) in [").unwrap();
+        let scratch_preallocation = prepare
+            .find("e2m1_scratch_layout(8_192, intermediate)")
+            .unwrap();
+        let scratch_capacity_check = prepare
+            .find("retained.cap_m == scratch_layout.cap_m")
+            .unwrap();
+        let retained_copy = prepare.find("build_flashinfer_merged_gate_up(").unwrap();
+        let route_retention = prepare.find("self.flashinfer_ffn_prefill = Some(").unwrap();
+        assert!(
+            symbol < nonzero
+                && nonzero < plan_freeze
+                && plan_freeze < scratch_preallocation
+                && scratch_preallocation < scratch_capacity_check
+                && scratch_capacity_check < retained_copy
+                && retained_copy < route_retention
+        );
+        assert!(prepare.contains("\"quantize_nvfp4\""));
+        assert!(prepare.contains("quantize_merged_silu_atlas_128x4_k,"));
+        assert!(!prepare.contains("\"flashinfer_projection_split\""));
+    }
+}
+
+#[cfg(test)]
+mod prefill_ffn_fast_route_tests {
+    use super::{PrefillFfnFastRoute as Route, prefill_ffn_fast_route};
+
+    #[test]
+    fn distinguishes_disabled_ineligible_complete_and_every_missing_dependency() {
+        assert_eq!(
+            prefill_ffn_fast_route(false, true, true, true, true),
+            Route::Disabled
+        );
+        assert_eq!(
+            prefill_ffn_fast_route(true, false, false, false, false),
+            Route::Ineligible
+        );
+        assert_eq!(
+            prefill_ffn_fast_route(true, true, true, true, true),
+            Route::Complete
+        );
+        for readiness in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert_eq!(
+                prefill_ffn_fast_route(true, true, readiness.0, readiness.1, readiness.2),
+                Route::Missing
+            );
+        }
+    }
+
+    #[test]
+    fn missing_fails_before_projection_and_marker_follows_completed_down_projection() {
+        let source = include_str!("dense_ffn.rs");
+        let select = source.find("let fast_route =").expect("FAST selector");
+        let branch = source[select..]
+            .find("if fast_path {")
+            .map(|offset| select + offset)
+            .expect("FAST projection branch");
+        let selection = &source[select..branch];
+        assert!(selection.contains("PrefillFfnFastRoute::Missing"));
+        assert!(selection.contains("before gate projection"));
+
+        let end = source[branch..]
+            .find("// Byte-exact cp.async pipelined path")
+            .map(|offset| branch + offset)
+            .expect("FAST projection boundary");
+        let body = &source[branch..end];
+        let down = body
+            .rfind("ops::w4a16_gemm_n128_m128(")
+            .expect("FAST down projection");
+        let marker = body
+            .find("log_prefill_ffn_fast_route_once(m, h, inter);")
+            .expect("FAST completion marker");
+        let returned = body.rfind("return Ok(());").expect("FAST return");
+        assert!(down < marker && marker < returned);
+        assert!(source.contains(
+            "ENGAGED ATLAS_PREFILL_FFN_FAST: approximate transposed M128 route complete"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod prefill_fused_epilogue_tests {
+    use super::{FfnActivation, PrefillFusedEpilogueRoute, prefill_fused_epilogue_route};
+
+    #[test]
+    fn route_distinguishes_disabled_ineligible_complete_and_missing() {
+        assert_eq!(
+            prefill_fused_epilogue_route(false, true, true, FfnActivation::SiLU, 8192, 5120, 17408,),
+            PrefillFusedEpilogueRoute::Disabled
+        );
+        for (activation, m, h, inter) in [
+            (FfnActivation::GeLU, 8192, 5120, 17408),
+            (FfnActivation::SiLU, 32, 5120, 17408),
+            (FfnActivation::SiLU, 8192, 5119, 17408),
+            (FfnActivation::SiLU, 8192, 5120, 17407),
+        ] {
+            assert_eq!(
+                prefill_fused_epilogue_route(true, true, true, activation, m, h, inter),
+                PrefillFusedEpilogueRoute::Ineligible
+            );
+        }
+        assert_eq!(
+            prefill_fused_epilogue_route(true, true, true, FfnActivation::SiLU, 33, 5120, 17408,),
+            PrefillFusedEpilogueRoute::Complete
+        );
+        assert_eq!(
+            prefill_fused_epilogue_route(true, false, true, FfnActivation::SiLU, 8192, 5120, 17408,),
+            PrefillFusedEpilogueRoute::Missing
+        );
+        assert_eq!(
+            prefill_fused_epilogue_route(true, true, false, FfnActivation::SiLU, 8192, 5120, 17408,),
+            PrefillFusedEpilogueRoute::Missing
+        );
+    }
+
+    #[test]
+    fn source_fails_before_projection_and_logs_each_engaged_route() {
+        let source = include_str!("dense_ffn.rs");
+        let dispatch_start = source.find("let pipe_requested =").unwrap();
+        let dispatch_end = source[dispatch_start..]
+            .find("// Baseline M_TILE=64 path")
+            .map(|offset| dispatch_start + offset)
+            .unwrap();
+        let dispatch = &source[dispatch_start..dispatch_end];
+        assert!(dispatch.contains(
+            "ATLAS_PREFILL_FFN_PIPE requested for an eligible shape but w4a16_gemm_pipe is missing"
+        ));
+        assert!(dispatch.contains(
+            "ATLAS_PREFILL_FFN_DUAL_FUSED requested for an eligible shape but its parent pipe or dual kernel is missing"
+        ));
+        assert!(dispatch.contains(
+            "ATLAS_PREFILL_FFN_FUSED_EPILOGUE requested for an eligible shape but its parent pipe or fused kernel is missing"
+        ));
+        assert!(
+            dispatch.contains("Dual is authoritative when both explicit candidate flags are set")
+        );
+        let log_start = source.find("fn log_prefill_pipe_route_once").unwrap();
+        let log_end = source[log_start..]
+            .find("enum ExactFfnDispatch")
+            .map(|offset| log_start + offset)
+            .unwrap();
+        let loggers = &source[log_start..log_end];
+        assert!(loggers.contains("ENGAGED ATLAS_PREFILL_FFN_PIPE"));
+        assert!(loggers.contains("ENGAGED ATLAS_PREFILL_FFN_FUSED_EPILOGUE"));
+        assert!(loggers.contains("ENGAGED ATLAS_PREFILL_FFN_DUAL_FUSED"));
+
+        let dual_launch = dispatch.find("ops::w4a16_gemm_pipe_dual(").unwrap();
+        let dual_marker = dispatch
+            .find("log_prefill_dual_fused_route_once();")
+            .unwrap();
+        assert!(dual_launch < dual_marker);
+    }
+
+    #[test]
+    fn legacy_boolean_silent_fallback_is_absent() {
+        let source = include_str!("dense_ffn.rs");
+        let legacy_name = ["fn use_prefill", "_fused_epilogue("].concat();
+        assert!(!source.contains(&legacy_name));
+    }
+
+    #[test]
+    fn cuda_source_retains_bf16_round_trip_and_in_place_abi() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/qwen3.8-27b/nvfp4/w4a16_gemm.cu"
+        ));
+        let start = source
+            .find("extern \"C\" __global__ void w4a16_gemm_pipe_silu_mul")
+            .expect("fused prefill epilogue kernel is missing");
+        let body = &source[start..];
+        assert!(body.contains("__nv_bfloat16 up_bf16 = __float2bfloat16(value)"));
+        assert!(body.contains("float u = __bfloat162float(up_bf16)"));
+        assert!(body.contains("float g = __bfloat162float(gate_in_out[out_idx])"));
+        assert!(body.contains("gate_in_out[out_idx] = __float2bfloat16(g * sigmoid_g * u)"));
+    }
+
+    #[test]
+    fn dual_cuda_source_retains_both_bf16_round_trips_and_independent_weights() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../kernels/gb10/qwen3.8-27b/nvfp4/w4a16_gemm.cu"
+        ));
+        let start = source
+            .find("extern \"C\" __global__ void w4a16_gemm_pipe_dual")
+            .expect("dual fused prefill kernel is missing");
+        let body = &source[start..];
+        assert!(body.contains("const unsigned char* __restrict__ gate_packed"));
+        assert!(body.contains("const unsigned char* __restrict__ up_packed"));
+        assert!(body.contains("__nv_bfloat16* C1"));
+        assert!(body.contains("if (fuse_silu != 0)"));
+        assert!(body.contains("__bfloat162float(__float2bfloat16(gate_value))"));
+        assert!(body.contains("__bfloat162float(__float2bfloat16(up_value))"));
+        assert!(body.contains("__float2bfloat16(g * sigmoid_g * u)"));
+        assert!(body.contains("C0[out_idx] = __float2bfloat16(g)"));
+        assert!(body.contains("C1[out_idx] = __float2bfloat16(u)"));
+    }
+
+    #[test]
+    fn dual_rust_abi_matches_cuda_and_fused_call_uses_null_second_output() {
+        let ops = include_str!("ops/gemm_dense.rs");
+        let start = ops
+            .find("pub fn w4a16_gemm_pipe_dual(")
+            .expect("dual Rust launcher is missing");
+        let body = &ops[start..];
+        let ordered = [
+            ".arg_ptr(input)",
+            ".arg_ptr(gate.weight)",
+            ".arg_ptr(gate.weight_scale)",
+            ".arg_f32(gate.weight_scale_2)",
+            ".arg_ptr(up.weight)",
+            ".arg_ptr(up.weight_scale)",
+            ".arg_f32(up.weight_scale_2)",
+            ".arg_ptr(output_first)",
+            ".arg_ptr(output_second)",
+            ".arg_u32(u32::from(fuse_silu))",
+            ".arg_u32(m)",
+            ".arg_u32(n)",
+            ".arg_u32(k)",
+        ];
+        let mut cursor = 0;
+        for argument in ordered {
+            let relative = body[cursor..]
+                .find(argument)
+                .unwrap_or_else(|| panic!("missing or misordered dual argument {argument}"));
+            cursor += relative + argument.len();
+        }
+
+        let host = include_str!("dense_ffn.rs");
+        let dispatch_start = host.find("let pipe_requested =").unwrap();
+        let dispatch = &host[dispatch_start..];
+        let call = dispatch.find("ops::w4a16_gemm_pipe_dual(").unwrap();
+        let call_body = &dispatch[call..];
+        let null_output = call_body.find("DevicePtr::NULL").unwrap();
+        let fused = call_body.find("true,").unwrap();
+        let launch_end = call_body.find(")?;").unwrap();
+        assert!(null_output < fused && fused < launch_end);
+    }
+}
+
+#[cfg(test)]
+mod e2m1_prefill_reuse_tests {
+    use super::{
+        E2M1_KMAJOR_M256_MIN_M, E2m1KmajorKernel, E2m1PrefillRoute, E2m1Scope, E2m1SelectedKernel,
+        e2m1_kmajor_kernel, e2m1_kmajor_projection_shape, e2m1_prefill_route, e2m1_selected_kernel,
+        validated_e2m1_checkpoint_scales,
+    };
+
+    #[test]
+    fn base_w4a4_selector_is_full_authoritative_and_fail_closed() {
+        assert_eq!(
+            e2m1_prefill_route(false, false, true, false, false),
+            E2m1PrefillRoute::Disabled
+        );
+        assert_eq!(
+            e2m1_prefill_route(true, false, false, false, false),
+            E2m1PrefillRoute::Ineligible
+        );
+        assert_eq!(
+            e2m1_prefill_route(true, false, true, true, false),
+            E2m1PrefillRoute::Complete(E2m1Scope::Full)
+        );
+        assert_eq!(
+            e2m1_prefill_route(false, true, true, false, true),
+            E2m1PrefillRoute::Complete(E2m1Scope::DownOnly)
+        );
+        assert_eq!(
+            e2m1_prefill_route(true, false, true, false, true),
+            E2m1PrefillRoute::Missing(E2m1Scope::Full)
+        );
+        assert_eq!(
+            e2m1_prefill_route(false, true, true, true, false),
+            E2m1PrefillRoute::Missing(E2m1Scope::DownOnly)
+        );
+        assert_eq!(
+            e2m1_prefill_route(true, true, true, false, true),
+            E2m1PrefillRoute::Missing(E2m1Scope::Full),
+            "full must never downgrade to a ready down-only route"
+        );
+    }
+
+    #[test]
+    fn selected_w4a4_kernel_names_the_actual_m2048_boundary() {
+        assert_eq!(
+            e2m1_selected_kernel(false, true, 8192),
+            E2m1SelectedKernel::RowMajorM64
+        );
+        assert_eq!(
+            e2m1_selected_kernel(true, true, 2047),
+            E2m1SelectedKernel::KmajorM128
+        );
+        assert_eq!(
+            e2m1_selected_kernel(true, true, 2048),
+            E2m1SelectedKernel::KmajorM256
+        );
+        assert_eq!(
+            e2m1_selected_kernel(true, false, 8192),
+            E2m1SelectedKernel::KmajorM128
+        );
+    }
+
+    #[test]
+    fn base_w4a4_missing_route_precedes_projection_and_marker_is_actual_only() {
+        let source = include_str!("dense_ffn.rs");
+        let select = source.find("let e2m1_route =").expect("W4A4 selector");
+        let projection = source[select..]
+            .find("if e2m1_fast_path {")
+            .map(|offset| select + offset)
+            .expect("W4A4 projection");
+        let selection = &source[select..projection];
+        assert!(selection.contains("E2m1PrefillRoute::Missing(E2m1Scope::Full)"));
+        assert!(selection.contains("E2m1PrefillRoute::Missing(E2m1Scope::DownOnly)"));
+        assert!(selection.contains("before gate projection"));
+
+        let log_start = source.find("fn log_e2m1_route_once").expect("W4A4 logger");
+        // Inspect this logger, not unrelated helpers inserted after it.
+        // Inner blocks are indented; this is its top-level closing brace.
+        let log_end = source[log_start..]
+            .find("\n}\n")
+            .map(|offset| log_start + offset + 3)
+            .expect("W4A4 logger boundary");
+        let logger = &source[log_start..log_end];
+        assert!(logger.contains("ENGAGED ATLAS_E2M1_PREFILL"));
+        for field in [
+            "scope={scope}",
+            "gate_up={gate_up}",
+            "e2m1_kernel={kernel}",
+            "activation_scale={activation_scale}",
+            "down_input={down_input}",
+            "activation={activation}",
+            "M={}",
+            "H={}",
+            "intermediate={}",
+        ] {
+            assert!(logger.contains(field), "missing actual field {field}");
+        }
+        assert!(!logger.contains("requested"));
+        assert!(!logger.contains("has_e2m1"));
+    }
+
+    #[test]
+    fn kmajor_m128_accepts_only_native_ffn_tile_geometry() {
+        assert!(e2m1_kmajor_projection_shape(8192, 17408, 5120));
+        assert!(e2m1_kmajor_projection_shape(8192, 5120, 17408));
+        assert!(!e2m1_kmajor_projection_shape(127, 17408, 5120));
+        assert!(!e2m1_kmajor_projection_shape(128, 17409, 5120));
+        assert!(!e2m1_kmajor_projection_shape(128, 17408, 5119));
+    }
+
+    #[test]
+    fn kmajor_kernel_stages_transformed_weights_for_eight_row_warps() {
+        let source =
+            include_str!("../../../../kernels/gb10/qwen3.8-27b/nvfp4/cutlass_nvfp4_gemm.cu");
+        let start = source
+            .find("void nvfp4_nvfp4_gemm_kmajor_m128(")
+            .expect("K-major W4A4 kernel is missing");
+        let end = source[start..]
+            .find("// K-major M256 shadow.")
+            .map(|offset| start + offset)
+            .expect("K-major kernel boundary is missing");
+        let body = &source[start..end];
+
+        assert!(source.contains("__launch_bounds__(256)\nvoid nvfp4_nvfp4_gemm_kmajor_m128"));
+        assert!(body.contains("const unsigned char* __restrict__ B_packed_t"));
+        assert!(body.contains("const unsigned char* __restrict__ B_scale_t"));
+        assert!(body.contains("B_packed_t[(unsigned long long)gk_byte * N + gn]"));
+        assert!(body.contains("B_scale_t[(unsigned long long)gg * N + gn]"));
+        assert!(body.contains("smem_Bp_km[2][N_TILE_LG][K_STEP / 2]"));
+        assert!(body.contains("smem_Bs_km[2][N_TILE_LG][K_STEP / GROUP_SIZE]"));
+        assert!(body.contains("warp_m_offset = warp_id * 16"));
+        assert!(body.contains("mma.sync.aligned.kind::mxf4nvf4.block_scale"));
+        assert!(body.contains("acc[nt][0] * scale2_ab"));
+        assert_eq!(body.matches("__syncthreads();").count(), 2);
+    }
+
+    #[test]
+    fn kmajor_m256_routes_only_at_the_saturated_long_prefill_threshold() {
+        assert_eq!(E2M1_KMAJOR_M256_MIN_M, 2048);
+        for m in [0, 127, 128, 256, 1024, 2047] {
+            assert_eq!(e2m1_kmajor_kernel(m, true), E2m1KmajorKernel::M128);
+        }
+        for m in [2048, 2049, 8192, u32::MAX] {
+            assert_eq!(e2m1_kmajor_kernel(m, true), E2m1KmajorKernel::M256);
+            assert_eq!(e2m1_kmajor_kernel(m, false), E2m1KmajorKernel::M128);
+        }
+    }
+
+    #[test]
+    fn kmajor_m256_reuses_one_weight_tile_across_sixteen_row_warps() {
+        let source =
+            include_str!("../../../../kernels/gb10/qwen3.8-27b/nvfp4/cutlass_nvfp4_gemm.cu");
+        let start = source
+            .find("void nvfp4_nvfp4_gemm_kmajor_m256(")
+            .expect("K-major M256 W4A4 kernel is missing");
+        let end = source[start..]
+            .find("// FIX PATH 3 LANDED")
+            .map(|offset| start + offset)
+            .expect("K-major M256 kernel boundary is missing");
+        let body = &source[start..end];
+
+        assert!(source.contains("__launch_bounds__(512, 1)\nvoid nvfp4_nvfp4_gemm_kmajor_m256"));
+        assert!(body.contains("cta_m = blockIdx.y * 256u"));
+        assert!(body.contains("smem_Ap_km256[2][256][K_STEP / 2]"));
+        assert!(body.contains("smem_Bp_km256[2][N_TILE_LG][K_STEP / 2]"));
+        assert!(body.contains("smem_Bs_km256[2][N_TILE_LG][K_STEP / GROUP_SIZE]"));
+        assert!(body.contains("if (threadIdx.x < 256)"));
+        assert!(body.contains("warp_m_offset = warp_id * 16"));
+        assert!(body.contains("B_packed_t[(unsigned long long)gk_byte * N + gn]"));
+        assert!(body.contains("B_scale_t[(unsigned long long)gg * N + gn]"));
+        assert!(body.contains("mma.sync.aligned.kind::mxf4nvf4.block_scale"));
+        assert!(body.contains("acc[nt][0] * scale2_ab"));
+        assert_eq!(body.matches("__syncthreads();").count(), 2);
+    }
+
+    #[test]
+    fn kmajor_dispatch_fails_closed_and_uses_only_transformed_weights() {
+        let source = include_str!("dense_ffn.rs");
+        let start = source
+            .find("let e2m1_kmajor_requested")
+            .expect("K-major request gate is missing");
+        let end = source[start..]
+            .find("if v2_fast_path {")
+            .map(|offset| start + offset)
+            .expect("K-major dispatch boundary is missing");
+        let body = &source[start..end];
+
+        assert!(body.contains("self.has_e2m1_kmajor_runtime()"));
+        assert!(body.contains("self.has_e2m1_kmajor_m256_runtime()"));
+        assert!(body.contains("self.has_transposed_ffn()"));
+        assert!(body.contains("e2m1_kmajor_projection_shape(m, inter, h)"));
+        assert!(body.contains("self.gate_proj_t.as_ref().unwrap()"));
+        assert!(body.contains("self.up_proj_t.as_ref().unwrap()"));
+        assert!(body.contains("self.down_proj_t.as_ref().unwrap()"));
+        assert!(source.contains("ops::nvfp4_nvfp4_gemm_kmajor_m128("));
+        assert!(source.contains("ops::nvfp4_nvfp4_gemm_kmajor_m256("));
+
+        let wrapper = include_str!("ops/gemm_dense.rs");
+        assert!(wrapper.contains("pub fn nvfp4_nvfp4_gemm_kmajor_m256("));
+        assert!(wrapper.contains(".grid([n / 128, div_ceil(m, 256), 1])"));
+        assert!(wrapper.contains(".block([512, 1, 1])"));
+    }
+
+    #[test]
+    fn static_scale_matches_merged_gate_up_contract_and_rejects_bad_metadata() {
+        let scales = validated_e2m1_checkpoint_scales(0.001, 0.00125, 0.002).unwrap();
+        assert_eq!(scales.gate_up.to_bits(), 0.00125_f32.to_bits());
+        assert_eq!(scales.down.to_bits(), 0.002_f32.to_bits());
+
+        for bad in [0.0, -0.1, f32::INFINITY, f32::NAN] {
+            assert!(validated_e2m1_checkpoint_scales(bad, 0.001, 0.002).is_err());
+            assert!(validated_e2m1_checkpoint_scales(0.001, bad, 0.002).is_err());
+            assert!(validated_e2m1_checkpoint_scales(0.001, 0.002, bad).is_err());
+        }
+    }
+
+    #[test]
+    fn static_scale_bypasses_runtime_absmax_and_sync_before_quantization() {
+        let source = include_str!("dense_ffn.rs");
+        let start = source
+            .find("fn prepare_e2m1_input(")
+            .expect("W4A4 activation preparation is missing");
+        let end = source[start..]
+            .find("fn forward_e2m1_prepared(")
+            .map(|offset| start + offset)
+            .expect("prepared W4A4 GEMM boundary is missing");
+        let body = &source[start..end];
+
+        let fixed = body
+            .find("if let Some(scale2) = checkpoint_scale2")
+            .expect("checkpoint-static branch is missing");
+        let dynamic = body
+            .find("ctx.gpu.synchronize(stream)?")
+            .expect("dynamic absmax fallback is missing");
+        let quantize = body
+            .find("ops::quantize_bf16_to_nvfp4(")
+            .expect("shared on-device quantizer is missing");
+        assert!(fixed < dynamic && dynamic < quantize);
+    }
+
+    #[test]
+    fn full_w4a4_gate_and_up_share_one_prepared_activation() {
+        let source = include_str!("dense_ffn.rs");
+        let start = source
+            .find("if e2m1_fast_path {")
+            .expect("full W4A4 dispatch is missing");
+        let end = source[start..]
+            .find("if e2m1_down_only_path {")
+            .map(|offset| start + offset)
+            .expect("down-only dispatch boundary is missing");
+        let branch = &source[start..end];
+
+        assert_eq!(branch.matches("self.prepare_e2m1_input(").count(), 1);
+        assert_eq!(branch.matches("self.forward_e2m1_prepared(").count(), 3);
+        assert_eq!(branch.matches("self.forward_e2m1_proj(").count(), 1);
+        assert_eq!(branch.matches(".prepare_e2m1_silu_input(").count(), 1);
+        assert!(branch.contains("&self.weights.gate_proj"));
+        assert!(branch.contains("&self.weights.up_proj"));
+        assert!(branch.contains("&self.weights.down_proj"));
+    }
+
+    #[test]
+    fn fused_silu_quant_preserves_bf16_boundary_and_fails_closed() {
+        let cuda = include_str!("../../../../kernels/gb10/common/quantize_bf16_to_nvfp4.cu");
+        let start = cuda
+            .find("void quantize_silu_mul_bf16_to_nvfp4(")
+            .expect("fused SwiGLU quantizer is missing");
+        let body = &cuda[start..];
+        assert!(cuda.contains("return __bfloat162float(__float2bfloat16(g * sigmoid_g * u));"));
+        assert!(body.contains("float_to_fp8_e4m3(fp8_float)"));
+        assert!(body.contains("quantize_e2m1(v0)"));
+        assert!(body.contains("quantize_e2m1(v1)"));
+
+        let rust = include_str!("dense_ffn.rs");
+        assert!(rust.contains("ATLAS_E2M1_SILU_QUANT=1 requires ATLAS_E2M1_STATIC_SCALE=1"));
+        assert!(rust.contains("ATLAS_E2M1_SILU_QUANT=1 is valid only for SiLU-gated FFNs"));
+        assert!(rust.contains("ATLAS_E2M1_SILU_QUANT=1 requires quantize_silu_mul_bf16_to_nvfp4"));
+    }
+
+    #[test]
+    fn kmajor_transform_and_tile_scatter_reconstruct_parent_layout() {
+        const N: usize = 256;
+        const K: usize = 192;
+        let packed_k = K / 2;
+        let scale_k = K / 16;
+
+        let packed_parent: Vec<u32> = (0..N * packed_k).map(|index| index as u32).collect();
+        let scale_parent: Vec<u32> = (0..N * scale_k)
+            .map(|index| 1_000_000 + index as u32)
+            .collect();
+        let mut packed_t = vec![0_u32; packed_parent.len()];
+        let mut scale_t = vec![0_u32; scale_parent.len()];
+        for column in 0..N {
+            for k_byte in 0..packed_k {
+                packed_t[k_byte * N + column] = packed_parent[column * packed_k + k_byte];
+            }
+            for group in 0..scale_k {
+                scale_t[group * N + column] = scale_parent[column * scale_k + group];
+            }
+        }
+
+        for n_base in [0, 128] {
+            for k_base in [0, 64, 128] {
+                for local_n in 0..128 {
+                    let column = n_base + local_n;
+                    for local_byte in 0..32 {
+                        let k_byte = k_base / 2 + local_byte;
+                        let staged = packed_t[k_byte * N + column];
+                        assert_eq!(staged, packed_parent[column * packed_k + k_byte]);
+                    }
+                    for local_group in 0..4 {
+                        let group = k_base / 16 + local_group;
+                        let staged = scale_t[group * N + column];
+                        assert_eq!(staged, scale_parent[column * scale_k + group]);
+                    }
+                }
+            }
+        }
+    }
+}

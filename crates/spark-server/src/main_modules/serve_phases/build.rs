@@ -9,6 +9,8 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+use super::super::context_extension::ContextAdmissionReceipt;
+
 pub(crate) fn build_prefix_cache(
     args: &cli::ServeArgs,
 ) -> Box<dyn spark_runtime::prefix_cache::PrefixCache> {
@@ -31,17 +33,18 @@ pub(crate) fn build_prefix_cache(
 pub(crate) fn build_model(
     args: &cli::ServeArgs,
     config: &ModelConfig,
+    context_admission: ContextAdmissionReceipt,
     store: &spark_runtime::weights::WeightStore,
     gpu: Box<dyn spark_runtime::gpu::GpuBackend>,
     max_batch_tokens: usize,
     kv_dtype: spark_runtime::kv_cache::KvCacheDtype,
     inference_reserve: usize,
     layer_dtypes: Vec<spark_runtime::kv_cache::KvCacheDtype>,
-    hss_cache_blocks_per_seq: Option<u32>,
     prefix_cache: Box<dyn spark_runtime::prefix_cache::PrefixCache>,
     comm: Option<std::sync::Arc<dyn spark_comm::CommBackend>>,
     dflash_args: Option<spark_model::factory::DflashBuildArgs<'_>>,
 ) -> Result<Box<dyn spark_model::traits::Model>> {
+    let admitted = context_admission.consume(config.max_position_embeddings)?;
     let mtp_quant: spark_model::layers::MtpQuantization = args
         .mtp_quantization
         .parse()
@@ -51,16 +54,16 @@ pub(crate) fn build_model(
         store,
         gpu,
         max_batch_tokens,
-        args.block_size,
-        args.max_seq_len,
-        args.max_batch_size,
+        admitted.block_size(),
+        admitted.max_seq_len(),
+        admitted.max_batch_size(),
         mtp_quant,
-        args.speculative || args.dflash,
+        admitted.speculative(),
         prefix_cache,
         args.mtp_vocab,
         comm,
-        args.self_speculative || args.ngram_speculative,
-        if args.dflash {
+        admitted.self_speculative(),
+        if admitted.dflash() {
             args.dflash_gamma.unwrap_or(15).max(1)
         } else {
             args.num_drafts
@@ -71,7 +74,7 @@ pub(crate) fn build_model(
         args.ssm_cache_slots,
         layer_dtypes,
         args.ssm_checkpoint_interval,
-        hss_cache_blocks_per_seq,
+        admitted.hss_cache_blocks_per_seq(),
         dflash_args,
     )
     .context("Failed to build model")

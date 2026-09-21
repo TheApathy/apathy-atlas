@@ -41,6 +41,8 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let total_len = tokens.len();
+        self.validate_vision_prompt(tokens, 0, total_len)?;
+        self.admit_rotary_prompt(tokens, seq, 0)?;
         if total_len == 0 {
             return Ok(DevicePtr::NULL);
         }
@@ -50,7 +52,10 @@ impl TransformerModel {
         // With chunked SSM prefill, this is the normal path for long prompts —
         // the monolithic SSM prefill() carries h_state/conv_state between chunks.
         let arena_cap = self.buffers.max_batch_tokens();
-        if total_len > arena_cap {
+        if total_len > arena_cap
+            || (self.config.mrope_interleaved && self.vision_prompt_present(tokens))
+        {
+            anyhow::ensure!(chunk_size > 0, "vision prefill chunk size must be positive");
             tracing::info!(
                 "Chunked SSM prefill: {total_len} tokens in {} chunks of {chunk_size} \
                  (arena_cap={arena_cap})",
@@ -133,31 +138,7 @@ impl TransformerModel {
             self.scale_embeddings(hidden, total_len, stream)?;
         }
 
-        // ── 1b. Overwrite image_pad token positions with vision encoder embeddings ──
-        {
-            let pending = *self.vision_embed_patches.lock();
-            if pending > 0
-                && let Some(ve) = &self.vision_encoder
-            {
-                let pad_id = self
-                    .config
-                    .vision
-                    .as_ref()
-                    .map(|v| v.image_pad_token_id)
-                    .filter(|v| *v != 0)
-                    .unwrap_or(crate::layers::vision_encoder::IMAGE_PAD_TOKEN_ID);
-                let mut img_idx = 0usize;
-                for (i, &tok) in tokens.iter().enumerate() {
-                    if tok == pad_id {
-                        let src = ve.buf_out.offset(img_idx * ve.out_hidden_size * 2);
-                        let dst = hidden.offset(i * h * fp32);
-                        self.gpu
-                            .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
-                        img_idx += 1;
-                    }
-                }
-            }
-        }
+        self.splice_vision_embeddings(tokens, 0, total_len, hidden, stream)?;
 
         // ── 2. Prefix cache lookup + block allocation for full sequence ──
         let bs = kv_cache.block_size();

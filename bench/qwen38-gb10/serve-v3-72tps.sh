@@ -5,10 +5,14 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-export MODEL_NAME="${MODEL_NAME:-qwen38-atlas-fork}"
-export GAMMA="${GAMMA:-15}"
-export MTP_VOCAB="${MTP_VOCAB:-248320}"
-export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-nvfp4}"
-export KV_HIGH_PRECISION_LAYERS="${KV_HIGH_PRECISION_LAYERS:-0}"
+if [[ -v RUNTIME_MODE && "$RUNTIME_MODE" != dflash-v3 ]]; then
+  echo "serve-v3-72tps.sh requires RUNTIME_MODE=dflash-v3" >&2
+  exit 2
+fi
+export RUNTIME_MODE=dflash-v3
+
+# Dynamic path; the sourced profile is checked separately.
+# shellcheck disable=SC1091
+source "$HERE/serve-v3-target-profile.sh"
 
 exec "$HERE/serve.sh" "$@"

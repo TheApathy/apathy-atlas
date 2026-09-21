@@ -523,6 +523,420 @@ void nvfp4_nvfp4_gemm_t_m64(
 }
 
 // =========================================================================
+// K-major M128 shadow.
+//
+// The original M64 kernel above consumes checkpoint-row-major B[N,K/2].
+// That makes every output-column CTA fetch a disjoint K span and was measured
+// to bottleneck the production gate/up shapes on weight traffic.  Atlas
+// already retains a decode/prefill transform with layouts B[K/2,N] and
+// S[K/16,N].  This shadow consumes those transformed bytes directly, stages
+// each coalesced K-major tile with cp.async, transposes it once in shared
+// memory, and serves the tile to eight 16-row warps (128 M rows total).
+//
+// The MMA fragments, K-step order, block scales, FP32 accumulation, global
+// scale, and BF16 epilogue are deliberately identical to the M64 parent.  The
+// only numerical change is where each weight byte is addressed in global
+// memory.  FFN routing requires N%128==0, so the transformed leading dimension
+// equals logical N (no padded-stride argument is needed).
+//
+// Grid:  (N / 128, ceil(M / 128))
+// Block: (256, 1, 1) -- eight warps, one 16-row fragment per warp
+// =========================================================================
+extern "C" __global__
+__launch_bounds__(256)
+void nvfp4_nvfp4_gemm_kmajor_m128(
+    const unsigned char* __restrict__ A_packed,   // [M, K/2]
+    const unsigned char* __restrict__ A_scale,    // [M, K/16]
+    const unsigned char* __restrict__ B_packed_t, // [K/2, N]
+    const unsigned char* __restrict__ B_scale_t,  // [K/16, N]
+    const float scale2_ab,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_m = blockIdx.y * 128u;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    // A stays in the row-major fragment layout used by the parent.  K-major B
+    // first lands in a coalesced staging tile, then is transposed into the
+    // parent's row-major shared fragment layout after the async wait.  One
+    // compute tile is enough because the transpose happens only after all
+    // warps have finished consuming the previous tile.
+    __shared__ unsigned char smem_Ap_km[2][128][K_STEP / 2];
+    __shared__ unsigned char smem_As_km[2][128][K_STEP / GROUP_SIZE];
+    __shared__ unsigned char smem_Bp_stage[2][K_STEP / 2][N_TILE_LG];
+    __shared__ unsigned char smem_Bs_stage[2][K_STEP / GROUP_SIZE][N_TILE_LG];
+    // Double-buffer the compute-form tile so transpose of `nxt` cannot
+    // overwrite weights still consumed by `cur`. Each transposer reads the
+    // exact cp.async slice it issued, so wait->transpose->sync is sufficient.
+    __shared__ unsigned char smem_Bp_km[2][N_TILE_LG][K_STEP / 2];
+    __shared__ unsigned char smem_Bs_km[2][N_TILE_LG][K_STEP / GROUP_SIZE];
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    #define KM128_LOAD_TILE(buf, kb) do {                                        \
+        /* A packed: 128 rows x 32 bytes. */                                     \
+        {                                                                         \
+            unsigned int row = threadIdx.x >> 1;                                 \
+            unsigned int col = (threadIdx.x & 1) << 4;                           \
+            unsigned int gr = cta_m + row;                                       \
+            unsigned int gc_byte = (kb) / 2 + col;                               \
+            bool valid = (gr < M) && (gc_byte + 15 < K / 2);                     \
+            cp_async_pred_16(&smem_Ap_km[(buf)][row][col],                       \
+                &A_packed[(unsigned long long)gr * (K / 2) + gc_byte], valid);   \
+        }                                                                         \
+        /* A scales: 128 naturally aligned u32 rows. */                           \
+        if (threadIdx.x < 128) {                                                  \
+            unsigned int row = threadIdx.x;                                      \
+            unsigned int gr = cta_m + row;                                       \
+            unsigned int gg = (kb) / GROUP_SIZE;                                 \
+            unsigned int packed_scale = 0;                                       \
+            if (gr < M) {                                                         \
+                packed_scale = *(const unsigned int*)&A_scale[                   \
+                    (unsigned long long)gr * (K / GROUP_SIZE) + gg];              \
+            }                                                                     \
+            *(unsigned int*)&smem_As_km[(buf)][row][0] = packed_scale;            \
+        }                                                                         \
+        /* K-major packed B: 32 K-bytes x 128 contiguous N bytes. */              \
+        {                                                                         \
+            unsigned int kp = threadIdx.x >> 3;                                  \
+            unsigned int ns = (threadIdx.x & 7) << 4;                            \
+            unsigned int gk_byte = (kb) / 2 + kp;                                \
+            unsigned int gn = cta_n + ns;                                        \
+            bool valid = (gk_byte < K / 2) && (gn + 15 < N);                     \
+            cp_async_pred_16(&smem_Bp_stage[(buf)][kp][ns],                      \
+                &B_packed_t[(unsigned long long)gk_byte * N + gn], valid);       \
+        }                                                                         \
+        /* K-major B scales: 4 groups x 128 contiguous N bytes. */                \
+        if (threadIdx.x < 32) {                                                   \
+            unsigned int kg = threadIdx.x >> 3;                                  \
+            unsigned int ns = (threadIdx.x & 7) << 4;                            \
+            unsigned int gg = (kb) / GROUP_SIZE + kg;                            \
+            unsigned int gn = cta_n + ns;                                        \
+            bool valid = (gg < K / GROUP_SIZE) && (gn + 15 < N);                 \
+            cp_async_pred_16(&smem_Bs_stage[(buf)][kg][ns],                      \
+                &B_scale_t[(unsigned long long)gg * N + gn], valid);             \
+        }                                                                         \
+    } while(0)
+
+    #define KM128_SCATTER_WORD(buf, word, nbase, kp) do {                         \
+        smem_Bp_km[(buf)][(nbase) + 0][(kp)] = (unsigned char)((word) >> 0);     \
+        smem_Bp_km[(buf)][(nbase) + 1][(kp)] = (unsigned char)((word) >> 8);     \
+        smem_Bp_km[(buf)][(nbase) + 2][(kp)] = (unsigned char)((word) >> 16);    \
+        smem_Bp_km[(buf)][(nbase) + 3][(kp)] = (unsigned char)((word) >> 24);    \
+    } while(0)
+
+    #define KM128_TRANSPOSE_B(buf) do {                                           \
+        unsigned int kp = threadIdx.x >> 3;                                      \
+        unsigned int ns = (threadIdx.x & 7) << 4;                                \
+        const unsigned int* src = (const unsigned int*)&smem_Bp_stage[(buf)][kp][ns];\
+        unsigned int w0 = src[0], w1 = src[1], w2 = src[2], w3 = src[3];         \
+        KM128_SCATTER_WORD(buf, w0, ns + 0, kp);                                 \
+        KM128_SCATTER_WORD(buf, w1, ns + 4, kp);                                 \
+        KM128_SCATTER_WORD(buf, w2, ns + 8, kp);                                 \
+        KM128_SCATTER_WORD(buf, w3, ns + 12, kp);                                \
+        if (threadIdx.x < 32) {                                                   \
+            unsigned int kg = threadIdx.x >> 3;                                  \
+            unsigned int sns = (threadIdx.x & 7) << 4;                           \
+            const unsigned int* ssrc =                                           \
+                (const unsigned int*)&smem_Bs_stage[(buf)][kg][sns];              \
+            unsigned int s0 = ssrc[0], s1 = ssrc[1], s2 = ssrc[2], s3 = ssrc[3];\
+            _Pragma("unroll")                                                     \
+            for (int b = 0; b < 4; b++) {                                        \
+                smem_Bs_km[(buf)][sns + b][kg] = (unsigned char)(s0 >> (8 * b)); \
+                smem_Bs_km[(buf)][sns + 4 + b][kg] = (unsigned char)(s1 >> (8 * b));\
+                smem_Bs_km[(buf)][sns + 8 + b][kg] = (unsigned char)(s2 >> (8 * b));\
+                smem_Bs_km[(buf)][sns + 12 + b][kg] = (unsigned char)(s3 >> (8 * b));\
+            }                                                                     \
+        }                                                                         \
+    } while(0)
+
+    #define KM128_COMPUTE(buf) do {                                               \
+        unsigned int fr0 = warp_m_offset + group_id;                             \
+        unsigned int fr1 = fr0 + 8;                                               \
+        unsigned int a_col_byte = 4 * tid;                                       \
+        unsigned int a0 = *(const unsigned int*)&smem_Ap_km[(buf)][fr0][a_col_byte];\
+        unsigned int a1 = *(const unsigned int*)&smem_Ap_km[(buf)][fr1][a_col_byte];\
+        unsigned int a2 = *(const unsigned int*)&smem_Ap_km[(buf)][fr0][a_col_byte + 16];\
+        unsigned int a3 = *(const unsigned int*)&smem_Ap_km[(buf)][fr1][a_col_byte + 16];\
+        unsigned int m_sfa = ((threadIdx.x & 31) >> 2) +                         \
+            8u * (threadIdx.x & 1u) + warp_m_offset;                             \
+        unsigned int sfa = *(const unsigned int*)&smem_As_km[(buf)][m_sfa][0];   \
+        _Pragma("unroll")                                                         \
+        for (int nt = 0; nt < 16; nt++) {                                        \
+            unsigned int nc = nt * 8 + group_id;                                 \
+            unsigned int b0 = *(const unsigned int*)&smem_Bp_km[(buf)][nc][a_col_byte];\
+            unsigned int b1 = *(const unsigned int*)&smem_Bp_km[(buf)][nc][a_col_byte + 16];\
+            unsigned int sfb = *(const unsigned int*)&smem_Bs_km[(buf)][nc][0]; \
+            asm volatile(                                                        \
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."     \
+                "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "                     \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"       \
+                "{%14},{%15,%16},{%17},{%18,%19};"                              \
+                : "=f"(acc[nt][0]), "=f"(acc[nt][1]),                           \
+                  "=f"(acc[nt][2]), "=f"(acc[nt][3])                            \
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),   \
+                  "f"(acc[nt][0]), "f"(acc[nt][1]),                             \
+                  "f"(acc[nt][2]), "f"(acc[nt][3]),                             \
+                  "r"(sfa), "h"((unsigned short)0), "h"((unsigned short)0),    \
+                  "r"(sfb), "h"((unsigned short)0), "h"((unsigned short)0));   \
+        }                                                                         \
+    } while(0)
+
+    KM128_LOAD_TILE(0, 0);
+    cp_async_commit_nv();
+    cp_async_wait_all_nv();
+    KM128_TRANSPOSE_B(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP; k_base < K; k_base += K_STEP) {
+        int nxt = 1 - cur;
+        KM128_LOAD_TILE(nxt, k_base);
+        cp_async_commit_nv();
+        KM128_COMPUTE(cur);
+        cp_async_wait_all_nv();
+        KM128_TRANSPOSE_B(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    KM128_COMPUTE(cur);
+
+    #undef KM128_LOAD_TILE
+    #undef KM128_SCATTER_WORD
+    #undef KM128_TRANSPOSE_B
+    #undef KM128_COMPUTE
+
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(acc[nt][0] * scale2_ab);
+        if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(acc[nt][1] * scale2_ab);
+        if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(acc[nt][2] * scale2_ab);
+        if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(acc[nt][3] * scale2_ab);
+    }
+}
+
+// =========================================================================
+// K-major M256 shadow.
+//
+// The M128 kernel above is register-limited to two 256-thread CTAs per SM:
+// sixteen resident warps total.  This variant combines those two CTAs into
+// one 512-thread CTA.  It retains the same sixteen resident warps and the
+// same per-warp m16n128 accumulator slab, but stages each K-major weight tile
+// only once for 256 prompt rows.  At long-prefill M this halves duplicate B
+// traffic and transpose work without changing any warp's OMMA inputs or K
+// accumulation order.
+//
+// Only the first 256 threads stage/transpose the 32x128 packed-B tile; all
+// 512 threads stage their own A rows and the sixteen warps consume the shared
+// B tile.  `__launch_bounds__(512, 1)` caps the kernel at 128 registers per
+// thread, the architectural limit needed for one 512-thread CTA on a
+// 65,536-register SM.  Rust dispatch keeps this symbol default-off and falls
+// back to the M128 kernel below the conservative 2,048-row long-prefill
+// threshold.
+//
+// Grid:  (N / 128, ceil(M / 256))
+// Block: (512, 1, 1) -- sixteen warps, one 16-row fragment per warp
+// =========================================================================
+extern "C" __global__
+__launch_bounds__(512, 1)
+void nvfp4_nvfp4_gemm_kmajor_m256(
+    const unsigned char* __restrict__ A_packed,   // [M, K/2]
+    const unsigned char* __restrict__ A_scale,    // [M, K/16]
+    const unsigned char* __restrict__ B_packed_t, // [K/2, N]
+    const unsigned char* __restrict__ B_scale_t,  // [K/16, N]
+    const float scale2_ab,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K
+) {
+    const unsigned int cta_n = blockIdx.x * N_TILE_LG;
+    const unsigned int cta_m = blockIdx.y * 256u;
+    const unsigned int warp_id = threadIdx.x / 32;
+    const unsigned int lane_id = threadIdx.x % 32;
+    const unsigned int warp_m_offset = warp_id * 16;
+    const unsigned int group_id = lane_id >> 2;
+    const unsigned int tid = lane_id & 3;
+
+    __shared__ unsigned char smem_Ap_km256[2][256][K_STEP / 2];
+    __shared__ unsigned char smem_As_km256[2][256][K_STEP / GROUP_SIZE];
+    __shared__ unsigned char smem_Bp_stage_km256[2][K_STEP / 2][N_TILE_LG];
+    __shared__ unsigned char smem_Bs_stage_km256[2][K_STEP / GROUP_SIZE][N_TILE_LG];
+    // Double-buffer the compute-form B tile as well as its cp.async staging
+    // tile. This lets the CTA transpose `nxt` without overwriting the `cur`
+    // tile still consumed by the sixteen compute warps, collapsing the
+    // wait/sync/transpose/sync sequence to wait/transpose/sync.
+    __shared__ unsigned char smem_Bp_km256[2][N_TILE_LG][K_STEP / 2];
+    __shared__ unsigned char smem_Bs_km256[2][N_TILE_LG][K_STEP / GROUP_SIZE];
+
+    float acc[16][4];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) {
+        acc[i][0] = 0.0f; acc[i][1] = 0.0f;
+        acc[i][2] = 0.0f; acc[i][3] = 0.0f;
+    }
+
+    #define KM256_LOAD_TILE(buf, kb) do {                                       \
+        /* A packed: 256 rows x 32 bytes. */                                    \
+        {                                                                        \
+            unsigned int row = threadIdx.x >> 1;                                \
+            unsigned int col = (threadIdx.x & 1) << 4;                          \
+            unsigned int gr = cta_m + row;                                      \
+            unsigned int gc_byte = (kb) / 2 + col;                              \
+            bool valid = (gr < M) && (gc_byte + 15 < K / 2);                    \
+            cp_async_pred_16(&smem_Ap_km256[(buf)][row][col],                   \
+                &A_packed[(unsigned long long)gr * (K / 2) + gc_byte], valid);  \
+        }                                                                        \
+        /* A scales: one naturally aligned u32 per row. */                       \
+        if (threadIdx.x < 256) {                                                 \
+            unsigned int row = threadIdx.x;                                     \
+            unsigned int gr = cta_m + row;                                      \
+            unsigned int gg = (kb) / GROUP_SIZE;                                \
+            unsigned int packed_scale = 0;                                      \
+            if (gr < M) {                                                        \
+                packed_scale = *(const unsigned int*)&A_scale[                  \
+                    (unsigned long long)gr * (K / GROUP_SIZE) + gg];             \
+            }                                                                    \
+            *(unsigned int*)&smem_As_km256[(buf)][row][0] = packed_scale;        \
+        }                                                                        \
+        /* One 256-thread cohort stages K-major B; the other half is compute. */ \
+        if (threadIdx.x < 256) {                                                 \
+            unsigned int kp = threadIdx.x >> 3;                                 \
+            unsigned int ns = (threadIdx.x & 7) << 4;                           \
+            unsigned int gk_byte = (kb) / 2 + kp;                               \
+            unsigned int gn = cta_n + ns;                                       \
+            bool valid = (gk_byte < K / 2) && (gn + 15 < N);                    \
+            cp_async_pred_16(&smem_Bp_stage_km256[(buf)][kp][ns],               \
+                &B_packed_t[(unsigned long long)gk_byte * N + gn], valid);      \
+        }                                                                        \
+        if (threadIdx.x < 32) {                                                  \
+            unsigned int kg = threadIdx.x >> 3;                                 \
+            unsigned int ns = (threadIdx.x & 7) << 4;                           \
+            unsigned int gg = (kb) / GROUP_SIZE + kg;                           \
+            unsigned int gn = cta_n + ns;                                       \
+            bool valid = (gg < K / GROUP_SIZE) && (gn + 15 < N);                \
+            cp_async_pred_16(&smem_Bs_stage_km256[(buf)][kg][ns],               \
+                &B_scale_t[(unsigned long long)gg * N + gn], valid);            \
+        }                                                                        \
+    } while(0)
+
+    #define KM256_SCATTER_WORD(buf, word, nbase, kp) do {                       \
+        smem_Bp_km256[(buf)][(nbase) + 0][(kp)] = (unsigned char)((word) >> 0);\
+        smem_Bp_km256[(buf)][(nbase) + 1][(kp)] = (unsigned char)((word) >> 8);\
+        smem_Bp_km256[(buf)][(nbase) + 2][(kp)] = (unsigned char)((word) >> 16);\
+        smem_Bp_km256[(buf)][(nbase) + 3][(kp)] = (unsigned char)((word) >> 24);\
+    } while(0)
+
+    #define KM256_TRANSPOSE_B(buf) do {                                         \
+        if (threadIdx.x < 256) {                                                \
+            unsigned int kp = threadIdx.x >> 3;                                \
+            unsigned int ns = (threadIdx.x & 7) << 4;                          \
+            const unsigned int* src =                                          \
+                (const unsigned int*)&smem_Bp_stage_km256[(buf)][kp][ns];       \
+            unsigned int w0 = src[0], w1 = src[1], w2 = src[2], w3 = src[3];   \
+            KM256_SCATTER_WORD(buf, w0, ns + 0, kp);                            \
+            KM256_SCATTER_WORD(buf, w1, ns + 4, kp);                            \
+            KM256_SCATTER_WORD(buf, w2, ns + 8, kp);                            \
+            KM256_SCATTER_WORD(buf, w3, ns + 12, kp);                           \
+        }                                                                        \
+        if (threadIdx.x < 32) {                                                 \
+            unsigned int kg = threadIdx.x >> 3;                                \
+            unsigned int sns = (threadIdx.x & 7) << 4;                         \
+            const unsigned int* ssrc =                                         \
+                (const unsigned int*)&smem_Bs_stage_km256[(buf)][kg][sns];      \
+            unsigned int s0 = ssrc[0], s1 = ssrc[1], s2 = ssrc[2], s3 = ssrc[3];\
+            _Pragma("unroll")                                                  \
+            for (int b = 0; b < 4; b++) {                                      \
+                smem_Bs_km256[(buf)][sns + b][kg] = (unsigned char)(s0 >> (8 * b));\
+                smem_Bs_km256[(buf)][sns + 4 + b][kg] = (unsigned char)(s1 >> (8 * b));\
+                smem_Bs_km256[(buf)][sns + 8 + b][kg] = (unsigned char)(s2 >> (8 * b));\
+                smem_Bs_km256[(buf)][sns + 12 + b][kg] = (unsigned char)(s3 >> (8 * b));\
+            }                                                                    \
+        }                                                                        \
+    } while(0)
+
+    #define KM256_COMPUTE(buf) do {                                              \
+        unsigned int fr0 = warp_m_offset + group_id;                            \
+        unsigned int fr1 = fr0 + 8;                                              \
+        unsigned int a_col_byte = 4 * tid;                                       \
+        unsigned int a0 = *(const unsigned int*)&smem_Ap_km256[(buf)][fr0][a_col_byte];\
+        unsigned int a1 = *(const unsigned int*)&smem_Ap_km256[(buf)][fr1][a_col_byte];\
+        unsigned int a2 = *(const unsigned int*)&smem_Ap_km256[(buf)][fr0][a_col_byte + 16];\
+        unsigned int a3 = *(const unsigned int*)&smem_Ap_km256[(buf)][fr1][a_col_byte + 16];\
+        unsigned int m_sfa = ((threadIdx.x & 31) >> 2) +                        \
+            8u * (threadIdx.x & 1u) + warp_m_offset;                            \
+        unsigned int sfa = *(const unsigned int*)&smem_As_km256[(buf)][m_sfa][0];\
+        _Pragma("unroll")                                                        \
+        for (int nt = 0; nt < 16; nt++) {                                       \
+            unsigned int nc = nt * 8 + group_id;                                \
+            unsigned int b0 = *(const unsigned int*)&smem_Bp_km256[(buf)][nc][a_col_byte];\
+            unsigned int b1 = *(const unsigned int*)&smem_Bp_km256[(buf)][nc][a_col_byte + 16];\
+            unsigned int sfb = *(const unsigned int*)&smem_Bs_km256[(buf)][nc][0];\
+            asm volatile(                                                       \
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."    \
+                "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "                    \
+                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"      \
+                "{%14},{%15,%16},{%17},{%18,%19};"                             \
+                : "=f"(acc[nt][0]), "=f"(acc[nt][1]),                          \
+                  "=f"(acc[nt][2]), "=f"(acc[nt][3])                           \
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),   \
+                  "f"(acc[nt][0]), "f"(acc[nt][1]),                            \
+                  "f"(acc[nt][2]), "f"(acc[nt][3]),                            \
+                  "r"(sfa), "h"((unsigned short)0), "h"((unsigned short)0),   \
+                  "r"(sfb), "h"((unsigned short)0), "h"((unsigned short)0));  \
+        }                                                                        \
+    } while(0)
+
+    KM256_LOAD_TILE(0, 0);
+    cp_async_commit_nv();
+    cp_async_wait_all_nv();
+    KM256_TRANSPOSE_B(0);
+    __syncthreads();
+
+    int cur = 0;
+    for (unsigned int k_base = K_STEP; k_base < K; k_base += K_STEP) {
+        int nxt = 1 - cur;
+        KM256_LOAD_TILE(nxt, k_base);
+        cp_async_commit_nv();
+        KM256_COMPUTE(cur);
+        cp_async_wait_all_nv();
+        KM256_TRANSPOSE_B(nxt);
+        __syncthreads();
+        cur = nxt;
+    }
+    KM256_COMPUTE(cur);
+
+    #undef KM256_LOAD_TILE
+    #undef KM256_SCATTER_WORD
+    #undef KM256_TRANSPOSE_B
+    #undef KM256_COMPUTE
+
+    #pragma unroll
+    for (int nt = 0; nt < 16; nt++) {
+        unsigned int c0 = cta_n + nt * 8 + tid * 2;
+        unsigned int c1 = c0 + 1;
+        unsigned int r0 = cta_m + warp_m_offset + group_id;
+        unsigned int r1 = r0 + 8;
+        if (r0 < M && c0 < N) C[(unsigned long long)r0 * N + c0] = __float2bfloat16(acc[nt][0] * scale2_ab);
+        if (r0 < M && c1 < N) C[(unsigned long long)r0 * N + c1] = __float2bfloat16(acc[nt][1] * scale2_ab);
+        if (r1 < M && c0 < N) C[(unsigned long long)r1 * N + c0] = __float2bfloat16(acc[nt][2] * scale2_ab);
+        if (r1 < M && c1 < N) C[(unsigned long long)r1 * N + c1] = __float2bfloat16(acc[nt][3] * scale2_ab);
+    }
+}
+
+// =========================================================================
 // FIX PATH 3 LANDED 2026-05-23 (gated behind ATLAS_E2M1_GEMM=1)
 // =========================================================================
 // Split-K variant. Addresses the wide-N=17408 wave-parallelism deficit:

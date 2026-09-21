@@ -74,6 +74,26 @@ fn detects_fence_body_with_varying_prefixes() {
     );
 }
 
+#[test]
+fn chatml_thinking_cycle_requires_four_role_openers_in_short_tail() {
+    const IM_START: u32 = 248_045;
+    let productive = vec![10, IM_START, 11, IM_START, 12, IM_START, 13];
+    assert!(!detect_chatml_thinking_cycle(&productive, None, IM_START));
+    assert!(detect_chatml_thinking_cycle(
+        &productive,
+        Some(IM_START),
+        IM_START
+    ));
+}
+
+#[test]
+fn chatml_thinking_cycle_ignores_old_role_openers_outside_window() {
+    const IM_START: u32 = 248_045;
+    let mut tokens = vec![IM_START; 4];
+    tokens.extend(0..CHATML_THINK_CYCLE_WINDOW as u32);
+    assert!(!detect_chatml_thinking_cycle(&tokens, None, IM_START));
+}
+
 // ── Content-phase loop detector tests (Claude Code 2026-04-26 fix) ──
 
 #[test]

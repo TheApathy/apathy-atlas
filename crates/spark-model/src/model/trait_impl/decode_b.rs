@@ -43,6 +43,14 @@ impl TransformerModel {
         prefill_is_last: bool,
         stream: u64,
     ) -> Result<crate::traits::MixedForwardResult> {
+        anyhow::ensure!(
+            !self.vision_prompt_present(prefill_tokens)
+                && prefill_seq.rotary_positions.is_identity()
+                && decode_seqs
+                    .iter()
+                    .all(|seq| seq.rotary_positions.is_identity()),
+            "image sequences require C1 ordinary/chunked prefill, not mixed forward"
+        );
         let n_decode = decode_tokens.len();
         let n_prefill = prefill_chunk_len;
 

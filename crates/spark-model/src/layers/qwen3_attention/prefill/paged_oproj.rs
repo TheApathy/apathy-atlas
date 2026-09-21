@@ -24,6 +24,13 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if let Some(output) =
+            self.try_flashinfer_projection_output(attn_out, n, h, nq, hd, ctx, stream)?
+        {
+            return Ok(output);
+        }
+
         let o_out = ctx.buffers.norm_output();
         if let Some(ref fp8t) = self.o_fp8w_t {
             ops::w8a16_gemm_t(
@@ -141,35 +148,51 @@ impl Qwen3AttentionLayer {
                 nq * hd,
                 stream,
             )?;
-        } else if crate::layers::prefill_proj_pipe_enabled()
-            && self.w4a16_gemm_pipe_k.0 != 0
-            && (nq * hd).is_multiple_of(64)
-        {
-            // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
-            // K = nq*hd must be a multiple of the pipe's 64-row stage.
-            ops::w4a16_gemm_pipe(
-                ctx.gpu,
-                self.w4a16_gemm_pipe_k,
-                attn_out,
-                &self.attn.o_proj,
-                o_out,
-                n,
-                h,
-                nq * hd,
-                stream,
-            )?;
         } else {
-            ops::w4a16_gemm(
-                ctx.gpu,
-                self.w4a16_gemm_k,
-                attn_out,
-                &self.attn.o_proj,
-                o_out,
-                n,
-                h,
+            match crate::layers::prefill_projection_pipe_route(
+                crate::layers::prefill_proj_pipe_enabled(),
                 nq * hd,
-                stream,
-            )?;
+                self.w4a16_gemm_pipe_k.0 != 0,
+            ) {
+                crate::layers::PrefillProjectionPipeRoute::Complete => {
+                    static O_PIPE: std::sync::Once = std::sync::Once::new();
+                    O_PIPE.call_once(|| {
+                        tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE: attention_o");
+                    });
+                    // Byte-exact pipelined shadow (see `prefill_proj_pipe_enabled`).
+                    // K = nq*hd must be a multiple of the pipe's 64-row stage.
+                    ops::w4a16_gemm_pipe(
+                        ctx.gpu,
+                        self.w4a16_gemm_pipe_k,
+                        attn_out,
+                        &self.attn.o_proj,
+                        o_out,
+                        n,
+                        h,
+                        nq * hd,
+                        stream,
+                    )?;
+                }
+                crate::layers::PrefillProjectionPipeRoute::Missing => {
+                    anyhow::bail!(
+                        "ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe for an eligible attention O projection"
+                    );
+                }
+                crate::layers::PrefillProjectionPipeRoute::Disabled
+                | crate::layers::PrefillProjectionPipeRoute::Ineligible => {
+                    ops::w4a16_gemm(
+                        ctx.gpu,
+                        self.w4a16_gemm_k,
+                        attn_out,
+                        &self.attn.o_proj,
+                        o_out,
+                        n,
+                        h,
+                        nq * hd,
+                        stream,
+                    )?;
+                }
+            }
         }
         Ok(o_out)
     }

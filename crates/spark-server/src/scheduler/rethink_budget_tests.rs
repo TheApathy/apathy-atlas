@@ -18,6 +18,7 @@ fn seq_state() -> SequenceState {
         block_table: Vec::new(),
         seq_len: 0,
         layer_states: Vec::new(),
+        rotary_positions: spark_model::traits::RotaryPositions::identity(),
         proposer_state: None,
         proposer_state_alt: None,
         slot_idx: 0,

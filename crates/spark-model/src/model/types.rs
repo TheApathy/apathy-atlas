@@ -366,32 +366,9 @@ pub struct TransformerModel {
     pub(super) last_mtp_hidden_idx: std::sync::atomic::AtomicUsize,
     /// Optional vision encoder for VL models (Qwen3-VL).
     pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
-    /// Number of patches encoded by the last prepare_vision_embed() call.
-    /// 0 means no vision embeddings pending.
-    pub(super) vision_embed_patches: Mutex<usize>,
-    /// Per-image `(grid_h_post_merge, grid_w_post_merge)` from the most
-    /// recent prepare_vision_embed() call. Used by MRoPE prefill to
-    /// assign correct (h, w) spatial position IDs to each image patch
-    /// token. Empty when no images are pending.
-    pub(super) vision_image_grids: Mutex<Vec<(usize, usize)>>,
-    /// Single-entry vision cache: fingerprint of the (grid + pixel)
-    /// data the ViT forward last ran on. When the next request's
-    /// fingerprint matches, we restore the cached features into
-    /// ve.buf_out from `vision_cache_buf` and skip ViT forward.
-    /// 0 = no cached forward. See prepare_vision_embed_dispatch for
-    /// the read/write flow.
-    pub(super) vision_cache_fp: std::sync::atomic::AtomicU64,
-    /// Cached `vision_image_grids` paired with `vision_cache_fp` so
-    /// the cache hit can restore them without re-running the encoder.
-    pub(super) vision_cache_grids: Mutex<Vec<(usize, usize)>>,
-    /// Dedicated GPU buffer holding a snapshot of `ve.buf_out` from
-    /// the last ViT forward. On cache hit we D2D-copy this back into
-    /// `ve.buf_out` so the splice reads stable features even if other
-    /// code paths have stomped on `buf_out` since the encode.
-    pub(super) vision_cache_buf: Mutex<DevicePtr>,
-    /// Allocated size in bytes of `vision_cache_buf`. Grows as needed
-    /// when a larger image is encountered.
-    pub(super) vision_cache_bytes: std::sync::atomic::AtomicUsize,
+    /// C1-only owned final-merger aggregate, coherent grids and full-input cache key.
+    /// Encoder scratch and DeepStack rows are never consumed as image tokens.
+    pub(super) vision_embeddings: Mutex<super::vision_embeddings::VisionEmbeddingState>,
     /// Save SSM snapshots every N blocks during chunked prefill.
     /// 0 = disabled (leaf-only). When > 0, intermediate checkpoints are saved
     /// at block boundaries, enabling partial prefix SSM restore.

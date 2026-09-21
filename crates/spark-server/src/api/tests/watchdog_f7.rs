@@ -117,6 +117,7 @@ mod watchdog_f7_tests {
             content: ParsedContent {
                 text: text.to_string(),
                 images: Vec::new(),
+                image_text_offsets: Vec::new(),
             },
             tool_calls: None,
             tool_call_id: None,

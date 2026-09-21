@@ -38,10 +38,46 @@ impl Qwen3SsmLayer {
         let vd = ctx.config.linear_value_head_dim;
         let vpg = nv / nk;
         let key_dim = nk * kd; // 2048
-        let value_dim = nv * vd; // 4096
-        let conv_dim = key_dim * 2 + value_dim; // 8192
+        let value_dim = nv * vd; // Qwen3.8: 6144
+        let conv_dim = key_dim * 2 + value_dim; // Qwen3.8: 10240
         let d_conv = ctx.config.linear_conv_kernel_dim;
-        let qkvz_size = ctx.config.ssm_qkvz_size(); // 12288
+        let qkvz_size = ctx.config.ssm_qkvz_size(); // Qwen3.8: 16384
+        let normed = ctx.buffers.norm_output();
+        let deinterleaved = ctx.buffers.ssm_deinterleaved();
+        let proj_dst = if self.sequential_qkvz {
+            deinterleaved
+        } else {
+            ctx.buffers.ssm_qkvz()
+        };
+        let out_proj_buf = ctx.buffers.moe_output();
+        let gdn_c143 = self.preflight_gdn_c143_prefill(
+            ctx,
+            num_tokens,
+            nk,
+            nv,
+            kd,
+            vd,
+            conv_dim,
+            nv * 2,
+            qkvz_size,
+            ssm_state.h_state,
+            ctx.buffers.ssm_qkvz(),
+            ctx.buffers.ssm_gates(),
+            ctx.buffers.attn_output(),
+            stream,
+        )?;
+        let flashinfer_ssm = self.preflight_flashinfer_ssm_prefill(
+            ctx,
+            num_tokens,
+            h,
+            qkvz_size,
+            value_dim,
+            normed,
+            proj_dst,
+            ctx.buffers.ssm_qkvz(),
+            out_proj_buf,
+            stream,
+        )?;
 
         // Profiling helper: sync + timestamp when ATLAS_PROFILE=1
         macro_rules! prof {
@@ -62,16 +98,7 @@ impl Qwen3SsmLayer {
             None
         };
 
-        // Diagnostic: sync at entry to catch prior-layer errors
-        if k > 4096 {
-            tracing::info!("SSM prefill ENTRY: k={k} h={h}");
-            ctx.gpu
-                .synchronize(stream)
-                .map_err(|e| anyhow::anyhow!("SSM prefill ENTRY: stream broken (k={k}): {e}"))?;
-        }
-
         // ── 1. RMS norm + residual for N tokens ──
-        let normed = ctx.buffers.norm_output();
         ops::rms_norm_residual(
             ctx.gpu,
             self.rms_norm_residual_k,
@@ -84,12 +111,6 @@ impl Qwen3SsmLayer {
             eps,
             stream,
         )?;
-        if k > 4096 {
-            ctx.gpu
-                .synchronize(stream)
-                .map_err(|e| anyhow::anyhow!("SSM prefill: SYNC after rms_norm (k={k}): {e}"))?;
-        }
-
         prof!("rms_norm_residual", t0);
         t0 = if ctx.profile {
             ctx.gpu.synchronize(stream)?;
@@ -99,13 +120,12 @@ impl Qwen3SsmLayer {
         };
 
         // ── 2+3. QKVZ GEMM (+ deinterleave if needed) ──
-        let deinterleaved = ctx.buffers.ssm_deinterleaved();
-        let proj_dst = if self.sequential_qkvz {
-            deinterleaved
-        } else {
-            ctx.buffers.ssm_qkvz()
-        };
-        if let Some(fp8) = self.qkvz_fp8 {
+        if flashinfer_ssm {
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            self.launch_flashinfer_ssm_qkvz(ctx, k, normed, proj_dst, stream)?;
+            #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+            unreachable!("non-CUDA FlashInfer SSM route passed preflight");
+        } else if let Some(fp8) = self.qkvz_fp8 {
             ops::fp8_gemm_n128(
                 ctx.gpu,
                 self.fp8_gemm_k,
@@ -315,13 +335,51 @@ impl Qwen3SsmLayer {
         };
         let __gdn_path: &'static str;
 
+        // The explicitly gated WY32 gate-cache shadow is byte-identical to the
+        // parent and uses the same selector and dynamic-smem sizing as the
+        // two-phase path. Resolve it before the default tuned route so an
+        // eligible explicit request cannot silently fall back to the parent.
+        let gatecache = super::trait_prefill_gdn::use_wy32_gatecache(
+            crate::layers::gdn_prefill_gatecache_enabled(),
+            self.gdn_prefill_wy32_gatecache_k.0 != 0,
+            k,
+            kd,
+            vd,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if let Some(gdn_c143) = gdn_c143.as_ref() {
+            __gdn_path = "c143_v3";
+            gdn_c143.launch(ctx.gpu)?;
+        } else if gatecache {
+            __gdn_path = "wy32_gatecache";
+            let smem = super::trait_prefill_gdn::wy32_dynamic_smem_bytes(kd, vd, true)
+                .ok_or_else(|| anyhow::anyhow!("WY32 gate-cache shared-memory size overflow"))?;
+            super::trait_prefill_gdn::log_wy32_gatecache_engaged(k);
+            ops::gdn_prefill_persistent_smem(
+                ctx.gpu,
+                self.gdn_prefill_wy32_gatecache_k,
+                ssm_state.h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gates_buf,
+                gates_buf.offset(nv * fp32),
+                gdn_out_buf,
+                1,
+                k,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                conv_dim as u32,
+                gb_stride,
+                smem,
+                stream,
+            )?;
         // wy32 (32 tokens/WY iteration) is the default GDN prefill kernel when
-        // available — matches the two-phase `prefill_gdn_full` path (see
-        // trait_prefill_gdn.rs:100, which already prefers wy32 unconditionally
-        // for total>32). A/B-validated on AEON-Q36-27B: ~3.0 ms/layer vs ~6.3
-        // ms/layer on wy4 (2.1×), 510-tok prefill 840→674 ms, output coherent.
-        // Opt out with ATLAS_GDN_PREFILL_TUNED=0 to fall back to wy4.
-        if std::env::var("ATLAS_GDN_PREFILL_TUNED").ok().as_deref() != Some("0")
+        // available. Opt out with ATLAS_GDN_PREFILL_TUNED=0 to fall back to wy4.
+        } else if std::env::var("ATLAS_GDN_PREFILL_TUNED").ok().as_deref() != Some("0")
             && self.gdn_prefill_wy32_k.0 != 0
             && k > 32
         {
@@ -475,9 +533,23 @@ impl Qwen3SsmLayer {
             None
         };
 
-        // ── 10. Output projection GEMM: [N, 4096] × [4096, 2048] → [N, 2048] ──
-        let out_proj_buf = ctx.buffers.moe_output();
-        self.prefill_out_proj_dispatch(ctx, normed_out_buf, out_proj_buf, k, h, value_dim, stream)?;
+        // ── 10. Output projection GEMM: Qwen3.8 [M,6144] × [5120,6144]ᵀ ──
+        if flashinfer_ssm {
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            self.launch_flashinfer_ssm_output(ctx, k, normed_out_buf, out_proj_buf, stream)?;
+            #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+            unreachable!("non-CUDA FlashInfer SSM route passed preflight");
+        } else {
+            self.prefill_out_proj_dispatch(
+                ctx,
+                normed_out_buf,
+                out_proj_buf,
+                k,
+                h,
+                value_dim,
+                stream,
+            )?;
+        }
 
         prof!("out_proj", t0);
         t0 = if ctx.profile {

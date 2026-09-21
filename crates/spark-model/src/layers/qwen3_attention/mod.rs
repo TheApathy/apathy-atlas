@@ -28,6 +28,9 @@ mod prefill;
 mod prefill_weights;
 mod trait_impl;
 mod types;
+mod yarn;
+#[cfg(test)]
+mod yarn_contract_tests;
 
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;

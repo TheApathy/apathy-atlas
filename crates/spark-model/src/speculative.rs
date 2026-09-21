@@ -57,6 +57,52 @@ pub trait ProposerState: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetTokenAuthority {
+    /// Normal serving policy may transform the target's raw argmax.
+    ServingPolicy,
+    /// Every proposed frame requires an exact raw-target-argmax receipt.
+    ExactRawArgmax,
+}
+
+/// Borrowed target-fed prefix plus the newly emitted token that has not yet
+/// been fed back through the target. The split mirrors the proposal ABI and
+/// avoids cloning a potentially million-token sequence on every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalCommittedPrefix<'a> {
+    pub fed_tokens: &'a [u32],
+    pub pending_token: u32,
+    pub position: usize,
+    pub prompt_len: usize,
+}
+
+impl CanonicalCommittedPrefix<'_> {
+    pub fn validate(self) -> Result<()> {
+        validate_canonical_prefix_lengths(self.position, self.fed_tokens.len(), self.prompt_len)
+    }
+}
+
+fn validate_canonical_prefix_lengths(
+    position: usize,
+    fed_tokens_len: usize,
+    prompt_len: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        position == fed_tokens_len,
+        "canonical prefix position {} != target-fed length {}",
+        position,
+        fed_tokens_len
+    );
+    anyhow::ensure!(
+        prompt_len <= position,
+        "canonical prefix prompt length exceeds position"
+    );
+    position
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("canonical prefix logical length overflow"))?;
+    Ok(())
+}
+
 /// A draft token proposer for speculative decoding.
 ///
 /// The engine calls `propose()` after each target decode to get draft tokens,
@@ -75,6 +121,27 @@ pub trait DraftProposer: Send + Sync {
     /// ngram proposers honor the mask and keep the default `false`.
     fn is_dflash(&self) -> bool {
         false
+    }
+
+    /// Whether this proposer is allowed to run only under a raw-target-argmax
+    /// scheduler receipt. Existing proposers preserve normal serving policy.
+    fn target_token_authority(&self) -> TargetTokenAuthority {
+        TargetTokenAuthority::ServingPolicy
+    }
+
+    /// Synchronize an exact-authority proposer's private model to the target's
+    /// canonical committed boundary. Called only for `ExactRawArgmax`; the
+    /// default rejects so a new exact-authority proposer cannot accidentally
+    /// run without implementing canonical synchronization.
+    fn sync_committed_prefix(
+        &self,
+        prefix: CanonicalCommittedPrefix<'_>,
+        state: &mut dyn ProposerState,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let _ = (prefix, state, ctx, stream);
+        anyhow::bail!("exact-authority proposer did not implement canonical prefix sync")
     }
 
     /// Physical target-verify token capacity, including the bonus/root row.
@@ -343,6 +410,131 @@ mod tests {
     fn non_dflash_proposer_has_no_physical_verify_capacity() {
         let proposer: &dyn DraftProposer = &MockProposer;
         assert_eq!(proposer.physical_verify_k(), None);
+        assert_eq!(
+            proposer.target_token_authority(),
+            TargetTokenAuthority::ServingPolicy
+        );
+    }
+
+    #[test]
+    fn canonical_prefix_is_borrowed_exact_and_overflow_checked() {
+        let tokens = [1, 2, 3, 4];
+        let valid = CanonicalCommittedPrefix {
+            fed_tokens: &tokens,
+            pending_token: 5,
+            position: tokens.len(),
+            prompt_len: 3,
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid.fed_tokens.as_ptr(), tokens.as_ptr());
+        assert_eq!(valid.pending_token, 5);
+
+        assert!(
+            CanonicalCommittedPrefix {
+                position: tokens.len() - 1,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CanonicalCommittedPrefix {
+                prompt_len: tokens.len() + 1,
+                ..valid
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(validate_canonical_prefix_lengths(usize::MAX, usize::MAX, 0).is_err());
+    }
+
+    #[test]
+    fn default_canonical_prefix_sync_fails_closed() {
+        let source = include_str!("speculative.rs");
+        let hook = source.find("fn sync_committed_prefix(").unwrap();
+        let next_method = source[hook..]
+            .find("fn physical_verify_k(")
+            .map(|offset| hook + offset)
+            .unwrap();
+        let body = &source[hook..next_method];
+        assert!(body.contains("anyhow::bail!"));
+        assert!(!body.contains("Ok(())"));
+    }
+
+    #[test]
+    fn model_authority_defaults_and_forwards_from_active_proposer() {
+        let model_trait = include_str!("traits/model.rs");
+        let default = model_trait
+            .split("fn proposer_target_token_authority(")
+            .nth(1)
+            .unwrap()
+            .split("fn dflash_verify_capacity_k(")
+            .next()
+            .unwrap();
+        assert!(default.contains("TargetTokenAuthority::ServingPolicy"));
+
+        let transformer = include_str!("model/trait_impl/mod.rs");
+        let forwarding = transformer
+            .split("fn proposer_target_token_authority(")
+            .nth(1)
+            .unwrap()
+            .split("fn dflash_verify_capacity_k(")
+            .next()
+            .unwrap();
+        assert!(forwarding.contains("self.active_proposer()"));
+        assert!(forwarding.contains("TargetTokenAuthority::ServingPolicy"));
+        assert!(forwarding.contains("p.target_token_authority()"));
+        assert!(!forwarding.contains("p.is_dflash()"));
+    }
+
+    #[test]
+    fn exact_prefix_sync_precedes_token_mirror_and_propose() {
+        let source = include_str!("model/impl_b3.rs");
+        let authority = source.find("let target_token_authority =").unwrap();
+        let early_exit = source[authority..]
+            .find("if Self::early_exit_enabled()")
+            .map(|offset| authority + offset)
+            .unwrap();
+        let early_exit_reject = source[early_exit..]
+            .find("target_token_authority == TargetTokenAuthority::ServingPolicy")
+            .map(|offset| early_exit + offset)
+            .unwrap();
+        let early_exit_return = source[early_exit_reject..]
+            .find("return self.early_exit_propose(")
+            .map(|offset| early_exit_reject + offset)
+            .unwrap();
+        let branch = source[early_exit_return..]
+            .find("TargetTokenAuthority::ExactRawArgmax")
+            .map(|offset| early_exit_return + offset)
+            .unwrap();
+        let sync = source[branch..]
+            .find("proposer.sync_committed_prefix(")
+            .map(|offset| branch + offset)
+            .unwrap();
+        let mirror = source[sync..]
+            .find("let want_token_mirror =")
+            .map(|offset| sync + offset)
+            .unwrap();
+        let propose = source[mirror..]
+            .find("proposer.propose(")
+            .map(|offset| mirror + offset)
+            .unwrap();
+        assert!(
+            authority < early_exit
+                && early_exit < early_exit_reject
+                && early_exit_reject < early_exit_return
+                && early_exit_return < branch
+                && branch < sync
+                && sync < mirror
+                && mirror < propose
+        );
+        let sync_call = &source[sync..mirror];
+        assert!(sync_call.contains("prop_state.as_mut(), &ctx, stream)?;"));
+        let sync_body = &source[branch..mirror];
+        assert!(sync_body.contains("fed_tokens: &seq.tokens"));
+        assert!(!sync_body.contains("to_vec("));
+        assert!(!sync_body.contains("clone("));
+        assert!(!sync_body.contains("collect("));
     }
 
     #[test]

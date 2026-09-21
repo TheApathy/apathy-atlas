@@ -142,6 +142,15 @@ impl TransformerModel {
             return Ok(Vec::new());
         }
 
+        // Physical storage extent is a conservative bound for every tree depth.
+        // Reject replay/overflow before snapshots, embeddings or cache mutation.
+        seq.rotary_positions.tail_scalar(seq.seq_len)?;
+        let last = seq
+            .seq_len
+            .checked_add(k - 1)
+            .ok_or_else(|| anyhow::anyhow!("verify physical extent overflow"))?;
+        seq.rotary_positions.tail_scalar(last)?;
+
         // ATLAS_SSM_H_FP16 stage 2. This entry point does NOT exist upstream —
         // the speculative verify is ours — and it is the one that matters most
         // here, because the WY kernels it dispatches are the h-state readers and
@@ -598,22 +607,23 @@ impl TransformerModel {
             }
         }
 
-        let positions: Vec<u32> = if dfs_active {
+        let rotary_depths: Vec<usize> = if dfs_active {
             // DFS slot i contains kernel slot dfs_perm[i]; its tree depth
             // (kernel frame) is dfs_depths[dfs_perm[i]]. RoPE position is
             // seq.seq_len + depth so siblings at the same depth share
             // a position.
-            (0..k)
-                .map(|t| (seq.seq_len + dfs_depths[dfs_perm[t]]) as u32)
-                .collect()
+            (0..k).map(|t| dfs_depths[dfs_perm[t]]).collect()
         } else if let Some(ref depths) = tree_depths {
             // Kernel slot 0 (bonus) is depth 0 → position seq.seq_len (the
             // last_token's slot). For drafts at depth d, position is
             // seq.seq_len + d.
-            (0..k).map(|t| (seq.seq_len + depths[t]) as u32).collect()
+            (0..k).map(|t| depths[t]).collect()
         } else {
-            (0..k).map(|t| (seq.seq_len + t) as u32).collect()
+            (0..k).collect()
         };
+        let positions = seq
+            .rotary_positions
+            .verify_tail(seq.seq_len, &rotary_depths)?;
         let pos_bytes =
             unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, k * 4) };
         let mut slots = vec![0i64; k];

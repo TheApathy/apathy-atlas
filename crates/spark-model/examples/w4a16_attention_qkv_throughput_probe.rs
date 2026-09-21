@@ -41,7 +41,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use data::{Fixture, as_le_bytes, random_fixture};
-use spark_model::layers::ops::{self, W4a16ExactAttentionKernels, W4a16ExactLmHeadKernels};
+use spark_model::layers::ops::{
+    self, W4a16ExactAttentionKernels, W4a16ExactAttentionM17AStageKernels, W4a16ExactLmHeadKernels,
+};
 use spark_model::weight_map::QuantizedWeight;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -61,6 +63,7 @@ const ROWS: usize = 17; // K=17 DFlash verify width
 const LM_HEAD_N: usize = 65_536;
 
 const ITERS: usize = 50;
+const ABBA_ROUNDS: usize = 3;
 /// 4 output rows per block, matching OUTS_PER_BLOCK in the kernels.
 const OUTS_PER_BLOCK: usize = 4;
 
@@ -70,11 +73,17 @@ fn weight_bytes(n: usize) -> usize {
     n * (HIDDEN / 2 + HIDDEN / 16)
 }
 
-/// Activation bytes the launch pulls through L2. Every block re-reads the
-/// whole [ROWS, HIDDEN] BF16 activation tile once, so this scales with the
-/// block count, not with the tile size.
-fn activation_bytes(n: usize) -> usize {
-    n.div_ceil(OUTS_PER_BLOCK) * ROWS * HIDDEN * 2
+/// Logical activation load requests. The baseline's four independent output
+/// groups each load A, so it requests one [ROWS,K] tile per output row. The
+/// staged candidate requests one tile per four-output CTA. These are not
+/// measured L2 transactions: cache/coalescing/multicast may merge requests.
+fn activation_request_bytes(n: usize, projections: usize, staged: bool) -> usize {
+    let groups = if staged {
+        n.div_ceil(OUTS_PER_BLOCK)
+    } else {
+        n
+    };
+    projections * groups * ROWS * HIDDEN * 2
 }
 
 fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
@@ -106,16 +115,40 @@ fn bench(gpu: &dyn GpuBackend, stream: u64, mut launch: impl FnMut() -> Result<(
     Ok(start.elapsed().as_secs_f64() * 1e3 / ITERS as f64)
 }
 
-fn report(label: &str, ms: f64, n: usize) -> f64 {
-    let w = weight_bytes(n) as f64;
-    let a = activation_bytes(n) as f64;
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+/// Alternate parent/candidate as A/B/B/A in each round so thermal and cache
+/// drift cannot systematically favor one route.
+fn bench_abba(
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    mut parent: impl FnMut() -> Result<()>,
+    mut staged: impl FnMut() -> Result<()>,
+) -> Result<(f64, f64)> {
+    let mut parent_ms = Vec::with_capacity(2 * ABBA_ROUNDS);
+    let mut staged_ms = Vec::with_capacity(2 * ABBA_ROUNDS);
+    for _ in 0..ABBA_ROUNDS {
+        parent_ms.push(bench(gpu, stream, &mut parent)?);
+        staged_ms.push(bench(gpu, stream, &mut staged)?);
+        staged_ms.push(bench(gpu, stream, &mut staged)?);
+        parent_ms.push(bench(gpu, stream, &mut parent)?);
+    }
+    Ok((median(parent_ms), median(staged_ms)))
+}
+
+fn report(label: &str, ms: f64, n: usize, projections: usize, staged: bool) -> f64 {
+    let w = (projections * weight_bytes(n)) as f64;
+    let a = activation_request_bytes(n, projections, staged) as f64;
     let weight_gbs = w / (ms * 1e-3) / 1e9;
-    let l2_gbs = a / (ms * 1e-3) / 1e9;
+    let request_gbs = a / (ms * 1e-3) / 1e9;
     println!(
-        "  {label:<22} N={n:>6}  blocks={:>6}  {ms:>7.3} ms/launch  \
+        "  {label:<27} N={n:>6}  blocks={:>6}  {ms:>7.3} ms/launch  \
          weights {:>6.1} MB @ {weight_gbs:>6.1} GB/s  \
-         activations {:>7.1} MB @ {l2_gbs:>7.1} GB/s (L2)",
-        n.div_ceil(OUTS_PER_BLOCK),
+         A-requests {:>7.1} MB @ {request_gbs:>7.1} GB/s (logical)",
+        projections * n.div_ceil(OUTS_PER_BLOCK),
         w / 1e6,
         a / 1e6,
     );
@@ -131,6 +164,16 @@ fn main() -> Result<()> {
     let attn = W4a16ExactAttentionKernels::new(
         gpu.kernel("w4a16_gemv_exact_attention", "w4a16_gemv_qg_exact_m17")?,
         gpu.kernel("w4a16_gemv_exact_attention", "w4a16_gemv_dual_kv_exact_m17")?,
+    );
+    let astage = W4a16ExactAttentionM17AStageKernels::new(
+        gpu.kernel(
+            "w4a16_gemv_exact_attention",
+            "w4a16_gemv_qg_exact_m17_astage",
+        )?,
+        gpu.kernel(
+            "w4a16_gemv_exact_attention",
+            "w4a16_gemv_dual_kv_exact_m17_astage",
+        )?,
     );
     let lm_head = W4a16ExactLmHeadKernels::new(
         gpu.kernel("w4a16_gemv", "w4a16_gemv_batch_logits_exact_m4")?,
@@ -157,10 +200,10 @@ fn main() -> Result<()> {
     let k_out = gpu.alloc(ROWS * KV_DIM * size_of::<u16>())?;
     let v_out = gpu.alloc(ROWS * KV_DIM * size_of::<u16>())?;
 
-    let q_ms = bench(gpu, stream, || {
+    let q_launch = |kernel| {
         ops::w4a16_gemv_qg_exact(
             gpu,
-            attn.qg_for_rows(ROWS),
+            kernel,
             input,
             &q_w,
             q_out,
@@ -172,15 +215,22 @@ fn main() -> Result<()> {
             Q_PROJ_DIM as u32,
             stream,
         )
-    })?;
-    let q_gbs = report("attention gated-Q", q_ms, Q_PROJ_DIM);
+    };
+    let (q_ms, q_astage_ms) = bench_abba(
+        gpu,
+        stream,
+        || q_launch(attn.qg_for_rows(ROWS)),
+        || q_launch(astage.qg()),
+    )?;
+    let q_gbs = report("attention gated-Q parent", q_ms, Q_PROJ_DIM, 1, false);
+    report("attention gated-Q staged", q_astage_ms, Q_PROJ_DIM, 1, true);
 
     // The dual kernel does K and V in one launch via grid.z, so it streams two
     // KV_DIM weight matrices; charge it both.
-    let kv_ms = bench(gpu, stream, || {
+    let kv_launch = |kernel| {
         ops::w4a16_gemv_dual_kv_exact(
             gpu,
-            attn.dual_kv_for_rows(ROWS),
+            kernel,
             input,
             &k_w,
             k_out,
@@ -192,8 +242,15 @@ fn main() -> Result<()> {
             KV_DIM as u32,
             stream,
         )
-    })?;
-    let kv_gbs = report("attention dual-K/V", kv_ms, 2 * KV_DIM);
+    };
+    let (kv_ms, kv_astage_ms) = bench_abba(
+        gpu,
+        stream,
+        || kv_launch(attn.dual_kv_for_rows(ROWS)),
+        || kv_launch(astage.dual_kv()),
+    )?;
+    let kv_gbs = report("attention dual-K/V parent", kv_ms, KV_DIM, 2, false);
+    report("attention dual-K/V staged", kv_astage_ms, KV_DIM, 2, true);
 
     for ptr in [q_out, k_out, v_out] {
         gpu.free(ptr)?;
@@ -216,13 +273,18 @@ fn main() -> Result<()> {
             false,
         )
     })?;
-    let lm_gbs = report("lm_head control", lm_ms, LM_HEAD_N);
+    let lm_gbs = report("lm_head control", lm_ms, LM_HEAD_N, 1, false);
 
     let per_layer_ms = q_ms + kv_ms;
+    let staged_per_layer_ms = q_astage_ms + kv_astage_ms;
     println!(
-        "\nper full-attention layer: {per_layer_ms:.3} ms  \
-         x16 layers = {:.2} ms/step (profile attributes 14.2 ms)",
-        per_layer_ms * 16.0
+        "\nparent per full-attention layer: {per_layer_ms:.3} ms, x16 = {:.2} ms/step\n\
+         staged per full-attention layer: {staged_per_layer_ms:.3} ms, x16 = {:.2} ms/step\n\
+         staged delta: {:.2} ms/step ({:.1}%) (profile attributes parent 14.2 ms)",
+        per_layer_ms * 16.0,
+        staged_per_layer_ms * 16.0,
+        (staged_per_layer_ms - per_layer_ms) * 16.0,
+        100.0 * (staged_per_layer_ms / per_layer_ms - 1.0),
     );
     println!(
         "attention-vs-lm_head bytes/s ratio: Q {:.2}x, K/V {:.2}x  \

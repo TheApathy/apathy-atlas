@@ -88,6 +88,8 @@ enum ProjectionWeight {
 
 /// Per-sequence MTP proposer state.
 pub struct MtpProposerState {
+    /// Target rotary map; own cache indices/length remain physical.
+    pub rotary_positions: crate::traits::RotaryPositions,
     /// Block table for MTP's own KV cache.
     pub block_table: Vec<u32>,
     /// Current sequence length in MTP's KV cache.
@@ -176,6 +178,7 @@ pub struct MtpHead {
     w4a16_gemv_qg_k: KernelHandle,
     w4a16_gemv_dual_k: KernelHandle,
     rope_k: KernelHandle,
+    rope_mrope_k: Option<KernelHandle>,
     reshape_cache_k: KernelHandle,
     paged_decode_k: KernelHandle,
     residual_add_k: KernelHandle,
@@ -293,10 +296,12 @@ impl MtpHead {
 mod forward;
 mod moe_forward;
 mod new;
+mod rotary;
 
 impl DraftProposer for MtpHead {
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         Ok(Box::new(MtpProposerState {
+            rotary_positions: crate::traits::RotaryPositions::identity(),
             block_table: Vec::new(),
             seq_len: 0,
             last_num_drafted: 0,
@@ -321,6 +326,7 @@ impl DraftProposer for MtpHead {
             .downcast_mut::<MtpProposerState>()
             .ok_or_else(|| anyhow::anyhow!("Invalid MTP proposer state"))?;
 
+        self.validate_rotary_span(mtp_state, position, num_drafts, ctx)?;
         let mut drafts = Vec::with_capacity(num_drafts);
         let mut current_token = last_token;
         let mut current_hidden = target_hidden;
@@ -447,6 +453,7 @@ mod tests {
     #[test]
     fn test_mtp_proposer_state_downcast() {
         let state: Box<dyn ProposerState> = Box::new(MtpProposerState {
+            rotary_positions: crate::traits::RotaryPositions::identity(),
             block_table: vec![0, 1, 2],
             seq_len: 42,
             last_num_drafted: 0,

@@ -29,6 +29,19 @@ pub struct MessagesRequest {
     pub thinking: Option<ThinkingConfig>,
 }
 
+impl MessagesRequest {
+    pub(super) fn contains_image(&self) -> bool {
+        if matches!(&self.system, Some(SystemContent::Blocks(blocks))
+            if blocks.iter().any(|block| block.block_type == "image")) {
+            return true;
+        }
+        self.messages.iter().any(|message| match &message.content {
+            AnthropicContent::Text(_) => false,
+            AnthropicContent::Blocks(blocks) => blocks.iter().any(ContentBlock::contains_image),
+        })
+    }
+}
+
 /// System content: either a plain string or an array of content blocks.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -120,8 +133,25 @@ pub enum ContentBlock {
         #[allow(dead_code)]
         thinking: Option<String>,
     },
+    #[serde(rename = "image")]
+    Image {
+        source: super::image_content::ImageSource,
+    },
     #[serde(other)]
     Unknown,
+}
+
+impl ContentBlock {
+    pub(super) fn contains_image(&self) -> bool {
+        match self {
+            Self::Image { .. } => true,
+            Self::ToolResult {
+                content: Some(content),
+                ..
+            } => content.contains_image(),
+            _ => false,
+        }
+    }
 }
 
 /// Tool result content: string or nested blocks.
@@ -144,6 +174,13 @@ impl ToolResultContent {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
+        }
+    }
+
+    fn contains_image(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Blocks(blocks) => blocks.iter().any(ContentBlock::contains_image),
         }
     }
 }

@@ -4,7 +4,7 @@
 
 #![allow(unused_imports)]
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
@@ -235,6 +235,72 @@ pub fn w4a16_gemm_pipe(
         .arg_ptr(weight.weight_scale)
         .arg_f32(weight.weight_scale_2)
         .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// W4A16 up projection with a fused SiLU(gate) * up epilogue.
+///
+/// The CUDA kernel retains the exact `w4a16_gemm_pipe` accumulation and BF16
+/// up-projection round trip, then applies the same scalar expression as
+/// `moe_silu_mul`. `gate_in_out` is updated in place.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe_silu_mul(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    gate_in_out: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(gate_in_out)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Full gate+up+SiLU fusion for the exact large-M prefill pipe route.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemm_pipe_dual(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    gate: &QuantizedWeight,
+    up: &QuantizedWeight,
+    output_first: DevicePtr,
+    output_second: DevicePtr,
+    fuse_silu: bool,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, 64), div_ceil(m, 64), 1])
+        .block([128, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(gate.weight)
+        .arg_ptr(gate.weight_scale)
+        .arg_f32(gate.weight_scale_2)
+        .arg_ptr(up.weight)
+        .arg_ptr(up.weight_scale)
+        .arg_f32(up.weight_scale_2)
+        .arg_ptr(output_first)
+        .arg_ptr(output_second)
+        .arg_u32(u32::from(fuse_silu))
         .arg_u32(m)
         .arg_u32(n)
         .arg_u32(k)
@@ -746,6 +812,218 @@ pub fn quantize_bf16_to_nvfp4(
         .launch(stream)
 }
 
+/// Byte-exact Atlas activation quantization with CUTLASS 128x4 physical
+/// scale placement. Unlike [`quantize_bf16_to_nvfp4`], `scale_out` includes
+/// explicit row padding to a multiple of 128 so it can be consumed directly
+/// by the FlashInfer SM121 NVFP4 GEMM ABI.
+///
+/// Grid: (min(padded_rows, 96), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_bf16_to_nvfp4_atlas_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "Atlas 128x4 NVFP4 quantizer handle is missing"
+    );
+    ensure!(rows > 0, "Atlas 128x4 NVFP4 quantizer requires rows > 0");
+    ensure!(
+        cols >= 16 && cols.is_multiple_of(16),
+        "Atlas 128x4 NVFP4 quantizer requires cols >= 16 and cols % 16 == 0; got {cols}"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "Atlas 128x4 NVFP4 quantizer requires a finite positive scale2"
+    );
+    ensure!(
+        !input.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "Atlas 128x4 NVFP4 quantizer received a null device pointer"
+    );
+    let padded_rows = div_ceil(rows, 128) * 128;
+    KernelLaunch::new(gpu, kernel)
+        .grid([padded_rows.min(96), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
+/// Fuse the SwiGLU boundary with NVFP4 activation quantization.
+///
+/// Reads independent BF16 gate/up projections `[N, K]`, reproduces the
+/// standalone `moe_silu_mul` BF16 round trip in registers, and emits packed
+/// E2M1 values plus E4M3 group scales for the W4A4 down projection.
+///
+/// Grid: (N, 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_silu_mul_bf16_to_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "fused SwiGLU NVFP4 quantizer handle is missing"
+    );
+    ensure!(n > 0, "fused SwiGLU NVFP4 quantizer requires N > 0");
+    ensure!(
+        k >= 16 && k.is_multiple_of(16),
+        "fused SwiGLU NVFP4 quantizer requires K >= 16 and K % 16 == 0; got {k}"
+    );
+    ensure!(
+        !gate.is_null() && !up.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "fused SwiGLU NVFP4 quantizer requires non-null gate, up, packed, and scale pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "fused SwiGLU NVFP4 quantizer requires a finite positive scale2; got {scale2}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Fuse the BF16-rounded SwiGLU boundary with NVFP4 quantization and emit
+/// FlashInfer/CUTLASS padded 128x4 physical scales.
+///
+/// This ABI is deliberately separate from [`quantize_silu_mul_bf16_to_nvfp4`],
+/// whose logical scale layout remains the W4A4 contract.
+///
+/// Grid: (min(padded_rows, 96), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_silu_mul_bf16_to_nvfp4_atlas_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gate: DevicePtr,
+    up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "fused SwiGLU Atlas 128x4 NVFP4 quantizer handle is missing"
+    );
+    ensure!(
+        rows > 0,
+        "fused SwiGLU Atlas 128x4 NVFP4 quantizer requires rows > 0"
+    );
+    ensure!(
+        cols >= 64 && cols.is_multiple_of(64),
+        "fused SwiGLU Atlas 128x4 NVFP4 quantizer requires cols >= 64 and cols % 64 == 0; got {cols}"
+    );
+    ensure!(
+        !gate.is_null() && !up.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "fused SwiGLU Atlas 128x4 NVFP4 quantizer requires non-null gate, up, packed, and scale pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "fused SwiGLU Atlas 128x4 NVFP4 quantizer requires a finite positive scale2; got {scale2}"
+    );
+    let padded_rows = rows
+        .checked_add(127)
+        .and_then(|value| (value / 128).checked_mul(128))
+        .ok_or_else(|| anyhow::anyhow!("fused SwiGLU Atlas 128x4 row padding overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([padded_rows.min(96), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gate)
+        .arg_ptr(up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
+/// Read a merged `[rows, gate cols | up cols]` BF16 projection once, apply
+/// the BF16-rounded SwiGLU boundary, and emit NVFP4 activation bytes plus
+/// FlashInfer/CUTLASS padded 128x4 physical scales.
+///
+/// This ABI is separate from the two-input fused quantizer so the production
+/// route cannot accidentally reinterpret independent gate/up allocations as a
+/// merged row.
+///
+/// Grid: (min(padded_rows, 96), 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    merged_gate_up: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    rows: u32,
+    cols: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0,
+        "merged SwiGLU Atlas 128x4 NVFP4 quantizer handle is missing"
+    );
+    ensure!(
+        rows > 0,
+        "merged SwiGLU Atlas 128x4 NVFP4 quantizer requires rows > 0"
+    );
+    ensure!(
+        cols >= 64 && cols.is_multiple_of(64),
+        "merged SwiGLU Atlas 128x4 NVFP4 quantizer requires cols >= 64 and cols % 64 == 0; got {cols}"
+    );
+    ensure!(
+        !merged_gate_up.is_null() && !packed_out.is_null() && !scale_out.is_null(),
+        "merged SwiGLU Atlas 128x4 NVFP4 quantizer requires non-null merged, packed, and scale pointers"
+    );
+    ensure!(
+        scale2.is_finite() && scale2 > 0.0,
+        "merged SwiGLU Atlas 128x4 NVFP4 quantizer requires a finite positive scale2; got {scale2}"
+    );
+    let padded_rows = rows
+        .checked_add(127)
+        .and_then(|value| (value / 128).checked_mul(128))
+        .ok_or_else(|| anyhow::anyhow!("merged SwiGLU Atlas 128x4 row padding overflow"))?;
+    KernelLaunch::new(gpu, kernel)
+        .grid([padded_rows.min(96), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(merged_gate_up)
+        .arg_ptr(packed_out)
+        .arg_ptr(scale_out)
+        .arg_f32(scale2)
+        .arg_u32(rows)
+        .arg_u32(cols)
+        .launch(stream)
+}
+
 /// Native NVFP4×NVFP4 (W4A4) tensor-core GEMM.
 ///
 /// Both A and B are pre-quantized to NVFP4 (E2M1 nibbles + FP8 E4M3 per-
@@ -784,6 +1062,135 @@ pub fn nvfp4_nvfp4_gemm(
         .arg_ptr(a_scale)
         .arg_ptr(b_packed)
         .arg_ptr(b_scale)
+        .arg_f32(scale2_ab)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// K-major M=128 native NVFP4×NVFP4 tensor-core GEMM.
+///
+/// Numerically mirrors [`nvfp4_nvfp4_gemm`], but consumes Atlas's existing
+/// transposed weight buffers:
+///
+/// - `B_packed_t`: `[K/2, N]`
+/// - `B_scale_t`: `[K/16, N]`
+///
+/// Eight warps own one 16-row fragment each, allowing one staged B tile to
+/// serve 128 prompt rows. The caller must require `N % 128 == 0` and
+/// `K % 64 == 0`; those constraints also guarantee that logical `N` is the
+/// transform's physical leading dimension.
+///
+/// Kernel: `nvfp4_nvfp4_gemm_kmajor_m128`
+/// Grid: `(N / 128, ceil(M / 128), 1)`  Block: `(256, 1, 1)`
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_nvfp4_gemm_kmajor_m128(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed_t: DevicePtr,
+    b_scale_t: DevicePtr,
+    scale2_ab: f32,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(kernel.0 != 0, "K-major W4A4 kernel handle is missing");
+    ensure!(m > 0, "K-major W4A4 requires M > 0");
+    ensure!(
+        n >= 128 && n.is_multiple_of(128),
+        "K-major W4A4 requires N >= 128 and N % 128 == 0; got {n}"
+    );
+    ensure!(
+        k >= 64 && k.is_multiple_of(64),
+        "K-major W4A4 requires K >= 64 and K % 64 == 0; got {k}"
+    );
+    ensure!(
+        !a_packed.is_null()
+            && !a_scale.is_null()
+            && !b_packed_t.is_null()
+            && !b_scale_t.is_null()
+            && !output.is_null(),
+        "K-major W4A4 requires non-null activation, weight, scale, and output pointers"
+    );
+    ensure!(
+        scale2_ab.is_finite() && scale2_ab >= 0.0,
+        "K-major W4A4 requires a finite non-negative combined scale; got {scale2_ab}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 128), 1])
+        .block([256, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed_t)
+        .arg_ptr(b_scale_t)
+        .arg_f32(scale2_ab)
+        .arg_ptr(output)
+        .arg_u32(m)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// K-major M=256 native NVFP4×NVFP4 tensor-core GEMM.
+///
+/// This is the sixteen-warp long-prefill shadow of
+/// [`nvfp4_nvfp4_gemm_kmajor_m128`]. Each warp retains one m16n128 output
+/// fragment, while a single staged K-major weight tile serves all 256 rows.
+/// The caller must use it only for sufficiently large M to keep the reduced
+/// CTA grid saturated; the production dispatch currently starts at M=2048.
+///
+/// Kernel: `nvfp4_nvfp4_gemm_kmajor_m256`
+/// Grid: `(N / 128, ceil(M / 256), 1)`  Block: `(512, 1, 1)`
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp4_nvfp4_gemm_kmajor_m256(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    a_packed: DevicePtr,
+    a_scale: DevicePtr,
+    b_packed_t: DevicePtr,
+    b_scale_t: DevicePtr,
+    scale2_ab: f32,
+    output: DevicePtr,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(kernel.0 != 0, "K-major M256 W4A4 kernel handle is missing");
+    ensure!(m >= 2048, "K-major M256 W4A4 requires M >= 2048; got {m}");
+    ensure!(
+        n >= 128 && n.is_multiple_of(128),
+        "K-major M256 W4A4 requires N >= 128 and N % 128 == 0; got {n}"
+    );
+    ensure!(
+        k >= 64 && k.is_multiple_of(64),
+        "K-major M256 W4A4 requires K >= 64 and K % 64 == 0; got {k}"
+    );
+    ensure!(
+        !a_packed.is_null()
+            && !a_scale.is_null()
+            && !b_packed_t.is_null()
+            && !b_scale_t.is_null()
+            && !output.is_null(),
+        "K-major M256 W4A4 requires non-null activation, weight, scale, and output pointers"
+    );
+    ensure!(
+        scale2_ab.is_finite() && scale2_ab >= 0.0,
+        "K-major M256 W4A4 requires a finite non-negative combined scale; got {scale2_ab}"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, div_ceil(m, 256), 1])
+        .block([512, 1, 1])
+        .arg_ptr(a_packed)
+        .arg_ptr(a_scale)
+        .arg_ptr(b_packed_t)
+        .arg_ptr(b_scale_t)
         .arg_f32(scale2_ab)
         .arg_ptr(output)
         .arg_u32(m)

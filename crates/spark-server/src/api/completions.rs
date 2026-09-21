@@ -219,12 +219,14 @@ pub async fn completions(
     };
 
     let prompt_len = prompt_tokens.len();
-    if prompt_len >= state.max_seq_len {
+    if super::context_budget::admitted_total(prompt_len, req.max_tokens, state.max_seq_len)
+        .is_none()
+    {
         return openai_error_response(
             StatusCode::BAD_REQUEST,
             format!(
-                "Prompt too long: {prompt_len} tokens exceeds max_seq_len {}",
-                state.max_seq_len
+                "Context too long: {prompt_len} prompt + {} requested output tokens exceeds max_seq_len {}",
+                req.max_tokens, state.max_seq_len
             ),
         );
     }

@@ -32,6 +32,32 @@ use crate::layers::ops::{W3_GROUP_SIZE, parse_w3_layer_set, w3_row_bytes, w3_tra
 
 use super::QuantizedWeight;
 
+#[path = "w3_sidecar/admission.rs"]
+mod admission;
+pub use admission::W3SidecarRequest;
+
+#[path = "w3_sidecar/digest.rs"]
+mod digest;
+
+#[path = "w3_sidecar/manifest.rs"]
+mod manifest;
+
+#[path = "w3_sidecar/session.rs"]
+mod session;
+pub use session::{W3SidecarReceipt, W3SidecarSession};
+
+#[cfg(test)]
+#[path = "w3_sidecar/admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(test)]
+#[path = "w3_sidecar/session_tests.rs"]
+mod session_tests;
+
+#[cfg(test)]
+#[path = "w3_sidecar/session_upload_tests.rs"]
+mod session_upload_tests;
+
 /// Layer set parsed from `ATLAS_FFN_W3_LAYERS` (empty when unset).
 pub fn w3_layer_set() -> &'static BTreeSet<usize> {
     static SET: OnceLock<BTreeSet<usize>> = OnceLock::new();

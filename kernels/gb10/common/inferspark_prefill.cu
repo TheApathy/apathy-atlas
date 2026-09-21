@@ -49,6 +49,8 @@ extern "C" __global__ void inferspark_prefill(
     const __nv_bfloat16* __restrict__ V,
     __nv_bfloat16* __restrict__ O,
     const unsigned int seq_len,
+    const unsigned int query_start,
+    const unsigned int query_len_total,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
@@ -65,9 +67,9 @@ extern "C" __global__ void inferspark_prefill(
 
     if (q_head >= num_q_heads) return;
 
-    const unsigned int q_start = q_block * BR;
-    if (q_start >= seq_len) return;
-    const unsigned int q_end = min(q_start + BR, seq_len);
+    const unsigned int q_start = query_start + q_block * BR;
+    if (q_start >= seq_len || q_start >= query_start + query_len_total) return;
+    const unsigned int q_end = min(q_start + BR, min(seq_len, query_start + query_len_total));
     const unsigned int q_len = q_end - q_start;
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
@@ -507,18 +509,40 @@ extern "C" __global__ void inferspark_prefill(
 #define TILE_CHUNKS_Q64 (BR64 * (HDIM / 8))  // 2048
 #define TILE_CHUNKS_KV  (BC * (HDIM / 8))     // 1024
 
-extern "C" __global__ void inferspark_prefill_64(
+#ifndef ATLAS_PREFILL_64_KERNEL_NAME
+#define ATLAS_PREFILL_64_KERNEL_NAME inferspark_prefill_64
+#endif
+#ifndef ATLAS_PREFILL_64_EXTRA_ARGS
+#define ATLAS_PREFILL_64_EXTRA_ARGS
+#endif
+#ifndef ATLAS_PREFILL_64_GATE_SETUP
+#define ATLAS_PREFILL_64_GATE_SETUP
+#endif
+#ifndef ATLAS_PREFILL_64_STORE_PAIR
+#define ATLAS_PREFILL_64_STORE_PAIR(base, row, stride, col, value0, value1, inv_l) do { \
+    unsigned int lo = (unsigned int)__bfloat16_as_ushort(                             \
+        __float2bfloat16((value0) * (inv_l)));                                        \
+    unsigned int hi = (unsigned int)__bfloat16_as_ushort(                             \
+        __float2bfloat16((value1) * (inv_l)));                                        \
+    *(unsigned int*)&(base)[(row) * (stride) + (col)] = lo | (hi << 16);              \
+} while (0)
+#endif
+
+extern "C" __global__ void ATLAS_PREFILL_64_KERNEL_NAME(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K,
     const __nv_bfloat16* __restrict__ V,
     __nv_bfloat16* __restrict__ O,
     const unsigned int seq_len,
+    const unsigned int query_start,
+    const unsigned int query_len_total,
     const unsigned int num_q_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
     const float inv_sqrt_d,
     const unsigned int causal,
     const unsigned int sliding_window   // 0 = no sliding limit
+    ATLAS_PREFILL_64_EXTRA_ARGS
 ) {
     const unsigned int q_head = blockIdx.x;
     const unsigned int q_block = blockIdx.y;
@@ -529,9 +553,9 @@ extern "C" __global__ void inferspark_prefill_64(
 
     if (q_head >= num_q_heads) return;
 
-    const unsigned int q_start = q_block * BR64;
-    if (q_start >= seq_len) return;
-    const unsigned int q_end = min(q_start + BR64, seq_len);
+    const unsigned int q_start = query_start + q_block * BR64;
+    if (q_start >= seq_len || q_start >= query_start + query_len_total) return;
+    const unsigned int q_end = min(q_start + BR64, min(seq_len, query_start + query_len_total));
     const unsigned int q_len = q_end - q_start;
 
     const unsigned int gqa_ratio = num_q_heads / num_kv_heads;
@@ -544,6 +568,7 @@ extern "C" __global__ void inferspark_prefill_64(
     const __nv_bfloat16* K_batch = K + batch * seq_len * kv_seq_stride;
     const __nv_bfloat16* V_batch = V + batch * seq_len * kv_seq_stride;
     __nv_bfloat16* O_batch = O + batch * seq_len * q_seq_stride;
+    ATLAS_PREFILL_64_GATE_SETUP
 
     __shared__ __nv_bfloat16 smem_Q[BR64][HDIM_PAD];
     __shared__ __nv_bfloat16 smem_K64[2][BC][HDIM_PAD];
@@ -914,14 +939,14 @@ extern "C" __global__ void inferspark_prefill_64(
             unsigned int gr1 = q_start + row1;
 
             if (gr0 < seq_len && row0 < q_len && col0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][0] * inv_l0));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][1] * inv_l0));
-                *(unsigned int*)&o_base[gr0 * q_seq_stride + col0] = lo | (hi << 16);
+                ATLAS_PREFILL_64_STORE_PAIR(
+                    o_base, gr0, q_seq_stride, col0,
+                    acc_o[nt][0], acc_o[nt][1], inv_l0);
             }
             if (gr1 < seq_len && row1 < q_len && col0 < head_dim) {
-                unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][2] * inv_l1));
-                unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(acc_o[nt][3] * inv_l1));
-                *(unsigned int*)&o_base[gr1 * q_seq_stride + col0] = lo | (hi << 16);
+                ATLAS_PREFILL_64_STORE_PAIR(
+                    o_base, gr1, q_seq_stride, col0,
+                    acc_o[nt][2], acc_o[nt][3], inv_l1);
             }
         }
     }

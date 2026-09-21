@@ -51,7 +51,6 @@ extern "C" __global__ void rope_forward_mrope_interleaved(
 
     const bool is_q = (head_idx < num_q_heads);
     const unsigned int head = is_q ? head_idx : (head_idx - num_q_heads);
-    const unsigned int num_heads = is_q ? num_q_heads : num_kv_heads;
 
     if (!is_q && head >= num_kv_heads) return;
 
@@ -104,4 +103,82 @@ extern "C" __global__ void rope_forward_mrope_interleaved(
 
     ptr[d0] = __float2bfloat16(y0);
     ptr[d1] = __float2bfloat16(y1);
+}
+
+// Static YaRN variant used by Qwen3.8 beyond its native 262,144-token
+// window. The section routing and rotate-half layout remain identical to
+// rope_forward_mrope_interleaved; only the inverse-frequency schedule and
+// cos/sin amplitude follow Transformers' YaRN reference.
+extern "C" __global__ void rope_forward_mrope_interleaved_yarn(
+    __nv_bfloat16* __restrict__ Q,
+    __nv_bfloat16* __restrict__ K,
+    const unsigned int* __restrict__ pos_t,
+    const unsigned int* __restrict__ pos_h,
+    const unsigned int* __restrict__ pos_w,
+    const unsigned int seq_len,
+    const unsigned int num_q_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int rotary_dim,
+    const float theta,
+    const float factor,
+    const float correction_low,
+    const float correction_high,
+    const float attention_factor
+) {
+    // The distinct scaled ABI puts the potentially large sequence grid in X
+    // (up to 250,000 blocks for a one-shot 1M-token chunk) and the small
+    // combined Q/KV head grid in Y, whose architectural limit is 65,535.
+    const unsigned int seq_block = blockIdx.x;
+    const unsigned int head_idx = blockIdx.y;
+    const unsigned int batch = blockIdx.z;
+    const unsigned int tid = threadIdx.x;
+
+    const bool is_q = head_idx < num_q_heads;
+    const unsigned int head = is_q ? head_idx : head_idx - num_q_heads;
+    if (!is_q && head >= num_kv_heads) return;
+
+    const unsigned int pairs_per_pos = rotary_dim / 2;
+    if (pairs_per_pos == 0) return;
+    const unsigned int pos_per_block = 128 / pairs_per_pos;
+    if (pos_per_block == 0) return;
+    const unsigned int local_pos = tid / pairs_per_pos;
+    const unsigned int pair_idx = tid % pairs_per_pos;
+    const unsigned int seq_pos = seq_block * pos_per_block + local_pos;
+    if (seq_pos >= seq_len || local_pos >= pos_per_block) return;
+
+    const size_t token_idx = (size_t)batch * (size_t)seq_len + (size_t)seq_pos;
+    const unsigned int section = pair_idx % 3;
+    const unsigned int abs_pos = section == 0 ? pos_t[token_idx]
+        : (section == 1 ? pos_h[token_idx] : pos_w[token_idx]);
+
+    const double exponent = (double)(2 * pair_idx) / (double)rotary_dim;
+    const float inv_freq_extrap = (float)(1.0 / pow((double)theta, exponent));
+    const float inv_freq_interp = inv_freq_extrap / factor;
+    float denominator = correction_high - correction_low;
+    if (fabsf(denominator) < 1.0e-6f) denominator += 0.001f;
+    const float ramp = fminf(1.0f, fmaxf(0.0f,
+        ((float)pair_idx - correction_low) / denominator));
+    const float inv_freq = inv_freq_interp * ramp + inv_freq_extrap * (1.0f - ramp);
+    const float angle = (float)abs_pos * inv_freq;
+    const float cos_val = cosf(angle) * attention_factor;
+    const float sin_val = sinf(angle) * attention_factor;
+
+    __nv_bfloat16* ptr;
+    if (is_q) {
+        ptr = Q + (size_t)batch * (size_t)seq_len * (size_t)num_q_heads * (size_t)head_dim
+                + (size_t)seq_pos * (size_t)num_q_heads * (size_t)head_dim
+                + (size_t)head * (size_t)head_dim;
+    } else {
+        ptr = K + (size_t)batch * (size_t)seq_len * (size_t)num_kv_heads * (size_t)head_dim
+                + (size_t)seq_pos * (size_t)num_kv_heads * (size_t)head_dim
+                + (size_t)head * (size_t)head_dim;
+    }
+    const unsigned int half_rot = rotary_dim / 2;
+    const unsigned int d0 = pair_idx;
+    const unsigned int d1 = pair_idx + half_rot;
+    const float x0 = (float)ptr[d0];
+    const float x1 = (float)ptr[d1];
+    ptr[d0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
+    ptr[d1] = __float2bfloat16(x1 * cos_val + x0 * sin_val);
 }

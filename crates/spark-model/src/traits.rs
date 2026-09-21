@@ -10,6 +10,9 @@ use spark_runtime::gpu::DevicePtr;
 use crate::layer::LayerState;
 use crate::speculative::ProposerState;
 
+mod rotary_positions;
+pub use rotary_positions::{ImageSpan, RotaryPositions};
+
 /// Result of a mixed forward pass (decode + prefill in one pass).
 pub struct MixedForwardResult {
     /// Logits for decode sequences: [N, vocab_size] BF16.
@@ -77,6 +80,8 @@ pub struct SequenceState {
     pub block_table: Vec<u32>,
     /// Current sequence length (prompt + generated).
     pub seq_len: usize,
+    /// Immutable target rotary coordinates; cache/token indices stay physical.
+    pub rotary_positions: RotaryPositions,
     /// Per-layer state (EmptyLayerState for attention, SsmLayerState for SSM).
     pub layer_states: Vec<Box<dyn LayerState>>,
     /// Per-sequence state for the speculative proposer on the ACTIVE arm

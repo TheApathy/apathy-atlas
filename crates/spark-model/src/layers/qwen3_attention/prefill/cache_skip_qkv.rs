@@ -38,6 +38,33 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if self.try_flashinfer_projection_qgkv(normed, n, h, q_proj_dim, kv_dim, ctx, stream)? {
+            return Ok(());
+        }
+
+        let k_contiguous = ctx.buffers.ssm_qkvz();
+        let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
+        let k_nvfp4 = self.k_weight.as_ref().and_then(|weight| weight.as_nvfp4());
+        let v_nvfp4 = self.v_weight.as_ref().and_then(|weight| weight.as_nvfp4());
+        let compatible_weights = k_nvfp4.is_some()
+            && v_nvfp4.is_some()
+            && self.k_fp8w_t.is_none()
+            && self.v_fp8w_t.is_none()
+            && self.k_fp8.is_none()
+            && self.v_fp8.is_none();
+        // Select before Q so an eligible explicit request cannot partially run
+        // the parent Q/K/V sequence and then fail or silently fall back.
+        let dual_kv = super::paged_qkv::use_prefill_kv_dual(
+            crate::layers::prefill_kv_dual_enabled(),
+            self.w4a16_gemm_pipe_dual_k.0 != 0,
+            n,
+            h,
+            !crate::layers::prefill_proj_fast_enabled(),
+            compatible_weights,
+        )
+        .map_err(anyhow::Error::msg)?;
+
         let qg_out = ctx.buffers.qkv_output();
         self.cache_skip_one_proj(
             SkipProj::Q,
@@ -50,7 +77,26 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
-        let k_contiguous = ctx.buffers.ssm_qkvz();
+
+        if dual_kv {
+            ops::w4a16_gemm_pipe_dual(
+                ctx.gpu,
+                self.w4a16_gemm_pipe_dual_k,
+                normed,
+                k_nvfp4.unwrap(),
+                v_nvfp4.unwrap(),
+                k_contiguous,
+                v_contiguous,
+                false,
+                n,
+                nkv * hd,
+                h,
+                stream,
+            )?;
+            super::mark_prefill_kv_dual_cache_skip_engaged();
+            return Ok(());
+        }
+
         self.cache_skip_one_proj(
             SkipProj::K,
             normed,
@@ -62,7 +108,6 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
-        let v_contiguous = k_contiguous.offset(num_tokens * kv_dim * bf16);
         self.cache_skip_one_proj(
             SkipProj::V,
             normed,

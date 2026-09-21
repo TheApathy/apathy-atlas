@@ -9,7 +9,7 @@
 //! into the per-seq QKV layout. The sequential path repeats the GEMV per
 //! token but supports every weight encoding.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::ctx::MultiSeqCtx;
@@ -36,14 +36,14 @@ use crate::weight_map::QuantizedWeight;
 /// layer and caused deterministic 17-token coding stops. Gated layers
 /// therefore require the explicit unsafe profiling opt-in below. Default off.
 ///
-/// REACHABILITY (2026-08-23): on gated ordinary-NVFP4 attention this branch is
-/// dead for n∈4..=17. `ms_phase_qkv` tests `ops::exact_attention_qkv_route`
-/// first, and that returns `Some(..)` for every such width — `ExactM4`/`ExactM17`
-/// when the exact symbols loaded, `SerialK1M4`/`SerialK1M17` when they did not —
-/// so the `else if` chain never reaches here. Qwen3.8-27B sets
+/// REACHABILITY (2026-08-28): on gated ordinary-NVFP4 attention this branch is
+/// dead for n∈4..=32. `ms_phase_qkv` tests `ops::exact_attention_qkv_route`
+/// first, and that returns `Some(..)` for every such width, selecting its exact
+/// M4/M17/M32 tier when both handles loaded and the corresponding complete
+/// serial-K1 phase otherwise. Qwen3.8-27B sets
 /// `attn_output_gate = true` and carries ordinary NVFP4 q/k/v, so setting
-/// `ATLAS_ATTN_QKV_BATCHED=1` on the DFlash verify widths is a no-op; only
-/// n∈18..=32 (or a non-NVFP4 encoding) can reach it. Pinned by
+/// `ATLAS_ATTN_QKV_BATCHED=1` on these DFlash verify widths is a no-op; only
+/// n>32 (or a non-NVFP4 encoding) can reach it. Pinned by
 /// `gated_nvfp4_never_falls_through_to_the_batched_route`. The `attn_qkv_proj`
 /// cost on this model therefore belongs to `ms_qkv_exact`, not to this path.
 fn attn_qkv_batched_plain_enabled() -> bool {
@@ -117,8 +117,41 @@ fn attn_qkv_exact_strided_enabled() -> bool {
     })
 }
 
+/// Default-off M17 exact-QKV candidate that cooperatively stages each
+/// 512-column BF16 activation tile once per CTA. The flag is intentionally
+/// separate from the proven exact route: when requested for an eligible
+/// n=5..=17 gated ordinary-NVFP4 phase, both staged QG and dual-KV symbols
+/// must be present or the request fails before launching a projection.
+fn parse_attn_qkv_exact_m17_astage(value: Option<&str>) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_ATTN_QKV_EXACT_M17_ASTAGE must be exactly 0 or 1"),
+    }
+}
+
+fn attn_qkv_exact_m17_astage_enabled() -> Result<bool> {
+    static CACHE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*CACHE.get_or_init(|| match std::env::var("ATLAS_ATTN_QKV_EXACT_M17_ASTAGE") {
+        Ok(value) => parse_attn_qkv_exact_m17_astage(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_attn_qkv_exact_m17_astage(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_ATTN_QKV_EXACT_M17_ASTAGE must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
+fn log_m17_astage_engagement_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!("ENGAGED ATLAS_ATTN_QKV_EXACT_M17_ASTAGE: atomic staged QG/dual-KV pair");
+    });
+}
+
 /// Cached `ATLAS_ATTN_QK_NORM_BATCHED` env-var lookup. When `1`/`true` the
-/// exact M4/M17 attention QKV routes replace their per-row `q_norm`/`k_norm`
+/// exact M4/M17/M32 attention QKV routes replace their per-row `q_norm`/`k_norm`
 /// pair with a single strided `rms_norm_qk_batch3` launch covering all `n`
 /// tokens.
 ///
@@ -150,6 +183,26 @@ impl Qwen3AttentionLayer {
         let ordinary_nvfp4 = self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.k_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && self.v_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some();
+        match ops::exact_attention_m17_astage_route(
+            attn_qkv_exact_m17_astage_enabled()?,
+            n,
+            self.gated,
+            ordinary_nvfp4,
+            self.w4a16_exact_qkv_m17_astage_kernels,
+        ) {
+            ops::ExactAttentionM17AStageRoute::Complete => {
+                self.ms_qkv_exact(c, true)?;
+                log_m17_astage_engagement_once();
+                return Ok(());
+            }
+            ops::ExactAttentionM17AStageRoute::Missing => {
+                bail!(
+                    "ATLAS_ATTN_QKV_EXACT_M17_ASTAGE requested but the staged QG/dual-KV kernel pair is incomplete"
+                );
+            }
+            ops::ExactAttentionM17AStageRoute::Disabled
+            | ops::ExactAttentionM17AStageRoute::Ineligible => {}
+        }
         let exact_route = ops::exact_attention_qkv_route(
             n,
             self.gated,
@@ -159,13 +212,19 @@ impl Qwen3AttentionLayer {
 
         if matches!(
             exact_route,
-            Some(ops::ExactAttentionQkvRoute::ExactM4 | ops::ExactAttentionQkvRoute::ExactM17)
+            Some(
+                ops::ExactAttentionQkvRoute::ExactM4
+                    | ops::ExactAttentionQkvRoute::ExactM17
+                    | ops::ExactAttentionQkvRoute::ExactM32
+            )
         ) {
-            self.ms_qkv_exact(c)?;
+            self.ms_qkv_exact(c, false)?;
         } else if matches!(
             exact_route,
             Some(
-                ops::ExactAttentionQkvRoute::SerialK1M4 | ops::ExactAttentionQkvRoute::SerialK1M17
+                ops::ExactAttentionQkvRoute::SerialK1M4
+                    | ops::ExactAttentionQkvRoute::SerialK1M17
+                    | ops::ExactAttentionQkvRoute::SerialK1M32
             )
         ) {
             self.ms_qkv_serial(c)?;
@@ -206,11 +265,11 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// K1-order exact M4/M17 route for gated ordinary-NVFP4 attention. QG is
+    /// K1-order exact M4/M17/M32 route for gated ordinary-NVFP4 attention. QG is
     /// deinterleaved at the exact BF16 output store; dual K/V remains row-major.
-    fn ms_qkv_exact(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+    fn ms_qkv_exact(&self, c: &MultiSeqCtx<'_>, m17_astage: bool) -> Result<()> {
         if attn_qkv_exact_strided_enabled() {
-            return self.ms_qkv_exact_strided(c);
+            return self.ms_qkv_exact_strided(c, m17_astage);
         }
 
         let MultiSeqCtx {
@@ -242,7 +301,11 @@ impl Qwen3AttentionLayer {
 
         ops::w4a16_gemv_qg_exact(
             fwd.gpu,
-            self.w4a16_exact_qkv_kernels.qg_for_rows(n),
+            if m17_astage {
+                self.w4a16_exact_qkv_m17_astage_kernels.qg()
+            } else {
+                self.w4a16_exact_qkv_kernels.qg_for_rows(n)
+            },
             normed,
             q_weight,
             q_scratch,
@@ -256,7 +319,11 @@ impl Qwen3AttentionLayer {
         )?;
         ops::w4a16_gemv_dual_kv_exact(
             fwd.gpu,
-            self.w4a16_exact_qkv_kernels.dual_kv_for_rows(n),
+            if m17_astage {
+                self.w4a16_exact_qkv_m17_astage_kernels.dual_kv()
+            } else {
+                self.w4a16_exact_qkv_kernels.dual_kv_for_rows(n)
+            },
             normed,
             k_weight,
             k_scratch,
@@ -301,7 +368,7 @@ impl Qwen3AttentionLayer {
     /// contiguous-scratch + per-row d2d scatter. Arithmetic and byte placement
     /// are identical to the contiguous path (the exact kernels already
     /// deinterleave QG at the BF16 output store), so this is bit-exact.
-    fn ms_qkv_exact_strided(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+    fn ms_qkv_exact_strided(&self, c: &MultiSeqCtx<'_>, m17_astage: bool) -> Result<()> {
         let MultiSeqCtx {
             fwd,
             n,
@@ -332,7 +399,11 @@ impl Qwen3AttentionLayer {
         // deinterleaved at the store. Out row stride is the full token stride.
         ops::w4a16_gemv_qg_exact(
             fwd.gpu,
-            self.w4a16_exact_qkv_kernels.qg_for_rows(n),
+            if m17_astage {
+                self.w4a16_exact_qkv_m17_astage_kernels.qg()
+            } else {
+                self.w4a16_exact_qkv_kernels.qg_for_rows(n)
+            },
             normed,
             q_weight,
             qkv_buf,
@@ -351,7 +422,11 @@ impl Qwen3AttentionLayer {
         let v_base = k_base.offset(kv_bytes);
         ops::w4a16_gemv_dual_kv_exact(
             fwd.gpu,
-            self.w4a16_exact_qkv_kernels.dual_kv_for_rows(n),
+            if m17_astage {
+                self.w4a16_exact_qkv_m17_astage_kernels.dual_kv()
+            } else {
+                self.w4a16_exact_qkv_kernels.dual_kv_for_rows(n)
+            },
             normed,
             k_weight,
             k_base,
@@ -1436,5 +1511,23 @@ impl Qwen3AttentionLayer {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod m17_astage_flag_tests {
+    use super::parse_attn_qkv_exact_m17_astage;
+
+    #[test]
+    fn accepts_only_absent_zero_or_one() {
+        assert_eq!(parse_attn_qkv_exact_m17_astage(None), Ok(false));
+        assert_eq!(parse_attn_qkv_exact_m17_astage(Some("0")), Ok(false));
+        assert_eq!(parse_attn_qkv_exact_m17_astage(Some("1")), Ok(true));
+        for invalid in ["", "true", "false", "2", "01", " 1"] {
+            assert!(
+                parse_attn_qkv_exact_m17_astage(Some(invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
     }
 }

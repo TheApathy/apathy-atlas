@@ -89,6 +89,7 @@ impl DraftProposer for MultiModuleMtpHead {
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
         let per_module = (0..self.modules.len())
             .map(|_| MtpProposerState {
+                rotary_positions: crate::traits::RotaryPositions::identity(),
                 block_table: Vec::new(),
                 seq_len: 0,
                 last_num_drafted: 0,
@@ -248,6 +249,7 @@ mod tests {
         let state = MultiModuleMtpState {
             per_module: (0..3)
                 .map(|_| MtpProposerState {
+                    rotary_positions: crate::traits::RotaryPositions::identity(),
                     block_table: Vec::new(),
                     seq_len: 0,
                     last_num_drafted: 0,

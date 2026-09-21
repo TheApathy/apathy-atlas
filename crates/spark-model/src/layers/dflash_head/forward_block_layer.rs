@@ -194,8 +194,8 @@ impl BlockDiffusionDraftHead {
         )?;
         // conv_out → norm_buf noise slice (stream-ordered D2D)
         gpu.copy_d2d_async(
-            self.scratch.norm_buf.offset(noise_byte_offset),
             self.scratch.conv_out,
+            self.scratch.norm_buf.offset(noise_byte_offset),
             noise_bytes,
             stream,
         )?;
@@ -230,8 +230,8 @@ impl BlockDiffusionDraftHead {
         )?;
         // conv_out → stream_acc noise slice
         gpu.copy_d2d_async(
-            self.scratch.stream_acc.offset(noise_byte_offset),
             self.scratch.conv_out,
+            self.scratch.stream_acc.offset(noise_byte_offset),
             noise_bytes,
             stream,
         )?;
@@ -1190,6 +1190,10 @@ impl BlockDiffusionDraftHead {
         // evolving stream/norm buffers) and the final norm/lm_head in
         // forward_block reads the noise slice only.
         let noise_only = dflash_noise_only_enabled();
+        let prefill_pipe_requested = self
+            .proposal_policy
+            .get_or_init(super::proposal_policy::ProposalPolicy::from_env)
+            .prefill_pipe;
         // Rectangular attention: compute attention outputs only for the tail
         // rows [aligned(eff_ctx), n_attn) instead of all n_attn query rows.
         // In noise-only mode the ctx-row attention outputs are dead compute
@@ -1399,7 +1403,42 @@ impl BlockDiffusionDraftHead {
             if new_ctx_count > 0 {
                 let fc_offset = old_ctx_count * self.hidden_size * bf16;
                 let kv_offset = old_ctx_count * kv_dim as usize * bf16;
-                if attn_kgamma_t {
+                if super::proposal_policy::use_prefill_dual_pipe(
+                    prefill_pipe_requested,
+                    self.kernels.w4a16_gemm_pipe_dual.0 != 0,
+                    new_ctx_count,
+                    h as usize,
+                )
+                .map_err(anyhow::Error::msg)?
+                {
+                    static KV_PIPE_SEEN: std::sync::Once = std::sync::Once::new();
+                    KV_PIPE_SEEN.call_once(|| {
+                        tracing::info!(
+                            "DFLASH_PREFILL_PIPE engaged dual V3 context K/V ingestion: \
+                             M={}, N={}, K={}",
+                            new_ctx_count,
+                            kv_dim,
+                            h,
+                        );
+                    });
+                    kp!(
+                        kv_ctx_new_us,
+                        ops::w4a16_gemm_pipe_dual(
+                            gpu,
+                            self.kernels.w4a16_gemm_pipe_dual,
+                            self.scratch.fc_proj.offset(fc_offset),
+                            &layer.k_proj,
+                            &layer.v_proj,
+                            self.scratch.k_buf.offset(kv_offset),
+                            self.scratch.v_buf.offset(kv_offset),
+                            false,
+                            new_ctx_count as u32,
+                            kv_dim,
+                            h,
+                            stream,
+                        )
+                    )?;
+                } else if attn_kgamma_t {
                     let k_t = layer.k_proj_t.as_ref().unwrap();
                     let v_t = layer.v_proj_t.as_ref().unwrap();
                     // These two GEMMs are the same shape class as the kv_noise

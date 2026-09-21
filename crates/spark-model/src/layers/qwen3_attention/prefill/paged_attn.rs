@@ -14,6 +14,67 @@ use super::super::Qwen3AttentionLayer;
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::layers::ops;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Nvfp4PagedBr128Route {
+    Disabled,
+    Ineligible,
+    Complete,
+    Missing,
+}
+
+pub(super) const fn nvfp4_paged_br128_route(
+    requested: bool,
+    dtype: KvCacheDtype,
+    q_len: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    has_kernel: bool,
+) -> Nvfp4PagedBr128Route {
+    if !requested {
+        return Nvfp4PagedBr128Route::Disabled;
+    }
+    if !matches!(dtype, KvCacheDtype::Nvfp4)
+        || q_len < 2048
+        || head_dim != 256
+        || num_kv_heads == 0
+        || num_q_heads == 0
+        || !num_q_heads.is_multiple_of(num_kv_heads)
+    {
+        return Nvfp4PagedBr128Route::Ineligible;
+    }
+    if has_kernel {
+        Nvfp4PagedBr128Route::Complete
+    } else {
+        Nvfp4PagedBr128Route::Missing
+    }
+}
+
+pub(super) fn parse_nvfp4_paged_br128(
+    value: Option<&str>,
+) -> std::result::Result<bool, &'static str> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err("ATLAS_PREFILL_ATTN_BR128 must be exactly 0 or 1"),
+    }
+}
+
+/// Strict default-off gate for the NVFP4 HD256 BR128 paged-prefill shadow.
+/// Eligible missing symbols fail closed; disabled/ineligible calls retain BR64.
+fn nvfp4_paged_br128_requested() -> Result<bool> {
+    static GATE: std::sync::OnceLock<std::result::Result<bool, &'static str>> =
+        std::sync::OnceLock::new();
+    (*GATE.get_or_init(|| match std::env::var("ATLAS_PREFILL_ATTN_BR128") {
+        Ok(value) => parse_nvfp4_paged_br128(Some(value.as_str())),
+        Err(std::env::VarError::NotPresent) => parse_nvfp4_paged_br128(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("ATLAS_PREFILL_ATTN_BR128 must be valid UTF-8 and exactly 0 or 1")
+        }
+    }))
+    .map_err(anyhow::Error::msg)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(super) struct PagedAttnArgs<'a> {
@@ -160,28 +221,76 @@ impl Qwen3AttentionLayer {
         } else {
             let use_br64 = n >= 256;
             let (fp8_k_scale, fp8_v_scale) = self.effective_fp8_scales();
+            let br128_route = nvfp4_paged_br128_route(
+                nvfp4_paged_br128_requested()?,
+                self.kv_dtype,
+                n,
+                nq,
+                nkv,
+                hd,
+                self.prefill_attn_paged_nvfp4_128_k.0 != 0,
+            );
             match (self.kv_dtype, use_br64) {
-                (KvCacheDtype::Nvfp4, true) => ops::prefill_attention_paged_nvfp4_64(
-                    ctx.gpu,
-                    self.prefill_attn_paged_nvfp4_64_k,
-                    q_contiguous,
-                    kv_cache.k_pool_ptr(self.attn_layer_idx),
-                    kv_cache.v_pool_ptr(self.attn_layer_idx),
-                    attn_out,
-                    meta.block_table,
-                    n,
-                    kv_len,
-                    seq_len_start as u32,
-                    nq,
-                    nkv,
-                    hd,
-                    bs_u,
-                    self.sliding_window.unwrap_or(0),
-                    inv_sqrt_d,
-                    kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
-                    kv_cache.nvfp4_data_bytes() as u64,
-                    stream,
-                )?,
+                (KvCacheDtype::Nvfp4, true) => match br128_route {
+                    Nvfp4PagedBr128Route::Complete => {
+                        static ENGAGED: std::sync::Once = std::sync::Once::new();
+                        let outcome = ops::prefill_attention_paged_nvfp4_128(
+                            ctx.gpu,
+                            self.prefill_attn_paged_nvfp4_128_k,
+                            q_contiguous,
+                            kv_cache.k_pool_ptr(self.attn_layer_idx),
+                            kv_cache.v_pool_ptr(self.attn_layer_idx),
+                            attn_out,
+                            meta.block_table,
+                            n,
+                            kv_len,
+                            seq_len_start as u32,
+                            nq,
+                            nkv,
+                            hd,
+                            bs_u,
+                            self.sliding_window.unwrap_or(0),
+                            inv_sqrt_d,
+                            kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                            kv_cache.nvfp4_data_bytes() as u64,
+                            stream,
+                        )?;
+                        ENGAGED.call_once(|| {
+                            tracing::info!("ENGAGED ATLAS_PREFILL_ATTN_BR128: nvfp4-hd256-br128");
+                        });
+                        outcome
+                    }
+                    Nvfp4PagedBr128Route::Missing => {
+                        anyhow::bail!(
+                            "ATLAS_PREFILL_ATTN_BR128=1 selected eligible NVFP4 HD256 \
+                             prefill, but inferspark_prefill_paged_nvfp4_128 is missing; \
+                             rebuild the Qwen3.8 kernel bundle before measuring"
+                        )
+                    }
+                    Nvfp4PagedBr128Route::Disabled | Nvfp4PagedBr128Route::Ineligible => {
+                        ops::prefill_attention_paged_nvfp4_64(
+                            ctx.gpu,
+                            self.prefill_attn_paged_nvfp4_64_k,
+                            q_contiguous,
+                            kv_cache.k_pool_ptr(self.attn_layer_idx),
+                            kv_cache.v_pool_ptr(self.attn_layer_idx),
+                            attn_out,
+                            meta.block_table,
+                            n,
+                            kv_len,
+                            seq_len_start as u32,
+                            nq,
+                            nkv,
+                            hd,
+                            bs_u,
+                            self.sliding_window.unwrap_or(0),
+                            inv_sqrt_d,
+                            kv_cache.block_stride_bytes_for_layer(self.attn_layer_idx) as u64,
+                            kv_cache.nvfp4_data_bytes() as u64,
+                            stream,
+                        )?
+                    }
+                },
                 (KvCacheDtype::Bf16KTurbo3V, _) => {
                     // TurboQuant+ safer-asym Bf16K + Turbo3V prefill (BR=64).
                     // K read as bf16 cp.async, V read as turbo3 sync dequant.

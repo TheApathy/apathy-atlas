@@ -29,6 +29,10 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let n = tokens.len();
         assert_eq!(n, seqs.len(), "tokens.len() must equal seqs.len()");
+        anyhow::ensure!(
+            n <= 1 || seqs.iter().all(|seq| seq.rotary_positions.is_identity()),
+            "image sequence decode currently requires C1"
+        );
 
         // ATLAS_SSM_H_FP16 stage 2: every sequence in the batch, before the
         // n==1 delegation below and before any graph work.

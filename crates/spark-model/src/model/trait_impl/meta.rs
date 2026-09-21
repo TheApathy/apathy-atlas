@@ -360,6 +360,7 @@ impl TransformerModel {
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
+            rotary_positions: crate::traits::RotaryPositions::identity(),
             layer_states,
             proposer_state,
             proposer_state_alt,

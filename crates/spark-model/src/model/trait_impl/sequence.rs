@@ -108,8 +108,7 @@ impl TransformerModel {
         // instead of cuMemFree avoids the ~200-950 ms UMA first-touch
         // page-fault cost of re-allocating it on the next request. The
         // smaller fc/K/V caches are still freed normally.
-        let ctx_acc_bytes = ds.max_ctx_len * ds.ctx_slot_bytes;
-        crate::layers::dflash_head::ctx_acc_pool_return(ctx_acc_bytes, ds.ctx_hidden_acc);
+        crate::layers::dflash_head::ctx_acc_pool_return(ds.ctx_alloc_bytes, ds.ctx_hidden_acc);
         ds.ctx_hidden_acc = spark_runtime::gpu::DevicePtr(0);
         let mut ptrs: Vec<spark_runtime::gpu::DevicePtr> = vec![ds.ctx_fc_cache];
         ptrs.append(&mut ds.ctx_k_cache);
@@ -125,6 +124,7 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        seq.rotary_positions = crate::traits::RotaryPositions::identity();
         // A verify-state commit may still be writing this slot on the
         // secondary stream. Chain that event onto the default stream before
         // zero_slot and its synchronize below; otherwise a newly allocated
@@ -485,6 +485,10 @@ impl TransformerModel {
         seq: &SequenceState,
         writer: &mut dyn std::io::Write,
     ) -> Result<()> {
+        anyhow::ensure!(
+            seq.rotary_positions.is_identity(),
+            "image rotary state is not supported by the legacy disk-swap format"
+        );
         let gpu = self.gpu.as_ref();
 
         // Phase 1: Copy all KV block data from GPU to host buffers under the lock.

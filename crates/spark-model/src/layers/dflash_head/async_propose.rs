@@ -523,15 +523,17 @@ impl BlockDiffusionDraftHead {
             clear_proposal_outputs(dstate);
             return Ok(Some(Vec::new()));
         }
-        let mut host_buf = vec![0u8; inflight.budget.flat * 4];
-        if let Err(error) = gpu.copy_d2h(self.scratch.draft_tokens_dev, &mut host_buf) {
+        let host_bytes = inflight
+            .budget
+            .flat
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("DFlash async draft output byte count overflow"))?;
+        let host_buf = &mut dstate.draft_output_pinned.as_mut_slice()[..host_bytes];
+        if let Err(error) = gpu.copy_d2h(self.scratch.draft_tokens_dev, host_buf) {
             clear_proposal_outputs(dstate);
             return Err(error);
         }
-        let drafts: Vec<u32> = host_buf
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let drafts = super::proposal_inputs::decode_token_ids(host_buf, inflight.budget.flat)?;
 
         // ATLAS_DFLASH_FREE_SLOTS: D2H the top-K and build the tree payload.
         // The stream is already synced above, so `collect_topk_d2h` reads

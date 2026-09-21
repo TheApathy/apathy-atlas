@@ -39,6 +39,9 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 4]> {
+        let positions = seq
+            .rotary_positions
+            .verify_tail(seq.seq_len, &[0, 1, 2, 3])?;
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -83,12 +86,6 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = self.max_blocks_per_seq;
 
-        let positions = [
-            seq.seq_len as u32,
-            (seq.seq_len + 1) as u32,
-            (seq.seq_len + 2) as u32,
-            (seq.seq_len + 3) as u32,
-        ];
         let pos_bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, 16) };
         let mut slots = [0i64; 4];
         for t in 0..k {

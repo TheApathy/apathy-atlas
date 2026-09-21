@@ -225,3 +225,237 @@ extern "C" __global__ void quantize_bf16_to_nvfp4(
         }
     }
 }
+
+// ── Fused SiLU(gate) * up → NVFP4 quantization ──
+//
+// Grid: (N, 1, 1)  Block: (256, 1, 1)
+//
+// This is the down-projection input boundary for a SwiGLU FFN. It preserves
+// the standalone `moe_silu_mul` numerical contract by materializing each
+// FP32 result through BF16 before either the group maximum or E2M1 quantizer
+// observes it. The materialization happens in registers instead of through a
+// temporary global BF16 matrix.
+__device__ __forceinline__ float silu_mul_bf16_round(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned long long idx
+) {
+    float g = __bfloat162float(gate[idx]);
+    float u = __bfloat162float(up[idx]);
+    float sigmoid_g = 1.0f / (1.0f + __expf(-g));
+    return __bfloat162float(__float2bfloat16(g * sigmoid_g * u));
+}
+
+extern "C" __global__ void quantize_silu_mul_bf16_to_nvfp4(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    float scale2,
+    unsigned int N,
+    unsigned int K
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= N) return;
+
+    unsigned long long row_base = (unsigned long long)row * K;
+    unsigned char* row_packed = packed_out + (unsigned long long)row * (K / 2);
+    unsigned char* row_scale = scale_out + (unsigned long long)row * (K / GROUP_SIZE);
+
+    float inv_scale2 = (scale2 > 0.0f) ? (1.0f / scale2) : 0.0f;
+    unsigned int num_groups = K / GROUP_SIZE;
+
+    for (unsigned int group = threadIdx.x; group < num_groups; group += blockDim.x) {
+        unsigned int base = group * GROUP_SIZE;
+
+        float group_max = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < GROUP_SIZE; i++) {
+            float value = fabsf(silu_mul_bf16_round(gate, up, row_base + base + i));
+            if (value > group_max) group_max = value;
+        }
+
+        float fp8_float = (group_max > 0.0f) ? (group_max * inv_scale2 / 6.0f) : 0.0f;
+        unsigned char fp8_byte = float_to_fp8_e4m3(fp8_float);
+        row_scale[group] = fp8_byte;
+
+        unsigned int fp8_sign = (fp8_byte >> 7) & 1;
+        unsigned int fp8_exp = (fp8_byte >> 3) & 0xF;
+        unsigned int fp8_man = fp8_byte & 0x7;
+        float fp8_decoded;
+        if (fp8_exp == 0) {
+            fp8_decoded = (float)fp8_man * 0.001953125f;
+        } else if (fp8_exp == 15 && fp8_man == 7) {
+            fp8_decoded = 0.0f;
+        } else {
+            unsigned int f32_bits = ((fp8_exp + 120u) << 23) | (fp8_man << 20);
+            fp8_decoded = __uint_as_float(f32_bits);
+        }
+        if (fp8_sign) fp8_decoded = -fp8_decoded;
+
+        float effective_scale = fp8_decoded * scale2;
+        float inv_eff = (effective_scale > 0.0f) ? (1.0f / effective_scale) : 0.0f;
+
+        #pragma unroll
+        for (int i = 0; i < GROUP_SIZE; i += 2) {
+            float v0 = silu_mul_bf16_round(gate, up, row_base + base + i) * inv_eff;
+            float v1 = silu_mul_bf16_round(gate, up, row_base + base + i + 1) * inv_eff;
+            unsigned int n0 = quantize_e2m1(v0);
+            unsigned int n1 = quantize_e2m1(v1);
+            row_packed[group * 8 + i / 2] =
+                (unsigned char)((n1 << 4) | (n0 & 0xF));
+        }
+    }
+}
+
+// ABI-separated FlashInfer/CUTLASS physical-scale sibling. Packed activation
+// bytes remain logical row-major [N,K/2], while scale bytes occupy the padded
+// 128-row x 4-group layout consumed by the SM121 down projection.
+__device__ __forceinline__ unsigned long long silu_scale_offset_128x4(
+    unsigned int row,
+    unsigned int group,
+    unsigned int groups
+) {
+    unsigned int group_blocks = (groups + 3u) / 4u;
+    return (((((static_cast<unsigned long long>(row / 128u) * group_blocks + group / 4u) * 32u
+                + row % 32u) * 4u + (row % 128u) / 32u) * 4u) + group % 4u);
+}
+
+extern "C" __global__ void quantize_silu_mul_bf16_to_nvfp4_atlas_128x4(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    float scale2,
+    unsigned int N,
+    unsigned int K
+) {
+    unsigned int padded_rows = ((N + 127u) / 128u) * 128u;
+    unsigned int num_groups = K / GROUP_SIZE;
+
+    for (unsigned int row = blockIdx.x; row < padded_rows; row += gridDim.x) {
+        if (row >= N) {
+            for (unsigned int group = threadIdx.x; group < num_groups; group += blockDim.x) {
+                scale_out[silu_scale_offset_128x4(row, group, num_groups)] = 0;
+            }
+            continue;
+        }
+
+        unsigned long long row_base = static_cast<unsigned long long>(row) * K;
+        unsigned char* row_packed = packed_out + static_cast<unsigned long long>(row) * (K / 2u);
+        float inv_scale2 = (scale2 > 0.0f) ? (1.0f / scale2) : 0.0f;
+
+        for (unsigned int group = threadIdx.x; group < num_groups; group += blockDim.x) {
+            unsigned int base = group * GROUP_SIZE;
+            float group_max = 0.0f;
+#pragma unroll
+            for (int i = 0; i < GROUP_SIZE; i++) {
+                float value = fabsf(silu_mul_bf16_round(gate, up, row_base + base + i));
+                if (value > group_max) group_max = value;
+            }
+
+            float fp8_float = (group_max > 0.0f) ? (group_max * inv_scale2 / 6.0f) : 0.0f;
+            unsigned char fp8_byte = float_to_fp8_e4m3(fp8_float);
+            scale_out[silu_scale_offset_128x4(row, group, num_groups)] = fp8_byte;
+
+            unsigned int fp8_sign = (fp8_byte >> 7) & 1;
+            unsigned int fp8_exp = (fp8_byte >> 3) & 0xF;
+            unsigned int fp8_man = fp8_byte & 0x7;
+            float fp8_decoded;
+            if (fp8_exp == 0) {
+                fp8_decoded = (float)fp8_man * 0.001953125f;
+            } else if (fp8_exp == 15 && fp8_man == 7) {
+                fp8_decoded = 0.0f;
+            } else {
+                unsigned int f32_bits = ((fp8_exp + 120u) << 23) | (fp8_man << 20);
+                fp8_decoded = __uint_as_float(f32_bits);
+            }
+            if (fp8_sign) fp8_decoded = -fp8_decoded;
+
+            float effective_scale = fp8_decoded * scale2;
+            float inv_eff = (effective_scale > 0.0f) ? (1.0f / effective_scale) : 0.0f;
+#pragma unroll
+            for (int i = 0; i < GROUP_SIZE; i += 2) {
+                float v0 = silu_mul_bf16_round(gate, up, row_base + base + i) * inv_eff;
+                float v1 = silu_mul_bf16_round(gate, up, row_base + base + i + 1) * inv_eff;
+                unsigned int n0 = quantize_e2m1(v0);
+                unsigned int n1 = quantize_e2m1(v1);
+                row_packed[group * 8u + i / 2] =
+                    (unsigned char)((n1 << 4) | (n0 & 0xF));
+            }
+        }
+    }
+}
+
+// Direct sibling for a merged FlashInfer gate/up projection. Each row is
+// laid out as [gate K | up K]. Keeping the sixteen BF16-rounded SwiGLU values
+// in registers makes the group maximum and E2M1 packing consume the same
+// materialization without an intermediate split or a second input pass.
+extern "C" __global__ void quantize_merged_silu_mul_bf16_to_nvfp4_atlas_128x4(
+    const __nv_bfloat16* __restrict__ merged_gate_up,
+    unsigned char* __restrict__ packed_out,
+    unsigned char* __restrict__ scale_out,
+    float scale2,
+    unsigned int N,
+    unsigned int K
+) {
+    unsigned int padded_rows = ((N + 127u) / 128u) * 128u;
+    unsigned int num_groups = K / GROUP_SIZE;
+
+    for (unsigned int row = blockIdx.x; row < padded_rows; row += gridDim.x) {
+        if (row >= N) {
+            for (unsigned int group = threadIdx.x; group < num_groups; group += blockDim.x) {
+                scale_out[silu_scale_offset_128x4(row, group, num_groups)] = 0;
+            }
+            continue;
+        }
+
+        unsigned long long merged_row_base =
+            static_cast<unsigned long long>(row) * (2ull * K);
+        const __nv_bfloat16* gate = merged_gate_up + merged_row_base;
+        const __nv_bfloat16* up = gate + K;
+        unsigned char* row_packed = packed_out + static_cast<unsigned long long>(row) * (K / 2u);
+        float inv_scale2 = (scale2 > 0.0f) ? (1.0f / scale2) : 0.0f;
+
+        for (unsigned int group = threadIdx.x; group < num_groups; group += blockDim.x) {
+            unsigned int base = group * GROUP_SIZE;
+            float rounded[GROUP_SIZE];
+            float group_max = 0.0f;
+#pragma unroll
+            for (int i = 0; i < GROUP_SIZE; i++) {
+                float value = silu_mul_bf16_round(gate, up, base + i);
+                rounded[i] = value;
+                float magnitude = fabsf(value);
+                if (magnitude > group_max) group_max = magnitude;
+            }
+
+            float fp8_float = (group_max > 0.0f) ? (group_max * inv_scale2 / 6.0f) : 0.0f;
+            unsigned char fp8_byte = float_to_fp8_e4m3(fp8_float);
+            scale_out[silu_scale_offset_128x4(row, group, num_groups)] = fp8_byte;
+
+            unsigned int fp8_sign = (fp8_byte >> 7) & 1;
+            unsigned int fp8_exp = (fp8_byte >> 3) & 0xF;
+            unsigned int fp8_man = fp8_byte & 0x7;
+            float fp8_decoded;
+            if (fp8_exp == 0) {
+                fp8_decoded = (float)fp8_man * 0.001953125f;
+            } else if (fp8_exp == 15 && fp8_man == 7) {
+                fp8_decoded = 0.0f;
+            } else {
+                unsigned int f32_bits = ((fp8_exp + 120u) << 23) | (fp8_man << 20);
+                fp8_decoded = __uint_as_float(f32_bits);
+            }
+            if (fp8_sign) fp8_decoded = -fp8_decoded;
+
+            float effective_scale = fp8_decoded * scale2;
+            float inv_eff = (effective_scale > 0.0f) ? (1.0f / effective_scale) : 0.0f;
+#pragma unroll
+            for (int i = 0; i < GROUP_SIZE; i += 2) {
+                unsigned int n0 = quantize_e2m1(rounded[i] * inv_eff);
+                unsigned int n1 = quantize_e2m1(rounded[i + 1] * inv_eff);
+                row_packed[group * 8u + i / 2] =
+                    (unsigned char)((n1 << 4) | (n0 & 0xF));
+            }
+        }
+    }
+}

@@ -43,6 +43,8 @@ pub struct W4a16ExactLmHeadKernels {
     rt2_m8: KernelHandle,
     rt2_m17: KernelHandle,
     rt2_m32: KernelHandle,
+    /// ABI-separated, default-unrouted M17 activation-staging candidate.
+    m17_astage: KernelHandle,
 }
 
 impl W4a16ExactLmHeadKernels {
@@ -61,6 +63,7 @@ impl W4a16ExactLmHeadKernels {
             rt2_m8: KernelHandle(0),
             rt2_m17: KernelHandle(0),
             rt2_m32: KernelHandle(0),
+            m17_astage: KernelHandle(0),
         }
     }
 
@@ -79,6 +82,21 @@ impl W4a16ExactLmHeadKernels {
         self.rt2_m17 = m17;
         self.rt2_m32 = m32;
         self
+    }
+
+    /// Attach the ABI-separated M17 activation-staging candidate.  Merely
+    /// resolving this symbol never changes normal exact/RT2 routing.
+    pub const fn with_m17_astage(mut self, kernel: KernelHandle) -> Self {
+        self.m17_astage = kernel;
+        self
+    }
+
+    pub const fn m17_astage(self) -> KernelHandle {
+        self.m17_astage
+    }
+
+    pub const fn m17_astage_present(self) -> bool {
+        self.m17_astage.0 != 0
     }
 
     pub const fn rt2_for_tier(self, tier: ExactLmHeadTier) -> KernelHandle {
@@ -189,6 +207,59 @@ pub fn w4a16_gemv_batch_logits_exact_with(
 
     KernelLaunch::new(gpu, kernel)
         .grid([div_ceil(n, outs_per_block), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(weight.weight)
+        .arg_ptr(weight.weight_scale)
+        .arg_f32(weight.weight_scale_2)
+        .arg_ptr(output)
+        .arg_u32(rows)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// Launch the ABI-separated activation-staged M17 exact GEMV.
+///
+/// This helper contains no environment policy: production first resolves an
+/// atomic Disabled/Ineligible/Complete/Missing decision, while raw gates can
+/// drive this symbol and the parent independently in one process.
+/// ABI: `(A, B_packed, B_scale, scale2, C, M, N, K)`.
+#[allow(clippy::too_many_arguments)]
+pub fn w4a16_gemv_batch_logits_exact_m17_astage(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    weight: &QuantizedWeight,
+    output: DevicePtr,
+    rows: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (9..=17).contains(&rows),
+        "activation-staged exact M17 rows must be in 9..=17, got {rows}"
+    );
+    ensure!(
+        kernel.0 != 0,
+        "missing exact M17 activation-staging kernel w4a16_gemv_batch_logits_exact_m17_astage"
+    );
+    ensure!(
+        n > 0,
+        "activation-staged exact M17 output width must be non-zero"
+    );
+    ensure!(
+        k > 0,
+        "activation-staged exact M17 hidden width must be non-zero"
+    );
+    ensure!(
+        k.is_multiple_of(16),
+        "activation-staged exact M17 hidden width must be divisible by 16, got {k}"
+    );
+
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(n, W4A16_EXACT_LM_HEAD_OUTS_PER_BLOCK), 1, 1])
         .block([256, 1, 1])
         .arg_ptr(input)
         .arg_ptr(weight.weight)

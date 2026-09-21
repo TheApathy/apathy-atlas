@@ -238,6 +238,10 @@ impl BlockDiffusionDraftHead {
             // `qwen3_attention/init.rs` and `dense_ffn.rs`.
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            // Optional while the policy is off. An explicit eligible bulk
+            // route validates this handle and fails closed at dispatch.
+            w4a16_gemm_pipe: crate::layers::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe"),
+            w4a16_gemm_pipe_dual: crate::layers::try_kernel(gpu, "w4a16", "w4a16_gemm_pipe_dual"),
             // M_TILE=16 specialization for the drafter FFN K=γ batched
             // path (ATLAS_DFLASH_FFN_KGAMMA=1). Resolved via try_kernel so
             // older built kernel caches that pre-date this symbol still
@@ -511,29 +515,28 @@ impl BlockDiffusionDraftHead {
                 // `full_attention` — so the heuristic makes every layer causal,
                 // which is the opposite of how it was trained.
                 //
-                // Gated so the champion path is provably untouched:
-                //   unset / 0  -> historical `layer_types` behaviour
-                //   1          -> honour the checkpoint's own declaration
-                // Only the explicit `Some(false)` case changes anything, so no
-                // drafter lacking the field can be affected either way.
-                let honour_is_causal = std::env::var("ATLAS_DFLASH_HONOR_IS_CAUSAL")
-                    .ok()
-                    .as_deref()
-                    == Some("1");
-                if honour_is_causal && weights.config.is_causal == Some(false) {
+                // An explicit checkpoint declaration is authoritative. Only
+                // `Some(false)` changes the legacy layer-type heuristic, so a
+                // checkpoint that omits the field keeps historical behavior.
+                if weights.config.is_causal == Some(false) {
                     let was_causal = causals.iter().filter(|c| **c).count();
-                    causals.iter_mut().for_each(|c| *c = false);
+                    causals.iter_mut().for_each(|causal| *causal = false);
                     tracing::info!(
-                        "ATLAS_DFLASH_HONOR_IS_CAUSAL=1 and the drafter config \
-                         declares is_causal=false: forcing all {num_layers} \
-                         drafter layers non-causal (was {was_causal} causal). SWA \
-                         windows are unchanged."
+                        "DFlash checkpoint declares is_causal=false: forcing all \
+                         {num_layers} drafter layers non-causal (was {was_causal} \
+                         causal); per-layer SWA windows are unchanged"
                     );
                 }
+                let causal_count = causals.iter().filter(|causal| **causal).count();
+                let causal_mode = match causal_count {
+                    0 => "noncausal",
+                    count if count == num_layers => "causal",
+                    _ => "mixed",
+                };
                 tracing::info!(
                     "DFlash per-layer SWA: {sliding_count}/{num_layers} layers \
-                     use sliding_window={sw} causal=true (causal+SWA); \
-                     full layers causal=false (bidirectional)"
+                     use sliding_window={sw}; causal_layers={causal_count}/{num_layers} \
+                     mode={causal_mode}"
                 );
                 (windows, causals)
             }
@@ -941,6 +944,7 @@ impl BlockDiffusionDraftHead {
             rotary_dim,
             rms_norm_eps: 1e-6,
             ctx_window,
+            proposal_policy: std::sync::OnceLock::new(),
             quant: quantization,
             async_inflight: Mutex::new(None),
             async_propose_stream: std::sync::OnceLock::new(),

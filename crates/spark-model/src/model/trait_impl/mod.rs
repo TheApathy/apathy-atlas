@@ -192,6 +192,12 @@ impl Model for TransformerModel {
     fn proposer_is_dflash(&self) -> bool {
         self.active_proposer().is_some_and(|p| p.is_dflash())
     }
+    fn proposer_target_token_authority(&self) -> crate::speculative::TargetTokenAuthority {
+        self.active_proposer().map_or(
+            crate::speculative::TargetTokenAuthority::ServingPolicy,
+            |p| p.target_token_authority(),
+        )
+    }
     fn dflash_verify_capacity_k(&self) -> Option<usize> {
         self.active_proposer()
             .filter(|proposer| proposer.is_dflash())

@@ -55,6 +55,8 @@ fn config() -> DflashConfig {
         // layer_types/sliding_window above; this fixture exercises metadata
         // validation, not the causality derivation.
         is_causal: None,
+        rms_norm_eps: None,
+        hidden_act: None,
         rope_theta: 10_000.0,
         rope_scaling: None,
         markov_rank: 0,

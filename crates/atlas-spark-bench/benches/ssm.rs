@@ -2,8 +2,9 @@
 
 //! SSM (Gated Delta Net) kernel microbenchmarks.
 //!
-//! Includes causal conv1d update and gated delta rule decode.
-//! Shapes match Qwen3-Next-80B-A3B: d_inner=8192, d_conv=4,
+//! Includes causal conv1d update, gated delta rule decode, and the exact
+//! Qwen3.8 WY32 prefill parent/candidate parity gate.
+//! Shapes match Qwen3-Next/Qwen3.8: d_inner=8192, d_conv=4,
 //! gdn_num_k=16, gdn_num_v=32, dim=128.
 
 use std::ffi::c_void;
@@ -14,8 +15,112 @@ use atlas_core::registry::RawCudaFunc;
 use atlas_spark_bench::gpu;
 use criterion::{Criterion, criterion_group, criterion_main};
 
+unsafe extern "C" {
+    fn cuMemcpyHtoD_v2(dst: u64, src: *const c_void, bytes: usize) -> i32;
+    fn cuMemcpyDtoH_v2(dst: *mut c_void, src: u64, bytes: usize) -> i32;
+}
+
+const OUTPUT_CANARY_BYTES: usize = 4096;
+const OUTPUT_CANARY_PREFIX: u8 = 0xA5;
+const OUTPUT_CANARY_SUFFIX: u8 = 0x5A;
+const WY32_PARENT_SMEM: u32 = 86_528;
+const WY32_DOT_BATCH_SMEM: u32 = 95_232;
+const _: () = assert!(WY32_DOT_BATCH_SMEM - WY32_PARENT_SMEM == 8_704);
+
+fn h2d<T: Copy>(dev: u64, host: &[T]) {
+    let bytes = std::mem::size_of_val(host);
+    let status = unsafe { cuMemcpyHtoD_v2(dev, host.as_ptr().cast(), bytes) };
+    assert_eq!(status, 0, "cuMemcpyHtoD failed: {status}");
+}
+
+fn d2h<T: Copy>(host: &mut [T], dev: u64) {
+    let bytes = std::mem::size_of_val(host);
+    let status = unsafe { cuMemcpyDtoH_v2(host.as_mut_ptr().cast(), dev, bytes) };
+    assert_eq!(status, 0, "cuMemcpyDtoH failed: {status}");
+}
+
+fn guarded_alloc(stream: u64, data_bytes: usize) -> (u64, u64) {
+    let total = data_bytes
+        .checked_add(2 * OUTPUT_CANARY_BYTES)
+        .expect("guarded allocation overflow");
+    let raw = gpu::gpu_alloc_zeroed(stream, total).expect("allocate guarded buffer");
+    gpu::gpu_sync(stream).expect("finish guarded buffer initialization");
+    h2d(raw, &vec![OUTPUT_CANARY_PREFIX; OUTPUT_CANARY_BYTES]);
+    h2d(
+        raw + (OUTPUT_CANARY_BYTES + data_bytes) as u64,
+        &vec![OUTPUT_CANARY_SUFFIX; OUTPUT_CANARY_BYTES],
+    );
+    (raw, raw + OUTPUT_CANARY_BYTES as u64)
+}
+
+fn assert_canaries(raw: u64, data_bytes: usize, label: &str) {
+    let mut prefix = vec![0u8; OUTPUT_CANARY_BYTES];
+    let mut suffix = vec![0u8; OUTPUT_CANARY_BYTES];
+    d2h(&mut prefix, raw);
+    d2h(&mut suffix, raw + (OUTPUT_CANARY_BYTES + data_bytes) as u64);
+    assert!(
+        prefix.iter().all(|&byte| byte == OUTPUT_CANARY_PREFIX),
+        "{label} wrote before its buffer"
+    );
+    assert!(
+        suffix.iter().all(|&byte| byte == OUTPUT_CANARY_SUFFIX),
+        "{label} wrote after its buffer"
+    );
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn assert_bytes_identical(label: &str, parent: &[u8], candidate: &[u8]) {
+    assert_eq!(parent.len(), candidate.len(), "{label} lengths differ");
+    if parent != candidate {
+        let first = parent
+            .iter()
+            .zip(candidate)
+            .position(|(left, right)| left != right)
+            .expect("different byte vectors must contain a mismatch");
+        panic!(
+            "{label} bitwise mismatch at byte {first}: parent=0x{:02x} candidate=0x{:02x}",
+            parent[first], candidate[first]
+        );
+    }
+}
+
+fn deterministic_bf16(elements: usize, salt: usize) -> Vec<u16> {
+    (0..elements)
+        .map(|index| {
+            let magnitude = 0x3d00u16 + ((index * 131 + salt * 17) % 0x180) as u16;
+            if (index + salt).is_multiple_of(3) {
+                magnitude | 0x8000
+            } else {
+                magnitude
+            }
+        })
+        .collect()
+}
+
+fn bench_wy32_seq_len() -> u32 {
+    let seq_len = match std::env::var("ATLAS_BENCH_SEQ") {
+        Ok(raw) => raw
+            .parse::<u32>()
+            .expect("ATLAS_BENCH_SEQ must be an integer"),
+        Err(std::env::VarError::NotPresent) => 256,
+        Err(error) => panic!("ATLAS_BENCH_SEQ is not valid Unicode: {error}"),
+    };
+    assert!(
+        (32..=32_768).contains(&seq_len) && seq_len.is_multiple_of(32),
+        "ATLAS_BENCH_SEQ must be a multiple of 32 in [32, 32768]"
+    );
+    seq_len
+}
+
 static CONV1D_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 static GDN_DECODE_FN: OnceLock<RawCudaFunc> = OnceLock::new();
+static GDN_WY32_PARENT_FN: OnceLock<RawCudaFunc> = OnceLock::new();
+static GDN_WY32_DOT_BATCH_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 
 /// causal_conv1d_update(conv_state, new_input, weight, bias, output, batch, dim, d_conv)
 /// Grid: (ceil(dim/256), batch, 1)  Block: (256, 1, 1)
@@ -382,5 +487,324 @@ fn bench_gdn_chunk2(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_conv1d, bench_gdn, bench_gdn_chunk2);
+#[allow(clippy::too_many_arguments)]
+fn launch_wy32(
+    reg: &atlas_core::registry::AtlasRegistry,
+    kernel: RawCudaFunc,
+    stream: u64,
+    shared_mem: u32,
+    h_state: u64,
+    query: u64,
+    key: u64,
+    value: u64,
+    gate: u64,
+    beta: u64,
+    output: u64,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+) {
+    let mut params: Vec<*mut c_void> = vec![
+        &h_state as *const u64 as *mut c_void,
+        &query as *const u64 as *mut c_void,
+        &key as *const u64 as *mut c_void,
+        &value as *const u64 as *mut c_void,
+        &gate as *const u64 as *mut c_void,
+        &beta as *const u64 as *mut c_void,
+        &output as *const u64 as *mut c_void,
+        &batch_size as *const u32 as *mut c_void,
+        &seq_len as *const u32 as *mut c_void,
+        &num_k_heads as *const u32 as *mut c_void,
+        &num_v_heads as *const u32 as *mut c_void,
+        &k_dim as *const u32 as *mut c_void,
+        &v_dim as *const u32 as *mut c_void,
+        &qk_stride as *const u32 as *mut c_void,
+        &v_stride as *const u32 as *mut c_void,
+        &gb_stride as *const u32 as *mut c_void,
+    ];
+    unsafe {
+        gpu::launch(
+            reg,
+            kernel,
+            (num_v_heads, batch_size, 1),
+            (128, 1, 1),
+            shared_mem,
+            stream,
+            &mut params,
+        )
+        .unwrap();
+    }
+}
+
+/// Exact parent-vs-dot-batched WY32 prefill state/output gate and kernel timer.
+///
+/// The correctness run uses independent guarded state and output allocations.
+/// Timing uses another guarded pair per arm so Criterion cannot alter the
+/// already-proven bytes. The recurrent state evolves between timed launches,
+/// but the instruction path is value-independent and no reset/copy is included
+/// in the reported kernel time.
+fn bench_gdn_wy32_prefill(c: &mut Criterion) {
+    let reg = gpu::ensure_registry();
+    let stream = reg.raw_stream();
+    let parent_kernel = gpu::get_kernel(
+        reg,
+        &GDN_WY32_PARENT_FN,
+        "gated_delta_rule_wy64_prefill",
+        "gated_delta_rule_prefill_wy64",
+    );
+    let dot_batch_kernel = gpu::get_kernel(
+        reg,
+        &GDN_WY32_DOT_BATCH_FN,
+        "gated_delta_rule_wy32_gatecache",
+        "gated_delta_rule_prefill_wy32_gatecache",
+    );
+
+    let batch_size = 1u32;
+    let seq_len = bench_wy32_seq_len();
+    let num_k_heads = 16u32;
+    let num_v_heads = 32u32;
+    let k_dim = 128u32;
+    let v_dim = 128u32;
+    let qk_stride = num_k_heads * k_dim;
+    let v_stride = num_v_heads * v_dim;
+    let gb_stride = num_v_heads;
+
+    let state_elements = num_v_heads as usize * k_dim as usize * v_dim as usize;
+    let qk_elements = seq_len as usize * qk_stride as usize;
+    let value_elements = seq_len as usize * v_stride as usize;
+    let gate_elements = seq_len as usize * gb_stride as usize;
+    let state_bytes = state_elements * 4;
+    let output_bytes = value_elements * 2;
+
+    let host_state: Vec<f32> = (0..state_elements)
+        .map(|index| ((index * 73 % 2001) as i32 - 1000) as f32 * 0.00001)
+        .collect();
+    let host_query = deterministic_bf16(qk_elements, 11);
+    let host_key = deterministic_bf16(qk_elements, 29);
+    let host_value = deterministic_bf16(value_elements, 47);
+    let host_gate: Vec<f32> = (0..gate_elements)
+        .map(|index| 0.90 + (index % 17) as f32 * 0.001)
+        .collect();
+    let host_beta: Vec<f32> = (0..gate_elements)
+        .map(|index| 0.05 + (index % 13) as f32 * 0.0005)
+        .collect();
+
+    let query = gpu::gpu_alloc_zeroed(stream, qk_elements * 2).unwrap();
+    let key = gpu::gpu_alloc_zeroed(stream, qk_elements * 2).unwrap();
+    let value = gpu::gpu_alloc_zeroed(stream, value_elements * 2).unwrap();
+    let gate = gpu::gpu_alloc_zeroed(stream, gate_elements * 4).unwrap();
+    let beta = gpu::gpu_alloc_zeroed(stream, gate_elements * 4).unwrap();
+    h2d(query, &host_query);
+    h2d(key, &host_key);
+    h2d(value, &host_value);
+    h2d(gate, &host_gate);
+    h2d(beta, &host_beta);
+
+    let (parent_state_raw, parent_state) = guarded_alloc(stream, state_bytes);
+    let (candidate_state_raw, candidate_state) = guarded_alloc(stream, state_bytes);
+    let (parent_output_raw, parent_output) = guarded_alloc(stream, output_bytes);
+    let (candidate_output_raw, candidate_output) = guarded_alloc(stream, output_bytes);
+    let (timed_parent_state_raw, timed_parent_state) = guarded_alloc(stream, state_bytes);
+    let (timed_candidate_state_raw, timed_candidate_state) = guarded_alloc(stream, state_bytes);
+    let (timed_parent_output_raw, timed_parent_output) = guarded_alloc(stream, output_bytes);
+    let (timed_candidate_output_raw, timed_candidate_output) = guarded_alloc(stream, output_bytes);
+    for state in [
+        parent_state,
+        candidate_state,
+        timed_parent_state,
+        timed_candidate_state,
+    ] {
+        h2d(state, &host_state);
+    }
+    gpu::gpu_sync(stream).unwrap();
+
+    launch_wy32(
+        reg,
+        parent_kernel,
+        stream,
+        WY32_PARENT_SMEM,
+        parent_state,
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        parent_output,
+        batch_size,
+        seq_len,
+        num_k_heads,
+        num_v_heads,
+        k_dim,
+        v_dim,
+        qk_stride,
+        v_stride,
+        gb_stride,
+    );
+    launch_wy32(
+        reg,
+        dot_batch_kernel,
+        stream,
+        WY32_DOT_BATCH_SMEM,
+        candidate_state,
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        candidate_output,
+        batch_size,
+        seq_len,
+        num_k_heads,
+        num_v_heads,
+        k_dim,
+        v_dim,
+        qk_stride,
+        v_stride,
+        gb_stride,
+    );
+    gpu::gpu_sync(stream).unwrap();
+
+    let mut parent_state_bytes = vec![0u8; state_bytes];
+    let mut candidate_state_bytes = vec![0u8; state_bytes];
+    let mut parent_output_bytes = vec![0u8; output_bytes];
+    let mut candidate_output_bytes = vec![0u8; output_bytes];
+    d2h(&mut parent_state_bytes, parent_state);
+    d2h(&mut candidate_state_bytes, candidate_state);
+    d2h(&mut parent_output_bytes, parent_output);
+    d2h(&mut candidate_output_bytes, candidate_output);
+    assert_bytes_identical(
+        "WY32 final H state",
+        &parent_state_bytes,
+        &candidate_state_bytes,
+    );
+    assert_bytes_identical(
+        "WY32 BF16 output",
+        &parent_output_bytes,
+        &candidate_output_bytes,
+    );
+    for (raw, bytes, label) in [
+        (parent_state_raw, state_bytes, "parent state"),
+        (candidate_state_raw, state_bytes, "candidate state"),
+        (parent_output_raw, output_bytes, "parent output"),
+        (candidate_output_raw, output_bytes, "candidate output"),
+    ] {
+        assert_canaries(raw, bytes, label);
+    }
+    eprintln!(
+        "[gdn_wy32 validation] M={seq_len} state=fnv1a64:{:016x} output=fnv1a64:{:016x} bitwise=PASS canaries=PASS",
+        fnv1a(&parent_state_bytes),
+        fnv1a(&parent_output_bytes)
+    );
+
+    let mut group = c.benchmark_group("gdn_wy32_prefill");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    group.bench_function(format!("parent_M{seq_len}"), |b| {
+        b.iter_custom(|iters| {
+            let ms = gpu::bench_kernel_ms(stream, 1, iters as usize, || {
+                launch_wy32(
+                    reg,
+                    parent_kernel,
+                    stream,
+                    WY32_PARENT_SMEM,
+                    timed_parent_state,
+                    query,
+                    key,
+                    value,
+                    gate,
+                    beta,
+                    timed_parent_output,
+                    batch_size,
+                    seq_len,
+                    num_k_heads,
+                    num_v_heads,
+                    k_dim,
+                    v_dim,
+                    qk_stride,
+                    v_stride,
+                    gb_stride,
+                );
+            });
+            Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
+        });
+    });
+    group.bench_function(format!("dot_batch_M{seq_len}"), |b| {
+        b.iter_custom(|iters| {
+            let ms = gpu::bench_kernel_ms(stream, 1, iters as usize, || {
+                launch_wy32(
+                    reg,
+                    dot_batch_kernel,
+                    stream,
+                    WY32_DOT_BATCH_SMEM,
+                    timed_candidate_state,
+                    query,
+                    key,
+                    value,
+                    gate,
+                    beta,
+                    timed_candidate_output,
+                    batch_size,
+                    seq_len,
+                    num_k_heads,
+                    num_v_heads,
+                    k_dim,
+                    v_dim,
+                    qk_stride,
+                    v_stride,
+                    gb_stride,
+                );
+            });
+            Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
+        });
+    });
+    group.finish();
+
+    gpu::gpu_sync(stream).unwrap();
+    for (raw, bytes, label) in [
+        (timed_parent_state_raw, state_bytes, "timed parent state"),
+        (
+            timed_candidate_state_raw,
+            state_bytes,
+            "timed candidate state",
+        ),
+        (timed_parent_output_raw, output_bytes, "timed parent output"),
+        (
+            timed_candidate_output_raw,
+            output_bytes,
+            "timed candidate output",
+        ),
+    ] {
+        assert_canaries(raw, bytes, label);
+    }
+
+    for raw in [
+        parent_state_raw,
+        candidate_state_raw,
+        parent_output_raw,
+        candidate_output_raw,
+        timed_parent_state_raw,
+        timed_candidate_state_raw,
+        timed_parent_output_raw,
+        timed_candidate_output_raw,
+    ] {
+        gpu::gpu_free(raw);
+    }
+    for input in [query, key, value, gate, beta] {
+        gpu::gpu_free(input);
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_conv1d,
+    bench_gdn,
+    bench_gdn_chunk2,
+    bench_gdn_wy32_prefill
+);
 criterion_main!(benches);

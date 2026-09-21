@@ -1,7 +1,15 @@
-# Qwen3.8 v3 Weschera 72 tok/s profile
+# Qwen3.8 v3 Weschera 72 tok/s historical receipt (quarantined)
 
-This records the promoted single-stream speed profile without replacing the
-historical BF16-KV production default.
+> **Invalid performance evidence. Do not promote or reproduce as a speed
+> target.** The Rust launcher passed 13 attention arguments to an 11-argument
+> PTX entrypoint. Its inserted `query_start=0` was decoded as
+> `num_q_heads=0`, so chunk-0 attention returned without writing output. A
+> deterministic output hash on that defective trajectory does not qualify it.
+
+This document preserves the exact receipt for audit and archaeology. Current
+Spark authority is the separately reproduced V2/BF16-KV 63.9 tok/s profile;
+the corrected-ABI V3 control is 58.011965 tok/s. See
+[`../bench/qwen38-gb10/README.md`](../bench/qwen38-gb10/README.md).
 
 ## Measured identity
 
@@ -26,8 +34,8 @@ substituting an upstream directory invalidates the performance comparison.
 
 ## End-to-end evidence
 
-The fixed Weschera MinHeap request uses temperature zero, reasoning disabled,
-400 output tokens, and one request at a time. The five-run promotion rates were
+The fixed Weschera MinHeap request used temperature zero, reasoning disabled,
+400 output tokens, and one request at a time. The five historical rates were
 70.6411, 72.1877, 72.2574, 72.0858, and 72.1689 tok/s; median 72.1689.
 
 A later ten-run gate against the unchanged process measured rates 72.9290,
@@ -50,10 +58,10 @@ server: 72.4800, 72.3395, 72.2242, 72.0106, and 71.5133 tok/s; median
 validation JSON SHA-256 is
 `1617a021965fe03b827b83af41f6e0631793ea7f913d4e741a6b0ae0fc479cc7`.
 
-### Current perf-branch requalification (2026-08-25)
+### Historical perf-branch rerun (2026-08-25; still invalid)
 
 After the upstream TUI port, commit
-`e5c8fedbc1c85cc8e5860ce10951f522479aabc7` was rebuilt and requalified with
+`e5c8fedbc1c85cc8e5860ce10951f522479aabc7` was rebuilt and rerun with
 the same target, v3 drafter, gamma 15, full vocabulary, NVFP4 target/drafter/KV,
 8192-token context, and the tracked five-run Weschera harness. The rebuilt
 `spark` binary SHA-256 is
@@ -72,7 +80,7 @@ Output is deterministic for this fixed probe. Timing is repeatable within
 normal runtime variance, not numerically deterministic. Every response ends at
 the 400-token cap, so the result does not certify task completion.
 
-## Local, VM, and Vast.ai reproduction
+## Historical reproduction record (do not use for qualification)
 
 Clone and pin the branch on the execution host:
 

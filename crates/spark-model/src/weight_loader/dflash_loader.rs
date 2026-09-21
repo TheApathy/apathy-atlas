@@ -168,6 +168,15 @@ pub struct DflashConfig {
     /// behaviour, so every existing drafter is bit-identical.
     #[serde(default)]
     pub is_causal: Option<bool>,
+    /// RMSNorm epsilon used by every drafter norm. Atlas's DFlash kernels use
+    /// the Qwen default, but strict checkpoint admission must still reject a
+    /// config trained with a different value.
+    #[serde(default)]
+    pub rms_norm_eps: Option<f32>,
+    /// FFN activation serialized by Qwen configs. Existing drafters omit this
+    /// field or use SiLU, which is the activation Atlas executes.
+    #[serde(default)]
+    pub hidden_act: Option<String>,
     /// RoPE rotation base. Qwen3.6-27B-DFlash and 35B-DFlash both ship 10_000_000.
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
@@ -201,6 +210,19 @@ pub struct DflashConfig {
 }
 
 impl DflashConfig {
+    /// Effective RMSNorm epsilon for legacy configs that predate this parsed
+    /// field. Strict official profiles inspect the raw [`Option`] so omission
+    /// remains distinguishable from an explicit declaration.
+    pub fn resolved_rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps.unwrap_or_else(default_rms_norm_eps)
+    }
+
+    /// Effective activation for legacy configs that omit `hidden_act`.
+    /// Strict official profiles require the raw field to be present.
+    pub fn resolved_hidden_act(&self) -> &str {
+        self.hidden_act.as_deref().unwrap_or("silu")
+    }
+
     /// Resolve the training block width. Generic DFlash drafters (z-lab)
     /// serialize `block_size` at the config root; DFlash 2 (incoai) nests it
     /// inside `dflash_config` (block = 1 anchor + drafts). The nested value
@@ -406,6 +428,10 @@ fn default_markov_head_type() -> String {
 
 fn default_rope_theta() -> f32 {
     10_000_000.0
+}
+
+fn default_rms_norm_eps() -> f32 {
+    1e-6
 }
 
 /// HF `rope_scaling` block. Qwen3.5/3.6 DFlash drafters that DO use scaling
@@ -1112,6 +1138,8 @@ mod tests {
             }}"#
         );
         let config = parse_dflash_config(&json).expect("legacy DFlash config");
+        assert_eq!(config.resolved_rms_norm_eps().to_bits(), 1e-6f32.to_bits());
+        assert_eq!(config.resolved_hidden_act(), "silu");
         assert_eq!(
             config.checkpoint_family().unwrap(),
             DrafterCheckpointFamily::Dflash

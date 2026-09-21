@@ -332,10 +332,9 @@ impl Qwen3AttentionLayer {
                     .unwrap_or(ctx.config.rope_theta as f32),
                 stream,
             )?;
-        } else if self.mrope_interleaved && self.rope_mrope_interleaved_k.0 != 0 {
-            ops::rope_mrope_interleaved(
+        } else if self.mrope_interleaved {
+            self.apply_mrope(
                 ctx.gpu,
-                self.rope_mrope_interleaved_k,
                 q_out,
                 k_out,
                 meta.positions,

@@ -23,7 +23,7 @@ use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
 use crate::layers::ops;
-use crate::speculative::DraftProposer;
+use crate::speculative::{CanonicalCommittedPrefix, DraftProposer, TargetTokenAuthority};
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
@@ -40,6 +40,14 @@ impl TransformerModel {
             Some(p) => p.as_ref(),
             None => return Ok(Vec::new()),
         };
+        self.sync_proposer_rotary(seq)?;
+        if !seq.rotary_positions.is_identity() {
+            anyhow::ensure!(
+                position == seq.seq_len,
+                "proposer physical position disagrees with target-fed length"
+            );
+            seq.rotary_positions.tail_scalar(position)?;
+        }
         // ATLAS_DFLASH_DEBUG_DUMP_FULL=1: emit the full token sequence
         // ONCE so a Python reference can run the SAME tokens through HF
         // transformers and dump matching hidden-state captures.
@@ -113,20 +121,40 @@ impl TransformerModel {
         // the draft source the neural drafter never runs, so its ctx is never
         // consumed. The verify path's SSM checkpoint/rollback is independent of
         // this and unchanged.
+        let target_token_authority = proposer.target_token_authority();
         if Self::early_exit_enabled() {
+            anyhow::ensure!(
+                target_token_authority == TargetTokenAuthority::ServingPolicy,
+                "target early-exit cannot bypass exact-authority proposal admission"
+            );
             return self.early_exit_propose(token, num_drafts, seq);
         }
+        let canonical_prefix = if target_token_authority == TargetTokenAuthority::ExactRawArgmax {
+            let prefix = CanonicalCommittedPrefix {
+                fed_tokens: &seq.tokens,
+                pending_token: token,
+                position,
+                prompt_len: seq.prompt_len,
+            };
+            prefix.validate()?;
+            Some(prefix)
+        } else {
+            None
+        };
         let prop_state = seq
             .proposer_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("No proposer state for sequence"))?;
+        if let Some(prefix) = canonical_prefix {
+            proposer.sync_committed_prefix(prefix, prop_state.as_mut(), &ctx, stream)?;
+        }
         // Refresh the host token mirror used by both prompt-lookup drafting
         // (ATLAS_DFLASH_PLD) and the generalized retrieval-augmented drafter
         // (ATLAS_DFLASH_RETRIEVAL). `seq.tokens` is the FULL committed
-        // sequence = prompt tokens + everything generated so far, so the
-        // retrieval haystack includes any reference code in the prompt for
-        // free. Only populated when one of the flags is on (default off ⇒
-        // no extra copy, legacy behavior byte-for-byte).
+        // target-fed prefix; `token` above is the just-emitted pending token.
+        // The retrieval haystack includes reference code in the prompt for
+        // free. Only populated when one of the flags is on (default off ⇒ no
+        // extra copy, legacy behavior byte-for-byte).
         let want_token_mirror = std::env::var("ATLAS_DFLASH_PLD").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_RETRIEVAL").ok().as_deref() == Some("1")
             || std::env::var("ATLAS_DFLASH_SAM").ok().as_deref() == Some("1");
@@ -289,8 +317,8 @@ impl TransformerModel {
     ///   - The seq has no `DflashProposerState`
     ///   - Rank > 0 under EP/TP (drafter is rank-0 only)
     ///
-    /// Layout: writes `hidden[t]` BF16 into
-    /// `acc[(chunk_start + t) * 5 * h + slot_idx * h]` for each t.
+    /// Layout: writes `hidden[t]` BF16 into physical accumulator slot
+    /// `(chunk_start + t) % ctx_capacity`, capture slice `slot_idx`.
     /// Per-layer call performs `proc_count` strided d2d_async copies —
     /// at typical prefill of 128–4096 tokens × 5 capture layers, total
     /// 640–20480 launches per prefill. Acceptable launch overhead for
@@ -332,19 +360,32 @@ impl TransformerModel {
         };
         let h = self.config.hidden_size;
         let bf16 = 2usize;
-        let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
         let max_ctx = dstate.max_ctx_len;
         let src_base = self.buffers.hidden_states();
+        let capture_bytes = h
+            .checked_mul(bf16)
+            .ok_or_else(|| anyhow::anyhow!("DFlash capture byte size overflow"))?;
         for t in 0..proc_count {
-            let abs_pos = chunk_start + t;
+            let abs_pos = chunk_start
+                .checked_add(t)
+                .ok_or_else(|| anyhow::anyhow!("DFlash capture absolute position overflow"))?;
             if abs_pos >= max_ctx {
                 break; // accumulator full; drop later positions
             }
-            let src = src_base.offset(t * h * bf16);
-            let dst_offset = abs_pos * n_capture * h * bf16 + slot_idx * h * bf16;
+            let src_offset = t
+                .checked_mul(capture_bytes)
+                .ok_or_else(|| anyhow::anyhow!("DFlash capture source offset overflow"))?;
+            let src = src_base.offset(src_offset);
+            let dst_offset = crate::layers::dflash_head::ring_window::accumulator_capture_offset(
+                abs_pos,
+                slot_idx,
+                dstate.ctx_capacity,
+                dstate.ctx_slot_bytes,
+                capture_bytes,
+            )?;
             self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
+                .copy_d2d_async(src, acc_base.offset(dst_offset), capture_bytes, stream)?;
         }
         Ok(())
     }
@@ -513,6 +554,7 @@ impl TransformerModel {
             Some(p) => p.clone(),
             None => return Ok(()),
         };
+        self.sync_proposer_rotary(seq)?;
         let lastk_buf = match self.mtp_lastk_buf {
             Some(p) => p,
             None => return Ok(()),
@@ -545,6 +587,21 @@ impl TransformerModel {
         };
         let row_bytes = h * fp32;
         let used_bytes = filled * row_bytes;
+        let start_abs = end_abs
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(filled))
+            .ok_or_else(|| anyhow::anyhow!("MTP last-K captured span overflow"))?;
+        anyhow::ensure!(
+            start_abs <= end_abs
+                && end_abs < tokens.len()
+                && filled <= capacity
+                && used_bytes <= seq.mtp_lastk_host_buf.len(),
+            "MTP last-K captured span exceeds token/hidden history"
+        );
+        let predict_into = start_abs
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("MTP last-K predict-into overflow"))?;
+        seq.rotary_positions.range(predict_into, filled)?;
 
         // The `filled` rows in the host ring occupy
         // `mtp_lastk_host_buf[(capacity-filled)*row_bytes ..]` when partially
@@ -563,14 +620,6 @@ impl TransformerModel {
             .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(src_slice, lastk_buf)], stream)?;
 
         // The captured tokens span `[end_abs - filled + 1 ..= end_abs]`.
-        let start_abs = end_abs + 1 - filled;
-        if start_abs > end_abs || end_abs >= tokens.len() {
-            tracing::warn!(
-                "MTP last-K prefill: invalid span [{start_abs}, {end_abs}] for tokens.len()={}",
-                tokens.len(),
-            );
-            return Ok(());
-        }
         let captured_tokens: Vec<u32> = tokens[start_abs..=end_abs].to_vec();
 
         // Build a ForwardContext mirroring `run_mtp_propose_inner`. MTP

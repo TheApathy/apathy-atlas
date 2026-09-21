@@ -6,6 +6,15 @@
 //!   A. `w4a16_gemm_t_m128` — BF16 A × NVFP4 B (production path)
 //!   B. `nvfp4_nvfp4_gemm_t_m64` — NVFP4 A × NVFP4 B with hardware
 //!      block-scaled MMA (`mma.sync.kind::mxf4nvf4.scale_vec::4X.m16n8k64`)
+//!   C. `nvfp4_nvfp4_gemm_kmajor_m128` — the same W4A4 arithmetic over
+//!      transformed K-major weights, shared across 128 rows and required to
+//!      match B bit-for-bit
+//!   D. `nvfp4_nvfp4_gemm_kmajor_m256` — the long-prefill shadow, shared
+//!      across 256 rows and required to match B and C bit-for-bit
+//!   E. `moe_silu_mul` + `quantize_bf16_to_nvfp4` — the production separate
+//!      SwiGLU/activation-quantization boundary
+//!   F. `quantize_silu_mul_bf16_to_nvfp4` — the fused boundary, required to
+//!      match E byte-for-byte for both packed E2M1 values and E4M3 scales
 //!
 //! Correctness strategy
 //! --------------------
@@ -56,12 +65,113 @@ fn d2h<T: Copy>(dst: &mut [T], dev: u64) {
     }
 }
 
+const OUTPUT_CANARY_BYTES: usize = 4096;
+const OUTPUT_CANARY_PREFIX: u8 = 0xA5;
+const OUTPUT_CANARY_SUFFIX: u8 = 0x5A;
+
+fn guarded_output_alloc(stream: u64, output_bytes: usize) -> (u64, u64) {
+    let total = output_bytes
+        .checked_add(2 * OUTPUT_CANARY_BYTES)
+        .expect("guarded output allocation overflow");
+    let raw = gpu::gpu_alloc_zeroed(stream, total).expect("allocate guarded output");
+    // `gpu_alloc_zeroed` enqueues an asynchronous memset on this stream,
+    // while h2d below is a synchronous driver copy with no ordering edge to
+    // that non-default stream. Finish the memset before publishing canaries.
+    gpu::gpu_sync(stream).expect("finish guarded output initialization");
+    h2d(raw, &vec![OUTPUT_CANARY_PREFIX; OUTPUT_CANARY_BYTES]);
+    h2d(
+        raw + (OUTPUT_CANARY_BYTES + output_bytes) as u64,
+        &vec![OUTPUT_CANARY_SUFFIX; OUTPUT_CANARY_BYTES],
+    );
+    (raw, raw + OUTPUT_CANARY_BYTES as u64)
+}
+
+fn assert_output_canaries(raw: u64, output_bytes: usize, label: &str) {
+    let mut prefix = vec![0u8; OUTPUT_CANARY_BYTES];
+    let mut suffix = vec![0u8; OUTPUT_CANARY_BYTES];
+    d2h(&mut prefix, raw);
+    d2h(
+        &mut suffix,
+        raw + (OUTPUT_CANARY_BYTES + output_bytes) as u64,
+    );
+    assert!(
+        prefix.iter().all(|&byte| byte == OUTPUT_CANARY_PREFIX),
+        "{label} wrote before its output buffer"
+    );
+    assert!(
+        suffix.iter().all(|&byte| byte == OUTPUT_CANARY_SUFFIX),
+        "{label} wrote after its output buffer"
+    );
+}
+
+fn fnv1a_bf16(values: &[u16]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for value in values {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn fnv1a_bytes(values: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for &byte in values {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn assert_bytes_identical(left_label: &str, left: &[u8], right_label: &str, right: &[u8]) {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "{left_label}/{right_label} output lengths differ"
+    );
+    if left != right {
+        let first = left
+            .iter()
+            .zip(right)
+            .position(|(left_value, right_value)| left_value != right_value)
+            .expect("different output vectors must contain a mismatch");
+        panic!(
+            "{left_label}/{right_label} byte mismatch at flat index {first}: {left_label}=0x{:02x} {right_label}=0x{:02x}",
+            left[first], right[first]
+        );
+    }
+}
+
+fn assert_bf16_identical(left_label: &str, left: &[u16], right_label: &str, right: &[u16]) {
+    assert_eq!(
+        left.len(),
+        right.len(),
+        "{left_label}/{right_label} output lengths differ"
+    );
+    if left != right {
+        let first = left
+            .iter()
+            .zip(right)
+            .position(|(left_value, right_value)| left_value != right_value)
+            .expect("different output vectors must contain a mismatch");
+        panic!(
+            "{left_label}/{right_label} bitwise mismatch at flat index {first}: {left_label}=0x{:04x} {right_label}=0x{:04x}",
+            left[first], right[first]
+        );
+    }
+}
+
 static W4A16_M128_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 static NVFP4_GEMM_FN: OnceLock<RawCudaFunc> = OnceLock::new();
+static NVFP4_KMAJOR_M128_FN: OnceLock<RawCudaFunc> = OnceLock::new();
+static NVFP4_KMAJOR_M256_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 static NVFP4_GEMM_SK_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 static NVFP4_SK_REDUCE_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 static ABSMAX_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 static QUANT_FN: OnceLock<RawCudaFunc> = OnceLock::new();
+static SILU_MUL_FN: OnceLock<RawCudaFunc> = OnceLock::new();
+static FUSED_SILU_QUANT_FN: OnceLock<RawCudaFunc> = OnceLock::new();
 
 // Tunable shape. Default is a small validation shape so the CPU reference
 // matmul (used for cos-sim) finishes in ~0.3s. For production timing
@@ -264,7 +374,230 @@ fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 
+fn bench_fused_silu_quant(c: &mut Criterion) {
+    let reg = gpu::ensure_registry();
+    let stream = reg.raw_stream();
+    let silu_kernel = gpu::get_kernel(reg, &SILU_MUL_FN, "moe_silu_mul", "moe_silu_mul");
+    let quant_kernel = gpu::get_kernel(reg, &QUANT_FN, "quantize_nvfp4", "quantize_bf16_to_nvfp4");
+    let fused_kernel = gpu::get_kernel(
+        reg,
+        &FUSED_SILU_QUANT_FN,
+        "quantize_nvfp4",
+        "quantize_silu_mul_bf16_to_nvfp4",
+    );
+
+    let (m, k, _) = bench_shape();
+    assert!(m > 0, "ATLAS_BENCH_M must be positive");
+    assert!(
+        k >= 16 && k.is_multiple_of(16),
+        "ATLAS_BENCH_K must be at least 16 and a multiple of 16"
+    );
+    let total_elements = m.checked_mul(k).expect("fused SiLU element count overflow");
+    let scale2 = std::env::var("ATLAS_BENCH_SCALE2")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.001);
+    assert!(
+        scale2.is_finite() && scale2 > 0.0,
+        "ATLAS_BENCH_SCALE2 must be finite and positive"
+    );
+
+    let mut host_gate = random_bf16(total_elements as usize, 0x51A051A0);
+    let mut host_up = random_bf16(total_elements as usize, 0xA15EA15E);
+    let edge_values = [-16.0, -8.0, -2.0, -1.0, -0.0, 0.0, 1.0, 2.0, 8.0, 16.0];
+    for (index, &value) in edge_values.iter().enumerate() {
+        host_gate[index] = bf16_from_f32(value);
+        host_up[index] = bf16_from_f32(edge_values[edge_values.len() - 1 - index]);
+        let tail = host_gate.len() - 1 - index;
+        host_gate[tail] = bf16_from_f32(value * 0.5);
+        host_up[tail] = bf16_from_f32(edge_values[edge_values.len() - 1 - index] * 0.5);
+    }
+
+    let bf16_bytes = total_elements as usize * std::mem::size_of::<u16>();
+    let packed_bytes = total_elements as usize / 2;
+    let scale_bytes = total_elements as usize / GROUP_SIZE as usize;
+    let (gate_raw, gate) = guarded_output_alloc(stream, bf16_bytes);
+    let (up_raw, up) = guarded_output_alloc(stream, bf16_bytes);
+    let (silu_raw, silu) = guarded_output_alloc(stream, bf16_bytes);
+    let (separate_packed_raw, separate_packed) = guarded_output_alloc(stream, packed_bytes);
+    let (separate_scale_raw, separate_scale) = guarded_output_alloc(stream, scale_bytes);
+    let (fused_packed_raw, fused_packed) = guarded_output_alloc(stream, packed_bytes);
+    let (fused_scale_raw, fused_scale) = guarded_output_alloc(stream, scale_bytes);
+    h2d(gate, &host_gate);
+    h2d(up, &host_up);
+    h2d(silu, &vec![0x3Cu8; bf16_bytes]);
+    h2d(separate_packed, &vec![0x11u8; packed_bytes]);
+    h2d(separate_scale, &vec![0x22u8; scale_bytes]);
+    h2d(fused_packed, &vec![0xD4u8; packed_bytes]);
+    h2d(fused_scale, &vec![0xE8u8; scale_bytes]);
+    gpu::gpu_sync(stream).expect("finish fused SiLU input upload");
+
+    let assert_inputs_unchanged = |phase: &str| {
+        let mut gate_after = vec![0u16; host_gate.len()];
+        let mut up_after = vec![0u16; host_up.len()];
+        d2h(&mut gate_after, gate);
+        d2h(&mut up_after, up);
+        assert_eq!(gate_after, host_gate, "{phase} mutated gate input");
+        assert_eq!(up_after, host_up, "{phase} mutated up input");
+        assert_output_canaries(gate_raw, bf16_bytes, "fused SiLU gate input");
+        assert_output_canaries(up_raw, bf16_bytes, "fused SiLU up input");
+    };
+
+    let silu_grid = (total_elements.div_ceil(256), 1, 1);
+    let quant_grid = (m, 1, 1);
+    let launch_separate = || {
+        let mut silu_params: Vec<*mut c_void> = vec![
+            &gate as *const u64 as *mut c_void,
+            &up as *const u64 as *mut c_void,
+            &silu as *const u64 as *mut c_void,
+            &total_elements as *const u32 as *mut c_void,
+        ];
+        unsafe {
+            gpu::launch(
+                reg,
+                silu_kernel,
+                silu_grid,
+                (256, 1, 1),
+                0,
+                stream,
+                &mut silu_params,
+            )
+            .unwrap();
+        }
+        let mut quant_params: Vec<*mut c_void> = vec![
+            &silu as *const u64 as *mut c_void,
+            &separate_packed as *const u64 as *mut c_void,
+            &separate_scale as *const u64 as *mut c_void,
+            &scale2 as *const f32 as *mut c_void,
+            &m as *const u32 as *mut c_void,
+            &k as *const u32 as *mut c_void,
+        ];
+        unsafe {
+            gpu::launch(
+                reg,
+                quant_kernel,
+                quant_grid,
+                (256, 1, 1),
+                0,
+                stream,
+                &mut quant_params,
+            )
+            .unwrap();
+        }
+    };
+    let launch_fused = || {
+        let mut params: Vec<*mut c_void> = vec![
+            &gate as *const u64 as *mut c_void,
+            &up as *const u64 as *mut c_void,
+            &fused_packed as *const u64 as *mut c_void,
+            &fused_scale as *const u64 as *mut c_void,
+            &scale2 as *const f32 as *mut c_void,
+            &m as *const u32 as *mut c_void,
+            &k as *const u32 as *mut c_void,
+        ];
+        unsafe {
+            gpu::launch(
+                reg,
+                fused_kernel,
+                quant_grid,
+                (256, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+            .unwrap();
+        }
+    };
+
+    launch_separate();
+    gpu::gpu_sync(stream).expect("finish separate SiLU quantization arm");
+    assert_inputs_unchanged("separate SiLU quantization arm");
+    assert_output_canaries(silu_raw, bf16_bytes, "separate SiLU output");
+    assert_output_canaries(separate_packed_raw, packed_bytes, "separate packed output");
+    assert_output_canaries(separate_scale_raw, scale_bytes, "separate scale output");
+
+    launch_fused();
+    gpu::gpu_sync(stream).expect("finish fused SiLU quantization arm");
+    assert_inputs_unchanged("fused SiLU quantization arm");
+    assert_output_canaries(fused_packed_raw, packed_bytes, "fused packed output");
+    assert_output_canaries(fused_scale_raw, scale_bytes, "fused scale output");
+
+    let mut separate_packed_host = vec![0u8; packed_bytes];
+    let mut separate_scale_host = vec![0u8; scale_bytes];
+    let mut fused_packed_host = vec![0u8; packed_bytes];
+    let mut fused_scale_host = vec![0u8; scale_bytes];
+    d2h(&mut separate_packed_host, separate_packed);
+    d2h(&mut separate_scale_host, separate_scale);
+    d2h(&mut fused_packed_host, fused_packed);
+    d2h(&mut fused_scale_host, fused_scale);
+    assert_bytes_identical(
+        "separate packed",
+        &separate_packed_host,
+        "fused packed",
+        &fused_packed_host,
+    );
+    assert_bytes_identical(
+        "separate scale",
+        &separate_scale_host,
+        "fused scale",
+        &fused_scale_host,
+    );
+    eprintln!(
+        "[fused_silu_nvfp4 validation] M={m} K={k} scale2={scale2:.9} bytewise PASS; packed_fingerprint=fnv1a64:{:016x}; scale_fingerprint=fnv1a64:{:016x}",
+        fnv1a_bytes(&fused_packed_host),
+        fnv1a_bytes(&fused_scale_host)
+    );
+
+    let mut group = c.benchmark_group("fused_silu_nvfp4");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    group.bench_function("E_separate_silu_plus_quantize", |b| {
+        b.iter_custom(|iters| {
+            let ms = gpu::bench_kernel_ms(stream, 10, iters as usize, &launch_separate);
+            Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
+        });
+    });
+    group.bench_function("F_fused_silu_quantize", |b| {
+        b.iter_custom(|iters| {
+            let ms = gpu::bench_kernel_ms(stream, 10, iters as usize, &launch_fused);
+            Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
+        });
+    });
+    group.finish();
+
+    gpu::gpu_sync(stream).expect("finish fused SiLU timing launches");
+    for (raw, bytes, label) in [
+        (gate_raw, bf16_bytes, "fused SiLU gate input"),
+        (up_raw, bf16_bytes, "fused SiLU up input"),
+        (silu_raw, bf16_bytes, "separate SiLU output"),
+        (separate_packed_raw, packed_bytes, "separate packed output"),
+        (separate_scale_raw, scale_bytes, "separate scale output"),
+        (fused_packed_raw, packed_bytes, "fused packed output"),
+        (fused_scale_raw, scale_bytes, "fused scale output"),
+    ] {
+        assert_output_canaries(raw, bytes, label);
+    }
+    assert_inputs_unchanged("timed fused/separate launches");
+    eprintln!("[fused_silu_nvfp4 validation] canaries=PASS inputs_immutable=PASS");
+
+    for ptr in [
+        gate_raw,
+        up_raw,
+        silu_raw,
+        separate_packed_raw,
+        separate_scale_raw,
+        fused_packed_raw,
+        fused_scale_raw,
+    ] {
+        gpu::gpu_free(ptr);
+    }
+}
+
 fn bench_nvfp4_gemm(c: &mut Criterion) {
+    if std::env::var("ATLAS_BENCH_FUSED_SILU_ONLY").as_deref() == Ok("1") {
+        bench_fused_silu_quant(c);
+        return;
+    }
     let reg = gpu::ensure_registry();
     let stream = reg.raw_stream();
 
@@ -274,6 +607,18 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
         &NVFP4_GEMM_FN,
         "nvfp4_cutlass",
         "nvfp4_nvfp4_gemm_t_m64",
+    );
+    let nvfp4_kmajor_m128_kernel = gpu::get_kernel(
+        reg,
+        &NVFP4_KMAJOR_M128_FN,
+        "nvfp4_cutlass",
+        "nvfp4_nvfp4_gemm_kmajor_m128",
+    );
+    let nvfp4_kmajor_m256_kernel = gpu::get_kernel(
+        reg,
+        &NVFP4_KMAJOR_M256_FN,
+        "nvfp4_cutlass",
+        "nvfp4_nvfp4_gemm_kmajor_m256",
     );
     let nvfp4_sk_kernel = gpu::get_kernel(
         reg,
@@ -296,6 +641,15 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     let m: u32 = mm;
     let k: u32 = kk;
     let n: u32 = nn;
+    assert!(m > 0, "ATLAS_BENCH_M must be positive");
+    assert!(
+        n >= 128 && n.is_multiple_of(128),
+        "ATLAS_BENCH_N must be a positive multiple of 128"
+    );
+    assert!(
+        k >= 64 && k.is_multiple_of(64),
+        "ATLAS_BENCH_K must be a positive multiple of 64"
+    );
     let skip_ref = (m as u64) * (k as u64) * (n as u64) > 1_000_000_000;
 
     eprintln!(
@@ -415,7 +769,9 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     let g_b_t = gpu::gpu_alloc_zeroed(stream, b_bytes).unwrap();
     let g_s_t = gpu::gpu_alloc_zeroed(stream, s_bytes).unwrap();
     let g_c_a = gpu::gpu_alloc_zeroed(stream, c_bytes).unwrap();
-    let g_c_b = gpu::gpu_alloc_zeroed(stream, c_bytes).unwrap();
+    let (g_c_b_raw, g_c_b) = guarded_output_alloc(stream, c_bytes);
+    let (g_c_km128_raw, g_c_km128) = guarded_output_alloc(stream, c_bytes);
+    let (g_c_km256_raw, g_c_km256) = guarded_output_alloc(stream, c_bytes);
     // Split-K scratch: F32 [K_SPLITS, M, N]. Allocate at max K_SPLITS=8.
     const MAX_K_SPLITS: u32 = 8;
     let scratch_bytes = MAX_K_SPLITS as usize * m as usize * n as usize * 4;
@@ -551,6 +907,67 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     gpu::gpu_sync(stream).unwrap();
 
     // ──────────────────────────────────────────────────────────────────
+    // Run the two K-major W4A4 kernels on the same already-quantized A bytes
+    // and the same weights represented in the K-major transform. All three
+    // W4A4 paths promise bitwise BF16 identity: every warp retains the same
+    // m16n128 fragment and K64 accumulation order; only weight staging and
+    // row sharing differ.
+    // ──────────────────────────────────────────────────────────────────
+    let grid_km128 = (n / 128, m.div_ceil(128), 1);
+    {
+        let mut params: Vec<*mut c_void> = vec![
+            &g_a_packed as *const u64 as *mut c_void,
+            &g_a_scale as *const u64 as *mut c_void,
+            &g_b_t as *const u64 as *mut c_void,
+            &g_s_t as *const u64 as *mut c_void,
+            &scale2_ab as *const f32 as *mut c_void,
+            &g_c_km128 as *const u64 as *mut c_void,
+            &m as *const u32 as *mut c_void,
+            &n as *const u32 as *mut c_void,
+            &k as *const u32 as *mut c_void,
+        ];
+        unsafe {
+            gpu::launch(
+                reg,
+                nvfp4_kmajor_m128_kernel,
+                grid_km128,
+                (256, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+            .unwrap();
+        }
+    }
+    let grid_km256 = (n / 128, m.div_ceil(256), 1);
+    {
+        let mut params: Vec<*mut c_void> = vec![
+            &g_a_packed as *const u64 as *mut c_void,
+            &g_a_scale as *const u64 as *mut c_void,
+            &g_b_t as *const u64 as *mut c_void,
+            &g_s_t as *const u64 as *mut c_void,
+            &scale2_ab as *const f32 as *mut c_void,
+            &g_c_km256 as *const u64 as *mut c_void,
+            &m as *const u32 as *mut c_void,
+            &n as *const u32 as *mut c_void,
+            &k as *const u32 as *mut c_void,
+        ];
+        unsafe {
+            gpu::launch(
+                reg,
+                nvfp4_kmajor_m256_kernel,
+                grid_km256,
+                (512, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+            .unwrap();
+        }
+    }
+    gpu::gpu_sync(stream).unwrap();
+
+    // ──────────────────────────────────────────────────────────────────
     // Run Path B-SplitK once for correctness (K_SPLITS=2)
     // ──────────────────────────────────────────────────────────────────
     let k_splits: u32 = std::env::var("ATLAS_BENCH_K_SPLITS")
@@ -623,9 +1040,22 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     let mut out_a = vec![0u16; m as usize * n as usize];
     let mut out_b = vec![0u16; m as usize * n as usize];
     let mut out_b_sk = vec![0u16; m as usize * n as usize];
+    let mut out_km128 = vec![0u16; m as usize * n as usize];
+    let mut out_km256 = vec![0u16; m as usize * n as usize];
     d2h(&mut out_a, g_c_a);
     d2h(&mut out_b, g_c_b);
     d2h(&mut out_b_sk, g_c_sk);
+    d2h(&mut out_km128, g_c_km128);
+    d2h(&mut out_km256, g_c_km256);
+    assert_output_canaries(g_c_b_raw, c_bytes, "row-major M64");
+    assert_output_canaries(g_c_km128_raw, c_bytes, "K-major M128");
+    assert_output_canaries(g_c_km256_raw, c_bytes, "K-major M256");
+    assert_bf16_identical("row-major M64", &out_b, "K-major M128", &out_km128);
+    assert_bf16_identical("K-major M128", &out_km128, "K-major M256", &out_km256);
+    let w4a4_fingerprint = fnv1a_bf16(&out_b);
+    eprintln!(
+        "[nvfp4_gemm validation] row-major M64/K-major M128/K-major M256 bitwise PASS; output_fingerprint=fnv1a64:{w4a4_fingerprint:016x}; canaries=PASS"
+    );
     let f_a: Vec<f32> = out_a.iter().map(|&b| bf16_to_f32(b)).collect();
     let f_b: Vec<f32> = out_b.iter().map(|&b| bf16_to_f32(b)).collect();
     let f_b_sk: Vec<f32> = out_b_sk.iter().map(|&b| bf16_to_f32(b)).collect();
@@ -768,6 +1198,68 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("C_nvfp4_kmajor_m128_mma_only", |b| {
+        b.iter_custom(|iters| {
+            let ms = gpu::bench_kernel_ms(stream, 50, iters as usize, || {
+                let mut params: Vec<*mut c_void> = vec![
+                    &g_a_packed as *const u64 as *mut c_void,
+                    &g_a_scale as *const u64 as *mut c_void,
+                    &g_b_t as *const u64 as *mut c_void,
+                    &g_s_t as *const u64 as *mut c_void,
+                    &scale2_ab as *const f32 as *mut c_void,
+                    &g_c_km128 as *const u64 as *mut c_void,
+                    &m as *const u32 as *mut c_void,
+                    &n as *const u32 as *mut c_void,
+                    &k as *const u32 as *mut c_void,
+                ];
+                unsafe {
+                    gpu::launch(
+                        reg,
+                        nvfp4_kmajor_m128_kernel,
+                        grid_km128,
+                        (256, 1, 1),
+                        0,
+                        stream,
+                        &mut params,
+                    )
+                    .unwrap();
+                }
+            });
+            Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
+        });
+    });
+
+    group.bench_function("D_nvfp4_kmajor_m256_mma_only", |b| {
+        b.iter_custom(|iters| {
+            let ms = gpu::bench_kernel_ms(stream, 50, iters as usize, || {
+                let mut params: Vec<*mut c_void> = vec![
+                    &g_a_packed as *const u64 as *mut c_void,
+                    &g_a_scale as *const u64 as *mut c_void,
+                    &g_b_t as *const u64 as *mut c_void,
+                    &g_s_t as *const u64 as *mut c_void,
+                    &scale2_ab as *const f32 as *mut c_void,
+                    &g_c_km256 as *const u64 as *mut c_void,
+                    &m as *const u32 as *mut c_void,
+                    &n as *const u32 as *mut c_void,
+                    &k as *const u32 as *mut c_void,
+                ];
+                unsafe {
+                    gpu::launch(
+                        reg,
+                        nvfp4_kmajor_m256_kernel,
+                        grid_km256,
+                        (512, 1, 1),
+                        0,
+                        stream,
+                        &mut params,
+                    )
+                    .unwrap();
+                }
+            });
+            Duration::from_secs_f64(ms as f64 / 1000.0 * iters as f64)
+        });
+    });
+
     group.bench_function("B_splitk_mma_plus_reduce", |b| {
         b.iter_custom(|iters| {
             let ms = gpu::bench_kernel_ms(stream, 50, iters as usize, || {
@@ -897,7 +1389,9 @@ fn bench_nvfp4_gemm(c: &mut Criterion) {
     gpu::gpu_free(g_b_t);
     gpu::gpu_free(g_s_t);
     gpu::gpu_free(g_c_a);
-    gpu::gpu_free(g_c_b);
+    gpu::gpu_free(g_c_b_raw);
+    gpu::gpu_free(g_c_km128_raw);
+    gpu::gpu_free(g_c_km256_raw);
     gpu::gpu_free(g_scratch);
     gpu::gpu_free(g_c_sk);
 }

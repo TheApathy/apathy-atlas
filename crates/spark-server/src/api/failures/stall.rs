@@ -131,6 +131,11 @@ pub fn prepend_reminder_to_system(
     messages: &mut Vec<crate::openai::IncomingMessage>,
     reminder: &str,
 ) {
+    // Optional notices may replace existing ranges; leave image-bearing system
+    // content intact rather than invalidating its ordered pixel ownership.
+    if messages.first().is_some_and(|m| m.role == "system" && !m.content.images.is_empty()) {
+        return;
+    }
     let trimmed = reminder.trim_matches(|c: char| c == '\n' || c == ' ');
     let block = format!("<atlas_runtime_notice>\n{trimmed}\n</atlas_runtime_notice>\n\n");
     let has_system_at_zero = messages.first().is_some_and(|m| m.role == "system");
@@ -281,6 +286,10 @@ pub fn f29_inject_environment_facts(
         lines.join("\n")
     );
 
+    // Optional idempotent rewrites must not move/delete embedded image positions.
+    if messages.first().is_some_and(|m| m.role == "system" && !m.content.images.is_empty()) {
+        return;
+    }
     // Locate or synthesise system message at position 0.
     let has_system_at_zero = messages.first().is_some_and(|m| m.role == "system");
     if has_system_at_zero {

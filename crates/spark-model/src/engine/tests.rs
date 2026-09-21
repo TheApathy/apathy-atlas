@@ -153,6 +153,7 @@ impl Model for MockModel {
             tokens: Vec::new(),
             block_table: Vec::new(),
             seq_len: 0,
+            rotary_positions: crate::traits::RotaryPositions::identity(),
             layer_states: Vec::new(),
             proposer_state: None,
             proposer_state_alt: None,

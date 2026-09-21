@@ -160,8 +160,10 @@ fn has_exact_swap_block(clean: &str) -> bool {
 pub(super) fn victim_selector(source: &str) -> Option<String> {
     const START: &str = "// ── Swap-out: evict active sequences to disk when blocks run low ──";
     const END: &str = "// ── Start new requests ──";
-    const SOURCE_LEN: usize = 41_276;
-    const SOURCE_FNV1A: u64 = 0xc67e9f9382b21e68;
+    // Reviewed against 73d9ca52: scalar dashboard reporting and two module
+    // declarations only; swap/grammar ownership paths remain byte-identical.
+    const SOURCE_LEN: usize = 42_533;
+    const SOURCE_FNV1A: u64 = 0xdfd4902a39703566;
     if source.matches(START).count() != 1 || source.matches(END).count() != 1 {
         return None;
     }

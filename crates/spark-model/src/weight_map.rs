@@ -7,8 +7,14 @@
 //!
 //! Refactor wave 4a (2026-05-03): split into `weight_map/` sub-modules.
 
+#[path = "weight_map/cutlass_scale_layout.rs"]
+pub mod cutlass_scale_layout;
 #[path = "weight_map/expert.rs"]
 mod expert;
+#[path = "weight_map/flashinfer_ffn_admission.rs"]
+pub mod flashinfer_ffn_admission;
+#[path = "weight_map/flashinfer_projection_admission.rs"]
+pub mod flashinfer_projection_admission;
 #[path = "weight_map/fp8_lut.rs"]
 mod fp8_lut;
 #[path = "weight_map/loaders_fp8.rs"]
@@ -23,6 +29,8 @@ mod loaders_mtp_dense;
 mod model_a;
 #[path = "weight_map/model_b.rs"]
 mod model_b;
+#[path = "weight_map/modelopt_scale_admission.rs"]
+pub mod modelopt_scale_admission;
 #[path = "weight_map/moe.rs"]
 mod moe;
 #[path = "weight_map/nemotron.rs"]

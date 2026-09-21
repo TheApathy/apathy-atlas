@@ -4,6 +4,7 @@
 
 pub(crate) mod app_state;
 pub(crate) mod byte_count;
+mod context_extension;
 pub(crate) mod kv_dtypes;
 pub(crate) mod middleware;
 pub(crate) mod serve;

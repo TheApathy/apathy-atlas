@@ -47,6 +47,7 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<[u32; 3]> {
+        let positions = seq.rotary_positions.verify_tail(seq.seq_len, &[0, 1, 2])?;
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
         let bf16 = 2usize;
@@ -128,11 +129,6 @@ impl TransformerModel {
         };
 
         // positions at offset 0 (3 × u32 = 12 bytes)
-        let positions = [
-            seq.seq_len as u32,
-            (seq.seq_len + 1) as u32,
-            (seq.seq_len + 2) as u32,
-        ];
         pack[0..12].copy_from_slice(unsafe {
             std::slice::from_raw_parts(positions.as_ptr() as *const u8, 12)
         });

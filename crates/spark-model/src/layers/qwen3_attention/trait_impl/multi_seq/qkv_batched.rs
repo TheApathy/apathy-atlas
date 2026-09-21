@@ -52,6 +52,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext<'_>,
         stream: u64,
     ) -> Result<()> {
+        self.validate_yarn_multi_seq_controls()?;
         // The batched projection reads scalars/buffers from a MultiSeqCtx.
         // `residual`/`max_seq_len_host`/`bs` are unused by the projection (it
         // only norms `hidden` and writes `qkv_out_base`); pass placeholders.

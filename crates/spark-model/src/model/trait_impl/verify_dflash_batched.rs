@@ -117,6 +117,14 @@ impl TransformerModel {
                 );
             }
         }
+        for seq in seqs.iter() {
+            seq.rotary_positions.tail_scalar(seq.seq_len)?;
+            let last = seq
+                .seq_len
+                .checked_add(k - 1)
+                .ok_or_else(|| anyhow::anyhow!("batched verify physical extent overflow"))?;
+            seq.rotary_positions.tail_scalar(last)?;
+        }
         // c==1 has no batching to do — defer to the proven single-seq path.
         if c == 1 {
             let out = self.decode_verify_dispatch(&tokens_per_seq[0], seqs[0], 0)?;
@@ -400,7 +408,8 @@ impl TransformerModel {
         let bs = kv_cache.block_size();
         let meta_base = self.buffers.scratch().offset(32768);
 
-        let positions: Vec<u32> = (0..k).map(|t| (seq.seq_len + t) as u32).collect();
+        let depths: Vec<_> = (0..k).collect();
+        let positions = seq.rotary_positions.verify_tail(seq.seq_len, &depths)?;
         let pos_bytes =
             unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, k * 4) };
         let mut slots = vec![0i64; k];

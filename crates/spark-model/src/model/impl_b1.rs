@@ -43,7 +43,12 @@ impl TransformerModel {
         let block_size = kv_cache.block_size();
         let max_blocks = self.max_blocks_per_seq;
 
-        let mut positions = Vec::with_capacity(padded_n);
+        let rotary_rows: Vec<_> = seqs
+            .iter()
+            .map(|seq| (&seq.rotary_positions, seq.seq_len))
+            .collect();
+        let rotary = crate::model::rotary_meta::BatchRotary::new(&rotary_rows, padded_n)?;
+        let positions = &rotary.positions;
         let mut slots = Vec::with_capacity(padded_n);
         let mut seq_lens_host = Vec::with_capacity(padded_n);
         // Default-fill with `dummy_kv_block` so any kernel out-of-bounds read
@@ -56,8 +61,7 @@ impl TransformerModel {
 
         // Active sequences
         for (i, seq) in seqs.iter().enumerate() {
-            let pos = seq.seq_len as u32;
-            positions.push(pos);
+            let pos = seq.seq_len;
 
             let block_idx = pos as usize / block_size;
             let block_offset = pos as usize % block_size;
@@ -90,7 +94,6 @@ impl TransformerModel {
         // Padding slots: write to dummy KV block, seq_len=1 (position 0)
         let dummy_slot = (self.dummy_kv_block as i64) * (block_size as i64);
         for i in n..padded_n {
-            positions.push(0);
             slots.push(dummy_slot);
             seq_lens_host.push(1);
             block_table_flat[i * max_blocks as usize] = self.dummy_kv_block as i32;
@@ -113,10 +116,12 @@ impl TransformerModel {
         ];
         self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
+        let (positions_h, positions_w) =
+            rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         Ok(AttnMetadataDev {
             positions: meta_base,
-            positions_h: meta_base,
-            positions_w: meta_base,
+            positions_h,
+            positions_w,
             slot: meta_base.offset(256),
             seq_len: meta_base.offset(512),
             block_table: meta_base.offset(768),
@@ -144,7 +149,12 @@ impl TransformerModel {
         let block_size = kv_cache.block_size();
         let max_blocks = self.max_blocks_per_seq;
 
-        let mut positions = Vec::with_capacity(padded_n);
+        let rotary_rows: Vec<_> = seqs
+            .iter()
+            .map(|seq| (&seq.rotary_positions, seq.seq_len))
+            .collect();
+        let rotary = crate::model::rotary_meta::BatchRotary::new(&rotary_rows, padded_n)?;
+        let positions = &rotary.positions;
         let mut slots = Vec::with_capacity(padded_n);
         let mut seq_lens_host = Vec::with_capacity(padded_n);
         // Sentinel default: see upload_batch_metadata_fixed for rationale.
@@ -152,8 +162,7 @@ impl TransformerModel {
             vec![self.dummy_kv_block as i32; padded_n * max_blocks as usize];
 
         for seq in seqs.iter() {
-            let pos = seq.seq_len as u32;
-            positions.push(pos);
+            let pos = seq.seq_len;
 
             let block_idx = pos as usize / block_size;
             let block_offset = pos as usize % block_size;
@@ -175,7 +184,6 @@ impl TransformerModel {
         // Padding slots
         let dummy_slot = (self.dummy_kv_block as i64) * (block_size as i64);
         for i in n..padded_n {
-            positions.push(0);
             slots.push(dummy_slot);
             seq_lens_host.push(1);
             block_table_flat[i * max_blocks as usize] = self.dummy_kv_block as i32;
@@ -197,10 +205,12 @@ impl TransformerModel {
         ];
         self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
+        let (positions_h, positions_w) =
+            rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         Ok(AttnMetadataDev {
             positions: meta_base,
-            positions_h: meta_base,
-            positions_w: meta_base,
+            positions_h,
+            positions_w,
             slot: meta_base.offset(256),
             seq_len: meta_base.offset(512),
             block_table: meta_base.offset(768),
@@ -394,6 +404,8 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        let rotary =
+            crate::model::rotary_meta::SingleRotary::new(&seq.rotary_positions, seq.seq_len)?;
         let stream = self.gpu.default_stream();
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -418,7 +430,7 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
 
-        let pos_val = seq.seq_len as u32;
+        let pos_val = rotary.position;
         let pos_bytes = pos_val.to_le_bytes();
 
         let block_idx = seq
@@ -441,10 +453,12 @@ impl TransformerModel {
         ];
         self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
+        let (positions_h, positions_w) =
+            rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
-            positions_h: meta_base,
-            positions_w: meta_base,
+            positions_h,
+            positions_w,
             slot: meta_base.offset(8),
             seq_len: meta_base.offset(16),
             block_table: meta_base.offset(256),
@@ -528,6 +542,8 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        let rotary =
+            crate::model::rotary_meta::SingleRotary::new(&seq.rotary_positions, seq.seq_len)?;
         let stream = self.gpu.default_stream();
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -552,7 +568,7 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
 
-        let pos_val = seq.seq_len as u32;
+        let pos_val = rotary.position;
         let pos_bytes = pos_val.to_le_bytes();
 
         let block_idx = seq
@@ -575,10 +591,12 @@ impl TransformerModel {
         ];
         self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
+        let (positions_h, positions_w) =
+            rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
-            positions_h: meta_base,
-            positions_w: meta_base,
+            positions_h,
+            positions_w,
             slot: meta_base.offset(8),
             seq_len: meta_base.offset(16),
             block_table: meta_base.offset(256),

@@ -36,10 +36,14 @@ pub(crate) mod impl_b1;
 pub(crate) mod impl_b2;
 pub(crate) mod impl_b3;
 pub(crate) mod k1_stage_diag;
+pub(crate) mod proposer_rotary;
+pub(crate) mod rotary_graphs;
+pub(crate) mod rotary_meta;
 pub(crate) mod ssm_pool;
 pub mod ssm_pool_geometry;
 pub(crate) mod ssm_snapshot;
 pub(crate) mod trait_impl;
 pub(crate) mod types;
+pub(crate) mod vision_embeddings;
 
 pub use types::TransformerModel;

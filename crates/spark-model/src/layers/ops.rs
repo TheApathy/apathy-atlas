@@ -17,12 +17,18 @@ mod activations;
 mod dflash2_conv;
 #[path = "ops/embeddings.rs"]
 mod embeddings;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[path = "ops/flashinfer_sm121.rs"]
+pub mod flashinfer_sm121;
 #[path = "ops/fp8_moe.rs"]
 mod fp8_moe;
 #[path = "ops/fp8_moe_batch_a.rs"]
 mod fp8_moe_batch_a;
 #[path = "ops/fp8_moe_batch_b.rs"]
 mod fp8_moe_batch_b;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[path = "ops/gdn_c143_sm121.rs"]
+pub mod gdn_c143_sm121;
 #[path = "ops/gemm_dense.rs"]
 mod gemm_dense;
 #[path = "ops/gemm_quant.rs"]
@@ -59,6 +65,8 @@ mod moe_grouped_b;
 mod moe_prefill;
 #[path = "ops/norm.rs"]
 mod norm;
+#[path = "ops/nvfp4_dynamic_scale.rs"]
+pub mod nvfp4_dynamic_scale;
 #[path = "ops/paged_decode_tree.rs"]
 mod paged_decode_tree;
 #[path = "ops/prefill_attn_a.rs"]

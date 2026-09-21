@@ -144,6 +144,13 @@ impl TransformerModel {
         streams: &mut [PrefillSlice<'_>],
         stream: u64,
     ) -> Result<Vec<DevicePtr>> {
+        anyhow::ensure!(
+            streams
+                .iter()
+                .all(|s| !self.vision_prompt_present(s.prompt_tokens)
+                    && s.seq.rotary_positions.is_identity()),
+            "kernel-batched prefill does not admit image rotary state"
+        );
         let n = streams.len();
         let chunk_len = streams[0].chunk_len;
         let is_last_chunk = streams[0].is_last_chunk;

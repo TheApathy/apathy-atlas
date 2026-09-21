@@ -250,7 +250,7 @@ pub(crate) fn quantized_any(
     };
 
     match effective_variant {
-        Nvfp4Variant::Standard => quantized(store, prefix, gpu),
+        Nvfp4Variant::Standard => quantized_modelopt_with_shape(store, prefix, n, k, gpu),
         Nvfp4Variant::CompressedTensors => quantized_v2(store, prefix, gpu),
         Nvfp4Variant::Fp8Dequanted => quantized_from_fp8(
             store,

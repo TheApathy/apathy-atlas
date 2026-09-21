@@ -34,6 +34,8 @@ impl TransformerModel {
         seq: &mut SequenceState,
         _stream: u64,
     ) -> Result<DevicePtr> {
+        let rotary =
+            crate::model::rotary_meta::SingleRotary::new(&seq.rotary_positions, seq.seq_len)?;
         // ATLAS_SSM_H_FP16 stage 2: flip this sequence's h-state to FP16 before
         // any graph capture/replay below. Must be here and not in a layer — see
         // `ssm_h_to_f16_dispatch`. No-op unless the flag is set.
@@ -84,7 +86,7 @@ impl TransformerModel {
         let meta_base = self.buffers.scratch().offset(32768);
         let max_blocks = seq.block_table.len() as u32;
 
-        let pos_val = seq.seq_len as u32;
+        let pos_val = rotary.position;
         let pos_bytes = pos_val.to_le_bytes();
 
         let block_idx = seq
@@ -107,10 +109,12 @@ impl TransformerModel {
         ];
         self.gpu.copy_h2d_group_on_stream(&copies, stream)?;
 
+        let (positions_h, positions_w) =
+            rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         let attn_metadata = AttnMetadataDev {
             positions: meta_base,
-            positions_h: meta_base,
-            positions_w: meta_base,
+            positions_h,
+            positions_w,
             slot: meta_base.offset(8),
             seq_len: meta_base.offset(16),
             block_table: meta_base.offset(256),

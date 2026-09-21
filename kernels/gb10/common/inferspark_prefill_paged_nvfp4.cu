@@ -80,3 +80,4 @@ __device__ __forceinline__ float fp8e4m3_f32(__nv_fp8_storage_t b) {
     __syncthreads();
 
 #include "prefill_paged_compute.cuh"
+#include "prefill_paged_nvfp4_br128.cuh"

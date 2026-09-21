@@ -264,6 +264,12 @@ impl MtpHead {
             w4a16_gemv_qg_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg")?,
             w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
             rope_k: gpu.kernel("rope", "rope_forward")?,
+            rope_mrope_k: if config.mrope_interleaved {
+                gpu.kernel("rope_mrope_interleaved", "rope_forward_mrope_interleaved")
+                    .ok()
+            } else {
+                None
+            },
             reshape_cache_k: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash_fp8")?,
             paged_decode_k: gpu.kernel("paged_decode_fp8", "paged_decode_attn_fp8")?,
             residual_add_k: if config.use_fp32_residual() {
@@ -431,6 +437,12 @@ impl MtpHead {
             w4a16_gemv_dual_k: gpu.kernel("w4a16_gemv_fused", "w4a16_gemv_dual")?,
             rope_k: gpu.kernel("rope", "rope_forward")?,
             reshape_cache_k: gpu.kernel("reshape_and_cache", "reshape_and_cache_flash_fp8")?,
+            rope_mrope_k: if config.mrope_interleaved {
+                gpu.kernel("rope_mrope_interleaved", "rope_forward_mrope_interleaved")
+                    .ok()
+            } else {
+                None
+            },
             paged_decode_k: gpu.kernel("paged_decode_fp8", "paged_decode_attn_fp8")?,
             residual_add_k: if config.use_fp32_residual() {
                 gpu.kernel("norm", "f32_residual_add")

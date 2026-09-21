@@ -101,6 +101,17 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 32768)]
     pub max_seq_len: usize,
 
+    /// Explicit RoPE theta for contexts beyond the checkpoint's native
+    /// max_position_embeddings. Required for an experimental extension;
+    /// capacity does not imply long-context quality.
+    #[arg(long)]
+    pub rope_theta_override: Option<f64>,
+
+    /// Static YaRN factor for an explicitly extended context. Qwen3.8's
+    /// official 1M recipe uses 4 and keeps rope_theta unchanged.
+    #[arg(long)]
+    pub rope_yarn_factor: Option<f32>,
+
     /// KV cache block size (tokens per block).
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,

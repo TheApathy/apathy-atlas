@@ -24,6 +24,70 @@ fn gdn_profile_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var("ATLAS_GDN_PROFILE").ok().as_deref() == Some("1"))
 }
 
+pub(super) fn use_wy32_gatecache(
+    requested: bool,
+    has_kernel: bool,
+    total_tokens: u32,
+    key_dim: usize,
+    value_dim: usize,
+) -> Result<bool, &'static str> {
+    let eligible = requested && total_tokens > 32 && key_dim == 128 && value_dim == 128;
+    if eligible && !has_kernel {
+        return Err(
+            "ATLAS_GDN_PREFILL_GATECACHE=1 requires gated_delta_rule_prefill_wy32_gatecache",
+        );
+    }
+    Ok(eligible)
+}
+
+pub(super) fn log_wy32_gatecache_engaged(total_tokens: u32) {
+    static GATECACHE_SEEN: std::sync::Once = std::sync::Once::new();
+    GATECACHE_SEEN.call_once(|| {
+        tracing::info!(
+            "ATLAS_GDN_PREFILL_GATECACHE engaged: WY32 cached gate products for M={total_tokens}"
+        );
+    });
+}
+
+const WY32_CHUNK_SIZE: usize = 32;
+const WY32_WARP_COUNT: usize = 4;
+const WY32_DOT_PAIR_COUNT: usize = WY32_CHUNK_SIZE * (WY32_CHUNK_SIZE - 1) / 2;
+
+pub(super) fn wy32_dynamic_smem_bytes(
+    key_dim: usize,
+    value_dim: usize,
+    dot_batched: bool,
+) -> Option<u32> {
+    let terms = [
+        key_dim.checked_mul(value_dim)?.checked_mul(4)?,
+        WY32_CHUNK_SIZE.checked_mul(key_dim)?.checked_mul(2)?,
+        WY32_CHUNK_SIZE.checked_mul(key_dim)?.checked_mul(2)?,
+        WY32_WARP_COUNT.checked_mul(4)?,
+        WY32_CHUNK_SIZE
+            .checked_mul(WY32_CHUNK_SIZE)?
+            .checked_mul(4)?,
+        WY32_CHUNK_SIZE.checked_mul(4)?,
+        WY32_CHUNK_SIZE.checked_mul(4)?,
+        if dot_batched {
+            WY32_DOT_PAIR_COUNT
+                .checked_mul(WY32_WARP_COUNT)?
+                .checked_mul(4)?
+        } else {
+            0
+        },
+        if dot_batched {
+            WY32_DOT_PAIR_COUNT.checked_mul(2)?
+        } else {
+            0
+        },
+    ];
+    let bytes = terms
+        .into_iter()
+        .try_fold(0usize, |sum, term| sum.checked_add(term))?;
+    let aligned = bytes.div_ceil(256).checked_mul(256)?;
+    aligned.try_into().ok()
+}
+
 /// Public dumper used from the server shutdown / bench script if needed.
 #[allow(dead_code)]
 pub fn dump_gdn_profile() {
@@ -58,13 +122,6 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let __gdn_prof = gdn_profile_enabled();
-        let __gdn_t0 = if __gdn_prof {
-            ctx.gpu.synchronize(stream)?;
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         let ssm_state = state
             .as_any_mut()
             .downcast_mut::<SsmLayerState>()
@@ -81,6 +138,30 @@ impl Qwen3SsmLayer {
         let fp32 = 4usize;
 
         let total = gdn_bufs.total_len as u32;
+        let gdn_c143 = self.preflight_gdn_c143_prefill(
+            ctx,
+            gdn_bufs.total_len,
+            nk,
+            nv,
+            kd,
+            vd,
+            conv_dim,
+            nv * 2,
+            ctx.config.ssm_qkvz_size(),
+            ssm_state.h_state,
+            gdn_bufs.qkv,
+            gdn_bufs.gate_beta,
+            gdn_bufs.output,
+            stream,
+        )?;
+
+        let __gdn_prof = gdn_profile_enabled();
+        let __gdn_t0 = if __gdn_prof {
+            ctx.gpu.synchronize(stream)?;
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // Packed QKV layout: Q at offset 0, K at key_dim, V at key_dim*2
         // Strides: qk_stride = conv_dim, v_stride = conv_dim (elements, not bytes)
@@ -97,13 +178,49 @@ impl Qwen3SsmLayer {
         // shared memory (~84KB). ~30× faster than per-token for 14k+ sequences.
         // Falls through to WY4 or sub-chunked persistent for shorter sequences.
         // Silenced per-call info log; instrumentation lives in trait_prefill.rs.
-        if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {
-            // SMEM layout: H[kd*vd]FP32 + smem_k[32*kd]BF16 + smem_q[32*kd]BF16
-            //   + smem_warp[4]FP32 + smem_kd[32*32]FP32
-            //   + smem_g[32]FP32 + smem_bt[32]FP32 (rounded to 256 B alignment)
-            let smem_bytes =
-                kd * vd * 4 + 32 * kd * 2 + 32 * kd * 2 + 4 * 4 + 32 * 32 * 4 + 32 * 4 + 32 * 4;
-            let smem = (smem_bytes.div_ceil(256) * 256) as u32;
+        // SMEM layout: H[kd*vd]FP32 + smem_k[32*kd]BF16 + smem_q[32*kd]BF16
+        //   + smem_warp[4]FP32 + smem_kd[32*32]FP32
+        //   + smem_g[32]FP32 + smem_bt[32]FP32. The gate-cache shadow adds
+        //   dot_partials[496][4]FP32; each route is rounded to 256 B alignment.
+        let wy32_smem = wy32_dynamic_smem_bytes(kd, vd, false)
+            .ok_or_else(|| anyhow::anyhow!("WY32 dynamic shared-memory size overflow"))?;
+        let wy32_gatecache_smem = wy32_dynamic_smem_bytes(kd, vd, true)
+            .ok_or_else(|| anyhow::anyhow!("WY32 gate-cache shared-memory size overflow"))?;
+        let gatecache = use_wy32_gatecache(
+            crate::layers::gdn_prefill_gatecache_enabled(),
+            self.gdn_prefill_wy32_gatecache_k.0 != 0,
+            total,
+            kd,
+            vd,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if let Some(gdn_c143) = gdn_c143.as_ref() {
+            gdn_c143.launch(ctx.gpu)?;
+        } else if gatecache {
+            log_wy32_gatecache_engaged(total);
+            ops::gdn_prefill_persistent_smem(
+                ctx.gpu,
+                self.gdn_prefill_wy32_gatecache_k,
+                ssm_state.h_state,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                gate_ptr,
+                beta_ptr,
+                gdn_bufs.output,
+                1,
+                total,
+                nk as u32,
+                nv as u32,
+                kd as u32,
+                vd as u32,
+                conv_dim as u32,
+                conv_dim as u32,
+                gb_stride,
+                wy32_gatecache_smem,
+                stream,
+            )?;
+        } else if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {
             ops::gdn_prefill_persistent_smem(
                 ctx.gpu,
                 self.gdn_prefill_wy32_k,
@@ -123,7 +240,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 conv_dim as u32,
                 gb_stride,
-                smem,
+                wy32_smem,
                 stream,
             )?;
         } else if total > 4096 {

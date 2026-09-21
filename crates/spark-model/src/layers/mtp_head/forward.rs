@@ -33,7 +33,8 @@ impl MtpHead {
         let h = ctx.config.hidden_size;
         let fp32 = if ctx.config.use_fp32_residual() { 4 } else { 2 };
         let stride = h * fp32;
-        let start_pos = (base_position + 1).saturating_sub(k);
+        let predict_start = super::rotary::prompt_tail_start(base_position, k)?;
+        self.validate_rotary_span(state, predict_start, k, ctx)?;
         for i in 0..k {
             let token = tokens[i];
             let target_hidden_i = target_hiddens.offset(i * stride);
@@ -43,7 +44,7 @@ impl MtpHead {
             // After K iterations the latest cache entry is RoPE'd at
             // `start_pos + k = base_position + 1`, matching what the first
             // post-prefill decode call will pass (`seq.seq_len` after bootstrap).
-            let position = start_pos + i + 1;
+            let position = predict_start + i;
             let _draft = self.forward_one(
                 token,
                 target_hidden_i,
@@ -91,6 +92,7 @@ impl MtpHead {
         let nkv = ctx.config.num_key_value_heads as u32;
         let hd = ctx.config.head_dim as u32;
         let eps = ctx.config.rms_norm_eps as f32;
+        let rotary = self.rotary_axes(state, position, ctx)?;
 
         // 1. Embed token
         let embed_out = ctx.buffers.ssm_qkvz(); // reuse scratch
@@ -275,7 +277,11 @@ impl MtpHead {
         // Fixed 512-byte buffer overflows when seq_len > ~2000 (block table > 256 bytes).
         let meta_size = 256 + bt_len;
         let mut meta_buf = vec![0u8; meta_size];
-        meta_buf[0..4].copy_from_slice(&(position as u32).to_le_bytes());
+        meta_buf[0..4].copy_from_slice(&rotary[0].to_le_bytes());
+        if !state.rotary_positions.is_identity() {
+            meta_buf[20..24].copy_from_slice(&rotary[1].to_le_bytes());
+            meta_buf[24..28].copy_from_slice(&rotary[2].to_le_bytes());
+        }
         meta_buf[8..16].copy_from_slice(&global_slot.to_le_bytes());
         meta_buf[16..20].copy_from_slice(&actual_seq_len.to_le_bytes());
         // Block table values are always < 2^31 (block indices), so u32 → i32 is lossless.
@@ -286,20 +292,7 @@ impl MtpHead {
             .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(&meta_buf, meta_base)], stream)?;
 
         // RoPE
-        ops::rope(
-            ctx.gpu,
-            self.rope_k,
-            q_out,
-            k_out,
-            meta_base, // positions
-            1,
-            nq,
-            nkv,
-            hd,
-            ctx.config.rotary_dim() as u32,
-            ctx.config.rope_theta as f32,
-            stream,
-        )?;
+        self.apply_rotary(state, ctx, q_out, k_out, meta_base, nq, nkv, hd, stream)?;
 
         // Reshape + cache (FP8).
         //
