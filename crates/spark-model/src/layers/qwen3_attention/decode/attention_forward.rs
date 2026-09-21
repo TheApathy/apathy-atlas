@@ -15,6 +15,7 @@ use spark_runtime::kv_dequant::{
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops;
+use crate::layers::qwen3_attention::{Qwen4DeviceAttentionRoute, Qwen4DeviceAttentionRow};
 
 impl Qwen3AttentionLayer {
     pub(in super::super) fn attention_forward(
@@ -28,6 +29,131 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            None,
+            Some(seq_len),
+            None,
+            false,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            Some(seq_len),
+            None,
+            false,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    /// Run the ordinary token-ordered attention/QSA/KV/gate core but leave
+    /// its H-wide result unprojected so an exact multi-row O projection can
+    /// be scheduled by the admitted prefill caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_raw(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            Some(seq_len),
+            None,
+            true,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) fn attention_forward_preprojected_device(
+        &self,
+        normed: DevicePtr,
+        qkv_row: DevicePtr,
+        device_row: Qwen4DeviceAttentionRow,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        self.attention_forward_impl(
+            normed,
+            Some(qkv_row),
+            None,
+            Some(device_row),
+            false,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            kv_cache,
+            ctx,
+            stream,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_forward_impl(
+        &self,
+        normed: DevicePtr,
+        preprojected_qkv: Option<DevicePtr>,
+        host_seq_len: Option<usize>,
+        device_row: Option<Qwen4DeviceAttentionRow>,
+        defer_oproj: bool,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        kv_cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<DevicePtr> {
+        anyhow::ensure!(
+            host_seq_len.is_some() != device_row.is_some(),
+            "attention requires exactly one host or device-metadata route"
+        );
+        anyhow::ensure!(
+            !defer_oproj || preprojected_qkv.is_some(),
+            "deferred O projection requires preprojected QKV"
+        );
         let h = ctx.config.hidden_size as u32;
         // Per-layer dimension overrides for heterogeneous models (Gemma-4)
         let nq = self
@@ -45,21 +171,23 @@ impl Qwen3AttentionLayer {
         // which handles HSS sliding-window eviction before this layer-internal
         // entry point. Defensive alloc here is incompatible with rolling-window
         // semantics (no access to disk_block_ids).
-        let blocks_needed = (seq_len / bs) + 1;
-        let expected_window_size = match kv_cache.config().cache_blocks_per_seq {
-            Some(cap) => blocks_needed.min(cap as usize),
-            None => blocks_needed,
-        };
-        debug_assert!(
-            block_table.len() >= expected_window_size,
-            "Qwen3AttentionLayer::decode entered with under-allocated block_table \
-             ({}/{} blocks) — caller must call ensure_blocks_through_decode",
-            block_table.len(),
-            expected_window_size,
-        );
+        if let Some(seq_len) = host_seq_len {
+            let blocks_needed = (seq_len / bs) + 1;
+            let expected_window_size = match kv_cache.config().cache_blocks_per_seq {
+                Some(cap) => blocks_needed.min(cap as usize),
+                None => blocks_needed,
+            };
+            debug_assert!(
+                block_table.len() >= expected_window_size,
+                "Qwen3AttentionLayer::decode entered with under-allocated block_table \
+                 ({}/{} blocks) — caller must call ensure_blocks_through_decode",
+                block_table.len(),
+                expected_window_size,
+            );
+        }
 
         // Q/K/V projections into separate regions of qkv_output (GEMV for M=1)
-        let q_out = ctx.buffers.qkv_output();
+        let q_out = preprojected_qkv.unwrap_or_else(|| ctx.buffers.qkv_output());
         let q_dim = nq * hd; // actual Q dimension
         let q_proj_dim = if self.gated { q_dim * 2 } else { q_dim }; // gated: Q + gate
         let q_proj_bytes = q_proj_dim as usize * 2;
@@ -86,8 +214,7 @@ impl Qwen3AttentionLayer {
             };
             return self.attention_forward_mla(kv_cache, ctx, &args);
         }
-
-        if self.gated {
+        if preprojected_qkv.is_none() && self.gated {
             // Q+Gate projection with inline deinterleave (output is [Q_all | Gate_all])
             if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 // FP8 native: w8a16_gemv + separate deinterleave (no fused QG variant yet)
@@ -147,7 +274,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
-        } else {
+        } else if preprojected_qkv.is_none() {
             // Ungated: Q projection only (no gate)
             if let Some(fp8) = self.q_weight.as_ref().and_then(|w| w.as_fp8()) {
                 ops::w8a16_gemv(
@@ -189,7 +316,7 @@ impl Qwen3AttentionLayer {
         }
 
         // DIAG: dump normed input and Q output for L0
-        if self.attn_layer_idx == 0 && ctx.profile {
+        if preprojected_qkv.is_none() && self.attn_layer_idx == 0 && ctx.profile {
             ctx.gpu.synchronize(stream)?;
             let mut input_buf = vec![0u8; 16]; // first 8 BF16 values
             ctx.gpu.copy_d2h(normed, &mut input_buf)?;
@@ -216,100 +343,117 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        // K+V output after Q projection region
-        let k_out = q_out.offset(q_proj_bytes);
-        let v_out = k_out.offset((nkv * hd) as usize * 2);
+        if preprojected_qkv.is_none() {
+            self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
 
-        self.attention_forward_kv(normed, k_out, v_out, nkv, hd, h, ctx, stream)?;
+            // Q/K RMS norms — three mutually-exclusive paths:
+            //  1. MiniMax M2 style: RMSNorm over full projected hidden
+            //     `[nq*hd]` per token, single learned weight of that shape.
+            //     Reached only for MiniMax — every other loader leaves
+            //     `q_norm_full` as `None` (see `AttentionWeights`).
+            //  2. Qwen3-family per-head: rows=nq, cols=hd.
+            //  3. Nemotron-H standalone attn: both weights NULL, skip.
+            //
+            // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
+            // This codepath never runs for Mistral/DeepSeek-style MLA
+            // models — they early-return in the MLA branch above.
+            if let Some(ref q_norm_full) = self.attn.q_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    q_out,
+                    q_norm_full,
+                    q_out,
+                    1,
+                    nq * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.q_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    q_out,
+                    &self.attn.q_norm,
+                    q_out,
+                    nq,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
+            if let Some(ref k_norm_full) = self.attn.k_norm_full {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    k_norm_full,
+                    k_out,
+                    1,
+                    nkv * hd,
+                    eps,
+                    stream,
+                )?;
+            } else if !self.attn.k_norm.weight.is_null() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    k_out,
+                    &self.attn.k_norm,
+                    k_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
 
-        // Q/K RMS norms — three mutually-exclusive paths:
-        //  1. MiniMax M2 style: RMSNorm over full projected hidden
-        //     `[nq*hd]` per token, single learned weight of that shape.
-        //     Reached only for MiniMax — every other loader leaves
-        //     `q_norm_full` as `None` (see `AttentionWeights`).
-        //  2. Qwen3-family per-head: rows=nq, cols=hd.
-        //  3. Nemotron-H standalone attn: both weights NULL, skip.
-        //
-        // Applied BEFORE RoPE (MiniMaxM2Attention.forward reference).
-        // This codepath never runs for Mistral/DeepSeek-style MLA
-        // models — they early-return in the MLA branch above.
-        if let Some(ref q_norm_full) = self.attn.q_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                q_out,
-                q_norm_full,
-                q_out,
-                1,
-                nq * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.q_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                q_out,
-                &self.attn.q_norm,
-                q_out,
-                nq,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
-        if let Some(ref k_norm_full) = self.attn.k_norm_full {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_out,
-                k_norm_full,
-                k_out,
-                1,
-                nkv * hd,
-                eps,
-                stream,
-            )?;
-        } else if !self.attn.k_norm.weight.is_null() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                k_out,
-                &self.attn.k_norm,
-                k_out,
-                nkv,
-                hd,
-                eps,
-                stream,
-            )?;
-        }
-
-        // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
-        // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
-        // `value_states = self.v_norm(value_states)` with
-        // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
-        // K=V mode. For full-attention K=V layers, v_out holds raw K (V
-        // GEMV against aliased K weights). For sliding layers, v_out holds
-        // V projection output. Either way, normalize in place. V does NOT
-        // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
-        // the absolute formula `out = x * rms * weight`.
-        if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                v_out,
-                v_norm_w,
-                v_out,
-                nkv,
-                hd,
-                eps,
-                stream,
-            )?;
+            // Gemma-4 v_norm (applied at EVERY layer, not just K=V). HF
+            // `Gemma4TextAttention.forward()` modeling_gemma4.py:1220 applies
+            // `value_states = self.v_norm(value_states)` with
+            // `Gemma4RMSNorm(with_scale=False)` = pure `x * rms` regardless of
+            // K=V mode. For full-attention K=V layers, v_out holds raw K (V
+            // GEMV against aliased K weights). For sliding layers, v_out holds
+            // V projection output. Either way, normalize in place. V does NOT
+            // receive RoPE. Ones (not zeros) because Gemma-4's rms_norm uses
+            // the absolute formula `out = x * rms * weight`.
+            if let Some(v_norm_w) = self.v_norm_weight.as_ref() {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    v_out,
+                    v_norm_w,
+                    v_out,
+                    nkv,
+                    hd,
+                    eps,
+                    stream,
+                )?;
+            }
         }
 
         if self.mla.is_some() {
             // MLA: RoPE already applied inside the MLA block (to rope portions only).
             // Skip the shared RoPE to avoid double-rotation.
+        } else if !self.qwen4_yarn_inv_freq.is_null() {
+            ops::rope_yarn_scaled(
+                ctx.gpu,
+                self.rope_yarn_scaled_k,
+                q_out,
+                k_out,
+                meta.positions,
+                1,
+                nq,
+                nkv,
+                hd,
+                self.rotary_dim_override
+                    .unwrap_or(ctx.config.rotary_dim() as u32),
+                self.qwen4_yarn_inv_freq,
+                self.rope_theta_override
+                    .unwrap_or(ctx.config.rope_theta as f32),
+                self.qwen4_yarn_attention_factor,
+                stream,
+            )?;
         } else if self.rope_proportional && self.rope_proportional_k.0 != 0 {
             // Gemma-4 full-attention: proportional RoPE with rotation pairs
             // (i, i + head_dim/2) for i < rope_angles. rotary_dim_override
@@ -387,6 +531,46 @@ impl Qwen3AttentionLayer {
             ctx.graph_capture,
         )?;
 
+        // QSA's indexer consumes the same hyperconnection-mixed attention
+        // input as the QKV projection. It must run for every prefix token so
+        // the compressed side cache is complete before position 2048 switches
+        // from dense fallback to sparse attention.
+        let qsa_indices = if meta.qwen4_qsa_required
+            && let Some(qsa) = self.qwen4_qsa.as_ref()
+        {
+            Some(if let Some(row) = device_row {
+                qsa.update_and_select_device(
+                    normed,
+                    row,
+                    kv_cache,
+                    meta,
+                    h,
+                    eps,
+                    ctx.config.rope_theta as f32,
+                    ctx.config.rotary_dim() as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            } else {
+                let seq_len = host_seq_len.expect("host QSA route checked above");
+                qsa.update_and_select(
+                    normed,
+                    seq_len,
+                    seq_len + 1,
+                    kv_cache,
+                    meta,
+                    h,
+                    eps,
+                    ctx.config.rope_theta as f32,
+                    ctx.config.rotary_dim() as u32,
+                    ctx.gpu,
+                    stream,
+                )?
+            })
+        } else {
+            None
+        };
+
         // Turbo KV cache: apply WHT to Q before paged decode.
         // KV cache stores WHT(K) and WHT(V). By Parseval's theorem,
         // <WHT(Q), WHT(K)> = <Q, K>, so WHT(Q) gives correct attention scores.
@@ -449,6 +633,10 @@ impl Qwen3AttentionLayer {
         // so the streaming kernel sees a self-consistent WHT-domain attention
         // and the bookend kernels recover real-V.
         let use_orchestrator = self.high_speed_swap_engaged(kv_cache);
+        anyhow::ensure!(
+            device_row.is_none() || !use_orchestrator,
+            "device-metadata attention cannot enter high-speed-swap dispatch"
+        );
 
         if use_orchestrator {
             // Phase 6.3: per-layer K/V offload to disk. The alloc-time
@@ -478,7 +666,46 @@ impl Qwen3AttentionLayer {
                 )
             })
             .expect("local installed checked in high_speed_swap_engaged")?;
+        } else if matches!(
+            device_row.map(|row| row.route),
+            Some(Qwen4DeviceAttentionRoute::SparseQsa)
+        ) || host_seq_len.is_some_and(|seq_len| seq_len >= 2048)
+        {
+            let qsa = self
+                .qwen4_qsa
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Qwen4 context beyond 2048 requires QSA"))?;
+            qsa.sparse_attention_bf16(
+                q_out,
+                qsa_indices.expect("QSA index update ran above"),
+                attn_out,
+                kv_cache,
+                meta,
+                self.attn_layer_idx,
+                nq,
+                nkv,
+                hd,
+                inv_sqrt_d,
+                ctx.gpu,
+                stream,
+            )?;
         } else {
+            let max_seq_len_host = if let Some(row) = device_row {
+                anyhow::ensure!(
+                    matches!(
+                        row.route,
+                        Qwen4DeviceAttentionRoute::DensePaged { num_splits: 2 }
+                    ),
+                    "invalid device-metadata dense-paged topology"
+                );
+                0
+            } else {
+                host_seq_len
+                    .expect("host dense-paged route checked above")
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("attention sequence length overflow"))?
+                    as u32
+            };
             // Single-sequence decode path: tree-aware indirection is only
             // active in K=γ verify (decode_multi_seq path), so always pass
             // null here.
@@ -501,10 +728,9 @@ impl Qwen3AttentionLayer {
                 spark_runtime::gpu::DevicePtr::NULL,
                 spark_runtime::gpu::DevicePtr::NULL,
                 0,
-                // Host-side seq_len for KV split heuristic. +1 accounts for the
-                // about-to-be-attended token (matches the value uploaded as
-                // device-side `seq_lens`).
-                (seq_len + 1) as u32,
+                // The device-metadata route seals legacy two-way split-K and
+                // therefore has no frame-varying host scalar in the launch.
+                max_seq_len_host,
                 stream,
             )?;
         }
@@ -545,9 +771,11 @@ impl Qwen3AttentionLayer {
             )?;
         }
 
-        // O projection ── (extracted to attention_forward_oproj.rs)
-        let o_out = self.attention_forward_oproj(attn_out, nq, hd, h, ctx, stream)?;
-
-        Ok(o_out)
+        if defer_oproj {
+            Ok(attn_out)
+        } else {
+            // O projection ── (extracted to attention_forward_oproj.rs)
+            self.attention_forward_oproj(attn_out, nq, hd, h, ctx, stream)
+        }
     }
 }

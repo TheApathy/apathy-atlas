@@ -534,11 +534,13 @@ pub const GDN_PREFILL_BLOCK_X: u32 = 128;
 
 /// As [`gdn_prefill_persistent_smem`], but with an explicit block width.
 ///
-/// The K-split kernel (`gated_delta_rule_prefill_wy32_gatecache_ksplit`) takes the
-/// SAME argument list but is launched with 512 threads arranged as 4 j-groups x 128
-/// V columns, so the only thing that varies between it and the parent kernel at the
-/// launch site is this dimension. Kept as a separate entry point rather than adding a
-/// parameter to the original so that no existing call site changes behaviour.
+/// Kept as a separate entry point rather than adding a parameter to the original so
+/// that no existing call site changes behaviour.
+///
+/// WARNING before wiring any kernel here at a width other than [`GDN_PREFILL_BLOCK_X`]:
+/// the only one that ever did was the WY32 gate-cache K-split, REJECTED ON NUMERICS —
+/// +8.62% legal-domain NLL against a +3.22% precedent, argmax 95-96% against a 100%
+/// standard, attribution closed by a same-ELF control. Needs a fresh per-domain gate.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_prefill_persistent_smem_blocked(
     gpu: &dyn GpuBackend,

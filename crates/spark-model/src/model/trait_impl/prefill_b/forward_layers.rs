@@ -17,6 +17,7 @@ use crate::traits::SequenceState;
 impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
+        tokens: &[u32],
         seq: &mut SequenceState,
         kv_cache: &mut PagedKvCache,
         chunk_start: usize,
@@ -58,6 +59,7 @@ impl TransformerModel {
             (meta_base, meta_base)
         };
         let attn_metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h: positions_h_dev,
             positions_w: positions_w_dev,
@@ -94,6 +96,11 @@ impl TransformerModel {
         // and the decode MoE path, which is ~7x faster per layer than the prefill
         // GEMM path for a single token (0.7ms/layer vs 5ms/layer).
         let use_decode_path = proc_count == 1 && effective_seq_len_start > 0;
+        let prefill_receipt = if use_decode_path {
+            None
+        } else {
+            crate::model::qwen4_prefill_engagement::begin(&self.config, proc_count)?
+        };
         let layer_kv_write_start = super::cached_kv_rows_in_slice(
             seq.cached_prefix_tokens,
             effective_seq_len_start,
@@ -107,6 +114,61 @@ impl TransformerModel {
         };
         let mut layer_times: Vec<u128> = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
+            if i == 1
+                && let Some(ple) = &self.qwen4_ple
+            {
+                let row_bytes = self.config.residual_width() * 2;
+                let end = effective_seq_len_start
+                    .saturating_add(proc_count)
+                    .min(tokens.len());
+                let prior = &tokens[..effective_seq_len_start.min(tokens.len())];
+                let current = &tokens[effective_seq_len_start..end];
+                anyhow::ensure!(
+                    current.len() == proc_count,
+                    "Qwen4 PLE chunk extent {} != proc_count {proc_count}",
+                    current.len()
+                );
+                if std::env::var("ATLAS_QWEN4_PLE_PREFILL_BATCH")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    ple.forward_prefill(
+                        current,
+                        prior,
+                        hidden,
+                        seq.slot_idx,
+                        effective_seq_len_start == 0,
+                        self.gpu.as_ref(),
+                        stream,
+                    )?;
+                } else {
+                    let mut history = prior.to_vec();
+                    for (row, &token) in current.iter().enumerate() {
+                        ple.forward_token(
+                            token,
+                            &history,
+                            hidden.offset(row * row_bytes),
+                            seq.slot_idx,
+                            effective_seq_len_start == 0 && row == 0,
+                            self.gpu.as_ref(),
+                            stream,
+                        )?;
+                        history.push(token);
+                    }
+                }
+                ple.capture_post_prefill_parity(
+                    hidden,
+                    tokens,
+                    prior,
+                    current,
+                    effective_seq_len_start,
+                    seq.slot_idx,
+                    effective_seq_len_start == 0,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
+            }
             let lt0 = if profile_now {
                 self.gpu.synchronize(stream)?;
                 Some(std::time::Instant::now())
@@ -204,11 +266,14 @@ impl TransformerModel {
                 && !dir.is_empty()
             {
                 self.gpu.synchronize(stream)?;
-                let last_start = (proc_count - 1) * h;
+                // Rows of the residual stream are residual_width() wide (4*h for
+                // the Qwen4 hyperconnection models); dump the whole last row.
+                let rw = self.config.residual_width();
+                let last_start = (proc_count - 1) * rw;
                 let (vals, _) = if self.config.use_fp32_residual() {
-                    self.readback_f32(hidden.offset(last_start * fp32), h)?
+                    self.readback_f32(hidden.offset(last_start * fp32), rw)?
                 } else {
-                    self.readback_bf16(hidden.offset(last_start * fp32), h)?
+                    self.readback_bf16(hidden.offset(last_start * fp32), rw)?
                 };
                 let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::create_dir_all(&dir).ok();
@@ -254,6 +319,9 @@ impl TransformerModel {
                 total_us as f64 / 1000.0,
                 top5.join(", "),
             );
+        }
+        if let Some(receipt) = prefill_receipt {
+            receipt.finish()?;
         }
         Ok(())
     }

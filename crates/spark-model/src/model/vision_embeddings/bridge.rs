@@ -37,7 +37,7 @@ impl TransformerModel {
                 "vision merger width does not match text hidden width"
             );
             ensure!(
-                !self.config.use_fp32_residual(),
+                self.config.is_qwen4_exp() || !self.config.use_fp32_residual(),
                 "Qwen vision embedding splice currently requires BF16 residual storage"
             );
             ensure!(
@@ -139,6 +139,25 @@ impl TransformerModel {
         let Some(config) = &self.config.vision else {
             return Ok(());
         };
+        if self.config.is_qwen4_exp() {
+            ensure!(
+                self.config.hc_count > 0
+                    && self.config.hidden_size.checked_mul(self.config.hc_count)
+                        == Some(self.config.residual_width()),
+                "invalid Qwen4 vision residual width"
+            );
+            return self.vision_embeddings.lock().splice_expanded(
+                tokens,
+                config.image_pad_token_id,
+                start,
+                len,
+                destination,
+                self.config.hidden_size,
+                self.config.hc_count,
+                stream,
+                |source, target| self.expand_qwen4_embedding(source, target, stream),
+            );
+        }
         self.vision_embeddings.lock().splice(
             self.gpu.as_ref(),
             tokens,

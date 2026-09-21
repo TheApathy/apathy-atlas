@@ -9,6 +9,12 @@
 use super::{LayerType, ModelConfig};
 
 impl ModelConfig {
+    /// Width of the persistent residual stream. Conventional transformers
+    /// have one stream; Qwen4-Exp concatenates `hc_count` streams.
+    pub fn residual_width(&self) -> usize {
+        self.hidden_size.saturating_mul(self.hc_count.max(1))
+    }
+
     /// GQA ratio: number of Q heads per KV head.
     pub fn gqa_ratio(&self) -> usize {
         self.num_attention_heads
@@ -198,6 +204,11 @@ impl ModelConfig {
             return true;
         }
         false
+    }
+
+    /// Qwen4 experimental architecture used by Qwen3.8-Flash-Next.
+    pub fn is_qwen4_exp(&self) -> bool {
+        self.model_type == "qwen4_exp"
     }
 
     /// Whether to skip NVFP4 quantization of the LM head.

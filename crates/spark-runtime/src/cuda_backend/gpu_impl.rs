@@ -80,6 +80,10 @@ impl Drop for CudaPinnedHostStorage {
 }
 
 impl GpuBackend for AtlasCudaBackend {
+    fn transform_cache_identity(&self) -> Option<&str> {
+        self.transform_cache_identity.as_deref()
+    }
+
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
         let mut dptr: u64 = 0;
         let status = unsafe { cuMemAlloc_v2(&mut dptr, bytes) };

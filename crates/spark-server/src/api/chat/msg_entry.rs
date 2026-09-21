@@ -69,7 +69,10 @@ pub(super) fn build_msg_entries(
     for (msg_idx, m) in req.messages.iter().enumerate() {
         let mut content = m.content.clone();
         content.validate_order().map_err(|e| {
-            openai_error_response(StatusCode::BAD_REQUEST, format!("Invalid message content: {e}"))
+            openai_error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid message content: {e}"),
+            )
         })?;
 
         // Historical assistant messages after the last user query
@@ -82,9 +85,9 @@ pub(super) fn build_msg_entries(
             && msg_idx > last_query_index
             && !thinking_suppressed
         {
-            content.prepend_text("<think>\n\n</think>\n\n").map_err(|e| {
-                openai_error_response(StatusCode::BAD_REQUEST, e)
-            })?;
+            content
+                .prepend_text("<think>\n\n</think>\n\n")
+                .map_err(|e| openai_error_response(StatusCode::BAD_REQUEST, e))?;
         }
         let mut text = content.text;
 
@@ -187,10 +190,9 @@ pub(super) fn build_msg_entries(
     // such a message as absent so a degenerate client prompt can't poison
     // generation. Conservative — only an empty body or a single short
     // bare `Label:` line qualifies; any substantive prompt is untouched.
-    if messages
-        .first()
-        .is_some_and(|m| m.role == "system" && m.image_count == 0 && is_vacuous_system_content(&m.content))
-    {
+    if messages.first().is_some_and(|m| {
+        m.role == "system" && m.image_count == 0 && is_vacuous_system_content(&m.content)
+    }) {
         let removed = messages.remove(0);
         tracing::info!(
             dropped = %removed.content.trim(),
@@ -202,8 +204,10 @@ pub(super) fn build_msg_entries(
     let mut image_pixels: Vec<(Vec<f32>, usize, usize)> = Vec::new();
     if !all_images.is_empty() {
         let Some(vcfg) = &state.vision_config else {
-            return Err(openai_error_response(StatusCode::BAD_REQUEST,
-                "Image input requires a vision-capable model".into()));
+            return Err(openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "Image input requires a vision-capable model".into(),
+            ));
         };
         for (idx, uri) in all_images.iter().enumerate() {
             match spark_model::vision_preprocess::preprocess_image(uri, vcfg) {

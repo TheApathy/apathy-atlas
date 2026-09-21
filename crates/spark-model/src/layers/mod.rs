@@ -12,6 +12,14 @@ pub mod nemotron_moe;
 pub mod ops;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4_oracle;
+pub mod qwen4_fast_proj;
+pub mod qwen4_flash_attn;
+pub mod qwen4_hyper;
+pub mod qwen4_mtp;
+pub mod qwen4_ple;
+pub(crate) mod qwen4_prefill_moe;
+pub mod qwen4_qsa;
 pub mod vision_encoder;
 
 pub use dense_ffn::{DenseFfnLayer, FfnActivation};
@@ -24,6 +32,12 @@ pub use nemotron_mamba2::NemotronMamba2Layer;
 pub use nemotron_moe::NemotronMoeLayer;
 pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
+pub use qwen4_hyper::Qwen4HyperConnection;
+pub use qwen4_mtp::Qwen4MtpHead;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+pub use qwen4_ple::Qwen4PleLayer;
+pub use qwen4_ple::{PleRowSelection, QWEN4_PLE_HEADS, Qwen4PleHasher};
+pub use qwen4_qsa::Qwen4QsaIndexer;
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
 
 use crate::layer::ForwardContext;
@@ -1190,22 +1204,6 @@ pub fn gdn_prefill_gatecache_v2_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_GDN_PREFILL_GATECACHE_V2").ok().as_deref() == Some("1"))
 }
 
-/// `ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1`: use the K-split (R3) variant of the
-/// WY32 gate-cache GDN prefill kernel -- 512 threads as 4 j-groups x 128 V
-/// columns, state register-resident (requires GATECACHE=1; fails closed if the
-/// symbol is missing).
-///
-/// NOT BIT-EXACT. The two dot products over j are reassociated: each j-group
-/// sums its own 32 terms and the four partials fold in ascending group order,
-/// instead of one sequential FP32 sum over j = 0..127. Harness receipts
-/// (bench/gdn/gdn_r3.txt): 0.0198% of output words differ, 95% of those by
-/// 1 ulp, output relative L2 3.2e-05, state relative L2 4.4e-08.
-pub fn gdn_prefill_gatecache_ksplit_enabled() -> bool {
-    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("ATLAS_GDN_PREFILL_GATECACHE_KSPLIT").ok().as_deref() == Some("1")
-    })
-}
 
 /// `ATLAS_SSM_RESET_ASYNC=1`: per-request SSM slot reset uses stream-ordered,
 /// per-region memsets + one sync instead of ~2000 synchronous memsets.
@@ -1216,6 +1214,11 @@ pub fn ssm_reset_async_enabled() -> bool {
 
 /// `ATLAS_DFLASH_CAPTURE_STRIDED=1`: DFlash prefill hidden capture uses one
 /// strided-copy kernel per captured layer instead of one D2D copy per row.
+///
+/// NO CALLERS since the phaseA-a1 merge — this gate currently does nothing.
+/// It is `pub`, so it is public API and `dead_code` does not fire on it; the
+/// same regression is documented in full on `strided_copy_rows_kernel`
+/// (`model/types.rs`), which is where the build would otherwise have failed.
 pub fn dflash_capture_strided_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("ATLAS_DFLASH_CAPTURE_STRIDED").ok().as_deref() == Some("1"))
@@ -1853,6 +1856,59 @@ impl FfnComponent {
             Self::Dense(d) => d.forward_k3(input, ctx, stream),
             Self::None => Ok(()),
         }
+    }
+
+    /// Compose the decode-qualified K=3 and K=2 kernels for a five-row
+    /// verifier tile. The input rows are dead after their group has run, so
+    /// they temporarily preserve the first three outputs without allocating
+    /// another arena.
+    pub fn forward_k5_split(
+        &self,
+        input: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        if std::env::var("ATLAS_QWEN4_K5_NATIVE_MOE").ok().as_deref() == Some("1")
+            && let Self::Moe(moe) = self
+        {
+            return moe.forward_k5(input, ctx, stream);
+        }
+        let row_bytes = ctx.config.hidden_size * 2;
+        self.forward_k3(input, ctx, stream)?;
+        let output = ctx.buffers.moe_output();
+        ctx.gpu
+            .copy_d2d_async(output, input, 3 * row_bytes, stream)?;
+        self.forward_k2(input.offset(3 * row_bytes), ctx, stream)?;
+        ctx.gpu
+            .copy_d2d_async(output, output.offset(3 * row_bytes), 2 * row_bytes, stream)?;
+        ctx.gpu
+            .copy_d2d_async(input, output, 3 * row_bytes, stream)?;
+        Ok(())
+    }
+
+    /// Exact Qwen4 speculative FFN for the qualified five- and nine-row
+    /// verifier tiles. Native MoE kernels are row-count parameterized; the
+    /// legacy split fallback remains limited to five rows.
+    pub fn forward_qwen4_exact_rows(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(rows, 5 | 9),
+            "Qwen4 exact FFN requires 5 or 9 rows"
+        );
+        if std::env::var("ATLAS_QWEN4_K5_NATIVE_MOE").ok().as_deref() == Some("1")
+            && let Self::Moe(moe) = self
+        {
+            return moe.forward_qwen4_exact(input, rows, ctx, stream);
+        }
+        if rows == 5 {
+            return self.forward_k5_split(input, ctx, stream);
+        }
+        self.forward_prefill(input, rows, ctx, stream)
     }
 
     /// K=γ verify batched FFN. Returns `true` when the call was serviced

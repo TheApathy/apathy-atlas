@@ -419,12 +419,6 @@ impl BlockDiffusionDraftHead {
             // Greedy walk seeded at the last verified token (`last_token`, the
             // bonus/root row's token id): draft_tokens_dev[i] = chosen
             // candidate at position i.
-            {
-                static SEL_SEEN: std::sync::Once = std::sync::Once::new();
-                SEL_SEEN.call_once(|| {
-                    tracing::info!("DFLASH2_EXEC: selector_walk RAN");
-                });
-            }
             ops::dflash2_selector_walk(
                 gpu,
                 self.kernels.dflash2_selector_walk,
@@ -439,6 +433,12 @@ impl BlockDiffusionDraftHead {
                 sel.rank as i32,
                 stream,
             )?;
+            {
+                static SEL_SEEN: std::sync::Once = std::sync::Once::new();
+                SEL_SEEN.call_once(|| {
+                    tracing::info!("DFLASH2_EXEC: selector_walk RAN");
+                });
+            }
         } else {
             for i in 0..gamma_eff {
                 let logits_row = self.scratch.logits.offset(i * lm_stride * bf16);

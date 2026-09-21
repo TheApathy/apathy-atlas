@@ -140,10 +140,14 @@ pub async fn responses_endpoint(
                     match crate::openai::IncomingMessage::try_from_responses_input_item(item) {
                         Ok(Some(message)) => messages.push(message),
                         Ok(None) => {} // Opaque reasoning is intentionally not replayed.
-                        Err(e) => return openai_error_response_with_param(
-                            StatusCode::BAD_REQUEST, format!("Invalid conversation item: {e}"),
-                            Some("conversation"), None,
-                        ),
+                        Err(e) => {
+                            return openai_error_response_with_param(
+                                StatusCode::BAD_REQUEST,
+                                format!("Invalid conversation item: {e}"),
+                                Some("conversation"),
+                                None,
+                            );
+                        }
                     }
                 }
                 messages

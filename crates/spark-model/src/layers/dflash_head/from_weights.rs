@@ -19,6 +19,9 @@ use crate::weight_loader::{
 };
 use crate::weight_map::{DenseWeight, quantize_to_nvfp4};
 
+#[path = "dflash_context_window.rs"]
+mod dflash_context_window;
+
 /// Resolve the two Qwen config dialects (`rope_scaling` and Transformers 5's
 /// `rope_parameters`) into the exact frequency table and amplitude multiplier
 /// consumed by the DFlash kernel.
@@ -117,8 +120,6 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        let _ = target_hidden_size;
-
         let num_layers = weights.config.num_hidden_layers;
         let hidden_size = weights.config.hidden_size;
         let intermediate_size = weights.config.intermediate_size;
@@ -126,8 +127,47 @@ impl BlockDiffusionDraftHead {
         let num_kv_heads = weights.config.num_key_value_heads;
         let head_dim = weights.config.head_dim;
         let vocab_size = weights.config.vocab_size;
+        let expected_fc_shape = [
+            hidden_size,
+            target_layer_ids.len().saturating_mul(target_hidden_size),
+        ];
+        anyhow::ensure!(
+            weights.fc_shape == expected_fc_shape,
+            "DFlash drafter fc.weight shape {:?} is incompatible with target intermediate width {} and {} capture layers; expected {:?}",
+            weights.fc_shape,
+            target_hidden_size,
+            target_layer_ids.len(),
+            expected_fc_shape,
+        );
         weights.config.validate_verify_mode(verify_mode)?;
         let checkpoint_family = weights.config.checkpoint_family()?;
+        let native_flash_next = dflash_context_window::is_native_flash_next(
+            &weights.config.architectures,
+            weights.config.model_type.as_deref(),
+            hidden_size,
+            intermediate_size,
+            num_layers,
+            weights.config.num_target_layers,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size,
+            &target_layer_ids,
+        );
+        // Resolve and reject an invalid runtime context contract before any
+        // backend kernel lookup or device allocation has an observable effect.
+        let ctx_window = dflash_context_window::resolve_context_window(
+            window_size,
+            max_seq_len,
+            native_flash_next,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        tracing::info!(
+            "DFlash resident context window = {} (absolute max_seq_len={}, native_flash_next={})",
+            ctx_window,
+            max_seq_len,
+            native_flash_next,
+        );
         let block_size = weights.config.resolved_block_size();
         let gamma_val = weights.config.resolve_draft_count(gamma)?;
         super::draft_budget::DflashDraftBudget::validate_head(gamma_val, physical_verify_k)?;
@@ -286,26 +326,9 @@ impl BlockDiffusionDraftHead {
         // logits + argmax tail still operates on γ rows (offset past ctx).
         let bf16 = 2usize;
         let g = gamma_val;
-        // Phase 2.5n: ctx_window controls how many captured target positions
-        // the drafter attends to per step. The drafter was trained over the
-        // FULL captured prefix (paper §A.1), but capping at γ=16 cripples it
-        // on prompts past a tiny window — Atlas's 6-10% acceptance vs the
-        // paper's 70% is dominated by this cap. Default raised to 512;
-        // ATLAS_DFLASH_CTX_WINDOW overrides at construction time.
-        //
-        // Memory cost: attention scratch scales linearly with `n_attn = γ + cw`.
-        // Logits are separate and compact: only configured draft rows by the
-        // shared target/drafter vocabulary prefix.
-        let ctx_window: usize = std::env::var("ATLAS_DFLASH_CTX_WINDOW")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(512);
-        tracing::info!(
-            "DFlash ctx_window = {} (set ATLAS_DFLASH_CTX_WINDOW to override; \
-             drafter trained on full captured prefix — larger is better, \
-             scratch grows linearly)",
-            ctx_window
-        );
+        // The startup-resolved value controls scratch, cache, and runtime
+        // attention. Native Flash-Next keeps this 4096-token tail resident
+        // even when absolute positions extend to 1M.
         let kv_dim = num_kv_heads * head_dim;
         let circular_kv_bytes = ctx_window * kv_dim * bf16 * 2 * num_layers;
         let circular_fc_bytes = ctx_window * hidden_size * bf16;
@@ -536,7 +559,8 @@ impl BlockDiffusionDraftHead {
                 tracing::info!(
                     "DFlash per-layer SWA: {sliding_count}/{num_layers} layers \
                      use sliding_window={sw}; causal_layers={causal_count}/{num_layers} \
-                     mode={causal_mode}"
+                     mode={causal_mode} causal={causals:?} checkpoint is_causal={:?}",
+                    weights.config.is_causal,
                 );
                 (windows, causals)
             }

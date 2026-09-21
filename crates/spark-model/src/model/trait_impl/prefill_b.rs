@@ -121,6 +121,24 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let total = tokens.len();
         self.validate_vision_prompt(tokens, chunk_start, chunk_len)?;
+        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
+            let high_speed_swap = self.kv_cache.lock().config().cache_blocks_per_seq.is_some();
+            crate::layers::qwen4_prefill_moe::attn16::admit_surface(
+                self.vision_prompt_present(tokens),
+                seq.seq_len,
+                chunk_start,
+                chunk_len,
+                total,
+                high_speed_swap,
+            )?;
+        }
+        crate::layers::qwen4_prefill_moe::admit_request(&self.config, total, 0)?;
+        if crate::layers::qwen4_prefill_moe::attn16::selected()? {
+            let kv_cache = self.kv_cache.lock();
+            for layer in &self.layers {
+                layer.preflight_qwen4_attn16(&kv_cache, self.gpu.as_ref(), stream)?;
+            }
+        }
         assert!(
             chunk_start + chunk_len <= total,
             "chunk_start({chunk_start}) + chunk_len({chunk_len}) > total({total})"
@@ -259,6 +277,7 @@ impl TransformerModel {
 
         // ── Phase 4: forward through all layers ──
         self.prefill_b_forward_layers(
+            tokens,
             seq,
             &mut kv_cache,
             chunk_start,

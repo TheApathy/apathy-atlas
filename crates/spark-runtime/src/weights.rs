@@ -3,9 +3,14 @@
 //! Weight loading from safetensors files (SBIO IORouter for filesystem I/O).
 
 use crate::gpu::{DevicePtr, GpuBackend};
-use anyhow::{Result, bail};
-use std::collections::HashMap;
+use anyhow::{Context, Result, bail, ensure};
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+mod safetensor_receipt;
+
+pub use safetensor_receipt::{Bf16FinitenessReceipt, attest_exact_bf16_safetensors};
 
 /// Advise the OS to evict a file's pages from the page cache.
 ///
@@ -37,6 +42,7 @@ pub enum WeightDtype {
     FP32,
     FP8E4M3,
     UInt8,
+    Int64,
 }
 
 impl WeightDtype {
@@ -46,6 +52,7 @@ impl WeightDtype {
             Self::FP32 => 4,
             Self::FP8E4M3 => 1,
             Self::UInt8 => 1,
+            Self::Int64 => 8,
         }
     }
 
@@ -54,6 +61,7 @@ impl WeightDtype {
             safetensors::Dtype::BF16 => Ok(Self::BF16),
             safetensors::Dtype::F32 => Ok(Self::FP32),
             safetensors::Dtype::U8 => Ok(Self::UInt8),
+            safetensors::Dtype::I64 => Ok(Self::Int64),
             safetensors::Dtype::F8_E4M3 => Ok(Self::FP8E4M3),
             other => bail!("Unsupported safetensors dtype: {other:?}"),
         }
@@ -80,6 +88,7 @@ impl WeightTensor {
 /// All model weights loaded onto the GPU, keyed by HuggingFace name.
 pub struct WeightStore {
     weights: HashMap<String, WeightTensor>,
+    released: Mutex<HashSet<String>>,
 }
 
 impl WeightStore {
@@ -87,17 +96,25 @@ impl WeightStore {
     pub fn empty() -> Self {
         Self {
             weights: HashMap::new(),
+            released: Mutex::new(HashSet::new()),
         }
     }
 
     /// Crate-internal: wrap a pre-built map. Used by alternate loaders
     /// (e.g. `fast_weights::FastSafetensorsLoader`).
     pub(crate) fn from_map(weights: HashMap<String, WeightTensor>) -> Self {
-        Self { weights }
+        Self {
+            weights,
+            released: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Get a weight tensor by name. Fails fast if not found.
     pub fn get(&self, name: &str) -> Result<&WeightTensor> {
+        ensure!(
+            !self.released.lock().contains(name),
+            "Weight '{name}' was consumed during model construction"
+        );
         self.weights
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Weight '{name}' not found in store"))
@@ -105,34 +122,112 @@ impl WeightStore {
 
     /// Check if a weight exists.
     pub fn contains(&self, name: &str) -> bool {
-        self.weights.contains_key(name)
+        self.weights.contains_key(name) && !self.released.lock().contains(name)
     }
 
     /// Number of loaded weights.
     pub fn len(&self) -> usize {
-        self.weights.len()
+        self.weights.len() - self.released.lock().len()
     }
 
     /// True if no weights are loaded.
     pub fn is_empty(&self) -> bool {
-        self.weights.is_empty()
+        self.len() == 0
     }
 
     /// Iterator over all weight names.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.weights.keys().map(|s| s.as_str())
+        self.weights
+            .keys()
+            .filter(|name| !self.released.lock().contains(name.as_str()))
+            .map(|name| name.as_str())
     }
 
     /// Total bytes across all weight tensors on the GPU.
     pub fn total_bytes(&self) -> usize {
-        self.weights.values().map(|w| w.byte_size()).sum()
+        let released = self.released.lock();
+        self.weights
+            .iter()
+            .filter(|(name, _)| !released.contains(name.as_str()))
+            .map(|(_, weight)| weight.byte_size())
+            .sum()
+    }
+
+    fn reserve_consumed_alias(
+        &self,
+        name: &str,
+        expected_ptr: DevicePtr,
+        expected_dtype: WeightDtype,
+    ) -> Result<Option<(DevicePtr, usize)>> {
+        let mut released = self.released.lock();
+        ensure!(
+            !released.contains(name),
+            "Weight '{name}' was already consumed"
+        );
+        let weight = self
+            .weights
+            .get(name)
+            .with_context(|| format!("Weight '{name}' not found in store"))?;
+        if weight.ptr != expected_ptr || weight.dtype != expected_dtype {
+            return Ok(None);
+        }
+        released.insert(name.to_string());
+        Ok(Some((weight.ptr, weight.byte_size())))
+    }
+
+    fn rollback_consumed(&self, name: &str) {
+        self.released.lock().remove(name);
+    }
+
+    /// Release a source tensor after model construction has durably replaced
+    /// it. A tombstone makes every later lookup fail closed instead of exposing
+    /// the stale device pointer retained in the immutable name map.
+    pub fn release_consumed_alias(
+        &self,
+        name: &str,
+        expected_ptr: DevicePtr,
+        expected_dtype: WeightDtype,
+        gpu: &dyn GpuBackend,
+    ) -> Result<usize> {
+        let Some((ptr, bytes)) = self.reserve_consumed_alias(name, expected_ptr, expected_dtype)?
+        else {
+            return Ok(0);
+        };
+        if let Err(error) = gpu.free(ptr) {
+            self.rollback_consumed(name);
+            return Err(error).with_context(|| format!("release consumed weight '{name}'"));
+        }
+        Ok(bytes)
+    }
+
+    /// Merge a separately loaded, disjoint sidecar store without copying GPU
+    /// allocations. Duplicate names are rejected so a supplemental checkpoint
+    /// cannot silently replace target weights.
+    pub fn merge_disjoint(&mut self, other: Self) -> Result<()> {
+        let Self {
+            weights: other_weights,
+            released: other_released,
+        } = other;
+        ensure!(
+            other_released.into_inner().is_empty(),
+            "cannot merge a WeightStore containing consumed tensors"
+        );
+        if let Some(name) = other_weights
+            .keys()
+            .find(|name| self.weights.contains_key(*name))
+        {
+            bail!("Weight sidecar duplicates target tensor '{name}'");
+        }
+        self.weights.extend(other_weights);
+        Ok(())
     }
 
     /// Check if any tensor has FP8 dtype.
     pub fn has_fp8_weights(&self) -> bool {
-        self.weights
-            .values()
-            .any(|w| matches!(w.dtype, WeightDtype::FP8E4M3))
+        let released = self.released.lock();
+        self.weights.iter().any(|(name, weight)| {
+            !released.contains(name.as_str()) && matches!(weight.dtype, WeightDtype::FP8E4M3)
+        })
     }
 }
 
@@ -144,6 +239,91 @@ pub trait WeightLoader {
         gpu: &dyn GpuBackend,
         oom_reserve_bytes: usize,
     ) -> Result<WeightStore>;
+}
+
+#[cfg(test)]
+mod consumed_weight_tests {
+    use super::*;
+
+    fn store() -> WeightStore {
+        WeightStore::from_map(HashMap::from([
+            (
+                "bf16".to_string(),
+                WeightTensor {
+                    ptr: DevicePtr(0x1000),
+                    shape: vec![2, 4],
+                    dtype: WeightDtype::BF16,
+                },
+            ),
+            (
+                "fp8".to_string(),
+                WeightTensor {
+                    ptr: DevicePtr(0x2000),
+                    shape: vec![8],
+                    dtype: WeightDtype::FP8E4M3,
+                },
+            ),
+        ]))
+    }
+
+    #[test]
+    fn reserved_consumed_weight_is_tombstoned_from_every_public_view() {
+        let store = store();
+        let (ptr, bytes) = store
+            .reserve_consumed_alias("bf16", DevicePtr(0x1000), WeightDtype::BF16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ptr, DevicePtr(0x1000));
+        assert_eq!(bytes, 16);
+        assert!(store.get("bf16").is_err());
+        assert!(!store.contains("bf16"));
+        assert_eq!(store.names().collect::<Vec<_>>(), ["fp8"]);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.total_bytes(), 8);
+        assert!(store.has_fp8_weights());
+        assert!(
+            store
+                .reserve_consumed_alias("bf16", DevicePtr(0x1000), WeightDtype::BF16)
+                .is_err()
+        );
+        assert!(
+            store
+                .reserve_consumed_alias("missing", DevicePtr(0x1000), WeightDtype::BF16)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_device_free_can_roll_back_tombstone() {
+        let store = store();
+        store
+            .reserve_consumed_alias("bf16", DevicePtr(0x1000), WeightDtype::BF16)
+            .unwrap();
+        store.rollback_consumed("bf16");
+        assert_eq!(store.get("bf16").unwrap().ptr, DevicePtr(0x1000));
+        assert!(store.contains("bf16"));
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.total_bytes(), 24);
+    }
+
+    #[test]
+    fn mismatched_alias_is_retained_without_a_tombstone() {
+        let store = store();
+        assert_eq!(
+            store
+                .reserve_consumed_alias("bf16", DevicePtr(0x1001), WeightDtype::BF16)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .reserve_consumed_alias("bf16", DevicePtr(0x1000), WeightDtype::FP8E4M3)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.get("bf16").unwrap().ptr, DevicePtr(0x1000));
+        assert_eq!(store.len(), 2);
+    }
 }
 
 /// Loads weights from safetensors files using mmap.
@@ -165,6 +345,11 @@ pub struct SafetensorsLoader {
     /// hybrid linear-attention model false-OOMs a plain one. Zero means
     /// "unknown / nothing extra", which is the pre-existing behaviour.
     pub construction_overhead_bytes: usize,
+    /// Optional exact tensor-name allowlist. When present, every tensor not
+    /// named here is skipped before OOM estimation and allocation. This is
+    /// used for small compatibility sidecars sourced from a full checkpoint
+    /// (for example a DFlash donor embedding + LM head).
+    pub tensor_allowlist: Option<HashSet<String>>,
 }
 
 impl Default for SafetensorsLoader {
@@ -182,6 +367,7 @@ impl SafetensorsLoader {
             num_experts: 0,
             peak_memory_multiplier: None,
             construction_overhead_bytes: 0,
+            tensor_allowlist: None,
         }
     }
 
@@ -193,6 +379,7 @@ impl SafetensorsLoader {
             num_experts,
             peak_memory_multiplier: None,
             construction_overhead_bytes: 0,
+            tensor_allowlist: None,
         }
     }
 
@@ -200,6 +387,13 @@ impl SafetensorsLoader {
     /// Skips `*.experts.{E}.*` tensors where E is not in local range.
     /// MTP head experts are never skipped (small, fully replicated).
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if self
+            .tensor_allowlist
+            .as_ref()
+            .is_some_and(|allow| !allow.contains(name))
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }

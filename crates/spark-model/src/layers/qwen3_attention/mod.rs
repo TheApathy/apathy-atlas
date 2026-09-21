@@ -26,11 +26,17 @@ mod init_kernel_dispatch;
 pub mod innerq_driver;
 mod prefill;
 mod prefill_weights;
+mod qwen4_device_attention;
 mod trait_impl;
 mod types;
 mod yarn;
 #[cfg(test)]
 mod yarn_contract_tests;
+
+pub(crate) use qwen4_device_attention::{
+    Qwen4DeviceAttentionRoute, Qwen4DeviceAttentionRow, Qwen4K5DeviceAttentionPlan,
+    Qwen4K5DeviceAttentionTopology,
+};
 
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;

@@ -62,6 +62,8 @@ pub mod backend;
 pub mod bench;
 #[cfg(feature = "cuda")]
 pub mod high_speed_swap;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+pub mod ple_offload;
 #[cfg(feature = "cuda")]
 pub mod predictor;
 #[cfg(feature = "cuda")]

@@ -288,6 +288,7 @@ impl TransformerModel {
             // Phase 4: forward through all layers (per-stream — Phase 2b/3
             // will hoist this out of the loop with `layer.prefill_batched`).
             self.prefill_b_forward_layers(
+                tokens,
                 seq,
                 &mut kv_cache,
                 chunk_start,

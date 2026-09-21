@@ -18,6 +18,19 @@ pub enum LayerType {
     Moe,
 }
 
+/// Runtime transform applied to target hidden states before DFlash capture.
+///
+/// This is never read from a checkpoint config: the target/drafter pairing
+/// selects it only after both configurations have been validated together.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DflashCaptureMode {
+    /// Copy a contiguous slice from the target residual row.
+    #[default]
+    ResidualSlice,
+    /// Collapse a Qwen4 four-stream residual with its terminal hyper mixer.
+    Qwen4HyperProjected,
+}
+
 /// Model configuration parsed from HuggingFace config.json.
 ///
 /// Single source of truth for model dimensions. All kernel launch
@@ -128,6 +141,51 @@ pub struct ModelConfig {
     // ── MTP ──
     #[serde(default)]
     pub mtp_num_hidden_layers: usize,
+
+    // ── Qwen4-Exp / Qwen3.8-Flash-Next ──
+    /// Number of parallel gated-residual streams. Qwen4-Exp uses four.
+    #[serde(default = "default_one")]
+    pub hc_count: usize,
+    /// Bottleneck rank used to mix the gated-residual streams.
+    #[serde(default)]
+    pub hc_lowrank: usize,
+    /// One-indexed decoder layers carrying the PLE n-gram injection.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub ple_embed_dim: usize,
+    #[serde(default = "default_conv_kernel")]
+    pub ple_conv_kernel_size: usize,
+    #[serde(default = "default_one")]
+    pub ngram_size: usize,
+    #[serde(default = "default_one")]
+    pub heads_per_ngram: usize,
+    #[serde(default)]
+    pub ngram_vocab_size_base: usize,
+    #[serde(default = "default_one")]
+    pub make_ngram_vocab_size_divisible_by: usize,
+    #[serde(default)]
+    pub seed: u64,
+    #[serde(default)]
+    pub split_ngram_parts: usize,
+    /// Qwen Sparse Attention indexer geometry. All five values are required
+    /// together; zero means the architecture does not use QSA.
+    #[serde(default)]
+    pub indexer_n_heads: usize,
+    #[serde(default)]
+    pub indexer_kv_heads: usize,
+    #[serde(default)]
+    pub indexer_head_dim: usize,
+    #[serde(default)]
+    pub indexer_budget: usize,
+    #[serde(default)]
+    pub indexer_compress_ratio: usize,
+    /// Runtime-only activation of QSA long-context execution.
+    #[serde(skip)]
+    pub qwen4_qsa: bool,
+    /// GDN output gate activation (`sigmoid` for Flash-Next).
+    #[serde(default)]
+    pub output_gate_type: String,
 
     // ── Nemotron-H / Mamba-2 ──
     #[serde(default)]
@@ -325,6 +383,23 @@ pub struct ModelConfig {
     /// is what the drafter's `fc` projection expects.
     #[serde(default)]
     pub dflash_capture_layers: Vec<usize>,
+    /// Runtime-only width copied from each target residual row into the
+    /// DFlash capture stack. Zero means the ordinary full residual width.
+    #[serde(skip)]
+    pub dflash_capture_width: usize,
+    /// Runtime-only BF16 element offset into each residual row. Used by the
+    /// explicit Flash-Next -> dense-DFlash compatibility bridge.
+    #[serde(skip)]
+    pub dflash_capture_offset: usize,
+    /// Runtime-only transform selected for target hidden-state capture.
+    #[serde(skip)]
+    pub dflash_capture_mode: DflashCaptureMode,
+
+    /// Runtime-only manifest for a sparse Qwen4 PLE backing store. The
+    /// server discovers `ple-offload/manifest.json` beside the checkpoint;
+    /// it is never read from or written to Hugging Face config.json.
+    #[serde(skip)]
+    pub ple_offload_manifest: Option<String>,
 }
 
 /// Advertised weight-quantization layout, as declared in the HF
@@ -348,6 +423,23 @@ pub struct ModelConfig {
 /// `ignore_modules` holds the already-expanded list of module-path
 /// patterns that should be loaded as dense BF16 rather than quantized.
 /// Patterns use HF glob semantics (`*` matches any non-`.` sub-path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOptWeightFormat {
+    /// NVIDIA FP4 E2M1 payload with one scale per 16 weights.
+    Nvfp4,
+    /// OCP MXFP8 payload with one E8M0 scale per 32 weights.
+    Mxfp8,
+}
+
+/// One entry from ModelOpt's `MIXED_PRECISION.config_groups` map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOptQuantizationGroup {
+    pub name: String,
+    pub weight_format: ModelOptWeightFormat,
+    pub group_size: usize,
+    pub targets: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QuantizationConfig {
     /// Raw `quant_method` string from the config. Stable values:
@@ -364,6 +456,22 @@ pub struct QuantizationConfig {
     /// tensors). Example entries: `"lm_head"`,
     /// `"model.layers.*.self_attn*"`.
     pub ignore_modules: Vec<String>,
+    /// Typed ModelOpt mixed-precision groups. Empty for uniform formats.
+    pub config_groups: Vec<ModelOptQuantizationGroup>,
+}
+
+impl QuantizationConfig {
+    /// Exact ModelOpt precision assigned to a module prefix.
+    ///
+    /// Mixed checkpoints such as Mia Flash-Next enumerate concrete module
+    /// names. Ambiguous overlaps were rejected while parsing, so lookup has a
+    /// single deterministic answer.
+    pub fn modelopt_weight_format_for(&self, module_path: &str) -> Option<ModelOptWeightFormat> {
+        self.config_groups
+            .iter()
+            .find(|group| group.targets.iter().any(|target| target == module_path))
+            .map(|group| group.weight_format)
+    }
 }
 
 /// Vision encoder configuration for Qwen3-VL models.
@@ -427,12 +535,14 @@ mod parsers;
 mod tests;
 
 pub use dispatch::parse_config;
-pub(crate) use parsers::{parse_gemma4_params, parse_minimax_m2, parse_vision_config};
+pub(crate) use parsers::{
+    parse_gemma4_params, parse_minimax_m2, parse_quantization_config_checked, parse_vision_config,
+};
 pub use parsers::{parse_mistral_params, parse_quantization_config};
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
     if config.quantization_config.is_none() {
-        config.quantization_config = parse_quantization_config(raw);
+        config.quantization_config = parse_quantization_config_checked(raw)?;
     }
     validate_config(config)
 }

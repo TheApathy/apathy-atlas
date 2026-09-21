@@ -122,8 +122,17 @@ pub struct DflashConfig {
     /// DSpark Markov/confidence feature contract.
     #[serde(default)]
     pub architectures: Vec<String>,
+    /// Underlying Transformers decoder ABI. Native Flash-Next V3 requires
+    /// the Qwen3 drafter implementation explicitly rather than accepting an
+    /// unknown architecture that happens to share tensor names.
+    #[serde(default)]
+    pub model_type: Option<String>,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
+    /// Decoder depth of the target used to train this drafter. Newer
+    /// Qwen3.8 DFlash checkpoints serialize this explicitly.
+    #[serde(default)]
+    pub num_target_layers: usize,
     pub intermediate_size: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
@@ -137,6 +146,11 @@ pub struct DflashConfig {
     /// DSpark uses `B = drafts` and adds the target bonus only at verification.
     #[serde(default = "default_block_size")]
     pub block_size: usize,
+    /// `block_size` has a legacy default, but native Flash-Next must attest
+    /// that the root field was actually serialized. Populated only by
+    /// [`parse_dflash_config`]; direct serde callers remain un-attested.
+    #[serde(skip)]
+    pub(crate) root_block_size_explicit: bool,
     /// DFlash-specific nested config object.
     #[serde(default)]
     pub dflash_config: Option<DflashSubConfig>,
@@ -514,6 +528,19 @@ pub struct DflashSubConfig {
     /// checkpoint).
     #[serde(default)]
     pub selector_top_k: usize,
+    /// Logical vocabulary considered by the DFlash 2 candidate selector.
+    ///
+    /// The codebooks retain the physical padded vocabulary, while proposal
+    /// top-k must crop logits to this value so padded rows are never
+    /// candidates. `None` preserves every existing non-native checkpoint.
+    #[serde(default)]
+    pub selector_vocab_size: Option<usize>,
+    /// Nested keys Atlas does not understand. Generic and V3 checkpoints keep
+    /// their historical permissive parsing; exact native DFlash2 admission
+    /// rejects this map unless it is empty so future trained semantics cannot
+    /// be ignored silently.
+    #[serde(default, flatten)]
+    pub unknown_fields: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Raw weight bundle for the DFlash drafter, post-load.
@@ -533,6 +560,8 @@ pub struct DflashWeights {
     /// `[draft_hidden, len(target_layer_ids) * target_hidden]`.
     /// Qwen3.6-35B-A3B-DFlash: `[2048, 10240]`.
     pub fc: DenseWeight,
+    /// Serialized FC geometry retained for fail-closed target pairing.
+    pub fc_shape: [usize; 2],
     /// `[draft_hidden]` — RMSNorm applied to the projected target context
     /// before mixing with token embeddings.
     pub hidden_norm: DenseWeight,
@@ -678,8 +707,14 @@ pub fn store_has_markov_head(store: &WeightStore) -> bool {
 /// `BlockDiffusionDraftHead` (layer count, head_dim, vocab_size, the
 /// `target_layer_ids` capture indices).
 pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
-    let config: DflashConfig =
+    let raw: serde_json::Value =
         serde_json::from_str(json).context("Parsing DFlash drafter config.json")?;
+    let root_block_size_explicit = raw
+        .as_object()
+        .is_some_and(|object| object.contains_key("block_size"));
+    let mut config: DflashConfig =
+        serde_json::from_value(raw).context("Parsing DFlash drafter config.json")?;
+    config.root_block_size_explicit = root_block_size_explicit;
     if config
         .dflash_config
         .as_ref()
@@ -691,7 +726,16 @@ pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
         );
     }
     config.validate_supported_semantics()?;
+    super::dflash_validation::validate_native_flash_next_config(&config)?;
     Ok(config)
+}
+
+/// Return the exact pre-upload BF16 manifest for a native Flash-Next V3
+/// checkpoint, or `None` for every other DFlash family.
+pub fn native_flash_next_finiteness_manifest(
+    config: &DflashConfig,
+) -> Result<Option<std::collections::BTreeMap<String, Vec<usize>>>> {
+    super::dflash_validation::native_flash_next_finiteness_manifest(config)
 }
 
 /// Load DFlash drafter weights from a separate [`WeightStore`] pointing at
@@ -740,8 +784,15 @@ pub fn load_dflash_weights(
         return Ok(None);
     };
 
-    let fc = dense(drafter_store, &format!("{prefix}fc.weight"))
-        .context("DFlash drafter: load fc.weight")?;
+    let fc_name = format!("{prefix}fc.weight");
+    let fc_tensor = drafter_store.get(&fc_name)?;
+    anyhow::ensure!(
+        fc_tensor.shape.len() == 2,
+        "DFlash drafter fc.weight must be rank 2, got {:?}",
+        fc_tensor.shape
+    );
+    let fc_shape = [fc_tensor.shape[0], fc_tensor.shape[1]];
+    let fc = dense(drafter_store, &fc_name).context("DFlash drafter: load fc.weight")?;
     let hidden_norm = dense(drafter_store, &format!("{prefix}hidden_norm.weight"))
         .context("DFlash drafter: load hidden_norm.weight")?;
     let norm = dense(drafter_store, &format!("{prefix}norm.weight"))
@@ -983,6 +1034,7 @@ pub fn load_dflash_weights(
     Ok(Some(DflashWeights {
         config: drafter_config.clone(),
         fc,
+        fc_shape,
         hidden_norm,
         norm,
         layers,

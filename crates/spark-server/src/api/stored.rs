@@ -216,8 +216,12 @@ pub async fn list_response_input_items(
         .collect();
     let mut items = match items {
         Ok(items) => items,
-        Err(e) => return openai_error_response(StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Stored message content is invalid: {e}")),
+        Err(e) => {
+            return openai_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Stored message content is invalid: {e}"),
+            );
+        }
     };
 
     let order = q.get("order").map(|s| s.as_str()).unwrap_or("asc");

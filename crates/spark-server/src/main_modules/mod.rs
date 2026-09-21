@@ -10,6 +10,7 @@ pub(crate) mod middleware;
 pub(crate) mod serve;
 pub(crate) mod serve_phases;
 mod serve_router;
+mod serve_shutdown;
 
 #[cfg(test)]
 mod tests;

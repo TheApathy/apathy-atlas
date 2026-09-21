@@ -369,6 +369,47 @@ pub fn paged_decode_attn_bf16(
         .launch(stream)
 }
 
+/// GQA-fused twin of [`paged_decode_attn_bf16`]: grid x = num_q_heads / 4.
+#[allow(clippy::too_many_arguments)]
+pub fn paged_decode_attn_bf16_gqa4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    q: DevicePtr,
+    k_cache: DevicePtr,
+    v_cache: DevicePtr,
+    output: DevicePtr,
+    block_tables: DevicePtr,
+    seq_lens: DevicePtr,
+    max_blocks_per_seq: u32,
+    num_seqs: u32,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    inv_sqrt_d: f32,
+    q_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_q_heads / 4, num_seqs, 1])
+        .block([256, 1, 1])
+        .arg_ptr(q)
+        .arg_ptr(k_cache)
+        .arg_ptr(v_cache)
+        .arg_ptr(output)
+        .arg_ptr(block_tables)
+        .arg_ptr(seq_lens)
+        .arg_u32(max_blocks_per_seq)
+        .arg_u32(num_q_heads)
+        .arg_u32(num_kv_heads)
+        .arg_u32(head_dim)
+        .arg_u32(block_size)
+        .arg_f32(inv_sqrt_d)
+        .arg_u32(q_stride)
+        .arg_u32(0) // sliding_window (kernel ABI retained; always full attention here)
+        .launch(stream)
+}
+
 pub fn paged_decode_attn_fp8(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,

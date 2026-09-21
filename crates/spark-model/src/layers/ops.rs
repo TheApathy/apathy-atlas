@@ -63,6 +63,8 @@ mod moe_grouped_a;
 mod moe_grouped_b;
 #[path = "ops/moe_prefill.rs"]
 mod moe_prefill;
+#[path = "ops/moe_worklist.rs"]
+mod moe_worklist;
 #[path = "ops/norm.rs"]
 mod norm;
 #[path = "ops/nvfp4_dynamic_scale.rs"]
@@ -124,6 +126,7 @@ pub use moe_grouped_a::*;
 #[allow(unused_imports)]
 pub(crate) use moe_grouped_b::*;
 pub use moe_prefill::*;
+pub use moe_worklist::*;
 pub use norm::*;
 pub use paged_decode_tree::*;
 pub use prefill_attn_a::*;

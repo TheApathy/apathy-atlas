@@ -52,6 +52,22 @@ pub fn step_verify_k2(model: &dyn Model, a: &mut ActiveSeq, drafts: &[u32], num_
     let v1 = v1_argmax;
     let accepted = drafts[0] == v0;
 
+    // Per-position acceptance diagnostics (ATLAS_MTP_ACCEPT_LOG=1, inert
+    // otherwise). Draft slot 0 compares against verified[0]; the bonus row v1
+    // is the target's own next token after the draft, not a draft slot.
+    record_accept(
+        if model.proposer_is_dflash() {
+            "dflash"
+        } else {
+            "mtp"
+        },
+        a.seq.seq_len,
+        num_drafts,
+        drafts,
+        &[v0],
+        usize::from(accepted),
+    );
+
     // Extract logprobs from verify logits buffer (K=2 positions) when requested.
     let verify_lps = if let Some(top_logprobs) = a.top_logprobs {
         extract_verify_logprobs(model, &[v0, v1], top_logprobs)

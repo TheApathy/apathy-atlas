@@ -47,6 +47,13 @@ fn official_config() -> DflashConfig {
             conv_group_size: 16,
             selector_rank: 256,
             selector_top_k: 16,
+            // Both added by theirs' exact-native-DFlash2 admission and absent
+            // from HEAD's literal, so the merge produced a struct the merged
+            // definition rejects. `None` and an empty map are the permissive
+            // values this fixture wants: it is a generic checkpoint, and an
+            // empty `unknown_fields` is exactly what exact admission requires.
+            selector_vocab_size: None,
+            unknown_fields: Default::default(),
         }),
         layer_types: Some(vec!["sliding_attention".into(); 5]),
         sliding_window: Some(2048),

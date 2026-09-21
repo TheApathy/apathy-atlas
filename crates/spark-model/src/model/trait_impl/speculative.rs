@@ -108,7 +108,6 @@ impl TransformerModel {
     ) -> Result<()> {
         let stream = self.gpu.default_stream();
         let h = self.config.hidden_size;
-        let _bf16 = 2usize;
         let fp32 = if self.config.use_fp32_residual() {
             4usize
         } else {
@@ -117,9 +116,17 @@ impl TransformerModel {
         // Save the RAW hidden state (before final_norm), not norm_output.
         // The MTP head applies its own pre_fc_norm_hidden — passing norm_output
         // would double-normalize and degrade prediction accuracy.
-        let src = self.buffers.hidden_states().offset(token_idx * h * fp32);
+        let (row_width, element_bytes) = if self.config.is_qwen4_exp() {
+            (self.config.residual_width(), 2usize)
+        } else {
+            (h, fp32)
+        };
+        let src = self
+            .buffers
+            .hidden_states()
+            .offset(token_idx * row_width * element_bytes);
         self.gpu
-            .copy_d2d_async(src, self.mtp_hidden_save, h * fp32, stream)?;
+            .copy_d2d_async(src, self.mtp_hidden_save, row_width * element_bytes, stream)?;
         self.last_mtp_hidden_idx
             .store(token_idx, std::sync::atomic::Ordering::Relaxed);
         Ok(())

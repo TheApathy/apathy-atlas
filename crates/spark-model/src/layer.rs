@@ -14,6 +14,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 mod transformer_layer;
+pub use transformer_layer::MoeStreamTransposeScratch;
 pub use transformer_layer::TransformerLayer;
 
 /// Per-layer persistent state tracked across decode steps.
@@ -106,6 +107,11 @@ impl LayerState for SsmLayerState {
 /// - block_table: `[N * max_blocks_per_seq]` i32 (row-major)
 #[derive(Clone, Copy)]
 pub struct AttnMetadataDev {
+    /// Host-side request policy: maintain/use Qwen4 QSA side indexes.
+    /// This is deliberately carried alongside the device pointers so every
+    /// attention layer sees the same immutable decision during prefill,
+    /// decode, and speculative verification.
+    pub qwen4_qsa_required: bool,
     /// Position values: `[N]` u32 at this device address. For multi-modal
     /// MRoPE this is the temporal (T) stream; callers set
     /// `positions_h`/`positions_w` to distinct buffers only when the token
@@ -304,6 +310,7 @@ unsafe impl Sync for TreeKvPack {}
 ///
 /// Provides access to GPU, buffers, and config without coupling
 /// layer implementations to the model struct.
+#[derive(Clone, Copy)]
 pub struct ForwardContext<'a> {
     /// Pre-allocated scratch buffers.
     pub buffers: &'a BufferArena,

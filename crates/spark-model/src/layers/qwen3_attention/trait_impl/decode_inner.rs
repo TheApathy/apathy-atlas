@@ -12,8 +12,226 @@ use super::super::Qwen3AttentionLayer;
 use super::{diag_norm, diag_norm_f32, gemma4_diag_enabled};
 use crate::layer::{ForwardContext, LayerState};
 use crate::layers::ops;
+use crate::layers::qwen3_attention::{Qwen4K5DeviceAttentionPlan, Qwen4K5DeviceAttentionTopology};
 
 impl Qwen3AttentionLayer {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn decode_qwen4_batched_inner(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        _state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        _h_intermediate: DevicePtr,
+        _conv_intermediate: DevicePtr,
+        _h_intermediate_stride: usize,
+        _conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (attn_hyper, mlp_hyper) = match (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper) {
+            (Some(attn), Some(mlp)) => (attn, mlp),
+            _ => anyhow::bail!("Qwen4 batched verify requested without hyperconnections"),
+        };
+        let metadata = ctx
+            .attn_metadata
+            .ok_or_else(|| anyhow::anyhow!("Qwen4 batched attention requires metadata"))?;
+        let device_attention_plan =
+            Qwen4K5DeviceAttentionPlan::from_host(ctx.config, num_tokens, seq_len, metadata)?;
+        if let Some(plan) = device_attention_plan {
+            let _topology: Qwen4K5DeviceAttentionTopology = plan.topology();
+            self.prepare_qwen4_k5_device_attention(plan, kv_cache, metadata, ctx)?;
+        }
+        let h = ctx.config.hidden_size;
+        let row_bytes = ctx.config.residual_width() * 2;
+        let core_bytes = h * 2;
+        let eps = ctx.config.rms_norm_eps as f32;
+        let mb = metadata.max_blocks_per_seq as usize;
+        let hybrid_k5 = matches!(num_tokens, 5 | 9)
+            && std::env::var("ATLAS_QWEN4_K5_HYBRID").ok().as_deref() == Some("1");
+        let exact_hyper_k5 =
+            hybrid_k5 && std::env::var("ATLAS_QWEN4_K5_BATCH_HYPER").ok().as_deref() != Some("1");
+
+        // Batch the four-stream projection weights. KV writes and attention
+        // remain token ordered to preserve exact causal semantics.
+        // `attention_forward_oproj` reuses norm_output, so preserve every
+        // mixed row before the first token's attention core clobbers it.
+        let attn_inputs = ctx.buffers.gate_logits();
+        anyhow::ensure!(
+            num_tokens * core_bytes <= ctx.buffers.sizes().gate_logits,
+            "Qwen4 batched attention input staging exceeds gate-logit workspace"
+        );
+        if exact_hyper_k5 {
+            for row in 0..num_tokens {
+                let (mixed, _) = attn_hyper.prepare_decode(
+                    hidden.offset(row * row_bytes),
+                    residual.offset(row * row_bytes),
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    mixed,
+                    attn_inputs.offset(row * core_bytes),
+                    core_bytes,
+                    stream,
+                )?;
+            }
+        } else {
+            let mixed_attn = attn_hyper.prepare_batched(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?;
+            ctx.gpu
+                .copy_d2d_async(mixed_attn, attn_inputs, num_tokens * core_bytes, stream)?;
+        }
+        // The projection helper retains the legacy exact K5/K9 path and may
+        // independently admit exact K16 for gamma-15 verification. Attention
+        // and KV writes below stay row-ordered in either case.
+        let exact_qkv = self.qwen4_k5_project_qkv_exact(attn_inputs, num_tokens, ctx, stream)?;
+        for row in 0..num_tokens {
+            let hidden_row = hidden.offset(row * row_bytes);
+            let residual_row = residual.offset(row * row_bytes);
+            let token_metadata = crate::layer::AttnMetadataDev {
+                positions: metadata.positions.offset(row * 4),
+                positions_h: metadata.positions_h.offset(row * 4),
+                positions_w: metadata.positions_w.offset(row * 4),
+                slot: metadata.slot.offset(row * 8),
+                seq_len: metadata.seq_len.offset(row * 4),
+                block_table: metadata.block_table.offset(row * mb * 4),
+                num_seqs: 1,
+                ..metadata
+            };
+            let token_ctx = ForwardContext {
+                attn_metadata: Some(token_metadata),
+                ..*ctx
+            };
+            let attn_input = attn_inputs.offset(row * core_bytes);
+            let attn_out = if let Some(plan) = device_attention_plan {
+                let (qkv, qkv_row_bytes) = exact_qkv.ok_or_else(|| {
+                    anyhow::anyhow!("ATLAS_QWEN4_K5_DEVICE_ATTN_GRAPH lost exact K5 QKV admission")
+                })?;
+                self.attention_forward_preprojected_device(
+                    attn_input,
+                    qkv.offset(row * qkv_row_bytes),
+                    plan.row(row)?,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    kv_cache,
+                    &token_ctx,
+                    stream,
+                )?
+            } else if let Some((qkv, qkv_row_bytes)) = exact_qkv {
+                self.attention_forward_preprojected(
+                    attn_input,
+                    qkv.offset(row * qkv_row_bytes),
+                    seq_len + row,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    kv_cache,
+                    &token_ctx,
+                    stream,
+                )?
+            } else {
+                self.attention_forward(
+                    attn_input,
+                    seq_len + row,
+                    block_table,
+                    disk_block_ids,
+                    disk_last_offloaded_per_layer,
+                    kv_cache,
+                    &token_ctx,
+                    stream,
+                )?
+            };
+            attn_hyper.inject_decode(
+                hidden_row,
+                attn_out,
+                attn_hyper.saved_inject(residual_row),
+                ctx.gpu,
+                stream,
+            )?;
+        }
+
+        let ffn_inputs = if exact_hyper_k5 {
+            let staging = ctx
+                .buffers
+                .qkv_output()
+                .offset(ctx.config.residual_width() * 2);
+            anyhow::ensure!(
+                ctx.config.residual_width() * 2 + num_tokens * core_bytes
+                    <= ctx.buffers.sizes().qkv_output,
+                "Qwen4 K=5 exact MLP staging exceeds QKV arena"
+            );
+            for row in 0..num_tokens {
+                let (mixed, _) = mlp_hyper.prepare_decode(
+                    hidden.offset(row * row_bytes),
+                    residual.offset(row * row_bytes),
+                    ctx.buffers,
+                    ctx.gpu,
+                    eps,
+                    stream,
+                )?;
+                ctx.gpu.copy_d2d_async(
+                    mixed,
+                    staging.offset(row * core_bytes),
+                    core_bytes,
+                    stream,
+                )?;
+            }
+            staging
+        } else {
+            mlp_hyper.prepare_batched(
+                hidden,
+                residual,
+                num_tokens,
+                ctx.buffers,
+                ctx.gpu,
+                eps,
+                stream,
+            )?
+        };
+        match num_tokens {
+            2 => self.ffn.forward_k2(ffn_inputs, ctx, stream)?,
+            3 => self.ffn.forward_k3(ffn_inputs, ctx, stream)?,
+            5 | 9 if hybrid_k5 => self
+                .ffn
+                .forward_qwen4_exact_rows(ffn_inputs, num_tokens, ctx, stream)?,
+            n => self.ffn.forward_prefill(ffn_inputs, n, ctx, stream)?,
+        }
+        let ffn_output = ctx.buffers.moe_output();
+        if hybrid_k5 {
+            mlp_hyper
+                .inject_saved_batched(hidden, ffn_output, residual, num_tokens, ctx.gpu, stream)?;
+        } else {
+            for row in 0..num_tokens {
+                let hidden_row = hidden.offset(row * row_bytes);
+                let residual_row = residual.offset(row * row_bytes);
+                mlp_hyper.inject_decode(
+                    hidden_row,
+                    ffn_output.offset(row * core_bytes),
+                    mlp_hyper.saved_inject(residual_row),
+                    ctx.gpu,
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn decode_inner(
         &self,
         hidden: DevicePtr,
@@ -29,6 +247,40 @@ impl Qwen3AttentionLayer {
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
+        if let (Some(attn_hyper), Some(mlp_hyper)) = (&self.qwen4_attn_hyper, &self.qwen4_mlp_hyper)
+        {
+            let (mixed, inject) =
+                attn_hyper.prepare_decode(hidden, residual, ctx.buffers, ctx.gpu, eps, stream)?;
+            let attn_out = self.attention_forward(
+                mixed,
+                seq_len,
+                block_table,
+                disk_block_ids,
+                disk_last_offloaded_per_layer,
+                kv_cache,
+                ctx,
+                stream,
+            )?;
+            attn_hyper.inject_decode(
+                hidden,
+                attn_out,
+                inject.expect("Qwen4 decoder mixer has injection weights"),
+                ctx.gpu,
+                stream,
+            )?;
+
+            let (mixed, inject) =
+                mlp_hyper.prepare_decode(hidden, residual, ctx.buffers, ctx.gpu, eps, stream)?;
+            let moe_out = self.ffn.forward(mixed, ctx, stream)?;
+            mlp_hyper.inject_decode(
+                hidden,
+                moe_out,
+                inject.expect("Qwen4 decoder mixer has injection weights"),
+                ctx.gpu,
+                stream,
+            )?;
+            return Ok(());
+        }
         // Disable diagnostics during CUDA graph capture — diag_norm does d2h
         // copy + sync which invalidates stream capture (status 901).
         let gemma4_diag =

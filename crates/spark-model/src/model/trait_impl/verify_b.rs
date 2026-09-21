@@ -36,6 +36,87 @@ use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
 impl TransformerModel {
+    /// Exact token-major oracle for Qwen4's four-stream K=2 verification.
+    /// Qwen4 decode-local scratch is not row-disjoint, so both tokens must
+    /// traverse the complete model one at a time.
+    fn decode_verify_qwen4_token_major(
+        &self,
+        tokens: &[u32; 2],
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<[u32; 2]> {
+        let row_bytes = self.config.residual_width() * 2;
+        let hidden = self.buffers.hidden_states();
+
+        let logits0 = self.decode_dispatch(tokens[0], seq, stream)?;
+        let token0 = self.argmax_on_device(logits0, stream)?;
+        let logits_row_bytes = self.config.vocab_size * if self.use_fp32_logits { 4 } else { 2 };
+        let mut logits0_host = vec![0u8; logits_row_bytes];
+        self.gpu.copy_d2h(logits0, &mut logits0_host)?;
+        self.gpu
+            .copy_d2d_async(hidden, self.mtp_hidden_save, row_bytes, stream)?;
+
+        let mut ssm_layer_idx = 0usize;
+        for (layer_idx, layer_state) in seq.layer_states.iter_mut().enumerate() {
+            if self.config.layer_type(layer_idx) != LayerType::LinearAttention {
+                continue;
+            }
+            let ssm = layer_state
+                .as_any_mut()
+                .downcast_mut::<SsmLayerState>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "qwen4_exp token-major verify expected SSM state at layer {layer_idx}"
+                    )
+                })?;
+            self.gpu.copy_d2d_async(
+                ssm.h_state,
+                self.ssm_pool.h_intermediate(ssm_layer_idx, seq.slot_idx, 0),
+                self.ssm_pool.h_bytes,
+                stream,
+            )?;
+            self.gpu.copy_d2d_async(
+                ssm.conv_state,
+                self.ssm_pool
+                    .conv_intermediate(ssm_layer_idx, seq.slot_idx, 0),
+                self.ssm_pool.conv_bytes,
+                stream,
+            )?;
+            ssm_layer_idx += 1;
+        }
+        if let Some(ple) = &self.qwen4_ple {
+            ple.save_intermediate(seq.slot_idx, 0, self.gpu.as_ref(), stream)?;
+        }
+
+        let logits1 = self.decode_dispatch(tokens[1], seq, stream)?;
+        let token1 = self.argmax_on_device(logits1, stream)?;
+        let mut logits1_host = vec![0u8; logits_row_bytes];
+        self.gpu.copy_d2h(logits1, &mut logits1_host)?;
+        // The policy verifier consumes the resident conventional [K, vocab]
+        // layout after target verification. Ordinary decode writes row zero,
+        // so reconstruct both rows explicitly for the exact sampler walk.
+        let logits_base = self.decode_logits_ptr();
+        self.gpu.copy_h2d_group_on_stream(
+            &[
+                HostToDeviceCopy::new(&logits0_host, logits_base),
+                HostToDeviceCopy::new(&logits1_host, logits_base.offset(logits_row_bytes)),
+            ],
+            stream,
+        )?;
+        if let Some(ple) = &self.qwen4_ple {
+            ple.save_intermediate(seq.slot_idx, 1, self.gpu.as_ref(), stream)?;
+        }
+
+        // Restore the conventional verify layout [row0, row1] for
+        // save_hidden_for_mtp(accepted_row).
+        self.gpu
+            .copy_d2d_async(hidden, hidden.offset(row_bytes), row_bytes, stream)?;
+        self.gpu
+            .copy_d2d_async(self.mtp_hidden_save, hidden, row_bytes, stream)?;
+
+        Ok([token0, token1])
+    }
+
     pub(super) fn decode_verify_graphed_dispatch(
         &self,
         tokens: &[u32; 2],
@@ -50,6 +131,7 @@ impl TransformerModel {
         } else {
             2usize
         };
+        let persistent_row_bytes = self.config.residual_width() * fp32;
         let k = 2usize;
 
         // F62 (2026-04-27): SpecMamba dual-buffer pre-verify copy.
@@ -57,6 +139,14 @@ impl TransformerModel {
         // BEFORE the kernel runs. The kernel mutates the scratch; the
         // canonical is preserved across verify until commit.
         self.pre_verify_copy_async(seq)?;
+
+        let qwen4_token_major_oracle = std::env::var("ATLAS_QWEN4_VERIFY_TOKEN_MAJOR")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if self.config.is_qwen4_exp() && qwen4_token_major_oracle {
+            return self.decode_verify_qwen4_token_major(tokens, seq, stream);
+        }
 
         let hidden = self.buffers.hidden_states();
         let residual = self.buffers.residual();
@@ -67,7 +157,7 @@ impl TransformerModel {
 
         // 1a. Embed 2 tokens
         self.embed(tokens[0], hidden, stream)?;
-        self.embed(tokens[1], hidden.offset(h * fp32), stream)?;
+        self.embed(tokens[1], hidden.offset(persistent_row_bytes), stream)?;
 
         // 1b. Allocate KV blocks for both positions
         let bs = kv_cache.block_size();
@@ -143,6 +233,7 @@ impl TransformerModel {
             .copy_h2d_group_on_stream(&[HostToDeviceCopy::new(pack, meta_base)], stream)?;
 
         let metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h: meta_base,
             positions_w: meta_base,
@@ -190,6 +281,9 @@ impl TransformerModel {
         let moe_overlap_probe = std::env::var("ATLAS_MOE_OVERLAP").ok().as_deref() == Some("1");
         let use_graphs = self.comm.is_none()
             && !suppress_graphs
+            // Qwen4 PLE performs host-backed sparse row fetches and its
+            // four-stream K=2 path is intentionally serialized for exactness.
+            && !self.config.is_qwen4_exp()
             // Phase 6.2.c — see decode() for rationale: HSS path's host I/O is
             // illegal under CUDA graph capture.
             && !hss_engaged
@@ -245,6 +339,7 @@ impl TransformerModel {
             let mut attn_ns: u64 = 0;
             let mut ssm_ns: u64 = 0;
             let probe = moe_overlap_probe;
+            let mut qwen4_ssm_layer_idx = 0usize;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_type = self.config.layer_type(layer_idx);
@@ -255,7 +350,113 @@ impl TransformerModel {
                     None
                 };
 
-                if layer_type == LayerType::FullAttention {
+                if self.config.is_qwen4_exp() {
+                    // The four-stream kernels are decode-native. Run the two
+                    // verify rows serially, but preserve the state after row
+                    // zero so a rejected draft can commit the always-accepted
+                    // target token exactly like the optimized K=2 path.
+                    for (row, &token) in tokens.iter().enumerate() {
+                        if layer_idx == 1
+                            && let Some(ple) = &self.qwen4_ple
+                        {
+                            let mut prior = seq.tokens.clone();
+                            prior.extend_from_slice(&tokens[..row]);
+                            ple.forward_token(
+                                token,
+                                &prior,
+                                hidden.offset(row * persistent_row_bytes),
+                                seq.slot_idx,
+                                false,
+                                self.gpu.as_ref(),
+                                stream,
+                            )?;
+                            // PLE commit uses the accepted-row index even on
+                            // a full K=2 accept. Preserve both rows: saving
+                            // only row zero makes a 2/2 accept restore stale
+                            // slot one on the next speculative cycle.
+                            ple.save_intermediate(seq.slot_idx, row, self.gpu.as_ref(), stream)?;
+                        }
+
+                        let token_metadata = AttnMetadataDev {
+                            positions: metadata.positions.offset(row * 4),
+                            positions_h: metadata.positions_h.offset(row * 4),
+                            positions_w: metadata.positions_w.offset(row * 4),
+                            slot: metadata.slot.offset(row * 8),
+                            seq_len: metadata.seq_len.offset(row * 4),
+                            block_table: metadata.block_table.offset(row * mb * 4),
+                            num_seqs: 1,
+                            ..metadata
+                        };
+                        let token_ctx = ForwardContext {
+                            attn_metadata: Some(token_metadata),
+                            ..ctx
+                        };
+                        layer.decode(
+                            hidden.offset(row * persistent_row_bytes),
+                            residual.offset(row * persistent_row_bytes),
+                            seq.layer_states[layer_idx].as_mut(),
+                            &mut kv_cache,
+                            seq.seq_len + row,
+                            &mut seq.block_table,
+                            &mut seq.disk_block_ids,
+                            &mut seq.disk_last_offloaded_per_layer,
+                            &token_ctx,
+                            stream,
+                        )?;
+
+                        if std::env::var("ATLAS_QWEN4_VERIFY_DUMP").ok().as_deref() == Some("1") {
+                            self.gpu.synchronize(stream)?;
+                            let mut buf = vec![0u8; persistent_row_bytes];
+                            self.gpu
+                                .copy_d2h(hidden.offset(row * persistent_row_bytes), &mut buf)?;
+                            std::fs::write(
+                                format!(
+                                    "/tmp/atlas_qwen4_k2_seqlen{}_row{row}_layer{layer_idx}.bin",
+                                    seq.seq_len
+                                ),
+                                buf,
+                            )?;
+                        }
+
+                        if row == 0 && layer_type == LayerType::LinearAttention {
+                            let ssm = seq.layer_states[layer_idx]
+                                .as_any_mut()
+                                .downcast_mut::<SsmLayerState>()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "qwen4_exp verify expected SSM state at layer {layer_idx}"
+                                    )
+                                })?;
+                            let nv = self.config.linear_num_value_heads;
+                            let vd = self.config.linear_value_head_dim;
+                            let nk = self.config.linear_num_key_heads;
+                            let kd = self.config.linear_key_head_dim;
+                            let h_bytes = nv * vd * kd * 4;
+                            let conv_dim = nk * kd * 2 + nv * vd;
+                            let conv_bytes = conv_dim * self.config.linear_conv_kernel_dim * 4;
+                            self.gpu.copy_d2d_async(
+                                ssm.h_state,
+                                self.ssm_pool
+                                    .h_intermediate(qwen4_ssm_layer_idx, seq.slot_idx, 0),
+                                h_bytes,
+                                stream,
+                            )?;
+                            self.gpu.copy_d2d_async(
+                                ssm.conv_state,
+                                self.ssm_pool.conv_intermediate(
+                                    qwen4_ssm_layer_idx,
+                                    seq.slot_idx,
+                                    0,
+                                ),
+                                conv_bytes,
+                                stream,
+                            )?;
+                        }
+                    }
+                    if layer_type == LayerType::LinearAttention {
+                        qwen4_ssm_layer_idx += 1;
+                    }
+                } else if layer_type == LayerType::FullAttention {
                     if hss_engaged {
                         // HSS path: `decode_multi_seq` calls the production
                         // paged-decode kernel which reads K/V from HBM only
@@ -348,19 +549,44 @@ impl TransformerModel {
                 );
             }
 
-            // Final norm [2, H]
+            // Final norm [2, H]. Qwen4 collapses each four-stream row through
+            // its learned terminal mixer. Preserve row zero in attn_output
+            // while row one temporarily occupies norm_output.
             let normed = self.buffers.norm_output();
-            ops::rms_norm(
-                self.gpu.as_ref(),
-                self.rms_norm_kernel,
-                hidden,
-                &self.final_norm,
-                normed,
-                k as u32,
-                h as u32,
-                self.config.rms_norm_eps as f32,
-                stream,
-            )?;
+            if self.config.is_qwen4_exp() {
+                let saved_row0 = self.buffers.attn_output();
+                for t in 0..k {
+                    let hidden_t = hidden.offset(t * persistent_row_bytes);
+                    let residual_t = residual.offset(t * persistent_row_bytes);
+                    self.qwen4_final_hidden(hidden_t, residual_t, stream)?
+                        .ok_or_else(|| anyhow::anyhow!("qwen4_exp verify missing final mixer"))?;
+                    if t == 0 {
+                        self.gpu
+                            .copy_d2d_async(normed, saved_row0, h * bf16, stream)?;
+                    } else {
+                        self.gpu.copy_d2d_async(
+                            normed,
+                            normed.offset(t * h * bf16),
+                            h * bf16,
+                            stream,
+                        )?;
+                    }
+                }
+                self.gpu
+                    .copy_d2d_async(saved_row0, normed, h * bf16, stream)?;
+            } else {
+                ops::rms_norm(
+                    self.gpu.as_ref(),
+                    self.rms_norm_kernel,
+                    hidden,
+                    &self.final_norm,
+                    normed,
+                    k as u32,
+                    h as u32,
+                    self.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+            }
 
             // LM head for 2 tokens (GEMM: weights loaded once)
             self.lm_head_batched(normed, k as u32, stream)?;

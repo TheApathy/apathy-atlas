@@ -1279,15 +1279,6 @@ impl BlockDiffusionDraftHead {
         // from the persistent cache + fc_proj).
         let (conv_noise_offset, conv_noise_count) = conv_noise_range(eff_ctx, n_attn, h);
         if let Some(conv) = &layer.attention_conv {
-            // One-shot execution proof. The NVFP4 conv sites carry no kprof
-            // label (only the BF16 ones do), so a profile cannot distinguish
-            // "ran unwrapped" from "never ran". This settles it.
-            {
-                static D2_SEEN: std::sync::Once = std::sync::Once::new();
-                D2_SEEN.call_once(|| {
-                    tracing::info!("DFLASH2_EXEC: nvfp4 attention_conv prepare RAN");
-                });
-            }
             kp!(
                 conv_prepare_us,
                 self.dflash2_conv_prepare(
@@ -1299,6 +1290,16 @@ impl BlockDiffusionDraftHead {
                     ctx,
                 )
             )?;
+            // One-shot execution proof. The NVFP4 conv sites carry no kprof
+            // label (only the BF16 ones do), so a profile cannot distinguish
+            // "ran unwrapped" from "never ran". Emit only after the fallible
+            // operation succeeds.
+            {
+                static D2_SEEN: std::sync::Once = std::sync::Once::new();
+                D2_SEEN.call_once(|| {
+                    tracing::info!("DFLASH2_EXEC: nvfp4 attention_conv prepare RAN");
+                });
+            }
         }
 
         // 3b. Q projection for all n_attn tokens. When the drafter was built

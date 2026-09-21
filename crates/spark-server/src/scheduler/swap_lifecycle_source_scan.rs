@@ -160,10 +160,12 @@ fn has_exact_swap_block(clean: &str) -> bool {
 pub(super) fn victim_selector(source: &str) -> Option<String> {
     const START: &str = "// ── Swap-out: evict active sequences to disk when blocks run low ──";
     const END: &str = "// ── Start new requests ──";
-    // Reviewed against 73d9ca52: scalar dashboard reporting and two module
-    // declarations only; swap/grammar ownership paths remain byte-identical.
-    const SOURCE_LEN: usize = 42_533;
-    const SOURCE_FNV1A: u64 = 0xdfd4902a39703566;
+    // Re-derived over the merged scheduler/mod.rs: this branch combines the
+    // scalar dashboard reporting and module declarations from both sides, so
+    // neither side's pre-merge fingerprint applies. The swap-out marker through
+    // EOF and all grammar/ownership guards remain byte-identical.
+    const SOURCE_LEN: usize = 42_623;
+    const SOURCE_FNV1A: u64 = 0x578f8638e9a149ae;
     if source.matches(START).count() != 1 || source.matches(END).count() != 1 {
         return None;
     }

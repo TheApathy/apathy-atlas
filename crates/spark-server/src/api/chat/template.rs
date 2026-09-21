@@ -57,8 +57,10 @@ pub(super) fn render_template(
     let image_count: usize = messages.iter().map(|m| m.image_count).sum();
     let has_images = image_count != 0;
     if image_count != image_pad_counts.len() || image_pad_counts.contains(&0) {
-        return Err(openai_error_response(StatusCode::BAD_REQUEST,
-            "Image markers and preprocessed images must have matching nonzero counts".into()));
+        return Err(openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "Image markers and preprocessed images must have matching nonzero counts".into(),
+        ));
     }
 
     // Build JSON messages with structured tool_calls for Jinja.
@@ -76,7 +78,9 @@ pub(super) fn render_template(
                 m.content.clone()
             };
             let content_val = ParsedContent::marker_json(
-                &effective_content, m.image_count, &m.image_text_offsets,
+                &effective_content,
+                m.image_count,
+                &m.image_text_offsets,
             )?;
             let mut msg = serde_json::json!({"role": m.role, "content": content_val});
             if let Some(ref tcs) = m.tool_calls {
@@ -206,11 +210,16 @@ pub(super) fn render_template(
     // Refuse templates that omit/duplicate images, before expansion can hide the mismatch.
     if has_images {
         let pad = state.tokenizer.image_pad_token_id().ok_or_else(|| {
-            openai_error_response(StatusCode::BAD_REQUEST, "Tokenizer lacks an image marker token".into())
+            openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "Tokenizer lacks an image marker token".into(),
+            )
         })?;
         if prompt_tokens.iter().filter(|&&id| id == pad).count() != image_count {
-            return Err(openai_error_response(StatusCode::BAD_REQUEST,
-                "Chat template did not preserve exactly one marker per image".into()));
+            return Err(openai_error_response(
+                StatusCode::BAD_REQUEST,
+                "Chat template did not preserve exactly one marker per image".into(),
+            ));
         }
     }
     // Expand image pads when needed.

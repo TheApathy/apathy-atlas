@@ -180,3 +180,52 @@ fn rejects_incomplete_or_out_of_order_capture() {
     assert!(record_batch("embed", &[1], 1).is_err());
     reset();
 }
+
+fn exact_fixture_report() -> StageReport {
+    StageReport {
+        manifest: CaptureManifest {
+            run_id: "fixture-test".to_owned(),
+            verify_step: 1,
+            pre_verify_len: 40,
+            tokens: (0..16).collect(),
+            absolute_seq_lens: (40..56).collect(),
+            family: BASELINE_FAMILY.to_owned(),
+        },
+        stages: 51,
+        terminal_stage: "logits".to_owned(),
+        logits_compared: true,
+        first: None,
+    }
+}
+
+#[test]
+fn fixture_report_rejects_divergence_and_every_inexact_completion_field() {
+    let exact = exact_fixture_report();
+    validate_fixture_report(&exact).unwrap();
+
+    let mut divergence = exact.clone();
+    divergence.first = Some(FirstDivergence {
+        stage: "layer_00".to_owned(),
+        row: 0,
+        first_byte: 0,
+        serial_hash: 1,
+        batch_hash: 2,
+        mismatch_rows: vec![0],
+    });
+    assert!(validate_fixture_report(&divergence).is_err());
+
+    for stage_count in [0, 50, 52] {
+        let mut hostile = exact.clone();
+        hostile.stages = stage_count;
+        assert!(validate_fixture_report(&hostile).is_err());
+    }
+    let mut terminal = exact.clone();
+    terminal.terminal_stage = "final_norm".to_owned();
+    assert!(validate_fixture_report(&terminal).is_err());
+    let mut logits = exact.clone();
+    logits.logits_compared = false;
+    assert!(validate_fixture_report(&logits).is_err());
+    let mut frame = exact;
+    frame.manifest.absolute_seq_lens[15] += 1;
+    assert!(validate_fixture_report(&frame).is_err());
+}

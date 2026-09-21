@@ -4,13 +4,28 @@
 
 #![allow(unused_imports)]
 
-use anyhow::{Context, Result};
+use std::collections::HashSet;
+
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use super::super::{ModelConfig, QuantizationConfig};
+use super::super::{
+    ModelConfig, ModelOptQuantizationGroup, ModelOptWeightFormat, QuantizationConfig,
+};
 
 pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<QuantizationConfig> {
-    let qc_raw = raw.get("quantization_config")?;
+    // Kept as an Option-returning compatibility surface for callers that merge
+    // optional sidecars after parsing. Architecture admission uses the checked
+    // form below and therefore never swallows malformed mixed precision.
+    parse_quantization_config_checked(raw).ok().flatten()
+}
+
+pub(crate) fn parse_quantization_config_checked(
+    raw: &serde_json::Value,
+) -> Result<Option<QuantizationConfig>> {
+    let Some(qc_raw) = raw.get("quantization_config") else {
+        return Ok(None);
+    };
     // NVIDIA ModelOpt's sibling `hf_quant_config.json` (merged into the
     // `quantization_config` slot by `merge_sidecar_quant_config`) nests the
     // quant fields one level deep under a `"quantization"` object and never
@@ -96,15 +111,145 @@ pub fn parse_quantization_config(raw: &serde_json::Value) -> Option<Quantization
     // An empty quant_method with empty ignore list is not a real quant
     // config — skip so callers can fall through to heuristic detection.
     if quant_method.is_empty() && quant_algo.is_empty() && ignore_modules.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(QuantizationConfig {
+    let config_groups = parse_modelopt_mixed_groups(qc, &quant_method, &quant_algo)?;
+
+    Ok(Some(QuantizationConfig {
         quant_method,
         quant_algo,
         format,
         ignore_modules,
-    })
+        config_groups,
+    }))
+}
+
+fn parse_modelopt_mixed_groups(
+    qc: &serde_json::Value,
+    quant_method: &str,
+    quant_algo: &str,
+) -> Result<Vec<ModelOptQuantizationGroup>> {
+    if !quant_method.eq_ignore_ascii_case("modelopt")
+        || !quant_algo.eq_ignore_ascii_case("MIXED_PRECISION")
+    {
+        return Ok(Vec::new());
+    }
+
+    let Some(groups_value) = qc.get("config_groups") else {
+        // Some ModelOpt sidecars advertise only the aggregate algorithm. Keep
+        // that metadata parseable; the weight loader still rejects the
+        // ambiguous mixed format until the checkpoint supplies typed groups.
+        return Ok(Vec::new());
+    };
+    let groups = groups_value
+        .as_object()
+        .context("ModelOpt MIXED_PRECISION config_groups must be an object")?;
+    if groups.is_empty() {
+        bail!("ModelOpt MIXED_PRECISION requires at least one config group");
+    }
+
+    let mut names = groups.keys().collect::<Vec<_>>();
+    names.sort_unstable();
+    let mut seen_targets = HashSet::new();
+    let mut parsed = Vec::with_capacity(names.len());
+
+    for name in names {
+        let group = groups[name]
+            .as_object()
+            .with_context(|| format!("ModelOpt config group {name:?} must be an object"))?;
+        let weights = group
+            .get("weights")
+            .and_then(serde_json::Value::as_object)
+            .with_context(|| format!("ModelOpt config group {name:?} is missing weights"))?;
+        let weight_type = weights
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| format!("ModelOpt config group {name:?} is missing weights.type"))?;
+        if weight_type != "float" {
+            bail!("ModelOpt config group {name:?} has unsupported weights.type {weight_type:?}");
+        }
+        if weights
+            .get("dynamic")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!("ModelOpt config group {name:?} uses unsupported dynamic weights");
+        }
+
+        let bits = weights
+            .get("num_bits")
+            .and_then(serde_json::Value::as_u64)
+            .with_context(|| {
+                format!("ModelOpt config group {name:?} is missing weights.num_bits")
+            })?;
+        let weight_format = match bits {
+            4 => ModelOptWeightFormat::Nvfp4,
+            8 => ModelOptWeightFormat::Mxfp8,
+            _ => bail!("ModelOpt config group {name:?} has unsupported {bits}-bit weights"),
+        };
+        let group_size = modelopt_group_size(weights).with_context(|| {
+            format!("ModelOpt config group {name:?} is missing its weight group size")
+        })?;
+        let expected_group_size = match weight_format {
+            ModelOptWeightFormat::Nvfp4 => 16,
+            ModelOptWeightFormat::Mxfp8 => 32,
+        };
+        if group_size != expected_group_size {
+            let label = match weight_format {
+                ModelOptWeightFormat::Nvfp4 => "NVFP4",
+                ModelOptWeightFormat::Mxfp8 => "MXFP8",
+            };
+            bail!(
+                "ModelOpt config group {name:?} requires {label} group size {expected_group_size}, got {group_size}"
+            );
+        }
+
+        let target_values = group
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| format!("ModelOpt config group {name:?} is missing targets"))?;
+        if target_values.is_empty() {
+            bail!("ModelOpt config group {name:?} has no targets");
+        }
+        let mut targets = Vec::with_capacity(target_values.len());
+        for value in target_values {
+            let target = value.as_str().with_context(|| {
+                format!("ModelOpt config group {name:?} contains a non-string target")
+            })?;
+            if target.is_empty() {
+                bail!("ModelOpt config group {name:?} contains an empty target");
+            }
+            if !seen_targets.insert(target.to_string()) {
+                bail!("ModelOpt mixed precision has duplicate target {target:?}");
+            }
+            targets.push(target.to_string());
+        }
+
+        parsed.push(ModelOptQuantizationGroup {
+            name: name.to_string(),
+            weight_format,
+            group_size,
+            targets,
+        });
+    }
+
+    Ok(parsed)
+}
+
+fn modelopt_group_size(weights: &serde_json::Map<String, serde_json::Value>) -> Option<usize> {
+    for key in ["group_size", "block_size"] {
+        if let Some(size) = weights.get(key).and_then(serde_json::Value::as_u64) {
+            return usize::try_from(size).ok();
+        }
+    }
+    weights
+        .get("block_sizes")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .find_map(serde_json::Value::as_u64)
+        .and_then(|size| usize::try_from(size).ok())
 }
 
 /// Flatten a ModelOpt-style `hf_quant_config.json` payload into the canonical
@@ -152,7 +297,8 @@ fn normalize_modelopt_sidecar(qc_raw: &serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_quantization_config;
+    use super::{parse_quantization_config, parse_quantization_config_checked};
+    use crate::config::ModelOptWeightFormat;
 
     /// The exact `hf_quant_config.json` schema shipped by
     /// `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4`, wrapped by
@@ -221,5 +367,115 @@ mod tests {
             .expect("mixed-precision sidecar must yield a QuantizationConfig");
         assert_eq!(qc.quant_method, "modelopt");
         assert_eq!(qc.quant_algo, "MIXED_PRECISION");
+    }
+
+    #[test]
+    fn modelopt_mixed_precision_groups_are_typed() {
+        let raw = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "config_groups": {
+                    "nvfp4_experts": {
+                        "weights": {
+                            "type": "float",
+                            "num_bits": 4,
+                            "block_sizes": [-1, 16],
+                            "dynamic": false
+                        },
+                        "targets": ["re:.*mlp.experts.*"]
+                    },
+                    "mxfp8_attention": {
+                        "weights": {
+                            "type": "float",
+                            "num_bits": 8,
+                            "block_sizes": [-1, 32],
+                            "dynamic": false
+                        },
+                        "targets": ["re:.*self_attn.*", "re:.*visual.*"]
+                    }
+                }
+            }
+        });
+
+        let qc = parse_quantization_config_checked(&raw)
+            .expect("valid mixed ModelOpt config must parse")
+            .expect("quantization config must be present");
+        assert_eq!(qc.config_groups.len(), 2);
+        assert_eq!(qc.config_groups[0].name, "mxfp8_attention");
+        assert_eq!(
+            qc.config_groups[0].weight_format,
+            ModelOptWeightFormat::Mxfp8
+        );
+        assert_eq!(qc.config_groups[0].group_size, 32);
+        assert_eq!(
+            qc.config_groups[1].weight_format,
+            ModelOptWeightFormat::Nvfp4
+        );
+        assert_eq!(qc.config_groups[1].group_size, 16);
+        assert_eq!(
+            qc.modelopt_weight_format_for("re:.*self_attn.*"),
+            Some(ModelOptWeightFormat::Mxfp8)
+        );
+        assert_eq!(qc.modelopt_weight_format_for("not-listed"), None);
+    }
+
+    #[test]
+    fn modelopt_mixed_precision_rejects_wrong_group_size() {
+        let raw = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "config_groups": {
+                    "bad_mxfp8": {
+                        "weights": {
+                            "type": "float",
+                            "num_bits": 8,
+                            "block_sizes": [-1, 16],
+                            "dynamic": false
+                        },
+                        "targets": ["re:.*self_attn.*"]
+                    }
+                }
+            }
+        });
+
+        let err = parse_quantization_config_checked(&raw)
+            .expect_err("MXFP8 with group size 16 must fail closed");
+        assert!(err.to_string().contains("MXFP8 group size 32"));
+    }
+
+    #[test]
+    fn modelopt_mixed_precision_rejects_duplicate_targets() {
+        let raw = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "config_groups": {
+                    "experts_a": {
+                        "weights": {
+                            "type": "float",
+                            "num_bits": 4,
+                            "group_size": 16,
+                            "dynamic": false
+                        },
+                        "targets": ["re:.*mlp.experts.*"]
+                    },
+                    "experts_b": {
+                        "weights": {
+                            "type": "float",
+                            "num_bits": 4,
+                            "group_size": 16,
+                            "dynamic": false
+                        },
+                        "targets": ["re:.*mlp.experts.*"]
+                    }
+                }
+            }
+        });
+
+        let err = parse_quantization_config_checked(&raw)
+            .expect_err("duplicate mixed-precision targets must fail closed");
+        assert!(err.to_string().contains("duplicate target"));
     }
 }

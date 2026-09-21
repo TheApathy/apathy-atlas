@@ -96,11 +96,58 @@ fn checked_reserve_totals(
     Ok((inference_reserve, total_reserve))
 }
 
-fn speculative_cuda_headroom(speculative_drafts: Option<usize>) -> usize {
+fn speculative_cuda_headroom(
+    speculative_drafts: Option<usize>,
+    configured_headroom_mb: usize,
+) -> usize {
     match speculative_drafts {
-        Some(_) => 4 * 1024 * 1024 * 1024,
+        Some(_) => configured_headroom_mb.saturating_mul(1024 * 1024),
         None => 512 * 1024 * 1024,
     }
+}
+
+fn qwen4_qsa_side_cache_reserve(args: &cli::ServeArgs, config: &ModelConfig) -> Result<usize> {
+    if !config.is_qwen4_exp() || !config.qwen4_qsa {
+        return Ok(0);
+    }
+    anyhow::ensure!(
+        args.block_size >= 4 && args.block_size.is_multiple_of(4),
+        "Qwen4 QSA requires --block-size divisible by 4"
+    );
+    let blocks_per_seq = args.max_seq_len.div_ceil(args.block_size);
+    let physical_blocks = args
+        .max_batch_size
+        .checked_mul(blocks_per_seq.saturating_add(1))
+        .and_then(|n| n.checked_add(1))
+        .context("QSA physical block reserve overflow")?;
+    let groups_per_page = args.block_size / 4;
+    let bytes_per_block_per_layer = (4usize + groups_per_page)
+        .checked_mul(128 * 2)
+        .context("QSA side-cache row reserve overflow")?;
+    let cache_bytes = physical_blocks
+        .checked_mul(config.num_attention_layers())
+        .and_then(|n| n.checked_mul(bytes_per_block_per_layer))
+        .context("QSA side-cache reserve overflow")?;
+    let logits_bytes = args
+        .max_batch_size
+        .checked_mul(args.max_seq_len.div_ceil(4))
+        .and_then(|n| n.checked_mul(config.num_attention_layers()))
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+        .context("QSA logits reserve overflow")?;
+    let sparse_parts_per_layer = 24usize
+        .checked_mul(8)
+        .and_then(|n| n.checked_mul((256 + 2) * std::mem::size_of::<f32>()))
+        .and_then(|n| n.checked_add(2051 * std::mem::size_of::<i32>()))
+        .and_then(|n| n.checked_add((640 + 128) * 2 + std::mem::size_of::<u32>()))
+        .context("QSA sparse workspace reserve overflow")?;
+    let sparse_workspace_bytes = sparse_parts_per_layer
+        .checked_mul(config.num_attention_layers())
+        .context("QSA sparse workspace layer reserve overflow")?;
+    checked_preflight_add(
+        checked_preflight_add(cache_bytes, logits_bytes, "QSA cache + logits")?,
+        sparse_workspace_bytes,
+        "QSA cache + sparse workspace",
+    )
 }
 
 pub(crate) fn preflight_reserve(
@@ -122,7 +169,12 @@ pub(crate) fn preflight_reserve(
         requested_ddtree_capacity,
     )?;
     let spec_tokens_pre = speculative_geometry.num_intermediates.max(1);
-    let cuda_headroom = speculative_cuda_headroom(speculative_drafts);
+    let qsa_side_cache_bytes = qwen4_qsa_side_cache_reserve(args, config)?;
+    let cuda_headroom = checked_preflight_add(
+        speculative_cuda_headroom(speculative_drafts, args.speculative_cuda_headroom_mb),
+        qsa_side_cache_bytes,
+        "CUDA headroom + QSA side cache",
+    )?;
     let decode_ring_slots = if num_ssm_layers > 0 {
         (atlas_kernels::ROLLBACK_RESTEER_CAP as usize)
             .checked_add(1)
@@ -255,6 +307,14 @@ pub(crate) fn preflight_reserve(
         buffer_arena_bytes / (1024 * 1024),
         free_mem as f64 / (1024.0 * 1024.0 * 1024.0),
     );
+    if qsa_side_cache_bytes > 0 {
+        tracing::info!(
+            "Qwen4 QSA side-cache reserve: {} MB for max_seq_len={} batch={}",
+            qsa_side_cache_bytes / (1024 * 1024),
+            args.max_seq_len,
+            args.max_batch_size,
+        );
+    }
     // Q09: per-component breakdown so future MTP/spec-decode reserve
     // jumps are diagnosable from the log alone. Each line is dropped at
     // debug to avoid noise on hot startup paths; flip to info if you
@@ -435,12 +495,15 @@ mod dflash_preflight_shape_tests {
 
     #[test]
     fn dflash_block16_reserves_for_fifteen_drafts() {
-        assert_eq!(speculative_cuda_headroom(Some(15)), 4 * 1024 * 1024 * 1024);
+        assert_eq!(
+            speculative_cuda_headroom(Some(15), 4096),
+            4 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
     fn plain_decode_keeps_the_small_reserve() {
-        assert_eq!(speculative_cuda_headroom(None), 512 * 1024 * 1024);
+        assert_eq!(speculative_cuda_headroom(None, 4096), 512 * 1024 * 1024);
     }
 }
 

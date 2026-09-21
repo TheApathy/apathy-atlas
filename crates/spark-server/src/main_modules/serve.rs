@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
-use crate::main_modules::serve_phases;
+use crate::main_modules::{serve_phases, serve_shutdown};
 use crate::tokenizer::ChatTokenizer;
 use crate::{
     cli, conversation_store, rate_limiter, response_store, scheduler, scheduling_policy,
@@ -28,7 +28,12 @@ type Prepared = (
     Arc<std::sync::atomic::AtomicBool>,
     String,
     u16,
+    std::thread::JoinHandle<()>,
 );
+
+fn qwen4_ngram_requires_unsafe(ngram_speculative: bool, is_qwen4: bool) -> bool {
+    ngram_speculative && is_qwen4
+}
 
 /// Bring the engine up, then serve.
 ///
@@ -48,12 +53,17 @@ pub(crate) async fn serve(
     tui_progress: Option<std::sync::mpsc::Receiver<crate::tui::capture_layer::ProgressEvent>>,
 ) -> Result<()> {
     // Signal listeners belong on the runtime, not inside the blocking section.
-    let Some((state, model_ready, bind, port)) =
+    let Some((state, model_ready, bind, port, scheduler_thread)) =
         tokio::task::spawn_blocking(move || startup(args, tui_progress)).await??
     else {
         return Ok(()); // EP worker: no router on this rank
     };
-    crate::main_modules::serve_router::build_and_serve(state, model_ready, &bind, port).await
+    let serve_result =
+        crate::main_modules::serve_router::build_and_serve(state, model_ready, &bind, port).await;
+    let scheduler_join =
+        tokio::task::spawn_blocking(move || serve_shutdown::join_scheduler(scheduler_thread)).await;
+
+    serve_shutdown::resolve_serve_result(serve_result, scheduler_join)
 }
 
 fn startup(
@@ -98,6 +108,35 @@ fn startup(
     // 1. Load model config (supports HF config.json and Mistral params.json)
     spark_runtime::progress::phase(2, "config");
     let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
+    config.qwen4_qsa = args.qwen4_qsa;
+    if args.qwen4_qsa && !config.is_qwen4_exp() {
+        anyhow::bail!("--qwen4-qsa requires a qwen4_exp checkpoint");
+    }
+    if config.is_qwen4_exp() && args.max_seq_len > 2048 && !args.qwen4_qsa {
+        anyhow::bail!(
+            "Qwen4 contexts above 2048 require --qwen4-qsa; dense fallback is intentionally capped"
+        );
+    }
+    if args.qwen4_qsa
+        && (args.max_batch_size != 1 || !matches!(args.kv_cache_dtype.as_str(), "bf16" | "nvfp4"))
+    {
+        anyhow::bail!(
+            "the Qwen4 QSA path requires --max-batch-size 1 and --kv-cache-dtype bf16 or nvfp4"
+        );
+    }
+    if config.is_qwen4_exp() && args.max_seq_len > config.max_position_embeddings {
+        let factor = (args.max_seq_len as f32 / config.max_position_embeddings as f32).ceil();
+        config.yarn_factor = factor;
+        config.yarn_beta_fast = 32.0;
+        config.yarn_beta_slow = 1.0;
+        config.yarn_original_max_position_embeddings = config.max_position_embeddings;
+        tracing::info!(
+            factor,
+            original_context = config.max_position_embeddings,
+            requested_context = args.max_seq_len,
+            "Qwen4 static YaRN long-context profile enabled"
+        );
+    }
 
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.
@@ -233,6 +272,21 @@ fn startup(
     // Apply MODEL.toml [behavior].default_num_drafts unless user passed --num-drafts.
     serve_phases::apply_model_default_num_drafts(&mut args, &ptx_set);
 
+    // The inherited K=2 verifier is single-stream. Flash-Next needs a
+    // four-stream + PLE-aware verifier and currently falls back to two exact
+    // serial rows. That path is coherent, but the Weschera qualification gate
+    // showed non-identical hashes and a net throughput regression. Refuse to
+    // advertise it as lossless speculation until the native batched verifier
+    // is qualified. The override is deliberately diagnostic-only.
+    if qwen4_ngram_requires_unsafe(args.ngram_speculative, config.is_qwen4_exp())
+        && std::env::var("ATLAS_QWEN4_NGRAM_UNSAFE").ok().as_deref() != Some("1")
+    {
+        anyhow::bail!(
+            "--ngram-speculative is not yet losslessly qualified for qwen4_exp; \
+             use target-only serving, or set ATLAS_QWEN4_NGRAM_UNSAFE=1 for diagnostic runs"
+        );
+    }
+
     let (gpu, free_mem) = serve_phases::init_gpu_backend(&args, &ptx_set)?;
 
     // ── Pre-load reserve preflight ──
@@ -278,9 +332,19 @@ fn startup(
 
     // 3. Load model weights
     spark_runtime::progress::phase(5, "weight load");
+    if config.is_qwen4_exp() {
+        let manifest = model_dir.join("ple-offload/manifest.json");
+        if manifest.is_file() {
+            config.ple_offload_manifest = Some(manifest.to_string_lossy().into_owned());
+            tracing::info!(
+                "Qwen4 PLE: discovered sparse offload manifest {}",
+                manifest.display()
+            );
+        }
+    }
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
     tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
-    let store = serve_phases::load_weight_store(
+    let mut store = serve_phases::load_weight_store(
         &args,
         &config,
         &model_dir,
@@ -289,6 +353,36 @@ fn startup(
         ep_size,
         oom_reserve_bytes,
     )?;
+
+    if let Some(mtp_dir) = &args.mtp_from_path {
+        use spark_runtime::weights::WeightLoader;
+        anyhow::ensure!(args.speculative, "--mtp-from-path requires --speculative");
+        anyhow::ensure!(
+            config.is_qwen4_exp(),
+            "--mtp-from-path currently supports only qwen4_exp"
+        );
+        let expert_prefixes =
+            (0..config.num_experts).map(|expert| format!("mtp.layers.0.mlp.experts.{expert}."));
+        let mut loader = spark_runtime::fast_weights::FastSafetensorsLoader::new()
+            .with_name_prefixes(expert_prefixes);
+        loader.peak_memory_multiplier = Some(1.15);
+        let mtp_store = loader
+            .load(mtp_dir, gpu.as_ref(), oom_reserve_bytes)
+            .with_context(|| format!("Failed to load MTP sidecar {}", mtp_dir.display()))?;
+        spark_model::weight_loader::qwen4_mtp::validate_qwen4_mtp_expert_store(&mtp_store, &config)
+            .context("Qwen4 MTP expert sidecar schema validation failed")?;
+        let count = mtp_store.len();
+        let bytes = mtp_store.total_bytes();
+        store.merge_disjoint(mtp_store)?;
+        spark_model::weight_loader::qwen4_mtp::validate_qwen4_mtp_store(&store, &config)
+            .context("Merged Qwen4 MTP schema validation failed")?;
+        tracing::info!(
+            tensors = count,
+            gib = bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            path = %mtp_dir.display(),
+            "Qwen4 native MTP sidecar loaded and schema-validated"
+        );
+    }
 
     // 3b. Auto-detect weight key prefix for nested models.
     serve_phases::auto_detect_weight_prefix(&store, &mut config);
@@ -381,8 +475,19 @@ fn startup(
     } = serve_phases::resolve_kv_cache_config(&args, &config, ptx_set.behavior.default_kv_dtype)?;
     let dflash_drafter_state =
         serve_phases::load_dflash_drafter(&args, &ptx_set, gpu.as_ref(), dspark_verify_mode)?;
+    let dflash_donor_state = serve_phases::load_dflash_donor(&args, gpu.as_ref())?;
     if let Some((_, drafter_config)) = dflash_drafter_state.as_ref() {
         args.dflash_gamma = Some(drafter_config.resolve_draft_count(args.dflash_gamma)?);
+    }
+    if config.is_qwen4_exp()
+        && dflash_donor_state.is_some()
+        && !matches!(args.dflash_gamma, Some(1 | 2))
+    {
+        anyhow::bail!(
+            "the experimental Qwen4-to-dense-V3 bridge supports only --dflash-gamma 1 or 2 \
+             (physical verifier K=2 or K=3); got {:?}",
+            args.dflash_gamma
+        );
     }
     let dflash_quantization = match args.dflash_quantization.as_str() {
         "bf16" => spark_model::layers::DflashQuantization::Bf16,
@@ -400,6 +505,7 @@ fn startup(
             .as_ref()
             .map(|(s, c)| spark_model::factory::DflashBuildArgs {
                 drafter_store: s,
+                donor_store: dflash_donor_state.as_ref(),
                 drafter_config: c.clone(),
                 gamma: args.dflash_gamma,
                 dspark_verify_mode,
@@ -669,35 +775,6 @@ fn startup(
         .unwrap_or(ptx_set.behavior.max_thinking_budget);
     // Moved into the scheduler thread; `None` leaves the gate disarmed.
     let scheduler_mtp_gate = args.mtp_gate.clone();
-    std::thread::spawn(move || {
-        scheduler::run(
-            scheduler_model,
-            request_rx,
-            scheduler_eos,
-            max_batch_size,
-            use_speculative,
-            num_drafts,
-            policy,
-            max_prefill_tokens,
-            max_batch_tokens,
-            use_self_spec,
-            use_ngram_spec,
-            swap_space_gb,
-            high_speed_swap_cfg,
-            block_size,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            reflection_suppress_ids,
-            grammar_engine,
-            adaptive_sampling,
-            session_manager,
-            scheduler_spontaneous_think_budget,
-            scheduler_mtp_gate,
-        );
-    });
 
     // Tool call parser resolution: CLI > MODEL.toml > defaults table.
     let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
@@ -714,8 +791,8 @@ fn startup(
         tokenizer,
         model_name,
         max_seq_len: args.max_seq_len,
-        yarn_context: config.yarn_factor > 0.0,
         max_batch_size,
+        yarn_context: config.yarn_factor > 0.0,
         request_tx,
         vision_config: config.vision.clone(),
         default_temperature,
@@ -779,8 +856,47 @@ fn startup(
         tracing::info!("runtime profile toggle armed: SIGUSR1=enable SIGUSR2=disable");
     }
 
+    // Spawn only after every fallible startup operation above has succeeded.
+    // From this point the returned JoinHandle is owned by `serve` until the
+    // HTTP request sender closes and the scheduler has dropped the model.
+    let scheduler_thread = std::thread::spawn(move || {
+        scheduler::run(
+            scheduler_model,
+            request_rx,
+            scheduler_eos,
+            max_batch_size,
+            use_speculative,
+            num_drafts,
+            policy,
+            max_prefill_tokens,
+            max_batch_tokens,
+            use_self_spec,
+            use_ngram_spec,
+            swap_space_gb,
+            high_speed_swap_cfg,
+            block_size,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            reflection_suppress_ids,
+            grammar_engine,
+            adaptive_sampling,
+            session_manager,
+            scheduler_spontaneous_think_budget,
+            scheduler_mtp_gate,
+        );
+    });
+
     // 9-11. Router + HTTP server run on the async side; hand them the pieces.
-    Ok(Some((state, model_ready, args.bind, args.port)))
+    Ok(Some((
+        state,
+        model_ready,
+        args.bind,
+        args.port,
+        scheduler_thread,
+    )))
 }
 
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an
@@ -820,4 +936,16 @@ fn build_auth_config(args: &cli::ServeArgs) -> Result<Option<Arc<crate::auth::Au
         if cfg.token_count() == 1 { "" } else { "s" },
     );
     Ok(Some(Arc::new(cfg)))
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    use super::qwen4_ngram_requires_unsafe;
+
+    #[test]
+    fn flash_next_ngram_is_fail_closed() {
+        assert!(qwen4_ngram_requires_unsafe(true, true));
+        assert!(!qwen4_ngram_requires_unsafe(false, true));
+        assert!(!qwen4_ngram_requires_unsafe(true, false));
+    }
 }

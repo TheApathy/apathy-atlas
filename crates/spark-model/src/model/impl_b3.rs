@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
+use atlas_core::config::{DflashCaptureMode, LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
@@ -350,70 +350,92 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
-        let h = self.config.hidden_size;
+        let h = self.dflash_capture_width;
+        // The ring slot holds ONE row per capture tap, and `ring_window_layout`
+        // sizes it as `capture_taps * hidden_size * 2` from
+        // `target_layer_ids.len()`. This binding was lost in the merge: the
+        // `ensure!` below survived theirs' capture-mode rewrite while HEAD's
+        // definition of the tap count did not, leaving the geometry check
+        // referring to a name that no longer existed.
+        let n_capture = self.dflash_capture_layers.len();
         let bf16 = 2usize;
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
-        let src_base = self.buffers.hidden_states();
-        let capture_bytes = h
-            .checked_mul(bf16)
-            .ok_or_else(|| anyhow::anyhow!("DFlash capture byte size overflow"))?;
-        if crate::layers::dflash_capture_strided_enabled() && self.strided_copy_rows_kernel.0 != 0 {
-            // Same bytes to the same destinations as the per-row loop below;
-            // the ring wraps at `ctx_capacity`, so split into contiguous runs.
-            let mut t = 0usize;
-            while t < proc_count {
-                let abs_pos = chunk_start + t;
-                if abs_pos >= max_ctx {
-                    break;
+        if proc_count == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            dstate.ctx_slot_bytes == n_capture * h * bf16,
+            "DFlash capture slot geometry does not match proposer ring"
+        );
+        let append = dstate
+            .ctx_ring_state()?
+            .plan_append_at(chunk_start, proc_count)?;
+        let capture_count = proc_count;
+        let source_stride;
+        let src_base = match self.dflash_capture_mode {
+            DflashCaptureMode::ResidualSlice => {
+                source_stride = self.config.residual_width();
+                self.buffers
+                    .hidden_states()
+                    .offset(self.dflash_capture_offset * bf16)
+            }
+            DflashCaptureMode::Qwen4HyperProjected => {
+                let mixer = self.qwen4_final_mixer.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("projected DFlash capture missing Qwen4 hyper mixer")
+                })?;
+                source_stride = h;
+                if std::env::var("ATLAS_QWEN4_HYPER_PREFILL_GEMM")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    mixer.prepare_prefill(
+                        self.buffers.hidden_states(),
+                        self.buffers.residual(),
+                        capture_count,
+                        &self.buffers,
+                        self.gpu.as_ref(),
+                        self.config.rms_norm_eps as f32,
+                        stream,
+                    )?
+                } else {
+                    // Match the target layer's default Qwen4 prefill path.
+                    // Switching only the capture projection to the faster
+                    // tensor-core GEMM changes BF16 features between prompt
+                    // and decode even when the target itself stays exact.
+                    mixer.prepare_prefill_exact(
+                        self.buffers.hidden_states(),
+                        self.buffers.residual(),
+                        capture_count,
+                        &self.buffers,
+                        self.gpu.as_ref(),
+                        self.config.rms_norm_eps as f32,
+                        stream,
+                    )?
                 }
-                let ring_pos = abs_pos % dstate.ctx_capacity;
-                let run = (proc_count - t)
-                    .min(dstate.ctx_capacity - ring_pos)
-                    .min(max_ctx - abs_pos);
+            }
+        };
+        for span in append.write.spans() {
+            for local in 0..span.slot_count {
+                let source_row = span.linear_slot + local;
+                let physical_slot = span.physical_slot + local;
+                let src = src_base.offset(source_row * source_stride * bf16);
+                let absolute_position = chunk_start + source_row;
                 let dst_offset =
                     crate::layers::dflash_head::ring_window::accumulator_capture_offset(
-                        abs_pos,
+                        absolute_position,
                         slot_idx,
                         dstate.ctx_capacity,
                         dstate.ctx_slot_bytes,
-                        capture_bytes,
+                        h * bf16,
                     )?;
-                crate::layers::ops::strided_copy_rows(
-                    self.gpu.as_ref(),
-                    self.strided_copy_rows_kernel,
-                    src_base.offset(t * capture_bytes),
-                    acc_base.offset(dst_offset),
-                    run as u32,
-                    capture_bytes as u32,
-                    capture_bytes as u64,
-                    dstate.ctx_slot_bytes as u64,
-                    stream,
-                )?;
-                t += run;
+                anyhow::ensure!(
+                    dst_offset / dstate.ctx_slot_bytes == physical_slot,
+                    "DFlash capture plan and byte offset disagree"
+                );
+                self.gpu
+                    .copy_d2d_async(src, acc_base.offset(dst_offset), h * bf16, stream)?;
             }
-            return Ok(());
-        }
-        for t in 0..proc_count {
-            let abs_pos = chunk_start
-                .checked_add(t)
-                .ok_or_else(|| anyhow::anyhow!("DFlash capture absolute position overflow"))?;
-            if abs_pos >= max_ctx {
-                break; // accumulator full; drop later positions
-            }
-            let src_offset = t
-                .checked_mul(capture_bytes)
-                .ok_or_else(|| anyhow::anyhow!("DFlash capture source offset overflow"))?;
-            let src = src_base.offset(src_offset);
-            let dst_offset = crate::layers::dflash_head::ring_window::accumulator_capture_offset(
-                abs_pos,
-                slot_idx,
-                dstate.ctx_capacity,
-                dstate.ctx_slot_bytes,
-                capture_bytes,
-            )?;
-            self.gpu
-                .copy_d2d_async(src, acc_base.offset(dst_offset), capture_bytes, stream)?;
         }
         Ok(())
     }
@@ -451,13 +473,16 @@ impl TransformerModel {
         if proc_count == 0 {
             return Ok(());
         }
-        let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
+        let row_bytes = if self.config.is_qwen4_exp() {
+            self.config.residual_width() * 2
         } else {
-            2usize
+            let element_bytes = if self.config.use_fp32_residual() {
+                4
+            } else {
+                2
+            };
+            self.config.hidden_size * element_bytes
         };
-        let row_bytes = h * fp32;
         let ring_capacity_bytes = capacity * row_bytes;
 
         // Lazy-size the host ring buffer.
@@ -606,13 +631,16 @@ impl TransformerModel {
             return Ok(());
         }
         let end_abs = seq.mtp_lastk_end_abs;
-        let h = self.config.hidden_size;
-        let fp32 = if self.config.use_fp32_residual() {
-            4usize
+        let row_bytes = if self.config.is_qwen4_exp() {
+            self.config.residual_width() * 2
         } else {
-            2usize
+            let element_bytes = if self.config.use_fp32_residual() {
+                4
+            } else {
+                2
+            };
+            self.config.hidden_size * element_bytes
         };
-        let row_bytes = h * fp32;
         let used_bytes = filled * row_bytes;
 
         // The `filled` rows in the host ring occupy
@@ -704,22 +732,29 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            let new_len = (chunk_start + proc_count).min(dstate.max_ctx_len);
-            dstate.ctx_len = new_len;
+            if proc_count == 0 {
+                return Ok(());
+            }
+            let append = dstate
+                .ctx_ring_state()?
+                .plan_append_at(chunk_start, proc_count)?;
+            dstate.apply_ctx_ring_state(append.next)?;
         }
         Ok(())
     }
 
     /// DFlash drafter-retrain teacher-forced capture. When
     /// `ATLAS_DUMP_CTX_HIDDEN=<path>` is set, dump the per-sequence
-    /// `ctx_hidden_acc` (all-position × 5-capture-layer hiddens from the
-    /// just-completed prefill, computed on the NVFP4 serving path) to the
-    /// append-only file. One record per request. No-op when the env var is
-    /// unset, DFlash capture is inactive, or rank > 0 under EP/TP.
+    /// chronological resident tail of `ctx_hidden_acc` (at most 4096 positions
+    /// × capture layers, computed on the serving path) to the append-only file.
+    /// One record per request. Long prompts therefore require training-token
+    /// truncation to the same absolute tail; the runtime logs that contract.
+    /// No-op when the env var is unset, DFlash capture is inactive, or rank > 0
+    /// under EP/TP.
     ///
-    /// The `ctx_hidden_acc` device layout is `[pos, slot, hidden]` BF16
-    /// (per-position stride `n_capture * hidden * 2`), which is exactly the
-    /// SpecForge offline `[T, L*H]` tensor with L = capture layers in
+    /// The physical device layout is `[ring_slot, capture, hidden]` BF16. The
+    /// dump gathers it chronologically into the SpecForge offline `[T, L*H]`
+    /// tensor with L = capture layers in
     /// `dflash_capture_layers` order (e.g. [1,16,31,46,61]). The Python
     /// harness pads to SPECFORGE_PAD_TO and saves `{md5(padded ids)}.pt`.
     ///
@@ -751,20 +786,21 @@ impl TransformerModel {
         {
             return Ok(());
         }
-        let h = self.config.hidden_size;
+        let h = self.dflash_capture_width;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
 
-        let (acc_base, n) = match seq.proposer_state.as_mut() {
+        let (acc_base, ring) = match seq.proposer_state.as_mut() {
             Some(ps) => match ps
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
             {
-                Some(dstate) => (dstate.ctx_hidden_acc, dstate.ctx_len),
+                Some(dstate) => (dstate.ctx_hidden_acc, dstate.ctx_ring_state()?),
                 None => return Ok(()),
             },
             None => return Ok(()),
         };
+        let n = ring.resident_len;
         if acc_base.0 == 0 || n == 0 {
             tracing::warn!(
                 "ATLAS_DUMP_CTX_HIDDEN: no ctx_hidden_acc/ctx_len (acc={:#x}, n={}) — skipping dump",
@@ -774,9 +810,24 @@ impl TransformerModel {
             return Ok(());
         }
 
-        let total_bytes = n * n_capture * h * bf16;
+        let resident_start = ring.resident_start();
+        let gather = ring.plan_gather(resident_start, n)?;
+        let slot_bytes = n_capture
+            .checked_mul(h)
+            .and_then(|elements| elements.checked_mul(bf16))
+            .ok_or_else(|| anyhow::anyhow!("DFlash dump slot size overflowed"))?;
+        let total_bytes = n
+            .checked_mul(slot_bytes)
+            .ok_or_else(|| anyhow::anyhow!("DFlash dump payload size overflowed"))?;
         let mut host_buf = vec![0u8; total_bytes];
-        self.gpu.copy_d2h(acc_base, &mut host_buf)?;
+        for span in gather.spans() {
+            let byte_count = span.slot_count * slot_bytes;
+            let dst_start = span.dst_slot * slot_bytes;
+            self.gpu.copy_d2h(
+                acc_base.offset(span.src_slot * slot_bytes),
+                &mut host_buf[dst_start..dst_start + byte_count],
+            )?;
+        }
 
         // FNV-1a over the prompt token bytes — lets the Python harness assert
         // it paired the right record with the right sample.
@@ -803,9 +854,17 @@ impl TransformerModel {
         f.write_all(&(h as u32).to_le_bytes())?;
         f.write_all(&fnv.to_le_bytes())?;
         f.write_all(&host_buf)?;
+        if ring.absolute_len > ring.resident_len {
+            tracing::warn!(
+                "ATLAS_DUMP_CTX_HIDDEN: bounded-ring payload contains only chronological absolute positions [{}..{}); retraining must truncate tokens to the same 4096-slot window and requalify acceptance",
+                resident_start,
+                ring.absolute_len,
+            );
+        }
         tracing::info!(
-            "ATLAS_DUMP_CTX_HIDDEN: wrote record seq_len={n} n_capture={n_capture} h={h} \
-             ({total_bytes} bytes payload) fnv={fnv:#018x} → {path}"
+            "ATLAS_DUMP_CTX_HIDDEN: wrote resident seq_len={n} absolute_len={} absolute_start={resident_start} n_capture={n_capture} h={h} \
+             ({total_bytes} bytes payload) fnv={fnv:#018x} → {path}",
+            ring.absolute_len,
         );
         Ok(())
     }
@@ -835,7 +894,7 @@ impl TransformerModel {
     ///   - DFlash is inactive (`dflash_hidden_save` is `None` / capture layers empty),
     ///   - the seq has no `DflashProposerState`,
     ///   - rank > 0 under EP/TP (drafter is rank-0 only),
-    ///   - the accumulator is already full.
+    ///   - the absolute model context limit has been reached.
     ///
     /// Drafter-conditioning ONLY: the target's verify path is untouched, so
     /// committed tokens remain byte-identical — this raises ACCEPTANCE, not
@@ -879,17 +938,14 @@ impl TransformerModel {
             Some(p) => p,
             None => return Ok(()),
         };
-        if abs_pos >= dstate.max_ctx_len {
-            return Ok(()); // accumulator full; drop later positions
-        }
+        let append = dstate.ctx_ring_state()?.plan_append_at(abs_pos, 1)?;
         // dflash_hidden_save layout is [k_max, n_capture, hidden] BF16; row 0
         // is one whole ctx slot (n_capture * hidden * bf16 == ctx_slot_bytes).
         let slot_bytes = dstate.ctx_slot_bytes;
-        let dst = dstate.ctx_hidden_acc.offset(abs_pos * slot_bytes);
+        let dst_slot = append.write.physical_slot_for(0)?;
+        let dst = dstate.ctx_hidden_acc.offset(dst_slot * slot_bytes);
         self.gpu.copy_d2d_async(src_base, dst, slot_bytes, stream)?;
-        // Keep ctx_len in lockstep with seq_len. Using max() guards against
-        // any transient where ctx_len was already advanced past this slot.
-        dstate.ctx_len = dstate.ctx_len.max((abs_pos + 1).min(dstate.max_ctx_len));
+        dstate.apply_ctx_ring_state(append.next)?;
         if std::env::var("ATLAS_PROPOSE_PROBE").ok().as_deref() == Some("1") {
             tracing::info!(
                 "dflash_capture_thinking: abs_pos={} ctx_len={} slot_bytes={}",
@@ -968,14 +1024,39 @@ impl TransformerModel {
             Some(s) => s,
             None => return Ok(()),
         };
-        let h = self.config.hidden_size;
+        let h = self.dflash_capture_width;
         let bf16 = 2usize;
         debug_assert!(
             !self.config.use_fp32_residual(),
             "DFlash hidden capture currently assumes BF16 residual; FP32-residual models need a separate downcast path"
         );
         let n_capture = self.dflash_capture_layers.len();
-        let src = self.buffers.hidden_states().offset(token_idx * h * bf16);
+        let raw = self
+            .buffers
+            .hidden_states()
+            .offset(token_idx * self.config.residual_width() * bf16);
+        let src = match self.dflash_capture_mode {
+            DflashCaptureMode::ResidualSlice => raw.offset(self.dflash_capture_offset * bf16),
+            DflashCaptureMode::Qwen4HyperProjected => {
+                let mixer = self.qwen4_final_mixer.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("projected DFlash capture missing Qwen4 hyper mixer")
+                })?;
+                let residual = self
+                    .buffers
+                    .residual()
+                    .offset(token_idx * self.config.residual_width() * bf16);
+                mixer
+                    .prepare_decode(
+                        raw,
+                        residual,
+                        &self.buffers,
+                        self.gpu.as_ref(),
+                        self.config.rms_norm_eps as f32,
+                        stream,
+                    )?
+                    .0
+            }
+        };
         // [token_idx, slot, hidden] BF16 layout. Per-token stride =
         // n_capture * h * bf16; per-slot stride = h * bf16.
         let dst_off = token_idx * n_capture * h * bf16 + slot * h * bf16;
@@ -1049,7 +1130,7 @@ impl TransformerModel {
             return Ok(());
         }
 
-        let h = self.config.hidden_size;
+        let h = self.dflash_capture_width;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let bytes_per_slot = h * bf16;

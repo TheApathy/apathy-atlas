@@ -20,6 +20,7 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 use cudarc::nvrtc::Ptx;
+use ring::digest::{Context as DigestContext, SHA256};
 
 use crate::error::{AtlasError, Result};
 
@@ -99,11 +100,13 @@ unsafe impl Sync for RawCudaFunc {}
 
 /// Global singleton registry.
 static REGISTRY: OnceLock<std::result::Result<AtlasRegistry, String>> = OnceLock::new();
+static REGISTRY_INITIALIZATION_IDENTITY: OnceLock<String> = OnceLock::new();
 
 /// Cached CUDA modules and a persistent stream.
 pub struct AtlasRegistry {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    initialization_identity: String,
     modules: HashMap<&'static str, Arc<CudaModule>>,
     /// Raw CUmodule handles for direct cuLaunchKernel access.
     raw_modules: HashMap<&'static str, *mut c_void>,
@@ -118,6 +121,44 @@ pub struct AtlasRegistry {
 unsafe impl Send for AtlasRegistry {}
 unsafe impl Sync for AtlasRegistry {}
 
+fn initialization_identity(ordinal: usize, ptx_sources: &[(&str, &str)]) -> String {
+    let mut digest = DigestContext::new(&SHA256);
+    digest.update(b"atlas-cuda-registry-modules.v1");
+    digest.update(&(ptx_sources.len() as u64).to_le_bytes());
+    for &(name, ptx) in ptx_sources {
+        digest.update(&(name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update(&(ptx.len() as u64).to_le_bytes());
+        digest.update(ptx.as_bytes());
+    }
+    let sha256: String = digest
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("backend=cuda;ordinal={ordinal};loaded_modules_sha256={sha256}")
+}
+
+fn require_initialization_identity(loaded: &str, requested: &str) -> Result<()> {
+    if loaded != requested {
+        return Err(AtlasError::ModuleLoad(format!(
+            "AtlasRegistry initialization identity mismatch: loaded {loaded}, requested \
+             {requested}"
+        )));
+    }
+    Ok(())
+}
+
+fn admit_initialization_request<'a>(
+    identity: &'a OnceLock<String>,
+    requested: &str,
+) -> Result<&'a str> {
+    let loaded = identity.get_or_init(|| requested.to_owned());
+    require_initialization_identity(loaded, requested)?;
+    Ok(loaded)
+}
+
 impl AtlasRegistry {
     /// Get or initialize the global registry.
     ///
@@ -127,17 +168,29 @@ impl AtlasRegistry {
         ordinal: usize,
         ptx_sources: &[(&'static str, &str)],
     ) -> Result<&'static Self> {
-        let result = REGISTRY.get_or_init(|| match Self::init(ordinal, ptx_sources) {
-            Ok(reg) => Ok(reg),
-            Err(e) => Err(format!("{e}")),
+        let requested_identity = initialization_identity(ordinal, ptx_sources);
+        let admitted_identity =
+            admit_initialization_request(&REGISTRY_INITIALIZATION_IDENTITY, &requested_identity)?;
+        let result = REGISTRY.get_or_init(|| {
+            match Self::init(ordinal, ptx_sources, admitted_identity.to_owned()) {
+                Ok(reg) => Ok(reg),
+                Err(e) => Err(format!("{e}")),
+            }
         });
         match result {
-            Ok(reg) => Ok(reg),
+            Ok(reg) => {
+                require_initialization_identity(&reg.initialization_identity, &requested_identity)?;
+                Ok(reg)
+            }
             Err(msg) => Err(AtlasError::ModuleLoad(msg.clone())),
         }
     }
 
-    fn init(ordinal: usize, ptx_sources: &[(&'static str, &str)]) -> Result<AtlasRegistry> {
+    fn init(
+        ordinal: usize,
+        ptx_sources: &[(&'static str, &str)],
+        initialization_identity: String,
+    ) -> Result<AtlasRegistry> {
         let ctx = CudaContext::new(ordinal).map_err(AtlasError::CudaDriver)?;
         let stream = ctx.new_stream().map_err(AtlasError::CudaDriver)?;
 
@@ -169,9 +222,15 @@ impl AtlasRegistry {
         Ok(AtlasRegistry {
             ctx,
             stream,
+            initialization_identity,
             modules,
             raw_modules,
         })
+    }
+
+    /// Exact ordinal and ordered module-name/PTX receipt loaded by this singleton.
+    pub fn initialization_identity(&self) -> &str {
+        &self.initialization_identity
     }
 
     /// Get the cached registry (panics if not initialized).
@@ -394,5 +453,34 @@ impl AtlasRegistry {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod initialization_identity_tests {
+    use std::sync::OnceLock;
+
+    use super::{admit_initialization_request, initialization_identity};
+
+    #[test]
+    fn identity_binds_offset_2048_order_count_and_ordinal() {
+        let original = "x".repeat(2_049);
+        let mut changed = original.clone();
+        changed.replace_range(2_048..2_049, "y");
+        let a = [("quantize_nvfp4", original.as_str())];
+        let b = [("quantize_nvfp4", changed.as_str())];
+        let reordered = [("other", "z"), ("quantize_nvfp4", original.as_str())];
+        let loaded = initialization_identity(0, &a);
+        let changed_offset = initialization_identity(0, &b);
+        let changed_ordinal = initialization_identity(1, &a);
+        let changed_order_count = initialization_identity(0, &reordered);
+        let same_process = OnceLock::new();
+        assert_eq!(
+            admit_initialization_request(&same_process, &loaded).unwrap(),
+            loaded
+        );
+        for requested in [changed_offset, changed_ordinal, changed_order_count] {
+            assert!(admit_initialization_request(&same_process, &requested).is_err());
+        }
     }
 }

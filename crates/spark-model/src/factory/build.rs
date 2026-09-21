@@ -3,22 +3,234 @@
 //! `build_model` — entry point that wires up the configured loader,
 //! buffers, KV cache, and (optional) DFlash drafter into a `TransformerModel`.
 
-use anyhow::Result;
-use atlas_core::config::ModelConfig;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use atlas_core::config::{DflashCaptureMode, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use spark_runtime::prefix_cache::PrefixCache;
+use spark_runtime::weights::WeightDtype;
 use spark_runtime::weights::WeightStore;
 
 use super::DflashBuildArgs;
 use super::loader_for_config;
 use super::m2_setup::maybe_run_minimax_m2_moe_transpose;
+use super::qwen4_stream_t::maybe_setup_qwen4_stream_t;
 use crate::layers::MtpQuantization;
 use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 use crate::weight_map::quantize_to_nvfp4;
+
+const QWEN38_FLASH_NEXT_HIDDEN: usize = 2560;
+const QWEN38_FLASH_NEXT_VOCAB: usize = 248_320;
+const QWEN38_FLASH_NEXT_TARGET_LAYERS: usize = 48;
+const QWEN38_FLASH_NEXT_DRAFT_LAYERS: usize = 6;
+const QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE: usize = 16;
+const QWEN38_FLASH_NEXT_DRAFT_GAMMA: usize = QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE - 1;
+const QWEN38_FLASH_NEXT_CAPTURE_LAYERS: [usize; 8] = [1, 7, 13, 20, 26, 33, 39, 46];
+const QWEN38_FLASH_NEXT_SELECTOR_VOCAB: usize = 248_077;
+const QWEN38_FLASH_NEXT_DFLASH2_LAYER_TYPES: [&str; QWEN38_FLASH_NEXT_DRAFT_LAYERS] = [
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "sliding_attention",
+    "full_attention",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen4DflashPairing {
+    Native,
+    DenseDonorBridge,
+}
+
+fn is_qwen38_flash_next_target_vocab(vocab_size: usize) -> bool {
+    matches!(
+        vocab_size,
+        QWEN38_FLASH_NEXT_VOCAB | QWEN38_FLASH_NEXT_SELECTOR_VOCAB
+    )
+}
+
+fn is_native_qwen38_flash_next_drafter(
+    target: &ModelConfig,
+    drafter: &crate::weight_loader::DflashConfig,
+) -> bool {
+    let Some(sub) = drafter.dflash_config.as_ref() else {
+        return false;
+    };
+    let common = target.is_qwen4_exp()
+        && target.hidden_size == QWEN38_FLASH_NEXT_HIDDEN
+        && target.residual_width() == 4 * QWEN38_FLASH_NEXT_HIDDEN
+        // The target store is loaded and preflighted at physical V248320,
+        // then server admission narrows ModelConfig to the tokenizer's
+        // canonical logical V248077 before factory construction. Both are
+        // exact identities for this target; no other cap is native.
+        && is_qwen38_flash_next_target_vocab(target.vocab_size)
+        && target.num_hidden_layers == QWEN38_FLASH_NEXT_TARGET_LAYERS
+        && drafter.hidden_size == QWEN38_FLASH_NEXT_HIDDEN
+        && drafter.vocab_size == QWEN38_FLASH_NEXT_VOCAB
+        && drafter.num_hidden_layers == QWEN38_FLASH_NEXT_DRAFT_LAYERS
+        && drafter.num_target_layers == QWEN38_FLASH_NEXT_TARGET_LAYERS
+        && drafter.intermediate_size == 8704
+        && drafter.num_attention_heads == 20
+        && drafter.num_key_value_heads == 4
+        && drafter.head_dim == 128
+        && drafter.model_type.as_deref() == Some("qwen3")
+        && drafter.root_block_size_explicit
+        && drafter.block_size == QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE
+        && drafter.resolved_block_size() == QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE
+        && drafter.is_causal == Some(false)
+        && !drafter.tie_word_embeddings
+        && drafter.draft_vocab_size.is_none()
+        && drafter.markov_rank == 0
+        && drafter
+            .confidence_head_config()
+            .is_ok_and(|confidence| confidence.is_none())
+        && sub.block_size == Some(QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE)
+        && sub.mask_token_id == 248_077
+        && sub.target_layer_ids == QWEN38_FLASH_NEXT_CAPTURE_LAYERS
+        && sub.projector_type.is_none()
+        && !sub.fc_layernorm;
+    if !common {
+        return false;
+    }
+    match drafter.architectures.as_slice() {
+        [architecture] if architecture == "DFlashDraftModel" => {
+            sub.conv_kernel_size == 0
+                && sub.conv_group_size == 0
+                && sub.selector_rank == 0
+                && sub.selector_top_k == 0
+                && sub.selector_vocab_size.is_none()
+        }
+        [architecture] if architecture == "DFlash2DraftModel" => {
+            sub.conv_kernel_size == 2
+                && sub.conv_group_size == 16
+                && sub.selector_rank == 256
+                && sub.selector_top_k == 16
+                && sub.selector_vocab_size == Some(QWEN38_FLASH_NEXT_SELECTOR_VOCAB)
+                && drafter.sliding_window == Some(4_096)
+                && drafter.layer_types.as_ref().is_some_and(|layer_types| {
+                    layer_types
+                        .iter()
+                        .map(String::as_str)
+                        .eq(QWEN38_FLASH_NEXT_DFLASH2_LAYER_TYPES)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn resolve_native_dflash2_proposal_vocab(
+    drafter: &crate::weight_loader::DflashConfig,
+    requested_vocab: u32,
+) -> Result<usize> {
+    anyhow::ensure!(
+        drafter.is_dflash2(),
+        "native Flash-Next DFlash2 proposal-vocabulary resolution requires DFlash2 semantics"
+    );
+    let selector_vocab = drafter
+        .dflash_config
+        .as_ref()
+        .and_then(|sub| sub.selector_vocab_size)
+        .context("native Flash-Next DFlash2 requires selector_vocab_size")?;
+    anyhow::ensure!(
+        selector_vocab == QWEN38_FLASH_NEXT_SELECTOR_VOCAB,
+        "native Flash-Next DFlash2 selector_vocab_size={selector_vocab}; expected {QWEN38_FLASH_NEXT_SELECTOR_VOCAB}"
+    );
+    anyhow::ensure!(
+        requested_vocab == 0 || requested_vocab as usize == selector_vocab,
+        "native Flash-Next DFlash2 proposal vocabulary must be uncapped or exactly {selector_vocab}; got {requested_vocab}"
+    );
+    Ok(selector_vocab)
+}
+
+fn classify_qwen4_dflash_pairing(
+    native_geometry: bool,
+    has_donor: bool,
+) -> Result<Qwen4DflashPairing> {
+    match (native_geometry, has_donor) {
+        (true, false) => Ok(Qwen4DflashPairing::Native),
+        (false, true) => Ok(Qwen4DflashPairing::DenseDonorBridge),
+        (true, true) => anyhow::bail!(
+            "native Qwen3.8-Flash-Next DFlash must share the target embedding/lm_head; remove --dflash-donor-model"
+        ),
+        (false, false) => anyhow::bail!(
+            "Qwen3.8-Flash-Next requires either the exact native H2560/V248320/T48 DFlash checkpoint or --dflash-donor-model for an explicit dense-DFlash bridge"
+        ),
+    }
+}
+
+fn validate_native_qwen4_dflash_width(
+    drafter: &crate::weight_loader::DflashConfig,
+    requested_gamma: Option<usize>,
+) -> Result<()> {
+    let trained_block = drafter.resolved_block_size();
+    anyhow::ensure!(
+        trained_block == QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE,
+        "native Qwen3.8-Flash-Next V3 requires the exact B{QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE}/gamma{QWEN38_FLASH_NEXT_DRAFT_GAMMA} recipe, but checkpoint block_size={trained_block}"
+    );
+    let gamma = requested_gamma.unwrap_or(QWEN38_FLASH_NEXT_DRAFT_GAMMA);
+    anyhow::ensure!(
+        gamma == QWEN38_FLASH_NEXT_DRAFT_GAMMA,
+        "native Qwen3.8-Flash-Next V3 uses bidirectional B{QWEN38_FLASH_NEXT_DRAFT_BLOCK_SIZE} attention and requires gamma={QWEN38_FLASH_NEXT_DRAFT_GAMMA}, but gamma={gamma} was requested"
+    );
+    Ok(())
+}
+
+fn remap_capture_depths(
+    ids: &[usize],
+    source_layers: usize,
+    target_layers: usize,
+) -> Result<Vec<usize>> {
+    anyhow::ensure!(
+        source_layers > 1 && target_layers > 1,
+        "invalid DFlash capture-depth bridge {source_layers}->{target_layers}"
+    );
+    let source_last = source_layers - 1;
+    let target_last = target_layers - 1;
+    ids.iter()
+        .map(|&id| {
+            anyhow::ensure!(
+                id < source_layers,
+                "DFlash capture layer {id} is outside donor depth {source_layers}"
+            );
+            Ok((id * target_last + source_last / 2) / source_last)
+        })
+        .collect()
+}
+
+fn donor_tensor<'a>(
+    store: &'a WeightStore,
+    candidates: &[&str],
+    expected_shape: &[usize],
+    role: &str,
+) -> Result<&'a spark_runtime::weights::WeightTensor> {
+    let matches: Vec<_> = candidates
+        .iter()
+        .filter_map(|name| store.get(name).ok().map(|tensor| (*name, tensor)))
+        .collect();
+    anyhow::ensure!(
+        matches.len() == 1,
+        "DFlash donor must contain exactly one {role}; found {:?}",
+        matches.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+    );
+    let (name, tensor) = matches[0];
+    anyhow::ensure!(
+        tensor.dtype == WeightDtype::BF16,
+        "DFlash donor tensor {name} must be BF16, got {:?}",
+        tensor.dtype
+    );
+    anyhow::ensure!(
+        tensor.shape == expected_shape,
+        "DFlash donor tensor {name} has shape {:?}; expected {:?}",
+        tensor.shape,
+        expected_shape
+    );
+    Ok(tensor)
+}
 
 pub fn build_model(
     mut config: ModelConfig,
@@ -106,11 +318,75 @@ pub fn build_model(
                  nonzero value for A/B testing that claim and nothing else."
             );
         }
-        config.dflash_capture_layers = sub
+        let raw_with_offset: Vec<_> = sub
             .target_layer_ids
             .iter()
             .map(|&id| (id as i64 + offset).max(0) as usize)
             .collect();
+        if config.is_qwen4_exp() {
+            let pairing = classify_qwen4_dflash_pairing(
+                is_native_qwen38_flash_next_drafter(&config, &args.drafter_config),
+                args.donor_store.is_some(),
+            )?;
+            config.dflash_capture_width = args.drafter_config.hidden_size;
+            config.dflash_capture_offset = 0;
+            match pairing {
+                Qwen4DflashPairing::Native => {
+                    validate_native_qwen4_dflash_width(&args.drafter_config, args.gamma)?;
+                    anyhow::ensure!(
+                        std::env::var("ATLAS_EXPERIMENTAL_NATIVE_QWEN4_DFLASH")
+                            .ok()
+                            .as_deref()
+                            == Some("1"),
+                        "native Qwen4 DFlash support is unqualified and disabled by default; set ATLAS_EXPERIMENTAL_NATIVE_QWEN4_DFLASH=1 only for correctness research"
+                    );
+                    anyhow::ensure!(
+                        offset == 0,
+                        "native Qwen3.8-Flash-Next DFlash requires exact unshifted capture layers"
+                    );
+                    config.dflash_capture_layers = raw_with_offset;
+                    config.dflash_capture_mode = DflashCaptureMode::Qwen4HyperProjected;
+                    tracing::warn!(
+                        "EXPERIMENTAL unqualified native Qwen3.8-Flash-Next DFlash: exact capture layers {:?}; projecting each Qwen4 4H residual through the terminal hyperconnection mixer to H={}. Do not use as a performance candidate until acceptance qualification passes.",
+                        config.dflash_capture_layers,
+                        config.dflash_capture_width,
+                    );
+                }
+                Qwen4DflashPairing::DenseDonorBridge => {
+                    let source_layers = args.drafter_config.num_target_layers;
+                    anyhow::ensure!(
+                        source_layers > 1,
+                        "Qwen4 DFlash bridge requires drafter config num_target_layers"
+                    );
+                    config.dflash_capture_layers = remap_capture_depths(
+                        &raw_with_offset,
+                        source_layers,
+                        config.num_hidden_layers,
+                    )?;
+                    config.dflash_capture_mode = DflashCaptureMode::ResidualSlice;
+                    anyhow::ensure!(
+                        config.dflash_capture_width <= config.residual_width(),
+                        "dense DFlash bridge width {} exceeds Flash-Next residual width {}",
+                        config.dflash_capture_width,
+                        config.residual_width(),
+                    );
+                    tracing::warn!(
+                        "EXPERIMENTAL Qwen4->dense-DFlash bridge: capture depths {:?}->{:?}; exposing BF16 residual slice [{}..{}) of {}. Target verification remains authoritative; qualification is required before production use.",
+                        raw_with_offset,
+                        config.dflash_capture_layers,
+                        config.dflash_capture_offset,
+                        config.dflash_capture_offset + config.dflash_capture_width,
+                        config.residual_width(),
+                    );
+                }
+            }
+        } else {
+            anyhow::ensure!(
+                args.donor_store.is_none(),
+                "--dflash-donor-model is only valid for an explicit Qwen3.8-Flash-Next bridge"
+            );
+            config.dflash_capture_layers = raw_with_offset;
+        }
         tracing::info!(
             "DFlash: target layer capture indices = {:?} (offset={offset} from raw {:?})",
             config.dflash_capture_layers,
@@ -130,9 +406,14 @@ pub fn build_model(
     // "use global num_kv_heads/head_dim for all layers" (backward compatible).
     config.kv_layer_dims = loader.kv_layer_dims(&config);
 
+    crate::weight_loader::transform_cache::configure_construction_mode(use_speculative)?;
     let mut layers = loader.load_layers(store, &config, gpu.as_ref(), &attn_layer_dtypes)?;
     let embed = loader.load_embedding(store, &config)?;
     let final_norm = loader.load_final_norm(store, &config, gpu.as_ref())?;
+    let qwen4_final_mixer = loader.load_qwen4_final_mixer(store, &config, gpu.as_ref())?;
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    let qwen4_ple =
+        crate::layers::Qwen4PleLayer::load(store, &config, gpu.as_ref(), max_batch_size)?;
     let lm_head = loader.load_lm_head(store, &config, gpu.as_ref())?;
     let mtp_weights = loader.load_mtp_weights_multi(store, &config, gpu.as_ref())?;
     // Probe dense MTP path for non-MoE models (Qwen3.5/3.6 27B family,
@@ -188,6 +469,51 @@ pub fn build_model(
         Some(q)
     };
 
+    let qwen4_mtp_layout = if use_speculative && config.is_qwen4_exp() {
+        crate::weight_loader::qwen4_mtp::classify_qwen4_mtp_store(store, &config)?
+    } else {
+        None
+    };
+    let qwen4_mtp_proposer: Option<Arc<dyn crate::speculative::DraftProposer>> =
+        if let Some(mtp_layout) = qwen4_mtp_layout {
+            tracing::info!(
+                layout = ?mtp_layout,
+                "Qwen4 native MTP schema admitted for direct proposer construction"
+            );
+            let mtp_config = crate::weight_loader::qwen4_mtp_config(&config);
+            let mtp_layer = crate::weight_loader::load_qwen4_mtp_layer(
+                store,
+                &config,
+                gpu.as_ref(),
+                KvCacheDtype::Bf16,
+            )?;
+            let mtp_final_mixer = loader
+                .load_qwen4_final_mixer(store, &mtp_config, gpu.as_ref())?
+                .context("Qwen4 MTP checkpoint is missing its final hyperconnection mixer")?;
+            let shared_lm_head =
+                lm_head_nvfp4.context("Qwen4 native MTP requires the target NVFP4 LM head")?;
+            Some(Arc::new(crate::layers::Qwen4MtpHead::new(
+                store,
+                &config,
+                mtp_layer,
+                mtp_final_mixer,
+                embed,
+                shared_lm_head,
+                gpu.as_ref(),
+                mtp_vocab_size,
+                max_seq_len,
+                max_batch_size,
+            )?))
+        } else {
+            None
+        };
+    if config.is_qwen4_exp() {
+        // Qwen4's native MTP layer, final mixer, and packed BF16 expert bank
+        // are constructed after the target layers. Publish only once every
+        // selected transform has succeeded; an error leaves no cache index.
+        crate::weight_loader::transform_cache::finish();
+    }
+
     // ── Step 3b: Post-load MoE prefill transpose (MiniMax EP=2 TTFT fix) ──
     //
     // MiniMax M2.7-NVFP4 EP=2 has ~46 GB free at layer-0 load time but
@@ -197,6 +523,7 @@ pub fn build_model(
     // gemma4) still call `transpose_for_prefill` inline during layer
     // construction; this default-no-op hook doesn't perturb them.
     maybe_run_minimax_m2_moe_transpose(&config, gpu.as_ref(), &mut layers)?;
+    maybe_setup_qwen4_stream_t(&config, gpu.as_ref(), &mut layers)?;
     // ── Step 4: Create buffer arena ──
     let buffers = BufferArena::new(
         &config,
@@ -409,15 +736,56 @@ pub fn build_model(
     // Capture pointers for any post-construction sharing (DFlash drafter
     // shares embed_tokens + lm_head with the target). DenseWeight is Copy
     // so this clones the device pointer cheaply.
-    let target_embed_for_dflash = embed.weight;
-    let target_lm_head_for_dflash = lm_head.weight;
-    let target_hidden_for_dflash = config.hidden_size;
+    let (target_embed_for_dflash, target_lm_head_for_dflash) = if let Some(args) =
+        dflash_args.as_ref()
+        && let Some(donor) = args.donor_store
+    {
+        let hidden = args.drafter_config.hidden_size;
+        let vocab = args.drafter_config.vocab_size;
+        let embed = donor_tensor(
+            donor,
+            &[
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "embed_tokens.weight",
+            ],
+            &[vocab, hidden],
+            "embedding",
+        )?;
+        let lm_head = donor_tensor(
+            donor,
+            &["lm_head.weight", "model.lm_head.weight"],
+            &[vocab, hidden],
+            "lm_head",
+        )?;
+        (embed.ptr, lm_head.ptr)
+    } else {
+        (embed.weight, lm_head.weight)
+    };
+    // DFlash trains against the target model's exposed intermediate states.
+    // Qwen4 exposes the full four-stream hyperconnection row (4H); ordinary
+    // targets have residual_width()==hidden_size, preserving their ABI.
+    let target_hidden_for_dflash = if config.dflash_capture_width > 0 {
+        config.dflash_capture_width
+    } else {
+        config.residual_width()
+    };
     // Honor --mtp-vocab for the DFlash drafter lm_head, mirroring the MTP
     // head: drafts only need argmax over the high-frequency vocab prefix,
     // and the full 248k-row lm_head GEMM at M=γ+1 dominates the propose
     // tail (~32ms of 67ms propose at ctx≈390, DFLASH_KP 2026-06-11).
     // mtp_vocab_size=0 means uncapped.
-    let target_vocab_for_dflash = if mtp_vocab_size > 0 {
+    let native_dflash2_selector_vocab = dflash_args
+        .as_ref()
+        .filter(|args| {
+            is_native_qwen38_flash_next_drafter(&config, &args.drafter_config)
+                && args.drafter_config.is_dflash2()
+        })
+        .map(|args| resolve_native_dflash2_proposal_vocab(&args.drafter_config, mtp_vocab_size))
+        .transpose()?;
+    let target_vocab_for_dflash = if let Some(selector_vocab) = native_dflash2_selector_vocab {
+        selector_vocab
+    } else if mtp_vocab_size > 0 {
         (mtp_vocab_size as usize).min(config.vocab_size)
     } else {
         config.vocab_size
@@ -427,6 +795,9 @@ pub fn build_model(
         config,
         embed,
         final_norm,
+        qwen4_final_mixer,
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        qwen4_ple,
         lm_head,
         lm_head_nvfp4,
         layers,
@@ -434,6 +805,7 @@ pub fn build_model(
         kv_cache,
         mtp_weights,
         mtp_dense_weights,
+        qwen4_mtp_proposer,
         gpu,
         max_seq_len,
         max_batch_size,
@@ -448,6 +820,8 @@ pub fn build_model(
         ssm_cache_slots,
         ssm_checkpoint_interval,
     )?;
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    model.initialize_qwen4_ple_prefill(max_batch_tokens)?;
 
     // ── Step 7: DFlash drafter (optional, post-construction) ──
     //
@@ -485,7 +859,9 @@ pub fn build_model(
         // drafter's propose lm_head fast path (gated at the call site by
         // ATLAS_DFLASH_LM_HEAD_NVFP4=1). Same device allocation — the
         // drafter reads the --mtp-vocab column prefix via ldb.
-        if let Some((t, ldb)) = model.dflash_lm_head_t() {
+        if args.donor_store.is_none()
+            && let Some((t, ldb)) = model.dflash_lm_head_t()
+        {
             head.lm_head_shared_t = Some(t);
             head.lm_head_shared_t_ldb = ldb;
         }
@@ -494,4 +870,187 @@ pub fn build_model(
     }
 
     Ok(Box::new(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Qwen4DflashPairing, classify_qwen4_dflash_pairing, is_native_qwen38_flash_next_drafter,
+        is_qwen38_flash_next_target_vocab, remap_capture_depths,
+        resolve_native_dflash2_proposal_vocab, validate_native_qwen4_dflash_width,
+    };
+    use atlas_core::config::ModelConfig;
+
+    fn flash_next_target() -> ModelConfig {
+        let mut target = ModelConfig::qwen3_next_80b_nvfp4();
+        target.model_type = "qwen4_exp".to_string();
+        target.hidden_size = 2560;
+        target.hc_count = 4;
+        target.vocab_size = 248_320;
+        target.num_hidden_layers = 48;
+        target
+    }
+
+    fn native_v3_json(block_size: usize) -> String {
+        format!(
+            r#"{{
+                "architectures":["DFlashDraftModel"],
+                "model_type":"qwen3",
+                "hidden_size":2560,
+                "num_hidden_layers":6,
+                "num_target_layers":48,
+                "intermediate_size":8704,
+                "num_attention_heads":20,
+                "num_key_value_heads":4,
+                "head_dim":128,
+                "vocab_size":248320,
+                "block_size":{block_size},
+                "tie_word_embeddings":false,
+                "is_causal":false,
+                "dflash_config":{{
+                    "block_size":{block_size},
+                    "mask_token_id":248077,
+                    "target_layer_ids":[1,7,13,20,26,33,39,46]
+                }}
+            }}"#
+        )
+    }
+
+    fn native_dflash2_json() -> &'static str {
+        r#"{
+            "architectures":["DFlash2DraftModel"],
+            "model_type":"qwen3",
+            "hidden_size":2560,
+            "num_hidden_layers":6,
+            "num_target_layers":48,
+            "intermediate_size":8704,
+            "num_attention_heads":20,
+            "num_key_value_heads":4,
+            "head_dim":128,
+            "vocab_size":248320,
+            "block_size":16,
+            "tie_word_embeddings":false,
+            "is_causal":false,
+            "layer_types":[
+                "sliding_attention","sliding_attention","sliding_attention",
+                "sliding_attention","sliding_attention","full_attention"
+            ],
+            "sliding_window":4096,
+            "dflash_config":{
+                "block_size":16,
+                "mask_token_id":248077,
+                "target_layer_ids":[1,7,13,20,26,33,39,46],
+                "conv_kernel_size":2,
+                "conv_group_size":16,
+                "selector_rank":256,
+                "selector_top_k":16,
+                "selector_vocab_size":248077
+            }
+        }"#
+    }
+
+    #[test]
+    fn remaps_dense_qwen38_capture_depths_to_flash_next() {
+        let mapped =
+            remap_capture_depths(&[1, 10, 18, 27, 35, 44, 52, 61], 64, 48).expect("valid bridge");
+        assert_eq!(mapped, [1, 7, 13, 20, 26, 33, 39, 46]);
+    }
+
+    #[test]
+    fn rejects_capture_outside_donor_depth() {
+        assert!(remap_capture_depths(&[64], 64, 48).is_err());
+    }
+
+    #[test]
+    fn native_qwen4_dflash_requires_no_donor() {
+        assert_eq!(
+            classify_qwen4_dflash_pairing(true, false).unwrap(),
+            Qwen4DflashPairing::Native
+        );
+        assert!(classify_qwen4_dflash_pairing(true, true).is_err());
+    }
+
+    #[test]
+    fn dense_qwen4_dflash_requires_donor() {
+        assert_eq!(
+            classify_qwen4_dflash_pairing(false, true).unwrap(),
+            Qwen4DflashPairing::DenseDonorBridge
+        );
+        assert!(classify_qwen4_dflash_pairing(false, false).is_err());
+    }
+
+    #[test]
+    fn native_qwen38_geometry_is_exact() {
+        let target = flash_next_target();
+        let mut drafter =
+            crate::weight_loader::dflash_loader::parse_dflash_config(&native_v3_json(16))
+                .expect("valid native drafter fixture");
+
+        assert!(is_native_qwen38_flash_next_drafter(&target, &drafter));
+        assert!(validate_native_qwen4_dflash_width(&drafter, None).is_ok());
+        assert!(validate_native_qwen4_dflash_width(&drafter, Some(15)).is_ok());
+        assert!(validate_native_qwen4_dflash_width(&drafter, Some(14)).is_err());
+        drafter.dflash_config.as_mut().unwrap().target_layer_ids[1] = 8;
+        assert!(!is_native_qwen38_flash_next_drafter(&target, &drafter));
+    }
+
+    #[test]
+    fn native_qwen38_accepts_only_physical_or_canonical_logical_target_vocab() {
+        assert!(is_qwen38_flash_next_target_vocab(248_320));
+        assert!(is_qwen38_flash_next_target_vocab(248_077));
+        assert!(!is_qwen38_flash_next_target_vocab(248_076));
+        assert!(!is_qwen38_flash_next_target_vocab(248_319));
+
+        let drafter =
+            crate::weight_loader::dflash_loader::parse_dflash_config(native_dflash2_json())
+                .expect("valid native DFlash2 fixture");
+        let mut target = flash_next_target();
+        target.vocab_size = 248_077;
+        assert!(is_native_qwen38_flash_next_drafter(&target, &drafter));
+        target.vocab_size = 248_076;
+        assert!(!is_native_qwen38_flash_next_drafter(&target, &drafter));
+    }
+
+    #[test]
+    fn native_qwen38_rejects_b32_even_with_matching_gamma() {
+        let target = flash_next_target();
+        assert!(
+            crate::weight_loader::dflash_loader::parse_dflash_config(&native_v3_json(32)).is_err()
+        );
+        let mut drafter =
+            crate::weight_loader::dflash_loader::parse_dflash_config(&native_v3_json(16))
+                .expect("valid B16 fixture");
+        drafter.block_size = 32;
+        drafter.dflash_config.as_mut().unwrap().block_size = Some(32);
+
+        assert!(!is_native_qwen38_flash_next_drafter(&target, &drafter));
+        assert!(validate_native_qwen4_dflash_width(&drafter, None).is_err());
+        assert!(validate_native_qwen4_dflash_width(&drafter, Some(31)).is_err());
+        assert!(validate_native_qwen4_dflash_width(&drafter, Some(15)).is_err());
+    }
+
+    #[test]
+    fn native_qwen38_dflash2_geometry_and_logical_vocab_are_exact() {
+        let target = flash_next_target();
+        let mut drafter =
+            crate::weight_loader::dflash_loader::parse_dflash_config(native_dflash2_json())
+                .expect("valid native DFlash2 fixture");
+
+        assert!(is_native_qwen38_flash_next_drafter(&target, &drafter));
+        assert!(validate_native_qwen4_dflash_width(&drafter, None).is_ok());
+        assert_eq!(
+            resolve_native_dflash2_proposal_vocab(&drafter, 0).unwrap(),
+            248_077
+        );
+        assert_eq!(
+            resolve_native_dflash2_proposal_vocab(&drafter, 248_077).unwrap(),
+            248_077
+        );
+        assert!(resolve_native_dflash2_proposal_vocab(&drafter, 100_000).is_err());
+        assert!(resolve_native_dflash2_proposal_vocab(&drafter, 248_320).is_err());
+
+        drafter.dflash_config.as_mut().unwrap().selector_vocab_size = Some(248_320);
+        assert!(!is_native_qwen38_flash_next_drafter(&target, &drafter));
+        assert!(resolve_native_dflash2_proposal_vocab(&drafter, 0).is_err());
+    }
 }

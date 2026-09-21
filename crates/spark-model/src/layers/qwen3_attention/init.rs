@@ -106,11 +106,24 @@ impl Qwen3AttentionLayer {
                 config.rotary_dim()
             );
         }
+        let qwen4_yarn_inv_freq = if config.is_qwen4_exp() && config.yarn_factor > 0.0 {
+            crate::layers::qwen4_qsa::compute_yarn_inv_freq(config, config.rotary_dim(), gpu)?
+        } else {
+            spark_runtime::gpu::DevicePtr::NULL
+        };
+        let qwen4_yarn_attention_factor = if config.yarn_factor > 0.0 {
+            1.0 + 0.1 * config.yarn_factor.ln()
+        } else {
+            1.0
+        };
         Ok(Self {
             input_norm,
             attn,
             post_attn_norm,
             ffn,
+            qwen4_attn_hyper: None,
+            qwen4_mlp_hyper: None,
+            qwen4_qsa: None,
             attn_layer_idx,
             gated,
             mrope_interleaved,
@@ -272,6 +285,9 @@ impl Qwen3AttentionLayer {
             },
             rope_strided_b3_k: super::super::try_kernel(gpu, "rope", "rope_forward_strided_b3"),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
+            rope_yarn_scaled_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn_scaled"),
+            qwen4_yarn_inv_freq,
+            qwen4_yarn_attention_factor,
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
             wht_bf16_k: super::super::try_kernel(gpu, "wht_bf16", "wht_bf16_inplace"),
