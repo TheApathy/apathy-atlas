@@ -106,8 +106,12 @@ fn shift_tab_walks_the_same_rows_backwards() {
         tap(&mut a, KeyCode::BackTab);
         assert_eq!(at(&a), expected);
     }
+    // Re-derived for the bench cut. Upstream's loop above ended one row
+    // further back, on `Benchmarks/History`, so a forward ⇥ from there landed
+    // on `Terminal/Ops`. With that row gone the loop ends ON `Terminal/Ops`,
+    // and ⇥ undoes the last ⇧⇥ by stepping forward to `Terminal/Chat`.
     tap(&mut a, KeyCode::Tab);
-    assert_eq!(at(&a), "Terminal/Ops", "and ⇥ undoes ⇧⇥");
+    assert_eq!(at(&a), "Terminal/Chat", "and ⇥ undoes ⇧⇥");
 }
 
 #[test]

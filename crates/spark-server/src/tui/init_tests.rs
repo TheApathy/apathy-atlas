@@ -110,7 +110,10 @@ fn the_tee_path_follows_its_environment_override_when_one_is_set() {
             assert!(
                 p.parent()
                     .expect("a parent")
-                    .ends_with(".cache/avarok/logs"),
+                    // OURS to name, unlike the Prometheus metric keys and the
+                    // GitHub URLs, which had to keep the upstream spelling
+                    // because something external matches on them.
+                    .ends_with(".cache/atlas/logs"),
                 "{}",
                 p.display()
             );

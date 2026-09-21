@@ -27,6 +27,10 @@
 /// it — `kv-cache-dtype`, not `--kv-cache-dtype`.
 pub(crate) fn options_for_flag(long: &str) -> Option<Vec<String>> {
     match long {
+        // Dispatched in `main_modules::serve` with a bail on anything else —
+        // AFTER the weight load. Listing it here moves the typo diagnosis to
+        // the Library form, where it costs milliseconds instead of minutes.
+        "scheduling-policy" => Some(vec!["fifo".to_string(), "slai".to_string()]),
         "kv-cache-dtype" => Some(
             spark_runtime::kv_cache::KvCacheDtype::ALL
                 .iter()

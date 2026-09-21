@@ -96,13 +96,20 @@ fn clicking_a_subsection_row_selects_that_subsection() {
 fn the_rows_below_shift_with_whichever_section_is_expanded() {
     // The subsections move with the selection, so the arithmetic has to be
     // re-derived from the ACTIVE section rather than assumed about Main.
+    // Y COORDINATES RE-DERIVED FOR THE BENCH CUT, by measuring what each row
+    // actually resolves to rather than by arithmetic: the sidebar EXPANDS the
+    // active section, so the offsets differ between "Main active" and
+    // "Terminal active" and cannot be read off the section list alone.
+    // Upstream's (10, 10, 9, 6) becomes (9, 9, 8, 6) — Benchmarks sat directly
+    // above Terminal, so only the Terminal rows move, and `Library` above it
+    // is unshifted, which is exactly what the last assertion is here to prove.
     let mut a = app();
-    click(&mut a, 2, 10, WIDE); // Terminal, now the expanded one
+    click(&mut a, 2, 9, WIDE); // Terminal, now the expanded one
     assert_eq!(at(&a), "Terminal/Ops");
     // Its rows are now the last two, and every section above is unshifted.
-    click(&mut a, 2, 10, WIDE);
-    assert_eq!(at(&a), "Terminal/Chat", "└ Chat");
     click(&mut a, 2, 9, WIDE);
+    assert_eq!(at(&a), "Terminal/Chat", "└ Chat");
+    click(&mut a, 2, 8, WIDE);
     assert_eq!(at(&a), "Terminal/Ops", "├ Ops");
     click(&mut a, 2, 6, WIDE);
     assert_eq!(at(&a), "Library");

@@ -236,12 +236,10 @@ impl Recipe {
         // the same fact. If a second subcommand is ever added, this line stops
         // compiling and the guard comes back with it.
         let crate::cli::Command::Serve(args) = cli.command;
-        // No `cli::validate_serve_args` on this engine: upstream validates the
-        // parsed argv a second time for cross-flag constraints clap cannot
-        // express. Clap's own parse above is the only validation here, so a
-        // recipe with an internally inconsistent flag pair is caught at serve
-        // time rather than at recipe load. Worth closing when that validator
-        // is ported; not worth inventing a second, different rule set now.
+        // Enumerated-value check. Narrower than upstream's validator, which
+        // also covers cross-flag constraints — those are still caught only at
+        // serve time here.
+        crate::cli::validate_serve_args(&args).map_err(|e| anyhow::anyhow!("{}: {e}", self.id))?;
         Ok(args)
     }
 }

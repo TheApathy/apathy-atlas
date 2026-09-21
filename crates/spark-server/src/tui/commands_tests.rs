@@ -106,6 +106,12 @@ fn the_watchdog_needs_on_or_off_and_says_so() {
 #[test]
 fn status_says_so_when_the_scheduler_has_not_published_yet() {
     // The counters are process-wide and always available; the snapshot is not.
+    //
+    // The snapshot is a PROCESS GLOBAL (Ruling B), so this must serialise
+    // against every other test that publishes into it and start from a known
+    // empty cell — otherwise it passes or fails by test ORDER.
+    let _serial = crate::scheduler::snapshot::TEST_SERIAL.lock();
+    crate::scheduler::snapshot::reset_for_test();
     let mut a = app();
     execute("/status", &mut a);
     let printed = out(&a);

@@ -7,6 +7,68 @@
 #[path = "cli_flag_values.rs"]
 pub(crate) mod flag_values;
 
+/// Refuse a value outside an enumerated flag's closed set.
+///
+/// Upstream runs a much larger `validate_serve_args` over the parsed argv for
+/// cross-flag constraints clap cannot express. This is the enum half only, and
+/// it exists because the alternative is worse than no check: `--scheduling-policy`
+/// is dispatched with a bail AFTER the multi-minute weight load, so a typo cost
+/// the whole load before saying anything. The Library form calls this through
+/// `Recipe::serve_args`, so a bad value is refused while it is still being typed.
+///
+/// Every problem is reported, not just the first: an operator fixing one typo
+/// and hitting the same wall again learns nothing the first message could not
+/// have told them.
+pub(crate) fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
+    let checks: [(&str, &str); 2] = [
+        ("scheduling-policy", args.scheduling_policy.as_str()),
+        ("kv-cache-dtype", args.kv_cache_dtype.as_str()),
+    ];
+    let mut problems = Vec::new();
+    for (flag, value) in checks {
+        let Some(allowed) = flag_values::options_for_flag(flag) else {
+            continue;
+        };
+        if !allowed.iter().any(|a| a == value) {
+            problems.push(format!(
+                "--{flag} {value:?} is not one of: {}",
+                allowed.join(", ")
+            ));
+        }
+    }
+    // ── Ranges ──
+    // clap parses `--gpu-memory-utilization 9.0` happily: it is a valid f64.
+    // The number is a FRACTION, so anything above 1.0 asks for more memory
+    // than the device has and fails during allocation, minutes in.
+    if !(0.0..=1.0).contains(&args.gpu_memory_utilization) {
+        problems.push(format!(
+            "--gpu-memory-utilization {} is a fraction of device memory; it must be in 0.0..=1.0",
+            args.gpu_memory_utilization
+        ));
+    }
+
+    // ── Cross-flag ──
+    // The pair, not the field: `--num-drafts` past 1 asks the scheduler to
+    // verify drafts that nothing produces unless a speculative method is on.
+    // A per-field check cannot see this, which is the whole reason the form
+    // validates the WHOLE config after every edit rather than the one row.
+    let any_speculative =
+        args.speculative || args.self_speculative || args.ngram_speculative || args.dflash;
+    if args.num_drafts > 1 && !any_speculative {
+        problems.push(format!(
+            "--num-drafts {} needs a speculative method: pass one of --speculative, \
+             --self-speculative, --ngram-speculative or --dflash",
+            args.num_drafts
+        ));
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
 use clap::Parser;
 
 /// The crate version, exposed under a name the dashboard can reference.

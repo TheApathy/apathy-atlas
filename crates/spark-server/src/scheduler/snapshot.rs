@@ -59,12 +59,31 @@ pub fn read() -> Option<SchedulerSnapshot> {
     *SNAP.lock()
 }
 
+/// Serialises tests that read or write the PROCESS-GLOBAL snapshot.
+///
+/// RULING B keeps this global rather than carrying upstream's per-instance
+/// `SnapshotCell`, and this is the cost: every test in the binary shares one
+/// cell, so a test asserting "nothing published yet" raced any other test that
+/// published. It failed by ORDER, which is the worst kind of flake — green
+/// alone, red in a full run, and blaming whichever change happened to be in
+/// flight. Take this lock and call `reset_for_test` in anything that touches it.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Put the global back to "never published". Test-only.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    *SNAP.lock() = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn publish_read_roundtrip() {
+        // Same global, same lock — see `TEST_SERIAL`.
+        let _serial = TEST_SERIAL.lock();
         let s = SchedulerSnapshot {
             active_seqs: 3,
             prefilling_seqs: 1,
