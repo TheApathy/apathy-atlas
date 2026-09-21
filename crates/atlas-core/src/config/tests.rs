@@ -739,3 +739,389 @@ fn test_parse_nllb_rejects_missing_required_dimension() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// DeepSeek-V4.1-Flash-Next (S0: the real, nested checkpoint config must parse)
+// ---------------------------------------------------------------------------------------
+
+/// The ACTUAL config.json shipped with
+/// `/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K`, embedded verbatim.
+/// Embedded rather than `include_str!`'d so the test does not depend on a machine path,
+/// and verbatim rather than hand-written so it is a regression against what we really load.
+const DEEPSEEK_V41_REAL_CONFIG: &str = r##"{
+  "architectures": [
+    "DeepseekV41ForCausalLM"
+  ],
+  "model_type": "deepseek_v41",
+  "dtype": "bfloat16",
+  "transformers_version": "5.6.0",
+  "bos_token_id": 0,
+  "eos_token_id": 1,
+  "pad_token_id": 2,
+  "image_token_id": 129264,
+  "quantization_config": {
+    "quant_method": "fp8",
+    "activation_scheme": "dynamic",
+    "weight_block_size": [
+      32,
+      32
+    ],
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4"
+  },
+  "text_config": {
+    "model_type": "deepseek_v41_text",
+    "vocab_size": 129280,
+    "hidden_size": 5120,
+    "moe_intermediate_size": 2304,
+    "num_hidden_layers": 40,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 1,
+    "head_dim": 512,
+    "qk_rope_head_dim": 64,
+    "q_lora_rank": 1280,
+    "o_lora_rank": 1024,
+    "o_groups": 8,
+    "hidden_act": "silu",
+    "swiglu_limit": 10.0,
+    "rms_norm_eps": 1e-20,
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "initializer_range": 0.02,
+    "use_cache": true,
+    "tie_word_embeddings": false,
+    "max_position_embeddings": 1048576,
+    "rope_theta": 10000,
+    "rope_scaling": {
+      "rope_type": "yarn",
+      "factor": 16,
+      "beta_fast": 32,
+      "beta_slow": 1,
+      "original_max_position_embeddings": 65536
+    },
+    "n_routed_experts": 384,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 6,
+    "scoring_func": "sqrtsoftplus",
+    "topk_method": "noaux_tc",
+    "norm_topk_prob": true,
+    "routed_scaling_factor": 1.5,
+    "sliding_window": 128,
+    "compress_ratios": [
+      0,
+      0,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0
+    ],
+    "compress_rope_theta": 160000,
+    "kv_source_layer_ids": [
+      2,
+      8,
+      14,
+      20
+    ],
+    "index_source_layer_ids": [
+      2,
+      8,
+      14,
+      20,
+      24,
+      28,
+      32,
+      36
+    ],
+    "index_n_heads": 32,
+    "index_head_dim": 128,
+    "index_topk": 512,
+    "candidate_source_layer_id": 20,
+    "candidate_topk_blocks": 2048,
+    "candidate_block_size": 8,
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "hc_eps": 1e-06,
+    "engram_layer_ids": [
+      1,
+      14
+    ],
+    "engram_num_embeddings": [
+      384006168,
+      384016682
+    ],
+    "engram_max_ngram_size": 4,
+    "engram_vocab_size": 16000000,
+    "engram_n_heads": 8,
+    "engram_head_dim": 256,
+    "engram_pad_token_id": 2,
+    "engram_compressed_vocab_size": 99092,
+    "num_nextn_predict_layers": 3,
+    "dspark_block_size": 5,
+    "dspark_noise_token_id": 128799,
+    "dspark_target_layer_ids": [
+      37,
+      38,
+      39
+    ],
+    "dspark_markov_rank": 256,
+    "dspark_n_routed_experts": 128,
+    "dspark_num_experts_per_tok": 3
+  },
+  "vision_config": {
+    "model_type": "deepseek_v41_vision",
+    "num_hidden_layers": 32,
+    "hidden_size": 1024,
+    "num_attention_heads": 16,
+    "intermediate_size": 2816,
+    "patch_size": 14,
+    "rope_theta": 10000,
+    "downsample_ratio": 3,
+    "max_image_tokens": 1024,
+    "min_pixels": 295936,
+    "max_wh_ratio": null
+  }
+}"##;
+
+#[test]
+fn test_parse_deepseek_v41_real_nested_config() {
+    let cfg = parse_config(DEEPSEEK_V41_REAL_CONFIG)
+        .expect("the shipped DeepSeek-V4.1 config.json must parse");
+
+    // It must NOT be mistaken for the 0731 lane.
+    assert_eq!(cfg.model_type, "deepseek_v41");
+
+    // The shapes that differ from V4-Flash-0731. These are the S0 deliverable: before the
+    // fix, dispatch rejected model_type outright, and aliasing it yielded hidden_size = 0
+    // because the parser read the top level instead of text_config.
+    assert_eq!(cfg.hidden_size, 5120, "hidden_size came from text_config");
+    assert_eq!(cfg.num_hidden_layers, 40);
+    assert_eq!(cfg.num_experts, 384);
+    assert_eq!(cfg.moe_intermediate_size, 2304);
+    assert_eq!(cfg.q_lora_rank, 1280);
+    assert_eq!(cfg.o_lora_rank, 1024);
+    assert_eq!(cfg.num_attention_heads, 64);
+    assert_eq!(cfg.num_key_value_heads, 1);
+    assert_eq!(cfg.vocab_size, 129280);
+
+    // MLA geometry: head_dim is explicit in text_config, so the 4096-only rescue branch
+    // in the shared body must not be needed.
+    assert_eq!(cfg.head_dim, 512);
+    assert_eq!(cfg.qk_rope_head_dim, 64);
+    assert_eq!(cfg.qk_nope_head_dim, 448);
+    assert_eq!(cfg.v_head_dim, 512);
+
+    // Routing.
+    assert_eq!(cfg.scoring_func, "sqrtsoftplus");
+    assert!(cfg.use_routing_bias, "noaux_tc implies the correction bias");
+    assert_eq!(cfg.num_experts_per_tok, 6);
+
+    // V4.1 predicts 3 next tokens where 0731 predicts 1.
+    assert_eq!(cfg.num_mtp_modules, 3);
+
+    // The indexer is admitted under the V4.1 geometry (32 heads, not 0731's 64).
+    let indexer = cfg
+        .deepseek_v4_indexer
+        .as_ref()
+        .expect("V4.1 declares an indexer");
+    assert_eq!(indexer.num_heads, 32);
+    assert_eq!(indexer.head_dim, 128);
+    assert_eq!(indexer.top_k, 512);
+
+    // Vision is deliberately NOT wired: V4.1 nests vision_config with HF-style names and
+    // we do not lift it, so the flat `vision_*` detector correctly finds nothing. If this
+    // ever becomes Some, someone has claimed vision support that does not exist.
+    assert!(
+        cfg.deepseek_vision.is_none(),
+        "V4.1 vision is out of scope for the config port"
+    );
+}
+
+#[test]
+fn test_deepseek_v41_geometry_still_rejected_by_the_v4_flash_lane() {
+    // The point of the variant split is that widening admission for V4.1 must NOT weaken
+    // the guard on the 0731 lane. Feed V4.1's indexer geometry through model_type
+    // "deepseek_v4" and it must still be refused.
+    let json = r#"{
+        "model_type": "deepseek_v4",
+        "hidden_size": 5120,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 64,
+        "head_dim": 512,
+        "q_lora_rank": 1280,
+        "o_lora_rank": 1024,
+        "qk_rope_head_dim": 64,
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "vocab_size": 129280,
+        "rope_theta": 10000
+    }"#;
+    let err = parse_config(json)
+        .expect_err("the V4-Flash lane must not admit V4.1 indexer geometry")
+        .to_string();
+    assert!(
+        err.contains("V4Flash"),
+        "error should name the variant that refused, got: {err}"
+    );
+}
+
+/// Drift guard for `DEEPSEEK_V41_REAL_CONFIG`.
+///
+/// The fixture above is embedded so the suite runs anywhere, but an embedded copy can
+/// silently diverge from the checkpoint we actually load. When the checkpoint is present
+/// on this machine, parse it for real and assert the S0 shapes against it directly. Skips
+/// (rather than fails) when absent, so CI without the 512K checkpoint stays green.
+#[test]
+fn test_deepseek_v41_on_disk_config_matches_embedded_fixture() {
+    const PATH: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/config.json";
+    let Ok(on_disk) = std::fs::read_to_string(PATH) else {
+        eprintln!("skipping: {PATH} not present on this machine");
+        return;
+    };
+
+    let real = parse_config(&on_disk).expect("the on-disk V4.1 config.json must parse");
+    let fixture = parse_config(DEEPSEEK_V41_REAL_CONFIG).expect("embedded fixture must parse");
+
+    // The S0 deliverable, asserted against the real file rather than a copy of it.
+    assert_eq!(real.model_type, "deepseek_v41");
+    assert_eq!(real.num_hidden_layers, 40);
+    assert_eq!(real.hidden_size, 5120);
+    assert_eq!(real.num_experts, 384);
+    assert_eq!(real.moe_intermediate_size, 2304);
+    assert_eq!(real.q_lora_rank, 1280);
+
+    // And the fixture must still describe the same model, or it has drifted.
+    assert_eq!(real.num_hidden_layers, fixture.num_hidden_layers);
+    assert_eq!(real.hidden_size, fixture.hidden_size);
+    assert_eq!(real.num_experts, fixture.num_experts);
+    assert_eq!(real.moe_intermediate_size, fixture.moe_intermediate_size);
+    assert_eq!(real.q_lora_rank, fixture.q_lora_rank);
+    assert_eq!(real.o_lora_rank, fixture.o_lora_rank);
+    assert_eq!(real.vocab_size, fixture.vocab_size);
+    assert_eq!(real.head_dim, fixture.head_dim);
+    assert_eq!(real.num_mtp_modules, fixture.num_mtp_modules);
+}
+
+/// S1 step 1: V4.1's weight keys are NOT prefixed with `model.`.
+///
+/// 0731 nests tensors under `model.`; V4.1 ships bare keys (`layers.0.attn_norm.weight`,
+/// `embed.weight`, `head.weight`, `norm.weight`) — zero of its 3925 index keys start with
+/// "model.". With the 0731 prefix every V4.1 weight lookup misses, which is a silent
+/// load failure rather than an error. 0731's own prefix must not move.
+#[test]
+fn test_deepseek_v41_has_no_model_weight_prefix() {
+    let v41 = parse_config(DEEPSEEK_V41_REAL_CONFIG).expect("V4.1 config must parse");
+    assert_eq!(v41.weight_prefix, "", "V4.1 tensor keys are bare");
+
+    let v4_json = r#"{
+        "model_type": "deepseek_v4", "hidden_size": 4096, "num_hidden_layers": 43,
+        "num_attention_heads": 64, "num_key_value_heads": 1, "head_dim": 512,
+        "q_lora_rank": 1024, "o_lora_rank": 1024, "qk_rope_head_dim": 64,
+        "n_routed_experts": 256, "n_shared_experts": 1, "num_experts_per_tok": 6,
+        "moe_intermediate_size": 2048, "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc", "sliding_window": 128,
+        "max_position_embeddings": 1048576, "rope_theta": 10000,
+        "rms_norm_eps": 1e-06, "vocab_size": 129280, "bos_token_id": 0,
+        "eos_token_id": 1, "tie_word_embeddings": false,
+        "num_nextn_predict_layers": 1
+    }"#;
+    let v4 = parse_config(v4_json).expect("0731 config must parse");
+    assert_eq!(v4.weight_prefix, "model", "0731 prefix must not regress");
+
+    // TRAP FOR S1 STEP 2. Several loaders build keys as `format!("{prefix}.foo")`, which
+    // with an empty prefix yields a LEADING DOT (".layers.0..."). step3p7 handles this
+    // explicitly (weight_loader/step3p7.rs:160, step3p7/load_layers.rs:43) with an
+    // `is_empty()` branch; the V4.1 loader must use the same idiom. This is inert today
+    // only because weight_loader/deepseek_v4/* hardcodes its keys and never reads
+    // weight_prefix — a fact that stops being true the moment step 2 writes a v41 loader.
+    assert!(v41.weight_prefix.is_empty());
+}
+
+/// The five 0731 fast-path arms must be UNABLE to engage under V4.1's geometry.
+///
+/// They are gated on `model_type == "deepseek_v4"` AND on 0731's exact shapes, so they are
+/// already inert for V4.1. This pins the shape half of that claim: if someone ever widens
+/// the model_type half with a blanket rename, these inequalities are what still stops the
+/// arms from firing — and an arm that fires on the wrong geometry reads out of bounds.
+#[test]
+fn test_v41_geometry_cannot_satisfy_the_0731_fast_path_arms() {
+    let cfg = parse_config(DEEPSEEK_V41_REAL_CONFIG).expect("V4.1 config must parse");
+
+    // prefill_hc_rms.rs:177 requires TARGET_LAYERS == 43 && TARGET_HIDDEN == 4096
+    // (constants at prefill_hc_rms.rs:18,15).
+    assert_ne!(
+        cfg.num_hidden_layers, 43,
+        "V4.1 is 40 layers, not 0731's 43"
+    );
+    assert_ne!(
+        cfg.hidden_size, 4096,
+        "V4.1 is hidden 5120, not 0731's 4096"
+    );
+
+    // cache_skip_v4.rs:180/484/560/1503 additionally require nq == 64 && hd_mla == 512
+    // && nope == 448 && rope == 64. V4.1 matches the MLA head geometry, so the LAYER
+    // count above is what actually keeps these off — assert that explicitly rather than
+    // implying the head dims differ, because they do not.
+    assert_eq!(
+        cfg.num_attention_heads, 64,
+        "V4.1 DOES match 0731 head count"
+    );
+    assert_eq!(cfg.head_dim, 512, "V4.1 DOES match 0731 MLA head_dim");
+    assert_eq!(cfg.qk_nope_head_dim, 448);
+    assert_eq!(cfg.qk_rope_head_dim, 64);
+}
+
+/// m2_setup.rs:35 must never admit V4.1.
+///
+/// Being wrong here is MEMORY-UNSAFE, not merely incorrect: the comment at m2_setup.rs:32-34
+/// records that without the fused E8M0 path, `run_routed_grouped_gemm` falls to the
+/// non-transposed NVFP4 fallback, which reads E8M0 `[N, K/32]` scales as NVFP4 `[N, K/16]`
+/// and runs off the end. V4.1's experts are CB3, not NVFP4, so it must not be on the list.
+#[test]
+fn test_v41_is_not_an_nvfp4_unified_moe_layout_model() {
+    let cfg = parse_config(DEEPSEEK_V41_REAL_CONFIG).expect("V4.1 config must parse");
+    for admitted in ["minimax_m2", "step3p7", "deepseek_v4"] {
+        assert_ne!(
+            cfg.model_type, admitted,
+            "V4.1 must not be admitted to the NVFP4/E8M0 unified MoE layout"
+        );
+    }
+}
