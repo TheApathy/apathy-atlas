@@ -1,4 +1,4 @@
-# CB3 expert pack — the bit-level format, and the one thing still unsettled
+# CB3 expert pack — the bit-level format, K-order now SETTLED
 
 Derived from the shipped pack (`k154-cb3/layers/layer-NN.safetensors`, layout
 `cb3-v2`) and cross-checked against the PTX the Python prefill path runs
@@ -61,3 +61,52 @@ ordering either reproduces the bytes or does not.
 `make_gemm_fixture.py` builds a float64 reference from the real pack and is
 correct up to that ordering; it is deliberately NOT presented as ground truth
 for a GEMM until the capture exists.
+
+## SETTLED 2026-09-21: the K-order, empirically
+
+The section above said this could not be settled by reading, and that was right
+about the FORMAT — but the tree already contained the answer in code:
+`dsv41-prefill-work/tools/cb3.py`. Two things the format notes above missed:
+
+1. **K is blocked.** `block_plan(K)` splits a row into 512-weight blocks, with a
+   256 tail where 512 does not divide: K = 5120 (w1/w3) -> 10x512 + 0; K = 2304
+   (w2) -> 4x512 + 1x256. The 256 tail exists so w2's hi tile is not 32 B wide
+   for the whole row, which would cap the kernel near 100 GB/s.
+
+2. **`_v2_fields(block_w)` is the mapping**, and it is unambiguous. Within one
+   block, for scale-group `g` (0..block_w/32) and sub-position `r` (0..1):
+
+       K index  = g*32 + lane*2 + r         (lane 0..15)
+       lo byte  = g // 2,  lo_shift = 4*(g%2) + 2*r
+       hi byte  = (g//2) // 2,  hi_bit = ((g//2)%2)*4 + (g%2)*2 + r
+
+   This also explains this decoder's four PTX specialisations
+   `(sh,hb) = (0,0) (4,2) (0,4) (4,6)`: they are exactly the `r = 0` cases, each
+   call covering its `r = 1` partner as the odd nibble. 4 x 2 = the 8 combinations.
+
+### The measurement, with its negative control
+
+Shipped Triton kernel (`moe_forward_v2`) vs a float64 CPU reference built from
+`dequant_cb3_v2`, one expert from the real `layer-00.safetensors`, 4 tokens:
+
+| ordering | rel_l2 | cosine |
+|---|---|---|
+| TRUE (`unpack_cb3_v2`) | **2.32e-03** | **+0.999997** |
+| `r` sub-position swapped (xor 1) | 1.35e+00 | +0.088 |
+| field-major <-> byte-major in block | 1.35e+00 | +0.094 |
+| random permutation of K | 1.33e+00 | +0.120 |
+
+2.32e-03 is bf16 rounding (the kernel accumulates fp32 from bf16 activations),
+not a permutation. The three controls are permutations of the SAME multiset, so
+each is "finite, correctly-shaped and meaningless" — the exact failure this file
+warned about — and the two the file named as genuinely ambiguous (the r-swap and
+the byte-major reading) both fail by ~580x. **The check has been watched FAIL**,
+which is what makes the agreement evidence rather than a gate that cannot fail.
+
+Captured reference for the Rust/CUDA decoder to validate against:
+`korder_ref_W1.npy` (dequantized [16, 256] bf16->f32) with the exact input
+planes beside it (`korder_ref_planes_{lo,hi,cb,s}.npy`). Reproduce with
+`korder_capture.py`; re-run `korder_control.py` before trusting any change.
+
+STILL OPEN for the Rust lane, and neither is implied by this: the MoE GEMM, and
+GPU residency for the 83 GB K154 pack.
