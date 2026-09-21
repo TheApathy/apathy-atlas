@@ -12,7 +12,7 @@ use spark_runtime::weights::WeightStore;
 
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::{
-    DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
+    DeepSeekV41WeightLoader, DeepSeekV4WeightLoader, DflashConfig, Gemma4WeightLoader, LagunaWeightLoader,
     MinimaxM2WeightLoader, ModelWeightLoader, NemotronHWeightLoader, NllbWeightLoader,
     Qwen3VLWeightLoader, Qwen3WeightLoader, Qwen35DenseWeightLoader, Qwen35WeightLoader,
     Step3p7WeightLoader,
@@ -117,9 +117,16 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "laguna" => Ok(Box::new(LagunaWeightLoader)),
         // DeepSeek-V4 family (Flash) — MLA + MoE + CSA/HCA hybrid attention + mHC.
         "deepseek_v4" => Ok(Box::new(DeepSeekV4WeightLoader)),
+        // DeepSeek-V4.1-Flash-Next — a DIFFERENT release from the line above, and it gets
+        // its own loader rather than sharing one. 0731's experts are EXL3 2-bit; V4.1's are
+        // CB3 3-bit. Routing V4.1 to DeepSeekV4WeightLoader would not fail here, it would
+        // fail far downstream, or decode EXL3 over CB3 bytes into plausible garbage.
+        // DeepSeekV41WeightLoader is an honest hard stop at the seam: it implements the
+        // weight-key join and refuses everything that needs CB3 kernels or GPU residency.
+        "deepseek_v41" => Ok(Box::new(DeepSeekV41WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, m2m_100",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, holo3_1_moe, qwen3_vl_moe, nemotron_h, nemotron_h_puzzle, gemma4, mistral, minimax_m2, step3p7, laguna, deepseek_v4, deepseek_v41, m2m_100",
             config.model_type,
             normalized,
         ),
@@ -130,6 +137,10 @@ mod build;
 pub mod kv_cap;
 mod lm_head_setup;
 mod m2_setup;
+pub mod vision_admission;
+pub mod vision_kv;
+pub mod vision_speculation;
+mod vision_speculation_loaded;
 
 pub use build::build_model;
 

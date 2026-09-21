@@ -18,6 +18,7 @@
 // `deepseek_v4::dspark` against the real drafter shards before the in-server
 // proposer exists (docs/dspark_port.md).
 pub mod deepseek_v4;
+pub mod deepseek_v41;
 pub mod dflash_loader;
 mod gemma4;
 mod laguna;
@@ -31,6 +32,7 @@ mod qwen3_vl;
 mod step3p7;
 
 pub use deepseek_v4::DeepSeekV4WeightLoader;
+pub use deepseek_v41::DeepSeekV41WeightLoader;
 pub use dflash_loader::{
     DflashConfig, DflashLayerWeights, DflashSubConfig, DflashWeights, load_dflash_weights,
     store_has_dflash_weights, store_has_laguna_dflash_weights,
