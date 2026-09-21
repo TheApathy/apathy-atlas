@@ -305,6 +305,12 @@ pub struct Qwen3AttentionLayer {
     /// Byte-exact 128x128-tile shadow of `w4a16_gemm` for large-M prefill
     /// (`ATLAS_PREFILL_PROJ_PIPE_M128=1`). Handle 0 = not in this bundle.
     pub(super) w4a16_gemm_pipe_m128n128_k: KernelHandle,
+    /// NVFP4 -> BF16 weight materialisation for the cuBLASLt attention route.
+    pub(super) dequant_nvfp4_to_bf16_k: KernelHandle,
+    /// Lazily materialised BF16 copies of this layer's NVFP4 projection
+    /// weights, keyed by the packed-weight device pointer (QKV and O are
+    /// distinct weights within a layer). ~189 MiB per layer at production size.
+    pub(super) bf16_weight_cache: std::sync::Mutex<std::collections::HashMap<u64, DevicePtr>>,
     /// 8-warp 128x128 bit-identical shadows of the FP8-MMA transposed GEMMs.
     pub(super) w4a16_gemm_t_w8_k: KernelHandle,
     pub(super) fp8_gemm_t_w8_k: KernelHandle,

@@ -1190,6 +1190,23 @@ pub fn gdn_prefill_gatecache_v2_enabled() -> bool {
     *GATE.get_or_init(|| std::env::var("ATLAS_GDN_PREFILL_GATECACHE_V2").ok().as_deref() == Some("1"))
 }
 
+/// `ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1`: use the K-split (R3) variant of the
+/// WY32 gate-cache GDN prefill kernel -- 512 threads as 4 j-groups x 128 V
+/// columns, state register-resident (requires GATECACHE=1; fails closed if the
+/// symbol is missing).
+///
+/// NOT BIT-EXACT. The two dot products over j are reassociated: each j-group
+/// sums its own 32 terms and the four partials fold in ascending group order,
+/// instead of one sequential FP32 sum over j = 0..127. Harness receipts
+/// (bench/gdn/gdn_r3.txt): 0.0198% of output words differ, 95% of those by
+/// 1 ulp, output relative L2 3.2e-05, state relative L2 4.4e-08.
+pub fn gdn_prefill_gatecache_ksplit_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("ATLAS_GDN_PREFILL_GATECACHE_KSPLIT").ok().as_deref() == Some("1")
+    })
+}
+
 /// `ATLAS_SSM_RESET_ASYNC=1`: per-request SSM slot reset uses stream-ordered,
 /// per-region memsets + one sync instead of ~2000 synchronous memsets.
 pub fn ssm_reset_async_enabled() -> bool {
@@ -1222,6 +1239,35 @@ pub(crate) const fn prefill_fp8_w8_route(requested: bool, m: u32, n: u32, k: u32
         return PrefillProjectionPipeRoute::Ineligible;
     }
     if has_kernel { PrefillProjectionPipeRoute::Complete } else { PrefillProjectionPipeRoute::Missing }
+}
+
+/// `ATLAS_ATTN_PROJ_CUBLASLT=1`: route the attention Q/K/V/O prefill
+/// projections through cuBLASLt's BF16 GEMM.
+///
+/// `w4a16_gemm_pipe_m128n128` dequantises NVFP4 to **BF16** and runs
+/// `mma.sync...f32.bf16.bf16.f32` with BF16 activations, so materialising the
+/// same BF16 weights hands cuBLASLt the identical operands. Unlike the SSM
+/// e4m3 case the accumulation is NOT provably invisible here — BF16 products
+/// carry 16 significant bits and K=5120 needs ~13 more, past FP32's 24 — so
+/// this reassociates the sum and must be gate-tested.
+pub fn attn_proj_cublaslt_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_ATTN_PROJ_CUBLASLT").ok().as_deref() == Some("1"))
+}
+
+/// `ATLAS_SSM_PROJ_CUBLASLT=1`: route the SSM prefill projections through
+/// cuBLASLt's FP8 e4m3 GEMM instead of the hand-written `fp8_gemm_t_m128` /
+/// `w4a16_gemm_t_m128` kernels.
+///
+/// Those kernels already round both operands to e4m3 before
+/// `mma.sync...f32.e4m3.e4m3.f32` (the W4A16 path dequantises NVFP4 and
+/// re-rounds with `cvt.rn.satfinite.e4m3x2.f32`), so handing cuBLASLt the same
+/// e4m3 bytes computes the same products and differs only in accumulation
+/// order. Measured 212-222 TFLOP/s at the production shapes against 44-61 for
+/// the hand-written kernels. Not bit-exact; gated and gate-tested.
+pub fn ssm_proj_cublaslt_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("ATLAS_SSM_PROJ_CUBLASLT").ok().as_deref() == Some("1"))
 }
 
 /// `ATLAS_SSM_OUT_PREFILL_M128=1`: SSM out-projection prefill uses the

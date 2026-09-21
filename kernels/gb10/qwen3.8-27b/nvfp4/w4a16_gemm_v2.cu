@@ -250,3 +250,92 @@ void w4a16_gemm_t_m128_v2(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// cast_bf16_to_e4m3: materialise the exact e4m3 activation bytes that the
+// W4A16 / FP8 prefill MMAs already consume, so a library GEMM (cuBLASLt FP8)
+// can be handed the identical operands.
+//
+// The conversion is statement-for-statement `v2_bf16x4_to_e4m3x4` above:
+// bf16 -> f32 via cvt.f32.bf16, then cvt.rn.satfinite.e4m3x2.f32, no scaling
+// and no per-row normalisation. So feeding these bytes to an e4m3 x e4m3 GEMM
+// reproduces the current products exactly; only the accumulation order differs.
+//
+// `n_elems` must be a multiple of 4. Grid-stride over packed groups of 4.
+extern "C" __global__ void cast_bf16_to_e4m3(
+    const unsigned short* __restrict__ input,   // [n_elems] BF16
+    unsigned int* __restrict__ output,          // [n_elems/4] packed e4m3 bytes
+    unsigned long long n_groups                 // n_elems / 4
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (; i < n_groups; i += stride) {
+        output[i] = v2_bf16x4_to_e4m3x4(input + i * 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dequant_nvfp4_to_e4m3: materialise, once, the exact e4m3 weight bytes that
+// V2_DEQUANT above produces on the fly, laid out row-major [N, K] so cuBLASLt
+// can consume them as the A operand of a TN FP8 GEMM.
+//
+// Per element this is statement-for-statement V2_DEQUANT:
+//     val = LUT[code] * ((float)block_scale_e4m3 * scale2)
+//     out = cvt.rn.satfinite.e4m3(val)
+// so the library multiplies the identical bytes the MMA path would have built.
+//
+// Source layout (from V2_LOADS): B_packed[(k >> 1) * N + n] holds the code for
+// even k in the low nibble and odd k in the high nibble; B_scale[(k / 16) * N + n].
+//
+// One block per (128-wide n tile, 32-deep k tile): reads are coalesced across n,
+// and each thread emits its 32 output bytes as one contiguous store. Runs once
+// per layer, so clarity beats micro-optimisation.
+#define DQ_NT 128
+#define DQ_KT 32
+
+extern "C" __global__ void dequant_nvfp4_to_e4m3(
+    const unsigned char* __restrict__ B_packed,  // [K/2, N]
+    const unsigned char* __restrict__ B_scale,   // [K/16, N] e4m3 bytes
+    unsigned char* __restrict__ out,             // [N, K] e4m3 bytes
+    float scale2,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int n0 = blockIdx.x * DQ_NT;
+    const unsigned int k0 = blockIdx.y * DQ_KT;
+    const unsigned int n = n0 + threadIdx.x;
+    if (n >= N || k0 >= K) return;
+
+    // Two 16-element groups span this 32-deep k tile.
+    float sv[DQ_KT / GROUP_SIZE];
+    #pragma unroll
+    for (int g = 0; g < DQ_KT / GROUP_SIZE; g++) {
+        const unsigned int sg = (k0 / GROUP_SIZE) + g;
+        __nv_fp8_e4m3 f;
+        *(unsigned char*)&f = B_scale[(unsigned long long)sg * N + n];
+        sv[g] = (float)f * scale2;
+    }
+
+    unsigned char local[DQ_KT];
+    #pragma unroll
+    for (int kk = 0; kk < DQ_KT; kk += 2) {
+        const unsigned int k = k0 + kk;
+        if (k >= K) break;
+        const unsigned char packed = B_packed[(unsigned long long)(k >> 1) * N + n];
+        const float s = sv[kk / GROUP_SIZE];
+        const float lo = E2M1_LUT_V2[packed & 0xF] * s;
+        const float hi = E2M1_LUT_V2[packed >> 4] * s;
+        unsigned short fp8_pair;
+        asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+                     : "=h"(fp8_pair) : "f"(hi), "f"(lo));
+        local[kk]     = (unsigned char)(fp8_pair & 0xFF);
+        local[kk + 1] = (unsigned char)(fp8_pair >> 8);
+    }
+
+    unsigned char* dst = out + (unsigned long long)n * K + k0;
+    const unsigned int span = (k0 + DQ_KT <= K) ? DQ_KT : (K - k0);
+    #pragma unroll
+    for (unsigned int kk = 0; kk < DQ_KT; kk++) {
+        if (kk < span) dst[kk] = local[kk];
+    }
+}

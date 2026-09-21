@@ -19,6 +19,12 @@ use super::{
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+/// Number of SSM prefill projections that actually executed on the cuBLASLt
+/// route. Read from the server log as `CUBLASLT_PROJ_CALL n=<total>`; a run
+/// whose total is short of `layers x requests` took the fail-safe fallback and
+/// must not be scored as a null result.
+static CUBLASLT_PROJ_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Qwen3SsmLayer {
     fn flashinfer_ssm_nvfp4_active(&self) -> bool {
         self.sequential_qkvz
@@ -397,6 +403,46 @@ impl Qwen3SsmLayer {
     /// QKVZ large-M projection: the 8-warp shadow when requested/eligible,
     /// else the parent `w4a16_gemm_t_m128`. Bit-identical either way.
     #[allow(clippy::too_many_arguments)]
+    /// e4m3 copy of this layer's NVFP4 QKVZ weight, materialised once on first
+    /// use. Returns None if the dequant kernel is missing or the allocation
+    /// fails, so the caller keeps the hand-written W4A16 kernel.
+    fn qkvz_weight_e4m3(
+        &self,
+        ctx: &ForwardContext,
+        nvfp4_t: &crate::weight_map::QuantizedWeight,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Option<DevicePtr> {
+        let mut slot = self.ssm_qkvz_e4m3.lock().ok()?;
+        if let Some(ptr) = *slot {
+            return Some(ptr);
+        }
+        if self.dequant_nvfp4_to_e4m3_k.0 == 0 || n % 128 != 0 || k % 32 != 0 {
+            return None;
+        }
+        let bytes = n as usize * k as usize;
+        let ptr = ctx.gpu.alloc(bytes).ok()?;
+        ops::dequant_nvfp4_to_e4m3(
+            ctx.gpu,
+            self.dequant_nvfp4_to_e4m3_k,
+            nvfp4_t.weight,
+            nvfp4_t.weight_scale,
+            ptr,
+            nvfp4_t.weight_scale_2,
+            n,
+            k,
+            stream,
+        )
+        .ok()?;
+        tracing::info!(
+            "ATLAS_SSM_PROJ_CUBLASLT: materialised QKVZ e4m3 weight N={n} K={k} ({} MiB)",
+            bytes / (1024 * 1024)
+        );
+        *slot = Some(ptr);
+        Some(ptr)
+    }
+
     pub(super) fn qkvz_prefill_m128_dispatch(
         &self,
         ctx: &ForwardContext,
@@ -409,6 +455,14 @@ impl Qwen3SsmLayer {
         stream: u64,
     ) -> Result<()> {
         use crate::layers::PrefillProjectionPipeRoute as Route;
+        // cuBLASLt FP8: needs the NVFP4 weight materialised as e4m3 once, then
+        // multiplies exactly the bytes the W4A16 kernel would have built.
+        if crate::layers::ssm_proj_cublaslt_enabled()
+            && let Some(w) = self.qkvz_weight_e4m3(ctx, nvfp4_t, n, h, stream)
+            && self.try_cublaslt_fp8_proj(ctx, normed, w, proj_dst, k, n, h, stream)?
+        {
+            return Ok(());
+        }
         match crate::layers::prefill_fp8_w8_route(
             crate::layers::prefill_fp8_w8_enabled(), k, n, h, self.w4a16_gemm_t_w8_k.0 != 0,
         ) {
@@ -422,6 +476,85 @@ impl Qwen3SsmLayer {
                 ctx.gpu, self.w4a16_gemm_t_m128_k, normed, nvfp4_t, proj_dst, k, n, h, stream,
             ),
         }
+    }
+
+    /// e4m3 activation scratch for the cuBLASLt projection route. Returns None
+    /// when the buffer cannot serve `bytes`, so callers fall back to the
+    /// hand-written kernel rather than failing the request.
+    fn act_e4m3_scratch(&self, ctx: &ForwardContext, bytes: usize) -> Option<DevicePtr> {
+        let mut slot = self.ssm_act_e4m3_scratch.lock().ok()?;
+        if let Some((ptr, cap)) = *slot
+            && cap >= bytes
+        {
+            return Some(ptr);
+        }
+        // Grow rather than fall back. The two SSM projections have different K
+        // (qkvz 5120, out_proj 6144) and share this buffer, so sizing it to
+        // whichever ran first silently pushed the other onto the hand-written
+        // kernel -- caught by the engagement receipt reading 288 of 576 calls.
+        // Growth happens at most once per distinct K and the old allocation is
+        // small (~10 MiB), so it is not retained.
+        let ptr = ctx.gpu.alloc(bytes).ok()?;
+        tracing::info!(
+            "ATLAS_SSM_PROJ_CUBLASLT: e4m3 activation scratch {} MiB",
+            bytes / (1024 * 1024)
+        );
+        *slot = Some((ptr, bytes));
+        Some(ptr)
+    }
+
+    /// cuBLASLt FP8 projection: cast the BF16 activations to the same e4m3 bytes
+    /// the MMA path produces, then run the library GEMM. Returns Ok(false) when
+    /// the route is unavailable so the caller uses the existing kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn try_cublaslt_fp8_proj(
+        &self,
+        ctx: &ForwardContext,
+        act_bf16: DevicePtr,
+        weight_fp8: DevicePtr,
+        out: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Result<bool> {
+        if !crate::layers::ssm_proj_cublaslt_enabled() || self.cast_bf16_to_e4m3_k.0 == 0 {
+            return Ok(false);
+        }
+        // cuBLASLt FP8 constraint, and the cast kernel packs 4 elements per word.
+        if k % 16 != 0 || n % 16 != 0 || (m as u64 * k as u64) % 4 != 0 {
+            return Ok(false);
+        }
+        let bytes = m as usize * k as usize;
+        let Some(act_e4m3) = self.act_e4m3_scratch(ctx, bytes) else {
+            return Ok(false);
+        };
+        ops::cast_bf16_to_e4m3(
+            ctx.gpu,
+            self.cast_bf16_to_e4m3_k,
+            act_bf16,
+            act_e4m3,
+            m as u64 * k as u64,
+            stream,
+        )?;
+        spark_runtime::cublaslt::fp8_gemm_act_weight_t(
+            act_e4m3.0,
+            weight_fp8.0,
+            out.0,
+            m,
+            n,
+            k,
+            stream,
+        )?;
+        // Engagement receipt. This route is deliberately fail-safe: a disabled
+        // gate, a missing kernel, an ineligible shape or an undersized scratch
+        // all fall back to the hand-written kernel and would otherwise produce
+        // a silent "no change" that reads as a null result rather than a bug.
+        // One line per call, with a running total, so a run can be scored only
+        // after asserting the count matches layers x requests.
+        let n_calls = CUBLASLT_PROJ_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!("CUBLASLT_PROJ_CALL n={n_calls} M={m} N={n} K={k}");
+        Ok(true)
     }
 
     pub(super) fn prefill_out_proj_dispatch(
@@ -448,6 +581,13 @@ impl Qwen3SsmLayer {
             )
         } else if let Some(fp8) = self.out_proj_fp8 {
             use crate::layers::PrefillProjectionPipeRoute as Route;
+            // Weights here are already e4m3 in memory, so the library GEMM takes
+            // the identical operands with no conversion pass.
+            if self.try_cublaslt_fp8_proj(
+                ctx, normed_out_buf, fp8, out_proj_buf, k, h as u32, value_dim as u32, stream,
+            )? {
+                return Ok(());
+            }
             match crate::layers::prefill_fp8_w8_route(
                 crate::layers::prefill_fp8_w8_enabled(), k, h as u32, value_dim as u32, self.fp8_gemm_t_w8_k.0 != 0,
             ) {

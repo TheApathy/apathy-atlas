@@ -265,6 +265,8 @@ impl Qwen3SsmLayer {
             ),
             reduce_splitk_k: super::super::try_kernel(gpu, "w4a16", "reduce_splitk_f32_to_bf16"),
             ssm_splitk_workspace: std::sync::Mutex::new(None),
+            ssm_act_e4m3_scratch: std::sync::Mutex::new(None),
+            ssm_qkvz_e4m3: std::sync::Mutex::new(None),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gdn_prefill_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_prefill")?,
@@ -292,10 +294,25 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_wy32_gatecache",
                 "gated_delta_rule_prefill_wy32_gatecache",
             ),
+            cast_bf16_to_e4m3_k: super::super::try_kernel(
+                gpu,
+                "w4a16_v2",
+                "cast_bf16_to_e4m3",
+            ),
+            dequant_nvfp4_to_e4m3_k: super::super::try_kernel(
+                gpu,
+                "w4a16_v2",
+                "dequant_nvfp4_to_e4m3",
+            ),
             gdn_prefill_wy32_gatecache_v2_k: super::super::try_kernel(
                 gpu,
                 "gated_delta_rule_wy32_gatecache_v2",
                 "gated_delta_rule_prefill_wy32_gatecache_v2",
+            ),
+            gdn_prefill_wy32_gatecache_ksplit_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy32_gatecache_ksplit",
+                "gated_delta_rule_prefill_wy32_gatecache_ksplit",
             ),
             // ── Q12 Phase 2b: batched GDN kernel handles ──
             gdn_prefill_wy32_batched_k: super::super::try_kernel(

@@ -286,6 +286,14 @@ pub struct Qwen3SsmLayer {
     /// Lazily-allocated FP32 split-K workspace [k_splits≤8, 32, max_n].
     /// Allocated at load time (pre-graph-capture) by `alloc_ssm_splitk_ws`.
     ssm_splitk_workspace: std::sync::Mutex<Option<DevicePtr>>,
+    /// Lazily-allocated e4m3 activation scratch for the cuBLASLt FP8 projection
+    /// route (`ATLAS_SSM_PROJ_CUBLASLT=1`). Holds `max_tokens * max_k` bytes,
+    /// one e4m3 byte per BF16 activation element. Grows on demand.
+    ssm_act_e4m3_scratch: std::sync::Mutex<Option<(DevicePtr, usize)>>,
+    /// Lazily materialised e4m3 copy of this layer's NVFP4 QKVZ weight, laid
+    /// out [N, K] for the cuBLASLt FP8 route. 80 MiB per layer at the
+    /// production shape; built once on first prefill use and kept.
+    ssm_qkvz_e4m3: std::sync::Mutex<Option<DevicePtr>>,
     w4a16_gemv_batch2_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     gdn_prefill_k: KernelHandle,
@@ -299,8 +307,17 @@ pub struct Qwen3SsmLayer {
     /// ABI-identical WY32 shadow that caches the thread-invariant gate-product
     /// triangle. Default off until live output-hash and TTFT qualification.
     gdn_prefill_wy32_gatecache_k: KernelHandle,
+    /// bf16 -> e4m3 activation cast, exactly the MMA path's own conversion.
+    cast_bf16_to_e4m3_k: KernelHandle,
+    /// NVFP4 -> e4m3 weight materialisation, matching V2_DEQUANT exactly.
+    dequant_nvfp4_to_e4m3_k: KernelHandle,
     /// Exact v2 shadow of the gate-cache kernel (ATLAS_GDN_PREFILL_GATECACHE_V2=1).
     gdn_prefill_wy32_gatecache_v2_k: KernelHandle,
+    /// K-split (R3) variant of the gate-cache kernel
+    /// (ATLAS_GDN_PREFILL_GATECACHE_KSPLIT=1). Same argument list and same
+    /// shared-memory footprint as v1, but launched with 512 threads. NOT
+    /// bit-exact -- reassociates the j-sums. Null on targets without it.
+    gdn_prefill_wy32_gatecache_ksplit_k: KernelHandle,
     // ── Q12 Phase 2b: same-chunk-len batched GDN prefill kernels ──
     // Each takes `float* const* h_state_ptrs` plus stacked QKV/gate/beta/output.
     // Used by `Qwen3SsmLayer::prefill_batched` when N≥2 streams have matching

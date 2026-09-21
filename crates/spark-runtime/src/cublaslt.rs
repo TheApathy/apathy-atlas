@@ -24,6 +24,8 @@ type cublasLtMatmulPreference_t = *mut c_void;
 
 const CUDA_R_16BF: i32 = 14;
 const CUDA_R_32F: i32 = 0;
+/// `library_types.h`: real as an `nv_fp8_e4m3`.
+const CUDA_R_8F_E4M3: i32 = 28;
 const CUBLAS_COMPUTE_32F: i32 = 68;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
@@ -173,7 +175,7 @@ struct TunedPlan {
 unsafe impl Send for TunedPlan {}
 unsafe impl Sync for TunedPlan {}
 
-type PlanShape = (u32, u32, u32);
+type PlanShape = (u32, u32, u32, i32);
 type PlanCache = std::collections::HashMap<PlanShape, &'static TunedPlan>;
 
 static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
@@ -185,8 +187,16 @@ static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
 /// heuristic[0] pick left the K=8 verify o_proj at 113 GB/s (~24 CTAs on 48
 /// SMs, no split-K) — tuning recovers the split-K/tile choice per shape.
 fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
+    tuned_plan_dt(m, n, k, CUDA_R_16BF, 2)
+}
+
+/// As [`tuned_plan`], but with the A/B operand element type chosen by the
+/// caller (`at`, `ab` = its size in bytes). D stays BF16. The plan cache is
+/// keyed by operand type as well as shape, so FP8 and BF16 plans for the same
+/// M/N/K never collide.
+fn tuned_plan_dt(m: u32, n: u32, k: u32, at: i32, ab: usize) -> Result<&'static TunedPlan> {
     let plans = PLANS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(p) = plans.lock().unwrap().get(&(m, n, k)) {
+    if let Some(p) = plans.lock().unwrap().get(&(m, n, k, at)) {
         return Ok(p);
     }
     let ctx = ctx()?;
@@ -220,11 +230,11 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
         chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut la, at, k as u64, n as u64, k as i64),
             "LayoutA",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut lb, at, k as u64, m as u64, k as i64),
             "LayoutB",
         )?;
         chk(
@@ -275,19 +285,19 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         // caller's stream (which may be mid graph-capture).
         let (mut dw, mut da, mut dd): (u64, u64, u64) = (0, 0, 0);
         chk(
-            cuMemAlloc_v2(&mut dw, n as usize * k as usize * 2),
+            cuMemAlloc_v2(&mut dw, n as usize * k as usize * ab),
             "tuneAllocW",
         )?;
         chk(
-            cuMemAlloc_v2(&mut da, m as usize * k as usize * 2),
+            cuMemAlloc_v2(&mut da, m as usize * k as usize * ab),
             "tuneAllocA",
         )?;
         chk(
             cuMemAlloc_v2(&mut dd, m as usize * n as usize * 2),
             "tuneAllocD",
         )?;
-        cuMemsetD8_v2(dw, 0, n as usize * k as usize * 2);
-        cuMemsetD8_v2(da, 0, m as usize * k as usize * 2);
+        cuMemsetD8_v2(dw, 0, n as usize * k as usize * ab);
+        cuMemsetD8_v2(da, 0, m as usize * k as usize * ab);
         let mut ts: u64 = 0;
         chk(cuStreamCreate(&mut ts, 1), "tuneStream")?;
         let (mut e0, mut e1): (u64, u64) = (0, 0);
@@ -348,9 +358,9 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         cuMemFree_v2(da);
         cuMemFree_v2(dd);
 
-        let bytes = n as u64 * k as u64 * 2;
+        let bytes = n as u64 * k as u64 * ab as u64;
         tracing::info!(
-            "cuBLASLt tune {m}x{n}x{k}: algo[{best}] of {returned} @ {best_ms:.3}ms \
+            "cuBLASLt tune {m}x{n}x{k} dtype={at}: algo[{best}] of {returned} @ {best_ms:.3}ms \
              ({:.0} GB/s weight-read)",
             bytes as f64 / (best_ms as f64 / 1e3) / 1e9,
         );
@@ -361,7 +371,7 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             ld: ld_ as usize,
             algo: results[best].algo,
         }));
-        plans.lock().unwrap().insert((m, n, k), plan);
+        plans.lock().unwrap().insert((m, n, k, at), plan);
         Ok(plan)
     }
 }
@@ -525,4 +535,59 @@ pub fn bf16_gemm_act_weight_t(
         chk(status, "Matmul")?;
     }
     Ok(())
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ` with **FP8 e4m3 operands and
+/// a BF16 result**, using the same per-shape immortal plan cache as
+/// [`bf16_gemm_act_weight_t_tuned`], so there is no per-call descriptor or
+/// heuristic work. The first call at a given shape autotunes over the
+/// heuristic's top-16 algorithms on a private stream; every later call is a
+/// single `cublasLtMatmul`.
+///
+/// The hand-written prefill kernels round both operands to e4m3 before
+/// `mma.sync...f32.e4m3.e4m3.f32` (the W4A16 path dequantises NVFP4 and
+/// re-rounds via `cvt.rn.satfinite.e4m3x2.f32`), so passing those same e4m3
+/// bytes here computes identical products and differs only in accumulation
+/// order. Not bit-exact by construction; gated and gate-tested.
+///
+/// `k` and `n` must be multiples of 16 (cuBLASLt FP8 constraint).
+pub fn fp8_gemm_act_weight_t(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if k % 16 != 0 || n % 16 != 0 {
+        bail!("cuBLASLt FP8 requires k and n multiples of 16, got k={k} n={n}");
+    }
+    let plan = tuned_plan_dt(m, n, k, CUDA_R_8F_E4M3, 1)?;
+    let ctx = ctx()?;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    unsafe {
+        chk(
+            cublasLtMatmul(
+                ctx.handle,
+                plan.desc as cublasLtMatmulDesc_t,
+                &alpha as *const f32 as *const c_void,
+                weight as *const c_void,
+                plan.la as cublasLtMatrixLayout_t,
+                act as *const c_void,
+                plan.lb as cublasLtMatrixLayout_t,
+                &beta as *const f32 as *const c_void,
+                out as *const c_void,
+                plan.ld as cublasLtMatrixLayout_t,
+                out as *mut c_void,
+                plan.ld as cublasLtMatrixLayout_t,
+                plan.algo.as_ptr() as *const c_void,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            ),
+            "MatmulFp8Tuned",
+        )
+    }
 }

@@ -4621,3 +4621,44 @@ fp8_gemm_t_m128n128_w8(
 #undef W8_M
 #undef W8_N
 #undef W8_THREADS
+
+// ---------------------------------------------------------------------------
+// dequant_nvfp4_to_bf16: materialise, once, the exact BF16 weight bytes that
+// w4a16_gemm_pipe_m128n128 builds on the fly, laid out [N, K] row-major so
+// cuBLASLt can take them as the A operand of a TN BF16 GEMM.
+//
+// Per element this is statement-for-statement that kernel's dequant:
+//     dst = __float2bfloat16(LUT[code] * (float)block_scale_e4m3 * scale2)
+// so the library multiplies the identical operands, and the ONLY difference
+// from the hand-written path is the order in which the FP32 accumulator sums
+// them. Unlike the SSM/e4m3 case that difference is NOT provably invisible:
+// BF16 products carry 16 significant bits and K=5120 needs ~13 more, which
+// exceeds FP32's 24-bit mantissa, so this route is gated and gate-tested.
+//
+// Attention weight layout (from that kernel's loader) differs from the SSM's:
+// B_packed is row-major [N, K/2] and B_scale row-major [N, K/16], so one
+// thread per packed byte gives fully coalesced reads and writes.
+extern "C" __global__ void dequant_nvfp4_to_bf16(
+    const unsigned char* __restrict__ B_packed,  // [N, K/2]
+    const unsigned char* __restrict__ B_scale,   // [N, K/16] e4m3 bytes
+    __nv_bfloat16* __restrict__ out,             // [N, K]
+    float scale2,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned long long half_k = K >> 1;
+    const unsigned long long total = (unsigned long long)N * half_k;
+    const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += stride) {
+        const unsigned long long n = i / half_k;
+        const unsigned long long kb = i - n * half_k;   // packed-byte index within the row
+        const unsigned char packed = B_packed[i];
+        __nv_fp8_e4m3 fp8;
+        *(unsigned char*)&fp8 = B_scale[n * (K >> 4) + (kb >> 3)];
+        const float fs = (float)fp8;
+        __nv_bfloat16* dst = out + n * K + (kb << 1);
+        dst[0] = __float2bfloat16(E2M1_LUT[packed & 0xF] * fs * scale2);
+        dst[1] = __float2bfloat16(E2M1_LUT[packed >> 4] * fs * scale2);
+    }
+}
