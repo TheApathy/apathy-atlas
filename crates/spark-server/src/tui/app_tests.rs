@@ -4,6 +4,54 @@
 
 use super::*;
 
+/// The ⇥ order must contain the subsection rows, in the order the sidebar draws
+/// them. This is the regression: the traversal list was top-level-only, so
+/// Main ▸ Kernels and Terminal ▸ Chat could not be reached with Tab at all.
+#[test]
+fn nav_rows_include_subsections_in_sidebar_order() {
+    let labels: Vec<String> = App::nav_rows()
+        .iter()
+        .map(|(s, i)| match s.subs().get(*i) {
+            Some(sub) => format!("{}/{}", s.label(), sub),
+            None => s.label().to_string(),
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "Main/Overview",
+            "Main/Kernels",
+            "Stats",
+            "Network",
+            "Library",
+            "Terminal/Ops",
+            "Terminal/Chat",
+            "Help/Guide",
+            "Help/Report Issue",
+        ]
+    );
+}
+
+/// The digit keys and `Section::ALL` must stay in step. Benchmarks was inserted
+/// BEFORE Terminal, which moved Terminal from `5` to `6` — a mismatch here is
+/// invisible until someone presses a number and lands in the wrong place.
+#[test]
+fn digit_keys_match_the_sidebar_order() {
+    use clap::Parser;
+    use crossterm::event::{KeyCode, KeyEvent};
+    let mut app = App::new(crate::cli::ServeArgs::parse_from(["spark", "some/model"]));
+    for (i, section) in Section::ALL.iter().enumerate() {
+        let digit = char::from_digit(i as u32 + 1, 10).expect("<=9 sections");
+        app.on_key(KeyEvent::from(KeyCode::Char(digit)));
+        assert_eq!(
+            app.section,
+            *section,
+            "key {digit} must select {}",
+            section.label()
+        );
+    }
+}
+
 /// A section without subsections must still contribute exactly one stop, or ⇥
 /// would silently skip it.
 #[test]
@@ -49,6 +97,7 @@ fn the_watchdog_command_toggles_the_running_run_not_a_process_global() {
     let other = std::sync::Arc::new(crate::scheduler::levers::SchedLevers::from_env());
     app.run = Some(crate::tui::RunHandles {
         levers: levers.clone(),
+        snapshot: std::sync::Arc::new(crate::scheduler::snapshot::SnapshotCell::default()),
     });
 
     crate::tui::commands::execute("/watchdog on", &mut app);

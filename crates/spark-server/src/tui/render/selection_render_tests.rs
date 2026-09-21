@@ -121,6 +121,44 @@ fn the_highlight_actually_sets_reverse_video_on_the_covered_cells() {
 }
 
 #[test]
+fn the_buffer_to_copy_from_is_the_completed_frame_not_the_current_one() {
+    // The bug this pins cost a live debugging session. Copying inline from
+    // `Terminal::current_buffer_mut()` looks obviously right and is wrong:
+    // ratatui swaps its two buffers after each draw and RESETS the one that
+    // becomes current, so between frames `current_buffer_mut()` is blank. The
+    // text only exists in the `CompletedFrame` that `draw()` returns, which is
+    // why the copy is deferred to just after the draw instead of being done in
+    // the mouse handler.
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let a = app();
+    let mut t = Terminal::new(TestBackend::new(120, 40)).expect("backend");
+
+    let rendered: String = {
+        let frame = t.draw(|f| draw(f, &a)).expect("draw");
+        frame.buffer.content().iter().map(|c| c.symbol()).collect()
+    };
+    assert!(
+        rendered.contains("Library"),
+        "the completed frame holds the rendered text:\n{rendered}"
+    );
+
+    let current: String = t
+        .current_buffer_mut()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert_ne!(
+        current.trim(),
+        rendered.trim(),
+        "current_buffer_mut() is NOT the frame just drawn — extracting from it \
+         copies a blank screen"
+    );
+}
+
+#[test]
 fn a_selection_does_not_survive_a_keystroke() {
     // Reported: select text, switch screen, and the highlight follows you —
     // painting reversed cells over unrelated content, because the selection is

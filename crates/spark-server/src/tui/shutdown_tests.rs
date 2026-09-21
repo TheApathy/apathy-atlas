@@ -14,6 +14,48 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a current-thread runtime")
 }
 
+/// The latch: it goes up once and never comes down.
+///
+/// The promise is load-bearing beyond shutdown itself — `bench_selfstart`
+/// refuses a second self-start in one process BECAUSE this never clears, and
+/// `model_swap` refuses to load once it is set. A reset would turn both
+/// refusals into a hang.
+#[test]
+fn a_shutdown_request_is_a_one_way_latch_with_no_reset() {
+    let rt = runtime();
+
+    // The transition is only observable from an untripped process, so it is
+    // asserted only when this test gets there first. Whichever branch runs, the
+    // idempotency below is asserted either way.
+    if !requested() {
+        rt.block_on(async {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), wait())
+                    .await
+                    .is_err(),
+                "wait() must not resolve before anything has been requested"
+            );
+        });
+        request("SIGINT");
+        assert!(requested(), "a request trips the latch");
+    }
+
+    // Idempotent: further requests neither panic on the spent escape sender nor
+    // clear anything.
+    for _ in 0..3 {
+        request("Ctrl+C");
+        assert!(requested(), "the latch has no reset");
+    }
+
+    // And a waiter registered after the fact resolves at once rather than
+    // parking on a notification that has already been sent.
+    rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_millis(500), wait())
+            .await
+            .expect("wait() resolves immediately once requested");
+    });
+}
+
 /// The startup escape: taken while `serve()` is still loading, parked for good
 /// once the accept loop owns shutdown.
 ///

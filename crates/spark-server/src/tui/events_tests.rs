@@ -52,6 +52,25 @@ fn at(a: &App) -> String {
 }
 
 #[test]
+fn clicking_a_sidebar_section_row_selects_that_section() {
+    // Rows under the tall header, with Main active and drawing two subsections:
+    // Main, ├Overview, └Kernels, Stats, Network, Library, Terminal.
+    // Benchmarks sat between Library and Terminal upstream; with that section
+    // cut, every row below Library moves UP one. The indices are the point of
+    // this test, so they are re-derived rather than left as upstream had them.
+    for (row, expected) in [
+        (6, "Stats"),
+        (7, "Network"),
+        (8, "Library"),
+        (9, "Terminal/Ops"),
+    ] {
+        let mut a = app();
+        click(&mut a, 2, row, WIDE);
+        assert_eq!(at(&a), expected, "row {row}");
+    }
+}
+
+#[test]
 fn clicking_the_section_already_shown_cycles_its_subsections() {
     // Same contract as pressing its number key twice.
     let mut a = app();
@@ -87,6 +106,21 @@ fn the_rows_below_shift_with_whichever_section_is_expanded() {
     assert_eq!(at(&a), "Terminal/Ops", "├ Ops");
     click(&mut a, 2, 6, WIDE);
     assert_eq!(at(&a), "Library");
+}
+
+#[test]
+fn a_narrow_sidebar_draws_no_subsections_and_offsets_nothing() {
+    // Icons only under a one-row header, so row N is section N.
+    for (row, expected) in [
+        (2, "Stats"),
+        (3, "Network"),
+        (4, "Library"),
+        (5, "Terminal/Ops"),
+    ] {
+        let mut a = app();
+        click(&mut a, 1, row, NARROW);
+        assert_eq!(at(&a), expected, "row {row}");
+    }
 }
 
 #[test]

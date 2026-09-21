@@ -57,6 +57,16 @@ fn every_section_renders_at_every_size() {
     }
 }
 
+#[test]
+fn a_terminal_one_cell_wide_does_not_panic() {
+    // Underflow guard: every layout in the tree subtracts from the width.
+    for (w, h) in [(1, 1), (2, 3), (1, 40), (40, 1)] {
+        let mut a = app();
+        a.section = Section::Library;
+        let _ = render(&a, w, h);
+    }
+}
+
 /// The Library panes must render at realistic and hostile sizes.
 mod library {
     use super::*;
@@ -227,6 +237,7 @@ fn the_library_leaves_nothing_behind_when_it_fills_in() {
     );
     assert!(out.contains("MODELS ─ 1"), "the new title is drawn:\n{out}");
 }
+
 
 #[test]
 fn the_clear_chat_prompt_names_what_it_will_discard() {

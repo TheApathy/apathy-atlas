@@ -58,6 +58,53 @@ fn snapshot(a: &App) -> (String, u8, Option<usize>, usize, bool, bool, bool) {
 }
 
 #[test]
+fn tab_walks_every_sidebar_row_in_order_and_wraps_home() {
+    let mut a = app();
+    let mut seen = vec![at(&a)];
+    for _ in 1..App::nav_rows().len() {
+        tap(&mut a, KeyCode::Tab);
+        seen.push(at(&a));
+    }
+    assert_eq!(
+        seen,
+        [
+            "Main/Overview",
+            "Main/Kernels",
+            "Stats",
+            "Network",
+            "Library",
+            "Terminal/Ops",
+            "Terminal/Chat",
+            "Help/Guide",
+            "Help/Report Issue",
+        ]
+    );
+    tap(&mut a, KeyCode::Tab);
+    assert_eq!(at(&a), "Main/Overview", "the last row wraps to the first");
+}
+
+#[test]
+fn shift_tab_walks_the_same_rows_backwards() {
+    let mut a = app();
+    tap(&mut a, KeyCode::BackTab);
+    assert_eq!(
+        at(&a),
+        "Help/Report Issue",
+        "the first row wraps to the last"
+    );
+    for expected in [
+        "Help/Guide",
+        "Terminal/Chat",
+        "Terminal/Ops",
+    ] {
+        tap(&mut a, KeyCode::BackTab);
+        assert_eq!(at(&a), expected);
+    }
+    tap(&mut a, KeyCode::Tab);
+    assert_eq!(at(&a), "Terminal/Ops", "and ⇥ undoes ⇧⇥");
+}
+
+#[test]
 fn a_repeat_section_key_cycles_that_sections_subsections() {
     let mut a = app();
     // Away from Main first, so the press below is a plain arrival rather than
@@ -351,6 +398,22 @@ fn q_still_quits_immediately_when_there_is_nothing_to_lose() {
     assert!(a.work_in_flight().is_none());
     press(&mut a, 'q');
     assert!(a.should_quit);
+    assert!(!a.confirm_quit);
+}
+
+/// ★ `q` DRAINS AND STOPS THE SERVER. A single stray keypress used to end a
+/// multi-hour benchmark with no way back, from any screen, including one where
+/// the user was only reading logs.
+#[test]
+fn q_asks_first_when_a_run_is_in_flight_and_a_second_q_confirms() {
+    let mut a = app();
+    a.chat.streaming = true;
+    press(&mut a, 'q');
+    assert!(a.confirm_quit, "the first press asks");
+    assert!(!a.should_quit, "and does NOT quit");
+
+    press(&mut a, 'q');
+    assert!(a.should_quit, "the second press is the deliberate one");
     assert!(!a.confirm_quit);
 }
 

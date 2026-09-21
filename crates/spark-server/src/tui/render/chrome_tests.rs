@@ -23,6 +23,26 @@ fn footer(rows: &[String]) -> &str {
 }
 
 #[test]
+fn the_sidebar_spells_out_its_sections_only_when_there_is_room_for_the_words() {
+    // 96 columns is the switch between the 18-cell labelled rail and the
+    // 4-cell icon rail; below it the labels would be cut mid-word.
+    let a = app();
+    let wide = screen(&a, 96, 40);
+    assert!(has(&wide, "Network"), "{wide:#?}");
+    assert!(has(&wide, "Library"));
+
+    let narrow = screen(&a, 95, 40);
+    assert!(
+        !has(&narrow, "Network"),
+        "the icon rail has no room for a label:\n{narrow:#?}"
+    );
+    assert!(
+        narrow.iter().any(|r| r.contains('▰')),
+        "but the icon is still there:\n{narrow:#?}"
+    );
+}
+
+#[test]
 fn the_active_section_lists_its_subsections_beneath_it() {
     let mut a = app();
     a.section = Section::Main;
@@ -33,6 +53,27 @@ fn the_active_section_lists_its_subsections_beneath_it() {
         !has(&rows, "Suite"),
         "an inactive section keeps its subsections folded away:\n{rows:#?}"
     );
+}
+
+#[test]
+fn the_footer_names_keys_that_do_something_in_the_section_it_is_showing() {
+    for (section, needle) in [
+        (Section::Main, "f filter"),
+        (Section::Stats, "cycle"),
+        (Section::Network, "node"),
+        (Section::Library, "search"),
+        (Section::Terminal, "Ops↔Chat"),
+    ] {
+        let mut a = app();
+        a.section = section;
+        let rows = screen(&a, 160, 40);
+        assert!(
+            footer(&rows).contains(needle),
+            "{} footer is missing {needle:?}: {:?}",
+            section.label(),
+            footer(&rows)
+        );
+    }
 }
 
 #[test]
@@ -316,6 +357,42 @@ fn the_quit_prompt_declines_when_the_dashboard_is_idle() {
     a.confirm_quit = true;
     assert!(a.work_in_flight().is_none());
     assert!(!has(&screen(&a, 160, 48), "STOP THE SERVER?"));
+}
+
+/// ★ The mouse handler used to hold its own copy of both sidebar breakpoints,
+/// in another file, with nothing tying them to what is actually drawn. Every
+/// number below was stated twice; had either copy drifted, a click would have
+/// selected the section above or below the one under the pointer, silently.
+///
+/// This is the renderer's half of the invariant — that the frame really is laid
+/// out where [`Chrome`] says. `events_tests` owns the other half: that a click
+/// at `chrome.header_h + n` selects the section drawn on row `n`.
+#[test]
+fn the_frame_is_laid_out_where_the_chrome_says_it_is() {
+    let a = app();
+    // Both breakpoints, from both sides: a tall/wide frame, and one column and
+    // one row short of each.
+    for (w, h) in [(96u16, 40u16), (95, 40), (120, 28), (120, 27)] {
+        let chrome = Chrome::of(Size {
+            width: w,
+            height: h,
+        });
+        let rows = screen(&a, w, h);
+        let first_sidebar_row = rows
+            .iter()
+            .position(|r| r.contains(Section::Main.icon()))
+            .unwrap_or_else(|| panic!("{w}x{h} drew no sidebar:\n{rows:#?}"));
+        assert_eq!(
+            first_sidebar_row, chrome.header_h as usize,
+            "{w}x{h}: the sidebar starts where the header ends"
+        );
+        // The labelled rail and the icon rail differ by exactly the label.
+        assert_eq!(
+            has(&rows, Section::Network.label()),
+            chrome.full_sidebar(),
+            "{w}x{h}: labels iff the wide rail:\n{rows:#?}"
+        );
+    }
 }
 
 #[test]

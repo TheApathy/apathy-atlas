@@ -92,10 +92,37 @@ fn with_no_tee_installed_there_is_nothing_to_name_and_no_fd_to_redirect() {
 }
 
 #[test]
+fn the_tee_path_follows_its_environment_override_when_one_is_set() {
+    // `$AVAROK_TUI_LOG_FILE` is how a benchmark driver puts the log where it can
+    // collect it; without it the file lands under the cache dir, named by pid
+    // so two runs cannot overwrite each other.
+    match std::env::var("AVAROK_TUI_LOG_FILE") {
+        Ok(explicit) => assert_eq!(tee_path(), std::path::PathBuf::from(explicit)),
+        Err(_) => {
+            let p = tee_path();
+            let name = p.file_name().expect("a file name").to_string_lossy();
+            assert!(name.starts_with("spark-serve-"), "{name}");
+            assert!(
+                name.contains(&std::process::id().to_string()),
+                "named by pid so concurrent runs do not collide: {name}"
+            );
+            assert!(name.ends_with(".log"), "{name}");
+            assert!(
+                p.parent()
+                    .expect("a parent")
+                    .ends_with(".cache/avarok/logs"),
+                "{}",
+                p.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn two_tee_paths_taken_in_the_same_second_are_the_same_file() {
     // The name carries a pid and a timestamp and nothing else random: a second
     // call must not invent a second log file for the same process.
-    if std::env::var("ATLAS_TUI_LOG_FILE").is_err() {
+    if std::env::var("AVAROK_TUI_LOG_FILE").is_err() {
         let a = tee_path();
         let b = tee_path();
         assert_eq!(

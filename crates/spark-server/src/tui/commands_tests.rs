@@ -257,3 +257,20 @@ fn running_a_command_snaps_the_scrollback_to_its_output() {
     assert_eq!(a.ops.scroll_up, 0, "Enter means: show me the result");
 }
 
+/// The one buffer in the tree with no cap (log ring 10_000, bench log 500):
+/// /metrics adds 40+ lines per call, and a dashboard serves for days.
+#[test]
+fn the_output_buffer_is_capped_oldest_first() {
+    let mut a = app();
+    a.ops.output = (0..1_500).map(|i| format!("old {i}")).collect();
+    execute("/help", &mut a);
+    assert_eq!(a.ops.output.len(), 1_000, "trimmed to the cap");
+    assert!(
+        a.ops.output.last().unwrap().contains("/quit"),
+        "the newest output — the command just run — is what is kept"
+    );
+    assert!(
+        !a.ops.output.iter().any(|l| l == "old 0"),
+        "the oldest lines are what went"
+    );
+}

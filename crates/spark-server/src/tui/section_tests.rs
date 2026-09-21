@@ -82,6 +82,16 @@ fn subsections_are_either_absent_or_a_pair() {
 }
 
 #[test]
+fn the_sections_with_subsections_are_the_ones_that_have_two_panes() {
+    assert_eq!(Section::Main.subs().to_vec(), vec!["Overview", "Kernels"]);
+    assert_eq!(Section::Terminal.subs().to_vec(), vec!["Ops", "Chat"]);
+    assert_eq!(Section::Help.subs().to_vec(), vec!["Guide", "Report Issue"]);
+    for s in [Section::Stats, Section::Network, Section::Library] {
+        assert!(s.subs().is_empty(), "{s:?}");
+    }
+}
+
+#[test]
 fn the_navigable_row_count_is_what_the_sidebar_draws() {
     // One row per subsection, or a single row for a section with none — the
     // count `⇥` steps through. Three hardcoded copies of this is how `⇥` came

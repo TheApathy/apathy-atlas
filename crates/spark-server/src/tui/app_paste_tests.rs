@@ -45,6 +45,30 @@ fn a_multiline_paste_into_ops_flattens_and_executes_nothing() {
 }
 
 #[test]
+fn single_line_fields_get_the_paste_flattened() {
+    // The log filter.
+    let mut a = app();
+    a.log_filter_editing = true;
+    a.on_paste("weight\nloader".into());
+    assert_eq!(a.log_filter, "weight loader");
+
+    // The Library search field.
+    let mut a = app();
+    a.section = Section::Library;
+    a.lib.filter_editing = true;
+    a.on_paste("qwen\n3.6".into());
+    assert_eq!(a.lib.filter, "qwen 3.6");
+
+    // The Library config edit buffer — the long-value case (an endpoint
+    // URL, a chat template path) is what pasting is FOR.
+    let mut a = app();
+    a.section = Section::Library;
+    a.lib.editing = true;
+    a.on_paste("/models/custom-template.jinja".into());
+    assert_eq!(a.lib.edit_buffer, "/models/custom-template.jinja");
+}
+
+#[test]
 fn control_characters_never_survive_a_paste() {
     let mut a = chat_input();
     a.on_paste("a\u{1b}b\u{7}c".into());
