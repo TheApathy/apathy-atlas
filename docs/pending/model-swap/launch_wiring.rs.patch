@@ -1,0 +1,95 @@
+// PENDING — the TUI half of the swap. Two edits, both reverted from the
+// landed change because they need `model_swap` to mean anything.
+//
+// Landed tree for reference: `LibState::launch` returns an error toast naming
+// model_swap as the one remaining gap, and `serve.rs` passes `None` to
+// `tui::start`. Restoring the swap means undoing both.
+
+// ── 1. main_modules/serve.rs, inside `startup` ──────────────────────────────
+// The dashboard needs the host to start anything, and each load must
+// republish its levers or the Stats pane samples a joined scheduler.
+// REPLACES the `crate::tui::start(args.clone(), progress_rx, None);` call.
+//
+//     let mut tui_handles_tx: Option<std::sync::mpsc::Sender<crate::tui::RunHandles>> = None;
+//     if let Some(progress_rx) = tui_progress && args.rank == 0 {
+//         let tx = crate::tui::start(args.clone(), progress_rx, Some(host.clone()));
+//         host.set_tui_handles(tx.clone());
+//         tui_handles_tx = Some(tx);
+//     }
+//
+// This also means `startup` takes `host: Arc<ModelHost>` again (the landed
+// version takes `carried` directly and never sees the host), and `load_model`
+// regains its `tui_handles_tx` parameter plus the `RunHandles` send beside the
+// scheduler spawn. CAVEAT recorded at the time: `scheduler::run` takes no
+// levers argument in this tree — the loop watchdog is gated by the global
+// `scheduler::set_enable_loop_watchdog` — so a published lever is correct to
+// READ but toggling it does not reach the scheduler. Wire that separately.
+
+// ── 2. tui/app_library.rs, in `launch_selected_recipe` ──────────────────────
+//     let Some(host) = self.host.clone() else {
+//         self.toast("no server attached to this dashboard".to_string(), true);
+//         return;
+//     };
+//     match self.lib.launch(&host) {
+
+// ── 3. tui/lib_state.rs — replaces the toast-returning `launch` ─────────────
+
+    /// Start the selected recipe, replacing whatever is running.
+    ///
+    /// Returns when the loader THREAD is spawned, not when the swap succeeds —
+    /// a load is minutes of shard reading and the dashboard must stay
+    /// interactive through it. The outcome arrives on `launch_result`, which
+    /// `poll_launch` drains: a message is a failure to show, and a silent
+    /// disconnect is success. That contract is already pinned by
+    /// `lib_state_tests.rs`.
+    ///
+    /// Off the UI thread for a second reason as well: `model_swap::swap` is
+    /// blocking and the dashboard is a plain `std::thread` with no runtime in
+    /// scope. `swap` enters the host's captured runtime handle itself, so
+    /// neither this call site nor the one inside the server has to know which
+    /// of them is already on a runtime.
+    ///
+    /// Single-flight is NOT enforced here. It is enforced inside `swap`, under
+    /// `ModelHost::swap_guard`, because this is not the only caller and a guard
+    /// at one call site is a guard the next caller forgets. Pressing `s` twice
+    /// spawns two threads; the second blocks on the guard, re-reads what is
+    /// loaded, and returns without loading anything if the winner already
+    /// loaded exactly what it wanted.
+    pub fn launch(
+        &mut self,
+        host: &std::sync::Arc<crate::main_modules::model_host::ModelHost>,
+    ) -> Result<(), String> {
+        let recipe = self.config_recipe().ok_or("no recipe selected")?;
+        // Built and VALIDATED on this thread, before anything is spawned. A
+        // recipe that cannot produce a legal command line is a form error the
+        // user can fix, and it must read as one — not as a load that starts,
+        // tears the running model down, and then discovers the same thing.
+        let args = recipe
+            .serve_args_edited(&self.overrides, &self.removed)
+            .map_err(|e| problem_line(&format!("{e:#}")))?;
+
+        let host = host.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("atlas-swap".into())
+            .spawn(move || {
+                if let Err(e) = crate::main_modules::model_swap::swap(&host, args) {
+                    // Send, do not log-and-forget: the dashboard owns this
+                    // terminal, so a `tracing::error` here is a line in the log
+                    // pane the user may never scroll to, while the load pill
+                    // sits on LOADING forever. Dropping the sender on success
+                    // is what `poll_launch` reads as "it worked".
+                    let _ = tx.send(format!("{e:#}"));
+                }
+            })
+            .map_err(|e| format!("could not start the loader thread: {e}"))?;
+        self.launch_result = Some(rx);
+        Ok(())
+    }
+
+// ── 4. main_modules/mod.rs ──────────────────────────────────────────────────
+//     pub(crate) mod model_swap;
+//
+// ── 5. serve_load.rs ────────────────────────────────────────────────────────
+// Drop the `#[allow(dead_code)]` from `Carried::from_previous` — the swap is
+// its caller.
