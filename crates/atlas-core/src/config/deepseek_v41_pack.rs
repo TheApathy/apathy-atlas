@@ -377,6 +377,55 @@ impl ExpertPack {
         Ok(mask)
     }
 
+    /// Bytes the resident experts occupy across ALL layers.
+    ///
+    /// **Sized from `packed_keep`, NEVER from the config's 384.** That distinction is not
+    /// stylistic — it is the difference between 71.7 GB and 222.0 GB on a 119 GB host:
+    ///
+    /// ```text
+    ///   384 (config n_routed_experts) -> 222.0 GB   host death
+    ///   154 (pack on disk)            ->  89.0 GB
+    ///   124 (PACKED_KEEP, served)     ->  71.7 GB   matches ARENA_GB=71.82
+    /// ```
+    ///
+    /// This is the shape of failure qwen27b-c found in `num_intermediates`: geometry driven
+    /// by a WORST-CASE CAPACITY CONSTANT rather than by what is actually enabled. There it
+    /// cost 2.3 GB and 7 ms of per-request zeroing for a disabled path; here the same mistake
+    /// allocates 3.1x the real requirement. On GB10 a GPU over-allocation takes the HOST
+    /// down, not just the process, so it must be refused before it is attempted.
+    pub fn resident_bytes(&self) -> u64 {
+        self.packed_keep as u64 * self.layers.len() as u64 * self.bytes_per_expert
+    }
+
+    /// Refuse a plan that cannot fit, BEFORE anything is allocated.
+    ///
+    /// `available_bytes` is what the caller is willing to spend. Returns the shortfall in the
+    /// error rather than a bare bool, because "how much over" is the number that tells the
+    /// operator which `packed_keep` would fit.
+    pub fn check_residency(&self, available_bytes: u64) -> Result<()> {
+        let need = self.resident_bytes();
+        if need <= available_bytes {
+            return Ok(());
+        }
+        // Largest packed_keep that would fit, as actionable advice.
+        let per_keep = self.layers.len() as u64 * self.bytes_per_expert;
+        let fits = (available_bytes / per_keep.max(1)) as usize;
+        bail!(
+            "DeepSeek-V4.1 expert residency needs {:.1} GB at packed_keep={} over {} layers, \
+             but only {:.1} GB is available (short by {:.1} GB). Largest packed_keep that \
+             fits is {}. NOTE: sizing from the config's {ROUTED_EXPERTS} experts instead of \
+             packed_keep would ask for {:.1} GB — on GB10 an over-allocation takes the HOST \
+             down, not just this process.",
+            need as f64 / 1e9,
+            self.packed_keep,
+            self.layers.len(),
+            available_bytes as f64 / 1e9,
+            (need - available_bytes) as f64 / 1e9,
+            fits,
+            (ROUTED_EXPERTS as u64 * per_keep) as f64 / 1e9,
+        )
+    }
+
     /// Resident ids for `layer`, in slot order.
     pub fn resident_ids(&self, layer: usize) -> Result<&[u32]> {
         let slots = self.layers.get(layer).with_context(|| {
@@ -631,6 +680,61 @@ mod tests {
                 tensor.name()
             );
         }
+    }
+
+    /// Residency must be sized from packed_keep, NOT the config's 384.
+    ///
+    /// The numbers are the whole point: 124 -> 71.7 GB (fits a 119 GB host and matches the
+    /// production ARENA_GB=71.82), 384 -> 222.0 GB (kills it). This is qwen27b-c's
+    /// worst-case-capacity-constant failure applied to weights instead of pools.
+    #[test]
+    fn residency_is_sized_from_packed_keep_not_the_config_expert_count() {
+        let served = ExpertPack::parse(&small(), SERVED_PACKED_KEEP).unwrap();
+        let full = ExpertPack::parse_full_pack(&small()).unwrap();
+
+        let gb = |b: u64| b as f64 / 1e9;
+        assert!(
+            (gb(served.resident_bytes()) - 71.7).abs() < 0.5,
+            "served residency should be ~71.7 GB, got {:.1}",
+            gb(served.resident_bytes())
+        );
+        assert!(
+            (gb(full.resident_bytes()) - 89.0).abs() < 0.5,
+            "full-pack residency should be ~89.0 GB, got {:.1}",
+            gb(full.resident_bytes())
+        );
+
+        // The config-sized figure is what must NEVER be allocated.
+        let per_keep = full.num_layers() as u64 * full.bytes_per_expert();
+        assert!(
+            gb(ROUTED_EXPERTS as u64 * per_keep) > 200.0,
+            "sizing from 384 experts must be visibly catastrophic"
+        );
+        assert!(served.resident_bytes() < full.resident_bytes());
+    }
+
+    /// The preflight refuses before allocating, and says which packed_keep would fit.
+    #[test]
+    fn residency_preflight_refuses_and_advises() {
+        let served = ExpertPack::parse(&small(), SERVED_PACKED_KEEP).unwrap();
+
+        // A 119 GB host with all of it free: fits.
+        assert!(served.check_residency(119_000_000_000).is_ok());
+
+        // A realistic budget after the rest of the model: does not.
+        let err = served
+            .check_residency(50_000_000_000)
+            .expect_err("50 GB cannot hold a 71.7 GB arena")
+            .to_string();
+        assert!(err.contains("short by"), "got: {err}");
+        assert!(err.contains("Largest packed_keep that fits"), "got: {err}");
+        // And it names the catastrophic alternative so nobody reaches for it.
+        assert!(err.contains("HOST"), "got: {err}");
+
+        // Exactly-enough is accepted; one byte short is not.
+        let need = served.resident_bytes();
+        assert!(served.check_residency(need).is_ok());
+        assert!(served.check_residency(need - 1).is_err());
     }
 
     /// The real artifact. Skips when the 290 GB checkpoint is absent so CI stays green.
