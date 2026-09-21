@@ -73,6 +73,92 @@ struct RawManifest {
     shards: Vec<RawShard>,
 }
 
+/// The twelve tensors a CB3 layer shard actually contains.
+///
+/// **This is the layout correction that matters.** `bytes_per_expert = 14,454,784` is the
+/// SUM over these twelve, NOT a contiguous per-expert run. Every tensor is expert-major
+/// (`[154, rows, bytes_per_row]`), so expert `i` occupies row `i` of each of the twelve
+/// independently. Treating `i * bytes_per_expert` as a file offset is wrong and lands
+/// mid-`s1` — the same class of error as assuming a tiled multi-row activation layout is
+/// `row * per_row_bytes`.
+///
+/// Measured from `k154-cb3/layers/layer-00.safetensors`; the sum is asserted against the
+/// manifest in `cb3_tensor_strides_sum_to_bytes_per_expert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cb3Tensor {
+    /// Per-expert scale planes.
+    S1,
+    S2,
+    S3,
+    /// `w1` = gate, `w2` = down, `w3` = up. `_cb` is the codebook, `_hi`/`_lo` the payload.
+    W1Cb,
+    W1Hi,
+    W1Lo,
+    W2Cb,
+    W2Hi,
+    W2Lo,
+    W3Cb,
+    W3Hi,
+    W3Lo,
+}
+
+/// All twelve, in the order they appear in the shard.
+pub const CB3_TENSORS: [Cb3Tensor; 12] = [
+    Cb3Tensor::S1,
+    Cb3Tensor::S2,
+    Cb3Tensor::S3,
+    Cb3Tensor::W1Cb,
+    Cb3Tensor::W1Hi,
+    Cb3Tensor::W1Lo,
+    Cb3Tensor::W2Cb,
+    Cb3Tensor::W2Hi,
+    Cb3Tensor::W2Lo,
+    Cb3Tensor::W3Cb,
+    Cb3Tensor::W3Hi,
+    Cb3Tensor::W3Lo,
+];
+
+impl Cb3Tensor {
+    /// Tensor name inside the layer shard.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::S1 => "s1",
+            Self::S2 => "s2",
+            Self::S3 => "s3",
+            Self::W1Cb => "w1_cb",
+            Self::W1Hi => "w1_hi",
+            Self::W1Lo => "w1_lo",
+            Self::W2Cb => "w2_cb",
+            Self::W2Hi => "w2_hi",
+            Self::W2Lo => "w2_lo",
+            Self::W3Cb => "w3_cb",
+            Self::W3Hi => "w3_hi",
+            Self::W3Lo => "w3_lo",
+        }
+    }
+
+    /// `(rows, bytes_per_row)` per expert. Rows are `moe_intermediate_size` (2304) for the
+    /// gate/up side and `hidden_size` (5120) for the down side.
+    pub fn shape(self) -> (usize, usize) {
+        match self {
+            Self::S1 | Self::S3 => (2304, 160),
+            Self::S2 => (5120, 72),
+            Self::W1Cb | Self::W3Cb => (2304, 8),
+            Self::W2Cb => (5120, 8),
+            Self::W1Hi | Self::W3Hi => (2304, 640),
+            Self::W2Hi => (5120, 288),
+            Self::W1Lo | Self::W3Lo => (2304, 1280),
+            Self::W2Lo => (5120, 576),
+        }
+    }
+
+    /// Bytes one expert occupies in THIS tensor — its row stride.
+    pub fn bytes_per_expert(self) -> u64 {
+        let (rows, bytes_per_row) = self.shape();
+        (rows * bytes_per_row) as u64
+    }
+}
+
 /// One layer's slot table: index = pack slot, value = 384-space expert id.
 #[derive(Debug, Clone)]
 pub struct LayerSlots {
@@ -152,11 +238,13 @@ impl ExpertPack {
                  allow-list disagree and reading either as the other would mis-route",
                 shard.layer
             );
-            // Experts are a fixed stride in the shard, so slot i is at i * bytes_per_expert.
-            // If this does not hold the offset arithmetic below is invalid.
+            // `bytes_per_expert` accounts for the whole of each expert. NOTE what this does
+            // and does NOT prove: it is a SUM check across the 12 CB3 tensors, not evidence
+            // that an expert is contiguous in the file. It is not — see `Cb3Tensor`.
             ensure!(
                 shard.tensor_bytes == raw.bytes_per_expert * raw.experts_kept_per_layer as u64,
-                "Layer {} tensor_bytes {} != {} x {}; experts are not a fixed stride",
+                "Layer {} tensor_bytes {} != {} x {}; the pack does not account for every \
+                 expert byte",
                 shard.layer,
                 shard.tensor_bytes,
                 raw.bytes_per_expert,
@@ -217,6 +305,11 @@ impl ExpertPack {
 
     /// Resolve a 384-space routed expert id to its slot in `layer`'s shard.
     ///
+    /// PERFORMANCE NOTE FOR WHOEVER MOVES THIS: it is a linear scan over <= 154 ids, which
+    /// is fine at LOAD time, where it runs once per expert per layer. If it ever lands on a
+    /// per-token path it wants an inverse table (`[u16; 384]` per layer, 0xFFFF for absent)
+    /// built once at parse. Do not leave the scan on a hot path.
+    ///
     /// **Hard error** when the expert is not resident — never a modulo, never a clamp.
     /// Callers that can legitimately see non-resident ids must consult [`Self::routing_mask`]
     /// BEFORE top-k, exactly as the Python engine does, rather than handling an error here.
@@ -249,10 +342,14 @@ impl ExpertPack {
         }
     }
 
-    /// Byte offset of a slot within its layer shard. Experts are a fixed stride, an
-    /// invariant checked at parse time against `tensor_bytes`.
-    pub fn slot_byte_offset(&self, slot: usize) -> u64 {
-        slot as u64 * self.bytes_per_expert
+    /// Per-expert byte stride WITHIN one CB3 tensor.
+    ///
+    /// **There is no single "offset of expert i" in the shard.** See [`CB3_TENSORS`]: the
+    /// shard holds 12 separate expert-major tensors, so one expert's data lives at 12
+    /// distinct offsets, one per tensor. `bytes_per_expert` is the SUM across all twelve,
+    /// not a contiguous run, and using it as a file offset lands in the middle of `s1`.
+    pub fn slot_stride_in(&self, tensor: Cb3Tensor) -> u64 {
+        tensor.bytes_per_expert()
     }
 
     /// The router allow-list for `layer`: `mask[id]` is true iff expert `id` is resident.
@@ -443,10 +540,14 @@ mod tests {
         assert!(ExpertPack::parse(&dup, MIN_PACKED_KEEP).is_err());
     }
 
-    /// Fixed-stride layout: slot i sits at i * bytes_per_expert. Checked at parse time
-    /// against tensor_bytes, because the offset arithmetic is invalid otherwise.
+    /// A shard whose `tensor_bytes` does not account for every expert is rejected.
+    ///
+    /// NOTE what this proves: only that the totals agree. It says NOTHING about whether an
+    /// expert is contiguous — it is not; see `cb3_tensor_strides_sum_to_bytes_per_expert`.
+    /// This test previously carried a "fixed stride" name that claimed the stronger
+    /// property it never checked.
     #[test]
-    fn non_fixed_stride_shard_is_rejected() {
+    fn shard_not_accounting_for_every_expert_byte_is_rejected() {
         let bad = small().replacen(
             "\"tensor_bytes\":2226036736",
             "\"tensor_bytes\":2226036737",
@@ -454,7 +555,76 @@ mod tests {
         );
         assert_ne!(bad, small());
         let err = ExpertPack::parse_full_pack(&bad).unwrap_err().to_string();
-        assert!(err.contains("fixed stride"), "got: {err}");
+        assert!(err.contains("every expert byte"), "got: {err}");
+    }
+
+    /// The twelve per-expert strides must sum to `bytes_per_expert`.
+    ///
+    /// THIS IS THE TEST THAT CATCHES THE LAYOUT ERROR I ACTUALLY MADE. The earlier check —
+    /// `tensor_bytes == 154 * bytes_per_expert` — passes whether or not an expert is
+    /// contiguous, because it is a SUM. It let a `slot * bytes_per_expert` file offset look
+    /// validated when it was wrong. A size-equality guard passing is not evidence about
+    /// layout.
+    #[test]
+    fn cb3_tensor_strides_sum_to_bytes_per_expert() {
+        let total: u64 = CB3_TENSORS.iter().map(|t| t.bytes_per_expert()).sum();
+        assert_eq!(
+            total, 14_454_784,
+            "the twelve CB3 tensors must account for exactly one expert"
+        );
+        // And no single tensor is the whole expert, i.e. the layout really is split.
+        assert!(CB3_TENSORS.iter().all(|t| t.bytes_per_expert() < total));
+    }
+
+    /// Verify the shapes against the SHIPPED shard header rather than trusting the table.
+    #[test]
+    fn cb3_tensor_table_matches_the_shipped_shard_header() {
+        const SHARD: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K\
+/k154-cb3/layers/layer-00.safetensors";
+        let Ok(mut file) = std::fs::File::open(SHARD) else {
+            eprintln!("skipping: {SHARD} not present");
+            return;
+        };
+        use std::io::Read;
+        let mut len = [0u8; 8];
+        file.read_exact(&mut len)
+            .expect("safetensors length prefix");
+        let mut header = vec![0u8; u64::from_le_bytes(len) as usize];
+        file.read_exact(&mut header).expect("safetensors header");
+        let header: serde_json::Value =
+            serde_json::from_slice(&header).expect("safetensors header is JSON");
+
+        for tensor in CB3_TENSORS {
+            let entry = &header[tensor.name()];
+            assert!(
+                !entry.is_null(),
+                "shard is missing tensor {}",
+                tensor.name()
+            );
+            let shape: Vec<u64> = entry["shape"]
+                .as_array()
+                .expect("shape array")
+                .iter()
+                .map(|v| v.as_u64().expect("shape entry"))
+                .collect();
+            let (rows, bytes_per_row) = tensor.shape();
+            assert_eq!(
+                shape,
+                vec![PACK_EXPERTS as u64, rows as u64, bytes_per_row as u64],
+                "shape mismatch for {}",
+                tensor.name()
+            );
+
+            // Expert-major: the declared byte span divided by 154 is the per-expert stride.
+            let offsets = entry["data_offsets"].as_array().expect("data_offsets");
+            let span = offsets[1].as_u64().unwrap() - offsets[0].as_u64().unwrap();
+            assert_eq!(
+                span / PACK_EXPERTS as u64,
+                tensor.bytes_per_expert(),
+                "per-expert stride mismatch for {}",
+                tensor.name()
+            );
+        }
     }
 
     /// The real artifact. Skips when the 290 GB checkpoint is absent so CI stays green.

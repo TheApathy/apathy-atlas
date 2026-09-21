@@ -521,7 +521,8 @@ mod deepseek_v4_indexer;
 pub use deepseek_v4_indexer::DeepSeekV4IndexerConfig;
 mod deepseek_v41_pack;
 pub use deepseek_v41_pack::{
-    ExpertPack, MIN_PACKED_KEEP, PACK_EXPERTS, ROUTED_EXPERTS, SERVED_PACKED_KEEP,
+    CB3_TENSORS, Cb3Tensor, ExpertPack, MIN_PACKED_KEEP, PACK_EXPERTS, ROUTED_EXPERTS,
+    SERVED_PACKED_KEEP,
 };
 mod deepseek_vision;
 pub use deepseek_vision::DeepSeekVisionConfig;
