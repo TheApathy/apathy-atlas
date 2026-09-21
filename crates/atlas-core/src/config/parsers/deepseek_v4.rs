@@ -19,8 +19,47 @@ use anyhow::{Context, Result};
 use super::super::{LayerType, ModelConfig, finalize_config, parse_quantization_config};
 
 pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
+    parse_deepseek_family(json, false)
+}
+
+/// Shared body for DeepSeek-V4-Flash-0731 (`is_v41 = false`) and
+/// DeepSeek-V4.1-Flash-Next (`is_v41 = true`).
+///
+/// V4.1 arrives NESTED under `text_config`; `parse_deepseek_v41` flattens it before
+/// calling here, so by this point `json` is flat for both variants. The variant flag
+/// selects the indexer admission set (geometry and `compress_ratios` alphabet differ)
+/// and the `model_type` stamped on the result — the two must stay distinguishable or
+/// the engine silently builds the 0731 model for a V4.1 checkpoint.
+pub(super) fn parse_deepseek_family(json: &str, is_v41: bool) -> Result<ModelConfig> {
     let mut raw: serde_json::Value =
         serde_json::from_str(json).context("Invalid JSON in DeepSeek-V4 config.json")?;
+    // DSpark is pure sliding-window attention: retain the declared base before
+    // legacy null sanitization and the compressed-target theta override below.
+    let main_rope_theta = raw
+        .get("rope_theta")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|theta| theta.is_finite() && *theta > 0.0);
+    if raw
+        .get("dspark_block_size")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|size| size > 0)
+    {
+        anyhow::ensure!(
+            main_rope_theta.is_some(),
+            "DeepSeek DSpark requires an explicit finite-positive base rope_theta"
+        );
+    }
+    // Preserve missing versus null before the legacy numeric sanitizer.
+    let deepseek_v4_indexer = if is_v41 {
+        super::super::DeepSeekV4IndexerConfig::parse_flat_v41(&raw)?
+    } else {
+        super::super::DeepSeekV4IndexerConfig::parse_flat(&raw)?
+    };
+    // Validate the visual contract BEFORE legacy numeric-null sanitization.
+    let deepseek_vision = super::super::DeepSeekVisionConfig::parse_flat(&raw)?;
+    if deepseek_vision.is_some() {
+        normalize_vision_layer_types(&mut raw)?;
+    }
 
     // Some DeepSeek-V4 checkpoints have `null` for numeric fields instead of
     // omitting the key. Serde's #[serde(default)] only handles missing keys,
@@ -38,6 +77,9 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
         serde_json::to_string(&raw).context("Failed to re-serialize DeepSeek-V4 config")?;
     let mut config: ModelConfig =
         serde_json::from_str(&json_fixed).context("Failed to parse deepseek_v4 config.json")?;
+    config.deepseek_vision = deepseek_vision;
+    config.deepseek_v4_indexer = deepseek_v4_indexer;
+    config.deepseek_main_rope_theta = main_rope_theta;
 
     // Map DeepSeek field names → Atlas canonical names
     if config.num_experts == 0 && config.n_routed_experts > 0 {
@@ -65,6 +107,9 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
     if config.head_dim == 0 && config.hidden_size > 0 && config.num_attention_heads > 0 {
         config.head_dim = config.hidden_size / config.num_attention_heads;
     }
+    // NOTE (V4.1): this rescue is gated on the 0731 geometry (hidden 4096 / 64 heads) and
+    // does NOT fire for V4.1 (hidden 5120). It does not need to: V4.1's text_config states
+    // head_dim = 512 explicitly, so the `head_dim == 0` fallback above never runs either.
     // DeepSeek-V4 uses MLA with head_dim=512, NOT hidden_size/num_attention_heads.
     // If the checkpoint lacks head_dim, the computed fallback (4096/64=64) breaks
     // qk_nope_head_dim, kv_dim, and all attention kernels. Force the correct value.
@@ -138,10 +183,20 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
     config.layer_types = vec![LayerType::FullAttention; config.num_hidden_layers];
 
     // Architecture flags
-    config.model_type = "deepseek_v4".to_string();
+    config.model_type = if is_v41 {
+        "deepseek_v41"
+    } else {
+        "deepseek_v4"
+    }
+    .to_string();
     config.attn_gated = false; // DeepSeek-V4 uses ungated Q
     config.nested_config = false;
-    config.weight_prefix = "model".to_string();
+    // Weight-key prefix. V4-Flash-0731 nests its tensors under `model.`; V4.1-Flash-Next
+    // does NOT — its index keys are bare (`layers.0.attn_norm.weight`, `embed.weight`,
+    // `head.weight`, `norm.weight`). Verified against the shipped
+    // `model.safetensors.index.json`: ZERO of its 3925 keys start with "model.". Leaving
+    // the 0731 prefix here makes every V4.1 weight lookup miss.
+    config.weight_prefix = if is_v41 { "" } else { "model" }.to_string();
 
     // Loss-free balancing (noaux_tc) implies correction bias
     let topk_method = raw
@@ -264,8 +319,49 @@ pub fn parse_deepseek_v4(json: &str) -> Result<ModelConfig> {
         config.yarn_mscale_all_dim,
     );
 
+    if let Some(indexer) = &config.deepseek_v4_indexer {
+        indexer.validate_model(&config)?;
+    }
     finalize_config(&mut config, &raw)?;
     Ok(config)
+}
+
+/// HF exports descriptive CSA/HCA labels, while Atlas represents all V4
+/// blocks through one attention-layer interface and dispatches using ratios.
+/// Validate the correspondence before mapping; never guess an unknown label.
+fn normalize_vision_layer_types(raw: &mut serde_json::Value) -> Result<()> {
+    let Some(labels) = raw.get("layer_types") else {
+        return Ok(());
+    };
+    let labels = labels
+        .as_array()
+        .context("DeepSeek Vision layer_types must be an array")?;
+    let layers = raw
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .context("DeepSeek Vision requires num_hidden_layers")? as usize;
+    let ratios = raw
+        .get("compress_ratios")
+        .and_then(|v| v.as_array())
+        .context("DeepSeek Vision layer_types requires compress_ratios")?;
+    anyhow::ensure!(
+        labels.len() == layers && ratios.len() >= layers,
+        "DeepSeek Vision attention schedule length mismatch"
+    );
+    for (index, label) in labels.iter().enumerate() {
+        let expected = match label.as_str() {
+            Some("sliding_attention") | Some("full_attention") => 0,
+            Some("compressed_sparse_attention") => 4,
+            Some("heavily_compressed_attention") => 128,
+            _ => anyhow::bail!("Unsupported DeepSeek Vision attention label at layer {index}"),
+        };
+        anyhow::ensure!(
+            ratios[index].as_u64() == Some(expected),
+            "DeepSeek Vision attention label/compression ratio mismatch at layer {index}"
+        );
+    }
+    raw["layer_types"] = serde_json::json!(vec!["full_attention"; layers]);
+    Ok(())
 }
 
 #[cfg(test)]

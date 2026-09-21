@@ -4,6 +4,7 @@
 //! budget.
 
 mod deepseek_v4;
+mod deepseek_v41;
 mod gemma4;
 mod laguna;
 mod lora;
@@ -14,6 +15,7 @@ mod step3p7;
 mod vision;
 
 pub(crate) use deepseek_v4::parse_deepseek_v4;
+pub(crate) use deepseek_v41::parse_deepseek_v41;
 pub(crate) use gemma4::parse_gemma4_params;
 pub(crate) use laguna::parse_laguna;
 pub use lora::{PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_peft_adapter_config};
