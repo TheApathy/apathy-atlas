@@ -24,7 +24,8 @@ use super::attn_block::{self, AttnCore, AttnScratch, HEAD_DIM, RING, V41AttnWeig
 use super::fwd::{BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block};
 use super::ops::{Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
 use crate::layers::deepseek_v41_engram::{
-    EngramGather, EngramHashState, N_HEAD_COLS, engram_dead_heads_with_carry, update_dead_carry,
+    EngramGather, EngramHashState, N_HEAD_COLS, engram_dead_heads, engram_dead_heads_with_carry,
+    update_dead_carry,
 };
 
 /// Set to dump `engram_in` (the block's `h` going INTO the engram projection),
@@ -265,12 +266,25 @@ impl V41Forward {
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
         let hashes = seq.hash.forward(ids, start, None)?;
-        // `engine/v41_engine.py:755` hashes the WHOLE image-expanded prompt once and slices
-        // per chunk -- carrying the trailing MAX_LOOKBACK raw ids is the exact equivalent
-        // (see deepseek_v41_engram::dead_heads's module doc), and is what makes an image
-        // span that straddles a chunk boundary come out right. All-False for text either way.
-        let dead: Vec<u8> = engram_dead_heads_with_carry(&seq.dead_carry, ids).into_iter().map(u8::from).collect();
-        update_dead_carry(&mut seq.dead_carry, ids);
+        // PREFILL (`engine/v41_engine.py:755`) hashes the WHOLE image-expanded prompt once and
+        // slices per chunk -- carrying the trailing MAX_LOOKBACK raw ids across chunks is the
+        // exact equivalent (see deepseek_v41_engram::dead_heads's module doc). DECODE does NOT
+        // carry: `m.forward(block, pos, prefill=False)` (v41_engine.py:912, 1037) passes no
+        // dead_heads, so `model.py:746-747`'s fallback computes it fresh from that call's own
+        // (single-token) ids with no history. Corrected 2026-09-22 by dsv41-parity: an earlier
+        // version of this carried on decode too, which is wrong at exactly the position right
+        // after an image-ending prompt's first generated token. Replay never reaches an engram
+        // layer, so it never exercises this branch either way.
+        let dead: Vec<u8> = match kind {
+            PassKind::Decode => engram_dead_heads(ids),
+            _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
+        }
+        .into_iter()
+        .map(u8::from)
+        .collect();
+        if kind != PassKind::Decode {
+            update_dead_carry(&mut seq.dead_carry, ids);
+        }
         if engram_debug() {
             // Straight off the host buffer this chunk is about to upload -- proves the mask
             // reaches the point of upload, not merely that it was computed somewhere upstream.

@@ -38,10 +38,19 @@
 //! `max_ngram_size - 1` (3) raw ids from before the chunk, not the whole
 //! history, because no group looks back further than that. A caller holding
 //! per-sequence state should keep exactly that many trailing ids and pass them
-//! in; `engram_dead_heads` alone (no carry) is correct ONLY for a sequence's
-//! first chunk, or wherever the true predecessor ids are unavailable/text-only
-//! (decode is safe either way once the carry itself is up to date, since real
-//! decode tokens are never image ids).
+//! in.
+//!
+//! **CORRECTED AGAIN 2026-09-22 (dsv41-parity): carry applies to PREFILL
+//! chunks ONLY, not decode.** `engine/v41_engine.py`'s decode call sites
+//! (`m.forward(block, pos, prefill=False)`, lines 912/1037) pass no
+//! `dead_heads` kwarg at all, so `model.py:746-747`'s local fallback runs —
+//! computed fresh from that decode step's own token(s), no history. That
+//! fallback is the correct citation for DECODE specifically (it was simply the
+//! wrong citation for prefill chunk boundaries, which is what the first
+//! correction above was about). A caller must NOT carry across a decode step:
+//! the position right after an image-ending prompt's last prefill chunk is
+//! exactly where carrying-on-decode and not-carrying disagree, since the
+//! sentinel can sit within `MAX_LOOKBACK` of the first generated token.
 //!
 //! `runD_L20_kernel`'s chunk 1 (S=512) mask is bit-identical to chunk 0's on a
 //! TEXT-ONLY prompt (both all-False) regardless of carry — that capture cannot
