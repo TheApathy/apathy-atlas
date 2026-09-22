@@ -194,9 +194,17 @@ fn main() {
         // against the case where ATLAS_TARGET_MODEL changes and re-numbers
         // the targets — without it we'd happily reuse a stale PTX from a
         // different model that happened to land at the same `idx`.
+        // The nvcc flags are part of the identity too: a KERNEL.toml flag
+        // change (or the fast-math opt-out) touches no .cu/.cuh, so without
+        // them here every cached PTX would be reused, compiled under the OLD
+        // flags, while cargo reports success.
         let signature = format!(
-            "{}|{}|{}|{}",
-            target.hw, target.model, target.quant, target.arch,
+            "{}|{}|{}|{}|{}",
+            target.hw,
+            target.model,
+            target.quant,
+            target.arch,
+            target.extra_flags.join(" "),
         );
         let signature_file = out_dir.join(format!("t{idx}__signature"));
         let signature_matches = std::fs::read_to_string(&signature_file)

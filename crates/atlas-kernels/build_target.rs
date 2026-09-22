@@ -6,6 +6,10 @@
 // is reachable through `super::build_target::*`.
 
 use std::path::PathBuf;
+
+/// KERNEL.toml `extra_nvcc_flags` sentinel: build this target without
+/// `--use_fast_math`. Consumed here, never forwarded to nvcc.
+pub(crate) const IEEE_MATH_SENTINEL: &str = "--atlas-ieee-math";
 use std::process::Command;
 
 use super::build_codegen::find_cuda_dir;
@@ -60,15 +64,20 @@ impl ComputeTarget for NvidiaTarget {
         // floor is far above fast-math drift. -Xptxas -O3 forces PTX-level
         // optimization too. Adds ~5-15% throughput on math-heavy kernels
         // (gated_delta_rule, l2_norm, rms_norm, gdn_decode).
-        let mut args = vec![
-            "--ptx".into(),
-            format!("-arch={arch}"),
-            "-O3".into(),
-            "--use_fast_math".into(),
-            "-Xptxas".into(),
-            "-O3".into(),
-        ];
-        args.extend(extra_flags.iter().cloned());
+        //
+        // A target whose KERNEL.toml lists the sentinel `--atlas-ieee-math`
+        // opts out of --use_fast_math entirely (the sentinel itself is not
+        // passed to nvcc). GLM-5.3 uses it: its kernels were developed and
+        // gated under upstream's IEEE build (no ftz, precise div/sqrt), and
+        // fast math moved its 2047-token prefill logits by rel-L2 0.13.
+        let ieee = extra_flags.iter().any(|f| f == IEEE_MATH_SENTINEL);
+        let mut args: Vec<String> = vec!["--ptx".into(), format!("-arch={arch}"), "-O3".into()];
+        if !ieee {
+            args.push("--use_fast_math".into());
+        }
+        args.push("-Xptxas".into());
+        args.push("-O3".into());
+        args.extend(extra_flags.iter().filter(|f| *f != IEEE_MATH_SENTINEL).cloned());
         args.push(source.to_str().unwrap().into());
         args.push("-o".into());
         args.push(output.to_str().unwrap().into());

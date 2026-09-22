@@ -1,3 +1,9 @@
+# Upstream builds these kernels WITHOUT --use_fast_math and merges
+# common/KERNEL.toml's flags (--fmad=false, -DTQ_PLUS_SIGNS) in; the GLM
+# prefill/decode levers were measured and gated that way. Reproduce it here.
+[build]
+extra_nvcc_flags = ["--atlas-ieee-math", "--fmad=false", "-DTQ_PLUS_SIGNS"]
+
 [modules]
 glm53_activations = "glm53_activations"
 glm53_dflash2_attention = "glm53_dflash2_attention"
