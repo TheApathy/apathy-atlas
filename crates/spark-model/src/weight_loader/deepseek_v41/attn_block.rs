@@ -238,6 +238,10 @@ pub fn attention(
         ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
         return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
     }
+    if t <= super::ops::GEMV_MAX_M && ops.k.fp8_gemv_m8.is_some() {
+        ops.fp8_gemv_rows(s.o, N_HEADS * HEAD_DIM, &w.wo_a, s.o2, O_GROUPS * O_LORA, t, O_LORA, grp_k)?;
+        return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
+    }
     // `v41_ref.wo_a_proj` runs the grouped fp8 kernel (row-invariant, not row-tiled), so the
     // same row policy as `linear_fp8_tiled`: one GEMM per group at M > 16, one tile at M <= 16.
     prof(ops, "dense/dequant", || ops.dequant(&w.wo_a, wscratch))?;
