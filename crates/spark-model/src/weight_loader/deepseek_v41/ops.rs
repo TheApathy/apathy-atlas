@@ -164,6 +164,9 @@ pub struct Dsv41Kernels {
     pub hc_mean_bf16: KernelHandle,
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
+    /// `dsv41_fp8_gemv_m8`: the same GEMV for 2..=8 rows, each row bit-identical to the M = 1
+    /// kernel. Used only with [`DENSE_GEMV_SMALL_M_ENV`]`=1` until it is gated end to end.
+    pub fp8_gemv_m8: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
     pub hc_split: Option<(KernelHandle, KernelHandle, DevicePtr)>,
 }
@@ -177,6 +180,11 @@ pub const DECODE_DENSE_MODULE: &str = "dsv41_decode";
 /// ON by default (`ATLAS_DSV41_DENSE_GEMV=0` turns it off): every M = 1 FP8 linear runs as
 /// a direct fp8 GEMV instead of dequant-to-bf16 + a 16-row GEMM.
 pub const DENSE_GEMV_ENV: &str = "ATLAS_DSV41_DENSE_GEMV";
+/// `ATLAS_DSV41_DENSE_GEMV_SMALL_M=1`: FP8 linears with 2..=8 rows also take the GEMV (for
+/// speculative verify). Off by default: it changes prefill tails of <= 8 rows.
+pub const DENSE_GEMV_SMALL_M_ENV: &str = "ATLAS_DSV41_DENSE_GEMV_SMALL_M";
+/// Largest row count the small-M GEMV serves.
+pub const GEMV_MAX_M: usize = 8;
 const GEMV_WARPS: u32 = 8;
 
 impl Dsv41Kernels {
@@ -215,6 +223,13 @@ impl Dsv41Kernels {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
                     format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
                 })?)
+            } else {
+                None
+            },
+            fp8_gemv_m8: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0")
+                && std::env::var(DENSE_GEMV_SMALL_M_ENV).as_deref() == Ok("1")
+            {
+                Some(k2("dsv41_fp8_gemv_m8")?)
             } else {
                 None
             },
@@ -394,6 +409,9 @@ impl Ops<'_> {
         if m == 1 && self.k.fp8_gemv_m1.is_some() {
             return self.fp8_gemv_m1(x, w, out, w.n, 0);
         }
+        if m <= GEMV_MAX_M && self.k.fp8_gemv_m8.is_some() {
+            return self.fp8_gemv_rows(x, w.k, w, out, w.n, m, w.n, 0);
+        }
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
         prof(self, "dense/gemm", || {
             if m > MM_TILE && !fp8_force_rowtile() {
@@ -431,6 +449,24 @@ impl Ops<'_> {
             .arg_ptr(x).arg_ptr(w.weight).arg_ptr(w.scale).arg_ptr(out)
             .arg_u32(w.n as u32).arg_u32(w.k as u32)
             .arg_u32(n_per_group as u32).arg_u32(x_group_stride as u32)
+            .launch(self.stream)
+    }
+
+    /// [`Self::fp8_gemv_m1`] for `m` (<= 8) activation rows `ldx` elements apart, writing output
+    /// rows `ldo` apart. Each row is bit-identical to its own M = 1 call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fp8_gemv_rows(&self, x: DevicePtr, ldx: usize, w: &Fp8Linear, out: DevicePtr, ldo: usize, m: usize, n_per_group: usize, x_group_stride: usize) -> Result<()> {
+        let kernel = self.k.fp8_gemv_m8.context("small-M fp8 GEMV not loaded")?;
+        ensure!(m >= 1 && m <= GEMV_MAX_M, "small-M fp8 GEMV: m = {m}");
+        ensure!(w.k % 16 == 0 && (n_per_group == w.n || n_per_group % 32 == 0), "fp8 GEMV extents: n {} k {} group {n_per_group}", w.n, w.k);
+        ensure!(ldx % 8 == 0, "fp8 GEMV: x row stride {ldx} must keep 16-byte alignment");
+        KernelLaunch::new(self.gpu, kernel)
+            .grid([(w.n as u32).div_ceil(GEMV_WARPS), 1, 1])
+            .block([32 * GEMV_WARPS, 1, 1])
+            .arg_ptr(x).arg_ptr(w.weight).arg_ptr(w.scale).arg_ptr(out)
+            .arg_u32(w.n as u32).arg_u32(w.k as u32)
+            .arg_u32(n_per_group as u32).arg_u32(x_group_stride as u32)
+            .arg_u32(m as u32).arg_u32(ldx as u32).arg_u32(ldo as u32)
             .launch(self.stream)
     }
 
