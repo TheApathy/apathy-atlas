@@ -110,6 +110,8 @@ pub struct Dsv41Model {
     /// The DSpark greedy speculator (drafter loaded): `decode_multi` runs its steps. Behind a
     /// Mutex because its drafter MoE keeps interior scratch state.
     dspark: Option<Mutex<Dspark>>,
+    /// Per-sequence DSpark counters (steps, accepted drafts), logged when the sequence is freed.
+    spec_stats: Mutex<(usize, usize)>,
 }
 
 // SAFETY-adjacent: every field is either immutable after construction, behind a Mutex, or a
@@ -186,6 +188,7 @@ impl Dsv41Model {
             next_slot: Mutex::new(0),
             tap,
             dspark,
+            spec_stats: Mutex::new((0, 0)),
         })
     }
 
@@ -355,6 +358,11 @@ impl Model for Dsv41Model {
             let ds = ds.lock().expect("dspark poisoned");
             ds.step_with_stop(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits, false, stop_ids)
         })?;
+        {
+            let mut st = self.spec_stats.lock().expect("dsv41 spec stats poisoned");
+            st.0 += 1;
+            st.1 += out.accepted;
+        }
         let accepted = out.emitted[..out.accepted].to_vec();
         seq.tokens.push(token);
         seq.tokens.extend_from_slice(&accepted);
@@ -434,6 +442,10 @@ impl Model for Dsv41Model {
         }
         if let Some(s) = self.seqs.lock().expect("dsv41 seqs poisoned").remove(&seq.slot_idx) {
             s.free(self.gpu.as_ref())?;
+        }
+        let (steps, acc) = std::mem::take(&mut *self.spec_stats.lock().expect("dsv41 spec stats poisoned"));
+        if steps > 0 {
+            tracing::info!("DSpark: {steps} speculative steps, {acc} drafts accepted ({:.2} tokens/step)", (steps + acc) as f64 / steps as f64);
         }
         Ok(())
     }
