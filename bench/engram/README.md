@@ -35,3 +35,18 @@ engine. It is **not** the bottleneck. The thread count is the whole game.
 - **UNVALIDATED: the dead-head mask.** On a text-only prompt `engram_dead_heads` is
   identically all-False, so `masked_fill` is a no-op and any comparison passes by
   construction. Validating it needs a capture containing a real image span.
+
+## Row reuse (why `gather_dedup` exists)
+
+Measured on the real 2048-token prompt above:
+
+| lookups | unique rows | saving |
+|---|---|---|
+| 98,304 (both layers) | 75,483 | **23.2%** |
+| 2-gram columns | 20,847 / 32,768 | 36.4% |
+| 3-gram columns | 26,191 / 32,768 | 20.1% |
+| 4-gram columns | 28,443 / 32,768 | 13.2% |
+
+A duplicate costs a full 4 KiB page fault, so the dedup removes ~23% of the I/O for
+the price of a hash map. The gradient — shorter n-grams repeat more — is what
+natural text should produce, and is a soft check that the hash is not degenerate.

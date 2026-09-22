@@ -46,6 +46,13 @@ pub const ENGRAM_HEAD_DIM: usize = 256;
 /// Values covered by one ue8m0 scale.
 pub const ENGRAM_SCALE_GROUP: usize = 32;
 
+/// Default reader threads. This is the single most consequential knob in the
+/// module: at the decode point (48 rows) one thread costs 20.3 ms against 1.21 ms
+/// at 32, a 17x regression, and it is the only way to make engram a bottleneck.
+/// 128 is a good compromise across the decode and prefill batch sizes — the reads
+/// block in the kernel, so oversubscribing cores is the point.
+pub const DEFAULT_ENGRAM_THREADS: usize = 128;
+
 const FADV_RANDOM: libc::c_int = 1;
 
 /// One engram layer's table: a whole safetensors shard holding exactly the
@@ -142,9 +149,22 @@ pub struct EngramTier {
 
 impl EngramTier {
     /// `shards[i]` must correspond to `layer_ids[i]`, in the model's order.
+    ///
+    /// Prefer [`DEFAULT_ENGRAM_THREADS`] unless you have measured something better
+    /// — see the note on that constant before passing a small number.
     pub fn new(shards: Vec<EngramShard>, threads: usize) -> Result<Self> {
         if shards.is_empty() {
             bail!("EngramTier needs at least one shard");
+        }
+        if threads < 8 {
+            // Not an error — a caller may genuinely want a serial read — but this
+            // is worth a line in the log, because it is a 17x cliff and it shows
+            // up as "the model is slow", never as "the reader is misconfigured".
+            tracing::warn!(
+                threads,
+                "engram tier configured with < 8 reader threads; expect a large \
+                 latency penalty (1 thread measures 20.3 ms/token vs 1.21 ms at 32)"
+            );
         }
         Ok(Self { shards, threads: threads.clamp(1, 512) })
     }
