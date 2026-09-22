@@ -78,17 +78,37 @@ fn library() -> Option<&'static TurboJpeg> {
     static LIB: OnceLock<Option<TurboJpeg>> = OnceLock::new();
     LIB.get_or_init(|| {
         let lib = load();
-        if lib.is_none() {
-            tracing::warn!(
-                "libturbojpeg.so.0 not found: DeepSeek-V4.1 JPEG input falls back to zune-jpeg, whose \
-                 pixels differ from the Python engine's (install libturbojpeg to match)"
-            );
+        match &lib {
+            Some(tj) => {
+                // Which file actually got mapped, and whether it is the 3.x ABI:
+                // parity was verified against 2.1.5 (Ubuntu) == Pillow's 3.0.3,
+                // so a different build must be visible in the startup log.
+                let file = std::fs::read_to_string("/proc/self/maps")
+                    .ok()
+                    .and_then(|m| m.lines().find(|l| l.contains("turbojpeg")).map(|l| {
+                        l.split_whitespace().last().unwrap_or_default().to_string()
+                    }))
+                    .unwrap_or_else(|| "?".into());
+                // SAFETY: symbol lookup only; the pointer is never called.
+                let v3 = unsafe { tj._lib.get::<InitFn>(b"tj3Init\0").is_ok() };
+                tracing::info!(
+                    "deepseek_v41 JPEG decoder: libjpeg-turbo {file} ({} ABI); pixel parity with \
+                     Pillow verified on 2.1.5",
+                    if v3 { "3.x" } else { "2.x" }
+                );
+            }
+            None => tracing::error!(
+                "!!! libturbojpeg.so.0 NOT FOUND: DeepSeek-V4.1 JPEG input falls back to zune-jpeg, \
+                 whose pixels DIFFER from the Python engine's (28% of RGB values, up to 12 levels). \
+                 Install libturbojpeg to restore parity."
+            ),
         }
         lib
     })
     .as_ref()
 }
 
+/// Also forces the load, so the decoder choice is logged at startup.
 pub fn available() -> bool {
     library().is_some()
 }

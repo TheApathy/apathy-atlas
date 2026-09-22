@@ -941,6 +941,8 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
 
     if config.model_type == "deepseek_v41" {
         crate::dsv41::repetition::configure(true);
+        // Resolve the JPEG decoder now so its version (or the fallback) is in the startup log.
+        let _ = crate::dsv41::turbojpeg::available();
         if !crate::scheduler::force_disable_watchdogs() {
             tracing::warn!(
                 "deepseek_v41: auto-watchdogs were already resolved ON; outputs will diverge from the Python engine"
