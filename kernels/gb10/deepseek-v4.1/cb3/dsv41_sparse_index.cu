@@ -379,3 +379,44 @@ extern "C" __global__ void dsv41_iota_i32(int* __restrict__ OUT, int start, int 
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) OUT[i] = start + i * stride;
 }
+
+// C[M, N] = A[M, K] @ B[N, K]^T, TRUE fp32 (no tensor cores), for the ratio-2 compressor.
+// Every output is ONE sequential fmaf chain over k = 0..K-1, so a row's result does not depend on
+// M, on the tile it lands in, or on how the prompt was chunked -- invariance by construction,
+// without the reference's 16-row tiling (which, through cuBLASLt's fp32 path, cost 24 ms per
+// call: 32 x 16-row GEMMs re-reading a 10.5 MB weight). 64x64 tile, 256 threads x (4x4) outputs.
+// Requires K % 16 == 0.
+extern "C" __global__ void __launch_bounds__(256) dsv41_gemm_f32_nt(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K)
+{
+    __shared__ float as[16][64 + 4];
+    __shared__ float bs[16][64 + 4];
+    const int tid = threadIdx.x;
+    const int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    const int tm = (tid / 16) * 4, tn = (tid % 16) * 4;
+    float acc[4][4] = {};
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        for (int i = tid; i < 64 * 16; i += 256) {
+            const int r = i / 16, k = i % 16;
+            as[k][r] = (m0 + r < M) ? A[(size_t)(m0 + r) * K + k0 + k] : 0.f;
+            bs[k][r] = (n0 + r < N) ? B[(size_t)(n0 + r) * K + k0 + k] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            float a[4], b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) { a[i] = as[k][tm + i]; b[i] = bs[k][tn + i]; }
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            if (m0 + tm + i < M && n0 + tn + j < N) C[(size_t)(m0 + tm + i) * N + n0 + tn + j] = acc[i][j];
+}

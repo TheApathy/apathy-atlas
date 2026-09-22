@@ -234,6 +234,9 @@ pub struct Dsv41SparseCore {
     prof: Prof,
     /// `ATLAS_DSV41_ATTN_SPLIT=0` forces the one-pass kernel for decode too (A/B arm only).
     split_on: bool,
+    /// `ATLAS_DSV41_COMP_CUBLAS=1`: the ratio-2 compressor's fp32 projections as the reference
+    /// issues them (cuBLASLt, 16-row tiles) instead of `dsv41_gemm_f32_nt` (A/B arm only).
+    comp_cublas_tiled: bool,
 }
 
 fn dev_f32_copy(gpu: &dyn GpuBackend, fwd: &Dsv41Kernels, bf: DevicePtr, n: usize) -> Result<DevicePtr> {
@@ -393,6 +396,7 @@ impl Dsv41SparseCore {
             st: Mutex::new(SeqState { has_pending: vec![false; 40], ..SeqState::default() }),
             prof: Prof::new(),
             split_on: std::env::var("ATLAS_DSV41_ATTN_SPLIT").as_deref() != Ok("0"),
+            comp_cublas_tiled: std::env::var("ATLAS_DSV41_COMP_CUBLAS").as_deref() == Ok("1"),
         })
     }
 
@@ -473,13 +477,18 @@ impl Dsv41SparseCore {
                 gpu.copy_d2d_async(c.pending.offset(row), s.sc, row, stream)?;
             }
             let wgate = c.wgate.expect("ratio-2 has a gate");
-            tiled(gpu, s.pad_in, s.pad_out, s.xf, s.kvl.offset(pend * row), t, HIDDEN * 4, row, stream, |x, o| {
-                ops.linear_f32(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
-            })?;
-            tiled(gpu, s.pad_in, s.pad_out, s.xf, s.sc.offset(pend * row), t, HIDDEN * 4, row, stream, |x, o| {
-                ops.linear_f32(x, wgate, o, MM_TILE, HEAD_DIM, HIDDEN)
-            })?;
-            self.prof.mark(ops, "compress.gemm_f32_x2")?;
+            if self.comp_cublas_tiled {
+                tiled(gpu, s.pad_in, s.pad_out, s.xf, s.kvl.offset(pend * row), t, HIDDEN * 4, row, stream, |x, o| {
+                    ops.linear_f32(x, c.wkv, o, MM_TILE, HEAD_DIM, HIDDEN)
+                })?;
+                tiled(gpu, s.pad_in, s.pad_out, s.xf, s.sc.offset(pend * row), t, HIDDEN * 4, row, stream, |x, o| {
+                    ops.linear_f32(x, wgate, o, MM_TILE, HEAD_DIM, HIDDEN)
+                })?;
+            } else {
+                iops.gemm_f32(s.xf, c.wkv, s.kvl.offset(pend * row), t, HEAD_DIM, HIDDEN)?;
+                iops.gemm_f32(s.xf, wgate, s.sc.offset(pend * row), t, HEAD_DIM, HIDDEN)?;
+            }
+            self.prof.mark(ops, if self.comp_cublas_tiled { "compress.gemm_f32_x2.cublas16" } else { "compress.gemm_f32_x2" })?;
             if n % 2 == 1 {
                 gpu.copy_d2d_async(s.kvl.offset((n - 1) * row), c.pending, row, stream)?;
                 gpu.copy_d2d_async(s.sc.offset((n - 1) * row), c.pending.offset(row), row, stream)?;

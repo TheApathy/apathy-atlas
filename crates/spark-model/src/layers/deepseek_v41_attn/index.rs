@@ -53,6 +53,7 @@ pub struct IndexKernels {
     pub combine2: KernelHandle,
     pub wts: KernelHandle,
     pub iota: KernelHandle,
+    pub gemm_f32: KernelHandle,
 }
 
 impl IndexKernels {
@@ -73,6 +74,7 @@ impl IndexKernels {
             combine2: k("dsv41_compress_combine2")?,
             wts: k("dsv41_index_wts")?,
             iota: k("dsv41_iota_i32")?,
+            gemm_f32: k("dsv41_gemm_f32_nt")?,
         })
     }
 }
@@ -192,6 +194,20 @@ impl IndexOps<'_> {
             .grid([Self::grid_1d(n)?, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(raw).arg_ptr(out).arg_f32(scale).arg_i32(n as i32)
+            .launch(self.stream)
+    }
+
+    /// `c[m, n] = a[m, k] @ b[n, k]^T` in TRUE fp32, one sequential fmaf chain per output
+    /// (row-invariant by construction). `k % 16 == 0`.
+    pub fn gemm_f32(&self, a: DevicePtr, b: DevicePtr, c: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
+        ensure!(k % 16 == 0, "gemm_f32: K {k} not a multiple of 16");
+        if m == 0 {
+            return Ok(());
+        }
+        KernelLaunch::new(self.gpu, self.k.gemm_f32)
+            .grid([n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1])
+            .block([256, 1, 1])
+            .arg_ptr(a).arg_ptr(b).arg_ptr(c).arg_i32(m as i32).arg_i32(n as i32).arg_i32(k as i32)
             .launch(self.stream)
     }
 
