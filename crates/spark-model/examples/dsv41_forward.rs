@@ -31,6 +31,10 @@ use spark_model::weight_loader::deepseek_v41::fwd::{
 use spark_model::weight_loader::deepseek_v41::attn_block::{
     self, AttnCore, AttnScratch, CoreArgs, HEAD_DIM, N_HEADS, RING, V41AttnWeights, compress_ratio,
 };
+use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP};
+use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
+use spark_model::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
+use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind, PrefillMode, V41Forward, V41Seq};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
@@ -177,6 +181,84 @@ fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
     Ok((0..n).step_by(chunk).map(|s| (s, chunk.min(n - s))).collect())
 }
 
+/// The engine lane's routed MoE over an arena holding layers `0..n_layers` (1.79 GB each at
+/// keep=124). The full 40-layer load is 71.7 GB and needs lead approval.
+fn real_moe<'a>(
+    store: &spark_runtime::weights::WeightStore,
+    gpu: &'a AtlasCudaBackend,
+    kernels: &'a Dsv41Kernels,
+    config: &atlas_core::config::ModelConfig,
+    n_layers: usize,
+    max_t: usize,
+) -> Result<Cb3RoutedMoe<'a>> {
+    let pack_dir = Path::new(MODEL_DIR).join("k154-cb3");
+    let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
+    let layers: Vec<usize> = (0..n_layers).collect();
+    let arena = Arc::new(Cb3ExpertArena::load_layer_subset(&pack_dir, &pack, &layers, gpu)?);
+    println!("routed MoE: {} layers resident, {:.2} GB", layers.len(), arena.resident_bytes() as f64 / 1e9);
+    let stream = gpu.default_stream();
+    let routers = layers
+        .iter()
+        .map(|&l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
+        .collect::<Result<Vec<_>>>()?;
+    Cb3RoutedMoe::new(gpu, kernels, config, arena, routers, 10.0, 1.5, max_t)
+}
+
+struct NoHook;
+impl PassHook for NoHook {
+    fn begin_pass(&self, _: PassKind, _: usize, _: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The SERVING forward (`V41Forward`: CED encoder chunks + SWA replay + head), with the
+/// attention core and the routed MoE teacher-forced from an all-layer capture (runH).
+/// Validates the orchestration end to end before the lanes' halves exist.
+#[allow(clippy::too_many_arguments)]
+fn run_model_path(
+    store: &spark_runtime::weights::WeightStore,
+    ops: &Ops,
+    config: &atlas_core::config::ModelConfig,
+    dims: V41Dims,
+    ref_dir: &Path,
+    ids: &[u32],
+    chunks: &[(usize, usize)],
+    n_layers: usize,
+    tap_dir: Option<PathBuf>,
+    gpu: Arc<AtlasCudaBackend>,
+    moe_real: bool,
+) -> Result<()> {
+    let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
+    let max_chunk = chunks.iter().map(|c| c.1).max().unwrap_or(1);
+    let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
+    let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };
+    let core = FedCore(&feeder);
+    let fed_moe = FedMoe(&feeder, dims.hidden);
+    let real;
+    let moe: &dyn V41RoutedMoe = if moe_real {
+        real = real_moe(store, gpu_ref, ops.k, config, n_layers, max_chunk.max(128))?;
+        &real
+    } else {
+        &fed_moe
+    };
+    let tap = match tap_dir {
+        Some(d) => Tap::to_dir(d, Vec::new())?,
+        None => Tap::off(),
+    };
+    let mut seq = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
+    let logits = ops.gpu.alloc(config.vocab_size * 2)?;
+    fwd.prefill(ops, &mut seq, ids, PrefillMode::Replay, &NoHook, &core, moe, &tap, logits)?;
+    tap.bf16(ops, "logits_last", 40, logits, &[config.vocab_size])?;
+    ops.gpu.synchronize(ops.stream)?;
+    let mut host = vec![0u8; config.vocab_size * 2];
+    ops.gpu.copy_d2h(logits, &mut host)?;
+    let v: Vec<f32> = host.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
+    let (arg, max) = v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a });
+    println!("model path (replay): prompt {} tokens, argmax {arg} (logit {max})", ids.len());
+    println!("DONE dsv41_forward path=model");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut run = "runA".to_string();
     let mut n_layers = 3usize;
@@ -184,6 +266,8 @@ fn main() -> Result<()> {
     let mut tap_dir: Option<PathBuf> = None;
     let mut control = BlockControl::None;
     let mut rope_swap = false;
+    let mut model_path = false;
+    let mut moe_real = false;
     let mut engram_live = false;
     let mut head_test = false;
     let mut args = std::env::args().skip(1);
@@ -201,6 +285,14 @@ fn main() -> Result<()> {
                 }
             }
             "--head-test" => head_test = true,
+            "--moe-real" => moe_real = true,
+            "--path" => {
+                model_path = match args.next().context("--path")?.as_str() {
+                    "model" => true,
+                    "driver" => false,
+                    o => bail!("--path model|driver, got {o}"),
+                }
+            }
             "--control" => {
                 control = match args.next().context("--control")?.as_str() {
                     "own-pre" => BlockControl::OwnPre,
@@ -245,6 +337,9 @@ fn main() -> Result<()> {
     let kernels = Dsv41Kernels::load(gpu.as_ref())?;
     let stream = gpu.default_stream();
     let ops = Ops { gpu: gpu.as_ref(), k: &kernels, stream };
+    if model_path {
+        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real);
+    }
     let blocks: Vec<V41BlockWeights> = (0..n_layers).map(|l| V41BlockWeights::load(&store, l, &dims, &ops)).collect::<Result<_>>()?;
     let largest = blocks
         .iter()
@@ -292,7 +387,15 @@ fn main() -> Result<()> {
     } else {
         &Refuse("attention")
     };
-    let moe: &dyn V41RoutedMoe = if feed.iter().any(|f| f == "moe") { &fed_moe } else { &Refuse("routed MoE") };
+    let real;
+    let moe: &dyn V41RoutedMoe = if feed.iter().any(|f| f == "moe") {
+        &fed_moe
+    } else if moe_real {
+        real = real_moe(&store, gpu.as_ref(), &kernels, &config, n_layers, max_t)?;
+        &real
+    } else {
+        &Refuse("routed MoE")
+    };
 
     let mut hash = if engram_live { Some(engram_hash_state()?) } else { None };
     let gathers: HashMap<usize, EngramGather> = if engram_live {
@@ -311,6 +414,7 @@ fn main() -> Result<()> {
     // is layer-independent, so one upload per chunk covers both engram layers.
     let d_dead = gpu.alloc(max_t * 24)?;
     for &(start, t) in &chunks {
+        moe.begin_pass(&ids[start..start + t])?;
         let chunk_ids = &ids[start..start + t];
         let hashes = match hash.as_mut() {
             Some(h) => Some(h.forward(chunk_ids, start, None)?),

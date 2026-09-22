@@ -40,7 +40,7 @@ use spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
     Cb3RoutedMoe, MoeControl, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
-use spark_model::weight_loader::deepseek_v41::ops::Dsv41Kernels;
+use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_model::weight_loader::deepseek_v41::routing::Routing;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::GpuBackend;
@@ -204,7 +204,7 @@ fn main() -> Result<()> {
             (num / den).sqrt(),
             want_idx.len()
         );
-        moe.forward(layer, d_in, d_out, tokens, stream)?;
+        moe.forward(&Ops { gpu: &gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;
     } else {
         let routing = Routing { indices: want_idx.clone(), weights: want_w.clone(), k: TOP_K };
         moe.forward_routed(layer, d_in, d_out, tokens, &routing, stream)?;

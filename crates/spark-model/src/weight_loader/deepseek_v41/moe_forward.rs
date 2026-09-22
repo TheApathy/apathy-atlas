@@ -38,7 +38,7 @@ use super::moe::{
     PERMUTE_KERNEL, SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, expert_matrices, gemm_weight_t_f32out,
     group_by_expert,
 };
-use super::ops::Dsv41Kernels;
+use super::ops::{Dsv41Kernels, Ops};
 use super::routing::{Routing, VisionBias, image_rows, score_of, select_experts_multimodal};
 
 /// `num_experts_per_tok`.
@@ -418,7 +418,14 @@ impl<'a> Cb3RoutedMoe<'a> {
 }
 
 impl V41RoutedMoe for Cb3RoutedMoe<'_> {
-    fn forward(&self, layer: usize, y: DevicePtr, out: DevicePtr, t: usize, stream: u64) -> Result<()> {
+    fn begin_pass(&self, token_ids: &[u32]) -> Result<()> {
+        let ids: Vec<i64> = token_ids.iter().map(|&t| t as i64).collect();
+        self.set_pass_tokens(&ids);
+        Ok(())
+    }
+
+    fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()> {
+        let stream = ops.stream;
         let scores = self.scores(layer, y, t, stream)?;
         let routing = self.route(layer, &scores, t)?;
         self.forward_routed(layer, y, out, t, &routing, stream)

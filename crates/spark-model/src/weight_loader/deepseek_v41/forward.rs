@@ -69,6 +69,8 @@ pub struct V41Seq {
     pub tail_h: DevicePtr,
     pub tail_pre: DevicePtr,
     pub tail_rows: usize,
+    /// Token ids of those tail rows (the replay's MoE routes by them).
+    pub tail_ids: Vec<u32>,
 }
 
 impl V41Seq {
@@ -87,6 +89,7 @@ impl V41Seq {
             tail_h: gpu.alloc(WINDOW * dims.hc * dims.hidden * 2)?,
             tail_pre: gpu.alloc(WINDOW * dims.hc * 4)?,
             tail_rows: 0,
+            tail_ids: Vec::new(),
         })
     }
 
@@ -236,13 +239,18 @@ impl V41Forward {
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         hook.begin_pass(kind, start, t)?;
+        moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
         seq.len = start + t;
         Ok(())
     }
 
     /// Keep the last `min(128, …)` encoder output rows across chunks (`_rep_keep`).
-    fn keep_tail(&self, ops: &Ops, seq: &mut V41Seq, t: usize) -> Result<()> {
+    fn keep_tail(&self, ops: &Ops, seq: &mut V41Seq, ids: &[u32]) -> Result<()> {
+        let t = ids.len();
+        seq.tail_ids.extend_from_slice(ids);
+        let drop = seq.tail_ids.len().saturating_sub(WINDOW);
+        seq.tail_ids.drain(..drop);
         let (hc, d) = (self.dims.hc, self.dims.hidden);
         let (hrow, prow) = (hc * d * 2, hc * 4);
         let take = t.min(WINDOW);
@@ -284,13 +292,14 @@ impl V41Forward {
         let start = seq.len;
         if start == 0 {
             seq.tail_rows = 0;
+            seq.tail_ids.clear();
         }
         let n = self.blocks.len();
         match mode {
             PrefillMode::Replay => {
                 let enc = 0..(ENCODER_LAST + 1).min(n);
                 self.pass(ops, seq, chunk, start, enc, PassKind::EncoderChunk, hook, core, moe, tap)?;
-                self.keep_tail(ops, seq, chunk.len())
+                self.keep_tail(ops, seq, chunk)
             }
             PrefillMode::Full => {
                 self.pass(ops, seq, chunk, start, 0..n, PassKind::FullChunk, hook, core, moe, tap)?;
@@ -324,6 +333,8 @@ impl V41Forward {
             ops.gpu.copy_d2d_async(seq.tail_h, self.scratch.h, t * hrow, ops.stream)?;
             ops.gpu.copy_d2d_async(seq.tail_pre, self.scratch.pre_mix, t * prow, ops.stream)?;
             hook.begin_pass(PassKind::Replay, start, t)?;
+            ensure!(seq.tail_ids.len() == t, "replay tail holds {} ids for {t} rows", seq.tail_ids.len());
+            moe.begin_pass(&seq.tail_ids)?;
             self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap)?;
         }
         super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, t, self.norm, self.head, self.vocab, logits)

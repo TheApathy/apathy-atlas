@@ -243,6 +243,11 @@ pub trait V41AttentionBlock {
 /// bf16 (router, residency mask, top-k, CB3 experts, weighted combine). Shared expert NOT
 /// included — that is [`SharedExpert`], here.
 pub trait V41RoutedMoe {
+    /// The token ids of the rows the NEXT pass carries (chunk ids, the replay tail's ids, or
+    /// the decode token), for routing that depends on them (image rows use `gate.bias_vl`).
+    fn begin_pass(&self, _token_ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
     fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()>;
 }
 
