@@ -110,7 +110,13 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // builders as their position capacity). NOTE for reviewers: the GLM builders
 // do not take the ContextAdmissionReceipt — GLM (NoPE DSA + KDA) is not a
 // RoPE-extension target, and config.json's max_position_embeddings is 1M.
-const SERVE_LOAD_SHA256: &str = "1f09702f3a8e573a291f8a36dc9ea3e0c67999af59cedbd557d4f9f6fcfbaf02";
+// Re-pinned 2026-09-22 (SEVENTH time) for merging fix/swap-reclaim@b6af536eb:
+// `Prepared` gains `gpu: Arc<dyn GpuBackend>` (the backend handle a swap frees
+// through), and `load_model` clones it before the model takes ownership.
+// MACHINE-checked: guard block byte-identical (sha256 9f6f8398...); `git diff
+// -U0` over this file and build.rs matches ZERO lines against
+// admission|max_seq_len|context_extension|ensure!.
+const SERVE_LOAD_SHA256: &str = "8377142ebf273fbecc0fae2d8da560d320e70b512702a8bb8bae4a238965aa8b";
 // Re-pinned 2026-09-22 for integrate/all-models: the ONLY change is the
 // `weights::{..}` re-export gaining `load_dflash_donor` (phaseA-a1's DFlash
 // donor loader, now called from `load_model`), rustfmt-wrapped onto three
@@ -119,7 +125,10 @@ const SERVE_LOAD_SHA256: &str = "1f09702f3a8e573a291f8a36dc9ea3e0c67999af59cedbd
 // the `TargetStoreLoadPlan` re-export (GLM GGUF load planning). Nothing else.
 const SERVE_PHASES_SHA256: &str =
     "c09f946989ac4f713001ba8bd0977faf6d088ccd57114fa518bbed88e8e3ed22";
-const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
+// Re-pinned 2026-09-22 for fix/swap-reclaim: the ONLY change is build_model's
+// `gpu` parameter, Box<dyn GpuBackend> -> Arc<dyn GpuBackend>. No admission
+// line moved (the zero-match `git diff -U0` check above covers this file).
+const BUILD_SHA256: &str = "be417e9d112349c46a9456815df3020ad8004a43456cdc1ce280dcb955ccb953";
 
 const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,

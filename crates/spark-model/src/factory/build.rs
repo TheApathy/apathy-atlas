@@ -235,7 +235,7 @@ fn donor_tensor<'a>(
 pub fn build_model(
     mut config: ModelConfig,
     store: &WeightStore,
-    gpu: Box<dyn GpuBackend>,
+    gpu: std::sync::Arc<dyn GpuBackend>,
     max_batch_tokens: usize,
     kv_block_size: usize,
     max_seq_len: usize,

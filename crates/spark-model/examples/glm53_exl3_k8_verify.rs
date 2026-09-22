@@ -29,7 +29,8 @@ fn main() -> Result<()> {
         .map(std::path::PathBuf::from)
         .context("usage: glm53_exl3_k8_verify <exact-checkpoint-directory>")?;
     let files = admit_glm53_exl3_files(&root)?;
-    let backend = Box::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
+    let backend: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend> =
+        std::sync::Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
     let gpu: &dyn GpuBackend = backend.as_ref();
     let store = match load_glm53_exl3_store(&files, gpu, RESERVE_BYTES) {
         Ok(store) => store,

@@ -38,7 +38,8 @@ fn main() -> Result<()> {
         "PHASE admitted_exl3 elapsed_seconds={:.6}",
         process_started.elapsed().as_secs_f64()
     );
-    let backend = Box::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
+    let backend: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend> =
+        std::sync::Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
     let gpu: &dyn GpuBackend = backend.as_ref();
     eprintln!(
         "PHASE initialized_cuda elapsed_seconds={:.6}",

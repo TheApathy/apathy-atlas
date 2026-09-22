@@ -35,7 +35,7 @@ pub(crate) fn build_model(
     config: &ModelConfig,
     context_admission: ContextAdmissionReceipt,
     store: &spark_runtime::weights::WeightStore,
-    gpu: Box<dyn spark_runtime::gpu::GpuBackend>,
+    gpu: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>,
     max_batch_tokens: usize,
     kv_dtype: spark_runtime::kv_cache::KvCacheDtype,
     inference_reserve: usize,

@@ -42,7 +42,8 @@ impl ProbeSession {
         // Existing loader-before-return failure semantics are NOT strengthened
         // by this diagnostic. Envelope coverage starts at constructed model.
         let files = admit_glm53_exl3_files(target)?;
-        let backend = Box::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
+        let backend: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend> =
+            std::sync::Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
         let gpu: &dyn GpuBackend = backend.as_ref();
         let store = match load_glm53_exl3_store(&files, gpu, RESERVE) {
             Ok(store) => store,

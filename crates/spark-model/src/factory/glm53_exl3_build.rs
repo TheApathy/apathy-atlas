@@ -18,7 +18,7 @@ use crate::weight_loader::{
 pub fn build_glm53_exl3_model(
     files: Glm53Exl3Files,
     store: Glm53Exl3DeviceStore,
-    gpu: Box<dyn GpuBackend>,
+    gpu: std::sync::Arc<dyn GpuBackend>,
     max_seq_len: usize,
     dflash2_root: Option<&Path>,
 ) -> Result<Box<dyn Model>> {

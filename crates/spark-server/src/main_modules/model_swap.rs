@@ -335,14 +335,46 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
 
     // 3. Wait for the scheduler to finish draining. JOINED, not detached: this
     // return is what proves the weights are no longer in use.
+    //
+    // Taken BEFORE the join, not after: `take_gpu_backend` just removes the
+    // host's reference, it doesn't block on anything, and taking it early
+    // means there is no window where a second swap racing this one could
+    // grab the same handle.
+    let outgoing_gpu = host.take_gpu_backend();
     if let Some(handle) = host.take_scheduler() {
         handle
             .join()
             .map_err(|_| anyhow::anyhow!("the scheduler thread panicked while draining"))?;
     }
 
-    // 4 + 5. The model drops as the scheduler thread unwinds, which is where
-    // its pools are freed; then the new one loads.
+    // 4. The model itself already dropped as the scheduler thread unwound,
+    // during the join above — but dropping the Rust struct does not free its
+    // GPU memory (see `GpuBackend::free_all_allocations`: weights, KV cache,
+    // SSM pools and the buffer arena are raw pointers with no destructor, by
+    // design, because of BUG #29). This is the ONE place that call is safe:
+    // the scheduler — the model's only other owner — has just been proven
+    // joined, so nothing on this GPU is concurrently allocating or launching
+    // kernels. Do it here, explicitly, rather than from `Drop`, so it can
+    // never fire on a path (a panic unwind, a future EP-worker teardown)
+    // that was never analysed for that same interleaving hazard.
+    if let Some(gpu) = outgoing_gpu {
+        match gpu.free_all_allocations() {
+            Ok(bytes) => tracing::info!(
+                "swap: released {:.2} GB of GPU allocations from the outgoing model \
+                 (weights, KV cache, SSM pools, buffer arena, scratch)",
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            ),
+            Err(error) => {
+                // Not fatal: the new load's own OOM pre-flight will see less
+                // free memory than it should and refuse honestly, which is
+                // the same failure mode as before this fix existed — not a
+                // new one.
+                tracing::error!("swap: free_all_allocations failed: {error:#}");
+            }
+        }
+    }
+
+    // 5. Load the new model.
     let next_args = next.clone();
     // From the HOST: a swap must republish its handles or the dashboard keeps
     // sampling the scheduler it just joined.
@@ -356,6 +388,7 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
         Ok(Some(prepared)) => {
             // 6.
             host.set_scheduler(prepared.scheduler);
+            host.set_gpu_backend(prepared.gpu);
             host.set_args(next_args);
             host.publish(prepared.state);
             signal_listener_phases(host);
@@ -378,6 +411,7 @@ pub(crate) fn swap(host: &Arc<ModelHost>, next: cli::ServeArgs) -> Result<SwapOu
     match load_model(previous.clone(), tui_handles_tx, carried, auth) {
         Ok(Some(prepared)) => {
             host.set_scheduler(prepared.scheduler);
+            host.set_gpu_backend(prepared.gpu);
             host.set_args(previous);
             host.publish(prepared.state);
             // The restored model is serving, so the dashboard must say so.

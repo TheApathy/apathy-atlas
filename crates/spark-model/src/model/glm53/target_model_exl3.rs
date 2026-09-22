@@ -115,7 +115,7 @@ fn external_embedding_rows(embeddings: Glm53Exl3Buffer) -> Result<usize> {
 
 #[must_use = "GLM EXL3 model owns device stores and requires explicit free"]
 pub struct Glm53Exl3Model {
-    gpu: Box<dyn GpuBackend>,
+    gpu: std::sync::Arc<dyn GpuBackend>,
     weights: Glm53Exl3TargetWeights,
     native_store: Glm53Exl3NativeStore,
     device_store: Glm53Exl3DeviceStore,
@@ -226,7 +226,7 @@ impl Glm53Exl3Model {
     }
 
     pub fn new(
-        gpu: Box<dyn GpuBackend>,
+        gpu: std::sync::Arc<dyn GpuBackend>,
         device_store: Glm53Exl3DeviceStore,
         native_store: Glm53Exl3NativeStore,
         weights: Glm53Exl3TargetWeights,
@@ -236,7 +236,7 @@ impl Glm53Exl3Model {
     }
 
     pub fn new_multimodal(
-        gpu: Box<dyn GpuBackend>,
+        gpu: std::sync::Arc<dyn GpuBackend>,
         device_store: Glm53Exl3DeviceStore,
         native_store: Glm53Exl3NativeStore,
         weights: Glm53Exl3TargetWeights,
@@ -254,7 +254,7 @@ impl Glm53Exl3Model {
     }
 
     fn new_inner(
-        gpu: Box<dyn GpuBackend>,
+        gpu: std::sync::Arc<dyn GpuBackend>,
         device_store: Glm53Exl3DeviceStore,
         native_store: Glm53Exl3NativeStore,
         weights: Glm53Exl3TargetWeights,

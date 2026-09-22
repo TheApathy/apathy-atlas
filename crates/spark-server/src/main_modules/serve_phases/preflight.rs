@@ -361,8 +361,8 @@ pub(crate) fn preflight_reserve(
 pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
-) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
-    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+) -> Result<(std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+    let gpu: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend> = std::sync::Arc::new(
         spark_runtime::cuda_backend::AtlasCudaBackend::new(args.gpu_ordinal, &ptx_set.modules)
             .context("Failed to initialize CUDA backend")?,
     );
@@ -381,9 +381,9 @@ pub(crate) fn init_gpu_backend(
 pub(crate) fn init_gpu_backend(
     args: &cli::ServeArgs,
     _ptx_set: &atlas_kernels::TargetPtxSet,
-) -> Result<(Box<dyn spark_runtime::gpu::GpuBackend>, usize)> {
+) -> Result<(std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>, usize)> {
     let modules = atlas_kernels::metallib_modules();
-    let gpu: Box<dyn spark_runtime::gpu::GpuBackend> = Box::new(
+    let gpu: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend> = std::sync::Arc::new(
         spark_runtime::metal_backend::MetalGpuBackend::new(args.gpu_ordinal, &modules)
             .context("Failed to initialize Metal backend")?,
     );

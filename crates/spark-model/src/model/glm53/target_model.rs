@@ -109,7 +109,7 @@ struct Glm53WalkState {
 }
 
 pub struct Glm53Model {
-    gpu: Box<dyn GpuBackend>,
+    gpu: std::sync::Arc<dyn GpuBackend>,
     weights: Glm53TargetRuntimeWeights,
     arena: DevicePtr,
     scratch_allocation: DevicePtr,
@@ -190,7 +190,7 @@ impl Glm53Model {
     /// over-allocating unified memory on GB10 takes the host down rather than
     /// returning an error.
     pub fn new(
-        gpu: Box<dyn GpuBackend>,
+        gpu: std::sync::Arc<dyn GpuBackend>,
         weights: Glm53TargetRuntimeWeights,
         positions: u32,
     ) -> Result<Self> {

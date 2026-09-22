@@ -136,7 +136,7 @@ mod tests {
         let result = build_model(
             config,
             &store,
-            Box::new(gpu),
+            std::sync::Arc::new(gpu),
             1,
             16,
             4096,

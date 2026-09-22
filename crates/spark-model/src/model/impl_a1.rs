@@ -45,7 +45,7 @@ impl TransformerModel {
         mtp_weights: Vec<MtpWeights>,
         mtp_dense_weights: Option<crate::weight_map::MtpDenseWeights>,
         qwen4_mtp_proposer: Option<Arc<dyn DraftProposer>>,
-        gpu: Box<dyn GpuBackend>,
+        gpu: std::sync::Arc<dyn GpuBackend>,
         max_seq_len: usize,
         max_batch_size: usize,
         mtp_quant: crate::layers::MtpQuantization,

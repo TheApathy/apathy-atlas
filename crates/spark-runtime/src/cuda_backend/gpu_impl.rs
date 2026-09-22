@@ -79,6 +79,26 @@ impl Drop for CudaPinnedHostStorage {
     }
 }
 
+impl AtlasCudaBackend {
+    /// Record a successful `alloc`/`alloc_managed` in the live-allocation
+    /// table that `free_all_allocations` drains at model teardown.
+    fn track_allocation(&self, dptr: u64, bytes: usize) {
+        self.live_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(dptr, bytes);
+    }
+
+    /// Remove an allocation freed individually via `free`, so
+    /// `free_all_allocations` does not attempt a double-free on it later.
+    fn untrack_allocation(&self, dptr: u64) {
+        self.live_allocations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&dptr);
+    }
+}
+
 impl GpuBackend for AtlasCudaBackend {
     fn transform_cache_identity(&self) -> Option<&str> {
         self.transform_cache_identity.as_deref()
@@ -98,6 +118,7 @@ impl GpuBackend for AtlasCudaBackend {
                 total as f64 / (1024.0 * 1024.0 * 1024.0),
             );
         }
+        self.track_allocation(dptr, bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -111,6 +132,7 @@ impl GpuBackend for AtlasCudaBackend {
                  Check system swap space: swapon --show"
             );
         }
+        self.track_allocation(dptr, bytes);
         Ok(DevicePtr(dptr))
     }
 
@@ -122,7 +144,43 @@ impl GpuBackend for AtlasCudaBackend {
         if status != 0 {
             bail!("cuMemFree_v2 failed: status {status}, ptr {ptr}");
         }
+        self.untrack_allocation(ptr.0);
         Ok(())
+    }
+
+    fn free_all_allocations(&self) -> Result<usize> {
+        // Drain first, free after releasing the lock: cuMemFree_v2 never
+        // re-enters `alloc`/`free` on this thread, but there is no reason to
+        // hold the mutex across a run of driver calls either.
+        let drained: Vec<(u64, usize)> = {
+            let mut live = self
+                .live_allocations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            live.drain().collect()
+        };
+        let mut freed_bytes = 0usize;
+        let mut failures = 0usize;
+        for (dptr, bytes) in drained {
+            let status = unsafe { cuMemFree_v2(dptr) };
+            if status != 0 {
+                failures += 1;
+                tracing::error!(
+                    "free_all_allocations: cuMemFree_v2 failed: status {status}, \
+                     ptr {dptr:#x}, {bytes} bytes — leaving it allocated"
+                );
+                continue;
+            }
+            freed_bytes += bytes;
+        }
+        if failures > 0 {
+            bail!(
+                "free_all_allocations: freed {:.2} GB but {failures} allocation(s) \
+                 failed to free — see prior errors",
+                freed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+        Ok(freed_bytes)
     }
 
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()> {

@@ -105,7 +105,7 @@ fn first_token_on_real_hardware() {
     // host-OOM cliff when other processes hold memory. The DSA pool plan uses
     // the architectural 1M constant, not this, so geometry is unaffected.
     const CONTEXT: u32 = 65_536;
-    let model = Glm53Model::new(Box::new(gpu), weights, CONTEXT).unwrap();
+    let model = Glm53Model::new(std::sync::Arc::new(gpu), weights, CONTEXT).unwrap();
 
     // Two tokens: one prefill step and one decode step, so the recurrence has
     // to carry state across a commit rather than only run once.
@@ -213,7 +213,7 @@ fn generates_real_text_on_real_hardware() {
     // host-OOM cliff when other processes hold memory. The DSA pool plan uses
     // the architectural 1M constant, not this, so geometry is unaffected.
     const CONTEXT: u32 = 65_536;
-    let model = Glm53Model::new(Box::new(gpu), weights, CONTEXT).unwrap();
+    let model = Glm53Model::new(std::sync::Arc::new(gpu), weights, CONTEXT).unwrap();
 
     let stream = 0u64;
 

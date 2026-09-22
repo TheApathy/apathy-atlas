@@ -33,6 +33,14 @@ pub struct ModelHost {
     /// whoever performs the swap must be able to take it, and that is not the
     /// one call site that first built the server.
     scheduler: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The GPU backend of the model currently loaded.
+    ///
+    /// Lives here for the same reason `scheduler` does: a swap needs to take
+    /// it, and specifically needs it AFTER `scheduler` has been joined (the
+    /// model itself has by then already dropped, inside that thread's
+    /// unwind) so it can free every allocation that model never freed — see
+    /// `GpuBackend::free_all_allocations` and `model_swap::swap`.
+    gpu: parking_lot::Mutex<Option<std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>>>,
     /// The argv the live model was loaded from.
     ///
     /// Kept here, not passed to `swap`, because a caller that has to supply it
@@ -97,6 +105,7 @@ impl ModelHost {
         Self {
             current: parking_lot::RwLock::new(None),
             scheduler: parking_lot::Mutex::new(None),
+            gpu: parking_lot::Mutex::new(None),
             args: parking_lot::RwLock::new(None),
             swapping: parking_lot::Mutex::new(()),
             runtime: parking_lot::RwLock::new(tokio::runtime::Handle::try_current().ok()),
@@ -214,6 +223,17 @@ impl ModelHost {
     /// Take the current scheduler, for a swap to join.
     pub fn take_scheduler(&self) -> Option<std::thread::JoinHandle<()>> {
         self.scheduler.lock().take()
+    }
+
+    /// Hand over the GPU backend of the model just loaded.
+    pub fn set_gpu_backend(&self, gpu: std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>) {
+        *self.gpu.lock() = Some(gpu);
+    }
+
+    /// Take the current GPU backend, for a swap to reclaim once its model's
+    /// scheduler has been joined.
+    pub fn take_gpu_backend(&self) -> Option<std::sync::Arc<dyn spark_runtime::gpu::GpuBackend>> {
+        self.gpu.lock().take()
     }
 
     /// Record what the live model was loaded from, for a restore.

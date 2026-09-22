@@ -32,7 +32,7 @@ pub fn build_glm53_model(
     profile: Glm53QuantProfile,
     config: &ModelConfig,
     store: GgufDeviceStore,
-    gpu: Box<dyn GpuBackend>,
+    gpu: std::sync::Arc<dyn GpuBackend>,
     max_seq_len: usize,
 ) -> Result<Box<dyn Model>> {
     let positions = u32::try_from(max_seq_len)

@@ -185,7 +185,7 @@ pub struct TransformerModel {
     /// 500x EP=2 decode regression (50 tok/s → 0.1 tok/s) due to contention
     /// with the NCCL all-reduce path.
     pub(super) pinned_staging: std::cell::UnsafeCell<PinnedMetaStaging>,
-    pub(super) gpu: Box<dyn GpuBackend>,
+    pub(super) gpu: std::sync::Arc<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
     /// Byte-exact strided row copy (`strided_copy_rows_16`); 0 when absent.
     ///

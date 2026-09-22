@@ -213,6 +213,37 @@ pub trait GpuBackend: Send + Sync {
     /// Free device memory.
     fn free(&self, ptr: DevicePtr) -> Result<()>;
 
+    /// Free every allocation this backend instance has made via [`Self::alloc`]
+    /// / [`Self::alloc_managed`] and not yet individually freed via
+    /// [`Self::free`]. Returns the number of bytes released.
+    ///
+    /// This exists for exactly one caller: model teardown at the end of a
+    /// hot swap (`TransformerModel::drop`). Model weights (`WeightStore` and
+    /// every per-layer `DenseWeight`/`QuantizedWeight`), the KV cache
+    /// (`PagedKvCache`), the SSM state/snapshot pools, `BufferArena`, and a
+    /// long tail of ad-hoc persistent `DevicePtr` fields on `TransformerModel`
+    /// hold raw, `Copy` device pointers with no destructor of their own — by
+    /// design, because on GB10 unified memory a `cuMemFree` interleaved with
+    /// *other* concurrent allocation or kernel traffic posts an in-band TLB
+    /// invalidation that corrupts neighbouring allocations (BUG #29, see
+    /// `spark-server/src/main_modules/serve_phases/weights.rs`). Every
+    /// existing call site that frees mid-load staging buffers is careful to
+    /// do so only while nothing else is concurrently allocating.
+    ///
+    /// Model teardown during a swap is the one place that is ALSO safe by
+    /// that same rule: it runs only after the scheduler thread has been
+    /// joined (see `main_modules/model_swap.rs`), so nothing else on the GPU
+    /// is allocating or launching kernels concurrently. Call this ONLY from
+    /// a point with that same guarantee — never from a live request path.
+    ///
+    /// Default: a no-op returning `Ok(0)`. Backends that do not (yet) track
+    /// their own outstanding allocations — the mock test backend, Metal —
+    /// simply leak nothing extra beyond what they already do; only the CUDA
+    /// backend overrides this.
+    fn free_all_allocations(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Copy from host to device.
     fn copy_h2d(&self, src: &[u8], dst: DevicePtr) -> Result<()>;
 
