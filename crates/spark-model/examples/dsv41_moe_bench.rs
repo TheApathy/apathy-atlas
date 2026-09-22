@@ -101,12 +101,14 @@ fn main() -> Result<()> {
     let max_t = *token_counts.iter().max().context("no token counts")?;
     ensure!(max_t <= captured, "{run} L{layer:02} has {captured} captured rows, asked for {max_t}");
 
-    let gpu = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
-    let kernels = Dsv41Kernels::load(&gpu)?;
+    let backend = Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
+    let shared: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = backend.clone();
+    let gpu: &AtlasCudaBackend = &backend;
+    let kernels = Dsv41Kernels::load(gpu)?;
     let pack_dir = PathBuf::from(MODEL_DIR).join("k154-cb3");
     let pack = ExpertPack::parse(&std::fs::read_to_string(pack_dir.join("manifest.json"))?, SERVED_PACKED_KEEP)?;
-    let arena = Arc::new(Cb3ExpertArena::load_one_layer(Path::new(&pack_dir), &pack, layer, &gpu)?);
-    let moe = Cb3RoutedMoe::new(&gpu, &kernels, &config, arena, vec![(layer, router(layer, hidden, &gpu)?)], 10.0, 1.5, max_t)?;
+    let arena = Arc::new(Cb3ExpertArena::load_one_layer(Path::new(&pack_dir), &pack, layer, &shared)?);
+    let moe = Cb3RoutedMoe::new(shared.clone(), kernels, &config, arena, vec![(layer, router(layer, hidden, gpu)?)], 10.0, 1.5, max_t)?;
     let stream = gpu.default_stream();
     let d_in = gpu.alloc(max_t * hidden * 2)?;
     let d_out = gpu.alloc(max_t * hidden * 2)?;
@@ -159,7 +161,7 @@ fn main() -> Result<()> {
         moe.set_expert_kernel(ExpertKernel::Fused);
         let fused = time(&mut || moe.forward_routed(layer, d_in, d_out, t, &routing, stream))?;
         let dev_route = time(&mut || moe.route_device(layer, d_in, t, stream).map(|_| ()))?;
-        let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, &Ops { gpu: &gpu, k: &kernels, stream }, layer, d_in, d_out, t))?;
+        let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, &Ops { gpu, k: &kernels, stream }, layer, d_in, d_out, t))?;
         println!(
             "      PRODUCTION forward (device router + fused): {full:.2} ms/layer [router {dev_route:.2}] -> {:.1} tok/s MoE-only",
             t as f64 / (LAYERS as f64 * full * 1e-3)
@@ -219,5 +221,6 @@ fn main() -> Result<()> {
     moe.set_gemv_max_rows(spark_model::weight_loader::deepseek_v41::moe_forward::DEFAULT_GEMV_MAX_ROWS);
     let _ = ROUTER_EXPERTS;
     println!("DONE");
-    moe.free()
+    drop(moe);
+    Ok(())
 }

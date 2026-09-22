@@ -34,6 +34,8 @@ use atlas_core::config::{CB3_TENSORS, Cb3Tensor, ExpertPack, ROUTED_EXPERTS, SER
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::deepseek_v41_pack::LayerShard;
 
+use super::device_allocs::{DeviceAllocs, SharedGpu};
+
 /// Module name of the CB3 reconstruct kernel, as the build system derives it from the
 /// file stem `cb3_reconstruct_bf16.cu`. Spelled ONCE, here.
 pub const CB3_RECONSTRUCT_MODULE: &str = "cb3_reconstruct_bf16";
@@ -137,6 +139,10 @@ pub struct Cb3ExpertArena {
     slot_of_routed: Vec<(usize, Vec<i32>)>,
     packed_keep: usize,
     resident_bytes: u64,
+    /// Every plane allocation. Freed when the arena drops IF it was loaded with an owned
+    /// backend handle ([`Cb3ExpertArena::load`]) — 71.7 GB at the served keep that a model
+    /// swap must get back.
+    allocs: DeviceAllocs,
 }
 
 /// `slot_of_routed` entry for an expert that is not resident in that layer.
@@ -165,7 +171,19 @@ impl Cb3ExpertArena {
     ///
     /// `pack_dir` is the `k154-cb3` directory. `pack` must already carry the intended
     /// `packed_keep` (see [`ExpertPack::parse`]).
-    pub fn load(pack_dir: &Path, pack: &ExpertPack, gpu: &dyn GpuBackend) -> Result<Self> {
+    ///
+    /// The arena OWNS its planes: they are freed when it drops.
+    pub fn load(pack_dir: &Path, pack: &ExpertPack, gpu: &SharedGpu) -> Result<Self> {
+        Self::load_full(pack_dir, pack, gpu.as_ref(), DeviceAllocs::owned(gpu.clone()))
+    }
+
+    /// [`Self::load`] for a caller holding only `&dyn GpuBackend` (the legacy `load_layers`
+    /// path): the planes are NEVER freed. Prefer [`Self::load`].
+    pub fn load_unowned(pack_dir: &Path, pack: &ExpertPack, gpu: &dyn GpuBackend) -> Result<Self> {
+        Self::load_full(pack_dir, pack, gpu, DeviceAllocs::unowned())
+    }
+
+    fn load_full(pack_dir: &Path, pack: &ExpertPack, gpu: &dyn GpuBackend, mut allocs: DeviceAllocs) -> Result<Self> {
         let packed_keep = pack.packed_keep();
         let need = pack.resident_bytes();
 
@@ -225,7 +243,7 @@ impl Cb3ExpertArena {
                 let bytes = stride
                     .checked_mul(packed_keep)
                     .context("CB3 plane extent overflow")?;
-                planes[index] = gpu.alloc(bytes).with_context(|| {
+                planes[index] = allocs.alloc(gpu, bytes).with_context(|| {
                     format!(
                         "CB3 arena: allocating {:.1} MB for layer {layer} plane {}",
                         bytes as f64 / 1e6,
@@ -310,6 +328,7 @@ impl Cb3ExpertArena {
             slot_of_routed,
             packed_keep,
             resident_bytes: need,
+            allocs,
         })
     }
 
@@ -326,7 +345,7 @@ impl Cb3ExpertArena {
         pack_dir: &Path,
         pack: &ExpertPack,
         layer: usize,
-        gpu: &dyn GpuBackend,
+        gpu: &SharedGpu,
     ) -> Result<Self> {
         Self::load_layer_subset(pack_dir, pack, &[layer], gpu)
     }
@@ -338,8 +357,10 @@ impl Cb3ExpertArena {
         pack_dir: &Path,
         pack: &ExpertPack,
         wanted: &[usize],
-        gpu: &dyn GpuBackend,
+        shared: &SharedGpu,
     ) -> Result<Self> {
+        let gpu = shared.as_ref();
+        let mut allocs = DeviceAllocs::owned(shared.clone());
         let packed_keep = pack.packed_keep();
         let per_layer = packed_keep as u64 * pack.bytes_per_expert();
         ensure!(!wanted.is_empty(), "CB3 layer subset is empty");
@@ -382,7 +403,7 @@ impl Cb3ExpertArena {
                 let bytes = stride
                     .checked_mul(packed_keep)
                     .context("CB3 plane extent overflow")?;
-                planes[index] = gpu.alloc(bytes)?;
+                planes[index] = allocs.alloc(gpu, bytes)?;
                 strides[index] = stride;
                 let span = shard.plane_span(*tensor, packed_keep)?;
                 ensure!(span.len() == bytes, "CB3 plane span disagrees with the stride table");
@@ -405,6 +426,7 @@ impl Cb3ExpertArena {
             slot_of_routed,
             packed_keep,
             resident_bytes: need,
+            allocs,
         })
     }
 
@@ -454,6 +476,10 @@ impl Cb3ExpertArena {
     }
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+    /// Whether dropping this arena returns its device memory.
+    pub fn frees_on_drop(&self) -> bool {
+        self.allocs.is_owned()
     }
 }
 
@@ -614,6 +640,7 @@ mod tests {
             slot_of_routed: vec![(held, inverse)],
             packed_keep: 3,
             resident_bytes: 0,
+            allocs: DeviceAllocs::unowned(),
         };
 
         assert_eq!(arena.layer(held).unwrap().layer(), held);

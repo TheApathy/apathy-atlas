@@ -32,6 +32,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::cb3_arena::Cb3ExpertArena;
+use super::device_allocs::{DeviceAllocs, SharedGpu};
 use super::fwd::V41RoutedMoe;
 use super::moe::{
     COMBINE_MODULE, Cb3Matrix, FUSED_DOWN_FN, FUSED_GATE_UP_FN, FUSED_GEMM_MODULE, FUSED_TILE_M,
@@ -185,9 +186,16 @@ pub enum ExpertWork {
     Skip,
 }
 
-pub struct Cb3RoutedMoe<'a> {
-    gpu: &'a dyn GpuBackend,
-    kernels: &'a Dsv41Kernels,
+/// Self-owned (`'static`, `Send + Sync`): holds an `Arc` to the backend and a copy of the
+/// kernel table, and FREES all its device memory — scratch, tile list, device routers and
+/// the widened router weights — when dropped. The arena is freed by its own drop when the
+/// last `Arc` goes. Before this the MoE borrowed both (`Cb3RoutedMoe<'a>`), which forced the
+/// served model to leak the backend and made a TUI model swap unable to return memory.
+pub struct Cb3RoutedMoe {
+    gpu: SharedGpu,
+    kernels: Dsv41Kernels,
+    /// Every device allocation this MoE made or adopted; freed on drop.
+    allocs: DeviceAllocs,
     arena: Arc<Cb3ExpertArena>,
     routers: Vec<(usize, RouterF32)>,
     reconstruct: Cb3Reconstruct,
@@ -217,12 +225,14 @@ pub struct Cb3RoutedMoe<'a> {
     max_tiles: usize,
 }
 
-impl<'a> Cb3RoutedMoe<'a> {
+impl Cb3RoutedMoe {
     /// `routers` must cover every layer the arena holds, keyed by REAL layer index.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// Takes ownership of `routers`: their widened `gate_w` is freed with the MoE.
     pub fn new(
-        gpu: &'a dyn GpuBackend,
-        kernels: &'a Dsv41Kernels,
+        shared: SharedGpu,
+        kernels: Dsv41Kernels,
         config: &atlas_core::config::ModelConfig,
         arena: Arc<Cb3ExpertArena>,
         routers: Vec<(usize, RouterF32)>,
@@ -245,7 +255,14 @@ impl<'a> Cb3RoutedMoe<'a> {
         // Every group contributes ceil(rows / BM) tiles: at most e / BM + one partial per expert.
         // MMA tiles: at most e / 128 + one partial per expert; GEMV tiles: at most one per row.
         let max_tiles = e + e / FUSED_TILE_M + ROUTER_EXPERTS;
-        let a = |bytes: usize| gpu.alloc(bytes);
+        let handle = shared.clone();
+        let gpu = handle.as_ref();
+        let mut allocs = DeviceAllocs::owned(shared.clone());
+        // Adopt the routers' device weights first, so an error below frees them too.
+        for (_, router) in &routers {
+            allocs.adopt(router.gate_w);
+        }
+        let mut a = |bytes: usize| allocs.alloc(gpu, bytes);
         let scratch = Scratch {
             max_t,
             y_f32: a(max_t * hidden * 4)?,
@@ -269,19 +286,21 @@ impl<'a> Cb3RoutedMoe<'a> {
         let mut device_routers = Vec::with_capacity(routers.len());
         for (layer, router) in &routers {
             let f32_bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-            let bias = gpu.alloc(ROUTER_EXPERTS * 4)?;
+            let bias = allocs.alloc(gpu, ROUTER_EXPERTS * 4)?;
             gpu.copy_h2d(&f32_bytes(&router.bias), bias)?;
-            let bias_vl = gpu.alloc(ROUTER_EXPERTS * 4)?;
+            let bias_vl = allocs.alloc(gpu, ROUTER_EXPERTS * 4)?;
             gpu.copy_h2d(&f32_bytes(&router.bias_vl), bias_vl)?;
             let mask: Vec<u8> = arena.routing_mask(*layer)?.iter().map(|m| u8::from(*m)).collect();
             ensure!(mask.len() == ROUTER_EXPERTS, "residency mask is {} wide", mask.len());
-            let resident = gpu.alloc(ROUTER_EXPERTS)?;
+            let resident = allocs.alloc(gpu, ROUTER_EXPERTS)?;
             gpu.copy_h2d(&mask, resident)?;
             device_routers.push((*layer, bias, bias_vl, resident));
         }
+        let tiles = allocs.alloc(gpu, max_tiles * 16)?;
         Ok(Self {
-            gpu,
+            gpu: shared,
             kernels,
+            allocs,
             arena,
             routers,
             reconstruct: Cb3Reconstruct::new(gpu)?,
@@ -305,7 +324,7 @@ impl<'a> Cb3RoutedMoe<'a> {
             k_gemv_gate_up: gpu.kernel(FUSED_GEMM_MODULE, GEMV_GATE_UP_FN)?,
             k_gemv_down: gpu.kernel(FUSED_GEMM_MODULE, GEMV_DOWN_FN)?,
             gemv_max_rows: Mutex::new(DEFAULT_GEMV_MAX_ROWS),
-            tiles: gpu.alloc(max_tiles * 16)?,
+            tiles,
             max_tiles,
         })
     }
@@ -361,7 +380,7 @@ impl<'a> Cb3RoutedMoe<'a> {
         ensure!(t <= self.scratch.max_t, "pass of {t} tokens exceeds scratch for {}", self.scratch.max_t);
         let router = self.router(layer)?;
         let n = t * self.hidden;
-        KernelLaunch::new(self.gpu, self.kernels.bf16_to_f32)
+        KernelLaunch::new(self.gpu.as_ref(), self.kernels.bf16_to_f32)
             .block([BLOCK, 1, 1])
             .grid([(n as u32).div_ceil(BLOCK), 1, 1])
             .arg_ptr(y)
@@ -405,7 +424,7 @@ impl<'a> Cb3RoutedMoe<'a> {
         self.router_logits(layer, y, t, stream)?;
         self.gpu.synchronize(stream)?;
         self.gpu.copy_h2d(&image, self.scratch.image)?;
-        KernelLaunch::new(self.gpu, self.k_route)
+        KernelLaunch::new(self.gpu.as_ref(), self.k_route)
             .block([128, 1, 1])
             .grid([t as u32, 1, 1])
             .arg_ptr(self.scratch.logits)
@@ -499,7 +518,7 @@ impl<'a> Cb3RoutedMoe<'a> {
         self.gpu.copy_h2d(as_bytes_i32(&plan.token_to_perm), s.tok2perm)?;
         self.gpu.copy_h2d(as_bytes_f32(&row_weight), s.row_w)?;
 
-        let launch = |kernel: KernelHandle| KernelLaunch::new(self.gpu, kernel).block([BLOCK, 1, 1]);
+        let launch = |kernel: KernelHandle| KernelLaunch::new(self.gpu.as_ref(), kernel).block([BLOCK, 1, 1]);
         launch(self.k_permute)
             .grid([expanded as u32, 1, 1])
             .arg_ptr(y)
@@ -537,7 +556,7 @@ impl<'a> Cb3RoutedMoe<'a> {
             }
             if do_reconstruct {
                 for (matrix, dst) in self.matrices.iter().zip([s.w1, s.w3, s.w2]) {
-                    self.reconstruct.run(residency, *matrix, group.slot, keep, dst, self.gpu, stream)?;
+                    self.reconstruct.run(residency, *matrix, group.slot, keep, dst, self.gpu.as_ref(), stream)?;
                 }
             }
             if !do_gemm {
@@ -627,7 +646,7 @@ impl<'a> Cb3RoutedMoe<'a> {
 
         // Both kernel families take identical arguments; only the grid's N split differs.
         let gate_up = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize, threads: u32, smem: u32| {
-            KernelLaunch::new(self.gpu, kernel)
+            KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .block([threads, 1, 1])
                 .shared_mem(smem)
                 .grid([(gate.rows / per_block) as u32, n as u32, 1])
@@ -644,7 +663,7 @@ impl<'a> Cb3RoutedMoe<'a> {
                 .launch(stream)
         };
         let down_proj = |kernel: KernelHandle, tiles: DevicePtr, n: usize, per_block: usize, threads: u32, smem: u32| {
-            KernelLaunch::new(self.gpu, kernel)
+            KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .block([threads, 1, 1])
                 .shared_mem(smem)
                 .grid([(down.rows / per_block) as u32, n as u32, 1])
@@ -672,28 +691,14 @@ impl<'a> Cb3RoutedMoe<'a> {
         Ok(())
     }
 
-    /// Release the scratch and the widened router weights.
-    pub fn free(self) -> Result<()> {
-        let s = &self.scratch;
-        for ptr in [
-            s.y_f32, s.logits, s.perm, s.gate, s.up, s.h, s.down, s.w1, s.w3, s.w2, s.sorted,
-            s.tok2perm, s.row_w, self.tiles, s.image, s.route_idx, s.route_w,
-        ] {
-            self.gpu.free(ptr)?;
-        }
-        for (_, bias, bias_vl, resident) in &self.device_routers {
-            for ptr in [*bias, *bias_vl, *resident] {
-                self.gpu.free(ptr)?;
-            }
-        }
-        for (_, router) in &self.routers {
-            self.gpu.free(router.gate_w)?;
-        }
-        Ok(())
+    /// Whether dropping this MoE returns its device memory (always, for this type).
+    pub fn frees_on_drop(&self) -> bool {
+        self.allocs.is_owned()
     }
 }
 
-impl V41RoutedMoe for Cb3RoutedMoe<'_> {
+
+impl V41RoutedMoe for Cb3RoutedMoe {
     fn begin_pass(&self, token_ids: &[u32]) -> Result<()> {
         let ids: Vec<i64> = token_ids.iter().map(|&t| t as i64).collect();
         self.set_pass_tokens(&ids);

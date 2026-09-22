@@ -26,6 +26,7 @@
 
 pub mod attn_block;
 pub mod cb3_arena;
+pub mod device_allocs;
 pub mod forward;
 pub mod fwd;
 pub mod indexer;
