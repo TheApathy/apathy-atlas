@@ -10,6 +10,7 @@
 
 pub mod index;
 pub mod schedule;
+pub mod seam;
 
 pub use schedule::{
     SparseSchedule, context_bucket, indexer_score_rows, indexer_topk_width, pad_topk,
