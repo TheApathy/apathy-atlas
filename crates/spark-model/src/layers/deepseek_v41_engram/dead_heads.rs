@@ -108,6 +108,25 @@ pub fn engram_dead_heads(ids: &[u32]) -> Vec<bool> {
 /// to be exact — see the module doc's "cross-chunk carry" section.
 pub const MAX_LOOKBACK: usize = 3;
 
+/// `true` iff `max_ngram_size` (read from the checkpoint's `config.json`,
+/// `engram_max_ngram_size`) is consistent with this module's hardcoded
+/// `NGRAM_GROUPS`/`N_HEAD_COLS`/`MAX_LOOKBACK`.
+///
+/// `engine/vision.py::engram_dead_heads` hardcodes `(2, 3, 4)` and `24`
+/// directly in its body — its signature is `engram_dead_heads(token_ids)`,
+/// with no `args`/config parameter at all, so PRODUCTION ITSELF never reads
+/// `engram_max_ngram_size` here. That is why this module hardcodes the same
+/// constants rather than deriving them from config: doing the "more
+/// principled" thing would make the port MORE config-aware than production
+/// and could silently DIVERGE from it if the checkpoint's config ever
+/// disagreed with vision.py's literals. Callers that DO read
+/// `engram_max_ngram_size` for other purposes (the hash layout) should call
+/// this once and fail loudly on mismatch, rather than let the assumption
+/// drift unnoticed — see [`super::token_map`]'s `for_checkpoint`.
+pub fn max_ngram_size_matches(max_ngram_size: usize) -> bool {
+    max_ngram_size == NGRAM_GROUPS.len() + 1
+}
+
 /// [`engram_dead_heads`], but correct at a chunk boundary: `carry` is the
 /// trailing up-to-[`MAX_LOOKBACK`] raw ids from immediately before `ids` (empty
 /// for a sequence's first chunk). Returns exactly `ids.len()` rows — the
@@ -240,6 +259,39 @@ mod tests {
         assert!(wrong_if_carried[16..24].iter().all(|&d| d), "carrying should kill exactly the 4-gram group here");
     }
 
+    /// THE SLOT-REUSE CASE (dsv41-parity's review, robustness item): request 1 ends in an
+    /// image, leaving a nonempty carry; request 2 reuses the sequence state (hypothetically --
+    /// `V41Seq` is rebuilt per request today, `Dsv41Model::alloc_sequence`, so this cannot
+    /// happen YET, but `forward.rs::prefill_chunk`'s `start == 0` branch now clears
+    /// `seq.dead_carry` defensively, alongside `tail_rows`/`tail_ids`). This test is the
+    /// pure-logic equivalent of that one-line fix: `prefill_chunk` itself can't be unit-tested
+    /// without a live GPU context (it drives real kernel launches through `Ops`), so this
+    /// exercises the exact Vec state transition instead.
+    #[test]
+    fn a_cleared_carry_does_not_leak_into_the_next_requests_first_chunk() {
+        // Request 1: an image near the end of its last chunk leaves a live carry.
+        let mut carry = Vec::new();
+        update_dead_carry(&mut carry, &[1u32, 2, IMAGE_SENTINEL_ID]);
+        assert_eq!(carry, vec![1u32, 2, IMAGE_SENTINEL_ID], "request 1 must leave a nonempty carry");
+
+        // Request 2's first chunk: text that would collide with request 1's trailing sentinel
+        // if the carry leaked (position 0 is exactly MAX_LOOKBACK - 2 from where the sentinel
+        // would sit if prepended).
+        let request2_ids = [10u32, 11, 12];
+
+        // What `start == 0` now does: clear before computing the mask.
+        carry.clear();
+        let cleared = engram_dead_heads_with_carry(&carry, &request2_ids);
+        assert!(cleared.iter().all(|&d| !d), "a properly cleared carry must not mask request 2's text");
+
+        // NEGATIVE CONTROL: without the clear, request 1's sentinel WOULD leak in and mask
+        // request 2's early positions -- proving the control (and the fix) actually matter.
+        let mut leaked_carry = Vec::new();
+        update_dead_carry(&mut leaked_carry, &[1u32, 2, IMAGE_SENTINEL_ID]);
+        let leaked = engram_dead_heads_with_carry(&leaked_carry, &request2_ids);
+        assert_ne!(leaked, cleared, "an uncleared carry produced the same result as a cleared one -- this control cannot show the leak it exists to catch");
+    }
+
     /// An empty carry (a sequence's first chunk) must be identical to calling
     /// `engram_dead_heads` directly -- the carry-aware function is a strict
     /// generalisation, not a different algorithm.
@@ -247,6 +299,16 @@ mod tests {
     fn empty_carry_matches_the_plain_function() {
         let ids = [129_264u32, 2, 3, 4, 5];
         assert_eq!(engram_dead_heads_with_carry(&[], &ids), engram_dead_heads(&ids));
+    }
+
+    /// The checkpoint's real value (from config.json, confirmed 2026-09-22) must pass, and
+    /// anything else must fail -- this guard exists specifically to catch a FUTURE checkpoint
+    /// disagreeing with vision.py's hardcoded (2,3,4), so both directions need coverage.
+    #[test]
+    fn max_ngram_size_matches_checks_against_the_hardcoded_groups() {
+        assert!(max_ngram_size_matches(4), "the real checkpoint's engram_max_ngram_size must pass");
+        assert!(!max_ngram_size_matches(3), "a mismatched max_ngram_size must be rejected");
+        assert!(!max_ngram_size_matches(5), "a mismatched max_ngram_size must be rejected");
     }
 
     /// A prompt with no image tokens at all must come back entirely alive: the
