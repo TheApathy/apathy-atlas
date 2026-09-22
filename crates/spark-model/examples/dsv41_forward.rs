@@ -232,9 +232,10 @@ fn run_model_path(
     decode_n: usize,
     force_decode: bool,
     warm_prefill: bool,
+    splits: Vec<Vec<usize>>,
 ) -> Result<()> {
     let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
-    let max_chunk = chunks.iter().map(|c| c.1).max().unwrap_or(1);
+    let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
     let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
     let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };
     let fed_core = FedCore(&feeder);
@@ -253,12 +254,35 @@ fn run_model_path(
     } else {
         &fed_moe
     };
+    let tap_base = tap_dir.clone();
     let tap = match tap_dir {
         Some(d) => Tap::to_dir(d, Vec::new())?,
         None => Tap::off(),
     };
     let mut seq = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
     let logits = ops.gpu.alloc(spark_model::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
+    // --split: the SAME prompt prefilled under several chunkings, each into <tap_dir>/split_<i>
+    // with a fresh sequence, for the chunk-invariance check. Then return.
+    if !splits.is_empty() {
+        let base = tap_base.clone().context("--split needs --tap-dir")?;
+        for (i, sp) in splits.iter().enumerate() {
+            ensure!(sp.iter().sum::<usize>() == ids.len(), "split {sp:?} does not sum to {}", ids.len());
+            let tap_i = Tap::to_dir(base.join(format!("split_{i}")), Vec::new())?;
+            let mut s = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
+            let mut at = 0;
+            for &n in sp {
+                fwd.prefill_chunk(ops, &mut s, &ids[at..at + n], PrefillMode::Replay, hook, core, moe, &tap_i)?;
+                at += n;
+            }
+            fwd.finish_prefill(ops, &mut s, PrefillMode::Replay, hook, core, moe, &tap_i, logits)?;
+            tap_i.bf16(ops, "logits_last", 40, logits, &[config.vocab_size])?;
+            ops.gpu.synchronize(ops.stream)?;
+            println!("split {i} {sp:?} done");
+            s.free(ops.gpu)?;
+        }
+        println!("DONE dsv41_forward path=model splits");
+        return Ok(());
+    }
     let t0 = std::time::Instant::now();
     fwd.prefill(ops, &mut seq, ids, PrefillMode::Replay, hook, core, moe, &tap, logits)?;
     ops.gpu.synchronize(ops.stream)?;
@@ -347,6 +371,7 @@ fn main() -> Result<()> {
     let mut decode_n = 0usize;
     let mut force_decode = false;
     let mut warm_prefill = false;
+    let mut splits: Vec<Vec<usize>> = Vec::new();
     let mut engram_live = false;
     let mut head_test = false;
     let mut core_real = false;
@@ -379,6 +404,15 @@ fn main() -> Result<()> {
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
             "--force-decode" => force_decode = true,
             "--warm-prefill" => warm_prefill = true,
+            // --split "512,512,20;1024,20;500,544"
+            "--split" => {
+                splits = args
+                    .next()
+                    .context("--split")?
+                    .split(';')
+                    .map(|g| g.split(',').map(|n| n.parse::<usize>().map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>())
+                    .collect::<Result<Vec<_>>>()?
+            }
             "--path" => {
                 model_path = match args.next().context("--path")?.as_str() {
                     "model" => true,
@@ -431,7 +465,7 @@ fn main() -> Result<()> {
     let stream = gpu.default_stream();
     let ops = Ops { gpu: gpu.as_ref(), k: &kernels, stream };
     if model_path {
-        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n, force_decode, warm_prefill);
+        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n, force_decode, warm_prefill, splits);
     }
     let blocks: Vec<V41BlockWeights> = (0..n_layers).map(|l| V41BlockWeights::load(&store, l, &dims, &ops)).collect::<Result<_>>()?;
     let largest = blocks

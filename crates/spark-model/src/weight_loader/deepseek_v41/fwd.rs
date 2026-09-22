@@ -350,6 +350,12 @@ impl Tap {
         if !self.layers.is_empty() && !self.layers.contains(&layer) {
             return Ok(());
         }
+        // ATLAS_DSV41_TAP_NAMES=h,logits_last restricts the dump to those tap names.
+        if let Ok(only) = std::env::var("ATLAS_DSV41_TAP_NAMES")
+            && !only.split(',').any(|n| n == name)
+        {
+            return Ok(());
+        }
         let key = format!("L{layer:02}.{name}");
         let occ = {
             let mut c = self.counts.lock().expect("tap counts poisoned");

@@ -49,6 +49,13 @@ pub mod profile {
     }
 }
 
+/// `ATLAS_DSV41_FP8_ROWTILE=1`: run FP8 dense GEMMs as 16-row tiles at every M (the
+/// chunk-invariance control arm for the untiled M > 16 path).
+pub fn fp8_force_rowtile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_DSV41_FP8_ROWTILE").as_deref() == Ok("1"))
+}
+
 /// Time `f` under `name` when profiling is on (see [`profile`]); a plain call otherwise.
 pub fn prof<R>(ops: &Ops, name: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
     if !profile::enabled() {
@@ -278,7 +285,7 @@ impl Ops<'_> {
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
         prof(self, "dense/gemm", || {
-            if m > MM_TILE {
+            if m > MM_TILE && !fp8_force_rowtile() {
                 self.linear_bf16_strided(x, w.k, scratch, out, w.n, m, w.n, w.k)
             } else {
                 self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
