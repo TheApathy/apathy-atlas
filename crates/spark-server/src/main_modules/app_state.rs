@@ -59,6 +59,10 @@ pub struct AppState {
     pub rotation_tx: Option<mpsc::Sender<crate::scheduler::LoraRotation>>,
     /// Vision config for VL models — None for text-only models.
     pub vision_config: Option<atlas_core::config::VisionConfig>,
+    /// The model is DeepSeek-V4.1 (`model_type = "deepseek_v41"`): prompts are
+    /// rendered and outputs parsed by `crate::dsv41` (the production Python
+    /// server's semantics) instead of the generic Jinja/tool-parser path.
+    pub dsv41: bool,
     /// Dedicated Vision-Exp architecture; never interpreted as Qwen vision.
     pub deepseek_vision_config: Option<atlas_core::config::DeepSeekVisionConfig>,
     /// Physical text embedding vocabulary; virtual image sentinels start here.

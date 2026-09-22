@@ -103,6 +103,7 @@ pub(crate) async fn build_and_serve(
         .route("/v1/images/variations", post(api::images_stub))
         .route("/v1/moderations", post(api::moderations_stub))
         .route("/tokenize", post(api::tokenize))
+        .route("/v1/debug/prompt", post(api::dsv41::debug_prompt))
         .route("/detokenize", post(api::detokenize))
         .route("/health", get(api::health))
         .route("/health/live", get(api::health_live))

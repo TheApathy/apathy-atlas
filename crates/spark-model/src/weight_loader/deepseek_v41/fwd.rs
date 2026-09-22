@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 
-use super::ops::{Fp8Linear, HcParams, Ops, bf16_tensor};
+use super::ops::{Fp8Linear, HcParams, Ops, bf16_tensor, prof};
 
 /// Model constants the block needs. Read from `ModelConfig` by the caller; kept as a plain
 /// struct so the forward cannot silently read a field that means something else for V4.
@@ -281,34 +281,40 @@ pub fn block(
     let (eps, it, hce) = (dims.norm_eps, dims.sinkhorn_iters, dims.hc_eps);
 
     // ---- attention sub-layer
-    ops.hc_mixes(s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, t, d, it, eps, hce)?;
     let attn_side_pre = match control {
         BlockControl::None => s.pre_mix,
         BlockControl::OwnPre => s.attn_pre,
     };
-    ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
-    ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)?;
+    prof(ops, "mhc+norm", || {
+        ops.hc_mixes(s.h, &w.hc_attn, s.attn_pre, s.attn_post, s.attn_comb, t, d, it, eps, hce)?;
+        ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
+        ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)
+    })?;
     tap.bf16(ops, "attn_x", l, s.x, &[t, d])?;
-    attn.forward(ops, l, s.x, s.y, t, start)?;
+    prof(ops, "attention", || attn.forward(ops, l, s.x, s.y, t, start))?;
     tap.bf16(ops, "attn_out", l, s.y, &[t, d])?;
-    ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
 
     // ---- FFN sub-layer (collapses with THIS block's attention-side pre)
-    ops.hc_mixes(s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, t, d, it, eps, hce)?;
     let ffn_side_pre = match control {
         BlockControl::None => s.attn_pre,
         BlockControl::OwnPre => s.ffn_pre,
     };
-    ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
-    ops.rmsnorm(s.x, w.ffn_norm, s.x, t, d, eps)?;
+    prof(ops, "mhc+norm", || {
+        ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
+        ops.hc_mixes(s.h, &w.hc_ffn, s.ffn_pre, s.ffn_post, s.ffn_comb, t, d, it, eps, hce)?;
+        ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
+        ops.rmsnorm(s.x, w.ffn_norm, s.x, t, d, eps)
+    })?;
     tap.bf16(ops, "moe_in", l, s.x, &[t, d])?;
-    moe.forward(ops, l, s.x, s.routed, t)?;
-    w.shared.forward(ops, s.x, s.shared, t, s, dims)?;
+    prof(ops, "moe.routed", || moe.forward(ops, l, s.x, s.routed, t))?;
+    prof(ops, "moe.shared", || w.shared.forward(ops, s.x, s.shared, t, s, dims))?;
     tap.bf16(ops, "moe_routed", l, s.routed, &[t, d])?;
     tap.bf16(ops, "moe_shared", l, s.shared, &[t, d])?;
-    ops.add_bf16(s.routed, s.shared, s.y, t * d)?;
-    ops.hc_post(s.y, s.h, s.ffn_post, s.ffn_comb, s.h, t, d)?;
-    ops.gpu.copy_d2d_async(s.ffn_pre, s.pre_mix, t * hc * 4, ops.stream)?;
+    prof(ops, "mhc+norm", || {
+        ops.add_bf16(s.routed, s.shared, s.y, t * d)?;
+        ops.hc_post(s.y, s.h, s.ffn_post, s.ffn_comb, s.h, t, d)?;
+        ops.gpu.copy_d2d_async(s.ffn_pre, s.pre_mix, t * hc * 4, ops.stream)
+    })?;
 
     tap.bf16(ops, "h", l, s.h, &[t, hc, d])?;
     tap.f32(ops, "pre_mix", l, s.pre_mix, &[t, hc])?;
@@ -342,6 +348,12 @@ impl Tap {
     fn write(&self, ops: &Ops, name: &str, layer: usize, ptr: DevicePtr, bytes: usize) -> Result<()> {
         let Some(dir) = &self.dir else { return Ok(()) };
         if !self.layers.is_empty() && !self.layers.contains(&layer) {
+            return Ok(());
+        }
+        // ATLAS_DSV41_TAP_NAMES=h,logits_last restricts the dump to those tap names.
+        if let Ok(only) = std::env::var("ATLAS_DSV41_TAP_NAMES")
+            && !only.split(',').any(|n| n == name)
+        {
             return Ok(());
         }
         let key = format!("L{layer:02}.{name}");

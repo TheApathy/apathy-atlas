@@ -35,28 +35,44 @@ pub struct V41Lanes {
     pub moe: Box<dyn V41RoutedMoe + Send + Sync>,
 }
 
-/// Build the lanes' halves for serving.
-///
-/// NOT WIRED YET, deliberately a hard stop: the attention core must come from dsv41-attention2's
-/// `Dsv41Attention` (compress / sparse_index_select / sparse_attention) and the routed MoE
-/// from dsv41-engine2's library path. A stand-in for either would serve fluent wrong tokens.
-pub fn build_lanes(
-    _store: &WeightStore,
-    _config: &ModelConfig,
-    _gpu: &dyn GpuBackend,
-    _max_seq: usize,
+/// The lanes' halves: attention2's sparse core (one object = core + hook, state model-wide)
+/// and engine2's routed MoE over the FULL keep=124 arena.
+#[allow(clippy::too_many_arguments)]
+fn build_lanes(
+    store: &WeightStore,
+    config: &ModelConfig,
+    gpu: &'static dyn GpuBackend,
+    kernels: &'static Dsv41Kernels,
+    fwd: &V41Forward,
+    model_dir: &std::path::Path,
+    max_seq: usize,
+    max_chunk: usize,
 ) -> Result<V41Lanes> {
-    bail!(
-        "DeepSeek-V4.1 serving: the attention core (OWNER dsv41-attention2) and the routed MoE \
-         (OWNER dsv41-engine2) are not wired into model::dsv41::build_lanes yet. Everything else \
-         — mHC, norms, shared expert, engram, attention projections, SWA-replay orchestration, \
-         head — is in V41Forward. This is a deliberate hard stop, not a fallback."
-    )
+    use crate::layers::deepseek_v41_attn::core::Dsv41SparseCore;
+    use crate::weight_loader::deepseek_v41::cb3_arena::{Cb3ExpertArena, resolve_packed_keep};
+    use crate::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
+    let core = std::sync::Arc::new(Dsv41SparseCore::load(gpu, store, config, max_seq, max_chunk, fwd.freqs_c)?);
+    let pack_dir = model_dir.join("k154-cb3");
+    let manifest = std::fs::read_to_string(pack_dir.join("manifest.json"))
+        .with_context(|| format!("DeepSeek-V4.1 expert pack manifest at {}", pack_dir.display()))?;
+    let pack = atlas_core::config::ExpertPack::parse(&manifest, resolve_packed_keep()?)?;
+    let arena = std::sync::Arc::new(Cb3ExpertArena::load(&pack_dir, &pack, gpu)?);
+    tracing::info!("DeepSeek-V4.1: {:.2} GB of CB3 experts resident (keep={})", arena.resident_bytes() as f64 / 1e9, arena.packed_keep());
+    let stream = gpu.default_stream();
+    let routers = (0..config.num_hidden_layers)
+        .map(|l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let moe = Cb3RoutedMoe::new(gpu, kernels, config, arena, routers, 10.0, 1.5, max_chunk.max(128))?;
+    Ok(V41Lanes { hook: Box::new(core.clone()), core: Box::new(core), moe: Box::new(moe) })
 }
 
 pub struct Dsv41Model {
-    gpu: Box<dyn GpuBackend>,
-    kernels: Dsv41Kernels,
+    /// LEAKED for the process lifetime: the routed MoE (`Cb3RoutedMoe<'a>`) borrows the
+    /// backend and the kernel table, and a served model lives until exit anyway. A second
+    /// model load in one process would leak one backend handle (not device memory: the arena
+    /// and weights are freed by their owners).
+    gpu: &'static dyn GpuBackend,
+    kernels: &'static Dsv41Kernels,
     fwd: V41Forward,
     lanes: V41Lanes,
     model_dir: std::path::PathBuf,
@@ -78,17 +94,18 @@ impl Dsv41Model {
         store: &WeightStore,
         gpu: Box<dyn GpuBackend>,
         model_dir: &std::path::Path,
-        lanes: V41Lanes,
         max_seq: usize,
         max_chunk: usize,
     ) -> Result<Self> {
         gpu.bind_to_thread()?;
+        let gpu: &'static dyn GpuBackend = Box::leak(gpu);
         let dims = V41Dims::from_config(config)?;
-        let kernels = Dsv41Kernels::load(gpu.as_ref())?;
+        let kernels: &'static Dsv41Kernels = Box::leak(Box::new(Dsv41Kernels::load(gpu)?));
         let stream = gpu.default_stream();
-        let ops = Ops { gpu: gpu.as_ref(), k: &kernels, stream };
+        let ops = Ops { gpu, k: kernels, stream };
         let threads = std::env::var("ATLAS_DSV41_ENGRAM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
         let fwd = V41Forward::load(store, &ops, dims, config.vocab_size, config.num_hidden_layers, max_chunk, max_seq, model_dir, threads)?;
+        let lanes = build_lanes(store, config, gpu, kernels, &fwd, model_dir, max_seq, max_chunk)?;
         let mode = match std::env::var("ATLAS_DSV41_PREFILL").ok().as_deref() {
             None | Some("replay") => PrefillMode::Replay,
             Some("full") => {
@@ -120,7 +137,7 @@ impl Dsv41Model {
     }
 
     fn ops(&self) -> Ops<'_> {
-        Ops { gpu: self.gpu.as_ref(), k: &self.kernels, stream: self.gpu.default_stream() }
+        Ops { gpu: self.gpu, k: self.kernels, stream: self.gpu.default_stream() }
     }
 
     fn with_seq<R>(&self, slot: usize, f: impl FnOnce(&mut V41Seq) -> Result<R>) -> Result<R> {
@@ -223,7 +240,7 @@ impl Model for Dsv41Model {
             *n += 1;
             *n
         };
-        map.insert(slot, V41Seq::new(self.gpu.as_ref(), &self.fwd.dims, hash)?);
+        map.insert(slot, V41Seq::new(self.gpu, &self.fwd.dims, hash)?);
         Ok(SequenceState {
             adapter_id: 0,
             adapter_slot: -1,
@@ -266,7 +283,7 @@ impl Model for Dsv41Model {
             return Ok(());
         }
         if let Some(s) = self.seqs.lock().expect("dsv41 seqs poisoned").remove(&seq.slot_idx) {
-            s.free(self.gpu.as_ref())?;
+            s.free(self.gpu)?;
         }
         Ok(())
     }

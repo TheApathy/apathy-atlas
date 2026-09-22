@@ -38,7 +38,7 @@ use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP, parse_config};
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
-    Cb3RoutedMoe, MoeControl, ROUTER_EXPERTS, RouterF32, TOP_K,
+    Cb3RoutedMoe, ExpertKernel, MoeControl, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_model::weight_loader::deepseek_v41::routing::Routing;
@@ -101,6 +101,7 @@ fn main() -> Result<()> {
     let mut ours = false;
     let mut control = MoeControl::None;
     let mut dump: Option<PathBuf> = None;
+    let mut kernel = ExpertKernel::Reconstruct;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -108,6 +109,13 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
+            "--kernel" => {
+                kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
+                    "fused" => ExpertKernel::Fused,
+                    "reconstruct" => ExpertKernel::Reconstruct,
+                    other => bail!("unknown kernel {other}"),
+                }
+            }
             "--routing" => {
                 ours = match args.next().context("--routing needs engine|ours")?.as_str() {
                     "engine" => false,
@@ -175,6 +183,8 @@ fn main() -> Result<()> {
     let moe = Cb3RoutedMoe::new(&gpu, &kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
     moe.set_pass_tokens(pass_ids);
     moe.set_control(control);
+    moe.set_expert_kernel(kernel);
+    println!("  expert kernel: {kernel:?}");
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
     }
@@ -202,6 +212,16 @@ fn main() -> Result<()> {
         println!(
             "  router: scores rel_l2 {:.3e}; route_idx {idx_mismatch}/{} picks differ on {rows_mismatch}/{tokens} rows; route_w worst {w_worst:.3e}",
             (num / den).sqrt(),
+            want_idx.len()
+        );
+        // The DEVICE router (what `forward` runs) against the engine AND the host router.
+        let device = moe.route_device(layer, d_in, tokens, stream)?;
+        let dev_vs_engine = device.indices.iter().zip(&want_idx).filter(|(a, b)| a != b).count();
+        let dev_vs_host = device.indices.iter().zip(&routing.indices).filter(|(a, b)| a != b).count();
+        let dw_engine = device.weights.iter().zip(&want_w).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let dw_host = device.weights.iter().zip(&routing.weights).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!(
+            "  device router: route_idx {dev_vs_engine}/{} differ vs engine, {dev_vs_host} vs host; route_w worst {dw_engine:.3e} vs engine, {dw_host:.3e} vs host",
             want_idx.len()
         );
         moe.forward(&Ops { gpu: &gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;

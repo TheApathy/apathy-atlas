@@ -738,61 +738,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // flip this bool — this selects the verify architecture, not the pick
     // basis.
     let dflash_verify_raw_argmax = args.dflash;
-    // DS4F hard-limit lane (2026-07-21): install the served-context ceiling so
-    // the scheduler enforces `max_seq_len` per decode step (§C-3), not just as a
-    // KV-allocation ceiling trued-up on completion. Set once, before the
-    // scheduler thread spawns.
-    scheduler::set_max_seq_len(args.max_seq_len);
-    std::thread::spawn(move || {
-        // ATLAS_SCHED_PIN=<core>: pin the scheduler thread to a dedicated
-        // core. Measured 2026-07-25 (LOOP_TRACE): ~1.4 involuntary
-        // preemptions per decode step, each costing ~4ms of re-schedule
-        // latency right after step end (tokio emit/detokenize wakeups win
-        // the core). A dedicated core removes the preemption; the kernel
-        // load-balances the tokio workers onto the remaining cores.
-        if let Ok(core) = std::env::var("ATLAS_SCHED_PIN")
-            && let Ok(core) = core.parse::<usize>()
-        {
-            unsafe {
-                let mut set: libc::cpu_set_t = std::mem::zeroed();
-                libc::CPU_SET(core, &mut set);
-                let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-                if rc == 0 {
-                    tracing::info!("scheduler thread pinned to core {core}");
-                } else {
-                    tracing::warn!("ATLAS_SCHED_PIN: sched_setaffinity failed (rc={rc})");
-                }
-            }
-        }
-        scheduler::run(
-            scheduler_model,
-            request_rx,
-            rotation_rx,
-            scheduler_eos,
-            max_batch_size,
-            use_speculative,
-            dflash_verify_raw_argmax,
-            num_drafts,
-            policy,
-            max_prefill_tokens,
-            max_batch_tokens,
-            use_self_spec,
-            use_ngram_spec,
-            swap_space_gb,
-            high_speed_swap_cfg,
-            block_size,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            grammar_engine,
-            adaptive_sampling,
-            session_manager,
-            scheduler_spontaneous_think_budget,
-        );
-    });
-
+    // ── Every fallible startup step runs BEFORE the scheduler thread spawns.
+    // The detached scheduler takes ownership of the loaded model; an early
+    // `?` after the spawn would return Err while that thread keeps the model's
+    // device memory (~84 GB on DeepSeek-V4.1) unreachable until process exit,
+    // and the next load attempt OOMs this unified-memory host. After the
+    // spawn only infallible wiring remains (the HTTP bind is the exception).
     // Tool call parser resolution: CLI > MODEL.toml > defaults table.
     let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
 
@@ -926,6 +877,74 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
 
+    let deepseek_vision_vocab = config
+        .deepseek_vision
+        .as_ref()
+        .map(|_| u32::try_from(config.vocab_size))
+        .transpose()
+        .context("DeepSeek vocabulary exceeds u32")?;
+
+    // DS4F hard-limit lane (2026-07-21): install the served-context ceiling so
+    // the scheduler enforces `max_seq_len` per decode step (§C-3), not just as a
+    // KV-allocation ceiling trued-up on completion. Set once, before the
+    // scheduler thread spawns.
+    scheduler::set_max_seq_len(args.max_seq_len);
+    std::thread::spawn(move || {
+        // ATLAS_SCHED_PIN=<core>: pin the scheduler thread to a dedicated
+        // core. Measured 2026-07-25 (LOOP_TRACE): ~1.4 involuntary
+        // preemptions per decode step, each costing ~4ms of re-schedule
+        // latency right after step end (tokio emit/detokenize wakeups win
+        // the core). A dedicated core removes the preemption; the kernel
+        // load-balances the tokio workers onto the remaining cores.
+        if let Ok(core) = std::env::var("ATLAS_SCHED_PIN")
+            && let Ok(core) = core.parse::<usize>()
+        {
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(core, &mut set);
+                let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                if rc == 0 {
+                    tracing::info!("scheduler thread pinned to core {core}");
+                } else {
+                    tracing::warn!("ATLAS_SCHED_PIN: sched_setaffinity failed (rc={rc})");
+                }
+            }
+        }
+        scheduler::run(
+            scheduler_model,
+            request_rx,
+            rotation_rx,
+            scheduler_eos,
+            max_batch_size,
+            use_speculative,
+            dflash_verify_raw_argmax,
+            num_drafts,
+            policy,
+            max_prefill_tokens,
+            max_batch_tokens,
+            use_self_spec,
+            use_ngram_spec,
+            swap_space_gb,
+            high_speed_swap_cfg,
+            block_size,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            grammar_engine,
+            adaptive_sampling,
+            session_manager,
+            scheduler_spontaneous_think_budget,
+        );
+    });
+
+    if config.model_type == "deepseek_v41" {
+        crate::dsv41::repetition::configure(true);
+        if !crate::scheduler::force_disable_watchdogs() {
+            tracing::warn!("deepseek_v41: auto-watchdogs were already resolved ON; outputs will diverge from the Python engine");
+        }
+    }
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
@@ -950,13 +969,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             Some(rotation_tx)
         },
         vision_config: config.vision.clone(),
+        dsv41: config.model_type == "deepseek_v41",
         deepseek_vision_config: config.deepseek_vision.clone(),
-        deepseek_vision_vocab: config
-            .deepseek_vision
-            .as_ref()
-            .map(|_| u32::try_from(config.vocab_size))
-            .transpose()
-            .context("DeepSeek vocabulary exceeds u32")?,
+        deepseek_vision_vocab,
         initial_prefill_tokens: prefill_budget,
         vision_max_pixels,
         default_temperature,

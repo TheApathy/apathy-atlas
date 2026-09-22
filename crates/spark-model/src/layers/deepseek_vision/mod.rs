@@ -94,7 +94,59 @@ impl DeepSeekVisionEncoder {
             config.rope_theta.to_bits() == 10_000.0f64.to_bits() && geometry.head_dim == 64,
             "DeepSeek vision device angles require exact theta 10000 and head dimension 64"
         );
-        let weights = Weights::load(store, &geometry, config.num_hidden_layers)?;
+        Self::load_with(store, geometry, config.num_hidden_layers, true, gpu)
+    }
+
+    /// DeepSeek-V4.1's tower: the same 32-block 1024-wide ViT and 3x3 aligner
+    /// as V4-Flash-Vision (the same tensor names and shapes), feeding a
+    /// 5120-wide text model, with up to 1024 image tokens and no `image_pad`
+    /// tensor. The arguments come from the checkpoint's `vision_config`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_v41(
+        store: &WeightStore,
+        hidden: usize,
+        intermediate: usize,
+        heads: usize,
+        layers: usize,
+        patch: usize,
+        downsample: usize,
+        rope_theta: f64,
+        max_image_tokens: usize,
+        text_hidden_size: usize,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            text_hidden_size == 5120,
+            "DeepSeek-V4.1 vision expects a 5120-wide text model"
+        );
+        anyhow::ensure!(
+            layers == 32 && rope_theta.to_bits() == 10_000.0f64.to_bits(),
+            "DeepSeek-V4.1 vision requires 32 blocks and rope_theta 10000"
+        );
+        let geometry = Geometry::new(
+            hidden,
+            intermediate,
+            heads,
+            patch,
+            downsample,
+            max_image_tokens,
+            text_hidden_size,
+        )?;
+        anyhow::ensure!(
+            geometry.head_dim == 64,
+            "DeepSeek vision device angles require head dimension 64"
+        );
+        Self::load_with(store, geometry, layers, false, gpu)
+    }
+
+    fn load_with(
+        store: &WeightStore,
+        geometry: Geometry,
+        depth: usize,
+        has_pad: bool,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        let weights = Weights::load(store, &geometry, depth, has_pad)?;
         let kernels = Kernels {
             angles: gpu.kernel("deepseek_vision_angles", "deepseek_vision_angles")?,
             linear: gpu.kernel("deepseek_vision_gemm", "deepseek_vision_linear")?,
@@ -144,6 +196,8 @@ impl DeepSeekVisionEncoder {
     }
 
     /// START, PAD, IMAGE (placeholder PAD), NEWLINE, END learned BF16 rows.
+    /// For V4.1 (`load_v41`) the two PAD entries are NULL: that checkpoint
+    /// has no learned pad row.
     pub fn image_special_embeddings(&self) -> [DevicePtr; 5] {
         self.weights.special
     }
