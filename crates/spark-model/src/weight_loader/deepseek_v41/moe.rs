@@ -796,7 +796,7 @@ mod permutation_tests {
         for kernel in [SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, ROUTE_TOPK_FN] {
             // `__launch_bounds__(...)` may sit between `__global__` and the return type.
             let declared = source.lines().any(|line| {
-                line.starts_with("extern \"C\" __global__") && line.contains(&format!(" void {kernel}("))
+                line.starts_with("extern \"C\" __global__") && line.contains(&format!(" {kernel}("))
             });
             assert!(declared, "{kernel} must be a C-linkage kernel in {}", cu.display());
         }
