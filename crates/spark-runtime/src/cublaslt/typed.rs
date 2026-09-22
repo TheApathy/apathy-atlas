@@ -35,7 +35,8 @@ impl GemmDtype {
 /// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ` with explicit row strides (`lda` for `act`,
 /// `ldc` for `out`, in elements; the weight is packed `[N,K]`), fp32 accumulate.
 ///
-/// `in_dtype` applies to both `act` and `weight`; `out_dtype` to `out`.
+/// `in_dtype` applies to both `act` and `weight`; `out_dtype` to `out`. cuBLASLt's default
+/// heuristic (split-K allowed). See [`gemm_act_weight_t_typed_ex`] for the no-split-K form.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_act_weight_t_typed(
     act: u64,
@@ -48,6 +49,36 @@ pub fn gemm_act_weight_t_typed(
     k: u32,
     in_dtype: GemmDtype,
     out_dtype: GemmDtype,
+    stream: u64,
+) -> Result<()> {
+    gemm_act_weight_t_typed_ex(act, lda, weight, out, ldc, m, n, k, in_dtype, out_dtype, false, stream)
+}
+
+/// [`gemm_act_weight_t_typed`] with a PER-CALL reduction policy. `no_split_k = true` restricts
+/// the heuristic to algorithms that do not split K
+/// (`CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK = 0`), so a row's sum is accumulated in one
+/// order whatever M is.
+///
+/// Why per call and not global: this file is shared across models, and the only caller that
+/// needs it measured it. dsv41-attention, on DeepSeek-V4.1's L20 compressor (16x512x5120,
+/// runF_faithful): default heuristic (split-K chosen) ckv 70.7% bf16-exact, top-k 296/512 rows
+/// wrong; split-K with fp32 reduction (mask 2) 97.75% / 53/512; mask 0 100.00% / 1/512.
+/// (The integrate/all-models branch has a separate deterministic-SELECTION fix for the tuned
+/// bf16 path in cublaslt.rs — tie-breaking between measured candidates. It does not restrict
+/// the reduction scheme and does not cover this untuned typed path.)
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_act_weight_t_typed_ex(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
     stream: u64,
 ) -> Result<()> {
     if lda < k || ldc < n {
@@ -92,21 +123,18 @@ pub fn gemm_act_weight_t_typed(
             ),
             "PrefWorkspace",
         )?;
-        // NO split-K. The reference's M=16 torch GEMMs do not split K, and even an fp32
-        // split-K reduction reorders the sum enough to move bf16 outputs: measured by
-        // dsv41-attention on L20's compressor (16x512x5120), the default heuristic took ckv
-        // from 100.00% to 70.7% bit-exact vs runF and changed top-k on 296/512 rows; mask 0
-        // restored 100.00% and 0/1024 rows differing across two chunkings.
-        let no_split_k: u32 = 0;
-        chk(
-            cublasLtMatmulPreferenceSetAttribute(
-                pref,
-                PREF_REDUCTION_SCHEME_MASK,
-                &no_split_k as *const u32 as *const c_void,
-                std::mem::size_of::<u32>(),
-            ),
-            "PrefReductionScheme",
-        )?;
+        if no_split_k {
+            let mask: u32 = 0;
+            chk(
+                cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    PREF_REDUCTION_SCHEME_MASK,
+                    &mask as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>(),
+                ),
+                "PrefReductionScheme",
+            )?;
+        }
         let mut result = [0u8; 128];
         let mut returned: i32 = 0;
         let heur = cublasLtMatmulAlgoGetHeuristic(

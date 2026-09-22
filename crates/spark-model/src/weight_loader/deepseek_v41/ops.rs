@@ -11,7 +11,7 @@
 //! NOT reproduced here — see DSV41_PORT/integrate.)
 
 use anyhow::{Context, Result, ensure};
-use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed};
+use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_ex};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::weights::{WeightDtype, WeightStore};
@@ -24,6 +24,9 @@ const BLOCK: u32 = 256;
 /// share the call. Without it chunking changes the model (dsv41-attention measured L20's
 /// replay-tail top-k moving on 19/128 rows under a re-chunking).
 pub const MM_TILE: usize = 16;
+/// Every DeepSeek-V4.1 GEMM forbids split-K (see `gemm_act_weight_t_typed_ex`): the
+/// reference's torch GEMMs do not split K at these shapes, and split-K changes top-k.
+const NO_SPLIT_K: bool = true;
 
 /// Rows a buffer must hold for `t` logical rows to go through the tiled GEMMs: every tile is
 /// issued at exactly MM_TILE rows, so the last tile reads and writes up to MM_TILE-1 slack rows.
@@ -179,18 +182,18 @@ impl Ops<'_> {
 
     /// `out[m, n] = x[m, k] @ w[n, k]^T`, bf16, fp32 accumulate.
     pub fn linear_bf16(&self, x: DevicePtr, w: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
-        gemm_act_weight_t_typed(x.0, k as u32, w.0, out.0, n as u32, m as u32, n as u32, k as u32, GemmDtype::Bf16, GemmDtype::Bf16, self.stream)
+        gemm_act_weight_t_typed_ex(x.0, k as u32, w.0, out.0, n as u32, m as u32, n as u32, k as u32, GemmDtype::Bf16, GemmDtype::Bf16, NO_SPLIT_K, self.stream)
     }
 
     /// Strided bf16 GEMM, for the grouped `wo_a` (column slices of wider row-major matrices).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_bf16_strided(&self, x: DevicePtr, lda: usize, w: DevicePtr, out: DevicePtr, ldc: usize, m: usize, n: usize, k: usize) -> Result<()> {
-        gemm_act_weight_t_typed(x.0, lda as u32, w.0, out.0, ldc as u32, m as u32, n as u32, k as u32, GemmDtype::Bf16, GemmDtype::Bf16, self.stream)
+        gemm_act_weight_t_typed_ex(x.0, lda as u32, w.0, out.0, ldc as u32, m as u32, n as u32, k as u32, GemmDtype::Bf16, GemmDtype::Bf16, NO_SPLIT_K, self.stream)
     }
 
     /// TRUE fp32 GEMM (no TF32): `out[m, n] = x[m, k] @ w[n, k]^T`.
     pub fn linear_f32(&self, x: DevicePtr, w: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
-        gemm_act_weight_t_typed(x.0, k as u32, w.0, out.0, n as u32, m as u32, n as u32, k as u32, GemmDtype::F32, GemmDtype::F32, self.stream)
+        gemm_act_weight_t_typed_ex(x.0, k as u32, w.0, out.0, n as u32, m as u32, n as u32, k as u32, GemmDtype::F32, GemmDtype::F32, NO_SPLIT_K, self.stream)
     }
 
     /// [`Self::linear_bf16_strided`] in fixed [`MM_TILE`]-row tiles. `x` and `out` must hold
@@ -199,10 +202,9 @@ impl Ops<'_> {
     #[allow(clippy::too_many_arguments)]
     pub fn linear_bf16_tiled(&self, x: DevicePtr, lda: usize, w: DevicePtr, out: DevicePtr, ldc: usize, m: usize, n: usize, k: usize) -> Result<()> {
         for r in (0..m).step_by(MM_TILE) {
-            gemm_act_weight_t_typed(
+            gemm_act_weight_t_typed_ex(
                 x.offset(r * lda * 2).0, lda as u32, w.0, out.offset(r * ldc * 2).0, ldc as u32,
-                MM_TILE as u32, n as u32, k as u32, GemmDtype::Bf16, GemmDtype::Bf16, self.stream,
-            )?;
+                MM_TILE as u32, n as u32, k as u32, GemmDtype::Bf16, GemmDtype::Bf16, NO_SPLIT_K, self.stream)?;
         }
         Ok(())
     }
@@ -210,10 +212,9 @@ impl Ops<'_> {
     /// TRUE fp32 GEMM in fixed [`MM_TILE`]-row tiles; same slack-row contract.
     pub fn linear_f32_tiled(&self, x: DevicePtr, w: DevicePtr, out: DevicePtr, m: usize, n: usize, k: usize) -> Result<()> {
         for r in (0..m).step_by(MM_TILE) {
-            gemm_act_weight_t_typed(
+            gemm_act_weight_t_typed_ex(
                 x.offset(r * k * 4).0, k as u32, w.0, out.offset(r * n * 4).0, n as u32,
-                MM_TILE as u32, n as u32, k as u32, GemmDtype::F32, GemmDtype::F32, self.stream,
-            )?;
+                MM_TILE as u32, n as u32, k as u32, GemmDtype::F32, GemmDtype::F32, NO_SPLIT_K, self.stream)?;
         }
         Ok(())
     }
