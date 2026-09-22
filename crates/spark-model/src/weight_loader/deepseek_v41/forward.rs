@@ -41,6 +41,52 @@ fn engram_debug() -> bool {
     std::env::var(ENGRAM_DEBUG_ENV).is_ok()
 }
 
+/// Attribution tool (team-lead's 3-arm plan): override the PREFILL dead-head mask on the
+/// EXECUTING path, so a comparison against the oracle needs no magnitude reasoning --
+/// whichever arm lands closest answers directly. `ported` (default, unset) is the real path
+/// and is a no-op. Never applies to decode: decode's own correctness (block-local, no carry)
+/// is a separate, already-tested question, and overriding it here would conflate the two.
+pub const ENGRAM_DEAD_ARM_ENV: &str = "ATLAS_DSV41_ENGRAM_DEAD_ARM";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadArm {
+    Ported,
+    Off,
+    Shifted,
+}
+
+fn dead_arm() -> Result<DeadArm> {
+    match std::env::var(ENGRAM_DEAD_ARM_ENV) {
+        Err(_) => Ok(DeadArm::Ported),
+        Ok(v) => match v.as_str() {
+            "ported" => Ok(DeadArm::Ported),
+            "off" => Ok(DeadArm::Off),
+            "shifted" => Ok(DeadArm::Shifted),
+            other => anyhow::bail!("{ENGRAM_DEAD_ARM_ENV}: ported|off|shifted, got {other}"),
+        },
+    }
+}
+
+/// Apply `arm` to an already-computed [T, N_HEAD_COLS] mask. `Ported` is a no-op (returns
+/// `dead` unchanged); the other two exist only for this attribution tool.
+fn apply_dead_arm(arm: DeadArm, dead: Vec<bool>, t: usize) -> Vec<bool> {
+    match arm {
+        DeadArm::Ported => dead,
+        DeadArm::Off => vec![false; dead.len()],
+        DeadArm::Shifted => {
+            // Same construction as dead_heads.rs's own negative control: OR the mask with
+            // itself shifted forward one position.
+            let mut wrong = dead.clone();
+            for p in (1..t).rev() {
+                for c in 0..N_HEAD_COLS {
+                    wrong[p * N_HEAD_COLS + c] = dead[p * N_HEAD_COLS + c] || dead[(p - 1) * N_HEAD_COLS + c];
+                }
+            }
+            wrong
+        }
+    }
+}
+
 /// `candidate_source_layer`: the last encoder layer.
 pub const ENCODER_LAST: usize = 20;
 pub const N_LAYERS: usize = 40;
@@ -281,13 +327,17 @@ impl V41Forward {
         // version of this carried on decode too, which is wrong at exactly the position right
         // after an image-ending prompt's first generated token. Replay never reaches an engram
         // layer, so it never exercises this branch either way.
-        let dead: Vec<u8> = match kind {
+        let mut dead_bools = match kind {
             PassKind::Decode => engram_dead_heads(ids),
             _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
+        };
+        if kind != PassKind::Decode {
+            // Attribution tool only, real path is a no-op (`DeadArm::Ported`) -- see
+            // `apply_dead_arm`'s doc. Applied AFTER the carry, so `--dead-arm shifted`'s shift
+            // is relative to what the executing path actually computed, not a re-derivation.
+            dead_bools = apply_dead_arm(dead_arm()?, dead_bools, t);
         }
-        .into_iter()
-        .map(u8::from)
-        .collect();
+        let dead: Vec<u8> = dead_bools.into_iter().map(u8::from).collect();
         if kind != PassKind::Decode {
             update_dead_carry(&mut seq.dead_carry, ids);
         }
