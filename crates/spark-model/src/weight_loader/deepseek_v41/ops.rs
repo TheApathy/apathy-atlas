@@ -194,6 +194,15 @@ pub struct Dsv41Kernels {
 
 /// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
 pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
+/// The M at which attention2 measured the fused wins; [`fused_shape`] evaluates the rule there.
+const FUSED_REF_M: usize = 512;
+
+/// Whether a weight `[n, k]` takes the fused FP8 GEMM on every non-decode pass. A function of
+/// the weight alone: `fused_wins` at the measured M, so the same shapes win (wo_b, w2, w1/w3,
+/// wq_a) and every chunk size, including tails of <= MM_TILE rows, uses the same kernel.
+pub fn fused_shape(n: usize, k: usize) -> bool {
+    fused_wins(FUSED_REF_M, n, k)
+}
 
 /// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
 /// block per token. Bit-identical by construction (same per-thread order, same tree).
@@ -443,11 +452,13 @@ impl Ops<'_> {
         if m <= GEMV_MAX_M && decode_pass() && self.k.fp8_gemv_m8.is_some() {
             return self.fp8_gemv_rows(x, w.k, w, out, w.n, m, w.n, 0);
         }
+        // The kernel choice depends on the WEIGHT (N, K) only, never on M: every row of a given
+        // weight takes the same kernel whatever the chunking, so chunk invariance holds by
+        // construction rather than by fused == cuBLAS bytewise. Decode passes returned above.
         if let Some(f) = self.k.fp8_fused
-            && m > MM_TILE
             && !fp8_force_rowtile()
             && fp8_policy() == Fp8Policy::Pinned
-            && fused_wins(m, w.n, w.k)
+            && fused_shape(w.n, w.k)
         {
             return prof(self, "dense/fused", || f.linear(self.gpu, x, w.k, w, out, w.n, m, self.stream));
         }
