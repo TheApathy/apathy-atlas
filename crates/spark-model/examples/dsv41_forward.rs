@@ -248,7 +248,11 @@ fn main() -> Result<()> {
         // layers for this chunk.
         if engram_live {
             let dead_host: Vec<u8> = engram_dead_heads(chunk_ids).iter().map(|&d| u8::from(d)).collect();
+            eprintln!("DEBUG dead_host True count = {} / {}", dead_host.iter().filter(|&&d| d != 0).count(), dead_host.len());
             gpu.copy_h2d(&dead_host, s.engram_dead)?;
+            let mut readback = vec![0u8; dead_host.len()];
+            gpu.copy_d2h(s.engram_dead, &mut readback)?;
+            eprintln!("DEBUG readback True count = {} / {}", readback.iter().filter(|&&d| d != 0).count(), readback.len());
         }
         for w in &blocks {
             if let Some(e) = &w.engram {
