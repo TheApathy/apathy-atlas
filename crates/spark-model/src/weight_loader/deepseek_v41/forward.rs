@@ -387,6 +387,8 @@ impl V41Forward {
             v.splice(ops.gpu, ops.stream, self.embed, ids, start, self.scratch.x)?;
         }
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
+        // Decode-size kernels key on the PASS KIND (never on t): see ops::set_decode_pass.
+        super::ops::set_decode_pass(kind == PassKind::Decode);
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
@@ -486,6 +488,7 @@ impl V41Forward {
             let (hrow, prow) = (self.dims.hc * self.dims.hidden * 2, self.dims.hc * 4);
             ops.gpu.copy_d2d_async(seq.tail_h, self.scratch.h, t * hrow, ops.stream)?;
             ops.gpu.copy_d2d_async(seq.tail_pre, self.scratch.pre_mix, t * prow, ops.stream)?;
+            super::ops::set_decode_pass(false);
             hook.begin_pass(PassKind::Replay, start, t)?;
             ensure!(seq.tail_ids.len() == t, "replay tail holds {} ids for {t} rows", seq.tail_ids.len());
             moe.begin_pass(&seq.tail_ids)?;

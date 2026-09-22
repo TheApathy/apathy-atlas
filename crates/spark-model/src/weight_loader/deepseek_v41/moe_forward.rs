@@ -355,7 +355,7 @@ impl Cb3RoutedMoe {
 
     /// Whether a `t`-row pass takes the decode path.
     pub fn uses_decode_path(&self, t: usize) -> bool {
-        self.decode.is_some() && t <= MAX_DECODE_T
+        self.decode.is_some() && t <= MAX_DECODE_T && super::ops::decode_pass()
     }
 
     /// The decode path's last device routing (synchronous; gates only).
@@ -559,7 +559,7 @@ impl Cb3RoutedMoe {
     ) -> Result<()> {
         ensure!(t <= self.scratch.max_t, "pass of {t} tokens exceeds scratch for {}", self.scratch.max_t);
         ensure!(routing.k == TOP_K, "routing k {} is not {TOP_K}", routing.k);
-        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T) {
+        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T && super::ops::decode_pass()) {
             return self.decode_experts(d, layer, y, out, t, Some(routing), stream);
         }
         let control = *self.control.lock().expect("control lock");
@@ -685,7 +685,10 @@ impl Cb3RoutedMoe {
         // whole pass is at most GEMV_MAX_PASS_T tokens (decode), MMA for every expert otherwise.
         let t = group_rows.last().map_or(0, |(_, end)| *end) / TOP_K;
         let pass_t = *self.gemv_pass_t.lock().expect("gemv lock");
-        let gemv_max = if t <= pass_t { *self.gemv_max_rows.lock().expect("gemv lock") } else { 0 };
+        // ...and only on a DECODE pass: a prefill chunk of <= 8 rows (a prompt's tail) must run the
+        // same MMA as the same rows inside a bigger chunk (dsv41-decode measured the 1-row and
+        // 4-row tails breaking chunk invariance at L00/L01 moe_routed through this branch).
+        let gemv_max = if t <= pass_t && super::ops::decode_pass() { *self.gemv_max_rows.lock().expect("gemv lock") } else { 0 };
         // Experts with few rows take the GEMV kernels (4-row tiles), the rest the MMA
         // kernels (128-row tiles). One upload: MMA tiles first, then GEMV tiles.
         let (mut mma, mut gemv): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());
@@ -794,7 +797,7 @@ impl V41RoutedMoe for Cb3RoutedMoe {
 
     fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()> {
         let stream = ops.stream;
-        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T) {
+        if let Some(d) = self.decode.as_ref().filter(|_| t <= MAX_DECODE_T && super::ops::decode_pass()) {
             let router = self.router(layer)?;
             d.route(self.gpu.as_ref(), layer, router, y, t, self.route_scale, stream)?;
             return self.decode_experts(d, layer, y, out, t, None, stream);

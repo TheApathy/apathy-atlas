@@ -123,6 +123,8 @@ fn main() -> Result<()> {
         "T", "exp", "scores", "route", "skip", "recon", "gemm", "all", "recon-", "gemm-", "GEMM TF/s", "MoE tok/s"
     );
     for &t in &token_counts {
+        // Production semantics: a pass of <= 8 rows at decode is a DECODE pass (dsv41-decode path).
+        spark_model::weight_loader::deepseek_v41::ops::set_decode_pass(t <= 8);
         moe.set_pass_tokens(&ids[..t]);
         // The subtraction phases only exist on the reconstruct path; Fused is the default.
         moe.set_expert_kernel(ExpertKernel::Reconstruct);
