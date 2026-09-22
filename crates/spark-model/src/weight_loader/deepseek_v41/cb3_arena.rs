@@ -182,43 +182,43 @@ impl Cb3ExpertArena {
                 strides[index] = stride;
             }
 
-            // Upload expert by expert, addressed by ROUTED ID through the pack. Going
-            // through `LayerShard::expert` rather than computing offsets here keeps the
-            // twelve-offsets fact in the one module that owns it, and makes a
-            // non-resident id a hard error instead of a silent wrong expert.
+            // UPLOAD ONE PLANE AT A TIME, not one expert at a time.
+            //
+            // Each plane is expert-major, so the resident prefix (slots 0..packed_keep) is
+            // ONE contiguous run inside it. That is 12 copies per layer instead of
+            // packed_keep * 12 — at the served keep of 124, 12 instead of 1488, and 480
+            // instead of 59,520 across the model.
+            //
+            // This is not a micro-optimisation: measured expert-by-expert, the upload ran
+            // at 0.24-0.43 GB/s end-to-end, which extrapolates to ~28 minutes at --keep 124.
+            // The per-copy overhead dominated; the bytes never did. dsv41-engram measured
+            // this box's NVMe at ~8.5 GB/s single-threaded, so the disk was never the
+            // constraint.
+            //
+            // CORRECTNESS IS NOT ASSUMED HERE. The residency microtest still reads every
+            // byte back and compares it PER EXPERT via `LayerShard::expert`, which resolves
+            // each expert's twelve offsets independently. So the batched write is verified
+            // against the unbatched read: if this span arithmetic were wrong, the readback
+            // would differ. The optimisation is checked by the control that already exists.
             let resident = pack.resident_ids(layer)?;
             ensure!(
                 resident.len() == packed_keep,
                 "CB3 layer {layer}: pack reports {} resident ids for packed_keep {packed_keep}",
                 resident.len()
             );
-            for (expected_slot, &expert_id) in resident.iter().enumerate() {
-                let bytes = shard.expert(pack, expert_id)?;
-                // The arena's slot order MUST equal the shard's. Asserted rather than
-                // assumed: if a future pack ever separates the router id list from the
-                // arena order, reading one as the other is precisely the mis-routing that
-                // produces plausible tokens and no error.
+            for (index, tensor) in CB3_TENSORS.iter().enumerate() {
+                let span = shard.plane_span(*tensor, packed_keep)?;
+                let expected = strides[index]
+                    .checked_mul(packed_keep)
+                    .context("CB3 plane span extent overflow")?;
                 ensure!(
-                    bytes.slot() == expected_slot,
-                    "CB3 layer {layer}: expert {expert_id} is shard slot {} but arena slot \
-                     {expected_slot} — pack slot order and resident_ids disagree",
-                    bytes.slot()
+                    span.len() == expected,
+                    "CB3 layer {layer} plane {}: span is {} bytes, expected {expected}",
+                    tensor.name(),
+                    span.len()
                 );
-                for (index, tensor) in CB3_TENSORS.iter().enumerate() {
-                    let plane = bytes.plane(*tensor);
-                    ensure!(
-                        plane.len() == strides[index],
-                        "CB3 layer {layer} expert {expert_id} plane {}: {} bytes, expected {}",
-                        tensor.name(),
-                        plane.len(),
-                        strides[index]
-                    );
-                    let dst = DevicePtr(
-                        planes[index].0 + (expected_slot as u64) * (strides[index] as u64),
-                    );
-                    gpu.copy_h2d(plane, dst)?;
-                    uploaded += plane.len() as u64;
-                }
+                gpu.copy_h2d(span, planes[index])?;
+                uploaded += span.len() as u64;
             }
 
             routing_masks.push(pack.routing_mask(layer)?);
