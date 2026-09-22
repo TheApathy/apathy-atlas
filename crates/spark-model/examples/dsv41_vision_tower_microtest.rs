@@ -149,6 +149,7 @@ fn main() -> Result<()> {
         u("max_image_tokens")?,
         text_hidden,
         gpu,
+        None,
     )?;
     let r = u("downsample_ratio")?;
     // START / NEWLINE / END rows (V4.1 has no learned pad row).

@@ -34,6 +34,9 @@ pub struct DeepSeekVisionEncoder {
     weights: Weights,
     kernels: Kernels,
     arena: DevicePtr,
+    /// Owns `arena` when built with an owned backend (V4.1: freed on drop, for
+    /// TUI model swap); unowned for V4-Flash-Vision, which frees via `release`.
+    allocs: crate::weight_loader::deepseek_v41::device_allocs::DeviceAllocs,
     scratch: Scratch,
     forward_lock: parking_lot::Mutex<()>,
 }
@@ -94,7 +97,7 @@ impl DeepSeekVisionEncoder {
             config.rope_theta.to_bits() == 10_000.0f64.to_bits() && geometry.head_dim == 64,
             "DeepSeek vision device angles require exact theta 10000 and head dimension 64"
         );
-        Self::load_with(store, geometry, config.num_hidden_layers, true, gpu)
+        Self::load_with(store, geometry, config.num_hidden_layers, true, gpu, None)
     }
 
     /// DeepSeek-V4.1's tower: the same 32-block 1024-wide ViT and 3x3 aligner
@@ -114,6 +117,7 @@ impl DeepSeekVisionEncoder {
         max_image_tokens: usize,
         text_hidden_size: usize,
         gpu: &dyn GpuBackend,
+        owner: Option<crate::weight_loader::deepseek_v41::device_allocs::SharedGpu>,
     ) -> Result<Self> {
         anyhow::ensure!(
             text_hidden_size == 5120,
@@ -136,7 +140,7 @@ impl DeepSeekVisionEncoder {
             geometry.head_dim == 64,
             "DeepSeek vision device angles require head dimension 64"
         );
-        Self::load_with(store, geometry, layers, false, gpu)
+        Self::load_with(store, geometry, layers, false, gpu, owner)
     }
 
     fn load_with(
@@ -145,6 +149,7 @@ impl DeepSeekVisionEncoder {
         depth: usize,
         has_pad: bool,
         gpu: &dyn GpuBackend,
+        owner: Option<crate::weight_loader::deepseek_v41::device_allocs::SharedGpu>,
     ) -> Result<Self> {
         let weights = Weights::load(store, &geometry, depth, has_pad)?;
         let kernels = Kernels {
@@ -161,7 +166,9 @@ impl DeepSeekVisionEncoder {
             unfold: gpu.kernel("deepseek_vision", "deepseek_vision_unfold")?,
         };
         let (offsets, bytes) = geometry.scratch_layout()?;
-        let arena = gpu.alloc(bytes)?;
+        use crate::weight_loader::deepseek_v41::device_allocs::DeviceAllocs;
+        let mut allocs = owner.map_or_else(DeviceAllocs::unowned, DeviceAllocs::owned);
+        let arena = allocs.alloc(gpu, bytes)?;
         let p: Vec<DevicePtr> = offsets
             .into_iter()
             .map(|offset| arena.offset(offset))
@@ -186,6 +193,7 @@ impl DeepSeekVisionEncoder {
             weights,
             kernels,
             arena,
+            allocs,
             scratch,
             forward_lock: parking_lot::Mutex::new(()),
         })
@@ -208,8 +216,13 @@ impl DeepSeekVisionEncoder {
 
     /// Explicit teardown for owners retaining the backend. The checkpoint's
     /// allocation owner retains all weights; only our scratch arena is freed.
+    /// With an owned backend (`load_v41(.., Some(owner))`) dropping the encoder
+    /// frees the arena, so this only synchronizes and drops.
     pub fn release(self, gpu: &dyn GpuBackend) -> Result<()> {
         gpu.synchronize(gpu.default_stream())?;
+        if self.allocs.is_owned() {
+            return Ok(()); // freed by `allocs` on drop
+        }
         gpu.free(self.arena)
     }
 }

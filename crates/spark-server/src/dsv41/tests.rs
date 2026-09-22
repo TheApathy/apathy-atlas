@@ -159,7 +159,11 @@ fn thinking_resolution_contract() {
         r(json!({"reasoning_effort": "none", "enable_thinking": true})),
         (true, 75)
     );
-    assert!(request::resolve_thinking(&json!({"reasoning_effort": 101}), false, 75).is_err());
+    // production (app.py:214-216) REJECTS out-of-range integers with a 400; it does not clamp
+    for bad in [json!(0), json!(101), json!(-1), json!("-1"), json!("0"), json!("101")] {
+        assert!(request::resolve_thinking(&json!({"reasoning_effort": bad}), false, 75).is_err(), "{bad}");
+    }
+    assert_eq!(r(json!({"reasoning_effort": 100})), (true, 100));
 }
 
 // ------------------------------------------------------------------ parse
@@ -315,4 +319,46 @@ fn grammar_text_is_byte_identical_to_python() {
         let got = grammar::build_tool_grammar(tools, grammar::DEFAULT_MAX_CALLS);
         assert_eq!(got.as_deref(), c["ebnf"].as_str(), "{name}: EBNF differs");
     }
+}
+
+/// The exact serve2 request 04 body (tool call + thinking at effort 90) now
+/// survives the typed wire parse AND renders with thinking on at effort 90.
+#[test]
+fn serve2_request_04_parses_and_renders_effort_90() {
+    let body = serde_json::json!({"model":"deepseek-v4.1","messages":[{"role":"system","content":"You are a helpful assistant. Use tools when they help."},{"role":"user","content":"What's the weather in Paris right now? Use the tool."}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the current weather for a city.","parameters":{"type":"object","properties":{"city":{"type":"string"},"units":{"type":"string","enum":["metric","imperial"]}},"required":["city"]}}}],"reasoning_effort":90,"max_tokens":1024,"temperature":0});
+    serde_json::from_value::<crate::openai::ChatCompletionRequest>(body.clone()).expect("typed parse");
+    let r = request::render_request(&body).unwrap();
+    assert!(r.thinking && r.effort == 90);
+    assert!(r.prompt.contains("Reasoning Effort: 90 "));
+}
+
+/// Every reasoning-effort form production's app.py accepts is accepted here with
+/// the same (thinking, effort), and every form it refuses is refused (at the
+/// typed wire parse or in the resolver), in all three places the server reads
+/// it: top-level, `reasoning.effort`, `chat_template_kwargs.reasoning_effort`.
+/// Expected values come from app.resolve_thinking (effort_forms.json).
+#[test]
+fn every_effort_form_matches_production() {
+    let fx = fixture("effort_forms.json");
+    let (mut acc, mut rej) = (0, 0);
+    for c in cases(&fx) {
+        let body = &c["body"];
+        let typed = serde_json::from_value::<crate::openai::ChatCompletionRequest>(body.clone());
+        let resolved = request::resolve_thinking(body, false, 75);
+        let what = format!("{} = {}", c["where"], body);
+        if c.get("error").is_some() {
+            assert!(typed.is_err() || resolved.is_err(), "production refuses {what}; Atlas accepted it");
+            rej += 1;
+        } else {
+            typed.unwrap_or_else(|e| panic!("production accepts {what}; the typed parse refused: {e}"));
+            let (th, ef) = resolved.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!((th, ef as u64), (c["thinking"].as_bool().unwrap(), c["effort"].as_u64().unwrap()), "{what}");
+            acc += 1;
+        }
+    }
+    assert!(acc >= 39 && rej >= 39, "{acc} accepted / {rej} refused");
+    // `reasoning` that is not an object is IGNORED by production (falls through to the defaults)
+    let body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "reasoning": "high"});
+    serde_json::from_value::<crate::openai::ChatCompletionRequest>(body.clone()).expect("non-object reasoning parses");
+    assert_eq!(request::resolve_thinking(&body, false, 75).unwrap(), (false, 75));
 }
