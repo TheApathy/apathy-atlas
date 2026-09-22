@@ -140,6 +140,16 @@ pub struct V41Seq {
     /// `engine/model.py:747`'s local fallback, which only applies to decode/text
     /// (dsv41-parity, 2026-09-22).
     pub dead_carry: Vec<u32>,
+    /// Prefetched engram hashes, keyed by chunk `start_pos`. Populated by
+    /// [`V41Forward::prefetch_engram`] before the chunk loop runs; `pass()` consumes (removes)
+    /// an entry here instead of calling `hash.forward()` again when one exists, since the hash
+    /// state is append-only and can only be advanced once per position.
+    pub engram_hash_cache: std::collections::HashMap<usize, Vec<i64>>,
+    /// Prefetched, dequantized (host, PRE-mask) engram rows, keyed by `(start_pos, layer)`.
+    /// Populated by [`V41Forward::prefetch_engram`] on a background thread while the chunk
+    /// loop's GPU work for earlier chunks runs; `run_layers` uploads straight from here when an
+    /// entry exists, skipping the synchronous NVMe gather.
+    pub engram_row_cache: std::collections::HashMap<(usize, usize), Vec<f32>>,
 }
 
 impl V41Seq {
@@ -160,6 +170,8 @@ impl V41Seq {
             tail_rows: 0,
             tail_ids: Vec::new(),
             dead_carry: Vec::new(),
+            engram_hash_cache: std::collections::HashMap::new(),
+            engram_row_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -302,7 +314,20 @@ impl V41Forward {
                 let li = if l == 1 { 0 } else { 1 };
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                 let g = &self.engram.iter().find(|(el, _)| *el == l).context("no engram gather")?.1;
-                prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                // A prefetch thread may already have this chunk's rows staged in host memory
+                // (see `prefetch_engram`); if so, skip the synchronous NVMe gather and just
+                // upload. Falls back to the live gather otherwise (decode, or prefill without
+                // prefetch) -- correctness never depends on the prefetch having run.
+                match seq.engram_row_cache.remove(&(start, l)) {
+                    Some(host) => {
+                        prof(ops, "engram.upload_prefetched", || {
+                            EngramGather::upload_rows(&host, s.engram_rows, ops.gpu, ops.stream, l)
+                        })?;
+                    }
+                    None => {
+                        prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
+                    }
+                }
                 let debug = engram_debug();
                 if debug {
                     tap.bf16(ops, "engram_in", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
@@ -342,7 +367,13 @@ impl V41Forward {
         let t = ids.len();
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
-        let hashes = seq.hash.forward(ids, start, None)?;
+        // `prefetch_engram` may have already computed this chunk's hashes (and advanced
+        // `seq.hash`'s append-only state) up front; reuse them instead of calling forward()
+        // again, which would either panic (position mismatch) or double-count.
+        let hashes = match seq.engram_hash_cache.remove(&start) {
+            Some(h) => h,
+            None => seq.hash.forward(ids, start, None)?,
+        };
         // PREFILL (`engine/v41_engine.py:755`) hashes the WHOLE image-expanded prompt once and
         // slices per chunk -- carrying the trailing MAX_LOOKBACK raw ids across chunks is the
         // exact equivalent (see deepseek_v41_engram::dead_heads's module doc). DECODE does NOT
@@ -509,10 +540,65 @@ impl V41Forward {
         logits: DevicePtr,
     ) -> Result<()> {
         ensure!(!ids.is_empty(), "empty prompt");
+        self.prefetch_engram(seq, ids)?;
         for chunk in ids.chunks(self.max_chunk) {
             self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
         }
         self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits)
+    }
+
+    /// Compute every chunk's engram hashes and gather every chunk's engram rows for THIS
+    /// prefill call, off the critical path, before any chunk's GPU work starts.
+    ///
+    /// PREFILL-only speed lever: every chunk's hashes depend only on the prompt ids, which are
+    /// entirely known at request start (unlike decode, whose next token isn't known until the
+    /// previous step samples -- see `deepseek_v41_engram::gather`'s module doc on why decode
+    /// reads can't be prefetched). The NVMe gather+dequant is the ~73 ms/chunk cost at chunk
+    /// 512 (~1 ms/decode step is comparatively nothing); this moves it off the per-chunk GPU
+    /// dependency chain by running it on background threads while earlier chunks' GPU work
+    /// proceeds.
+    ///
+    /// Advances `seq.hash`'s append-only state for the WHOLE prompt up front (matching what the
+    /// normal per-chunk `pass()` calls would have done, just not interleaved with GPU work), and
+    /// populates `seq.engram_hash_cache` / `seq.engram_row_cache` for `pass()` / `run_layers` to
+    /// consume instead of recomputing. A no-op when the model has no engram layers.
+    fn prefetch_engram(&self, seq: &mut V41Seq, ids: &[u32]) -> Result<()> {
+        if self.engram.is_empty() {
+            return Ok(());
+        }
+        let mut start = seq.len;
+        let mut jobs: Vec<(usize, usize, Vec<i64>)> = Vec::new();
+        for chunk in ids.chunks(self.max_chunk) {
+            let t = chunk.len();
+            let hashes = seq.hash.forward(chunk, start, None)?;
+            for &(l, _) in &self.engram {
+                let li = if l == 1 { 0 } else { 1 };
+                let rows: Vec<i64> =
+                    (0..t).flat_map(|tok| hashes[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
+                jobs.push((start, l, rows));
+            }
+            seq.engram_hash_cache.insert(start, hashes);
+            start += t;
+        }
+
+        // Scoped threads: bounded by this function's own lifetime, so `&self.engram` (read-only,
+        // safe to share -- EngramTier already does its own internal thread fan-out for
+        // gather_dedup, no interior mutability) never needs a 'static bound.
+        let results: Vec<((usize, usize), Result<Vec<f32>>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|(start, l, row_ids)| {
+                    let g = &self.engram.iter().find(|(el, _)| *el == l).expect("layer just read from self.engram").1;
+                    let t = row_ids.len() / 24;
+                    scope.spawn(move || ((start, l), g.gather_rows_host(&row_ids, t)))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("engram prefetch thread panicked")).collect()
+        });
+        for (key, host) in results {
+            seq.engram_row_cache.insert(key, host?);
+        }
+        Ok(())
     }
 
     /// One decode step at position `seq.len`; bf16 logits `[vocab]`.

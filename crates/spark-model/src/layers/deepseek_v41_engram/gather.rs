@@ -88,7 +88,16 @@ impl EngramGather {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        let host = self.gather_rows_host(row_ids, num_tokens)?;
+        Self::upload_rows(&host, out, gpu, stream, self.layer)
+    }
 
+    /// The NVMe-bound half of [`Self::gather_rows_gpu`], with no device involved at all: dedup,
+    /// pread, dequantize, return the host buffer. Split out so a caller can run this on a
+    /// background thread (the disk read and dequant are the ~73 ms/chunk cost; the upload is
+    /// microseconds by comparison) and only pay [`Self::upload_rows`] on the critical path —
+    /// see `V41Forward::prefetch_engram`.
+    pub fn gather_rows_host(&self, row_ids: &[i64], num_tokens: usize) -> Result<Vec<f32>> {
         let want = num_tokens * ENGRAM_ROWS_PER_TOKEN;
         if row_ids.len() != want {
             bail!(
@@ -115,15 +124,17 @@ impl EngramGather {
             let dst = &mut host[k * ENGRAM_HEAD_DIM..(k + 1) * ENGRAM_HEAD_DIM];
             dequant_row(src, dst)?;
         }
+        Ok(host)
+    }
 
+    /// Upload an already-dequantized host row buffer (from [`Self::gather_rows_host`], live or
+    /// prefetched) to the device. `layer` is only for the error message.
+    pub fn upload_rows(host: &[f32], out: DevicePtr, gpu: &dyn GpuBackend, stream: u64, layer: usize) -> Result<()> {
         // SAFETY-adjacent note: `host` is f32 and `out` is documented as f32, so the byte
         // count is the contract. A dtype change on either side must change both.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(host.as_ptr() as *const u8, std::mem::size_of_val(&host[..]))
-        };
-        gpu
-            .copy_h2d_async(bytes, out, stream)
-            .with_context(|| format!("engram layer {}: H2D of {} bytes", self.layer, bytes.len()))
+        let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, std::mem::size_of_val(host)) };
+        gpu.copy_h2d_async(bytes, out, stream)
+            .with_context(|| format!("engram layer {layer}: H2D of {} bytes", bytes.len()))
     }
 }
 
