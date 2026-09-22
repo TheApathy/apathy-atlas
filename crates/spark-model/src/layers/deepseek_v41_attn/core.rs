@@ -43,6 +43,14 @@ pub const REPLAY_ROWS: usize = WINDOW;
 pub const HEAD_DIM: usize = 512;
 const HEADS_PER_BLOCK: usize = 8;
 const ATTN_THREADS: u32 = 256;
+/// Decode (T <= DECODE_MAX_T) uses the SPLIT-KV entry: keys cut into slices of this many,
+/// one CTA per (row, head group, slice), then a combine. Measured at T=1 on runC_2048 L2's real
+/// tensors: one-pass 527 us, split 82 us (6.4x; sweep 8/16/32/64 -> 16 fastest). Only the
+/// within-row accumulation order changes: 99.98% of bf16 outputs identical to the one-pass
+/// kernel, the rest 1 ulp (attn gate log). Used ONLY for Decode passes, so every PREFILL row
+/// stays chunk-invariant bit-for-bit.
+const DECODE_SLICE: usize = 16;
+const DECODE_MAX_T: usize = 8;
 const HIDDEN: usize = 5120;
 const Q_LORA: usize = 1280;
 /// `wts` scale: `index_head_dim^-0.5 * index_n_heads^-0.5` = 1/64, exact in fp32.
@@ -173,6 +181,10 @@ pub struct Dsv41SparseCore {
     max_chunk: usize,
     max_seq: usize,
     attn_kernel: KernelHandle,
+    split_kernel: KernelHandle,
+    combine_kernel: KernelHandle,
+    /// `[DECODE_MAX_T, 64, S, 2 + 512]` fp32 split partials.
+    part: DevicePtr,
     idx: IndexKernels,
     rope_c: RopeTable,
     tail: Tail,
@@ -218,6 +230,8 @@ impl Dsv41SparseCore {
         ensure!(freqs_c.positions >= max_seq, "freqs_c covers {} positions, max_seq is {max_seq}", freqs_c.positions);
         let fwd = Dsv41Kernels::load(gpu)?;
         let idx = IndexKernels::load(gpu)?;
+        let split_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split").context("dsv41_sparse_attn_split not in the PTX")?;
+        let combine_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_combine").context("dsv41_sparse_attn_combine not in the PTX")?;
         let attn_kernel = gpu
             .kernel(ATTN_MODULE, "dsv41_sparse_attn_w32")
             .with_context(|| format!("{ATTN_MODULE}::dsv41_sparse_attn_w32 is not in the compiled PTX"))?;
@@ -301,6 +315,7 @@ impl Dsv41SparseCore {
             pad_in: alloc(MM_TILE * HIDDEN * 4)?,
             pad_out: alloc(MM_TILE * INDEX_HEADS * INDEX_HEAD_DIM * 4)?,
         };
+        let part = alloc(DECODE_MAX_T * 64 * (WINDOW + INDEX_TOPK).div_ceil(DECODE_SLICE) * (2 + HEAD_DIM) * 4)?;
         let tail = Tail {
             topk: [alloc(REPLAY_ROWS * INDEX_TOPK * 8)?, alloc(REPLAY_ROWS * INDEX_TOPK * 8)?],
             cand: [alloc(REPLAY_ROWS * n_pad_max)?, alloc(REPLAY_ROWS * n_pad_max)?],
@@ -318,6 +333,9 @@ impl Dsv41SparseCore {
             max_chunk,
             max_seq,
             attn_kernel,
+            split_kernel,
+            combine_kernel,
+            part,
             idx,
             rope_c: freqs_c,
             tail,
@@ -348,6 +366,34 @@ impl Dsv41SparseCore {
     /// dropped it would. Nothing in the forward calls it.
     pub fn control_drop_pending(&self, layer: usize) {
         self.st.lock().expect("core state poisoned").has_pending[layer] = false;
+    }
+
+    /// GATE SCAFFOLDING ONLY: install a captured state for the decoder replay — L20's
+    /// compressed cache (`rows` rows of ckv/ik, copied into the core's OWN caches) and the replay
+    /// tail's candidate mask `[tail_rows, cand_ld]` — so a capture holding only replay layers
+    /// (runI: L24/L28) can be gated teacher-forced. Nothing in the forward calls it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gate_seed_replay(
+        &self,
+        gpu: &dyn GpuBackend,
+        ckv: DevicePtr,
+        ik: DevicePtr,
+        rows: usize,
+        cand: DevicePtr,
+        cand_ld: usize,
+        tail_rows: usize,
+    ) -> Result<()> {
+        let c = self.layers.get(CANDIDATE_SOURCE_LAYER).and_then(|l| l.kv.as_ref()).context("layer 20 not loaded")?;
+        ensure!(rows <= c.rows_cap && cand_ld <= self.tail.cand_cap && tail_rows <= REPLAY_ROWS, "seed exceeds the caches");
+        gpu.copy_d2d(ckv, c.ckv, rows * HEAD_DIM * 2)?;
+        gpu.copy_d2d(ik, c.ik, rows * INDEX_HEAD_DIM * 2)?;
+        let mut st = self.st.lock().expect("core state poisoned");
+        let cur = st.tail.cur;
+        gpu.copy_d2d(cand, self.tail.cand[cur], tail_rows * cand_ld)?;
+        gpu.memset(self.tail.topk[cur], 0xFF, REPLAY_ROWS * INDEX_TOPK * 8)?;
+        st.tail = TailState { cur, rows: tail_rows, ld: cand_ld };
+        st.published = Some((c.ckv, c.ik, rows, c.ratio));
+        Ok(())
     }
 
     fn compress(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState) -> Result<()> {
@@ -503,6 +549,40 @@ impl Dsv41SparseCore {
         if a.t == 0 {
             return Ok(());
         }
+        let scale = (HEAD_DIM as f32).powf(-0.5);
+        if st.kind == Some(PassKind::Decode) && a.t <= DECODE_MAX_T {
+            let keys = WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK };
+            let splits = keys.div_ceil(DECODE_SLICE);
+            KernelLaunch::new(ops.gpu, self.split_kernel)
+                .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, splits as u32])
+                .block([ATTN_THREADS, 1, 1])
+                .arg_ptr(a.q)
+                .arg_ptr(a.ring)
+                .arg_ptr(a.wpos)
+                .arg_ptr(ckv)
+                .arg_ptr(cidx)
+                .arg_ptr(self.part)
+                .arg_i32(a.t as i32)
+                .arg_i32(64)
+                .arg_i32(HEAD_DIM as i32)
+                .arg_i32(WINDOW as i32)
+                .arg_i32(INDEX_TOPK as i32)
+                .arg_i32(RING as i32)
+                .arg_i32(a.win_lo as i32)
+                .arg_f32(scale)
+                .arg_i32(DECODE_SLICE as i32)
+                .launch(ops.stream)?;
+            return KernelLaunch::new(ops.gpu, self.combine_kernel)
+                .grid([a.t as u32, 64, 1])
+                .block([ATTN_THREADS, 1, 1])
+                .arg_ptr(self.part)
+                .arg_ptr(a.sink)
+                .arg_ptr(a.out)
+                .arg_i32(64)
+                .arg_i32(HEAD_DIM as i32)
+                .arg_i32(splits as i32)
+                .launch(ops.stream);
+        }
         KernelLaunch::new(ops.gpu, self.attn_kernel)
             .grid([a.t as u32, (64 / HEADS_PER_BLOCK) as u32, 1])
             .block([ATTN_THREADS, 1, 1])
@@ -520,7 +600,7 @@ impl Dsv41SparseCore {
             .arg_i32(INDEX_TOPK as i32)
             .arg_i32(RING as i32)
             .arg_i32(a.win_lo as i32)
-            .arg_f32((HEAD_DIM as f32).powf(-0.5))
+            .arg_f32(scale)
             .launch(ops.stream)
     }
 }
