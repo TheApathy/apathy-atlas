@@ -128,12 +128,28 @@ int main(int argc, char** argv) {
         fused2(M, Cf); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
         std::vector<uint16_t> f2((size_t)M * N); CK(cudaMemcpy(f2.data(), Cf, f2.size() * 2, cudaMemcpyDeviceToHost));
         const bool v2same = std::memcmp(f2.data(), f.data(), f.size() * 2) == 0;
+        // PREFILL TAILS (M <= 16 now take this kernel too): for M in {1, 4, 16, 20}, v2's rows
+        // must be BYTE-IDENTICAL to the same rows at M=512 and every row >= M must keep its
+        // 0xFFFF sentinel (no out-of-bounds store). Control: launch M+1 rows, the sentinel check
+        // must see row M written.
+        auto tail_ok = [&](int ms, int launch_m) {
+            CK(cudaMemset(Cf, 0xFF, (size_t)M * N * 2)); fused2(launch_m, Cf); CK(cudaDeviceSynchronize());
+            std::vector<uint16_t> t((size_t)M * N); CK(cudaMemcpy(t.data(), Cf, t.size() * 2, cudaMemcpyDeviceToHost));
+            const bool rows = std::memcmp(t.data(), f2.data(), (size_t)ms * N * 2) == 0;
+            bool untouched = true;
+            for (size_t i = (size_t)ms * N; i < t.size() && untouched; ++i) untouched = t[i] == 0xFFFF;
+            return rows && untouched; };
+        bool tails = true;
+        for (int ms : {1, 4, 16, 20}) tails = tails && tail_ok(ms, ms);
+        const bool tail_ctrl = !tail_ok(4, 5);
+        std::printf("           v2 tails M=1/4/16/20: rows byte-identical to M=512 and no store past M: %s | CTRL (M+1 launched) caught: %s\n",
+                    tails ? "yes" : "NO", tail_ctrl ? "yes" : "NO");
         const float t_v2 = time_it([&] { fused2(M, Cf); });
         std::printf("           v2 (on-the-fly B, 3 stages): byte-identical to v1: %s, %.3f ms (%.1f TF/s, %.2fx current)\n",
                     v2same ? "yes" : "NO", t_v2, 2.0 * M * N * K / (t_v2 * 1e9), t_cur / t_v2);
         const float t_nc = time_it([&] { dsv41_fp8_gemm_probe_noconv<<<dim3(N / dsv41_fp8gemm::BN, (M + dsv41_fp8gemm::BM - 1) / dsv41_fp8gemm::BM), dsv41_fp8gemm::THREADS>>>(A, K, W, S, SK, Cf, N, M, N, K); });
         std::printf("           PROBE v2 without the fp8->bf16 conversion (wrong values, timing only): %.3f ms (%.1f TF/s)\n", t_nc, 2.0 * M * N * K / (t_nc * 1e9));
-        const bool ok = same >= 0.99 && rel <= 1e-3 && inv && crel > 0.5 && v2same;
+        const bool ok = same >= 0.99 && rel <= 1e-3 && inv && crel > 0.5 && v2same && tails && tail_ctrl;
         fails += !ok;
         std::printf("%-10s M=%d N=%5d K=%5d | identical %.4f%% rel %.2e | M=20 rows byte-identical: %s | CTRL scale+1 rel %.2e | "
                     "current (dequant+gemm) %.3f ms, gemm alone %.3f ms, FUSED %.3f ms (%.1f TF/s, %.2fx current) %s\n",
