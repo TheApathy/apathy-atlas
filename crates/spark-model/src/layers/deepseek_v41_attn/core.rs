@@ -564,3 +564,37 @@ impl AttnCore for Dsv41SparseCore {
         self.attend(ops, a, &st)
     }
 }
+
+/// `Dsv41Model` holds the hook and the core in two separate boxes; one shared core serves both:
+/// `let c = Arc::new(Dsv41SparseCore::load(..)?); hook: Box::new(c.clone()), core: Box::new(c)`.
+impl PassHook for std::sync::Arc<Dsv41SparseCore> {
+    fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        self.as_ref().begin_pass(kind, start, t)
+    }
+}
+
+impl AttnCore for std::sync::Arc<Dsv41SparseCore> {
+    fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
+        self.as_ref().run(ops, a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The model boxes the core as `Box<dyn AttnCore + Send + Sync>`.
+    #[test]
+    fn the_core_can_be_shared_across_the_models_two_boxes() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Dsv41SparseCore>();
+        assert_send_sync::<std::sync::Arc<Dsv41SparseCore>>();
+    }
+
+    /// Score scratch sizing: n_pad rounds max_seq up to 512 columns.
+    #[test]
+    fn score_scratch_is_one_chunk_by_the_widest_row() {
+        assert_eq!(score_scratch_bytes(512, 8192), 512 * 8192 * 4);
+        assert_eq!(score_scratch_bytes(512, 8193), 512 * 8704 * 4);
+    }
+}
