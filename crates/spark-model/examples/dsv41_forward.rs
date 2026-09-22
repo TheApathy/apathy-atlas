@@ -35,6 +35,7 @@ use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP};
 use spark_model::layers::deepseek_v41_attn::core::Dsv41SparseCore;
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
+use spark_model::layers::deepseek_v41_attn::core::Dsv41SparseCore;
 use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind, PrefillMode, V41Forward, V41Seq};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -306,6 +307,7 @@ fn main() -> Result<()> {
     let mut decode_n = 0usize;
     let mut engram_live = false;
     let mut head_test = false;
+    let mut core_real = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -321,6 +323,15 @@ fn main() -> Result<()> {
                 }
             }
             "--head-test" => head_test = true,
+            // The attention lane's real core (compressor/indexer/sparse attention) in place of
+            // the capture-fed one; only meaningful with `--feed attn-core,...`.
+            "--core" => {
+                core_real = match args.next().context("--core")?.as_str() {
+                    "real" => true,
+                    "fed" => false,
+                    o => bail!("--core real|fed, got {o}"),
+                }
+            }
             "--moe-real" => moe_real = true,
             "--attn-real" => attn_real = true,
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
@@ -398,7 +409,9 @@ fn main() -> Result<()> {
     let fed_core = FedCore(&feeder);
     let fed_moe = FedMoe(&feeder, dims.hidden);
     let proj_attn;
+    let real_core: Option<Dsv41SparseCore>;
     let attn: &dyn V41AttentionBlock = if feed.iter().any(|f| f == "attn") {
+        real_core = None;
         &fed_attn
     } else if feed.iter().any(|f| f == "attn-core") {
         let weights: Vec<V41AttnWeights> = (0..n_layers).map(|l| V41AttnWeights::load(&store, l, dims.hidden)).collect::<Result<_>>()?;
@@ -408,21 +421,31 @@ fn main() -> Result<()> {
         let spec_w = RopeSpec { dim: 64, original_seq_len: 0, base: 10000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
         let spec_c = RopeSpec { original_seq_len: 65536, base: 160000.0, ..spec_w };
         let rings = (0..n_layers).map(|_| { let r = gpu.alloc(RING * HEAD_DIM * 2)?; gpu.memset(r, 0, RING * HEAD_DIM * 2)?; Ok(r) }).collect::<Result<Vec<_>>>()?;
+        let freqs_c = spec_c.upload(gpu.as_ref(), positions)?;
+        real_core = if core_real {
+            Some(Dsv41SparseCore::load_prefix(gpu.as_ref(), &store, &config, 8192, max_t, freqs_c, n_layers)?)
+        } else {
+            None
+        };
         proj_attn = ProjAttention {
             ops: &ops,
             weights,
             scratch: AttnScratch::new(gpu.as_ref(), max_t)?,
             wscratch,
-            freqs_c: spec_c.upload(gpu.as_ref(), positions)?,
+            freqs_c,
             freqs_w: spec_w.upload(gpu.as_ref(), positions)?,
             rings,
-            core: &fed_core,
+            core: match &real_core {
+                Some(c) => c,
+                None => &fed_core,
+            },
             tap: &tap,
             norm_eps: dims.norm_eps,
             rope_swap,
         };
         &proj_attn
     } else {
+        real_core = None;
         &Refuse("attention")
     };
     let real;
@@ -453,6 +476,10 @@ fn main() -> Result<()> {
     let d_dead = gpu.alloc(max_t * 24)?;
     for &(start, t) in &chunks {
         moe.begin_pass(&ids[start..start + t])?;
+        if let Some(c) = &real_core {
+            // Every layer over the chunk: the debug (no-replay) pass, as runF was captured.
+            c.begin_pass(PassKind::FullChunk, start, t)?;
+        }
         let chunk_ids = &ids[start..start + t];
         let hashes = match hash.as_mut() {
             Some(h) => Some(h.forward(chunk_ids, start, None)?),
