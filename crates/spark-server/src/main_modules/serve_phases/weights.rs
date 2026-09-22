@@ -46,6 +46,19 @@ pub(crate) fn quant_multiplier(config: &ModelConfig) -> Option<f64> {
     }
 }
 
+/// Per-model "never upload" filter for the serving store. DeepSeek-V4.1's engram tables
+/// (~190 GB) are gathered from NVMe and must not be loaded — see
+/// `spark_model::weight_loader::deepseek_v41::skip_tensor_for_serving`.
+fn serving_skip(config: &ModelConfig) -> Option<spark_runtime::weights::TensorSkipFn> {
+    if config.model_type == "deepseek_v41" {
+        Some(std::sync::Arc::new(
+            spark_model::weight_loader::deepseek_v41::skip_tensor_for_serving,
+        ))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn load_weight_store(
     args: &cli::ServeArgs,
     config: &ModelConfig,
@@ -73,6 +86,7 @@ pub(crate) fn load_weight_store(
                 spark_runtime::fast_weights::FastSafetensorsLoader::new()
             };
             loader.peak_memory_multiplier = mult;
+            loader.extra_skip = serving_skip(config);
             loader.prefetch_shards = args.fast_load_prefetch_shards
                 || std::env::var("ATLAS_FAST_LOAD_PREFETCH_SHARDS")
                     .ok()
@@ -95,6 +109,7 @@ pub(crate) fn load_weight_store(
             spark_runtime::weights::SafetensorsLoader::new()
         };
         loader.peak_memory_multiplier = mult;
+        loader.extra_skip = serving_skip(config);
         loader
             .load(model_dir, gpu, oom_reserve_bytes)
             .context("Failed to load model weights")?

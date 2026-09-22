@@ -236,14 +236,14 @@ impl PassScratch {
 /// Everything from `wq_a` to `wo_b`, including the ring/compressor/indexer state updates.
 pub trait V41AttentionBlock {
     #[allow(clippy::too_many_arguments)]
-    fn forward(&self, layer: usize, x: DevicePtr, out: DevicePtr, t: usize, start: usize, stream: u64) -> Result<()>;
+    fn forward(&self, ops: &Ops, layer: usize, x: DevicePtr, out: DevicePtr, t: usize, start: usize) -> Result<()>;
 }
 
 /// The routed experts of one layer: post-`ffn_norm` y `[T, hidden]` -> routed sum `[T, hidden]`
 /// bf16 (router, residency mask, top-k, CB3 experts, weighted combine). Shared expert NOT
 /// included — that is [`SharedExpert`], here.
 pub trait V41RoutedMoe {
-    fn forward(&self, layer: usize, y: DevicePtr, out: DevicePtr, t: usize, stream: u64) -> Result<()>;
+    fn forward(&self, ops: &Ops, layer: usize, y: DevicePtr, out: DevicePtr, t: usize) -> Result<()>;
 }
 
 /// A deliberately WRONG wiring, for negative controls only.
@@ -283,7 +283,7 @@ pub fn block(
     ops.hc_pre(s.h, attn_side_pre, s.x, t, d)?;
     ops.rmsnorm(s.x, w.attn_norm, s.x, t, d, eps)?;
     tap.bf16(ops, "attn_x", l, s.x, &[t, d])?;
-    attn.forward(l, s.x, s.y, t, start, ops.stream)?;
+    attn.forward(ops, l, s.x, s.y, t, start)?;
     tap.bf16(ops, "attn_out", l, s.y, &[t, d])?;
     ops.hc_post(s.y, s.h, s.attn_post, s.attn_comb, s.h, t, d)?;
 
@@ -296,7 +296,7 @@ pub fn block(
     ops.hc_pre(s.h, ffn_side_pre, s.x, t, d)?;
     ops.rmsnorm(s.x, w.ffn_norm, s.x, t, d, eps)?;
     tap.bf16(ops, "moe_in", l, s.x, &[t, d])?;
-    moe.forward(l, s.x, s.routed, t, ops.stream)?;
+    moe.forward(ops, l, s.x, s.routed, t)?;
     w.shared.forward(ops, s.x, s.shared, t, s, dims)?;
     tap.bf16(ops, "moe_routed", l, s.routed, &[t, d])?;
     tap.bf16(ops, "moe_shared", l, s.shared, &[t, d])?;

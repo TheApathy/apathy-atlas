@@ -60,6 +60,22 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    // DeepSeek-V4.1: standalone model over the CED + SWA-replay forward (see `model::dsv41`).
+    // Dispatched FIRST: none of the decoder-only checks below describe it.
+    #[cfg(feature = "cuda")]
+    if config.model_type == "deepseek_v41" {
+        if max_batch_size > 1 {
+            tracing::warn!(
+                "DeepSeek-V4.1 serves ONE live sequence (model-wide compressed-KV caches); \
+                 --max-batch-size {max_batch_size} is ignored"
+            );
+        }
+        let model_dir = crate::weight_loader::deepseek_v41::resolve_model_dir()?;
+        let max_chunk = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+        let lanes = crate::model::dsv41::build_lanes(store, &config, gpu.as_ref(), max_seq_len)?;
+        let model = crate::model::dsv41::Dsv41Model::new(&config, store, gpu, &model_dir, lanes, max_seq_len, max_chunk)?;
+        return Ok(Box::new(model));
+    }
     let vision_dspark_candidate = super::vision_speculation_loaded::validate(
         &config,
         store,

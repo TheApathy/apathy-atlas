@@ -47,6 +47,10 @@ pub(crate) mod types;
 #[cfg(feature = "cuda")]
 pub mod nllb;
 
+// Served DeepSeek-V4.1 (standalone Model over the validated CED + SWA-replay forward).
+#[cfg(feature = "cuda")]
+pub mod dsv41;
+
 pub use types::TransformerModel;
 
 /// Row capacity of `TransformerModel::dspark_capture_stage`, the graph-safe

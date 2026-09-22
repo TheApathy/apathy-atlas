@@ -56,6 +56,10 @@ pub struct FastSafetensorsLoader {
     /// sequentially before the per-tensor copy loop starts. This helps NFS
     /// mounts where many small tensor reads defeat normal readahead.
     pub prefetch_shards: bool,
+    /// Extra "don't load this tensor" predicate, ORed with the EP rule; same contract as
+    /// [`crate::weights::SafetensorsLoader::extra_skip`]. DeepSeek-V4.1 uses it to keep its two
+    /// ~95 GB engram tables (row-gathered from NVMe, never resident) out of the store.
+    pub extra_skip: Option<crate::weights::TensorSkipFn>,
 }
 
 /// Default tensor-count cap for per-shard `O_DIRECT`. Above this, the fast
@@ -79,6 +83,7 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            extra_skip: None,
         }
     }
 
@@ -91,10 +96,16 @@ impl FastSafetensorsLoader {
             try_direct_io: true,
             direct_io_tensor_cap: DEFAULT_DIRECT_IO_TENSOR_CAP,
             prefetch_shards: false,
+            extra_skip: None,
         }
     }
 
     fn should_skip_tensor(&self, name: &str) -> bool {
+        if let Some(ref extra) = self.extra_skip
+            && extra(name)
+        {
+            return true;
+        }
         if self.ep_world_size <= 1 {
             return false;
         }
