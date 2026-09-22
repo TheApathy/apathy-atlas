@@ -404,6 +404,14 @@ fn main() -> Result<()> {
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
             "--force-decode" => force_decode = true,
             "--warm-prefill" => warm_prefill = true,
+            // Per-run switches for the env-gated ops (read once, so set before any GPU work).
+            // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
+            "--fp8-rowtile" => unsafe { std::env::set_var("ATLAS_DSV41_FP8_ROWTILE", "1") },
+            "--prof" => unsafe { std::env::set_var("ATLAS_DSV41_PROF", "1") },
+            "--tap-names" => {
+                let v = args.next().context("--tap-names")?;
+                unsafe { std::env::set_var("ATLAS_DSV41_TAP_NAMES", v) }
+            }
             // --split "512,512,20;1024,20;500,544"
             "--split" => {
                 splits = args
