@@ -181,7 +181,7 @@ pub struct Dsv41Kernels {
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
     /// `dsv41_fp8_gemv_m8`: the same GEMV for 2..=8 rows, each row bit-identical to the M = 1
-    /// kernel. Used only with [`DENSE_GEMV_SMALL_M_ENV`]`=1` until it is gated end to end.
+    /// kernel (decode-kind passes only; see [`DENSE_GEMV_SMALL_M_ENV`]).
     pub fp8_gemv_m8: Option<KernelHandle>,
     /// The bit-identical split `hc_mixes` for T = 1 ([`HC_SPLIT_ENV`]): (dot, finish, raw scratch).
     pub hc_split: Option<(KernelHandle, KernelHandle)>,
@@ -198,8 +198,10 @@ pub const DECODE_DENSE_MODULE: &str = "dsv41_decode";
 /// ON by default (`ATLAS_DSV41_DENSE_GEMV=0` turns it off): every M = 1 FP8 linear runs as
 /// a direct fp8 GEMV instead of dequant-to-bf16 + a 16-row GEMM.
 pub const DENSE_GEMV_ENV: &str = "ATLAS_DSV41_DENSE_GEMV";
-/// `ATLAS_DSV41_DENSE_GEMV_SMALL_M=1`: FP8 linears with 2..=8 rows also take the GEMV (for
-/// speculative verify). Off by default: it changes prefill tails of <= 8 rows.
+/// FP8 linears with 2..=8 rows of a DECODE-kind pass (the DSpark verify) take the small-M GEMV,
+/// whose rows are bit-identical to the M = 1 GEMV -- which is what makes a verify row equal to
+/// plain decode. ON by default (`ATLAS_DSV41_DENSE_GEMV_SMALL_M=0` turns it off); prefill never
+/// takes it (the dispatch keys on `decode_pass()`).
 pub const DENSE_GEMV_SMALL_M_ENV: &str = "ATLAS_DSV41_DENSE_GEMV_SMALL_M";
 /// Largest row count the small-M GEMV serves.
 pub const GEMV_MAX_M: usize = 8;
@@ -245,7 +247,7 @@ impl Dsv41Kernels {
                 None
             },
             fp8_gemv_m8: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0")
-                && std::env::var(DENSE_GEMV_SMALL_M_ENV).as_deref() == Ok("1")
+                && std::env::var(DENSE_GEMV_SMALL_M_ENV).as_deref() != Ok("0")
             {
                 Some(k2("dsv41_fp8_gemv_m8")?)
             } else {
