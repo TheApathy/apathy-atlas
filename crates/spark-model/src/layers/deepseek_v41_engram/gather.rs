@@ -24,13 +24,12 @@
 //! and a ~30 ms decode step, engram is ~4% and nothing should be contorted to avoid it.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::weights::WeightStore;
 
 use spark_storage::engram_tier::{
     DEFAULT_ENGRAM_THREADS, ENGRAM_HEAD_DIM, ENGRAM_ROW_BYTES, EngramShard, EngramTier,
@@ -130,7 +129,6 @@ fn read_weight_map(model_dir: &Path) -> Result<HashMap<String, String>> {
 
 /// Builds an [`EngramGather`] for layers 1 and 14, and `None` for the other 38.
 pub struct EngramLoader {
-    model_dir: PathBuf,
     threads: usize,
 }
 
@@ -138,14 +136,14 @@ impl Dsv41EngramLoader for EngramLoader {
     fn load_engram(
         &self,
         layer: usize,
-        _store: &WeightStore,
+        model_dir: &Path,
         _config: &ModelConfig,
         _gpu: &dyn GpuBackend,
     ) -> Result<Option<Box<dyn Dsv41Engram>>> {
         if !ENGRAM_LAYERS.contains(&layer) {
             return Ok(None);
         }
-        Ok(Some(Box::new(EngramGather::open(&self.model_dir, layer, self.threads)?)))
+        Ok(Some(Box::new(EngramGather::open(model_dir, layer, self.threads)?)))
     }
 }
 
@@ -153,17 +151,17 @@ static LOADER: OnceLock<EngramLoader> = OnceLock::new();
 
 /// Install this lane's engram loader. Call before `load_layers`.
 ///
-/// `model_dir` is needed because the tables are not in the `WeightStore`: at ~95 GB each
-/// they cannot be resident on a 119.7 GB box, so they are opened as files and row-gathered.
+/// The model directory arrives per-call on [`Dsv41EngramLoader::load_engram`] rather than
+/// being captured here: the tables are ~95 GB each, are never in the `WeightStore`, and are
+/// opened as files. The seam names that source explicitly so the signature cannot drift away
+/// from where the bytes actually come from.
 ///
 /// Note the initialisation and the registration are deliberately two statements. Calling
 /// `register_engram_loader` from inside `get_or_init` would take the registry's write lock
 /// while holding the `OnceLock`'s initialisation lock, which is the shape that deadlocks.
-pub fn register(model_dir: PathBuf, threads: Option<usize>) {
-    let loader = LOADER.get_or_init(|| EngramLoader {
-        model_dir,
-        threads: threads.unwrap_or(DEFAULT_ENGRAM_THREADS),
-    });
+pub fn register(threads: Option<usize>) {
+    let loader =
+        LOADER.get_or_init(|| EngramLoader { threads: threads.unwrap_or(DEFAULT_ENGRAM_THREADS) });
     register_engram_loader(loader);
 }
 
@@ -209,19 +207,19 @@ mod tests {
     /// valid ModelConfig exercises the same path.
     #[test]
     fn non_engram_layers_return_none_without_touching_the_disk() {
-        let l = EngramLoader { model_dir: PathBuf::from("/nonexistent"), threads: 4 };
-        let store = WeightStore::empty();
+        let l = EngramLoader { threads: 4 };
+        let dir = Path::new("/nonexistent");
         let cfg = ModelConfig::qwen3_next_80b_nvfp4();
         let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
         for layer in [0usize, 2, 13, 15, 39] {
-            let got = l.load_engram(layer, &store, &cfg, &gpu).unwrap();
+            let got = l.load_engram(layer, dir, &cfg, &gpu).unwrap();
             assert!(got.is_none(), "layer {layer} should have no engram");
         }
         // And the engram layers DO try (and fail, since the path is bogus) — otherwise the
         // check above would pass for a loader that returns None for everything.
         for layer in ENGRAM_LAYERS {
             assert!(
-                l.load_engram(layer, &store, &cfg, &gpu).is_err(),
+                l.load_engram(layer, dir, &cfg, &gpu).is_err(),
                 "layer {layer} must attempt to open its table"
             );
         }
