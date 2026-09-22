@@ -79,6 +79,11 @@ unsafe extern "C" {
 /// Initialized once via [`AtlasCudaBackend::new`], which loads all PTX
 /// modules from `atlas-kernels` into the global AtlasRegistry singleton.
 pub struct AtlasCudaBackend {
+    /// The module registry this backend was initialized with. Kernel lookups
+    /// and launches go through it rather than the process-wide "current"
+    /// registry, so a backend keeps resolving its own target's kernels even
+    /// after a later swap initializes a different target.
+    registry: &'static atlas_core::registry::AtlasRegistry,
     /// Default CUDA stream handle (from AtlasRegistry).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -131,6 +136,7 @@ impl AtlasCudaBackend {
                 }
             };
         Ok(Self {
+            registry,
             default_stream,
             cuda_ctx,
             transform_cache_identity,

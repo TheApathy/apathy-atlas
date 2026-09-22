@@ -98,9 +98,22 @@ pub struct RawCudaFunc(pub *mut c_void);
 unsafe impl Send for RawCudaFunc {}
 unsafe impl Sync for RawCudaFunc {}
 
-/// Global singleton registry.
-static REGISTRY: OnceLock<std::result::Result<AtlasRegistry, String>> = OnceLock::new();
-static REGISTRY_INITIALIZATION_IDENTITY: OnceLock<String> = OnceLock::new();
+/// Every registry this process has loaded, keyed by its initialization
+/// identity (ordinal + the exact ordered module/PTX set). Leaked: modules are
+/// never unloaded, so every `RawCudaFunc` handed out stays valid for the
+/// process lifetime.
+///
+/// Keyed rather than a single `OnceLock` because a hot model swap
+/// (`model_swap`) can load a model with a DIFFERENT kernel target (for
+/// example qwen3.5-27b -> glm5.3-flash/exl3). A single registry refused that
+/// with "initialization identity mismatch", so every cross-target swap failed
+/// and restored the previous model. The old rule is kept where it matters: a
+/// request is only ever served by a registry with exactly its identity, never
+/// by one that loaded a different module set.
+static REGISTRIES: std::sync::Mutex<Vec<&'static AtlasRegistry>> = std::sync::Mutex::new(Vec::new());
+/// The most recently initialized/selected registry, for `get()` callers that
+/// have no backend handle. Backends keep their own registry reference.
+static CURRENT: std::sync::RwLock<Option<&'static AtlasRegistry>> = std::sync::RwLock::new(None);
 
 /// Cached CUDA modules and a persistent stream.
 pub struct AtlasRegistry {
@@ -140,6 +153,12 @@ fn initialization_identity(ordinal: usize, ptx_sources: &[(&str, &str)]) -> Stri
     format!("backend=cuda;ordinal={ordinal};loaded_modules_sha256={sha256}")
 }
 
+/// The registry in `slots` whose identity is exactly `requested`, if any.
+fn select_registry<'a, T>(slots: &'a [(&str, T)], requested: &str) -> Option<&'a T> {
+    slots.iter().find(|(identity, _)| *identity == requested).map(|(_, r)| r)
+}
+
+#[cfg(test)]
 fn require_initialization_identity(loaded: &str, requested: &str) -> Result<()> {
     if loaded != requested {
         return Err(AtlasError::ModuleLoad(format!(
@@ -150,6 +169,7 @@ fn require_initialization_identity(loaded: &str, requested: &str) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 fn admit_initialization_request<'a>(
     identity: &'a OnceLock<String>,
     requested: &str,
@@ -169,21 +189,22 @@ impl AtlasRegistry {
         ptx_sources: &[(&'static str, &str)],
     ) -> Result<&'static Self> {
         let requested_identity = initialization_identity(ordinal, ptx_sources);
-        let admitted_identity =
-            admit_initialization_request(&REGISTRY_INITIALIZATION_IDENTITY, &requested_identity)?;
-        let result = REGISTRY.get_or_init(|| {
-            match Self::init(ordinal, ptx_sources, admitted_identity.to_owned()) {
-                Ok(reg) => Ok(reg),
-                Err(e) => Err(format!("{e}")),
+        let mut loaded = REGISTRIES.lock().unwrap_or_else(|p| p.into_inner());
+        let slots: Vec<(&str, &'static AtlasRegistry)> = loaded
+            .iter()
+            .map(|r| (r.initialization_identity.as_str(), *r))
+            .collect();
+        let registry = match select_registry(&slots, &requested_identity) {
+            Some(existing) => *existing,
+            None => {
+                let fresh: &'static AtlasRegistry =
+                    Box::leak(Box::new(Self::init(ordinal, ptx_sources, requested_identity)?));
+                loaded.push(fresh);
+                fresh
             }
-        });
-        match result {
-            Ok(reg) => {
-                require_initialization_identity(&reg.initialization_identity, &requested_identity)?;
-                Ok(reg)
-            }
-            Err(msg) => Err(AtlasError::ModuleLoad(msg.clone())),
-        }
+        };
+        *CURRENT.write().unwrap_or_else(|p| p.into_inner()) = Some(registry);
+        Ok(registry)
     }
 
     fn init(
@@ -233,13 +254,13 @@ impl AtlasRegistry {
         &self.initialization_identity
     }
 
-    /// Get the cached registry (panics if not initialized).
+    /// The most recently initialized/selected registry (panics if none).
+    /// Callers holding an `AtlasCudaBackend` should use its own registry.
     pub fn get() -> &'static Self {
-        REGISTRY
-            .get()
+        CURRENT
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
             .expect("AtlasRegistry not initialized — call get_or_init first")
-            .as_ref()
-            .expect("AtlasRegistry initialization failed")
     }
 
     /// Look up a cached function handle (cudarc safe API).
@@ -479,8 +500,16 @@ mod initialization_identity_tests {
             admit_initialization_request(&same_process, &loaded).unwrap(),
             loaded
         );
-        for requested in [changed_offset, changed_ordinal, changed_order_count] {
-            assert!(admit_initialization_request(&same_process, &requested).is_err());
+        for requested in [&changed_offset, &changed_ordinal, &changed_order_count] {
+            assert!(admit_initialization_request(&same_process, requested).is_err());
         }
+
+        // Keyed selection: a request is served only by a registry with its
+        // exact identity, never by one that loaded a different module set.
+        let slots = [(loaded.as_str(), 1u32), (changed_offset.as_str(), 2u32)];
+        assert_eq!(super::select_registry(&slots, &loaded), Some(&1));
+        assert_eq!(super::select_registry(&slots, &changed_offset), Some(&2));
+        assert_eq!(super::select_registry(&slots, &changed_ordinal), None);
+        assert_eq!(super::select_registry(&slots, &changed_order_count), None);
     }
 }
