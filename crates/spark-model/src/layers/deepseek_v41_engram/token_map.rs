@@ -156,6 +156,16 @@ impl EngramHashState {
             );
         }
 
+        if !super::dead_heads::max_ngram_size_matches(cfg.engram_max_ngram_size) {
+            bail!(
+                "config.json says engram_max_ngram_size = {}, but engine/vision.py's \
+                 engram_dead_heads hardcodes (2, 3, 4) / 24 columns regardless of config -- \
+                 this checkpoint's dead-head masking would silently diverge from production \
+                 (see dead_heads.rs's max_ngram_size_matches doc)",
+                cfg.engram_max_ngram_size
+            );
+        }
+
         let layout = EngramLayout::new(
             &cfg.engram_layer_ids,
             cfg.engram_max_ngram_size,

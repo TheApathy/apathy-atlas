@@ -117,6 +117,12 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_forward"
 required-features = ["cuda", "gpu-examples"]
 
+# Served DeepSeek-V4.1: dropping the model must return >= 95% of its memory (TUI swap);
+# `--control leak` forgets it and must FAIL.
+[[example]]
+name = "dsv41_drop_gate"
+required-features = ["cuda", "gpu-examples"]
+
 [[example]]
 name = "dsv41_attn_seam"
 required-features = ["cuda", "gpu-examples"]

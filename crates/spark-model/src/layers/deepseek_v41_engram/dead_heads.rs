@@ -108,6 +108,25 @@ pub fn engram_dead_heads(ids: &[u32]) -> Vec<bool> {
 /// to be exact — see the module doc's "cross-chunk carry" section.
 pub const MAX_LOOKBACK: usize = 3;
 
+/// `true` iff `max_ngram_size` (read from the checkpoint's `config.json`,
+/// `engram_max_ngram_size`) is consistent with this module's hardcoded
+/// `NGRAM_GROUPS`/`N_HEAD_COLS`/`MAX_LOOKBACK`.
+///
+/// `engine/vision.py::engram_dead_heads` hardcodes `(2, 3, 4)` and `24`
+/// directly in its body — its signature is `engram_dead_heads(token_ids)`,
+/// with no `args`/config parameter at all, so PRODUCTION ITSELF never reads
+/// `engram_max_ngram_size` here. That is why this module hardcodes the same
+/// constants rather than deriving them from config: doing the "more
+/// principled" thing would make the port MORE config-aware than production
+/// and could silently DIVERGE from it if the checkpoint's config ever
+/// disagreed with vision.py's literals. Callers that DO read
+/// `engram_max_ngram_size` for other purposes (the hash layout) should call
+/// this once and fail loudly on mismatch, rather than let the assumption
+/// drift unnoticed — see [`super::token_map`]'s `for_checkpoint`.
+pub fn max_ngram_size_matches(max_ngram_size: usize) -> bool {
+    max_ngram_size == NGRAM_GROUPS.len() + 1
+}
+
 /// [`engram_dead_heads`], but correct at a chunk boundary: `carry` is the
 /// trailing up-to-[`MAX_LOOKBACK`] raw ids from immediately before `ids` (empty
 /// for a sequence's first chunk). Returns exactly `ids.len()` rows — the
@@ -240,6 +259,129 @@ mod tests {
         assert!(wrong_if_carried[16..24].iter().all(|&d| d), "carrying should kill exactly the 4-gram group here");
     }
 
+    /// THE SLOT-REUSE CASE (dsv41-parity's review, robustness item): request 1 ends in an
+    /// image, leaving a nonempty carry; request 2 reuses the sequence state (hypothetically --
+    /// `V41Seq` is rebuilt per request today, `Dsv41Model::alloc_sequence`, so this cannot
+    /// happen YET, but `forward.rs::prefill_chunk`'s `start == 0` branch now clears
+    /// `seq.dead_carry` defensively, alongside `tail_rows`/`tail_ids`). This test is the
+    /// pure-logic equivalent of that one-line fix: `prefill_chunk` itself can't be unit-tested
+    /// without a live GPU context (it drives real kernel launches through `Ops`), so this
+    /// exercises the exact Vec state transition instead.
+    #[test]
+    fn a_cleared_carry_does_not_leak_into_the_next_requests_first_chunk() {
+        // Request 1: an image near the end of its last chunk leaves a live carry.
+        let mut carry = Vec::new();
+        update_dead_carry(&mut carry, &[1u32, 2, IMAGE_SENTINEL_ID]);
+        assert_eq!(carry, vec![1u32, 2, IMAGE_SENTINEL_ID], "request 1 must leave a nonempty carry");
+
+        // Request 2's first chunk: text that would collide with request 1's trailing sentinel
+        // if the carry leaked (position 0 is exactly MAX_LOOKBACK - 2 from where the sentinel
+        // would sit if prepended).
+        let request2_ids = [10u32, 11, 12];
+
+        // What `start == 0` now does: clear before computing the mask.
+        carry.clear();
+        let cleared = engram_dead_heads_with_carry(&carry, &request2_ids);
+        assert!(cleared.iter().all(|&d| !d), "a properly cleared carry must not mask request 2's text");
+
+        // NEGATIVE CONTROL: without the clear, request 1's sentinel WOULD leak in and mask
+        // request 2's early positions -- proving the control (and the fix) actually matter.
+        let mut leaked_carry = Vec::new();
+        update_dead_carry(&mut leaked_carry, &[1u32, 2, IMAGE_SENTINEL_ID]);
+        let leaked = engram_dead_heads_with_carry(&leaked_carry, &request2_ids);
+        assert_ne!(leaked, cleared, "an uncleared carry produced the same result as a cleared one -- this control cannot show the leak it exists to catch");
+    }
+
+    /// THE REAL ORACLE (dsv41-parity, 2026-09-22): production's own full-prompt
+    /// `engram_dead_heads` over two real chat-with-image requests, captured on CPU with the
+    /// actual pipeline (`app.py::build_chat_prompt`, `vision.py::expand_image_placeholders`,
+    /// `engine/vision.py::engram_dead_heads`). One case (`02_chat_image_ends_at_chunk`) has
+    /// its image span ending at position 510 -- one MAX_LOOKBACK short of the 512-token chunk
+    /// boundary -- so positions 512/513 of chunk 1 must come out dead from the carry alone.
+    /// Replays both requests chunked at 512 tokens through `engram_dead_heads_with_carry` +
+    /// `update_dead_carry`, matching what `forward.rs::pass` does for `PassKind::EncoderChunk`.
+    #[test]
+    fn matches_dsv41_parity_full_prompt_oracle_across_a_real_chunk_boundary() {
+        let path = "/home/flocka/atlas/DSV41_PORT/parity/vision_e2e/dead_heads_oracle.json";
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present on this box");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("parse dead_heads_oracle.json");
+        let obj = v.as_object().expect("top level must be an object of named requests");
+        assert!(!obj.is_empty(), "oracle file has no requests");
+
+        const CHUNK: usize = 512;
+        let mut checked_requests = 0usize;
+        for (name, req) in obj {
+            let ids: Vec<u32> = req["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let want: Vec<bool> = req["dead_heads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_array().unwrap().iter().map(|b| b.as_u64().unwrap() != 0))
+                .collect();
+            assert_eq!(want.len(), ids.len() * N_HEAD_COLS, "{name}: dead_heads shape does not match expanded_ids");
+
+            let mut carry: Vec<u32> = Vec::new();
+            let mut got: Vec<bool> = Vec::with_capacity(want.len());
+            for chunk in ids.chunks(CHUNK) {
+                got.extend(engram_dead_heads_with_carry(&carry, chunk));
+                update_dead_carry(&mut carry, chunk);
+            }
+            let mismatches = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(mismatches, 0, "{name}: {mismatches}/{} entries differ from production's full-prompt oracle", got.len());
+            checked_requests += 1;
+        }
+        assert!(checked_requests > 0, "the replay must have checked at least one request");
+        eprintln!("full-prompt oracle replay: {checked_requests} request(s), all exact");
+    }
+
+    /// NEGATIVE CONTROL for the oracle test above: dropping the carry (chunking with a
+    /// no-carry `engram_dead_heads` per chunk) must disagree with production on
+    /// `02_chat_image_ends_at_chunk` -- specifically at positions 512 and 513, the two rows
+    /// dsv41-parity identified (dead-column counts 16 and 8 respectively, vs 0 with no carry).
+    #[test]
+    fn dropping_the_carry_disagrees_with_the_oracle_at_the_predicted_rows() {
+        let path = "/home/flocka/atlas/DSV41_PORT/parity/vision_e2e/dead_heads_oracle.json";
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present on this box");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("parse dead_heads_oracle.json");
+        let Some(req) = v.get("02_chat_image_ends_at_chunk") else {
+            eprintln!("skipping: 02_chat_image_ends_at_chunk not present");
+            return;
+        };
+        let ids: Vec<u32> = req["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        assert!(ids.len() > 513, "fixture too short to reach position 513");
+
+        const CHUNK: usize = 512;
+        let mut no_carry: Vec<bool> = Vec::new();
+        for chunk in ids.chunks(CHUNK) {
+            no_carry.extend(engram_dead_heads(chunk)); // deliberately wrong: no carry
+        }
+        fn row(v: &[bool], p: usize) -> &[bool] {
+            &v[p * N_HEAD_COLS..(p + 1) * N_HEAD_COLS]
+        }
+        assert_eq!(row(&no_carry, 512).iter().filter(|&&d| d).count(), 0, "no-carry row 512 must be all-False");
+        assert_eq!(row(&no_carry, 513).iter().filter(|&&d| d).count(), 0, "no-carry row 513 must be all-False");
+
+        let mut carry: Vec<u32> = Vec::new();
+        let mut with_carry: Vec<bool> = Vec::new();
+        for chunk in ids.chunks(CHUNK) {
+            with_carry.extend(engram_dead_heads_with_carry(&carry, chunk));
+            update_dead_carry(&mut carry, chunk);
+        }
+        assert_eq!(row(&with_carry, 512).iter().filter(|&&d| d).count(), 16, "carried row 512 must have 16 dead columns, per parity's oracle");
+        assert_eq!(row(&with_carry, 513).iter().filter(|&&d| d).count(), 8, "carried row 513 must have 8 dead columns, per parity's oracle");
+        assert_ne!(
+            row(&no_carry, 512),
+            row(&with_carry, 512),
+            "dropping the carry produced the same row 512 as carrying it -- this control cannot show the bug"
+        );
+    }
+
     /// An empty carry (a sequence's first chunk) must be identical to calling
     /// `engram_dead_heads` directly -- the carry-aware function is a strict
     /// generalisation, not a different algorithm.
@@ -247,6 +389,16 @@ mod tests {
     fn empty_carry_matches_the_plain_function() {
         let ids = [129_264u32, 2, 3, 4, 5];
         assert_eq!(engram_dead_heads_with_carry(&[], &ids), engram_dead_heads(&ids));
+    }
+
+    /// The checkpoint's real value (from config.json, confirmed 2026-09-22) must pass, and
+    /// anything else must fail -- this guard exists specifically to catch a FUTURE checkpoint
+    /// disagreeing with vision.py's hardcoded (2,3,4), so both directions need coverage.
+    #[test]
+    fn max_ngram_size_matches_checks_against_the_hardcoded_groups() {
+        assert!(max_ngram_size_matches(4), "the real checkpoint's engram_max_ngram_size must pass");
+        assert!(!max_ngram_size_matches(3), "a mismatched max_ngram_size must be rejected");
+        assert!(!max_ngram_size_matches(5), "a mismatched max_ngram_size must be rejected");
     }
 
     /// A prompt with no image tokens at all must come back entirely alive: the

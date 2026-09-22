@@ -25,7 +25,14 @@
 // tile, so its activation rows are read from DRAM once and then hit L2. With tiles fastest,
 // every wave touched ~48 different experts' activations and re-read them per N tile:
 // ~13 GB of activation traffic per layer at T=2048, more than the whole weight stream.
-// Grid: Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
+// MEASURED AND REJECTED (2026-09-22, interleaved A/B, 6 rounds, clean window):
+//   - __launch_bounds__(256, 2) for 2 CTAs/SM: 128 regs + ~90 B spill, 14% SLOWER at T=2048.
+//   - Warp specialisation (8 MMA warps + 4 producer warps decoding the next K step into a
+//     second dynamic-smem stage, cp.async activations): bit-identical, but 38.2 vs 32.5 ms
+//     at T=2048, 24.3 vs 18.8 at T=512, 17.0 vs 14.0 at T=128. Concentrating the decode on
+//     4 warps made it the critical path: decode, not MMA, bounds this kernel (ncu: tensor
+//     pipe 28.7%, IPC 1.12). The lever is cheaper or less redundant decode, not overlap.
+// Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -73,13 +80,6 @@ __device__ __forceinline__ uint32_t bf16_bits(float v) {
     return (uint32_t)(*reinterpret_cast<const unsigned short*>(&b));
 }
 
-/// Pick entry `idx` (0..7) of an 8-entry bf16 table held as four packed u32 — predicated
-/// selects, no dynamically indexed register array (which would spill to local memory).
-__device__ __forceinline__ uint32_t pick(uint32_t idx, uint32_t t0, uint32_t t1, uint32_t t2, uint32_t t3) {
-    const uint32_t w = (idx & 4u) ? ((idx & 2u) ? t3 : t2) : ((idx & 2u) ? t1 : t0);
-    return (idx & 1u) ? (w >> 16) : (w & 0xFFFFu);
-}
-
 /// The packed bytes one thread needs for one (row, 32-weight group): fetched one K step
 /// AHEAD so the global loads are in flight during the MMAs of the current step.
 struct Raw {
@@ -98,35 +98,66 @@ __device__ __forceinline__ Raw fetch_group(const Cb3Planes& p, long long n, int 
     return r;
 }
 
-/// Decode one row's one 32-weight scale group into dst[0..32) (bf16, K order).
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+
+/// Four 3-bit codebook indices -> a prmt selector (one index per nibble, bit 3 clear).
+/// Byte j of L/H belongs to lane j of this word; `shift`/`bit` pick sub-position r.
+__device__ __forceinline__ uint32_t cb3_selector(uint32_t L, uint32_t H, int shift, int bit) {
+    const uint32_t a = (L >> shift) & 0x03030303u;
+    const uint32_t b = (bit >= 2 ? (H >> (bit - 2)) : (H << (2 - bit))) & 0x04040404u;
+    const uint32_t ie = a | b;             // one index (0..7) per byte
+    const uint32_t t = ie | (ie >> 4);     // bytes 0 and 2 now hold two indices each
+    return (t & 0xFFu) | ((t >> 8) & 0xFF00u);
+}
+
+/// Decode one row's 32-weight scale group into 16 packed bf16 pairs (K order).
 ///
-/// The row's codebook times the group scale becomes an 8-entry bf16 table, so each weight
-/// costs an index extraction and a select. Values are exactly those of
-/// `cb3_reconstruct_bf16` (fp4 x 2^(s-127), exact in bf16).
-__device__ __forceinline__ void decode_group(const Raw& r, uint2 cb, int k0, __nv_bfloat16* dst) {
+/// The row codebook times the group scale is an 8-entry bf16 table, split into a low-byte
+/// table and a high-byte table (two u32 each). Each weight index then selects its two bytes
+/// with `prmt` — four weights per selector, no per-weight arithmetic, no dynamic register
+/// indexing. Values are exactly `cb3_reconstruct_bf16`'s (fp4 x 2^(s-127), exact in bf16);
+/// this replaced a per-weight predicated select that cost ~3x the instructions.
+__device__ __forceinline__ void decode32(const Raw& r, uint2 cb, int k0, uint32_t (&out)[16]) {
     const int g = (k0 % 512) / 32;
     const float scale = exp2f((float)r.sc - 127.0f);
-    uint32_t t[4];
+    uint32_t e[8];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint32_t word = (i < 2) ? cb.x : cb.y;
-        const uint32_t c0 = (word >> ((2 * i % 4) * 8)) & 0x0Fu;
-        const uint32_t c1 = (word >> ((2 * i % 4 + 1) * 8)) & 0x0Fu;
-        t[i] = bf16_bits(fp4_value(c0) * scale) | (bf16_bits(fp4_value(c1) * scale) << 16);
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t word = (i < 4) ? cb.x : cb.y;
+        e[i] = bf16_bits(fp4_value((word >> ((i % 4) * 8)) & 0x0Fu) * scale);
     }
+    const uint32_t tlo_x = (e[0] & 0xFFu) | ((e[1] & 0xFFu) << 8) | ((e[2] & 0xFFu) << 16) | ((e[3] & 0xFFu) << 24);
+    const uint32_t tlo_y = (e[4] & 0xFFu) | ((e[5] & 0xFFu) << 8) | ((e[6] & 0xFFu) << 16) | ((e[7] & 0xFFu) << 24);
+    const uint32_t thi_x = (e[0] >> 8) | ((e[1] >> 8) << 8) | ((e[2] >> 8) << 16) | ((e[3] >> 8) << 24);
+    const uint32_t thi_y = (e[4] >> 8) | ((e[5] >> 8) << 8) | ((e[6] >> 8) << 16) | ((e[7] >> 8) << 24);
     const int lo_shift = 4 * (g % 2);
     const int hi_bit = ((g / 2) % 2) * 4 + (g % 2) * 2;
     const uint32_t lo_w[4] = {r.lo.x, r.lo.y, r.lo.z, r.lo.w};
     const uint32_t hi_w[4] = {r.hi.x, r.hi.y, r.hi.z, r.hi.w};
-    uint32_t out[16];
 #pragma unroll
-    for (int lane = 0; lane < 16; ++lane) {
-        const uint32_t l = (lo_w[lane / 4] >> ((lane % 4) * 8)) & 0xFFu;
-        const uint32_t h = (hi_w[lane / 4] >> ((lane % 4) * 8)) & 0xFFu;
-        const uint32_t i0 = ((l >> lo_shift) & 3u) | (((h >> hi_bit) & 1u) << 2);
-        const uint32_t i1 = ((l >> (lo_shift + 2)) & 3u) | (((h >> (hi_bit + 1)) & 1u) << 2);
-        out[lane] = pick(i0, t[0], t[1], t[2], t[3]) | (pick(i1, t[0], t[1], t[2], t[3]) << 16);
+    for (int q = 0; q < 4; ++q) {
+        const uint32_t s0 = cb3_selector(lo_w[q], hi_w[q], lo_shift, hi_bit);          // r = 0
+        const uint32_t s1 = cb3_selector(lo_w[q], hi_w[q], lo_shift + 2, hi_bit + 1);  // r = 1
+        const uint32_t lo0 = prmt(tlo_x, tlo_y, s0), hi0 = prmt(thi_x, thi_y, s0);
+        const uint32_t lo1 = prmt(tlo_x, tlo_y, s1), hi1 = prmt(thi_x, thi_y, s1);
+        // Interleave to bf16(lane j, r=0) | bf16(lane j, r=1) << 16 for j = 0..3.
+        const uint32_t x01 = prmt(lo0, lo1, 0x5140), x23 = prmt(lo0, lo1, 0x7362);
+        const uint32_t y01 = prmt(hi0, hi1, 0x5140), y23 = prmt(hi0, hi1, 0x7362);
+        out[4 * q + 0] = prmt(x01, y01, 0x5140);
+        out[4 * q + 1] = prmt(x01, y01, 0x7362);
+        out[4 * q + 2] = prmt(x23, y23, 0x5140);
+        out[4 * q + 3] = prmt(x23, y23, 0x7362);
     }
+}
+
+/// Decode one row's one 32-weight scale group into dst[0..32) (bf16, K order).
+__device__ __forceinline__ void decode_group(const Raw& r, uint2 cb, int k0, __nv_bfloat16* dst) {
+    uint32_t out[16];
+    decode32(r, cb, k0, out);
     uint4* d = reinterpret_cast<uint4*>(dst);
 #pragma unroll
     for (int q = 0; q < 4; ++q) d[q] = make_uint4(out[4 * q], out[4 * q + 1], out[4 * q + 2], out[4 * q + 3]);
@@ -165,7 +196,9 @@ static_assert(SMEM_BYTES >= BM * BN * 4, "epilogue tile must fit in the mainloop
 
 /// Gate + up + SwiGLU for one (expert tile, N tile):
 ///   h[row, n] = bf16( silu(min(g, L)) * clamp(u, -L, L) * route_w[row] ),  g/u fp32.
-extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
+namespace {
+/// The gate/up body, shared by the 1- and 2-CTA-per-SM entry points below.
+__device__ __forceinline__ void gate_up_body(
     const __nv_bfloat16* __restrict__ act,  // [P, K] permuted rows
     const int4* __restrict__ tiles,         // {row_begin, rows, slot, 0}
     const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
@@ -245,39 +278,52 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
         __syncthreads();
     }
 
-    // Epilogue in two passes through one fp32 staging tile: gate first, then up.
+    // Epilogue. gate and up fragments share one (unspecified but identical) element layout,
+    // so the clamp and SwiGLU run element-wise in registers; only silu(g)*u goes through the
+    // fp32 staging tile, where the row is known for the route weight. The association
+    // ((g * sig) * u) * w is the reference's, and h is rounded to bf16 exactly once.
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
-        for (int j = 0; j < 2; ++j)
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+            for (int e = 0; e < acc_g[i][j].num_elements; ++e) {
+                const float g = fminf(acc_g[i][j].x[e], limit);
+                const float u = fminf(fmaxf(acc_u[i][j].x[e], -limit), limit);
+                const float sig = 1.0f / (1.0f + expf(-g));
+                acc_g[i][j].x[e] = g * sig * u;
+            }
             wmma::store_matrix_sync(&s_out[wm + i * 16][wn + j * 16], acc_g[i][j], BN, wmma::mem_row_major);
+        }
     __syncthreads();
-    constexpr int PER = BM * BN / THREADS;
-    float gate_v[PER];
-#pragma unroll
-    for (int e = 0; e < PER; ++e) {
-        const int idx = threadIdx.x + e * THREADS;
-        gate_v[e] = s_out[idx / BN][idx % BN];
-    }
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < 2; ++i)
-#pragma unroll
-        for (int j = 0; j < 2; ++j)
-            wmma::store_matrix_sync(&s_out[wm + i * 16][wn + j * 16], acc_u[i][j], BN, wmma::mem_row_major);
-    __syncthreads();
-#pragma unroll
-    for (int e = 0; e < PER; ++e) {
-        const int idx = threadIdx.x + e * THREADS;
+    for (int idx = threadIdx.x; idx < BM * BN; idx += THREADS) {
         const int row = idx / BN, col = idx % BN;
         if (row >= rows) continue;
-        const float g = fminf(gate_v[e], limit);
-        const float u = fminf(fmaxf(s_out[row][col], -limit), limit);
-        const float sig = 1.0f / (1.0f + expf(-g));
         const long long prow = row_begin + row;
-        // Same association as the reference: ((g * sig) * u) * w.
-        h[prow * N + n0 + col] = __float2bfloat16(g * sig * u * row_weight[prow]);
+        h[prow * N + n0 + col] = __float2bfloat16(s_out[row][col] * row_weight[prow]);
     }
+}
+
+}  // namespace
+
+#define ATLAS_CB3_GATE_UP_ARGS act, tiles, w1_lo, w1_hi, w1_cb, w1_sc, w3_lo, w3_hi, w3_cb, w3_sc, \
+    lo_s, hi_s, cb_s, sc_s, row_weight, h, N, K, limit
+
+/// Gate + up + SwiGLU, one CTA per SM (168 registers, no spills).
+///
+/// Measured, interleaved A/B (6 rounds, clean window): the same body at
+/// __launch_bounds__(256, 2) — 128 registers, 2 CTAs/SM, a ~90-byte spill — was 14% SLOWER
+/// (35.9 vs 31.5 ms experts at T=2048) despite ncu showing this variant at 16.7% occupancy.
+extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
+    const __nv_bfloat16* __restrict__ act,  // [P, K] permuted rows
+    const int4* __restrict__ tiles,         // {row_begin, rows, slot, 0}
+    const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
+    const uint8_t* w3_lo, const uint8_t* w3_hi, const uint8_t* w3_cb, const uint8_t* w3_sc,
+    unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
+    const float* __restrict__ row_weight,   // [P]
+    __nv_bfloat16* __restrict__ h,          // [P, N]
+    int N, int K, float limit) {
+    gate_up_body(ATLAS_CB3_GATE_UP_ARGS);
 }
 
 /// Down projection for one (expert tile, N tile): out[row, n] = h[row, :] . w2[n, :], fp32.
@@ -356,5 +402,125 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
     for (int idx = threadIdx.x; idx < BM * BN; idx += THREADS) {
         const int row = idx / BN, col = idx % BN;
         if (row < rows) out[(long long)(row_begin + row) * N + n0 + col] = s_out[row][col];
+    }
+}
+
+// =====================================================================================
+// GEMV path for FEW rows per expert (decode, and small-T tails): no shared memory, no MMA.
+//
+// At T=1 the 128-row MMA tile above decodes a whole expert to multiply ONE row: measured
+// 0.94 ms/layer for 6 experts (212 M weights) against a ~0.4 ms read floor. Here one warp
+// owns one output row n; each lane takes 32-weight scale groups (g = lane, lane + 32, ...),
+// decodes them in registers and dots them with up to GEMV_ROWS activation rows read
+// straight from global (L1/L2), then a warp shuffle reduces. Same decoded values, fp32
+// accumulate; only the summation order differs from the MMA path.
+//
+// WORK LIST: {row_begin, rows <= GEMV_ROWS, slot, 0}. Grid: (N / GEMV_WARPS, num_tiles).
+// =====================================================================================
+namespace {
+constexpr int GEMV_ROWS = 4;
+constexpr int GEMV_WARPS = 8;
+
+/// GEMV alias of `decode32`: the weights stay in registers.
+__device__ __forceinline__ void decode_group_regs(const Raw& r, uint2 cb, int k0, uint32_t (&out)[16]) {
+    decode32(r, cb, k0, out);
+}
+
+__device__ __forceinline__ float bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
+__device__ __forceinline__ float bf16_hi(uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); }
+
+/// acc[r] += dot(x[r][k0 .. k0+32), w[0..32)) for the tile's rows.
+__device__ __forceinline__ void dot_group(const __nv_bfloat16* __restrict__ x, int row_begin, int rows,
+                                          int K, int k0, const uint32_t (&w)[16], float (&acc)[GEMV_ROWS]) {
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS; ++r) {
+        if (r >= rows) break;
+        const uint4* xp = reinterpret_cast<const uint4*>(x + (long long)(row_begin + r) * K + k0);
+        float s = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const uint4 v = xp[q];
+            const uint32_t xv[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const uint32_t wv = w[q * 4 + e];
+                s += bf16_lo(xv[e]) * bf16_lo(wv);
+                s += bf16_hi(xv[e]) * bf16_hi(wv);
+            }
+        }
+        acc[r] += s;
+    }
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(GEMV_WARPS * 32) cb3_moe_gemv_gate_up(
+    const __nv_bfloat16* __restrict__ act,
+    const int4* __restrict__ tiles,
+    const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
+    const uint8_t* w3_lo, const uint8_t* w3_hi, const uint8_t* w3_cb, const uint8_t* w3_sc,
+    unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
+    const float* __restrict__ row_weight,
+    __nv_bfloat16* __restrict__ h,
+    int N, int K, float limit) {
+    const int4 tile = tiles[blockIdx.y];
+    const int row_begin = tile.x, rows = tile.y, slot = tile.z;
+    const int lane = threadIdx.x % 32;
+    const long long n = (long long)blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
+    const Cb3Planes p1 = planes_for(w1_lo, w1_hi, w1_cb, w1_sc, lo_s, hi_s, cb_s, sc_s, slot);
+    const Cb3Planes p3 = planes_for(w3_lo, w3_hi, w3_cb, w3_sc, lo_s, hi_s, cb_s, sc_s, slot);
+    const uint2 cb1 = *reinterpret_cast<const uint2*>(p1.cb + n * 8);
+    const uint2 cb3 = *reinterpret_cast<const uint2*>(p3.cb + n * 8);
+    float ag[GEMV_ROWS] = {}, au[GEMV_ROWS] = {};
+    for (int k0 = lane * 32; k0 < K; k0 += 32 * 32) {
+        uint32_t w[16];
+        decode_group_regs(fetch_group(p1, n, k0, K), cb1, k0, w);
+        dot_group(act, row_begin, rows, K, k0, w, ag);
+        decode_group_regs(fetch_group(p3, n, k0, K), cb3, k0, w);
+        dot_group(act, row_begin, rows, K, k0, w, au);
+    }
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS; ++r) {
+        const float gsum = warp_sum(ag[r]);
+        const float usum = warp_sum(au[r]);
+        if (lane == 0 && r < rows) {
+            const float g = fminf(gsum, limit);
+            const float u = fminf(fmaxf(usum, -limit), limit);
+            const float sig = 1.0f / (1.0f + expf(-g));
+            const float hv = g * sig * u;
+            const long long prow = row_begin + r;
+            h[prow * N + n] = __float2bfloat16(hv * row_weight[prow]);
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(GEMV_WARPS * 32) cb3_moe_gemv_down(
+    const __nv_bfloat16* __restrict__ hin,
+    const int4* __restrict__ tiles,
+    const uint8_t* w2_lo, const uint8_t* w2_hi, const uint8_t* w2_cb, const uint8_t* w2_sc,
+    unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
+    float* __restrict__ out,
+    int N, int K) {
+    const int4 tile = tiles[blockIdx.y];
+    const int row_begin = tile.x, rows = tile.y, slot = tile.z;
+    const int lane = threadIdx.x % 32;
+    const long long n = (long long)blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
+    const Cb3Planes p2 = planes_for(w2_lo, w2_hi, w2_cb, w2_sc, lo_s, hi_s, cb_s, sc_s, slot);
+    const uint2 cb = *reinterpret_cast<const uint2*>(p2.cb + n * 8);
+    float acc[GEMV_ROWS] = {};
+    for (int k0 = lane * 32; k0 < K; k0 += 32 * 32) {
+        uint32_t w[16];
+        decode_group_regs(fetch_group(p2, n, k0, K), cb, k0, w);
+        dot_group(hin, row_begin, rows, K, k0, w, acc);
+    }
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS; ++r) {
+        const float s = warp_sum(acc[r]);
+        if (lane == 0 && r < rows) out[(long long)(row_begin + r) * N + n] = s;
     }
 }
