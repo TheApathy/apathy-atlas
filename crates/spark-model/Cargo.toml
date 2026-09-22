@@ -27,6 +27,11 @@ metal = [
 # Kept off the bare `metal` feature so a metal-feature library build
 # doesn't drag in the tokenizer crate.
 metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
+# DeepSeek-V4.1 engram needs the checkpoint's own tokenizer to build the
+# compressed token map (`layers/deepseek_v41_engram/token_map.rs`), independent
+# of the cuda/metal split above. NOT in `default`: serving must opt in, and
+# tests that don't need a real tokenizer.json stay buildable without it.
+engram-tokenizer = ["dep:tokenizers"]
 # Opt-in gate for the GPU kernel microtest examples. NOT in `default`, so the
 # no-GPU CI `cargo test --workspace` skips building them (they link CUDA
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
