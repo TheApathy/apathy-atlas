@@ -20,14 +20,12 @@ const BM: usize = 128;
 const BN: usize = 128;
 const BK: usize = 32;
 
-/// Which weight shapes take the fused kernel: decided by the WEIGHT alone (N, K), never by M, so a
-/// given linear runs the SAME kernel for a 512-row chunk and a 20-row tail. Chunk invariance then
-/// holds by construction, instead of resting on fused == pinned cuBLASLt bytewise (lead ruling).
-/// Measured at M = 512 (gate log): wins wo_b 1.50x, w2 1.51x, w1/w3 1.14x, wq_a 1.15x (all
-/// K >= 2048, N >= 1280); losses excluded: wq_b (K = 1280) 0.82x, wkv (N = 512) 0.49x, a wo_a group
-/// (N = 1024) 0.86x. N >= 1280 is the old ">= 40 CTAs at M = 512" rule with M fixed at 512.
-pub fn fused_wins(n: usize, k: usize) -> bool {
-    k >= 2048 && n >= 1280 && n % BN == 0 && k % BK == 0
+/// Where the fused kernel measured faster than dequant + cuBLASLt at M = 512 (gate log): K >= 2048
+/// and at least 40 CTAs. Measured wins: wo_b 1.50x, w2 1.51x, w1/w3 1.14x, wq_a 1.15x. Measured
+/// losses it excludes: wq_b (K=1280) 0.82x, wkv (16 CTAs) 0.49x, a wo_a group (32 CTAs) 0.86x.
+pub fn fused_wins(m: usize, n: usize, k: usize) -> bool {
+    let ctas = n.div_ceil(BN) * m.div_ceil(BM);
+    k >= 2048 && ctas >= 40 && n % BN == 0 && k % BK == 0
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,10 +74,10 @@ mod tests {
     #[test]
     fn fused_wins_where_it_measured_faster() {
         for (n, k) in [(5120, 8192), (5120, 2304), (2304, 5120), (1280, 5120)] {
-            assert!(fused_wins(n, k), "{n}x{k} measured faster fused");
+            assert!(fused_wins(512, n, k), "{n}x{k} measured faster fused");
         }
         for (n, k) in [(32768, 1280), (512, 5120), (1024, 4096)] {
-            assert!(!fused_wins(n, k), "{n}x{k} measured slower fused");
+            assert!(!fused_wins(512, n, k), "{n}x{k} measured slower fused");
         }
     }
 }
