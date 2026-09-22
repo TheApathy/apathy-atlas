@@ -123,7 +123,7 @@ fn main() -> Result<()> {
     }));
     let store = loader.load(Path::new(MODEL_DIR), gpu.as_ref(), 0)?;
     let spec = RopeSpec { dim: 64, original_seq_len: 65536, base: 160000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
-    let core = Dsv41SparseCore::load_prefix(gpu.as_ref(), &store, &config, MAX_SEQ, 512, spec.upload(gpu.as_ref(), MAX_SEQ + 8)?, 37)?;
+    let core = Dsv41SparseCore::load_prefix(&(gpu.clone() as spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu), &store, &config, MAX_SEQ, 512, spec.upload(gpu.as_ref(), MAX_SEQ + 8)?, 37)?;
     let out = gpu.alloc(512 * QROW)?;
     let mut fail = 0usize;
 

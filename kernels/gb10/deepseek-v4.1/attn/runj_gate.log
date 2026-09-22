@@ -2,11 +2,11 @@ DeepSeek-V4 YaRN parameters: factor=16.0, beta_fast=32.0, beta_slow=1.0, origina
 ENCODER L02 chunk 0 (S=0, T=512): topk 0/512 rows differ; attention bit-exact 0.9954 rel 1.34e-4
 ENCODER L20 chunk 0 (S=0, T=512): topk 0/512 rows differ; attention bit-exact 0.9991 rel 8.52e-5
 ENCODER L02 chunk 1 (S=512, T=512): topk 0/512 rows differ; attention bit-exact 0.9947 rel 1.51e-4
-ENCODER L20 chunk 1 (S=512, T=512): topk 1/512 rows differ; attention bit-exact 0.9987 rel 1.16e-4
+ENCODER L20 chunk 1 (S=512, T=512): topk 1/512 rows differ; attention bit-exact 0.9986 rel 1.39e-4
 ENCODER L02 chunk 2 (S=1024, T=20): topk 0/20 rows differ; attention bit-exact 0.9949 rel 1.39e-4
-ENCODER L20 chunk 2 (S=1024, T=20): topk 1/20 rows differ; attention bit-exact 0.9891 rel 4.31e-4
+ENCODER L20 chunk 2 (S=1024, T=20): topk 0/20 rows differ; attention bit-exact 0.9988 rel 1.16e-4
 REPLAY TAIL (108 rows of chunk 2 + 20 of chunk 3, widths 1024/1536): 128 rows; candidates differ 0/196608 vs L24.cand_in; topk 1/128 rows vs L20's chunk rows
-REPLAY L24 (own tail): topk 2/128 rows differ; attention bit-exact 0.9976 rel 1.62e-4
+REPLAY L24 (own tail): topk 1/128 rows differ; attention bit-exact 0.9982 rel 1.47e-4
 REPLAY L28 (own tail): topk 0/128 rows differ; attention bit-exact 0.9990 rel 1.09e-4
 REPLAY L32 (own tail): topk 0/128 rows differ; attention bit-exact 0.9990 rel 1.10e-4
 REPLAY L36 (own tail): topk 0/128 rows differ; attention bit-exact 0.9989 rel 9.86e-5

@@ -298,7 +298,7 @@ extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn_combine(
 // idea -- instead of the 8 a single bf16 P would keep. l is accumulated from fp32 P.
 // Numerics vs the fp32-FMA one-pass kernel: different summation order and ~2^-17 relative P
 // error; the band is pre-registered in the gate.
-static const int MH = 16, MK = 16, MWARPS = 4, MNT = MWARPS * 32, KPAD = 8;
+static const int MH = 16, MWARPS = 4, MNT = MWARPS * 32, KPAD = 8;
 
 __device__ __forceinline__ void mma_bf16_16816(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
     asm volatile(
@@ -311,7 +311,8 @@ __device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
     return (uint32_t)__bfloat16_as_ushort(lo) | ((uint32_t)__bfloat16_as_ushort(hi) << 16);
 }
 
-extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
+template <int TK>
+__device__ __forceinline__ void sparse_attn_mma_body(
     const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
     const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
     __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
@@ -320,17 +321,25 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int g = lane >> 2, q = lane & 3;
 
-    __shared__ __align__(16) __nv_bfloat16 qs[MH][DMAX + KPAD];
-    __shared__ __align__(16) __nv_bfloat16 ks[MK][DMAX + KPAD];
-    __shared__ float spart[MWARPS][MH][MK];
-    __shared__ __align__(16) __nv_bfloat16 ph[MH][MK + KPAD], pl[MH][MK + KPAD];
+    __shared__ __align__(16) __nv_bfloat16 ks[TK][DMAX + KPAD];
+    __shared__ float spart[MWARPS][MH][TK];
+    __shared__ __align__(16) __nv_bfloat16 ph[MH][TK + KPAD], pl[MH][TK + KPAD];
     __shared__ float mrow[MH], lrow[MH], arow[MH];
-    __shared__ int vld[MK];
+    __shared__ int vld[TK];
 
-    for (int i = tid; i < MH * DMAX / 8; i += MNT) {
-        const int h = i / (DMAX / 8), c = i % (DMAX / 8);
-        *reinterpret_cast<uint4*>(&qs[h][c * 8]) =
-            reinterpret_cast<const uint4*>(Q + ((size_t)t * NH + hg * MH + h) * D)[c];
+    // Q stays in registers: this warp's A fragments over its 128 dims (8 k-steps).
+    uint32_t qa[8][4];
+    {
+        const __nv_bfloat16* q0 = Q + ((size_t)t * NH + hg * MH + g) * D;
+        const __nv_bfloat16* q1 = q0 + 8 * (size_t)D;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int kd = warp * 128 + kk * 16;
+            qa[kk][0] = *reinterpret_cast<const uint32_t*>(q0 + kd + 2 * q);
+            qa[kk][1] = *reinterpret_cast<const uint32_t*>(q1 + kd + 2 * q);
+            qa[kk][2] = *reinterpret_cast<const uint32_t*>(q0 + kd + 8 + 2 * q);
+            qa[kk][3] = *reinterpret_cast<const uint32_t*>(q1 + kd + 8 + 2 * q);
+        }
     }
     if (tid < MH) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
     float acc[16][4];
@@ -342,9 +351,9 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
         const int n = seg == 0 ? NW : NC;
         if (seg == 1 && CIDX == nullptr) continue;
         const __nv_bfloat16* src = seg == 0 ? RING : CKV;
-        for (int kb = 0; kb < n; kb += MK) {
-            if (tid < MK) {
-                const int c = kb + tid;
+        for (int kb = 0; kb < n; kb += TK) {
+            for (int j = tid; j < TK; j += MNT) {
+                const int c = kb + j;
                 int row = -1;
                 if (c < n) {
                     if (seg == 0) {
@@ -355,10 +364,10 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
                         if (j >= 0) row = (int)j;
                     }
                 }
-                vld[tid] = row;
+                vld[j] = row;
             }
             __syncthreads();
-            for (int i = tid; i < MK * DMAX / 8; i += MNT) {
+            for (int i = tid; i < TK * DMAX / 8; i += MNT) {
                 const int r = i / (DMAX / 8), c = i % (DMAX / 8);
                 const int row = vld[r];
                 *reinterpret_cast<uint4*>(&ks[r][c * 8]) = row >= 0
@@ -367,17 +376,16 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
             __syncthreads();
 
             // ---- S partial over this warp's 128 dims: 8 k-steps x 2 n-tiles of 8 keys
-            float sp[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
+            constexpr int NS = TK / 8;
+            float sp[NS][4];
+#pragma unroll
+            for (int nt = 0; nt < NS; ++nt) sp[nt][0] = sp[nt][1] = sp[nt][2] = sp[nt][3] = 0.f;
 #pragma unroll
             for (int kk = 0; kk < 8; ++kk) {
                 const int kd = warp * 128 + kk * 16;
-                uint32_t a[4];
-                a[0] = *reinterpret_cast<const uint32_t*>(&qs[g][kd + 2 * q]);
-                a[1] = *reinterpret_cast<const uint32_t*>(&qs[g + 8][kd + 2 * q]);
-                a[2] = *reinterpret_cast<const uint32_t*>(&qs[g][kd + 8 + 2 * q]);
-                a[3] = *reinterpret_cast<const uint32_t*>(&qs[g + 8][kd + 8 + 2 * q]);
+                const uint32_t (&a)[4] = qa[kk];
 #pragma unroll
-                for (int nt = 0; nt < 2; ++nt) {
+                for (int nt = 0; nt < NS; ++nt) {
                     uint32_t b[2];
                     b[0] = *reinterpret_cast<const uint32_t*>(&ks[nt * 8 + g][kd + 2 * q]);
                     b[1] = *reinterpret_cast<const uint32_t*>(&ks[nt * 8 + g][kd + 8 + 2 * q]);
@@ -385,7 +393,7 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
                 }
             }
 #pragma unroll
-            for (int nt = 0; nt < 2; ++nt) {
+            for (int nt = 0; nt < NS; ++nt) {
                 spart[warp][g][nt * 8 + 2 * q]         = sp[nt][0];
                 spart[warp][g][nt * 8 + 2 * q + 1]     = sp[nt][1];
                 spart[warp][g + 8][nt * 8 + 2 * q]     = sp[nt][2];
@@ -395,11 +403,12 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
 
             // ---- online softmax: 8 threads per head row, 2 keys each
             {
-                const int row = tid >> 3, k0 = (tid & 7) * 2;
-                float sv[2], pv[2];
+                constexpr int KPT = TK / 8;   // keys per thread
+                const int row = tid >> 3, k0 = (tid & 7) * KPT;
+                float sv[KPT], pv[KPT];
                 float tmax = -INFINITY;
 #pragma unroll
-                for (int j = 0; j < 2; ++j) {
+                for (int j = 0; j < KPT; ++j) {
                     const int k = k0 + j;
                     float v = spart[0][row][k];
                     for (int w = 1; w < MWARPS; ++w) v += spart[w][row][k];
@@ -414,7 +423,7 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
                 const float alpha = __expf(m_old - m_safe);
                 float lsum = 0.f;
 #pragma unroll
-                for (int j = 0; j < 2; ++j) {
+                for (int j = 0; j < KPT; ++j) {
                     pv[j] = sv[j] == -INFINITY ? 0.f : __expf(sv[j] - m_safe);
                     lsum += pv[j];
                     const __nv_bfloat16 hi = __float2bfloat16_rn(pv[j]);
@@ -434,24 +443,31 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
             // ---- O = O * alpha + (P_hi + P_lo) K over this warp's 128 dims (16 n-tiles)
             {
                 const float a0 = arow[g], a1 = arow[g + 8];
-                uint32_t ah[4], al[4];
-                ah[0] = *reinterpret_cast<const uint32_t*>(&ph[g][2 * q]);
-                ah[1] = *reinterpret_cast<const uint32_t*>(&ph[g + 8][2 * q]);
-                ah[2] = *reinterpret_cast<const uint32_t*>(&ph[g][8 + 2 * q]);
-                ah[3] = *reinterpret_cast<const uint32_t*>(&ph[g + 8][8 + 2 * q]);
-                al[0] = *reinterpret_cast<const uint32_t*>(&pl[g][2 * q]);
-                al[1] = *reinterpret_cast<const uint32_t*>(&pl[g + 8][2 * q]);
-                al[2] = *reinterpret_cast<const uint32_t*>(&pl[g][8 + 2 * q]);
-                al[3] = *reinterpret_cast<const uint32_t*>(&pl[g + 8][8 + 2 * q]);
 #pragma unroll
                 for (int nt = 0; nt < 16; ++nt) {
                     acc[nt][0] *= a0; acc[nt][1] *= a0; acc[nt][2] *= a1; acc[nt][3] *= a1;
-                    const int dim = warp * 128 + nt * 8 + g;
-                    uint32_t b[2];
-                    b[0] = pack2(ks[2 * q][dim], ks[2 * q + 1][dim]);
-                    b[1] = pack2(ks[8 + 2 * q][dim], ks[9 + 2 * q][dim]);
-                    mma_bf16_16816(acc[nt], ah, b);
-                    mma_bf16_16816(acc[nt], al, b);
+                }
+#pragma unroll
+                for (int ks16 = 0; ks16 < TK / 16; ++ks16) {
+                    const int kc = ks16 * 16;
+                    uint32_t ah[4], al[4];
+                    ah[0] = *reinterpret_cast<const uint32_t*>(&ph[g][kc + 2 * q]);
+                    ah[1] = *reinterpret_cast<const uint32_t*>(&ph[g + 8][kc + 2 * q]);
+                    ah[2] = *reinterpret_cast<const uint32_t*>(&ph[g][kc + 8 + 2 * q]);
+                    ah[3] = *reinterpret_cast<const uint32_t*>(&ph[g + 8][kc + 8 + 2 * q]);
+                    al[0] = *reinterpret_cast<const uint32_t*>(&pl[g][kc + 2 * q]);
+                    al[1] = *reinterpret_cast<const uint32_t*>(&pl[g + 8][kc + 2 * q]);
+                    al[2] = *reinterpret_cast<const uint32_t*>(&pl[g][kc + 8 + 2 * q]);
+                    al[3] = *reinterpret_cast<const uint32_t*>(&pl[g + 8][kc + 8 + 2 * q]);
+#pragma unroll
+                    for (int nt = 0; nt < 16; ++nt) {
+                        const int dim = warp * 128 + nt * 8 + g;
+                        uint32_t b[2];
+                        b[0] = pack2(ks[kc + 2 * q][dim], ks[kc + 2 * q + 1][dim]);
+                        b[1] = pack2(ks[kc + 8 + 2 * q][dim], ks[kc + 9 + 2 * q][dim]);
+                        mma_bf16_16816(acc[nt], ah, b);
+                        mma_bf16_16816(acc[nt], al, b);
+                    }
                 }
             }
             __syncthreads();
@@ -472,6 +488,21 @@ extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
         o1[0] = __float2bfloat16_rn(acc[nt][2] / d1); o1[1] = __float2bfloat16_rn(acc[nt][3] / d1);
     }
 }
+
+
+
+// Tensor-core prefill entry (16-key tiles). MEASURED AND DROPPED (attn gate 2026-09-22, real
+// fixture T=148): 32-key tiles 0.85x (slower); cp.async double-buffered gather 1.01x (bit-
+// identical to this, no gain: the kernel is not gather-latency bound). It sits ~3x above the
+// bf16 MMA compute roof, a third of which is the deliberate P_hi + P_lo second MMA.
+extern "C" __global__ void __launch_bounds__(MNT) dsv41_sparse_attn_mma(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
+    const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
+    __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    sparse_attn_mma_body<16>(Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
 
 // PRODUCTION entry. grid (T, NH / 8), block 256. CIDX may be null (window-only layers 0/1).
 extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn(
@@ -791,6 +822,7 @@ int main() {
                         "| CTRL compressed rows dropped: %zu differ | T=%d: one-pass %.3f ms, mma %.3f ms (%.1fx)\n",
                         mbad, no, 100.0 * (1.0 - (double)mbad / no), em.rel, eo.rel, cbad, T, t_one, t_mma, t_one / t_mma);
             prod_ok = prod_ok && em.rel <= 1e-5 + eo.rel && (double)mbad / no <= 0.01 && cbad > no / 2;
+
         }
         cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
     }

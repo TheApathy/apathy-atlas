@@ -420,3 +420,27 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_gemm_f32_nt(
         for (int j = 0; j < 4; ++j)
             if (m0 + tm + i < M && n0 + tn + j < N) C[(size_t)(m0 + tm + i) * N + n0 + tn + j] = acc[i][j];
 }
+
+// Small-N bf16 projection for the indexer's head weights: out[m, n] = bf16(sum_k x[m,k] w[n,k]),
+// fp32 accumulate. One block per row m, warp w owns outputs n = w, w+8, ...; each lane walks
+// k = 2*lane + 64*i in a fixed order, then a fixed shuffle tree -> deterministic and row-invariant
+// by construction (replaces 32 cuBLASLt calls of 16 rows at N=32). K % 64 == 0.
+extern "C" __global__ void __launch_bounds__(256) dsv41_gemm_bf16_smalln(
+    const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ OUT,
+    int N, int K)
+{
+    const int m = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(X + (size_t)m * K);
+    for (int n = warp; n < N; n += 8) {
+        const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(W + (size_t)n * K);
+        float s = 0.f;
+        for (int i = lane; i < K / 2; i += 32) {
+            const float2 xv = __bfloat1622float2(x2[i]);
+            const float2 wv = __bfloat1622float2(w2[i]);
+            s = fmaf(xv.x, wv.x, s);
+            s = fmaf(xv.y, wv.y, s);
+        }
+        for (int off = 16; off; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        if (lane == 0) OUT[(size_t)m * N + n] = __float2bfloat16_rn(s);
+    }
+}

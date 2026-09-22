@@ -68,7 +68,7 @@ fn build_lanes(
     use crate::layers::deepseek_v41_attn::core::Dsv41SparseCore;
     use crate::weight_loader::deepseek_v41::cb3_arena::{Cb3ExpertArena, resolve_packed_keep};
     use crate::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
-    let core = std::sync::Arc::new(Dsv41SparseCore::load(gpu, store, config, max_seq, max_chunk, fwd.freqs_c)?);
+    let core = std::sync::Arc::new(Dsv41SparseCore::load(shared, store, config, max_seq, max_chunk, fwd.freqs_c)?);
     let pack_dir = model_dir.join("k154-cb3");
     let manifest = std::fs::read_to_string(pack_dir.join("manifest.json"))
         .with_context(|| format!("DeepSeek-V4.1 expert pack manifest at {}", pack_dir.display()))?;
