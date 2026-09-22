@@ -35,7 +35,6 @@ use atlas_core::config::{ExpertPack, SERVED_PACKED_KEEP};
 use spark_model::layers::deepseek_v41_attn::core::Dsv41SparseCore;
 use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{Cb3RoutedMoe, RouterF32};
-use spark_model::layers::deepseek_v41_attn::core::Dsv41SparseCore;
 use spark_model::weight_loader::deepseek_v41::forward::{PassHook, PassKind, PrefillMode, V41Forward, V41Seq};
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
@@ -231,6 +230,8 @@ fn run_model_path(
     moe_real: bool,
     attn_real: bool,
     decode_n: usize,
+    force_decode: bool,
+    warm_prefill: bool,
 ) -> Result<()> {
     let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
     let max_chunk = chunks.iter().map(|c| c.1).max().unwrap_or(1);
@@ -272,23 +273,53 @@ fn run_model_path(
     if decode_n > 0 {
         let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(ref_dir.join("manifest.json"))?)?;
         let want: Vec<u32> = m["greedy_continuation"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()).unwrap_or_default();
-        let mut got = vec![arg as u32];
+        // Per step: our top-5, the oracle's token and its logit under OUR distribution, and the
+        // margin top1 - logit(oracle token). With --force-decode the INPUT at each step is the
+        // oracle's token (teacher forcing), so every step is conditioned on the oracle's prefix.
+        let report = |step: usize, v: &[f32]| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.select_nth_unstable_by(5, |&a, &b| v[b].total_cmp(&v[a]));
+            let mut top: Vec<usize> = idx[..5].to_vec();
+            top.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+            let o = want.get(step).copied();
+            let (ol, margin) = match o {
+                Some(t) => (v[t as usize], v[top[0]] - v[t as usize]),
+                None => (f32::NAN, f32::NAN),
+            };
+            println!(
+                "step {step:2}: ours {:6} oracle {:6?} | logit(oracle) {ol:7.3} margin {margin:6.3} | top5 {:?}",
+                top[0], o, top.iter().map(|&i| (i, v[i])).collect::<Vec<_>>()
+            );
+            top[0] as u32
+        };
+        let to_f32 = |h: &[u8]| -> Vec<f32> { h.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect() };
+        let mut got = vec![report(0, &v)];
         let t1 = std::time::Instant::now();
-        for _ in 1..decode_n {
-            let tok = *got.last().unwrap();
-            fwd.decode(ops, &mut seq, tok, hook, core, moe, &Tap::off(), logits)?;
+        for step in 1..decode_n {
+            let input = if force_decode { want[step - 1] } else { *got.last().unwrap() };
+            fwd.decode(ops, &mut seq, input, hook, core, moe, &Tap::off(), logits)?;
             ops.gpu.synchronize(ops.stream)?;
             ops.gpu.copy_d2h(logits, &mut host)?;
-            let v: Vec<f32> = host.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
-            let a = v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
-            got.push(a as u32);
+            got.push(report(step, &to_f32(&host)));
         }
         let dt = t1.elapsed().as_secs_f64();
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
-        println!("decode: {} tokens in {dt:.2}s ({:.2} tok/s)", got.len() - 1, (got.len() - 1) as f64 / dt);
+        let matches = got.iter().zip(&want).filter(|(a, b)| a == b).count();
+        println!("decode ({}): {} steps in {dt:.2}s ({:.2} tok/s)", if force_decode { "teacher-forced" } else { "free" }, got.len() - 1, (got.len() - 1) as f64 / dt);
         println!("decode ours:   {got:?}");
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
-        println!("decode: first {agree} of {} greedy tokens identical to the oracle", got.len());
+        println!("decode: first {agree} identical; top-1 agreement {matches}/{}", got.len().min(want.len()));
+    }
+    if warm_prefill {
+        // Second prefill of the same prompt in the same process: weights, arena, kernels and
+        // cuBLASLt heuristics warm; engram rows now in page cache. Fresh sequence state.
+        let mut seq2 = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
+        ops.gpu.synchronize(ops.stream)?;
+        let t0 = std::time::Instant::now();
+        fwd.prefill(ops, &mut seq2, ids, PrefillMode::Replay, hook, core, moe, &Tap::off(), logits)?;
+        ops.gpu.synchronize(ops.stream)?;
+        let dt = t0.elapsed().as_secs_f64();
+        println!("WARM prefill: {} tokens in {dt:.3}s = {:.1} tok/s (chunk {max_chunk}, replay 128, engram page-cache warm)", ids.len(), ids.len() as f64 / dt);
     }
     println!("DONE dsv41_forward path=model");
     Ok(())
@@ -305,6 +336,8 @@ fn main() -> Result<()> {
     let mut moe_real = false;
     let mut attn_real = false;
     let mut decode_n = 0usize;
+    let mut force_decode = false;
+    let mut warm_prefill = false;
     let mut engram_live = false;
     let mut head_test = false;
     let mut core_real = false;
@@ -335,6 +368,8 @@ fn main() -> Result<()> {
             "--moe-real" => moe_real = true,
             "--attn-real" => attn_real = true,
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
+            "--force-decode" => force_decode = true,
+            "--warm-prefill" => warm_prefill = true,
             "--path" => {
                 model_path = match args.next().context("--path")?.as_str() {
                     "model" => true,
@@ -387,7 +422,7 @@ fn main() -> Result<()> {
     let stream = gpu.default_stream();
     let ops = Ops { gpu: gpu.as_ref(), k: &kernels, stream };
     if model_path {
-        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n);
+        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n, force_decode, warm_prefill);
     }
     let blocks: Vec<V41BlockWeights> = (0..n_layers).map(|l| V41BlockWeights::load(&store, l, &dims, &ops)).collect::<Result<_>>()?;
     let largest = blocks
