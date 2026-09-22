@@ -32,6 +32,10 @@
 //     at T=2048, 24.3 vs 18.8 at T=512, 17.0 vs 14.0 at T=128. Concentrating the decode on
 //     4 warps made it the critical path: decode, not MMA, bounds this kernel (ncu: tensor
 //     pipe 28.7%, IPC 1.12). The lever is cheaper or less redundant decode, not overlap.
+//   - Deeper pipelining (3-stage cp.async activation ring + packed weight bytes fetched TWO
+//     K steps ahead, 73.7 KB dynamic smem): bit-identical, but 35.3 vs 28.7 ms at T=2048,
+//     21.7 vs 17.2 at T=512, 16.7 vs 13.0 at T=128 (6 interleaved rounds). Exposed load
+//     latency is not what bounds a step either.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
@@ -402,125 +406,5 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
     for (int idx = threadIdx.x; idx < BM * BN; idx += THREADS) {
         const int row = idx / BN, col = idx % BN;
         if (row < rows) out[(long long)(row_begin + row) * N + n0 + col] = s_out[row][col];
-    }
-}
-
-// =====================================================================================
-// GEMV path for FEW rows per expert (decode, and small-T tails): no shared memory, no MMA.
-//
-// At T=1 the 128-row MMA tile above decodes a whole expert to multiply ONE row: measured
-// 0.94 ms/layer for 6 experts (212 M weights) against a ~0.4 ms read floor. Here one warp
-// owns one output row n; each lane takes 32-weight scale groups (g = lane, lane + 32, ...),
-// decodes them in registers and dots them with up to GEMV_ROWS activation rows read
-// straight from global (L1/L2), then a warp shuffle reduces. Same decoded values, fp32
-// accumulate; only the summation order differs from the MMA path.
-//
-// WORK LIST: {row_begin, rows <= GEMV_ROWS, slot, 0}. Grid: (N / GEMV_WARPS, num_tiles).
-// =====================================================================================
-namespace {
-constexpr int GEMV_ROWS = 4;
-constexpr int GEMV_WARPS = 8;
-
-/// GEMV alias of `decode32`: the weights stay in registers.
-__device__ __forceinline__ void decode_group_regs(const Raw& r, uint2 cb, int k0, uint32_t (&out)[16]) {
-    decode32(r, cb, k0, out);
-}
-
-__device__ __forceinline__ float bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
-__device__ __forceinline__ float bf16_hi(uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); }
-
-/// acc[r] += dot(x[r][k0 .. k0+32), w[0..32)) for the tile's rows.
-__device__ __forceinline__ void dot_group(const __nv_bfloat16* __restrict__ x, int row_begin, int rows,
-                                          int K, int k0, const uint32_t (&w)[16], float (&acc)[GEMV_ROWS]) {
-#pragma unroll
-    for (int r = 0; r < GEMV_ROWS; ++r) {
-        if (r >= rows) break;
-        const uint4* xp = reinterpret_cast<const uint4*>(x + (long long)(row_begin + r) * K + k0);
-        float s = 0.0f;
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            const uint4 v = xp[q];
-            const uint32_t xv[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const uint32_t wv = w[q * 4 + e];
-                s += bf16_lo(xv[e]) * bf16_lo(wv);
-                s += bf16_hi(xv[e]) * bf16_hi(wv);
-            }
-        }
-        acc[r] += s;
-    }
-}
-
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
-    return v;
-}
-}  // namespace
-
-extern "C" __global__ void __launch_bounds__(GEMV_WARPS * 32) cb3_moe_gemv_gate_up(
-    const __nv_bfloat16* __restrict__ act,
-    const int4* __restrict__ tiles,
-    const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
-    const uint8_t* w3_lo, const uint8_t* w3_hi, const uint8_t* w3_cb, const uint8_t* w3_sc,
-    unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
-    const float* __restrict__ row_weight,
-    __nv_bfloat16* __restrict__ h,
-    int N, int K, float limit) {
-    const int4 tile = tiles[blockIdx.y];
-    const int row_begin = tile.x, rows = tile.y, slot = tile.z;
-    const int lane = threadIdx.x % 32;
-    const long long n = (long long)blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
-    const Cb3Planes p1 = planes_for(w1_lo, w1_hi, w1_cb, w1_sc, lo_s, hi_s, cb_s, sc_s, slot);
-    const Cb3Planes p3 = planes_for(w3_lo, w3_hi, w3_cb, w3_sc, lo_s, hi_s, cb_s, sc_s, slot);
-    const uint2 cb1 = *reinterpret_cast<const uint2*>(p1.cb + n * 8);
-    const uint2 cb3 = *reinterpret_cast<const uint2*>(p3.cb + n * 8);
-    float ag[GEMV_ROWS] = {}, au[GEMV_ROWS] = {};
-    for (int k0 = lane * 32; k0 < K; k0 += 32 * 32) {
-        uint32_t w[16];
-        decode_group_regs(fetch_group(p1, n, k0, K), cb1, k0, w);
-        dot_group(act, row_begin, rows, K, k0, w, ag);
-        decode_group_regs(fetch_group(p3, n, k0, K), cb3, k0, w);
-        dot_group(act, row_begin, rows, K, k0, w, au);
-    }
-#pragma unroll
-    for (int r = 0; r < GEMV_ROWS; ++r) {
-        const float gsum = warp_sum(ag[r]);
-        const float usum = warp_sum(au[r]);
-        if (lane == 0 && r < rows) {
-            const float g = fminf(gsum, limit);
-            const float u = fminf(fmaxf(usum, -limit), limit);
-            const float sig = 1.0f / (1.0f + expf(-g));
-            const float hv = g * sig * u;
-            const long long prow = row_begin + r;
-            h[prow * N + n] = __float2bfloat16(hv * row_weight[prow]);
-        }
-    }
-}
-
-extern "C" __global__ void __launch_bounds__(GEMV_WARPS * 32) cb3_moe_gemv_down(
-    const __nv_bfloat16* __restrict__ hin,
-    const int4* __restrict__ tiles,
-    const uint8_t* w2_lo, const uint8_t* w2_hi, const uint8_t* w2_cb, const uint8_t* w2_sc,
-    unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
-    float* __restrict__ out,
-    int N, int K) {
-    const int4 tile = tiles[blockIdx.y];
-    const int row_begin = tile.x, rows = tile.y, slot = tile.z;
-    const int lane = threadIdx.x % 32;
-    const long long n = (long long)blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
-    const Cb3Planes p2 = planes_for(w2_lo, w2_hi, w2_cb, w2_sc, lo_s, hi_s, cb_s, sc_s, slot);
-    const uint2 cb = *reinterpret_cast<const uint2*>(p2.cb + n * 8);
-    float acc[GEMV_ROWS] = {};
-    for (int k0 = lane * 32; k0 < K; k0 += 32 * 32) {
-        uint32_t w[16];
-        decode_group_regs(fetch_group(p2, n, k0, K), cb, k0, w);
-        dot_group(hin, row_begin, rows, K, k0, w, acc);
-    }
-#pragma unroll
-    for (int r = 0; r < GEMV_ROWS; ++r) {
-        const float s = warp_sum(acc[r]);
-        if (lane == 0 && r < rows) out[(long long)(row_begin + r) * N + n] = s;
     }
 }

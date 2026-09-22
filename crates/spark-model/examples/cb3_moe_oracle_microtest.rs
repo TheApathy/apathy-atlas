@@ -102,8 +102,7 @@ fn main() -> Result<()> {
     let mut control = MoeControl::None;
     let mut dump: Option<PathBuf> = None;
     let mut kernel = ExpertKernel::Reconstruct;
-    let mut gemv_max: Option<usize> = None;
-    let mut gemv_pass_t: Option<usize> = None;
+    let mut leak_control = false;
     let mut invariance: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -112,9 +111,10 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
-            "--gemv-pass-t" => gemv_pass_t = Some(args.next().context("--gemv-pass-t")?.parse()?),
+            // NEGATIVE CONTROL for the ownership check: cycles 2-3 load the arena UNOWNED (the
+            // old never-free behaviour); the check must then FAIL.
+            "--leak-control" => leak_control = true,
             "--invariance" => invariance = Some(args.next().context("--invariance needs SPLIT[;SPLIT]")?),
-            "--gemv-max-rows" => gemv_max = Some(args.next().context("--gemv-max-rows")?.parse()?),
             "--kernel" => {
                 kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
                     "fused" => ExpertKernel::Fused,
@@ -193,13 +193,7 @@ fn main() -> Result<()> {
     moe.set_pass_tokens(pass_ids);
     moe.set_control(control);
     moe.set_expert_kernel(kernel);
-    if let Some(t) = gemv_pass_t {
-        moe.set_gemv_pass_t(t);
-    }
-    if let Some(rows) = gemv_max {
-        moe.set_gemv_max_rows(rows);
-    }
-    println!("  expert kernel: {kernel:?}, gemv_max_rows {gemv_max:?}");
+    println!("  expert kernel: {kernel:?}");
     if control != MoeControl::None {
         println!("  [control {control:?}] — MUST FAIL");
     }
@@ -308,30 +302,66 @@ fn main() -> Result<()> {
         }
         moe.set_pass_tokens(pass_ids);
         println!("  CHUNK INVARIANCE: {}", if all_identical { "BYTE-IDENTICAL" } else { "DIFFERS" });
-        if control == MoeControl::None && gemv_pass_t.is_none() {
+        // Only the production path must be invariant; `--kernel reconstruct` (cuBLASLt per
+        // expert, M = its row count) is the control that is expected to DIFFER.
+        if control == MoeControl::None && kernel == ExpertKernel::Fused {
             ensure!(all_identical, "the routed MoE is not chunk-invariant");
         }
     }
 
-    // OWNERSHIP CHECK on the real driver: the MoE and the arena free on drop. The arena is
-    // 1.79 GB and the MoE scratch is sized by T, so "most of it came back" is a real check;
-    // the control is the loaded state (free memory must have DROPPED by >= the arena first).
+    // OWNERSHIP CHECK on the real driver. Cycle 1 also pays process-global one-time costs
+    // (cuBLASLt handle + 64 MB workspace + its lazily loaded kernels), which are NOT a leak, so
+    // the leak test is REPEATED cycles: load 1.79 GB + scratch, run a pass, drop — cycles 2 and
+    // 3 must each return >= 95% of what they took, and free memory must not drift between
+    // cycles. (free_memory on GB10 is system-wide unified memory, so other processes add noise;
+    // the thresholds are loose on purpose and the numbers are printed either way.)
     let free_loaded = gpu.free_memory()? as i64;
     drop(moe); // frees the scratch, tiles and router weights; the arena goes with its last Arc
     let free_after = gpu.free_memory()? as i64;
-    let taken = free_before - free_loaded;
-    let returned = free_after - free_loaded;
+    let (taken, returned) = (free_before - free_loaded, free_after - free_loaded);
     println!(
-        "  ownership: load took {:.3} GB, drop returned {:.3} GB ({:.1}%)",
+        "  ownership cycle 1: load took {:.3} GB, drop returned {:.3} GB ({:.1}%) — includes one-time global state",
         taken as f64 / 1e9,
         returned as f64 / 1e9,
         100.0 * returned as f64 / taken.max(1) as f64
     );
     ensure!(taken >= 1_700_000_000, "loading one layer took only {taken} bytes — the check cannot see a leak");
-    ensure!(
-        returned as f64 >= 0.95 * taken as f64,
-        "dropping the MoE returned only {returned} of {taken} bytes — something still owns device memory"
-    );
+    let mut prev_after = free_after;
+    for cycle in 2..=3 {
+        let before = gpu.free_memory()? as i64;
+        let arena = Arc::new(if leak_control {
+            Cb3ExpertArena::load_one_layer_unowned(&pack_dir, &pack, layer, gpu)?
+        } else {
+            Cb3ExpertArena::load_one_layer(&pack_dir, &pack, layer, &shared)?
+        });
+        let router = router_from_checkpoint(layer, hidden, gpu)?;
+        let again = Cb3RoutedMoe::new(shared.clone(), kernels, &config, arena, vec![(layer, router)], limit, route_scale, tokens)?;
+        again.set_pass_tokens(pass_ids);
+        again.forward(&Ops { gpu, k: &kernels, stream }, layer, d_in, d_out, tokens)?;
+        gpu.synchronize(stream)?;
+        let loaded = gpu.free_memory()? as i64;
+        drop(again);
+        let after = gpu.free_memory()? as i64;
+        let (took, gave) = (before - loaded, after - loaded);
+        println!(
+            "  ownership cycle {cycle}: took {:.3} GB, returned {:.3} GB ({:.1}%), drift vs previous cycle {:+.3} GB",
+            took as f64 / 1e9,
+            gave as f64 / 1e9,
+            100.0 * gave as f64 / took.max(1) as f64,
+            (after - prev_after) as f64 / 1e9
+        );
+        ensure!(took >= 1_700_000_000, "cycle {cycle} took only {took} bytes — the check cannot see a leak");
+        // Asserted on the LAST cycle only. Measured (dsv41-engine, 11 runs): cycle 2 still
+        // returns only 93-95% (drift ~-0.13 GB) and cycle 3 returns 99.5-101% (drift
+        // -0.014..+0.025 GB), so one-time costs spread over two cycles; the leak control
+        // (--leak-control) returns 4.6% with drift -1.91 GB. The first version of this
+        // check asserted cycle 2 and failed on every production run — recorded, not hidden.
+        if cycle == 3 {
+            ensure!(gave as f64 >= 0.95 * took as f64, "cycle {cycle}: drop returned only {gave} of {took} bytes");
+            ensure!(after - prev_after > -256_000_000, "cycle {cycle}: free memory drifted down by {} bytes", prev_after - after);
+        }
+        prev_after = after;
+    }
 
     if control != MoeControl::None {
         let floor = TOL * MIN_SEPARATION;
