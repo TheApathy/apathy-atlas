@@ -132,10 +132,14 @@ struct ProjAttention<'a> {
     core: &'a dyn AttnCore,
     tap: &'a Tap,
     norm_eps: f32,
+    rope_swap: bool,
 }
 impl V41AttentionBlock for ProjAttention<'_> {
     fn forward(&self, _ops: &Ops, layer: usize, x: DevicePtr, out: DevicePtr, t: usize, start: usize) -> Result<()> {
-        let rope = if compress_ratio(layer) != 0 { &self.freqs_c } else { &self.freqs_w };
+        // NEGATIVE CONTROL (--control rope-swap): each layer gets the OTHER table. Runs, is
+        // finite, and must fail q / kv_new on every layer.
+        let yarn = (compress_ratio(layer) != 0) != self.rope_swap;
+        let rope = if yarn { &self.freqs_c } else { &self.freqs_w };
         attn_block::attention(
             self.ops, &self.weights[layer], &self.scratch, self.wscratch, rope, self.rings[layer],
             x, out, t, start, 0, self.norm_eps, self.core, self.tap,
@@ -179,6 +183,7 @@ fn main() -> Result<()> {
     let mut feed: Vec<String> = Vec::new();
     let mut tap_dir: Option<PathBuf> = None;
     let mut control = BlockControl::None;
+    let mut rope_swap = false;
     let mut engram_live = false;
     let mut head_test = false;
     let mut args = std::env::args().skip(1);
@@ -199,6 +204,10 @@ fn main() -> Result<()> {
             "--control" => {
                 control = match args.next().context("--control")?.as_str() {
                     "own-pre" => BlockControl::OwnPre,
+                    "rope-swap" => {
+                        rope_swap = true;
+                        BlockControl::None
+                    }
                     o => bail!("unknown control {o}"),
                 }
             }
@@ -277,6 +286,7 @@ fn main() -> Result<()> {
             core: &fed_core,
             tap: &tap,
             norm_eps: dims.norm_eps,
+            rope_swap,
         };
         &proj_attn
     } else {
