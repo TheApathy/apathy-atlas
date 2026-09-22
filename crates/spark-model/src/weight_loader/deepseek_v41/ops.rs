@@ -195,7 +195,7 @@ pub struct Dsv41Kernels {
 /// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
 pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
 
-/// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): at T = 1, `hc_mixes` runs as 25 blocks + an epilogue instead of one
+/// ON by default (`ATLAS_DSV41_HC_SPLIT=0` turns it off): on decode-kind passes of <= 16 rows, `hc_mixes` runs as 25 x T blocks + an epilogue instead of one
 /// block per token. Bit-identical by construction (same per-thread order, same tree).
 pub const HC_SPLIT_ENV: &str = "ATLAS_DSV41_HC_SPLIT";
 /// Bytes of the split hc_mixes' partials: 25 floats (24 mixes + the sum of squares) per token row.
@@ -320,14 +320,16 @@ impl Ops<'_> {
     #[allow(clippy::too_many_arguments)]
     /// `raw` is the split path's partials buffer ([`HC_RAW_BYTES`], `PassScratch::hc_raw`).
     pub fn hc_mixes(&self, h: DevicePtr, hc: &HcParams, pre: DevicePtr, post: DevicePtr, comb: DevicePtr, t: usize, d: usize, iters: u32, eps: f32, hc_eps: f32, raw: DevicePtr) -> Result<()> {
-        if let Some((dot, finish)) = self.k.hc_split.filter(|_| t == 1 && decode_pass() && !raw.is_null()) {
+        // Decode-kind passes up to MM_TILE rows (T=1 decode, T=6 DSpark verify): 25 x T blocks, each
+        // token's arithmetic exactly the one-block kernel's (bit-identical at any T).
+        if let Some((dot, finish)) = self.k.hc_split.filter(|_| t >= 1 && t <= MM_TILE && decode_pass() && !raw.is_null()) {
             KernelLaunch::new(self.gpu, dot)
-                .grid([25, 1, 1])
+                .grid([25, t as u32, 1])
                 .block([BLOCK, 1, 1])
                 .arg_ptr(h).arg_ptr(hc.func).arg_ptr(raw).arg_u32(d as u32)
                 .launch(self.stream)?;
             return KernelLaunch::new(self.gpu, finish)
-                .grid([1, 1, 1])
+                .grid([t as u32, 1, 1])
                 .block([32, 1, 1])
                 .arg_ptr(raw).arg_ptr(hc.scale).arg_ptr(hc.base)
                 .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
