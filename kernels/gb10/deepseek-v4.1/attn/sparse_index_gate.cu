@@ -15,7 +15,7 @@
 // Controls, each REQUIRED to change the selection (else the claim is UNRUNNABLE):
 //   no bf16 rounding of the dot; compress_lens off by one row; candidate mask dropped (L24).
 
-#include "sparse_index.cu"
+#include "../cb3/dsv41_sparse_index.cu"
 
 #include <algorithm>
 #include <cmath>

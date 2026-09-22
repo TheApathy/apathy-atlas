@@ -46,7 +46,7 @@ fn byte(sum: i64) -> u8 {
     (sum >> FRACTION).clamp(0, 255) as u8
 }
 
-pub(super) fn resize(source: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
+pub(crate) fn resize(source: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
     super::validate_source_size(source.width(), source.height())?;
     super::validate_source_size(width, height)?;
     super::validate_source_size(width, source.height())?;
@@ -87,7 +87,7 @@ pub(super) fn resize(source: &RgbImage, width: u32, height: u32) -> Result<RgbIm
     }))
 }
 
-pub(super) fn pad(source: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
+pub(crate) fn pad(source: &RgbImage, width: u32, height: u32) -> Result<RgbImage> {
     super::validate_source_size(width, height)?;
     super::validate_source_size(source.width(), source.height())?;
     let ratio = f64::from(source.width()) / f64::from(source.height());

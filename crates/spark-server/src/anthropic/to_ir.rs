@@ -132,6 +132,7 @@ impl From<MessagesRequest> for ir::ChatRequest {
             seed: None,
             timeout_secs: None,
             return_token_ids: false,
+            raw_openai_body: None,
         }
     }
 }

@@ -13,6 +13,9 @@ use std::ffi::c_void;
 
 use super::*;
 
+/// `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK` (u32).
+const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
+
 /// Element type of a GEMM operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmDtype {
@@ -32,7 +35,8 @@ impl GemmDtype {
 /// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ` with explicit row strides (`lda` for `act`,
 /// `ldc` for `out`, in elements; the weight is packed `[N,K]`), fp32 accumulate.
 ///
-/// `in_dtype` applies to both `act` and `weight`; `out_dtype` to `out`.
+/// `in_dtype` applies to both `act` and `weight`; `out_dtype` to `out`. cuBLASLt's default
+/// heuristic (split-K allowed). See [`gemm_act_weight_t_typed_ex`] for the no-split-K form.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_act_weight_t_typed(
     act: u64,
@@ -45,6 +49,88 @@ pub fn gemm_act_weight_t_typed(
     k: u32,
     in_dtype: GemmDtype,
     out_dtype: GemmDtype,
+    stream: u64,
+) -> Result<()> {
+    gemm_act_weight_t_typed_ex(act, lda, weight, out, ldc, m, n, k, in_dtype, out_dtype, false, stream)
+}
+
+/// [`gemm_act_weight_t_typed`] with a PER-CALL reduction policy. `no_split_k = true` restricts
+/// the heuristic to algorithms that do not split K
+/// (`CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK = 0`), so a row's sum is accumulated in one
+/// order whatever M is.
+///
+/// Why per call and not global: this file is shared across models, and the only caller that
+/// needs it measured it. dsv41-attention, on DeepSeek-V4.1's L20 compressor (16x512x5120,
+/// runF_faithful): default heuristic (split-K chosen) ckv 70.7% bf16-exact, top-k 296/512 rows
+/// wrong; split-K with fp32 reduction (mask 2) 97.75% / 53/512; mask 0 100.00% / 1/512.
+/// (The integrate/all-models branch has a separate deterministic-SELECTION fix for the tuned
+/// bf16 path in cublaslt.rs — tie-breaking between measured candidates. It does not restrict
+/// the reduction scheme and does not cover this untuned typed path.)
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_act_weight_t_typed_ex(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
+    stream: u64,
+) -> Result<()> {
+    typed_impl(act, lda, weight, out, ldc, m, n, k, in_dtype, out_dtype, no_split_k, None, stream)
+}
+
+/// [`gemm_act_weight_t_typed_ex`] with ONE algorithm per shape, independent of M: the heuristic
+/// runs once per (n, k, lda, ldc, dtypes, no_split_k) at M = `ref_m`, and that algorithm is then
+/// issued at the TRUE M of every call. With a fixed tile configuration and no split-K, an output
+/// element's K-loop does not depend on how many rows share the call, so results become
+/// M-invariant without padding M (the property DeepSeek-V4.1's chunk invariance needs).
+/// Measured, not assumed: see bench/dsv41/compare_splits.py.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_act_weight_t_typed_pinned(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
+    ref_m: u32,
+    stream: u64,
+) -> Result<()> {
+    typed_impl(act, lda, weight, out, ldc, m, n, k, in_dtype, out_dtype, no_split_k, Some(ref_m), stream)
+}
+
+type PinKey = (u32, u32, u32, u32, i32, i32, bool, u32);
+
+fn pinned_algos() -> &'static std::sync::Mutex<std::collections::HashMap<PinKey, [u8; 128]>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PinKey, [u8; 128]>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_impl(
+    act: u64,
+    lda: u32,
+    weight: u64,
+    out: u64,
+    ldc: u32,
+    m: u32,
+    n: u32,
+    k: u32,
+    in_dtype: GemmDtype,
+    out_dtype: GemmDtype,
+    no_split_k: bool,
+    pin_ref_m: Option<u32>,
     stream: u64,
 ) -> Result<()> {
     if lda < k || ldc < n {
@@ -89,20 +175,59 @@ pub fn gemm_act_weight_t_typed(
             ),
             "PrefWorkspace",
         )?;
+        if no_split_k {
+            let mask: u32 = 0;
+            chk(
+                cublasLtMatmulPreferenceSetAttribute(
+                    pref,
+                    PREF_REDUCTION_SCHEME_MASK,
+                    &mask as *const u32 as *const c_void,
+                    std::mem::size_of::<u32>(),
+                ),
+                "PrefReductionScheme",
+            )?;
+        }
         let mut result = [0u8; 128];
         let mut returned: i32 = 0;
-        let heur = cublasLtMatmulAlgoGetHeuristic(
-            ctx.handle,
-            desc,
-            la,
-            lb,
-            ld_,
-            ld_,
-            pref,
-            1,
-            result.as_mut_ptr() as *mut c_void,
-            &mut returned,
-        );
+        let pin_key: Option<PinKey> =
+            pin_ref_m.map(|r| (n, k, lda, ldc, ti, to, no_split_k, r));
+        let cached = pin_key.and_then(|key| pinned_algos().lock().ok()?.get(&key).copied());
+        let heur = if let Some(c) = cached {
+            result = c;
+            returned = 1;
+            0
+        } else if let Some(r) = pin_ref_m {
+            // Choose the algorithm at the REFERENCE M, then reuse it at every M.
+            let mut lb_r: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            let mut ld_r: cublasLtMatrixLayout_t = std::ptr::null_mut();
+            chk(cublasLtMatrixLayoutCreate(&mut lb_r, ti, k as u64, r as u64, lda as i64), "LayoutBref")?;
+            chk(cublasLtMatrixLayoutCreate(&mut ld_r, to, n as u64, r as u64, ldc as i64), "LayoutDref")?;
+            let h = cublasLtMatmulAlgoGetHeuristic(
+                ctx.handle, desc, la, lb_r, ld_r, ld_r, pref, 1,
+                result.as_mut_ptr() as *mut c_void, &mut returned,
+            );
+            cublasLtMatrixLayoutDestroy(lb_r);
+            cublasLtMatrixLayoutDestroy(ld_r);
+            if h == 0 && returned >= 1 {
+                if let (Some(key), Ok(mut t)) = (pin_key, pinned_algos().lock()) {
+                    t.insert(key, result);
+                }
+            }
+            h
+        } else {
+            cublasLtMatmulAlgoGetHeuristic(
+                ctx.handle,
+                desc,
+                la,
+                lb,
+                ld_,
+                ld_,
+                pref,
+                1,
+                result.as_mut_ptr() as *mut c_void,
+                &mut returned,
+            )
+        };
         let status = if heur != 0 || returned < 1 {
             None
         } else {

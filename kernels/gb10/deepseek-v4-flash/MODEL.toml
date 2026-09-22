@@ -55,19 +55,19 @@ model_type = "deepseek_v4"
 # o_lora_rank > 0 distinguishes Flash from V3/V4-Pro.
 
 # Recommended sampling (DeepSeek V4 family defaults).
-[sampling.thinking]
+[sampling.thinking_text]
 temperature = 1.0
 top_p = 1.0
 top_k = 0
 presence_penalty = 0.0
 
-[sampling.coding]
+[sampling.thinking_coding]
 temperature = 1.0
 top_p = 1.0
 top_k = 0
 presence_penalty = 0.0
 
-[sampling.general]
+[sampling.non_thinking]
 temperature = 1.0
 top_p = 0.95
 top_k = 20

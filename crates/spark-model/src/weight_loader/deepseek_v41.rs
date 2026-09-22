@@ -24,11 +24,14 @@
 //! over `crates/` and `kernels/` finds only documentation. Both need box time to verify,
 //! so the seam is here, documented, against a tested shard reader.
 
+pub mod attn_block;
 pub mod cb3_arena;
+pub mod forward;
 pub mod fwd;
 pub mod indexer;
 pub mod layer;
 mod load_layers;
+pub use load_layers::resolve_model_dir;
 pub mod ops;
 pub mod moe;
 pub mod moe_forward;
@@ -60,6 +63,17 @@ pub fn v41_key(prefix: &str, suffix: &str) -> String {
     } else {
         format!("{prefix}.{suffix}")
     }
+}
+
+/// Tensors the SERVING weight store must never load for DeepSeek-V4.1.
+///
+/// - `layers.{1,14}.engram.embed.*`: two ~95 GB tables. They cannot fit next to the expert
+///   arena on a 119.7 GB box and are row-gathered from NVMe by the engram lane. Uploading them
+///   would over-allocate unified memory, which takes the HOST down, not the process.
+/// - `mtp.*`: the three DSpark modules (incl. in-shard FP8 routed experts). Nothing consumes
+///   them until MTP is ported; loading them is pure memory cost.
+pub fn skip_tensor_for_serving(name: &str) -> bool {
+    name.contains(".engram.embed.") || name.starts_with("mtp.")
 }
 
 /// DeepSeek-V4.1-Flash-Next weight loader.

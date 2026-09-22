@@ -32,7 +32,7 @@ use spark_model::weight_loader::deepseek_v41::cb3_arena::Cb3ExpertArena;
 use spark_model::weight_loader::deepseek_v41::moe_forward::{
     Cb3RoutedMoe, ExpertKernel, ExpertWork, ROUTER_EXPERTS, RouterF32, TOP_K,
 };
-use spark_model::weight_loader::deepseek_v41::ops::Dsv41Kernels;
+use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::GpuBackend;
 
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
         moe.set_expert_kernel(ExpertKernel::Fused);
         let fused = time(&mut || moe.forward_routed(layer, d_in, d_out, t, &routing, stream))?;
         let dev_route = time(&mut || moe.route_device(layer, d_in, t, stream).map(|_| ()))?;
-        let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, layer, d_in, d_out, t, stream))?;
+        let full = time(&mut || spark_model::weight_loader::deepseek_v41::fwd::V41RoutedMoe::forward(&moe, &Ops { gpu: &gpu, k: &kernels, stream }, layer, d_in, d_out, t))?;
         println!(
             "      PRODUCTION forward (device router + fused): {full:.2} ms/layer [router {dev_route:.2}] -> {:.1} tok/s MoE-only",
             t as f64 / (LAYERS as f64 * full * 1e-3)

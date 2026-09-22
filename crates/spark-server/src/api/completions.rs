@@ -40,7 +40,29 @@ use super::sanitizer::*;
 /// Resolve an OpenAI `prompt` field into the scheduler's prompt tokens. Text
 /// tokenizes with `add_special_tokens=false` (no BOS); token-ID forms are used
 /// verbatim, range-checked against the vocab (out-of-range → 400).
+///
+/// deepseek_v41 (`AppState::dsv41`) prepends BOS to TEXT prompts that do not
+/// already start with it, as the Python server does (`add_bos` default true).
 fn resolve_prompts(
+    state: &AppState,
+    prompt: &PromptInput,
+) -> Result<Vec<Vec<u32>>, (StatusCode, String)> {
+    let prompts = resolve_prompts_raw(state, prompt)?;
+    let text = matches!(prompt, PromptInput::Text(_) | PromptInput::TextArray(_));
+    let bos = state
+        .dsv41
+        .then(|| state.tokenizer.inner().token_to_id(crate::dsv41::encoding::BOS))
+        .flatten();
+    Ok(match (text, bos) {
+        (true, Some(bos)) => prompts
+            .into_iter()
+            .map(|p| if p.first() == Some(&bos) { p } else { std::iter::once(bos).chain(p).collect() })
+            .collect(),
+        _ => prompts,
+    })
+}
+
+fn resolve_prompts_raw(
     state: &AppState,
     prompt: &PromptInput,
 ) -> Result<Vec<Vec<u32>>, (StatusCode, String)> {

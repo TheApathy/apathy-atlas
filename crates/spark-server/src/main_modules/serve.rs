@@ -738,61 +738,12 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     // flip this bool — this selects the verify architecture, not the pick
     // basis.
     let dflash_verify_raw_argmax = args.dflash;
-    // DS4F hard-limit lane (2026-07-21): install the served-context ceiling so
-    // the scheduler enforces `max_seq_len` per decode step (§C-3), not just as a
-    // KV-allocation ceiling trued-up on completion. Set once, before the
-    // scheduler thread spawns.
-    scheduler::set_max_seq_len(args.max_seq_len);
-    std::thread::spawn(move || {
-        // ATLAS_SCHED_PIN=<core>: pin the scheduler thread to a dedicated
-        // core. Measured 2026-07-25 (LOOP_TRACE): ~1.4 involuntary
-        // preemptions per decode step, each costing ~4ms of re-schedule
-        // latency right after step end (tokio emit/detokenize wakeups win
-        // the core). A dedicated core removes the preemption; the kernel
-        // load-balances the tokio workers onto the remaining cores.
-        if let Ok(core) = std::env::var("ATLAS_SCHED_PIN")
-            && let Ok(core) = core.parse::<usize>()
-        {
-            unsafe {
-                let mut set: libc::cpu_set_t = std::mem::zeroed();
-                libc::CPU_SET(core, &mut set);
-                let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
-                if rc == 0 {
-                    tracing::info!("scheduler thread pinned to core {core}");
-                } else {
-                    tracing::warn!("ATLAS_SCHED_PIN: sched_setaffinity failed (rc={rc})");
-                }
-            }
-        }
-        scheduler::run(
-            scheduler_model,
-            request_rx,
-            rotation_rx,
-            scheduler_eos,
-            max_batch_size,
-            use_speculative,
-            dflash_verify_raw_argmax,
-            num_drafts,
-            policy,
-            max_prefill_tokens,
-            max_batch_tokens,
-            use_self_spec,
-            use_ngram_spec,
-            swap_space_gb,
-            high_speed_swap_cfg,
-            block_size,
-            think_end_token,
-            think_start_token,
-            code_fence_token,
-            tool_call_start_token,
-            tool_call_end_token,
-            grammar_engine,
-            adaptive_sampling,
-            session_manager,
-            scheduler_spontaneous_think_budget,
-        );
-    });
-
+    // ── Every fallible startup step runs BEFORE the scheduler thread spawns.
+    // The detached scheduler takes ownership of the loaded model; an early
+    // `?` after the spawn would return Err while that thread keeps the model's
+    // device memory (~84 GB on DeepSeek-V4.1) unreachable until process exit,
+    // and the next load attempt OOMs this unified-memory host. After the
+    // spawn only infallible wiring remains (the HTTP bind is the exception).
     // Tool call parser resolution: CLI > MODEL.toml > defaults table.
     let tool_call_parser = serve_phases::resolve_tool_call_parser(&args, &ptx_set, &config)?;
 
@@ -926,6 +877,78 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         );
     }
 
+    let deepseek_vision_vocab = config
+        .deepseek_vision
+        .as_ref()
+        .map(|_| u32::try_from(config.vocab_size))
+        .transpose()
+        .context("DeepSeek vocabulary exceeds u32")?;
+
+    // DS4F hard-limit lane (2026-07-21): install the served-context ceiling so
+    // the scheduler enforces `max_seq_len` per decode step (§C-3), not just as a
+    // KV-allocation ceiling trued-up on completion. Set once, before the
+    // scheduler thread spawns.
+    scheduler::set_max_seq_len(args.max_seq_len);
+    std::thread::spawn(move || {
+        // ATLAS_SCHED_PIN=<core>: pin the scheduler thread to a dedicated
+        // core. Measured 2026-07-25 (LOOP_TRACE): ~1.4 involuntary
+        // preemptions per decode step, each costing ~4ms of re-schedule
+        // latency right after step end (tokio emit/detokenize wakeups win
+        // the core). A dedicated core removes the preemption; the kernel
+        // load-balances the tokio workers onto the remaining cores.
+        if let Ok(core) = std::env::var("ATLAS_SCHED_PIN")
+            && let Ok(core) = core.parse::<usize>()
+        {
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::CPU_SET(core, &mut set);
+                let rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+                if rc == 0 {
+                    tracing::info!("scheduler thread pinned to core {core}");
+                } else {
+                    tracing::warn!("ATLAS_SCHED_PIN: sched_setaffinity failed (rc={rc})");
+                }
+            }
+        }
+        scheduler::run(
+            scheduler_model,
+            request_rx,
+            rotation_rx,
+            scheduler_eos,
+            max_batch_size,
+            use_speculative,
+            dflash_verify_raw_argmax,
+            num_drafts,
+            policy,
+            max_prefill_tokens,
+            max_batch_tokens,
+            use_self_spec,
+            use_ngram_spec,
+            swap_space_gb,
+            high_speed_swap_cfg,
+            block_size,
+            think_end_token,
+            think_start_token,
+            code_fence_token,
+            tool_call_start_token,
+            tool_call_end_token,
+            grammar_engine,
+            adaptive_sampling,
+            session_manager,
+            scheduler_spontaneous_think_budget,
+        );
+    });
+
+    if config.model_type == "deepseek_v41" {
+        crate::dsv41::repetition::configure(true);
+        // Resolve the JPEG decoder now so its version (or the fallback) is in the startup log.
+        let _ = crate::dsv41::turbojpeg::available();
+        if !crate::scheduler::force_disable_watchdogs() {
+            tracing::warn!(
+                "deepseek_v41: auto-watchdogs were already resolved ON; outputs will diverge from the Python engine"
+            );
+        }
+    }
     let state = Arc::new(AppState {
         tokenizer,
         model_name,
@@ -950,13 +973,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
             Some(rotation_tx)
         },
         vision_config: config.vision.clone(),
+        dsv41: config.model_type == "deepseek_v41",
         deepseek_vision_config: config.deepseek_vision.clone(),
-        deepseek_vision_vocab: config
-            .deepseek_vision
-            .as_ref()
-            .map(|_| u32::try_from(config.vocab_size))
-            .transpose()
-            .context("DeepSeek vocabulary exceeds u32")?,
+        deepseek_vision_vocab,
         initial_prefill_tokens: prefill_budget,
         vision_max_pixels,
         default_temperature,
@@ -1217,6 +1236,11 @@ fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bool {
         ("nvfp4", "bf16") |
         // BF16 reference bundle handles any quant by dequant on load.
         ("bf16", "fp8") |
+        // DeepSeek-V4.1's CB3 bundle: the checkpoint declares fp8 (its dense tensors are
+        // FP8 e4m3 + block-32 UE8M0, dequantized by weight_loader::deepseek_v41::ops), while
+        // the routed experts live in the separate k154-cb3 pack the cb3 kernels decode. Only
+        // the (gb10, deepseek-v4.1, cb3) target has quant "cb3".
+        ("cb3", "fp8") |
         ("bf16", "nvfp4")
     )
 }
@@ -1248,5 +1272,97 @@ mod qv1_tests {
     fn incompat_unknown_rejected() {
         assert!(!quant_pair_compatible("nvfp4", "gptq-4bit"));
         assert!(!quant_pair_compatible("fp8", "nvfp4"));
+    }
+}
+
+/// The scheduler thread owns the loaded model (~84 GB on DeepSeek-V4.1). Any
+/// fallible step after it spawns can make `serve` return Err while the
+/// detached thread keeps that memory, and on this unified-memory host the next
+/// load then OOMs. These tests read serve.rs itself and fail if an error
+/// exit (`?`, `bail!`, `ensure!`, `return Err`) appears between the end of the
+/// scheduler spawn and the end of the function.
+#[cfg(test)]
+mod spawn_order_tests {
+    /// Error exits in `src` after the scheduler spawn closes, up to the end of
+    /// the enclosing fn. Comments and string literals are skipped.
+    pub(super) fn error_exits_after_spawn(src: &str) -> Vec<String> {
+        let spawn = src
+            .find("std::thread::spawn(move ||")
+            .expect("scheduler spawn not found");
+        // skip the closure body: balanced braces from its first '{'
+        let open = spawn + src[spawn..].find('{').expect("closure body");
+        let (mut depth, mut i) = (0usize, open);
+        for (k, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i = open + k + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // the enclosing fn ends at the first "\n}\n" (column-0 brace) after it
+        let end = i + src[i..].find("\n}\n").expect("fn end");
+        let mut hits = Vec::new();
+        for line in src[i..end].lines() {
+            let code = strip_strings_and_comments(line);
+            if code.contains('?')
+                || code.contains("bail!")
+                || code.contains("ensure!")
+                || code.contains("return Err")
+            {
+                hits.push(line.trim().to_string());
+            }
+        }
+        hits
+    }
+
+    fn strip_strings_and_comments(line: &str) -> String {
+        let mut out = String::new();
+        let (mut in_str, mut prev) = (false, ' ');
+        let chars: Vec<char> = line.chars().collect();
+        for (k, &c) in chars.iter().enumerate() {
+            if !in_str && c == '/' && chars.get(k + 1) == Some(&'/') {
+                break;
+            }
+            if c == '"' && prev != '\\' {
+                in_str = !in_str;
+            } else if !in_str {
+                out.push(c);
+            }
+            prev = c;
+        }
+        out
+    }
+
+    #[test]
+    fn no_error_exit_after_the_scheduler_spawn() {
+        let src = include_str!("serve.rs");
+        let hits = error_exits_after_spawn(src);
+        assert!(
+            hits.is_empty(),
+            "error exits after the scheduler spawn: {hits:#?}"
+        );
+    }
+
+    /// NEGATIVE CONTROL: the same scan must catch a `?` put back after the
+    /// spawn (the pre-fix shape), or the test above cannot fail.
+    #[test]
+    fn the_scan_catches_a_question_mark_after_the_spawn() {
+        let src = include_str!("serve.rs");
+        let anchor = "    let state = Arc::new(AppState {";
+        assert!(src.contains(anchor));
+        let broken = src.replacen(
+            anchor,
+            &format!("    let _x = build_auth_config(&args)?;\n{anchor}"),
+            1,
+        );
+        assert_eq!(error_exits_after_spawn(&broken).len(), 1);
+        let broken = src.replacen(anchor, &format!("    anyhow::bail!(\"x\");\n{anchor}"), 1);
+        assert_eq!(error_exits_after_spawn(&broken).len(), 1);
     }
 }

@@ -34,6 +34,9 @@ pub(crate) fn prepare_chat_prompt(
     state: &Arc<AppState>,
     req: &mut ChatRequest,
 ) -> Result<PreparedChat, Response> {
+    if state.dsv41 {
+        return super::super::dsv41::prepare(state, req);
+    }
     // Tool-active gating.
     let tools_active = state.tool_call_parser.is_some()
         && !req.tools.is_empty()
