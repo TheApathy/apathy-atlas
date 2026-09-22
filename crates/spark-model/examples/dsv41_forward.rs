@@ -192,7 +192,11 @@ fn manifest_ids(dir: &Path) -> Result<Vec<u32>> {
 /// computed pass line up occurrence for occurrence.
 fn manifest_chunks(dir: &Path, n: usize) -> Result<Vec<(usize, usize)>> {
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
-    let chunk = m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize;
+    // DSV41_DRIVER_CHUNK overrides the capture's chunk (e.g. 2048, the serving default).
+    let chunk = match std::env::var("DSV41_DRIVER_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(c) => c,
+        None => m["model_globals"]["MAX_CHUNK"].as_u64().context("no MAX_CHUNK")? as usize,
+    };
     Ok((0..n).step_by(chunk).map(|s| (s, chunk.min(n - s))).collect())
 }
 
@@ -559,7 +563,9 @@ fn main() -> Result<()> {
             o => bail!("unknown argument {o}"),
         }
     }
-    let ref_dir = PathBuf::from(REF_ROOT).join(&run);
+    // `--run` is a capture under REF_ROOT, or (containing '/') any directory with a manifest.json
+    // holding `token_ids` (+ optional `greedy_continuation`, `model_globals.MAX_CHUNK`): real prompts.
+    let ref_dir = if run.contains('/') { PathBuf::from(&run) } else { PathBuf::from(REF_ROOT).join(&run) };
     ensure!(ref_dir.join("manifest.json").is_file(), "{} has no manifest", ref_dir.display());
     let ids = manifest_ids(&ref_dir)?;
     let chunks = manifest_chunks(&ref_dir, ids.len())?;
