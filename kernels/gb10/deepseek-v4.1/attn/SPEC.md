@@ -206,9 +206,39 @@ about as much accuracy as the final bf16 rounding of o. The prefill kernel does 
 Three different P precisions therefore exist in the reference (fp32 `_softmax_attn`, split-bf16
 decode, single-bf16 prefill); name which one any comparison is against.
 
+## 8c. Gate results (kernels/gb10/deepseek-v4.1/attn/sparse_attn.cu, commit aab4dad99)
+
+Synthetic fixture, T=128, S=4096, RING=4096 (the window wraps the ring). Reproduced identically
+across two runs.
+
+    kernel vs fp32-P reference       rel_l2 4.750e-07   worst_abs 1.164e-08
+    kernel vs bf16-P reference       rel_l2 1.419e-03   worst_abs 1.460e-05
+    all-masked row (token 0)         finite, max|o| = 0.000e+00   (no NaN)
+    CONTROL gather (sequential rows) rel_l2 1.197e+00   -> 2,520,753x separation
+    CONTROL order  (reordered)       rel_l2 6.086e-07 vs the correct order  -> DOES NOT SEPARATE
+
+Independently confirmed by `DSV41_PORT/oracle/compare.py` (PASS against the fp32 reference;
+its own `--negative-control` watched rejecting on this data).
+
+Reading of these numbers: the kernel sits essentially ON the fp32 reference, and the entire
+1.419e-03 against the bf16-P reference is `prefill_attn`'s P-rounding, not error here. The
+kernel is MORE accurate than the Python prefill path. Do not "fix" it toward the bf16-P number.
+
+The consequence, which is real: more accurate means DIVERGING from the Python engine, and ulp
+differences flip MoE router decisions. End-to-end validation is therefore on OUTPUT QUALITY, not
+bit-identity, and a per-layer bisect is valid only up to the FIRST routing flip — the same
+lesson as GLM's MoE expert flip.
+
+WHAT THIS GATE DOES NOT COVER: block order (above); the orchestration of sections 1-4 (which
+layer sources the cache, which RoPE table, the inverse RoPE on the output) — that needs the
+captured oracle; and any real weight, since the fixture is synthetic.
+
 ## 9. Open items / things NOT yet verified
 
-- No captured oracle yet. Nothing below §1 has been checked against a real tensor.
+- No captured oracle yet. Nothing in sections 1-4 has been checked against a real tensor.
+- The layer-20 capture (T>=512, S>0, plus a candidate-mask consumer) is queued with
+  dsv41-oracle. The first capture (layers 0,1,2,14 at T=64) cannot cover this kernel: at T=64
+  there is no full window and no compressed rows, which are the two things it exists to do.
 - Decode path (`engine/fastdecode.py` + `tools/decode_attn.py`) has its own static-bucket
   scheduling (`indexer_score_rows`, `indexer_topk_width`) not yet transcribed here.
 - Atlas Rust has NO GLM DSA code in this tree (grep for "dsa" over crates/ and kernels/ is

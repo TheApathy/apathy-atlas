@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -253,9 +254,16 @@ int main() {
         if (which == 2) sparse_attn<false,true ><<<grid,NT>>>(d_q,d_ring,d_wpos,d_ckv,d_cidx,d_sink,d_o,T,NH,D,NW,NC,RING_N,0,scale);
         CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
         CUDA_OK(cudaMemcpy(h_o, d_o, no*4, cudaMemcpyDeviceToHost));
+        // Dump for DSV41_PORT/oracle/compare.py, so the verdict does not rest
+        // on this file's own arithmetic alone.
+        static const char* names[3] = { "ar_out.bin", "ar_out_ctrl_order.bin", "ar_out_ctrl_gather.bin" };
+        FILE* f = std::fopen(names[which], "wb");
+        if (f) { std::fwrite(h_o, 4, no, f); std::fclose(f); }
     };
 
     run(0);
+    float* h_ok = (float*)std::malloc(no*4);
+    std::memcpy(h_ok, h_o, no*4);
     const Err e32 = compare(h_o, h_r32, no);
     const Err ebf = compare(h_o, h_rbf, no);
     std::printf("kernel vs fp32-P reference  : rel_l2=%.3e worst_abs=%.3e\n", e32.rel, e32.worst);
@@ -275,20 +283,48 @@ int main() {
     // block order and proves nothing about it.
     run(1);
     const Err c_ord = compare(h_o, h_r32, no);
+    const Err d_ord = compare(h_o, h_ok, no);   // the order difference ITSELF
     // Negative control 2: sequential compressed rows instead of the gathered
     // ones. This is the wrong-K-order analogue and must land far away.
     run(2);
     const Err c_gat = compare(h_o, h_r32, no);
-    std::printf("CONTROL order  (compressed-first): rel_l2=%.3e  (kernel %.3e)\n", c_ord.rel, e32.rel);
+    std::printf("CONTROL order  (compressed-first): rel_l2=%.3e vs ref, %.3e vs correct order\n",
+                c_ord.rel, d_ord.rel);
     std::printf("CONTROL gather (sequential rows) : rel_l2=%.3e  -> separation %.0fx\n",
                 c_gat.rel, c_gat.rel / e32.rel);
 
+    // Deliberately does NOT include the order control: it does not separate,
+    // and a gate condition that cannot fail is worse than no gate condition.
     const bool ok = e32.rel < 1e-5 && fin0 && amax0 == 0.0 && c_gat.rel > 0.2 && e32.finite;
     if (c_gat.rel <= 0.2)
         std::printf("INCONCLUSIVE: the wrong gather also passed -- this gate cannot fail\n");
-    if (c_ord.rel <= e32.rel)
-        std::printf("NOTE: block order is not observable at this tolerance; the order "
-                    "contract is NOT covered by this gate\n");
+    // MEASURED, not assumed. Window-first vs compressed-first moves the result
+    // by ~6e-07 -- the same order as this kernel's own distance from the fp32
+    // reference, ~2300x SMALLER than the bf16-P rounding prefill_attn already
+    // accepts, and comfortably inside compare.py's fp32 tolerance. The online
+    // softmax rescaling is numerically stable enough in fp32 that block order
+    // is a bit-exactness question, NOT a correctness constraint.
+    //
+    // So: THIS GATE DOES NOT COVER BLOCK ORDER, and no one should contort a
+    // kernel to preserve it. Keep window-first to match the reference, but do
+    // not treat a reordering as a bug on this evidence.
+    std::printf("\nBLOCK ORDER IS NOT COVERED BY THIS GATE. Reordering moves the result\n"
+                "      %.3e (vs the kernel's own %.3e from the fp32 reference, and the\n"
+                "      %.3e that prefill_attn's bf16-P rounding already costs). Order is a\n"
+                "      bit-exactness question here, not a correctness one.\n",
+                d_ord.rel, e32.rel, ebf.rel);
+    // This warning is printed, not just committed, so it travels with the result.
+    if (ebf.rel > e32.rel * 10.0) {
+        std::printf("\nNOTE: the gap against the bf16-P reference is this kernel being MORE\n"
+                    "      accurate, not less. tools/prefill_attn.py rounds P to bf16 because\n"
+                    "      tl.dot needs a tensor-core dtype; this kernel's hand-rolled FMA dot\n"
+                    "      has no reason to pay that. DO NOT 'fix' the kernel toward the bf16-P\n"
+                    "      number -- that makes the port worse to make a number prettier.\n"
+                    "      Consequence to expect: being more accurate means DIVERGING from the\n"
+                    "      Python engine, and ulp differences flip MoE router decisions. So\n"
+                    "      end-to-end validation is on OUTPUT QUALITY, not bit-identity, and a\n"
+                    "      per-layer bisect is only valid up to the FIRST routing flip.\n");
+    }
     std::printf(ok ? "PASS one-pass streaming gather (controls separate)\n" : "FAIL\n");
     return ok ? 0 : 1;
 }
