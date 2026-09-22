@@ -47,6 +47,13 @@
 //     28.8 ms at T=2048, 34.2 vs 17.2 at T=512 (6 interleaved rounds; 244 registers, each
 //     thread's 16-byte plane loads scattered over 8 rows with no prefetch). Removing the
 //     barrier did not pay for losing the shared, coalesced decode.
+// KEPT (2026-09-22): the group scale as a __vadd2 exponent add on a per-row table built once,
+// and the group's selector shifts as template constants. Per-group decode SASS fell from ~290
+// to ~115 instructions, and the output is byte-identical on runA/runF L0,L2/runE_image/runC_2048.
+// Wall time barely moved, though (6 interleaved rounds): T=128 13.38 vs 13.55 ms (-1.3%),
+// T=512 18.01 vs 18.12 (-0.6%), T=2048 31.03 vs 31.00, T=4096 51.80 vs 51.72 (noise). Together
+// with the warp-specialisation result this says decode instructions are no longer what bounds
+// a step; the barrier stall is.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
@@ -129,36 +136,75 @@ __device__ __forceinline__ uint32_t cb3_selector(uint32_t L, uint32_t H, int shi
     return (t & 0xFFu) | ((t >> 8) & 0xFF00u);
 }
 
+/// A row's 8 codebook entries as UNSCALED bf16 (fp4 values, exact), two per u32, plus a
+/// mask of the non-zero halves. Built once per thread: the codebook is per row, and only
+/// the group scale changes along K.
+struct RowTable {
+    uint32_t pair[4];
+    uint32_t nz[4];
+};
+
+__device__ __forceinline__ RowTable row_table(uint2 cb) {
+    RowTable t;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t word = (j < 2) ? cb.x : cb.y;
+        const uint32_t e0 = bf16_bits(fp4_value((word >> ((2 * j % 4) * 8)) & 0x0Fu));
+        const uint32_t e1 = bf16_bits(fp4_value((word >> (((2 * j + 1) % 4) * 8)) & 0x0Fu));
+        t.pair[j] = e0 | (e1 << 16);
+        t.nz[j] = ((e0 & 0x7FFFu) ? 0x0000FFFFu : 0u) | ((e1 & 0x7FFFu) ? 0xFFFF0000u : 0u);
+    }
+    return t;
+}
+
+/// The row table times 2^(s-127), split into low-byte and high-byte tables (two u32 each).
+///
+/// fp4 magnitudes have bf16 exponents 126..129, so for 2 <= s <= 252 every non-zero entry
+/// stays normal and the scale is an exponent add: one __vadd2 per pair of entries. Zeros
+/// (+0 and the -0 code) are masked out of the add. Outside that range (never seen in the
+/// shipped weights) it falls back to the float multiply, which is what the fast path
+/// reproduces bit for bit inside it.
+__device__ __forceinline__ void scaled_table(const RowTable& t, uint32_t s, uint32_t (&tl)[2], uint32_t (&th)[2]) {
+    uint32_t p[4];
+    if (s - 2u <= 250u) {
+        const uint32_t d = ((s - 127u) << 7) & 0xFFFFu;
+        const uint32_t dd = d | (d << 16);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) p[j] = __vadd2(t.pair[j], dd & t.nz[j]);
+    } else {
+        const float scale = exp2f((float)s - 127.0f);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t e0 = bf16_bits(__uint_as_float(t.pair[j] << 16) * scale);
+            const uint32_t e1 = bf16_bits(__uint_as_float(t.pair[j] & 0xFFFF0000u) * scale);
+            p[j] = e0 | (e1 << 16);
+        }
+    }
+    tl[0] = prmt(p[0], p[1], 0x6420);
+    th[0] = prmt(p[0], p[1], 0x7531);
+    tl[1] = prmt(p[2], p[3], 0x6420);
+    th[1] = prmt(p[2], p[3], 0x7531);
+}
+
 /// Decode one row's 32-weight scale group into 16 packed bf16 pairs (K order).
 ///
-/// The row codebook times the group scale is an 8-entry bf16 table, split into a low-byte
-/// table and a high-byte table (two u32 each). Each weight index then selects its two bytes
-/// with `prmt` — four weights per selector, no per-weight arithmetic, no dynamic register
-/// indexing. Values are exactly `cb3_reconstruct_bf16`'s (fp4 x 2^(s-127), exact in bf16);
-/// this replaced a per-weight predicated select that cost ~3x the instructions.
-__device__ __forceinline__ void decode32(const Raw& r, uint2 cb, int k0, uint32_t (&out)[16]) {
-    const int g = (k0 % 512) / 32;
-    const float scale = exp2f((float)r.sc - 127.0f);
-    uint32_t e[8];
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const uint32_t word = (i < 4) ? cb.x : cb.y;
-        e[i] = bf16_bits(fp4_value((word >> ((i % 4) * 8)) & 0x0Fu) * scale);
-    }
-    const uint32_t tlo_x = (e[0] & 0xFFu) | ((e[1] & 0xFFu) << 8) | ((e[2] & 0xFFu) << 16) | ((e[3] & 0xFFu) << 24);
-    const uint32_t tlo_y = (e[4] & 0xFFu) | ((e[5] & 0xFFu) << 8) | ((e[6] & 0xFFu) << 16) | ((e[7] & 0xFFu) << 24);
-    const uint32_t thi_x = (e[0] >> 8) | ((e[1] >> 8) << 8) | ((e[2] >> 8) << 16) | ((e[3] >> 8) << 24);
-    const uint32_t thi_y = (e[4] >> 8) | ((e[5] >> 8) << 8) | ((e[6] >> 8) << 16) | ((e[7] >> 8) << 24);
-    const int lo_shift = 4 * (g % 2);
-    const int hi_bit = ((g / 2) % 2) * 4 + (g % 2) * 2;
+/// Each weight index selects its two bytes from the scaled table with `prmt` — four
+/// weights per selector, no per-weight arithmetic, no dynamic register indexing. Values
+/// are exactly `cb3_reconstruct_bf16`'s (fp4 x 2^(s-127), exact in bf16). The group's
+/// sub-positions (LO_SHIFT = 4 * (g % 2), HI_BIT = ((g / 2) % 2) * 4 + (g % 2) * 2) are
+/// template constants so the selector shifts fold.
+template <int LO_SHIFT, int HI_BIT>
+__device__ __forceinline__ void decode32(const Raw& r, const RowTable& t, uint32_t (&out)[16]) {
+    uint32_t tl[2], th[2];
+    scaled_table(t, r.sc, tl, th);
     const uint32_t lo_w[4] = {r.lo.x, r.lo.y, r.lo.z, r.lo.w};
     const uint32_t hi_w[4] = {r.hi.x, r.hi.y, r.hi.z, r.hi.w};
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
-        const uint32_t s0 = cb3_selector(lo_w[q], hi_w[q], lo_shift, hi_bit);          // r = 0
-        const uint32_t s1 = cb3_selector(lo_w[q], hi_w[q], lo_shift + 2, hi_bit + 1);  // r = 1
-        const uint32_t lo0 = prmt(tlo_x, tlo_y, s0), hi0 = prmt(thi_x, thi_y, s0);
-        const uint32_t lo1 = prmt(tlo_x, tlo_y, s1), hi1 = prmt(thi_x, thi_y, s1);
+        const uint32_t s0 = cb3_selector(lo_w[q], hi_w[q], LO_SHIFT, HI_BIT);          // r = 0
+        const uint32_t s1 = cb3_selector(lo_w[q], hi_w[q], LO_SHIFT + 2, HI_BIT + 1);  // r = 1
+        const uint32_t lo0 = prmt(tl[0], tl[1], s0), hi0 = prmt(th[0], th[1], s0);
+        const uint32_t lo1 = prmt(tl[0], tl[1], s1), hi1 = prmt(th[0], th[1], s1);
         // Interleave to bf16(lane j, r=0) | bf16(lane j, r=1) << 16 for j = 0..3.
         const uint32_t x01 = prmt(lo0, lo1, 0x5140), x23 = prmt(lo0, lo1, 0x7362);
         const uint32_t y01 = prmt(hi0, hi1, 0x5140), y23 = prmt(hi0, hi1, 0x7362);
@@ -170,9 +216,16 @@ __device__ __forceinline__ void decode32(const Raw& r, uint2 cb, int k0, uint32_
 }
 
 /// Decode one row's one 32-weight scale group into dst[0..32) (bf16, K order).
-__device__ __forceinline__ void decode_group(const Raw& r, uint2 cb, int k0, __nv_bfloat16* dst) {
+/// g % 4 is warp-uniform (a warp's 32 threads share dgrp, and k0 is uniform), so the
+/// switch does not diverge.
+__device__ __forceinline__ void decode_group(const Raw& r, const RowTable& t, int k0, __nv_bfloat16* dst) {
     uint32_t out[16];
-    decode32(r, cb, k0, out);
+    switch (((k0 % 512) / 32) & 3) {
+        case 0: decode32<0, 0>(r, t, out); break;
+        case 1: decode32<4, 2>(r, t, out); break;
+        case 2: decode32<0, 4>(r, t, out); break;
+        default: decode32<4, 6>(r, t, out); break;
+    }
     uint4* d = reinterpret_cast<uint4*>(dst);
 #pragma unroll
     for (int q = 0; q < 4; ++q) d[q] = make_uint4(out[4 * q], out[4 * q + 1], out[4 * q + 2], out[4 * q + 3]);
@@ -254,14 +307,14 @@ __device__ __forceinline__ void gate_up_body(
     const int drow = threadIdx.x % BN;
     const int dgrp = (threadIdx.x / BN) % 2;
     const long long dn = n0 + drow;
-    const uint2 cb = *reinterpret_cast<const uint2*>(mine.cb + dn * 8);
+    const RowTable tab = row_table(*reinterpret_cast<const uint2*>(mine.cb + dn * 8));
     Raw raw = fetch_group(mine, dn, dgrp * 32, K);
     uint4 a_reg[ACT_CHUNKS];
     fetch_act(act, row_begin, rows, 0, K, a_reg);
 
     for (int k0 = 0; k0 < K; k0 += BK) {
         store_act(a_reg, s_a);
-        decode_group(raw, cb, k0 + dgrp * 32, &s_mine[drow][dgrp * 32]);
+        decode_group(raw, tab, k0 + dgrp * 32, &s_mine[drow][dgrp * 32]);
         __syncthreads();
         if (k0 + BK < K) {
             // Next step's loads go out now and land during this step's MMAs.
@@ -373,10 +426,10 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
     const int drow = threadIdx.x % BN;
     const int dgrp = (threadIdx.x / BN) % 2;
     const long long dn = n0 + drow;
-    uint2 cb = make_uint2(0, 0);
+    RowTable tab{};
     Raw raw{};
     if (decoder) {
-        cb = *reinterpret_cast<const uint2*>(p2.cb + dn * 8);
+        tab = row_table(*reinterpret_cast<const uint2*>(p2.cb + dn * 8));
         raw = fetch_group(p2, dn, dgrp * 32, K);
     }
     uint4 a_reg[ACT_CHUNKS];
@@ -384,7 +437,7 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_down(
 
     for (int k0 = 0; k0 < K; k0 += BK) {
         store_act(a_reg, s_a);
-        if (decoder) decode_group(raw, cb, k0 + dgrp * 32, &s_w[drow][dgrp * 32]);
+        if (decoder) decode_group(raw, tab, k0 + dgrp * 32, &s_w[drow][dgrp * 32]);
         __syncthreads();
         if (k0 + BK < K) {
             if (decoder) raw = fetch_group(p2, dn, k0 + BK + dgrp * 32, K);

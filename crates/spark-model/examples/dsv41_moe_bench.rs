@@ -99,7 +99,17 @@ fn main() -> Result<()> {
     let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json"))?)?;
     let ids: Vec<i64> = manifest["token_ids"].as_array().context("ids")?.iter().filter_map(|v| v.as_i64()).collect();
     let max_t = *token_counts.iter().max().context("no token counts")?;
-    ensure!(max_t <= captured, "{run} L{layer:02} has {captured} captured rows, asked for {max_t}");
+    ensure!(ids.len() >= captured, "{run}: {} token ids for {captured} rows", ids.len());
+    // Beyond the capture, tile its rows (and their token ids) so a larger chunk can be timed:
+    // every expert sees proportionally more rows, which is what a longer prefill chunk does.
+    let (moe_in, ids) = if max_t > captured {
+        println!("{run} L{layer:02}: {captured} captured rows, TILED to {max_t} (routing repeats)");
+        let row = hidden * 2;
+        let tiled: Vec<u8> = (0..max_t).flat_map(|r| moe_in[(r % captured) * row..(r % captured + 1) * row].iter().copied()).collect();
+        (tiled, (0..max_t).map(|r| ids[r % captured]).collect::<Vec<i64>>())
+    } else {
+        (moe_in, ids)
+    };
 
     let backend = Arc::new(AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?);
     let shared: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = backend.clone();
