@@ -263,6 +263,9 @@ fn run_model_path(
     fwd.prefill(ops, &mut seq, ids, PrefillMode::Replay, hook, core, moe, &tap, logits)?;
     ops.gpu.synchronize(ops.stream)?;
     println!("prefill {} tokens in {:.2}s", ids.len(), t0.elapsed().as_secs_f64());
+    if spark_model::weight_loader::deepseek_v41::ops::profile::enabled() {
+        println!("PROFILE (cold prefill, every scope synchronized):\n{}", spark_model::weight_loader::deepseek_v41::ops::profile::report());
+    }
     tap.bf16(ops, "logits_last", 40, logits, &[config.vocab_size])?;
     ops.gpu.synchronize(ops.stream)?;
     let mut host = vec![0u8; config.vocab_size * 2];
@@ -303,6 +306,9 @@ fn run_model_path(
             got.push(report(step, &to_f32(&host)));
         }
         let dt = t1.elapsed().as_secs_f64();
+        if spark_model::weight_loader::deepseek_v41::ops::profile::enabled() {
+            println!("PROFILE (decode steps):\n{}", spark_model::weight_loader::deepseek_v41::ops::profile::report());
+        }
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
         let matches = got.iter().zip(&want).filter(|(a, b)| a == b).count();
         println!("decode ({}): {} steps in {dt:.2}s ({:.2} tok/s)", if force_decode { "teacher-forced" } else { "free" }, got.len() - 1, (got.len() - 1) as f64 / dt);
@@ -320,6 +326,9 @@ fn run_model_path(
         ops.gpu.synchronize(ops.stream)?;
         let dt = t0.elapsed().as_secs_f64();
         println!("WARM prefill: {} tokens in {dt:.3}s = {:.1} tok/s (chunk {max_chunk}, replay 128, engram page-cache warm)", ids.len(), ids.len() as f64 / dt);
+        if spark_model::weight_loader::deepseek_v41::ops::profile::enabled() {
+            println!("PROFILE (warm prefill, every scope synchronized; wall above is NOT a throughput number):\n{}", spark_model::weight_loader::deepseek_v41::ops::profile::report());
+        }
     }
     println!("DONE dsv41_forward path=model");
     Ok(())

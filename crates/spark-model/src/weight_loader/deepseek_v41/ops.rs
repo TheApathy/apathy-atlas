@@ -16,6 +16,56 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
+/// Opt-in wall-clock profiler (`ATLAS_DSV41_PROF=1`): each [`prof`] scope SYNCHRONIZES the
+/// stream before and after, so the numbers are exclusive GPU+host wall time per scope and the
+/// run is slower overall. Never read a profiled run's total as a throughput number.
+pub mod profile {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("ATLAS_DSV41_PROF").as_deref() == Ok("1"))
+    }
+
+    pub(super) fn table() -> &'static Mutex<BTreeMap<String, (f64, u64)>> {
+        static T: OnceLock<Mutex<BTreeMap<String, (f64, u64)>>> = OnceLock::new();
+        T.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    /// Drain and format the accumulated table (seconds, calls), largest first.
+    pub fn report() -> String {
+        let mut t = table().lock().expect("prof poisoned");
+        let mut rows: Vec<(String, (f64, u64))> = std::mem::take(&mut *t).into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let total: f64 = rows.iter().filter(|r| !r.0.contains('/')).map(|r| r.1.0).sum();
+        let mut out = format!("{:<34} {:>9} {:>7} {:>6}\n", "scope (a/b = nested in a)", "ms", "calls", "%top");
+        for (k, (sec, n)) in rows {
+            let pct = if k.contains('/') { String::new() } else { format!("{:.1}", 100.0 * sec / total.max(1e-12)) };
+            out += &format!("{k:<34} {:>9.1} {n:>7} {pct:>6}\n", sec * 1e3);
+        }
+        out += &format!("{:<34} {:>9.1}\n", "TOTAL (top-level scopes)", total * 1e3);
+        out
+    }
+}
+
+/// Time `f` under `name` when profiling is on (see [`profile`]); a plain call otherwise.
+pub fn prof<R>(ops: &Ops, name: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    if !profile::enabled() {
+        return f();
+    }
+    ops.gpu.synchronize(ops.stream)?;
+    let t0 = std::time::Instant::now();
+    let r = f()?;
+    ops.gpu.synchronize(ops.stream)?;
+    let dt = t0.elapsed().as_secs_f64();
+    let mut t = profile::table().lock().expect("prof poisoned");
+    let e = t.entry(name.to_string()).or_insert((0.0, 0));
+    e.0 += dt;
+    e.1 += 1;
+    Ok(r)
+}
+
 /// Kernel module compiled from `kernels/gb10/deepseek-v4.1/cb3/dsv41_fwd.cu`.
 pub const FWD_MODULE: &str = "dsv41_fwd";
 const BLOCK: u32 = 256;
@@ -219,10 +269,21 @@ impl Ops<'_> {
         Ok(())
     }
 
-    /// [`Self::linear_fp8`] with the GEMM tiled; same slack-row contract.
+    /// The FP8 dense linear with the reference's row policy. `v41_ref.dense` sends an
+    /// FP8Weight at M > 16 to ONE untiled `F.linear(x.bf16, w.dequant())` (it is not row-tiled
+    /// like the bf16/fp32 `mm` path), and at M <= 16 to a 16-row kernel. So: M > MM_TILE runs
+    /// one GEMM over all rows (no split-K); M <= MM_TILE runs one 16-row tile (slack contract).
+    /// Measured: untiled vs 16-row-tiled gave bit-identical h over all 40 layers at M=512, and
+    /// the tiled form re-reads the whole bf16 weight once per 16 rows (32x per 512-row chunk).
     pub fn linear_fp8_tiled(&self, x: DevicePtr, w: &Fp8Linear, scratch: DevicePtr, out: DevicePtr, m: usize) -> Result<()> {
-        self.dequant(w, scratch)?;
-        self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
+        prof(self, "dense/dequant", || self.dequant(w, scratch))?;
+        prof(self, "dense/gemm", || {
+            if m > MM_TILE {
+                self.linear_bf16_strided(x, w.k, scratch, out, w.n, m, w.n, w.k)
+            } else {
+                self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
+            }
+        })
     }
 
     /// Dequantize `w` to bf16 into `scratch` (at least `w.n * w.k * 2` bytes).
