@@ -1,0 +1,9 @@
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 1.602 ms (26.8 TF/s, 0.83x current)
+fx/wq_b    M=512 N=32768 K= 1280 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 1.327 ms, gemm alone 0.622 ms, FUSED 1.545 ms (27.8 TF/s, 0.86x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.884 ms (48.6 TF/s, 1.37x current)
+fx/wo_b    M=512 N= 5120 K= 8192 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 1.211 ms, gemm alone 0.587 ms, FUSED 1.008 ms (42.6 TF/s, 1.20x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.215 ms (56.2 TF/s, 1.31x current)
+fx/w1      M=512 N= 2304 K= 5120 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.281 ms, gemm alone 0.115 ms, FUSED 0.258 ms (46.7 TF/s, 1.09x current) PASS
+           v2 (on-the-fly B, 3 stages): byte-identical to v1: yes, 0.129 ms (52.1 TF/s, 1.15x current)
+fx/wq_a    M=512 N= 1280 K= 5120 | identical 100.0000% rel 0.00e+00 | M=20 rows byte-identical: yes | CTRL scale+1 rel 1.00e+00 | current (dequant+gemm) 0.149 ms, gemm alone 0.078 ms, FUSED 0.149 ms (44.9 TF/s, 1.00x current) PASS
+GATE PASS
