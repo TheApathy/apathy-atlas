@@ -20,14 +20,34 @@
 //! (offsets 0,1,2,3) — group `g` covers `ngram = g + 2` and looks back
 //! `0..ngram` positions.
 //!
-//! Unlike [`super::hash::EngramHashState`], this does **not** carry history
-//! across a chunk boundary: the reference is called fresh on each forward's local
-//! `ids` (`engine/model.py:747`, `dead_heads = engram_dead_heads(ids)`), so a
-//! chunk's own start is always treated as if nothing precedes it. Confirmed
-//! empirically: `runD_L20_kernel`'s chunk 1 (S=512) mask is bit-identical to
-//! chunk 0's on a text-only prompt (both all-False), and `runE_image`'s image
-//! span sits entirely inside chunk 0 — chunk 1 restarts at all-False rather than
-//! inheriting anything from chunk 0's tail.
+//! ## Cross-chunk carry — CORRECTED 2026-09-22 (dsv41-parity)
+//!
+//! [`engram_dead_heads`] itself is local by construction: it only ever looks
+//! back `0..max_ngram_size` positions within the slice it is given. The
+//! ORIGINAL version of this doc claimed that matched the reference's own
+//! per-chunk behaviour, citing `engine/model.py:747`
+//! (`dead_heads = engram_dead_heads(ids)`) — that citation was wrong. Reading
+//! is `model.py:747`'s fallback path only, used for decode and text (where
+//! `dead_heads` arrives as `None`). The actual SERVING call,
+//! `engine/v41_engine.py:755`, computes `engram_dead_heads(ids)` ONCE over the
+//! full image-expanded prompt and slices `dead_heads[s:s+MAX_CHUNK]` per chunk
+//! (`v41_engine.py:834`, `845`) — so a chunk boundary that follows image tokens
+//! DOES inherit look-back across it in production.
+//!
+//! [`engram_dead_heads_with_carry`] restores that: it needs only the trailing
+//! `max_ngram_size - 1` (3) raw ids from before the chunk, not the whole
+//! history, because no group looks back further than that. A caller holding
+//! per-sequence state should keep exactly that many trailing ids and pass them
+//! in; `engram_dead_heads` alone (no carry) is correct ONLY for a sequence's
+//! first chunk, or wherever the true predecessor ids are unavailable/text-only
+//! (decode is safe either way once the carry itself is up to date, since real
+//! decode tokens are never image ids).
+//!
+//! `runD_L20_kernel`'s chunk 1 (S=512) mask is bit-identical to chunk 0's on a
+//! TEXT-ONLY prompt (both all-False) regardless of carry — that capture cannot
+//! discriminate the two functions. `runE_image`'s image span sits entirely
+//! inside chunk 0, so it cannot either: an image-spanning-a-boundary capture is
+//! needed to exercise this, and none exists yet.
 
 /// `IMAGE_SENTINEL_ID` / `IMAGE_PAD_ID` from `engine/vision.py`. These are V4.1's
 /// own multimodal token ids, unrelated to any other model's image-pad constants
@@ -73,6 +93,40 @@ pub fn engram_dead_heads(ids: &[u32]) -> Vec<bool> {
     dead
 }
 
+/// The longest look-back any n-gram group reads: the 4-gram group's offsets are
+/// `0..4`, so `max_ngram_size - 1 = 3`. A caller only needs to keep this many
+/// trailing raw ids across a chunk boundary for [`engram_dead_heads_with_carry`]
+/// to be exact — see the module doc's "cross-chunk carry" section.
+pub const MAX_LOOKBACK: usize = 3;
+
+/// [`engram_dead_heads`], but correct at a chunk boundary: `carry` is the
+/// trailing up-to-[`MAX_LOOKBACK`] raw ids from immediately before `ids` (empty
+/// for a sequence's first chunk). Returns exactly `ids.len()` rows — the
+/// carry's own rows are computed only to seed the look-back and then dropped.
+///
+/// Correct because [`engram_dead_heads`] never looks back further than
+/// `MAX_LOOKBACK`: prefixing `ids` with anything further back than that cannot
+/// change a single output row, so a short carry is exact, not an approximation
+/// of the full-sequence computation.
+pub fn engram_dead_heads_with_carry(carry: &[u32], ids: &[u32]) -> Vec<bool> {
+    if carry.is_empty() {
+        return engram_dead_heads(ids);
+    }
+    let combined: Vec<u32> = carry.iter().chain(ids).copied().collect();
+    let full = engram_dead_heads(&combined);
+    full[carry.len() * N_HEAD_COLS..].to_vec()
+}
+
+/// Update a rolling carry buffer with this chunk's ids, keeping only the
+/// trailing [`MAX_LOOKBACK`] raw ids — exactly what
+/// [`engram_dead_heads_with_carry`] needs for the NEXT chunk. Call once per
+/// chunk, after hashing/masking it.
+pub fn update_dead_carry(carry: &mut Vec<u32>, ids: &[u32]) {
+    carry.extend_from_slice(ids);
+    let drop = carry.len().saturating_sub(MAX_LOOKBACK);
+    carry.drain(..drop);
+}
+
 /// Apply the reference's `rows.masked_fill(dead_heads.unsqueeze(-1), 0)`: zero
 /// every `[row_dim]` slice whose `(position, col)` is dead. `rows` is `[T,
 /// N_HEAD_COLS, row_dim]` row-major, matching `engram_rows_premask` /
@@ -91,6 +145,61 @@ pub fn apply_dead_mask(rows: &mut [f32], dead: &[bool], t: usize, row_dim: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE TEST THAT MATTERS FOR THE CARRY: a sentinel at the very end of chunk 0
+    /// must still kill the leading positions of chunk 1 -- the exact case a
+    /// no-carry computation misses (dsv41-parity's finding). Split at the
+    /// sentinel's own position and compare the carried split against one-shot.
+    #[test]
+    fn carry_reproduces_the_one_shot_result_across_a_boundary() {
+        let ids = [1u32, 2, 3, 129_264, 5, 6, 7, 8, 9, 10];
+        let one_shot = engram_dead_heads(&ids);
+
+        // Split right after the sentinel (index 4): chunk 0 = ids[..4], chunk 1 =
+        // ids[4..]. Chunk 1's first three positions (5,6,7 -> offsets 1,2,3 from
+        // the sentinel) must come back dead in the right groups despite chunk 1
+        // never seeing the sentinel itself.
+        let (c0, c1) = ids.split_at(4);
+        let split0 = engram_dead_heads(c0);
+        let mut carry = Vec::new();
+        update_dead_carry(&mut carry, c0);
+        assert_eq!(carry, vec![2u32, 3, 129_264], "carry must keep exactly the trailing MAX_LOOKBACK ids");
+        let split1 = engram_dead_heads_with_carry(&carry, c1);
+
+        let mut got = split0;
+        got.extend(split1.clone());
+        assert_eq!(got, one_shot, "carried split must reproduce the one-shot computation exactly");
+
+        // Negative control: WITHOUT the carry, chunk 1's leading positions must
+        // come back wrong (this is exactly the bug dsv41-parity found).
+        let split1_no_carry = engram_dead_heads(c1);
+        assert_ne!(
+            split1_no_carry, split1,
+            "no-carry and carried results are identical -- this control cannot show the bug it exists to catch"
+        );
+    }
+
+    /// A carry longer than MAX_LOOKBACK must not change the result: only the
+    /// trailing 3 ids can ever matter, so `update_dead_carry` truncating to 3
+    /// must be lossless for this function's purposes.
+    #[test]
+    fn carry_beyond_max_lookback_is_irrelevant() {
+        let ids = [129_264u32, 2, 3, 4, 5, 6];
+        let short_carry = vec![2u32, 3, 4]; // last MAX_LOOKBACK of [129264,2,3,4]
+        let long_carry = vec![129_264u32, 2, 3, 4]; // the sentinel itself, 4 back
+        let a = engram_dead_heads_with_carry(&short_carry, &ids[4..]);
+        let b = engram_dead_heads_with_carry(&long_carry, &ids[4..]);
+        assert_eq!(a, b, "a carry longer than MAX_LOOKBACK changed the result");
+    }
+
+    /// An empty carry (a sequence's first chunk) must be identical to calling
+    /// `engram_dead_heads` directly -- the carry-aware function is a strict
+    /// generalisation, not a different algorithm.
+    #[test]
+    fn empty_carry_matches_the_plain_function() {
+        let ids = [129_264u32, 2, 3, 4, 5];
+        assert_eq!(engram_dead_heads_with_carry(&[], &ids), engram_dead_heads(&ids));
+    }
 
     /// A prompt with no image tokens at all must come back entirely alive: the
     /// mask cannot invent a dead head from nothing.

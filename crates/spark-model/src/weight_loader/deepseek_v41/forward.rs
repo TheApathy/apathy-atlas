@@ -23,7 +23,9 @@ use spark_runtime::weights::WeightStore;
 use super::attn_block::{self, AttnCore, AttnScratch, HEAD_DIM, RING, V41AttnWeights, WINDOW, compress_ratio};
 use super::fwd::{BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block};
 use super::ops::{Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
-use crate::layers::deepseek_v41_engram::{EngramGather, EngramHashState, engram_dead_heads};
+use crate::layers::deepseek_v41_engram::{
+    EngramGather, EngramHashState, engram_dead_heads_with_carry, update_dead_carry,
+};
 
 /// `candidate_source_layer`: the last encoder layer.
 pub const ENCODER_LAST: usize = 20;
@@ -71,6 +73,13 @@ pub struct V41Seq {
     pub tail_rows: usize,
     /// Token ids of those tail rows (the replay's MoE routes by them).
     pub tail_ids: Vec<u32>,
+    /// The trailing up-to-`MAX_LOOKBACK` raw ids from the most recently processed
+    /// chunk/token, carried so `engram_dead_heads_with_carry` sees look-back
+    /// across a chunk boundary the way `engine/v41_engine.py:755` does (it hashes
+    /// the WHOLE image-expanded prompt once, then slices per chunk) rather than
+    /// `engine/model.py:747`'s local fallback, which only applies to decode/text
+    /// (dsv41-parity, 2026-09-22).
+    pub dead_carry: Vec<u32>,
 }
 
 impl V41Seq {
@@ -90,6 +99,7 @@ impl V41Seq {
             tail_pre: gpu.alloc(WINDOW * dims.hc * 4)?,
             tail_rows: 0,
             tail_ids: Vec::new(),
+            dead_carry: Vec::new(),
         })
     }
 
@@ -231,9 +241,12 @@ impl V41Forward {
         ensure!(seq.len == start, "sequence holds {} positions, pass starts at {start}", seq.len);
         ensure!(start + t <= self.max_seq, "position {} exceeds max_seq {}", start + t, self.max_seq);
         let hashes = seq.hash.forward(ids, start, None)?;
-        // `engram_dead_heads` is a pure function of THIS forward's ids (model.py:747, no
-        // cross-chunk carry); all-False for text.
-        let dead: Vec<u8> = engram_dead_heads(ids).into_iter().map(u8::from).collect();
+        // `engine/v41_engine.py:755` hashes the WHOLE image-expanded prompt once and slices
+        // per chunk -- carrying the trailing MAX_LOOKBACK raw ids is the exact equivalent
+        // (see deepseek_v41_engram::dead_heads's module doc), and is what makes an image
+        // span that straddles a chunk boundary come out right. All-False for text either way.
+        let dead: Vec<u8> = engram_dead_heads_with_carry(&seq.dead_carry, ids).into_iter().map(u8::from).collect();
+        update_dead_carry(&mut seq.dead_carry, ids);
         ops.gpu.copy_h2d_async(&dead, self.scratch.engram_dead, ops.stream)?;
         ops.gpu.copy_h2d_async(bytemuck_u32(ids), self.ids_dev, ops.stream)?;
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
