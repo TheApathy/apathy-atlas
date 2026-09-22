@@ -124,3 +124,32 @@ Negative controls, each watched FAIL:
 Both engram layers' masks are IDENTICAL (same sha256) at every occurrence, as
 expected — `engram_dead_heads` is a pure function of token ids, not of which
 engram layer is asking.
+
+## `engram_out` spec — CONFIRMED, not yet a clean PASS (2026-09-22)
+
+`validate_engram_forward.py` re-derives `tools/v41_ref.py:782` `engram_forward` in a
+standalone CPU script — the real `layers.1.engram.{wkv,q_weight,k_weight}` weights,
+`L00.h.000.bin` as the layer-1 input (the loop's `h` tap right before layer 1's
+`if L in W.engram` branch is entered — no separate "input to engram" tap exists,
+but layer 0 has no engram, so its own `h` tap IS layer 1's input), and
+`L01.engram_rows.000.bin` (post-mask, already this lane's contract) as the rows.
+
+Confirms the wkv path is genuinely dense fp8, never fp4-requantized (`v41_ref.py`:
+"the engram wkv ... always stays fp8 -- not covered by [DSV41_DENSE_FP4]"), so
+runA-E are valid `engram_out` targets, not just runF/G.
+
+  rel_l2 vs `L01.engram_out.000.bin`:  **3.032e-3** (tol 3e-3 -- FAILS by 0.6%)
+  cosine:                              0.9999954
+  negative control (h alone, gate/value dropped): rel_l2 0.60 -- correctly far off
+
+So the MECHANISM is right (dropping the gate/value term moves the result 200x
+further than the residual does), and the residual sits right at the bf16 tolerance
+boundary, not off by an order of magnitude. Re-running with the production
+`MM_TILE=16` row-tiling (`engine/model.py:65`) made no difference on CPU — that
+effect is a GPU/cuBLAS split-K artifact the reference itself documents, and cannot
+manifest on a plain CPU `F.linear`. Likely cause: e4m3 round-to-nearest-even tie
+behaviour differing between this script's `.to(torch.float8_e4m3fn)` cast and
+whatever kernel produced the capture, not a spec error — but this is NOT
+confirmed, only argued. **Do not treat 3.03e-3 as a closed question; re-run this
+script (or the Rust port) and compare before assuming either a bug or a clean bit
+match.**
