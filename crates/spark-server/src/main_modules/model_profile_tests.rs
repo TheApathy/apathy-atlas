@@ -11,14 +11,15 @@ fn the_deepseek_v41_profile_carries_the_measured_numbers() {
     let p = dsv41();
     assert_eq!(p.recipe_id, "deepseek/deepseek-v4.1-flash-next");
     assert!(p.run_alone);
-    assert_eq!(p.resident_gb, 84.0);
+    assert_eq!(p.resident_gb, 85.0);
     assert_eq!(p.dspark_extra_gb, 8.0);
     assert_eq!(p.headroom_gb, 16.0);
     assert_eq!(p.env.get("ATLAS_DSV41_PACKED_KEEP").map(String::as_str), Some("124"));
     assert_eq!(p.env.get("ATLAS_DSV41_DSPARK").map(String::as_str), Some("0"));
-    // 84 + 16 = 100 GB without DSpark, 108 with it.
-    assert_eq!(p.required_bytes(false), 100_000_000_000);
-    assert_eq!(p.required_bytes(true), 108_000_000_000);
+    assert_eq!(p.env.get("ATLAS_DSV41_CHUNK").map(String::as_str), Some("2048"));
+    // 85 + 16 = 101 GB without DSpark, 109 with it.
+    assert_eq!(p.required_bytes(false), 101_000_000_000);
+    assert_eq!(p.required_bytes(true), 109_000_000_000);
 }
 
 #[test]
@@ -35,7 +36,7 @@ fn run_alone_admission_refuses_one_byte_short() {
     admit(&p, need, false).expect("exactly enough must be admitted");
     let err = admit(&p, need - 1, false).expect_err("one byte short must be refused").to_string();
     assert!(err.contains("must run alone"), "{err}");
-    assert!(err.contains("100.0 GB free"), "{err}");
+    assert!(err.contains("101.0 GB free"), "{err}");
     // DSpark raises the bar: what admitted without it is refused with it.
     assert!(admit(&p, need, true).is_err());
 }

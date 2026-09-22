@@ -5,6 +5,7 @@
 # dsv41 lanes measured (DSV41_PORT/BRIEF.md, serve windows 4-6):
 #   - spark serve text == the Python-oracle driver; greedy KL ~2.8e-4 vs the oracle
 #   - keep=124 routed experts resident = 71.7 GB of CB3 planes; ~84 GB total with the rest
+#     (+1.1 GB scratch for the 2048 chunk, integrate 78bdf641b)
 #   - DSpark (MTP drafter) OFF until its gate passes: +7.93 GB, low-water 23 GB when on
 recipe_version: "2"
 model: DeepSeek-V4.1-Flash-Next-DGX-Spark-512K
@@ -18,7 +19,8 @@ metadata:
   kv_dtype: bf16
   description: |
     DeepSeek-V4.1-Flash-Next, 124 of 384 routed experts per layer resident as CB3 (71.7 GB),
-    fused CB3 grouped-GEMM MoE, device routing, 512-token prefill chunks. Needs the whole
+    fused CB3 grouped-GEMM MoE, device routing, 2048-token prefill chunks (byte-identical to
+    512, 1333.5 tok/s prefill; the engine caps the chunk itself when DSpark is on). Needs the whole
     GB10: the TUI refuses to start it unless ~84 GB plus a 16 GB floor is free after the
     previous model is released.
 defaults:
@@ -30,11 +32,11 @@ defaults:
 # Atlas extension block, read by `main_modules::model_profile` (Recipe::parse ignores it).
 atlas:
   model_type: deepseek_v41
-  resident_gb: 84
+  resident_gb: 85
   dspark_extra_gb: 8
   headroom_gb: 16
   run_alone: true
   env:
     ATLAS_DSV41_PACKED_KEEP: "124"
-    ATLAS_DSV41_CHUNK: "512"
+    ATLAS_DSV41_CHUNK: "2048"
     ATLAS_DSV41_DSPARK: "0"
