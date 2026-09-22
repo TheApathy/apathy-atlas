@@ -134,17 +134,30 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    const REF_DIR: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref/runA";
+    const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
     const NUM_EXPERTS: usize = 384;
     const K: usize = 6;
     const ROUTE_SCALE: f32 = 1.5;
 
-    fn ref_path(name: &str) -> PathBuf {
-        Path::new(REF_DIR).join(name)
+    /// Every capture under `ref/`, sorted. Scanned rather than hardcoded so a new run
+    /// (runB, runC, ...) is picked up the moment the oracle lane drops it — a test that
+    /// named runA would have gone on passing while ignoring every later capture.
+    fn ref_dirs() -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(REF_ROOT) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                path.join("manifest.json").is_file().then_some(path)
+            })
+            .collect();
+        dirs.sort();
+        dirs
     }
 
-    fn read_f32(name: &str) -> Option<Vec<f32>> {
-        let bytes = std::fs::read(ref_path(name)).ok()?;
+    fn read_f32(dir: &Path, name: &str) -> Option<Vec<f32>> {
+        let bytes = std::fs::read(dir.join(name)).ok()?;
         Some(
             bytes
                 .chunks_exact(4)
@@ -153,8 +166,8 @@ mod tests {
         )
     }
 
-    fn read_i64(name: &str) -> Option<Vec<i64>> {
-        let bytes = std::fs::read(ref_path(name)).ok()?;
+    fn read_i64(dir: &Path, name: &str) -> Option<Vec<i64>> {
+        let bytes = std::fs::read(dir.join(name)).ok()?;
         Some(
             bytes
                 .chunks_exact(8)
@@ -195,61 +208,67 @@ mod tests {
     /// the set.
     #[test]
     fn routing_replays_the_oracle_exactly() {
-        if !Path::new(REF_DIR).is_dir() {
-            eprintln!("skipping: {REF_DIR} not present");
+        let dirs = ref_dirs();
+        if dirs.is_empty() {
+            eprintln!("skipping: no captures under {REF_ROOT}");
             return;
         }
         let mut layers_checked = 0;
-        for layer in ["L00", "L02", "L14"] {
-            let (Some(scores), Some(logits), Some(want_idx), Some(want_w)) = (
-                read_f32(&format!("{layer}.route_scores.000.bin")),
-                read_f32(&format!("{layer}.route_logits.000.bin")),
-                read_i64(&format!("{layer}.route_idx.000.bin")),
-                read_f32(&format!("{layer}.route_w.000.bin")),
-            ) else {
-                eprintln!("skipping {layer}: taps not present");
-                continue;
-            };
-            let tokens = scores.len() / NUM_EXPERTS;
-            assert_eq!(tokens, 37, "{layer}: the capture is a 37-token prompt");
+        let mut rows_checked = 0usize;
+        for dir in &dirs {
+            for layer in ["L00", "L01", "L02", "L14"] {
+                let (Some(scores), Some(logits), Some(want_idx), Some(want_w)) = (
+                    read_f32(dir, &format!("{layer}.route_scores.000.bin")),
+                    read_f32(dir, &format!("{layer}.route_logits.000.bin")),
+                    read_i64(dir, &format!("{layer}.route_idx.000.bin")),
+                    read_f32(dir, &format!("{layer}.route_w.000.bin")),
+                ) else {
+                    continue;
+                };
+                let tokens = scores.len() / NUM_EXPERTS;
+                let tag = format!("{}/{layer}", dir.file_name().unwrap().to_string_lossy());
 
-            let (bias, mask) = bias_and_mask(&scores, &logits);
-            let resident = mask.iter().filter(|keep| **keep).count();
-            assert_eq!(
-                resident, 124,
-                "{layer}: the capture must show packed_keep=124 pruning, got {resident}"
-            );
+                let (bias, mask) = bias_and_mask(&scores, &logits);
+                let resident = mask.iter().filter(|keep| **keep).count();
+                assert_eq!(
+                    resident, 124,
+                    "{tag}: expected packed_keep=124 pruning, got {resident}"
+                );
 
-            let got = select_experts(
-                &scores, &bias, &mask, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
-            )
-            .expect("routing must succeed");
+                let got = select_experts(
+                    &scores, &bias, &mask, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+                )
+                .expect("routing must succeed");
 
-            let mismatches = got
-                .indices
-                .iter()
-                .zip(&want_idx)
-                .filter(|(a, b)| a != b)
-                .count();
-            assert_eq!(
-                mismatches, 0,
-                "{layer}: {mismatches} of {} selected experts differ from the engine",
-                want_idx.len()
-            );
+                let mismatches = got
+                    .indices
+                    .iter()
+                    .zip(&want_idx)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(
+                    mismatches, 0,
+                    "{tag}: {mismatches} of {} selected experts differ from the engine",
+                    want_idx.len()
+                );
 
-            let worst = got
-                .weights
-                .iter()
-                .zip(&want_w)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                worst < 1e-5,
-                "{layer}: worst route_w error {worst:.3e} exceeds 1e-5"
-            );
-            layers_checked += 1;
+                let worst = got
+                    .weights
+                    .iter()
+                    .zip(&want_w)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(worst < 1e-5, "{tag}: worst route_w error {worst:.3e} exceeds 1e-5");
+                layers_checked += 1;
+                rows_checked += tokens;
+            }
         }
         assert!(layers_checked > 0, "the replay must have run on at least one layer");
+        eprintln!(
+            "routing replay: {layers_checked} layer-captures, {rows_checked} token-rows, \
+             across {} run(s)",
+            dirs.len()
+        );
     }
 
     /// NEGATIVE CONTROL 1: taking the weights from the LOGITS instead of the scores must
@@ -258,15 +277,15 @@ mod tests {
     /// Measured ~0.41 away, so the 1e-5 tolerance above genuinely separates them.
     #[test]
     fn weights_must_come_from_scores_not_logits() {
-        if !Path::new(REF_DIR).is_dir() {
-            eprintln!("skipping: {REF_DIR} not present");
+        let Some(dir) = ref_dirs().into_iter().next() else {
+            eprintln!("skipping: no captures under {REF_ROOT}");
             return;
-        }
+        };
         let (Some(scores), Some(logits), Some(want_idx), Some(want_w)) = (
-            read_f32("L00.route_scores.000.bin"),
-            read_f32("L00.route_logits.000.bin"),
-            read_i64("L00.route_idx.000.bin"),
-            read_f32("L00.route_w.000.bin"),
+            read_f32(&dir, "L00.route_scores.000.bin"),
+            read_f32(&dir, "L00.route_logits.000.bin"),
+            read_i64(&dir, "L00.route_idx.000.bin"),
+            read_f32(&dir, "L00.route_w.000.bin"),
         ) else {
             eprintln!("skipping: taps not present");
             return;
@@ -297,12 +316,13 @@ mod tests {
         );
     }
 
-    /// **The oracle replay is BLIND to the residency mask.** Measured, not assumed.
+    /// **The oracle replay is BLIND to the residency mask.** Measured, not assumed, and
+    /// re-measured over EVERY capture rather than the one this was first written against.
     ///
-    /// On every captured layer (0, 1, 2, 14) and all 37 tokens, the top-6 by UNMASKED
-    /// logits are already resident, so masked and unmasked selection are identical. A port
-    /// that skipped the mask entirely would pass `routing_replays_the_oracle_exactly` on
-    /// this capture.
+    /// Across runA (prose) and runB (Python source) — two unrelated prompts, layers 0/1/2/14,
+    /// 296 token-rows — the top-6 by UNMASKED logits are ALWAYS already resident, so masked
+    /// and unmasked selection are identical. A port that skipped the mask entirely would
+    /// pass `routing_replays_the_oracle_exactly` on both.
     ///
     /// That is expected rather than alarming — `packed_keep = 124` is a RANKED PREFIX of
     /// the most-used experts, so the top-6 for ordinary tokens nearly always fall inside
@@ -313,36 +333,46 @@ mod tests {
     /// If this ever starts failing, the capture has gained a token whose routing the mask
     /// actually changes — that is good news, and the replay becomes a real test of it.
     #[test]
-    fn the_oracle_capture_does_not_exercise_the_residency_mask() {
-        if !Path::new(REF_DIR).is_dir() {
-            eprintln!("skipping: {REF_DIR} not present");
+    fn the_oracle_captures_do_not_exercise_the_residency_mask() {
+        let dirs = ref_dirs();
+        if dirs.is_empty() {
+            eprintln!("skipping: no captures under {REF_ROOT}");
             return;
         }
-        let (Some(scores), Some(logits), Some(want_idx)) = (
-            read_f32("L00.route_scores.000.bin"),
-            read_f32("L00.route_logits.000.bin"),
-            read_i64("L00.route_idx.000.bin"),
-        ) else {
-            eprintln!("skipping: taps not present");
-            return;
-        };
-        let tokens = scores.len() / NUM_EXPERTS;
-        let (bias, _mask) = bias_and_mask(&scores, &logits);
-
-        let all_resident = vec![true; NUM_EXPERTS];
-        let unmasked =
-            select_experts(&scores, &bias, &all_resident, tokens, NUM_EXPERTS, K, ROUTE_SCALE)
+        let mut biting_rows = 0usize;
+        let mut total_rows = 0usize;
+        for dir in &dirs {
+            for layer in ["L00", "L01", "L02", "L14"] {
+                let (Some(scores), Some(logits)) = (
+                    read_f32(dir, &format!("{layer}.route_scores.000.bin")),
+                    read_f32(dir, &format!("{layer}.route_logits.000.bin")),
+                ) else {
+                    continue;
+                };
+                let tokens = scores.len() / NUM_EXPERTS;
+                let (bias, mask) = bias_and_mask(&scores, &logits);
+                let all_resident = vec![true; NUM_EXPERTS];
+                let unmasked = select_experts(
+                    &scores, &bias, &all_resident, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+                )
                 .unwrap();
-        let differ = unmasked
-            .indices
-            .iter()
-            .zip(&want_idx)
-            .filter(|(a, b)| a != b)
-            .count();
+                for token in 0..tokens {
+                    let picks = &unmasked.indices[token * K..(token + 1) * K];
+                    if picks.iter().any(|e| !mask[*e as usize]) {
+                        biting_rows += 1;
+                    }
+                    total_rows += 1;
+                }
+            }
+        }
+        eprintln!(
+            "residency mask bites on {biting_rows}/{total_rows} token-rows across {} capture(s)",
+            dirs.len()
+        );
         assert_eq!(
-            differ, 0,
-            "the capture NOW exercises the mask ({differ} picks differ unmasked). Good — \
-             delete this test and let `routing_replays_the_oracle_exactly` cover it."
+            biting_rows, 0,
+            "the captures NOW exercise the mask ({biting_rows}/{total_rows} rows). Good — \
+             delete this test; `routing_replays_the_oracle_exactly` now covers it for real."
         );
     }
 

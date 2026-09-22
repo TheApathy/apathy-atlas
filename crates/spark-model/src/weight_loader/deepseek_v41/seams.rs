@@ -44,45 +44,111 @@ pub const CANDIDATE_SOURCE_LAYER: usize = 20;
 /// change router decisions downstream. This is a numerics contract, not a buffer size.
 pub const INDEX_TOPK: usize = 512;
 
-/// Cross-layer state for ONE forward pass, threaded through all 40 layers.
+/// Per-CHUNK sparse state, threaded through all 40 layers of one pass.
 ///
-/// ## Where this lives, and why it is here rather than on `ForwardContext`
-/// The lifetime asked for is "persists across the whole 40-layer loop of one forward,
-/// resets per forward". That does **not** fit [`crate::layer::LayerState`], which is
-/// per-layer. The structurally right home is `ForwardContext`, which this lane does not
-/// own.
+/// ## What is in here, and what is deliberately NOT
+/// Only the things whose lifetime is ONE CHUNK: `topk` and `candidates`. Both are indexed
+/// by the CURRENT chunk's tokens, so rebuilding them per chunk is correct.
 ///
-/// So the layers share one `Arc<Mutex<SparseShared>>` and **layer 0 resets it**. That is
-/// sound rather than merely convenient: layer 0 runs exactly once per forward, and it has
-/// `compress_ratio == 0`, so it does no sparse work that a reset could destroy. It is
-/// still a workaround — if `ForwardContext` ever gains a per-forward slot, move it there.
+/// **`ckv` and `ik` are NOT storage here — they are borrowed handles.** An earlier version
+/// of this struct OWNED them and cleared them in `begin_pass`. That was wrong, and
+/// dsv41-attention settled it from the reference with evidence I could not have derived:
 ///
-/// ## What is NOT here
-/// The compressor's `pending` (one unpaired position per ratio-2 layer) carries across
-/// CHUNKS, not just across layers, so it belongs in the KV cache. Putting it here would
-/// silently drop it between chunks of the same sequence.
+/// - they are allocated ONCE per sequence, sized `max_seq / ratio + 1` (`Caches.__init__`),
+///   never rebuilt per chunk;
+/// - writes land at an ABSOLUTE offset, `c.ckv[L][j0 : j0+nj]` with `j0 = chunk_start /
+///   ratio`, so a chunk fills its own slice of a sequence-long cache;
+/// - `Shared` in the reference only ALIASES them — `sh.ckv, sh.ik, sh.ratio = c.ckv[L],
+///   c.ik[L], r` is a pointer plus the ratio, never a copy;
+/// - `Caches.rollback` says it outright: these caches are APPEND-ONLY.
+///
+/// And the clincher: the indexer selects ABSOLUTE positions. At chunk 2 a token may select
+/// compressed row 12, which chunk 1 wrote. Clearing `ckv` per chunk makes that gather read
+/// ZEROS — attention silently mixes in zero rows, output is wrong, nothing errors. Exactly
+/// the failure class this port is organised against, which is why it was flagged rather
+/// than guessed.
+///
+/// So `ckv`/`ik` live in the KV CACHE alongside the window ring and the compressor's
+/// `pending` — all three are sequence-lifetime, append-only and indexed by absolute
+/// position. `pending` feeds `ckv`, so they must share a lifetime; that symmetry holds.
+/// [`Self::begin_pass`] therefore has nothing to special-case, and "ckv got cleared"
+/// becomes unrepresentable rather than a comment someone has to remember.
+///
+/// ## Where this lives, and why it is NOT on `ForwardContext`
+/// The layers share one `Arc<Mutex<SparseShared>>`. The objection to a shared mutable
+/// singleton is that two concurrent forwards would corrupt each other. **They cannot.**
+/// `spark-server`'s scheduler takes `mut model: Box<dyn Model>` by value
+/// (`crates/spark-server/src/scheduler/mod.rs:206`) — the model is MOVED into one thread
+/// and exactly one forward runs at a time. Batched decode batches WITHIN a forward. So the
+/// singleton is sound, and a `ForwardContext` field would buy nothing while touching 34
+/// construction sites across files two other lanes are editing.
+///
+/// The lock is taken once per LAYER, not per token — about 40 uncontended acquisitions per
+/// forward. If the scheduler ever grows concurrent forwards over one model, this becomes a
+/// real bug and `ForwardContext` becomes the right answer. That is the trigger to watch.
 #[derive(Default)]
 pub struct SparseShared {
-    /// Per layer, the inherited compressed-KV rows: `[n, 512]` bf16. Written on
-    /// [`KV_SOURCE_LAYERS`], read by their inheritors.
+    /// Handle to the current kv-source layer's compressed-KV cache: `[rows, 512]` bf16.
+    ///
+    /// BORROWED from the KV cache, never owned here. Set on [`KV_SOURCE_LAYERS`], read by
+    /// their inheritors. Survives chunk boundaries because the cache does.
     pub ckv: Option<DevicePtr>,
-    /// Rows currently in `ckv`.
+    /// Handle to the matching index-key cache, `[rows, index_head_dim]`.
+    pub ik: Option<DevicePtr>,
+    /// Rows currently VALID in `ckv`/`ik` — grows with the sequence, not with the chunk.
     pub ckv_rows: usize,
-    /// Index keys built alongside `ckv` on the same layers.
-    pub index_keys: Option<DevicePtr>,
-    /// Per layer, the inherited selection: `[T, 512]` i64, -1 = none. Written on
-    /// [`INDEX_SOURCE_LAYERS`], read by their inheritors. ALWAYS 512 wide.
+    /// `compress_ratios[layer]` of the kv-source layer whose caches `ckv`/`ik` point at.
+    ///
+    /// **Re-read from the kv-source layer on EVERY layer; never cached across a forward.**
+    /// The ratio flips 2 -> 1 at layer 20, which is itself a kv-source layer. The reference
+    /// asserts `sh.ratio == w.ratio` on every layer for exactly this reason: if a future
+    /// schedule moved the flip off a source boundary, a layer would inherit a cache built
+    /// at the wrong ratio and nothing else would catch it.
+    pub ratio: usize,
+    /// Per-chunk selection: `[num_tokens, 512]` i64, -1 = none. Written on
+    /// [`INDEX_SOURCE_LAYERS`], read by their inheritors. ALWAYS 512 wide. RESET per chunk.
     pub topk: Option<DevicePtr>,
     /// The candidate block mask from layer 20's indexer alone, pruning 24/28/32/36.
+    /// RESET per chunk.
     pub candidates: Option<DevicePtr>,
-    /// `compress_ratios[layer]` of whichever layer last wrote `ckv`. Flips 2 -> 1 at 20.
-    pub ratio: usize,
+    /// Chunk start of the pass in flight, for debugging a stale-state bug.
+    pub pass_start: usize,
+    /// Passes begun since construction. Lets a caller assert the reset actually ran.
+    pub passes: u64,
 }
 
 impl SparseShared {
-    /// Called by layer 0 at the top of every forward. See the note on the struct.
-    pub fn reset_for_new_forward(&mut self) {
-        *self = Self::default();
+    /// Begin one pass over the 40 layers, for the chunk starting at `chunk_start`.
+    ///
+    /// Called by LAYER 0 and nowhere else. Layer 0 is a sound reset point for a reason, not
+    /// by convenience: it runs exactly once per pass and has `compress_ratio == 0`, so it
+    /// performs no sparse work a reset could destroy.
+    ///
+    /// Clears ONLY the per-chunk fields. `ckv`/`ik`/`ckv_rows`/`ratio` are handles into
+    /// sequence-lifetime caches and are re-published by the next kv-source layer; clearing
+    /// them here is the bug described on the struct.
+    pub fn begin_pass(&mut self, chunk_start: usize) {
+        self.topk = None;
+        self.candidates = None;
+        self.pass_start = chunk_start;
+        self.passes += 1;
+    }
+
+    /// Publish a kv-source layer's caches for its inheritors.
+    ///
+    /// Takes `ratio` alongside the pointers so the two cannot drift: a handle without the
+    /// ratio it was built at is how a layer ends up reading a cache at the wrong stride.
+    pub fn publish_compressed(
+        &mut self,
+        ckv: DevicePtr,
+        ik: DevicePtr,
+        rows: usize,
+        ratio: usize,
+    ) {
+        self.ckv = Some(ckv);
+        self.ik = Some(ik);
+        self.ckv_rows = rows;
+        self.ratio = ratio;
     }
 }
 
@@ -213,10 +279,19 @@ pub trait Dsv41Engram: Send + Sync {
 /// Returning `None` is the CORRECT answer off [`ENGRAM_LAYERS`], and is the one place in
 /// this port where an empty success is not a silent gap.
 pub trait Dsv41EngramLoader: Send + Sync {
+    /// Takes a MODEL DIRECTORY, not a `WeightStore`.
+    ///
+    /// This signature originally took `&WeightStore` by symmetry with the attention loader.
+    /// That was a lie about where the data comes from: at ~95 GB per table the engram
+    /// tensors are never loaded into the store at all, and an implementation must parse
+    /// `model.safetensors.index.json` itself to find the right shard. The old signature
+    /// "worked" only because the implementation ignored the argument and took the directory
+    /// through a separate registration call — which is exactly the kind of quiet divergence
+    /// between a signature and reality that costs the next reader an hour.
     fn load_engram(
         &self,
         layer: usize,
-        store: &WeightStore,
+        model_dir: &std::path::Path,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<Option<Box<dyn Dsv41Engram>>>;
@@ -382,20 +457,62 @@ mod tests {
         }
     }
 
-    /// `cidx` width is a numerics contract, and `SparseShared` must reset cleanly.
+    /// `cidx` width is a numerics contract, and `begin_pass` must clear the per-chunk
+    /// fields while LEAVING the sequence-lifetime handles alone.
+    ///
+    /// The second half is the regression test for a bug this struct actually had: clearing
+    /// `ckv` per chunk makes a chunk-2 gather of a chunk-1 row read zeros, which attention
+    /// mixes in silently.
     #[test]
-    fn topk_width_is_fixed_and_shared_resets() {
+    fn begin_pass_clears_per_chunk_state_and_preserves_the_sequence_caches() {
         assert_eq!(INDEX_TOPK, 512);
-        let mut shared = SparseShared {
-            ckv: Some(DevicePtr(0xdead)),
-            ckv_rows: 99,
-            ratio: 2,
-            ..Default::default()
-        };
-        shared.reset_for_new_forward();
-        assert!(shared.ckv.is_none());
-        assert_eq!(shared.ckv_rows, 0);
-        assert_eq!(shared.ratio, 0);
+        let mut shared = SparseShared::default();
+        shared.publish_compressed(DevicePtr(0xC10), DevicePtr(0x1C0), 1024, 2);
+        shared.topk = Some(DevicePtr(0x700));
+        shared.candidates = Some(DevicePtr(0xCA0));
+
+        shared.begin_pass(2048);
+
+        // Per-chunk state is gone.
+        assert!(shared.topk.is_none(), "topk is per-chunk and must be cleared");
+        assert!(shared.candidates.is_none(), "candidates are per-chunk");
+        assert_eq!(shared.pass_start, 2048);
+        assert_eq!(shared.passes, 1);
+
+        // Sequence-lifetime handles SURVIVE. If this ever fails, a chunk-2 gather of a
+        // chunk-1 compressed row reads zeros and nothing errors.
+        assert_eq!(
+            shared.ckv,
+            Some(DevicePtr(0xC10)),
+            "ckv is a handle into a sequence-lifetime cache and must survive a chunk boundary"
+        );
+        assert_eq!(shared.ik, Some(DevicePtr(0x1C0)), "ik survives with ckv");
+        assert_eq!(shared.ckv_rows, 1024, "valid rows grow with the sequence, not the chunk");
+        assert_eq!(shared.ratio, 2, "the ratio travels with the handle");
+
+        // The pass counter keeps counting across passes.
+        shared.begin_pass(4096);
+        assert_eq!(shared.passes, 2);
+        assert_eq!(shared.pass_start, 4096);
+        assert_eq!(shared.ckv_rows, 1024);
+    }
+
+    /// The ratio flip at layer 20 lands ON a kv-source layer.
+    ///
+    /// That is what makes "re-read the ratio from the kv-source layer every layer" safe. If
+    /// a future schedule moved the flip off a source boundary, a layer would inherit a
+    /// cache built at the wrong stride and nothing else would catch it — so the property is
+    /// asserted rather than assumed.
+    #[test]
+    fn the_ratio_flip_lands_on_a_kv_source_layer() {
+        // compress_ratios: 0 for 0-1, 2 for 2-19, 1 for 20-39.
+        const FLIP: usize = 20;
+        assert!(
+            KV_SOURCE_LAYERS.contains(&FLIP),
+            "the 2 -> 1 ratio flip at layer {FLIP} must coincide with a kv-source layer"
+        );
+        // And it is the last one, so no later source re-publishes at the old ratio.
+        assert_eq!(*KV_SOURCE_LAYERS.last().unwrap(), FLIP);
     }
 
     /// Engram belongs to exactly two layers, with the shape the engram lane specified.
