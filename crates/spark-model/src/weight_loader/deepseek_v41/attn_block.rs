@@ -232,6 +232,23 @@ pub fn attention(
         )
     })?;
     tap.bf16(ops, "attn_o_pre_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
+    attn_output(ops, w, s, wscratch, rope, t, out, tap)
+}
+
+/// The attention sub-layer AFTER the core: inverse RoPE of `s.o` (positions in `s.pos`), the
+/// grouped `wo_a`, then `wo_b` into `out`. Shared by the main layers and the DSpark draft blocks.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_output(
+    ops: &Ops,
+    w: &V41AttnWeights,
+    s: &AttnScratch,
+    wscratch: DevicePtr,
+    rope: &RopeTable,
+    t: usize,
+    out: DevicePtr,
+    tap: &Tap,
+) -> Result<()> {
+    let l = w.layer;
     ops.rope_tail(s.o, s.pos, rope, t, N_HEADS, HEAD_DIM, true)?;
     tap.bf16(ops, "attn_o_post_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
 

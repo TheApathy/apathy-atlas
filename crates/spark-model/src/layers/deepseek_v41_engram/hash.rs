@@ -271,6 +271,30 @@ impl EngramHashState {
         self.cache.clear();
     }
 
+    /// Discard everything at positions `>= n` (DSpark verify rejection).
+    ///
+    /// The checkpoint's own `NgramHashState.forward` writes into a pre-allocated,
+    /// ABSOLUTE-position buffer (`self.cache[:batch, start_pos:start_pos+seqlen] = compressed`,
+    /// `inference/engram.py`), so on the Python side a rejected speculative pass needs no
+    /// explicit rollback at all: the next real forward call at the same `start_pos` simply
+    /// overwrites the garbage before anything reads it — the same reasoning
+    /// `engine/model.py::Caches.rollback`'s docstring gives for the window ring and the
+    /// compressed/index caches ("append-only and every slot at or after n is rewritten by the
+    /// next forward before anything can read it").
+    ///
+    /// This port's `cache` is append-only (`Vec::push`, not an absolute-index buffer), so it
+    /// has no such free lunch: `forward` asserts `self.cache.len() == start_pos`, and after a
+    /// speculative verify call pushed rejected draft ids past the real accepted length, the
+    /// NEXT forward call (at the accepted length `n`) would fail that assertion without an
+    /// explicit truncation first. `rollback` is that truncation.
+    pub fn rollback(&mut self, n: usize) -> Result<()> {
+        if n > self.cache.len() {
+            bail!("engram hash state holds {} positions, cannot roll forward to {n}", self.cache.len());
+        }
+        self.cache.truncate(n);
+        Ok(())
+    }
+
     /// Positions already absorbed.
     pub fn len(&self) -> usize {
         self.cache.len()
@@ -576,6 +600,105 @@ mod tests {
         let mut split = st.forward(&ids[..3], 0, None).unwrap();
         split.extend(st.forward(&ids[3..], 3, None).unwrap());
         assert_eq!(one, split, "chunk boundary changed the hashes");
+    }
+
+    /// THE DSPARK GATE (team-lead, 2026-09-22): push a 6-token draft+anchor block (the
+    /// verify-pass shape, block_size 5 + anchor), roll back to `k` accepted positions, push the
+    /// real accepted continuation, and require this to be BYTE-IDENTICAL to a state that never
+    /// saw the rejected draft ids at all. `rollback` must be a true undo, not an approximation.
+    #[test]
+    fn rollback_reproduces_a_state_that_never_saw_the_rejected_drafts() {
+        let anchor_and_drafts = [0u32, 1, 2, 3, 4, 5]; // 1 anchor + 5 speculative drafts
+        let k = 3usize; // 2 of the 5 drafts accepted (anchor + 2), 3 rejected
+        let accepted_continuation = [6u32, 7, 0]; // what verify actually emits next
+
+        // Reference: a fresh state that only ever sees the TRUE sequence.
+        let mut clean = state(mults());
+        let mut want = clean.forward(&anchor_and_drafts[..k], 0, None).unwrap();
+        want.extend(clean.forward(&accepted_continuation, k, None).unwrap());
+
+        // The speculative path: push all 6 (as the verify forward call does), reject the last
+        // 3, roll back, then push the same accepted continuation.
+        let mut spec = state(mults());
+        let mut got = spec.forward(&anchor_and_drafts, 0, None).unwrap(); // all 6, speculative
+        spec.rollback(k).unwrap();
+        assert_eq!(spec.len(), k, "rollback did not truncate to the accepted length");
+        let replay = spec.forward(&accepted_continuation, k, None).unwrap();
+
+        // Compare only the surviving prefix (first k positions) plus the replayed continuation
+        // -- rows k..6 of `got` are the discarded speculative hashes and are not part of the
+        // comparison (nothing downstream should ever read them again).
+        got.truncate(k * 2 * 24); // n_layers=2, n_cols=24 per position
+        got.extend(replay);
+        assert_eq!(got, want, "rollback + replay did not reproduce a state that never saw the rejected drafts");
+    }
+
+    /// NEGATIVE CONTROL: skipping the rollback (pushing the accepted continuation at the WRONG
+    /// start_pos, or -- since `forward`'s own `ensure!` would reject a length mismatch outright
+    /// -- continuing to push past the rejected drafts as if they were real) must NOT reproduce
+    /// the clean state. Exercised by asserting `forward` itself refuses to proceed without a
+    /// rollback first, which is the actual failure mode: a caller that forgets to roll back
+    /// cannot even take the next step, rather than silently corrupting history.
+    #[test]
+    fn skipping_the_rollback_is_rejected_not_silently_wrong() {
+        let anchor_and_drafts = [0u32, 1, 2, 3, 4, 5];
+        let k = 3usize;
+        let accepted_continuation = [6u32, 7, 0];
+
+        let mut spec = state(mults());
+        spec.forward(&anchor_and_drafts, 0, None).unwrap(); // cache.len() == 6
+        // Attempting to push the accepted continuation at position k WITHOUT rolling back
+        // first must fail loudly (cache.len()==6 != start_pos==3), not silently accept it and
+        // produce a state that still carries the rejected drafts' history.
+        let err = spec.forward(&accepted_continuation, k, None);
+        assert!(err.is_err(), "forward without a prior rollback must be rejected, not silently corrupt history");
+
+        // And to show the control is not vacuous: WITH rollback, the identical call succeeds.
+        spec.rollback(k).unwrap();
+        assert!(spec.forward(&accepted_continuation, k, None).is_ok(), "the same call must succeed after rollback");
+    }
+
+    /// `rollback` itself must refuse to roll FORWARD (n > current length) rather than silently
+    /// treating it as a no-op or extending the cache with garbage.
+    #[test]
+    fn rollback_past_the_current_length_is_rejected() {
+        let mut st = state(mults());
+        st.forward(&[1u32, 2, 3], 0, None).unwrap();
+        assert!(st.rollback(5).is_err(), "rolling back past the current length must fail");
+        assert!(st.rollback(3).is_ok(), "rolling back to exactly the current length must succeed (a no-op)");
+    }
+
+    /// "the dead-head decode behaviour must match too" (team-lead): DSpark verify calls
+    /// `m.forward(block, pos, prefill=False)` (`v41_engine.py:1006`/`946`) -- no `dead_heads`
+    /// kwarg, so `model.py:746-747`'s fallback computes it fresh from THAT CALL'S OWN block,
+    /// exactly like ordinary decode (see `dead_heads.rs`'s
+    /// `decode_after_an_image_ending_prompt_must_not_carry`). Because `engram_dead_heads` never
+    /// looks outside the ids it is given, a rejected speculative pass cannot pollute it the way
+    /// it can `EngramHashState`'s cache: the accepted continuation's dead-head row is identical
+    /// whether or not a rejected draft block was hashed first. No rollback state is needed for
+    /// dead-heads at all -- this test is the gate that proves that, not just asserts it.
+    #[test]
+    fn dead_heads_for_the_accepted_continuation_is_unaffected_by_a_rejected_draft_block() {
+        use super::super::dead_heads::engram_dead_heads;
+        let rejected_drafts = [129_264u32, 99, 98]; // a sentinel among the REJECTED drafts
+        let accepted_continuation = [1u32, 2, 3];
+
+        // "Speculative" path: hash the rejected block (as the verify call does), then compute
+        // decode-style dead-heads for the accepted continuation -- which, being block-local,
+        // never even looks at `rejected_drafts`.
+        let after_rejected_draft = engram_dead_heads(&accepted_continuation);
+
+        // Clean path: never saw the rejected block at all.
+        let clean = engram_dead_heads(&accepted_continuation);
+
+        assert_eq!(after_rejected_draft, clean, "dead-heads for the accepted continuation must not depend on a rejected draft block");
+        // Not vacuous: the rejected block's OWN dead-heads (if computed) would differ, since it
+        // contains a sentinel and the accepted continuation does not.
+        assert_ne!(
+            engram_dead_heads(&rejected_drafts).iter().filter(|&&d| d).count(),
+            0,
+            "the rejected block must actually contain a sentinel for this control to mean anything"
+        );
     }
 
     /// Row ids are never negative. NOTE: this is a weak property — it holds

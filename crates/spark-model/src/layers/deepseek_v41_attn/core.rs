@@ -149,6 +149,12 @@ struct KvSource {
     rows_cap: usize,
     /// r=2 unpaired position carried across chunks: kv `[512]` f32 then score `[512]` f32.
     pending: DevicePtr,
+    /// ROLLBACK (DSpark verify): the last pass's compressor inputs, as `Caches._chunk_inputs`:
+    /// its projected kv/score rows `[max_chunk, 512]` f32 each, and the pending row it started
+    /// from. Only ratio-2 layers carry state across positions, so only they keep these.
+    save_kv: DevicePtr,
+    save_sc: DevicePtr,
+    before: DevicePtr,
 }
 
 struct Indexer {
@@ -194,6 +200,11 @@ struct SeqState {
     topk: Option<DevicePtr>,
     cand: Option<(DevicePtr, usize)>,
     kind: Option<PassKind>,
+    /// Per layer: the last compressor pass `(start, t, pending_before)` -- what rollback restores
+    /// from. `None` until the layer has compressed in this sequence.
+    last: Vec<Option<(usize, usize, bool)>>,
+    /// Positions the core has absorbed (end of the last pass, or the rollback point).
+    len: usize,
     pass_start: usize,
     pass_t: usize,
     tail: TailState,
@@ -223,7 +234,7 @@ pub struct Dsv41SparseCore {
     /// token). On the real runC fixture: 12.5x faster than the one-pass fp32 kernel, 99.90% of
     /// bf16 outputs identical to it, no added error vs the fp32 reference (attn gate log).
     /// `ATLAS_DSV41_ATTN_MMA=0` restores the one-pass kernel (A/B arm only).
-    mma_kernel: Option<KernelHandle>,
+    mma_kernel: Option<(KernelHandle, usize)>,
     combine_kernel: KernelHandle,
     /// `[DECODE_MAX_T, 64, S, 2 + 512]` fp32 split partials.
     part: DevicePtr,
@@ -291,10 +302,20 @@ impl Dsv41SparseCore {
         let cvt = gpu.kernel(FWD_MODULE, "dsv41_bf16_to_f32").context("dsv41_fwd::dsv41_bf16_to_f32 not in the PTX")?;
         let idx = IndexKernels::load(gpu)?;
         let split_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split").context("dsv41_sparse_attn_split not in the PTX")?;
+        // Heads per CTA for the tensor-core entry: 16 (4 warps), 32 or 64 (the same warps fused,
+        // sharing one K gather per tile). All three are BYTE-IDENTICAL (attn gate); the choice is
+        // speed only. `ATLAS_DSV41_ATTN_HPC` overrides the default for A/B.
+        let hpc: usize = std::env::var("ATLAS_DSV41_ATTN_HPC").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
         let mma_kernel = if std::env::var("ATLAS_DSV41_ATTN_MMA").as_deref() == Ok("0") {
             None
         } else {
-            Some(gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_mma").context("dsv41_sparse_attn_mma not in the PTX")?)
+            let name = match hpc {
+                16 => "dsv41_sparse_attn_mma",
+                32 => "dsv41_sparse_attn_mma32h",
+                64 => "dsv41_sparse_attn_mma64",
+                o => anyhow::bail!("ATLAS_DSV41_ATTN_HPC={o}: use 16, 32 or 64"),
+            };
+            Some((gpu.kernel(ATTN_MODULE, name).with_context(|| format!("{name} not in the PTX"))?, hpc))
         };
         let combine_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_combine").context("dsv41_sparse_attn_combine not in the PTX")?;
         let attn_kernel = gpu
@@ -345,6 +366,9 @@ impl Dsv41SparseCore {
                     ik,
                     rows_cap,
                     pending: alloc(2 * HEAD_DIM * 4)?,
+                    save_kv: alloc(max_chunk * HEAD_DIM * 4)?,
+                    save_sc: alloc(max_chunk * HEAD_DIM * 4)?,
+                    before: alloc(2 * HEAD_DIM * 4)?,
                 })
             } else {
                 None
@@ -411,7 +435,7 @@ impl Dsv41SparseCore {
             rope_c: freqs_c,
             tail,
             s,
-            st: Mutex::new(SeqState { has_pending: vec![false; 40], ..SeqState::default() }),
+            st: Mutex::new(SeqState { has_pending: vec![false; 40], last: vec![None; 40], ..SeqState::default() }),
             prof: Prof::new(),
             allocs: allocs.into_inner(),
             split_on: std::env::var("ATLAS_DSV41_ATTN_SPLIT").as_deref() != Ok("0"),
@@ -446,6 +470,64 @@ impl Dsv41SparseCore {
     pub fn prof_take(&self) -> Vec<(&'static str, f64, u64)> {
         let mut g = self.prof.inner.lock().expect("prof");
         std::mem::take(&mut g.1).into_iter().map(|(k, (ms, n))| (k, ms, n)).collect()
+    }
+
+    /// DSpark ROLLBACK: discard every position >= `n` (`engine/model.py` `Caches.rollback`).
+    ///
+    /// Only the ratio-2 compressor carries state across positions: its unpaired `pending` row.
+    /// It is restored from the LAST pass's saved inputs: `n` even -> nothing pending; else the
+    /// row for position n-1, which is either in the last pass (its saved projection) or the one
+    /// that pass started from. Everything else is append-only at absolute offsets -- ckv/ik rows,
+    /// L20's cache, the rings (the caller's) -- so rows >= n are simply rewritten by the next
+    /// pass before anything reads them (compressed row j is visible only to positions >= j*r,
+    /// and the next pass writes row j before attending). Rolling back past the last pass's
+    /// start is refused: those inputs are no longer kept.
+    pub fn rollback(&self, gpu: &dyn GpuBackend, n: usize, stream: u64) -> Result<()> {
+        self.rollback_inner(gpu, n, true, stream)
+    }
+
+    /// NEGATIVE CONTROL ONLY: truncate the length but SKIP the pending restore -- the bug the
+    /// rollback gate must be able to see.
+    pub fn control_rollback_without_restore(&self, gpu: &dyn GpuBackend, n: usize, stream: u64) -> Result<()> {
+        self.rollback_inner(gpu, n, false, stream)
+    }
+
+    fn rollback_inner(&self, gpu: &dyn GpuBackend, n: usize, restore: bool, stream: u64) -> Result<()> {
+        let mut st = self.st.lock().expect("core state poisoned");
+        ensure!(n <= st.len, "rollback({n}) past the {} positions held", st.len);
+        let row = HEAD_DIM * 4;
+        for (layer, lw) in self.layers.iter().enumerate() {
+            let Some(c) = lw.kv.as_ref() else { continue };
+            if c.ratio != 2 || !restore {
+                continue;
+            }
+            let Some((s0, t0, pend_before)) = st.last[layer] else {
+                // Never compressed in this sequence (a gate driving a subset of layers): it holds
+                // no pending row to restore.
+                ensure!(!st.has_pending[layer], "layer {layer}: pending row with no compressor pass recorded");
+                continue;
+            };
+            if n % 2 == 0 {
+                st.has_pending[layer] = false;
+                continue;
+            }
+            let p = n - 1; // the position left unpaired at n
+            if p >= s0 && p < s0 + t0 {
+                gpu.copy_d2d_async(c.save_kv.offset((p - s0) * row), c.pending, row, stream)?;
+                gpu.copy_d2d_async(c.save_sc.offset((p - s0) * row), c.pending.offset(row), row, stream)?;
+            } else if p + 1 == s0 {
+                ensure!(pend_before, "layer {layer}: position {p} should have been pending before the pass at {s0}");
+                gpu.copy_d2d_async(c.before, c.pending, 2 * row, stream)?;
+            } else {
+                anyhow::bail!(
+                    "rollback({n}) reaches before the last pass (start {s0}); the compressor input for position {p} is no longer kept"
+                );
+            }
+            st.has_pending[layer] = true;
+        }
+        st.len = n;
+        st.kind = None; // the next pass starts clean
+        Ok(())
     }
 
     /// NEGATIVE CONTROL ONLY: forget the carried ratio-2 row at `layer`, as a port that
@@ -494,6 +576,11 @@ impl Dsv41SparseCore {
         let (j0, nj) = if r == 2 {
             let pend = usize::from(st.has_pending[layer]);
             let n = t + pend;
+            ensure!(t <= self.max_chunk, "compress: {t} rows exceed max_chunk {}", self.max_chunk);
+            if pend == 1 {
+                gpu.copy_d2d_async(c.pending, c.before, 2 * row, stream)?; // for rollback
+            }
+            st.last[layer] = Some((start, t, pend == 1));
             ops.bf16_to_f32(a.x, s.xf, t * HIDDEN)?;
             self.prof.mark(ops, "compress.x_to_f32")?;
             if pend == 1 {
@@ -513,6 +600,8 @@ impl Dsv41SparseCore {
                 iops.gemm_f32(s.xf, wgate, s.sc.offset(pend * row), t, HEAD_DIM, HIDDEN)?;
             }
             self.prof.mark(ops, if self.comp_cublas_tiled { "compress.gemm_f32_x2.cublas16" } else { "compress.gemm_f32_x2" })?;
+            gpu.copy_d2d_async(s.kvl.offset(pend * row), c.save_kv, t * row, stream)?; // for rollback
+            gpu.copy_d2d_async(s.sc.offset(pend * row), c.save_sc, t * row, stream)?;
             if n % 2 == 1 {
                 gpu.copy_d2d_async(s.kvl.offset((n - 1) * row), c.pending, row, stream)?;
                 gpu.copy_d2d_async(s.sc.offset((n - 1) * row), c.pending.offset(row), row, stream)?;
@@ -661,7 +750,7 @@ impl Dsv41SparseCore {
             return Ok(());
         }
         let scale = (HEAD_DIM as f32).powf(-0.5);
-        if st.kind == Some(PassKind::Decode) && a.t <= DECODE_MAX_T && self.split_on {
+        if matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on {
             let keys = WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK };
             let splits = keys.div_ceil(DECODE_SLICE);
             KernelLaunch::new(ops.gpu, self.split_kernel)
@@ -695,7 +784,7 @@ impl Dsv41SparseCore {
                 .launch(ops.stream);
         }
         let (kernel, heads_per_cta, threads) = match self.mma_kernel {
-            Some(k) => (k, 16usize, 128u32),
+            Some((k, hpc)) => (k, hpc, (hpc / 16 * 128) as u32),
             None => (self.attn_kernel, HEADS_PER_BLOCK, ATTN_THREADS),
         };
         KernelLaunch::new(ops.gpu, kernel)
@@ -728,6 +817,8 @@ impl PassHook for Dsv41SparseCore {
             // A new prompt: nothing is carried. NEVER on Decode or Replay, which continue the
             // sequence -- a reset there would wipe ckv's pending row and the replay tail.
             st.has_pending = vec![false; 40];
+            st.last = vec![None; 40];
+            st.len = 0;
             st.published = None;
             st.tail = TailState::default();
         }
@@ -742,6 +833,12 @@ impl PassHook for Dsv41SparseCore {
                 eprintln!("  {k:28} {ms:9.2} ms  {n:5} calls  {:8.3} ms/call", ms / n as f64);
             }
         }
+        if kind != PassKind::Replay {
+            // Encoder/decode passes continue the sequence exactly where it stands (a rolled-back
+            // sequence resumes AT the rollback point, never past it).
+            ensure!(start == st.len || start == 0, "pass at {start} but the core holds {} positions", st.len);
+            st.len = start + t;
+        }
         st.kind = Some(kind);
         st.pass_start = start;
         st.pass_t = t;
@@ -753,12 +850,17 @@ impl PassHook for Dsv41SparseCore {
                 st.topk = Some(self.tail.topk[st.tail.cur]);
                 st.cand = Some((self.tail.cand[st.tail.cur], st.tail.ld));
             }
-            PassKind::EncoderChunk | PassKind::FullChunk | PassKind::Decode => {
+            PassKind::EncoderChunk | PassKind::FullChunk | PassKind::Decode | PassKind::Verify => {
                 st.topk = None;
                 st.cand = None;
             }
         }
         Ok(())
+    }
+
+    /// DSpark: delegates to the gated [`Dsv41SparseCore::rollback`] on the forward's stream.
+    fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
+        Dsv41SparseCore::rollback(self, ops.gpu, n, ops.stream)
     }
 }
 
@@ -784,7 +886,7 @@ impl AttnCore for Dsv41SparseCore {
         }
         self.prof.begin(ops)?;
         self.attend(ops, a, &st)?;
-        let split = st.kind == Some(PassKind::Decode) && a.t <= DECODE_MAX_T && self.split_on;
+        let split = matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on;
         self.prof.mark(
             ops,
             match (lw.ratio == 0, split) {
@@ -802,6 +904,10 @@ impl AttnCore for Dsv41SparseCore {
 impl PassHook for std::sync::Arc<Dsv41SparseCore> {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         self.as_ref().begin_pass(kind, start, t)
+    }
+
+    fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
+        PassHook::rollback(self.as_ref(), ops, n)
     }
 }
 

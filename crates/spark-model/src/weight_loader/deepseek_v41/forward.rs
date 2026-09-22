@@ -102,6 +102,9 @@ pub enum PassKind {
     Replay,
     /// One generated token through all 40 layers.
     Decode,
+    /// DSpark verify: the accepted token plus the drafts (T <= 8) through all 40 layers. Behaves as
+    /// Decode everywhere (decode-size kernels, no dead-head carry); followed by a rollback.
+    Verify,
     /// Debug: all 40 layers over a whole prompt chunk (no replay).
     FullChunk,
 }
@@ -117,6 +120,12 @@ pub enum PrefillMode {
 /// Per-pass hook for the attention lane, called once before the first layer of a pass.
 pub trait PassHook {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()>;
+    /// DSpark: discard every position >= `n` after a Verify pass (see BRIEF.md, "DSPARK ROLLBACK
+    /// CONTRACT"). The default REFUSES: a core that carries state across positions and does not
+    /// implement this would otherwise silently keep the rejected drafts' state.
+    fn rollback(&self, _ops: &Ops, n: usize) -> Result<()> {
+        anyhow::bail!("this attention core cannot roll back (to {n} positions)")
+    }
 }
 
 /// Per-sequence state this module owns. (ckv / ik / pending belong to the attention lane.)
@@ -381,17 +390,17 @@ impl V41Forward {
         // after an image-ending prompt's first generated token. Replay never reaches an engram
         // layer, so it never exercises this branch either way.
         let mut dead_bools = match kind {
-            PassKind::Decode => engram_dead_heads(ids),
+            PassKind::Decode | PassKind::Verify => engram_dead_heads(ids),
             _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
         };
-        if kind != PassKind::Decode {
+        if !matches!(kind, PassKind::Decode | PassKind::Verify) {
             // Attribution tool only, real path is a no-op (`DeadArm::Ported`) -- see
             // `apply_dead_arm`'s doc. Applied AFTER the carry, so `--dead-arm shifted`'s shift
             // is relative to what the executing path actually computed, not a re-derivation.
             dead_bools = apply_dead_arm(dead_arm()?, dead_bools, t);
         }
         let dead: Vec<u8> = dead_bools.into_iter().map(u8::from).collect();
-        if kind != PassKind::Decode {
+        if !matches!(kind, PassKind::Decode | PassKind::Verify) {
             update_dead_carry(&mut seq.dead_carry, ids);
         }
         if engram_debug() {
@@ -409,14 +418,14 @@ impl V41Forward {
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
         // Image spans (prefill only; decode ids are never image ids). A no-op, with no
         // GPU work, unless this request encoded images.
-        if kind != PassKind::Decode
+        if !matches!(kind, PassKind::Decode | PassKind::Verify)
             && let Some(v) = &self.vision
         {
             v.splice(ops.gpu, ops.stream, self.embed, ids, start, self.scratch.x)?;
         }
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         // Decode-size kernels key on the PASS KIND (never on t): see ops::set_decode_pass.
-        super::ops::set_decode_pass(kind == PassKind::Decode);
+        super::ops::set_decode_pass(matches!(kind, PassKind::Decode | PassKind::Verify));
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
@@ -544,6 +553,42 @@ impl V41Forward {
             self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
         }
         self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits)
+    }
+
+    /// DSpark verify: `ids` (the accepted token + the drafts, <= 8) at positions `seq.len..`, as ONE
+    /// Verify pass through every layer; bf16 logits of EVERY row, `[t, vocab]` (row i predicts
+    /// position seq.len + i + 1). `logits` must hold `tiled_rows(t)` rows. Follow with
+    /// [`Self::rollback`] to the accepted length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        ids: &[u32],
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        ensure!(!ids.is_empty() && ids.len() <= super::ops::GEMV_MAX_M, "verify block of {} ids", ids.len());
+        let start = seq.len;
+        self.pass(ops, seq, ids, start, 0..self.blocks.len(), PassKind::Verify, hook, core, moe, tap)?;
+        prof(ops, "head", || super::fwd::final_logits_rows(ops, &self.dims, &self.scratch, ids.len(), self.norm, self.head, self.vocab, logits))
+    }
+
+    /// Discard every position >= `n` (after a Verify pass): the attention core's carried state
+    /// (`hook`), the engram n-gram history, and the sequence length. The window rings and the
+    /// compressed caches are append-only and need nothing (BRIEF.md rollback contract).
+    pub fn rollback(&self, ops: &Ops, seq: &mut V41Seq, n: usize, hook: &dyn PassHook) -> Result<()> {
+        ensure!(n <= seq.len, "rollback to {n} positions but the sequence holds {}", seq.len);
+        if n == seq.len {
+            return Ok(());
+        }
+        hook.rollback(ops, n)?;
+        seq.hash.rollback(n)?;
+        seq.len = n;
+        Ok(())
     }
 
     /// One decode step at position `seq.len`; bf16 logits `[vocab]`.

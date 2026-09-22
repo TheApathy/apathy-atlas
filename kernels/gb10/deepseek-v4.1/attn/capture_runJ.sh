@@ -9,7 +9,7 @@
 set -uo pipefail
 Q=/home/flocka/atlas/.gb10-queue
 OUT=/home/flocka/atlas/DSV41_PORT/oracle/ref/runJ_decode
-NEED_KB=$((90 * 1024 * 1024)); ABORT_KB=$((6 * 1024 * 1024))
+NEED_KB=$((90 * 1024 * 1024)); ABORT_KB=$((12 * 1024 * 1024))   # lead 2026-09-22: >= 12 GB (runJ low-water was 15 GB)
 memavail() { awk '/^MemAvailable:/ {print $2}' /proc/meminfo; }
 echo "$(date -u +%FT%TZ) dsv41-attention runJ capture (runI prompt + 8 tapped decode steps, L2/20/24/28/32/36; python engine, K124 arena ~72GB, ~15min) QUEUED pid=$$" >> "$Q"
 [ -e "$OUT/manifest.json" ] && { echo "DONE runJ rc=96 ($OUT already complete; refusing to overwrite)"; exit 96; }
@@ -18,7 +18,7 @@ export CONTAINER_NAME="dsv41-attention-runJ-$$"
 export EXTRA_DOCKER_ARGS="-e DSV41_DEV_SKIP_VERIFY=1 -e DSV41_MEM_FLOOR_GB=5.0 -e DSV41_DENSE_FP4=off -e DSV41_HEAD_FMT=bf16 -e DSV41_SWA_REPLAY=1 -e DSV41_PREFILL_CHUNK=512 --mount type=bind,src=/home/flocka/atlas/DSV41_PORT/oracle,dst=/oracle"
 # in_image.sh takes the GPU flock itself for exactly the container's lifetime. This watcher writes
 # START once the container runs (= lock held), then samples MemAvailable every 0.5 s: it records the
-# low-water mark and KILLS the container below 6 GB. It also re-checks the preflight at START,
+# low-water mark and KILLS the container below 12 GB. It also re-checks the preflight at START,
 # because the lock -- not queue position -- decides when we actually run.
 LOWF=$(mktemp)
 ( until docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; do sleep 1; kill -0 $$ 2>/dev/null || exit 0; done
