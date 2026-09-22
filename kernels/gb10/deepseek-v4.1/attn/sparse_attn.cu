@@ -270,13 +270,27 @@ int main() {
     std::printf("kernel vs bf16-P reference  : rel_l2=%.3e worst_abs=%.3e\n", ebf.rel, ebf.worst);
     if (!e32.finite) { std::printf("FAIL non-finite output\n"); return 1; }
 
-    // Gate A: the all-masked row (token 0) must be finite ZERO, not NaN.
+    // Gate A: if token 0 is genuinely all-masked, it must be finite ZERO, not NaN.
+    // Whether it IS all-masked is a property of the FIXTURE, so read it off the
+    // inputs rather than assuming. The synthetic fixture forces it; a real
+    // capture's token 0 is an ordinary token with a one-row window, and
+    // demanding zero there is a gate that fails correct output.
+    bool tok0_all_masked = true;
+    { const int32_t* wp = (const int32_t*)h_wpos;
+      const int32_t* ci = (const int32_t*)h_cidx;
+      for (int i = 0; i < NW && tok0_all_masked; ++i) if (wp[i] >= 0) tok0_all_masked = false;
+      for (int i = 0; i < NC && tok0_all_masked; ++i) if (ci[i] >= 0) tok0_all_masked = false; }
+
     double amax0 = 0; bool fin0 = true;
     for (size_t i = 0; i < (size_t)NH*D; ++i) {
         if (!std::isfinite(h_o[i])) fin0 = false;
         amax0 = std::fmax(amax0, std::fabs((double)h_o[i]));
     }
-    std::printf("all-masked row (token 0)    : finite=%d  max|o|=%.3e\n", (int)fin0, amax0);
+    if (tok0_all_masked)
+        std::printf("all-masked row (token 0)    : finite=%d  max|o|=%.3e  (expect 0)\n", (int)fin0, amax0);
+    else
+        std::printf("all-masked row              : NOT PRESENT in this fixture -- NaN-avoidance\n"
+                    "                              control NOT EXERCISED here (token 0 is a real token)\n");
 
     // Negative control 1: compressed-before-window. Online softmax is not
     // associative, so this MUST move -- if it does not, the gate is blind to
@@ -295,7 +309,8 @@ int main() {
 
     // Deliberately does NOT include the order control: it does not separate,
     // and a gate condition that cannot fail is worse than no gate condition.
-    const bool ok = e32.rel < 1e-5 && fin0 && amax0 == 0.0 && c_gat.rel > 0.2 && e32.finite;
+    const bool ok = e32.rel < 1e-5 && e32.finite && c_gat.rel > 0.2
+                    && (!tok0_all_masked || (fin0 && amax0 == 0.0));
     if (c_gat.rel <= 0.2)
         std::printf("INCONCLUSIVE: the wrong gather also passed -- this gate cannot fail\n");
     // MEASURED, not assumed. Window-first vs compressed-first moves the result

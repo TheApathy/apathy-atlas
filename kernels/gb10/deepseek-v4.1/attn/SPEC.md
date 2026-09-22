@@ -234,6 +234,44 @@ WHAT THIS GATE DOES NOT COVER: block order (above); the orchestration of section
 layer sources the cache, which RoPE table, the inverse RoPE on the output) — that needs the
 captured oracle; and any real weight, since the fixture is synthetic.
 
+## 8d. REAL-TENSOR gate (runC_2048 layer 2 + checkpoint attn_sink)
+
+Inputs are actual model tensors, not synthetic: q, the window ring (from kv_new,
+slot == pos since pos < 2048 < RING), the compressed cache (latent_1) and the selection
+(topk) from the capture; attn_sink read from the checkpoint, since it is a stored WEIGHT
+and not a tap. 148 tokens spanning clipped windows, the compress_lens == 512 transition,
+and full selections (61/148 at the full 512). No GPU capture window was needed.
+
+    kernel vs fp32-P reference       rel_l2 3.468e-07   worst_abs 2.623e-06
+    kernel vs bf16-P reference       rel_l2 1.039e-03
+    CONTROL gather (sequential rows) rel_l2 7.765e-01   -> 2,238,813x separation
+    CONTROL order  (reordered)       rel_l2 3.846e-07   -> does not separate, as swept
+
+PASS, and confirmed independently by compare.py at the tightened fp32 tolerance of 1e-4
+(rel_l2 3.4682e-07, max_rel 1.27e-06, 0 non-finite), with its automatic negative control
+watched rejecting on this same reference.
+
+Predicted 1e-7..1e-6 before running; landed at 3.468e-07. The kernel's accuracy does not
+depend on the data distribution, as expected.
+
+A GATE BUG THIS RUN EXPOSED, worth keeping as a lesson. The first real-tensor run reported
+FAIL at rel_l2 3.468e-07. The kernel was fine; the GATE was wrong. Its PASS condition
+required token 0 to be all-masked with max|o| == 0 — true of the synthetic fixture BY
+CONSTRUCTION, false of a real capture whose token 0 is an ordinary token with a one-row
+window. The check now derives whether an all-masked row EXISTS from the inputs (scanning
+wpos/cidx row 0) instead of assuming the fixture's shape, and says plainly when the
+NaN-avoidance control is NOT EXERCISED rather than silently passing or failing. The
+synthetic fixture still exercises it and still requires exactly zero — verified by
+re-running both after the fix.
+
+The general form: a gate condition that encodes a property of one FIXTURE rather than of
+the KERNEL will fail correct output the moment the fixture changes.
+
+WHAT THIS STILL DOES NOT COVER: the inverse RoPE and the grouped o_proj are the caller's
+(see sec 2), and the capture's `attn_out` is taken after both, so this is a comparison
+against a float64 reference computed here from captured INPUTS — sound, but it is this
+lane's arithmetic, not the engine's. A pre-o_proj tap would make it end-to-end.
+
 ## 9. Open items / things NOT yet verified
 
 - No captured oracle yet. Nothing in sections 1-4 has been checked against a real tensor.
