@@ -1,4 +1,6 @@
 cb3_reconstruct
 cb3_decode_check
 fx_dims.txt
+gx_dims.txt
+cb3_gemm
 __pycache__/
