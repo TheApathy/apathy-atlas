@@ -302,3 +302,200 @@ mod tests {
         assert!(expert_matrices(&config).is_err());
     }
 }
+
+// =====================================================================================
+// COMBINE — grouping tokens by expert, then the weighted sum
+// =====================================================================================
+
+/// Tokens routed to one expert, and their routing weights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertGroup {
+    /// 384-space routed id.
+    pub expert_id: u32,
+    /// Resident slot in the arena, resolved once.
+    pub slot: usize,
+    /// Indices of the tokens routed here.
+    pub tokens: Vec<u32>,
+    /// Their weights, parallel to `tokens`.
+    pub weights: Vec<f32>,
+}
+
+/// Group a routing decision by EXPERT rather than by token.
+///
+/// ## Why this shape, and what it costs
+/// The obvious loop is per (token, expert) pair, which reconstructs three CB3 matrices —
+/// ~70.8 MB of bf16 — for every pair. Grouping means each expert is reconstructed **once
+/// per forward** and applied to all its tokens as one batched GEMM, so the reconstruct
+/// amortises over the group.
+///
+/// The amortisation is everything, and it is wildly different between the two regimes:
+///
+/// ```text
+///   prefill, 2048 tokens x 6 / 124 experts  ~= 99 tokens per expert -> ~99x amortised
+///   decode,  1 token x 6 experts            ==  1 token per expert  -> NONE
+/// ```
+///
+/// So at decode this path reconstructs ~425 MB of bf16 to multiply one 5120-wide vector.
+/// That is the bandwidth argument `CB3_FORMAT.md` says is the only argument for a fused
+/// decode+MMA kernel, and it is where one would pay off. Stated here rather than
+/// discovered later: grouping fixes prefill and does nothing for decode.
+///
+/// Returned groups are sorted by `expert_id` so the reconstruct order is deterministic —
+/// fp32 accumulation is not associative, and a nondeterministic expert order would make
+/// run-to-run output differ for no reason.
+pub fn group_by_expert(
+    indices: &[i64],
+    weights: &[f32],
+    num_tokens: usize,
+    k: usize,
+    slot_of: impl Fn(u32) -> Result<i32>,
+) -> Result<Vec<ExpertGroup>> {
+    ensure!(
+        indices.len() == num_tokens * k && weights.len() == indices.len(),
+        "routing is {} indices / {} weights, expected {num_tokens} x {k}",
+        indices.len(),
+        weights.len()
+    );
+
+    let mut groups: std::collections::BTreeMap<u32, ExpertGroup> = std::collections::BTreeMap::new();
+    for token in 0..num_tokens {
+        for pick in 0..k {
+            let flat = token * k + pick;
+            let expert_id = u32::try_from(indices[flat])
+                .with_context(|| format!("negative expert id {} at token {token}", indices[flat]))?;
+            let slot = slot_of(expert_id)?;
+            ensure!(
+                slot >= 0,
+                "token {token} routed to expert {expert_id}, which is NOT resident. Routing \
+                 must apply the arena's residency mask BEFORE top-k; reaching here means the \
+                 mask was skipped, and there is no correct fallback — a modulo or clamp would \
+                 silently substitute a different, valid-looking expert."
+            );
+            let entry = groups.entry(expert_id).or_insert_with(|| ExpertGroup {
+                expert_id,
+                slot: slot as usize,
+                tokens: Vec::new(),
+                weights: Vec::new(),
+            });
+            entry.tokens.push(token as u32);
+            entry.weights.push(weights[flat]);
+        }
+    }
+    Ok(groups.into_values().collect())
+}
+
+/// Reconstruct-cost accounting for one forward, in bytes of bf16 written.
+///
+/// Exposed so the decode/prefill asymmetry above is a number a caller can log or assert
+/// on, not just a comment.
+pub fn reconstruct_bytes_for(groups: &[ExpertGroup], config: &ModelConfig) -> Result<usize> {
+    let per_expert = scratch_bytes(config)?;
+    per_expert
+        .checked_mul(groups.len())
+        .context("reconstruct byte accounting overflow")
+}
+
+#[cfg(test)]
+mod combine_tests {
+    use super::*;
+
+    fn all_resident(id: u32) -> Result<i32> {
+        Ok(id as i32)
+    }
+
+    /// Grouping must invert the routing exactly: every (token, expert) pair lands once,
+    /// with its own weight.
+    #[test]
+    fn grouping_preserves_every_token_expert_pair() {
+        // 3 tokens, k=2. Token 0 -> {5, 9}, token 1 -> {5, 7}, token 2 -> {9, 5}.
+        let indices: Vec<i64> = vec![5, 9, 5, 7, 9, 5];
+        let weights: Vec<f32> = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let groups = group_by_expert(&indices, &weights, 3, 2, all_resident).unwrap();
+
+        // Sorted by expert id, so the reconstruct order is deterministic.
+        assert_eq!(
+            groups.iter().map(|g| g.expert_id).collect::<Vec<_>>(),
+            vec![5, 7, 9]
+        );
+        let five = &groups[0];
+        assert_eq!(five.tokens, vec![0, 1, 2]);
+        assert_eq!(five.weights, vec![0.1, 0.3, 0.6]);
+        assert_eq!(groups[1].tokens, vec![1]);
+        assert_eq!(groups[2].tokens, vec![0, 2]);
+        assert_eq!(groups[2].weights, vec![0.2, 0.5]);
+
+        // Every pair is accounted for exactly once — no drops, no duplicates.
+        let placed: usize = groups.iter().map(|g| g.tokens.len()).sum();
+        assert_eq!(placed, indices.len());
+    }
+
+    /// A non-resident expert must be a HARD ERROR, never a substitution.
+    ///
+    /// This is the last line of defence behind the routing mask. If it ever silently
+    /// clamped, the model would run on a different-but-valid expert and produce fluent,
+    /// wrong output — the failure this whole port is organised against.
+    #[test]
+    fn a_non_resident_expert_is_refused_not_substituted() {
+        let indices: Vec<i64> = vec![3, 11];
+        let weights: Vec<f32> = vec![0.5, 0.5];
+        // Expert 11 is not resident.
+        let slot_of = |id: u32| Ok(if id == 11 { -1 } else { id as i32 });
+        let err = group_by_expert(&indices, &weights, 1, 2, slot_of)
+            .expect_err("a non-resident expert must not be grouped")
+            .to_string();
+        assert!(err.contains("NOT resident"), "{err}");
+        assert!(err.contains("no correct fallback"), "{err}");
+
+        // NEGATIVE CONTROL: the same call with 11 resident must SUCCEED, so the refusal
+        // above is about residency and not about some unrelated shape error.
+        let groups = group_by_expert(&indices, &weights, 1, 2, all_resident).unwrap();
+        assert_eq!(groups.len(), 2);
+    }
+
+    /// The prefill/decode amortisation asymmetry, as numbers rather than prose.
+    #[test]
+    fn grouping_amortises_at_prefill_and_not_at_decode() {
+        let Ok(raw) = std::fs::read_to_string(
+            "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/config.json",
+        ) else {
+            eprintln!("skipping: checkpoint not present");
+            return;
+        };
+        let config = atlas_core::config::parse_config(&raw).unwrap();
+        let k = 6usize;
+
+        // DECODE: 1 token, 6 distinct experts -> 6 groups of 1. No amortisation.
+        let decode_idx: Vec<i64> = (0..k as i64).collect();
+        let decode_w = vec![1.0f32 / k as f32; k];
+        let decode = group_by_expert(&decode_idx, &decode_w, 1, k, all_resident).unwrap();
+        assert_eq!(decode.len(), 6);
+        assert!(decode.iter().all(|g| g.tokens.len() == 1));
+        let decode_bytes = reconstruct_bytes_for(&decode, &config).unwrap();
+        // ~425 MB of bf16 reconstructed to multiply ONE 5120-wide vector.
+        assert!(
+            (420e6..430e6).contains(&(decode_bytes as f64)),
+            "decode reconstructs {:.0} MB, expected ~425",
+            decode_bytes as f64 / 1e6
+        );
+
+        // PREFILL: 256 tokens over 124 experts. Groups are bounded by the expert count,
+        // so the reconstruct cost stops growing with tokens — that IS the amortisation.
+        let mut prefill_idx: Vec<i64> = Vec::new();
+        for token in 0..256usize {
+            for pick in 0..k {
+                prefill_idx.push(((token * k + pick) % 124) as i64);
+            }
+        }
+        let prefill_w = vec![1.0f32 / k as f32; prefill_idx.len()];
+        let prefill = group_by_expert(&prefill_idx, &prefill_w, 256, k, all_resident).unwrap();
+        assert_eq!(prefill.len(), 124, "groups are capped by the resident expert count");
+        let prefill_bytes = reconstruct_bytes_for(&prefill, &config).unwrap();
+
+        // 256x the tokens for only ~20x the reconstruct bytes.
+        let ratio = prefill_bytes as f64 / decode_bytes as f64;
+        assert!(
+            (20.0..21.0).contains(&ratio),
+            "expected ~20.7x reconstruct for 256x the tokens, got {ratio:.1}x"
+        );
+    }
+}
