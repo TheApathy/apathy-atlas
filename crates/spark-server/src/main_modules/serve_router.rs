@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use axum::routing::{get, post};
 
@@ -20,8 +20,7 @@ use crate::main_modules::middleware::{
 pub(crate) async fn build_and_serve(
     state: Arc<AppState>,
     model_ready: Arc<std::sync::atomic::AtomicBool>,
-    bind: &str,
-    port: u16,
+    listener: tokio::net::TcpListener,
 ) -> Result<()> {
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
@@ -135,6 +134,19 @@ pub(crate) async fn build_and_serve(
     // Model loaded, scheduler running — mark as ready.
     model_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
+    tracing::info!(
+        "Listening on {}",
+        listener
+            .local_addr()
+            .map_or_else(|_| "?".into(), |a| a.to_string())
+    );
+    serve_with_header_timeout(listener, app).await
+}
+
+/// Bind the HTTP listener. `serve` calls this BEFORE the scheduler thread
+/// takes the model, so a port already in use fails startup while nothing is
+/// detached (see serve.rs `spawn_order_tests`).
+pub(crate) async fn bind_listener(bind: &str, port: u16) -> Result<tokio::net::TcpListener> {
     let addr = format!("{bind}:{port}");
     if bind == "0.0.0.0" {
         tracing::warn!(
@@ -154,9 +166,9 @@ pub(crate) async fn build_and_serve(
              --auth-tokens-file for non-trusted networks."
         );
     }
-    tracing::info!("Listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    serve_with_header_timeout(listener, app).await
+    tokio::net::TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("cannot bind {addr}"))
 }
 
 /// Serve `app` with a hyper connection-layer **header-read timeout** so a
@@ -232,5 +244,16 @@ async fn serve_with_header_timeout(
                 tracing::debug!("connection closed: {err}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    #[tokio::test]
+    async fn a_port_in_use_is_an_error_from_bind_listener() {
+        let held = super::bind_listener("127.0.0.1", 0).await.expect("ephemeral bind");
+        let port = held.local_addr().unwrap().port();
+        let err = super::bind_listener("127.0.0.1", port).await.unwrap_err();
+        assert!(format!("{err:#}").contains(&format!("cannot bind 127.0.0.1:{port}")), "{err:#}");
     }
 }

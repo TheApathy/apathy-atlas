@@ -899,6 +899,9 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
         .transpose()
         .context("DeepSeek vocabulary exceeds u32")?;
 
+    // The HTTP bind is fallible too (port in use): take it before the spawn.
+    let listener = crate::main_modules::serve_router::bind_listener(&args.bind, args.port).await?;
+
     // DS4F hard-limit lane (2026-07-21): install the served-context ceiling so
     // the scheduler enforces `max_seq_len` per decode step (§C-3), not just as a
     // KV-allocation ceiling trued-up on completion. Set once, before the
@@ -1055,8 +1058,7 @@ pub(crate) async fn serve(mut args: cli::ServeArgs) -> Result<()> {
     serve_phases::log_behavior_audit(&args, &ptx_set);
 
     // 9-11. Build router + start HTTP server (extracted: serve_router.rs).
-    crate::main_modules::serve_router::build_and_serve(state, model_ready, &args.bind, args.port)
-        .await
+    crate::main_modules::serve_router::build_and_serve(state, model_ready, listener).await
 }
 
 /// Parse the vLLM-style `--default-chat-template-kwargs` JSON
@@ -1337,6 +1339,16 @@ mod spawn_order_tests {
         hits
     }
 
+    /// The HTTP listener is bound before the scheduler spawn (a port-in-use
+    /// error must exit while nothing owns the model).
+    pub(super) fn bind_precedes_spawn(src: &str) -> bool {
+        let spawn = src
+            .find("std::thread::spawn(move ||")
+            .expect("scheduler spawn not found");
+        src.find("serve_router::bind_listener(")
+            .is_some_and(|b| b < spawn)
+    }
+
     fn strip_strings_and_comments(line: &str) -> String {
         let mut out = String::new();
         let (mut in_str, mut prev) = (false, ' ');
@@ -1363,6 +1375,31 @@ mod spawn_order_tests {
             hits.is_empty(),
             "error exits after the scheduler spawn: {hits:#?}"
         );
+    }
+
+    #[test]
+    fn the_http_bind_precedes_the_scheduler_spawn() {
+        assert!(bind_precedes_spawn(include_str!("serve.rs")));
+    }
+
+    /// NEGATIVE CONTROL: moving the bind back after the spawn (where
+    /// build_and_serve used to bind) must be caught twice: by the ordering
+    /// check and by the error-exit scan (the bind carries a `?`).
+    #[test]
+    fn a_bind_moved_after_the_spawn_is_caught() {
+        let src = include_str!("serve.rs");
+        let bind_line = src
+            .lines()
+            .find(|l| l.contains("serve_router::bind_listener("))
+            .expect("bind line");
+        let anchor = "    let state = Arc::new(AppState {";
+        let moved = src.replacen(&format!("{bind_line}\n"), "", 1).replacen(
+            anchor,
+            &format!("{bind_line}\n{anchor}"),
+            1,
+        );
+        assert!(!bind_precedes_spawn(&moved));
+        assert_eq!(error_exits_after_spawn(&moved).len(), 1);
     }
 
     /// NEGATIVE CONTROL: the same scan must catch a `?` put back after the
