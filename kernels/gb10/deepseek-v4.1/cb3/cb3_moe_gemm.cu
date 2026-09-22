@@ -165,7 +165,9 @@ static_assert(SMEM_BYTES >= BM * BN * 4, "epilogue tile must fit in the mainloop
 
 /// Gate + up + SwiGLU for one (expert tile, N tile):
 ///   h[row, n] = bf16( silu(min(g, L)) * clamp(u, -L, L) * route_w[row] ),  g/u fp32.
-extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
+namespace {
+/// The gate/up body, shared by the 1- and 2-CTA-per-SM entry points below.
+__device__ __forceinline__ void gate_up_body(
     const __nv_bfloat16* __restrict__ act,  // [P, K] permuted rows
     const int4* __restrict__ tiles,         // {row_begin, rows, slot, 0}
     const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
@@ -245,39 +247,52 @@ extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
         __syncthreads();
     }
 
-    // Epilogue in two passes through one fp32 staging tile: gate first, then up.
+    // Epilogue. gate and up fragments share one (unspecified but identical) element layout,
+    // so the clamp and SwiGLU run element-wise in registers; only silu(g)*u goes through the
+    // fp32 staging tile, where the row is known for the route weight. The association
+    // ((g * sig) * u) * w is the reference's, and h is rounded to bf16 exactly once.
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
-        for (int j = 0; j < 2; ++j)
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+            for (int e = 0; e < acc_g[i][j].num_elements; ++e) {
+                const float g = fminf(acc_g[i][j].x[e], limit);
+                const float u = fminf(fmaxf(acc_u[i][j].x[e], -limit), limit);
+                const float sig = 1.0f / (1.0f + expf(-g));
+                acc_g[i][j].x[e] = g * sig * u;
+            }
             wmma::store_matrix_sync(&s_out[wm + i * 16][wn + j * 16], acc_g[i][j], BN, wmma::mem_row_major);
+        }
     __syncthreads();
-    constexpr int PER = BM * BN / THREADS;
-    float gate_v[PER];
-#pragma unroll
-    for (int e = 0; e < PER; ++e) {
-        const int idx = threadIdx.x + e * THREADS;
-        gate_v[e] = s_out[idx / BN][idx % BN];
-    }
-    __syncthreads();
-#pragma unroll
-    for (int i = 0; i < 2; ++i)
-#pragma unroll
-        for (int j = 0; j < 2; ++j)
-            wmma::store_matrix_sync(&s_out[wm + i * 16][wn + j * 16], acc_u[i][j], BN, wmma::mem_row_major);
-    __syncthreads();
-#pragma unroll
-    for (int e = 0; e < PER; ++e) {
-        const int idx = threadIdx.x + e * THREADS;
+    for (int idx = threadIdx.x; idx < BM * BN; idx += THREADS) {
         const int row = idx / BN, col = idx % BN;
         if (row >= rows) continue;
-        const float g = fminf(gate_v[e], limit);
-        const float u = fminf(fmaxf(s_out[row][col], -limit), limit);
-        const float sig = 1.0f / (1.0f + expf(-g));
         const long long prow = row_begin + row;
-        // Same association as the reference: ((g * sig) * u) * w.
-        h[prow * N + n0 + col] = __float2bfloat16(g * sig * u * row_weight[prow]);
+        h[prow * N + n0 + col] = __float2bfloat16(s_out[row][col] * row_weight[prow]);
     }
+}
+
+}  // namespace
+
+#define ATLAS_CB3_GATE_UP_ARGS act, tiles, w1_lo, w1_hi, w1_cb, w1_sc, w3_lo, w3_hi, w3_cb, w3_sc, \
+    lo_s, hi_s, cb_s, sc_s, row_weight, h, N, K, limit
+
+/// Gate + up + SwiGLU, one CTA per SM (168 registers, no spills).
+///
+/// Measured, interleaved A/B (6 rounds, clean window): the same body at
+/// __launch_bounds__(256, 2) — 128 registers, 2 CTAs/SM, a ~90-byte spill — was 14% SLOWER
+/// (35.9 vs 31.5 ms experts at T=2048) despite ncu showing this variant at 16.7% occupancy.
+extern "C" __global__ void __launch_bounds__(THREADS) cb3_moe_gate_up(
+    const __nv_bfloat16* __restrict__ act,  // [P, K] permuted rows
+    const int4* __restrict__ tiles,         // {row_begin, rows, slot, 0}
+    const uint8_t* w1_lo, const uint8_t* w1_hi, const uint8_t* w1_cb, const uint8_t* w1_sc,
+    const uint8_t* w3_lo, const uint8_t* w3_hi, const uint8_t* w3_cb, const uint8_t* w3_sc,
+    unsigned long long lo_s, unsigned long long hi_s, unsigned long long cb_s, unsigned long long sc_s,
+    const float* __restrict__ row_weight,   // [P]
+    __nv_bfloat16* __restrict__ h,          // [P, N]
+    int N, int K, float limit) {
+    gate_up_body(ATLAS_CB3_GATE_UP_ARGS);
 }
 
 /// Down projection for one (expert tile, N tile): out[row, n] = h[row, :] . w2[n, :], fp32.
