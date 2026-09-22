@@ -201,6 +201,45 @@ mod tests {
         assert_eq!(a, b, "a carry longer than MAX_LOOKBACK changed the result");
     }
 
+    /// THE DECODE CASE dsv41-parity's review asked for: a prompt whose user turn ends in an
+    /// image (`[..., SENTINEL, ASSISTANT, THINK]`), then one decode step. Production's decode
+    /// call sites pass no `dead_heads` (`v41_engine.py:912`, `1037`), so `model.py:746-747`'s
+    /// fallback computes it fresh from THAT STEP'S OWN TOKEN ALONE -- no carry. The correct
+    /// decode row must be all-False even though the sentinel sits 3 positions back (exactly
+    /// `MAX_LOOKBACK`, so a carry WOULD reach it and wrongly kill the 4-gram group).
+    #[test]
+    fn decode_after_an_image_ending_prompt_must_not_carry() {
+        const SENTINEL: u32 = IMAGE_SENTINEL_ID;
+        const ASSISTANT: u32 = 100; // stand-in token ids; only SENTINEL's identity matters
+        const THINK: u32 = 101;
+        let prompt_tail = [SENTINEL, ASSISTANT, THINK];
+        let decode_tok = [999u32];
+
+        // What forward.rs's PassKind::Decode branch does: plain engram_dead_heads, no carry.
+        let correct = engram_dead_heads(&decode_tok);
+        assert!(
+            correct.iter().all(|&d| !d),
+            "decode's own (carry-free) computation must be all-False here, matching production"
+        );
+
+        // NEGATIVE CONTROL: what c2aa2e7ae did before this fix -- carry the prompt tail's
+        // trailing MAX_LOOKBACK ids into decode. This MUST differ from `correct`, or the test
+        // above proves nothing about the carry mattering.
+        let mut carry = Vec::new();
+        update_dead_carry(&mut carry, &prompt_tail);
+        assert_eq!(carry, vec![SENTINEL, ASSISTANT, THINK], "carry must hold the prompt's trailing MAX_LOOKBACK ids");
+        let wrong_if_carried = engram_dead_heads_with_carry(&carry, &decode_tok);
+        assert_ne!(
+            wrong_if_carried, correct,
+            "carrying into decode produced the same result as not carrying -- this control cannot \
+             show the bug it exists to catch"
+        );
+        // And specifically: the sentinel is exactly MAX_LOOKBACK back, so only the 4-gram
+        // group (cols 16..24) should be affected by carrying, not the 2-/3-gram groups.
+        assert!(wrong_if_carried[0..16].iter().all(|&d| !d), "carrying wrongly touched the 2-/3-gram groups");
+        assert!(wrong_if_carried[16..24].iter().all(|&d| d), "carrying should kill exactly the 4-gram group here");
+    }
+
     /// An empty carry (a sequence's first chunk) must be identical to calling
     /// `engram_dead_heads` directly -- the carry-aware function is a strict
     /// generalisation, not a different algorithm.

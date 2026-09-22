@@ -354,6 +354,11 @@ impl V41Forward {
         if start == 0 {
             seq.tail_rows = 0;
             seq.tail_ids.clear();
+            // Robustness (dsv41-parity): V41Seq is rebuilt per request today
+            // (Dsv41Model::alloc_sequence), so this is currently unreachable with a nonempty
+            // carry -- but if a sequence slot is ever reused, a stale dead_carry from the
+            // PREVIOUS request would otherwise silently leak into this request's first chunk.
+            seq.dead_carry.clear();
         }
         let n = self.blocks.len();
         match mode {
