@@ -34,5 +34,11 @@ CTRL DECODE L02 wpos shifted by one: attention bit-identical to the real decode 
 CTRL DECODE L08 wpos shifted by one: attention bit-identical to the real decode 0.0774 (must collapse)
 CTRL DECODE L14 wpos shifted by one: attention bit-identical to the real decode 0.0866 (must collapse)
 CTRL DECODE L20 wpos shifted by one: attention bit-identical to the real decode 0.1307 (must collapse)
+ROLLBACK real            (resume two T=1 passes): verify T=6 (3 accepted + 3 wrong drafts), rollback(1003), resume 1003..1004 -> 0 differing top-k rows/attention values vs never-drafted decode; 0 differing ckv/ik bytes
+ROLLBACK real            (resume one T=2 pass): verify T=6 (3 accepted + 3 wrong drafts), rollback(1003), resume 1003..1004 -> 0 differing top-k rows/attention values vs never-drafted decode; 0 differing ckv/ik bytes
+ROLLBACK CTRL no restore (resume two T=1 passes): REFUSED loudly (layer 2: 502 compressed rows visible, 501 published)
+ROLLBACK CTRL no restore (resume one T=2 pass): verify T=6 (3 accepted + 3 wrong drafts), rollback(1003), resume 1003..1004 -> 155333 differing top-k rows/attention values vs never-drafted decode; 3120 differing ckv/ik bytes
+ROLLBACK real            (verify at ODD 1001, 0 of 6 accepted, restore = the pass's own starting pending row): 0 differing values vs never-drafted decode
+ROLLBACK CTRL no restore (verify at ODD 1001, 0 of 6 accepted, restore = the pass's own starting pending row): 113163 differing values vs never-drafted decode
 RESET RULE: after Decode(pos 1024) the tail still holds 128 rows; after a new prompt 0
 CORE GATE PASS
