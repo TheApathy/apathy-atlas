@@ -8,6 +8,9 @@ Everything here runs on CPU/NVMe only. No GPU lock is needed.
 | `ref_hashes.py` | Runs the checkpoint's `inference/engram.py` `NgramHashState` on a prompt and dumps `ref_hashes.bin` `[T, 2, 24]` int64 plus `ref_ids.bin`. |
 | `cmp_rows.py` | Dequantizes the reference rows for those hashes and compares a candidate `[T, 2, 24, 256]` f32 dump **bitwise**. Both sides are exact in f32 (3-bit mantissa x power-of-two scale), so anything but bit-equality is a real bug, not rounding. |
 | `iofloor.rs` | The I/O floor probe (`rustc -O -o iofloor iofloor.rs`). Args: `<tokens> <iters> <split|cached> <thread list> [seed]`. Pass a FRESH seed each run — replaying a seed replays the row ids and measures the page cache instead of the device. |
+| `dump_chunk_ids.py` | Pulls one occurrence's LOCAL chunk token ids out of an oracle manifest (`engram_dead_heads` is called fresh per forward chunk, no cross-chunk carry — see `dead_heads.rs`'s module doc). Writes `ids_NNN.bin` per occurrence. |
+| `oracle_dead_heads.rs` | Splice with `dead_heads.rs` (zero external deps, compiles standalone) and run against `ids_NNN.bin` files to validate `engram_dead_heads` against a real capture's `engram_dead` taps. |
+| `oracle_apply_mask.rs` | Splice with `dead_heads.rs`; applies `apply_dead_mask` to a captured `engram_rows_premask` and checks it reproduces `engram_rows` bit-exactly. |
 
 ## Measured I/O floor (cold, this box)
 
@@ -32,9 +35,24 @@ engine. It is **not** the bottleneck. The thread count is the whole game.
 - Negative controls, each watched to FAIL: perturbed multiplier (hash), swapped
   prime order (layout), non-sticky look-back, perturbed scale byte (dequant), and
   wrong row ids (gather).
-- **UNVALIDATED: the dead-head mask.** On a text-only prompt `engram_dead_heads` is
-  identically all-False, so `masked_fill` is a no-op and any comparison passes by
-  construction. Validating it needs a capture containing a real image span.
+- **Dead-head mask: NOW VALIDATED, 2026-09-22.** `runE_image` (1031 tokens, a real
+  IMAGE_SENTINEL/IMAGE_PAD span at positions 8-14) makes `engram_dead_heads`
+  non-degenerate: occurrence 0 has 216/12288 True, matching the brief exactly.
+  `crates/spark-model/src/layers/deepseek_v41_engram/dead_heads.rs` (in-crate,
+  `cargo test -p spark-model --lib deepseek_v41_engram::dead_heads`) unit-tests the
+  pure function; `oracle_dead_heads.rs` + `oracle_apply_mask.rs` (below) validate the
+  SAME code against the real engine's taps, bit-exact, with negative controls
+  watched failing (an off-by-one shift: 24/12288 mismatches at the boundary row; a
+  skipped mask: rel_l2 0.15).
+- **Chunk boundary: NOW VALIDATED, 2026-09-22.** `hash.rs`'s
+  `chunk_boundary_matches_the_oracle_exactly` replays `runD_L20_kernel` (1024 real
+  tokens, two 512-token chunks) through `EngramHashState` and matches the oracle's
+  `engram_hashes` at the S=512 occurrence exactly, both engram layers. Negative
+  control `dropping_the_carry_breaks_the_match`: re-hashing chunk 1 without the
+  cross-chunk cache moves exactly 48/12288 row ids — 24+16+8, the count the n-gram
+  geometry predicts for how far a 4-gram's look-back reaches past the boundary, not
+  merely "some". Needs `token_map_i32.bin` (regenerate with `export_map.py`;
+  `*.bin` is gitignored so it is not checked in).
 
 ## Row reuse (why `gather_dedup` exists)
 
@@ -80,9 +98,29 @@ Failing is not enough; the failure must land where the n-gram geometry says it m
 The third control is the team lead's: its failure would otherwise be mistaken for
 a tokenizer-version difference rather than a bug.
 
-### Dead-head path: still UNVALIDATED
+### Dead-head path: validated on `runE_image`
 
-`engram_dead` in runA is 888 entries, **0 True**, on both layers — confirmed
-empirically, as predicted. `masked_fill` is a no-op here, so the dead-head path is
-NOT exercised and a PASS on `engram_rows` does not cover it. Needs an
-image-bearing capture.
+`engram_dead` in runA is 888 entries, 0 True, on both layers — confirmed empirically,
+as predicted, and it is why runA alone could never validate this path.
+`runE_image` fixes that: a synthetic-token image span (`IMAGE_PAD_ID`/
+`IMAGE_SENTINEL_ID` present, vision encoder did not run — valid for engram and the
+router's vl-bias branch, not the vision encoder itself) gives occurrence 0 a
+non-degenerate 216/12288 True.
+
+| tap | result |
+|---|---|
+| `L01.engram_dead.000` / `L14.engram_dead.000` | **0/12288 mismatches**, both PASS |
+| `L01.engram_dead.001/.002`, `L14.` (post-image, all-False) | **0 mismatches** too — low-information per compare.py, kept as a sanity check that the mask correctly turns back off once the span ends |
+| `L01.engram_rows.000` = `apply_dead_mask(premask.000)` | **rel_l2 0.0** (3,145,728 f32) |
+| `L14.engram_rows.000` = `apply_dead_mask(premask.000)` | **rel_l2 0.0** |
+
+Negative controls, each watched FAIL:
+
+| control | predicted | observed |
+|---|---|---|
+| shift the mask forward one position (`p > offset` instead of `p >= offset`) | only the boundary row where the span's own look-back reaches position 0 of the chunk moves = 1 row x 24 cols = **24** | 24 |
+| skip `apply_dead_mask` entirely (compare premask directly) | premask != rows wherever the mask is True | rel_l2 0.151 (L01), 0.155 (L14) |
+
+Both engram layers' masks are IDENTICAL (same sha256) at every occurrence, as
+expected — `engram_dead_heads` is a pure function of token ids, not of which
+engram layer is asking.
