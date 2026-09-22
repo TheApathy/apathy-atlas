@@ -321,66 +321,83 @@ impl Cb3ExpertArena {
         layer: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
+        Self::load_layer_subset(pack_dir, pack, &[layer], gpu)
+    }
+
+    /// Make a SUBSET of layers resident (1.79 GB each at the served keep), for teacher-forced
+    /// multi-layer validation without the 71.7 GB full-scale run. Lookups are keyed by the
+    /// real layer index; any layer not listed errors.
+    pub fn load_layer_subset(
+        pack_dir: &Path,
+        pack: &ExpertPack,
+        wanted: &[usize],
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
         let packed_keep = pack.packed_keep();
         let per_layer = packed_keep as u64 * pack.bytes_per_expert();
+        ensure!(!wanted.is_empty(), "CB3 layer subset is empty");
+        for (i, layer) in wanted.iter().enumerate() {
+            ensure!(*layer < pack.num_layers(), "CB3 pack has no layer {layer}");
+            ensure!(!wanted[..i].contains(layer), "CB3 layer subset lists layer {layer} twice");
+        }
+        let need = per_layer * wanted.len() as u64;
 
         let budget = arena_budget_bytes(gpu)?;
         ensure!(
-            per_layer <= budget,
-            "CB3 single-layer arena needs {:.1} GB but the budget is {:.1} GB",
-            per_layer as f64 / 1e9,
+            need <= budget,
+            "CB3 arena subset {wanted:?} needs {:.1} GB but the budget is {:.1} GB",
+            need as f64 / 1e9,
             budget as f64 / 1e9
         );
         let free = gpu.free_memory().context("CB3 arena: querying free device memory")? as u64;
         ensure!(
-            free.saturating_sub(per_layer) >= MIN_HEADROOM_BYTES,
-            "CB3 single-layer arena for layer {layer} would leave under the {:.1} GB headroom \
-             floor",
+            free.saturating_sub(need) >= MIN_HEADROOM_BYTES,
+            "CB3 arena subset {wanted:?} would leave under the {:.1} GB headroom floor",
             MIN_HEADROOM_BYTES as f64 / 1e9
         );
-
         tracing::info!(
-            "DeepSeek-V4.1 CB3 arena: SINGLE LAYER {layer} at packed_keep={packed_keep}, \
-             {:.2} GB. This is a validation path — `layer()` errors for any other index.",
-            per_layer as f64 / 1e9,
+            "DeepSeek-V4.1 CB3 arena: LAYER SUBSET {wanted:?} at packed_keep={packed_keep}, \
+             {:.2} GB. `layer()` errors for any other index.",
+            need as f64 / 1e9,
         );
 
-        let shard = LayerShard::open(pack_dir, layer, pack)
-            .with_context(|| format!("CB3 single-layer arena: opening layer {layer}"))?;
-        let mut planes = [DevicePtr::NULL; 12];
-        let mut strides = [0usize; 12];
+        let mut layers = Vec::with_capacity(wanted.len());
+        let mut routing_masks = Vec::with_capacity(wanted.len());
+        let mut slot_of_routed = Vec::with_capacity(wanted.len());
         let mut uploaded = 0u64;
-        for (index, tensor) in CB3_TENSORS.iter().enumerate() {
-            let stride = pack.slot_stride_in(*tensor) as usize;
-            let bytes = stride
-                .checked_mul(packed_keep)
-                .context("CB3 plane extent overflow")?;
-            planes[index] = gpu.alloc(bytes)?;
-            strides[index] = stride;
-            let span = shard.plane_span(*tensor, packed_keep)?;
-            ensure!(span.len() == bytes, "CB3 plane span disagrees with the stride table");
-            gpu.copy_h2d(span, planes[index])?;
-            uploaded += span.len() as u64;
+        for &layer in wanted {
+            let shard = LayerShard::open(pack_dir, layer, pack)
+                .with_context(|| format!("CB3 arena subset: opening layer {layer}"))?;
+            let mut planes = [DevicePtr::NULL; 12];
+            let mut strides = [0usize; 12];
+            for (index, tensor) in CB3_TENSORS.iter().enumerate() {
+                let stride = pack.slot_stride_in(*tensor) as usize;
+                let bytes = stride
+                    .checked_mul(packed_keep)
+                    .context("CB3 plane extent overflow")?;
+                planes[index] = gpu.alloc(bytes)?;
+                strides[index] = stride;
+                let span = shard.plane_span(*tensor, packed_keep)?;
+                ensure!(span.len() == bytes, "CB3 plane span disagrees with the stride table");
+                gpu.copy_h2d(span, planes[index])?;
+                uploaded += span.len() as u64;
+            }
+            let resident = pack.resident_ids(layer)?;
+            let mut inverse = vec![NO_SLOT; ROUTED_EXPERTS];
+            for (slot, &expert_id) in resident.iter().enumerate() {
+                inverse[expert_id as usize] = slot as i32;
+            }
+            layers.push(Cb3LayerResidency { planes, strides, layer });
+            routing_masks.push((layer, pack.routing_mask(layer)?));
+            slot_of_routed.push((layer, inverse));
         }
-        ensure!(
-            uploaded == per_layer,
-            "single-layer upload moved {uploaded} bytes, planned {per_layer}"
-        );
-
-        let resident = pack.resident_ids(layer)?;
-        let mut inverse = vec![NO_SLOT; ROUTED_EXPERTS];
-        for (slot, &expert_id) in resident.iter().enumerate() {
-            inverse[expert_id as usize] = slot as i32;
-        }
-        // `layers` is indexed by the REAL layer number via the `layer` field, and
-        // `self.layer()` checks it — so a lookup of the wrong layer is an error, never a
-        // silent hit on the only entry present.
+        ensure!(uploaded == need, "subset upload moved {uploaded} bytes, planned {need}");
         Ok(Self {
-            layers: vec![Cb3LayerResidency { planes, strides, layer }],
-            routing_masks: vec![(layer, pack.routing_mask(layer)?)],
-            slot_of_routed: vec![(layer, inverse)],
+            layers,
+            routing_masks,
+            slot_of_routed,
             packed_keep,
-            resident_bytes: per_layer,
+            resident_bytes: need,
         })
     }
 
