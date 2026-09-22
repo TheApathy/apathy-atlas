@@ -199,6 +199,20 @@ impl Dsv41SparseCore {
         max_chunk: usize,
         freqs_c: RopeTable,
     ) -> Result<Self> {
+        Self::load_prefix(gpu, store, config, max_seq, max_chunk, freqs_c, 40)
+    }
+
+    /// Layers `0..n_layers` only — for drivers that load a layer prefix of the checkpoint.
+    pub fn load_prefix(
+        gpu: &dyn GpuBackend,
+        store: &WeightStore,
+        config: &ModelConfig,
+        max_seq: usize,
+        max_chunk: usize,
+        freqs_c: RopeTable,
+        n_layers: usize,
+    ) -> Result<Self> {
+        ensure!((1..=40).contains(&n_layers), "n_layers {n_layers} outside 1..=40");
         ensure!(config.num_attention_heads == 64, "V4.1 attention is 64 heads, config says {}", config.num_attention_heads);
         ensure!(max_chunk <= RING - WINDOW, "chunk {max_chunk} would overwrite window rows still in use");
         ensure!(freqs_c.positions >= max_seq, "freqs_c covers {} positions, max_seq is {max_seq}", freqs_c.positions);
@@ -213,8 +227,8 @@ impl Dsv41SparseCore {
             gpu.alloc(bytes.max(256))
         };
 
-        let mut layers = Vec::with_capacity(40);
-        for layer in 0..40 {
+        let mut layers = Vec::with_capacity(n_layers);
+        for layer in 0..n_layers {
             let ratio = *config.compress_ratios.get(layer).with_context(|| format!("no compress_ratio for layer {layer}"))?;
             let p = |s: &str| format!("layers.{layer}.attn.{s}");
             let kv = if KV_SOURCE_LAYERS.contains(&layer) {
