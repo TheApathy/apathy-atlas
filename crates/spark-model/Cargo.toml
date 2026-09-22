@@ -103,6 +103,12 @@ required-features = ["cuda", "gpu-examples"]
 name = "cb3_arena_residency_microtest"
 required-features = ["cuda", "gpu-examples"]
 
+# DeepSeek-V4.1 forward driver: runs N blocks over an oracle capture's prompt and dumps
+# per-layer taps for DSV41_PORT/oracle/compare.py. `--feed` teacher-forces sub-layers.
+[[example]]
+name = "dsv41_forward"
+required-features = ["cuda", "gpu-examples"]
+
 [[example]]
 name = "gemv_fp4_vs_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]
