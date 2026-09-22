@@ -50,3 +50,39 @@ Measured on the real 2048-token prompt above:
 A duplicate costs a full 4 KiB page fault, so the dedup removes ~23% of the I/O for
 the price of a hash map. The gradient — shorter n-grams repeat more — is what
 natural text should produce, and is a soft check that the hash is not degenerate.
+
+## Validated against the oracle capture (runA, the real engine)
+
+`validate_oracle.sh` compares against `DSV41_PORT/oracle/ref/runA`, a 37-token
+capture of the production engine. This is a stronger check than running the
+reference myself: it is the engine's own taps.
+
+| tap | result |
+|---|---|
+| `L01.engram_hashes` | **0 / 888 mismatches** (exact integer compare) |
+| `L14.engram_hashes` | **0 / 888 mismatches** |
+| `L01.engram_rows` | **rel_l2 0.0, max_abs 0.0** over 227,328 f32 |
+| `L14.engram_rows` | **rel_l2 0.0, max_abs 0.0** over 227,328 f32 |
+
+compare.py's own auto negative control was rejected in every float case, so the
+tolerance is not what produced the PASS.
+
+### Negative controls — each fails with the count the structure predicts
+
+Failing is not enough; the failure must land where the n-gram geometry says it must.
+
+| control | predicted | observed |
+|---|---|---|
+| flip one multiplier (`mult[0][2]`) | enters `rolling` at i=2, so the 3- and 4-gram groups = 16 cols x 37 = **592**, layer 0 only | 592, L14 correctly untouched |
+| swap two primes (layer 0, 2-gram, heads 0/1) | exactly those 2 cols x 37 = **74**, layer 0 only | 74, L14 correctly untouched |
+| perturb `token_map` at one id | id 260 occurs at positions 5/23/29/35; a change at p reaches p+0..3 but the 2-gram looks back only 1 and the 3-gram 2, giving 24+24+16+8 per isolated occurrence and 48 for the one at the tail = **264**, BOTH layers | 264 on both |
+
+The third control is the team lead's: its failure would otherwise be mistaken for
+a tokenizer-version difference rather than a bug.
+
+### Dead-head path: still UNVALIDATED
+
+`engram_dead` in runA is 888 entries, **0 True**, on both layers — confirmed
+empirically, as predicted. `masked_fill` is a no-op here, so the dead-head path is
+NOT exercised and a PASS on `engram_rows` does not cover it. Needs an
+image-bearing capture.
