@@ -93,4 +93,13 @@ extern "C" __global__ void atlas_glm53_dflash2_rope_rect(
 #define KERNEL_EXTRA_PARAMS , const float inv_sqrt_d
 #define KERNEL_PREAMBLE
 
+// This tree's common/prefill_paged_compute*.cuh predate upstream's portable
+// cp.async helpers; GLM's tile-load macros call atlas_cp16, so define it here.
+#ifndef GLM53_ATLAS_CP16_DEFINED
+#define GLM53_ATLAS_CP16_DEFINED
+__device__ __forceinline__ void atlas_cp16(void* smem_dst, const void* gmem_src) {
+    unsigned _s = __cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(_s), "l"(gmem_src));
+}
+#endif
 #include "../../common/prefill_paged_compute.cuh"
