@@ -80,4 +80,10 @@ __device__ __forceinline__ float fp8e4m3_f32(__nv_fp8_storage_t b) {
     __syncthreads();
 
 #include "prefill_paged_compute.cuh"
+// The BR=128 shadow's 95,808-byte shared-memory ABI is sized for head_dim 256.
+// On other head dims (minimax-m2, qwen3-vl: 128) its static_assert fires and
+// broke every wildcard build; skip it there. The host looks the `_128` symbol
+// up with try_kernel, so those targets simply do not offer the BR128 route.
+#if HDIM == 256
 #include "prefill_paged_nvfp4_br128.cuh"
+#endif
