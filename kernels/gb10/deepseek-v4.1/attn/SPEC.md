@@ -316,3 +316,16 @@ DISCRIMINATES in runD/runE. runC_2048 would (n_c to 1024) but has no idx_q/wts t
 (3) Exact ties at the k-th score: 0 in every fixture; the kernel breaks them by lowest column,
 torch.topk's order is unspecified. (4) The q/wts projections feeding the indexer (qr @ wq_b,
 x @ weights_proj, freqs_c RoPE) — inputs here are the engine's own idx_q/wts taps.
+
+### 8e.1 The indexer's INPUT projections (CPU, checkpoint weights, qr/attn_x taps)
+
+    q_i = rope_tail(bf16(qr @ dequant_fp8(wq_b)^T).view(T,32,128), freqs_c[abs pos])
+    wts = bf16(x @ weights_proj^T).float() * 128^-0.5 * 32^-0.5
+
+reproduces idx_q 99.98-99.99% and wts 99.96-100% bf16 bit-exact (rel 3e-5..1e-4; the residue
+is GEMM accumulation order). wq_b is the checkpoint's FP8 -- it is NOT in the FP4 re-quant
+groups of the production engine. Selection sensitivity to that residue, fp64 dot on top:
+1-3 rows of 512 (L20) and 1 of 128 (L24) change. So once the projections are Atlas's own
+GEMMs, expect top-k to match the engine on ~99.5% of rows, NOT 100%: the kernel is exact on
+the engine's inputs, and the remaining flips are upstream ulps meeting near-ties. A per-layer
+bisect must compare selection as set overlap from here on, not identity.
