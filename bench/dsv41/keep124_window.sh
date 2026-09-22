@@ -55,9 +55,11 @@ run_one() {
   echo "=== run: $*"
   "$BIN" "$@" &
   child=$!
+  local runlow; runlow=$(memavail)
   while kill -0 "$child" 2>/dev/null; do
     m=$(memavail)
     [ "$m" -lt "$low" ] && low=$m
+    [ "$m" -lt "$runlow" ] && runlow=$m
     if [ "$m" -lt "$ABORT_KB" ]; then
       echo "WATCHDOG: MemAvailable $((m/1024)) MB < 6 GB -> SIGKILL pid $child"
       kill -9 "$child"
@@ -65,7 +67,7 @@ run_one() {
     sleep 0.1
   done
   wait "$child"; local r=$?
-  echo "=== run rc=$r, low-water so far $((low/1024/1024)) GB"
+  echo "=== run rc=$r, this run's low-water $((runlow/1024)) MB, low-water so far $((low/1024/1024)) GB"
   [ "$r" -ne 0 ] && rc=$r
   return 0
 }

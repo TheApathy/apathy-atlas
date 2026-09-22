@@ -411,6 +411,8 @@ fn main() -> Result<()> {
     let mut dead_arm = DeadArm::Ported;
     let mut head_test = false;
     let mut core_real = false;
+    let mut chunk_override: Option<usize> = None;
+    let mut tile_prompt = 1usize;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -449,6 +451,11 @@ fn main() -> Result<()> {
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
             "--force-decode" => force_decode = true,
             "--warm-prefill" => warm_prefill = true,
+            // --chunk N: prefill chunk (and every chunk-sized scratch) instead of the capture's.
+            "--chunk" => chunk_override = Some(args.next().context("--chunk")?.parse()?),
+            // --tile-prompt K: the capture's prompt repeated K times (speed/memory/identity only:
+            // there is no oracle for the longer prompt).
+            "--tile-prompt" => tile_prompt = args.next().context("--tile-prompt")?.parse()?,
             // Per-run switches for the env-gated ops (read once, so set before any GPU work).
             // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
             "--fp8-rowtile" => unsafe { std::env::set_var("ATLAS_DSV41_FP8_ROWTILE", "1") },
@@ -503,8 +510,12 @@ fn main() -> Result<()> {
     }
     let ref_dir = PathBuf::from(REF_ROOT).join(&run);
     ensure!(ref_dir.join("manifest.json").is_file(), "{} has no manifest", ref_dir.display());
-    let ids = manifest_ids(&ref_dir)?;
-    let chunks = manifest_chunks(&ref_dir, ids.len())?;
+    let ids = manifest_ids(&ref_dir)?.repeat(tile_prompt);
+    let chunks = match chunk_override {
+        Some(c) => (0..ids.len()).step_by(c).map(|s| (s, c.min(ids.len() - s))).collect(),
+        None if tile_prompt > 1 => (0..ids.len()).step_by(512).map(|s| (s, 512.min(ids.len() - s))).collect(),
+        None => manifest_chunks(&ref_dir, ids.len())?,
+    };
     println!("{run}: {} tokens in chunks {chunks:?}; layers 0..{n_layers}; feed {feed:?}; control {control:?}", ids.len());
 
     let config = parse_config(&std::fs::read_to_string(format!("{MODEL_DIR}/config.json"))?)?;
