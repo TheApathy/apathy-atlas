@@ -18,6 +18,7 @@ pub mod parse;
 pub mod pyjson;
 pub mod repetition;
 pub mod request;
+pub mod vision;
 
 #[cfg(test)]
 mod tests;

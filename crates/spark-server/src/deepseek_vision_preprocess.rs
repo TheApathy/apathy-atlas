@@ -3,7 +3,7 @@
 //! DeepSeek-V4 image preprocessing and sentinel layout.
 
 #[path = "deepseek_vision_preprocess/bicubic.rs"]
-mod bicubic;
+pub(crate) mod bicubic;
 #[path = "deepseek_vision_preprocess/geometry.rs"]
 mod geometry;
 #[path = "deepseek_vision_preprocess/prompt.rs"]
@@ -184,7 +184,7 @@ pub(crate) fn preprocess_rgb(
     })
 }
 
-fn round_bf16(value: f32) -> f32 {
+pub(crate) fn round_bf16(value: f32) -> f32 {
     let bits = value.to_bits();
     let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000;
     f32::from_bits(rounded)

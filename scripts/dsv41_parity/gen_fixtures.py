@@ -347,6 +347,85 @@ def repetition_cases():
     return out
 
 
+def _png(img, fmt="PNG", **kw):
+    import base64
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format=fmt, **kw)
+    mime = "image/png" if fmt == "PNG" else "image/jpeg"
+    return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def _pattern(w, h, mode="RGB"):
+    import numpy as np
+    from PIL import Image
+    y, x = np.mgrid[0:h, 0:w]
+    arr = np.stack([(x * 7 + y * 3) % 256, (x * 11 ^ y * 5) % 256, ((x // 9 + y // 7) * 37) % 256], -1)
+    return Image.fromarray(arr.astype("uint8"), "RGB").convert(mode)
+
+
+def vision_cases():
+    import numpy as np
+    from PIL import Image
+    sys.path.insert(0, os.path.join(PY_TREE, "engine"))
+    from engine import vision as V
+    cfg = V.VisionConfig.from_mapping(json.load(open(os.path.join(MODEL_DIR, "config.json"))))
+    exif_img = _pattern(90, 60)
+    exif = exif_img.getexif()
+    exif[0x0112] = 6  # orientation: rotate 90 CW on display
+    images = [
+        ("gradient_640x480", _png(_pattern(640, 480))),
+        ("small_upscaled_200x100", _png(_pattern(200, 100))),
+        ("large_solver_3000x2000", _png(_pattern(3000, 2000))),
+        ("wide_5000x300", _png(_pattern(5000, 300))),
+        ("tall_120x2500", _png(_pattern(120, 2500))),
+        ("tiny_1x1", _png(_pattern(1, 1))),
+        ("jpeg_q90", _png(_pattern(333, 222), "JPEG", quality=90)),
+        ("jpeg_exif_orient6", _png(exif_img, "JPEG", quality=95, exif=exif)),
+        ("rgba_png", _png(_pattern(150, 170, "RGBA"))),
+        ("gray_png", _png(_pattern(150, 170, "L"))),
+        ("palette_png", _png(_pattern(160, 90).convert("P"))),
+    ]
+    out = []
+    for name, uri in images:
+        rec = {"name": name, "uri": uri}
+        try:
+            img = V.decode_image_record({"type": "image", "url": uri})
+            prep = V.preprocess_image(img, cfg)
+        except ValueError as e:
+            rec["error"] = str(e)
+            out.append(rec)
+            continue
+        bits = prep.patches.contiguous().view(torch_int16()).numpy().astype("<u2").tobytes()
+        rec.update(decoded_size=list(img.size), vit_h=prep.vit_h, vit_w=prep.vit_w, llm_h=prep.llm_h,
+                   llm_w=prep.llm_w, types=prep.types.tolist(), patches_shape=list(prep.patches.shape),
+                   patches_fnv=fnv1a64(bits), patches_head=[float(v) for v in prep.patches.flatten()[:48]])
+        out.append(rec)
+    for name, uri in [("remote_url", "https://example.com/a.png"), ("gif", _png(_pattern(8, 8), "GIF").replace("image/jpeg", "image/gif")),
+                      ("too_many_pixels", _png(_pattern(8000, 5001))), ("not_base64", "data:image/png;base64,@@@@")]:
+        try:
+            V.decode_image_record({"type": "image", "url": uri})
+            out.append({"name": name, "uri": uri, "error": None})
+        except ValueError as e:
+            # the 8000x5001 payload is ~MBs; the Rust test builds its own oversized image
+            out.append({"name": name, "uri": uri if len(uri) < 4096 else None, "error": str(e)})
+    types = [V.image_token_types(2, 3), V.image_token_types(1, 1)]
+    expand = []
+    for ids in ([5, 129264, 7, 129264], [129264, 129264], [5, 6, 129264, 8, 9, 10, 129264, 11]):
+        o, spans = V.expand_image_placeholders(ids, types)
+        expand.append({"ids": ids, "out": o, "spans": [[p.start, p.pad, p.types.numel()] for p in spans]})
+    dead_ids = [5, 129265, 129264, 129264, 7, 8, 9, 10, 129264, 11]
+    import torch
+    dead = V.engram_dead_heads(torch.tensor(dead_ids)).int().tolist()
+    return {"images": out, "types": [t.tolist() for t in types], "expand": expand,
+            "dead_heads": {"ids": dead_ids, "dead": dead}}
+
+
+def torch_int16():
+    import torch
+    return torch.int16
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     render = [render_case(n, b) for n, b in RENDER_CASES]
@@ -357,6 +436,8 @@ def main():
         ebnf = tool_grammar.build_tool_grammar(t)
         grammar.append({"name": n, "tools": t, "ebnf": ebnf,
                         "streams": [mask_trace(ebnf, x) for x in MASK_STREAMS.get(n, [])]})
+    with open(os.path.join(OUT, "vision.json"), "w") as f:
+        json.dump(vision_cases(), f)
     with open(os.path.join(OUT, "repetition.json"), "w") as f:
         json.dump({"cases": repetition_cases()}, f)
     meta = {"generator": "scripts/dsv41_parity/gen_fixtures.py", "py_tree": PY_TREE, "model_dir": MODEL_DIR}
