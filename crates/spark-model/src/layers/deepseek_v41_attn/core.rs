@@ -857,6 +857,11 @@ impl PassHook for Dsv41SparseCore {
         }
         Ok(())
     }
+
+    /// DSpark: delegates to the gated [`Dsv41SparseCore::rollback`] on the forward's stream.
+    fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
+        Dsv41SparseCore::rollback(self, ops.gpu, n, ops.stream)
+    }
 }
 
 impl AttnCore for Dsv41SparseCore {
@@ -899,6 +904,10 @@ impl AttnCore for Dsv41SparseCore {
 impl PassHook for std::sync::Arc<Dsv41SparseCore> {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
         self.as_ref().begin_pass(kind, start, t)
+    }
+
+    fn rollback(&self, ops: &Ops, n: usize) -> Result<()> {
+        PassHook::rollback(self.as_ref(), ops, n)
     }
 }
 

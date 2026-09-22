@@ -436,13 +436,13 @@ fn main() -> Result<()> {
     //      with the pending restore skipped must differ.
     {
         const R0: usize = 1000;
-        let run_rows = |start: usize, src: &[usize]| -> Result<PassOut> {
+        let run_rows_kind = |start: usize, src: &[usize], kind: PassKind| -> Result<PassOut> {
             let t = src.len();
             let mut r = PassOut { topk: vec![Vec::new(); ins.len()], out: vec![Vec::new(); ins.len()] };
             let wpos_d = dev.up(bytemuck_i32(&window_positions(start, t)))?;
             let out_d = gpu.alloc(t * QROW)?;
             let (xb, qrb, qb) = (gpu.alloc(t * 5120 * 2)?, gpu.alloc(t * 1280 * 2)?, gpu.alloc(t * QROW)?);
-            core.begin_pass(PassKind::Decode, start, t)?;
+            core.begin_pass(kind, start, t)?;
             for (i, li) in ins.iter().enumerate() {
                 for (j, &sr) in src.iter().enumerate() {
                     gpu.copy_d2d(li.x.offset(sr * 5120 * 2), xb.offset(j * 5120 * 2), 5120 * 2)?;
@@ -459,6 +459,7 @@ fn main() -> Result<()> {
             }
             Ok(r)
         };
+        let run_rows = |start: usize, src: &[usize]| run_rows_kind(start, src, PassKind::Decode);
         // Compare only the rows BOTH runs legitimately own: those below the final length. Rows at
         // or past it hold whatever a rejected draft (or an earlier arm) wrote and are rewritten
         // before any query can see them. (A first version compared a fixed 1005 rows and "failed"
@@ -488,9 +489,9 @@ fn main() -> Result<()> {
         for (restore, joined) in [(true, false), (true, true), (false, false), (false, true)] {
             let arm = || -> Result<usize> {
             run_encoder(&dev, &ops, &core, &ins, &[0, CHUNK, R0], None)?;
-            let v = run_rows(R0, &[1000, 1001, 1002, 900, 901, 902])?;
+            let v = run_rows_kind(R0, &[1000, 1001, 1002, 900, 901, 902], PassKind::Verify)?;
             if restore {
-                core.rollback(gpu.as_ref(), 1003, ops.stream)?;
+                PassHook::rollback(&core, &ops, 1003)?; // the forward's trait path
             } else {
                 core.control_rollback_without_restore(gpu.as_ref(), 1003, ops.stream)?;
             }
@@ -517,7 +518,7 @@ fn main() -> Result<()> {
             }
             let c_diff: usize = caches(&core, 1005)?.iter().zip(&a_cache).map(|(x, y)| x.iter().zip(y).filter(|(a, b)| a != b).count()).sum();
             println!(
-                "ROLLBACK {} (resume {}): verify T=6 (3 accepted + 3 wrong drafts), rollback(1003), resume 1003..1004 -> {diff} differing top-k rows/attention values vs never-drafted decode; {c_diff} differing ckv/ik bytes",
+                "ROLLBACK {} (resume {}): Verify T=6 via PassHook::rollback (3 accepted + 3 wrong drafts), rollback(1003), resume 1003..1004 -> {diff} differing top-k rows/attention values vs never-drafted decode; {c_diff} differing ckv/ik bytes",
                 if restore { "real           " } else { "CTRL no restore" },
                 if joined { "one T=2 pass" } else { "two T=1 passes" }
             );
@@ -544,9 +545,9 @@ fn main() -> Result<()> {
             let arm = || -> Result<usize> {
                 run_encoder(&dev, &ops, &core, &ins, &[0, CHUNK, R0], None)?;
                 run_rows(R0, &[R0])?;
-                run_rows(R0 + 1, &[900, 901, 902, 903, 904, 905])?; // all six drafts wrong
+                run_rows_kind(R0 + 1, &[900, 901, 902, 903, 904, 905], PassKind::Verify)?; // all six drafts wrong
                 if restore {
-                    core.rollback(gpu.as_ref(), R0 + 1, ops.stream)?;
+                    PassHook::rollback(&core, &ops, R0 + 1)?;
                 } else {
                     core.control_rollback_without_restore(gpu.as_ref(), R0 + 1, ops.stream)?;
                 }
