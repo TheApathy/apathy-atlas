@@ -133,6 +133,12 @@ required-features = ["cuda", "gpu-examples"]
 name = "dsv41_moe_bench"
 required-features = ["cuda", "gpu-examples"]
 
+# DeepSeek-V4.1 vision tower vs the production vision.py, stage by stage, with
+# an exact unfold-layout check and a `--control` that must separate.
+[[example]]
+name = "dsv41_vision_tower_microtest"
+required-features = ["cuda", "gpu-examples"]
+
 [[example]]
 name = "gemv_fp4_vs_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]

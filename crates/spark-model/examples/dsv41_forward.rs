@@ -230,9 +230,12 @@ fn run_model_path(
     moe_real: bool,
     attn_real: bool,
     decode_n: usize,
+    force_decode: bool,
+    warm_prefill: bool,
+    splits: Vec<Vec<usize>>,
 ) -> Result<()> {
     let gpu_ref: &AtlasCudaBackend = &Arc::clone(&gpu);
-    let max_chunk = chunks.iter().map(|c| c.1).max().unwrap_or(1);
+    let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
     let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
     let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };
     let fed_core = FedCore(&feeder);
@@ -251,16 +254,42 @@ fn run_model_path(
     } else {
         &fed_moe
     };
+    let tap_base = tap_dir.clone();
     let tap = match tap_dir {
         Some(d) => Tap::to_dir(d, Vec::new())?,
         None => Tap::off(),
     };
     let mut seq = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
     let logits = ops.gpu.alloc(spark_model::weight_loader::deepseek_v41::ops::MM_TILE * config.vocab_size * 2)?;
+    // --split: the SAME prompt prefilled under several chunkings, each into <tap_dir>/split_<i>
+    // with a fresh sequence, for the chunk-invariance check. Then return.
+    if !splits.is_empty() {
+        let base = tap_base.clone().context("--split needs --tap-dir")?;
+        for (i, sp) in splits.iter().enumerate() {
+            ensure!(sp.iter().sum::<usize>() == ids.len(), "split {sp:?} does not sum to {}", ids.len());
+            let tap_i = Tap::to_dir(base.join(format!("split_{i}")), Vec::new())?;
+            let mut s = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
+            let mut at = 0;
+            for &n in sp {
+                fwd.prefill_chunk(ops, &mut s, &ids[at..at + n], PrefillMode::Replay, hook, core, moe, &tap_i)?;
+                at += n;
+            }
+            fwd.finish_prefill(ops, &mut s, PrefillMode::Replay, hook, core, moe, &tap_i, logits)?;
+            tap_i.bf16(ops, "logits_last", 40, logits, &[config.vocab_size])?;
+            ops.gpu.synchronize(ops.stream)?;
+            println!("split {i} {sp:?} done");
+            s.free(ops.gpu)?;
+        }
+        println!("DONE dsv41_forward path=model splits");
+        return Ok(());
+    }
     let t0 = std::time::Instant::now();
     fwd.prefill(ops, &mut seq, ids, PrefillMode::Replay, hook, core, moe, &tap, logits)?;
     ops.gpu.synchronize(ops.stream)?;
     println!("prefill {} tokens in {:.2}s", ids.len(), t0.elapsed().as_secs_f64());
+    if spark_model::weight_loader::deepseek_v41::ops::profile::enabled() {
+        println!("PROFILE (cold prefill, every scope synchronized):\n{}", spark_model::weight_loader::deepseek_v41::ops::profile::report());
+    }
     tap.bf16(ops, "logits_last", 40, logits, &[config.vocab_size])?;
     ops.gpu.synchronize(ops.stream)?;
     let mut host = vec![0u8; config.vocab_size * 2];
@@ -271,26 +300,48 @@ fn run_model_path(
     if decode_n > 0 {
         let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(ref_dir.join("manifest.json"))?)?;
         let want: Vec<u32> = m["greedy_continuation"].as_array().map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()).unwrap_or_default();
-        let mut got = vec![arg as u32];
+        // Per step: our top-5, the oracle's token and its logit under OUR distribution, and the
+        // margin top1 - logit(oracle token). With --force-decode the INPUT at each step is the
+        // oracle's token (teacher forcing), so every step is conditioned on the oracle's prefix.
+        let report = |step: usize, v: &[f32]| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.select_nth_unstable_by(5, |&a, &b| v[b].total_cmp(&v[a]));
+            let mut top: Vec<usize> = idx[..5].to_vec();
+            top.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+            let o = want.get(step).copied();
+            let (ol, margin) = match o {
+                Some(t) => (v[t as usize], v[top[0]] - v[t as usize]),
+                None => (f32::NAN, f32::NAN),
+            };
+            println!(
+                "step {step:2}: ours {:6} oracle {:6?} | logit(oracle) {ol:7.3} margin {margin:6.3} | top5 {:?}",
+                top[0], o, top.iter().map(|&i| (i, v[i])).collect::<Vec<_>>()
+            );
+            top[0] as u32
+        };
+        let to_f32 = |h: &[u8]| -> Vec<f32> { h.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect() };
+        let mut got = vec![report(0, &v)];
         let t1 = std::time::Instant::now();
         let mut steps_ms = Vec::with_capacity(decode_n);
         let mut hashes: Vec<u64> = Vec::with_capacity(decode_n);
-        for _ in 1..decode_n {
-            let tok = *got.last().unwrap();
+        for step in 1..decode_n {
+            let input = if force_decode { want[step - 1] } else { *got.last().unwrap() };
             let ts = std::time::Instant::now();
-            fwd.decode(ops, &mut seq, tok, hook, core, moe, &Tap::off(), logits)?;
+            fwd.decode(ops, &mut seq, input, hook, core, moe, &Tap::off(), logits)?;
             ops.gpu.synchronize(ops.stream)?;
             steps_ms.push(ts.elapsed().as_secs_f64() * 1e3);
             ops.gpu.copy_d2h(logits, &mut host)?;
             // FNV-1a over the step's raw bf16 logits: arms that must be bit-identical compare these.
             hashes.push(host.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)));
-            let v: Vec<f32> = host.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
-            let a = v.iter().enumerate().fold((0usize, f32::MIN), |a, (i, &x)| if x > a.1 { (i, x) } else { a }).0;
-            got.push(a as u32);
+            got.push(report(step, &to_f32(&host)));
         }
         let dt = t1.elapsed().as_secs_f64();
+        if spark_model::weight_loader::deepseek_v41::ops::profile::enabled() {
+            println!("PROFILE (decode steps):\n{}", spark_model::weight_loader::deepseek_v41::ops::profile::report());
+        }
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
-        println!("decode: {} tokens in {dt:.2}s ({:.2} tok/s)", got.len() - 1, (got.len() - 1) as f64 / dt);
+        let matches = got.iter().zip(&want).filter(|(a, b)| a == b).count();
+        println!("decode ({}): {} steps in {dt:.2}s ({:.2} tok/s)", if force_decode { "teacher-forced" } else { "free" }, got.len() - 1, (got.len() - 1) as f64 / dt);
         if steps_ms.len() > 2 {
             // Warm steps: drop the first (cold caches, first-touch of lazily resolved kernels).
             let mut w = steps_ms[1..].to_vec();
@@ -304,7 +355,21 @@ fn run_model_path(
         println!("decode logits fnv: {:016x}", hashes.iter().fold(0u64, |a, h| a.rotate_left(7) ^ h));
         println!("decode logits fnv per step: {:x?}", hashes);
         println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
-        println!("decode: first {agree} of {} greedy tokens identical to the oracle", got.len());
+        println!("decode: first {agree} identical; top-1 agreement {matches}/{}", got.len().min(want.len()));
+    }
+    if warm_prefill {
+        // Second prefill of the same prompt in the same process: weights, arena, kernels and
+        // cuBLASLt heuristics warm; engram rows now in page cache. Fresh sequence state.
+        let mut seq2 = V41Seq::new(ops.gpu, &dims, EngramHashState::for_checkpoint(Path::new(MODEL_DIR))?)?;
+        ops.gpu.synchronize(ops.stream)?;
+        let t0 = std::time::Instant::now();
+        fwd.prefill(ops, &mut seq2, ids, PrefillMode::Replay, hook, core, moe, &Tap::off(), logits)?;
+        ops.gpu.synchronize(ops.stream)?;
+        let dt = t0.elapsed().as_secs_f64();
+        println!("WARM prefill: {} tokens in {dt:.3}s = {:.1} tok/s (chunk {max_chunk}, replay 128, engram page-cache warm)", ids.len(), ids.len() as f64 / dt);
+        if spark_model::weight_loader::deepseek_v41::ops::profile::enabled() {
+            println!("PROFILE (warm prefill, every scope synchronized; wall above is NOT a throughput number):\n{}", spark_model::weight_loader::deepseek_v41::ops::profile::report());
+        }
     }
     println!("DONE dsv41_forward path=model");
     Ok(())
@@ -321,6 +386,9 @@ fn main() -> Result<()> {
     let mut moe_real = false;
     let mut attn_real = false;
     let mut decode_n = 0usize;
+    let mut force_decode = false;
+    let mut warm_prefill = false;
+    let mut splits: Vec<Vec<usize>> = Vec::new();
     let mut engram_live = false;
     let mut head_test = false;
     let mut core_real = false;
@@ -351,6 +419,25 @@ fn main() -> Result<()> {
             "--moe-real" => moe_real = true,
             "--attn-real" => attn_real = true,
             "--decode" => decode_n = args.next().context("--decode")?.parse()?,
+            "--force-decode" => force_decode = true,
+            "--warm-prefill" => warm_prefill = true,
+            // Per-run switches for the env-gated ops (read once, so set before any GPU work).
+            // SAFETY: single-threaded at argument parsing; nothing has read the environment yet.
+            "--fp8-rowtile" => unsafe { std::env::set_var("ATLAS_DSV41_FP8_ROWTILE", "1") },
+            "--prof" => unsafe { std::env::set_var("ATLAS_DSV41_PROF", "1") },
+            "--tap-names" => {
+                let v = args.next().context("--tap-names")?;
+                unsafe { std::env::set_var("ATLAS_DSV41_TAP_NAMES", v) }
+            }
+            // --split "512,512,20;1024,20;500,544"
+            "--split" => {
+                splits = args
+                    .next()
+                    .context("--split")?
+                    .split(';')
+                    .map(|g| g.split(',').map(|n| n.parse::<usize>().map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>())
+                    .collect::<Result<Vec<_>>>()?
+            }
             "--path" => {
                 model_path = match args.next().context("--path")?.as_str() {
                     "model" => true,
@@ -403,7 +490,7 @@ fn main() -> Result<()> {
     let stream = gpu.default_stream();
     let ops = Ops { gpu: gpu.as_ref(), k: &kernels, stream };
     if model_path {
-        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n);
+        return run_model_path(&store, &ops, &config, dims, &ref_dir, &ids, &chunks, n_layers, tap_dir, Arc::clone(&gpu), moe_real, attn_real, decode_n, force_decode, warm_prefill, splits);
     }
     let blocks: Vec<V41BlockWeights> = (0..n_layers).map(|l| V41BlockWeights::load(&store, l, &dims, &ops)).collect::<Result<_>>()?;
     let largest = blocks

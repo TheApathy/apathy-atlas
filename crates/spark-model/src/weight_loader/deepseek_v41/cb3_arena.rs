@@ -107,6 +107,13 @@ impl Cb3LayerResidency {
     pub fn layer(&self) -> usize {
         self.layer
     }
+
+    /// Slot-0 base of one plane and its per-slot stride in bytes, for kernels that address
+    /// every resident expert of the layer themselves (the fused grouped GEMM).
+    pub fn plane_base(&self, tensor: Cb3Tensor) -> (DevicePtr, u64) {
+        let index = tensor_index(tensor);
+        (self.planes[index], self.strides[index] as u64)
+    }
 }
 
 /// The resident expert pack: 40 layers x 12 planes x `packed_keep` experts.

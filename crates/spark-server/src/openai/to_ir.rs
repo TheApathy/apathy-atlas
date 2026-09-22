@@ -117,6 +117,7 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             seed: req.seed,
             timeout_secs: req.timeout,
             return_token_ids: req.return_token_ids,
+            raw_openai_body: None,
         }
     }
 }

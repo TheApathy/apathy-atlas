@@ -22,7 +22,7 @@ use spark_runtime::weights::WeightStore;
 
 use super::attn_block::{self, AttnCore, AttnScratch, HEAD_DIM, RING, V41AttnWeights, WINDOW, compress_ratio};
 use super::fwd::{BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block};
-use super::ops::{Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
+use super::ops::{Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32, prof};
 use crate::layers::deepseek_v41_engram::{EngramGather, EngramHashState, engram_dead_heads};
 
 /// `candidate_source_layer`: the last encoder layer.
@@ -201,9 +201,9 @@ impl V41Forward {
                 let li = if l == 1 { 0 } else { 1 };
                 let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                 let g = &self.engram.iter().find(|(el, _)| *el == l).context("no engram gather")?.1;
-                g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream)?;
+                prof(ops, "engram.gather", || g.gather_rows_gpu(&rows, t, s.engram_rows, ops.gpu, ops.stream))?;
                 // `pass` uploaded this chunk's dead-head mask into `s.engram_dead`.
-                e.forward(ops, s.h, s.engram_rows, s.engram_dead, t, s, &self.dims)?;
+                prof(ops, "engram.proj", || e.forward(ops, s.h, s.engram_rows, s.engram_dead, t, s, &self.dims))?;
                 tap.bf16(ops, "engram_out", l, s.h, &[t, self.dims.hc, self.dims.hidden])?;
             }
             let adapter = AttnAdapter { fwd: self, ring: seq.rings[l], win_lo, core, tap };
@@ -337,7 +337,7 @@ impl V41Forward {
             moe.begin_pass(&seq.tail_ids)?;
             self.run_layers(ops, seq, (ENCODER_LAST + 1)..n, t, start, start, None, core, moe, tap)?;
         }
-        super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, t, self.norm, self.head, self.vocab, logits)
+        prof(ops, "head", || super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, t, self.norm, self.head, self.vocab, logits))
     }
 
     /// The whole prompt: chunks of `max_chunk`, then [`Self::finish_prefill`].
@@ -376,7 +376,7 @@ impl V41Forward {
     ) -> Result<()> {
         let start = seq.len;
         self.pass(ops, seq, &[token], start, 0..self.blocks.len(), PassKind::Decode, hook, core, moe, tap)?;
-        super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, 1, self.norm, self.head, self.vocab, logits)
+        prof(ops, "head", || super::fwd::final_logits_last_row(ops, &self.dims, &self.scratch, 1, self.norm, self.head, self.vocab, logits))
     }
 }
 

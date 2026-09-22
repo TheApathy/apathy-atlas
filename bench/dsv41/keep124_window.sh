@@ -11,7 +11,7 @@ set -uo pipefail
 LABEL="$1"; shift
 Q=/home/flocka/atlas/.gb10-queue; LOCK=/home/flocka/atlas/.gb10.lock
 BIN=/home/flocka/atlas/dsv41-integration/target/release/examples/dsv41_forward
-ABORT_KB=$((6 * 1024 * 1024))
+ABORT_KB=$(( ${ABORT_GB:-6} * 1024 * 1024 ))
 NEED_KB=$((100 * 1024 * 1024))
 memavail() { awk '/^MemAvailable:/ {print $2}' /proc/meminfo; }
 [ -x "$BIN" ] || { echo "FATAL: $BIN missing"; echo "DONE $LABEL rc=99"; exit 99; }

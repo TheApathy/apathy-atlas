@@ -22,7 +22,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::WeightStore;
 
 use super::fwd::Tap;
-use super::ops::{Fp8Linear, Ops, RopeTable, bf16_tensor, bytemuck_i32, f32_tensor};
+use super::ops::{Fp8Linear, MM_TILE, Ops, RopeTable, bf16_tensor, bytemuck_i32, f32_tensor, prof};
 
 /// Window ring slots (`engine/model.py` RING). Must exceed window + longest chunk.
 pub const RING: usize = 4096;
@@ -216,10 +216,12 @@ pub fn attention(
         gpu.copy_d2d_async(s.kv.offset(n1 * row), ring, (t - n1) * row, ops.stream)?;
     }
 
-    core.run(
-        ops,
-        &CoreArgs { layer: l, x, qr: s.qr, q: s.q, ring, wpos: s.wpos, win_lo, sink: w.attn_sink, t, start, out: s.o },
-    )?;
+    prof(ops, "attention/core", || {
+        core.run(
+            ops,
+            &CoreArgs { layer: l, x, qr: s.qr, q: s.q, ring, wpos: s.wpos, win_lo, sink: w.attn_sink, t, start, out: s.o },
+        )
+    })?;
     tap.bf16(ops, "attn_o_pre_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
     ops.rope_tail(s.o, s.pos, rope, t, N_HEADS, HEAD_DIM, true)?;
     tap.bf16(ops, "attn_o_post_inverse_rope", l, s.o, &[t, N_HEADS, HEAD_DIM])?;
@@ -231,9 +233,14 @@ pub fn attention(
         ops.fp8_gemv_m1(s.o, &w.wo_a, s.o2, O_LORA, grp_k)?;
         return ops.linear_fp8_tiled(s.o2, &w.wo_b, wscratch, out, t);
     }
-    ops.dequant(&w.wo_a, wscratch)?;
+    // `v41_ref.wo_a_proj` runs the grouped fp8 kernel (row-invariant, not row-tiled), so the
+    // same row policy as `linear_fp8_tiled`: one GEMM per group at M > 16, one tile at M <= 16.
+    prof(ops, "dense/dequant", || ops.dequant(&w.wo_a, wscratch))?;
+    let grouped = |x: DevicePtr, lda: usize, wt: DevicePtr, o: DevicePtr, ldc: usize, m: usize, n: usize, k: usize| {
+        if m > MM_TILE && !super::ops::fp8_force_rowtile() { ops.linear_bf16_strided(x, lda, wt, o, ldc, m, n, k) } else { ops.linear_bf16_tiled(x, lda, wt, o, ldc, m, n, k) }
+    };
     for g in 0..O_GROUPS {
-        ops.linear_bf16_tiled(
+        grouped(
             s.o.offset(g * grp_k * 2),
             N_HEADS * HEAD_DIM,
             wscratch.offset(g * O_LORA * grp_k * 2),

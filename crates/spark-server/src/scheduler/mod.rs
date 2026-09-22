@@ -59,6 +59,7 @@ use decode_logits_step::*;
 use decode_step::*;
 use emit_step::*;
 pub use helpers::disable_watchdogs;
+pub use helpers::force_disable_watchdogs;
 pub use helpers::set_boundary_token_mask;
 pub use helpers::set_enable_loop_watchdog;
 pub use helpers::set_enable_think_loop_watchdog;

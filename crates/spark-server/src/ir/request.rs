@@ -69,6 +69,9 @@ pub struct ChatRequest {
     pub timeout_secs: Option<f32>,
     /// Emit sampled token IDs on stream chunks (vLLM extension).
     pub return_token_ids: bool,
+    /// The OpenAI request body verbatim, kept only when the model renders its
+    /// prompt from the wire request itself (deepseek_v41, `api/dsv41.rs`).
+    pub raw_openai_body: Option<std::sync::Arc<serde_json::Value>>,
 }
 
 /// Client sampling parameters. `None` = client silent → the server's

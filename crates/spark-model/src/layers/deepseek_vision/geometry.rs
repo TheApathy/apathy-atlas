@@ -25,14 +25,17 @@ impl Geometry {
         max_rows: usize,
         text_hidden: usize,
     ) -> Result<Self> {
+        // The tower is identical in V4-Flash-Vision (text 4096, <=384 image
+        // tokens) and V4.1 (text 5120, <=1024 image tokens incl. newlines).
         ensure!(
-            (hidden, intermediate, heads, patch, ratio, text_hidden)
-                == (1024, 2816, 16, 14, 3, 4096),
+            (hidden, intermediate, heads, patch, ratio) == (1024, 2816, 16, 14, 3)
+                && matches!(text_hidden, 4096 | 5120),
             "unsupported DeepSeek vision encoder geometry"
         );
+        let cap = if text_hidden == 5120 { 1024 } else { 384 };
         ensure!(
-            (1..=384).contains(&max_rows),
-            "DeepSeek vision image token capacity must be 1..384"
+            (1..=cap).contains(&max_rows),
+            "DeepSeek vision image token capacity must be 1..{cap}"
         );
         Ok(Self {
             hidden,

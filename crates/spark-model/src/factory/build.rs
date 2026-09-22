@@ -72,8 +72,7 @@ pub fn build_model(
         }
         let model_dir = crate::weight_loader::deepseek_v41::resolve_model_dir()?;
         let max_chunk = std::env::var("ATLAS_DSV41_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
-        let lanes = crate::model::dsv41::build_lanes(store, &config, gpu.as_ref(), max_seq_len)?;
-        let model = crate::model::dsv41::Dsv41Model::new(&config, store, gpu, &model_dir, lanes, max_seq_len, max_chunk)?;
+        let model = crate::model::dsv41::Dsv41Model::new(&config, store, gpu, &model_dir, max_seq_len, max_chunk)?;
         return Ok(Box::new(model));
     }
     let vision_dspark_candidate = super::vision_speculation_loaded::validate(

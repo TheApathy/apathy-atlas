@@ -257,6 +257,13 @@ fn parse_disable_watchdogs(env: Option<&str>) -> bool {
 
 /// Whether all auto-watchdogs are disabled at runtime. `false` by
 /// default; flipped only when `ATLAS_DISABLE_WATCHDOGS=1`/`true`.
+/// Force the kill-switch on before the first read (deepseek_v41: the Python
+/// engine has none of these heuristics, so parity means switching them off).
+/// Returns false if the switch was already resolved (too late to change).
+pub fn force_disable_watchdogs() -> bool {
+    DISABLE_WATCHDOGS.set(true).is_ok() || disable_watchdogs()
+}
+
 pub fn disable_watchdogs() -> bool {
     *DISABLE_WATCHDOGS.get_or_init(|| {
         parse_disable_watchdogs(std::env::var("ATLAS_DISABLE_WATCHDOGS").ok().as_deref())
