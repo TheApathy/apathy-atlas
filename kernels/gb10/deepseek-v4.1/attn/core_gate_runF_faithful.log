@@ -21,5 +21,13 @@ L14 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows diffe
 L20 chunk invariance [0, 511, 1000, 1023, 1024] vs 2x512: topk 0/1024 rows differ (worst 1.0000), attention bit-identical 1.000000
 odd splits: replay tail 128 rows spanning 3 chunks, == own last 128 rows: true
 CTRL dropped pending at 511: REFUSED loudly (layer 2: 500 compressed rows visible, 499 published)
+DECODE L02 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 1.000000 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9976 rel 9.34e-5
+DECODE L08 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 1.000000 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9977 rel 9.30e-5
+DECODE L14 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 1.000000 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9980 rel 9.76e-5
+DECODE L20 (24 steps, T=1): vs own prefill topk 0 rows differ, attention bit-identical 1.000000 | vs capture topk 0/24 (worst 1.0000), attention bit-exact 0.9996 rel 5.76e-5
+CTRL DECODE L02 wpos shifted by one: attention bit-identical to the real decode 0.1290 (must collapse)
+CTRL DECODE L08 wpos shifted by one: attention bit-identical to the real decode 0.0774 (must collapse)
+CTRL DECODE L14 wpos shifted by one: attention bit-identical to the real decode 0.0865 (must collapse)
+CTRL DECODE L20 wpos shifted by one: attention bit-identical to the real decode 0.1307 (must collapse)
 RESET RULE: after Decode(pos 1024) the tail still holds 128 rows; after a new prompt 0
 CORE GATE PASS

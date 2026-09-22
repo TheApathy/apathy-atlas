@@ -283,7 +283,10 @@ fn main() -> Result<()> {
     //      Layers 21..23 inherit L20's tail; 24/28/32/36 re-index INSIDE the tail's candidate
     //      pool; the rest inherit the latest selection. Every replay layer's attention and every
     //      replay indexer's top-k is compared.
-    if cap.tap(21, "q", 0).is_ok() {
+    // runF also taps L21, but over whole chunks (replay OFF): only a capture whose L21 ran in
+    // the replay (win_lo > 0) is a replay reference.
+    let replay_capture = cap.tap(21, "win_lo", 0).map(|b| i64s(&b)[0] > 0).unwrap_or(false);
+    if replay_capture {
         run_encoder(&dev, &ops, &core, &ins, &[0, CHUNK, N_TOK], None)?; // restore the tail
         let start = N_TOK - REPLAY_ROWS;
         let wpos_d = dev.up(bytemuck_i32(&window_positions(start, REPLAY_ROWS)))?;
@@ -349,6 +352,71 @@ fn main() -> Result<()> {
             }
         }
         println!("REPLAY worst attention bit-exact over captured layers: {worst_att:.4}");
+    }
+
+    // ---- 5. DECODE: the prompt's last rows re-run as T=1 Decode passes after an encoder
+    //      prefill of the rest. Decode must reproduce the prefill of the same row: compared
+    //      BIT-FOR-BIT against this core's own 2x512 prefill, and against the capture.
+    //      Pre-registered band: top-k identical to the prefill rows (0 extra differing rows),
+    //      attention bit-identical to the core's prefill; vs the capture the prefill band.
+    {
+        const D0: usize = 1000; // decode positions D0..N_TOK (24 steps, both parities for r=2)
+        run_encoder(&dev, &ops, &core, &ins, &[0, CHUNK, D0], None)?;
+        let dec = |wpos_shift: usize| -> Result<PassOut> {
+            let mut r = PassOut { topk: vec![Vec::new(); ins.len()], out: vec![Vec::new(); ins.len()] };
+            let wpos_d = gpu.alloc(128 * 4)?;
+            let out_d = gpu.alloc(QROW)?;
+            for p in D0..N_TOK {
+                gpu.copy_h2d(bytemuck_i32(&window_positions(p - wpos_shift, 1)), wpos_d)?;
+                core.begin_pass(PassKind::Decode, p, 1)?;
+                for (i, li) in ins.iter().enumerate() {
+                    let a = CoreArgs {
+                        layer: li.layer,
+                        x: li.x.offset(p * 5120 * 2),
+                        qr: li.qr.offset(p * 1280 * 2),
+                        q: li.q.offset(p * QROW),
+                        ring: li.ring,
+                        wpos: wpos_d,
+                        win_lo: 0,
+                        sink: li.sink,
+                        t: 1,
+                        start: p,
+                        out: out_d,
+                    };
+                    core.run(&ops, &a)?;
+                    r.topk[i].extend(i64s(&dev.down(core.current_topk().unwrap(), INDEX_TOPK * 8)?));
+                    r.out[i].extend(u16s(&dev.down(out_d, QROW)?));
+                }
+            }
+            gpu.free(wpos_d)?;
+            gpu.free(out_d)?;
+            Ok(r)
+        };
+        let d = dec(0)?;
+        let n = N_TOK - D0;
+        for (i, li) in ins.iter().enumerate() {
+            let l = li.layer;
+            let own_tk = &std_run.topk[i][D0 * INDEX_TOPK..];
+            let own_o = &std_run.out[i][D0 * QROW / 2..];
+            let (self_bad, _) = topk_rows(&d.topk[i], own_tk, n);
+            let self_o = bits_equal(&d.out[i], own_o);
+            let cap_tk = &i64s(&cap.tap(l, "topk", 1)?)[(D0 - CHUNK) * INDEX_TOPK..];
+            let cap_o = &u16s(&cap.tap(l, "attn_o_pre_inverse_rope", 1)?)[(D0 - CHUNK) * QROW / 2..];
+            let (cap_bad, worst) = topk_rows(&d.topk[i], cap_tk, n);
+            let (ce, crl) = (bits_equal(&d.out[i], cap_o), rel_l2(&d.out[i], cap_o));
+            println!(
+                "DECODE L{l:02} ({n} steps, T=1): vs own prefill topk {self_bad} rows differ, attention bit-identical {self_o:.6} \
+                 | vs capture topk {cap_bad}/{n} (worst {worst:.4}), attention bit-exact {ce:.4} rel {crl:.2e}"
+            );
+            fail += usize::from(self_bad != 0 || self_o < 1.0 || cap_bad > 1 || ce < 0.98);
+        }
+        // CONTROL: window positions off by one (the query's own row dropped, p-128 added).
+        let c = dec(1)?;
+        for (i, li) in ins.iter().enumerate() {
+            let e = bits_equal(&c.out[i], &d.out[i]);
+            println!("CTRL DECODE L{:02} wpos shifted by one: attention bit-identical to the real decode {e:.4} (must collapse)", li.layer);
+            fail += usize::from(e > 0.5);
+        }
     }
 
     // ---- 4. the reset rule: Decode continues the sequence; only a new prompt resets.
