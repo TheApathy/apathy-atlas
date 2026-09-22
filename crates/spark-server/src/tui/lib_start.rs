@@ -126,12 +126,30 @@ pub(super) fn starting_points(recipes: &[Recipe], entry: &Entry) -> Vec<Recipe> 
         .as_ref()
         .map(|l| l.model_type.as_str())
         .unwrap_or_default();
+    let model = servable_model(entry);
     let mut out: Vec<Recipe> = ranked_donors(recipes, &entry.model, model_type)
         .into_iter()
-        .map(|d| template_from(d, &entry.model))
+        .map(|d| template_from(d, &model))
         .collect();
-    out.push(blank(&entry.model));
+    out.push(blank(&model));
     out
+}
+
+/// What `spark serve` must be given for this entry.
+///
+/// A model found under `ATLAS_MODEL_DIRS` is a plain directory whose id is
+/// just its folder name (no `org/`). Handing that bare name to `spark serve`
+/// sends it to the HF resolver, which does not find it in the cache and goes
+/// to the network, so a Library launch of a local checkpoint never loads.
+/// Such an entry is served by its directory path, which the positional
+/// MODEL argument accepts. HF-cache entries keep their `org/name` id.
+pub(super) fn servable_model(entry: &Entry) -> String {
+    match entry.local.as_ref() {
+        Some(local) if !local.id.contains('/') && !local.snapshot_dir.as_os_str().is_empty() => {
+            local.snapshot_dir.display().to_string()
+        }
+        _ => entry.model.clone(),
+    }
 }
 
 impl LibState {

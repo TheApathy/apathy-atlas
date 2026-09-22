@@ -200,3 +200,33 @@ fn a_real_recipe_arriving_for_the_model_outranks_the_guess() {
         "the measurement replaces the guess"
     );
 }
+
+/// A checkpoint found under ATLAS_MODEL_DIRS has a bare folder-name id; its
+/// cards must launch the DIRECTORY, not that name (the name goes to the HF
+/// resolver, misses the cache and hangs on the network). An HF-cache id keeps
+/// `org/name`. Control: the same entry without a snapshot dir keeps its id.
+#[test]
+fn local_dir_models_launch_by_path_hf_models_by_id() {
+    let mut plain = local("AEON-Q36-27B-Full", "qwen3_5");
+    plain.snapshot_dir = std::path::PathBuf::from("/models/AEON-Q36-27B-Full");
+    let entry = Entry {
+        model: "AEON-Q36-27B-Full".into(),
+        recipes: Vec::new(),
+        local: Some(plain),
+    };
+    let cards = starting_points(&[donor("qwen3.6/x", "Qwen/Qwen3.6-35B-A3B-FP8")], &entry);
+    assert!(!cards.is_empty());
+    assert!(cards.iter().all(|c| c.model == "/models/AEON-Q36-27B-Full"));
+
+    let mut hf = local("org/name", "qwen3_5");
+    hf.snapshot_dir = std::path::PathBuf::from("/cache/models--org--name/snapshots/abc");
+    let entry = Entry { model: "org/name".into(), recipes: Vec::new(), local: Some(hf) };
+    assert_eq!(servable_model(&entry), "org/name");
+
+    let entry = Entry {
+        model: "bare".into(),
+        recipes: Vec::new(),
+        local: Some(local("bare", "qwen3_5")),
+    };
+    assert_eq!(servable_model(&entry), "bare");
+}
