@@ -1,0 +1,31 @@
+[model]
+name = "deepseek-v4.1"
+hf_id = "deepseek-ai/DeepSeek-V4.1-Flash-Next"
+architecture = "MLA + CB3 MoE + engram + cross-layer sparse attention"
+
+# Shapes are from the LOCAL checkpoint's `text_config`
+# (/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/config.json),
+# flattened by `parse_deepseek_v41`. This is a DIFFERENT RELEASE from
+# `deepseek-v4-flash`, which is V4-Flash-0731; every major shape differs.
+layers_total = 40
+layers_full_attention = 40
+
+hidden_dim = 5120
+head_dim = 512
+q_heads = 64
+# MQA. This is why `DeepSeekV41WeightLoader::supports_tp` is false: 1 is not
+# divisible by any tp_size > 1. Architectural, not an unfinished feature.
+kv_heads = 1
+
+# MLA
+q_lora_rank = 1280
+qk_rope_head_dim = 64
+
+# MoE. `num_experts` is the ROUTER's id space. It is NOT what is on disk:
+# the K154-CB3 pack holds a per-layer permutation of 154, and production
+# serves a 124 prefix of that. See `atlas_core::config::ExpertPack`.
+num_experts = 384
+moe_intermediate_size = 2304
+
+[[model_types]]
+model_type = "deepseek_v41"

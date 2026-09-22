@@ -96,6 +96,13 @@ required-features = ["cuda", "gpu-examples"]
 name = "vision_hc_bf16_probe"
 required-features = ["cuda", "gpu-examples"]
 
+# The CB3 expert-arena residency control: uploads the pack and reads every byte
+# back off the device. `--control` corrupts one expectation so the comparison is
+# watched to FAIL before its PASS is treated as evidence.
+[[example]]
+name = "cb3_arena_residency_microtest"
+required-features = ["cuda", "gpu-examples"]
+
 [[example]]
 name = "gemv_fp4_vs_fp8_microtest"
 required-features = ["cuda", "gpu-examples"]

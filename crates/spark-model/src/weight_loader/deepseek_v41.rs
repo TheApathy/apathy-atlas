@@ -24,6 +24,14 @@
 //! over `crates/` and `kernels/` finds only documentation. Both need box time to verify,
 //! so the seam is here, documented, against a tested shard reader.
 
+pub mod cb3_arena;
+pub mod indexer;
+pub mod layer;
+mod load_layers;
+pub mod moe;
+pub mod routing;
+pub mod seams;
+
 use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
@@ -54,17 +62,19 @@ pub fn v41_key(prefix: &str, suffix: &str) -> String {
 /// DeepSeek-V4.1-Flash-Next weight loader.
 pub struct DeepSeekV41WeightLoader;
 
-/// One message, so every unimplemented entry point says the same true thing.
-fn cb3_residency_unimplemented(what: &str) -> anyhow::Error {
+/// One message, for the entry points that are STILL unimplemented.
+///
+/// Since `load_layers` landed this is only [`ModelWeightLoader::load_mtp_weights`]. The
+/// message no longer claims residency is missing — it is not; the arena uploads the pack.
+/// What MTP needs is its own three draft modules, which nothing has read yet.
+fn v41_unimplemented(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "DeepSeek-V4.1 {what} is not implemented: the engine can parse the config, resolve \
-         the 384 -> 154 -> 124 expert mapping, READ CB3 expert bytes, and DECODE them \
-         (kernels/gb10/deepseek-v4.1/cb3/cb3_decode.cuh, 256/256 vectors bit-exact against \
-         an independent reference), but it cannot yet make the pack resident. Missing: GPU \
-         residency for the 83 GB K154 expert pack, and the MoE GEMM that consumes the \
-         decoded e2m1 tiles. This is a deliberate hard stop, NOT a fallback to the \
-         deepseek_v4 loader, whose experts are EXL3 and would decode V4.1's CB3 bytes into \
-         plausible garbage."
+        "DeepSeek-V4.1 {what} is not implemented. What DOES work: the config parses, the \
+         384 -> 154 -> 124 expert mapping resolves, CB3 bytes are read and decoded \
+         (kernels/gb10/deepseek-v4.1/cb3/, bit-exact against an independent reference), the \
+         expert pack is made RESIDENT, and `load_layers` builds all 40 layers. This is a \
+         deliberate hard stop, NOT a fallback to the deepseek_v4 loader, whose experts are \
+         EXL3 and would decode V4.1's CB3 bytes into plausible garbage."
     )
 }
 
@@ -76,14 +86,24 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         false
     }
 
+    /// Build all 40 layers and make the CB3 expert pack RESIDENT.
+    ///
+    /// This is no longer a hard stop. The pack is parsed, residency-checked against the
+    /// real budget and uploaded once (71.7 GB at the served `packed_keep = 124`), the
+    /// dense per-layer tensors resolve, and the layers are constructed.
+    ///
+    /// The layers' FORWARD still refuses — attention, engram and routing/combine are open.
+    /// See [`layer::DeepSeekV41Layer`], which names all three and their owners. Loading and
+    /// running are deliberately separate milestones here: a forward that ran with any of
+    /// them stubbed would emit fluent, wrong tokens and no error.
     fn load_layers(
         &self,
-        _store: &WeightStore,
-        _config: &ModelConfig,
-        _gpu: &dyn GpuBackend,
-        _layer_kv_dtypes: &[KvCacheDtype],
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+        layer_kv_dtypes: &[KvCacheDtype],
     ) -> Result<Vec<Box<dyn TransformerLayer>>> {
-        bail!(cb3_residency_unimplemented("layer loading"))
+        load_layers::load_all_layers(store, config, gpu, layer_kv_dtypes)
     }
 
     // ---------------------------------------------------------------------------------
@@ -139,9 +159,7 @@ impl ModelWeightLoader for DeepSeekV41WeightLoader {
         // NOT `Ok(None)`. None means "this checkpoint has no MTP", which is FALSE here:
         // V4.1 declares num_nextn_predict_layers = 3 and ships 2401 `mtp.*` tensors.
         // Returning None would silently disable speculation and look like a config choice.
-        bail!(cb3_residency_unimplemented(
-            "MTP loading (3 modules, vs 0731's 1)"
-        ))
+        bail!(v41_unimplemented("MTP loading (3 modules, vs 0731's 1)"))
     }
 }
 
@@ -261,10 +279,15 @@ mod tests {
     /// and would silently disable speculation while looking deliberate.
     #[test]
     fn unimplemented_entry_points_name_the_seam() {
-        let message = cb3_residency_unimplemented("layer loading").to_string();
-        assert!(message.contains("CB3 3-bit decode kernels"));
-        assert!(message.contains("deliberate hard stop"));
-        // It must say what DOES work, so the reader knows where the boundary is.
-        assert!(message.contains("READ CB3 expert bytes"));
+        let message = v41_unimplemented("MTP loading").to_string();
+        assert!(message.contains("deliberate hard stop"), "{message}");
+        assert!(message.contains("plausible garbage"), "{message}");
+        // It must say what DOES work, so the reader knows where the boundary is — and
+        // it must NOT still claim residency is missing, which was true and no longer is.
+        assert!(message.contains("RESIDENT"), "{message}");
+        assert!(
+            !message.contains("cannot yet make the pack resident"),
+            "the message is stale: residency landed. {message}"
+        );
     }
 }
