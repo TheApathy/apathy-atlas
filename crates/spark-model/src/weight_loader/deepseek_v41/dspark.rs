@@ -276,6 +276,27 @@ impl Dspark {
         logits: DevicePtr,
         force_accept_all: bool,
     ) -> Result<StepOut> {
+        self.step_with_stop(ops, fwd, seq, tok, hook, core, main_moe, tap, logits, force_accept_all, &[])
+    }
+
+    /// [`Dspark::step`], but acceptance also ends BEFORE the first draft in `stop`: such a token
+    /// is never an accepted draft, only ever the bonus (the target's own argmax at that row),
+    /// so a serving caller can run its per-token bookkeeping on it from the bonus logits row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_stop(
+        &self,
+        ops: &Ops,
+        fwd: &V41Forward,
+        seq: &mut V41Seq,
+        tok: u32,
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        main_moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+        logits: DevicePtr,
+        force_accept_all: bool,
+        stop: &[u32],
+    ) -> Result<StepOut> {
         let pos = seq.len;
         let drafts = self.draft(ops, fwd, tok, pos, tap)?;
         let mut block_ids = Vec::with_capacity(T_VERIFY);
@@ -285,6 +306,9 @@ impl Dspark {
         let (mut a, am) = self.accept(ops, logits)?;
         if force_accept_all {
             a = B;
+        }
+        if let Some(i) = drafts[..a].iter().position(|d| stop.contains(d)) {
+            a = i;
         }
         fwd.rollback(ops, seq, pos + a + 1, hook)?;
         self.seed(ops, fwd, a + 1, pos)?;

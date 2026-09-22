@@ -439,6 +439,24 @@ pub trait Model: Send + Sync {
     /// Check if self-speculative decoding is enabled.
     fn has_self_speculative(&self) -> bool;
 
+    /// The model speculates internally (its own drafter + verify + rollback in one call):
+    /// the scheduler then calls [`Model::decode_multi`] instead of `decode` for eligible
+    /// greedy steps. Default: no.
+    fn has_internal_spec(&self) -> bool {
+        false
+    }
+
+    /// Feed `token` at `seq.seq_len`, then speculate internally. Returns the ACCEPTED drafts
+    /// (already fed: in `seq.tokens`/`seq_len`, each the model's own greedy argmax at its
+    /// position, lowest id on exact ties) and a logits pointer for the NEXT position, laid out
+    /// like `decode`'s, from which the caller picks the next token exactly as after `decode`.
+    /// No accepted draft is in `stop_ids` (acceptance ends before one), so the caller's
+    /// per-token bookkeeping for those ids always runs on a normally picked token. Only called
+    /// when [`Model::has_internal_spec`] is true.
+    fn decode_multi(&self, _token: u32, _seq: &mut SequenceState, _stop_ids: &[u32], _stream: u64) -> Result<(Vec<u32>, DevicePtr)> {
+        anyhow::bail!("decode_multi: this model has no internal speculation")
+    }
+
     /// Eager decode skipping SSM layers. Used by self-speculative drafting.
     /// Returns logits pointer for argmax. Advances seq_len by 1.
     fn decode_draft(&self, token: u32, seq: &mut SequenceState, stream: u64) -> Result<DevicePtr>;

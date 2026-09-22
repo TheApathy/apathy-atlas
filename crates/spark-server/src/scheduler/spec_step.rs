@@ -11,6 +11,80 @@ use super::*;
 /// each verify position runs through the full 8-stage pre-sample
 /// pipeline instead of falling through unmasked. See
 /// `verify_pipeline_helper` for the rationale.
+/// Whether a lone sequence's next step may run the model's internal speculation: exactly the
+/// conditions under which `process_decode_logits` takes its raw GPU-argmax fast path (greedy, no
+/// grammar, no logprobs, not inside/after thinking, bf16 logits), so every speculated token is
+/// the token plain decode would have picked. Any other request decodes plainly.
+pub fn internal_spec_eligible(a: &ActiveSeq, model: &dyn Model) -> bool {
+    a.temperature == 0.0
+        && a.grammar_state.is_none()
+        && a.top_logprobs.is_none()
+        && !a.inside_thinking
+        && !a.think_ended
+        && !a.suppress_tool_call
+        && !a.disable_mtp
+        && !model.decode_logits_fp32()
+}
+
+/// One step of a model's internal speculation (`Model::decode_multi`, e.g. DeepSeek-V4.1
+/// DSpark): the accepted drafts are emitted like MTP-accepted tokens, then the next token is
+/// picked from the returned logits row by the normal decode path, so the tokens the stateful
+/// bookkeeping keys on (think / tool-call / EOS / hard-stop ids, which never come back as
+/// accepted drafts) always go through `process_decode_logits`.
+#[allow(clippy::too_many_arguments)]
+pub fn step_internal_spec(
+    model: &dyn Model,
+    active: &mut Vec<ActiveSeq>,
+    think_end_token: Option<u32>,
+    think_start_token: Option<u32>,
+    code_fence_token: Option<u32>,
+    tool_call_start_token: Option<u32>,
+    tool_call_end_token: Option<u32>,
+    adaptive_sampling: bool,
+) {
+    let t0 = std::time::Instant::now();
+    let a = &mut active[0];
+    let stop: Vec<u32> = a
+        .eos_tokens
+        .iter()
+        .copied()
+        .chain([think_end_token, think_start_token, tool_call_start_token, tool_call_end_token, tool_response_hard_stop()].into_iter().flatten())
+        .collect();
+    if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
+        tracing::error!("EP broadcast internal-spec token: {e:#}");
+        a.finished = true;
+        return;
+    }
+    let (accepted, logits) = match model.decode_multi(a.last_token, &mut a.seq, &stop, 0) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("internal speculation step: {e:#}");
+            let mut a = active.remove(0);
+            send_error(model, &mut a, &format!("{e:#}"));
+            return;
+        }
+    };
+    for tok in accepted {
+        emit_token(a, tok, None);
+        if a.finished {
+            return;
+        }
+        a.last_token = tok;
+    }
+    process_decode_logits(
+        model,
+        active,
+        logits,
+        t0,
+        think_end_token,
+        think_start_token,
+        code_fence_token,
+        tool_call_start_token,
+        tool_call_end_token,
+        adaptive_sampling,
+    );
+}
+
 pub fn step_self_spec(
     model: &dyn Model,
     active: &mut [ActiveSeq],

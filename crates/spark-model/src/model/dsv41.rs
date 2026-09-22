@@ -26,7 +26,13 @@ use crate::weight_loader::deepseek_v41::forward::{PassHook, PrefillMode, V41Forw
 use crate::weight_loader::deepseek_v41::fwd::{Tap, V41Dims, V41RoutedMoe};
 use crate::weight_loader::deepseek_v41::attn_block::AttnCore;
 use crate::weight_loader::deepseek_v41::device_allocs::{DeviceAllocs, SharedGpu};
+use crate::weight_loader::deepseek_v41::dspark::{Dspark, T_VERIFY};
 use crate::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
+
+/// `swiglu_limit` and `routed_scaling_factor` of the checkpoint's text_config, shared by the
+/// main routed MoE and the DSpark drafter's MoE.
+const MOE_SWIGLU_LIMIT: f32 = 10.0;
+const MOE_ROUTE_SCALE: f32 = 1.5;
 
 /// ATLAS_LOG_PINNED_ALGO=1: print the stream and every ATLAS_*/DSV41_* variable, so a serve
 /// process and a driver process can be diffed for the environment they actually ran with.
@@ -80,7 +86,7 @@ fn build_lanes(
     let routers = (0..config.num_hidden_layers)
         .map(|l| Ok((l, RouterF32::load(store, l, config.hidden_size, gpu, kernels, stream)?)))
         .collect::<Result<Vec<_>>>()?;
-    let moe = Cb3RoutedMoe::new(shared.clone(), *kernels, config, arena, routers, 10.0, 1.5, max_chunk.max(128))?;
+    let moe = Cb3RoutedMoe::new(shared.clone(), *kernels, config, arena, routers, MOE_SWIGLU_LIMIT, MOE_ROUTE_SCALE, max_chunk.max(128))?;
     Ok(V41Lanes { hook: Box::new(core.clone()), core: Box::new(core), moe: Box::new(moe) })
 }
 
@@ -101,6 +107,9 @@ pub struct Dsv41Model {
     seqs: Mutex<HashMap<usize, V41Seq>>,
     next_slot: Mutex<usize>,
     tap: Tap,
+    /// The DSpark greedy speculator (drafter loaded): `decode_multi` runs its steps. Behind a
+    /// Mutex because its drafter MoE keeps interior scratch state.
+    dspark: Option<Mutex<Dspark>>,
 }
 
 // SAFETY-adjacent: every field is either immutable after construction, behind a Mutex, or a
@@ -154,7 +163,15 @@ impl Dsv41Model {
             Ok(d) => Tap::to_dir(d.into(), Vec::new())?,
             Err(_) => Tap::off(),
         };
-        tracing::info!("DeepSeek-V4.1 served model ready: max_seq {max_seq}, chunk {max_chunk}, prefill {mode:?}");
+        let dspark = if fwd.dspark.is_some() {
+            Some(Mutex::new(Dspark::new(&shared, &fwd, MOE_SWIGLU_LIMIT, MOE_ROUTE_SCALE)?))
+        } else {
+            None
+        };
+        tracing::info!(
+            "DeepSeek-V4.1 served model ready: max_seq {max_seq}, chunk {max_chunk}, prefill {mode:?}, DSpark speculation {}",
+            if dspark.is_some() { "ON (greedy steps)" } else { "off" }
+        );
         Ok(Self {
             gpu: shared.clone(),
             kernels: kernels_owned,
@@ -168,6 +185,7 @@ impl Dsv41Model {
             seqs: Mutex::new(HashMap::new()),
             next_slot: Mutex::new(0),
             tap,
+            dspark,
         })
     }
 
@@ -205,6 +223,11 @@ impl Dsv41Model {
             }
             if last {
                 self.fwd.finish_prefill(&ops, s, m, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
+                // The drafter ring from the replay rows (the last tail_rows prompt positions).
+                if let Some(ds) = &self.dspark {
+                    let rows = s.tail_rows;
+                    ds.lock().expect("dspark poisoned").seed(&ops, &self.fwd, rows, s.len - rows)?;
+                }
             }
             Ok(())
         })?;
@@ -301,12 +324,43 @@ impl Model for Dsv41Model {
         let ops = self.ops();
         let l = &self.lanes;
         self.with_seq(seq.slot_idx, |s| {
-            self.fwd.decode(&ops, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)
+            self.fwd.decode(&ops, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits)?;
+            // A plain step (non-greedy request, or near max_seq) still feeds the drafter ring,
+            // so a later speculative step drafts from current context.
+            if let Some(ds) = &self.dspark {
+                ds.lock().expect("dspark poisoned").seed(&ops, &self.fwd, 1, s.len - 1)?;
+            }
+            Ok(())
         })?;
         self.gpu.synchronize(self.gpu.default_stream())?;
         seq.tokens.push(token);
         seq.seq_len += 1;
         Ok(self.logits)
+    }
+
+    fn has_internal_spec(&self) -> bool {
+        self.dspark.is_some()
+    }
+
+    fn decode_multi(&self, token: u32, seq: &mut SequenceState, stop_ids: &[u32], stream: u64) -> Result<(Vec<u32>, DevicePtr)> {
+        let ds = self.dspark.as_ref().context("dsv41 decode_multi: DSpark is not loaded")?;
+        let near_end = self.with_seq(seq.slot_idx, |s| Ok(s.len + T_VERIFY > self.fwd.max_seq))?;
+        if near_end {
+            // The verify pass writes T_VERIFY positions: finish the last few plainly.
+            return Ok((Vec::new(), self.decode(token, seq, stream)?));
+        }
+        let ops = self.ops();
+        let l = &self.lanes;
+        let out = self.with_seq(seq.slot_idx, |s| {
+            let ds = ds.lock().expect("dspark poisoned");
+            ds.step_with_stop(&ops, &self.fwd, s, token, l.hook.as_ref(), l.core.as_ref(), l.moe.as_ref(), &self.tap, self.logits, false, stop_ids)
+        })?;
+        let accepted = out.emitted[..out.accepted].to_vec();
+        seq.tokens.push(token);
+        seq.tokens.extend_from_slice(&accepted);
+        seq.seq_len += out.accepted + 1;
+        // Verify row `accepted` holds the logits of the next position (its argmax is the bonus).
+        Ok((accepted, self.logits.offset(out.accepted * self.vocab * 2)))
     }
 
     fn decode_batch(&self, tokens: &[u32], seqs: &mut [&mut SequenceState], stream: u64) -> Result<DevicePtr> {
