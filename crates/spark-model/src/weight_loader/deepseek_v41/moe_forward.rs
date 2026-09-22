@@ -26,7 +26,7 @@
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, Mutex};
 
-use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed};
+use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed_pinned};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::{WeightDtype, WeightStore};
@@ -45,10 +45,16 @@ use super::routing::{Routing, image_rows, score_of, select_experts_multimodal};
 
 /// `num_experts_per_tok`.
 pub const TOP_K: usize = 6;
-/// GEMV cut-over, rows per expert. Clean sweep (runC_2048 L02, 3 interleaved rounds): cut 2
-/// is best or tied at every T — T=1 0.74 ms (MMA-only 1.05), T=16 5.12 (5.60), T=128 13.54
-/// (14.07), T=512 18.53 (18.64), T=2048 unchanged; cut 8 costs T=512 +21%.
-pub const DEFAULT_GEMV_MAX_ROWS: usize = 2;
+/// GEMV cut-over, rows per expert, applied ONLY to passes of <= [`GEMV_MAX_PASS_T`] tokens
+/// (so at the default every expert of such a pass takes the GEMV). The per-expert cut used to
+/// apply to every pass — a clean sweep had cut 2 best at T=16..512 by up to 0.5 ms — but it
+/// made output depend on chunking; that gain was given up for chunk invariance.
+pub const DEFAULT_GEMV_MAX_ROWS: usize = 8;
+/// Passes of at most this many tokens may use the GEMV kernels (every expert then has at most
+/// this many rows). Larger passes are MMA-only so the arithmetic never depends on chunking.
+pub const GEMV_MAX_PASS_T: usize = 8;
+/// M at which the pinned router GEMM's algorithm is chosen.
+pub const ROUTER_REF_M: u32 = 512;
 /// Router id space.
 pub const ROUTER_EXPERTS: usize = 384;
 const BLOCK: u32 = 256;
@@ -221,6 +227,8 @@ pub struct Cb3RoutedMoe {
     k_gemv_down: KernelHandle,
     /// Experts with at most this many rows take the GEMV kernels.
     gemv_max_rows: Mutex<usize>,
+    /// Largest pass (tokens) allowed to use the GEMV kernels. See [`GEMV_MAX_PASS_T`].
+    gemv_pass_t: Mutex<usize>,
     tiles: DevicePtr,
     max_tiles: usize,
 }
@@ -324,6 +332,7 @@ impl Cb3RoutedMoe {
             k_gemv_gate_up: gpu.kernel(FUSED_GEMM_MODULE, GEMV_GATE_UP_FN)?,
             k_gemv_down: gpu.kernel(FUSED_GEMM_MODULE, GEMV_DOWN_FN)?,
             gemv_max_rows: Mutex::new(DEFAULT_GEMV_MAX_ROWS),
+            gemv_pass_t: Mutex::new(GEMV_MAX_PASS_T),
             tiles,
             max_tiles,
         })
@@ -348,6 +357,12 @@ impl Cb3RoutedMoe {
     /// both paths are gated against the oracle.
     pub fn set_gemv_max_rows(&self, rows: usize) {
         *self.gemv_max_rows.lock().expect("gemv lock") = rows;
+    }
+
+    /// CONTROLS / A/B only: let passes up to `t` tokens use the GEMV. Raising it above
+    /// [`GEMV_MAX_PASS_T`] restores the per-expert choice that broke chunk invariance.
+    pub fn set_gemv_pass_t(&self, t: usize) {
+        *self.gemv_pass_t.lock().expect("gemv lock") = t;
     }
 
     /// TIMING ONLY; see [`ExpertWork`].
@@ -387,7 +402,10 @@ impl Cb3RoutedMoe {
             .arg_ptr(self.scratch.y_f32)
             .arg_u64(n as u64)
             .launch(stream)?;
-        gemm_act_weight_t_typed(
+        // PINNED, no split-K: one cuBLASLt algorithm per shape chosen at ROUTER_REF_M, issued
+        // at the true M, so a token's scores do not depend on how many rows share the call
+        // (chunk invariance; the heuristic's choice changes with M and split-K reorders K).
+        gemm_act_weight_t_typed_pinned(
             self.scratch.y_f32.0,
             self.hidden as u32,
             router.gate_w.0,
@@ -398,6 +416,8 @@ impl Cb3RoutedMoe {
             self.hidden as u32,
             GemmDtype::F32,
             GemmDtype::F32,
+            true,
+            ROUTER_REF_M,
             stream,
         )
     }
@@ -602,7 +622,14 @@ impl Cb3RoutedMoe {
         stream: u64,
     ) -> Result<()> {
         let s = &self.scratch;
-        let gemv_max = *self.gemv_max_rows.lock().expect("gemv lock");
+        // CHUNK INVARIANCE: the GEMV and MMA kernels sum in different orders, so choosing
+        // between them per EXPERT by its row count made a token's output depend on how many
+        // other tokens shared its chunk (dsv41-integrate measured L00.moe_routed differing
+        // between 512- and 1024-row chunks). The choice is now per PASS: GEMV only when the
+        // whole pass is at most GEMV_MAX_PASS_T tokens (decode), MMA for every expert otherwise.
+        let t = group_rows.last().map_or(0, |(_, end)| *end) / TOP_K;
+        let pass_t = *self.gemv_pass_t.lock().expect("gemv lock");
+        let gemv_max = if t <= pass_t { *self.gemv_max_rows.lock().expect("gemv lock") } else { 0 };
         // Experts with few rows take the GEMV kernels (4-row tiles), the rest the MMA
         // kernels (128-row tiles). One upload: MMA tiles first, then GEMV tiles.
         let (mut mma, mut gemv): (Vec<i32>, Vec<i32>) = (Vec::new(), Vec::new());

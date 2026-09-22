@@ -43,7 +43,7 @@ use spark_model::weight_loader::deepseek_v41::moe_forward::{
 use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops};
 use spark_model::weight_loader::deepseek_v41::routing::Routing;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
-use spark_runtime::gpu::GpuBackend;
+use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 const MODEL_DIR: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
 const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
@@ -103,6 +103,8 @@ fn main() -> Result<()> {
     let mut dump: Option<PathBuf> = None;
     let mut kernel = ExpertKernel::Reconstruct;
     let mut gemv_max: Option<usize> = None;
+    let mut gemv_pass_t: Option<usize> = None;
+    let mut invariance: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -110,6 +112,8 @@ fn main() -> Result<()> {
             "--layer" => layer = args.next().context("--layer needs a value")?.parse()?,
             "--occurrence" => occurrence = args.next().context("--occurrence needs a value")?.parse()?,
             "--dump" => dump = Some(args.next().context("--dump needs a path")?.into()),
+            "--gemv-pass-t" => gemv_pass_t = Some(args.next().context("--gemv-pass-t")?.parse()?),
+            "--invariance" => invariance = Some(args.next().context("--invariance needs SPLIT[;SPLIT]")?),
             "--gemv-max-rows" => gemv_max = Some(args.next().context("--gemv-max-rows")?.parse()?),
             "--kernel" => {
                 kernel = match args.next().context("--kernel needs fused|reconstruct")?.as_str() {
@@ -189,6 +193,9 @@ fn main() -> Result<()> {
     moe.set_pass_tokens(pass_ids);
     moe.set_control(control);
     moe.set_expert_kernel(kernel);
+    if let Some(t) = gemv_pass_t {
+        moe.set_gemv_pass_t(t);
+    }
     if let Some(rows) = gemv_max {
         moe.set_gemv_max_rows(rows);
     }
@@ -272,6 +279,40 @@ fn main() -> Result<()> {
         std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
         println!("  candidate dumped to {} (float32, [{tokens}, {hidden}])", path.display());
     }
+    // CHUNK INVARIANCE: the same rows split into different chunks must give the SAME BYTES.
+    // Each split is a list of chunk sizes summing to T, e.g. "512,512,512,512;1000,1048".
+    if let Some(spec) = &invariance {
+        ensure!(ours, "--invariance runs the production forward: use --routing ours");
+        let d_split = gpu.alloc(tokens * hidden * 2)?;
+        let ops = Ops { gpu, k: &kernels, stream };
+        let mut all_identical = true;
+        for split in spec.split(';') {
+            let sizes: Vec<usize> = split.split(',').map(str::parse).collect::<Result<_, _>>()?;
+            ensure!(sizes.iter().sum::<usize>() == tokens, "split {split} does not sum to {tokens}");
+            let mut start = 0usize;
+            for &n in &sizes {
+                moe.set_pass_tokens(&pass_ids[start..start + n]);
+                let off = (start * hidden * 2) as u64;
+                moe.forward(&ops, layer, DevicePtr(d_in.0 + off), DevicePtr(d_split.0 + off), n)?;
+                start += n;
+            }
+            gpu.synchronize(stream)?;
+            let mut bytes = vec![0u8; tokens * hidden * 2];
+            gpu.copy_d2h(d_split, &mut bytes)?;
+            let differ = bytes.chunks_exact(2).zip(out_bytes.chunks_exact(2)).filter(|(a, b)| a != b).count();
+            let rows = (0..tokens)
+                .filter(|r| bytes[r * hidden * 2..(r + 1) * hidden * 2] != out_bytes[r * hidden * 2..(r + 1) * hidden * 2])
+                .count();
+            println!("  invariance [{split}] vs one pass of {tokens}: {differ} values differ on {rows} rows");
+            all_identical &= differ == 0;
+        }
+        moe.set_pass_tokens(pass_ids);
+        println!("  CHUNK INVARIANCE: {}", if all_identical { "BYTE-IDENTICAL" } else { "DIFFERS" });
+        if control == MoeControl::None && gemv_pass_t.is_none() {
+            ensure!(all_identical, "the routed MoE is not chunk-invariant");
+        }
+    }
+
     // OWNERSHIP CHECK on the real driver: the MoE and the arena free on drop. The arena is
     // 1.79 GB and the MoE scratch is sized by T, so "most of it came back" is a real check;
     // the control is the loaded state (free memory must have DROPPED by >= the arena first).
