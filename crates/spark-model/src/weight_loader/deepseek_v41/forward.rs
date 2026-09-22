@@ -150,6 +150,9 @@ impl V41Forward {
             .max()
             .unwrap_or(0);
         let (c, w) = rope_specs();
+        // FP8 dense GEMMs at M > 16 are issued at ONE M for every chunk (see ops::fp8_fixed_m);
+        // every activation buffer below holds tiled_rows(max(max_chunk, 128)) rows.
+        super::ops::set_fp8_fixed_m(super::ops::tiled_rows(max_chunk.max(WINDOW)));
         let engram = blocks
             .iter()
             .filter(|b| b.engram.is_some())

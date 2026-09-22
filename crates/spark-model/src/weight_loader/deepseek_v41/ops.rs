@@ -49,6 +49,25 @@ pub mod profile {
     }
 }
 
+/// The M every FP8 dense GEMM with M > MM_TILE is ISSUED at (rows past the real M are slack).
+/// 0 = issue at the real M. Set once by the forward from its max chunk: a GEMM whose M changes
+/// with chunking lets cuBLASLt pick a different algorithm per M, and the untiled FP8 path was
+/// measured NOT chunk-invariant ([500,544] vs [512,512,20]: 72,443 of 21.4M h values differ at L00).
+/// Issuing at one fixed M keeps one algorithm for every chunk.
+static FP8_FIXED_M: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_fp8_fixed_m(m: usize) {
+    FP8_FIXED_M.store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn fp8_fixed_m() -> usize {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("ATLAS_DSV41_FP8_FIXED_M").as_deref() == Ok("0")) {
+        return 0;
+    }
+    FP8_FIXED_M.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `ATLAS_DSV41_FP8_ROWTILE=1`: run FP8 dense GEMMs as 16-row tiles at every M (the
 /// chunk-invariance control arm for the untiled M > 16 path).
 pub fn fp8_force_rowtile() -> bool {
@@ -286,7 +305,9 @@ impl Ops<'_> {
         prof(self, "dense/dequant", || self.dequant(w, scratch))?;
         prof(self, "dense/gemm", || {
             if m > MM_TILE && !fp8_force_rowtile() {
-                self.linear_bf16_strided(x, w.k, scratch, out, w.n, m, w.n, w.k)
+                let fm = fp8_fixed_m();
+                let mm = if fm >= m { fm } else { m };
+                self.linear_bf16_strided(x, w.k, scratch, out, w.n, mm, w.n, w.k)
             } else {
                 self.linear_bf16_tiled(x, w.k, scratch, out, w.n, m, w.n, w.k)
             }
