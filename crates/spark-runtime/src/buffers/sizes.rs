@@ -49,7 +49,27 @@ pub struct BufferSizes {
     pub expert_gate_out: usize,
     pub expert_up_out: usize,
     pub expert_down_out: usize,
+    /// Compact NVFP4 MoE tile work-list: two u32 words per item.
+    pub moe_worklist: usize,
+    /// Device-written compact work-list length (one i32).
+    pub moe_worklist_total: usize,
     pub splitk_workspace: usize,
+}
+
+const NVFP4_WORKLIST_N_TILE: usize = 128;
+const NVFP4_WORKLIST_GATE_UP_M_TILE: usize = 64;
+const NVFP4_WORKLIST_DOWN_M_TILE: usize = 64;
+
+fn nvfp4_worklist_capacity_items(
+    total_expanded: usize,
+    num_experts: usize,
+    n_tiles: usize,
+    m_tile: usize,
+) -> usize {
+    // One expert may receive every row; spreading rows across experts adds at
+    // most one partial M tile per expert. The extra item mirrors the proven
+    // FP8 work-list bound and keeps the allocation conservative at boundaries.
+    (total_expanded.div_ceil(m_tile) + num_experts + 1) * n_tiles
 }
 
 impl BufferSizes {
@@ -70,6 +90,10 @@ impl BufferSizes {
         let bf16 = 2;
         let m = max_batch_tokens;
         let h = config.hidden_size;
+        // Qwen4-Exp carries hc_count parallel residual streams between
+        // blocks. Core attention/GDN/MoE tensors remain hidden_size wide;
+        // only the persistent hidden/residual pair uses the expanded width.
+        let residual_width = config.residual_width();
 
         // Q projection output: gated models produce [Q, gate] (2× nq*hd),
         // ungated models (VL) produce only [Q] (nq*hd).
@@ -113,7 +137,12 @@ impl BufferSizes {
         let bt_offset = (slot_end + 3) & !3;
         let bt_end = bt_offset + max_blocks * 4;
         let sl_offset = (bt_end + 3) & !3;
-        let prefill_meta = sl_offset + 4;
+        // Qwen4's correctness-first serialized prefill consumes the decode
+        // attention path one row at a time, so it needs one cumulative
+        // sequence length per prompt row. Other prefill implementations only
+        // need the final scalar length.
+        let seq_lens_bytes = if config.is_qwen4_exp() { m * 4 } else { 4 };
+        let prefill_meta = sl_offset + seq_lens_bytes;
         // Block table metadata: max(batch_size=8, K=4 verify, K=γ DFlash verify)
         // rows × max_blocks × 4 bytes. DFlash γ-block verify uses up to γ+1=17
         // rows (γ=16 for Qwen3.6-DFlash), so size for the worst case.
@@ -141,6 +170,34 @@ impl BufferSizes {
             k_max * h * bf16
         };
 
+        // Persistent compact work-list used by the default-off ordinary-NVFP4
+        // prefill route. Gate+up and down use the parent's compilable M64 K64
+        // kernels over fused 2*intermediate N and hidden-size N respectively.
+        // A single arena allocation is reused sequentially for both builders
+        // on the compute stream.
+        let moe_worklist = if config.num_experts > 0 {
+            let total_expanded = m * top_k;
+            let gate_up_n_tiles =
+                (2 * config.moe_intermediate_size).div_ceil(NVFP4_WORKLIST_N_TILE);
+            let down_n_tiles = h.div_ceil(NVFP4_WORKLIST_N_TILE);
+            let gate_up_items = nvfp4_worklist_capacity_items(
+                total_expanded,
+                config.num_experts,
+                gate_up_n_tiles,
+                NVFP4_WORKLIST_GATE_UP_M_TILE,
+            );
+            let down_items = nvfp4_worklist_capacity_items(
+                total_expanded,
+                config.num_experts,
+                down_n_tiles,
+                NVFP4_WORKLIST_DOWN_M_TILE,
+            );
+            gate_up_items.max(down_items) * 2 * std::mem::size_of::<u32>()
+        } else {
+            256
+        };
+        let moe_worklist_total = std::mem::size_of::<i32>();
+
         // Logits: only last token used during prefill. Cap at 32 tokens
         // (sufficient for decode=1, batched_decode=8, spec_verify≤5,
         // DFlash K=γ verify with γ=16 → K=17 tokens — bumped from 16
@@ -150,6 +207,12 @@ impl BufferSizes {
         // Mamba-2 d_inner may exceed hidden_size; norm_output and attn_output must fit.
         let mamba2_d_inner = config.mamba2_d_inner();
         let max_dim = h.max(mamba2_d_inner);
+        // Gated-delta layers can be wider than full attention. Qwen4-Exp, for
+        // example, has 48 value heads x 128 = 6144 elements while its full
+        // attention output is only 16 x 256 = 4096. `attn_output` is the BF16
+        // GDN output scratch in both decode and prefill, so size it for the
+        // widest producer rather than assuming attention is the maximum.
+        let linear_value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
 
         // Split-K decode workspace: stores partials [o[head_dim], m, l] per
         // (seq, q_head, split). Indexed as
@@ -209,12 +272,13 @@ impl BufferSizes {
             qwen38_flashinfer_merged_output_bytes(config, m, flashinfer_ffn_requested);
 
         Self {
-            hidden_states: m * h * residual_elem,
-            residual: m * h * residual_elem,
+            hidden_states: m * residual_width * residual_elem,
+            residual: m * residual_width * residual_elem,
             norm_output: m * max_dim * bf16,
             qkv_output: m * qkv_dim * bf16,
             attn_output: (m * config.num_attention_heads * config.head_dim * bf16)
                 .max(m * mamba2_d_inner * bf16)
+                .max(m * linear_value_dim * bf16)
                 // MLA absorbed: attention output is [M, nq, mla_cache_dim=kv_lora+rope]
                 .max(if config.kv_lora_rank > 0 {
                     m * config.num_attention_heads
@@ -292,6 +356,8 @@ impl BufferSizes {
             expert_gate_out,
             expert_up_out,
             expert_down_out,
+            moe_worklist,
+            moe_worklist_total,
             splitk_workspace,
         }
     }
@@ -316,6 +382,25 @@ impl BufferSizes {
             + self.expert_gate_out
             + self.expert_up_out
             + self.expert_down_out
+            + self.moe_worklist
+            + self.moe_worklist_total
             + self.splitk_workspace
+    }
+}
+
+#[cfg(test)]
+mod worklist_tests {
+    use super::nvfp4_worklist_capacity_items;
+
+    #[test]
+    fn flash_next_16k_capacity_matches_gate_up_and_down_geometry() {
+        let total_expanded = 16_000 * 10;
+        let experts = 512;
+        let gate_up_items = nvfp4_worklist_capacity_items(total_expanded, experts, 10, 64);
+        let down_items = nvfp4_worklist_capacity_items(total_expanded, experts, 20, 64);
+
+        assert_eq!(gate_up_items * 8, 241_040);
+        assert_eq!(down_items * 8, 482_080);
+        assert!(down_items > gate_up_items);
     }
 }

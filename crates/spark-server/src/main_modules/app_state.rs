@@ -18,7 +18,7 @@ pub struct AppState {
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     pub max_seq_len: usize,
-    /// Effective scheduler concurrency; image features are currently C1-only.
+    /// Effective scheduler concurrency, used for image ownership admission.
     pub max_batch_size: usize,
     /// True when static YaRN scaling is active. Until persistent multimodal
     /// position deltas are implemented, request admission uses this to keep

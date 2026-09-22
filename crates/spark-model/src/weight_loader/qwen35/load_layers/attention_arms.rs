@@ -9,14 +9,15 @@ use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, Qwen3AttentionLayer};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_dense_bf16, shard_quantized_nvfp4};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, dense, dense_auto, load_kv_scales,
-    quantize_to_nvfp4, quantized_auto,
+    AttentionWeights, DenseWeight, Nvfp4Variant, dense, dense_auto,
+    dense_modelopt_mixed_or_fp8_or_bf16, load_kv_scales, quantize_to_nvfp4,
+    quantized_modelopt_mixed,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -38,6 +39,20 @@ pub(super) fn build_full_attention_nvfp4(
     ffn: FfnComponent,
 ) -> Result<Box<dyn TransformerLayer>> {
     let p = format!("{lp}.self_attn");
+    // Quantization recipes can exclude attention while quantizing the routed
+    // experts. Flash-Next NVFP4 is such a mixed checkpoint, so select the
+    // attention arm from the projection itself rather than the model-wide
+    // variant inferred from expert tensors.
+    let variant = store
+        .get(&format!("{p}.q_proj.weight"))
+        .map(|weight| {
+            if weight.dtype == WeightDtype::BF16 {
+                Nvfp4Variant::Bf16Raw
+            } else {
+                variant
+            }
+        })
+        .unwrap_or(variant);
     let tp_rank = config.tp_rank;
     let tp_size = config.tp_world_size.max(1);
     let i = layer_idx;
@@ -59,7 +74,18 @@ pub(super) fn build_full_attention_nvfp4(
                               full_k: usize,
                               kind: TpShardKind|
              -> Result<crate::weight_map::QuantizedWeight> {
-                let src = quantized_auto(store, &format!("{p}.{name}"), gpu, variant)?;
+                let src = quantized_modelopt_mixed(
+                    store,
+                    &format!("{p}.{name}"),
+                    full_n,
+                    full_k,
+                    config,
+                    variant,
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
+                )?;
                 if tp_size == 1 {
                     return Ok(src);
                 }
@@ -182,6 +208,29 @@ pub(super) fn build_full_attention_nvfp4(
         config.fp8_kv_calibration_tokens,
         config,
     )?;
+
+    if config.is_qwen4_exp() && config.qwen4_qsa {
+        anyhow::ensure!(
+            config.indexer_n_heads == 4
+                && config.indexer_kv_heads == 1
+                && config.indexer_head_dim == 128
+                && config.indexer_budget == 2048
+                && config.indexer_compress_ratio == 4,
+            "unsupported Qwen4 QSA geometry"
+        );
+        layer.set_qwen4_qsa(crate::layers::Qwen4QsaIndexer::new(
+            dense_modelopt_mixed_or_fp8_or_bf16(
+                store,
+                &format!("{p}.indexer.index_qk_proj"),
+                config,
+                gpu,
+            )?,
+            dense(store, &format!("{p}.indexer.q_layernorm.weight"))?,
+            dense(store, &format!("{p}.indexer.k_layernorm.weight"))?,
+            gpu,
+            config,
+        )?);
+    }
 
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;

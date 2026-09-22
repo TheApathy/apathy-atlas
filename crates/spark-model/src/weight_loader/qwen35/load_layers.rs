@@ -6,18 +6,18 @@ mod linear_attn_arms;
 mod tq_plus_weight_rotation;
 
 use anyhow::Result;
-use atlas_core::config::{LayerType, ModelConfig};
+use atlas_core::config::{LayerType, ModelConfig, ModelOptWeightFormat};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::kv_cache::KvCacheDtype;
 use spark_runtime::weights::WeightStore;
 
 use super::super::{ModelWeightLoader, QuantFormat, WeightFormat};
 use crate::layer::TransformerLayer;
-use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer};
+use crate::layers::{FfnComponent, MoeLayer, Qwen3AttentionLayer, Qwen4HyperConnection};
 use crate::tp_shard::{TpShardKind, load_qkvo_tp, shard_fp8_block_scaled};
 use crate::weight_map::{
-    AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense, detect_nvfp4_variant,
-    load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_moe_qwen35,
+    AttentionWeights, DenseWeight, Nvfp4Variant, QuantizedWeight, dense, dense_auto,
+    detect_nvfp4_variant, load_fp8_block_scaled_as_fp8weight, load_kv_scales, load_moe_qwen35,
     load_moe_qwen35_fp8_experts, quantize_to_nvfp4,
 };
 
@@ -28,6 +28,8 @@ pub(super) fn load_layers(
     gpu: &dyn GpuBackend,
     layer_kv_dtypes: &[KvCacheDtype],
 ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+    ensure_supported_weight_formats(config)?;
+
     let layer_types = if config.layer_types.is_empty() {
         (0..config.num_hidden_layers)
             .map(|i| config.layer_type(i))
@@ -124,8 +126,19 @@ pub(super) fn load_layers(
 
     for (i, lt) in layer_types.iter().enumerate() {
         let lp = config.layer_prefix(i);
-        let input_norm = dense(store, &format!("{lp}.input_layernorm.weight"))?;
-        let post_attn_norm = dense(store, &format!("{lp}.post_attention_layernorm.weight"))?;
+        let (input_norm, post_attn_norm) = if config.is_qwen4_exp() {
+            // These fields are unused once the hyperconnection path is
+            // installed, but the shared Qwen3 core constructors require a
+            // DenseWeight. Alias a real offset-RMS tensor rather than inventing
+            // an allocation.
+            let norm = dense(store, &format!("{lp}.attn_hyper_connection.hc_norm.weight"))?;
+            (norm, norm)
+        } else {
+            (
+                dense(store, &format!("{lp}.input_layernorm.weight"))?,
+                dense(store, &format!("{lp}.post_attention_layernorm.weight"))?,
+            )
+        };
 
         // When native_fp8, skip NVFP4 routed experts — FP8 fused batch1/2/3
         // kernels handle all MoE dispatch including MTP verify.
@@ -159,15 +172,28 @@ pub(super) fn load_layers(
             stream,
             skip_nvfp4_experts,
         )?;
-        let gate_nvfp4 = quantize_to_nvfp4(
-            &moe_weights.gate,
-            config.num_experts,
-            h,
-            gpu,
-            absmax_k,
-            quantize_k,
-            stream,
-        )?;
+        let gate_nvfp4 = if config.is_qwen4_exp() {
+            crate::weight_map::quantize_to_nvfp4_cached(
+                &moe_weights.gate,
+                config.num_experts,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+                &format!("{lp}.moe_gate.nvfp4"),
+            )?
+        } else {
+            quantize_to_nvfp4(
+                &moe_weights.gate,
+                config.num_experts,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?
+        };
         let mut moe_layer = MoeLayer::new(
             moe_weights,
             config.num_experts,
@@ -377,6 +403,33 @@ pub(super) fn load_layers(
             LayerType::Moe => unreachable!("Qwen3.5 has no standalone MoE layers"),
         }
 
+        if config.is_qwen4_exp() {
+            let attn_hyper = load_qwen4_hyper(
+                store,
+                &format!("{lp}.attn_hyper_connection"),
+                true,
+                config,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?;
+            let mlp_hyper = load_qwen4_hyper(
+                store,
+                &format!("{lp}.mlp_hyper_connection"),
+                true,
+                config,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?;
+            layers
+                .last_mut()
+                .expect("layer was just pushed")
+                .set_qwen4_hyperconnections(attn_hyper, mlp_hyper)?;
+        }
+
         if (i + 1) % 10 == 0 || i < 5 {
             let free_gb = gpu.free_memory()? as f64 / (1024.0 * 1024.0 * 1024.0);
             tracing::info!("Loaded layers 0..{} — {free_gb:.1} GB free", i + 1);
@@ -391,7 +444,268 @@ pub(super) fn load_layers(
         layers.len() - attn_idx,
     );
 
-    crate::weight_loader::transform_cache::finish();
+    // Qwen4 still has model-level hyperconnection and PLE projections after
+    // the layer vector is built. Keep the writer open so those transforms
+    // participate in the same provenance-locked artifact.
+    if !config.is_qwen4_exp() {
+        crate::weight_loader::transform_cache::finish();
+    }
 
     Ok(layers)
+}
+
+fn ensure_supported_weight_formats(config: &ModelConfig) -> Result<()> {
+    let Some(quant) = config.quantization_config.as_ref() else {
+        return Ok(());
+    };
+    let is_mixed = quant.quant_algo.eq_ignore_ascii_case("MIXED_PRECISION")
+        || quant
+            .config_groups
+            .iter()
+            .any(|group| group.weight_format == ModelOptWeightFormat::Mxfp8);
+    if !is_mixed {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !quant.config_groups.is_empty(),
+        "Qwen Flash-Next ModelOpt MIXED_PRECISION requires explicit per-target config_groups"
+    );
+    for group in &quant.config_groups {
+        for target in &group.targets {
+            anyhow::ensure!(
+                mixed_target_has_consumer(target, group.weight_format),
+                "Qwen Flash-Next mixed target {target:?} ({:?}) has no fail-closed Atlas consumer",
+                group.weight_format
+            );
+        }
+    }
+    Ok(())
+}
+
+fn mixed_target_has_consumer(target: &str, format: ModelOptWeightFormat) -> bool {
+    match format {
+        ModelOptWeightFormat::Mxfp8 => {
+            numbered_target_has_suffix(
+                target,
+                "model.language_model.layers.",
+                &[
+                    "linear_attn.in_proj_a",
+                    "linear_attn.in_proj_b",
+                    "linear_attn.in_proj_qkv",
+                    "linear_attn.in_proj_z",
+                    "linear_attn.out_proj",
+                    "self_attn.indexer.index_qk_proj",
+                    "self_attn.k_proj",
+                    "self_attn.o_proj",
+                    "self_attn.q_proj",
+                    "self_attn.v_proj",
+                    "mlp.shared_expert.down_proj",
+                    "mlp.shared_expert.gate_proj",
+                    "mlp.shared_expert.up_proj",
+                ],
+            ) || numbered_target_has_suffix(
+                target,
+                "model.visual.blocks.",
+                &["attn.proj", "attn.qkv", "mlp.linear_fc1"],
+            ) || matches!(
+                target,
+                "model.visual.merger.linear_fc1" | "model.visual.merger.linear_fc2"
+            )
+        }
+        ModelOptWeightFormat::Nvfp4 => {
+            numbered_target_has_suffix(target, "model.language_model.layers.", &["mlp.experts"])
+                || numbered_target_has_suffix(target, "mtp.layers.", &["mlp.experts"])
+                || numbered_target_has_suffix(target, "model.visual.blocks.", &["mlp.linear_fc2"])
+        }
+    }
+}
+
+fn numbered_target_has_suffix(target: &str, prefix: &str, suffixes: &[&str]) -> bool {
+    let Some(rest) = target.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((index, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && suffixes.contains(&suffix)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_qwen4_hyper(
+    store: &WeightStore,
+    prefix: &str,
+    with_injection: bool,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    absmax_k: spark_runtime::gpu::KernelHandle,
+    quantize_k: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+) -> Result<Qwen4HyperConnection> {
+    let r = config.residual_width();
+    let rank = config.hc_lowrank;
+    let norm = dense(store, &format!("{prefix}.hc_norm.weight"))?;
+    let down_dense = dense_auto(
+        store,
+        &format!("{prefix}.input_mix_weight_down.weight"),
+        gpu,
+    )?;
+    let up_dense = dense_auto(store, &format!("{prefix}.input_mix_weight_up.weight"), gpu)?;
+    let down = crate::weight_map::quantize_to_nvfp4_cached(
+        &down_dense,
+        rank,
+        r,
+        gpu,
+        absmax_k,
+        quantize_k,
+        stream,
+        &format!("{prefix}.down.nvfp4"),
+    )?;
+    let up = crate::weight_map::quantize_to_nvfp4_cached(
+        &up_dense,
+        r,
+        rank,
+        gpu,
+        absmax_k,
+        quantize_k,
+        stream,
+        &format!("{prefix}.up.nvfp4"),
+    )?;
+    let inject = if with_injection {
+        let dense = dense_auto(store, &format!("{prefix}.block_inject_weight.weight"), gpu)?;
+        Some(crate::weight_map::quantize_to_nvfp4_cached(
+            &dense,
+            config.hc_count,
+            r,
+            gpu,
+            absmax_k,
+            quantize_k,
+            stream,
+            &format!("{prefix}.inject.nvfp4"),
+        )?)
+    } else {
+        None
+    };
+    Qwen4HyperConnection::new(
+        norm,
+        down,
+        up,
+        inject,
+        config.hidden_size,
+        config.hc_count,
+        rank,
+        gpu,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use atlas_core::config::{
+        ModelConfig, ModelOptQuantizationGroup, ModelOptWeightFormat, QuantizationConfig,
+    };
+
+    use super::{ensure_supported_weight_formats, mixed_target_has_consumer};
+
+    #[test]
+    fn pinned_mia_mixed_target_classes_have_exact_consumers() {
+        for target in [
+            "model.language_model.layers.0.linear_attn.in_proj_a",
+            "model.language_model.layers.3.self_attn.q_proj",
+            "model.language_model.layers.3.self_attn.indexer.index_qk_proj",
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj",
+            "model.visual.blocks.0.attn.qkv",
+            "model.visual.blocks.0.mlp.linear_fc1",
+            "model.visual.merger.linear_fc2",
+        ] {
+            assert!(
+                mixed_target_has_consumer(target, ModelOptWeightFormat::Mxfp8),
+                "missing MXFP8 consumer for {target}"
+            );
+        }
+        for target in [
+            "model.language_model.layers.0.mlp.experts",
+            "mtp.layers.0.mlp.experts",
+            "mtp.layers.48.mlp.experts",
+            "model.visual.blocks.0.mlp.linear_fc2",
+        ] {
+            assert!(
+                mixed_target_has_consumer(target, ModelOptWeightFormat::Nvfp4),
+                "missing NVFP4 consumer for {target}"
+            );
+        }
+        assert!(!mixed_target_has_consumer(
+            "model.visual.blocks.0.mlp.linear_fc2",
+            ModelOptWeightFormat::Mxfp8
+        ));
+        assert!(!mixed_target_has_consumer(
+            "model.visual.blocks.0.mlp.linear_fc1",
+            ModelOptWeightFormat::Nvfp4
+        ));
+        for target in [
+            "model.language_model.layers.x.linear_attn.in_proj_a",
+            "model.language_model.layers.0.linear_attn.unknown_proj",
+            "model.language_model.layers.0.linear_attn.in_proj_a.trailing",
+            "model.language_model.layers.0x.linear_attn.in_proj_a",
+            "model.visual.blocks.-1.attn.qkv",
+            "model.visual.blocks.0.attn.unknown",
+            "mtp.layers.0.mlp.experts.trailing",
+        ] {
+            assert!(
+                !mixed_target_has_consumer(target, ModelOptWeightFormat::Mxfp8)
+                    && !mixed_target_has_consumer(target, ModelOptWeightFormat::Nvfp4),
+                "hostile or unknown target must fail closed: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_mixed_mxfp8_target_is_admitted() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen4_exp".into();
+        config.quantization_config = Some(QuantizationConfig {
+            quant_method: "modelopt".into(),
+            quant_algo: "MIXED_PRECISION".into(),
+            format: String::new(),
+            ignore_modules: Vec::new(),
+            config_groups: vec![ModelOptQuantizationGroup {
+                name: "attention".into(),
+                weight_format: ModelOptWeightFormat::Mxfp8,
+                group_size: 32,
+                targets: vec!["model.language_model.layers.3.self_attn.q_proj".into()],
+            }],
+        });
+
+        ensure_supported_weight_formats(&config)
+            .expect("wired mixed target class must be admitted before GPU access");
+    }
+
+    #[test]
+    fn unknown_mixed_target_fails_before_loader_touches_the_gpu() {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen4_exp".into();
+        config.quantization_config = Some(QuantizationConfig {
+            quant_method: "modelopt".into(),
+            quant_algo: "MIXED_PRECISION".into(),
+            format: String::new(),
+            ignore_modules: Vec::new(),
+            config_groups: vec![ModelOptQuantizationGroup {
+                name: "unknown".into(),
+                weight_format: ModelOptWeightFormat::Mxfp8,
+                group_size: 32,
+                targets: vec!["model.unknown.projection".into()],
+            }],
+        });
+
+        let err = ensure_supported_weight_formats(&config)
+            .expect_err("unknown mixed target must fail closed");
+        assert!(err.to_string().contains("no fail-closed Atlas consumer"));
+    }
+
+    #[test]
+    fn uniform_nvfp4_remains_admitted() {
+        let config = ModelConfig::qwen3_next_80b_nvfp4();
+        ensure_supported_weight_formats(&config)
+            .expect("existing NVFP4 path must remain unchanged");
+    }
 }

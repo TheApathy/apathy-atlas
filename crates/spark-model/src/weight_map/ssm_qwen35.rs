@@ -77,6 +77,14 @@ pub(crate) fn load_ssm_qwen35(
     // unpacked weight (n rows × k cols of BF16).
     let load_proj_bf16 = |proj: &str, n: usize, k: usize| -> Result<DenseWeight> {
         let prefix = format!("{p}.{proj}");
+        if config
+            .quantization_config
+            .as_ref()
+            .and_then(|quant| quant.modelopt_weight_format_for(&prefix))
+            .is_some()
+        {
+            return dense_modelopt_mixed_or_fp8_or_bf16(store, &prefix, config, gpu);
+        }
         if is_packed(proj) {
             return dequant_nvfp4_to_bf16(store, &prefix, n, k, gpu);
         }
@@ -161,38 +169,175 @@ pub(crate) fn load_moe_qwen35(
     // each expert at load time and runtime-quantize to NVFP4.
     let fused_gate_up_key = format!("{p}.experts.gate_up_proj");
     let fused_down_key = format!("{p}.experts.down_proj");
-    let is_fused_bf16 = variant == Nvfp4Variant::Bf16Raw
-        && store.contains(&fused_gate_up_key)
-        && store.contains(&fused_down_key);
+    let numbered_expert_key = format!("{p}.experts.0.gate_proj.weight");
+    let has_numbered_experts = store.contains(&numbered_expert_key);
+    let has_fused_gate_up = store.contains(&fused_gate_up_key);
+    let has_fused_down = store.contains(&fused_down_key);
+    if !has_numbered_experts {
+        ensure!(
+            has_fused_gate_up == has_fused_down,
+            "packed BF16 expert bank for {p} is partial"
+        );
+    }
+    let is_fused_bf16 = !has_numbered_experts && has_fused_gate_up;
+    let cache_official_packed_mtp = config.is_qwen4_exp() && p == "mtp.layers.0.mlp";
+    if is_fused_bf16 {
+        ensure!(num_experts > 0, "packed BF16 expert bank cannot be empty");
+        let gate_up = store.get(&fused_gate_up_key)?;
+        let down = store.get(&fused_down_key)?;
+        let gate_up_rows = inter
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("packed BF16 gate/up shape overflow"))?;
+        ensure!(
+            gate_up.dtype == WeightDtype::BF16 && gate_up.shape == [num_experts, gate_up_rows, h],
+            "{fused_gate_up_key} must be BF16 [{num_experts}, {gate_up_rows}, {h}]"
+        );
+        ensure!(
+            down.dtype == WeightDtype::BF16 && down.shape == [num_experts, h, inter],
+            "{fused_down_key} must be BF16 [{num_experts}, {h}, {inter}]"
+        );
+        let _ = crate::weight_loader::qwen4_mtp::packed_bf16_expert_offsets(
+            num_experts - 1,
+            num_experts,
+            inter,
+            h,
+        )?;
+        tracing::info!(
+            experts = num_experts,
+            "Loading exact packed BF16 expert bank with runtime NVFP4 quantization"
+        );
+    }
 
     let load_expert_fused = |expert_idx: usize| -> Result<ExpertWeight> {
         // gate_up: [num_experts, 2*inter, hidden] BF16
         let fused_gu = store.get(&fused_gate_up_key)?;
         // down: [num_experts, hidden, inter] BF16
         let fused_d = store.get(&fused_down_key)?;
-        let bf16 = 2usize;
-        let gu_per_expert_bytes = 2 * inter * h * bf16;
-        let d_per_expert_bytes = h * inter * bf16;
-        let gate_off = expert_idx * gu_per_expert_bytes;
-        let up_off = gate_off + inter * h * bf16;
-        let down_off = expert_idx * d_per_expert_bytes;
-        let gate_dw = DenseWeight {
-            weight: fused_gu.ptr.offset(gate_off),
-        };
-        let up_dw = DenseWeight {
-            weight: fused_gu.ptr.offset(up_off),
-        };
-        let down_dw = DenseWeight {
-            weight: fused_d.ptr.offset(down_off),
-        };
+        let offsets = crate::weight_loader::qwen4_mtp::packed_bf16_expert_offsets(
+            expert_idx,
+            num_experts,
+            inter,
+            h,
+        )?;
         Ok(ExpertWeight {
-            gate_proj: quantize_to_nvfp4(&gate_dw, inter, h, gpu, absmax_k, quantize_k, stream)?,
-            up_proj: quantize_to_nvfp4(&up_dw, inter, h, gpu, absmax_k, quantize_k, stream)?,
-            down_proj: quantize_to_nvfp4(&down_dw, h, inter, gpu, absmax_k, quantize_k, stream)?,
+            gate_proj: quantize_packed_mtp_slice(
+                cache_official_packed_mtp,
+                &fused_gate_up_key,
+                fused_gu,
+                expert_idx,
+                PackedMtpProjection::Gate,
+                offsets.gate,
+                inter,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?,
+            up_proj: quantize_packed_mtp_slice(
+                cache_official_packed_mtp,
+                &fused_gate_up_key,
+                fused_gu,
+                expert_idx,
+                PackedMtpProjection::Up,
+                offsets.up,
+                inter,
+                h,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?,
+            down_proj: quantize_packed_mtp_slice(
+                cache_official_packed_mtp,
+                &fused_down_key,
+                fused_d,
+                expert_idx,
+                PackedMtpProjection::Down,
+                offsets.down,
+                h,
+                inter,
+                gpu,
+                absmax_k,
+                quantize_k,
+                stream,
+            )?,
         })
     };
 
     let load_expert = |prefix: &str| -> Result<ExpertWeight> {
+        // Quantization recipes may exclude the shared expert while keeping the
+        // routed experts in the checkpoint's native format.  Flash-Next NVFP4
+        // does exactly that, so the model-wide variant is not sufficient to
+        // choose the loader here.  Inspect the projection itself and perform
+        // the established load-time BF16 -> NVFP4 transform when necessary.
+        let weight_is_bf16 = |projection: &str| -> bool {
+            store
+                .get(&format!("{prefix}.{projection}.weight"))
+                .map(|weight| weight.dtype == WeightDtype::BF16)
+                .unwrap_or(false)
+        };
+        if weight_is_bf16("gate_proj") && weight_is_bf16("up_proj") && weight_is_bf16("down_proj") {
+            return Ok(ExpertWeight {
+                gate_proj: load_bf16_then_nvfp4(&format!("{prefix}.gate_proj"), inter, h)?,
+                up_proj: load_bf16_then_nvfp4(&format!("{prefix}.up_proj"), inter, h)?,
+                down_proj: load_bf16_then_nvfp4(&format!("{prefix}.down_proj"), h, inter)?,
+            });
+        }
+        let declared = |projection: &str| {
+            config.quantization_config.as_ref().and_then(|quant| {
+                quant.modelopt_weight_format_for(&format!("{prefix}.{projection}"))
+            })
+        };
+        if declared("gate_proj").is_some()
+            || declared("up_proj").is_some()
+            || declared("down_proj").is_some()
+        {
+            ensure!(
+                declared("gate_proj").is_some()
+                    && declared("up_proj").is_some()
+                    && declared("down_proj").is_some(),
+                "mixed ModelOpt expert {prefix} has a partial projection declaration"
+            );
+            return Ok(ExpertWeight {
+                gate_proj: quantized_modelopt_mixed(
+                    store,
+                    &format!("{prefix}.gate_proj"),
+                    inter,
+                    h,
+                    config,
+                    variant,
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
+                )?,
+                up_proj: quantized_modelopt_mixed(
+                    store,
+                    &format!("{prefix}.up_proj"),
+                    inter,
+                    h,
+                    config,
+                    variant,
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
+                )?,
+                down_proj: quantized_modelopt_mixed(
+                    store,
+                    &format!("{prefix}.down_proj"),
+                    h,
+                    inter,
+                    config,
+                    variant,
+                    gpu,
+                    absmax_k,
+                    quantize_k,
+                    stream,
+                )?,
+            });
+        }
         match variant {
             Nvfp4Variant::Bf16Raw => Ok(ExpertWeight {
                 gate_proj: load_bf16_then_nvfp4(&format!("{prefix}.gate_proj"), inter, h)?,

@@ -496,6 +496,9 @@ pub fn gdn_prefill_persistent(
 
 /// Persistent GDN prefill with explicit shared memory size.
 /// Used for WY4-persistent variant which needs more shared memory.
+///
+/// Launches at the historical 128-thread block width. Every caller that existed
+/// before the K-split port routes through here and is unchanged by it.
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_prefill_persistent_smem(
     gpu: &dyn GpuBackend,
@@ -519,9 +522,52 @@ pub fn gdn_prefill_persistent_smem(
     smem: u32,
     stream: u64,
 ) -> Result<()> {
+    gdn_prefill_persistent_smem_blocked(
+        gpu, kernel, h_state, query, key, value, gate, beta, output, batch_size, seq_len,
+        num_k_heads, num_v_heads, k_dim, v_dim, qk_stride, v_stride, gb_stride, smem,
+        GDN_PREFILL_BLOCK_X, stream,
+    )
+}
+
+/// Historical GDN prefill block width: one thread per V column.
+pub const GDN_PREFILL_BLOCK_X: u32 = 128;
+
+/// As [`gdn_prefill_persistent_smem`], but with an explicit block width.
+///
+/// Kept as a separate entry point rather than adding a parameter to the original so
+/// that no existing call site changes behaviour.
+///
+/// WARNING before wiring any kernel here at a width other than [`GDN_PREFILL_BLOCK_X`]:
+/// the only one that ever did was the WY32 gate-cache K-split, REJECTED ON NUMERICS —
+/// +8.62% legal-domain NLL against a +3.22% precedent, argmax 95-96% against a 100%
+/// standard, attribution closed by a same-ELF control. Needs a fresh per-domain gate.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prefill_persistent_smem_blocked(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    h_state: DevicePtr,
+    query: DevicePtr,
+    key: DevicePtr,
+    value: DevicePtr,
+    gate: DevicePtr,
+    beta: DevicePtr,
+    output: DevicePtr,
+    batch_size: u32,
+    seq_len: u32,
+    num_k_heads: u32,
+    num_v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    qk_stride: u32,
+    v_stride: u32,
+    gb_stride: u32,
+    smem: u32,
+    block_x: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([num_v_heads, batch_size, 1])
-        .block([128, 1, 1])
+        .block([block_x, 1, 1])
         .shared_mem(smem)
         .arg_ptr(h_state)
         .arg_ptr(query)

@@ -99,6 +99,8 @@ impl Qwen3SsmLayer {
             ssm,
             post_attn_norm,
             ffn,
+            qwen4_attn_hyper: None,
+            qwen4_mlp_hyper: None,
             qkvz_nvfp4,
             qkvz_nvfp4_t: None,
             out_proj_nvfp4_t: None,
@@ -114,8 +116,16 @@ impl Qwen3SsmLayer {
             } else {
                 gpu.kernel("norm", "rms_norm_residual")?
             },
-            gated_rms_norm_k: gpu.kernel("norm", "gated_rms_norm")?,
-            gated_rms_norm_f32_k: super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input"),
+            gated_rms_norm_k: if config.output_gate_type == "sigmoid" {
+                gpu.kernel("qwen4_hyper", "qwen4_gated_rms_norm_sigmoid")?
+            } else {
+                gpu.kernel("norm", "gated_rms_norm")?
+            },
+            gated_rms_norm_f32_k: if config.output_gate_type == "sigmoid" {
+                super::super::try_kernel(gpu, "qwen4_hyper", "qwen4_gated_rms_norm_sigmoid_f32")
+            } else {
+                super::super::try_kernel(gpu, "norm", "gated_rms_norm_f32_input")
+            },
             dense_gemv_k: gpu.kernel("gemv", "dense_gemv_bf16")?,
             // Optional K=3 batched BA-proj GEMV. Built into the common
             // nvfp4/dense_gemv_bf16.cu so every target picks it up, but
@@ -158,7 +168,12 @@ impl Qwen3SsmLayer {
                     "w4a16_gemv_rt",
                     ops::ExactLmHeadTier::M32.symbol_rt2(),
                 ),
-            ),
+            )
+            .with_rt2_m32_grid(super::super::try_kernel(
+                gpu,
+                "w4a16_gemv_rt",
+                "w4a16_gemv_batch_logits_exact_rt2_m32_grid",
+            )),
             w4a16_gemv_sw_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             gemv_sw: crate::layers::ops::gemv_sw_enabled(),
             w8a16_gemv_k: gpu.kernel("w8a16_gemv", "w8a16_gemv")?,
@@ -250,6 +265,8 @@ impl Qwen3SsmLayer {
             w4a16_gemm_t_k: gpu.kernel("w4a16", "w4a16_gemm_t")?,
             w4a16_gemm_t_k64_k: gpu.kernel("w4a16", "w4a16_gemm_t_k64")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
+            w4a16_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m128n128_w8"),
+            fp8_gemm_t_w8_k: super::super::try_kernel(gpu, "w4a16", "fp8_gemm_t_m128n128_w8"),
             // Optional small-M variant (qwen3.6-27b only). Use try_kernel so
             // generic builds without the kernel still link cleanly.
             w4a16_gemm_t_m16_k: super::super::try_kernel(gpu, "w4a16", "w4a16_gemm_t_m16"),
@@ -263,6 +280,8 @@ impl Qwen3SsmLayer {
             ),
             reduce_splitk_k: super::super::try_kernel(gpu, "w4a16", "reduce_splitk_f32_to_bf16"),
             ssm_splitk_workspace: std::sync::Mutex::new(None),
+            ssm_act_e4m3_scratch: std::sync::Mutex::new(None),
+            ssm_qkvz_e4m3: std::sync::Mutex::new(None),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
             gdn_prefill_k: gpu.kernel("gated_delta_rule", "gated_delta_rule_prefill")?,
@@ -289,6 +308,32 @@ impl Qwen3SsmLayer {
                 gpu,
                 "gated_delta_rule_wy32_gatecache",
                 "gated_delta_rule_prefill_wy32_gatecache",
+            ),
+            cast_bf16_to_e4m3_k: super::super::try_kernel(
+                gpu,
+                "w4a16_v2",
+                "cast_bf16_to_e4m3",
+            ),
+            dequant_nvfp4_to_e4m3_k: super::super::try_kernel(
+                gpu,
+                "w4a16_v2",
+                "dequant_nvfp4_to_e4m3",
+            ),
+            gdn_prefill_wy32_gatecache_v2_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy32_gatecache_v2",
+                "gated_delta_rule_prefill_wy32_gatecache_v2",
+            ),
+            // Flash-Next's warp-parallel WY32 variant. `try_kernel` is soft by
+            // design: this kernel ships only under the qwen3.8-flash-next
+            // target, so on every other build the handle is 0 — and theirs'
+            // dispatch guards on `.0 != 0`, so the route is simply unavailable
+            // rather than a load failure. The merge brought the field and its
+            // dispatch across without this registration.
+            gdn_prefill_wy32_warp_k: super::super::try_kernel(
+                gpu,
+                "gated_delta_rule_wy32_warp",
+                "gated_delta_rule_prefill_wy32_warp",
             ),
             // ── Q12 Phase 2b: batched GDN kernel handles ──
             gdn_prefill_wy32_batched_k: super::super::try_kernel(
@@ -350,11 +395,19 @@ impl Qwen3SsmLayer {
                 "gated_delta_rule_f32_multi_seq",
                 "gated_delta_rule_decode_f32_multi_seq",
             ),
-            gated_rms_norm_f32_multi_seq_k: super::super::try_kernel(
-                gpu,
-                "gated_rms_norm_f32_multi_seq",
-                "gated_rms_norm_f32_multi_seq",
-            ),
+            gated_rms_norm_f32_multi_seq_k: if config.output_gate_type == "sigmoid" {
+                super::super::try_kernel(
+                    gpu,
+                    "qwen4_hyper",
+                    "qwen4_gated_rms_norm_sigmoid_f32_multi_seq",
+                )
+            } else {
+                super::super::try_kernel(
+                    gpu,
+                    "gated_rms_norm_f32_multi_seq",
+                    "gated_rms_norm_f32_multi_seq",
+                )
+            },
             conv1d_l2norm_chunk3_k: super::super::try_kernel(
                 gpu,
                 "causal_conv1d_chunk3_l2norm",
@@ -691,6 +744,15 @@ impl Qwen3SsmLayer {
             output,
         });
         Ok(())
+    }
+
+    pub fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) {
+        self.qwen4_attn_hyper = Some(attn);
+        self.qwen4_mlp_hyper = Some(mlp);
     }
 
     /// Set raw FP8 DevicePtrs for the prefill GEMM path ONLY (no decode GEMV

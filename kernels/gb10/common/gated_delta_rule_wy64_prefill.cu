@@ -108,12 +108,40 @@ gated_delta_rule_prefill_wy64(
             smem_q[tok * K_DIM + dim] = query[off];   // BF16 direct
         }
         if (tid < C) {
-            smem_g[tid] = gate[(unsigned long long)(chunk_start + tid) * gb_stride + vh];
+            const float g_raw = gate[(unsigned long long)(chunk_start + tid) * gb_stride + vh];
+            smem_g[tid] = fminf(fmaxf(g_raw, 0.0f), 1.0f);
             smem_bt[tid] = beta[(unsigned long long)(chunk_start + tid) * gb_stride + vh];
         }
         __syncthreads();
 
-        // Compute k-dot products: kd[i][j] = k_i^T @ k_j for i > j
+        // Compute k-dot products: kd[i][j] = k_i^T @ k_j for i > j.
+#ifdef ATLAS_GDN_KD_WARP
+        // Preserve the original FP32 reduction tree, but compute four
+        // independent (i,j) pairs concurrently (one per warp). Each warp
+        // reduces the same four contiguous 32-value segments as the old
+        // 128-thread block reduction, in the same order. This removes two
+        // block barriers per pair without changing tensor-core precision.
+        const unsigned int warp = tid >> 5;
+        const unsigned int lane = tid & 31;
+        unsigned int pair = 0;
+        for (int i = 1; i < C; ++i) {
+            for (int j = 0; j < i; ++j, ++pair) {
+                if ((pair & 3) == warp) {
+                    float dot = 0.0f;
+                    #pragma unroll
+                    for (int seg = 0; seg < 4; ++seg) {
+                        int d = seg * 32 + lane;
+                        float partial = (float)smem_k[i * K_DIM + d] *
+                                        (float)smem_k[j * K_DIM + d];
+                        partial = wy_warp_reduce(partial);
+                        if (lane == 0) dot += partial;
+                    }
+                    if (lane == 0) smem_kd[i * C + j] = dot;
+                }
+            }
+        }
+        __syncthreads();
+#else
         for (unsigned int idx = tid; idx < C * C; idx += V_DIM) {
             smem_kd[idx] = 0.0f;
         }
@@ -128,6 +156,28 @@ gated_delta_rule_prefill_wy64(
                 __syncthreads();
             }
         }
+#endif
+
+#ifdef ATLAS_GDN_PREWEIGHT_KD
+        // Gate products depend on token indices, not value lanes. The generic
+        // path redundantly rebuilds every product in all 128 threads. Compute
+        // each coefficient once, in the exact original ascending multiply
+        // order, and fold it into the lower-triangular Gram matrix. Store the
+        // H coefficient on the otherwise-unused diagonal.
+        if (tid == 0) {
+            for (int t = 0; t < C; ++t) {
+                float h_coeff = 1.0f;
+                for (int s = 0; s < t; ++s) h_coeff *= smem_g[s];
+                smem_kd[t * C + t] = h_coeff;
+                for (int s = 0; s < t; ++s) {
+                    float coeff = 1.0f;
+                    for (int m = s + 1; m < t; ++m) coeff *= smem_g[m];
+                    smem_kd[t * C + s] *= coeff;
+                }
+            }
+        }
+        __syncthreads();
+#endif
 
         // Pass 1: Read H once, compute all C hk_prev values
         float hk_prev[C];
@@ -146,6 +196,14 @@ gated_delta_rule_prefill_wy64(
             float v_t = (float)value[(unsigned long long)(chunk_start + t) * v_stride + vh * v_dim + tid];
 
             // Cumulative gate product for H^T @ k[t] term: prod(g[0..t-1])
+#ifdef ATLAS_GDN_PREWEIGHT_KD
+            float hk_corr = smem_kd[t * C + t] * hk_prev[t];
+
+            // Lower triangle already contains gate-product-weighted k dots.
+            for (int s = 0; s < t; s++) {
+                hk_corr += smem_kd[t * C + s] * v_new_arr[s];
+            }
+#else
             float g_prod = 1.0f;
             for (int s = 0; s < t; s++) g_prod *= smem_g[s];
 
@@ -157,6 +215,7 @@ gated_delta_rule_prefill_wy64(
                 for (int m = s + 1; m < t; m++) g_prod_s *= smem_g[m];
                 hk_corr += g_prod_s * smem_kd[t * C + s] * v_new_arr[s];
             }
+#endif
 
             v_new_arr[t] = (v_t - smem_g[t] * hk_corr) * smem_bt[t];
         }
@@ -192,7 +251,8 @@ gated_delta_rule_prefill_wy64(
         __syncthreads();
 
         float v_i = (float)value[(unsigned long long)t * v_stride + vh * v_dim + tid];
-        float g_t = gate[(unsigned long long)t * gb_stride + vh];
+        const float g_raw = gate[(unsigned long long)t * gb_stride + vh];
+        float g_t = fminf(fmaxf(g_raw, 0.0f), 1.0f);
         float bt_t = beta[(unsigned long long)t * gb_stride + vh];
 
         float hk = 0.0f;
@@ -306,7 +366,8 @@ gated_delta_rule_prefill_wy64_batched(
             smem_q[tok * K_DIM + dim] = query[off];
         }
         if (tid < C) {
-            smem_g[tid] = gate[gb_batch_off + (unsigned long long)(chunk_start + tid) * gb_stride + vh];
+            const float g_raw = gate[gb_batch_off + (unsigned long long)(chunk_start + tid) * gb_stride + vh];
+            smem_g[tid] = fminf(fmaxf(g_raw, 0.0f), 1.0f);
             smem_bt[tid] = beta[gb_batch_off + (unsigned long long)(chunk_start + tid) * gb_stride + vh];
         }
         __syncthreads();
@@ -382,7 +443,8 @@ gated_delta_rule_prefill_wy64_batched(
         __syncthreads();
 
         float v_i = (float)value[v_batch_off + (unsigned long long)t * v_stride + vh * v_dim + tid];
-        float g_t = gate[gb_batch_off + (unsigned long long)t * gb_stride + vh];
+        const float g_raw = gate[gb_batch_off + (unsigned long long)t * gb_stride + vh];
+        float g_t = fminf(fmaxf(g_raw, 0.0f), 1.0f);
         float bt_t = beta[gb_batch_off + (unsigned long long)t * gb_stride + vh];
 
         float hk = 0.0f;

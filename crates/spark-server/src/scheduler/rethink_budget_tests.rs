@@ -17,6 +17,7 @@ fn seq_state() -> SequenceState {
         tokens: Vec::new(),
         block_table: Vec::new(),
         seq_len: 0,
+        qwen4_qsa_required: false,
         layer_states: Vec::new(),
         rotary_positions: spark_model::traits::RotaryPositions::identity(),
         proposer_state: None,

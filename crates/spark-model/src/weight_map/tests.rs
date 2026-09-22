@@ -137,6 +137,96 @@ fn gpu_dequant_bf16_contract_is_truncation_not_round_to_nearest() {
 }
 
 #[test]
+fn mxfp8_e4m3_e8m0_reference_values() {
+    assert_eq!(mxfp8_e8m0_scale(0).unwrap().to_bits(), 0x0040_0000);
+    assert_eq!(mxfp8_e8m0_scale(127).unwrap(), 1.0);
+    assert_eq!(mxfp8_e8m0_scale(254).unwrap().to_bits(), 0x7f00_0000);
+    assert!(mxfp8_e8m0_scale(255).is_err());
+
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0x00, 127).unwrap(), 0.0);
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0x01, 127).unwrap(), 1.0 / 512.0);
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0x38, 127).unwrap(), 1.0);
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0xb8, 127).unwrap(), -1.0);
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0x7e, 127).unwrap(), 448.0);
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0x7f, 127).unwrap(), 0.0);
+    assert_eq!(mxfp8_e4m3_e8m0_to_f32(0x38, 126).unwrap(), 0.5);
+    assert!(mxfp8_e4m3_e8m0_to_f32(0x38, 255).is_err());
+}
+
+#[test]
+fn mxfp8_geometry_accepts_pinned_mia_shapes() {
+    assert_eq!(
+        mxfp8_gpu_dequant_args(
+            &[48, 2_560],
+            WeightDtype::FP8E4M3,
+            &[48, 80],
+            WeightDtype::UInt8,
+        )
+        .unwrap(),
+        (48, 2_560, 80)
+    );
+    assert_eq!(
+        mxfp8_gpu_dequant_args(
+            &[4_304, 1_152],
+            WeightDtype::FP8E4M3,
+            &[4_304, 36],
+            WeightDtype::UInt8,
+        )
+        .unwrap(),
+        (4_304, 1_152, 36)
+    );
+}
+
+#[test]
+fn mxfp8_geometry_rejects_ambiguous_or_malformed_layouts() {
+    assert!(
+        mxfp8_gpu_dequant_args(
+            &[48, 2_560],
+            WeightDtype::UInt8,
+            &[48, 80],
+            WeightDtype::UInt8,
+        )
+        .is_err()
+    );
+    assert!(
+        mxfp8_gpu_dequant_args(
+            &[48, 2_560],
+            WeightDtype::FP8E4M3,
+            &[48, 80],
+            WeightDtype::FP8E4M3,
+        )
+        .is_err()
+    );
+    assert!(
+        mxfp8_gpu_dequant_args(
+            &[48, 2_559],
+            WeightDtype::FP8E4M3,
+            &[48, 80],
+            WeightDtype::UInt8,
+        )
+        .is_err()
+    );
+    assert!(
+        mxfp8_gpu_dequant_args(
+            &[48, 2_560],
+            WeightDtype::FP8E4M3,
+            &[48, 79],
+            WeightDtype::UInt8,
+        )
+        .is_err()
+    );
+    assert!(
+        mxfp8_gpu_dequant_args(
+            &[48, 1, 2_560],
+            WeightDtype::FP8E4M3,
+            &[48, 80],
+            WeightDtype::UInt8,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn mixed_precision_fp8_detection_excludes_nvfp4_layouts() {
     assert!(is_mixed_precision_fp8_weight(
         Some(WeightDtype::FP8E4M3),

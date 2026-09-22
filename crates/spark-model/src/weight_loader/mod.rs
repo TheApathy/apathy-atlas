@@ -25,6 +25,7 @@ mod qwen35;
 mod qwen35_dense;
 mod qwen35_mixed_precision;
 mod qwen3_vl;
+pub mod qwen4_mtp;
 pub mod transform_cache;
 
 pub use dflash_loader::{
@@ -39,6 +40,7 @@ pub use nemotron::NemotronHWeightLoader;
 pub use qwen3::Qwen3WeightLoader;
 pub use qwen3_vl::Qwen3VLWeightLoader;
 pub use qwen35::Qwen35WeightLoader;
+pub(crate) use qwen35::{load_qwen4_mtp_layer, qwen4_mtp_config};
 pub use qwen35_dense::Qwen35DenseWeightLoader;
 
 use anyhow::Result;
@@ -188,6 +190,17 @@ pub trait ModelWeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight>;
+
+    /// Optional terminal Qwen4 hyperconnection mixer. Conventional models
+    /// return `None` and use `final_norm` as before.
+    fn load_qwen4_final_mixer(
+        &self,
+        _store: &WeightStore,
+        _config: &ModelConfig,
+        _gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::Qwen4HyperConnection>> {
+        Ok(None)
+    }
     fn load_lm_head(
         &self,
         store: &WeightStore,

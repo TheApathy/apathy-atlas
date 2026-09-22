@@ -12,7 +12,12 @@ use crate::layers::FfnComponent;
 
 mod decode_inner;
 mod multi_seq;
+mod prefill_fast_attn;
 mod prefill_inner;
+mod prefill_moe_admit;
+mod prefill_moe_attn16;
+mod prefill_moe_attn16_device;
+mod prefill_moe_only;
 
 fn ddtree_indirection_supported(
     dtype: spark_runtime::kv_cache::KvCacheDtype,
@@ -98,6 +103,24 @@ pub(super) fn gemma4_diag_enabled() -> bool {
 }
 
 impl TransformerLayer for Qwen3AttentionLayer {
+    fn preflight_qwen4_attn16(
+        &self,
+        kv_cache: &PagedKvCache,
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<()> {
+        self.preflight_moe_attn16(kv_cache, gpu, stream)
+    }
+
+    fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) -> Result<()> {
+        Qwen3AttentionLayer::set_qwen4_hyperconnections(self, attn, mlp);
+        Ok(())
+    }
+
     fn ddtree_ancestor_attention_exact(&self) -> bool {
         // BF16 certifies only when this exact Qwen target resolved the
         // dedicated tree ABI. Turbo variants still ignore indirection.
@@ -132,6 +155,43 @@ impl TransformerLayer for Qwen3AttentionLayer {
             block_table,
             disk_block_ids,
             disk_last_offloaded_per_layer,
+            ctx,
+            stream,
+        )
+    }
+
+    fn decode_qwen4_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        h_intermediate: DevicePtr,
+        conv_intermediate: DevicePtr,
+        h_intermediate_stride: usize,
+        conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_qwen4_batched_inner(
+            hidden,
+            residual,
+            num_tokens,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            h_intermediate,
+            conv_intermediate,
+            h_intermediate_stride,
+            conv_intermediate_stride,
             ctx,
             stream,
         )
@@ -387,6 +447,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
                 packed_ptrs_t,
                 scale_ptrs_t,
             );
+        }
+    }
+
+    fn set_moe_stream_transpose_scratch(
+        &mut self,
+        scratch: crate::layer::MoeStreamTransposeScratch,
+    ) {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.set_moe_stream_transpose_scratch(scratch);
+        }
+        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
+            moe.set_moe_stream_transpose_scratch(scratch);
         }
     }
 

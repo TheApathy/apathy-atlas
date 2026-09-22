@@ -73,6 +73,11 @@ impl SpecCycle {
         )
     }
 
+    /// True only when the startup-validated C=1, async=0 diagnostic owns this frame.
+    pub(super) fn qualification_c1_active(&self) -> bool {
+        self.0.is_some()
+    }
+
     fn begin_with<B, F>(
         enabled: bool,
         pre: usize,

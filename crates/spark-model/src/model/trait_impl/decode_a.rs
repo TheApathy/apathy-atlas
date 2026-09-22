@@ -36,6 +36,11 @@ impl TransformerModel {
     ) -> Result<DevicePtr> {
         let rotary =
             crate::model::rotary_meta::SingleRotary::new(&seq.rotary_positions, seq.seq_len)?;
+        if self.config.is_qwen4_exp() && seq.seq_len >= 2048 && !self.config.qwen4_qsa {
+            anyhow::bail!(
+                "Qwen4 QSA is disabled: exact full-attention fallback is limited to 2048 tokens"
+            );
+        }
         // ATLAS_SSM_H_FP16 stage 2: flip this sequence's h-state to FP16 before
         // any graph capture/replay below. Must be here and not in a layer — see
         // `ssm_h_to_f16_dispatch`. No-op unless the flag is set.
@@ -63,13 +68,8 @@ impl TransformerModel {
         } else {
             2
         };
-        self.capture_k1_stage(
-            "embed",
-            hidden,
-            1,
-            self.config.hidden_size * hidden_elem_bytes,
-            stream,
-        )?;
+        let persistent_row_bytes = self.config.residual_width() * hidden_elem_bytes;
+        self.capture_k1_stage("embed", hidden, 1, persistent_row_bytes, stream)?;
 
         // 2. Pre-allocate KV cache blocks + upload attention metadata
         let bs = kv_cache.block_size();
@@ -112,6 +112,7 @@ impl TransformerModel {
         let (positions_h, positions_w) =
             rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         let attn_metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h,
             positions_w,
@@ -163,8 +164,28 @@ impl TransformerModel {
             && !self.profile
             && !suppress_graphs
             && !hss_engaged
+            && self.qwen4_ple.is_none()
             && !serial_debug_dump
             && !crate::model::k1_stage_diag::enabled();
+
+        // PLE performs host/NVMe work between layers 0 and 1, so it cannot
+        // live inside a monolithic CUDA graph. The remaining layers are
+        // address-stable for a fixed sequence slot, however. The segmented
+        // path is qualified and default-on; setting the environment variable
+        // to zero retains an explicit eager diagnostic control.
+        let use_qwen4_ple_suffix_graph = self.config.is_qwen4_exp()
+            && self.qwen4_ple.is_some()
+            && self.comm.is_none()
+            && !self.profile
+            && !suppress_graphs
+            && !hss_engaged
+            && !serial_debug_dump
+            && !crate::model::k1_stage_diag::enabled()
+            && !self.any_proposer()
+            && std::env::var("ATLAS_QWEN4_PLE_SEGMENTED_GRAPHS")
+                .ok()
+                .as_deref()
+                != Some("0");
 
         let ctx = ForwardContext {
             buffers: &self.buffers,
@@ -181,8 +202,20 @@ impl TransformerModel {
             ffn_defer: None,
         };
 
+        if use_qwen4_ple_suffix_graph {
+            return self.decode_qwen4_ple_suffix_graph(
+                token,
+                hidden,
+                residual,
+                seq,
+                &mut kv_cache,
+                &ctx,
+                stream,
+            );
+        }
+
         // Profile mode: use per-layer sync decode for timing breakdown.
-        if self.profile {
+        if self.profile && self.qwen4_ple.is_none() {
             return self.decode_profiled(token, hidden, residual, seq, &mut kv_cache, &ctx, stream);
         }
 
@@ -221,6 +254,19 @@ impl TransformerModel {
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
+            if i == 1
+                && let Some(ple) = &self.qwen4_ple
+            {
+                ple.forward_token(
+                    token,
+                    &seq.tokens,
+                    hidden,
+                    seq.slot_idx,
+                    seq.seq_len == 0,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
+            }
             layer.decode(
                 hidden,
                 residual,
@@ -237,7 +283,7 @@ impl TransformerModel {
                 &format!("layer_{i:02}"),
                 hidden,
                 1,
-                self.config.hidden_size * hidden_elem_bytes,
+                persistent_row_bytes,
                 stream,
             )?;
             // Offline K=gamma parity probe: capture the single-token hidden
@@ -289,17 +335,19 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         let h = self.config.hidden_size as u32;
         let eps = self.config.rms_norm_eps as f32;
-        ops::rms_norm(
-            self.gpu.as_ref(),
-            self.rms_norm_kernel,
-            hidden,
-            &self.final_norm,
-            normed,
-            1,
-            h,
-            eps,
-            stream,
-        )?;
+        if self.qwen4_final_hidden(hidden, residual, stream)?.is_none() {
+            ops::rms_norm(
+                self.gpu.as_ref(),
+                self.rms_norm_kernel,
+                hidden,
+                &self.final_norm,
+                normed,
+                1,
+                h,
+                eps,
+                stream,
+            )?;
+        }
         self.capture_k1_stage("final_norm", normed, 1, self.config.hidden_size * 2, stream)?;
 
         if serial_debug_dump {

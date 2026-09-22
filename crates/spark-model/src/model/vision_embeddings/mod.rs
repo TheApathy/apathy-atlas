@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 mod bridge;
 mod cache;
+mod expanded;
 mod layout;
 mod plan;
 mod ranges;
@@ -18,6 +19,8 @@ pub(crate) mod test_gpu;
 mod tests;
 #[cfg(test)]
 mod tests_admission;
+#[cfg(test)]
+mod tests_expanded;
 #[cfg(test)]
 mod tests_failures;
 #[cfg(test)]

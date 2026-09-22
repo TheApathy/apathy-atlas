@@ -169,8 +169,15 @@ pub(super) fn victim_selector(source: &str) -> Option<String> {
     // `grammar_state` path are byte-identical; nothing this scan reasons about
     // moved. Re-pinning without that diff would turn the guard into a rubber
     // stamp, which is the one way this test can fail silently.
-    const SOURCE_LEN: usize = 42_631;
-    const SOURCE_FNV1A: u64 = 0x3253f9107edb5f20;
+    //
+    // Re-pinned 2026-09-22 for integrate/all-models: the phaseA-a1 merge adds
+    // `mod spec_accept_log;` and its `use spec_accept_log::*;` (and drops a
+    // duplicate `mod vision_request_reset_tests;` phaseA carried). The bytes
+    // from the swap-out marker to EOF were machine-compared against
+    // feat/tui-port and are identical (23_142 bytes); the recomputed FNV-1a of
+    // the old file reproduced the old pin before the new one was taken.
+    const SOURCE_LEN: usize = 42_676;
+    const SOURCE_FNV1A: u64 = 0x1d7f1651b7c00b51;
     if source.matches(START).count() != 1 || source.matches(END).count() != 1 {
         return None;
     }

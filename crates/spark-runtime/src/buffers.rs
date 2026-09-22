@@ -24,9 +24,11 @@ pub use sizes::BufferSizes;
 /// only touch k_max slots during decode, so the extra pages don't affect
 /// decode bandwidth on unified memory.
 pub struct BufferArena {
-    /// Hidden states: [M, hidden_size] in BF16.
+    /// Persistent hidden states: [M, residual_width] in BF16 (or FP32 for
+    /// models that request it). `residual_width == hidden_size` except for
+    /// multi-stream hyperconnection architectures such as Qwen4-Exp.
     hidden_states: DevicePtr,
-    /// Residual stream: [M, hidden_size] in BF16.
+    /// Residual scratch: [M, residual_width], matching `hidden_states`.
     residual: DevicePtr,
     /// Post-norm output: [M, hidden_size] in BF16.
     norm_output: DevicePtr,
@@ -63,6 +65,10 @@ pub struct BufferArena {
     expert_up_out: DevicePtr,
     /// Expert down projection output: [k2 * top_k, hidden_size] BF16.
     expert_down_out: DevicePtr,
+    /// Persistent compact ordinary-NVFP4 MoE tile work-list.
+    moe_worklist: DevicePtr,
+    /// Device-written number of valid compact work-list items.
+    moe_worklist_total: DevicePtr,
     /// Split-K decode attention workspace: partials from split CTAs (F32).
     splitk_workspace: DevicePtr,
     /// Maximum batch tokens this arena was sized for.
@@ -100,6 +106,8 @@ impl BufferArena {
         let expert_gate_out = gpu.alloc(sizes.expert_gate_out)?;
         let expert_up_out = gpu.alloc(sizes.expert_up_out)?;
         let expert_down_out = gpu.alloc(sizes.expert_down_out)?;
+        let moe_worklist = gpu.alloc(sizes.moe_worklist)?;
+        let moe_worklist_total = gpu.alloc(sizes.moe_worklist_total)?;
         let splitk_workspace = gpu.alloc(sizes.splitk_workspace)?;
 
         tracing::info!(
@@ -130,6 +138,8 @@ impl BufferArena {
             expert_gate_out,
             expert_up_out,
             expert_down_out,
+            moe_worklist,
+            moe_worklist_total,
             splitk_workspace,
             max_batch_tokens,
             sizes,
@@ -197,6 +207,14 @@ impl BufferArena {
     /// Batched expert down projection output.
     pub fn expert_down_out(&self) -> DevicePtr {
         self.expert_down_out
+    }
+    /// Persistent compact ordinary-NVFP4 MoE tile work-list.
+    pub fn moe_worklist(&self) -> DevicePtr {
+        self.moe_worklist
+    }
+    /// Device-written number of valid compact work-list items.
+    pub fn moe_worklist_total(&self) -> DevicePtr {
+        self.moe_worklist_total
     }
     /// Split-K decode attention workspace (F32 partials).
     pub fn splitk_workspace(&self) -> DevicePtr {

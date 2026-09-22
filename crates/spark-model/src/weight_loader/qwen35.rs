@@ -10,9 +10,35 @@ use spark_runtime::weights::WeightStore;
 
 use super::ModelWeightLoader;
 use crate::layer::TransformerLayer;
-use crate::weight_map::{DenseWeight, MtpWeights, dense, detect_nvfp4_variant, load_mtp};
+use crate::weight_map::{
+    DenseWeight, MtpWeights, dense, dense_auto, detect_nvfp4_variant, load_mtp,
+};
 
 pub struct Qwen35WeightLoader;
+
+pub(crate) fn qwen4_mtp_config(target: &ModelConfig) -> ModelConfig {
+    let mut config = target.clone();
+    config.num_hidden_layers = 1;
+    config.layer_types = vec![atlas_core::config::LayerType::FullAttention];
+    config.full_attention_interval = 1;
+    config.weight_prefix = "mtp".to_string();
+    config.dflash_capture_layers.clear();
+    config.vision = None;
+    config
+}
+
+pub(crate) fn load_qwen4_mtp_layer(
+    store: &WeightStore,
+    target: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    kv_dtype: KvCacheDtype,
+) -> Result<Box<dyn TransformerLayer>> {
+    let config = qwen4_mtp_config(target);
+    let mut layers =
+        load_layers::load_layers(&Qwen35WeightLoader, store, &config, gpu, &[kv_dtype])?;
+    anyhow::ensure!(layers.len() == 1, "Qwen4 MTP must load exactly one layer");
+    Ok(layers.remove(0))
+}
 
 impl ModelWeightLoader for Qwen35WeightLoader {
     fn supports_tp(&self) -> bool {
@@ -50,6 +76,16 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         _gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
         let prefix = &config.weight_prefix;
+        if config.is_qwen4_exp() {
+            // Qwen4 has no terminal RMSNorm; the model-level hyperconnection
+            // mixer is installed separately. Return a real tensor to satisfy
+            // the architecture-neutral constructor without allocating a
+            // dummy. Forward must not apply it.
+            return dense(
+                store,
+                &format!("{prefix}.hyper_connection_mixer.hc_norm.weight"),
+            );
+        }
         dense(store, &format!("{prefix}.norm.weight"))
     }
 
@@ -62,6 +98,55 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         super::qwen35_mixed_precision::load_lm_head(store, config, gpu)
     }
 
+    fn load_qwen4_final_mixer(
+        &self,
+        store: &WeightStore,
+        config: &ModelConfig,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Option<crate::layers::Qwen4HyperConnection>> {
+        if !config.is_qwen4_exp() {
+            return Ok(None);
+        }
+        let p = format!("{}.hyper_connection_mixer", config.weight_prefix);
+        let norm = dense(store, &format!("{p}.hc_norm.weight"))?;
+        let down_dense = dense_auto(store, &format!("{p}.input_mix_weight_down.weight"), gpu)?;
+        let up_dense = dense_auto(store, &format!("{p}.input_mix_weight_up.weight"), gpu)?;
+        let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
+        let quantize = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let stream = gpu.default_stream();
+        let r = config.residual_width();
+        let down = crate::weight_map::quantize_to_nvfp4_cached(
+            &down_dense,
+            config.hc_lowrank,
+            r,
+            gpu,
+            absmax,
+            quantize,
+            stream,
+            "qwen4.final_mixer.down.nvfp4",
+        )?;
+        let up = crate::weight_map::quantize_to_nvfp4_cached(
+            &up_dense,
+            r,
+            config.hc_lowrank,
+            gpu,
+            absmax,
+            quantize,
+            stream,
+            "qwen4.final_mixer.up.nvfp4",
+        )?;
+        Ok(Some(crate::layers::Qwen4HyperConnection::new(
+            norm,
+            down,
+            up,
+            None,
+            config.hidden_size,
+            config.hc_count,
+            config.hc_lowrank,
+            gpu,
+        )?))
+    }
+
     fn load_mtp_weights(
         &self,
         store: &WeightStore,
@@ -69,7 +154,15 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         gpu: &dyn GpuBackend,
     ) -> Result<Option<MtpWeights>> {
         if !store.contains("mtp.fc.weight") {
-            tracing::info!("No MTP weights found — speculative decoding disabled");
+            let qwen4_mtp_tensors =
+                config.is_qwen4_exp() && store.names().any(|name| name.starts_with("mtp."));
+            if qwen4_mtp_tensors {
+                tracing::info!(
+                    "Qwen4 MTP-prefixed tensors detected; exact packed/numbered schema admission is deferred to the factory"
+                );
+            } else {
+                tracing::info!("No MTP weights found — speculative decoding disabled");
+            }
             return Ok(None);
         }
         let variant = detect_nvfp4_variant(store, config);
@@ -98,7 +191,7 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<Option<crate::layers::VisionEncoder>> {
-        use crate::weight_map::dense_auto_fp8_or_bf16;
+        use crate::weight_map::dense_modelopt_mixed_or_fp8_or_bf16;
         let vcfg = match &config.vision {
             Some(v) => v.clone(),
             None => return Ok(None),
@@ -136,15 +229,39 @@ impl ModelWeightLoader for Qwen35WeightLoader {
             blocks.push(crate::layers::ViTBlock {
                 norm1_w: dense(store, &format!("{bp}.norm1.weight"))?.weight,
                 norm1_b: dense(store, &format!("{bp}.norm1.bias"))?.weight,
-                qkv_w: dense_auto_fp8_or_bf16(store, &format!("{bp}.attn.qkv"), gpu)?.weight,
+                qkv_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                    store,
+                    &format!("{bp}.attn.qkv"),
+                    config,
+                    gpu,
+                )?
+                .weight,
                 qkv_b: dense(store, &format!("{bp}.attn.qkv.bias"))?.weight,
-                proj_w: dense_auto_fp8_or_bf16(store, &format!("{bp}.attn.proj"), gpu)?.weight,
+                proj_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                    store,
+                    &format!("{bp}.attn.proj"),
+                    config,
+                    gpu,
+                )?
+                .weight,
                 proj_b: dense(store, &format!("{bp}.attn.proj.bias"))?.weight,
                 norm2_w: dense(store, &format!("{bp}.norm2.weight"))?.weight,
                 norm2_b: dense(store, &format!("{bp}.norm2.bias"))?.weight,
-                fc1_w: dense_auto_fp8_or_bf16(store, &format!("{bp}.mlp.linear_fc1"), gpu)?.weight,
+                fc1_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                    store,
+                    &format!("{bp}.mlp.linear_fc1"),
+                    config,
+                    gpu,
+                )?
+                .weight,
                 fc1_b: dense(store, &format!("{bp}.mlp.linear_fc1.bias"))?.weight,
-                fc2_w: dense_auto_fp8_or_bf16(store, &format!("{bp}.mlp.linear_fc2"), gpu)?.weight,
+                fc2_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                    store,
+                    &format!("{bp}.mlp.linear_fc2"),
+                    config,
+                    gpu,
+                )?
+                .weight,
                 fc2_b: dense(store, &format!("{bp}.mlp.linear_fc2.bias"))?.weight,
             });
         }
@@ -155,9 +272,21 @@ impl ModelWeightLoader for Qwen35WeightLoader {
             deepstack.push(crate::layers::MergerLayer {
                 norm_w: dense(store, &format!("{mp}.norm.weight"))?.weight,
                 norm_b: dense(store, &format!("{mp}.norm.bias"))?.weight,
-                fc1_w: dense_auto_fp8_or_bf16(store, &format!("{mp}.linear_fc1"), gpu)?.weight,
+                fc1_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                    store,
+                    &format!("{mp}.linear_fc1"),
+                    config,
+                    gpu,
+                )?
+                .weight,
                 fc1_b: dense(store, &format!("{mp}.linear_fc1.bias"))?.weight,
-                fc2_w: dense_auto_fp8_or_bf16(store, &format!("{mp}.linear_fc2"), gpu)?.weight,
+                fc2_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                    store,
+                    &format!("{mp}.linear_fc2"),
+                    config,
+                    gpu,
+                )?
+                .weight,
                 fc2_b: dense(store, &format!("{mp}.linear_fc2.bias"))?.weight,
             });
         }
@@ -166,9 +295,21 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         let merger = crate::layers::MergerLayer {
             norm_w: dense(store, &format!("{mp}.norm.weight"))?.weight,
             norm_b: dense(store, &format!("{mp}.norm.bias"))?.weight,
-            fc1_w: dense_auto_fp8_or_bf16(store, &format!("{mp}.linear_fc1"), gpu)?.weight,
+            fc1_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                store,
+                &format!("{mp}.linear_fc1"),
+                config,
+                gpu,
+            )?
+            .weight,
             fc1_b: dense(store, &format!("{mp}.linear_fc1.bias"))?.weight,
-            fc2_w: dense_auto_fp8_or_bf16(store, &format!("{mp}.linear_fc2"), gpu)?.weight,
+            fc2_w: dense_modelopt_mixed_or_fp8_or_bf16(
+                store,
+                &format!("{mp}.linear_fc2"),
+                config,
+                gpu,
+            )?
+            .weight,
             fc2_b: dense(store, &format!("{mp}.linear_fc2.bias"))?.weight,
         };
 

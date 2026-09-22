@@ -77,9 +77,33 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // No admission rule and no phase ordering moved. This hash exists so somebody
 // LOOKS when it breaks; updating it without the diff is how it becomes a
 // rubber stamp.
-const SERVE_LOAD_SHA256: &str = "f88c17367f80ef17f4ea4536f285bf560220fd8a5ee57564f561f76f80877255";
+// Re-pinned 2026-09-22 (FIFTH time) for integrate/all-models, which merges
+// integrate/phaseA-a1 (Qwen3.8-Flash-Next / qwen4_exp). phaseA's serve.rs
+// deltas were ported into `load_model`, in the same relative order phaseA had
+// them: qwen4 QSA/context checks + qwen4-only static YaRN right after
+// `load_model_config`; the qwen4 n-gram fail-closed gate after
+// `apply_model_default_num_drafts`; PLE manifest discovery and the
+// `--mtp-from-path` sidecar around `load_weight_store`; the DFlash donor store;
+// and the tool-call-parser resolution hoisted ABOVE the scheduler spawn.
+//
+// MACHINE-checked before re-pinning:
+//   * the guard block (`let context_extension =` .. `if let Some(extension) =`,
+//     end-exclusive) is byte-identical to feat/tui-port — sha256 9f6f8398
+//     238d7378bba46683d6d730876f627eeff99a3d95e2da77a45a62c5be on both sides;
+//   * the three anchors each appear exactly once and the guard precedes both;
+//   * the old file hashed to the old pin (f88c1736...), so the hasher agrees.
+// `git diff -U0` DOES match max_seq_len (4 lines) and ensure! (2 lines), all
+// inside new qwen4-only blocks: the qwen4 2048/QSA refusal, the qwen4 static
+// YaRN profile (sets yarn_* on qwen4_exp configs BEFORE the guard runs, as it
+// did in phaseA), and two ensure!s on the MTP sidecar flags. None of them
+// touches a non-qwen4 config, and no admission rule moved.
+const SERVE_LOAD_SHA256: &str = "a2078167147ca40340603c2cef9a5aac1c8c0374dcf9056120a7baba81b54ed0";
+// Re-pinned 2026-09-22 for integrate/all-models: the ONLY change is the
+// `weights::{..}` re-export gaining `load_dflash_donor` (phaseA-a1's DFlash
+// donor loader, now called from `load_model`), rustfmt-wrapped onto three
+// lines. `git diff feat/tui-port` over this file is exactly that one hunk.
 const SERVE_PHASES_SHA256: &str =
-    "e3e84d068c761ff43ad49a04c67d3cd37a8107f99110c919bd016832219c9f1e";
+    "b77f0fd7fadba6843533613071531530322869161cb6e69710dc0e6ea01206c1";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
 
 const INITIAL: [u32; 8] = [

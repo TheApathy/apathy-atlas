@@ -108,7 +108,7 @@ impl TransformerModel {
         // instead of cuMemFree avoids the ~200-950 ms UMA first-touch
         // page-fault cost of re-allocating it on the next request. The
         // smaller fc/K/V caches are still freed normally.
-        crate::layers::dflash_head::ctx_acc_pool_return(ds.ctx_alloc_bytes, ds.ctx_hidden_acc);
+        crate::layers::dflash_head::ctx_acc_pool_return(ds.ctx_allocation_bytes, ds.ctx_hidden_acc);
         ds.ctx_hidden_acc = spark_runtime::gpu::DevicePtr(0);
         let mut ptrs: Vec<spark_runtime::gpu::DevicePtr> = vec![ds.ctx_fc_cache];
         ptrs.append(&mut ds.ctx_k_cache);

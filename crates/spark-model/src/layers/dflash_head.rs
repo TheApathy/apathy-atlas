@@ -28,9 +28,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle, PinnedHostBuffer};
 use crate::speculative::{DraftProposer, ProposerState};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 
-/// Cross-request pool for the (multi-GB) per-sequence `ctx_hidden_acc`
-/// accumulator. Allocating it fresh per request (up to 5.37 GB at
-/// max_seq_len=65536) costs 200-950 ms of UMA first-touch page faults on
+/// Cross-request pool for the bounded per-sequence `ctx_hidden_acc`
+/// accumulator. Allocating it fresh per request costs UMA first-touch faults on
 /// every request — measured 623/952/188 ms in the 2026-08-19 alloc split
 /// vs 28 ms for the memset. Pooling the allocation across requests removes
 /// that from TTFT while the per-request memset keeps stale-slot semantics
@@ -460,21 +459,23 @@ pub struct DflashProposerState {
     pub last_num_drafted: usize,
     /// Immutable limits from the most recent outer `propose` call.
     pub draft_budget: Option<draft_budget::DflashDraftBudget>,
-    /// Multi-token accumulator for captured target hidden states. Layout:
-    /// `[ctx_capacity, 5 * target_hidden]` BF16 packed as a circular buffer.
-    /// Absolute logical position `p` resides in physical slot
-    /// `p % ctx_capacity`; only the latest `ctx_capacity` positions are valid.
+    /// Multi-token accumulator for captured target hidden states. Physical
+    /// layout: `[ctx_capacity, captures * target_hidden]` BF16 packed. The scheduler appends
+    /// the model's `dflash_hidden_save` (latest decoded position's 5 hiddens)
+    /// into physical slot `ctx_len % ctx_capacity` after each successful verify. `propose()` reads
+    /// the latest resident window and projects it through `fc` at forward
+    /// time. Absolute positions wrap only at the physical-storage boundary.
     pub ctx_hidden_acc: DevicePtr,
-    /// Absolute logical end of the populated range. Capped at `max_ctx_len`;
-    /// the number of physically retained slots is at most `ctx_capacity`.
+    /// Absolute one-past-last captured target position. It never wraps.
     pub ctx_len: usize,
-    /// Logical context ceiling. Mirrors the `max_seq_len` build argument.
-    pub max_ctx_len: usize,
-    /// Physical slot count allocated for `ctx_hidden_acc`. This is bounded by
-    /// the drafter's local context window rather than the model's full context.
+    /// Number of latest absolute positions currently resident in the ring.
+    pub ctx_resident_len: usize,
+    /// Physical slot count allocated for `ctx_hidden_acc`.
     pub ctx_capacity: usize,
-    /// Exact allocation size used by the accumulator pool.
-    pub ctx_alloc_bytes: usize,
+    /// Exact pool/allocation key for `ctx_hidden_acc`.
+    pub ctx_allocation_bytes: usize,
+    /// Absolute context limit from the model build.
+    pub max_ctx_len: usize,
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
@@ -676,6 +677,27 @@ pub struct DflashProposerState {
     /// real drafts are collected via `collect_async_drafts` at the top of
     /// the next scheduler step. Cleared on collect / resolve.
     pub async_placeholder: bool,
+}
+
+impl DflashProposerState {
+    pub(crate) fn ctx_ring_state(&self) -> Result<ring_window::RingState> {
+        Ok(ring_window::RingState::from_lengths(
+            self.max_ctx_len,
+            self.ctx_capacity,
+            self.ctx_len,
+            self.ctx_resident_len,
+        )?)
+    }
+
+    pub(crate) fn apply_ctx_ring_state(&mut self, state: ring_window::RingState) -> Result<()> {
+        anyhow::ensure!(
+            state.max_context == self.max_ctx_len && state.capacity == self.ctx_capacity,
+            "DFlash ring state geometry changed while applying an update"
+        );
+        self.ctx_len = state.absolute_len;
+        self.ctx_resident_len = state.resident_len;
+        Ok(())
+    }
 }
 
 impl ProposerState for DflashProposerState {
@@ -981,36 +1003,16 @@ impl BlockDiffusionDraftHead {
         if write_count == 0 {
             return Ok((cache_start, cache_end));
         }
-        let write_end = write_start + write_count;
-        let first_wrap = ((write_start / window) + 1) * window;
-        if first_wrap >= write_end {
-            // No wrap.
-            let src_offset = 0usize;
-            let dst_offset = (write_start % window) * slot_bytes;
+        let write_end = write_start
+            .checked_add(write_count)
+            .ok_or_else(|| anyhow::anyhow!("DFlash cache write end overflowed"))?;
+        let plan =
+            ring_window::plan_write_chunk(write_start, write_count, write_end.max(window), window)?;
+        for span in plan.spans() {
             gpu.copy_d2d_async(
-                src.offset(src_offset),
-                cache.offset(dst_offset),
-                write_count * slot_bytes,
-                stream,
-            )?;
-        } else {
-            // Wrap.
-            let count1 = first_wrap - write_start;
-            let src1 = 0usize;
-            let dst1 = (write_start % window) * slot_bytes;
-            gpu.copy_d2d_async(
-                src.offset(src1),
-                cache.offset(dst1),
-                count1 * slot_bytes,
-                stream,
-            )?;
-            let count2 = write_end - first_wrap;
-            let src2 = count1 * slot_bytes;
-            let dst2 = 0usize;
-            gpu.copy_d2d_async(
-                src.offset(src2),
-                cache.offset(dst2),
-                count2 * slot_bytes,
+                src.offset(span.linear_slot * slot_bytes),
+                cache.offset(span.physical_slot * slot_bytes),
+                span.slot_count * slot_bytes,
                 stream,
             )?;
         }
@@ -1172,20 +1174,30 @@ impl DraftProposer for BlockDiffusionDraftHead {
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        // The drafter attends only its latest `ctx_window` target captures, so
-        // retaining all `max_seq_len` captures is wasteful and makes a 1M
-        // context request allocate tens of GiB. Keep absolute logical
-        // positions in state while storing only the latest local window.
-        let bf16 = 2usize;
-        let ctx_layout = ring_window::plan_accumulator_layout(
+        anyhow::ensure!(
+            self.max_seq_len <= ring_window::MAX_ABSOLUTE_CONTEXT,
+            "DFlash absolute context {} exceeds the checked ring limit {}",
             self.max_seq_len,
+            ring_window::MAX_ABSOLUTE_CONTEXT,
+        );
+        anyhow::ensure!(
+            self.ctx_window <= ring_window::NATIVE_V3_RING_SLOTS,
+            "DFlash requested context window {} exceeds the qualified resident ring capacity {}",
             self.ctx_window,
+            ring_window::NATIVE_V3_RING_SLOTS,
+        );
+        let bf16 = 2usize;
+        let native_v3_geometry = self.target_layer_ids.len() == ring_window::NATIVE_V3_CAPTURE_TAPS
+            && self.target_hidden_size == ring_window::NATIVE_V3_HIDDEN_SIZE;
+        let layout: ring_window::AccumulatorLayout = ring_window::plan_accumulator_layout(
+            self.max_seq_len,
+            ring_window::NATIVE_V3_RING_SLOTS,
             self.target_layer_ids.len(),
             self.target_hidden_size,
         )?;
-        let ctx_slot_bytes = ctx_layout.slot_bytes;
-        let ctx_capacity = ctx_layout.capacity;
-        let total = ctx_layout.allocation_bytes;
+        let initial_ring = ring_window::RingState::new(self.max_seq_len, layout.capacity)?;
+        let ctx_slot_bytes = layout.slot_bytes;
+        let total = layout.allocation_bytes;
         let alloc_t0 = std::time::Instant::now();
         // Reuse a pooled buffer when one is idle (see `ctx_acc_pool`): a
         // fresh cuMemAlloc of this size page-faults ~200-950 ms per request
@@ -1210,6 +1222,14 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 memset_us / 1000.0,
             );
         }
+        tracing::warn!(
+            "DFlash bounded target-hidden ring: native_v3_geometry={} absolute_limit={} resident_slots={} resident_bytes={} active_attention_window={}. The drafter sees only the latest resident window; training and acceptance qualification must use this same bounded 4096-slot contract.",
+            native_v3_geometry,
+            self.max_seq_len,
+            layout.capacity,
+            total,
+            self.ctx_window,
+        );
         // Allocate per-sequence persistent context caches.
         // These eliminate O(seq_len) recomputation of fc_proj and k_proj/v_proj
         // for previously-seen context positions.
@@ -1236,10 +1256,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
             last_num_drafted: 0,
             draft_budget: None,
             ctx_hidden_acc,
-            ctx_len: 0,
+            ctx_len: initial_ring.absolute_len,
+            ctx_resident_len: initial_ring.resident_len,
+            ctx_capacity: layout.capacity,
+            ctx_allocation_bytes: total,
             max_ctx_len: self.max_seq_len,
-            ctx_capacity,
-            ctx_alloc_bytes: total,
             ctx_slot_bytes,
             last_capture_idx: 0,
             last_num_accepted: 0,
@@ -1488,5 +1509,45 @@ mod draft_kv_storage_contract_tests {
         assert!(layer.contains("cache_write_range("));
         assert!(layer.contains("ops::prefill_attention("));
         assert!(!layer.contains(concat!("prefill_attention", "_paged")));
+    }
+
+    #[test]
+    fn bounded_hidden_ring_is_wired_through_all_production_boundaries() {
+        let head = include_str!("dflash_head.rs");
+        let prefill = include_str!("../model/impl_b3.rs");
+        let propose = include_str!("dflash_head/propose.rs");
+        let forward = include_str!("dflash_head/forward_block.rs");
+        let lifecycle = include_str!("../model/trait_impl/sequence.rs");
+
+        for required in [
+            "plan_accumulator_layout(",
+            "ctx_resident_len",
+            "ctx_capacity",
+            "ctx_allocation_bytes",
+        ] {
+            assert!(head.contains(required), "head is missing `{required}`");
+        }
+        assert!(prefill.matches(".plan_append_at(").count() >= 3);
+        assert!(prefill.contains(".plan_gather("));
+        assert!(propose.contains(".plan_append_at("));
+        assert!(propose.contains(".physical_slot_for("));
+        assert!(forward.matches(".plan_gather(").count() >= 2);
+        assert!(forward.contains(".slot_for("));
+        assert!(lifecycle.contains("ds.ctx_allocation_bytes"));
+
+        for forbidden in [
+            concat!("ctx_hidden_acc.offset(abs_pos", " * slot_bytes)"),
+            concat!("base.offset(old_fc_end", " * ctx_slot_bytes)"),
+            concat!("ds.max_ctx_len", " * ds.ctx_slot_bytes"),
+        ] {
+            assert!(
+                !head.contains(forbidden)
+                    && !prefill.contains(forbidden)
+                    && !propose.contains(forbidden)
+                    && !forward.contains(forbidden)
+                    && !lifecycle.contains(forbidden),
+                "absolute/nonresident ring access returned: `{forbidden}`"
+            );
+        }
     }
 }

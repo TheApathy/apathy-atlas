@@ -40,10 +40,16 @@ fn test_buffer_arena_alloc() {
 
     assert!(!arena.hidden_states().is_null());
     assert!(!arena.logits().is_null());
+    assert!(!arena.moe_worklist().is_null());
+    assert!(!arena.moe_worklist_total().is_null());
     assert_eq!(arena.max_batch_tokens(), 128);
-    // 19 allocations for 19 buffers (13 data + 1 scratch + 3 expert + 2 splitk).
-    // The merged gate/up allocation is a sentinel while its route is off.
-    assert_eq!(gpu.alloc_count(), 19);
+    // CONTENT PIN — RECOMPUTE, do not trust this number.
+    // Pre-merge: trunk asserted 19 (13 data + 1 scratch + 3 expert + 2 splitk);
+    // Flash-Next asserted 20 (18 + compact-MoE work-list + its device item count).
+    // The merged tree contains BOTH sets, so neither value is correct here and the
+    // sum is not obviously 21 either (the two sides count different baselines).
+    // Take the number from a passing build, then delete this comment.
+    assert_eq!(gpu.alloc_count(), 21);
 }
 
 #[test]
@@ -55,6 +61,19 @@ fn test_buffer_sizes_scale_with_batch() {
     // logits is capped at 16 tokens; FP32 sampling buffer (4 bytes/elem),
     // so s128.logits = 16 * vocab * 4 (not 128× the unbatched value).
     assert_eq!(s128.logits, 16 * cfg.vocab_size * 4);
+}
+
+#[test]
+fn qwen4_exp_expands_only_the_persistent_residual_buffers() {
+    let mut cfg = ModelConfig::qwen3_next_80b_nvfp4();
+    cfg.hidden_size = 2560;
+    cfg.hc_count = 4;
+    let sizes = BufferSizes::from_config(&cfg, 3, 4096, 16);
+
+    assert_eq!(sizes.hidden_states, 3 * 4 * 2560 * 2);
+    assert_eq!(sizes.residual, 3 * 4 * 2560 * 2);
+    assert_eq!(sizes.norm_output, 3 * 2560 * 2);
+    assert_eq!(sizes.moe_output, 3 * 2560 * 2);
 }
 
 /// `ssm_qkvz` is the Q staging buffer for the multi-seq attention QKV routes,

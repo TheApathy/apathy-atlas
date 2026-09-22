@@ -75,6 +75,186 @@ pub(super) fn fp8_gpu_dequant_args(
     ))
 }
 
+/// Decode an OCP E8M0 scale byte into its exact Float32 power of two.
+/// Encoding 255 is the sole NaN value and is rejected rather than allowed to
+/// contaminate every element in its 32-value microscaling block.
+#[cfg(test)]
+pub(super) fn mxfp8_e8m0_scale(exponent: u8) -> Result<f32> {
+    ensure!(exponent != u8::MAX, "MXFP8 E8M0 scale is NaN (255)");
+    let bits = if exponent == 0 {
+        // 2^-127 is a Float32 subnormal. A raw exponent field of zero with a
+        // zero mantissa would instead encode zero.
+        1u32 << 22
+    } else {
+        u32::from(exponent) << 23
+    };
+    Ok(f32::from_bits(bits))
+}
+
+/// Scalar reference for the exact MXFP8 dequant equation used by CUDA.
+#[cfg(test)]
+pub(super) fn mxfp8_e4m3_e8m0_to_f32(value: u8, exponent: u8) -> Result<f32> {
+    Ok(fp8_e4m3_to_f32(value) * mxfp8_e8m0_scale(exponent)?)
+}
+
+/// Validate Mia/ModelOpt's rowwise MXFP8 storage and narrow launch arguments.
+pub(super) fn mxfp8_gpu_dequant_args(
+    weight_shape: &[usize],
+    weight_dtype: WeightDtype,
+    scale_shape: &[usize],
+    scale_dtype: WeightDtype,
+) -> Result<(u32, u32, u32)> {
+    ensure!(
+        weight_dtype == WeightDtype::FP8E4M3,
+        "MXFP8 weight must be F8_E4M3, got {weight_dtype:?}"
+    );
+    ensure!(
+        scale_dtype == WeightDtype::UInt8,
+        "MXFP8 scale must be U8 E8M0, got {scale_dtype:?}"
+    );
+    let [n, k] = weight_shape else {
+        bail!("MXFP8 weight must be 2-D [N,K], got {weight_shape:?}");
+    };
+    ensure!(*n > 0 && *k > 0, "MXFP8 weight dimensions must be non-zero");
+    ensure!(
+        k.is_multiple_of(32),
+        "MXFP8 K must be divisible by group size 32, got {k}"
+    );
+    let expected_scale = [*n, *k / 32];
+    ensure!(
+        scale_shape == expected_scale,
+        "MXFP8 scale shape must be {expected_scale:?}, got {scale_shape:?}"
+    );
+    Ok((
+        u32::try_from(*n).context("MXFP8 weight row count exceeds u32")?,
+        u32::try_from(*k).context("MXFP8 weight column count exceeds u32")?,
+        u32::try_from(expected_scale[1]).context("MXFP8 scale column count exceeds u32")?,
+    ))
+}
+
+/// Dequantize ModelOpt MXFP8 (`F8_E4M3` values + rowwise `U8` E8M0
+/// group-32 scales) into a temporary BF16 matrix on the GPU.
+pub(crate) fn dequant_mxfp8_to_bf16(
+    store: &WeightStore,
+    prefix: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    let weight_key = format!("{prefix}.weight");
+    let scale_key = format!("{prefix}.weight_scale");
+    let weight = store.get(&weight_key)?;
+    let scale = store.get(&scale_key)?;
+    let (n, k, scale_cols) =
+        mxfp8_gpu_dequant_args(&weight.shape, weight.dtype, &scale.shape, scale.dtype)?;
+
+    // Validate the only reserved E8M0 encoding before allocating output or
+    // launching. The scale tensor is 1/32 the weight size.
+    let mut scale_bytes = vec![0u8; scale.byte_size()];
+    gpu.copy_d2h(scale.ptr, &mut scale_bytes)
+        .with_context(|| format!("failed to validate MXFP8 scales for {prefix}"))?;
+    ensure!(
+        !scale_bytes.contains(&u8::MAX),
+        "MXFP8 tensor {prefix} contains reserved E8M0 NaN scale 255"
+    );
+
+    let elements = usize::try_from(n)?
+        .checked_mul(usize::try_from(k)?)
+        .context("MXFP8 element count overflows usize")?;
+    let output_bytes = elements
+        .checked_mul(2)
+        .context("MXFP8 BF16 output size overflows usize")?;
+    let kernel = gpu
+        .kernel("dequant_mxfp8_bf16", "dequant_mxfp8_bf16")
+        .context("native MXFP8 dequant kernel is unavailable")?;
+    let output = gpu.alloc(output_bytes)?;
+    let stream = gpu.default_stream();
+    use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+    let launched = KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(k, 64), div_ceil(n, 4), 1])
+        .block([64, 4, 1])
+        .arg_ptr(weight.ptr)
+        .arg_ptr(scale.ptr)
+        .arg_ptr(output)
+        .arg_u32(n)
+        .arg_u32(k)
+        .arg_u32(scale_cols)
+        .launch(stream)
+        .and_then(|()| gpu.synchronize(stream));
+    if let Err(error) = launched {
+        let _ = gpu.free(output);
+        return Err(error).with_context(|| format!("MXFP8 dequant failed for {prefix}"));
+    }
+    Ok(DenseWeight { weight: output })
+}
+
+/// Load one explicitly classified ModelOpt mixed-precision matrix as BF16.
+/// Unclassified matrices retain the established BF16/block-FP8 behavior.
+pub(crate) fn dense_modelopt_mixed_or_fp8_or_bf16(
+    store: &WeightStore,
+    prefix: &str,
+    config: &atlas_core::config::ModelConfig,
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    let declared = config
+        .quantization_config
+        .as_ref()
+        .and_then(|quant| quant.modelopt_weight_format_for(prefix));
+    match declared {
+        Some(atlas_core::config::ModelOptWeightFormat::Mxfp8) => {
+            dequant_mxfp8_to_bf16(store, prefix, gpu)
+        }
+        Some(atlas_core::config::ModelOptWeightFormat::Nvfp4) => {
+            let weight = store.get(&format!("{prefix}.weight"))?;
+            ensure!(
+                weight.dtype == WeightDtype::UInt8 && weight.shape.len() == 2,
+                "declared NVFP4 tensor {prefix}.weight must be packed U8 [N,K/2], got {:?} {:?}",
+                weight.dtype,
+                weight.shape
+            );
+            let n = weight.shape[0];
+            let k = weight.shape[1]
+                .checked_mul(2)
+                .context("declared NVFP4 logical K overflows usize")?;
+            dequant_nvfp4_to_bf16(store, prefix, n, k, gpu)
+        }
+        None => dense_auto_fp8_or_bf16(store, prefix, gpu),
+    }
+}
+
+/// Load a mixed ModelOpt matrix into Atlas's NVFP4 hot-path representation.
+/// MXFP8 is dequantized exactly to BF16 first, then passed through the same
+/// runtime NVFP4 quantizer used by established BF16 checkpoints.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn quantized_modelopt_mixed(
+    store: &WeightStore,
+    prefix: &str,
+    n: usize,
+    k: usize,
+    config: &atlas_core::config::ModelConfig,
+    variant: Nvfp4Variant,
+    gpu: &dyn GpuBackend,
+    absmax_kernel: spark_runtime::gpu::KernelHandle,
+    quantize_kernel: spark_runtime::gpu::KernelHandle,
+    stream: u64,
+) -> Result<QuantizedWeight> {
+    let declared = config
+        .quantization_config
+        .as_ref()
+        .and_then(|quant| quant.modelopt_weight_format_for(prefix));
+    if declared == Some(atlas_core::config::ModelOptWeightFormat::Mxfp8) {
+        let source = store.get(&format!("{prefix}.weight"))?;
+        ensure!(
+            source.shape == [n, k],
+            "declared MXFP8 tensor {prefix}.weight must have shape [{n},{k}], got {:?}",
+            source.shape
+        );
+        let bf16 = dequant_mxfp8_to_bf16(store, prefix, gpu)?;
+        let quantized = quantize_to_nvfp4(&bf16, n, k, gpu, absmax_kernel, quantize_kernel, stream);
+        gpu.free(bf16.weight)?;
+        return quantized;
+    }
+    quantized_auto(store, prefix, gpu, variant)
+}
+
 /// Dequantize FP8 E4M3 block/per-row/per-tensor-scaled weight → BF16.
 ///
 /// Block-scaled FP8 (e.g. `quant_method: "fp8"` with `weight_block_size: [128, 128]`):

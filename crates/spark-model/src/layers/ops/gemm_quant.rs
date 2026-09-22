@@ -450,3 +450,90 @@ pub fn transpose_block_scale(
 //
 // These wrappers select the correct kernel based on the QuantWeight
 // variant. Adding a new quant format requires only a new match arm here.
+
+/// Cast `n_elems` BF16 activations to e4m3 bytes using exactly the conversion
+/// the prefill MMAs perform internally (`cvt.f32.bf16` then
+/// `cvt.rn.satfinite.e4m3x2.f32`, no scaling). `n_elems` must be a multiple of 4.
+///
+/// This exists so a library GEMM can be handed the identical operands the
+/// hand-written kernels already feed to `mma.sync...e4m3.e4m3`.
+pub fn cast_bf16_to_e4m3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    output: DevicePtr,
+    n_elems: u64,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        n_elems % 4 == 0,
+        "cast_bf16_to_e4m3 requires a multiple of 4 elements, got {n_elems}"
+    );
+    let groups = n_elems / 4;
+    let blocks = groups.div_ceil(256).min(4096) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([blocks.max(1), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(input)
+        .arg_ptr(output)
+        .arg_u64(groups)
+        .launch(stream)
+}
+
+/// One-time materialisation of NVFP4 weights as the exact e4m3 bytes the
+/// W4A16 prefill MMA would have produced, laid out `[N, K]` row-major for a
+/// cuBLASLt TN FP8 GEMM. Grid is (N/128, K/32); block 128.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_nvfp4_to_e4m3(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(n % 128 == 0, "dequant_nvfp4_to_e4m3 needs N % 128 == 0, got {n}");
+    anyhow::ensure!(k % 32 == 0, "dequant_nvfp4_to_e4m3 needs K % 32 == 0, got {k}");
+    KernelLaunch::new(gpu, kernel)
+        .grid([n / 128, k / 32, 1])
+        .block([128, 1, 1])
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_ptr(out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// One-time materialisation of NVFP4 attention weights as the exact BF16 the
+/// W4A16 prefill kernel builds internally, laid out `[N, K]` row-major for a
+/// cuBLASLt TN BF16 GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_nvfp4_to_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    b_packed: DevicePtr,
+    b_scale: DevicePtr,
+    out: DevicePtr,
+    scale2: f32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(k % 16 == 0, "dequant_nvfp4_to_bf16 needs K % 16 == 0, got {k}");
+    let groups = (n as u64 * (k as u64 / 2)).div_ceil(256).min(8192) as u32;
+    KernelLaunch::new(gpu, kernel)
+        .grid([groups.max(1), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(b_packed)
+        .arg_ptr(b_scale)
+        .arg_ptr(out)
+        .arg_f32(scale2)
+        .arg_u32(n)
+        .arg_u32(k)
+        .launch(stream)
+}

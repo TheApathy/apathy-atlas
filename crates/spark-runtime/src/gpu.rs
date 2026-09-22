@@ -196,6 +196,12 @@ impl<'a> PinnedHostSlice<'a> {
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
 pub trait GpuBackend: Send + Sync {
+    /// Stable identity of the exact backend implementation and loaded kernel
+    /// byte stream. Persistent transform caches must fail closed when absent.
+    fn transform_cache_identity(&self) -> Option<&str> {
+        None
+    }
+
     /// Allocate `bytes` of device memory.
     fn alloc(&self, bytes: usize) -> Result<DevicePtr>;
 

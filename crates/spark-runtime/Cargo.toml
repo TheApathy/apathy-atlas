@@ -100,6 +100,7 @@ objc2-foundation = { version = "0.3", optional = true, features = [
 # byte container), not an `NSData`. dispatch2 ships the wrapper.
 dispatch2 = { version = "0.3", optional = true }
 anyhow = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 safetensors = "0.7"

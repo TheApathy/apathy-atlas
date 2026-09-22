@@ -113,6 +113,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cudarc",
+ "ring",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2362,6 +2363,7 @@ dependencies = [
  "image",
  "memmap2",
  "parking_lot",
+ "ring",
  "safetensors",
  "serde",
  "serde_json",
@@ -2389,6 +2391,7 @@ dependencies = [
  "objc2-metal",
  "parking_lot",
  "rand 0.8.6",
+ "ring",
  "safetensors",
  "serde",
  "serde_json",

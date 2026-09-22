@@ -29,10 +29,15 @@ mod tests {
 
     #[test]
     fn yarn_images_are_rejected_before_message_preprocessing() {
+        // The YaRN image rejection lives in `image_admission::validate`, which
+        // takes `state.yarn_context` and runs before message preprocessing.
         let chat = include_str!("chat/mod.rs");
-        let reject = chat.find("if state.yarn_context").unwrap();
+        let admission = include_str!("chat/image_admission.rs");
+        let reject = chat.find("image_admission::validate(").unwrap();
+        let yarn_arg = chat[reject..].find("state.yarn_context").unwrap() + reject;
         let preprocess = chat.find("msg_entry::build_msg_entries").unwrap();
-        assert!(reject < preprocess);
-        assert!(chat.contains("unsupported_multimodal_context"));
+        assert!(reject < yarn_arg && yarn_arg < preprocess);
+        assert!(admission.contains("if yarn_context"));
+        assert!(admission.contains("unsupported_multimodal_context"));
     }
 }

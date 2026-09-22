@@ -6,8 +6,8 @@
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 
-use crate::layers::FfnComponent;
 use crate::layers::fp8_calibration::Fp8KvCalibration;
+use crate::layers::{FfnComponent, Qwen4HyperConnection, Qwen4QsaIndexer};
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
 
 use super::yarn::YarnRopeParams;
@@ -67,6 +67,13 @@ pub struct Qwen3AttentionLayer {
     pub(crate) attn: AttentionWeights,
     pub(super) post_attn_norm: DenseWeight,
     pub(super) ffn: FfnComponent,
+    /// Qwen4-Exp replaces the ordinary residual additions with gated
+    /// four-stream mixers around attention and the FFN.
+    pub(super) qwen4_attn_hyper: Option<Qwen4HyperConnection>,
+    pub(super) qwen4_mlp_hyper: Option<Qwen4HyperConnection>,
+    /// Qwen sparse-attention index branch. Present only when explicitly
+    /// enabled for long-context Qwen4 serving.
+    pub(super) qwen4_qsa: Option<Qwen4QsaIndexer>,
     pub(super) attn_layer_idx: usize,
     /// Whether Q projection includes an output gate (Q+Gate interleaved).
     /// When true, q_proj output is 2× q_dim; attn output is gated by sigmoid.
@@ -176,6 +183,9 @@ pub struct Qwen3AttentionLayer {
     pub(super) rope_strided_b3_k: KernelHandle,
     /// YaRN RoPE kernel using pre-computed inv_freq table (Mistral, etc.)
     pub(super) rope_yarn_k: KernelHandle,
+    pub(super) rope_yarn_scaled_k: KernelHandle,
+    pub(super) qwen4_yarn_inv_freq: DevicePtr,
+    pub(super) qwen4_yarn_attention_factor: f32,
     /// Proportional RoPE kernel (Gemma-4 full-attention layers).
     pub(super) rope_proportional_k: KernelHandle,
     pub(super) reshape_cache_k: KernelHandle,
@@ -302,6 +312,18 @@ pub struct Qwen3AttentionLayer {
     /// kernel is latency-bound at small M (~21 GB/s), the pipe lands near the
     /// decode kernels' ~190 GB/s. Handle 0 falls back to the baseline.
     pub(super) w4a16_gemm_pipe_k: KernelHandle,
+    /// Byte-exact 128x128-tile shadow of `w4a16_gemm` for large-M prefill
+    /// (`ATLAS_PREFILL_PROJ_PIPE_M128=1`). Handle 0 = not in this bundle.
+    pub(super) w4a16_gemm_pipe_m128n128_k: KernelHandle,
+    /// NVFP4 -> BF16 weight materialisation for the cuBLASLt attention route.
+    pub(super) dequant_nvfp4_to_bf16_k: KernelHandle,
+    /// Lazily materialised BF16 copies of this layer's NVFP4 projection
+    /// weights, keyed by the packed-weight device pointer (QKV and O are
+    /// distinct weights within a layer). ~189 MiB per layer at production size.
+    pub(super) bf16_weight_cache: std::sync::Mutex<std::collections::HashMap<u64, DevicePtr>>,
+    /// 8-warp 128x128 bit-identical shadows of the FP8-MMA transposed GEMMs.
+    pub(super) w4a16_gemm_t_w8_k: KernelHandle,
+    pub(super) fp8_gemm_t_w8_k: KernelHandle,
     /// Exact dual original-layout pipe kernel. The opt-in large-M prefill path
     /// uses it to project K and V from one A load while preserving two BF16
     /// outputs. Missing symbols fail the explicit route closed.

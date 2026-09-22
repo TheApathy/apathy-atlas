@@ -163,6 +163,9 @@ pub struct TransformerModel {
     pub tree_kv_pack_active: bool,
     pub(super) embed_tokens: DenseWeight,
     pub(super) final_norm: DenseWeight,
+    pub(super) qwen4_final_mixer: Option<crate::layers::Qwen4HyperConnection>,
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub(super) qwen4_ple: Option<crate::layers::Qwen4PleLayer>,
     pub(super) lm_head_weight: DenseWeight,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// Transposed NVFP4 lm_head shared with the DFlash drafter propose path.
@@ -184,6 +187,30 @@ pub struct TransformerModel {
     pub(super) pinned_staging: std::cell::UnsafeCell<PinnedMetaStaging>,
     pub(super) gpu: Box<dyn GpuBackend>,
     pub(super) rms_norm_kernel: KernelHandle,
+    /// Byte-exact strided row copy (`strided_copy_rows_16`); 0 when absent.
+    ///
+    /// UNREACHABLE since the phaseA-a1 merge: the DFlash prefill capture in
+    /// `impl_b3.rs` was rewritten around `DflashCaptureMode` + the bounded ring
+    /// (`plan_append_at`), which replaced the strided fast path that was this
+    /// field's only reader. It is still initialised in `impl_a1.rs`, so the
+    /// `allow` below is what keeps `deny(warnings)` from failing the build.
+    ///
+    /// This is a KNOWN REGRESSION, not dead weight. The dropped path was worth
+    /// a measured, BIT-IDENTICAL +3.8% in the `SSM_RESET_ASYNC +
+    /// DFLASH_CAPTURE_STRIDED` glue arm (1563.5 -> 1506.9 ms, 1309.9 -> 1359.1
+    /// tok/s; RUST_PREFILL_REPORTS/qwen27b.md:207) and is part of the chain
+    /// reaching the banked 1773.0 — the two flags were measured together, so
+    /// the strided path alone is not separately attributed.
+    ///
+    /// Restoring it is NOT a revert. It needs a per-span strided copy keyed off
+    /// `append.write.spans()` with `src_stride = source_stride * bf16` (the
+    /// source stride now varies by capture mode), and it must still satisfy the
+    /// per-row `dst_offset / ctx_slot_bytes == physical_slot` assert that the
+    /// rewrite added and a bulk copy cannot express. The two sides also diverge
+    /// past `max_ctx`: the old path `break`s, the new one errors via
+    /// `plan_append_at`. Needs a GPU A/B before it goes back.
+    #[allow(dead_code)]
+    pub(super) strided_copy_rows_kernel: KernelHandle,
     pub(super) bf16_to_f32_kernel: KernelHandle,
     pub(super) dense_gemv_kernel: KernelHandle,
     /// FP32-output variant of dense_gemv_bf16. Used by the LM head when
@@ -328,6 +355,13 @@ pub struct TransformerModel {
     /// Layer indices to capture for DFlash. Empty when DFlash is disabled.
     /// Sourced from drafter's `dflash_config.target_layer_ids` at model build.
     pub(super) dflash_capture_layers: Vec<usize>,
+    /// Width and source offset for each captured DFlash slice. Ordinary
+    /// targets use the entire residual row; compatibility bridges may expose
+    /// a narrower explicit slice.
+    pub(super) dflash_capture_width: usize,
+    pub(super) dflash_capture_offset: usize,
+    /// Target-side transform selected after validating the drafter pairing.
+    pub(super) dflash_capture_mode: atlas_core::config::DflashCaptureMode,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for
@@ -366,7 +400,7 @@ pub struct TransformerModel {
     pub(super) last_mtp_hidden_idx: std::sync::atomic::AtomicUsize,
     /// Optional vision encoder for VL models (Qwen3-VL).
     pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
-    /// C1-only owned final-merger aggregate, coherent grids and full-input cache key.
+    /// C1-only owned final-merger aggregate, coherent grids and exact input cache key.
     /// Encoder scratch and DeepStack rows are never consumed as image tokens.
     pub(super) vision_embeddings: Mutex<super::vision_embeddings::VisionEmbeddingState>,
     /// Save SSM snapshots every N blocks during chunked prefill.

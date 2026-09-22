@@ -12,6 +12,7 @@ use super::dflash_loader::DflashConfig;
 
 mod config;
 mod qwen38_dflash2;
+mod native_flash_next;
 
 #[derive(Clone, Copy)]
 struct TensorMetadata<'a> {
@@ -41,7 +42,21 @@ pub(super) fn validate_dflash_store(
     store: &WeightStore,
     config: &DflashConfig,
 ) -> Result<Option<&'static str>> {
+    // WeightStore exposes only GPU pointers plus structural metadata. This
+    // proves BF16 dtype, exact names/shapes/count, and parameter cardinality;
+    // it cannot prove numerical finiteness. Native promotion must separately
+    // carry the pre-upload safetensor finiteness receipt.
     validate_dflash_metadata(store, config)
+}
+
+pub(super) fn validate_native_flash_next_config(config: &DflashConfig) -> Result<()> {
+    native_flash_next::validate_config_if_candidate(config)
+}
+
+pub(super) fn native_flash_next_finiteness_manifest(
+    config: &DflashConfig,
+) -> Result<Option<std::collections::BTreeMap<String, Vec<usize>>>> {
+    native_flash_next::finiteness_manifest_if_candidate(config)
 }
 
 fn validate_dflash_metadata(
@@ -64,8 +79,24 @@ fn validate_dflash_metadata(
         (false, false) => return Ok(None),
     };
 
-    let strict_qwen38_dflash2 =
-        config::declares_qwen38_dflash2(config) || qwen38_dflash2::has_tensor_signature(source);
+    // THE SPECIFIC DISCRIMINATOR WINS OVER THE BROAD ONE.
+    //
+    // Flash-Next's DFlash2 also declares `DFlash2DraftModel` and sets the same
+    // conv/selector geometry fields, so `declares_qwen38_dflash2` — which is an
+    // OR over exactly those two signals — matches it too. Strict admission then
+    // demanded 5120/17408/5 of a drafter that is 2560-wide by design, and
+    // refused a checkpoint it was never written to judge.
+    //
+    // `looks_like_native_config` is the careful one: a two-of-three quorum over
+    // target depth, draft geometry and capture taps, documented as deliberately
+    // not claiming "every future 48-layer or H=2560 drafter". Where it claims a
+    // config, the Qwen3.8 geometry check must stand down — that path has its
+    // own validator (`validate_native_flash_next_config`).
+    //
+    // This narrows neither check; it makes them mutually exclusive.
+    let strict_qwen38_dflash2 = !native_flash_next::looks_like_native_config(config)
+        && (config::declares_qwen38_dflash2(config)
+            || qwen38_dflash2::has_tensor_signature(source));
     let dimensions = validate_config(config, strict_qwen38_dflash2)?;
     validate_layer_indices(source, prefix, config.num_hidden_layers)?;
     validate_required_tensors(source, prefix, config, dimensions)?;
@@ -74,6 +105,7 @@ fn validate_dflash_metadata(
     }
     validate_markov_tensors(source, prefix, config)?;
     validate_confidence_tensors(source, prefix, config)?;
+    native_flash_next::validate_store_if_candidate(source, prefix, config)?;
     Ok(Some(prefix))
 }
 
@@ -273,6 +305,10 @@ fn validate_confidence_tensors(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dflash_validation/native_flash_next_tests.rs"]
+mod native_flash_next_tests;
 
 #[cfg(test)]
 #[path = "dflash_validation_tests.rs"]

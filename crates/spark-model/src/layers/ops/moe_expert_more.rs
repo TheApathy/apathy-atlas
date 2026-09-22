@@ -231,10 +231,11 @@ pub fn moe_expert_gate_up_shared_batch3(
     n: u32,
     k: u32,
     top_k: u32,
+    num_tokens: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), 3 * (top_k + 1), 2])
+        .grid([div_ceil(n, 8), num_tokens * (top_k + 1), 2])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(gate_packed_ptrs)
@@ -257,6 +258,7 @@ pub fn moe_expert_gate_up_shared_batch3(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(num_tokens)
         .launch(stream)
 }
 
@@ -281,13 +283,14 @@ pub fn moe_expert_silu_down_shared_batch3(
     n: u32,
     k: u32,
     top_k: u32,
+    num_tokens: u32,
     stream: u64,
 ) -> Result<()> {
     // s_act is extern shared: K floats (issue #85 -- static 1024 overflowed
     // for expert inter dims > 1024).
     let smem_bytes = (k as usize * std::mem::size_of::<f32>()) as u32;
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(n, 8), 3 * (top_k + 1), 1])
+        .grid([div_ceil(n, 8), num_tokens * (top_k + 1), 1])
         .block([128, 1, 1])
         .shared_mem(smem_bytes)
         .arg_ptr(gate_out)
@@ -306,6 +309,7 @@ pub fn moe_expert_silu_down_shared_batch3(
         .arg_u32(n)
         .arg_u32(k)
         .arg_u32(top_k)
+        .arg_u32(num_tokens)
         .launch(stream)
 }
 
@@ -325,10 +329,11 @@ pub fn moe_weighted_sum_blend_batch3(
     hidden: u32,
     top_k: u32,
     k: u32,
+    num_tokens: u32,
     stream: u64,
 ) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
-        .grid([div_ceil(hidden, 256), 3, 1])
+        .grid([div_ceil(hidden, 256), num_tokens, 1])
         .block([256, 1, 1])
         .arg_ptr(output)
         .arg_ptr(expert_out)

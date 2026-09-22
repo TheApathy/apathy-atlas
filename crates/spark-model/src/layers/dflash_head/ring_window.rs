@@ -1,269 +1,181 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Pure indexing contract for DFlash's absolute-position circular caches.
+//! Pure, checked indexing for the bounded native-V3 target-hidden ring.
 //!
-//! Keeping this arithmetic independent from GPU I/O makes wrap behavior
-//! testable before a ring-native attention kernel consumes the same layout.
+//! Logical positions remain absolute. Only physical storage wraps. GPU callers
+//! must consume these plans instead of applying absolute byte offsets directly.
 
-use anyhow::{Result, bail};
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+
+pub(crate) const NATIVE_V3_RING_SLOTS: usize = 4096;
+pub(crate) const NATIVE_V3_CAPTURE_TAPS: usize = 8;
+pub(crate) const NATIVE_V3_HIDDEN_SIZE: usize = 2560;
+pub(crate) const MAX_ABSOLUTE_CONTEXT: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct AccumulatorLayout {
-    pub capacity: usize,
-    pub slot_bytes: usize,
-    pub allocation_bytes: usize,
+pub(crate) struct RingPlanError(&'static str);
+
+impl Display for RingPlanError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
 }
 
-/// Size the target-hidden accumulator by the drafter's retained local window,
-/// not by the target model's full sequence ceiling.
-pub(super) fn plan_accumulator_layout(
-    max_seq_len: usize,
-    ctx_window: usize,
-    capture_layers: usize,
-    target_hidden_size: usize,
-) -> Result<AccumulatorLayout> {
-    let capacity = max_seq_len.min(ctx_window);
-    if capacity == 0 {
-        bail!("DFlash context accumulator capacity must be non-zero");
-    }
-    let slot_bytes = capture_layers
-        .checked_mul(target_hidden_size)
-        .and_then(|n| n.checked_mul(size_of::<u16>()))
-        .ok_or_else(|| anyhow::anyhow!("DFlash context slot byte size overflow"))?;
-    if slot_bytes == 0 {
-        bail!("DFlash context accumulator slot must be non-empty");
-    }
-    let allocation_bytes = capacity
-        .checked_mul(slot_bytes)
-        .ok_or_else(|| anyhow::anyhow!("DFlash context allocation size overflow"))?;
-    Ok(AccumulatorLayout {
-        capacity,
-        slot_bytes,
-        allocation_bytes,
-    })
-}
+impl Error for RingPlanError {}
 
-/// Resolve one captured layer slice within the circular target-hidden
-/// accumulator. `absolute_position` remains logical while the returned byte
-/// offset is always within the bounded physical allocation.
-pub(crate) fn accumulator_capture_offset(
-    absolute_position: usize,
-    capture_slot: usize,
-    capacity: usize,
-    slot_bytes: usize,
-    capture_bytes: usize,
-) -> Result<usize> {
-    if capacity == 0 {
-        bail!("DFlash context accumulator capacity must be non-zero");
-    }
-    if slot_bytes == 0 || capture_bytes == 0 {
-        bail!("DFlash context accumulator capture sizes must be non-zero");
-    }
+type Result<T> = std::result::Result<T, RingPlanError>;
 
-    let capture_offset = capture_slot
-        .checked_mul(capture_bytes)
-        .ok_or_else(|| anyhow::anyhow!("DFlash capture slot byte offset overflow"))?;
-    let capture_end = capture_offset
-        .checked_add(capture_bytes)
-        .ok_or_else(|| anyhow::anyhow!("DFlash capture slot byte end overflow"))?;
-    if capture_end > slot_bytes {
-        bail!(
-            "DFlash capture slice {capture_offset}..{capture_end} exceeds slot size {slot_bytes}"
-        );
-    }
+#[path = "ring_window_layout.rs"]
+mod layout;
+pub(crate) use layout::{accumulator_capture_offset, plan_accumulator_layout};
+pub(crate) type AccumulatorLayout = layout::AccumulatorLayout;
 
-    let physical_slot = absolute_position % capacity;
-    physical_slot
-        .checked_mul(slot_bytes)
-        .and_then(|slot_base| slot_base.checked_add(capture_offset))
-        .ok_or_else(|| anyhow::anyhow!("DFlash context accumulator byte offset overflow"))
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RingSpan {
+    pub physical_slot: usize,
+    pub linear_slot: usize,
+    pub slot_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct RingCopySpan {
+pub(crate) struct RingSpanPlan {
+    spans: [RingSpan; 2],
+    len: usize,
+}
+
+impl RingSpanPlan {
+    pub(crate) fn spans(&self) -> &[RingSpan] {
+        &self.spans[..self.len]
+    }
+
+    pub(crate) fn physical_slot_for(&self, linear_slot: usize) -> Result<usize> {
+        for span in self.spans() {
+            let span_end = span
+                .linear_slot
+                .checked_add(span.slot_count)
+                .ok_or(RingPlanError("ring span end overflowed"))?;
+            if (span.linear_slot..span_end).contains(&linear_slot) {
+                return span
+                    .physical_slot
+                    .checked_add(linear_slot - span.linear_slot)
+                    .ok_or(RingPlanError("physical ring slot overflowed"));
+            }
+        }
+        Err(RingPlanError("linear slot is outside the ring plan"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RingCopySpan {
     pub src_slot: usize,
     pub dst_slot: usize,
     pub slot_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct RingCopyPlan {
+pub(crate) struct RingCopyPlan {
     spans: [RingCopySpan; 2],
     len: usize,
 }
 
 impl RingCopyPlan {
-    pub fn spans(&self) -> &[RingCopySpan] {
+    pub(crate) fn spans(&self) -> &[RingCopySpan] {
         &self.spans[..self.len]
     }
 }
 
-/// Intersect an absolute requested range with the valid cache range, then
-/// express the result as at most two contiguous ring spans.
-pub(super) fn plan_ring_copy(
+pub(crate) fn plan_ring_copy(
     cache_start: usize,
     cache_end: usize,
     window: usize,
     needed_start: usize,
     needed_end: usize,
 ) -> Result<RingCopyPlan> {
-    if window == 0 {
-        bail!("DFlash ring window must be non-zero");
+    if window == 0 || cache_start > cache_end || needed_start > needed_end {
+        return Err(RingPlanError("ring copy range or window is invalid"));
     }
-    if cache_start > cache_end {
-        bail!("DFlash cache range is reversed: {cache_start}..{cache_end}");
+    if cache_end - cache_start > window || needed_end - needed_start > window {
+        return Err(RingPlanError("ring copy range exceeds capacity"));
     }
-    if needed_start > needed_end {
-        bail!("DFlash requested range is reversed: {needed_start}..{needed_end}");
-    }
-    if cache_end - cache_start > window {
-        bail!(
-            "DFlash cache range {} exceeds ring window {window}",
-            cache_end - cache_start
-        );
-    }
-    if needed_end - needed_start > window {
-        bail!(
-            "DFlash requested range {} exceeds ring window {window}",
-            needed_end - needed_start
-        );
-    }
-
     let copy_start = needed_start.max(cache_start);
     let copy_end = needed_end.min(cache_end);
     if copy_start >= copy_end {
         return Ok(RingCopyPlan::default());
     }
-
     let total = copy_end - copy_start;
     let src_slot = copy_start % window;
     let first_count = total.min(window - src_slot);
-    let first = RingCopySpan {
-        src_slot,
-        dst_slot: copy_start - needed_start,
-        slot_count: first_count,
-    };
     let second_count = total - first_count;
-    let second = RingCopySpan {
-        src_slot: 0,
-        dst_slot: first.dst_slot + first_count,
-        slot_count: second_count,
-    };
-
     Ok(RingCopyPlan {
-        spans: [first, second],
+        spans: [
+            RingCopySpan {
+                src_slot,
+                dst_slot: copy_start - needed_start,
+                slot_count: first_count,
+            },
+            RingCopySpan {
+                src_slot: 0,
+                dst_slot: copy_start - needed_start + first_count,
+                slot_count: second_count,
+            },
+        ],
         len: if second_count == 0 { 1 } else { 2 },
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        RingCopySpan, accumulator_capture_offset, plan_accumulator_layout, plan_ring_copy,
-    };
-
-    #[test]
-    fn accumulator_capture_offset_wraps_at_capacity() {
-        let capacity = 4096;
-        let capture_bytes = 8192 * size_of::<u16>();
-        let slot_bytes = 5 * capture_bytes;
-
-        assert_eq!(
-            accumulator_capture_offset(4095, 0, capacity, slot_bytes, capture_bytes).unwrap(),
-            4095 * slot_bytes
-        );
-        assert_eq!(
-            accumulator_capture_offset(4096, 0, capacity, slot_bytes, capture_bytes).unwrap(),
-            0
-        );
-        assert_eq!(
-            accumulator_capture_offset(4096, 4, capacity, slot_bytes, capture_bytes).unwrap(),
-            4 * capture_bytes
-        );
+fn plan_spans(absolute_start: usize, rows: usize, capacity: usize) -> Result<RingSpanPlan> {
+    if capacity == 0 || rows == 0 {
+        return Err(RingPlanError(
+            "ring capacity and row count must be non-zero",
+        ));
     }
-
-    #[test]
-    fn invalid_or_overflowing_capture_offset_fails_closed() {
-        assert!(accumulator_capture_offset(0, 0, 0, 10, 2).is_err());
-        assert!(accumulator_capture_offset(0, 0, 1, 0, 2).is_err());
-        assert!(accumulator_capture_offset(0, 0, 1, 2, 0).is_err());
-        assert!(accumulator_capture_offset(0, 1, 1, 2, 2).is_err());
-        assert!(accumulator_capture_offset(0, usize::MAX, 1, 2, 2).is_err());
-        assert!(accumulator_capture_offset(usize::MAX - 1, 0, usize::MAX, 3, 1).is_err());
+    if rows > capacity {
+        return Err(RingPlanError("chunk exceeds ring capacity"));
     }
-
-    #[test]
-    fn one_million_context_retains_only_the_local_draft_window() {
-        let layout = plan_accumulator_layout(1_048_576, 4096, 5, 8192).unwrap();
-        assert_eq!(layout.capacity, 4096);
-        assert_eq!(layout.slot_bytes, 81_920);
-        assert_eq!(layout.allocation_bytes, 335_544_320);
-    }
-
-    #[test]
-    fn invalid_or_overflowing_accumulator_layout_fails_closed() {
-        assert!(plan_accumulator_layout(0, 4096, 5, 8192).is_err());
-        assert!(plan_accumulator_layout(4096, 4096, 0, 8192).is_err());
-        assert!(plan_accumulator_layout(usize::MAX, usize::MAX, usize::MAX, 2).is_err());
-    }
-
-    #[test]
-    fn empty_intersection_has_no_spans() {
-        assert!(plan_ring_copy(8, 12, 8, 2, 6).unwrap().spans().is_empty());
-    }
-
-    #[test]
-    fn unwrapped_overlap_preserves_requested_destination_offset() {
-        let plan = plan_ring_copy(10, 14, 8, 8, 16).unwrap();
-        assert_eq!(
-            plan.spans(),
-            &[RingCopySpan {
-                src_slot: 2,
-                dst_slot: 2,
-                slot_count: 4,
-            }]
-        );
-    }
-
-    #[test]
-    fn wrapped_window_splits_at_physical_slot_zero() {
-        let plan = plan_ring_copy(14, 20, 8, 14, 20).unwrap();
-        assert_eq!(
-            plan.spans(),
-            &[
-                RingCopySpan {
-                    src_slot: 6,
-                    dst_slot: 0,
-                    slot_count: 2,
-                },
-                RingCopySpan {
-                    src_slot: 0,
-                    dst_slot: 2,
-                    slot_count: 4,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn full_window_at_exact_boundary_is_one_span() {
-        let plan = plan_ring_copy(16, 24, 8, 16, 24).unwrap();
-        assert_eq!(
-            plan.spans(),
-            &[RingCopySpan {
-                src_slot: 0,
-                dst_slot: 0,
-                slot_count: 8,
-            }]
-        );
-    }
-
-    #[test]
-    fn invalid_ranges_and_oversized_windows_fail_closed() {
-        assert!(plan_ring_copy(0, 1, 0, 0, 1).is_err());
-        assert!(plan_ring_copy(2, 1, 8, 0, 1).is_err());
-        assert!(plan_ring_copy(0, 1, 8, 2, 1).is_err());
-        assert!(plan_ring_copy(0, 9, 8, 0, 8).is_err());
-        assert!(plan_ring_copy(0, 8, 8, 0, 9).is_err());
-    }
+    let physical_slot = absolute_start % capacity;
+    let first_count = rows.min(capacity - physical_slot);
+    let second_count = rows - first_count;
+    Ok(RingSpanPlan {
+        spans: [
+            RingSpan {
+                physical_slot,
+                linear_slot: 0,
+                slot_count: first_count,
+            },
+            RingSpan {
+                physical_slot: 0,
+                linear_slot: first_count,
+                slot_count: second_count,
+            },
+        ],
+        len: if second_count == 0 { 1 } else { 2 },
+    })
 }
+
+/// Plan an arbitrary bounded write without advancing sequence state.
+pub(crate) fn plan_write_chunk(
+    absolute_start: usize,
+    rows: usize,
+    max_context: usize,
+    capacity: usize,
+) -> Result<RingSpanPlan> {
+    if capacity == 0 || capacity > max_context {
+        return Err(RingPlanError("ring capacity is incompatible with context"));
+    }
+    let absolute_end = absolute_start
+        .checked_add(rows)
+        .ok_or(RingPlanError("absolute chunk end overflowed"))?;
+    if absolute_end > max_context {
+        return Err(RingPlanError("chunk exceeds absolute context limit"));
+    }
+    plan_spans(absolute_start, rows, capacity)
+}
+
+#[path = "ring_window_state.rs"]
+mod state;
+pub(crate) use state::RingState;
+
+#[cfg(test)]
+#[path = "ring_window_tests.rs"]
+mod tests;

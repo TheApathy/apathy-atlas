@@ -119,6 +119,7 @@ impl TransformerModel {
         let (positions_h, positions_w) =
             rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         Ok(AttnMetadataDev {
+            qwen4_qsa_required: seqs.iter().any(|seq| seq.qwen4_qsa_required),
             positions: meta_base,
             positions_h,
             positions_w,
@@ -208,6 +209,7 @@ impl TransformerModel {
         let (positions_h, positions_w) =
             rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         Ok(AttnMetadataDev {
+            qwen4_qsa_required: seqs.iter().any(|seq| seq.qwen4_qsa_required),
             positions: meta_base,
             positions_h,
             positions_w,
@@ -456,6 +458,7 @@ impl TransformerModel {
         let (positions_h, positions_w) =
             rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         let attn_metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h,
             positions_w,
@@ -594,6 +597,7 @@ impl TransformerModel {
         let (positions_h, positions_w) =
             rotary.upload_axes(self.gpu.as_ref(), meta_base, stream)?;
         let attn_metadata = AttnMetadataDev {
+            qwen4_qsa_required: seq.qwen4_qsa_required,
             positions: meta_base,
             positions_h,
             positions_w,

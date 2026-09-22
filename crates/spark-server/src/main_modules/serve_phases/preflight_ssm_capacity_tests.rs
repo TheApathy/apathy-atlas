@@ -88,8 +88,8 @@ fn every_snapshot_checked_boundary_is_contextual() {
 
 #[test]
 fn final_reserve_additions_fail_closed() {
-    assert_eq!(speculative_cuda_headroom(None), 512 << 20);
-    assert_eq!(speculative_cuda_headroom(Some(15)), 4 << 30);
+    assert_eq!(speculative_cuda_headroom(None, 4096), 512 << 20);
+    assert_eq!(speculative_cuda_headroom(Some(15), 4096), 4 << 30);
 
     for (parts, expected) in [
         ((usize::MAX, 1, 0, 0, 0), "SSM pool + snapshot"),

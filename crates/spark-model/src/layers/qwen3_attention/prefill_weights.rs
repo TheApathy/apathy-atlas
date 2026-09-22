@@ -11,7 +11,133 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::types::Qwen3AttentionLayer;
 use crate::weight_map::{Fp8Weight, QuantWeight, QuantizedWeight};
 
+
+/// Attention projections that actually executed on the cuBLASLt route. Read
+/// from the server log as `ATTN_CUBLASLT_CALL n=<total>`; a total short of
+/// (projections x layers x requests) means the fail-safe fallback ran and the
+/// run must not be scored. A boolean "did it engage" cannot see partial
+/// engagement — only a count against an expected count can.
+static ATTN_CUBLASLT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Qwen3AttentionLayer {
+    /// BF16 copy of `weight`, materialised once and cached by packed-weight
+    /// pointer. Returns None if the kernel is missing or allocation fails, so
+    /// the caller keeps the hand-written path.
+    fn bf16_weight_for(
+        &self,
+        gpu: &dyn GpuBackend,
+        weight: &crate::weight_map::QuantizedWeight,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> Option<DevicePtr> {
+        if self.dequant_nvfp4_to_bf16_k.0 == 0 || k % 16 != 0 {
+            return None;
+        }
+        let key = weight.weight.0;
+        let mut cache = self.bf16_weight_cache.lock().ok()?;
+        if let Some(p) = cache.get(&key) {
+            return Some(*p);
+        }
+        let bytes = n as usize * k as usize * 2;
+        let ptr = gpu.alloc(bytes).ok()?;
+        crate::layers::ops::dequant_nvfp4_to_bf16(
+            gpu,
+            self.dequant_nvfp4_to_bf16_k,
+            weight.weight,
+            weight.weight_scale,
+            ptr,
+            weight.weight_scale_2,
+            n,
+            k,
+            stream,
+        )
+        .ok()?;
+        tracing::info!(
+            "ATLAS_ATTN_PROJ_CUBLASLT: materialised BF16 weight N={n} K={k} ({} MiB)",
+            bytes / (1024 * 1024)
+        );
+        cache.insert(key, ptr);
+        Some(ptr)
+    }
+
+    /// Exact original-layout NVFP4 prefill projection. Prefers the 128x128
+    /// byte-exact shadow (`ATLAS_PREFILL_PROJ_PIPE_M128=1`), then the 64x64
+    /// pipe shadow (`ATLAS_PREFILL_PROJ_PIPE=1`), then the baseline
+    /// `w4a16_gemm`. All three produce bit-identical output; only speed differs.
+    /// An explicitly requested eligible route with a missing symbol fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exact_prefill_projection(
+        &self,
+        gpu: &dyn GpuBackend,
+        label: &'static str,
+        input: DevicePtr,
+        weight: &crate::weight_map::QuantizedWeight,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: u64,
+    ) -> anyhow::Result<()> {
+        use crate::layers::PrefillProjectionPipeRoute as Route;
+        // cuBLASLt BF16: identical operands to the W4A16 kernel (same
+        // __float2bfloat16 dequant, BF16 activations untouched); only the
+        // FP32 accumulation order differs. Fail-safe.
+        if crate::layers::attn_proj_cublaslt_enabled()
+            && let Some(w) = self.bf16_weight_for(gpu, weight, n, k, stream)
+            && spark_runtime::cublaslt::bf16_gemm_act_weight_t_tuned(
+                input.0, w.0, output.0, m, n, k, stream,
+            )
+            .is_ok()
+        {
+            let calls =
+                ATTN_CUBLASLT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::info!("ATTN_CUBLASLT_CALL n={calls} {label} M={m} N={n} K={k}");
+            return Ok(());
+        }
+        match crate::layers::prefill_projection_pipe_m128_route(
+            crate::layers::prefill_proj_pipe_m128_enabled(),
+            n,
+            k,
+            self.w4a16_gemm_pipe_m128n128_k.0 != 0,
+        ) {
+            Route::Complete => {
+                static SEEN: std::sync::Once = std::sync::Once::new();
+                SEEN.call_once(|| {
+                    tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE_M128: {label} (first) M={m} N={n} K={k}");
+                });
+                return crate::layers::ops::w4a16_gemm_pipe_m128n128(
+                    gpu, self.w4a16_gemm_pipe_m128n128_k, input, weight, output, m, n, k, stream,
+                );
+            }
+            Route::Missing => anyhow::bail!(
+                "ATLAS_PREFILL_PROJ_PIPE_M128=1 requires w4a16_gemm_pipe_m128n128 for {label}"
+            ),
+            Route::Disabled | Route::Ineligible => {}
+        }
+        match crate::layers::prefill_projection_pipe_route(
+            crate::layers::prefill_proj_pipe_enabled(),
+            k,
+            self.w4a16_gemm_pipe_k.0 != 0,
+        ) {
+            Route::Complete => {
+                static SEEN_PIPE: std::sync::Once = std::sync::Once::new();
+                SEEN_PIPE.call_once(|| {
+                    tracing::info!("ENGAGED ATLAS_PREFILL_PROJ_PIPE: {label} (first)");
+                });
+                crate::layers::ops::w4a16_gemm_pipe(
+                    gpu, self.w4a16_gemm_pipe_k, input, weight, output, m, n, k, stream,
+                )
+            }
+            Route::Missing => anyhow::bail!(
+                "ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe for {label}"
+            ),
+            Route::Disabled | Route::Ineligible => crate::layers::ops::w4a16_gemm(
+                gpu, self.w4a16_gemm_k, input, weight, output, m, n, k, stream,
+            ),
+        }
+    }
+
     /// Dispatch the M=128 W4A16 prefill GEMM. Routes to the v2 shadow
     /// kernel when available (MiniMax-only), otherwise to the v1 kernel.
     /// Args mirror [`crate::layers::ops::w4a16_gemm_n128_m128`].
@@ -40,6 +166,22 @@ impl Qwen3AttentionLayer {
                     _ => 0, // auto (prefer v2)
                 },
             );
+        {
+            use crate::layers::PrefillProjectionPipeRoute as Route;
+            match crate::layers::prefill_fp8_w8_route(
+                crate::layers::prefill_fp8_w8_enabled(), m, n, k, self.w4a16_gemm_t_w8_k.0 != 0,
+            ) {
+                Route::Complete => {
+                    static SEEN: std::sync::Once = std::sync::Once::new();
+                    SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_PREFILL_FP8_W8: attention w4a16_t M={m} N={n} K={k}"));
+                    return crate::layers::ops::w4a16_gemm_t_w8(
+                        gpu, self.w4a16_gemm_t_w8_k, input, weight, output, m, n, k, stream,
+                    );
+                }
+                Route::Missing => anyhow::bail!("ATLAS_PREFILL_FP8_W8=1 requires w4a16_gemm_t_m128n128_w8 (attention)"),
+                Route::Disabled | Route::Ineligible => {}
+            }
+        }
         if v == 3 && self.w4a16_gemm_t_m128_v3_k.0 != 0 {
             crate::layers::ops::w4a16_gemm_n128_m128_v3(
                 gpu,

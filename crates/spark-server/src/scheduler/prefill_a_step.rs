@@ -4,6 +4,13 @@
 
 use super::*;
 
+const QWEN4_QSA_DENSE_LIMIT: usize = 2048;
+
+#[inline]
+fn request_can_reach_qwen4_qsa(prompt_tokens: usize, max_tokens: usize) -> bool {
+    prompt_tokens.saturating_add(max_tokens) >= QWEN4_QSA_DENSE_LIMIT
+}
+
 /// Start a chunked prefill: process chunk 0, return result.
 pub fn start_chunked_prefill(
     think_end_token: Option<u32>,
@@ -127,11 +134,16 @@ pub fn start_chunked_prefill(
         }
     };
     seq.session_hash = req_session_hash;
+    // Qwen4 dense attention is exact below 2048 tokens. Avoid building all
+    // twelve QSA side indexes when the immutable request budget cannot cross
+    // that boundary; requests that can cross it still index the entire prefix.
+    seq.qwen4_qsa_required = request_can_reach_qwen4_qsa(total, max_tokens);
     pstep_mark!("alloc_sequence");
 
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
-        // Empty input must invalidate the previous request's published images.
+        // Vision: encode images and store embeddings for chunk 0 token overwrite.
+        // Empty input invalidates the prior request's published images.
         model.prepare_vision_embed(&image_pixels)?;
 
         // EP: broadcast chunk 0 tokens to worker.
@@ -436,5 +448,23 @@ pub fn start_chunked_prefill(
             top_logprobs: req_top_logprobs,
             timeout_at: req_timeout_at,
         }))
+    }
+}
+
+#[cfg(test)]
+mod qwen4_qsa_request_tests {
+    use super::request_can_reach_qwen4_qsa;
+
+    #[test]
+    fn skips_only_requests_strictly_below_dense_limit() {
+        assert!(!request_can_reach_qwen4_qsa(38, 400));
+        assert!(!request_can_reach_qwen4_qsa(2047, 0));
+        assert!(request_can_reach_qwen4_qsa(2047, 1));
+        assert!(request_can_reach_qwen4_qsa(21, 2048));
+    }
+
+    #[test]
+    fn overflow_is_conservative() {
+        assert!(request_can_reach_qwen4_qsa(usize::MAX, 1));
     }
 }

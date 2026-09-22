@@ -5,7 +5,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
 #[path = "k1_stage_diag_types.rs"]
 mod types;
@@ -61,9 +61,25 @@ enum Phase {
     Batch(Capture),
 }
 
+#[derive(Debug, Default)]
+enum FixtureReceipt {
+    #[default]
+    Idle,
+    Armed {
+        pre_verify_len: usize,
+        tokens: Vec<u32>,
+    },
+    Ready(StageReport),
+}
+
 fn state() -> &'static Mutex<Phase> {
     static STATE: OnceLock<Mutex<Phase>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(Phase::Idle))
+}
+
+fn fixture_receipt() -> &'static Mutex<FixtureReceipt> {
+    static RECEIPT: OnceLock<Mutex<FixtureReceipt>> = OnceLock::new();
+    RECEIPT.get_or_init(|| Mutex::new(FixtureReceipt::Idle))
 }
 
 pub(super) fn completed_flag() -> &'static AtomicBool {
@@ -206,6 +222,75 @@ pub fn begin_batch(pre_verify_len: usize, tokens: &[u32]) -> Result<()> {
     begin_batch_with_family(pre_verify_len, tokens, serial_family)
 }
 
+/// Arm one exact report receipt after the fixture's serial replay is ready and
+/// immediately before its production batched verify. Ordinary diagnostics do
+/// not retain reports, so the default path remains inert.
+pub fn arm_fixture_receipt(pre_verify_len: usize, tokens: &[u32]) -> Result<()> {
+    ensure!(
+        tokens.len() == 16,
+        "K16 fixture stage receipt requires 16 inputs"
+    );
+    let phase = state().lock().expect("K1 stage diagnostic mutex");
+    let Phase::Ready(capture) = &*phase else {
+        bail!("K16 fixture stage receipt lacks a prepared serial replay");
+    };
+    ensure!(
+        capture.manifest.pre_verify_len == pre_verify_len && capture.manifest.tokens == tokens,
+        "K16 fixture stage receipt frame identity mismatch"
+    );
+    let mut receipt = fixture_receipt()
+        .lock()
+        .expect("K16 fixture stage receipt mutex");
+    ensure!(
+        matches!(*receipt, FixtureReceipt::Idle),
+        "K16 fixture stage receipt already armed"
+    );
+    *receipt = FixtureReceipt::Armed {
+        pre_verify_len,
+        tokens: tokens.to_vec(),
+    };
+    Ok(())
+}
+
+fn validate_fixture_report(report: &StageReport) -> Result<()> {
+    ensure!(report.first.is_none(), "K16 fixture K1 stage divergence");
+    ensure!(
+        report.stages == 51,
+        "K16 fixture requires exactly 51 K1 stages"
+    );
+    ensure!(
+        report.terminal_stage == "logits",
+        "K16 fixture terminal stage is not logits"
+    );
+    ensure!(
+        report.logits_compared,
+        "K16 fixture did not compare full logits"
+    );
+    let expected_lens: Vec<usize> = (0..report.manifest.tokens.len())
+        .map(|row| report.manifest.pre_verify_len + row)
+        .collect();
+    ensure!(
+        report.manifest.absolute_seq_lens == expected_lens,
+        "K16 fixture stage report sequence identities drifted"
+    );
+    Ok(())
+}
+
+pub fn take_fixture_report(pre_verify_len: usize, tokens: &[u32]) -> Result<StageReport> {
+    let mut receipt = fixture_receipt()
+        .lock()
+        .expect("K16 fixture stage receipt mutex");
+    let FixtureReceipt::Ready(report) = std::mem::take(&mut *receipt) else {
+        bail!("K16 fixture lacks a completed K1 stage receipt");
+    };
+    ensure!(
+        report.manifest.pre_verify_len == pre_verify_len && report.manifest.tokens == tokens,
+        "K16 fixture completed K1 stage frame identity mismatch"
+    );
+    validate_fixture_report(&report)?;
+    Ok(report)
+}
+
 fn begin_batch_with_family(
     pre_verify_len: usize,
     tokens: &[u32],
@@ -284,18 +369,43 @@ pub fn finish_batch() -> Result<StageReport> {
         .map(|stage| stage.name.clone())
         .ok_or_else(|| anyhow::anyhow!("DFLASH_K1_STAGE_DIAG empty completed capture"))?;
     let logits_compared = terminal_stage == "logits";
-    completed_flag().store(true, Ordering::Relaxed);
-    Ok(StageReport {
+    let report = StageReport {
         manifest: capture.manifest,
         stages: capture.stages.len(),
         terminal_stage,
         logits_compared,
         first: capture.first,
-    })
+    };
+    let mut receipt = fixture_receipt()
+        .lock()
+        .expect("K16 fixture stage receipt mutex");
+    match std::mem::take(&mut *receipt) {
+        FixtureReceipt::Idle => {}
+        FixtureReceipt::Armed {
+            pre_verify_len,
+            tokens,
+        } => {
+            ensure!(
+                report.manifest.pre_verify_len == pre_verify_len
+                    && report.manifest.tokens == tokens,
+                "K16 fixture armed/completed K1 stage frame identity mismatch"
+            );
+            *receipt = FixtureReceipt::Ready(report.clone());
+        }
+        FixtureReceipt::Ready(previous) => {
+            *receipt = FixtureReceipt::Ready(previous);
+            bail!("K16 fixture K1 stage receipt completed twice");
+        }
+    }
+    completed_flag().store(true, Ordering::Relaxed);
+    Ok(report)
 }
 
 pub fn abort() {
     *state().lock().expect("K1 stage diagnostic mutex") = Phase::Idle;
+    *fixture_receipt()
+        .lock()
+        .expect("K16 fixture stage receipt mutex") = FixtureReceipt::Idle;
 }
 
 #[cfg(test)]

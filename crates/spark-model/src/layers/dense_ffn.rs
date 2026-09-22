@@ -1994,8 +1994,14 @@ impl DenseFfnLayer {
             "FlashInfer FFN checkpoint operand identity changed after preparation"
         );
 
-        let merged_plan = select_qwen38_ffn_launch(Qwen38FfnOperation::MergedGateUp, m as usize)?;
-        let down_plan = select_qwen38_ffn_launch(Qwen38FfnOperation::Down, m as usize)?;
+        let mut merged_plan = select_qwen38_ffn_launch(Qwen38FfnOperation::MergedGateUp, m as usize)?;
+        let mut down_plan = select_qwen38_ffn_launch(Qwen38FfnOperation::Down, m as usize)?;
+        if let Some((gu, dn)) = crate::layers::flashinfer_ffn_tactic_override() {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            SEEN.call_once(|| tracing::warn!("ATLAS_FLASHINFER_FFN_TACTIC override: merged_gate_up={gu} down={dn} (diagnostic, not exact-qualified)"));
+            merged_plan.tactic = gu;
+            down_plan.tactic = dn;
+        }
         ensure!(
             merged_plan.workspace_bytes == 0 && down_plan.workspace_bytes == 0,
             "FlashInfer FFN runtime selected a nonzero-workspace plan"

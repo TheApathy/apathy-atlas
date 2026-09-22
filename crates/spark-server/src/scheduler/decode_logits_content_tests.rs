@@ -38,6 +38,7 @@ fn seq_state(tokens: &[u32]) -> SequenceState {
         tokens: tokens.to_vec(),
         block_table: Vec::new(),
         seq_len: tokens.len(),
+        qwen4_qsa_required: false,
         layer_states: Vec::new(),
         rotary_positions: spark_model::traits::RotaryPositions::identity(),
         proposer_state: None,

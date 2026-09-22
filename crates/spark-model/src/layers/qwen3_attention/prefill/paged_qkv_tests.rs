@@ -122,21 +122,43 @@ fn requested_large_dual_kv_rejects_conflicting_layouts_and_has_path_proof() {
 
 #[test]
 fn projection_pipe_call_sites_are_fail_closed_and_attributed() {
+    // The attention Q/K/V and O projections now share one helper,
+    // `exact_prefill_projection` in prefill_weights.rs, which carries the
+    // fail-closed routing and the ENGAGED attribution for both the pipe and
+    // the 128x128 pipe kernels. The SSM projections still route inline.
+    let shared = include_str!("../prefill_weights.rs");
     let attention_qkv = include_str!("paged_qkv.rs");
     let attention_o = include_str!("paged_oproj.rs");
+    let cache_skip = include_str!("cache_skip_qkv.rs");
     let ssm_qkvz = include_str!("../../qwen3_ssm/trait_prefill_phase1.rs");
     let ssm_out = include_str!("../../qwen3_ssm/trait_prefill_phase3.rs");
 
-    for source in [attention_qkv, attention_o, ssm_qkvz, ssm_out] {
+    for source in [shared, ssm_qkvz, ssm_out] {
         assert!(source.contains("prefill_projection_pipe_route("));
-        assert!(source.contains("PrefillProjectionPipeRoute::Missing"));
+        assert!(source.contains("PrefillProjectionPipeRoute::Missing") || source.contains("Route::Missing"));
         assert!(source.contains("ATLAS_PREFILL_PROJ_PIPE=1 requires w4a16_gemm_pipe"));
     }
-    assert!(attention_qkv.contains("ENGAGED ATLAS_PREFILL_PROJ_PIPE: {name}"));
+
+    // The 128x128 route is fail-closed and attributed in the shared helper.
+    assert!(shared.contains("prefill_projection_pipe_m128_route("));
+    assert!(shared.contains("ATLAS_PREFILL_PROJ_PIPE_M128=1 requires w4a16_gemm_pipe_m128n128"));
+    assert!(shared.contains("ENGAGED ATLAS_PREFILL_PROJ_PIPE_M128: {label}"));
+    assert!(shared.contains("ENGAGED ATLAS_PREFILL_PROJ_PIPE: {label}"));
+
+    // Every attention call site reaches the shared helper and labels itself,
+    // including the cache-skip QKV path which previously had no pipe route.
+    for source in [attention_qkv, attention_o, cache_skip] {
+        assert!(source.contains("self.exact_prefill_projection("));
+    }
     for name in ["attention_q", "attention_k", "attention_v"] {
         assert!(attention_qkv.contains(name));
     }
-    assert!(attention_o.contains("ENGAGED ATLAS_PREFILL_PROJ_PIPE: attention_o"));
+    // The cache-skip path labels its projections by weight name.
+    for name in ["q_proj", "k_proj", "v_proj"] {
+        assert!(cache_skip.contains(name));
+    }
+    assert!(attention_o.contains("attention_o"));
     assert!(ssm_qkvz.contains("ENGAGED ATLAS_PREFILL_PROJ_PIPE: ssm_qkvz"));
     assert!(ssm_out.contains("ENGAGED ATLAS_PREFILL_PROJ_PIPE: ssm_out"));
 }
+

@@ -9,7 +9,37 @@ use spark_runtime::kv_cache::{KvCacheDtype, PagedKvCache};
 
 use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
 
+/// One shared Qwen4 routed-expert transpose arena. Projection order is
+/// gate/up/down; pointer-table arrays address the corresponding arena slices.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeStreamTransposeScratch {
+    pub(crate) packed: [DevicePtr; 3],
+    pub(crate) scale: [DevicePtr; 3],
+    pub(crate) packed_tables: [DevicePtr; 3],
+    pub(crate) scale_tables: [DevicePtr; 3],
+}
+
 pub trait TransformerLayer: Send + Sync {
+    /// Preflight the optional exact Qwen4 M16 attention path before request state changes.
+    fn preflight_qwen4_attn16(
+        &self,
+        _kv_cache: &PagedKvCache,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Install Qwen4-Exp gated-residual mixers after the ordinary core layer
+    /// has been assembled. Other architectures fail closed by default.
+    fn set_qwen4_hyperconnections(
+        &mut self,
+        _attn: crate::layers::Qwen4HyperConnection,
+        _mlp: crate::layers::Qwen4HyperConnection,
+    ) -> Result<()> {
+        anyhow::bail!("layer does not support Qwen4 hyperconnections")
+    }
+
     /// Decode one token through this layer, modifying `hidden` in-place.
     ///
     /// # Arguments
@@ -42,6 +72,31 @@ pub trait TransformerLayer: Send + Sync {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()>;
+
+    /// Qwen4 speculative verify: run `num_tokens` four-stream rows through
+    /// this layer while batching the MoE sublayer. Architectures without
+    /// Qwen4 hyperconnections fail closed.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_qwen4_batched(
+        &self,
+        _hidden: DevicePtr,
+        _residual: DevicePtr,
+        _num_tokens: usize,
+        _state: &mut dyn LayerState,
+        _kv_cache: &mut PagedKvCache,
+        _seq_len: usize,
+        _block_table: &mut Vec<u32>,
+        _disk_block_ids: &mut Vec<u32>,
+        _disk_last_offloaded_per_layer: &mut Vec<u32>,
+        _h_intermediate: DevicePtr,
+        _conv_intermediate: DevicePtr,
+        _h_intermediate_stride: usize,
+        _conv_intermediate_stride: usize,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("layer does not support batched Qwen4 verify")
+    }
 
     /// Prefill N tokens through this layer using GEMM-batched projections.
     ///
@@ -323,6 +378,11 @@ pub trait TransformerLayer: Send + Sync {
         _scale_ptrs_t: DevicePtr,
     ) {
     }
+
+    /// Wire the shared complete gate/up/down streaming-transpose arena.
+    /// Originals remain authoritative for decode; prefill overwrites this
+    /// scratch immediately before each layer consumes it.
+    fn set_moe_stream_transpose_scratch(&mut self, _scratch: MoeStreamTransposeScratch) {}
 
     /// Phase 8a unified-layout MoE transpose: build persistent transposed
     /// gate/up/down for all experts and free the untransposed copies.

@@ -88,6 +88,32 @@ pub(super) fn wy32_dynamic_smem_bytes(
     aligned.try_into().ok()
 }
 
+/// Dynamic smem for the v2 gate-cache shadow: parent layout + 16 B alignment
+/// slack + two FP32 [key_dim][36] transposed chunk copies.
+pub(super) fn wy32_gatecache_v2_dynamic_smem_bytes(key_dim: usize, value_dim: usize) -> Option<u32> {
+    let base = wy32_dynamic_smem_bytes(key_dim, value_dim, true)? as usize;
+    let extra = 16usize.checked_add(2usize.checked_mul(key_dim)?.checked_mul(36)?.checked_mul(4)?)?;
+    let bytes = base.checked_add(extra)?;
+    (bytes.div_ceil(256) * 256).try_into().ok()
+}
+
+/// Selects the v2 kernel handle + smem when requested and available.
+pub(super) fn gatecache_kernel_choice(
+    v2_requested: bool,
+    v1: spark_runtime::gpu::KernelHandle,
+    v2: spark_runtime::gpu::KernelHandle,
+    smem_v1: u32,
+    smem_v2: u32,
+) -> Result<(spark_runtime::gpu::KernelHandle, u32, bool), &'static str> {
+    if !v2_requested {
+        return Ok((v1, smem_v1, false));
+    }
+    if v2.0 == 0 {
+        return Err("ATLAS_GDN_PREFILL_GATECACHE_V2=1 requires gated_delta_rule_prefill_wy32_gatecache_v2");
+    }
+    Ok((v2, smem_v2, true))
+}
+
 /// Public dumper used from the server shutdown / bench script if needed.
 #[allow(dead_code)]
 pub fn dump_gdn_profile() {
@@ -198,9 +224,23 @@ impl Qwen3SsmLayer {
             gdn_c143.launch(ctx.gpu)?;
         } else if gatecache {
             log_wy32_gatecache_engaged(total);
-            ops::gdn_prefill_persistent_smem(
-                ctx.gpu,
+            let smem_v2 = wy32_gatecache_v2_dynamic_smem_bytes(kd, vd)
+                .ok_or_else(|| anyhow::anyhow!("WY32 gate-cache v2 shared-memory size overflow"))?;
+            let (gatecache_k, wy32_gatecache_smem, is_v2) = gatecache_kernel_choice(
+                crate::layers::gdn_prefill_gatecache_v2_enabled(),
                 self.gdn_prefill_wy32_gatecache_k,
+                self.gdn_prefill_wy32_gatecache_v2_k,
+                wy32_gatecache_smem,
+                smem_v2,
+            )
+            .map_err(anyhow::Error::msg)?;
+            if is_v2 {
+                static V2_SEEN: std::sync::Once = std::sync::Once::new();
+                V2_SEEN.call_once(|| tracing::info!("ENGAGED ATLAS_GDN_PREFILL_GATECACHE_V2: M={total} smem={wy32_gatecache_smem}"));
+            }
+            ops::gdn_prefill_persistent_smem_blocked(
+                ctx.gpu,
+                gatecache_k,
                 ssm_state.h_state,
                 q_ptr,
                 k_ptr,
@@ -218,6 +258,7 @@ impl Qwen3SsmLayer {
                 conv_dim as u32,
                 gb_stride,
                 wy32_gatecache_smem,
+                ops::GDN_PREFILL_BLOCK_X,
                 stream,
             )?;
         } else if self.gdn_prefill_wy32_k.0 != 0 && total > 32 {

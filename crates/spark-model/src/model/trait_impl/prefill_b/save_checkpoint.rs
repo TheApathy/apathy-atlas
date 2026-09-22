@@ -23,7 +23,10 @@ impl TransformerModel {
         chunk_len: usize,
         stream: u64,
     ) -> Result<()> {
-        if self.ssm_checkpoint_interval == 0 || !self.ssm_snapshots.is_enabled() {
+        if self.ssm_checkpoint_interval == 0
+            || !self.prefix_cache.is_active()
+            || !self.ssm_snapshots.is_enabled()
+        {
             return Ok(());
         }
         let bs = kv_cache.block_size();

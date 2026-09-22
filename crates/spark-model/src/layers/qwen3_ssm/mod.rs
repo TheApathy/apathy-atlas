@@ -21,8 +21,8 @@ use spark_runtime::kv_cache::PagedKvCache;
 use crate::layer::{
     ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
-use crate::layers::FfnComponent;
 use crate::layers::ops;
+use crate::layers::{FfnComponent, Qwen4HyperConnection};
 use crate::weight_map::{DenseWeight, Fp8Weight, QuantizedWeight, SsmWeights};
 
 const QWEN38_FLASHINFER_HIDDEN: usize = 5_120;
@@ -162,6 +162,8 @@ pub struct Qwen3SsmLayer {
     ssm: SsmWeights,
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
+    qwen4_attn_hyper: Option<Qwen4HyperConnection>,
+    qwen4_mlp_hyper: Option<Qwen4HyperConnection>,
     // NVFP4-quantized QKVZ weight (quarters bandwidth vs BF16)
     qkvz_nvfp4: Option<QuantizedWeight>,
     // Transposed [K/2, N] copy for coalesced w4a16_gemm reads (prefill)
@@ -259,7 +261,10 @@ pub struct Qwen3SsmLayer {
     w4a16_gemm_pipe_k: KernelHandle,
     w4a16_gemm_t_k: KernelHandle, // Transposed B layout [K/2, N] — K_STEP_T=32
     w4a16_gemm_t_k64_k: KernelHandle, // K64 variant: K_STEP_T=64, halves outer loop
-    w4a16_gemm_t_m128_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
+    w4a16_gemm_t_m128_k: KernelHandle,
+    /// 8-warp 128x128 bit-identical shadows (ATLAS_PREFILL_FP8_W8=1); 0 when absent.
+    w4a16_gemm_t_w8_k: KernelHandle,
+    fp8_gemm_t_w8_k: KernelHandle, // M128 variant: 2 M-chunks per CTA, halves B re-reads
     /// M16 variant: 1 CTA row × 4 warps × 32-N each (K=γ verify, M≤32).
     /// Gated by `ATLAS_TC_NVFP4_M16=1` env var. KernelHandle(0) if not compiled
     /// for this target (qwen3.6-27b NVFP4 shadow only as of 2026-05-19).
@@ -283,6 +288,14 @@ pub struct Qwen3SsmLayer {
     /// Lazily-allocated FP32 split-K workspace [k_splits≤8, 32, max_n].
     /// Allocated at load time (pre-graph-capture) by `alloc_ssm_splitk_ws`.
     ssm_splitk_workspace: std::sync::Mutex<Option<DevicePtr>>,
+    /// Lazily-allocated e4m3 activation scratch for the cuBLASLt FP8 projection
+    /// route (`ATLAS_SSM_PROJ_CUBLASLT=1`). Holds `max_tokens * max_k` bytes,
+    /// one e4m3 byte per BF16 activation element. Grows on demand.
+    ssm_act_e4m3_scratch: std::sync::Mutex<Option<(DevicePtr, usize)>>,
+    /// Lazily materialised e4m3 copy of this layer's NVFP4 QKVZ weight, laid
+    /// out [N, K] for the cuBLASLt FP8 route. 80 MiB per layer at the
+    /// production shape; built once on first prefill use and kept.
+    ssm_qkvz_e4m3: std::sync::Mutex<Option<DevicePtr>>,
     w4a16_gemv_batch2_k: KernelHandle,
     dense_gemm_k: KernelHandle,
     gdn_prefill_k: KernelHandle,
@@ -296,6 +309,14 @@ pub struct Qwen3SsmLayer {
     /// ABI-identical WY32 shadow that caches the thread-invariant gate-product
     /// triangle. Default off until live output-hash and TTFT qualification.
     gdn_prefill_wy32_gatecache_k: KernelHandle,
+    /// bf16 -> e4m3 activation cast, exactly the MMA path's own conversion.
+    cast_bf16_to_e4m3_k: KernelHandle,
+    /// NVFP4 -> e4m3 weight materialisation, matching V2_DEQUANT exactly.
+    dequant_nvfp4_to_e4m3_k: KernelHandle,
+    /// Exact v2 shadow of the gate-cache kernel (ATLAS_GDN_PREFILL_GATECACHE_V2=1).
+    gdn_prefill_wy32_gatecache_v2_k: KernelHandle,
+    /// Flash-Next WY32 variant with four warp-parallel FP32 reductions.
+    gdn_prefill_wy32_warp_k: KernelHandle,
     // ── Q12 Phase 2b: same-chunk-len batched GDN prefill kernels ──
     // Each takes `float* const* h_state_ptrs` plus stacked QKV/gate/beta/output.
     // Used by `Qwen3SsmLayer::prefill_batched` when N≥2 streams have matching
@@ -465,6 +486,14 @@ mod prefill_gdn_gatecache_tests;
 mod prefill_pack_tests;
 #[cfg(test)]
 mod prefill_sync_contract_tests;
+mod qwen4_k5_ssm;
+mod qwen4_prefill_check;
+mod qwen4_prefill_check_raw;
+pub(crate) mod qwen4_prefill_exact;
+mod qwen4_prefill_exact_forward;
+mod qwen4_prefill_exact_plan;
+pub(crate) mod qwen4_prefill_gemm;
+mod qwen4_prefill_moe;
 mod serial_diag;
 mod ssm_forward;
 mod trait_decode;
@@ -503,6 +532,82 @@ pub(crate) fn ssm_profile_record(ns: u64) {
 
 // ── TransformerLayer impl (delegates to per-file inherent _inner methods) ──
 impl TransformerLayer for Qwen3SsmLayer {
+    fn set_qwen4_hyperconnections(
+        &mut self,
+        attn: crate::layers::Qwen4HyperConnection,
+        mlp: crate::layers::Qwen4HyperConnection,
+    ) -> Result<()> {
+        Qwen3SsmLayer::set_qwen4_hyperconnections(self, attn, mlp);
+        Ok(())
+    }
+
+    // ── MoE transpose hooks ──
+    //
+    // These were previously left to the trait's default `Ok(())`, which is a
+    // SILENT no-op. Only `Qwen3AttentionLayer` implemented them, so on
+    // Qwen3.8-Flash-Next — 36 SSM layers and 12 full-attention layers — a
+    // whole-model transpose pass actually transposed 12 of 48 layers and
+    // reported success. The two visible symptoms: `ATLAS_NVFP4_MOE_WORKLIST=1`
+    // failed at "Prefill chunk layer 0 ... requires transposed gate/up expert
+    // pointer tables" (layer 0 is an SSM layer), and `ATLAS_UNIFIED_MOE_LAYOUT=1`
+    // measured as a pure loss because it switched decode to the `_t` kernels
+    // while three quarters of the layers had no `_t` weights to use.
+    //
+    // Unlike the attention layer there is no `moe_ffn` here; the SSM layer owns
+    // exactly one FFN.
+    fn transpose_moe_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_gate_up_for_prefill(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_gate_up_for_prefill(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn set_moe_stream_transpose_scratch(
+        &mut self,
+        scratch: crate::layer::MoeStreamTransposeScratch,
+    ) {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.set_moe_stream_transpose_scratch(scratch);
+        }
+    }
+
+    fn transpose_moe_for_prefill_unified(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_unified(gpu, config)?;
+        }
+        Ok(())
+    }
+
+    fn transpose_moe_for_prefill_hybrid(
+        &mut self,
+        gpu: &dyn GpuBackend,
+        config: &atlas_core::config::ModelConfig,
+    ) -> Result<()> {
+        if let FfnComponent::Moe(moe) = &mut self.ffn {
+            moe.transpose_for_prefill_hybrid(gpu, config)?;
+        }
+        Ok(())
+    }
+
     fn decode(
         &self,
         hidden: DevicePtr,
@@ -525,6 +630,43 @@ impl TransformerLayer for Qwen3SsmLayer {
             block_table,
             disk_block_ids,
             disk_last_offloaded_per_layer,
+            ctx,
+            stream,
+        )
+    }
+
+    fn decode_qwen4_batched(
+        &self,
+        hidden: DevicePtr,
+        residual: DevicePtr,
+        num_tokens: usize,
+        state: &mut dyn LayerState,
+        kv_cache: &mut PagedKvCache,
+        seq_len: usize,
+        block_table: &mut Vec<u32>,
+        disk_block_ids: &mut Vec<u32>,
+        disk_last_offloaded_per_layer: &mut Vec<u32>,
+        h_intermediate: DevicePtr,
+        conv_intermediate: DevicePtr,
+        h_intermediate_stride: usize,
+        conv_intermediate_stride: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.decode_qwen4_batched_inner(
+            hidden,
+            residual,
+            num_tokens,
+            state,
+            kv_cache,
+            seq_len,
+            block_table,
+            disk_block_ids,
+            disk_last_offloaded_per_layer,
+            h_intermediate,
+            conv_intermediate,
+            h_intermediate_stride,
+            conv_intermediate_stride,
             ctx,
             stream,
         )

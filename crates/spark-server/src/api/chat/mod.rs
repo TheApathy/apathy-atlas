@@ -155,21 +155,6 @@ pub(crate) async fn chat_completions_inner(
         req.repetition_penalty,
     );
 
-    if state.yarn_context
-        && req
-            .messages
-            .iter()
-            .any(|message| !message.content.images.is_empty())
-    {
-        return super::compact::openai_error_response_with_param(
-            StatusCode::BAD_REQUEST,
-            "Static-YaRN long context is currently text-only; image requests require persistent MRoPE position deltas"
-                .to_string(),
-            Some("messages"),
-            Some("unsupported_multimodal_context"),
-        );
-    }
-
     // ── Phase 1: build MsgEntry vec + image preprocess + cwd ────
     let msg_entry::BuildOut {
         mut messages,
@@ -253,11 +238,7 @@ pub(crate) async fn chat_completions_inner(
         prompt_tokens = prompt_tokens.len()
     );
     let prompt_len = prompt_tokens.len();
-    let requested_output =
-        thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens);
-    if super::context_budget::admitted_total(prompt_len, requested_output, state.max_seq_len)
-        .is_none()
-    {
+    if prompt_len >= state.max_seq_len {
         // The overflow-truncation safety net (task #76, see template.rs) already
         // dropped oldest turns; reaching here means even the minimal tail can't
         // fit (e.g. a single oversized system prompt or user turn). Emit the
@@ -268,8 +249,8 @@ pub(crate) async fn chat_completions_inner(
         return super::compact::openai_error_response_with_param(
             StatusCode::BAD_REQUEST,
             format!(
-                "Context too long: {prompt_len} prompt + {requested_output} requested output tokens exceeds max_seq_len {}",
-                state.max_seq_len,
+                "Prompt too long: {prompt_len} tokens exceeds max_seq_len {} (leave room for output tokens)",
+                state.max_seq_len
             ),
             Some("messages"),
             Some("context_length_exceeded"),

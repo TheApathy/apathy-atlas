@@ -8,7 +8,12 @@
 //! selector choose different results. Runtime correction requires a separate
 //! CUDA tranche and native parity gate.
 
-#[path = "dflash2_bf16_reference_lexer.rs"]
+// Moved under `dflash2_lexer/`: a .rs file directly in `tests/` is compiled
+// as its OWN test binary as well as being included here, and at a crate root
+// `use super::` / `pub(super)` do not resolve — there is nothing above it.
+// Cargo does not auto-compile files in a tests/ SUBDIRECTORY, so the module
+// is reachable from here and nowhere else.
+#[path = "dflash2_lexer/dflash2_bf16_reference_lexer.rs"]
 mod python_receipt;
 
 use python_receipt::python_canonical;

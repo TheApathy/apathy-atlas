@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
+use atlas_core::config::{DflashCaptureMode, LayerType, ModelConfig};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, GraphHandle, HostToDeviceCopy, KernelHandle};
 use spark_runtime::kv_cache::PagedKvCache;
@@ -33,6 +33,10 @@ impl TransformerModel {
         config: ModelConfig,
         embed_tokens: DenseWeight,
         final_norm: DenseWeight,
+        qwen4_final_mixer: Option<crate::layers::Qwen4HyperConnection>,
+        #[cfg(all(feature = "cuda", target_os = "linux"))] qwen4_ple: Option<
+            crate::layers::Qwen4PleLayer,
+        >,
         lm_head_weight: DenseWeight,
         lm_head_nvfp4: Option<QuantizedWeight>,
         layers: Vec<Box<dyn TransformerLayer>>,
@@ -40,6 +44,7 @@ impl TransformerModel {
         kv_cache: PagedKvCache,
         mtp_weights: Vec<MtpWeights>,
         mtp_dense_weights: Option<crate::weight_map::MtpDenseWeights>,
+        qwen4_mtp_proposer: Option<Arc<dyn DraftProposer>>,
         gpu: Box<dyn GpuBackend>,
         max_seq_len: usize,
         max_batch_size: usize,
@@ -192,6 +197,7 @@ impl TransformerModel {
         let has_mtp = self_speculative
             || (use_speculative && !mtp_weights.is_empty() && lm_head_nvfp4.is_some())
             || (use_speculative && mtp_dense_weights.is_some() && lm_head_nvfp4.is_some())
+            || qwen4_mtp_proposer.is_some()
             || dflash_enabled;
         let requested_ddtree_capacity = std::env::var("ATLAS_DDTREE_MAX_NODES")
             .ok()
@@ -598,18 +604,20 @@ impl TransformerModel {
         };
 
         // Build MTP proposer (extracted to keep `new` under the file cap).
-        let proposer: Option<Arc<dyn DraftProposer>> = super::impl_a1_init::build_mtp_proposer(
-            use_speculative,
-            mtp_weights,
-            mtp_dense_weights,
-            embed_tokens,
-            lm_head_nvfp4,
-            &config,
-            gpu.as_ref(),
-            mtp_quant,
-            mtp_vocab_size,
-            max_seq_len,
-        );
+        let proposer: Option<Arc<dyn DraftProposer>> = qwen4_mtp_proposer.or_else(|| {
+            super::impl_a1_init::build_mtp_proposer(
+                use_speculative,
+                mtp_weights,
+                mtp_dense_weights,
+                embed_tokens,
+                lm_head_nvfp4,
+                &config,
+                gpu.as_ref(),
+                mtp_quant,
+                mtp_vocab_size,
+                max_seq_len,
+            )
+        });
 
         if self_speculative {
             let num_ssm = config.num_ssm_layers();
@@ -621,8 +629,14 @@ impl TransformerModel {
             );
         }
 
-        // MTP hidden state save buffer (1 × hidden_size FP32)
-        let mtp_hidden_save = gpu.alloc(config.hidden_size * 4)?;
+        // Qwen4 MTP consumes the pre-final four-stream row in BF16; legacy
+        // MTP consumes one hidden stream and may use FP32 residuals.
+        let mtp_hidden_bytes = if config.is_qwen4_exp() {
+            config.residual_width() * 2
+        } else {
+            config.hidden_size * 4
+        };
+        let mtp_hidden_save = gpu.alloc(mtp_hidden_bytes)?;
 
         // Last-K prompt-tail target hidden capture buffer for MTP prefill.
         // Gated by ATLAS_MTP_LASTK_PREFILL=N (N>0 enables, default 0 disabled).
@@ -630,14 +644,19 @@ impl TransformerModel {
         let mtp_lastk_capacity: usize = std::env::var("ATLAS_MTP_LASTK_PREFILL")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or(if config.is_qwen4_exp() { 64 } else { 0 });
         let mtp_lastk_buf = if mtp_lastk_capacity > 0 && proposer.is_some() {
+            let row_bytes = if config.is_qwen4_exp() {
+                config.residual_width() * 2
+            } else {
+                config.hidden_size * 4
+            };
             tracing::info!(
                 "MTP last-K prefill: ENABLED (K={mtp_lastk_capacity} tokens, \
                  {} KiB hidden capture buffer)",
-                mtp_lastk_capacity * config.hidden_size * 4 / 1024,
+                mtp_lastk_capacity * row_bytes / 1024,
             );
-            Some(gpu.alloc(mtp_lastk_capacity * config.hidden_size * 4)?)
+            Some(gpu.alloc(mtp_lastk_capacity * row_bytes)?)
         } else {
             None
         };
@@ -727,6 +746,32 @@ impl TransformerModel {
             );
             dflash_capture_layers = layers;
         }
+        let dflash_capture_width = if config.dflash_capture_width == 0 {
+            config.residual_width()
+        } else {
+            config.dflash_capture_width
+        };
+        let dflash_capture_offset = config.dflash_capture_offset;
+        anyhow::ensure!(
+            dflash_capture_offset.saturating_add(dflash_capture_width) <= config.residual_width(),
+            "DFlash capture slice offset={} width={} exceeds target residual width {}",
+            dflash_capture_offset,
+            dflash_capture_width,
+            config.residual_width(),
+        );
+        let dflash_capture_mode = config.dflash_capture_mode;
+        if dflash_capture_mode == DflashCaptureMode::Qwen4HyperProjected {
+            anyhow::ensure!(
+                config.is_qwen4_exp()
+                    && dflash_capture_width == config.hidden_size
+                    && dflash_capture_offset == 0,
+                "projected DFlash capture requires a Qwen4 target with H-wide, zero-offset output"
+            );
+            anyhow::ensure!(
+                qwen4_final_mixer.is_some(),
+                "projected DFlash capture requires the target Qwen4 terminal hyperconnection mixer"
+            );
+        }
         let dflash_hidden_save = if dflash_capture_layers.is_empty() {
             None
         } else {
@@ -736,7 +781,7 @@ impl TransformerModel {
             // `try_dflash_capture(token_idx=0..T)`. Track the real flat/tree
             // capacities instead of hardcoding a historical width.
             let k_max = dflash_kgamma.max(ddtree_cap);
-            Some(gpu.alloc(k_max * n * config.hidden_size * 2)?)
+            Some(gpu.alloc(k_max * n * dflash_capture_width * 2)?)
         };
 
         // EP command buffer for token broadcast (4 bytes, u32)
@@ -961,12 +1006,20 @@ impl TransformerModel {
             tree_kv_pack_active,
             embed_tokens,
             final_norm,
+            qwen4_final_mixer,
+            #[cfg(all(feature = "cuda", target_os = "linux"))]
+            qwen4_ple,
             lm_head_weight,
             lm_head_nvfp4,
             lm_head_nvfp4_t,
             layers,
             buffers,
             kv_cache: Mutex::new(kv_cache),
+            strided_copy_rows_kernel: crate::layers::try_kernel(
+                gpu.as_ref(),
+                "strided_copy_rows",
+                "strided_copy_rows_16",
+            ),
             gpu,
             rms_norm_kernel,
             bf16_to_f32_kernel,
@@ -1018,6 +1071,9 @@ impl TransformerModel {
             dflash_hidden_save,
             dflash_batched_ffn_input: parking_lot::Mutex::new(None),
             dflash_capture_layers,
+            dflash_capture_width,
+            dflash_capture_offset,
+            dflash_capture_mode,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
             verify4_graph: Mutex::new(std::collections::HashMap::new()),

@@ -24,6 +24,8 @@ type cublasLtMatmulPreference_t = *mut c_void;
 
 const CUDA_R_16BF: i32 = 14;
 const CUDA_R_32F: i32 = 0;
+/// `library_types.h`: real as an `nv_fp8_e4m3`.
+const CUDA_R_8F_E4M3: i32 = 28;
 const CUBLAS_COMPUTE_32F: i32 = 68;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
@@ -98,6 +100,7 @@ unsafe extern "C" {
     fn cuMemsetD8_v2(dptr: u64, uc: u8, n: usize) -> i32;
     fn cuStreamCreate(stream: *mut u64, flags: u32) -> i32;
     fn cuStreamDestroy_v2(stream: u64) -> i32;
+    fn cuStreamSynchronize(stream: u64) -> i32;
     fn cuEventCreate(event: *mut u64, flags: u32) -> i32;
     fn cuEventRecord(event: u64, stream: u64) -> i32;
     fn cuEventSynchronize(event: u64) -> i32;
@@ -173,7 +176,7 @@ struct TunedPlan {
 unsafe impl Send for TunedPlan {}
 unsafe impl Sync for TunedPlan {}
 
-type PlanShape = (u32, u32, u32);
+type PlanShape = (u32, u32, u32, i32, u32);
 type PlanCache = std::collections::HashMap<PlanShape, &'static TunedPlan>;
 
 static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
@@ -184,9 +187,24 @@ static PLANS: OnceLock<std::sync::Mutex<PlanCache>> = OnceLock::new();
 /// another stream is mid graph-capture), and cache the winner. The naive
 /// heuristic[0] pick left the K=8 verify o_proj at 113 GB/s (~24 CTAs on 48
 /// SMs, no split-K) — tuning recovers the split-K/tile choice per shape.
-fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
+fn tuned_plan(m: u32, n: u32, k: u32, ldc: u32) -> Result<&'static TunedPlan> {
+    tuned_plan_dt(m, n, k, CUDA_R_16BF, 2, ldc)
+}
+
+/// As [`tuned_plan`], but with the A/B operand element type chosen by the
+/// caller (`at`, `ab` = its size in bytes). D stays BF16. The plan cache is
+/// keyed by operand type AND the output row stride as well as shape, so FP8
+/// and BF16 plans — and plans for different `ldc` — never collide.
+fn tuned_plan_dt(
+    m: u32,
+    n: u32,
+    k: u32,
+    at: i32,
+    ab: usize,
+    ldc: u32,
+) -> Result<&'static TunedPlan> {
     let plans = PLANS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(p) = plans.lock().unwrap().get(&(m, n, k)) {
+    if let Some(p) = plans.lock().unwrap().get(&(m, n, k, at, ldc)) {
         return Ok(p);
     }
     let ctx = ctx()?;
@@ -220,15 +238,15 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         let mut lb: cublasLtMatrixLayout_t = std::ptr::null_mut();
         let mut ld_: cublasLtMatrixLayout_t = std::ptr::null_mut();
         chk(
-            cublasLtMatrixLayoutCreate(&mut la, CUDA_R_16BF, k as u64, n as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut la, at, k as u64, n as u64, k as i64),
             "LayoutA",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut lb, CUDA_R_16BF, k as u64, m as u64, k as i64),
+            cublasLtMatrixLayoutCreate(&mut lb, at, k as u64, m as u64, k as i64),
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, ldc as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -275,19 +293,19 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         // caller's stream (which may be mid graph-capture).
         let (mut dw, mut da, mut dd): (u64, u64, u64) = (0, 0, 0);
         chk(
-            cuMemAlloc_v2(&mut dw, n as usize * k as usize * 2),
+            cuMemAlloc_v2(&mut dw, n as usize * k as usize * ab),
             "tuneAllocW",
         )?;
         chk(
-            cuMemAlloc_v2(&mut da, m as usize * k as usize * 2),
+            cuMemAlloc_v2(&mut da, m as usize * k as usize * ab),
             "tuneAllocA",
         )?;
         chk(
-            cuMemAlloc_v2(&mut dd, m as usize * n as usize * 2),
+            cuMemAlloc_v2(&mut dd, m as usize * ldc as usize * 2),
             "tuneAllocD",
         )?;
-        cuMemsetD8_v2(dw, 0, n as usize * k as usize * 2);
-        cuMemsetD8_v2(da, 0, m as usize * k as usize * 2);
+        cuMemsetD8_v2(dw, 0, n as usize * k as usize * ab);
+        cuMemsetD8_v2(da, 0, m as usize * k as usize * ab);
         let mut ts: u64 = 0;
         chk(cuStreamCreate(&mut ts, 1), "tuneStream")?;
         let (mut e0, mut e1): (u64, u64) = (0, 0);
@@ -295,9 +313,16 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         cuEventCreate(&mut e1, 0);
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
-        let mut best = 0usize;
-        let mut best_ms = f32::INFINITY;
+        // Candidate timings, indexed 1:1 with `results`. NaN = candidate was
+        // rejected (bad state, runtime refusal, or event failure) and is not
+        // eligible. Selection happens AFTER the loop so the winner is a pure
+        // function of the ordering, not of measurement sequence.
+        let mut times = vec![f32::NAN; returned as usize];
         let iters = 10;
+        // Bursts are min-reduced: cross-process spread for a FIXED algo was
+        // measured at 2-23% on GB10 (one transient per ~9 runs dominates the
+        // tail), and min-of-k is the robust estimator that filters it.
+        let bursts = 3;
         for (i, r) in results.iter().enumerate().take(returned as usize) {
             if r.state != 0 {
                 continue;
@@ -325,20 +350,32 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             if run(ts) != 0 {
                 continue; // algo rejected at runtime — skip
             }
-            cuEventRecord(e0, ts);
+            // Warmup burst, untimed: first-touch of this algo's workspace and
+            // any lazy kernel load must not land inside a measured window.
             for _ in 0..iters {
                 let _ = run(ts);
             }
-            cuEventRecord(e1, ts);
-            if cuEventSynchronize(e1) != 0 {
+            if cuStreamSynchronize(ts) != 0 {
                 continue;
             }
-            let mut ms = 0f32;
-            cuEventElapsedTime(&mut ms, e0, e1);
-            let per = ms / iters as f32;
-            if per < best_ms {
-                best_ms = per;
-                best = i;
+            let mut per = f32::INFINITY;
+            let mut ok = true;
+            for _ in 0..bursts {
+                cuEventRecord(e0, ts);
+                for _ in 0..iters {
+                    let _ = run(ts);
+                }
+                cuEventRecord(e1, ts);
+                if cuEventSynchronize(e1) != 0 {
+                    ok = false;
+                    break;
+                }
+                let mut ms = 0f32;
+                cuEventElapsedTime(&mut ms, e0, e1);
+                per = per.min(ms / iters as f32);
+            }
+            if ok && per.is_finite() {
+                times[i] = per;
             }
         }
         cuEventDestroy_v2(e0);
@@ -348,10 +385,58 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
         cuMemFree_v2(da);
         cuMemFree_v2(dd);
 
-        let bytes = n as u64 * k as u64 * 2;
+        // Deterministic selection. A wall-clock race between candidates that
+        // are numerically DIFFERENT but equally fast is a per-process coin
+        // flip: whichever algo wins picks a different split-K count, hence a
+        // different fp32 accumulation order, hence different bf16 roundings.
+        // On Qwen3.8-Flash-Next the 2048x4x10240 hyperconnection inject offers
+        // 8 split-K variants that all measure 0.148ms, and the flip propagated
+        // a 1-ULP perturbation from layer 0 into an argmax flip at the head --
+        // the same binary and config produced different completions at T=0.
+        //
+        // So: take the fastest time, then keep the LOWEST-INDEXED candidate
+        // within TIE_EPS of it. cuBLASLt returns candidates in its own
+        // deterministic preference order, so ties resolve to the heuristic's
+        // own top pick and the outcome is a function of the ORDERING. A rule
+        // that instead threaded a running incumbent through the loop would
+        // still let measured duration decide, only at a smaller margin.
+        //
+        // TIE_EPS must exceed the cross-process noise floor for a FIXED algo,
+        // which was measured at 2-23% on GB10 before the warmup/min-of-bursts
+        // hardening above. Verify with two processes and diff the tune lines
+        // across EVERY shape after changing it.
+        // 0.20 is calibrated, not chosen: the worst WITHIN-process ratio of
+        // candidate[0] to the fastest candidate observed across a two-process
+        // receipt was 1.099 (2048x10240x320, where the two candidates' order
+        // reversed between processes), so this is ~2x headroom on measured
+        // data. Its cost is bounded by the same number: at most ~10% on that
+        // one shape, 0-3.4% on the other eight, against a prefill where that
+        // GEMM is <0.1% of the time. Re-derive it from a receipt if the
+        // candidate set changes.
+        const TIE_EPS: f32 = 0.20;
+        let t_min = times
+            .iter()
+            .copied()
+            .filter(|t| t.is_finite())
+            .fold(f32::INFINITY, f32::min);
+        if !t_min.is_finite() {
+            bail!("cuBLASLt: every algorithm for {m}x{n}x{k} failed to run");
+        }
+        let band = t_min * (1.0 + TIE_EPS);
+        let best = times
+            .iter()
+            .position(|t| t.is_finite() && *t <= band)
+            .expect("t_min is finite, so at least one candidate is within the band");
+        let best_ms = times[best];
+        let in_band = times
+            .iter()
+            .filter(|t| t.is_finite() && **t <= band)
+            .count();
+        let bytes = n as u64 * k as u64 * ab as u64;
         tracing::info!(
-            "cuBLASLt tune {m}x{n}x{k}: algo[{best}] of {returned} @ {best_ms:.3}ms \
-             ({:.0} GB/s weight-read)",
+            "cuBLASLt tune {m}x{n}x{k} dtype={at}: algo[{best}] of {returned} @ {best_ms:.3}ms \
+             ({:.0} GB/s weight-read) fastest={t_min:.3}ms tie_band={in_band} \
+             eps={TIE_EPS} times={times:.4?}",
             bytes as f64 / (best_ms as f64 / 1e3) / 1e9,
         );
         let plan: &'static TunedPlan = Box::leak(Box::new(TunedPlan {
@@ -361,7 +446,7 @@ fn tuned_plan(m: u32, n: u32, k: u32) -> Result<&'static TunedPlan> {
             ld: ld_ as usize,
             algo: results[best].algo,
         }));
-        plans.lock().unwrap().insert((m, n, k), plan);
+        plans.lock().unwrap().insert((m, n, k, at, ldc), plan);
         Ok(plan)
     }
 }
@@ -377,9 +462,27 @@ pub fn bf16_gemm_act_weight_t_tuned(
     k: u32,
     stream: u64,
 ) -> Result<()> {
-    let plan = tuned_plan(m, n, k)?;
+    bf16_gemm_act_weight_t_tuned_ex(act, weight, out, m, n, k, n, 1.0, stream)
+}
+
+/// Tuned variant with explicit output stride and alpha (plans cached per (m,n,k,ldc)).
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_tuned_ex(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldc: u32,
+    alpha: f32,
+    stream: u64,
+) -> Result<()> {
+    if ldc < n {
+        bail!("cuBLASLt: ldc {ldc} < n {n}");
+    }
+    let plan = tuned_plan(m, n, k, ldc)?;
     let ctx = ctx()?;
-    let alpha: f32 = 1.0;
     let beta: f32 = 0.0;
     unsafe {
         chk(
@@ -418,6 +521,26 @@ pub fn bf16_gemm_act_weight_t(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    bf16_gemm_act_weight_t_ldc(act, weight, out, m, n, k, n, 1.0, stream)
+}
+
+/// [`bf16_gemm_act_weight_t`] with an explicit output row stride `ldc >= n`
+/// (elements), so a projection can land inside a wider interleaved row.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_ldc(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    ldc: u32,
+    alpha: f32,
+    stream: u64,
+) -> Result<()> {
+    if ldc < n {
+        bail!("cuBLASLt: ldc {ldc} < n {n}");
+    }
     let ctx = ctx()?;
     unsafe {
         let mut desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
@@ -460,7 +583,7 @@ pub fn bf16_gemm_act_weight_t(
             "LayoutB",
         )?;
         chk(
-            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, n as i64),
+            cublasLtMatrixLayoutCreate(&mut ld_, CUDA_R_16BF, n as u64, m as u64, ldc as i64),
             "LayoutD",
         )?;
         let mut pref: cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -497,7 +620,7 @@ pub fn bf16_gemm_act_weight_t(
         if returned < 1 {
             bail!("cuBLASLt: no algorithm for {m}x{n}x{k}");
         }
-        let alpha: f32 = 1.0;
+        let alpha: f32 = alpha;
         let beta: f32 = 0.0;
         let status = cublasLtMatmul(
             ctx.handle,
@@ -525,4 +648,60 @@ pub fn bf16_gemm_act_weight_t(
         chk(status, "Matmul")?;
     }
     Ok(())
+}
+
+/// Row-major `out[M,N] = act[M,K] @ weight[N,K]ᵀ` with **FP8 e4m3 operands and
+/// a BF16 result**, using the same per-shape immortal plan cache as
+/// [`bf16_gemm_act_weight_t_tuned`], so there is no per-call descriptor or
+/// heuristic work. The first call at a given shape autotunes over the
+/// heuristic's top-16 algorithms on a private stream; every later call is a
+/// single `cublasLtMatmul`.
+///
+/// The hand-written prefill kernels round both operands to e4m3 before
+/// `mma.sync...f32.e4m3.e4m3.f32` (the W4A16 path dequantises NVFP4 and
+/// re-rounds via `cvt.rn.satfinite.e4m3x2.f32`), so passing those same e4m3
+/// bytes here computes identical products and differs only in accumulation
+/// order. Not bit-exact by construction; gated and gate-tested.
+///
+/// `k` and `n` must be multiples of 16 (cuBLASLt FP8 constraint).
+pub fn fp8_gemm_act_weight_t(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    if k % 16 != 0 || n % 16 != 0 {
+        bail!("cuBLASLt FP8 requires k and n multiples of 16, got k={k} n={n}");
+    }
+    // FP8 path writes a packed [m, n] output, so the row stride is n.
+    let plan = tuned_plan_dt(m, n, k, CUDA_R_8F_E4M3, 1, n)?;
+    let ctx = ctx()?;
+    let alpha: f32 = 1.0;
+    let beta: f32 = 0.0;
+    unsafe {
+        chk(
+            cublasLtMatmul(
+                ctx.handle,
+                plan.desc as cublasLtMatmulDesc_t,
+                &alpha as *const f32 as *const c_void,
+                weight as *const c_void,
+                plan.la as cublasLtMatrixLayout_t,
+                act as *const c_void,
+                plan.lb as cublasLtMatrixLayout_t,
+                &beta as *const f32 as *const c_void,
+                out as *const c_void,
+                plan.ld as cublasLtMatrixLayout_t,
+                out as *mut c_void,
+                plan.ld as cublasLtMatrixLayout_t,
+                plan.algo.as_ptr() as *const c_void,
+                ctx.workspace as *mut c_void,
+                ctx.ws_size,
+                stream as *mut c_void,
+            ),
+            "MatmulFp8Tuned",
+        )
+    }
 }

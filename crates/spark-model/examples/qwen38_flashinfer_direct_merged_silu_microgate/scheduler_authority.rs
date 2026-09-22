@@ -44,7 +44,11 @@ impl SchedulerSession {
         );
         trusted_root_file(manifest_path, 0o444, "scheduler manifest")?;
         let manifest = HeldFile::open(manifest_path, None)?;
-        let fields = parse_manifest(&manifest.read_text()?)?;
+        // The text must be BOUND: `parse_manifest` borrows from it, so passing
+        // the temporary directly drops it at the end of the statement while
+        // `fields` still points into it.
+        let manifest_text = manifest.read_text()?;
+        let fields = parse_manifest(&manifest_text)?;
         bind_manifest(&fields, binary, bundle, sources)?;
         let build = open_build_authority(&fields, binary, bundle, sources)?;
 
@@ -71,8 +75,8 @@ impl SchedulerSession {
         let ticket_meta = ticket.metadata()?;
         ensure!(
             ticket_meta.mode() & 0o170_000 == 0o010_000
-                && ticket_meta.dev() == decimal(&fields, "ticket_dev")?
-                && ticket_meta.ino() == decimal(&fields, "ticket_ino")?,
+                && ticket_meta.dev() == decimal::<u64>(&fields, "ticket_dev")?
+                && ticket_meta.ino() == decimal::<u64>(&fields, "ticket_ino")?,
             "scheduler ticket descriptor identity changed"
         );
         let mut ticket_bytes = [0_u8; TICKET_BYTES];
@@ -97,8 +101,8 @@ impl SchedulerSession {
                 && receipt_meta.mode() & 0o7777 == 0o400
                 && receipt_meta.nlink() == 1
                 && receipt_meta.len() == 0
-                && receipt_meta.dev() == decimal(&fields, "receipt_dev")?
-                && receipt_meta.ino() == decimal(&fields, "receipt_ino")?
+                && receipt_meta.dev() == decimal::<u64>(&fields, "receipt_dev")?
+                && receipt_meta.ino() == decimal::<u64>(&fields, "receipt_ino")?
                 && receipt_meta.dev() == path_meta.dev()
                 && receipt_meta.ino() == path_meta.ino(),
             "scheduler receipt descriptor identity changed"

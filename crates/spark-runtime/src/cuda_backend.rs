@@ -12,6 +12,7 @@ use anyhow::{Result, bail};
 use atlas_core::registry::AtlasRegistry;
 
 mod gpu_impl;
+mod transform_cache_identity;
 
 // ── Raw CUDA driver API for memory operations ──
 
@@ -41,11 +42,11 @@ unsafe extern "C" {
     pub(super) fn cuGraphLaunch(hGraphExec: u64, hStream: u64) -> i32;
     pub(super) fn cuGraphExecDestroy(hGraphExec: u64) -> i32;
     pub(super) fn cuGraphDestroy(hGraph: u64) -> i32;
-    fn cuCtxGetCurrent(pctx: *mut u64) -> i32;
     pub(super) fn cuCtxSetCurrent(ctx: u64) -> i32;
     // Device properties. `CUdevice` is an opaque int handle, not a pointer.
     pub(super) fn cuCtxGetDevice(device: *mut i32) -> i32;
     pub(super) fn cuDeviceGetAttribute(pi: *mut i32, attrib: u32, dev: i32) -> i32;
+    pub(super) fn cuDriverGetVersion(driver_version: *mut i32) -> i32;
     pub(super) fn cuStreamCreate(phStream: *mut u64, flags: u32) -> i32;
     // Page-locked host memory for efficient async transfers
     pub(super) fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;
@@ -68,6 +69,8 @@ pub struct AtlasCudaBackend {
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
     cuda_ctx: u64,
+    /// Exact ordered module-name/PTX receipt used to initialize the registry.
+    transform_cache_identity: Option<String>,
 }
 
 impl AtlasCudaBackend {
@@ -80,13 +83,16 @@ impl AtlasCudaBackend {
     pub fn new(ordinal: usize, ptx_modules: &[(&'static str, &str)]) -> Result<Self> {
         let registry = AtlasRegistry::get_or_init(ordinal, ptx_modules)
             .map_err(|e| anyhow::anyhow!("AtlasRegistry init failed: {e}"))?;
+        registry
+            .ctx
+            .bind_to_thread()
+            .map_err(|e| anyhow::anyhow!("AtlasRegistry context bind failed: {e}"))?;
         let default_stream = registry.raw_stream();
 
-        // Capture current CUDA context for cross-thread binding.
-        let mut cuda_ctx: u64 = 0;
-        let status = unsafe { cuCtxGetCurrent(&mut cuda_ctx) };
-        if status != 0 || cuda_ctx == 0 {
-            bail!("cuCtxGetCurrent failed: status {status}, ctx {cuda_ctx:#x}");
+        // Capture the registry-owned CUDA context for cross-thread binding.
+        let cuda_ctx = registry.ctx.cu_ctx() as u64;
+        if cuda_ctx == 0 {
+            bail!("AtlasRegistry returned a null CUDA context");
         }
 
         tracing::info!(
@@ -94,9 +100,18 @@ impl AtlasCudaBackend {
             ptx_modules.len()
         );
 
+        let transform_cache_identity =
+            match transform_cache_identity::identity(registry.initialization_identity()) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    tracing::warn!("transform-cache CUDA identity unavailable: {error:#}");
+                    None
+                }
+            };
         Ok(Self {
             default_stream,
             cuda_ctx,
+            transform_cache_identity,
         })
     }
 

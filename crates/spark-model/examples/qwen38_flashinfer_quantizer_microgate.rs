@@ -60,6 +60,13 @@ unsafe extern "C" {
 #[derive(Debug)]
 struct FunctionResources {
     max_threads: i32,
+    /// REPORTED, NOT GATED. It reaches the operator through the `{:?}` in the
+    /// `ensure!` message and the RESOURCES line, but `derive(Debug)` does not
+    /// count as a read for `dead_code`, hence the allow. Its three siblings
+    /// carry thresholds; this one does not, and inventing a shared-memory
+    /// bound here to silence the lint would be fabricating a gate criterion
+    /// nobody measured. Give it a threshold when one has been established.
+    #[allow(dead_code)]
     shared_bytes: i32,
     local_bytes: i32,
     registers: i32,

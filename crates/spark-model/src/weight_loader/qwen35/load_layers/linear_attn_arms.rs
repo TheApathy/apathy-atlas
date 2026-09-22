@@ -7,7 +7,7 @@
 use anyhow::Result;
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::weights::WeightStore;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::layer::TransformerLayer;
 use crate::layers::{FfnComponent, Qwen3SsmLayer};
@@ -15,6 +15,19 @@ use crate::weight_map::{
     DenseWeight, Fp8Weight, Nvfp4Variant, QuantizedWeight, SsmWeights, gpu_concat_rows,
     interleave_ba, load_fp8_block_scaled_as_fp8weight, load_ssm_qwen35, quantize_to_nvfp4,
 };
+
+fn retain_bf16_out_proj(value: Option<&str>) -> bool {
+    matches!(value, Some("1"))
+}
+
+fn release_bf16_store_alias(
+    store: &WeightStore,
+    name: &str,
+    dense: DenseWeight,
+    gpu: &dyn GpuBackend,
+) -> Result<usize> {
+    store.release_consumed_alias(name, dense.weight, WeightDtype::BF16, gpu)
+}
 
 // Currently unused while the FP8 LinearAttention dispatch arm in the
 // caller (`load_layers.rs`) is short-circuited; preserved for the
@@ -172,6 +185,36 @@ pub(super) fn build_linear_attention_nvfp4(
         gpu,
     )?;
 
+    // The combined QKVZ and interleaved BA buffers above are durable copies.
+    // On BF16 checkpoints, retaining their four source allocations in the
+    // immutable WeightStore needlessly raises construction peak by gigabytes.
+    // Pointer + dtype matching makes packed/dequantized variants a no-op.
+    let mut reclaimed_source_bytes = 0usize;
+    reclaimed_source_bytes += release_bf16_store_alias(
+        store,
+        &format!("{lp}.linear_attn.in_proj_qkv.weight"),
+        ssm35.in_proj_qkv,
+        gpu,
+    )?;
+    reclaimed_source_bytes += release_bf16_store_alias(
+        store,
+        &format!("{lp}.linear_attn.in_proj_z.weight"),
+        ssm35.in_proj_z,
+        gpu,
+    )?;
+    reclaimed_source_bytes += release_bf16_store_alias(
+        store,
+        &format!("{lp}.linear_attn.in_proj_a.weight"),
+        ssm35.in_proj_a,
+        gpu,
+    )?;
+    reclaimed_source_bytes += release_bf16_store_alias(
+        store,
+        &format!("{lp}.linear_attn.in_proj_b.weight"),
+        ssm35.in_proj_b,
+        gpu,
+    )?;
+
     let qkvz_size = config.ssm_qkvz_size();
     let qkvz_nvfp4 =
         quantize_to_nvfp4(&qkvz_dense, qkvz_size, h, gpu, absmax_k, quantize_k, stream)?;
@@ -275,10 +318,9 @@ pub(super) fn build_linear_attention_nvfp4(
     // HF). Test fix for long-context drift root cause (commit 1db7572
     // and onward investigation). ssm35.out_proj is the BF16 weight
     // (loaded via dense_auto with FP8→BF16 dequant).
-    if matches!(
-        std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref(),
-        Some("1")
-    ) {
+    let retain_out_proj =
+        retain_bf16_out_proj(std::env::var("ATLAS_GDN_BF16_WEIGHTS").ok().as_deref());
+    if retain_out_proj {
         // ssm35.out_proj weight is BF16 on GPU (from load_ssm_qwen35 →
         // dense_auto on Fp8Dequanted variant). It's a separate buffer
         // from out_proj_nvfp4 / out_proj_fp8_prefill. Set as dense path.
@@ -286,6 +328,32 @@ pub(super) fn build_linear_attention_nvfp4(
         tracing::info!(
             "SSM[{lp}] ATLAS_GDN_BF16_WEIGHTS: out_proj routed through BF16 dense_gemm (overrides FP8/NVFP4)"
         );
+    } else {
+        reclaimed_source_bytes += release_bf16_store_alias(
+            store,
+            &format!("{lp}.linear_attn.out_proj.weight"),
+            ssm35.out_proj,
+            gpu,
+        )?;
+    }
+    if reclaimed_source_bytes != 0 {
+        tracing::debug!(
+            "SSM[{lp}] released {:.2} MiB of replaced BF16 source projections",
+            reclaimed_source_bytes as f64 / (1024.0 * 1024.0)
+        );
     }
     Ok(Box::new(layer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_bf16_out_proj;
+
+    #[test]
+    fn bf16_out_proj_retention_selector_is_exact() {
+        assert!(retain_bf16_out_proj(Some("1")));
+        for rejected in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+            assert!(!retain_bf16_out_proj(rejected));
+        }
+    }
 }

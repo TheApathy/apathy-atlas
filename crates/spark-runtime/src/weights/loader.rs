@@ -175,9 +175,7 @@ impl WeightLoader for SafetensorsLoader {
             weight_map.extend(extra_weights);
         }
 
-        Ok(WeightStore {
-            weights: weight_map,
-        })
+        Ok(WeightStore::from_map(weight_map))
     }
 }
 
@@ -264,6 +262,7 @@ pub(crate) fn estimate_load_bytes(
             }
             let numel: usize = shape.iter().product();
             let elem_bytes = match dtype {
+                safetensors::Dtype::F64 | safetensors::Dtype::I64 | safetensors::Dtype::U64 => 8,
                 safetensors::Dtype::F32 | safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
                 safetensors::Dtype::F16
                 | safetensors::Dtype::BF16
@@ -297,6 +296,7 @@ pub(crate) fn estimate_has_fp8(
             }
             let numel: usize = shape.iter().product();
             let elem_bytes = match dtype {
+                safetensors::Dtype::F64 | safetensors::Dtype::I64 | safetensors::Dtype::U64 => 8,
                 safetensors::Dtype::F32 | safetensors::Dtype::I32 | safetensors::Dtype::U32 => 4,
                 safetensors::Dtype::F16
                 | safetensors::Dtype::BF16

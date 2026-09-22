@@ -80,7 +80,11 @@ pub(super) fn validate_build_recipe(argv_hex: &str, env_hex: &str, cargo: &str) 
         "build argv is not the exact released example command"
     );
     let mut environment = BTreeMap::new();
-    for record in decode_records(env_hex, "build environment")? {
+    // BOUND FIRST so the owned `String`s outlive the map. `decode_records`
+    // returns `Vec<String>`; iterating it by value drops each record at the end
+    // of its iteration while `environment` still holds `&str` slices into it.
+    let env_records = decode_records(env_hex, "build environment")?;
+    for record in &env_records {
         let (key, value) = record
             .split_once('=')
             .context("build environment record omitted equals")?;

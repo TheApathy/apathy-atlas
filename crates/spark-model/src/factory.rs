@@ -30,6 +30,7 @@ use crate::weight_loader::{
 /// target before constructing [`crate::layers::BlockDiffusionDraftHead`].
 pub struct DflashBuildArgs<'a> {
     pub drafter_store: &'a WeightStore,
+    pub donor_store: Option<&'a WeightStore>,
     pub drafter_config: DflashConfig,
     pub gamma: Option<usize>,
     pub dspark_verify_mode: DsparkVerifyMode,
@@ -73,6 +74,10 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         // full-attention layers — both handled at forward-pass layer time,
         // not during weight loading.
         "qwen3_6_moe" => Ok(Box::new(Qwen35WeightLoader)),
+        // Qwen3.8-Flash-Next (Qwen4 experimental text architecture) reuses
+        // the Qwen3.5 attention/GDN/MoE cores and installs its gated
+        // four-stream wrappers in that loader.
+        "qwen4_exp" => Ok(Box::new(Qwen35WeightLoader)),
         // Nemotron-H family (Mamba-2 + MoE + Attention)
         "nemotron_h" => Ok(Box::new(NemotronHWeightLoader)),
         // Gemma-4 family (pure attention, GeGLU, sliding + full attention)
@@ -84,7 +89,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
         "minimax_m2" => Ok(Box::new(MinimaxM2WeightLoader)),
         _ => bail!(
             "Unsupported model type: '{}' (normalized: '{}'). \
-             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, qwen3_vl_moe, nemotron_h, gemma4, mistral, minimax_m2",
+             Supported: qwen3_next, qwen3_5_moe, qwen3_5, qwen3_6_moe, qwen4_exp, qwen3_vl_moe, nemotron_h, gemma4, mistral, minimax_m2",
             config.model_type,
             normalized,
         ),
@@ -93,6 +98,7 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 
 mod build;
 mod m2_setup;
+mod qwen4_stream_t;
 
 pub use build::build_model;
 

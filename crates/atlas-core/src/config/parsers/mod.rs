@@ -15,4 +15,5 @@ pub(crate) use minimax::parse_minimax_m2;
 pub use mistral::parse_mistral_params;
 pub use quantization::parse_quantization_config;
 pub(crate) use qwen_yarn::parse_qwen_rope_parameters;
+pub(crate) use quantization::parse_quantization_config_checked;
 pub(crate) use vision::parse_vision_config;

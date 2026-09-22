@@ -99,7 +99,11 @@ impl TransformerModel {
         } else {
             (pos_stream_bytes + 7) & !7
         };
-        let needs_paged = effective_seq_len_start > 0;
+        // Qwen4 serializes four-stream prompt rows through decode attention
+        // during bring-up, including chunk zero. It therefore needs the
+        // paged block table and mutable sequence-length scalar even where the
+        // ordinary batched prefill path would use contiguous flash attention.
+        let needs_paged = effective_seq_len_start > 0 || self.config.is_qwen4_exp();
         let layout = MetaLayout {
             meta_base,
             slot_offset,

@@ -82,6 +82,13 @@ pub struct SequenceState {
     pub seq_len: usize,
     /// Immutable target rotary coordinates; cache/token indices stay physical.
     pub rotary_positions: RotaryPositions,
+    /// Whether this request can reach Qwen4's sparse-attention boundary.
+    ///
+    /// QSA must index every prefix token when true, but maintaining its side
+    /// cache is pure overhead for requests whose prompt plus decode budget
+    /// remains below 2048 tokens. The scheduler sets this once from the
+    /// immutable request budget before prefill starts.
+    pub qwen4_qsa_required: bool,
     /// Per-layer state (EmptyLayerState for attention, SsmLayerState for SSM).
     pub layer_states: Vec<Box<dyn LayerState>>,
     /// Per-sequence state for the speculative proposer on the ACTIVE arm
