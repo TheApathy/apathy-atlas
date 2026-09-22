@@ -292,6 +292,96 @@ mod tests {
         assert_ne!(leaked, cleared, "an uncleared carry produced the same result as a cleared one -- this control cannot show the leak it exists to catch");
     }
 
+    /// THE REAL ORACLE (dsv41-parity, 2026-09-22): production's own full-prompt
+    /// `engram_dead_heads` over two real chat-with-image requests, captured on CPU with the
+    /// actual pipeline (`app.py::build_chat_prompt`, `vision.py::expand_image_placeholders`,
+    /// `engine/vision.py::engram_dead_heads`). One case (`02_chat_image_ends_at_chunk`) has
+    /// its image span ending at position 510 -- one MAX_LOOKBACK short of the 512-token chunk
+    /// boundary -- so positions 512/513 of chunk 1 must come out dead from the carry alone.
+    /// Replays both requests chunked at 512 tokens through `engram_dead_heads_with_carry` +
+    /// `update_dead_carry`, matching what `forward.rs::pass` does for `PassKind::EncoderChunk`.
+    #[test]
+    fn matches_dsv41_parity_full_prompt_oracle_across_a_real_chunk_boundary() {
+        let path = "/home/flocka/atlas/DSV41_PORT/parity/vision_e2e/dead_heads_oracle.json";
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present on this box");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("parse dead_heads_oracle.json");
+        let obj = v.as_object().expect("top level must be an object of named requests");
+        assert!(!obj.is_empty(), "oracle file has no requests");
+
+        const CHUNK: usize = 512;
+        let mut checked_requests = 0usize;
+        for (name, req) in obj {
+            let ids: Vec<u32> = req["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let want: Vec<bool> = req["dead_heads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_array().unwrap().iter().map(|b| b.as_u64().unwrap() != 0))
+                .collect();
+            assert_eq!(want.len(), ids.len() * N_HEAD_COLS, "{name}: dead_heads shape does not match expanded_ids");
+
+            let mut carry: Vec<u32> = Vec::new();
+            let mut got: Vec<bool> = Vec::with_capacity(want.len());
+            for chunk in ids.chunks(CHUNK) {
+                got.extend(engram_dead_heads_with_carry(&carry, chunk));
+                update_dead_carry(&mut carry, chunk);
+            }
+            let mismatches = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            assert_eq!(mismatches, 0, "{name}: {mismatches}/{} entries differ from production's full-prompt oracle", got.len());
+            checked_requests += 1;
+        }
+        assert!(checked_requests > 0, "the replay must have checked at least one request");
+        eprintln!("full-prompt oracle replay: {checked_requests} request(s), all exact");
+    }
+
+    /// NEGATIVE CONTROL for the oracle test above: dropping the carry (chunking with a
+    /// no-carry `engram_dead_heads` per chunk) must disagree with production on
+    /// `02_chat_image_ends_at_chunk` -- specifically at positions 512 and 513, the two rows
+    /// dsv41-parity identified (dead-column counts 16 and 8 respectively, vs 0 with no carry).
+    #[test]
+    fn dropping_the_carry_disagrees_with_the_oracle_at_the_predicted_rows() {
+        let path = "/home/flocka/atlas/DSV41_PORT/parity/vision_e2e/dead_heads_oracle.json";
+        let Ok(text) = std::fs::read_to_string(path) else {
+            eprintln!("skipping: {path} not present on this box");
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).expect("parse dead_heads_oracle.json");
+        let Some(req) = v.get("02_chat_image_ends_at_chunk") else {
+            eprintln!("skipping: 02_chat_image_ends_at_chunk not present");
+            return;
+        };
+        let ids: Vec<u32> = req["expanded_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+        assert!(ids.len() > 513, "fixture too short to reach position 513");
+
+        const CHUNK: usize = 512;
+        let mut no_carry: Vec<bool> = Vec::new();
+        for chunk in ids.chunks(CHUNK) {
+            no_carry.extend(engram_dead_heads(chunk)); // deliberately wrong: no carry
+        }
+        fn row(v: &[bool], p: usize) -> &[bool] {
+            &v[p * N_HEAD_COLS..(p + 1) * N_HEAD_COLS]
+        }
+        assert_eq!(row(&no_carry, 512).iter().filter(|&&d| d).count(), 0, "no-carry row 512 must be all-False");
+        assert_eq!(row(&no_carry, 513).iter().filter(|&&d| d).count(), 0, "no-carry row 513 must be all-False");
+
+        let mut carry: Vec<u32> = Vec::new();
+        let mut with_carry: Vec<bool> = Vec::new();
+        for chunk in ids.chunks(CHUNK) {
+            with_carry.extend(engram_dead_heads_with_carry(&carry, chunk));
+            update_dead_carry(&mut carry, chunk);
+        }
+        assert_eq!(row(&with_carry, 512).iter().filter(|&&d| d).count(), 16, "carried row 512 must have 16 dead columns, per parity's oracle");
+        assert_eq!(row(&with_carry, 513).iter().filter(|&&d| d).count(), 8, "carried row 513 must have 8 dead columns, per parity's oracle");
+        assert_ne!(
+            row(&no_carry, 512),
+            row(&with_carry, 512),
+            "dropping the carry produced the same row 512 as carrying it -- this control cannot show the bug"
+        );
+    }
+
     /// An empty carry (a sequence's first chunk) must be identical to calling
     /// `engram_dead_heads` directly -- the carry-aware function is a strict
     /// generalisation, not a different algorithm.
