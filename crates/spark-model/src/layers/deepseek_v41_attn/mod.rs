@@ -2,15 +2,15 @@
 
 //! DeepSeek-V4.1 cross-layer sparse index attention.
 //!
-//! Status: schedule arithmetic only. The kernel lives in
-//! `kernels/gb10/deepseek-v4.1/attn/` and is not yet wired in; until it is,
-//! nothing here may be used to claim the model runs. A `full_attention`
-//! fallback for this architecture is a DIFFERENT MODEL producing wrong output,
-//! not a slower one, and must hard-stop rather than ship silently.
+//! `core::Dsv41SparseCore` is the forward's `AttnCore` + `PassHook`: compressor, indexer,
+//! L20 replay tail and the one-pass sparse attention (kernels in
+//! `kernels/gb10/deepseek-v4.1/cb3/dsv41_sparse_{attn,index}.cu`). Gated against
+//! runF_faithful / runG_replay by `examples/dsv41_attn_seam.rs` (SPEC.md 8f-8g). A
+//! `full_attention` fallback for this architecture is a DIFFERENT MODEL, not a slower one.
 
 pub mod index;
 pub mod schedule;
-pub mod seam;
+pub mod core;
 
 pub use schedule::{
     SparseSchedule, context_bucket, indexer_score_rows, indexer_topk_width, pad_topk,

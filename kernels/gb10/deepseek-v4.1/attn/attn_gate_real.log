@@ -22,4 +22,5 @@ NOTE: the gap against the bf16-P reference is this kernel being MORE
       per-layer bisect is only valid up to the FIRST routing flip.
 PRODUCTION entry (i64 idx, bf16 out)            : 0/4849664 differ from bf16(fp32 kernel) | CTRL other mode: 4562738 differ
 PRODUCTION entry (i64 idx, bf16 out) window-only: 0/4849664 differ from bf16(fp32 kernel) | CTRL other mode: 4809958 differ
+PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/4849664 differ from bf16(fp32 kernel)
 PASS one-pass streaming gather (controls separate)

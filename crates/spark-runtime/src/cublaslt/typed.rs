@@ -89,6 +89,17 @@ pub fn gemm_act_weight_t_typed(
             ),
             "PrefWorkspace",
         )?;
+        // NO SPLIT-K. At small M the top-1 heuristic splits K, which reorders the fp32
+        // accumulation (and with INPLACE/OUTPUT_TYPE schemes reduces in the OUTPUT dtype).
+        // Measured on DeepSeek-V4.1 L20's bf16 compressor GEMM (16x512x5120) vs runF_faithful:
+        // default schemes 70.7% bit-exact / top-k 296 of 512 rows wrong; fp32 split-K (mask 2)
+        // 97.75% / 53 rows; no split-K (mask 0) 100.00% / 1 row. torch's M=16 GEMM does not
+        // split K. CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK = 3, CUBLASLT_REDUCTION_SCHEME_NONE = 0.
+        let no_split_k: u32 = 0;
+        chk(
+            cublasLtMatmulPreferenceSetAttribute(pref, 3, &no_split_k as *const u32 as *const c_void, 4),
+            "PrefReductionSchemeNone",
+        )?;
         let mut result = [0u8; 128];
         let mut returned: i32 = 0;
         let heur = cublasLtMatmulAlgoGetHeuristic(

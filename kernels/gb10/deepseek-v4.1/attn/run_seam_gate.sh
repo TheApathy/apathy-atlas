@@ -8,7 +8,7 @@ echo "$(date -u +%FT%TZ) dsv41-attention seam gate vs runF (compress/index/atten
 exec 9>/home/flocka/atlas/.gb10.lock
 flock 9
 echo "$(date -u +%FT%TZ) dsv41-attention seam gate START pid=$$" >> $Q
-"$BIN" > "$LOG" 2>&1; rc=$?
+"$BIN" $RUN > "$LOG" 2>&1; rc=$?
 echo "$(date -u +%FT%TZ) dsv41-attention seam gate END rc=$rc pid=$$" >> $Q
 flock -u 9
 echo "DONE rc=$rc"

@@ -353,3 +353,21 @@ Two numerics facts this measured, both now contracts:
    gave ckv 70.7% bit-exact and top-k 296/512 rows wrong. With an fp32 split-K reduction (mask 2)
    it was still 97.75% and 53/512. With REDUCTION_SCHEME_MASK = 0 it is 100.00% and 1/512. The fix
    belongs in `cublaslt/typed.rs` (owned by dsv41-integrate), not here.
+
+## 8g. The core behind the forward's AttnCore + PassHook (layers/deepseek_v41_attn/core.rs)
+
+Superseded seams.rs for the loop (lead ruling). One object implements both traits of
+`weight_loader::deepseek_v41::{attn_block::AttnCore, forward::PassHook}` UNCHANGED. It owns
+ckv/ik/pending, L20's replay tail and ONE shared fp32 score scratch [max_chunk, n_pad(max_seq)]
+(logged at load), all allocated from max_seq/max_chunk; `Dsv41Model` serves one sequence, so
+the state lives in the core. New entry `dsv41_sparse_attn_w32` takes attn_block's i32 wpos;
+gated bit-identical to the fp32 kernel (0/4.85M, 0/1.57M).
+`cublaslt/typed.rs` now forbids split-K (REDUCTION_SCHEME_MASK = 0) — see 8f.
+
+Gate, teacher-forced at CoreArgs (core_gate_runF_faithful.log, core_gate_runG_replay.log): PASS
+    top-k rows differ     0/512 everywhere except L20 chunk 1: 1/512 (overlap .998)
+    attention bf16-exact  .9969-.9997 per layer/chunk, on the core's OWN ckv + top-k
+    ckv/ik                L2-14 >= .9983, L20 1.0000/.9999;  candidates 0 differ
+    chunk invariance      [0,511,1000,1023,1024] vs 2x512: 0 top-k rows, attention BIT-IDENTICAL
+    REPLAY (runG) L21     inherits L20's tail: top-k 0/128 rows differ, attention .9997
+    CONTROLS              cleared ckv .0021; dropped pending REFUSES; replay with win_lo=0 .0207
