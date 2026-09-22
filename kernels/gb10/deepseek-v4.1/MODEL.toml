@@ -1,0 +1,80 @@
+[model]
+name = "deepseek-v4.1"
+hf_id = "deepseek-ai/DeepSeek-V4.1-Flash-Next"
+architecture = "MLA + CB3 MoE + engram + cross-layer sparse attention"
+
+# Shapes are from the LOCAL checkpoint's `text_config`
+# (/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K/config.json),
+# flattened by `parse_deepseek_v41`. This is a DIFFERENT RELEASE from
+# `deepseek-v4-flash`, which is V4-Flash-0731; every major shape differs.
+layers_total = 40
+layers_full_attention = 40
+
+hidden_dim = 5120
+head_dim = 512
+q_heads = 64
+# MQA. This is why `DeepSeekV41WeightLoader::supports_tp` is false: 1 is not
+# divisible by any tp_size > 1. Architectural, not an unfinished feature.
+kv_heads = 1
+
+# MLA
+q_lora_rank = 1280
+qk_rope_head_dim = 64
+
+# MoE. `num_experts` is the ROUTER's id space. It is NOT what is on disk:
+# the K154-CB3 pack holds a per-layer permutation of 154, and production
+# serves a 124 prefix of that. See `atlas_core::config::ExpertPack`.
+num_experts = 384
+moe_intermediate_size = 2304
+
+[[model_types]]
+model_type = "deepseek_v41"
+
+# ---------------------------------------------------------------------------
+# Serving behaviour: parity with the production Python server
+# (dsv41-prefill-work/server/app.py + engine/v41_engine.py; see
+# DSV41_PORT/PARITY.md). Prompt rendering and output parsing for this
+# model_type are done by crates/spark-server/src/dsv41, not by Jinja or the
+# generic tool pipeline. These keys switch off the Atlas-only generation
+# heuristics that the Python engine does not have, so both engines sample
+# the same distribution.
+# Sections are [sampling.thinking_text|thinking_coding|non_thinking|tools].
+# build_parse.rs reads only those four names; `[sampling.general]` etc.
+# would be ignored without a warning.
+[sampling.thinking_text]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+presence_penalty = 0.0
+
+[sampling.thinking_coding]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+presence_penalty = 0.0
+
+[sampling.non_thinking]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+presence_penalty = 0.0
+
+[sampling.tools]
+temperature = 1.0
+top_p = 0.95
+top_k = 0
+presence_penalty = 0.0
+
+[behavior]
+tool_call_parser = "dsml_v41"
+# app.py --default-thinking off; the effort default (75) lives in crate::dsv41.
+thinking_default = false
+# Production runs DSV41_TOOL_GRAMMAR unset, so tool calls are unconstrained
+# and parsed from text (strict, then tolerant).
+disable_tool_grammar = true
+# No Python counterpart for any of these.
+enable_loop_watchdog = false
+enable_think_loop_watchdog = false
+confidence_early_stop = false
+rollback_resteer = false
+tool_retry = false

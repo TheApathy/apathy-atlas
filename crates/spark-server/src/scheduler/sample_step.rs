@@ -103,12 +103,7 @@ pub fn sample_token(
     }
     if temperature == 0.0 {
         // Greedy argmax over FP32
-        let best = f32_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        let best = spark_runtime::sampler::first_max_index(&f32_logits);
         return Ok(best);
     }
     let f32_bytes: &[u8] =
@@ -244,6 +239,13 @@ pub fn sample_token_with_grammar(
             f32_logits[id as usize] = f32::NEG_INFINITY;
         }
     }
+    // Kept as A's own structure (grammar_state is already unwrapped into `gs` above, at the
+    // `let Some(gs) = grammar_state else { .. }` earlier in this function -- D's conflicting
+    // side re-wrapped it in an `if let Some` that doesn't match, and also threaded penalties/
+    // history through a stage A doesn't apply them at, which is a separate, pre-existing gap
+    // out of scope for this cherry-pick). The argmax fix itself needs no change HERE: this
+    // path falls through to `sample_with_params` below, which now calls the fixed
+    // `first_max_index` internally via `sample_with_params_seeded` whenever temperature <= 0.
     gs.apply_bitmask_to_logits(&mut f32_logits);
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
