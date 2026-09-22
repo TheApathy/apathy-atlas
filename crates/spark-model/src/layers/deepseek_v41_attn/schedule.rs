@@ -37,6 +37,43 @@ pub struct SparseSchedule {
 }
 
 impl SparseSchedule {
+    /// Build from layer sets supplied by the caller.
+    ///
+    /// THIS is the constructor production code must use, with the constants
+    /// from `weight_loader::deepseek_v41::seams`
+    /// (INDEX_SOURCE_LAYERS / KV_SOURCE_LAYERS / CANDIDATE_SOURCE_LAYER /
+    /// INDEX_TOPK) or from engine's `IndexerAdmission`, which derives them from
+    /// the weight store. Two drifting copies of {2,8,14,20,24,28,32,36} is
+    /// exactly the mis-selection this module exists to prevent, so the layer
+    /// sets are a PARAMETER here and are not declared in this file outside the
+    /// test-only default below.
+    pub fn new(
+        num_layers: usize,
+        compress_ratios: Vec<usize>,
+        kv_source_layers: Vec<usize>,
+        index_source_layers: Vec<usize>,
+        candidate_source_layer: usize,
+        index_topk: usize,
+    ) -> Self {
+        Self {
+            num_layers,
+            compress_ratios,
+            kv_source_layers,
+            index_source_layers,
+            candidate_source_layer,
+            index_topk,
+            window_size: 128,
+            candidate_block_size: 8,
+            candidate_topk_blocks: 2048,
+        }
+    }
+
+    /// PROVISIONAL / TEST-ONLY. The V4.1-Flash-Next layer sets, hardcoded so
+    /// these tests can run before the attention and engine branches converge.
+    /// Once `seams` is reachable from this crate path, this must be replaced by
+    /// `SparseSchedule::new(..)` fed from it — the literals below are the
+    /// second copy, and the only acceptable second copy is one a test pins.
+    ///
     /// `compress_ratios = [0,0] + [2]*18 + [1]*20`, 40 layers.
     pub fn v41_flash_next() -> Self {
         let mut compress_ratios = vec![0usize; 2];

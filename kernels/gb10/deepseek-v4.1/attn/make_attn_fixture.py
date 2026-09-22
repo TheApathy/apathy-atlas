@@ -25,15 +25,22 @@ Two references are written, and the gate reports against BOTH (SPEC.md sec 5):
 Both are accumulated in float64 from the same bf16 inputs the kernel sees, so
 the gap between them is the P-rounding contract alone and nothing else.
 """
+import os
 import numpy as np, torch
 
-T, NH, D, NW, NC, RING, S = 128, 64, 512, 128, 512, 4096, 4096
+# DSV41_ATTN_SKEW scales the compressed rows so they produce much LARGER scores
+# than the window rows. Online-softmax rescaling error depends on the magnitude
+# ORDER in which blocks arrive, so a skewed fixture is the adversarial case for
+# the window-first-vs-compressed-first question. 1.0 = the neutral fixture.
+SKEW = float(os.environ.get("DSV41_ATTN_SKEW", "1.0"))
+T = int(os.environ.get("DSV41_ATTN_T", "128"))
+NH, D, NW, NC, RING, S = 64, 512, 128, 512, 4096, 4096
 torch.manual_seed(0)
 
 q    = (torch.randn(T, NH, D) * 0.05).to(torch.bfloat16)
 ring = (torch.randn(RING, D) * 0.05).to(torch.bfloat16)
 n_c  = (S + T)                                    # ratio 1 (layer 20): one compressed row per token
-ckv  = (torch.randn(n_c, D) * 0.05).to(torch.bfloat16)
+ckv  = (torch.randn(n_c, D) * 0.05 * SKEW).to(torch.bfloat16)
 sink = (torch.randn(NH) * 0.5).float()            # learned per-head, denominator only
 
 pos  = torch.arange(S, S + T)
@@ -94,6 +101,6 @@ ref32.numpy().astype(np.float32).tofile("ar_f32.bin")
 refbf.numpy().astype(np.float32).tofile("ar_bf16.bin")
 open("ar_dims.txt", "w").write(f"{T} {NH} {D} {NW} {NC} {RING} {n_c}\n")
 
-print(f"T={T} NH={NH} D={D} NW={NW} NC={NC} RING={RING} n_c={n_c}")
+print(f"SKEW={SKEW}  T={T} NH={NH} D={D} NW={NW} NC={NC} RING={RING} n_c={n_c}")
 print(f"masked cols: wpos {(wpos < 0).sum().item()}  cidx {(cidx < 0).sum().item()}")
 print(f"fp32-P vs bf16-P reference gap: rel_l2={gap:.3e}   <- the prefill kernel's accepted cost")
