@@ -2179,6 +2179,7 @@ dependencies = [
  "image",
  "lazy_static",
  "libc",
+ "libloading 0.8.9",
  "minijinja",
  "parking_lot",
  "prometheus",

@@ -6,7 +6,8 @@
 //!
 //! The pixel resampling (Pillow 10.4 BICUBIC, gray-127 `ImageOps.pad`) is
 //! reused from the V4-Vision path (`deepseek_vision_preprocess::bicubic`),
-//! which already matches Pillow. What differs from V4 is everything around
+//! which already matches Pillow. JPEG decode goes through libjpeg-turbo
+//! (`super::turbojpeg`), as Pillow's does. What differs from V4 is everything around
 //! it: the resize solver and token budget (1024 tokens, not 384), the token
 //! layout, and EXIF orientation.
 //!
@@ -115,8 +116,15 @@ fn percent_decode(s: &str) -> Vec<u8> {
 }
 
 /// `decode_image_record`: an encoder image record (`{"url"|"data"|"source": ...}`)
-/// or a bare string -> RGB, EXIF-transposed. Remote URLs are refused.
+/// or a bare string -> RGB, EXIF-transposed. Remote URLs are refused. JPEGs
+/// decode through libjpeg-turbo (Pillow's decoder) when it is installed.
 pub fn decode_image_record(record: &Value) -> Result<RgbImage> {
+    decode_image_record_with(record, true)
+}
+
+/// `use_turbo = false` forces the zune-jpeg path (the fallback, and the
+/// negative control in the tests).
+pub(crate) fn decode_image_record_with(record: &Value, use_turbo: bool) -> Result<RgbImage> {
     let value = match record {
         Value::Object(m) => m
             .get("data")
@@ -152,8 +160,16 @@ pub fn decode_image_record(record: &Value) -> Result<RgbImage> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder)
-        .map_err(|_| anyhow::anyhow!("invalid PNG/JPEG image"))?;
+    let turbo = if format == ImageFormat::Jpeg && use_turbo {
+        super::turbojpeg::decode_rgb(&raw)?
+    } else {
+        None
+    };
+    let mut img = match turbo {
+        Some(rgb) => DynamicImage::ImageRgb8(rgb),
+        None => DynamicImage::from_decoder(decoder)
+            .map_err(|_| anyhow::anyhow!("invalid PNG/JPEG image"))?,
+    };
     img.apply_orientation(orientation);
     Ok(img.to_rgb8())
 }
@@ -405,15 +421,14 @@ mod tests {
             );
             let want_types: Vec<u8> = serde_json::from_value(c["types"].clone()).unwrap();
             assert_eq!(prep.types, want_types, "{name}: types");
-            if name.starts_with("jpeg") && std::env::var("DSV41_JPEG_PIXELS").is_err() {
-                // KNOWN GAP: image's zune-jpeg and Pillow's libjpeg-turbo decode the
-                // same JPEG differently (measured on these fixtures: 28% of RGB
-                // values differ, max 9-12 levels). Geometry, orientation and
-                // types above are exact; the pixels are checked by
-                // `jpeg_pixels_match_pillow` (ignored until a libjpeg-turbo
-                // decoder is linked). PNG pixels ARE bit-exact.
+            if name.starts_with("jpeg") {
+                // JPEG pixels are exact only through libjpeg-turbo; without it
+                // this test must fail rather than quietly skip them.
+                assert!(
+                    super::super::turbojpeg::available(),
+                    "libturbojpeg.so.0 is required for JPEG parity"
+                );
                 jpeg += 1;
-                continue;
             }
             let head: Vec<f32> = serde_json::from_value(c["patches_head"].clone()).unwrap();
             assert_eq!(
@@ -429,7 +444,7 @@ mod tests {
             ok += 1;
         }
         assert!(
-            ok >= 9 && jpeg == 2 && refused >= 3,
+            ok >= 11 && jpeg == 2 && refused >= 3,
             "{ok} images, {jpeg} jpeg, {refused} refusals"
         );
         // the oversized payload is not stored in the fixture: build one
@@ -448,14 +463,29 @@ mod tests {
         assert!(err.contains("pixel limit"), "{err}");
     }
 
-    /// Fails today (see the KNOWN GAP above). Run with
-    /// `DSV41_JPEG_PIXELS=1 cargo test ... -- --ignored jpeg_pixels`.
+    /// NEGATIVE CONTROL: the zune-jpeg fallback must NOT reproduce Pillow's
+    /// JPEG pixels (measured: 28% of RGB values differ), or the JPEG check
+    /// above could not tell the two decoders apart.
     #[test]
-    #[ignore = "zune-jpeg != libjpeg-turbo: 28% of values differ by up to 12 levels"]
-    fn jpeg_pixels_match_pillow() {
-        // SAFETY of the env var: read-only toggle consumed by the test above.
-        unsafe { std::env::set_var("DSV41_JPEG_PIXELS", "1") };
-        preprocessing_matches_vision_py_bit_exact();
+    fn zune_jpeg_fallback_disagrees_with_pillow() {
+        let fx = fixture();
+        let cfg = config();
+        for c in fx["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["name"].as_str().unwrap().starts_with("jpeg"))
+        {
+            let rec = serde_json::json!({"type": "image", "url": c["uri"]});
+            let zune =
+                preprocess_image(&decode_image_record_with(&rec, false).unwrap(), &cfg).unwrap();
+            assert_ne!(
+                fnv_bf16(&zune.patches),
+                c["patches_fnv"].as_str().unwrap(),
+                "{}",
+                c["name"]
+            );
+        }
     }
 
     #[test]
