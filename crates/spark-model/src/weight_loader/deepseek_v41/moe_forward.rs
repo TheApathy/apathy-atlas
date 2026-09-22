@@ -263,7 +263,7 @@ impl Cb3RoutedMoe {
         for (layer, _) in &routers {
             arena.layer(*layer).with_context(|| format!("router for layer {layer} has no resident experts"))?;
         }
-        let decode = if moe_decode::enabled() { Some(MoeDecode::new(shared.as_ref(), &arena, &routers)?) } else { None };
+        let decode = if moe_decode::enabled() { Some(MoeDecode::new(&shared, &arena, &routers)?) } else { None };
         ensure!(
             inter % FUSED_TILE_N == 0 && hidden % FUSED_TILE_N == 0 && inter % 32 == 0 && hidden % 32 == 0,
             "fused CB3 GEMM needs N % {FUSED_TILE_N} == 0 and K % 32 == 0 (hidden {hidden}, inter {inter})"
@@ -775,24 +775,12 @@ impl Cb3RoutedMoe {
     }
 
     /// Whether dropping this MoE returns its device memory (always, for this type).
-    /// (The decode path's buffers are freed by `Drop for Cb3RoutedMoe` below.)
+    /// (The decode path's buffers are freed by its own `DeviceAllocs`.)
     pub fn frees_on_drop(&self) -> bool {
         self.allocs.is_owned()
     }
 }
 
-
-impl Drop for Cb3RoutedMoe {
-    /// The decode path (dsv41-decode's `MoeDecode`) allocates outside `DeviceAllocs`; free it
-    /// here so dropping the MoE returns ALL of its memory.
-    fn drop(&mut self) {
-        if let Some(d) = self.decode.take() {
-            if let Err(e) = d.free(self.gpu.as_ref()) {
-                tracing::warn!("Cb3RoutedMoe drop: freeing the decode path failed: {e}");
-            }
-        }
-    }
-}
 
 impl V41RoutedMoe for Cb3RoutedMoe {
     fn begin_pass(&self, token_ids: &[u32]) -> Result<()> {
