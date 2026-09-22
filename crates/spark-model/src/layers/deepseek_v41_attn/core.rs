@@ -661,7 +661,7 @@ impl Dsv41SparseCore {
             return Ok(());
         }
         let scale = (HEAD_DIM as f32).powf(-0.5);
-        if st.kind == Some(PassKind::Decode) && a.t <= DECODE_MAX_T && self.split_on {
+        if matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on {
             let keys = WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK };
             let splits = keys.div_ceil(DECODE_SLICE);
             KernelLaunch::new(ops.gpu, self.split_kernel)
@@ -753,7 +753,7 @@ impl PassHook for Dsv41SparseCore {
                 st.topk = Some(self.tail.topk[st.tail.cur]);
                 st.cand = Some((self.tail.cand[st.tail.cur], st.tail.ld));
             }
-            PassKind::EncoderChunk | PassKind::FullChunk | PassKind::Decode => {
+            PassKind::EncoderChunk | PassKind::FullChunk | PassKind::Decode | PassKind::Verify => {
                 st.topk = None;
                 st.cand = None;
             }
@@ -784,7 +784,7 @@ impl AttnCore for Dsv41SparseCore {
         }
         self.prof.begin(ops)?;
         self.attend(ops, a, &st)?;
-        let split = st.kind == Some(PassKind::Decode) && a.t <= DECODE_MAX_T && self.split_on;
+        let split = matches!(st.kind, Some(PassKind::Decode | PassKind::Verify)) && a.t <= DECODE_MAX_T && self.split_on;
         self.prof.mark(
             ops,
             match (lw.ratio == 0, split) {

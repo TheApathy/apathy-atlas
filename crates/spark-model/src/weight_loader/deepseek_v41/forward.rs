@@ -102,6 +102,9 @@ pub enum PassKind {
     Replay,
     /// One generated token through all 40 layers.
     Decode,
+    /// DSpark verify: the accepted token plus the drafts (T <= 8) through all 40 layers. Behaves as
+    /// Decode everywhere (decode-size kernels, no dead-head carry); followed by a rollback.
+    Verify,
     /// Debug: all 40 layers over a whole prompt chunk (no replay).
     FullChunk,
 }
@@ -381,17 +384,17 @@ impl V41Forward {
         // after an image-ending prompt's first generated token. Replay never reaches an engram
         // layer, so it never exercises this branch either way.
         let mut dead_bools = match kind {
-            PassKind::Decode => engram_dead_heads(ids),
+            PassKind::Decode | PassKind::Verify => engram_dead_heads(ids),
             _ => engram_dead_heads_with_carry(&seq.dead_carry, ids),
         };
-        if kind != PassKind::Decode {
+        if !matches!(kind, PassKind::Decode | PassKind::Verify) {
             // Attribution tool only, real path is a no-op (`DeadArm::Ported`) -- see
             // `apply_dead_arm`'s doc. Applied AFTER the carry, so `--dead-arm shifted`'s shift
             // is relative to what the executing path actually computed, not a re-derivation.
             dead_bools = apply_dead_arm(dead_arm()?, dead_bools, t);
         }
         let dead: Vec<u8> = dead_bools.into_iter().map(u8::from).collect();
-        if kind != PassKind::Decode {
+        if !matches!(kind, PassKind::Decode | PassKind::Verify) {
             update_dead_carry(&mut seq.dead_carry, ids);
         }
         if engram_debug() {
@@ -409,14 +412,14 @@ impl V41Forward {
         ops.embed(self.embed, self.ids_dev, self.scratch.x, t, self.dims.hidden)?;
         // Image spans (prefill only; decode ids are never image ids). A no-op, with no
         // GPU work, unless this request encoded images.
-        if kind != PassKind::Decode
+        if !matches!(kind, PassKind::Decode | PassKind::Verify)
             && let Some(v) = &self.vision
         {
             v.splice(ops.gpu, ops.stream, self.embed, ids, start, self.scratch.x)?;
         }
         ops.hc_expand(self.scratch.x, self.scratch.h, self.scratch.pre_mix, t, self.dims.hidden)?;
         // Decode-size kernels key on the PASS KIND (never on t): see ops::set_decode_pass.
-        super::ops::set_decode_pass(kind == PassKind::Decode);
+        super::ops::set_decode_pass(matches!(kind, PassKind::Decode | PassKind::Verify));
         hook.begin_pass(kind, start, t)?;
         moe.begin_pass(ids)?;
         self.run_layers(ops, seq, layers, t, start, 0, Some(&hashes), core, moe, tap)?;
