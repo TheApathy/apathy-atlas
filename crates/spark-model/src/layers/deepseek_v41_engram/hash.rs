@@ -590,4 +590,162 @@ mod tests {
         let out = st.forward(&ids, 0, None).unwrap();
         assert!(out.iter().all(|&v| v >= 0), "a negative row id escaped the modulo fold");
     }
+
+    // -------------------------------------------------------------- oracle: chunk boundary
+    //
+    // `chunked_matches_one_shot` above proves the history carries across a split with a toy
+    // 8-token fixture; this proves the SAME mechanism against the real engine's own capture,
+    // where the split lands inside a real 1024-token prompt rather than a fixture built to
+    // exercise it.
+
+    const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
+    /// From `bench/engram/export_map.py`, run against the real checkpoint tokenizer.
+    /// `109,092`-entry `i32` map (129,280 raw ids -> 99,092 compressed ids), sha256
+    /// `c60a86322ec17b4142bfef3c57a8d81f` (first 32 hex chars) at generation time.
+    const TOKEN_MAP_PATH: &str = "/home/flocka/atlas/dsv41-engram/bench/engram/token_map_i32.bin";
+
+    /// The real per-layer multipliers, reproduced from `inference/engram.py`
+    /// `compute_hash_multipliers`: `np.random.default_rng(10007 * layer_id).integers(low=0,
+    /// high=(i64::MAX // 99_092) // 2, size=4) * 2 + 1`, `tokenizer_vocab_size` = the
+    /// COMPRESSED vocab (99,092), not the raw 129,280 — confirmed by reproducing these exact
+    /// values with that parameter and no other.
+    fn real_multipliers() -> Vec<Vec<i64>> {
+        vec![
+            vec![76_632_096_046_245, 4_839_876_093_313, 35_959_672_319_349, 73_987_337_458_391],
+            vec![67_716_810_739_261, 51_510_806_800_915, 30_921_347_202_721, 82_619_226_485_591],
+        ]
+    }
+
+    fn real_token_map() -> Option<Vec<i32>> {
+        let bytes = std::fs::read(TOKEN_MAP_PATH).ok()?;
+        Some(bytes.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    fn real_state() -> Option<EngramHashState> {
+        let token_map = real_token_map()?;
+        let layout = EngramLayout::new(&[1, 14], 4, 8, 256, 16_000_000).unwrap();
+        layout.validate_against_config(&NUM_EMBEDDINGS).unwrap();
+        Some(EngramHashState::new(layout, token_map, real_multipliers(), 2, 99_092).unwrap())
+    }
+
+    /// Hand-rolled: pull the flat top-level `token_ids` array out of an oracle manifest
+    /// without a full JSON model of the file's schema.
+    fn manifest_token_ids(dir: &str) -> Option<Vec<u32>> {
+        let text = std::fs::read_to_string(format!("{dir}/manifest.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some(v["token_ids"].as_array()?.iter().map(|x| x.as_u64().unwrap() as u32).collect())
+    }
+
+    fn read_i64(path: &str) -> Option<Vec<i64>> {
+        let bytes = std::fs::read(path).ok()?;
+        Some(bytes.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+
+    /// THE TEST THAT MATTERS: replay `runD_L20_kernel` (1024 real tokens, prefilled as two
+    /// 512-token chunks, `S = 0` then `S = 512`) through the real hash state and require the
+    /// SECOND chunk's row ids to match the engine's own `engram_hashes` tap EXACTLY. This is
+    /// the case `chunked_matches_one_shot` cannot reach: real tokens, the real checkpoint's
+    /// token map and multipliers, and a chunk boundary the engine itself produced.
+    #[test]
+    fn chunk_boundary_matches_the_oracle_exactly() {
+        let dir = format!("{REF_ROOT}/runD_L20_kernel");
+        let (Some(mut st), Some(ids)) = (real_state(), manifest_token_ids(&dir)) else {
+            eprintln!("skipping: token_map_i32.bin or {dir}/manifest.json not present");
+            return;
+        };
+        assert_eq!(ids.len(), 1024, "runD_L20_kernel is documented as a 1024-token capture");
+
+        let n_layers = st.layout().layer_ids.len();
+        let n_cols = st.layout().n_hash_cols();
+        assert_eq!((n_layers, n_cols), (2, 24));
+
+        // Chunk 0: S=0, 512 tokens. Chunk 1: S=512, 512 tokens -- the boundary under test.
+        let out0 = st.forward(&ids[..512], 0, None).unwrap();
+        let out1 = st.forward(&ids[512..1024], 512, None).unwrap();
+
+        let mut checked = 0usize;
+        for (li, name) in [(0usize, "L01"), (1usize, "L14")] {
+            for (chunk_ix, out) in [(0, &out0), (1, &out1)] {
+                let Some(want) = read_i64(&format!("{dir}/{name}.engram_hashes.{chunk_ix:03}.bin")) else {
+                    continue;
+                };
+                assert_eq!(want.len(), 512 * n_cols, "{name} occ {chunk_ix}: unexpected tap length");
+                let mut got = Vec::with_capacity(want.len());
+                for t in 0..512 {
+                    got.extend_from_slice(&out[(t * n_layers + li) * n_cols..(t * n_layers + li + 1) * n_cols]);
+                }
+                let mismatches = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    mismatches, 0,
+                    "{name} occurrence {chunk_ix}: {mismatches}/{} row ids differ from the oracle",
+                    want.len()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the replay must have compared at least one occurrence");
+        eprintln!("chunk boundary replay: {checked} layer x occurrence comparisons, all exact");
+    }
+
+    /// NEGATIVE CONTROL: dropping the history carry (i.e. re-hashing chunk 1 as if it were
+    /// its own sequence, `start_pos = 0` with a fresh cache) must NOT reproduce the oracle's
+    /// chunk-1 hashes -- the failure this whole test exists to catch.
+    ///
+    /// The geometry predicts an EXACT count for one layer, not just "some mismatches": only
+    /// the first 3 positions of chunk 1 can reach back into chunk 0 at all (`max_ngram_size -
+    /// 1 = 3`), and each position's mismatch is scoped to the groups whose look-back crosses
+    /// the boundary --
+    ///   - t=0 (global pos 512): every group's look-back of 1+ crosses into chunk 0 -> all
+    ///     24 columns move.
+    ///   - t=1 (pos 513): only the 3-/4-gram groups look back 2+ -> 16 columns.
+    ///   - t=2 (pos 514): only the 4-gram group looks back 3 -> 8 columns.
+    ///   - t=3 and beyond: every look-back stays inside chunk 1 -> 0 columns.
+    ///
+    /// Total: 24 + 16 + 8 = **48** of 512*24 = 12,288. Measured: 48. A control that merely
+    /// "differed" would be weaker evidence than one that differs by the number the mechanism
+    /// itself predicts.
+    #[test]
+    fn dropping_the_carry_breaks_the_match() {
+        let dir = format!("{REF_ROOT}/runD_L20_kernel");
+        let (Some(mut st), Some(ids)) = (real_state(), manifest_token_ids(&dir)) else {
+            eprintln!("skipping: token_map_i32.bin or {dir}/manifest.json not present");
+            return;
+        };
+        let Some(want) = read_i64(&format!("{dir}/L01.engram_hashes.001.bin")) else {
+            eprintln!("skipping: L01.engram_hashes.001.bin not present");
+            return;
+        };
+
+        // Correct: chunk 1 hashed WITH the carry (chunk 0 absorbed first).
+        let _ = st.forward(&ids[..512], 0, None).unwrap();
+        let with_carry = st.forward(&ids[512..1024], 512, None).unwrap();
+
+        // Wrong: chunk 1 hashed as if it opened a fresh sequence.
+        let mut fresh = real_state().unwrap();
+        let without_carry = fresh.forward(&ids[512..1024], 0, None).unwrap();
+
+        let n_layers = 2;
+        let n_cols = 24;
+        let extract = |out: &[i64]| -> Vec<i64> {
+            let mut got = Vec::with_capacity(512 * n_cols);
+            for t in 0..512 {
+                got.extend_from_slice(&out[(t * n_layers) * n_cols..(t * n_layers + 1) * n_cols]);
+            }
+            got
+        };
+        let with_carry_l01 = extract(&with_carry);
+        let without_carry_l01 = extract(&without_carry);
+
+        assert_eq!(with_carry_l01, want, "the correct (carrying) replay must match the oracle first");
+        let mismatches = without_carry_l01.iter().zip(&with_carry_l01).filter(|(a, b)| a != b).count();
+        assert!(
+            mismatches > 0,
+            "dropping the cross-chunk carry produced the SAME hashes as carrying it -- \
+             this control cannot distinguish a correct implementation from a broken one"
+        );
+        eprintln!(
+            "dropping the carry moved {mismatches}/{} row ids in L01's chunk-1 hashes",
+            with_carry_l01.len()
+        );
+    }
 }
