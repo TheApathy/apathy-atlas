@@ -278,6 +278,41 @@ dsv41_index_score(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const float* 
     index_score_body<true, HEAD_SUM_ORDER>(Q, IK, W, CAND, OUT, n_keys, n_pad, pos0, ratio, cand_ld, sq, sbuf);
 }
 
+// One row's top-k over score columns [0, n): ascending selected columns, then -1.
+__device__ void topk_row(const float* row, long long* out, int n, int kmax, int* hist, int* scratch)
+{
+    for (int i = threadIdx.x; i < TOPK; i += SEL_THREADS) out[i] = -1;
+    const Threshold th = radix_threshold(row, n, min(kmax, TOPK), hist, scratch);
+    __syncthreads();
+    emit_selected(row, n, th, scratch, [&](int c, int slot) { out[slot] = c; });
+}
+
+// One row's candidate mask over score columns [0, n). brow holds ceil(n / block_size) floats.
+__device__ void candidates_row(const float* row, float* brow, uint8_t* crow, int n, long long lens,
+                               int topk_blocks, int block_size, int* hist, int* scratch)
+{
+    const int nb = (n + block_size - 1) / block_size;
+    const long long last = lens >= 1 ? (lens - 1) / block_size : -1;   // floor, as torch's //
+    for (int b = threadIdx.x; b < nb; b += SEL_THREADS) {
+        float m = -INFINITY;
+        for (int i = 0; i < block_size; ++i) {
+            const int c = b * block_size + i;
+            if (c < n) m = fmaxf(m, row[c]);
+        }
+        brow[b] = b == last ? INFINITY : m;
+    }
+    for (int c = threadIdx.x; c < n; c += SEL_THREADS) crow[c] = 0;
+    __syncthreads();
+    const Threshold th = radix_threshold(brow, nb, topk_blocks, hist, scratch);
+    __syncthreads();
+    emit_selected(brow, nb, th, scratch, [&](int b, int) {
+        for (int i = 0; i < block_size; ++i) {
+            const int c = b * block_size + i;
+            if (c < n) crow[c] = 1;
+        }
+    });
+}
+
 // One block per row. OUT_IDX: [T, 512] int64, ascending selected columns then -1.
 // kmax = min(512, n_c) -- the caller passes it so a short bucket cannot ask for more.
 extern "C" __global__ void __launch_bounds__(SEL_THREADS)
@@ -285,12 +320,7 @@ dsv41_index_topk(const float* SCORE, long long* OUT_IDX, int n_pad, int kmax)
 {
     __shared__ int hist[256];
     __shared__ int scratch[SEL_THREADS / 32];
-    const float* row = SCORE + (size_t)blockIdx.x * n_pad;
-    long long* out = OUT_IDX + (size_t)blockIdx.x * TOPK;
-    for (int i = threadIdx.x; i < TOPK; i += SEL_THREADS) out[i] = -1;
-    const Threshold th = radix_threshold(row, n_pad, min(kmax, TOPK), hist, scratch);
-    __syncthreads();
-    emit_selected(row, n_pad, th, scratch, [&](int c, int slot) { out[slot] = c; });
+    topk_row(SCORE + (size_t)blockIdx.x * n_pad, OUT_IDX + (size_t)blockIdx.x * TOPK, n_pad, kmax, hist, scratch);
 }
 
 // Layer 20 only. BLOCK_SCORE: [T, n_pad/8] fp32 scratch. CAND: [T, n_pad] uint8.
@@ -302,29 +332,8 @@ dsv41_select_candidates(const float* SCORE, float* BLOCK_SCORE, uint8_t* CAND, i
     __shared__ int scratch[SEL_THREADS / 32];
     const int t = blockIdx.x;
     const int nb = (n_pad + block_size - 1) / block_size;
-    const float* row = SCORE + (size_t)t * n_pad;
-    float* brow = BLOCK_SCORE + (size_t)t * nb;
-    uint8_t* crow = CAND + (size_t)t * n_pad;
-    const long long lens = (pos0 + t + 1) / ratio;
-    const long long last = lens >= 1 ? (lens - 1) / block_size : -1;   // floor, as torch's //
-    for (int b = threadIdx.x; b < nb; b += SEL_THREADS) {
-        float m = -INFINITY;
-        for (int i = 0; i < block_size; ++i) {
-            const int c = b * block_size + i;
-            if (c < n_pad) m = fmaxf(m, row[c]);
-        }
-        brow[b] = b == last ? INFINITY : m;
-    }
-    for (int c = threadIdx.x; c < n_pad; c += SEL_THREADS) crow[c] = 0;
-    __syncthreads();
-    const Threshold th = radix_threshold(brow, nb, topk_blocks, hist, scratch);
-    __syncthreads();
-    emit_selected(brow, nb, th, scratch, [&](int b, int) {
-        for (int i = 0; i < block_size; ++i) {
-            const int c = b * block_size + i;
-            if (c < n_pad) crow[c] = 1;
-        }
-    });
+    candidates_row(SCORE + (size_t)t * n_pad, BLOCK_SCORE + (size_t)t * nb, CAND + (size_t)t * n_pad, n_pad,
+                   (pos0 + t + 1) / ratio, topk_blocks, block_size, hist, scratch);
 }
 
 #ifdef DSV41_INDEX_GATE
@@ -349,10 +358,8 @@ dsv41_index_score_probe(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const f
 // Ratio-2 gated combine (engine/model.py `_compressed`, r = 2):
 //   latent[g, c] = kv[2g, c] * w0 + kv[2g+1, c] * w1,  (w0, w1) = softmax(sc[2g, c], sc[2g+1, c])
 // fp32 in, bf16 out (`latent.to(bfloat16)` before comp_norm). expf, not __expf: torch's softmax.
-extern "C" __global__ void dsv41_compress_combine2(const float* __restrict__ KV,
-                                                  const float* __restrict__ SC,
-                                                  __nv_bfloat16* __restrict__ OUT,
-                                                  int n_pairs, int d)
+__device__ __forceinline__ void combine2_at(const float* __restrict__ KV, const float* __restrict__ SC,
+                                            __nv_bfloat16* __restrict__ OUT, int n_pairs, int d)
 {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (long long)n_pairs * d) return;
@@ -363,6 +370,14 @@ extern "C" __global__ void dsv41_compress_combine2(const float* __restrict__ KV,
     const float s = ea + eb;
     const float lat = KV[(2 * g) * d + c] * (ea / s) + KV[(2 * g + 1) * d + c] * (eb / s);
     OUT[i] = __float2bfloat16_rn(lat);
+}
+
+extern "C" __global__ void dsv41_compress_combine2(const float* __restrict__ KV,
+                                                  const float* __restrict__ SC,
+                                                  __nv_bfloat16* __restrict__ OUT,
+                                                  int n_pairs, int d)
+{
+    combine2_at(KV, SC, OUT, n_pairs, d);
 }
 
 // wts = float(bf16 x @ weights_proj^T) * scale   (scale = 128^-0.5 * 32^-0.5)
@@ -443,4 +458,158 @@ extern "C" __global__ void __launch_bounds__(256) dsv41_gemm_bf16_smalln(
         for (int off = 16; off; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
         if (lane == 0) OUT[(size_t)m * N + n] = __float2bfloat16_rn(s);
     }
+}
+
+// Small-M (<= 16) form of dsv41_gemm_f32_nt, BIT-IDENTICAL to it by construction: every output is
+// the SAME single fmaf(a, b, acc) chain over k = 0..K-1 from 0.f. dsv41_gemm_f32_nt tiles N by 64,
+// so at decode/verify M its grid is N/64 = 8 CTAs streaming a 10.5 MB fp32 weight (~800 us per
+// call at T=6, dsv41-decode nsys). This one tiles N by 8 (64 CTAs) and never splits K, which would
+// change the order. Double-buffered smem, K % 128 == 0.
+namespace dsv41_gemv {
+constexpr int NB = 8, KC = 128, MMAX = 16;
+}
+extern "C" __global__ void __launch_bounds__(256) dsv41_gemv_f32_nt(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K)
+{
+    using namespace dsv41_gemv;
+    __shared__ float ws[2][NB][KC + 1];     // +1: the 8 rows would share a bank
+    __shared__ float xs[2][MMAX][KC + 1];
+    const int tid = threadIdx.x, n0 = blockIdx.x * NB;
+    auto load = [&](int k0, int b) {
+        for (int i = tid; i < NB * KC; i += 256) {
+            const int r = i / KC, c = i % KC;
+            ws[b][r][c] = n0 + r < N ? B[(size_t)(n0 + r) * K + k0 + c] : 0.f;
+        }
+        for (int i = tid; i < M * KC; i += 256) {
+            const int r = i / KC, c = i % KC;
+            xs[b][r][c] = A[(size_t)r * K + k0 + c];
+        }
+    };
+    const int n = tid % NB, m = tid / NB;
+    const bool act = m < M && n0 + n < N;
+    float acc = 0.f;
+    load(0, 0);
+    __syncthreads();
+    for (int k0 = 0, it = 0; k0 < K; k0 += KC, ++it) {
+        const int b = it & 1;
+        if (k0 + KC < K) load(k0 + KC, b ^ 1);   // the other buffer: its readers passed the last sync
+        if (act)
+#pragma unroll 8
+            for (int k = 0; k < KC; ++k) acc = fmaf(xs[b][m][k], ws[b][n][k], acc);
+        __syncthreads();
+    }
+    if (act) C[(size_t)m * N + n0 + n] = acc;
+}
+
+// ------------------------------------------------------------------ shape-static decode core
+// ATLAS_DSV41_CORE_STATIC: Decode/Verify passes (T = gridDim.x or the `t` argument, T <= 8)
+// read the pass START from device memory (*DSTART), so one captured CUDA graph replays at any
+// position. Everything that varied per step is derived here from it:
+//   ratio-2 pending parity p = start & 1 (every pass is contiguous from 0, so len % 2 IS it),
+//   compressed rows visible n_c = (start + T) / ratio, score width score_width(n_c),
+//   first published row j0 = (start - p) / 2 (ratio 2) or start (ratio 1), rows published
+//   (T + p) / 2 or T.
+// The launch geometry is FIXED: the score is launched over a static width `ld` (the largest
+// the sequence can reach); blocks beyond score_width(n_c) exit at once and the selection loops
+// stop there, so the work matches the dynamic path. Columns past n_c are -inf and never
+// selectable, so the outputs are the dynamic path's, bit for bit (gated, not assumed).
+
+namespace dsv41_index {
+constexpr int KEY_BLOCK = 512;   // index.rs KEY_BLOCK: score_width granularity
+
+__device__ __forceinline__ int score_width_of(long long n_c) {
+    const long long b = (n_c + KEY_BLOCK - 1) / KEY_BLOCK;
+    return (int)(b < 1 ? 1 : b) * KEY_BLOCK;
+}
+}  // namespace dsv41_index
+
+extern "C" __global__ void __launch_bounds__(SCORE_THREADS)
+dsv41_index_score_dev(const __nv_bfloat16* Q, const __nv_bfloat16* IK, const float* W,
+                      const uint8_t* CAND, float* OUT, int ld, const int* DSTART, int ratio, int cand_ld)
+{
+    const long long start = DSTART[0];
+    const int T = gridDim.x;
+    const long long n_c = (start + T) / ratio;
+    if ((int)blockIdx.y * BN >= score_width_of(n_c)) return;
+    DSV41_INDEX_SCORE_SMEM
+    index_score_body<true, HEAD_SUM_ORDER>(Q, IK, W, CAND, OUT, (int)n_c, ld, start, ratio, cand_ld, sq, sbuf);
+}
+
+extern "C" __global__ void __launch_bounds__(SEL_THREADS)
+dsv41_index_topk_dev(const float* SCORE, long long* OUT_IDX, int ld, const int* DSTART, int ratio)
+{
+    __shared__ int hist[256];
+    __shared__ int scratch[SEL_THREADS / 32];
+    const long long n_c = (DSTART[0] + (long long)gridDim.x) / ratio;
+    // kmax = TOPK: the dynamic path's min(TOPK, n_c) is implied, because radix_threshold clamps k
+    // to the finite count, and at most n_c columns are finite.
+    topk_row(SCORE + (size_t)blockIdx.x * ld, OUT_IDX + (size_t)blockIdx.x * TOPK, score_width_of(n_c), TOPK, hist, scratch);
+}
+
+extern "C" __global__ void __launch_bounds__(SEL_THREADS)
+dsv41_select_candidates_dev(const float* SCORE, float* BLOCK_SCORE, uint8_t* CAND, int ld,
+                            const int* DSTART, int ratio, int topk_blocks, int block_size)
+{
+    __shared__ int hist[256];
+    __shared__ int scratch[SEL_THREADS / 32];
+    const int t = blockIdx.x;
+    const long long start = DSTART[0];
+    const int n = score_width_of((start + (long long)gridDim.x) / ratio);
+    const int nb_ld = (ld + block_size - 1) / block_size;
+    candidates_row(SCORE + (size_t)t * ld, BLOCK_SCORE + (size_t)t * nb_ld, CAND + (size_t)t * ld, n,
+                   (start + t + 1) / ratio, topk_blocks, block_size, hist, scratch);
+}
+
+// out[i] = base + i * stride, base = start (tokens, ratio-1 rows) or start & ~1 (= j0 * 2, the
+// first ratio-2 row this pass publishes).
+extern "C" __global__ void dsv41_iota_dev(int* __restrict__ OUT, const int* DSTART, int even_floor, int stride, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int base = even_floor ? (DSTART[0] & ~1) : DSTART[0];
+    if (i < n) OUT[i] = base + i * stride;
+}
+
+// Ratio-2 compressor, static form. The projections of the pass's T rows always sit at slots
+// 1..T of KV/SC; a pending row (p = 1) is copied to slot 0 and the pairs start at slot 1 - p.
+extern "C" __global__ void dsv41_comp2_pending_in(const float* __restrict__ PENDING, float* __restrict__ KV,
+                                                  float* __restrict__ SC, int d, const int* DSTART)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((DSTART[0] & 1) == 0 || i >= d) return;
+    KV[i] = PENDING[i];
+    SC[i] = PENDING[d + i];
+}
+
+extern "C" __global__ void dsv41_compress_combine2_dev(const float* __restrict__ KV,
+                                                      const float* __restrict__ SC,
+                                                      __nv_bfloat16* __restrict__ OUT,
+                                                      int n_pairs, int d, const int* DSTART)
+{
+    const int off = 1 - (DSTART[0] & 1);
+    combine2_at(KV + (size_t)off * d, SC + (size_t)off * d, OUT, n_pairs, d);
+}
+
+// The row left unpaired when T + p is odd is always the pass's LAST row, slot T.
+extern "C" __global__ void dsv41_comp2_pending_out(const float* __restrict__ KV, const float* __restrict__ SC,
+                                                   float* __restrict__ PENDING, int d, int t, const int* DSTART)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (((t + (DSTART[0] & 1)) & 1) == 0 || i >= d) return;
+    PENDING[i] = KV[(size_t)t * d + i];
+    PENDING[d + i] = SC[(size_t)t * d + i];
+}
+
+// Publish the pass's compressed rows: SRC rows 0..nj-1 -> DST rows j0..j0+nj-1 (16-byte units).
+// grid.x = the most rows the pass can publish; blocks past nj do nothing.
+extern "C" __global__ void dsv41_publish_rows(const uint4* __restrict__ SRC, uint4* __restrict__ DST,
+                                              int row_u4, int ratio, int t, const int* DSTART)
+{
+    const int start = DSTART[0];
+    const int p = ratio == 2 ? (start & 1) : 0;
+    const int j0 = ratio == 2 ? (start - p) / 2 : start;
+    const int nj = ratio == 2 ? (t + p) / 2 : t;
+    const int r = blockIdx.x;
+    if (r >= nj) return;
+    for (int i = threadIdx.x; i < row_u4; i += blockDim.x)
+        DST[(size_t)(j0 + r) * row_u4 + i] = SRC[(size_t)r * row_u4 + i];
 }
