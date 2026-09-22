@@ -234,7 +234,7 @@ pub struct Dsv41SparseCore {
     /// token). On the real runC fixture: 12.5x faster than the one-pass fp32 kernel, 99.90% of
     /// bf16 outputs identical to it, no added error vs the fp32 reference (attn gate log).
     /// `ATLAS_DSV41_ATTN_MMA=0` restores the one-pass kernel (A/B arm only).
-    mma_kernel: Option<KernelHandle>,
+    mma_kernel: Option<(KernelHandle, usize)>,
     combine_kernel: KernelHandle,
     /// `[DECODE_MAX_T, 64, S, 2 + 512]` fp32 split partials.
     part: DevicePtr,
@@ -302,10 +302,20 @@ impl Dsv41SparseCore {
         let cvt = gpu.kernel(FWD_MODULE, "dsv41_bf16_to_f32").context("dsv41_fwd::dsv41_bf16_to_f32 not in the PTX")?;
         let idx = IndexKernels::load(gpu)?;
         let split_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_split").context("dsv41_sparse_attn_split not in the PTX")?;
+        // Heads per CTA for the tensor-core entry: 16 (4 warps), 32 or 64 (the same warps fused,
+        // sharing one K gather per tile). All three are BYTE-IDENTICAL (attn gate); the choice is
+        // speed only. `ATLAS_DSV41_ATTN_HPC` overrides the default for A/B.
+        let hpc: usize = std::env::var("ATLAS_DSV41_ATTN_HPC").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
         let mma_kernel = if std::env::var("ATLAS_DSV41_ATTN_MMA").as_deref() == Ok("0") {
             None
         } else {
-            Some(gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_mma").context("dsv41_sparse_attn_mma not in the PTX")?)
+            let name = match hpc {
+                16 => "dsv41_sparse_attn_mma",
+                32 => "dsv41_sparse_attn_mma32h",
+                64 => "dsv41_sparse_attn_mma64",
+                o => anyhow::bail!("ATLAS_DSV41_ATTN_HPC={o}: use 16, 32 or 64"),
+            };
+            Some((gpu.kernel(ATTN_MODULE, name).with_context(|| format!("{name} not in the PTX"))?, hpc))
         };
         let combine_kernel = gpu.kernel(ATTN_MODULE, "dsv41_sparse_attn_combine").context("dsv41_sparse_attn_combine not in the PTX")?;
         let attn_kernel = gpu
@@ -774,7 +784,7 @@ impl Dsv41SparseCore {
                 .launch(ops.stream);
         }
         let (kernel, heads_per_cta, threads) = match self.mma_kernel {
-            Some(k) => (k, 16usize, 128u32),
+            Some((k, hpc)) => (k, hpc, (hpc / 16 * 128) as u32),
             None => (self.attn_kernel, HEADS_PER_BLOCK, ATTN_THREADS),
         };
         KernelLaunch::new(ops.gpu, kernel)

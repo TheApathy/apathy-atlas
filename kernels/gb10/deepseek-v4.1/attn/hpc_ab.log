@@ -1,0 +1,24 @@
+=== HPC=16 rep 1
+  attn.sparse.mma                  57.11 ms     38 calls     1.503 ms/call
+prefill 1024 tokens in 1.31s
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)
+=== HPC=32 rep 1
+  attn.sparse.mma                  54.29 ms     38 calls     1.429 ms/call
+prefill 1024 tokens in 0.85s
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)
+=== HPC=64 rep 1
+  attn.sparse.mma                  57.68 ms     38 calls     1.518 ms/call
+prefill 1024 tokens in 0.86s
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)
+=== HPC=16 rep 2
+  attn.sparse.mma                  57.69 ms     38 calls     1.518 ms/call
+prefill 1024 tokens in 0.85s
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)
+=== HPC=32 rep 2
+  attn.sparse.mma                  54.02 ms     38 calls     1.421 ms/call
+prefill 1024 tokens in 0.85s
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)
+=== HPC=64 rep 2
+  attn.sparse.mma                  58.57 ms     38 calls     1.541 ms/call
+prefill 1024 tokens in 0.85s
+model path (replay): prompt 1024 tokens, argmax 4 (logit 27.25)

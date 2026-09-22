@@ -23,10 +23,12 @@ PRODUCTION entry (i64 idx, bf16 out)            : 0/1572864 differ from bf16(fp3
 PRODUCTION entry (i64 idx, bf16 out) window-only: 0/1572864 differ from bf16(fp32 kernel) | CTRL other mode: 1538579 differ
 PRODUCTION entry w32 (i32 wpos, i64 idx, bf16) : 0/1572864 differ from bf16(fp32 kernel)
 SPLIT-KV decode entry (S=20 x 32 keys + combine): 502/1572864 bf16 differ from bf16(one-pass) (99.9681% identical), vs fp32 ref rel_l2=1.664e-03 | CTRL last split dropped: 1527399 differ
-T=1 latency (GPU-lock held, nothing else running): one-pass 527.4 us
-    split SLICE=64 (S=10,  80 CTAs) + combine 86.1 us (6.1x)  [split alone 83.0, combine alone 4.2]
-    split SLICE=32 (S=20, 160 CTAs) + combine 87.6 us (6.0x)  [split alone 80.9, combine alone 7.4]
-    split SLICE=16 (S=40, 320 CTAs) + combine 82.0 us (6.4x)  [split alone 73.7, combine alone 6.2]
-    split SLICE= 8 (S=80, 640 CTAs) + combine 91.9 us (5.7x)  [split alone 75.8, combine alone 10.3]
-MMA prefill entry: 2736/1572864 bf16 differ from bf16(one-pass) (99.8260% identical); vs fp32 ref: mma 1.664e-03 (bf16-rounded one-pass 1.664e-03) | CTRL compressed rows dropped: 1538577 differ | T=48: one-pass 3.035 ms, mma 0.166 ms (18.3x)
+T=1 latency (GPU-lock held, nothing else running): one-pass 526.8 us
+    split SLICE=64 (S=10,  80 CTAs) + combine 87.7 us (6.0x)  [split alone 83.0, combine alone 4.2]
+    split SLICE=32 (S=20, 160 CTAs) + combine 86.7 us (6.1x)  [split alone 81.2, combine alone 8.3]
+    split SLICE=16 (S=40, 320 CTAs) + combine 82.1 us (6.4x)  [split alone 75.0, combine alone 6.2]
+    split SLICE= 8 (S=80, 640 CTAs) + combine 91.3 us (5.8x)  [split alone 75.7, combine alone 10.2]
+MMA prefill entry: 2736/1572864 bf16 differ from bf16(one-pass) (99.8260% identical); vs fp32 ref: mma 1.664e-03 (bf16-rounded one-pass 1.664e-03) | CTRL compressed rows dropped: 1538577 differ | T=48: one-pass 3.022 ms, mma 0.180 ms (16.8x)
+MMA64 prefill entry (64 heads/CTA): 0/1572864 differ from mma16 (must be 0) | T=48: 0.139 ms (1.29x mma16)
+MMA32H prefill entry (32 heads/CTA): 0/1572864 differ from mma16 (must be 0) | T=48: 0.141 ms (1.27x mma16)
 PASS one-pass streaming gather (controls separate)

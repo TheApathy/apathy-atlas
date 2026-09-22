@@ -489,6 +489,209 @@ __device__ __forceinline__ void sparse_attn_mma_body(
     }
 }
 
+template <int HGPC>
+__device__ __forceinline__ void sparse_attn_mma_hg_body(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
+    const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
+    __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    constexpr int TK = 16, NTH = MNT * HGPC, ROWS = MH * HGPC;
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    // Warp = (head block hbl, dim quarter wq): EXACTLY one warp of the 16-head kernel, so every
+    // product, partial and reduction is the same -- only the K tile is gathered once for all.
+    const int hbl = warp >> 2, wq = warp & 3;
+    const int hg = blockIdx.y * HGPC + hbl;
+    const int g = lane >> 2, q = lane & 3;
+
+    __shared__ __align__(16) __nv_bfloat16 ks[TK][DMAX + KPAD];
+    __shared__ float spart[HGPC][MWARPS][MH][TK];
+    __shared__ __align__(16) __nv_bfloat16 ph[ROWS][TK + KPAD], pl[ROWS][TK + KPAD];
+    __shared__ float mrow[ROWS], lrow[ROWS], arow[ROWS];
+    __shared__ int vld[TK];
+
+    // Q stays in registers: this warp's A fragments over its 128 dims (8 k-steps).
+    uint32_t qa[8][4];
+    {
+        const __nv_bfloat16* q0 = Q + ((size_t)t * NH + hg * MH + g) * D;
+        const __nv_bfloat16* q1 = q0 + 8 * (size_t)D;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+            const int kd = wq * 128 + kk * 16;
+            qa[kk][0] = *reinterpret_cast<const uint32_t*>(q0 + kd + 2 * q);
+            qa[kk][1] = *reinterpret_cast<const uint32_t*>(q1 + kd + 2 * q);
+            qa[kk][2] = *reinterpret_cast<const uint32_t*>(q0 + kd + 8 + 2 * q);
+            qa[kk][3] = *reinterpret_cast<const uint32_t*>(q1 + kd + 8 + 2 * q);
+        }
+    }
+    if (tid < ROWS) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    float acc[16][4];
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.f;
+    __syncthreads();
+
+    for (int seg = 0; seg < 2; ++seg) {
+        const int n = seg == 0 ? NW : NC;
+        if (seg == 1 && CIDX == nullptr) continue;
+        const __nv_bfloat16* src = seg == 0 ? RING : CKV;
+        for (int kb = 0; kb < n; kb += TK) {
+            for (int j = tid; j < TK; j += NTH) {
+                const int c = kb + j;
+                int row = -1;
+                if (c < n) {
+                    if (seg == 0) {
+                        const long long p = WPOS[(size_t)t * NW + c];
+                        if (p >= 0 && p >= win_lo) row = (int)(p % RING_N);
+                    } else {
+                        const long long j = CIDX[(size_t)t * NC + c];
+                        if (j >= 0) row = (int)j;
+                    }
+                }
+                vld[j] = row;
+            }
+            __syncthreads();
+            for (int i = tid; i < TK * DMAX / 8; i += NTH) {
+                const int r = i / (DMAX / 8), c = i % (DMAX / 8);
+                const int row = vld[r];
+                *reinterpret_cast<uint4*>(&ks[r][c * 8]) = row >= 0
+                    ? reinterpret_cast<const uint4*>(src + (size_t)row * D)[c] : make_uint4(0, 0, 0, 0);
+            }
+            __syncthreads();
+
+            // ---- S partial over this warp's 128 dims: 8 k-steps x 2 n-tiles of 8 keys
+            constexpr int NS = TK / 8;
+            float sp[NS][4];
+#pragma unroll
+            for (int nt = 0; nt < NS; ++nt) sp[nt][0] = sp[nt][1] = sp[nt][2] = sp[nt][3] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < 8; ++kk) {
+                const int kd = wq * 128 + kk * 16;
+                const uint32_t (&a)[4] = qa[kk];
+#pragma unroll
+                for (int nt = 0; nt < NS; ++nt) {
+                    uint32_t b[2];
+                    b[0] = *reinterpret_cast<const uint32_t*>(&ks[nt * 8 + g][kd + 2 * q]);
+                    b[1] = *reinterpret_cast<const uint32_t*>(&ks[nt * 8 + g][kd + 8 + 2 * q]);
+                    mma_bf16_16816(sp[nt], a, b);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < NS; ++nt) {
+                spart[hbl][wq][g][nt * 8 + 2 * q]         = sp[nt][0];
+                spart[hbl][wq][g][nt * 8 + 2 * q + 1]     = sp[nt][1];
+                spart[hbl][wq][g + 8][nt * 8 + 2 * q]     = sp[nt][2];
+                spart[hbl][wq][g + 8][nt * 8 + 2 * q + 1] = sp[nt][3];
+            }
+            __syncthreads();
+
+            // ---- online softmax: 8 threads per head row, 2 keys each
+            {
+                constexpr int KPT = TK / 8;   // keys per thread
+                const int row = tid >> 3, k0 = (tid & 7) * KPT;
+                float sv[KPT], pv[KPT];
+                float tmax = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < KPT; ++j) {
+                    const int k = k0 + j;
+                    float v = spart[row / MH][0][row % MH][k];
+                    for (int w = 1; w < MWARPS; ++w) v += spart[row / MH][w][row % MH][k];
+                    const bool ok = vld[k] >= 0 && kb + k < n;
+                    sv[j] = ok ? v * scale : -INFINITY;
+                    tmax = fmaxf(tmax, sv[j]);
+                }
+                for (int off = 1; off < 8; off <<= 1) tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, off));
+                const float m_old = mrow[row];
+                const float m_new = fmaxf(m_old, tmax);
+                const float m_safe = (m_new == -INFINITY) ? 0.f : m_new;
+                const float alpha = __expf(m_old - m_safe);
+                float lsum = 0.f;
+#pragma unroll
+                for (int j = 0; j < KPT; ++j) {
+                    pv[j] = sv[j] == -INFINITY ? 0.f : __expf(sv[j] - m_safe);
+                    lsum += pv[j];
+                    const __nv_bfloat16 hi = __float2bfloat16_rn(pv[j]);
+                    ph[row][k0 + j] = hi;
+                    pl[row][k0 + j] = __float2bfloat16_rn(pv[j] - __bfloat162float(hi));
+                }
+                for (int off = 1; off < 8; off <<= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, off);
+                __syncwarp();
+                if ((tid & 7) == 0) {
+                    lrow[row] = lrow[row] * alpha + lsum;
+                    mrow[row] = m_new;
+                    arow[row] = alpha;
+                }
+            }
+            __syncthreads();
+
+            // ---- O = O * alpha + (P_hi + P_lo) K over this warp's 128 dims (16 n-tiles)
+            {
+                const float a0 = arow[hbl * MH + g], a1 = arow[hbl * MH + g + 8];
+#pragma unroll
+                for (int nt = 0; nt < 16; ++nt) {
+                    acc[nt][0] *= a0; acc[nt][1] *= a0; acc[nt][2] *= a1; acc[nt][3] *= a1;
+                }
+#pragma unroll
+                for (int ks16 = 0; ks16 < TK / 16; ++ks16) {
+                    const int kc = ks16 * 16;
+                    uint32_t ah[4], al[4];
+                    ah[0] = *reinterpret_cast<const uint32_t*>(&ph[hbl * MH + g][kc + 2 * q]);
+                    ah[1] = *reinterpret_cast<const uint32_t*>(&ph[hbl * MH + g + 8][kc + 2 * q]);
+                    ah[2] = *reinterpret_cast<const uint32_t*>(&ph[hbl * MH + g][kc + 8 + 2 * q]);
+                    ah[3] = *reinterpret_cast<const uint32_t*>(&ph[hbl * MH + g + 8][kc + 8 + 2 * q]);
+                    al[0] = *reinterpret_cast<const uint32_t*>(&pl[hbl * MH + g][kc + 2 * q]);
+                    al[1] = *reinterpret_cast<const uint32_t*>(&pl[hbl * MH + g + 8][kc + 2 * q]);
+                    al[2] = *reinterpret_cast<const uint32_t*>(&pl[hbl * MH + g][kc + 8 + 2 * q]);
+                    al[3] = *reinterpret_cast<const uint32_t*>(&pl[hbl * MH + g + 8][kc + 8 + 2 * q]);
+#pragma unroll
+                    for (int nt = 0; nt < 16; ++nt) {
+                        const int dim = wq * 128 + nt * 8 + g;
+                        uint32_t b[2];
+                        b[0] = pack2(ks[kc + 2 * q][dim], ks[kc + 2 * q + 1][dim]);
+                        b[1] = pack2(ks[kc + 8 + 2 * q][dim], ks[kc + 9 + 2 * q][dim]);
+                        mma_bf16_16816(acc[nt], ah, b);
+                        mma_bf16_16816(acc[nt], al, b);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    const int h0 = hg * MH + g, h1 = h0 + 8;
+    const float m0 = mrow[hbl * MH + g] == -INFINITY ? 0.f : mrow[hbl * MH + g];
+    const float m1 = mrow[hbl * MH + g + 8] == -INFINITY ? 0.f : mrow[hbl * MH + g + 8];
+    const float d0 = lrow[hbl * MH + g] + __expf(SINK[h0] - m0);
+    const float d1 = lrow[hbl * MH + g + 8] + __expf(SINK[h1] - m1);
+#pragma unroll
+    for (int nt = 0; nt < 16; ++nt) {
+        const int dim = wq * 128 + nt * 8 + 2 * q;
+        __nv_bfloat16* o0 = O + ((size_t)t * NH + h0) * D + dim;
+        __nv_bfloat16* o1 = O + ((size_t)t * NH + h1) * D + dim;
+        o0[0] = __float2bfloat16_rn(acc[nt][0] / d0); o0[1] = __float2bfloat16_rn(acc[nt][1] / d0);
+        o1[0] = __float2bfloat16_rn(acc[nt][2] / d1); o1[1] = __float2bfloat16_rn(acc[nt][3] / d1);
+    }
+}
+
+// 64 heads per CTA: 4 x the 16-head kernel's warps in one CTA (512 threads), sharing ONE gather
+// of each K tile instead of four. Identical arithmetic by construction -> the gate requires 0
+// differing values vs dsv41_sparse_attn_mma.
+extern "C" __global__ void __launch_bounds__(MNT * 4) dsv41_sparse_attn_mma64(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
+    const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
+    __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    sparse_attn_mma_hg_body<4>(Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
+// 32 heads per CTA (256 threads): the occupancy middle ground between 16 and 64.
+extern "C" __global__ void __launch_bounds__(MNT * 2) dsv41_sparse_attn_mma32h(
+    const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ RING, const int32_t* __restrict__ WPOS,
+    const __nv_bfloat16* __restrict__ CKV, const long long* __restrict__ CIDX, const float* __restrict__ SINK,
+    __nv_bfloat16* __restrict__ O, int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    sparse_attn_mma_hg_body<2>(Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
 
 
 // Tensor-core prefill entry (16-key tiles). MEASURED AND DROPPED (attn gate 2026-09-22, real
@@ -822,6 +1025,25 @@ int main() {
                         "| CTRL compressed rows dropped: %zu differ | T=%d: one-pass %.3f ms, mma %.3f ms (%.1fx)\n",
                         mbad, no, 100.0 * (1.0 - (double)mbad / no), em.rel, eo.rel, cbad, T, t_one, t_mma, t_one / t_mma);
             prod_ok = prod_ok && em.rel <= 1e-5 + eo.rel && (double)mbad / no <= 0.01 && cbad > no / 2;
+            // 64 heads per CTA. PRE-REGISTERED: 0 differing values vs the 16-head entry.
+            {
+                mma(1);
+                std::vector<__nv_bfloat16> ref16(ob);
+                dsv41_sparse_attn_mma64<<<dim3(T, NH / 64), MNT * 4>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale);
+                CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
+                size_t d64 = 0; for (size_t i = 0; i < no; ++i) d64 += std::memcmp(&ob[i], &ref16[i], 2) != 0;
+                const float t64 = time_it([&] { dsv41_sparse_attn_mma64<<<dim3(T, NH / 64), MNT * 4>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale); });
+                std::printf("MMA64 prefill entry (64 heads/CTA): %zu/%zu differ from mma16 (must be 0) | T=%d: %.3f ms (%.2fx mma16)\n", d64, no, T, t64, t_mma / t64);
+                prod_ok = prod_ok && d64 == 0;
+                dsv41_sparse_attn_mma32h<<<dim3(T, NH / 32), MNT * 2>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale);
+                CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
+                size_t d32 = 0; for (size_t i = 0; i < no; ++i) d32 += std::memcmp(&ob[i], &ref16[i], 2) != 0;
+                const float t32 = time_it([&] { dsv41_sparse_attn_mma32h<<<dim3(T, NH / 32), MNT * 2>>>(d_q, d_ring, d_wpos, d_ckv, d_c64, d_sink, d_ob, T, NH, D, NW, NC, RING_N, 0, scale); });
+                std::printf("MMA32H prefill entry (32 heads/CTA): %zu/%zu differ from mma16 (must be 0) | T=%d: %.3f ms (%.2fx mma16)\n", d32, no, T, t32, t_mma / t32);
+                prod_ok = prod_ok && d32 == 0;
+            }
 
         }
         cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
