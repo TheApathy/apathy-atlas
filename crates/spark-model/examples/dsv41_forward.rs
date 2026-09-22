@@ -221,6 +221,22 @@ fn real_moe(
     Cb3RoutedMoe::new(shared, *kernels, config, arena, routers, 10.0, 1.5, max_t)
 }
 
+/// See its one use in `run_model_path`: a stateless-core rollback for layers 0-1 only.
+struct NoCarryCore<'a>(&'a Dsv41SparseCore);
+impl PassHook for NoCarryCore<'_> {
+    fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()> {
+        self.0.begin_pass(kind, start, t)
+    }
+    fn rollback(&self, _ops: &Ops, _n: usize) -> Result<()> {
+        Ok(())
+    }
+}
+impl AttnCore for NoCarryCore<'_> {
+    fn run(&self, ops: &Ops, a: &CoreArgs) -> Result<()> {
+        self.0.run(ops, a)
+    }
+}
+
 struct NoHook;
 impl PassHook for NoHook {
     fn begin_pass(&self, _: PassKind, _: usize, _: usize) -> Result<()> {
@@ -253,13 +269,35 @@ fn run_model_path(
     let shared_dyn: spark_model::weight_loader::deepseek_v41::device_allocs::SharedGpu = gpu.clone();
     spark_model::model::dsv41::log_run_identity("driver", ops.stream);
     let max_chunk = splits.iter().flatten().copied().chain(chunks.iter().map(|c| c.1)).max().unwrap_or(1);
-    let fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
+    let mut fwd = V41Forward::load(store, ops, dims, config.vocab_size, n_layers, max_chunk, 8192, Path::new(MODEL_DIR), 128)?;
+    // DSpark (DSV41_DRIVER_DSPARK=1): the drafter's weights and the L37-39 seed buffer.
+    let dspark_on = std::env::var("DSV41_DRIVER_DSPARK").as_deref() == Ok("1");
+    let dspark_force = std::env::var("DSV41_DRIVER_DSPARK_FORCE_ACCEPT").as_deref() == Ok("1");
+    if dspark_on {
+        fwd.dspark = Some(spark_model::weight_loader::deepseek_v41::mtp::DsparkWeights::load(store, &dims, config.vocab_size)?);
+        fwd.enable_dspark_seed(ops.gpu)?;
+    }
+    let fwd = fwd;
+    let ds = if dspark_on {
+        Some(spark_model::weight_loader::deepseek_v41::dspark::Dspark::new(&shared_dyn, &fwd, 10.0, 1.5)?)
+    } else {
+        None
+    };
     let feeder = Feeder { dir: ref_dir.to_path_buf(), counts: RefCell::new(HashMap::new()), gpu };
     let fed_core = FedCore(&feeder);
     let real_core;
+    let no_carry;
     let (core, hook): (&dyn AttnCore, &dyn PassHook) = if attn_real {
         real_core = Dsv41SparseCore::load_prefix(&shared_dyn, store, config, 8192, max_chunk, fwd.freqs_c, n_layers)?;
-        (&real_core, &real_core)
+        if dspark_on && n_layers <= 2 {
+            // TEST ONLY: layers 0-1 are window-only (no compressor, no indexer), so the core
+            // carries no per-position state and a rollback has nothing to restore. Lets the
+            // DSpark mechanics be gated before the core's own rollback lands.
+            no_carry = NoCarryCore(&real_core);
+            (&no_carry, &no_carry)
+        } else {
+            (&real_core, &real_core)
+        }
     } else {
         (&fed_core, &NoHook)
     };
@@ -338,6 +376,41 @@ fn run_model_path(
         };
         let to_f32 = |h: &[u8]| -> Vec<f32> { h.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect() };
         let mut got = vec![report(0, &v)];
+        if let Some(ds) = &ds {
+            // Greedy DSpark: seed from the replay rows, then draft/verify/accept/rollback steps.
+            let rows = seq.tail_rows;
+            ds.seed(ops, &fwd, rows, seq.len - rows)?;
+            let t1 = std::time::Instant::now();
+            let (mut steps, mut acc_hist) = (0usize, [0usize; 6]);
+            let mut step_ms = Vec::new();
+            while got.len() < decode_n {
+                let tok = *got.last().unwrap();
+                let ts = std::time::Instant::now();
+                let out = ds.step(ops, &fwd, &mut seq, tok, hook, core, moe, &Tap::off(), logits, dspark_force)?;
+                step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
+                acc_hist[out.accepted] += 1;
+                steps += 1;
+                got.extend_from_slice(&out.emitted);
+            }
+            got.truncate(decode_n);
+            let dt = t1.elapsed().as_secs_f64();
+            let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
+            let mean_a = acc_hist.iter().enumerate().map(|(a, n)| a * n).sum::<usize>() as f64 / steps.max(1) as f64;
+            let mut w = step_ms.clone();
+            w.sort_by(f64::total_cmp);
+            println!(
+                "dspark{}: {} tokens in {steps} steps, {dt:.2}s ({:.2} tok/s); accepted/step mean {mean_a:.2} hist {acc_hist:?}; step ms median {:.2}",
+                if dspark_force { " [CONTROL force-accept]" } else { "" },
+                got.len() - 1,
+                (got.len() - 1) as f64 / dt,
+                w[w.len() / 2]
+            );
+            println!("decode ours:   {got:?}");
+            println!("decode oracle: {:?}", &want[..want.len().min(got.len())]);
+            println!("decode: first {agree} identical");
+            println!("DONE dsv41_forward path=model dspark");
+            return Ok(());
+        }
         let t1 = std::time::Instant::now();
         let mut steps_ms = Vec::with_capacity(decode_n);
         let mut hashes: Vec<u64> = Vec::with_capacity(decode_n);
@@ -516,7 +589,10 @@ fn main() -> Result<()> {
     let keep_layers = n_layers;
     let mut loader = SafetensorsLoader::new();
     loader.extra_skip = Some(Arc::new(move |name: &str| {
-        if name.contains(".engram.embed.") || name.starts_with("mtp.") || name.starts_with("vision") {
+        if name.contains(".engram.embed.")
+            || (name.starts_with("mtp.") && std::env::var("DSV41_DRIVER_DSPARK").as_deref() != Ok("1"))
+            || name.starts_with("vision")
+        {
             return true;
         }
         if let Some(rest) = name.strip_prefix("layers.") {

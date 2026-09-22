@@ -120,6 +120,12 @@ pub enum PrefillMode {
 /// Per-pass hook for the attention lane, called once before the first layer of a pass.
 pub trait PassHook {
     fn begin_pass(&self, kind: PassKind, start: usize, t: usize) -> Result<()>;
+    /// DSpark: discard every position >= `n` after a Verify pass (see BRIEF.md, "DSPARK ROLLBACK
+    /// CONTRACT"). The default REFUSES: a core that carries state across positions and does not
+    /// implement this would otherwise silently keep the rejected drafts' state.
+    fn rollback(&self, _ops: &Ops, n: usize) -> Result<()> {
+        anyhow::bail!("this attention core cannot roll back (to {n} positions)")
+    }
 }
 
 /// Per-sequence state this module owns. (ckv / ik / pending belong to the attention lane.)
@@ -547,6 +553,42 @@ impl V41Forward {
             self.prefill_chunk(ops, seq, chunk, mode, hook, core, moe, tap)?;
         }
         self.finish_prefill(ops, seq, mode, hook, core, moe, tap, logits)
+    }
+
+    /// DSpark verify: `ids` (the accepted token + the drafts, <= 8) at positions `seq.len..`, as ONE
+    /// Verify pass through every layer; bf16 logits of EVERY row, `[t, vocab]` (row i predicts
+    /// position seq.len + i + 1). `logits` must hold `tiled_rows(t)` rows. Follow with
+    /// [`Self::rollback`] to the accepted length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        &self,
+        ops: &Ops,
+        seq: &mut V41Seq,
+        ids: &[u32],
+        hook: &dyn PassHook,
+        core: &dyn AttnCore,
+        moe: &dyn V41RoutedMoe,
+        tap: &Tap,
+        logits: DevicePtr,
+    ) -> Result<()> {
+        ensure!(!ids.is_empty() && ids.len() <= super::ops::GEMV_MAX_M, "verify block of {} ids", ids.len());
+        let start = seq.len;
+        self.pass(ops, seq, ids, start, 0..self.blocks.len(), PassKind::Verify, hook, core, moe, tap)?;
+        prof(ops, "head", || super::fwd::final_logits_rows(ops, &self.dims, &self.scratch, ids.len(), self.norm, self.head, self.vocab, logits))
+    }
+
+    /// Discard every position >= `n` (after a Verify pass): the attention core's carried state
+    /// (`hook`), the engram n-gram history, and the sequence length. The window rings and the
+    /// compressed caches are append-only and need nothing (BRIEF.md rollback contract).
+    pub fn rollback(&self, ops: &Ops, seq: &mut V41Seq, n: usize, hook: &dyn PassHook) -> Result<()> {
+        ensure!(n <= seq.len, "rollback to {n} positions but the sequence holds {}", seq.len);
+        if n == seq.len {
+            return Ok(());
+        }
+        hook.rollback(ops, n)?;
+        seq.hash.rollback(n)?;
+        seq.len = n;
+        Ok(())
     }
 
     /// One decode step at position `seq.len`; bf16 logits `[vocab]`.
