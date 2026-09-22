@@ -107,3 +107,5 @@ docker/gb10/Dockerfile.ffnbf16
 docker/gb10/Dockerfile.fp32res
 docker/gb10/Dockerfile.hangdiag
 docker/gb10/Dockerfile.zeropen
+# GLM-5.3 bring-up walk dumps (relative ATLAS_GLM53_DUMP_DIR wrote these into the repo root)
+/p[0-9]*/

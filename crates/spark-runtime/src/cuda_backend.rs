@@ -28,6 +28,7 @@ unsafe extern "C" {
         stream: u64,
     ) -> i32;
     pub(super) fn cuMemcpyDtoDAsync_v2(dst: u64, src: u64, bytes: usize, stream: u64) -> i32;
+    pub(super) fn cuStreamIsCapturing(hStream: u64, captureStatus: *mut u32) -> i32;
     pub(super) fn cuStreamSynchronize(stream: u64) -> i32;
     pub(super) fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> i32;
     pub(super) fn cuMemsetD8Async(dst: u64, value: u8, n: usize, stream: u64) -> i32;
@@ -51,6 +52,19 @@ unsafe extern "C" {
     // Page-locked host memory for efficient async transfers
     pub(super) fn cuMemAllocHost_v2(pp: *mut *mut c_void, bytesize: usize) -> i32;
     pub(super) fn cuMemFreeHost(p: *mut c_void) -> i32;
+    pub(super) fn cuLaunchCooperativeKernel(
+        f: *mut c_void,
+        grid_dim_x: u32,
+        grid_dim_y: u32,
+        grid_dim_z: u32,
+        block_dim_x: u32,
+        block_dim_y: u32,
+        block_dim_z: u32,
+        shared_mem_bytes: u32,
+        stream: u64,
+        kernel_params: *mut *mut c_void,
+    ) -> i32;
+    pub(super) fn cuFuncSetAttribute(hfunc: *mut c_void, attrib: i32, value: i32) -> i32;
     // Managed (unified) memory — allows over-subscription with Linux swap paging
     pub(super) fn cuMemAllocManaged(dptr: *mut u64, bytesize: usize, flags: u32) -> i32;
     // CUDA events for inter-stream synchronization

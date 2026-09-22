@@ -10,6 +10,7 @@ mod kernel_gate;
 mod kv_cache;
 mod preflight;
 mod runtime;
+mod target_store;
 mod sampling_audit;
 mod tokenizer_runtime;
 mod topology;
@@ -63,6 +64,7 @@ pub(super) use runtime::{
     log_response_store_audit, open_dump_writer, resolve_model_name, resolve_tool_call_parser,
 };
 pub(super) use sampling_audit::log_sampling_presets;
+pub(super) use target_store::TargetStoreLoadPlan;
 pub(super) use tokenizer_runtime::{TokenizerRuntime, resolve_tokenizer_runtime};
 pub(super) use topology::{Topology, init_nccl_comm, resolve_topology};
 pub(super) use weights::{

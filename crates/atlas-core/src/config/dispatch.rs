@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use super::parsers::parse_qwen_rope_parameters;
 use super::{
     LayerType, ModelConfig, default_conv_kernel, default_rms_eps, finalize_config,
-    parse_gemma4_params, parse_minimax_m2, parse_mistral_params, parse_quantization_config,
+    parse_gemma4_params, parse_glm5_next, parse_minimax_m2, parse_mistral_params, parse_quantization_config,
     parse_vision_config, validate_config,
 };
 
@@ -178,6 +178,7 @@ pub fn parse_config(json: &str) -> Result<ModelConfig> {
             Ok(config)
         }
         "gemma4" => parse_gemma4_params(&raw),
+        "glm5_next" => parse_glm5_next(&raw),
         "minimax_m2" => parse_minimax_m2(&raw),
         _ => {
             // Flat config (qwen3_next, etc.)

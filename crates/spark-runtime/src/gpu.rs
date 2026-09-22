@@ -281,6 +281,26 @@ pub trait GpuBackend: Send + Sync {
         params: &mut [*mut std::ffi::c_void],
     ) -> Result<()>;
 
+    /// Launch a kernel whose implementation performs a grid-wide cooperative sync.
+    /// Backends without CUDA cooperative-grid support reject before enqueue.
+    fn launch_cooperative(
+        &self,
+        _func: KernelHandle,
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_mem: u32,
+        _stream: u64,
+        _params: &mut [*mut std::ffi::c_void],
+    ) -> Result<()> {
+        anyhow::bail!("cooperative-grid kernel launch is unsupported by this backend")
+    }
+
+    /// Opt a kernel into a dynamic shared-memory allocation above the default limit.
+    /// Unsupported backends reject before mutating function state.
+    fn set_kernel_max_dynamic_shared_memory(&self, _func: KernelHandle, _bytes: u32) -> Result<()> {
+        anyhow::bail!("kernel dynamic shared-memory attributes are unsupported by this backend")
+    }
+
     /// Typed-args kernel launch.
     ///
     /// CUDA's default impl packs args into u64 slots and forwards to
@@ -319,7 +339,23 @@ pub trait GpuBackend: Send + Sync {
     }
 
     /// Synchronize a CUDA stream (blocks until all work completes).
+    /// True when `stream` is currently being captured into a CUDA graph.
+    /// Eager paths use it to avoid host synchronisation (or pageable copies)
+    /// on a capturing stream — those calls invalidate the capture (CUDA 901).
+    /// Default `false` (backends without capture never capture through this
+    /// trait's eager paths).
+    fn stream_is_capturing(&self, _stream: u64) -> bool {
+        false
+    }
+
     fn synchronize(&self, stream: u64) -> Result<()>;
+
+    /// Async host-to-device copy (no stream synchronization). The caller must
+    /// keep `src` alive until the copy completes on `stream`. Default: the
+    /// synchronous copy.
+    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, _stream: u64) -> Result<()> {
+        self.copy_h2d(src, dst)
+    }
 
     /// Get the default stream handle.
     fn default_stream(&self) -> u64;
@@ -680,6 +716,27 @@ mod tests {
     fn test_device_ptr_offset() {
         let ptr = DevicePtr(0x1000);
         assert_eq!(ptr.offset(256).0, 0x1100);
+    }
+
+    #[test]
+    fn mock_cooperative_launch_fails_closed() {
+        let gpu = MockGpuBackend::new();
+        let mut params = [];
+        let error = gpu
+            .launch_cooperative(KernelHandle(1), [1, 1, 1], [32, 1, 1], 0, 0, &mut params)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(gpu.launch_count(), 0);
+    }
+
+    #[test]
+    fn mock_kernel_shared_memory_attribute_fails_closed() {
+        let gpu = MockGpuBackend::new();
+        let error = gpu
+            .set_kernel_max_dynamic_shared_memory(KernelHandle(1), 90 * 1024)
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported"));
+        assert_eq!(gpu.launch_count(), 0);
     }
 }
 

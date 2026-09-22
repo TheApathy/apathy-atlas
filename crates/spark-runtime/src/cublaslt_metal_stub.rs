@@ -34,3 +34,15 @@ pub fn bf16_gemm_act_weight_t_tuned(
 ) -> Result<()> {
     unreachable!("cublaslt::bf16_gemm_act_weight_t_tuned is cuda-only (not built for metal)")
 }
+
+pub fn bf16_gemm_act_weight(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_act_weight is cuda-only (not built for metal)")
+}

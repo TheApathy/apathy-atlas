@@ -26,7 +26,7 @@ pub(crate) fn load_eos_tokens(model_dir: &Path, config: &ModelConfig) -> Vec<u32
                         tracing::info!("EOS tokens (from generation_config.json): {:?}", ids);
                         ids
                     } else {
-                        vec![config.eos_token_id]
+                        config.stop_token_ids()
                     }
                 }
                 Some(serde_json::Value::Number(n)) => {
@@ -34,13 +34,13 @@ pub(crate) fn load_eos_tokens(model_dir: &Path, config: &ModelConfig) -> Vec<u32
                     tracing::info!("EOS token (from generation_config.json): {}", id);
                     vec![id]
                 }
-                _ => vec![config.eos_token_id],
+                _ => config.stop_token_ids(),
             };
         }
-        return vec![config.eos_token_id];
+        return config.stop_token_ids();
     }
-    tracing::info!("EOS token (from config.json): {}", config.eos_token_id);
-    vec![config.eos_token_id]
+    tracing::info!("EOS tokens (from config.json): {:?}", config.stop_token_ids());
+    config.stop_token_ids()
 }
 
 pub(crate) struct SamplingDefaults {

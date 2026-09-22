@@ -79,31 +79,23 @@ pub(crate) fn parse_quantization_config_checked(
         .to_string();
     let format = qc
         .get("format")
+        .or_else(|| qc.get("fmt"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
 
-    // Ignore list: ModelOpt calls it `ignore`, compressed-tensors calls
-    // it `ignore` too at the top level but also has `targets` inside
-    // `config_groups`. Collect anything useful from both places.
+    // Ignore list aliases used by ModelOpt, compressed-tensors, and native
+    // Transformers FP8 checkpoints respectively. Preserve their order while
+    // deduplicating so downstream format dispatch never guesses precision.
     let mut ignore_modules: Vec<String> = Vec::new();
-    if let Some(arr) = qc.get("ignore").and_then(serde_json::Value::as_array) {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                ignore_modules.push(s.to_string());
-            }
-        }
-    }
-    // compressed-tensors can also use `exclude_modules` (vLLM-style).
-    if let Some(arr) = qc
-        .get("exclude_modules")
-        .and_then(serde_json::Value::as_array)
-    {
-        for v in arr {
-            if let Some(s) = v.as_str()
-                && !ignore_modules.contains(&s.to_string())
-            {
-                ignore_modules.push(s.to_string());
+    for key in ["ignore", "exclude_modules", "modules_to_not_convert"] {
+        if let Some(arr) = qc.get(key).and_then(serde_json::Value::as_array) {
+            for value in arr {
+                if let Some(module) = value.as_str()
+                    && !ignore_modules.iter().any(|known| known == module)
+                {
+                    ignore_modules.push(module.to_string());
+                }
             }
         }
     }
@@ -477,5 +469,28 @@ mod tests {
         let err = parse_quantization_config_checked(&raw)
             .expect_err("duplicate mixed-precision targets must fail closed");
         assert!(err.to_string().contains("duplicate target"));
+    }
+
+    #[test]
+    fn transformers_fp8_modules_to_not_convert_are_preserved() {
+        let raw = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "fp8",
+                "modules_to_not_convert": [
+                    "model.layers.0.self_attn.q_proj",
+                    "model.layers.0.self_attn.q_proj",
+                    "lm_head"
+                ]
+            }
+        });
+        let qc = parse_quantization_config(&raw).expect("native FP8 block must parse");
+        assert_eq!(qc.quant_method, "fp8");
+        assert_eq!(
+            qc.ignore_modules,
+            vec![
+                "model.layers.0.self_attn.q_proj".to_string(),
+                "lm_head".to_string()
+            ]
+        );
     }
 }

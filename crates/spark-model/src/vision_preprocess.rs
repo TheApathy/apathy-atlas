@@ -12,8 +12,12 @@ use image::{DynamicImage, ImageFormat};
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
-const MEAN: [f32; 3] = [0.5, 0.5, 0.5];
-const STD: [f32; 3] = [0.5, 0.5, 0.5];
+const SIGLIP_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
+const SIGLIP_STD: [f32; 3] = [0.5, 0.5, 0.5];
+
+/// CLIP normalization shipped in GLM-5.3-Flash's pinned processor_config.json.
+const GLM53_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+const GLM53_STD: [f32; 3] = [0.268_629_55, 0.261_302_6, 0.275_777_1];
 
 /// Maximum allowed image dimension in pixels (longer side).
 const MAX_DIM: u32 = 1280;
@@ -102,6 +106,11 @@ fn target_size(orig_h: u32, orig_w: u32, grid_unit: u32) -> (u32, u32) {
 /// - `grid_h`: number of patches along height
 /// - `grid_w`: number of patches along width
 pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>, usize, usize)> {
+    let (mean, std) = if vcfg.model_type == "glm5_next_vision" {
+        (GLM53_MEAN, GLM53_STD)
+    } else {
+        (SIGLIP_MEAN, SIGLIP_STD)
+    };
     let img = decode_image(data_uri)?;
     let img = img.to_rgb8();
     let (orig_w, orig_h) = (img.width(), img.height());
@@ -126,7 +135,18 @@ pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>
     // Layout: [P, C, T, Hp, Wp] → stored as [P, C*T*Hp*Wp] in row-major order.
     for ph in 0..grid_h {
         for pw in 0..grid_w {
-            let patch_idx = ph * grid_w + pw;
+            // GLM consumes every spatial 2x2 block as four consecutive rows:
+            // the post tower `view(-1, 2, 2, hidden)` feeds its stride-2
+            // downsample directly. Qwen's encoder performs an explicit spatial
+            // gather later and therefore keeps ordinary row-major patch order.
+            let patch_idx = if vcfg.model_type == "glm5_next_vision" {
+                let sms = vcfg.spatial_merge_size;
+                ((ph / sms) * (grid_w / sms) + (pw / sms)) * sms * sms
+                    + (ph % sms) * sms
+                    + (pw % sms)
+            } else {
+                ph * grid_w + pw
+            };
             for c in 0..3usize {
                 for t in 0..tp {
                     for py in 0..ps {
@@ -135,7 +155,7 @@ pub fn preprocess_image(data_uri: &str, vcfg: &VisionConfig) -> Result<(Vec<f32>
                             let pixel_x = pw * ps + px;
                             let raw =
                                 img.get_pixel(pixel_x as u32, pixel_y as u32)[c] as f32 / 255.0;
-                            let norm = (raw - MEAN[c]) / STD[c];
+                            let norm = (raw - mean[c]) / std[c];
                             // Offset into patch_dim: c*(T*Hp*Wp) + t*(Hp*Wp) + py*Wp + px
                             let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
                             pixels[patch_idx * patch_dim + off] = norm;
@@ -211,5 +231,12 @@ mod tests {
     fn test_image_pad_count_non_divisible_floors() {
         // Integer division truncates: 65/2 = 32 (not 33).
         assert_eq!(image_pad_count(65, 64, 2), 32 * 32);
+    }
+
+    #[test]
+    fn glm53_uses_checkpoint_clip_normalization() {
+        assert_eq!(GLM53_MEAN, [0.481_454_66, 0.457_827_5, 0.408_210_73]);
+        assert_eq!(GLM53_STD, [0.268_629_55, 0.261_302_6, 0.275_777_1]);
+        assert_ne!(GLM53_MEAN, SIGLIP_MEAN);
     }
 }

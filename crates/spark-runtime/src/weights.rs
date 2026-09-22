@@ -100,9 +100,10 @@ impl WeightStore {
         }
     }
 
-    /// Crate-internal: wrap a pre-built map. Used by alternate loaders
-    /// (e.g. `fast_weights::FastSafetensorsLoader`).
-    pub(crate) fn from_map(weights: HashMap<String, WeightTensor>) -> Self {
+    /// Wrap a pre-built map. Used by alternate loaders (e.g.
+    /// `fast_weights::FastSafetensorsLoader`) and by GLM-5.3's DFlash2
+    /// admission, which validates against an empty store from another crate.
+    pub fn from_map(weights: HashMap<String, WeightTensor>) -> Self {
         Self {
             weights,
             released: Mutex::new(HashSet::new()),
@@ -428,6 +429,7 @@ pub(crate) fn parse_expert_index(name: &str) -> Option<usize> {
     None
 }
 
+pub mod gguf;
 mod loader;
 pub mod mlx_int8;
 pub(crate) use loader::{check_oom_guard, estimate_has_fp8, estimate_load_bytes};

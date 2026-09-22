@@ -14,10 +14,23 @@
 //!   - `nemotron`: Nemotron-H (Mamba-2 + MoE + Attention)
 //!   - `gemma4`: Gemma-4 (pure attention, GeGLU, sliding + full attention)
 
+mod dflash_admission;
 pub mod dflash_loader;
 mod dflash_validation;
 pub mod dspark_confidence;
 mod gemma4;
+mod glm53_catalog;
+mod glm53_context;
+mod glm53_dflash2;
+mod glm53_exl3;
+mod glm53_exl3_catalog;
+mod glm53_exl3_device;
+mod glm53_exl3_linear;
+mod glm53_exl3_native;
+mod glm53_exl3_target;
+mod glm53_exl3_vision;
+mod glm53_gguf;
+mod glm53_prefill;
 mod minimax;
 mod nemotron;
 mod qwen3;
@@ -28,6 +41,7 @@ mod qwen3_vl;
 pub mod qwen4_mtp;
 pub mod transform_cache;
 
+pub use dflash_admission::{DflashDrafterConfig, parse_dflash_drafter_config};
 pub use dflash_loader::{
     DflashConfig, DflashConvWeights, DflashLayerWeights, DflashSelectorWeights, DflashSubConfig,
     DflashWeights, DrafterCheckpointFamily, DsparkConfidenceConfig, DsparkConfidenceWeights,
@@ -35,6 +49,62 @@ pub use dflash_loader::{
     store_has_markov_head,
 };
 pub use gemma4::Gemma4WeightLoader;
+pub use glm53_catalog::{
+    Glm53AttentionKind, Glm53AttentionWeights, Glm53DenseFfnWeights, Glm53DsaWeights, Glm53FfnKind,
+    Glm53FfnWeights, Glm53GgufCatalog, Glm53HyperBranchWeights, Glm53HyperWeights, Glm53KdaWeights,
+    Glm53LayerDescriptor, Glm53LayerNorms, Glm53MoeWeights, Glm53NextnWeights,
+    Glm53TargetLayerWeights,
+};
+pub use glm53_context::{
+    GLM53_DENSE_KV_CACHE_STREAMS, GLM53_DSA_LAYERS, GLM53_KDA_LAYERS, GLM53_MAX_CONTEXT_TOKENS,
+    Glm53ContextAdmission, Glm53ContextDtype, Glm53ContextPlan, Glm53ContextRegion,
+    Glm53DsaStorage,
+};
+pub use glm53_dflash2::{
+    GLM53_DFLASH2_PAYLOAD_BYTES, GLM53_DFLASH2_TENSOR_COUNT, Glm53Dflash2CandidateSelectorWeights,
+    Glm53Dflash2Config, Glm53Dflash2ConvWeights, Glm53Dflash2LayerWeights, Glm53Dflash2SubConfig,
+    Glm53Dflash2Weights, load_glm53_dflash2_weights, parse_glm53_dflash2_config,
+    validate_glm53_dflash2_store,
+};
+pub use glm53_exl3::{
+    GLM53_EXL3_DATA_BYTES, GLM53_EXL3_LEDGER_ENTRIES, GLM53_EXL3_QUANTIZED_ENTRIES,
+    GLM53_EXL3_TENSOR_COUNT, Glm53Exl3Admission, Glm53Exl3Dtype, Glm53Exl3Files,
+    Glm53Exl3ShardInfo, Glm53Exl3TensorInfo, admit_glm53_exl3_checkpoint, admit_glm53_exl3_files,
+};
+pub use glm53_exl3_catalog::{
+    GLM53_EXL3_TARGET_LINEAR_COUNT, GLM53_EXL3_TARGET_PHYSICAL_TENSOR_COUNT,
+    GLM53_EXL3_TARGET_RAW_COUNT, Glm53Exl3RawTensor, Glm53Exl3TargetCatalog,
+    validate_glm53_exl3_target_manifest,
+};
+pub use glm53_exl3_device::{
+    Glm53Exl3DeviceLoadError, Glm53Exl3DeviceStore, Glm53Exl3DeviceStoreFreeError,
+    Glm53Exl3DeviceTensor, load_glm53_exl3_store,
+};
+pub use glm53_exl3_linear::{
+    Glm53Exl3Bf16LinearBuffers, Glm53Exl3Linear, Glm53Exl3LinearBuffers,
+    PreparedGlm53Exl3Bf16Linear, PreparedGlm53Exl3Linear,
+};
+pub use glm53_exl3_native::{
+    Glm53Exl3NativeDtype, Glm53Exl3NativeLoadError, Glm53Exl3NativeStore, Glm53Exl3NativeTensor,
+    materialize_glm53_exl3_native,
+};
+pub use glm53_exl3_target::{
+    GLM53_EXL3_TARGET_EXPERTS, GLM53_EXL3_TARGET_LAYERS, Glm53Exl3AttentionWeights,
+    Glm53Exl3DenseFfnWeights, Glm53Exl3DsaWeights, Glm53Exl3ExpertWeights, Glm53Exl3FfnWeights,
+    Glm53Exl3HyperBranchWeights, Glm53Exl3HyperWeights, Glm53Exl3KdaWeights, Glm53Exl3MoeWeights,
+    Glm53Exl3NormWeights, Glm53Exl3TargetLayerWeights, Glm53Exl3TargetWeights,
+};
+pub use glm53_exl3_vision::{
+    GLM53_EXL3_VISION_BLOCKS, GLM53_EXL3_VISION_LINEAR_COUNT,
+    GLM53_EXL3_VISION_PHYSICAL_TENSOR_COUNT, GLM53_EXL3_VISION_RAW_COUNT, Glm53Exl3VisionCatalog,
+    Glm53Exl3VisionRawTensor, validate_glm53_exl3_vision_manifest,
+};
+pub use glm53_gguf::{Glm53GgufExperts, Glm53GgufF32, Glm53GgufMatrix, Glm53GgufMatrixBank};
+pub use glm53_prefill::{
+    GLM53_PREFILL_BLOCK_TOKENS, GLM53_PREFILL_MAX_CHUNK_TOKENS, GLM53_PREFILL_MAX_CHUNKS,
+    GLM53_PREFILL_MAX_GRID_Y, Glm53PrefillChunk, Glm53PrefillContracts, Glm53PrefillIndexState,
+    Glm53PrefillSchedule,
+};
 pub use minimax::MinimaxM2WeightLoader;
 pub use nemotron::NemotronHWeightLoader;
 pub use qwen3::Qwen3WeightLoader;
@@ -42,6 +112,10 @@ pub use qwen3_vl::Qwen3VLWeightLoader;
 pub use qwen35::Qwen35WeightLoader;
 pub(crate) use qwen35::{load_qwen4_mtp_layer, qwen4_mtp_config};
 pub use qwen35_dense::Qwen35DenseWeightLoader;
+
+#[cfg(test)]
+#[path = "glm53_gguf_tests.rs"]
+mod glm53_gguf_tests;
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;

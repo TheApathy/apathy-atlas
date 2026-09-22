@@ -130,6 +130,10 @@ pub struct SequenceState {
     /// the scheduler to populate `usage.prompt_tokens_details.cached_tokens`.
     /// 0 when prefix caching is disabled or the prompt had no cache match.
     pub cached_prefix_tokens: usize,
+    /// Tokens whose K/V (or recurrent state) the model has actually written.
+    /// Maintained by model-owned-state models (GLM-5.3), whose verify-policy
+    /// binding requires it to equal `seq_len`; 0 and unread elsewhere.
+    pub kv_valid_tokens: usize,
     /// Original prompt token count, set at the first prefill and never
     /// mutated by decode. Used by `cache_sequence` to split seq.tokens into
     /// prompt (already inserted + ref-bumped by prefill) vs generated
@@ -240,4 +244,5 @@ impl SequenceState {
 /// thread. The `unsafe impl Sync` on `TransformerModel` documents this
 /// single-thread invariant — do NOT share `&dyn Model` across threads.
 mod model;
+mod sequence_state_init;
 pub use model::{EP_CMD_VERIFY_KGAMMA, EP_VERIFY_KGAMMA_ABORT, Model};

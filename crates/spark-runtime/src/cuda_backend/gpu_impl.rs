@@ -33,7 +33,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use atlas_core::registry::{AtlasRegistry, RawCudaFunc, cuda_error_text};
 use cudarc::driver::LaunchConfig;
 
@@ -286,6 +286,51 @@ impl GpuBackend for AtlasCudaBackend {
         }
     }
 
+    fn launch_cooperative(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        let status = unsafe {
+            super::cuLaunchCooperativeKernel(
+                func.0 as *mut c_void,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_mem,
+                stream,
+                params.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            bail!(
+                "cuLaunchCooperativeKernel failed: {}",
+                cuda_error_text(status)
+            );
+        }
+        Ok(())
+    }
+
+    fn set_kernel_max_dynamic_shared_memory(&self, func: KernelHandle, bytes: u32) -> Result<()> {
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8.
+        let value = i32::try_from(bytes).context("dynamic shared-memory size exceeds i32")?;
+        let status = unsafe { super::cuFuncSetAttribute(func.0 as *mut c_void, 8, value) };
+        if status != 0 {
+            bail!(
+                "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) failed: {}",
+                cuda_error_text(status)
+            );
+        }
+        Ok(())
+    }
+
     fn synchronize(&self, stream: u64) -> Result<()> {
         let status = unsafe { cuStreamSynchronize(stream) };
         if status != 0 {
@@ -330,6 +375,24 @@ impl GpuBackend for AtlasCudaBackend {
         let src = src.as_bytes();
         let status = unsafe {
             cuMemcpyHtoDAsync_v2(dst.0, src.as_ptr() as *const c_void, src.len(), stream)
+        };
+        if status != 0 {
+            bail!("cuMemcpyHtoDAsync_v2 failed: status {status}");
+        }
+        Ok(())
+    }
+
+    fn stream_is_capturing(&self, stream: u64) -> bool {
+        let mut status: u32 = 0;
+        // CU_STREAM_CAPTURE_STATUS_NONE = 0; treat query failure as
+        // capturing (conservative: the caller skips its eager work).
+        let rc = unsafe { super::cuStreamIsCapturing(stream, &mut status) };
+        rc != 0 || status != 0
+    }
+
+    fn copy_h2d_async(&self, src: &[u8], dst: DevicePtr, stream: u64) -> Result<()> {
+        let status = unsafe {
+            super::cuMemcpyHtoDAsync_v2(dst.0, src.as_ptr() as *const c_void, src.len(), stream)
         };
         if status != 0 {
             bail!("cuMemcpyHtoDAsync_v2 failed: status {status}");

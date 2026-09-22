@@ -400,6 +400,22 @@ pub struct ModelConfig {
     /// it is never read from or written to Hugging Face config.json.
     #[serde(skip)]
     pub ple_offload_manifest: Option<String>,
+
+    /// Number of hyper-connection residual streams per block (`hc_mult`).
+    /// 0 = disabled. GLM-5.3 (mHC) uses 4.
+    #[serde(default)]
+    pub hc_mult: usize,
+    /// Number of Sinkhorn normalization iterations for the HC mixing matrix
+    /// (`hc_sinkhorn_iters`). GLM-5.3 uses 20.
+    #[serde(default)]
+    pub hc_sinkhorn_iters: usize,
+    /// Numerical-stability epsilon for HC sigmoid/softmax/Sinkhorn (`hc_eps`).
+    #[serde(default)]
+    pub hc_eps: f32,
+
+    /// GLM-5-Next-only KDA, sparse indexer, FFN schedule, and stop-token ABI.
+    #[serde(skip)]
+    pub glm5_next: Option<Glm5NextConfig>,
 }
 
 /// Advertised weight-quantization layout, as declared in the HF
@@ -474,9 +490,11 @@ impl QuantizationConfig {
     }
 }
 
-/// Vision encoder configuration for Qwen3-VL models.
+/// Vision encoder configuration parsed from a conditional-generation model.
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
+    /// Architecture tag from `vision_config.model_type`.
+    pub model_type: String,
     /// Number of ViT transformer blocks (depth=27).
     pub depth: usize,
     /// ViT hidden dimension (1152).
@@ -493,18 +511,41 @@ pub struct VisionConfig {
     pub intermediate_size: usize,
     /// Projection output dimension = LLM hidden_size (2048).
     pub out_hidden_size: usize,
+    /// Input channel count (normally RGB = 3).
+    pub in_channels: usize,
+    /// Native image size from the checkpoint contract, when declared.
+    pub image_size: usize,
+    /// GLM vision merger bottleneck width. Zero for Qwen-family towers.
+    pub projection_intermediate_size: usize,
+    /// Vision RMSNorm epsilon. Zero when the tower uses LayerNorm/defaults.
+    pub rms_norm_eps: f64,
+    /// Optional model-defined clamp for vision SwiGLU.
+    pub swiglu_limit: Option<f32>,
     /// Layer indices after which deepstack mergers are applied ([8, 16, 24]).
     pub deepstack_visual_indexes: Vec<usize>,
     /// Placeholder token ID that marks where vision embeddings get spliced
     /// into the text embedding stream. Qwen3-VL uses 151655; Qwen3.6 uses
     /// 248056. When 0 the runtime falls back to the legacy Qwen3-VL value.
     pub image_pad_token_id: u32,
+    /// Video placeholder token ID. Zero when video is unsupported/not declared.
+    pub video_pad_token_id: u32,
 }
 
 impl VisionConfig {
     /// Dimension of the merger input (spatial_merge_size² × hidden_size).
     pub fn merger_input_size(&self) -> usize {
         self.spatial_merge_size * self.spatial_merge_size * self.hidden_size
+    }
+}
+
+impl ModelConfig {
+    /// Complete model-defined generation stop set.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        self.glm5_next
+            .as_ref()
+            .map(|config| config.eos_token_ids.clone())
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| vec![self.eos_token_id])
     }
 }
 
@@ -529,14 +570,17 @@ pub(crate) fn default_conv_kernel() -> usize {
 
 mod dispatch;
 mod factory;
+mod glm5_next;
 mod methods;
 mod parsers;
 #[cfg(test)]
 mod tests;
 
 pub use dispatch::parse_config;
+pub use glm5_next::{Glm5NextConfig, Glm5NextIndexerType, Glm5NextMlpType};
 pub(crate) use parsers::{
-    parse_gemma4_params, parse_minimax_m2, parse_quantization_config_checked, parse_vision_config,
+    parse_gemma4_params, parse_glm5_next, parse_minimax_m2, parse_quantization_config_checked,
+    parse_vision_config,
 };
 pub use parsers::{parse_mistral_params, parse_quantization_config};
 

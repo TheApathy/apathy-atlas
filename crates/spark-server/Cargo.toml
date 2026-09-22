@@ -70,7 +70,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 toml = "0.8"
-minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json"] }
+minijinja = { version = "2", features = ["builtins", "adjacent_loop_items", "json", "loop_controls"] }
 # Pure-Rust grammar-constrained decoding (W7: was the C++-backed
 # `xgrammar-rs = "0.1"` patched to `vendor/xgrammar-rs`; now the
 # from-scratch Rust port at `crates/xgrammar`). The crate's lib is
@@ -89,6 +89,9 @@ base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
+# Unit tests consume `spark_runtime::gpu::mock`, which is exported only by
+# spark-runtime's non-production `test-utils` feature.
+spark-runtime = { path = "../spark-runtime", default-features = false, features = ["test-utils"] }
 
 [lints]
 workspace = true

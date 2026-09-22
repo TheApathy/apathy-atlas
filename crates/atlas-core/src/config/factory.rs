@@ -118,6 +118,10 @@ impl ModelConfig {
             dflash_capture_offset: 0,
             dflash_capture_mode: super::DflashCaptureMode::ResidualSlice,
             ple_offload_manifest: None,
+            glm5_next: None,
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 1e-6,
         }
     }
 }

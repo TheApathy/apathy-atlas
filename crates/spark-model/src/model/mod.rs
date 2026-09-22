@@ -49,4 +49,7 @@ pub(crate) mod trait_impl;
 pub(crate) mod types;
 pub(crate) mod vision_embeddings;
 
+// Dormant, fail-closed GLM-5.3 target ownership/admission foundation.
+pub mod glm53;
+
 pub use types::TransformerModel;

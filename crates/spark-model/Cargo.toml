@@ -7,6 +7,8 @@ description = "Atlas Spark model — Qwen3 forward pass orchestration"
 
 [features]
 default = ["cuda"]
+# GPU-only GLM-5.3 bring-up examples (opt-in; never built by --all-targets).
+gpu-examples = []
 # spark-model has no Metal port yet (Phases 4–7 add it). The cuda feature
 # forwards atlas-core/cuda + spark-runtime/cuda so the default Linux build
 # remains unchanged after the workspace-level default-features = false on
@@ -120,3 +122,20 @@ spark-runtime = { path = "../spark-runtime", default-features = false, features 
 
 [lints]
 workspace = true
+
+[[example]]
+name = "glm53_dflash2_kv_parity"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm53_projection_probe"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm53_partial_replay_parity"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm53_exl3_private_device"
+required-features = ["cuda", "gpu-examples"]
+

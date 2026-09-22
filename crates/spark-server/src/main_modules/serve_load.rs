@@ -186,6 +186,40 @@ pub(crate) fn load_model(
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
 
+    // GLM-5.3 has two deliberately disjoint physical sources. An explicit
+    // GGUF directory always wins; otherwise the presence of both EXL3 marker
+    // files selects the strict 2.05-bpw admission. A partial marker set is a
+    // broken EXL3 checkpoint, not permission to fall through to GGUF.
+    let glm53_exl3_files =
+        if config.model_type == "glm5_next" && std::env::var_os("ATLAS_GLM53_GGUF_DIR").is_none() {
+            let index = model_dir.join("model.safetensors.index.json");
+            let quant = model_dir.join("quantization_config.json");
+            match (index.is_file(), quant.is_file()) {
+                (true, true) => Some(
+                    spark_model::weight_loader::admit_glm53_exl3_files(&model_dir)
+                        .context("admitting the exact GLM-5.3 EXL3 checkpoint")?,
+                ),
+                (false, false) => None,
+                _ => anyhow::bail!(
+                    "GLM-5.3 EXL3 checkpoint is incomplete: both {} and {} are required",
+                    index.display(),
+                    quant.display(),
+                ),
+            }
+        } else {
+            None
+        };
+    let is_glm53_exl3 = glm53_exl3_files.is_some();
+    // GLM's DFlash2 proposer and its scheduler policy driver were not ported
+    // onto this engine's scheduler (integrate/all-models); refuse instead of
+    // silently serving the legacy drafter against a GLM target.
+    if config.model_type == "glm5_next" && (args.dflash || args.speculative) {
+        anyhow::bail!(
+            "GLM-5.3 speculative decoding (--dflash/--speculative) is not available in this \
+             build; serve GLM-5.3 target-only"
+        );
+    }
+
     let context_extension = super::context_extension::apply_context_extension(
         &mut config,
         args.max_seq_len,
@@ -306,6 +340,29 @@ pub(crate) fn load_model(
             },
         )?
     };
+    // GLM-5.3 ships two kernel bundles (exl3, iq3) declaring the same
+    // (model_type, hidden_size); a wildcard build contains both, so pick the
+    // one matching the physical source rather than whichever sorts first.
+    let ptx_set = if config.model_type == "glm5_next" {
+        let required_quant = if is_glm53_exl3 { "exl3" } else { "iq3" };
+        if ptx_set.target.quant == required_quant {
+            ptx_set
+        } else {
+            atlas_kernels::available_targets()
+                .into_iter()
+                .find(|t| t.target.model == ptx_set.target.model && t.target.quant == required_quant)
+                .with_context(|| {
+                    format!(
+                        "GLM-5.3 serving selected the {required_quant} physical source, but this \
+                         binary has no {} {required_quant} kernel bundle. Rebuild with \
+                         ATLAS_TARGET_QUANT={required_quant} (or '*') and restart.",
+                        ptx_set.target.model,
+                    )
+                })?
+        }
+    } else {
+        ptx_set
+    };
     let sampling_presets = ptx_set.sampling;
     tracing::info!(
         "Selected kernel target: {} ({} modules)",
@@ -388,15 +445,98 @@ pub(crate) fn load_model(
     }
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
     tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
-    let mut store = serve_phases::load_weight_store(
-        &args,
-        &config,
-        &model_dir,
-        gpu.as_ref(),
-        ep_rank,
-        ep_size,
-        oom_reserve_bytes,
-    )?;
+    // GLM-5.3-Flash's trunk (34 KDA + 11 DSA layers under mHC) cannot use the
+    // generic transformer path. It loads through its own EXL3 or GGUF device
+    // store and is built by `build_glm53_*` below. Every other model takes the
+    // unchanged safetensors path.
+    let glm53_exl3 = if let Some(files) = glm53_exl3_files {
+        let physical_vocab = spark_runtime::weights::gguf::GLM53_GGUF_VOCAB_SIZE;
+        if config.vocab_size != physical_vocab {
+            tracing::info!(
+                "GLM-5.3 EXL3: config.json declares vocab_size={}, physical embedding holds {} — using the payload",
+                config.vocab_size,
+                physical_vocab,
+            );
+            config.vocab_size = physical_vocab;
+        }
+        let loaded = match spark_model::weight_loader::load_glm53_exl3_store(
+            &files,
+            gpu.as_ref(),
+            oom_reserve_bytes,
+        ) {
+            Ok(store) => store,
+            Err(error) => match error.retry_cleanup(gpu.as_ref()) {
+                Ok(primary) => return Err(primary.context("loading GLM-5.3 EXL3 checkpoint")),
+                Err(retained) => anyhow::bail!("GLM-5.3 EXL3 load cleanup failed: {retained}"),
+            },
+        };
+        tracing::info!(
+            "GLM-5.3 EXL3 store: {} tensors, {} bytes resident",
+            loaded.len(),
+            loaded.allocated_bytes(),
+        );
+        Some((files, loaded))
+    } else {
+        None
+    };
+    let glm53_gguf: Option<(
+        spark_runtime::weights::gguf::Glm53QuantProfile,
+        spark_runtime::weights::gguf::GgufDeviceStore,
+    )> = if config.model_type == "glm5_next" && glm53_exl3.is_none() {
+        let profile = spark_runtime::weights::gguf::Glm53QuantProfile::UdIq2Xxs;
+        // The GGUF payload does not have to sit beside config.json: search an
+        // explicit ATLAS_GLM53_GGUF_DIR, the profile subdirectory, then the
+        // model directory itself.
+        let shard_dir = std::env::var_os("ATLAS_GLM53_GGUF_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| model_dir.join(profile.directory_name()));
+        let shard_dir = if shard_dir.is_dir() {
+            shard_dir
+        } else {
+            model_dir.clone()
+        };
+        tracing::info!("GLM-5.3 GGUF shard directory: {}", shard_dir.display());
+        let gguf_vocab = spark_runtime::weights::gguf::GLM53_GGUF_VOCAB_SIZE;
+        if config.vocab_size != gguf_vocab {
+            tracing::info!(
+                "GLM-5.3: config.json declares vocab_size={}, GGUF payload holds {} — \
+                 using the payload",
+                config.vocab_size,
+                gguf_vocab,
+            );
+            config.vocab_size = gguf_vocab;
+        }
+        let shards = super::glm53_gguf_resolver::resolve_exact_glm53_shards(&shard_dir, profile)
+            .context("resolving GLM-5.3 GGUF shards")?;
+        let loaded = serve_phases::TargetStoreLoadPlan::resolved_glm53(profile, shards)
+            .context("planning the GLM-5.3 GGUF load")?
+            .load_glm53_gguf(gpu.as_ref(), oom_reserve_bytes)
+            .map_err(|error| anyhow::anyhow!("GLM-5.3 GGUF load failed: {error}"))?;
+        tracing::info!(
+            "GLM-5.3 GGUF store: {} tensors, {} bytes resident",
+            loaded.tensor_count(),
+            loaded.total_bytes(),
+        );
+        Some(loaded.into_glm53_gguf()?)
+    } else {
+        None
+    };
+    let has_glm53_target_store = glm53_exl3.is_some() || glm53_gguf.is_some();
+    let mut store = if has_glm53_target_store {
+        // The safetensors-shaped checks below are skipped for GLM; this empty
+        // store keeps their types satisfied without pretending to hold weights.
+        spark_runtime::weights::WeightStore::empty()
+    } else {
+        serve_phases::load_weight_store(
+            &args,
+            &config,
+            &model_dir,
+            gpu.as_ref(),
+            ep_rank,
+            ep_size,
+            oom_reserve_bytes,
+        )?
+    };
 
     if let Some(mtp_dir) = &args.mtp_from_path {
         use spark_runtime::weights::WeightLoader;
@@ -428,8 +568,11 @@ pub(crate) fn load_model(
         );
     }
 
-    // 3b. Auto-detect weight key prefix for nested models.
-    serve_phases::auto_detect_weight_prefix(&store, &mut config);
+    // 3b. Auto-detect weight key prefix for nested models. Safetensors only:
+    // the GLM store has its own pinned tensor names.
+    if !has_glm53_target_store {
+        serve_phases::auto_detect_weight_prefix(&store, &mut config);
+    }
 
     // Pre-flight weight-store / config consistency check. Runs before
     // NCCL init so a mis-matched checkpoint (wrong expert count, MiniMax
@@ -439,8 +582,10 @@ pub(crate) fn load_model(
     // MiniMax M2.7 hang on NCCL init today because the actual mismatch
     // only surfaces later inside `build_model`; this check surfaces it
     // up-front.
-    spark_model::preflight::preflight(&store, &config, args.speculative)
-        .context("Checkpoint pre-flight check failed")?;
+    if !has_glm53_target_store {
+        spark_model::preflight::preflight(&store, &config, args.speculative)
+            .context("Checkpoint pre-flight check failed")?;
+    }
 
     // Resolve and log the QuantFormat dispatch decision now so a silent
     // fallback is visible in the server log (and not just in the
@@ -463,7 +608,11 @@ pub(crate) fn load_model(
         &args,
         &config,
         gpu.as_ref(),
-        store.total_bytes(),
+        match (&glm53_exl3, &glm53_gguf) {
+            (Some((_, exl3_store)), _) => exl3_store.allocated_bytes(),
+            (None, Some((_, gguf_store))) => gguf_store.total_bytes(),
+            (None, None) => store.total_bytes(),
+        },
         free_mem,
         inference_reserve,
         total_reserve,
@@ -510,7 +659,12 @@ pub(crate) fn load_model(
             std::env::set_var("ATLAS_PROFILE", "1");
         }
     }
-    serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
+    // Not for GLM-5.3: the payload pads the embedding to 154,880 physical rows
+    // while tokenizer.json holds 154,856 tokens; capping here would undo the
+    // physical-vocab override above and refuse a correct checkpoint.
+    if !has_glm53_target_store {
+        serve_phases::cap_vocab_size_to_tokenizer(&model_dir, &mut config);
+    }
     let serve_phases::KvCacheConfig {
         effective_kv_dtype_str: _,
         kv_dtype,
@@ -560,20 +714,36 @@ pub(crate) fn load_model(
                 },
                 quantization: dflash_quantization,
             });
-    let model = serve_phases::build_model(
-        &args,
-        &config,
-        context_admission,
-        &store,
-        gpu,
-        max_batch_tokens,
-        kv_dtype,
-        inference_reserve,
-        layer_dtypes,
-        prefix_cache,
-        comm,
-        dflash_args,
-    )?;
+    // GLM-5.3 bypasses the generic transformer builder: `Glm53Model`
+    // implements `Model` directly over the owned device store loaded above.
+    let model = if let Some((files, exl3_store)) = glm53_exl3 {
+        spark_model::factory::build_glm53_exl3_model(
+            files,
+            exl3_store,
+            gpu,
+            args.max_seq_len,
+            None,
+        )
+        .context("building the GLM-5.3 EXL3 model")?
+    } else if let Some((profile, gguf_store)) = glm53_gguf {
+        spark_model::factory::build_glm53_model(profile, &config, gguf_store, gpu, args.max_seq_len)
+            .context("building the GLM-5.3 model")?
+    } else {
+        serve_phases::build_model(
+            &args,
+            &config,
+            context_admission,
+            &store,
+            gpu,
+            max_batch_tokens,
+            kv_dtype,
+            inference_reserve,
+            layer_dtypes,
+            prefix_cache,
+            comm,
+            dflash_args,
+        )?
+    };
 
     // `--check-kernels`: every kernel lookup is eager and lives in a layer
     // constructor on the `build_model` path above, so the audit is complete

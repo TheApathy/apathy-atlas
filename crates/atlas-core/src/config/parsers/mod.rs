@@ -4,6 +4,7 @@
 //! budget.
 
 mod gemma4;
+mod glm5_next;
 mod minimax;
 mod mistral;
 mod quantization;
@@ -11,6 +12,7 @@ mod qwen_yarn;
 mod vision;
 
 pub(crate) use gemma4::parse_gemma4_params;
+pub(crate) use glm5_next::parse_glm5_next;
 pub(crate) use minimax::parse_minimax_m2;
 pub use mistral::parse_mistral_params;
 pub use quantization::parse_quantization_config;

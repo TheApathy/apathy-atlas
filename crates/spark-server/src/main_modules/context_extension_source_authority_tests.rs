@@ -97,13 +97,28 @@ const ADMISSION_SHA256: &str = "c1f12ecd43e1a8f1263033723802f2fcde0841cf503b3657
 // YaRN profile (sets yarn_* on qwen4_exp configs BEFORE the guard runs, as it
 // did in phaseA), and two ensure!s on the MTP sidecar flags. None of them
 // touches a non-qwen4 config, and no admission rule moved.
-const SERVE_LOAD_SHA256: &str = "a2078167147ca40340603c2cef9a5aac1c8c0374dcf9056120a7baba81b54ed0";
+// Re-pinned 2026-09-22 (SIXTH time) for the GLM-5.3 port. `load_model` gains
+// the GLM EXL3/GGUF source admission (after merge_sidecar_quant_config), a
+// quant-aware kernel-bundle pick for glm5_next, the GLM device-store loads,
+// `!has_glm53_target_store` guards on prefix-detect/preflight/vocab-cap, and a
+// GLM branch in front of `build_model`.
+//
+// MACHINE-checked: the guard block is byte-identical (sha256 9f6f8398...
+// again); the three anchors appear once each, guard first. `git diff -U0`
+// matches `context_admission` twice (the same argument, re-indented into the
+// non-GLM else-branch) and `max_seq_len` twice (passed to the two GLM
+// builders as their position capacity). NOTE for reviewers: the GLM builders
+// do not take the ContextAdmissionReceipt — GLM (NoPE DSA + KDA) is not a
+// RoPE-extension target, and config.json's max_position_embeddings is 1M.
+const SERVE_LOAD_SHA256: &str = "1f09702f3a8e573a291f8a36dc9ea3e0c67999af59cedbd557d4f9f6fcfbaf02";
 // Re-pinned 2026-09-22 for integrate/all-models: the ONLY change is the
 // `weights::{..}` re-export gaining `load_dflash_donor` (phaseA-a1's DFlash
 // donor loader, now called from `load_model`), rustfmt-wrapped onto three
 // lines. `git diff feat/tui-port` over this file is exactly that one hunk.
+// Re-pinned again 2026-09-22 for the GLM-5.3 port: `mod target_store;` and
+// the `TargetStoreLoadPlan` re-export (GLM GGUF load planning). Nothing else.
 const SERVE_PHASES_SHA256: &str =
-    "b77f0fd7fadba6843533613071531530322869161cb6e69710dc0e6ea01206c1";
+    "c09f946989ac4f713001ba8bd0977faf6d088ccd57114fa518bbed88e8e3ed22";
 const BUILD_SHA256: &str = "63b5663ef0880e17d3725ec8833b6d82c20ef45567bc6cfbd41a8136c2005f3e";
 
 const INITIAL: [u32; 8] = [

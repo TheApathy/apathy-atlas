@@ -97,10 +97,24 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
 }
 
 mod build;
+mod glm53;
+mod glm53_build;
+mod glm53_exl3_build;
+mod glm53_runtime;
 mod m2_setup;
 mod qwen4_stream_t;
+mod source;
 
 pub use build::build_model;
+pub use glm53::{AdmittedGlm53Features, Glm53FeatureRequest, PreparedGlm53Target};
+pub use glm53_build::build_glm53_model;
+pub use glm53_exl3_build::build_glm53_exl3_model;
+pub use glm53_runtime::{
+    Glm53OwnedStoreCleanupError, Glm53TargetRuntimeAdmissionError, Glm53TargetRuntimeWeights,
+};
+pub use source::{
+    ConfiguredModelLoader, Glm53QuantProfile, Glm53TargetLoader, ModelSourceKind, loader_for_source,
+};
 
 #[cfg(test)]
 mod tests {
