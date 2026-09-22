@@ -23,12 +23,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_core::config::parse_config;
-use spark_model::layers::deepseek_v41_engram::{EngramGather, EngramHashState, EngramLayout};
+use spark_model::layers::deepseek_v41_engram::{EngramGather, EngramHashState, EngramLayout, engram_dead_heads};
 use spark_model::weight_loader::deepseek_v41::fwd::{
     BlockControl, PassScratch, Tap, V41AttentionBlock, V41BlockWeights, V41Dims, V41RoutedMoe, block,
     final_logits_last_row,
 };
-use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, bf16_tensor, bytemuck_u32};
+use spark_model::weight_loader::deepseek_v41::attn_block::{
+    self, AttnCore, AttnScratch, CoreArgs, HEAD_DIM, N_HEADS, RING, V41AttnWeights, compress_ratio,
+};
+use spark_model::weight_loader::deepseek_v41::ops::{Dsv41Kernels, Ops, RopeSpec, RopeTable, bf16_tensor, bytemuck_u32};
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{SafetensorsLoader, WeightLoader};
@@ -96,26 +99,58 @@ impl Feeder {
 
 struct FedAttention<'a>(&'a Feeder, usize);
 impl V41AttentionBlock for FedAttention<'_> {
-    fn forward(&self, layer: usize, _x: DevicePtr, out: DevicePtr, t: usize, _start: usize, _stream: u64) -> Result<()> {
+    fn forward(&self, _ops: &Ops, layer: usize, _x: DevicePtr, out: DevicePtr, t: usize, _start: usize) -> Result<()> {
         self.0.feed_raw("attn_out", layer, out, t * self.1 * 2)
     }
 }
 
 struct FedMoe<'a>(&'a Feeder, usize);
 impl V41RoutedMoe for FedMoe<'_> {
-    fn forward(&self, layer: usize, _y: DevicePtr, out: DevicePtr, t: usize, _stream: u64) -> Result<()> {
+    fn forward(&self, _ops: &Ops, layer: usize, _y: DevicePtr, out: DevicePtr, t: usize) -> Result<()> {
         self.0.feed_f32_as_bf16("moe_routed", layer, out, t * self.1)
+    }
+}
+
+/// The attention lane's core fed from the capture (`attn_o_pre_inverse_rope`); everything
+/// around it — projections, RoPE, ring, inverse RoPE, wo_a/wo_b — is computed.
+struct FedCore<'a>(&'a Feeder);
+impl AttnCore for FedCore<'_> {
+    fn run(&self, _ops: &Ops, a: &CoreArgs) -> Result<()> {
+        self.0.feed_raw("attn_o_pre_inverse_rope", a.layer, a.out, a.t * N_HEADS * HEAD_DIM * 2)
+    }
+}
+
+/// Attention computed around a core: `attn_block::attention` with this driver's rings.
+struct ProjAttention<'a> {
+    ops: &'a Ops<'a>,
+    weights: Vec<V41AttnWeights>,
+    scratch: AttnScratch,
+    wscratch: DevicePtr,
+    freqs_c: RopeTable,
+    freqs_w: RopeTable,
+    rings: Vec<DevicePtr>,
+    core: &'a dyn AttnCore,
+    tap: &'a Tap,
+    norm_eps: f32,
+}
+impl V41AttentionBlock for ProjAttention<'_> {
+    fn forward(&self, _ops: &Ops, layer: usize, x: DevicePtr, out: DevicePtr, t: usize, start: usize) -> Result<()> {
+        let rope = if compress_ratio(layer) != 0 { &self.freqs_c } else { &self.freqs_w };
+        attn_block::attention(
+            self.ops, &self.weights[layer], &self.scratch, self.wscratch, rope, self.rings[layer],
+            x, out, t, start, 0, self.norm_eps, self.core, self.tap,
+        )
     }
 }
 
 struct Refuse(&'static str);
 impl V41AttentionBlock for Refuse {
-    fn forward(&self, l: usize, _: DevicePtr, _: DevicePtr, _: usize, _: usize, _: u64) -> Result<()> {
+    fn forward(&self, _: &Ops, l: usize, _: DevicePtr, _: DevicePtr, _: usize, _: usize) -> Result<()> {
         bail!("layer {l}: {} is not wired into this driver yet — use --feed", self.0)
     }
 }
 impl V41RoutedMoe for Refuse {
-    fn forward(&self, l: usize, _: DevicePtr, _: DevicePtr, _: usize, _: u64) -> Result<()> {
+    fn forward(&self, _: &Ops, l: usize, _: DevicePtr, _: DevicePtr, _: usize) -> Result<()> {
         bail!("layer {l}: {} is not wired into this driver yet — use --feed", self.0)
     }
 }
@@ -212,15 +247,42 @@ fn main() -> Result<()> {
     let s = PassScratch::new(gpu.as_ref(), &dims, max_t, largest)?;
     let embed = bf16_tensor(&store, "embed.weight", &[config.vocab_size, dims.hidden])?;
 
-    let feeder = Feeder { dir: ref_dir.clone(), counts: RefCell::new(HashMap::new()), gpu: Arc::clone(&gpu) };
-    let fed_attn = FedAttention(&feeder, dims.hidden);
-    let fed_moe = FedMoe(&feeder, dims.hidden);
-    let attn: &dyn V41AttentionBlock = if feed.iter().any(|f| f == "attn") { &fed_attn } else { &Refuse("attention") };
-    let moe: &dyn V41RoutedMoe = if feed.iter().any(|f| f == "moe") { &fed_moe } else { &Refuse("routed MoE") };
     let tap = match &tap_dir {
         Some(d) => Tap::to_dir(d.clone(), Vec::new())?,
         None => Tap::off(),
     };
+    let feeder = Feeder { dir: ref_dir.clone(), counts: RefCell::new(HashMap::new()), gpu: Arc::clone(&gpu) };
+    let fed_attn = FedAttention(&feeder, dims.hidden);
+    let fed_core = FedCore(&feeder);
+    let fed_moe = FedMoe(&feeder, dims.hidden);
+    let proj_attn;
+    let attn: &dyn V41AttentionBlock = if feed.iter().any(|f| f == "attn") {
+        &fed_attn
+    } else if feed.iter().any(|f| f == "attn-core") {
+        let weights: Vec<V41AttnWeights> = (0..n_layers).map(|l| V41AttnWeights::load(&store, l, dims.hidden)).collect::<Result<_>>()?;
+        let big = weights.iter().map(|w| w.largest_weight()).max().unwrap_or(0).max(largest);
+        let wscratch = gpu.alloc(big * 2)?;
+        let positions = 8192 + 8;
+        let spec_w = RopeSpec { dim: 64, original_seq_len: 0, base: 10000.0, factor: 16.0, beta_fast: 32.0, beta_slow: 1.0 };
+        let spec_c = RopeSpec { original_seq_len: 65536, base: 160000.0, ..spec_w };
+        let rings = (0..n_layers).map(|_| { let r = gpu.alloc(RING * HEAD_DIM * 2)?; gpu.memset(r, 0, RING * HEAD_DIM * 2)?; Ok(r) }).collect::<Result<Vec<_>>>()?;
+        proj_attn = ProjAttention {
+            ops: &ops,
+            weights,
+            scratch: AttnScratch::new(gpu.as_ref(), max_t)?,
+            wscratch,
+            freqs_c: spec_c.upload(gpu.as_ref(), positions)?,
+            freqs_w: spec_w.upload(gpu.as_ref(), positions)?,
+            rings,
+            core: &fed_core,
+            tap: &tap,
+            norm_eps: dims.norm_eps,
+        };
+        &proj_attn
+    } else {
+        &Refuse("attention")
+    };
+    let moe: &dyn V41RoutedMoe = if feed.iter().any(|f| f == "moe") { &fed_moe } else { &Refuse("routed MoE") };
 
     let mut hash = if engram_live { Some(engram_hash_state()?) } else { None };
     let gathers: HashMap<usize, EngramGather> = if engram_live {
@@ -233,6 +295,11 @@ fn main() -> Result<()> {
         HashMap::new()
     };
     let d_ids = gpu.alloc(max_t * 4)?;
+    // Dead-head mask buffer, sized for the largest chunk and reused/overwritten per chunk,
+    // matching `d_ids`'s pattern. `engram_dead_heads` is a pure function of that chunk's own
+    // token ids (see deepseek_v41_engram::dead_heads's module doc: no cross-chunk carry) and
+    // is layer-independent, so one upload per chunk covers both engram layers.
+    let d_dead = gpu.alloc(max_t * 24)?;
     for &(start, t) in &chunks {
         let chunk_ids = &ids[start..start + t];
         let hashes = match hash.as_mut() {
@@ -242,11 +309,15 @@ fn main() -> Result<()> {
         gpu.copy_h2d(bytemuck_u32(chunk_ids), d_ids)?;
         ops.embed(embed, d_ids, s.x, t, dims.hidden)?;
         ops.hc_expand(s.x, s.h, s.pre_mix, t, dims.hidden)?;
+        if engram_live {
+            let dead_host: Vec<u8> = engram_dead_heads(chunk_ids).iter().map(|&d| u8::from(d)).collect();
+            gpu.copy_h2d(&dead_host, d_dead)?;
+        }
         for w in &blocks {
             if let Some(e) = &w.engram {
-                match (&hashes, gathers.get(&w.layer)) {
+                let dead_ptr = match (&hashes, gathers.get(&w.layer)) {
                     (Some(all), Some(g)) => {
-                        // [T][layer][24] -> this layer's [T, 24]. Text-only here, so no dead heads.
+                        // [T][layer][24] -> this layer's [T, 24].
                         let li = if w.layer == 1 { 0 } else { 1 };
                         let rows: Vec<i64> = (0..t).flat_map(|tok| all[(tok * 2 + li) * 24..(tok * 2 + li + 1) * 24].iter().copied()).collect();
                         let rb: Vec<u8> = rows.iter().flat_map(|r| r.to_le_bytes()).collect();
@@ -256,13 +327,18 @@ fn main() -> Result<()> {
                         gpu.free(tmp)?;
                         g.gather_rows_gpu(&rows, t, s.engram_rows, gpu.as_ref(), stream)?;
                         tap.f32(&ops, "engram_rows", w.layer, s.engram_rows, &[t, 24, 256])?;
+                        // Live gather returns PRE-mask rows (EngramGather's own contract); the
+                        // dead-head mask must be applied downstream, inside EngramProj::forward.
+                        d_dead
                     }
                     _ => {
-                        // Rows come from the capture (POST-mask), so no mask is applied here.
+                        // Rows come from the capture (POST-mask already applied there), so no
+                        // mask is applied again here -- NULL, not a double mask.
                         feeder.feed_raw("engram_rows", w.layer, s.engram_rows, t * 24 * 256 * 4)?;
+                        DevicePtr::NULL
                     }
-                }
-                e.forward(&ops, s.h, s.engram_rows, DevicePtr::NULL, t, &s, &dims)?;
+                };
+                e.forward(&ops, s.h, s.engram_rows, dead_ptr, t, &s, &dims)?;
                 tap.bf16(&ops, "engram_out", w.layer, s.h, &[t, dims.hc, dims.hidden])?;
             }
             block(&ops, w, &dims, &s, t, start, attn, moe, &tap, control)?;

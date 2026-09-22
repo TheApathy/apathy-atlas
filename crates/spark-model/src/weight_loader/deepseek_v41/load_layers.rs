@@ -201,7 +201,7 @@ pub fn load_all_layers(
 ///
 /// The engram tables are ~95 GB each and are never loaded into the `WeightStore`, so the
 /// engram seam takes this path rather than a store. See `seams::Dsv41EngramLoader`.
-fn resolve_model_dir() -> Result<PathBuf> {
+pub fn resolve_model_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var(MODEL_DIR_ENV) {
         return Ok(PathBuf::from(dir));
     }
