@@ -40,6 +40,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <vector>
 
 #define CUDA_OK(x) do { cudaError_t e_=(x); if(e_!=cudaSuccess){ \
     std::fprintf(stderr,"%s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e_)); std::exit(2);} } while(0)
@@ -54,15 +55,22 @@ static const int DPT  = DMAX / NT;   // d-slots per thread
 //   CTRL_ORDER  : compressed segment before window -- the block-order contract.
 //   CTRL_GATHER : ignore cidx and read compressed rows 0..NC-1 sequentially --
 //                 the "wrong K-order" analogue for a gather kernel.
-template <bool CTRL_ORDER, bool CTRL_GATHER>
-__global__ void sparse_attn(
+template <typename OutT> __device__ __forceinline__ OutT to_out(float x);
+template <> __device__ __forceinline__ float to_out<float>(float x) { return x; }
+template <> __device__ __forceinline__ __nv_bfloat16 to_out<__nv_bfloat16>(float x) { return __float2bfloat16_rn(x); }
+
+// IdxT: int32_t for the fixture gate, int64_t (long long) in production -- the indexer
+// emits i64 and the window positions are i64, as in the reference. OutT: float for the
+// gate, bf16 in production (the reference's `_softmax_attn(...).to(bfloat16)`).
+template <bool CTRL_ORDER, bool CTRL_GATHER, typename IdxT, typename OutT>
+__device__ void sparse_attn_body(
     const __nv_bfloat16* __restrict__ Q,     // [T, NH, D]
     const __nv_bfloat16* __restrict__ RING,  // [RING_N, D]
-    const int32_t*       __restrict__ WPOS,  // [T, NW]  absolute positions, -1 = none
+    const IdxT*          __restrict__ WPOS,  // [T, NW]  absolute positions, -1 = none
     const __nv_bfloat16* __restrict__ CKV,   // [n_c, D]
-    const int32_t*       __restrict__ CIDX,  // [T, NC]  compressed rows, -1 = none
+    const IdxT*          __restrict__ CIDX,  // [T, NC]  compressed rows, -1 = none
     const float*         __restrict__ SINK,  // [NH]
-    float*               __restrict__ O,     // [T, NH, D]
+    OutT*                __restrict__ O,     // [T, NH, D]
     int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
 {
     const int t   = blockIdx.x;
@@ -104,13 +112,13 @@ __global__ void sparse_attn(
                 int row = -1;
                 if (c < n) {
                     if (seg == 0) {
-                        const int p = WPOS[(size_t)t * NW + c];
-                        if (p >= 0 && p >= win_lo) row = p % RING_N;   // ring modulo
+                        const long long p = WPOS[(size_t)t * NW + c];
+                        if (p >= 0 && p >= win_lo) row = (int)(p % RING_N);   // ring modulo
                     } else if (CTRL_GATHER) {
                         row = c;                                       // wrong on purpose
                     } else {
-                        const int j = CIDX[(size_t)t * NC + c];
-                        if (j >= 0) row = j;
+                        const long long j = CIDX[(size_t)t * NC + c];
+                        if (j >= 0) row = (int)j;
                     }
                 }
                 vld[tid] = row;
@@ -189,11 +197,32 @@ __global__ void sparse_attn(
         const float denom  = l[h] + __expf(SINK[hb * HB + h] - m_safe);
         for (int i = 0; i < DPT; ++i) {
             const int d = tid + i * NT;
-            O[((size_t)t * NH + (hb * HB + h)) * D + d] = acc[h][i] / denom;
+            O[((size_t)t * NH + (hb * HB + h)) * D + d] = to_out<OutT>(acc[h][i] / denom);
         }
     }
 }
 
+template <bool CTRL_ORDER, bool CTRL_GATHER>
+__global__ void __launch_bounds__(NT) sparse_attn(
+    const __nv_bfloat16* Q, const __nv_bfloat16* RING, const int32_t* WPOS,
+    const __nv_bfloat16* CKV, const int32_t* CIDX, const float* SINK, float* O,
+    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    sparse_attn_body<CTRL_ORDER, CTRL_GATHER, int32_t, float>(
+        Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
+// PRODUCTION entry. grid (T, NH / 8), block 256. CIDX may be null (window-only layers 0/1).
+extern "C" __global__ void __launch_bounds__(NT) dsv41_sparse_attn(
+    const __nv_bfloat16* Q, const __nv_bfloat16* RING, const long long* WPOS,
+    const __nv_bfloat16* CKV, const long long* CIDX, const float* SINK, __nv_bfloat16* O,
+    int T, int NH, int D, int NW, int NC, int RING_N, int win_lo, float scale)
+{
+    sparse_attn_body<false, false, long long, __nv_bfloat16>(
+        Q, RING, WPOS, CKV, CIDX, SINK, O, T, NH, D, NW, NC, RING_N, win_lo, scale);
+}
+
+#ifdef DSV41_ATTN_GATE
 static void* slurp(const char* p, size_t want) {
     FILE* f = std::fopen(p, "rb");
     if (!f) { std::fprintf(stderr, "open %s\n", p); std::exit(2); }
@@ -340,6 +369,51 @@ int main() {
                     "      end-to-end validation is on OUTPUT QUALITY, not bit-identity, and a\n"
                     "      per-layer bisect is only valid up to the FIRST routing flip.\n");
     }
-    std::printf(ok ? "PASS one-pass streaming gather (controls separate)\n" : "FAIL\n");
-    return ok ? 0 : 1;
+    // PRODUCTION ENTRY: dsv41_sparse_attn takes i64 indices and writes bf16. It is the same
+    // body, so its output must equal the gated fp32 output rounded to bf16 BIT FOR BIT --
+    // with compressed rows, and window-only (CIDX = null, layers 0/1) against the fp32 kernel
+    // run the same way. Anything else means the index widening or the store is wrong.
+    bool prod_ok = true;
+    {
+        std::vector<long long> w64((size_t)T*NW), c64((size_t)T*NC);
+        for (size_t i = 0; i < w64.size(); ++i) w64[i] = ((const int32_t*)h_wpos)[i];
+        for (size_t i = 0; i < c64.size(); ++i) c64[i] = ((const int32_t*)h_cidx)[i];
+        long long *d_w64, *d_c64; __nv_bfloat16* d_ob;
+        CUDA_OK(cudaMalloc(&d_w64, w64.size()*8)); CUDA_OK(cudaMemcpy(d_w64, w64.data(), w64.size()*8, cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMalloc(&d_c64, c64.size()*8)); CUDA_OK(cudaMemcpy(d_c64, c64.data(), c64.size()*8, cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMalloc(&d_ob, no*2));
+        std::vector<__nv_bfloat16> ob(no);
+        auto bits_equal = [&](const float* ref) {
+            size_t bad = 0;
+            for (size_t i = 0; i < no; ++i) {
+                const __nv_bfloat16 r = __float2bfloat16_rn(ref[i]);
+                bad += std::memcmp(&r, &ob[i], 2) != 0;
+            }
+            return bad;
+        };
+        for (int window_only = 0; window_only < 2; ++window_only) {
+            const long long* ci = window_only ? nullptr : d_c64;
+            dsv41_sparse_attn<<<grid,NT>>>(d_q,d_ring,d_w64,d_ckv,ci,d_sink,d_ob,T,NH,D,NW,NC,RING_N,0,scale);
+            CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+            CUDA_OK(cudaMemcpy(ob.data(), d_ob, no*2, cudaMemcpyDeviceToHost));
+            if (window_only) {
+                CUDA_OK(cudaMemset(d_o, 0, no*4));
+                sparse_attn<false,false><<<grid,NT>>>(d_q,d_ring,d_wpos,d_ckv,nullptr,d_sink,d_o,T,NH,D,NW,NC,RING_N,0,scale);
+                CUDA_OK(cudaGetLastError()); CUDA_OK(cudaDeviceSynchronize());
+                CUDA_OK(cudaMemcpy(h_o, d_o, no*4, cudaMemcpyDeviceToHost));
+            }
+            const float* ref = window_only ? h_o : h_ok;
+            const size_t bad = bits_equal(ref);
+            // control: the window-only output must NOT match the full one (else CIDX was ignored)
+            const size_t ctrl = bits_equal(window_only ? h_ok : h_o);
+            std::printf("PRODUCTION entry (i64 idx, bf16 out)%s: %zu/%zu differ from bf16(fp32 kernel) | CTRL other mode: %zu differ\n",
+                        window_only ? " window-only" : "            ", bad, no, ctrl);
+            prod_ok = prod_ok && bad == 0 && ctrl > 0;
+        }
+        cudaFree(d_w64); cudaFree(d_c64); cudaFree(d_ob);
+    }
+    const bool all_ok = ok && prod_ok;
+    std::printf(all_ok ? "PASS one-pass streaming gather (controls separate)\n" : "FAIL\n");
+    return all_ok ? 0 : 1;
 }
+#endif  // DSV41_ATTN_GATE
