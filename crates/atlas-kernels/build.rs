@@ -578,7 +578,12 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<String> {
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            if entry.file_type().ok()?.is_dir() {
+            // Follow symlinks: variant targets (qwen3.6-35b-a3b-abl,
+            // qwen3.5-122b-a10b-heretic) symlink their quant dir to the
+            // canonical target's, and `DirEntry::file_type` does not follow
+            // links, so a wildcard build silently compiled zero kernels for
+            // them.
+            if std::fs::metadata(entry.path()).ok()?.is_dir() {
                 Some(entry.file_name().to_string_lossy().to_string())
             } else {
                 None
