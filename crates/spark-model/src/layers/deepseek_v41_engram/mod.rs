@@ -6,6 +6,8 @@
 //! box, so `spark_storage::engram_tier` pulls each token's rows off NVMe. This
 //! module owns the *which rows* half: see [`hash`].
 
+pub mod gather;
 pub mod hash;
 
+pub use gather::{EngramGather, EngramLoader, register};
 pub use hash::{DEAD, EngramHashState, EngramLayout};
