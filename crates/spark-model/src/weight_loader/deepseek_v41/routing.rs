@@ -59,17 +59,82 @@ pub fn score_of(logit: f32) -> f32 {
     softplus.sqrt()
 }
 
-/// Select experts and compute their weights.
+/// Token ids whose router row uses `gate.bias_vl` instead of `gate.bias`.
+///
+/// From the engine's `vision.image_sentinel_mask`: the image sentinel AND the image pad.
+pub const IMAGE_SENTINEL_ID: i64 = 129_264;
+pub const IMAGE_PAD_ID: i64 = 129_265;
+
+/// Which rows are image positions, per `vision.image_sentinel_mask`.
+pub fn image_rows(token_ids: &[i64]) -> Vec<bool> {
+    token_ids
+        .iter()
+        .map(|id| *id == IMAGE_SENTINEL_ID || *id == IMAGE_PAD_ID)
+        .collect()
+}
+
+/// Proof that a batch has NO image rows, so the text-only [`select_experts`] is correct for it.
+///
+/// Image rows route with `gate.bias_vl`. A text-only router applied to a multimodal batch
+/// selects a different, valid expert set and raises nothing — measured on runE_image: 97
+/// picks wrong across 4 layers from 7 image rows. So the text-only entry point cannot be
+/// called without first checking the token ids; a multimodal caller gets an error pointing
+/// at [`select_experts_multimodal`] instead of silently wrong routing.
+#[derive(Clone, Copy, Debug)]
+pub struct TextOnly {
+    rows: usize,
+}
+
+impl TextOnly {
+    pub fn verify(token_ids: &[i64]) -> Result<Self> {
+        let image = image_rows(token_ids).iter().filter(|row| **row).count();
+        ensure!(
+            image == 0,
+            "{image} of {} rows are image positions; they route with gate.bias_vl — use \
+             select_experts_multimodal",
+            token_ids.len()
+        );
+        Ok(Self { rows: token_ids.len() })
+    }
+}
+
+/// Select experts and compute their weights, for a batch PROVEN text-only.
 ///
 /// * `scores` — `[num_tokens, num_experts]`, already `sqrt(softplus(y @ gate_w))`.
-/// * `bias` — `[num_experts]`, the noaux_tc correction bias (`gate.bias`, or `gate.bias_vl`
-///   on the multimodal path — the caller chooses, because that is a forward-path decision).
+/// * `bias` — `[num_experts]`, `gate.bias`.
 /// * `resident` — `[num_experts]` allow-list from `Cb3ExpertArena::routing_mask`. Applied
 ///   as `-inf` on the logits before top-k.
 /// * `route_scale` — `config.routed_scaling_factor`, 1.5 for this checkpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn select_experts(
     scores: &[f32],
     bias: &[f32],
+    text: TextOnly,
+    resident: &[bool],
+    num_tokens: usize,
+    num_experts: usize,
+    k: usize,
+    route_scale: f32,
+) -> Result<Routing> {
+    ensure!(
+        text.rows == num_tokens,
+        "TextOnly was verified for {} rows, this batch has {num_tokens}",
+        text.rows
+    );
+    let no_image = vec![false; num_tokens];
+    select_experts_multimodal(
+        scores, bias, bias, &no_image, resident, num_tokens, num_experts, k, route_scale,
+    )
+}
+
+/// The general router: `gate.bias_vl` on `image_rows`, `gate.bias` elsewhere, per row —
+/// the engine's `vision.router_bias`. Both biases and the row mask are always required.
+#[allow(clippy::too_many_arguments)]
+pub fn select_experts_multimodal(
+    scores: &[f32],
+    bias: &[f32],
+    bias_vl: &[f32],
+    image_rows: &[bool],
     resident: &[bool],
     num_tokens: usize,
     num_experts: usize,
@@ -82,6 +147,12 @@ pub fn select_experts(
         scores.len()
     );
     ensure!(bias.len() == num_experts, "bias must be {num_experts} wide");
+    ensure!(bias_vl.len() == num_experts, "bias_vl must be {num_experts} wide");
+    ensure!(
+        image_rows.len() == num_tokens,
+        "image_rows is {} long for {num_tokens} tokens",
+        image_rows.len()
+    );
     ensure!(
         resident.len() == num_experts,
         "the residency mask must be {num_experts} wide"
@@ -100,6 +171,7 @@ pub fn select_experts(
 
     for token in 0..num_tokens {
         let row = &scores[token * num_experts..(token + 1) * num_experts];
+        let bias = if image_rows[token] { bias_vl } else { bias };
 
         order.clear();
         order.extend((0..num_experts as u32).filter(|expert| resident[*expert as usize]));
@@ -135,6 +207,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     const REF_ROOT: &str = "/home/flocka/atlas/DSV41_PORT/oracle/ref";
+
+    /// A one-row text-only proof for synthetic single-token tests.
+    fn text1() -> TextOnly {
+        TextOnly::verify(&[0]).unwrap()
+    }
     const NUM_EXPERTS: usize = 384;
     const K: usize = 6;
     const ROUTE_SCALE: f32 = 1.5;
@@ -184,12 +261,17 @@ mod tests {
     /// `-inf`, so `logits - scores` recovers nothing. Any question about what routing would
     /// do WITHOUT the mask has to read the real tensor.
     fn checkpoint_gate_bias(layer: usize) -> Option<Vec<f32>> {
+        checkpoint_gate_f32(layer, "bias")
+    }
+
+    /// `layers.N.ffn.gate.<which>` as F32 straight from the shard (`bias` or `bias_vl`).
+    fn checkpoint_gate_f32(layer: usize, which: &str) -> Option<Vec<f32>> {
         const MODEL: &str = "/home/flocka/models/DeepSeek-V4.1-Flash-Next-DGX-Spark-512K";
         let index: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(
                 format!("{MODEL}/model.safetensors.index.json"),
             ).ok()?).ok()?;
-        let key = format!("layers.{layer}.ffn.gate.bias");
+        let key = format!("layers.{layer}.ffn.gate.{which}");
         let shard = index["weight_map"][&key].as_str()?;
         let bytes = std::fs::read(format!("{MODEL}/{shard}")).ok()?;
         let header_len = u64::from_le_bytes(bytes[..8].try_into().ok()?) as usize;
@@ -220,12 +302,20 @@ mod tests {
     /// Derived from the taps rather than loaded from the checkpoint ON PURPOSE: this test
     /// is about the routing RULE, and pulling the real bias tensor in would couple it to
     /// weight loading. `-inf` logits mark the pruned experts.
-    fn bias_and_mask(scores: &[f32], logits: &[f32]) -> (Vec<f32>, Vec<bool>) {
+    ///
+    /// Only rows where `use_row` holds are read. Image rows carry `gate.bias_vl`, a
+    /// DIFFERENT bias, so a text bias must be recovered from text rows only and vice versa —
+    /// recovering from "the first finite row" silently mixed the two on runE_image.
+    fn bias_and_mask(
+        scores: &[f32],
+        logits: &[f32],
+        use_row: impl Fn(usize) -> bool,
+    ) -> (Vec<f32>, Vec<bool>) {
         let mut bias = vec![0.0f32; NUM_EXPERTS];
         let mut mask = vec![false; NUM_EXPERTS];
         let tokens = scores.len() / NUM_EXPERTS;
         for expert in 0..NUM_EXPERTS {
-            for token in 0..tokens {
+            for token in (0..tokens).filter(|token| use_row(*token)) {
                 let logit = logits[token * NUM_EXPERTS + expert];
                 if logit.is_finite() {
                     bias[expert] = logit - scores[token * NUM_EXPERTS + expert];
@@ -235,6 +325,25 @@ mod tests {
             }
         }
         (bias, mask)
+    }
+
+    /// Image rows of the capture's first `tokens` positions, from the manifest's token ids.
+    ///
+    /// Occurrence 000 of a chunked capture is the FIRST chunk, which starts at position 0,
+    /// so its rows are `token_ids[..tokens]`.
+    fn capture_image_rows(dir: &Path, tokens: usize) -> Vec<bool> {
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("manifest.json")).expect("manifest readable"),
+        )
+        .expect("manifest parses");
+        let ids: Vec<i64> = manifest["token_ids"]
+            .as_array()
+            .expect("manifest has token_ids")
+            .iter()
+            .map(|id| id.as_i64().expect("integer token id"))
+            .collect();
+        assert!(ids.len() >= tokens, "manifest has {} ids for {tokens} rows", ids.len());
+        image_rows(&ids[..tokens])
     }
 
     /// THE TEST THAT MATTERS: replay the working engine's own router scores and require
@@ -252,6 +361,10 @@ mod tests {
         }
         let mut layers_checked = 0;
         let mut rows_checked = 0usize;
+        let mut image_rows_checked = 0usize;
+        // Picks that differ when image rows are routed with the TEXT bias. Must be > 0
+        // wherever image rows were checked, or the vl-bias branch was never exercised.
+        let mut text_bias_on_image_mismatches = 0usize;
         for dir in &dirs {
             for layer in ["L00", "L01", "L02", "L14"] {
                 let (Some(scores), Some(logits), Some(want_idx), Some(want_w)) = (
@@ -265,17 +378,50 @@ mod tests {
                 let tokens = scores.len() / NUM_EXPERTS;
                 let tag = format!("{}/{layer}", dir.file_name().unwrap().to_string_lossy());
 
-                let (bias, mask) = bias_and_mask(&scores, &logits);
+                let image = capture_image_rows(dir, tokens);
+                let (_, mask) = bias_and_mask(&scores, &logits, |t| !image[t]);
                 let resident = mask.iter().filter(|keep| **keep).count();
                 assert_eq!(
                     resident, 124,
                     "{tag}: expected packed_keep=124 pruning, got {resident}"
                 );
+                let image_count = image.iter().filter(|row| **row).count();
+                // BOTH biases from the CHECKPOINT, as F32 — not recovered from the capture.
+                // This is also the end-to-end check that the F32 bias reproduces the engine.
+                let li: usize = layer[1..].parse().unwrap();
+                let (Some(true_bias), Some(true_vl)) =
+                    (checkpoint_gate_f32(li, "bias"), checkpoint_gate_f32(li, "bias_vl"))
+                else {
+                    panic!("{tag}: checkpoint gate biases unreadable");
+                };
+                if image_count > 0 {
+                    let (_, vl_mask) = bias_and_mask(&scores, &logits, |t| image[t]);
+                    assert_eq!(vl_mask, mask, "{tag}: image rows see a different residency mask");
+                }
 
-                let got = select_experts(
-                    &scores, &bias, &mask, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+                let got = select_experts_multimodal(
+                    &scores, &true_bias, &true_vl, &image, &mask, tokens, NUM_EXPERTS, K,
+                    ROUTE_SCALE,
                 )
                 .expect("routing must succeed");
+
+                if image_count > 0 {
+                    // NEGATIVE CONTROL: the text bias on image rows must NOT reproduce them.
+                    let text_on_images = select_experts_multimodal(
+                        &scores, &true_bias, &true_bias, &image, &mask, tokens, NUM_EXPERTS, K,
+                        ROUTE_SCALE,
+                    )
+                    .unwrap();
+                    let wrong = text_on_images
+                        .indices
+                        .iter()
+                        .zip(&want_idx)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    eprintln!("  {tag}: text bias on {image_count} image rows -> {wrong} picks wrong");
+                    text_bias_on_image_mismatches += wrong;
+                    image_rows_checked += image_count;
+                }
 
                 let mismatches = got
                     .indices
@@ -301,11 +447,91 @@ mod tests {
             }
         }
         assert!(layers_checked > 0, "the replay must have run on at least one layer");
+        if image_rows_checked > 0 {
+            assert!(
+                text_bias_on_image_mismatches > 0,
+                "routing {image_rows_checked} image rows with the TEXT bias changed nothing, so \
+                 the bias_vl branch is untested by these captures"
+            );
+        }
         eprintln!(
-            "routing replay: {layers_checked} layer-captures, {rows_checked} token-rows, \
-             across {} run(s)",
+            "routing replay: {layers_checked} layer-captures, {rows_checked} token-rows \
+             ({image_rows_checked} image rows; text bias on them: \
+             {text_bias_on_image_mismatches} picks wrong), across {} run(s)",
             dirs.len()
         );
+    }
+
+    /// The text-only entry point must REFUSE a batch with image rows, rather than route them
+    /// with the wrong bias. Control: the same call on text ids succeeds.
+    #[test]
+    fn the_text_only_router_refuses_image_rows() {
+        let err = TextOnly::verify(&[11, IMAGE_SENTINEL_ID, 12]).expect_err("sentinel row");
+        assert!(err.to_string().contains("select_experts_multimodal"), "{err}");
+        assert!(TextOnly::verify(&[11, IMAGE_PAD_ID]).is_err(), "the pad id is an image row too");
+        let proof = TextOnly::verify(&[11, 12]).expect("text ids are text-only");
+
+        // A proof for a different row count cannot be spent on this batch.
+        let scores = vec![0.5f32; NUM_EXPERTS];
+        let bias = vec![0.0f32; NUM_EXPERTS];
+        let mask = vec![true; NUM_EXPERTS];
+        assert!(select_experts(&scores, &bias, proof, &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE).is_err());
+        assert!(select_experts(&scores, &bias, text1(), &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE).is_ok());
+    }
+
+    /// The router bias must stay F32. `dense_auto` narrows F32 to bf16, and at ~9.8 bf16's
+    /// step is 0.0625 — coarser than the 0.036 spread across experts. The replay above uses
+    /// the F32 checkpoint bias and is exact; THIS is the control that shows the narrowing is
+    /// not harmless: the bf16-rounded bias must mis-route real captured rows.
+    #[test]
+    fn a_bf16_router_bias_misroutes() {
+        let dirs = ref_dirs();
+        if dirs.is_empty() {
+            eprintln!("skipping: no captures under {REF_ROOT}");
+            return;
+        }
+        let to_bf16 = |v: f32| {
+            let bits = v.to_bits();
+            f32::from_bits(((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) << 16)
+        };
+        let (mut wrong, mut picks) = (0usize, 0usize);
+        for dir in &dirs {
+            for (layer, li) in [("L00", 0usize), ("L02", 2)] {
+                let (Some(scores), Some(logits), Some(want_idx)) = (
+                    read_f32(dir, &format!("{layer}.route_scores.000.bin")),
+                    read_f32(dir, &format!("{layer}.route_logits.000.bin")),
+                    read_i64(dir, &format!("{layer}.route_idx.000.bin")),
+                ) else {
+                    continue;
+                };
+                let tokens = scores.len() / NUM_EXPERTS;
+                let image = capture_image_rows(dir, tokens);
+                let (_, mask) = bias_and_mask(&scores, &logits, |t| !image[t]);
+                let bias = checkpoint_gate_f32(li, "bias").expect("bias");
+                let bias_vl = checkpoint_gate_f32(li, "bias_vl").expect("bias_vl");
+                let distinct = {
+                    let mut v: Vec<u32> = bias.iter().map(|b| to_bf16(*b).to_bits()).collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v.len()
+                };
+                assert!(distinct < 10, "{layer}: bf16 should collapse 384 biases to a handful, got {distinct}");
+                let narrow = |b: &[f32]| b.iter().map(|v| to_bf16(*v)).collect::<Vec<f32>>();
+                let got = select_experts_multimodal(
+                    &scores, &narrow(&bias), &narrow(&bias_vl), &image, &mask, tokens,
+                    NUM_EXPERTS, K, ROUTE_SCALE,
+                )
+                .unwrap();
+                wrong += got.indices.iter().zip(&want_idx).filter(|(a, b)| a != b).count();
+                picks += want_idx.len();
+            }
+        }
+        if picks == 0 {
+            eprintln!("skipping: no L00/L02 route taps");
+            return;
+        }
+        eprintln!("bf16-narrowed router bias: {wrong} of {picks} picks wrong");
+        assert!(wrong > 0, "a bf16 bias reproduced every pick — the F32 requirement would be unfounded");
     }
 
     /// NEGATIVE CONTROL 1: taking the weights from the LOGITS instead of the scores must
@@ -404,11 +630,14 @@ mod tests {
                 continue;
             };
             let tokens = scores.len() / NUM_EXPERTS;
-            let (_, mask) = bias_and_mask(&scores, &logits);
+            // TEXT rows only: image rows carry `gate.bias_vl`, which is not the tensor
+            // under test here.
+            let image = capture_image_rows(dir, tokens);
+            let (_, mask) = bias_and_mask(&scores, &logits, |t| !image[t]);
 
             // The TRUE bias must reproduce the capture's logits on resident entries. Without
             // this the comparison below could be measuring a mis-read tensor.
-            for token in 0..tokens {
+            for token in (0..tokens).filter(|t| !image[*t]) {
                 for expert in 0..NUM_EXPERTS {
                     if mask[expert] {
                         let mine = scores[token * NUM_EXPERTS + expert] + true_bias[expert];
@@ -423,11 +652,12 @@ mod tests {
             }
 
             let all_resident = vec![true; NUM_EXPERTS];
-            let unmasked = select_experts(
-                &scores, &true_bias, &all_resident, tokens, NUM_EXPERTS, K, ROUTE_SCALE,
+            let unmasked = select_experts_multimodal(
+                &scores, &true_bias, &true_bias, &image, &all_resident, tokens, NUM_EXPERTS, K,
+                ROUTE_SCALE,
             )
             .unwrap();
-            for token in 0..tokens {
+            for token in (0..tokens).filter(|t| !image[*t]) {
                 let picks = &unmasked.indices[token * K..(token + 1) * K];
                 if picks.iter().any(|e| !mask[*e as usize]) {
                     biting += 1;
@@ -470,7 +700,7 @@ mod tests {
             scores[expert] = 1.0;
         }
         let routed =
-            select_experts(&scores, &bias, &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE).unwrap();
+            select_experts(&scores, &bias, text1(), &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE).unwrap();
 
         for expert in &routed.indices {
             assert!(
@@ -486,7 +716,7 @@ mod tests {
         // non-resident 0..6. So the assertion above is discriminating, not vacuous.
         let all_resident = vec![true; NUM_EXPERTS];
         let unmasked =
-            select_experts(&scores, &bias, &all_resident, 1, NUM_EXPERTS, K, ROUTE_SCALE)
+            select_experts(&scores, &bias, text1(), &all_resident, 1, NUM_EXPERTS, K, ROUTE_SCALE)
                 .unwrap();
         let mut unmasked_ids = unmasked.indices.clone();
         unmasked_ids.sort_unstable();
@@ -509,12 +739,12 @@ mod tests {
         for slot in mask.iter_mut().take(K - 1) {
             *slot = true;
         }
-        let err = select_experts(&scores, &bias, &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE)
+        let err = select_experts(&scores, &bias, text1(), &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE)
             .expect_err("5 resident experts cannot satisfy top-6");
         assert!(err.to_string().contains("resident"), "{err}");
         // And exactly k IS allowed.
         mask[K - 1] = true;
-        assert!(select_experts(&scores, &bias, &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE).is_ok());
+        assert!(select_experts(&scores, &bias, text1(), &mask, 1, NUM_EXPERTS, K, ROUTE_SCALE).is_ok());
     }
 
     /// `sqrt(softplus(x))` must be the score function, and must not overflow.

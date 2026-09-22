@@ -219,6 +219,58 @@ pub fn gemm_weight_t(
     )
 }
 
+/// [`gemm_weight_t`] with an fp32 output — the accumulator is NOT rounded to bf16.
+///
+/// The engine keeps gate/up in fp32 through the SwiGLU and keeps each expert's down
+/// projection in fp32 until the six picks are summed. Rounding either to bf16 here adds
+/// error the reference does not have; see [`COMBINE_MODULE`].
+pub fn gemm_weight_t_f32out(
+    act: DevicePtr,
+    weight_bf16: DevicePtr,
+    out_f32: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    use spark_runtime::cublaslt::{GemmDtype, gemm_act_weight_t_typed};
+    gemm_act_weight_t_typed(
+        act.0,
+        k as u32,
+        weight_bf16.0,
+        out_f32.0,
+        n as u32,
+        m as u32,
+        n as u32,
+        k as u32,
+        GemmDtype::Bf16,
+        GemmDtype::F32,
+        stream,
+    )
+}
+
+/// Module of the V4.1 routed epilogues (`kernels/gb10/deepseek-v4.1/cb3/dsv41_moe_combine.cu`),
+/// which round to bf16 at the engine's two points and nowhere else.
+pub const COMBINE_MODULE: &str = "dsv41_moe_combine";
+/// `h = bf16(silu(min(g,L)) * clamp(u,±L) * w_row)` from fp32 gate/up.
+pub const SWIGLU_WEIGHTED_FN: &str = "dsv41_swiglu_weighted";
+/// `out = bf16(sum_k expert_out[token_to_perm[t,k]])` over fp32, already-weighted rows.
+pub const UNPERMUTE_SUM_FN: &str = "dsv41_unpermute_sum_f32";
+/// Router softplus/sqrt + bias (text or vision per row) + residency mask + top-k + weights.
+pub const ROUTE_TOPK_FN: &str = "dsv41_route_topk";
+
+/// Module of the fused grouped CB3 GEMM (`cb3/cb3_moe_gemm.cu`): weights decoded in shared
+/// memory, never written to DRAM.
+pub const FUSED_GEMM_MODULE: &str = "cb3_moe_gemm";
+/// Gate + up + SwiGLU x route weight -> bf16 h.
+pub const FUSED_GATE_UP_FN: &str = "cb3_moe_gate_up";
+/// Down projection -> fp32 rows.
+pub const FUSED_DOWN_FN: &str = "cb3_moe_down";
+/// Rows per M tile of the fused kernels (`BM` in the .cu). N must divide by
+/// [`FUSED_TILE_N`], K by 32.
+pub const FUSED_TILE_M: usize = 128;
+pub const FUSED_TILE_N: usize = 64;
+
 /// Bytes of bf16 scratch one expert's reconstruct needs, for all three matrices at once.
 pub fn scratch_bytes(config: &ModelConfig) -> Result<usize> {
     let matrices = expert_matrices(config)?;
@@ -533,6 +585,15 @@ pub struct Cb3Permutation {
     pub total_expanded: usize,
 }
 
+/// Module holding [`PERMUTE_KERNEL`] and [`UNPERMUTE_KERNEL`].
+///
+/// NOT the file stem: `kernels/gb10/common/moe_permute.cu` is renamed to `moe` by the
+/// `[modules]` table in `kernels/gb10/deepseek-v4.1/cb3/KERNEL.toml`, so a lookup of
+/// `"moe_permute"` fails at `gpu.kernel()`. Pinned to that file by a test.
+pub const MOE_PERMUTE_MODULE: &str = "moe";
+/// Module holding `moe_silu_mul` (the swiglu_limit-clamped routed SwiGLU). Not renamed, so
+/// the stem is the module name.
+pub const SILU_MUL_MODULE: &str = "moe_silu_mul";
 /// The unpermute kernel this plan is valid for. Spelled once.
 pub const UNPERMUTE_KERNEL: &str = "moe_unpermute_reduce_indexed";
 /// The gather kernel.
@@ -675,6 +736,70 @@ mod permutation_tests {
         );
         // And name the kernel that IS correct, so the constant cannot drift from the doc.
         assert_eq!(UNPERMUTE_KERNEL, "moe_unpermute_reduce_indexed");
+    }
+
+    /// The module names must be the ones the cb3 target's `KERNEL.toml` actually produces.
+    ///
+    /// The previous agent's first GPU run failed at `gpu.kernel("moe_permute", ..)` because
+    /// the target renames that stem. This ties the constants to the file, so the next rename
+    /// fails here rather than at load time on the GPU.
+    #[test]
+    fn moe_module_names_match_the_cb3_kernel_toml() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .to_path_buf();
+        let toml = std::fs::read_to_string(root.join("kernels/gb10/deepseek-v4.1/cb3/KERNEL.toml"))
+            .expect("cb3 KERNEL.toml readable");
+        let renamed_to = |stem: &str| -> Option<String> {
+            toml.lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with('#'))
+                .find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == stem).then(|| value.trim().trim_matches('"').to_string())
+                })
+        };
+        // The stem IS renamed, so the stem is the wrong lookup name — the bug this pins.
+        assert_eq!(renamed_to("moe_permute").as_deref(), Some(MOE_PERMUTE_MODULE));
+        assert_ne!(MOE_PERMUTE_MODULE, "moe_permute");
+        // silu_mul is NOT renamed, so its stem is its module name.
+        assert_eq!(renamed_to(SILU_MUL_MODULE), None);
+        let common = root.join("kernels/gb10/common");
+        for (file, kernel) in [
+            ("moe_permute.cu", PERMUTE_KERNEL),
+            ("moe_permute.cu", UNPERMUTE_KERNEL),
+            ("moe_silu_mul.cu", "moe_silu_mul"),
+        ] {
+            let source = std::fs::read_to_string(common.join(file)).expect("kernel source");
+            assert!(
+                source.contains(&format!("__global__ void {kernel}(")),
+                "{kernel} must be defined in {file}"
+            );
+        }
+    }
+
+    /// The combine kernels must exist under the names the build gives them (file stem, no
+    /// KERNEL.toml override).
+    #[test]
+    fn combine_kernel_names_match_the_source() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .to_path_buf();
+        let cu = root
+            .join("kernels/gb10/deepseek-v4.1/cb3")
+            .join(format!("{COMBINE_MODULE}.cu"));
+        let source = std::fs::read_to_string(&cu).expect("combine kernel source");
+        for kernel in [SWIGLU_WEIGHTED_FN, UNPERMUTE_SUM_FN, ROUTE_TOPK_FN] {
+            // `__launch_bounds__(...)` may sit between `__global__` and the return type.
+            let declared = source.lines().any(|line| {
+                line.starts_with("extern \"C\" __global__") && line.contains(&format!(" {kernel}("))
+            });
+            assert!(declared, "{kernel} must be a C-linkage kernel in {}", cu.display());
+        }
     }
 
     /// An inconsistent permutation must be REFUSED, not silently used.

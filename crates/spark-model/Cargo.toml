@@ -16,6 +16,9 @@ cuda = [
     "spark-runtime/cuda",
     "spark-storage/cuda",
     "spark-comm/cuda",
+    # Served DeepSeek-V4.1 (`model::dsv41`) builds its engram hash state from the
+    # checkpoint's tokenizer.json at alloc_sequence.
+    "engram-tokenizer",
 ]
 metal = [
     "atlas-core/metal",
@@ -27,6 +30,11 @@ metal = [
 # Kept off the bare `metal` feature so a metal-feature library build
 # doesn't drag in the tokenizer crate.
 metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
+# DeepSeek-V4.1 engram needs the checkpoint's own tokenizer to build the
+# compressed token map (`layers/deepseek_v41_engram/token_map.rs`), independent
+# of the cuda/metal split above. NOT in `default`: serving must opt in, and
+# tests that don't need a real tokenizer.json stay buildable without it.
+engram-tokenizer = ["dep:tokenizers"]
 # Opt-in gate for the GPU kernel microtest examples. NOT in `default`, so the
 # no-GPU CI `cargo test --workspace` skips building them (they link CUDA
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
@@ -101,6 +109,28 @@ required-features = ["cuda", "gpu-examples"]
 # watched to FAIL before its PASS is treated as evidence.
 [[example]]
 name = "cb3_arena_residency_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+# DeepSeek-V4.1 forward driver: runs N blocks over an oracle capture's prompt and dumps
+# per-layer taps for DSV41_PORT/oracle/compare.py. `--feed` teacher-forces sub-layers.
+[[example]]
+name = "dsv41_forward"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "dsv41_attn_seam"
+required-features = ["cuda", "gpu-examples"]
+
+# The first comparison of an actual MoE OUTPUT against the serving engine:
+# feeds the oracle's moe_in through CB3 reconstruct + cuBLASLt and checks
+# moe_routed. `--control` reverses the routing weights and must FAIL.
+[[example]]
+name = "cb3_moe_oracle_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+# Per-phase timing of the routed MoE on one resident layer (scores/route/plan/recon/GEMM).
+[[example]]
+name = "dsv41_moe_bench"
 required-features = ["cuda", "gpu-examples"]
 
 # DeepSeek-V4.1 vision tower vs the production vision.py, stage by stage, with

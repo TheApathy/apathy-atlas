@@ -107,20 +107,34 @@ impl Cb3LayerResidency {
     pub fn layer(&self) -> usize {
         self.layer
     }
+
+    /// Slot-0 base of one plane and its per-slot stride in bytes, for kernels that address
+    /// every resident expert of the layer themselves (the fused grouped GEMM).
+    pub fn plane_base(&self, tensor: Cb3Tensor) -> (DevicePtr, u64) {
+        let index = tensor_index(tensor);
+        (self.planes[index], self.strides[index] as u64)
+    }
 }
 
 /// The resident expert pack: 40 layers x 12 planes x `packed_keep` experts.
 pub struct Cb3ExpertArena {
     layers: Vec<Cb3LayerResidency>,
-    /// Per layer, the router allow-list over the 384-space id. Applied BEFORE top-k, which
-    /// is what makes non-residency a routing decision rather than a lookup failure.
-    routing_masks: Vec<Vec<bool>>,
+    /// Per layer, the router allow-list over the 384-space id, PAIRED WITH ITS REAL LAYER
+    /// INDEX. Applied BEFORE top-k, which is what makes non-residency a routing decision
+    /// rather than a lookup failure.
+    ///
+    /// Keyed by `(layer, ...)` rather than by position because the single-layer validation
+    /// arena holds one entry whose layer is NOT 0. A positional lookup there returns that
+    /// entry for every index — a plausible wrong answer, which is the failure mode this
+    /// whole module is written against. Found by `cb3_moe_oracle_microtest` erroring on
+    /// layer 2 after `layer()` had already been fixed and its two siblings had not.
+    routing_masks: Vec<(usize, Vec<bool>)>,
     /// Per layer, a 384-wide inverse table: routed id -> resident slot, or [`NO_SLOT`].
     ///
     /// [`ExpertPack::slot_of`] is a linear scan over <= 154 ids, which its own doc comment
     /// says is fine at load time and must not land on a hot path. Routing IS a hot path, so
     /// the table is built once here — the inverse table that comment asks for.
-    slot_of_routed: Vec<Vec<i32>>,
+    slot_of_routed: Vec<(usize, Vec<i32>)>,
     packed_keep: usize,
     resident_bytes: u64,
 }
@@ -260,12 +274,12 @@ impl Cb3ExpertArena {
                 uploaded += span.len() as u64;
             }
 
-            routing_masks.push(pack.routing_mask(layer)?);
+            routing_masks.push((layer, pack.routing_mask(layer)?));
             let mut inverse = vec![NO_SLOT; ROUTED_EXPERTS];
             for (slot, &expert_id) in resident.iter().enumerate() {
                 inverse[expert_id as usize] = slot as i32;
             }
-            slot_of_routed.push(inverse);
+            slot_of_routed.push((layer, inverse));
             layers.push(Cb3LayerResidency {
                 planes,
                 strides,
@@ -299,17 +313,122 @@ impl Cb3ExpertArena {
         })
     }
 
+    /// Make **one layer** resident, for validation against a per-layer oracle tap.
+    ///
+    /// The full arena is 71.7 GB at the served keep and needs a clean machine. A single
+    /// layer is 1.79 GB, which is safe to run alongside anything — and it is all the
+    /// `moe_routed` comparison needs, because that tap is per layer. Without this, checking
+    /// the MoE output against the engine would have been gated behind the full-scale run.
+    ///
+    /// `layer(l)` is valid ONLY for the layer loaded; every other index errors rather than
+    /// returning a plausible wrong residency.
+    pub fn load_one_layer(
+        pack_dir: &Path,
+        pack: &ExpertPack,
+        layer: usize,
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        Self::load_layer_subset(pack_dir, pack, &[layer], gpu)
+    }
+
+    /// Make a SUBSET of layers resident (1.79 GB each at the served keep), for teacher-forced
+    /// multi-layer validation without the 71.7 GB full-scale run. Lookups are keyed by the
+    /// real layer index; any layer not listed errors.
+    pub fn load_layer_subset(
+        pack_dir: &Path,
+        pack: &ExpertPack,
+        wanted: &[usize],
+        gpu: &dyn GpuBackend,
+    ) -> Result<Self> {
+        let packed_keep = pack.packed_keep();
+        let per_layer = packed_keep as u64 * pack.bytes_per_expert();
+        ensure!(!wanted.is_empty(), "CB3 layer subset is empty");
+        for (i, layer) in wanted.iter().enumerate() {
+            ensure!(*layer < pack.num_layers(), "CB3 pack has no layer {layer}");
+            ensure!(!wanted[..i].contains(layer), "CB3 layer subset lists layer {layer} twice");
+        }
+        let need = per_layer * wanted.len() as u64;
+
+        let budget = arena_budget_bytes(gpu)?;
+        ensure!(
+            need <= budget,
+            "CB3 arena subset {wanted:?} needs {:.1} GB but the budget is {:.1} GB",
+            need as f64 / 1e9,
+            budget as f64 / 1e9
+        );
+        let free = gpu.free_memory().context("CB3 arena: querying free device memory")? as u64;
+        ensure!(
+            free.saturating_sub(need) >= MIN_HEADROOM_BYTES,
+            "CB3 arena subset {wanted:?} would leave under the {:.1} GB headroom floor",
+            MIN_HEADROOM_BYTES as f64 / 1e9
+        );
+        tracing::info!(
+            "DeepSeek-V4.1 CB3 arena: LAYER SUBSET {wanted:?} at packed_keep={packed_keep}, \
+             {:.2} GB. `layer()` errors for any other index.",
+            need as f64 / 1e9,
+        );
+
+        let mut layers = Vec::with_capacity(wanted.len());
+        let mut routing_masks = Vec::with_capacity(wanted.len());
+        let mut slot_of_routed = Vec::with_capacity(wanted.len());
+        let mut uploaded = 0u64;
+        for &layer in wanted {
+            let shard = LayerShard::open(pack_dir, layer, pack)
+                .with_context(|| format!("CB3 arena subset: opening layer {layer}"))?;
+            let mut planes = [DevicePtr::NULL; 12];
+            let mut strides = [0usize; 12];
+            for (index, tensor) in CB3_TENSORS.iter().enumerate() {
+                let stride = pack.slot_stride_in(*tensor) as usize;
+                let bytes = stride
+                    .checked_mul(packed_keep)
+                    .context("CB3 plane extent overflow")?;
+                planes[index] = gpu.alloc(bytes)?;
+                strides[index] = stride;
+                let span = shard.plane_span(*tensor, packed_keep)?;
+                ensure!(span.len() == bytes, "CB3 plane span disagrees with the stride table");
+                gpu.copy_h2d(span, planes[index])?;
+                uploaded += span.len() as u64;
+            }
+            let resident = pack.resident_ids(layer)?;
+            let mut inverse = vec![NO_SLOT; ROUTED_EXPERTS];
+            for (slot, &expert_id) in resident.iter().enumerate() {
+                inverse[expert_id as usize] = slot as i32;
+            }
+            layers.push(Cb3LayerResidency { planes, strides, layer });
+            routing_masks.push((layer, pack.routing_mask(layer)?));
+            slot_of_routed.push((layer, inverse));
+        }
+        ensure!(uploaded == need, "subset upload moved {uploaded} bytes, planned {need}");
+        Ok(Self {
+            layers,
+            routing_masks,
+            slot_of_routed,
+            packed_keep,
+            resident_bytes: need,
+        })
+    }
+
     pub fn layer(&self, layer: usize) -> Result<&Cb3LayerResidency> {
+        // Matched on the layer's OWN index, not its position in the vec. For the
+        // single-layer validation arena those differ, and a positional lookup would return
+        // layer 0's residency for any request — a plausible wrong answer.
         self.layers
-            .get(layer)
-            .with_context(|| format!("CB3 arena has no layer {layer}"))
+            .iter()
+            .find(|residency| residency.layer == layer)
+            .with_context(|| {
+                format!(
+                    "CB3 arena has no layer {layer} (holds {:?})",
+                    self.layers.iter().map(|r| r.layer).collect::<Vec<_>>()
+                )
+            })
     }
 
     /// The router allow-list for `layer`. Apply BEFORE top-k.
     pub fn routing_mask(&self, layer: usize) -> Result<&[bool]> {
         self.routing_masks
-            .get(layer)
-            .map(Vec::as_slice)
+            .iter()
+            .find(|(index, _)| *index == layer)
+            .map(|(_, mask)| mask.as_slice())
             .with_context(|| format!("CB3 arena has no layer {layer}"))
     }
 
@@ -317,7 +436,9 @@ impl Cb3ExpertArena {
     pub fn slot_of(&self, layer: usize, expert_id: u32) -> Result<i32> {
         let table = self
             .slot_of_routed
-            .get(layer)
+            .iter()
+            .find(|(index, _)| *index == layer)
+            .map(|(_, table)| table)
             .with_context(|| format!("CB3 arena has no layer {layer}"))?;
         let slot = *table
             .get(expert_id as usize)
@@ -462,6 +583,49 @@ mod tests {
             .expect_err("a 55 GB budget cannot hold 71.7 GB")
             .to_string();
         assert!(err.contains("short by"), "refusal must name the shortfall: {err}");
+    }
+
+    /// Every per-layer lookup must match on the layer's OWN index, not its vec position.
+    ///
+    /// `load_one_layer` holds a single entry whose layer is not 0. `layer()` was fixed for
+    /// this first; `routing_mask()` and `slot_of()` still indexed by position and answered
+    /// layer 0 (or any index) with layer 2's tables — found only when the GPU microtest
+    /// errored. This covers all three siblings with no GPU: the arena is built directly.
+    ///
+    /// NEGATIVE CONTROL built in: layers 0 and 1 are asked for too and MUST error. Under the
+    /// positional bug, index 0 returned the only entry, so those asserts are the ones that
+    /// would have caught it.
+    #[test]
+    fn single_layer_arena_lookups_match_the_real_layer_not_the_position() {
+        let held = 2usize;
+        let mut mask = vec![false; ROUTED_EXPERTS];
+        let mut inverse = vec![NO_SLOT; ROUTED_EXPERTS];
+        for (slot, id) in [7u32, 40, 301].into_iter().enumerate() {
+            mask[id as usize] = true;
+            inverse[id as usize] = slot as i32;
+        }
+        let arena = Cb3ExpertArena {
+            layers: vec![Cb3LayerResidency {
+                planes: [DevicePtr::NULL; 12],
+                strides: [0; 12],
+                layer: held,
+            }],
+            routing_masks: vec![(held, mask)],
+            slot_of_routed: vec![(held, inverse)],
+            packed_keep: 3,
+            resident_bytes: 0,
+        };
+
+        assert_eq!(arena.layer(held).unwrap().layer(), held);
+        assert!(arena.routing_mask(held).unwrap()[40]);
+        assert_eq!(arena.slot_of(held, 301).unwrap(), 2);
+        assert_eq!(arena.slot_of(held, 8).unwrap(), NO_SLOT);
+
+        for absent in [0usize, 1, 3] {
+            assert!(arena.layer(absent).is_err(), "layer({absent}) must error");
+            assert!(arena.routing_mask(absent).is_err(), "routing_mask({absent}) must error");
+            assert!(arena.slot_of(absent, 301).is_err(), "slot_of({absent}, ..) must error");
+        }
     }
 
     /// The inverse table and the mask must agree with `ExpertPack::slot_of` exactly,

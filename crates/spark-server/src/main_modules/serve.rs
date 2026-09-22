@@ -1236,6 +1236,11 @@ fn quant_pair_compatible(kernel_quant: &str, model_quant: &str) -> bool {
         ("nvfp4", "bf16") |
         // BF16 reference bundle handles any quant by dequant on load.
         ("bf16", "fp8") |
+        // DeepSeek-V4.1's CB3 bundle: the checkpoint declares fp8 (its dense tensors are
+        // FP8 e4m3 + block-32 UE8M0, dequantized by weight_loader::deepseek_v41::ops), while
+        // the routed experts live in the separate k154-cb3 pack the cb3 kernels decode. Only
+        // the (gb10, deepseek-v4.1, cb3) target has quant "cb3".
+        ("cb3", "fp8") |
         ("bf16", "nvfp4")
     )
 }
