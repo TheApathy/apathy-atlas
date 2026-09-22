@@ -2,3 +2,7 @@ ar_*.bin
 ar_dims.txt
 sparse_attn
 gate.log
+idx_fixtures/
+sparse_index_gate
+sparse_index_gate_fmad
+run_index_gate.out

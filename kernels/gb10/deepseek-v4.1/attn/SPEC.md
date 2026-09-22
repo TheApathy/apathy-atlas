@@ -285,3 +285,34 @@ lane's arithmetic, not the engine's. A pre-o_proj tap would make it end-to-end.
 - `crates/spark-model/src/weight_loader/deepseek_v4/indexer.rs` admits indexer weights only
   where `compress_ratio == 4`. V4.1's ratios are 0/2/1, so it admits ZERO tensors for this
   checkpoint and returns Ok(0) silently. That is a V4-Flash-0731 assumption, not a V4.1 one.
+
+## 8e. INDEXER (sparse_index.cu) — validated EXACTLY against the engine's own taps
+
+`dsv41_index_score` -> (`dsv41_select_candidates` on L20) -> `dsv41_index_topk`, gate
+`sparse_index_gate.cu`, fixtures `make_index_fixture.py` (runD_L20_kernel = production Triton
+indexer, runE_torch = torch einsum indexer), built with the target's `--fmad=false`. Log:
+`index_gate.log`. GATE PASS, 0 hard failures.
+
+    END2END (score -> topk) vs engine topk, integer compare:  0 rows differ on ALL 12 cases
+      discriminating rows (more finite columns than k):       1280 (L20 chunk 1 + L24, both runs)
+    SELECT  (engine idx_score -> my topk):                    0 rows differ, 12/12
+    CAND    @2048 (engine idx_score -> cand_out):             0 differ, 4/4
+    CAND    @96 blocks, reference algorithm verbatim:         0 differ (force-keep + block top-k)
+    POOL    96-block pool -> score kernel mask -> topk:       0 rows differ, 4/4
+    CONTROLS watched changing the selection: lens-1 (511/512), no bf16 round (259/512, 100/128),
+      pool dropped (219/512, 128/128), force-keep shifted (64, 48), block size 16 (2048).
+
+The DOT is exact under WMMA (bf16 16x16x16, fp32 accumulate, k ascending): score worst_abs is
+4.8e-07, against 8.7e-03 for an fp64/scalar dot, whose bf16-before-relu rounding lands on the
+other side of a boundary often enough to flip 1/512 rows at L20. The HEAD SUM is not bit-exact
+to either reference (pairwise 99.05-99.65% vs Triton, which is why it is the production order).
+
+NOT COVERED, stated so nobody banks it: (1) layer 20's candidate PRUNING at production size —
+at 1024 tokens every visible block survives top-2048, so cand == visibility and dropping it
+changes nothing (0 rows); it bites only above 16384 compressed rows. POOL covers the mechanism
+with 96 blocks on real scores, but no capture covers the real threshold. (2) ratio-2 selection:
+at 1024 tokens n_c <= 512 on L2/L14, every visible row is kept — the ratio-2 indexer never
+DISCRIMINATES in runD/runE. runC_2048 would (n_c to 1024) but has no idx_q/wts taps.
+(3) Exact ties at the k-th score: 0 in every fixture; the kernel breaks them by lowest column,
+torch.topk's order is unspecified. (4) The q/wts projections feeding the indexer (qr @ wq_b,
+x @ weights_proj, freqs_c RoPE) — inputs here are the engine's own idx_q/wts taps.
