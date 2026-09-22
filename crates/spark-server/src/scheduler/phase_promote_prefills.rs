@@ -37,7 +37,9 @@ pub(super) fn promote_completed_prefills(
             }
             continue;
         };
-        let spontaneous_think = !p.enable_thinking && think_start_token == Some(first);
+        // deepseek_v41: a first <think> is an ordinary token for the Python engine.
+        let spontaneous_think =
+            !p.enable_thinking && think_start_token == Some(first) && !crate::dsv41::serving();
         // Only stream non-EOS tokens (OpenAI: stop seq not in output).
         if !spontaneous_think
             && !p.eos_tokens.contains(&first)

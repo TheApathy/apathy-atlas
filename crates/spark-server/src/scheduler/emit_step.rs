@@ -21,7 +21,8 @@ pub(super) fn eos_is_suppressed(a: &ActiveSeq, output_len: usize) -> bool {
         .is_some_and(|gs| !gs.is_terminated())
         || a.require_tool_call
         || output_len < a.min_tokens
-        || a.inside_thinking
+        // deepseek_v41: the Python engine stops on EOS inside thinking too.
+        || (a.inside_thinking && !crate::dsv41::serving())
 }
 
 /// ChatML role boundaries end the assistant turn even when ordinary EOS is
@@ -266,7 +267,10 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     // committed to the KV cache by the verify pass) but force an immediate exit
     // via force_end_thinking. The very next token becomes </think> (0 thinking
     // content tokens, 1 </think> overhead), and coding output continues cleanly.
-    if !a.inside_thinking && a.think_start_token == Some(tok) {
+    // deepseek_v41: `<think>` and a stray `</think>` are ordinary output
+    // tokens for the Python engine (its router splits on the text).
+    let dsv41 = crate::dsv41::serving();
+    if !dsv41 && !a.inside_thinking && a.think_start_token == Some(tok) {
         // Re-entering thinking re-arms the response-entry counter for the
         // next `</think>` boundary.
         a.post_think_gate_steps = 0;
@@ -293,7 +297,7 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
     }
 
     // Silently skip </think> tokens outside thinking mode (same as process_decode_logits).
-    if !a.inside_thinking && a.think_end_token == Some(tok) {
+    if !dsv41 && !a.inside_thinking && a.think_end_token == Some(tok) {
         a.think_skip_count += 1;
         if a.think_skip_count >= 50 {
             a.finished = true;
@@ -369,7 +373,9 @@ pub fn emit_token(a: &mut ActiveSeq, tok: u32, logprobs: Option<crate::api::Toke
         a.content_started = true;
         a.content_tokens = a.content_tokens.saturating_add(1);
 
-        let catastrophic_loop = a.content_tokens >= CATASTROPHIC_LOOP_MIN_TOKENS as u32
+        // Not for deepseek_v41 (the Python engine has only its cycle breaker).
+        let catastrophic_loop = !crate::dsv41::serving()
+            && a.content_tokens >= CATASTROPHIC_LOOP_MIN_TOKENS as u32
             && a.content_tokens.is_multiple_of(CONTENT_LOOP_CHECK_STRIDE)
             && detect_catastrophic_content_loop(&a.output_tokens);
         let configured_loop = enable_loop_watchdog()

@@ -67,6 +67,12 @@ pub fn sample_token(
     top_p: f32,
     suppress_ids: &[u32],
 ) -> Result<u32> {
+    // deepseek_v41: the Python engine may end on its very first token.
+    let suppress_ids = if crate::dsv41::serving() {
+        &[][..]
+    } else {
+        suppress_ids
+    };
     if temperature == 0.0 && suppress_ids.is_empty() {
         return model.argmax_on_device(logits, 0);
     }

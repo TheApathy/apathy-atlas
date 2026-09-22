@@ -148,7 +148,9 @@ pub fn prefill_request(
 
     // Spontaneous <think>: if the first token is <think> and thinking was not
     // requested, suppress it and enter thinking mode on the ActiveSeq.
-    let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+    // deepseek_v41: a first <think> is an ordinary token for the Python engine.
+    let spontaneous_think =
+        !req_enable_thinking && think_start_token == Some(first) && !crate::dsv41::serving();
     if !spontaneous_think
         && let ResponseSink::Streaming(ref tx) = sink
         && let Err(e) = tx.blocking_send(StreamEvent::Token(first))
