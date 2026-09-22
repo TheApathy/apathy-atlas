@@ -179,6 +179,9 @@ pub struct Dsv41Kernels {
     pub mul_bf16_to_f32: KernelHandle,
     /// `dsv41_hc_mean_bf16`: the DSpark seed (mean over the hc streams).
     pub hc_mean_bf16: KernelHandle,
+    /// `dsv41_hc_mixes_tb`: [`HC_TB`] tokens per block for prefill passes, bit-identical per
+    /// token to `hc_mixes`. [`HC_MIX_TB_ENV`]`=1` only, until the end-to-end byte test.
+    pub hc_mixes_tb: Option<KernelHandle>,
     /// `dsv41_decode::dsv41_fp8_gemv_m1`, used at M = 1 when [`DENSE_GEMV_ENV`] is on.
     pub fp8_gemv_m1: Option<KernelHandle>,
     /// `dsv41_fp8_gemv_m8`: the same GEMV for 2..=8 rows, each row bit-identical to the M = 1
@@ -191,6 +194,11 @@ pub struct Dsv41Kernels {
     /// until the end-to-end byte test passes.
     pub fp8_fused: Option<Fp8Gemm>,
 }
+
+/// `ATLAS_DSV41_HC_MIX_TB=1`: non-decode `hc_mixes` serve [`HC_TB`] tokens per block.
+pub const HC_MIX_TB_ENV: &str = "ATLAS_DSV41_HC_MIX_TB";
+/// Tokens per block of `dsv41_hc_mixes_tb` (`DSV41_HC_TB` in the kernel).
+pub const HC_TB: usize = 4;
 
 /// `ATLAS_DSV41_FP8_FUSED=1`: prefill FP8 linears on the winning shapes skip the bf16 dequant.
 pub const FP8_FUSED_ENV: &str = "ATLAS_DSV41_FP8_FUSED";
@@ -247,6 +255,7 @@ impl Dsv41Kernels {
             engram_gate: k("dsv41_engram_gate")?,
             mul_bf16_to_f32: k("dsv41_mul_bf16_to_f32")?,
             hc_mean_bf16: k("dsv41_hc_mean_bf16")?,
+            hc_mixes_tb: if std::env::var(HC_MIX_TB_ENV).as_deref() == Ok("1") { Some(k("dsv41_hc_mixes_tb")?) } else { None },
             fp8_gemv_m1: if std::env::var(DENSE_GEMV_ENV).as_deref() != Ok("0") {
                 Some(gpu.kernel(DECODE_DENSE_MODULE, "dsv41_fp8_gemv_m1").with_context(|| {
                     format!("{DENSE_GEMV_ENV}=1 but {DECODE_DENSE_MODULE}::dsv41_fp8_gemv_m1 is not in the PTX")
@@ -334,6 +343,15 @@ impl Ops<'_> {
                 .arg_ptr(raw).arg_ptr(hc.scale).arg_ptr(hc.base)
                 .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
                 .arg_u32(d as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
+                .launch(self.stream);
+        }
+        if let Some(tb) = self.k.hc_mixes_tb.filter(|_| !decode_pass()) {
+            return self
+                .l(tb)
+                .grid([t.div_ceil(HC_TB) as u32, 1, 1])
+                .arg_ptr(h).arg_ptr(hc.func).arg_ptr(hc.scale).arg_ptr(hc.base)
+                .arg_ptr(pre).arg_ptr(post).arg_ptr(comb)
+                .arg_u32(d as u32).arg_u32(t as u32).arg_u32(iters).arg_f32(eps).arg_f32(hc_eps)
                 .launch(self.stream);
         }
         self.l(self.k.hc_mixes)
