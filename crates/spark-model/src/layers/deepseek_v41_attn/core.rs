@@ -350,6 +350,34 @@ impl Dsv41SparseCore {
         self.st.lock().expect("core state poisoned").has_pending[layer] = false;
     }
 
+    /// GATE SCAFFOLDING ONLY: install a captured state for the decoder replay — L20's
+    /// compressed cache (`rows` rows of ckv/ik, copied into the core's OWN caches) and the replay
+    /// tail's candidate mask `[tail_rows, cand_ld]` — so a capture holding only replay layers
+    /// (runI: L24/L28) can be gated teacher-forced. Nothing in the forward calls it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gate_seed_replay(
+        &self,
+        gpu: &dyn GpuBackend,
+        ckv: DevicePtr,
+        ik: DevicePtr,
+        rows: usize,
+        cand: DevicePtr,
+        cand_ld: usize,
+        tail_rows: usize,
+    ) -> Result<()> {
+        let c = self.layers.get(CANDIDATE_SOURCE_LAYER).and_then(|l| l.kv.as_ref()).context("layer 20 not loaded")?;
+        ensure!(rows <= c.rows_cap && cand_ld <= self.tail.cand_cap && tail_rows <= REPLAY_ROWS, "seed exceeds the caches");
+        gpu.copy_d2d(ckv, c.ckv, rows * HEAD_DIM * 2)?;
+        gpu.copy_d2d(ik, c.ik, rows * INDEX_HEAD_DIM * 2)?;
+        let mut st = self.st.lock().expect("core state poisoned");
+        let cur = st.tail.cur;
+        gpu.copy_d2d(cand, self.tail.cand[cur], tail_rows * cand_ld)?;
+        gpu.memset(self.tail.topk[cur], 0xFF, REPLAY_ROWS * INDEX_TOPK * 8)?;
+        st.tail = TailState { cur, rows: tail_rows, ld: cand_ld };
+        st.published = Some((c.ckv, c.ik, rows, c.ratio));
+        Ok(())
+    }
+
     fn compress(&self, ops: &Ops, a: &CoreArgs, st: &mut SeqState) -> Result<()> {
         let (layer, t, start, stream) = (a.layer, a.t, a.start, ops.stream);
         let c = self.layers[layer].kv.as_ref().expect("kv-source");
