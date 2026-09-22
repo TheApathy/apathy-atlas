@@ -41,6 +41,12 @@
 //     cycles/instr gate_up, 5.82 down). Bit-identical and chunk-invariant, but SLOWER at every
 //     T: 19.55 vs 17.13 ms at T=512, 31.08 vs 28.67 at 2048, 9.51 vs 8.21 at 32 (6
 //     interleaved rounds; 254 registers with 4 decode jobs per thread).
+//   - Register-fragment kernels (CB3 decoded straight into mma.sync B fragments, no B smem
+//     tile, no main-loop barrier, scale as a __vadd2 exponent add on a per-column table,
+//     A fragments from global): bit-identical and chunk-invariant, but 2-3x SLOWER — 85.7 vs
+//     28.8 ms at T=2048, 34.2 vs 17.2 at T=512 (6 interleaved rounds; 244 registers, each
+//     thread's 16-byte plane loads scattered over 8 rows with no prefetch). Removing the
+//     barrier did not pay for losing the shared, coalesced decode.
 // Block: 256 threads (8 warps, each a 32x32 quadrant of 128x64).
 
 #include <cstdint>
